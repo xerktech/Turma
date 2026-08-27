@@ -231,7 +231,9 @@ paths:
   - **Only APPEND-ONLY bytes belong under `<tid>/dsh/`.** The per-file cursor ships bytes past an
     offset — correct for dsh's event-sourced JSONL log, wrong for a page-mutating SQLite (an in-place
     rewrite leaves the archived early bytes stale). dsh's SQLite is a derived index it rebuilds from
-    the log, so it is not archived. This `<tid>/dsh/` log is the DISPLAY/metrics feed, and migration
+    the log, so it is not archived. This `<tid>/dsh/` log is the DISPLAY/metrics feed — and the hub's
+    **Turma-native Trajectory viewer reads it back from THIS raw layer** (`archive.dshTrajectory`,
+    `GET /api/dsh/<tid>/trajectory`, XERK-498), which is why it must land here in full. Migration
     ([K], XERK-475) does NOT carry it — dsh resumes from its OWN store under `DSH_SESSIONS_ROOT`
     (a separate file), which the bundle carries instead; the target rebuilds this feed from new
     events (the resumed dsh does not replay history). The earlier note that [K] would

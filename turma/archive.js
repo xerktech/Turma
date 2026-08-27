@@ -1258,8 +1258,179 @@ function rebuildIndex() {
   return files.length;
 }
 
+// ---- the dsh Trajectory (XERK-498) ------------------------------------------
+// A read-only Trajectory over a dsh session's D3 NATIVE event log — the
+// canonical record the raw layer already keeps at `<id>/dsh/*.jsonl` (XERK-469),
+// so no host proxy and no per-session dsh web server. Parsed HERE, server-side
+// and in ONE place, into the turns / steps / tool-calls / token-usage / timings
+// the S1 projection flattens away — the richer telemetry D3 exists to retain.
+// This is the Turma-native viewer that replaces the removed per-session dsh
+// terminal. BOUNDED on every axis: the log is served on an HTTP route and is
+// attacker-influenced (a session holds whatever was pasted into it), so the read
+// is capped, tool-call args are snippeted, and no raw bytes are returned.
+const DSH_TRAJ_READ_MAX = 8 * 1024 * 1024;    // bytes of the log we scan (tail)
+const DSH_TRAJ_TURNS_MAX = 1000;              // turns kept (newest)
+const DSH_TRAJ_CALLS_MAX = 4000;              // tool calls kept (across turns)
+const DSH_TRAJ_SNIPPET = 400;                 // per tool-call arg snippet
+
+function dshTrajNum(x) {
+  return (typeof x === "number" && isFinite(x) && x >= 0) ? Math.floor(x) : 0;
+}
+
+// The session's native dsh events file inside the raw layer, or null. Matches on
+// the `/dsh/` segment + `.jsonl` so a renamed log file still resolves.
+function dshEventsFile(transcriptId) {
+  const files = listRawFiles(transcriptId);
+  if (!files) return null;
+  const hit = files.find((f) => /(^|\/)dsh\/[^/]+\.jsonl$/.test(f.path));
+  return hit ? hit.path : null;
+}
+
+function dshTrajectory(transcriptId) {
+  const rel = dshEventsFile(transcriptId);
+  if (!rel) return null;
+  const full = rawFileFor(transcriptId, rel);
+  if (!full) return null;
+  let text = "", truncated = false;
+  try {
+    const fd = fs.openSync(full, "r");
+    try {
+      const size = fs.fstatSync(fd).size;
+      const take = Math.min(size, DSH_TRAJ_READ_MAX);
+      // Read the TAIL when oversized — a live viewer wants the most RECENT turns,
+      // and a leading partial line is dropped below.
+      const start = size - take;
+      truncated = start > 0;
+      const buf = Buffer.allocUnsafe(take);
+      let off = 0;
+      while (off < take) {
+        const n = fs.readSync(fd, buf, off, take - off, start + off);
+        if (n <= 0) break;
+        off += n;
+      }
+      text = buf.toString("utf8", 0, off);
+    } finally { fs.closeSync(fd); }
+  } catch { return null; }
+  if (truncated) { const nl = text.indexOf("\n"); text = nl >= 0 ? text.slice(nl + 1) : ""; }
+
+  const snip = (s) => {
+    s = String(s == null ? "" : s);
+    return s.length > DSH_TRAJ_SNIPPET ? s.slice(0, DSH_TRAJ_SNIPPET) + "…" : s;
+  };
+  const turnsMap = new Map();  // turn number -> object
+  const order = [];            // turn numbers, first-seen order
+  const stepsSeen = new Set(); // "<turn>/<step>"
+  let title = null, model = null, firstTime = null, lastTime = null;
+  let calls = 0, callsDropped = 0;
+  const totals = { turns: 0, steps: 0, toolCalls: 0, errors: 0,
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+  const getTurn = (n) => {
+    let t = turnsMap.get(n);
+    if (!t) {
+      t = { turn: n, startedAt: null, endedAt: null, reason: null, steps: 0,
+        calls: [], tokens: { input: 0, output: 0 } };
+      turnsMap.set(n, t); order.push(n); totals.turns++;
+    }
+    return t;
+  };
+
+  for (const line of text.split("\n")) {
+    const s = line.trim();
+    if (!s) continue;
+    let e; try { e = JSON.parse(s); } catch { continue; }
+    if (!e || typeof e !== "object") continue;
+    const type = e.type, d = (e.data && typeof e.data === "object") ? e.data : {};
+    const time = (typeof e.time === "number" && isFinite(e.time)) ? e.time : null;
+    if (time != null) {
+      if (firstTime == null || time < firstTime) firstTime = time;
+      if (lastTime == null || time > lastTime) lastTime = time;
+    }
+    const tn = d.turn;
+    if (type === "session/title" && d.title) { title = snip(d.title); continue; }
+    if (type === "turn/start" && typeof tn === "number") {
+      const t = getTurn(tn); if (t.startedAt == null) t.startedAt = time; continue;
+    }
+    if (type === "turn/end" && typeof tn === "number") {
+      const t = getTurn(tn); t.endedAt = time;
+      t.reason = (d.reason && d.reason.kind) ? String(d.reason.kind) : null;
+      if (t.reason === "error") totals.errors++;
+      continue;
+    }
+    if (type === "step/start" && typeof tn === "number" && typeof d.step === "number") {
+      const k = tn + "/" + d.step;
+      if (!stepsSeen.has(k)) { stepsSeen.add(k); getTurn(tn).steps++; totals.steps++; }
+      continue;
+    }
+    if (type === "tool/call" && typeof tn === "number") {
+      totals.toolCalls++;
+      if (calls < DSH_TRAJ_CALLS_MAX) {
+        getTurn(tn).calls.push({
+          name: String(d.name || "?"),
+          callId: d.callId != null ? String(d.callId) : null,
+          at: time, ok: null, error: false,
+          args: snip(typeof d.arguments === "string"
+            ? d.arguments : JSON.stringify(d.arguments == null ? "" : d.arguments)),
+        });
+        calls++;
+      } else callsDropped++;
+      continue;
+    }
+    if (type === "tool/result") {
+      const msg = (d.message && typeof d.message === "object") ? d.message : {};
+      const content = Array.isArray(msg.content) ? msg.content : [];
+      const cid = (msg.source && msg.source.callId)
+        || (content[0] && content[0].toolCallId) || null;
+      const isErr = content.some((c) => c && c.isError === true);
+      if (isErr) totals.errors++;
+      if (cid != null && typeof tn === "number") {
+        const t = turnsMap.get(tn);
+        const call = t && t.calls.find((c) => c.callId === String(cid) && c.ok === null);
+        if (call) {
+          call.ok = !isErr; call.error = isErr;
+          call.durationMs = (call.at != null && time != null)
+            ? Math.max(0, time - call.at) : null;
+        }
+      }
+      continue;
+    }
+    if (type === "assistant/chunk" && d.chunk && d.chunk.type === "usage" && d.chunk.usage) {
+      const u = d.chunk.usage;
+      const inp = dshTrajNum(u.inputTokens), out = dshTrajNum(u.outputTokens);
+      totals.tokens.input += inp;
+      totals.tokens.output += out;
+      totals.tokens.cacheRead += dshTrajNum(u.cacheReadInputTokens);
+      totals.tokens.cacheWrite += dshTrajNum(u.cacheCreationInputTokens);
+      if (typeof tn === "number") {
+        const t = getTurn(tn); t.tokens.input += inp; t.tokens.output += out;
+      }
+      continue;
+    }
+    if (type === "assistant/message" && !model
+        && d.message && d.message.source && d.message.source.model) {
+      const m = d.message.source.model;
+      model = snip(typeof m === "string" ? m : ((m && m.model) || ""));
+      continue;
+    }
+  }
+  let turns = order.map((n) => turnsMap.get(n));
+  let turnsDropped = 0;
+  if (turns.length > DSH_TRAJ_TURNS_MAX) {
+    turnsDropped = turns.length - DSH_TRAJ_TURNS_MAX;
+    turns = turns.slice(-DSH_TRAJ_TURNS_MAX);
+  }
+  return {
+    transcriptId, title, model,
+    startedAt: firstTime, endedAt: lastTime,
+    durationMs: (firstTime != null && lastTime != null) ? lastTime - firstTime : null,
+    totals, turns,
+    truncated: truncated || turnsDropped > 0 || callsDropped > 0,
+    turnsDropped, callsDropped,
+  };
+}
+
 module.exports = {
   ARCHIVE_DIR, ARCHIVE_DB, ARCHIVE_TRANSCRIPT_MAX, ARCHIVE_TOTAL_MAX,
+  dshTrajectory, dshEventsFile,
   ARCHIVE_RAW_TRANSCRIPT_MAX, ARCHIVE_RAW_CURSOR_MAX, ARCHIVE_MANIFEST_CURSOR_MAX,
   RAW_DIR_SUFFIX,
   slugify, archiveRelPath, ftsQuery, byteCeiling, shedFilePayloads,

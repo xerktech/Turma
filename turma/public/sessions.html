@@ -346,7 +346,28 @@
 
   /* ---- Right stage: read-only transcript view of an ended session ----------- */
   .transcript-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; background: var(--page); }
-  .stage-empty[hidden], .term-pane[hidden], .transcript-pane[hidden] { display: none; }
+  .stage-empty[hidden], .term-pane[hidden], .transcript-pane[hidden], .traj-pane[hidden] { display: none; }
+  /* dsh Trajectory viewer (XERK-498) */
+  .traj-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; background: var(--page); }
+  .traj-scroll { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+  .traj-empty, .traj-c-none { color: var(--muted); font-size: 13px; padding: 8px 2px; }
+  .traj-head { display: flex; flex-direction: column; gap: 7px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+  .traj-h-title { font-size: 15px; font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+  .traj-h-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .traj-tag { font-size: 11.5px; padding: 1px 7px; border-radius: 999px; background: var(--surface); border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+  .traj-tag.traj-err { color: var(--danger, #c0392b); border-color: var(--danger, #c0392b); }
+  .traj-trunc { font-size: 12px; color: var(--muted); font-style: italic; }
+  .traj-turns { display: flex; flex-direction: column; gap: 10px; }
+  .traj-turn { border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); padding: 9px 11px; }
+  .traj-t-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 6px; }
+  .traj-t-n { font-weight: 600; font-size: 13px; color: var(--ink); }
+  .traj-call { display: grid; grid-template-columns: auto auto 1fr; gap: 6px 8px; align-items: baseline; padding: 3px 0; font-size: 12.5px; }
+  .traj-call-err .traj-c-name { color: var(--danger, #c0392b); }
+  .traj-c-mark { font-weight: 700; }
+  .traj-call-err .traj-c-mark { color: var(--danger, #c0392b); }
+  .traj-c-name { font-family: var(--mono, monospace); color: var(--ink); }
+  .traj-c-dur { color: var(--muted); font-size: 11.5px; }
+  .traj-c-args { grid-column: 1 / -1; color: var(--muted); font-family: var(--mono, monospace); font-size: 11.5px; white-space: pre-wrap; overflow-wrap: anywhere; opacity: 0.85; }
   .tr-scroll { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
   .tr-msg { max-width: 760px; padding: 9px 13px; border-radius: var(--radius-md); font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
   .tr-msg.user { align-self: flex-end; background: var(--accent-soft); color: var(--ink); }
@@ -910,6 +931,10 @@
           <span class="spacer"></span>
           <span class="verbosity" id="chatVerbosity"></span>
           <button class="seg-toggle" id="chatTermBtn" onclick="chatToTerminal()" title="Open the raw ttyd terminal for debugging">Terminal ▸</button>
+          <!-- dsh sessions are headless (no ttyd, XERK-498): the Terminal toggle
+               above is hidden for them and this Trajectory toggle takes its place,
+               a read-only view over the dsh D3 native event log. -->
+          <button class="seg-toggle" id="chatTrajBtn" hidden onclick="chatToTrajectory()" title="Open the read-only dsh Trajectory (turns, tool calls, tokens)">Trajectory ▸</button>
           <button class="kill-btn" id="chatKill" onclick="killCurrentChat()">Kill</button>
         </div>
         <div class="chat-scroll-wrap">
@@ -963,6 +988,20 @@
           <button class="primary compose-stop" id="termStop" onclick="termComposeStop()" hidden>◼ Stop</button>
           <button class="primary compose-action" id="termSend" onclick="termComposeAction()">Send</button>
         </div>
+      </div>
+      <!-- The dsh Trajectory pane (XERK-498): a Turma-native read-only view over
+           a dsh session's D3 native event log, replacing the removed per-session
+           dsh terminal. Fetched from /api/dsh/<transcriptId>/trajectory, rendered
+           by renderTrajectory(). No compose box, no terminal — observe-only. -->
+      <div class="traj-pane" id="trajPane" hidden>
+        <div class="term-bar">
+          <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
+          <button class="seg-toggle" id="trajChatBtn" onclick="trajectoryToChat()" title="Back to the native chat view">◂ Chat</button>
+          <span class="t-title"><span class="name" id="trajTitle"></span> · <span class="path" id="trajPath"></span></span>
+          <span class="spacer"></span>
+          <button class="seg-toggle" id="trajRefresh" onclick="loadTrajectory(currentTrajId, true)" title="Reload the trajectory">↻ Refresh</button>
+        </div>
+        <div class="traj-scroll" id="trajScroll"></div>
       </div>
     </main>
   </div>
@@ -2328,7 +2367,11 @@ const $frame = document.getElementById("termFrame");
 const $termPane = document.getElementById("termPane");
 const $chatPane = document.getElementById("chatPane");
 const $transcriptPane = document.getElementById("transcriptPane");
+const $trajPane = document.getElementById("trajPane");
 const $stageEmpty = document.getElementById("stageEmpty");
+// The dsh session whose Trajectory is currently staged (XERK-498), so ↻ Refresh
+// and a re-open know which one to re-fetch.
+let currentTrajId = null;
 let currentId = null;
 // The host the staged session belongs to, remembered across beats — see
 // render()'s vanish check, which needs it to tell a host that has dropped the
@@ -2563,8 +2606,18 @@ function selectSession(id) {
   resetEndedBar();   // leaving any ended-session view (incl. one just resumed)
   $termPane.hidden = true;
   $transcriptPane.hidden = true;
+  if ($trajPane) $trajPane.hidden = true;
   $stageEmpty.hidden = true;
   $chatPane.hidden = false;
+  // A dsh session is HEADLESS — no ttyd, no raw terminal (XERK-498), so hide the
+  // "Terminal ▸" toggle and show "Trajectory ▸" in its place (the Turma-native
+  // read-only view over its D3 native log). A claude session keeps the terminal
+  // toggle and never shows trajectory.
+  const isDsh = !!(hit.s && hit.s.agentType === "dsh");
+  const chatTermBtn = document.getElementById("chatTermBtn");
+  if (chatTermBtn) chatTermBtn.style.display = isDsh ? "none" : "";
+  const chatTrajBtn = document.getElementById("chatTrajBtn");
+  if (chatTrajBtn) chatTrajBtn.hidden = !isDsh;
   disarmChatKill();
   currentHostKey = hit.a.key;
   stageTunnelReset();   // this session's tunnel is up — it's how we reached it
@@ -2602,6 +2655,9 @@ function growCompose(id) {
 function chatToTerminal() {
   if (!currentId) return;
   const hit = sessionHit(currentId);
+  // A dsh session has no ttyd (XERK-498); the toggle is hidden, but guard the
+  // handler too so a stale keybinding/deeplink can't navigate to a dead /term.
+  if (hit && hit.s && hit.s.agentType === "dsh") return;
   // setFrame() clears the terminal's box (it's opening a session's terminal), so
   // the draft has to be carried across after it, not before.
   setFrame(currentId, hit ? hit.s : null, hit ? hit.a : null);
@@ -2622,6 +2678,98 @@ function terminalToChat() {
   disarmTermKill();
   carryDraft("termInput", "chatInput"); // after the swap — see chatToTerminal()
   if (window.TurmaChat) TurmaChat.repaint();
+}
+// The dsh Trajectory view (XERK-498): replaces the removed per-session dsh
+// terminal with a Turma-native read-only render of the session's D3 native event
+// log. Keeps the chat's live tail warm underneath so returning is instant.
+function chatToTrajectory() {
+  if (!currentId) return;
+  const rec = findSession(currentId);
+  if (!rec || rec.agentType !== "dsh") return;  // dsh-only, guarded like the button
+  viewMode = "trajectory";
+  $chatPane.hidden = true;
+  if ($trajPane) $trajPane.hidden = false;
+  const nm = document.getElementById("trajTitle");
+  const pth = document.getElementById("trajPath");
+  if (nm) nm.textContent = sessTitle(rec);
+  if (pth) pth.textContent = sessMeta(rec);
+  loadTrajectory(rec.transcriptId, false);
+}
+function trajectoryToChat() {
+  if (!currentId) return;
+  viewMode = "chat";
+  if ($trajPane) $trajPane.hidden = true;
+  $chatPane.hidden = false;
+  if (window.TurmaChat) TurmaChat.repaint();
+}
+// Fetch and render the trajectory. `force` re-fetches even if we just showed it.
+async function loadTrajectory(transcriptId, force) {
+  const scroll = document.getElementById("trajScroll");
+  if (!scroll) return;
+  if (!transcriptId) { scroll.innerHTML = '<div class="traj-empty">This session has no transcript id yet.</div>'; return; }
+  if (!force && currentTrajId === transcriptId && scroll.dataset.loaded === "1") return;
+  currentTrajId = transcriptId;
+  scroll.innerHTML = '<div class="traj-empty">Loading trajectory…</div>';
+  scroll.dataset.loaded = "";
+  let data;
+  try {
+    const r = await fetch(`/api/dsh/${encodeURIComponent(transcriptId)}/trajectory`, { credentials: "same-origin" });
+    if (r.status === 404) {
+      scroll.innerHTML = '<div class="traj-empty">No dsh trajectory yet — a running session syncs its native log to the archive within a few beats. Reopen or ↻ Refresh in a moment.</div>';
+      return;
+    }
+    if (!r.ok) { scroll.innerHTML = `<div class="traj-empty">Could not load the trajectory (HTTP ${r.status}).</div>`; return; }
+    data = await r.json();
+  } catch (e) {
+    scroll.innerHTML = '<div class="traj-empty">Could not reach the hub for the trajectory.</div>';
+    return;
+  }
+  if (currentTrajId !== transcriptId) return;  // a newer open won the race
+  renderTrajectory(scroll, data);
+  scroll.dataset.loaded = "1";
+}
+function trajMs(ms) {
+  if (ms == null || !isFinite(ms)) return "";
+  if (ms < 1000) return ms + "ms";
+  const s = ms / 1000;
+  return s < 60 ? s.toFixed(s < 10 ? 1 : 0) + "s" : Math.floor(s / 60) + "m" + String(Math.round(s % 60)).padStart(2, "0") + "s";
+}
+function trajNum(n) { return (typeof n === "number" && isFinite(n)) ? n.toLocaleString() : "0"; }
+function renderTrajectory(scroll, d) {
+  if (!d || !Array.isArray(d.turns)) { scroll.innerHTML = '<div class="traj-empty">Empty trajectory.</div>'; return; }
+  const t = d.totals || {};
+  const tok = t.tokens || {};
+  const head = `
+    <div class="traj-head">
+      <div class="traj-h-title">${esc(d.title || "dsh session")}</div>
+      <div class="traj-h-meta">
+        ${d.model ? `<span class="traj-tag">${esc(d.model)}</span>` : ""}
+        <span class="traj-tag">${trajNum(t.turns)} turns</span>
+        <span class="traj-tag">${trajNum(t.toolCalls)} tool calls</span>
+        ${t.errors ? `<span class="traj-tag traj-err">${trajNum(t.errors)} errors</span>` : ""}
+        <span class="traj-tag">↑${trajNum(tok.input)} ↓${trajNum(tok.output)} tok</span>
+        ${d.durationMs != null ? `<span class="traj-tag">${esc(trajMs(d.durationMs))}</span>` : ""}
+      </div>
+      ${d.truncated ? '<div class="traj-trunc">Showing the most recent activity — this session’s log is large and was truncated.</div>' : ""}
+    </div>`;
+  // Newest turn first — a live viewer watches the latest.
+  const turns = d.turns.slice().reverse().map((tn) => {
+    const calls = Array.isArray(tn.calls) ? tn.calls : [];
+    const rows = calls.map((c) => {
+      const mark = c.ok === false ? "✗" : (c.ok === true ? "✓" : "•");
+      const cls = c.ok === false ? "traj-call traj-call-err" : "traj-call";
+      const dur = c.durationMs != null ? `<span class="traj-c-dur">${esc(trajMs(c.durationMs))}</span>` : "";
+      return `<div class="${cls}"><span class="traj-c-mark">${mark}</span><span class="traj-c-name">${esc(c.name || "?")}</span>${dur}<div class="traj-c-args">${esc(c.args || "")}</div></div>`;
+    }).join("");
+    const rk = tn.reason ? `<span class="traj-tag ${tn.reason === "error" ? "traj-err" : ""}">${esc(tn.reason)}</span>` : "";
+    const dur = (tn.startedAt != null && tn.endedAt != null) ? `<span class="traj-tag">${esc(trajMs(tn.endedAt - tn.startedAt))}</span>` : "";
+    const tk = (tn.tokens && (tn.tokens.input || tn.tokens.output)) ? `<span class="traj-tag">↑${trajNum(tn.tokens.input)} ↓${trajNum(tn.tokens.output)}</span>` : "";
+    return `<div class="traj-turn">
+      <div class="traj-t-head"><span class="traj-t-n">Turn ${esc(String(tn.turn))}</span><span class="traj-tag">${trajNum(tn.steps)} steps</span><span class="traj-tag">${calls.length} calls</span>${tk}${dur}${rk}</div>
+      ${rows || '<div class="traj-c-none">no tool calls</div>'}
+    </div>`;
+  }).join("");
+  scroll.innerHTML = head + `<div class="traj-turns">${turns || '<div class="traj-empty">No turns recorded yet.</div>'}</div>`;
 }
 // Push one mobile history entry the back button consumes, and reveal the stage.
 function enterStage() {
@@ -2692,9 +2840,11 @@ function clearStage() {
   navFrame("about:blank"); // tear down any live session's WebSocket
   if (window.TurmaChat) { TurmaChat.close(); TurmaChat.closeStatic(); } // stop the chat live tail + clear the archived view
   viewMode = null;
+  currentTrajId = null;
   $chatPane.hidden = true;
   $termPane.hidden = true;
   $transcriptPane.hidden = true;
+  if ($trajPane) $trajPane.hidden = true;
   $stageEmpty.hidden = false;
   document.body.classList.remove("showing-term");
   disarmTermKill();

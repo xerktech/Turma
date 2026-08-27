@@ -130,14 +130,16 @@ runtime-independent and already worked — `_peer_rows`/`_write_peers_file` list
 - **`inject` must include `agentLoop`.** `@deepseek-ai/dsh-agent-loop` registers the agent factory
   (`agents.setFactory`); without injecting it the driver can load first and `agents.create()` throws
   "no agent factory registered".
-- **`agents.create` MUST pass a `setup` that mounts a preset — or the agent has NO tools.** With no
-  `setup`, the agent is created with no bash/edit/ask-user/approval tools, so the model can neither
-  do work nor raise a HITL request (it just prints tool JSON as prose) — the whole vertical looks
-  alive but does nothing. dsh's own hosts compose a preset (`composeAgent`); the driver's setup calls
-  `ctx.get('agentPresets').mount(agentCtx)` (default preset). A mount failure is tolerated only for a
-  rosterless deployment (tools live in the global host layer); in the `web` profile the mount is what
-  delivers the tools. Because the async setup adds latency, the `input` op waits for the agent to be
-  registered before `followup`, or the initial prompt races ahead and is dropped.
+- **On the MINIMAL profile the tools come from base's GLOBAL host layer, and the `agentPresets`
+  mount failing is EXPECTED** (XERK-498). The driver's setup calls `ctx.get('agentPresets').mount(
+  agentCtx)`, which succeeds on the `web` profile (where a roster delivers the tools) but is ABSENT
+  on the minimal `[base, driver]` profile — `agent-presets` was a `dsh-web-app` plugin. That is
+  fine: a rosterless deployment gets its tools (bash/edit/read/str_replace_editor/web/subagent/…)
+  from `@deepseek-ai/dsh-base`'s global layer, verified against real dsh (a `bash` `tool/call` ran on
+  the minimal profile). The mount is tolerated ONLY for the rosterless case; never make a mount
+  failure fatal, or the minimal profile has no agent. Because the async setup adds latency, the
+  `input` op waits for the agent to be registered before `followup`, or the initial prompt races
+  ahead and is dropped.
 - **The native event log lives under `<tid>/dsh/`, NOT the worktree** (XERK-469 [E]): the raw
   archive layer excludes the worktree, so a log there is D3's canonical record retained by nothing.
   `_launch_dsh` writes `TURMA_DSH_EVENTS` to `<PROJECTS_ROOT>/<slug>/<claude_sid>/dsh/events.jsonl`;
@@ -160,11 +162,23 @@ runtime-independent and already worked — `_peer_rows`/`_write_peers_file` list
   THEN displaces it and installs Turma's (which can't make apiproxy throw, its apply having
   completed). A headless profile with no incumbent registers directly after a grace window. Turma
   owns HITL; the dsh web UI is a read-only viewer.
-- **Persistence keeps the web-app loaded.** `dsh-app-boot` exits after boot with no "app", so
-  removing `dsh-web-app` makes the process die (tearing down the socket). `_launch_dsh` runs
-  `dsh --profile web --no-open --port` — the web-app stays for persistence (a loopback web server
-  per session, unexposed), and the driver owns HITL over it. A single host-wide read-only viewer is
-  a follow-up.
+- **Persistence is the DRIVER'S control socket, NOT a per-session web server** (XERK-498). The
+  per-session process boots a MINIMAL profile — `@deepseek-ai/dsh-base` + the driver, built fresh by
+  `_ensure_dsh_profile` (package.json bundles written directly, no pnpm, base resolves from the dsh
+  install) — and `_launch_dsh` runs bare `dsh --profile <DSH_PROFILE>` with NO `--no-open`/`--port`.
+  The driver's own `net.createServer().listen(<sock>)` is a ref'd libuv handle that holds the event
+  loop open; nothing else has to. This REPLACES the old `dsh --profile web` (the web-app's webserver
+  was the only reason `--profile web` provided persistence — a full loopback web server per session).
+  Verified end to end against real dsh 0.1.1-rc.2: process alive, socket bound, `agentUp:true`, a
+  real bash tool call completed, and NO port bound. The old "removing `dsh-web-app` makes the process
+  die" observation was really the DRIVER exiting(1) because removing web-app also removed
+  `agent-presets` (its tools) — kept apart here, base carries the tools (next pitfall).
+  - **The host-wide read-only viewer is the Turma-native Trajectory view** (over the D3 native log,
+    `.claude/rules/turma-sessions.md`), NOT a `dsh web` proxied through the tunnel: `dsh web` has no
+    base-path flag (only `--host`/`--port`/`--trusted-host`/`--no-open`), so it cannot be sub-path
+    -proxied per host under one domain the way ttyd's `-b /term/<id>` allows. The dsh-web fallback in
+    `docs/dsh-session-lifecycle.md` is superseded by that blocker; Q1 (dsh web CAN list foreign
+    sessions off the shared store) is moot against it.
 - **Profile prep is off the beat.** `_ensure_dsh_profile` (npm/dsh setup) is primed on a worker
   thread at startup when `dsh_configured()`; `_launch_dsh` only reads the cached `_dsh_profile_ready`
   and refuses if not ready — it never runs the heavy setup on the beat (XERK-395).

@@ -552,3 +552,50 @@ test("listRawFiles and rawFileFor read the layer back", () => {
   assert.equal(archive.rawFileFor("raw7", "nope.jsonl"), null);
   assert.equal(archive.listRawFiles("never-seen"), null);
 });
+
+test("dshTrajectory parses the D3 native log into turns/steps/tool-calls/tokens (XERK-498)", () => {
+  seedRaw("dshtraj");
+  const events = [
+    { type: "session/title", seq: 1, time: 1000, data: { title: "my dsh session" } },
+    { type: "turn/start", seq: 2, time: 1000, data: { turn: 1 } },
+    { type: "step/start", seq: 3, time: 1000, data: { turn: 1, step: 1 } },
+    { type: "assistant/chunk", seq: 4, time: 1100, data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 120, outputTokens: 8 } } } },
+    { type: "assistant/message", seq: 5, time: 1100, data: { turn: 1, step: 1, message: { source: { model: "deepseek-v4-flash" } } } },
+    { type: "tool/call", seq: 6, time: 1100, data: { turn: 1, step: 1, callId: "c1", name: "bash", arguments: { command: "echo hi" } } },
+    { type: "tool/result", seq: 7, time: 1150, data: { turn: 1, step: 1, message: { source: { callId: "c1" }, content: [{ type: "tool-result", toolCallId: "c1", isError: false }] } } },
+    { type: "step/start", seq: 75, time: 1200, data: { turn: 1, step: 2 } },
+    { type: "tool/call", seq: 8, time: 1200, data: { turn: 1, step: 2, callId: "c2", name: "str_replace_editor", arguments: {} } },
+    { type: "tool/result", seq: 9, time: 1260, data: { turn: 1, step: 2, message: { source: { callId: "c2" }, content: [{ type: "tool-result", toolCallId: "c2", isError: true }] } } },
+    { type: "turn/end", seq: 10, time: 1300, data: { turn: 1, reason: { kind: "completed" } } },
+  ].map((e) => JSON.stringify(e)).join("\n") + "\n";
+  archive.ingestRaw("nas", "dshtraj", "dshtraj/dsh/events.jsonl", 0, Buffer.from(events, "utf8"));
+  const t = archive.dshTrajectory("dshtraj");
+  assert.equal(t.title, "my dsh session");
+  assert.equal(t.model, "deepseek-v4-flash");
+  assert.equal(t.totals.turns, 1);
+  assert.equal(t.totals.steps, 2);
+  assert.equal(t.totals.toolCalls, 2);
+  assert.equal(t.totals.errors, 1);          // one tool-result carried isError
+  assert.equal(t.totals.tokens.input, 120);
+  assert.equal(t.totals.tokens.output, 8);
+  assert.equal(t.durationMs, 300);           // 1300 - 1000
+  const turn = t.turns[0];
+  assert.equal(turn.turn, 1);
+  assert.equal(turn.reason, "completed");
+  assert.equal(turn.calls.length, 2);
+  const bash = turn.calls.find((c) => c.name === "bash");
+  assert.equal(bash.ok, true);
+  assert.equal(bash.durationMs, 50);         // 1150 - 1100
+  const edit = turn.calls.find((c) => c.name === "str_replace_editor");
+  assert.equal(edit.ok, false);
+  assert.equal(edit.error, true);
+  assert.ok(bash.args.includes("echo hi"));
+  assert.equal(t.truncated, false);
+});
+
+test("dshTrajectory returns null when a session has no dsh native log (XERK-498)", () => {
+  seedRaw("nodsh");
+  archive.ingestRaw("nas", "nodsh", "nodsh.jsonl", 0, Buffer.from("x"));
+  assert.equal(archive.dshTrajectory("nodsh"), null);
+  assert.equal(archive.dshTrajectory("never-seen-at-all"), null);
+});

@@ -452,6 +452,25 @@ so the Claude-inbox protocol and the crossSessionInbound policy stay in ONE Pyth
 - Both events STAGE on the reader thread and DELIVER off the beat on a worker (a callback may not
   socket-write to another session). Mechanics + pitfalls: `.claude/rules/dsh-input.md`.
 
+## XERK-498 shipped: drop the per-session terminal/web-server; Turma-native Trajectory viewer
+
+The per-session dsh "terminal" (raw stdout of a headless process) and the `dsh --profile web` it ran
+(a loopback web server per session, kept alive purely for persistence) are both gone. Three
+invariants a change must not undo; mechanics in `.claude/rules/dsh-input.md` + `turma-sessions.md`:
+
+- **Per-session dsh runs a MINIMAL `[dsh-base, driver]` profile, not `--profile web`.** The driver's
+  own listening control socket is the keep-alive; `_launch_dsh` runs bare `dsh --profile <DSH_PROFILE>`
+  with no `--no-open`/`--port` and allocates no port. Tools come from base's global layer.
+- **No ttyd for a dsh session** — `_launch_ttyd` early-returns on `agentType=="dsh"`, the ONE choke
+  point covering every launch path. The chat header hides "Terminal ▸" and shows "Trajectory ▸".
+- **The host-wide viewer is Turma-native, over the D3 native log — NOT a proxied `dsh web`.** `dsh
+  web` has no base-path flag, so it can't be sub-path-proxied per host the way ttyd's `-b` allows (Q1
+  — that dsh web CAN list foreign sessions off the shared store — is real but moot against that
+  blocker). `archive.dshTrajectory` parses the log the raw archive already holds (`<tid>/dsh/*.jsonl`,
+  XERK-469) into turns/steps/tool-calls/tokens/timings, served by `GET /api/dsh/<tid>/trajectory`.
+  Web-first; Android/glasses in `android/PARITY.md`. Tests: `dshTrajectory` in `archive.test.js`,
+  the `/api/dsh/<id>/trajectory` case in `server.test.js`.
+
 ## Open questions flagged to Malcolm (recorded on XERK-462)
 
 1. **Resource + retention sizing.** Is adding dsh's node/npm tree to the native install

@@ -476,6 +476,14 @@ those are marked `[MODEL]`.
   glance at the list says which sessions are on the weaker model without opening each one. Read
   `session.modelSource == "local"`, titled with `modelSourceAt`. Both fields already decode onto
   `SessionInfo`.
+- **P2 dsh Trajectory view, and no terminal for dsh (XERK-498).** The web hides the "Terminal ▸"
+  toggle for a dsh session (it is headless — no ttyd) and shows "Trajectory ▸" instead: a read-only
+  render of the dsh D3 native event log (turns/steps/tool-calls/tokens/timings) from `GET
+  /api/dsh/<transcriptId>/trajectory`. Android's `TerminalScreen` still offers a terminal for every
+  session; for a dsh session it should be suppressed (there is nothing to attach to) and, ideally,
+  replaced with the same Trajectory view. The endpoint is platform-agnostic JSON, so the port is a
+  screen that fetches + renders it; suppressing the terminal entry for `agentType == "dsh"` is the
+  minimum. Glasses (`hub-client.ts`) likewise still exposes the terminal for dsh — same suppression.
 - ~~P2 dsh runtime badge on session CARDS (XERK-465 remainder).~~ Done (XERK-477, see Done below):
   the web's `⚙ dsh` chip on live and ended session cards, so a glance says which sessions run on dsh.
 - ~~P2 board ticket "Runtime" row (XERK-473 → XERK-477).~~ Done (XERK-477, see Done below): the board
