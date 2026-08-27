@@ -16501,6 +16501,42 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         sm.registry = [{"id": "s", "worktreePath": wt, "status": "stopped"}]
         self.assertEqual(len(sm._archive_manifest()), 1)
 
+    def test_manifest_keeps_a_running_dsh_session_so_its_trajectory_populates(self):
+        # A RUNNING dsh session is the exception to the running-slug exclusion
+        # (XERK-498): its native event log is the only viewer a headless dsh
+        # session has, and the in-dashboard Trajectory reads that log back through
+        # the raw archive layer — so it MUST sync while running, or the Trajectory
+        # 404s for the whole life of the session. Excluding it (as the test above
+        # does for a claude session) is exactly what broke the feature.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/dshlive"
+        slug = self._write_transcript(wt, "d1.jsonl", [_text_entry("u1", "user", "hi")])
+        # The native event log the Trajectory reads, under <tid>/dsh/ (XERK-469).
+        store = os.path.join(ha.PROJECTS_ROOT, slug, "d1", ha.DSH_STORE_DIRNAME)
+        os.makedirs(store, exist_ok=True)
+        with open(os.path.join(store, "events.jsonl"), "w", encoding="utf-8") as f:
+            f.write('{"type":"turn/start","seq":1,"time":1000,"data":{"turn":1}}\n')
+        self._ledger(sm, wt)
+        sm.registry = [{"id": "s", "worktreePath": wt, "status": "running",
+                        "agentType": "dsh"}]
+        manifest = sm._archive_manifest()
+        self.assertEqual(len(manifest), 1)
+        m = manifest[0]
+        self.assertEqual(m["transcriptId"], "d1")
+        # The native log rides the raw layer, keyed on the <tid>/dsh/ path the
+        # Trajectory route matches (turma/archive.js dshEventsFile).
+        rels = {rel for rel, _ in (m.get("rawFiles") or [])}
+        self.assertIn("d1/dsh/events.jsonl", rels)
+        # A running CLAUDE session in another slug is still excluded.
+        claude_wt = "/w/.turma/worktrees/Turma/cc"
+        self._write_transcript(claude_wt, "c1.jsonl", [_text_entry("u2", "user", "hi")])
+        sm.usage_ledger[claude_wt] = {"repo": "Turma",
+                                      "remote": "git@github.com:xerk/Turma.git",
+                                      "slug": ha._project_slug(claude_wt)}
+        sm.registry.append({"id": "c", "worktreePath": claude_wt, "status": "running"})
+        got = {m["transcriptId"] for m in sm._archive_manifest()}
+        self.assertEqual(got, {"d1"})
+
     # --- the manifest WINDOW (XERK-424) ---------------------------------
 
     def _many_transcripts(self, sm, n, wt="/w/.turma/worktrees/Turma/win"):
