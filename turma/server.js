@@ -8538,6 +8538,22 @@ const server = http.createServer(async (req, res) => {
         .pipe(res);
     }
 
+    // GET /api/dsh/<transcriptId>/trajectory — the Turma-native read-only
+    // Trajectory over a dsh session's D3 NATIVE event log (XERK-498), parsed
+    // server-side from the raw archive layer into turns/steps/tool-calls/
+    // token-usage/timings. This is the host-wide dsh viewer that replaces the
+    // removed per-session dsh terminal; it needs no host proxy and no dsh web
+    // server because the native log already rides the raw archive (XERK-469).
+    // JSON and bounded (archive.js); nothing raw is returned. A non-dsh (or
+    // not-yet-archived) session answers 404 — the client shows "no trajectory".
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "dsh" &&
+        parts[3] === "trajectory" && parts.length === 4) {
+      const transcriptId = decodeURIComponent(parts[2]);
+      const traj = archive.dshTrajectory(transcriptId);
+      if (!traj) return json(res, 404, { error: "no dsh trajectory for this session" });
+      return json(res, 200, traj);
+    }
+
     // POST /api/agents/<host>/clone — queue a clone into the host's repos
     // root. Body: {repo, source?} — repo is owner/repo or a GitHub URL, and
     // source ("github"/"azure"/"gitlab", XERK-155) says which listing the pick

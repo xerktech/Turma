@@ -2251,6 +2251,34 @@ test("http: a raw push is agent-authed and lands byte for byte", async () => {
   assert.equal((await request("GET", "/api/archive/tr1/raw/nope.jsonl", { headers: userHeaders })).status, 404);
 });
 
+test("http: GET /api/dsh/<id>/trajectory parses the native log (XERK-498)", async () => {
+  // tr1's row/canonical file exist from the raw-push test above; add its dsh
+  // native event log and read the Trajectory back through the route.
+  const events = [
+    '{"type":"session/title","seq":1,"time":1000,"data":{"title":"trajectory session"}}',
+    '{"type":"turn/start","seq":2,"time":1000,"data":{"turn":1}}',
+    '{"type":"step/start","seq":3,"time":1000,"data":{"turn":1,"step":1}}',
+    '{"type":"assistant/chunk","seq":4,"time":1100,"data":{"turn":1,"step":1,"chunk":{"type":"usage","usage":{"inputTokens":50,"outputTokens":5}}}}',
+    '{"type":"tool/call","seq":5,"time":1100,"data":{"turn":1,"step":1,"callId":"c1","name":"bash","arguments":{"command":"ls"}}}',
+    '{"type":"tool/result","seq":6,"time":1140,"data":{"turn":1,"step":1,"message":{"source":{"callId":"c1"},"content":[{"type":"tool-result","toolCallId":"c1","isError":false}]}}}',
+    '{"type":"turn/end","seq":7,"time":1200,"data":{"turn":1,"reason":{"kind":"completed"}}}',
+  ].join("\n") + "\n";
+  const push = await rawPush("nas", "tr1", "tr1/dsh/events.jsonl", 0, gz(events), agentHeaders);
+  assert.equal(push.status, 200);
+  // User-authed like the archive reads; anonymous is refused.
+  assert.equal((await request("GET", "/api/dsh/tr1/trajectory")).status, 401);
+  const r = await request("GET", "/api/dsh/tr1/trajectory", { headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.title, "trajectory session");
+  assert.equal(r.body.totals.turns, 1);
+  assert.equal(r.body.totals.toolCalls, 1);
+  assert.equal(r.body.totals.tokens.input, 50);
+  assert.equal(r.body.turns[0].calls[0].name, "bash");
+  assert.equal(r.body.turns[0].calls[0].ok, true);
+  // A session with no dsh native log answers 404 — the client shows "no trajectory".
+  assert.equal((await request("GET", "/api/dsh/nope/trajectory", { headers: userHeaders })).status, 404);
+});
+
 test("http: a full chunk of INCOMPRESSIBLE bytes still fits the wire cap", async () => {
   // gzip EXPANDS incompressible input, so a wire cap equal to the chunk size made
   // any session file holding a full chunk of already-compressed bytes impossible

@@ -41,8 +41,9 @@ Fleet Hub to a local per-session socket.
 - **Headless.** The dsh process runs with no interactive terminal a person types into. `paneBusy`,
   `panePrompt`, `_busy_from_capture`, `set_mode` and `tmux send-keys` **do not apply to a dsh
   session** — there is no Claude-style pane to parse. Liveness/"busy" comes from the dsh event log
-  over the control socket (see the "Working" note below). A ttyd MAY still attach to the dsh tmux to
-  show the process's raw stdout/logs for debugging, but it is not an input surface.
+  over the control socket (see the "Working" note below). **No ttyd attaches to a dsh session**
+  (XERK-498, shipped): the tmux shows only raw stdout, never an input surface, so the per-session
+  terminal was dropped for the host-wide Trajectory viewer (see the follow-up note below).
 - **The dsh process loads a Turma-local driver plugin** (`@turma/dsh-session-driver`, derived from
   `poc/turma-2.0-poc/fleet-agent-plugin`, with the Fleet-Hub WebSocket client replaced by a local
   UNIX-socket server). On load it:
@@ -160,9 +161,14 @@ dsh call is made.
 - **The driver plugin ships in the agent image** (a Dockerfile/toolchain add — node + dsh + the
   plugin). Image/resource sizing is the DockerOps follow-up already flagged as ADR Q1.
 - **`_session_transcript_path` is unchanged** — the projection is named by the pinned id (D3).
-- **Host-wide read-only `dsh web`** over the shared retained event store is a per-host viewer link,
-  built after the lifecycle lands; verify `dsh web` renders sessions it did not create in-process,
-  else fall back to a Turma-native Trajectory view over the D3 logs.
+- **Host-wide read-only viewer — SHIPPED as the Turma-native Trajectory view** (XERK-498), NOT a
+  `dsh web`. The `dsh web` path was ruled out: it has no base-path flag, so it cannot be
+  sub-path-proxied per host under one hub domain the way ttyd's `-b /term/<id>` allows (its Q1
+  ability to list foreign sessions off the shared store is real but moot against that blocker).
+  Instead `archive.dshTrajectory` parses the D3 native log the raw archive already holds
+  (`<tid>/dsh/*.jsonl`) into turns/steps/tool-calls/tokens/timings, served by
+  `GET /api/dsh/<tid>/trajectory` and rendered read-only in the Sessions page. See
+  `.claude/rules/dsh.md` (XERK-498) and `.claude/rules/turma-sessions.md`.
 
 ## Build sequencing (why this is a design PR, not the launcher yet)
 

@@ -105,6 +105,17 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
 - The raw ttyd terminal stays one **"Terminal ▸" toggle** away in the chat header (`#termPane`
   iframe). `GET /api/ws-token` also authenticates the web chat's `/live` socket. Tests:
   `chat.test.js`.
+- **A dsh session is HEADLESS — it hides "Terminal ▸" and shows "Trajectory ▸" instead** (XERK-498):
+  a Turma-native read-only view (`#trajPane`, `renderTrajectory`) over the dsh D3 NATIVE event log,
+  which the raw archive layer already holds (`<tid>/dsh/*.jsonl`, XERK-469). `chatToTrajectory` fetches
+  `GET /api/dsh/<transcriptId>/trajectory` (parsed server-side by `archive.dshTrajectory` into
+  turns/steps/tool-calls/token-usage/timings — the richer telemetry the S1 projection flattens) and
+  renders newest-turn-first. This REPLACES the removed per-session dsh terminal/web-server; there is
+  no ttyd or dsh web server for a dsh session. A running session's log syncs to the archive within a
+  few beats, so a just-opened dsh session may 404 until the first sync (the pane says so, ↻ Refresh).
+  The dsh-web-through-tunnel path was ruled out — `dsh web` has no base-path flag, so it cannot be
+  sub-path-proxied per host. Web-first; Android (`TerminalScreen`) + glasses in `android/PARITY.md`.
+  Tests: the `dshTrajectory` cases in `archive.test.js`, `/api/dsh/<id>/trajectory` in `server.test.js`.
 
 ### The model and mode chips
 

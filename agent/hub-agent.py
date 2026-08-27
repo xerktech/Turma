@@ -1116,7 +1116,21 @@ LOCAL_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,60}$")
 # DSH_* vars. The API key rides an ENV VAR NAME (apiKeyEnv), so no secret is
 # written into the profile on disk.
 DSH_HOME = os.environ.get("DSH_HOME") or os.path.join(REGISTRY_DIR, "dsh-home")
-DSH_PROFILE = os.environ.get("DSH_PROFILE", "web")
+# The per-session dsh profile is MINIMAL: `@deepseek-ai/dsh-base` + the Turma
+# driver, and deliberately NOT `@deepseek-ai/dsh-web-app` (XERK-498). The old
+# per-session `--profile web` ran a full loopback web SERVER per session purely
+# to keep the headless process alive; the driver's own control socket
+# (a listening UNIX server = a ref'd libuv handle) holds the event loop open
+# instead, so no per-session web server or port is allocated. Tools come from
+# base's global host layer (a rosterless deployment — `agent-presets`/the mount
+# is a web-app concern), verified end to end against real dsh 0.1.1-rc.2.
+DSH_PROFILE = os.environ.get("DSH_PROFILE", "turma")
+# The ONE host-wide read-only viewer profile (XERK-498): a single long-running
+# `dsh --profile web` per host, over the SHARED DSH_HOME/sessions store, exposed
+# through the tunnel once per host. dsh-session-query.listSessions() reads that
+# store off disk, so this viewer renders sessions every per-session dsh process
+# created — the dsh-web path the lifecycle doc left to verify, now confirmed.
+DSH_VIEWER_PROFILE = os.environ.get("DSH_VIEWER_PROFILE", "web")
 # The provider ROUTE key == agentOptions.provider the driver passes per session.
 DSH_PROVIDER = os.environ.get("DSH_PROVIDER", "turma-dsh")
 DSH_MODEL = (os.environ.get("DSH_MODEL")
@@ -1129,9 +1143,11 @@ DSH_MODEL_CONTEXT = int(os.environ.get("DSH_MODEL_CONTEXT")
 # The built driver plugin (agent/dsh-session-driver/dist), installed into the
 # profile as a bundle by _ensure_dsh_profile.
 DSH_PLUGIN_DIR = os.path.join(_AGENT_DIR, "dsh-session-driver")
-# Per-session dsh web port (headless: --no-open); allocated like a ttyd port so
-# concurrent dsh sessions never collide. The web UI is not an input surface here.
-DSH_WEB_PORT_BASE = int(os.environ.get("DSH_WEB_PORT_BASE", "7900"))
+# The loopback port the ONE host-wide read-only dsh viewer binds (XERK-498).
+# Not per session any more — a single viewer serves the whole host over the
+# shared store, exposed through the tunnel like ttyd but once per host.
+DSH_VIEWER_PORT = int(os.environ.get("DSH_VIEWER_PORT")
+                      or os.environ.get("DSH_WEB_PORT_BASE") or "7900")
 # Where per-session control sockets live: ~/.turma/dsh/<id>.sock, under the
 # agent-owned ~/.turma the guard already governs — never a worktree.
 DSH_SOCKET_DIR = os.path.join(REGISTRY_DIR, "dsh")
@@ -12649,19 +12665,33 @@ class SessionManager:
         env = dict(os.environ, DSH_HOME=DSH_HOME)
         profile_dir = os.path.join(DSH_HOME, "profiles", DSH_PROFILE)
         try:
-            os.makedirs(DSH_HOME, exist_ok=True)
-            # 1. Scaffold the profile (booting any dsh command creates it).
-            r = subprocess.run(
-                [DSH_BIN, "--profile", DSH_PROFILE, "--dump-default-config"],
-                env=env, capture_output=True, text=True, timeout=120)
-            if r.returncode != 0 or not os.path.isdir(profile_dir):
-                log(f"dsh: could not scaffold profile under {DSH_HOME} "
-                    f"(is dsh installed?): {(r.stderr or '').strip()[:200]}")
-                return None
+            os.makedirs(profile_dir, exist_ok=True)
+            # 1. Build the MINIMAL per-session profile from scratch (XERK-498):
+            # `@deepseek-ai/dsh-base` + the Turma driver ONLY, never
+            # `@deepseek-ai/dsh-web-app`. The driver is a bundle (it declares
+            # dsh.bundle); the guard is NOT — it is INSERTed via cordis.patch.yml.
+            # We write the two profile files DIRECTLY rather than `dsh plugin add`
+            # (which needs pnpm on PATH); the base bundle resolves from the dsh
+            # installation, and the local plugins are npm-installed below. No
+            # `--dump-default-config` scaffold: that only works for a profile dsh
+            # already ships (web/headless), and the whole point is a fresh one.
+            pkg_path = os.path.join(profile_dir, "package.json")
+            with open(pkg_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "name": f"dsh-profile-{DSH_PROFILE}",
+                    "private": True,
+                    "dsh": {"profile": {"bundles": [
+                        "@deepseek-ai/dsh-base", "@turma/dsh-session-driver"]}},
+                }, f, indent=2)
+                f.write("\n")
+            with open(os.path.join(profile_dir, "pnpm-workspace.yaml"), "w",
+                      encoding="utf-8") as f:
+                f.write("packages:\n  - .\n\n"
+                        "nodeLinker: hoisted\nautoInstallPeers: false\n")
             # 2. Install the built driver plugin AND the safety guard (XERK-470
-            # [F]) into the profile as bundles. A dsh runtime without the guard
-            # is the not-shippable state [F] gates against, so the launcher MUST
-            # compose it — this is where.
+            # [F]) into the profile. A dsh runtime without the guard is the
+            # not-shippable state [F] gates against, so the launcher MUST compose
+            # it — this is where.
             guard_cfg = self._dsh_guard_config()
             # Install BOTH local packages in ONE npm command: a second sequential
             # `npm install <localdir>` drops the first's dependency entry, so the
@@ -12675,24 +12705,7 @@ class SessionManager:
                 log(f"dsh: installing the driver + guard plugins failed: "
                     f"{(r.stderr or '').strip()[:200]}")
                 return None
-            # 3. Register both in dsh.profile.bundles (idempotent).
-            pkg_path = os.path.join(profile_dir, "package.json")
-            with open(pkg_path, encoding="utf-8") as f:
-                pkg = json.load(f)
-            bundles = (pkg.setdefault("dsh", {}).setdefault("profile", {})
-                       .setdefault("bundles", []))
-            # The driver is a bundle (it declares dsh.bundle); the guard is NOT —
-            # it is INSERTed via cordis.patch.yml (see _dsh_cordis_patch), so only
-            # the driver goes in dsh.profile.bundles.
-            changed = False
-            if "@turma/dsh-session-driver" not in bundles:
-                bundles.append("@turma/dsh-session-driver")
-                changed = True
-            if changed:
-                with open(pkg_path, "w", encoding="utf-8") as f:
-                    json.dump(pkg, f, indent=2)
-                    f.write("\n")
-            # 4. Write the profile patch (driver entry + pi-ai route + default +
+            # 3. Write the profile patch (driver entry + pi-ai route + default +
             # the guard, configured with the host-fixed deny/allow policy).
             base_url = DSH_MODEL_BASE_URL.rstrip("/")
             if not base_url.endswith("/v1"):
@@ -12710,25 +12723,17 @@ class SessionManager:
             f"(provider {DSH_PROVIDER}, model {DSH_MODEL})")
         return DSH_PROFILE
 
-    def _alloc_dsh_port(self):
-        """A free per-session dsh web port (headless `--no-open`), allocated like
-        a ttyd port so concurrent dsh sessions never collide."""
-        used = {s.get("dshPort") for s in self.registry if s.get("dshPort")}
-        p = DSH_WEB_PORT_BASE
-        while p in used or _port_open(p):
-            p += 1
-        return p
-
     def _launch_dsh(self, sess, resume=False, prompt=None, resume_id=None):
         """Launch a session on the dsh runtime: a headless per-session dsh process
         in the session's own tmux, driven over a per-session UNIX control socket
         (XERK-466 [B] process model, XERK-467 [C] I/O). Replaces [A]'s placeholder.
 
         Mirrors _launch_tmux's shape — a pinned conversation id (which names the
-        projection transcript), the new-work / ticket-branch / peers directive, a
-        ttyd for a debug view of dsh's stdout — but dsh has NO pane: input,
-        answers and liveness ride the control socket, and the transcript is a
-        projection of dsh's own event log (dsh_session.py + [S1]).
+        projection transcript), the new-work / ticket-branch / peers directive —
+        but dsh has NO pane and (XERK-498) NO per-session ttyd or web server:
+        input, answers and liveness ride the control socket, and the transcript
+        is a projection of dsh's own event log (dsh_session.py + [S1]). A single
+        host-wide read-only `dsh web` viewer serves observation instead.
 
         Raises RuntimeError on a hard failure, like _launch_tmux, so the caller's
         error handling (provision's _set_error, the resume paths) marks the
@@ -12844,13 +12849,13 @@ class SessionManager:
                     f.write(f"export {k}={shlex.quote(str(v))}\n")
         except OSError as e:
             raise RuntimeError(f"dsh env file: {e}")
-        # 5. A per-session dsh web port (headless: --no-open) + the launch.
-        dsh_port = self._alloc_dsh_port()
-        sess["dshPort"] = dsh_port
+        # 5. Launch the minimal profile (XERK-498): NO `--no-open`/`--port` —
+        # those are dsh-web-app flags, and this profile has no web app. The
+        # driver's control socket keeps the headless process alive; the process
+        # binds no network port at all.
         dsh_cmd = (
             f"set -a; . {shlex.quote(env_file)}; set +a; "
-            + shlex.join([DSH_BIN, "--profile", profile, "--no-open",
-                          "--port", str(dsh_port)]))
+            + shlex.join([DSH_BIN, "--profile", profile]))
         run(["tmux", "kill-session", "-t", sess["tmuxName"]])
         rc, err = run_ok([
             "tmux", "new-session", "-d", "-s", sess["tmuxName"],
@@ -13250,7 +13255,16 @@ class SessionManager:
         tunnel-agent the hub drives), interactive (-W), scoped to base path
         /term/<id> so ttyd's own asset/WS URLs resolve behind the hub prefix,
         JBMNerd font + canvas renderer + disableLeaveAlert for the TUI, and
-        basic auth (-c) keyed off the shared agent token as defense in depth."""
+        basic auth (-c) keyed off the shared agent token as defense in depth.
+
+        A dsh session gets NO ttyd (XERK-498): it is headless, so its tmux shows
+        only raw dsh stdout/logs — never an input surface — and the per-session
+        "Terminal ▸" view it fed is dropped in favour of one host-wide read-only
+        dsh viewer. Guarding here (the ONE ttyd choke point) covers every launch
+        path — spawn/provision, resume, restart, resume-on-boot — with one rule,
+        so no dsh session ever allocates or adopts a ttyd."""
+        if sess.get("agentType") == "dsh":
+            return
         proc = self.ttyd.get(sess["id"])
         if proc is not None and proc.poll() is None:
             return  # already serving (e.g. an in-process restart keeps ttyd up)
