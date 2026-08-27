@@ -2,6 +2,9 @@ package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.DshInfo
+import com.xerktech.turma.model.LocalModelInfo
+import com.xerktech.turma.model.LocalModelOption
+import com.xerktech.turma.model.SessionInfo
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -47,5 +50,63 @@ class RuntimeTest {
         assertEquals(false, Runtime.hostDsh(agents, "a")?.available)
         assertEquals(true, Runtime.hostDsh(agents, "b")?.available)
         assertNull(Runtime.hostDsh(agents, "missing"))
+    }
+
+    // ---- the unified Runtime picker (XERK-503) -------------------------------
+
+    @Test fun `composerRuntimes offers only the runtimes the host reports`() {
+        // Plain subscription host -> just Claude Code (the caller then hides the
+        // one-option picker).
+        assertEquals(listOf("claude"), Runtime.composerRuntimes(null, null).map { it.first })
+        // A local endpoint adds "Claude Code Local".
+        assertEquals(
+            listOf("claude" to "Claude Code", "local" to "Claude Code Local"),
+            Runtime.composerRuntimes(LocalModelInfo(available = true), null),
+        )
+        // dsh adds "dsh"; both present -> all three, in order.
+        assertEquals(
+            listOf("claude", "local", "dsh"),
+            Runtime.composerRuntimes(LocalModelInfo(available = true), DshInfo(available = true))
+                .map { it.first },
+        )
+        // A non-available block does not add its row.
+        assertEquals(
+            listOf("claude"),
+            Runtime.composerRuntimes(LocalModelInfo(available = false), DshInfo(available = false))
+                .map { it.first },
+        )
+    }
+
+    @Test fun `a chosen runtime maps onto the agentType and modelSource wire fields`() {
+        // Claude Code: nothing sent (bare spawn unchanged).
+        assertNull(Runtime.spawnAgentType("claude"))
+        assertNull(Runtime.spawnModelSource("claude"))
+        // Claude Code Local: modelSource local, still a claude agent.
+        assertNull(Runtime.spawnAgentType("local"))
+        assertEquals("local", Runtime.spawnModelSource("local"))
+        // dsh: agentType dsh, no modelSource.
+        assertEquals("dsh", Runtime.spawnAgentType("dsh"))
+        assertNull(Runtime.spawnModelSource("dsh"))
+    }
+
+    // ---- dsh model list (XERK-503/504) ---------------------------------------
+
+    @Test fun `dsh model helpers mirror the local ones over the discovered set`() {
+        val dsh = DshInfo(
+            available = true, defaultModel = "deepseek-chat",
+            models = listOf(
+                LocalModelOption("deepseek-chat", 128000),
+                LocalModelOption("qwen3-coder", 32768),
+            ),
+        )
+        assertTrue(Runtime.dshModelPickable(dsh))
+        assertFalse(Runtime.dshModelPickable(DshInfo(available = true, models = emptyList())))
+        // Options are "id · Nk".
+        assertEquals(listOf("deepseek-chat", "qwen3-coder"), Runtime.dshOptions(dsh).map { it.first })
+        assertEquals("qwen3-coder · 33k", Runtime.dshOptions(dsh)[1].second)
+        // The session's own model wins over the host default.
+        assertEquals("qwen3-coder", Runtime.currentDshModel(SessionInfo(id = "s", model = "qwen3-coder"), dsh))
+        assertEquals("deepseek-chat", Runtime.currentDshModel(SessionInfo(id = "s", model = ""), dsh))
+        assertEquals("deepseek-chat · 128k", Runtime.dshModelLabel(SessionInfo(id = "s", model = "deepseek-chat"), dsh))
     }
 }

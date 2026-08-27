@@ -212,6 +212,7 @@ class HubHarness : ExternalResource() {
         fun fleetJson(
             host: String = "nas01",
             localModel: String? = null,
+            dsh: String? = null,
             sessions: String = "",
             repo: String = "Turma",
             now: Long = 1,
@@ -220,6 +221,7 @@ class HubHarness : ExternalResource() {
               "online": true, "terminalOnline": true,
               "repos": [ { "name": "$repo", "lastActivity": "2026-08-12T00:00:00Z" } ],
               ${if (localModel != null) "\"localModel\": $localModel," else ""}
+              ${if (dsh != null) "\"dsh\": $dsh," else ""}
               "sessions": [ $sessions ] } ] }
         """.trimIndent()
     }

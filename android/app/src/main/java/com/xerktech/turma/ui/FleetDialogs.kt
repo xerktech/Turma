@@ -67,12 +67,14 @@ fun SpawnDialog(
     var prompt by remember { mutableStateOf("") }
     var label by remember { mutableStateOf("") }
     var baseRef by remember { mutableStateOf("") }
-    var model by remember { mutableStateOf("default") }
+    var model by remember { mutableStateOf("default") }   // Claude alias
     var mode by remember { mutableStateOf("auto") }
-    var modelSource by remember { mutableStateOf(ModelSource.SUBSCRIPTION) }
-    var agentType by remember { mutableStateOf(Runtime.CLAUDE) }
-    val sourceOpts = remember(localModel) { ModelSource.options(localModel) }
-    val runtimeOpts = remember { Runtime.options() }
+    // ONE Runtime picker (XERK-503) collapses the old Runtime + "Run against" pair
+    // into "Claude Code" / "Claude Code Local" / "dsh"; each maps onto the existing
+    // agentType/modelSource wire fields at spawn (Runtime.spawn*). Shown only when
+    // the host offers more than one runtime.
+    val runtimeOpts = remember(localModel, dsh) { Runtime.composerRuntimes(localModel, dsh) }
+    var runtime by remember { mutableStateOf(Runtime.CLAUDE) }
     // The chosen endpoint model for a LOCAL spawn (XERK-489), defaulting to the
     // host default. The context override is web-only for now (see PARITY.md).
     val localOpts = remember(localModel) { ModelSource.localOptions(localModel) }
@@ -81,18 +83,21 @@ fun SpawnDialog(
             localOpts.firstOrNull()?.first ?: ""
         })
     }
-    // Never keep a choice the operator can no longer see. If the host stops
-    // reporting a local model while the composer is open, the "Run against" row
-    // disappears — and a `local` left behind in state would spawn into a
-    // guaranteed 409 with nothing on screen explaining it or able to change it.
-    LaunchedEffect(localModel?.available) {
-        if (!ModelSource.composerOffers(localModel)) modelSource = ModelSource.SUBSCRIPTION
+    // The chosen dsh model (XERK-503): the SAME discovered list a local session
+    // gets when both point at one LiteLLM URL — a dsh session is no longer locked
+    // to one model.
+    val dshOpts = remember(dsh) { Runtime.dshOptions(dsh) }
+    var dshModelId by remember(dsh) {
+        mutableStateOf(Runtime.currentDshModel(null, dsh).ifBlank {
+            dshOpts.firstOrNull()?.first ?: ""
+        })
     }
-    // Same for the runtime: if the host stops offering dsh while the composer is
-    // open, the "Runtime" row disappears, so a `dsh` left in state would spawn
-    // into a guaranteed 409 with nothing on screen to explain or change it.
-    LaunchedEffect(dsh?.available) {
-        if (!Runtime.composerOffers(dsh)) agentType = Runtime.CLAUDE
+    // Never keep a runtime the operator can no longer see. If the host stops
+    // reporting a local model or dsh while the composer is open, that row leaves
+    // the picker — and a stale choice would spawn into a guaranteed 409 with
+    // nothing on screen to explain it or change it, so fall back to Claude Code.
+    LaunchedEffect(localModel?.available, dsh?.available) {
+        if (runtimeOpts.none { it.first == runtime }) runtime = Runtime.CLAUDE
     }
 
     AlertDialog(
@@ -121,50 +126,71 @@ fun SpawnDialog(
                         singleLine = true, modifier = Modifier.fillMaxWidth(),
                     )
                 }
-                // The Model picker stays for a local spawn, matching the web
-                // composer (sessions.html), which offers and sends it whatever
-                // the source. The agent drops `--model` for a local session
-                // itself, and the alias is what that session goes back to if it
-                // is ever switched to the subscription — so discarding it here
-                // would silently give an Android-spawned session a different
-                // model from a web-spawned one. Only the CHAT bar fixes the
-                // model, because there the picker would break a live session.
-                // Runtime leads the model/permission rows when offered: it picks
-                // WHICH agent runs, on the same capability gate as "Run against".
-                if (Runtime.composerOffers(dsh)) {
+                // ONE Runtime picker, shown only when the host offers more than
+                // one runtime (matching web `sessions.html`). It leads the model
+                // and permission rows because it decides which of them apply.
+                if (runtimeOpts.size > 1) {
                     DropdownField(
                         label = "Runtime",
                         options = runtimeOpts.map { it.first },
-                        selected = agentType,
+                        selected = runtime,
                         optionLabel = { v -> runtimeOpts.firstOrNull { it.first == v }?.second ?: v },
-                    ) { agentType = it }
+                    ) { runtime = it }
                 }
-                DropdownField("Model", MODELS, model) { model = it }
-                DropdownField("Permission mode", MODES, mode) { mode = it }
-                if (ModelSource.composerOffers(localModel)) {
-                    DropdownField(
-                        label = "Run against",
-                        options = sourceOpts.map { it.first },
-                        selected = modelSource,
-                        optionLabel = { v -> sourceOpts.firstOrNull { it.first == v }?.second ?: v },
-                    ) { modelSource = it }
-                }
-                // When "local" is chosen, reveal the endpoint's discovered models
-                // (XERK-489), mirroring the web composer's revealed dropdown.
-                if (modelSource == ModelSource.LOCAL && ModelSource.localModelPickable(localModel)) {
-                    DropdownField(
-                        label = "Self-hosted model",
-                        options = localOpts.map { it.first },
-                        selected = localModelId.ifBlank { localOpts.firstOrNull()?.first ?: "" },
-                        optionLabel = { v -> localOpts.firstOrNull { it.first == v }?.second ?: v },
-                    ) { localModelId = it }
+                when (runtime) {
+                    Runtime.DSH -> {
+                        // A dsh session offers the endpoint's DISCOVERED models,
+                        // not Claude aliases (XERK-503) — the fix for the pi-ai
+                        // "no configured model" lock. Falls back to a fixed label
+                        // when the list has not been discovered yet.
+                        if (Runtime.dshModelPickable(dsh)) {
+                            DropdownField(
+                                label = "Model",
+                                options = dshOpts.map { it.first },
+                                selected = dshModelId.ifBlank { dshOpts.firstOrNull()?.first ?: "" },
+                                optionLabel = { v -> dshOpts.firstOrNull { it.first == v }?.second ?: v },
+                            ) { dshModelId = it }
+                        }
+                        // dsh manages approvals itself (ask/never + sandbox), not
+                        // Claude's permission modes — so a note, not a dropdown.
+                        Text(
+                            "Approvals are managed by dsh — it asks before risky actions and confines writes to the worktree.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Runtime.LOCAL -> {
+                        // The endpoint's discovered models (XERK-489).
+                        if (ModelSource.localModelPickable(localModel)) {
+                            DropdownField(
+                                label = "Model",
+                                options = localOpts.map { it.first },
+                                selected = localModelId.ifBlank { localOpts.firstOrNull()?.first ?: "" },
+                                optionLabel = { v -> localOpts.firstOrNull { it.first == v }?.second ?: v },
+                            ) { localModelId = it }
+                        }
+                        DropdownField("Permission mode", MODES, mode) { mode = it }
+                    }
+                    else -> {   // Claude Code (subscription)
+                        DropdownField("Model", MODELS, model) { model = it }
+                        DropdownField("Permission mode", MODES, mode) { mode = it }
+                    }
                 }
             }
         },
         confirmButton = {
             TextButton(onClick = {
-                onSpawn(prompt, label, baseRef, model, mode, modelSource,
-                    if (modelSource == ModelSource.LOCAL) localModelId else "", agentType)
+                // Map the one Runtime choice onto the wire fields, exactly as web
+                // `startSession` does — no field from another runtime leaks.
+                val outModelSource = Runtime.spawnModelSource(runtime) ?: ModelSource.SUBSCRIPTION
+                val outAgentType = Runtime.spawnAgentType(runtime) ?: Runtime.CLAUDE
+                val outModel = when (runtime) {
+                    Runtime.DSH -> dshModelId
+                    Runtime.LOCAL -> ""          // the local model rides `localModel`
+                    else -> model
+                }
+                val outLocal = if (runtime == Runtime.LOCAL) localModelId else ""
+                onSpawn(prompt, label, baseRef, outModel, mode, outModelSource, outLocal, outAgentType)
             }) {
                 Text("Spawn")
             }

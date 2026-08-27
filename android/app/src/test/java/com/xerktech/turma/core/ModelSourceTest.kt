@@ -193,15 +193,14 @@ class ModelSourceTest {
         assertEquals("☁", ModelSource.glyph(ModelSource.SUBSCRIPTION))
     }
 
-    @Test fun `the local source reads 'Other', not the raw model id`() {
-        // The selector is subscription vs the host's own endpoint; the model is
-        // named in the adjacent model dropdown, so the raw discovered id is noise
-        // here. Independent of whether a model name is reported.
-        assertEquals("Other", ModelSource.label(ModelSource.LOCAL, configured))
-        assertEquals("Subscription", ModelSource.label(ModelSource.SUBSCRIPTION, configured))
-        assertEquals("Other", ModelSource.label(ModelSource.LOCAL, null))
-        assertEquals("Other", ModelSource.options(null)[1].second)
-        assertEquals("Other", ModelSource.options(configured)[1].second)
+    @Test fun `the footer runtime chip reads the composer's runtime names, not the model id`() {
+        // The chip matches the spawn composer's Runtime picker labels (XERK-504),
+        // never naming the model (the adjacent dropdown does that).
+        assertEquals("Claude Code Local", ModelSource.label(ModelSource.LOCAL, configured))
+        assertEquals("Claude Code", ModelSource.label(ModelSource.SUBSCRIPTION, configured))
+        assertEquals("Claude Code Local", ModelSource.label(ModelSource.LOCAL, null))
+        assertEquals("Claude Code Local", ModelSource.options(null)[1].second)
+        assertEquals("Claude Code", ModelSource.options(configured)[0].second)
         assertEquals(
             listOf(ModelSource.SUBSCRIPTION, ModelSource.LOCAL),
             ModelSource.options(configured).map { it.first },

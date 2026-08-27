@@ -401,6 +401,33 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   (`LaunchedEffect`), the same reset the local-model row has.
 - Pure half in `core/Runtime.kt` (`RuntimeTest.kt`); the composer call site in
   `ui/SpawnComposerTest.kt`; the wire body in `vm/SpawnRequestTest.kt`.
+
+## Done (XERK-503/504 — unified Runtime picker; dsh model list; dsh chat footer)
+
+- **The spawn composer collapses to ONE Runtime picker** (`ui/FleetDialogs.kt` `SpawnDialog`),
+  matching web `sessions.html`: "Claude Code" / "Claude Code Local" (host reports `localModel`) /
+  "dsh" (host reports `dsh`), shown only when there is more than one runtime. **"Run against" is
+  gone** — its subscription/local choice IS the runtime now. The one choice maps onto the unchanged
+  `agentType`/`modelSource` wire fields at spawn (`Runtime.composerRuntimes`/`spawnAgentType`/
+  `spawnModelSource`); no field from another runtime leaks. The Model row adapts per runtime (Claude
+  aliases / the discovered local list / the discovered dsh list), and dsh shows an "approvals managed
+  by dsh" note instead of the permission dropdown (dsh's policy is `ask`/`never`, not Claude's modes).
+- **`DshInfo` now types `models`/`defaultModel`/`contextTokens`** (`model/Models.kt`, reusing
+  `LocalModelOption`), coerced hub-side by `normalizeDsh`, so a dsh session offers the endpoint's
+  DISCOVERED models (the fix for the pi-ai "no configured model" lock) instead of Claude aliases.
+  `core/Runtime.kt` gained the dsh model helpers mirroring `ModelSource`'s local ones
+  (`dshModels`/`dshOptions`/`currentDshModel`/`dshModelLabel`/`dshModelPickable`).
+- **The chat footer reflects a dsh session's runtime** (`ui/ChatScreen.kt` `ChatFooter`,
+  `vm/ChatViewModel.kt` `ChatUiState.dsh`): a read-only "⚙ dsh" chip (a dsh conversation can't switch
+  to a Claude runtime live), a live dropdown of the host's discovered dsh models (switched via the
+  same `/model` POST, which the agent turns into a dsh-process relaunch — `_switch_dsh_model`), and
+  NO permission-mode chip. The Claude source chip is relabeled "Claude Code" / "Claude Code Local"
+  (was "Subscription"/"Other") to match the composer (`ModelSource.label`/`options`).
+- Tests: `RuntimeTest`/`ModelSourceTest` (pure), `SpawnComposerTest` (the unified picker end to end),
+  `ChatModelChipsTest` (the dsh footer + relabel), `AgentDecodeTest` (the dsh model list decodes),
+  and the target-host wiring in `FleetSpawnLocalModelTest`/`SessionsPaneSpawnTest`. Full
+  `testDebugUnitTest` green (450 tests).
+
 ## Done (XERK-477 — board runtime row; runtime badge on cards removed)
 
 - **The `⚙ dsh` session-card runtime badge is GONE, on every surface.** The web dropped it
@@ -481,40 +508,6 @@ those are marked `[MODEL]`.
   loopback-only host, so the link hides). Android's `DshInfo` does not yet type a `web` field (which
   is decode-SAFE — `ignoreUnknownKeys` skips it until typed); to reach parity, type `DshInfo.web:
   DshWebInfo?` and add an equivalent link/affordance on the dsh session/chat screen.
-- **P1 Unified Runtime picker + dsh model list in the spawn composer (XERK-503).** The web collapsed
-  the composer's separate `Runtime` (Claude Code / dsh) and `Run against` (subscription / local) rows
-  into ONE **Runtime** picker — "Claude Code" / "Claude Code Local" / "dsh" — and dropped "Run
-  against" entirely (`sessions.html` `composer`/`onOptChange`/`startSession`, `SpawnComposerTest`).
-  Android's `SpawnDialog` (`ui/FleetDialogs.kt`) still shows the two separate rows. Three parts to
-  the port, none decode-breaking (the backend contract for claude/local is unchanged — the runtime
-  choice just maps onto the same `agentType`/`modelSource` `SpawnRequest` fields):
-  - Fold `core/Runtime.kt` + `core/ModelSource.kt` into one runtime selection: options are
-    `claude`/`local` (when `localModel.available`)/`dsh` (when `dsh.available`); `local` sends
-    `modelSource=local` + the discovered local model, `dsh` sends `agentType=dsh` + a discovered dsh
-    model. Show the picker only when there is more than one runtime (`RuntimeTest`/`ModelSourceTest`).
-  - A dsh session now offers the ENDPOINT's DISCOVERED models, not Claude aliases — type
-    `DshInfo.models: List<LocalModel>` + `defaultModel`/`contextTokens` (the hub coerces them in
-    `normalizeDsh`, so typing is safe) and render a model dropdown for the dsh runtime, mirroring the
-    local one. This is the fix for the `pi-ai provider has no configured model` lock; **the backend
-    fix already resolves it for Android spawns** (a dsh spawn that leaves the model at Default runs
-    the host default; a Claude alias sent for dsh now errors cleanly instead of the confusing pi-ai
-    error), so this port is UX unification, not a correctness gap.
-  - Permission modes are now consistent: Claude Code and Claude Code Local share the full list (with
-    a hint that `auto` needs a recent model — it is model-gated, not provider-gated, and downgrades
-    to Manual otherwise); dsh shows an "approvals managed by dsh" note instead of the Claude-mode
-    dropdown (dsh's approval policy is `ask`/`never`, not Claude's modes). Mirror that in `SpawnDialog`.
-- **P1 dsh runtime footer chips in the live chat (XERK-504).** The web chat footer now reflects a dsh
-  session's RUNTIME instead of the Claude subscription/local split (`chat.js`
-  `isDshSession`/`dshRuntimeChipHtml`/`dshModelChipHtml`/`setSessionDshModel`, `dsh footer` cases in
-  `chat.test.js`). A dsh session showed "☁ Subscription" + Claude aliases — both wrong. The web now
-  shows a read-only "⚙ dsh" runtime chip, a live dropdown of the host's discovered `dsh.models`
-  (switched via `POST .../model`, which the agent turns into a dsh-process relaunch on the new model —
-  `_switch_dsh_model`), and no permission-mode chip (dsh-managed). It also relabeled the Claude
-  source chip to "Claude Code" / "Claude Code Local" (was "Subscription"/"Other") to match the
-  composer. Android's chat model/mode chips (`ui/ChatScreen.kt` + `vm/ChatViewModel.kt`) still show
-  the subscription/local chip; the port is: type `SessionInfo.agentType` (already typed) + host
-  `dsh.models`, render a read-only dsh runtime chip + a dsh model dropdown for a dsh session, hide the
-  mode chip, and relabel the source chip. Decode-safe today (Android just shows the old chips).
 - **P2 To-do checklist card + the dsh "Deep diving…" verb (Enable DSH To-Dos).** The web renders a
   `TodoWrite` / dsh `todo_write` tool call as a CHECKLIST (state glyph per row + a `1 in progress ·
   6 pending` count on the summary) instead of raw-JSON input — `renderTodoCard` in `chat.js`, fed by

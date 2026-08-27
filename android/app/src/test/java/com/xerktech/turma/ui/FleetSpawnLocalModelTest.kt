@@ -25,7 +25,7 @@ import org.robolectric.annotation.Config
  *
  * `ModelSource.hostLocalModel` picks the TARGET host's block rather than the
  * fleet's first, and is pure and already tested. The mutation that escaped set
- * the ARGUMENT to `null` at this call site: the "Run against" row vanishes from
+ * the ARGUMENT to `null` at this call site: the "Runtime" row vanishes from
  * the Dashboard fleet-wide — the failover becomes unreachable from the screen
  * new work actually starts on — while every `hostLocalModel` assertion stays
  * green.
@@ -95,7 +95,7 @@ class FleetSpawnLocalModelTest {
         seed(firstHasModel = false, secondHasModel = true)
         render()
         openComposerFor("Secondrepo")
-        compose.onNodeWithText("Run against").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Runtime").performScrollTo().assertIsDisplayed()
     }
 
     /**
@@ -108,6 +108,6 @@ class FleetSpawnLocalModelTest {
         render()
         openComposerFor("Secondrepo")
         compose.onNodeWithText("Permission mode").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithText("Run against").assertDoesNotExist()
+        compose.onNodeWithText("Runtime").assertDoesNotExist()
     }
 }
