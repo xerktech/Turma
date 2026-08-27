@@ -512,6 +512,18 @@ those are marked `[MODEL]`.
     a hint that `auto` needs a recent model — it is model-gated, not provider-gated, and downgrades
     to Manual otherwise); dsh shows an "approvals managed by dsh" note instead of the Claude-mode
     dropdown (dsh's approval policy is `ask`/`never`, not Claude's modes). Mirror that in `SpawnDialog`.
+- **P1 dsh runtime footer chips in the live chat (XERK-504).** The web chat footer now reflects a dsh
+  session's RUNTIME instead of the Claude subscription/local split (`chat.js`
+  `isDshSession`/`dshRuntimeChipHtml`/`dshModelChipHtml`/`setSessionDshModel`, `dsh footer` cases in
+  `chat.test.js`). A dsh session showed "☁ Subscription" + Claude aliases — both wrong. The web now
+  shows a read-only "⚙ dsh" runtime chip, a live dropdown of the host's discovered `dsh.models`
+  (switched via `POST .../model`, which the agent turns into a dsh-process relaunch on the new model —
+  `_switch_dsh_model`), and no permission-mode chip (dsh-managed). It also relabeled the Claude
+  source chip to "Claude Code" / "Claude Code Local" (was "Subscription"/"Other") to match the
+  composer. Android's chat model/mode chips (`ui/ChatScreen.kt` + `vm/ChatViewModel.kt`) still show
+  the subscription/local chip; the port is: type `SessionInfo.agentType` (already typed) + host
+  `dsh.models`, render a read-only dsh runtime chip + a dsh model dropdown for a dsh session, hide the
+  mode chip, and relabel the source chip. Decode-safe today (Android just shows the old chips).
 - **P2 To-do checklist card + the dsh "Deep diving…" verb (Enable DSH To-Dos).** The web renders a
   `TodoWrite` / dsh `todo_write` tool call as a CHECKLIST (state glyph per row + a `1 in progress ·
   6 pending` count on the summary) instead of raw-JSON input — `renderTodoCard` in `chat.js`, fed by

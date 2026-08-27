@@ -3538,6 +3538,43 @@ test("http: model endpoint rejects a malformed model before it can queue", async
   assert.equal(ok.status, 200);
 });
 
+test("http: model endpoint accepts a discovered dsh model for a dsh session (XERK-504)", async () => {
+  // A dsh session's model is a DISCOVERED endpoint id, not a Claude alias, so the
+  // route takes the endpoint charset (`/`, `:`) and validates against the host's
+  // discovered dsh set — mirroring the local branch. The agent relaunches the dsh
+  // process on the new model rather than driving the (non-existent) /model picker.
+  await request("POST", "/api/heartbeat", { body: {
+    device: "hmdsh",
+    dsh: { available: true, defaultModel: "deepseek-chat",
+           models: [{ id: "deepseek-chat", contextTokens: 128000 },
+                    { id: "qwen3-coder", contextTokens: 32768 }] },
+    sessions: [{ id: "sd1", repo: "r", agentType: "dsh", model: "deepseek-chat" }],
+  }, headers: agentHeaders });
+  // A discovered id is accepted and queues setModel.
+  const ok = await request("POST", "/api/agents/hmdsh/sessions/sd1/model", {
+    body: { model: "qwen3-coder" }, headers: userHeaders });
+  assert.equal(ok.status, 200);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "hmdsh",
+    dsh: { available: true, defaultModel: "deepseek-chat",
+           models: [{ id: "deepseek-chat", contextTokens: 128000 },
+                    { id: "qwen3-coder", contextTokens: 32768 }] },
+    sessions: [{ id: "sd1", repo: "r", agentType: "dsh", model: "deepseek-chat" }] },
+    headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "setModel", sessionId: "sd1", model: "qwen3-coder", cmdId: ok.body.cmdId },
+  ]);
+  // A model the host does NOT serve -> 409 (not queued), like the local route.
+  const unserved = await request("POST", "/api/agents/hmdsh/sessions/sd1/model", {
+    body: { model: "some-other-model" }, headers: userHeaders });
+  assert.equal(unserved.status, 409);
+  // A slash-bearing id (a bedrock-style route) passes the endpoint charset gate
+  // that the Claude-alias branch would reject — here it 409s only because it is
+  // not in the discovered set, proving it reached the dsh branch not the alias one.
+  const slashy = await request("POST", "/api/agents/hmdsh/sessions/sd1/model", {
+    body: { model: "bedrock/us.anthropic.foo" }, headers: userHeaders });
+  assert.equal(slashy.status, 409);
+});
+
 test("http: mode endpoint queues a setMode command that rides the next heartbeat", async () => {
   await request("POST", "/api/heartbeat", { body: { device: "hm2" }, headers: agentHeaders });
   const res = await request("POST", "/api/agents/hm2/sessions/sess1/mode", {

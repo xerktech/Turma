@@ -165,6 +165,28 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
   `android/PARITY.md`. Tests: the `Runtime`/`dsh model list` cases in `sessions.test.js`,
   `normalizeDsh` in `server.test.js`, `TestDshModelDiscovery` in `test_hub_agent.py`.
 
+### The dsh session footer (XERK-504)
+
+- **A dsh session's footer reflects its RUNTIME, not the Claude subscription/local split.** A dsh
+  session carries `modelSource:"subscription"` under the hood (forced at spawn), so the old footer
+  painted it "☁ Subscription" and offered Claude aliases — both wrong. `isDshSession()`
+  (`sess.agentType === "dsh"`) now branches the footer: a read-only **"⚙ dsh"** runtime chip
+  (`dshRuntimeChipHtml` — NOT a picker; a running dsh conversation is a dsh event log, not Claude
+  JSONL, so it cannot switch to a Claude runtime live), a live **dsh model dropdown** of the host's
+  discovered `dsh.models` (`dshModelChipHtml`/`setSessionDshModel`, mirroring the local one minus the
+  context override), and **no permission-mode chip** (dsh manages approvals itself).
+- **A dsh model switch is a real runtime relaunch** (`_switch_dsh_model`, the dsh analogue of
+  `_switch_local_model`): `set_model` routes a dsh session there instead of driving the non-existent
+  /model picker; it validates against the discovered set, sets `sess["model"]`, and relaunches the
+  dsh process via `_launch_tmux(resume=True)` (dsh reloads its own store, keeping the conversation),
+  reverting the record if the launch throws. The `/model` route takes the endpoint charset for a dsh
+  session (`sessionAgentType === "dsh"` → `dshServes`), like the local branch — a Claude-alias
+  charset would reject a slash-bearing endpoint id.
+- **The Claude source chip is relabeled to the composer's runtime names** — "Claude Code" /
+  "Claude Code Local" (was "Subscription"/"Other") — so the footer reads like the spawn composer's
+  Runtime picker. Android in `android/PARITY.md`. Tests: the `dsh footer`/`model source` cases in
+  `chat.test.js`, the dsh `/model` case in `server.test.js`, `TestSwitchDshModel` in `test_hub_agent.py`.
+
 ### The model and mode chips
 
 - A third selector — **"Run against"** (`cc-source`, XERK-246) — moves the session between the Claude

@@ -1684,45 +1684,54 @@
     const host = $("chatComposeOpts");
     if (!host) return;
     if (fromPoll && host.querySelector(".cc-menu.open")) return;
+    const dsh = isDshSession();
     const mode = modeChipValue(), model = currentModelValue();
     const modeOpts = availableModeOpts();
     const mOpts = availableModelOpts();
     const mTitle = "Model for this session — switched live, session-only" +
       (sess && sess.pendingModel ? " (switching after the current turn)"
         : sess && sess.modelActual ? " (now: " + sess.modelActual + ")" : "");
-    host.innerHTML =
+    // The permission-mode chip is Claude-only: a dsh session manages its own
+    // approvals (ask/never + sandbox), not Claude's modes (XERK-504).
+    const modeChip = dsh ? "" :
       '<span class="cc-opt cc-mode">' +
         '<button class="cc-btn" id="ccModeBtn" title="Agent (permission) mode — switched live, best-effort">' +
         '🛡 <span class="cc-val">' + esc(optLabel(MODE_OPTS, mode)) + '</span><span class="cc-caret">▾</span></button>' +
         '<span class="cc-menu" id="ccModeMenu"><span class="cc-hint">Agent mode</span>' +
-        menuHtml(modeOpts, mode, "data-mode") + "</span></span>" +
-      '<span class="cc-right">' + contextMeterChip() + ticketFooterChip(sess) + prFooterChip(sess) +
-        (localModelOffered()
+        menuHtml(modeOpts, mode, "data-mode") + "</span></span>";
+    // The runtime chip: a read-only "⚙ dsh" for a dsh session, else the Claude
+    // subscription/local switch (shown when the host offers a local endpoint).
+    const runtimeChip = dsh ? dshRuntimeChipHtml()
+      : (localModelOffered()
           ? '<span class="cc-opt cc-source' + (currentModelSource() === "local" ? " cc-source-local" : "") + '">' +
             '<button class="cc-btn" id="ccSourceBtn" title="' +
-            esc("Which model this session runs against. Switching keeps the conversation" +
+            esc("Which runtime this session runs on. Switching keeps the conversation" +
                 (localModelInfo().model ? " — self-hosted: " + localModelInfo().model : "")) + '">' +
             (currentModelSource() === "local" ? "🏠" : "☁") +
             ' <span class="cc-val">' + esc(modelSourceLabel()) + '</span><span class="cc-caret">▾</span></button>' +
-            '<span class="cc-menu" id="ccSourceMenu"><span class="cc-hint">Run against</span>' +
+            '<span class="cc-menu" id="ccSourceMenu"><span class="cc-hint">Runtime</span>' +
             menuHtml(modelSourceOpts(), currentModelSource(), "data-source") + "</span></span>"
-          : "") +
-        (currentModelSource() === "local"
-          // A local session's model is one of the ENDPOINT's discovered models
-          // (XERK-489): a live dropdown, not a fixed label. Selecting one applies
-          // its served context window; an advanced field can only shrink it.
+          : "");
+    // The model chip: the discovered dsh list for a dsh session, the discovered
+    // local list for a local session, else the Claude alias picker.
+    const modelChip = dsh ? dshModelChipHtml()
+      : (currentModelSource() === "local"
           ? localModelChipHtml()
           : '<span class="cc-opt cc-model">' +
             '<button class="cc-btn" id="ccModelBtn" title="' + esc(mTitle) + '">' +
             '<span class="cc-val">' + esc(modelChipLabel()) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
             '<span class="cc-menu" id="ccModelMenu"><span class="cc-hint">Model</span>' +
-            menuHtml(mOpts, model, "data-model") + "</span></span>") +
-      "</span>";
+            menuHtml(mOpts, model, "data-model") + "</span></span>");
+    host.innerHTML = modeChip +
+      '<span class="cc-right">' + contextMeterChip() + ticketFooterChip(sess) + prFooterChip(sess) +
+        runtimeChip + modelChip + "</span>";
     wireComposeMenu("ccModeBtn", "ccModeMenu", "data-mode", setSessionMode);
     wireComposeMenu("ccModelBtn", "ccModelMenu", "data-model", setSessionModel);
     wireComposeMenu("ccSourceBtn", "ccSourceMenu", "data-source", setSessionModelSource);
     wireComposeMenu("ccLocalModelBtn", "ccLocalModelMenu", "data-lmodel",
       (v) => setSessionLocalModel(v));
+    wireComposeMenu("ccDshModelBtn", "ccDshModelMenu", "data-dmodel",
+      (v) => setSessionDshModel(v));
     wireLocalContext();
   }
   // ---- context-fullness meter (XERK-489 Phase 4) ----------------------------
@@ -1772,17 +1781,21 @@
     if (mine && Date.now() - modelSourcePending.at < 60000) return modelSourcePending.value;
     return (sess && sess.modelSource) || "subscription";
   }
-  // The source selector is subscription vs the host's OWN endpoint. It does NOT
-  // name the model — the adjacent model dropdown (localModelChipHtml) does, and
-  // the raw discovered id (e.g. "bedrock/us.anthropic.claude-opus-4-5-…") is
-  // noise here — so the local source reads a plain "Other".
+  // The runtime selector for a Claude session: the mounted subscription vs the
+  // host's OWN endpoint — the same two "Claude Code" / "Claude Code Local"
+  // runtimes the spawn composer offers (XERK-504), so the footer reads like the
+  // initial selector. It does NOT name the model — the adjacent model dropdown
+  // does, and the raw discovered id (e.g. "bedrock/us.anthropic.claude-opus-4-5-…")
+  // is noise here. (A dsh session is a different runtime that cannot be switched
+  // to a Claude one live — its conversation is a dsh event log, not Claude JSONL
+  // — so it shows a read-only runtime chip instead; see dshRuntimeChipHtml.)
   function modelSourceLabel() {
-    return currentModelSource() === "local" ? "Other" : "Subscription";
+    return currentModelSource() === "local" ? "Claude Code Local" : "Claude Code";
   }
   function modelSourceOpts() {
     return [
-      { value: "subscription", label: "Claude subscription" },
-      { value: "local", label: "Other" },
+      { value: "subscription", label: "Claude Code" },
+      { value: "local", label: "Claude Code Local" },
     ];
   }
   async function setSessionModelSource(value) {
@@ -1917,6 +1930,80 @@
       if (!r.ok) { await hubRefused("Model switch", r); localModelPending = null; renderComposeOpts(); return; }
       if (typeof fastPoll === "function") fastPoll();
     } catch { localModelPending = null; renderComposeOpts(); }
+  }
+
+  // ---- dsh runtime footer (XERK-504) ----------------------------------------
+  // A dsh session runs a DIFFERENT runtime (the DeepSeek Harness), not the
+  // Claude subscription/local split — so its footer shows a read-only "⚙ dsh"
+  // runtime chip (a dsh conversation cannot be moved to a Claude runtime live)
+  // and a live dropdown of the host's DISCOVERED dsh models, mirroring the local
+  // one minus the context override (dsh has no per-session window override). The
+  // mode chip is hidden for dsh — dsh manages approvals itself (ask/never +
+  // sandbox), not Claude's permission modes.
+  function isDshSession() { return Boolean(sess && sess.agentType === "dsh"); }
+  function dshInfo(a) { return (a || agent || {}).dsh || {}; }
+  function dshModels() {
+    const d = dshInfo();
+    return Array.isArray(d.models) ? d.models : [];
+  }
+  let dshModelPending = null; // {value, at, sessionId}
+  function dshModelMemoActive() {
+    return dshModelPending && dshModelPending.sessionId === sessionId &&
+      Date.now() - dshModelPending.at < LOCAL_MODEL_SETTLE_MS;
+  }
+  function currentDshModel() {
+    if (dshModelMemoActive()) return dshModelPending.value;
+    const d = dshInfo();
+    return (sess && sess.model) || d.defaultModel || "";
+  }
+  function dshModelOpts() {
+    return dshModels().map((m) => {
+      const k = fmtCtx(m && m.contextTokens);
+      return { value: m.id, label: (m && m.id) + (k ? " · " + k : "") };
+    });
+  }
+  // A read-only runtime marker matching the session card's "⚙ dsh" badge — it is
+  // NOT a picker: a running dsh session cannot switch to a Claude runtime live
+  // (the conversation formats differ), so offering the change would only queue a
+  // command the host refuses.
+  function dshRuntimeChipHtml() {
+    return '<span class="cc-opt cc-source cc-source-local">' +
+      '<span class="cc-btn" title="' +
+      esc("Runs on the dsh (DeepSeek Harness) runtime, not Claude Code") + '">' +
+      '⚙ <span class="cc-val">dsh</span></span></span>';
+  }
+  function dshModelChipHtml() {
+    const models = dshModels();
+    const cur = currentDshModel();
+    if (!models.length) {
+      return '<span class="cc-opt cc-model cc-model-fixed">' +
+        '<span class="cc-btn" title="' +
+        esc("This host's dsh model. Its list has not been discovered yet.") + '">' +
+        '<span class="cc-val">' + esc(cur || "dsh model") + "</span> 🧠</span></span>";
+    }
+    const k = fmtCtx((models.find((m) => m && m.id === cur) || {}).contextTokens);
+    const val = esc(cur || "dsh model") +
+      (k ? ' <span class="cc-ctx">· ' + esc(k) + "</span>" : "") +
+      (dshModelMemoActive() ? "…" : "");
+    return '<span class="cc-opt cc-model cc-model-local">' +
+      '<button class="cc-btn" id="ccDshModelBtn" title="' +
+      esc("dsh model for this session — switched live; the session resumes its " +
+          "conversation on the new model.") + '">' +
+      '<span class="cc-val">' + val + '</span><span class="cc-caret">▾</span> 🧠</button>' +
+      '<span class="cc-menu" id="ccDshModelMenu"><span class="cc-hint">dsh model</span>' +
+      menuHtml(dshModelOpts(), cur, "data-dmodel") + "</span></span>";
+  }
+  async function setSessionDshModel(value) {
+    if (!hostKey || !sessionId || !sess || value === currentDshModel()) return;
+    dshModelPending = { value, at: Date.now(), sessionId };
+    renderComposeOpts();
+    try {
+      const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/model", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: value }) });
+      if (!r.ok) { await hubRefused("Model switch", r); dshModelPending = null; renderComposeOpts(); return; }
+      if (typeof fastPoll === "function") fastPoll();
+    } catch { dshModelPending = null; renderComposeOpts(); }
   }
 
   async function setSessionModel(value) {
@@ -2553,10 +2640,14 @@
     // Same for the endpoint-model memo (XERK-489): drop a foreign session's, and
     // retire ours once the heartbeat's localModelName agrees.
     if (!localModelPending || localModelPending.sessionId !== id) localModelPending = null;
+    // Same for the dsh endpoint-model memo (XERK-504): drop a foreign session's,
+    // and retire ours once the heartbeat's `model` agrees.
+    if (!dshModelPending || dshModelPending.sessionId !== id) dshModelPending = null;
     hostKey = hk; sessionId = id; sess = s; agent = a;
     // The switch has landed once the host reports the source we asked for.
     if (modelSourcePending && s && s.modelSource === modelSourcePending.value) modelSourcePending = null;
     if (localModelPending && s && s.localModelName === localModelPending.value) localModelPending = null;
+    if (dshModelPending && s && s.model === dshModelPending.value) dshModelPending = null;
     historyChain = false;   // a chain from the PREVIOUS session must not block this one
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; liveAgents = [];
     backoffIdx = 0;
@@ -2681,6 +2772,10 @@
       localModels, localModelOpts, currentLocalModel, currentLocalContext,
       servedContextFor, fmtCtx, localModelChipHtml, setSessionLocalModel,
       contextMeterChip,   // Phase 4 context-fullness meter
+      // XERK-504 dsh runtime footer (read-only runtime chip + live model dropdown)
+      isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml,
+      dshRuntimeChipHtml, setSessionDshModel, renderComposeOpts,
+      __setDshModelPending: (p) => { dshModelPending = p; },
       __setLocalModelPending: (p) => { localModelPending = p; },
       __setModelSourcePending: (p) => { modelSourcePending = p; },
       __setModeSwitchPending: (p) => { modeSwitchPending = p; },

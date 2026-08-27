@@ -6414,6 +6414,75 @@ class TestDshModelDiscovery(unittest.TestCase):
                 self.assertEqual(ha.dsh_model_default(), "configured")
 
 
+class TestSwitchDshModel(ManagerMixin, unittest.TestCase):
+    """Live model switch for a RUNNING dsh session (XERK-504): a dsh session has
+    no Claude /model picker, so set_model relaunches the dsh process on the new
+    discovered model via --resume, keeping the conversation."""
+
+    def _running_dsh(self, sm):
+        sess = {"id": "d1", "status": "running", "agentType": "dsh",
+                "model": "deepseek-chat", "tmuxName": "agent-d1",
+                "worktreePath": "/wt", "claudeSessionId": "cid"}
+        sm.registry.append(sess)
+        # The launch machinery is heavy (npm/dsh); stub it — this test covers the
+        # switch LOGIC (validate, set, relaunch-or-revert), not the dsh launcher.
+        sm._kill_tmux = mock.Mock()
+        sm._clear_question_files = mock.Mock()
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        sm.save = mock.Mock()
+        return sess
+
+    def test_switch_relaunches_on_a_served_model_via_resume(self):
+        sm = self.make_manager()
+        sess = self._running_dsh(sm)
+        with mock.patch.object(ha, "dsh_configured", lambda: True), \
+             mock.patch.object(ha, "discovered_dsh_models",
+                               lambda: [{"id": "deepseek-chat", "contextTokens": 1},
+                                        {"id": "qwen3", "contextTokens": 2}]):
+            sm.set_model("d1", "qwen3")          # routes to _switch_dsh_model
+        self.assertEqual(sess["model"], "qwen3")
+        sm._launch_tmux.assert_called_once()
+        # Relaunched via --resume (keeps the conversation), never a fresh context.
+        _, kw = sm._launch_tmux.call_args
+        self.assertTrue(kw.get("resume") is True
+                        or (sm._launch_tmux.call_args[0][1:] == (True,)))
+        self.assertIsNone(sess.get("errorMsg"))
+
+    def test_switch_refuses_a_model_the_host_does_not_serve(self):
+        sm = self.make_manager()
+        sess = self._running_dsh(sm)
+        with mock.patch.object(ha, "dsh_configured", lambda: True), \
+             mock.patch.object(ha, "discovered_dsh_models",
+                               lambda: [{"id": "deepseek-chat", "contextTokens": 1}]):
+            sm.set_model("d1", "not-served")
+        self.assertIsNotNone(sess.get("errorMsg"))
+        self.assertEqual(sess["model"], "deepseek-chat")   # unchanged
+        sm._launch_tmux.assert_not_called()                # no relaunch
+
+    def test_switch_reverts_the_model_if_the_relaunch_throws(self):
+        sm = self.make_manager()
+        sess = self._running_dsh(sm)
+        sm._launch_tmux.side_effect = RuntimeError("boom")
+        with mock.patch.object(ha, "dsh_configured", lambda: True), \
+             mock.patch.object(ha, "discovered_dsh_models",
+                               lambda: [{"id": "deepseek-chat", "contextTokens": 1},
+                                        {"id": "qwen3", "contextTokens": 2}]):
+            sm.set_model("d1", "qwen3")
+        # A record claiming a model a failed launch never ran is worse than an error.
+        self.assertEqual(sess["model"], "deepseek-chat")
+        self.assertIsNotNone(sess.get("errorMsg"))
+
+    def test_switch_to_the_same_model_is_a_noop(self):
+        sm = self.make_manager()
+        sess = self._running_dsh(sm)
+        with mock.patch.object(ha, "dsh_configured", lambda: True), \
+             mock.patch.object(ha, "discovered_dsh_models",
+                               lambda: [{"id": "deepseek-chat", "contextTokens": 1}]):
+            sm.set_model("d1", "deepseek-chat")
+        sm._launch_tmux.assert_not_called()
+
+
 class TestSpawnFailures(ManagerMixin, unittest.TestCase):
     """A refused session-creating command is REPORTED, not just logged
     (XERK-265). The command is ACKed whether the agent ran it or declined it, so
