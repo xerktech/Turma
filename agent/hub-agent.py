@@ -19404,27 +19404,29 @@ class SessionManager:
                 self._start_summary(sess, text)
 
     def _seed_dsh_summary(self, sess):
-        """Name a running dsh session from dsh's OWN `session/title` event (the
-        projection tail captured it — never a `claude -p`, which a dsh host has no
-        summarizer for). dsh writes the title in TWO passes for one session: a
-        crude deterministic FALLBACK slice of the raw prompt the instant the first
-        turn starts, then the real GENERATED title once its title-llm call returns
-        — and that call can take longer than one INTERVAL on a busy local model.
+        """Name a running dsh session, preferring dsh's OWN generated title and
+        never spending a `claude -p` (a dsh host has no Claude summarizer to lean
+        on). Three tiers, weakest first, with a later one overriding an earlier:
 
-        So the generated title is authoritative and OVERRIDES a fallback name THIS
-        seeder applied on a prior beat, while a fallback (before any generated
-        title) names the card provisionally rather than leaving it blank. Without
-        the override the session pinned the fallback forever (`_summary_due` stops
-        re-checking once `summary` is set), which is exactly 'the generated title
-        is never pulled'.
+          1. GENERATED title (`session/title`, `source.kind != "fallback"`) — dsh's
+             title-llm output; authoritative.
+          2. dsh's deterministic FALLBACK title (`source.kind == "fallback"`) — a
+             crude slice of the raw prompt dsh writes the instant the first turn
+             starts, before its title-llm returns.
+          3. The first user PROMPT from the projected transcript — the SAME source
+             a Claude session is named from. This tier is what keeps the card from
+             going blank when dsh emits NO `session/title` at all: an older dsh, a
+             title-route failure, a profile without the title plugin. A dsh session
+             takes no `claude -p`, so before this tier such a session had no name
+             on any beat (the reported "titles never reach the card").
 
-        The override is scoped by `summaryProvisional`: it replaces ONLY a name
-        this seeder set from a fallback, NEVER a name from another source — a
-        TICKET session's `<key> <summary>` (set at record-build, `summaryManual`
-        unset), a migrated name, or an operator rename (`summaryManual`). A dsh
-        ticket session therefore keeps its ticket name exactly as a Claude one
-        does (`_summary_due` stops on any set `summary`), which is the contract in
-        `.claude/rules/agent-board.md`.
+        Tiers 2 and 3 are PROVISIONAL (`summaryProvisional`); tier 1 is final and
+        replaces a provisional name, then clears the flag so nothing but a manual
+        rename can move it. The override is scoped by that flag so a name from
+        another source is never clobbered — a TICKET session's `<key> <summary>`
+        (set at record-build, `summaryManual` unset), a migrated name, or an
+        operator rename (`summaryManual`) all read as non-provisional and are left
+        alone, matching the Claude ticket-naming contract (`agent-board.md`).
 
         Guarded because this runs on the beat — the agent's MAIN process — where an
         uncaught exception is the whole host, not a skipped cycle (XERK-395/402): a
@@ -19435,8 +19437,8 @@ class SessionManager:
             return
         current = sess.get("summary")
         provisional = bool(sess.get("summaryProvisional"))
-        # A name from any source OTHER than this seeder's own fallback is left
-        # alone — ticket / migrated / operator names must not be clobbered.
+        # A name from any source OTHER than this seeder's own provisional one is
+        # left alone — ticket / migrated / operator names must not be clobbered.
         if current and not provisional:
             return
         tail = self.dsh_tails.get(sess["id"])
@@ -19445,13 +19447,9 @@ class SessionManager:
             final = tail.title_final() if tail else False
         except Exception as e:
             log(f"dsh title lookup failed for {sess['id']}: {e}")
-            return
-        if not title:
-            return
-        if final:
-            # dsh's generated (or user-set) title is authoritative: apply it and
-            # drop the provisional flag so no later title can move it (only a
-            # manual rename can, via the summaryManual guard above).
+            title, final = None, False
+        # Tier 1 — dsh's generated (or user-set) title is authoritative.
+        if title and final:
             if current != title:
                 sess["summary"] = title
                 sess.pop("summaryProvisional", None)
@@ -19459,19 +19457,30 @@ class SessionManager:
                 self.save()
                 log(f"named dsh session {sess['id']}: {title!r}")
             elif provisional:
-                # Text already matches (a fallback that happened to equal the
-                # generated title); finalize so we stop revisiting it.
+                # Text already matches (a fallback equal to the generated title);
+                # finalize so we stop revisiting it.
                 sess.pop("summaryProvisional", None)
                 self.save()
-        elif not current:
-            # Only the fallback has arrived and nothing is named yet — apply it so
-            # the card is not blank; the generated title overrides it above.
-            sess["summary"] = title
+            return
+        # Tiers 2/3 — provisional. dsh's fallback title if it wrote one, else the
+        # first user prompt from the projected transcript (so the card is never
+        # blank even when dsh emits no session/title). A generated title overrides
+        # it above on a later beat.
+        provisional_name = title
+        if not provisional_name:
+            path = _session_transcript_path(sess)
+            text = _first_user_text(path) if path else None
+            if text:
+                provisional_name = clean_manual_summary(text)
+        if not provisional_name:
+            return  # nothing to name it from yet — look again next beat
+        if current != provisional_name:
+            sess["summary"] = provisional_name
             sess["summaryProvisional"] = True
             sess.pop("summaryRetryAt", None)
             self.save()
-            log(f"named dsh session {sess['id']}: {title!r} "
-                "(fallback; awaiting dsh's generated title)")
+            log(f"named dsh session {sess['id']}: {provisional_name!r} "
+                "(provisional; awaiting dsh's generated title)")
 
     def _poll_summaries(self):
         """Reap finished summary subprocesses (one poll() per active job each
