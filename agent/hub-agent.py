@@ -1256,11 +1256,15 @@ QWEN_RUNTIME_DIR = os.path.join(REGISTRY_DIR, "qwen")
 #   might commit. `context.fileName` points qwen at this name; a project's own
 #   `QWEN.md` is not auto-loaded for a Turma qwen session (an accepted trade —
 #   the SESSION's directive is what must land, and [Qwen S1]/[C] can refine).
+#   It is deliberately NOT dot-prefixed: the G0 spike proved the loader against a
+#   plain filename, and some context loaders skip hidden files — a plain Turma
+#   name is both proven-loadable AND non-clobbering. (Real-loader confirmation of
+#   this exact name is XERK-520 [Qwen QA]; override via QWEN_CONTEXT_FILENAME.)
 # Both files are git-excluded so they never read as uncommitted work (prune/delete
 # key on that) nor get committed; they are regenerated on every launch.
 QWEN_CONFIG_DIRNAME = ".qwen"
 QWEN_CONTEXT_FILENAME = os.environ.get("QWEN_CONTEXT_FILENAME",
-                                       ".turma-qwen-context.md")
+                                       "TURMA_QWEN_CONTEXT.md")
 # The qwen model/endpoint identifiers ride into a generated settings.json; the
 # model name also reaches OPENAI_MODEL in the env file. Charset-check them like a
 # local model name / dsh identifier — operator-set, but never trust an env value

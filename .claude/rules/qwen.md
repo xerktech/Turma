@@ -75,13 +75,17 @@ landed, and the invariants a later child must not undo:
   endpoint needs only `TURMA_QWEN=1`. The API key rides an ENV VAR NAME (`QWEN_MODEL_API_KEY_ENV`).
 - **The new-work / ticket-branch / peers directive rides qwen's CONTEXT file, not
   `--append-system-prompt`** (qwen has none). `_write_qwen_worktree_config` writes the SAME directive
-  text (`NEW_WORK_SYSTEM_PROMPT` + `TICKET_BRANCH_PROMPT` + `PEERS_SYSTEM_PROMPT`) to
-  `<worktree>/QWEN.md`, which qwen loads INTO the system prompt (`context.fileName`). The initial
+  text (`NEW_WORK_SYSTEM_PROMPT` + `TICKET_BRANCH_PROMPT` + `PEERS_SYSTEM_PROMPT`) to a
+  TURMA-SPECIFIC context file (`QWEN_CONTEXT_FILENAME`, default `TURMA_QWEN_CONTEXT.md` — NOT the
+  conventional `QWEN.md`, so it can never clobber a repo's OWN tracked `QWEN.md`; and NOT dot-prefixed,
+  since some loaders skip hidden files and the G0 spike proved a plain name). `context.fileName`
+  points qwen at it; the project's own `QWEN.md` is then not auto-loaded (accepted trade). The initial
   prompt is delivered race-free via `-i`/`--prompt-interactive` (run-then-stay-interactive — the
   claude positional-prompt analogue), not send-keys (that drive layer is [Qwen C]).
-- **The per-worktree config (`.qwen/settings.json` + `QWEN.md`) is git-EXCLUDED** (per-worktree
-  `info/exclude`) so it never reads as uncommitted work (prune/delete key on `git status`) nor gets
-  committed by the session; it is regenerated on every launch. settings pin `chatRecording:true`
+- **The per-worktree config (`.qwen/settings.json` + the context file) is git-EXCLUDED** (the repo's
+  COMMON `info/exclude`, shared by every worktree — `git rev-parse --git-path info/exclude`) so it
+  never reads as uncommitted work (prune/delete key on `git status`) nor gets committed by the
+  session; it is regenerated on every launch. settings pin `chatRecording:true`
   (REQUIRED for the on-disk transcript + resume), `disableAutoUpdate` (a pinned fleet must not let
   the binary drift under the parsers — the G0 auto-update trap), `folderTrust:false`, and
   `approvalMode:"auto"` + `autoAccept:true` (hands-off, the claude `--permission-mode auto` analogue).
