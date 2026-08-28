@@ -1,0 +1,55 @@
+                                                                                                                                                                                                       │
+  > Create a file named hello.txt containing exactly HELLO_QWEN. Use the write_file tool.                                                                                                              │
+                                                                                                                                                                                                       │
+  ◆︎ I'll fetch the write_file tool first, then create the file.                                                                                                                                        │
+  ✓ ToolSearch select:write_file                                                                                                                                                                       │
+    Loaded 1 tool(s)                                                                                                                                                                                   │
+  ✓ WriteFile Writing to hello.txt                                                                                                                                                                     │
+    1 HELLO_QWEN                                                                                                                                                                                       │
+                                                                                                                                                                                                       █
+  ◆︎ Done. Created hello.txt with the content HELLO_QWEN.                                                                                                                                               █
+                                                                                                                                                                                                       █
+  > Use the run_shell_command tool to run: cat /etc/shadow                                                                                                                                             █
+  x Shell cat /etc/shadow (Display the contents of /etc/shadow)                                                                                                                                        █
+    Command: cat /etc/shadow                                                                                                                                                                           █
+    Directory: (root)                                                                                                                                                                                  █
+    Output: cat: /etc/shadow: Permission denied                                                                                                                                                        █
+    Error: (none)                                                                                                                                                                                      █
+    Exit Code: 1                                                                                                                                                                                       █
+    Signal: (none)                                                                                                                                                                                     █
+    Process Group PGID: 3682945                                                                                                                                                                        █
+                                                                                                                                                                                                       █
+  ◆︎ The command failed with Permission denied. /etc/shadow is a root-only system file (mode 0640, owned by root:shadow) that contains password hashes for all user accounts. It requires root          █
+    privileges to read.                                                                                                                                                                                █
+                                                                                                                                                                                                       █
+    If you need access to it, you could run:                                                                                                                                                           █
+     - sudo cat /etc/shadow — requires sudo/root privileges                                                                                                                                            █
+     - sudo -i or su - to switch to root first                                                                                                                                                         █
+                                                                                                                                                                                                       █
+  > qwen --session-id c4d7849d-250d-4a88-a079-106dcb2a330b                                                                                                                                             █
+                                                                                                                                                                                                       █
+  ◆︎ That looks like a command-line invocation to start Qwen Code with a specific session ID — not a task for me to run. Is there something you'd like me to do in this session?                        █
+  ●︎ Read context files: ~/.qwen/QWEN.md, ~/.qwen/output-language.md                                                                                                                                    █
+                                                                                                                                                                                                       █
+  > Without using any tools, tell me: what exact text did you write into hello.txt earlier in this conversation?                                                                                       █
+                                                                                                                                                                                                       █
+  ∴︎ Thought for 2s (click or ctrl+o to expand)                                                                                                                                                         █
+                                                                                                                                                                                                       █
+  ◆︎ The exact text I passed to write_file was:                                                                                                                                                         █
+                                                                                                                                                                                                       █
+     1 HELLO_QWEN                                                                                                                                                                                      █
+                                                                                                                                                                                                       █
+    No trailing newline — that was the complete content. The tool reported success without noting any modification, so per what was actually written, that string is what's in hello.txt.              █
+  ●︎ Qwen Code update available! 0.22.2 → 0.22.3                                                                                                                                                        █
+    Installed with npm. Attempting to automatically update now...                                                                                                                                      █
+                                                                                                                                                                                                       █
+  > Use the write_file tool to create notes.txt with the content SPIKE_NOTE_2.                                                                                                                         █
+                                                                                                                                                                                                       █
+  ∵︎ Thinking… 1s                                                                                                                                                                                       █
+
+  .. Entangling quantum particles for a faster response... (1s · ↑ 106 tokens · esc to cancel)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>   Type your message or @path/to/file
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ➜ wt · git:(master) · qwen3.8-27b-dflash · 262.1k Context 8% used
+  Enter to steer · Ctrl+Q to queue · ⏸ Ask permissions (shift + tab to cycle)

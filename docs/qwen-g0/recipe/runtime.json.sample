@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "pid": 3684718,
+  "session_id": "757253de-b908-4212-9ff7-dfc1f84c5b50",
+  "work_dir": "/tmp/claude-1000/-home-mhabeeb-git--turma-worktrees-Turma-d04ee/a9c3e666-0c95-40f6-b687-936f3b61d3d1/scratchpad/wt",
+  "hostname": "MaxAI",
+  "started_at": 1787940823.858,
+  "qwen_version": "0.22.2"
+}
