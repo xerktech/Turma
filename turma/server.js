@@ -52,17 +52,19 @@ const PORT = parseInt(process.env.PORT || "8300", 10);
 // dsh functionality WITHOUT deleting any of the dsh machinery, so it can be flipped
 // back on by editing one line. Set to DISABLED (false).
 //
-// The agent (Python), Android and glasses each carry a SAME-NAMED flag, so no
-// single component can re-enable dsh on its own — the hub still refuses to accept
-// or advertise dsh here even if an agent reports the capability. It gates the two
+// The agent (Python) and Android each carry a SAME-NAMED flag, so no single
+// component can re-enable dsh on its own — the hub still refuses to accept or
+// advertise dsh here even if an agent reports the capability. (Glasses has no
+// runtime-selection surface, so it carries no such flag.) It gates the two
 // hub choke points every dsh decision funnels through: `dshAvailable` (server-side
 // acceptance — spawn gate, org gate, ticket routing) and `normalizeDsh` (the wire
 // coercion, so the served /api/agents payload never advertises dsh to any client).
 let DSH_ENABLED = false;
 
 // The qwen (Qwen Code, XERK-504) equivalent of DSH_ENABLED. Same in-CODE kill
-// switch discipline: the agent (Python), Android and glasses carry a SAME-named
-// flag, so no single component can re-enable qwen on its own — the hub still
+// switch discipline: the agent (Python) and Android carry a SAME-named flag
+// (glasses has no runtime-selection surface), so no single component can
+// re-enable qwen on its own — the hub still
 // refuses to accept or advertise qwen here even if an agent reports the
 // capability. It gates the two hub choke points every qwen decision funnels
 // through: `qwenAvailable` (server-side acceptance — the spawn gate) and
