@@ -2903,12 +2903,19 @@ function normalizeDsh(payload) {
     if ("dsh" in payload) payload.dsh = null;
     return;
   }
-  // With the fleet-wide kill switch off, the coerced block is forced to advertise
-  // no dsh (and the `web` viewer sub-block is omitted below) — so the served
-  // /api/agents payload never offers dsh to any client (web, Android, glasses)
-  // even when an agent reports the capability. The rest of the shape/coercion is
-  // left intact so re-enabling the flag needs no further change here.
-  const out = { available: DSH_ENABLED && d.available === true };
+  // With the fleet-wide kill switch off, the served block is fully INERT — no
+  // capability, no discovered models, no default, no web viewer — so nothing
+  // dsh-shaped rides /api/agents to any client (web, Android, glasses) even when
+  // an agent reports the capability. Zeroing `models`/`defaultModel` too (not
+  // just `available`) matters because the hub's own `/model` route reads
+  // `dsh.models` via `dshServes`: leaving them would keep a dsh code path live
+  // with the switch off. The full coercion below runs only with the flag on, so
+  // re-enabling needs no further change here.
+  if (!DSH_ENABLED) {
+    payload.dsh = { available: false, models: [], defaultModel: null, contextTokens: null };
+    return;
+  }
+  const out = { available: d.available === true };
   // The endpoint's discovered dsh models (XERK-503), the exact shape and
   // coercion as normalizeLocalModel's — [{id, contextTokens|null}], bound the
   // length first, sanitize each id (drop a nameless row), dedupe. A dsh session
@@ -4344,6 +4351,11 @@ function normalizeSessions(payload) {
     for (const k of ["modelSource", "modelSourceAt", "agentType"]) {
       if (k in s && typeof s[k] !== "string") s[k] = "";
     }
+    // Kill switch OFF: a reported/persisted dsh session runtime reads as claude
+    // on the wire (coerce "dsh" -> "", which every client already treats as the
+    // default), so no client renders a session as dsh and the hub's own /model
+    // route never takes its dsh branch. Mirrors the agent's rebuild coercion.
+    if (!DSH_ENABLED && s.agentType === "dsh") s.agentType = "";
     // XERK-489: the per-session self-hosted model name (String? on Android) and
     // its context window (Int? on Android). Typing a field on SessionInfo and
     // adding its hub-side coercion are the SAME change — a wrong-typed one from a

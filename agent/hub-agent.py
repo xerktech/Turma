@@ -14609,7 +14609,13 @@ class SessionManager:
             # Resuming an ended session keeps whichever model it was running
             # against; usage has not come back just because it was killed.
             "modelSource": rec.get("modelSource") or "subscription",
-            "agentType": rec.get("agentType") or "claude",
+            # Re-gate the runtime on rebuild, like receive_migration does: a
+            # persisted "dsh" falls back to claude when this host does not offer
+            # dsh (which the DSH_ENABLED kill switch forces off), rather than
+            # resuming as a runtime this host cannot launch.
+            "agentType": (resolve_agent_type(rec.get("agentType"))
+                          if rec.get("agentType") in AGENT_TYPES
+                          and dsh_configured() else "claude"),
             # ...and which self-hosted model it was on (XERK-489); the launch
             # re-validates and falls back if the host no longer serves it.
             "localModelName": rec.get("localModelName"),

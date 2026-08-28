@@ -3544,6 +3544,7 @@ test("http: model endpoint rejects a malformed model before it can queue", async
 });
 
 test("http: model endpoint accepts a discovered dsh model for a dsh session (XERK-504)", async () => {
+  hub.__setDshEnabled(true);
   // A dsh session's model is a DISCOVERED endpoint id, not a Claude alias, so the
   // route takes the endpoint charset (`/`, `:`) and validates against the host's
   // discovered dsh set — mirroring the local branch. The agent relaunches the dsh
@@ -11887,6 +11888,29 @@ test("normalizeDsh whitelists the host-wide web viewer sub-block (XERK-501)", ()
   // A junk web block on an otherwise-good dsh block drops the web, keeps the flag.
   assert.deepEqual(norm({ available: true, web: "yes" }), { available: true, ...M });
   assert.deepEqual(norm({ available: true, web: [1] }), { available: true, ...M });
+});
+
+test("DSH_ENABLED off (the shipped default) makes the hub serve an inert dsh block and no dsh runtime", () => {
+  // This test deliberately does NOT flip the flag — it pins the SHIPPED default.
+  // The dsh tests around it enable the flag and the top-level afterEach resets it,
+  // so the flag is false here. Without this, all the flag-on dsh tests stay green
+  // even if every hub kill-switch gate is removed (the coverage gap QA flagged).
+  assert.equal(hub.__getDshEnabled(), false);
+  // dshAvailable refuses whatever an agent claims.
+  assert.equal(hub.dshAvailable({ dsh: { available: true } }), false);
+  // normalizeDsh forces the block fully inert: no capability, no models, no
+  // default, no web viewer — even from a fully-populated agent report.
+  const p = { dsh: { available: true, web: { running: true, port: 7788, url: "http://x:7788/" },
+    models: [{ id: "deepseek-chat", contextTokens: 64000 }], defaultModel: "deepseek-chat", contextTokens: 64000 } };
+  hub.normalizeDsh(p);
+  assert.deepEqual(p.dsh, { available: false, models: [], defaultModel: null, contextTokens: null });
+  assert.equal("web" in p.dsh, false);
+  // normalizeRecord (the real ingest/restore path) coerces a dsh session runtime
+  // to claude on the wire, so no client renders a session as dsh.
+  const rec = { device: "h", dsh: { available: true }, sessions: [{ id: "s1", agentType: "dsh" }] };
+  hub.normalizeRecord(rec);
+  assert.equal(rec.dsh.available, false);
+  assert.equal(rec.sessions[0].agentType, "");
 });
 
 test("normalizeDsh coerces the discovered model list (XERK-503)", () => {
