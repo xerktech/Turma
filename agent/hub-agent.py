@@ -42,6 +42,7 @@ stdlib only — no pip installs in the image.
 
 import base64
 import datetime
+import glob
 import gzip
 import hashlib
 import html
@@ -1200,6 +1201,65 @@ DSH_SESSIONS_ROOT = os.path.join(DSH_HOME, "sessions")
 # collide with one: a claude session id is never a dotfile. `_unpack_transcript`
 # routes members under it to the target's own DSH_SESSIONS_ROOT, not the slug.
 DSH_STORE_ARCNAME = ".dsh-store"
+
+# --- qwen (Qwen Code, XERK-504) runtime host configuration ([Qwen B]) -------
+# Qwen Code is an interactive TUI, so its launcher is the Claude-shaped one, NOT
+# the dsh headless driver: a pinned session id, a native JSONL transcript on
+# disk, a tmux pane injected with input, `capture-pane` state parsing, and its
+# OWN ttyd terminal (ttyd is NOT suppressed for qwen the way it is for dsh —
+# XERK-498). qwen has NO Claude-style subscription failover: this
+# OpenAI-compatible route is the WHOLE model story for a qwen session (like dsh's
+# D5). Defaults fall back to the Claude failover's LOCAL_MODEL_* so a host
+# already wired for a local OpenAI-compatible endpoint needs only TURMA_QWEN=1 to
+# try qwen; a dedicated endpoint uses the QWEN_* vars. The API key rides an ENV
+# VAR NAME, so no secret is written into a command line or the on-disk settings.
+QWEN_BIN = os.environ.get("QWEN_BIN", "qwen")
+QWEN_MODEL = (os.environ.get("QWEN_MODEL")
+              or os.environ.get("LOCAL_MODEL_NAME") or "")
+QWEN_MODEL_BASE_URL = (os.environ.get("QWEN_MODEL_BASE_URL")
+                       or os.environ.get("LOCAL_MODEL_BASE_URL") or "")
+QWEN_MODEL_API_KEY_ENV = os.environ.get("QWEN_MODEL_API_KEY_ENV",
+                                        "LOCAL_MODEL_API_KEY")
+QWEN_MODEL_CONTEXT = int(os.environ.get("QWEN_MODEL_CONTEXT")
+                         or os.environ.get("LOCAL_MODEL_CONTEXT") or "262144")
+# qwen writes its native session log + live registry under ~/.qwen/projects/,
+# mirroring Claude's ~/.claude/projects/ (a per-cwd slug). The LAUNCHER does not
+# READ the native transcript — the projection into Claude JSONL that the chat/
+# usage/PR surfaces read is [Qwen S1] (XERK-508, agent/qwen_transcript.py). It
+# uses only the per-session live registry `<id>.runtime.json` to CONFIRM the
+# session actually came up (XERK-492), located by the pinned id across project
+# dirs so the exact slug rule is not depended on.
+QWEN_HOME = (os.environ.get("QWEN_HOME")
+             or os.path.join(os.path.expanduser("~"), ".qwen"))
+QWEN_PROJECTS_ROOT = (os.environ.get("QWEN_PROJECTS_ROOT")
+                      or os.path.join(QWEN_HOME, "projects"))
+# Per-session transient files (the sourced 0600 env file with the model key)
+# live under the agent-owned ~/.turma, never a worktree — the same discipline as
+# the dsh socket dir and the local-model env file.
+QWEN_RUNTIME_DIR = os.path.join(REGISTRY_DIR, "qwen")
+# The per-worktree qwen config: `<worktree>/.qwen/settings.json` (workspace
+# settings override user settings — verified in the G0 spike) pins approval mode,
+# chat-recording ON (required for the on-disk transcript + resume), auto-update
+# OFF (a pinned fleet must not let the binary drift under the parsers), and
+# folder-trust OFF (Turma owns the worktree). The new-work / ticket-branch /
+# peers directive rides qwen's CONTEXT ("memory") file — qwen has NO
+# --append-system-prompt, and the context file is loaded INTO the system prompt,
+# so it is the append-system-prompt analogue. Both files are git-excluded per
+# worktree so they never read as uncommitted work (prune/delete key on that) nor
+# get committed by the session; they are regenerated on every launch.
+QWEN_CONFIG_DIRNAME = ".qwen"
+QWEN_CONTEXT_FILENAME = os.environ.get("QWEN_CONTEXT_FILENAME", "QWEN.md")
+# The qwen model/endpoint identifiers ride into a generated settings.json; the
+# model name also reaches OPENAI_MODEL in the env file. Charset-check them like a
+# local model name / dsh identifier — operator-set, but never trust an env value
+# into a generated config or an endpoint request.
+QWEN_IDENT_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,80}$")
+# Launch confirmation window (XERK-492): a tmux that STARTED is not proof qwen
+# actually came up (a bad config, a failed load), so the launch waits for the
+# session's `<id>.runtime.json` to appear with a live pid before recording it.
+QWEN_LAUNCH_CONFIRM_SEC = float(os.environ.get("QWEN_LAUNCH_CONFIRM_SEC", "12"))
+QWEN_LAUNCH_CONFIRM_POLL_SEC = float(
+    os.environ.get("QWEN_LAUNCH_CONFIRM_POLL_SEC", "0.4"))
 
 # --- Host-wide read-only `dsh web` viewer (XERK-501) ----------------------
 # ONE `dsh web` per host (never one per session — that was XERK-498's blocker),
@@ -13278,18 +13338,324 @@ class SessionManager:
         capability flag only."""
         return {"available": qwen_configured()}
 
-    def _launch_qwen(self, sess, resume=False, prompt=None, resume_id=None):
-        """Launch a session on the qwen (Qwen Code, XERK-504) runtime.
+    def _ensure_qwen_ready(self):
+        """Probe (once per manager) whether this host can LAUNCH qwen — the qwen
+        binary runs and a model route is configured — caching the verdict on
+        self._qwen_ready and returning it.
 
-        [Qwen A] (XERK-506) establishes the runtime field, the capability flag
-        and this launch choke-point dispatch; the LAUNCHER itself is [Qwen B].
-        Until it lands there is no qwen process to start, and QWEN_ENABLED being
-        False means resolve_agent_type refuses an agentType="qwen" spawn before
-        any record ever carries it — so this is unreachable today. It raises
-        rather than silently no-op'ing, so if a future change reaches it before
-        [Qwen B] fills in the body the failure is loud and routes through the
-        caller's error handling instead of stranding an empty session."""
-        raise RuntimeError("qwen runtime launcher not yet implemented ([Qwen B])")
+        Primed on a WORKER THREAD at startup (run_forever) because it spawns a
+        `qwen --version` subprocess, which is too heavy for the beat (XERK-395).
+        _launch_qwen only ever READS the cached flag and refuses if unset, so it
+        never triggers this probe on the beat — exactly as _launch_dsh reads
+        _dsh_profile_ready without running _ensure_dsh_profile."""
+        cached = getattr(self, "_qwen_ready", None)
+        if cached is not None:
+            return cached
+        ready = False
+        if not (QWEN_MODEL and QWEN_MODEL_BASE_URL):
+            log("qwen: no model route configured (set QWEN_MODEL + "
+                "QWEN_MODEL_BASE_URL, or LOCAL_MODEL_NAME + LOCAL_MODEL_BASE_URL); "
+                "qwen spawns are refused")
+        elif not (QWEN_IDENT_RE.fullmatch(QWEN_MODEL)
+                  and QWEN_MODEL_BASE_URL.startswith(("http://", "https://"))):
+            log(f"qwen: invalid model/endpoint "
+                f"({QWEN_MODEL!r}/{QWEN_MODEL_BASE_URL!r}); qwen spawns are refused")
+        else:
+            try:
+                r = subprocess.run([QWEN_BIN, "--version"], capture_output=True,
+                                   text=True, timeout=30)
+                if r.returncode == 0:
+                    ready = True
+                    log(f"qwen: ready ({(r.stdout or '').strip()[:40]}, model "
+                        f"{QWEN_MODEL} at {QWEN_MODEL_BASE_URL})")
+                else:
+                    log(f"qwen: `{QWEN_BIN} --version` failed "
+                        f"(rc={r.returncode}); qwen spawns are refused")
+            except (OSError, subprocess.SubprocessError) as e:
+                log(f"qwen: the qwen binary is not runnable "
+                    f"({QWEN_BIN!r}: {e}); qwen spawns are refused")
+        self._qwen_ready = ready
+        return ready
+
+    def _launch_qwen(self, sess, resume=False, prompt=None, resume_id=None):
+        """Launch a session on the qwen (Qwen Code, XERK-504) runtime: an
+        interactive qwen TUI in the session's own tmux + worktree, with a PINNED
+        session id and its OWN ttyd terminal (unlike dsh, XERK-498, ttyd is NOT
+        suppressed for qwen — the caller's _launch_ttyd serves it exactly as for
+        a Claude session, and the chat header keeps "Terminal ▸").
+
+        The Claude-shaped launcher, deliberately close to _launch_tmux: a pinned
+        conversation id (which NAMES the native transcript), the new-work /
+        ticket-branch / peers directive, an OpenAI-compatible model route SOURCED
+        from a 0600 env file (never argv, never `tmux -e` — /proc/<pid>/cmdline
+        is world-readable), and a launch confirmation before the session is
+        recorded running (XERK-492). qwen has no --append-system-prompt, so the
+        directive rides its context ("memory") file, which qwen loads into the
+        system prompt.
+
+        Raises RuntimeError on a hard failure, like _launch_tmux/_launch_dsh, so
+        the caller's error handling (provision's _set_error, the resume paths'
+        _refuse_start — the XERK-265 channel) marks the session with a reason
+        rather than launching it half-wired."""
+        # Primed off the beat at startup (run_forever); an unset flag means qwen
+        # isn't usable here yet. Refuse rather than run the version probe on the
+        # beat (XERK-395), the same discipline _launch_dsh applies to its profile.
+        if not getattr(self, "_qwen_ready", None):
+            raise RuntimeError("qwen runtime is not ready on this host "
+                               "(the qwen binary is missing/unrunnable, or no "
+                               "model route is configured)")
+        # 1. Pin the conversation id — it NAMES the native transcript, exactly as
+        # _launch_tmux pins claudeSessionId. A resume keeps the existing id so
+        # qwen's persisted session and the transcript line up (qwen --resume <id>
+        # appends to the SAME <id>.jsonl — G0 spike); a fresh launch mints one.
+        claude_sid = None
+        if resume:
+            if resume_id and VALID_CLAUDE_SID_RE.fullmatch(resume_id):
+                claude_sid = resume_id
+            elif sess.get("claudeSessionId"):
+                claude_sid = sess["claudeSessionId"]
+        if not claude_sid:
+            claude_sid = str(uuid.uuid4())
+        sess["claudeSessionId"] = claude_sid
+        self._remember_ticket(sess)
+        worktree = sess["worktreePath"]
+        sid = sess["id"]
+        # 2. The new-work / ticket-branch / peers directive (the SAME text the
+        # claude path appends via --append-system-prompt) — written to qwen's
+        # context file, which qwen loads into the system prompt.
+        policy = NEW_WORK_SYSTEM_PROMPT
+        ticket = sess.get("ticket") or {}
+        if ticket.get("branch"):
+            policy += TICKET_BRANCH_PROMPT.format(
+                key=ticket.get("key") or "this session's ticket",
+                branch=ticket["branch"])
+        policy += PEERS_SYSTEM_PROMPT.format(
+            path=PEERS_FILE, sid=sid, host=self.device)
+        # 3. Per-worktree qwen config (settings.json + the context file), both
+        # git-excluded so they never read as uncommitted work or get committed.
+        self._write_qwen_worktree_config(sess, policy)
+        # 4. Per-session env, SOURCED from a 0600 file, never argv'd — the same
+        # discipline as the local-model credential (/proc/<pid>/cmdline is
+        # world-readable). The key named by QWEN_MODEL_API_KEY_ENV reaches qwen
+        # as OPENAI_API_KEY; only the file PATH ever hits a command line.
+        try:
+            os.makedirs(QWEN_RUNTIME_DIR, exist_ok=True)
+        except OSError as e:
+            raise RuntimeError(f"qwen runtime dir: {e}")
+        env_file = os.path.join(QWEN_RUNTIME_DIR, f"{sid}.env")
+        env_map = {
+            "OPENAI_BASE_URL": QWEN_MODEL_BASE_URL,
+            "OPENAI_MODEL": sess.get("model") or QWEN_MODEL,
+            # A pinned fleet must not let qwen auto-update the binary out from
+            # under the parsers (the G0 spike caught it upgrading mid-run) — belt
+            # and suspenders with settings.general.disableAutoUpdate.
+            "QWEN_CODE_SKIP_UPDATE_CHECK_ONCE": "1",
+        }
+        api_key_val = os.environ.get(QWEN_MODEL_API_KEY_ENV)
+        if api_key_val:
+            env_map["OPENAI_API_KEY"] = api_key_val
+        try:
+            fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for k, v in env_map.items():
+                    f.write(f"export {k}={shlex.quote(str(v))}\n")
+        except OSError as e:
+            raise RuntimeError(f"qwen env file: {e}")
+        # 5. Build the interactive TUI command. Endpoint auth is `openai` + the
+        # sourced OPENAI_* env (the ticket's form, proven in the G0 spike).
+        parts = [QWEN_BIN, "--auth-type", "openai"]
+        if resume:
+            parts += ["--resume", claude_sid]
+        else:
+            parts += ["--session-id", claude_sid]
+        # The initial prompt (spawn only) as qwen's prompt-interactive: run it as
+        # the first turn and stay interactive — the race-free equivalent of
+        # claude's positional `-- <prompt>`, with no send-keys timing to get
+        # wrong. A resume carries no fresh prompt (context continues).
+        if prompt and not resume:
+            parts += ["-i", prompt]
+        qwen_cmd = (f"set -a; . {shlex.quote(env_file)}; set +a; "
+                    + shlex.join(parts))
+        run(["tmux", "kill-session", "-t", sess["tmuxName"]])
+        rc, err = run_ok([
+            "tmux", "new-session", "-d", "-s", sess["tmuxName"],
+            "-c", worktree, "-x", "220", "-y", "50", qwen_cmd,
+        ])
+        if rc != 0:
+            raise RuntimeError(f"qwen tmux launch failed: {err}")
+        # 6. Confirm the session actually came up before recording it (XERK-492):
+        # a started tmux is not proof qwen bound its session (a bad config, a
+        # failed load, an unreachable endpoint). A failed confirm tears down and
+        # raises, routing through the caller's _set_error / _refuse_start.
+        if not self._confirm_qwen_launch(sess, claude_sid):
+            self._kill_tmux(sess)
+            raise RuntimeError(
+                "qwen started in tmux but the session never came up "
+                "(a bad config, a failed load, or an unreachable model route)")
+
+    def _qwen_settings(self, sess):
+        """The workspace `.qwen/settings.json` for a qwen session — pinning the
+        launch posture Turma needs and nothing per-secret (the endpoint key
+        rides the sourced env file, never this on-disk file). Workspace settings
+        override the user's (verified in the G0 spike)."""
+        model = sess.get("model") or QWEN_MODEL
+        settings = {
+            "$version": 4,
+            # Turma owns the worktree, so folder-trust is a launch decision, not
+            # a prompt; off so workspace hooks/config apply without a gate.
+            "security": {"folderTrust": {"enabled": False}},
+            "general": {
+                # REQUIRED for the on-disk transcript + --resume to work (G0).
+                "chatRecording": True,
+                # A pinned fleet must not let the binary drift under the parsers
+                # (G0: it auto-updated mid-spike). Both keys, plus the env var.
+                "disableAutoUpdate": True,
+                "disableUpdateNag": True,
+            },
+            "tools": {
+                # A Turma session runs hands-off, so tools auto-run — the
+                # analogue of a Claude session's default `--permission-mode
+                # auto`. The hard-deny SAFETY guard that makes that safe is
+                # [Qwen F] (XERK-510: PreToolUse hooks reusing the shared deny
+                # policy), NOT this launcher — which is why qwen stays disabled
+                # fleet-wide (QWEN_ENABLED) until [Qwen F] lands. Permission-mode
+                # parity (Shift+Tab / setMode) is [Qwen P] (XERK-522).
+                "autoAccept": True,
+                "approvalMode": "auto",
+            },
+            # The directive rides the context file, loaded into the system
+            # prompt — qwen's --append-system-prompt analogue.
+            "context": {"fileName": QWEN_CONTEXT_FILENAME},
+        }
+        # Size the model's context window to what the endpoint really serves — an
+        # overstated window makes qwen pack too much and the tail truncate, the
+        # same care the local-model failover takes with CLAUDE_CODE_MAX_CONTEXT.
+        if (QWEN_IDENT_RE.fullmatch(model) and QWEN_MODEL_BASE_URL
+                and QWEN_MODEL_CONTEXT > 0):
+            settings["modelProviders"] = {"openai": [{
+                "id": model,
+                "baseUrl": QWEN_MODEL_BASE_URL,
+                "envKey": QWEN_MODEL_API_KEY_ENV,
+                "generationConfig": {"contextWindowSize": QWEN_MODEL_CONTEXT},
+            }]}
+        return settings
+
+    def _write_qwen_worktree_config(self, sess, policy):
+        """Write the per-worktree qwen config — `.qwen/settings.json` and the
+        context file carrying the directive — then git-exclude both. Raises
+        RuntimeError only if settings.json cannot be written (that config pins
+        chat-recording / approval mode / auto-update, so a session without it
+        would run wrong); the context file and the git-exclude are best-effort."""
+        worktree = sess["worktreePath"]
+        conf_dir = os.path.join(worktree, QWEN_CONFIG_DIRNAME)
+        try:
+            os.makedirs(conf_dir, exist_ok=True)
+            with open(os.path.join(conf_dir, "settings.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(self._qwen_settings(sess), f, indent=2)
+        except OSError as e:
+            raise RuntimeError(f"qwen settings: {e}")
+        try:
+            with open(os.path.join(worktree, QWEN_CONTEXT_FILENAME), "w",
+                      encoding="utf-8") as f:
+                f.write(policy)
+        except OSError as e:
+            log(f"qwen: could not write the context file for {sess['id']} "
+                f"({e}); the session launches without the new-work directive")
+        # Keep the generated config out of git so it is neither reported as
+        # uncommitted work (prune/delete key on `git status`) nor committed by
+        # the session. Best-effort — a failure only means the files show as
+        # untracked; the files are regenerated on every launch either way.
+        self._qwen_git_exclude(worktree)
+
+    def _qwen_git_exclude(self, worktree):
+        """Add the generated qwen config to this worktree's git exclude (the
+        per-worktree `info/exclude`, resolved via git so a linked worktree's
+        real gitdir is used). Best-effort — never raises."""
+        try:
+            exclude_path = run(["git", "-C", worktree, "rev-parse",
+                                "--git-path", "info/exclude"])
+            if not exclude_path:
+                return
+            if not os.path.isabs(exclude_path):
+                exclude_path = os.path.join(worktree, exclude_path)
+            entries = [f"/{QWEN_CONFIG_DIRNAME}/", f"/{QWEN_CONTEXT_FILENAME}"]
+            existing = ""
+            try:
+                with open(exclude_path, "r", encoding="utf-8") as f:
+                    existing = f.read()
+            except OSError:
+                pass
+            add = [e for e in entries if e not in existing.split()]
+            if not add:
+                return
+            os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
+            with open(exclude_path, "a", encoding="utf-8") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                f.write("# Turma qwen runtime config (XERK-507)\n"
+                        + "\n".join(add) + "\n")
+        except Exception as e:
+            log(f"qwen: could not git-exclude the config in {worktree} ({e})")
+
+    def _qwen_runtime_file(self, claude_sid):
+        """The live-registry file qwen writes for a pinned session id, located
+        by the id ACROSS project dirs (glob) so the launcher does not depend on
+        the exact cwd->slug rule. Returns the path if present, else None."""
+        if not (claude_sid and VALID_CLAUDE_SID_RE.fullmatch(claude_sid)):
+            return None
+        hits = glob.glob(os.path.join(QWEN_PROJECTS_ROOT, "*", "chats",
+                                      f"{claude_sid}.runtime.json"))
+        return hits[0] if hits else None
+
+    def _qwen_runtime_pid(self, path):
+        """The pid recorded in a qwen `<id>.runtime.json`, or None if unreadable.
+        Best-effort and never raises — it runs in the launch-confirm loop."""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            pid = data.get("pid")
+            return int(pid) if isinstance(pid, (int, float)) and pid > 0 else None
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _confirm_qwen_launch(self, sess, claude_sid):
+        """Confirm a just-launched qwen session actually came up before it is
+        recorded running (XERK-492), the qwen analogue of _confirm_dsh_launch.
+
+        A started tmux is not proof qwen bound its session: a bad model route, a
+        failed config load or a crash-on-boot ends the process a moment later.
+        qwen writes `<id>.runtime.json` (pid/work_dir/version) the instant it
+        starts (G0 spike), so wait a bounded window for one of two verdicts:
+
+        - the tmux process is GONE — qwen is that tmux session's only command, so
+          a vanished session means it exited (crash-on-load); fail fast.
+        - the registry file exists with a LIVE pid — the session is up. A
+          resume reuses the id, so the PREVIOUS launch's registry (a dead pid)
+          lingers until qwen overwrites it; checking the pid is live is what
+          keeps that stale file from confirming a session that has not come up.
+
+        Returns True once confirmed alive, False on a dead or wedged launch."""
+        tmux = sess.get("tmuxName")
+        sid = sess.get("id")
+        deadline = time.time() + QWEN_LAUNCH_CONFIRM_SEC
+        while time.time() < deadline:
+            if not self._tmux_alive(tmux):
+                log(f"qwen session {sid}: process exited during startup "
+                    "(crashed on load) — refusing the launch")
+                return False
+            rt = self._qwen_runtime_file(claude_sid)
+            if rt:
+                pid = self._qwen_runtime_pid(rt)
+                # A live pid is the session up. An UNreadable pid (a partial
+                # write, or a version whose file shape differs) still means qwen
+                # wrote the registry — take that as up rather than false-fail.
+                if pid is None or _pid_alive(pid):
+                    return True
+            time.sleep(QWEN_LAUNCH_CONFIRM_POLL_SEC)
+        log(f"qwen session {sid}: tmux started but no live session registry "
+            f"appeared within {QWEN_LAUNCH_CONFIRM_SEC:g}s — refusing the launch")
+        return False
 
     def _launch_dsh(self, sess, resume=False, prompt=None, resume_id=None):
         """Launch a session on the dsh runtime: a headless per-session dsh process
@@ -21664,6 +22030,14 @@ class SessionManager:
         if dsh_configured():
             threading.Thread(target=self._ensure_dsh_profile,
                              name="dsh-profile", daemon=True).start()
+        # Probe the qwen runtime (binary + model route) on a WORKER THREAD when
+        # this host offers qwen — the `qwen --version` subprocess is off-beat
+        # (XERK-395), so a qwen spawn before it finishes is refused and retried
+        # rather than stalling the loop. No-op unless TURMA_QWEN is set and
+        # QWEN_ENABLED is lifted ([Qwen B]).
+        if qwen_configured():
+            threading.Thread(target=self._ensure_qwen_ready,
+                             name="qwen-ready", daemon=True).start()
         # The dsh peer-message delivery worker (XERK-476): delivers staged
         # cross-session traffic off the beat (see _dsh_peer_worker_loop). Started
         # once here rather than lazily so the first staged message is delivered
