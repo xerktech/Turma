@@ -13,6 +13,9 @@ import com.xerktech.turma.model.LocalModelInfo
 import com.xerktech.turma.model.LocalModelOption
 import org.junit.Assert.assertEquals
 import org.junit.Rule
+import com.xerktech.turma.core.Runtime
+import org.junit.After
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -38,6 +41,12 @@ class SpawnComposerTest {
 
     @get:Rule
     val compose = createComposeRule()
+
+    // dsh ships DISABLED fleet-wide (Runtime.DSH_ENABLED = false). These tests
+    // exercise the retained dsh composer machinery, so enable it before each and
+    // reset after so the flag can't leak into any other test.
+    @Before fun enableDsh() { Runtime.DSH_ENABLED = true }
+    @After fun resetDsh() { Runtime.DSH_ENABLED = false }
 
     private val local = LocalModelInfo(
         available = true, model = "gpt-oss:120b", defaultModel = "gpt-oss:120b",

@@ -119,6 +119,21 @@ export function sessionName(s: SessionInfo): string {
   return summary || s.id.slice(0, 6);
 }
 
+// In-code kill switch for ALL dsh (DeepSeek Harness runtime, XERK-460)
+// functionality on the glasses client. NOT an env/build flag — it is a single
+// source-level constant, flipped by editing this line, that hides every dsh
+// surface WITHOUT removing the machinery (the wire types in types.ts and the
+// `isDsh` marker below are retained). The agent (Python), hub and Android carry
+// the same-named `DSH_ENABLED` flag; this is the glasses half of a fleet-wide
+// disable. Set to `false` = dsh disabled.
+//
+// ESM `let` exports can't be reassigned by importers, so tests flip it through
+// `__setDshEnabled` rather than by assigning the binding.
+export let DSH_ENABLED = false;
+export function __setDshEnabled(v: boolean): void {
+  DSH_ENABLED = v;
+}
+
 // Does this session run on the dsh (DeepSeek Harness) runtime rather than Claude
 // Code (XERK-460)? `agentType` is "dsh" only for a dsh session; "claude", ""
 // (a pre-dsh agent) and absent all read as the default Claude runtime, so no
@@ -127,8 +142,12 @@ export function sessionName(s: SessionInfo): string {
 // (core/Runtime.kt). Purely presentational — busy/ready/summary state for a dsh
 // session rides the same `paneBusy`/transcript signals as any other (XERK-468),
 // so nothing else here branches on the runtime.
+//
+// Gated on the DSH_ENABLED kill switch: when dsh is disabled, no dsh session
+// exists as far as this client is concerned, so this presentational marker
+// always reads false even for a record whose `agentType` says "dsh".
 export function isDsh(s: SessionInfo): boolean {
-  return s.agentType === "dsh";
+  return DSH_ENABLED && s.agentType === "dsh";
 }
 
 // The tracker org a host belongs to — a host with no tracker creds reports no

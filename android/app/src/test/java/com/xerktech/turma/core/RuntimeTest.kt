@@ -5,10 +5,12 @@ import com.xerktech.turma.model.DshInfo
 import com.xerktech.turma.model.LocalModelInfo
 import com.xerktech.turma.model.LocalModelOption
 import com.xerktech.turma.model.SessionInfo
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 /**
@@ -17,6 +19,24 @@ import org.junit.Test
  * pin the rules themselves.
  */
 class RuntimeTest {
+
+    // dsh ships DISABLED fleet-wide (Runtime.DSH_ENABLED = false). The dsh
+    // machinery is RETAINED, so these tests prove it still works when enabled;
+    // reset in @After so the flag can't leak into any other test.
+    @Before fun enableDsh() { Runtime.DSH_ENABLED = true }
+    @After fun resetDsh() { Runtime.DSH_ENABLED = false }
+
+    @Test fun `with the kill switch OFF every dsh surface refuses`() {
+        Runtime.DSH_ENABLED = false
+        val dsh = DshInfo(available = true)
+        val agents = listOf(AgentInfo(key = "b", dsh = dsh))
+        assertFalse(Runtime.composerOffers(dsh))
+        assertFalse(Runtime.isDsh("dsh"))
+        assertNull(Runtime.hostDsh(agents, "b"))
+        assertNull(Runtime.hostDshFor(agents, "b"))
+        // The composer's Runtime rows drop dsh even when the host reports it.
+        assertFalse(Runtime.composerRuntimes(null, dsh).any { it.first == "dsh" })
+    }
 
     @Test fun `composerOffers follows the host capability flag, absent means cannot`() {
         assertTrue(Runtime.composerOffers(DshInfo(available = true)))
