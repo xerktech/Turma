@@ -452,6 +452,34 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `core/Board.kt`, tested in `core/BoardTest.kt`; the `ticketRuntimes` decode in
   `model/AgentDecodeTest.kt`.
 
+## Done (XERK-498 — dsh Trajectory replaces the terminal, no empty page)
+
+- **A dsh session is HEADLESS (no ttyd), so its chat header shows a Trajectory action, not Terminal.**
+  Before this the header always showed Terminal and tapping it opened an empty `/term` WebView — the
+  reported bug. `ui/ChatScreen.kt` now gates the header action on `Runtime.isDsh(session.agentType)`
+  (web `sessions.html` hides "Terminal ▸" / shows "Trajectory ▸"): a dsh session gets an Analytics
+  icon that routes to `Routes.trajectory(host, transcriptId)`; a claude session keeps Terminal.
+- **`ui/TrajectoryScreen.kt` is the Android port of web `renderTrajectory`** — a read-only render of
+  the dsh D3 native event log from `GET /api/dsh/<transcriptId>/trajectory` (`net/HubApi.dshTrajectory`,
+  a `Response<DshTrajectory>` so a 404 is handled apart), driven by `vm/TrajectoryViewModel`. It shows
+  the header (title/model/turn+tool-call+error counts/token totals/duration) and turns newest-first,
+  each with its tool calls (✓/✗/• + args + duration), mirroring the web. A 404 reads as "not synced
+  yet — ↻ Refresh in a moment" (the ordinary case for a just-opened running dsh session), kept apart
+  from a real error.
+- **Wire model** (`model/Models.kt`): `DshTrajectory` + `TrajTotals`/`TrajTokens`/`TrajTurn`/
+  `TrajTurnTokens`/`TrajCall`. Timestamps decode as `Double?` (dsh's own epoch-ms, can be fractional),
+  token counts as `Long` (floored hub-side). Not part of the atomic `/api/agents` decode, so a
+  wrong-typed field breaks only this screen.
+- Route `trajectory/{host}/{tid}` in `ui/TurmaApp.kt`, wired through the chat route and `SessionsRoute`
+  (`onTrajectory`). `TerminalScreen` is unchanged (a claude session still uses it); the dsh session
+  simply never navigates there now.
+- Tests: `vm/TrajectoryViewModelTest` (200/404/500/blank-id outcomes over MockWebServer),
+  `ui/DshChatActionTest` (a dsh session shows Trajectory not Terminal, carries the transcript id; a
+  claude session keeps Terminal — the wiring the `core/`-tested `Runtime.isDsh` gate does not cover),
+  `ui/TrajectoryFormatTest` (the `trajMs`/`trajNum` formatters).
+- Still open: the **glasses** client (`hub-client.ts`) exposes the terminal for a dsh session — the
+  same suppression + Trajectory render, tracked under P2 above.
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
@@ -494,14 +522,9 @@ those are marked `[MODEL]`.
   glance at the list says which sessions are on the weaker model without opening each one. Read
   `session.modelSource == "local"`, titled with `modelSourceAt`. Both fields already decode onto
   `SessionInfo`.
-- **P2 dsh Trajectory view, and no terminal for dsh (XERK-498).** The web hides the "Terminal ▸"
-  toggle for a dsh session (it is headless — no ttyd) and shows "Trajectory ▸" instead: a read-only
-  render of the dsh D3 native event log (turns/steps/tool-calls/tokens/timings) from `GET
-  /api/dsh/<transcriptId>/trajectory`. Android's `TerminalScreen` still offers a terminal for every
-  session; for a dsh session it should be suppressed (there is nothing to attach to) and, ideally,
-  replaced with the same Trajectory view. The endpoint is platform-agnostic JSON, so the port is a
-  screen that fetches + renders it; suppressing the terminal entry for `agentType == "dsh"` is the
-  minimum. Glasses (`hub-client.ts`) likewise still exposes the terminal for dsh — same suppression.
+- **P2 dsh Trajectory view, and no terminal for dsh (XERK-498).** Android half DONE (see Done below).
+  Still open: **glasses** (`hub-client.ts`) likewise still exposes the terminal for a dsh session —
+  the same suppression, plus ideally the same Trajectory render.
 - **P3 host-wide "dsh web ↗" link in the dsh chat header (XERK-501).** The web shows a link to the
   host's single host-wide `dsh web` viewer for a dsh session whose host reports a reachable
   `dsh.web.url` (`AgentInfo.dsh.web = {running, port, url}`, hub-whitelisted; absent/`url:null` on a

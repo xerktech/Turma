@@ -7,6 +7,7 @@ import com.xerktech.turma.model.CreateMetaEnvelope
 import com.xerktech.turma.model.CreateResultEnvelope
 import com.xerktech.turma.model.CreateTicketRequest
 import com.xerktech.turma.model.CreateTicketResponse
+import com.xerktech.turma.model.DshTrajectory
 import com.xerktech.turma.model.HistoryResponse
 import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.SearchResponse
@@ -180,6 +181,15 @@ interface HubApi {
 
     @GET("api/archive/{tid}")
     suspend fun archiveTranscript(@Path("tid") transcriptId: String): ArchiveTranscript
+
+    // A dsh session's read-only Trajectory (XERK-498): turns/steps/tool-calls/
+    // tokens parsed hub-side from the D3 native event log the raw archive holds
+    // (`turma/archive.js` dshTrajectory). A Response, not a bare body, because a
+    // 404 is the ORDINARY case for a just-opened running dsh session whose log
+    // hasn't synced to the archive yet — the screen shows "not synced yet, retry"
+    // for a 404 and an error only for anything else.
+    @GET("api/dsh/{tid}/trajectory")
+    suspend fun dshTrajectory(@Path("tid") transcriptId: String): Response<DshTrajectory>
 
     // 200 {issue|error, fetchedAt, stale?}, or 202 {pending} while the host
     // fetches it on demand. The issue is nested under `issue` in the envelope.

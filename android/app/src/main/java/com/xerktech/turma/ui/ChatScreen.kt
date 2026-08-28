@@ -30,6 +30,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.CheckBox
 import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
+import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Mic
@@ -99,6 +100,11 @@ fun ChatScreen(
     sessionId: String,
     onBack: () -> Unit,
     onTerminal: () -> Unit,
+    // A dsh session is HEADLESS (no ttyd), so its header shows a Trajectory
+    // action instead of Terminal (XERK-498), carrying the session's transcript
+    // id — what `/api/dsh/<tid>/trajectory` reads. Default no-op keeps previews
+    // and any caller that only wants the terminal happy.
+    onTrajectory: (transcriptId: String) -> Unit = {},
     showBack: Boolean = true,
     onOpenSubagent: (String, String) -> Unit = { _, _ -> },
 ) {
@@ -207,7 +213,24 @@ fun ChatScreen(
                 },
                 actions = {
                     ChatSettingsMenu(state.verbosity) { vm.setVerbosity(it) }
-                    IconButton(onClick = onTerminal) { Icon(Icons.Filled.Terminal, "Terminal") }
+                    // A dsh session has no ttyd terminal (XERK-498) — the web
+                    // hides "Terminal ▸" and shows "Trajectory ▸" instead. Match
+                    // it: route a dsh session to its read-only Trajectory rather
+                    // than to an empty terminal. A claude session keeps Terminal.
+                    val sess = state.session
+                    if (com.xerktech.turma.core.Runtime.isDsh(sess?.agentType)) {
+                        // A dsh session pins its id at launch (D3), so transcriptId
+                        // is present in practice; guard anyway — navigating with an
+                        // empty {tid} segment would not match the route.
+                        IconButton(onClick = {
+                            val tid = sess?.transcriptId.orEmpty()
+                            if (tid.isNotBlank()) onTrajectory(tid)
+                        }) {
+                            Icon(Icons.Filled.Analytics, "Trajectory")
+                        }
+                    } else {
+                        IconButton(onClick = onTerminal) { Icon(Icons.Filled.Terminal, "Terminal") }
+                    }
                     // Kill the session you're in (web chatKill): arm/confirm, then
                     // leave the view — the card drops on the agent's next beat.
                     KillAction(onKill = { vm.kill(); onBack() })

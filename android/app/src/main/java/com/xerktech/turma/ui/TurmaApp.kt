@@ -23,6 +23,10 @@ object Routes {
     const val LOGIN = "login"
     fun chat(host: String, session: String) = "chat/${enc(host)}/${enc(session)}"
     fun terminal(host: String, session: String) = "terminal/${enc(host)}/${enc(session)}"
+    /** The dsh session's read-only Trajectory (XERK-498) — a headless dsh
+     *  session has no terminal, so its chat header routes here instead. Keyed on
+     *  the TRANSCRIPT id (what `/api/dsh/<tid>/trajectory` reads). */
+    fun trajectory(host: String, transcriptId: String) = "trajectory/${enc(host)}/${enc(transcriptId)}"
     /** Read-only review of an ended session by transcript id — what a board
      *  ticket chip opens for anything not running (web /sessions?ended=<tid>). */
     fun ended(host: String, transcriptId: String) = "ended/${enc(host)}/${enc(transcriptId)}"
@@ -125,6 +129,7 @@ fun TurmaApp(
                 wide = wide,
                 onNavigate = goTab,
                 onTerminal = { h, s -> nav.navigate(Routes.terminal(h, s)) },
+                onTrajectory = { h, tid -> nav.navigate(Routes.trajectory(h, tid)) },
             )
         }
         composable(TopDest.BOARD.route) {
@@ -155,6 +160,7 @@ fun TurmaApp(
                 sessionId = session,
                 onBack = { nav.popBackStack() },
                 onTerminal = { nav.navigate(Routes.terminal(host, session)) },
+                onTrajectory = { tid -> nav.navigate(Routes.trajectory(host, tid)) },
             )
         }
         composable(
@@ -167,6 +173,19 @@ fun TurmaApp(
             val host = entry.arguments?.getString("host").orEmpty()
             val session = entry.arguments?.getString("session").orEmpty()
             TerminalScreen(host = host, sessionId = session, onBack = { nav.popBackStack() })
+        }
+        // A dsh session's read-only Trajectory (XERK-498) — the terminal
+        // replacement for a headless dsh session. Keyed on the transcript id.
+        composable(
+            "trajectory/{host}/{tid}",
+            arguments = listOf(
+                navArgument("host") { type = NavType.StringType },
+                navArgument("tid") { type = NavType.StringType },
+            ),
+        ) { entry ->
+            val host = entry.arguments?.getString("host").orEmpty()
+            val tid = entry.arguments?.getString("tid").orEmpty()
+            TrajectoryScreen(host = host, transcriptId = tid, onBack = { nav.popBackStack() })
         }
         // An ended session's read-only review, reached from a board ticket chip
         // (the Sessions pane composes EndedSessionView inline instead).
