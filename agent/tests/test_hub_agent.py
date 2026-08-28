@@ -15402,6 +15402,29 @@ class TestSetSummary(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.registry[0]["summary"], "My Own Name")
         self.assertTrue(sm.registry[0]["summaryManual"])
 
+    def test_resume_regates_agent_type_on_dsh_availability(self):
+        # The resume rebuild re-gates agentType on dsh_configured() (like
+        # receive_migration): a persisted "dsh" resumes as claude when this host
+        # does not offer dsh — which the DSH_ENABLED kill switch forces off —
+        # rather than as a runtime the host cannot launch. Without the re-gate a
+        # stale "dsh" record would come back as dsh with the switch off.
+        wt = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, wt, ignore_errors=True)
+
+        def resumed_agent_type(dsh_on):
+            sm = self.make_manager()
+            sm.closed = [{"id": "s1", "status": "stopped", "repo": "r",
+                          "worktreePath": wt, "tmuxName": "agent-s1",
+                          "rcName": "h-r-s1", "ttydPort": 7681, "agentType": "dsh"}]
+            with mock.patch.object(ha, "dsh_configured", lambda: dsh_on), \
+                    mock.patch.object(sm, "_launch_tmux"), \
+                    mock.patch.object(sm, "_launch_ttyd"):
+                sm.resume("s1")
+            return sm.registry[0]["agentType"]
+
+        self.assertEqual(resumed_agent_type(False), "claude")  # kill switch / no dsh
+        self.assertEqual(resumed_agent_type(True), "dsh")      # dsh offered -> preserved
+
 
 class TestSessionSummaries(ManagerMixin, unittest.TestCase):
     def test_missing_prompt_skipped(self):
