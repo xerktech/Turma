@@ -1220,8 +1220,13 @@ QWEN_MODEL_BASE_URL = (os.environ.get("QWEN_MODEL_BASE_URL")
                        or os.environ.get("LOCAL_MODEL_BASE_URL") or "")
 QWEN_MODEL_API_KEY_ENV = os.environ.get("QWEN_MODEL_API_KEY_ENV",
                                         "LOCAL_MODEL_API_KEY")
-QWEN_MODEL_CONTEXT = int(os.environ.get("QWEN_MODEL_CONTEXT")
-                         or os.environ.get("LOCAL_MODEL_CONTEXT") or "262144")
+# Parsed through _positive_int_env, never a bare int() at module scope: a typo
+# in this var must not raise during import and take every session on the host
+# down (the same discipline LOCAL_MODEL_CONTEXT already uses — a bare int() here
+# would be a third copy of a fragile pattern). Falls back to the already-safe
+# LOCAL_MODEL_CONTEXT when unset, so a host wired for a local endpoint inherits
+# its window; an operator sets QWEN_MODEL_CONTEXT for a wider one (validated).
+QWEN_MODEL_CONTEXT = _positive_int_env("QWEN_MODEL_CONTEXT", LOCAL_MODEL_CONTEXT)
 # qwen writes its native session log + live registry under ~/.qwen/projects/,
 # mirroring Claude's ~/.claude/projects/ (a per-cwd slug). The LAUNCHER does not
 # READ the native transcript — the projection into Claude JSONL that the chat/
@@ -1244,11 +1249,18 @@ QWEN_RUNTIME_DIR = os.path.join(REGISTRY_DIR, "qwen")
 # folder-trust OFF (Turma owns the worktree). The new-work / ticket-branch /
 # peers directive rides qwen's CONTEXT ("memory") file — qwen has NO
 # --append-system-prompt, and the context file is loaded INTO the system prompt,
-# so it is the append-system-prompt analogue. Both files are git-excluded per
-# worktree so they never read as uncommitted work (prune/delete key on that) nor
-# get committed by the session; they are regenerated on every launch.
+# so it is the append-system-prompt analogue.
+#   The context file is a TURMA-SPECIFIC name, NOT the conventional `QWEN.md`, so
+#   it can never clobber a repo's OWN tracked `QWEN.md` (a project that ships qwen
+#   context) — overwriting a tracked file would be uncommitted work the session
+#   might commit. `context.fileName` points qwen at this name; a project's own
+#   `QWEN.md` is not auto-loaded for a Turma qwen session (an accepted trade —
+#   the SESSION's directive is what must land, and [Qwen S1]/[C] can refine).
+# Both files are git-excluded so they never read as uncommitted work (prune/delete
+# key on that) nor get committed; they are regenerated on every launch.
 QWEN_CONFIG_DIRNAME = ".qwen"
-QWEN_CONTEXT_FILENAME = os.environ.get("QWEN_CONTEXT_FILENAME", "QWEN.md")
+QWEN_CONTEXT_FILENAME = os.environ.get("QWEN_CONTEXT_FILENAME",
+                                       ".turma-qwen-context.md")
 # The qwen model/endpoint identifiers ride into a generated settings.json; the
 # model name also reaches OPENAI_MODEL in the env file. Charset-check them like a
 # local model name / dsh identifier — operator-set, but never trust an env value
@@ -13569,9 +13581,14 @@ class SessionManager:
         self._qwen_git_exclude(worktree)
 
     def _qwen_git_exclude(self, worktree):
-        """Add the generated qwen config to this worktree's git exclude (the
-        per-worktree `info/exclude`, resolved via git so a linked worktree's
-        real gitdir is used). Best-effort — never raises."""
+        """Add the generated qwen config to git's exclude so `git status` (hence
+        prune's dirty check) and the session's own commits never see it.
+        `git rev-parse --git-path info/exclude` resolves to the repo's COMMON
+        `.git/info/exclude` (shared by every linked worktree of the repo), not a
+        per-worktree file — so the patterns apply repo-wide. That is harmless:
+        the entries are anchored/idempotent, exclude only UNTRACKED files (a repo
+        that TRACKS a `.qwen/` or context file is unaffected), and every worktree
+        of a Turma pool uses the config the same way. Best-effort — never raises."""
         try:
             exclude_path = run(["git", "-C", worktree, "rev-parse",
                                 "--git-path", "info/exclude"])

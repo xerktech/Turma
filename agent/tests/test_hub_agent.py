@@ -4088,8 +4088,11 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         self.assertTrue(settings["general"]["disableAutoUpdate"])
         self.assertEqual(settings["tools"]["approvalMode"], "auto")
         self.assertFalse(settings["security"]["folderTrust"]["enabled"])
-        self.assertEqual(settings["context"]["fileName"], "QWEN.md")
-        with open(os.path.join(self.wt, "QWEN.md")) as f:
+        # The context file is a TURMA-specific name (never the conventional
+        # QWEN.md), so it can't clobber a repo's own tracked QWEN.md.
+        self.assertEqual(settings["context"]["fileName"], ha.QWEN_CONTEXT_FILENAME)
+        self.assertNotEqual(ha.QWEN_CONTEXT_FILENAME, "QWEN.md")
+        with open(os.path.join(self.wt, ha.QWEN_CONTEXT_FILENAME)) as f:
             ctx = f.read()
         self.assertIn("git fetch origin", ctx)          # NEW_WORK directive
         self.assertIn("peers.tsv", ctx)                 # PEERS directive
@@ -4115,7 +4118,7 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sess = self._sess(ticket={"key": "XERK-9", "branch": "XERK-9"})
         self._launch(sm, sess, prompt="work it")
-        with open(os.path.join(self.wt, "QWEN.md")) as f:
+        with open(os.path.join(self.wt, ha.QWEN_CONTEXT_FILENAME)) as f:
             ctx = f.read()
         self.assertIn("XERK-9", ctx)
 
@@ -4128,16 +4131,32 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         self.assertNotIn("--session-id", cmd)
         self.assertNotIn(" -i ", cmd)
 
+    def test_resume_with_a_prompt_still_suppresses_the_initial_prompt(self):
+        # `-i` is a SPAWN-only initial-prompt delivery (a resume continues the
+        # existing context). Exercises the `and not resume` guard directly, so
+        # dropping it is caught even though no live caller passes a resume prompt.
+        sm = self.make_manager()
+        sess = self._sess(claudeSessionId="11111111-2222-3333-4444-555555555555")
+        self._launch(sm, sess, resume=True, prompt="should NOT be sent")
+        cmd = self._last_tmux_cmd()
+        tail = shlex.split(cmd.split("set +a; ", 1)[1])
+        self.assertNotIn("-i", tail)
+        self.assertNotIn("should NOT be sent", cmd)
+
     def test_failed_confirmation_tears_down_and_raises(self):
         # The XERK-492 lesson: a started tmux is not a live session. A failed
-        # confirm kills the tmux and raises so the caller reports a reason.
+        # confirm kills the tmux and raises so the caller reports a reason. Assert
+        # _kill_tmux is invoked specifically — the launcher ALSO runs a clean-slate
+        # `tmux kill-session` before new-session, so a bare run_calls membership
+        # check would pass even if the failed-confirm teardown were removed.
         sm = self.make_manager()
         sess = self._sess()
         sm._qwen_ready = True
-        with mock.patch.object(sm, "_confirm_qwen_launch", return_value=False):
+        with mock.patch.object(sm, "_confirm_qwen_launch", return_value=False), \
+             mock.patch.object(sm, "_kill_tmux") as kill:
             with self.assertRaises(RuntimeError):
                 sm._launch_qwen(sess)
-        self.assertIn(["tmux", "kill-session", "-t", "agent-q1"], self.run_calls)
+        kill.assert_called_once_with(sess)
 
     # --- launch confirmation (XERK-492) --------------------------------------
 
@@ -4169,6 +4188,48 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
              mock.patch.object(ha.time, "sleep", lambda *_: None), \
              mock.patch.object(sm, "_tmux_alive", return_value=True):
             self.assertFalse(sm._confirm_qwen_launch(self._sess(), "cccc"))
+
+    # --- git-exclude against a REAL linked worktree --------------------------
+
+    def test_git_exclude_hides_the_config_from_a_real_worktree(self):
+        # The generated `.qwen/`/context file must never read as uncommitted
+        # work (prune/delete key on `git status`). Drive _qwen_git_exclude
+        # against a real git repo + linked worktree — the mixin's fake `run`
+        # can't exercise the exclude, which is why QA found it untested.
+        repo = os.path.join(self.tmp, "repo")
+        wt = os.path.join(self.tmp, "wt2")
+
+        def g(*args, cwd=repo):
+            subprocess.run(["git", "-C", cwd, *args], check=True,
+                           capture_output=True, text=True)
+
+        subprocess.run(["git", "init", "-q", repo], check=True,
+                       capture_output=True, text=True)
+        g("config", "user.email", "t@t")
+        g("config", "user.name", "t")
+        g("commit", "--allow-empty", "-qm", "init")
+        g("worktree", "add", "-q", "--detach", wt)
+
+        def real_run(cmd, cwd=None, timeout=15):
+            r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+            return r.stdout.strip() if r.returncode == 0 else ""
+
+        os.makedirs(os.path.join(wt, ha.QWEN_CONFIG_DIRNAME))
+        open(os.path.join(wt, ha.QWEN_CONFIG_DIRNAME, "settings.json"),
+             "w").close()
+        open(os.path.join(wt, ha.QWEN_CONTEXT_FILENAME), "w").close()
+        sm = self.make_manager()
+        with mock.patch.object(ha, "run", real_run):
+            sm._qwen_git_exclude(wt)
+            sm._qwen_git_exclude(wt)   # idempotent — no duplicate entries
+        self.assertEqual(real_run(["git", "-C", wt, "status", "--porcelain"]), "")
+        # It is the repo's COMMON info/exclude (shared by every worktree), and
+        # the entries are written once.
+        with open(os.path.join(repo, ".git", "info", "exclude")) as f:
+            body = f.read()
+        self.assertEqual(body.count("Turma qwen runtime config"), 1)
+        self.assertIn(f"/{ha.QWEN_CONFIG_DIRNAME}/", body)
+        self.assertIn(f"/{ha.QWEN_CONTEXT_FILENAME}", body)
 
 
 class TestDshRouting(ManagerMixin, unittest.TestCase):
