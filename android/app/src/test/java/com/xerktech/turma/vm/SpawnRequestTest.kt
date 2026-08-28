@@ -91,6 +91,13 @@ class SpawnRequestTest {
             json(spawnRequest("Turma", agentType = Runtime.DSH)))
     }
 
+    @Test fun `a qwen spawn carries the runtime (XERK-506)`() {
+        // spawnValue sends the non-default "qwen" the same way it sends "dsh";
+        // the hub 409s it at a host that doesn't offer qwen.
+        assertEquals("""{"repo":"Turma","agentType":"qwen"}""",
+            json(spawnRequest("Turma", agentType = Runtime.QWEN)))
+    }
+
     @Test fun `the full composer body keeps its field order and content`() {
         assertEquals(
             """{"repo":"Turma","prompt":"do the thing","label":"lbl","baseRef":"main",""" +

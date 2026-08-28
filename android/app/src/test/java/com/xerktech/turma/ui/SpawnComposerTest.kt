@@ -45,8 +45,8 @@ class SpawnComposerTest {
     // dsh ships DISABLED fleet-wide (Runtime.DSH_ENABLED = false). These tests
     // exercise the retained dsh composer machinery, so enable it before each and
     // reset after so the flag can't leak into any other test.
-    @Before fun enableDsh() { Runtime.DSH_ENABLED = true }
-    @After fun resetDsh() { Runtime.DSH_ENABLED = false }
+    @Before fun enableDsh() { Runtime.DSH_ENABLED = true; Runtime.QWEN_ENABLED = true }
+    @After fun resetDsh() { Runtime.DSH_ENABLED = false; Runtime.QWEN_ENABLED = false }
 
     private val local = LocalModelInfo(
         available = true, model = "gpt-oss:120b", defaultModel = "gpt-oss:120b",
@@ -72,11 +72,12 @@ class SpawnComposerTest {
     private fun show(
         localModel: LocalModelInfo? = null,
         dshInfo: DshInfo? = null,
+        qwenInfo: com.xerktech.turma.model.QwenInfo? = null,
         onSpawn: (Spawn) -> Unit = {},
     ) = compose.setContent {
         SpawnDialog(
             host = "nas01", repo = "Turma", isRoot = false,
-            localModel = localModel, dsh = dshInfo, onDismiss = {},
+            localModel = localModel, dsh = dshInfo, qwen = qwenInfo, onDismiss = {},
             onSpawn = { _, _, _, model, mode, source, lm, agentType ->
                 onSpawn(Spawn(model, mode, source, lm, agentType))
             },
@@ -163,6 +164,29 @@ class SpawnComposerTest {
         // No permission mode: dsh's approvals are dsh-managed and web omits it,
         // so the body must not carry a stray "auto" (spawnRequest drops blank).
         assertEquals("", got?.mode)
+    }
+
+    // ---- the qwen runtime (XERK-506 [Qwen A]) --------------------------------
+
+    @Test
+    fun `the picker offers Qwen Code when the host reports it`() {
+        show(qwenInfo = com.xerktech.turma.model.QwenInfo(available = true))
+        compose.onNodeWithText("Claude Code").performScrollTo().performClick()
+        compose.onNodeWithText("Qwen Code").assertIsDisplayed()
+    }
+
+    @Test
+    fun `Qwen Code carries agentType qwen and no model or permission mode`() {
+        var got: Spawn? = null
+        show(qwenInfo = com.xerktech.turma.model.QwenInfo(available = true)) { got = it }
+        pick(current = "Claude Code", option = "Qwen Code")
+        // [Qwen A] is presentational plumbing only — no model or permission row.
+        compose.onNodeWithText("Permission mode").assertDoesNotExist()
+        compose.onNodeWithText("Spawn").performClick()
+        assertEquals("qwen", got?.agentType)
+        assertEquals("", got?.model)              // no qwen model in [Qwen A]
+        assertEquals("subscription", got?.source) // never a modelSource
+        assertEquals("", got?.mode)               // no permission mode
     }
 
     // ---- resets when a runtime leaves the picker ----------------------------

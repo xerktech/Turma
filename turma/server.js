@@ -52,13 +52,25 @@ const PORT = parseInt(process.env.PORT || "8300", 10);
 // dsh functionality WITHOUT deleting any of the dsh machinery, so it can be flipped
 // back on by editing one line. Set to DISABLED (false).
 //
-// The agent (Python), Android and glasses each carry a SAME-NAMED flag, so no
-// single component can re-enable dsh on its own — the hub still refuses to accept
-// or advertise dsh here even if an agent reports the capability. It gates the two
+// The agent (Python) and Android each carry a SAME-NAMED flag, so no single
+// component can re-enable dsh on its own — the hub still refuses to accept or
+// advertise dsh here even if an agent reports the capability. (Glasses has no
+// runtime-selection surface, so it carries no such flag.) It gates the two
 // hub choke points every dsh decision funnels through: `dshAvailable` (server-side
 // acceptance — spawn gate, org gate, ticket routing) and `normalizeDsh` (the wire
 // coercion, so the served /api/agents payload never advertises dsh to any client).
 let DSH_ENABLED = false;
+
+// The qwen (Qwen Code, XERK-504) equivalent of DSH_ENABLED. Same in-CODE kill
+// switch discipline: the agent (Python) and Android carry a SAME-named flag
+// (glasses has no runtime-selection surface), so no single component can
+// re-enable qwen on its own — the hub still
+// refuses to accept or advertise qwen here even if an agent reports the
+// capability. It gates the two hub choke points every qwen decision funnels
+// through: `qwenAvailable` (server-side acceptance — the spawn gate) and
+// `normalizeQwen` (the wire coercion, so the served /api/agents payload never
+// advertises qwen to any client). [Qwen A] ships it false; [Qwen B] lifts it.
+let QWEN_ENABLED = false;
 
 /**
  * The memory ceiling this process actually runs under — `containerMemoryLimit()`
@@ -242,6 +254,16 @@ function dshAvailable(agent) {
   return Boolean(agent && agent.dsh && agent.dsh.available);
 }
 
+// Whether a host offers the qwen (Qwen Code, XERK-504) runtime — the qwen twin
+// of dshAvailable. The capability gate the composer's runtime option is shown
+// on, and the spawn route validates a `qwen` choice against. An ABSENT flag (a
+// pre-qwen agent) means "cannot do it". The fleet-wide kill switch wins first,
+// so with qwen disabled no host offers it whatever it reports.
+function qwenAvailable(agent) {
+  if (!QWEN_ENABLED) return false;
+  return Boolean(agent && agent.qwen && agent.qwen.available);
+}
+
 // Whether `model` is one the host's discovered set serves (XERK-489) — the
 // membership check that makes the dropdown honest, mirroring checkSpawnModelSource.
 // An EMPTY set (older agent, or discovery not landed) cannot DISPROVE membership,
@@ -316,11 +338,14 @@ function checkSpawnModelSource(cmd, hostKey) {
 // too (resolve_agent_type) — this is the hub half of that contract.
 function checkSpawnAgentType(cmd, hostKey) {
   if (cmd.agentType == null) return null;
-  if (!["claude", "dsh"].includes(cmd.agentType)) {
-    return { status: 400, error: "agentType must be claude or dsh" };
+  if (!["claude", "dsh", "qwen"].includes(cmd.agentType)) {
+    return { status: 400, error: "agentType must be claude, dsh or qwen" };
   }
   if (cmd.agentType === "dsh" && !dshAvailable(agents[hostKey])) {
     return { status: 409, error: "host does not offer the dsh runtime" };
+  }
+  if (cmd.agentType === "qwen" && !qwenAvailable(agents[hostKey])) {
+    return { status: 409, error: "host does not offer the qwen runtime" };
   }
   return null;
 }
@@ -2963,6 +2988,29 @@ function normalizeDsh(payload) {
   payload.dsh = out;
 }
 
+// The qwen (Qwen Code, XERK-504) capability block, coerced at ingest exactly
+// like normalizeDsh and for the same reason: Android TYPES it (AgentInfo.qwen),
+// and `/api/agents` decodes atomically there, so one host's `qwen.available:
+// "yes"` would fail the whole fleet decode. Strictly boolean, so a non-`true`
+// value — a truthy string included — reads as "this host cannot do qwen", which
+// is what makes the composer HIDE the runtime option for it rather than queue a
+// spawn the host will refuse. With the fleet-wide kill switch off the served
+// block is fully INERT ({available:false}), so nothing qwen-shaped rides
+// /api/agents to any client even when an agent reports the capability.
+function normalizeQwen(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const q = payload.qwen;
+  if (!q || typeof q !== "object" || Array.isArray(q)) {
+    if ("qwen" in payload) payload.qwen = null;
+    return;
+  }
+  if (!QWEN_ENABLED) {
+    payload.qwen = { available: false };
+    return;
+  }
+  payload.qwen = { available: q.available === true };
+}
+
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
 // into the host's per-session cache, then bound its memory: drop entries older
 // than HISTORY_MAX_AGE_MS and cap the cache at HISTORY_MAX_SESSIONS, evicting
@@ -3842,7 +3890,7 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "dsh", "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
+  "dsh", "qwen", "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
   "sessions", "startedAt", "subscription", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
@@ -4123,6 +4171,7 @@ function normalizeRecord(a) {
   normalizeSubscription(a);
   normalizeLocalModel(a);
   normalizeDsh(a);
+  normalizeQwen(a);
   normalizeModels(a);
   normalizeSpawnRefusals(a);
   normalizeRetired(a);
@@ -4356,6 +4405,9 @@ function normalizeSessions(payload) {
     // default), so no client renders a session as dsh and the hub's own /model
     // route never takes its dsh branch. Mirrors the agent's rebuild coercion.
     if (!DSH_ENABLED && s.agentType === "dsh") s.agentType = "";
+    // Same kill-switch coercion for qwen (XERK-506): a reported/persisted qwen
+    // session runtime reads as claude on the wire while QWEN_ENABLED is off.
+    if (!QWEN_ENABLED && s.agentType === "qwen") s.agentType = "";
     // XERK-489: the per-session self-hosted model name (String? on Android) and
     // its context window (Int? on Android). Typing a field on SessionInfo and
     // adding its hub-side coercion are the SAME change — a wrong-typed one from a
@@ -10397,6 +10449,13 @@ if (process.env.TURMA_TEST) {
     // reset to false after); the getter is for asserting the default is off.
     __setDshEnabled(v) { DSH_ENABLED = v; },
     __getDshEnabled() { return DSH_ENABLED; },
+    normalizeQwen,
+    qwenAvailable,
+    // The fleet-wide qwen kill switch (XERK-504) mirrors the dsh one above: the
+    // [Qwen A] tests flip it ON around themselves to prove the plumbing works
+    // when enabled, and assert the default is off.
+    __setQwenEnabled(v) { QWEN_ENABLED = v; },
+    __getQwenEnabled() { return QWEN_ENABLED; },
     normalizeRetired,
     normalizeJira,
     normalizeClones,

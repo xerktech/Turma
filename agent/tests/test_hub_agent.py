@@ -567,6 +567,67 @@ class TestSpawnOptionHelpers(unittest.TestCase):
             self.assertEqual(ha.resolve_agent_type("dsh"), "dsh")
             self.assertEqual(ha.resolve_agent_type("claude"), "claude")
 
+    def test_qwen_configured_is_off_by_default_and_env_gated(self):
+        # The in-code QWEN_ENABLED kill switch wins over the env, exactly like
+        # DSH_ENABLED: while it is False (the shipped default), every TURMA_QWEN
+        # value reads as off, so the capability is disabled fleet-wide no matter
+        # what a host's env says.
+        for on in ("1", "true", "TRUE", "yes", "on", " On "):
+            with mock.patch.dict(os.environ, {"TURMA_QWEN": on}):
+                self.assertFalse(ha.qwen_configured(), on)
+        # With the switch lifted the env gate decides: opt-in, off by default, so
+        # a host that lifts the flag but sets no env still degrades.
+        with mock.patch.object(ha, "QWEN_ENABLED", True):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("TURMA_QWEN", None)
+                self.assertFalse(ha.qwen_configured())
+            for on in ("1", "true", "TRUE", "yes", "on", " On "):
+                with mock.patch.dict(os.environ, {"TURMA_QWEN": on}):
+                    self.assertTrue(ha.qwen_configured(), on)
+            for off in ("0", "", "no", "off", "maybe"):
+                with mock.patch.dict(os.environ, {"TURMA_QWEN": off}):
+                    self.assertFalse(ha.qwen_configured(), off)
+
+    def test_resolve_agent_type_qwen_gate(self):
+        # qwen is in the enum but refused on a host that does not offer it, the
+        # dsh gate mirrored (a clean spawn error beats a record naming a runtime
+        # this host cannot launch).
+        self.assertIn("qwen", ha.AGENT_TYPES)
+        with mock.patch.object(ha, "qwen_configured", lambda: False):
+            with self.assertRaises(ValueError):
+                ha.resolve_agent_type("qwen")
+            # claude is unaffected by the qwen gate.
+            self.assertEqual(ha.resolve_agent_type("claude"), "claude")
+        with mock.patch.object(ha, "qwen_configured", lambda: True):
+            self.assertEqual(ha.resolve_agent_type("qwen"), "qwen")
+
+    def test_agent_type_configured_gates_each_runtime_independently(self):
+        # The rebuild/resume guard: blank/claude always launchable; dsh and qwen
+        # each follow THEIR OWN capability, not each other's — so a qwen session
+        # resumes on a qwen-only host (the bug the dsh-only guard had). An unknown
+        # runtime is not launchable (the caller falls back to claude).
+        with mock.patch.object(ha, "dsh_configured", lambda: True), \
+             mock.patch.object(ha, "qwen_configured", lambda: False):
+            self.assertTrue(ha.agent_type_configured(""))
+            self.assertTrue(ha.agent_type_configured("claude"))
+            self.assertTrue(ha.agent_type_configured("dsh"))
+            self.assertFalse(ha.agent_type_configured("qwen"))
+            self.assertFalse(ha.agent_type_configured("codex"))
+        with mock.patch.object(ha, "dsh_configured", lambda: False), \
+             mock.patch.object(ha, "qwen_configured", lambda: True):
+            self.assertFalse(ha.agent_type_configured("dsh"))
+            self.assertTrue(ha.agent_type_configured("qwen"))
+
+    def test_qwen_payload_is_the_capability_flag_alone(self):
+        # The heartbeat qwen block tracks qwen_configured and carries ONLY
+        # {available} ([Qwen A] has no qwen model plumbing) — off by default so
+        # every current host degrades.
+        sm = ha.SessionManager()
+        with mock.patch.object(ha, "qwen_configured", lambda: False):
+            self.assertEqual(sm._qwen_payload(), {"available": False})
+        with mock.patch.object(ha, "qwen_configured", lambda: True):
+            self.assertEqual(sm._qwen_payload(), {"available": True})
+
     def test_perm_cycle_for(self):
         base = ["default", "acceptEdits", "plan"]
         # Base modes / blank / unknown launch -> base cycle only, no optionals.

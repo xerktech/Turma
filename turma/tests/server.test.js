@@ -138,7 +138,7 @@ const hub = require("../server.js");
 // The dsh tests below flip it ON to exercise the retained machinery; this resets
 // it after EVERY test (runs even on a thrown assertion) so that ON state can
 // never leak into the non-dsh tests that surround them.
-test.afterEach(() => { hub.__setDshEnabled(false); });
+test.afterEach(() => { hub.__setDshEnabled(false); hub.__setQwenEnabled(false); });
 // notify() no-ops when no device is registered; register one so the alert tests
 // see the fan-out. Real fan-out/pruning is exercised separately below.
 hub.registerDevice("capture-device", "android", ["dismiss"]);
@@ -11163,6 +11163,91 @@ test("http: spawning dsh is refused on a host that does not offer it (XERK-465)"
 
 test("heartbeat: dsh is a known key, not an unknown-field remnant (XERK-465)", async () => {
   assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("dsh"));
+});
+
+// ---- XERK-506 [Qwen A]: the qwen runtime field + capability flag -------------
+
+test("normalizeQwen coerces the capability flag strictly boolean (XERK-506)", () => {
+  hub.__setQwenEnabled(true);
+  // Same atomic-decode hazard as normalizeDsh: one host's bad `qwen` block would
+  // fail Android's whole /api/agents decode and empty the fleet.
+  const norm = (qwen) => { const p = { device: "h", qwen }; hub.normalizeQwen(p); return p.qwen; };
+  assert.deepEqual(norm({ available: true }), { available: true });
+  // Strictly boolean: a truthy non-true value reads as "cannot do qwen".
+  assert.deepEqual(norm({ available: "yes" }), { available: false });
+  assert.deepEqual(norm({ available: 1 }), { available: false });
+  assert.deepEqual(norm({ available: false }), { available: false });
+  // [Qwen A] carries ONLY {available}: any unknown extra key is dropped (rebuilt,
+  // not spread), so no qwen model plumbing leaks onto the wire before [Qwen B].
+  assert.deepEqual(norm({ available: true, models: [{ id: "x" }] }), { available: true });
+  // Not an object at all -> null, which every client reads as "cannot do qwen".
+  assert.equal(norm("yes"), null);
+  assert.equal(norm([1]), null);
+  assert.equal(norm(null), null);
+  // A pre-qwen agent sends nothing; the key stays absent, not an explicit null.
+  const old = { device: "h" };
+  hub.normalizeQwen(old);
+  assert.ok(!("qwen" in old));
+});
+
+test("QWEN_ENABLED off (the shipped default) makes the hub serve an inert qwen block and no qwen runtime", () => {
+  // Deliberately does NOT flip the flag — it pins the SHIPPED default, so the
+  // flag-on qwen tests can't stay green with every hub kill-switch gate removed.
+  assert.equal(hub.__getQwenEnabled(), false);
+  // qwenAvailable refuses whatever an agent claims.
+  assert.equal(hub.qwenAvailable({ qwen: { available: true } }), false);
+  // normalizeQwen forces the block inert even from a populated agent report.
+  const p = { qwen: { available: true } };
+  hub.normalizeQwen(p);
+  assert.deepEqual(p.qwen, { available: false });
+  // normalizeRecord (the real ingest/restore path) coerces a qwen session runtime
+  // to claude on the wire, so no client renders a session as qwen.
+  const rec = { device: "h", qwen: { available: true }, sessions: [{ id: "s1", agentType: "qwen" }] };
+  hub.normalizeRecord(rec);
+  assert.equal(rec.qwen.available, false);
+  assert.equal(rec.sessions[0].agentType, "");
+});
+
+test("heartbeat: qwen flag + session agentType survive into the fleet payload (XERK-506)", async () => {
+  hub.__setQwenEnabled(true);
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "qwen1",
+      qwen: { available: true },
+      sessions: [{ id: "s1", repo: "Turma", status: "running", agentType: "qwen" }],
+    },
+    headers: agentHeaders,
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const host = res.body.agents.find((a) => a.device === "qwen1");
+  assert.equal(host.qwen.available, true);
+  assert.equal(host.sessions[0].agentType, "qwen");
+});
+
+test("http: spawn validates a qwen agentType and 409s a host without the capability (XERK-506)", async () => {
+  hub.__setQwenEnabled(true);
+  // A host offering qwen accepts the choice; one without it 409s a stale click.
+  await request("POST", "/api/heartbeat", {
+    body: { device: "qwen2", qwen: { available: true } }, headers: agentHeaders,
+  });
+  await request("POST", "/api/heartbeat", { body: { device: "qwen3" }, headers: agentHeaders });
+  const ok = await request("POST", "/api/agents/qwen2/sessions", {
+    body: { repo: "Turma", agentType: "qwen" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+  const refused = await request("POST", "/api/agents/qwen3/sessions", {
+    body: { repo: "Turma", agentType: "qwen" }, headers: userHeaders,
+  });
+  assert.equal(refused.status, 409);
+  // The enum accepts claude/dsh/qwen and 400s anything else.
+  const bad = await request("POST", "/api/agents/qwen2/sessions", {
+    body: { repo: "Turma", agentType: "codex" }, headers: userHeaders,
+  });
+  assert.equal(bad.status, 400);
+});
+
+test("heartbeat: qwen is a known key, not an unknown-field remnant (XERK-506)", () => {
+  assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("qwen"));
 });
 
 

@@ -753,6 +753,7 @@ fun SessionsListPane(
             // repo has shipped before.
             localModel = com.xerktech.turma.core.ModelSource.hostLocalModel(fleet.agents, host),
             dsh = com.xerktech.turma.core.Runtime.hostDsh(fleet.agents, host),
+            qwen = com.xerktech.turma.core.Runtime.hostQwen(fleet.agents, host),
             onDismiss = { spawnFor = null },
             onSpawn = { prompt, label, baseRef, model, mode, source, localModel, agentType ->
                 vm.spawn(host, repo, prompt, label, baseRef, model, mode, source, localModel, agentType); spawnFor = null

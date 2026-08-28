@@ -82,6 +82,32 @@ class TrajectoryViewModelTest {
     }
 
     @Test
+    fun `a settled 404 is idempotent per id — a non-force reload does not re-fetch, force does`() {
+        // The guard is keyed on the ID, not on `data`, so a 404 (data == null) is
+        // idempotent too. This is what lets the screen render over an already-
+        // settled state: its LaunchedEffect(transcriptId) re-issues load(tid) on
+        // every re-entry, and a re-fetch there would un-settle the paint.
+        hub.json("/api/dsh/$tid/trajectory", """{"error":"not yet"}""", code = 404)
+        val vm = TrajectoryViewModel(hub.app)
+        vm.load(tid)
+        hub.awaitValue { if (vm.state.value.loading) null else Unit }
+        assertTrue(vm.state.value.notSynced)
+
+        // The log has since synced — but a NON-force reload of the same id is a
+        // no-op, so the state stays not-synced (no network, no un-settle).
+        hub.json("/api/dsh/$tid/trajectory", trajectoryJson)
+        vm.load(tid)
+        assertTrue("a non-force reload of a settled id must not re-fetch", vm.state.value.notSynced)
+        assertNull(vm.state.value.data)
+
+        // ↻ Refresh (force=true) is the retry path, and it does re-fetch.
+        vm.load(tid, force = true)
+        val d = hub.awaitValue { vm.state.value.data }
+        assertEquals("my dsh session", d.title)
+        assertTrue(!vm.state.value.notSynced)
+    }
+
+    @Test
     fun `a blank transcript id never hits the network`() {
         // No route registered — if it fetched, the harness would 404 (→ notSynced),
         // so an error state with no fetch is the proof it short-circuited.

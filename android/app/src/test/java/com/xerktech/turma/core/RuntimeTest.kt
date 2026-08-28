@@ -4,6 +4,7 @@ import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.DshInfo
 import com.xerktech.turma.model.LocalModelInfo
 import com.xerktech.turma.model.LocalModelOption
+import com.xerktech.turma.model.QwenInfo
 import com.xerktech.turma.model.SessionInfo
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -24,7 +25,7 @@ class RuntimeTest {
     // machinery is RETAINED, so these tests prove it still works when enabled;
     // reset in @After so the flag can't leak into any other test.
     @Before fun enableDsh() { Runtime.DSH_ENABLED = true }
-    @After fun resetDsh() { Runtime.DSH_ENABLED = false }
+    @After fun resetDsh() { Runtime.DSH_ENABLED = false; Runtime.QWEN_ENABLED = false }
 
     @Test fun `with the kill switch OFF every dsh surface refuses`() {
         Runtime.DSH_ENABLED = false
@@ -107,6 +108,43 @@ class RuntimeTest {
         // dsh: agentType dsh, no modelSource.
         assertEquals("dsh", Runtime.spawnAgentType("dsh"))
         assertNull(Runtime.spawnModelSource("dsh"))
+    }
+
+    // ---- the qwen (Qwen Code, XERK-504/506 [Qwen A]) runtime ------------------
+
+    @Test fun `qwen runtime mirrors the dsh selection plumbing`() {
+        Runtime.QWEN_ENABLED = true
+        val qwen = QwenInfo(available = true)
+        val agents = listOf(
+            AgentInfo(key = "a", qwen = QwenInfo(available = false)),
+            AgentInfo(key = "b", qwen = qwen),
+        )
+        // The composer's Runtime rows add "Qwen Code" when the host offers it,
+        // gated on the host's own flag like dsh.
+        assertEquals(
+            listOf("claude" to "Claude Code", "qwen" to "Qwen Code"),
+            Runtime.composerRuntimes(null, null, qwen),
+        )
+        assertFalse(Runtime.composerRuntimes(null, null, QwenInfo(available = false))
+            .any { it.first == "qwen" })
+        // spawnAgentType/spawnValue send "qwen" (a non-default runtime), never claude.
+        assertEquals("qwen", Runtime.spawnAgentType("qwen"))
+        assertEquals("qwen", Runtime.spawnValue("qwen"))
+        assertNull(Runtime.spawnModelSource("qwen"))
+        // hostQwen reads the TARGET host, never the fleet's first.
+        assertEquals(false, Runtime.hostQwen(agents, "a")?.available)
+        assertEquals(true, Runtime.hostQwen(agents, "b")?.available)
+        assertNull(Runtime.hostQwen(agents, "missing"))
+    }
+
+    @Test fun `with the qwen kill switch OFF every qwen surface refuses`() {
+        Runtime.QWEN_ENABLED = false
+        val qwen = QwenInfo(available = true)
+        val agents = listOf(AgentInfo(key = "b", qwen = qwen))
+        // The row is dropped and the target-host lookup returns null even when the
+        // host reports the capability — the fleet-wide kill switch wins first.
+        assertFalse(Runtime.composerRuntimes(null, null, qwen).any { it.first == "qwen" })
+        assertNull(Runtime.hostQwen(agents, "b"))
     }
 
     // ---- dsh model list (XERK-503/504) ---------------------------------------

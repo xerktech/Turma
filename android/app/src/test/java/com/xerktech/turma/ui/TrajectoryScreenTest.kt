@@ -60,25 +60,38 @@ class TrajectoryScreenTest {
         Locale.setDefault(savedLocale)
     }
 
-    /** Compose the screen holding its VM, then WAIT for the async
-     *  `/api/dsh/<tid>/trajectory` fetch the screen's `LaunchedEffect` kicks off
-     *  to settle before asserting — `waitForIdle` settles composition, not the
-     *  network, so asserting straight after races the loading spinner against the
-     *  response (green on a warm local run, flaky on a slow CI runner). Holding
-     *  the VM lets the test await its state directly. */
+    /** SETTLE the fetch in the VM, THEN compose the screen over the settled state.
+     *
+     *  The `/api/dsh/<tid>/trajectory` fetch is a real async round trip: it
+     *  resolves the VM's StateFlow on an OkHttp thread, and the screen observes
+     *  that through `collectAsStateWithLifecycle`. Composing FIRST and asserting
+     *  after was the flake: the paint that renders the settled state lands a
+     *  cross-thread hop AFTER the value (the collector's resume is posted to the
+     *  main looper from the OkHttp thread), and neither `waitForIdle`, a
+     *  `waitForIdle` pump-loop, nor `waitUntil` reliably drains that post under a
+     *  loaded runner — reproduced here by pinning the suite to one core under CPU
+     *  contention, where the failing method moved across the three fetch-backed
+     *  tests (never the synchronous `TurnCard` one).
+     *
+     *  So the fetch is driven and AWAITED off the compose surface entirely
+     *  (`awaitValue` reads `StateFlow.value` on the test thread, which the OkHttp
+     *  thread settles independently of any looper), and only THEN is the screen
+     *  composed. `collectAsStateWithLifecycle`'s INITIAL value is read
+     *  synchronously at first composition, so the settled outcome paints on the
+     *  first frame — the same main-thread, no-cross-thread path the `TurnCard`
+     *  test uses and which never flaked. `TrajectoryViewModel.load` is idempotent
+     *  per id, so the screen's own `LaunchedEffect(transcriptId)` re-issue is a
+     *  no-op that cannot re-open the fetch and un-settle the paint. */
     private fun open(json: String, code: Int = 200) {
         hub.json("/api/dsh/$tid/trajectory", json, code = code)
         val vm = TrajectoryViewModel(hub.app)
-        compose.setContent { TrajectoryScreen(host = "nas01", transcriptId = tid, onBack = {}, vm = vm) }
-        compose.waitForIdle()   // let the LaunchedEffect fire vm.load(tid)
-        // Wait for a genuine OUTCOME, not merely "not loading" — the initial Ui()
-        // has loading=false, so a "!loading" wait can return on the empty state
-        // before the fetch has even flipped it (the CI-only race).
+        vm.load(tid)
         hub.awaitValue {
             val s = vm.state.value
             if (s.data != null || s.notSynced || s.error != null) Unit else null
         }
-        compose.waitForIdle()   // paint the settled state
+        compose.setContent { TrajectoryScreen(host = "nas01", transcriptId = tid, onBack = {}, vm = vm) }
+        compose.waitForIdle()   // paint the already-settled state (LaunchedEffect load is a no-op)
     }
 
     @Test

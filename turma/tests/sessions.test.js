@@ -2000,6 +2000,38 @@ test("composer: each Runtime maps onto the right spawn wire fields (XERK-503)", 
   assert.equal(dsh.permissionMode, undefined);
 });
 
+test("composer: the qwen runtime option appears and maps to agentType qwen (XERK-506)", () => {
+  const open = (h) => {
+    const page = loadPage();
+    const now = Date.now();
+    page.setCache({ now, agents: [h] });
+    page.render({ now, agents: [h] });
+    page.toggleComposer("hostA::repoX", "repoX");
+    return page;
+  };
+  const base = {
+    key: "hostA", device: "hostA", online: true, terminalOnline: true,
+    lastSeen: Date.now(), repos: [{ name: "repoX" }], sessions: [],
+  };
+  // qwen.available -> the picker offers "Qwen Code" beside Claude Code.
+  const withQwen = open({ ...base, qwen: { available: true } }).els.spawn.innerHTML;
+  assert.match(withQwen, /Runtime/);
+  assert.match(withQwen, />Qwen Code</);
+  // A host that does not offer qwen shows no runtime option at all (no other
+  // second runtime here), so nothing to choose.
+  assert.doesNotMatch(open(base).els.spawn.innerHTML, /Qwen Code</);
+  // Selecting qwen sends agentType:"qwen" and NO model/modelSource/permissionMode
+  // ([Qwen A] is presentational plumbing; the launcher is [Qwen B]).
+  const page = open({ ...base, qwen: { available: true } });
+  page.els["cmp-runtime-hostA__repoX"] = { value: "qwen" };
+  page.startSession("hostA", "repoX");
+  const body = page.posts.find((p) => p.url.endsWith("/sessions")).body;
+  assert.equal(body.agentType, "qwen");
+  assert.equal(body.model, undefined);
+  assert.equal(body.modelSource, undefined);
+  assert.equal(body.permissionMode, undefined);
+});
+
 test("composer: the dsh runtime offers the discovered model list, not Claude aliases (XERK-503)", () => {
   // The fix for the `pi-ai provider has no configured model` lock: a dsh session
   // picks a DISCOVERED endpoint model, the same list a local session gets.

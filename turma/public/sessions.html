@@ -1366,7 +1366,9 @@ function onOptChange(rk, repo) {
   show("modelclaude", runtime === "claude");
   show("lmwrap", runtime === "local");
   show("dmwrap", runtime === "dsh");
-  show("permwrap", runtime !== "dsh");
+  // qwen ([Qwen A]) carries no model or permission controls of its own — that is
+  // [Qwen B] — so it shows only the runtime picker, like dsh minus the note.
+  show("permwrap", runtime !== "dsh" && runtime !== "qwen");
   show("dshnote", runtime === "dsh");
   saveOpts(repo, o);
 }
@@ -1399,14 +1401,21 @@ function composer(a, repo, rk, spawning) {
   // flags exactly as the individual controls did.
   const localModel = (a.localModel && a.localModel.available) ? a.localModel : null;
   const dsh = (a.dsh && a.dsh.available) ? a.dsh : null;
+  // The qwen (Qwen Code, XERK-504) runtime option, gated on the host's own
+  // capability flag exactly like dsh. [Qwen A] is presentational plumbing only —
+  // it carries no model/permission controls (that is [Qwen B]); the picker sends
+  // agentType:"qwen" and the rest falls through to the plain runtime state.
+  const qwen = (a.qwen && a.qwen.available) ? a.qwen : null;
   const runtimeOpts = [{ v: "claude", label: "Claude Code" }];
   if (localModel) runtimeOpts.push({ v: "local", label: "Claude Code Local" });
   if (dsh) runtimeOpts.push({ v: "dsh", label: "dsh" });
+  if (qwen) runtimeOpts.push({ v: "qwen", label: "Qwen Code" });
   // Selected runtime: the stored `runtime`, else derived from the legacy
   // agentType/modelSource a pre-XERK-503 composer persisted, else claude. A
   // stored value whose runtime the host no longer offers falls back to claude.
   const legacyRuntime = o.agentType === "dsh" ? "dsh"
-    : (o.modelSource === "local" ? "local" : "claude");
+    : (o.agentType === "qwen" ? "qwen"
+    : (o.modelSource === "local" ? "local" : "claude"));
   const selRuntime = runtimeOpts.some(r => r.v === o.runtime) ? o.runtime
     : (runtimeOpts.some(r => r.v === legacyRuntime) ? legacyRuntime : "claude");
   // The Claude-local endpoint's discovered models (XERK-489): id + optional
@@ -1472,7 +1481,7 @@ function composer(a, repo, rk, spawning) {
               : `<option value="">${esc(dDefault || "endpoint default")}</option>`}
           </select>
         </div>` : ""}
-        <div id="${cid(rk, "permwrap")}"${selRuntime === "dsh" ? ' style="display:none"' : ""}>
+        <div id="${cid(rk, "permwrap")}"${(selRuntime === "dsh" || selRuntime === "qwen") ? ' style="display:none"' : ""}>
           <label>Permission mode</label>
           <select id="${cid(rk, "perm")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
             ${opt("auto", "auto", selPerm)}${opt("acceptEdits", "acceptEdits", selPerm)}${opt("plan", "plan", selPerm)}${opt("default", "default", selPerm)}${opt("bypassPermissions", "bypassPermissions", selPerm)}
@@ -2330,6 +2339,10 @@ function startSession(key, repo) {
     body.agentType = "dsh";
     // A discovered dsh id (blank = the host default); NOT a Claude alias.
     if (dshModel) body.model = dshModel;
+  } else if (runtime === "qwen") {
+    // XERK-506 [Qwen A]: presentational runtime plumbing only — the launcher and
+    // qwen's model/permission handling are [Qwen B]. Send just the runtime choice.
+    body.agentType = "qwen";
   } else {
     if (runtime === "local") {
       body.modelSource = "local";
