@@ -1,0 +1,33 @@
+
+   ▄▄▄▄▄▄  ▄▄     ▄▄ ▄▄▄▄▄▄▄ ▄▄▄    ▄▄   ┌──────────────────────────────────────────────────────────┐
+  ██╔═══██╗██║    ██║██╔════╝████╗  ██║  │ >_ Qwen Code (v0.22.2)                                   │
+  ██║   ██║██║ █╗ ██║█████╗  ██╔██╗ ██║  │                                                          │
+  ██║▄▄ ██║██║███╗██║██╔══╝  ██║╚██╗██║  │ API Key | qwen3.8-27b-dflash (/model to change)          │
+  ╚██████╔╝╚███╔███╔╝███████╗██║ ╚████║  │ /tmp/.../scratchpad/wt                                   │
+   ╚══▀▀═╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═══╝  └──────────────────────────────────────────────────────────┘
+
+  Tips: You can run any shell commands from Qwen Code using ! (e.g. !ls).
+
+  > Use the run_shell_command tool to run: echo hi && whoami
+  x Shell echo hi && whoami (Print hi and show current user)
+    SPIKE-GUARD: run_shell_command is hard-denied by policy
+
+  ◆︎ The command was hard-denied by policy: SPIKE-GUARD: run_shell_command is hard-denied by policy.
+
+    I can't run it, and I won't route around the denial through another path. If you want that specific command allowed, it needs to be unblocked in the active permission policy (e.g., via
+    .qwen/settings.json / a PreToolUse hook), after which I can run it.
+
+    Note the working tree also has a .qwen/hooks/deny.py — that hook is likely what's enforcing this denial. Want me to read it to confirm what it's blocking?
+  ●︎ Update successful! The new version will be used on your next run.
+  ●︎ Read context files: ~/.qwen/QWEN.md, ~/.qwen/output-language.md
+
+  > Run this now with the run_shell_command tool, do not explain first: uname -a
+
+  ∵︎ Thinking… 0s
+
+  .. Pre-heating the servers... (0s · ↑ 32 tokens · esc to cancel)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>   Type your message or @path/to/file
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ➜ wt · git:(master) · qwen3.8-27b-dflash · 262.1k Context 7.4% used
+  Enter to steer · Ctrl+Q to queue · ⏸ Ask permissions (shift + tab to cycle)

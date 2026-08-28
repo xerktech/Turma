@@ -1,0 +1,1 @@
+1787940757.4049087 tool='run_shell_command' keys=['session_id', 'transcript_path', 'cwd', 'hook_event_name', 'timestamp', 'permission_mode', 'tool_name', 'tool_input', 'tool_use_id', 'tool_call_id'] input={"command": "echo hi && whoami", "description": "Print hi and show current user"}

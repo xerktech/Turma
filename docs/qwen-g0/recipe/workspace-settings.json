@@ -1,0 +1,11 @@
+{
+  "security": { "folderTrust": { "enabled": false } },
+  "tools": { "autoAccept": false, "approvalMode": "default" },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "run_shell_command",
+        "hooks": [ { "type": "command", "command": "python3 $QWEN_PROJECT_DIR/.qwen/hooks/deny.py", "name": "spike-deny", "timeout": 10000 } ] }
+    ]
+  },
+  "$version": 4
+}
