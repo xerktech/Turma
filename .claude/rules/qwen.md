@@ -1,6 +1,8 @@
 ---
 paths:
   - "agent/hub-agent.py"
+  - "agent/qwen_transcript.py"
+  - "agent/tests/test_qwen_transcript.py"
   - "turma/server.js"
   - "turma/public/sessions.html"
   - "android/**"
@@ -64,3 +66,41 @@ the qwen process model. What landed, and the invariants a later child must not u
   `test_agent_type_configured_*`, `test_qwen_payload_*`) agent-side; the `normalizeQwen`/
   `QWEN_ENABLED`/spawn-route/known-key cases in `server.test.js`; the qwen composer case in
   `sessions.test.js`; `RuntimeTest`/`SpawnRequestTest`/`SpawnComposerTest`/`AgentDecodeTest` (android).
+
+## [Qwen S1] (XERK-508) shipped: transcript projection (`agent/qwen_transcript.py`)
+
+The read-side load-bearing piece, mirroring dsh [S1] (`.claude/rules/dsh.md`). `QwenProjector.feed(
+event)` projects one Qwen native-log event into the 0+ Claude-Code JSONL entry dicts it maps to;
+`project_log()` is the batch form. PURE, stdlib-only, its own file (parallel-safe). The launcher's
+tail ([Qwen B], XERK-507) appends the projection to the pinned `<claudeSessionId>.jsonl`, and the
+EXISTING `_entry_blocks`/`entryBlocks`, `_entry_text`, usage accountancy, PR scan and live tail read
+it UNCHANGED — **NO new reader, NO JS translator**. The py/js parity IS that the projected JSONL
+renders identically under both. Invariants a change must not undo:
+
+- **Only the three Qwen SURFACE types project**: `user`, `assistant`, `tool_result`. Every `system`
+  event (attribution/file-history/`ui_telemetry`/slash-command) is log-only → `[]`. The
+  `ui_telemetry` `api_response`/`tool_call` rows are NOT the usage or tool-call source (those ride
+  the `assistant` event), so nothing double-counts.
+- **`run_shell_command` → `Bash` name map** (`_TOOL_NAME_MAP`) — a CORRECTNESS requirement, not
+  cosmetics: `_scan_pr_line`'s PR attribution ([Qwen H]) and `_tool_use_detail`'s Bash card key on
+  the tool_use `name` being `"Bash"`, and Qwen's shell tool registers as `run_shell_command` with
+  `args.command`. Widen PR attribution only by teaching `_scan_pr_line` another creation event, never
+  by loosening this map. Every other Qwen tool (`write_file`, `read_file`, `tool_search`, …) passes
+  through under its own name (generic card).
+- **Tool calls ride the `assistant` event's `message.parts` `functionCall` blocks** → one `tool_use`
+  each; the redundant `ui_telemetry` `tool_call` row drops. Qwen flags reasoning as `{text,
+  thought:true}` (NOT a block type) → `thinking`; plain `{text}` → text.
+- **usage: Qwen's Gemini-shaped `usageMetadata` → Claude's DISJOINT counts** (`_map_usage`):
+  `input = promptTokenCount − cachedContentTokenCount` (the two sum to the whole prompt like Claude's,
+  clamped ≥0), `cache_read = cachedContentTokenCount`, `output = candidatesTokenCount` (which ALREADY
+  includes `thoughtsTokenCount` — verified: prompt+candidates == total — so thoughts are NOT re-added,
+  else the model's reasoning double-counts), `cache_creation = 0` (Qwen has none). A usage-less OR
+  all-zero step projects NO `usage` key (never a fabricated zero — it poisons the per-model
+  denominator; local-endpoint turns commonly report zero usage). `message.model` is the real model id.
+- **Deterministic uuids** (uuid5 over session id + per-feed seq), so replaying the native log
+  re-projects byte-identically without forking the file.
+- **Verified against REAL Qwen output** ([Qwen G0]'s corpus, the G1 no-mock lesson): `qwen_corpus.json`
+  (built by `qwen_corpus_gen.mjs` from `docs/qwen-g0/corpus/`), `qwen_projected.jsonl` and
+  `qwen_expected_blocks.json` are the SAME artifacts the py test and the js `entryBlocks` test both
+  assert against — pinning both readers to one expected result. Tests: `test_qwen_transcript.py`, the
+  `Qwen projection` case in `tunnel-agent.test.js`.

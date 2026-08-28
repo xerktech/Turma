@@ -2037,6 +2037,27 @@ test("entryBlocks: dsh projection renders equal to the Python side (XERK-464)", 
   assert.deepEqual(got, expected);
 });
 
+// --- XERK-508 [Qwen][S1]: the Qwen native-log -> Claude-JSONL projection renders
+// identically under the JS entryBlocks as under the Python _entry_blocks.
+// qwen_projected.jsonl and qwen_expected_blocks.json are produced by the Python
+// projector (agent/qwen_transcript.py) from the REAL Qwen G0 corpus and asserted
+// there too (test_qwen_transcript.py), so pinning both readers to the SAME
+// expected blocks IS the py/js parity proof the ticket requires — a drift on
+// either side fails its own suite. There is NO JS translator: the projection runs
+// only in Python and the parity is that the projected JSONL reads identically.
+test("entryBlocks: Qwen projection renders equal to the Python side (XERK-508)", () => {
+  const projected = fs
+    .readFileSync(path.join(__dirname, "qwen_projected.jsonl"), "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const expected = JSON.parse(
+    fs.readFileSync(path.join(__dirname, "qwen_expected_blocks.json"), "utf8"),
+  );
+  const got = projected.map((e) => entryBlocks(e, BLOCK_CAPS));
+  assert.deepEqual(got, expected);
+});
+
 // --- XERK-474 [dsh][J]: the delegation launch/stop the Python projector
 // synthesizes are STANDARD Claude-Code background-launch shapes, so the JS
 // scanAgentEntry mirror folds them into the live-agent set exactly as the Python
