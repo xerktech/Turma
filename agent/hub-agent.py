@@ -1098,11 +1098,13 @@ MODEL_SOURCES = {"subscription", "local"}
 # Claude Code launcher every session uses today and the default every existing
 # record reads back as; "dsh" is the DeepSeek Harness runtime, selectable per
 # session only where this host reports the dsh capability (see dsh_configured).
-# The value is presentational per-session state — it grants nothing and says
-# nothing about whether the dsh PROCESS is per-session or per-host (that is the
-# launcher's concern, XERK-466). Validated agent-side like every other spawn
-# enum.
-AGENT_TYPES = {"claude", "dsh"}
+# "qwen" is the Qwen Code runtime (XERK-504), likewise selectable only where this
+# host reports the qwen capability (see qwen_configured). The value is
+# presentational per-session state — it grants nothing and says nothing about
+# whether a runtime's PROCESS is per-session or per-host (that is the launcher's
+# concern, XERK-466 for dsh, [Qwen B] for qwen). Validated agent-side like every
+# other spawn enum.
+AGENT_TYPES = {"claude", "dsh", "qwen"}
 # The model name is interpolated into a launch command line, so it is charset
 # checked like every other launch input. Ollama-style tags carry a colon.
 LOCAL_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,60}$")
@@ -1118,6 +1120,20 @@ LOCAL_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,60}$")
 # to True (and set the env) to bring dsh back. Tests that exercise the retained
 # dsh machinery patch this True (or patch dsh_configured directly).
 DSH_ENABLED = False
+
+# --- qwen master kill switch (code flag, not env/build) --------------------
+# The qwen (Qwen Code, XERK-504) equivalent of DSH_ENABLED: a single in-CODE
+# flag that disables ALL qwen functionality fleet-wide without removing the
+# machinery. When False, qwen_configured() below returns False regardless of
+# TURMA_QWEN, so this host never advertises the qwen capability and refuses
+# every agentType="qwen" spawn — the same "off" state a host without the env
+# has, but one no per-host env can override. The hub, Android and glasses carry
+# the SAME-named flag so no single component can re-enable qwen alone. [Qwen A]
+# (XERK-506) establishes the field, the flag and the whole wire path; the qwen
+# LAUNCHER is [Qwen B], so this stays False until that lands (there is no
+# _launch_qwen body to run yet). Flip to True (and set the env) once the
+# launcher exists. Tests patch this True (or patch qwen_configured directly).
+QWEN_ENABLED = False
 
 # --- dsh runtime host configuration (XERK-460, launcher XERK-467) ----------
 # Where a dsh session's process finds its profile (the driver plugin + the model
@@ -1792,10 +1808,24 @@ def dsh_configured():
             in ("1", "true", "yes", "on"))
 
 
+def qwen_configured():
+    """True when this host offers the qwen (Qwen Code, XERK-504) runtime as a
+    per-session choice. The qwen twin of dsh_configured: doubles as the heartbeat
+    capability flag, gated FIRST on the in-code QWEN_ENABLED kill switch (so no
+    per-host env can turn qwen on while it is disabled fleet-wide), then on
+    TURMA_QWEN so the capability can be turned on per host once the flag is
+    lifted. [Qwen A] establishes the field, the flag and the whole wire path; an
+    agentType="qwen" spawn is refused at launch whenever this returns False, so
+    leaving it off keeps every current host on Claude Code with nothing changed."""
+    return (QWEN_ENABLED
+            and os.environ.get("TURMA_QWEN", "").strip().lower()
+            in ("1", "true", "yes", "on"))
+
+
 def resolve_agent_type(agent_type):
     """Validate a runtime choice against a fixed enum. Blank -> claude (what
-    every session was before this existed). "dsh" is refused on a host that
-    does not offer it, mirroring resolve_model_source's local gate."""
+    every session was before this existed). "dsh"/"qwen" are refused on a host
+    that does not offer them, mirroring resolve_model_source's local gate."""
     agent_type = (agent_type or "").strip()
     if not agent_type:
         return "claude"
@@ -1803,7 +1833,27 @@ def resolve_agent_type(agent_type):
         raise ValueError(f"unknown agent type {agent_type!r}")
     if agent_type == "dsh" and not dsh_configured():
         raise ValueError("dsh runtime not available on this host")
+    if agent_type == "qwen" and not qwen_configured():
+        raise ValueError("qwen runtime not available on this host")
     return agent_type
+
+
+def agent_type_configured(agent_type):
+    """Whether this host can currently LAUNCH `agent_type` — the rebuild/resume
+    guard that keeps resolve_agent_type from raising on a persisted runtime this
+    host no longer offers (the caller falls back to claude instead). Blank/claude
+    is always launchable; dsh/qwen follow their own capability gate; anything
+    else is not (falls back to claude). Keyed per runtime so a qwen session
+    resumes on a qwen-only host and a dsh session on a dsh-only one, rather than
+    both hinging on dsh_configured()."""
+    at = (agent_type or "").strip() or "claude"
+    if at == "claude":
+        return True
+    if at == "dsh":
+        return dsh_configured()
+    if at == "qwen":
+        return qwen_configured()
+    return False
 
 
 # ---- dsh session liveness / control socket (XERK-468 [D]) -------------------
@@ -13217,6 +13267,30 @@ class SessionManager:
             d["web"] = web
         return d
 
+    def _qwen_payload(self):
+        """The heartbeat `qwen` block: the capability flag alone ({available}),
+        mirroring the dsh/localModel discipline. available:false — every host
+        today, since qwen is opt-in and off by default (and QWEN_ENABLED gates it
+        off fleet-wide until [Qwen B] lands) — makes the hub and composers HIDE
+        the runtime option rather than queue a spawn the host would ack and then
+        fail to launch. [Qwen A] deliberately carries NO models/default here: the
+        qwen model plumbing is a later child, and this block is the presentational
+        capability flag only."""
+        return {"available": qwen_configured()}
+
+    def _launch_qwen(self, sess, resume=False, prompt=None, resume_id=None):
+        """Launch a session on the qwen (Qwen Code, XERK-504) runtime.
+
+        [Qwen A] (XERK-506) establishes the runtime field, the capability flag
+        and this launch choke-point dispatch; the LAUNCHER itself is [Qwen B].
+        Until it lands there is no qwen process to start, and QWEN_ENABLED being
+        False means resolve_agent_type refuses an agentType="qwen" spawn before
+        any record ever carries it — so this is unreachable today. It raises
+        rather than silently no-op'ing, so if a future change reaches it before
+        [Qwen B] fills in the body the failure is loud and routes through the
+        caller's error handling instead of stranding an empty session."""
+        raise RuntimeError("qwen runtime launcher not yet implemented ([Qwen B])")
+
     def _launch_dsh(self, sess, resume=False, prompt=None, resume_id=None):
         """Launch a session on the dsh runtime: a headless per-session dsh process
         in the session's own tmux, driven over a per-session UNIX control socket
@@ -13557,6 +13631,15 @@ class SessionManager:
         # swap is that method's body alone, this dispatch line stays.
         if sess.get("agentType") == "dsh":
             self._launch_dsh(sess, resume=resume, prompt=prompt, resume_id=resume_id)
+            return
+        if sess.get("agentType") == "qwen":
+            # The qwen runtime (XERK-504). [Qwen A] establishes the field, the
+            # flag and the dispatch; the LAUNCHER is [Qwen B], which fills in
+            # _launch_qwen — the swap is that method's body alone, this dispatch
+            # line stays. Unreachable today (QWEN_ENABLED is False, so
+            # resolve_agent_type refuses an agentType="qwen" spawn before any
+            # record carries it); the stub raises defensively if ever reached.
+            self._launch_qwen(sess, resume=resume, prompt=prompt, resume_id=resume_id)
             return
         self._drop_bridge_pointer(sess["worktreePath"])
         # Claude in this worktree. IS_SANDBOX=1 (compose) lets
@@ -14610,12 +14693,14 @@ class SessionManager:
             # against; usage has not come back just because it was killed.
             "modelSource": rec.get("modelSource") or "subscription",
             # Re-gate the runtime on rebuild, like receive_migration does: a
-            # persisted "dsh" falls back to claude when this host does not offer
-            # dsh (which the DSH_ENABLED kill switch forces off), rather than
-            # resuming as a runtime this host cannot launch.
+            # persisted "dsh"/"qwen" falls back to claude when this host does not
+            # offer that runtime (which its kill switch forces off), rather than
+            # resuming as a runtime this host cannot launch. Keyed per runtime
+            # (agent_type_configured), so a qwen session resumes on a qwen-only
+            # host instead of hinging on dsh_configured().
             "agentType": (resolve_agent_type(rec.get("agentType"))
-                          if rec.get("agentType") in AGENT_TYPES
-                          and dsh_configured() else "claude"),
+                          if agent_type_configured(rec.get("agentType"))
+                          else "claude"),
             # ...and which self-hosted model it was on (XERK-489); the launch
             # re-validates and falls back if the host no longer serves it.
             "localModelName": rec.get("localModelName"),
@@ -14837,12 +14922,14 @@ class SessionManager:
             "modelSource": (resolve_model_source(extra.get("modelSource"))
                             if extra.get("modelSource") in MODEL_SOURCES
                             and local_model_configured() else "subscription"),
-            # Same story for the runtime (XERK-460): a dsh session migrated onto a
-            # host that does not offer dsh falls back to claude rather than being
-            # recorded as a runtime this host cannot launch.
+            # Same story for the runtime (XERK-460): a dsh/qwen session migrated
+            # onto a host that does not offer that runtime falls back to claude
+            # rather than being recorded as a runtime this host cannot launch.
+            # Keyed per runtime (agent_type_configured) so each re-gates on its own
+            # capability, not just dsh's.
             "agentType": (resolve_agent_type(extra.get("agentType"))
-                          if extra.get("agentType") in AGENT_TYPES
-                          and dsh_configured() else "claude"),
+                          if agent_type_configured(extra.get("agentType"))
+                          else "claude"),
             # The self-hosted model it was on (XERK-489), carried raw; the launch
             # re-validates against THIS host's discovered set and falls back to
             # the host default when the target serves a different set.
@@ -21243,6 +21330,14 @@ class SessionManager:
             # then refuse to launch. Absent (a pre-dsh agent) reads the same as
             # false, coerced hub-side.
             "dsh": self._dsh_payload(),
+            # Whether this host offers the qwen (Qwen Code, XERK-504) runtime as
+            # a per-session choice. The qwen twin of the dsh block above: doubles
+            # as the capability flag, available:false — every host today, since
+            # qwen is opt-in and off by default — makes the hub and composers HIDE
+            # the runtime option rather than queue a spawn the host would ack and
+            # then refuse to launch. Absent (a pre-qwen agent) reads the same as
+            # false, coerced hub-side (normalizeQwen).
+            "qwen": self._qwen_payload(),
             # The largest file this agent will take as a message attachment
             # (XERK-234). Doubles as the capability flag, exactly like
             # inputMaxChars above: an agent predating attachments reports nothing

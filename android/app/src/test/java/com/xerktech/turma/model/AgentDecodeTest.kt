@@ -162,6 +162,30 @@ class AgentDecodeTest {
         assertEquals("", resp.agents[2].sessions[0].agentType)
     }
 
+    // XERK-506 [Qwen A]: the qwen capability flag + per-session runtime. Typing
+    // AgentInfo.qwen is what makes it decode-fatal if wrong, so the shape — the
+    // available/absent block and the "qwen" agentType — is pinned here.
+    @Test fun `the qwen block and session agentType decode`() {
+        val body = """
+            { "now": 1, "agents": [
+              { "key": "on", "device": "on", "online": true,
+                "qwen": { "available": true },
+                "sessions": [ { "id": "s1", "agentType": "qwen" } ] },
+              { "key": "off", "device": "off", "online": true,
+                "qwen": { "available": false },
+                "sessions": [ { "id": "s2", "agentType": "claude" } ] },
+              { "key": "old", "device": "old", "online": true,
+                "sessions": [ { "id": "s3" } ] }
+            ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertEquals(true, resp.agents[0].qwen?.available)
+        assertEquals("qwen", resp.agents[0].sessions[0].agentType)
+        assertEquals(false, resp.agents[1].qwen?.available)
+        // A pre-qwen agent sends no block; it reads as absent, never a throw.
+        assertNull(resp.agents[2].qwen)
+    }
+
     // XERK-477 [M]: an ENDED dsh session's runtime rides _closed_payload's
     // agentType too, so its ended card carries the same badge as the live one.
     // A record from an agent predating the field omits it and defaults to "".

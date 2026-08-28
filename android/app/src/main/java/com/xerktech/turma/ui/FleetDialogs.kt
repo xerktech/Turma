@@ -39,6 +39,7 @@ import androidx.compose.ui.unit.dp
 import com.xerktech.turma.core.ModelSource
 import com.xerktech.turma.core.Runtime
 import com.xerktech.turma.model.DshInfo
+import com.xerktech.turma.model.QwenInfo
 import com.xerktech.turma.model.LocalModelInfo
 import com.xerktech.turma.model.RepoInfo
 
@@ -61,6 +62,7 @@ fun SpawnDialog(
     isRoot: Boolean,
     localModel: LocalModelInfo? = null,
     dsh: DshInfo? = null,
+    qwen: QwenInfo? = null,
     onDismiss: () -> Unit,
     onSpawn: (prompt: String, label: String, baseRef: String, model: String, mode: String, modelSource: String, localModel: String, agentType: String) -> Unit,
 ) {
@@ -73,7 +75,7 @@ fun SpawnDialog(
     // into "Claude Code" / "Claude Code Local" / "dsh"; each maps onto the existing
     // agentType/modelSource wire fields at spawn (Runtime.spawn*). Shown only when
     // the host offers more than one runtime.
-    val runtimeOpts = remember(localModel, dsh) { Runtime.composerRuntimes(localModel, dsh) }
+    val runtimeOpts = remember(localModel, dsh, qwen) { Runtime.composerRuntimes(localModel, dsh, qwen) }
     var runtime by remember { mutableStateOf(Runtime.CLAUDE) }
     // The chosen endpoint model for a LOCAL spawn (XERK-489), defaulting to the
     // host default. The context override is web-only for now (see PARITY.md).
@@ -96,7 +98,7 @@ fun SpawnDialog(
     // reporting a local model or dsh while the composer is open, that row leaves
     // the picker — and a stale choice would spawn into a guaranteed 409 with
     // nothing on screen to explain it or change it, so fall back to Claude Code.
-    LaunchedEffect(localModel?.available, dsh?.available) {
+    LaunchedEffect(localModel?.available, dsh?.available, qwen?.available) {
         if (runtimeOpts.none { it.first == runtime }) runtime = Runtime.CLAUDE
     }
 
@@ -159,6 +161,11 @@ fun SpawnDialog(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                    Runtime.QWEN -> {
+                        // XERK-506 [Qwen A]: presentational plumbing only — qwen's
+                        // model/permission controls are [Qwen B], so the picker
+                        // sends just the runtime and shows no runtime-specific row.
+                    }
                     Runtime.LOCAL -> {
                         // The endpoint's discovered models (XERK-489).
                         if (ModelSource.localModelPickable(localModel)) {
@@ -187,13 +194,15 @@ fun SpawnDialog(
                 val outModel = when (runtime) {
                     Runtime.DSH -> dshModelId
                     Runtime.LOCAL -> ""          // the local model rides `localModel`
+                    Runtime.QWEN -> ""           // no qwen model in [Qwen A]
                     else -> model
                 }
                 val outLocal = if (runtime == Runtime.LOCAL) localModelId else ""
-                // dsh has no Claude permission mode (its approvals are dsh-managed
-                // and the dropdown is hidden), so omit it — web's dsh spawn sends
-                // no permissionMode either. spawnRequest drops a blank to null.
-                val outMode = if (runtime == Runtime.DSH) "" else mode
+                // Neither dsh nor qwen sends a Claude permission mode (dsh manages
+                // approvals itself; qwen's mode handling is [Qwen B]) — both hide
+                // the dropdown, so omit it, matching web. spawnRequest drops a
+                // blank to null.
+                val outMode = if (runtime == Runtime.DSH || runtime == Runtime.QWEN) "" else mode
                 onSpawn(prompt, label, baseRef, outModel, outMode, outModelSource, outLocal, outAgentType)
             }) {
                 Text("Spawn")

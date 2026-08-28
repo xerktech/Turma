@@ -4,6 +4,7 @@ import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.DshInfo
 import com.xerktech.turma.model.LocalModelInfo
 import com.xerktech.turma.model.LocalModelOption
+import com.xerktech.turma.model.QwenInfo
 import com.xerktech.turma.model.SessionInfo
 
 /**
@@ -26,8 +27,19 @@ object Runtime {
      */
     var DSH_ENABLED: Boolean = false
 
+    /**
+     * Fleet-wide kill switch for ALL qwen (Qwen Code, XERK-504) functionality —
+     * the qwen twin of [DSH_ENABLED]. When false the composer's qwen runtime row
+     * is hidden and a spawn cannot select it, WITHOUT removing the plumbing, so
+     * flipping it true (once [Qwen B]'s launcher lands) restores qwen with no
+     * code change. In-CODE flag; the agent (Python) and hub carry the same-named
+     * flag. `var` only so tests can flip it; production ships it false.
+     */
+    var QWEN_ENABLED: Boolean = false
+
     const val CLAUDE = "claude"
     const val DSH = "dsh"
+    const val QWEN = "qwen"
 
     // The spawn composer collapses the old Runtime (claude/dsh) + "Run against"
     // (subscription/local) pair into ONE Runtime picker (XERK-503), matching web
@@ -43,16 +55,25 @@ object Runtime {
      * shows the picker only when there is more than one row (a plain subscription
      * host has one runtime, so nothing to choose).
      */
-    fun composerRuntimes(local: LocalModelInfo?, dsh: DshInfo?): List<Pair<String, String>> =
+    fun composerRuntimes(
+        local: LocalModelInfo?,
+        dsh: DshInfo?,
+        qwen: QwenInfo? = null,
+    ): List<Pair<String, String>> =
         buildList {
             add(CLAUDE to "Claude Code")
             if (local?.available == true) add(LOCAL to "Claude Code Local")
             if (DSH_ENABLED && dsh?.available == true) add(DSH to "dsh")
+            if (QWEN_ENABLED && qwen?.available == true) add(QWEN to "Qwen Code")
         }
 
     /** The `agentType` a chosen composer runtime spawns as, or null to omit it
-     *  (only "dsh" is ever sent; "claude"/"local" are Claude sessions). */
-    fun spawnAgentType(runtime: String): String? = if (runtime == DSH) DSH else null
+     *  (only "dsh"/"qwen" are ever sent; "claude"/"local" are Claude sessions). */
+    fun spawnAgentType(runtime: String): String? = when (runtime) {
+        DSH -> DSH
+        QWEN -> QWEN
+        else -> null
+    }
 
     /** The `modelSource` a chosen composer runtime spawns as, or null to omit it
      *  (only "local" is sent; a bare/dsh spawn carries no source). */
@@ -68,11 +89,12 @@ object Runtime {
     fun composerOffers(dsh: DshInfo?): Boolean = DSH_ENABLED && dsh?.available == true
 
     /**
-     * The `agentType` a spawn should carry, or null to omit it. Only "dsh" is
-     * ever sent: "claude" is what a spawn already meant, so omitting it keeps a
-     * bare spawn byte-identical to what it was before dsh existed.
+     * The `agentType` a spawn should carry, or null to omit it. Only a
+     * non-default runtime ("dsh"/"qwen") is sent: "claude" is what a spawn
+     * already meant, so omitting it keeps a bare spawn byte-identical to what it
+     * was before these runtimes existed.
      */
-    fun spawnValue(agentType: String?): String? = agentType?.takeIf { it == DSH }
+    fun spawnValue(agentType: String?): String? = agentType?.takeIf { it == DSH || it == QWEN }
 
     /** Menu rows as (value, label) pairs, in the web menu's order. */
     fun options(): List<Pair<String, String>> =
@@ -86,6 +108,14 @@ object Runtime {
      */
     fun hostDsh(agents: List<AgentInfo>, host: String): DshInfo? =
         if (!DSH_ENABLED) null else agents.firstOrNull { it.key == host }?.dsh
+
+    /**
+     * The qwen (Qwen Code, XERK-504) capability of the host a spawn is TARGETING
+     * — the qwen twin of [hostDsh], never the fleet's first (the same "wrong
+     * loop" hazard), since qwen is offered per host.
+     */
+    fun hostQwen(agents: List<AgentInfo>, host: String): QwenInfo? =
+        if (!QWEN_ENABLED) null else agents.firstOrNull { it.key == host }?.qwen
 
     /**
      * Is a session on a non-default (dsh) runtime, i.e. does its card carry a

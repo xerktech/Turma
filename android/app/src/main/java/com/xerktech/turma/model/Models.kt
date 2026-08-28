@@ -216,6 +216,13 @@ data class AgentInfo(
      * hide the runtime selector rather than queue a spawn the host would refuse.
      */
     val dsh: DshInfo? = null,
+    /**
+     * Whether this host offers the qwen (Qwen Code, XERK-504) runtime as a
+     * per-session choice. The qwen twin of [dsh]: doubles as the capability flag,
+     * an ABSENT block means "that host cannot do it", and the hub coerces it
+     * strictly (`normalizeQwen`) so this decode is safe against a rogue host.
+     */
+    val qwen: QwenInfo? = null,
 )
 
 /**
@@ -234,6 +241,17 @@ data class DshInfo(
     val models: List<LocalModelOption> = emptyList(),
     val defaultModel: String? = null,
     val contextTokens: Int? = null,
+)
+
+/**
+ * A host's qwen-runtime capability (hub-agent's `qwen` block, XERK-504). The
+ * qwen twin of [DshInfo]: [available] is the flag the composer gates on. [Qwen
+ * A] carries the capability flag ALONE — qwen's model plumbing is a later child
+ * — so unlike [DshInfo] there is no models/default here.
+ */
+@Serializable
+data class QwenInfo(
+    val available: Boolean = false,
 )
 
 /**
