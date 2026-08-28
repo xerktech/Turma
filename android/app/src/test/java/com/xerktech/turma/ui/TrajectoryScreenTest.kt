@@ -2,7 +2,6 @@ package com.xerktech.turma.ui
 
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
-import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
@@ -82,26 +81,6 @@ class TrajectoryScreenTest {
         compose.waitForIdle()   // paint the settled state
     }
 
-    /** Assert a node appears, WAITING for it rather than reading the tree once.
-     *  `awaitValue` settles the VM's StateFlow, but the screen observes it through
-     *  `collectAsState`, so the recomposition that paints the loaded state can lag
-     *  the value on a loaded CI runner — a single `assertExists()` then races that
-     *  paint (the moving TrajectoryScreenTest flake). The delivery needs the MAIN
-     *  dispatcher pumped (`waitForIdle`), not the Compose clock advanced
-     *  (`waitUntil` alone timed out here — the external StateFlow emission is off
-     *  the clock), so this retries waitForIdle until the node exists. It can only
-     *  settle the race, never mask a genuinely missing node — the final
-     *  `assertExists` still fails loud with the real reason. */
-    private fun awaitText(text: String, substring: Boolean = false) {
-        repeat(200) {
-            if (compose.onAllNodesWithText(text, substring = substring)
-                    .fetchSemanticsNodes().isNotEmpty()) return
-            compose.waitForIdle()
-            Thread.sleep(20)
-        }
-        compose.onNodeWithText(text, substring = substring).assertExists()
-    }
-
     @Test
     fun `the screen composes and renders the header token totals in full`() {
         // The header is LazyColumn item 0 — always composed. The 3e9 input token
@@ -115,8 +94,8 @@ class TrajectoryScreenTest {
              "turns":[{"turn":1,"steps":2,"tokens":{"input":12,"output":5},"calls":[]}]}
             """.trimIndent(),
         )
-        awaitText("3,000,000,000", substring = true)
-        awaitText("deepseek")
+        compose.onNodeWithText("3,000,000,000", substring = true).assertExists()
+        compose.onNodeWithText("deepseek").assertExists()
     }
 
     @Test
@@ -127,14 +106,14 @@ class TrajectoryScreenTest {
             """{"transcriptId":"tr1","title":"quiet","totals":{"turns":0,"steps":0,"toolCalls":0,
                 "errors":0,"tokens":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}},"turns":[]}""",
         )
-        awaitText("No turns recorded yet.")
+        compose.onNodeWithText("No turns recorded yet.").assertExists()
     }
 
     @Test
     fun `a 404 shows the not-synced-yet message, not an error`() {
         // The 404 branch renders outside the LazyColumn (a centered Box).
         open("""{"error":"no dsh trajectory for this session"}""", code = 404)
-        awaitText("No dsh trajectory yet", substring = true)
+        compose.onNodeWithText("No dsh trajectory yet", substring = true).assertExists()
     }
 
     @Test
