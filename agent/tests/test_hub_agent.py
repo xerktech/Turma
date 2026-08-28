@@ -30,6 +30,7 @@ import socket
 import struct
 import sys
 import tempfile
+import types
 import threading
 import tracemalloc
 import time
@@ -3988,6 +3989,247 @@ class TestConfirmDshLaunch(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "DSH_LAUNCH_CONFIRM_SEC", 0.05), \
              mock.patch.object(sm, "_tmux_alive", return_value=True):
             self.assertFalse(sm._confirm_dsh_launch(self._sess(), ctl))
+
+
+class TestLaunchQwen(ManagerMixin, unittest.TestCase):
+    """XERK-507 [Qwen B]: the interactive-TUI launcher. Close to the Claude
+    launch path — a pinned session id, its OWN ttyd, an OpenAI route sourced from
+    a 0600 env file, the directive on qwen's context file, a launch confirmation
+    — and unlike dsh it is NOT headless (ttyd is not suppressed)."""
+
+    def setUp(self):
+        super().setUp()
+        self.wt = os.path.join(self.tmp, "wt")
+        os.makedirs(self.wt, exist_ok=True)
+        for name, value in [
+            ("QWEN_RUNTIME_DIR", os.path.join(self.tmp, "qwen")),
+            ("QWEN_PROJECTS_ROOT", os.path.join(self.tmp, "qwen-projects")),
+            ("QWEN_MODEL", "qwen3-coder"),
+            ("QWEN_MODEL_BASE_URL", "https://gw.example.com/v1"),
+            ("QWEN_MODEL_API_KEY_ENV", "QWEN_TEST_KEY"),
+            ("QWEN_MODEL_CONTEXT", 262144),
+        ]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _sess(self, **extra):
+        sess = {"id": "q1", "tmuxName": "agent-q1", "worktreePath": self.wt,
+                "agentType": "qwen"}
+        sess.update(extra)
+        return sess
+
+    def _last_tmux_cmd(self):
+        # The `tmux new-session ... <cmd>` the launcher built (fake run_ok logs it).
+        for cmd in reversed(self.run_ok_calls):
+            if cmd[:2] == ["tmux", "new-session"]:
+                return cmd[-1]
+        return ""
+
+    # --- readiness gate (off-beat prime) -------------------------------------
+
+    def test_ensure_qwen_ready_refuses_without_a_model_route(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "QWEN_MODEL_BASE_URL", ""):
+            self.assertFalse(sm._ensure_qwen_ready())
+        # cached — the flag reads False without re-probing.
+        self.assertFalse(sm._qwen_ready)
+
+    def test_ensure_qwen_ready_probes_the_binary_and_caches(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.subprocess, "run",
+                               return_value=types.SimpleNamespace(
+                                   returncode=0, stdout="qwen 0.22.2")) as sp:
+            self.assertTrue(sm._ensure_qwen_ready())
+            self.assertTrue(sm._ensure_qwen_ready())  # cached
+        self.assertEqual(sp.call_count, 1)
+
+    def test_ensure_qwen_ready_false_when_binary_missing(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.subprocess, "run",
+                               side_effect=FileNotFoundError("no qwen")):
+            self.assertFalse(sm._ensure_qwen_ready())
+
+    def test_launch_refuses_when_not_ready(self):
+        # The launcher reads the cached flag and refuses — it NEVER runs the
+        # version probe on the beat (XERK-395).
+        sm = self.make_manager()
+        with mock.patch.object(ha.subprocess, "run") as sp:
+            with self.assertRaises(RuntimeError):
+                sm._launch_qwen(self._sess())
+            sp.assert_not_called()
+
+    # --- happy-path launch wiring --------------------------------------------
+
+    def _launch(self, sm, sess, **kw):
+        sm._qwen_ready = True
+        os.environ["QWEN_TEST_KEY"] = "sk-secret"
+        self.addCleanup(os.environ.pop, "QWEN_TEST_KEY", None)
+        with mock.patch.object(sm, "_confirm_qwen_launch", return_value=True):
+            sm._launch_qwen(sess, **kw)
+
+    def test_spawn_pins_id_writes_config_and_delivers_prompt(self):
+        sm = self.make_manager()
+        sess = self._sess()
+        self._launch(sm, sess, prompt="do the thing")
+        # A fresh conversation id is pinned (uuid4) and named on the record.
+        cid = sess["claudeSessionId"]
+        self.assertTrue(ha.VALID_CLAUDE_SID_RE.fullmatch(cid))
+        cmd = self._last_tmux_cmd()
+        self.assertIn("--auth-type openai", cmd)
+        self.assertIn(f"--session-id {cid}", cmd)
+        # Initial prompt delivered race-free via prompt-interactive, not send-keys.
+        self.assertIn("-i", shlex.split(cmd.split("set +a; ", 1)[1]))
+        self.assertIn("do the thing", cmd)
+        # settings.json + the context file are written into the worktree.
+        with open(os.path.join(self.wt, ".qwen", "settings.json")) as f:
+            settings = json.load(f)
+        self.assertTrue(settings["general"]["chatRecording"])
+        self.assertTrue(settings["general"]["disableAutoUpdate"])
+        self.assertEqual(settings["tools"]["approvalMode"], "auto")
+        self.assertFalse(settings["security"]["folderTrust"]["enabled"])
+        # The context file is a TURMA-specific name (never the conventional
+        # QWEN.md), so it can't clobber a repo's own tracked QWEN.md.
+        self.assertEqual(settings["context"]["fileName"], ha.QWEN_CONTEXT_FILENAME)
+        self.assertNotEqual(ha.QWEN_CONTEXT_FILENAME, "QWEN.md")
+        with open(os.path.join(self.wt, ha.QWEN_CONTEXT_FILENAME)) as f:
+            ctx = f.read()
+        self.assertIn("git fetch origin", ctx)          # NEW_WORK directive
+        self.assertIn("peers.tsv", ctx)                 # PEERS directive
+
+    def test_model_route_is_sourced_from_a_0600_env_file_never_argv(self):
+        sm = self.make_manager()
+        sess = self._sess()
+        self._launch(sm, sess, prompt="hi")
+        env_file = os.path.join(self.tmp, "qwen", "q1.env")
+        self.assertEqual(oct(os.stat(env_file).st_mode & 0o777), "0o600")
+        with open(env_file) as f:
+            body = f.read()
+        self.assertIn("export OPENAI_BASE_URL=https://gw.example.com/v1", body)
+        self.assertIn("export OPENAI_API_KEY=sk-secret", body)
+        self.assertIn("export OPENAI_MODEL=qwen3-coder", body)
+        # The credential NEVER reaches the command line (/proc/<pid>/cmdline is
+        # world-readable) — only the sourced file path does.
+        cmd = self._last_tmux_cmd()
+        self.assertNotIn("sk-secret", cmd)
+        self.assertIn(f". {shlex.quote(env_file)}", cmd)
+
+    def test_ticket_branch_directive_rides_the_context_file(self):
+        sm = self.make_manager()
+        sess = self._sess(ticket={"key": "XERK-9", "branch": "XERK-9"})
+        self._launch(sm, sess, prompt="work it")
+        with open(os.path.join(self.wt, ha.QWEN_CONTEXT_FILENAME)) as f:
+            ctx = f.read()
+        self.assertIn("XERK-9", ctx)
+
+    def test_resume_reuses_the_pinned_id_and_carries_no_prompt(self):
+        sm = self.make_manager()
+        sess = self._sess(claudeSessionId="11111111-2222-3333-4444-555555555555")
+        self._launch(sm, sess, resume=True)
+        cmd = self._last_tmux_cmd()
+        self.assertIn("--resume 11111111-2222-3333-4444-555555555555", cmd)
+        self.assertNotIn("--session-id", cmd)
+        self.assertNotIn(" -i ", cmd)
+
+    def test_resume_with_a_prompt_still_suppresses_the_initial_prompt(self):
+        # `-i` is a SPAWN-only initial-prompt delivery (a resume continues the
+        # existing context). Exercises the `and not resume` guard directly, so
+        # dropping it is caught even though no live caller passes a resume prompt.
+        sm = self.make_manager()
+        sess = self._sess(claudeSessionId="11111111-2222-3333-4444-555555555555")
+        self._launch(sm, sess, resume=True, prompt="should NOT be sent")
+        cmd = self._last_tmux_cmd()
+        tail = shlex.split(cmd.split("set +a; ", 1)[1])
+        self.assertNotIn("-i", tail)
+        self.assertNotIn("should NOT be sent", cmd)
+
+    def test_failed_confirmation_tears_down_and_raises(self):
+        # The XERK-492 lesson: a started tmux is not a live session. A failed
+        # confirm kills the tmux and raises so the caller reports a reason. Assert
+        # _kill_tmux is invoked specifically — the launcher ALSO runs a clean-slate
+        # `tmux kill-session` before new-session, so a bare run_calls membership
+        # check would pass even if the failed-confirm teardown were removed.
+        sm = self.make_manager()
+        sess = self._sess()
+        sm._qwen_ready = True
+        with mock.patch.object(sm, "_confirm_qwen_launch", return_value=False), \
+             mock.patch.object(sm, "_kill_tmux") as kill:
+            with self.assertRaises(RuntimeError):
+                sm._launch_qwen(sess)
+        kill.assert_called_once_with(sess)
+
+    # --- launch confirmation (XERK-492) --------------------------------------
+
+    def _runtime_file(self, cid, pid):
+        d = os.path.join(self.tmp, "qwen-projects", "some-slug", "chats")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{cid}.runtime.json")
+        with open(path, "w") as f:
+            json.dump({"schema_version": 1, "pid": pid}, f)
+        return path
+
+    def test_confirm_true_when_registry_names_a_live_pid(self):
+        sm = self.make_manager()
+        self._runtime_file("aaaa", os.getpid())  # this test's own live pid
+        with mock.patch.object(sm, "_tmux_alive", return_value=True):
+            self.assertTrue(sm._confirm_qwen_launch(self._sess(), "aaaa"))
+
+    def test_confirm_false_when_tmux_is_gone(self):
+        sm = self.make_manager()
+        with mock.patch.object(sm, "_tmux_alive", return_value=False):
+            self.assertFalse(sm._confirm_qwen_launch(self._sess(), "bbbb"))
+
+    def test_confirm_keeps_polling_past_a_stale_dead_pid_then_times_out(self):
+        # A resume's PREVIOUS registry lingers with a dead pid; it must NOT count
+        # as the session up. With no fresh registry it times out.
+        sm = self.make_manager()
+        self._runtime_file("cccc", 2 ** 22)  # a pid that is not alive
+        with mock.patch.object(ha, "QWEN_LAUNCH_CONFIRM_SEC", 0.05), \
+             mock.patch.object(ha.time, "sleep", lambda *_: None), \
+             mock.patch.object(sm, "_tmux_alive", return_value=True):
+            self.assertFalse(sm._confirm_qwen_launch(self._sess(), "cccc"))
+
+    # --- git-exclude against a REAL linked worktree --------------------------
+
+    def test_git_exclude_hides_the_config_from_a_real_worktree(self):
+        # The generated `.qwen/`/context file must never read as uncommitted
+        # work (prune/delete key on `git status`). Drive _qwen_git_exclude
+        # against a real git repo + linked worktree — the mixin's fake `run`
+        # can't exercise the exclude, which is why QA found it untested.
+        repo = os.path.join(self.tmp, "repo")
+        wt = os.path.join(self.tmp, "wt2")
+
+        def g(*args, cwd=repo):
+            subprocess.run(["git", "-C", cwd, *args], check=True,
+                           capture_output=True, text=True)
+
+        subprocess.run(["git", "init", "-q", repo], check=True,
+                       capture_output=True, text=True)
+        g("config", "user.email", "t@t")
+        g("config", "user.name", "t")
+        g("commit", "--allow-empty", "-qm", "init")
+        g("worktree", "add", "-q", "--detach", wt)
+
+        def real_run(cmd, cwd=None, timeout=15):
+            r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+            return r.stdout.strip() if r.returncode == 0 else ""
+
+        os.makedirs(os.path.join(wt, ha.QWEN_CONFIG_DIRNAME))
+        open(os.path.join(wt, ha.QWEN_CONFIG_DIRNAME, "settings.json"),
+             "w").close()
+        open(os.path.join(wt, ha.QWEN_CONTEXT_FILENAME), "w").close()
+        sm = self.make_manager()
+        with mock.patch.object(ha, "run", real_run):
+            sm._qwen_git_exclude(wt)
+            sm._qwen_git_exclude(wt)   # idempotent — no duplicate entries
+        self.assertEqual(real_run(["git", "-C", wt, "status", "--porcelain"]), "")
+        # It is the repo's COMMON info/exclude (shared by every worktree), and
+        # the entries are written once.
+        with open(os.path.join(repo, ".git", "info", "exclude")) as f:
+            body = f.read()
+        self.assertEqual(body.count("Turma qwen runtime config"), 1)
+        self.assertIn(f"/{ha.QWEN_CONFIG_DIRNAME}/", body)
+        self.assertIn(f"/{ha.QWEN_CONTEXT_FILENAME}", body)
 
 
 class TestDshRouting(ManagerMixin, unittest.TestCase):
