@@ -52,6 +52,7 @@ kept dependency-free like the rest of `agent/`.
 """
 
 import json
+import math
 import re
 import uuid as _uuidlib
 from datetime import datetime, timezone
@@ -202,10 +203,20 @@ def _map_usage(usage):
 def _int(v):
     """A dsh count coerced to a non-negative int (the ledger re-coerces, but a
     clean projection keeps a float/None from ever reaching the wire). Unusable ->
-    0; a fractional value truncates."""
+    0; a fractional value truncates.
+
+    `feed()` runs per streamed event, so this must NEVER raise — a single bad
+    usage field must not abort the projection. A non-finite float is the trap the
+    codebase has hit before (`_token_count`, `read_limits_snapshot`,
+    `_archive_known`, and `_iso` just above): `1e999` is legal RFC-8259 JSON that
+    `json.loads` yields as `inf`, and `int(inf)` raises OverflowError — NOT one of
+    the two obvious exceptions — while `int(nan)` raises ValueError. isfinite
+    screens both, and OverflowError is caught as a backstop."""
+    if isinstance(v, float) and not math.isfinite(v):
+        return 0
     try:
         n = int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
     return n if n >= 0 else 0
 

@@ -361,6 +361,35 @@ class TestDshFeedNeverCrashes(unittest.TestCase):
                         '"data":{"role":"user","content":[{"type":"text","text":"x"}]}}')
         self.assertEqual(proj.feed(ev)[0]["timestamp"], "")
 
+    def test_infinite_usage_count_never_crashes(self):
+        """A usage field that is a JSON infinity (`1e999` -> inf, and int(inf)
+        raises OverflowError) or NaN must NOT abort the projection — it drops to a
+        0 count. `_iso` already guarded `time`; `_int` (the usage path) had not."""
+        proj = dt.DshProjector(SID)
+        for field in ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"):
+            for bad in (float("inf"), float("-inf"), float("nan")):
+                usage = {"inputTokens": 100, "outputTokens": 50,
+                         "cacheReadTokens": 0, "cacheWriteTokens": 0}
+                usage[field] = bad
+                ev = {"type": "assistant/message", "seq": 1, "time": 0, "data": {
+                    "turn": 1, "step": 1, "usage": usage, "message": {
+                        "id": "m", "role": "assistant", "source": {"model": "x"},
+                        "content": [{"type": "text", "text": "hi"}]}}}
+                out = proj.feed(ev)  # must not raise
+                self.assertEqual(out[0]["type"], "assistant", (field, bad))
+
+    def test_json_infinity_literal_usage(self):
+        # `1e999` decodes straight to inf from a native log line; int(inf) is the
+        # OverflowError _int must swallow (distinct from the `time` path).
+        proj = dt.DshProjector(SID)
+        ev = json.loads('{"type":"assistant/message","seq":1,"time":0,"data":{'
+                        '"usage":{"inputTokens":1e999,"outputTokens":5},'
+                        '"message":{"id":"m","role":"assistant","source":{"model":"x"},'
+                        '"content":[{"type":"text","text":"x"}]}}}')
+        usage = proj.feed(ev)[0]["message"]["usage"]
+        self.assertEqual(usage["input_tokens"], 0)   # inf dropped, never inf
+        self.assertEqual(usage["output_tokens"], 5)
+
     def test_tool_result_non_dict_source(self):
         proj = dt.DshProjector(SID)
         for src in ("tool", 1, ["x"], True):
