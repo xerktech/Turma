@@ -8,6 +8,7 @@ import com.xerktech.turma.harness.MainDispatcherRule
 import com.xerktech.turma.model.TrajCall
 import com.xerktech.turma.model.TrajTurn
 import com.xerktech.turma.model.TrajTurnTokens
+import com.xerktech.turma.vm.TrajectoryViewModel
 import org.junit.After
 import org.junit.Before
 import org.junit.Rule
@@ -19,12 +20,16 @@ import java.util.Locale
 
 /**
  * The dsh Trajectory render path (XERK-498) — what the VM/format tests do not
- * reach. Split so nothing depends on a LazyColumn's viewport: the WHOLE screen
- * is composed over a seeded `/api/dsh/<tid>/trajectory` and asserted on its
- * always-composed header (item 0) + the non-lazy empty/404 messages; the turn
- * card and its call rows are exercised as an ISOLATED composable, so a short CI
- * viewport can neither leave a row uncomposed nor drop the scroll action (both
- * of which broke a scroll-based version — see `.claude/rules/android.md`).
+ * reach. Two deliberate choices keep it deterministic on a slow CI runner where
+ * a warm local run hid the flakiness:
+ *  - the `/api/dsh/<tid>/trajectory` fetch is a real async round trip, so the VM
+ *    is loaded and AWAITED (`HubHarness.awaitValue`) BEFORE the screen is
+ *    composed — `waitForIdle` settles composition, not the network, so composing
+ *    first races the loading spinner against the response;
+ *  - the turn card is exercised as an ISOLATED composable, so a short viewport
+ *    cannot leave its LazyColumn row uncomposed (`.claude/rules/android.md`). The
+ *    whole screen is asserted only on its always-composed header (item 0) and the
+ *    non-lazy empty/404 messages.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -55,18 +60,32 @@ class TrajectoryScreenTest {
         Locale.setDefault(savedLocale)
     }
 
+    /** Compose the screen holding its VM, then WAIT for the async
+     *  `/api/dsh/<tid>/trajectory` fetch the screen's `LaunchedEffect` kicks off
+     *  to settle before asserting — `waitForIdle` settles composition, not the
+     *  network, so asserting straight after races the loading spinner against the
+     *  response (green on a warm local run, flaky on a slow CI runner). Holding
+     *  the VM lets the test await its state directly. */
     private fun open(json: String, code: Int = 200) {
         hub.json("/api/dsh/$tid/trajectory", json, code = code)
-        compose.setContent { TrajectoryScreen(host = "nas01", transcriptId = tid, onBack = {}) }
-        compose.waitForIdle()
+        val vm = TrajectoryViewModel(hub.app)
+        compose.setContent { TrajectoryScreen(host = "nas01", transcriptId = tid, onBack = {}, vm = vm) }
+        compose.waitForIdle()   // let the LaunchedEffect fire vm.load(tid)
+        // Wait for a genuine OUTCOME, not merely "not loading" — the initial Ui()
+        // has loading=false, so a "!loading" wait can return on the empty state
+        // before the fetch has even flipped it (the CI-only race).
+        hub.awaitValue {
+            val s = vm.state.value
+            if (s.data != null || s.notSynced || s.error != null) Unit else null
+        }
+        compose.waitForIdle()   // paint the settled state
     }
 
     @Test
     fun `the screen composes and renders the header token totals in full`() {
-        // The header is LazyColumn item 0 — always composed, so `assertExists`
-        // needs no scroll. The 3e9 input token renders in full (grouped), which
-        // proves the whole screen composed over the real fetch AND that the Long
-        // token path is not narrowed through Int.
+        // The header is LazyColumn item 0 — always composed. The 3e9 input token
+        // renders in full (grouped), proving the screen composed over the real
+        // fetch AND that the Long token path is not narrowed through Int.
         open(
             """
             {"transcriptId":"tr1","title":"my dsh session","model":"deepseek","durationMs":1500,
@@ -92,8 +111,7 @@ class TrajectoryScreenTest {
 
     @Test
     fun `a 404 shows the not-synced-yet message, not an error`() {
-        // The 404 branch renders outside the LazyColumn (a centered Box), so it
-        // is always composed.
+        // The 404 branch renders outside the LazyColumn (a centered Box).
         open("""{"error":"no dsh trajectory for this session"}""", code = 404)
         compose.onNodeWithText("No dsh trajectory yet", substring = true).assertExists()
     }
