@@ -38,6 +38,13 @@ class TrajectoryViewModel(app: Application) : AndroidViewModel(app) {
     private val _state = MutableStateFlow(Ui())
     val state: StateFlow<Ui> = _state
 
+    /** The last id a load has committed to (in-flight or settled), so a second
+     *  non-force load of the same id — the screen re-runs its `LaunchedEffect` on
+     *  every re-entry — neither re-fetches nor un-settles a resolved outcome.
+     *  The ↻ Refresh button (force=true) is the retry path. Keyed on the id, not
+     *  on `data`, so a 404/error is idempotent too, not just a success. */
+    private var loadedId: String? = null
+
     /**
      * Load the trajectory for [transcriptId]. Idempotent per id unless [force]:
      * a re-open of the same session that already loaded does not re-fetch, but
@@ -49,7 +56,8 @@ class TrajectoryViewModel(app: Application) : AndroidViewModel(app) {
             _state.update { Ui(error = "This session has no transcript id yet.") }
             return
         }
-        if (!force && _state.value.data?.transcriptId == transcriptId) return
+        if (!force && loadedId == transcriptId) return
+        loadedId = transcriptId
         _state.update { it.copy(loading = true, error = null) }
         viewModelScope.launch {
             val res = runCatching { container.client.api.dshTrajectory(transcriptId) }
