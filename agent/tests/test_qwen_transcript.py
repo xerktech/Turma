@@ -366,6 +366,38 @@ class TestQwenProjectionEdgeCases(unittest.TestCase):
         block = proj.feed(ev)[0]["message"]["content"][0]
         self.assertTrue(block["is_error"])
 
+    def test_infinite_or_nan_usage_never_crashes(self):
+        """feed() runs per streamed event in the launcher, so a usage field that
+        is a JSON infinity (`1e999` is legal RFC-8259 → inf, and int(inf) raises
+        OverflowError) or NaN must NOT abort the projection — it drops to a 0
+        count. The trap the codebase already guards elsewhere (`_token_count`)."""
+        proj = qt.QwenProjector(SID)
+        for field in ("promptTokenCount", "candidatesTokenCount",
+                      "cachedContentTokenCount"):
+            for bad in (float("inf"), float("-inf"), float("nan")):
+                meta = {"promptTokenCount": 100, "candidatesTokenCount": 50,
+                        "cachedContentTokenCount": 0}
+                meta[field] = bad
+                ev = {"type": "assistant", "timestamp": "", "model": "m",
+                      "usageMetadata": meta, "message": {
+                          "role": "model", "parts": [{"text": "hi"}]}}
+                out = proj.feed(ev)  # must not raise
+                self.assertEqual(out[0]["type"], "assistant", (field, bad))
+
+    def test_json_infinity_literal_usage_never_crashes(self):
+        # `1e999` decodes to inf straight from a native log line; int(inf) is the
+        # OverflowError _int must swallow.
+        proj = qt.QwenProjector(SID)
+        ev = json.loads('{"type":"assistant","timestamp":"","model":"m",'
+                        '"usageMetadata":{"promptTokenCount":1e999,'
+                        '"candidatesTokenCount":5},'
+                        '"message":{"role":"model","parts":[{"text":"hi"}]}}')
+        out = proj.feed(ev)  # must not raise
+        # inf input drops to 0, so with only a finite output count the usage block
+        # survives (output_tokens=5); the poisoned input is 0, never inf.
+        self.assertEqual(out[0]["message"]["usage"]["input_tokens"], 0)
+        self.assertEqual(out[0]["message"]["usage"]["output_tokens"], 5)
+
     def test_interrupt_marker_flows_through_as_a_user_turn(self):
         # Qwen has no dedicated interrupt event; if it writes the marker as user
         # text, it projects as a user message and the reader's INTERRUPT_RE

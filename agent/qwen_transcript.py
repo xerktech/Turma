@@ -70,6 +70,7 @@ dependency-free like the rest of `agent/`.
 """
 
 import json
+import math
 import re
 import uuid as _uuidlib
 
@@ -115,12 +116,22 @@ def _mk_uuid(session_id, seq, index=0):
 def _int(v):
     """A token count coerced to a non-negative int (the ledger re-coerces, but a
     clean projection keeps a float/None from ever reaching the wire). Unusable ->
-    0; a fractional value truncates; a bool is not a count."""
+    0; a fractional value truncates; a bool is not a count.
+
+    `feed()` runs per streamed event in the launcher, so this must NEVER raise —
+    a single bad usage field must not abort the projection. Two non-finite floats
+    are the trap the codebase has hit before (`_token_count`, `read_limits_snapshot`,
+    `_archive_known`): `1e999` is legal RFC-8259 JSON that `json.loads` yields as
+    `inf`, and `int(inf)` raises OverflowError — NOT one of the obvious two — while
+    `int(nan)` raises ValueError. isfinite screens both, and OverflowError is
+    caught as a backstop for any other numeric type `int()` cannot render."""
     if isinstance(v, bool):
+        return 0
+    if isinstance(v, float) and not math.isfinite(v):
         return 0
     try:
         n = int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
     return n if n >= 0 else 0
 
