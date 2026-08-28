@@ -530,17 +530,25 @@ class TestSpawnOptionHelpers(unittest.TestCase):
                 ha.resolve_permission_mode(bad)
 
     def test_dsh_configured_is_off_by_default_and_env_gated(self):
-        # Opt-in, off by default, so every current host reads the capability as
-        # false and degrades — the whole degrade contract rests on this.
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("TURMA_DSH", None)
-            self.assertFalse(ha.dsh_configured())
+        # The in-code DSH_ENABLED kill switch wins over the env: while it is
+        # False (the shipped default), every TURMA_DSH value reads as off, so the
+        # capability is disabled fleet-wide no matter what a host's env says.
         for on in ("1", "true", "TRUE", "yes", "on", " On "):
             with mock.patch.dict(os.environ, {"TURMA_DSH": on}):
-                self.assertTrue(ha.dsh_configured(), on)
-        for off in ("0", "", "no", "off", "maybe"):
-            with mock.patch.dict(os.environ, {"TURMA_DSH": off}):
-                self.assertFalse(ha.dsh_configured(), off)
+                self.assertFalse(ha.dsh_configured(), on)
+        # With the switch lifted the env gate is what decides: opt-in, off by
+        # default, so a host that lifts the flag but sets no env still degrades —
+        # the whole degrade contract rests on this.
+        with mock.patch.object(ha, "DSH_ENABLED", True):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("TURMA_DSH", None)
+                self.assertFalse(ha.dsh_configured())
+            for on in ("1", "true", "TRUE", "yes", "on", " On "):
+                with mock.patch.dict(os.environ, {"TURMA_DSH": on}):
+                    self.assertTrue(ha.dsh_configured(), on)
+            for off in ("0", "", "no", "off", "maybe"):
+                with mock.patch.dict(os.environ, {"TURMA_DSH": off}):
+                    self.assertFalse(ha.dsh_configured(), off)
 
     def test_resolve_agent_type_enum_and_dsh_gate(self):
         # Blank -> claude, what every session was before this existed.
@@ -15393,6 +15401,29 @@ class TestSetSummary(ManagerMixin, unittest.TestCase):
             sm.resume("s1")
         self.assertEqual(sm.registry[0]["summary"], "My Own Name")
         self.assertTrue(sm.registry[0]["summaryManual"])
+
+    def test_resume_regates_agent_type_on_dsh_availability(self):
+        # The resume rebuild re-gates agentType on dsh_configured() (like
+        # receive_migration): a persisted "dsh" resumes as claude when this host
+        # does not offer dsh — which the DSH_ENABLED kill switch forces off —
+        # rather than as a runtime the host cannot launch. Without the re-gate a
+        # stale "dsh" record would come back as dsh with the switch off.
+        wt = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, wt, ignore_errors=True)
+
+        def resumed_agent_type(dsh_on):
+            sm = self.make_manager()
+            sm.closed = [{"id": "s1", "status": "stopped", "repo": "r",
+                          "worktreePath": wt, "tmuxName": "agent-s1",
+                          "rcName": "h-r-s1", "ttydPort": 7681, "agentType": "dsh"}]
+            with mock.patch.object(ha, "dsh_configured", lambda: dsh_on), \
+                    mock.patch.object(sm, "_launch_tmux"), \
+                    mock.patch.object(sm, "_launch_ttyd"):
+                sm.resume("s1")
+            return sm.registry[0]["agentType"]
+
+        self.assertEqual(resumed_agent_type(False), "claude")  # kill switch / no dsh
+        self.assertEqual(resumed_agent_type(True), "dsh")      # dsh offered -> preserved
 
 
 class TestSessionSummaries(ManagerMixin, unittest.TestCase):

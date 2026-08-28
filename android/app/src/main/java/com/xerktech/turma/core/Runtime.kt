@@ -14,6 +14,18 @@ import com.xerktech.turma.model.SessionInfo
  */
 object Runtime {
 
+    /**
+     * Fleet-wide kill switch for ALL dsh (DeepSeek Harness, XERK-460) functionality.
+     * When false, every dsh surface is hidden/refused — the composer's dsh row, the
+     * board's dsh runtime pin, the dsh model dropdowns and the presentational dsh
+     * card marker — WITHOUT removing any of the machinery, so flipping it back to
+     * true restores dsh with no code change. This is an in-CODE flag (not env, not a
+     * build flavour); the agent (Python) and hub carry the same-named flag, so the
+     * fleet turns dsh off in one place per component. It is a `var` ONLY so tests can
+     * flip it to exercise the retained dsh behavior; production ships it false.
+     */
+    var DSH_ENABLED: Boolean = false
+
     const val CLAUDE = "claude"
     const val DSH = "dsh"
 
@@ -35,7 +47,7 @@ object Runtime {
         buildList {
             add(CLAUDE to "Claude Code")
             if (local?.available == true) add(LOCAL to "Claude Code Local")
-            if (dsh?.available == true) add(DSH to "dsh")
+            if (DSH_ENABLED && dsh?.available == true) add(DSH to "dsh")
         }
 
     /** The `agentType` a chosen composer runtime spawns as, or null to omit it
@@ -53,7 +65,7 @@ object Runtime {
      * so nobody can pick a runtime the host would only ack and drop (the hub
      * 409s it too).
      */
-    fun composerOffers(dsh: DshInfo?): Boolean = dsh?.available == true
+    fun composerOffers(dsh: DshInfo?): Boolean = DSH_ENABLED && dsh?.available == true
 
     /**
      * The `agentType` a spawn should carry, or null to omit it. Only "dsh" is
@@ -73,14 +85,14 @@ object Runtime {
      * queue a `dsh` spawn the target 409s.
      */
     fun hostDsh(agents: List<AgentInfo>, host: String): DshInfo? =
-        agents.firstOrNull { it.key == host }?.dsh
+        if (!DSH_ENABLED) null else agents.firstOrNull { it.key == host }?.dsh
 
     /**
      * Is a session on a non-default (dsh) runtime, i.e. does its card carry a
      * runtime badge? A claude session (the default, and every session predating
      * the field, which reports "") gets none, so the common card is unchanged.
      */
-    fun isDsh(agentType: String?): Boolean = agentType == DSH
+    fun isDsh(agentType: String?): Boolean = DSH_ENABLED && agentType == DSH
 
     // ---- dsh model list (XERK-503/504) --------------------------------------
     // A dsh session offers the endpoint's DISCOVERED models (DshInfo.models), not
@@ -121,5 +133,5 @@ object Runtime {
 
     /** The dsh runtime capability of the host a chat session runs on. */
     fun hostDshFor(agents: List<AgentInfo>, host: String): DshInfo? =
-        agents.firstOrNull { it.key == host }?.dsh
+        if (!DSH_ENABLED) null else agents.firstOrNull { it.key == host }?.dsh
 }

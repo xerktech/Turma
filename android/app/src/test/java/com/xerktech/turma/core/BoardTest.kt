@@ -465,15 +465,23 @@ class BoardTest {
     // runtimePinOf/prettyRuntime + mergeSites dshAvailable ----------------------
 
     @Test fun `mergeSites marks dshAvailable when ANY reporting host offers dsh`() {
-        val noDsh = agent("hostA", true, JiraBlock(siteKey = "org", user = "u", fetchedAt = "2026-07-16T01:00:00Z"))
-        val withDsh = agent("hostB", true, JiraBlock(siteKey = "org", user = "u", fetchedAt = "2026-07-16T02:00:00Z"))
-            .copy(dsh = com.xerktech.turma.model.DshInfo(available = true))
-        // One host offering dsh makes the whole org offer it (an OR).
-        assertTrue(mergeSites(listOf(noDsh, withDsh)).single().dshAvailable)
-        // No host offering it (absent or available:false) leaves the org without.
-        val off = agent("hostC", true, JiraBlock(siteKey = "org2", user = "u"))
-            .copy(dsh = com.xerktech.turma.model.DshInfo(available = false))
-        assertFalse(mergeSites(listOf(noDsh.copy(jira = JiraBlock(siteKey = "org2", user = "u")), off)).single().dshAvailable)
+        // dsh ships DISABLED fleet-wide (Runtime.DSH_ENABLED = false); enable it to
+        // exercise the retained mergeSites dsh-availability OR, resetting in finally
+        // so the flag can't leak into the other board tests.
+        Runtime.DSH_ENABLED = true
+        try {
+            val noDsh = agent("hostA", true, JiraBlock(siteKey = "org", user = "u", fetchedAt = "2026-07-16T01:00:00Z"))
+            val withDsh = agent("hostB", true, JiraBlock(siteKey = "org", user = "u", fetchedAt = "2026-07-16T02:00:00Z"))
+                .copy(dsh = com.xerktech.turma.model.DshInfo(available = true))
+            // One host offering dsh makes the whole org offer it (an OR).
+            assertTrue(mergeSites(listOf(noDsh, withDsh)).single().dshAvailable)
+            // No host offering it (absent or available:false) leaves the org without.
+            val off = agent("hostC", true, JiraBlock(siteKey = "org2", user = "u"))
+                .copy(dsh = com.xerktech.turma.model.DshInfo(available = false))
+            assertFalse(mergeSites(listOf(noDsh.copy(jira = JiraBlock(siteKey = "org2", user = "u")), off)).single().dshAvailable)
+        } finally {
+            Runtime.DSH_ENABLED = false
+        }
     }
 
     @Test fun `runtimePinOf reads the map, treating claude and blank as no pin`() {

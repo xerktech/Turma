@@ -8,6 +8,9 @@ import androidx.compose.ui.test.performClick
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
 import org.junit.Rule
+import com.xerktech.turma.core.Runtime
+import org.junit.After
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -45,6 +48,12 @@ class ChatModelChipsTest {
 
     @get:Rule(order = 2)
     val compose = createAndroidComposeRule<ComponentActivity>()
+
+    // dsh ships DISABLED fleet-wide (Runtime.DSH_ENABLED = false); the dsh footer
+    // chip/model dropdown under test read Runtime.isDsh/hostDshFor, so enable it
+    // before each and reset after so the flag can't leak into any other test.
+    @Before fun enableDsh() { Runtime.DSH_ENABLED = true }
+    @After fun resetDsh() { Runtime.DSH_ENABLED = false }
 
     private val host = "nas01"
     private val session = "s1"

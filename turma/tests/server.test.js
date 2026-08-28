@@ -134,6 +134,11 @@ const titles = () => notifications.filter((n) => n.title != null).map((n) => n.t
 const dismisses = () => notifications.filter((n) => n.data?.action === "dismiss").map((n) => n.data.notifKey);
 
 const hub = require("../server.js");
+// dsh ships behind an OFF-by-default in-code kill switch (server.js DSH_ENABLED).
+// The dsh tests below flip it ON to exercise the retained machinery; this resets
+// it after EVERY test (runs even on a thrown assertion) so that ON state can
+// never leak into the non-dsh tests that surround them.
+test.afterEach(() => { hub.__setDshEnabled(false); });
 // notify() no-ops when no device is registered; register one so the alert tests
 // see the fan-out. Real fan-out/pruning is exercised separately below.
 hub.registerDevice("capture-device", "android", ["dismiss"]);
@@ -3539,6 +3544,7 @@ test("http: model endpoint rejects a malformed model before it can queue", async
 });
 
 test("http: model endpoint accepts a discovered dsh model for a dsh session (XERK-504)", async () => {
+  hub.__setDshEnabled(true);
   // A dsh session's model is a DISCOVERED endpoint id, not a Claude alias, so the
   // route takes the endpoint charset (`/`, `:`) and validates against the host's
   // discovered dsh set — mirroring the local branch. The agent relaunches the dsh
@@ -5687,6 +5693,7 @@ const dshTicketBeat = (device, site, { key = "ENG-5", repo = "Turma" } = {}) =>
   });
 
 test("http: pinning a ticket to dsh needs an org host offering it; claude releases", async () => {
+  hub.__setDshEnabled(true);
   await jiraBeat("trNo", "trNo.atlassian.net");
   // No host of this org offers dsh, so a dsh pin is refused (nothing could run it).
   assert.equal((await setRuntime("trNo.atlassian.net", "ENG-1", { runtime: "dsh" })).status, 400);
@@ -5711,6 +5718,7 @@ test("http: pinning a ticket to dsh needs an org host offering it; claude releas
 });
 
 test("http: the runtime pin rides the /api/agents payload + requires the user login", async () => {
+  hub.__setDshEnabled(true);
   await dshTicketBeat("trPay", "trPay.atlassian.net");
   await setRuntime("trPay.atlassian.net", "ENG-5", { runtime: "dsh" });
   const res = await request("GET", "/api/agents", { headers: userHeaders });
@@ -5722,6 +5730,7 @@ test("http: the runtime pin rides the /api/agents payload + requires the user lo
 });
 
 test("http: a dsh-pinned ticket carries agentType on its spawnTicket command", async () => {
+  hub.__setDshEnabled(true);
   await dshTicketBeat("trSpawn", "trSpawn.atlassian.net");
   await setRuntime("trSpawn.atlassian.net", "ENG-5", { runtime: "dsh" });
   const res = await request("POST", "/api/jira/trSpawn.atlassian.net/ENG-5/session",
@@ -5734,6 +5743,7 @@ test("http: a dsh-pinned ticket carries agentType on its spawnTicket command", a
 });
 
 test("findTicketHost routes a dsh ticket only to a host that offers dsh", async () => {
+  hub.__setDshEnabled(true);
   // A dsh pin plus one org host that does NOT offer dsh: blocked, not full — a
   // freed slot would not give it the runtime.
   await ticketBeat("trPlain", "trRoute.atlassian.net", { key: "ENG-9" });
@@ -11104,6 +11114,7 @@ test("heartbeat: localModel is a known key, not an unknown-field remnant", async
 });
 
 test("heartbeat: dsh flag + session agentType survive into the fleet payload (XERK-465)", async () => {
+  hub.__setDshEnabled(true);
   await request("POST", "/api/heartbeat", {
     body: {
       device: "dsh1",
@@ -11120,6 +11131,7 @@ test("heartbeat: dsh flag + session agentType survive into the fleet payload (XE
 });
 
 test("http: spawn validates agentType like modelSource does (XERK-465)", async () => {
+  hub.__setDshEnabled(true);
   await request("POST", "/api/heartbeat", {
     body: { device: "dsh2", dsh: { available: true } }, headers: agentHeaders,
   });
@@ -11803,6 +11815,7 @@ test("normalizeLocalModel coerces the block so one host cannot hide the fleet", 
 });
 
 test("normalizeDsh coerces the capability flag strictly boolean (XERK-465)", () => {
+  hub.__setDshEnabled(true);
   // Same atomic-decode hazard as normalizeLocalModel: one host's bad `dsh`
   // block would fail Android's whole /api/agents decode and empty the fleet.
   const norm = (dsh) => {
@@ -11834,6 +11847,7 @@ test("normalizeDsh coerces the capability flag strictly boolean (XERK-465)", () 
 });
 
 test("normalizeDsh whitelists the host-wide web viewer sub-block (XERK-501)", () => {
+  hub.__setDshEnabled(true);
   const norm = (dsh) => {
     const p = { device: "h", dsh };
     hub.normalizeDsh(p);
@@ -11876,7 +11890,31 @@ test("normalizeDsh whitelists the host-wide web viewer sub-block (XERK-501)", ()
   assert.deepEqual(norm({ available: true, web: [1] }), { available: true, ...M });
 });
 
+test("DSH_ENABLED off (the shipped default) makes the hub serve an inert dsh block and no dsh runtime", () => {
+  // This test deliberately does NOT flip the flag — it pins the SHIPPED default.
+  // The dsh tests around it enable the flag and the top-level afterEach resets it,
+  // so the flag is false here. Without this, all the flag-on dsh tests stay green
+  // even if every hub kill-switch gate is removed (the coverage gap QA flagged).
+  assert.equal(hub.__getDshEnabled(), false);
+  // dshAvailable refuses whatever an agent claims.
+  assert.equal(hub.dshAvailable({ dsh: { available: true } }), false);
+  // normalizeDsh forces the block fully inert: no capability, no models, no
+  // default, no web viewer — even from a fully-populated agent report.
+  const p = { dsh: { available: true, web: { running: true, port: 7788, url: "http://x:7788/" },
+    models: [{ id: "deepseek-chat", contextTokens: 64000 }], defaultModel: "deepseek-chat", contextTokens: 64000 } };
+  hub.normalizeDsh(p);
+  assert.deepEqual(p.dsh, { available: false, models: [], defaultModel: null, contextTokens: null });
+  assert.equal("web" in p.dsh, false);
+  // normalizeRecord (the real ingest/restore path) coerces a dsh session runtime
+  // to claude on the wire, so no client renders a session as dsh.
+  const rec = { device: "h", dsh: { available: true }, sessions: [{ id: "s1", agentType: "dsh" }] };
+  hub.normalizeRecord(rec);
+  assert.equal(rec.dsh.available, false);
+  assert.equal(rec.sessions[0].agentType, "");
+});
+
 test("normalizeDsh coerces the discovered model list (XERK-503)", () => {
+  hub.__setDshEnabled(true);
   const norm = (dsh) => {
     const p = { device: "h", dsh };
     hub.normalizeDsh(p);

@@ -1107,6 +1107,18 @@ AGENT_TYPES = {"claude", "dsh"}
 # checked like every other launch input. Ollama-style tags carry a colon.
 LOCAL_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,60}$")
 
+# --- dsh master kill switch (code flag, not env/build) ---------------------
+# A single in-CODE flag that disables ALL dsh functionality fleet-wide without
+# removing the dsh machinery from the repo. When False, dsh_configured() below
+# returns False regardless of TURMA_DSH / the DSH_* env, so this host never
+# advertises the dsh capability, refuses every agentType="dsh" spawn, and runs
+# no dsh launcher or `dsh web` viewer — the same "off" state a host without the
+# env has, but one no per-host env can override. The hub, Android and glasses
+# carry the SAME-named flag so no single component can re-enable dsh alone. Flip
+# to True (and set the env) to bring dsh back. Tests that exercise the retained
+# dsh machinery patch this True (or patch dsh_configured directly).
+DSH_ENABLED = False
+
 # --- dsh runtime host configuration (XERK-460, launcher XERK-467) ----------
 # Where a dsh session's process finds its profile (the driver plugin + the model
 # provider route), and how it reaches a model. dsh has NO Claude-style failover
@@ -1769,12 +1781,14 @@ def dsh_configured():
     off by default — makes the hub and composers HIDE the runtime selector
     rather than queue a spawn the host would ack and then fail to launch.
 
-    Gated on TURMA_DSH so the capability can be turned on per host once the dsh
-    launcher (XERK-466) and the image's dsh toolchain land. [A] establishes the
-    field, the flag and the whole wire path; until the launcher exists, an
-    agentType="dsh" spawn is refused at launch (see _launch_tmux), so leaving
-    this off keeps every current host on Claude Code with nothing changed."""
-    return (os.environ.get("TURMA_DSH", "").strip().lower()
+    Gated FIRST on the in-code DSH_ENABLED kill switch (so no per-host env can
+    turn dsh on while it is disabled fleet-wide), then on TURMA_DSH so the
+    capability can be turned on per host once the flag is lifted. [A] establishes
+    the field, the flag and the whole wire path; an agentType="dsh" spawn is
+    refused at launch (see _launch_tmux) whenever this returns False, so leaving
+    it off keeps every current host on Claude Code with nothing changed."""
+    return (DSH_ENABLED
+            and os.environ.get("TURMA_DSH", "").strip().lower()
             in ("1", "true", "yes", "on"))
 
 
@@ -14595,7 +14609,13 @@ class SessionManager:
             # Resuming an ended session keeps whichever model it was running
             # against; usage has not come back just because it was killed.
             "modelSource": rec.get("modelSource") or "subscription",
-            "agentType": rec.get("agentType") or "claude",
+            # Re-gate the runtime on rebuild, like receive_migration does: a
+            # persisted "dsh" falls back to claude when this host does not offer
+            # dsh (which the DSH_ENABLED kill switch forces off), rather than
+            # resuming as a runtime this host cannot launch.
+            "agentType": (resolve_agent_type(rec.get("agentType"))
+                          if rec.get("agentType") in AGENT_TYPES
+                          and dsh_configured() else "claude"),
             # ...and which self-hosted model it was on (XERK-489); the launch
             # re-validates and falls back if the host no longer serves it.
             "localModelName": rec.get("localModelName"),

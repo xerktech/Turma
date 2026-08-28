@@ -47,6 +47,19 @@ const usageLedger = require("./usage-ledger.js");
 
 const PORT = parseInt(process.env.PORT || "8300", 10);
 
+// dsh (DeepSeek Harness runtime, XERK-460) fleet-wide KILL SWITCH. This is an
+// in-CODE flag — deliberately not an env var or a build flag — that turns OFF all
+// dsh functionality WITHOUT deleting any of the dsh machinery, so it can be flipped
+// back on by editing one line. Set to DISABLED (false).
+//
+// The agent (Python), Android and glasses each carry a SAME-NAMED flag, so no
+// single component can re-enable dsh on its own — the hub still refuses to accept
+// or advertise dsh here even if an agent reports the capability. It gates the two
+// hub choke points every dsh decision funnels through: `dshAvailable` (server-side
+// acceptance — spawn gate, org gate, ticket routing) and `normalizeDsh` (the wire
+// coercion, so the served /api/agents payload never advertises dsh to any client).
+let DSH_ENABLED = false;
+
 /**
  * The memory ceiling this process actually runs under — `containerMemoryLimit()`
  * when containerised (which is how it is deployed), else the host's RAM.
@@ -221,6 +234,11 @@ function localModelAvailable(agent) {
 // composer's runtime selector is shown on, and the spawn route validates a
 // `dsh` choice against. An ABSENT flag (a pre-dsh agent) means "cannot do it".
 function dshAvailable(agent) {
+  // The fleet-wide kill switch wins first: with dsh disabled no host offers it,
+  // whatever it reports. This is the single decision function checkSpawnAgentType,
+  // orgOffersDsh, findTicketHost and the spawn-eligibility loops all go through,
+  // so gating it here disables server-side dsh acceptance everywhere at once.
+  if (!DSH_ENABLED) return false;
   return Boolean(agent && agent.dsh && agent.dsh.available);
 }
 
@@ -2885,6 +2903,18 @@ function normalizeDsh(payload) {
     if ("dsh" in payload) payload.dsh = null;
     return;
   }
+  // With the fleet-wide kill switch off, the served block is fully INERT — no
+  // capability, no discovered models, no default, no web viewer — so nothing
+  // dsh-shaped rides /api/agents to any client (web, Android, glasses) even when
+  // an agent reports the capability. Zeroing `models`/`defaultModel` too (not
+  // just `available`) matters because the hub's own `/model` route reads
+  // `dsh.models` via `dshServes`: leaving them would keep a dsh code path live
+  // with the switch off. The full coercion below runs only with the flag on, so
+  // re-enabling needs no further change here.
+  if (!DSH_ENABLED) {
+    payload.dsh = { available: false, models: [], defaultModel: null, contextTokens: null };
+    return;
+  }
   const out = { available: d.available === true };
   // The endpoint's discovered dsh models (XERK-503), the exact shape and
   // coercion as normalizeLocalModel's — [{id, contextTokens|null}], bound the
@@ -2919,7 +2949,7 @@ function normalizeDsh(payload) {
   // lesson: an uncapped agent-set string is a memory hazard); a non-string or
   // an absent url becomes null, which the clients render as host-only text.
   const w = d.web;
-  if (w && typeof w === "object" && !Array.isArray(w) && w.running === true) {
+  if (DSH_ENABLED && w && typeof w === "object" && !Array.isArray(w) && w.running === true) {
     // The url flows to an anchor href on the client, so accept ONLY http(s):
     // — an agent-set javascript:/data: value is dropped to null here rather
     // than trusted downstream (defence in depth; not a live XSS on Chromium).
@@ -4321,6 +4351,11 @@ function normalizeSessions(payload) {
     for (const k of ["modelSource", "modelSourceAt", "agentType"]) {
       if (k in s && typeof s[k] !== "string") s[k] = "";
     }
+    // Kill switch OFF: a reported/persisted dsh session runtime reads as claude
+    // on the wire (coerce "dsh" -> "", which every client already treats as the
+    // default), so no client renders a session as dsh and the hub's own /model
+    // route never takes its dsh branch. Mirrors the agent's rebuild coercion.
+    if (!DSH_ENABLED && s.agentType === "dsh") s.agentType = "";
     // XERK-489: the per-session self-hosted model name (String? on Android) and
     // its context window (Int? on Android). Typing a field on SessionInfo and
     // adding its hub-side coercion are the SAME change — a wrong-typed one from a
@@ -10355,6 +10390,13 @@ if (process.env.TURMA_TEST) {
     normalizeRecord,
     normalizeLocalModel,
     normalizeDsh,
+    dshAvailable,
+    // The fleet-wide dsh kill switch (XERK-460) is in-code and DISABLED by
+    // default, so the retained dsh tests must flip it ON around themselves to
+    // prove dsh still works when enabled. The setter lets a test do that (and
+    // reset to false after); the getter is for asserting the default is off.
+    __setDshEnabled(v) { DSH_ENABLED = v; },
+    __getDshEnabled() { return DSH_ENABLED; },
     normalizeRetired,
     normalizeJira,
     normalizeClones,

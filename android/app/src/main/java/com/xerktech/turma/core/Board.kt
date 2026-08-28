@@ -318,7 +318,11 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
         val j = a.jira ?: continue
         if (j.siteKey.isBlank()) continue
         reporterOnline[j.siteKey] = (reporterOnline[j.siteKey] ?: false) || a.online
-        if (a.dsh?.available == true) dshBySite[j.siteKey] = true
+        // Gated on the fleet-wide dsh kill switch (Runtime.DSH_ENABLED): with dsh
+        // disabled, `site.dshAvailable` is false everywhere so the board Runtime
+        // picker isn't offered. An existing dsh pin is still carried back and
+        // releasable (runtimeEditable), unchanged.
+        if (Runtime.DSH_ENABLED && a.dsh?.available == true) dshBySite[j.siteKey] = true
         val hk = a.key.ifBlank { a.device }
         if (hk.isNotBlank()) {
             hostOpts.getOrPut(j.siteKey) { LinkedHashMap() }[hk] =

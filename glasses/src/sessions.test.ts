@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { flattenSessions, glyph, isDsh, liveState } from "./sessions.ts";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { __setDshEnabled, flattenSessions, glyph, isDsh, liveState } from "./sessions.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
 function signals(overrides: Partial<LiveSignals> = {}): LiveSignals {
@@ -151,6 +151,13 @@ describe("glyph", () => {
 });
 
 describe("isDsh", () => {
+  // The dsh machinery is RETAINED behind the DSH_ENABLED kill switch (currently
+  // OFF fleet-wide). These assertions exercise the marker's own logic, so they
+  // flip the switch on for the block and reset it after — no leakage into the
+  // rest of the suite, which must see the shipped (disabled) behavior.
+  beforeEach(() => __setDshEnabled(true));
+  afterEach(() => __setDshEnabled(false));
+
   // XERK-460: "dsh" is the only truthy runtime; the default and every pre-dsh
   // session (claude / "" / absent) must read false so it shows no marker.
   it("is true only for agentType === 'dsh'", () => {
@@ -164,6 +171,13 @@ describe("isDsh", () => {
     ["unknown value", { agentType: "something-else" }],
   ] as const)("is false for %s", (_label, overrides) => {
     expect(isDsh(session(overrides))).toBe(false);
+  });
+
+  // With the kill switch OFF (the shipped default) a dsh session is invisible as
+  // a dsh session — the marker reads false even for agentType === "dsh".
+  it("is false for a dsh session when DSH_ENABLED is off", () => {
+    __setDshEnabled(false);
+    expect(isDsh(session({ agentType: "dsh" }))).toBe(false);
   });
 });
 
