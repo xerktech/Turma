@@ -86,13 +86,18 @@ class TrajectoryScreenTest {
      *  `awaitValue` settles the VM's StateFlow, but the screen observes it through
      *  `collectAsState`, so the recomposition that paints the loaded state can lag
      *  the value on a loaded CI runner — a single `assertExists()` then races that
-     *  paint (the moving TrajectoryScreenTest flake). `waitUntil` recomposes and
-     *  re-checks until the node exists or the bound elapses, so it can only settle
-     *  the race, never mask a genuinely missing node. */
+     *  paint (the moving TrajectoryScreenTest flake). The delivery needs the MAIN
+     *  dispatcher pumped (`waitForIdle`), not the Compose clock advanced
+     *  (`waitUntil` alone timed out here — the external StateFlow emission is off
+     *  the clock), so this retries waitForIdle until the node exists. It can only
+     *  settle the race, never mask a genuinely missing node — the final
+     *  `assertExists` still fails loud with the real reason. */
     private fun awaitText(text: String, substring: Boolean = false) {
-        compose.waitUntil(timeoutMillis = 5_000) {
-            compose.onAllNodesWithText(text, substring = substring)
-                .fetchSemanticsNodes().isNotEmpty()
+        repeat(200) {
+            if (compose.onAllNodesWithText(text, substring = substring)
+                    .fetchSemanticsNodes().isNotEmpty()) return
+            compose.waitForIdle()
+            Thread.sleep(20)
         }
         compose.onNodeWithText(text, substring = substring).assertExists()
     }
