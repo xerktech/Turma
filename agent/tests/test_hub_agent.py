@@ -24062,5 +24062,194 @@ class TestRestartAgent(ManagerMixin, unittest.TestCase):
         self.assertEqual(popen.call_args.args[0], [ctl, "restart"])
 
 
+QWEN_IDLE_PANE = (
+    "  ● The exact text I wrote was HELLO_QWEN.\n"
+    "  > tell me what you wrote\n"
+    "  ✜ wt · git:(master) · qwen3-coder · 262.1k Context 8% used\n"
+    "  ⏸ Ask permissions (shift + tab to cycle)\n"
+)
+
+
+def _qwen_pane_frame(name):
+    """A REAL captured qwen TUI frame from the G0 spike (docs/qwen-g0/pane/). Used
+    instead of a hand-cleaned copy so the parsers are pinned against exactly what
+    qwen renders — including its right-edge scrollbar column, which a cleaned copy
+    strips (the escape that hid the parse_pane_prompt bug QA caught)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "..", "..", "docs", "qwen-g0", "pane", f"{name}.txt")
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+class TestQwenSessionArms(ManagerMixin, unittest.TestCase):
+    """XERK-509 [Qwen C]: the pane-driven read/HITL/naming arms of a qwen session
+    — the busy markers, the approval-dialog parse, digit+Enter answering, the ask
+    MCP registration, naming without claude -p, and tail teardown. The pane
+    parsers are driven against the REAL captured G0 frames (not cleaned copies)."""
+
+    # --- liveness: qwen busy markers (unioned, qwen-exclusive) ---------------
+
+    def test_qwen_busy_pane_reads_busy(self):
+        # Real busy frames: the streaming spinner (02) and a tool run (04).
+        self.assertTrue(ha._busy_from_capture(_qwen_pane_frame("02-busy")))
+        self.assertTrue(ha._busy_from_capture(_qwen_pane_frame("04-hard-deny")))
+
+    def test_qwen_idle_pane_reads_idle(self):
+        # Real idle frame, and the approval frame (blocked on a human, not the
+        # model's own turn) must read idle like a Claude panePrompt.
+        self.assertFalse(ha._busy_from_capture(_qwen_pane_frame("01-idle")))
+        self.assertFalse(ha._busy_from_capture(_qwen_pane_frame("03-tool-approval")))
+
+    def test_qwen_markers_do_not_fire_on_a_claude_permission_dialog(self):
+        # Claude's own permission dialog footer says "Esc to cancel · Tab to
+        # amend" (no paren) and must stay idle — the qwen spinner token keeps its
+        # closing paren precisely to avoid this collision.
+        self.assertFalse("esc to cancel)" in
+                         "Esc to cancel · Tab to amend · ctrl+e to explain".lower())
+
+    # --- HITL input 1: the qwen approval prompt off the pane -----------------
+
+    def test_qwen_approval_prompt_parses_from_the_real_frame(self):
+        # Drives the REAL 03-tool-approval capture, scrollbar column and all —
+        # the cleaned copy hid that qwen's "█" right-edge scrollbar made the
+        # question line not end in "?" and the separator lines not blank.
+        prompt = ha.parse_pane_prompt(_qwen_pane_frame("03-tool-approval"))
+        self.assertIsNotNone(prompt)
+        self.assertEqual(prompt["prompt"], "Apply this change?")
+        self.assertEqual([o["number"] for o in prompt["options"]], [1, 2, 3])
+        selected = [o for o in prompt["options"] if o["selected"]]
+        self.assertEqual([o["number"] for o in selected], [1])
+        # The scrollbar is stripped from the labels too (not carried as junk).
+        self.assertEqual(prompt["options"][0]["label"], "Yes, allow once")
+
+    def test_real_qwen_idle_and_busy_frames_are_never_a_dialog(self):
+        for name in ("01-idle", "02-busy", "04-hard-deny"):
+            self.assertIsNone(ha.parse_pane_prompt(_qwen_pane_frame(name)), name)
+
+    def test_qwen_idle_footer_is_never_a_dialog(self):
+        # A qwen composer footer below a numbered list means "not blocking".
+        pane = (QWEN_IDLE_PANE
+                + "  › 1. option one\n    2. option two\n"
+                + "  ⏸ Ask permissions (shift + tab to cycle)\n")
+        self.assertIsNone(ha.parse_pane_prompt(pane))
+
+    def test_answer_pane_prompt_sends_digit_then_enter_for_qwen(self):
+        sm = self.make_manager()
+        sess = {"id": "q1", "status": "running", "tmuxName": "agent-q1",
+                "agentType": "qwen"}
+        sm.registry = [sess]
+        with mock.patch.object(ha, "_capture_pane",
+                               return_value=_qwen_pane_frame("03-tool-approval")):
+            sm.answer_pane_prompt("q1", 1)
+        sends = [c for c in self.run_calls if c[:2] == ["tmux", "send-keys"]]
+        self.assertEqual(sends[-2][-1], "1")
+        self.assertEqual(sends[-1][-1], "Enter")
+
+    def test_answer_pane_prompt_for_claude_sends_no_enter(self):
+        sm = self.make_manager()
+        sess = {"id": "c1", "status": "running", "tmuxName": "agent-c1",
+                "agentType": "claude"}
+        sm.registry = [sess]
+        # A Claude permission dialog (❯ cursor, submits on the digit alone).
+        pane = ("  Bash command\n\n    touch /tmp/x\n\n  Do you want to proceed?\n"
+                "  ❯ 1. Yes\n    2. No\n")
+        with mock.patch.object(ha, "_capture_pane", return_value=pane):
+            sm.answer_pane_prompt("c1", 1)
+        sends = [c for c in self.run_calls if c[:2] == ["tmux", "send-keys"]]
+        self.assertEqual([s[-1] for s in sends], ["1"])  # no Enter
+
+    # --- HITL input 2: the ask_user_question MCP registration ---------------
+
+    def test_qwen_settings_registers_the_ask_mcp_server(self):
+        sm = self.make_manager()
+        settings = sm._qwen_settings({"id": "q1"})
+        srv = settings["mcpServers"]["turma-ask"]
+        self.assertEqual(srv["command"], "python3")
+        self.assertIn("-SsE", srv["args"])
+        self.assertTrue(srv["args"][-1].endswith(os.path.join("qwen", "ask_mcp.py")))
+        self.assertEqual(srv["env"]["TURMA_SESSION_ID"], "q1")
+        self.assertEqual(srv["env"]["TURMA_QUESTIONS_DIR"], ha.QUESTIONS_DIR)
+
+    # --- naming: never claude -p for a qwen session -------------------------
+
+    def test_start_summary_refuses_a_qwen_session(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm._start_summary({"id": "q1", "agentType": "qwen"}, "some task")
+        popen.assert_not_called()
+
+    def _qwen_transcript(self, workdir, first_prompt):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(workdir))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, "qsid.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "mode"}) + "\n")
+            f.write(json.dumps({"type": "user", "message": {
+                "role": "user", "content": first_prompt}}) + "\n")
+        return path
+
+    def test_seed_qwen_summary_provisional_first_prompt_then_qwen_one_shot(self):
+        sm = self.make_manager()
+        wd = "/w/.turma/worktrees/Turma/q"
+        self._qwen_transcript(wd, "Add a compose flag to the widget")
+        sess = {"id": "q1", "status": "running", "agentType": "qwen",
+                "worktreePath": wd, "claudeSessionId": "qsid", "summary": None}
+        sm.registry = [sess]
+        with mock.patch.object(ha, "QWEN_MODEL", "qwen3-coder"), \
+             mock.patch.object(ha, "QWEN_MODEL_BASE_URL", "https://gw/v1"), \
+             mock.patch.object(sm, "_start_qwen_summary") as one_shot:
+            sm._seed_summaries()
+        # Tier 3: provisional first-prompt name applied so the card isn't blank.
+        self.assertTrue(sess["summaryProvisional"])
+        self.assertTrue(sess["summary"])
+        # Tier 2: the qwen -p one-shot was launched to generate the real name.
+        one_shot.assert_called_once()
+        self.assertEqual(one_shot.call_args.args[1],
+                         "Add a compose flag to the widget")
+
+    def test_seed_qwen_summary_native_title_wins_and_finalizes(self):
+        sm = self.make_manager()
+        wd = "/w/.turma/worktrees/Turma/q2"
+        self._qwen_transcript(wd, "some prompt")
+        sess = {"id": "q2", "status": "running", "agentType": "qwen",
+                "worktreePath": wd, "claudeSessionId": "qsid", "summary": None}
+        sm.registry = [sess]
+        sm.qwen_tails["q2"] = types.SimpleNamespace(
+            title=lambda: "Generated Qwen Title", title_final=lambda: True)
+        with mock.patch.object(sm, "_start_qwen_summary") as one_shot:
+            sm._seed_summaries()
+        self.assertEqual(sess["summary"], "Generated Qwen Title")
+        self.assertNotIn("summaryProvisional", sess)
+        one_shot.assert_not_called()  # a native title needs no one-shot
+
+    def test_start_qwen_summary_uses_qwen_binary_not_claude(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "QWEN_MODEL", "qwen3-coder"), \
+             mock.patch.object(ha, "QWEN_MODEL_BASE_URL", "https://gw/v1"), \
+             mock.patch.object(ha, "QWEN_MODEL_API_KEY_ENV", "QWEN_K"), \
+             mock.patch.dict(os.environ, {"QWEN_K": "secret"}), \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
+            popen.return_value = types.SimpleNamespace(pid=1)
+            sm._start_qwen_summary({"id": "q1", "agentType": "qwen"}, "name me")
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[0], ha.QWEN_BIN)
+        self.assertIn("-p", argv)
+        self.assertIn("--safe-mode", argv)
+        # The endpoint key rides env, NEVER argv (/proc/<pid>/cmdline is public).
+        self.assertNotIn("secret", " ".join(argv))
+        self.assertEqual(popen.call_args.kwargs["env"]["OPENAI_API_KEY"], "secret")
+
+    # --- teardown -----------------------------------------------------------
+
+    def test_teardown_qwen_stops_the_tail(self):
+        sm = self.make_manager()
+        stopped = []
+        sm.qwen_tails["q1"] = types.SimpleNamespace(stop=lambda: stopped.append(1))
+        sm._teardown_qwen("q1")
+        self.assertEqual(stopped, [1])
+        self.assertNotIn("q1", sm.qwen_tails)
+        sm._teardown_qwen("q1")  # idempotent
+
+
 if __name__ == "__main__":
     unittest.main()

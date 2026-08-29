@@ -2,7 +2,12 @@
 paths:
   - "agent/hub-agent.py"
   - "agent/qwen_transcript.py"
+  - "agent/qwen_session.py"
+  - "agent/qwen/**"
+  - "agent/tunnel-agent.js"
   - "agent/tests/test_qwen_transcript.py"
+  - "agent/tests/test_qwen_session.py"
+  - "agent/tests/test_qwen_ask_mcp.py"
   - "turma/server.js"
   - "turma/public/sessions.html"
   - "android/**"
@@ -167,3 +172,83 @@ renders identically under both. Invariants a change must not undo:
   `qwen_expected_blocks.json` are the SAME artifacts the py test and the js `entryBlocks` test both
   assert against — pinning both readers to one expected result. Tests: `test_qwen_transcript.py`, the
   `Qwen projection` case in `tunnel-agent.test.js`.
+
+## [Qwen C] (XERK-509) shipped: input, liveness, HITL, and session naming (pane-driven)
+
+The drive/read layer over [Qwen B]'s launcher. A qwen session is an interactive TUI in tmux (the
+Claude-shaped runtime, NOT dsh-headless), so — unlike dsh's [C] — input, liveness, tool-approval and
+answers all ride the real PANE (hub-agent's existing parsers, made qwen-aware); there is NO control
+socket. The ONE net-new module is the projection tail. Invariants a change must not undo:
+
+- **Input & PR-nudge delivery are FREE — a qwen session uses the CLAUDE pane path unchanged.**
+  `send_input`/`notify_session` add NO qwen arm (only dsh has one): `send_input` types into the qwen
+  TUI via `_type_into_pane` (reusing `INPUT_MAX_CHARS`/`_store_uploads`), and `notify_session` finds
+  no Claude inbox (qwen writes no `~/.claude/sessions/<pid>.json`) so it falls back to the pane. The
+  `pendingInputs` compaction outbox is harmless (the projection carries no `compact_boundary`, so
+  `_pending_scan` never resends). Never add a dsh-style qwen arm to these.
+- **Liveness reuses the SAME `paneBusy` wire field, so sessionWorking/readyForReview's five mirrors
+  are UNCHANGED** (do NOT add a qwen liveness signal to the mirrors). Qwen's busy hint differs from
+  Claude's "esc to interrupt": while a turn runs the footer gains "Enter to steer · Ctrl+Q to queue"
+  and the spinner ends "(… · esc to cancel)". Both ride `QWEN_PANE_BUSY_MARKERS`, UNIONED into
+  `_busy_from_capture` (and tunnel-agent's `paneShowsBusy`) — qwen-agnostic strings needing no
+  agentType, checked ahead of the operator-overridable `PANE_BUSY_MARKERS`. **The spinner token keeps
+  its CLOSING PAREN (`esc to cancel)`)**: Claude's OWN permission-dialog footer says "Esc to cancel ·
+  Tab to amend" (no paren) and must still read blocked/idle — dropping the paren makes every Claude
+  approval read busy (a regression a test pins).
+- **HITL is TWO inputs, both to full parity, KEPT not degraded** (Malcolm):
+  - **(1) A tool-APPROVAL prompt is the panePrompt analogue.** `parse_pane_prompt` accepts qwen's
+    cursor glyph `›` beside Claude's `❯`, and treats qwen's composer footer (`QWEN_PANE_FOOTER_RE`,
+    "Ask permissions (shift + tab to cycle)") like Claude's mode footer — its presence below a
+    numbered run means "not a dialog". `answer_pane_prompt` types the digit AND **Enter for a qwen
+    session** (G0: `1`+Enter; Claude submits on the digit alone). Under the launcher's
+    `approvalMode:"auto"` these prompts are largely suppressed; the parser is parity + future
+    permission-mode work ([Qwen P]). **Pitfall: qwen draws a right-edge SCROLLBAR
+    glyph (`█` + the block/vertical-bar family) on every line of a SCROLLED pane**
+    (real capture `docs/qwen-g0/pane/03-tool-approval.txt`), so the question line
+    ends in `█` not `?` and the "blank" separator lines strip to `█` not `""` —
+    `parse_pane_prompt` strips that trailing column (`_PANE_SCROLLBAR_RE`) per line
+    or a real approval dialog is missed. Pin pane parsers against the REAL captured
+    frame, not a hand-cleaned copy (the cleaned copy hid this — a QA catch).
+  - **(2) A STRUCTURED question renders the SAME multi-select card a Claude session shows** — NOT a
+    yes/no approval. Qwen has NO native AskUserQuestion tool (G0), so `_qwen_settings` REGISTERS one
+    via MCP: `mcpServers."turma-ask"` runs `python3 -SsE agent/qwen/ask_mcp.py`, a stdlib stdio
+    JSON-RPC server exposing `ask_user_question({question, options[], multiSelect, header?})`. On a
+    call it writes the EXACT `QUESTIONS_DIR/<sid>.req.json` shape `ask.py`/`_hook_question` use and
+    BLOCKS for `<sid>.ans.json` — so the EXISTING `answer_question` path (the else-branch, dropping
+    the .ans.json) answers it with **NO client change**. The session id / rendezvous dir / block
+    timeout ride the server's own `env` block. `QWEN_QUESTION_BLOCK_TIMEOUT_SEC` (600) stays under
+    `QUESTION_STALE_AFTER_SEC` so a still-blocking question isn't stale-dropped from the beat.
+  - **Residual gap (host-proof only): the `mcpServers` settings key and that qwen surfaces an MCP
+    tool to its deferred-tool model are UNVERIFIED** — qwen is not installed in CI. Unit-tested via
+    the server's JSON-RPC contract (`test_qwen_ask_mcp.py`); confirm end-to-end on a real qwen host.
+- **Session naming is generated by QWEN and ITS model, NEVER `claude -p`** (Malcolm) — a pure-qwen
+  host may have no Claude login, so naming must not depend on one. `_start_summary` REFUSES a qwen
+  session (as it does dsh). `_seed_qwen_summary` names in three tiers, weakest first, a later one
+  overriding an earlier (before the `_summary_due` gate, like dsh):
+  - Tier 1 — qwen's OWN generated title, captured by the tail's `title()`. **G0 found NO native title
+    mechanism, so this is DORMANT**; a future qwen that writes one is honoured with no code change.
+  - Tier 2 — a `qwen -p` ONE-SHOT (`_start_qwen_summary`) over the session's OWN OpenAI-compatible
+    endpoint (the qwen `-p` analogue of `claude -p`), reusing `self.summaries`/`_poll_summaries`/
+    `_finish_summary`. The endpoint key rides the subprocess ENV, never argv; `--safe-mode` + cwd
+    `REGISTRY_DIR` keep it a clean, unguarded, repo-untouching title call. `_finish_summary` clears
+    `summaryProvisional` when a name lands, finalizing over tier 3.
+  - Tier 3 — the first user prompt, PROVISIONAL, applied at once so the card is never blank while the
+    one-shot runs. Gated so tier 2 launches even after tier 3 sets a provisional name (`_summary_due`
+    stops once `summary` is set, so the tier-2 launch checks the attempt/backoff budget directly).
+- **The projection tail is the one net-new module (`agent/qwen_session.py`).** `QwenProjectionTail`
+  reads qwen's native log (`~/.qwen/projects/<slug>/chats/<id>.jsonl`) through `QwenProjector` ([S1])
+  and appends the Claude-JSONL projection to the pinned `<claudeSessionId>.jsonl`, incrementally, off
+  the beat, never raising. **It LOCATES the native log by GLOB (`<id>.jsonl` across project dirs), not
+  a computed slug** — the same discipline `_qwen_runtime_file` uses, load-bearing because the
+  cwd→slug rule is uncertain (G0 recorded `/`→`-`; Claude's own rule is every non-alnum→`-`). Resume
+  starts at the native log's EOF (qwen `--resume` appends in place). Wired in `_launch_qwen`
+  (`_start_qwen_tail`), reattached on the resume-on-boot ADOPT path (the tail died with the manager
+  while the TUI kept appending), and stopped in `_forget_session_caches`/`_teardown_qwen`.
+- **Known gap: qwen's NATIVE log is not archived.** It lives under `~/.qwen/projects/`, outside the
+  Claude `<tid>/` tree the raw archive walks, so only the PROJECTION (the top-level `<id>.jsonl`)
+  archives — unlike dsh's `<tid>/dsh/` native log. Metrics-from-native-log is out of [Qwen C]'s scope.
+- Tests: `test_qwen_session.py` (tail: glob discovery, resume-at-EOF, incremental, title), `test_qwen_ask_mcp.py`
+  (the MCP round-trip + the rendezvous-file shape), `TestQwenSessionArms` in `test_hub_agent.py`
+  (busy markers, the `›` approval parse, digit+Enter, ask-MCP registration, the three naming tiers,
+  teardown), the qwen busy cases in `tunnel-agent.test.js`. Real-qwen legs are host-proof only (qwen
+  is not installed in CI) — the same footing [D]/[E]/[J] shipped on for dsh.

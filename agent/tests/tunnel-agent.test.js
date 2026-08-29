@@ -692,6 +692,34 @@ test("parsePaneLiveTurn: completed turn (no 'esc to interrupt') -> not generatin
   assert.deepEqual(parsePaneLiveTurn(pane), { generating: false, text: "", status: null, agents: [] });
 });
 
+// XERK-509 [Qwen C]: a qwen session's TUI busy hint is "esc to cancel)" / the
+// "Enter to steer" footer, not Claude's "esc to interrupt" — the live tail
+// scrapes the pane like Claude's and can't tell the runtime, so both are unioned
+// into paneShowsBusy (mirroring hub-agent's QWEN_PANE_BUSY_MARKERS).
+test("parsePaneLiveTurn: a qwen busy pane is generating (Enter to steer / esc to cancel)", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  const pane = [
+    "● The exact text I wrote was HELLO_QWEN.",
+    "  .. Polishing the algorithms... (1s · ↑ 106 tokens · esc to cancel)",
+    ">   Type your message or @path/to/file",
+    "  Enter to steer · Ctrl+Q to queue · ⏸ Ask permissions (shift + tab to cycle)",
+  ].join("\n");
+  assert.equal(parsePaneLiveTurn(pane).generating, true);
+});
+
+test("parsePaneLiveTurn: a Claude permission dialog ('Esc to cancel · Tab') is NOT busy", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  // The qwen spinner token keeps its closing paren so this collision can't fire.
+  const pane = [
+    "  Bash command",
+    "    touch /tmp/x",
+    "  Do you want to proceed?",
+    "  ❯ 1. Yes",
+    "  Esc to cancel · Tab to amend · ctrl+e to explain",
+  ].join("\n");
+  assert.equal(parsePaneLiveTurn(pane).generating, false);
+});
+
 // XERK-130: a pane once viewed from a narrow client (a phone) stays ~54
 // columns wide, and at that width the TUI ellipsizes the footer's
 // "· esc to interrupt" to "· esc to inte…" — the full-string gate read every
