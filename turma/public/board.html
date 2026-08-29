@@ -548,12 +548,14 @@ function paintDetail() {
     modelEditing: s.modelEditing,
     modelError: s.modelError,
     models: (site && site.models) || null,
-    // The runtime pin is hub-owned too (XERK-473); "dsh" is offerable only when
-    // the org has a dsh-capable host (site.dshAvailable, off the merged block).
+    // The runtime pin is hub-owned too (XERK-473 dsh, XERK-515 qwen); "dsh"/"qwen"
+    // are each offerable only when the org has a capable host (site.dshAvailable/
+    // site.qwenAvailable, off the merged block).
     runtimePin,
     runtimeEditing: s.runtimeEditing,
     runtimeError: s.runtimeError,
     dshAvailable: !!(site && site.dshAvailable),
+    qwenAvailable: !!(site && site.qwenAvailable),
     // The status change writes back to Jira/Azure via the heartbeat command
     // path, so — like the Repo override, unlike the hub-owned agent/model pins —
     // it needs an online host AND the fetched detail (its statusOptions) to be

@@ -446,11 +446,12 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   fleet payload (typed as `AgentsResponse.ticketRuntimes` → `FleetState.ticketRuntimes`, refreshed by
   the poll and the `ticketRuntimes` SSE event) and writes with `POST
   /api/jira/<siteKey>/<issueKey>/runtime` (`vm.setTicketRuntime`), authoritative on a 200 like the
-  Model pin. "dsh" is offered only when the org has a dsh-capable host (`BoardSite.dshAvailable`,
-  OR'd over every host's `dsh.available` in `mergeSites`), with an existing dsh pin always releasable
-  (`Runtime` row `runtimeEditable`). Pure ports (`runtimePinOf`/`prettyRuntime`/`runtimeEditable`) in
-  `core/Board.kt`, tested in `core/BoardTest.kt`; the `ticketRuntimes` decode in
-  `model/AgentDecodeTest.kt`.
+  Model pin. A non-default runtime is offered only when the org has a capable host — "dsh"
+  (`BoardSite.dshAvailable`) and, since XERK-515, "qwen" (`BoardSite.qwenAvailable`), each OR'd over
+  every host's `dsh.available`/`qwen.available` in `mergeSites` — with an existing pin always
+  releasable (`Runtime` row `runtimeEditable`). Pure ports
+  (`runtimePinOf`/`prettyRuntime`/`runtimeEditable`) in `core/Board.kt`, tested in
+  `core/BoardTest.kt`; the `ticketRuntimes` decode in `model/AgentDecodeTest.kt`.
 
 ## Done (XERK-498 — dsh Trajectory replaces the terminal, no empty page)
 

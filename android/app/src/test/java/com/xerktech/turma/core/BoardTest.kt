@@ -502,11 +502,43 @@ class BoardTest {
         assertEquals("Claude Code", prettyRuntime("claude"))
         assertEquals("Claude Code", prettyRuntime(""))
         val pin = com.xerktech.turma.model.TicketRuntimePin(runtime = "dsh", at = 1)
-        // Editable when the org offers dsh OR a pin already exists (so it can be
-        // released even after the last dsh host leaves).
-        assertTrue(runtimeEditable(dshAvailable = true, pin = null))
-        assertTrue(runtimeEditable(dshAvailable = false, pin = pin))
-        assertFalse(runtimeEditable(dshAvailable = false, pin = null))
+        // Editable when the org offers a non-default runtime OR a pin already
+        // exists (so it can be released even after the last capable host leaves).
+        assertTrue(runtimeEditable(dshAvailable = true, qwenAvailable = false, pin = null))
+        assertTrue(runtimeEditable(dshAvailable = false, qwenAvailable = false, pin = pin))
+        assertFalse(runtimeEditable(dshAvailable = false, qwenAvailable = false, pin = null))
+    }
+
+    // ---- XERK-515 [Qwen I]: qwen is a second board runtime pin, parity with the web
+
+    @Test fun `mergeSites marks qwenAvailable when ANY reporting host offers qwen`() {
+        // qwen ships DISABLED fleet-wide (Runtime.QWEN_ENABLED = false); enable it to
+        // exercise the mergeSites qwen-availability OR, resetting in finally.
+        Runtime.QWEN_ENABLED = true
+        try {
+            val noQwen = agent("hostA", true, JiraBlock(siteKey = "org", user = "u", fetchedAt = "2026-07-16T01:00:00Z"))
+            val withQwen = agent("hostB", true, JiraBlock(siteKey = "org", user = "u", fetchedAt = "2026-07-16T02:00:00Z"))
+                .copy(qwen = com.xerktech.turma.model.QwenInfo(available = true))
+            assertTrue(mergeSites(listOf(noQwen, withQwen)).single().qwenAvailable)
+            // No host offering it leaves the org without.
+            val off = agent("hostC", true, JiraBlock(siteKey = "org2", user = "u"))
+                .copy(qwen = com.xerktech.turma.model.QwenInfo(available = false))
+            assertFalse(mergeSites(listOf(noQwen.copy(jira = JiraBlock(siteKey = "org2", user = "u")), off)).single().qwenAvailable)
+        } finally {
+            Runtime.QWEN_ENABLED = false
+        }
+    }
+
+    @Test fun `qwen is a non-default runtime pin like dsh, and its picker mirrors the web`() {
+        val tr = mapOf(
+            "org.atlassian.net/X-1" to com.xerktech.turma.model.TicketRuntimePin(runtime = "qwen", at = 1),
+        )
+        assertEquals("qwen", runtimePinOf(tr, "org.atlassian.net", "X-1")?.runtime)
+        assertEquals("Qwen Code", prettyRuntime("qwen"))
+        val qwenPin = com.xerktech.turma.model.TicketRuntimePin(runtime = "qwen", at = 1)
+        // Offering qwen makes the row editable; a qwen pin stays releasable with qwen gone.
+        assertTrue(runtimeEditable(dshAvailable = false, qwenAvailable = true, pin = null))
+        assertTrue(runtimeEditable(dshAvailable = false, qwenAvailable = false, pin = qwenPin))
     }
 
     @Test fun `prettyModel capitalizes aliases and parses claude ids`() {

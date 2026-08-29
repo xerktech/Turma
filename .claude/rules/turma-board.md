@@ -305,21 +305,22 @@ the Start button AND the auto-start sweep.
   falls back to the static aliases, never an empty menu.
 - Tests: `server.test.js`; `modelPinOf`/`modelPickerHtml`/`modelChoices` in `board.test.js`.
 
-##### Runtime row (XERK-473)
+##### Runtime row (XERK-473 dsh, XERK-515 qwen)
 
-- **Which RUNTIME the session runs on** — "Claude Code" (default) or "dsh" (XERK-460). Hub-owned
-  durable like the Model row (`ticketRuntimes` → the `spawnTicket` command's **`agentType`**), so it
-  needs no online host to edit. `{runtime:"dsh"}` pins; `{runtime:"claude"}` or `{auto:true}` release
-  (only the non-default is stored). The full picture — the pin, the `orgOffersDsh` gate, and the
-  `findTicketHost` runtime-capability filter that routes a dsh ticket only to a dsh-capable host — is
-  in `.claude/rules/dsh.md`'s **[I] (XERK-473)** section.
-- **"dsh" is offered only when the org offers it** (`site.dshAvailable`, from any reporting host's
-  `dsh.available` via `mergeSites`), so the picker can't name a runtime the hub would refuse — but an
-  existing dsh pin is always carried back so it can be released even after the last dsh host leaves.
-- **Shipped on Android** in XERK-477 (`RuntimeSection` in `BoardScreen.kt`), the way the dsh card
-  badge was.
-- Tests: `server.test.js` (the `/runtime` route + the dsh `findTicketHost` cases);
-  `runtimePinOf`/`runtimeFieldHtml`/`runtimePickerHtml` in `board.test.js`.
+- **Which RUNTIME the session runs on** — "Claude Code" (default), "dsh" (XERK-460) or "Qwen Code"
+  (XERK-504). Hub-owned durable like the Model row (`ticketRuntimes` → the `spawnTicket` command's
+  **`agentType`**), so it needs no online host to edit. `{runtime:"dsh"|"qwen"}` pins;
+  `{runtime:"claude"}` or `{auto:true}` release (only the non-default is stored). The dsh picture is
+  in `.claude/rules/dsh.md`'s **[I] (XERK-473)**; the qwen twin (`orgOffersQwen`, the per-runtime
+  `findTicketHost` filter, `qwenAvailable`) is in `.claude/rules/qwen.md`'s **[Qwen I] (XERK-515)**.
+- **A non-default runtime is offered only when the org offers it** (`site.dshAvailable`/
+  `site.qwenAvailable`, from any reporting host's `dsh.available`/`qwen.available` via `mergeSites`),
+  so the picker can't name a runtime the hub would refuse — but an existing pin is always carried
+  back so it can be released even after the last capable host leaves.
+- **Shipped on Android** — the dsh row in XERK-477 (`RuntimeSection` in `BoardScreen.kt`), the qwen
+  option beside it in XERK-515.
+- Tests: `server.test.js` (the `/runtime` route + the dsh/qwen `findTicketHost` cases);
+  `runtimePinOf`/`runtimeFieldHtml`/`runtimePickerHtml` in `board.test.js` (both runtimes).
 
 ##### Status row (XERK-138) — the one detail control that writes BACK to the tracker
 

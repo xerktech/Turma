@@ -10,6 +10,10 @@ paths:
   - "agent/tests/test_qwen_ask_mcp.py"
   - "turma/server.js"
   - "turma/public/sessions.html"
+  - "turma/public/board.js"
+  - "turma/public/board.html"
+  - "turma/tests/board.test.js"
+  - "glasses/src/vendor/board.cjs"
   - "android/**"
 ---
 
@@ -345,3 +349,45 @@ subscription `limits`/probe/card stay Claude-only) lives in **`.claude/rules/age
   projector's output through `repo_usage_report`/`_aggregate_project` on disk, proving host + per-repo
   totals and the local/OpenAI-compat per-model breakdown; `TestQwenProjectionAccounting`/
   `TestQwenUsageMapping` cover the layer below. All in `test_qwen_transcript.py`.
+
+## [Qwen I] (XERK-515) shipped: board integration — a ticket can run on qwen
+
+The dsh [I] (XERK-473, `.claude/rules/dsh.md`) analogue for qwen: a board ticket is DISPATCHED to
+the qwen runtime through the SAME per-ticket runtime pin, so the runtime choice is presentational
+plumbing over the same spawn path — no new session model. What landed, and the invariants a change
+must not undo:
+
+- **"qwen" is a valid value of the hub-owned durable `ticketRuntimes` pin** — the SAME map dsh uses
+  (keyed `<siteKey>/<issueKey>`, on `/data`), stored only for a NON-default choice, riding the
+  `spawnTicket` command as `agentType`. `POST /api/jira/<siteKey>/<issueKey>/runtime` now accepts
+  `{runtime:"qwen"}` beside `dsh`/`claude`, authoritative on a 200 like the model pin, feeding the
+  Start button + auto-start sweep. `setTicketRuntime` needed NO body change — only `"claude"` and
+  `{auto:true}` release, so a qwen pin stores/carries exactly like a dsh one.
+- **Dispatch filters the pool by capability, per-runtime.** `findTicketHost` generalised its
+  single `wantDsh` gate into a `wantRuntime` string with a `runtimeOfferedBy(a)` check
+  (`dshAvailable`/`qwenAvailable`), so a qwen-pinned ticket routes only to a host reporting
+  `qwen.available` — checked ahead of capacity so "no host offers qwen" reads as **blocked** (a
+  freed slot would not add the runtime, ages out) not **full**. A pinned host that lacks qwen is
+  reported, never routed around. `orgOffersQwen` (the `orgOffersDsh` twin) gates the pin
+  server-side; the board hides the option where the org offers none; the agent re-validates
+  (`resolve_agent_type`).
+- **Agent side is UNCHANGED — one already-forwarded argument.** `spawn_ticket(agent_type="qwen")`
+  → `spawn()`, validated by `resolve_agent_type` (which already accepts qwen from [Qwen A]);
+  `_launch_tmux` already dispatches on `agentType` to `_launch_qwen`, which already appends the
+  ticket-branch directive and delivers the ticket prompt + attachments. So a qwen ticket session is
+  "told its branch, cuts it itself, worktree stays detached" with NO new launch code — the whole
+  point of the [A]/[B] shape. Because `QWEN_ENABLED` ships False, the pin cannot reach a launch in
+  production yet (the whole runtime is gated off until fleet-enable).
+- **Collectors + the two tracker writes are runtime-agnostic and untouched, and the `_board_column`
+  mirrors are too** (the ticket's explicit ask) — the runtime pin is orthogonal to a ticket's
+  column.
+- **Web ⇄ Android parity**: `mergeSites` gains `qwenAvailable` (the `dshAvailable` twin), the board
+  Runtime picker a "Qwen Code" option gated on it, `prettyRuntime("qwen")` → "Qwen Code". Android
+  mirrors all of it — `BoardSite.qwenAvailable`, `qwenBySite` in `core/Board.kt` (gated on
+  `Runtime.QWEN_ENABLED`), `runtimeEditable(dshAvailable, qwenAvailable, pin)` (a signature change —
+  the added parameter is a compile-time break every caller must pass), and the `RuntimePicker` qwen
+  row. The vendored `glasses/src/vendor/board.cjs` stays byte-identical to `board.js`.
+- Tests: the `XERK-515`/qwen `runtime*` cases in `board.test.js`, the qwen `/runtime` route +
+  spawnTicket + `findTicketHost` cases in `server.test.js`, the qwen board cases in `BoardTest.kt`.
+  Agent-side needs none new — `TestSpawnTicket`'s runtime-pin cases already cover the forwarded
+  `agentType` for both runtimes.
