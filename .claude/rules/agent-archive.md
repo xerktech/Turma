@@ -235,6 +235,10 @@ paths:
     (`qwen_session.QwenProjectionTail`) MIRRORS its bytes into the store, append-only, on its own
     cursor. A running qwen session is NOT un-excluded from the manifest (below) — qwen has no
     Trajectory viewer, so its native log is retention only and archives once the session ends.
+    Migration ([Qwen K], XERK-516) does NOT carry this `<tid>/qwen/` mirror: it is the display/metrics
+    feed, and qwen resumes from its OWN native log under `~/.qwen/projects/` (the file the bundle
+    carries under `.qwen-store/` instead). The target rebuilds this mirror from new events, exactly as
+    dsh's `<tid>/dsh/` feed is rebuilt. Keep the resumable log and this feed straight.
   - **A RUNNING dsh session is NOT excluded from the manifest** (`_running_slugs` subtracts
     `_live_dsh_slugs`), and that exception is what makes the Trajectory work at all. **A running
     QWEN session gets NO such carve-out** (XERK-512): qwen has a real ttyd TUI and no Trajectory

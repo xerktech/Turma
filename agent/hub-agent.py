@@ -1261,6 +1261,29 @@ QWEN_HOME = (os.environ.get("QWEN_HOME")
              or os.path.join(os.path.expanduser("~"), ".qwen"))
 QWEN_PROJECTS_ROOT = (os.environ.get("QWEN_PROJECTS_ROOT")
                       or os.path.join(QWEN_HOME, "projects"))
+# Reserved tar arcname carrying qwen's native session log into a migration bundle
+# ([Qwen K], XERK-516), the qwen twin of DSH_STORE_ARCNAME. The CRUCIAL
+# difference from dsh: dsh resumes from a SEPARATE store (DSH_SESSIONS_ROOT),
+# distinct from its `<sid>/dsh/` display feed — so dsh migration carries that
+# store. qwen is Claude-shaped: its native log at ~/.qwen/projects/<slug>/chats/
+# <id>.jsonl IS what `qwen --resume <id>` reloads from (there is no separate
+# store), so THAT log is what a qwen migration carries. It rides under this
+# reserved prefix (never a slug-relative member — a claude session id is never a
+# dotfile) so _unpack_transcript routes it into the target's OWN
+# QWEN_PROJECTS_ROOT at the localized cwd's slug, not into the projection slug
+# tree. qwen keys the native log on the cwd (issue #2373: not yet portable), so a
+# cross-mount move MUST place it under the TARGET cwd's slug (== _project_slug,
+# verified: qwen's slug rule is Claude's every-non-alnum->'-', not the G0 note's
+# '/'->'-') and re-point the log's per-row cwd, or a resume in the new worktree
+# finds nothing. The `<slug>/<sid>/qwen/` raw-archive mirror ([Qwen E]) is the
+# DISPLAY/metrics feed and is NOT what resume reads — keep the two straight.
+QWEN_STORE_ARCNAME = ".qwen-store"
+# The single member name the native log rides as inside QWEN_STORE_ARCNAME. Fixed
+# (not the session-id filename) so _unpack_transcript writes it to the ONE target
+# path — the shared chats/ dir holds every cwd-cohabiting session's log, so a
+# migration must place exactly this session's <id>.jsonl, never unpack a dir into
+# it.
+QWEN_STORE_MEMBER = "chat.jsonl"
 # Per-session transient files (the sourced 0600 env file with the model key)
 # live under the agent-owned ~/.turma, never a worktree — the same discipline as
 # the dsh socket dir and the local-model env file.
@@ -13564,9 +13587,27 @@ class SessionManager:
         except OSError as e:
             raise RuntimeError(f"qwen runtime dir: {e}")
         env_file = os.path.join(QWEN_RUNTIME_DIR, f"{sid}.env")
+        # The model/endpoint are re-validated against THIS host's qwen config on
+        # every launch, which is what makes a MIGRATED session ([Qwen K],
+        # XERK-516) land cleanly: the endpoint/key are the TARGET host's
+        # (QWEN_MODEL_BASE_URL / QWEN_MODEL_API_KEY_ENV read here, never the
+        # source's), and a carried model is kept only if it passes qwen's ident
+        # charset — a garbage/foreign one falls back to the host default rather
+        # than being argv'd through. qwen has NO model-list discovery (unlike the
+        # local-model failover), so an id the target's endpoint does not actually
+        # serve is caught at _confirm_qwen_launch (clean teardown + a reason via
+        # _refuse_start), not pre-validated here. A target with no qwen at all
+        # never reaches this: agent_type_configured already fell it back to claude.
+        carried_model = sess.get("model")
+        model = (carried_model if carried_model
+                 and QWEN_IDENT_RE.fullmatch(carried_model) else QWEN_MODEL)
+        if carried_model and model != carried_model:
+            log(f"qwen session {sid}: carried model {carried_model!r} is not a "
+                f"valid qwen model id on this host; using the host default "
+                f"{QWEN_MODEL!r}")
         env_map = {
             "OPENAI_BASE_URL": QWEN_MODEL_BASE_URL,
-            "OPENAI_MODEL": sess.get("model") or QWEN_MODEL,
+            "OPENAI_MODEL": model,
             # A pinned fleet must not let qwen auto-update the binary out from
             # under the parsers (the G0 spike caught it upgrading mid-run) — belt
             # and suspenders with settings.general.disableAutoUpdate.
@@ -13810,6 +13851,28 @@ class SessionManager:
         hits = glob.glob(os.path.join(QWEN_PROJECTS_ROOT, "*", "chats",
                                       f"{claude_sid}.runtime.json"))
         return hits[0] if hits else None
+
+    def _qwen_native_log(self, claude_sid):
+        """qwen's native session log for a pinned id — the file `qwen --resume`
+        reloads from ([Qwen K], XERK-516) — located by the id ACROSS project dirs
+        (glob), the same slug-rule-independent discipline as _qwen_runtime_file
+        and the projection tail. Returns the path if present, else None (an empty
+        conversation writes no `<id>.jsonl` until its first turn)."""
+        if not (claude_sid and VALID_CLAUDE_SID_RE.fullmatch(claude_sid)):
+            return None
+        hits = glob.glob(os.path.join(QWEN_PROJECTS_ROOT, "*", "chats",
+                                      f"{claude_sid}.jsonl"))
+        return hits[0] if hits else None
+
+    def _qwen_store_dest(self, cwd, claude_sid):
+        """Where a migrated qwen native log must land on THIS host so
+        `qwen --resume <id>` (run in the localized worktree) finds it: under the
+        TARGET cwd's project slug. qwen's slug rule is Claude's _project_slug
+        (every non-alnum->'-', verified against real on-disk qwen project dirs —
+        the G0 note's '/'->'-' was imprecise), so a cross-mount move re-keys by
+        computing the slug from the LOCALIZED cwd, not the source's."""
+        return os.path.join(QWEN_PROJECTS_ROOT, _project_slug(cwd), "chats",
+                            f"{claude_sid}.jsonl")
 
     def _qwen_runtime_pid(self, path):
         """The pid recorded in a qwen `<id>.runtime.json`, or None if unreadable.
@@ -15596,8 +15659,21 @@ class SessionManager:
                 cand = _dsh_store_dir(worktree, sid)
                 if os.path.isdir(cand):
                     dsh_store = cand
+        # A qwen session carries its NATIVE LOG ([Qwen K], XERK-516) — for qwen,
+        # unlike dsh, that log IS what `qwen --resume` reloads from (qwen is
+        # Claude-shaped, no separate store). The top-level transcript above is the
+        # lossy display PROJECTION, which qwen cannot resume; without the native
+        # log the target resumes into a blank conversation. Located by the pinned
+        # id across project dirs (glob), so the exact cwd->slug rule is not relied
+        # on. The `<slug>/<sid>/qwen/` archive mirror is the DISPLAY/metrics feed,
+        # NOT carried here (the target rebuilds it from new events past the log's
+        # EOF — the tail's resume=True), so the two never get crossed.
+        qwen_store = None
+        if sess.get("agentType") == "qwen":
+            qwen_store = self._qwen_native_log(sess.get("claudeSessionId") or "")
         try:
-            blob = self._pack_transcript(path, dsh_store=dsh_store)
+            blob = self._pack_transcript(path, dsh_store=dsh_store,
+                                         qwen_store=qwen_store)
         except Exception as e:
             refuse(f"packing the transcript failed: {e}")
             return
@@ -15659,14 +15735,32 @@ class SessionManager:
         want_dsh = cmd.get("agentType") == "dsh" and dsh_configured()
         dsh_store_dest = (_dsh_store_dir(os.path.normpath(cwd), transcript_id)
                           if want_dsh else None)
+        # A qwen session carries its NATIVE LOG under `.qwen-store/` ([Qwen K],
+        # XERK-516); unpack it into THIS host's QWEN_PROJECTS_ROOT at the LOCALIZED
+        # cwd's slug so `qwen --resume <id>` (run in the new worktree) finds it.
+        # Only when the target will actually launch qwen — a qwen session falling
+        # back to claude here (no qwen, via agent_type_configured in _resume_at_cwd)
+        # has no resume to consume the log, so it is dropped, exactly as a stray
+        # dsh store is. The per-row cwd is re-pointed to the localized worktree so
+        # a cross-mount move stays self-consistent (issue #2373: qwen keys on cwd).
+        want_qwen = cmd.get("agentType") == "qwen" and qwen_configured()
+        qwen_store_dest = (self._qwen_store_dest(os.path.normpath(cwd),
+                                                 transcript_id)
+                           if want_qwen else None)
         try:
             os.makedirs(slug_dir, exist_ok=True)
             if dsh_store_dest:
                 os.makedirs(dsh_store_dest, exist_ok=True)
-            self._unpack_transcript(blob, slug_dir, dsh_store_dest=dsh_store_dest)
+            if qwen_store_dest:
+                os.makedirs(os.path.dirname(qwen_store_dest), exist_ok=True)
+            self._unpack_transcript(blob, slug_dir, dsh_store_dest=dsh_store_dest,
+                                    qwen_store_dest=qwen_store_dest)
             if dsh_store_dest:
                 self._reconcile_dsh_store_cwd(dsh_store_dest,
                                               os.path.normpath(cwd))
+            if qwen_store_dest:
+                self._reconcile_qwen_store_cwd(qwen_store_dest,
+                                               os.path.normpath(cwd))
         except Exception as e:
             refuse(f"unpacking the transcript bundle failed: {e}")
             return
@@ -15686,18 +15780,22 @@ class SessionManager:
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd.get("cmdId"),
                             extra=extra, migration_id=migration_id)
 
-    def _pack_bytes(self, path, runs, dsh_store=None):
+    def _pack_bytes(self, path, runs, dsh_store=None, qwen_store=None):
         """The bundle itself: `<id>.jsonl` (truncated to its last complete line),
         plus `<id>/subagents/...` when present, plus the `runs` dir as
         `<id>/workflows/...` when one is given, plus a dsh session's durable
-        store as `.dsh-store/...` when one is given. See _pack_transcript.
+        store as `.dsh-store/...` OR a qwen session's native log as
+        `.qwen-store/chat.jsonl` when one is given. See _pack_transcript.
 
-        The dsh store rides under the reserved `.dsh-store/` prefix (never a
-        slug-relative member) so `_unpack_transcript` routes it to the target's
-        own DSH_SESSIONS_ROOT rather than into the project-slug tree. Unlike the
-        workflow records, it is NOT droppable — it is the resumable data — so it
-        is packed on every path, and if that pushes the bundle over the ceiling
-        the move is refused (export_session) rather than shipped un-resumable."""
+        The dsh store / qwen native log ride under a reserved dotfile prefix
+        (never a slug-relative member) so `_unpack_transcript` routes them to the
+        target's own store root rather than into the project-slug tree. Unlike the
+        workflow records, they are NOT droppable — they are the resumable data —
+        so they are packed on every path, and if that pushes the bundle over the
+        ceiling the move is refused (export_session) rather than shipped
+        un-resumable. A live qwen log is appended by its process, so — like the
+        main transcript — it is truncated to its last complete line, or a resume
+        could choke on a half-written tail."""
         tid = os.path.basename(path)[:-len(".jsonl")]
         with open(path, "rb") as f:
             raw = f.read()
@@ -15715,9 +15813,18 @@ class SessionManager:
                 tar.add(runs, arcname=os.path.join(tid, WORKFLOW_RUNS_SUBDIR))
             if dsh_store and os.path.isdir(dsh_store):
                 tar.add(dsh_store, arcname=DSH_STORE_ARCNAME)
+            if qwen_store and os.path.isfile(qwen_store):
+                with open(qwen_store, "rb") as f:
+                    qraw = f.read()
+                qnl = qraw.rfind(b"\n")
+                qcomplete = qraw[:qnl + 1] if qnl >= 0 else qraw
+                qti = tarfile.TarInfo(
+                    name=QWEN_STORE_ARCNAME + "/" + QWEN_STORE_MEMBER)
+                qti.size = len(qcomplete)
+                tar.addfile(qti, io.BytesIO(qcomplete))
         return buf.getvalue()
 
-    def _pack_transcript(self, path, dsh_store=None):
+    def _pack_transcript(self, path, dsh_store=None, qwen_store=None):
         """Bundle a transcript file (+ its subagents/ and workflows/ dirs, if
         any) into gzipped tar bytes, laid out relative to the project-slug dir so
         the target unpacks straight into PROJECTS_ROOT/<slug>/: `<id>.jsonl` and,
@@ -15750,7 +15857,8 @@ class SessionManager:
                     f"{WORKFLOW_PACK_MAX_BYTES} bytes; not carrying them")
             else:
                 try:
-                    blob = self._pack_bytes(path, runs, dsh_store=dsh_store)
+                    blob = self._pack_bytes(path, runs, dsh_store=dsh_store,
+                                            qwen_store=qwen_store)
                 except OSError as e:
                     # An unreadable file in the RECORDS tree (a leftover
                     # root-owned one after a PUID change, say) must not refuse
@@ -15778,9 +15886,11 @@ class SessionManager:
                         return blob
                     log(f"migration: workflow records for {tid} would put the "
                         f"bundle over {MIGRATION_BLOB_MAX} bytes; not carrying them")
-        return self._pack_bytes(path, None, dsh_store=dsh_store)
+        return self._pack_bytes(path, None, dsh_store=dsh_store,
+                                qwen_store=qwen_store)
 
-    def _unpack_transcript(self, blob, dest_dir, dsh_store_dest=None):
+    def _unpack_transcript(self, blob, dest_dir, dsh_store_dest=None,
+                           qwen_store_dest=None):
         """Extract a _pack_transcript bundle. Slug-relative members go to
         dest_dir; members under the reserved `.dsh-store/` prefix go to
         `dsh_store_dest` instead (a dsh session's durable store, which lives
@@ -15792,10 +15902,17 @@ class SessionManager:
 
         A `.dsh-store/` member with no `dsh_store_dest` (a claude import, or a
         dsh session falling back to claude on a host without dsh) is skipped —
-        the store is useless without a dsh resume to consume it."""
+        the store is useless without a dsh resume to consume it. A `.qwen-store/`
+        member ([Qwen K], XERK-516) routes the SAME way, but to a single FILE
+        (`qwen_store_dest`, the target native log `<id>.jsonl`) rather than a dir:
+        the shared chats/ dir holds every cwd-cohabiting session's log, so a
+        migration writes exactly this session's file, never a tree into it. It is
+        likewise skipped without a `qwen_store_dest` (a qwen session falling back
+        to claude on a host without qwen)."""
         root = os.path.realpath(dest_dir)
         store_root = os.path.realpath(dsh_store_dest) if dsh_store_dest else None
         store_prefix = DSH_STORE_ARCNAME + "/"
+        qwen_prefix = QWEN_STORE_ARCNAME + "/"
         buf = io.BytesIO(blob)
         with tarfile.open(fileobj=buf, mode="r:gz") as tar:
             for m in tar.getmembers():
@@ -15808,6 +15925,13 @@ class SessionManager:
                         continue
                     rel = m.name[len(store_prefix):] if m.name != DSH_STORE_ARCNAME else ""
                     base, check_root = dsh_store_dest, store_root
+                # Route .qwen-store/* to the single target native-log FILE.
+                elif m.name == QWEN_STORE_ARCNAME or m.name.startswith(qwen_prefix):
+                    if qwen_store_dest is None or not m.isreg():
+                        continue  # no qwen resume to feed, or a stray dir member
+                    base = os.path.dirname(qwen_store_dest)
+                    rel = os.path.basename(qwen_store_dest)
+                    check_root = os.path.realpath(base)
                 else:
                     rel, base, check_root = m.name, dest_dir, root
                 out = os.path.join(base, rel) if rel else base
@@ -15857,6 +15981,63 @@ class SessionManager:
                 f.write(rest)
         except OSError as e:
             log(f"migration: could not re-key dsh store cwd for {store_dir}: {e}")
+
+    def _reconcile_qwen_store_cwd(self, store_path, cwd):
+        """Re-point a migrated qwen native log's per-row `cwd` to the localized
+        worktree ([Qwen K], XERK-516). qwen keys the log on the working dir
+        (issue #2373: not yet portable) — a cross-mount move already placed the
+        log under the TARGET cwd's slug (_qwen_store_dest), and re-pointing the
+        cwd carried on every row keeps the log self-consistent with where it now
+        lives (its raw-archive mirror, any tool reading cwd, and a resume that
+        may check it). Every native-log row carries `cwd` (unlike dsh's single
+        header line), so this rewrites the WHOLE file, replacing only rows whose
+        cwd equals the SOURCE cwd (read from the first row) with the target cwd.
+
+        A no-op when the source cwd already equals the target (same-mount move)
+        or the shape is unexpected — like the dsh twin, it never raises the
+        migration over a store detail. Bounded like _reconcile_dsh_store_cwd: the
+        log was just written from the in-memory bundle, so reading it back is the
+        same order of memory the migration already spent."""
+        try:
+            with open(store_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            return
+        # The source cwd is whatever the first parseable row records — robust to
+        # the command's cwd not matching the log byte-for-byte.
+        source_cwd = None
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and isinstance(row.get("cwd"), str):
+                source_cwd = row["cwd"]
+                break
+        if not source_cwd or source_cwd == cwd:
+            return  # nothing to re-key (same-mount move, or no cwd in the log)
+        out = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                out.append(line)
+                continue
+            try:
+                row = json.loads(stripped)
+            except ValueError:
+                out.append(line)          # keep an unparseable line verbatim
+                continue
+            if isinstance(row, dict) and row.get("cwd") == source_cwd:
+                row["cwd"] = cwd
+                out.append(json.dumps(row, ensure_ascii=False) + "\n")
+            else:
+                out.append(line)
+        try:
+            with open(store_path, "w", encoding="utf-8") as f:
+                f.writelines(out)
+        except OSError as e:
+            log(f"migration: could not re-key qwen native log cwd for "
+                f"{store_path}: {e}")
 
     # A bundle is the largest thing an agent ever sends, so it is the body most
     # likely to meet the hub's in-flight budget (XERK-258) and be told 503 "busy,
