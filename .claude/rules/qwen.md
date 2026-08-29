@@ -253,6 +253,34 @@ socket. The ONE net-new module is the projection tail. Invariants a change must 
   teardown), the qwen busy cases in `tunnel-agent.test.js`. Real-qwen legs are host-proof only (qwen
   is not installed in CI) — the same footing [D]/[E]/[J] shipped on for dsh.
 
+## [Qwen D] (XERK-511) shipped: busy / ready-for-review / summary semantics
+
+The read-side of a qwen session's state — the dsh [D] (`.claude/rules/dsh.md`) analogue, but SIMPLER
+because a qwen session has a REAL pane. The implementation already rode in on [Qwen C] (the pane-aware
+liveness + the naming tiers); [Qwen D] is the read-side VERIFICATION that PINS these invariants:
+
+- **`session_report` has NO qwen branch — a qwen session takes the CLAUDE pane path** (the `else` of
+  the `agent_type == "dsh"` branch). paneBusy/modeActual/panePrompt come from `_pane_status`, NOT a
+  socket cache (dsh needed the cache only because it was headless). `dsh_status` is ignored for a
+  qwen session even if one is passed — the branch keys on exactly `"dsh"`. So `sessionWorking`,
+  `liveState`, the readyForReview mirrors and the ready-for-review alert are UNCHANGED and CANNOT
+  drift: the CLAUDE.md "Working = paneBusy OR live agents" contract holds verbatim for qwen (verified
+  — `sessionWorking`/`readyForReview` in `server.js` read only the wire fields, no `agentType`).
+- **Everything OTHER than liveness stays transcript-derived from the [Qwen S1] projection**:
+  `lastRole`, `lastHasToolUse`, `transcriptAgeSec` and the PR scan read the projected
+  `<claudeSessionId>.jsonl` with no change — which is what makes readyForReview's finished-turn
+  branch work identically for a qwen session.
+- **Naming override is scoped to the seeder's OWN provisional name** (`_seed_qwen_summary`): a
+  `summaryManual` rename, or any non-provisional `summary` (a ticket session's `<key> <summary>`, a
+  migrated name), is left ALONE — even when a native title or first prompt is available and no
+  one-shot is spent — matching the Claude ticket-naming contract (`agent-board.md`). This is the same
+  `if summaryManual: return` / `if current and not provisional: return` guard `_seed_dsh_summary`
+  uses.
+- Tests: `TestQwenLivenessInReport` in `test_hub_agent.py` (the pane path, dsh_status ignored,
+  pane-sourced panePrompt, transcript-derived lastRole/lastHasToolUse — mirroring
+  `TestDshLivenessInReport` but asserting `_pane_status` IS called), and the
+  `test_seed_qwen_summary_never_clobbers_*` cases in `TestQwenSessionArms`.
+
 ## [Qwen G] (XERK-513) shipped: usage aggregates + per-model attribution
 
 D4's usage obligation for qwen, the dsh [G] (XERK-471) analogue — a qwen session's spend charts on
