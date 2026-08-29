@@ -1154,10 +1154,13 @@ DSH_ENABLED = False
 # has, but one no per-host env can override. The hub, Android and glasses carry
 # the SAME-named flag so no single component can re-enable qwen alone. [Qwen A]
 # (XERK-506) establishes the field, the flag and the whole wire path; the qwen
-# LAUNCHER is [Qwen B], so this stays False until that lands (there is no
-# _launch_qwen body to run yet). Flip to True (and set the env) once the
-# launcher exists. Tests patch this True (or patch qwen_configured directly).
-QWEN_ENABLED = False
+# LAUNCHER is [Qwen B]. The launcher now exists and the XERK-520 end-to-end gate
+# verified qwen on real Qwen Code (spawn, chat, the guard's hard-deny under
+# approvalMode:auto, HITL, usage, archive, migrate, board dispatch), so it now
+# ships True. A host still advertises qwen only when qwen_configured() also holds
+# (TURMA_QWEN + a model route + the qwen binary). Tests patch this True (or patch
+# qwen_configured directly).
+QWEN_ENABLED = True
 
 # --- dsh runtime host configuration (XERK-460, launcher XERK-467) ----------
 # Where a dsh session's process finds its profile (the driver plugin + the model

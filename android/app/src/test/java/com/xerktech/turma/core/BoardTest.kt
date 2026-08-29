@@ -512,8 +512,8 @@ class BoardTest {
     // ---- XERK-515 [Qwen I]: qwen is a second board runtime pin, parity with the web
 
     @Test fun `mergeSites marks qwenAvailable when ANY reporting host offers qwen`() {
-        // qwen ships DISABLED fleet-wide (Runtime.QWEN_ENABLED = false); enable it to
-        // exercise the mergeSites qwen-availability OR, resetting in finally.
+        // The mergeSites qwen-availability OR is gated on Runtime.QWEN_ENABLED; set it
+        // explicitly (reset in finally) to exercise the OR regardless of the default.
         Runtime.QWEN_ENABLED = true
         try {
             val noQwen = agent("hostA", true, JiraBlock(siteKey = "org", user = "u", fetchedAt = "2026-07-16T01:00:00Z"))

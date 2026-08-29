@@ -11263,10 +11263,12 @@ test("normalizeQwen coerces the capability flag strictly boolean (XERK-506)", ()
   assert.ok(!("qwen" in old));
 });
 
-test("QWEN_ENABLED off (the shipped default) makes the hub serve an inert qwen block and no qwen runtime", () => {
-  // Deliberately does NOT flip the flag — it pins the SHIPPED default, so the
-  // flag-on qwen tests can't stay green with every hub kill-switch gate removed.
-  assert.equal(hub.__getQwenEnabled(), false);
+test("QWEN_ENABLED flipped OFF makes the hub serve an inert qwen block and no qwen runtime", () => {
+  // QWEN_ENABLED now ships TRUE (the XERK-520 go-live), but the kill switch must
+  // still gate when an operator flips it off — prove the mechanism holds so qwen
+  // can be disabled fleet-wide without every hub gate having rotted. (afterEach
+  // resets it to false, so set it explicitly here rather than lean on ordering.)
+  hub.__setQwenEnabled(false);
   // qwenAvailable refuses whatever an agent claims.
   assert.equal(hub.qwenAvailable({ qwen: { available: true } }), false);
   // normalizeQwen forces the block inert even from a populated agent report.

@@ -570,12 +570,14 @@ class TestSpawnOptionHelpers(unittest.TestCase):
 
     def test_qwen_configured_is_off_by_default_and_env_gated(self):
         # The in-code QWEN_ENABLED kill switch wins over the env, exactly like
-        # DSH_ENABLED: while it is False (the shipped default), every TURMA_QWEN
-        # value reads as off, so the capability is disabled fleet-wide no matter
-        # what a host's env says.
-        for on in ("1", "true", "TRUE", "yes", "on", " On "):
-            with mock.patch.dict(os.environ, {"TURMA_QWEN": on}):
-                self.assertFalse(ha.qwen_configured(), on)
+        # DSH_ENABLED: while it is False, every TURMA_QWEN value reads as off, so
+        # the capability is disabled fleet-wide no matter what a host's env says.
+        # (QWEN_ENABLED now ships True after the XERK-520 gate, so this arm patches
+        # it False explicitly to keep proving the kill-switch mechanism holds.)
+        with mock.patch.object(ha, "QWEN_ENABLED", False):
+            for on in ("1", "true", "TRUE", "yes", "on", " On "):
+                with mock.patch.dict(os.environ, {"TURMA_QWEN": on}):
+                    self.assertFalse(ha.qwen_configured(), on)
         # With the switch lifted the env gate decides: opt-in, off by default, so
         # a host that lifts the flag but sets no env still degrades.
         with mock.patch.object(ha, "QWEN_ENABLED", True):
