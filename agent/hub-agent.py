@@ -1284,6 +1284,19 @@ QWEN_STORE_ARCNAME = ".qwen-store"
 # migration must place exactly this session's <id>.jsonl, never unpack a dir into
 # it.
 QWEN_STORE_MEMBER = "chat.jsonl"
+# qwen persists its per-server MCP connection-trust decisions here, keyed by the
+# workdir's realpath (XERK-507 D1). We PRE-AUTHORIZE our own registered servers
+# in it at launch so a session never wedges at the trust dialog. Same resolution
+# order qwen's getMcpApprovalsPath uses (the env override, then ~/.qwen), so both
+# sides always read the same file.
+QWEN_MCP_APPROVALS_PATH = (os.environ.get("QWEN_CODE_MCP_APPROVALS_PATH")
+                           or os.path.join(QWEN_HOME, "mcpApprovals.json"))
+# The distinctive title qwen's per-server MCP connection-trust dialog draws
+# (real capture in the XERK-507 D1 investigation). _confirm_qwen_launch treats a
+# pane sitting on it as a FAILED launch: pre-authorization (above) should keep it
+# from ever appearing, but if that silently stops matching (a qwen upgrade
+# changing the config hash), a wedged session must fail loudly, not read running.
+QWEN_MCP_APPROVAL_PANE_SIG = "Untrusted MCP server"
 # Per-session transient files (the sourced 0600 env file with the model key)
 # live under the agent-owned ~/.turma, never a worktree — the same discipline as
 # the dsh socket dir and the local-model env file.
@@ -2891,6 +2904,37 @@ def qwen_peer_inbox_path():
     rendezvous directory for the hub to pick up and inject."""
     return os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "qwen", "peer_inbox.py")
+
+
+# The fields qwen's hashMcpServerConfig treats as non-behavioral and strips
+# before hashing (packages/core/src/mcp/configHash.ts): provenance/cosmetics that
+# must not force re-approval.
+_QWEN_MCP_NON_BEHAVIORAL_FIELDS = frozenset(("scope", "extensionName",
+                                             "description"))
+
+
+def _qwen_mcp_config_hash(config):
+    """Reproduce qwen's ``hashMcpServerConfig`` byte-for-byte so a pre-written MCP
+    approval (XERK-507 D1) MATCHES the one qwen computes for the same server —
+    qwen binds an approval to this hash and reads a mismatch as ``pending``,
+    which re-opens the connection-trust dialog.
+
+    The algorithm (qwen 0.22.2): drop the non-behavioral fields, then
+    ``JSON.stringify`` with every OBJECT's keys sorted recursively (arrays keep
+    their order) and NO whitespace, then sha256-hex. ``ensure_ascii=False`` and
+    the compact separators are load-bearing — JS's stringify emits UTF-8 and no
+    spaces. Validated against the real installed binary via ``qwen mcp list``."""
+    def _canon(v):
+        if isinstance(v, dict):
+            return {k: _canon(v[k]) for k in sorted(v)}
+        if isinstance(v, list):
+            return [_canon(x) for x in v]
+        return v
+    behavioral = {k: v for k, v in config.items()
+                  if k not in _QWEN_MCP_NON_BEHAVIORAL_FIELDS}
+    stable = json.dumps(_canon(behavioral), separators=(",", ":"),
+                        ensure_ascii=False)
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
 
 
 def _glob_literal(path):
@@ -13796,6 +13840,36 @@ class SessionManager:
         capability flag only."""
         return {"available": qwen_configured()}
 
+    def _qwen_version_pin(self):
+        """Env that forces qwen to run the INSTALLED base package, never a
+        cached self-update under ``~/.qwen/updates`` (XERK-507 D3).
+
+        A background self-update downloads a newer build (e.g. 0.22.3) and the
+        launcher shim (``bin/qwen``) then dispatches to IT — so both ``qwen
+        --version`` and a launched session drift off the version the [Qwen S1]
+        projectors were validated against, while the workspace
+        ``disableAutoUpdate`` only governs the per-session process, not the
+        shim's version dispatch. The shim honours ``QWEN_CODE_MANAGED_NPM_PIN``
+        with ``version:null`` by selecting the base package — but ONLY when its
+        ``bootstrap`` equals the realpath of the entry node runs, so this is
+        best-effort: an entry we cannot resolve to an absolute path (or a
+        standalone-shim install whose bootstrap differs) yields NO pin and the
+        current behavior, never a broken launch. Applied to BOTH the readiness
+        probe and the session's sourced env file so the two never disagree; the
+        shim re-publishes the null pin to the interactive relaunch, keeping it on
+        the base build too."""
+        entry = shutil.which(QWEN_BIN) or (QWEN_BIN if os.path.isabs(QWEN_BIN)
+                                           else None)
+        if not entry:
+            return {}
+        try:
+            entry = os.path.realpath(entry)
+        except OSError:
+            return {}
+        update_root = os.path.normpath(os.path.join(QWEN_HOME, "updates", "npm"))
+        return {"QWEN_CODE_MANAGED_NPM_PIN": json.dumps(
+            {"bootstrap": entry, "version": None, "updateRoot": update_root})}
+
     def _ensure_qwen_ready(self):
         """Probe (once per manager) whether this host can LAUNCH qwen — the qwen
         binary runs and a model route is configured — caching the verdict on
@@ -13821,7 +13895,8 @@ class SessionManager:
         else:
             try:
                 r = subprocess.run([QWEN_BIN, "--version"], capture_output=True,
-                                   text=True, timeout=30)
+                                   text=True, timeout=30,
+                                   env={**os.environ, **self._qwen_version_pin()})
                 if r.returncode == 0:
                     ready = True
                     log(f"qwen: ready ({(r.stdout or '').strip()[:40]}, model "
@@ -13943,6 +14018,11 @@ class SessionManager:
             # and suspenders with settings.general.disableAutoUpdate.
             "QWEN_CODE_SKIP_UPDATE_CHECK_ONCE": "1",
         }
+        # Force the base build even if a self-update was ALREADY cached: skipping
+        # the update CHECK does not un-select an already-downloaded newer build
+        # the shim dispatches to (XERK-507 D3). Best-effort — no-op if the entry
+        # can't be resolved to a pin the shim accepts.
+        env_map.update(self._qwen_version_pin())
         api_key_val = os.environ.get(QWEN_MODEL_API_KEY_ENV)
         if api_key_val:
             env_map["OPENAI_API_KEY"] = api_key_val
@@ -14237,18 +14317,26 @@ class SessionManager:
     def _write_qwen_worktree_config(self, sess, policy):
         """Write the per-worktree qwen config — `.qwen/settings.json` and the
         context file carrying the directive — then git-exclude both. Raises
-        RuntimeError only if settings.json cannot be written (that config pins
+        RuntimeError if settings.json cannot be written (that config pins
         chat-recording / approval mode / auto-update, so a session without it
-        would run wrong); the context file and the git-exclude are best-effort."""
+        would run wrong) OR if the MCP servers it registers cannot be
+        pre-authorized (XERK-507 D1 — an un-authorized server wedges the session
+        at qwen's trust dialog); the context file and the git-exclude are
+        best-effort."""
         worktree = sess["worktreePath"]
         conf_dir = os.path.join(worktree, QWEN_CONFIG_DIRNAME)
+        settings = self._qwen_settings(sess)
         try:
             os.makedirs(conf_dir, exist_ok=True)
             with open(os.path.join(conf_dir, "settings.json"), "w",
                       encoding="utf-8") as f:
-                json.dump(self._qwen_settings(sess), f, indent=2)
+                json.dump(settings, f, indent=2)
         except OSError as e:
             raise RuntimeError(f"qwen settings: {e}")
+        # Pre-authorize the MCP servers THIS settings file registers, keyed to
+        # this worktree, BEFORE the tmux launch — else qwen sits at its per-server
+        # connection-trust dialog and the initial prompt never runs (XERK-507 D1).
+        self._authorize_qwen_mcp_servers(sess, settings)
         try:
             with open(os.path.join(worktree, QWEN_CONTEXT_FILENAME), "w",
                       encoding="utf-8") as f:
@@ -14261,6 +14349,55 @@ class SessionManager:
         # the session. Best-effort — a failure only means the files show as
         # untracked; the files are regenerated on every launch either way.
         self._qwen_git_exclude(worktree)
+
+    def _authorize_qwen_mcp_servers(self, sess, settings):
+        """Pre-authorize the workspace's registered MCP servers for THIS
+        session's worktree, so qwen does not wedge at its per-server
+        connection-trust dialog (XERK-507 D1).
+
+        That dialog is a SEPARATE gate from per-tool-call confirmation:
+        `approvalMode:"auto"` answers the latter but NOT this one, `trust:true`/
+        `mcp.allowed` do not suppress it, and qwen persists the decision
+        per-workdir — so a fresh worktree per session re-asks every launch. We
+        write the `approved` record qwen would have written on a manual approval:
+        keyed by the worktree's REALPATH (qwen keys on `process.cwd()`, which the
+        OS resolves to the physical path) and bound to the server config's hash
+        exactly as qwen computes it (`_qwen_mcp_config_hash`); a hash mismatch
+        reads as `pending` and re-prompts, so the two must track.
+
+        Merges into the existing file (other worktrees' entries and qwen's own
+        writes must survive) and replaces atomically. RAISES on a write failure:
+        a session left at the trust dialog reads `running` on the wire but runs
+        nothing, so refusing the launch (XERK-265) beats launching it wedged."""
+        servers = (settings or {}).get("mcpServers") or {}
+        worktree = sess.get("worktreePath")
+        if not servers or not worktree:
+            return
+        root = os.path.realpath(worktree)
+        entry = {name: {"hash": _qwen_mcp_config_hash(config),
+                        "status": "approved"}
+                 for name, config in servers.items()}
+        path = QWEN_MCP_APPROVALS_PATH
+        # Read-merge: a missing or corrupt file just starts fresh (qwen tolerates
+        # a rewrite and would re-prompt for anything we drop; clobbering another
+        # worktree's live entry is the outcome to avoid, hence the merge).
+        data = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            data = {}
+        data[root] = entry
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.tmp.{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, path)
+        except OSError as e:
+            raise RuntimeError(f"qwen MCP approvals: {e}")
 
     def _qwen_git_exclude(self, worktree):
         """Add the generated qwen config to git's exclude so `git status` (hence
@@ -14364,6 +14501,17 @@ class SessionManager:
             if not self._tmux_alive(tmux):
                 log(f"qwen session {sid}: process exited during startup "
                     "(crashed on load) — refusing the launch")
+                return False
+            # A live runtime.json can appear WHILE the per-server MCP trust dialog
+            # blocks (qwen has started, but the initial prompt never runs), so a
+            # bare pid check would confirm a wedged session (XERK-507 D1, the
+            # XERK-492 "a bound thing is not a live thing" class). Pre-auth should
+            # prevent the dialog; if it is up anyway it never clears itself, so
+            # fail fast with a reason rather than record it running.
+            if QWEN_MCP_APPROVAL_PANE_SIG in (_capture_pane(tmux) or ""):
+                log(f"qwen session {sid}: wedged at the MCP server-approval "
+                    "dialog (pre-authorization did not take) — refusing the "
+                    "launch")
                 return False
             rt = self._qwen_runtime_file(claude_sid)
             if rt:

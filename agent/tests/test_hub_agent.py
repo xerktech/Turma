@@ -4138,6 +4138,9 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
             ("QWEN_RUNTIME_DIR", os.path.join(self.tmp, "qwen")),
             ("QWEN_PROJECTS_ROOT", os.path.join(self.tmp, "qwen-projects")),
             ("QWEN_PEER_DIR", os.path.join(self.tmp, "qwen-peer")),
+            # Never let a launch test write the host's real ~/.qwen approvals.
+            ("QWEN_MCP_APPROVALS_PATH",
+             os.path.join(self.tmp, "mcpApprovals.json")),
             ("QWEN_MODEL", "qwen3-coder"),
             ("QWEN_MODEL_BASE_URL", "https://gw.example.com/v1"),
             ("QWEN_MODEL_API_KEY_ENV", "QWEN_TEST_KEY"),
@@ -4399,6 +4402,126 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
              mock.patch.object(ha.time, "sleep", lambda *_: None), \
              mock.patch.object(sm, "_tmux_alive", return_value=True):
             self.assertFalse(sm._confirm_qwen_launch(self._sess(), "cccc"))
+
+    # --- MCP server-approval pre-authorization (XERK-507 D1) -----------------
+
+    def _approvals(self):
+        with open(os.path.join(self.tmp, "mcpApprovals.json")) as f:
+            return json.load(f)
+
+    def test_config_hash_matches_qwens_algorithm(self):
+        # Golden pin of _qwen_mcp_config_hash against qwen 0.22.2's own
+        # hashMcpServerConfig (validated end-to-end against the installed binary
+        # via `qwen mcp list`): non-behavioral fields dropped, every object's
+        # keys sorted recursively, compact UTF-8 JSON, sha256-hex. A drift here
+        # silently re-opens the trust dialog, so the value is pinned literally.
+        cfg = {"command": "python3",
+               "args": ["-SsE", "/x/ask_mcp.py"],
+               "env": {"TURMA_SESSION_ID": "abc", "TURMA_QUESTIONS_DIR": "/q",
+                       "TURMA_QUESTION_TIMEOUT_SEC": "600"},
+               "scope": "workspace"}          # scope is stripped before hashing
+        self.assertEqual(
+            ha._qwen_mcp_config_hash(cfg),
+            "2777202635b8ab510dfcfdd994eb6e177153918493619f8b67419dcf39a377f2")
+        # Dropping only the non-behavioral fields — key ORDER must not matter.
+        self.assertEqual(ha._qwen_mcp_config_hash(cfg),
+                         ha._qwen_mcp_config_hash({"scope": "user",
+                                                   "args": cfg["args"],
+                                                   "env": cfg["env"],
+                                                   "command": "python3"}))
+
+    def test_launch_preauthorizes_the_registered_mcp_servers(self):
+        # The whole D1 fix: after a launch the worktree's realpath carries an
+        # `approved` record for every server settings.json registers, each bound
+        # to the hash qwen will recompute — so qwen never wedges at the dialog.
+        sm = self.make_manager()
+        sess = self._sess()
+        self._launch(sm, sess, prompt="hi")
+        approvals = self._approvals()
+        root = os.path.realpath(self.wt)
+        self.assertIn(root, approvals)
+        entry = approvals[root]
+        self.assertEqual(set(entry), {"turma-ask", "turma-peer"})
+        settings = json.load(open(os.path.join(self.wt, ".qwen",
+                                               "settings.json")))
+        for name, server in settings["mcpServers"].items():
+            self.assertEqual(entry[name]["status"], "approved")
+            self.assertEqual(entry[name]["hash"],
+                             ha._qwen_mcp_config_hash(server))
+
+    def test_preauthorization_merges_and_keeps_other_worktree_entries(self):
+        # The approvals file is shared across every session on the host, so a
+        # launch must MERGE, never clobber another worktree's live entry.
+        path = os.path.join(self.tmp, "mcpApprovals.json")
+        with open(path, "w") as f:
+            json.dump({"/other/worktree": {"srv": {"hash": "x",
+                                                   "status": "approved"}}}, f)
+        sm = self.make_manager()
+        self._launch(sm, self._sess(), prompt="hi")
+        approvals = self._approvals()
+        self.assertIn("/other/worktree", approvals)
+        self.assertIn(os.path.realpath(self.wt), approvals)
+
+    def test_preauthorization_survives_a_corrupt_existing_file(self):
+        path = os.path.join(self.tmp, "mcpApprovals.json")
+        with open(path, "w") as f:
+            f.write("{ this is not json")
+        sm = self.make_manager()
+        self._launch(sm, self._sess(), prompt="hi")   # must not raise
+        self.assertIn(os.path.realpath(self.wt), self._approvals())
+
+    def test_preauthorization_write_failure_refuses_the_launch(self):
+        # A session that cannot be pre-authorized would sit at the trust dialog
+        # forever, so the launch RAISES (routes through _refuse_start) rather
+        # than recording a wedged session running (XERK-265).
+        sm = self.make_manager()
+        sm._qwen_ready = True
+        with mock.patch.object(ha.os, "replace",
+                               side_effect=OSError("read-only fs")):
+            with self.assertRaises(RuntimeError):
+                sm._launch_qwen(self._sess(), prompt="hi")
+
+    def test_confirm_fails_when_pane_shows_the_mcp_approval_dialog(self):
+        # Defense in depth: even with a live runtime.json, a pane sitting on the
+        # server-approval dialog means the initial prompt never ran — confirm
+        # must fail, not mark it running (the XERK-492 lesson the ticket cites).
+        sm = self.make_manager()
+        self._runtime_file("dddd", os.getpid())       # a live pid would confirm
+        cap = ("│ Untrusted MCP server in .qwen/settings.json\n"
+               "│ › 1. Approve this server\n")
+        with mock.patch.object(sm, "_tmux_alive", return_value=True), \
+             mock.patch.object(ha, "_capture_pane", return_value=cap):
+            self.assertFalse(sm._confirm_qwen_launch(self._sess(), "dddd"))
+
+    # --- version pin: run the INSTALLED base build, never a self-update (D3) --
+
+    def test_version_pin_forces_the_base_build_and_rides_the_env_file(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.shutil, "which",
+                               return_value="/opt/qwen/bin/qwen"), \
+             mock.patch.object(ha.os.path, "realpath",
+                               return_value="/opt/qwen/lib/cli-entry.js"):
+            pin = sm._qwen_version_pin()
+        parsed = json.loads(pin["QWEN_CODE_MANAGED_NPM_PIN"])
+        # version:null is what makes the shim select the base package, not the
+        # cached self-update; bootstrap is the realpath of the entry node runs.
+        self.assertIsNone(parsed["version"])
+        self.assertEqual(parsed["bootstrap"], "/opt/qwen/lib/cli-entry.js")
+        # It must reach the SESSION too (not just the readiness probe), sourced
+        # from the 0600 env file like every other qwen var.
+        sess = self._sess()
+        self._launch(sm, sess, prompt="hi")
+        with open(os.path.join(self.tmp, "qwen", "q1.env")) as f:
+            body = f.read()
+        self.assertIn("QWEN_CODE_MANAGED_NPM_PIN", body)
+
+    def test_version_pin_is_empty_when_the_entry_cannot_be_resolved(self):
+        # Best-effort: an unresolvable bare command yields NO pin (the shim would
+        # reject a bad bootstrap anyway) rather than a broken launch.
+        sm = self.make_manager()
+        with mock.patch.object(ha, "QWEN_BIN", "qwen"), \
+             mock.patch.object(ha.shutil, "which", return_value=None):
+            self.assertEqual(sm._qwen_version_pin(), {})
 
     # --- git-exclude against a REAL linked worktree --------------------------
 
