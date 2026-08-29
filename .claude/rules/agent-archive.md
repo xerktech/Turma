@@ -228,8 +228,18 @@ paths:
     is the wrong home: the raw layer excludes it on purpose (its contents are what prune/delete key
     on), so a native log there is D3's canonical record retained by NOTHING. This reconciles the
     `docs/dsh-session-lifecycle.md` design, which had proposed the worktree.
+  - **A qwen session's native event log rides this layer at `<tid>/qwen/`** (`QWEN_STORE_DIRNAME`,
+    XERK-512) the SAME way — a raw sidecar under the project-slug session dir. The difference is only
+    WHO writes it there: dsh's driver writes its feed directly, but qwen owns its native log (it
+    writes it under `~/.qwen/projects/`, which this walk does not reach), so the projection TAIL
+    (`qwen_session.QwenProjectionTail`) MIRRORS its bytes into the store, append-only, on its own
+    cursor. A running qwen session is NOT un-excluded from the manifest (below) — qwen has no
+    Trajectory viewer, so its native log is retention only and archives once the session ends.
   - **A RUNNING dsh session is NOT excluded from the manifest** (`_running_slugs` subtracts
-    `_live_dsh_slugs`), and that exception is what makes the Trajectory work at all. Every other
+    `_live_dsh_slugs`), and that exception is what makes the Trajectory work at all. **A running
+    QWEN session gets NO such carve-out** (XERK-512): qwen has a real ttyd TUI and no Trajectory
+    viewer, so its native log is retention/metrics only — it archives once the session ends, like
+    every non-dsh running session. Every other
     running session is excluded ("sync it once it ends"), but the in-dashboard Trajectory (XERK-498)
     is the ONLY viewer a headless dsh session has, and it reads the native log back through THIS raw
     layer — so a running dsh session that did not sync would 404 for its whole life, which is exactly
