@@ -310,11 +310,11 @@ shelled out to `python3 -SsE <hook>` exactly as Claude and dsh do.
 - **The credential env file is read-denied** (`Read(~/.turma/qwen/*.env)`, holds `OPENAI_API_KEY`) —
   defence in depth: 0600 already stops other uids and the session runs as the owning uid, so this only
   stops a casual read via the file-editing tools (Bash walks past it, XERK-309).
-- **The flat globs match an expanduser'd (not realpath'd) prefix against a realpath'd target**, so a
-  symlinked HOME could dodge a credential glob — the SAME accepted limitation the dsh guard has;
-  `fileguard.py` realpaths its ~/.claude base, so the ~/.claude predicate holds regardless.
-- Two further residual gaps (an ungated unknown mutating tool NAME, with no fs-sandbox backstop; and
-  the shim's re-read config being Bash-overwritable) are stated in `docs/qwen-adr.md` — accepted, not
+- **`_realpath_glob_prefix`** (XERK-503) resolves symlinks in each glob's literal prefix, so a
+  symlinked HOME *subdirectory* (`~/.aws` a bind mount, or WSL's Windows-side profile) no longer
+  dodges its own deny rule, matching how `fileguard.py` realpaths its `~/.claude` base. Three further
+  residual gaps (the ungated unknown tool name; the shim's re-readable config; a credential FILE
+  itself symlinked, still open after the prefix fix) are stated in `docs/qwen-adr.md` — accepted, not
   open bugs.
 - Tests: `test_qwen_guard.py` — `TestBuildQwenGuardConfig` pins the config (hook wiring, ms-timeout
   ordering, shared-rule-set derivation, credential read-deny, no-ListAgents, missing-fileguard

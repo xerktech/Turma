@@ -88,5 +88,12 @@ Every one of these is unit-tested against its contract and awaits host confirmat
 - **A `run_shell_command` that overwrites the shim's config could self-bypass** — not net-new
   (`guard.py` equally allows `echo > guard.py`); the guard defends against the MODEL, not a hostile
   same-uid shell. It is a weaker backstop than the guard-settings file claude reads once at launch.
+- **A credential-store glob dodge via a symlinked HOME subdirectory is FIXED** (XERK-503,
+  `_realpath_glob_prefix`) — `~/.aws` itself being a bind mount, or on WSL the Windows-side profile,
+  no longer dodges its deny rule; the glob's literal prefix is realpath'd the same way `fileguard.py`
+  already realpaths its `~/.claude` base. **Still open: a credential FILE itself symlinked**
+  (`~/.kube/config` elsewhere, `~/.kube` itself real) — nothing to realpath in the prefix, so that
+  leaf still dodges. Closing it needs a nominal-path check alongside the realpath one, in
+  qwen/dsh/fileguard alike — a bigger change, not yet done. Same limitation applies to the dsh guard.
 - **The project's own `QWEN.md` is not auto-loaded**, since `context.fileName` points at Turma's own
   context file instead. Accepted trade.

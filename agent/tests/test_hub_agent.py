@@ -4070,6 +4070,7 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         for name, value in [
             ("QWEN_RUNTIME_DIR", os.path.join(self.tmp, "qwen")),
             ("QWEN_PROJECTS_ROOT", os.path.join(self.tmp, "qwen-projects")),
+            ("QWEN_PEER_DIR", os.path.join(self.tmp, "qwen-peer")),
             ("QWEN_MODEL", "qwen3-coder"),
             ("QWEN_MODEL_BASE_URL", "https://gw.example.com/v1"),
             ("QWEN_MODEL_API_KEY_ENV", "QWEN_TEST_KEY"),
@@ -4131,8 +4132,14 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         sm._qwen_ready = True
         os.environ["QWEN_TEST_KEY"] = "sk-secret"
         self.addCleanup(os.environ.pop, "QWEN_TEST_KEY", None)
-        with mock.patch.object(sm, "_confirm_qwen_launch", return_value=True):
+        # The peer-inbox forger (XERK-518 [Qwen L]) is a REAL subprocess in
+        # production (forging a ~/.claude/sessions/<pid>.json record + binding a
+        # socket, host-proof only per .claude/rules/dsh-input.md's RECEIVE-path
+        # note) — never let a unit test actually spawn it.
+        with mock.patch.object(sm, "_confirm_qwen_launch", return_value=True), \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
             sm._launch_qwen(sess, **kw)
+        return popen
 
     def test_spawn_pins_id_writes_config_and_delivers_prompt(self):
         sm = self.make_manager()
@@ -4162,6 +4169,15 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
             ctx = f.read()
         self.assertIn("git fetch origin", ctx)          # NEW_WORK directive
         self.assertIn("peers.tsv", ctx)                 # PEERS directive
+        # QWEN_PEERS_ADDENDUM (XERK-518 [Qwen L]) corrects the SendMessage/
+        # ListAgents references for a runtime with neither tool.
+        self.assertIn("send_message", ctx)
+        self.assertIn("no `SendMessage` or\n`ListAgents` tool", ctx)
+        # The turma-peer MCP server is registered beside turma-ask.
+        peer_mcp = settings["mcpServers"]["turma-peer"]
+        self.assertEqual(peer_mcp["args"][-1], ha.qwen_peer_mcp_path())
+        self.assertEqual(peer_mcp["env"]["TURMA_SESSION_ID"], "q1")
+        self.assertEqual(peer_mcp["env"]["TURMA_QWEN_PEER_DIR"], ha.QWEN_PEER_DIR)
 
     def test_model_route_is_sourced_from_a_0600_env_file_never_argv(self):
         sm = self.make_manager()
@@ -4179,6 +4195,68 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         cmd = self._last_tmux_cmd()
         self.assertNotIn("sk-secret", cmd)
         self.assertIn(f". {shlex.quote(env_file)}", cmd)
+
+    def test_launch_starts_the_peer_inbox_forger(self):
+        # XERK-518 [Qwen L]: RECEIVE rides a per-session subprocess (never argv'd
+        # secrets — it carries no credential at all, unlike the model env file).
+        sm = self.make_manager()
+        sess = self._sess(rcName="host-Repo-Q1")
+        popen = self._launch(sm, sess, prompt="hi")
+        cid = sess["claudeSessionId"]
+        args, kwargs = popen.call_args
+        self.assertEqual(args[0], ["python3", "-SsE", ha.qwen_peer_inbox_path()])
+        env = kwargs["env"]
+        self.assertEqual(env["TURMA_SESSION_ID"], "q1")
+        self.assertEqual(env["TURMA_CLAUDE_SESSION_ID"], cid)
+        self.assertEqual(env["TURMA_RC_NAME"], "host-Repo-Q1")
+        self.assertEqual(env["TURMA_QWEN_PEER_DIR"], ha.QWEN_PEER_DIR)
+        self.assertEqual(env["TURMA_CWD"], self.wt)
+        self.assertIn("q1", sm.qwen_peer_inboxes)
+        # The pid is PERSISTED on the record (mirroring ttydPid) so a later
+        # manager instance — which starts with an empty qwen_peer_inboxes dict
+        # — can still find and reap this forger if it survives a restart
+        # (KillMode=process leaves a bare, non-tmux-hosted subprocess alive;
+        # a QA finding — see _start_qwen_peer_inbox's docstring).
+        self.assertEqual(sess["qwenPeerInboxPid"], sm.qwen_peer_inboxes["q1"].pid)
+
+    def test_teardown_stops_the_peer_inbox_forger(self):
+        sm = self.make_manager()
+        sess = self._sess()
+        self._launch(sm, sess, prompt="hi")
+        proc = sm.qwen_peer_inboxes["q1"]
+        sm._teardown_qwen("q1")
+        proc.terminate.assert_called_once()
+        self.assertNotIn("q1", sm.qwen_peer_inboxes)
+
+    def test_relaunch_reaps_a_forger_orphaned_by_a_restart(self):
+        # A fresh manager instance (post-restart) has an EMPTY qwen_peer_inboxes
+        # — the in-memory Popen handle died with the old manager, but the bare
+        # subprocess itself did not (KillMode=process). The persisted pid is
+        # what lets the resume-on-boot adopt path reap that orphan before
+        # starting a fresh forger, or every restart leaks one more (a QA
+        # finding).
+        sm = self.make_manager()
+        sess = self._sess(qwenPeerInboxPid=31337)   # an orphan from "before"
+        with mock.patch.object(ha.os, "kill") as oskill:
+            self._start_qwen_peer_inbox_only(sm, sess)
+        oskill.assert_called_once_with(31337, ha.signal.SIGTERM)
+
+    def _start_qwen_peer_inbox_only(self, sm, sess):
+        sm.registry = [sess]
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm._start_qwen_peer_inbox(sess, "cs-1")
+        return popen
+
+    def test_teardown_reaps_an_orphaned_forger_by_persisted_pid(self):
+        # Mirrors test_kill_ttyd_reaps_adopted_orphan_by_pid: a forger this
+        # process never started (self.qwen_peer_inboxes has no entry) but whose
+        # pid is on the record must still be reaped, not leaked.
+        sm = self.make_manager()
+        sess = self._sess(qwenPeerInboxPid=9191)
+        sm.registry = [sess]
+        with mock.patch.object(ha.os, "kill") as oskill:
+            sm._stop_qwen_peer_inbox("q1")
+        oskill.assert_called_once_with(9191, ha.signal.SIGTERM)
 
     def test_ticket_branch_directive_rides_the_context_file(self):
         sm = self.make_manager()
@@ -4296,6 +4374,238 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         self.assertEqual(body.count("Turma qwen runtime config"), 1)
         self.assertIn(f"/{ha.QWEN_CONFIG_DIRNAME}/", body)
         self.assertIn(f"/{ha.QWEN_CONTEXT_FILENAME}", body)
+
+
+class TestQwenPeerMessaging(ManagerMixin, unittest.TestCase):
+    """XERK-518 [Qwen L]: cross-session peer messaging for qwen — the dsh [L]
+    analogue (.claude/rules/dsh-input.md), but FILE-rendezvous based rather than
+    control-socket-event based (qwen has no control socket) and PANE-delivered
+    rather than socket-delivered (qwen is an interactive TUI, not headless).
+    SEND rides the turma-peer MCP tool (agent/qwen/peer_mcp.py) writing request
+    files under QWEN_PEER_DIR/<sid>/; RECEIVE rides the peer-inbox forger
+    (agent/qwen/peer_inbox.py) writing "recv-*.json" files there. Both are
+    picked up by _poll_qwen_peer_dir and delivered off the beat by the qwen
+    peer worker (_qwen_peer_worker_loop)."""
+
+    def setUp(self):
+        super().setUp()
+        self.peer_dir = os.path.join(self.tmp, "qwen-peer")
+        p = mock.patch.object(ha, "QWEN_PEER_DIR", self.peer_dir)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _qwen_session(self, sid="q1", **extra):
+        sm = self.make_manager()
+        sess = {"id": sid, "status": "running", "agentType": "qwen",
+                "tmuxName": f"agent-{sid}",
+                "worktreePath": os.path.join(self.tmp, "wt-" + sid),
+                "rcName": f"host-Repo-{sid.upper()}",
+                "summary": "named", "summaryAttempts": 1}
+        sess.update(extra)
+        sm.registry = [sess]
+        sm.qwen_tails[sid] = types.SimpleNamespace(stop=lambda: None)
+        return sm, sess
+
+    def _peer_pair(self, target_type="qwen"):
+        """A src qwen session and a target session (qwen/dsh/claude) on one
+        host — mirrors TestDshRouting's _peer_pair."""
+        sm, src = self._qwen_session("src")
+        tgt = {"id": "tgt", "status": "running", "agentType": target_type,
+               "rcName": "host-Repo-TGT", "tmuxName": "agent-tgt",
+               "claudeSessionId": "cs-tgt",
+               "summary": "named", "summaryAttempts": 1,
+               "worktreePath": os.path.join(self.tmp, "tgt")}
+        sm.registry.append(tgt)
+        tgt_ctl = None
+        if target_type == "dsh":
+            tgt_ctl = _FakeDshControl()
+            sm.dsh_controls["tgt"] = tgt_ctl
+        return sm, src, tgt_ctl
+
+    def _write_peer_file(self, sid, name, data):
+        d = os.path.join(self.peer_dir, sid)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    # --- file polling / dispatch ---------------------------------------------
+
+    def test_poll_dispatches_a_send_request_and_consumes_the_file(self):
+        sm, sess = self._qwen_session()
+        self._write_peer_file("q1", "1700000000000-1.json",
+                              {"to": "somebody", "message": "hi"})
+        with mock.patch.object(sm, "_deliver_qwen_peer_send") as deliver:
+            sm._poll_qwen_peer_dir("q1")
+        deliver.assert_called_once_with("q1", "somebody", "hi")
+        self.assertEqual(os.listdir(os.path.join(self.peer_dir, "q1")), [])
+
+    def test_poll_dispatches_an_inbound_message_and_consumes_the_file(self):
+        sm, sess = self._qwen_session()
+        self._write_peer_file("q1", "recv-1700000000000-42.json",
+                              {"from": "peerA", "text": "heads up"})
+        with mock.patch.object(sm, "_deliver_qwen_peer_inbound") as deliver:
+            sm._poll_qwen_peer_dir("q1")
+        deliver.assert_called_once_with("q1", "peerA", "heads up")
+        self.assertEqual(os.listdir(os.path.join(self.peer_dir, "q1")), [])
+
+    def test_poll_drops_an_unparseable_file_rather_than_retrying_it(self):
+        # A peer message is best-effort (matching Claude Code's own
+        # SendMessage), so a file this manager cannot parse is DROPPED, never
+        # retried forever.
+        sm, sess = self._qwen_session()
+        d = os.path.join(self.peer_dir, "q1")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "garbage.json"), "w") as f:
+            f.write("not json")
+        sm._poll_qwen_peer_dir("q1")   # must not raise
+        self.assertEqual(os.listdir(d), [])
+
+    def test_poll_is_a_noop_when_the_session_has_no_peer_dir(self):
+        sm, sess = self._qwen_session()
+        sm._poll_qwen_peer_dir("q1")   # no directory exists yet — must not raise
+
+    def test_poll_leaves_a_fresh_dotfile_alone(self):
+        # A dotfile could be a writer's atomic-write tmp file still in flight
+        # (peer_mcp.py/peer_inbox.py both dot-prefix theirs) — a fresh one must
+        # NOT be swept, or a real in-progress write could be deleted out from
+        # under its own os.replace.
+        sm, sess = self._qwen_session()
+        d = os.path.join(self.peer_dir, "q1")
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, ".req.json.tmp.123"), "w").close()
+        sm._poll_qwen_peer_dir("q1")
+        self.assertEqual(os.listdir(d), [".req.json.tmp.123"])
+
+    def test_poll_sweeps_a_stale_dotfile_left_by_a_crashed_writer(self):
+        # A writer that crashed between open() and os.replace() leaves its tmp
+        # file behind forever otherwise (a QA finding) — bounded to session
+        # lifetime before this fix, unbounded within a long-lived one across
+        # repeated crashes.
+        sm, sess = self._qwen_session()
+        d = os.path.join(self.peer_dir, "q1")
+        os.makedirs(d, exist_ok=True)
+        stale = os.path.join(d, ".req.json.tmp.123")
+        open(stale, "w").close()
+        old = time.time() - (ha.QWEN_PEER_POLL_SEC * 10)
+        os.utime(stale, (old, old))
+        sm._poll_qwen_peer_dir("q1")
+        self.assertEqual(os.listdir(d), [])
+
+    def test_worker_loop_polls_every_live_qwen_session_once(self):
+        sm, _ = self._qwen_session("q1")
+        sm.qwen_tails["q2"] = types.SimpleNamespace(stop=lambda: None)
+        polled = []
+        with mock.patch.object(sm, "_poll_qwen_peer_dir", polled.append), \
+             mock.patch.object(ha.time, "sleep",
+                               side_effect=[None, StopIteration]):
+            with self.assertRaises(StopIteration):
+                sm._qwen_peer_worker_loop()
+        self.assertEqual(sorted(polled), ["q1", "q2"])
+
+    # --- SEND resolution/dispatch (mirrors TestDshRouting's peer_send set) --
+
+    def test_peer_send_to_qwen_target_types_into_its_pane(self):
+        sm, src, _ = self._peer_pair("qwen")
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._deliver_qwen_peer_send("src", "host-Repo-TGT", "check foo.py")
+        self.assertEqual(len(self.run_stdin_calls), 1)
+        _, text = self.run_stdin_calls[0]
+        self.assertIn("host-Repo-SRC", text)       # the message names its sender
+        self.assertIn("check foo.py", text)
+
+    def test_peer_send_to_dsh_target_frames_and_names_sender(self):
+        sm, src, tgt_ctl = self._peer_pair("dsh")
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._deliver_qwen_peer_send("src", "host-Repo-TGT", "check foo.py")
+        self.assertEqual(len(tgt_ctl.inputs), 1)
+        text, kind = tgt_ctl.inputs[0]
+        self.assertEqual(kind, "peer")
+        self.assertIn("host-Repo-SRC", text)
+        self.assertIn("check foo.py", text)
+
+    def test_peer_send_to_claude_target_posts_as_native_peer(self):
+        sm, src, _ = self._peer_pair("claude")
+        posts = []
+
+        def fake_post(sp, pid, cs, text, sender=ha.INBOX_SENDER):
+            posts.append((cs, text, sender))
+            return True
+
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False), \
+             mock.patch.object(ha, "_session_inbox", lambda cs: ("/s.sock", 42, cs)), \
+             mock.patch.object(ha, "_post_to_inbox", fake_post):
+            sm._deliver_qwen_peer_send("src", "host-Repo-TGT", "hi peer")
+        self.assertEqual(len(posts), 1)
+        cs, text, sender = posts[0]
+        self.assertEqual(cs, "cs-tgt")
+        # `from` is the qwen session's own name (a native peer), NOT turma, and
+        # the body carries no INBOX_PREFIX — it reads as a real peer message.
+        self.assertEqual(sender, "host-Repo-SRC")
+        self.assertEqual(text, "hi peer")
+        self.assertFalse(text.startswith(ha.INBOX_PREFIX))
+
+    def test_peer_send_unknown_name_is_dropped(self):
+        sm, src, _ = self._peer_pair("qwen")
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._deliver_qwen_peer_send("src", "host-Repo-NOBODY", "hi")
+        self.assertEqual(self.run_stdin_calls, [])
+
+    def test_peer_send_to_own_name_is_not_echoed(self):
+        sm, src = self._qwen_session("src", rcName="host-Repo-SRC")
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._deliver_qwen_peer_send("src", "host-Repo-SRC", "to myself")
+        self.assertEqual(self.run_stdin_calls, [])
+
+    def test_peer_send_ambiguous_name_is_dropped(self):
+        sm, src, _ = self._peer_pair("qwen")
+        dup = {"id": "tgt2", "status": "running", "agentType": "qwen",
+               "rcName": "host-Repo-TGT", "tmuxName": "agent-tgt2",
+               "summary": "named", "summaryAttempts": 1,
+               "worktreePath": os.path.join(self.tmp, "tgt2")}
+        sm.registry.append(dup)
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._deliver_qwen_peer_send("src", "host-Repo-TGT", "which one?")
+        self.assertEqual(self.run_stdin_calls, [])
+
+    def test_peer_send_to_opted_out_target_is_dropped(self):
+        sm, src, _ = self._peer_pair("qwen")
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: True):
+            sm._deliver_qwen_peer_send("src", "host-Repo-TGT", "hi")
+        self.assertEqual(self.run_stdin_calls, [])
+
+    def test_peer_send_refuses_past_input_max_chars(self):
+        sm, src, _ = self._peer_pair("qwen")
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._deliver_qwen_peer_send(
+                "src", "host-Repo-TGT", "x" * (ha.INPUT_MAX_CHARS + 1))
+        self.assertEqual(self.run_stdin_calls, [])
+
+    # --- RECEIVE (native Claude peer -> qwen, via the forged inbox) ---------
+
+    def test_peer_inbound_injects_peer_framed_into_the_pane(self):
+        sm, sess = self._qwen_session()
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._deliver_qwen_peer_inbound("q1", "host-Repo-A", "heads up")
+        self.assertEqual(len(self.run_stdin_calls), 1)
+        _, text = self.run_stdin_calls[0]
+        self.assertIn("host-Repo-A", text)
+        self.assertIn("heads up", text)
+
+    def test_peer_inbound_honours_crossSessionInbound_opt_out(self):
+        sm, sess = self._qwen_session()
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: True):
+            sm._deliver_qwen_peer_inbound("q1", "x", "hi")
+        self.assertEqual(self.run_stdin_calls, [])
+
+    # --- helper paths ---------------------------------------------------------
+
+    def test_peer_mcp_and_inbox_paths_point_at_the_qwen_dir(self):
+        self.assertTrue(ha.qwen_peer_mcp_path().endswith(
+            os.path.join("qwen", "peer_mcp.py")))
+        self.assertTrue(ha.qwen_peer_inbox_path().endswith(
+            os.path.join("qwen", "peer_inbox.py")))
+        self.assertTrue(os.path.isfile(ha.qwen_peer_mcp_path()))
+        self.assertTrue(os.path.isfile(ha.qwen_peer_inbox_path()))
 
 
 class TestDshRouting(ManagerMixin, unittest.TestCase):
