@@ -4812,6 +4812,261 @@ class TestDshPrAttribution(ManagerMixin, unittest.TestCase):
         self.assertIn("rename the flag", text)
 
 
+class TestQwenPrAttribution(ManagerMixin, unittest.TestCase):
+    """XERK-514 [Qwen H]: a qwen session that opens a PR gets the SAME chips,
+    ledgers, attribution and comment/conflict delivery as a Claude Code one —
+    with NO qwen-specific PR code, exactly as dsh [H] (TestDshPrAttribution)
+    proved for the headless runtime. The symmetry is [Qwen S1]'s: the projection
+    needs no new reader, so the whole PR web reads a qwen transcript unchanged.
+
+    PR attribution keys on a `gh pr create` landing as a real `Bash` tool_use /
+    tool_result pair in the transcript (`_scan_pr_line`). A qwen session's
+    transcript is the [Qwen S1] projection of Qwen's own native log, and the
+    projector maps Qwen's shell tool (`run_shell_command`) onto the `Bash` name
+    the scan keys on (`_TOOL_NAME_MAP`, qwen_transcript.py). So the whole PR web
+    — the per-beat scan, `_seed_prs`, `refresh_pr_status`, the GitLab/ADO
+    dispatch, and the comment/conflict nudges typed back in — reads and writes a
+    qwen session with no branch on `agentType`.
+
+    These tests drive the REAL qwen projector over a REAL-shaped corpus carrying
+    a `gh pr create` (agent/tests/qwen_pr_corpus.json, cloned from the captured
+    Qwen 0.22.2 event shapes — the G1 no-mock lesson), never a hand-rolled JSONL
+    fixture. A change that breaks any of this — the projector's name map, the
+    scan's Bash-name gate, or a stray qwen arm on notify_session — fails here
+    rather than silently leaving qwen PRs chipless.
+
+    The ONE difference from dsh [H]: dsh is headless, so its comment/conflict
+    nudges ride a control socket (`_dsh_notify`); a qwen session is an
+    interactive TUI with a REAL pane and NO inbox record ([Qwen C]), so
+    notify_session falls back to the pane exactly as a Claude session with no
+    inbox does — proven below, not by a socket."""
+
+    # The PR the corpus's `gh pr create` opens (see agent/tests/qwen_pr_corpus.json)
+    # — the SAME URL TestDshPrAttribution asserts, so the mirrored suites match.
+    PR_URL = "https://github.com/xerktech/Turma/pull/999"
+
+    def _qt(self):
+        """The real qwen projector, loaded by path like the qwen usage tests —
+        the projection under test is genuine qwen_transcript.py output."""
+        path = os.path.join(AGENT_DIR, "qwen_transcript.py")
+        spec = importlib.util.spec_from_file_location("qwen_transcript", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _corpus(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "qwen_pr_corpus.json")) as f:
+            return json.load(f)
+
+    def _projected(self, sid, wt):
+        """The projected Claude-JSONL entries for the corpus, as the qwen tail
+        (QwenProjectionTail) would append them to the pinned <sid>.jsonl."""
+        return self._qt().project_log(self._corpus(), sid, cwd=wt)
+
+    def _write_transcript(self, wt, sid, entries):
+        slug = ha._project_slug(wt)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, sid + ".jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        return path
+
+    def _qwen_session(self, sm, sid="qwen1", wt=None):
+        wt = wt or os.path.join(self.tmp, "worktrees", "Turma", sid)
+        cid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        sess = {"id": sid, "status": "running", "agentType": "qwen",
+                "worktreePath": wt, "tmuxName": "agent-" + sid,
+                "claudeSessionId": cid, "summary": "qwen task",
+                "summaryAttempts": 1}
+        sm.registry = [sess]
+        return sess, cid, wt
+
+    # --- the core claim: the projected transcript attributes the PR ----------
+
+    def test_projected_gh_pr_create_is_attributed(self):
+        """The corpus's `gh pr create` — run through Qwen's `run_shell_command`
+        tool, projected to a `Bash` tool_use/tool_result pair — is attributed by
+        the same scan a Claude session uses, with zero qwen-specific code."""
+        entries = self._projected("sid", "/repos/Turma")
+        report = {"prUrls": []}
+        state = {}
+        for e in entries:
+            ha._scan_pr_line(json.dumps(e).encode(), state, report)
+        self.assertEqual(report["prUrls"], [self.PR_URL])
+
+    def test_a_non_bash_projection_would_not_be_attributed(self):
+        """The narrowness is the same as Claude's: attribution needs the projected
+        name to be `Bash`. This pins that the win above comes from the projector's
+        `run_shell_command`->`Bash` map, not from loose text matching — drop the
+        map and the chip is gone (a PR opened via qwen's `cordis_run`/`ralph` or
+        the raw GitLab API gets none, matching a Claude PR opened via MCP)."""
+        entries = self._projected("sid", "/repos/Turma")
+        renamed = 0
+        for e in entries:
+            for b in (((e.get("message") or {}).get("content")) or []):
+                if isinstance(b, dict) and b.get("name") == "Bash":
+                    b["name"] = "run_shell_command"   # as if the map were dropped
+                    renamed += 1
+        self.assertTrue(renamed, "the corpus must carry a Bash tool_use to rename")
+        report = {"prUrls": []}
+        state = {}
+        for e in entries:
+            ha._scan_pr_line(json.dumps(e).encode(), state, report)
+        self.assertEqual(report["prUrls"], [])
+
+    # --- the live per-beat scan reads a qwen session's projection ------------
+
+    def test_live_beat_scan_derives_the_chip_for_a_qwen_session(self):
+        """session_report(agent_type="qwen") runs the SAME incremental PR scan over
+        the pinned projection transcript. The first beat primes offsets to EOF (so
+        a restart never replays old links); the PR that the session opens DURING
+        its life is seen as freshly appended bytes on a later beat. A qwen session
+        takes the CLAUDE pane path in session_report ([Qwen D]), so _pane_status is
+        stubbed — the PR scan itself is agentType-agnostic."""
+        sess, cid, wt = self._qwen_session(self.make_manager())
+        entries = self._projected(cid, wt)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(None, None, None)):
+            # Prime: only the opening user turn exists when the first beat lands.
+            self._write_transcript(wt, cid, entries[:1])
+            state = {}
+            first = ha.session_report(wt, state, tmux_name=sess["tmuxName"],
+                                      session_id=sess["id"], claude_sid=cid,
+                                      agent_type="qwen")
+            self.assertEqual(first["prUrls"], [])
+            # The session now runs `gh pr create` — the rest of the conversation
+            # is appended, and the next beat's scan picks the PR link out of it.
+            self._write_transcript(wt, cid, entries)
+            second = ha.session_report(wt, state, tmux_name=sess["tmuxName"],
+                                       session_id=sess["id"], claude_sid=cid,
+                                       agent_type="qwen")
+        self.assertEqual(second["prUrls"], [self.PR_URL])
+
+    # --- _seed_prs re-derives chips for a resumed/migrated qwen session ------
+
+    def test_seed_prs_rederives_chips_for_a_resumed_qwen_session(self):
+        """A resumed or migrated qwen session already has the `gh pr create` in its
+        transcript at launch (past the EOF the live scan primes to), so `_seed_prs`
+        re-derives its chips — keyed on the PRESERVED transcript id, so a migrated
+        session lands the same URLs the source reported. The dispatch to
+        _launch_qwen lives inside _launch_tmux, so _resume_at_cwd's _seed_prs call
+        covers qwen exactly as it does dsh and claude."""
+        sm = self.make_manager()
+        sess, cid, wt = self._qwen_session(sm)
+        self._write_transcript(wt, cid, self._projected(cid, wt))
+        sm._seed_prs(sess)
+        self.assertEqual(sm.session_pr_urls[sess["id"]], [self.PR_URL])
+        self.assertEqual(sess["prUrls"], [self.PR_URL])
+        # It seeds the durable transcript-keyed ledger too, so the chip survives
+        # into the session's ENDED life exactly as a Claude session's does.
+        ledgered = set()
+        for entry in sm.pr_ledger.values():
+            ledgered.update((entry or {}).get("urls") or [])
+        self.assertIn(self.PR_URL, ledgered)
+
+    def test_seed_prs_is_a_noop_for_a_qwen_session_that_opened_no_pr(self):
+        sm = self.make_manager()
+        sess, cid, wt = self._qwen_session(sm)
+        # A transcript with a plain user turn and nothing else.
+        self._write_transcript(wt, cid, [
+            {"type": "user", "uuid": "u1", "timestamp": "2026-01-01T00:00:00Z",
+             "message": {"role": "user", "content": [{"type": "text",
+                                                       "text": "hi"}]}}])
+        sm._seed_prs(sess)
+        self.assertNotIn(sess["id"], sm.session_pr_urls)
+        self.assertNotIn("prUrls", sess)
+
+    # --- refresh_pr_status + GitLab/ADO dispatch reach a qwen session's PR ---
+
+    def test_refresh_pr_status_polls_a_qwen_sessions_pr(self):
+        """A qwen session's PR is re-polled like any other — refresh_pr_status keys
+        on session_pr_urls (session id), never agentType."""
+        sm = self.make_manager()
+        sess, cid, wt = self._qwen_session(sm)
+        sm.session_pr_urls[sess["id"]] = [self.PR_URL]
+        sm.github = {"available": True}
+        with mock.patch.object(ha, "pr_status",
+                               return_value={"url": self.PR_URL,
+                                             "state": "OPEN"}) as pr:
+            sm.refresh_pr_status()
+        pr.assert_called_once_with(self.PR_URL)
+        self.assertEqual(sm.pr_status_cache[self.PR_URL]["state"], "OPEN")
+
+    def test_a_qwen_sessions_gitlab_mr_dispatches_the_same_way(self):
+        """The URL-keyed source dispatch (_pr_source_ok) is agent-agnostic, so a
+        qwen session that opens a GitLab MR refreshes through the configured
+        GitLab exactly as a Claude session's would."""
+        mr = "https://gitlab.example.com/grp/app/-/merge_requests/5"
+        sm = self.make_manager()
+        sess, cid, wt = self._qwen_session(sm)
+        sm.session_pr_urls[sess["id"]] = [mr]
+        sm.github = {"available": False}
+        with mock.patch.multiple(ha, GITLAB_URL="https://gitlab.example.com",
+                                 GITLAB_TOKEN="tok"), \
+                mock.patch.object(ha, "pr_status",
+                                  return_value={"url": mr,
+                                                "state": "OPEN"}) as pr:
+            sm.refresh_pr_status()
+        pr.assert_called_once_with(mr)
+
+    # --- comment + conflict delivery reach a qwen session over its PANE -------
+
+    def test_conflict_nudge_reaches_a_qwen_session_over_its_pane(self):
+        """A CONFLICTING PR nudges the session that opened it. A qwen session has
+        NO inbox record (it writes no ~/.claude/sessions/<pid>.json), so
+        notify_session falls back to the pane — send_input — exactly as a Claude
+        session with no inbox does. The nudge carries the MERGE instruction
+        _pr_conflict_message builds, and the episode is recorded so it isn't
+        re-nudged every beat."""
+        sm = self.make_manager()
+        sess, cid, wt = self._qwen_session(sm)
+        os.makedirs(wt, exist_ok=True)
+        sm.session_pr_urls[sess["id"]] = [self.PR_URL]
+        sm.pr_status_cache[self.PR_URL] = {
+            "url": self.PR_URL, "state": "OPEN",
+            "mergeable": "CONFLICTING", "base": "main"}
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False), \
+                mock.patch.object(ha, "_session_inbox", return_value=None), \
+                mock.patch.object(sm, "send_input") as si:
+            sm._poll_pr_conflicts()
+        si.assert_called_once()
+        args = si.call_args[0]
+        self.assertEqual(args[0], sess["id"])
+        self.assertIn("origin/main", args[1])
+        # The episode is recorded on the record so it isn't re-nudged every beat.
+        self.assertIn(self.PR_URL, sess["prConflicts"])
+
+    def test_comment_activity_reaches_a_qwen_session_over_its_pane(self):
+        """New, not-self PR review activity is delivered into the qwen session that
+        opened the PR — over the pane (send_input), since it has no inbox. The
+        first sighting only baselines (no delivery); a later new comment is what
+        reaches the session."""
+        sm = self.make_manager()
+        sess, cid, wt = self._qwen_session(sm)
+        os.makedirs(wt, exist_ok=True)
+        sm.session_pr_urls[sess["id"]] = [self.PR_URL]
+        sm.github = {"available": True, "login": "me"}
+
+        events = [{"key": "c1", "is_self": False, "author": "reviewer",
+                   "body": "please fix the naming", "kind": "comment"}]
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False), \
+                mock.patch.object(ha, "_session_inbox", return_value=None), \
+                mock.patch.object(ha, "_pr_comment_events", return_value=events), \
+                mock.patch.object(sm, "send_input") as si:
+            sm._poll_pr_comments()   # first sighting: baseline, no delivery
+            si.assert_not_called()
+            events.append({"key": "c2", "is_self": False, "author": "reviewer",
+                           "body": "and rename the flag", "kind": "comment"})
+            sm._poll_pr_comments()   # the new comment reaches the session
+        si.assert_called_once()
+        args = si.call_args[0]
+        self.assertEqual(args[0], sess["id"])
+        self.assertIn("rename the flag", args[1])
+
+
 class TestStartedAt(ManagerMixin, unittest.TestCase):
     """The heartbeat's startedAt: docker's StartedAt where it answers, else the
     manager's own start — never empty. The hub's restart-loop alert keys on this
