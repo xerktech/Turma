@@ -305,21 +305,41 @@ the Start button AND the auto-start sweep.
   falls back to the static aliases, never an empty menu.
 - Tests: `server.test.js`; `modelPinOf`/`modelPickerHtml`/`modelChoices` in `board.test.js`.
 
-##### Runtime row (XERK-473)
+##### Runtime row (XERK-473 dsh, XERK-515 qwen)
 
-- **Which RUNTIME the session runs on** — "Claude Code" (default) or "dsh" (XERK-460). Hub-owned
-  durable like the Model row (`ticketRuntimes` → the `spawnTicket` command's **`agentType`**), so it
-  needs no online host to edit. `{runtime:"dsh"}` pins; `{runtime:"claude"}` or `{auto:true}` release
-  (only the non-default is stored). The full picture — the pin, the `orgOffersDsh` gate, and the
-  `findTicketHost` runtime-capability filter that routes a dsh ticket only to a dsh-capable host — is
-  in `.claude/rules/dsh.md`'s **[I] (XERK-473)** section.
-- **"dsh" is offered only when the org offers it** (`site.dshAvailable`, from any reporting host's
-  `dsh.available` via `mergeSites`), so the picker can't name a runtime the hub would refuse — but an
-  existing dsh pin is always carried back so it can be released even after the last dsh host leaves.
-- **Shipped on Android** in XERK-477 (`RuntimeSection` in `BoardScreen.kt`), the way the dsh card
-  badge was.
-- Tests: `server.test.js` (the `/runtime` route + the dsh `findTicketHost` cases);
-  `runtimePinOf`/`runtimeFieldHtml`/`runtimePickerHtml` in `board.test.js`.
+- **Which RUNTIME the session runs on** — "Claude Code" (default), "dsh" (XERK-460) or "Qwen Code"
+  (XERK-504). Hub-owned durable like the Model row (`ticketRuntimes` → the `spawnTicket` command's
+  **`agentType`**), so it needs no online host to edit. `{runtime:"dsh"|"qwen"}` pins;
+  `{runtime:"claude"}` or `{auto:true}` release (only the non-default is stored). The dsh side is in
+  `.claude/rules/dsh.md`'s **[I] (XERK-473)**; this row is the home for the **qwen twin ([Qwen I],
+  XERK-515)**, to which `.claude/rules/qwen.md`'s [Qwen I] pointer refers — the qwen board mechanics
+  are the bullets below rather than a second copy in that file.
+- **A non-default runtime is offered only when the org offers it** (`site.dshAvailable`/
+  `site.qwenAvailable`, from any reporting host's `dsh.available`/`qwen.available` via `mergeSites`
+  — `orgOffersQwen` is the hub gate, the `orgOffersDsh` twin), so the picker can't name a runtime the
+  hub would refuse — but an existing pin is always carried back so it can be released even after the
+  last capable host leaves. `setTicketRuntime` stores a qwen pin exactly like a dsh one (no body
+  change — only `"claude"`/`{auto}` release).
+- **Dispatch filters the pool by runtime capability, per-runtime.** `findTicketHost` carries one
+  `wantRuntime` string + a `runtimeOfferedBy(a)` check (`dshAvailable`/`qwenAvailable`), so a
+  qwen-pinned ticket routes only to a `qwen.available` host — checked ahead of capacity so "no host
+  offers qwen" reads as **blocked** (a freed slot would not add the runtime, ages out) not **full**;
+  a pinned host lacking qwen is reported, never routed around. The agent re-validates
+  (`resolve_agent_type`).
+- **The agent side is UNCHANGED for both runtimes** — `spawn_ticket` forwards `agentType` to
+  `spawn()`, `_launch_tmux` dispatches to `_launch_dsh`/`_launch_qwen` (each already appends the
+  ticket-branch directive), so a runtime ticket session needs NO new launch code; because
+  `QWEN_ENABLED` ships False a qwen pin cannot reach a launch in production yet. **Collectors, the two
+  tracker writes and the `_board_column` mirrors are runtime-agnostic and untouched** — the runtime
+  pin is orthogonal to a ticket's column.
+- **Shipped on Android** — the dsh row in XERK-477 (`RuntimeSection` in `BoardScreen.kt`), the qwen
+  option beside it in XERK-515 (`BoardSite.qwenAvailable`, `qwenBySite` gated on
+  `Runtime.QWEN_ENABLED`, `runtimeEditable(dshAvailable, qwenAvailable, pin)` — a signature change
+  every caller must pass). The vendored `glasses/src/vendor/board.cjs` stays byte-identical to
+  `board.js`.
+- Tests: `server.test.js` (the `/runtime` route + the dsh/qwen `findTicketHost` + spawnTicket cases);
+  `runtimePinOf`/`runtimeFieldHtml`/`runtimePickerHtml`/`mergeSites` in `board.test.js` (both
+  runtimes); the qwen board cases in android `BoardTest.kt`.
 
 ##### Status row (XERK-138) — the one detail control that writes BACK to the tracker
 

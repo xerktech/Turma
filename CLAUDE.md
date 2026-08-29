@@ -36,6 +36,7 @@ that component's files.
 | `.claude/rules/routing-eval.md` | `bench/archive/**`, the routing docs | archive-sourced replay eval: the requestId turn unit, curation gates, why routing is per-session |
 | `.claude/rules/dsh.md` | `poc/turma-2.0-poc/**`, `agent/**` | dsh ADR + per-child mechanics (XERK-460) |
 | `.claude/rules/qwen.md` | `agent/hub-agent.py`, `turma/server.js`, `sessions.html`, `android/**` | Qwen Code runtime plumbing (XERK-504) |
+| `.claude/rules/qwen-migration.md` | `agent/hub-agent.py` | qwen session migration + resume (XERK-516 [Qwen K]): the native log as the resumable store |
 | `.claude/rules/dsh-input.md` | `agent/dsh_session.py` | driving a dsh session (XERK-467 [C]): socket, driver, input |
 | `.claude/rules/dsh-delegation.md` | `agent/dsh_transcript.py` | dsh delegation (XERK-474 [J]): bg-agent/workflow rows + `subagentHistory` |
 | `.claude/rules/dsh-guard.md` | `agent/dsh/guard/**` | dsh safety guard (XERK-470 [F]): deny policy on dsh's pipeline |

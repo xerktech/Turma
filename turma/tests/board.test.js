@@ -1207,6 +1207,56 @@ test("runtimePickerHtml: dsh offered only when the org offers it or a pin exists
   assert.equal(runtimePickerValue(null), "claude");
 });
 
+// ---- XERK-515: the qwen runtime is a second board runtime pin ---------------
+
+test("mergeSites: qwenAvailable is set when any reporting host offers qwen", () => {
+  assert.equal(mergeSites([agent("h1", block())])[0].qwenAvailable, false);
+  assert.equal(mergeSites([agent("h1", block(), { qwen: { available: true } })])[0].qwenAvailable, true);
+  // Any host in the org is enough, online or not — the orgOffersQwen shape.
+  assert.equal(mergeSites([
+    agent("h1", block(), { online: false, qwen: { available: true } }),
+    agent("h2", block()),
+  ])[0].qwenAvailable, true);
+  // dsh and qwen are independent capabilities.
+  const both = mergeSites([agent("h1", block(),
+    { dsh: { available: true }, qwen: { available: true } })])[0];
+  assert.equal(both.dshAvailable, true);
+  assert.equal(both.qwenAvailable, true);
+});
+
+test("runtimePinOf/prettyRuntime: qwen is a non-default runtime like dsh", () => {
+  const tr = { "s/X-1": { runtime: "qwen", at: 1 } };
+  assert.equal(runtimePinOf(tr, "s", "X-1").runtime, "qwen");
+  assert.equal(prettyRuntime("qwen"), "Qwen Code");
+});
+
+test("runtimePickerHtml: qwen offered only when the org offers it or a pin exists", () => {
+  // Neither runtime in the org and no pin: only the Claude option.
+  const none = runtimePickerHtml(null, { dshAvailable: false, qwenAvailable: false });
+  assert.ok(!none.includes('value="qwen"'));
+  assert.ok(!none.includes('value="dsh"'));
+  // The org offers qwen: the option appears (and dsh's does not).
+  const offered = runtimePickerHtml(null, { dshAvailable: false, qwenAvailable: true });
+  assert.ok(offered.includes('value="qwen"'));
+  assert.ok(offered.includes("Qwen Code"));
+  assert.ok(!offered.includes('value="dsh"'));
+  // Both offered: both options appear beside Claude.
+  const both = runtimePickerHtml(null, { dshAvailable: true, qwenAvailable: true });
+  assert.ok(both.includes('value="dsh"'));
+  assert.ok(both.includes('value="qwen"'));
+  // An existing qwen pin is always carried so it can be released, even with qwen gone.
+  const pinned = runtimePickerHtml({ runtime: "qwen" }, { dshAvailable: false, qwenAvailable: false });
+  assert.ok(/<option value="qwen" selected>/.test(pinned));
+  assert.equal(runtimePickerValue({ runtime: "qwen" }), "qwen");
+});
+
+test("runtimeFieldHtml: a qwen pin renders its name and stays editable to release", () => {
+  const pinned = runtimeFieldHtml({ runtime: "qwen" }, { editable: true });
+  assert.ok(pinned.includes("Qwen Code"));
+  assert.ok(pinned.includes("set by you"));
+  assert.ok(pinned.includes("data-runtime-edit"));
+});
+
 test("modelPickerHtml: a pinned alias off the probed list stays selected", () => {
   // The org's probe no longer lists "opus" (only sonnet), but the pin persists —
   // carried back so the browser doesn't fall back to Default and silently release.

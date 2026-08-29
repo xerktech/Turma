@@ -5762,6 +5762,79 @@ test("findTicketHost routes a dsh ticket only to a host that offers dsh", async 
   hub.setTicketRuntime("trRoute.atlassian.net", "ENG-9", null);   // cleanup
 });
 
+// ---- XERK-515 [Qwen I]: a ticket can be pinned to the qwen runtime ----------
+
+// A ticket host that ALSO offers the qwen runtime — the qwen twin of dshTicketBeat.
+const qwenTicketBeat = (device, site, { key = "ENG-5", repo = "Turma" } = {}) =>
+  request("POST", "/api/heartbeat", {
+    body: {
+      device,
+      repos: [{ name: repo, path: `/git/${repo}` }],
+      qwen: { available: true },
+      jira: {
+        available: true, configured: true, siteKey: site, user: `${device}@x.com`,
+        fetchedAt: "2026-07-14T12:00:00Z",
+        tickets: [{ key, summary: "Fix it", repoGuess: { repo, cloned: true } }],
+      },
+    },
+    headers: agentHeaders,
+  });
+
+test("http: pinning a ticket to qwen needs an org host offering it; claude releases", async () => {
+  hub.__setQwenEnabled(true);
+  await jiraBeat("trqNo", "trqNo.atlassian.net");
+  // No host of this org offers qwen, so a qwen pin is refused (nothing could run it).
+  const refused = await setRuntime("trqNo.atlassian.net", "ENG-1", { runtime: "qwen" });
+  assert.equal(refused.status, 400);
+  assert.match(refused.body.error, /qwen runtime/);
+  assert.ok(!("trqNo.atlassian.net/ENG-1" in hub.ticketRuntimes));
+
+  // A host that offers qwen makes the pin acceptable.
+  await qwenTicketBeat("trqYes", "trqYes.atlassian.net");
+  const ok = await setRuntime("trqYes.atlassian.net", "ENG-5", { runtime: "qwen" });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.runtime, "qwen");
+  assert.equal(hub.ticketRuntimes["trqYes.atlassian.net/ENG-5"].runtime, "qwen");
+
+  // "claude" releases the pin — nothing to store.
+  const rel = await setRuntime("trqYes.atlassian.net", "ENG-5", { runtime: "claude" });
+  assert.equal(rel.status, 200);
+  assert.ok(!("trqYes.atlassian.net/ENG-5" in hub.ticketRuntimes));
+});
+
+test("http: a qwen-pinned ticket carries agentType:qwen on its spawnTicket command", async () => {
+  hub.__setQwenEnabled(true);
+  await qwenTicketBeat("trqSpawn", "trqSpawn.atlassian.net");
+  await setRuntime("trqSpawn.atlassian.net", "ENG-5", { runtime: "qwen" });
+  const res = await request("POST", "/api/jira/trqSpawn.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.deepEqual(agents.trqSpawn.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
+      ticketSite: "trqSpawn.atlassian.net", agentType: "qwen", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("findTicketHost routes a qwen ticket only to a host that offers qwen", async () => {
+  hub.__setQwenEnabled(true);
+  // A qwen pin plus one org host that does NOT offer qwen: blocked, not full — a
+  // freed slot would not add the runtime.
+  await ticketBeat("trqPlain", "trqRoute.atlassian.net", { key: "ENG-9" });
+  hub.setTicketRuntime("trqRoute.atlassian.net", "ENG-9", "qwen");
+  const blocked = hub.findTicketHost("trqRoute.atlassian.net", "Turma", "ENG-9",
+    { requireFree: true });
+  assert.equal(blocked.host, undefined);
+  assert.ok(!blocked.full);
+  assert.match(blocked.error, /qwen runtime/);
+
+  // A qwen-capable host in the same org is chosen.
+  await qwenTicketBeat("trqCap", "trqRoute.atlassian.net", { key: "ENG-9" });
+  const ok = hub.findTicketHost("trqRoute.atlassian.net", "Turma", "ENG-9",
+    { requireFree: true });
+  assert.equal(ok.host, "trqCap");
+  hub.setTicketRuntime("trqRoute.atlassian.net", "ENG-9", null);   // cleanup
+});
+
 test("ticket-model pins survive a hub restart (read back from their own file)", () => {
   const file = path.join(os.tmpdir(), `turma-test-tm-persist-${process.pid}.json`);
   fs.writeFileSync(file, JSON.stringify({

@@ -10,6 +10,10 @@ paths:
   - "agent/tests/test_qwen_ask_mcp.py"
   - "turma/server.js"
   - "turma/public/sessions.html"
+  - "turma/public/board.js"
+  - "turma/public/board.html"
+  - "turma/tests/board.test.js"
+  - "glasses/src/vendor/board.cjs"
   - "android/**"
 ---
 
@@ -447,28 +451,22 @@ sessions" section); the invariants a change must not undo:
   per-beat scan, `_seed_prs` + the durable ledger, `refresh_pr_status` + GitLab/ADO dispatch, and the
   PANE-delivered comment/conflict nudges — the G1 no-mock lesson, mirroring `TestDshPrAttribution`.
 
+## [Qwen I] (XERK-515) shipped: board integration — a ticket can run on qwen
+
+A board ticket can be pinned to the qwen runtime, the dsh [I] (XERK-473) analogue — the runtime
+choice is presentational plumbing over the SAME `spawnTicket` path (the `ticketRuntimes` pin now
+accepts `"qwen"`), so the AGENT side is unchanged (`spawn_ticket` already forwards `agentType` to
+`spawn()`, `resolve_agent_type` already validates qwen, `_launch_qwen` already appends the
+ticket-branch directive — no new launch code). The mechanics — the `/runtime` route + `orgOffersQwen`
+gate, the per-runtime `findTicketHost` capability filter, the board `qwenAvailable`/picker, and the
+Android parity — live in **`.claude/rules/turma-board.md`**'s Runtime-row section (board-scoped,
+where the dsh [I] board detail's twin belongs), whose `paths:` load for the board files this touched.
+
 ## [Qwen K] (XERK-516) shipped: session migration + resume
 
-XERK-101 extended to qwen, the dsh [K] (XERK-475, `.claude/rules/dsh.md`) analogue. Load-bearing
-difference: qwen is **Claude-shaped**, so its NATIVE LOG *is* the durable store `qwen --resume <id>`
-reloads from — NO separate store like dsh's `DSH_SESSIONS_ROOT`. Full mechanics are in the
-`QWEN_STORE_ARCNAME` comment in `hub-agent.py`; the invariants:
-
-- **RESUME was already wired by [Qwen B]/[Qwen C]; [K] only PINS it.** `_start_qwen_tail(resume=True)`
-  starts at the native log's EOF so it never re-projects/doubles the kept `<id>.jsonl`; boot-adopt
-  reattaches the same way. Never add a resume path that re-reads from 0.
-- **MIGRATION carries the NATIVE LOG.** `export_session` GLOB-locates it (`_qwen_native_log`) and
-  packs it under `.qwen-store/chat.jsonl` (twin of `.dsh-store/`), truncated to its last complete
-  line; `_unpack_transcript` routes it to a single target FILE (`_qwen_store_dest`), NEVER a dir (the
-  shared `chats/` dir holds other sessions' logs). The `<slug>/<sid>/qwen/` raw mirror ([Qwen E]) is
-  the DISPLAY feed and is NEVER carried (the target rebuilds it past EOF) — the [K] correction.
-- **Cross-mount re-key is MANDATORY (issue #2373: qwen keys on cwd).** The log lands under the TARGET
-  cwd's slug — qwen's slug rule is `_project_slug` (every non-alnum→`-`, VERIFIED against real qwen
-  dirs; the G0 `/`→`-` note was imprecise). `_reconcile_qwen_store_cwd` re-points the `cwd` on EVERY
-  row (qwen has no single header) to the localized worktree; no-op on same-mount; never raises.
-- **No-qwen target falls back to CLAUDE cleanly** (the `agent_type_configured` guard, which
-  `want_qwen` gates on, so the `.qwen-store/` member is DROPPED). Model/endpoint re-validate against
-  the TARGET on launch; a carried `model` is kept only if `QWEN_IDENT_RE`-valid, else the host
-  default (no model-list discovery, so a served-but-wrong id is caught at `_confirm_qwen_launch`).
-- Tests: the qwen cases in `TestMigrateSession`. A real cross-host move resumed by qwen is host-proof
-  (qwen not in CI) — the footing [Qwen C]/[E] shipped on.
+Session migration + resume for a qwen session (the dsh [K] analogue) lives in
+**`.claude/rules/qwen-migration.md`** — split out to keep this file under its size ceiling; its
+`paths:` include `hub-agent.py`, so it co-loads with this file when the migration code is touched.
+The load-bearing point: qwen is Claude-shaped, so its NATIVE LOG *is* the store `qwen --resume`
+reloads from (no separate store like dsh's `DSH_SESSIONS_ROOT`) — a migration carries that log under
+`.qwen-store/`, places it at the target cwd's slug and re-keys its per-row `cwd`.
