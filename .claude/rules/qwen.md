@@ -92,6 +92,28 @@ Deliberately CLOSE to `_launch_tmux`, not the dsh driver.
 - **The safety guard ([Qwen F]) is wired into `_qwen_settings`.** `approvalMode:"auto"` runs tools
   unattended, so a launcher WITHOUT the guard is unguarded — the load-bearing reason `QWEN_ENABLED`
   stays False.
+- **The registered MCP servers are PRE-AUTHORIZED at launch** (`_authorize_qwen_mcp_servers`,
+  XERK-507 D1) or every real spawn WEDGES at qwen's per-server connection-trust dialog and the initial
+  prompt never runs. That gate is SEPARATE from per-tool-call confirmation: `approvalMode:"auto"` does
+  NOT answer it, and `trust:true`/`mcp.allowed` do not suppress it. qwen persists the decision
+  per-workdir in `mcpApprovals.json`, so a fresh worktree per session re-asks every launch. We write
+  the `approved` record qwen would have: keyed by the worktree's **realpath** (qwen keys on
+  `process.cwd()`, which the OS resolves to the physical path — verified through a symlinked cwd) and
+  bound to `_qwen_mcp_config_hash`, a byte-for-byte port of qwen's `hashMcpServerConfig` (strip
+  scope/extensionName/description, sort every object's keys, compact UTF-8 JSON, sha256). A hash drift
+  reads as `pending` and re-prompts, so the port is golden-pinned AND validated against the real
+  binary. Merges into the shared file; RAISES on write failure (a wedged session reads running but
+  runs nothing). `_confirm_qwen_launch` also fails on a pane still showing the dialog — defense if the
+  hash ever stops matching after a qwen upgrade.
+- **The binary is PINNED to the installed base build, not a cached self-update** (`_qwen_version_pin`,
+  XERK-507 D3). qwen background-downloads a newer build under `~/.qwen/updates` and the launcher shim
+  dispatches to it, so BOTH `qwen --version` and a session drift off the [Qwen S1] corpus version —
+  and `QWEN_CODE_SKIP_UPDATE_CHECK_ONCE` only skips the CHECK, it does not un-select an
+  already-cached build, nor does workspace `disableAutoUpdate` (that governs the per-session process,
+  not the shim's dispatch). The fix sets `QWEN_CODE_MANAGED_NPM_PIN` with `version:null` (+ `bootstrap`
+  = realpath of the entry node runs) on BOTH the probe and the session env file; the shim then selects
+  the base package and re-publishes the null pin to the interactive relaunch. Best-effort — an
+  unresolvable entry yields no pin, never a broken launch.
 - **Config readiness is primed OFF THE BEAT** (`_ensure_qwen_ready` on a worker at startup): a `qwen
   --version` probe + model-route validation cached on `_qwen_ready`. `_launch_qwen` only READS the
   cached flag and refuses if unset — never the probe on the beat (XERK-395).
@@ -106,7 +128,8 @@ Deliberately CLOSE to `_launch_tmux`, not the dsh driver.
   resumes/migrates onto a qwen-only host.
 - Tests: `TestLaunchQwen` (readiness gate, pinned id, 0600 env file with no credential on the command
   line, settings/context-file content, `-i` initial prompt, `--resume` in place, teardown-on-failed-
-  confirm, `_confirm_qwen_launch`).
+  confirm, `_confirm_qwen_launch`, the MCP pre-auth golden hash + merge + write-failure-refuses +
+  dialog-fails-confirm cases, the version-pin cases).
 
 ## [Qwen S1] (XERK-508) the projection (`agent/qwen_transcript.py`)
 
