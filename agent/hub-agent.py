@@ -8492,6 +8492,12 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # exactly as an uncapturable Claude pane does.
         pane_busy, mode_actual, pane_prompt = dsh_pane_busy(dsh_status), None, None
     else:
+        # Claude AND qwen (XERK-511 [Qwen D]): a qwen session is an interactive
+        # TUI with a REAL pane, so its liveness/mode/blocking-dialog come from the
+        # SAME `_pane_status` scrape — no dsh cache, no agentType branch (the qwen
+        # busy hints are unioned into _busy_from_capture, [Qwen C]). Reusing the
+        # pane path keeps sessionWorking/liveState/the readyForReview mirrors
+        # UNCHANGED for qwen; dsh_status is ignored here, even if one is passed.
         pane_busy, mode_actual, pane_prompt = _pane_status(tmux_name, state)
     report = {
         "bridgeAttached": os.path.exists(os.path.join(proj, "bridge-pointer.json")),
