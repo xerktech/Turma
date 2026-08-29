@@ -185,3 +185,24 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
     CHANGING) and card Uptime working. The container-log tail is not available natively.
   - The bundled `tmux.conf` only takes effect at `/etc/tmux.conf`/`~/.tmux.conf`; a host with its
     own conf loses truecolor and the OSC 52 copy chain (hub-agent launches bare `tmux`).
+- **`TURMA_DEFAULT_RUNTIME` sets the per-host default runtime for UNPINNED work** (XERK-521): an
+  auto-started/unpinned ticket session, and a bare "+ New session" whose Runtime dropdown was never
+  touched. One of `{claude,dsh,qwen}`; UNSET → claude, so every current host is byte-for-byte
+  unchanged. Resolved in ONE place agent-side (`resolve_agent_type` / `default_runtime`), so no
+  spawn route diverges — precedence is `explicit agentType (composer pick OR per-ticket pin) →
+  TURMA_DEFAULT_RUNTIME → claude`.
+  - **Self-validating / fail-safe**, the same half-config discipline as `local_model_configured`: it
+    is checked against THIS host's own capability (`dsh_configured`/`qwen_configured`), so a host
+    that sets `qwen` but has not configured Qwen falls back to claude and SAYS so (log + the
+    heartbeat's EFFECTIVE `defaultRuntime`) — never a broken launch.
+  - **Only the fresh-spawn call applies the default** (`apply_default=True`). Every REBUILD path
+    (resume, resume-transcript, migration in, closed-record) passes the STORED `agentType` and
+    leaves the default OFF, so a resumed/migrated session keeps the runtime it already had rather
+    than being re-defaulted.
+  - **It needs no hub capability-filter on the dispatch path.** A queued ticket's host is chosen at
+    DISPATCH (XERK-296) and an unpinned ticket carries no runtime, so `findTicketHost` routes to the
+    most-available host and the CLAIMING host applies its own default — which it can always run by
+    construction. (An explicit pin still filters + blocks, `.claude/rules/turma-board.md`.)
+  - **Known limitation — per-host is NONDETERMINISTIC in a MIXED org**: the same unpinned ticket
+    runs whatever the host that frees a slot first defaults to. Determinism needs a per-ticket pin
+    (XERK-515) or homogeneous hosts. Accepted tradeoff of the per-host choice.

@@ -3018,6 +3018,27 @@ function normalizeQwen(payload) {
   payload.qwen = { available: q.available === true };
 }
 
+// This host's EFFECTIVE default runtime for an unpinned spawn (XERK-521), coerced
+// at ingest exactly like normalizeQwen/normalizeDsh and for the same reason: it
+// is agent-supplied, a client may TYPE it, and `/api/agents` decodes atomically
+// on Android, so one host's `defaultRuntime: 123` would fail the whole fleet
+// decode. Coerced to the fixed runtime enum; anything else — a non-string, an
+// unknown value, or ABSENT (a pre-XERK-521 agent) — reads as "claude", the same
+// "can't tell / unchanged" value the composer treats an absent field as, never a
+// plausible other default. A runtime whose fleet-wide kill switch is OFF here is
+// also forced to "claude", so the served default stays CONSISTENT with the
+// zeroed capability block a disabled runtime reports (a composer must not
+// pre-select a runtime whose option normalizeQwen/normalizeDsh just hid).
+function normalizeDefaultRuntime(a) {
+  if (!a || typeof a !== "object") return;
+  if (!("defaultRuntime" in a)) return;
+  let r = a.defaultRuntime;
+  if (r !== "claude" && r !== "dsh" && r !== "qwen") r = "claude";
+  if (r === "dsh" && !DSH_ENABLED) r = "claude";
+  if (r === "qwen" && !QWEN_ENABLED) r = "claude";
+  a.defaultRuntime = r;
+}
+
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
 // into the host's per-session cache, then bound its memory: drop entries older
 // than HISTORY_MAX_AGE_MS and cap the cache at HISTORY_MAX_SESSIONS, evicting
@@ -3904,7 +3925,7 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "dsh", "qwen", "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
+  "dsh", "qwen", "defaultRuntime", "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
   "sessions", "startedAt", "subscription", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
@@ -4186,6 +4207,7 @@ function normalizeRecord(a) {
   normalizeLocalModel(a);
   normalizeDsh(a);
   normalizeQwen(a);
+  normalizeDefaultRuntime(a);
   normalizeModels(a);
   normalizeSpawnRefusals(a);
   normalizeRetired(a);
@@ -10467,6 +10489,7 @@ if (process.env.TURMA_TEST) {
     __setDshEnabled(v) { DSH_ENABLED = v; },
     __getDshEnabled() { return DSH_ENABLED; },
     normalizeQwen,
+    normalizeDefaultRuntime,
     qwenAvailable,
     // The fleet-wide qwen kill switch (XERK-504) mirrors the dsh one above: the
     // [Qwen A] tests flip it ON around themselves to prove the plumbing works

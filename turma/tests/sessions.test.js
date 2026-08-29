@@ -2032,6 +2032,35 @@ test("composer: the qwen runtime option appears and maps to agentType qwen (XERK
   assert.equal(body.permissionMode, undefined);
 });
 
+test("composer: a bare spawn pre-selects the host's default runtime (XERK-521)", () => {
+  const open = (h) => {
+    const page = loadPage();
+    const now = Date.now();
+    page.setCache({ now, agents: [h] });
+    page.render({ now, agents: [h] });
+    page.toggleComposer("hostA::repoX", "repoX");
+    return page.els.spawn.innerHTML;
+  };
+  const base = {
+    key: "hostA", device: "hostA", online: true, terminalOnline: true,
+    lastSeen: Date.now(), repos: [{ name: "repoX" }], sessions: [],
+    qwen: { available: true },
+  };
+  // A host defaulting to qwen pre-selects "Qwen Code" in an untouched dropdown,
+  // so a bare "+ New session" shows which runtime it will run on.
+  const dflt = open({ ...base, defaultRuntime: "qwen" });
+  assert.match(dflt, /<option value="qwen" selected>Qwen Code</);
+  // Absent defaultRuntime (older agent) falls back to Claude Code selected.
+  const none = open(base);
+  assert.match(none, /<option value="claude" selected>Claude Code</);
+  assert.doesNotMatch(none, /<option value="qwen" selected>/);
+  // A default naming a runtime NOT on offer here (qwen host, dsh default) falls
+  // back to selecting claude rather than an option that isn't in the picker.
+  const offer = open({ ...base, defaultRuntime: "dsh" });
+  assert.match(offer, /<option value="claude" selected>Claude Code</);
+  assert.doesNotMatch(offer, /<option value="dsh" selected>/);
+});
+
 test("composer: the dsh runtime offers the discovered model list, not Claude aliases (XERK-503)", () => {
   // The fix for the `pi-ai provider has no configured model` lock: a dsh session
   // picks a DISCOVERED endpoint model, the same list a local session gets.

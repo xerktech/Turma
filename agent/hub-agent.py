@@ -1951,13 +1951,27 @@ def qwen_configured():
             in ("1", "true", "yes", "on"))
 
 
-def resolve_agent_type(agent_type):
-    """Validate a runtime choice against a fixed enum. Blank -> claude (what
-    every session was before this existed). "dsh"/"qwen" are refused on a host
-    that does not offer them, mirroring resolve_model_source's local gate."""
+def resolve_agent_type(agent_type, apply_default=False):
+    """Validate a runtime choice against a fixed enum. "dsh"/"qwen" are refused
+    on a host that does not offer them, mirroring resolve_model_source's local
+    gate.
+
+    Blank is the operator/pin choosing NOTHING, and what that resolves to is the
+    ONE place XERK-521's precedence lives, so no route can diverge:
+      explicit agentType  ->  TURMA_DEFAULT_RUNTIME  ->  "claude"
+    The middle rung applies ONLY on the fresh-spawn path (apply_default=True): a
+    blank there means an unpinned "+ New session" / auto-started ticket, so the
+    host default (default_runtime(), already self-validated against THIS host's
+    capability) runs. Every REBUILD path — resume, resume-transcript, migration
+    in, closed-record — passes the STORED value and leaves apply_default False,
+    so a resumed/migrated session keeps the runtime it already had rather than
+    being re-defaulted onto a host default it never chose (a pre-field record
+    whose stored value is blank must stay claude, not adopt the default). The
+    default is self-validating, so it never returns a runtime this host can't
+    launch and needs no capability re-check here."""
     agent_type = (agent_type or "").strip()
     if not agent_type:
-        return "claude"
+        return default_runtime() if apply_default else "claude"
     if agent_type not in AGENT_TYPES:
         raise ValueError(f"unknown agent type {agent_type!r}")
     if agent_type == "dsh" and not dsh_configured():
@@ -1965,6 +1979,44 @@ def resolve_agent_type(agent_type):
     if agent_type == "qwen" and not qwen_configured():
         raise ValueError("qwen runtime not available on this host")
     return agent_type
+
+
+def default_runtime():
+    """The per-host default runtime for an UNPINNED spawn (XERK-521): the runtime
+    a bare "+ New session" (dropdown untouched) or an auto-started/unpinned
+    ticket session runs on, so a host need not pin every ticket to run it on the
+    right runtime. It is `TURMA_DEFAULT_RUNTIME` VALIDATED against this host's own
+    capability, and it is the EFFECTIVE value the heartbeat reports as
+    `defaultRuntime` (after this fallback), never the raw env.
+
+    Self-validating / fail-safe, the same half-config discipline as
+    local_model_configured (endpoint AND capability, or it reads as "no"): a host
+    that sets `qwen`/`dsh` but has NOT configured that runtime (its kill switch
+    off, or the env unset) falls back to claude and SAYS so, rather than
+    advertising or launching a runtime it cannot run. So the CLAIMING host always
+    applies a default it can run by construction, which is why the hub's ticket
+    dispatch needs no capability filter for the default path (unlike an explicit
+    pin): findTicketHost routes an unpinned ticket to the most-available host and
+    that host applies its own default.
+
+    UNSET -> claude, so every current host is byte-for-byte unchanged. An
+    unknown value (charset/enum-gated by the AGENT_TYPES membership check) also
+    falls back to claude and logs."""
+    raw = (os.environ.get("TURMA_DEFAULT_RUNTIME") or "").strip().lower()
+    if not raw:
+        return "claude"
+    if raw not in AGENT_TYPES:
+        log(f"TURMA_DEFAULT_RUNTIME={raw[:40]!r} is not one of "
+            f"{sorted(AGENT_TYPES)} — defaulting to claude")
+        return "claude"
+    if not agent_type_configured(raw):
+        # Set but not runnable here (kill switch off / runtime unconfigured):
+        # fall back rather than break every unpinned launch. A card signal
+        # rides the heartbeat's effective `defaultRuntime` (which this feeds).
+        log(f"TURMA_DEFAULT_RUNTIME={raw!r} but this host cannot run it "
+            "— defaulting to claude")
+        return "claude"
+    return raw
 
 
 def agent_type_configured(agent_type):
@@ -15218,7 +15270,11 @@ class SessionManager:
         # in the queue. Model and permission mode apply to root too.
         try:
             sess["permissionMode"] = resolve_permission_mode(permission_mode)
-            sess["agentType"] = resolve_agent_type(agent_type)
+            # The ONE fresh-spawn call: a blank agentType here (unpinned ticket
+            # or a bare "+ New session" whose dropdown was untouched) resolves to
+            # THIS host's TURMA_DEFAULT_RUNTIME (XERK-521), not a hardcoded
+            # claude. An explicit composer pick or per-ticket pin still wins.
+            sess["agentType"] = resolve_agent_type(agent_type, apply_default=True)
             if sess["agentType"] == "dsh":
                 # A dsh session's model is a DISCOVERED endpoint id, not a Claude
                 # alias, and dsh has no subscription/local split (D5) — so it does
@@ -22882,6 +22938,16 @@ class SessionManager:
             # then refuse to launch. Absent (a pre-qwen agent) reads the same as
             # false, coerced hub-side (normalizeQwen).
             "qwen": self._qwen_payload(),
+            # This host's EFFECTIVE default runtime for an unpinned spawn
+            # (XERK-521), AFTER the self-validation fallback — so it never
+            # advertises a runtime this host can't launch (a host that set
+            # TURMA_DEFAULT_RUNTIME=qwen but has qwen unconfigured reports
+            # "claude" here). Doubles as the card signal that the fallback fired.
+            # Absent (a pre-XERK-521 agent) reads as "claude", coerced hub-side
+            # (normalizeDefaultRuntime); so does an unset env, keeping every
+            # current host byte-for-byte unchanged. The composer pre-selects this
+            # so a bare "+ New session" shows which runtime it will use.
+            "defaultRuntime": default_runtime(),
             # The largest file this agent will take as a message attachment
             # (XERK-234). Doubles as the capability flag, exactly like
             # inputMaxChars above: an agent predating attachments reports nothing

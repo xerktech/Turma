@@ -11297,6 +11297,57 @@ test("heartbeat: qwen flag + session agentType survive into the fleet payload (X
   assert.equal(host.sessions[0].agentType, "qwen");
 });
 
+// ---- XERK-521: per-host default runtime (defaultRuntime) --------------------
+
+test("normalizeDefaultRuntime coerces to the runtime enum, absent stays absent", () => {
+  hub.__setQwenEnabled(true);
+  hub.__setDshEnabled(true);
+  const norm = (v) => { const p = { device: "h", defaultRuntime: v }; hub.normalizeDefaultRuntime(p); return p.defaultRuntime; };
+  // Valid enum values pass through (both runtimes enabled here).
+  assert.equal(norm("claude"), "claude");
+  assert.equal(norm("qwen"), "qwen");
+  assert.equal(norm("dsh"), "dsh");
+  // Anything else — unknown string, non-string, the same atomic-decode hazard as
+  // the qwen/dsh blocks — reads as "claude", the composer's "unchanged" default.
+  assert.equal(norm("codex"), "claude");
+  assert.equal(norm(123), "claude");
+  assert.equal(norm(null), "claude");
+  assert.equal(norm({}), "claude");
+  // A pre-XERK-521 agent sends nothing; the key stays absent (client treats it
+  // as claude), not an explicit value.
+  const old = { device: "h" };
+  hub.normalizeDefaultRuntime(old);
+  assert.ok(!("defaultRuntime" in old));
+});
+
+test("normalizeDefaultRuntime forces a disabled runtime to claude (kill-switch consistency)", () => {
+  // With a runtime's fleet-wide kill switch OFF, its capability block is served
+  // inert — so a served default naming it must also fall to claude, or the
+  // composer would pre-select a runtime whose option normalizeQwen/normalizeDsh
+  // just hid. Deliberately does NOT flip the flags (pins the shipped default).
+  assert.equal(hub.__getQwenEnabled(), false);
+  assert.equal(hub.__getDshEnabled(), false);
+  const norm = (v) => { const p = { defaultRuntime: v }; hub.normalizeDefaultRuntime(p); return p.defaultRuntime; };
+  assert.equal(norm("qwen"), "claude");
+  assert.equal(norm("dsh"), "claude");
+  assert.equal(norm("claude"), "claude");
+  // The real ingest/restore path coerces it too.
+  const rec = { device: "h", defaultRuntime: "qwen" };
+  hub.normalizeRecord(rec);
+  assert.equal(rec.defaultRuntime, "claude");
+});
+
+test("heartbeat: defaultRuntime survives into the fleet payload (XERK-521)", async () => {
+  hub.__setQwenEnabled(true);
+  await request("POST", "/api/heartbeat", {
+    body: { device: "drt1", qwen: { available: true }, defaultRuntime: "qwen" },
+    headers: agentHeaders,
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const host = res.body.agents.find((a) => a.device === "drt1");
+  assert.equal(host.defaultRuntime, "qwen");
+});
+
 test("http: spawn validates a qwen agentType and 409s a host without the capability (XERK-506)", async () => {
   hub.__setQwenEnabled(true);
   // A host offering qwen accepts the choice; one without it 409s a stale click.

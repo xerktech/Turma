@@ -629,6 +629,73 @@ class TestSpawnOptionHelpers(unittest.TestCase):
         with mock.patch.object(ha, "qwen_configured", lambda: True):
             self.assertEqual(sm._qwen_payload(), {"available": True})
 
+    def test_default_runtime_unset_is_claude(self):
+        # UNSET -> claude, so every current host is byte-for-byte unchanged.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TURMA_DEFAULT_RUNTIME", None)
+            self.assertEqual(ha.default_runtime(), "claude")
+
+    def test_default_runtime_unknown_value_falls_back_to_claude(self):
+        # An unknown value (charset/enum-gated by the AGENT_TYPES membership
+        # check) falls back to claude rather than raising or being launched.
+        for bad in ("codex", "CLAUDE ", "qwen; rm -rf", "42"):
+            with mock.patch.dict(os.environ, {"TURMA_DEFAULT_RUNTIME": bad}):
+                self.assertEqual(ha.default_runtime(), "claude", bad)
+
+    def test_default_runtime_self_validates_against_host_capability(self):
+        # Set but NOT runnable here (kill switch off / runtime unconfigured) ->
+        # claude, never a broken launch. Case-insensitive.
+        with mock.patch.object(ha, "qwen_configured", lambda: False), \
+             mock.patch.object(ha, "dsh_configured", lambda: False):
+            for v in ("qwen", "QWEN", "dsh"):
+                with mock.patch.dict(os.environ, {"TURMA_DEFAULT_RUNTIME": v}):
+                    self.assertEqual(ha.default_runtime(), "claude", v)
+        # Configured -> the effective default is that runtime.
+        with mock.patch.object(ha, "qwen_configured", lambda: True):
+            with mock.patch.dict(os.environ, {"TURMA_DEFAULT_RUNTIME": "qwen"}):
+                self.assertEqual(ha.default_runtime(), "qwen")
+        with mock.patch.object(ha, "dsh_configured", lambda: True):
+            with mock.patch.dict(os.environ, {"TURMA_DEFAULT_RUNTIME": "dsh"}):
+                self.assertEqual(ha.default_runtime(), "dsh")
+        # claude is always a valid explicit default.
+        with mock.patch.dict(os.environ, {"TURMA_DEFAULT_RUNTIME": "claude"}):
+            self.assertEqual(ha.default_runtime(), "claude")
+
+    def test_resolve_agent_type_applies_default_only_on_fresh_spawn(self):
+        # XERK-521 precedence, resolved in ONE place: an EXPLICIT choice always
+        # wins over the host default; a BLANK resolves to the default only when
+        # apply_default is set (the fresh-spawn path), and stays claude on every
+        # rebuild/resume path (apply_default False) so a resumed/migrated session
+        # keeps the runtime it already had.
+        with mock.patch.object(ha, "qwen_configured", lambda: True), \
+             mock.patch.dict(os.environ, {"TURMA_DEFAULT_RUNTIME": "qwen"}):
+            # Fresh spawn, no explicit type -> the host default.
+            self.assertEqual(ha.resolve_agent_type("", apply_default=True), "qwen")
+            self.assertEqual(ha.resolve_agent_type(None, apply_default=True), "qwen")
+            # Explicit claude pick beats the default.
+            self.assertEqual(ha.resolve_agent_type("claude", apply_default=True), "claude")
+            # Rebuild/resume path: a blank stored value stays claude, NOT the
+            # host default (a pre-field record must not adopt it).
+            self.assertEqual(ha.resolve_agent_type(""), "claude")
+            self.assertEqual(ha.resolve_agent_type(None), "claude")
+            # A stored qwen still resolves to qwen where the host offers it.
+            self.assertEqual(ha.resolve_agent_type("qwen"), "qwen")
+        # A default that fails self-validation resolves the fresh spawn to claude.
+        with mock.patch.object(ha, "qwen_configured", lambda: False), \
+             mock.patch.dict(os.environ, {"TURMA_DEFAULT_RUNTIME": "qwen"}):
+            self.assertEqual(ha.resolve_agent_type("", apply_default=True), "claude")
+
+    def test_default_runtime_rides_the_heartbeat_effective(self):
+        # The heartbeat carries the EFFECTIVE default (post-fallback), so it never
+        # advertises a runtime the host can't run.
+        sm = ha.SessionManager()
+        with mock.patch.object(ha, "qwen_configured", lambda: True), \
+             mock.patch.dict(os.environ, {"TURMA_DEFAULT_RUNTIME": "qwen"}):
+            self.assertEqual(ha.default_runtime(), "qwen")
+        with mock.patch.object(ha, "qwen_configured", lambda: False), \
+             mock.patch.dict(os.environ, {"TURMA_DEFAULT_RUNTIME": "qwen"}):
+            self.assertEqual(ha.default_runtime(), "claude")
+
     def test_perm_cycle_for(self):
         base = ["default", "acceptEdits", "plan"]
         # Base modes / blank / unknown launch -> base cycle only, no optionals.
