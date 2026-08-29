@@ -210,7 +210,9 @@ already reads. The reconciliation, and the two things a change must not undo:
 - **The native event log is NEVER counted; the projection is the single copy.** dsh's canonical log
   at `<slug>/<claudeSessionId>/dsh/` (XERK-469 [E]) is neither a top-level `*.jsonl` nor under
   `subagents/`, so `_project_transcripts` skips it — counting both would double a dsh session's
-  spend. Do not teach the walk to read `<sid>/dsh/`.
+  spend. Do not teach the walk to read `<sid>/dsh/`. **A qwen session's native log at
+  `<slug>/<claudeSessionId>/qwen/`** (XERK-512 [Qwen E]) is skipped for the SAME reason and must stay
+  skipped — its projection is the single counted copy; do not teach the walk to read `<sid>/qwen/`.
 - **Subscription limits and the probe are CLAUDE-SUBSCRIPTION only, and dsh does not feed them.** A
   dsh session has no 5h/7d window — its model is a local/DeepSeek route with no pool shared with
   claude.ai (D5) — so nothing dsh spends touches the `limits` block, and there is deliberately no dsh
@@ -246,11 +248,13 @@ confirmation plus the end-to-end test.** The two things a change must not undo:
   model row. This is the `<synthetic>` guard's job done at the projector. Tests:
   `TestQwenUsageReportEndToEnd`, `TestQwenProjectionAccounting`, `TestQwenUsageMapping`
   (`test_all_zero_usage_projects_no_usage_key`) in `test_qwen_transcript.py`.
-- **The native event log is NEVER counted; the projection is the single copy.** qwen's native log
-  lives under `QWEN_PROJECTS_ROOT` (`~/.qwen/projects/<slug>/chats/<id>.jsonl`), OUTSIDE the Claude
-  `PROJECTS_ROOT` tree `_project_transcripts` walks — so it can never be double-counted, and the
-  tail only appends the projection into `PROJECTS_ROOT`. (Unlike dsh's `<sid>/dsh/`, qwen's native
-  log is also NOT archived — [Qwen C]'s known gap — but that is orthogonal to counting.)
+- **The native event log is NEVER counted; the projection is the single copy.**
+  `_project_transcripts` counts only a slug's top-level `*.jsonl` (the projection the tail appends
+  into `PROJECTS_ROOT`) plus `subagents/**`. qwen's native log is in neither: it lives in qwen's own
+  home (`QWEN_PROJECTS_ROOT`, `~/.qwen/projects/<slug>/chats/<id>.jsonl`), and its raw ARCHIVE copy
+  ([Qwen E], XERK-512) is a sidecar at `<slug>/<sid>/qwen/chat.jsonl` — a raw sidecar like dsh's
+  `<sid>/dsh/`, which the usage walk does not read. So it can never be double-counted. Do not teach
+  the walk to read `<sid>/qwen/`.
 - **Subscription limits, the probe and the CARD stay Claude-only, and a qwen session never feeds
   them.** qwen has no 5h/7d window — its model is an OpenAI-compatible route with no pool shared with
   claude.ai — so nothing qwen spends touches `limits`, and `_start_summary` REFUSES a qwen session

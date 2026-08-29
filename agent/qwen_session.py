@@ -84,7 +84,7 @@ class QwenProjectionTail:
 
     def __init__(self, qwen_projects_root, transcript_path, session_id,
                  cwd=None, git_branch=None, log=None, resume=False,
-                 events_path=None):
+                 events_path=None, store_dir=None):
         self.qwen_projects_root = qwen_projects_root
         self.transcript_path = transcript_path
         self._log = log or _noop_log
@@ -108,6 +108,28 @@ class QwenProjectionTail:
         self._resume = resume
         self._offset = None            # None until the first pump primes it
         self._partial = b""
+        # RAW-archive mirror of qwen's native event log (XERK-512, [Qwen][E]).
+        # qwen writes its native log under its OWN home, which the raw archive
+        # layer does not reach; the tail copies its bytes, append-only, into
+        # `<store_dir>/chat.jsonl` (== `<slug>/<sid>/qwen/chat.jsonl`), which
+        # `_session_files` walks — so the canonical native log rides the raw
+        # layer with no new archive code. Independent of the PROJECTION cursor
+        # above: the mirror copies the WHOLE native log (the projection may skip
+        # history on resume to avoid doubling the transcript, but the mirror must
+        # be complete for metrics/retention), and its own byte count is the
+        # cursor, so a manager restart resumes the copy where it left off. None
+        # store_dir disables the mirror (kept optional for tests / older callers).
+        self._store_dir = store_dir
+        self._raw_path = (os.path.join(store_dir, "chat.jsonl")
+                          if store_dir else None)
+        self._raw_offset = None        # None until the first mirror primes it
+        # Set once the native log is seen to have SHRUNK under us (a rewrite —
+        # which append-only qwen --resume never does). Once frozen, the mirror is
+        # left exactly as-is for the rest of THIS tail's life: chasing a rewritten
+        # log by appending from a lowered offset would splice a diverged prefix
+        # onto the archived copy. A manager restart re-primes cleanly from the
+        # mirror's true size (self-heal), which is the only correct recovery.
+        self._raw_frozen = False
         self._stop = threading.Event()
         self._thread = None
         self._wake = threading.Event()
@@ -196,6 +218,11 @@ class QwenProjectionTail:
         events_path = self._resolve_events_path()
         if not events_path:
             return  # native log not written yet
+        # Mirror the native log into the raw-archive store FIRST — it is a pure
+        # byte copy on its own cursor, independent of whether there are new
+        # PROJECTION bytes below (a resumed tail's projection offset is at EOF,
+        # but the mirror still catches up any native bytes not yet copied).
+        self._mirror_native(events_path)
         try:
             size = os.path.getsize(events_path)
         except OSError:
@@ -238,6 +265,72 @@ class QwenProjectionTail:
             entries.extend(self._proj.feed(event))
         if entries:
             self._append(self.transcript_path, entries)
+
+    def _mirror_native(self, events_path):
+        """Copy qwen's native event log, byte for byte and append-only, into the
+        raw-archive store (`<slug>/<sid>/qwen/chat.jsonl`, XERK-512 [Qwen][E]) so
+        it rides the raw archive layer — the canonical record metrics read, kept
+        in full beside the lossy projection.
+
+        The mirror's own byte count is the cursor (primed lazily from the mirror
+        file's size on the first pump), so it is:
+          * complete — it copies the whole native log regardless of the
+            projection's resume-at-EOF skip; and
+          * self-healing across a manager restart / resume-on-boot ADOPT — the
+            new tail resumes the copy from the mirror's current size, catching up
+            every native byte written while the tail was dead (a superset of what
+            the projection can re-read without doubling the transcript).
+
+        Never raises (runs on the tail's own daemon thread, off the beat): any IO
+        error is logged and retried on the next poll. A `<store_dir>` of None
+        disables mirroring entirely."""
+        if not self._raw_path or self._raw_frozen:
+            return
+        try:
+            native_size = os.path.getsize(events_path)
+        except OSError:
+            return
+        if self._raw_offset is None:
+            # First pump: resume the copy from wherever the mirror left off, so a
+            # restart backfills every byte qwen wrote while the tail was down and
+            # a running session's mirror is never re-copied from zero.
+            try:
+                self._raw_offset = os.path.getsize(self._raw_path)
+            except OSError:
+                self._raw_offset = 0
+        if native_size < self._raw_offset:
+            # The native log was rewritten/truncated under us — the mirror holds
+            # the longer history, so NEVER truncate it to match (the same rule the
+            # raw archive draws for a source shorter than its cursor). FREEZE
+            # rather than lower the cursor: appending from a lowered offset if the
+            # log later regrows would splice a diverged prefix onto the archive.
+            # qwen --resume appends in place, so this is defensive/unreachable; a
+            # restart re-primes from the mirror's true size and resumes cleanly.
+            self._log("qwen native log shorter than its mirror; freezing the "
+                      "archived copy intact")
+            self._raw_frozen = True
+            return
+        if native_size == self._raw_offset:
+            return
+        try:
+            os.makedirs(self._store_dir, exist_ok=True)
+            copied = 0
+            with open(events_path, "rb") as src, \
+                    open(self._raw_path, "ab") as dst:
+                src.seek(self._raw_offset)
+                while True:
+                    # Bounded read: the one large-copy case is a pre-existing
+                    # native log with no mirror yet (a session that ran before
+                    # this shipped, then adopted) — chunk it so the backfill never
+                    # buffers the whole file.
+                    chunk = src.read(1 << 20)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    copied += len(chunk)
+            self._raw_offset += copied
+        except OSError as e:
+            self._log(f"qwen native log mirror failed: {e}")
 
     def _maybe_capture_title(self, event):
         """Best-effort tier-1 title capture (see _TITLE_EVENT_TYPES). A missing or

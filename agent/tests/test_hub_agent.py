@@ -18431,6 +18431,180 @@ class TestDshArchiveSync(TestArchiveSync):
         self.assertEqual(stored[native_rel], os.path.getsize(path))
 
 
+class TestQwenArchiveSync(TestArchiveSync):
+    """A qwen session archives with BOTH layers and no new archive code
+    (XERK-512, [Qwen][E]) — the qwen analogue of TestDshArchiveSync.
+
+    Same symmetry as dsh: the qwen->Claude-JSONL projection ([Qwen S1]) needs no
+    new READER because it is named `<slug>/<sid>.jsonl` like any transcript, and
+    the native event log needs no new WRITER in the archive because the tail
+    MIRRORS it under `<slug>/<sid>/qwen/` (QWEN_STORE_DIRNAME) like any raw
+    sidecar. These tests pin that a qwen-SHAPED session on disk — projection at
+    the top level, native event log under `<sid>/qwen/` — flows through the
+    existing manifest and both delta pushes unchanged. The session is built the
+    way [Qwen S1]'s own tests build one: from real qwen native events
+    (`qwen_corpus.json`) run through the real projector.
+    """
+
+    def _qt(self):
+        """Load the real qwen projector (agent/qwen_transcript.py), as [Qwen S1]'s
+        own test does — the projection under test is genuine qwen output, not a
+        hand-rolled JSONL fixture that could drift from the real shape."""
+        path = os.path.join(AGENT_DIR, "qwen_transcript.py")
+        spec = importlib.util.spec_from_file_location("qwen_transcript", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _qwen_events(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "qwen_corpus.json")) as f:
+            return json.load(f)
+
+    def _build_qwen_session(self, sm, wt="/w/.turma/worktrees/Turma/qwen1",
+                            sid="q1"):
+        """Lay a qwen session on disk the way the launcher's tail (XERK-509 +
+        XERK-512) leaves it:
+
+          <slug>/<sid>.jsonl         the S1 projection (rendered layer reads this)
+          <slug>/<sid>/qwen/chat.jsonl   the native log the tail MIRRORS (raw)
+
+        Returns (slug, native_rel, native_bytes)."""
+        qt = self._qt()
+        events = self._qwen_events()
+        # The projection — exactly what the tail appends to the transcript.
+        entries = qt.project_log(events, session_id=sid, cwd=wt)
+        slug = ha._project_slug(wt)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, sid + ".jsonl"),
+                    [json.dumps(e, ensure_ascii=False) for e in entries])
+        # The native event log — qwen's canonical record (D3), mirrored byte for
+        # byte into the raw store. Its bytes are the append-only event stream,
+        # which is what the raw layer's per-file cursor is built for.
+        native = b"".join(
+            (json.dumps(e, ensure_ascii=False) + "\n").encode() for e in events)
+        native_rel = os.path.join(sid, ha.QWEN_STORE_DIRNAME, "chat.jsonl")
+        self._nested(slug, sid,
+                     os.path.join(ha.QWEN_STORE_DIRNAME, "chat.jsonl"), native)
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm.closed = [{"id": "s", "worktreePath": wt, "summary": "qwen task",
+                      "createdAt": "2026-07-01T00:00:00Z"}]
+        return slug, native_rel, native
+
+    def test_the_store_dir_is_a_fixed_named_contract(self):
+        # The tail ([Qwen C]) and this layer must agree on ONE dir name, so a
+        # rename can't strand the native log outside the archive silently.
+        self.assertEqual(ha.QWEN_STORE_DIRNAME, "qwen")
+
+    def test_a_qwen_session_appears_in_the_manifest_with_both_layers(self):
+        sm = self.make_manager()
+        slug, native_rel, _ = self._build_qwen_session(sm)
+        manifest = sm._archive_manifest()
+        self.assertEqual(len(manifest), 1)
+        m = manifest[0]
+        # RENDERED: the projection is the transcript the manifest enumerates.
+        self.assertEqual(m["transcriptId"], "q1")
+        self.assertEqual(m["repo"], "Turma")
+        self.assertGreater(m["size"], 0)
+        # RAW: the native event log rides as a sidecar, no special case.
+        rels = [rel for rel, _s in (m["rawFiles"] or [])]
+        self.assertIn("q1.jsonl", rels)
+        self.assertIn(native_rel, rels)
+
+    def test_session_files_lists_the_native_qwen_log(self):
+        sm = self.make_manager()
+        slug, native_rel, native = self._build_qwen_session(sm)
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        sizes = dict(sm._session_files(proj, "q1"))
+        self.assertIn(native_rel, sizes)
+        self.assertEqual(sizes[native_rel], len(native))
+        # Everything the raw layer offers is under the project-slug SESSION tree
+        # (`<sid>.jsonl` or `<sid>/...`) — never the worktree (the raw layer
+        # excludes it), which is exactly why the tail mirrors here.
+        for rel in sizes:
+            self.assertTrue(rel == "q1.jsonl" or rel.startswith("q1" + os.sep),
+                            rel)
+
+    def test_the_rendered_layer_ships_the_projection(self):
+        sm = self.make_manager()
+        self._build_qwen_session(sm)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed = []
+
+        def fake_chunk(tid, body):
+            pushed.append((tid, body.get("startOffset"), body.get("endOffset")))
+            return {"bytesStored": body.get("endOffset")}
+
+        with mock.patch.object(sm, "_post_archive_chunk", fake_chunk):
+            sm._archive_deltas({})
+        self.assertTrue(pushed, "the qwen projection ships through the rendered layer")
+        self.assertEqual({t for t, _s, _e in pushed}, {"q1"})
+
+    def test_the_raw_layer_ships_the_native_log_byte_for_byte(self):
+        sm = self.make_manager()
+        slug, native_rel, native = self._build_qwen_session(sm)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        stored = {}
+        pushed = []
+
+        def fake_post(tid, rel, start, raw):
+            pushed.append((tid, rel, start, raw))
+            if start != stored.get(rel, 0):
+                return {"stored": stored.get(rel, 0)}
+            stored[rel] = start + len(raw)
+            return {"stored": stored[rel]}
+
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({})
+        got = {rel: b"".join(r for _t, rl, _s, r in pushed if rl == rel)
+               for _t, rel, _s, _r in pushed}
+        # The native event log went up byte-for-byte, not a rendering of it —
+        # this is D3's canonical record, kept in full for metrics/retention.
+        self.assertIn(native_rel, got)
+        self.assertEqual(got[native_rel], native)
+
+    def test_a_resumed_qwen_log_ships_only_the_appended_bytes(self):
+        # The tail mirrors the native log append-only into the SAME file across a
+        # resume, so the raw layer's per-file cursor ships only the tail, exactly
+        # as for a resumed Claude/dsh transcript.
+        sm = self.make_manager()
+        slug, native_rel, native = self._build_qwen_session(sm)
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        path = os.path.join(proj, native_rel)
+        first = os.path.getsize(path)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        stored = {}
+        pushed = []
+
+        def fake_post(tid, rel, start, raw):
+            pushed.append((rel, start, len(raw)))
+            if start != stored.get(rel, 0):
+                return {"stored": stored.get(rel, 0)}
+            stored[rel] = start + len(raw)
+            return {"stored": stored[rel]}
+
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({})
+        self.assertEqual(stored[native_rel], first)
+
+        # Resume: append one more native event line, re-manifest, sync with the
+        # hub's cursor at `first`. Only the appended bytes go up.
+        with open(path, "ab") as f:
+            f.write(json.dumps({"type": "user", "uuid": "z9",
+                                "message": {"role": "user",
+                                "parts": [{"text": "again"}]}}).encode() + b"\n")
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed.clear()
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({"q1": {native_rel: first}})
+        tail = [p for p in pushed if p[0] == native_rel]
+        self.assertEqual(len(tail), 1)
+        self.assertEqual(tail[0][1], first)  # started at the old EOF, not 0
+        self.assertEqual(stored[native_rel], os.path.getsize(path))
+
+
 class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
     """The archive's SendUserFile payload budget (XERK-267): the previews are
     bounded per delivery but unbounded relative to the transcript, so a
