@@ -464,11 +464,8 @@ where the dsh [I] board detail's twin belongs), whose `paths:` load for the boar
 
 ## [Qwen J] (XERK-517) shipped: background-agent rows + subagentHistory
 
-Delegation, the dsh [J] analogue, lives in **`.claude/rules/qwen-delegation.md`** (split out for the
-size cap). The load-bearing point: qwen's delegation is a near-Claude `Agent` launch, so the
-projector RESHAPES it rather than synthesizing — `agent`→`Agent`, `task_execution`→`async_launched`,
-the STOP edge already an exact `<task-notification>`, each child's own log projected into the Claude
-`subagents/` layout — so the existing readers and usage/archive/migration walks read it unchanged.
+Delegation lives in **`.claude/rules/qwen-delegation.md`**. qwen's `Agent` launch reshapes to
+`Agent`/`async_launched`/`<task-notification>` — readers/usage/archive/migration unchanged.
 
 ## [Qwen K] (XERK-516) shipped: session migration + resume
 
@@ -478,3 +475,7 @@ Session migration + resume for a qwen session (the dsh [K] analogue) lives in
 The load-bearing point: qwen is Claude-shaped, so its NATIVE LOG *is* the store `qwen --resume`
 reloads from (no separate store like dsh's `DSH_SESSIONS_ROOT`) — a migration carries that log under
 `.qwen-store/`, places it at the target cwd's slug and re-keys its per-row `cwd`.
+
+## [Qwen P] (XERK-522) shipped: permission-mode parity
+
+No mode name in qwen's footer → `_set_mode_blind`. Tests: `test_qwen_footer_returns_none`.
