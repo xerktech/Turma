@@ -2434,6 +2434,72 @@ class TestDshLivenessSeam(unittest.TestCase):
         self.assertNotIn("s1", sm.dsh_status)
 
 
+class TestQwenLivenessInReport(ProjectDirMixin, unittest.TestCase):
+    """XERK-511 [Qwen D]: the read-side state of a qwen session. Unlike dsh [D]
+    (headless, paneBusy from the control socket), a qwen session has a REAL pane,
+    so paneBusy/modeActual/panePrompt come from the SAME `_pane_status` scrape a
+    Claude session uses — no dsh cache, no agentType branch. Everything else in
+    the report is transcript-derived from the [Qwen S1] projection, exactly like
+    Claude. This mirrors TestDshLivenessInReport but asserts the PANE PATH — so
+    sessionWorking, liveState, the readyForReview mirrors and the ready-for-review
+    alert read a qwen session with no change and cannot drift."""
+
+    def _txn(self, role, text, tool_use=False):
+        content = [{"type": "text", "text": text}]
+        if tool_use:
+            content.append({"type": "tool_use", "name": "Bash",
+                            "input": {"command": "ls"}})
+        return {"type": role, "message": {"role": role, "content": content}}
+
+    def test_qwen_busy_comes_from_the_pane_not_the_dsh_cache(self):
+        # A qwen session scrapes its pane like Claude. Pass a dsh_status alongside
+        # agent_type="qwen" and assert it is IGNORED: the branch keys on exactly
+        # "dsh", so a stray cache entry can never source a qwen session's liveness.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self._txn("assistant", "done")])
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(True, "plan", None)) as ps:
+            rep = ha.session_report(self.WORKDIR, {}, "agent-qwen",
+                                    agent_type="qwen",
+                                    dsh_status={"status": "idle"})
+        ps.assert_called_once()
+        self.assertIs(rep["paneBusy"], True)
+        self.assertEqual(rep["modeActual"], "plan")
+        # Transcript-derived ready inputs populate from the projection, exactly as
+        # for Claude — this is what makes readyForReview's finished-turn branch
+        # work unchanged for a qwen session.
+        self.assertEqual(rep["lastRole"], "assistant")
+        self.assertIs(rep["lastHasToolUse"], False)
+        self.assertIsNotNone(rep["transcriptAgeSec"])
+
+    def test_qwen_pane_prompt_and_idle_ride_the_pane(self):
+        # A blocking approval dialog and an idle turn both come off the pane for a
+        # qwen session; panePrompt is what makes a blocked qwen read ready-for-
+        # review (waiting on a human) rather than idle.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self._txn("assistant", "hi")])
+        prompt = {"prompt": "Allow Bash?", "options": ["Yes", "No"]}
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, None, prompt)):
+            rep = ha.session_report(self.WORKDIR, {}, "agent-qwen",
+                                    agent_type="qwen")
+        self.assertIs(rep["paneBusy"], False)
+        self.assertEqual(rep["panePrompt"], prompt)
+
+    def test_qwen_last_tool_use_rides_the_projected_transcript(self):
+        # lastHasToolUse is read from the projected JSONL (the run_shell_command ->
+        # Bash map is [Qwen S1]'s job), not the pane — a finished tool turn must
+        # keep the session OUT of readyForReview's finished-turn branch.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self._txn("assistant", "running", tool_use=True)])
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, None, None)):
+            rep = ha.session_report(self.WORKDIR, {}, "agent-qwen",
+                                    agent_type="qwen")
+        self.assertEqual(rep["lastRole"], "assistant")
+        self.assertIs(rep["lastHasToolUse"], True)
+
+
 class TestStablePaneBusy(unittest.TestCase):
     """_stable_pane_busy suppresses the busy->idle flicker a single mid-repaint
     capture would otherwise cause: a busy read is instant, an idle read is
@@ -24221,6 +24287,46 @@ class TestQwenSessionArms(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["summary"], "Generated Qwen Title")
         self.assertNotIn("summaryProvisional", sess)
         one_shot.assert_not_called()  # a native title needs no one-shot
+
+    def test_seed_qwen_summary_never_clobbers_a_non_provisional_name(self):
+        # XERK-511 [Qwen D]: the override is scoped to the seeder's OWN provisional
+        # name. A ticket/migrated name (summary set, summaryProvisional unset) is
+        # left ALONE even when a native title is available and even though the
+        # first prompt would otherwise seed a name — matching the Claude ticket-
+        # naming contract. No one-shot is spent on an already-named session.
+        sm = self.make_manager()
+        wd = "/w/.turma/worktrees/Turma/q3"
+        self._qwen_transcript(wd, "some prompt")
+        sess = {"id": "q3", "status": "running", "agentType": "qwen",
+                "worktreePath": wd, "claudeSessionId": "qsid",
+                "summary": "XERK-511 read-side semantics"}  # a ticket name
+        sm.registry = [sess]
+        sm.qwen_tails["q3"] = types.SimpleNamespace(
+            title=lambda: "Generated Qwen Title", title_final=lambda: True)
+        with mock.patch.object(ha, "QWEN_MODEL", "qwen3-coder"), \
+             mock.patch.object(ha, "QWEN_MODEL_BASE_URL", "https://gw/v1"), \
+             mock.patch.object(sm, "_start_qwen_summary") as one_shot:
+            sm._seed_summaries()
+        self.assertEqual(sess["summary"], "XERK-511 read-side semantics")
+        self.assertNotIn("summaryProvisional", sess)
+        one_shot.assert_not_called()
+
+    def test_seed_qwen_summary_never_clobbers_a_manual_rename(self):
+        # An operator rename (summaryManual) outranks every tier, including a
+        # native title — a hand-set name is final on any runtime.
+        sm = self.make_manager()
+        wd = "/w/.turma/worktrees/Turma/q4"
+        self._qwen_transcript(wd, "some prompt")
+        sess = {"id": "q4", "status": "running", "agentType": "qwen",
+                "worktreePath": wd, "claudeSessionId": "qsid",
+                "summary": "My Own Name", "summaryManual": True}
+        sm.registry = [sess]
+        sm.qwen_tails["q4"] = types.SimpleNamespace(
+            title=lambda: "Generated Qwen Title", title_final=lambda: True)
+        with mock.patch.object(sm, "_start_qwen_summary") as one_shot:
+            sm._seed_summaries()
+        self.assertEqual(sess["summary"], "My Own Name")
+        one_shot.assert_not_called()
 
     def test_start_qwen_summary_uses_qwen_binary_not_claude(self):
         sm = self.make_manager()
