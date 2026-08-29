@@ -345,3 +345,33 @@ subscription `limits`/probe/card stay Claude-only) lives in **`.claude/rules/age
   projector's output through `repo_usage_report`/`_aggregate_project` on disk, proving host + per-repo
   totals and the local/OpenAI-compat per-model breakdown; `TestQwenProjectionAccounting`/
   `TestQwenUsageMapping` cover the layer below. All in `test_qwen_transcript.py`.
+
+## [Qwen H] (XERK-514) shipped: PR/MR chips, ledgers & attribution
+
+D4's "PR chips work with no new code" for qwen, the dsh [H] (XERK-472) analogue — a qwen session that
+opens a PR gets the same chips, ledgers, attribution and comment/conflict delivery as a Claude one,
+with NO `agentType` branch on the PR path. The symmetry is [Qwen S1]'s: the projection needs no new
+reader, so the whole PR web reads a qwen transcript unchanged. **[Qwen H] added NO PR code** — it is
+verification plus the mirror test. The mechanics live in `.claude/rules/agent-prs.md` ("qwen
+sessions" section); the invariants a change must not undo:
+
+- **The load-bearing dependency is [Qwen S1]'s `run_shell_command`->`Bash` name map**: `_scan_pr_line`
+  attributes only a `Bash` tool_use, and qwen's shell tool registers as `run_shell_command`, so the
+  map is what makes `gh pr create` chip. Same narrowness as Claude/dsh (a PR opened via
+  `cordis_run`/`ralph` or the raw GitLab API gets none). **Widen only by teaching `_scan_pr_line`
+  another creation event, never by loosening the Bash-name gate.**
+- **Comment/conflict nudges route through `notify_session` → the PANE — the ONE difference from dsh
+  [H].** dsh is headless and nudges over its control socket (`_dsh_notify`); a qwen session is an
+  interactive TUI that writes no `~/.claude/sessions/<pid>.json`, so `notify_session` finds no inbox
+  and falls back to `send_input`'s pane path exactly as a Claude session with no inbox does. Neither
+  `send_input` nor `notify_session` carries a qwen arm ([Qwen C]) — never add one. `refresh_pr_status`
+  stays the same inline offender for ALL runtimes (XERK-397's scope, not widened here).
+- **Chips survive a qwen resume/migration** via `_seed_prs` over the projected `<tid>.jsonl` (the
+  top-level transcript migration packs), independent of the raw native-log sidecar `<tid>/qwen/`
+  ([Qwen E]).
+- Tests: `TestQwenPrAttribution` in `test_hub_agent.py` drives the REAL qwen projector over
+  `agent/tests/qwen_pr_corpus.json` — a corpus carrying a `gh pr create`, cloned from the captured
+  Qwen 0.22.2 event SHAPES (`qwen_pr_corpus_gen.mjs`) because [Qwen G0]'s two real sessions had their
+  shell tool guard-denied and so carry no successful shell run. It proves attribution, the live
+  per-beat scan, `_seed_prs` + the durable ledger, `refresh_pr_status` + GitLab/ADO dispatch, and the
+  PANE-delivered comment/conflict nudges — the G1 no-mock lesson, mirroring `TestDshPrAttribution`.
