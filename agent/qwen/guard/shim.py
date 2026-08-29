@@ -129,8 +129,13 @@ def classify(name, args):
     n = str(name or "").lower()
     if not isinstance(args, dict):
         args = {}
-    if _SHELL_NAME_RE.search(n) and isinstance(args.get("command"), str):
-        return ("shell", args["command"])
+    if _SHELL_NAME_RE.search(n):
+        # A shell-named tool is ALWAYS the shell surface, whatever `command`'s
+        # type. `decide` fails CLOSED if it is not an inspectable string — a
+        # non-string command (a list/dict/number the model emitted) is one the
+        # shared guard.py cannot classify, and for a shell tool the guard script
+        # is the ONLY protection, so it must never fall through to allow.
+        return ("shell", args.get("command"))
     if n in _FS_WRITE_TOOLS:
         return ("write", _target_paths(args))
     if n in _FS_READ_TOOLS:
@@ -276,6 +281,14 @@ def decide(event, cfg):
             raise _FailClosed(
                 "Turma qwen safety guard: no shell guard script configured. "
                 "Denying by default.")
+        if not isinstance(payload, str):
+            # A shell tool whose `command` is not a string cannot be inspected by
+            # guard.py, and shell has no glob backstop (it walks past the path
+            # rules, XERK-309), so a non-string command MUST fail closed rather
+            # than read as "other" and allow.
+            raise _FailClosed(
+                "Turma qwen safety guard: a shell tool was called with a "
+                "non-string command that cannot be inspected. Denying by default.")
         return _run_hook(cfg, cfg["guardScript"], "Bash",
                          {"command": payload}, cwd, session_id)
 

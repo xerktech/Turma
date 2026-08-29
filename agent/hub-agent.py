@@ -2655,9 +2655,16 @@ _GUARD_DENY_PATH_RULES = [
     "Edit(~/.turma/peers.tsv)",
     # The qwen safety-guard shim config (XERK-510 [Qwen F]) — it holds the hook
     # script paths and the credential/runtime-code globs the qwen PreToolUse shim
-    # enforces, so a session that rewrote it could disable its own guard, exactly
-    # like guard-settings.json above. Adding it HERE is the shared-list contract
-    # the ticket names: it covers all three runtimes with no qwen-specific change.
+    # enforces, so a session that rewrote it could disable its own guard. Adding
+    # it HERE is the shared-list contract the ticket names: it covers all three
+    # runtimes with no qwen-specific change. This is DEFENCE IN DEPTH against the
+    # file-editing tools only — Bash walks past every deny pattern (XERK-309), so
+    # `echo {} > ~/.turma/qwen-guard.json` is NOT stopped by this, exactly as
+    # `echo > guard.py` is not stopped for the Claude guard (the guard defends
+    # against the MODEL, not a hostile same-uid shell). It is a weaker backstop
+    # than guard-settings.json's: the shim RE-READS this file on every tool call,
+    # where guard-settings.json is read once at claude launch and a restart
+    # repairs a tamper — so a repoint here takes effect immediately and persists.
     "Edit(~/.turma/qwen-guard.json)",
     # The qwen per-session model-credential env file (XERK-509 [Qwen B],
     # ~/.turma/qwen/<sid>.env) holds OPENAI_API_KEY. Read-denied as defence in

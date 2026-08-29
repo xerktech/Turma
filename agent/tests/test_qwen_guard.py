@@ -184,6 +184,15 @@ class TestQwenGuardShimEndToEnd(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIsNone(reason)
 
+    def test_shell_with_a_non_string_command_fails_closed(self):
+        # A shell tool whose `command` is a list/dict/number cannot be inspected
+        # by guard.py; it MUST fail closed, never fall through to allow (a QA
+        # finding — the shell branch has no glob backstop).
+        for bad in ([" rm", "-rf", "/"], {"x": 1}, 42, True, None):
+            rc, reason = self._run(self._ev("run_shell_command", {"command": bad}))
+            self.assertEqual(rc, 2, f"non-string command {bad!r} must fail closed")
+            self.assertIsNotNone(reason, bad)
+
     # --- writes (fileguard.py + the credential globs) ---
     def test_write_to_ssh_is_denied(self):
         rc, reason = self._run(self._ev("write_file", {

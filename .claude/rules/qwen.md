@@ -310,6 +310,13 @@ shelled out to `python3 -SsE <hook>` exactly as Claude and dsh do. Invariants a 
   - **The flat globs match an expanduser'd (not realpath'd) prefix against a realpath'd target**, so a
     symlinked HOME could dodge a credential glob — the SAME accepted limitation the dsh guard has;
     `fileguard.py` realpaths its ~/.claude base, so the ~/.claude predicate holds regardless.
+  - **The shim RE-READS `~/.turma/qwen-guard.json` every call, and a Bash redirect walks past its
+    Edit-deny** (XERK-309) — so a `run_shell_command` that overwrites it could repoint `guardScript`
+    and self-bypass. This is NOT net-new: `guard.py` equally allows `echo > guard.py` for the Claude
+    guard (the guard defends against the MODEL, not a hostile same-uid shell), and deriving the
+    script paths from the shim's own location does not close it either (Bash can overwrite guard.py
+    directly). It is a weaker backstop than guard-settings.json's, which claude reads once at launch
+    (restart-repairable) — the deny-rule comment in `_GUARD_DENY_PATH_RULES` states this.
 - Tests: `test_qwen_guard.py` — `TestBuildQwenGuardConfig` pins the config (hook wiring, the
   ms-timeout ordering, the shared-rule-set derivation, the credential read-deny, no-ListAgents,
   missing-fileguard degrade) and `TestQwenGuardShimEndToEnd` drives the REAL shim over the REAL
