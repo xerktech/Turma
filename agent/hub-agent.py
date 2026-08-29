@@ -7826,6 +7826,14 @@ PANE_PROMPT_OPTION_RE = re.compile(r"^\s*([❯›]\s+)?(\d+)\.\s+(\S.*?)\s*$")
 # run says "not a blocking dialog" — a qwen approval dialog REPLACES the footer
 # with "Waiting for user confirmation…" (G0), so a real dialog shows none.
 QWEN_PANE_FOOTER_RE = re.compile(r"Ask permissions \(shift \+ tab to cycle\)")
+# A trailing right-edge SCROLLBAR column + its padding (XERK-509 [Qwen C]): the
+# block-element family (█ and eighths/shades, U+2588-258F / U+2591-2593), the
+# right-block glyphs (▐ ▕) and light/heavy vertical bars (│ ┃), any run of them
+# and whitespace at end of line. Deliberately EXCLUDES the horizontal rule glyphs
+# (─ ━ etc) so a real rule/detail line is untouched. Stripped per line in
+# parse_pane_prompt so qwen's scrolled-pane scrollbar can't hide a live dialog.
+_PANE_SCROLLBAR_RE = re.compile(
+    r"[\s█-▏░-▓▐▕│┃]+$")
 # A box/rule line the TUI draws between sections. The dialog's context is the
 # nearest block ABOVE the question fenced by these, which is why they are
 # skipped before the block and end it after: a permission dialog's block sits
@@ -7852,7 +7860,18 @@ def parse_pane_prompt(cap):
     dialog still scrolled on screen can't shadow the live one."""
     if not cap:
         return None
-    lines = cap.splitlines()
+    # Strip a right-edge SCROLLBAR column before parsing (XERK-509 [Qwen C]):
+    # qwen's TUI draws a vertical scrollbar glyph (█ and the partial-block /
+    # vertical-bar family) at the far right of EVERY line of a scrolled
+    # conversation, separated from the text by padding spaces (real capture:
+    # docs/qwen-g0/pane/03-tool-approval.txt). That makes "Apply this change?"
+    # end in "█" not "?", and a blank separator line strip to "█" not "" — so
+    # without this the question `endswith("?")` and the blank-skip both fail and a
+    # real qwen approval dialog is missed. Claude panes carry no such column, so
+    # this only ever removes trailing whitespace there (a no-op — every check
+    # below already .strip()s). NOT the horizontal rule glyphs (─━ etc), which a
+    # legitimate rule/detail line is made of.
+    lines = [_PANE_SCROLLBAR_RE.sub("", l) for l in cap.splitlines()]
     # A mode footer anywhere below means the composer is live -> no dialog.
     for i in range(len(lines) - 1, -1, -1):
         line = lines[i]

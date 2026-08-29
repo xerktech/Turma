@@ -202,7 +202,13 @@ socket. The ONE net-new module is the projection tail. Invariants a change must 
     numbered run means "not a dialog". `answer_pane_prompt` types the digit AND **Enter for a qwen
     session** (G0: `1`+Enter; Claude submits on the digit alone). Under the launcher's
     `approvalMode:"auto"` these prompts are largely suppressed; the parser is parity + future
-    permission-mode work ([Qwen P]).
+    permission-mode work ([Qwen P]). **Pitfall: qwen draws a right-edge SCROLLBAR
+    glyph (`█` + the block/vertical-bar family) on every line of a SCROLLED pane**
+    (real capture `docs/qwen-g0/pane/03-tool-approval.txt`), so the question line
+    ends in `█` not `?` and the "blank" separator lines strip to `█` not `""` —
+    `parse_pane_prompt` strips that trailing column (`_PANE_SCROLLBAR_RE`) per line
+    or a real approval dialog is missed. Pin pane parsers against the REAL captured
+    frame, not a hand-cleaned copy (the cleaned copy hid this — a QA catch).
   - **(2) A STRUCTURED question renders the SAME multi-select card a Claude session shows** — NOT a
     yes/no approval. Qwen has NO native AskUserQuestion tool (G0), so `_qwen_settings` REGISTERS one
     via MCP: `mcpServers."turma-ask"` runs `python3 -SsE agent/qwen/ask_mcp.py`, a stdlib stdio

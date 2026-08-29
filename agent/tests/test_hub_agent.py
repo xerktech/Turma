@@ -24062,48 +24062,43 @@ class TestRestartAgent(ManagerMixin, unittest.TestCase):
         self.assertEqual(popen.call_args.args[0], [ctl, "restart"])
 
 
-QWEN_BUSY_PANE = (
-    "  ∴ Thinking… 1s\n"
-    "  .. Polishing the algorithms for a faster response... "
-    "(1s · ↑ 106 tokens · esc to cancel)\n"
-    ">   Type your message or @path/to/file\n"
-    "  ✜ wt · git:(master) · qwen3-coder · 262.1k Context 8% used\n"
-    "  Enter to steer · Ctrl+Q to queue · ⏸ Ask permissions (shift + tab to cycle)\n"
-)
 QWEN_IDLE_PANE = (
     "  ● The exact text I wrote was HELLO_QWEN.\n"
     "  > tell me what you wrote\n"
     "  ✜ wt · git:(master) · qwen3-coder · 262.1k Context 8% used\n"
     "  ⏸ Ask permissions (shift + tab to cycle)\n"
 )
-QWEN_APPROVAL_PANE = (
-    "  ∴ Thought for 4s (click or ctrl+o to expand)\n"
-    "  ? WriteFile Writing to notes.txt ←\n"
-    "\n"
-    "   1 SPIKE_NOTE_2\n"
-    "\n"
-    "   Apply this change?\n"
-    "\n"
-    "   › 1. Yes, allow once\n"
-    "     2. Yes, allow always\n"
-    "     3. No, suggest changes (esc)\n"
-    "\n"
-    "   Waiting for user confirmation...\n"
-)
+
+
+def _qwen_pane_frame(name):
+    """A REAL captured qwen TUI frame from the G0 spike (docs/qwen-g0/pane/). Used
+    instead of a hand-cleaned copy so the parsers are pinned against exactly what
+    qwen renders — including its right-edge scrollbar column, which a cleaned copy
+    strips (the escape that hid the parse_pane_prompt bug QA caught)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "..", "..", "docs", "qwen-g0", "pane", f"{name}.txt")
+    with open(path, encoding="utf-8") as f:
+        return f.read()
 
 
 class TestQwenSessionArms(ManagerMixin, unittest.TestCase):
     """XERK-509 [Qwen C]: the pane-driven read/HITL/naming arms of a qwen session
     — the busy markers, the approval-dialog parse, digit+Enter answering, the ask
-    MCP registration, naming without claude -p, and tail teardown."""
+    MCP registration, naming without claude -p, and tail teardown. The pane
+    parsers are driven against the REAL captured G0 frames (not cleaned copies)."""
 
     # --- liveness: qwen busy markers (unioned, qwen-exclusive) ---------------
 
     def test_qwen_busy_pane_reads_busy(self):
-        self.assertTrue(ha._busy_from_capture(QWEN_BUSY_PANE))
+        # Real busy frames: the streaming spinner (02) and a tool run (04).
+        self.assertTrue(ha._busy_from_capture(_qwen_pane_frame("02-busy")))
+        self.assertTrue(ha._busy_from_capture(_qwen_pane_frame("04-hard-deny")))
 
     def test_qwen_idle_pane_reads_idle(self):
-        self.assertFalse(ha._busy_from_capture(QWEN_IDLE_PANE))
+        # Real idle frame, and the approval frame (blocked on a human, not the
+        # model's own turn) must read idle like a Claude panePrompt.
+        self.assertFalse(ha._busy_from_capture(_qwen_pane_frame("01-idle")))
+        self.assertFalse(ha._busy_from_capture(_qwen_pane_frame("03-tool-approval")))
 
     def test_qwen_markers_do_not_fire_on_a_claude_permission_dialog(self):
         # Claude's own permission dialog footer says "Esc to cancel · Tab to
@@ -24114,13 +24109,22 @@ class TestQwenSessionArms(ManagerMixin, unittest.TestCase):
 
     # --- HITL input 1: the qwen approval prompt off the pane -----------------
 
-    def test_qwen_approval_prompt_parses_with_the_angle_cursor(self):
-        prompt = ha.parse_pane_prompt(QWEN_APPROVAL_PANE)
+    def test_qwen_approval_prompt_parses_from_the_real_frame(self):
+        # Drives the REAL 03-tool-approval capture, scrollbar column and all —
+        # the cleaned copy hid that qwen's "█" right-edge scrollbar made the
+        # question line not end in "?" and the separator lines not blank.
+        prompt = ha.parse_pane_prompt(_qwen_pane_frame("03-tool-approval"))
         self.assertIsNotNone(prompt)
         self.assertEqual(prompt["prompt"], "Apply this change?")
         self.assertEqual([o["number"] for o in prompt["options"]], [1, 2, 3])
         selected = [o for o in prompt["options"] if o["selected"]]
         self.assertEqual([o["number"] for o in selected], [1])
+        # The scrollbar is stripped from the labels too (not carried as junk).
+        self.assertEqual(prompt["options"][0]["label"], "Yes, allow once")
+
+    def test_real_qwen_idle_and_busy_frames_are_never_a_dialog(self):
+        for name in ("01-idle", "02-busy", "04-hard-deny"):
+            self.assertIsNone(ha.parse_pane_prompt(_qwen_pane_frame(name)), name)
 
     def test_qwen_idle_footer_is_never_a_dialog(self):
         # A qwen composer footer below a numbered list means "not blocking".
@@ -24134,7 +24138,8 @@ class TestQwenSessionArms(ManagerMixin, unittest.TestCase):
         sess = {"id": "q1", "status": "running", "tmuxName": "agent-q1",
                 "agentType": "qwen"}
         sm.registry = [sess]
-        with mock.patch.object(ha, "_capture_pane", return_value=QWEN_APPROVAL_PANE):
+        with mock.patch.object(ha, "_capture_pane",
+                               return_value=_qwen_pane_frame("03-tool-approval")):
             sm.answer_pane_prompt("q1", 1)
         sends = [c for c in self.run_calls if c[:2] == ["tmux", "send-keys"]]
         self.assertEqual(sends[-2][-1], "1")
