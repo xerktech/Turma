@@ -189,8 +189,21 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   auto-started/unpinned ticket session, and a bare "+ New session" whose Runtime dropdown was never
   touched. One of `{claude,dsh,qwen}`; UNSET → claude, so every current host is byte-for-byte
   unchanged. Resolved in ONE place agent-side (`resolve_agent_type` / `default_runtime`), so no
-  spawn route diverges — precedence is `explicit agentType (composer pick OR per-ticket pin) →
-  TURMA_DEFAULT_RUNTIME → claude`.
+  spawn route diverges — precedence is `explicit agentType → TURMA_DEFAULT_RUNTIME → claude`, where
+  an EXPLICIT choice is a NON-BLANK `agentType` on the spawn command, applied via `apply_default=True`
+  on the fresh-spawn call only. A blank agentType is what resolves to the default.
+  - **"Explicit claude" must SEND `agentType:"claude"`, or it reads as unpinned.** A composer "Claude
+    Code"/"Claude Code Local" pick omitted `agentType` (the bare fast path); on a non-claude-default
+    host that omission would resolve to the host default, so `sessions.html` now sends an explicit
+    `agentType:"claude"` for a claude/local pick WHEN the host default is non-claude (byte-for-byte
+    unchanged on every claude-default host).
+  - **KNOWN GAP — a per-ticket CLAUDE pin does NOT yet override a non-claude host default.** The
+    board Runtime row treats `{runtime:"claude"}` as RELEASE (drops the pin), so a claude-pinned
+    ticket carries no `agentType` and adopts the host default — unlike a dsh/qwen pin, which stores +
+    forwards its `agentType` and DOES override. Closing it needs the Runtime picker to distinguish
+    "Auto — host default" from a pinned "Claude Code" across `board.js` + its vendored `board.cjs` +
+    `Board.kt` + glasses (a UX/design change), so it is a follow-up rather than part of this change.
+    Latent today (dsh/qwen ship behind their kill switches, so no host has a non-claude default yet).
   - **Self-validating / fail-safe**, the same half-config discipline as `local_model_configured`: it
     is checked against THIS host's own capability (`dsh_configured`/`qwen_configured`), so a host
     that sets `qwen` but has not configured Qwen falls back to claude and SAYS so (log + the

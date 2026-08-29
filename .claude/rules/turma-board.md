@@ -314,6 +314,14 @@ the Start button AND the auto-start sweep.
   `.claude/rules/dsh.md`'s **[I] (XERK-473)**; this row is the home for the **qwen twin ([Qwen I],
   XERK-515)**, to which `.claude/rules/qwen.md`'s [Qwen I] pointer refers — the qwen board mechanics
   are the bullets below rather than a second copy in that file.
+  - **KNOWN GAP with the per-host default (XERK-521): a `{runtime:"claude"}` release does NOT force
+    claude when a host DEFAULTS to a non-claude runtime.** The pin is dropped, so the spawnTicket
+    command carries no `agentType` and the claiming host applies its own `TURMA_DEFAULT_RUNTIME` —
+    which may be dsh/qwen. A dsh/qwen pin overrides (it stores + forwards `agentType`); only the
+    claude case is release-not-pin, so it cannot beat a non-claude default. Closing it means the
+    picker distinguishing "Auto — host default" from a pinned "Claude Code" across this file's four
+    mirrors (`board.js` + vendored `board.cjs` + `Board.kt` + glasses) — a UX change deferred to a
+    follow-up. Latent today (dsh/qwen behind their kill switches, so no host has a non-claude default).
 - **A non-default runtime is offered only when the org offers it** (`site.dshAvailable`/
   `site.qwenAvailable`, from any reporting host's `dsh.available`/`qwen.available` via `mergeSites`
   — `orgOffersQwen` is the hub gate, the `orgOffersDsh` twin), so the picker can't name a runtime the
