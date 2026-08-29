@@ -13179,6 +13179,19 @@ class TestParsePaneMode(unittest.TestCase):
         self.assertIsNone(ha.parse_pane_mode(None))
         self.assertIsNone(ha.parse_pane_mode("❯ \n  ? for shortcuts"))
 
+    def test_qwen_footer_returns_none(self):
+        """Qwen's footer shows no mode name, only 'Ask permissions (shift + tab
+        to cycle)' — so parse_pane_mode correctly returns None, and set_mode
+        falls back to _set_mode_blind (computed presses)."""
+        # From docs/qwen-g0/pane/01-idle.txt line 55 — qwen's idle footer
+        qwen_idle = "❯ \n  ⏸ Ask permissions (shift + tab to cycle)"
+        self.assertIsNone(ha.parse_pane_mode(qwen_idle))
+
+        # From docs/qwen-g0/pane/02-busy.txt line 55 — qwen's busy footer
+        qwen_busy = ("❯ \n  Enter to steer · Ctrl+Q to queue · "
+                     "⏸ Ask permissions (shift + tab to cycle)")
+        self.assertIsNone(ha.parse_pane_mode(qwen_busy))
+
 
 # What `claude -p "/model"` really prints (v2.1.214): the current default's
 # label, then the usage line carrying the login's whole alias list.
