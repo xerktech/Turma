@@ -133,7 +133,7 @@ what it ships, what bounds one delta, and when it sheds — is in `.claude/rules
   straight into sqlite, which takes only scalars — an object or array threw, the route answered 500,
   and one poisoned transcript then answered 500 on every beat forever. A non-scalar stores as
   nothing rather than as `[object Object]`, and the length cap is the receiving half of the agent's
-  own (a bound the receiving path does not enforce is not a bound).
+  own — XERK-235's rule again (above).
 - The Sessions page gains a search box (`GET /api/search?q=` — hub-local full-text search, ranked,
   `<mark>`-highlighted, grouped by `remoteKey`, working for offline hosts) and an "Ended sessions"
   browser (`GET /api/archive`); a result opens read-only (`GET /api/archive/<transcriptId>`). Ingest

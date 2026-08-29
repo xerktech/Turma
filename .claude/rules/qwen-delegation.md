@@ -10,10 +10,10 @@ paths:
 
 The decision lives in `.claude/rules/qwen.md` ([Qwen J] pointer); this is the mechanics, scoped to
 the delegation files. The projection philosophy (S1) applied to DELEGATION: a qwen session that
-spawns sub-agents shows the picker + per-agent transcripts IDENTICALLY to Claude, so instead of
-teaching any reader about qwen, the projector RESHAPES qwen's own near-Claude launch into the exact
-Claude-Code on-disk shapes and every existing reader (`_scan_agent_entry`, `_resolve_subagent`, the
-usage/archive walks) works UNCHANGED — the XERK-304 contract, no new field.
+spawns sub-agents shows the picker + per-agent transcripts IDENTICALLY to Claude — the projector
+RESHAPES qwen's own near-Claude launch into the exact Claude-Code on-disk shapes, so every existing
+reader (`_scan_agent_entry`, `_resolve_subagent`, the usage/archive walks) works UNCHANGED with no
+new field (the XERK-304 contract), rather than teaching any reader about qwen.
 
 - **Qwen's delegation is a near-Claude `Agent` launch, so this is a RESHAPE, not a synthesis** (the
   dsh [J] difference — dsh had to synthesize launch/stop from ctx-bus edges; qwen already writes

@@ -254,8 +254,7 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     trust-on-first-use). `jira.siteKey` is agent-asserted, so gating on it let any host's token
     join any org and read its whole roster — exposure no agent credential had, since `/api/agents`
     refuses one. Same objection XERK-268 makes to a self-asserted `<host>`. The binding is
-    hub-owned, assigned AFTER the payload spread like `tokenBound`, persisted with the record, and
-    reset only by `DELETE /api/agents/<host>`.
+    hub-owned; assignment/persistence mechanics are in `.claude/rules/turma.md`.
   - **Drift is declaring a DIFFERENT org, never failing to declare one** — a host whose tracker goes
     quiet keeps its binding and its peers.
   - **The binding gates the peer roster and NOTHING else.** The MIGRATION route still compares the

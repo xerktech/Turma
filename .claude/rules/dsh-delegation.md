@@ -9,13 +9,10 @@ paths:
 
 # Background-agent / workflow rows + subagentHistory for dsh (XERK-474 [J])
 
-The decision lives in `.claude/rules/dsh.md` ([J]); this is the mechanics, scoped to the delegation
-files. The projection philosophy (D3/S1) applied to DELEGATION: a dsh session that spawns sub-agents
-/ workflows must show the picker + per-agent transcripts IDENTICALLY to Claude Code, so instead of
-teaching any reader about dsh, the launcher SYNTHESIZES the Claude-Code on-disk shapes and every
-existing reader (`_scan_agent_entry`/`scanAgentEntry`, `_resolve_subagent`, `_resolve_workflow_run`,
-`_workflow_agents`, the usage/archive walks) works UNCHANGED. It matches the XERK-304 cross-cutting
-contract with no new field. Three streams feed it; the split is the whole design.
+The decision + the D3/S1 projection philosophy applied to delegation are in `.claude/rules/dsh.md`
+([J], the XERK-304 contract, no new field) — this file is the mechanics, scoped to the delegation
+files: how the launcher SYNTHESIZES the Claude-Code on-disk shapes so every existing reader works
+UNCHANGED. Three streams feed it; the split is the whole design.
 
 - **dsh's delegation model is NOT Claude's, and the differences drive the mapping** (verified against
   0.1.1-rc.2 `.d.ts`):

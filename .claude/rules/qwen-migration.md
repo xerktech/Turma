@@ -6,17 +6,16 @@ paths:
 
 # Qwen session migration + resume ([Qwen K], XERK-516)
 
-Split out of `.claude/rules/qwen.md` (which reached its size ceiling once every XERK-504 child had a
-section). This is the migration/resume child; read `qwen.md` for the qwen runtime around it
+Split out of `.claude/rules/qwen.md` (size ceiling); read it for the qwen runtime around this piece
 (launcher [Qwen B], projection [Qwen S1], drive/liveness [Qwen C], archive [Qwen E]).
 
 XERK-101 (`CLAUDE.md`, "Migrating a session to another agent") extended to qwen — the dsh [K]
-(XERK-475, `.claude/rules/dsh.md`) analogue. The **load-bearing difference from dsh**: qwen is
+(XERK-475, `.claude/rules/dsh.md`) analogue. **Load-bearing difference from dsh**: qwen is
 Claude-shaped, so its NATIVE LOG at `~/.qwen/projects/<slug>/chats/<id>.jsonl` *is* the durable store
-`qwen --resume <id>` reloads from — there is NO separate store like dsh's `DSH_SESSIONS_ROOT`, which
-is distinct from dsh's `<sid>/dsh/` display feed. So a qwen migration carries the native log itself.
-Full mechanics + rationale are in the `QWEN_STORE_ARCNAME` comment in `hub-agent.py`; the invariants
-a change must not undo:
+`qwen --resume <id>` reloads from — no separate store like dsh's `DSH_SESSIONS_ROOT` (distinct from
+dsh's `<sid>/dsh/` display feed). So a qwen migration carries the native log itself. Full mechanics +
+rationale are in the `QWEN_STORE_ARCNAME` comment in `hub-agent.py`; invariants a change must not
+undo:
 
 - **RESUME (process-death `--resume`, boot-adopt) was already wired by [Qwen B]/[Qwen C]; [K] only
   PINS it.** `_launch_tmux(resume=True)` dispatches to `_launch_qwen(resume=True)` → `qwen --resume
@@ -44,8 +43,8 @@ a change must not undo:
   on EVERY native-log row (qwen has no single header line like dsh) from the source cwd (read from the
   first row) to the localized worktree, so the placed log is self-consistent with where it now lives.
   A no-op on a same-mount move (source cwd == target); never raises the migration over a store detail.
-- **A qwen session migrated to a host without qwen falls back to CLAUDE cleanly** — the existing
-  `agent_type_configured` rebuild guard in `_resume_at_cwd` (per-runtime, not dsh-only). `want_qwen`
+- **A qwen session migrated to a host without qwen falls back to CLAUDE cleanly** via the existing
+  per-runtime `agent_type_configured` rebuild guard in `_resume_at_cwd`. `want_qwen`
   (`agentType=="qwen" and qwen_configured()`) gates the unpack, so a claude-fallback import DROPS the
   `.qwen-store/` member (no resume to feed it), exactly as a stray dsh store is dropped.
 - **Model/endpoint re-validation is against the TARGET host's config on every launch.** `_launch_qwen`

@@ -43,11 +43,9 @@ option LABEL, or an approval OUTCOME.
 
 ## Cross-session peer messaging (XERK-476)
 
-Match XERK-348 for dsh: the org-scoped roster and its messaging. The ROSTER half is
-runtime-independent and already worked — `_peer_rows`/`_write_peers_file` list any running session,
-`_launch_dsh` appends `PEERS_SYSTEM_PROMPT` (+ `DSH_PEERS_ADDENDUM`, since dsh's send tool is
-`send_message` and it has no `ListAgents`), and `build_dsh_guard_config` grants the read of
-`~/.turma/peers.tsv`. What [L] adds is the MESSAGING, hub-routed both ways:
+Match XERK-348 for dsh (the already-working roster mechanics are in `.claude/rules/dsh.md` [L], incl.
+`DSH_PEERS_ADDENDUM` since dsh's send tool is `send_message` and it has no `ListAgents`). What [L]
+adds here is the MESSAGING, hub-routed both ways:
 
 - **SEND (dsh → peer).** The driver registers a `send_message` tool (`ctx.tools.register(defineTool
   {name:'send_message', to, message})`, dynamic-imported like the sandbox policy) that emits
@@ -220,12 +218,10 @@ is `.claude/rules/dsh.md` [D]). The tail (`dsh_session.py`) captures `data.title
   die" observation was really the DRIVER exiting(1) because removing web-app also removed
   `agent-presets` (its tools) — kept apart here, base carries the tools (next pitfall).
   - **The IN-DASHBOARD viewer is the Turma-native Trajectory view** (over the D3 native log,
-    `.claude/rules/turma-sessions.md`), NOT a `dsh web` proxied through the tunnel: `dsh web` has no
-    base-path flag (only `--host`/`--port`/`--trusted-host`/`--no-open`), so it cannot be sub-path
-    -proxied per host under one domain the way ttyd's `-b /term/<id>` allows. The dsh-web fallback in
-    `docs/dsh-session-lifecycle.md` is superseded by that blocker for the PROXY role. XERK-501 adds a
-    SECOND, DIRECT-ACCESS viewer beside it — one host-wide `dsh web` (the "Host-wide dsh web viewer"
-    section below) — which sidesteps the blocker precisely because it is not proxied per session.
+    `.claude/rules/turma-sessions.md`) — NOT a `dsh web` proxied through the tunnel, for the reason in
+    `.claude/rules/dsh.md` (XERK-498: no base-path flag). That supersedes the dsh-web fallback in
+    `docs/dsh-session-lifecycle.md` for the PROXY role. XERK-501 adds a SECOND, DIRECT-ACCESS viewer
+    beside it (below), which sidesteps the blocker precisely because it is not proxied per session.
 - **Profile prep is off the beat.** `_ensure_dsh_profile` (npm/dsh setup) is primed on a worker
   thread at startup when `dsh_configured()`; `_launch_dsh` only reads the cached `_dsh_profile_ready`
   and refuses if not ready — it never runs the heavy setup on the beat (XERK-395).

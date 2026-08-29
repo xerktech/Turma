@@ -100,12 +100,10 @@ landed, and the invariants a later child must not undo:
   (REQUIRED for the on-disk transcript + resume), `disableAutoUpdate` (a pinned fleet must not let
   the binary drift under the parsers — the G0 auto-update trap), `folderTrust:false`, and
   `approvalMode:"auto"` + `autoAccept:true` (hands-off, the claude `--permission-mode auto` analogue).
-- **The safety guard is [Qwen F] (XERK-510), now SHIPPED and wired into `_qwen_settings`** —
-  PreToolUse hooks + `permissions.deny` reusing the shared `guard.py`/`fileguard.py` deny policy
-  (qwen's hook contract is Claude Code's, ported — G0 crit. 5). See the "[Qwen F]" section below.
-  `approvalMode:"auto"` runs tools unattended, so a launcher WITHOUT the guard is unguarded — the
-  load-bearing reason `QWEN_ENABLED` stays False, now liftable once [Qwen F] is host-verified.
-  Permission-mode parity (Shift+Tab / setMode) is [Qwen P] (XERK-522).
+- **The safety guard ([Qwen F], XERK-510) is SHIPPED and wired into `_qwen_settings`** — see that
+  section below for the mechanism. `approvalMode:"auto"` runs tools unattended, so a launcher
+  WITHOUT the guard is unguarded — the load-bearing reason `QWEN_ENABLED` stays False, now liftable
+  once [Qwen F] is host-verified. Permission-mode parity (Shift+Tab / setMode) is [Qwen P] (XERK-522).
 - **Config readiness is primed OFF THE BEAT** (`_ensure_qwen_ready` on a worker at startup when
   `qwen_configured()`): a `qwen --version` probe + model-route validation, cached on `_qwen_ready`.
   `_launch_qwen` only READS the cached flag and refuses if unset — it never runs the probe on the

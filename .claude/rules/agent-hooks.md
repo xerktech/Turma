@@ -62,8 +62,8 @@ implementation contract behind it.
 ## Implementation contract
 
 - **Guard** (`hooks/guard.py`, stdlib-only at `/usr/local/bin/hooks/guard.py`) — a `PreToolUse` hook
-  over Bash, plus the `permissions.deny` credential-store rules. It classifies what the SHELL runs,
-  **never the raw string**. **Fails open on malformed input**; an unwritable settings file still
+  over Bash, plus the `permissions.deny` credential-store rules (same shell-not-string classification
+  as the Policy section above). **Fails open on malformed input**; an unwritable settings file still
   launches the session. Keep in sync with the twin hook outside this repo. Tests: `test_guard.py`,
   `test_guard_settings.py`.
 - **File guard** (`hooks/fileguard.py`, same shape) — a `PreToolUse` hook over
@@ -76,13 +76,11 @@ implementation contract behind it.
     is necessary but NOT sufficient for a session's own auto-memory — subagent stores are what the
     carve-out delivers. Keep the `projects/` hole open anyway: it costs nothing and a future release
     may lift that gate, which `test_matcher_oracle.py` will report as a failure.
-  - **It is a hook and not a `permissions.deny` pattern because the rule is "everything under X
-    except Y", which a glob list cannot express.** Deny beats allow, so the exception must be a hole
-    in the deny, and three attempts each cut one wrong: too big (**a deny matching a DIRECTORY takes
-    its whole subtree**, so `Edit(~/.claude/*)` matches the `agent-memory` entry and is the blanket
-    rule again), too small (an enumerated danger list missed `shell-snapshots/`, which Claude Code
-    sources on every Bash call of every live session — RCE across sessions), and unable to track a
-    vendor directory set that grows each release. Do not go back to patterns for this.
+  - **It is a hook rather than a pattern (Policy above) because three pattern attempts each cut one
+    wrong**: too big (`Edit(~/.claude/*)` matches the `agent-memory` entry and is the blanket rule
+    again), too small (an enumerated danger list missed `shell-snapshots/`, which Claude Code sources
+    on every Bash call of every live session — RCE across sessions), and unable to track a vendor
+    directory set that grows each release. Do not go back to patterns for this.
   - **The rule list is pinned by EQUALITY** (`EXPECTED_DENY_RULES` in `test_guard_settings.py`),
     because containment lost six rules: each was deletable with the whole suite *and* the live
     oracle green, `settings.json*` among them — the oracle asks whether the TARGET is refused, and

@@ -41,15 +41,15 @@ paths:
     one held across a hub whose archive was reset or evicted is ahead of the hub forever, and that
     transcript then never ships again — silence is worse than one discarded chunk.
   - **A wedged pass is otherwise SILENT** now that the beat no longer stalls behind it, and
-    `urlopen`'s timeout is per SOCKET OPERATION, so a hub trickling bytes never trips it. The beat
-    reports it (`_warn_if_archive_pass_stalled`) and that line is the only signal there is — so it
-    measures the LAST COMPLETED PUSH, never the pass's age. Timing the pass fired on exactly the
-    healthy host this ticket is about, saying "no deltas are shipping" while 69 were.
+    `urlopen`'s timeout is per SOCKET OPERATION, so a hub trickling bytes never trips it. The beat's
+    `_warn_if_archive_pass_stalled` is the only signal there is, and it measures the LAST COMPLETED
+    PUSH, never the pass's age — a naive version fired on a healthy host, claiming "no deltas are
+    shipping" while 69 were.
   - Its reachability is as fragile as its logic: the worker stamping the pass, the push helpers
     stamping each completion, the seed at pass start, the throttle sentinel starting a full window
-    in the past, and the beat calling the warn are all separate, and dropping any one leaves a
-    wedged host silent or a healthy one accused. Each is pinned END TO END, through a real wedged
-    pass, not by calling the warn with a hand-set stamp.
+    in the past, and the beat calling the warn are all separate — dropping any one leaves a wedged
+    host silent or a healthy one accused. Pin each END TO END through a real wedged pass, not by
+    calling the warn with a hand-set stamp.
   - **It runs BEFORE the `archiveHave` gate**, because a wedged pass is the WORKER's state and not
     the reply's: behind that gate, a host whose manifest emptied mid-wedge was silent forever.
   - **A BLACKHOLED hub deliberately does not trip it**, and that is not a hole to close: every push
@@ -69,11 +69,11 @@ paths:
     than zero, and the rotation exists precisely to reach those. A reported cursor REPLACES what we
     held, including downwards — a reset or evicted archive answers smaller, and a high-water mark
     would leave that transcript looking complete here and missing there for good.
-    - **It may not raise**, because `queue_archive_sync` runs on the beat loop, which is the
-      agent's main process. `int(float("inf"))` raises OverflowError — neither of the two
-      obvious exceptions — and a bare `1e400` is plain RFC-8259 JSON, so it is reachable from
-      anything broken or hostile answering `TURMA_URL`. Keys are length-capped as well as counted:
-      bounding ENTRIES bounds no bytes when one key may be a megabyte.
+    - **It may not raise either** (same beat-loop-is-main-process constraint as above).
+      `int(float("inf"))` raises OverflowError — neither of the two obvious exceptions — and a bare
+      `1e400` is valid RFC-8259 JSON, reachable from anything broken or hostile answering
+      `TURMA_URL`. Keys are length-capped as well as counted: bounding ENTRIES bounds no bytes when
+      one key may be a megabyte.
   - **Three ways this reverts to a cliff, each closed deliberately.** They all look like tidying.
     - **The rotation is keyed on the TRANSCRIPT, never on a position in the candidate list.**
       `_archive_offered` stamps what each beat offered and the pool is taken least-recently-offered
@@ -94,23 +94,23 @@ paths:
           busy drops out — 201 of 1201 on a 201/1000 toggle, 2250 of 3250 on 250/3000;
         - no constant multiplier fixes that: the one needed tracks the peak/trough ratio, which is
           unbounded (k>=6 for 201/1000, k>=13 for 250/3000);
-        - and the high-water CANDIDATE count is still too small, because `_archive_manifest` drops
-          a running slug **before** it lists that slug's files, so the candidate count can never
-          see it. Three large slugs with one idle per beat hold the per-beat peak at one slug's
-          worth while the union is three: 600 of 3000 starved.
+        - and the high-water CANDIDATE count is still too small: `_archive_manifest` drops a
+          running slug **before** listing that slug's files, so the candidate count never sees it —
+          three large slugs with one idle per beat hold the per-beat peak at one slug's worth while
+          the union is three (600 of 3000 starved).
         The universe is the set that can be live rather than the subset offerable this beat, so
-        there is no oscillation left for it to be smaller than. It costs one extra `os.listdir`
-        per RUNNING slug, of which there are at most `MAX_SESSIONS`.
+        there is no oscillation left for it to be smaller than. Costs one extra `os.listdir` per
+        RUNNING slug, of which there are at most `MAX_SESSIONS`.
       - **The mark never decays**, so the map does not shrink after a delete — a roomier map than
         needed costs bytes and cannot cost correctness. `ARCHIVE_OFFERED_HARD_MAX` is where that
         trade stops (32.5 MB RSS measured at the 200k cap with real UUID keys, ~100k transcripts on
         one host). Past it the loss is a linear slope, roughly `universe - cap - MANIFEST_MAX`
         transcripts, so it is **logged once** rather than left silent.
       - **The two paths that can GROW the map both trim** — the normal window and the under-cap
-        passthrough — because the passthrough is every beat for a host below the cap and the hard
-        cap has to be enforceable there too. The two early returns that trim nothing also never
-        stamp, so the map cannot grow through them. Not because a shrunk
-        host's map comes down — under a never-decaying mark it does not.
+        passthrough — because the passthrough runs every beat for a host below the cap and the hard
+        cap must be enforceable there too. The two early returns that trim nothing also never stamp,
+        so the map cannot grow through them either; a shrunk host's map does not come back down,
+        since the mark never decays.
       - **The state is in MEMORY, so a restart LOOP starves the rotation** (XERK-430): a single
         restart is safe, but at a 2-4 beat restart period 900 of 1300 were never offered. The
         durable copy of "what the hub already has" lives on the hub, which is what XERK-431
@@ -153,11 +153,11 @@ paths:
   back to mtime only when no entry is timestamped. Tests: `TestArchiveSync`, `TestLastActivityTs`,
   `TestResumableReport`.
 - **The archive is the ONE place a SendUserFile preview is shed** (`_shed_block_payloads`,
-  XERK-267): the payloads are bounded per delivery but unbounded relative to the transcript, so a
+  XERK-267): payloads are bounded per delivery but unbounded relative to the transcript, so a
   screenshot-heavy session archives orders of magnitude larger than what it records (measured:
   28 KB of transcript → 447 MB archived). Past `ARCHIVE_PAYLOAD_MAX` the rest of that transcript
-  ships as name-only chips flagged `shed`. The live tail and `history` keep their previews — those
-  are re-read from the transcript on demand and cost nothing durable.
+  ships as name-only chips flagged `shed`. The live tail and `history` re-read previews from the
+  transcript on demand, so they keep theirs at no durable cost.
 - **The hub owns the ceiling, this is only an early stop.** `archiveShed`/`archiveFull` on the
   heartbeat reply are the hub's verdict (`turma/archive.js`), which the agent applies to keep the
   bytes off the wire and to skip a pass at a full store; the hub re-applies both itself, since an
@@ -174,9 +174,9 @@ paths:
   `ARCHIVE_CHUNK_BYTES` is only how far ahead `_archive_deltas` reads to find whole lines;
   `_archive_chunk_entries` then cuts at a LINE BOUNDARY so the measured body stays under
   `_archive_body_max()`. The two are not a ratio of each other — a SendUserFile turn is a short
-  transcript line that renders to megabytes of preview the agent reads off DISK — so sizing the
-  window bounds nothing. A chunk's byte range must contain exactly the entries it carries: an entry
-  that does not fit opens the NEXT delta, and the cursor stops behind it.
+  transcript line that renders to megabytes of preview read off DISK, so sizing the window bounds
+  nothing. A chunk's byte range must contain exactly the entries it carries: an entry that does not
+  fit opens the NEXT delta, and the cursor stops behind it.
   - **The number comes from the hub** (`archiveChunkMax` on the beat reply), like `bodyMax` and for
     the same reason. The default used before one arrives is deliberately under an OLD hub's 1 MiB
     route cap, which is what makes the archive work against a hub that has not been upgraded — the
@@ -233,18 +233,16 @@ paths:
     WHO writes it there: dsh's driver writes its feed directly, but qwen owns its native log (it
     writes it under `~/.qwen/projects/`, which this walk does not reach), so the projection TAIL
     (`qwen_session.QwenProjectionTail`) MIRRORS its bytes into the store, append-only, on its own
-    cursor. A running qwen session is NOT un-excluded from the manifest (below) — qwen has no
-    Trajectory viewer, so its native log is retention only and archives once the session ends.
-    Migration ([Qwen K], XERK-516) does NOT carry this `<tid>/qwen/` mirror: it is the display/metrics
+    cursor (running-session carve-out below). Migration ([Qwen K], XERK-516) does NOT carry this
+    `<tid>/qwen/` mirror: it is the display/metrics
     feed, and qwen resumes from its OWN native log under `~/.qwen/projects/` (the file the bundle
     carries under `.qwen-store/` instead). The target rebuilds this mirror from new events, exactly as
     dsh's `<tid>/dsh/` feed is rebuilt. Keep the resumable log and this feed straight.
   - **A RUNNING dsh session is NOT excluded from the manifest** (`_running_slugs` subtracts
     `_live_dsh_slugs`), and that exception is what makes the Trajectory work at all. **A running
     QWEN session gets NO such carve-out** (XERK-512): qwen has a real ttyd TUI and no Trajectory
-    viewer, so its native log is retention/metrics only — it archives once the session ends, like
-    every non-dsh running session. Every other
-    running session is excluded ("sync it once it ends"), but the in-dashboard Trajectory (XERK-498)
+    viewer, so its native log is retention/metrics only, archiving once the session ends like every
+    other running session — dsh alone is the exception, because the in-dashboard Trajectory (XERK-498)
     is the ONLY viewer a headless dsh session has, and it reads the native log back through THIS raw
     layer — so a running dsh session that did not sync would 404 for its whole life, which is exactly
     when the operator needs it. So a running dsh session syncs live: its projected `<tid>.jsonl` and

@@ -11,8 +11,7 @@ is in `CLAUDE.md`, and `.claude/rules/agent.md` carries the Python side.
 
 - The reverse tunnel; the hub's `{open,port}` selects which per-session ttyd to bridge over one
   per-host control channel, which also carries the **live transcript tail** (`{watch}`/`{unwatch}`,
-  ~1s, `{tail,entries}` deltas). Tailing runs only while a client watches. It is a JS
-  re-implementation of `hub-agent.py`'s parsers — see `CLAUDE.md`'s parity contract.
+  ~1s, `{tail,entries}` deltas). Tailing runs only while a client watches.
 
 ### Control-channel liveness
 

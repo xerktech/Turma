@@ -130,8 +130,8 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
   which the raw archive layer already holds (`<tid>/dsh/*.jsonl`, XERK-469). `chatToTrajectory` fetches
   `GET /api/dsh/<transcriptId>/trajectory` (parsed server-side by `archive.dshTrajectory` into
   turns/steps/tool-calls/token-usage/timings — the richer telemetry the S1 projection flattens) and
-  renders newest-turn-first. This REPLACES the removed PER-SESSION dsh terminal/web-server; there is
-  no ttyd and no per-session dsh web server. A running session's log syncs to the archive within a
+  renders newest-turn-first. This REPLACES the removed per-session dsh terminal/web-server (no ttyd,
+  no per-session dsh web server). A running session's log syncs to the archive within a
   few beats, so a just-opened dsh session may 404 until the first sync (the pane says so, ↻ Refresh).
   The dsh-web-through-tunnel PROXY path was ruled out — `dsh web` has no base-path flag, so it cannot
   be sub-path-proxied per host. Web-first; Android (`TerminalScreen`) + glasses in `android/PARITY.md`.

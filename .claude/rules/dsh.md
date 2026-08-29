@@ -78,9 +78,8 @@ invariants a later child must not undo:
 - **Cost this accepts, and the follow-up it needs.** dsh (node + its npm tree — the PoC's
   `test-real-dsh.sh` installs ~460 packages) adds a native prerequisite, and a live dsh session
   (node runtime + a model client) is not free on a host's memory/process budget, sized per host
-  against `MAX_SESSIONS`. Whether those ceilings need raising before dsh sessions run beside Claude
-  sessions is a **host sizing follow-up** (child of this epic), not a code change here — flagged to
-  Malcolm below (Q1).
+  against `MAX_SESSIONS`. Whether those ceilings need raising is a host sizing follow-up, not a code
+  change here — flagged to Malcolm as Q1 below.
 
 ## D2 — Coordinator: reuse the existing Turma hub; the PoC Fleet Hub is redundant for this epic
 
@@ -127,11 +126,10 @@ invariants a later child must not undo:
 - **Retention obligation — this is the load-bearing part of the decision.** The native dsh log
   (SQLite + telemetry JSONL) MUST be persisted durably and in full, not summarized. It rides
   XERK-338's raw archive layer, which already stores each session's own files byte-for-byte and is
-  the only place anything Turma does not render survives the host. Two consequences for children:
-  the raw-layer ceilings (`ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES`, and that the layer excludes
-  background-agent transcripts) must be checked against real dsh session sizes so metrics data is not
-  silently truncated — fold into the sizing follow-up (Q1); and a future metrics / Trajectory surface
-  is a downstream child that reads these retained native events directly, never the JSONL projection.
+  the only place anything Turma does not render survives the host. The raw-layer ceilings must be
+  checked against real dsh session sizes so metrics data is not silently truncated (Q1); a future
+  metrics / Trajectory surface is a downstream child that reads these retained native events
+  directly, never the JSONL projection.
 - **Session identity is preserved by construction.** The agent pins a session id at launch and names
   the projection JSONL by it, so `_session_transcript_path()` resolves a dsh session with no new
   resolver and no newest-mtime fallback (the XERK-6 trap). dsh's own internal session id is mapped to
@@ -478,9 +476,8 @@ invariants a change must not undo; mechanics in `.claude/rules/dsh-input.md` + `
 
 ## Open questions flagged to Malcolm (recorded on XERK-462)
 
-1. **Resource + retention sizing.** Is adding dsh's node/npm tree to the native install
-   acceptable, and does a host's memory/process budget need raising before dsh sessions run
-   beside Claude sessions? Also: does the archive raw-layer ceiling
+1. **Resource + retention sizing.** Does a host's memory/process budget need raising before dsh
+   sessions run beside Claude sessions (D1)? Does the archive raw-layer ceiling
    (`ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES`) fit real dsh session sizes so the canonical native log we
    keep for metrics (D3) is not silently truncated? A host / archive sizing follow-up, not code
    here.

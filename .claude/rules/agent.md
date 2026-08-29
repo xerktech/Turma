@@ -63,9 +63,8 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
 
 ### `input` / `send_input`, `notify_session` — putting a message INTO a session
 
-- Two paths, and which one a message takes is a rule, not a preference: the pane for what a person
-  typed, the session's own inbox for what this manager composed. Both, and why, are in
-  `.claude/rules/agent-input.md`.
+- Two delivery paths — the pane vs. the session's own inbox, and the rule for which one a message
+  takes — are in `.claude/rules/agent-input.md`.
 
 ### `history`
 
@@ -250,9 +249,9 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
 
 ## PR status, comment delivery and conflict nudges
 
-See `.claude/rules/agent-prs.md` — merge-readiness and CI rollup, the two transcript-keyed ledgers,
-`_scan_pr_line` attribution, the GitLab/ADO dispatch, and the comment/conflict replies typed back
-into a session. All of it lives in `hub-agent.py`.
+See `.claude/rules/agent-prs.md` (all in `hub-agent.py`) — merge-readiness and CI rollup, the two
+transcript-keyed ledgers, `_scan_pr_line` attribution, the GitLab/ADO dispatch, and the
+comment/conflict replies typed back into a session.
 
 ## Expected-restart "updating" status (XERK-29)
 
@@ -268,14 +267,14 @@ into a session. All of it lives in `hub-agent.py`.
 
 ## Usage aggregates, ledger and subscription limits
 
-See `.claude/rules/agent-usage.md` — the per-repo/host token aggregates, the worktree→repo
-attribution ledger that outlives a session, and the subscription-limit snapshot plus the probe that
-captures it. All of it lives in `hub-agent.py` and `hooks/statusline.py`.
+See `.claude/rules/agent-usage.md` (all in `hub-agent.py` + `hooks/statusline.py`) — the per-repo/host
+token aggregates, the worktree→repo attribution ledger that outlives a session, and the
+subscription-limit snapshot plus the probe that captures it.
 
 ## Board sources, triage and ticket sessions
 
-See `.claude/rules/agent-board.md` — the Jira/Azure DevOps collectors, the two tracker writes, repo
-triage and ticket-backed sessions. All of it lives in `hub-agent.py`.
+See `.claude/rules/agent-board.md` (all in `hub-agent.py`) — the Jira/Azure DevOps collectors, the
+two tracker writes, repo triage and ticket-backed sessions.
 
 ## Session activity summaries
 
@@ -408,9 +407,8 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
 
 ## Archive sync
 
-See `.claude/rules/agent-archive.md` (scoped to `hub-agent.py` + its tests): the manifest, the
-rendered and raw delta pushes and what bounds one, the SendUserFile shed, and the sync WORKER
-that keeps all of it off the beat loop.
+See `.claude/rules/agent-archive.md` (scoped to `hub-agent.py` + its tests) — same coverage as the
+root table's row, not restated here.
 
 ## Hooks
 

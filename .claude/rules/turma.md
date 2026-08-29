@@ -167,12 +167,12 @@ hub half.
   so an older hub never false-alarms.
 - **A live-update event carries the agent record, never `retiredUsage`** (XERK-338), and both this
   page and `/usage` skip the fallback poll entirely while SSE is healthy — so the cached retired
-  list is whatever the page LOADED with unless the event handlers maintain it. Two do:
-  - `removed` **re-fetches**: removing a host MOVES its spend from `agents` to `retiredUsage`, so
-    patching `agents` alone drops everything that host ever spent off the token tiles — the exact
-    disappearance the tiles were fixed to stop, on a longer clock.
-  - `applyAgent` **drops that key from the cached `retiredUsage`**: a retired host beating again is
-    already off the hub's list, and a stale entry charts and totals it twice, live and retired.
+  list is whatever the page LOADED with unless the event handlers maintain it. Two do: `removed`
+  **re-fetches** (removing a host MOVES its spend from `agents` to `retiredUsage`, so patching
+  `agents` alone drops everything that host ever spent off the token tiles — the exact
+  disappearance the tiles were fixed to stop, on a longer clock); `applyAgent` **drops that key
+  from the cached `retiredUsage`** (a retired host beating again is already off the hub's list, and
+  a stale entry charts and totals it twice, live and retired).
   - Coalesced, both pages: the hub emits one `removed` PER HOST inside its registry-eviction loop,
     so one fetch per event multiplies the hub's heaviest read by the eviction size, per open tab.
   - Tests: the live-update cases in `dashboard-tiles.test.js`, `usage.test.js`.
@@ -386,8 +386,8 @@ layers, the size ceilings, and the rules about how the total is measured.
   to an eighth of the container's own cgroup limit, clamped 8–64 MiB) and **`AGENTS_MAX`** (record
   count, default 64). The count cap is not redundant — the byte budget measures what
   `agentRecordSize` measures, which EXCLUDES the on-demand caches, so it bounds their MULTIPLE and
-  nothing bounds their SIZE. A ceiling above the limit the kernel kills on is not a ceiling: size it
-  from the container, never pick a number.
+  nothing bounds their SIZE. A ceiling above the kernel's own OOM limit isn't one — size it from
+  the container, never pick a number.
 - **A newcomer never displaces a host that is still around.** Past the cap a record is reclaimed
   only if it has been unseen for `AGENT_EVICT_IDLE_MS` (1h, ≫ `OFFLINE_AFTER_MS`) — a record holds
   an offline host's last known sessions, PR chips and usage, so a host rebooting or updating keeps
