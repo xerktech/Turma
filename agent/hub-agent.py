@@ -3079,6 +3079,30 @@ def dsh_guard_plugin_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "dsh", "guard")
 
 
+def _realpath_glob_prefix(p):
+    """Resolve symlinks in the LITERAL portion of an absolute glob (the part
+    before its first `*`/`?`), leaving the wildcard suffix untouched — the glob
+    equivalent of `fileguard.py`'s `os.path.realpath(~/.claude)` base.
+
+    Both the dsh guard (`policy.mjs`'s `resolveTarget`) and the qwen shim
+    (`_resolve_target`) realpath the TARGET before matching, closing `..` and
+    symlink escapes on that side. Without this, a glob built from the
+    un-resolved literal path stops matching the moment its directory IS a
+    symlink — e.g. `~/.aws` bind-mounted, or (measured on a real WSL host)
+    pointed at the Windows-side profile — because the realpath'd target no
+    longer starts with the un-realpath'd rule prefix. `os.path.realpath` on a
+    path that does not fully exist yet resolves only its existing prefix and
+    passes the rest through literally, exactly like the target-side resolution
+    this mirrors, so this is safe to call unconditionally."""
+    m = re.search(r"[*?]", p)
+    if m is None:
+        return os.path.realpath(p)          # no wildcard: the whole path is literal
+    cut = p.rfind("/", 0, m.start())
+    if cut < 0:
+        return p                            # no literal directory prefix to resolve
+    return os.path.realpath(p[:cut]) + p[cut:]
+
+
 def _parse_perm_rule(rule):
     """Turn one Claude ``Read(P)``/``Edit(P)`` permission rule into
     ``('read'|'write', <absolute path glob>)`` for the dsh guard, or ``None`` for
@@ -3089,7 +3113,9 @@ def _parse_perm_rule(rule):
     itself: `runtime_code_deny_rules` emits a DOUBLED leading slash (Claude reads
     a single `/` relative to the settings-file dir) and glob-escapes metacharacters
     with a backslash (`_glob_literal`). The dsh guard does its own matching against
-    a realpath'd target, so both are reversed here."""
+    a realpath'd target, so both are reversed here — and `_realpath_glob_prefix`
+    resolves the rule itself the same way, so a symlinked HOME subdirectory
+    cannot dodge its own deny rule (see that function's docstring)."""
     m = re.match(r"^(Read|Edit)\((.*)\)$", rule.strip())
     if not m:
         return None
@@ -3099,6 +3125,7 @@ def _parse_perm_rule(rule):
     if p.startswith("~"):
         p = os.path.expanduser(p)
     p = re.sub(r"^/{2,}", "/", p)           # collapse the Claude-relative // anchor
+    p = _realpath_glob_prefix(p)
     return (op, p)
 
 
