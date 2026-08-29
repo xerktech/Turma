@@ -1410,14 +1410,24 @@ function composer(a, repo, rk, spawning) {
   if (localModel) runtimeOpts.push({ v: "local", label: "Claude Code Local" });
   if (dsh) runtimeOpts.push({ v: "dsh", label: "dsh" });
   if (qwen) runtimeOpts.push({ v: "qwen", label: "Qwen Code" });
-  // Selected runtime: the stored `runtime`, else derived from the legacy
-  // agentType/modelSource a pre-XERK-503 composer persisted, else claude. A
-  // stored value whose runtime the host no longer offers falls back to claude.
+  // Selected runtime: the stored `runtime`, else the legacy agentType/modelSource
+  // a pre-XERK-503 composer persisted, else this HOST's default runtime, else
+  // claude. A stored value whose runtime the host no longer offers falls back.
+  // `legacyRuntime` is null (not "claude") when the draft carries NEITHER field,
+  // so a brand-new draft falls through to the host default rather than masking
+  // it with a hardcoded claude.
   const legacyRuntime = o.agentType === "dsh" ? "dsh"
-    : (o.agentType === "qwen" ? "qwen"
-    : (o.modelSource === "local" ? "local" : "claude"));
+    : o.agentType === "qwen" ? "qwen"
+    : o.modelSource === "local" ? "local"
+    : (o.agentType === "claude" || o.modelSource === "subscription") ? "claude"
+    : null;
+  // A bare "+ New session" whose Runtime dropdown was never touched runs on the
+  // host's default runtime (XERK-521, `a.defaultRuntime`, effective/self-validated
+  // agent-side), so the dropdown PRE-SELECTS it — but only when that runtime is
+  // actually on offer here. Absent (older agent) reads as claude.
+  const hostDefault = runtimeOpts.some(r => r.v === a.defaultRuntime) ? a.defaultRuntime : "claude";
   const selRuntime = runtimeOpts.some(r => r.v === o.runtime) ? o.runtime
-    : (runtimeOpts.some(r => r.v === legacyRuntime) ? legacyRuntime : "claude");
+    : (legacyRuntime && runtimeOpts.some(r => r.v === legacyRuntime) ? legacyRuntime : hostDefault);
   // The Claude-local endpoint's discovered models (XERK-489): id + optional
   // context override, revealed when the "Claude Code Local" runtime is chosen.
   const lModels = (localModel && Array.isArray(localModel.models)) ? localModel.models : [];
@@ -2344,6 +2354,14 @@ function startSession(key, repo) {
     // qwen's model/permission handling are [Qwen B]. Send just the runtime choice.
     body.agentType = "qwen";
   } else {
+    // else = claude or local, both agentType "claude". Normally we OMIT agentType
+    // so a bare composed spawn stays byte-for-byte the fast path. But when this
+    // host DEFAULTS to a non-claude runtime (XERK-521), an omitted agentType
+    // resolves to that default agent-side — so an EXPLICIT "Claude Code" /
+    // "Claude Code Local" pick must SEND agentType:"claude" to beat the host
+    // default, exactly as the dsh/qwen picks send theirs. Scoped to a non-claude
+    // default so every current host's body is unchanged.
+    if (host && host.defaultRuntime && host.defaultRuntime !== "claude") body.agentType = "claude";
     if (runtime === "local") {
       body.modelSource = "local";
       if (localModel) body.localModel = localModel;

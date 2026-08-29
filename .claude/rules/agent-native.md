@@ -121,3 +121,31 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
     log tail natively.
   - The bundled `tmux.conf` only applies at `/etc/tmux.conf`/`~/.tmux.conf`; a host with its own conf
     loses truecolor + the OSC 52 copy chain.
+- **`TURMA_DEFAULT_RUNTIME` = the per-host default runtime for UNPINNED work** (XERK-521): an
+  auto-started/unpinned ticket, and a bare "+ New session" with the Runtime dropdown untouched. One
+  of `{claude,dsh,qwen}`; UNSET → claude, so every current host is unchanged. Resolved in ONE place
+  (`resolve_agent_type`/`default_runtime`): precedence `explicit agentType → TURMA_DEFAULT_RUNTIME →
+  claude`, where an EXPLICIT choice is a NON-BLANK `agentType`, applied via `apply_default=True` on
+  the fresh-spawn call ONLY — every rebuild/resume/migration passes the STORED value with it OFF, so
+  a resumed session keeps its runtime (a blank pre-field record stays claude, never adopts the
+  default).
+  - **Self-validating / fail-safe** (the `local_model_configured` half-config discipline): checked
+    against THIS host's `dsh_configured`/`qwen_configured`, so a host that sets `qwen` but hasn't
+    configured it falls back to claude and SAYS so (log + the heartbeat's EFFECTIVE `defaultRuntime`)
+    — never a broken launch.
+  - **No hub capability-filter on the dispatch path**: an unpinned ticket carries no runtime, so
+    `findTicketHost` routes to the most-available host and the CLAIMING host applies its own default
+    (always runnable by construction). An explicit pin still filters + blocks (`turma-board.md`).
+  - **"Explicit claude" must SEND `agentType:"claude"` or it reads as unpinned** — a composer
+    "Claude Code"/"Claude Code Local" pick omitted it (the bare fast path), which on a
+    non-claude-default host resolves to the default, so `sessions.html` now sends explicit
+    `agentType:"claude"` for a claude/local pick WHEN the host default is non-claude (byte-for-byte
+    unchanged on every claude-default host).
+  - **KNOWN GAP**: a per-ticket CLAUDE *pin* does NOT yet override a non-claude host default — the
+    board Runtime row treats `{runtime:"claude"}` as RELEASE, so a claude-pinned ticket adopts the
+    host default (dsh/qwen pins DO override). Closing it needs the Runtime picker to split "Auto —
+    host default" from a pinned "Claude Code" across `board.js`/`board.cjs`/`Board.kt`/glasses (a UX
+    change), deferred to a follow-up. Latent today (dsh/qwen behind their kill switches).
+  - **Known limitation — NONDETERMINISTIC in a MIXED org**: an unpinned ticket runs whatever host
+    frees a slot first defaults to. Determinism needs a per-ticket pin (XERK-515) or homogeneous
+    hosts. Accepted tradeoff of the per-host choice.

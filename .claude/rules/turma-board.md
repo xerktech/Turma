@@ -239,6 +239,13 @@ button and the auto-start sweep.
   host to edit. `{runtime:"dsh"|"qwen"}` pins; `{runtime:"claude"}`/`{auto:true}` release (only
   non-default stored). dsh side: `.claude/rules/dsh.md` [I]; qwen twin ([Qwen I], XERK-515) lives
   HERE (the bullets below), not duplicated in `qwen.md`.
+  - **KNOWN GAP with the per-host default (XERK-521): a `{runtime:"claude"}` release does NOT force
+    claude when a host DEFAULTS to a non-claude runtime.** The pin is dropped, so `spawnTicket`
+    carries no `agentType` and the claiming host applies its own `TURMA_DEFAULT_RUNTIME` (possibly
+    dsh/qwen). A dsh/qwen pin overrides (stores + forwards `agentType`); only claude is
+    release-not-pin. Closing it needs the picker to split "Auto — host default" from a pinned "Claude
+    Code" across this file's four mirrors (`board.js` + vendored `board.cjs` + `Board.kt` + glasses)
+    — a UX change deferred to a follow-up. Latent today (dsh/qwen behind their kill switches).
 - **Offered only when the org offers it** (`site.dshAvailable`/`site.qwenAvailable` via
   `mergeSites`; `orgOffersDsh`/`orgOffersQwen` gate hub-side) — but an existing pin is always
   carried back so it can be released even after the last capable host leaves.
