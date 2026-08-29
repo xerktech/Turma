@@ -130,7 +130,7 @@
         reporters.set(site, rep = {
           hosts: new Set(), online: false, repos: new Map(), hostOpts: new Map(),
           modelAvail: new Set(), modelAt: "", modelDefaultLabel: "",
-          dshAvailable: false });
+          dshAvailable: false, qwenAvailable: false });
       }
       rep.hosts.add(a.device || a.key || "?");
       if (a.online) rep.online = true;
@@ -138,6 +138,9 @@
       // offering it, online or not — matching orgOffersDsh hub-side, so the
       // Runtime picker offers "dsh" exactly when a dsh pin would be accepted.
       if (a.dsh && a.dsh.available) rep.dshAvailable = true;
+      // The qwen twin (XERK-515), matching orgOffersQwen hub-side — the Runtime
+      // picker offers "qwen" exactly when a qwen pin would be accepted.
+      if (a.qwen && a.qwen.available) rep.qwenAvailable = true;
       // The per-ticket model picker's choices (XERK-123): the aliases this org's
       // hosts probed available, unioned over EVERY reporting host (same reason as
       // the repo/host options — the freshest-block winners loop below sees only
@@ -251,6 +254,8 @@
           // Whether the org offers the dsh runtime (XERK-473) — the Runtime
           // picker's "dsh" option is gated on this, as orgOffersDsh gates the pin.
           dshAvailable: !!rep.dshAvailable,
+          // The qwen twin (XERK-515) — gates the picker's "qwen" option.
+          qwenAvailable: !!rep.qwenAvailable,
           _byKey: new Map(),
         });
       }
@@ -1057,11 +1062,13 @@
     return p && p.runtime && p.runtime !== "claude" ? p : null;
   }
   function prettyRuntime(v) {
-    return v === "dsh" ? "dsh (DeepSeek Harness)" : "Claude Code";
+    return v === "dsh" ? "dsh (DeepSeek Harness)"
+      : v === "qwen" ? "Qwen Code"
+      : "Claude Code";
   }
-  // The Runtime row. Editable only when the org offers dsh OR a pin already
-  // exists (so an existing dsh pin can always be released even if the last
-  // dsh-capable host went away) — mirroring how the hub still lets a pin clear.
+  // The Runtime row. Editable only when the org offers a non-default runtime OR
+  // a pin already exists (so an existing pin can always be released even if the
+  // last capable host went away) — mirroring how the hub still lets a pin clear.
   function runtimeFieldHtml(pin, opts) {
     const o = opts || {};
     const bits = [];
@@ -1082,16 +1089,19 @@
   function runtimePickerValue(pin) {
     return pin ? pin.runtime : "claude";
   }
-  // The runtime picker. "Claude Code" is the release (drops the pin); "dsh" pins
-  // it, offered only when the org offers dsh (else a pin the hub would refuse).
-  // An existing dsh pin is always carried so it can be released.
+  // The runtime picker. "Claude Code" is the release (drops the pin); "dsh"/"qwen"
+  // pin it, each offered only when the org offers that runtime (else a pin the hub
+  // would refuse). An existing non-default pin is always carried so it can be
+  // released even after the last capable host went away.
   function runtimePickerHtml(pin, opts) {
     const o = opts || {};
     const cur = pin ? pin.runtime : "claude";
     const dshOffered = !!o.dshAvailable || cur === "dsh";
+    const qwenOffered = !!o.qwenAvailable || cur === "qwen";
     const sel = `<select class="td-repo-select" data-runtime-select="1">
       <option value="claude"${cur === "claude" ? " selected" : ""}>Claude Code (default)</option>
       ${dshOffered ? `<option value="dsh"${cur === "dsh" ? " selected" : ""}>dsh (DeepSeek Harness)</option>` : ""}
+      ${qwenOffered ? `<option value="qwen"${cur === "qwen" ? " selected" : ""}>Qwen Code</option>` : ""}
     </select>`;
     return `<div class="td-repo-edit">${sel}
       <button type="button" class="td-edit" data-runtime-cancel="1">Cancel</button>
@@ -1212,14 +1222,15 @@
             editable: true,
             error: o.modelError,
           })),
-      // Which RUNTIME this ticket's session runs on (XERK-473). Hub-owned like
-      // the agent/model pins (o.runtimePin, from ticketRuntimes), so it needs no
-      // online host to edit — but "dsh" is offered only when the org offers it
-      // (o.dshAvailable), with an existing dsh pin always releasable.
+      // Which RUNTIME this ticket's session runs on (XERK-473 dsh, XERK-515 qwen).
+      // Hub-owned like the agent/model pins (o.runtimePin, from ticketRuntimes),
+      // so it needs no online host to edit — but "dsh"/"qwen" are each offered
+      // only when the org offers that runtime (o.dshAvailable/o.qwenAvailable),
+      // with an existing pin always releasable.
       fieldRow("Runtime", o.runtimeEditing
-        ? runtimePickerHtml(o.runtimePin, { dshAvailable: o.dshAvailable })
+        ? runtimePickerHtml(o.runtimePin, { dshAvailable: o.dshAvailable, qwenAvailable: o.qwenAvailable })
         : runtimeFieldHtml(o.runtimePin, {
-            editable: !!(o.runtimePin || o.dshAvailable),
+            editable: !!(o.runtimePin || o.dshAvailable || o.qwenAvailable),
             error: o.runtimeError,
           })),
       fieldRow("Assignee", d.assignee ? esc(d.assignee) : ""),

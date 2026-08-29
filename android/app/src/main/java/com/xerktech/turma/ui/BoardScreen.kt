@@ -844,12 +844,13 @@ private fun ModelPicker(site: BoardSite, pin: com.xerktech.turma.model.TicketMod
 }
 
 /**
- * The Runtime row of the detail sheet (XERK-473): which RUNTIME this ticket's
- * session spawns on — Claude Code (default) or dsh. Mirrors board.js
- * runtimeFieldHtml + runtimePickerHtml: a pin says "set by you", and the row is
- * editable when the org offers dsh OR a pin already exists (so an existing dsh
- * pin can always be released — [core.runtimeEditable]). A non-editable, unpinned
- * ticket renders a plain read-only value, matching the web's static field.
+ * The Runtime row of the detail sheet (XERK-473 dsh, XERK-515 qwen): which
+ * RUNTIME this ticket's session spawns on — Claude Code (default), dsh or Qwen
+ * Code. Mirrors board.js runtimeFieldHtml + runtimePickerHtml: a pin says "set
+ * by you", and the row is editable when the org offers a non-default runtime OR
+ * a pin already exists (so an existing pin can always be released —
+ * [core.runtimeEditable]). A non-editable, unpinned ticket renders a plain
+ * read-only value, matching the web's static field.
  */
 @Composable
 private fun RuntimeSection(
@@ -858,7 +859,7 @@ private fun RuntimeSection(
     pin: com.xerktech.turma.model.TicketRuntimePin?,
     vm: BoardViewModel,
 ) {
-    val editable = com.xerktech.turma.core.runtimeEditable(site.dshAvailable, pin)
+    val editable = com.xerktech.turma.core.runtimeEditable(site.dshAvailable, site.qwenAvailable, pin)
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         SectionLabel("Runtime")
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -874,9 +875,9 @@ private fun RuntimeSection(
 
 /**
  * The runtime value rendered as the picker; a pick IS the save. "Claude Code" is
- * the release (null), "dsh" pins. "dsh" is offered only when the org offers it OR
- * a dsh pin already exists (so it stays selectable to be released) — the same
- * carry-back the web `runtimePickerHtml` does.
+ * the release (null); "dsh"/"qwen" pin. Each non-default option is offered only
+ * when the org offers that runtime OR a matching pin already exists (so it stays
+ * selectable to be released) — the same carry-back the web `runtimePickerHtml` does.
  */
 @Composable
 private fun RuntimePicker(
@@ -888,6 +889,7 @@ private fun RuntimePicker(
     var open by remember { mutableStateOf(false) }
     val cur = pin?.runtime ?: "claude"
     val dshOffered = site.dshAvailable || cur == "dsh"
+    val qwenOffered = site.qwenAvailable || cur == "qwen"
     val current = com.xerktech.turma.core.prettyRuntime(cur)
     Box {
         SelectableValue(current, onClick = { open = true }, enabled = enabled, mono = pin != null)
@@ -900,6 +902,12 @@ private fun RuntimePicker(
                 androidx.compose.material3.DropdownMenuItem(
                     text = { Text("dsh (DeepSeek Harness)") },
                     onClick = { open = false; onPick("dsh") },
+                )
+            }
+            if (qwenOffered) {
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text("Qwen Code") },
+                    onClick = { open = false; onPick("qwen") },
                 )
             }
         }

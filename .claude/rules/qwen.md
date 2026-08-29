@@ -10,6 +10,10 @@ paths:
   - "agent/tests/test_qwen_ask_mcp.py"
   - "turma/server.js"
   - "turma/public/sessions.html"
+  - "turma/public/board.js"
+  - "turma/public/board.html"
+  - "turma/tests/board.test.js"
+  - "glasses/src/vendor/board.cjs"
   - "android/**"
 ---
 
@@ -446,3 +450,14 @@ sessions" section); the invariants a change must not undo:
   shell tool guard-denied and so carry no successful shell run. It proves attribution, the live
   per-beat scan, `_seed_prs` + the durable ledger, `refresh_pr_status` + GitLab/ADO dispatch, and the
   PANE-delivered comment/conflict nudges — the G1 no-mock lesson, mirroring `TestDshPrAttribution`.
+
+## [Qwen I] (XERK-515) shipped: board integration — a ticket can run on qwen
+
+A board ticket can be pinned to the qwen runtime, the dsh [I] (XERK-473) analogue — the runtime
+choice is presentational plumbing over the SAME `spawnTicket` path (the `ticketRuntimes` pin now
+accepts `"qwen"`), so the AGENT side is unchanged (`spawn_ticket` already forwards `agentType` to
+`spawn()`, `resolve_agent_type` already validates qwen, `_launch_qwen` already appends the
+ticket-branch directive — no new launch code). The mechanics — the `/runtime` route + `orgOffersQwen`
+gate, the per-runtime `findTicketHost` capability filter, the board `qwenAvailable`/picker, and the
+Android parity — live in **`.claude/rules/turma-board.md`**'s Runtime-row section (board-scoped,
+where the dsh [I] board detail's twin belongs), whose `paths:` load for the board files this touched.
