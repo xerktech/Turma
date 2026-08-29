@@ -6,242 +6,196 @@ paths:
 
 # `hub-agent.py` — how a session actually runs
 
-Split out of `CLAUDE.md` to keep that file under its size ceiling. What spans components — the
-session model itself, which transcript is a session's, migration, and the refused-start contract —
-stays there; this is the agent-side runtime detail behind it. `.claude/rules/agent.md` carries the
-process model and the command table.
+Split out of `CLAUDE.md` to keep that file under its size ceiling. The session model itself, which
+transcript is a session's, migration and the refused-start contract stay there; this is the
+agent-side runtime detail. `.claude/rules/agent.md` carries the process model and command table.
 
 ## How a session runs
 
-- Each session runs as the native agent's run-as identity
-  (`.claude/rules/agent-native.md`) as an interactive `claude --remote-control`, defaulting to
-  `--permission-mode auto`; the composer can pick
-  `bypassPermissions`/`acceptEdits`/`plan`/`default`. `bypassPermissions` is refused **under root**
-  unless `IS_SANDBOX` is set (in `turma-agent.env`).
-- Deliberately the interactive form, **not** `claude remote-control` server mode, whose terminal is
-  a QR/status lobby with no conversation.
-- Sessions are independent processes under the one agent manager, so a session ending doesn't restart
-  the manager — it marks the session stopped. "Restart (clear context)" relaunches a single
-  session's Claude in place.
-- All of a host's sessions share the one mounted `~/.claude` login; distinct worktree paths give
-  each its own project slug and Remote Control bridge pointer. `MAX_SESSIONS` caps concurrency; the
-  manager staggers launches on boot.
-- Agents connect purely outbound to the public `TURMA_URL` (the Cloudflare tunnel), so they work
-  from any host/network.
+- Each session runs as the native agent's run-as identity (`agent-native.md`) as an interactive
+  `claude --remote-control`, default `--permission-mode auto`; composer can pick
+  `bypassPermissions`/`acceptEdits`/`plan`/`default`. `bypassPermissions` refused under root unless
+  `IS_SANDBOX` is set.
+- Interactive form only, **never** `claude remote-control` server mode (a QR/status lobby, no
+  conversation).
+- Sessions are independent processes under one manager: a session ending doesn't restart the
+  manager. "Restart (clear context)" relaunches a single session's Claude in place.
+- All sessions on a host share the one mounted `~/.claude` login; distinct worktree paths give each
+  its own project slug + Remote Control bridge pointer. `MAX_SESSIONS` caps concurrency; boot staggers
+  launches.
+- Agents connect outbound-only to `TURMA_URL` (Cloudflare tunnel) — works from any network.
 
 ## Repos-root sessions
 
-- Run `claude` directly in `REPOS_ROOT` — spanning every repo — with **no worktree and no branch**,
-  so the base-branch option doesn't apply. Kill/delete tear down only the processes; `REPOS_ROOT` is
-  never touched.
-- All root sessions share that one cwd (hence one claude project slug + Remote Control bridge
-  pointer), so **at most one root session runs per host at a time** (enforced on
-  spawn/start/resume).
-- That ONE slug dir accumulates EVERY root session's transcript, which is why the transcript pin
-  exists (`CLAUDE.md`, "Which transcript is a session's").
+- Run `claude` directly in `REPOS_ROOT` — no worktree, no branch, base-branch option doesn't apply.
+  Kill/delete tear down only processes; `REPOS_ROOT` is never touched.
+- All root sessions share one cwd/slug/bridge pointer, so **at most one root session runs per host**
+  (enforced on spawn/start/resume).
+- That one slug dir holds EVERY root session's transcript — why the transcript pin exists
+  (`CLAUDE.md`, "Which transcript is a session's").
 
 ## The session queue (XERK-14)
 
-- A spawn that can't run RIGHT NOW is **queued, not refused** — an ordinary registry record with
-  `status:"queued"` and no worktree/tmux/ttyd yet. `spawn()` splits into the record-build and
+- A spawn that can't run NOW is **queued, not refused** — a registry record with
+  `status:"queued"`, no worktree/tmux/ttyd yet. `spawn()` splits record-build from
   `_provision_session()`, which a queued session later runs unchanged. Prompt/base-ref stash as
-  `_pendingPrompt`/`_pendingBaseRef` for it to consume.
-- Three orthogonal `queuedReason`s, each re-checked by the drainer: **capacity**,
-  **awaiting-clone**, **root-busy**. Surfaced as `session.queuedReason`/`queuedAt`.
-- The queue/run decision is made BEFORE the record is appended, so counts exclude the session being
-  added (else a root sees itself as root-busy and capacity is off by one).
-- `_drain_queue()` runs every heartbeat, oldest-first, **at most one per beat** (provisioning
-  launches claude against the one shared `~/.claude` login), head-of-line skipped not blocking. A
-  failed on-demand clone fails the session; a clone job lost to a restart re-triggers from
-  `awaitCloneOwner`.
+  `_pendingPrompt`/`_pendingBaseRef`.
+- Three orthogonal `queuedReason`s, re-checked by the drainer: **capacity**, **awaiting-clone**,
+  **root-busy** (`session.queuedReason`/`queuedAt`).
+- Queue/run decision is made BEFORE the record is appended (else a root sees itself as root-busy and
+  capacity is off by one).
+- `_drain_queue()` runs every heartbeat, oldest-first, **at most one per beat**, head-of-line
+  skipped not blocking. A failed on-demand clone fails the session; a clone lost to a restart
+  re-triggers from `awaitCloneOwner`.
 - Capacity rides the heartbeat as `capacity` = {maxSessions, running, queued, free, rootRunning}
-  (`_capacity_payload`); `free` never goes negative.
-- Queued sessions are killable (nothing to tear down); resume-on-boot skips them (the drainer picks
-  them up), as do archival/usage/PR scans.
-- **The agent queue is for spawns whose HOST is already the decision** — an explicit "+ New session"
-  on the host whose card was clicked, and a ticket session waiting on its repo to finish cloning.
-  **A ticket spawn waiting for a SLOT is not one of those**: it waits in the hub's ticket queue
-  (`CLAUDE.md`), so a host takes one only when it can start it. One can still land here if a host
-  fills between the hub's capacity read and its next beat — a race, not the normal path.
-- **A repo is forkable when it has a commit to detach at, never when `.git` exists** (XERK-343).
-  `git clone` creates `<dest>/.git` with an unborn HEAD before it fetches an object, so a repo is in
-  `scan_repos()` — and offerable in the composer — for the whole length of its own clone, and
-  detaching a worktree in that window dies with `fatal: invalid reference: HEAD`. `repo_forkable`
-  gates the spawn and the drain release. It takes NO base ref: an operator's base is
-  `resolve_base_ref`'s to judge, and holding a session for one that has not landed only delays the
-  accurate "base ref not found".
-  - **It is not `repo_head_ready`, and the difference is a regression that already happened**: a
-    repo whose local HEAD is unborn over a live `origin/<default>` — an orphan checkout, a
-    hand-bootstrapped `init`+`fetch` — forks fine, and gating on HEAD refused it. `repo_forkable`
-    mirrors `resolve_base_ref` minus its fetch. `_worktree_add`'s pre-flight is the one place
-    `repo_head_ready` is right, because it only fires when it is about to detach at HEAD.
-  - **Only a clone of OURS turns unforkable into a wait** (`_cloning`). Nothing the agent does fixes
-    an empty repo, and `awaiting-clone` renders as "cloning the repo first" on all five clients — a
-    lie for anything else. The rest fall through to that pre-flight and land as an error card
-    naming the cause.
-  - `repo_head_ready` fails OPEN: "can't tell" must degrade to git's own error, never to a session
-    queued forever.
-  - **In the drain, the deadline is checked BEFORE the re-clone**, and neither runs while a clone
-    job is live (`_poll_clones` bounds that one). `clone()` files a refusal under `slugify(spec)`,
-    so a 3-segment GitLab/ADO spec lands under a key the job lookup can't see — behind an `elif`
-    that retried every beat and `awaitCloneSince` never bounded anything.
-  - **A clone does NOT outlive its manager**: the native launcher runs `hub-agent.py` as the
-    managed foreground process, so a manager restart takes the `git clone` child with it. A
-    restart mid-clone leaves a directory that `clone()` refuses as an existing dest — nothing can
-    retry it — so that session errors in ONE beat naming the dir, rather than spinning out the
-    deadline. Removing it is the operator's call; don't have the agent take it. The re-clone is for
-    the case with nothing on disk, and runs once (`awaitCloneRetried`).
-  - **The drain branches on the clone job's STATUS, and a `done` job is its own answer**: a clone of
-    an empty upstream exits 0, so the job finishes while the repo stays unforkable. Read that while
-    the job lingers and say the repo is empty — once `_poll_clones` prunes it (30 s, far short of
-    the 600 s deadline) it is indistinguishable from an interrupted clone, and the branch below
-    would assert the wrong cause and recommend deleting a perfectly good clone. For the same reason
-    the no-job message claims no cause: after a restart the two are not distinguishable.
-  - `repo_forkable` skips the fetch, so it only ever UNDER-counts — it never releases a session that
-    then fails. The one shape it misses is a DANGLING `origin/HEAD` (the default branch's ref is
-    only on the remote), which costs that session the deadline. Adding a fetch is not the trade: it
-    would run per queued session per beat, on the loop the heartbeat is on.
-- **`scan_repos()` deliberately still lists a repo mid-clone**: the check costs a `git` per repo per
-  beat and the gates above already cover it. Don't move it there.
+  (`_capacity_payload`); `free` never negative.
+- Queued sessions are killable (nothing to tear down); resume-on-boot skips them (drainer picks up),
+  as do archival/usage/PR scans.
+- **The agent queue is for spawns whose HOST is already the decision** (an explicit "+ New session",
+  or a ticket session waiting on its repo to clone). A ticket spawn waiting for a SLOT is not — it
+  waits in the hub's ticket queue (`CLAUDE.md`); landing here for that reason is a race, not normal.
+- **A repo is forkable when it has a commit to detach at, never when `.git` exists** (XERK-343): `git
+  clone` creates `<dest>/.git` with an unborn HEAD before fetching an object, so a repo is offerable
+  in the composer for its whole clone, and detaching mid-window dies with `fatal: invalid reference:
+  HEAD`. `repo_forkable` gates the spawn and drain release, taking no base ref (that's
+  `resolve_base_ref`'s job; holding for one not yet landed only delays the accurate error).
+  - **Not `repo_head_ready`** — a repo with an unborn local HEAD over a live `origin/<default>` (an
+    orphan checkout, a hand-bootstrapped init+fetch) forks fine; gating on HEAD wrongly refused it.
+    `repo_head_ready` is right only in `_worktree_add`'s pre-flight, which fires right before
+    detaching at HEAD.
+  - **Only a clone of OURS turns unforkable into a wait** (`_cloning`) — nothing the agent does fixes
+    an empty repo, and `awaiting-clone` renders as "cloning the repo first" everywhere else it would
+    be a lie. `repo_head_ready` fails OPEN: "can't tell" degrades to git's own error, never to a
+    forever-queued session.
+  - In the drain, the deadline is checked BEFORE the re-clone, neither running while a clone job is
+    live (`_poll_clones` bounds that). `clone()` files a refusal under `slugify(spec)` — a 3-segment
+    GitLab/ADO spec must land under a key the job lookup can see, or it retries forever behind an
+    `elif` with `awaitCloneSince` never bounding anything.
+  - **A clone does NOT outlive its manager** — a restart mid-clone leaves a directory `clone()`
+    refuses as an existing dest, nothing can retry it, so that session errors in ONE beat naming the
+    dir rather than spinning to the deadline. Removing it is the operator's call. The re-clone is only
+    for nothing-on-disk, and runs once (`awaitCloneRetried`).
+  - **The drain branches on the clone job's STATUS; a `done` job is its own answer** — a clone of an
+    empty upstream exits 0, so the job finishes while the repo stays unforkable; once `_poll_clones`
+    prunes it (30s) that's indistinguishable from an interrupted clone, so neither message claims a
+    cause after that point.
+  - `repo_forkable` skips the fetch, so it only ever UNDER-counts, never releases a session that then
+    fails — except a DANGLING `origin/HEAD` (default branch only on the remote), which costs that
+    session the deadline. Adding a fetch isn't the trade: it would run per queued session per beat.
+- **`scan_repos()` deliberately still lists a repo mid-clone** — the check costs a `git` per repo per
+  beat and the gates above already cover it.
 - Tests: `TestSessionLifecycle`, `TestSpawnTicket`, `TestSpawnDuringAnUnfinishedClone`,
-  `TestRepoHeadReady` in `test_hub_agent.py`; `sessions.test.js`.
+  `TestRepoHeadReady`, `sessions.test.js`.
 
 ## Kill, resume, delete
 
 - **Killing** drops the registry record but KEEPS its worktree (uncommitted work survives),
   conversation and token-usage history, moving it to the Sessions page's **Ended sessions** list.
-- `_remember_closed` **snapshots onto the closed record** the `prUrls` this session opened and its
-  `transcriptId`; `_forget_session_caches` drops both moments later, so that snapshot is the only
-  thing keeping an ended session's PR chips reachable.
+- `_remember_closed` snapshots the closed record's `prUrls` + `transcriptId`; `_forget_session_caches`
+  drops both later — that snapshot is the only thing keeping an ended session's PR chips reachable.
 - The closed history is a **cache of what a kill knew, not the record that it happened**, capped at
-  `CLOSED_PER_REPO` per repo. **Anything that must survive belongs on the durable side** — the
-  transcripts under `~/.claude` (which `_resumable_report()` re-derives from), the hub's archive,
-  and `~/.turma`.
-- **`~/.turma`'s durability is the HOST's to provide, and no code here may assume it.** It lives in
-  the agent user's home on the host, so a reinstall/update must preserve it; every ledger still
-  reconciles from disk rather than trusting itself.
-- Resuming relaunches `claude --resume <transcript id>` **cwd'd at that transcript's origin path**,
+  `CLOSED_PER_REPO` per repo. Anything that must survive belongs on the durable side: the transcripts
+  under `~/.claude` (`_resumable_report()` re-derives from them), the hub's archive, `~/.turma`.
+- **`~/.turma`'s durability is the HOST's to provide** — a reinstall/update must preserve it; every
+  ledger reconciles from disk rather than trusting itself.
+- Resuming relaunches `claude --resume <transcript id>` cwd'd at that transcript's origin path,
   re-creating a deleted/pruned worktree there first: Claude scopes id lookup to a repo's live
-  worktrees + repo dir, so the origin must exist for `--resume` to resolve. A dev-machine session
-  synced through the shared `~/.claude` has a foreign cwd and stays view-only.
-- **Delete** (on a stopped session) also removes the worktree; since the app owns no branch, any the
-  agent committed survives.
+  worktrees + repo dir. A dev-machine session synced through the shared `~/.claude` has a foreign cwd
+  and stays view-only.
+- **Delete** (on a stopped session) also removes the worktree; any branch the agent committed
+  survives (the app owns no branch).
 
 ## New-work branching policy
 
 - A session's checkout is only as fresh as spawn (`default_base_ref`'s short-bounded `git fetch`
   falls back to a stale local ref; a repos-root session works on whatever branch the host last left
   checked out).
-- So every launch (spawn AND resume) passes **`--append-system-prompt`** a fixed directive
-  (`NEW_WORK_SYSTEM_PROMPT`) telling the agent to refresh the base ITSELF when it starts new work:
-  `git fetch origin`, resolve the default via `refs/remotes/origin/HEAD`, cut its branch from that
-  **remote** ref rather than the current HEAD, carrying uncommitted work across and flagging a stale
-  base when the fetch fails.
-- It's `--append-system-prompt` because settings.json has no field carrying instructions, and a
-  **directive rather than manager-side enforcement** because only the agent knows when "new work"
-  begins. Tests: `TestSessionLifecycle`.
+- Every launch (spawn AND resume) passes **`--append-system-prompt`** a fixed directive
+  (`NEW_WORK_SYSTEM_PROMPT`): refresh the base ITSELF when starting new work — `git fetch origin`,
+  resolve the default via `refs/remotes/origin/HEAD`, cut from that **remote** ref (not current
+  HEAD), carry uncommitted work across, flag a stale base on fetch failure.
+- It's `--append-system-prompt` (settings.json has no instruction field) as a **directive, not
+  manager-side enforcement**, since only the agent knows when "new work" begins. Tests:
+  `TestSessionLifecycle`.
 
 ## Cross-session messaging (XERK-339)
 
-- Every Turma session is an ordinary Claude Code session, so the fleet gets peer messaging
-  (`ListAgents`/`SendMessage` over a per-session inbox socket) for free — but only once three
-  launch-time facts are fixed, none of which defaults usefully here. All three live in
-  `_launch_tmux` and `build_guard_settings`; the reasoning is in `PEERS_FILE`'s comment.
-- **`--name` pins the peer name to the RC name**, so a session is addressed identically whether a
-  peer reaches it over the local socket or across hosts through Remote Control. Claude's own default
-  is the working directory's folder name — for a Turma session the random worktree dir (`b0d0d-a0`),
-  which names nothing. Never drop the flag from a launch path: an anonymous session is unreachable.
-- **`crossSessionInbound: accept` on the `--settings` file** — see `.claude/rules/agent-hooks.md`
-  for why the default is actively harmful here rather than merely unhelpful.
-- **`PEERS_FILE` (`~/.turma/peers.tsv`) is a session's ONLY address book**, because `ListAgents` is
-  denied outright — so what is in it is the org boundary, not a convenience. See the cross-cutting
-  contract in `CLAUDE.md` for the hub half; this file owns the agent half.
-  - `ListAgents` answers with the operator's WHOLE fleet — 291 rows / 18.4 KB measured here,
-    truncated past that, at which point `SendMessage` warns it could not check every session for the
-    name it is addressing. Nearly all of it is dead Remote Control rows the agent cannot prune, and
-    **reusing an `rcName` does not help**: a `--remote-control` launch registers a NEW server-side
-    session whatever name it is given (verified — two launches under one name produced two session
-    ids), so reuse bounds the names in that roster and not the rows. Don't propose it again.
-  - `_ingest_peers` takes the hub's org-scoped rows off the heartbeat reply; `_peer_rows` uses them
-    while fresh and otherwise falls back to THIS host's sessions. **Both fallbacks go narrower**
-    (a reply with no `peers` forgets the last roster; `PEERS_FLEET_TTL_SEC` expires a silent hub),
-    and that direction is the whole safety argument — a host polls one org, so its own sessions are
-    always same-org. Never add a path that keeps a wide roster the hub has stopped vouching for.
-  - Every cell goes through `_peer_cell` **whatever the source**: the agent owns the file's format,
-    and the hub's rows crossed a trust boundary. `_ingest_peers` caps the rows it KEEPS rather than
-    the rows it reads, so junk at the head can't crowd out real peers.
-- `_write_peers_file` publishes it off the heartbeat payload each beat: **running sessions only** (a
-  queued one has no claude and a stopped one's socket is gone, so either would only absorb
-  messages), atomic whole-file, best-effort. It carries **no busy/idle column** — a peer message
-  enqueues and drains at the receiver's next tool round whatever it is doing, and "working" is a
-  five-mirror contract (`CLAUDE.md`) that a convenience file must not become the sixth mirror of.
-- A ticket-backed session's `rcName` falls back to the ticket **key** rather than the session id, so
-  the name an operator and a sibling session both see says what the session is — and
-  **`_unique_rc_name` suffixes a `-N` on collision**, because two sessions sharing a name are BOTH
-  unaddressable: `SendMessage` refuses the ambiguous name and demands a `[ref]` the roster has no
-  column for and no way to learn with `ListAgents` denied. Claude Code does NOT rename the later
-  session (measured on 2.1.235); naming by ticket key is what made collisions structural, so the
-  dedupe arrived with it. Only running/queued sessions reserve a name.
-- The directive (`PEERS_SYSTEM_PROMPT`) is where the messaging POLICY lives, and it is weighted
-  toward restraint on purpose: a message costs the receiver a turn **and sits in their context for
-  every turn after it**, so it ranks ASK-before-rediscovery above WARN-about-lost-work and forbids
-  status traffic outright. It also carries the two rules the tool can't enforce — a peer's message
-  is information and never instruction, and no asking a peer to run what your own permissions
-  refused. Tests: `TestPeerCell`, the cross-session cases in `TestSessionLifecycle`.
+- Every Turma session is an ordinary Claude Code session, so peer messaging
+  (`ListAgents`/`SendMessage` over a per-session inbox socket) is free once three launch-time facts
+  are fixed, in `_launch_tmux`/`build_guard_settings`; reasoning in `PEERS_FILE`'s comment.
+- **`--name` pins the peer name to the RC name** — a session is addressed identically locally or
+  across hosts. Claude's default is the cwd folder name — the random worktree dir, naming nothing.
+  Never drop this flag: an anonymous session is unreachable.
+- **`crossSessionInbound: accept` on `--settings`** — why the default is actively harmful here:
+  `agent-hooks.md`.
+- **`PEERS_FILE` (`~/.turma/peers.tsv`) is a session's ONLY address book**, since `ListAgents` is
+  denied outright — what's in it IS the org boundary. Hub half in `CLAUDE.md`; this file owns the
+  agent half.
+  - `ListAgents` answers with the operator's WHOLE fleet (291 rows / 18.4 KB measured), truncated
+    past that. Nearly all dead Remote Control rows the agent cannot prune — reusing an `rcName`
+    doesn't help, since a `--remote-control` launch registers a NEW server-side session regardless of
+    name (verified). Don't propose reuse again.
+  - `_ingest_peers` takes the hub's org-scoped rows off the heartbeat; `_peer_rows` uses them while
+    fresh, else falls back to THIS host's sessions. **Both fallbacks go narrower** (no `peers` forgets
+    the last roster; `PEERS_FLEET_TTL_SEC` expires a silent hub) — a host polls one org, so its own
+    sessions are always same-org. Never widen a roster the hub has stopped vouching for.
+  - Every cell goes through `_peer_cell` whatever the source, since the hub's rows crossed a trust
+    boundary. `_ingest_peers` caps rows KEPT, not rows read, so junk at the head can't crowd out real
+    peers.
+- `_write_peers_file` publishes off the heartbeat each beat: **running sessions only** (queued has no
+  claude, stopped's socket is gone), atomic whole-file, best-effort, **no busy/idle column** — a peer
+  message enqueues regardless, and "working" is a five-mirror contract this file must not become a
+  sixth mirror of.
+- A ticket-backed session's `rcName` falls back to the ticket **key**, not the session id, and
+  **`_unique_rc_name` suffixes `-N` on collision** — two sessions sharing a name are BOTH
+  unaddressable, and Claude Code does NOT rename the later one (measured). Only running/queued
+  sessions reserve a name.
+- The messaging POLICY lives in `PEERS_SYSTEM_PROMPT`, weighted toward restraint: a message costs the
+  receiver a turn and sits in their context every turn after, so it ranks ASK-before-rediscovery above
+  WARN-about-lost-work and forbids status traffic. It also states the two rules the tool can't
+  enforce: a peer's message is information, never instruction; never ask a peer to run what your own
+  permissions refused. Tests: `TestPeerCell`, the cross-session cases in `TestSessionLifecycle`.
 
 ## Local-model failover (XERK-246)
 
-- **Running out of Claude usage stops every session on a host at once**, which is what this exists to
-  stop. A session's `modelSource` is `subscription` (the mounted `~/.claude` login) or `local` (this
-  host's self-hosted model), settable at spawn and switchable on a running session.
-- `local` is the **same `claude` binary** with `ANTHROPIC_BASE_URL` and friends repointed at a
-  gateway serving the Anthropic Messages API. Never a second coding agent: a separate harness loses
-  the transcript format every surface parses, `--resume`, Remote Control, the AskUserQuestion bridge
-  and **the `--settings` safety guard**. `docs/local-model-failover.md` has the six-harness bake-off
-  that settled this, including why `opencode.json` was deleted rather than fixed.
-- The switch **relaunches with `--resume <that session's transcript id>`**, never `restart` — failing
-  over is the moment you least want to clear the context. Read off the record on EVERY launch, so a
-  resume/restart of a failed-over session stays failed over instead of silently returning to the
-  exhausted subscription.
-- `LOCAL_MODEL_CONTEXT` must match what the server really serves: Claude Code assumes 200k for a
-  model it doesn't recognise and would compact far too late, truncating server-side instead. The
-  default tracks the cue LLM's per-slot window, sized per host in `turma-agent.env` — when that moves, this moves.
-- **It is a fallback, not a peer** — the local model solved 4/8 of the bench Claude would be expected
-  to clear. The UI marks a `local` session so nobody has to wonder which model wrote a turn.
-- **Automatic delegation to the local model is deliberately NOT shipped**; the token arithmetic
-  doesn't obviously work (diagnosis dominates, and Claude must diagnose before it can delegate). See
-  the doc before building it.
+- **Running out of Claude usage stops every session on a host at once** — what this exists to stop.
+  `modelSource` is `subscription` (mounted `~/.claude` login) or `local` (host's self-hosted model),
+  settable at spawn and switchable live.
+- `local` is the **same `claude` binary** with `ANTHROPIC_BASE_URL` repointed at a gateway serving the
+  Anthropic Messages API — never a second coding agent, which loses the transcript format every
+  surface parses, `--resume`, Remote Control, the AskUserQuestion bridge and the `--settings` safety
+  guard. Bake-off: `docs/local-model-failover.md`.
+- The switch **relaunches with `--resume <transcript id>`, never `restart`** — failing over is the
+  moment you least want to clear context. Rewrites `local-model.env` (`ANTHROPIC_MODEL` +
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS`). Read off the record on EVERY launch, so a resume/restart
+  stays failed over.
+- `LOCAL_MODEL_CONTEXT` must match what the server really serves: Claude Code assumes 200k for an
+  unrecognised model, and an overstated `CLAUDE_CODE_MAX_CONTEXT_TOKENS` compacts too late,
+  truncating server-side. Sized per host in `turma-agent.env`.
+- **A fallback, not a peer** — solved 4/8 of the bench Claude would clear. The UI marks a `local`
+  session so nobody wonders which model wrote a turn.
+- **Automatic delegation to the local model is deliberately NOT shipped** — the token arithmetic
+  doesn't obviously work (diagnosis dominates). See the doc before building it.
 
 ### Endpoint model discovery + live per-session model (XERK-489)
 
-- **`LOCAL_MODEL_NAME`/`LOCAL_MODEL_CONTEXT` are OPTIONAL now** — the DEFAULT model and its fallback
-  window. With only base+key set, the endpoint's model list is DISCOVERED and the first discovered
-  id is the default. A configured `LOCAL_MODEL_NAME` still wins as the default. `local_model_default`
-  / `local_model_context` / `local_model_member` are the resolvers; `local_model_configured` now also
-  requires a usable model (a discovered list OR a configured default), so a base+key host stays
-  hidden until discovery lands (silent — that is "not ready", not an error).
-- **Discovery runs on a WORKER THREAD, never the beat** (`start_local_model_discovery`,
-  `_local_model_discovery_loop`) — a blackholed endpoint must not stall the heartbeat past
-  `OFFLINE_AFTER_MS`, the XERK-395 rule that moved archive-sync/prune off-beat. It polls
-  `{root}/v1/models` for ids and LiteLLM's `{root}/model/info` for per-model `max_input_tokens`
-  (a bare OpenAI endpoint has no such route → null window → the fallback applies). The beat only ever
-  reads the cache (`discovered_local_models`, lock-guarded whole-list rebind). A failed pass KEEPS
-  the last good list — never blank a working dropdown. Heartbeat `localModel` gains
-  `models:[{id, contextTokens|null}]` + `defaultModel`; `model`/`contextTokens` stay the current
-  default for back-compat.
-- **A local session's MODEL is per-session, live-switchable** (`localModelName`/`localModelContext` on
-  the record): the switch rewrites `local-model.env` (`ANTHROPIC_MODEL` + `CLAUDE_CODE_MAX_CONTEXT_TOKENS`)
-  and relaunches via `--resume` — the setModelSource machinery, minus the source change
-  (`_switch_local_model`). `set_model` for a local session routes here instead of refusing; the
-  `/model` TUI picker stays refused (its Claude rows all 403 the gateway). `setModelSource` takes an
-  optional `model` for a one-step subscription→local switch onto a chosen model; spawn takes
-  `local_model`.
+- **`LOCAL_MODEL_NAME`/`LOCAL_MODEL_CONTEXT` are OPTIONAL** — with only base+key set, the endpoint's
+  model list is DISCOVERED and the first id is the default; a configured name still wins.
+  `local_model_configured` now also requires a usable model (discovered OR configured), so a base+key
+  host stays hidden until discovery lands (silent — "not ready", not an error).
+- **Discovery runs on a WORKER THREAD, never the beat** (`start_local_model_discovery`) — a
+  blackholed endpoint must not stall the heartbeat past `OFFLINE_AFTER_MS` (XERK-395). It polls
+  `{root}/v1/models` for ids and LiteLLM's `{root}/model/info` for per-model `max_input_tokens` (a
+  bare OpenAI endpoint has no such route → null window → fallback applies). The beat only reads the
+  cache (`discovered_local_models`, lock-guarded); a failed pass KEEPS the last good list. Heartbeat
+  `localModel` gains `models:[{id, contextTokens|null}]` + `defaultModel`.
+- **A local session's MODEL is per-session, live-switchable** (`localModelName`/`localModelContext`):
+  the switch rewrites `local-model.env` and relaunches via `--resume` (`_switch_local_model`).
+  `set_model` for a local session routes here instead of refusing; the `/model` TUI picker stays
+  refused (its rows all 403 the gateway).
 - **Membership is validated before the gateway sees it** (`local_model_member`), on top of the
-  charset gate — a model the host doesn't serve errors the card rather than 403ing every turn. An
-  EMPTY discovered set can't DISPROVE membership (discovery not landed) so it accepts charset-valid;
-  the launch demotes cleanly if the endpoint truly lacks it. The window only ever SHRINKS to the
-  served figure (an overstated `CLAUDE_CODE_MAX_CONTEXT_TOKENS` compacts too late and truncates).
-- **The choice rides every rebuild** beside `modelSource` — closed record, resume, resume-any,
-  migration in, boot — and migration RE-VALIDATES against the target's own discovered set (falls back
-  to the target default). Tests: `TestLocalModelConfig` (discovery/resolvers), `TestLocalModelFailover`
-  (switch/spawn/persistence).
+  charset gate — an EMPTY discovered set can't DISPROVE membership, so it accepts charset-valid and
+  the launch demotes cleanly if the endpoint lacks it. The window only ever SHRINKS to the served
+  figure.
+- **The choice rides every rebuild** beside `modelSource`; migration RE-VALIDATES against the
+  target's own discovered set. Tests: `TestLocalModelConfig`, `TestLocalModelFailover`.

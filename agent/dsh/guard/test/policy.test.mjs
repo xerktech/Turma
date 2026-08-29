@@ -20,6 +20,23 @@ const HOOKS = path.resolve(HERE, '..', '..', '..', 'hooks')
 const HOME = os.homedir()
 const CWD = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-guard-cwd-'))
 
+// Mirrors hub-agent.py's `_realpath_glob_prefix` (XERK-503): resolve symlinks in
+// the LITERAL portion of a glob before matching against it, since `decideDeny`
+// realpaths the TARGET (see resolveTarget below). Without this, a HOME
+// subdirectory that is itself a symlink -- a bind mount, or on WSL the
+// Windows-side profile -- silently stops matching once the target resolves
+// elsewhere. Falls back to the un-resolved literal on any resolution error
+// (nonexistent path), exactly like Python's `os.path.realpath`.
+function realpathGlobPrefix(p) {
+  const m = p.match(/[*?]/)
+  if (m === null) {
+    try { return fs.realpathSync(p) } catch { return p }
+  }
+  const cut = p.lastIndexOf('/', m.index - 1)
+  if (cut < 0) return p
+  try { return fs.realpathSync(p.slice(0, cut)) + p.slice(cut) } catch { return p }
+}
+
 // A config shaped exactly like `build_dsh_guard_config()` output, with the
 // credential/roster globs the real builder derives from build_guard_settings.
 const cfg = compileConfig({
@@ -36,9 +53,9 @@ const cfg = compileConfig({
     `${HOME}/.claude/hooks/**`,
     `${HOME}/.turma/guard-settings.json`,
     `${HOME}/.local/lib/python*/site-packages/**`,
-  ],
-  denyRead: [`${HOME}/.turma/local-model.env`],
-  allowRead: [`${HOME}/.turma/uploads/**`, `${HOME}/.turma/peers.tsv`],
+  ].map(realpathGlobPrefix),
+  denyRead: [`${HOME}/.turma/local-model.env`].map(realpathGlobPrefix),
+  allowRead: [`${HOME}/.turma/uploads/**`, `${HOME}/.turma/peers.tsv`].map(realpathGlobPrefix),
 })
 
 const ex = (name, args) => ({ name, arguments: args })

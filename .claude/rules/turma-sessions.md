@@ -10,406 +10,282 @@ paths:
 
 # `turma/` — the Sessions page and its chat engine
 
-Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to keep both under the
-40,000-character ceiling; read that file too for the shared chrome, the org filter and notifications.
+Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications) to stay under the
+40,000-char ceiling.
 
 ## The page
 
-- **`turma/public/chat.js` is VENDORED into glasses byte-identical** as `glasses/src/vendor/chat.cjs`
-  (like `board.js` → `board.cjs`), asserted by `glasses`'s `vendor.test.ts` and gated by `glasses-ci.yml`.
-  Any edit to `chat.js` must be re-copied there in the SAME change (`cp turma/public/chat.js
-  glasses/src/vendor/chat.cjs`), or glasses CI fails on the byte-identical check.
-- **The fleet payload is polled ONCE, at load, whenever SSE is healthy** — `fastPoll` returns early
-  and the fallback interval only fires when it isn't. So anything on `cache` that must MOVE in the
-  browser needs its own `es.addEventListener` in `connectSSE`; `agent`, `removed`, `orgColors` and
-  `migrations` each have one. A hub-broadcast event with no listener here reads as a feature that
-  works in tests and never updates in front of the operator (that was every in-flight move: its
-  phase stayed at load state, so the follow never saw `importCmdId` and never surfaced a failure).
-- Opens a running session in a **native chat view by default** (`turma/public/chat.js`) instead of
-  the raw ttyd terminal, streaming over the `/live/<host>/<id>` WebSocket (ws-token auth, seeded
-  from the heartbeat's cached tail, scrollback from `GET .../history`, `/history`-poll fallback when
-  the socket is down).
-- **The stage is dropped only on POSITIVE evidence that the SESSION went** (XERK-252) — its own host
-  reporting it stopped, or reporting without it. Three things that are NOT that evidence, each of
-  which used to evict the operator mid-read:
-  - **A host whose terminal tunnel went offline.** Every hub restart flaps every host's control
-    channel (they all reconnect within a second or two) while the sessions keep running and keep
-    heartbeating. The stage holds, both bars show a chip (`setStageTunnel`, mirrored by Android's
-    `liveMarker`), and the RETURN heals in place: the chat reconnects its socket at once
-    (`TurmaChat.reconnectNow`, since the hub held the watch and re-arms it) and the ttyd iframe is
-    re-navigated, because its WebSocket died with the tunnel and nothing inside the frame retries.
-    Transitions only — re-navigating per beat restarts the terminal every few seconds.
-    - The chip **says which fault it is**: a host still heartbeating reads "⚠ tunnel offline" and
-      promises the session is running; one that has gone silent reads "⚠ host offline" and promises
-      nothing. Since the stage no longer clears itself, the chip carries a **Close** beside it —
-      otherwise a dead host with no other session to pick leaves no way off the stage.
-    - `stageTunnelOnline` belongs to ONE staged subject: every path that re-points the stage calls
-      `stageTunnelReset()`. Left stale, the next session's first beat reads as a tunnel RETURN and
-      fires the heal at a view that never lost anything — which opened a duplicate `/live` socket.
-  - **A beat that doesn't mention the host at all** (a hub answering before the first heartbeat
-    lands, a failed refresh). Silence about a host says nothing about its sessions;
-    `currentHostKey` is what tells the two apart.
-  - **The org filter.** The check reads the WHOLE fleet (`sessionRecord`, like `sessionHit`), never
-    the org-scoped `running` — scoping is a sidebar concern (XERK-62).
-  - `loadHistory` bails before building its URL when the view has closed; without it a 202-retry
-    timer fetches `/api/agents/null/sessions/null/history`.
-  - **`startWs` is single-flight PER GENERATION** (`wsStarting`): it assigns `ws` only after the
-    ws-token round trip, so two connects for one view (a retry timer and a nudge) each built a
-    socket and `close()` — which knows only the last — leaked the other, leaving the hub a live
-    client it never unwatched. Keyed by generation, not a bare flag, so opening a DIFFERENT session
-    still connects. Tests: the tunnel-flap cases in `sessions.test.js`, `chat-live.test.js`.
-- It renders chat bubbles — **user right, agent left** — with collapsible tool-action cards
-  (tool_use + its paired tool_result, error-styled) and collapsed thinking traces, and the
-  in-progress turn as a trailing bubble.
-  - **A `TodoWrite` / dsh `todo_write` tool call renders as a CHECKLIST, not raw-JSON input**
-    (`renderTodoCard`): a state glyph per row (○ pending / ◐ in-progress / ✓ done) and a one-line
-    count on the summary (`1 in progress · 6 pending`) so it reads even collapsed. Both runtimes
-    share the `{content, status, activeForm?}` snapshot the AGENT attaches to the block
-    (`_tool_use_detail`/`toolUseDetail` → `todos`, capped `TODO_ITEMS_MAX`); dsh's todos ride the S1
-    projection's `todo_write` tool_use, so this is one renderer for Claude and dsh with no new
-    reader. Each call is a fresh whole-list snapshot (last-wins), so the newest card is the current
-    list. Tests: the `todo_write`/`TodoWrite` cases in `chat.test.js`, `tunnel-agent.test.js`,
+- **`chat.js` is VENDORED into glasses byte-identical** as `glasses/src/vendor/chat.cjs` (like
+  `board.js`), asserted by `vendor.test.ts`, gated by `glasses-ci.yml`. Re-copy on every edit (`cp
+  turma/public/chat.js glasses/src/vendor/chat.cjs`) or glasses CI fails.
+- **The fleet payload is polled ONCE, at load, while SSE is healthy** — the fallback interval only
+  fires when SSE isn't. Anything on `cache` that must MOVE in the browser needs its own
+  `es.addEventListener` in `connectSSE` (`agent`, `removed`, `orgColors`, `migrations` each have one);
+  an event with no listener silently never updates the UI (every in-flight move's phase used to stick
+  at load state this way).
+- Opens a running session in a **native chat view by default** (`chat.js`), not the raw ttyd
+  terminal, over `/live/<host>/<id>` (ws-token auth, seeded from the cached tail, `/history` scrollback
+  + poll fallback when the socket is down).
+- **The stage drops only on POSITIVE evidence the SESSION went** (XERK-252) — its host reporting it
+  stopped, or reporting without it. Three things that are NOT that evidence, each used to wrongly
+  evict the operator mid-read:
+  - **A host's terminal tunnel going offline** (every hub restart flaps every control channel for a
+    second or two while sessions keep heartbeating). The stage holds, both bars show a
+    "⚠ tunnel offline"/"⚠ host offline" chip (`setStageTunnel`, mirrored by Android's `liveMarker`,
+    the wording says which fault it is) with a **Close** beside it, and the RETURN heals in place:
+    chat reconnects at once (hub held the watch, re-arms it), ttyd re-navigates (transitions only, or
+    it restarts the terminal every few seconds). `stageTunnelReset()` must be called by every path
+    that re-points the stage, or a stale flag reads the next session's first beat as a false RETURN
+    and opens a duplicate socket.
+  - **A beat that doesn't mention the host at all** (pre-first-heartbeat reply, a failed refresh) —
+    silence about a host says nothing about its sessions; `currentHostKey` distinguishes the two.
+  - **The org filter** — the stage check reads the WHOLE fleet (`sessionRecord`), never the org-scoped
+    `running` (scoping is a sidebar-only concern, XERK-62).
+  - `loadHistory` bails before building its URL once the view has closed, or a 202-retry timer fetches
+    `/api/agents/null/sessions/null/history`.
+  - **`startWs` is single-flight PER GENERATION** (`wsStarting`) — two connects for one view (a retry
+    + a nudge) otherwise each open a socket, and `close()` only knows the last, leaking the other as a
+    live client the hub never unwatched. Keyed by generation so opening a DIFFERENT session still
+    connects. Tests: the tunnel-flap cases in `sessions.test.js`, `chat-live.test.js`.
+- Renders chat bubbles — user right, agent left — with collapsible tool-action cards (tool_use +
+  paired tool_result, error-styled), collapsed thinking traces, in-progress turn as a trailing bubble.
+  - **`TodoWrite`/dsh `todo_write` renders as a CHECKLIST, not raw JSON** (`renderTodoCard`): a state
+    glyph per row + a one-line count so it reads collapsed. Both runtimes share the agent-attached
+    `{content, status, activeForm?}` snapshot, capped `TODO_ITEMS_MAX` (dsh rides the S1 projection's
+    `todo_write` tool_use, so
+    one renderer serves both with no new reader). Each call is a fresh whole-list snapshot (last
+    wins). Tests: the `todo_write`/`TodoWrite` cases in `chat.test.js`, `tunnel-agent.test.js`,
     `test_hub_agent.py`.
-  - **No text ever types in** (XERK-251): a capture is painted whole the frame it arrives, in this
-    and every other client. The typewriter was animation over an already-~1s-delayed pane scrape —
-    it delayed the text further and bought nothing. Don't reintroduce one.
-  - **dsh sessions genuinely stream** (unlike claude's pane scrape): `tunnel-agent.js` folds the
-    dsh native event log's `assistant/chunk` deltas into the SAME `turn` frames a claude pane
-    scrape produces (`pollDshTurn`/`foldDshView`), so a dsh response grows in the live bubble as it
-    generates instead of appearing whole when `assistant/message` commits. It is a real-time stream
-    over the existing `/live` socket, NOT a reintroduced typewriter — the committed
-    `assistant/message` clears the bubble and the projected transcript tail owns it. This reads the
-    native events file directly; the S1 projection is untouched, per the ADR. Tests: the
+  - **No text ever types in** (XERK-251) — a capture paints whole the frame it arrives; a typewriter
+    would only add delay on top of the ~1s pane-scrape delay. Don't reintroduce one.
+  - **dsh sessions genuinely stream** (unlike claude's pane scrape): `tunnel-agent.js` folds the dsh
+    native log's `assistant/chunk` deltas into the same `turn` frames a pane scrape produces
+    (`pollDshTurn`/`foldDshView`), so a response grows live instead of appearing whole at commit. Reads
+    the native events file directly; the S1 projection is untouched (`docs/dsh-adr.md`). Tests: the
     `pollDshTurn`/`foldDshView`/`dshEventsPath` cases in `tunnel-agent.test.js`.
   - **A generating dsh turn frame carries a working `status`** (`dshStatus`): the fixed
-    **"Deep diving…"** verb dsh's own web UI uses, plus an elapsed clock that appears only once the
-    turn passes **15s** (`fmtDshElapsed`, matching dsh's `showClock = elapsedMs >= 15e3`). Elapsed
-    is dsh's OWN event timestamps (`turn/start` → newest event), never a wall clock, so the frame
-    stays deterministic. The status carries **`noStop: true`**, because a dsh turn has no
-    pane-Escape interrupt (kill ends the whole session) — `composeBusy()` hides Stop on that flag
-    while the bar still shows the verb. This REPLACES the earlier "dsh frames carry no status"; the
-    six-mirror "Working" contract is unchanged (that keys on the heartbeat `paneBusy`/`dsh_pane_busy`,
-    not the chat's `liveStatus` bar). Tests: the Deep-diving cases in `tunnel-agent.test.js`.
-  - The live turn is the tmux **pane scrape's "last ● bullet"**, NOT monotonic (XERK-19): it SWAPS
-    blocks mid-turn, so every `turn` frame is CLASSIFIED by `applyTurn` before it reaches the bubble
-    — an empty frame or a tool-use bullet (`isToolBullet`, biased toward matching since a miss
-    brings the flicker back) CLEARS it, the same prose block keeps the LONGER text and never shrinks
-    (a shorter re-capture is the TUI redrawing mid-frame), a different one replaces it wholesale.
-    Tests: `chat-selection.test.js`.
-- Bubble prose is rendered by `renderProse`: **fenced ` ``` ` blocks** become `<pre
-  class="md-code">` (language chip from the info string), inline **` `code` ` spans** become `<code
-  class="md-code-inline">` chips (`renderInline`), GFM **tables** become real `<table>`s, else
-  linkified.
-  - Passes nest outward-in — fence, table, inline, link — so a code body is never linkified, and the
-    fence pass runs above the table pass. An inline span never crosses a line break; an
-    **unterminated fence renders as code**. A code-carrying bubble takes a **definite** `width:
-    min(760px, 100%)` (`:has()`-scoped), out of shrink-to-fit sizing so overflow lands on its own
-    scroller, not a grid track.
-  - **Images/SVGs render inline (XERK-221)**: `![alt](url)` → `<img>` (`linkify`, src `http(s)` +
-    `data:image/*`); a line-start raw `<svg>` (`renderSvgAndText`) or all-SVG fence body → a
-    sandboxed `data:image/svg+xml` `<img>` (`svgToImg`) — **never DOM-injected**, so embedded
-    `<script>`/`onload` can't run. SendUserFile deliveries render the same way (`renderToolFiles`:
-    images inline, HTML in a fully sandboxed iframe, open by default). Android deferred
-    (`android/PARITY.md`). Tests: `linkify`/`renderProse` in `chat.test.js`.
-- A per-session **verbosity control** (Concise/Normal/Verbose presets + per-type
-  thinking/tool-calls/tool-outputs toggles, persisted in `localStorage`) filters which `blocks[]`
-  show — client-side, over the received buffer.
-- Typed prompts go to `POST .../input`; pending `AskUserQuestion`s answer via option chips / custom
-  text to `POST .../answer`.
-- The pending-question box renders Claude Code's full picker: each option a card with its
-  `description` + collapsible **`preview`**, a `header` chip and an "n of N" counter, riding
-  `questionOptionsRich`/`questionHeader`/`questionIndex`/`questionTotal`/`questionMulti` beside the
-  backward-compat `questionOptions` labels, so glasses/android keep the flat list. A
-  **`multiSelect`** question renders checkboxes + a Submit that POSTs `optionIndices`;
-  `optionCardHtml` builds each card.
-- The raw ttyd terminal stays one **"Terminal ▸" toggle** away in the chat header (`#termPane`
-  iframe). `GET /api/ws-token` also authenticates the web chat's `/live` socket. Tests:
-  `chat.test.js`.
-- **A dsh session is HEADLESS — it hides "Terminal ▸" and shows "Trajectory ▸" instead** (XERK-498):
-  a Turma-native read-only view (`#trajPane`, `renderTrajectory`) over the dsh D3 NATIVE event log,
-  which the raw archive layer already holds (`<tid>/dsh/*.jsonl`, XERK-469). `chatToTrajectory` fetches
-  `GET /api/dsh/<transcriptId>/trajectory` (parsed server-side by `archive.dshTrajectory` into
-  turns/steps/tool-calls/token-usage/timings — the richer telemetry the S1 projection flattens) and
-  renders newest-turn-first. This REPLACES the removed PER-SESSION dsh terminal/web-server; there is
-  no ttyd and no per-session dsh web server. A running session's log syncs to the archive within a
-  few beats, so a just-opened dsh session may 404 until the first sync (the pane says so, ↻ Refresh).
-  The dsh-web-through-tunnel PROXY path was ruled out — `dsh web` has no base-path flag, so it cannot
-  be sub-path-proxied per host. Web-first; Android (`TerminalScreen`) + glasses in `android/PARITY.md`.
-  Tests: the `dshTrajectory` cases in `archive.test.js`, `/api/dsh/<id>/trajectory` in `server.test.js`.
-- **Beside the in-dashboard Trajectory, a dsh session's chat header shows a "dsh web ↗" link**
-  (XERK-501) to the host's SINGLE host-wide `dsh web` (a DIRECT-access read-only viewer over the
-  shared store — `.claude/rules/dsh-input.md`), so the chat can be confirmed in dsh's own UI too.
-  Shown only for a dsh session whose host reports a reachable `dsh.web.url`; a loopback-only host
-  reports none (`url:null`) and the link stays hidden rather than pointing nowhere. Web-first
-  (`android/PARITY.md`).
+    "Deep diving…" verb dsh's own web UI uses, plus an elapsed clock past **15s**
+    (`fmtDshElapsed`/`showClock`), using dsh's OWN event timestamps (deterministic, never wall-clock).
+    Carries **`noStop: true`** — a dsh turn has no pane-Escape interrupt (kill ends the session), so
+    `composeBusy()` hides Stop on that flag while the bar still shows the verb. The "Working" contract
+    (paneBusy/dsh_pane_busy) is unaffected — this only drives the chat's `liveStatus` bar. Tests: the
+    Deep-diving cases in `tunnel-agent.test.js`.
+  - The live turn is the pane scrape's **"last ● bullet"**, NOT monotonic (XERK-19) — it SWAPS blocks
+    mid-turn, so every frame is classified by `applyTurn` before reaching the bubble: an
+    empty/tool-use frame CLEARS it, the same prose block keeps the LONGER text (a shorter re-capture is
+    a mid-frame redraw), a different one replaces wholesale. Tests: `chat-selection.test.js`.
+- Bubble prose via `renderProse`: fenced ` ``` ` → `<pre class="md-code">` (language chip); inline
+  ` `code` ` → `<code class="md-code-inline">`; GFM tables → real `<table>`s; else linkified.
+  - Passes nest outward-in (fence, table, inline, link) so code is never linkified; an inline span
+    never crosses a line break; an unterminated fence renders as code.
+  - **Images/SVGs render inline (XERK-221)**: `![alt](url)` → `<img>`; a raw `<svg>`/all-SVG fence →
+    a sandboxed `data:image/svg+xml` `<img>` — **never DOM-injected**, so an embedded `<script>` can't
+    run. SendUserFile deliveries render the same way (images inline, HTML in a sandboxed iframe).
+    Android deferred (`android/PARITY.md`). Tests: `linkify`/`renderProse` in `chat.test.js`.
+- A per-session **verbosity control** (Concise/Normal/Verbose + per-type toggles, `localStorage`)
+  filters which `blocks[]` show client-side.
+- Typed prompts → `POST .../input`; pending `AskUserQuestion`s answer via option chips/custom text →
+  `POST .../answer`. The picker renders Claude Code's full card set (description + collapsible
+  `preview`, header chip, "n of N" counter) with a backward-compat flat-list fallback for
+  glasses/android; `multiSelect` renders checkboxes + a Submit posting `optionIndices`.
+- Raw ttyd terminal is one **"Terminal ▸"** toggle away (`#termPane` iframe); `GET /api/ws-token` also
+  authenticates the chat's `/live` socket. Tests: `chat.test.js`.
+- **A dsh session is HEADLESS — hides "Terminal ▸", shows "Trajectory ▸"** (XERK-498): a read-only
+  view (`#trajPane`) over the dsh D3 native event log (already in the raw archive,
+  `<tid>/dsh/*.jsonl`), fetched via `GET /api/dsh/<transcriptId>/trajectory` and rendered
+  newest-turn-first. Replaces the removed per-session dsh terminal/web-server. A log syncs to the
+  archive within a few beats, so a just-opened dsh session may 404 until then (pane says so, ↻
+  Refresh). The dsh-web-through-tunnel PROXY path is ruled out (`dsh web` has no base-path flag).
+  Web-first; Android/glasses in `android/PARITY.md`. Tests: `dshTrajectory` in `archive.test.js`,
+  `/api/dsh/<id>/trajectory` in `server.test.js`.
+- **A dsh session's chat header also shows a "dsh web ↗" link** (XERK-501) to the host's single
+  host-wide `dsh web` (direct-access viewer over the shared store, `dsh-input.md`) — shown only when
+  the host reports a reachable `dsh.web.url` (a loopback-only host reports `null`, link stays hidden).
 
 ### The spawn composer's runtime + model (XERK-503)
 
-- **ONE `Runtime` picker, not four selectors.** It collapses the old `Runtime` (claude/dsh) +
-  `Run against` (subscription/local) pair into "Claude Code" / "Claude Code Local" (when
-  `localModel.available`) / "dsh" (when `dsh.available`), shown only when more than one runtime
-  exists. It maps onto the UNCHANGED wire fields in `startSession` — local → `modelSource:local` +
-  `localModel`; dsh → `agentType:dsh` + a discovered dsh `model` — so no backend contract moved.
-  `onOptChange` toggles the per-runtime controls in place (no re-render). "Run against" is gone.
-- **A dsh session offers the endpoint's DISCOVERED models, never Claude aliases.** `dsh.models[]`/
-  `defaultModel` ride the heartbeat exactly like `localModel.models[]` (agent `_dsh_payload`, hub
-  `normalizeDsh`), so dsh and a local session share the SAME list when pointed at one LiteLLM URL.
-  Agent-side (`hub-agent.py`): the pi-ai provider route (`_dsh_cordis_patch`) lists EVERY discovered
-  model + the configured default + the session's pick — a single-model route rejected every other id
-  with pi-ai's "no configured model" error (the lock this fixes); the route is rewritten per launch
-  (`_write_dsh_cordis_patch`) because discovery lands after boot-time profile prep; and spawn resolves
-  a dsh model via `resolve_dsh_model` (validate against the discovered set) NOT `resolve_model` (the
-  Claude-alias allowlist, which was the cause of the lock). dsh still needs `DSH_MODEL` set as the
-  default; discovery only widens the per-session choice.
-- **Permission modes are consistent, and `auto` is MODEL-gated, not provider-gated.** Claude Code and
-  Claude Code Local share the full list (`auto` needs Sonnet 5 / Opus 4.7+ / Fable 5 and downgrades
-  to Manual otherwise — a graceful Claude Code behavior, so it is offered with a hint, never hidden
-  per-runtime). dsh uses `ask`/`never` + a sandbox mode, NOT Claude's modes, so the composer shows an
-  "approvals managed by dsh" note instead of the permission dropdown for dsh. Android in
-  `android/PARITY.md`. Tests: the `Runtime`/`dsh model list` cases in `sessions.test.js`,
-  `normalizeDsh` in `server.test.js`, `TestDshModelDiscovery` in `test_hub_agent.py`.
+- **ONE `Runtime` picker, not four selectors** — collapses the old Runtime (claude/dsh) + "Run
+  against" (subscription/local) pair into "Claude Code" / "Claude Code Local" (if
+  `localModel.available`) / "dsh" (if `dsh.available`), shown only when more than one exists. Maps
+  onto UNCHANGED wire fields (local → `modelSource:local`+`localModel`; dsh →
+  `agentType:dsh`+discovered `model`) — no backend contract moved.
+- **A dsh session offers the endpoint's DISCOVERED models, never Claude aliases** — `dsh.models[]`
+  ride the heartbeat like `localModel.models[]`, so dsh and local share a list when pointed at one
+  LiteLLM URL. Spawn resolves a dsh model via `resolve_dsh_model` (the discovered set), NOT
+  `resolve_model` (the Claude-alias allowlist that previously caused a "no configured model" lock: the
+  pi-ai provider route now lists EVERY discovered model, not just one). `DSH_MODEL` is still the
+  required default; discovery only widens the per-session choice.
+- **Permission modes are consistent; `auto` is MODEL-gated, not provider-gated** — Claude Code/Local
+  share the full list (`auto` needs Sonnet 5/Opus 4.7+/Fable 5, else Manual, offered with a hint
+  rather than hidden). dsh uses `ask`/`never` + a sandbox mode, so the composer shows an
+  "approvals managed by dsh" note instead. Android in `android/PARITY.md`. Tests: the
+  `Runtime`/`dsh model list` cases in `sessions.test.js`, `normalizeDsh` in `server.test.js`,
+  `TestDshModelDiscovery` in `test_hub_agent.py`.
 
 ### The dsh session footer (XERK-504)
 
-- **A dsh session's footer reflects its RUNTIME, not the Claude subscription/local split.** A dsh
-  session carries `modelSource:"subscription"` under the hood (forced at spawn), so the old footer
-  painted it "☁ Subscription" and offered Claude aliases — both wrong. `isDshSession()`
-  (`sess.agentType === "dsh"`) now branches the footer: a read-only **"⚙ dsh"** runtime chip
-  (`dshRuntimeChipHtml` — NOT a picker; a running dsh conversation is a dsh event log, not Claude
-  JSONL, so it cannot switch to a Claude runtime live), a live **dsh model dropdown** of the host's
-  discovered `dsh.models` (`dshModelChipHtml`/`setSessionDshModel`, mirroring the local one minus the
-  context override), and **no permission-mode chip** (dsh manages approvals itself).
-- **A dsh model switch is a real runtime relaunch** (`_switch_dsh_model`, the dsh analogue of
-  `_switch_local_model`): `set_model` routes a dsh session there instead of driving the non-existent
-  /model picker; it validates against the discovered set, sets `sess["model"]`, and relaunches the
-  dsh process via `_launch_tmux(resume=True)` (dsh reloads its own store, keeping the conversation),
-  reverting the record if the launch throws. The `/model` route takes the endpoint charset for a dsh
-  session (`sessionAgentType === "dsh"` → `dshServes`), like the local branch — a Claude-alias
-  charset would reject a slash-bearing endpoint id.
-- **The Claude source chip is relabeled to the composer's runtime names** — "Claude Code" /
-  "Claude Code Local" (was "Subscription"/"Other") — so the footer reads like the spawn composer's
-  Runtime picker. Android in `android/PARITY.md`. Tests: the `dsh footer`/`model source` cases in
-  `chat.test.js`, the dsh `/model` case in `server.test.js`, `TestSwitchDshModel` in `test_hub_agent.py`.
+- **A dsh footer reflects its RUNTIME, not the Claude subscription/local split** — a dsh session
+  carries `modelSource:"subscription"` under the hood, so `isDshSession()` branches the footer to: a
+  read-only **"⚙ dsh"** chip (not a picker — a running dsh conversation is an event log, not Claude
+  JSONL, so it can't switch runtimes live), a live dsh model dropdown, and **no permission-mode chip**.
+- **A dsh model switch is a real runtime relaunch** (`_switch_dsh_model`) — validates against the
+  discovered set, sets `sess["model"]`, relaunches via `_launch_tmux(resume=True)` (dsh reloads its
+  own store), reverting the record if the launch throws. `/model` takes the endpoint charset
+  (`dshServes`) for a dsh session, like the local branch.
+- Claude source chip relabeled to the composer's runtime names ("Claude Code"/"Claude Code Local").
+  Android in `android/PARITY.md`. Tests: the `dsh footer`/`model source` cases in `chat.test.js`, the
+  dsh `/model` case in `server.test.js`, `TestSwitchDshModel` in `test_hub_agent.py`.
 
 ### The model and mode chips
 
-- A third selector — **"Run against"** (`cc-source`, XERK-246) — moves the session between the Claude
-  subscription and the host's self-hosted model. It follows the HOST's `localModel.available`
-  exactly as the 📎 follows `uploadMaxBytes`; an agent reporting nothing cannot do it, so offering
-  the switch would queue a command it silently drops. It is **also shown when the session is already
-  `local`**, so one whose host later lost its configuration still has a visible way back. A `local`
-  session is marked (🏠, warn colour) — it is a weaker model, and nobody should have to wonder which
-  one wrote a turn. **Its two rows read "Claude subscription" / "Other"** (`modelSourceOpts`,
-  `modelSourceLabel`) — the selector is subscription vs the host's own endpoint and does NOT name the
-  model (the adjacent DROPDOWN below does), so the raw discovered id — e.g.
-  `bedrock/us.anthropic.claude-opus-4-5-…` — stays out of it. Like the mode switch it paints from a MEMO, never an optimistic write onto
-  `sess`, so a stale beat can't flash the old value back; the memo ages out so a switch that never
-  lands doesn't pin the chip. **`normalizeLocalModel` coerces the block at ingest** — the block is
-  typed on Android and `/api/agents` decodes atomically there, so one host's `available:"yes"` hid
-  the whole fleet from the phone; see CLAUDE.md's heartbeat contract. Tests: the `model source:`
-  cases in `chat.test.js`, `normalizeLocalModel` in `server.test.js`.
-- **A LOCAL session's model is a live DROPDOWN of the endpoint's DISCOVERED models** (XERK-489,
-  `localModelChipHtml`), not the old fixed `cc-model-fixed` label — each row is `id · 128k`, and
-  selecting one POSTs the endpoint id to `.../sessions/<id>/model` (the same route, which now
-  accepts an endpoint model for a local session). The menu also carries an **advanced context
-  override** (`ccLocalCtx`) that may only SHRINK the served window; selecting a model auto-applies
-  its window. With no discovered `models[]` (older agent / pre-discovery) it falls back to the fixed
-  label. The spawn composer (`sessions.html`) reveals the same model dropdown + context field under
-  "Run against: local". `normalizeSessions` now coerces the per-session `localModelName`/
-  `localModelContext` (typed on Android). Android has the dropdown (chat + composer); the context
-  override is web-only (`android/PARITY.md`). Tests: the `local model (XERK-489)` cases in
-  `chat.test.js`, the composer cases in `sessions.test.js`, `/model` context + `normalizeSessions`
-  in `server.test.js`.
-- The compose footer's agent-mode / model selectors are joined by a compact **PR status chip**
-  (`prFooterChip`) when it has one, and a `jira-chip` when the session has a ticket.
-- **A context-fullness meter** (XERK-489 Phase 4, `contextMeterChip`) rides the compose footer and
-  the dashboard session card (`contextMeterHtml` in `index.html`), warning before the ~95%
-  auto-compaction (warn ~85%, danger ~95%). Numerator = the newest assistant turn's window
-  occupancy (input + cache), agent-computed per-session as `lastTurnContextTokens` — NOT the
-  cumulative usage totals, which keep climbing across compactions. Denominator = `contextWindowTokens`,
-  agent-computed in `context_window_tokens`: EXACT for a local session (its selected model's window);
-  for a subscription one, derived from the MODEL it runs (`_subscription_context_window` maps the
-  `modelActual`/`model` family — the current Opus/Sonnet/Fable families serve 1M, so a flat 200k
-  `SUBSCRIPTION_CONTEXT_ASSUMED` over-warned 5x and is now only the fallback for an unrecognised model
-  or a session that has not named one). Still marked "~" (derived off `modelSource`): `message.model`
-  is the bare family id, so the transcript can't tell a family's `[1m]` 1M variant from its 200k one,
-  and the map errs toward 1M (under-warn) over the old cry-wolf. Both figures come off the HEARTBEAT
-  transcript-sum, never a pane statusLine — that text needs a statusLine Turma refuses to wire
-  because it breaks busy detection (XERK-130). Android mirrors it (`core/ContextMeter.kt` +
-  `ContextMeterBar` on the card and chat bar). Tests: the `context meter` cases in `chat.test.js`,
-  `dashboard-tiles.test.js`, `TestContextMeter` in `test_hub_agent.py`, `ContextMeterTest.kt`.
-- The **model selector is accurate** (XERK-33) — never a hardcoded menu, and never rewriting the
-  shared login's default:
-  - the chip leads with the session's heartbeated `modelActual`, humanized by `prettyModel`
-    ("claude-opus-4-8" → "Opus 4.8"), falling back to the picked alias, raw id in the tooltip;
-  - the menu is `modelOpts` from the host's probed `models` block — curated to the aliases the
-    /model picker can reach, "Default (<label>)" saying what it resolves to, the static four before
-    a probe;
-  - a just-picked switch holds its optimistic label until the agent confirms or
-    `MODEL_SWITCH_SETTLE_MS` passes (`modelSwitchPending`); a DEFERRED pick (`session.pendingModel`)
-    outranks the memo and shows an ellipsis. The mode chip shares the memo
-    (`modeChipValue`/`modeSwitchPending`), retired when the heartbeat's `permissionMode` agrees;
-  - `onPoll` carries the fresh host payload so the menu tracks the probe.
-  - Tests: `modelOpts`/`prettyModel` in `chat.test.js`, the malformed-model case in
-    `server.test.js`.
+- **"Run against"** (`cc-source`, XERK-246) moves a session between the Claude subscription and the
+  host's local model — follows the host's `localModel.available` (an agent reporting nothing can't do
+  it), and is **also shown when already `local`** so a host that lost its config still has a way
+  back. A `local` session is marked (🏠, warn colour). Rows read "Claude subscription"/"Other" — the
+  selector is subscription-vs-endpoint, not the model name (the adjacent dropdown does that). Paints
+  from a MEMO (never optimistic onto `sess`), aged out so a switch that never lands doesn't pin.
+  **`normalizeLocalModel` coerces at ingest** (typed on Android, atomic decode — one bad host hides the
+  fleet; CLAUDE.md's heartbeat contract). Tests: `model source:` in `chat.test.js`,
+  `normalizeLocalModel` in `server.test.js`.
+- **A LOCAL session's model is a live DROPDOWN of DISCOVERED models** (XERK-489,
+  `localModelChipHtml`), each row `id · 128k`; selecting POSTs to `.../model` (accepts an endpoint
+  model for a local session). An **advanced context override** (`ccLocalCtx`) may only SHRINK the
+  served window; picking a model auto-applies its window. Falls back to the fixed label with no
+  discovered `models[]`. Composer has the same controls. Android has the dropdown only (context
+  override web-only, `android/PARITY.md`). Tests: the `local model (XERK-489)` cases in `chat.test.js`,
+  the composer cases in `sessions.test.js`, `/model` context + `normalizeSessions` in `server.test.js`.
+- Footer also carries a PR status chip (`prFooterChip`) and a `jira-chip` when applicable.
+- **A context-fullness meter** (XERK-489 Phase 4, `contextMeterChip`) warns before ~95%
+  auto-compaction (warn ~85%, danger ~95%). Numerator = the newest turn's window occupancy
+  (`lastTurnContextTokens`, NOT cumulative usage). Denominator = `contextWindowTokens` — exact for a
+  local session, else derived from the running model family (a flat 200k `SUBSCRIPTION_CONTEXT_ASSUMED`
+  fallback over-warned 5x
+  against the 1M families now served, so it's the fallback only). Marked "~" since a transcript can't
+  tell a family's 1M variant from its 200k one. Reads off the heartbeat transcript-sum, never a pane
+  statusLine (that breaks busy detection, XERK-130). Android mirrors it. Tests: `context meter` cases
+  in `chat.test.js`, `dashboard-tiles.test.js`, `TestContextMeter`, `ContextMeterTest.kt`.
+- **Model selector is accurate** (XERK-33), never a hardcoded menu: chip leads with heartbeated
+  `modelActual` (humanized, raw id in tooltip); menu is `modelOpts` from the probed `models` block; a
+  just-picked switch holds its optimistic label until confirmed or `MODEL_SWITCH_SETTLE_MS`; a
+  DEFERRED pick shows an ellipsis. Mode chip shares the same memo pattern. Tests: `modelOpts`/
+  `prettyModel` in `chat.test.js`, the malformed-model case in `server.test.js`.
 
 ### Working-status bar and agent list
 
-- A pinned **working-status bar** below the transcript mirrors the terminal's bottom region from the
-  live `status` frame: the spinner verb + ↑/↓ token counters + elapsed, and Claude Code's rotating
-  tip/active-task hint. When background agents run it shows a clickable **agent list**
-  (`agentsHtml`: `main` a plain marker, each subagent a button carrying its type + description).
-- **The bar outlives the turn when agents are still running** (XERK-245): `liveStatus` clears the
-  moment the turn ends (it is what shows Stop), so the list is held in its own `liveAgents` off the
-  frame's `agents` — falling back to `status.agents` for an older agent — and the bar then renders
-  just the list under a "Background agents…" spinner. Without that split it either vanished mid-run
-  or would have faked a running turn.
-- Clicking a subagent opens its transcript read-only in the right stage (`openSubagentView` → `GET
-  /api/agents/<host>/sessions/<id>/subagents/history?type=&label=&agentId=`, reusing the archive
-  viewer + chat engine), with **Back** returning to the live session.
-- **A `workflow` row opens the run's AGENT PICKER, not a transcript** (XERK-304): a workflow is N
-  agents and has no conversation of its own. The reply carrying `agents` — **the empty list
-  included** — is the whole signal, so `renderWorkflowAgents` runs on presence and never on length;
-  an empty run reads "hasn't started any agents yet", which is a real answer and deliberately worded
-  apart from the "unavailable" an unresolved row gets.
-- **Back is three rungs deep there**, and `subagentListReturn` is the middle one: one agent of a run
-  returns to that run's list, and only the list returns to the session. Every place that drops
-  `subagentReturn` must drop it too — a stale middle rung sends Back into a list the pane is no
-  longer showing. The back label names the rung it actually reaches ("Workflow" vs "Session").
-  - **The middle rung is only taken when the list can still be FETCHED.** It is read from the
-    session's host, so once that session leaves the cache `openSubagentView` early-returns on the
-    missing host key and the press vanishes — the rung must fall through to the session rung, which
-    already handles a session that ended, rather than consume it.
-- **The picker is a SNAPSHOT per fetch**, like `/history`: agents starting while it is open do not
-  appear until it is reopened. Acceptable for a finished run, visibly stale for a running one.
-- **An unresolved row must not be rendered as a transcript.** No `agents` and no entries means the
-  row did not resolve; handing that to the chat engine paints its "This session's transcript is
-  empty.", the wording for a conversation that exists and is empty, which reads as if the agent did
-  nothing. A background agent that has a transcript always has at least its prompt.
-- Tests: `agentsHtml` in `chat.test.js`, the subagent-history cases in `server.test.js`, the
-  XERK-304 drill-down cases in `sessions.test.js`.
+- A pinned bar mirrors the terminal's bottom region from the live `status` frame: spinner verb + ↑/↓
+  counters + elapsed + Claude Code's rotating tip. Background agents show a clickable **agent list**
+  (`agentsHtml`).
+- **The bar outlives the turn when agents are still running** (XERK-245) — `liveStatus` clears at
+  turn-end, so the list is held separately (`liveAgents`, falling back to `status.agents` for an
+  older agent) and renders under a "Background agents…" spinner alone; without the split it either
+  vanished mid-run or faked a running turn.
+- Clicking a subagent opens its transcript read-only (`openSubagentView` → `GET
+  .../subagents/history?...`), Back returns to the live session.
+- **A `workflow` row opens the run's AGENT PICKER, not a transcript** (XERK-304) — a workflow has no
+  conversation of its own. `agents` present (**empty list included**) is the whole signal;
+  `renderWorkflowAgents` runs on presence, never length, wording an empty run "hasn't started any
+  agents yet" — deliberately distinct from an unresolved row's "unavailable".
+- **Back is three rungs deep**; `subagentListReturn` is the middle one (one agent → that run's list →
+  the session). Every place dropping `subagentReturn` must drop it too, or a stale middle rung sends
+  Back into a list no longer shown. **The middle rung is only taken when the list can still be
+  FETCHED** — once the session leaves the cache, the press falls through to the session rung instead.
+- **The picker is a SNAPSHOT per fetch** (like `/history`) — agents starting while open don't appear
+  until reopened.
+- **An unresolved row must not render as a transcript** — no `agents` and no entries means the row
+  didn't resolve, not that the conversation is empty (a background agent with a transcript always has
+  at least its prompt). Tests: `agentsHtml` in `chat.test.js`, the subagent-history cases in
+  `server.test.js`, the XERK-304 drill-down cases in `sessions.test.js`.
 
 ### Queued sessions
 
-- A **"Queued" section** above the live lists: static cards with the wait reason
-  (`queuedReasonText`) and an arm-then-confirm **Cancel**. A followed spawn (`?spawn=<cmdId>`)
-  landing there words its stage **"Queued — <reason>"**, flipping to the live session once
-  provisioned; the dashboard's card mirrors this. Tests: `sessions.test.js`.
+A **"Queued" section** above the live lists: static cards with the wait reason
+(`queuedReasonText`) + arm-then-confirm Cancel. A followed spawn (`?spawn=<cmdId>`) landing there
+words its stage "Queued — <reason>", flipping live once provisioned. Tests: `sessions.test.js`.
 
 ### Ready for review (XERK-224)
 
-- The live sessions split three ways in reading order — **Ready for review** (stopped, waiting on
-  YOU), **Active** (working), **Idle** (quiet).
-- **A session running background agents is Active, and its card names them** ("1 background agent",
-  `agentWorkLabel`; Android's `liveStateLabel(state, live)` matches). It is `liveState`, not
-  `readyForReview`, that this changes — the working branch already disqualifies it — which is what
-  stops the ready-for-review alert firing the instant work is delegated. See `CLAUDE.md`.
-- `readyForReview(s, live)` is **derived from the signals alone** — there is no "I've reviewed this"
-  action. It qualifies on a pending question/pane prompt (blocked on a human, so the busy read
-  doesn't matter; it leads the section), a PR that hasn't landed, or a **finished turn**
-  (`lastRole=="assistant"`, no `lastHasToolUse`) — the only trace a research task that opened no PR
-  leaves, and the case a PR-only rule was asked to stop missing.
-- Every PR reaching MERGED/CLOSED demotes it: merging IS the review, so it drops to Idle, where work
-  merged but not yet verified is parked. `prLanded` counts an unknown state as still live; an
-  unreadable one must never drop work off the list.
-- **That demotion is scoped in TIME, never absolute**: a landed PR stops being a reason to look but
-  must not become a reason NOT to. A session is a CONVERSATION, not a pull request — hand the same
-  one a new task and it finishes with no new PR to show, which an absolute demotion hid for good.
-  `newWorkSincePrs` (against the agent's `prsLandedTs`) says the conversation moved past it, and the
-  rule then falls through to the finished-turn signal. False when unanswerable (older agent
-  included), erring toward parking over a wrong claim.
-- **FIVE mirrors must agree** — see CLAUDE.md's cross-cutting contracts. The card says WHY it
-  qualified, on `.dot.review`. Tests: `sessions.test.js`, `readyForReview` in `server.test.js`.
+- Live sessions split, in reading order: **Ready for review** (stopped, waiting on you), **Active**
+  (working), **Idle** (quiet).
+- **A session running background agents is Active, named on its card** ("1 background agent") — it's
+  `liveState` this changes, not `readyForReview` (the working branch already disqualifies it), which
+  is what stops the alert firing the instant work is delegated.
+- `readyForReview(s, live)` is **derived from signals alone** (no "I've reviewed this" action):
+  qualifies on a pending question/pane prompt (blocked on a human, leads the section), an unlanded PR,
+  or a **finished turn** (`lastRole=="assistant"`, no `lastHasToolUse` — the only trace a
+  no-PR research task leaves).
+- Every PR reaching MERGED/CLOSED demotes it (merging IS the review) to Idle; an unknown state counts
+  as still live, an unreadable one must never drop work off the list.
+- **That demotion is scoped in TIME, never absolute** — a landed PR stops being A reason to look but
+  must not become a reason NOT to (the same conversation, handed new work, finishes with no new PR to
+  show). `newWorkSincePrs` (against `prsLandedTs`) says the conversation moved past it, falling
+  through to the finished-turn signal; false when unanswerable, erring toward parking.
+- **FIVE mirrors must agree** — see CLAUDE.md. Card shows WHY it qualified (`.dot.review`). Tests:
+  `sessions.test.js`, `readyForReview` in `server.test.js`.
 
 ### Ended sessions
 
-- The sidebar's last section, **collapsed by default**. It merges the three channels an
-  over-but-resumable session arrives on: **killed** (`a.closedSessions`), **stopped** (a non-running
-  record still in `a.sessions`), and **resumable** (a transcript from each repo's `resumable` scan,
-  no registry record behind it).
-- The third channel makes the list **durable**: the first two read the capped `~/.turma` records,
-  while `resumable` is re-derived every slow beat from the transcripts under `~/.claude/projects`.
-- **Deduped on `<host>::<transcriptId>`**, a registry-backed record always winning; a kill that ages
-  out of `closed.json` keeps listing, minus its PR chips. Sorted **most recently ended first**
-  (`endedMs`, from `closedAt`/`stoppedAt`/`endedTs` — `resumableSession()` must copy `endedTs` onto
-  the record, where `endedEntry` reads the key); an undated record sorts oldest.
-- A **running** session is never also listed as ended: the agent re-cuts the cached scan against its
-  live registry every beat (`_sorted_repo_entries`), and the page dedupes resumable rows against
-  every reported session's `transcriptId` (why `_session_payload` reports it while running).
-- **Clicking a row opens that session read-only on the stage** — the same `#transcriptPane` the
-  archive/subagent views use: scrollable conversation + a verbosity control, **no terminal toggle
-  and no compose box**. `resetEndedBar()` keeps the pane's shared PR/Resume bar from leaking into
-  those views. The conversation is read from the hub's **archive** (`GET
-  /api/archive/<transcriptId>`), so it works for an offline host; a just-killed session hasn't
-  synced yet and says so.
-- Its **PRs are chips on the stage bar and are LINKS there** (`prBadgeLinkHtml`); the sidebar copy
-  stays an inert `<span>` (the card is a `<button>`).
-- **Resume** sits on the row and stage bar, dispatching on how the session ended: killed →
-  `.../resume` (same id), stopped → `.../start`, resumable → `.../transcripts/<id>/resume` with its
-  origin cwd (the agent re-validates the path and re-creates the dir if a prune removed it). The
-  list is DERIVED, so a resumed session drops out the beat the agent reports it running. The
-  resumable path comes back under a **new id**, so it follows its queued command's `cmdId`. Resume
-  needs the host **online**; reading doesn't.
-- Tests: `sessions.test.js`, `TestRefreshPrStatus`, `TestSessionLifecycle`, `TestResumableReport`,
-  `TestCardedSlugs`.
+- Sidebar's last section, collapsed by default — merges **killed** (`a.closedSessions`), **stopped**
+  (a non-running record in `a.sessions`), and **resumable** (each repo's transcript scan, no registry
+  record).
+- **Resumable makes the list DURABLE** — the first two read capped `~/.turma` records; resumable is
+  re-derived every slow beat from `~/.claude/projects`.
+- **Deduped on `<host>::<transcriptId>`**, a registry-backed record winning. Sorted most-recently-ended
+  first (`endedMs`); undated sorts oldest. A running session is never also listed ended (dedup against
+  every reported `transcriptId`).
+- **Clicking a row opens it read-only on the stage** (same `#transcriptPane` as archive/subagent
+  views): scrollable conversation + verbosity control, no terminal toggle, no compose box. Read from
+  the hub's **archive** (`GET /api/archive/<transcriptId>`), so it works for an offline host; a
+  just-killed session hasn't synced yet and says so.
+- PRs are LINKS on the stage bar; the sidebar copy stays an inert `<span>`.
+- **Resume** dispatches on how it ended: killed → `.../resume` (same id), stopped → `.../start`,
+  resumable → `.../transcripts/<id>/resume` (agent re-validates/re-creates the cwd if pruned). List is
+  derived, so a resumed session drops out once the agent reports it running; the resumable path comes
+  back under a NEW id. Needs the host online; reading doesn't. Tests: `sessions.test.js`,
+  `TestRefreshPrStatus`, `TestSessionLifecycle`, `TestResumableReport`, `TestCardedSlugs`.
 
 ### Session card ⋯ menu
 
-- Each sidebar session card carries a **⋯ overflow menu** — a sibling of the card `<button>`,
-  absolutely positioned over it (a nested button is invalid HTML). **Rename…** swaps the card for an
-  inline field POSTing to `.../sessions/<id>/summary`, painted optimistically; **Kill** arms-then-
-  confirms; **Move** migrates the session (XERK-101). Its state lives in page variables, not the
-  DOM.
+Each card carries a **⋯ overflow menu** (a sibling of the card button, absolutely positioned — a
+nested button is invalid HTML). **Rename…** swaps the card for an inline field POSTing to
+`.../summary`, painted optimistically; **Kill** arms-then-confirms; **Move** migrates (XERK-101).
 
 ### Send and Stop buttons
 
-- **Send always sends, and ◼ Stop is its own button**, in both chat and terminal views. A message
-  sent mid-turn QUEUES, so the button that talks must stay available while the agent works. The
-  warning-coloured Stop appears beside Send only while a turn runs.
-- Stop interrupts the turn (`chatComposeStop`/`termComposeStop` → `stop()` → `POST
-  /api/agents/<host>/sessions/<id>/interrupt`). Unlike Kill it arms/confirms nothing and leaves the
-  session on the stage. **Enter always sends**, like the button.
-- The busy read driving Stop's visibility is `liveStatus` (the ~1s pane scrape), NOT the heartbeat's
-  `paneBusy`. With the live socket down `liveStatus` stays null and Stop stays hidden (a Stop that
-  can't see the turn is worse than no Stop).
-- A clicked Stop **hides immediately** (`stopPendingAt`, `composeBusy()`); if the turn outlives
-  `STOP_SUPPRESS_MS` the interrupt didn't take and Stop comes back. A failed POST paints "Stop
-  failed" (`actionFailed`'s selector arg).
-- **A pending `AskUserQuestion` hides Stop** (`composeBusy()` returns false while `questionActive`)
-  — the answer is typed THROUGH the compose box, routed to `/answer` (`send()`'s `wasAnswer` path),
-  and an accidental Stop would destroy the question (XERK-21). `updateQuestion` repaints the bar the
-  instant a question appears/clears.
-- `chat.js` paints every `.compose-action` + `.compose-stop` button from that one read, so the
-  terminal's bar can't disagree with the chat's. Tests: `chat.test.js`,
+- **Send always sends, ◼ Stop is its own button**, in both chat and terminal — a mid-turn message
+  QUEUES, so the button that talks must stay available while the agent works. Stop appears beside
+  Send only while a turn runs.
+- Stop interrupts (→ `POST .../interrupt`); unlike Kill, arms/confirms nothing and leaves the session
+  on stage. **Enter always sends**, like the button.
+- Stop's visibility reads `liveStatus` (the ~1s pane scrape), NOT the heartbeat's `paneBusy` — with
+  the live socket down, `liveStatus` stays null and Stop stays hidden (a blind Stop is worse than none).
+- A clicked Stop **hides immediately**; if the turn outlives `STOP_SUPPRESS_MS` the interrupt didn't
+  take and Stop returns. A failed POST paints "Stop failed".
+- **A pending `AskUserQuestion` hides Stop** — the answer is typed THROUGH the compose box (routed to
+  `/answer`), and an accidental Stop would destroy the question (XERK-21). Tests: `chat.test.js`,
   `termComposeAction`/`termComposeStop` in `sessions.test.js`.
 
 ### The compose draft survives the view toggle (XERK-122)
 
-- The chat and terminal panes have a compose box each, but a session has ONE draft: each toggle
-  **moves** the text across (`carryDraft`), clearing the source, so the two can never disagree. It
-  is carried **after** the pane swap — `focus()` on a still-`hidden` textarea is a silent no-op.
-  Focus follows only a NON-EMPTY draft, so toggling with an empty box doesn't pop a soft keyboard.
-- **A compose box auto-grows to its `scrollHeight`, but only while it is laid out** (XERK-149): a
-  hidden textarea (`.chat-pane`/`.term-pane[hidden]`, or a phone's `display:none` `.stage`) reports
-  `scrollHeight` 0, and an unguarded `growCompose`→`autoGrow` during the toggle's `carryDraft` pins
-  an inline `height:0px`. `autoGrow`/`autoGrowTermInput` bail on `offsetParent === null`, keeping
-  the last laid-out height; `carryDraft` re-grows it when shown.
-- Tests: `sessions.test.js`.
+- Chat and terminal panes each have a compose box, but a session has ONE draft: each toggle **moves**
+  the text across, clearing the source. Carried AFTER the pane swap (`focus()` on a still-`hidden`
+  textarea is a silent no-op); focus follows only a non-empty draft.
+- **A compose box auto-grows to `scrollHeight`, but only while laid out** (XERK-149) — a hidden
+  textarea reports `scrollHeight` 0, so an unguarded auto-grow during the toggle pins `height:0px`.
+  `autoGrow`/`autoGrowTermInput` bail on `offsetParent === null`; the toggle re-grows on show. Tests:
+  `sessions.test.js`.
 
 ### Copying out of the terminal
 
-- A copy made in the terminal view reaches the viewer's **real system clipboard** — three
-  independent links, since the text has to survive the app, tmux AND xterm.js (XERK-7).
-- Selecting at all needs a **modifier**, because the Claude TUI holds mouse tracking: **Shift**
-  everywhere except macOS, where xterm.js honours **Alt** only when `macOptionClickForcesSelection`
-  is on (defaults off) — `_launch_ttyd` passes it (cost: Mac's Alt+drag column-select). Once a
-  selection exists ttyd copies it itself.
-- **Every other copy — the app's own and tmux copy-mode's — travels as OSC 52**, needing all three
-  of: `agent/tmux.conf` declaring an `Ms` capability (tmux emits OSC 52 only if the OUTER terminal
-  advertises it, and xterm-256color / tmux-256color lack it); `set-clipboard on` (the default
-  `external` forwards **no** application OSC 52); and the hub injecting xterm.js's missing OSC 52
-  handler (`TERM_OSC52_JS`, in `proxyTerm`, via ttyd's `window.term`).
-- The bridge is deliberately **write-only**: an OSC 52 READ request (`?`) is never answered (else
-  any program in the pane reads the clipboard). An empty payload is dropped. It splits at the
-  **first `;`** (an app sends `52;c;<b64>`, tmux `52;;<b64>`, both must land).
-- Tests: `server.test.js`, `test_launch_ttyd_lets_a_mac_force_a_selection` in `test_hub_agent.py`.
+- A terminal-view copy reaches the viewer's real system clipboard via three independent links (the
+  text survives app, tmux AND xterm.js, XERK-7).
+- Selecting needs a **modifier** (the Claude TUI holds mouse tracking): **Shift** everywhere except
+  macOS, where xterm.js honours **Alt** only with `macOptionClickForcesSelection` on (which
+  `_launch_ttyd` sets — cost: Mac's Alt+drag column-select). ttyd then copies the selection itself.
+- **Every other copy travels as OSC 52**, needing all three of: `agent/tmux.conf`'s `Ms` capability
+  (tmux emits OSC 52 only if the OUTER terminal advertises it); `set-clipboard on` (default `external`
+  forwards no application OSC 52); and the hub injecting xterm.js's missing OSC 52 handler
+  (`TERM_OSC52_JS`).
+- The bridge is **write-only** — an OSC 52 READ (`?`) is never answered (else any pane program reads
+  the clipboard). Splits at the FIRST `;` (an app sends `52;c;<b64>`, tmux `52;;<b64>`, both must
+  land). Tests: `server.test.js`, `test_launch_ttyd_lets_a_mac_force_a_selection` in
+  `test_hub_agent.py`.

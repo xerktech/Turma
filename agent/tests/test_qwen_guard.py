@@ -77,7 +77,13 @@ class TestBuildQwenGuardConfig(unittest.TestCase):
         self.assertTrue(all(g.startswith("/") for g in dw), dw)
         self.assertFalse(any("~" in g for g in dw), dw)
         self.assertFalse(any(g.startswith("//") for g in dw), "no Claude-relative anchor leaks")
-        for want in (f"{HOME}/.ssh/**", f"{HOME}/.aws/**"):
+        # realpath'd, not a literal f"{HOME}/..." join: XERK-503 found `~/.aws` can
+        # itself be a symlink (a bind mount, or on WSL the Windows-side profile),
+        # and a rule built from the un-resolved path silently stops matching once
+        # the target resolves elsewhere. Asserting the resolved form pins that fix
+        # instead of assuming HOME's subdirectories are never symlinks.
+        for want in (os.path.realpath(f"{HOME}/.ssh") + "/**",
+                     os.path.realpath(f"{HOME}/.aws") + "/**"):
             self.assertIn(want, dw)
 
     def test_shim_config_is_the_shared_rule_set(self):

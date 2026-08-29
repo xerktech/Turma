@@ -6,143 +6,97 @@ paths:
 
 # PR status, comment delivery and conflict nudges
 
-Split out of `.claude/rules/agent.md` to keep that file (which loads for ALL of `agent/**`) under
-the size ceiling. Everything here lives in `hub-agent.py`: what makes a PR a session's, how its
-state is polled across GitHub/GitLab/Azure DevOps, and what gets typed back in because of it.
+Split out of `.claude/rules/agent.md` to keep that file under the size ceiling. All in
+`hub-agent.py`: what makes a PR a session's, how its state is polled across GitHub/GitLab/Azure
+DevOps, and what gets typed back because of it.
 
 ## PR status
 
 - State, CI rollup and mergeability of every PR a session opened, on `PR_STATUS_REFRESH_EVERY`.
 - The card's **single ✓/✗/● mark is merge READINESS, not CI** (`ready`, from `_merge_ready`): a
-  conflict blocks on its own, and a ✓ requires an affirmative MERGEABLE — a just-opened PR's UNKNOWN
-  is `pending`. Conflicts only matter while a PR could still land: MERGED/CLOSED reports CI alone; a
-  PR with **no checks** keeps its no-mark unless it CONFLICTS. `checks`/`checkCounts` stay pure CI
-  beside it; all four renderers (web ×3, android's `PrBadge`) read `ready`, falling back to the CI
-  half for older agents.
+  conflict blocks on its own; a ✓ requires an affirmative MERGEABLE (a just-opened PR's UNKNOWN is
+  `pending`). MERGED/CLOSED reports CI alone; a PR with **no checks** keeps its no-mark unless it
+  CONFLICTS. `checks`/`checkCounts` stay pure CI beside it; all four renderers read `ready`, falling
+  back to the CI half for older agents.
 - Cached by URL in `pr_status_cache`, attached as `session.prs`, kept after the session stops.
-  **Durable across an agent restart** (XERK-15) via `prUrls` on the record, and **for ENDED sessions
-  and the pill too** (XERK-13) via two transcript-keyed ledgers that outlive the registry record:
-  - `pr-sessions.json` (`PR_LEDGER_PATH`) — written by `_remember_prs`, backfilled from closed
-    history, read by the resumable scan (`_ledger_prs`); the only channel left once a closed record
-    ages out.
-  - `pr-status.json` (`PR_STATUS_LEDGER_PATH`) — persisted by `refresh_pr_status` and seeded back at
-    boot; an ended session is never re-polled, so without this its chip degrades to a bare link.
-    Ledgered URLs count as `referenced`.
-- **Which PRs are "a session's"** is `_scan_pr_line`, deliberately narrow: a URL counts only when it
-  comes back in a **creating call's own `tool_result`** (`PR_CREATE_RE`) — the one event that says
-  this session OPENED it. `gh pr create`; `glab mr create` / `git push -o merge_request.create`
-  (XERK-162); `az repos pr create` (XERK-226), whose JSON carries no link, so `_azdo_created_pr_url`
-  builds one from `repository.webUrl` + `pullRequestId`. Call and result land in different beats, so
-  pending tool_use ids carry across (capped); the scan parses whole lines.
-  - **An on-prem Azure DevOps Server host has no vendor CLI to name here** — the `azure-devops` az
-    extension refuses a self-hosted collection outright, so those hosts open PRs with a local REST
-    wrapper. `ado pr-create` **and `ado.py pr-create`** are built in (a host that loses the wrapper
-    from PATH runs it as `python3 …/ado.py`, the same PR opened the same way);
-    **`TURMA_PR_CREATE_CMDS`** (CSV of command prefixes) registers any other, so a host isn't
-    chipless because its tool isn't a vendor's.
-  - `_pr_create_pattern` treats every command — built-in and configured alike — as literal escaped
-    words, anchored against `-` (and `.` trailing) so one can't match the tail of `run-mkpr` or a
-    `pr-create.md` filename. An entry whose longest word is under `PR_CREATE_CMD_MIN` chars is
-    **ignored**: attribution must not fail OPEN, and a 1–2 char token matches half the commands a
-    session runs (measuring the JOINED length lets `a b` through).
-  - The ADO URL regexes take **http as well as https** — an on-prem collection is routinely served
-    over plain http on the LAN, and a scheme-only mismatch drops the chip in silence.
-  - Cost: a PR opened another way (subagent, MCP tool, web UI) gets no chip. **Widen only by
-    teaching `_scan_pr_line` another creation event, never by scanning loose text.**
-- **A GitLab MR and an ADO PR answer everywhere a GitHub PR does**: `pr_status`/`_pr_comment_events`
-  dispatch by URL to `mr_status`/`azdo_pr_status`, identical shapes, each URL polled only through
-  the source that can answer it (`_pr_source_ok`; unreachable → bare link chip). ADO reuses the
-  BOARD's PAT and has no CI rollup, so `checks` is the **CI-bearing branch POLICY evaluations only**
-  (`AZDO_CI_POLICY_IDS`) — reviewer/work-item policies would read a PR awaiting a human as "CI
-  pending". `mergeable` is `mergeStatus`, conflicts alone. The image bundles `glab` and az's
-  `azure-devops` extension (Services only — see the wrapper note above); the native install ships
-  `glab` too (`ensure_glab`) — without it a session improvises with the raw GitLab API, the one
-  MR-creation path the scan can't attribute.
+  **Durable across an agent restart** (XERK-15, via `prUrls` on the record) and **for ENDED
+  sessions/the pill too** (XERK-13) via two transcript-keyed ledgers outliving the registry record:
+  `pr-sessions.json` (`PR_LEDGER_PATH`, `_remember_prs`, the only channel once a closed record ages
+  out) and `pr-status.json` (`PR_STATUS_LEDGER_PATH`, seeded back at boot so an ended session's chip
+  doesn't degrade to a bare link).
+- **Which PRs are "a session's"** is `_scan_pr_line`, deliberately narrow: a URL counts only from a
+  **creating call's own `tool_result`** (`PR_CREATE_RE`) — `gh pr create`; `glab mr create`/`git push
+  -o merge_request.create` (XERK-162); `az repos pr create` (XERK-226, no link in its JSON, so
+  `_azdo_created_pr_url` builds one from `repository.webUrl`+`pullRequestId`).
+  - **On-prem ADO Server has no vendor CLI** (`az`'s extension refuses self-hosted), so those hosts
+    open PRs with a local REST wrapper (`ado pr-create`/`ado.py pr-create`, both built in);
+    `TURMA_PR_CREATE_CMDS` registers any other so a host isn't chipless for lacking a vendor tool.
+  - `_pr_create_pattern` treats every command as literal escaped words, anchored so one can't match
+    the tail of `run-mkpr`/`pr-create.md`. An entry under `PR_CREATE_CMD_MIN` chars is **ignored** —
+    attribution must not fail open on a 1-2 char token.
+  - ADO URL regexes take **http as well as https** (on-prem is routinely plain HTTP on the LAN).
+  - Cost: a PR opened another way (subagent, MCP, web UI) gets no chip. **Widen only by teaching
+    `_scan_pr_line` another creation event, never by scanning loose text.**
+- **A GitLab MR and an ADO PR answer everywhere a GitHub PR does**: dispatch by URL to
+  `mr_status`/`azdo_pr_status`, each polled only through the source that can answer it
+  (`_pr_source_ok`; unreachable → bare link). ADO reuses the board's PAT, no CI rollup: `checks` is
+  the **CI-bearing branch POLICY evaluations only** (`AZDO_CI_POLICY_IDS`), else reviewer/work-item
+  policies read a human-awaiting PR as "CI pending". `mergeable` is `mergeStatus`, conflicts alone.
   - **An MR's `mergeable` answers conflicts ONLY, like GitHub's**: `detailed_merge_status` buckets
-    via `_MR_CONFLICT_STATUSES`/`_MR_UNVERIFIED_STATUSES`, every other KNOWN status → MERGEABLE —
-    mapping only `"mergeable"` parked every healthy MR (not_approved, ci_still_running …) at ●.
+    via `_MR_CONFLICT_STATUSES`/`_MR_UNVERIFIED_STATUSES`, every other KNOWN status → MERGEABLE.
   - `_mr_url_parts` matches GITLAB_URL by **host(:port), case-insensitively, ignoring scheme** — a
-    byte-prefix compare left attributed MRs as bare link chips over a trivial spelling mismatch.
-  - Every session launch exports **`GITLAB_HOST`** (from `gitlab_base()`, operator's own wins):
-    glab reads that var, never GITLAB_URL, so self-hosted `glab mr create` can't auth without it.
-  - Chips label an MR/ADO PR **`!n`, not `#n`** (in ADO `#n` is a WORK ITEM) — every renderer
-    (web ×3, android `PrBadge`, glasses `phone/render.ts` + vendored chat.cjs) mirrors `_pr_ref`.
+    byte-prefix compare misattributed MRs over a spelling mismatch.
+  - Every launch exports **`GITLAB_HOST`**: glab reads that var, never GITLAB_URL, so self-hosted
+    `glab mr create` can't auth without it.
+  - Chips label an MR/ADO PR **`!n`, not `#n`** (ADO's `#n` is a WORK ITEM) — every renderer mirrors
+    `_pr_ref`.
 - Tests: `TestPrStatus`, `TestMr*`, `TestAzdoPr*`, `TestRefreshPrStatus`, `TestPrLedger`.
 
 ## PR comment delivery (XERK-49) and conflict nudges (XERK-223)
 
-- **A reply asking for corrections on a session's PR is delivered back to the session that opened
-  it.** `_poll_pr_comments` runs on the PR cadence, **running sessions only**, over their OWN PRs
-  (`session_pr_urls`), through `notify_session` — the session's inbox (XERK-340), falling back to
-  `send_input`'s pane and outbox only for a session that has none. Same for the conflict nudge.
-- `_pr_comment_events(url, self_login)` gathers **three channels** — conversation comments, review
-  bodies, inline review-thread comments; a bare approve is dropped. One call covers all three on
-  GitLab (notes) and ADO (threads), minus that tracker's own system notes. `_pr_ref` numbers it
-  `#12` on GitHub, `!12` on GitLab and ADO (there `#12` is a WORK ITEM).
-- **Baseline-on-first-sight, then deliver only new + not-self.** The whole comment set is recorded
-  silently the first beat a PR is seen (`prCommentBase`, capped `PR_COMMENTS_SEEN_MAX`); after that
-  only NEW keys not the agent's own (`viewerDidAuthor`, else an identity compare) are typed in.
-  Bounded `PR_COMMENTS_MAX` per beat; **a fetch failure (→ None) leaves the baseline UNTOUCHED.**
-- `_poll_pr_conflicts` types `_pr_conflict_message` (**MERGE `origin/<base>`, never a
-  rebase/force-push**) off the `mergeable` just cached. `prConflicts` bounds the nudging per PR;
-  MERGEABLE/closed clears and re-arms it, **UNKNOWN does neither** — that is what a just-pushed fix
-  looks like, and clearing on it would grant unlimited retries.
-- Disable with `TURMA_PR_COMMENTS=0` / `TURMA_PR_CONFLICTS=0`. Tests: `TestPrComment*`,
+- **A reply on a session's PR is delivered back to the session that opened it.** `_poll_pr_comments`
+  runs on the PR cadence, **running sessions only**, over their own PRs, through `notify_session` —
+  the session's inbox (XERK-340), falling back to `send_input`'s pane only for a session with none.
+- `_pr_comment_events(url, self_login)` gathers **three channels** (conversation comments, review
+  bodies, inline review-thread comments; a bare approve is dropped) — one call covers GitLab (notes)
+  and ADO (threads) too, minus system notes. `_pr_ref` numbers `#12` (GitHub) vs `!12` (GitLab/ADO).
+- **Baseline-on-first-sight, then deliver only new + not-self.** The whole comment set records
+  silently the first beat a PR is seen (`prCommentBase`, capped `PR_COMMENTS_SEEN_MAX`), after that
+  only NEW keys not the agent's own are typed in. Bounded `PR_COMMENTS_MAX` per beat; **a fetch
+  failure leaves the baseline UNTOUCHED.**
+- `_poll_pr_conflicts` types `_pr_conflict_message` (**MERGE `origin/<base>`, never a rebase/force-
+  push**) off the just-cached `mergeable`. `prConflicts` bounds nudging per PR; MERGEABLE/closed
+  re-arms it, **UNKNOWN does neither** — that's what a just-pushed fix looks like, and clearing on it
+  would grant unlimited retries.
+- Disable with `TURMA_PR_COMMENTS=0`/`TURMA_PR_CONFLICTS=0`. Tests: `TestPrComment*`,
   `TestPollPrComments`, `TestPollPrConflicts`, `TestPrConflictMessage`.
-- `_poll_prs_landed` stamps `prsLandedTs` (last-activity when the sweep first sees every PR landed;
-  a new PR clears it) so the hub can tell "merged and done" from "merged, then handed new work". It
-  and `newWorkSincePrs` are **transcript timestamps** — the conversation's clock, not the mtime a
-  synced `~/.claude` inflates. Tests: `TestPrsLanded`.
+- `_poll_prs_landed` stamps `prsLandedTs` (last-activity when every PR first reads landed; a new PR
+  clears it) so the hub can tell "merged and done" from "merged, then handed new work" — a
+  **transcript timestamp**, not the mtime a synced `~/.claude` inflates. Tests: `TestPrsLanded`.
 
-## dsh sessions get the same PR chips with NO dsh-specific PR code (XERK-472 [H])
+## dsh and qwen sessions get the same PR chips, with NO runtime-specific PR code
 
-- **Everything above reads and writes a dsh session UNCHANGED — do not add an `agentType` branch to
-  the PR path.** `_scan_pr_line`, `_seed_prs`, `refresh_pr_status`, the GitLab/ADO dispatch and the
-  comment/conflict pollers all key on `session_pr_urls` (session id) and the transcript, never on the
-  runtime. A dsh session's transcript is the S1 projection of dsh's own event log, so the SAME scan
-  attributes the SAME `gh pr create`. This is D4's "PR chips work with no new code", proven end to
-  end by `TestDshPrAttribution` over the real projector + real corpus (which carries a `gh pr create`).
-- **The one load-bearing dependency is the projector's `bash`→`Bash` name map**
-  (`_TOOL_NAME_MAP` in `dsh_transcript.py`). `_scan_pr_entry` attributes only a `tool_use` whose
-  `name` is `"Bash"`; dsh's shell tool registers as `bash`, so without that map a dsh `gh pr create`
-  projects to an unattributed tool call and the PR is chipless. Same narrowness as Claude: a PR
-  opened another way — dsh's `cordis_run`/`ralph`, or the raw GitLab API — gets no chip, exactly as a
-  Claude PR opened via MCP/subagent does. **Widen only by teaching `_scan_pr_line` another creation
-  event, never by loosening the Bash-name gate.**
-- **Comment/conflict delivery routes through `notify_session` → `_dsh_notify`** (the control socket,
-  XERK-467 [C]), peer-framed (`machine` source + `INBOX_PREFIX`), with the operator-framed fallback
-  on `crossSessionInbound` opt-out — the dsh analogue of the pane fallback. No pane, no `pendingInputs`
-  outbox. The socket send is bounded by `DSH_ACK_TIMEOUT_SEC` and never raises, so a dsh session on
-  the PR pollers adds no new beat-loop budget over Claude's inbox post; `refresh_pr_status` stays the
-  same inline offender for both runtimes (XERK-397's scope, not widened here).
-- **Chips survive a dsh resume/migration** because `_seed_prs` reads the PROJECTED `<tid>.jsonl`,
-  which migration already packs as the top-level transcript — independent of [K]'s native-log
-  `tar.add(<tid>/dsh)`, still out of scope. Tests: `TestDshPrAttribution`.
+(XERK-472 [H] / XERK-514 [Qwen H])
 
-## qwen sessions get the same PR chips with NO qwen-specific PR code (XERK-514 [Qwen H])
-
-- **Everything above reads and writes a qwen session UNCHANGED — do not add an `agentType` branch to
-  the PR path.** Same as dsh [H]: `_scan_pr_line`, `_seed_prs`, `refresh_pr_status`, the GitLab/ADO
-  dispatch and the comment/conflict pollers all key on `session_pr_urls` (session id) and the
-  transcript, never on the runtime. A qwen session's transcript is the [Qwen S1] projection of Qwen's
-  own native log, so the SAME scan attributes the SAME `gh pr create`. Proven end to end by
-  `TestQwenPrAttribution` over the real projector + a real-shaped corpus carrying a `gh pr create`.
-- **The one load-bearing dependency is the projector's `run_shell_command`->`Bash` name map**
-  (`_TOOL_NAME_MAP` in `qwen_transcript.py`). `_scan_pr_entry` attributes only a `tool_use` whose
-  `name` is `"Bash"`; Qwen's shell tool registers as `run_shell_command`, so without that map a qwen
-  `gh pr create` projects to an unattributed tool call and the PR is chipless. Same narrowness as
-  Claude/dsh: a PR opened another way — qwen's `cordis_run`/`ralph`, or the raw GitLab API — gets no
+- **Everything above reads/writes a dsh or qwen session UNCHANGED — never add an `agentType` branch
+  to the PR path.** `_scan_pr_line`, `_seed_prs`, `refresh_pr_status`, the GitLab/ADO dispatch and the
+  comment/conflict pollers key on `session_pr_urls` + the transcript, never the runtime. Each
+  runtime's transcript is its own S1/[Qwen S1] projection of its native log, so the SAME scan
+  attributes the SAME `gh pr create`. Proven end to end by `TestDshPrAttribution`/
+  `TestQwenPrAttribution` over the real projector + real corpus.
+- **Load-bearing dependency: each projector's shell-tool name map** (`_TOOL_NAME_MAP` in
+  `dsh_transcript.py`/`qwen_transcript.py`) — dsh's shell tool is `bash`, qwen's is
+  `run_shell_command`, both must map to `"Bash"` or the call is unattributed and the PR is chipless.
+  Same narrowness as Claude: a PR opened another way (`cordis_run`/`ralph`, raw GitLab API) gets no
   chip. **Widen only by teaching `_scan_pr_line` another creation event, never by loosening the
   Bash-name gate.**
-- **Comment/conflict delivery routes through `notify_session` → the PANE, not a socket.** This is the
-  ONE place qwen differs from dsh [H]: dsh is headless and nudges over its control socket
-  (`_dsh_notify`); a qwen session is an interactive TUI and — like a Claude session — writes no
-  `~/.claude/sessions/<pid>.json`, so `notify_session` finds no inbox and falls back to `send_input`'s
-  pane path ([Qwen C]: `send_input`/`notify_session` carry NO qwen arm). The pane send is bounded by
-  `INPUT_MAX_CHARS` and never raises, so a qwen session on the PR pollers adds no new beat-loop budget
-  over Claude's; `refresh_pr_status` stays the same inline offender for ALL runtimes (XERK-397's
-  scope, not widened here).
-- **Chips survive a qwen resume/migration** because `_seed_prs` reads the PROJECTED `<tid>.jsonl`
-  (`QwenProjectionTail`'s output), which migration packs as the top-level transcript — independent of
-  the raw native-log sidecar `<tid>/qwen/` ([Qwen E]). Tests: `TestQwenPrAttribution` (drives the REAL
-  qwen projector over `agent/tests/qwen_pr_corpus.json`, mirroring `TestDshPrAttribution`).
+- **Comment/conflict delivery differs by process model**: dsh (headless) routes through
+  `notify_session` → `_dsh_notify`, its control socket (peer-framed, `DSH_ACK_TIMEOUT_SEC`-bounded,
+  never raises); qwen (interactive TUI, writes no `~/.claude/sessions/<pid>.json`) falls back to
+  `send_input`'s PANE path like a Claude session with no inbox — neither carries a new arm ([Qwen C]).
+  Neither adds new beat-loop budget; `refresh_pr_status` stays the same inline offender for ALL
+  runtimes (XERK-397's scope, not widened here).
+- **Chips survive resume/migration for both** — `_seed_prs` reads the PROJECTED `<tid>.jsonl` (what
+  migration packs as the top-level transcript), independent of each runtime's raw native-log sidecar
+  (dsh's `<tid>/dsh/`, qwen's `<tid>/qwen/`). Tests: `TestDshPrAttribution`, `TestQwenPrAttribution`
+  (drives the real qwen projector over `qwen_pr_corpus.json`).

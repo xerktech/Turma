@@ -15,250 +15,163 @@ paths:
 # Usage aggregates, the attribution ledger and subscription limits
 
 The agent half of the Usage page: how much this host SPENT (token aggregates re-parsed from every
-transcript, and the ledger that keeps them attributable after a session is gone) and how much of the
-Claude subscription is LEFT (the 5h/7d windows, which only Claude Code can answer). All of it lives
-in `hub-agent.py` plus `hooks/statusline.py`; the hub/UI half is `.claude/rules/turma.md`.
+transcript, plus a ledger keeping them attributable after a session is gone) vs. how much of the
+Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All in `hub-agent.py` +
+`hooks/statusline.py`; hub/UI half: `turma.md`.
 
 ## Usage aggregates and the attribution ledger
 
 - The heartbeat carries **usage aggregates independent of the live registry** — per-repo
   `repoUsage[]` and host-level `usage`, from re-parsing *every* known transcript
-  (`repo_usage_report()`). Each entry carries a `remoteKey` (`normalize_remote()`) so the hub can
-  unify a repo across hosts.
+  (`repo_usage_report()`). Each entry carries a `remoteKey` (`normalize_remote()`) so the hub unifies
+  a repo across hosts.
 - **A slug's transcripts are BOTH the conversations and the background agents' own**
-  (`_project_transcripts`, XERK-302): `<slug>/<id>.jsonl`, plus `<slug>/<id>/subagents/agent-<x>.jsonl`
-  and a Workflow run's `subagents/workflows/wf_<run>/agent-<x>.jsonl`. Reading only the flat listing
-  left **every delegated token uncounted** — 19% of one host's real spend, rising with how much the
-  fleet delegates.
-  - The nesting under `subagents/` is Claude Code's and has already grown a level, so it is
-    **walked**, never hard-coded at either depth; and it is anchored on the `subagents` dir, not on
-    the parent transcript still existing (the tokens were spent either way).
-  - **Offsets key on the RELATIVE path**, never the bare filename: two parents' agents routinely
-    share `agent-<x>.jsonl`, and a name-keyed map silently skips one of them.
-  - Delegated tokens fold into `totals`/`days`/`models` like any other turn and are counted a second
-    time into **`usage.subagent`** ({totals, today, week}) — a **SLICE**, never an addend, so no
-    client adds it back. `sessions` still counts CONVERSATIONS only, else it inflates by the fan-out.
-  - Absent `subagent` = "that agent can't tell you"; a zeroed one asserts nothing was delegated —
-    and a genuine all-zero report must survive, or a non-delegating host is excluded and the share
-    OVER-states. The Usage page divides by these, so `normalizeSubagentUsage` **validates and drops,
-    never repairs**: a repaired block is indistinguishable from that genuine zero, so `{}` or
-    `{totals:{input:"9"}}` would land in the denominator with a fabricated 0 on top. Figures must be
-    non-negative SAFE INTEGERS — a float or a `1e308` decodes into a Kotlin `Long` and fails the
-    whole `/api/agents` array.
-  - **Every token figure is coerced where it leaves the transcript** (`_token_count`, XERK-306).
-    A figure travels untouched to a Kotlin `Long` on Android, where a float or an out-of-range one
-    fails the decode of the WHOLE `/api/agents` array and empties every OTHER host from that phone's
-    fleet list; a string raised straight out of `_add_tokens`, costing this host its whole report.
-    Unusable counts as 0, a FRACTIONAL one truncates (the count is real, only its type is wrong),
-    and a bool is not a count. The hub coerces again at ingest because it must survive any agent.
-  - **Only REGULAR FILES are enumerated, on both branches.** A `*.jsonl` directory would read as a
-    conversation and skip its own `subagents/` tree; a FIFO named `*.jsonl` blocks a read forever,
-    on the heartbeat's critical path. Nothing in the walk raises — an escape there is a host that
-    reads offline.
-  - `repo_usage_report` gates the host block on **tokens OR conversations**: `sessions` counts
-    conversations, so a slug left holding only a pruned session's `subagents/` tree has real spend
-    and a zero count, and gating on the count alone reported per-repo usage beside a null host block.
+  (`_project_transcripts`, XERK-302): `<slug>/<id>.jsonl` plus nested `subagents/agent-<x>.jsonl` and
+  workflow-run paths. A flat listing left delegated tokens uncounted entirely.
+  - The nesting is WALKED, never hard-coded at a depth, and anchored on the `subagents/` dir (tokens
+    were spent whether or not the parent transcript still exists).
+  - **Offsets key on the RELATIVE path, never the bare filename** — two parents' agents routinely
+    share `agent-<x>.jsonl`.
+  - Delegated tokens fold into `totals`/`days`/`models` AND count a second time into **`usage.subagent`**
+    (a **SLICE**, never an addend — no client adds it back). `sessions` counts CONVERSATIONS only.
+  - Absent `subagent` = "can't tell"; a genuine all-zero must survive as zero, so
+    `normalizeSubagentUsage` **validates and drops, never repairs** (a repaired block is
+    indistinguishable from genuine zero). Figures must be non-negative safe integers — a float or
+    `1e308` fails the whole `/api/agents` Kotlin decode.
+  - **Every token figure is coerced where it leaves the transcript** (`_token_count`, XERK-306) —
+    else a bad type fails the WHOLE `/api/agents` decode on Android or crashes `_add_tokens` agent-
+    side. Unusable→0, fractional→truncated, bool rejected. The hub coerces again at ingest.
+  - **Only REGULAR FILES enumerated, both branches** — a `*.jsonl` directory would misread as a
+    conversation; a FIFO named `*.jsonl` blocks the heartbeat's critical path forever. The walk never
+    raises.
+  - `repo_usage_report` gates the host block on **tokens OR conversations** — a slug holding only a
+    pruned session's `subagents/` tree has real spend and a zero count.
   - Tests: `TestSubagentUsage`, `subagentCard` in `usage.test.js`, the split cases in
     `UsageViewModelTest`.
-- The per-model breakdown **excludes `<synthetic>`** (and any `<...>` model): Claude Code stamps
-  fabricated entries with that model and an all-zero usage block, so `_accumulate_usage` keeps them
-  out of `acc.models`, else the usage page lists a phantom model that ran nothing. Their tokens
-  still fold into the grand totals. Mirrors `_scan_model_entry`'s guard.
-- A durable worktree→{repo, remote, slug} **attribution ledger** (`~/.turma/repo-usage.json`) keeps
-  a transcript traceable after its session and worktree are gone, so **usage history survives
-  kill/delete/prune**. Written at spawn (`_remember_usage`), backfilled from registry/closed
-  history, reconciled each usage beat by `_reconcile_orphan_transcripts()`, pruned only when a
-  transcript dir disappears. `repo_usage_report()` folds only slugs the ledger names, so
-  **reconciliation is what makes it cover every transcript on disk**.
-- Orphans are adopted best-effort in order: (1) exact repo + git origin when the worktree exists;
-  (2) the repo from the worktree-shaped slug; (3) the repo from the transcript's recorded `cwd`
-  (`_repo_from_transcript_cwd`); (4) the root bucket (`ROOT_REPO_NAME`) — **there is no "(other)"
-  bucket**.
-- **A derived name (case 2/3) only stands when it names a repo this host scans** (XERK-147): both
-  heuristics are lossy and unvalidated they mint phantom repos. `_sanitize_junk_repo_entries`
-  retires persisted junk the same way each beat (a stored name stands only with a recorded git
-  remote or a scanned repo), and is a **no-op when the repo scan is empty** so an unreadable
-  `REPOS_ROOT` can't fold real history into root.
-- **No real session is excluded.** The one carve-out is the manager's OWN internal `claude -p`
-  helpers (naming, triage, models probe), which run with `cwd=REGISTRY_DIR` yet write into the
-  shared projects dir — else the reconciler adopts the agent's overhead as a phantom repo (XERK-27).
-  `_is_internal_tool_slug` knows them by the registry dir's slug, or a harness's temp slug via
-  `INTERNAL_TOOL_PROMPT_SIGS`; the models probe's prompt is a slash command (which
-  `_first_user_text` skips) so it goes by `_first_command_name` = `/model`. Such a slug is
-  **tombstoned** (`{internal:true}`); `_sanitize_internal_tool_entries` retires entries earlier
-  builds adopted.
-  - **But the `REPOS_ROOT` slug is never `internal`**: the check reads only the newest transcript,
-    and a root session where the operator typed only `/model` reads exactly like the models probe.
-    The sanitizer lifts such a tombstone.
-- **This ledger is also the archive's input** (`_archive_manifest` enumerates ledger slugs), so
-  reconciliation *intentionally* widens archival too — decouple them only if the scopes should
-  diverge.
+- The per-model breakdown **excludes `<synthetic>`** (any `<...>` model) — Claude Code stamps
+  fabricated entries with that model and an all-zero block; `_accumulate_usage` keeps them out of
+  `acc.models` (tokens still fold into grand totals). Mirrors `_scan_model_entry`'s guard.
+- A durable worktree→{repo, remote, slug} **attribution ledger** (`~/.turma/repo-usage.json`) keeps a
+  transcript traceable after its session/worktree are gone, so **usage history survives
+  kill/delete/prune**. Written at spawn (`_remember_usage`), reconciled each beat
+  (`_reconcile_orphan_transcripts()`), pruned only when a transcript dir disappears.
+  `repo_usage_report()` folds only slugs the ledger names — reconciliation is what makes it cover
+  every transcript on disk.
+- Orphans adopt best-effort: (1) exact repo + git origin if the worktree exists; (2) repo from the
+  worktree-shaped slug; (3) repo from the transcript's recorded `cwd`; (4) the root bucket — **no
+  "(other)" bucket**.
+- **A derived name (2/3) only stands when it names a repo this host scans** (XERK-147, both
+  heuristics are lossy/unvalidated). `_sanitize_junk_repo_entries` retires persisted junk the same
+  way each beat, no-op when the repo scan is empty (so an unreadable `REPOS_ROOT` can't fold real
+  history into root).
+- **No real session is excluded.** The one carve-out is the manager's OWN `claude -p` helpers
+  (naming/triage/models probe: `cwd=REGISTRY_DIR`, but writing into the shared projects dir) —
+  `_is_internal_tool_slug` tombstones them (`{internal:true}`) by registry-dir slug or
+  `INTERNAL_TOOL_PROMPT_SIGS`; the models probe goes by `_first_command_name` = `/model`.
+  - **The `REPOS_ROOT` slug is never `internal`** — a root session where the operator typed only
+    `/model` reads like the probe; the sanitizer lifts such a mistaken tombstone.
+- **This ledger is also the archive's input** (`_archive_manifest` enumerates ledger slugs) — decouple
+  reconciliation from archival only if the scopes should diverge.
 - Tests: `TestReconcileOrphanTranscripts`, `TestSanitizeJunkRepoEntries`, android
   `UsageViewModelTest`.
 
-## Subscription limits and the limits probe (XERK-247)
+## Subscription limits and the probe (XERK-247)
 
-- The heartbeat's **`limits`** block is how much of the Claude SUBSCRIPTION's 5-hour and 7-day
-  windows is gone — a different question from the token counts above, on a pool shared with
-  claude.ai. There is no API behind it (the Usage & Cost API is org-scoped, admin-keyed, and reports
-  API spend), so the numbers exist **only in the blob Claude Code hands a `statusLine` command**.
-- It is the early warning for the condition the **local-model failover** exists to handle (XERK-246,
-  `.claude/rules/agent-sessions.md`): running out of Claude usage stops every session on a host at
-  once. Reading the headroom and failing a session over are deliberately separate controls —
-  nothing here switches a session automatically.
-- The probe runs against the **mounted subscription login, never the failover's endpoint** — a local
-  model has no such windows, so every probe would time out having spent a real turn. That holds
-  because the failover's credentials are sourced into one session's launch line rather than exported
-  process-wide; the probe's command sources nothing. Tests: `TestLimitsSnapshot`.
-- `hooks/statusline.py` captures that blob into `~/.turma/limits.json`; the beat re-validates the
-  file (`read_limits_snapshot`) and reports it. A snapshot **older than `LIMITS_MAX_AGE_SEC` is
-  refused outright** — a day-old 5-hour window has reset several times since, so it is wrong data,
-  not stale data. Absent = "this host can't tell you", never 0% used.
-- **The statusLine is NEVER wired into a session's settings**, only into the probe's own
-  (`build_limits_settings`, a separate file from `build_guard_settings`). Configuring one makes
-  Claude Code stop painting the footer's `esc to interrupt`, which is what `_busy_from_capture` and
-  tunnel-agent's `paneShowsBusy` read: measured on a 54-column pane mid-stream, busy detection falls
-  from 53/54 captures to 10/41 (the XERK-130 defect), on every session on the host.
+- The heartbeat's **`limits`** block is how much of the Claude SUBSCRIPTION's 5h/7d windows is gone —
+  a different question from the token counts above, on a pool shared with claude.ai. No API answers
+  this (Usage & Cost API is org-scoped/admin-keyed, reports API spend only) — the numbers exist
+  **only in the blob Claude Code hands a `statusLine` command**.
+- Early warning for what **local-model failover** (XERK-246, `agent-sessions.md`) handles: reading
+  headroom and failing a session over are deliberately separate controls.
+- The probe runs against the **mounted subscription login, never the failover's endpoint** (a local
+  model has no windows and every probe would time out). Tests: `TestLimitsSnapshot`.
+- `hooks/statusline.py` captures the blob into `~/.turma/limits.json`; the beat re-validates
+  (`read_limits_snapshot`). **A snapshot older than `LIMITS_MAX_AGE_SEC` is refused outright** — wrong
+  data, not stale data. Absent = "can't tell", never 0% used.
+- **The statusLine is NEVER wired into a session's settings**, only the probe's own
+  (`build_limits_settings`, separate from `build_guard_settings`) — configuring one on a session stops
+  Claude Code painting the footer's `esc to interrupt`, breaking busy detection for every session on
+  the host (the XERK-130 defect).
 - So the capture happens in a **throwaway probe whose pane nothing parses**: `_start_limits_probe`
-  runs an interactive claude in its own tmux (`LIMITS_TMUX`) on a daemon thread — print mode never
-  invokes a statusLine, so it can't be a `claude -p` one-shot like the summary/models helpers — and
-  kills it once the snapshot lands. cwd is `REGISTRY_DIR`, so its transcript is tombstoned as
-  internal overhead by the same rule as those helpers.
-- The probe is **a real turn billed against the very windows it measures** — ~36k tokens, nearly all
-  of it prompt cache, and ~15s wall clock when measured on a real host — so it is sized down (the
-  cheapest model, a one-line `--system-prompt` replacing the default, `--strict-mcp-config`, a
-  one-word answer) and spent sparingly: only with no snapshot at all, or once one ages past
-  `LIMITS_PROBE_SEC` **and a session is actually running**. A settled host lets its snapshot go
-  stale, which is the honest rendering of "nothing has moved these numbers here".
-  - **`--model haiku` is a request, not a guarantee.** It sets the session's model, but a login
-    whose routing picks per turn answers with what that routing chooses — every interactive probe
-    measured came back `claude-sonnet-5`. Don't restate the cost as a Haiku cost.
-- **A probe that captures nothing backs off, doubling to `LIMITS_PROBE_MAX_BACKOFF_SEC`.** The
-  failure that matters is the permanent one: a login with no subscription windows (API key, Bedrock,
-  Vertex) can NEVER produce a snapshot, and the "only while a session runs" gate doesn't apply to
-  the no-snapshot branch — so without the backoff such a host spends a real turn every beat forever.
-- It answers the trust-folder dialog with one `Enter` — that dialog blocks the turn entirely, so
-  without it a first probe in an untrusted `~/.turma` captures nothing.
-- **Its prompt is a distinctive signature, not a bare "ok"** (`INTERNAL_TOOL_PROMPT_SIGS`): where
-  `~/.turma` is a SYMLINK, claude resolves the path before slugifying it, so the probe's transcript
-  lands under the resolved dir's slug and `_is_internal_tool_slug`'s direct `REGISTRY_DIR` match
-  never fires — the prompt signature is then the only thing keeping the agent's own overhead dir off
-  the usage page (XERK-27), and a bare "ok" would also match a real session that opened with "ok".
-- **The probe's tmux is reaped in three places**, because its own `finally` is not enough: it runs on
-  a daemon thread, whose `finally` does NOT run when the interpreter exits, and tmux outlives the
-  manager. So `_kill_limits_probe` is also called from `_handle_shutdown` (the native updater's
-  SIGTERM is a routine path) and from `resume_on_boot` (a crash mid-probe).
-- **`read_limits_snapshot` never raises**, and that is load-bearing: it runs on the beat's critical
-  path, `~/.turma` is NOT in the guard's deny list (any session can write there), and `NaN`/`inf`
-  pass an `isinstance(x, float)` gate and then raise inside `int()`. An escape crash-loops the agent
-  on every restart until someone deletes the file. It also size-caps the read (a path pointed at
-  `/dev/zero` is an unbounded allocation), bounds both epochs, and refuses a FUTURE `capturedAt`,
-  which would otherwise read as freshly captured forever and never go stale.
+  runs an interactive claude in its own tmux (`LIMITS_TMUX`) on a daemon thread (print mode never
+  invokes a statusLine, so it can't be a `claude -p` one-shot) and kills it once the snapshot lands.
+  cwd `REGISTRY_DIR` → tombstoned as internal overhead.
+- The probe is **a real turn billed against the windows it measures** (~36k tokens, mostly cache) —
+  sized down (cheapest model, minimal system prompt, `--strict-mcp-config`) and spent sparingly: only
+  with no snapshot at all, or once one ages past `LIMITS_PROBE_SEC` **and a session is actually
+  running**.
+  - **`--model haiku` is a request, not a guarantee** — a login whose routing picks per turn may
+    answer with a different model regardless. Don't restate the cost as a Haiku cost.
+- **A probe that captures nothing backs off, doubling to `LIMITS_PROBE_MAX_BACKOFF_SEC`** — a login
+  with no subscription windows (API key, Bedrock, Vertex) can NEVER produce one, and the
+  no-snapshot branch ignores the "only while running" gate, so without backoff such a host spends a
+  real turn every beat forever.
+- Answers the trust-folder dialog with one `Enter` (blocks the turn otherwise).
+- **Its prompt is a distinctive signature, not a bare "ok"** (`INTERNAL_TOOL_PROMPT_SIGS`) — a
+  symlinked `~/.turma` resolves to a different slug before the direct `REGISTRY_DIR` match can fire,
+  so the signature is the only thing keeping this overhead off the usage page (XERK-27), and a bare
+  "ok" would also match a real session.
+- **The probe's tmux is reaped in three places** since its own `finally` doesn't run on interpreter
+  exit and tmux outlives the manager: `_kill_limits_probe` also from `_handle_shutdown` (routine
+  SIGTERM) and `resume_on_boot` (crash mid-probe).
+- **`read_limits_snapshot` never raises** — beat critical path, `~/.turma` is NOT guard-denied so any
+  session can write there, and `NaN`/`inf` pass an `isinstance(x, float)` gate then raise inside
+  `int()`. Size-caps the read, bounds both epochs, refuses a FUTURE `capturedAt` (else it never goes
+  stale).
 - Tests: `TestLimitsSnapshot`, `TestLimitsSettings`, `test_statusline.py`.
 
 ## Which subscription a host is on (XERK-301)
 
-- Those windows belong to the **ACCOUNT, not the machine**: every host logged into one Claude
-  account reads and spends the same pool, so the Usage page draws one card per subscription. The
-  heartbeat's **`subscription`** block (`subscription_identity()`) is the key it groups on.
-- The identity comes from **`oauthAccount.accountUuid` in Claude Code's own config file**, tried at
-  both real layouts (`CLAUDE_CONFIG_PATHS`: inside the config dir, then beside it). The credentials
-  file next to it cannot answer this — its tokens rotate, and `subscriptionType` names a PLAN, which
-  two different accounts share.
-  - **Every path is tried until one ANSWERS**, not until one EXISTS: `~/.claude/` sits beside
-    `~/.claude.json`, so falling through only on a missing path lets an accountless first file
-    permanently suppress the layout holding the login.
-- **What rides the wire is a hash, never the uuid, org uuid or email.** The hub persists every beat
-  into `state.json` and fans it out to web, Android and glasses, and grouping only ever asks whether
-  two hosts are equal.
-- **Absent means "this host can't tell you"**, and the clients keep such a host on a card of its own
-  — two hosts that both report nothing are not thereby on one plan. `TURMA_SUBSCRIPTION_KEY` pins a
-  group by hand for a host whose config this can't read; it is hashed the same way, so two hosts
-  given one string group.
-- `subscription_identity` **never raises and never blocks** — it runs inline on the beat over a path
-  the agent does not own, so `_subscription_from_config` takes **regular files ONLY** (a FIFO there
-  blocks `open()` until somebody writes, and the host would simply stop heartbeating with nothing
-  anywhere to say why) and bounds the **READ**, never `st_size` (a char device reports 0 and then
-  hands over bytes forever — the trap `read_limits_snapshot` spells out).
-- Cached on the file's `(mtime, size)`, per path — it is ~120 KiB of caches, so re-parsing it every
-  beat would be pure waste, while a re-login still wins.
-- Tests: `TestSubscriptionIdentity`.
+- Windows belong to the **ACCOUNT, not the machine** — every host on one Claude account spends the
+  same pool, so the Usage page draws one card per subscription. The heartbeat's **`subscription`**
+  block (`subscription_identity()`) is the grouping key.
+- Identity comes from **`oauthAccount.accountUuid` in Claude Code's own config file**, tried at both
+  real layouts (`CLAUDE_CONFIG_PATHS`). The credentials file can't answer this — tokens rotate, and
+  `subscriptionType` names
+  a PLAN two different accounts share.
+  - **Every path is tried until one ANSWERS, not until one EXISTS** — falling through only on a
+    missing path lets an accountless first file permanently suppress the layout holding the login.
+- **What rides the wire is a hash, never the uuid, org uuid or email** — grouping only ever asks
+  whether two hosts are equal.
+- **Absent means "can't tell"** — such a host gets its own card, never merged by default.
+  `TURMA_SUBSCRIPTION_KEY` pins a group by hand, hashed the same way.
+- `subscription_identity` **never raises and never blocks** — `_subscription_from_config` takes
+  **regular files ONLY** (a FIFO blocks `open()` forever) and bounds the **READ**, never `st_size` (a
+  char device reports 0 then hands over bytes forever).
+- Cached on the file's `(mtime, size)`, per path — a re-login still wins. Tests:
+  `TestSubscriptionIdentity`.
 
-## dsh sessions ride this half unchanged (XERK-471 [dsh][G])
+## dsh and qwen sessions ride all of this UNCHANGED (XERK-471 [G], XERK-513 [Qwen G])
 
-The dsh runtime (XERK-460) spends tokens through a different model client, but its usage reaches
-every surface here through the SAME code with no dsh branch — because [S1]'s projection
-(`dsh_transcript.py`) writes dsh spend into the exact `message.usage`/`message.model` shape this file
-already reads. The reconciliation, and the two things a change must not undo:
+Both runtimes spend tokens through a different model client, but reach every surface above through
+the SAME code with NO `agentType` branch — because each runtime's projection (`dsh_transcript.py` /
+`qwen_transcript.py`) writes spend into the exact `message.usage`/`message.model` shape this file
+already reads. **Adding an `agentType` branch to the aggregation is the regression to avoid.**
 
-- **Token aggregates + the attribution ledger cost dsh NO new code, and adding an `agentType` branch
-  to the aggregation is the regression to avoid.** A dsh session is an ordinary session here:
+- **Token aggregates + the ledger cost NEITHER runtime new code.** Each is an ordinary session here:
   `_remember_usage` records its worktree→repo at spawn like any other, and its spend is the
-  PROJECTION transcript `<slug>/<claudeSessionId>.jsonl`, whose assistant entries carry
-  `message.usage` (dsh `TokenUsage` mapped 1:1 by `_map_usage`) and a real `message.model` (D4). So
-  `_accumulate_usage` / `_token_count` / `repo_usage_report` fold it, `retiredUsage` (XERK-338)
-  carries it after the host is gone, and the per-model breakdown attributes it — all by construction.
-  The wire needs nothing new either: usage is `agentType`-agnostic, so no heartbeat field is added
-  for [G] (the capability plumbing was [A]).
-- **Local / DeepSeek model ids just APPEAR in the per-model breakdown and may DOMINATE a host's
-  turns** ([G0] D5). They are not `<synthetic>` (no `<...>` name), so `_accumulate_usage`'s guard
-  leaves them in — correctly. The one dsh-specific care is at the projection: `_map_usage` drops an
-  all-zero usage block to `None`, so a local OpenAI-compatible endpoint that returns no counts does
-  NOT plant a phantom zero-token model row in "Tokens by model" (the defect the `<synthetic>` guard
-  removes for Claude). Tests: `TestDshProjectionAccounting`, `TestDshUsageReportEndToEnd`,
-  `test_all_zero_usage_projects_no_usage_key` in `test_dsh_transcript.py`.
-- **The native event log is NEVER counted; the projection is the single copy.** dsh's canonical log
-  at `<slug>/<claudeSessionId>/dsh/` (XERK-469 [E]) is neither a top-level `*.jsonl` nor under
-  `subagents/`, so `_project_transcripts` skips it — counting both would double a dsh session's
-  spend. Do not teach the walk to read `<sid>/dsh/`. **A qwen session's native log at
-  `<slug>/<claudeSessionId>/qwen/`** (XERK-512 [Qwen E]) is skipped for the SAME reason and must stay
-  skipped — its projection is the single counted copy; do not teach the walk to read `<sid>/qwen/`.
-- **Subscription limits and the probe are CLAUDE-SUBSCRIPTION only, and dsh does not feed them.** A
-  dsh session has no 5h/7d window — its model is a local/DeepSeek route with no pool shared with
-  claude.ai (D5) — so nothing dsh spends touches the `limits` block, and there is deliberately no dsh
-  limits path to build ("where applicable" = not applicable). The probe already runs against the
-  mounted subscription login and sources nothing from the dsh model route, so it is unchanged. Never
-  wire dsh spend into `limits`.
-- **The subscription CARD still applies to the host, and a dsh session never moves it.** A host
-  running dsh is still logged into Claude (the mounted login powers summaries/triage/the probe), so
-  `subscription_identity` — per-host, off the Claude config — reports the same account whether or not
-  a dsh session is running. A dsh-only-active host groups on its Claude account like any other.
-
-## qwen sessions ride this half unchanged too (XERK-513 [Qwen G])
-
-The Qwen runtime (XERK-504) is the interactive-TUI analogue of dsh, and its usage reaches every
-surface here through the SAME code with no qwen branch — same reconciliation as dsh above, because
-[Qwen S1]'s projection (`qwen_transcript.py`) writes qwen spend into the exact
-`message.usage`/`message.model` shape this file already reads. **[Qwen G] added NO aggregation code:
-the projection's `_map_usage` hardening was already folded into [S1], so this ticket is the
-confirmation plus the end-to-end test.** The two things a change must not undo:
-
-- **Token aggregates + the attribution ledger cost qwen NO new code; an `agentType` branch in the
-  aggregation is the regression to avoid.** A qwen session is an ordinary session here:
-  `_remember_usage` records its worktree→repo at spawn, and its spend is the PROJECTION transcript
-  `<slug>/<claudeSessionId>.jsonl` (`QwenProjectionTail`), whose assistant entries carry
-  `message.usage` (Gemini `usageMetadata` mapped by `_map_usage`) and a real `message.model`. So
-  `_accumulate_usage` / `_token_count` / `repo_usage_report` fold it, `retiredUsage` (XERK-338)
-  carries it after the host is gone, and the per-model breakdown attributes it — all by
-  construction. No heartbeat field is added (usage is `agentType`-agnostic).
-- **Local / OpenAI-compatible model ids just APPEAR in the per-model breakdown and may DOMINATE.**
-  They are not `<synthetic>` (no `<...>` name), so `_accumulate_usage`'s guard leaves them in. The
-  one care is at the projection: `_map_usage` returns None for a usage-less OR all-zero block
-  (common on a local endpoint that reports no counts), so it does NOT plant a phantom zero-token
-  model row. This is the `<synthetic>` guard's job done at the projector. Tests:
-  `TestQwenUsageReportEndToEnd`, `TestQwenProjectionAccounting`, `TestQwenUsageMapping`
-  (`test_all_zero_usage_projects_no_usage_key`) in `test_qwen_transcript.py`.
-- **The native event log is NEVER counted; the projection is the single copy.**
-  `_project_transcripts` counts only a slug's top-level `*.jsonl` (the projection the tail appends
-  into `PROJECTS_ROOT`) plus `subagents/**`. qwen's native log is in neither: it lives in qwen's own
-  home (`QWEN_PROJECTS_ROOT`, `~/.qwen/projects/<slug>/chats/<id>.jsonl`), and its raw ARCHIVE copy
-  ([Qwen E], XERK-512) is a sidecar at `<slug>/<sid>/qwen/chat.jsonl` — a raw sidecar like dsh's
-  `<sid>/dsh/`, which the usage walk does not read. So it can never be double-counted. Do not teach
-  the walk to read `<sid>/qwen/`.
-- **Subscription limits, the probe and the CARD stay Claude-only, and a qwen session never feeds
-  them.** qwen has no 5h/7d window — its model is an OpenAI-compatible route with no pool shared with
-  claude.ai — so nothing qwen spends touches `limits`, and `_start_summary` REFUSES a qwen session
-  (as it does dsh) so no Claude summarizer turn is spent on a runtime that may have no Claude login.
-  The probe runs against the mounted subscription login and sources nothing from the qwen route;
-  `subscription_identity` is per-host off the Claude config, so a qwen session never moves the card.
-  Never wire qwen spend into `limits`.
+  PROJECTION transcript, whose assistant entries carry `message.usage` (mapped 1:1 by `_map_usage`)
+  and a real `message.model`. So `_accumulate_usage`/`_token_count`/`repo_usage_report` fold it,
+  `retiredUsage` (XERK-338) carries it after the host is gone, and the per-model breakdown attributes
+  it — all by construction. No heartbeat field is added; usage is `agentType`-agnostic.
+- **Local/DeepSeek/OpenAI-compatible model ids just APPEAR in the per-model breakdown and may
+  DOMINATE a host's turns.** They are not `<synthetic>`, so `_accumulate_usage`'s guard leaves them
+  in — correctly. The one runtime-specific care is at the projection: `_map_usage` drops an all-zero
+  usage block to `None` for BOTH runtimes, so a local endpoint reporting no counts does NOT plant a
+  phantom zero-token model row (the `<synthetic>` guard's job, done at the projector instead). Tests:
+  `TestDshProjectionAccounting`/`TestDshUsageReportEndToEnd`/`test_all_zero_usage_projects_no_usage_key`
+  (dsh), `TestQwenUsageReportEndToEnd`/`TestQwenProjectionAccounting`/`TestQwenUsageMapping` (qwen).
+- **The native event log is NEVER counted; the projection is the single copy, for both.** qwen's own
+  live home (`QWEN_PROJECTS_ROOT`, `~/.qwen/projects/<slug>/chats/<id>.jsonl`) is never walked at all;
+  its raw ARCHIVE sidecar at `<slug>/<id>/qwen/`, and dsh's log at `<slug>/<id>/dsh/`, are neither
+  top-level `*.jsonl` nor under
+  `subagents/`, so `_project_transcripts` skips both — counting either would double that session's
+  spend. **Do not teach the walk to read `<sid>/dsh/` or `<sid>/qwen/`.**
+- **Subscription limits, the probe, and the CARD stay Claude-only for both runtimes.** Neither dsh
+  nor qwen has a 5h/7d window (each is a local/API route with no pool shared with claude.ai, D5), so
+  nothing either spends touches `limits`; there is deliberately no dsh/qwen limits path. `
+  _start_summary` REFUSES both runtimes (no Claude summarizer turn on a login-less runtime). The
+  probe runs against the mounted Claude login regardless of what runtime is active, and
+  `subscription_identity` is per-HOST off the Claude config, so a dsh/qwen session never moves the
+  card (the host is still logged into Claude, which powers summaries/triage/the probe). **Never wire
+  dsh or qwen spend into `limits`.**
