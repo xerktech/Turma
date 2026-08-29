@@ -100,11 +100,12 @@ landed, and the invariants a later child must not undo:
   (REQUIRED for the on-disk transcript + resume), `disableAutoUpdate` (a pinned fleet must not let
   the binary drift under the parsers — the G0 auto-update trap), `folderTrust:false`, and
   `approvalMode:"auto"` + `autoAccept:true` (hands-off, the claude `--permission-mode auto` analogue).
-- **The safety guard is NOT wired here — that is [Qwen F] (XERK-510)**, PreToolUse hooks +
-  `permissions.deny` reusing the shared `guard.py`/`fileguard.py` deny policy (qwen's hook contract
-  is Claude Code's, ported — G0 crit. 5). `approvalMode:"auto"` runs tools unattended, so a launcher
-  WITHOUT [Qwen F] is unguarded — which is the load-bearing reason `QWEN_ENABLED` stays False past
-  [Qwen B]. Permission-mode parity (Shift+Tab / setMode) is [Qwen P] (XERK-522).
+- **The safety guard is [Qwen F] (XERK-510), now SHIPPED and wired into `_qwen_settings`** —
+  PreToolUse hooks + `permissions.deny` reusing the shared `guard.py`/`fileguard.py` deny policy
+  (qwen's hook contract is Claude Code's, ported — G0 crit. 5). See the "[Qwen F]" section below.
+  `approvalMode:"auto"` runs tools unattended, so a launcher WITHOUT the guard is unguarded — the
+  load-bearing reason `QWEN_ENABLED` stays False, now liftable once [Qwen F] is host-verified.
+  Permission-mode parity (Shift+Tab / setMode) is [Qwen P] (XERK-522).
 - **Config readiness is primed OFF THE BEAT** (`_ensure_qwen_ready` on a worker at startup when
   `qwen_configured()`): a `qwen --version` probe + model-route validation, cached on `_qwen_ready`.
   `_launch_qwen` only READS the cached flag and refuses if unset — it never runs the probe on the
@@ -349,6 +350,76 @@ subscription `limits`/probe/card stay Claude-only) lives in **`.claude/rules/age
   projector's output through `repo_usage_report`/`_aggregate_project` on disk, proving host + per-repo
   totals and the local/OpenAI-compat per-model breakdown; `TestQwenProjectionAccounting`/
   `TestQwenUsageMapping` cover the layer below. All in `test_qwen_transcript.py`.
+
+## [Qwen F] (XERK-510) shipped: safety guard (PreToolUse shim + permissions.deny)
+
+The dsh [F] discipline (`.claude/rules/dsh-guard.md`) applied to qwen — but qwen's PreToolUse-hook
+model IS Claude's (G0 crit. 5), so it reuses the shared deny policy even more directly. The deny
+POLICY is NOT duplicated: destructive/policy/attribution shell classification (`guard.py`) and the
+"everything under ~/.claude except the two memory trees" predicate (`fileguard.py`) have ONE home,
+shelled out to `python3 -SsE <hook>` exactly as Claude and dsh do. Invariants a change must not undo:
+
+- **The one mismatch qwen adds is TOOL NAMES, so a thin SHIM bridges it** (`agent/qwen/guard/shim.py`).
+  `guard.py` keys on `tool_name=="Bash"` and `fileguard.py` on `Write|Edit|…`; a qwen
+  `run_shell_command`/`write_file` sails past both. The shim classifies a qwen tool (shell/write/read,
+  the qwen twin of the dsh guard's `classify`), shells out to the SHARED hooks with the Claude tool
+  shape they expect, AND matches the flat credential/config/runtime-code globs itself (realpath'd, so
+  a symlink/`..` cannot dodge them). **The shim is the enforcement; it does NOT re-implement the deny
+  policy** — only routing + the flat globs, exactly what the dsh guard already reimplements natively.
+- **`build_qwen_guard_config()` reads the SAME rule set `build_guard_settings()` produces** (parsed
+  with `_parse_perm_rule`, as the dsh builder does) and emits (a) the `hooks.PreToolUse` wiring and
+  (b) the shim's data config (`~/.turma/qwen-guard.json`: hook paths + denyWrite/denyRead/allowRead).
+  **Adding a store to `_GUARD_DENY_PATH_RULES` covers all three runtimes with NO qwen change** — the
+  ticket's shared-list contract, pinned by `test_shim_config_is_the_shared_rule_set`. Built + written
+  at the launch choke point (`_qwen_guard_config`, memoized like `_ensure_guard_settings`; primed
+  off-beat by `_prime_qwen`, XERK-395), merged into `.qwen/settings.json` by `_qwen_settings`.
+- **It FAILS CLOSED.** `guard.py`/`fileguard.py` fail OPEN on a malformed payload because Claude keeps
+  `permissions.deny` as a backstop; qwen has none the shim can rely on, so the shim DENIES (deny JSON
+  on stdout AND exit 2) on: an unreadable config, a hook it cannot spawn / that crashes (nonzero
+  exit) / times out / returns unreadable output, a SHELL call with no configured guard script, an
+  unparseable tool payload, or any unexpected error in the shim. A missing FILEGUARD degrades to the
+  write-deny globs (defence in depth, like dsh), not a fail-closed — the globs still name the
+  catastrophic ~/.claude subset. **G0 GOTCHA baked in: qwen's hook `timeout` is MILLISECONDS** — a
+  too-small value silently disables the guard, so `QWEN_GUARD_HOOK_TIMEOUT_MS` (15000) comfortably
+  exceeds the shim's own nested-subprocess budget (`QWEN_SHIM_HOOK_TIMEOUT_MS`, 5000).
+- **Approval mode stays `auto` (NOT `yolo`, NOT `default`)** — the ticket's "not auto-yolo, not
+  auto-reject". `default` would HANG on every tool-approval prompt (nothing auto-answers them until
+  [Qwen P]); `yolo` risks skipping hooks. `auto` is the Claude `--permission-mode auto` analogue:
+  hands-off, hooks fire. **LOAD-BEARING HOST-PROOF: G0 proved the deny hook fires under `default`;
+  that it also fires under `auto` (the mode the launcher runs) is UNVERIFIED and is THE gate before
+  `QWEN_ENABLED` is flipped.** If `auto` skips hooks on a real host, qwen must not be enabled until
+  the mode question is resolved.
+- **`permissions.deny` is UNVERIFIED defence in depth** — the G0 spike catalogued qwen's settings
+  keys and found no `permissions` block, so whether qwen honours one is unknown; it is emitted
+  (ticket-required, the Claude backstop analogue) but the shim does NOT depend on it, and if a real
+  qwen REJECTS the unknown key the fix is a one-line removal (`_confirm_qwen_launch` catches a launch
+  break). Host-proof, like the [Qwen C] `mcpServers` key.
+- **The credential env file is read-denied** (`Read(~/.turma/qwen/*.env)`, holds `OPENAI_API_KEY`) —
+  ticket point 5, defence in depth: 0600 already stops other uids and the session runs as the owning
+  uid, so this only stops a casual read via the file-editing tools (Bash walks past it, XERK-309).
+- **Residual gaps (stated, not papered over):**
+  - **An unknown mutating tool NAME is ungated** (the qwen twin of dsh's ungated `cordis_run`/`ralph`):
+    the shim only sees the tools the matcher lists (`_QWEN_GUARDED_TOOLS`) and classifies the rest as
+    `other`→allow. Worse than dsh here — dsh pins `sandbox: workspace-write` (landlock) as the fs
+    backstop, but qwen's `--sandbox` needs docker/podman (absent on native hosts), so there is NO fs
+    confinement backstop. Widening the tool list, not a sandbox, is the honest fix if qwen grows a
+    new fs tool.
+  - **The flat globs match an expanduser'd (not realpath'd) prefix against a realpath'd target**, so a
+    symlinked HOME could dodge a credential glob — the SAME accepted limitation the dsh guard has;
+    `fileguard.py` realpaths its ~/.claude base, so the ~/.claude predicate holds regardless.
+  - **The shim RE-READS `~/.turma/qwen-guard.json` every call, and a Bash redirect walks past its
+    Edit-deny** (XERK-309) — so a `run_shell_command` that overwrites it could repoint `guardScript`
+    and self-bypass. This is NOT net-new: `guard.py` equally allows `echo > guard.py` for the Claude
+    guard (the guard defends against the MODEL, not a hostile same-uid shell), and deriving the
+    script paths from the shim's own location does not close it either (Bash can overwrite guard.py
+    directly). It is a weaker backstop than guard-settings.json's, which claude reads once at launch
+    (restart-repairable) — the deny-rule comment in `_GUARD_DENY_PATH_RULES` states this.
+- Tests: `test_qwen_guard.py` — `TestBuildQwenGuardConfig` pins the config (hook wiring, the
+  ms-timeout ordering, the shared-rule-set derivation, the credential read-deny, no-ListAgents,
+  missing-fileguard degrade) and `TestQwenGuardShimEndToEnd` drives the REAL shim over the REAL
+  guard.py/fileguard.py with hostile inputs (destructive/policy/attribution shell, credential+
+  ~/.claude writes, credential reads vs the uploads/roster carve-outs, symlink escape, and every
+  fail-closed path). The `permissions.deny`-honoured and `auto`-fires-hooks legs are host-proof only.
 
 ## [Qwen I] (XERK-515) shipped: board integration — a ticket can run on qwen
 
