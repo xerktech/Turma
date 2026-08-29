@@ -462,6 +462,14 @@ gate, the per-runtime `findTicketHost` capability filter, the board `qwenAvailab
 Android parity — live in **`.claude/rules/turma-board.md`**'s Runtime-row section (board-scoped,
 where the dsh [I] board detail's twin belongs), whose `paths:` load for the board files this touched.
 
+## [Qwen J] (XERK-517) shipped: background-agent rows + subagentHistory
+
+Delegation, the dsh [J] analogue, lives in **`.claude/rules/qwen-delegation.md`** (split out for the
+size cap). The load-bearing point: qwen's delegation is a near-Claude `Agent` launch, so the
+projector RESHAPES it rather than synthesizing — `agent`→`Agent`, `task_execution`→`async_launched`,
+the STOP edge already an exact `<task-notification>`, each child's own log projected into the Claude
+`subagents/` layout — so the existing readers and usage/archive/migration walks read it unchanged.
+
 ## [Qwen K] (XERK-516) shipped: session migration + resume
 
 Session migration + resume for a qwen session (the dsh [K] analogue) lives in
