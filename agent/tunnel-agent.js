@@ -1067,8 +1067,18 @@ function parsePaneStatus(l) {
 //    ("✻ Brewed for 9s") lacks, so it can't fake busy.
 const PANE_BUSY_TRUNC_RE = /[⏸⏵][^\n]*·\s*e[sc to interup]*…\s*$/im;
 const PANE_SPINNER_RE = /^[^\sA-Za-z0-9●❯]\s+[A-Z][a-z]+(?:…|\.\.\.)(?:\s*\(|\s*$)/;
+// Qwen Code's TUI (XERK-509 [Qwen C]) shows a different busy hint than Claude's
+// "esc to interrupt": while a turn runs the footer gains "Enter to steer ·
+// Ctrl+Q to queue" and the spinner ends "(… · esc to cancel)" (G0 spike).
+// Unioned in here so a qwen session's live tail detects "generating" with no
+// agentType (the live tail scrapes the pane like Claude's and can't tell the
+// runtime). The spinner token keeps its CLOSING PAREN — Claude's own permission
+// dialog says "Esc to cancel · Tab to amend" (no paren) and must not read busy.
+// Mirrors hub-agent.py's QWEN_PANE_BUSY_MARKERS (the py/js parity contract).
+const QWEN_PANE_BUSY_RE = /enter to steer|esc to cancel\)/i;
 function paneShowsBusy(raw) {
   if (/esc to interrupt/i.test(raw)) return true;
+  if (QWEN_PANE_BUSY_RE.test(raw)) return true;
   if (PANE_BUSY_TRUNC_RE.test(raw)) return true;
   return raw.split("\n").some((l) => PANE_SPINNER_RE.test(l));
 }

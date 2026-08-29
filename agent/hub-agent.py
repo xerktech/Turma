@@ -2710,6 +2710,16 @@ def ask_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "ask.py")
 
 
+def qwen_ask_mcp_path():
+    """Absolute path to the qwen AskUserQuestion MCP server (``qwen/ask_mcp.py``,
+    XERK-509 [Qwen C]). Qwen has no native AskUserQuestion tool, so this stdio MCP
+    server REGISTERS one whose call writes the same rendezvous file every question
+    surface reads and blocks for the operator's answer (answered by the existing
+    answer_question path — no client change)."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "qwen", "ask_mcp.py")
+
+
 def _glob_literal(path):
     """Escape glob metacharacters so a path is matched as literal text.
 
@@ -2803,6 +2813,12 @@ def statusline_script_path():
 # bridge's own per-question block (TURMA_QUESTION_TIMEOUT_SEC, default 600) or
 # Claude would kill the hook first. A little headroom over the 600s default.
 ASK_HOOK_TIMEOUT_SEC = 660
+# The qwen AskUserQuestion MCP server (qwen/ask_mcp.py, XERK-509 [Qwen C]) blocks
+# a tool call for this long waiting on the operator's answer before returning "no
+# answer". Kept BELOW QUESTION_STALE_AFTER_SEC (below) so a still-blocking
+# question is never stale-dropped from the beat's pending read while the operator
+# is still deciding — the qwen analogue of ask.py's own 600s block.
+QWEN_QUESTION_BLOCK_TIMEOUT_SEC = 600
 
 
 def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
@@ -7586,6 +7602,21 @@ PANE_BUSY_MARKERS = tuple(
     os.environ.get("TURMA_PANE_BUSY_MARKERS", "esc to interrupt").split("|")
     if m.strip()
 )
+# Qwen Code's TUI (XERK-509 [Qwen C]) shows a DIFFERENT busy hint than Claude's
+# "esc to interrupt": while a turn is active the footer gains an "Enter to steer ·
+# Ctrl+Q to queue" prefix and the spinner line ends "(… · esc to cancel)" (G0
+# spike, docs/qwen-g0/pane/02-busy.txt). Both are UNIONED into the busy read
+# rather than gated on agentType: a qwen session reports the SAME paneBusy wire
+# field with no plumbing change, and neither string occurs in a Claude pane —
+# NOTE the spinner token is matched WITH its closing paren ("esc to cancel)"),
+# because Claude's OWN permission-dialog footer says "Esc to cancel · Tab to
+# amend" (no paren), which must still read as blocked/idle, not busy. Kept
+# separate from PANE_BUSY_MARKERS (which the operator can override) so a custom
+# Claude marker can't drop qwen detection. Mirrored in tunnel-agent.js
+# `paneShowsBusy` (the py/js parity contract). The spinner's PHRASE randomizes
+# ("Entangling quantum particles…"), so a parser must key only on these stable
+# tokens (G0 pitfall).
+QWEN_PANE_BUSY_MARKERS = ("enter to steer", "esc to cancel)")
 
 # The hint alone is not enough on a NARROW pane (XERK-130). tmux sizes the
 # window to its smallest-ever attached client, so a session once viewed from a
@@ -7646,9 +7677,18 @@ def _busy_from_capture(cap):
     enough to show it whole), the width-truncated remnant of that hint on the
     mode footer line, or the column-0 working-spinner line — see the regexes'
     comment for why all three are needed (XERK-130)."""
-    if cap is None or not PANE_BUSY_MARKERS:
+    if cap is None:
         return None
     low = cap.lower()
+    # Qwen's busy tokens are ALWAYS-ON and qwen-EXCLUSIVE (see
+    # QWEN_PANE_BUSY_MARKERS): checked first so a qwen session reads busy even if
+    # the operator disabled the Claude markers, and a no-op for a Claude pane
+    # (which never contains them). The Claude-specific trunc/spinner shapes below
+    # stay gated on PANE_BUSY_MARKERS so emptying it still disables THAT feature.
+    if any(m in low for m in QWEN_PANE_BUSY_MARKERS):
+        return True
+    if not PANE_BUSY_MARKERS:
+        return None
     if any(m in low for m in PANE_BUSY_MARKERS):
         return True
     if PANE_BUSY_TRUNC_RE.search(cap):
@@ -7775,7 +7815,17 @@ def parse_pane_mode(cap):
 #   4. NO mode footer below it — the footer marker rides the composer, which a
 #      dialog replaces, so its absence is what says "this is a live dialog"
 #      rather than transcript text that happens to look like one.
-PANE_PROMPT_OPTION_RE = re.compile(r"^\s*(❯\s+)?(\d+)\.\s+(\S.*?)\s*$")
+# The selection cursor is "❯" in Claude Code and "›" in Qwen Code (XERK-509
+# [Qwen C], G0 pane/03-tool-approval.txt: "› 1. Yes, allow once"). Both are
+# accepted — neither glyph occurs in ordinary conversation text, so the cursor
+# requirement stays the strong guard against a false positive on a numbered list.
+PANE_PROMPT_OPTION_RE = re.compile(r"^\s*([❯›]\s+)?(\d+)\.\s+(\S.*?)\s*$")
+# Qwen's composer footer (idle: "⏸ Ask permissions (shift + tab to cycle)";
+# busy adds "Enter to steer · Ctrl+Q to queue ·" ahead of it). Like Claude's
+# PANE_MODE_RE it means the composer is live, so its presence below a numbered
+# run says "not a blocking dialog" — a qwen approval dialog REPLACES the footer
+# with "Waiting for user confirmation…" (G0), so a real dialog shows none.
+QWEN_PANE_FOOTER_RE = re.compile(r"Ask permissions \(shift \+ tab to cycle\)")
 # A box/rule line the TUI draws between sections. The dialog's context is the
 # nearest block ABOVE the question fenced by these, which is why they are
 # skipped before the block and end it after: a permission dialog's block sits
@@ -7808,8 +7858,9 @@ def parse_pane_prompt(cap):
         line = lines[i]
         m = PANE_PROMPT_OPTION_RE.match(line)
         if not m or m.group(2) == "0":
-            if PANE_MODE_RE.search(line):
-                return None          # composer footer: nothing is blocking
+            if PANE_MODE_RE.search(line) or QWEN_PANE_FOOTER_RE.search(line):
+                return None          # composer footer (Claude or Qwen): nothing
+                                     # is blocking
             continue
         # Walk up while the numbers keep descending to 1.
         end = i
@@ -11829,6 +11880,12 @@ class SessionManager:
         # session", which every dsh path treats as nothing to deliver to.
         self.dsh_controls = {}                   # id -> dsh_session.DshControl
         self.dsh_tails = {}                      # id -> dsh_session.DshProjectionTail
+        # qwen sessions (XERK-509 [Qwen C]): the per-session projection tail that
+        # reads qwen's native log and appends the Claude-JSONL projection to the
+        # pinned transcript. A qwen session is a TUI (input/liveness/HITL ride the
+        # pane, no control socket like dsh), so this is the ONE piece of qwen read
+        # state that isn't the pane. A lookup miss means "not a live qwen session".
+        self.qwen_tails = {}                     # id -> qwen_session.QwenProjectionTail
         # id -> "running"|"idle": the dsh agent's last turn/status edge off the
         # control socket, the dsh session's "working" signal for [D] (XERK-468).
         self.dsh_status = {}
@@ -13508,6 +13565,53 @@ class SessionManager:
             raise RuntimeError(
                 "qwen started in tmux but the session never came up "
                 "(a bad config, a failed load, or an unreachable model route)")
+        # 7. Wire the projection tail ([Qwen S1]/[C]): read qwen's native log and
+        # append the derived Claude-Code JSONL projection to the pinned transcript
+        # INCREMENTALLY, off the beat. Until it runs the chat/history/PR/usage
+        # surfaces read a blank <id>.jsonl (the ttyd terminal is fully live
+        # meanwhile). A resume starts at the native log's EOF so it never
+        # re-projects the kept history (qwen --resume appends in place).
+        self._start_qwen_tail(sess, claude_sid, resume=resume)
+
+    def _start_qwen_tail(self, sess, claude_sid, resume=False):
+        """Create + start the projection tail for a qwen session and remember it
+        in self.qwen_tails (replacing any prior one). Shared by _launch_qwen and
+        the resume-on-boot ADOPT path (_reattach_qwen). Best-effort: a tail that
+        fails to start leaves the chat blank but never fails the launch — the
+        terminal is still live and the tail retries every poll."""
+        import qwen_session
+        sid = sess["id"]
+        worktree = sess.get("worktreePath")
+        transcript_path = os.path.join(
+            PROJECTS_ROOT, _project_slug(worktree), f"{claude_sid}.jsonl")
+        old = self.qwen_tails.pop(sid, None)
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:
+                pass
+        tail = qwen_session.QwenProjectionTail(
+            QWEN_PROJECTS_ROOT, transcript_path, claude_sid,
+            cwd=worktree, log=log, resume=resume)
+        tail.start()
+        self.qwen_tails[sid] = tail
+
+    def _teardown_qwen(self, sid):
+        """Stop a qwen session's projection tail and drop its transient files
+        (XERK-509). Idempotent: a session that had no tail (a claude/dsh session,
+        or one already torn down) is a no-op. Unlike dsh there is no control
+        socket to close — a qwen session is driven through its pane."""
+        tail = self.qwen_tails.pop(sid, None)
+        if tail is not None:
+            try:
+                tail.stop()
+            except Exception:
+                pass
+        # Drop the per-session env file (holds the model API key, 0600).
+        try:
+            os.remove(os.path.join(QWEN_RUNTIME_DIR, f"{sid}.env"))
+        except OSError:
+            pass
 
     def _qwen_settings(self, sess):
         """The workspace `.qwen/settings.json` for a qwen session — pinning the
@@ -13542,6 +13646,28 @@ class SessionManager:
             # The directive rides the context file, loaded into the system
             # prompt — qwen's --append-system-prompt analogue.
             "context": {"fileName": QWEN_CONTEXT_FILENAME},
+        }
+        # HITL structured questions (XERK-509 [Qwen C]): Qwen has no native
+        # AskUserQuestion tool, so REGISTER one via MCP — the one Claude-Code-
+        # compatible mechanism for a model-callable tool. The `turma-ask` MCP
+        # server (qwen/ask_mcp.py) exposes `ask_user_question`; when the model
+        # calls it, the server writes the SAME QUESTIONS_DIR/<sid>.req.json card
+        # every question surface reads and blocks for the operator's answer
+        # (dropped by the existing answer_question path — NO client change). The
+        # session id + rendezvous dir + block timeout ride the server's own env
+        # block (per-session). `python3 -SsE` matches the guard-hook security
+        # flags. (The exact `mcpServers` settings key is host-proof-only — qwen
+        # is not installed in CI; unit-tested via the server's JSON-RPC contract.)
+        settings["mcpServers"] = {
+            "turma-ask": {
+                "command": "python3",
+                "args": ["-SsE", qwen_ask_mcp_path()],
+                "env": {
+                    "TURMA_SESSION_ID": sess["id"],
+                    "TURMA_QUESTIONS_DIR": QUESTIONS_DIR,
+                    "TURMA_QUESTION_TIMEOUT_SEC": str(QWEN_QUESTION_BLOCK_TIMEOUT_SEC),
+                },
+            }
         }
         # Size the model's context window to what the endpoint really serves — an
         # overstated window makes qwen pack too much and the tail truncate, the
@@ -14372,6 +14498,10 @@ class SessionManager:
         # clean-kill call (kill/delete/restart do it first, so this is a no-op
         # there). Never sends the socket kill — that is the explicit callers' job.
         self._teardown_dsh(sid)
+        # A qwen session has no control socket, only a projection tail — stop it
+        # here (kill/delete/restart all reach this) so it doesn't keep tailing a
+        # dead session's native log (XERK-509 [Qwen C]).
+        self._teardown_qwen(sid)
         self.sess_state.pop(sid, None)
         self.dsh_status.pop(sid, None)  # dsh liveness dies with the session (XERK-468)
         # Drop any peer traffic still staged for this session (XERK-476): a send
@@ -16492,6 +16622,11 @@ class SessionManager:
             log(f"pane-prompt answer {number} for {sid} dropped: not an option")
             return
         run(["tmux", "send-keys", "-t", sess["tmuxName"], str(number)])
+        # Qwen's approval picker requires the digit AND Enter to submit (G0
+        # crit. 3: "the approval keystroke (1 + Enter)"); Claude Code's dialog
+        # submits on the digit alone, so Enter is qwen-only.
+        if sess.get("agentType") == "qwen":
+            run(["tmux", "send-keys", "-t", sess["tmuxName"], "Enter"])
         log(f"answered pane prompt for session {sid}: option {number}")
 
     def set_summary(self, sid, summary):
@@ -19764,9 +19899,13 @@ class SessionManager:
         # A dsh session is named from dsh's OWN auto-generated title (the
         # `session/title` event, seeded by _seed_summaries), never claude -p — a
         # dsh session has no Claude summarizer to lean on, and spending a turn to
-        # re-derive what dsh already wrote would be pure waste. Guards the
-        # spawn/dsh-input/summaries call sites in one place.
-        if sess.get("agentType") == "dsh":
+        # re-derive what dsh already wrote would be pure waste. A qwen session is
+        # likewise named WITHOUT claude -p (XERK-509 [Qwen C]): a pure-qwen host
+        # may have no Claude login at all, so naming must not depend on one — it
+        # is named from qwen's own generated title, else a qwen -p one-shot over
+        # the session's endpoint, else its first prompt (see _seed_qwen_summary).
+        # Guards the spawn/input/summaries call sites in one place.
+        if sess.get("agentType") in ("dsh", "qwen"):
             return
         sid = sess["id"]
         out_path = os.path.join(REGISTRY_DIR, f"summary-{slugify(sid)}.out")
@@ -19842,6 +19981,12 @@ class SessionManager:
         if summary:
             sess["summary"] = summary
             sess.pop("summaryRetryAt", None)
+            # A summarizer result (claude -p, or a qwen -p one-shot for a qwen
+            # session, XERK-509 [Qwen C]) is a real GENERATED name, so it is
+            # final — clear any provisional flag a weaker tier (a qwen session's
+            # first-prompt fallback) set, or _seed_qwen_summary would keep trying
+            # to override it. Harmless for claude/dsh, which never set it here.
+            sess.pop("summaryProvisional", None)
             self.save()
             log(f"named session {sid}: {summary!r}")
             return
@@ -19885,6 +20030,13 @@ class SessionManager:
             # that a later beat must be allowed to override (see _seed_dsh_summary).
             if sess.get("agentType") == "dsh":
                 self._seed_dsh_summary(sess)
+                continue
+            # A qwen session is named by QWEN and ITS model, never claude -p
+            # (XERK-509 [Qwen C]) — like dsh it runs BEFORE the _summary_due gate
+            # so a later tier (the qwen -p one-shot) can override a provisional
+            # first-prompt name.
+            if sess.get("agentType") == "qwen":
+                self._seed_qwen_summary(sess, now)
                 continue
             if not _summary_due(sess, now):
                 continue
@@ -19975,6 +20127,148 @@ class SessionManager:
             self.save()
             log(f"named dsh session {sess['id']}: {provisional_name!r} "
                 "(provisional; awaiting dsh's generated title)")
+
+    def _seed_qwen_summary(self, sess, now):
+        """Name a running qwen session by QWEN and ITS model, NEVER `claude -p`
+        (XERK-509 [Qwen C]) — a pure-qwen host may have no Claude login, so naming
+        must not depend on one. Three tiers, weakest first, a later one overriding
+        an earlier (the same shape as _seed_dsh_summary):
+
+          1. Qwen's OWN generated session title, if it ever emits one — captured
+             by the projection tail (`title()`). The G0 spike found NO native
+             title mechanism, so this is DORMANT today; a future qwen that writes
+             one is honoured here with no code change. Final (Qwen has no
+             provisional/fallback two-title race like dsh).
+          2. A qwen ONE-SHOT title (`qwen -p`) over the session's OWN configured
+             Qwen model / OpenAI-compatible endpoint — the qwen analogue of the
+             `claude -p` summarizer, reusing the session's endpoint (never a Claude
+             login). Its result lands via _finish_summary as a FINAL name.
+          3. The first user PROMPT from the projected transcript — applied
+             PROVISIONALLY at once so the card is never blank while the one-shot
+             runs, then overridden by tier 1/2.
+
+        Runs on the beat (the agent's MAIN process), so the tail lookup is guarded:
+        a sibling-module skew (a new hub-agent.py beside an old qwen_session.py with
+        no `title()`) must degrade to 'unnamed this beat', never crash the fleet
+        (the XERK-395/402 beat-loop contract)."""
+        if sess.get("summaryManual"):
+            return
+        current = sess.get("summary")
+        provisional = bool(sess.get("summaryProvisional"))
+        # A name from any source OTHER than this seeder's own provisional one is
+        # left alone — a ticket session's `<key> <summary>`, a migrated name, an
+        # operator rename, or a finalized qwen -p / native title.
+        if current and not provisional:
+            return
+        sid = sess["id"]
+        tail = self.qwen_tails.get(sid)
+        try:
+            title = tail.title() if tail else None
+            final = tail.title_final() if tail else False
+        except Exception as e:
+            log(f"qwen title lookup failed for {sid}: {e}")
+            title, final = None, False
+        # Tier 1 — qwen's own generated title is authoritative.
+        if title and final:
+            if current != title:
+                sess["summary"] = title
+                sess.pop("summaryProvisional", None)
+                sess.pop("summaryRetryAt", None)
+                self.save()
+                log(f"named qwen session {sid}: {title!r}")
+            elif provisional:
+                sess.pop("summaryProvisional", None)
+                self.save()
+            return
+        path = _session_transcript_path(sess)
+        first_prompt = _first_user_text(path) if path else None
+        if not first_prompt:
+            return  # nothing to name it from yet — look again next beat
+        # Tier 2 — launch a qwen -p one-shot over the session's endpoint. Gated on
+        # the attempt/backoff budget directly (NOT _summary_due, which stops the
+        # moment the tier-3 provisional name is set) and skipped when no model
+        # route is configured (a resumed/migrated session on an unconfigured host
+        # falls through to tier 3 rather than spending attempts on a doomed call).
+        if (QWEN_MODEL and QWEN_MODEL_BASE_URL
+                and sid not in self.summaries
+                and _summary_attempts(sess) < SUMMARY_MAX_ATTEMPTS
+                and now >= (sess.get("summaryRetryAt") or 0)):
+            self._start_qwen_summary(sess, first_prompt)
+        # Tier 3 — the first user prompt, provisional (so the card is never blank
+        # while the one-shot runs). _finish_summary clears the flag when the
+        # one-shot's real name lands, finalizing it.
+        if not current:
+            name = clean_manual_summary(first_prompt)
+            if name:
+                sess["summary"] = name
+                sess["summaryProvisional"] = True
+                sess.pop("summaryRetryAt", None)
+                self.save()
+                log(f"named qwen session {sid}: {name!r} "
+                    "(provisional; awaiting qwen's generated title)")
+
+    def _start_qwen_summary(self, sess, prompt):
+        """Kick off a `qwen -p` one-shot to name a qwen session from its first
+        prompt, over the SESSION's own OpenAI-compatible endpoint — never a Claude
+        login (a pure-qwen host may have none). A DETACHED subprocess reaped by the
+        shared _poll_summaries / _finish_summary (its result is a final name), the
+        exact machinery `claude -p` naming uses, so the bounded-retry budget,
+        timeout and reaping are all reused. Best-effort: a launch failure spends an
+        attempt and schedules the next.
+
+        Credential discipline: the endpoint key is passed through the subprocess
+        ENVIRONMENT, never argv (/proc/<pid>/cmdline is world-readable — the
+        local-model / dsh discipline). cwd is REGISTRY_DIR (its transcript is
+        internal overhead, tombstoned off the usage page) and --safe-mode disables
+        the worktree config/hooks/MCP/context so the one-shot is a clean, fast,
+        unguarded title call that touches no repo."""
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return
+        sid = sess["id"]
+        model = sess.get("model") or QWEN_MODEL
+        if not (QWEN_IDENT_RE.fullmatch(str(model))
+                and QWEN_MODEL_BASE_URL.startswith(("http://", "https://"))):
+            return  # no usable route — leave naming to tier 3
+        out_path = os.path.join(REGISTRY_DIR, f"summary-{slugify(sid)}.out")
+        env = dict(os.environ)
+        env["OPENAI_BASE_URL"] = QWEN_MODEL_BASE_URL
+        env["OPENAI_MODEL"] = str(model)
+        env["QWEN_CODE_SKIP_UPDATE_CHECK_ONCE"] = "1"
+        api_key_val = os.environ.get(QWEN_MODEL_API_KEY_ENV)
+        if api_key_val:
+            env["OPENAI_API_KEY"] = api_key_val
+        outf = None
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            outf = open(out_path, "w")
+            # Headless, text output, safe-mode (no worktree config / hooks / MCP /
+            # context load), argv is a list so the prompt can't inject, and the
+            # key rides `env` not argv. The timeout in _poll_summaries backstops a
+            # hang.
+            proc = subprocess.Popen(
+                [QWEN_BIN, "-p", SUMMARY_INSTRUCTION + prompt[:SUMMARY_PROMPT_CAP],
+                 "--model", str(model), "--auth-type", "openai",
+                 "-o", "text", "--safe-mode"],
+                stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR, env=env,
+            )
+        except Exception as e:
+            log(f"qwen summary launch failed for {sid}: {e}")
+            if outf is not None:
+                try:
+                    outf.close()
+                except Exception:
+                    pass
+            self._spend_summary_attempt(sess)
+            return
+        self.summaries[sid] = {
+            "proc": proc, "outf": outf, "outPath": out_path,
+            "startedMono": time.time(),
+        }
+        self._spend_summary_attempt(sess)
+        attempts = _summary_attempts(sess)
+        log(f"summarizing qwen session {sid} via qwen -p ({model}), "
+            f"attempt {attempts}/{SUMMARY_MAX_ATTEMPTS}")
 
     def _poll_summaries(self):
         """Reap finished summary subprocesses (one poll() per active job each
@@ -20647,6 +20941,17 @@ class SessionManager:
                     # (input dropped, transcript frozen) until its next relaunch.
                     if sess.get("agentType") == "dsh":
                         self._reattach_dsh(sess)
+                    # A qwen session's projection tail also lived in THIS manager
+                    # and died with it, while the qwen TUI in tmux kept running and
+                    # appending to its native log — so re-start the tail at the
+                    # native log's EOF (resume=True) or the adopted session's chat
+                    # stays frozen at the pre-restart transcript (XERK-509 [Qwen C]).
+                    if sess.get("agentType") == "qwen" and sess.get("claudeSessionId"):
+                        try:
+                            self._start_qwen_tail(
+                                sess, sess["claudeSessionId"], resume=True)
+                        except Exception as e:  # never fail the adopt on this
+                            log(f"qwen tail reattach failed for {sess['id']}: {e}")
                     log(f"adopted live session {sess['id']} on :{sess['ttydPort']}")
                     continue
                 self._launch_tmux(sess, resume=True)
