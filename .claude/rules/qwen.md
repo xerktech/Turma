@@ -404,9 +404,11 @@ shelled out to `python3 -SsE <hook>` exactly as Claude and dsh do. Invariants a 
     backstop, but qwen's `--sandbox` needs docker/podman (absent on native hosts), so there is NO fs
     confinement backstop. Widening the tool list, not a sandbox, is the honest fix if qwen grows a
     new fs tool.
-  - **The flat globs match an expanduser'd (not realpath'd) prefix against a realpath'd target**, so a
-    symlinked HOME could dodge a credential glob — the SAME accepted limitation the dsh guard has;
-    `fileguard.py` realpaths its ~/.claude base, so the ~/.claude predicate holds regardless.
+  - **`_realpath_glob_prefix`** (XERK-503) resolves symlinks in each glob's literal prefix — a
+    symlinked HOME *subdirectory* (`~/.aws` a bind mount, or WSL's Windows-side profile) no longer
+    dodges its deny, matching how `fileguard.py` realpaths its `~/.claude` base. **Still open: a
+    credential FILE itself symlinked** (`~/.kube/config` elsewhere, `~/.kube` real) — nothing to
+    realpath in the prefix. Needs a nominal-path check ALONGSIDE realpath, in qwen/dsh/fileguard alike.
   - **The shim RE-READS `~/.turma/qwen-guard.json` every call, and a Bash redirect walks past its
     Edit-deny** (XERK-309) — so a `run_shell_command` that overwrites it could repoint `guardScript`
     and self-bypass. This is NOT net-new: `guard.py` equally allows `echo > guard.py` for the Claude

@@ -27,7 +27,11 @@ class TestParsePermRule(unittest.TestCase):
     def test_tilde_is_expanded(self):
         op, p = ha._parse_perm_rule("Edit(~/.ssh/**)")
         self.assertEqual(op, "write")
-        self.assertEqual(p, os.path.expanduser("~/.ssh/**"))
+        # realpath'd, not a bare expanduser: XERK-503 found `~/.ssh` can itself be
+        # a symlink (a bind mount, or on WSL the Windows-side profile), and a
+        # rule built from the un-resolved path silently stops matching once the
+        # target resolves elsewhere.
+        self.assertEqual(p, os.path.realpath(os.path.expanduser("~/.ssh")) + "/**")
         self.assertTrue(p.startswith("/"))
 
     def test_doubled_leading_slash_collapses(self):
@@ -72,22 +76,27 @@ class TestBuildDshGuardConfig(unittest.TestCase):
         self.assertTrue(all(g.startswith("/") for g in dw), dw)
         self.assertFalse(any("~" in g for g in dw), dw)
         self.assertFalse(any(g.startswith("//") for g in dw), "no Claude-relative anchor leaks")
-        # the credential stores build_guard_settings denies with Edit() rules
+        # the credential stores build_guard_settings denies with Edit() rules,
+        # realpath'd (see test_tilde_is_expanded — a symlinked HOME subdirectory
+        # must not dodge its own deny rule)
         home = os.path.expanduser("~")
-        for want in (f"{home}/.ssh/**", f"{home}/.aws/**"):
+        for want in (os.path.realpath(f"{home}/.ssh") + "/**",
+                     os.path.realpath(f"{home}/.aws") + "/**"):
             self.assertIn(want, dw)
 
     def test_local_model_secret_is_read_denied(self):
         home = os.path.expanduser("~")
-        self.assertIn(f"{home}/.turma/local-model.env", self.plugin["denyRead"])
+        want = os.path.realpath(f"{home}/.turma") + "/local-model.env"
+        self.assertIn(want, self.plugin["denyRead"])
 
     def test_uploads_and_roster_are_read_allowed(self):
         # The cross-child contract with [C] (XERK-467): a staged attachment under
         # ~/.turma/uploads/<sid>/ must be readable with no approval prompt.
         home = os.path.expanduser("~")
+        turma = os.path.realpath(f"{home}/.turma")
         ar = self.plugin["allowRead"]
-        self.assertIn(f"{home}/.turma/uploads/**", ar)
-        self.assertIn(f"{home}/.turma/peers.tsv", ar)
+        self.assertIn(f"{turma}/uploads/**", ar)
+        self.assertIn(f"{turma}/peers.tsv", ar)
 
     def test_bare_tool_rules_are_dropped(self):
         # ListAgents is a Claude tool rule with no path — dsh has no such tool,
