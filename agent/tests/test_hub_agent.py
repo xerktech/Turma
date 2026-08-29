@@ -4212,6 +4212,12 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         self.assertEqual(env["TURMA_QWEN_PEER_DIR"], ha.QWEN_PEER_DIR)
         self.assertEqual(env["TURMA_CWD"], self.wt)
         self.assertIn("q1", sm.qwen_peer_inboxes)
+        # The pid is PERSISTED on the record (mirroring ttydPid) so a later
+        # manager instance — which starts with an empty qwen_peer_inboxes dict
+        # — can still find and reap this forger if it survives a restart
+        # (KillMode=process leaves a bare, non-tmux-hosted subprocess alive;
+        # a QA finding — see _start_qwen_peer_inbox's docstring).
+        self.assertEqual(sess["qwenPeerInboxPid"], sm.qwen_peer_inboxes["q1"].pid)
 
     def test_teardown_stops_the_peer_inbox_forger(self):
         sm = self.make_manager()
@@ -4221,6 +4227,36 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         sm._teardown_qwen("q1")
         proc.terminate.assert_called_once()
         self.assertNotIn("q1", sm.qwen_peer_inboxes)
+
+    def test_relaunch_reaps_a_forger_orphaned_by_a_restart(self):
+        # A fresh manager instance (post-restart) has an EMPTY qwen_peer_inboxes
+        # — the in-memory Popen handle died with the old manager, but the bare
+        # subprocess itself did not (KillMode=process). The persisted pid is
+        # what lets the resume-on-boot adopt path reap that orphan before
+        # starting a fresh forger, or every restart leaks one more (a QA
+        # finding).
+        sm = self.make_manager()
+        sess = self._sess(qwenPeerInboxPid=31337)   # an orphan from "before"
+        with mock.patch.object(ha.os, "kill") as oskill:
+            self._start_qwen_peer_inbox_only(sm, sess)
+        oskill.assert_called_once_with(31337, ha.signal.SIGTERM)
+
+    def _start_qwen_peer_inbox_only(self, sm, sess):
+        sm.registry = [sess]
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm._start_qwen_peer_inbox(sess, "cs-1")
+        return popen
+
+    def test_teardown_reaps_an_orphaned_forger_by_persisted_pid(self):
+        # Mirrors test_kill_ttyd_reaps_adopted_orphan_by_pid: a forger this
+        # process never started (self.qwen_peer_inboxes has no entry) but whose
+        # pid is on the record must still be reaped, not leaked.
+        sm = self.make_manager()
+        sess = self._sess(qwenPeerInboxPid=9191)
+        sm.registry = [sess]
+        with mock.patch.object(ha.os, "kill") as oskill:
+            sm._stop_qwen_peer_inbox("q1")
+        oskill.assert_called_once_with(9191, ha.signal.SIGTERM)
 
     def test_ticket_branch_directive_rides_the_context_file(self):
         sm = self.make_manager()
@@ -4427,6 +4463,33 @@ class TestQwenPeerMessaging(ManagerMixin, unittest.TestCase):
     def test_poll_is_a_noop_when_the_session_has_no_peer_dir(self):
         sm, sess = self._qwen_session()
         sm._poll_qwen_peer_dir("q1")   # no directory exists yet — must not raise
+
+    def test_poll_leaves_a_fresh_dotfile_alone(self):
+        # A dotfile could be a writer's atomic-write tmp file still in flight
+        # (peer_mcp.py/peer_inbox.py both dot-prefix theirs) — a fresh one must
+        # NOT be swept, or a real in-progress write could be deleted out from
+        # under its own os.replace.
+        sm, sess = self._qwen_session()
+        d = os.path.join(self.peer_dir, "q1")
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, ".req.json.tmp.123"), "w").close()
+        sm._poll_qwen_peer_dir("q1")
+        self.assertEqual(os.listdir(d), [".req.json.tmp.123"])
+
+    def test_poll_sweeps_a_stale_dotfile_left_by_a_crashed_writer(self):
+        # A writer that crashed between open() and os.replace() leaves its tmp
+        # file behind forever otherwise (a QA finding) — bounded to session
+        # lifetime before this fix, unbounded within a long-lived one across
+        # repeated crashes.
+        sm, sess = self._qwen_session()
+        d = os.path.join(self.peer_dir, "q1")
+        os.makedirs(d, exist_ok=True)
+        stale = os.path.join(d, ".req.json.tmp.123")
+        open(stale, "w").close()
+        old = time.time() - (ha.QWEN_PEER_POLL_SEC * 10)
+        os.utime(stale, (old, old))
+        sm._poll_qwen_peer_dir("q1")
+        self.assertEqual(os.listdir(d), [])
 
     def test_worker_loop_polls_every_live_qwen_session_once(self):
         sm, _ = self._qwen_session("q1")

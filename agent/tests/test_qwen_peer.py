@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _QWEN = os.path.join(os.path.dirname(_HERE), "qwen")
@@ -167,6 +168,25 @@ class PeerMcpSendTest(_EnvMixin, unittest.TestCase):
         data = self._read_only_file()
         self.assertEqual(len(data["to"]), 200)
         self.assertEqual(len(data["message"]), 200000)
+
+    def test_the_atomic_write_uses_a_dot_prefixed_tmp_name(self):
+        # A QA finding: an un-prefixed tmp name (`<path>.tmp.<pid>`) is not
+        # skipped by the hub's poller (_poll_qwen_peer_dir dotfile check), so a
+        # microscopic window let the poller read-and-delete the file before
+        # this process's own os.replace ran, which then raised
+        # FileNotFoundError and reported "write failed" for a message that had,
+        # in fact, already been delivered. Assert the tmp path actually used is
+        # dot-prefixed, matching peer_inbox.py's own atomic write.
+        seen = {}
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            seen["src"] = src
+            return real_replace(src, dst)
+
+        with mock.patch.object(peer_mcp.os, "replace", spy_replace):
+            peer_mcp._send({"to": "peer", "message": "hi"})
+        self.assertTrue(os.path.basename(seen["src"]).startswith("."), seen)
 
 
 class PeerInboxRecordTest(_EnvMixin, unittest.TestCase):

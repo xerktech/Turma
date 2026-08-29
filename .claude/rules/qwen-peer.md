@@ -37,6 +37,15 @@ control socket — so both directions are FILE-RENDEZVOUS based and delivery is 
 - **Every file is consumed (removed) once read, whether or not delivery succeeded.** A peer message
   is best-effort — matching Claude Code's own SendMessage — and a file this manager cannot parse
   would otherwise be retried forever.
+- **Both writers' atomic-write tmp names are DOT-PREFIXED, and `_poll_qwen_peer_dir` skips a dotfile
+  it finds** — the mechanism that keeps the poller from reading a request mid-write. A QA finding:
+  `peer_mcp.py`'s tmp name was originally `<path>.tmp.<pid>` (not dot-prefixed), so a microscopic
+  window let the poller read-and-delete it before its own `os.replace` ran, which then raised
+  `FileNotFoundError` and reported "write failed" for a message that had, in fact, already been
+  delivered. Keep any future writer into this directory dot-prefixed too.
+- **A dotfile older than `QWEN_PEER_POLL_SEC * 5` is SWEPT, not left forever.** A fresh one might
+  still be an in-flight write and is left alone; one that old means its writer crashed between
+  `open()` and `os.replace()` (another QA finding) and is stale.
 - Delivery stays OFF THE BEAT (XERK-395) exactly as dsh's does: a Claude target's inbox post and a
   dsh target's control-socket write both block on a 5s-class ack, and a batch of those on the
   heartbeat could approach `OFFLINE_AFTER_MS`. A qwen target's pane write is fast but rides the
@@ -81,11 +90,24 @@ control socket — so both directions are FILE-RENDEZVOUS based and delivery is 
   before typing it into the pane.
 - **This depends on Claude Code's PRIVATE, versioned peer-record format** (`peerProtocol`,
   `procStart`/`pidDomain` liveness) — HOST-VERIFIED ONLY, never CI, and it may drift across Claude
-  releases. The SEND path and the roster have no such dependency. A hard-killed qwen session may
-  leave a stale forged record until Claude Code's own registry reaper drops it (harmless — it is
-  undeliverable once the pid is gone).
+  releases. The SEND path and the roster have no such dependency. A hard-killed qwen session's
+  forger is torn down WITH it (`_teardown_qwen` → `_stop_qwen_peer_inbox`), so its stale record goes
+  undeliverable the moment the pid is gone — harmless.
 - **A failed forger never fails the launch.** Such a session can still SEND and still runs
   normally; it just cannot be reached BY a native Claude peer.
+- **The forger is a BARE subprocess, not tmux-hosted, and a MANAGER RESTART does not kill it** (a QA
+  finding, XERK-518). `turma-agent.service` runs `KillMode=process` precisely so tmux/ttyd/dsh
+  survive an in-place update for `resume_on_boot`'s adopt path to reattach to — but that same
+  mechanism leaves a bare forger alive too, and unlike tmux/ttyd it has no adopt path: the OLD
+  manager's `self.qwen_peer_inboxes` entry dies with it, so a naive restart would leak a second
+  live forger (process + bound `cc-socks` entry + live registry record) next to the orphaned first,
+  once per restart, forever. Fixed the same way `_launch_ttyd`/`_kill_ttyd` handle exactly this for
+  ttyd: the pid is PERSISTED on the record (`sess["qwenPeerInboxPid"]`), and both
+  `_start_qwen_peer_inbox` (via `_stop_qwen_peer_inbox`, called on every start including the adopt
+  path's re-reattach) and `_stop_qwen_peer_inbox` itself (the `_teardown_qwen` path, for a forger
+  this process never started) reap a persisted pid that is not the one currently tracked. **Any
+  future per-session helper that is a bare `Popen` rather than tmux-hosted needs this same
+  pid-persistence + reap-on-adopt discipline, or it leaks identically.**
 
 ## Invariants a change must not undo
 
@@ -116,8 +138,10 @@ control socket — so both directions are FILE-RENDEZVOUS based and delivery is 
   ordinary input rather than a queued peer turn. `_peer_frame` is what keeps the attribution
   correct; there is no pane equivalent of the inbox's out-of-band delivery.
 - Tests: `TestQwenPeerMessaging` in `test_hub_agent.py` (file dispatch, the `recv-` split, drop-on-
-  unparseable, worker polling, send resolution to a qwen/dsh/claude target, `from`/framing, opt-out,
-  unknown + ambiguous names, `INPUT_MAX_CHARS`, inbound inject), the peer-inbox/MCP cases in
-  `TestLaunchQwen` (MCP registration, the forger's env + teardown), and `test_qwen_peer.py` (the MCP
-  JSON-RPC contract, the request-file shape and caps, the forged record's pid/socket/filename
-  agreement, and the inbound wire handling over a real socket).
+  unparseable, the fresh-vs-stale dotfile sweep, worker polling, send resolution to a
+  qwen/dsh/claude target, `from`/framing, opt-out, unknown + ambiguous names, `INPUT_MAX_CHARS`,
+  inbound inject), the peer-inbox/MCP cases in `TestLaunchQwen` (MCP registration, the forger's env +
+  teardown, pid persistence, the restart-orphan reap on both `_start_qwen_peer_inbox` and
+  `_stop_qwen_peer_inbox`), and `test_qwen_peer.py` (the MCP JSON-RPC contract, the request-file
+  shape and caps, the dot-prefixed atomic write, the forged record's pid/socket/filename agreement,
+  and the inbound wire handling over a real socket).

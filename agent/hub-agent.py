@@ -13932,7 +13932,19 @@ class SessionManager:
         peer_inbox.py) that lets a native Claude peer's SendMessage reach a qwen
         session. Replaces any prior process for this sid (a resume/reattach).
         Never raises — the session still runs, and still sends peer messages,
-        without it; it just cannot RECEIVE a native Claude peer's SendMessage."""
+        without it; it just cannot RECEIVE a native Claude peer's SendMessage.
+
+        **The forger is a BARE subprocess, not tmux-hosted**, and
+        `turma-agent.service` runs `KillMode=process` precisely so a manager
+        restart leaves tmux/ttyd/dsh ALIVE for resume_on_boot's adopt path to
+        reattach to (agent-native.md) — which means it ALSO leaves a bare
+        forger alive, orphaned, with no adopt path of its own (a QA finding:
+        the in-memory `self.qwen_peer_inboxes` entry dies with the OLD manager
+        instance, so a naive relaunch here just leaks a second live forger next
+        to the first, forever, per restart). So — mirroring `_launch_ttyd`'s
+        `ttydPid`/`_kill_ttyd` pattern — the pid is PERSISTED on the session
+        record, and any pid found there that this fresh process does not
+        already track is reaped before a new one is started."""
         sid = sess["id"]
         self._stop_qwen_peer_inbox(sid)
         env = dict(os.environ)
@@ -13956,22 +13968,37 @@ class SessionManager:
                 f"SendMessage")
             return
         self.qwen_peer_inboxes[sid] = proc
+        sess["qwenPeerInboxPid"] = proc.pid  # persisted so a later manager can reap it
 
     def _stop_qwen_peer_inbox(self, sid):
         """Kill a session's peer-inbox forger subprocess, if one is running.
         Idempotent. The process's own shutdown handler unlinks its socket and
         registry record; this is the backstop for a process that doesn't get
-        the chance (SIGKILL, a crash)."""
+        the chance (SIGKILL, a crash, or an orphan left by a PRIOR manager
+        instance — see _start_qwen_peer_inbox's comment)."""
         proc = self.qwen_peer_inboxes.pop(sid, None)
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except Exception:
+        if proc is not None:
             try:
-                proc.kill()
+                proc.terminate()
+                proc.wait(timeout=3)
             except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        # Also reap a forger we ADOPTED-then-replaced or that outlived a PRIOR
+        # manager entirely (KillMode=process, so it is not in self.qwen_peer_
+        # inboxes here): the persisted pid is that same live process. Without
+        # this, every restart while a qwen session runs leaks one process + one
+        # bound cc-socks entry + one live ~/.claude/sessions record, forever.
+        # Best-effort — a recycled/dead pid just fails harmlessly, mirroring
+        # _kill_ttyd's identical reap-by-persisted-pid step.
+        sess = self._find(sid)
+        pid = sess.get("qwenPeerInboxPid") if sess else None
+        if pid and (proc is None or proc.pid != pid):
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except (OSError, ValueError):
                 pass
 
     def _start_qwen_tail(self, sess, claude_sid, resume=False):
@@ -18157,6 +18184,18 @@ class SessionManager:
             return
         for name in names[:QWEN_PEER_DELIVER_BATCH]:
             if name.startswith("."):
+                # An in-flight atomic write (peer_mcp.py/peer_inbox.py both dot-
+                # prefix their tmp file) — skip it this pass, it will have a
+                # real name once the writer's os.replace lands. But a writer
+                # that CRASHED between open() and replace() leaves one behind
+                # forever otherwise, so a dotfile older than a few poll ticks
+                # is stale rather than in-flight and is swept.
+                stale = os.path.join(peer_dir, name)
+                try:
+                    if time.time() - os.stat(stale).st_mtime > QWEN_PEER_POLL_SEC * 5:
+                        os.remove(stale)
+                except OSError:
+                    pass
                 continue
             path = os.path.join(peer_dir, name)
             try:
@@ -21743,15 +21782,22 @@ class SessionManager:
                         except Exception as e:  # never fail the adopt on this
                             log(f"qwen tail reattach failed for {sess['id']}: {e}")
                         # Same story for the peer-inbox forger (XERK-518 [Qwen
-                        # L]): the Popen handle died with the old manager, so
-                        # this session cannot be reached by a native Claude
-                        # peer's SendMessage until a fresh forger is started
-                        # (under a new pid — the qwen process itself is
-                        # untouched). The PREVIOUS forger process, if it
-                        # survived the restart as an orphan, is not reaped here;
-                        # its stale registry record/socket goes undeliverable
-                        # once its pid is gone, same accepted cost as a
-                        # hard-killed dsh session's forged record.
+                        # L]): the Popen HANDLE died with the old manager, but —
+                        # unlike a hard-killed session's forger — the PROCESS
+                        # itself did NOT (KillMode=process, the same reason the
+                        # qwen TUI/dsh/ttyd survive this restart): it is a bare
+                        # subprocess, not tmux-hosted, so nothing signals it.
+                        # _start_qwen_peer_inbox reaps that orphan itself, via
+                        # the pid PERSISTED on the record (sess["qwenPeerInboxPid"],
+                        # the ttydPid pattern) — without that reap, every
+                        # restart while this session runs would leak one more
+                        # live forger (process + bound socket + registry
+                        # record) forever. This is the ONE call site an
+                        # orphaned forger can be adopted-then-replaced FROM; a
+                        # `_stop_qwen_peer_inbox` reached only through
+                        # `_teardown_qwen` (a real kill/delete) is the case
+                        # where the accepted "goes undeliverable once its pid
+                        # is gone" cost genuinely applies.
                         try:
                             self._start_qwen_peer_inbox(
                                 sess, sess["claudeSessionId"])

@@ -69,7 +69,15 @@ _send_counter = 0
 
 
 def _write_json_atomic(path, data):
-    tmp = f"{path}.tmp.{os.getpid()}"
+    # The tmp name is DOT-PREFIXED (matching peer_inbox.py's own atomic write)
+    # because the hub's poller (_poll_qwen_peer_dir) skips dotfiles precisely to
+    # avoid reading a request mid-write — an un-prefixed tmp name left a
+    # microscopic window where the poller could read-and-delete THIS file
+    # before the rename below ran, so the following os.replace raised
+    # FileNotFoundError and _send() reported "write failed" for a message that
+    # had, in fact, already been delivered (a QA finding).
+    d, name = os.path.split(path)
+    tmp = os.path.join(d, f".{name}.tmp.{os.getpid()}")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f)
     os.replace(tmp, path)
