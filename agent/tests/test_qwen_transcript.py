@@ -244,6 +244,88 @@ class TestQwenUsageMapping(unittest.TestCase):
         self.assertNotIn("usage", proj.feed(ev)[0]["message"])
 
 
+class TestQwenUsageReportEndToEnd(unittest.TestCase):
+    """[Qwen G] (XERK-513): a Qwen session's spend charts on the Usage page and
+    the dashboard token tiles IDENTICALLY to a Claude session, because the
+    projection writes the same `message.usage` / `message.model` shape the
+    aggregation reads — no schema change and no `agentType` branch (D4, the dsh
+    [G]/XERK-471 analogue). This proves the whole chain one layer above
+    `_accumulate_usage`: a projected Qwen transcript on disk, named by the pinned
+    session id like any conversation, folds through `repo_usage_report` into the
+    host + per-repo totals AND the per-model breakdown, with LOCAL / OpenAI-compat
+    model ids appearing beside Claude's rather than being filtered as synthetic
+    (they may dominate a Qwen host's turns). Mirrors `TestDshUsageReportEndToEnd`
+    in `test_dsh_transcript.py`."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="qwen-usage-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        p = mock.patch.object(ha, "PROJECTS_ROOT", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _assistant(self, seq, model, prompt, cand, cached=0):
+        # A Qwen assistant event carries Gemini-shaped `usageMetadata` at the top
+        # level (promptTokenCount is the WHOLE prompt, cachedContentTokenCount the
+        # cached subset), which `_map_usage` splits into Claude's disjoint counts.
+        return {"type": "assistant", "uuid": f"u{seq}",
+                "timestamp": "2025-06-15T12:00:00.000Z", "model": model,
+                "usageMetadata": {"promptTokenCount": prompt,
+                                  "candidatesTokenCount": cand,
+                                  "cachedContentTokenCount": cached,
+                                  "totalTokenCount": prompt + cand},
+                "message": {"role": "model", "parts": [{"text": "ok"}]}}
+
+    def _write_projection(self, worktree, events):
+        slug = ha._project_slug(worktree)
+        d = os.path.join(self.tmp, slug)
+        os.makedirs(d, exist_ok=True)
+        # Named by the pinned conversation id, exactly as the launcher's tail
+        # (`QwenProjectionTail`) writes it under PROJECTS_ROOT.
+        lines = qt.project_log_lines(events, session_id=SID, cwd=worktree)
+        with open(os.path.join(d, f"{SID}.jsonl"), "w") as f:
+            f.writelines(lines)
+        return slug
+
+    def _fold_full(self, slug):
+        acc = ha._UsageAcc()
+        ha._aggregate_project(os.path.join(self.tmp, slug), acc)
+        return acc
+
+    def test_qwen_spend_and_local_models_flow_into_the_report(self):
+        worktree = "/repos/.turma/worktrees/Turma/qwen01"
+        # Two turns on a local qwen model (the first with a cached prompt), one on
+        # an OpenAI-compatible endpoint — none of them Claude.
+        slug = self._write_projection(worktree, [
+            self._assistant(1, "qwen3-coder-30b-a3b", 5000, 200, cached=4000),
+            self._assistant(2, "qwen3-coder-30b-a3b", 300, 40),
+            self._assistant(3, "deepseek-v3", 500, 90),
+        ])
+        ledger = {worktree: {"repo": "Turma",
+                             "remote": "git@github.com:xerktech/Turma.git",
+                             "slug": slug}}
+        repo_usage, host = ha.repo_usage_report(ledger, self._fold_full)
+
+        # The Qwen session's spend is a real host block — "charts identically".
+        self.assertIsNotNone(host)
+        self.assertEqual(host["totals"]["input"], 1800)   # 1000 + 300 + 500
+        self.assertEqual(host["totals"]["output"], 330)   # 200 + 40 + 90
+        self.assertEqual(host["totals"]["cacheRead"], 4000)
+        # Qwen has NO cache-CREATION concept, so cacheWrite is always 0 — unlike
+        # dsh, which maps a real cacheWriteTokens.
+        self.assertEqual(host["totals"]["cacheWrite"], 0)
+
+        turma = next(r for r in repo_usage if r["repo"] == "Turma")
+        self.assertEqual(turma["usage"]["totals"]["input"], 1800)
+
+        # Local qwen + OpenAI-compat ids appear in the per-model breakdown, NOT
+        # filtered out the way `<synthetic>` is.
+        models = {m["model"]: m for m in host["models"]}
+        self.assertEqual(models["qwen3-coder-30b-a3b"]["totals"]["input"], 1300)
+        self.assertEqual(models["deepseek-v3"]["totals"]["input"], 500)
+        self.assertNotIn("<synthetic>", models)
+
+
 class TestQwenToolNameMapping(unittest.TestCase):
     """Qwen's shell tool is `run_shell_command`; the read side keys PR attribution
     and the Bash card on `"Bash"`. The projector must map it in the seam — teaching
