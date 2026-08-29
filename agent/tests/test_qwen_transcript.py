@@ -392,6 +392,159 @@ class TestQwenPrAttribution(unittest.TestCase):
                          ["https://github.com/xerktech/Turma/pull/321"])
 
 
+class TestQwenSubagentDelegation(unittest.TestCase):
+    """[Qwen J] (XERK-517): a Qwen subagent delegation surfaces the picker row +
+    drill-in transcript IDENTICALLY to Claude, because the projector RESHAPES
+    Qwen's `agent`-tool launch into the Claude background-launch record and each
+    child's native log is projected into the `subagents/` layout — so
+    `_scan_agent_entry` / `_resolve_subagent` read it with NO reader change (the
+    XERK-304 contract). Driven through hub-agent's REAL readers over a corpus
+    CAPTURED from a real Qwen 0.22.x background delegation on disk (the no-mock
+    lesson), sanitized only for paths. Mirrors `TestDshSubagentProjection`."""
+
+    AID = "Explore-call_b01c582ff5fb496987c52ded"
+
+    def _parent(self):
+        with open(os.path.join(HERE, "qwen_delegation_corpus.json")) as f:
+            corpus = json.load(f)
+        return qt.project_log(corpus, session_id=SID, **PROJECT_KW)
+
+    def test_agent_tool_name_maps_to_Agent(self):
+        # Qwen's delegation tool registers as `agent`; `_scan_agent_entry` /
+        # `_resolve_subagent` key on `Agent`/`Task`, so the projector must map it.
+        entries = self._parent()
+        agent_uses = [b for e in entries if e["type"] == "assistant"
+                      for b in e["message"]["content"]
+                      if b.get("type") == "tool_use" and b["name"] == "Agent"]
+        self.assertEqual(len(agent_uses), 1)
+        self.assertEqual(agent_uses[0]["input"]["subagent_type"], "Explore")
+
+    def test_task_execution_result_becomes_async_launched(self):
+        # Qwen writes a `task_execution` resultDisplay, not Claude's
+        # `async_launched` toolUseResult — the projector reshapes it so
+        # `_async_launch` fires, and the result text carries `agentId:` for
+        # `_resolve_subagent`.
+        entries = self._parent()
+        launch = ha._async_launch(next(
+            e for e in entries if e.get("toolUseResult")))
+        self.assertEqual(launch, {"id": self.AID, "type": "Explore",
+                                  "label": "Find org selector dropdown"})
+        result = next(e for e in entries if e.get("toolUseResult"))
+        self.assertIn("agentId: %s" % self.AID,
+                      result["message"]["content"][0]["content"])
+
+    def test_live_agent_registered_then_retired_by_notification(self):
+        # The whole delegation lifecycle through the REAL live-agent scan: the
+        # launch registers the row, and Qwen's own `<task-notification>` (a plain
+        # user turn the projector passes through) retires it.
+        entries = self._parent()
+        running = {}
+        for e in entries[:-1]:          # everything up to the notification
+            ha._scan_agent_entry(e, running)
+        self.assertEqual(ha.live_agents_report(running),
+                         [{"type": "Explore", "label": "Find org selector dropdown"}])
+        # The final entry IS the <task-notification>; folding it retires the row.
+        ha._scan_agent_entry(entries[-1], running)
+        self.assertEqual(running.get("liveAgents"), {})
+
+    def test_resolve_subagent_opens_the_child_transcript(self):
+        # With the parent projection + the projected child on disk in the Claude
+        # layout, a clicked row (type+description) resolves to the child file.
+        tmp = tempfile.mkdtemp(prefix="qwen-deleg-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        main = os.path.join(tmp, SID + ".jsonl")
+        with open(main, "w") as f:
+            f.write("\n".join(json.dumps(e) for e in self._parent()))
+        with open(os.path.join(HERE, "qwen_delegation_child.json")) as f:
+            child = json.load(f)
+        subdir = os.path.join(tmp, SID, "subagents")
+        os.makedirs(subdir)
+        with open(os.path.join(subdir, "agent-%s.jsonl" % self.AID), "w") as f:
+            f.write("\n".join(json.dumps(e)
+                              for e in qt.project_log(child, session_id=self.AID)))
+        resolved = ha._resolve_subagent(main, "Explore", "Find org selector dropdown")
+        self.assertEqual(resolved,
+                         os.path.join(subdir, "agent-%s.jsonl" % self.AID))
+
+    def test_synchronous_subagent_is_resolvable_but_not_a_live_row(self):
+        # A FOREGROUND subagent (resultDisplay.status != "background") already
+        # finished when its result lands and gets NO `<task-notification>`, so it
+        # must NOT be marked async_launched (that would strand a permanent phantom
+        # live row) — but it stays RESOLVABLE via a reconstructed `agentId:` line.
+        proj = qt.QwenProjector(SID)
+        call = {"type": "assistant", "timestamp": "", "model": "m", "message": {
+            "role": "model", "parts": [{"functionCall": {
+                "id": "call_abc", "name": "agent",
+                "args": {"description": "Do the thing", "subagent_type": "Explore",
+                         "prompt": "..."}}}]}}
+        result = {"type": "tool_result", "timestamp": "",
+                  "toolCallResult": {"callId": "call_abc", "status": "success",
+                      "resultDisplay": {"type": "task_execution",
+                          "subagentName": "Explore",
+                          "taskDescription": "Do the thing", "status": "completed"}},
+                  "message": {"role": "user", "parts": [{"functionResponse": {
+                      "id": "call_abc", "name": "agent",
+                      "response": {"output": "The real answer."}}}]}}
+        entries = proj.feed(call) + proj.feed(result)
+        res = entries[-1]
+        self.assertNotIn("toolUseResult", res)                # not a live row
+        self.assertIsNone(ha._async_launch(res))
+        # ...but resolvable: the reconstructed agentId (<type>-<callId>) is in text.
+        self.assertIn("agentId: Explore-call_abc",
+                      res["message"]["content"][0]["content"])
+        self.assertIn("The real answer.", res["message"]["content"][0]["content"])
+
+    def test_delegated_tokens_are_counted_as_a_subagent_slice(self):
+        # The ticket's "usage/archive walks count them unchanged": the child
+        # projection landing under `<sid>/subagents/` is walked by
+        # `_project_transcripts` and its spend folds into the totals AND the
+        # delegated `subagent` slice — no aggregation change (the XERK-302 walk).
+        tmp = tempfile.mkdtemp(prefix="qwen-deleg-usage-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        slug = os.path.join(tmp, "some-slug")
+        os.makedirs(os.path.join(slug, SID, "subagents"))
+        with open(os.path.join(slug, SID + ".jsonl"), "w") as f:      # parent
+            f.write("\n".join(json.dumps(e) for e in self._parent()))
+        with open(os.path.join(HERE, "qwen_delegation_child.json")) as f:
+            child = json.load(f)
+        with open(os.path.join(slug, SID, "subagents",
+                               "agent-%s.jsonl" % self.AID), "w") as f:
+            f.write("\n".join(json.dumps(e)
+                              for e in qt.project_log(child, session_id=self.AID)))
+        acc = ha._UsageAcc()
+        ha._aggregate_project(slug, acc)
+        # The child's one usage-bearing assistant turn (8073 prompt, 0 cached).
+        self.assertEqual(acc.subagent["totals"]["input"], 8073)
+        # Folded into the grand total (a SLICE, not an addend) beside the parent.
+        self.assertGreater(acc.totals["input"], 8073)
+
+    def test_a_non_agent_tool_result_is_unaffected(self):
+        # The reshaping is scoped to the `agent` tool with a `task_execution`
+        # result — an ordinary tool_result projects exactly as before.
+        proj = qt.QwenProjector(SID)
+        ev = {"type": "tool_result", "timestamp": "", "message": {
+            "role": "user", "parts": [{"functionResponse": {
+                "id": "c", "name": "read_file", "response": {"output": "data"}}}]}}
+        entry = proj.feed(ev)[0]
+        self.assertNotIn("toolUseResult", entry)
+        self.assertEqual(entry["message"]["content"][0]["content"], "data")
+
+    def test_a_grammar_failing_agent_id_projects_a_plain_card(self):
+        # An id that cannot satisfy the reader's ASCII grammar would name nothing,
+        # so it is NOT reshaped into an unresolvable launch — it stays a plain
+        # tool_result (Qwen mints valid ids, so this is defensive).
+        proj = qt.QwenProjector(SID)
+        ev = {"type": "tool_result", "timestamp": "",
+              "toolCallResult": {"status": "success", "resultDisplay": {
+                  "type": "task_execution", "subagentName": "bad/../name",
+                  "taskDescription": "x", "status": "background"}},
+              "message": {"role": "user", "parts": [{"functionResponse": {
+                  "id": "bad/../name-call", "name": "agent",
+                  "response": {"output": "no task_id here"}}}]}}
+        entry = proj.feed(ev)[0]
+        self.assertNotIn("toolUseResult", entry)
+
+
 class TestQwenProjectionEdgeCases(unittest.TestCase):
     def test_malformed_event_projects_nothing(self):
         proj = qt.QwenProjector(SID)

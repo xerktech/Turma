@@ -15,6 +15,12 @@ incrementally — so every existing transcript surface (hub-agent tail,
 tunnel-agent live tail, history, archive, usage, PR scan) reads a qwen session
 with NO change and NO new reader.
 
+It ALSO projects each subagent the session delegated to (XERK-517 [Qwen J]):
+Qwen writes each child's own native log at `<slug>/subagents/<parent>/agent-<id>.jsonl`,
+which the tail projects into the Claude `subagents/agent-<id>.jsonl` layout the
+pickers resolve — so a qwen delegation's drill-in transcript and its delegated
+tokens surface identically to Claude. See `.claude/rules/qwen-delegation.md`.
+
 Qwen writes its native log at `~/.qwen/projects/<cwd-slug>/chats/<id>.jsonl`
 (G0 spike). The exact cwd->slug rule is NOT depended on: the tail LOCATES the
 log by GLOBBING for `<id>.jsonl` across the project dirs, the same discipline
@@ -37,6 +43,7 @@ path (XERK-395: nothing on the beat may stall past the hub's OFFLINE_AFTER_MS):
 import glob
 import json
 import os
+import re
 import threading
 import time
 
@@ -45,6 +52,13 @@ try:
     from qwen_transcript import QwenProjector
 except ImportError:  # pragma: no cover - only when run outside the agent dir
     QwenProjector = None
+
+# A child subagent's id names both the Qwen native log file
+# (`subagents/<parent>/agent-<id>.jsonl`) and the projected `agent-<id>.jsonl`
+# the pickers open — held to hub-agent's `VALID_WORKFLOW_AGENT_ID_RE` grammar so
+# a child the tail files is one the reader accepts (and so an id from a filename
+# can never traverse out of the subagents dir). Qwen mints `<type>-call_<hex>`.
+_CHILD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # How often the projection tail wakes to look for new native events, when it is
 # not being poked. Cheap: it only reads bytes appended since its last offset.
@@ -140,6 +154,19 @@ class QwenProjectionTail:
         # final: Qwen has no fallback/provisional two-title race like dsh). Kept
         # symmetric with dsh's tail so hub-agent's seeder reads one shape.
         self._title_final = False
+        # --- delegation: per-child subagent transcripts (XERK-517 [Qwen J]) -----
+        # Qwen writes each subagent's OWN native log at a SIBLING of the parent's
+        # chats dir — `<slug>/subagents/<parentSessionId>/agent-<childId>.jsonl`
+        # (+ a `.meta.json`). The tail projects each through a fresh QwenProjector
+        # into the Claude `subagents/` layout hub-agent's pickers resolve
+        # (`<transcript stem>/subagents/agent-<childId>.jsonl`), so the launch row
+        # `_resolve_subagent` opens finds a file, and the usage/archive walks count
+        # + migrate the delegated tokens with no change. Per-child tail state:
+        # childId -> {"proj","offset","partial","dest"}.
+        stem = (transcript_path[:-len(".jsonl")]
+                if transcript_path.endswith(".jsonl") else transcript_path)
+        self._subagents_dir = os.path.join(stem, "subagents")
+        self._children = {}
 
     def start(self):
         if self._proj is None:
@@ -223,6 +250,18 @@ class QwenProjectionTail:
         # PROJECTION bytes below (a resumed tail's projection offset is at EOF,
         # but the mirror still catches up any native bytes not yet copied).
         self._mirror_native(events_path)
+        # Project any new PARENT bytes, but do NOT early-return on "no new parent
+        # data": a BACKGROUND subagent grows its OWN child log while the parent
+        # turn is idle, so the child sync at the tail must run every pump
+        # regardless of the parent (XERK-517 [Qwen J] — the qwen difference from
+        # dsh, whose driver writes parent + child edges together).
+        self._pump_parent(events_path)
+        try:
+            self._sync_children(events_path)
+        except Exception as e:      # never let it kill the tail thread
+            self._log(f"qwen child projection error: {e}")
+
+    def _pump_parent(self, events_path):
         try:
             size = os.path.getsize(events_path)
         except OSError:
@@ -265,6 +304,99 @@ class QwenProjectionTail:
             entries.extend(self._proj.feed(event))
         if entries:
             self._append(self.transcript_path, entries)
+
+    def _sync_children(self, events_path):
+        """Discover and project every subagent's native log the parent spawned,
+        appending to its Claude-Code `subagents/agent-<id>.jsonl` destination.
+
+        Qwen writes them at `<slug>/subagents/<parentSessionId>/agent-<id>.jsonl`
+        — a SIBLING of `<slug>/chats/<id>.jsonl` — so the dir is resolved off the
+        parent native log path (which the tail already located by glob), never a
+        recomputed slug."""
+        child_dir = os.path.join(
+            os.path.dirname(os.path.dirname(events_path)),
+            "subagents", self._session_id)
+        try:
+            names = os.listdir(child_dir)
+        except OSError:
+            return  # no subagents yet (or the dir is unreadable)
+        for name in names:
+            if not (name.startswith("agent-") and name.endswith(".jsonl")):
+                continue
+            child_id = name[len("agent-"):-len(".jsonl")]
+            if not _CHILD_ID_RE.match(child_id):
+                continue
+            src = os.path.join(child_dir, name)
+            try:
+                if os.path.islink(src) or not os.path.isfile(src):
+                    continue      # never follow a planted link into another tree
+            except OSError:
+                continue
+            self._pump_child(child_id, src)
+
+    def _pump_child(self, child_id, src):
+        """Project the new bytes of one subagent's native log through a fresh
+        QwenProjector into `subagents/agent-<child_id>.jsonl`, incrementally on
+        its own offset — the same discipline the parent projection uses."""
+        st = self._children.get(child_id)
+        if st is None:
+            if QwenProjector is None:
+                return
+            dest = os.path.join(self._subagents_dir, "agent-%s.jsonl" % child_id)
+            # The child's events carry the PARENT's sessionId, so the projector is
+            # seeded on the CHILD id — unique uuids, no collision with the parent.
+            st = {"proj": QwenProjector(child_id, cwd=self._cwd,
+                                        git_branch=self._git_branch),
+                  "offset": 0, "partial": b"", "dest": dest}
+            self._children[child_id] = st
+            self._ensure_child_file(dest)
+        try:
+            size = os.path.getsize(src)
+        except OSError:
+            return
+        if size < st["offset"]:      # rewritten under us — re-project from 0
+            st["offset"] = 0
+            st["partial"] = b""
+            st["proj"] = QwenProjector(child_id, cwd=self._cwd,
+                                       git_branch=self._git_branch)
+            try:
+                open(st["dest"], "w").close()   # start the destination over too
+            except OSError:
+                pass
+        try:
+            with open(src, "rb") as fh:
+                fh.seek(st["offset"])
+                data = fh.read()
+        except OSError:
+            return
+        if not data:
+            return
+        st["offset"] += len(data)
+        st["partial"] += data
+        entries = []
+        while b"\n" in st["partial"]:
+            line, st["partial"] = st["partial"].split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            entries.extend(st["proj"].feed(event))
+        if entries:
+            self._append(st["dest"], entries)
+
+    def _ensure_child_file(self, dest):
+        """Create the destination transcript (empty) so a picker resolving the
+        child mid-run finds a file — an empty one reads as an empty conversation,
+        the same guarantee the main transcript gets at launch."""
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if not os.path.exists(dest):
+                open(dest, "a", encoding="utf-8").close()
+        except OSError as e:
+            self._log(f"qwen child transcript create failed: {e}")
 
     def _mirror_native(self, events_path):
         """Copy qwen's native event log, byte for byte and append-only, into the

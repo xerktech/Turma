@@ -293,5 +293,120 @@ class QwenProjectionTailTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.mirror_path))
 
 
+class QwenDelegationTailTest(unittest.TestCase):
+    """[Qwen J] (XERK-517): the tail projects each subagent's native log
+    (`<slug>/subagents/<parent>/agent-<id>.jsonl`) into the Claude `subagents/`
+    layout hub-agent's pickers resolve, so a Qwen delegation's drill-in
+    transcript populates and its tokens are counted/migrated unchanged. Driven
+    over a corpus CAPTURED from a real Qwen 0.22.x delegation on disk."""
+
+    AID = "Explore-call_b01c582ff5fb496987c52ded"
+    FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)))
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="qwen-deleg-tail-")
+        self.addCleanup(self._rmtree)
+        self.sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        self.projects_root = os.path.join(self.tmp, "qwen-projects")
+        slug = os.path.join(self.projects_root, "some-slug")
+        self.chats_dir = os.path.join(slug, "chats")
+        os.makedirs(self.chats_dir, exist_ok=True)
+        self.native_log = os.path.join(self.chats_dir, f"{self.sid}.jsonl")
+        # The Qwen subagent native log lives at <slug>/subagents/<parent>/, a
+        # SIBLING of chats/ — exactly where the tail resolves it off events_path.
+        self.child_dir = os.path.join(slug, "subagents", self.sid)
+        os.makedirs(self.child_dir, exist_ok=True)
+        self.child_native = os.path.join(self.child_dir, f"agent-{self.AID}.jsonl")
+        self.transcript = os.path.join(self.tmp, "projects", "slug",
+                                       f"{self.sid}.jsonl")
+        os.makedirs(os.path.dirname(self.transcript), exist_ok=True)
+        # Where the projected child must land (the Claude layout _resolve_subagent
+        # derives from the main transcript).
+        self.projected_child = os.path.join(
+            self.tmp, "projects", "slug", self.sid, "subagents",
+            f"agent-{self.AID}.jsonl")
+
+    def _rmtree(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, path, events):
+        with open(path, "a", encoding="utf-8") as fh:
+            for e in events:
+                fh.write(json.dumps(e) + "\n")
+
+    def _fixture(self, name):
+        with open(os.path.join(self.FIXTURES, name)) as f:
+            return json.load(f)
+
+    def _tail(self):
+        return qs.QwenProjectionTail(
+            self.projects_root, self.transcript, self.sid,
+            cwd="/repos/wt", log=lambda m: None, events_path=None)
+
+    def test_child_log_is_projected_into_the_claude_layout_and_resolves(self):
+        # Parent delegation native log + the child's OWN native log on disk.
+        self._write(self.native_log, self._fixture("qwen_delegation_corpus.json"))
+        self._write(self.child_native, self._fixture("qwen_delegation_child.json"))
+        tail = self._tail()
+        self.addCleanup(tail.stop)
+        tail._pump()
+        # The projected child landed in the Claude subagents/ layout, non-empty.
+        self.assertTrue(os.path.isfile(self.projected_child))
+        self.assertGreater(os.path.getsize(self.projected_child), 0)
+        # And hub-agent's REAL reader resolves the launch row to exactly it.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "hub_agent", os.path.join(os.path.dirname(self.FIXTURES), "hub-agent.py"))
+        ha = importlib.util.module_from_spec(spec)
+        sys.modules["hub_agent"] = ha
+        spec.loader.exec_module(ha)
+        resolved = ha._resolve_subagent(
+            self.transcript, "Explore", "Find org selector dropdown")
+        self.assertEqual(resolved, self.projected_child)
+
+    def test_child_projection_is_incremental(self):
+        self._write(self.native_log, self._fixture("qwen_delegation_corpus.json"))
+        child = self._fixture("qwen_delegation_child.json")
+        self._write(self.child_native, child[:1])
+        tail = self._tail()
+        self.addCleanup(tail.stop)
+        tail._pump()
+        with open(self.projected_child, encoding="utf-8") as f:
+            first = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual(len(first), 1)
+        # Appending more child events projects only the new ones on the next pump.
+        self._write(self.child_native, child[1:])
+        tail._pump()
+        with open(self.projected_child, encoding="utf-8") as f:
+            full = [json.loads(l) for l in f if l.strip()]
+        self.assertGreater(len(full), len(first))
+        self.assertEqual(full[0], first[0])   # prefix not re-projected
+
+    def test_no_subagents_dir_is_a_clean_no_op(self):
+        # A session that never delegates has no subagents dir — the tail projects
+        # the parent and touches no child layout.
+        import shutil
+        shutil.rmtree(self.child_dir)
+        self._write(self.native_log, self._fixture("qwen_delegation_corpus.json"))
+        tail = self._tail()
+        self.addCleanup(tail.stop)
+        tail._pump()   # must not raise
+        self.assertFalse(os.path.exists(os.path.dirname(self.projected_child)))
+
+    def test_a_symlinked_child_log_is_refused(self):
+        # isfile() follows a symlink, so a planted link would be a phantom child
+        # whose "transcript" is whatever it points at — refused (islink beside
+        # isfile), the file half of os.walk's dir-symlink rule.
+        self._write(self.native_log, self._fixture("qwen_delegation_corpus.json"))
+        target = os.path.join(self.tmp, "elsewhere.jsonl")
+        self._write(target, self._fixture("qwen_delegation_child.json"))
+        os.symlink(target, self.child_native)
+        tail = self._tail()
+        self.addCleanup(tail.stop)
+        tail._pump()
+        self.assertFalse(os.path.exists(self.projected_child))
+
+
 if __name__ == "__main__":
     unittest.main()

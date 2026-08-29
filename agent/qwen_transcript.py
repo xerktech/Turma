@@ -65,6 +65,17 @@ and the corpus under `docs/qwen-g0/corpus/`):
   incrementally, and a re-projection (resume, replay) must reproduce the same
   uuids so the file does not fork and the usage de-dup stays exact.
 
+- DELEGATION rides the SAME seam (XERK-517 [Qwen J]). Qwen's subagent tool is a
+  near-Claude `Agent` launch (`agent` name mapped to `Agent`), but its
+  tool_result is a `task_execution` resultDisplay rather than Claude's
+  `async_launched` toolUseResult, so `_subagent_launch` RESHAPES it into the
+  Claude background-launch record — the launch row and drill-in resolve with no
+  reader change (the XERK-304 contract). Qwen already writes an exact Claude
+  `<task-notification>` for the STOP edge, which passes through as a user turn.
+  Each child's own native log is projected into the Claude `subagents/` layout by
+  the tail (`agent/qwen_session.py`), never by this module. Workflows have no
+  Claude-shaped on-disk mapping evidenced yet and are a stated residual gap.
+
 Stdlib only — imported by the Qwen launcher/tail in `hub-agent.py`, kept
 dependency-free like the rest of `agent/`.
 """
@@ -78,6 +89,21 @@ import uuid as _uuidlib
 # to the SAME entry uuid — see the DETERMINISTIC UUIDS note above.
 _UUID_NS = _uuidlib.UUID("b2c7f4e1-9a3d-4e6f-8b0c-1d2e3f4a5b6c")
 
+# A subagent's agentId names a live-agent row AND its transcript file
+# (subagents/agent-<id>.jsonl), and is written verbatim into the `agentId:` text
+# `_resolve_subagent` matches on — so it is held to the ASCII grammar hub-agent's
+# own `VALID_WORKFLOW_AGENT_ID_RE` / `_AGENT_ID_RE` accept (NOT `str.isalnum`,
+# which is Unicode-aware and would pass a char those readers reject, or an id
+# carrying XML/newlines that could break the `<task-notification>` the stop edge
+# rides). Qwen mints `<subagent_type>-call_<hex>`, so this never rejects a real id.
+_VALID_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# The `task_id: <id>` line Qwen writes into a BACKGROUND `agent` launch's tool
+# result output — the authoritative agentId (it also names the child transcript
+# `agent-<id>.jsonl`). A foreground subagent's result carries the agent's real
+# output instead, so the id is reconstructed as `<subagentName>-<callId>` there.
+_TASK_ID_RE = re.compile(r"task_id:\s*(\S+)")
+
 # Qwen's three surface event types — the only ones producing model-visible
 # messages and therefore the only ones projected. Everything else is log-only.
 SURFACE_EVENT_TYPES = ("user", "assistant", "tool_result")
@@ -88,7 +114,14 @@ SURFACE_EVENT_TYPES = ("user", "assistant", "tool_result")
 # corpus), but `_scan_pr_line`'s PR attribution and `_tool_use_detail`'s Bash card
 # both key on the name being `"Bash"`. The mapping lives HERE, in the one seam,
 # rather than teaching every reader mirror about Qwen names.
-_TOOL_NAME_MAP = {"run_shell_command": "Bash"}
+_TOOL_NAME_MAP = {"run_shell_command": "Bash", "agent": "Agent"}
+
+# Qwen's subagent-delegation tool (`agent`, mapped to `Agent` above). Its
+# tool_result carries a `toolCallResult.resultDisplay` of type `task_execution`
+# — NOT Claude Code's `toolUseResult{status:"async_launched"}` — so the launch
+# is invisible to `_scan_agent_entry` / `_resolve_subagent` until [Qwen J]
+# reshapes it (XERK-517). `_subagent_launch` below detects that shape.
+_QWEN_AGENT_TOOL = "agent"
 
 # A permissive ISO-8601 UTC shape. Qwen already stamps each row with a
 # millisecond ISO-8601 Z timestamp — the EXACT shape Claude Code writes
@@ -227,6 +260,44 @@ def _assistant_content(parts):
     return blocks
 
 
+def _subagent_launch(fr, resp, tcr, call_id):
+    """Detect a Qwen `agent`-tool subagent launch and return
+    `(agentId, subagentType, description, backgrounded)`, or None if `fr` is not
+    an `agent` tool response Qwen wrote a `task_execution` result for (XERK-517
+    [Qwen J]). This is the ONE Qwen-specific delegation shape; everything the
+    reshaped entry then feeds — `_scan_agent_entry`, `_resolve_subagent` — is
+    Claude-Code-native and unchanged.
+
+    Qwen's delegation is a near-Claude launch pair (verified against real Qwen
+    0.22.x captures): the assistant `agent` tool_use carries
+    `{description, subagent_type, prompt}` (projected to a Claude `Agent`
+    tool_use via `_TOOL_NAME_MAP`), and the tool_result carries a
+    `toolCallResult.resultDisplay` of type `task_execution` with `subagentName`,
+    `taskDescription` and `status` ("background" for an in-flight launch, else a
+    terminal state for a synchronous one). The agentId — which names the child
+    transcript `agent-<id>.jsonl` — is the `task_id:` Qwen prints into a
+    background launch's output, reconstructed as `<subagentName>-<callId>` for a
+    synchronous one (that is exactly how Qwen names the on-disk file). A malformed
+    or grammar-failing id yields None, so the result projects as a plain tool card
+    rather than an unresolvable row."""
+    if not isinstance(fr, dict) or str(fr.get("name") or "") != _QWEN_AGENT_TOOL:
+        return None
+    rd = tcr.get("resultDisplay") if isinstance(tcr, dict) else None
+    if not isinstance(rd, dict) or rd.get("type") != "task_execution":
+        return None
+    subagent_type = str(rd.get("subagentName") or "").strip()
+    description = str(rd.get("taskDescription") or "").strip()
+    output = str(resp.get("output") or "") if isinstance(resp, dict) else ""
+    m = _TASK_ID_RE.search(output)
+    aid = m.group(1).strip() if m else ""
+    if not aid and subagent_type and call_id:
+        aid = "%s-%s" % (subagent_type, call_id)
+    if not _VALID_AGENT_ID_RE.match(aid):
+        return None
+    backgrounded = rd.get("status") == "background"
+    return aid, subagent_type, description, backgrounded
+
+
 class QwenProjector:
     """Stateful, single-pass projector: `feed(event)` returns the Claude-JSONL
     entry dicts one Qwen native-log event projects to (usually 0 or 1), so a
@@ -355,6 +426,36 @@ class QwenProjector:
         if isinstance(tcr, dict) and (
                 tcr.get("status") == "error" or tcr.get("executionStatus") == "error"):
             is_error = True
+        # Delegation (XERK-517 [Qwen J]): reshape a Qwen `agent`-tool launch into
+        # the Claude-Code background-launch record the readers already parse, so
+        # `_scan_agent_entry` registers the live row and `_resolve_subagent` opens
+        # the child transcript with NO reader change (the XERK-304 contract). The
+        # subagent's OWN turns never touch this parent transcript — they live in
+        # the child log (`subagents/<parent>/agent-<id>.jsonl`), which the tail
+        # projects into the Claude `subagents/` layout.
+        tool_use_result = None
+        launch = _subagent_launch(fr, resp, tcr, call_id)
+        if launch:
+            aid, subagent_type, description, backgrounded = launch
+            if backgrounded:
+                # An in-flight background launch: the async_launched record makes
+                # it a LIVE agent row, and Qwen's own `<task-notification>` (a
+                # plain user turn this projector passes through) retires it later.
+                # The clean launch text replaces Qwen's verbose output (which
+                # leaks the internal output_file path) and carries the `agentId:`
+                # `_resolve_subagent` keys on.
+                text = "Async agent launched successfully. agentId: %s" % aid
+                tool_use_result = {"status": "async_launched", "agentId": aid,
+                                   "agentType": subagent_type or "agent",
+                                   "description": description}
+                is_error = False
+            elif aid not in text:
+                # A synchronous subagent that already finished: keep its result
+                # (the parent model consumed it) but make it RESOLVABLE — NOT a
+                # live row, since no `<task-notification>` will retire it, so
+                # marking it async_launched would strand a permanent phantom
+                # (the same reason `_async_launch` excludes a sync subagent).
+                text = "agentId: %s\n%s" % (aid, text)
         result_block = {"type": "tool_result"}
         if call_id:
             result_block["tool_use_id"] = str(call_id)
@@ -364,6 +465,8 @@ class QwenProjector:
         entry = self._envelope("user")
         entry["timestamp"] = ts
         entry["message"] = {"role": "user", "content": [result_block]}
+        if tool_use_result is not None:
+            entry["toolUseResult"] = tool_use_result
         return [self._emit(entry)]
 
 
