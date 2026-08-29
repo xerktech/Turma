@@ -252,3 +252,24 @@ socket. The ONE net-new module is the projection tail. Invariants a change must 
   (busy markers, the `›` approval parse, digit+Enter, ask-MCP registration, the three naming tiers,
   teardown), the qwen busy cases in `tunnel-agent.test.js`. Real-qwen legs are host-proof only (qwen
   is not installed in CI) — the same footing [D]/[E]/[J] shipped on for dsh.
+
+## [Qwen G] (XERK-513) shipped: usage aggregates + per-model attribution
+
+D4's usage obligation for qwen, the dsh [G] (XERK-471) analogue — a qwen session's spend charts on
+the Usage page and the dashboard token tiles IDENTICALLY to a Claude session, with no schema change
+and no `agentType` branch in the aggregation, because [Qwen S1]'s projection already writes
+`message.usage`/`message.model` in the shape the ledger reads. The full contract (why the token
+aggregates + attribution ledger cost qwen nothing, why local/OpenAI-compat ids appear in the
+per-model breakdown and may dominate, why the native log is never double-counted, and why the
+subscription `limits`/probe/card stay Claude-only) lives in **`.claude/rules/agent-usage.md`**
+("qwen sessions ride this half unchanged too"), whose `paths:` now loads for the qwen modules.
+
+- **[Qwen G] added NO aggregation code.** The `_map_usage` all-zero-block hardening that dsh [G]
+  needed was already folded into [Qwen S1] (`qwen_transcript.py`), so this ticket is the
+  confirmation plus the end-to-end test. qwen's native log lives under `QWEN_PROJECTS_ROOT`, OUTSIDE
+  the `PROJECTS_ROOT` tree any usage/archive walk reads, so it can never be double-counted — simpler
+  than dsh, whose `<sid>/dsh/` is under the slug dir and relies on `_project_transcripts` skipping it.
+- Tests: `TestQwenUsageReportEndToEnd` (mirrors `TestDshUsageReportEndToEnd`) drives the REAL
+  projector's output through `repo_usage_report`/`_aggregate_project` on disk, proving host + per-repo
+  totals and the local/OpenAI-compat per-model breakdown; `TestQwenProjectionAccounting`/
+  `TestQwenUsageMapping` cover the layer below. All in `test_qwen_transcript.py`.
