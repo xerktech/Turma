@@ -118,3 +118,31 @@ state is polled across GitHub/GitLab/Azure DevOps, and what gets typed back in b
 - **Chips survive a dsh resume/migration** because `_seed_prs` reads the PROJECTED `<tid>.jsonl`,
   which migration already packs as the top-level transcript — independent of [K]'s native-log
   `tar.add(<tid>/dsh)`, still out of scope. Tests: `TestDshPrAttribution`.
+
+## qwen sessions get the same PR chips with NO qwen-specific PR code (XERK-514 [Qwen H])
+
+- **Everything above reads and writes a qwen session UNCHANGED — do not add an `agentType` branch to
+  the PR path.** Same as dsh [H]: `_scan_pr_line`, `_seed_prs`, `refresh_pr_status`, the GitLab/ADO
+  dispatch and the comment/conflict pollers all key on `session_pr_urls` (session id) and the
+  transcript, never on the runtime. A qwen session's transcript is the [Qwen S1] projection of Qwen's
+  own native log, so the SAME scan attributes the SAME `gh pr create`. Proven end to end by
+  `TestQwenPrAttribution` over the real projector + a real-shaped corpus carrying a `gh pr create`.
+- **The one load-bearing dependency is the projector's `run_shell_command`->`Bash` name map**
+  (`_TOOL_NAME_MAP` in `qwen_transcript.py`). `_scan_pr_entry` attributes only a `tool_use` whose
+  `name` is `"Bash"`; Qwen's shell tool registers as `run_shell_command`, so without that map a qwen
+  `gh pr create` projects to an unattributed tool call and the PR is chipless. Same narrowness as
+  Claude/dsh: a PR opened another way — qwen's `cordis_run`/`ralph`, or the raw GitLab API — gets no
+  chip. **Widen only by teaching `_scan_pr_line` another creation event, never by loosening the
+  Bash-name gate.**
+- **Comment/conflict delivery routes through `notify_session` → the PANE, not a socket.** This is the
+  ONE place qwen differs from dsh [H]: dsh is headless and nudges over its control socket
+  (`_dsh_notify`); a qwen session is an interactive TUI and — like a Claude session — writes no
+  `~/.claude/sessions/<pid>.json`, so `notify_session` finds no inbox and falls back to `send_input`'s
+  pane path ([Qwen C]: `send_input`/`notify_session` carry NO qwen arm). The pane send is bounded by
+  `INPUT_MAX_CHARS` and never raises, so a qwen session on the PR pollers adds no new beat-loop budget
+  over Claude's; `refresh_pr_status` stays the same inline offender for ALL runtimes (XERK-397's
+  scope, not widened here).
+- **Chips survive a qwen resume/migration** because `_seed_prs` reads the PROJECTED `<tid>.jsonl`
+  (`QwenProjectionTail`'s output), which migration packs as the top-level transcript — independent of
+  the raw native-log sidecar `<tid>/qwen/` ([Qwen E]). Tests: `TestQwenPrAttribution` (drives the REAL
+  qwen projector over `agent/tests/qwen_pr_corpus.json`, mirroring `TestDshPrAttribution`).

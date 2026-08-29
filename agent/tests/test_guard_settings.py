@@ -266,6 +266,11 @@ class TestGuardSettings(unittest.TestCase):
         # The peer roster is the org boundary (XERK-348), so a session must not
         # be able to append rows to its own address book.
         "Edit(~/.turma/peers.tsv)",
+        # XERK-510 [Qwen F]: the qwen guard's own config (a rewrite disables the
+        # guard) and the qwen per-session model-credential env file. Added to the
+        # SHARED list so all three runtimes cover them with no qwen-specific change.
+        "Edit(~/.turma/qwen-guard.json)",
+        "Read(~/.turma/qwen/*.env)",
     })
 
     def test_every_claude_backstop_rule_is_pinned(self):

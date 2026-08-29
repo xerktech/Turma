@@ -96,11 +96,12 @@ landed, and the invariants a later child must not undo:
   (REQUIRED for the on-disk transcript + resume), `disableAutoUpdate` (a pinned fleet must not let
   the binary drift under the parsers — the G0 auto-update trap), `folderTrust:false`, and
   `approvalMode:"auto"` + `autoAccept:true` (hands-off, the claude `--permission-mode auto` analogue).
-- **The safety guard is NOT wired here — that is [Qwen F] (XERK-510)**, PreToolUse hooks +
-  `permissions.deny` reusing the shared `guard.py`/`fileguard.py` deny policy (qwen's hook contract
-  is Claude Code's, ported — G0 crit. 5). `approvalMode:"auto"` runs tools unattended, so a launcher
-  WITHOUT [Qwen F] is unguarded — which is the load-bearing reason `QWEN_ENABLED` stays False past
-  [Qwen B]. Permission-mode parity (Shift+Tab / setMode) is [Qwen P] (XERK-522).
+- **The safety guard is [Qwen F] (XERK-510), now SHIPPED and wired into `_qwen_settings`** —
+  PreToolUse hooks + `permissions.deny` reusing the shared `guard.py`/`fileguard.py` deny policy
+  (qwen's hook contract is Claude Code's, ported — G0 crit. 5). See the "[Qwen F]" section below.
+  `approvalMode:"auto"` runs tools unattended, so a launcher WITHOUT the guard is unguarded — the
+  load-bearing reason `QWEN_ENABLED` stays False, now liftable once [Qwen F] is host-verified.
+  Permission-mode parity (Shift+Tab / setMode) is [Qwen P] (XERK-522).
 - **Config readiness is primed OFF THE BEAT** (`_ensure_qwen_ready` on a worker at startup when
   `qwen_configured()`): a `qwen --version` probe + model-route validation, cached on `_qwen_ready`.
   `_launch_qwen` only READS the cached flag and refuses if unset — it never runs the probe on the
@@ -346,50 +347,128 @@ subscription `limits`/probe/card stay Claude-only) lives in **`.claude/rules/age
   totals and the local/OpenAI-compat per-model breakdown; `TestQwenProjectionAccounting`/
   `TestQwenUsageMapping` cover the layer below. All in `test_qwen_transcript.py`.
 
+## [Qwen F] (XERK-510) shipped: safety guard (PreToolUse shim + permissions.deny)
+
+The dsh [F] discipline (`.claude/rules/dsh-guard.md`) applied to qwen — but qwen's PreToolUse-hook
+model IS Claude's (G0 crit. 5), so it reuses the shared deny policy even more directly. The deny
+POLICY is NOT duplicated: destructive/policy/attribution shell classification (`guard.py`) and the
+"everything under ~/.claude except the two memory trees" predicate (`fileguard.py`) have ONE home,
+shelled out to `python3 -SsE <hook>` exactly as Claude and dsh do. Invariants a change must not undo:
+
+- **The one mismatch qwen adds is TOOL NAMES, so a thin SHIM bridges it** (`agent/qwen/guard/shim.py`).
+  `guard.py` keys on `tool_name=="Bash"` and `fileguard.py` on `Write|Edit|…`; a qwen
+  `run_shell_command`/`write_file` sails past both. The shim classifies a qwen tool (shell/write/read,
+  the qwen twin of the dsh guard's `classify`), shells out to the SHARED hooks with the Claude tool
+  shape they expect, AND matches the flat credential/config/runtime-code globs itself (realpath'd, so
+  a symlink/`..` cannot dodge them). **The shim is the enforcement; it does NOT re-implement the deny
+  policy** — only routing + the flat globs, exactly what the dsh guard already reimplements natively.
+- **`build_qwen_guard_config()` reads the SAME rule set `build_guard_settings()` produces** (parsed
+  with `_parse_perm_rule`, as the dsh builder does) and emits (a) the `hooks.PreToolUse` wiring and
+  (b) the shim's data config (`~/.turma/qwen-guard.json`: hook paths + denyWrite/denyRead/allowRead).
+  **Adding a store to `_GUARD_DENY_PATH_RULES` covers all three runtimes with NO qwen change** — the
+  ticket's shared-list contract, pinned by `test_shim_config_is_the_shared_rule_set`. Built + written
+  at the launch choke point (`_qwen_guard_config`, memoized like `_ensure_guard_settings`; primed
+  off-beat by `_prime_qwen`, XERK-395), merged into `.qwen/settings.json` by `_qwen_settings`.
+- **It FAILS CLOSED.** `guard.py`/`fileguard.py` fail OPEN on a malformed payload because Claude keeps
+  `permissions.deny` as a backstop; qwen has none the shim can rely on, so the shim DENIES (deny JSON
+  on stdout AND exit 2) on: an unreadable config, a hook it cannot spawn / that crashes (nonzero
+  exit) / times out / returns unreadable output, a SHELL call with no configured guard script, an
+  unparseable tool payload, or any unexpected error in the shim. A missing FILEGUARD degrades to the
+  write-deny globs (defence in depth, like dsh), not a fail-closed — the globs still name the
+  catastrophic ~/.claude subset. **G0 GOTCHA baked in: qwen's hook `timeout` is MILLISECONDS** — a
+  too-small value silently disables the guard, so `QWEN_GUARD_HOOK_TIMEOUT_MS` (15000) comfortably
+  exceeds the shim's own nested-subprocess budget (`QWEN_SHIM_HOOK_TIMEOUT_MS`, 5000).
+- **Approval mode stays `auto` (NOT `yolo`, NOT `default`)** — the ticket's "not auto-yolo, not
+  auto-reject". `default` would HANG on every tool-approval prompt (nothing auto-answers them until
+  [Qwen P]); `yolo` risks skipping hooks. `auto` is the Claude `--permission-mode auto` analogue:
+  hands-off, hooks fire. **LOAD-BEARING HOST-PROOF: G0 proved the deny hook fires under `default`;
+  that it also fires under `auto` (the mode the launcher runs) is UNVERIFIED and is THE gate before
+  `QWEN_ENABLED` is flipped.** If `auto` skips hooks on a real host, qwen must not be enabled until
+  the mode question is resolved.
+- **`permissions.deny` is UNVERIFIED defence in depth** — the G0 spike catalogued qwen's settings
+  keys and found no `permissions` block, so whether qwen honours one is unknown; it is emitted
+  (ticket-required, the Claude backstop analogue) but the shim does NOT depend on it, and if a real
+  qwen REJECTS the unknown key the fix is a one-line removal (`_confirm_qwen_launch` catches a launch
+  break). Host-proof, like the [Qwen C] `mcpServers` key.
+- **The credential env file is read-denied** (`Read(~/.turma/qwen/*.env)`, holds `OPENAI_API_KEY`) —
+  ticket point 5, defence in depth: 0600 already stops other uids and the session runs as the owning
+  uid, so this only stops a casual read via the file-editing tools (Bash walks past it, XERK-309).
+- **Residual gaps (stated, not papered over):**
+  - **An unknown mutating tool NAME is ungated** (the qwen twin of dsh's ungated `cordis_run`/`ralph`):
+    the shim only sees the tools the matcher lists (`_QWEN_GUARDED_TOOLS`) and classifies the rest as
+    `other`→allow. Worse than dsh here — dsh pins `sandbox: workspace-write` (landlock) as the fs
+    backstop, but qwen's `--sandbox` needs docker/podman (absent on native hosts), so there is NO fs
+    confinement backstop. Widening the tool list, not a sandbox, is the honest fix if qwen grows a
+    new fs tool.
+  - **The flat globs match an expanduser'd (not realpath'd) prefix against a realpath'd target**, so a
+    symlinked HOME could dodge a credential glob — the SAME accepted limitation the dsh guard has;
+    `fileguard.py` realpaths its ~/.claude base, so the ~/.claude predicate holds regardless.
+  - **The shim RE-READS `~/.turma/qwen-guard.json` every call, and a Bash redirect walks past its
+    Edit-deny** (XERK-309) — so a `run_shell_command` that overwrites it could repoint `guardScript`
+    and self-bypass. This is NOT net-new: `guard.py` equally allows `echo > guard.py` for the Claude
+    guard (the guard defends against the MODEL, not a hostile same-uid shell), and deriving the
+    script paths from the shim's own location does not close it either (Bash can overwrite guard.py
+    directly). It is a weaker backstop than guard-settings.json's, which claude reads once at launch
+    (restart-repairable) — the deny-rule comment in `_GUARD_DENY_PATH_RULES` states this.
+- Tests: `test_qwen_guard.py` — `TestBuildQwenGuardConfig` pins the config (hook wiring, the
+  ms-timeout ordering, the shared-rule-set derivation, the credential read-deny, no-ListAgents,
+  missing-fileguard degrade) and `TestQwenGuardShimEndToEnd` drives the REAL shim over the REAL
+  guard.py/fileguard.py with hostile inputs (destructive/policy/attribution shell, credential+
+  ~/.claude writes, credential reads vs the uploads/roster carve-outs, symlink escape, and every
+  fail-closed path). The `permissions.deny`-honoured and `auto`-fires-hooks legs are host-proof only.
+
+## [Qwen H] (XERK-514) shipped: PR/MR chips, ledgers & attribution
+
+D4's "PR chips work with no new code" for qwen, the dsh [H] (XERK-472) analogue — a qwen session that
+opens a PR gets the same chips, ledgers, attribution and comment/conflict delivery as a Claude one,
+with NO `agentType` branch on the PR path. The symmetry is [Qwen S1]'s: the projection needs no new
+reader, so the whole PR web reads a qwen transcript unchanged. **[Qwen H] added NO PR code** — it is
+verification plus the mirror test. The mechanics live in `.claude/rules/agent-prs.md` ("qwen
+sessions" section); the invariants a change must not undo:
+
+- **The load-bearing dependency is [Qwen S1]'s `run_shell_command`->`Bash` name map**: `_scan_pr_line`
+  attributes only a `Bash` tool_use, and qwen's shell tool registers as `run_shell_command`, so the
+  map is what makes `gh pr create` chip. Same narrowness as Claude/dsh (a PR opened via
+  `cordis_run`/`ralph` or the raw GitLab API gets none). **Widen only by teaching `_scan_pr_line`
+  another creation event, never by loosening the Bash-name gate.**
+- **Comment/conflict nudges route through `notify_session` → the PANE — the ONE difference from dsh
+  [H].** dsh is headless and nudges over its control socket (`_dsh_notify`); a qwen session is an
+  interactive TUI that writes no `~/.claude/sessions/<pid>.json`, so `notify_session` finds no inbox
+  and falls back to `send_input`'s pane path exactly as a Claude session with no inbox does. Neither
+  `send_input` nor `notify_session` carries a qwen arm ([Qwen C]) — never add one. `refresh_pr_status`
+  stays the same inline offender for ALL runtimes (XERK-397's scope, not widened here).
+- **Chips survive a qwen resume/migration** via `_seed_prs` over the projected `<tid>.jsonl` (the
+  top-level transcript migration packs), independent of the raw native-log sidecar `<tid>/qwen/`
+  ([Qwen E]).
+- Tests: `TestQwenPrAttribution` in `test_hub_agent.py` drives the REAL qwen projector over
+  `agent/tests/qwen_pr_corpus.json` — a corpus carrying a `gh pr create`, cloned from the captured
+  Qwen 0.22.2 event SHAPES (`qwen_pr_corpus_gen.mjs`) because [Qwen G0]'s two real sessions had their
+  shell tool guard-denied and so carry no successful shell run. It proves attribution, the live
+  per-beat scan, `_seed_prs` + the durable ledger, `refresh_pr_status` + GitLab/ADO dispatch, and the
+  PANE-delivered comment/conflict nudges — the G1 no-mock lesson, mirroring `TestDshPrAttribution`.
+
 ## [Qwen K] (XERK-516) shipped: session migration + resume
 
-XERK-101 extended to qwen, the dsh [K] (XERK-475, `.claude/rules/dsh.md`) analogue. The load-bearing
-difference from dsh: qwen is **Claude-shaped**, so its NATIVE LOG *is* the durable store that
-`qwen --resume <id>` reloads from — there is NO separate store like dsh's `DSH_SESSIONS_ROOT`. So a
-qwen migration carries the native log itself, not a distinct store.
+XERK-101 extended to qwen, the dsh [K] (XERK-475, `.claude/rules/dsh.md`) analogue. Load-bearing
+difference: qwen is **Claude-shaped**, so its NATIVE LOG *is* the durable store `qwen --resume <id>`
+reloads from — NO separate store like dsh's `DSH_SESSIONS_ROOT`. Full mechanics are in the
+`QWEN_STORE_ARCNAME` comment in `hub-agent.py`; the invariants:
 
-- **RESUME was already wired by [Qwen B]/[Qwen C] and is only PINNED here.** `_launch_tmux(resume=
-  True)` dispatches to `_launch_qwen(resume=True)` → `qwen --resume <id>` at the transcript's origin
-  cwd, and `_start_qwen_tail(resume=True)` restarts the projection at the native log's EOF so it
-  never re-projects/doubles the transcript (the deterministic-uuid projection is already in the kept
-  `<id>.jsonl`; qwen appends in place). Boot-adopt reattaches the tail the same way. Do not add a
-  resume path that re-reads the native log from 0.
-- **MIGRATION carries the NATIVE LOG, not the projection feed.** `export_session` locates qwen's
-  native log by GLOB (`_qwen_native_log`, `<id>.jsonl` across `QWEN_PROJECTS_ROOT/*/chats/`, the
-  slug-rule-independent discipline the tail/`_qwen_runtime_file` use) and packs it under the reserved
-  `.qwen-store/chat.jsonl` prefix (twin of dsh's `.dsh-store/`), truncated to its last complete line
-  like the main transcript — a live log is appended by its process. `import_session` routes that
-  member to a single target FILE (`_qwen_store_dest`), NOT a dir: the shared `chats/` dir holds every
-  cwd-cohabiting session's log, so it places exactly this session's `<id>.jsonl`.
-- **The `<slug>/<sid>/qwen/` raw-archive mirror ([Qwen E]) is the DISPLAY/metrics feed and is NEVER
-  carried by migration** — the target rebuilds it from new events past the log's EOF (the tail's
-  `_mirror_native` primes from the fresh mirror's size 0 and copies the whole placed native log).
-  Keep the two straight (the [K] correction the ticket names): resume reads the native log, not the
-  mirror.
-- **Cross-mount re-key is MANDATORY (issue #2373: qwen keys the store on the working dir).** The log
-  lands under the TARGET cwd's slug — and qwen's slug rule is `_project_slug` (every non-alnum→`-`,
-  VERIFIED against real on-disk qwen project dirs; the G0 note's `/`→`-` was imprecise), not a
-  qwen-specific port. `_reconcile_qwen_store_cwd` then re-points the `cwd` carried on EVERY row (qwen
-  has no single header line like dsh) from the source cwd (read from the first row) to the localized
-  worktree, so the placed log is self-consistent with where it now lives. A no-op on a same-mount
-  move (source cwd == target); never raises the migration over a store detail.
-- **A qwen session migrated to a host without qwen falls back to CLAUDE cleanly** — the existing
-  `agent_type_configured` rebuild guard in `_resume_at_cwd` (per-runtime, not dsh-only). `want_qwen`
-  gates on it, so a claude-fallback import DROPS the `.qwen-store/` member (no resume to feed it),
-  exactly as a stray dsh store is dropped.
-- **Model/endpoint re-validation is against the TARGET host's config on every launch.** `_launch_qwen`
-  reads the TARGET's `QWEN_MODEL_BASE_URL`/`QWEN_MODEL_API_KEY_ENV` (never the source's) and keeps a
-  carried `model` only if it passes `QWEN_IDENT_RE`, else the host default. qwen has NO model-list
-  discovery (unlike local-model failover), so an id the target's endpoint does not actually serve is
-  caught at `_confirm_qwen_launch` (clean teardown + a reason via `_refuse_start`), not pre-validated.
-- Tests: the qwen cases in `TestMigrateSession` (`test_a_qwen_bundle_carries_the_native_log_*`,
-  `test_a_claude_import_drops_a_stray_qwen_log`, `test_import_places_and_rekeys_the_qwen_log_cross_mount`,
-  `test_import_drops_the_qwen_log_when_target_lacks_qwen`, `test_qwen_store_dest_uses_the_project_slug_rule`,
-  `test_reconcile_qwen_log_cwd_is_a_noop_on_same_mount`). Real-qwen end-to-end (a cross-host move
-  actually resumed by qwen) is host-proof only — qwen is not installed in CI — the same footing
-  [Qwen C]/[E] shipped on.
+- **RESUME was already wired by [Qwen B]/[Qwen C]; [K] only PINS it.** `_start_qwen_tail(resume=True)`
+  starts at the native log's EOF so it never re-projects/doubles the kept `<id>.jsonl`; boot-adopt
+  reattaches the same way. Never add a resume path that re-reads from 0.
+- **MIGRATION carries the NATIVE LOG.** `export_session` GLOB-locates it (`_qwen_native_log`) and
+  packs it under `.qwen-store/chat.jsonl` (twin of `.dsh-store/`), truncated to its last complete
+  line; `_unpack_transcript` routes it to a single target FILE (`_qwen_store_dest`), NEVER a dir (the
+  shared `chats/` dir holds other sessions' logs). The `<slug>/<sid>/qwen/` raw mirror ([Qwen E]) is
+  the DISPLAY feed and is NEVER carried (the target rebuilds it past EOF) — the [K] correction.
+- **Cross-mount re-key is MANDATORY (issue #2373: qwen keys on cwd).** The log lands under the TARGET
+  cwd's slug — qwen's slug rule is `_project_slug` (every non-alnum→`-`, VERIFIED against real qwen
+  dirs; the G0 `/`→`-` note was imprecise). `_reconcile_qwen_store_cwd` re-points the `cwd` on EVERY
+  row (qwen has no single header) to the localized worktree; no-op on same-mount; never raises.
+- **No-qwen target falls back to CLAUDE cleanly** (the `agent_type_configured` guard, which
+  `want_qwen` gates on, so the `.qwen-store/` member is DROPPED). Model/endpoint re-validate against
+  the TARGET on launch; a carried `model` is kept only if `QWEN_IDENT_RE`-valid, else the host
+  default (no model-list discovery, so a served-but-wrong id is caught at `_confirm_qwen_launch`).
+- Tests: the qwen cases in `TestMigrateSession`. A real cross-host move resumed by qwen is host-proof
+  (qwen not in CI) — the footing [Qwen C]/[E] shipped on.
