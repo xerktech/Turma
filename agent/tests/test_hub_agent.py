@@ -6921,6 +6921,155 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
             self.assertFalse(os.path.exists(sessions_root))
         self.assertEqual(sm.registry[0]["agentType"], "claude")
 
+    # --- qwen session migration: the native log IS the store (XERK-516) ------
+    #
+    # qwen is Claude-shaped: `qwen --resume <id>` reloads from its native log at
+    # ~/.qwen/projects/<slug>/chats/<id>.jsonl (there is no separate store like
+    # dsh). So migration carries THAT log, places it under the TARGET cwd's slug
+    # (qwen keys on cwd — issue #2373), and re-points its per-row cwd. The
+    # `<slug>/<sid>/qwen/` archive mirror is the DISPLAY feed, never carried.
+
+    def _write_qwen_native_log(self, path, cwd, sid, tail="\n"):
+        """A qwen native log as the tail reads it: uuid/parentUuid-linked rows,
+        each carrying `cwd` (unlike dsh's single header). `tail` lets a test add a
+        half-written final line to prove the truncation."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(json.dumps({"uuid": "u1", "parentUuid": None,
+                                "sessionId": sid, "cwd": cwd, "type": "user",
+                                "message": {"role": "user",
+                                            "parts": [{"text": "hi"}]}}) + "\n")
+            f.write(json.dumps({"uuid": "u2", "parentUuid": "u1",
+                                "sessionId": sid, "cwd": cwd, "type": "assistant",
+                                "message": {"role": "assistant",
+                                            "parts": [{"text": "ok"}]}}) + "\n")
+            f.write(tail)
+        return path
+
+    def test_a_qwen_bundle_carries_the_native_log_under_its_own_prefix(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "qwmig")
+        path = self._write_transcript(wt, "transQ")
+        native = os.path.join(self.tmp, "qwen-src", "chats", "transQ.jsonl")
+        # A half-written final line must not travel — a resume could choke on it.
+        self._write_qwen_native_log(native, wt, "transQ", tail='{"partial')
+        sm = self._manager()
+        blob = sm._pack_transcript(path, qwen_store=native)
+        dest = os.path.join(self.tmp, "dest-q")
+        os.makedirs(dest)
+        store_dest = os.path.join(self.tmp, "qwen-dst", "chats", "transQ.jsonl")
+        sm._unpack_transcript(blob, dest, qwen_store_dest=store_dest)
+        # The projection still rides the slug tree; the native log rides its own
+        # prefix and landed at the single target FILE, never in the slug tree.
+        self.assertTrue(os.path.isfile(os.path.join(dest, "transQ.jsonl")))
+        self.assertFalse(os.path.exists(os.path.join(dest, ha.QWEN_STORE_ARCNAME)))
+        self.assertTrue(os.path.isfile(store_dest))
+        with open(store_dest) as f:
+            body = f.read()
+        self.assertNotIn("partial", body)          # truncated at the last newline
+        self.assertTrue(body.endswith("\n"))
+        self.assertEqual(len([l for l in body.splitlines() if l.strip()]), 2)
+
+    def test_a_claude_import_drops_a_stray_qwen_log(self):
+        # No qwen_store_dest -> `.qwen-store/` members are skipped, never written
+        # into the slug tree (they have no resume to feed).
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "qwstray")
+        path = self._write_transcript(wt, "transQS")
+        native = os.path.join(self.tmp, "qwen-src2", "chats", "transQS.jsonl")
+        self._write_qwen_native_log(native, wt, "transQS")
+        sm = self._manager()
+        blob = sm._pack_transcript(path, qwen_store=native)
+        dest = os.path.join(self.tmp, "dest-qs")
+        os.makedirs(dest)
+        sm._unpack_transcript(blob, dest, qwen_store_dest=None)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "transQS.jsonl")))
+        self.assertFalse(os.path.exists(os.path.join(dest, ha.QWEN_STORE_ARCNAME)))
+        self.assertEqual(sorted(os.listdir(dest)), ["transQS.jsonl"])
+
+    def test_import_places_and_rekeys_the_qwen_log_cross_mount(self):
+        """The end-to-end target half for a qwen session: the native log lands at
+        the LOCALIZED cwd's slug (where `qwen --resume` in the new worktree
+        looks), and its per-row cwd is re-pointed from the source's to match."""
+        foreign = "/home/otheruser/src/.turma/worktrees/Turma/qwx"
+        local = os.path.join(ha.WORKTREES_ROOT, "Turma", "qwx")
+        projects_root = os.path.join(self.tmp, "qwen-home", "projects")
+        sm = self._manager()
+        sm._worktree_add = mock.Mock()
+        with mock.patch.object(ha, "QWEN_PROJECTS_ROOT", projects_root), \
+                mock.patch.object(ha, "qwen_configured", lambda: True):
+            src_path = self._write_transcript(local, "transQX")
+            # The source native log carries the FOREIGN cwd on every row.
+            native = os.path.join(self.tmp, "qwen-foreign", "chats",
+                                  "transQX.jsonl")
+            self._write_qwen_native_log(native, foreign, "transQX")
+            blob = sm._pack_transcript(src_path, qwen_store=native)
+            shutil.rmtree(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(local)))
+            sm._migration_download = lambda mid: blob
+            cmd = {"type": "importSession", "cmdId": "cQX", "migrationId": "migQX",
+                   "transcriptId": "transQX", "cwd": foreign, "repo": "Turma",
+                   "agentType": "qwen"}
+            with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
+                sm.import_session(cmd)
+            # The native log landed at the LOCAL cwd's slug (not the foreign one).
+            placed = sm._qwen_store_dest(local, "transQX")
+            self.assertTrue(os.path.isfile(placed))
+            self.assertFalse(os.path.isfile(
+                sm._qwen_store_dest(foreign, "transQX")))
+            # ...and every row's cwd was re-pointed to the local worktree.
+            with open(placed) as f:
+                rows = [json.loads(l) for l in f if l.strip()]
+            self.assertTrue(rows and all(r["cwd"] == local for r in rows))
+            self.assertEqual(rows[0]["uuid"], "u1")   # every other field kept
+        self.assertEqual(sm.registry[0]["agentType"], "qwen")
+        self.assertEqual(sm._launch_tmux.call_args.kwargs["resume_id"], "transQX")
+
+    def test_import_drops_the_qwen_log_when_target_lacks_qwen(self):
+        # agentType=qwen but the target does not offer qwen -> the session falls
+        # back to claude (agent_type_configured), so the native log has no resume
+        # to feed and is not placed under QWEN_PROJECTS_ROOT.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "qwno")
+        projects_root = os.path.join(self.tmp, "qwen-home2", "projects")
+        sm = self._manager()
+        sm._worktree_add = mock.Mock()
+        with mock.patch.object(ha, "QWEN_PROJECTS_ROOT", projects_root), \
+                mock.patch.object(ha, "qwen_configured", lambda: False):
+            src_path = self._write_transcript(wt, "transQN")
+            native = os.path.join(self.tmp, "qwen-src3", "chats", "transQN.jsonl")
+            self._write_qwen_native_log(native, wt, "transQN")
+            blob = sm._pack_transcript(src_path, qwen_store=native)
+            shutil.rmtree(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt)))
+            sm._migration_download = lambda mid: blob
+            cmd = {"type": "importSession", "cmdId": "cQN", "migrationId": "migQN",
+                   "transcriptId": "transQN", "cwd": wt, "repo": "Turma",
+                   "agentType": "qwen"}
+            with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
+                sm.import_session(cmd)
+            self.assertFalse(os.path.exists(projects_root))
+        self.assertEqual(sm.registry[0]["agentType"], "claude")
+
+    def test_qwen_store_dest_uses_the_project_slug_rule(self):
+        # qwen's native-log dir is keyed by the cwd's project slug (every
+        # non-alnum -> '-', == _project_slug, verified against real qwen dirs),
+        # so a cross-mount move that re-keys must compute it the same way qwen
+        # will when it runs `--resume` in the localized worktree.
+        sm = self._manager()
+        with mock.patch.object(ha, "QWEN_PROJECTS_ROOT", "/q/projects"):
+            self.assertEqual(
+                sm._qwen_store_dest("/home/me/git/.turma/worktrees/Turma/abc",
+                                    "sid1"),
+                "/q/projects/-home-me-git--turma-worktrees-Turma-abc/chats/"
+                "sid1.jsonl")
+
+    def test_reconcile_qwen_log_cwd_is_a_noop_on_same_mount(self):
+        # Same-mount move (source cwd == target): the log is left byte-for-byte
+        # unchanged — never rewritten over a store detail resume re-validates.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "qwsame")
+        native = os.path.join(self.tmp, "qwen-same", "chats", "transS.jsonl")
+        self._write_qwen_native_log(native, wt, "transS")
+        before = open(native, "rb").read()
+        sm = self._manager()
+        sm._reconcile_qwen_store_cwd(native, wt)
+        self.assertEqual(open(native, "rb").read(), before)
+
 
 class TestDshProjectKey(unittest.TestCase):
     """`_dsh_project_key` ports dsh's `projectKey(cwd)` byte-for-byte — the store

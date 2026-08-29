@@ -461,3 +461,12 @@ ticket-branch directive — no new launch code). The mechanics — the `/runtime
 gate, the per-runtime `findTicketHost` capability filter, the board `qwenAvailable`/picker, and the
 Android parity — live in **`.claude/rules/turma-board.md`**'s Runtime-row section (board-scoped,
 where the dsh [I] board detail's twin belongs), whose `paths:` load for the board files this touched.
+
+## [Qwen K] (XERK-516) shipped: session migration + resume
+
+Session migration + resume for a qwen session (the dsh [K] analogue) lives in
+**`.claude/rules/qwen-migration.md`** — split out to keep this file under its size ceiling; its
+`paths:` include `hub-agent.py`, so it co-loads with this file when the migration code is touched.
+The load-bearing point: qwen is Claude-shaped, so its NATIVE LOG *is* the store `qwen --resume`
+reloads from (no separate store like dsh's `DSH_SESSIONS_ROOT`) — a migration carries that log under
+`.qwen-store/`, places it at the target cwd's slug and re-keys its per-row `cwd`.
