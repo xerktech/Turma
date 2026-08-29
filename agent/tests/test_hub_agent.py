@@ -25329,6 +25329,20 @@ class TestQwenSessionArms(ManagerMixin, unittest.TestCase):
         self.assertEqual(srv["env"]["TURMA_SESSION_ID"], "q1")
         self.assertEqual(srv["env"]["TURMA_QUESTIONS_DIR"], ha.QUESTIONS_DIR)
 
+    def test_qwen_settings_disables_the_native_ask_tool(self):
+        # XERK-509 D2 (QA reopen XERK-520): qwen's built-in ask_user_question
+        # renders in-pane and writes no rendezvous file, so it must be excluded
+        # or it shadows the turma-ask MCP tool and the operator card never shows.
+        # `tools.exclude` matches a REGISTERED name; the built-in is the bare
+        # name, our MCP tool is server-prefixed, so this drops only the built-in.
+        sm = self.make_manager()
+        settings = sm._qwen_settings({"id": "q1"})
+        self.assertIn("ask_user_question", settings["tools"]["exclude"])
+        self.assertEqual(ha.QWEN_NATIVE_ASK_TOOL, "ask_user_question")
+        # The MCP replacement is still registered under the bare name (qwen
+        # exposes it prefixed to the model, so exclude does not remove it).
+        self.assertIn("turma-ask", settings["mcpServers"])
+
     # --- naming: never claude -p for a qwen session -------------------------
 
     def test_start_summary_refuses_a_qwen_session(self):
