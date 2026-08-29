@@ -14,11 +14,10 @@ paths:
   here is a change to those.
 - **`src/sessions.ts` is one of the FOUR `readyForReview` mirrors** that must agree — see
   `CLAUDE.md`'s cross-cutting contracts.
-- **Every body read in `hub-client.ts` goes through `readJson`, never a bare `res.json()`**.
-  `timeoutFetch` bounds the RESPONSE and cannot reach the body after it, so an
-  unwrapped read is an unbounded await on a live socket; since `App.poll()` re-arms only in its
-  `finally`, one hub that sends headers then stalls freezes the display on stale content forever.
-  A new endpoint added with a bare `res.json()` silently reopens that hole on its own route.
+- **Every body read in `hub-client.ts` goes through `readJson`, never a bare `res.json()`** —
+  `timeoutFetch` bounds the RESPONSE only, so an unwrapped read is an unbounded await on a live
+  socket; since `App.poll()` re-arms only in its `finally`, a hub that sends headers then stalls
+  freezes the display on stale content forever. A bare `res.json()` on a new endpoint reopens it.
 - **The hub's refusal text is clamped in `refusalText`, at the point it becomes ours** (300 chars).
   It reaches `render.ts`'s `wrapText`, which is quadratic in an unbroken word — 200k chars measured
   at 4s — so an unclamped refusal stalls the render loop rather than the socket.

@@ -6,8 +6,8 @@ paths:
 
 # `agent/tunnel-agent.js` — reverse tunnel, live tail and pane footer
 
-It is a JS re-implementation of `hub-agent.py`'s transcript and pane parsers — the parity contract
-is in `CLAUDE.md`, and `.claude/rules/agent.md` carries the Python side.
+JS re-implementation of `hub-agent.py`'s transcript/pane parsers — parity contract in `CLAUDE.md`,
+Python side in `.claude/rules/agent.md`.
 
 - The reverse tunnel; the hub's `{open,port}` selects which per-session ttyd to bridge over one
   per-host control channel, which also carries the **live transcript tail** (`{watch}`/`{unwatch}`,
@@ -15,55 +15,49 @@ is in `CLAUDE.md`, and `.claude/rules/agent.md` carries the Python side.
 
 ### Control-channel liveness
 
-- **Both ends prove the channel rather than assume it**: the heartbeat is a fresh HTTP POST while
-  the tunnel is one long-lived socket, so they die independently — a wedged tunnel reads as a
-  healthy host (`online` with `terminalOnline:false`).
-- Hub beats every `CONTROL_PING_EVERY_MS` (30s) and drops a channel silent for
-  `CONTROL_DEAD_AFTER_MS` (90s); the agent reconnects after `TURMA_CONTROL_IDLE_TIMEOUT_MS` (90s).
-- It sends **two pings and needs both**: the **protocol ping** (`0x9`), auto-ponged by every agent,
-  is liveness the hub gets from OLD agents for free (how it reaps a half-open channel to a host that
-  died without a FIN); the **app-level `{ping}`** text frame is the only liveness a browser-style
-  WebSocket's `onmessage` can observe. Older agents ignore the unknown key.
-- **A dead hub does not necessarily close the socket** — through Cloudflare the edge holds the
-  agent's end open after the origin dies, so **silence, not a close event, is what the agent acts
-  on**.
-- The agent's watchdog arms **only once the hub has proven it app-pings**, so a new agent against an
-  older hub keeps the old behaviour instead of reconnect-looping.
-- `retire()` is idempotent per-socket and **never waits on `ws.close()`**: it schedules the
-  reconnect itself. **Supervision cannot cover any of this** — the native supervisor only respawns
-  on process *exit*, and a wedged socket never exits.
+- **Both ends prove the channel rather than assume it** — heartbeat is a fresh HTTP POST, the tunnel
+  is one long-lived socket; they die independently, so a wedged tunnel reads as `online` with
+  `terminalOnline:false`.
+- Hub beats every `CONTROL_PING_EVERY_MS` (30s), drops a channel silent for `CONTROL_DEAD_AFTER_MS`
+  (90s); agent reconnects after `TURMA_CONTROL_IDLE_TIMEOUT_MS` (90s).
+- **Sends TWO pings, needs both**: the protocol ping (`0x9`, auto-ponged by every agent — how the hub
+  reaps a channel to a host that died without a FIN) and the app-level `{ping}` text frame (the only
+  liveness a browser WebSocket's `onmessage` can observe). Older agents ignore the unknown key.
+- **A dead hub does not necessarily close the socket** — Cloudflare's edge holds the agent's end
+  open after the origin dies, so **silence, not a close event, is what the agent acts on**.
+- Agent's watchdog arms **only once the hub has proven it app-pings** — a new agent against an older
+  hub keeps old behaviour instead of reconnect-looping.
+- `retire()` is idempotent per-socket, **never waits on `ws.close()`** (schedules its own reconnect).
+  **Supervision can't cover this** — the native supervisor respawns only on process exit, and a
+  wedged socket never exits.
 - Tests: `tunnel-agent.test.js`, `server.test.js`.
 
 ### Live working footer and agent list
 
-- `parsePaneLiveTurn` → `{generating,text,status,agents}`: the in-progress assistant text plus
-  `status = {verb, token counters, elapsed, hint}` and the live agent rows (`parseAgentList`).
-- **`agents` rides the FRAME, not `status`** (XERK-245): the two stop being true at different
-  moments. `status` is "a turn is running" — it drives the chat's Stop button, so it must clear the
-  instant the turn ends — while a background agent keeps going past that, which is exactly when the
-  operator can no longer tell the session from an idle one.
-- **The frame's `agents` come from the TRANSCRIPT** (`scanAgentEntry`, folded from the same tail
-  parse into per-watcher `agentState` that persists across polls), never from the pane — see
-  `.claude/rules/agent.md` for the forged rows and the ~24s linger that ruled the pane out. Because
-  a tail window is a pure suffix, re-folding it is safe; and a stop already seen beats a later-read
-  launch, since the queued copy of a notification can sit at an earlier offset than the launch.
-- `__setControlSink` exists so a test can drive `startWatch` → `transcriptTail` → `pollWatcher` and
-  assert the emitted frame carries `agents`. Four independent cut points on that path were each
-  severable with a green CI before it existed.
-- The pane's footer rows still ride **`status.agents` while a turn runs**, for the live
-  elapsed/token counters the transcript cannot know. **Display only** — never liveness.
-- **`turn` text only ever moves forward** (`resolveLiveText`): activity summaries strip off the
-  REFLOWED tail (`stripActivityTail`); already-committed text is suppressed (`committedDupe`,
-  skeleton compare — the pane renders markdown away); and UNCOMMITTED prose HOLDS through
-  empty/tool-bullet frames until the tail owns it (at a block boundary the tool bullet paints before
-  the entry lands — clearing into that gap blinks).
-- A single-frame **busy→idle blip is held one poll** before the bar clears (`liveTurnDecision`,
-  XERK-42); busy is never held.
+- `parsePaneLiveTurn` → `{generating,text,status,agents}`: in-progress assistant text plus
+  `status = {verb, token counters, elapsed, hint}` and live agent rows (`parseAgentList`).
+- **`agents` rides the FRAME, not `status`** (XERK-245) — they clear at different moments: `status`
+  is "a turn is running" (drives the Stop button, must clear the instant a turn ends), while a
+  background agent keeps going past that.
+- **The frame's `agents` come from the TRANSCRIPT** (`scanAgentEntry`, folded into per-watcher
+  `agentState` persisting across polls), **never the pane** — forged rows + the ~24s linger ruled
+  the pane out (`agent.md`). A tail window is a pure suffix, so re-folding is safe; a stop already
+  seen beats a later-read launch (a queued notification can sit at an earlier offset than its
+  launch).
+- `__setControlSink` lets a test drive `startWatch` → `transcriptTail` → `pollWatcher` and assert the
+  emitted frame carries `agents`.
+- The pane's footer rows still ride `status.agents` while a turn runs, for live elapsed/token
+  counters the transcript can't know. **Display only — never liveness.**
+- **`turn` text only ever moves forward** (`resolveLiveText`): activity summaries strip the REFLOWED
+  tail (`stripActivityTail`); already-committed text is suppressed (`committedDupe`); UNCOMMITTED
+  prose HOLDS through empty/tool-bullet frames until the tail owns it (else clearing into the gap
+  before a block lands blinks).
+- A single-frame busy→idle blip is held one poll before the bar clears (`liveTurnDecision`, XERK-42);
+  busy is never held.
 - **Clicking a subagent row opens that background agent's own transcript**: `subagentHistory` →
   `_resolve_subagent`/`_stage_subagent_history` maps the row to `subagents/agent-<id>.jsonl` via the
-  main transcript's Task `tool_use` + its result text (`agentId: <id>`), matching type + description
-  (exact else prefix; **trailing pane-ellipsis stripped**, XERK-130). Results ride the next beat as
+  main transcript's Task `tool_use` + result text (`agentId: <id>`), matching type + description
+  (exact else prefix; trailing pane-ellipsis stripped, XERK-130). Results ride the next beat as
   `subagentHistoryResults`.
 - Tests: `TestResolveSubagent`, `TestStageSubagentHistory`; `parseAgentList`, `liveTurnDecision`,
   `stripActivityTail` in `tunnel-agent.test.js`.
-

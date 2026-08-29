@@ -1,466 +1,395 @@
 # CLAUDE.md
 
-Guidance for Claude Code (claude.ai/code) working in this repository.
+Guidance for Claude Code working in this repository.
 
 ## Where the instructions live
 
-This file is loaded into **every** session on every host. Component detail lives in
-`.claude/rules/*.md`, each scoped with `paths:` frontmatter so it loads only when Claude touches
-that component's files.
+This file loads into **every** session. Component detail lives in `.claude/rules/*.md`, each scoped
+with `paths:` frontmatter so it loads only when Claude touches that component's files.
 
 | File | Loads when Claude touches | Covers |
 |------|---------------------------|--------|
 | `CLAUDE.md` | **always** | repo purpose, session model, cross-cutting contracts, conventions, deploy |
-| `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, live-session signals, summaries, transcript blocks |
-| `.claude/rules/agent-input.md` | `agent/hub-agent.py` | putting a message INTO a session: `send_input`'s pane path and its compaction outbox, `notify_session`'s session inbox |
-| `.claude/rules/agent-sessions.md` | `agent/hub-agent.py` | how a session is launched, repos-root sessions, the agent-side session queue, kill/resume/delete, the new-work directive, local-model failover |
-| `.claude/rules/agent-workflows.md` | `agent/hub-agent.py` | workflow runs: run-dir layout, resolving a `workflow` row, journal/label reads |
-| `.claude/rules/agent-archive.md` | `agent/hub-agent.py` | archive sync: the manifest, the rendered + raw delta pushes and what bounds one, the payload shed, the off-the-beat sync worker |
-| `.claude/rules/agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |
-| `.claude/rules/agent-usage.md` | `agent/hub-agent.py`, `agent/hooks/statusline.py` | token aggregates, attribution ledger, subscription limits + probe |
-| `.claude/rules/agent-prs.md` | `agent/hub-agent.py` | PR/MR status + ledgers, `_scan_pr_line` attribution, GitLab/ADO dispatch, comment + conflict replies |
-| `.claude/rules/agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
-| `.claude/rules/agent-hooks.md` | `agent/hooks/**`, `agent/hub-agent.py` | safety-guard policy, guard + file-guard hooks, AskUserQuestion bridge |
-| `.claude/rules/agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
-| `.claude/rules/turma.md` | `turma/**` | chrome, org filter, dashboard, notifications, auth |
-| `.claude/rules/turma-archive.md` | `turma/archive.js` + its tests | the durable archive: layers, the two size ceilings, how the total is measured |
-| `.claude/rules/turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
-| `.claude/rules/turma-usage.md` | `turma/public/usage.html`, `turma/usage-ledger.js`, `turma/server.js` | the token chart, the durable usage ledger, the sub-agent split, subscription-limit cards, the usage ingest coercions |
-| `.claude/rules/turma-board.md` | `turma/public/board.*`, `turma/server.js` | Kanban, ticket panel, routing, auto-start/stop |
-| `.claude/rules/turma-ticket-queue.md` | `turma/public/board.*`, `turma/server.js` | the hub's ticket queue: admission, drain, expiries, caps |
-| `.claude/rules/board-ticket-view.md` | `turma/server.js`, `agent/hub-agent.py`, `board.js` + its vendored copies, `core/Board.kt` | routing a ticket to a host that can run it, and the hub resolving a ticket as the board does |
-| `.claude/rules/turma-sessions.md` | `turma/public/sessions.html`, `chat.js` + their tests | the Sessions page, chat engine, live tail, composer, terminal |
-| `.claude/rules/android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
-| `.claude/rules/glasses.md` | `glasses/**` | G2 client |
-| `.claude/rules/release.md` | `.github/**`, `VERSION`, `turma/Dockerfile` | releases, PR gates, the hub image |
-| `.claude/rules/routing-eval.md` | `bench/archive/**`, the routing docs | archive-sourced replay eval: the requestId turn unit, curation gates, why routing is per-session |
-| `.claude/rules/dsh.md` | `poc/turma-2.0-poc/**`, `agent/**` | dsh ADR + per-child mechanics (XERK-460) |
-| `.claude/rules/qwen.md` | `agent/hub-agent.py`, `turma/server.js`, `sessions.html`, `android/**` | Qwen Code runtime plumbing (XERK-504) |
-| `.claude/rules/qwen-migration.md` | `agent/hub-agent.py` | qwen session migration + resume (XERK-516 [Qwen K]): the native log as the resumable store |
-| `.claude/rules/dsh-input.md` | `agent/dsh_session.py` | driving a dsh session (XERK-467 [C]): socket, driver, input |
-| `.claude/rules/dsh-delegation.md` | `agent/dsh_transcript.py` | dsh delegation (XERK-474 [J]): bg-agent/workflow rows + `subagentHistory` |
-| `.claude/rules/dsh-guard.md` | `agent/dsh/guard/**` | dsh safety guard (XERK-470 [F]): deny policy on dsh's pipeline |
+| `agent.md` | `agent/hub-agent.py` | process model, commands, heartbeat, live-session signals, summaries, transcript blocks |
+| `agent-input.md` | `agent/hub-agent.py` | `send_input`'s pane path + compaction outbox, `notify_session`'s inbox |
+| `agent-sessions.md` | `agent/hub-agent.py` | session launch, repos-root sessions, queue, kill/resume/delete, new-work directive, local-model failover |
+| `agent-workflows.md` | `agent/hub-agent.py` | workflow runs: run-dir layout, resolving a `workflow` row, journal/label reads |
+| `agent-archive.md` | `agent/hub-agent.py` | archive sync: manifest, rendered + raw delta pushes, payload shed, off-beat sync worker |
+| `agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |
+| `agent-usage.md` | `agent/hub-agent.py`, `hooks/statusline.py` | token aggregates, attribution ledger, subscription limits + probe |
+| `agent-prs.md` | `agent/hub-agent.py` | PR/MR status + ledgers, `_scan_pr_line`, GitLab/ADO dispatch, comment + conflict replies |
+| `agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
+| `agent-hooks.md` | `agent/hooks/**` | safety-guard policy, guard + file-guard hooks, AskUserQuestion bridge |
+| `agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
+| `turma.md` | `turma/**` | chrome, org filter, dashboard, notifications, auth |
+| `turma-archive.md` | `turma/archive.js` | durable archive: layers, size ceilings, how the total is measured |
+| `turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
+| `turma-usage.md` | `turma/public/usage.html`, `usage-ledger.js` | token chart, durable ledger, sub-agent split, limit cards, ingest coercions |
+| `turma-board.md` | `turma/public/board.*` | Kanban, ticket panel, routing, auto-start/stop |
+| `turma-ticket-queue.md` | `turma/server.js`, `board.*` | hub ticket queue: admission, drain, expiries, caps |
+| `board-ticket-view.md` | `server.js`, `hub-agent.py`, `board.js` + vendored copies, `Board.kt` | routing a ticket to a capable host; hub resolving a ticket as the board does |
+| `turma-sessions.md` | `turma/public/sessions.html`, `chat.js` | Sessions page, chat engine, live tail, composer, terminal |
+| `android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
+| `glasses.md` | `glasses/**` | G2 client |
+| `release.md` | `.github/**`, `VERSION`, `turma/Dockerfile` | releases, PR gates, hub image |
+| `routing-eval.md` | `bench/archive/**` | archive-sourced replay eval: requestId turn unit, curation gates |
+| `dsh.md` | dsh-specific `agent/**` files | dsh runtime invariants (XERK-460); rationale in `docs/dsh-adr.md` |
+| `dsh-input.md` | `agent/dsh_session.py` | driving a dsh session: socket, driver, input |
+| `dsh-delegation.md` | `agent/dsh_transcript.py` | dsh delegation: bg-agent/workflow rows + `subagentHistory` |
+| `dsh-guard.md` | `agent/dsh/guard/**` | dsh safety guard: deny policy on dsh's pipeline |
+| `qwen.md` | qwen-specific `agent/**` files | Qwen runtime invariants (XERK-504); rationale in `docs/qwen-adr.md` |
+| `qwen-migration.md` | `agent/hub-agent.py` | qwen migration + resume: native log as the resumable store |
+| `qwen-delegation.md` | `agent/qwen_transcript.py` | qwen delegation rows + `subagentHistory` |
 
 ### Editing these files
 
-- **Every one of them MUST stay under 40,000 characters** — Claude Code's own threshold, above which
-  it prints `⚠ Large CLAUDE.md will impact performance (Xk chars > 40.0k)` at startup and adherence
-  drops. **CI enforces it** (`Instruction file size limits` in `code-scan.yml`, path-filtered to
-  `CLAUDE.md` and `.claude/rules/**` so a docs-only PR still runs it). Check locally with `wc -m
-  <file>` (`-m`, not `-c` — these files are full of multibyte glyphs).
-  - There is **no hard truncation limit**: Claude Code loads a CLAUDE.md in full at any length. The
-    cost of a large file is context tokens and weaker adherence, which is what the ceiling protects.
-    A ceiling stated as a truncation cliff was wrong; do not restore that framing.
-  - **When a file approaches the ceiling, split it by path into another rules file** — that is the
-    remedy, not raising the number and not deleting rationale. `agent-board.md`, `agent-prs.md`,
-    `agent-sessions.md`, `turma-board.md` and `turma-sessions.md` exist for exactly that reason.
-- **Put a fact in the narrowest file that always sees it.** Component detail → that component's
-  rules file. A rule spanning two components → "Cross-cutting contracts" below, since a
-  `paths:`-scoped file does not load when Claude works on the other side of the contract.
-- `paths:` matches the files Claude **reads**, so scope a rule to the sources it governs (and their
-  tests), not to a directory that happens to contain them.
-- One idea per line, wrapped at ~100 characters; nested bullets and headings, not run-on paragraphs
-  — a single multi-kilobyte line conflicts every open PR.
-- When adding to a component, add a **new bullet** rather than extending an existing one.
-- **Document current behavior, not its history.** State the rule and the one-line reason it must not
-  be undone — don't narrate the bug it replaced, retell the symptom, or make the same point twice. A
-  decision that supersedes an old one **replaces** that text; it does not append beside it.
-- **Cut narration, keep invariants.** Anything derivable by reading the code (call sequences, field
-  lists, feature tours) does not belong here. What belongs: pitfalls, rationale, and rules that a
-  reasonable change would otherwise undo. Keep `Tests:` pointers to file + test-name.
+- **Every one MUST stay under 40,000 characters** — Claude Code's own threshold, above which adherence
+  drops. **CI enforces it** (`Instruction file size limits` in `code-scan.yml`). Check with `wc -m`
+  (`-m`, not `-c` — these files are full of multibyte glyphs). There is **no truncation cliff**;
+  the cost is context tokens and weaker adherence. Do not restore a "truncation limit" claim.
+- **When a file nears the ceiling, split it by path** — never raise the number.
+- **Put a fact in the narrowest file that always sees it.** Component detail → that component's rules
+  file. A rule spanning two components → "Cross-cutting contracts" below, since a `paths:`-scoped file
+  does not load on the other side of the contract.
+- **Settled decision NARRATIVE belongs in `docs/`, not here** — rationale, alternatives considered,
+  spike history, open questions. `docs/dsh-adr.md` and `docs/qwen-adr.md` are the pattern. Rules files
+  carry the operative rule and point there for *why*.
+- `paths:` matches the files Claude **reads**, so scope a rule to the sources it governs and their
+  tests, not a directory that merely contains them.
+- One idea per line, ~100 chars; nested bullets, not run-on paragraphs. Add a **new bullet** rather
+  than extending an existing one.
+- **Document current behavior, not its history.** State the rule and a short reason it must not be
+  undone. A decision that supersedes an old one **replaces** that text. Keep `Tests:` pointers.
 
 ## What This Repo Is
 
-Turma is the source and CI for the Claude Code agent fleet used with the TrueNAS-based home lab: a
-**one-native-agent-per-host** process that scans a git root and multiplexes many worktree-backed
-Claude Code Remote Control sessions, plus a central dashboard ("turma") that lists each host's
-repos, spawns/kills those sessions, and monitors them.
+Source and CI for the Claude Code agent fleet: a **one-native-agent-per-host** process that scans a
+git root and multiplexes many worktree-backed Claude Code Remote Control sessions, plus a central
+dashboard ("turma") that lists each host's repos, spawns/kills those sessions, and monitors them.
 
-The agent runs **natively** on each host (systemd + a shipped tarball, see `.claude/rules/agent-native.md`);
-the repo no longer builds an agent container. It builds ONE image — the hub — and pushes it to GHCR;
-the hub runs on `k8x` from **xerktech/ArgoCD** (`ai/turma/`), which a release updates itself — see
-Deployment below.
+The agent runs **natively** on each host (systemd + tarball, `agent-native.md`); no agent container.
+One image is built — the hub — pushed to GHCR and run on `k8x` from **xerktech/ArgoCD** (`ai/turma/`).
 
 ## Session Model
 
-One native agent per host, multiplexing sessions across every repo it scans. What follows is the
-part that spans components; the agent-side runtime behind it — launch flags, repos-root sessions,
-the session queue, kill/resume/delete — is in `.claude/rules/agent-sessions.md`.
+One native agent per host, multiplexing sessions across every repo it scans. Agent-side runtime
+(launch flags, repos-root sessions, queue, kill/resume/delete) is in `agent-sessions.md`.
 
 ### Hosts, repos, spawning
 
-- Mounted at a git root (`REPOS_ROOT`), scanned one level deep for git repos, plus a **repos-root
-  pseudo-repo** (`ROOT_REPO_NAME`, "⌂ Repos root").
-- A **session** is backed by a randomly-named git worktree (dir keyed on the session `<id>`) under
-  `REPOS_ROOT/.turma/worktrees`, checked out **detached HEAD** off the latest default branch
-  (`origin/HEAD` → main → master), best-effort fetched; the composer can override the base.
-- **The app creates no branch of its own.** The running agent creates and names its own branch when
-  ready; that live branch (read from the worktree's git HEAD) shows on the session card, "detached"
-  until then. A ticket session is told its branch NAME but still cuts it itself, so the worktree
-  stays detached.
-- Each session runs its own `claude --remote-control` in its own tmux (`agent-<id>`) + loopback
-  ttyd. Many run concurrently (up to `MAX_SESSIONS`), several per repo via separate worktrees, each
-  registering in claude.ai/code as `<host>-<repo>-<worktree-or-label>`.
+- Mounted at a git root (`REPOS_ROOT`), scanned one level deep, plus a **repos-root pseudo-repo**
+  (`ROOT_REPO_NAME`, "⌂ Repos root").
+- A **session** is a randomly-named git worktree under `REPOS_ROOT/.turma/worktrees`, checked out
+  **detached HEAD** off the latest default branch (`origin/HEAD` → main → master), best-effort
+  fetched; the composer can override the base.
+- **The app creates no branch of its own.** The running agent names its own branch when ready; that
+  live branch (read from the worktree's git HEAD) shows on the card, "detached" until then. A ticket
+  session is told its branch NAME but still cuts it itself, so the worktree stays detached.
+- Each session runs `claude --remote-control` in its own tmux (`agent-<id>`) + loopback ttyd, up to
+  `MAX_SESSIONS`, registering as `<host>-<repo>-<worktree-or-label>`.
 - All spawn options are validated agent-side (allowlisted base refs, fixed model/permission enums),
   so nothing free-form reaches the shell. The worktree dir and `agent-<id>` tmux are the canonical
-  internal keys; a label is presentational only.
+  keys; a label is presentational.
 
 ### The hub's ticket queue (XERK-296)
 
 - **Work waiting for a slot is a QUEUED TICKET on the hub, never a created session on a host**, and
-  **its host is chosen at DISPATCH** — so whichever of an org's agents frees a slot first takes the
-  oldest waiting ticket. A queued ticket has no session id, no worktree and no host.
+  **its host is chosen at DISPATCH** — whichever agent frees a slot first takes the oldest ticket. A
+  queued ticket has no session id, worktree or host.
 - It rides `/api/agents` as top-level `ticketQueue` + its own SSE event, the ONLY place a waiting
   ticket exists; `DELETE /api/jira/<siteKey>/<issueKey>/session` cancels one and can never touch a
-  running session. Mechanics and the routing rules are in `.claude/rules/turma-ticket-queue.md`.
+  running session. Mechanics: `turma-ticket-queue.md`.
 
 ### Which transcript is a session's
 
-- Every launch **pins claude's session id** — `--session-id <uuid4>` minted in `_launch_tmux`, or
-  the `--resume` id for a rejoined one — persisted as `claudeSessionId`, so a session's conversation
-  is `<claudeSessionId>.jsonl` under its cwd's project slug, known by name before its first byte.
-- `_session_transcript_path()` is the one resolver every surface goes through; the hub heartbeats
-  the id so `tunnel-agent.js`'s live tail agrees. **Never go back to a newest-mtime rule** (XERK-6):
-  a root session's dir holds every root session's transcript, so the newest is the PREVIOUS
-  session's until the new claude writes.
+- Every launch **pins claude's session id** — `--session-id <uuid4>` in `_launch_tmux`, or the
+  `--resume` id — persisted as `claudeSessionId`, so the conversation is `<claudeSessionId>.jsonl`
+  under its cwd's project slug, known by name before its first byte.
+- `_session_transcript_path()` is the one resolver every surface goes through; the hub heartbeats the
+  id so `tunnel-agent.js`'s live tail agrees. **Never go back to a newest-mtime rule** (XERK-6): a
+  root session's dir holds every root session's transcript, so the newest is the PREVIOUS session's.
 - **A pinned session with no transcript on disk resolves to nothing.** Never add a newest-mtime
-  fallback — an empty conversation before the first turn is the truth. A session launched by an
-  agent predating the pin carries no id and keeps the newest-mtime rule.
+  fallback — an empty conversation before the first turn is the truth. A session from an agent
+  predating the pin carries no id and keeps the newest-mtime rule.
 - A watch is sent once and held, so `rearmMovedWatches` re-sends it when a watched session's
   `transcriptId` moves. Only "Restart (clear context)" moves it; without the re-arm that session's
   chat freezes on the pre-restart conversation.
 - Two things stay slug-keyed, sharing one identity across a root session's neighbours: archival's
-  `_running_slugs` exclusion and the summary/date an archived transcript inherits
-  (`_session_meta_by_slug`).
-- Tests: `TestRootSessionIsolation`, `sessionTranscript` in `tunnel-agent.test.js`,
-  `server.test.js`.
+  `_running_slugs` exclusion and the summary/date an archived transcript inherits.
+- Tests: `TestRootSessionIsolation`, `sessionTranscript` in `tunnel-agent.test.js`, `server.test.js`.
 
 ### Migrating a session to another agent (XERK-101)
 
-- **Move a running session to another agent in the SAME org.** The conversation moves; committed
+- **Moves a running session to another agent in the SAME org.** The conversation moves; committed
   work rides git; uncommitted work stays on the source (KILLED, so resumable).
 - The hub can't touch a worktree and agents are outbound-only, so a migration is composed hub-side
   from agent commands + a hub-brokered relay of the **RAW transcript bytes** (what `claude --resume`
-  needs and the archive lacks): `exportSession` packs the transcript (+ `subagents/`, truncated to
-  its last complete line) and POSTs the gzip-tar to `POST /api/agents/<host>/migrations/<id>/blob`,
+  needs and the archive lacks): `exportSession` packs the transcript (+ `subagents/`, truncated to its
+  last complete line) and POSTs the gzip-tar to `POST /api/agents/<host>/migrations/<id>/blob`,
   queueing `importSession` on the target (recording `importCmdId`); the target reporting up
   (`spawnCmdId` == `importCmdId`) makes `advanceMigrations` KILL the source and finish.
-- Hosts may mount `REPOS_ROOT` at DIFFERENT paths, so `import_session` first
+- **Hosts may mount `REPOS_ROOT` at DIFFERENT paths**, so `import_session` first
   `_localize_migrated_cwd`s the source's worktree path onto THIS host's `REPOS_ROOT` (the
-  `.turma/worktrees/<repo>/<dir>` tail is mount-independent) — both the unpack slug and the
-  re-created worktree use that local cwd, and without the remap a cross-mount move wedges in
-  `importing` forever.
+  `.turma/worktrees/<repo>/<dir>` tail is mount-independent). Without the remap a cross-mount move
+  wedges in `importing` forever.
 - The tar extract guards against `..`/absolute members — untrusted, it crosses a host boundary.
-- **A migrated session keeps its PR chips**, re-derived from the transcript rather than carried in
-  the command: the per-beat scan PRIMES a resumed transcript's byte offset to EOF, so `gh pr create`
-  events sit past it. `_resume_at_cwd` (shared with `resume_transcript`) calls `_seed_prs` once at
-  launch to scan the whole transcript, keyed by the PRESERVED transcript id. Idempotent.
+- **A migrated session keeps its PR chips**, re-derived from the transcript rather than carried in the
+  command: the per-beat scan PRIMES a resumed transcript's byte offset to EOF, so `gh pr create`
+  events sit past it. `_resume_at_cwd` calls `_seed_prs` once at launch to scan the whole transcript,
+  keyed by the PRESERVED transcript id. Idempotent.
 - Blob relay is agent-authed; `POST .../sessions/<id>/migrate {host}` validates same-org + online +
   repo-cloned + running/non-root/has-conversation, single-flight per session. State is in-memory; a
   hub restart mid-move aborts it, leaving the source intact. **The target must already have the repo
   cloned** (v1).
 - **The bundle NEVER rides in the hub's heap** (XERK-263): the relay spools it to `MIGRATE_SPOOL_DIR`
-  (`/data/migrations`) and streams it back out, so a 65 MiB move costs a hub capped at 256 MiB a
-  buffer rather than a quarter of its memory. The record keeps only the path/size; every settle,
-  timeout and failure unlinks it, and boot sweeps the dir (nothing there outlives a restart usefully).
-  `MIGRATE_INFLIGHT_MAX` bounds the disk that burst can hold — refused where a move STARTS, since the
-  agent's upload is best-effort with no retry and refusing THAT strands the migration.
+  (`/data/migrations`) and streams it out; the record keeps only path/size. Every settle, timeout and
+  failure unlinks it, and boot sweeps the dir. `MIGRATE_INFLIGHT_MAX` bounds that burst — refused
+  where a move STARTS, since the agent's upload is best-effort with no retry.
 - Tests: `TestMigrateSession`, `server.test.js`, the Move cases in `sessions.test.js`,
   `eligibleMoveTargets` in android `SessionsTest`.
 
 ### A refused session start is REPORTED, never just logged (XERK-265)
 
-- **A command is ACKed whether the agent ran it or declined it**, so a refusal the agent only
-  `log()`s is indistinguishable from a slow spawn: the move sat in `importing` until
-  `MIGRATE_TIMEOUT_MS` and failed with no reason, and the Sessions page spun out `SPAWN_FOLLOW_MS`.
-- Every refusal in `_resume_at_cwd`, `import_session` and `export_session` therefore goes through
-  **`_refuse_start`**, staging `{cmdId, migrationId, error}` onto the beat's **`spawnFailures`** with
-  the same held-across-a-failed-POST lifecycle as `ticketStatusResults`. The `error` is
-  operator-facing — it is what the UI and the migration record show.
+- **A command is ACKed whether the agent ran it or declined it**, so a refusal the agent only `log()`s
+  is indistinguishable from a slow spawn — the move sits in `importing` until `MIGRATE_TIMEOUT_MS`
+  with no reason.
+- Every refusal in `_resume_at_cwd`, `import_session` and `export_session` goes through
+  **`_refuse_start`**, staging `{cmdId, migrationId, error}` onto the beat's **`spawnFailures`**. The
+  `error` is operator-facing — it is what the UI and the migration record show.
 - Hub-side `ingestSpawnFailures` caches it per cmdId as **`spawnRefusals`** (served with the record,
-  NOT stripped like the other caches — the client following that spawn is who needs it) and stamps
-  `m.refusal`, which `advanceMigrations` applies **after** its handoff check, so a success always
-  wins the tie. Absent = "that agent can't tell", i.e. the old timeout wait, on both halves. The
-  Sessions page mirrors that order: the session lookup runs first and clears `pendingSpawn`.
+  NOT stripped like the other caches) and stamps `m.refusal`, which `advanceMigrations` applies
+  **after** its handoff check, so a success always wins the tie. Absent = "that agent can't tell",
+  i.e. the old timeout wait. The Sessions page mirrors that order: the session lookup runs first and
+  clears `pendingSpawn`.
 - **Both handles are checked against what the HUB knows, never taken on the agent's word** — the
-  migrationId against that move's own src/target, the cmdId against the queue that host was actually
-  given. All agents share one token, so unchecked either one lets any host fail another host's move
-  or end its spawn wait with arbitrary text.
-- **The reason is length-capped at both ends** (agent `SPAWN_FAILURE_REASON_MAX`, hub
-  `SPAWN_FAILURE_ERROR_MAX`). It interpolates exception text, and `spawnRefusals` is the first
-  served cache that `agentRecordSize` COUNTS while the ceiling check runs BEFORE the ingest: one
-  unbounded reason lands, pushes the record past `AGENT_RECORD_MAX`, and then 413s every later beat
-  from that host — including the ones that would have swept it (XERK-235's failure class).
+  migrationId against that move's own src/target, the cmdId against the queue that host was given.
+  All agents share one token, so unchecked either one lets any host fail another host's move.
+- **The reason is length-capped at both ends** (`SPAWN_FAILURE_REASON_MAX`, `SPAWN_FAILURE_ERROR_MAX`).
+  It interpolates exception text, and `spawnRefusals` is counted by `agentRecordSize` while the
+  ceiling check runs BEFORE the ingest: one unbounded reason lands, pushes the record past
+  `AGENT_RECORD_MAX`, then 413s every later beat from that host — including the sweeps.
 - A refusal with neither handle stays a log line: the id being rejected IS the correlation.
-- **Every refusal on a session-creating path is expected to go through it**, including `resume()`'s
-  — the prune handshake (`_claim_worktree`, XERK-256) is the one this exists for, and it is ordinary
-  timing rather than operator error. A new refusal that only `log()`s re-opens the bug.
+- **Every refusal on a session-creating path must go through it**, including `resume()`'s — the prune
+  handshake (`_claim_worktree`, XERK-256) is ordinary timing, not operator error.
 
 ## Cross-cutting contracts
 
 Rules spanning more than one component, so no `paths:`-scoped file can carry them alone.
 
-- **Web UI ⇄ Android parity (XERK-30).** The mobile web UI (`turma/public/`) is the source of truth;
-  the Android app must match it. **A PR that changes user-facing behavior in `turma/public/` must
-  carry the matching change to `android/` in the same PR** — or, if out of scope, add a line to
-  `android/PARITY.md` and say so in the PR. An unlisted, unmentioned divergence is what this rule
-  exists to stop. "User-facing" = a control, screen, state, chip, interaction, or layout a person
-  sees or touches; pure server/agent plumbing is exempt. Page → screen map in
-  `.claude/rules/android.md`.
+- **Web UI ⇄ Android parity (XERK-30).** `turma/public/` is the source of truth; Android must match.
+  **A PR changing user-facing behavior in `turma/public/` must carry the matching `android/` change in
+  the same PR** — or add a line to `android/PARITY.md` and say so in the PR. "User-facing" = a
+  control, screen, state, chip, interaction or layout a person sees or touches; pure server/agent
+  plumbing is exempt. Page → screen map in `android.md`. `PARITY.md` is the living gap tracker.
 - **A background-agent row's `subagentHistory` reply means "a list" by the PRESENCE of `agents`, the
   empty list included** (XERK-304). A `Workflow` row is N agents with no conversation of its own, so
-  it answers with that run's agent picker and only a second request naming one of those ids returns
-  a transcript. Empty = "this run has started nothing yet"; **absent = the row did not resolve**, and
-  a client must word those two differently rather than collapsing them. It spans `hub-agent.py`,
-  `turma/server.js`, `turma/public/sessions.html` and `android/`, so no `paths:`-scoped file sees
-  every side of it. Mechanics in `.claude/rules/agent-workflows.md` and `.claude/rules/turma-sessions.md`.
-- **Token usage OUTLIVES the host that spent it** (XERK-338). The hub keeps a durable per-host
-  ledger on `/data` — a per-UTC-day high-water mark, since a report can only under-state a past day
-  — and serves what a host it no longer has spent as a top-level **`retiredUsage`** on
-  `/api/agents`; a live host that has lost transcripts is served the recorded history raised by its
-  own report. It spans `turma/usage-ledger.js`, `turma/server.js`, `turma/public/usage.html` and
-  `android/`, so no `paths:`-scoped file sees every side of it.
-  - **`retired` is HUB-OWNED and coerced off every heartbeat** (`normalizeRetired`). Android TYPES it,
-    and a full `/api/agents` decode is atomic there, so an agent putting `retired:"yes"` on its own
-    beat emptied every OTHER host from every phone's fleet list — and it persisted into `state.json`.
-    Typing a field on `AgentInfo` and adding its hub-side coercion are the SAME change.
-  - **`retiredUsage` is read by the surfaces that COUNT SPEND, and by no other** — the Usage
-    page/screen and the dashboard's three TOKEN TILES (`fleetSummary(agents, retired)` on android),
-    which say `incl. removed hosts` when they do. Its entries are agent-SHAPED so those surfaces
-    chart them with the code they already have, but they carry no sessions, repos or commands, so
-    anything treating one as a HOST — the cards, the online count, the session ceiling — invents a
-    host that does not exist. Counting spend on one surface and not the other is what made the front
-    page disagree with `/usage` after a busy host was removed.
-  - **Retired spend is org-scoped off the LIVE fleet's orgs**, on every surface — org.js builds its
-    key set from `data.agents` and applies it to whatever list it is handed, and android's
-    `scopedRetired(retired, live, stored)` mirrors that. Scoping the retired list against ITSELF
-    (`scopedAgents(retiredUsage, org)`) is a different rule that adds other orgs' removed spend to a
-    scoped total, and nothing in the types catches it — both sides are `List<AgentInfo>`.
-  - **Removing a host is not a purge**: `DELETE /api/agents/<host>` keeps the spend, `?usage=purge`
-    is the deliberate second step. Never make a removal imply one.
-  - The archive does NOT already hold this. It stores displayable entries and no token counts, never
-    sees a live session, and excludes background-agent transcripts. Mechanics in
-    `.claude/rules/turma-usage.md`.
+  it answers with that run's agent picker; a second request naming one of those ids returns a
+  transcript. Empty = "started nothing yet"; **absent = the row did not resolve** — word those
+  differently, never collapse them. Spans `hub-agent.py`, `server.js`, `sessions.html`, `android/`.
+- **Token usage OUTLIVES the host that spent it** (XERK-338). The hub keeps a durable per-host ledger
+  on `/data` — a per-UTC-day high-water mark, since a report can only under-state a past day — and
+  serves a removed host's spend as top-level **`retiredUsage`** on `/api/agents`; a live host that
+  lost transcripts is served its recorded history raised by its own report.
+  - **`retired` is HUB-OWNED and coerced off every heartbeat** (`normalizeRetired`). Android TYPES it
+    and a full `/api/agents` decode is atomic there, so an agent asserting `retired:"yes"` empties
+    every OTHER host from every phone's fleet list, and it persists into `state.json`. **Typing a
+    field on `AgentInfo` and adding its hub-side coercion are the SAME change.**
+  - **`retiredUsage` is read by the surfaces that COUNT SPEND and no other** — the Usage page/screen
+    and the dashboard's three TOKEN TILES (`fleetSummary(agents, retired)`), which say
+    `incl. removed hosts` when they do. Entries are agent-SHAPED so those surfaces chart them with
+    existing code, but they carry no sessions, repos or commands — anything treating one as a HOST
+    (cards, online count, session ceiling) invents a host that does not exist.
+  - **Retired spend is org-scoped off the LIVE fleet's orgs**, on every surface: org.js builds its key
+    set from `data.agents` and applies it to whatever list it is handed; android's
+    `scopedRetired(retired, live, stored)` mirrors that. **Never scope the retired list against
+    ITSELF** (`scopedAgents(retiredUsage, org)`) — that adds other orgs' removed spend to a scoped
+    total, and nothing in the types catches it (both sides are `List<AgentInfo>`).
+  - **Removing a host is not a purge**: `DELETE /api/agents/<host>` keeps the spend; `?usage=purge` is
+    the deliberate second step. Never make a removal imply one.
+  - The archive does NOT already hold this — it stores displayable entries, no token counts, never
+    sees a live session, and excludes background-agent transcripts. Mechanics: `turma-usage.md`.
 - **The peer roster IS the org boundary for cross-session messaging** (XERK-348). Claude Code's own
-  control is per-MACHINE (`isolatePeerMachines`) and a Turma org spans hosts, so no setting
-  expresses the rule: instead the agent denies `ListAgents` — which removes the tool, leaving a
-  session unable to ENUMERATE anyone — and the hub's **`orgPeers`** puts the same-org sessions on
-  every heartbeat reply, which the agent renders to `~/.turma/peers.tsv`. It spans
-  `turma/server.js` and `agent/hub-agent.py`, so no `paths:`-scoped file sees both halves.
-  - **The roster removes DISCOVERY, not delivery.** `SendMessage` resolves any string, and an
-    `rcName` is `<host>-<repo>-<TICKET-KEY>`, so a session can still guess one. Never write this up
-    as "a session can only name what the hub sent" — it is not true and it hides the residual risk.
+  control is per-MACHINE and a Turma org spans hosts, so the agent denies `ListAgents` (removing the
+  tool, so a session cannot ENUMERATE anyone) and the hub's **`orgPeers`** puts same-org sessions on
+  every heartbeat reply, which the agent renders to `~/.turma/peers.tsv`.
+  - **The roster removes DISCOVERY, not delivery.** `SendMessage` resolves any string and an `rcName`
+    is `<host>-<repo>-<TICKET-KEY>`, so a session can still guess one. Never write this up as "a
+    session can only name what the hub sent" — it hides the residual risk.
   - **The org is the one the hub BOUND the host to, never the one the host claims** (`orgBound`,
-    trust-on-first-use). `jira.siteKey` is agent-asserted, so gating on it let any host's token
-    join any org and read its whole roster — exposure no agent credential had, since `/api/agents`
-    refuses one. Same objection XERK-268 makes to a self-asserted `<host>`. The binding is
-    hub-owned; assignment/persistence mechanics are in `.claude/rules/turma.md`.
+    trust-on-first-use). `jira.siteKey` is agent-asserted, so gating on it lets any host's token join
+    any org and read its roster. The binding is hub-owned; mechanics in `turma.md`.
   - **Drift is declaring a DIFFERENT org, never failing to declare one** — a host whose tracker goes
     quiet keeps its binding and its peers.
   - **The binding gates the peer roster and NOTHING else.** The MIGRATION route still compares the
-    claimed org, unchanged. Two attempts to bind-gate it were reverted: **no client can mirror a
-    rule keyed on `orgBound`** (it is stripped from the served payload, so `eligibleMoveTargets` and
-    its Android and glasses twins see only `jira.siteKey`), so the hub and every Move menu
-    disagreed. Don't retry it without serving the decided org to the clients — that is **XERK-349**,
-    which also carries the pre-existing hole it would close: two hosts that both declare NO org
-    match each other whatever they are bound to. Mechanics in `.claude/rules/turma.md`.
-  - **Every roster cell is capped on the wire** (`PEER_CELL_MAX`), not just the free-text one.
-    Nothing bounds `rcName` in the normalizers and the spawn route takes a 100k `label`, so
-    capping one field of six built a 23.8 MB reply that OOM-killed a hub in a real 256 MiB cgroup.
+    claimed org. **Do not bind-gate it**: `orgBound` is stripped from the served payload, so no client
+    can mirror a rule keyed on it and the hub and every Move menu disagree. Reverted twice. Serving
+    the decided org to clients is **XERK-349**, which also carries the pre-existing hole: two hosts
+    that both declare NO org match each other whatever they are bound to.
+  - **Every roster cell is capped on the wire** (`PEER_CELL_MAX`), not just the free-text one —
+    nothing else bounds `rcName`, and the spawn route takes a 100k `label`.
   - **Both sides fail NARROW.** No `peers` on a reply forgets the roster; a silent hub expires it;
-    either way the agent falls back to its OWN host's sessions, which are same-org by construction
-    because a host polls one org. Never add a path that keeps a wide roster nothing vouches for.
+    either way the agent falls back to its OWN host's sessions, same-org by construction. Never add a
+    path that keeps a wide roster nothing vouches for.
   - **It is a strong soft boundary, not an airtight one.** `crossSessionInbound` has no per-sender
-    filter (accept/hold/refuse only), so an off-org session sharing the Claude login can still
-    DELIVER into a session — it just can't discover one. **One Claude login per org is the only
-    hard boundary**, and it is a per-host deployment decision. Don't describe this contract as sealing it.
-  - Mechanics in `.claude/rules/agent-sessions.md` and `.claude/rules/agent-hooks.md`.
+    filter, so an off-org session sharing the Claude login can still DELIVER into a session — it just
+    can't discover one. **One Claude login per org is the only hard boundary**, a per-host deployment
+    decision. Don't describe this contract as sealing it.
 - **Nothing on the agent's BEAT LOOP may have a worst case at or above the hub's `OFFLINE_AFTER_MS`**
-  (XERK-395). The hub calls a host offline after 75s of silence (`turma/server.js`); what sets the
-  gap between two beats is the AGENT's own timeouts and retry counts, so neither side's
-  `paths:`-scoped file sees both halves. Archive sync broke it — `ARCHIVE_CHUNK_TIMEOUT_SEC` +
-  `ARCHIVE_RAW_FAILURES_MAX` x `ARCHIVE_RAW_TIMEOUT_SEC` = 105s of pushes inline, measured on a
-  lossy link as a 111s beat gap that rendered a healthy host offline for ~36s, 8x in 2h — and moved
-  to a worker thread, as `prune` did for the same reason (XERK-256).
-  - **A try/except around slow work does not satisfy this**: it catches exceptions, never TIME,
-    which is what actually costs the host its online status. Nor does a deadline alone, while one
-    in-flight push can overshoot it by a full timeout.
+  (XERK-395). The hub calls a host offline after 75s of silence; what sets the gap between beats is
+  the AGENT's own timeouts and retry counts, so neither side's scoped file sees both halves.
+  - **A try/except does not satisfy this** — it catches exceptions, never TIME. Nor does a deadline
+    alone, while one in-flight push can overshoot it by a full timeout.
   - Inline may cost `INTERVAL` plus the beat's own POSTs (`HEARTBEAT_TIMEOUT_SEC`, twice on a cycle
-    that executed commands) — 40s of the 75s. Anything else with a network or disk worst case
-    belongs on a worker. Tests: `TestBeatLoopBudget`, `TestArchiveSyncWorker`.
-  - **It is the rule for new work, and NOT yet true everywhere** — say so rather than reading it as
-    a description. Still inline and still over: `refresh_pr_status` (`PR_STATUS_MAX` x `run()`'s 15s
-    ≈ 300s), `refresh_jira` (measured at a 20s beat gap against a blackholed site), `refresh_github`
-    — all three in `build_payload` — and `_migration_upload` under `handle_commands` (~96s).
-    XERK-397 carries them. A fix there extends `TestBeatLoopBudget` rather than adding its own pin.
+    that executed commands) — 40s of the 75s. Anything else with a network or disk worst case belongs
+    on a worker, as archive sync and `prune` (XERK-256) were moved.
+  - **It is the rule for new work, and NOT yet true everywhere** — say so rather than reading it as a
+    description. Still inline and still over: `refresh_pr_status` (`PR_STATUS_MAX` x `run()`'s 15s),
+    `refresh_jira`, `refresh_github`
+    (all in `build_payload`), and `_migration_upload` under `handle_commands`. **XERK-397** carries
+    them; a fix there extends `TestBeatLoopBudget` rather than adding its own pin.
+  - Tests: `TestBeatLoopBudget`, `TestArchiveSyncWorker`.
 - **`readyForReview` has FOUR mirrors that must agree**: `turma/public/sessions.html`,
-  `turma/server.js`, `android/…/core/Sessions.kt`, and `glasses/src/sessions.ts`. Changing the rule
-  means changing all four.
-- **"Working" is `paneBusy` OR live background agents** (XERK-245), in every mirror of the read
-  (those four plus `turma/public/index.html`). A session that delegates work ENDS ITS OWN TURN: the
-  pane drops the interrupt hint, so `paneBusy` says False while an agent it launched keeps going —
-  which read idle everywhere AND qualified as ready-for-review, buzzing the operator mid-run. The
-  session's `agents[]` is the second input; it sits BEHIND the offline and no-transcript gates,
-  exactly like `paneBusy`, and an absent field means "that agent can't tell", never "no agents".
-  **It comes from the TRANSCRIPT** (`_scan_agent_entry`: `agentId:` on launch, `<task-notification>`
-  on stop), never from the TUI's footer rows — those are forgeable pane content and linger ~24s past
-  completion, so they cannot answer "is one running right now".
-- **`turma/public/board.js` has FOUR mirrors of its column rule** (`categoryOf` /
-  `REVIEW_STATUS_RE`), and changing it means changing all four: the source, its **byte-identical
-  vendored copy** (`glasses/src/vendor/board.cjs`, asserted by `glasses`'s own `vendor.test.ts`),
-  and the two ports, `_board_column` in `hub-agent.py` and `categoryOf` in android's `core/Board.kt`.
-  The agent resolves a dropped column against its OWN read, so a drift silently refuses valid drops.
-  Tests: `TestBoardColumn`, `board.test.js`, `BoardTest.kt`.
+  `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`. Changing the rule means
+  changing all four.
+- **"Working" is `paneBusy` OR live background agents** (XERK-245), in every mirror of the read (those
+  four plus `turma/public/index.html`). A session that delegates work ENDS ITS OWN TURN: the pane
+  drops the interrupt hint, so `paneBusy` says False while an agent it launched keeps going — which
+  reads idle everywhere AND qualifies as ready-for-review. The session's `agents[]` is the second
+  input; it sits BEHIND the offline and no-transcript gates like `paneBusy`, and an absent field means
+  "that agent can't tell", never "no agents". **It comes from the TRANSCRIPT** (`_scan_agent_entry`:
+  `agentId:` on launch, `<task-notification>` on stop), **never from the TUI's footer rows** — those
+  are forgeable pane content and linger ~24s past completion.
+- **`turma/public/board.js` has FOUR mirrors of its column rule** (`categoryOf` / `REVIEW_STATUS_RE`):
+  the source, its **byte-identical vendored copy** (`glasses/src/vendor/board.cjs`, asserted by
+  `vendor.test.ts`), and the two ports — `_board_column` in `hub-agent.py` and `categoryOf` in
+  android's `core/Board.kt`. The agent resolves a dropped column against its OWN read, so drift
+  silently refuses valid drops. Tests: `TestBoardColumn`, `board.test.js`, `BoardTest.kt`.
 - **`hub-agent.py` ↔ `tunnel-agent.js` are a parity contract** for everything both parse:
   `_entry_blocks`/`entryBlocks`, `_entry_text`, `transcript_tail`, `_busy_from_capture`/
   `paneShowsBusy`, `_fold_queue_op`/`foldQueueOp`, `_send_user_file_detail`/`sendUserFileDetail`.
-  Both live in `agent/`; parity-tested in `tunnel-agent.test.js`.
+  Parity-tested in `tunnel-agent.test.js`.
   - **`device_name`/`deviceName` + `_usable_hostname`/`usableHostname` are on that list too.** They
-    must resolve the SAME name: `openChannel` keys `controlChannels` by it, so a tunnel and a
-    manager under different names is a host whose commands work while its terminal, live tail and
-    heartbeat poke are dead — and a ghost card `DELETE` cannot reach. The native launcher exports an
+    must resolve the SAME name: `openChannel` keys `controlChannels` by it, so a tunnel and a manager
+    under different names is a host whose commands work while its terminal, live tail and heartbeat
+    poke are dead — and a ghost card `DELETE` cannot reach. The native launcher exports an
     operator-set `DEVICE_NAME` to both processes unvalidated, so an env-path divergence is the one
     that bites. Tests: `TestDeviceName`, `usableHostname`/`deviceName` in `tunnel-agent.test.js`.
-- **The heartbeat is the wire contract** between `hub-agent.py` and `turma/server.js` (and through
-  it every client). A field older agents don't send must degrade, never break: clients gate on the
+- **The heartbeat is the wire contract** between `hub-agent.py` and `turma/server.js` (and through it
+  every client). A field older agents don't send must degrade, never break: clients gate on the
   capability flag the agent reports (`inputMaxChars`, `uploadMaxBytes`, `github.available`,
   `capacity`), and an absent flag means "that agent can't do it", not "unlimited".
   - **A full `/api/agents` decode is ATOMIC on Android**, so one host's wrong-typed field throws for
-    the whole array — the poll fails silently while the app keeps its last snapshot and the tile
-    still says "N / N online". Per-agent SSE events decode individually, so the bad host is simply
-    missing from the list while SSE is healthy; with SSE down too, the raw decoder exception
-    replaces the screen. **Most of the payload is served raw**, so this is a live hazard, not a
-    solved one: grep `normalize`/`sanitize` in `turma/server.js` for what is actually covered rather
-    than trusting a list here, which has been wrong repeatedly.
+    the whole array — the poll fails silently while the app keeps its last snapshot and the tile still
+    says "N / N online". Per-agent SSE events decode individually, so the bad host is simply missing
+    while SSE is healthy; with SSE down too, the decoder exception replaces the screen. **Most of the
+    payload is served raw**, so this is a live hazard: grep `normalize`/`sanitize` in `server.js` for
+    what is actually covered rather than trusting a list here, which has been wrong repeatedly.
   - **A field becomes decode-fatal the moment a client TYPES it** — until then `ignoreUnknownKeys`
-    skips it and any value is harmless. So typing one on `SessionInfo`/`AgentInfo` and adding its
-    hub-side coercion are the SAME change; `normalizeRecord` is where it goes, and it runs on both
-    the heartbeat ingest and the `state.json` restore (a restart is when a coercion ships, and the
-    restore is the first thing it serves). Coerce to the "can't tell you" value every client already
-    handles, never to a plausible default. A `normalize*` is a WHITELIST — a sub-key a newer agent
-    adds is dropped fleet-wide unless it is added there too.
-- **A hub refusal must reach the operator, in the hub's own words** (XERK-264). The hub refuses
-  commands with a status and a JSON `{error}` body (409 org mismatch / unsupported agent, 503 host
-  offline, 404 stale attachment, 413 too long, 429 queue full); a client that reads the body and
-  ignores `res.status` shows a refused kill/rename/spawn as one that worked.
-  - Web: `post()`/`del()` (both pages) resolve **null on a refusal, having already toasted**
-    `TurmaNav.refusalText`, and callers roll back whatever they painted optimistically on that null.
-    `TurmaNav.toast` (nav.js, `.toast` in app.css) is the ONE failure surface — nothing announces
-    success through it, so a toast on screen always means a command did not run.
-  - Android: `hubErrorMessage` reads the `{error}` off an `HttpException` **or** a typed `Response`;
+    skips it. `normalizeRecord` is where a coercion goes, and it runs on both the heartbeat ingest and
+    the `state.json` restore (a restart is when a coercion ships, and the restore is the first thing
+    it serves). Coerce to the "can't tell you" value every client already handles, never to a
+    plausible default. **A `normalize*` is a WHITELIST** — a sub-key a newer agent adds is dropped
+    fleet-wide unless added there too.
+- **A hub refusal must reach the operator, in the hub's own words** (XERK-264). The hub refuses with a
+  status and a JSON `{error}` body (409 org mismatch / unsupported agent, 503 host offline, 404 stale
+  attachment, 413 too long, 429 queue full); a client that reads the body and ignores `res.status`
+  shows a refused kill/rename/spawn as one that worked.
+  - Web: `post()`/`del()` resolve **null on a refusal, having already toasted**
+    `TurmaNav.refusalText`, and callers roll back whatever they painted optimistically.
+    `TurmaNav.toast` is the ONE failure surface — nothing announces success through it, so a toast
+    always means a command did not run.
+  - Android: `hubErrorMessage` reads `{error}` off an `HttpException` or a typed `Response`;
     `FleetViewModel.run`/`ChatViewModel.report` word the snackbar from it and drop the optimistic
-    pending row. `/history` refusals are `HistoryResult.Failed`, never `Pending` — polling can't fix
-    a refusal, and folding them together burned 60s and then said nothing.
-  - Glasses (XERK-270): `hub-client.ts`'s `refusal()` reads the body BEFORE it
-    throws, so the `HttpError` carries the hub's words — and `app.ts`'s `failureFlash` is what puts
-    them on the display. Both halves or neither: the client throwing good text is invisible while
-    every `.catch` flashes a flat "hub unreachable", which is also wrong (the hub answered, it said
-    no). `FLASH_HUB_UNREACHABLE` is now only for a failure with **no status** — a dead socket or the
-    fetch timeout. A one-line header clips a long refusal with "…" (`headerLine`); the session
-    screen wraps it whole.
+    pending row. **`/history` refusals are `HistoryResult.Failed`, never `Pending`** — polling can't
+    fix a refusal.
+  - Glasses (XERK-270): `hub-client.ts`'s `refusal()` reads the body BEFORE it throws, so the
+    `HttpError` carries the hub's words, and `app.ts`'s `failureFlash` puts them on the display. Both
+    halves or neither. `FLASH_HUB_UNREACHABLE` is only for a failure with **no status** — a dead
+    socket or fetch timeout. A one-line header clips a long refusal (`headerLine`); the session screen
+    wraps it whole.
   - All three fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
 - **An agent's HOST is proved by its credential, never by what it types** (XERK-268). Every
-  agent-authed surface names the host it acts as — the `<host>` segment, the heartbeat's `device`,
-  the tunnel's `?name=` — and each agent runs on its OWN token,
+  agent-authed surface names the host it acts as — the `<host>` segment, the heartbeat's `device`, the
+  tunnel's `?name=` — and each agent runs on its OWN token,
   `<base64url(device)>.<HMAC(TURMA_AGENT_TOKEN, device)>`, which the hub re-derives against the host
-  that was named. **The token NAMES its host on purpose**: an HMAC can't be inverted, so a bare
-  digest could only be checked once the host was known, and `/api/heartbeat` — whose host is buried
-  in a 32 MiB body — would have had to admit any bearer before reading it.
+  that was named. **The token NAMES its host on purpose**: an HMAC can't be inverted, so a bare digest
+  could only be checked once the host was known, and `/api/heartbeat` — whose host is buried in a
+  32 MiB body — would have had to admit any bearer before reading it.
   - **Scoping a route to a host is not a security check on its own.** Under one fleet-shared token
     `<host>` was self-asserted, so `m.srcHost !== host` refused a caller naming ITSELF and passed one
-    naming the victim; `device` was the same, so any token-holder could beat as another host and be
-    handed the commands queued for it. Both halves — the scope AND the binding — or neither is worth
-    stating. Never write a comment claiming a `<host>` compare keeps one agent out of another's data
-    without checking the credential is bound.
+    naming the victim. Both halves — the scope AND the binding — or neither is worth stating. Never
+    write a comment claiming a `<host>` compare keeps one agent out of another's data without
+    checking the credential is bound.
   - That is also why a **per-relay one-time secret is not the fix** and must not be re-proposed: it
     would ride on exactly the commands an impersonated heartbeat hands out.
   - The master still authenticates as `legacy` so a fleet mid-rollover keeps beating;
     **`TURMA_AGENT_STRICT` retires it**, and the hub warns at boot until it is set. Detail in
-    `.claude/rules/turma.md`; the agent needs no code change, only the right `TURMA_TOKEN`.
-- **The hub's memory ceilings are FRACTIONS OF ITS CONTAINER LIMIT, never fixed numbers**
-  (XERK-258, XERK-273). It runs at `mem_limit: 256m`, so a flat constant larger than that can never
-  refuse anything before the OOM killer fires — which is how a flat 128 MiB upload ceiling and an
-  unbounded socket count each killed the fleet's whole control plane, `restart: unless-stopped`
-  looping the outage. `containerMemoryLimit()` reads the cgroup; everything derives from it and is
-  logged at boot. Raising the hub's `mem_limit` in its ArgoCD deployment widens them with no code change. The mechanics
-  are in `.claude/rules/turma-limits.md`; what spans components is here:
+    `turma.md`; the agent needs no code change, only the right `TURMA_TOKEN`.
+- **The hub's memory ceilings are FRACTIONS OF ITS CONTAINER LIMIT, never fixed numbers** (XERK-258,
+  XERK-273). It runs at `mem_limit: 256m`, so a flat constant larger than that can never refuse
+  anything before the OOM killer fires. `containerMemoryLimit()` reads the cgroup; everything derives
+  from it and is logged at boot. Raising `mem_limit` widens them with no code change. Mechanics:
+  `turma-limits.md`. What spans components:
   - **413 and 503 mean opposite things and must not be collapsed**: 413 is "your body is too big,
-    send less", 503 is "the hub is momentarily full, send it again". Every `readRawBody` caller has
-    to draw the distinction itself — both did answer a flat 413 once. On a 503 the migration relay
-    HOLDS the migration in `exporting`, and `_migration_upload` retries (5xx only, never 4xx);
-    nothing else would, and a lost bundle strands the move.
+    send less", 503 is "the hub is momentarily full, send it again". Every `readRawBody` caller must
+    draw the distinction itself. On a 503 the migration relay HOLDS the migration in `exporting` and
+    `_migration_upload` retries (5xx only, never 4xx); nothing else would, and a lost bundle strands
+    the move.
   - **An OVERSIZE body is deliberately NOT refused on its declaration.** Refusing early makes Node
-    close the connection under a request still being written, and a client that writes before
-    reading — python urllib, which is what `hub-agent.py` posts with — loses the response and sees a
-    socket error. That is exactly XERK-235's offline loop, so this is an agent-facing contract, not
-    a hub detail: test agent refusals with urllib, never with fetch.
-  - **Known gap (XERK-287): held UPLOADS are a budget of their own, outside the in-flight ceiling**,
-    so the true worst case is `in-flight + uploads` — 192 MiB of a 256 MiB container — and the flood
-    row OOMs once attachments are staged beside it. Closing it is a sizing decision with
-    user-visible cost (the upload relay, `HEARTBEAT_MAX`, or `mem_limit`), not a code fix.
-- **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
-  the living gap tracker, updated whenever a gap closes or knowingly opens.
+    close the connection under a request still being written, and a client that writes before reading
+    — python urllib, which is what `hub-agent.py` posts with — loses the response and sees a socket
+    error (XERK-235's offline loop). **Test agent refusals with urllib, never with fetch.**
+  - **Known gap (XERK-287): held UPLOADS are a budget of their own, outside the in-flight ceiling**, so
+    the true worst case is `in-flight + uploads` — 192 MiB of a 256 MiB container. Closing it is a
+    sizing decision with user-visible cost, not a code fix.
 
 ## Conventions
 
-### Credentials
-
-- All credentials are inline in environment variables (no Docker secrets mechanism): the agent's in
-  its per-host `agent/native/turma-agent.env`, the hub's in its ArgoCD deployment — never here.
-
-### Agent-side conventions, elsewhere
-
-- **Native install, run-as identity and the updater** — `.claude/rules/agent-native.md`.
-- **How a session runs**, the **new-work branching directive** and **local-model failover** —
-  `.claude/rules/agent-sessions.md`.
-- **The safety guard** — what it denies and why, and the `--settings` file every launch passes —
-  `.claude/rules/agent-hooks.md`.
+- All credentials are inline in environment variables (no Docker secrets): the agent's in its per-host
+  `agent/native/turma-agent.env`, the hub's in its ArgoCD deployment — never here.
+- Native install, run-as identity, updater → `agent-native.md`. Session runtime, new-work branching
+  directive, local-model failover → `agent-sessions.md`. Safety guard and the `--settings` file every
+  launch passes → `agent-hooks.md`.
 
 ## Deployment (mostly not here)
 
-- **The agent runs NATIVELY on each host** — a shipped tarball + systemd unit, installed and
-  self-updated by `agent/native/` (`install.sh`, `turma-agent`, `turma-agent-update`). Per-host
-  config lives in `agent/native/turma-agent.env`: `REPOS_ROOT`, `MAX_SESSIONS`/`TTYD_PORT_BASE`,
-  that host's OWN `TURMA_TOKEN` (`node turma/server.js --agent-token <device>` against the hub's
-  master `TURMA_AGENT_TOKEN`; `TURMA_AGENT_STRICT` on the hub once every host has one — see XERK-268
-  in the contracts above), and the push service-account. No pricing/cost env — usage is counted in
-  tokens per model, so there is no rate table. Mechanics in `.claude/rules/agent-native.md`.
-- **The HUB runs on `k8x` from xerktech/ArgoCD (`ai/turma/`) as the `turma` image, and a release
-  DEPLOYS it** (XERK-425): the last step of `build-turma-image` rewrites that manifest's image tag to
-  the build it just pushed, and the Application is `automated`, so merging hub code to main is what
-  puts it in production. It needs the `ARGOCD_DEPLOY_KEY` secret (a write deploy key on that repo,
-  not a PAT) and fails loudly without it; detail in `.claude/rules/release.md`.
-- Adding a host is a native install on that host; the hub is the only container this repo ships.
-- The hub's `/data` volume holds `state.json` AND the durable session archive, so it must be a
-  persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`.
-  - The archive holds **two layers**: the rendered entries every Turma surface reads, and a
-    byte-for-byte copy of each session's own files beside it (XERK-338) — roughly 5-10x the bytes,
-    and the only place anything Turma does not render today survives the host.
-  - **Three things share that volume's SPACE**, and each is bounded separately: the archive (both
-    layers, one ceiling) by `ARCHIVE_TOTAL_MAX_BYTES` (`.claude/rules/turma-archive.md`), the migration spool
-    (`MIGRATE_SPOOL_DIR`, transient by design) by `MIGRATE_INFLIGHT_MAX`, and `state.json` by
-    nothing at all — which is why the other two have ceilings. No compose change: all default
-    under `/data`.
+- **The agent runs NATIVELY on each host** — tarball + systemd, installed and self-updated by
+  `agent/native/`. Per-host config in `agent/native/turma-agent.env`: `REPOS_ROOT`,
+  `MAX_SESSIONS`/`TTYD_PORT_BASE`, that host's OWN `TURMA_TOKEN` (`node turma/server.js --agent-token
+  <device>`; set `TURMA_AGENT_STRICT` on the hub once every host has one), and the push
+  service-account. No pricing/cost env — usage is counted in tokens per model.
+- **The HUB runs on `k8x` from xerktech/ArgoCD (`ai/turma/`), and a release DEPLOYS it** (XERK-425):
+  the last step of `build-turma-image` rewrites that manifest's image tag, and the Application is
+  `automated`, so merging hub code to main puts it in production. Needs the `ARGOCD_DEPLOY_KEY` secret
+  (a write deploy key, not a PAT) and fails loudly without it. Detail: `release.md`.
+- Adding a host is a native install; the hub is the only container this repo ships.
+- The hub's `/data` volume holds `state.json` AND the durable archive, so it must be persisted
+  (`ARCHIVE_DIR`/`ARCHIVE_DB` override).
+  - The archive holds **two layers**: the rendered entries every surface reads, and a byte-for-byte
+    copy of each session's own files (XERK-338) — roughly 5-10x the bytes, and the only place anything
+    Turma does not render survives the host.
+  - **Three things share that volume's SPACE**, each bounded separately: the archive (both layers, one
+    ceiling) by `ARCHIVE_TOTAL_MAX_BYTES` (`turma-archive.md`), the migration spool by
+    `MIGRATE_INFLIGHT_MAX`, and `state.json` by nothing — which is why the other two have ceilings.
   - `ARCHIVE_TRANSCRIPT_MAX_BYTES` bounds one transcript's rendered entries and
-    `ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES` its raw copy, rather than the store. Neither archive
-    ceiling counts `index.db`, which lives on the same volume and is unbounded across fill/wipe
-    cycles (XERK-332) — size the volume for that too.
-- Local-model failover is per host: `LOCAL_MODEL_BASE_URL` / `LOCAL_MODEL_API_KEY` /
-  `LOCAL_MODEL_NAME` / `LOCAL_MODEL_CONTEXT` in the agent's `turma-agent.env`. Unset = feature off,
-  and the agent reports `localModel.available:false` so clients hide the control.
-- The hub also takes the LiteLLM env for **Whisper STT** (`LITELLM_URL` = that
-  instance's `/v1` base, optional `LITELLM_API_KEY`; legacy `WHISPER_URL`/`WHISPER_API_KEY`
-  override), and `NODE_NO_WARNINGS=1` to silence `node:sqlite`'s experimental warning.
+    `ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES` its raw copy, rather than the store. Neither counts `index.db`,
+    which lives on the same volume and is unbounded across fill/wipe cycles (XERK-332) — size the
+    volume for that too.
+- Local-model failover is per host: `LOCAL_MODEL_BASE_URL` / `LOCAL_MODEL_API_KEY` / `LOCAL_MODEL_NAME`
+  / `LOCAL_MODEL_CONTEXT` in the
+  agent's env. Unset = off, and the agent reports `localModel.available:false` so clients hide it.
+- The hub also takes the LiteLLM env for **Whisper STT** (`LITELLM_URL` = that instance's `/v1` base,
+  optional `LITELLM_API_KEY`; legacy `WHISPER_URL`/`WHISPER_API_KEY` override), and `NODE_NO_WARNINGS=1`.
 
 ## Releases and CI, in one line each
 
-Full detail in `.claude/rules/release.md`.
+Full detail in `release.md`.
 
 - **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all four components + a changelog**, cut by
   `.github/workflows/release.yml`. Never split back into per-component workflows.
 - The four components: `turma` image, native agent tarball, glasses `.ehpk`, android `.apk`.
-- The root **`VERSION`** file holds `MAJOR.MINOR` only; **the patch is derived from existing `v*`
-  tags and never committed**. Bump `VERSION` only for a minor/major.
+- The root **`VERSION`** holds `MAJOR.MINOR` only; **the patch is derived from existing `v*` tags and
+  never committed**. Bump `VERSION` only for a minor/major.
 - Only **changed** components build; unchanged ones are **carried** at their prior version. Every
   release publishes all four.
 - PR gates that block a merge: `code-scan.yml` (Semgrep, hadolint, ShellCheck, unit tests, the

@@ -1,41 +1,36 @@
 ---
 paths:
   - "poc/turma-2.0-poc/**"
-  - "agent/**"
+  - "agent/hub-agent.py"
+  - "agent/dsh_transcript.py"
+  - "agent/dsh_session.py"
+  - "agent/dsh/**"
+  - "agent/dsh-session-driver/**"
+  - "agent/tests/test_hub_agent.py"
+  - "agent/tests/test_dsh_transcript.py"
+  - "agent/tests/test_dsh_session.py"
   - "turma/server.js"
   - "turma/public/sessions.html"
   - "android/**"
 ---
 
-# dsh integration — architecture decisions (ADR)
+# dsh runtime — invariants (XERK-460)
 
-Gate for XERK-460 (integrate DeepSeek Harness, `dsh`, as a first-class agent runtime **alongside**
-Claude Code). This file records the five G0 decisions with rationale so the parallel children build
-against one shape. It is a decision record, not a how-to — mechanics land in the component rules
-files as each child ships, and this file's `paths:` widens then.
+dsh (DeepSeek Harness) is a per-session runtime **alongside** Claude Code: its own launcher inside
+the existing agent, reporting through the existing hub, with a HEADLESS process model (no TUI pane).
 
-- **Background.** Two design docs frame dsh differently, and the difference is the whole point of
-  this gate. `docs/turma-2.0-design.md` + `poc/turma-2.0-poc/` describe a **full rewrite** of Turma
-  on dsh: a NEW separate "Fleet Hub" service, dsh running the web UI, every Turma concern
-  reimplemented as a dsh plugin. `docs/deepseek-harness-integration.md` (Option A) describes an
-  **incremental** path: dsh added as a selectable per-session runtime under the EXISTING agent and
-  the EXISTING hub. **XERK-460's title says "alongside Claude Code" — so the epic is the incremental
-  path, and these decisions choose it over the rewrite wherever the two conflict.**
-- **`agentType`/`agent_type` in `hub-agent.py`/`server.js` ALSO names Task-tool SUBAGENTS** — an
-  older, unrelated concept. The dsh runtime is the per-session `agentType` field ([A]) plus the
-  `agent/dsh_*` modules; do not conflate the two.
-- **G1 (XERK-463) is done: go/no-go = GO.** All four operations are proven end-to-end against real
-  dsh 0.1.1-rc.2, no mock, via `poc/turma-2.0-poc/test-real-dsh.sh --drive`. The go/no-go corrected
-  the PoC plugin, which had spawn/input/kill written against a *guessed* `ctx.agents` API the mock
-  never checked: real dsh is `agents.create({sessionId,meta:{cwd},agentOptions})`→handle (not
-  `resume`), `agent.followup(msg)` (not `inbox.append`, which never wakes the driver), and
-  `handle.dispose()` (not arg-less `cancel`). The model rides a hand-declared OpenAI-compatible
-  `dsh-llm-pi-ai` route (D5). Detail + recorded run in `poc/turma-2.0-poc/README.md`.
+**The decisions and their rationale (D1-D5, the G1 spike, open questions) are in
+`docs/dsh-adr.md`** — read it for *why*; this file is the rules. Two load-bearing consequences it
+establishes, which almost every invariant below descends from:
 
-## [A] (XERK-465) shipped: runtime field + capability flag
+- **dsh's native event log is CANONICAL** (retained for metrics); the Claude-JSONL projection is a
+  lossy DISPLAY derivative, never the record.
+- **The projection exists to keep the parity mirrors at N, not 2N** — so no dsh work may add a
+  reader, a transcript shape, or an `agentType` branch to a shared read path.
 
-The runtime-SELECTION plumbing is in place; the dsh LAUNCHER is [B] (XERK-466). What landed, and the
-invariants a later child must not undo:
+Naming trap: `agentType`/`agent_type` ALSO names Task-tool SUBAGENTS, an older unrelated concept.
+
+## [A] (XERK-465) runtime field + capability flag
 
 - **`agentType` ∈ {"claude","dsh"} is a per-session record field**, default "claude", validated at
   spawn (`resolve_agent_type`) like every spawn enum and carried on every record-rebuild path
@@ -48,443 +43,210 @@ invariants a later child must not undo:
   coerced strict-boolean by `normalizeDsh`, a `HEARTBEAT_KNOWN_KEYS` member, typed on Android
   (`AgentInfo.dsh: DshInfo?`). Absent/false = "this host cannot do dsh", so the composer HIDES the
   runtime selector rather than queue a spawn the host refuses. Both spawn routes 409 a `dsh` choice
-  at a host with no capability (`checkSpawnAgentType`), and the agent re-validates
-  (`resolve_agent_type`).
+  at a host with no capability (`checkSpawnAgentType`), and the agent re-validates.
 - **`_launch_tmux` is the single launch choke point, and its FIRST action is the runtime dispatch**:
-  `if sess.agentType == "dsh": self._launch_dsh(sess); return`. `_launch_dsh` performs the real
-  per-session dsh launch (XERK-466 [B]); the dispatch line and choke point stay.
-  Do not hoist the dispatch to the ~6 callers — they all funnel through `_launch_tmux`.
-- **Composer only, no card badge**: `sessions.html` gates a "Runtime" `<select>` on `a.dsh.available`,
-  sending `agentType` only for "dsh" (a bare spawn is unchanged); Android mirrors just that composer
-  row (`core/Runtime.kt`, `SpawnDialog`). There is deliberately **no dsh runtime chip on the session
-  card** — the web `⚙ dsh` marker, the glasses `ph-runtime`/G2 `·dsh` suffix and Android's
-  `RuntimeBadge` were removed.
+  `if sess.agentType == "dsh": self._launch_dsh(sess); return`. Do not hoist the dispatch to the ~6
+  callers — they all funnel through `_launch_tmux`.
+- **Composer only, no card badge**: `sessions.html` gates a "Runtime" `<select>` on
+  `a.dsh.available`, sending `agentType` only for "dsh"; Android mirrors just that composer row
+  (`core/Runtime.kt`, `SpawnDialog`). The web `⚙ dsh` marker, the glasses `ph-runtime`/G2 `·dsh`
+  suffix and Android's `RuntimeBadge` were removed — do not re-add a runtime chip to the card.
 - Tests: `TestSpawnOptionHelpers`/`TestSessionLifecycle` (agent), `normalizeDsh`/spawn-route/restore
   cases (`server.test.js`), the Runtime cases in `sessions.test.js`, `RuntimeTest`/`SpawnRequestTest`/
   `SpawnComposerTest`/`AgentDecodeTest` (android).
 
-## D1 — Where dsh runs: inside the existing agent
+## S1 (XERK-464) the projection (`agent/dsh_transcript.py`)
 
-- **Decision: dsh runs as an additional per-session LAUNCHER inside the existing agent,
-  not as a separate agent.** A dsh session is launched the way a `claude --remote-control` session
-  is — its own tmux, its own worktree, counting against `MAX_SESSIONS` — dispatched on a validated
-  `agentType` spawn option (`{'claude','dsh'}`, allowlisted agent-side like every other spawn enum).
-- **Why not a separate agent.** The fleet's whole model is one-agent-per-host, and a host's
-  identity is singular: one XERK-268 credential, one heartbeat, one org binding, one peer roster,
-  one worktree pool under `.turma/worktrees`. A second agent would be a second "host" to the
-  hub — doubling the online count, the credential, and the roster for one physical machine, and
-  forcing every cross-cutting contract to learn a split identity. Keeping dsh in the same agent means
-  the runtime choice is per-session and invisible to the hub's host model.
-- **Cost this accepts, and the follow-up it needs.** dsh (node + its npm tree — the PoC's
-  `test-real-dsh.sh` installs ~460 packages) adds a native prerequisite, and a live dsh session
-  (node runtime + a model client) is not free on a host's memory/process budget, sized per host
-  against `MAX_SESSIONS`. Whether those ceilings need raising is a host sizing follow-up, not a code
-  change here — flagged to Malcolm as Q1 below.
-
-## D2 — Coordinator: reuse the existing Turma hub; the PoC Fleet Hub is redundant for this epic
-
-- **Decision: dsh reports through the EXISTING Turma hub via the existing `hub-agent.py`, not
-  through a new hub or a dsh-plugin-to-hub link. The PoC's separate Fleet Hub
-  (`poc/turma-2.0-poc/fleet-hub/`) and `@turma/dsh-fleet-agent` plugin are the FULL-REWRITE path and
-  are out of scope for XERK-460.**
-- **Why.** The existing hub already owns agent registry, org isolation (`orgBound`, trust-on-first-
-  use), the ticket queue, the peer roster, the archive, usage aggregation, migration, and the mobile
-  API. The PoC Fleet Hub reinvents all of it and is, by its own README, unauthenticated and bound to
-  all interfaces. Standing up a second control plane would fork every cross-cutting contract in
-  CLAUDE.md (the heartbeat wire contract, XERK-268 host proof, XERK-264 refusal semantics, XERK-258
-  memory ceilings, XERK-348 peer boundary). Reusing the one hub keeps one set of those invariants.
-- **What this means concretely.** `hub-agent.py` launches dsh as a child process, reads its session
-  state (see D3), and surfaces it on the SAME heartbeat every Claude session rides. The hub does not
-  learn a new protocol; a dsh session is just a session whose `agentType` is `dsh`. The heartbeat's
-  degrade rule applies: older hubs/clients that don't know `agentType` treat the field as absent and
-  render the session as they would any other — never break.
-- **This does not delete the PoC.** It stays as validated evidence for the rewrite direction, which
-  remains a SEPARATE future question (Q3 below). This decision only says the rewrite is not how
-  XERK-460 ships.
-
-## D3 — Transcript format: dsh's native event log is CANONICAL; Claude JSONL is a display projection
-
-- **Decision: dsh's native event-sourced log is the CANONICAL session record and is retained in full
-  fidelity — it is the better representation and the one we collect metrics from. The agent ALSO
-  emits a derived Claude-Code JSONL PROJECTION of it, purely so the existing display surfaces keep
-  reading one shape. The projection is lossy and is NOT the source of truth; the native log is never
-  down-sampled to feed it.** Feeds S1.
-- **Why keep dsh's format.** dsh manages session data far better than Claude Code's transcript: its
-  Trajectory view breaks out every input, output, and tool call with the time each arrived, because
-  a session is an append-only log of typed events (`turn/*`, `step/*`, `tool/call`, `tool/result`,
-  `assistant/message` with token usage). That granularity is exactly what later metrics want —
-  per-turn tokens, tool success rates, step timings, error rates — and flattening it into Claude
-  JSONL turns would throw it away. So the native log is what we KEEP; the JSONL is what we DERIVE.
-- **Why derive the JSONL at all (the projection).** Turma's read side is a web of parity contracts
-  that already cost N-way edits: `readyForReview` (four mirrors), "Working" = paneBusy OR live agents
-  (five mirrors), the board column rule (`categoryOf`, four mirrors), and the whole `hub-agent.py` ↔
-  `tunnel-agent.js` py/js parity set. Teaching the archive and every client (hub, android, glasses)
-  a SECOND transcript shape multiplies each of those (N → 2N). A single agent-side
-  projection into the shape they already read keeps the mirrors at N — the exact reason the ticket
-  names — WITHOUT making that projection the record. Display reads the projection; metrics read the
-  native log. Neither impersonates the other.
-- **Retention obligation — this is the load-bearing part of the decision.** The native dsh log
-  (SQLite + telemetry JSONL) MUST be persisted durably and in full, not summarized. It rides
-  XERK-338's raw archive layer, which already stores each session's own files byte-for-byte and is
-  the only place anything Turma does not render survives the host. The raw-layer ceilings must be
-  checked against real dsh session sizes so metrics data is not silently truncated (Q1); a future
-  metrics / Trajectory surface is a downstream child that reads these retained native events
-  directly, never the JSONL projection.
-- **Session identity is preserved by construction.** The agent pins a session id at launch and names
-  the projection JSONL by it, so `_session_transcript_path()` resolves a dsh session with no new
-  resolver and no newest-mtime fallback (the XERK-6 trap). dsh's own internal session id is mapped to
-  the pinned id, and the retained native log is keyed by that same id so the two representations of
-  one session stay joinable.
-- **Parity obligation.** The dsh→JSONL projection is itself a py/js parity surface if any of it runs
-  in `tunnel-agent.js` for live tail; keep the mapping in one place and mirror it under test, the way
-  `_entry_blocks`/`entryBlocks` are. The `corpus-eval` skill is the tool for proving old-vs-new here.
-
-## D4 — Auth / session identity: dsh inherits the host credential; no new identity (XERK-268)
-
-- **Decision: a dsh session has NO credential or fleet identity of its own. It runs under the host
-  agent, which authenticates to the hub with its per-host token
-  `<base64url(device)>.<HMAC(TURMA_AGENT_TOKEN, device)>` exactly as today.** dsh never talks to the
-  hub directly (that follows from D2), so there is nothing new to authenticate.
-- **Tracker / PR attribution rides the translated JSONL (D3), unchanged.** `_scan_pr_line` /
-  `_seed_prs` detect `gh pr create` from transcript tool events; because dsh's shell/tool calls are
-  translated into the same `tool_use`/`tool_result` JSONL shape, PR chips work with no new code —
-  **provided the translator represents the tool call that runs `gh pr create` as a tool event, not
-  as opaque assistant text.** That is a translator requirement, called out for S1. Git authorship is
-  the host's git user on a worktree, unchanged.
-- **Usage accounting rides the same JSONL, with one real new requirement.** Usage is counted
-  per-MODEL from the transcript and kept in XERK-338's durable per-host ledger. dsh spend counts
-  against the SAME host. The translator MUST populate the JSONL token-usage fields AND a real model
-  id from dsh's `assistant/message` events — otherwise a dsh session spends tokens the ledger cannot
-  attribute to a model. New (local / DeepSeek) model ids simply appear in the per-model breakdown;
-  the ledger needs no schema change, only correct input. This covers the accounting TOTALS only;
-  the richer per-turn / per-tool metrics come from the retained native log (D3), not the projection.
-- **Consequence for the credential-binding contract.** Nothing in XERK-268 changes: the host is
-  still proved by its token, not by what it types, and a dsh session cannot assert a different host
-  or org. The `agentType` on a session is presentational, like a label — it grants nothing.
-- **Left open (Q2 below):** whether PR/commit attribution should visibly DISTINGUISH dsh-authored
-  from Claude-authored work (e.g. carrying `agentType` onto the PR chip). Not required for
-  correctness; a product call.
-
-## D5 — Models: the runtime picks the model mechanism; a dsh session has NO Claude failover
-
-- **Decision: model selection is PER SESSION and follows the session's runtime. If `agentType` is
-  `dsh`, there is NO Claude-Code local-model failover in play at all — the dsh model selector
-  (`@deepseek-ai/dsh-llm-pi-ai`, YAML provider config: DeepSeek API natively, plus any
-  OpenAI-compatible local endpoint — LiteLLM / Ollama / vLLM) is the WHOLE story for that session.
-  If `agentType` is `claude`, its existing local-model failover stays exactly as today.** The two
-  mechanisms never coexist within one session and G0 does not try to unify them.
-- **Why not unify.** Claude's failover is subscription-limit-driven and specific to the Claude
-  runtime (`LOCAL_MODEL_*` env, `localModel.available` capability flag). dsh has no subscription
-  limit and no such concept — it just points its adapter at whichever providers are configured, and
-  can run local models as PRIMARY (the rewrite doc's "local-first"). Merging the two would couple two
-  runtimes at exactly the seam QA is told never to stub. Keep them parallel.
-- **Model set to start.** dsh with (a) local models via the existing LiteLLM/Ollama infra and (b)
-  DeepSeek API where a key is provisioned, model chosen per session like the Claude model enum. Both
-  are validated agent-side against a fixed enum, same as every spawn option.
-- **Provisioning is a product/cost call (Q1/Q4 below):** whether a `DEEPSEEK_API_KEY` is provided at
-  all, or dsh runs local-only first; and whether dsh defaults local-first. Neither blocks the code
-  shape decided here.
-
-## S1 — the projection, implemented (`agent/dsh_transcript.py`, XERK-464)
-
-D3's dsh→Claude-JSONL projection is built as a pure, stdlib-only module the dsh launcher (D1)
-imports. `DshProjector.feed(event)` returns the 0+ Claude-JSONL entry dicts one dsh event projects
-to; `project_log()` is the batch form. Invariants a change here must not undo:
+`DshProjector.feed(event)` returns the 0+ Claude-JSONL entry dicts one dsh event projects to;
+`project_log()` is the batch form. Pure, stdlib-only.
 
 - **Incremental, one file, no new reader.** The launcher appends each event's projected entries to
-  the pinned `<claudeSessionId>.jsonl` as events arrive, and the EXISTING `_entry_blocks`/
-  `entryBlocks`, `_entry_text`, usage accountancy, PR scan and live tail read it unchanged. There is
-  **no JS translator** — the projection runs only in Python, and the "py/js parity" this ticket
-  names is that the projected JSONL renders IDENTICALLY under `_entry_blocks` (py) and `entryBlocks`
-  (js). Adding a second reader/shape is the mirror multiplication the whole seam exists to avoid.
+  the pinned `<claudeSessionId>.jsonl`, and the EXISTING `_entry_blocks`/`entryBlocks`, `_entry_text`,
+  usage accountancy, PR scan and live tail read it unchanged. There is **no JS translator** — the
+  projection runs only in Python, and the "py/js parity" here is that the projected JSONL renders
+  IDENTICALLY under `_entry_blocks` (py) and `entryBlocks` (js).
 - **Only the three dsh SURFACE types project to entries** (`user/message`, `assistant/message`,
-  `tool/result`). Every other event is log-only and projects to `[]` — turn/step boundaries,
-  `assistant/chunk`, `request/*`, `todo/write`, `session/*`. A user-cancelled `turn/end`
-  (reason `aborted`/`user`) projects the `[Request interrupted by user]` marker.
+  `tool/result`). Every other event is log-only → `[]` — turn/step boundaries, `assistant/chunk`,
+  `request/*`, `todo/write`, `session/*`. A user-cancelled `turn/end` (reason `aborted`/`user`)
+  projects the `[Request interrupted by user]` marker.
 - **Tool calls ride the assistant message, NOT the `tool/call` event.** dsh appends BOTH an
   `assistant/message` whose `content` includes the `tool-call` blocks AND a redundant standalone
-  `tool/call` event (verified in `dsh-agent-loop/lib/index.js`: the loop itself reads calls back via
-  `message.content.filter(b => b.type === "tool-call")`). The projector emits tool_use from the
-  assistant message and SKIPS `tool/call`, so exactly one tool_use appears — which is what makes PR
-  attribution (D4) work: `gh pr create` lands as a real tool_use/tool_result pair, not opaque text.
+  `tool/call` event (the loop itself reads calls back via `message.content.filter(b => b.type ===
+  "tool-call")`). The projector emits tool_use from the assistant message and SKIPS `tool/call`, so
+  exactly one tool_use appears — which is what makes PR attribution work: `gh pr create` lands as a
+  real tool_use/tool_result pair, not opaque text.
+- **`bash`→`Bash` name map**: `_scan_pr_line` attributes only a `Bash` tool_use and dsh's shell tool
+  is `bash`. Widen PR attribution only by teaching `_scan_pr_line` another creation event, never by
+  loosening this map.
 - **Liveness is deliberately NOT in the projection.** dsh has no pane, so `paneBusy` has no
-  transcript equivalent; a dsh session's "working" signal is an in-flight turn (`turn/start` with no
-  `turn/end`, i.e. `agent.status === 'running'`), reported as a heartbeat field by [D] and read from
-  dsh directly. Injecting a turn marker into the JSONL would force `entryBlocks` to grow a case.
+  transcript equivalent; the working signal is an in-flight turn, reported as a heartbeat field by
+  [D] and read from dsh directly. Injecting a turn marker would force `entryBlocks` to grow a case.
 - **The chat's live streaming also reads the native log, never the projection** (`tunnel-agent.js`
-  `pollDshTurn`/`foldDshView`). A dsh session streams its `assistant/chunk` deltas into the same
-  `/live` `turn` frames a claude pane scrape produces, so the chat page grows the response as it
-  generates. It tails `events.jsonl` directly for the DISPLAY; it does not project chunks into JSONL
-  and adds no new reader to `_entry_blocks`/`entryBlocks`.
-- **usage + model ride the assistant entry** (D4): dsh `TokenUsage` maps 1:1 to Claude's disjoint
-  `input/output/cache_read/cache_creation` counts, and `message.model` comes from the event's
-  `message.source.model`. A step with no usage projects no `usage` key (never a fabricated zero,
-  which would poison the per-model denominator).
+  `pollDshTurn`/`foldDshView`): `assistant/chunk` deltas stream into the same `/live` `turn` frames a
+  claude pane scrape produces. It tails `events.jsonl` for the DISPLAY, projecting no chunks into
+  JSONL and adding no reader.
+- **usage + model ride the assistant entry**: dsh `TokenUsage` maps 1:1 to Claude's disjoint
+  `input/output/cache_read/cache_creation`, and `message.model` comes from `message.source.model`. A
+  step with no usage projects no `usage` key — never a fabricated zero, which poisons the per-model
+  denominator.
 - **uuids are deterministic** (uuid5 over session id + seq), so replaying the retained native log
   re-projects byte-identically without forking the file.
-- **Verification is against real dsh 0.1.1-rc.2**, not a mock (the G1 lesson): the corpus
-  (`dsh_corpus.json`) is built by `dsh_corpus_gen.mjs` from dsh's OWN `createUserMessage`/
-  `createAssistantMessage`/`createToolResultMessage`, and the event shapes and loop behaviour were
-  read from the cached `@deepseek-ai/*` `.d.ts` + `dsh-agent-loop` source. `dsh_projected.jsonl` +
-  `dsh_expected_blocks.json` are the SAME artifacts the py test and the js test in
-  `tunnel-agent.test.js` both assert against — pinning both readers to one expected result.
+- **Verified against real dsh 0.1.1-rc.2, not a mock** (the G1 lesson): `dsh_corpus.json` is built by
+  `dsh_corpus_gen.mjs` from dsh's OWN message constructors. `dsh_projected.jsonl` +
+  `dsh_expected_blocks.json` are the SAME artifacts the py and js tests assert against, pinning both
+  readers to one expected result.
 - Tests: `test_dsh_transcript.py`, the `dsh projection` case in `tunnel-agent.test.js`.
 
-## [D] (XERK-468) — busy / ready / summary semantics, implemented (`hub-agent.py`)
+## [D] (XERK-468) busy / ready / summary semantics
 
-The read-side of a dsh session's state. A dsh session runs HEADLESS
-(`docs/dsh-session-lifecycle.md`, [B]): no Claude TUI pane, so `paneBusy` — the "is its own turn
-running" signal every working/ready mirror keys on — cannot come from `_pane_status`. It comes from
-the dsh driver plugin's control-socket `state` (status running|idle). Invariants a change here must
-not undo:
+A dsh session is HEADLESS, so `paneBusy` cannot come from `_pane_status`; it comes from the driver
+plugin's control-socket `state` (running|idle).
 
-- **It REUSES the `paneBusy` wire field, agent-side — it does NOT add a dsh signal to the mirrors.**
+- **It REUSES the `paneBusy` wire field agent-side — it does NOT add a dsh signal to the mirrors.**
   `session_report(agent_type="dsh", dsh_status=…)` sources `paneBusy` from the cached dsh status
-  (`dsh_pane_busy`) instead of scraping the pane, and reports it in the same `paneBusy`. So
-  `sessionWorking`, `liveState`, the FIVE `readyForReview` mirrors, the ready-for-review alert and
-  summaries are **UNCHANGED and cannot drift** — the projection philosophy applied to liveness
-  (keep the mirrors at N). The CLAUDE.md "Working = paneBusy OR live agents" contract holds verbatim;
-  the [B] design note's "all mirrors branch on agentType" was the rejected alternative — do not
-  restore it (it multiplies the very mirror edits S1 exists to avoid).
-- **Everything OTHER than liveness stays transcript-derived**, from the S1 projection: `lastRole`,
-  `lastHasToolUse`, `transcriptAgeSec` and the PR scan all read the projected `<claudeSessionId>.jsonl`
-  with no change. This is what makes `readyForReview`'s finished-turn branch work identically for a
-  dsh session — the only signal that is not transcript-derived is liveness, exactly as S1's "liveness
-  is deliberately NOT in the projection" note carves out.
-- **A dsh session's NAME comes from dsh's OWN `session/title` event, never `claude -p`.** Log-only
-  (not a transcript entry); the projection tail (`dsh_session.py`) captures `data.title`, and
-  `_seed_dsh_summary` names the session from it on the beat. `_start_summary` refuses a
-  `agentType=="dsh"` session, so no Claude summarizer turn is spent on a runtime with no Claude login.
-  - `_seed_dsh_summary` names in three tiers — dsh's generated `session/title`, else its fallback
-    title, else the first prompt — so the card is never blank when dsh emits no title, and a
-    generated title overrides a provisional one. Mechanics in `.claude/rules/dsh-input.md`.
+  (`dsh_pane_busy`) instead of scraping. So `sessionWorking`, `liveState`, the five `readyForReview`
+  mirrors, the alert and summaries are UNCHANGED and cannot drift. **"All mirrors branch on
+  agentType" was the rejected alternative — do not restore it.**
+- **Everything OTHER than liveness stays transcript-derived** from the S1 projection: `lastRole`,
+  `lastHasToolUse`, `transcriptAgeSec` and the PR scan read the projected `<claudeSessionId>.jsonl`
+  unchanged, which is what makes readyForReview's finished-turn branch work identically.
+- **A dsh session's NAME comes from dsh's OWN `session/title` event, never `claude -p`.** Log-only;
+  the tail (`dsh_session.py`) captures `data.title` and `_seed_dsh_summary` names from it.
+  `_start_summary` refuses an `agentType=="dsh"` session, so no Claude summarizer turn is spent on a
+  runtime with no Claude login. Three tiers — generated title, fallback title, first prompt — so the
+  card is never blank; a generated title overrides a provisional one. Mechanics in `dsh-input.md`.
 - **`dsh_pane_busy` is a tri-state and deliberately NOT time-expired.** running→True, idle→False,
-  unknown/missing→None ("can't tell", so downstream falls back to transcript freshness exactly like an
-  uncapturable Claude pane). A pending interaction reads False (blocked on a human, not its own turn —
-  like a Claude `panePrompt`). Expiring a stale "running" by AGE would reintroduce the transcript-
-  freshness false-idle the socket signal exists to avoid (a long dsh tool call emits no status edge for
-  minutes) — the exact bug paneBusy's "esc to interrupt" solves for Claude. Liveness-of-the-SIGNAL is
-  the producer's job: it clears to unknown on socket disconnect, and the host-offline gate zeroes it
-  when the host dies.
+  unknown/missing→None ("can't tell", falling back to transcript freshness like an uncapturable
+  Claude pane). A pending interaction reads False (blocked on a human, not its own turn). Expiring a
+  stale "running" by AGE would reintroduce the transcript-freshness false-idle the socket signal
+  exists to avoid — a long dsh tool call emits no status edge for minutes. Liveness-of-the-SIGNAL is
+  the producer's job: it clears to unknown on socket disconnect, and the host-offline gate zeroes it.
 - **The driver derives its `state` status from the TURN EDGE, never `agent.status` at emit time**
-  (XERK-479 D3). Because the hub cannot age-expire a stale "running" (above), the PRODUCER must
-  deliver the idle edge: `dsh-session-driver` emits `running` on `turn/start` and `idle` on
-  `turn/end`. Reading `ctx.agents.get(sid).status` inside the `turn/end` handler returns `running`
-  (the agent has not settled yet), so no idle edge ever fires and a finished dsh session reads
-  "working" forever — never becoming ready-for-review. Keep the committed `dist/` in sync with `src/`.
-- **`_on_dsh_state` stores the PARSED snapshot dict, via `_ingest_dsh_event`** — the reader's canonical
-  fold. `dsh_pane_busy` is dict-only; storing the bare status STRING made paneBusy read None for every
-  dsh session (XERK-479 D1). The reader callback and `_ingest_dsh_event` are one path, not two.
-- **The beat only ever READS an in-memory cache (`self.dsh_status`), never the socket** — so a wedged
-  plugin cannot stall the heartbeat past `OFFLINE_AFTER_MS` (XERK-395). The PRODUCER that fills the
-  cache — the persistent per-session socket reader — is the LAUNCHER's ([B] impl phase), off the beat.
-  [D] owns the CONSUMER seam: `_ingest_dsh_event(sid, event)` (the launcher's reader forwards each
-  streamed `state` line here), `_set_dsh_status(sid, None)` (what it calls on disconnect), and
-  `refresh_dsh_status` / `dsh_query_state` (the off-beat one-shot a poller can use instead). The cache
-  is dropped on kill/delete (`_forget_session_caches`) and restart (a fresh dsh agent).
-- **`_ingest_dsh_event` handles the `state` event ONLY; the `interaction` event is [C]'s** (XERK-467) —
-  surfacing a dsh approval/question as a pending `question` through the AskUserQuestion bridge is what
-  leads a blocked dsh session into Ready-for-review's "waiting" lead. [D] leaves `interaction`
-  untouched so the two seams don't collide, and only a USABLE status (running|idle) updates the cache
-  (a malformed state event must not clobber a known-good "running").
-- **Verified by unit test, not against real dsh** — no launcher exists yet, so no dsh session runs to
-  drive end to end. `dsh_query_state` is tested against a real fake UNIX-socket server speaking the
-  contract; the cache/mapping/seam are tested directly. When the launcher lands it wires its reader to
-  `_ingest_dsh_event` and this lights up. Tests: `TestDshState`, `TestDshQueryState`,
-  `TestDshLivenessInReport`, `TestDshLivenessSeam` in `test_hub_agent.py`.
+  (XERK-479 D3). Since the hub cannot age-expire a stale "running", the PRODUCER must deliver the
+  idle edge: `running` on `turn/start`, `idle` on `turn/end`. Reading `ctx.agents.get(sid).status`
+  inside the `turn/end` handler returns `running` (the agent has not settled), so no idle edge fires
+  and a finished session reads "working" forever, never becoming ready-for-review. Keep the committed
+  `dist/` in sync with `src/`.
+- **`_on_dsh_state` stores the PARSED snapshot dict, via `_ingest_dsh_event`** — the reader's
+  canonical fold. `dsh_pane_busy` is dict-only; storing the bare status STRING made paneBusy read
+  None for every dsh session (XERK-479 D1). The callback and `_ingest_dsh_event` are one path.
+- **The beat only ever READS an in-memory cache (`self.dsh_status`), never the socket**, so a wedged
+  plugin cannot stall the heartbeat past `OFFLINE_AFTER_MS` (XERK-395). The producer filling it — the
+  persistent per-session socket reader — is the launcher's, off the beat. Consumer seam:
+  `_ingest_dsh_event(sid, event)`, `_set_dsh_status(sid, None)` on disconnect, and
+  `refresh_dsh_status`/`dsh_query_state` (the off-beat one-shot). Dropped on kill/delete
+  (`_forget_session_caches`) and restart.
+- **`_ingest_dsh_event` handles the `state` event ONLY; `interaction` is [C]'s** — only a USABLE
+  status (running|idle) updates the cache, so a malformed state event cannot clobber a known-good
+  "running".
+- Tests: `TestDshState`, `TestDshQueryState`, `TestDshLivenessInReport`, `TestDshLivenessSeam`.
 
-## [E] (XERK-469) shipped: archive sync (rendered + raw) for dsh sessions
-
-D3's retention obligation made concrete — a dsh session archives with BOTH layers and no new archive
-code, which is the same symmetry S1 buys the read side: the projection needs no new READER, the
-native log needs no new WRITER.
+## [E] (XERK-469) archive sync — the store-dir contract
 
 - **The projection (`<slug>/<sid>.jsonl`) rides the RENDERED layer unchanged** — `_archive_manifest`
-  enumerates every ledger slug's top-level `*.jsonl`, and a dsh session is in the usage ledger like
-  any other. The native log (`<slug>/<sid>/dsh/...`) is nested, so it is NOT mistaken for a rendered
-  transcript.
-- **The native event log rides the RAW layer unchanged** because it is placed under the project-slug
-  session dir at **`<slug>/<sid>/dsh/`** (`DSH_STORE_DIRNAME`), which `_session_files` already walks.
-  This RECONCILES the [B] design-of-record (`docs/dsh-session-lifecycle.md`), which proposed the
-  worktree's `.dsh/` — a location the raw layer reaches into for nothing (it excludes the worktree on
-  purpose; those bytes are what prune/delete key on). The launcher (XERK-466) MUST write the store
-  here, not in the worktree, or D3's canonical record is retained by nothing.
+  enumerates every ledger slug's top-level `*.jsonl`. The native log (`<slug>/<sid>/dsh/...`) is
+  nested, so it is NOT mistaken for a rendered transcript.
+- **The native event log rides the RAW layer at `<slug>/<sid>/dsh/`** (`DSH_STORE_DIRNAME`), which
+  `_session_files` already walks. **The launcher MUST write the store here, not in the worktree** —
+  the raw layer excludes the worktree on purpose (those bytes are what prune/delete key on), so a
+  worktree `.dsh/` is retained by nothing. This supersedes the `.dsh/` location in
+  `docs/dsh-session-lifecycle.md`.
 - **dsh's "raw" bytes are its append-only event log, not its SQLite.** The raw cursor ships bytes
   past an offset — right for an event-sourced JSONL stream, wrong for a page-mutating DB. The SQLite
-  is a derived index dsh rebuilds from the log, so it is not the archived artifact and must not land
-  under `<sid>/dsh/`.
-- **This `<sid>/dsh/` log is the DISPLAY/metrics feed, NOT what dsh resumes from** (corrected by
-  XERK-475 [K] — the earlier "kept for resume/migration" was wrong). The driver writes it for the
-  projector; dsh's OWN durable store, which `agents.resume` reloads, is a SEPARATE file under
-  `DSH_SESSIONS_ROOT` (see [K]). The raw-layer de-dup property still holds for this feed on a
-  host-local resume (same id, appended), and metrics read it — resume does not.
-- **No beat-loop budget regression**: archive sync stays on the sync worker (XERK-395); [E] adds no
-  code to the beat or the archive functions, only the store-dir contract. Tests: `TestDshArchiveSync`
-  (agent), and the existing `TestArchiveSyncWorker` / `TestBeatLoopBudget`.
+  is a derived index dsh rebuilds from the log and must not land under `<sid>/dsh/`.
+- **This `<sid>/dsh/` log is the DISPLAY/metrics feed, NOT what dsh resumes from** — dsh's own
+  durable store is a separate file under `DSH_SESSIONS_ROOT` ([K]).
+- **No beat-loop budget regression**: archive sync stays on the sync worker (XERK-395). Tests:
+  `TestDshArchiveSync`, plus `TestArchiveSyncWorker`/`TestBeatLoopBudget`.
 
-## [G] (XERK-471) shipped: usage aggregates, attribution ledger, subscription limits
+## Children that added NO new code path
 
-D4's usage obligation made concrete — a dsh session's spend charts on the Usage page and the
-dashboard token tiles IDENTICALLY to a Claude session, with no schema change and no `agentType`
-branch in the aggregation, because [S1]'s projection already writes `message.usage`/`message.model`
-in the shape the ledger reads. The full contract (why token aggregates + the attribution ledger cost
-dsh nothing, why local/DeepSeek ids appear in the per-model breakdown and may dominate, why the
-native log is never double-counted, and why the subscription `limits`/probe stay Claude-only) lives
-in **`.claude/rules/agent-usage.md`** ("dsh sessions ride this half unchanged"), whose `paths:` now
-loads for the dsh modules. The one code change was hardening `_map_usage` to drop an all-zero block.
-Tests: `TestDshUsageReportEndToEnd`, `TestDshProjectionAccounting` in `test_dsh_transcript.py`.
+Each proves the D3 "no new reader, no `agentType` branch" property for its own surface; the
+mechanics live in the file named, whose `paths:` load beside this one.
 
-## [H] (XERK-472) shipped: PR/MR chips, ledgers & attribution for dsh sessions
+- **[G] (XERK-471) usage** — spend charts identically with no schema change, because S1 already
+  writes `message.usage`/`message.model` in the ledger's shape. Why the native log is never
+  double-counted and why subscription `limits`/probe stay Claude-only: `agent-usage.md`. The one code
+  change was hardening `_map_usage` to drop an all-zero block. Tests:
+  `TestDshUsageReportEndToEnd`, `TestDshProjectionAccounting`.
+- **[H] (XERK-472) PR/MR chips** — same chips, ledgers, attribution and comment/conflict delivery,
+  keyed on S1's `bash`→`Bash` map. Nudges route `notify_session` → `_dsh_notify` (control socket),
+  bounded by `DSH_ACK_TIMEOUT_SEC`, never raising. `refresh_pr_status` stays the same inline offender
+  for BOTH runtimes (XERK-397's scope). Chips survive resume/migration via `_seed_prs` over the
+  projected `<tid>.jsonl`. Mechanics: `agent-prs.md`. Tests: `TestDshPrAttribution` (real projector,
+  real corpus).
+- **[J] (XERK-474) delegation** — background-agent/workflow rows + `subagentHistory` work because the
+  launcher SYNTHESIZES the Claude-Code on-disk shapes, so `_scan_agent_entry`, `_resolve_subagent`,
+  `_resolve_workflow_run`, `_workflow_agents` and the usage/archive walks read a dsh delegation with
+  no reader change (the XERK-304 contract, no new field). Mechanics + residual gaps:
+  `dsh-delegation.md`. The `ctx.on('subagent/start', {global:true})` scope is the one thing live dsh
+  must confirm.
+- **[L] (XERK-476) peer roster** — the ROSTER was already runtime-independent (`_peer_rows`/
+  `_write_peers_file` list any running session; `_launch_dsh` appends `PEERS_SYSTEM_PROMPT`;
+  `build_dsh_guard_config` grants the `peers.tsv` read). [L] adds only the MESSAGING, HUB-ROUTED both
+  ways so the Claude-inbox protocol and crossSessionInbound policy stay in ONE Python home.
+  Mechanics + pitfalls: `dsh-input.md`.
 
-D4's "PR chips work with no new code" made concrete and LOCKED — a dsh session that opens a PR gets
-the same chips, ledgers, attribution and comment/conflict delivery as a Claude one, with no
-`agentType` branch on the PR path. The symmetry is the same one S1/E buy: the projection needs no new
-reader, so the whole PR web reads a dsh transcript unchanged.
-
-- **The load-bearing dependency is S1's `bash`→`Bash` name map**: `_scan_pr_line` attributes only a
-  `Bash` tool_use, and dsh's shell tool is `bash`, so the map is what makes `gh pr create` chip. Same
-  narrowness as Claude (a PR opened via `cordis_run`/`ralph` or the raw GitLab API gets none).
-- **No new PR code, and no beat-loop regression**: comment/conflict nudges route through
-  `notify_session` → `_dsh_notify` (control socket, [C]), bounded by `DSH_ACK_TIMEOUT_SEC` and never
-  raising. `refresh_pr_status` remains the same inline offender for BOTH runtimes — XERK-397's scope,
-  not widened here. Chips survive a dsh resume/migration via `_seed_prs` over the projected
-  `<tid>.jsonl` (which migration packs as the top-level transcript, independent of [K]'s dsh store).
-- The mechanics live in `.claude/rules/agent-prs.md` ("dsh sessions" section). Tests:
-  `TestDshPrAttribution` drives the REAL projector over the REAL corpus (which carries a `gh pr
-  create`), proving attribution, the live per-beat scan, `_seed_prs`, `refresh_pr_status` +
-  GitLab/ADO dispatch, and socket-delivered comment/conflict nudges — the G1 lesson (no mock).
-
-## [I] (XERK-473) shipped: board integration — a ticket can run on dsh
-
-A ticket is DISPATCHED to a runtime, and the board's collectors/triage/tracker-writes are
-runtime-agnostic. Like [A]'s composer selector, the runtime choice is presentational plumbing over
-the same spawn path — no new session model.
+## [I] (XERK-473) board — a ticket can run on dsh
 
 - **The ticket runtime is a per-ticket PIN, mirroring the model pin (XERK-123), not a spawn-time
-  flag.** Hub-owned durable state (`ticketRuntimes` on `/data`, keyed `<siteKey>/<issueKey>`), it
-  rides the `spawnTicket` command as `agentType` and so must survive a hub restart and feed both the
-  Start button and the auto-start sweep. Only a NON-default ("dsh") choice is stored — "claude" and
-  clearing both release — so an unpinned ticket rides byte-for-byte the command it always did.
-  `POST /api/jira/<siteKey>/<issueKey>/runtime` is the board's Runtime row (a fifth tap-to-change
-  picker beside Status/Repo/Agent/Model), authoritative on a 200 like the model pin.
-- **The DISPATCH filters the pool by runtime capability, not just triage** (XERK-296). `findTicketHost`
-  restricts a dsh-pinned ticket to hosts reporting `dsh.available` — the same shape as the triage
-  filter, checked ahead of capacity so "no host offers dsh" reads as **blocked** (a freed slot would
-  not add the runtime, so it ages out) rather than **full** (clears itself). A pinned host that lacks
-  dsh is reported, never routed around. `orgOffersDsh` gates the pin server-side and `dshAvailable`
-  hides the board option, so a dsh pin can only name a runtime the org can actually run — the agent
-  still re-validates (`resolve_agent_type`).
-- **The agent side is one forwarded argument.** `spawn_ticket(agent_type=…)` passes it to `spawn()`,
-  validated by `resolve_agent_type` like every other spawn enum; the launch choke point (`_launch_tmux`)
-  already dispatches on `agentType`, and `_launch_dsh` already appends the ticket-branch directive and
-  delivers the built ticket prompt + attachments. So a dsh ticket session is "told its branch, cuts
-  it itself, worktree stays detached" with NO new launch code — the whole point of the [A]/[B] shape.
-- **Collectors and the two tracker writes are runtime-agnostic and untouched** — they gather tickets
-  and write status/create, never spawn a session, so the runtime never reaches them. **The
-  `_board_column` mirrors are untouched too** (the ticket's explicit ask): the runtime pin is
-  orthogonal to a ticket's column.
-- **Web ⇄ Android parity**: the board Runtime row shipped on Android too (XERK-477 —
-  `RuntimeSection` in `BoardScreen.kt`, `ticketRuntimes`/`dshAvailable` typed). The vendored
-  `board.cjs` copy (glasses) stays byte-identical to `board.js`.
+  flag.** Hub-owned durable state (`ticketRuntimes` on `/data`, keyed `<siteKey>/<issueKey>`) riding
+  `spawnTicket` as `agentType`, so it must survive a hub restart and feed both the Start button and
+  the auto-start sweep. Only a NON-default ("dsh") choice is stored — "claude" and clearing both
+  release — so an unpinned ticket rides byte-for-byte the command it always did.
+- **The DISPATCH filters the pool by runtime capability, not just triage** (XERK-296).
+  `findTicketHost` restricts a dsh-pinned ticket to hosts reporting `dsh.available`, checked ahead of
+  capacity so "no host offers dsh" reads as **blocked** (a freed slot would not add the runtime, so
+  it ages out) rather than **full** (which clears itself). A pinned host lacking dsh is reported,
+  never routed around. `orgOffersDsh` gates the pin server-side and `dshAvailable` hides the board
+  option; the agent still re-validates.
+- **The agent side is one forwarded argument** — `spawn_ticket(agent_type=…)` → `spawn()`, and the
+  launch choke point already dispatches. So a dsh ticket session is "told its branch, cuts it itself,
+  worktree stays detached" with NO new launch code.
+- **Collectors, the two tracker writes and the `_board_column` mirrors are untouched** — the runtime
+  pin is orthogonal to a ticket's column.
+- **Web ⇄ Android parity**: the board Runtime row shipped on Android too (XERK-477). The vendored
+  `board.cjs` stays byte-identical to `board.js`. Board mechanics: `turma-board.md`.
 - Tests: `TestSpawnTicket` (`test_a_runtime_pin_lands_on_the_session_record`,
-  `test_handle_commands_carries_the_runtime_pin`) agent-side; the `/runtime` route + the dsh
-  `findTicketHost` cases in `server.test.js`; the `runtime*` cases in `board.test.js`.
+  `test_handle_commands_carries_the_runtime_pin`) agent-side; the `/runtime` route + dsh
+  `findTicketHost` cases in
+  `server.test.js`; the `runtime*` cases in `board.test.js`.
 
-## [J] (XERK-474) shipped: background-agent / workflow rows + subagentHistory for dsh
+## [K] (XERK-475) migration + resume
 
-The projection philosophy (D3/S1) applied to DELEGATION: a dsh session that spawns sub-agents /
-workflows shows the picker + per-agent transcripts IDENTICALLY to Claude Code because the launcher
-SYNTHESIZES the Claude-Code on-disk shapes — so `_scan_agent_entry`, `_resolve_subagent`,
-`_resolve_workflow_run`, `_workflow_agents` and the usage/archive walks read a dsh delegation with NO
-reader change (the XERK-304 contract, no new field). The subagent lifecycle (ctx-bus) is forwarded
-into the parent log; the workflow's own `tool-workflow/*` are already there; each child's native log
-is captured and projected into the Claude `subagents/` + `workflows/` layout.
-
-**Mechanics + invariants (the projector, the tail's run-record/child synthesis, the driver's forward
-+ capture, and the residual gaps) are in `.claude/rules/dsh-delegation.md`**, scoped to the
-delegation files. Verified by unit test through hub-agent's real readers, not against real dsh (as
-[D]/[E]); the `ctx.on('subagent/start', {global:true})` scope is the one thing live dsh must confirm.
-
-## [K] (XERK-475) shipped: session migration + resume for dsh
-
-XERK-101 extended to dsh, and it corrected a false premise [B]/[E] carried: that `<sid>/dsh/` was
-dsh's resumable log and migration was `tar.add(<tid>/dsh)`. Verified against real dsh 0.1.1-rc.2:
-`<sid>/dsh/` is the driver's projection FEED; dsh resumes from its own `session-persistence-jsonl`
-store, a distinct file. So [K] is the STORE plus the resume the driver never wired.
+`<sid>/dsh/` is the projection FEED; dsh resumes from its own `session-persistence-jsonl` store, a
+distinct file. [K] is that store plus the resume the driver never wired.
 
 - **dsh's durable store is `$DSH_HOME/sessions/<projectKey(cwd)>/<sid>/session.jsonl`**
-  (`DSH_SESSIONS_ROOT`, `_dsh_store_dir`). `agents.create` on an already-persisted id THROWS
-  ("load/resume it instead"); the driver honors `TURMA_DSH_RESUME` → `ctx.agents.resume(
-  {resumeSessionId})` (falling back to create only if no store exists). This also fixes host-local
-  dsh resume, which [B] left as design-of-record — the driver had always called `create`.
+  (`DSH_SESSIONS_ROOT`, `_dsh_store_dir`). `agents.create` on an already-persisted id THROWS, so the
+  driver honors `TURMA_DSH_RESUME` → `ctx.agents.resume({resumeSessionId})`, falling back to create
+  only if no store exists.
 - **Migration carries the STORE, not the feed.** `export_session` packs `_dsh_store_dir` under the
-  reserved `.dsh-store/` tar prefix; `import_session` unpacks it to THIS host's key and re-points its
-  header `cwd` to the localized worktree (`_reconcile_dsh_store_cwd`) — dsh refuses a store whose
-  on-disk path disagrees with its header cwd, so a cross-mount move MUST re-key. The `<sid>/dsh/`
-  feed is deliberately NOT migrated: the resumed dsh does not replay history (verified — "constructor
-  seeds do not emit"), so the target rebuilds the feed from new events alone, and the projection tail
-  starts at the kept log's EOF (`resume=True`) so it never re-projects/doubles the transcript.
+  reserved `.dsh-store/` prefix; `import_session` unpacks to THIS host's key and re-points its header
+  `cwd` to the localized worktree (`_reconcile_dsh_store_cwd`) — **dsh refuses a store whose on-disk
+  path disagrees with its header cwd, so a cross-mount move MUST re-key.** The feed is deliberately
+  NOT migrated: the resumed dsh does not replay history, so the target rebuilds it from new events
+  and the projection tail starts at the kept log's EOF (`resume=True`), never doubling the transcript.
 - **The store is PLAINTEXT.** `_dsh_cordis_patch` overrides the base profile's persistence to
-  `compression: none` (re-stating `root` as DSH_SESSIONS_ROOT, since a patch REPLACES config) so the
-  header cwd is edited in place — Python has no stdlib zstd. A patch entry can't merge, so the whole
-  config is re-stated. New fleet: no pre-existing zstd stores to convert.
+  `compression: none` (re-stating `root`, since a patch REPLACES config) so the header cwd is edited
+  in place — Python has no stdlib zstd.
 - **`_dsh_project_key` ports dsh's `projectKey(cwd)` byte-for-byte** — golden-tested against a real
   store dir name, because the corruption guard compares the store's path to `logPath(root,
   header.cwd, id)`. Tests: `TestDshProjectKey`, `TestDshCordisPatchPersistence`, the dsh cases in
-  `TestMigrateSession`, `DshProjectionTailTest` resume cases. Verified end to end by QA driving a
-  real cross-host move.
+  `TestMigrateSession`, `DshProjectionTailTest` resume cases.
 
-## [L] (XERK-476) shipped: peer roster + cross-session messaging for dsh
-
-XERK-348 matched for dsh. The ROSTER was already runtime-independent (`_peer_rows`/
-`_write_peers_file` list any running session; `_launch_dsh` appends `PEERS_SYSTEM_PROMPT`;
-`build_dsh_guard_config` grants the `peers.tsv` read). [L] adds the MESSAGING, HUB-ROUTED both ways
-so the Claude-inbox protocol and the crossSessionInbound policy stay in ONE Python home:
-
-- **SEND**: a driver `send_message` tool emits `peer_send`; the hub resolves the roster name against
-  this host's running sessions and delivers peer-framed (Claude target via `_post_to_inbox` with the
-  dsh session's own name as `from`; dsh target via `ctl.input(kind="peer")`).
-- **RECEIVE**: the driver forges a `~/.claude/sessions/<pid>.json` record + `cc-socks/<pid>.sock`
-  under its own live pid so a Claude peer's native SendMessage lands, forwarding it as `peer_inbound`
-  for the hub to policy-check and inject. This is the ONE piece that depends on Claude Code's private,
-  versioned peer-record format — host-verified, not CI.
-- Both events STAGE on the reader thread and DELIVER off the beat on a worker (a callback may not
-  socket-write to another session). Mechanics + pitfalls: `.claude/rules/dsh-input.md`.
-
-## XERK-498 shipped: drop the per-session terminal/web-server; Turma-native Trajectory viewer
-
-The per-session dsh "terminal" (raw stdout of a headless process) and the `dsh --profile web` it ran
-(a loopback web server per session, kept alive purely for persistence) are both gone. Three
-invariants a change must not undo; mechanics in `.claude/rules/dsh-input.md` + `turma-sessions.md`:
+## XERK-498 — no per-session terminal or web server
 
 - **Per-session dsh runs a MINIMAL `[dsh-base, driver]` profile, not `--profile web`.** The driver's
-  own listening control socket is the keep-alive; `_launch_dsh` runs bare `dsh --profile <DSH_PROFILE>`
-  with no `--no-open`/`--port` and allocates no port. Tools come from base's global layer.
+  own listening control socket is the keep-alive; `_launch_dsh` runs bare `dsh --profile
+  <DSH_PROFILE>` with no `--no-open`/`--port` and allocates no port.
 - **No ttyd for a dsh session** — `_launch_ttyd` early-returns on `agentType=="dsh"`, the ONE choke
   point covering every launch path. The chat header hides "Terminal ▸" and shows "Trajectory ▸".
-- **The IN-DASHBOARD viewer is Turma-native, over the D3 native log — NOT a proxied `dsh web`.** `dsh
-  web` has no base-path flag, so it can't be sub-path-proxied per host the way ttyd's `-b` allows.
-  `archive.dshTrajectory` parses the log the raw archive already holds (`<tid>/dsh/*.jsonl`, XERK-469)
-  into turns/steps/tool-calls/tokens/timings, served by `GET /api/dsh/<tid>/trajectory`. Web-first;
-  Android/glasses in `android/PARITY.md`. Tests: `dshTrajectory` in `archive.test.js`, the
-  `/api/dsh/<id>/trajectory` case in `server.test.js`.
-- **XERK-501 adds a SECOND, direct-access viewer beside it: ONE host-wide `dsh web` per host** over
-  the shared store, so a dsh chat can be confirmed in dsh's OWN UI too. That per-session proxy blocker
-  does NOT apply to one host-wide instance — it lists every session off the shared store with no
-  sub-path, reached DIRECTLY on the host, and only READS the store (never drives the live per-session
-  processes, so the HITL/provider pitfalls don't apply). Mechanics in `.claude/rules/dsh-input.md`.
-
-## Open questions flagged to Malcolm (recorded on XERK-462)
-
-1. **Resource + retention sizing.** Does a host's memory/process budget need raising before dsh
-   sessions run beside Claude sessions (D1)? Does the archive raw-layer ceiling
-   (`ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES`) fit real dsh session sizes so the canonical native log we
-   keep for metrics (D3) is not silently truncated? A host / archive sizing follow-up, not code
-   here.
-2. **Attribution granularity.** Should PR/commit attribution visibly distinguish dsh-authored from
-   Claude-authored work, or is host-level attribution enough? Not needed for correctness.
-3. **Fate of the full rewrite.** These decisions treat the PoC Fleet Hub + dsh-plugin rewrite as out
-   of scope for XERK-460. Confirm the "alongside" integration SUPERSEDES the Turma-2.0 rewrite (or is
-   a deliberate stepping stone toward it), so `docs/turma-2.0-design.md` can be marked accordingly.
-4. **DeepSeek API vs local-only, and default.** Provision a `DEEPSEEK_API_KEY` and accept DeepSeek-API
-   spend, or start dsh local-only? And should dsh default to local-first?
+- **The IN-DASHBOARD viewer is Turma-native over the D3 native log — NOT a proxied `dsh web`**, which
+  has no base-path flag and so cannot be sub-path-proxied per host the way ttyd's `-b` allows.
+  `archive.dshTrajectory` parses the log the raw archive already holds, served by `GET
+  /api/dsh/<tid>/trajectory`. Tests: `dshTrajectory` in `archive.test.js`, the trajectory case in
+  `server.test.js`.
+- **XERK-501 adds ONE host-wide `dsh web` per host** over the shared store. The per-session proxy
+  blocker does not apply: it has no sub-path, is reached DIRECTLY on the host, and only READS the
+  store. Mechanics: `dsh-input.md`.
