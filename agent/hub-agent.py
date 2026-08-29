@@ -2862,10 +2862,12 @@ def ask_script_path():
 
 def qwen_ask_mcp_path():
     """Absolute path to the qwen AskUserQuestion MCP server (``qwen/ask_mcp.py``,
-    XERK-509 [Qwen C]). Qwen has no native AskUserQuestion tool, so this stdio MCP
-    server REGISTERS one whose call writes the same rendezvous file every question
-    surface reads and blocks for the operator's answer (answered by the existing
-    answer_question path — no client change)."""
+    XERK-509 [Qwen C]). Qwen's OWN native ``ask_user_question`` renders in-pane and
+    writes no rendezvous file (invisible to Turma), so ``_qwen_settings`` DISABLES
+    it (``tools.exclude``, see ``QWEN_NATIVE_ASK_TOOL``) and this stdio MCP server
+    provides the replacement whose call writes the same rendezvous file every
+    question surface reads and blocks for the operator's answer (answered by the
+    existing answer_question path — no client change)."""
     return os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "qwen", "ask_mcp.py")
 
@@ -2992,6 +2994,17 @@ ASK_HOOK_TIMEOUT_SEC = 660
 # question is never stale-dropped from the beat's pending read while the operator
 # is still deciding — the qwen analogue of ask.py's own 600s block.
 QWEN_QUESTION_BLOCK_TIMEOUT_SEC = 600
+
+# The BUILT-IN qwen tool the launcher DISABLES (XERK-509 D2, QA reopen XERK-520).
+# qwen 0.22.x ships a native `ask_user_question` that renders its HITL selector
+# in the PANE and writes NO QUESTIONS_DIR rendezvous file — so a structured
+# question is invisible to Turma and reads idle — and it name-collides with (and
+# shadows) the turma-ask MCP tool. `_qwen_settings` drops it via `tools.exclude`
+# so the model's only operator-question tool is our MCP one, which DOES route
+# through the QUESTIONS_DIR bridge. Exclusion matches a tool's REGISTERED name;
+# built-ins keep the bare name while an MCP tool is exposed server-prefixed
+# (`mcp__turma-ask__ask_user_question`), so this drops only the built-in.
+QWEN_NATIVE_ASK_TOOL = "ask_user_question"
 
 
 def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
@@ -14170,22 +14183,41 @@ class SessionManager:
                 # .claude/rules/qwen.md. Permission-mode parity is [Qwen P].
                 "autoAccept": True,
                 "approvalMode": "auto",
+                # DISABLE qwen's native `ask_user_question` (XERK-509 D2, QA
+                # reopen XERK-520). qwen 0.22.x ships one that renders its HITL
+                # selector IN THE PANE and writes NO QUESTIONS_DIR rendezvous
+                # file — so a structured question is invisible to Turma (paneBusy
+                # False, panePrompt None, question None, reads idle) — AND it
+                # name-collides with the turma-ask MCP tool below, the native one
+                # winning. `tools.exclude` drops a tool by its REGISTERED name;
+                # built-ins keep the bare name while our MCP tool is exposed
+                # server-prefixed (`mcp__turma-ask__ask_user_question`), so this
+                # removes ONLY the built-in and the MCP replacement — which DOES
+                # route through the bridge — becomes the model's sole operator-
+                # question tool. See QWEN_NATIVE_ASK_TOOL.
+                "exclude": [QWEN_NATIVE_ASK_TOOL],
             },
             # The directive rides the context file, loaded into the system
             # prompt — qwen's --append-system-prompt analogue.
             "context": {"fileName": QWEN_CONTEXT_FILENAME},
         }
-        # HITL structured questions (XERK-509 [Qwen C]): Qwen has no native
-        # AskUserQuestion tool, so REGISTER one via MCP — the one Claude-Code-
-        # compatible mechanism for a model-callable tool. The `turma-ask` MCP
-        # server (qwen/ask_mcp.py) exposes `ask_user_question`; when the model
-        # calls it, the server writes the SAME QUESTIONS_DIR/<sid>.req.json card
-        # every question surface reads and blocks for the operator's answer
-        # (dropped by the existing answer_question path — NO client change). The
-        # session id + rendezvous dir + block timeout ride the server's own env
-        # block (per-session). `python3 -SsE` matches the guard-hook security
-        # flags. (The exact `mcpServers` settings key is host-proof-only — qwen
-        # is not installed in CI; unit-tested via the server's JSON-RPC contract.)
+        # HITL structured questions (XERK-509 [Qwen C]): qwen's OWN native
+        # `ask_user_question` is invisible to Turma (in-pane, no rendezvous file)
+        # and is DISABLED above, so REGISTER a replacement via MCP — the one
+        # Claude-Code-compatible mechanism for a model-callable tool. The
+        # `turma-ask` MCP server (qwen/ask_mcp.py) exposes `ask_user_question`
+        # (surfaced to the model as `mcp__turma-ask__ask_user_question`); when the
+        # model calls it, the server writes the SAME QUESTIONS_DIR/<sid>.req.json
+        # card every question surface reads and blocks for the operator's answer
+        # (dropped by the existing answer_question path — NO client change). With
+        # the built-in gone the model selects this by the tool's DESCRIPTION, not
+        # a bare name (no directive names one). The session id + rendezvous dir +
+        # block timeout ride the server's own env block (per-session). `python3
+        # -SsE` matches the guard-hook security flags. (The `mcpServers`/
+        # `tools.exclude` settings keys are host-proof-only — qwen is not
+        # installed in CI; unit-tested via the server's JSON-RPC contract and the
+        # settings builder. `tools.exclude` key + prefix confirmed against the
+        # installed 0.22.2 bundle.)
         settings["mcpServers"] = {
             "turma-ask": {
                 "command": "python3",

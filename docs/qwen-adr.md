@@ -44,8 +44,12 @@ Recorded in full in `docs/qwen-g0-spike.md`; these five drove concrete code:
 
 1. **No native title mechanism** — so session naming needed the three-tier scheme (a dormant tier 1
    honours a future qwen that emits one).
-2. **No native AskUserQuestion tool** — so structured questions are registered via an MCP server
-   (`agent/qwen/ask_mcp.py`) rather than degraded to a yes/no approval.
+2. **~~No native AskUserQuestion tool~~ — WRONG (corrected by XERK-520 D2).** qwen 0.22.x DOES ship a
+   native `ask_user_question`, but it renders its selector in the PANE and writes no rendezvous file,
+   so it is invisible to Turma and shadows the MCP tool. So `_qwen_settings` DISABLES the built-in
+   (`tools.exclude:["ask_user_question"]`) and the MCP server (`agent/qwen/ask_mcp.py`, exposed
+   server-prefixed) is the structured-question tool the model actually reaches — still the SAME
+   operator card, not a yes/no approval. Details: `.claude/rules/qwen.md` [Qwen C] HITL (2).
 3. **The cwd→slug rule is uncertain** (G0 recorded `/`→`-`; Claude's own rule is every non-alnum→`-`)
    — so every native-log lookup GLOBs by pinned id instead of computing a slug.
 4. **Hook contract is Claude Code's, ported** — so the shared `guard.py`/`fileguard.py` deny policy is
@@ -75,6 +79,8 @@ host, qwen must not be enabled until that is resolved.
 Every one of these is unit-tested against its contract and awaits host confirmation:
 
 - the `mcpServers` settings key, and that qwen surfaces an MCP tool to its deferred-tool model;
+- the `tools.exclude` key actually dropping the native `ask_user_question` at runtime (key + name
+  matching confirmed by static bundle inspection, XERK-520; live confirmation gated on D1);
 - whether qwen honours a `permissions.deny` block at all (the G0 catalogue found no `permissions`
   key) — it is emitted as defence in depth, and the shim does not depend on it;
 - that hooks fire under `approvalMode:"auto"` (above).
