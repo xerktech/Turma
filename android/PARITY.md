@@ -541,7 +541,12 @@ those are marked `[MODEL]`.
   the visual pre-select. `AgentInfo` does not type `defaultRuntime` yet (decode-SAFE —
   `ignoreUnknownKeys` skips it until typed); to reach parity, type `AgentInfo.defaultRuntime: String?`
   and default `SpawnDialog`'s runtime choice to it (falling back to claude when absent or not on
-  offer), mirroring `sessions.html`'s `hostDefault`/`selRuntime`.
+  offer), mirroring `sessions.html`'s `hostDefault`/`selRuntime`. **AND — the load-bearing half — an
+  explicit "Claude Code"/"Claude Code Local" pick must SEND `agentType:"claude"` when the host default
+  is non-claude** (the web does this in `startSession`): a claude/local spawn normally OMITS
+  `agentType`, but an omitted `agentType` resolves to the host default agent-side, so on a
+  non-claude-default host omitting it silently runs the default runtime. Build the pre-select WITHOUT
+  this and Android reintroduces the exact XERK-521 defect an explicit claude pick is supposed to beat.
 - **P2 To-do checklist card + the dsh "Deep diving…" verb (Enable DSH To-Dos).** The web renders a
   `TodoWrite` / dsh `todo_write` tool call as a CHECKLIST (state glyph per row + a `1 in progress ·
   6 pending` count on the summary) instead of raw-JSON input — `renderTodoCard` in `chat.js`, fed by
