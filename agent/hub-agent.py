@@ -442,6 +442,29 @@ ARCHIVE_RAW_REL_LEN_MAX = 400
 # so it is not the archived artifact and must not be written into this dir.
 DSH_STORE_DIRNAME = "dsh"
 
+# The qwen analogue of DSH_STORE_DIRNAME (XERK-512, [Qwen][E]). qwen's native
+# session log is D3's canonical record for a qwen session — the full-fidelity
+# event stream metrics read, of which the pinned `<sid>.jsonl` transcript is a
+# lossy PROJECTION ([Qwen S1]). qwen writes that native log under its OWN home
+# (`~/.qwen/projects/<slug>/chats/<id>.jsonl`), which the raw archive layer does
+# NOT reach — so, like dsh, it is placed UNDER the project-slug session dir at
+# `<slug>/<sessionId>/qwen/`, where `_session_files` walks it as a raw sidecar
+# with NO new archive code. The difference from dsh is only WHO writes it there:
+# a dsh session's driver writes its feed directly, but qwen owns its native log,
+# so the projection TAIL (`qwen_session.QwenProjectionTail`) — already reading
+# that log off the beat to build the projection — MIRRORS its bytes here. Same
+# store-dir contract, same raw-layer ride; the launcher ([Qwen B]) points the
+# tail at this dir.
+#
+# Only the APPEND-ONLY event log belongs here (the raw layer's per-file cursor
+# ships bytes past an offset — right for an event stream, wrong for a
+# page-mutating index): any SQLite/index qwen rebuilds from the log must NOT be
+# mirrored in. There is no live-Trajectory reader for a qwen session (it has a
+# real ttyd TUI, unlike headless dsh), so — unlike dsh — a RUNNING qwen session
+# is not un-excluded from the manifest; its native log archives once the session
+# ends, for retention/metrics only.
+QWEN_STORE_DIRNAME = "qwen"
+
 
 def _archivable_rel(rel):
     """Whether the hub's allowlist can name this session-relative path."""
@@ -13601,8 +13624,16 @@ class SessionManager:
         import qwen_session
         sid = sess["id"]
         worktree = sess.get("worktreePath")
+        slug = _project_slug(worktree)
         transcript_path = os.path.join(
-            PROJECTS_ROOT, _project_slug(worktree), f"{claude_sid}.jsonl")
+            PROJECTS_ROOT, slug, f"{claude_sid}.jsonl")
+        # The raw-archive store dir for qwen's native log (XERK-512, [Qwen][E]):
+        # a sibling of the transcript under the pinned-id session dir, so the
+        # tail's mirror rides the raw layer as `<slug>/<sid>/qwen/...` with no
+        # new archive code. Named off claude_sid (== the pinned transcript id),
+        # exactly as the transcript is.
+        store_dir = os.path.join(PROJECTS_ROOT, slug, claude_sid,
+                                 QWEN_STORE_DIRNAME)
         old = self.qwen_tails.pop(sid, None)
         if old is not None:
             try:
@@ -13611,7 +13642,7 @@ class SessionManager:
                 pass
         tail = qwen_session.QwenProjectionTail(
             QWEN_PROJECTS_ROOT, transcript_path, claude_sid,
-            cwd=worktree, log=log, resume=resume)
+            cwd=worktree, log=log, resume=resume, store_dir=store_dir)
         tail.start()
         self.qwen_tails[sid] = tail
 
@@ -18650,11 +18681,13 @@ class SessionManager:
           <tid>/workflows/wf_<run>.json      the workflow run records (XERK-304)
           <tid>/tool-results/<id>.txt        overflowed tool output
           <tid>/dsh/...                      a dsh session's native event log (XERK-469)
+          <tid>/qwen/...                     a qwen session's native event log (XERK-512)
           <tid>/...                          whatever Claude Code adds next
 
-        A dsh session's canonical native log (D3, `.claude/rules/dsh.md`) is
-        written under `<tid>/dsh/` for exactly this reason — placed here it is a
-        raw sidecar like any other and needs no special case (DSH_STORE_DIRNAME).
+        A dsh or qwen session's canonical native log (D3, `.claude/rules/dsh.md`
+        / `.claude/rules/qwen.md`) is written under `<tid>/dsh/` or `<tid>/qwen/`
+        for exactly this reason — placed here it is a raw sidecar like any other
+        and needs no special case (DSH_STORE_DIRNAME / QWEN_STORE_DIRNAME).
 
         Deliberately NOT filtered to `*.jsonl`: the point of the raw layer is that
         nobody has to have predicted what would be worth keeping, and the files

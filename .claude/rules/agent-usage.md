@@ -207,7 +207,9 @@ already reads. The reconciliation, and the two things a change must not undo:
 - **The native event log is NEVER counted; the projection is the single copy.** dsh's canonical log
   at `<slug>/<claudeSessionId>/dsh/` (XERK-469 [E]) is neither a top-level `*.jsonl` nor under
   `subagents/`, so `_project_transcripts` skips it — counting both would double a dsh session's
-  spend. Do not teach the walk to read `<sid>/dsh/`.
+  spend. Do not teach the walk to read `<sid>/dsh/`. **A qwen session's native log at
+  `<slug>/<claudeSessionId>/qwen/`** (XERK-512 [Qwen E]) is skipped for the SAME reason and must stay
+  skipped — its projection is the single counted copy; do not teach the walk to read `<sid>/qwen/`.
 - **Subscription limits and the probe are CLAUDE-SUBSCRIPTION only, and dsh does not feed them.** A
   dsh session has no 5h/7d window — its model is a local/DeepSeek route with no pool shared with
   claude.ai (D5) — so nothing dsh spends touches the `limits` block, and there is deliberately no dsh

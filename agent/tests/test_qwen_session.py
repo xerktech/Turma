@@ -34,6 +34,11 @@ class QwenProjectionTailTest(unittest.TestCase):
         self.transcript = os.path.join(self.tmp, "projects", "slug",
                                        f"{self.sid}.jsonl")
         os.makedirs(os.path.dirname(self.transcript), exist_ok=True)
+        # The raw-archive store for qwen's native log (XERK-512): a sibling of
+        # the transcript under `<slug>/<sid>/qwen/`, walked by _session_files.
+        self.store_dir = os.path.join(self.tmp, "projects", "slug",
+                                      self.sid, "qwen")
+        self.mirror_path = os.path.join(self.store_dir, "chat.jsonl")
 
     def _rmtree(self):
         import shutil
@@ -49,11 +54,22 @@ class QwenProjectionTailTest(unittest.TestCase):
         with open(self.transcript, encoding="utf-8") as fh:
             return [json.loads(l) for l in fh if l.strip()]
 
-    def _tail(self, resume=False, use_glob=True):
+    def _tail(self, resume=False, use_glob=True, store=False):
         return qs.QwenProjectionTail(
             self.projects_root, self.transcript, self.sid,
             cwd="/work", log=lambda m: None, resume=resume,
-            events_path=None if use_glob else self.native_log)
+            events_path=None if use_glob else self.native_log,
+            store_dir=self.store_dir if store else None)
+
+    def _read_mirror(self):
+        if not os.path.exists(self.mirror_path):
+            return b""
+        with open(self.mirror_path, "rb") as fh:
+            return fh.read()
+
+    def _native_bytes(self):
+        with open(self.native_log, "rb") as fh:
+            return fh.read()
 
     def _user(self, text, uuid="u1"):
         return {"type": "user", "uuid": uuid, "timestamp": "2026-08-28T18:08:40.134Z",
@@ -172,6 +188,109 @@ class QwenProjectionTailTest(unittest.TestCase):
         tail._pump()
         self.assertEqual(tail.title(), "Refactor The Widget")
         self.assertTrue(tail.title_final())
+
+
+    # --- native-log mirror into the raw-archive store (XERK-512 [Qwen E]) ----
+
+    def test_mirror_copies_the_native_log_byte_for_byte(self):
+        # The tail mirrors qwen's native event log into <slug>/<sid>/qwen/ so it
+        # rides the raw archive layer — kept in FULL, not a rendering of it.
+        self._append_native(self._user("hello"))
+        self._append_native(self._assistant("hi there"))
+        tail = self._tail(use_glob=False, store=True)
+        self.addCleanup(tail.stop)
+        tail._pump()
+        self.assertEqual(self._read_mirror(), self._native_bytes())
+
+    def test_mirror_is_incremental_and_append_only(self):
+        # Only the bytes appended since the last pump are copied — the raw layer
+        # ships append-only deltas, so the mirror must grow that way too.
+        self._append_native(self._user("one"))
+        tail = self._tail(use_glob=False, store=True)
+        self.addCleanup(tail.stop)
+        tail._pump()
+        after_first = self._read_mirror()
+        self.assertEqual(after_first, self._native_bytes())
+        self._append_native(self._assistant("two"))
+        tail._pump()
+        full = self._read_mirror()
+        self.assertEqual(full, self._native_bytes())
+        # The second pump appended; it did not rewrite the prefix.
+        self.assertTrue(full.startswith(after_first))
+
+    def test_mirror_is_complete_even_when_the_projection_resumes_at_eof(self):
+        # The mirror is INDEPENDENT of the projection cursor: on resume the
+        # projection starts at EOF (to avoid doubling the transcript), but the
+        # mirror does not yet exist, so it must still copy the WHOLE native log —
+        # the canonical record for metrics must be complete regardless.
+        self._append_native(self._user("old turn"))
+        self._append_native(self._assistant("old reply"))
+        resumed = self._tail(resume=True, use_glob=False, store=True)
+        self.addCleanup(resumed.stop)
+        resumed._pump()
+        # Projection skipped the history (resume-at-EOF)...
+        self.assertEqual(self._read_transcript(), [])
+        # ...but the raw mirror carries it in full.
+        self.assertEqual(self._read_mirror(), self._native_bytes())
+
+    def test_mirror_resumes_from_its_own_size_across_a_restart(self):
+        # A manager restart (adopt) makes a NEW tail over the SAME native log
+        # while a partial mirror already exists on disk. The new tail must resume
+        # the copy from the mirror's current size — catching up bytes qwen wrote
+        # while the tail was dead, and never re-copying from zero (which would
+        # double the mirror).
+        self._append_native(self._user("before restart"))
+        first = self._tail(use_glob=False, store=True)
+        first._pump()
+        first.stop()
+        mirrored = self._read_mirror()
+        self.assertEqual(mirrored, self._native_bytes())
+        # qwen keeps appending while the tail is dead, then a fresh tail adopts.
+        self._append_native(self._assistant("during the gap"))
+        self._append_native(self._user("after restart"))
+        adopted = self._tail(resume=True, use_glob=False, store=True)
+        self.addCleanup(adopted.stop)
+        adopted._pump()
+        full = self._read_mirror()
+        self.assertEqual(full, self._native_bytes())
+        self.assertTrue(full.startswith(mirrored))          # no re-copy from zero
+        self.assertEqual(full.count(b"before restart"), 1)  # prefix not doubled
+
+    def test_mirror_freezes_intact_when_the_native_log_is_rewritten(self):
+        # If the native log is rewritten shorter than the mirror, the mirror
+        # holds the longer history — never truncate the archived copy to match
+        # (the same rule the raw archive draws for a shrunk source). And once a
+        # rewrite is seen the mirror FREEZES: a subsequent regrow within the same
+        # tail must NOT splice a diverged prefix onto the archived copy (removing
+        # the freeze would corrupt it here — this pins the guard as load-bearing).
+        self._append_native(self._user("kept history"))
+        self._append_native(self._assistant("more history"))
+        tail = self._tail(use_glob=False, store=True)
+        self.addCleanup(tail.stop)
+        tail._pump()
+        kept = self._read_mirror()
+        self.assertEqual(kept, self._native_bytes())
+        # Rewrite the native log to something shorter, then let it regrow LARGER
+        # than the original — the pathological rewrite case.
+        with open(self.native_log, "wb") as fh:
+            fh.write(b"{}\n")
+        tail._pump()
+        self.assertEqual(self._read_mirror(), kept)  # unchanged, longer copy wins
+        self._append_native(self._user("this is a much longer replacement turn"))
+        self._append_native(self._assistant("and another one to grow well past"))
+        tail._pump()
+        # Still exactly the pre-rewrite bytes: frozen, not appended-onto.
+        self.assertEqual(self._read_mirror(), kept)
+
+    def test_no_store_dir_disables_the_mirror(self):
+        # store_dir=None (older callers / a non-archiving context) is a clean
+        # no-op: the projection still runs, nothing is written to a store.
+        self._append_native(self._user("no store"))
+        tail = self._tail(use_glob=False, store=False)
+        self.addCleanup(tail.stop)
+        tail._pump()
+        self.assertEqual(len(self._read_transcript()), 1)
+        self.assertFalse(os.path.exists(self.mirror_path))
 
 
 if __name__ == "__main__":
