@@ -2434,6 +2434,72 @@ class TestDshLivenessSeam(unittest.TestCase):
         self.assertNotIn("s1", sm.dsh_status)
 
 
+class TestQwenLivenessInReport(ProjectDirMixin, unittest.TestCase):
+    """XERK-511 [Qwen D]: the read-side state of a qwen session. Unlike dsh [D]
+    (headless, paneBusy from the control socket), a qwen session has a REAL pane,
+    so paneBusy/modeActual/panePrompt come from the SAME `_pane_status` scrape a
+    Claude session uses — no dsh cache, no agentType branch. Everything else in
+    the report is transcript-derived from the [Qwen S1] projection, exactly like
+    Claude. This mirrors TestDshLivenessInReport but asserts the PANE PATH — so
+    sessionWorking, liveState, the readyForReview mirrors and the ready-for-review
+    alert read a qwen session with no change and cannot drift."""
+
+    def _txn(self, role, text, tool_use=False):
+        content = [{"type": "text", "text": text}]
+        if tool_use:
+            content.append({"type": "tool_use", "name": "Bash",
+                            "input": {"command": "ls"}})
+        return {"type": role, "message": {"role": role, "content": content}}
+
+    def test_qwen_busy_comes_from_the_pane_not_the_dsh_cache(self):
+        # A qwen session scrapes its pane like Claude. Pass a dsh_status alongside
+        # agent_type="qwen" and assert it is IGNORED: the branch keys on exactly
+        # "dsh", so a stray cache entry can never source a qwen session's liveness.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self._txn("assistant", "done")])
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(True, "plan", None)) as ps:
+            rep = ha.session_report(self.WORKDIR, {}, "agent-qwen",
+                                    agent_type="qwen",
+                                    dsh_status={"status": "idle"})
+        ps.assert_called_once()
+        self.assertIs(rep["paneBusy"], True)
+        self.assertEqual(rep["modeActual"], "plan")
+        # Transcript-derived ready inputs populate from the projection, exactly as
+        # for Claude — this is what makes readyForReview's finished-turn branch
+        # work unchanged for a qwen session.
+        self.assertEqual(rep["lastRole"], "assistant")
+        self.assertIs(rep["lastHasToolUse"], False)
+        self.assertIsNotNone(rep["transcriptAgeSec"])
+
+    def test_qwen_pane_prompt_and_idle_ride_the_pane(self):
+        # A blocking approval dialog and an idle turn both come off the pane for a
+        # qwen session; panePrompt is what makes a blocked qwen read ready-for-
+        # review (waiting on a human) rather than idle.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self._txn("assistant", "hi")])
+        prompt = {"prompt": "Allow Bash?", "options": ["Yes", "No"]}
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, None, prompt)):
+            rep = ha.session_report(self.WORKDIR, {}, "agent-qwen",
+                                    agent_type="qwen")
+        self.assertIs(rep["paneBusy"], False)
+        self.assertEqual(rep["panePrompt"], prompt)
+
+    def test_qwen_last_tool_use_rides_the_projected_transcript(self):
+        # lastHasToolUse is read from the projected JSONL (the run_shell_command ->
+        # Bash map is [Qwen S1]'s job), not the pane — a finished tool turn must
+        # keep the session OUT of readyForReview's finished-turn branch.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self._txn("assistant", "running", tool_use=True)])
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, None, None)):
+            rep = ha.session_report(self.WORKDIR, {}, "agent-qwen",
+                                    agent_type="qwen")
+        self.assertEqual(rep["lastRole"], "assistant")
+        self.assertIs(rep["lastHasToolUse"], True)
+
+
 class TestStablePaneBusy(unittest.TestCase):
     """_stable_pane_busy suppresses the busy->idle flicker a single mid-repaint
     capture would otherwise cause: a busy read is instant, an idle read is
@@ -18365,6 +18431,180 @@ class TestDshArchiveSync(TestArchiveSync):
         self.assertEqual(stored[native_rel], os.path.getsize(path))
 
 
+class TestQwenArchiveSync(TestArchiveSync):
+    """A qwen session archives with BOTH layers and no new archive code
+    (XERK-512, [Qwen][E]) — the qwen analogue of TestDshArchiveSync.
+
+    Same symmetry as dsh: the qwen->Claude-JSONL projection ([Qwen S1]) needs no
+    new READER because it is named `<slug>/<sid>.jsonl` like any transcript, and
+    the native event log needs no new WRITER in the archive because the tail
+    MIRRORS it under `<slug>/<sid>/qwen/` (QWEN_STORE_DIRNAME) like any raw
+    sidecar. These tests pin that a qwen-SHAPED session on disk — projection at
+    the top level, native event log under `<sid>/qwen/` — flows through the
+    existing manifest and both delta pushes unchanged. The session is built the
+    way [Qwen S1]'s own tests build one: from real qwen native events
+    (`qwen_corpus.json`) run through the real projector.
+    """
+
+    def _qt(self):
+        """Load the real qwen projector (agent/qwen_transcript.py), as [Qwen S1]'s
+        own test does — the projection under test is genuine qwen output, not a
+        hand-rolled JSONL fixture that could drift from the real shape."""
+        path = os.path.join(AGENT_DIR, "qwen_transcript.py")
+        spec = importlib.util.spec_from_file_location("qwen_transcript", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _qwen_events(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "qwen_corpus.json")) as f:
+            return json.load(f)
+
+    def _build_qwen_session(self, sm, wt="/w/.turma/worktrees/Turma/qwen1",
+                            sid="q1"):
+        """Lay a qwen session on disk the way the launcher's tail (XERK-509 +
+        XERK-512) leaves it:
+
+          <slug>/<sid>.jsonl         the S1 projection (rendered layer reads this)
+          <slug>/<sid>/qwen/chat.jsonl   the native log the tail MIRRORS (raw)
+
+        Returns (slug, native_rel, native_bytes)."""
+        qt = self._qt()
+        events = self._qwen_events()
+        # The projection — exactly what the tail appends to the transcript.
+        entries = qt.project_log(events, session_id=sid, cwd=wt)
+        slug = ha._project_slug(wt)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, sid + ".jsonl"),
+                    [json.dumps(e, ensure_ascii=False) for e in entries])
+        # The native event log — qwen's canonical record (D3), mirrored byte for
+        # byte into the raw store. Its bytes are the append-only event stream,
+        # which is what the raw layer's per-file cursor is built for.
+        native = b"".join(
+            (json.dumps(e, ensure_ascii=False) + "\n").encode() for e in events)
+        native_rel = os.path.join(sid, ha.QWEN_STORE_DIRNAME, "chat.jsonl")
+        self._nested(slug, sid,
+                     os.path.join(ha.QWEN_STORE_DIRNAME, "chat.jsonl"), native)
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm.closed = [{"id": "s", "worktreePath": wt, "summary": "qwen task",
+                      "createdAt": "2026-07-01T00:00:00Z"}]
+        return slug, native_rel, native
+
+    def test_the_store_dir_is_a_fixed_named_contract(self):
+        # The tail ([Qwen C]) and this layer must agree on ONE dir name, so a
+        # rename can't strand the native log outside the archive silently.
+        self.assertEqual(ha.QWEN_STORE_DIRNAME, "qwen")
+
+    def test_a_qwen_session_appears_in_the_manifest_with_both_layers(self):
+        sm = self.make_manager()
+        slug, native_rel, _ = self._build_qwen_session(sm)
+        manifest = sm._archive_manifest()
+        self.assertEqual(len(manifest), 1)
+        m = manifest[0]
+        # RENDERED: the projection is the transcript the manifest enumerates.
+        self.assertEqual(m["transcriptId"], "q1")
+        self.assertEqual(m["repo"], "Turma")
+        self.assertGreater(m["size"], 0)
+        # RAW: the native event log rides as a sidecar, no special case.
+        rels = [rel for rel, _s in (m["rawFiles"] or [])]
+        self.assertIn("q1.jsonl", rels)
+        self.assertIn(native_rel, rels)
+
+    def test_session_files_lists_the_native_qwen_log(self):
+        sm = self.make_manager()
+        slug, native_rel, native = self._build_qwen_session(sm)
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        sizes = dict(sm._session_files(proj, "q1"))
+        self.assertIn(native_rel, sizes)
+        self.assertEqual(sizes[native_rel], len(native))
+        # Everything the raw layer offers is under the project-slug SESSION tree
+        # (`<sid>.jsonl` or `<sid>/...`) — never the worktree (the raw layer
+        # excludes it), which is exactly why the tail mirrors here.
+        for rel in sizes:
+            self.assertTrue(rel == "q1.jsonl" or rel.startswith("q1" + os.sep),
+                            rel)
+
+    def test_the_rendered_layer_ships_the_projection(self):
+        sm = self.make_manager()
+        self._build_qwen_session(sm)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed = []
+
+        def fake_chunk(tid, body):
+            pushed.append((tid, body.get("startOffset"), body.get("endOffset")))
+            return {"bytesStored": body.get("endOffset")}
+
+        with mock.patch.object(sm, "_post_archive_chunk", fake_chunk):
+            sm._archive_deltas({})
+        self.assertTrue(pushed, "the qwen projection ships through the rendered layer")
+        self.assertEqual({t for t, _s, _e in pushed}, {"q1"})
+
+    def test_the_raw_layer_ships_the_native_log_byte_for_byte(self):
+        sm = self.make_manager()
+        slug, native_rel, native = self._build_qwen_session(sm)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        stored = {}
+        pushed = []
+
+        def fake_post(tid, rel, start, raw):
+            pushed.append((tid, rel, start, raw))
+            if start != stored.get(rel, 0):
+                return {"stored": stored.get(rel, 0)}
+            stored[rel] = start + len(raw)
+            return {"stored": stored[rel]}
+
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({})
+        got = {rel: b"".join(r for _t, rl, _s, r in pushed if rl == rel)
+               for _t, rel, _s, _r in pushed}
+        # The native event log went up byte-for-byte, not a rendering of it —
+        # this is D3's canonical record, kept in full for metrics/retention.
+        self.assertIn(native_rel, got)
+        self.assertEqual(got[native_rel], native)
+
+    def test_a_resumed_qwen_log_ships_only_the_appended_bytes(self):
+        # The tail mirrors the native log append-only into the SAME file across a
+        # resume, so the raw layer's per-file cursor ships only the tail, exactly
+        # as for a resumed Claude/dsh transcript.
+        sm = self.make_manager()
+        slug, native_rel, native = self._build_qwen_session(sm)
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        path = os.path.join(proj, native_rel)
+        first = os.path.getsize(path)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        stored = {}
+        pushed = []
+
+        def fake_post(tid, rel, start, raw):
+            pushed.append((rel, start, len(raw)))
+            if start != stored.get(rel, 0):
+                return {"stored": stored.get(rel, 0)}
+            stored[rel] = start + len(raw)
+            return {"stored": stored[rel]}
+
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({})
+        self.assertEqual(stored[native_rel], first)
+
+        # Resume: append one more native event line, re-manifest, sync with the
+        # hub's cursor at `first`. Only the appended bytes go up.
+        with open(path, "ab") as f:
+            f.write(json.dumps({"type": "user", "uuid": "z9",
+                                "message": {"role": "user",
+                                "parts": [{"text": "again"}]}}).encode() + b"\n")
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed.clear()
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({"q1": {native_rel: first}})
+        tail = [p for p in pushed if p[0] == native_rel]
+        self.assertEqual(len(tail), 1)
+        self.assertEqual(tail[0][1], first)  # started at the old EOF, not 0
+        self.assertEqual(stored[native_rel], os.path.getsize(path))
+
+
 class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
     """The archive's SendUserFile payload budget (XERK-267): the previews are
     bounded per delivery but unbounded relative to the transcript, so a
@@ -24221,6 +24461,46 @@ class TestQwenSessionArms(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["summary"], "Generated Qwen Title")
         self.assertNotIn("summaryProvisional", sess)
         one_shot.assert_not_called()  # a native title needs no one-shot
+
+    def test_seed_qwen_summary_never_clobbers_a_non_provisional_name(self):
+        # XERK-511 [Qwen D]: the override is scoped to the seeder's OWN provisional
+        # name. A ticket/migrated name (summary set, summaryProvisional unset) is
+        # left ALONE even when a native title is available and even though the
+        # first prompt would otherwise seed a name — matching the Claude ticket-
+        # naming contract. No one-shot is spent on an already-named session.
+        sm = self.make_manager()
+        wd = "/w/.turma/worktrees/Turma/q3"
+        self._qwen_transcript(wd, "some prompt")
+        sess = {"id": "q3", "status": "running", "agentType": "qwen",
+                "worktreePath": wd, "claudeSessionId": "qsid",
+                "summary": "XERK-511 read-side semantics"}  # a ticket name
+        sm.registry = [sess]
+        sm.qwen_tails["q3"] = types.SimpleNamespace(
+            title=lambda: "Generated Qwen Title", title_final=lambda: True)
+        with mock.patch.object(ha, "QWEN_MODEL", "qwen3-coder"), \
+             mock.patch.object(ha, "QWEN_MODEL_BASE_URL", "https://gw/v1"), \
+             mock.patch.object(sm, "_start_qwen_summary") as one_shot:
+            sm._seed_summaries()
+        self.assertEqual(sess["summary"], "XERK-511 read-side semantics")
+        self.assertNotIn("summaryProvisional", sess)
+        one_shot.assert_not_called()
+
+    def test_seed_qwen_summary_never_clobbers_a_manual_rename(self):
+        # An operator rename (summaryManual) outranks every tier, including a
+        # native title — a hand-set name is final on any runtime.
+        sm = self.make_manager()
+        wd = "/w/.turma/worktrees/Turma/q4"
+        self._qwen_transcript(wd, "some prompt")
+        sess = {"id": "q4", "status": "running", "agentType": "qwen",
+                "worktreePath": wd, "claudeSessionId": "qsid",
+                "summary": "My Own Name", "summaryManual": True}
+        sm.registry = [sess]
+        sm.qwen_tails["q4"] = types.SimpleNamespace(
+            title=lambda: "Generated Qwen Title", title_final=lambda: True)
+        with mock.patch.object(sm, "_start_qwen_summary") as one_shot:
+            sm._seed_summaries()
+        self.assertEqual(sess["summary"], "My Own Name")
+        one_shot.assert_not_called()
 
     def test_start_qwen_summary_uses_qwen_binary_not_claude(self):
         sm = self.make_manager()

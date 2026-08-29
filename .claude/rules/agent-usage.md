@@ -4,9 +4,12 @@ paths:
   - "agent/hooks/statusline.py"
   - "agent/dsh_transcript.py"
   - "agent/dsh_session.py"
+  - "agent/qwen_transcript.py"
+  - "agent/qwen_session.py"
   - "agent/tests/test_hub_agent.py"
   - "agent/tests/test_statusline.py"
   - "agent/tests/test_dsh_transcript.py"
+  - "agent/tests/test_qwen_transcript.py"
 ---
 
 # Usage aggregates, the attribution ledger and subscription limits
@@ -207,7 +210,9 @@ already reads. The reconciliation, and the two things a change must not undo:
 - **The native event log is NEVER counted; the projection is the single copy.** dsh's canonical log
   at `<slug>/<claudeSessionId>/dsh/` (XERK-469 [E]) is neither a top-level `*.jsonl` nor under
   `subagents/`, so `_project_transcripts` skips it — counting both would double a dsh session's
-  spend. Do not teach the walk to read `<sid>/dsh/`.
+  spend. Do not teach the walk to read `<sid>/dsh/`. **A qwen session's native log at
+  `<slug>/<claudeSessionId>/qwen/`** (XERK-512 [Qwen E]) is skipped for the SAME reason and must stay
+  skipped — its projection is the single counted copy; do not teach the walk to read `<sid>/qwen/`.
 - **Subscription limits and the probe are CLAUDE-SUBSCRIPTION only, and dsh does not feed them.** A
   dsh session has no 5h/7d window — its model is a local/DeepSeek route with no pool shared with
   claude.ai (D5) — so nothing dsh spends touches the `limits` block, and there is deliberately no dsh
@@ -218,3 +223,42 @@ already reads. The reconciliation, and the two things a change must not undo:
   running dsh is still logged into Claude (the mounted login powers summaries/triage/the probe), so
   `subscription_identity` — per-host, off the Claude config — reports the same account whether or not
   a dsh session is running. A dsh-only-active host groups on its Claude account like any other.
+
+## qwen sessions ride this half unchanged too (XERK-513 [Qwen G])
+
+The Qwen runtime (XERK-504) is the interactive-TUI analogue of dsh, and its usage reaches every
+surface here through the SAME code with no qwen branch — same reconciliation as dsh above, because
+[Qwen S1]'s projection (`qwen_transcript.py`) writes qwen spend into the exact
+`message.usage`/`message.model` shape this file already reads. **[Qwen G] added NO aggregation code:
+the projection's `_map_usage` hardening was already folded into [S1], so this ticket is the
+confirmation plus the end-to-end test.** The two things a change must not undo:
+
+- **Token aggregates + the attribution ledger cost qwen NO new code; an `agentType` branch in the
+  aggregation is the regression to avoid.** A qwen session is an ordinary session here:
+  `_remember_usage` records its worktree→repo at spawn, and its spend is the PROJECTION transcript
+  `<slug>/<claudeSessionId>.jsonl` (`QwenProjectionTail`), whose assistant entries carry
+  `message.usage` (Gemini `usageMetadata` mapped by `_map_usage`) and a real `message.model`. So
+  `_accumulate_usage` / `_token_count` / `repo_usage_report` fold it, `retiredUsage` (XERK-338)
+  carries it after the host is gone, and the per-model breakdown attributes it — all by
+  construction. No heartbeat field is added (usage is `agentType`-agnostic).
+- **Local / OpenAI-compatible model ids just APPEAR in the per-model breakdown and may DOMINATE.**
+  They are not `<synthetic>` (no `<...>` name), so `_accumulate_usage`'s guard leaves them in. The
+  one care is at the projection: `_map_usage` returns None for a usage-less OR all-zero block
+  (common on a local endpoint that reports no counts), so it does NOT plant a phantom zero-token
+  model row. This is the `<synthetic>` guard's job done at the projector. Tests:
+  `TestQwenUsageReportEndToEnd`, `TestQwenProjectionAccounting`, `TestQwenUsageMapping`
+  (`test_all_zero_usage_projects_no_usage_key`) in `test_qwen_transcript.py`.
+- **The native event log is NEVER counted; the projection is the single copy.**
+  `_project_transcripts` counts only a slug's top-level `*.jsonl` (the projection the tail appends
+  into `PROJECTS_ROOT`) plus `subagents/**`. qwen's native log is in neither: it lives in qwen's own
+  home (`QWEN_PROJECTS_ROOT`, `~/.qwen/projects/<slug>/chats/<id>.jsonl`), and its raw ARCHIVE copy
+  ([Qwen E], XERK-512) is a sidecar at `<slug>/<sid>/qwen/chat.jsonl` — a raw sidecar like dsh's
+  `<sid>/dsh/`, which the usage walk does not read. So it can never be double-counted. Do not teach
+  the walk to read `<sid>/qwen/`.
+- **Subscription limits, the probe and the CARD stay Claude-only, and a qwen session never feeds
+  them.** qwen has no 5h/7d window — its model is an OpenAI-compatible route with no pool shared with
+  claude.ai — so nothing qwen spends touches `limits`, and `_start_summary` REFUSES a qwen session
+  (as it does dsh) so no Claude summarizer turn is spent on a runtime that may have no Claude login.
+  The probe runs against the mounted subscription login and sources nothing from the qwen route;
+  `subscription_identity` is per-host off the Claude config, so a qwen session never moves the card.
+  Never wire qwen spend into `limits`.

@@ -245,14 +245,107 @@ socket. The ONE net-new module is the projection tail. Invariants a change must 
   starts at the native log's EOF (qwen `--resume` appends in place). Wired in `_launch_qwen`
   (`_start_qwen_tail`), reattached on the resume-on-boot ADOPT path (the tail died with the manager
   while the TUI kept appending), and stopped in `_forget_session_caches`/`_teardown_qwen`.
-- **Known gap: qwen's NATIVE log is not archived.** It lives under `~/.qwen/projects/`, outside the
-  Claude `<tid>/` tree the raw archive walks, so only the PROJECTION (the top-level `<id>.jsonl`)
-  archives — unlike dsh's `<tid>/dsh/` native log. Metrics-from-native-log is out of [Qwen C]'s scope.
+- **qwen's NATIVE log is archived by [Qwen E]** (XERK-512, below): the tail mirrors it under
+  `<slug>/<sid>/qwen/`, so the native log rides the raw layer beside the projection. [Qwen C] itself
+  ships without that mirror — only the PROJECTION (the top-level `<id>.jsonl`) archives here.
 - Tests: `test_qwen_session.py` (tail: glob discovery, resume-at-EOF, incremental, title), `test_qwen_ask_mcp.py`
   (the MCP round-trip + the rendezvous-file shape), `TestQwenSessionArms` in `test_hub_agent.py`
   (busy markers, the `›` approval parse, digit+Enter, ask-MCP registration, the three naming tiers,
   teardown), the qwen busy cases in `tunnel-agent.test.js`. Real-qwen legs are host-proof only (qwen
   is not installed in CI) — the same footing [D]/[E]/[J] shipped on for dsh.
+
+## [Qwen D] (XERK-511) shipped: busy / ready-for-review / summary semantics
+
+The read-side of a qwen session's state — the dsh [D] (`.claude/rules/dsh.md`) analogue, but SIMPLER
+because a qwen session has a REAL pane. The implementation already rode in on [Qwen C] (the pane-aware
+liveness + the naming tiers); [Qwen D] is the read-side VERIFICATION that PINS these invariants:
+
+- **`session_report` has NO qwen branch — a qwen session takes the CLAUDE pane path** (the `else` of
+  the `agent_type == "dsh"` branch). paneBusy/modeActual/panePrompt come from `_pane_status`, NOT a
+  socket cache (dsh needed the cache only because it was headless). `dsh_status` is ignored for a
+  qwen session even if one is passed — the branch keys on exactly `"dsh"`. So `sessionWorking`,
+  `liveState`, the readyForReview mirrors and the ready-for-review alert are UNCHANGED and CANNOT
+  drift: the CLAUDE.md "Working = paneBusy OR live agents" contract holds verbatim for qwen (verified
+  — `sessionWorking`/`readyForReview` in `server.js` read only the wire fields, no `agentType`).
+- **Everything OTHER than liveness stays transcript-derived from the [Qwen S1] projection**:
+  `lastRole`, `lastHasToolUse`, `transcriptAgeSec` and the PR scan read the projected
+  `<claudeSessionId>.jsonl` with no change — which is what makes readyForReview's finished-turn
+  branch work identically for a qwen session.
+- **Naming override is scoped to the seeder's OWN provisional name** (`_seed_qwen_summary`): a
+  `summaryManual` rename, or any non-provisional `summary` (a ticket session's `<key> <summary>`, a
+  migrated name), is left ALONE — even when a native title or first prompt is available and no
+  one-shot is spent — matching the Claude ticket-naming contract (`agent-board.md`). This is the same
+  `if summaryManual: return` / `if current and not provisional: return` guard `_seed_dsh_summary`
+  uses.
+- Tests: `TestQwenLivenessInReport` in `test_hub_agent.py` (the pane path, dsh_status ignored,
+  pane-sourced panePrompt, transcript-derived lastRole/lastHasToolUse — mirroring
+  `TestDshLivenessInReport` but asserting `_pane_status` IS called), and the
+  `test_seed_qwen_summary_never_clobbers_*` cases in `TestQwenSessionArms`.
+
+## [Qwen E] (XERK-512) shipped: archive sync — projection (rendered) + native log (raw)
+
+Retention, the qwen analogue of dsh [E] (XERK-469, `.claude/rules/dsh.md`). D3's obligation made
+concrete for qwen: a qwen session archives BOTH layers with NO new archive code — only a store-dir
+contract. The one difference from dsh is WHO writes the native log into the store.
+
+- **The projection (`<slug>/<sid>.jsonl`) rides the RENDERED layer unchanged** — it is a top-level
+  `*.jsonl` in the usage ledger's slug, enumerated by `_archive_manifest` like any transcript.
+- **The native event log rides the RAW layer at `<slug>/<sid>/qwen/`** (`QWEN_STORE_DIRNAME`, a fixed
+  `chat.jsonl`), which `_session_files` already walks as a raw sidecar — so `_archive_raw_deltas`
+  ships it byte-for-byte with no special case, exactly as it does dsh's `<sid>/dsh/`.
+- **The TAIL mirrors it, not the launcher** — the load-bearing reconciliation. A dsh session's driver
+  writes its feed directly into `<sid>/dsh/`, but qwen owns its native log and writes it under its OWN
+  home (`~/.qwen/projects/<slug>/chats/<id>.jsonl`), which the raw layer does not reach. So
+  `QwenProjectionTail` — already reading that log off the beat to build the projection — copies its
+  bytes into the store. The mirror is APPEND-ONLY and on its OWN cursor (the mirror file's size),
+  independent of the projection cursor: the projection may start at EOF on resume to avoid doubling
+  the transcript, but the mirror always copies the WHOLE native log, and a manager restart / adopt
+  resumes the copy from the mirror's size — catching up every native byte written while the tail was
+  dead (a superset of what the projection can safely re-read). A native log rewritten SHORTER than the
+  mirror leaves the archived copy intact (the raw layer's shrunk-source rule).
+- **Only the append-only event log rides raw** — any SQLite/index qwen rebuilds from the log must NOT
+  be mirrored (the per-file cursor ships bytes past an offset, wrong for a page-mutating DB). The tail
+  copies only the native `<id>.jsonl` stream.
+- **A RUNNING qwen session is NOT un-excluded from the manifest** — unlike dsh. dsh un-excludes a live
+  session so its in-dashboard Trajectory populates; qwen has a real ttyd TUI and NO Trajectory
+  analogue, so its native log is retention/metrics only and archives once the session ENDS, like any
+  Claude session. `_teardown_qwen` drops only the 0600 env file, never the store dir, so the retained
+  log survives kill (it lives under `PROJECTS_ROOT`, not the worktree delete removes).
+- **The native log is never double-counted in usage** — `<sid>/qwen/chat.jsonl` is neither a top-level
+  `*.jsonl` nor under `subagents/`, so `_project_transcripts` skips it; the projection is the single
+  counted copy. Do not teach the walk to read `<sid>/qwen/` (the same rule dsh's note draws).
+- **No beat-loop budget regression** — the mirror runs on the tail's own daemon thread (never the
+  beat, never raising), and archive sync stays on the sync worker (XERK-395). [Qwen E] adds no code to
+  the beat or the archive functions, only the store-dir contract.
+- Tests: `TestQwenArchiveSync` in `test_hub_agent.py` (manifest + both delta pushes over the real
+  projector/corpus, mirroring `TestDshArchiveSync`) and the `test_mirror_*` cases in
+  `test_qwen_session.py` (the tail's byte-for-byte copy, incremental append, resume-complete,
+  restart catch-up, shorter-log-left-intact).
+
+## [Qwen G] (XERK-513) shipped: usage aggregates + per-model attribution
+
+D4's usage obligation for qwen, the dsh [G] (XERK-471) analogue — a qwen session's spend charts on
+the Usage page and the dashboard token tiles IDENTICALLY to a Claude session, with no schema change
+and no `agentType` branch in the aggregation, because [Qwen S1]'s projection already writes
+`message.usage`/`message.model` in the shape the ledger reads. The full contract (why the token
+aggregates + attribution ledger cost qwen nothing, why local/OpenAI-compat ids appear in the
+per-model breakdown and may dominate, why the native log is never double-counted, and why the
+subscription `limits`/probe/card stay Claude-only) lives in **`.claude/rules/agent-usage.md`**
+("qwen sessions ride this half unchanged too"), whose `paths:` now loads for the qwen modules.
+
+- **[Qwen G] added NO aggregation code.** The `_map_usage` all-zero-block hardening that dsh [G]
+  needed was already folded into [Qwen S1] (`qwen_transcript.py`), so this ticket is the
+  confirmation plus the end-to-end test.
+- **The native log is never double-counted — including [Qwen E]'s raw mirror.** `_project_transcripts`
+  counts only a slug's top-level `*.jsonl` (the projection) plus `subagents/**`. qwen's native log
+  sits in neither place a usage walk reads: not in qwen's own home (`~/.qwen/projects/…`), and not in
+  [Qwen E]'s raw archive mirror at `<slug>/<sid>/qwen/chat.jsonl` (a raw sidecar, like dsh's
+  `<sid>/dsh/`). So the projection is the single counted copy — do not teach the walk to read
+  `<sid>/qwen/`.
+- Tests: `TestQwenUsageReportEndToEnd` (mirrors `TestDshUsageReportEndToEnd`) drives the REAL
+  projector's output through `repo_usage_report`/`_aggregate_project` on disk, proving host + per-repo
+  totals and the local/OpenAI-compat per-model breakdown; `TestQwenProjectionAccounting`/
+  `TestQwenUsageMapping` cover the layer below. All in `test_qwen_transcript.py`.
 
 ## [Qwen F] (XERK-510) shipped: safety guard (PreToolUse shim + permissions.deny)
 
