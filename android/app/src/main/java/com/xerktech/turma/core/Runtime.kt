@@ -31,11 +31,12 @@ object Runtime {
      * Fleet-wide kill switch for ALL qwen (Qwen Code, XERK-504) functionality —
      * the qwen twin of [DSH_ENABLED]. When false the composer's qwen runtime row
      * is hidden and a spawn cannot select it, WITHOUT removing the plumbing, so
-     * flipping it true (once [Qwen B]'s launcher lands) restores qwen with no
-     * code change. In-CODE flag; the agent (Python) and hub carry the same-named
-     * flag. `var` only so tests can flip it; production ships it false.
+     * flipping it true (once [Qwen B]'s launcher lands and is verified) restores
+     * qwen with no code change. In-CODE flag; the agent (Python) and hub carry
+     * the same-named flag. `var` only so tests can flip it. Shipped true once the
+     * XERK-520 end-to-end gate verified qwen on real Qwen Code.
      */
-    var QWEN_ENABLED: Boolean = false
+    var QWEN_ENABLED: Boolean = true
 
     const val CLAUDE = "claude"
     const val DSH = "dsh"

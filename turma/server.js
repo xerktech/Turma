@@ -70,7 +70,7 @@ let DSH_ENABLED = false;
 // through: `qwenAvailable` (server-side acceptance — the spawn gate) and
 // `normalizeQwen` (the wire coercion, so the served /api/agents payload never
 // advertises qwen to any client). [Qwen A] ships it false; [Qwen B] lifts it.
-let QWEN_ENABLED = false;
+let QWEN_ENABLED = true; // [Qwen B] launcher + XERK-520 end-to-end gate verified qwen on real Qwen Code; still gated per-host by qwen_configured()
 
 /**
  * The memory ceiling this process actually runs under — `containerMemoryLimit()`
