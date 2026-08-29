@@ -4442,8 +4442,8 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         self.assertIn(root, approvals)
         entry = approvals[root]
         self.assertEqual(set(entry), {"turma-ask", "turma-peer"})
-        settings = json.load(open(os.path.join(self.wt, ".qwen",
-                                               "settings.json")))
+        with open(os.path.join(self.wt, ".qwen", "settings.json")) as f:
+            settings = json.load(f)
         for name, server in settings["mcpServers"].items():
             self.assertEqual(entry[name]["status"], "approved")
             self.assertEqual(entry[name]["hash"],
@@ -4496,21 +4496,23 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
     # --- version pin: run the INSTALLED base build, never a self-update (D3) --
 
     def test_version_pin_forces_the_base_build_and_rides_the_env_file(self):
+        # Mock only `which` (to an ABSOLUTE path realpath passes through
+        # unchanged) for the WHOLE body, so the assertion holds on a CI host with
+        # no qwen on PATH without disturbing the realpath the launch uses to key
+        # the MCP approvals. The real entry resolution is covered by the
+        # empty-when-unresolvable case.
         sm = self.make_manager()
         with mock.patch.object(ha.shutil, "which",
-                               return_value="/opt/qwen/bin/qwen"), \
-             mock.patch.object(ha.os.path, "realpath",
-                               return_value="/opt/qwen/lib/cli-entry.js"):
+                               return_value="/opt/qwen/bin/qwen"):
             pin = sm._qwen_version_pin()
-        parsed = json.loads(pin["QWEN_CODE_MANAGED_NPM_PIN"])
-        # version:null is what makes the shim select the base package, not the
-        # cached self-update; bootstrap is the realpath of the entry node runs.
-        self.assertIsNone(parsed["version"])
-        self.assertEqual(parsed["bootstrap"], "/opt/qwen/lib/cli-entry.js")
-        # It must reach the SESSION too (not just the readiness probe), sourced
-        # from the 0600 env file like every other qwen var.
-        sess = self._sess()
-        self._launch(sm, sess, prompt="hi")
+            # version:null is what makes the shim select the base package, not
+            # the cached self-update; bootstrap is the realpath of the entry.
+            parsed = json.loads(pin["QWEN_CODE_MANAGED_NPM_PIN"])
+            self.assertIsNone(parsed["version"])
+            self.assertEqual(parsed["bootstrap"], "/opt/qwen/bin/qwen")
+            # It must reach the SESSION too (not just the readiness probe),
+            # sourced from the 0600 env file like every other qwen var.
+            self._launch(sm, self._sess(), prompt="hi")
         with open(os.path.join(self.tmp, "qwen", "q1.env")) as f:
             body = f.read()
         self.assertIn("QWEN_CODE_MANAGED_NPM_PIN", body)
