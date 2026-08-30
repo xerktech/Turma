@@ -169,6 +169,17 @@ const AUTOSTART_ORGS_FILE = process.env.AUTOSTART_ORGS_FILE || "/data/autostart-
 // shared by web + android through the fleet payload + its own SSE event).
 const ORG_COLORS_FILE = process.env.ORG_COLORS_FILE || "/data/org-colors.json";
 const ORG_COLOR_SLOTS = 8; // categorical palette --s1..--s8 (app.css / TurmaColors.series)
+// Per-repo importance tiers (XERK-487): repo name -> "live"|"active"|"archive"|
+// "ignore". Feeds triage ORDERING (a tiebreaker under XERK-480 [E]'s priority
+// key) and POLICY ([F]'s allow/deny), and gates auto-start (ignore-tier repos
+// never auto-start). Hub-owned durable state like the auto-start opt-in and org
+// colors above — per-repo, tiny, and it must survive a restart, so it lives on
+// the /data volume, not the best-effort state.json.
+const REPO_TIERS_FILE = process.env.REPO_TIERS_FILE || "/data/repo-tiers.json";
+// A one-shot boot seed (config-file to start, per the ticket): a JSON object of
+// {repo: tier} applied only to repos the durable file does not already carry, so
+// operator edits made through the API always win over the seed.
+const REPO_TIER_SEED = process.env.REPO_TIER_SEED || "";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -1469,6 +1480,107 @@ function setOrgColor(siteKey, slot) {
   sseBroadcast("orgColors", orgColors);
 }
 
+// ---- per-repo importance tiers (XERK-487) ----------------------------------
+// A repo's tier weights triage ordering and policy above raw ticket priority:
+// "a bug in the live-serving hub" outranks "a docs nit in an archived repo".
+// The four tiers are a TOTAL ORDER, most important first; higher rank sorts
+// earlier and is the more important repo.
+const REPO_TIERS = ["ignore", "archive", "active", "live"]; // rank = index
+const REPO_TIER_RANK = Object.fromEntries(REPO_TIERS.map((t, i) => [t, i]));
+// The default for an UNSET repo is the middle working tier, never the top
+// (XERK-487): a repo we know nothing special about is ordinary "active" work —
+// it outranks an explicitly archived repo and is outranked by a live one, and
+// it still routes (only "ignore" is ever withheld from the auto stream). It is
+// deliberately NOT the top tier, so silence never promotes a repo above one an
+// operator deliberately marked live.
+const DEFAULT_REPO_TIER = "active";
+// A repo name is agent/operator-supplied and this map outlives the request, so
+// the key is bounded like every other durable free-text key.
+const REPO_NAME_MAX = 200;
+const isRepoTier = (t) => typeof t === "string" && Object.hasOwn(REPO_TIER_RANK, t);
+let repoTiers = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(REPO_TIERS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) {
+      // Only NON-default, in-range tiers are kept: the default is implicit, so
+      // storing it would just be dead weight (setRepoTier deletes back to it).
+      if (k && k.length <= REPO_NAME_MAX && isRepoTier(v) && v !== DEFAULT_REPO_TIER) {
+        repoTiers[k] = v;
+      }
+    }
+  }
+} catch {
+  /* first boot or no volume mounted */
+}
+// One-shot config seed: fills in repos the durable file does not already carry.
+// Wrapped so a malformed REPO_TIER_SEED is a logged boot warning, never a crash.
+if (REPO_TIER_SEED) {
+  try {
+    const seed = JSON.parse(REPO_TIER_SEED);
+    if (seed && typeof seed === "object" && !Array.isArray(seed)) {
+      for (const [k, v] of Object.entries(seed)) {
+        if (k && k.length <= REPO_NAME_MAX && isRepoTier(v) &&
+            v !== DEFAULT_REPO_TIER && !Object.hasOwn(repoTiers, k)) {
+          repoTiers[k] = v;
+        }
+      }
+    } else {
+      console.error("REPO_TIER_SEED is not a JSON object of {repo: tier} — ignored");
+    }
+  } catch (err) {
+    console.error(`REPO_TIER_SEED could not be parsed — ignored: ${err.message}`);
+  }
+}
+let rtSaveTimer = null;
+function scheduleRepoTiersSave() {
+  if (rtSaveTimer) return;
+  rtSaveTimer = setTimeout(() => {
+    rtSaveTimer = null;
+    fs.mkdir(path.dirname(REPO_TIERS_FILE), { recursive: true }, () => {
+      fs.writeFile(REPO_TIERS_FILE, JSON.stringify(repoTiers), (err) => {
+        if (err) console.error(`repo-tiers save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  rtSaveTimer.unref();
+}
+// The read seams the rest of triage consumes. Keyed by the SAME repo name
+// `repoGuess`/`ticketRepo` yields, so a ticket's triaged repo joins cleanly.
+// An unset or blank repo is the default middle tier — the "can't tell" answer,
+// never top — so every caller gets a usable rank without a null check.
+function repoTier(repo) {
+  return (repo && repoTiers[repo]) || DEFAULT_REPO_TIER;
+}
+function repoTierRank(repo) {
+  return REPO_TIER_RANK[repoTier(repo)];
+}
+// The one policy the tier store owns outright (XERK-487): an ignore-tier repo is
+// never auto-started. [F]'s allow/deny reads the rank for finer thresholds.
+function isRepoIgnored(repo) {
+  return repoTier(repo) === "ignore";
+}
+// Set (or, with tier === DEFAULT_REPO_TIER, clear) a repo's tier. The caller has
+// already validated the name and the tier value; this owns the map bookkeeping,
+// mirroring setAutoStartOrg/setOrgColor — durable save, cache bust, SSE frame.
+function setRepoTier(repo, tier) {
+  if (tier && tier !== DEFAULT_REPO_TIER) repoTiers[repo] = tier;
+  else delete repoTiers[repo];
+  scheduleRepoTiersSave();
+  invalidateAgentsCache();
+  sseBroadcast("repoTiers", repoTiers);
+}
+// The repo names the fleet actually reports (agents[].repos[].name), so a tier
+// can't be pinned onto a phantom repo — the same "no inventing state the fleet
+// doesn't back" guard the /autostart and /color routes apply to a siteKey.
+function fleetRepoNames() {
+  const names = new Set();
+  for (const a of Object.values(agents)) {
+    for (const r of (a && a.repos) || []) if (r && r.name) names.add(r.name);
+  }
+  return names;
+}
+
 // ---- session migration across hosts (XERK-101) -----------------------------
 // Move a running session from one agent to another in the same org (e.g. to the
 // host that has the container whose logs the conversation needs). The hub can't
@@ -1859,6 +1971,11 @@ function buildAgentsCache() {
   // own SSE events for open boards).
   const body = JSON.stringify({
     now, agents: list, ticketAgents, ticketModels, ticketRuntimes, autoStartOrgs, orgColors,
+    // Per-repo importance tiers (XERK-487), hub-owned durable state keyed by
+    // repo name. Only non-default tiers ride here; an absent repo is the default
+    // middle tier. Board reads it to show/set a repo's tier; the ordering and
+    // ignore-gate it drives are hub-side.
+    repoTiers,
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -6530,6 +6647,14 @@ function drainTicketQueue() {
       }
       continue;
     }
+    // The repo was retiered to "ignore" while this AUTO entry waited (XERK-487).
+    // The sweep won't re-queue an ignore-tier repo, so drop it with no churn —
+    // exactly like a ticket that lost its triaged repo above. A MANUAL entry is
+    // left alone: a hand-started ticket is deliberate intent, not tier-gated.
+    if (e.source === "auto" && isRepoIgnored(repo)) {
+      drop("its repo is now ignore-tier");
+      continue;
+    }
     const { host, error, full } = findTicketHost(
       e.siteKey, repo, e.issueKey, { requireFree: true });
     if (!host) {
@@ -6720,11 +6845,23 @@ function autoStartSweep() {
     // The board's own view of this org's tickets — see `fleetTicketRows`. Never
     // walk `agents` for a ticket list here: this sweep STARTS work, so acting on
     // a copy the operator was not shown is a session nobody asked for.
-    for (const { row: t } of ticketRowsForSite(rows, siteKey)) {
+    // XERK-487: among the tickets ready in one pass, the more important repo's
+    // tickets take the scarce auto slots first. Tier is a TIEBREAKER — [E]'s
+    // priority key will sort by ticket priority+type ahead of it — but until
+    // that lands it is the only ordering the auto stream has. STABLE, so
+    // same-tier tickets keep the board's own order (V8 sort is stable).
+    const candidates = ticketRowsForSite(rows, siteKey).sort((a, b) =>
+      repoTierRank((b.row.repoGuess || {}).repo) - repoTierRank((a.row.repoGuess || {}).repo));
+    for (const { row: t } of candidates) {
       if (!t || !t.key) continue;
       if (t.statusCategory !== "todo") continue;      // only "To Do" tickets
       const repo = ticketRepo(siteKey, t.key, rows);   // a repo must be assigned
       if (!repo) continue;
+      // An ignore-tier repo is never auto-started (XERK-487): its tickets stay
+      // off the auto stream entirely. A human can still Start one by hand — that
+      // is deliberate intent, which this gate does not touch (the queue's manual
+      // path is not tier-gated).
+      if (isRepoIgnored(repo)) continue;
       const k = siteKey + "\x00" + t.key;
       // A session exists on some channel — the work is under way (or was, and
       // was deliberately killed). Done with this ticket for good; drop any
@@ -9991,6 +10128,33 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, slot: auto ? null : body.slot });
     }
 
+    // POST /api/repos/<repo>/tier — set a repo's importance tier (XERK-487).
+    // Body: {tier:"live"|"active"|"archive"|"ignore"} to pin, {auto:true} to
+    // reset to the default middle tier. Hub-owned durable state like /autostart
+    // and /color: the save is authoritative on return (a 200, nothing rides a
+    // heartbeat), and the repo must be one the fleet actually reports (or already
+    // has a tier), so a pin can't invent a phantom repo or grow the map without
+    // bound. The repo name is the same one repoGuess yields, so it joins to a
+    // ticket's triaged repo.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "repos" &&
+        parts.length === 4 && parts[3] === "tier") {
+      const repo = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const auto = body.auto === true;
+      if (!auto && !isRepoTier(body.tier)) {
+        return json(res, 400, {
+          error: `body needs {tier:${REPO_TIERS.map((t) => `"${t}"`).join("|")}} or {auto:true}` });
+      }
+      if (!repo || repo.length > REPO_NAME_MAX) {
+        return json(res, 400, { error: "a repo name is required" });
+      }
+      if (!fleetRepoNames().has(repo) && !Object.hasOwn(repoTiers, repo)) {
+        return json(res, 404, { error: "no host reports a repo by that name" });
+      }
+      setRepoTier(repo, auto ? DEFAULT_REPO_TIER : body.tier);
+      return json(res, 200, { ok: true, tier: auto ? DEFAULT_REPO_TIER : body.tier });
+    }
+
     // Terminal proxy: /term/<sessionId>/… -> the ttyd of the host that owns
     // that session, tunneled to its per-session ttydPort. User auth already
     // enforced by the gate above.
@@ -10582,6 +10746,15 @@ if (process.env.TURMA_TEST) {
     setAutoStartOrg,
     orgColors,
     setOrgColor,
+    // Per-repo importance tiers (XERK-487): the store and the read seams [E]'s
+    // priority key and [F]'s allow/deny consume, plus the setter tests drive.
+    repoTiers,
+    repoTier,
+    repoTierRank,
+    isRepoIgnored,
+    setRepoTier,
+    DEFAULT_REPO_TIER,
+    REPO_TIERS,
     ticketAgents,
     ticketModels,
     ticketModelPin,

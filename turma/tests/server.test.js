@@ -168,6 +168,8 @@ const {
   ticketQueueAdmission, TICKET_QUEUE_MAX, TICKET_QUEUE_ERROR_MAX, TICKET_QUEUE_STALE_MS,
   TICKET_QUEUE_BLOCKED_MAX_MS,
   orgColors, setOrgColor,
+  repoTiers, repoTier, repoTierRank, isRepoIgnored, setRepoTier,
+  DEFAULT_REPO_TIER, REPO_TIERS,
   migrations, advanceMigrations, MIGRATE_SPOOL_DIR, sweepMigrationSpool,
   dropMigrationBlob, migrationSpoolPath,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
@@ -6537,6 +6539,130 @@ test("XERK-296: when two hosts of one org report the same ticket, the FRESHER ro
     drainTicketQueue();
     assert.equal(queuedTicket(site, "ENG-5"), null);
   }
+});
+
+// ---- per-repo importance tiers (XERK-487) -----------------------------------
+// Feeds triage ordering (a tiebreaker under [E]'s priority key) and policy
+// ([F]'s allow/deny), and gates auto-start (ignore-tier repos never auto-start).
+const resetRepoTiers = () => { for (const k of Object.keys(repoTiers)) delete repoTiers[k]; };
+
+test("XERK-487: tiers are a total order, live > active(default) > archive > ignore", () => {
+  resetRepoTiers();
+  assert.deepEqual(REPO_TIERS, ["ignore", "archive", "active", "live"]);
+  assert.equal(DEFAULT_REPO_TIER, "active");
+  setRepoTier("Live", "live");
+  setRepoTier("Arch", "archive");
+  setRepoTier("Ign", "ignore");
+  // An unset repo is the default MIDDLE tier — the "can't tell" answer, never
+  // top, and it still routes (only ignore is withheld).
+  assert.equal(repoTier("Unset"), "active");
+  assert.equal(isRepoIgnored("Unset"), false);
+  const rank = repoTierRank;
+  assert.ok(rank("Live") > rank("Unset"), "live outranks the default");
+  assert.ok(rank("Unset") > rank("Arch"), "the default outranks archive");
+  assert.ok(rank("Arch") > rank("Ign"), "archive outranks ignore");
+  assert.ok(isRepoIgnored("Ign"));
+});
+
+test("XERK-487: setRepoTier stores non-defaults and clears back to the default", () => {
+  resetRepoTiers();
+  setRepoTier("Hub", "live");
+  assert.equal(repoTiers.Hub, "live");
+  assert.equal(repoTier("Hub"), "live");
+  // Setting the default is stored implicitly — the key is REMOVED, not written,
+  // so the map only ever holds the repos that differ from the default.
+  setRepoTier("Hub", DEFAULT_REPO_TIER);
+  assert.equal("Hub" in repoTiers, false);
+  assert.equal(repoTier("Hub"), "active");
+});
+
+test("XERK-487: an ignore-tier repo's tickets never enter the auto stream", async () => {
+  resetAutoStart();
+  resetRepoTiers();
+  await asBeat("rtIgnore", "rt1.atlassian.net", { repos: ["Junk"],
+    tickets: [{ key: "ENG-7", statusCategory: "todo",
+      repoGuess: { repo: "Junk", cloned: true } }] });
+  setRepoTier("Junk", "ignore");
+  autoStartRound();
+  assert.equal((agents.rtIgnore.commands || []).length, 0, "no session auto-started");
+  assert.equal(ticketQueue.length, 0, "and nothing queued for it either");
+  // Retiering it back to a routable tier lets it start again.
+  setRepoTier("Junk", "active");
+  autoStartRound();
+  assert.deepEqual((agents.rtIgnore.commands || []).map((c) => c.issueKey), ["ENG-7"]);
+});
+
+test("XERK-487: two same-priority tickets take the auto slots in tier order", async () => {
+  resetAutoStart();
+  resetRepoTiers();
+  // One host, no free slots, three eligible To Do tickets in three repos. The
+  // board order deliberately runs LOW→HIGH, so a pass that honors tier must
+  // reorder it high→low.
+  await asBeat("rtOrder", "rt2.atlassian.net", { capacity: FULL,
+    repos: ["Live", "Arch", "Mystery"],
+    tickets: [
+      { key: "ENG-1", statusCategory: "todo", repoGuess: { repo: "Arch", cloned: true } },
+      { key: "ENG-2", statusCategory: "todo", repoGuess: { repo: "Mystery", cloned: true } },
+      { key: "ENG-3", statusCategory: "todo", repoGuess: { repo: "Live", cloned: true } },
+    ] });
+  setRepoTier("Live", "live");
+  setRepoTier("Arch", "archive");            // "Mystery" stays unset -> active
+  autoStartRound();                          // host is full, so all three queue
+  // live > default(active) > archive — and the unset repo still routes, in the
+  // middle.
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["ENG-3", "ENG-2", "ENG-1"]);
+  // So when the single slot frees, the live-tier ticket is the one dispatched.
+  agents.rtOrder.capacity = { ...ROOMY };
+  drainTicketQueue();
+  assert.deepEqual((agents.rtOrder.commands || []).map((c) => c.issueKey), ["ENG-3"]);
+});
+
+test("XERK-487: a repo retiered to ignore while its ticket waits drops from the queue", async () => {
+  resetAutoStart();
+  resetRepoTiers();
+  await asBeat("rtLate", "rt5.atlassian.net", { capacity: FULL, repos: ["Late"],
+    tickets: [{ key: "ENG-9", statusCategory: "todo",
+      repoGuess: { repo: "Late", cloned: true } }] });
+  autoStartRound();                          // queues (host full, repo routable)
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["ENG-9"]);
+  setRepoTier("Late", "ignore");             // operator marks it ignore mid-wait
+  drainTicketQueue();
+  assert.equal(ticketQueue.length, 0, "the auto entry drops, no session");
+  assert.equal((agents.rtLate.commands || []).length, 0);
+});
+
+test("XERK-487: POST /api/repos/<repo>/tier pins a tier, rides the payload, resets on auto", async () => {
+  resetRepoTiers();
+  await asBeat("rtApi", "rt3.atlassian.net", { autoStart: false, repos: ["Hub"] });
+  let r = await request("POST", "/api/repos/Hub/tier",
+    { body: { tier: "live" }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { ok: true, tier: "live" });
+  assert.equal(repoTiers.Hub, "live");
+  // Rides the fleet payload as a top-level {repo: tier} map.
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.body.repoTiers.Hub, "live");
+  // {auto:true} resets to the default — the key is removed (default is implicit).
+  r = await request("POST", "/api/repos/Hub/tier",
+    { body: { auto: true }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { ok: true, tier: DEFAULT_REPO_TIER });
+  assert.equal("Hub" in repoTiers, false);
+});
+
+test("XERK-487: the tier route rejects a bad tier and a phantom repo", async () => {
+  resetRepoTiers();
+  await asBeat("rtApi2", "rt4.atlassian.net", { autoStart: false, repos: ["Hub"] });
+  // Not one of the four tiers.
+  let r = await request("POST", "/api/repos/Hub/tier",
+    { body: { tier: "urgent" }, headers: userHeaders });
+  assert.equal(r.status, 400);
+  // A repo no host reports (and with no existing tier) can't be pinned — no
+  // phantom entries, and no unbounded key growth.
+  r = await request("POST", "/api/repos/Ghost/tier",
+    { body: { tier: "live" }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  assert.equal("Ghost" in repoTiers, false);
 });
 
 test("XERK-296: a terminal note counts against NO line — per org or fleet-wide", async () => {
