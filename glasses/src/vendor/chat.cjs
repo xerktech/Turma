@@ -1714,9 +1714,11 @@
             '<span class="cc-menu" id="ccSourceMenu"><span class="cc-hint">Runtime</span>' +
             menuHtml(modelSourceOpts(), currentModelSource(), "data-source") + "</span></span>"
           : "");
-    // The model chip: the discovered dsh list for a dsh session, the discovered
-    // local list for a local session, else the Claude alias picker.
+    // The model chip: the discovered dsh list for a dsh session, a fixed
+    // label for a qwen session (no discovered list, host-configured model),
+    // the discovered local list for a local session, else the Claude alias picker.
     const modelChip = dsh ? dshModelChipHtml()
+      : qwen ? qwenModelChipHtml()
       : (currentModelSource() === "local"
           ? localModelChipHtml()
           : '<span class="cc-opt cc-model">' +
@@ -1983,6 +1985,19 @@
       '<span class="cc-btn" title="' +
       esc("Runs on the Qwen Code runtime, not Claude Code") + '">' +
       '⚙ <span class="cc-val">Qwen Code</span></span></span>';
+  }
+  // The qwen model chip: a fixed, read-only label. The qwen heartbeat reports
+  // only {available} — no discovered model list (model plumbing is a later
+  // child, XERK-504) — so there is nothing to offer in a dropdown; the session
+  // runs on the host's configured qwen model. Show the actual model (the same
+  // value the Claude picker's label already reads off sess.modelActual) as a
+  // fixed chip, mirroring the dsh/local "no discovered list" fallback. This is
+  // what stops the qwen session's model chip from offering Claude's aliases.
+  function qwenModelChipHtml() {
+    return '<span class="cc-opt cc-model cc-model-fixed">' +
+      '<span class="cc-btn" title="' +
+      esc("The Qwen Code model this session runs on. It is set by the host and cannot be switched live.") + '">' +
+      '<span class="cc-val">' + esc(modelChipLabel() || "qwen model") + "</span> 🧠</span></span>";
   }
   function dshModelChipHtml() {
     const models = dshModels();
@@ -2787,7 +2802,7 @@
       // XERK-504 dsh runtime footer (read-only runtime chip + live model dropdown)
       isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml,
       dshRuntimeChipHtml, setSessionDshModel,
-      isQwenSession, qwenRuntimeChipHtml,
+      isQwenSession, qwenRuntimeChipHtml, qwenModelChipHtml,
       renderComposeOpts,
       __setDshModelPending: (p) => { dshModelPending = p; },
       __setLocalModelPending: (p) => { localModelPending = p; },
