@@ -2092,6 +2092,32 @@ test("composer: an explicit Claude pick BEATS a non-claude host default (XERK-52
   assert.equal("agentType" in spawn(noDefault, "claude"), false);
 });
 
+test("composer: a new session follows the host default, not the prior session's runtime (XERK-521)", () => {
+  // The default is a default, not a memory of last pick: a host set to qwen must
+  // pre-select Qwen Code on the NEXT bare "+ New session" even after the operator
+  // just spawned a Claude session — otherwise every spawn lands on Claude and the
+  // operator re-picks qwen each time.
+  const page = loadPage();
+  const now = Date.now();
+  const h = {
+    key: "hostA", device: "hostA", online: true, terminalOnline: true,
+    lastSeen: now, repos: [{ name: "repoX" }], sessions: [],
+    qwen: { available: true }, defaultRuntime: "qwen",
+  };
+  page.setCache({ now, agents: [h] });
+  page.render({ now, agents: [h] });
+  // First spawn: the operator explicitly picks Claude and starts a session.
+  page.toggleComposer("hostA::repoX", "repoX");
+  page.els["cmp-runtime-hostA__repoX"] = { value: "claude" };
+  page.startSession("hostA", "repoX");
+  // Reopen: the fresh composer must pre-select the host default (Qwen), not carry
+  // forward the just-spawned Claude.
+  page.toggleComposer("hostA::repoX", "repoX");
+  const html = page.els.spawn.innerHTML;
+  assert.match(html, /<option value="qwen" selected>Qwen Code</);
+  assert.doesNotMatch(html, /<option value="claude" selected>/);
+});
+
 test("composer: the dsh runtime offers the discovered model list, not Claude aliases (XERK-503)", () => {
   // The fix for the `pi-ai provider has no configured model` lock: a dsh session
   // picks a DISCOVERED endpoint model, the same list a local session gets.

@@ -1351,7 +1351,6 @@ function onOptChange(rk, repo) {
   // Claude Code, in which case the runtime stays "claude".
   const rtEl = document.getElementById(cid(rk, "runtime"));
   const runtime = rtEl ? rtEl.value : "claude";
-  o.runtime = runtime;
   o.model = v("model"); o.permissionMode = v("perm");
   o.localModel = v("lmodel");
   const lctx = parseInt(v("lctx"), 10);
@@ -1410,12 +1409,12 @@ function composer(a, repo, rk, spawning) {
   if (localModel) runtimeOpts.push({ v: "local", label: "Claude Code Local" });
   if (dsh) runtimeOpts.push({ v: "dsh", label: "dsh" });
   if (qwen) runtimeOpts.push({ v: "qwen", label: "Qwen Code" });
-  // Selected runtime: the stored `runtime`, else the legacy agentType/modelSource
-  // a pre-XERK-503 composer persisted, else this HOST's default runtime, else
-  // claude. A stored value whose runtime the host no longer offers falls back.
-  // `legacyRuntime` is null (not "claude") when the draft carries NEITHER field,
-  // so a brand-new draft falls through to the host default rather than masking
-  // it with a hardcoded claude.
+  // Selected runtime: a NEW session follows this host's default runtime
+  // (XERK-521), not the last-used runtime of a prior session — remembering it
+  // per-repo masked the operator's configured default, so every spawn landed on
+  // Claude and had to be re-picked. The legacy agentType/modelSource a
+  // pre-XERK-503 composer persisted still seeds the field as a one-time pin,
+  // falling through to the host default when it carries neither.
   const legacyRuntime = o.agentType === "dsh" ? "dsh"
     : o.agentType === "qwen" ? "qwen"
     : o.modelSource === "local" ? "local"
@@ -1426,8 +1425,8 @@ function composer(a, repo, rk, spawning) {
   // agent-side), so the dropdown PRE-SELECTS it — but only when that runtime is
   // actually on offer here. Absent (older agent) reads as claude.
   const hostDefault = runtimeOpts.some(r => r.v === a.defaultRuntime) ? a.defaultRuntime : "claude";
-  const selRuntime = runtimeOpts.some(r => r.v === o.runtime) ? o.runtime
-    : (legacyRuntime && runtimeOpts.some(r => r.v === legacyRuntime) ? legacyRuntime : hostDefault);
+  const selRuntime = (legacyRuntime && runtimeOpts.some(r => r.v === legacyRuntime))
+    ? legacyRuntime : hostDefault;
   // The Claude-local endpoint's discovered models (XERK-489): id + optional
   // context override, revealed when the "Claude Code Local" runtime is chosen.
   const lModels = (localModel && Array.isArray(localModel.models)) ? localModel.models : [];
@@ -2371,7 +2370,10 @@ function startSession(key, repo) {
     }
     if (perm && perm !== "auto") body.permissionMode = perm;
   }
-  saveOpts(repo, { baseRef, runtime, model, permissionMode: perm,
+  // Runtime is intentionally NOT persisted here: a new session seeds from the
+  // host's default runtime (XERK-521), not the last-used one, so the operator's
+  // configured default isn't masked by whichever runtime the previous session used.
+  saveOpts(repo, { baseRef, model, permissionMode: perm,
     localModel: runtime === "local" ? localModel : "",
     localContext: runtime === "local" && localContext > 0 ? localContext : 0,
     dshModel: runtime === "dsh" ? dshModel : "",
