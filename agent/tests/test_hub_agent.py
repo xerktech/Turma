@@ -24049,6 +24049,20 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
         self.assertEqual(t["triage"], {"priority": "P0", "actionable": False, "source": "auto"})
         self.assertNotIn("repoGuess", t)
 
+    def test_apply_triage_clears_a_stale_assessment_when_the_ledger_drops_it(self):
+        # The ticket dict is mutated in place across beats, so a ledger entry that
+        # LOSES its triage sub-dict (a re-triage invalidation, or B/E clearing it)
+        # must clear the stamped block — the pop mirrors the repoGuess pop right
+        # below it. Pins that else-branch.
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        key = ha._triage_key("s.atlassian.net", "ENG-1")
+        sm.triage_ledger[key] = {"triage": {"priority": "P1", "source": "auto"}}
+        sm._apply_triage()
+        self.assertEqual(sm.jira["tickets"][0]["triage"], {"priority": "P1", "source": "auto"})
+        sm.triage_ledger[key] = {"decided": True, "repo": "Turma"}
+        sm._apply_triage()
+        self.assertNotIn("triage", sm.jira["tickets"][0])
+
     def test_apply_triage_carries_no_triage_block_when_unassessed(self):
         # No ledger entry, or an entry with no assessment -> no `triage` key at
         # all (absence == "not triaged yet"), matching the repoGuess contract.

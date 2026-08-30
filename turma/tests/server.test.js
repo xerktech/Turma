@@ -9592,6 +9592,26 @@ test("normalizeRecord runs the clone coercion too, on ingest and on restore", ()
   assert.equal(a.clones[0].status, undefined);
 });
 
+test("normalizeRecord runs the triage coercions too, on ingest and on restore (XERK-481)", () => {
+  // Pins the WIRING, not just the leaves: a malformed TOP-LEVEL `triage` block is
+  // decode-fatal for Android's whole /api/agents array, so normalizeRecord must
+  // call normalizeTriage on both the ingest and the state.json restore. Driving
+  // through normalizeRecord (not the leaf directly) is the half that catches the
+  // call being dropped in a refactor — the same reason the clone case above and
+  // the qwen ones exist.
+  const top = { device: "h", triage: "yes" };
+  hub.normalizeRecord(top);
+  assert.equal(top.triage, null);
+  const flag = { device: "h", triage: { available: "yes", extra: 1 } };
+  hub.normalizeRecord(flag);
+  assert.deepEqual(flag.triage, { available: false });
+  // The per-ticket coercion (via normalizeJira) is wired too — a bad band is
+  // dropped rather than served as a P-something to a typed client.
+  const perTicket = { device: "h", jira: { tickets: [{ key: "ENG-1", triage: { priority: "P9", reason: "x" } }] } };
+  hub.normalizeRecord(perTicket);
+  assert.deepEqual(perTicket.jira.tickets[0].triage, { reason: "x" });
+});
+
 test("migrate: rejects a root session and one with no conversation yet", async () => {
   await migHost("mRoot", "mr.atlassian.net", { root: true });
   await migHost("mRootTgt", "mr.atlassian.net");
