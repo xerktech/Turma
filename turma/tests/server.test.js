@@ -9738,6 +9738,28 @@ test("normalizeRecord runs the clone coercion too, on ingest and on restore", ()
   assert.equal(a.clones[0].status, undefined);
 });
 
+test("normalizeRecord coerces session summary: type, whitespace, length", () => {
+  // Android types SessionInfo.summary as String and decodes /api/agents
+  // atomically — a non-string would hide the whole fleet from that phone,
+  // and the notification titles now lead with it, so an unbounded name
+  // would push the FCM payload past its ~4 KB limit.
+  const a = {
+    sessions: [
+      { id: "s1", summary: 42 },
+      { id: "s2", summary: "   " },
+      { id: "s3", summary: "  Fix terminal font  " },
+      { id: "s4", summary: "x".repeat(500) },
+      { id: "s5" },
+    ],
+  };
+  hub.normalizeRecord(a);
+  assert.equal(a.sessions[0].summary, "", "non-string coerced to empty");
+  assert.equal(a.sessions[1].summary, "", "whitespace-only trimmed to empty");
+  assert.equal(a.sessions[2].summary, "Fix terminal font", "trimmed");
+  assert.equal(a.sessions[3].summary.length, 120, "capped at 120 chars");
+  assert.equal("summary" in a.sessions[4], false, "absent stays absent");
+});
+
 test("normalizeRecord runs the triage coercions too, on ingest and on restore (XERK-481)", () => {
   // Pins the WIRING, not just the leaves: a malformed TOP-LEVEL `triage` block is
   // decode-fatal for Android's whole /api/agents array, so normalizeRecord must
