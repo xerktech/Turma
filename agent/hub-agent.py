@@ -4914,6 +4914,15 @@ PR_CONFLICT_RESOLVE = os.environ.get("TURMA_PR_CONFLICTS", "1") != "0"
 PR_CONFLICT_MAX_ATTEMPTS = int(os.environ.get("TURMA_PR_CONFLICT_ATTEMPTS", "3"))
 PR_CONFLICT_RETRY_SEC = int(os.environ.get("TURMA_PR_CONFLICT_RETRY_SEC", "1800"))
 
+# Open-PR nudge (XERK-526): a session that has finished a turn holding code work
+# that is not on an open PR gets nudged to commit, push, and open a PR — the
+# hub-side complement to the in-session Stop-hook backstop (XERK-525). Same
+# edge-triggered, cooldown, attempt-capped shape as the conflict nudge: one nudge
+# per episode, re-sent only past the retry interval while attempts remain.
+PR_OPEN_NUDGE = os.environ.get("TURMA_PR_OPEN_NUDGE", "1") != "0"
+PR_OPEN_NUDGE_RETRY_SEC = int(os.environ.get("TURMA_PR_OPEN_NUDGE_RETRY_SEC", "1800"))
+PR_OPEN_NUDGE_MAX_ATTEMPTS = int(os.environ.get("TURMA_PR_OPEN_NUDGE_ATTEMPTS", "3"))
+
 
 def _check_class(entry):
     """Map one `statusCheckRollup` entry to 'pass' | 'fail' | 'pending' | None.
@@ -5666,6 +5675,30 @@ def _pr_conflict_message(url, base, again=False):
         f"goes back to mergeable. Do not rebase or force-push the branch, and "
         f"do not merge the {what} itself. If a conflict genuinely needs a human "
         f"decision, say so on the {what} instead of guessing.")
+
+
+def _open_pr_message(branch, work_desc, again=False):
+    """The message typed into a session that finished a turn with undelivered
+    code work and no open PR (XERK-526).
+
+    It names the work in hand and asks it to commit, push, and open a PR, then
+    watch CI. Like _pr_conflict_message it says WHAT to achieve and leaves the
+    HOW to the session (it is the only thing that knows what the work means),
+    and it carries an explicit out — if the work is not deliverable as a PR, say
+    so rather than opening a junk one."""
+    where = f"on branch {branch}" if branch else "in the worktree"
+    retry = ("You were asked to do this before — check what was left "
+             "unfinished and finish it now. ") if again else ""
+    return (
+        f"You finished a turn with undelivered code work {where}: {work_desc}, "
+        f"and there is no open pull request for it. {retry}Deliver it now: "
+        f"commit any uncommitted changes, push the branch, and open a PR "
+        f"(title: ticket + one-line summary; body: what changed, why, and how "
+        f"to verify). Then watch that check goes green before you stop. If "
+        f"this work is not deliverable as a PR — it is a question, a doc note, "
+        f"or it belongs in another session's change — say so in one sentence "
+        f"instead of opening a PR."
+    )
 
 
 LOG_TAIL_LINES = 50
@@ -21201,6 +21234,108 @@ class SessionManager:
             sess["prsLandedTs"] = ts
             self.save()
 
+    def _poll_open_pr_nudges(self):
+        """Nudge a session that has finished a turn holding code work that is
+        not on an open PR (XERK-526): commit, push, open a PR, watch CI.
+
+        The operator's complaint this addresses (XERK-525 is the in-session
+        Stop-hook backstop; this is the hub-side half) is having to type
+        "make a PR" after every finished turn. So: a session that is IDLE
+        (finished a turn), holds undelivered code work, and has NO open PR gets
+        one nudge telling it to deliver.
+
+        Three gates, all cheap, in order:
+          - An OPEN (or not-yet-fetched) PR already covers the work → skip, and
+            re-arm the episode so a later undelivered turn re-arms from zero.
+            Checked first because it is a dict read — a session that has a PR
+            pays no pane capture or git walk.
+          - IDLE: only a session whose pane has settled to idle
+            (`_pane_status` busy is False) and is not sitting on a blocking
+            dialog (`pane_prompt` is None). True=busy (mid-turn) or
+            None=unknown (uncapturable) is never nudged, matching the
+            tri-state convention every other poller uses.
+          - UNDELIVERED WORK: the live git facts `_session_git` already computes
+            per beat — dirty files, a local branch that was never pushed, or
+            commits still ahead of origin. Turma worktrees are forked fresh per
+            session, so dirt in a worktree is this session's own work, not a
+            neighbour's. (The "pushed & in sync but no PR" case is left to the
+            in-session rules; there is no cheap, reliable base-ref to count
+            against, so this deliberately does not reach for it.)
+
+        Edge-triggered like _poll_pr_conflicts: one nudge per episode, retried
+        only past PR_OPEN_NUDGE_RETRY_SEC, capped at PR_OPEN_NUDGE_MAX_ATTEMPTS.
+        Runs off the same beat as refresh_pr_status, so the pr_status_cache it
+        reads is already fresh — no network call of its own."""
+        if not PR_OPEN_NUDGE:
+            return
+        now = time.time()
+        for sess in self.registry:
+            if sess.get("status") != "running":
+                continue
+            sid = sess["id"]
+            # An open (or not-yet-fetched) PR already covers the work: re-arm any
+            # stale episode and skip before paying for a pane capture.
+            have_open = False
+            for u in (self.session_pr_urls.get(sid) or []):
+                st = (self.pr_status_cache.get(u) or {}).get("state")
+                if st in ("OPEN", "DRAFT") or st is None:
+                    have_open = True
+                    break
+            nudged = sess.get("prOpenNudged")
+            if have_open:
+                if nudged and sid in nudged:
+                    del nudged[sid]
+                    if not nudged:
+                        del sess["prOpenNudged"]
+                    self.save()
+                continue
+            # Idle gate: only a confirmed-idle, dialog-free session is nudged.
+            busy, _mode, prompt = _pane_status(
+                sess.get("tmuxName"), self.sess_state.setdefault(sid, {}))
+            if busy is not False or prompt is not None:
+                continue
+            gi, work = self._session_git(sess, refresh=False)
+            dirty = (gi or {}).get("dirtyFiles") or 0
+            live_branch = (self.session_facts.get(sid) or {}).get("liveBranch")
+            ahead_remote = (work or {}).get("aheadOfRemote") or 0
+            undelivered = (
+                dirty > 0
+                or (live_branch is not None and (work or {}).get("pushed") is False)
+                or ahead_remote > 0
+            )
+            # Work cleared (or a PR just opened between the read and here):
+            # re-arm so the next undelivered turn starts at zero attempts.
+            if not undelivered:
+                if nudged and sid in nudged:
+                    del nudged[sid]
+                    if not nudged:
+                        del sess["prOpenNudged"]
+                    self.save()
+                continue
+            ep = (nudged or {}).get(sid) or {}
+            attempts = int(ep.get("attempts") or 0)
+            if attempts >= PR_OPEN_NUDGE_MAX_ATTEMPTS:
+                continue
+            if attempts and now - float(ep.get("at") or 0) < PR_OPEN_NUDGE_RETRY_SEC:
+                continue
+            work_desc = (
+                f"{dirty} uncommitted file(s)" if dirty > 0
+                else (f"a commit on {live_branch} not yet on origin"
+                      if ahead_remote > 0
+                      else f"a local branch {live_branch} that was never pushed")
+            )
+            msg = _open_pr_message(live_branch, work_desc, again=bool(attempts))
+            # Arm on delivery regardless of channel: notify_session returns
+            # False for the pane fallback (the same message is still typed in),
+            # and the conflict poller arms on attempt, not on inbox-success.
+            self.notify_session(sid, msg)
+            sess.setdefault("prOpenNudged", {})[sid] = {
+                "at": now, "attempts": attempts + 1,
+            }
+            log(f"open-pr nudge: nudging {sid} to open a PR for "
+                f"undelivered work (attempt {attempts + 1})")
+            self.save()
+
     def _poll_pr_conflicts(self):
         """Tell a running session to resolve the merge conflicts on its OWN PR,
         without an operator relaying it (XERK-223).
@@ -23528,6 +23663,13 @@ class SessionManager:
                 self._poll_prs_landed()
             except Exception as e:
                 log(f"pr landed poll failed: {e}")
+            # A session that idled out with code work but no open PR is nudged
+            # to deliver it (XERK-526). Same beat, same cached status; wrapped
+            # for the same reason.
+            try:
+                self._poll_open_pr_nudges()
+            except Exception as e:
+                log(f"open-pr nudge poll failed: {e}")
         # New review activity on a session's PR is typed back into that session
         # so a reply asking for corrections continues the work (XERK-49). Own
         # cadence + per-beat cap; wrapped, because a PR comment is never worth
