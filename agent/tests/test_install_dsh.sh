@@ -44,7 +44,7 @@ sys.exit(1)
 PY
 }
 
-for fn in dsh_wanted install_dsh_files install_config; do
+for fn in dsh_wanted install_dsh_files install_config install_files; do
   extract "$fn" > "$WORK/$fn.sh" || exit 1
 done
 
@@ -210,6 +210,44 @@ if [ "$(cat "$cfgdir3/turma-agent.env")" = "TURMA_TOKEN=keepme" ]; then
   ok "a preserved config is left untouched even under --with-dsh"
 else
   fail "install_config rewrote a preserved config"
+fi
+
+# --- install_files() lays the qwen runtime UNCONDITIONALLY (XERK-523) --------
+# The qwen Python siblings + qwen/ ship beside hub-agent.py on EVERY install (no
+# --with-qwen, no marker — they are stdlib-only and qwen is core-enabled). A
+# missing qwen_session.py is the "No module named 'qwen_session'" spawn failure
+# on a TURMA_QWEN=1 host, so install_files must place them at the exact
+# hub-agent.py-relative paths the agent resolves.
+qsrc="$WORK/src-full"
+mkdir -p "$qsrc/hooks" "$qsrc/qwen/guard"
+echo "# hub" >"$qsrc/hub-agent.py"
+echo "// tunnel" >"$qsrc/tunnel-agent.js"
+echo "# tmux" >"$qsrc/tmux.conf"
+echo "# guard" >"$qsrc/hooks/guard.py"
+echo "# qwen_session" >"$qsrc/qwen_session.py"
+echo "# qwen_transcript" >"$qsrc/qwen_transcript.py"
+echo "# ask_mcp" >"$qsrc/qwen/ask_mcp.py"
+echo "# peer_mcp" >"$qsrc/qwen/peer_mcp.py"
+echo "# peer_inbox" >"$qsrc/qwen/peer_inbox.py"
+echo "# shim" >"$qsrc/qwen/guard/shim.py"
+echo "9.9" >"$qsrc/VERSION"
+# SELF_DIR holds the bin scripts install_files copies; content is irrelevant here.
+qself="$WORK/self-full"; mkdir -p "$qself"
+for b in turma-agent turma-agentctl turma-agent-update; do echo "# $b" >"$qself/$b"; done
+qprefix="$(stub_prefix "$WORK/rq")"
+cat > "$WORK/t7.sh" <<EOF
+$(cat "$WORK/harness.sh")
+$(cat "$WORK/install_files.sh")
+PREFIX="$qprefix"; SRC_DIR="$qsrc"; SELF_DIR="$qself"
+install_files >/dev/null 2>&1
+EOF
+bash "$WORK/t7.sh"
+if [ -f "$qprefix/qwen_session.py" ] && [ -f "$qprefix/qwen_transcript.py" ] \
+   && [ -f "$qprefix/qwen/ask_mcp.py" ] && [ -f "$qprefix/qwen/peer_mcp.py" ] \
+   && [ -f "$qprefix/qwen/peer_inbox.py" ] && [ -f "$qprefix/qwen/guard/shim.py" ]; then
+  ok "install_files lays the qwen siblings + qwen/ at the hub-agent.py-relative paths"
+else
+  fail "install_files did not lay the qwen runtime files (spawn -> No module named 'qwen_session')"
 fi
 
 if [ "$FAILED" = 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi

@@ -221,6 +221,21 @@ driver/guard plugin files ride each native-payload swap, so the whole toolchain
 stays current on a dsh host. `--verify` checks the dsh files and CLI;
 `--uninstall` notes the CLI it leaves in `~/.local`.
 
+### Qwen Code
+
+Unlike dsh, the **qwen runtime files ship and lay down unconditionally** — the
+Python siblings `qwen_session.py` / `qwen_transcript.py` and the `qwen/` support
+dir (MCP servers, peer-inbox forger, guard shim) sit beside `hub-agent.py` on
+every install and ride every payload swap, exactly like the hooks. They are
+stdlib-only and touched only when a qwen session launches, and qwen is
+core-enabled (`QWEN_ENABLED`), so there is no `--with-qwen` flag or marker.
+
+To make a host *offer* qwen, set `TURMA_QWEN=1`, give it a model route
+(`QWEN_MODEL_BASE_URL` + `QWEN_MODEL`, falling back to the `LOCAL_MODEL_*` keys),
+and provide the `qwen` (`@qwen-code/qwen-code`) CLI on the launcher's PATH — the
+native installer does **not** provision the CLI itself. `--verify` checks the
+qwen Python files.
+
 ## Known limitations (graceful degradation)
 
 - **No container self-inspect** — the heartbeat's container-log tail is empty

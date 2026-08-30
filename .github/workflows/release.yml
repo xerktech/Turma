@@ -446,6 +446,14 @@ jobs:
           cp agent/dsh_session.py agent/dsh_transcript.py "$STAGE/"
           cp -a agent/dsh-session-driver "$STAGE/dsh-session-driver"
           mkdir -p "$STAGE/dsh"; cp -a agent/dsh/guard "$STAGE/dsh/guard"
+          # qwen runtime (XERK-504+): the Python siblings land beside hub-agent.py
+          # (imported by _launch_qwen/_start_qwen_tail) and agent/qwen/ carries the
+          # MCP servers, peer-inbox forger and guard shim it resolves from ITS own
+          # dir. Unlike dsh these are stdlib-only and cost nothing when qwen is off,
+          # and qwen is core-enabled (QWEN_ENABLED), so they ship + lay down
+          # UNCONDITIONALLY like hub-agent.py/hooks — no --with-qwen, no marker.
+          cp agent/qwen_session.py agent/qwen_transcript.py "$STAGE/"
+          cp -a agent/qwen "$STAGE/qwen"
           echo "$VERSION" > "$STAGE/VERSION"
           ASSET="turma-agent-native-v${VERSION}.tar.gz"
           tar czf "$GITHUB_WORKSPACE/$ASSET" -C "$STAGE" .

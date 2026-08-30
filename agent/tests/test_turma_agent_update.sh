@@ -38,6 +38,13 @@ make_tarball() {  # <version> <outdir> [nohooks] [withdsh]
   echo "# hub-agent $version" >"$staged/hub-agent.py"
   echo "// tunnel $version" >"$staged/tunnel-agent.js"
   echo "# guard" >"$staged/hooks/guard.py"
+  # qwen runtime ships UNCONDITIONALLY (XERK-523) beside hub-agent.py, like the
+  # hooks — every real release payload carries it, so every fixture payload does.
+  echo "# qwen_session $version" >"$staged/qwen_session.py"
+  echo "# qwen_transcript $version" >"$staged/qwen_transcript.py"
+  mkdir -p "$staged/qwen/guard"
+  echo "# ask_mcp $version" >"$staged/qwen/ask_mcp.py"
+  echo "# shim $version" >"$staged/qwen/guard/shim.py"
   # A payload missing hooks/ — the swap DELETES the installed hooks before it
   # moves the staged ones in, so this must be refused outright.
   [ "${3:-}" = nohooks ] && rm -rf "$staged/hooks"
@@ -1165,6 +1172,41 @@ else
   pass "no restart for a refused payload"
 fi
 unset TURMA_TEST_RESTART_LOG
+rm -rf "$root" "$d"
+
+# --- qwen runtime (XERK-523) -------------------------------------------------
+# The qwen Python siblings + qwen/ ship UNCONDITIONALLY beside hub-agent.py (no
+# marker, unlike dsh) and MUST ride each payload swap, or a self-updated host has
+# qwen enabled (QWEN_ENABLED) but no qwen_session.py — the "No module named
+# 'qwen_session'" spawn failure this ticket fixes.
+
+# 25b. Any update refreshes the qwen files from the payload (no opt-in needed).
+d="$(new_gh_dir)"
+add_unified_release "$d" "v0.4.5" "0.4.5" "v0.4.5"
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old hub" >"$prefix/hub-agent.py"; echo "// old tunnel" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+# Stale qwen files a past install laid down.
+echo "# OLD qwen_session" >"$prefix/qwen_session.py"
+echo "# OLD qwen_transcript" >"$prefix/qwen_transcript.py"
+mkdir -p "$prefix/qwen/guard"
+echo "# OLD ask_mcp" >"$prefix/qwen/ask_mcp.py"
+echo "# OLD shim" >"$prefix/qwen/guard/shim.py"
+install_fake_restart "$bin"; install_fake_gh "$bin"
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 "$bin/turma-agent-update" >/dev/null 2>&1 || true
+got="$(tr -d '[:space:]' < "$prefix/VERSION")"
+assert_eq "0.4.5" "$got" "qwen: update installs the newer version (-> $got)" "qwen host update failed, VERSION $got"
+if grep -q "qwen_session 0.4.5" "$prefix/qwen_session.py" \
+   && grep -q "qwen_transcript 0.4.5" "$prefix/qwen_transcript.py" \
+   && grep -q "ask_mcp 0.4.5" "$prefix/qwen/ask_mcp.py" \
+   && grep -q "shim 0.4.5" "$prefix/qwen/guard/shim.py"; then
+  pass "qwen: the Python siblings + qwen/ are refreshed from the payload"
+else
+  fail "qwen runtime NOT refreshed on an update — a qwen spawn would fail with No module named 'qwen_session'"
+fi
 rm -rf "$root" "$d"
 
 # --- dsh toolchain (XERK-496) ------------------------------------------------

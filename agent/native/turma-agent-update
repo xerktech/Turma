@@ -657,6 +657,15 @@ install_payload() {  # <tgz> <version>
   rm -rf "$PREFIX/hooks"; mv -f "$src/hooks" "$PREFIX/hooks"
   mv -f "$src/tunnel-agent.js" "$PREFIX/tunnel-agent.js"
   [ -f "$src/tmux.conf" ] && mv -f "$src/tmux.conf" "$PREFIX/tmux.conf"
+  # qwen runtime (XERK-504+): the Python siblings + agent/qwen/ ship
+  # UNCONDITIONALLY beside hub-agent.py (core-enabled, stdlib-only), so they swap
+  # with the payload like hub-agent.py itself — no $PREFIX/.qwen marker gate.
+  # Conditional (not part of the completeness check): a payload without them is a
+  # qwen REFUSAL, not the fail-open safety hole that a missing hook would be. Every
+  # release from XERK-523 on ships them, so they are effectively always present.
+  [ -f "$src/qwen_session.py" ] && mv -f "$src/qwen_session.py" "$PREFIX/qwen_session.py"
+  [ -f "$src/qwen_transcript.py" ] && mv -f "$src/qwen_transcript.py" "$PREFIX/qwen_transcript.py"
+  [ -d "$src/qwen" ] && { rm -rf "$PREFIX/qwen"; mv -f "$src/qwen" "$PREFIX/qwen"; }
   local b
   for b in turma-agent turma-agentctl turma-agent-update; do
     [ -f "$src/$b" ] && { mv -f "$src/$b" "$PREFIX/bin/$b"; chmod +x "$PREFIX/bin/$b"; }

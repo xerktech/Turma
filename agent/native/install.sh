@@ -278,6 +278,16 @@ install_files() {
   cp "$SRC_DIR/tunnel-agent.js"  "$PREFIX/tunnel-agent.js"
   cp "$SRC_DIR/tmux.conf"        "$PREFIX/tmux.conf"
   cp "$SRC_DIR"/hooks/*.py       "$PREFIX/hooks/"        # sibling to hub-agent.py (load-bearing)
+  # qwen runtime (XERK-504+): the Python siblings (imported by _launch_qwen /
+  # _start_qwen_tail) and agent/qwen/ (MCP servers, peer-inbox forger, guard
+  # shim — all resolved relative to hub-agent.py's own dir). Stdlib-only and
+  # only touched on a qwen launch, and qwen is core-enabled (QWEN_ENABLED), so
+  # unlike the dsh toolchain they lay down UNCONDITIONALLY here — no --with-qwen,
+  # no marker. A missing qwen_session.py is exactly the "No module named
+  # 'qwen_session'" spawn failure on a TURMA_QWEN=1 host.
+  cp "$SRC_DIR/qwen_session.py"    "$PREFIX/qwen_session.py"
+  cp "$SRC_DIR/qwen_transcript.py" "$PREFIX/qwen_transcript.py"
+  rm -rf "$PREFIX/qwen"; cp -a "$SRC_DIR/qwen" "$PREFIX/qwen"
   cp "$SELF_DIR/turma-agent"        "$PREFIX/bin/turma-agent"
   cp "$SELF_DIR/turma-agentctl"     "$PREFIX/bin/turma-agentctl"
   cp "$SELF_DIR/turma-agent-update" "$PREFIX/bin/turma-agent-update"
@@ -469,6 +479,8 @@ do_verify() {
   echo "prefix: $PREFIX (version $( [ -f "$PREFIX/VERSION" ] && cat "$PREFIX/VERSION" || echo MISSING))"
   for f in hub-agent.py tunnel-agent.js hooks/guard.py hooks/fileguard.py \
            hooks/ask.py hooks/statusline.py \
+           qwen_session.py qwen_transcript.py \
+           qwen/ask_mcp.py qwen/peer_mcp.py qwen/peer_inbox.py qwen/guard/shim.py \
            bin/turma-agent bin/turma-agentctl bin/turma-agent-update; do
     if [ -e "$PREFIX/$f" ]; then echo "  file $f: ok"; else echo "  file $f: MISSING"; ok=1; fi
   done
