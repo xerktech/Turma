@@ -15249,7 +15249,7 @@ class SessionManager:
         per-session: loopback-only (the sole reachable path is the local
         tunnel-agent the hub drives), interactive (-W), scoped to base path
         /term/<id> so ttyd's own asset/WS URLs resolve behind the hub prefix,
-        JBMNerd font + DOM renderer + disableLeaveAlert for the TUI, and
+        JBMNerd font + WebGL renderer + disableLeaveAlert for the TUI, and
         basic auth (-c) keyed off the shared agent token as defense in depth.
 
         A dsh session gets NO ttyd (XERK-498): it is headless, so its tmux shows
@@ -15279,12 +15279,19 @@ class SessionManager:
             "ttyd", "-p", str(sess["ttydPort"]), "-i", "127.0.0.1",
             "-b", f"/term/{sess['id']}", "-W", "-m", "8",
             "-t", 'fontFamily=JBMNerd, "JetBrainsMono Nerd Font Mono", "DejaVu Sans Mono", monospace',
-            "-t", "fontSize=14",
-            # DOM, not canvas: canvas left after-images on the TUI's full
-            # alt-screen repaints and jittered on the Nerd Font's fractional
-            # cell width (the qwen TUI's box-drawing + input box read garbled).
-            # DOM reflows per cell, so a late font swap can't misalign it.
-            "-t", "rendererType=dom",
+            # 15px, not 14: the Nerd Font's advance is exactly 0.6em (measured
+            # from jbm-nerd-mono.woff2), so at 14px the cell is a fractional
+            # 8.4px and each row drifts a subpixel — the shimmer + misaligned
+            # box-drawing in the qwen TUI. At 15px the cell is exactly 9.0px
+            # and rows land pixel-exact in every renderer.
+            "-t", "fontSize=15",
+            # WebGL, not canvas or DOM: canvas left after-images on the TUI's
+            # full alt-screen repaints, and DOM (one span per cell) flickered
+            # on every streamed line of the busy qwen TUI. WebGL is ttyd's own
+            # default — GPU-blitted, subpixel-accurate, no per-column
+            # rounding — and degrades to a software renderer in browsers
+            # without a GL context.
+            "-t", "rendererType=webgl",
             "-t", "disableLeaveAlert=true",
             # A mouse-tracking app (the Claude TUI is one) takes the drag, so
             # xterm.js only makes a SELECTION when a modifier forces one — the
