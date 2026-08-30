@@ -841,6 +841,11 @@ function isStatusLine(l) {
   const t = String(l == null ? "" : l).trim();
   if (!t) return false;
   if (/esc to interrupt/i.test(t)) return true;
+  // Qwen Code's spinner line ends "(… · esc to cancel)" — recognized even
+  // before any token counter is present (it is not shown until tokens flow).
+  // Claude's own permission dialog says "Esc to cancel · Tab to amend" WITHOUT
+  // a closing paren, so require the paren (mirrors QWEN_PANE_BUSY_RE below).
+  if (/esc to cancel\)/i.test(t)) return true;
   if (/[↑↓]\s*[\d.,]+\s*[kKmM]?\s*tokens/i.test(t)) return true;
   return /^[^\sA-Za-z0-9]\s+[A-Z][a-z]+(?:…|\.\.\.)(?:\s*\(|\s*$)/.test(t);
 }
@@ -1032,7 +1037,26 @@ function liveAgentsReport(state) {
 // so each field is matched independently rather than positionally.
 function parsePaneStatus(l) {
   const t = String(l == null ? "" : l).trim();
-  const verb = t.match(/([A-Za-z][A-Za-z-]*)(?:…|\.\.\.)/);
+  // The working phrase is the text after the leading spinner glyph (a run of
+  // non-alphanumerics: Claude's "✻"/"∗", Qwen's tmux frames ". " / "..") up to
+  // the trailing TUI detail. Qwen's phrase is MULTI-WORD ("Polishing the
+  // algorithms..."), so a last-word-only capture surfaced just "algorithms" in
+  // the chat bar — take the whole phrase instead.
+  let verb = t.replace(/^[^\sA-Za-z0-9]+\s+/, "");
+  // The line may end with a CLOSED detail paren ("(1s · ↑ 106 tokens · esc to
+  // cancel)" / "(esc to interrupt · …)"): cut it off only when its content
+  // reads as that detail, so a paren INSIDE a phrase ("…(or my code)…")
+  // survives. Then drop the phrase's own trailing ellipsis — an INTERNAL one
+  // ("Loading... Do a barrel roll!") is kept.
+  const detail = verb.match(/\([^()]*\)\s*$/);
+  if (detail && /esc to (cancel|interrupt)|[↑↓]|\btokens?\b/i.test(detail[0].slice(1, -1))) {
+    verb = verb.slice(0, detail.index).replace(/(?:…|\.\.\.)\s*$/, "").trim();
+  } else {
+    // No closed detail (a bare "· Honking…", or a width-truncated
+    // "… (esc to inte…"): the phrase ends at the FIRST ellipsis.
+    const e = verb.search(/…|\.\.\./);
+    verb = (e < 0 ? verb : verb.slice(0, e)).trim();
+  }
   const up = t.match(/↑\s*([\d.,]+\s*[kKmM]?)/);
   const down = t.match(/↓\s*([\d.,]+\s*[kKmM]?)/);
   const elapsed = t.match(/(?:^|[\s(·])(\d+)\s*s\b/);
@@ -1040,7 +1064,7 @@ function parsePaneStatus(l) {
   let u = clean(up), d = clean(down);
   // No arrows but a bare "1.2k tokens" -> treat as the primary (up) count.
   if (!u && !d) { const tok = t.match(/([\d.,]+\s*[kKmM]?)\s*tokens/i); if (tok) u = clean(tok); }
-  return { verb: verb ? verb[1] : "", up: u, down: d, elapsed: elapsed ? elapsed[1] + "s" : "" };
+  return { verb, up: u, down: d, elapsed: elapsed ? elapsed[1] + "s" : "" };
 }
 
 // "Is a turn running" read off the whole capture — the same three shapes
