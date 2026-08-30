@@ -4249,6 +4249,95 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
                 sm._launch_qwen(self._sess())
             sp.assert_not_called()
 
+    # --- readiness verdict stability (transient vs config-level) --------------
+
+    def test_ensure_qwen_ready_reprobes_after_a_transient_failure(self):
+        # A failed `--version` (binary mid-update, a PATH blip) is TRANSIENT: it
+        # must NOT poison the verdict for the manager's lifetime. The flag stays
+        # unset, so a later call re-probes instead of returning a cached False.
+        sm = self.make_manager()
+        with mock.patch.object(ha.subprocess, "run", side_effect=[
+                FileNotFoundError("mid-update"),
+                types.SimpleNamespace(returncode=0, stdout="qwen 0.22.2")]) as sp:
+            self.assertFalse(sm._ensure_qwen_ready())
+            self.assertFalse(hasattr(sm, "_qwen_ready"))  # transient: not cached
+            self.assertTrue(sm._ensure_qwen_ready())      # re-probed, now ready
+        self.assertEqual(sp.call_count, 2)
+
+    def test_prime_qwen_retries_until_the_probe_passes(self):
+        # The boot worker must keep re-probing through transient failures
+        # (sleeping QWEN_READY_RETRY_SEC between attempts) until the probe
+        # passes, then prime the guard config and signal the ready event.
+        sm = self.make_manager()
+        sm._qwen_ready_event = threading.Event()
+        calls = {"n": 0}
+        def probe():
+            calls["n"] += 1
+            return calls["n"] >= 2  # first attempt fails (transient), second passes
+        with mock.patch.object(sm, "_ensure_qwen_ready", side_effect=probe), \
+             mock.patch.object(ha, "QWEN_READY_RETRY_SEC", 0), \
+             mock.patch.object(sm, "_qwen_guard_config") as guard:
+            sm._prime_qwen()
+        self.assertEqual(calls["n"], 2)
+        guard.assert_called_once()
+        self.assertTrue(sm._qwen_ready_event.is_set())
+
+    def test_prime_qwen_stops_on_a_config_refusal(self):
+        # A config-level refusal (no model route) is cached False and stable for
+        # the manager's lifetime — the worker must NOT loop re-probing it
+        # forever; it breaks out after one attempt, still primes the guard
+        # config, and still signals the event so waiters don't hang.
+        sm = self.make_manager()
+        sm._qwen_ready_event = threading.Event()
+        sm._qwen_ready = False  # cached config-level refusal
+        with mock.patch.object(sm, "_ensure_qwen_ready",
+                               return_value=False) as probe, \
+             mock.patch.object(ha, "QWEN_READY_RETRY_SEC", 30), \
+             mock.patch.object(sm, "_qwen_guard_config") as guard:
+            sm._prime_qwen()
+        probe.assert_called_once()
+        guard.assert_called_once()
+        self.assertTrue(sm._qwen_ready_event.is_set())
+
+    # --- boot-window wait in the launch gate ----------------------------------
+
+    def test_launch_qwen_waits_for_an_in_flight_boot_probe(self):
+        # The reported failure: a qwen relaunch reaching _launch_qwen before the
+        # boot probe (worker thread) cached its verdict used to error the
+        # session "not ready" while the probe finished a moment later. The gate
+        # must wait for the in-flight probe and then launch normally.
+        sm = self.make_manager()
+        sess = self._sess()
+        ev = threading.Event()
+        sm._qwen_ready_event = ev
+        os.environ["QWEN_TEST_KEY"] = "sk-secret"
+        self.addCleanup(os.environ.pop, "QWEN_TEST_KEY", None)
+        def arm_probe():
+            time.sleep(0.05)
+            sm._qwen_ready = True
+            ev.set()
+        t = threading.Thread(target=arm_probe)
+        t.start()
+        # Note: deliberately NOT pre-setting sm._qwen_ready (unlike _launch) —
+        # that is the boot window under test.
+        with mock.patch.object(sm, "_confirm_qwen_launch", return_value=True), \
+             mock.patch.object(ha.subprocess, "Popen"):
+            sm._launch_qwen(sess)  # raises "not ready" if the wait regresses
+        t.join()
+        self.assertIn("--session-id", self._last_tmux_cmd())
+
+    def test_launch_qwen_refuses_when_the_probe_never_lands(self):
+        # Bounded wait: if the probe never reaches a verdict, the gate still
+        # refuses after QWEN_READY_WAIT_SEC instead of hanging the beat — and
+        # it never runs the probe itself on the beat (XERK-395).
+        sm = self.make_manager()
+        sm._qwen_ready_event = threading.Event()  # created but never set
+        with mock.patch.object(ha, "QWEN_READY_WAIT_SEC", 0.05):
+            with mock.patch.object(ha.subprocess, "run") as sp:
+                with self.assertRaises(RuntimeError):
+                    sm._launch_qwen(self._sess())
+                sp.assert_not_called()
+
     # --- happy-path launch wiring --------------------------------------------
 
     def _launch(self, sm, sess, **kw):
