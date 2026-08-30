@@ -1685,6 +1685,7 @@
     if (!host) return;
     if (fromPoll && host.querySelector(".cc-menu.open")) return;
     const dsh = isDshSession();
+    const qwen = isQwenSession();
     const mode = modeChipValue(), model = currentModelValue();
     const modeOpts = availableModeOpts();
     const mOpts = availableModelOpts();
@@ -1702,6 +1703,7 @@
     // The runtime chip: a read-only "⚙ dsh" for a dsh session, else the Claude
     // subscription/local switch (shown when the host offers a local endpoint).
     const runtimeChip = dsh ? dshRuntimeChipHtml()
+      : qwen ? qwenRuntimeChipHtml()
       : (localModelOffered()
           ? '<span class="cc-opt cc-source' + (currentModelSource() === "local" ? " cc-source-local" : "") + '">' +
             '<button class="cc-btn" id="ccSourceBtn" title="' +
@@ -1941,6 +1943,7 @@
   // mode chip is hidden for dsh — dsh manages approvals itself (ask/never +
   // sandbox), not Claude's permission modes.
   function isDshSession() { return Boolean(sess && sess.agentType === "dsh"); }
+  function isQwenSession() { return Boolean(sess && sess.agentType === "qwen"); }
   function dshInfo(a) { return (a || agent || {}).dsh || {}; }
   function dshModels() {
     const d = dshInfo();
@@ -1971,6 +1974,15 @@
       '<span class="cc-btn" title="' +
       esc("Runs on the dsh (DeepSeek Harness) runtime, not Claude Code") + '">' +
       '⚙ <span class="cc-val">dsh</span></span></span>';
+  }
+  // Read-only runtime marker for a qwen session: a running Qwen Code session
+  // cannot switch to a Claude runtime live (the conversation formats differ),
+  // so it is shown as a fixed chip, not a picker.
+  function qwenRuntimeChipHtml() {
+    return '<span class="cc-opt cc-source cc-source-local">' +
+      '<span class="cc-btn" title="' +
+      esc("Runs on the Qwen Code runtime, not Claude Code") + '">' +
+      '⚙ <span class="cc-val">Qwen Code</span></span></span>';
   }
   function dshModelChipHtml() {
     const models = dshModels();
@@ -2774,7 +2786,9 @@
       contextMeterChip,   // Phase 4 context-fullness meter
       // XERK-504 dsh runtime footer (read-only runtime chip + live model dropdown)
       isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml,
-      dshRuntimeChipHtml, setSessionDshModel, renderComposeOpts,
+      dshRuntimeChipHtml, setSessionDshModel,
+      isQwenSession, qwenRuntimeChipHtml,
+      renderComposeOpts,
       __setDshModelPending: (p) => { dshModelPending = p; },
       __setLocalModelPending: (p) => { localModelPending = p; },
       __setModelSourcePending: (p) => { modelSourcePending = p; },
