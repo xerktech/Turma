@@ -15180,7 +15180,7 @@ class SessionManager:
         per-session: loopback-only (the sole reachable path is the local
         tunnel-agent the hub drives), interactive (-W), scoped to base path
         /term/<id> so ttyd's own asset/WS URLs resolve behind the hub prefix,
-        JBMNerd font + canvas renderer + disableLeaveAlert for the TUI, and
+        JBMNerd font + DOM renderer + disableLeaveAlert for the TUI, and
         basic auth (-c) keyed off the shared agent token as defense in depth.
 
         A dsh session gets NO ttyd (XERK-498): it is headless, so its tmux shows
@@ -15211,7 +15211,11 @@ class SessionManager:
             "-b", f"/term/{sess['id']}", "-W", "-m", "8",
             "-t", 'fontFamily=JBMNerd, "JetBrainsMono Nerd Font Mono", "DejaVu Sans Mono", monospace',
             "-t", "fontSize=14",
-            "-t", "rendererType=canvas",
+            # DOM, not canvas: canvas left after-images on the TUI's full
+            # alt-screen repaints and jittered on the Nerd Font's fractional
+            # cell width (the qwen TUI's box-drawing + input box read garbled).
+            # DOM reflows per cell, so a late font swap can't misalign it.
+            "-t", "rendererType=dom",
             "-t", "disableLeaveAlert=true",
             # A mouse-tracking app (the Claude TUI is one) takes the drag, so
             # xterm.js only makes a SELECTION when a modifier forces one — the
