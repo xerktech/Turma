@@ -131,3 +131,34 @@ ticket panel). Read this before touching `findTicketHost`, the `/session` routes
     restart empties it with no event the socket could carry, and the 15s poll only runs while SSE
     is down. Android polls every 6s regardless, so it never had this gap.
 - Tests: the `XERK-296:` cases in `server.test.js`, `board.test.js`, `BoardTest.kt`.
+
+## Repo importance tiers (XERK-487)
+
+Per-repo tiers weight triage ordering and policy above raw ticket priority ("a bug in the
+live-serving hub" over "a docs nit in an archived repo"). Hub-owned durable state, mirroring
+`autoStartOrgs`/`orgColors`: `REPO_TIERS_FILE` on `/data`, its own SSE frame, rides `/api/agents`
+as top-level `repoTiers`. `REPO_TIER_SEED` (env JSON `{repo: tier}`) is a one-shot boot seed for
+repos the durable file lacks — operator edits always win.
+
+- **Four tiers, a TOTAL ORDER**: `REPO_TIERS = [ignore, archive, active, live]`, rank = index
+  (higher = more important). Keyed by the **same repo name `repoGuess`/`ticketRepo` yields**, so it
+  joins cleanly to a ticket's triaged repo.
+- **Unset = the DEFAULT middle tier `active`, never top** — the "can't tell" answer. It outranks an
+  explicitly archived repo, is outranked by a live one, and **still routes** (only `ignore` is ever
+  withheld). Silence must never promote a repo above one an operator marked live. Only NON-default
+  tiers are stored; `setRepoTier(repo, "active")` deletes the key.
+- **The read seams the rest of triage consumes**: `repoTier`/`repoTierRank` for [E]'s priority key
+  (tier is a TIEBREAKER **below** priority+type — E sorts by those ahead of it) and [F]'s allow/deny;
+  `isRepoIgnored` for the one policy this store owns outright.
+- **`ignore`-tier repos never auto-start.** `autoStartSweep` skips them (never enqueued) and
+  `drainTicketQueue` drops an AUTO entry whose repo was retiered to ignore mid-wait — no churn, like
+  a ticket that lost its triaged repo. A MANUAL start is deliberate intent and is **not** tier-gated.
+- **Auto-stream ordering**: the sweep sorts each org's ready tickets by `repoTierRank` desc (STABLE,
+  so same-tier keeps board order) before enqueue, so higher-tier tickets take the scarce auto slots
+  first. Until [E] lands this is the only ordering the auto stream has; E folds tier under
+  priority+type without changing this seam.
+- **The `/api/repos/<repo>/tier` route** (POST `{tier}` or `{auto:true}`) mirrors `/autostart`:
+  user-authed, durable-authoritative on the 200, and the repo must be one the fleet reports (or
+  already tiered) — no phantom repos, no unbounded key growth (`REPO_NAME_MAX`). A public/Android UI
+  is deferred (optional per the ticket); config-seed + route operate it for now.
+- Tests: the `XERK-487:` cases in `server.test.js`.
