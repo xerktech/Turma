@@ -11764,6 +11764,46 @@ JIRA_TRIAGE_INSTRUCTION = (
 )
 
 
+# --- Ticket-triage assessment (XERK-482) --------------------------------------
+# A SIBLING classifier to the repo triage above: instead of "which repo", it
+# asks for the gate/prioritize/dedupe assessment that rides the ticket as
+# `triage` (the wire shape XERK-481 wired into build_ticket_triage, the hub's
+# sanitizeTicketTriage, and Android's TicketTriage). It answers a different
+# question (no candidate repos involved), so it keeps its OWN ledger file and
+# its OWN in-flight job — but it rides the same beat slot and the same
+# shared-login tunables as the repo triage, so a settled board costs nothing
+# and a busy board still never forks more than one model per job type.
+TICKET_TRIAGE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-triage.json")
+# Fixed enums the model must pick from; anything else is a failed attempt.
+TRIAGE_TYPES = ("bug", "feature", "task", "chore", "improvement",
+                "documentation", "other")
+TRIAGE_VALUES = ("high", "medium", "low")
+TICKET_TRIAGE_INSTRUCTION = (
+    "You are triaging Jira tickets for a session queue: for each, decide its "
+    "priority, work type, value, whether it is actionable, and what it "
+    "duplicates.\n\n"
+    "Rules:\n"
+    "- priority: exactly one of P0, P1, P2, P3 (P0 = urgent production impact, "
+    "P3 = low).\n"
+    "- type: exactly one of " + ", ".join(TRIAGE_TYPES) + ".\n"
+    "- value: exactly one of " + ", ".join(TRIAGE_VALUES) + " "
+    "(the impact/value of the work).\n"
+    "- actionable: true only if it is concrete engineering work a coding "
+    "session can start on; false for pure discussion, design, meeting, "
+    "access-request, or blocked work.\n"
+    "- dedupeOf: the key of ANOTHER ticket listed below that this one "
+    "duplicates, or null.\n"
+    "- reason: at most 12 words.\n\n"
+    "Only assess the tickets listed under 'Assess these'. You may read every "
+    "ticket listed below to detect duplicates.\n"
+    "Reply with ONLY a JSON object mapping each requested key to "
+    '{"priority": "P0|P1|P2|P3", "type": "<one of the types>", '
+    '"value": "<one of the values>", "actionable": true|false, '
+    '"dedupeOf": "<ticket key or null>", "reason": "<max 12 words>"}. '
+    "No markdown fences, no preamble.\n\n"
+)
+
+
 def _triage_candidates(repos, github):
     """The repos a ticket on this host may be matched to: its cloned repos first
     (they carry `cloned`, which the prompt tells the model to prefer), then every
@@ -12036,6 +12076,102 @@ def _parse_triage(raw, tickets, cands):
             "reason": why,
         }
     return out
+
+
+def _ticket_triage_stale(entry, ticket_fp):
+    """True when a ticket-triage entry doesn't answer the ticket text now on
+    the board: never assessed, or assessed from different text. Stale means
+    're-triage this', never 'stop showing it' — the old answer keeps rendering
+    until a new one lands."""
+    if not isinstance(entry, dict) or not entry.get("decided"):
+        return True
+    return entry.get("ticketFp") != ticket_fp
+
+
+def _ticket_triage_attempts(entry, ticket_fp):
+    """How many attempts have been spent on the question currently being asked,
+    scoped to that question (a changed ticket gets a fresh budget), mirroring
+    _triage_attempts for the repo ledger."""
+    if not isinstance(entry, dict):
+        return 0
+    if entry.get("tryTicketFp") != ticket_fp:
+        return 0
+    n = entry.get("attempts")
+    return n if isinstance(n, int) else 0
+
+
+def _parse_ticket_triage(raw, asked_keys, board_keys):
+    """Model reply -> {issueKey: {priority, type, value, actionable, dedupeOf,
+    reason}} for the ticket-triage assessment.
+
+    Trust boundary, the same sharp line _parse_triage draws: an EXPLICIT,
+    fully-valid answer is a decision; anything else — a missing field, a
+    priority outside P0..P3, a type or value outside the fixed enums, a
+    non-bool actionable, or a dedupeOf pointing at a key that is not on the
+    board — is a FAILED ATTEMPT. Its key is omitted so the ticket stays
+    undecided and the retry picks it up. Recording a half-validated
+    assessment would paint a confident value the model never fully asserted,
+    and a decision is never re-triaged. Keys not asked about are ignored
+    outright. An entirely unusable reply returns {} (a failed attempt for the
+    whole batch)."""
+    data = _extract_json_object(raw)
+    if data is None:
+        return {}
+    asked = set(asked_keys)
+    board = set(board_keys)
+    out = {}
+    for key, val in data.items():
+        if key not in asked:
+            continue
+        if not isinstance(val, dict):
+            continue      # a bare string/number/list is not an assessment
+        if val.get("priority") not in TRIAGE_PRIORITIES:
+            continue      # out-of-band band is a broken attempt, not a guess
+        if val.get("type") not in TRIAGE_TYPES:
+            continue
+        if val.get("value") not in TRIAGE_VALUES:
+            continue
+        if not isinstance(val.get("actionable"), bool):
+            continue
+        dedupe = val.get("dedupeOf", None)
+        if dedupe is not None and (not isinstance(dedupe, str) or dedupe not in board):
+            continue      # invented or off-board duplicate -> broken attempt
+        out[key] = {
+            "priority": val["priority"],
+            "type": val["type"],
+            "value": val["value"],
+            "actionable": val["actionable"],
+            "dedupeOf": dedupe,
+            "reason": str(val.get("reason") or "")[:JIRA_TRIAGE_REASON_MAX],
+        }
+    return out
+
+
+def _ticket_triage_prompt(batch, board):
+    """The ticket-triage prompt. Ticket text is DATA here: it reaches
+    `claude -p` as a single argv element (no shell), the reply is
+    allowlist-checked in _parse_ticket_triage, and dedupeOf is validated
+    against the board's own keys — so a ticket summary carrying
+    prompt-injection text can at worst mislabel its own card. Every ticket on
+    the board is listed (key + summary) so duplicates can be seen across
+    tickets outside this batch; only `batch` is assessed."""
+    def line(t):
+        bits = [f"- {t.get('key')}: {t.get('summary') or ''}"]
+        if t.get("type"):
+            bits.append(f"(type: {t['type']})")
+        if t.get("project"):
+            bits.append(f"(project: {t['project']})")
+        labels = t.get("labels")
+        if isinstance(labels, list) and labels:
+            bits.append(f"(labels: {', '.join(labels)})")
+        return " ".join(bits)
+    lines = [TICKET_TRIAGE_INSTRUCTION, "Tickets on the board:"]
+    for t in board:
+        lines.append(line(t))
+    lines.append("\nAssess these:")
+    for t in batch:
+        lines.append(line(t))
+    return "\n".join(lines)
 
 
 # --- Session activity summaries ------------------------------------------------
@@ -12615,6 +12751,13 @@ class SessionManager:
         # against the one shared login. Both stay empty on unconfigured hosts.
         self.triage_ledger = self._load_triage_ledger()
         self.triage_job = None
+        # Durable Jira ticket-triage assessments (XERK-482): the sibling of the
+        # repo ledger, in its own file because it answers a different question
+        # (no candidate-repo dependency, so a gh sweep or fresh clone must not
+        # restale it) and prunes independently. At most one assessment job runs
+        # at a time, same shared login.
+        self.ticket_triage_ledger = self._load_ticket_triage_ledger()
+        self.ticket_triage_job = None
         # Durable transcript -> ticket attribution (persisted). Keeps the board's
         # ticket chips answerable after the session record behind them is gone —
         # killed, aged out of closed.json, or never in either. Backfilled from the
@@ -12976,6 +13119,246 @@ class SessionManager:
         for lkey, _ in order[:over]:
             self.triage_ledger.pop(lkey, None)
 
+    # --- Jira ticket-triage assessment (XERK-482) ---------------------------
+
+    def _load_ticket_triage_ledger(self):
+        try:
+            with open(TICKET_TRIAGE_LEDGER_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_ticket_triage_ledger(self):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = TICKET_TRIAGE_LEDGER_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.ticket_triage_ledger, f, indent=2)
+            os.replace(tmp, TICKET_TRIAGE_LEDGER_PATH)
+        except OSError as e:
+            log(f"ticket triage ledger save failed: {e}")
+
+    def _ticket_triage_due(self, tickets, now, site_key):
+        """The tickets wanting an assessment right now: stale (never assessed,
+        or assessed from different ticket text), attempts left, and past the
+        backoff a previous failed attempt armed. Bounded to one batch — the rest
+        come back on later beats.
+
+        Staleness is the ticket's OWN text only (the same _ticket_fingerprint
+        the repo ledger uses): the candidate-repo set is deliberately NOT part
+        of it, because priority/type/value/dedupe do not depend on which repos
+        this host can reach, so a gh sweep or a fresh clone must not re-run the
+        whole board through the model a second time."""
+        due = []
+        for t in tickets:
+            key = t.get("key")
+            if not key:
+                continue
+            entry = self.ticket_triage_ledger.get(_triage_key(site_key, key))
+            # An operator's own assessment outranks anything the model would
+            # decide: a manual pin is never re-triaged and never spends an
+            # attempt. (Honored here even though no pin command ships in
+            # XERK-482 — the operator tooling that writes one is a sibling
+            # child of XERK-480, and the ledger must already respect it.)
+            if isinstance(entry, dict) and entry.get("manual"):
+                continue
+            tfp = _ticket_fingerprint(t)
+            if not _ticket_triage_stale(entry, tfp):
+                continue
+            attempts = _ticket_triage_attempts(entry, tfp)
+            if attempts >= JIRA_TRIAGE_MAX_ATTEMPTS:
+                continue
+            # The backoff is only this question's to enforce; `attempts` is 0
+            # when the retryAt on record was armed answering a different one.
+            if attempts and now < (entry.get("retryAt") or 0):
+                continue
+            due.append(t)
+            if len(due) >= JIRA_TRIAGE_BATCH:
+                break
+        return due
+
+    def _start_ticket_triage(self):
+        """Kick off one batch of ticket-triage assessments as a DETACHED
+        `claude -p`, reaped by _poll_ticket_triage. No-op when a job is already
+        in flight, when the board is off, or when every ticket already has a
+        fresh assessment — so a settled board costs nothing. Source-agnostic:
+        it reads only the ticket text in self.jira, and needs no candidate
+        repos at all (the assessment doesn't depend on them)."""
+        if not board_configured():
+            return
+        if self.ticket_triage_job is not None:
+            return
+        tickets = self.jira.get("tickets") or []
+        if not tickets:
+            return
+        site_key = self.jira.get("siteKey")
+        batch = self._ticket_triage_due(tickets, time.time(), site_key)
+        if not batch:
+            return
+        out_path = os.path.join(REGISTRY_DIR, "jira-ticket-triage.out")
+        outf = None
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            outf = open(out_path, "w")
+            # Same posture as _start_jira_triage: headless, cwd is REGISTRY_DIR
+            # (NOT a repo) and no --settings, so it never loads the session
+            # guard or explores a worktree — it decides from the ticket text in
+            # the prompt alone. The command is a list (no shell), so ticket
+            # text can't inject, and _poll_ticket_triage's timeout backstops a
+            # hang.
+            proc = subprocess.Popen(
+                ["claude", "-p", "--model", JIRA_TRIAGE_MODEL,
+                 _ticket_triage_prompt(batch, tickets)],
+                stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+            )
+        except Exception as e:
+            log(f"ticket triage launch failed: {e}")
+            if outf is not None:
+                try:
+                    outf.close()
+                except Exception:
+                    pass
+            self._spend_ticket_triage_attempts(batch, site_key)
+            return
+        self.ticket_triage_job = {
+            "proc": proc, "outf": outf, "outPath": out_path,
+            "startedMono": time.time(), "batch": batch,
+            # Pinned rather than re-read at reap time: the ledger key a decision
+            # lands under must be the one its attempt was counted under, and a
+            # job outlives the beat that started it.
+            "siteKey": site_key,
+        }
+        self._spend_ticket_triage_attempts(batch, site_key)
+        log(f"triaging {len(batch)} jira ticket(s) for priority/dedupe via "
+            f"claude -p ({JIRA_TRIAGE_MODEL})")
+
+    def _spend_ticket_triage_attempts(self, batch, site_key):
+        """Count an attempt against each ticket in a batch and arm its backoff.
+        Armed up-front like _spend_triage_attempts: if the manager dies
+        mid-batch the job dies with it, and the persisted count is what makes
+        the reload retry once rather than loop.
+
+        Touches ONLY the attempt-run fields. Any assessment already on the
+        entry is left intact and keeps rendering while this attempt runs — it
+        is the best answer available until a better one lands, and destroying
+        it here would blank the board on nothing more than a transient."""
+        for t in batch:
+            lkey = _triage_key(site_key, t.get("key"))
+            entry = dict(self.ticket_triage_ledger.get(lkey) or {})
+            tfp = _ticket_fingerprint(t)
+            prev = _ticket_triage_attempts(entry, tfp)
+            entry["attempts"] = prev + 1
+            entry["retryAt"] = time.time() + JIRA_TRIAGE_BACKOFF_SEC * (prev + 1)
+            entry["tryTicketFp"] = tfp
+            self.ticket_triage_ledger[lkey] = entry
+        self._prune_ticket_triage_ledger()
+        self._save_ticket_triage_ledger()
+
+    def _finish_ticket_triage(self, job, results):
+        """Tear down a ticket-triage job and merge whatever it decided into the
+        ledger. A ticket the reply didn't cover keeps the attempt it spent and
+        comes back on a later beat once its backoff elapses."""
+        try:
+            if job.get("outf"):
+                job["outf"].close()
+        except Exception:
+            pass
+        try:
+            if job.get("outPath"):
+                os.remove(job["outPath"])
+        except OSError:
+            pass
+        self.ticket_triage_job = None
+        decided = 0
+        for t in job.get("batch") or []:
+            key = t.get("key")
+            if key not in results:
+                continue
+            lkey = _triage_key(job.get("siteKey"), key)
+            entry = dict(self.ticket_triage_ledger.get(lkey) or {})
+            # The operator overrode this ticket while the model was still
+            # deciding it. Their answer wins: the batch was built before the
+            # override existed, so this reply is an answer to a question that
+            # is no longer being asked. Mirrors _finish_jira_triage declining
+            # to clobber a manual pin.
+            if entry.get("manual"):
+                continue
+            entry.update(results[key])
+            entry["decided"] = True
+            entry["at"] = now_iso()
+            entry["source"] = "auto"
+            # The tracker's OWN label rides alongside the normalized band; it
+            # is the ticket's data, not the model's, so it is taken from the
+            # board, never from the reply.
+            entry["priorityName"] = t.get("priority") or ""
+            # Stamp the question this decision ANSWERS (the one the batch was
+            # built from, not whatever the block says now), and close out the
+            # attempt run — a landed answer owes no more retries, and leaving
+            # the counter to accumulate across the ticket's life would
+            # eventually ban it from ever being re-triaged.
+            entry["ticketFp"] = _ticket_fingerprint(t)
+            for k in ("attempts", "retryAt", "tryTicketFp"):
+                entry.pop(k, None)
+            self.ticket_triage_ledger[lkey] = entry
+            decided += 1
+        if decided:
+            self._save_ticket_triage_ledger()
+            self._apply_triage()
+        missed = len(job.get("batch") or []) - decided
+        log(f"ticket triage: assessed {decided} ticket(s)"
+            + (f", {missed} unanswered (will retry)" if missed else ""))
+
+    def _poll_ticket_triage(self):
+        """Reap the in-flight ticket-triage subprocess (one non-blocking poll()
+        per beat, like _poll_jira_triage): on clean exit merge the validated
+        assessments; kill and drop anything that overran the timeout."""
+        job = self.ticket_triage_job
+        if job is None:
+            return
+        proc = job.get("proc")
+        rc = proc.poll() if proc else 0
+        if rc is None:
+            if time.time() - job.get("startedMono", 0) > JIRA_TRIAGE_TIMEOUT_SEC:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                log("ticket triage timed out")
+                self._finish_ticket_triage(job, {})
+            return
+        raw = None
+        if rc == 0:
+            try:
+                with open(job.get("outPath") or "", errors="replace") as f:
+                    raw = f.read()
+            except OSError:
+                raw = None
+        else:
+            log(f"ticket triage exited {rc}")
+        asked = [t.get("key") for t in job.get("batch") or []]
+        board_keys = [t.get("key") for t in (self.jira.get("tickets") or [])]
+        self._finish_ticket_triage(
+            job, _parse_ticket_triage(raw, asked, board_keys))
+
+    def _prune_ticket_triage_ledger(self):
+        """Bound the assessment ledger. Entries are dropped oldest-assessment-
+        first; an undecided entry (in flight or awaiting a retry) sorts newest
+        so a prune can't silently cancel work still owed.
+
+        A MANUAL entry is evicted last: an auto assessment the prune drops is
+        simply recomputed on the next beat, but a pin the operator typed is the
+        one thing here that cannot be regenerated, and losing it would silently
+        hand the ticket back to the model."""
+        over = len(self.ticket_triage_ledger) - JIRA_TRIAGE_LEDGER_MAX
+        if over <= 0:
+            return
+        order = sorted(self.ticket_triage_ledger.items(),
+                       key=lambda kv: ("￿" if (kv[1] or {}).get("manual")
+                                       else (kv[1] or {}).get("at") or "￿"))
+        for lkey, _ in order[:over]:
+            self.ticket_triage_ledger.pop(lkey, None)
+
     def _apply_triage(self):
         """Stamp each cached decision onto its ticket in the live jira block, so
         the guess rides the ordinary heartbeat rather than needing a channel of its
@@ -12992,15 +13375,17 @@ class SessionManager:
         site_key = self.jira.get("siteKey")
         by_name = {c["name"]: c for c in (self.triage_cands or [])}
         for t in self.jira.get("tickets") or []:
-            entry = self.triage_ledger.get(_triage_key(site_key, t.get("key")))
-            # The triage ASSESSMENT (priority/type/dedupe — XERK-481) is
+            lkey = _triage_key(site_key, t.get("key"))
+            entry = self.triage_ledger.get(lkey)
+            # The triage ASSESSMENT (priority/type/dedupe — XERK-482) is
             # INDEPENDENT of the repo decision: a ticket can be prioritized before
             # (or without) a repo being chosen, so it is stamped ahead of the
-            # repoGuess decided-gate below. The block's shape is defined by
-            # build_ticket_triage; the ledger entry's `triage` sub-dict is
-            # populated by B/E (XERK-480), so this is dormant-but-wired until then
-            # and simply stamps nothing while entries carry no assessment.
-            triage = build_ticket_triage(entry.get("triage")) if isinstance(entry, dict) else None
+            # repoGuess decided-gate below. It lives in its own ledger because
+            # its staleness depends only on the ticket's own text, not the
+            # candidate-repo set. Absence of an entry reads as "not assessed
+            # yet", never a fabricated value.
+            tentry = self.ticket_triage_ledger.get(lkey)
+            triage = build_ticket_triage(tentry) if isinstance(tentry, dict) else None
             if triage:
                 t["triage"] = triage
             else:
@@ -23103,19 +23488,21 @@ class SessionManager:
         # configured() guard keeps unconfigured hosts at zero board HTTP calls forever.
         if not light and beat % JIRA_REFRESH_EVERY == 0 and board_configured():
             self.refresh_jira()
-        # Ticket -> repo triage. Attempted every beat rather than on the slow jira
-        # cadence: it's one batch in flight at a time, so a freshly-polled board
-        # would otherwise take an hour of 10-minute beats to classify instead of a
-        # few minutes. Both calls no-op immediately on a settled board (nothing
-        # stale) and on an unconfigured host (no tickets), so the steady-state cost
-        # is a fingerprint check.
-        # Both halves are wrapped, not just the start: this runs on the heartbeat
-        # path of the PID-1 manager, and a repo chip is never worth taking the
+        # Ticket -> repo triage and ticket ASSESSMENT (XERK-482). Attempted every
+        # beat rather than on the slow jira cadence: it's one batch in flight at a
+        # time, so a freshly-polled board would otherwise take an hour of 10-minute
+        # beats to classify instead of a few minutes. Both calls no-op immediately
+        # on a settled board (nothing stale) and on an unconfigured host (no
+        # tickets), so the steady-state cost is a fingerprint check.
+        # All four are wrapped, not just the start: this runs on the heartbeat
+        # path of the PID-1 manager, and a triage chip is never worth taking the
         # host's sessions down for.
         if not light:
             try:
                 self._poll_jira_triage()
                 self._start_jira_triage()
+                self._poll_ticket_triage()
+                self._start_ticket_triage()
             except Exception as e:
                 log(f"jira triage failed: {e}")
         # PR state + CI checks for the links live sessions opened, on a faster
