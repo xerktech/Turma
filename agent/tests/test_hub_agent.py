@@ -12379,6 +12379,253 @@ class TestPollPrConflicts(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self.assertEqual(self._typed(), [])
 
 
+class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
+    """_poll_open_pr_nudges nudges a running, idle session that holds undelivered
+    code work with no open PR to commit/push/open a PR (XERK-526).
+
+    The registry is empty in these tests, so delivery falls back to the pane and
+    `_typed()` reads it — the inbox route is asserted on its own below."""
+
+    URL = "https://github.com/o/r/pull/7"
+
+    def make_manager(self):
+        sm = super().make_manager()
+        sm.github = {"available": True, "login": "botlogin", "repos": []}
+        self.run_calls.clear()
+        return sm
+
+    def _session(self, sm, dirty=1, live_branch="feature-x", pushed=None,
+                 ahead_remote=0, status="running", urls=()):
+        sess = {"id": "s1", "status": status, "tmuxName": "agent-s1",
+                "worktreePath": os.path.join(self.tmp, "wt"), "summary": "work"}
+        sm.registry = [sess]
+        sm.session_pr_urls = {"s1": list(urls)}
+        sm.pr_status_cache = {}
+        gi = {"branch": live_branch or "HEAD", "dirtyFiles": dirty}
+        work = {"baseRef": None, "aheadOfBase": None,
+                "pushed": pushed, "aheadOfRemote": ahead_remote}
+        sm.session_facts = {"s1": {"liveBranch": live_branch, "slow": {},
+                                   "work": work}}
+        sm._session_git = lambda sess_, refresh=False: (gi, work)
+        return sess
+
+    def _typed(self):
+        return [data for _cmd, data in self.run_stdin_calls]
+
+    def test_idle_undelivered_work_is_nudged_once(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(len(self._typed()), 1)
+        self.assertIn("feature-x", self._typed()[0])
+        self.assertIn("uncommitted", self._typed()[0])
+        self.assertEqual(sess["prOpenNudged"]["s1"]["attempts"], 1)
+
+    def test_second_beat_within_backoff_does_not_resent(self):
+        sm = self.make_manager()
+        self._session(sm)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+            sm._poll_open_pr_nudges()          # within PR_OPEN_NUDGE_RETRY_SEC
+        self.assertEqual(len(self._typed()), 1)
+
+    def test_busy_session_is_not_nudged(self):
+        sm = self.make_manager()
+        self._session(sm)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(True, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+
+    def test_unknown_pane_state_is_not_nudged(self):
+        sm = self.make_manager()
+        self._session(sm)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(None, None, None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+
+    def test_blocking_dialog_is_not_nudged(self):
+        sm = self.make_manager()
+        self._session(sm)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", "allow? y/n")):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+
+    def test_clean_worktree_is_not_nudged(self):
+        sm = self.make_manager()
+        sess = self._session(sm, dirty=0, pushed=True, ahead_remote=0)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+
+    def test_unpushed_branch_is_nudged(self):
+        sm = self.make_manager()
+        sess = self._session(sm, dirty=0, pushed=False, ahead_remote=0)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(len(self._typed()), 1)
+        self.assertIn("never pushed", self._typed()[0])
+
+    def test_commits_ahead_of_origin_are_nudged(self):
+        sm = self.make_manager()
+        sess = self._session(sm, dirty=0, pushed=True, ahead_remote=2)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(len(self._typed()), 1)
+        self.assertIn("not yet on origin", self._typed()[0])
+
+    def test_session_with_open_pr_is_not_nudged(self):
+        sm = self.make_manager()
+        self._session(sm, urls=[self.URL])
+        sm.pr_status_cache = {self.URL: {"state": "OPEN"}}
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+
+    def test_unfetched_pr_is_treated_as_open(self):
+        # A PR whose state has not been fetched yet must not be double-nudged.
+        sm = self.make_manager()
+        self._session(sm, urls=[self.URL])
+        sm.pr_status_cache = {}
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+
+    def test_open_pr_clears_a_stale_episode(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()          # nudged, episode armed
+        self.assertIn("s1", sess["prOpenNudged"])
+        # A PR now covers the work -> episode cleared.
+        sm.session_pr_urls["s1"] = [self.URL]
+        sm.pr_status_cache = {self.URL: {"state": "OPEN"}}
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertNotIn("prOpenNudged", sess)
+        self.assertEqual(len(self._typed()), 1)
+
+    def test_work_cleared_clears_a_stale_episode(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()          # nudged, episode armed
+        self.assertIn("s1", sess["prOpenNudged"])
+        # Work delivered (clean tree, in sync) -> episode cleared.
+        sm.session_facts["s1"]["liveBranch"] = "feature-x"
+        sm._session_git = lambda s, refresh=False: (
+            {"branch": "feature-x", "dirtyFiles": 0},
+            {"baseRef": None, "aheadOfBase": None, "pushed": True,
+             "aheadOfRemote": 0})
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertNotIn("prOpenNudged", sess)
+        self.assertEqual(len(self._typed()), 1)
+
+    def test_retries_are_spaced_and_bounded(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        for _ in range(ha.PR_OPEN_NUDGE_MAX_ATTEMPTS + 2):
+            with mock.patch.object(ha, "_pane_status",
+                                   return_value=(False, "auto", None)):
+                sm._poll_open_pr_nudges()
+            ep = sess.get("prOpenNudged", {}).get("s1")
+            if ep:
+                ep["at"] = 0                  # age past the backoff
+        self.assertEqual(len(self._typed()), ha.PR_OPEN_NUDGE_MAX_ATTEMPTS)
+        self.assertIn("asked to do this before", self._typed()[1])
+
+    def test_stopped_session_is_skipped(self):
+        sm = self.make_manager()
+        self._session(sm, status="stopped")
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+
+    def test_dsh_running_session_is_not_nudged(self):
+        # A headless dsh session's pane is empty (XERK-468 [D]) — its busy
+        # state is the control-socket status, and a mid-turn session must not
+        # be nudged just because the empty pane reads idle.
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["agentType"] = "dsh"
+        sm.dsh_status["s1"] = {"status": "running"}
+        sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+        self.assertNotIn("prOpenNudged", sess)
+
+    def test_dsh_idle_session_is_nudged(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["agentType"] = "dsh"
+        sm.dsh_status["s1"] = {"status": "idle"}
+        fake = _FakeDshControl()
+        sm.dsh_controls["s1"] = fake
+        sm._poll_open_pr_nudges()
+        self.assertEqual(len(fake.inputs), 1)
+        self.assertIn("feature-x", fake.inputs[0][0])
+        self.assertEqual(fake.inputs[0][1], "machine")
+        self.assertEqual(sess["prOpenNudged"]["s1"]["attempts"], 1)
+
+    def test_dsh_pending_interaction_is_not_nudged(self):
+        # A dsh session blocked on a human has not finished its turn — the
+        # same suppression a blocking dialog gets on a Claude/qwen pane.
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["agentType"] = "dsh"
+        sm.dsh_status["s1"] = {"status": "idle", "pendingInteraction": True}
+        sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+        self.assertNotIn("prOpenNudged", sess)
+
+    def test_dsh_unknown_status_is_not_nudged(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["agentType"] = "dsh"
+        sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+        self.assertNotIn("prOpenNudged", sess)
+
+    def test_nudge_rides_the_session_inbox_when_it_has_one(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["claudeSessionId"] = "cc-1"
+        self._register(7, "cc-1")
+        posts = []
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)), \
+             mock.patch.object(ha, "_post_to_inbox",
+                               side_effect=lambda *a: posts.append(a) or True):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+        self.assertIn("feature-x", posts[0][3])
+        self.assertEqual(sess["prOpenNudged"]["s1"]["attempts"], 1)
+
+    def test_disabled_by_env_flag(self):
+        sm = self.make_manager()
+        self._session(sm)
+        with mock.patch.object(ha, "PR_OPEN_NUDGE", False), \
+             mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+
+
 # Verbatim `tmux capture-pane -p` output from a live Claude Code 2.1.220
 # session, trimmed to the dialog region — the two blocking dialogs
 # parse_pane_prompt exists to read. Kept as real captures rather than
