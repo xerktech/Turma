@@ -591,6 +591,46 @@ class TestSpawnOptionHelpers(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"TURMA_QWEN": off}):
                     self.assertFalse(ha.qwen_configured(), off)
 
+    def test_qwen_configured_requires_the_runtime_files(self):
+        # XERK-523: QWEN_ENABLED shipped True before the self-updater that lays
+        # the qwen siblings down was itself refreshed, so a host can carry the
+        # flag + env but NOT the files. That host must DEGRADE (offer nothing,
+        # refuse cleanly) rather than crash on `import qwen_session`, and recover
+        # the moment the files land — so the capability is gated on presence.
+        with mock.patch.object(ha, "QWEN_ENABLED", True), \
+             mock.patch.dict(os.environ, {"TURMA_QWEN": "1"}):
+            with mock.patch.object(ha, "qwen_runtime_present", lambda: False):
+                self.assertFalse(ha.qwen_configured(),
+                                 "flag+env but no files must read unavailable")
+            with mock.patch.object(ha, "qwen_runtime_present", lambda: True):
+                self.assertTrue(ha.qwen_configured())
+
+    def test_qwen_runtime_present_checks_every_launch_file(self):
+        # It is True only when EVERY file a qwen launch imports/execs is beside
+        # hub-agent.py; dropping any one reads False (the host would crash on
+        # that missing piece at launch, so it must not advertise qwen).
+        import tempfile
+        files = ("qwen_session.py", "qwen_transcript.py",
+                 os.path.join("qwen", "ask_mcp.py"),
+                 os.path.join("qwen", "peer_mcp.py"),
+                 os.path.join("qwen", "peer_inbox.py"),
+                 os.path.join("qwen", "guard", "shim.py"))
+        with tempfile.TemporaryDirectory() as d:
+            for f in files:
+                p = os.path.join(d, f)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                open(p, "w").close()
+            fake = os.path.join(d, "hub-agent.py")
+            with mock.patch.object(ha.os.path, "abspath", lambda _p: fake):
+                self.assertTrue(ha.qwen_runtime_present())
+                # Remove one file at a time -> the whole check fails.
+                for f in files:
+                    p = os.path.join(d, f)
+                    os.rename(p, p + ".bak")
+                    self.assertFalse(ha.qwen_runtime_present(),
+                                     f"missing {f} must read unavailable")
+                    os.rename(p + ".bak", p)
+
     def test_resolve_agent_type_qwen_gate(self):
         # qwen is in the enum but refused on a host that does not offer it, the
         # dsh gate mirrored (a clean spawn error beats a record naming a runtime

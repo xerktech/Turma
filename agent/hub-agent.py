@@ -1953,18 +1953,52 @@ def dsh_configured():
             in ("1", "true", "yes", "on"))
 
 
+def qwen_runtime_present():
+    """True when the qwen runtime files this host would import/exec on a qwen
+    launch are actually laid down beside hub-agent.py (XERK-523).
+
+    QWEN_ENABLED shipped True fleet-wide (XERK-520) BEFORE the native packaging
+    shipped these files (XERK-523) — and the self-updater that installs a
+    qwen-needing hub-agent.py is itself only refreshed BY that same payload, so
+    the FIRST update to introduce qwen swaps in the new manager while being
+    processed by the OLD updater, which does not copy the qwen siblings. The
+    result was a host whose hub-agent.py runs `import qwen_session` with no
+    qwen_session.py on disk, crashing every qwen spawn. Gating the capability on
+    the files being present makes such a host DEGRADE (hide + cleanly refuse
+    qwen) instead of crash, and self-heal the moment the next update lays them
+    down — the fail-safe discipline of local_model_configured / default_runtime.
+
+    Checked live (cheap stat calls, no memo) so a host that gains the files —
+    a later payload swap, or a manual lay-down — starts offering qwen without a
+    restart, and one that somehow loses them stops."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    needed = ("qwen_session.py", "qwen_transcript.py",
+              os.path.join("qwen", "ask_mcp.py"),
+              os.path.join("qwen", "peer_mcp.py"),
+              os.path.join("qwen", "peer_inbox.py"),
+              os.path.join("qwen", "guard", "shim.py"))
+    try:
+        return all(os.path.isfile(os.path.join(base, n)) for n in needed)
+    except OSError:
+        return False
+
+
 def qwen_configured():
     """True when this host offers the qwen (Qwen Code, XERK-504) runtime as a
     per-session choice. The qwen twin of dsh_configured: doubles as the heartbeat
     capability flag, gated FIRST on the in-code QWEN_ENABLED kill switch (so no
     per-host env can turn qwen on while it is disabled fleet-wide), then on
     TURMA_QWEN so the capability can be turned on per host once the flag is
-    lifted. [Qwen A] establishes the field, the flag and the whole wire path; an
-    agentType="qwen" spawn is refused at launch whenever this returns False, so
-    leaving it off keeps every current host on Claude Code with nothing changed."""
+    lifted, and finally on the runtime FILES being present (qwen_runtime_present,
+    XERK-523) so a host that has the flag + env but not the files DEGRADES rather
+    than crashing on `import qwen_session`. [Qwen A] establishes the field, the
+    flag and the whole wire path; an agentType="qwen" spawn is refused at launch
+    whenever this returns False, so leaving it off keeps every current host on
+    Claude Code with nothing changed."""
     return (QWEN_ENABLED
             and os.environ.get("TURMA_QWEN", "").strip().lower()
-            in ("1", "true", "yes", "on"))
+            in ("1", "true", "yes", "on")
+            and qwen_runtime_present())
 
 
 def resolve_agent_type(agent_type, apply_default=False):
