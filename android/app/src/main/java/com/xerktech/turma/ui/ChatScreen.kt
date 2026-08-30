@@ -293,6 +293,7 @@ fun ChatScreen(
                     onMode = vm::setMode,
                     localModel = state.localModel,
                     dsh = state.dsh,
+                    qwen = state.qwen,
                     modelSource = state.modelSource(),
                     canSwitchModelSource = state.canSwitchModelSource(),
                     onModelSource = vm::setModelSource,
@@ -615,6 +616,7 @@ private fun ChatFooter(
     onMode: (String) -> Unit,
     localModel: com.xerktech.turma.model.LocalModelInfo?,
     dsh: com.xerktech.turma.model.DshInfo?,
+    qwen: com.xerktech.turma.model.QwenInfo?,
     modelSource: String,
     canSwitchModelSource: Boolean,
     onModelSource: (String) -> Unit,
@@ -658,6 +660,20 @@ private fun ChatFooter(
             }
             // The runtime chip: read-only, matching the web footer's "⚙ dsh".
             StaticChip("⚙ dsh", why = "Runs on the dsh (DeepSeek Harness) runtime, not Claude Code")
+            session?.prs?.asReversed()?.forEach { PrBadge(it) }
+            return@FlowRow
+          }
+          // A qwen session runs the Qwen Code runtime (XERK-506): a read-only
+          // "⚙ Qwen Code" chip + a FIXED model label (qwen has no discovered
+          // model list, so there is nothing to pick), and NO permission-mode
+          // chip (qwen manages its own approvals) — the qwen twin of the dsh
+          // branch above.
+          if (com.xerktech.turma.core.Runtime.isQwen(session?.agentType)) {
+            StaticChip(
+                "model: ${com.xerktech.turma.core.Runtime.qwenModelLabel(session)}",
+                why = "This host's Qwen Code model. Qwen has no discovered model list, so the chip is fixed.",
+            )
+            StaticChip("⚙ Qwen Code", why = "Runs on the Qwen Code runtime, not Claude Code")
             session?.prs?.asReversed()?.forEach { PrBadge(it) }
             return@FlowRow
           }

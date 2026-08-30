@@ -125,6 +125,13 @@ object Runtime {
      */
     fun isDsh(agentType: String?): Boolean = DSH_ENABLED && agentType == DSH
 
+    /**
+     * Is a session on the qwen runtime — the qwen twin of [isDsh], so the
+     * chat footer renders a fixed "⚙ Qwen Code" chip instead of the
+     * Claude alias picker.
+     */
+    fun isQwen(agentType: String?): Boolean = QWEN_ENABLED && agentType == QWEN
+
     // ---- dsh model list (XERK-503/504) --------------------------------------
     // A dsh session offers the endpoint's DISCOVERED models (DshInfo.models), not
     // Claude aliases — the same shape [ModelSource]'s local helpers use, so the
@@ -161,6 +168,12 @@ object Runtime {
         val k = fmtCtx(ctx)
         return if (k.isNotEmpty()) "$id · $k" else id
     }
+
+    /** The chip label for a qwen session (XERK-506): the model the host
+     *  configured (QWEN_MODEL) or the hub carried on the session — qwen has
+     *  NO discovered model list, so the footer chip is always fixed. */
+    fun qwenModelLabel(session: SessionInfo?): String =
+        session?.model?.trim()?.ifBlank { null } ?: "qwen model"
 
     /** The dsh runtime capability of the host a chat session runs on. */
     fun hostDshFor(agents: List<AgentInfo>, host: String): DshInfo? =

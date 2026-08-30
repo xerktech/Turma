@@ -52,8 +52,17 @@ class ChatModelChipsTest {
     // dsh ships DISABLED fleet-wide (Runtime.DSH_ENABLED = false); the dsh footer
     // chip/model dropdown under test read Runtime.isDsh/hostDshFor, so enable it
     // before each and reset after so the flag can't leak into any other test.
-    @Before fun enableDsh() { Runtime.DSH_ENABLED = true }
-    @After fun resetDsh() { Runtime.DSH_ENABLED = false }
+    // qwen ships ENABLED, but RuntimeTest's @After leaves it off; pin it on here
+    // so the qwen footer tests don't depend on class ordering, and reset to the
+    // production default afterwards.
+    @Before fun enableRuntimes() {
+        Runtime.DSH_ENABLED = true
+        Runtime.QWEN_ENABLED = true
+    }
+    @After fun resetRuntimes() {
+        Runtime.DSH_ENABLED = false
+        Runtime.QWEN_ENABLED = true
+    }
 
     private val host = "nas01"
     private val session = "s1"
@@ -220,5 +229,55 @@ class ChatModelChipsTest {
         )
         compose.onNodeWithText("⚙ dsh").assertIsDisplayed()
         compose.onNodeWithText("model: deepseek-v4-flash").assertIsDisplayed()
+    }
+
+    /** Seed a qwen session and open its chat (XERK-506 footer). */
+    private fun openQwenChat(sessionModel: String) {
+        hub.json(
+            "/api/agents/$host/sessions/$session/history",
+            """{"entries":[],"truncated":false,"pending":false}""",
+        )
+        hub.json("/api/ws-token", """{"token":"t"}""")
+        hub.seedFleet(
+            HubHarness.fleetJson(
+                host = host, qwen = """{"available":true}""",
+                sessions = """{ "id": "$session", "repo": "Turma", "status": "running",
+                                "worktree": "wt", "agentType": "qwen",
+                                "model": "$sessionModel", "modelSource": "subscription" }""",
+            )
+        )
+        compose.setContent {
+            ChatScreen(host = host, sessionId = session, onBack = {}, onTerminal = {})
+        }
+        compose.waitForIdle()
+    }
+
+    /**
+     * XERK-506: a qwen session's footer reflects its RUNTIME, not the Claude
+     * subscription/local split. It shows a read-only "⚙ Qwen Code" chip and a
+     * FIXED model label (qwen has no discovered model list to pick from), and NO
+     * permission-mode chip (qwen manages approvals itself). It must NEVER read
+     * "Claude Code" or offer the Claude alias picker.
+     */
+    @Test
+    fun `a qwen session shows the qwen runtime chip and a fixed model label`() {
+        openQwenChat(sessionModel = "qwen3-coder")
+        // The read-only runtime chip, matching the web footer's "Qwen Code".
+        compose.onNodeWithText("⚙ Qwen Code").assertIsDisplayed()
+        // Qwen is capability-flag-only: a fixed label, never a menu.
+        compose.onNodeWithText("model: qwen3-coder").assertIsDisplayed()
+        // NOT the Claude subscription/local chips, and no permission-mode chip.
+        compose.onNodeWithText("☁ run: Claude Code").assertDoesNotExist()
+        compose.onNodeWithText("mode: auto").assertDoesNotExist()
+        compose.onNodeWithText("model: default").assertDoesNotExist()
+    }
+
+    /** When the hub carries no model for a qwen session the chip degrades to a
+     *  generic label rather than a broken or Claude-branded one. */
+    @Test
+    fun `a qwen session with no model falls back to a generic label`() {
+        openQwenChat(sessionModel = "")
+        compose.onNodeWithText("⚙ Qwen Code").assertIsDisplayed()
+        compose.onNodeWithText("model: qwen model").assertIsDisplayed()
     }
 }

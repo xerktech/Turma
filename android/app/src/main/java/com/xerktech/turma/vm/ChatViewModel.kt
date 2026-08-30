@@ -85,6 +85,11 @@ data class ChatUiState(
     // session's footer shows a live dsh model dropdown instead of the Claude
     // subscription/local chips. Null = not a dsh host (the common case).
     val dsh: com.xerktech.turma.model.DshInfo? = null,
+    // This host's qwen (Qwen Code) capability (XERK-506): qwen has NO discovered
+    // model list (capability-flag-only), so a qwen session's footer shows a
+    // FIXED model label + "⚙ Qwen Code" chip, never the Claude alias picker.
+    // Null = not a qwen host (the common case).
+    val qwen: com.xerktech.turma.model.QwenInfo? = null,
     val modelSourcePending: ModelSource.Pending? = null,
 ) {
     val prefs: VerbosityPrefs get() = VerbosityPrefs.forPreset(verbosity)
@@ -127,6 +132,7 @@ data class ChatUiState(
         uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
         localModel = agent?.localModel,
         dsh = agent?.dsh,
+        qwen = agent?.qwen,
     )
 }
 

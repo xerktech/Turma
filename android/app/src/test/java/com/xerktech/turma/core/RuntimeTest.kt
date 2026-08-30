@@ -147,6 +147,24 @@ class RuntimeTest {
         assertNull(Runtime.hostQwen(agents, "b"))
     }
 
+    @Test fun `isQwen badges only a qwen session, and the label needs no host lookup`() {
+        Runtime.QWEN_ENABLED = true
+        assertTrue(Runtime.isQwen("qwen"))
+        assertFalse(Runtime.isQwen("claude"))
+        assertFalse(Runtime.isQwen("dsh"))
+        // "" is what an agent predating the field reports (coerced hub-side).
+        assertFalse(Runtime.isQwen(""))
+        assertFalse(Runtime.isQwen(null))
+        // Qwen has NO discovered model list (capability-flag-only), so the footer
+        // label is the session's own model with a generic fallback — no
+        // DshInfo-style host lookup involved.
+        assertEquals("qwen3-coder", Runtime.qwenModelLabel(SessionInfo(id = "s", model = "qwen3-coder")))
+        assertEquals("qwen model", Runtime.qwenModelLabel(SessionInfo(id = "s", model = "")))
+        assertEquals("qwen model", Runtime.qwenModelLabel(null))
+        Runtime.QWEN_ENABLED = false
+        assertFalse(Runtime.isQwen("qwen"))
+    }
+
     // ---- dsh model list (XERK-503/504) ---------------------------------------
 
     @Test fun `dsh model helpers mirror the local ones over the discovered set`() {

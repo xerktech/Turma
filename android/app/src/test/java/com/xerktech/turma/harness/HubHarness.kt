@@ -213,6 +213,7 @@ class HubHarness : ExternalResource() {
             host: String = "nas01",
             localModel: String? = null,
             dsh: String? = null,
+            qwen: String? = null,
             sessions: String = "",
             repo: String = "Turma",
             now: Long = 1,
@@ -222,6 +223,7 @@ class HubHarness : ExternalResource() {
               "repos": [ { "name": "$repo", "lastActivity": "2026-08-12T00:00:00Z" } ],
               ${if (localModel != null) "\"localModel\": $localModel," else ""}
               ${if (dsh != null) "\"dsh\": $dsh," else ""}
+              ${if (qwen != null) "\"qwen\": $qwen," else ""}
               "sessions": [ $sessions ] } ] }
         """.trimIndent()
     }
