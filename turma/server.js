@@ -7240,17 +7240,20 @@ function sendPage(req, res, page) {
 const TERM_FONT = fs.readFileSync(path.join(__dirname, "public", "jbm-nerd-mono.woff2"));
 // <link preload> + <style> injected into ttyd's HTML document defining that
 // font as 'JBMNerd' — the family name the agent points ttyd's fontFamily at.
-// The preload + `font-display:block` matter: ttyd's inline bundle creates the
-// xterm.js terminal synchronously at end-of-body, so with `swap` the 1 MB font
-// often had not landed when xterm measured the cell width — it measured the
-// fallback, and the late Nerd-Font swap misaligned the box-drawing (the qwen
-// TUI's text box read garbled). `block` waits on the font, so the first
-// measure already runs on the real metrics.
+// The preload starts the 1 MB fetch at parse time, and the /term-font.woff2
+// route serves it immutable, so repeat loads hit the browser cache.
+// `font-display:swap` (NOT `block`): text renders immediately on the fallback
+// stack and the Nerd Font swaps in when it lands. With `block`, the entire
+// terminal stayed blank while the font downloaded — up to the 3 s block
+// period, and longer-feeling on slow mobile links, which read as "the
+// terminal is invisible". The fallbacks in ttyd's fontFamily stack (DejaVu
+// Sans Mono, system monospace) share JBMNerd's 0.6 em advance, so the swap
+// lands without grid shift or box-drawing misalignment.
 const TERM_FONT_STYLE =
   "<link rel='preload' as='font' type='font/woff2' crossorigin " +
   "href='/term-font.woff2'>" +
   "<style>@font-face{font-family:'JBMNerd';" +
-  "src:url('/term-font.woff2') format('woff2');font-display:block;}</style>";
+  "src:url('/term-font.woff2') format('woff2');font-display:swap;}</style>";
 
 // Touch-scroll shim injected into ttyd's page for phones. The Claude TUI owns
 // the alternate screen buffer, so xterm.js has no scrollable viewport — it only
