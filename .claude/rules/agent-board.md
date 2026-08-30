@@ -91,6 +91,29 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
   repo its `gh` login can clone. The reply is **allowlist-validated back against that list**
   (`_parse_triage`). Purely presentational; **no ticket text reaches a shell, path, or URL**.
 
+### Ticket triage assessment (`triage`, XERK-481 — foundation for XERK-480)
+
+- A SIBLING of `repoGuess`: each heartbeated ticket also carries an optional `triage` block
+  `{priority, priorityName, type, value, actionable, dedupeOf, reason, at, source}` — the
+  gate/prioritize/dedupe assessment. `priority` is a normalized P0..P3 band; `priorityName` is the
+  tracker's OWN label. `_apply_triage` stamps it INDEPENDENTLY of the repo decision (a ticket can be
+  prioritized before/without a repo), ahead of the repoGuess decided-gate, from the ledger entry's
+  `triage` sub-dict. **Absence == "not assessed"** (no key at all), never a fabricated priority —
+  same contract as an untriaged `repoGuess`.
+- **The wire shape has ONE builder, `build_ticket_triage`** (pure, drops any unusable field), and
+  THREE mirrors that must agree: it (agent), `sanitizeTicketTriage` inside `normalizeJira`
+  (hub — `jira` is a KNOWN key so `sanitizeHeartbeat` never looks inside it), and Android's
+  `TicketTriage` (typed, so a malformed block would fail the atomic `/api/agents` decode). Change one,
+  change all.
+- **`triage.available`** is the top-level capability flag (`_triage_payload`, gated on
+  `board_configured()`), coerced by `normalizeTriage` exactly like `qwen`/`dsh` — absent reads as
+  "this host can't triage", never "triaged, unknown".
+- **[A] is the data model + wire contract only** — the PRODUCER (computing priority/type/dedupe into
+  the ledger entry) is B/E, so the stamping is dormant-but-wired until then. Tests:
+  `TestJiraTriage` (`build_ticket_triage`, `_apply_triage` stamping), `TestSpawnOptionHelpers`
+  (`_triage_payload`); hub `normalizeTriage`/`normalizeJira` cases in `server.test.js`; Android
+  `AgentDecodeTest`.
+
 ### The triage ledger
 
 - Cached in `~/.turma/jira-repos.json`, keyed `<siteKey>/<issueKey>` — triage runs **once per

@@ -223,6 +223,14 @@ data class AgentInfo(
      * strictly (`normalizeQwen`) so this decode is safe against a rogue host.
      */
     val qwen: QwenInfo? = null,
+    /**
+     * Whether this host can produce a ticket triage assessment (XERK-481, the
+     * foundation for XERK-480). The triage twin of [dsh]/[qwen]: doubles as the
+     * capability flag, an ABSENT block means "that host can't triage", and the
+     * hub coerces it strictly (`normalizeTriage`) so this decode is safe against
+     * a rogue host. The assessment itself rides per-ticket as [JiraTicket.triage].
+     */
+    val triage: TriageInfo? = null,
 )
 
 /**
@@ -251,6 +259,19 @@ data class DshInfo(
  */
 @Serializable
 data class QwenInfo(
+    val available: Boolean = false,
+)
+
+/**
+ * A host's ticket-triage capability (hub-agent's `triage` block, XERK-481). The
+ * triage twin of [QwenInfo]: [available] is the flag clients gate on. The
+ * default `available = false` is load-bearing — an agent predating triage
+ * reports no block at all, and the hub coerces a malformed one to null
+ * (`normalizeTriage`), so an absent/null block reads as "this host can't
+ * triage", never as "triaged, unknown".
+ */
+@Serializable
+data class TriageInfo(
     val available: Boolean = false,
 )
 
@@ -397,6 +418,34 @@ data class JiraTicket(
     val dueDate: String? = null,
     val parentKey: String? = null,
     val repoGuess: RepoGuess? = null,
+    val triage: TicketTriage? = null,
+)
+
+/**
+ * The per-ticket triage assessment (XERK-481) — XERK-480's gate/prioritize/dedupe
+ * result, riding the heartbeat alongside [RepoGuess]. Every field is nullable and
+ * defaults to null so an ABSENT one reads as "not assessed", never a fabricated
+ * value — the acceptance criterion the hub's coercion (`sanitizeTicketTriage`)
+ * upholds by DROPPING an unusable field rather than inventing one.
+ *
+ * [priority] is the normalized band (P0..P3) the board sorts on; [priorityName]
+ * is the tracker's OWN label (Jira "Highest", ADO "1"). [type] is the assessed
+ * work type, [value] the assessed value/impact band, [actionable] whether it is
+ * ready to reach the session queue, [dedupeOf] the issue key it duplicates,
+ * [reason] the model's rationale, [at] when it was assessed, [source] who
+ * assessed it (mirroring [RepoGuess.manual]'s who-chose role).
+ */
+@Serializable
+data class TicketTriage(
+    val priority: String? = null,
+    val priorityName: String? = null,
+    val type: String? = null,
+    val value: String? = null,
+    val actionable: Boolean? = null,
+    val dedupeOf: String? = null,
+    val reason: String? = null,
+    val at: String? = null,
+    val source: String? = null,
 )
 
 @Serializable

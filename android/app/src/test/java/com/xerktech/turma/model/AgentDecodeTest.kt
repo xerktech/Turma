@@ -186,6 +186,49 @@ class AgentDecodeTest {
         assertNull(resp.agents[2].qwen)
     }
 
+    // XERK-481: the triage capability flag + the per-ticket triage assessment.
+    // Typing AgentInfo.triage and JiraTicket.triage is what makes them
+    // decode-fatal if wrong (a full /api/agents decode is atomic here), so both
+    // shapes are pinned — the available/absent block, and a full/absent
+    // assessment. The acceptance criterion: an absent field reads as null
+    // ("not assessed"), never a fabricated value.
+    @Test fun `the triage flag and per-ticket assessment decode`() {
+        val body = """
+            { "now": 1, "agents": [
+              { "key": "on", "device": "on", "online": true,
+                "triage": { "available": true },
+                "jira": { "siteKey": "acme", "tickets": [
+                  { "key": "ENG-1", "triage": {
+                      "priority": "P0", "priorityName": "Highest", "type": "bug",
+                      "value": "high", "actionable": true, "dedupeOf": "ENG-9",
+                      "reason": "dup", "at": "2026-08-30T00:00:00Z", "source": "auto" } },
+                  { "key": "ENG-2" }
+                ] } },
+              { "key": "off", "device": "off", "online": true,
+                "triage": { "available": false } },
+              { "key": "old", "device": "old", "online": true,
+                "jira": { "siteKey": "acme", "tickets": [ { "key": "ENG-3" } ] } }
+            ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertEquals(true, resp.agents[0].triage?.available)
+        val tr = resp.agents[0].jira?.tickets?.get(0)?.triage
+        assertEquals("P0", tr?.priority)
+        assertEquals("Highest", tr?.priorityName)
+        assertEquals("bug", tr?.type)
+        assertEquals("high", tr?.value)
+        assertEquals(true, tr?.actionable)
+        assertEquals("ENG-9", tr?.dedupeOf)
+        assertEquals("auto", tr?.source)
+        // A ticket with no assessment reads as absent, never a fabricated one.
+        assertNull(resp.agents[0].jira?.tickets?.get(1)?.triage)
+        assertEquals(false, resp.agents[1].triage?.available)
+        // A pre-triage agent sends no block and no ticket assessment; both read
+        // as absent, never a throw.
+        assertNull(resp.agents[2].triage)
+        assertNull(resp.agents[2].jira?.tickets?.get(0)?.triage)
+    }
+
     // XERK-477 [M]: an ENDED dsh session's runtime rides _closed_payload's
     // agentType too, so its ended card carries the same badge as the live one.
     // A record from an agent predating the field omits it and defaults to "".

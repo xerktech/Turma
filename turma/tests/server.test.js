@@ -145,6 +145,7 @@ hub.registerDevice("capture-device", "android", ["dismiss"]);
 const {
   server, agents, queueCommand, findSession, orgPeers, boundOrgOf, orgDrifted,
   orgDriftWarned, warnOrgDrift, siteKeyOf, normalizeJira, normalizeClones,
+  normalizeTriage,
   CLONE_PROGRESS_MAX,
   wsAccept, wsEncode, wsParser, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
@@ -8181,11 +8182,17 @@ test("XERK-325: only the shared resolvers may read a block's ticket list", () =>
     const last = decls[decls.length - 1];
     readers.push(last ? (last[1] || last[2]) : "(top level)");
   }
+  // `normalizeJira` reads `tickets` but is NOT a ranking site — it is the
+  // ingest/restore COERCION pass (XERK-481) that sanitizes each ticket's typed
+  // `triage` block in place, exactly as normalizeSessions does for `sessions`.
+  // It resolves no repo and picks no host, so it is on the allow-list beside the
+  // two resolvers rather than being a new ranking site to route through them.
   assert.deepEqual([...new Set(readers)].sort(),
-    ["fleetTicketRows", "hostTriagedTicket"],
+    ["fleetTicketRows", "hostTriagedTicket", "normalizeJira"],
     "a new reader of a block's ticket list is a new ranking site — route it "
     + "through fleetTicketRows instead. (If this is an unrelated `tickets` "
-    + "field, say so here rather than widening the pattern.)");
+    + "field, or a non-ranking coercion pass like normalizeJira, say so here "
+    + "rather than widening the pattern.)");
 
   // The other half of agreeing with the board is the GROUPING, not just the
   // tie-break, and it is the one that broke most recently: both sweeps must read
@@ -9602,6 +9609,74 @@ test("normalizeJira drops a non-string key and leaves a good one alone", () => {
   assert.doesNotThrow(() => normalizeJira(null));
 });
 
+test("normalizeTriage coerces the capability flag strictly boolean (XERK-481)", () => {
+  // Same atomic-decode hazard as normalizeQwen: one host's bad `triage` block
+  // would fail Android's whole /api/agents decode and empty the fleet.
+  const norm = (triage) => { const p = { device: "h", triage }; normalizeTriage(p); return p.triage; };
+  assert.deepEqual(norm({ available: true }), { available: true });
+  // Strictly boolean: a truthy non-true value reads as "cannot triage".
+  assert.deepEqual(norm({ available: "yes" }), { available: false });
+  assert.deepEqual(norm({ available: 1 }), { available: false });
+  assert.deepEqual(norm({ available: false }), { available: false });
+  // Carries ONLY {available}: any unknown extra key is dropped (rebuilt, not
+  // spread), so nothing triage-shaped leaks onto the wire.
+  assert.deepEqual(norm({ available: true, extra: 1 }), { available: true });
+  // Not an object at all -> null, which every client reads as "cannot triage".
+  assert.equal(norm("yes"), null);
+  assert.equal(norm([1]), null);
+  assert.equal(norm(null), null);
+  // A pre-triage agent sends nothing; the key stays absent, not an explicit null.
+  const old = { device: "h" };
+  normalizeTriage(old);
+  assert.ok(!("triage" in old));
+});
+
+test("normalizeJira coerces each ticket's triage block to the contract shape (XERK-481)", () => {
+  // The assessment rides jira.tickets[].triage and Android TYPES it, so a
+  // malformed one must be coerced here (jira is a KNOWN key sanitizeHeartbeat
+  // never looks inside), covering the state.json restore too.
+  const a = {
+    device: "h",
+    jira: {
+      siteKey: "acme",
+      tickets: [
+        // A full, valid assessment survives verbatim.
+        { key: "ENG-1", triage: {
+          priority: "P1", priorityName: "High", type: "bug", value: "medium",
+          actionable: true, dedupeOf: "ENG-9", reason: "dup of ENG-9",
+          at: "2026-08-30T00:00:00Z", source: "auto" } },
+        // An out-of-band priority is DROPPED (absence reads as unknown, never
+        // "P-something"); a non-bool actionable and a non-string label go too.
+        { key: "ENG-2", triage: {
+          priority: "P9", actionable: "yes", type: 3, reason: "kept" } },
+        // A non-object triage is removed outright.
+        { key: "ENG-3", triage: "junk" },
+        // A ticket with no triage is untouched.
+        { key: "ENG-4" },
+      ],
+    },
+  };
+  hub.normalizeRecord(a);
+  assert.deepEqual(a.jira.tickets[0].triage, {
+    priority: "P1", priorityName: "High", type: "bug", value: "medium",
+    actionable: true, dedupeOf: "ENG-9", reason: "dup of ENG-9",
+    at: "2026-08-30T00:00:00Z", source: "auto",
+  });
+  assert.deepEqual(a.jira.tickets[1].triage, { reason: "kept" });
+  assert.ok(!("triage" in a.jira.tickets[2]));
+  assert.ok(!("triage" in a.jira.tickets[3]));
+  // A per-ticket string field is length-capped (agent-supplied, unbounded on the
+  // wire otherwise — the XERK-348 lesson).
+  const big = { device: "h", jira: { tickets: [
+    { key: "ENG-5", triage: { reason: "x".repeat(5000), priorityName: "y".repeat(500) } }] } };
+  hub.normalizeRecord(big);
+  assert.equal(big.jira.tickets[0].triage.reason.length, 2000);
+  assert.equal(big.jira.tickets[0].triage.priorityName.length, 120);
+  // Malformed tickets/shapes never throw (a throw lands in the restore's catch).
+  assert.doesNotThrow(() => normalizeJira({ jira: { tickets: [null, 1, "x", []] } }));
+  assert.doesNotThrow(() => normalizeJira({ jira: { tickets: "nope" } }));
+});
+
 test("normalizeClones coerces every field a client types, and caps progress", () => {
   // There was no coercion here at all while Android types EVERY field on
   // CloneInfo as a String — and a full /api/agents decode is atomic there, so
@@ -9646,6 +9721,26 @@ test("normalizeRecord runs the clone coercion too, on ingest and on restore", ()
   const a = { clones: [{ status: 7 }] };
   hub.normalizeRecord(a);
   assert.equal(a.clones[0].status, undefined);
+});
+
+test("normalizeRecord runs the triage coercions too, on ingest and on restore (XERK-481)", () => {
+  // Pins the WIRING, not just the leaves: a malformed TOP-LEVEL `triage` block is
+  // decode-fatal for Android's whole /api/agents array, so normalizeRecord must
+  // call normalizeTriage on both the ingest and the state.json restore. Driving
+  // through normalizeRecord (not the leaf directly) is the half that catches the
+  // call being dropped in a refactor — the same reason the clone case above and
+  // the qwen ones exist.
+  const top = { device: "h", triage: "yes" };
+  hub.normalizeRecord(top);
+  assert.equal(top.triage, null);
+  const flag = { device: "h", triage: { available: "yes", extra: 1 } };
+  hub.normalizeRecord(flag);
+  assert.deepEqual(flag.triage, { available: false });
+  // The per-ticket coercion (via normalizeJira) is wired too — a bad band is
+  // dropped rather than served as a P-something to a typed client.
+  const perTicket = { device: "h", jira: { tickets: [{ key: "ENG-1", triage: { priority: "P9", reason: "x" } }] } };
+  hub.normalizeRecord(perTicket);
+  assert.deepEqual(perTicket.jira.tickets[0].triage, { reason: "x" });
 });
 
 test("migrate: rejects a root session and one with no conversation yet", async () => {
@@ -11428,6 +11523,43 @@ test("heartbeat: qwen flag + session agentType survive into the fleet payload (X
   const host = res.body.agents.find((a) => a.device === "qwen1");
   assert.equal(host.qwen.available, true);
   assert.equal(host.sessions[0].agentType, "qwen");
+});
+
+test("heartbeat: triage flag + per-ticket assessment survive into the fleet payload (XERK-481)", async () => {
+  try {
+    await request("POST", "/api/heartbeat", {
+      body: {
+        device: "triage1",
+        triage: { available: true },
+        jira: { siteKey: "acme", tickets: [
+          { key: "ENG-1", summary: "x", triage: { priority: "P0", actionable: true, source: "auto" } }] },
+      },
+      headers: agentHeaders,
+    });
+    const res = await request("GET", "/api/agents", { headers: userHeaders });
+    const host = res.body.agents.find((a) => a.device === "triage1");
+    assert.equal(host.triage.available, true);
+    assert.deepEqual(host.jira.tickets[0].triage, { priority: "P0", actionable: true, source: "auto" });
+  } finally {
+    delete agents["triage1"];
+  }
+});
+
+test("heartbeat: a pre-triage agent carries no triage block (absence == cannot triage, XERK-481)", async () => {
+  try {
+    await request("POST", "/api/heartbeat", {
+      body: { device: "old1", jira: { siteKey: "acme", tickets: [{ key: "ENG-1", summary: "x" }] } },
+      headers: agentHeaders,
+    });
+    const res = await request("GET", "/api/agents", { headers: userHeaders });
+    const host = res.body.agents.find((a) => a.device === "old1");
+    // Absent, never a fabricated {available:false} — clients read absent as
+    // "this host can't triage", and the ticket carries no assessment.
+    assert.equal(host.triage == null, true);
+    assert.ok(!("triage" in host.jira.tickets[0]));
+  } finally {
+    delete agents["old1"];
+  }
 });
 
 // ---- XERK-521: per-host default runtime (defaultRuntime) --------------------

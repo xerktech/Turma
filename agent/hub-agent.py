@@ -11844,6 +11844,50 @@ def _triage_key(site_key, issue_key):
     return f"{site_key or ''}/{issue_key}"
 
 
+# The normalized priority band a triage assessment carries (XERK-481); the
+# tracker's own label rides separately as `priorityName`.
+TRIAGE_PRIORITIES = ("P0", "P1", "P2", "P3")
+
+
+def build_ticket_triage(assessment):
+    """The per-ticket `triage` block that rides the heartbeat alongside
+    `repoGuess` (XERK-481) — the data model for XERK-480's gate/prioritize/dedupe.
+
+    PURE: maps a triage ASSESSMENT dict to the fixed wire shape, so B/E's
+    computation and this contract agree in exactly one place. The shape is
+    {priority, priorityName, type, value, actionable, dedupeOf, reason, at,
+    source}:
+      - priority     normalized band, one of P0..P3 (else omitted).
+      - priorityName the tracker's OWN label (Jira 'Highest', ADO '1', …).
+      - type         the assessed work type (bug/feature/chore/…).
+      - value        the assessed value/impact band (a label, tracker-agnostic).
+      - actionable   whether it is ready to reach the session queue (bool).
+      - dedupeOf     the issue key this duplicates, when it is a duplicate.
+      - reason       the model's short rationale.
+      - at           when the assessment was made (ISO).
+      - source       who made it ('auto'/'manual'/…), mirroring repoGuess.
+
+    Every field is OPTIONAL and an absent one reads as 'not assessed', never a
+    fabricated value — so an unusable input is DROPPED rather than defaulted (a
+    priority that is not a real band, a non-string label, a non-bool actionable).
+    Returns None when nothing survives, so `_apply_triage` stamps no empty block.
+    """
+    if not isinstance(assessment, dict):
+        return None
+    out = {}
+    if assessment.get("priority") in TRIAGE_PRIORITIES:
+        out["priority"] = assessment["priority"]
+    for k in ("priorityName", "type", "value", "dedupeOf", "reason", "source", "at"):
+        v = assessment.get(k)
+        if isinstance(v, str) and v:
+            out[k] = v
+    act = assessment.get("actionable")
+    # A strict bool only — absent reads as 'unknown', never a plausible default.
+    if isinstance(act, bool):
+        out["actionable"] = act
+    return out or None
+
+
 # A ledger entry holds two independent things, and keeping them apart is what
 # makes the cache safe:
 #
@@ -12948,6 +12992,18 @@ class SessionManager:
         by_name = {c["name"]: c for c in (self.triage_cands or [])}
         for t in self.jira.get("tickets") or []:
             entry = self.triage_ledger.get(_triage_key(site_key, t.get("key")))
+            # The triage ASSESSMENT (priority/type/dedupe — XERK-481) is
+            # INDEPENDENT of the repo decision: a ticket can be prioritized before
+            # (or without) a repo being chosen, so it is stamped ahead of the
+            # repoGuess decided-gate below. The block's shape is defined by
+            # build_ticket_triage; the ledger entry's `triage` sub-dict is
+            # populated by B/E (XERK-480), so this is dormant-but-wired until then
+            # and simply stamps nothing while entries carry no assessment.
+            triage = build_ticket_triage(entry.get("triage")) if isinstance(entry, dict) else None
+            if triage:
+                t["triage"] = triage
+            else:
+                t.pop("triage", None)
             if not isinstance(entry, dict) or not entry.get("decided"):
                 t.pop("repoGuess", None)
                 continue
@@ -13889,6 +13945,19 @@ class SessionManager:
         qwen model plumbing is a later child, and this block is the presentational
         capability flag only."""
         return {"available": qwen_configured()}
+
+    def _triage_payload(self):
+        """The heartbeat `triage` block: the capability flag alone ({available}),
+        mirroring the qwen/dsh/localModel discipline (XERK-481). This is the
+        FOUNDATION for ticket triage (XERK-480) — the assessment that rides each
+        ticket alongside repoGuess, computed by B/E. The flag reflects whether
+        this build can produce that assessment: it rides the same machinery repo
+        triage does (the board's tickets + the host's authenticated `claude -p`),
+        so a host with a board configured can triage, and one without reports
+        available:false. Absent (a pre-triage agent) reads the same as false,
+        coerced hub-side (normalizeTriage), so clients gate on it and read absent
+        as 'that host can't triage', never as 'triaged, unknown result'."""
+        return {"available": board_configured()}
 
     def _qwen_version_pin(self):
         """Env that forces qwen to run the INSTALLED base package, never a
@@ -23233,6 +23302,14 @@ class SessionManager:
             # Jira Cloud assigned tickets (user-scoped creds); the hub's /board
             # merges these across hosts by siteKey into one cross-org Kanban.
             "jira": self._jira_payload(),
+            # Whether this host can produce a ticket triage assessment (XERK-481,
+            # the foundation for XERK-480). Doubles as the capability flag,
+            # exactly like the qwen/dsh blocks above: a host with no board
+            # reports available:false and an agent predating triage reports
+            # nothing, both coerced hub-side (normalizeTriage) so clients read it
+            # as 'this host can't triage', never 'triaged, unknown'. The triage
+            # ASSESSMENT itself rides per-ticket as jira.tickets[].triage.
+            "triage": self._triage_payload(),
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),
