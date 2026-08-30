@@ -863,6 +863,21 @@ test("alerts: answering a question retracts its notification (XERK-154)", () => 
   assert.deepEqual(dismisses(), []);
 });
 
+test("alerts: notification titles use the session's title, not its rcName", () => {
+  const beat = makeHost();
+  notifications.length = 0;
+  beat({
+    sessions: [{ id: "s1", rcName: "nas-repo-s1", summary: "Fix terminal font", session: { question: "Deploy to prod?" } }],
+  });
+  assert.deepEqual(titles(), ["Fix terminal font has a question"]);
+  notifications.length = 0;
+  // A session without a summary yet falls back to the structural rcName.
+  beat({
+    sessions: [{ id: "s2", rcName: "nas-repo-s2", session: { question: "Ship it?" } }],
+  });
+  assert.deepEqual(titles(), ["nas-repo-s2 has a question"]);
+});
+
 // ---- The ready-for-review alert, held until CI is green --------------------
 // XERK-153 (hold a PR alert until its CI settles) collapsed into XERK-224's one
 // per-session alert: a session that finished a turn AND opened a PR is ONE
@@ -9721,6 +9736,28 @@ test("normalizeRecord runs the clone coercion too, on ingest and on restore", ()
   const a = { clones: [{ status: 7 }] };
   hub.normalizeRecord(a);
   assert.equal(a.clones[0].status, undefined);
+});
+
+test("normalizeRecord coerces session summary: type, whitespace, length", () => {
+  // Android types SessionInfo.summary as String and decodes /api/agents
+  // atomically — a non-string would hide the whole fleet from that phone,
+  // and the notification titles now lead with it, so an unbounded name
+  // would push the FCM payload past its ~4 KB limit.
+  const a = {
+    sessions: [
+      { id: "s1", summary: 42 },
+      { id: "s2", summary: "   " },
+      { id: "s3", summary: "  Fix terminal font  " },
+      { id: "s4", summary: "x".repeat(500) },
+      { id: "s5" },
+    ],
+  };
+  hub.normalizeRecord(a);
+  assert.equal(a.sessions[0].summary, "", "non-string coerced to empty");
+  assert.equal(a.sessions[1].summary, "", "whitespace-only trimmed to empty");
+  assert.equal(a.sessions[2].summary, "Fix terminal font", "trimmed");
+  assert.equal(a.sessions[3].summary.length, 120, "capped at 120 chars");
+  assert.equal("summary" in a.sessions[4], false, "absent stays absent");
 });
 
 test("normalizeRecord runs the triage coercions too, on ingest and on restore (XERK-481)", () => {

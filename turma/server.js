@@ -4617,6 +4617,19 @@ function normalizeSessions(payload) {
     for (const k of ["modelSource", "modelSourceAt", "agentType"]) {
       if (k in s && typeof s[k] !== "string") s[k] = "";
     }
+    // summary is agent-supplied display text (the session's own title — what the
+    // Android card shows and the notification titles now lead with). Coerce to a
+    // trimmed, capped string: a non-string would throw the atomic /api/agents
+    // decode on Android (typed String), and an unbounded name would push the
+    // notification payload past FCM's ~4 KB data limit, dropping the whole
+    // alert. 120 is 2.5x the agent's own 48-char cap, so legitimate titles
+    // never get cut. Literal, not a module const: normalizeSessions is reached
+    // from loadState's restore loop, where a later const is in its TDZ
+    // (XERK-301, same reason normalizeClones inlines its 120).
+    if ("summary" in s) {
+      const t = typeof s.summary === "string" ? s.summary.trim() : "";
+      s.summary = t.slice(0, 120);
+    }
     // Kill switch OFF: a reported/persisted dsh session runtime reads as claude
     // on the wire (coerce "dsh" -> "", which every client already treats as the
     // default), so no client renders a session as dsh and the hub's own /model
@@ -5929,7 +5942,11 @@ function heartbeatAlerts(key, prev, next) {
   for (const session of next.sessions || []) {
     liveIds.add(session.id);
     const sa = (alerts.sessions[session.id] = alerts.sessions[session.id] || { prSeen: [] });
-    const label = session.rcName || `${key} · ${session.repo}@${session.branch}`;
+    // The session's own title (its `summary`) is what the operator recognises on
+    // the phone — the Sessions screen leads with it too. `rcName` is the
+    // structural <host>-<repo>-<key> spawn id, which means nothing at a glance,
+    // so it stands in only while a summary has not been generated yet.
+    const label = session.summary || session.rcName || `${key} · ${session.repo}@${session.branch}`;
     const s = session.session || {}; // null for stopped sessions
 
     const route = { host: key, sessionId: session.id };
