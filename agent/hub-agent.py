@@ -1346,6 +1346,17 @@ QWEN_IDENT_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,80}$")
 QWEN_LAUNCH_CONFIRM_SEC = float(os.environ.get("QWEN_LAUNCH_CONFIRM_SEC", "12"))
 QWEN_LAUNCH_CONFIRM_POLL_SEC = float(
     os.environ.get("QWEN_LAUNCH_CONFIRM_POLL_SEC", "0.4"))
+# A launch can reach _launch_qwen while the boot probe is still running on its
+# worker thread (a boot-time relaunch of a qwen session whose tmux died is
+# exactly that case): the gate WAITS for the in-flight probe's verdict instead
+# of refusing a host that is in fact ready. The wait is bounded so a wedged
+# probe cannot stall the launch path (the probe itself is bounded at 30s, so
+# this only fires when the probe is slow or still queued).
+QWEN_READY_WAIT_SEC = float(os.environ.get("QWEN_READY_WAIT_SEC", "30"))
+# How long the priming worker waits before RE-PROBING a transient probe
+# failure (binary mid-update, a blip). Config-level refusals (no model route)
+# never retry — they are stable for the manager's lifetime.
+QWEN_READY_RETRY_SEC = float(os.environ.get("QWEN_READY_RETRY_SEC", "60"))
 
 # --- Host-wide read-only `dsh web` viewer (XERK-501) ----------------------
 # ONE `dsh web` per host (never one per session — that was XERK-498's blocker),
@@ -14377,44 +14388,52 @@ class SessionManager:
             {"bootstrap": entry, "version": None, "updateRoot": update_root})}
 
     def _ensure_qwen_ready(self):
-        """Probe (once per manager) whether this host can LAUNCH qwen — the qwen
-        binary runs and a model route is configured — caching the verdict on
-        self._qwen_ready and returning it.
+        """Probe whether this host can LAUNCH qwen — the qwen binary runs and a
+        model route is configured — returning True/False.
+
+        Caching is verdict-stability aware: success (True) and config-level
+        refusals (False: no/invalid model route — env-fixed for this process's
+        lifetime) are cached on self._qwen_ready, but a TRANSIENT probe failure
+        (binary missing mid-update, `--version` failing) is NOT cached, so a
+        later call re-probes instead of one bad read poisoning every qwen
+        launch for the manager's lifetime.
 
         Primed on a WORKER THREAD at startup (run_forever) because it spawns a
         `qwen --version` subprocess, which is too heavy for the beat (XERK-395).
-        _launch_qwen only ever READS the cached flag and refuses if unset, so it
+        _launch_qwen only ever READS the cached flag (or waits briefly for this
+        in-flight probe via _qwen_ready_event) and refuses if unset, so it
         never triggers this probe on the beat — exactly as _launch_dsh reads
         _dsh_profile_ready without running _ensure_dsh_profile."""
         cached = getattr(self, "_qwen_ready", None)
         if cached is not None:
             return cached
-        ready = False
         if not (QWEN_MODEL and QWEN_MODEL_BASE_URL):
             log("qwen: no model route configured (set QWEN_MODEL + "
                 "QWEN_MODEL_BASE_URL, or LOCAL_MODEL_NAME + LOCAL_MODEL_BASE_URL); "
                 "qwen spawns are refused")
-        elif not (QWEN_IDENT_RE.fullmatch(QWEN_MODEL)
-                  and QWEN_MODEL_BASE_URL.startswith(("http://", "https://"))):
+            self._qwen_ready = False
+            return False
+        if not (QWEN_IDENT_RE.fullmatch(QWEN_MODEL)
+                and QWEN_MODEL_BASE_URL.startswith(("http://", "https://"))):
             log(f"qwen: invalid model/endpoint "
                 f"({QWEN_MODEL!r}/{QWEN_MODEL_BASE_URL!r}); qwen spawns are refused")
-        else:
-            try:
-                r = subprocess.run([QWEN_BIN, "--version"], capture_output=True,
-                                   text=True, timeout=30,
-                                   env={**os.environ, **self._qwen_version_pin()})
-                if r.returncode == 0:
-                    ready = True
-                    log(f"qwen: ready ({(r.stdout or '').strip()[:40]}, model "
-                        f"{QWEN_MODEL} at {QWEN_MODEL_BASE_URL})")
-                else:
-                    log(f"qwen: `{QWEN_BIN} --version` failed "
-                        f"(rc={r.returncode}); qwen spawns are refused")
-            except (OSError, subprocess.SubprocessError) as e:
-                log(f"qwen: the qwen binary is not runnable "
-                    f"({QWEN_BIN!r}: {e}); qwen spawns are refused")
-        self._qwen_ready = ready
-        return ready
+            self._qwen_ready = False
+            return False
+        try:
+            r = subprocess.run([QWEN_BIN, "--version"], capture_output=True,
+                               text=True, timeout=30,
+                               env={**os.environ, **self._qwen_version_pin()})
+            if r.returncode == 0:
+                self._qwen_ready = True
+                log(f"qwen: ready ({(r.stdout or '').strip()[:40]}, model "
+                    f"{QWEN_MODEL} at {QWEN_MODEL_BASE_URL})")
+                return True
+            log(f"qwen: `{QWEN_BIN} --version` failed (rc={r.returncode}); "
+                f"qwen spawns are refused until the probe passes again")
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"qwen: the qwen binary is not runnable ({QWEN_BIN!r}: {e}); "
+                f"qwen spawns are refused until the probe passes again")
+        return False  # transient: deliberately NOT cached
 
     def _prime_qwen(self):
         """Prime the qwen runtime off the beat (run_forever worker): the version/
@@ -14423,13 +14442,28 @@ class SessionManager:
         cheap but do file/subprocess I/O, so they belong off the heartbeat's
         critical path (XERK-395). A guard-prime failure only logs — it is rebuilt
         (and, if it still fails, RAISES) at the launch choke point, refusing that
-        launch rather than running unguarded."""
-        self._ensure_qwen_ready()
+        launch rather than running unguarded.
+
+        Transient probe failures (binary missing, --version crash) are retried
+        every QWEN_READY_RETRY_SEC; config-level refusals (no model route) are
+        terminal and stop the loop immediately. Once the probe reaches a stable
+        verdict (or is retried indefinitely), the _qwen_ready_event is set so
+        any waiter in _launch_qwen can unblock."""
+        while not self._ensure_qwen_ready():
+            # A cached False means config-level refusal (no route / bad ident).
+            # That is stable for this process's lifetime, so re-probing cannot
+            # help — break out and let the flag stay False.
+            if getattr(self, "_qwen_ready", None) is False:
+                break
+            time.sleep(QWEN_READY_RETRY_SEC)
         try:
             self._qwen_guard_config()
         except Exception as e:
             log(f"qwen: safety-guard config not primed ({e}); it will be rebuilt "
                 f"at launch (and refuse the launch if it still cannot be written)")
+        ev = getattr(self, "_qwen_ready_event", None)
+        if ev is not None:
+            ev.set()
 
     def _launch_qwen(self, sess, resume=False, prompt=None, resume_id=None):
         """Launch a session on the qwen (Qwen Code, XERK-504) runtime: an
@@ -14451,9 +14485,17 @@ class SessionManager:
         the caller's error handling (provision's _set_error, the resume paths'
         _refuse_start — the XERK-265 channel) marks the session with a reason
         rather than launching it half-wired."""
-        # Primed off the beat at startup (run_forever); an unset flag means qwen
-        # isn't usable here yet. Refuse rather than run the version probe on the
-        # beat (XERK-395), the same discipline _launch_dsh applies to its profile.
+        # Primed off the beat at startup (run_forever). A launch can reach this
+        # gate before the worker probe has cached a verdict — a boot-time
+        # relaunch of a qwen session whose tmux died is exactly that case, and
+        # it is what used to error the session "not ready" one log-line before
+        # the probe finished. When no verdict is cached yet, WAIT (bounded) for
+        # the in-flight probe instead of refusing; the probe itself stays off
+        # the beat (XERK-395), this only observes its outcome.
+        if getattr(self, "_qwen_ready", None) is None:
+            ev = getattr(self, "_qwen_ready_event", None)
+            if ev is not None:
+                ev.wait(QWEN_READY_WAIT_SEC)
         if not getattr(self, "_qwen_ready", None):
             raise RuntimeError("qwen runtime is not ready on this host "
                                "(the qwen binary is missing/unrunnable, or no "
@@ -17790,7 +17832,14 @@ class SessionManager:
         composed text is what lands on the outbox, so a compaction resend re-types
         the same paths at files that are already there."""
         sess = self._find(sid)
-        if not sess or sess.get("status") != "running":
+        if sess is None:
+            return
+        if sess.get("status") != "running":
+            # A found-but-not-running session has no live pane: surface the drop
+            # instead of swallowing it silently (the composer had no feedback
+            # that an errored session was never receiving input).
+            log(f"input for session {sid} dropped: status is "
+                f"{sess.get('status')!r}, not 'running'")
             return
         # A dsh session has no Claude TUI pane to type into: input is a
         # programmatic followup over its control socket (XERK-467 [C]). Same
@@ -23969,6 +24018,19 @@ class SessionManager:
         # bring us back. Must be set on the main thread, like SIGUSR1 above.
         signal.signal(signal.SIGTERM, self._handle_shutdown)
         signal.signal(signal.SIGINT, self._handle_shutdown)
+        # Probe the qwen runtime (binary + model route) on a WORKER THREAD when
+        # this host offers qwen — the `qwen --version` subprocess stays off-beat
+        # (XERK-395). It must start BEFORE resume_on_boot below: a boot relaunch
+        # of a qwen session whose tmux died (container restart) reaches
+        # _launch_qwen with no cached verdict, and that gate now waits (bounded,
+        # QWEN_READY_WAIT_SEC) for _qwen_ready_event instead of refusing a host
+        # that is in fact ready — the ordering that used to error the session
+        # "not ready" while the probe finished a moment later. No-op unless
+        # TURMA_QWEN is set and QWEN_ENABLED is lifted ([Qwen B]).
+        if qwen_configured():
+            self._qwen_ready_event = threading.Event()
+            threading.Thread(target=self._prime_qwen,
+                             name="qwen-ready", daemon=True).start()
         self.resume_on_boot()
         # Discover the local endpoint's model list on a WORKER THREAD (XERK-489),
         # never inline on the beat — a blackholed endpoint must not stall the
@@ -23986,14 +24048,6 @@ class SessionManager:
         if dsh_configured():
             threading.Thread(target=self._ensure_dsh_profile,
                              name="dsh-profile", daemon=True).start()
-        # Probe the qwen runtime (binary + model route) on a WORKER THREAD when
-        # this host offers qwen — the `qwen --version` subprocess is off-beat
-        # (XERK-395), so a qwen spawn before it finishes is refused and retried
-        # rather than stalling the loop. No-op unless TURMA_QWEN is set and
-        # QWEN_ENABLED is lifted ([Qwen B]).
-        if qwen_configured():
-            threading.Thread(target=self._prime_qwen,
-                             name="qwen-ready", daemon=True).start()
         # The dsh peer-message delivery worker (XERK-476): delivers staged
         # cross-session traffic off the beat (see _dsh_peer_worker_loop). Started
         # once here rather than lazily so the first staged message is delivered
