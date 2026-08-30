@@ -3018,6 +3018,27 @@ function normalizeQwen(payload) {
   payload.qwen = { available: q.available === true };
 }
 
+// The triage (XERK-481) capability block, coerced at ingest exactly like
+// normalizeQwen/normalizeDsh and for the same reason: it is agent-supplied, a
+// client TYPES it (AgentInfo.triage: TriageInfo?), and `/api/agents` decodes
+// atomically on Android — so one host's `triage.available: "yes"` would fail the
+// whole fleet decode and empty every other host from every phone's fleet list.
+// Strictly boolean, so a non-`true` value — a truthy string included — reads as
+// "this host cannot triage". Unusable becomes NULL (never a rebuilt {available:
+// true}), and absent means absent: an agent predating triage carries no block,
+// which clients read as "that host can't triage", never as "triaged, unknown".
+// The per-ticket ASSESSMENT rides jira.tickets[].triage and is coerced in
+// normalizeJira; this is only the top-level capability flag.
+function normalizeTriage(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const t = payload.triage;
+  if (!t || typeof t !== "object" || Array.isArray(t)) {
+    if ("triage" in payload) payload.triage = null;
+    return;
+  }
+  payload.triage = { available: t.available === true };
+}
+
 // This host's EFFECTIVE default runtime for an unpinned spawn (XERK-521), coerced
 // at ingest exactly like normalizeQwen/normalizeDsh and for the same reason: it
 // is agent-supplied, a client may TYPE it, and `/api/agents` decodes atomically
@@ -3925,7 +3946,7 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "dsh", "qwen", "defaultRuntime", "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
+  "dsh", "qwen", "triage", "defaultRuntime", "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
   "sessions", "startedAt", "subscription", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
@@ -4207,6 +4228,7 @@ function normalizeRecord(a) {
   normalizeLocalModel(a);
   normalizeDsh(a);
   normalizeQwen(a);
+  normalizeTriage(a);
   normalizeDefaultRuntime(a);
   normalizeModels(a);
   normalizeSpawnRefusals(a);
@@ -4271,6 +4293,48 @@ function normalizeJira(a) {
   const j = a.jira;
   if (!j || typeof j !== "object" || Array.isArray(j)) return;
   if ("siteKey" in j && typeof j.siteKey !== "string") delete j.siteKey;
+  // Per-ticket triage assessment (XERK-481). `jira` is a KNOWN heartbeat key, so
+  // sanitizeHeartbeat's unknown-field sweep never looks inside it — a field
+  // typed under a ticket has to be coerced HERE, the same rule normalizeSessions
+  // states for the `sessions` array. Android TYPES `JiraTicket.triage`, so one
+  // host beating a malformed block would fail the whole fleet decode; coercing
+  // it in normalizeRecord covers the state.json restore too.
+  if (Array.isArray(j.tickets)) {
+    for (const t of j.tickets) {
+      if (t && typeof t === "object" && !Array.isArray(t)) sanitizeTicketTriage(t);
+    }
+  }
+}
+
+// Coerce ONE ticket's `triage` block (XERK-481) to the fixed wire shape every
+// client types: {priority, priorityName, type, value, actionable, dedupeOf,
+// reason, at, source}. Mirrors the agent's build_ticket_triage — the two are
+// the SAME contract, so an unusable field is DROPPED (letting the client's own
+// null/absent default apply — "not assessed"), never invented as a plausible
+// value. `priority` is kept only when it is a real P0..P3 band, so a malformed
+// one reads as unknown, never as "P-something". `actionable` is kept only strict
+// boolean. Every string is length-capped: it is agent-supplied, per-ticket and
+// otherwise unbounded on the wire (the XERK-348 lesson). Bounds are INLINE
+// LITERALS, not module consts: normalizeRecord is reached from loadState's
+// restore loop near the top of this file, where a const declared below is in its
+// TDZ, and the ReferenceError lands in the restore's catch and empties the whole
+// registry (XERK-301) — the same reason the sibling normalizers inline theirs.
+function sanitizeTicketTriage(t) {
+  if (!t || typeof t !== "object" || !("triage" in t)) return;
+  const tr = t.triage;
+  if (!tr || typeof tr !== "object" || Array.isArray(tr)) { delete t.triage; return; }
+  const out = {};
+  if (tr.priority === "P0" || tr.priority === "P1" ||
+      tr.priority === "P2" || tr.priority === "P3") {
+    out.priority = tr.priority;
+  }
+  // caps: labels/keys/source are short; `reason` is a model rationale.
+  const caps = { priorityName: 120, type: 60, value: 60, dedupeOf: 60, source: 40, reason: 2000, at: 40 };
+  for (const k of Object.keys(caps)) {
+    if (typeof tr[k] === "string" && tr[k]) out[k] = tr[k].slice(0, caps[k]);
+  }
+  if (tr.actionable === true || tr.actionable === false) out.actionable = tr.actionable;
+  t.triage = out;
 }
 
 // The host login's own model list (`models`, XERK-33) — NOT the per-model usage
@@ -10497,6 +10561,7 @@ if (process.env.TURMA_TEST) {
     __setDshEnabled(v) { DSH_ENABLED = v; },
     __getDshEnabled() { return DSH_ENABLED; },
     normalizeQwen,
+    normalizeTriage,
     normalizeDefaultRuntime,
     qwenAvailable,
     // The fleet-wide qwen kill switch (XERK-504) mirrors the dsh one above: the

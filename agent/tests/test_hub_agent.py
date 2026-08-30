@@ -671,6 +671,16 @@ class TestSpawnOptionHelpers(unittest.TestCase):
         with mock.patch.object(ha, "qwen_configured", lambda: True):
             self.assertEqual(sm._qwen_payload(), {"available": True})
 
+    def test_triage_payload_tracks_whether_a_board_is_configured(self):
+        # The heartbeat triage block (XERK-481) carries ONLY {available}, gated on
+        # board_configured — a host with no board can't triage, and a client reads
+        # available:false the same as an absent block ("this host can't triage").
+        sm = ha.SessionManager()
+        with mock.patch.object(ha, "board_configured", lambda: False):
+            self.assertEqual(sm._triage_payload(), {"available": False})
+        with mock.patch.object(ha, "board_configured", lambda: True):
+            self.assertEqual(sm._triage_payload(), {"available": True})
+
     def test_default_runtime_unset_is_claude(self):
         # UNSET -> claude, so every current host is byte-for-byte unchanged.
         with mock.patch.dict(os.environ, {}, clear=False):
@@ -23997,6 +24007,59 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
         sm = self._manager([{"key": "ENG-1", "summary": "x"}])
         sm._apply_triage()
         self.assertNotIn("repoGuess", sm.jira["tickets"][0])
+
+    def test_build_ticket_triage_keeps_the_contract_shape_and_drops_junk(self):
+        # The pure builder (XERK-481) is the ONE place the wire shape is defined.
+        full = ha.build_ticket_triage({
+            "priority": "P1", "priorityName": "High", "type": "bug",
+            "value": "medium", "actionable": True, "dedupeOf": "ENG-9",
+            "reason": "same crash as ENG-9", "at": "2026-08-30T00:00:00Z",
+            "source": "auto", "ignored": "extra",
+        })
+        self.assertEqual(full, {
+            "priority": "P1", "priorityName": "High", "type": "bug",
+            "value": "medium", "actionable": True, "dedupeOf": "ENG-9",
+            "reason": "same crash as ENG-9", "at": "2026-08-30T00:00:00Z",
+            "source": "auto",
+        })
+        # An out-of-band priority is DROPPED, never carried — absence reads as
+        # "not assessed", never a fabricated band. Ditto a non-bool actionable and
+        # a non-string label.
+        partial = ha.build_ticket_triage({
+            "priority": "P9", "priorityName": "", "type": 3,
+            "actionable": "yes", "reason": "only this survives",
+        })
+        self.assertEqual(partial, {"reason": "only this survives"})
+        # Nothing usable -> None, so _apply_triage stamps no empty block.
+        self.assertIsNone(ha.build_ticket_triage({}))
+        self.assertIsNone(ha.build_ticket_triage({"priority": "nope"}))
+        self.assertIsNone(ha.build_ticket_triage(None))
+        self.assertIsNone(ha.build_ticket_triage("junk"))
+
+    def test_apply_triage_stamps_a_ledger_assessment_onto_the_ticket(self):
+        # The assessment is INDEPENDENT of the repo decision: an entry that
+        # carries a triage sub-dict but is not `decided` still stamps triage,
+        # while its repoGuess stays absent.
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        sm.triage_ledger[ha._triage_key("s.atlassian.net", "ENG-1")] = {
+            "triage": {"priority": "P0", "actionable": False, "source": "auto"},
+        }
+        sm._apply_triage()
+        t = sm.jira["tickets"][0]
+        self.assertEqual(t["triage"], {"priority": "P0", "actionable": False, "source": "auto"})
+        self.assertNotIn("repoGuess", t)
+
+    def test_apply_triage_carries_no_triage_block_when_unassessed(self):
+        # No ledger entry, or an entry with no assessment -> no `triage` key at
+        # all (absence == "not triaged yet"), matching the repoGuess contract.
+        sm = self._manager([{"key": "ENG-1", "summary": "x"},
+                            {"key": "ENG-2", "summary": "y"}])
+        sm.triage_ledger[ha._triage_key("s.atlassian.net", "ENG-2")] = {
+            "decided": True, "repo": "Turma",
+        }
+        sm._apply_triage()
+        self.assertNotIn("triage", sm.jira["tickets"][0])
+        self.assertNotIn("triage", sm.jira["tickets"][1])
 
     def test_declined_ticket_carries_an_explicit_null_repo(self):
         sm = self._manager([{"key": "ENG-1", "summary": "Design review"}])

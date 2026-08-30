@@ -386,6 +386,19 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   compose-bar chip already names the model. The chip's missing tooltip is a deliberate difference,
   recorded above.
 
+## Done (XERK-481 — triage data model + heartbeat contract)
+
+- **Type the field + capability flag** so `/api/agents` keeps decoding once agents report the triage
+  assessment (XERK-480's foundation, landing before B/E): `AgentInfo.triage: TriageInfo?` (the
+  `{available}` capability block, mirroring `qwen`) and `JiraTicket.triage: TicketTriage?` (the
+  per-ticket assessment: `priority`/`priorityName`/`type`/`value`/`actionable`/`dedupeOf`/`reason`/
+  `at`/`source`, every field nullable). Both are the "typed on Android in the same change" half of
+  the wire contract — a field is only decode-fatal once a client types it, and `/api/agents` decodes
+  atomically here. The hub coerces both (`normalizeTriage`, `sanitizeTicketTriage` inside
+  `normalizeJira`), so an absent/malformed block reads as "not assessed"/"can't triage", never a
+  fabricated priority. No UI yet — a data-model-only ticket; the board rendering is a later child.
+- Pinned by `model/AgentDecodeTest.kt` (`the triage flag and per-ticket assessment decode`).
+
 ## Done (XERK-465 — dsh runtime selection + capability flag)
 
 - **Type the field + capability flag** so `/api/agents` keeps decoding once agents report them:
