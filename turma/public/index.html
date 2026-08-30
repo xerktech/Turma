@@ -905,13 +905,12 @@ function agentState(a, now) {
 }
 
 // Human text for why a queued session hasn't started — the agent's queuedReason
-// (capacity / awaiting-clone / root-busy), with a generic fallback for an agent
-// that reported a reason we don't recognize.
+// (capacity / awaiting-clone), with a generic fallback for an agent that
+// reported a reason we don't recognize.
 function queuedReasonText(reason) {
   return ({
     "capacity": "queued — waiting for a free session slot",
     "awaiting-clone": "queued — cloning the repo first",
-    "root-busy": "queued — waiting for the repos-root slot",
   })[reason] || "queued — waiting to start";
 }
 
@@ -1539,8 +1538,8 @@ function sessCard(a, s, now) {
       // stopped/errored cards below.
       `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${idJs}')">${confirming.has(kKey) ? esc(killConfirm) : "Kill"}</button>`;
   } else if (st === "queued") {
-    // Waiting for a slot / clone / the root slot. It has no worktree yet, so the
-    // only thing to do is cancel it — Kill drops the queued record.
+    // Waiting for a slot / a clone. It has no worktree yet, so the only thing
+    // to do is cancel it — Kill drops the queued record.
     actions =
       `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${idJs}')">${confirming.has(kKey) ? "Confirm cancel" : "Cancel"}</button>`;
   } else {

@@ -9351,7 +9351,9 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
     # A session spawned against ROOT_REPO_NAME runs directly at REPOS_ROOT with
     # no worktree and no branch; the worktree/branch machinery must be skipped
     # everywhere (spawn/kill/delete) so REPOS_ROOT and its repos are never
-    # touched, and only one may run at a time.
+    # touched. Several root sessions may run at once in REPOS_ROOT — they share
+    # one project slug but transcripts are keyed per session, and only
+    # MAX_SESSIONS bounds them.
 
     def _root_ready_manager(self):
         sm = self.make_spawn_ready_manager([])  # scan_repos irrelevant for root
@@ -9399,14 +9401,26 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["model"], "opus")            # model still applies
         self.assertEqual(sess["permissionMode"], "acceptEdits")
 
-    def test_second_root_session_queues_behind_the_first(self):
+    def test_second_root_session_runs_concurrently(self):
         sm = self._root_ready_manager()
         sm.spawn(ha.ROOT_REPO_NAME)
         self.assertEqual(sm.registry[0]["status"], "running")
-        sm.spawn(ha.ROOT_REPO_NAME)  # only one root slot — the second waits
+        # Several root sessions may run at once in REPOS_ROOT; they share a
+        # project slug, but transcripts are per-session and the RC bridge
+        # pointer is last-writer-wins, so only MAX_SESSIONS caps them.
+        sm.spawn(ha.ROOT_REPO_NAME)
         self.assertEqual(len(sm.registry), 2)
-        self.assertEqual(sm.registry[1]["status"], "queued")
-        self.assertEqual(sm.registry[1]["queuedReason"], "root-busy")
+        self.assertEqual(sm.registry[1]["status"], "running")
+
+    def test_root_sessions_bound_only_by_max_sessions(self):
+        sm = self._root_ready_manager()
+        with mock.patch.object(ha, "MAX_SESSIONS", 2):
+            sm.spawn(ha.ROOT_REPO_NAME)
+            sm.spawn(ha.ROOT_REPO_NAME)
+            self.assertEqual(sm.registry[1]["status"], "running")
+            sm.spawn(ha.ROOT_REPO_NAME)
+        self.assertEqual(sm.registry[2]["status"], "queued")
+        self.assertEqual(sm.registry[2]["queuedReason"], "capacity")
 
     def test_kill_root_keeps_repos_root_and_records_root(self):
         sm = self._root_ready_manager()
