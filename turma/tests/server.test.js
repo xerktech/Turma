@@ -6583,6 +6583,11 @@ test("XERK-487: an ignore-tier repo's tickets never enter the auto stream", asyn
     tickets: [{ key: "ENG-7", statusCategory: "todo",
       repoGuess: { repo: "Junk", cloned: true } }] });
   setRepoTier("Junk", "ignore");
+  // The SWEEP alone must not even enqueue it (not just rely on the drain drop):
+  // a transient enqueue would flash a ticketQueue SSE frame and churn every
+  // sweep before the drain removed it. This pins the sweep gate on its own.
+  autoStartSweep();
+  assert.equal(ticketQueue.length, 0, "the sweep never enqueues an ignore-tier ticket");
   autoStartRound();
   assert.equal((agents.rtIgnore.commands || []).length, 0, "no session auto-started");
   assert.equal(ticketQueue.length, 0, "and nothing queued for it either");
