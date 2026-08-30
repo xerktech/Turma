@@ -704,7 +704,11 @@ test("parsePaneLiveTurn: a qwen busy pane is generating (Enter to steer / esc to
     ">   Type your message or @path/to/file",
     "  Enter to steer · Ctrl+Q to queue · ⏸ Ask permissions (shift + tab to cycle)",
   ].join("\n");
-  assert.equal(parsePaneLiveTurn(pane).generating, true);
+  const r = parsePaneLiveTurn(pane);
+  assert.equal(r.generating, true);
+  // The whole multi-word Qwen phrase reaches the status bar — not just its
+  // last word ("algorithms") as the old single-word capture produced.
+  assert.equal(r.status.verb, "Polishing the algorithms");
 });
 
 test("parsePaneLiveTurn: a Claude permission dialog ('Esc to cancel · Tab') is NOT busy", () => {
@@ -1112,6 +1116,25 @@ test("parsePaneStatus: extracts verb + up/down token counters + elapsed", () => 
   // A single count with no arrows folds into `up`.
   assert.deepEqual(parsePaneStatus("✽ Noodling… (8s · 1.2k tokens)"),
     { verb: "Noodling", up: "1.2k", down: "", elapsed: "8s" });
+  // Qwen Code's spinner is a multi-word phrase, not a single gerund. The whole
+  // phrase must reach the chat bar, not just its last word ("algorithms"), and
+  // the trailing "(… · esc to cancel)" detail paren is stripped.
+  assert.deepEqual(parsePaneStatus(".. Polishing the algorithms... (1s · ↑ 106 tokens · esc to cancel)"),
+    { verb: "Polishing the algorithms", up: "106", down: "", elapsed: "1s" });
+  // A phrase with no trailing ellipsis still works; detail paren stripped.
+  assert.deepEqual(parsePaneStatus(".. Optimizing for ludicrous speed (12s · esc to cancel)"),
+    { verb: "Optimizing for ludicrous speed", up: "", down: "", elapsed: "12s" });
+  // A paren INSIDE the phrase must survive — only the trailing detail paren is
+  // removed; the phrase's own trailing "..." is dropped.
+  assert.deepEqual(parsePaneStatus(".. Don't rush perfection (or my code)... (3s · esc to cancel)"),
+    { verb: "Don't rush perfection (or my code)", up: "", down: "", elapsed: "3s" });
+  // An internal ellipsis is kept; only the final "..." is a detail marker.
+  assert.deepEqual(parsePaneStatus(".. Loading... Do a barrel roll! (3s · esc to cancel)"),
+    { verb: "Loading... Do a barrel roll!", up: "", down: "", elapsed: "3s" });
+  // A width-truncated line leaves the detail paren UNCLOSED — the phrase still
+  // ends at its own ellipsis and the clipped detail must not leak into the verb.
+  assert.deepEqual(parsePaneStatus("✻ Herding… (esc to inte…"),
+    { verb: "Herding", up: "", down: "", elapsed: "" });
 });
 
 test("isStatusLine: recognizes spinner/verb/token lines glyph-agnostically, not prose", () => {
@@ -1122,6 +1145,11 @@ test("isStatusLine: recognizes spinner/verb/token lines glyph-agnostically, not 
   assert.ok(!isStatusLine("● Recursion is when a function calls itself."));
   assert.ok(!isStatusLine("  It needs a base case to stop."));
   assert.ok(!isStatusLine("✻ Worked for 4s"));
+  // Qwen's spinner line carries "(… · esc to cancel)" — recognized even before
+  // any token counter is shown.
+  assert.ok(isStatusLine(".. Polishing the algorithms... (1s · esc to cancel)"));
+  // A Claude permission dialog has the words but no closing paren, so it is not a status line.
+  assert.ok(!isStatusLine("Esc to cancel · Tab to amend"));
 });
 
 test("isHintLine: recognizes the corner-glyph tip/task footer, not prose", () => {
