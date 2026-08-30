@@ -21244,23 +21244,28 @@ class SessionManager:
         (finished a turn), holds undelivered code work, and has NO open PR gets
         one nudge telling it to deliver.
 
-        Three gates, all cheap, in order:
+        Three gates, in order:
           - An OPEN (or not-yet-fetched) PR already covers the work → skip, and
             re-arm the episode so a later undelivered turn re-arms from zero.
             Checked first because it is a dict read — a session that has a PR
             pays no pane capture or git walk.
-          - IDLE: only a session whose pane has settled to idle
-            (`_pane_status` busy is False) and is not sitting on a blocking
-            dialog (`pane_prompt` is None). True=busy (mid-turn) or
-            None=unknown (uncapturable) is never nudged, matching the
-            tri-state convention every other poller uses.
-          - UNDELIVERED WORK: the live git facts `_session_git` already computes
-            per beat — dirty files, a local branch that was never pushed, or
-            commits still ahead of origin. Turma worktrees are forked fresh per
-            session, so dirt in a worktree is this session's own work, not a
-            neighbour's. (The "pushed & in sync but no PR" case is left to the
-            in-session rules; there is no cheap, reliable base-ref to count
-            against, so this deliberately does not reach for it.)
+          - IDLE: only a session that has settled to idle is nudged —
+            `_pane_status` busy is False and no blocking dialog is up
+            (`pane_prompt` None) for Claude/qwen; for a headless dsh session
+            the pane is empty, so the control-socket status decides instead
+            (`dsh_pane_busy`), with a pending interaction suppressed the way a
+            blocking dialog is. True=busy (mid-turn) or None=unknown
+            (uncapturable) is never nudged, matching the tri-state convention
+            every other poller uses.
+          - UNDELIVERED WORK: dirty files, a local branch that was never
+            pushed, or commits still ahead of origin, read FRESH — this poller
+            runs on the faster PR-status cadence, so it requests a recompute
+            rather than the (up to a beat stale) cached branch-sync facts.
+            Turma worktrees are forked fresh per session, so dirt in a
+            worktree is this session's own work, not a neighbour's. (The
+            "pushed & in sync but no PR" case is left to the in-session rules;
+            there is no cheap, reliable base-ref to count against, so this
+            deliberately does not reach for it.)
 
         Edge-triggered like _poll_pr_conflicts: one nudge per episode, retried
         only past PR_OPEN_NUDGE_RETRY_SEC, capped at PR_OPEN_NUDGE_MAX_ATTEMPTS.
@@ -21290,11 +21295,27 @@ class SessionManager:
                     self.save()
                 continue
             # Idle gate: only a confirmed-idle, dialog-free session is nudged.
-            busy, _mode, prompt = _pane_status(
-                sess.get("tmuxName"), self.sess_state.setdefault(sid, {}))
-            if busy is not False or prompt is not None:
-                continue
-            gi, work = self._session_git(sess, refresh=False)
+            # A dsh session is HEADLESS — its pane is empty, so _pane_status
+            # would always read idle and let a mid-turn dsh nudge through. Its
+            # real busy/idle state is the control-socket status (XERK-468 [D]).
+            if sess.get("agentType") == "dsh":
+                snap = self.dsh_status.get(sid)
+                busy = dsh_pane_busy(snap)
+                # dsh_pane_busy maps pendingInteraction -> False (not running),
+                # but that means "blocked on a human", not "done" — suppress it
+                # the way pane_prompt does for a Claude/qwen dialog.
+                blocked = isinstance(snap, dict) and bool(snap.get("pendingInteraction"))
+                if busy is not False or blocked:
+                    continue
+            else:
+                busy, _mode, prompt = _pane_status(
+                    sess.get("tmuxName"), self.sess_state.setdefault(sid, {}))
+                if busy is not False or prompt is not None:
+                    continue
+            # Force a fresh read of the branch-sync facts: the poller runs more
+            # often than the slow facts refresh (USAGE_EVERY), and the undelivered
+            # check (pushed / aheadOfRemote) must not be up to a beat stale.
+            gi, work = self._session_git(sess, refresh=True)
             dirty = (gi or {}).get("dirtyFiles") or 0
             live_branch = (self.session_facts.get(sid) or {}).get("liveBranch")
             ahead_remote = (work or {}).get("aheadOfRemote") or 0

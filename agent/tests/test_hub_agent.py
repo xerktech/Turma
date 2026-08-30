@@ -12468,6 +12468,50 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
             sm._poll_open_pr_nudges()
         self.assertEqual(self._typed(), [])
 
+    def test_dsh_running_session_is_not_nudged(self):
+        # A headless dsh session's pane is empty (XERK-468 [D]) — its busy
+        # state is the control-socket status, and a mid-turn session must not
+        # be nudged just because the empty pane reads idle.
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["agentType"] = "dsh"
+        sm.dsh_status["s1"] = {"status": "running"}
+        sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+        self.assertNotIn("prOpenNudged", sess)
+
+    def test_dsh_idle_session_is_nudged(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["agentType"] = "dsh"
+        sm.dsh_status["s1"] = {"status": "idle"}
+        fake = _FakeDshControl()
+        sm.dsh_controls["s1"] = fake
+        sm._poll_open_pr_nudges()
+        self.assertEqual(len(fake.inputs), 1)
+        self.assertIn("feature-x", fake.inputs[0][0])
+        self.assertEqual(fake.inputs[0][1], "machine")
+        self.assertEqual(sess["prOpenNudged"]["s1"]["attempts"], 1)
+
+    def test_dsh_pending_interaction_is_not_nudged(self):
+        # A dsh session blocked on a human has not finished its turn — the
+        # same suppression a blocking dialog gets on a Claude/qwen pane.
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["agentType"] = "dsh"
+        sm.dsh_status["s1"] = {"status": "idle", "pendingInteraction": True}
+        sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+        self.assertNotIn("prOpenNudged", sess)
+
+    def test_dsh_unknown_status_is_not_nudged(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["agentType"] = "dsh"
+        sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+        self.assertNotIn("prOpenNudged", sess)
+
     def test_nudge_rides_the_session_inbox_when_it_has_one(self):
         sm = self.make_manager()
         sess = self._session(sm)
