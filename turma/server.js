@@ -5929,7 +5929,11 @@ function heartbeatAlerts(key, prev, next) {
   for (const session of next.sessions || []) {
     liveIds.add(session.id);
     const sa = (alerts.sessions[session.id] = alerts.sessions[session.id] || { prSeen: [] });
-    const label = session.rcName || `${key} · ${session.repo}@${session.branch}`;
+    // The session's own title (its `summary`) is what the operator recognises on
+    // the phone — the Sessions screen leads with it too. `rcName` is the
+    // structural <host>-<repo>-<key> spawn id, which means nothing at a glance,
+    // so it stands in only while a summary has not been generated yet.
+    const label = session.summary || session.rcName || `${key} · ${session.repo}@${session.branch}`;
     const s = session.session || {}; // null for stopped sessions
 
     const route = { host: key, sessionId: session.id };

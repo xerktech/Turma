@@ -863,6 +863,21 @@ test("alerts: answering a question retracts its notification (XERK-154)", () => 
   assert.deepEqual(dismisses(), []);
 });
 
+test("alerts: notification titles use the session's title, not its rcName", () => {
+  const beat = makeHost();
+  notifications.length = 0;
+  beat({
+    sessions: [{ id: "s1", rcName: "nas-repo-s1", summary: "Fix terminal font", session: { question: "Deploy to prod?" } }],
+  });
+  assert.deepEqual(titles(), ["Fix terminal font has a question"]);
+  notifications.length = 0;
+  // A session without a summary yet falls back to the structural rcName.
+  beat({
+    sessions: [{ id: "s2", rcName: "nas-repo-s2", session: { question: "Ship it?" } }],
+  });
+  assert.deepEqual(titles(), ["nas-repo-s2 has a question"]);
+});
+
 // ---- The ready-for-review alert, held until CI is green --------------------
 // XERK-153 (hold a PR alert until its CI settles) collapsed into XERK-224's one
 // per-session alert: a session that finished a turn AND opened a PR is ONE
