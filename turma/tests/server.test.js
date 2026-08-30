@@ -10879,6 +10879,114 @@ test("XERK-268: ttyd is proxied with the token that host actually runs", async (
   assert.ok(row && !("tokenBound" in row));
 });
 
+// Build a client->server (masked, FIN) binary WebSocket frame. The hub's
+// wsParser accepts masked or unmasked frames; masking matches what a real
+// WS client (the tunnel-agent) sends, so this exercises the same wire bytes.
+function wsClientFrame(opcode, payload) {
+  payload = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.alloc(2);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | len;
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  const mask = crypto.randomBytes(4);
+  const body = Buffer.from(payload);
+  for (let i = 0; i < body.length; i++) body[i] ^= mask[i & 3];
+  return Buffer.concat([header, mask, body]);
+}
+
+test("term: terminal HTML serves JBMNerd with font-display:swap (not block)", async () => {
+  // The font swap is the whole point of PR #569: the terminal must never go
+  // blank waiting on the 1 MB Nerd Font. This drives the REAL proxyTerm path —
+  // a fake ttyd answers the document request over the tunnel with a minimal
+  // </head>-containing page — and asserts what the browser actually receives.
+  const host = "fontSwapHost";
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: host,
+      sessions: [{ id: "fs1", repo: "Turma", status: "running", ttydPort: 7910,
+        worktreePath: "/git/.turma/worktrees/Turma/fs1", transcriptId: "t-fs1" }],
+    },
+    headers: agentHeaders,
+  });
+  const ctrl = await wsConnect(`/agent/control?name=${host}&token=${hostAgentToken(host)}`);
+  const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
+
+  // Fire the document request; the hub cannot answer until the (fake) ttyd
+  // responds over the tunnel, so drive the tunnel by hand.
+  const docP = request("GET", "/term/fs1/", { headers: userHeaders });
+
+  // Wait for the hub to ask the agent to dial back a data channel.
+  await waitFor(() => ctrlFrames.some((f) => {
+    try { return JSON.parse(f.payload).open; } catch { return false; }
+  }));
+  const ch = ctrlFrames
+    .map((f) => { try { return JSON.parse(f.payload).open; } catch { return null; } })
+    .find(Boolean);
+  assert.ok(ch, "hub should request a data channel for the terminal");
+
+  const data = await wsConnect(`/agent/data?ch=${ch}&token=${hostAgentToken(host)}`, 1500);
+  const dataFrames = collectFrames(data.socket, data.leftover);
+
+  // Wait for the hub's HTTP request to arrive over the channel, then answer it
+  // with a minimal ttyd-style HTML document.
+  await waitFor(() => dataFrames.some((f) => f.payload.length), 3000);
+  const sent = Buffer.concat(dataFrames.map((f) => f.payload));
+  assert.match(sent.toString("utf8"), /GET \/term\/fs1\/ HTTP\/1\.1/);
+
+  const html = "<!doctype html><html><head><title>t</title></head><body>x</body></html>";
+  const resp =
+    "HTTP/1.1 200 OK\r\n" +
+    "Content-Type: text/html\r\n" +
+    `Content-Length: ${html.length}\r\n` +
+    "\r\n" + html;
+  data.socket.write(wsClientFrame(0x2, Buffer.from(resp, "utf8")));
+
+  const doc = await Promise.race([
+    docP,
+    new Promise((_, rej) => {
+      const t = setTimeout(() => rej(new Error("terminal document timed out")), 5000);
+      t.unref?.();
+    }),
+  ]);
+  assert.equal(doc.status, 200);
+  const text = doc.raw;
+  // PR #569: text must render immediately on the fallback stack.
+  assert.ok(text.includes("font-display:swap"), "terminal HTML must serve font-display:swap");
+  assert.ok(!text.includes("font-display:block"), "font-display:block must not regress");
+  assert.ok(text.includes("rel='preload' as='font'"), "preload link must survive injection");
+  assert.ok(text.includes("@font-face"), "@font-face rule must be injected");
+  assert.ok(text.includes("JBMNerd"), "injected family must be JBMNerd");
+  // The injected <style> must land before </head>, not in the body.
+  assert.ok(
+    text.indexOf("@font-face") < text.indexOf("</head>"),
+    "@font-face must be injected before </head>"
+  );
+  data.socket.destroy();
+  ctrl.socket.destroy();
+
+  // The font route itself: content-typed + immutable, so the preloaded fetch
+  // hits the browser cache on every repeat load (the swap only matters cold).
+  const font = await request("GET", "/term-font.woff2", { headers: userHeaders });
+  assert.equal(font.status, 200);
+  assert.match(font.headers["content-type"], /^font\/woff2/);
+  assert.match(font.headers["cache-control"], /max-age=31536000/);
+  assert.ok(font.headers["cache-control"].includes("immutable"), "font must be immutable");
+});
+
+
 test("migrate: the blob relay is scoped to the migration's own two hosts", async () => {
   // The <host> segment is checked against the migration's own halves (XERK-266),
   // so a mis-addressed call can no longer act on someone else's move. It is
