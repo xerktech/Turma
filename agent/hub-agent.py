@@ -111,9 +111,10 @@ TTYD_PORT_BASE = int(os.environ.get("TTYD_PORT_BASE", "7700"))
 # Reserved pseudo-repo name for a session that runs directly at REPOS_ROOT
 # (spanning every repo) instead of inside one repo's worktree. It is NOT a git
 # worktree: no branch, no base/branch-name option, no worktree add/remove —
-# claude just runs in REPOS_ROOT. Because all root sessions share that cwd (and
-# thus one claude project slug + Remote Control bridge pointer), at most one may
-# run at a time. Parens keep it clear of any real (dir-name) repo in the scan.
+# claude just runs in REPOS_ROOT. All root sessions share that cwd (and thus
+# one claude project slug), but transcripts stay keyed per session and the RC
+# bridge pointer is last-writer-wins, so several may run at once, bounded only
+# by MAX_SESSIONS. Parens keep it clear of any real (dir-name) repo in the scan.
 ROOT_REPO_NAME = "(root)"
 
 # A transcript reconciliation can't tie to a repo this host has (a bare
@@ -13552,15 +13553,16 @@ class SessionManager:
             # already over it, and "-2 free slots" is not something the hub
             # should have to reason about.
             "free": max(0, MAX_SESSIONS - running),
-            # A second, orthogonal ceiling — one root session per host — so the
-            # hub can see a root spawn is blocked without inferring it.
+            # How many root (repos-root) sessions are live on this host. Purely
+            # informational: root sessions are bounded by MAX_SESSIONS like any
+            # other, not by a separate one-per-host slot.
             "rootRunning": self._root_running(),
         }
 
     def _root_running(self):
-        """True if a root session (cwd = REPOS_ROOT) is already live. Root
-        sessions share one claude project slug + RC bridge pointer, so only one
-        may run at a time; spawn/start/resume all gate on this."""
+        """True if any root session (cwd = REPOS_ROOT) is currently live. Kept
+        for the heartbeat display; it no longer gates spawn/start/resume —
+        several root sessions may run concurrently, bounded by MAX_SESSIONS."""
         return any(s.get("root") and s.get("status") == "running"
                    for s in self.registry)
 
@@ -15467,13 +15469,15 @@ class SessionManager:
         `spawnCmdId`) is what lets the UI recognize its own spawn and open it.
 
         A spawn that can't run RIGHT NOW is no longer refused: it lands as a
-        `queued` record and _drain_queue provisions it when a slot frees, the
-        clone finishes, or the root slot opens. `await_clone` (a repo name) is
+        `queued` record and _drain_queue provisions it when a slot frees or the
+        clone finishes. `await_clone` (a repo name) is
         the ticket-router's promise that this host is cloning that repo — it lets
         the record exist before its repo does, so the session waits for the clone
         instead of failing the unknown-repo check. See _drain_queue."""
         # A root session runs directly at REPOS_ROOT (no worktree/branch). The
-        # base option doesn't apply; only one may run at a time.
+        # base option doesn't apply. Several may run at once; the shared project
+        # slug is safe because transcripts are pinned per session id and the RC
+        # bridge pointer is last-writer-wins.
         is_root = (repo_name == ROOT_REPO_NAME)
         awaiting_clone = False
         if is_root:
@@ -15507,17 +15511,16 @@ class SessionManager:
                 # pre-flight, which says what is wrong on an error card now.
                 awaiting_clone = True
         # Decide run-now vs queue HERE, before the record is appended, so the
-        # counts don't include the session we're about to add (a root session
-        # would otherwise see itself and always read root-busy; a capacity check
-        # would be off by one). Three orthogonal blocks, each re-checked by
-        # _drain_queue before it lets the session run:
-        #   root-busy — another root session already holds the one root slot;
+        # counts don't include the session we're about to add (a capacity check
+        # would otherwise be off by one). Two orthogonal blocks, each re-checked
+        # by _drain_queue before it lets the session run:
         #   capacity — the host is at MAX_SESSIONS;
         #   awaiting-clone — the repo is being cloned to this host right now.
+        # Root sessions are NOT gated separately: several may run at once in
+        # REPOS_ROOT (they share a project slug, but transcripts are per-session
+        # and the RC bridge pointer is last-writer-wins), capped only by MAX.
         reason = None
-        if is_root and self._root_running():
-            reason = "root-busy"
-        elif self._running_count() >= MAX_SESSIONS:
+        if self._running_count() >= MAX_SESSIONS:
             reason = "capacity"
         elif awaiting_clone:
             reason = "awaiting-clone"
@@ -15656,7 +15659,7 @@ class SessionManager:
     def _provision_session(self, sess):
         """Bring a session's record to life: add its worktree, launch claude +
         ttyd, start naming it. This is the second half of a spawn — split out so
-        a session that had to WAIT (for a slot, a clone, or the root slot) starts
+        a session that had to WAIT (for a slot or a clone) starts
         through exactly this code rather than a second, divergent path. Called by
         spawn() when a slot is free and by _drain_queue() when one frees up."""
         sid = sess["id"]
@@ -15731,10 +15734,7 @@ class SessionManager:
         for sess in self.registry:
             if sess.get("status") != "queued":
                 continue
-            if sess.get("root"):
-                if self._root_running():
-                    continue  # the one root slot is still taken
-            elif sess.get("awaitClone"):
+            if sess.get("awaitClone"):
                 # Readiness is "has this repo something to fork from", never the
                 # .git entry: git clone creates that before it fetches an object,
                 # so a `.git`-only check released the session mid-clone and
@@ -16055,9 +16055,6 @@ class SessionManager:
         if self._running_count() >= MAX_SESSIONS:
             log(f"start refused: at MAX_SESSIONS ({MAX_SESSIONS})")
             return
-        if sess.get("root") and self._root_running():
-            log("start refused: a root session is already running")
-            return
         try:
             # Root runs in REPOS_ROOT (always present) — no worktree to re-add.
             # Normally the worktree persists (kill keeps it), so this is skipped.
@@ -16087,9 +16084,6 @@ class SessionManager:
             return
         if self._running_count() >= MAX_SESSIONS:
             log(f"resume refused: at MAX_SESSIONS ({MAX_SESSIONS})")
-            return
-        if rec.get("root") and self._root_running():
-            log("resume refused: a root session is already running")
             return
         sess = {
             "id": sid,
@@ -16293,14 +16287,13 @@ class SessionManager:
         if self._running_count() >= MAX_SESSIONS:
             refuse(f"the host is at MAX_SESSIONS ({MAX_SESSIONS})")
             return None
-        if is_root and self._root_running():
-            refuse("a root session is already running on this host")
-            return None
-        # One live session per cwd: two claudes in the same dir share a project
-        # slug + RC bridge pointer and would collide (the same reason root is
-        # single). A worktree resume gets its own dir, so this only bites a repo-
-        # dir / repos-root re-resume while one is already up.
-        if any(s.get("status") == "running"
+        # One live session per NON-ROOT cwd: two claudes in the same repo dir
+        # share a project slug + RC bridge pointer and would collide. Root
+        # sessions all share REPOS_ROOT on purpose — they are bounded only by
+        # MAX_SESSIONS, and transcripts stay pinned per session. A worktree
+        # resume gets its own dir, so this only bites a repo-dir re-resume while
+        # one is already up.
+        if not is_root and any(s.get("status") == "running"
                and os.path.normpath(s.get("worktreePath") or "") == cwd
                for s in self.registry):
             refuse(f"a session is already running in {cwd}")
@@ -22887,8 +22880,8 @@ class SessionManager:
             "permissionModes": perm_cycle_for(sess.get("launchPermissionMode")),
             "baseRef": sess.get("baseRef"),
             "status": sess.get("status"),
-            # Why a `queued` session is waiting (capacity / awaiting-clone /
-            # root-busy) and since when — so the card can say "waiting for a
+            # Why a `queued` session is waiting (capacity / awaiting-clone)
+            # and since when — so the card can say "waiting for a
             # slot" rather than looking like a stuck spawn. Absent (None) for any
             # session that isn't queued.
             "queuedReason": sess.get("queuedReason"),
@@ -23160,8 +23153,8 @@ class SessionManager:
                 log(f"pr comment poll failed: {e}")
         self._poll_clones()
         self._poll_prunes()
-        # Start any queued session that can now run — a freed slot, a finished
-        # on-demand clone, or the root slot opening. One per beat; see the method.
+        # Start any queued session that can now run — a freed slot or a
+        # finished on-demand clone. One per beat; see the method.
         if not light:
             self._drain_queue()
         # Drop AskUserQuestion rendezvous files left behind by a turn that died

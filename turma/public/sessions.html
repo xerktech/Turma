@@ -1988,7 +1988,7 @@ function render(data) {
       }</div>
     </details>`;
 
-  // Queued sessions: waiting for a slot, a clone, or the root slot. Above the
+  // Queued sessions: waiting for a slot or a clone. Above the
   // live lists — they're the work about to start. Cancelable but not attachable
   // (there's no pane yet).
   $queued.innerHTML = queued.length
@@ -2076,7 +2076,6 @@ function queuedReasonText(reason) {
   return ({
     "capacity": "waiting for a free session slot",
     "awaiting-clone": "cloning the repo first",
-    "root-busy": "waiting for the repos-root slot",
   })[reason] || "waiting to start";
 }
 // The stage headline while a followed spawn is sitting in the queue.
@@ -2503,10 +2502,11 @@ function followSpawn(cmdId) {
   followedSpawn = true;
 }
 // Did the agent tell the hub it REFUSED this command (XERK-265)? A resume the
-// agent declines — the host is full, a root session is already up, a prune took
-// the worktree out from under it — is ACKed like any other, so without this the
-// wait below has nothing to end it but its own timeout. Returns {error, migration}
-// or null; `migration` marks a refused move, which reports through its own record.
+// agent declines — the host is full, a session already runs in that cwd, a
+// prune took the worktree out from under it — is ACKed like any other, so
+// without this the wait below has nothing to end it but its own timeout.
+// Returns {error, migration} or null; `migration` marks a refused move, which
+// reports through its own record.
 function spawnRefusal(cmdId) {
   if (!cmdId) return null;
   for (const a of (cache.agents || [])) {
