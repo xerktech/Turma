@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending, isQwenSession, qwenRuntimeChipHtml } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -1891,6 +1891,29 @@ test("dsh footer (XERK-504): a non-dsh session is not treated as dsh", () => {
   assert.equal(isDshSession(), false);
   __setSess({ id: "s1", agentType: "claude", modelSource: "local" });
   assert.equal(isDshSession(), false);
+});
+
+test("qwen footer: a qwen session shows a read-only 'Qwen Code' runtime chip, not the Claude switch", () => {
+  __setSess({ id: "s1", agentType: "qwen", modelSource: "subscription" });
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  assert.equal(isQwenSession(), true);
+  assert.equal(isDshSession(), false);
+  // Even with a local endpoint offered on the host, a qwen session must NOT
+  // render the Claude subscription/local switch.
+  const runtime = qwenRuntimeChipHtml();
+  assert.match(runtime, /<span class="cc-val">Qwen Code<\/span>/); // the visible label
+  assert.doesNotMatch(runtime, /cc-caret/);          // read-only, no picker
+  assert.doesNotMatch(runtime, /ccSourceBtn/);       // no switchable button
+});
+
+test("qwen footer: a non-qwen session is not treated as qwen", () => {
+  __setSess({ id: "s1", modelSource: "subscription" });
+  __setAgent({ localModel: { available: false } });
+  assert.equal(isQwenSession(), false);
+  __setSess({ id: "s1", agentType: "claude", modelSource: "local" });
+  assert.equal(isQwenSession(), false);
+  __setSess({ id: "s1", agentType: "dsh" });
+  assert.equal(isQwenSession(), false);
 });
 
 test("local model (XERK-489): a stored context override wins, and shrinks the readout", () => {
