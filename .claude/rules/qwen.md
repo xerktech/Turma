@@ -42,6 +42,19 @@ diverges it is because the TUI process model differs, never because a decision w
   - **It carries NO qwen model plumbing** — `{available}` alone, unlike dsh's
     `{available,models,defaultModel,contextTokens}`. Do not widen
     `_qwen_payload`/`normalizeQwen`/`QwenInfo` here.
+  - **`qwen_configured()` is ALSO gated on the runtime FILES being present**
+    (`qwen_runtime_present`, XERK-523) — the qwen siblings + `qwen/` beside
+    `hub-agent.py`. `QWEN_ENABLED` shipped True (XERK-520) before the native
+    packaging shipped those files (XERK-523), and the SELF-UPDATER that lays them
+    down is refreshed by the SAME payload, so the first qwen update swaps in a
+    qwen-needing `hub-agent.py` while the OLD updater (not yet qwen-aware)
+    processes it and skips the files — leaving `import qwen_session` to crash
+    every spawn. Presence-gating makes such a host DEGRADE (hide + cleanly refuse
+    via `resolve_agent_type`) and self-heal once the next update lands the files;
+    the fail-safe discipline of `local_model_configured`/`default_runtime`.
+    Checked LIVE (cheap stats, no memo) so a lay-down is picked up with no
+    restart. Tests: `test_qwen_configured_requires_the_runtime_files`,
+    `test_qwen_runtime_present_checks_every_launch_file`.
 - **`QWEN_ENABLED` is an in-CODE fleet-wide kill switch**, the qwen twin of `DSH_ENABLED`: it gates
   `qwen_configured()` (agent),
   `qwenAvailable`/`normalizeQwen` (hub) and `Runtime.QWEN_ENABLED` (Android), so no single component
