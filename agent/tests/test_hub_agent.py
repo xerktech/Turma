@@ -4015,6 +4015,7 @@ class ManagerMixin:
             ("QUESTIONS_DIR", os.path.join(self.tmp, "questions")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
+            ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
@@ -6476,6 +6477,11 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
         # would silently stop excluding the helper transcripts (XERK-27). Reading
         # the transcript is the harness-proof path; this guards its input.
         self.assertTrue(any(ha.JIRA_TRIAGE_INSTRUCTION.startswith(s)
+                            for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
+        # The ticket-triage assessment prompt (XERK-482) reuses the repo-triage
+        # lead-in, so the same signature must also prefix it — a reword of either
+        # must not silently stop excluding the helper transcript.
+        self.assertTrue(any(ha.TICKET_TRIAGE_INSTRUCTION.startswith(s)
                             for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
         self.assertTrue(any(ha.SUMMARY_INSTRUCTION.startswith(s)
                             for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
@@ -17720,6 +17726,7 @@ class TestPruneRepo(unittest.TestCase):
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
+            ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
@@ -24056,12 +24063,11 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
         self.assertIsNone(ha.build_ticket_triage("junk"))
 
     def test_apply_triage_stamps_a_ledger_assessment_onto_the_ticket(self):
-        # The assessment is INDEPENDENT of the repo decision: an entry that
-        # carries a triage sub-dict but is not `decided` still stamps triage,
-        # while its repoGuess stays absent.
+        # The assessment is INDEPENDENT of the repo decision: an assessment entry
+        # stamps `triage` on its own, while its repoGuess stays absent.
         sm = self._manager([{"key": "ENG-1", "summary": "x"}])
-        sm.triage_ledger[ha._triage_key("s.atlassian.net", "ENG-1")] = {
-            "triage": {"priority": "P0", "actionable": False, "source": "auto"},
+        sm.ticket_triage_ledger[ha._triage_key("s.atlassian.net", "ENG-1")] = {
+            "priority": "P0", "actionable": False, "source": "auto",
         }
         sm._apply_triage()
         t = sm.jira["tickets"][0]
@@ -24069,16 +24075,16 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
         self.assertNotIn("repoGuess", t)
 
     def test_apply_triage_clears_a_stale_assessment_when_the_ledger_drops_it(self):
-        # The ticket dict is mutated in place across beats, so a ledger entry that
-        # LOSES its triage sub-dict (a re-triage invalidation, or B/E clearing it)
+        # The ticket dict is mutated in place across beats, so a ticket-triage
+        # ledger entry that is dropped (a prune eviction, or a manual release)
         # must clear the stamped block — the pop mirrors the repoGuess pop right
         # below it. Pins that else-branch.
         sm = self._manager([{"key": "ENG-1", "summary": "x"}])
         key = ha._triage_key("s.atlassian.net", "ENG-1")
-        sm.triage_ledger[key] = {"triage": {"priority": "P1", "source": "auto"}}
+        sm.ticket_triage_ledger[key] = {"priority": "P1", "source": "auto"}
         sm._apply_triage()
         self.assertEqual(sm.jira["tickets"][0]["triage"], {"priority": "P1", "source": "auto"})
-        sm.triage_ledger[key] = {"decided": True, "repo": "Turma"}
+        del sm.ticket_triage_ledger[key]
         sm._apply_triage()
         self.assertNotIn("triage", sm.jira["tickets"][0])
 
@@ -24313,6 +24319,402 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "collect_jira", return_value=fresh):
             sm.refresh_jira()
         self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+
+class TestTicketTriageFingerprints(unittest.TestCase):
+    """What re-triages a ticket's ASSESSMENT (XERK-482) and — just as
+    important — what doesn't: status/updated churn must not burn the retry
+    budget, and a changed ticket must get a fresh one."""
+
+    def _entry_for(self, ticket):
+        return {"decided": True,
+                "ticketFp": ha._ticket_fingerprint(ticket)}
+
+    def test_never_assessed_is_stale(self):
+        self.assertTrue(ha._ticket_triage_stale(None, 123))
+        self.assertTrue(ha._ticket_triage_stale({}, 123))
+        self.assertTrue(ha._ticket_triage_stale(
+            {"attempts": 1}, ha._ticket_fingerprint({"summary": "x"})))
+
+    def test_ticket_text_change_invalidates(self):
+        a = {"summary": "Fix login", "type": "Bug", "project": "ENG", "labels": []}
+        b = {**a, "summary": "Fix logout"}
+        entry = self._entry_for(a)
+        self.assertTrue(ha._ticket_triage_stale(entry, ha._ticket_fingerprint(b)))
+
+    def test_status_or_updated_churn_does_not_invalidate(self):
+        a = {"summary": "Fix login", "type": "Bug", "project": "ENG", "labels": [],
+             "status": "To Do", "updated": "2026-07-01T00:00:00Z"}
+        b = {**a, "status": "In Progress", "updated": "2026-07-15T00:00:00Z"}
+        entry = self._entry_for(a)
+        self.assertFalse(ha._ticket_triage_stale(entry, ha._ticket_fingerprint(b)))
+
+    def test_a_changed_ticket_gets_a_fresh_attempt_budget(self):
+        old = {"summary": "Fix login"}
+        new = {"summary": "Rewrite the Widget API"}
+        entry = {"decided": True, "attempts": 3, "retryAt": 1e12,
+                 "tryTicketFp": ha._ticket_fingerprint(old)}
+        self.assertEqual(ha._ticket_triage_attempts(entry, ha._ticket_fingerprint(old)), 3)
+        # The new question gets a fresh budget — a lifetime counter would
+        # permanently ban re-triage after a single failed run.
+        self.assertEqual(ha._ticket_triage_attempts(entry, ha._ticket_fingerprint(new)), 0)
+        self.assertEqual(ha._ticket_triage_attempts(None, 1), 0)
+        self.assertEqual(ha._ticket_triage_attempts(
+            {"attempts": "x", "tryTicketFp": 1}, 1), 0)
+
+
+class TestParseTicketTriage(unittest.TestCase):
+    """The trust boundary for the assessment (XERK-482): a model reply becomes a
+    decision only when EVERY field lands on its fixed enum — a ticket is
+    all-or-nothing, so any out-of-band field is a failed attempt, never a
+    half-validated value stamped onto a card."""
+
+    def setUp(self):
+        self.asked = ["ENG-1", "ENG-2"]
+        self.board = ["ENG-1", "ENG-2", "ENG-9"]
+
+    def _raw(self, **fields):
+        base = {"priority": "P1", "type": "bug", "value": "low",
+                "actionable": True, "dedupeOf": None, "reason": "x"}
+        base.update(fields)
+        return json.dumps({"ENG-1": base})
+
+    def _parse(self, raw):
+        return ha._parse_ticket_triage(raw, self.asked, self.board)
+
+    def test_parses_a_full_assessment(self):
+        out = self._parse(self._raw())
+        self.assertEqual(out["ENG-1"], {
+            "priority": "P1", "type": "bug", "value": "low",
+            "actionable": True, "dedupeOf": None, "reason": "x"})
+
+    def test_out_of_band_priority_is_a_failed_attempt(self):
+        for p in ("P9", "p1", "high", 1, None):
+            self.assertEqual(self._parse(self._raw(priority=p)), {}, repr(p))
+
+    def test_out_of_band_type_or_value_is_a_failed_attempt(self):
+        self.assertEqual(self._parse(self._raw(type="epic")), {})
+        self.assertEqual(self._parse(self._raw(value="urgent")), {})
+        self.assertEqual(self._parse(self._raw(type="chore", value="high")),
+                         {"ENG-1": {"priority": "P1", "type": "chore",
+                                    "value": "high", "actionable": True,
+                                    "dedupeOf": None, "reason": "x"}})
+
+    def test_non_bool_actionable_is_a_failed_attempt(self):
+        for a in ("yes", "true", 1, None):
+            self.assertEqual(self._parse(self._raw(actionable=a)), {}, repr(a))
+
+    def test_dedupe_of_a_board_key_is_kept(self):
+        out = self._parse(self._raw(dedupeOf="ENG-9"))
+        self.assertEqual(out["ENG-1"]["dedupeOf"], "ENG-9")
+
+    def test_dedupe_of_an_off_board_key_is_a_failed_attempt(self):
+        # A key the board doesn't show is invented — recording it would point
+        # the card at a ticket this host has never seen.
+        self.assertEqual(self._parse(self._raw(dedupeOf="ZZZ-1")), {})
+
+    def test_unasked_keys_are_ignored(self):
+        raw = json.dumps({"ENG-9": {"priority": "P1", "type": "bug",
+                                    "value": "low", "actionable": True,
+                                    "dedupeOf": None, "reason": "x"}})
+        self.assertEqual(self._parse(raw), {})
+
+    def test_unreadable_value_shapes_are_no_answer(self):
+        for raw in ['{"ENG-1": "P1"}',
+                    '{"ENG-1": ["P1", "bug"]}',
+                    '{"ENG-1": 42}',
+                    '{"ENG-1": {}}']:
+            self.assertEqual(self._parse(raw), {}, raw)
+
+    def test_unusable_reply_is_no_decision(self):
+        for raw in ["", None, "I cannot determine this.", "{oops", "[1,2]"]:
+            self.assertEqual(self._parse(raw), {}, repr(raw))
+
+    def test_json_in_a_fence_or_prose_is_recovered(self):
+        valid = self._raw()
+        for raw in ['```json\n' + valid + '\n```',
+                    'Sure! Here you go:\n' + valid + '\nHope that helps.']:
+            out = self._parse(raw)
+            self.assertEqual(out["ENG-1"]["priority"], "P1", raw)
+
+    def test_missing_fields_are_a_failed_attempt(self):
+        self.assertEqual(
+            ha._parse_ticket_triage('{"ENG-1": {"priority": "P1"}}',
+                                    self.asked, self.board), {})
+
+    def test_reason_is_capped(self):
+        out = self._parse(self._raw(reason="x" * 400))
+        self.assertEqual(len(out["ENG-1"]["reason"]), ha.JIRA_TRIAGE_REASON_MAX)
+
+
+class TestTicketTriage(ManagerMixin, unittest.TestCase):
+    """The ticket-triage lifecycle on the manager (XERK-482): batching, caching,
+    retries, and the triage block that rides the heartbeat."""
+
+    def setUp(self):
+        super().setUp()
+        self.popen_calls = []
+        p = mock.patch.object(ha, "scan_repos",
+                              return_value=[{"name": "Turma",
+                                             "path": os.path.join(self.tmp, "Turma")}])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _configured(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net",
+                                   JIRA_EMAIL="e", JIRA_TOKEN="t")
+
+    def _manager(self, tickets):
+        sm = self.make_manager()
+        sm.jira = {**ha.JIRA_EMPTY, "available": True, "configured": True,
+                   "siteKey": "s.atlassian.net", "tickets": tickets}
+        return sm
+
+    def _assessment(self, **fields):
+        a = {"priority": "P1", "type": "bug", "value": "high",
+             "actionable": True, "dedupeOf": None, "reason": "crashes login"}
+        a.update(fields)
+        return a
+
+    def _fake_popen(self, reply, rc=0):
+        """Stand in for the detached `claude -p`: record the argv and write the
+        reply where the real subprocess's stdout redirect would have put it."""
+        test = self
+
+        class FakeProc:
+            def __init__(self, cmd, stdout=None, **kw):
+                test.popen_calls.append(cmd)
+                if reply is not None and stdout is not None:
+                    stdout.write(reply)
+                    stdout.flush()
+
+            def poll(self):
+                return rc
+
+            def kill(self):
+                pass
+
+        return mock.patch.object(ha.subprocess, "Popen", FakeProc)
+
+    def test_assessment_decides_and_stamps_the_ticket(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Login crashes on click",
+                             "priority": "High"}])
+        reply = json.dumps({"ENG-1": self._assessment()})
+        with self._configured(), self._fake_popen(reply):
+            sm._start_ticket_triage()
+            sm._poll_ticket_triage()
+        t = sm.jira["tickets"][0]
+        self.assertEqual(t["triage"]["priority"], "P1")
+        self.assertEqual(t["triage"]["type"], "bug")
+        self.assertEqual(t["triage"]["value"], "high")
+        self.assertIs(t["triage"]["actionable"], True)
+        self.assertNotIn("dedupeOf", t["triage"])     # null never rides the wire
+        self.assertEqual(t["triage"]["priorityName"], "High")
+        self.assertEqual(t["triage"]["source"], "auto")
+        self.assertTrue(t["triage"]["at"])
+
+    def test_dedupe_pointing_at_a_sister_ticket_rides_the_wire(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Login crashes"},
+                            {"key": "ENG-2", "summary": "Login is broken again"}])
+        reply = json.dumps({"ENG-1": self._assessment(),
+                            "ENG-2": self._assessment(dedupeOf="ENG-1")})
+        with self._configured(), self._fake_popen(reply):
+            sm._start_ticket_triage()
+            sm._poll_ticket_triage()
+        self.assertEqual(sm.jira["tickets"][1]["triage"]["dedupeOf"], "ENG-1")
+
+    def test_the_prompt_sees_the_whole_board_but_only_assesses_the_batch(self):
+        # The model may read EVERY ticket to detect duplicates, but is only
+        # ASKED to decide on the batch — the reply to the rest is ignored.
+        tickets = [{"key": f"ENG-{i}", "summary": f"t{i}"} for i in range(30)]
+        sm = self._manager(tickets)
+        with self._configured(), self._fake_popen("{}"):
+            sm._start_ticket_triage()
+        board, assess = self.popen_calls[0][-1].split("Assess these:")
+        # ENG-29 is past the JIRA_TRIAGE_BATCH cut: on the board, not asked.
+        self.assertIn("ENG-29", board)
+        self.assertNotIn("ENG-29", assess)
+        self.assertIn("ENG-1", board)
+        self.assertIn("ENG-1", assess)
+
+    def test_launch_is_headless_and_never_enters_a_repo(self):
+        # The ticket summary is DATA: argv list (no shell), no --settings, and
+        # no workdir override — the ticket text never reaches a shell, path,
+        # or URL.
+        sm = self._manager([{"key": "ENG-1", "summary": "x; rm -rf /"}])
+        with self._configured(), self._fake_popen("{}"):
+            sm._start_ticket_triage()
+        cmd = self.popen_calls[0]
+        self.assertEqual(cmd[:4], ["claude", "-p", "--model", ha.JIRA_TRIAGE_MODEL])
+        self.assertEqual(len(cmd), 5)          # the prompt is ONE argv element
+        self.assertNotIn("--settings", cmd)
+
+    def test_a_settled_board_costs_nothing(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        reply = json.dumps({"ENG-1": self._assessment()})
+        with self._configured(), self._fake_popen(reply):
+            sm._start_ticket_triage()
+            sm._poll_ticket_triage()
+            self.popen_calls.clear()
+            for _ in range(5):
+                sm._start_ticket_triage()
+        self.assertEqual(self.popen_calls, [])
+
+    def test_decisions_survive_a_manager_restart(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        reply = json.dumps({"ENG-1": self._assessment()})
+        with self._configured(), self._fake_popen(reply):
+            sm._start_ticket_triage()
+            sm._poll_ticket_triage()
+        again = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        again._apply_triage()
+        self.assertEqual(again.jira["tickets"][0]["triage"]["priority"], "P1")
+        self.popen_calls.clear()
+        with self._configured(), self._fake_popen(reply):
+            again._start_ticket_triage()
+        self.assertEqual(self.popen_calls, [])   # no re-run
+
+    def test_edited_ticket_is_retriaged(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen(
+                json.dumps({"ENG-1": self._assessment(priority="P0")})):
+            sm._start_ticket_triage()
+            sm._poll_ticket_triage()
+        sm.jira["tickets"] = [{"key": "ENG-1", "summary": "Rewrite the Widget API"}]
+        self.popen_calls.clear()
+        with self._configured(), self._fake_popen(
+                json.dumps({"ENG-1": self._assessment(priority="P2")})):
+            sm._start_ticket_triage()
+            sm._poll_ticket_triage()
+        self.assertEqual(len(self.popen_calls), 1)
+        self.assertEqual(sm.jira["tickets"][0]["triage"]["priority"], "P2")
+
+    def test_a_stale_assessment_keeps_rendering_until_a_new_one_lands(self):
+        # Stale means "re-triage this", NOT "stop showing it": the old answer is
+        # the best one available until a better one arrives, and blanking it
+        # here would wipe the board over a transient.
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen(
+                json.dumps({"ENG-1": self._assessment(priority="P0")})):
+            sm._start_ticket_triage()
+            sm._poll_ticket_triage()
+        sm.jira["tickets"] = [{"key": "ENG-1", "summary": "Rewrite the Widget API"}]
+        with self._configured(), self._fake_popen(None):
+            sm._start_ticket_triage()   # re-triage in flight
+        sm._apply_triage()
+        self.assertEqual(sm.jira["tickets"][0]["triage"]["priority"], "P0")
+
+    def test_a_failed_attempt_does_not_destroy_the_existing_assessment(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen(
+                json.dumps({"ENG-1": self._assessment(priority="P0")})):
+            sm._start_ticket_triage()
+            sm._poll_ticket_triage()
+        sm.jira["tickets"] = [{"key": "ENG-1", "summary": "Rewrite the Widget API"}]
+        with self._configured(), self._fake_popen("garbage"):
+            sm._start_ticket_triage()
+            sm._poll_ticket_triage()    # attempt fails outright
+        sm._apply_triage()
+        self.assertEqual(sm.jira["tickets"][0]["triage"]["priority"], "P0")
+
+    def test_unreadable_reply_is_a_failed_attempt_not_a_decision(self):
+        # An empty/garbage reply is a failed ATTEMPT (retry it), never an
+        # assessment: no `triage` block is stamped, and the attempt count is
+        # what arms the backoff.
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        with self._configured(), self._fake_popen("I could not determine this."):
+            sm._start_ticket_triage()
+            sm._poll_ticket_triage()
+        self.assertNotIn("triage", sm.jira["tickets"][0])
+        entry = sm.ticket_triage_ledger[ha._triage_key("s.atlassian.net", "ENG-1")]
+        self.assertEqual(entry["attempts"], 1)
+        self.assertNotIn("decided", entry)
+
+    def test_out_of_band_reply_from_the_model_never_freezes_a_value(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        bad = self._assessment(priority="P9")
+        with self._configured(), self._fake_popen(json.dumps({"ENG-1": bad})):
+            sm._start_ticket_triage()
+            sm._poll_ticket_triage()
+        self.assertNotIn("triage", sm.jira["tickets"][0])
+        entry = sm.ticket_triage_ledger[ha._triage_key("s.atlassian.net", "ENG-1")]
+        self.assertEqual(entry["attempts"], 1)
+
+    def test_manual_pin_is_never_retriaged(self):
+        # An operator's own assessment outranks the model: no re-triage, no
+        # attempt spent — the same posture a hand-typed session rename takes
+        # against the auto-summarizer.
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        sm.ticket_triage_ledger[ha._triage_key("s.atlassian.net", "ENG-1")] = {
+            "manual": True, "decided": True, "priority": "P2",
+            "source": "manual", "at": "2026-08-01T00:00:00Z",
+            "ticketFp": ha._ticket_fingerprint({"key": "ENG-1", "summary": "x"}),
+        }
+        with self._configured(), self._fake_popen("{}"):
+            sm._start_ticket_triage()
+        self.assertEqual(self.popen_calls, [])
+
+    def test_batch_is_bounded_and_one_job_runs_at_a_time(self):
+        tickets = [{"key": f"ENG-{i}", "summary": f"t{i}"} for i in range(60)]
+        sm = self._manager(tickets)
+        with self._configured(), self._fake_popen(None):
+            sm._start_ticket_triage()
+            sm._start_ticket_triage()   # a job is in flight; must not fork another
+        self.assertEqual(len(self.popen_calls), 1)
+        self.assertEqual(len(sm.ticket_triage_job["batch"]), ha.JIRA_TRIAGE_BATCH)
+
+    def test_backoff_spaces_the_retries(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        with self._configured(), self._fake_popen("garbage"):
+            sm._start_ticket_triage()
+            sm._poll_ticket_triage()
+            self.popen_calls.clear()
+            sm._start_ticket_triage()   # immediately after: still inside the backoff
+        self.assertEqual(self.popen_calls, [])
+
+    def test_a_backlog_drains_over_later_beats(self):
+        tickets = [{"key": f"ENG-{i}", "summary": f"t{i}"} for i in range(60)]
+        sm = self._manager(tickets)
+        for _ in range(3):
+            reply = json.dumps({t["key"]: self._assessment() for t in tickets})
+            with self._configured(), self._fake_popen(reply):
+                sm._start_ticket_triage()
+                sm._poll_ticket_triage()
+        seen = {t.get("triage", {}).get("priority") for t in sm.jira["tickets"]}
+        self.assertEqual(seen, {"P1"})   # all 60 assessed in 3 batches of 25
+
+    def test_unanswered_ticket_retries_then_gives_up(self):
+        # The bounded-retry budget is armed up-front in the ledger: a ticket the
+        # model keeps failing on is retried JIRA_TRIAGE_MAX_ATTEMPTS times, no
+        # more — the counter is persisted, so a restart mid-batch neither loops
+        # nor loses the remaining retries.
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        for i in range(ha.JIRA_TRIAGE_MAX_ATTEMPTS + 2):
+            with self._configured(), self._fake_popen("garbage"), \
+                 mock.patch.object(ha.time, "time", return_value=1e9 + i * 1e6):
+                sm._start_ticket_triage()
+                sm._poll_ticket_triage()
+        self.assertEqual(len(self.popen_calls), ha.JIRA_TRIAGE_MAX_ATTEMPTS)
+        self.assertNotIn("triage", sm.jira["tickets"][0])
+
+    def test_timeout_kills_the_job_and_frees_the_slot(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        with self._configured(), self._fake_popen(None, rc=None):
+            sm._start_ticket_triage()
+            sm.ticket_triage_job["startedMono"] -= ha.JIRA_TRIAGE_TIMEOUT_SEC + 1
+            sm._poll_ticket_triage()
+        self.assertIsNone(sm.ticket_triage_job)
+
+    def test_unconfigured_host_never_triages(self):
+        sm = self.make_manager()
+        sm.jira = {**ha.JIRA_EMPTY, "available": True, "configured": True,
+                   "siteKey": "s.atlassian.net",
+                   "tickets": [{"key": "ENG-1", "summary": "x"}]}
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN=""), \
+             self._fake_popen("{}"):
+            sm._start_ticket_triage()
+        self.assertEqual(self.popen_calls, [])
+        self.assertIsNone(sm.ticket_triage_job)
 
 
 class TestSetJiraRepo(ManagerMixin, unittest.TestCase):
