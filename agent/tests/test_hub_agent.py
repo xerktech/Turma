@@ -8391,12 +8391,15 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
         args = popen.call_args[0][0]
         self.assertIn("macOptionClickForcesSelection=true", args)
 
-    def test_launch_ttyd_uses_the_dom_renderer(self):
-        # The canvas renderer left after-images on the TUI's full alt-screen
-        # repaints and jittered on the Nerd Font's fractional cell width (the
-        # qwen TUI's box-drawing + input box read garbled), so the ttyd flag is
-        # pinned to the DOM renderer — the same way the Mac selection option is
-        # pinned above, so a revert to canvas is a visible test failure.
+    def test_launch_ttyd_uses_the_webgl_renderer(self):
+        # Canvas left after-images on the TUI's full alt-screen repaints, and
+        # the DOM renderer (one span per cell) flickered on every streamed line
+        # of the busy qwen TUI. WebGL is ttyd's own default — GPU-blitted and
+        # subpixel-accurate — and the Nerd Font's 0.6em advance means fontSize
+        # must be 15 so the cell is an integer 9.0px (14px gives 8.4px, and
+        # fractional cells shimmer/drift box-drawing in every renderer).
+        # Pinned the same way the Mac selection option is above, so a revert is
+        # a visible test failure.
         sm = self.make_manager()
         sess = self._running_sess()
 
@@ -8409,8 +8412,10 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
              mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()) as popen:
             sm._launch_ttyd(sess)
         args = popen.call_args[0][0]
-        self.assertIn("rendererType=dom", args)
+        self.assertIn("rendererType=webgl", args)
         self.assertNotIn("rendererType=canvas", args)
+        self.assertNotIn("rendererType=dom", args)
+        self.assertIn("fontSize=15", args)
 
     def test_kill_ttyd_reaps_adopted_orphan_by_pid(self):
         # An adopted ttyd isn't in self.ttyd; _kill_ttyd must still reap it via
