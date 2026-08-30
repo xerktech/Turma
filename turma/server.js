@@ -7037,11 +7037,19 @@ function sendPage(req, res, page) {
 // proxyTerm() injects the matching @font-face. A Nerd Font gives the TUI full
 // Unicode + icon coverage regardless of what fonts the viewer's machine has.
 const TERM_FONT = fs.readFileSync(path.join(__dirname, "public", "jbm-nerd-mono.woff2"));
-// <style> injected into ttyd's HTML document defining that font as 'JBMNerd' —
-// the family name the agent points ttyd's fontFamily at.
+// <link preload> + <style> injected into ttyd's HTML document defining that
+// font as 'JBMNerd' — the family name the agent points ttyd's fontFamily at.
+// The preload + `font-display:block` matter: ttyd's inline bundle creates the
+// xterm.js terminal synchronously at end-of-body, so with `swap` the 1 MB font
+// often had not landed when xterm measured the cell width — it measured the
+// fallback, and the late Nerd-Font swap misaligned the box-drawing (the qwen
+// TUI's text box read garbled). `block` waits on the font, so the first
+// measure already runs on the real metrics.
 const TERM_FONT_STYLE =
+  "<link rel='preload' as='font' type='font/woff2' crossorigin " +
+  "href='/term-font.woff2'>" +
   "<style>@font-face{font-family:'JBMNerd';" +
-  "src:url('/term-font.woff2') format('woff2');font-display:swap;}</style>";
+  "src:url('/term-font.woff2') format('woff2');font-display:block;}</style>";
 
 // Touch-scroll shim injected into ttyd's page for phones. The Claude TUI owns
 // the alternate screen buffer, so xterm.js has no scrollable viewport — it only

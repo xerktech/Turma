@@ -8381,6 +8381,27 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
         args = popen.call_args[0][0]
         self.assertIn("macOptionClickForcesSelection=true", args)
 
+    def test_launch_ttyd_uses_the_dom_renderer(self):
+        # The canvas renderer left after-images on the TUI's full alt-screen
+        # repaints and jittered on the Nerd Font's fractional cell width (the
+        # qwen TUI's box-drawing + input box read garbled), so the ttyd flag is
+        # pinned to the DOM renderer — the same way the Mac selection option is
+        # pinned above, so a revert to canvas is a visible test failure.
+        sm = self.make_manager()
+        sess = self._running_sess()
+
+        class FakeProc:
+            pid = 4244
+            def poll(self_i):
+                return None
+
+        with mock.patch.object(ha, "_port_open", return_value=False), \
+             mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()) as popen:
+            sm._launch_ttyd(sess)
+        args = popen.call_args[0][0]
+        self.assertIn("rendererType=dom", args)
+        self.assertNotIn("rendererType=canvas", args)
+
     def test_kill_ttyd_reaps_adopted_orphan_by_pid(self):
         # An adopted ttyd isn't in self.ttyd; _kill_ttyd must still reap it via
         # the persisted pid so stop/delete don't leak the process and its port.
