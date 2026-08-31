@@ -7351,13 +7351,14 @@ const TERM_OSC52_CLIPBOARD = "<script>" + TERM_OSC52_JS + "</script>";
 // whole scroll by hand. This adds a floating pill that drives qwen's own scroll
 // to the bottom by dispatching wheel-DOWN events on the .xterm element: the same
 // primitive TERM_TOUCH_SCROLL already uses, and the same gesture the operator
-// scrolls qwen with today, so it needs no knowledge of qwen's internal key map
-// and works whether xterm forwards the wheel as mouse events or translates it to
-// arrow keys. It repeats bursts until the visible screen stops changing (qwen
-// clamps at the bottom). While a turn is STREAMING its footer animates every
-// frame, which would never "settle" — so during an active turn (detected from
-// the busy footer) it stops after a tight cap and lets qwen finish following the
-// tail itself, rather than spinning to the idle safety cap.
+// scrolls qwen with today, so it needs no knowledge of qwen's internal key map.
+// qwen keeps SGR mouse tracking ON (verified end-to-end), so the wheel events
+// reach it as real mouse-wheel reports and it scrolls its own region — no
+// dependence on xterm's wheel→arrow fallback. It repeats bursts until the screen
+// stays unchanged for a few consecutive polls (qwen clamps at the tail). While a
+// turn is STREAMING its footer animates every frame and never "settles", so an
+// active turn (detected from the busy footer) stops at a tight cap; qwen snaps to
+// the tail on turn completion regardless.
 //
 // Gated to qwen SERVER-SIDE in proxyTerm, so Claude's composer never takes a
 // stray Down-arrow from a control it has no use for. window.term is ttyd's own
@@ -7372,17 +7373,25 @@ const TERM_SCROLL_BOTTOM_STYLE =
 // Bare JS (exported for the sandbox test), embedded in TERM_SCROLL_BOTTOM below.
 const TERM_SCROLL_BOTTOM_JS =
   "(function(){" +
-  // BURST wheel-downs per pass; TAIL rows excluded from the change test (the
-  // spinner/composer footer); MAX bounds the arrow-keys sent to qwen when the
-  // change test can't settle (e.g. mid-stream), where qwen auto-follows anyway.
-  // BURST wheel-downs per pass. MAX bounds the IDLE case (stops the moment the
-  // screen settles, so it's only a safety net). ACTIVE_MAX is the much tighter
-  // bound while a turn is streaming: qwen auto-follows the tail during a turn, so
-  // a couple of nudges is all it takes — and its footer (spinner/thinking line)
-  // animates every frame regardless of scroll, which would otherwise defeat the
-  // "screen settled" test and spin to MAX (a real bug QA caught: those lines sit
-  // 6-8 rows above the bottom, inside any small TAIL window).
-  "var STEP=40,BURST=8,TAIL=3,MAX=800,ACTIVE_MAX=64,busy=false,btn=null;" +
+  // BURST wheel-downs per pass. The loop stops when the screen has been UNCHANGED
+  // for STABLE consecutive passes (qwen has clamped at the tail) or a cap is hit.
+  // Requiring STABLE consecutive reads — not a single one — is what survives a
+  // repaint that lands after the poll: the pane is redrawn by bytes making a full
+  // round trip (browser→tunnel→ttyd→qwen and back), so one poll can read the
+  // pre-scroll frame and look "settled" when it isn't (a real ~1/10 stop-short QA
+  // caught, worse over the tunnel). A late frame just resets the counter.
+  // DELAY is comfortably above a typical round trip for the same reason.
+  // MAX is the idle safety net (never reached in practice — an idle scroll settles
+  // as soon as it clamps). ACTIVE_MAX is the tight bound while a turn STREAMS:
+  // qwen does NOT auto-follow mid-stream — it pins the viewport to the TOP of the
+  // new output and only snaps to the tail at turn COMPLETION — and its footer
+  // animates every frame, so the settle test never trips during a turn. The cap
+  // stops us dead rather than spinning to MAX; completion then lands the operator
+  // at the tail anyway. (If a future qwen renders more than one screenful
+  // mid-stream, this cap could stop short of the current bottom — acceptable, and
+  // flagged here so the next change doesn't assume auto-follow.)
+  "var STEP=40,BURST=8,TAIL=3,STABLE=3,DELAY=120,MAX=800,ACTIVE_MAX=64," +
+  "busy=false,btn=null,sawActive=false;" +
   "function xterm(){return document.querySelector('.xterm');}" +
   // The visible screen rows as an array. In qwen's alt buffer viewportY is 0 and
   // getLine walks the on-screen rows; when the pane scrolls these change, and
@@ -7395,23 +7404,24 @@ const TERM_SCROLL_BOTTOM_JS =
   // part of the settle test.
   "function snap(){var r=rows();return r?r.slice(0,r.length-TAIL).join('\\n'):null;}" +
   // Is a turn streaming? qwen's busy footer carries these (a subset of the agent's
-  // QWEN_PANE_BUSY_MARKERS); if they ever drift we simply fall back to the MAX/
-  // ACTIVE_MAX bounds rather than misbehaving.
+  // QWEN_PANE_BUSY_MARKERS); if they ever drift we simply fall back to the MAX
+  // bound rather than misbehaving.
   "function active(){var r=rows();if(!r)return false;" +
   "return /esc to cancel|Enter to steer|Ctrl\\+Q to queue/.test(r.join('\\n'));}" +
   "function wheelDown(n){var t=xterm();if(!t)return;for(var i=0;i<n;i++){" +
   "t.dispatchEvent(new WheelEvent('wheel',{deltaY:STEP,deltaMode:0," +
   "bubbles:true,cancelable:true}));}}" +
-  "function toBottom(){if(busy)return;busy=true;var sent=0;" +
+  "function toBottom(){if(busy)return;busy=true;sawActive=false;var sent=0,stable=0;" +
   "(function pass(){var before=snap();wheelDown(BURST);sent+=BURST;" +
   "setTimeout(function(){var after=snap();" +
-  // Continue only while: under the idle cap, the terminal is ready, the screen is
-  // still moving, AND we haven't hit the tighter cap during a streaming turn
-  // (where qwen finishes the follow itself). A null snap also stops rather than
-  // spins.
-  "var cap=active()?ACTIVE_MAX:MAX;" +
-  "if(sent<cap&&before!==null&&after!==null&&after!==before){pass();}" +
-  "else{busy=false;hide();}},45);})();}" +
+  // A null snap (term not ready) bails rather than spins.
+  "if(before===null||after===null){busy=false;hide();return;}" +
+  // sawActive is STICKY: once a streaming turn is seen, keep the tight cap even if
+  // active() flickers false on a later poll (its footer read is momentary).
+  "if(active())sawActive=true;var cap=sawActive?ACTIVE_MAX:MAX;" +
+  "if(after===before)stable++;else stable=0;" +
+  "if(sent<cap&&stable<STABLE){pass();}else{busy=false;hide();}" +
+  "},DELAY);})();}" +
   "function show(){if(btn)btn.style.display='flex';}" +
   "function hide(){if(btn)btn.style.display='none';}" +
   "function wire(){btn=document.createElement('button');btn.id='turmaToBottom';" +

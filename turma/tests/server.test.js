@@ -554,21 +554,37 @@ test("OSC 52 bridge survives a malformed payload", () => {
 // maxScroll so an over-scroll is a no-op, exactly as the real TUI clamps.
 // `animate` models qwen's real busy footer: a "esc to cancel" line 6 rows above
 // the bottom (INSIDE the compare region) whose token changes every wheel event,
-// exactly as QA found in docs/qwen-g0/pane/02-busy.txt — the case that made the
-// old fixed-TAIL settle test spin to the cap.
-function runScrollBottom({ maxScroll = 5, rows = 24, startAt = 0, withTerm = true, animate = false } = {}) {
+// exactly as QA found in docs/qwen-g0/pane/02-busy.txt.
+// `stallAtCall` models a late repaint (QA's ~1/10 stop-short): on that Nth full
+// screen read, the fake returns the PREVIOUS frame's content — as if the scroll's
+// redraw hadn't landed by the poll — so that one `after` read equals its `before`
+// even though the pane is still mid-scroll. Reads are counted per screen scan
+// (each starts at row 0): pass K does before(2K-1... actually before/after/active),
+// so callers target the read they want to stall.
+function runScrollBottom({ maxScroll = 5, rows = 24, startAt = 0, withTerm = true, animate = false, stallAtCall = 0 } = {}) {
   let scrollPos = startAt, frame = 0;
+  let cycle = 0, useScroll = startAt, lastCycleScroll = startAt;
   const wheelDeltas = [];
   const timers = [];
   let clickHandler = null, globalWheel = null, appended = null;
+  function beginCycle() {
+    cycle++;
+    if (stallAtCall && cycle === stallAtCall) {
+      useScroll = lastCycleScroll; // stale: repeat the previous frame's content
+    } else {
+      useScroll = scrollPos;
+      lastCycleScroll = scrollPos;
+    }
+  }
   const term = {
     rows,
     buffer: { active: {
       viewportY: 0,
-      getLine: (i) => ({ translateToString: () => (
-        animate && i === rows - 6 ? "working… esc to cancel (" + frame + " tokens)"
-          : "row" + (scrollPos + i)
-      ) }),
+      getLine: (i) => ({ translateToString: () => {
+        if (i === 0) beginCycle();
+        return animate && i === rows - 6 ? "working… esc to cancel (" + frame + " tokens)"
+          : "row" + (useScroll + i);
+      } }),
     } },
   };
   const xterm = {
@@ -624,10 +640,21 @@ test("scroll-to-bottom: clicking drives qwen's scroll to the tail with wheel-DOW
   assert.equal(t.scrollPos(), 20, "reaches the bottom (clamped at maxScroll)");
   assert.ok(t.wheelDeltas.length >= 24, "took multiple bursts to get there");
   assert.ok(t.wheelDeltas.every((d) => d > 0), "every dispatched wheel is DOWN — never up");
-  // Stops the first pass the screen no longer changes, so it never approaches the
-  // MAX safety cap on an ordinary idle scroll.
-  assert.ok(t.wheelDeltas.length <= 40, "settles once clamped rather than spinning to the cap");
+  // Settles a few passes after clamping (STABLE consecutive unchanged reads), well
+  // short of the MAX safety cap on an ordinary idle scroll.
+  assert.ok(t.wheelDeltas.length <= 64, "settles once clamped rather than spinning to the cap");
   assert.equal(t.button.style.display, "none", "hides itself once it clamps at the bottom");
+});
+
+test("scroll-to-bottom: a single late-landing repaint frame does not stop it short", () => {
+  // QA's ~1/10 stop-short: a burst's redraw lands after the poll, so one `after`
+  // read equals its `before` though the pane is still mid-scroll. Requiring STABLE
+  // consecutive unchanged reads absorbs it — the loop must still reach the tail.
+  // (With the old single-read stop condition this would quit at scroll ~8.)
+  const t = runScrollBottom({ maxScroll: 40, startAt: 0, stallAtCall: 2 });
+  t.click();
+  t.drain();
+  assert.equal(t.scrollPos(), 40, "reaches the tail despite one stale repaint frame");
 });
 
 test("scroll-to-bottom: an active streaming turn stops at the tight cap, not the runaway MAX", () => {

@@ -243,10 +243,15 @@ the total is measured.
   TUI keeps an IN-APP scroll region with its own scrollbar (the glyph column `_PANE_SCROLLBAR_RE`
   strips), which a scroll-up leaves parked above the tail. The pill drives qwen's own scroll down by
   dispatching wheel-DOWN events on `.xterm` (the SAME primitive `TERM_TOUCH_SCROLL` uses, and the
-  gesture the operator scrolls qwen with — so it needs no knowledge of qwen's key map), repeating
-  until the visible screen stops changing (qwen clamps). **A STREAMING turn's footer animates every
-  frame and never "settles", so during an active turn (detected from the busy footer) it stops at a
-  tight cap and lets qwen auto-follow the tail — without that it spins to the idle safety cap.**
+  gesture the operator scrolls qwen with — so it needs no knowledge of qwen's key map). qwen keeps
+  **SGR mouse tracking on** (verified end-to-end in a real browser), so the wheel events reach it as
+  real mouse reports and it scrolls its own region. It repeats bursts until the screen is unchanged
+  for **STABLE consecutive polls** — a single read is not enough, because a redraw makes a full
+  browser↔tunnel↔qwen round trip and one poll can catch the pre-scroll frame and look "settled"
+  when it isn't (a ~1/10 stop-short, worse over the tunnel). **A STREAMING turn's footer animates
+  every frame so the settle test never trips; an active turn (busy-footer regex) stops at a tight
+  cap. qwen does NOT auto-follow mid-stream** — it pins to the TOP of new output and snaps to the
+  tail only at turn COMPLETION, which is why stopping early there is safe.
   **Gated by `agentType` server-side**
   (`findSession` carries it), never client-side, so Claude's composer never takes a stray Down-arrow.
 - **Android's `TerminalScreen` loads the same `/term/<id>/` in a WebView**, so this injection reaches
