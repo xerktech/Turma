@@ -611,6 +611,10 @@ class TestSpawnOptionHelpers(unittest.TestCase):
         # that missing piece at launch, so it must not advertise qwen).
         import tempfile
         files = ("qwen_session.py", "qwen_transcript.py",
+                 # The shared runtime siblings qwen_transcript/qwen_session import
+                 # (XERK-528) — a host with the qwen files but not these runs the
+                 # projector as None (dark chat), so the gate must require them too.
+                 "runtime_projection.py", "runtime_tail.py",
                  os.path.join("qwen", "ask_mcp.py"),
                  os.path.join("qwen", "peer_mcp.py"),
                  os.path.join("qwen", "peer_inbox.py"),

@@ -2028,6 +2028,17 @@ def qwen_runtime_present():
     restart, and one that somehow loses them stops."""
     base = os.path.dirname(os.path.abspath(__file__))
     needed = ("qwen_session.py", "qwen_transcript.py",
+              # The shared runtime scaffolding qwen_transcript/qwen_session IMPORT
+              # (XERK-528): a host with the qwen files but not these two runs
+              # `import qwen_session` into `except ImportError: QwenProjector =
+              # None`, and every qwen tail then no-ops — the chat/history/PR/usage
+              # surfaces read a blank transcript while the ttyd TUI stays live.
+              # They were added as required siblings AFTER this gate first shipped
+              # (XERK-523), and the self-updater lays them down CONDITIONALLY, so a
+              # payload that omits them (v1.1.62 did) leaves a host dark and silent.
+              # Gating on them makes such a host DEGRADE (hide + cleanly refuse
+              # qwen) and self-heal when they land, the same as the qwen files.
+              "runtime_projection.py", "runtime_tail.py",
               os.path.join("qwen", "ask_mcp.py"),
               os.path.join("qwen", "peer_mcp.py"),
               os.path.join("qwen", "peer_inbox.py"),
