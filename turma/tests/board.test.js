@@ -13,6 +13,7 @@ const {
   cardHtml, boardHtml, detailHtml, textHtml, linkify,
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
+  dedupeChipHtml, dedupeTwinUrl,
   agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
   modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
   runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
@@ -970,6 +971,88 @@ test("repoPickerValue: agrees with what the picker preselects", () => {
     assert.ok(selected, `nothing preselected for ${JSON.stringify(g)}`);
     assert.equal(selected[1], repoPickerValue(t));
   }
+});
+
+// ---- likely-duplicate chip (XERK-484) ---------------------------------------
+// The classifier flags a ticket as a duplicate of another one (triage.dedupeOf,
+// rides the heartbeat ticket only). The card shows a chip linking to the twin;
+// the detail panel spells it out as a field. No flag -> nothing renders.
+
+test("dedupeChipHtml: no flag, no chip", () => {
+  assert.equal(dedupeChipHtml(ticket("X-1")), "");
+  assert.equal(dedupeChipHtml(ticket("X-1", { triage: {} })), "");
+  assert.equal(dedupeChipHtml(ticket("X-1", { triage: { dedupeOf: "" } }),
+    { siteKey: "s", source: "jira" }), "");
+  assert.equal(dedupeChipHtml({}, { siteKey: "s" }), "");
+  assert.equal(dedupeChipHtml(null, { siteKey: "s" }), "");
+});
+
+test("dedupeChipHtml: the chip links to the twin's own board URL when present", () => {
+  const site = { siteKey: "myorg.atlassian.net", source: "jira", tickets: [
+    ticket("X-1", { triage: { dedupeOf: "X-2" } }),
+    ticket("X-2", { url: "https://myorg.atlassian.net/browse/X-2?mode=comment" }),
+  ]};
+  const html = dedupeChipHtml(site.tickets[0], site);
+  assert.ok(html.includes("kc-dup"));
+  assert.ok(html.includes("dup of X-2"));
+  assert.ok(html.includes('href="https://myorg.atlassian.net/browse/X-2?mode=comment"'));
+  assert.ok(html.includes('title="Flagged as a duplicate of X-2"'));
+});
+
+test("dedupeTwinUrl: twin absent from the board -> rebuilt tracker URL", () => {
+  const t = ticket("X-1", { triage: { dedupeOf: "X-2" } });
+  assert.equal(dedupeTwinUrl(t, { siteKey: "myorg.atlassian.net", source: "jira", tickets: [] }),
+    "https://myorg.atlassian.net/browse/X-2");
+  // Azure twins get the work-items URL shape.
+  assert.equal(dedupeTwinUrl(t, { siteKey: "myorg.visualstudio.com", source: "azure", tickets: [] }),
+    "https://myorg.visualstudio.com/_workitems/edit/X-2");
+  // Without a site to rebuild from there is no URL to link.
+  assert.equal(dedupeTwinUrl(t, null), "");
+  assert.equal(dedupeTwinUrl(t, {}), "");
+});
+
+test("cardHtml: the dup chip rides the card, before the org chip", () => {
+  const site = { siteKey: "myorg.atlassian.net", source: "jira", tickets: [] };
+  const html = cardHtml(ticket("X-1", { triage: { dedupeOf: "X-2" } }), site, {});
+  assert.ok(html.includes("kc-dup"));
+  assert.ok(html.includes("dup of X-2"));
+  // kc-org is margin-left:auto, so anything after it would be pushed off the
+  // right edge of the meta row.
+  assert.ok(html.indexOf("kc-dup") < html.indexOf("kc-org"));
+});
+
+test("cardHtml: an unflagged card gets no dup chip", () => {
+  const site = { siteKey: "s", source: "jira", tickets: [] };
+  assert.ok(!cardHtml(ticket("X-1"), site, {}).includes("kc-dup"));
+});
+
+test("detailHtml: the Duplicate-of row links the twin and carries the rationale", () => {
+  const site = { siteKey: "myorg.atlassian.net", source: "jira", tickets: [] };
+  const html = detailHtml(ticket("X-1", { triage: { dedupeOf: "X-2", reason: "same crash trace" } }),
+    null, { siteKey: "myorg.atlassian.net", site });
+  assert.ok(html.includes("Duplicate of"));
+  assert.ok(html.includes('href="https://myorg.atlassian.net/browse/X-2"'));
+  assert.ok(html.includes("same crash trace"));
+  assert.ok(html.includes("td-dim"));
+});
+
+test("detailHtml: an unflagged ticket gets no Duplicate-of row", () => {
+  // fieldRow drops empty rows, so an unflagged ticket shows nothing at all —
+  // same convention as Parent.
+  const html = detailHtml(ticket("X-1"), null,
+    { siteKey: "myorg.atlassian.net", site: { siteKey: "myorg.atlassian.net", source: "jira", tickets: [] } });
+  assert.ok(!html.includes("Duplicate of"));
+  assert.ok(!html.includes("dup of"));
+  assert.ok(!html.includes("browse/X-2"));
+});
+
+test("dedupeChipHtml: a hostile twin key is escaped", () => {
+  // dedupeOf rides the heartbeat, so the chip must not be the only thing
+  // standing between a compromised payload and script execution.
+  const t = ticket("X-1", { triage: { dedupeOf: '<img src=x onerror=alert(1)>' } });
+  const html = dedupeChipHtml(t, { siteKey: "myorg.atlassian.net", source: "jira", tickets: [] });
+  assert.ok(!html.includes("<img"));
+  assert.ok(!html.includes("<script"));
 });
 
 // ---- ticket -> agent pin (XERK-38): the detail panel's Agent row ------------

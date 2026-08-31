@@ -78,6 +78,16 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   chip, listed-only = **dashed**, declined = muted italic **"no repo"**; no guess yet = **no chip**.
   Detail: tooltip + panel's Repo row (`repoFieldHtml`, reads `t.repoGuess` directly).
 - `.kc-repo` ellipsises on its own element (flex content can't be clipped by a parent).
+- **Likely-duplicate chip** (XERK-484): a ticket the classifier flagged carries a warning-tinted
+  `kc-dup` chip ("dup of <twin>") linking to the twin — `dedupeTwinUrl` prefers the twin's own
+  board row when it is on this board, else rebuilds the tracker URL from the site's
+  source+siteKey (Jira `/browse/<key>`, ADO `/_workitems/edit/<key>`); the panel's **Duplicate of**
+  row (`detailHtml`, fed the site via `paintDetail`'s opts) spells it out with the classifier's
+  rationale dimmed. `triage.dedupeOf` rides the **heartbeat ticket only** (the on-demand fetch
+  comes straight from the tracker, which knows nothing of triage), so it is read off `t` directly,
+  like `repoGuess`. No flag → no chip, no row. The hub's per-org sweep that queues the
+  `createDuplicateLink` command to the Jira host is documented in
+  `.claude/rules/agent-board.md` ("Writing back to the board").
 
 ### Starting a session on a ticket
 

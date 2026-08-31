@@ -661,6 +661,10 @@ those are marked `[MODEL]`.
 - P1 Repo picker: cloned/not-cloned optgroups, "Currently set" orphan, `nameWithOwner`, save-error.
 - P1 Agent picker (XERK-38, shipped): inline save-error on the row (Android toasts like the repo
   picker's; the web paints "Couldn't save" on the row itself).
+- P2 Likely-duplicate chip (XERK-484): the web card's `kc-dup` chip (links to the `triage.dedupeOf`
+  twin) and the detail panel's "Duplicate of" row — not ported to Android yet; `TicketTriage`
+  already decodes `dedupeOf`, so only the chip + row need drawing (the Jira Duplicate link itself is
+  hub/agent-side, not a client surface).
 - P2 Mobile scroll-snapping columns with peek; deep-link (`?ticket=&site=`); refresh outcome/landing.
 - P3 Card org-chip placement; empty-column + truncation notes. (The org chips themselves are gone —
   XERK-62 — and their "offline · synced N ago" note now rides the header control's org rows.)

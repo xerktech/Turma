@@ -81,6 +81,18 @@
   border: 0; background: none; padding: 0; color: var(--muted);
   font-style: italic; font-family: var(--font-sans);
 }
+/* Likely-duplicate chip (XERK-484). Same chip metrics as .kc-repo; the warning
+   tint marks a ticket the classifier considers a duplicate, and the link target
+   is the twin ticket it duplicates. */
+.kc-dup {
+  display: inline-block; vertical-align: middle;
+  padding: 1px 7px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--page);
+  color: var(--warning); font-family: var(--font-mono); font-size: 10.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 15ch;
+}
+.kc-dup a { color: inherit; text-decoration: none; }
 /* Start-a-session-on-this-ticket, and the sessions it started. Both sit in
    .kc-meta between the repo chip and the org, i.e. before the margin-left:auto
    that pins .kc-org right. */

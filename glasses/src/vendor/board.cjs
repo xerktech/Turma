@@ -438,6 +438,28 @@
     return `<span class="${cls}" title="${esc(tip || g.repo)}">${esc(g.repo)}</span>`;
   }
 
+  // A likely-duplicate chip (XERK-484): shown when the classifier flagged this
+  // ticket as a duplicate of another (triage.dedupeOf). Links to the twin so the
+  // operator can jump to the other ticket. No triage.dedupeOf -> no chip.
+  // The twin's URL comes from its own board row when it is on this board; when
+  // the twin isn't polled (or left the board) the tracker URL is rebuilt from
+  // the site's source and siteKey, exactly the way the agent builds ticket URLs.
+  function dedupeTwinUrl(t, site) {
+    const twin = t && t.triage && t.triage.dedupeOf;
+    if (!twin) return "";
+    const tw = (site && site.tickets || []).find((x) => x && x.key === twin);
+    if (tw && tw.url) return tw.url;
+    if (!site || !site.siteKey) return "";
+    return site.source === "azure"
+      ? `https://${site.siteKey}/_workitems/edit/${twin}`
+      : `https://${site.siteKey}/browse/${twin}`;
+  }
+  function dedupeChipHtml(t, site) {
+    const twin = t && t.triage && t.triage.dedupeOf;
+    if (!twin) return "";
+    return `<span class="kc-dup"><a href="${safeUrl(dedupeTwinUrl(t, site))}" target="_blank" rel="noopener" title="Flagged as a duplicate of ${esc(twin)}">dup of ${esc(twin)}</a></span>`;
+  }
+
   // --- ticket -> session link ----------------------------------------------
   // The agent stamps the ticket onto the session record it spawns (session.ticket
   // = {key, siteKey, url, summary, branch}); this indexes the fleet payload the
@@ -694,6 +716,10 @@
     }
     const repo = repoChipHtml(t);
     if (repo) bits.push(repo);
+    // A likely duplicate (XERK-484) links to its twin — the card's one pointer
+    // at the other ticket; the detail view spells it out as a field.
+    const dup = dedupeChipHtml(t, site);
+    if (dup) bits.push(dup);
     const start = ticketStartHtml(t, o.sessions, o.start, o.queued);
     if (start) bits.push(start);
     // A drag in flight / just landed (XERK-141) shows a "moving…" chip; a failed
@@ -1241,6 +1267,15 @@
       fieldRow("Parent", v("parentKey")
         ? esc(v("parentKey")) + (d.parentSummary ? ` <span class="td-dim">${esc(d.parentSummary)}</span>` : "")
         : ""),
+      // Likely duplicate (XERK-484): triage.dedupeOf rides the heartbeat ticket
+      // only (the on-demand fetch comes straight from the tracker, which knows
+      // nothing of triage), so read `t` directly like Repo does. Links to the
+      // twin; the classifier's rationale rides dimmed, as it does on the chip.
+      fieldRow("Duplicate of",
+        t.triage && t.triage.dedupeOf
+          ? `<a href="${safeUrl(dedupeTwinUrl(t, o.site))}" target="_blank" rel="noopener">${esc(t.triage.dedupeOf)}</a>`
+              + (t.triage.reason ? ` <span class="td-dim">${esc(t.triage.reason)}</span>` : "")
+          : ""),
       fieldRow("Created", v("created") ? esc(fmtDate(v("created"))) : ""),
       fieldRow("Updated", v("updated") ? esc(fmtDate(v("updated"))) : ""),
       fieldRow("Due", v("dueDate")
@@ -1573,6 +1608,7 @@
     createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
+    dedupeChipHtml, dedupeTwinUrl,
     agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
     modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
     runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,

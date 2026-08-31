@@ -11951,6 +11951,18 @@ TICKET_TRIAGE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-triage.json")
 # human's and is never touched. Bounded by PRIORITY_WRITE_LEDGER_MAX.
 PRIORITY_WRITE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-priority-writes.json")
 PRIORITY_WRITE_LEDGER_MAX = 500
+# XERK-484: durable record of issue pairs THIS host has linked as duplicates,
+# {siteKey/issueKey: twinKey}. The live GET-links read is the real idempotency
+# source; this ledger only tells "I linked it and a human later removed it"
+# (sticky: don't relink a reversal) apart from "never linked". Bounded like
+# PRIORITY_WRITE_LEDGER_MAX — losing a record can only make the sweep
+# re-attempt (where the live read no-ops), never relink.
+DUPLICATE_LINK_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-duplicate-links.json")
+DUPLICATE_LINK_LEDGER_MAX = 500
+# The Jira issue-link type name a duplicate link uses. Must exist in the org's
+# link types, else createIssueLink 400s and the tracker's own refusal is
+# staged on the result.
+JIRA_DUPLICATE_LINK_TYPE = "Duplicate"
 # Fixed enums the model must pick from; anything else is a failed attempt.
 TRIAGE_TYPES = ("bug", "feature", "task", "chore", "improvement",
                 "documentation", "other")
@@ -12954,6 +12966,12 @@ class SessionManager:
         # (XERK-483): what the host may correct on re-triage, as opposed to a
         # value a human set, which is left alone.
         self.priority_writes = self._load_priority_writes()
+        # Durable record of issue pairs THIS host has linked as duplicates
+        # (XERK-484): {siteKey/issueKey: twinKey}. Lets the linker tell "linked
+        # and since reversed by a human" (sticky no-op) apart from "never
+        # linked" (link it). Same staging lifecycle as ticket_priority_results.
+        self.duplicate_links = self._load_duplicate_links()
+        self.ticket_link_results = []
         # Durable transcript -> ticket attribution (persisted). Keeps the board's
         # ticket chips answerable after the session record behind them is gone —
         # killed, aged out of closed.json, or never in either. Backfilled from the
@@ -13360,6 +13378,40 @@ class SessionManager:
         except OSError as e:
             log(f"priority write ledger save failed: {e}")
 
+    def _load_duplicate_links(self):
+        try:
+            with open(DUPLICATE_LINK_LEDGER_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_duplicate_links(self):
+        """Persist the host's own duplicate links (XERK-484). Updated keys are
+        re-inserted (moved to the tail), so at the cap the oldest entries are
+        the ones dropped — losing a record can only make the linker re-attempt
+        (where the live links read no-ops), never relink over a human's
+        reversal."""
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            while len(self.duplicate_links) > DUPLICATE_LINK_LEDGER_MAX:
+                self.duplicate_links.pop(next(iter(self.duplicate_links)))
+            tmp = DUPLICATE_LINK_LEDGER_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.duplicate_links, f, indent=2)
+            os.replace(tmp, DUPLICATE_LINK_LEDGER_PATH)
+        except OSError as e:
+            log(f"duplicate link ledger save failed: {e}")
+
+    def _record_duplicate_link(self, lkey, twin):
+        """Remember that this host confirmed the pair linked, and persist the
+        ledger. Re-inserting moves the key to the tail: a plain assignment
+        keeps its original insertion position, and the evict-oldest save would
+        then drop a re-confirmed pair before a newer unconfirmed one."""
+        self.duplicate_links.pop(lkey, None)
+        self.duplicate_links[lkey] = twin
+        self._save_duplicate_links()
+
     def _ticket_triage_due(self, tickets, now, site_key):
         """The tickets wanting an assessment right now: stale (never assessed,
         or assessed from different ticket text), attempts left, and past the
@@ -13634,6 +13686,91 @@ class SessionManager:
                 "manual": bool(entry.get("manual")),
                 "at": entry.get("at"),
             }
+
+    def create_duplicate_link(self, cmd_id, issue_key, twin_key):
+        """Link two Jira issues as duplicates (XERK-484, `createDuplicateLink`).
+
+        Called because the hub saw the classifier flag `issue_key` as a strong
+        duplicate of `twin_key`. Idempotent: a live Duplicate link between the
+        two already in Jira is recorded and no-op'd; a link this host made that
+        a human later removed is a sticky skip (the human's word wins). The
+        live links read is the source of truth; the ledger only distinguishes
+        "reversed" from "never linked". Stages into ticket_link_results.
+        Jira-only: the issueLink API is Jira's, and the hub only sweeps Jira
+        orgs, so an Azure board errors the command rather than guessing.
+        """
+        k = str(issue_key or "").strip()
+        twin = str(twin_key or "").strip()
+        result = {
+            "cmdId": cmd_id,
+            "key": k[:50],  # staged key is the truncation the hub keyed it on
+            "twinKey": twin[:50],
+            "siteKey": None,
+            "ok": False,
+            "error": None,
+            "action": None,  # "linked" | "no-op" | "skipped"
+        }
+
+        def stage(ok=False, action=None, err=None):
+            result["ok"] = ok
+            if action is not None:
+                result["action"] = action
+            if err is not None:
+                result["error"] = err
+            self.ticket_link_results.append(dict(result))
+
+        if not valid_issue_key(k):
+            stage(err="not a valid issue key")
+            return
+        if not valid_issue_key(twin):
+            stage(err="not a valid twin issue key")
+            return
+        if k == twin:
+            stage(err="twin key must differ from the ticket's own key")
+            return
+        if not board_configured():
+            stage(err="no board credentials on this host")
+            return
+        if azure_configured():
+            stage(err="issue linking is not supported for Azure DevOps yet")
+            return
+        result["siteKey"] = board_site_key()
+        lkey = _triage_key(result["siteKey"], k)
+
+        # Live links first: if the pair is already linked as Duplicate in Jira
+        # (by this host or anyone), that is the terminal state — record it and
+        # stop, no relink.
+        try:
+            links = jira_get(f"/rest/api/3/issue/{urllib.parse.quote(k)}/links", None)
+        except Exception as e:
+            log(f"link check {k}: {e}")
+            stage(err=str(e)[:200])
+            return
+        for link in (links if isinstance(links, list) else []):
+            lt = (link or {}).get("linkType") or {}
+            inward = (link or {}).get("inwardIssue") or {}
+            if lt.get("name") == JIRA_DUPLICATE_LINK_TYPE and inward.get("key") == twin:
+                self._record_duplicate_link(lkey, twin)
+                stage(ok=True, action="no-op")
+                return
+        if self.duplicate_links.get(lkey) == twin:
+            # This host linked the pair and it is gone from Jira: a human
+            # removed it. Do not relink — the reversal is sticky.
+            stage(ok=True, action="skipped")
+            return
+        try:
+            jira_post("/rest/api/3/issueLink", {
+                "inwardIssue": {"key": twin},
+                "outwardIssue": {"key": k},
+                "linkType": {"name": JIRA_DUPLICATE_LINK_TYPE},
+            })
+        except Exception as e:
+            log(f"issueLink {k} -> {twin}: {e}")
+            stage(err=str(e)[:200])
+            return
+        self._record_duplicate_link(lkey, twin)
+        log(f"linked {k} as duplicate of {twin} (site {result['siteKey']})")
+        stage(ok=True, action="linked")
 
     # --- usage attribution ledger -----------------------------------------
 
@@ -23252,6 +23389,9 @@ class SessionManager:
                 elif ctype == "setTicketPriority":
                     self.set_ticket_priority(
                         cid, cmd.get("issueKey"), cmd.get("priority"))
+                elif ctype == "createDuplicateLink":
+                    self.create_duplicate_link(
+                        cid, cmd.get("issueKey"), cmd.get("twinKey"))
                 elif ctype == "setJiraRepo":
                     self.set_jira_repo(
                         cmd.get("issueKey"), cmd.get("repo"),
@@ -24303,6 +24443,8 @@ class SessionManager:
             payload["createTicketResults"] = list(self.create_ticket_results)
         if self.ticket_priority_results:
             payload["ticketPriorityResults"] = list(self.ticket_priority_results)
+        if self.ticket_link_results:
+            payload["ticketLinkResults"] = list(self.ticket_link_results)
         if self.spawn_failures:
             payload["spawnFailures"] = list(self.spawn_failures)
         # Archive sync manifest on the slow cadence: the inactive transcripts the
@@ -24372,6 +24514,7 @@ class SessionManager:
             self.create_meta_results.clear()  # delivered — same lifecycle
             self.create_ticket_results.clear()  # delivered — same lifecycle
             self.ticket_priority_results.clear()  # delivered — same lifecycle
+            self.ticket_link_results.clear()  # delivered — same lifecycle
             self.spawn_failures.clear()  # delivered — same lifecycle
             return reply if isinstance(reply, dict) else {}
         except urllib.error.HTTPError as e:

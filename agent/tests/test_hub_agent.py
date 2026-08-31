@@ -4069,6 +4069,7 @@ class ManagerMixin:
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
             ("PRIORITY_WRITE_LEDGER_PATH", os.path.join(self.tmp, "jira-priority-writes.json")),
+            ("DUPLICATE_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-duplicate-links.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
@@ -18122,6 +18123,7 @@ class TestPruneRepo(unittest.TestCase):
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
             ("PRIORITY_WRITE_LEDGER_PATH", os.path.join(self.tmp, "jira-priority-writes.json")),
+            ("DUPLICATE_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-duplicate-links.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
@@ -23593,6 +23595,217 @@ class TestSetTicketPriority(ManagerMixin, unittest.TestCase):
         req.assert_not_called()
         self.assertIn("no priority or severity field",
                       sm.ticket_priority_results[0]["error"])
+
+
+class TestCreateDuplicateLink(ManagerMixin, unittest.TestCase):
+    """XERK-484: createDuplicateLink links two Jira issues as duplicates.
+    Idempotent via live GET-links read + local ledger for sticky reversal.
+    Jira-only; Azure boards are refused. Results stage into
+    ticket_link_results keyed by cmdId."""
+
+    def _jira(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net",
+                                   JIRA_EMAIL="e", JIRA_TOKEN="t",
+                                   AZDO_URL="", AZDO_TOKEN="")
+
+    def _azure(self):
+        return mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                   AZDO_TOKEN="p", JIRA_SITE="", JIRA_EMAIL="",
+                                   JIRA_TOKEN="")
+
+    def test_links_when_no_live_duplicate(self):
+        sm = self.make_manager()
+        seen = {}
+
+        def fake_jira_get(path, params):
+            seen["get_path"] = path
+            return []  # no existing links
+
+        def fake_jira_post(path, body):
+            seen["post_path"] = path
+            seen["post_body"] = body
+            return {}
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", fake_jira_get), \
+             mock.patch.object(ha, "jira_post", fake_jira_post):
+            sm.create_duplicate_link("c1", "ENG-9", "ENG-8")
+        self.assertEqual(seen["get_path"],
+                         "/rest/api/3/issue/ENG-9/links")
+        self.assertEqual(seen["post_path"], "/rest/api/3/issueLink")
+        self.assertEqual(seen["post_body"], {
+            "inwardIssue": {"key": "ENG-8"},
+            "outwardIssue": {"key": "ENG-9"},
+            "linkType": {"name": "Duplicate"},
+        })
+        r = sm.ticket_link_results[0]
+        self.assertEqual((r["cmdId"], r["key"], r["twinKey"], r["siteKey"],
+                          r["ok"], r["action"]),
+                         ("c1", "ENG-9", "ENG-8", "s.atlassian.net",
+                          True, "linked"))
+        self.assertIsNone(r["error"])
+        # Ledger recorded
+        self.assertEqual(
+            sm.duplicate_links["s.atlassian.net/ENG-9"], "ENG-8")
+
+    def test_noop_when_live_duplicate_link_exists(self):
+        """If Jira already shows a Duplicate link to the twin, no POST is made."""
+        sm = self.make_manager()
+        calls = []
+
+        def fake_jira_post(path, body):
+            calls.append((path, body))
+            return {}
+        live_links = [
+            {"linkType": {"name": "Blocks"},
+             "inwardIssue": {"key": "ENG-7"}},
+            {"linkType": {"name": "Duplicate"},
+             "inwardIssue": {"key": "ENG-8"}},
+        ]
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=live_links), \
+             mock.patch.object(ha, "jira_post", fake_jira_post):
+            sm.create_duplicate_link("c1", "ENG-9", "ENG-8")
+        self.assertEqual(calls, [])  # no POST — the live link is terminal
+        r = sm.ticket_link_results[0]
+        self.assertEqual((r["ok"], r["action"]), (True, "no-op"))
+        # Ledger should record it so future sweeps see it
+        self.assertEqual(
+            sm.duplicate_links["s.atlassian.net/ENG-9"], "ENG-8")
+
+    def test_sticky_skip_on_human_reversal(self):
+        """Ledger says we linked this pair, but live read shows no link —
+        a human removed it. Must NOT relink."""
+        sm = self.make_manager()
+        sm.duplicate_links["s.atlassian.net/ENG-9"] = "ENG-8"
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=[]), \
+             mock.patch.object(ha, "jira_post") as post:
+            sm.create_duplicate_link("c1", "ENG-9", "ENG-8")
+        post.assert_not_called()
+        r = sm.ticket_link_results[0]
+        self.assertEqual((r["ok"], r["action"]), (True, "skipped"))
+
+    def test_validation_errors(self):
+        sm = self.make_manager()
+        with self._jira(), mock.patch.object(ha, "jira_get") as g, \
+             mock.patch.object(ha, "jira_post") as p:
+            sm.create_duplicate_link("c1", "../evil", "ENG-8")
+        g.assert_not_called()
+        p.assert_not_called()
+        self.assertEqual(sm.ticket_link_results[0]["error"],
+                         "not a valid issue key")
+
+        sm.ticket_link_results.clear()
+        with self._jira():
+            sm.create_duplicate_link("c2", "ENG-9", "../evil")
+        self.assertEqual(sm.ticket_link_results[0]["error"],
+                         "not a valid twin issue key")
+
+        sm.ticket_link_results.clear()
+        with self._jira():
+            sm.create_duplicate_link("c3", "ENG-9", "ENG-9")
+        self.assertEqual(sm.ticket_link_results[0]["error"],
+                         "twin key must differ from the ticket's own key")
+
+    def test_unconfigured_stages_error(self):
+        sm = self.make_manager()
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="",
+                                 JIRA_TOKEN="", AZDO_URL="", AZDO_TOKEN=""), \
+             mock.patch.object(ha, "jira_get") as g:
+            sm.create_duplicate_link("c1", "ENG-9", "ENG-8")
+        g.assert_not_called()
+        self.assertIn("no board credentials", sm.ticket_link_results[0]["error"])
+
+    def test_azure_rejected(self):
+        sm = self.make_manager()
+        with self._azure(), mock.patch.object(ha, "jira_get") as g:
+            sm.create_duplicate_link("c1", "42", "43")
+        g.assert_not_called()
+        self.assertEqual(sm.ticket_link_results[0]["error"],
+                         "issue linking is not supported for Azure DevOps yet")
+
+    def test_refusal_error_bounded_to_200_chars(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=[]), \
+             mock.patch.object(ha, "jira_post",
+                               side_effect=RuntimeError(
+                                   "HTTP Error 403: Forbidden — "
+                                   + "x" * 300)):
+            sm.create_duplicate_link("c1", "ENG-9", "ENG-8")
+        r = sm.ticket_link_results[0]
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["error"].startswith("HTTP Error 403: Forbidden"))
+        self.assertLessEqual(len(r["error"]), 200)
+
+    def test_link_check_failure_stages_error(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get",
+                               side_effect=RuntimeError(
+                                   "HTTP Error 404: Not Found")), \
+             mock.patch.object(ha, "jira_post") as p:
+            sm.create_duplicate_link("c1", "ENG-9", "ENG-8")
+        p.assert_not_called()
+        r = sm.ticket_link_results[0]
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["error"], "HTTP Error 404: Not Found")
+
+    def test_key_truncated_to_50_chars(self):
+        """The staged result key is capped at 50 chars (same convention as
+        XERK-483) so the hub's suppression key stays stable."""
+        sm = self.make_manager()
+        long_key = "A" * 55 + "-1"
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=[]), \
+             mock.patch.object(ha, "jira_post", return_value={}):
+            sm.create_duplicate_link("c1", long_key, "ENG-8")
+        self.assertEqual(sm.ticket_link_results[0]["key"], long_key[:50])
+        self.assertEqual(len(sm.ticket_link_results[0]["key"]), 50)
+
+    def test_command_dispatch_and_payload_rides(self):
+        sm = self.make_manager()
+        sm.registry = []
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=[]), \
+             mock.patch.object(ha, "jira_post", return_value={}):
+            sm.handle_commands([{"cmdId": "c9", "type": "createDuplicateLink",
+                                 "issueKey": "ENG-9", "twinKey": "ENG-8"}])
+        self.assertIn("c9", sm.acked)
+        self.assertEqual(sm.ticket_link_results[0]["cmdId"], "c9")
+        payload = sm.build_payload(1)
+        self.assertEqual(payload["ticketLinkResults"][0]["cmdId"], "c9")
+
+    def test_ledger_update_moves_key_to_tail(self):
+        """Re-insertion moves the key to the tail (XERK-484 ledger contract):
+        at the cap, _save_duplicate_links evicts from the head, so a
+        re-confirmed pair must not be the one dropped. A plain assignment
+        keeps the original insertion position, so pin that the update
+        actually moves it."""
+        sm = self.make_manager()
+        for i in range(ha.DUPLICATE_LINK_LEDGER_MAX):
+            sm.duplicate_links["s.atlassian.net/OLD-%d" % i] = "ENG-8"
+        # Re-confirm the oldest pair through the live no-op path.
+        live = [{"linkType": {"name": "Duplicate"},
+                 "inwardIssue": {"key": "ENG-8"}}]
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=live):
+            sm.create_duplicate_link("c1", "OLD-0", "ENG-8")
+        self.assertEqual(sm.ticket_link_results[0]["action"], "no-op")
+        self.assertEqual(
+            list(sm.duplicate_links)[-1], "s.atlassian.net/OLD-0",
+            "update must move the key to the tail")
+        # A new pair on a full ledger evicts the next oldest, never the
+        # just-re-confirmed one.
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=[]), \
+             mock.patch.object(ha, "jira_post", return_value={}):
+            sm.create_duplicate_link("c2", "NEW-1", "ENG-8")
+        self.assertIn("s.atlassian.net/NEW-1", sm.duplicate_links)
+        self.assertIn("s.atlassian.net/OLD-0", sm.duplicate_links,
+                      "re-confirmed pair must survive the cap")
+        self.assertNotIn("s.atlassian.net/OLD-1", sm.duplicate_links,
+                         "the next-oldest unconfirmed entry is evicted")
 
 
 class TestBoardColumn(unittest.TestCase):
