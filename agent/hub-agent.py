@@ -14810,20 +14810,23 @@ class SessionManager:
             # Render append-only into the scrollback INSTEAD of qwen's default
             # alt-screen "virtualized viewport" (XERK-flicker). That viewport is
             # gated only on `isInteractiveTerminal()` (a real TTY + TERM!="dumb"),
-            # which our tmux pane satisfies, so it turns ON — and it repaints the
-            # WHOLE screen each frame (measured: it emits `?1049` alt-screen +
-            # `?2J` full-clear + cursor-home per frame; append-only emits NONE of
-            # those). qwen wraps a frame in synchronized-output (`?2026`) to hide
-            # that repaint, but ttyd 1.7.4's bundled xterm.js does NOT implement
-            # mode 2026 (verified: zero `2026` in its inlined frontend), so the
-            # clear+repaint renders progressively in the browser = the flicker.
-            # Claude Code is smooth in this SAME tmux+ttyd+xterm.js pipeline for
-            # exactly one reason: it writes history incrementally to scrollback,
-            # never a full-frame alt-screen repaint. `useTerminalBuffer:false`
-            # gives qwen that same discipline. The cost is qwen's in-app viewport
-            # extras (Shift+arrow scroll, click-a-menu-option, hover-highlight) —
-            # ttyd/xterm.js already own scrollback, and a Claude session never had
-            # those either, so it is the right trade for "smooth like Claude".
+            # which our tmux pane satisfies, so it turns ON — and it drives a
+            # heavy full-region repaint: `?1049` alt-screen + `?2J` full-clear +
+            # cursor-home at entry, the `?2J` recurring on every stream/resize,
+            # and a per-frame erase-line (`?2K`) churn measured ~4.6x the byte
+            # volume of append-only under real model streaming. Append-only emits
+            # NONE of the alt-screen/`?2J`/cursor-home and far less line churn.
+            # qwen wraps frames in synchronized-output (`?2026`) to hide the
+            # repaint, but ttyd 1.7.4's bundled xterm.js does NOT implement mode
+            # 2026 (verified: zero `2026` in its inlined frontend), so that churn
+            # renders progressively in the browser = the flicker. Claude Code is
+            # smooth in this SAME tmux+ttyd+xterm.js pipeline for exactly one
+            # reason: it writes history incrementally to scrollback, never a
+            # full-region alt-screen repaint. `useTerminalBuffer:false` gives
+            # qwen that same discipline. The cost is qwen's in-app viewport extras
+            # (Shift+arrow scroll, click-a-menu-option, hover-highlight) — ttyd/
+            # xterm.js already own scrollback, and a Claude session never had those
+            # either, so it is the right trade for "smooth like Claude".
             "ui": {"useTerminalBuffer": False},
             "general": {
                 # REQUIRED for the on-disk transcript + --resume to work (G0).
