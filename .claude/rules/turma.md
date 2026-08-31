@@ -237,6 +237,26 @@ the total is measured.
   into the ORIGINAL request target, only for origin-form requests, so the query survives byte-for-byte
   and an absolute-form/backslash target still 404s rather than resolving. Tests: the base-path cases
   in `server.test.js`.
+- **`proxyTerm` rewrites the top-level ttyd HTML to inject font + touch-scroll + OSC52 clipboard on
+  EVERY session, plus a qwen-ONLY jump-to-bottom pill** (`TERM_SCROLL_BOTTOM`). Claude's TUI owns the
+  alternate screen and stays pinned to its last line — nothing to scroll — so it gets no pill; qwen's
+  TUI keeps an IN-APP scroll region with its own scrollbar (the glyph column `_PANE_SCROLLBAR_RE`
+  strips), which a scroll-up leaves parked above the tail. The pill drives qwen's own scroll down by
+  dispatching wheel-DOWN events on `.xterm` (the SAME primitive `TERM_TOUCH_SCROLL` uses, and the
+  gesture the operator scrolls qwen with — so it needs no knowledge of qwen's key map). qwen keeps
+  **SGR mouse tracking on** (verified end-to-end in a real browser), so the wheel events reach it as
+  real mouse reports and it scrolls its own region. It repeats bursts until the screen is unchanged
+  for **STABLE consecutive polls** — a single read is not enough, because a redraw makes a full
+  browser↔tunnel↔qwen round trip and one poll can catch the pre-scroll frame and look "settled"
+  when it isn't (a ~1/10 stop-short, worse over the tunnel). **A STREAMING turn's footer animates
+  every frame so the settle test never trips; an active turn (busy-footer regex) stops at a tight
+  cap. qwen does NOT auto-follow mid-stream** — it pins to the TOP of new output and snaps to the
+  tail only at turn COMPLETION, which is why stopping early there is safe.
+  **Gated by `agentType` server-side**
+  (`findSession` carries it), never client-side, so Claude's composer never takes a stray Down-arrow.
+- **Android's `TerminalScreen` loads the same `/term/<id>/` in a WebView**, so this injection reaches
+  it with no android change — it is server plumbing, not a `turma/public/` control, so parity-exempt.
+  Tests: the `term:`/`scroll-to-bottom:` cases in `server.test.js`.
 
 ## Auth and the glasses surface
 
