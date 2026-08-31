@@ -26,6 +26,14 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
 - Opens a running session in a **native chat view by default** (`chat.js`), not the raw ttyd
   terminal, over `/live/<host>/<id>` (ws-token auth, seeded from the cached tail, `/history` scrollback
   + poll fallback when the socket is down).
+  - **`/history` for a RUNNING session is served INSTANTLY from the hub's durable archive** on a cache
+    miss (`archiveHistory` in `server.js`), not by round-tripping to the agent — the agent keeps a
+    worktree-backed running session's rendered transcript syncing to the archive
+    (`agent-archive.md`), so scrollback is hub-local and ready the moment the operator arrives. The
+    hub still queues a `history` command to REFRESH the cache to the freshest copy (the archive lags
+    the live head by a few beats; the live tail covers that head, and the client folds the two in
+    transcript order — `foldHistory`). Only a session the archive has NOT caught up on yet (brand
+    new, first beats) or a root session falls through to the old queue-and-202 wait.
 - **The stage drops only on POSITIVE evidence the SESSION went** (XERK-252) — its host reporting it
   stopped, or reporting without it. Three things that are NOT that evidence, each used to wrongly
   evict the operator mid-read:

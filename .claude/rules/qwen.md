@@ -316,11 +316,13 @@ WHO writes the native log into the store.
   the mirror leaves the archived copy intact (the raw layer's shrunk-source rule).
 - **Only the append-only event log rides raw** — any SQLite/index qwen rebuilds must NOT be mirrored
   (the per-file cursor ships bytes past an offset, wrong for a page-mutating DB).
-- **A RUNNING qwen session is NOT un-excluded from the manifest** — unlike dsh, which un-excludes a
-  live session so its Trajectory populates. qwen has a real ttyd TUI and no Trajectory analogue, so
-  its native log is retention/metrics only and archives once the session ENDS, like any Claude
-  session. `_teardown_qwen` drops only the 0600 env file, never the store dir, so the retained log
-  survives kill (it lives under `PROJECTS_ROOT`, not the worktree delete removes).
+- **A running qwen session ships its RENDERED projection while running but DEFERS its RAW native log
+  to session end** — like every worktree-backed runtime except dsh (`agent-archive.md`,
+  `_live_worktree_slugs` / `defer_raw`). The rendered `<sid>.jsonl` materializes hub-side so the chat
+  serves instant scrollback; the `<sid>/qwen/chat.jsonl` mirror is retention/metrics only (qwen has a
+  real ttyd TUI, no live Trajectory the way headless dsh does) so it archives once the session ENDS.
+  `_teardown_qwen` drops only the 0600 env file, never the store dir, so the retained log survives
+  kill (it lives under `PROJECTS_ROOT`, not the worktree delete removes).
 - **The native log is never double-counted in usage** — `<sid>/qwen/chat.jsonl` is neither a top-level
   `*.jsonl` nor under `subagents/`, so `_project_transcripts` skips it; the projection is the single
   counted copy. **Do not teach the walk to read `<sid>/qwen/`.**

@@ -160,20 +160,25 @@ paths:
     (`QwenProjectionTail`) copies it in, append-only, on its own cursor. Migration ([Qwen K]) does
     NOT carry this mirror — qwen resumes from its own native log, which the migration bundle carries
     separately under `.qwen-store/`; the target rebuilds the mirror from new events.
-  - **A RUNNING dsh session is NOT excluded from the manifest** (`_running_slugs` subtracts
-    `_live_dsh_slugs`) — the one exception, because the in-dashboard Trajectory (XERK-498) is a
-    headless dsh session's ONLY viewer and reads this raw layer back live; both its projected
-    `<tid>.jsonl` and its `<tid>/dsh/` log ship every beat. **A running QWEN session gets NO such
-    carve-out** (real ttyd TUI, no Trajectory analogue) — archives once it ends like any session.
-    - **The rendered layer MUST ship too, not just the raw one** — the raw layer hangs off the
-      rendered `sessions` row (`ingestRaw` skips any transcript with no `filePath`), so the exception
-      is at the SLUG level, both layers, not a raw-only carve-out.
-    - A dsh session's slug is unique to it (own worktree), so un-excluding it archives only that
-      session; a ROOT session (shared slug, no worktree) is never dragged in
-      (`_live_dsh_slugs` requires `worktreePath`).
-    - Accepted minor effect: a running dsh session can appear in the archive browser/hub search
-      while still running; cosmetic (Ended-sessions dedupes on running `transcriptId`, Restore
-      refuses a running conversation). Tests:
+  - **Every RUNNING WORKTREE-BACKED session ships its RENDERED transcript while running**
+    (`_running_slugs` subtracts `_live_worktree_slugs`, any runtime) so its chat scrollback
+    materializes hub-side and `/history` serves it INSTANTLY from the archive instead of round-
+    tripping to the agent (the delay that motivated this). Only a running ROOT session stays
+    excluded — its shared slug holds every root session ever (XERK-6), so un-excluding it would sync
+    them all under one slug; `_live_worktree_slugs` requires `worktreePath`, so root is never dragged
+    in (a worktree slug backs exactly one session).
+    - **The RENDERED layer un-exclusion is at the SLUG level** — the raw layer hangs off the rendered
+      `sessions` row (`ingestRaw` skips any transcript with no `filePath`), so the rendered row must
+      exist for any raw bytes to land.
+    - **The RAW layer while running is DSH-ONLY** (`offer_raw` skips `defer_raw` =
+      `_live_worktree_slugs − _live_dsh_slugs`). dsh's `<tid>/dsh/` log is its live Trajectory's ONLY
+      feed (XERK-498, headless, no ttyd) and must ship every beat; every OTHER runtime (claude, qwen)
+      ships RENDERED only while running and DEFERS its raw sidecars to session end — bounding the new
+      continuous cost to prose deltas, not screenshots/subagent trees.
+    - Accepted minor effect: a running session can appear in the archive browser/hub search while
+      still running; cosmetic (Ended-sessions dedupes on running `transcriptId`, Restore refuses a
+      running conversation). Tests: `test_manifest_keeps_a_running_worktree_session_rendered_only`,
+      `test_manifest_excludes_a_running_ROOT_session`,
       `test_manifest_keeps_a_running_dsh_session_so_its_trajectory_populates`.
   - **Only APPEND-ONLY bytes belong under `<tid>/dsh/`** — the per-file cursor ships bytes past an
     offset, right for an event-sourced log, wrong for a page-mutating SQLite (an in-place rewrite

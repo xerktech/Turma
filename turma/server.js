@@ -198,6 +198,11 @@ const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
 const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
 const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted first
+// Newest N entries served when scrollback comes from the hub's durable archive
+// (a running session materializes there — see the /history route). The archive
+// holds the WHOLE transcript; this bounds the payload to the same order of
+// magnitude as an agent `/history` window (SESSION_HISTORY_MSGS defaults to 200).
+const HISTORY_ARCHIVE_MSGS = Number(process.env.HISTORY_ARCHIVE_MSGS) || 200;
 // Bounds for a session's live agent rows (sanitizeLiveAgents, far below). They
 // live UP HERE, away from their function, because the state.json restore runs
 // at module init and calls that function: a `const` declared later is in its
@@ -3182,6 +3187,33 @@ function normalizeDefaultRuntime(a) {
 // than HISTORY_MAX_AGE_MS and cap the cache at HISTORY_MAX_SESSIONS, evicting
 // the oldest `fetchedAt` first. Runs on every heartbeat ingest, even absent new
 // results, so the sweep still bounds memory on quiet hosts.
+// Scrollback for a RUNNING session, read from the hub's durable archive, shaped
+// as the /history contract. The agent keeps a worktree-backed running session's
+// rendered transcript syncing to the archive, so this materializes hub-side and
+// serves INSTANTLY — no agent round-trip. Returns null when the archive has
+// nothing for this transcript yet (a brand-new session, first few beats), so the
+// caller falls back to the queue-and-202 path.
+//
+// The archive keys entries on `uuid`; the live/history path and the client merge
+// (foldHistory) key on `id`, so map uuid -> id here. Bounded to the newest
+// HISTORY_ARCHIVE_MSGS; the archive holds the whole transcript.
+function archiveHistory(transcriptId) {
+  if (!transcriptId) return null;
+  let t;
+  try { t = archive.getTranscript(transcriptId); } catch { return null; }
+  if (!t || !Array.isArray(t.entries) || t.entries.length === 0) return null;
+  const all = t.entries;
+  const truncated = all.length > HISTORY_ARCHIVE_MSGS;
+  const window = truncated ? all.slice(-HISTORY_ARCHIVE_MSGS) : all;
+  const entries = window.map((e) => ({
+    id: e.uuid, role: e.role, ts: e.ts, text: e.text || "",
+    blocks: Array.isArray(e.blocks) ? e.blocks : [],
+  }));
+  // queued:[] — the still-queued prompt list rides the live tail, not the
+  // archive; the client keeps whatever the socket last delivered.
+  return { entries, truncated, queued: [], fetchedAt: Date.now(), fromArchive: true };
+}
+
 function ingestHistory(agent, historyResults) {
   const now = Date.now();
   for (const r of historyResults || []) {
@@ -9602,6 +9634,22 @@ const server = http.createServer(async (req, res) => {
         }
         const pending = (agents[key].commands || [])
           .find((c) => c.type === "history" && c.sessionId === sessionId);
+        // A RUNNING session's transcript is materialized in the hub's durable
+        // archive (the agent keeps a worktree-backed running session syncing), so
+        // serve scrollback from there INSTANTLY on a cache miss instead of making
+        // the operator wait out an agent round-trip — the delay this fixes. Still
+        // queue a refresh so the cache heals to the freshest copy (the archive
+        // lags the live head by a few beats; the live tail covers that head, and
+        // the client folds the two in transcript order). Only when the archive has
+        // nothing yet do we fall through to the queue-and-202 path.
+        const sess = (agents[key].sessions || []).find((x) => x.id === sessionId);
+        if (sess && sess.status === "running") {
+          const fromArchive = archiveHistory(sess.transcriptId);
+          if (fromArchive) {
+            if (!pending) queueCommand(key, { type: "history", sessionId });
+            return json(res, 200, fromArchive);
+          }
+        }
         const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "history", sessionId });
         return json(res, 202, { pending: true, cmdId });
       }

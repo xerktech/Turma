@@ -4016,6 +4016,49 @@ test("http: stale cached history (>5 minutes) is re-queued instead of served", a
   assert.equal(res.body.pending, true);
 });
 
+test("http: a running session's scrollback is served INSTANTLY from the archive (200, not 202) + refresh queued", async () => {
+  // The agent keeps a running worktree-backed session syncing to the archive, so
+  // /history serves it hub-locally on a cache miss instead of waiting out an agent
+  // round-trip — while still queuing a refresh to heal to the freshest copy.
+  const meta = { remoteKey: "github.com/x/r", repo: "r", worktree: "/w/live",
+    slug: "-w-live", createdAt: "2026-08-30T00:00:00Z", summary: "Live chat" };
+  const push = await request("POST", "/api/agents/hh7/archive/tconv", {
+    headers: agentHeaders,
+    body: { startOffset: 0, endOffset: 60, size: 60, meta, entries: [
+      { uuid: "a1", role: "user", ts: "2026-08-30T00:00:00Z", text: "hello" },
+      { uuid: "a2", role: "assistant", ts: "2026-08-30T00:00:10Z", text: "hi there" },
+    ] },
+  });
+  assert.equal(push.status, 200);
+  // The host reports the session RUNNING with that transcript.
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: "hh7",
+    sessions: [{ id: "sa", status: "running", repo: "r", worktreePath: "/w/live",
+      transcriptId: "tconv", session: { transcriptAgeSec: 1 } }],
+  } });
+
+  const res = await request("GET", "/api/agents/hh7/sessions/sa/history", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.fromArchive, true);
+  // uuid -> id mapping: the archive keys on uuid, the client merge keys on id.
+  assert.deepEqual(res.body.entries.map((e) => e.id), ["a1", "a2"]);
+  assert.equal(res.body.entries[1].role, "assistant");
+  // A refresh command was queued so the cache heals to the agent's fresh copy.
+  const beat = await request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: "hh7" } });
+  assert.ok((beat.body.commands || []).some((c) => c.type === "history" && c.sessionId === "sa"));
+});
+
+test("http: a running session with nothing in the archive yet still 202s (cold start)", async () => {
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: "hh8",
+    sessions: [{ id: "sb", status: "running", repo: "r", worktreePath: "/w/new",
+      transcriptId: "no-archive-yet", session: { transcriptAgeSec: 1 } }],
+  } });
+  const res = await request("GET", "/api/agents/hh8/sessions/sb/history", { headers: userHeaders });
+  assert.equal(res.status, 202);
+  assert.equal(res.body.pending, true);
+});
+
 test("http: history cache eviction — entries older than 10 minutes dropped on ingest", async () => {
   await request("POST", "/api/heartbeat", { body: { device: "hh4" }, headers: agentHeaders });
   await request("POST", "/api/heartbeat", {
