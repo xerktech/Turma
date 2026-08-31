@@ -7158,7 +7158,12 @@ function priorityWriteBackSweep() {
       const band = t && t.triage && t.triage.priority;
       if (!band || !map[band]) continue;             // no triage band, or unknown band
       if (String(t.priority || "") === map[band]) continue; // tracker already agrees
-      const sk = siteKey + "\x00" + key + "\x00" + band;
+      // The agent stages its result keyed by the issue key TRUNCATED to 50
+      // chars (record-size bound), and ingestPriorityResults keys the
+      // suppression map off that staged value — so a key longer than 50 would
+      // never suppress (every sweep re-queues the same ticket, forever). Build
+      // the key the same way; short keys are untouched by the slice.
+      const sk = siteKey + "\x00" + String(key).slice(0, 50) + "\x00" + band;
       const sup = priorityWriteBackSkips.get(sk);
       if (sup && (sup.prio === null || String(t.priority || "") === String(sup.prio)))
         continue;                                    // recently answered, value unchanged

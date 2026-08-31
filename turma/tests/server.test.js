@@ -6080,6 +6080,7 @@ const asBeat = async (device, site, {
                repoGuess: { repo: "Turma", cloned: true } }],
   fetchedAt = "2026-07-14T12:00:00Z",
   ticketPriorityResults,
+  ackedCommands,
 } = {}) => {
   const r = await request("POST", "/api/heartbeat", {
     body: {
@@ -6090,6 +6091,7 @@ const asBeat = async (device, site, {
       jira: { available: true, configured: true, siteKey: site,
               user: user || `${device}@x.com`, fetchedAt, tickets },
       ...(ticketPriorityResults ? { ticketPriorityResults } : {}),
+      ...(ackedCommands ? { ackedCommands } : {}),
     },
     headers: agentHeaders,
   });
@@ -6551,6 +6553,42 @@ test("priority-writeback: an error result suppresses re-queueing regardless of v
   });
   priorityWriteBackSweep();
   assert.equal((agents.pwErr.commands || []).filter((c) => c.type === "setTicketPriority").length, 0);
+  resetPriorityWriteBack();
+});
+
+test("priority-writeback: keys over 50 chars suppress via the agent's truncated key", async () => {
+  resetPriorityWriteBack();
+  setPriorityWriteBackOrg("pwlong.atlassian.net", true);
+  // Legal Jira key longer than the agent's 50-char staged-key bound (the same
+  // k[:50] record-size convention every staged result uses). The agent stages
+  // its result keyed by the truncated value; the sweep must look suppression
+  // up with the same truncated key or this ticket re-queues every 15s forever.
+  const LK = "A".repeat(49) + "-12345"; // 55 chars
+  const longTicket = () => ({ key: LK, summary: "long key", statusCategory: "todo",
+    triage: { priority: "P1", type: "bug", value: "high",
+              at: "2026-08-30T00:00:00Z", source: "model" },
+    priority: "Low", repoGuess: { repo: "Turma", cloned: true } });
+  await asBeat("pwLong", "pwlong.atlassian.net", { autoStart: false, tickets: [longTicket()] });
+  priorityWriteBackSweep();
+  let cmds = (agents.pwLong.commands || []).filter((c) => c.type === "setTicketPriority");
+  assert.equal(cmds.length, 1);
+  const cmdId = cmds[0].cmdId;
+  // What the REAL agent stages: key truncated to 50, error result.
+  await asBeat("pwLong", "pwlong.atlassian.net", {
+    autoStart: false,
+    tickets: [longTicket()],
+    ackedCommands: [cmdId],
+    ticketPriorityResults: [{
+      cmdId, key: LK.slice(0, 50), siteKey: "pwlong.atlassian.net",
+      band: "P1", ok: false, error: "HTTP Error 404: Not Found", priority: null,
+    }],
+  });
+  priorityWriteBackSweep();
+  cmds = (agents.pwLong.commands || []).filter((c) => c.type === "setTicketPriority");
+  assert.equal(cmds.length, 0); // suppressed, not re-queued
+  // The suppression entry is keyed on the truncated form, not the full key.
+  assert.equal(priorityWriteBackSkips.has("pwlong.atlassian.net" + "\x00" + LK.slice(0, 50) + "\x00" + "P1"), true);
+  assert.equal(priorityWriteBackSkips.has("pwlong.atlassian.net" + "\x00" + LK + "\x00" + "P1"), false);
   resetPriorityWriteBack();
 });
 

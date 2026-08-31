@@ -23456,6 +23456,24 @@ class TestSetTicketPriority(ManagerMixin, unittest.TestCase):
         self.assertEqual((r["ok"], r["action"], r["priority"]),
                          (True, "skipped", "P1"))
 
+    def test_result_key_truncated_to_50_chars(self):
+        """The staged result's `key` is capped at 50 chars (the shared k[:50]
+        record-size convention, same as the XERK-137/138 result shapes). The
+        hub's XERK-483 sweep builds its suppression key from this truncated
+        value — if this ever grows, the sweep's slice(0, 50) must track it or
+        long-key tickets re-queue forever."""
+        sm = self.make_manager()
+        long = "A" * 55 + "-1"
+        with self._jira(), \
+             mock.patch.object(ha, "jira_priority_options",
+                               return_value=list(self._JIRA_OPTS)), \
+             mock.patch.object(ha, "jira_req", return_value={}), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": long, "priority": "Medium"}):
+            sm.set_ticket_priority("c1", long, "P1")
+        self.assertEqual(sm.ticket_priority_results[0]["key"], long[:50])
+        self.assertEqual(len(sm.ticket_priority_results[0]["key"]), 50)
+
     def test_azure_no_op_when_already_at_target(self):
         sm = self.make_manager()
         calls = []
