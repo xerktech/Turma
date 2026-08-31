@@ -278,6 +278,12 @@ install_files() {
   cp "$SRC_DIR/tunnel-agent.js"  "$PREFIX/tunnel-agent.js"
   cp "$SRC_DIR/tmux.conf"        "$PREFIX/tmux.conf"
   cp "$SRC_DIR"/hooks/*.py       "$PREFIX/hooks/"        # sibling to hub-agent.py (load-bearing)
+  # Shared runtime scaffolding (XERK-528): imported by BOTH the dsh and qwen
+  # transcript/tail siblings, so lay them down UNCONDITIONALLY like qwen's — a
+  # host with either runtime that lacks them runs that runtime DARK (the
+  # transcript import fails, the projector is None: no transcript/summary/PR/usage).
+  cp "$SRC_DIR/runtime_projection.py" "$PREFIX/runtime_projection.py"
+  cp "$SRC_DIR/runtime_tail.py"       "$PREFIX/runtime_tail.py"
   # qwen runtime (XERK-504+): the Python siblings (imported by _launch_qwen /
   # _start_qwen_tail) and agent/qwen/ (MCP servers, peer-inbox forger, guard
   # shim — all resolved relative to hub-agent.py's own dir). Stdlib-only and
@@ -479,6 +485,7 @@ do_verify() {
   echo "prefix: $PREFIX (version $( [ -f "$PREFIX/VERSION" ] && cat "$PREFIX/VERSION" || echo MISSING))"
   for f in hub-agent.py tunnel-agent.js hooks/guard.py hooks/fileguard.py \
            hooks/ask.py hooks/statusline.py \
+           runtime_projection.py runtime_tail.py \
            qwen_session.py qwen_transcript.py \
            qwen/ask_mcp.py qwen/peer_mcp.py qwen/peer_inbox.py qwen/guard/shim.py \
            bin/turma-agent bin/turma-agentctl bin/turma-agent-update; do

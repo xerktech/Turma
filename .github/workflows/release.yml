@@ -436,6 +436,12 @@ jobs:
              agent/native/turma-agent.env \
              agent/native/README.md "$STAGE/"
           cp agent/hub-agent.py agent/tunnel-agent.js agent/tmux.conf "$STAGE/"
+          # Shared runtime scaffolding (XERK-528): runtime_projection.py +
+          # runtime_tail.py are imported by BOTH the dsh and qwen transcript/tail
+          # siblings, so they ship UNCONDITIONALLY with the core — a host with
+          # either runtime that lacks them runs that runtime DARK (the transcript
+          # import fails and the projector is None: no transcript/summary/PR/usage).
+          cp agent/runtime_projection.py agent/runtime_tail.py "$STAGE/"
           cp agent/hooks/*.py "$STAGE/hooks/"
           # dsh toolchain (XERK-496): the Python siblings land beside hub-agent.py
           # and the driver/guard dirs at the paths hub-agent.py resolves from ITS
