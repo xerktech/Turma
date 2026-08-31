@@ -13328,6 +13328,15 @@ class SessionManager:
         except OSError as e:
             log(f"duplicate link ledger save failed: {e}")
 
+    def _record_duplicate_link(self, lkey, twin):
+        """Remember that this host confirmed the pair linked, and persist the
+        ledger. Re-inserting moves the key to the tail: a plain assignment
+        keeps its original insertion position, and the evict-oldest save would
+        then drop a re-confirmed pair before a newer unconfirmed one."""
+        self.duplicate_links.pop(lkey, None)
+        self.duplicate_links[lkey] = twin
+        self._save_duplicate_links()
+
     def _ticket_triage_due(self, tickets, now, site_key):
         """The tickets wanting an assessment right now: stale (never assessed,
         or assessed from different ticket text), attempts left, and past the
@@ -13666,9 +13675,7 @@ class SessionManager:
             lt = (link or {}).get("linkType") or {}
             inward = (link or {}).get("inwardIssue") or {}
             if lt.get("name") == JIRA_DUPLICATE_LINK_TYPE and inward.get("key") == twin:
-                if self.duplicate_links.get(lkey) != twin:
-                    self.duplicate_links[lkey] = twin
-                    self._save_duplicate_links()
+                self._record_duplicate_link(lkey, twin)
                 stage(ok=True, action="no-op")
                 return
         if self.duplicate_links.get(lkey) == twin:
@@ -13686,8 +13693,7 @@ class SessionManager:
             log(f"issueLink {k} -> {twin}: {e}")
             stage(err=str(e)[:200])
             return
-        self.duplicate_links[lkey] = twin
-        self._save_duplicate_links()
+        self._record_duplicate_link(lkey, twin)
         log(f"linked {k} as duplicate of {twin} (site {result['siteKey']})")
         stage(ok=True, action="linked")
 

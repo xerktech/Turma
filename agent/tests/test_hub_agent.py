@@ -23724,6 +23724,37 @@ class TestCreateDuplicateLink(ManagerMixin, unittest.TestCase):
         payload = sm.build_payload(1)
         self.assertEqual(payload["ticketLinkResults"][0]["cmdId"], "c9")
 
+    def test_ledger_update_moves_key_to_tail(self):
+        """Re-insertion moves the key to the tail (XERK-484 ledger contract):
+        at the cap, _save_duplicate_links evicts from the head, so a
+        re-confirmed pair must not be the one dropped. A plain assignment
+        keeps the original insertion position, so pin that the update
+        actually moves it."""
+        sm = self.make_manager()
+        for i in range(ha.DUPLICATE_LINK_LEDGER_MAX):
+            sm.duplicate_links["s.atlassian.net/OLD-%d" % i] = "ENG-8"
+        # Re-confirm the oldest pair through the live no-op path.
+        live = [{"linkType": {"name": "Duplicate"},
+                 "inwardIssue": {"key": "ENG-8"}}]
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=live):
+            sm.create_duplicate_link("c1", "OLD-0", "ENG-8")
+        self.assertEqual(sm.ticket_link_results[0]["action"], "no-op")
+        self.assertEqual(
+            list(sm.duplicate_links)[-1], "s.atlassian.net/OLD-0",
+            "update must move the key to the tail")
+        # A new pair on a full ledger evicts the next oldest, never the
+        # just-re-confirmed one.
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=[]), \
+             mock.patch.object(ha, "jira_post", return_value={}):
+            sm.create_duplicate_link("c2", "NEW-1", "ENG-8")
+        self.assertIn("s.atlassian.net/NEW-1", sm.duplicate_links)
+        self.assertIn("s.atlassian.net/OLD-0", sm.duplicate_links,
+                      "re-confirmed pair must survive the cap")
+        self.assertNotIn("s.atlassian.net/OLD-1", sm.duplicate_links,
+                         "the next-oldest unconfirmed entry is evicted")
+
 
 class TestBoardColumn(unittest.TestCase):
     """The status-column resolver behind drag-and-drop (XERK-141). Mirrors
