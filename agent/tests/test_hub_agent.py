@@ -4016,6 +4016,7 @@ class ManagerMixin:
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
+            ("PRIORITY_WRITE_LEDGER_PATH", os.path.join(self.tmp, "jira-priority-writes.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
@@ -18068,6 +18069,7 @@ class TestPruneRepo(unittest.TestCase):
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
+            ("PRIORITY_WRITE_LEDGER_PATH", os.path.join(self.tmp, "jira-priority-writes.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
@@ -23224,6 +23226,321 @@ class TestSetBoardStatus(ManagerMixin, unittest.TestCase):
                                  "issueKey": "ENG-9", "value": "", "category": "done"}])
         self.assertIn("c9", sm.acked)
         self.assertTrue(sm.ticket_status_results[0]["ok"])
+
+
+class TestSetTicketPriority(ManagerMixin, unittest.TestCase):
+    """XERK-483: the third agent->tracker write. setTicketPriority re-reads the
+    ticket and writes the triage band's tracker value only when the field is
+    still the tracker's default or a value this host itself wrote; a human-set
+    value is reported "skipped" and left untouched. Outcomes are staged in
+    ticket_priority_results keyed by cmdId; nothing raises out of the loop."""
+
+    _JIRA_OPTS = [{"name": "Highest"}, {"name": "High"},
+                  {"name": "Medium", "default": True}, {"name": "Low"}]
+
+    def _jira(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net",
+                                   JIRA_EMAIL="e", JIRA_TOKEN="t",
+                                   AZDO_URL="", AZDO_TOKEN="")
+
+    def _azure(self):
+        return mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                   AZDO_TOKEN="p", JIRA_SITE="", JIRA_EMAIL="",
+                                   JIRA_TOKEN="")
+
+    def test_jira_writes_when_tracker_still_at_default(self):
+        sm = self.make_manager()
+        seen = {}
+
+        def fake_req(path, params, body=None):
+            seen["path"], seen["body"] = path, body
+            return {}
+        with self._jira(), \
+             mock.patch.object(ha, "jira_priority_options",
+                               return_value=list(self._JIRA_OPTS)), \
+             mock.patch.object(ha, "jira_req", fake_req), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "ENG-9", "priority": "Medium"}):
+            sm.set_ticket_priority("c1", "ENG-9", "P1")
+        self.assertEqual(seen["path"], "/rest/api/3/issue/ENG-9")
+        self.assertEqual(seen["body"], {"fields": {"priority": {"name": "High"}}})
+        r = sm.ticket_priority_results[0]
+        self.assertEqual((r["cmdId"], r["key"], r["ok"], r["action"], r["priority"]),
+                         ("c1", "ENG-9", True, "written", "High"))
+        # The write is remembered so a later re-triage may correct it.
+        self.assertEqual(sm.priority_writes["s.atlassian.net/ENG-9"], "High")
+
+    def test_jira_human_value_is_left_untouched(self):
+        """The acceptance case: a value nobody here set (and not the default)
+        is a human's choice — the write is skipped, not staged as an error."""
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "jira_priority_options",
+                               return_value=list(self._JIRA_OPTS)), \
+             mock.patch.object(ha, "jira_req") as req, \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "ENG-9", "priority": "Low"}):
+            sm.set_ticket_priority("c1", "ENG-9", "P1")
+        req.assert_not_called()
+        r = sm.ticket_priority_results[0]
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["action"], "skipped")
+        self.assertEqual(r["priority"], "Low")
+
+    def test_jira_no_op_when_already_at_target(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "jira_priority_options",
+                               return_value=list(self._JIRA_OPTS)), \
+             mock.patch.object(ha, "jira_req") as req, \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "ENG-9", "priority": "High"}):
+            sm.set_ticket_priority("c1", "ENG-9", "P1")
+        req.assert_not_called()
+        r = sm.ticket_priority_results[0]
+        self.assertEqual((r["ok"], r["action"], r["priority"]),
+                         (True, "no-op", "High"))
+
+    def test_jira_corrects_a_write_this_host_made(self):
+        """A value the host itself wrote is fair game on re-triage."""
+        sm = self.make_manager()
+        sm.priority_writes["s.atlassian.net/ENG-9"] = "High"
+        seen = {}
+
+        def fake_req(path, params, body=None):
+            seen["body"] = body
+            return {}
+        with self._jira(), \
+             mock.patch.object(ha, "jira_priority_options",
+                               return_value=list(self._JIRA_OPTS)), \
+             mock.patch.object(ha, "jira_req", fake_req), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "ENG-9", "priority": "High"}):
+            sm.set_ticket_priority("c1", "ENG-9", "P2")
+        self.assertEqual(seen["body"], {"fields": {"priority": {"name": "Medium"}}})
+        self.assertEqual(sm.priority_writes["s.atlassian.net/ENG-9"], "Medium")
+        self.assertEqual(sm.ticket_priority_results[0]["action"], "written")
+
+    def test_bad_band_bad_key_and_unconfigured_stage_errors(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "jira_req") as req, \
+             mock.patch.object(ha, "fetch_board_issue") as fetch:
+            sm.set_ticket_priority("c1", "ENG-9", "P9")
+        fetch.assert_not_called()
+        self.assertIn("not a triage priority band", sm.ticket_priority_results[0]["error"])
+        sm.ticket_priority_results.clear()
+        with self._jira(), mock.patch.object(ha, "fetch_board_issue") as fetch:
+            sm.set_ticket_priority("c2", "../secrets", "P1")
+        fetch.assert_not_called()
+        self.assertEqual(sm.ticket_priority_results[0]["error"], "not a valid issue key")
+        sm.ticket_priority_results.clear()
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="", AZDO_TOKEN=""), \
+             mock.patch.object(ha, "jira_req") as req:
+            sm.set_ticket_priority("c3", "ENG-9", "P1")
+        req.assert_not_called()
+        self.assertIn("no board credentials", sm.ticket_priority_results[0]["error"])
+
+    def test_missing_priority_option_is_refused_without_writing(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "jira_priority_options",
+                               return_value=[{"name": "Medium", "default": True},
+                                             {"name": "Low"}]), \
+             mock.patch.object(ha, "jira_req") as req, \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "ENG-9", "priority": "Medium"}):
+            sm.set_ticket_priority("c1", "ENG-9", "P1")
+        req.assert_not_called()
+        self.assertIn("no 'High' priority option in this org",
+                      sm.ticket_priority_results[0]["error"])
+
+    def test_priority_options_read_failure_stages_error(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "jira_priority_options", return_value=[]), \
+             mock.patch.object(ha, "jira_req") as req, \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "ENG-9", "priority": "Medium"}):
+            sm.set_ticket_priority("c1", "ENG-9", "P1")
+        req.assert_not_called()
+        self.assertEqual(sm.ticket_priority_results[0]["error"],
+                         "couldn't read available priorities")
+
+    def test_issue_fetch_failure_stages_error_not_raise(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "jira_priority_options",
+                               return_value=list(self._JIRA_OPTS)), \
+             mock.patch.object(ha, "jira_req") as req, \
+             mock.patch.object(ha, "fetch_board_issue",
+                               side_effect=RuntimeError("HTTP Error 404: Not Found")):
+            sm.set_ticket_priority("c1", "ENG-9", "P1")
+        req.assert_not_called()
+        r = sm.ticket_priority_results[0]
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["error"], "HTTP Error 404: Not Found")
+
+    def test_refusal_stages_tracker_message_and_bounded(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "jira_priority_options",
+                               return_value=list(self._JIRA_OPTS)), \
+             mock.patch.object(ha, "jira_req",
+                               side_effect=RuntimeError(
+                                   "HTTP Error 403: Forbidden — no permission "
+                                   + "x" * 300)), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "ENG-9", "priority": "Medium"}):
+            sm.set_ticket_priority("c1", "ENG-9", "P0")
+        r = sm.ticket_priority_results[0]
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["error"].startswith("HTTP Error 403: Forbidden"))
+        self.assertLessEqual(len(r["error"]), 200)
+
+    def test_command_routes_acks_and_rides_payload(self):
+        sm = self.make_manager()
+        sm.registry = []
+        with self._jira(), \
+             mock.patch.object(ha, "jira_priority_options",
+                               return_value=list(self._JIRA_OPTS)), \
+             mock.patch.object(ha, "jira_req", return_value={}), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "ENG-9", "priority": "Medium"}):
+            sm.handle_commands([{"cmdId": "c9", "type": "setTicketPriority",
+                                 "issueKey": "ENG-9", "priority": "P0"}])
+        self.assertIn("c9", sm.acked)
+        self.assertEqual(sm.ticket_priority_results[0]["cmdId"], "c9")
+        self.assertEqual(
+            sm.build_payload(1)["ticketPriorityResults"][0]["cmdId"], "c9")
+
+    # --- Azure DevOps: 1-4 value into the field the type actually has ----
+
+    def test_azure_patches_priority_field_when_at_default(self):
+        sm = self.make_manager()
+        calls = []
+
+        def fake_req(path, params, body=None, method=None,
+                     content_type="application/json"):
+            calls.append((path, params, body, method, content_type))
+            return {"fields": {"Microsoft.VSTS.Common.Priority": 2}}
+        with self._azure(), \
+             mock.patch.object(ha, "_azure_type_fields",
+                               return_value={"Microsoft.VSTS.Common.Priority",
+                                             "System.Title"}), \
+             mock.patch.object(ha, "azure_req", fake_req), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "42", "project": "proj",
+                                             "type": "Task", "priority": "P2"}):
+            sm.set_ticket_priority("c1", "42", "P0")
+        self.assertEqual(calls[0][0], "/_apis/wit/workitems/42")
+        self.assertEqual(calls[0][1], {"fields": "Microsoft.VSTS.Common.Priority"})
+        self.assertEqual(calls[1][2],
+                         [{"op": "add", "path": "/fields/Microsoft.VSTS.Common.Priority",
+                           "value": 1}])
+        self.assertEqual(calls[1][3], "PATCH")
+        self.assertEqual(calls[1][4], "application/json-patch+json")
+        r = sm.ticket_priority_results[0]
+        # Board wire shape: the tracker value as the board spells it.
+        self.assertEqual((r["ok"], r["action"], r["priority"]),
+                         (True, "written", "P1"))
+
+    def test_azure_bends_to_severity_when_type_lacks_priority(self):
+        sm = self.make_manager()
+        calls = []
+
+        def fake_req(path, params, body=None, method=None,
+                     content_type="application/json"):
+            calls.append((path, params, body, method, content_type))
+            return {"fields": {"Microsoft.VSTS.Common.Severity": ""}}
+        with self._azure(), \
+             mock.patch.object(ha, "_azure_type_fields",
+                               return_value={"Microsoft.VSTS.Common.Severity",
+                                             "System.Title"}), \
+             mock.patch.object(ha, "azure_req", fake_req), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "42", "project": "proj",
+                                             "type": "Bug"}):
+            sm.set_ticket_priority("c1", "42", "P2")
+        self.assertEqual(calls[1][2],
+                         [{"op": "add", "path": "/fields/Microsoft.VSTS.Common.Severity",
+                           "value": 3}])
+        self.assertEqual(sm.ticket_priority_results[0]["action"], "written")
+
+    def test_azure_human_value_is_left_untouched(self):
+        sm = self.make_manager()
+        calls = []
+
+        def fake_req(path, params, body=None, method=None,
+                     content_type="application/json"):
+            calls.append((path, params, body, method, content_type))
+            return {"fields": {"Microsoft.VSTS.Common.Priority": 1}}
+        with self._azure(), \
+             mock.patch.object(ha, "_azure_type_fields",
+                               return_value={"Microsoft.VSTS.Common.Priority"}), \
+             mock.patch.object(ha, "azure_req", fake_req), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "42", "project": "proj",
+                                             "type": "Task", "priority": "P1"}):
+            sm.set_ticket_priority("c1", "42", "P1")
+        self.assertEqual(len(calls), 1)        # read only — no PATCH
+        r = sm.ticket_priority_results[0]
+        self.assertEqual((r["ok"], r["action"], r["priority"]),
+                         (True, "skipped", "P1"))
+
+    def test_result_key_truncated_to_50_chars(self):
+        """The staged result's `key` is capped at 50 chars (the shared k[:50]
+        record-size convention, same as the XERK-137/138 result shapes). The
+        hub's XERK-483 sweep builds its suppression key from this truncated
+        value — if this ever grows, the sweep's slice(0, 50) must track it or
+        long-key tickets re-queue forever."""
+        sm = self.make_manager()
+        long = "A" * 55 + "-1"
+        with self._jira(), \
+             mock.patch.object(ha, "jira_priority_options",
+                               return_value=list(self._JIRA_OPTS)), \
+             mock.patch.object(ha, "jira_req", return_value={}), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": long, "priority": "Medium"}):
+            sm.set_ticket_priority("c1", long, "P1")
+        self.assertEqual(sm.ticket_priority_results[0]["key"], long[:50])
+        self.assertEqual(len(sm.ticket_priority_results[0]["key"]), 50)
+
+    def test_azure_no_op_when_already_at_target(self):
+        sm = self.make_manager()
+        calls = []
+
+        def fake_req(path, params, body=None, method=None,
+                     content_type="application/json"):
+            calls.append((path, params, body, method, content_type))
+            return {"fields": {"Microsoft.VSTS.Common.Priority": 1}}
+        with self._azure(), \
+             mock.patch.object(ha, "_azure_type_fields",
+                               return_value={"Microsoft.VSTS.Common.Priority"}), \
+             mock.patch.object(ha, "azure_req", fake_req), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "42", "project": "proj",
+                                             "type": "Task", "priority": "P1"}):
+            sm.set_ticket_priority("c1", "42", "P0")
+        self.assertEqual(len(calls), 1)
+        r = sm.ticket_priority_results[0]
+        self.assertEqual((r["ok"], r["action"], r["priority"]),
+                         (True, "no-op", "P1"))
+
+    def test_azure_type_without_priority_field_stages_error(self):
+        sm = self.make_manager()
+        with self._azure(), \
+             mock.patch.object(ha, "_azure_type_fields",
+                               return_value={"System.Title"}), \
+             mock.patch.object(ha, "azure_req") as req, \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "42", "project": "proj",
+                                             "type": "Test"}):
+            sm.set_ticket_priority("c1", "42", "P1")
+        req.assert_not_called()
+        self.assertIn("no priority or severity field",
+                      sm.ticket_priority_results[0]["error"])
 
 
 class TestBoardColumn(unittest.TestCase):

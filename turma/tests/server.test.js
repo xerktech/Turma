@@ -65,6 +65,10 @@ process.env.AUTOSTART_ORGS_FILE = path.join(
   os.tmpdir(),
   `turma-test-autostart-orgs-${process.pid}.json`
 );
+process.env.PRIORITY_WRITEBACK_ORGS_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-priority-writeback-orgs-${process.pid}.json`
+);
 process.env.TICKET_MODELS_FILE = path.join(
   os.tmpdir(),
   `turma-test-ticket-models-${process.pid}.json`
@@ -161,6 +165,8 @@ const {
   TERM_SCROLL_BOTTOM_JS,
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStartOrgs, setAutoStartOrg,
+  priorityWriteBackOrgs, setPriorityWriteBackOrg, orgsWithPriorityWriteBack,
+  priorityWriteBackSweep, priorityWriteBackSkips,
   ticketQueue, ticketQueuePayload, enqueueTicketStart, dropQueuedTicket,
   dropAutoQueuedTickets, drainTicketQueue, queuedTicket, hostHasFreeSlot, holdQueued,
   liveQueueCount,
@@ -6140,6 +6146,8 @@ const asBeat = async (device, site, {
   tickets = [{ key: "ENG-5", summary: "Fix it", statusCategory: "todo",
                repoGuess: { repo: "Turma", cloned: true } }],
   fetchedAt = "2026-07-14T12:00:00Z",
+  ticketPriorityResults,
+  ackedCommands,
 } = {}) => {
   const r = await request("POST", "/api/heartbeat", {
     body: {
@@ -6149,6 +6157,8 @@ const asBeat = async (device, site, {
       ...(capacity ? { capacity } : {}),
       jira: { available: true, configured: true, siteKey: site,
               user: user || `${device}@x.com`, fetchedAt, tickets },
+      ...(ticketPriorityResults ? { ticketPriorityResults } : {}),
+      ...(ackedCommands ? { ackedCommands } : {}),
     },
     headers: agentHeaders,
   });
@@ -6469,6 +6479,184 @@ test("POST /api/jira/<site>/autostart rejects a bad body and an unknown org", as
     { body: { enabled: true }, headers: userHeaders });
   assert.equal(r.status, 404);
   assert.equal("nobody.atlassian.net" in autoStartOrgs, false);
+});
+
+// ---- triage priority write-back (XERK-483) -----------------------------------
+// Hub-side half of the third tracker write: a per-org opt-in toggle plus a
+// sweep that queues setTicketPriority commands where the triage band disagrees
+// with the tracker's own priority field. The AGENT makes the conservative
+// decision (a human-set value is never overwritten); the sweep only decides
+// WHEN to ask, and suppresses re-queueing from the agent's own staged results.
+
+// A triaged ticket the sweep can act on: band P1 (-> "High" on Jira), still at
+// the tracker default "Medium".
+const pwTicket = (o = {}) => ({
+  key: "ENG-5", summary: "Fix it", statusCategory: "todo",
+  triage: { priority: "P1", type: "bug", value: "high",
+            at: "2026-08-30T00:00:00Z", source: "model" },
+  priority: "Medium",
+  ...o,
+});
+const resetPriorityWriteBack = () => {
+  priorityWriteBackSkips.clear();
+  for (const k of Object.keys(priorityWriteBackOrgs)) delete priorityWriteBackOrgs[k];
+};
+
+test("POST /api/jira/<site>/priority-writeback flips the opt-in and rides the payload", async () => {
+  resetPriorityWriteBack();
+  await asBeat("pwApi", "pwapi.atlassian.net", { autoStart: false });
+  let r = await request("POST", "/api/jira/pwapi.atlassian.net/priority-writeback",
+    { body: { enabled: true }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { ok: true, enabled: true });
+  assert.equal(priorityWriteBackOrgs["pwapi.atlassian.net"], true);
+  assert.equal(orgsWithPriorityWriteBack().has("pwapi.atlassian.net"), true);
+  // Rides the fleet payload like autoStartOrgs.
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.body.priorityWriteBackOrgs["pwapi.atlassian.net"], true);
+  // Disable it — the key is removed (presence = enabled).
+  r = await request("POST", "/api/jira/pwapi.atlassian.net/priority-writeback",
+    { body: { enabled: false }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal("pwapi.atlassian.net" in priorityWriteBackOrgs, false);
+});
+
+test("POST /api/jira/<site>/priority-writeback rejects a bad body and an unknown org", async () => {
+  resetPriorityWriteBack();
+  await asBeat("pwApi2", "pwapi2.atlassian.net", { autoStart: false });
+  let r = await request("POST", "/api/jira/pwapi2.atlassian.net/priority-writeback",
+    { body: {}, headers: userHeaders });
+  assert.equal(r.status, 400);
+  r = await request("POST", "/api/jira/pwapi2.atlassian.net/priority-writeback",
+    { body: { enabled: "yes" }, headers: userHeaders });
+  assert.equal(r.status, 400);
+  // An org no host reports can't be toggled (no phantom entries).
+  r = await request("POST", "/api/jira/nobody.atlassian.net/priority-writeback",
+    { body: { enabled: true }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  assert.equal("nobody.atlassian.net" in priorityWriteBackOrgs, false);
+});
+
+test("priority-writeback: sweep queues setTicketPriority only for opted-in orgs with a mismatch", async () => {
+  resetPriorityWriteBack();
+  await asBeat("pwOff", "pwoff.atlassian.net", {
+    autoStart: false, tickets: [pwTicket()],
+  });
+  // Off by default: nothing is queued even though the value mismatches.
+  priorityWriteBackSweep();
+  assert.equal((agents.pwOff.commands || []).filter((c) => c.type === "setTicketPriority").length, 0);
+  // Opt in: the P1 band wants "High", the tracker shows the default "Medium".
+  setPriorityWriteBackOrg("pwoff.atlassian.net", true);
+  priorityWriteBackSweep();
+  let cmds = (agents.pwOff.commands || []).filter((c) => c.type === "setTicketPriority");
+  assert.equal(cmds.length, 1);
+  assert.equal(cmds[0].issueKey, "ENG-5");
+  assert.equal(cmds[0].priority, "P1");
+  // The command is still riding the host's queue: no double-queue.
+  priorityWriteBackSweep();
+  cmds = (agents.pwOff.commands || []).filter((c) => c.type === "setTicketPriority");
+  assert.equal(cmds.length, 1);
+  resetPriorityWriteBack();
+});
+
+test("priority-writeback: no queue when the tracker already matches the band", async () => {
+  resetPriorityWriteBack();
+  setPriorityWriteBackOrg("pwmatch.atlassian.net", true);
+  await asBeat("pwMatch", "pwmatch.atlassian.net", {
+    autoStart: false, tickets: [pwTicket({ priority: "High" })], // P1 band, already "High"
+  });
+  priorityWriteBackSweep();
+  assert.equal((agents.pwMatch.commands || []).filter((c) => c.type === "setTicketPriority").length, 0);
+  resetPriorityWriteBack();
+});
+
+test("priority-writeback: untriaged tickets are never queued", async () => {
+  resetPriorityWriteBack();
+  setPriorityWriteBackOrg("pwnotri.atlassian.net", true);
+  await asBeat("pwNoTri", "pwnotri.atlassian.net", {
+    autoStart: false,
+    tickets: [{ key: "ENG-7", summary: "No triage yet", statusCategory: "todo", priority: "Low" }],
+  });
+  priorityWriteBackSweep();
+  assert.equal((agents.pwNoTri.commands || []).filter((c) => c.type === "setTicketPriority").length, 0);
+  resetPriorityWriteBack();
+});
+
+test("priority-writeback: a 'skipped' result suppresses re-queueing while the human's value holds", async () => {
+  resetPriorityWriteBack();
+  setPriorityWriteBackOrg("pwsup.atlassian.net", true);
+  // Human set "Low"; the band wants "High". The agent already answered that it
+  // left the human's value alone, and the answer rides this beat.
+  await asBeat("pwSup", "pwsup.atlassian.net", {
+    autoStart: false,
+    tickets: [pwTicket({ priority: "Low" })],
+    ticketPriorityResults: [{
+      cmdId: "pw-c1", key: "ENG-5", siteKey: "pwsup.atlassian.net",
+      band: "P1", ok: true, action: "skipped", priority: "Low",
+    }],
+  });
+  priorityWriteBackSweep();
+  assert.equal((agents.pwSup.commands || []).filter((c) => c.type === "setTicketPriority").length, 0);
+  // The human resets the ticket back to the default: the sweep re-arms and
+  // queues again, so the field gets filled in.
+  await asBeat("pwSup", "pwsup.atlassian.net", {
+    autoStart: false, tickets: [pwTicket({ priority: "Medium" })],
+  });
+  priorityWriteBackSweep();
+  assert.equal((agents.pwSup.commands || []).filter((c) => c.type === "setTicketPriority").length, 1);
+  resetPriorityWriteBack();
+});
+
+test("priority-writeback: an error result suppresses re-queueing regardless of value", async () => {
+  resetPriorityWriteBack();
+  setPriorityWriteBackOrg("pwerr.atlassian.net", true);
+  await asBeat("pwErr", "pwerr.atlassian.net", {
+    autoStart: false,
+    tickets: [pwTicket()],
+    ticketPriorityResults: [{
+      cmdId: "pw-c2", key: "ENG-5", siteKey: "pwerr.atlassian.net",
+      band: "P1", ok: false, error: "HTTP Error 403: Forbidden", priority: null,
+    }],
+  });
+  priorityWriteBackSweep();
+  assert.equal((agents.pwErr.commands || []).filter((c) => c.type === "setTicketPriority").length, 0);
+  resetPriorityWriteBack();
+});
+
+test("priority-writeback: keys over 50 chars suppress via the agent's truncated key", async () => {
+  resetPriorityWriteBack();
+  setPriorityWriteBackOrg("pwlong.atlassian.net", true);
+  // Legal Jira key longer than the agent's 50-char staged-key bound (the same
+  // k[:50] record-size convention every staged result uses). The agent stages
+  // its result keyed by the truncated value; the sweep must look suppression
+  // up with the same truncated key or this ticket re-queues every 15s forever.
+  const LK = "A".repeat(49) + "-12345"; // 55 chars
+  const longTicket = () => ({ key: LK, summary: "long key", statusCategory: "todo",
+    triage: { priority: "P1", type: "bug", value: "high",
+              at: "2026-08-30T00:00:00Z", source: "model" },
+    priority: "Low", repoGuess: { repo: "Turma", cloned: true } });
+  await asBeat("pwLong", "pwlong.atlassian.net", { autoStart: false, tickets: [longTicket()] });
+  priorityWriteBackSweep();
+  let cmds = (agents.pwLong.commands || []).filter((c) => c.type === "setTicketPriority");
+  assert.equal(cmds.length, 1);
+  const cmdId = cmds[0].cmdId;
+  // What the REAL agent stages: key truncated to 50, error result.
+  await asBeat("pwLong", "pwlong.atlassian.net", {
+    autoStart: false,
+    tickets: [longTicket()],
+    ackedCommands: [cmdId],
+    ticketPriorityResults: [{
+      cmdId, key: LK.slice(0, 50), siteKey: "pwlong.atlassian.net",
+      band: "P1", ok: false, error: "HTTP Error 404: Not Found", priority: null,
+    }],
+  });
+  priorityWriteBackSweep();
+  cmds = (agents.pwLong.commands || []).filter((c) => c.type === "setTicketPriority");
+  assert.equal(cmds.length, 0); // suppressed, not re-queued
+  // The suppression entry is keyed on the truncated form, not the full key.
+  assert.equal(priorityWriteBackSkips.has("pwlong.atlassian.net" + "\x00" + LK.slice(0, 50) + "\x00" + "P1"), true);
+  assert.equal(priorityWriteBackSkips.has("pwlong.atlassian.net" + "\x00" + LK + "\x00" + "P1"), false);
+  resetPriorityWriteBack();
 });
 
 // ---- the hub-side ticket queue (XERK-296) -----------------------------------
