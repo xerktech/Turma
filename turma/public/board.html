@@ -529,6 +529,7 @@ function paintDetail() {
   $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
     color: B.orgColor(s.siteKey, lastAllKeys, TurmaOrg.orgColors()),
     siteKey: s.siteKey,
+    site: site,
     error: s.error,
     // The override rides the heartbeat, so it needs a live host to reach; an
     // offline org's ticket is still readable, just not re-assignable.

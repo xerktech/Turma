@@ -167,6 +167,8 @@ const {
   autoStopped, autoStartOrgs, setAutoStartOrg,
   priorityWriteBackOrgs, setPriorityWriteBackOrg, orgsWithPriorityWriteBack,
   priorityWriteBackSweep, priorityWriteBackSkips,
+  dedupeLinkOrgs, setDedupeLinkOrg, orgsWithDedupeLink,
+  dedupeLinkSweep, dedupeLinkSkips,
   ticketQueue, ticketQueuePayload, enqueueTicketStart, dropQueuedTicket,
   dropAutoQueuedTickets, drainTicketQueue, queuedTicket, hostHasFreeSlot, holdQueued,
   liveQueueCount,
@@ -6147,6 +6149,8 @@ const asBeat = async (device, site, {
                repoGuess: { repo: "Turma", cloned: true } }],
   fetchedAt = "2026-07-14T12:00:00Z",
   ticketPriorityResults,
+  ticketLinkResults,
+  jiraSource,
   ackedCommands,
 } = {}) => {
   const r = await request("POST", "/api/heartbeat", {
@@ -6156,8 +6160,10 @@ const asBeat = async (device, site, {
       sessions, closedSessions,
       ...(capacity ? { capacity } : {}),
       jira: { available: true, configured: true, siteKey: site,
-              user: user || `${device}@x.com`, fetchedAt, tickets },
+              user: user || `${device}@x.com`, fetchedAt, tickets,
+              ...(jiraSource ? { source: jiraSource } : {}) },
       ...(ticketPriorityResults ? { ticketPriorityResults } : {}),
+      ...(ticketLinkResults ? { ticketLinkResults } : {}),
       ...(ackedCommands ? { ackedCommands } : {}),
     },
     headers: agentHeaders,
@@ -6657,6 +6663,202 @@ test("priority-writeback: keys over 50 chars suppress via the agent's truncated 
   assert.equal(priorityWriteBackSkips.has("pwlong.atlassian.net" + "\x00" + LK.slice(0, 50) + "\x00" + "P1"), true);
   assert.equal(priorityWriteBackSkips.has("pwlong.atlassian.net" + "\x00" + LK + "\x00" + "P1"), false);
   resetPriorityWriteBack();
+});
+
+// ---- duplicate linking (XERK-484) ------------------------------------------
+// Hub-side half of the fourth tracker write: a per-org opt-in toggle plus a
+// sweep that queues createDuplicateLink commands for tickets the classifier
+// flagged with triage.dedupeOf. The AGENT is the idempotency authority (live
+// GET-links read; its ledger makes a human's removal sticky); the sweep only
+// decides WHEN to ask, and suppresses re-queueing from the agent's own staged
+// results: an ok outcome is sticky, an error is suppressed for the retry window.
+
+const dlTicket = (o = {}) => ({
+  key: "ENG-9", summary: "Fix it", statusCategory: "todo",
+  triage: { priority: "P1", type: "bug", value: "high",
+            at: "2026-08-30T00:00:00Z", source: "model",
+            dedupeOf: "ENG-8" },
+  ...o,
+});
+const resetDedupeLink = () => {
+  dedupeLinkSkips.clear();
+  for (const k of Object.keys(dedupeLinkOrgs)) delete dedupeLinkOrgs[k];
+};
+const dlCmds = (host) =>
+  (agents[host].commands || []).filter((c) => c.type === "createDuplicateLink");
+
+test("POST /api/jira/<site>/dedupe-link flips the opt-in and rides the payload", async () => {
+  resetDedupeLink();
+  await asBeat("dlApi", "dlapi.atlassian.net", { autoStart: false });
+  let r = await request("POST", "/api/jira/dlapi.atlassian.net/dedupe-link",
+    { body: { enabled: true }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { ok: true, enabled: true });
+  assert.equal(dedupeLinkOrgs["dlapi.atlassian.net"], true);
+  assert.equal(orgsWithDedupeLink().has("dlapi.atlassian.net"), true);
+  // Rides the fleet payload like priorityWriteBackOrgs.
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.body.dedupeLinkOrgs["dlapi.atlassian.net"], true);
+  // Disable it — the key is removed (presence = enabled).
+  r = await request("POST", "/api/jira/dlapi.atlassian.net/dedupe-link",
+    { body: { enabled: false }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal("dlapi.atlassian.net" in dedupeLinkOrgs, false);
+});
+
+test("POST /api/jira/<site>/dedupe-link rejects a bad body and an unknown org", async () => {
+  resetDedupeLink();
+  await asBeat("dlApi2", "dlapi2.atlassian.net", { autoStart: false });
+  let r = await request("POST", "/api/jira/dlapi2.atlassian.net/dedupe-link",
+    { body: {}, headers: userHeaders });
+  assert.equal(r.status, 400);
+  r = await request("POST", "/api/jira/dlapi2.atlassian.net/dedupe-link",
+    { body: { enabled: "yes" }, headers: userHeaders });
+  assert.equal(r.status, 400);
+  // An org no host reports can't be toggled (no phantom entries).
+  r = await request("POST", "/api/jira/nobody.atlassian.net/dedupe-link",
+    { body: { enabled: true }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  assert.equal("nobody.atlassian.net" in dedupeLinkOrgs, false);
+});
+
+test("dedupe-link: sweep queues createDuplicateLink only for opted-in orgs with a dedupeOf", async () => {
+  resetDedupeLink();
+  await asBeat("dlOff", "dloff.atlassian.net", {
+    autoStart: false, tickets: [dlTicket()],
+  });
+  // Off by default: nothing is queued even though the ticket carries a dedupeOf.
+  dedupeLinkSweep();
+  assert.equal(dlCmds("dlOff").length, 0);
+  // Opt in: the sweep queues one command carrying both keys.
+  setDedupeLinkOrg("dloff.atlassian.net", true);
+  dedupeLinkSweep();
+  let cmds = dlCmds("dlOff");
+  assert.equal(cmds.length, 1);
+  assert.equal(cmds[0].issueKey, "ENG-9");
+  assert.equal(cmds[0].twinKey, "ENG-8");
+  // The command is still riding the host's queue: no double-queue.
+  dedupeLinkSweep();
+  assert.equal(dlCmds("dlOff").length, 1);
+  resetDedupeLink();
+});
+
+test("dedupe-link: untriaged tickets and self-flags are never queued", async () => {
+  resetDedupeLink();
+  setDedupeLinkOrg("dlnotri.atlassian.net", true);
+  await asBeat("dlNoTri", "dlnotri.atlassian.net", {
+    autoStart: false,
+    tickets: [
+      { key: "ENG-7", summary: "No triage yet", statusCategory: "todo" }, // no triage
+      { key: "ENG-6", summary: "self", statusCategory: "todo",
+        triage: { priority: "P2", dedupeOf: "ENG-6" } },                // self-flag
+    ],
+  });
+  dedupeLinkSweep();
+  assert.equal(dlCmds("dlNoTri").length, 0);
+  resetDedupeLink();
+});
+
+test("dedupe-link: a Jira org with no Jira host is never queued", async () => {
+  resetDedupeLink();
+  setDedupeLinkOrg("dlnohost.atlassian.net", true);
+  // The org is opted in but no host beats for it, so pickBoardWriteHost
+  // returns null and the sweep queues nothing.
+  dedupeLinkSweep();
+  assert.equal(dedupeLinkSkips.size, 0);
+  resetDedupeLink();
+});
+
+test("dedupe-link: an Azure org is skipped even when opted in", async () => {
+  resetDedupeLink();
+  setDedupeLinkOrg("dlado.atlassian.net", true);
+  await asBeat("dlAzo", "dlado.atlassian.net", {
+    autoStart: false, tickets: [dlTicket()], jiraSource: "azure",
+  });
+  dedupeLinkSweep();
+  assert.equal(dlCmds("dlAzo").length, 0);
+  resetDedupeLink();
+});
+
+test("dedupe-link: an ok result suppresses the pair sticky (no relink storm)", async () => {
+  resetDedupeLink();
+  setDedupeLinkOrg("dlsup.atlassian.net", true);
+  await asBeat("dlSup", "dlsup.atlassian.net", { autoStart: false, tickets: [dlTicket()] });
+  dedupeLinkSweep();
+  const cmdId = dlCmds("dlSup")[0].cmdId;
+  // The agent acks the command and reports a successful link.
+  await asBeat("dlSup", "dlsup.atlassian.net", {
+    autoStart: false,
+    tickets: [dlTicket()],
+    ackedCommands: [cmdId],
+    ticketLinkResults: [{
+      cmdId, key: "ENG-9", twinKey: "ENG-8", siteKey: "dlsup.atlassian.net",
+      ok: true, error: null, action: "linked",
+    }],
+  });
+  // The acked command left the queue; the sticky suppression stops the re-queue.
+  assert.equal(dlCmds("dlSup").length, 0);
+  dedupeLinkSweep();
+  assert.equal(dlCmds("dlSup").length, 0);
+  const entry = dedupeLinkSkips.get("dlsup.atlassian.net" + "\x00" + "ENG-9" + "\x00" + "ENG-8");
+  assert.ok(entry && entry.sticky === true, "ok outcome is sticky");
+  resetDedupeLink();
+});
+
+test("dedupe-link: an error result suppresses re-queueing for the retry window", async () => {
+  resetDedupeLink();
+  setDedupeLinkOrg("dlerr.atlassian.net", true);
+  await asBeat("dlErr", "dlerr.atlassian.net", { autoStart: false, tickets: [dlTicket()] });
+  dedupeLinkSweep();
+  const cmdId = dlCmds("dlErr")[0].cmdId;
+  await asBeat("dlErr", "dlerr.atlassian.net", {
+    autoStart: false,
+    tickets: [dlTicket()],
+    ackedCommands: [cmdId],
+    ticketLinkResults: [{
+      cmdId, key: "ENG-9", twinKey: "ENG-8", siteKey: "dlerr.atlassian.net",
+      ok: false, error: "HTTP Error 403: Forbidden", action: null,
+    }],
+  });
+  dedupeLinkSweep();
+  assert.equal(dlCmds("dlErr").length, 0);
+  const entry = dedupeLinkSkips.get("dlerr.atlassian.net" + "\x00" + "ENG-9" + "\x00" + "ENG-8");
+  assert.ok(entry && entry.sticky === false, "error outcome is non-sticky (retryable)");
+  resetDedupeLink();
+});
+
+test("dedupe-link: keys over 50 chars suppress via the agent's truncated key", async () => {
+  resetDedupeLink();
+  setDedupeLinkOrg("dllong.atlassian.net", true);
+  // Legal key longer than the agent's 50-char staged-key bound. The agent
+  // stages its result keyed by the truncated value; the sweep must look
+  // suppression up with the same truncated key or this pair re-queues every
+  // 15s forever (the XERK-483 lesson).
+  const LK = "A".repeat(49) + "-12345"; // 55 chars
+  const longTicket = { key: LK, summary: "long key", statusCategory: "todo",
+    triage: { priority: "P2", at: "2026-08-30T00:00:00Z", source: "model",
+              dedupeOf: "ENG-8" } };
+  await asBeat("dlLong", "dllong.atlassian.net", { autoStart: false, tickets: [longTicket] });
+  dedupeLinkSweep();
+  const cmds = dlCmds("dlLong");
+  assert.equal(cmds.length, 1);
+  const cmdId = cmds[0].cmdId;
+  // What the REAL agent stages: key truncated to 50, ok result.
+  await asBeat("dlLong", "dllong.atlassian.net", {
+    autoStart: false,
+    tickets: [longTicket],
+    ackedCommands: [cmdId],
+    ticketLinkResults: [{
+      cmdId, key: LK.slice(0, 50), twinKey: "ENG-8", siteKey: "dllong.atlassian.net",
+      ok: true, error: null, action: "linked",
+    }],
+  });
+  dedupeLinkSweep();
+  assert.equal(dlCmds("dlLong").length, 0); // suppressed, not re-queued
+  // The suppression entry is keyed on the truncated form, not the full key.
+  assert.equal(dedupeLinkSkips.has("dllong.atlassian.net" + "\x00" + LK.slice(0, 50) + "\x00" + "ENG-8"), true);
+  assert.equal(dedupeLinkSkips.has("dllong.atlassian.net" + "\x00" + LK + "\x00" + "ENG-8"), false);
+  resetDedupeLink();
 });
 
 // ---- the hub-side ticket queue (XERK-296) -----------------------------------

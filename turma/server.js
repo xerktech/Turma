@@ -169,6 +169,12 @@ const AUTOSTART_ORGS_FILE = process.env.AUTOSTART_ORGS_FILE || "/data/autostart-
 // the auto-start opt-in: per-org, tiny, must survive a hub restart.
 const PRIORITY_WRITEBACK_ORGS_FILE =
   process.env.PRIORITY_WRITEBACK_ORGS_FILE || "/data/priority-writeback-orgs.json";
+// Per-org opt-in for duplicate linking (XERK-484): when ON for an org, the
+// hub's sweep queues a createDuplicateLink command so a ticket the classifier
+// flagged triage.dedupeOf gets linked as a Jira Duplicate of its twin. Same
+// hub-owned-durable rationale as the priority write-back opt-in above.
+const DEDUPE_LINK_ORGS_FILE =
+  process.env.DEDUPE_LINK_ORGS_FILE || "/data/dedupe-link-orgs.json";
 // Manual org-color pins (XERK-145): siteKey -> palette slot 1..8, the operator's
 // override of the hash-assigned org color. Hub-owned durable state like the
 // auto-start opt-in (same reasons: per-org, tiny, must survive a restart, and
@@ -838,7 +844,7 @@ const STATE_FILE_MAX = positiveEnv(
 // temporal dead zone and the restore's own `catch {}` swallows the throw.
 const AGENT_CACHE_KEYS = [
   "history", "subagentHistory", "jiraIssues", "statusResults",
-  "priorityResults",
+  "priorityResults", "linkResults",
   "createMeta", "createTypes", "createResults", "resultWaits",
 ];
 
@@ -1493,6 +1499,45 @@ function setPriorityWriteBackOrg(siteKey, enabled) {
   sseBroadcast("priorityWriteBackOrgs", priorityWriteBackOrgs);
 }
 
+// ---- per-org duplicate linking opt-in (XERK-484) ---------------------------
+// The set of orgs the operator has switched duplicate linking ON for, keyed by
+// siteKey with the value simply `true` (presence = enabled; disabling deletes
+// the key). Writing issue links into someone's tracker is intrusive, so this is
+// OFF by default everywhere. Same shape and lifecycle as priorityWriteBackOrgs.
+let dedupeLinkOrgs = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(DEDUPE_LINK_ORGS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) if (v) dedupeLinkOrgs[k] = true;
+  }
+} catch {
+  /* first boot or no volume mounted */
+}
+let dlSaveTimer = null;
+function scheduleDedupeLinkSave() {
+  if (dlSaveTimer) return;
+  dlSaveTimer = setTimeout(() => {
+    dlSaveTimer = null;
+    fs.mkdir(path.dirname(DEDUPE_LINK_ORGS_FILE), { recursive: true }, () => {
+      fs.writeFile(DEDUPE_LINK_ORGS_FILE, JSON.stringify(dedupeLinkOrgs), (err) => {
+        if (err) console.error(`dedupe-link-orgs save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  dlSaveTimer.unref();
+}
+// Flip an org's duplicate-linking opt-in. The caller has already validated the
+// siteKey is one the fleet actually reports; this owns the map's bookkeeping.
+function setDedupeLinkOrg(siteKey, enabled) {
+  if (enabled) dedupeLinkOrgs[siteKey] = true;
+  else delete dedupeLinkOrgs[siteKey];
+  scheduleDedupeLinkSave();
+  // Rides the /api/agents payload (and its own SSE event), like the other
+  // per-org opt-ins, so open boards reflect the toggle without an ETag match.
+  invalidateAgentsCache();
+  sseBroadcast("dedupeLinkOrgs", dedupeLinkOrgs);
+}
+
 // ---- manual org colors (XERK-145) ------------------------------------------
 // The operator's per-org palette pins, keyed by siteKey with the value the slot
 // number (1..8). Loaded like the auto-start opt-in: only well-formed entries
@@ -1985,7 +2030,7 @@ function serializeAgent(key, agent, now) {
   // `unsupported` is NOT: it's a tiny, rarely-changing map of what this host's
   // agent can't do, worth reading.
   const { history, subagentHistory, jiraIssues, statusResults,
-          priorityResults,
+          priorityResults, linkResults,
           createMeta, createTypes, createResults, resultWaits, tokenBound,
           orgBound, ...a } = agent;
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
@@ -2022,7 +2067,7 @@ function buildAgentsCache() {
   // board-scoped, and hub-owned, so this is their one read channel (plus their
   // own SSE events for open boards).
   const body = JSON.stringify({
-    now, agents: list, ticketAgents, ticketModels, ticketRuntimes, autoStartOrgs, priorityWriteBackOrgs, orgColors,
+    now, agents: list, ticketAgents, ticketModels, ticketRuntimes, autoStartOrgs, priorityWriteBackOrgs, dedupeLinkOrgs, orgColors,
     // Per-repo importance tiers (XERK-487), hub-owned durable state keyed by
     // repo name. Only non-default tiers ride here; an absent repo is the default
     // middle tier. Board reads it to show/set a repo's tier; the ordering and
@@ -3446,6 +3491,39 @@ function ingestPriorityResults(agent, ticketPriorityResults) {
   }
 }
 
+// Duplicate-link outcomes (XERK-484): cache by cmdId like priorityResults, and
+// fold each into the sweep's suppression map. An ok result ("linked", "no-op",
+// or "skipped") suppresses STICKY: the pair is either linked in the tracker, or
+// a human removed our link and the agent's ledger keeps it that way — either
+// way re-queueing every 15s would be a relink storm. An error suppresses only
+// for the retry window, so a tracker that refused (bad link type, permissions)
+// is re-tried after DEDUPE_LINK_RETRY_MS instead of every sweep.
+function ingestTicketLinkResults(agent, ticketLinkResults) {
+  const now = Date.now();
+  for (const r of ticketLinkResults || []) {
+    if (!r || !r.cmdId) continue;
+    agent.linkResults[r.cmdId] = {
+      key: r.key || null, twinKey: r.twinKey || null, siteKey: r.siteKey || null,
+      ok: !!r.ok, error: r.error || null, action: r.action || null, at: now,
+    };
+    if (r.siteKey && r.key && r.twinKey) {
+      dedupeLinkSkips.set(
+        r.siteKey + "\x00" + r.key + "\x00" + r.twinKey,
+        { at: now, sticky: !!r.ok });
+    }
+  }
+  for (const [id, e] of Object.entries(agent.linkResults)) {
+    if (now - e.at > JIRA_ISSUE_MAX_AGE_MS) delete agent.linkResults[id];
+  }
+  const over = Object.keys(agent.linkResults).length - JIRA_ISSUE_MAX;
+  if (over > 0) {
+    Object.entries(agent.linkResults)
+      .sort((a, b) => a[1].at - b[1].at)
+      .slice(0, over)
+      .forEach(([id]) => delete agent.linkResults[id]);
+  }
+}
+
 // How long a staged session-start refusal (XERK-265) stays readable, and how
 // many one host may hold. It exists to answer a wait that is already running —
 // the Sessions page's SPAWN_FOLLOW_MS, or a migration — so minutes is generous.
@@ -3610,6 +3688,7 @@ function resultLanded(agent, cmdId, wait) {
   if (wait.kind === "createTicket") return !!(agent.createResults || {})[cmdId];
   if (wait.kind === "setTicketStatus") return !!(agent.statusResults || {})[cmdId];
   if (wait.kind === "setTicketPriority") return !!(agent.priorityResults || {})[cmdId];
+  if (wait.kind === "createDuplicateLink") return !!(agent.linkResults || {})[cmdId];
   return true;
 }
 
@@ -4188,7 +4267,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "sessions", "startedAt", "subscription", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
-  "ticketPriorityResults",
+  "ticketPriorityResults", "ticketLinkResults",
   "spawnFailures",
 ]);
 
@@ -7210,6 +7289,80 @@ function priorityWriteBackSweep() {
     }
   }
 }
+
+// --- Duplicate linking (XERK-484) -------------------------------------------
+// Per-org opt-in (see dedupeLinkOrgs above): when ON for an org, this sweep
+// queues a createDuplicateLink command for every ticket the classifier flagged
+// with triage.dedupeOf, so the tracker shows the pair as Jira "Duplicate"
+// links. The AGENT is the idempotency authority (live GET-links read beats a
+// hub-side assumption, and its ledger keeps a human's removal of a link
+// sticky); this sweep only DECIDES which pairs are still worth asking about.
+// Its suppression map (dedupeLinkSkips, keyed like the sweep builds it below,
+// off the agent's 50-char-truncated key) is filled by ingestTicketLinkResults:
+// an ok outcome suppresses sticky, an error until the retry window lapses.
+// Jira only: the issueLink API is Jira's, so non-Jira orgs are skipped even if
+// opted in, and the agent refuses them too — two layers, either one alone is
+// safe, both together mean an operator can't turn this on for an ADO org and
+// watch it fail.
+const DEDUPE_LINK_RETRY_MS = 10 * 60 * 1000;
+const DEDUPE_LINK_SKIP_MAX = 500;
+// (siteKey, key[:50], twin) -> {at, sticky}: the outcome an agent answered for
+// this pair. sticky === true (an ok result) never expires — relinking or
+// re-probing a confirmed pair would be the relink storm the ticket calls out;
+// sticky === false (an error) expires after DEDUPE_LINK_RETRY_MS.
+const dedupeLinkSkips = new Map();
+
+function orgsWithDedupeLink() {
+  return new Set(Object.keys(dedupeLinkOrgs).filter((k) => dedupeLinkOrgs[k]));
+}
+
+// A createDuplicateLink for this ticket already riding some org host's queue.
+function dedupeLinkInFlight(siteKey, issueKey) {
+  return Object.values(agents).some((a) =>
+    a.jira && a.jira.siteKey === siteKey &&
+    (a.commands || []).some(
+      (c) => c && c.type === "createDuplicateLink" && c.issueKey === issueKey));
+}
+
+function dedupeLinkSweep() {
+  const orgs = orgsWithDedupeLink();
+  if (!orgs.size) return;
+  const now = Date.now();
+  // Expire the non-sticky (error) entries, then cap the map oldest-first
+  // (Map keeps insertion order). A capped sticky entry only costs one
+  // re-attempt, which the agent's live links read answers with a no-op — or a
+  // sticky skip if its ledger says a human removed the link.
+  for (const [k, e] of dedupeLinkSkips) {
+    if (!e.sticky && now - e.at > DEDUPE_LINK_RETRY_MS) dedupeLinkSkips.delete(k);
+  }
+  const over = dedupeLinkSkips.size - DEDUPE_LINK_SKIP_MAX;
+  if (over > 0) {
+    for (const [k] of [...dedupeLinkSkips].slice(0, over)) {
+      dedupeLinkSkips.delete(k);
+    }
+  }
+  const rows = fleetTicketRows();
+  for (const siteKey of orgs) {
+    if (orgBoardSource(siteKey) !== "jira") continue; // issueLink is Jira's API
+    for (const { row: t, key } of ticketRowsForSite(rows, siteKey)) {
+      const twin = t && t.triage && t.triage.dedupeOf;
+      if (!twin || twin === key) continue; // no dedupe flag, or a self-flag
+      // Same 50-char-truncated keys the agent stages (and ingestTicketLinkResults
+      // keys the suppression map on), so long keys suppress too.
+      const sk = siteKey + "\x00" + String(key).slice(0, 50) + "\x00" + String(twin).slice(0, 50);
+      if (dedupeLinkSkips.has(sk)) continue; // answered: sticky or in retry window
+      if (dedupeLinkInFlight(siteKey, key)) continue;
+      const host = pickBoardWriteHost(siteKey, "createDuplicateLink");
+      if (!host) continue;
+      if (agentGapError(agents[host], "createDuplicateLink", "link duplicate tickets"))
+        continue;
+      const cmdId = queueCommand(
+        host, { type: "createDuplicateLink", issueKey: key, twinKey: twin });
+      awaitResult(agents[host], cmdId, "createDuplicateLink");
+      rememberCmdHost(cmdId, host, "createDuplicateLink");
+    }
+  }
+}
 // The lifecycle counterpart to autoStartSweep (XERK-45): when a ticket moves to
 // Done, stop the session(s) working it.
 //
@@ -7297,6 +7450,9 @@ setInterval(() => {
   autoStopSweep();
   // Triage -> tracker priority (XERK-483): gated per org; no-op unless opted in.
   priorityWriteBackSweep();
+  // Triage -> duplicate links (XERK-484): gated per org and Jira-only; no-op
+  // unless opted in.
+  dedupeLinkSweep();
   // Drained AFTER the sweeps so a ticket the sweep just queued can go out in the
   // same tick, and a session auto-stop just freed is seen by the drain the beat
   // it lands. The heartbeat drains too (that's where capacity actually changes);
@@ -8438,6 +8594,11 @@ const server = http.createServer(async (req, res) => {
       // human-set value (or a tracker error) isn't re-queued every 15s.
       const ticketPriorityResults = payload.ticketPriorityResults;
       delete payload.ticketPriorityResults;
+      // Duplicate-link outcomes (XERK-484) — cached by cmdId below like
+      // ticketPriorityResults, and folded into the sweep's suppression map so a
+      // linked (or human-removed) pair is not re-queued every 15s.
+      const ticketLinkResults = payload.ticketLinkResults;
+      delete payload.ticketLinkResults;
       // Session-creating commands this agent REFUSED since the last beat
       // (XERK-265) — cached by cmdId below and applied to any migration they
       // name, so a refusal fails the move now rather than at its timeout.
@@ -8504,6 +8665,9 @@ const server = http.createServer(async (req, res) => {
         // Per-cmdId triage-priority-write outcome cache (see the /priority
         // route, XERK-483); survives across beats like `statusResults`.
         priorityResults: prev.priorityResults || {},
+        // Per-cmdId duplicate-link outcome cache (XERK-484); survives across
+        // beats like `priorityResults` and is stripped from the fleet payload.
+        linkResults: prev.linkResults || {},
         // Per-cmdId refusals of a session-creating command (XERK-265). Survives
         // across beats like the caches above, but is SERVED with the record
         // rather than stripped — the client following that spawn is who needs it.
@@ -8627,6 +8791,7 @@ const server = http.createServer(async (req, res) => {
       ingestJiraIssues(next, jiraIssueResults);
       ingestStatusResults(next, ticketStatusResults);
       ingestPriorityResults(next, ticketPriorityResults);
+      ingestTicketLinkResults(next, ticketLinkResults);
       ingestCreateMeta(next, createMetaResults);
       ingestCreateResults(next, createTicketResults);
       // Scoped to the commands this host was actually given: `prev.commands` is
@@ -10573,6 +10738,27 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, enabled: body.enabled });
     }
 
+    // POST /api/jira/<siteKey>/dedupe-link — flip an org's duplicate-linking
+    // opt-in (XERK-484). Body: {enabled:true|false}. Same posture as
+    // /priority-writeback: hub-owned durable state, authoritative on return,
+    // the org must be one the fleet reports, the host need not be online.
+    // Writing issue links into a tracker is intrusive, so it stays OFF until
+    // explicitly enabled here.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "dedupe-link") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      if (typeof body.enabled !== "boolean") {
+        return json(res, 400, { error: "body needs {enabled:true|false}" });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      setDedupeLinkOrg(siteKey, body.enabled);
+      return json(res, 200, { ok: true, enabled: body.enabled });
+    }
+
     // POST /api/jira/<siteKey>/color — pin an org's palette color (XERK-145).
     // Body: {slot: 1..8} to pin, {auto:true} to release back to the
     // hash-assigned color. Hub-owned durable state like /autostart: the save is
@@ -11218,6 +11404,14 @@ if (process.env.TURMA_TEST) {
     orgsWithPriorityWriteBack,
     priorityWriteBackSweep,
     priorityWriteBackSkips,
+    // Duplicate-linking (XERK-484): per-org opt-in store, sweep, suppression map,
+    // and the setter the /dedupe-link route drives.
+    dedupeLinkOrgs,
+    setDedupeLinkOrg,
+    orgsWithDedupeLink,
+    dedupeLinkSweep,
+    dedupeLinkSkips,
+    ingestTicketLinkResults,
     orgColors,
     setOrgColor,
     // Per-repo importance tiers (XERK-487): the store and the read seams [E]'s

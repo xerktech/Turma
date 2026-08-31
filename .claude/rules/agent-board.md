@@ -19,7 +19,8 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
   `valid_issue_key()` are the dispatch shims every gate goes through; downstream reads `self.jira`
   unchanged.
 - Unset creds = feature off, **zero tracker HTTP**, `available:False`. **Nothing writes to the
-  tracker except the operator's own create (XERK-137) and status change (XERK-138).**
+  tracker except the operator's own create (XERK-137), status change (XERK-138), the hub-driven
+  triage priority write-back (XERK-483), and hub-driven duplicate linking (XERK-484).**
 - **On-demand issue detail**: a `{type:"jiraIssue", issueKey}` command (allowlist-checked against
   the key grammar) calls `fetch_jira_issue`/`fetch_azure_issue`, staging onto `jiraIssueResults`.
   **Every failure path stages a result carrying an `error` instead of raising**; an ADO
@@ -79,6 +80,19 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
 - **An agent that predates a write command still ACKs it** (a poison command must not retry
   forever), so these commands **stage their result in the SAME `handle_commands` call** — never move
   the staging to a later beat.
+- `createDuplicateLink` (XERK-484) links two Jira issues as Duplicates
+  (`POST /rest/api/3/issueLink`, outward = the flagged ticket, inward = its `triage.dedupeOf` twin).
+  **Jira-only**: an ADO host stages a refusal, no HTTP. Idempotency is layered —
+  1. a live `GET /issue/{key}/links` read is the source of truth: the link already exists →
+     `ok, action:"no-op"`, no POST;
+  2. the durable ledger `~/.turma/jira-duplicate-links.json`
+     (`DUPLICATE_LINK_LEDGER_PATH`, `<siteKey>/<issueKey>` → twin, bounded
+     `DUPLICATE_LINK_LEDGER_MAX`) makes HUMAN REMOVALS sticky — a pair we linked that Jira no longer
+     shows as linked is `ok, action:"skipped"`, never re-linked;
+  3. success → ledger entry + `ok, action:"linked"`. Every failure path (bad key, unconfigured,
+     HTTP error) stages `ok:false` with a bounded error, so the hub's suppression map can retry
+     (errors) or drop (oks) instead of re-queuing every sweep. Staged on `ticketLinkResults`,
+     same held-across-a-failed-POST lifecycle as the other results. Tests: `TestCreateDuplicateLink`.
 - Tests: `TestSetBoardStatus`, `TestAzureStatusOptions`, `TestCreateAzureIssue`,
   `TestAzure*Identit*`, `TestHttpErrorDetail`, `TestBoardColumn`.
 
