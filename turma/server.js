@@ -2044,6 +2044,13 @@ function serializeAgent(key, agent, now) {
     key,
     ...a,
     ...(durable || {}),
+    // Fold agent-overhead scratch repos (`hub-agent-mgr-*`, `.turma`) into one
+    // `Turma-System-Usage` block (XERK-338). `durable.repoUsage` is already folded
+    // (repoBlocks), so this only bites the raw path — a live host whose OWN
+    // heartbeat still names such a repo while the ledger does not augment
+    // (`fold` → null), which would otherwise serve the junk repo unfolded.
+    // Idempotent, and returns the list unchanged when nothing matches.
+    repoUsage: usageLedger.foldSystemRepos((durable && durable.repoUsage) || a.repoUsage),
     commands: publicCommands(a.commands),
     online,
     // An expected restart in progress (XERK-29): only meaningful while the host

@@ -146,6 +146,31 @@ paths:
 - Attribution is the `.meta` **`host`** field, never the archived file's NAME (a migrated session
   keeps its original archive name).
 
+### The system-usage fold (`Turma-System-Usage`)
+
+- **Agent-overhead repo series fold at SERVE time into one `Turma-System-Usage` block**
+  (`repoBlocks`/`isSystemUsageRepo` in `usage-ledger.js`) instead of listing dozens of phantom repos
+  on "By repo". The class is the manager's own `claude -p` helpers (naming/triage/probe, cwd under a
+  temp `REGISTRY_DIR`) that a recover run banked here — `hub-agent-mgr-<rand>` names / their
+  `-tmp-hub-agent-mgr-` slugs / `.turma`.
+- **Hub-side analogue of `hub-agent.py`'s `_sanitize_junk_repo_entries`** — those fold the same class
+  into `(root)` on the AGENT's ledger, which can NEVER reach this durable HUB store, so a phantom
+  already banked here (recover tool, or an agent predating those sanitizers) needs a hub-side fold.
+- **NON-DESTRUCTIVE**: the stored series are untouched, only the rendered output merges — so a purge
+  or a corrected classifier still has the raw history. One pure `foldSystemRepos(list)` (idempotent,
+  same-ref when nothing folds) is applied at BOTH serve points: `repoBlocks` (live-augmented hosts via
+  `fold`, removed hosts via `retiredAgents`) AND `serializeAgent`'s RAW path in `server.js` — a live
+  host whose OWN heartbeat still names an overhead repo has no ledger augment (`fold`→null), so its
+  raw `repoUsage` would otherwise serve the junk unfolded (the legacy-agent case the comment cites).
+- **DISTINCT repos are ADDITIVE** in the fold (`addUsageBlock`), unlike the per-day high-water raise a
+  single series takes across its OWN reports. Client `repoSeries` then merges every host's system
+  block into one cross-fleet line, so no client change is needed (parity-exempt: an ordinary block).
+- **The structural signatures (`hub-agent-mgr-*`/slug, `.turma`) can never name a real repo**;
+  host-specific junk (a home-dir username, `git`, `tmp` the recover tool slugified from an orphan cwd)
+  is OPERATOR-CONFIGURED via `USAGE_SYSTEM_REPOS` (CSV) after confirming from the archive it is not
+  real work — "reattribute the real ones, fold the rest". Tests: the system-usage cases in
+  `usage-ledger.test.js`, `usage-system-repos-env.test.js` (env read at require time, own process).
+
 ### Bounds
 
 - **`models` is capped (`USAGE_LEDGER_MODELS`), every agent-supplied NAME is length-bounded, and each

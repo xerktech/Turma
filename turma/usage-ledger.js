@@ -113,6 +113,58 @@ const LEDGER_MODELS = positiveEnv("USAGE_LEDGER_MODELS", 64);
 const hostShare = () => Math.max(64 << 10, Math.floor((LEDGER_MAX * 0.9) / LEDGER_HOSTS));
 const LEDGER_NAME_MAX = positiveEnv("USAGE_LEDGER_NAME_MAX", 200);
 
+// ---- system-usage fold ------------------------------------------------------
+//
+// Some repo series in this store name AGENT OVERHEAD, not a project: the
+// manager's own `claude -p` helpers (session naming, Jira triage, the model /
+// limits probes) run with cwd under a temp REGISTRY_DIR, and when a test/verify
+// harness boots the manager they land in ~/.claude/projects under a
+// worktree-shaped-but-not-real slug (`…-tmp-hub-agent-mgr-<rand>`, repo name
+// `hub-agent-mgr-<rand>`) — plus `.turma`, the agent's own home dir. A
+// `recover-usage-from-archive` run banked a fleet of these here as phantom repo
+// series (its README predicts "45 hub-agent-mgr-* scratch slugs … bare names no
+// live report can produce"), so the Usage page's "By repo" view listed dozens of
+// junk repos.
+//
+// They can never be a real repo, so they are FOLDED at SERVE time (`repoBlocks`)
+// into ONE honest `Turma-System-Usage` block rather than listed individually.
+// This is the hub-side analogue of hub-agent.py's `_sanitize_junk_repo_entries`
+// / `_is_internal_tool_slug`, which fold the SAME class into ROOT_REPO_NAME
+// agent-side — but those run on the AGENT's ledger and can never reach this
+// durable HUB store, so a phantom already banked here (from the recover tool, or
+// an agent build predating those sanitizers) needs a hub-side fold to leave the
+// page.
+//
+// NON-DESTRUCTIVE by design: the stored series are untouched — only the rendered
+// output merges — so a purge, an env change or a corrected classifier still has
+// the raw history, and `repoBlocks` runs for both live-augmented hosts (via
+// `fold`) and retired ones (via `retiredAgents`), so it is the one choke point.
+const SYSTEM_USAGE_REPO = "Turma-System-Usage";
+// Extra repo names the recover tool slugified from an orphan cwd that is not a
+// real repo (a home-dir username, `git`, `tmp`, …). These are host-specific, so
+// they are OPERATOR-CONFIGURED (CSV) rather than hardcoded fleet-wide, after the
+// operator confirms from the archive that the name is not real repo work — the
+// "reattribute the real ones, fold the rest" rule. The structural signatures
+// below never match a real repo; the configured set is the operator's own call.
+const SYSTEM_USAGE_EXTRA = new Set(
+  String(process.env.USAGE_SYSTEM_REPOS || "")
+    .split(",").map((s) => s.trim()).filter(Boolean)
+);
+// The manager's temp dir as a repo NAME (`hub-agent-mgr-<rand>`, always at the
+// START) or as a worktree-shaped project SLUG (`…-tmp-hub-agent-mgr-<rand>`,
+// which the `/tmp/hub-agent-mgr-*` registry dir always slugifies to with the
+// `tmp-` segment present). Requiring `tmp-` for the mid-string form is what
+// keeps a real repo that merely CONTAINS the substring (`my-hub-agent-mgr-tool`)
+// from being folded — it neither starts with the name nor carries `tmp-`.
+const HUB_AGENT_MGR_RE = /^hub-agent-mgr-|(?:^|-)tmp-hub-agent-mgr-/;
+function isSystemUsageRepo(remoteKey, repo) {
+  for (const v of [remoteKey, repo]) {
+    if (!v || typeof v !== "string") continue;
+    if (v === ".turma" || HUB_AGENT_MGR_RE.test(v) || SYSTEM_USAGE_EXTRA.has(v)) return true;
+  }
+  return false;
+}
+
 // The ledger is held in memory and serialized whole on every save, so it is
 // bounded as a FRACTION OF THE CONTAINER, like every other hub ceiling — a flat
 // number larger than `mem_limit` can never refuse anything before the OOM killer
@@ -860,6 +912,82 @@ function servedSeries(stored, live, now) {
   return render(merged, live, now);
 }
 
+// A rendered-usage accumulator for the system-usage fold. DISTINCT repos are
+// ADDITIVE (unlike the per-day HIGH-WATER raise a single series takes across its
+// own reports), so this sums whole rendered blocks — the shape `render` emits —
+// rather than merging stored series, which also lets a fold cover the
+// liveRepos-only branch below with no special case.
+function blankUsageAcc() {
+  return {
+    totals: blankBucket(), today: blankBucket(), week: blankBucket(),
+    days: {}, models: new Map(), sessions: 0, subagent: null, lastActivity: null,
+  };
+}
+function addUsageBlock(acc, u) {
+  if (!u || typeof u !== "object") return acc;
+  addBucket(acc.totals, u.totals);
+  addBucket(acc.today, u.today);
+  addBucket(acc.week, u.week);
+  if (u.days && typeof u.days === "object") {
+    for (const [d, b] of Object.entries(u.days)) addBucket(acc.days[d] || (acc.days[d] = blankBucket()), b);
+  }
+  if (Array.isArray(u.models)) {
+    for (const m of u.models) {
+      if (!m || typeof m.model !== "string" || !m.model) continue;
+      let cur = acc.models.get(m.model);
+      if (!cur) acc.models.set(m.model, cur = { totals: blankBucket(), today: blankBucket(), week: blankBucket() });
+      addBucket(cur.totals, m.totals); addBucket(cur.today, m.today); addBucket(cur.week, m.week);
+    }
+  }
+  acc.sessions += num(u.sessions);
+  if (u.subagent) {
+    acc.subagent = acc.subagent || { totals: blankBucket(), today: blankBucket(), week: blankBucket() };
+    addBucket(acc.subagent.totals, u.subagent.totals);
+    addBucket(acc.subagent.today, u.subagent.today);
+    addBucket(acc.subagent.week, u.subagent.week);
+  }
+  if (u.lastActivity && (!acc.lastActivity || u.lastActivity > acc.lastActivity)) acc.lastActivity = u.lastActivity;
+  return acc;
+}
+// The accumulator as a rendered usage block, matching `render`'s output (models
+// an array sorted biggest-first; `lastActivity`/`subagent` present only if set).
+function finalizeUsageAcc(acc) {
+  const out = {
+    totals: acc.totals, today: acc.today, week: acc.week, days: acc.days,
+    models: [...acc.models.entries()]
+      .map(([model, b]) => ({ model, totals: b.totals, today: b.today, week: b.week }))
+      .sort((x, y) => bucketTokens(y.totals) - bucketTokens(x.totals)),
+    sessions: acc.sessions,
+  };
+  if (acc.lastActivity) out.lastActivity = acc.lastActivity;
+  if (acc.subagent) out.subagent = acc.subagent;
+  return out;
+}
+
+/**
+ * Fold agent-overhead repo blocks into one `Turma-System-Usage` block (see
+ * SYSTEM_USAGE_REPO above). Pure and IDEMPOTENT: an already-folded list has no
+ * overhead-classed entry left (its own `Turma-System-Usage` block is not one),
+ * so it passes through untouched. Operates on rendered blocks, so it serves BOTH
+ * the ledger paths (`repoBlocks`) and server.js's raw-report path (a live host
+ * whose OWN heartbeat still names such a repo, where the ledger does not augment).
+ *
+ * Returns the input list UNCHANGED (same reference, no reorder) when nothing
+ * matches — so an ordinary fleet's served payload is byte-for-byte its report.
+ */
+function foldSystemRepos(list) {
+  if (!Array.isArray(list)) return list;
+  let sys = null;
+  const out = [];
+  for (const b of list) {
+    if (b && isSystemUsageRepo(b.remoteKey, b.repo)) sys = addUsageBlock(sys || blankUsageAcc(), b.usage);
+    else out.push(b);
+  }
+  if (!sys) return list;
+  out.push({ repo: SYSTEM_USAGE_REPO, remote: "", remoteKey: SYSTEM_USAGE_REPO, usage: finalizeUsageAcc(sys) });
+  return out;
+}
+
 function repoBlocks(entry, liveRepos, now) {
   const out = Object.entries(entry.repos).map(([remoteKey, slot]) => ({
     repo: slot.repo, remote: slot.remote, remoteKey,
@@ -875,7 +1003,10 @@ function repoBlocks(entry, liveRepos, now) {
       out.push({ repo: r.repo, remote: r.remote, remoteKey, usage: render(s, r.usage, now) });
     }
   }
-  return out.sort((a, b) => bucketTokens(b.usage.totals) - bucketTokens(a.usage.totals));
+  // Fold overhead into the system block, THEN sort (the block sorts by totals
+  // like every other repo). repoBlocks always sorts; `foldSystemRepos` alone does
+  // not, so server.js's raw path keeps the agent's own order when nothing folds.
+  return foldSystemRepos(out).sort((a, b) => bucketTokens(b.usage.totals) - bucketTokens(a.usage.totals));
 }
 
 /**
@@ -981,6 +1112,7 @@ module.exports = {
   ingest, fold, retiredAgents, forget, has,
   LEDGER_FILE, LEDGER_MAX, LEDGER_DAYS, LEDGER_HOSTS, LEDGER_REPOS, RETIRED_MAX,
   LEDGER_MODELS, LEDGER_NAME_MAX, hostShare,
+  SYSTEM_USAGE_REPO, isSystemUsageRepo, foldSystemRepos,
   // Test seams: the pure reducers, and a way to start from an empty store.
   _internals: {
     hosts: () => hosts,

@@ -1306,6 +1306,37 @@ test("safeAgentsCache serves something rather than failing the fleet payload", (
   assert.equal(typeof serializeAgentsForSave(), "string", "a healthy fleet still saves");
 });
 
+test("a live host reporting an overhead repo raw is still folded (XERK-338 seam)", () => {
+  // The fold's ledger paths cover augmented/retired hosts, but a LIVE host whose
+  // OWN heartbeat names an overhead repo has no ledger augment (fold -> null), so
+  // its raw repoUsage is served. serializeAgent folds that path too.
+  const u = (n) => ({
+    totals: { input: n, output: 0, cacheWrite: 0, cacheRead: 0 },
+    today: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 },
+    week: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 },
+    days: {}, models: [], sessions: 1,
+  });
+  agents["seam-host"] = {
+    key: "seam-host", device: "seam-host", lastSeen: Date.now(),
+    repoUsage: [
+      { repo: "Turma", remoteKey: "rk-turma", remote: "", usage: u(100) },
+      { repo: "hub-agent-mgr-abc", remoteKey: "hub-agent-mgr-abc", remote: "", usage: u(5) },
+      { repo: ".turma", remoteKey: ".turma", remote: "", usage: u(3) },
+    ],
+  };
+  invalidateAgentsCache();
+  try {
+    const served = JSON.parse(safeAgentsCache().body).agents.find((x) => x.key === "seam-host");
+    const keys = served.repoUsage.map((r) => r.remoteKey).sort();
+    assert.deepEqual(keys, ["Turma-System-Usage", "rk-turma"]);
+    const sys = served.repoUsage.find((r) => r.remoteKey === "Turma-System-Usage");
+    assert.equal(sys.usage.totals.input, 8); // 5 + 3, additive
+  } finally {
+    delete agents["seam-host"];
+    invalidateAgentsCache();
+  }
+});
+
 test("sessionWorking: a dead host's session is not still working (XERK-235)", () => {
   // paneBusy is a value on the record the host LAST PUSHED, so a host that dies
   // mid-turn leaves paneBusy:true behind. Without the online gate its session
