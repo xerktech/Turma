@@ -78,22 +78,62 @@ fun mergeTail(existing: List<TailEntry>, incoming: List<TailEntry>): List<TailEn
 }
 
 /**
- * Fold a `/history` page into the buffer — the web chat.js loadHistory
- * semantics, NOT a drop-duplicates prepend: history is the authoritative
- * chronological scrollback with the LOOSER per-block caps, so it seeds the
- * order and each already-known entry is re-merged on top, the heavier copy
- * winning per key. (The old drop-known-keys prepend left every entry stuck at
- * the 500-char heartbeat preview / 4000-char live-tail block cap it first
- * arrived with — the XERK-77 mid-sentence cutoff.) Buffer keys history doesn't
- * know are strictly newer live entries and keep their order at the end.
- * Returns the merged list and whether more history remains ([truncated]).
+ * Fold a `/history` WINDOW into the buffer — the web chat.js `foldHistory`
+ * semantics. History is the authoritative chronological scrollback with the
+ * LOOSER per-block caps, so where the two overlap the heavier copy wins per key
+ * (fixing the XERK-77 mid-sentence cutoff, where a drop-known-keys prepend left
+ * entries stuck at the heartbeat/live-tail cap).
+ *
+ * It is NOT `mergeTail(history, buffer)`: that seeds order from the history
+ * window and appends every buffer id history lacks at the END, so once the
+ * grow-only live buffer reaches further back than the bounded history window, a
+ * reload — fired by the poll fallback on every socket drop, common on mobile —
+ * dumped those PRE-window entries below history, older text out of order. This
+ * two-pointer merge instead syncs on the shared ids and preserves each side's
+ * transcript order: history's older head leads, and only the buffer entries
+ * newer than history's newest shared id trail it. [pickHeavier] mirrors
+ * [mergeTail]'s tie-break (the buffer/live copy wins an equal-weight tie, a
+ * blocks copy beats a text-only one).
+ *
+ * `existing` is the live buffer; `older` is the /history window. Returns the
+ * merged list and whether more history remains ([truncated]).
  */
 fun prependHistory(
     existing: List<TailEntry>,
     older: List<TailEntry>,
     truncated: Boolean,
 ): Pair<List<TailEntry>, Boolean> {
-    return Pair(mergeTail(older, existing), truncated)
+    return Pair(foldHistory(older, existing), truncated)
+}
+
+/** Order-preserving merge of a history window and the live buffer. See [prependHistory]. */
+fun foldHistory(history: List<TailEntry>, buffer: List<TailEntry>): List<TailEntry> {
+    val inHist = HashSet<String>()
+    for (h in history) if (h.key.isNotEmpty()) inHist.add(h.key)
+    val inBuf = HashSet<String>()
+    for (b in buffer) if (b.key.isNotEmpty()) inBuf.add(b.key)
+    fun pickHeavier(h: TailEntry, b: TailEntry): TailEntry =
+        if (entryWeight(b) >= entryWeight(h) || (b.blocks.isNotEmpty() && h.blocks.isEmpty())) b else h
+    val out = ArrayList<TailEntry>(history.size + buffer.size)
+    val seen = HashSet<String>()
+    fun pushOnce(e: TailEntry) { if (e.key.isNotEmpty() && seen.add(e.key)) out.add(e) }
+    var i = 0
+    var j = 0
+    while (i < history.size && j < buffer.size) {
+        val h = history[i]
+        val b = buffer[j]
+        if (h.key.isEmpty() || h.key in seen) { i++; continue }
+        if (b.key.isEmpty() || b.key in seen) { j++; continue }
+        if (h.key == b.key) { pushOnce(pickHeavier(h, b)); i++; j++; continue }
+        // Emit whichever entry precedes the next shared anchor; when neither is
+        // shared, history — the authoritative scrollback — leads.
+        if (b.key in inHist && h.key !in inBuf) { pushOnce(h); i++ }
+        else if (h.key in inBuf && b.key !in inHist) { pushOnce(b); j++ }
+        else { pushOnce(h); i++ }
+    }
+    while (i < history.size) { pushOnce(history[i]); i++ }
+    while (j < buffer.size) { pushOnce(buffer[j]); j++ }
+    return out
 }
 
 /** Reserved for callers needing the max weight across a list (e.g. tests). */

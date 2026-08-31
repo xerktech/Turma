@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending, isQwenSession, qwenRuntimeChipHtml, qwenModelChipHtml } = require("../public/chat.js");
+const { mergeTail, foldHistory, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending, isQwenSession, qwenRuntimeChipHtml, qwenModelChipHtml } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -52,6 +52,49 @@ test("mergeTail: history (looser caps, higher weight) replaces the live copy", (
   const merged = mergeTail(live, hist);
   assert.equal(merged[0].blocks[0].text, "short but much longer output");
   assert.ok(weight(hist[0]) > weight(live[0]));
+});
+
+test("foldHistory: a reload never drops the grow-only buffer's pre-window entries to the bottom", () => {
+  // The regression: the live buffer accumulates from open and is never trimmed,
+  // so it reaches further back than the bounded /history window. mergeTail(hist,
+  // buffer) seeds order from the window then appends the buffer's older ids at
+  // the END — older text out of order, worst on mobile where the poll fallback
+  // reloads on every socket drop. foldHistory must keep transcript order.
+  const buffer = ["e1", "e2", "e3", "e4", "e5"].map((id) =>
+    ({ id, role: "assistant", text: id }));
+  const historyWindow = ["e3", "e4", "e5"].map((id) => ({ id, role: "assistant", text: id }));
+  assert.deepEqual(mergeTail(historyWindow, buffer).map((e) => e.id),
+    ["e3", "e4", "e5", "e1", "e2"], "old behavior scrambled — the bug this fixes");
+  assert.deepEqual(foldHistory(historyWindow, buffer).map((e) => e.id),
+    ["e1", "e2", "e3", "e4", "e5"], "foldHistory keeps transcript order");
+});
+
+test("foldHistory: history's older head leads, newer live tail trails, overlap upgrades", () => {
+  // buffer opened mid-conversation (e2..e4); history reaches back to e1 and
+  // carries the fuller (looser-cap) copy of the overlap; e4 is a newer live-only
+  // entry past the snapshot.
+  const buffer = [
+    { id: "e2", role: "assistant", text: "cut off mid sen" },
+    { id: "e3", role: "assistant", text: "c" },
+    { id: "e4", role: "assistant", text: "newest live" },
+  ];
+  const historyWindow = [
+    { id: "e1", role: "user", text: "a" },
+    { id: "e2", role: "assistant", text: "cut off mid sentence no more" },
+    { id: "e3", role: "assistant", text: "c" },
+  ];
+  const merged = foldHistory(historyWindow, buffer);
+  assert.deepEqual(merged.map((e) => e.id), ["e1", "e2", "e3", "e4"]);
+  assert.equal(merged[1].text, "cut off mid sentence no more", "fuller history copy wins the overlap");
+});
+
+test("foldHistory: an initial load (tiny/empty buffer) adopts the whole window in order", () => {
+  const historyWindow = ["e1", "e2", "e3"].map((id) => ({ id, role: "assistant", text: id }));
+  assert.deepEqual(foldHistory(historyWindow, []).map((e) => e.id), ["e1", "e2", "e3"]);
+  // A live entry that raced in before history returns is kept, newest last.
+  assert.deepEqual(
+    foldHistory(historyWindow, [{ id: "e4", role: "assistant", text: "raced" }]).map((e) => e.id),
+    ["e1", "e2", "e3", "e4"]);
 });
 
 test("buildItems: user text -> right bubble; assistant text+tool_use pairs its result", () => {
