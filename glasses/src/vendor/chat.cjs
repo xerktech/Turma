@@ -641,9 +641,10 @@
     try { j = await r.json(); } catch { return; }
     if (myGen !== gen || !j || !Array.isArray(j.entries)) return;
     // History is the authoritative chronological scrollback (bigger byte window,
-    // looser per-block caps). Seed order from it, then re-merge any newer live
-    // entries already in the buffer on top.
-    buffer = mergeTail(j.entries, buffer);
+    // looser per-block caps). Fold it in preserving transcript order — never
+    // seed-then-append, which drops the grow-only buffer's pre-window entries
+    // below history out of order on every reload (foldHistory).
+    buffer = foldHistory(j.entries, buffer);
     if (Array.isArray(j.queued)) queuedPrompts = j.queued;
     repaint();
   }
@@ -700,6 +701,58 @@
       if (weight(inc) >= weight(cur) || (incHasBlocks && !curHasBlocks)) byId.set(inc.id, inc);
     }
     return order.map((id) => byId.get(id));
+  }
+
+  // Fold a /history WINDOW into the live buffer, preserving transcript order.
+  //
+  // Both `history` (the /history response) and `buffer` (the grow-only live
+  // buffer) are individually oldest-to-newest and share a common run of ids.
+  // The old code did `mergeTail(history, buffer)` — seed order from history,
+  // append every buffer id history didn't know at the END. That is wrong: the
+  // live buffer accumulates from the moment the chat opened and is never
+  // trimmed, so once it reaches further back than the (bounded) /history
+  // window, a reload — which the poll fallback fires on every socket drop, far
+  // more often on a flaky mobile link — appended all those PRE-window entries
+  // BELOW history, dropping older text to the bottom out of order.
+  //
+  // Instead do a two-pointer merge that syncs on the shared ids and keeps each
+  // side's own order: history is authoritative (looser caps) where they
+  // overlap, its older head leads, and only the buffer entries strictly newer
+  // than history's newest shared id — the live tail past the snapshot — trail
+  // it. pickHeavier mirrors mergeTail's tie-break (the buffer/live copy wins an
+  // equal-weight tie, a blocks copy beats a text-only one).
+  function foldHistory(history, buffer) {
+    history = history || [];
+    buffer = buffer || [];
+    const inHist = new Set();
+    for (const h of history) if (h && h.id != null) inHist.add(h.id);
+    const inBuf = new Set();
+    for (const b of buffer) if (b && b.id != null) inBuf.add(b.id);
+    const pickHeavier = (h, b) => {
+      const bBlocks = b.blocks && b.blocks.length;
+      const hBlocks = h.blocks && h.blocks.length;
+      return (weight(b) >= weight(h) || (bBlocks && !hBlocks)) ? b : h;
+    };
+    const out = [];
+    const seen = new Set();
+    let i = 0, j = 0;
+    const pushOnce = (e) => { if (e && e.id != null && !seen.has(e.id)) { seen.add(e.id); out.push(e); } };
+    while (i < history.length && j < buffer.length) {
+      const h = history[i], b = buffer[j];
+      if (!h || h.id == null || seen.has(h.id)) { i++; continue; }
+      if (!b || b.id == null || seen.has(b.id)) { j++; continue; }
+      if (h.id === b.id) { pushOnce(pickHeavier(h, b)); i++; j++; continue; }
+      // Emit whichever entry sits before the next shared anchor. A buffer-unique
+      // entry (history never has it) that precedes a shared id goes now; a
+      // history-unique entry likewise. When neither is shared, history — the
+      // authoritative scrollback — leads.
+      if (inHist.has(b.id) && !inBuf.has(h.id)) { pushOnce(h); i++; }
+      else if (inBuf.has(h.id) && !inHist.has(b.id)) { pushOnce(b); j++; }
+      else { pushOnce(h); i++; }
+    }
+    for (; i < history.length; i++) pushOnce(history[i]);
+    for (; j < buffer.length; j++) pushOnce(buffer[j]);
+    return out;
   }
 
   // ---- build display items from rich entries --------------------------------
@@ -2768,7 +2821,7 @@
   // in the browser (no `module`); the browser path uses window.TurmaChat above.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
+      mergeTail, foldHistory, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, hasBackgroundAgents, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll,
       isBusy, updateComposeAction, updateLiveStatus, isToolBullet, sendFailure, isTooLong, TOO_LONG,

@@ -74,10 +74,24 @@ class TranscriptTest {
         assertEquals("the full live text", merged[0].text)
     }
 
-    @Test fun `prependHistory seeds order from history and appends newer live keys`() {
+    @Test fun `prependHistory keeps history's older head and trails newer live keys`() {
         val live = listOf(e("3", "assistant", "newest live"))
         val (merged, _) = prependHistory(live, listOf(e("1", "user", "a"), e("2", "assistant", "b")), truncated = false)
         assertEquals(listOf("1", "2", "3"), merged.map { it.key })
+    }
+
+    @Test fun `prependHistory never drops the grow-only buffer's pre-window entries to the bottom`() {
+        // The regression (worst on mobile, where the poll fallback reloads on every
+        // socket drop): the live buffer accumulates from open and outgrows the
+        // bounded history window, so mergeTail(history, buffer) appended those
+        // pre-window entries BELOW history — older text out of order.
+        val buffer = listOf("1", "2", "3", "4", "5").map { e(it, "assistant", it) }
+        val historyWindow = listOf("3", "4", "5").map { e(it, "assistant", it) }
+        // Old behavior scrambled: [3,4,5,1,2].
+        assertEquals(listOf("3", "4", "5", "1", "2"), mergeTail(historyWindow, buffer).map { it.key })
+        // Fixed: transcript order preserved.
+        val (merged, _) = prependHistory(buffer, historyWindow, truncated = false)
+        assertEquals(listOf("1", "2", "3", "4", "5"), merged.map { it.key })
     }
 
     @Test fun `mergeTail ignores empty deltas`() {
