@@ -18401,15 +18401,37 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         self.assertNotIn("mtime", m)  # internal sort key stripped
         self.assertNotIn("path", m)   # internal read path stripped
 
-    def test_manifest_excludes_running_session_slug(self):
+    def test_manifest_keeps_a_running_worktree_session_rendered_only(self):
+        # A running WORKTREE-backed session now stays in the manifest so its
+        # rendered transcript materializes on the hub while it runs (that is what
+        # lets the chat serve instant scrollback from the archive). Its RAW
+        # sidecars are deferred to session end, so rawFiles stays empty — only a
+        # live dsh session ships raw while running.
         sm = self.make_manager()
         wt = "/w/.turma/worktrees/Turma/live"
         self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
         self._ledger(sm, wt)
         sm.registry = [{"id": "s", "worktreePath": wt, "status": "running"}]
-        self.assertEqual(sm._archive_manifest(), [])
-        # Once it stops, it becomes eligible.
+        manifest = sm._archive_manifest()
+        self.assertEqual(len(manifest), 1)
+        self.assertEqual(manifest[0]["transcriptId"], "t1")
+        self.assertFalse(manifest[0].get("rawFiles"))  # raw deferred to session end
+        # Once it stops, its raw sidecars become eligible too.
         sm.registry = [{"id": "s", "worktreePath": wt, "status": "stopped"}]
+        self.assertEqual(len(sm._archive_manifest()), 1)
+
+    def test_manifest_excludes_a_running_ROOT_session(self):
+        # A root session shares one slug across every root session ever (XERK-6),
+        # so un-excluding it would sync every root conversation under one slug —
+        # it stays on the on-demand path while running.
+        sm = self.make_manager()
+        self._write_transcript(ha.REPOS_ROOT, "r1.jsonl", [_text_entry("u1", "user", "hi")])
+        sm.usage_ledger[ha.REPOS_ROOT] = {"repo": "(root)", "remote": "",
+                                          "slug": ha._project_slug(ha.REPOS_ROOT)}
+        sm.registry = [{"id": "s", "root": True, "status": "running"}]
+        self.assertEqual(sm._archive_manifest(), [])
+        # Once the root session stops, its transcript becomes eligible.
+        sm.registry = [{"id": "s", "root": True, "status": "stopped"}]
         self.assertEqual(len(sm._archive_manifest()), 1)
 
     def test_manifest_keeps_a_running_dsh_session_so_its_trajectory_populates(self):
@@ -18438,15 +18460,26 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         # Trajectory route matches (turma/archive.js dshEventsFile).
         rels = {rel for rel, _ in (m.get("rawFiles") or [])}
         self.assertIn("d1/dsh/events.jsonl", rels)
-        # A running CLAUDE session in another slug is still excluded.
+        # A running CLAUDE session in another slug is ALSO kept now (rendered), so
+        # its chat scrollback materializes hub-side — but RENDERED ONLY: its raw
+        # sidecars are deferred to session end. Only the dsh session ships raw
+        # while running.
         claude_wt = "/w/.turma/worktrees/Turma/cc"
-        self._write_transcript(claude_wt, "c1.jsonl", [_text_entry("u2", "user", "hi")])
+        cc_slug = self._write_transcript(claude_wt, "c1.jsonl", [_text_entry("u2", "user", "hi")])
+        # A raw sidecar exists on disk; it must NOT be offered while running.
+        cc_sub = os.path.join(ha.PROJECTS_ROOT, cc_slug, "c1", "subagents")
+        os.makedirs(cc_sub, exist_ok=True)
+        with open(os.path.join(cc_sub, "agent-x.jsonl"), "w", encoding="utf-8") as f:
+            f.write('{"type":"user"}\n')
         sm.usage_ledger[claude_wt] = {"repo": "Turma",
                                       "remote": "git@github.com:xerk/Turma.git",
                                       "slug": ha._project_slug(claude_wt)}
         sm.registry.append({"id": "c", "worktreePath": claude_wt, "status": "running"})
-        got = {m["transcriptId"] for m in sm._archive_manifest()}
-        self.assertEqual(got, {"d1"})
+        by_tid = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        self.assertEqual(set(by_tid), {"d1", "c1"})
+        self.assertIn("d1/dsh/events.jsonl",
+                      {rel for rel, _ in (by_tid["d1"].get("rawFiles") or [])})
+        self.assertFalse(by_tid["c1"].get("rawFiles"))  # claude raw deferred
 
     # --- the manifest WINDOW (XERK-424) ---------------------------------
 

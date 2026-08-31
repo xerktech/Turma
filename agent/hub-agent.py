@@ -19693,16 +19693,43 @@ class SessionManager:
     # and the agent POSTs the missing append-only byte-range deltas.
 
     def _running_slugs(self):
-        """Project slugs backing a currently-RUNNING session — excluded from the
-        archive (their transcript is still being written; sync it once it ends).
+        """Project slugs excluded from the archive's RENDERED layer this beat.
 
-        A running DSH session is the one exception (`_live_dsh_slugs`): its native
-        event log is the ONLY viewer a headless dsh session has (there is no ttyd —
-        XERK-498), and the in-dashboard Trajectory reads that log back through the
-        raw archive layer. So it must sync WHILE it runs, or the Trajectory 404s for
-        the whole life of the session — which is exactly when the operator wants it.
-        Excluding it here (as every other running session is) is what breaks that."""
-        return self._running_slugs_all() - self._live_dsh_slugs()
+        Historically every running session was excluded (its transcript is still
+        being written; sync once it ends). Now a running WORKTREE-BACKED session is
+        KEPT in the manifest (`_live_worktree_slugs`) so its rendered transcript
+        materializes on the hub WHILE it runs — that is what lets the chat serve
+        instant scrollback from the archive instead of round-tripping to the agent
+        for `/history`. dsh already relied on this for its live Trajectory
+        (`_live_dsh_slugs`, which reads the RAW layer back); this widens the
+        rendered-layer inclusion to every runtime with a worktree.
+
+        Only a running ROOT session (shared slug across every root session ever, no
+        worktree) stays excluded: un-excluding it would sync every root
+        conversation under one slug, and the transcript-pin ambiguity (XERK-6) is
+        exactly what that shared slug carries. A worktree slug backs one session,
+        so keeping it archives only that session.
+
+        The RAW layer is bounded SEPARATELY: only a live DSH session ships raw while
+        running (its Trajectory reads it back); every other running session ships
+        RENDERED only and defers its raw sidecars to session end — see
+        `_archive_manifest`'s `offer_raw`."""
+        return self._running_slugs_all() - self._live_worktree_slugs()
+
+    def _live_worktree_slugs(self):
+        """Slugs backing a running WORKTREE-BACKED session, ANY runtime — the ones
+        kept in the rendered manifest while running (see `_running_slugs`). A
+        worktree slug is unique to its session; a root session (shared slug, no
+        worktree) is deliberately never included, the same guard `_live_dsh_slugs`
+        uses."""
+        slugs = set()
+        for s in self.registry:
+            if s.get("status") != "running":
+                continue
+            wt = s.get("worktreePath")
+            if wt:
+                slugs.add(_project_slug(wt))
+        return slugs
 
     def _running_slugs_all(self):
         """Every project slug backing a running session, dsh included."""
@@ -20185,6 +20212,11 @@ class SessionManager:
         known to be missing, then a rotation over the rest (XERK-424). It is not
         newest-by-mtime alone, because that never re-offers what falls out."""
         running = self._running_slugs()
+        # A running non-dsh session ships its RENDERED transcript (for instant chat
+        # scrollback) but DEFERS its raw sidecars to session end — bounding the
+        # continuous cost to prose deltas. Only a live dsh session ships raw while
+        # running (its Trajectory reads the raw layer back). `offer_raw` skips these.
+        defer_raw = self._live_worktree_slugs() - self._live_dsh_slugs()
         sess_meta = self._session_meta_by_slug()
         # slug -> {repo, remoteKey, worktree}, from the durable attribution ledger.
         slug_attr = {}
@@ -20262,6 +20294,9 @@ class SessionManager:
             """Attach up to `room` of this transcript's sidecars. Returns spend."""
             nonlocal raw_budget, spent_recent
             if room <= 0 or m.get("rawFiles"):
+                return 0
+            # A running non-dsh session's raw sidecars are deferred to session end.
+            if m["slug"] in defer_raw:
                 return 0
             files = self._session_files(
                 os.path.join(PROJECTS_ROOT, m["slug"]), m["transcriptId"],
