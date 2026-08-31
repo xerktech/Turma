@@ -10267,6 +10267,37 @@ def _jira_status_options(key):
     return _shape_transitions(data.get("transitions"))
 
 
+def jira_priority_options():
+    """The org's available Jira priorities as [{name, default}] (XERK-483).
+
+    `default` is the tracker's own defaultFlag when it reports one; when it
+    doesn't, "Medium" (Jira's documented default for new issues) is taken as
+    the default only if the org actually offers it. The default is what the
+    conservative write rule reads as "the field is still untouched" — a value
+    that is neither the default nor one this host wrote is a human's and is
+    left alone. Returns [] on any failure: the caller reads that as "can't
+    verify" and refuses rather than guessing (like board_status_options)."""
+    try:
+        data = jira_get("/rest/api/3/field/priority", {})
+    except Exception as e:
+        log(f"jira priority options fetch failed: {e}")
+        return []
+    if isinstance(data, dict):
+        data = data.get("values") or data.get("priorities") or []
+    out = []
+    for p in data or []:
+        if not isinstance(p, dict):
+            continue
+        name = str(p.get("name") or "").strip()
+        if name:
+            out.append({"name": name, "default": p.get("defaultFlag") is True})
+    if not out:
+        return []
+    if not any(o["default"] for o in out) and "Medium" in [o["name"] for o in out]:
+        out = [dict(o, default=(o["name"] == "Medium")) for o in out]
+    return out
+
+
 def _shape_attachments(raw, name_of, size_of, url_of, mime_of=None):
     """The source-agnostic attachment list a detail carries (XERK-242):
     ([{name, size, url, mime}], total) — capped at TICKET_ATTACH_MAX, and the
@@ -11076,6 +11107,12 @@ _AZDO_FIELD_CACHE = {}
 # create fails rather than the description being dropped. Ordered by preference;
 # the first one the type actually has wins.
 AZDO_DESCRIPTION_FIELDS = ("System.Description", "Microsoft.VSTS.TCM.ReproSteps")
+# XERK-483: the fields a work-item type may carry a priority-ish value in, in
+# the order to prefer. Most types have Microsoft.VSTS.Common.Priority (1-4, 2
+# is the standard default); some process types expose only
+# Microsoft.VSTS.Common.Severity, which plays the same role for that type.
+AZDO_PRIORITY_FIELDS = ("Microsoft.VSTS.Common.Priority",
+                        "Microsoft.VSTS.Common.Severity")
 
 
 def _azure_type_fields(site_key, project, wtype):
@@ -11112,6 +11149,21 @@ def _azure_description_field(site_key, project, wtype):
     if not fields:
         return AZDO_DESCRIPTION_FIELDS[0]
     for ref in AZDO_DESCRIPTION_FIELDS:
+        if ref in fields:
+            return ref
+    return None
+
+
+def _azure_priority_field(site_key, project, wtype):
+    """The field to write a work item's triage priority into, or None to write
+    none at all (XERK-483) — bent to the field the work-item TYPE actually has,
+    exactly like _azure_description_field: an empty field list means "couldn't
+    ask", so it falls back to the common Priority field (right for every
+    standard type), and None only when the type demonstrably carries neither."""
+    fields = _azure_type_fields(site_key, project, wtype)
+    if not fields:
+        return AZDO_PRIORITY_FIELDS[0]
+    for ref in AZDO_PRIORITY_FIELDS:
         if ref in fields:
             return ref
     return None
@@ -11818,6 +11870,12 @@ JIRA_TRIAGE_INSTRUCTION = (
 # shared-login tunables as the repo triage, so a settled board costs nothing
 # and a busy board still never forks more than one model per job type.
 TICKET_TRIAGE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-triage.json")
+# Durable record of tracker priority values THIS host wrote (XERK-483):
+# {siteKey/issueKey: value}. A value the host itself wrote may be corrected on
+# re-triage; a value nobody here wrote that is not the tracker's default is a
+# human's and is never touched. Bounded by PRIORITY_WRITE_LEDGER_MAX.
+PRIORITY_WRITE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-priority-writes.json")
+PRIORITY_WRITE_LEDGER_MAX = 500
 # Fixed enums the model must pick from; anything else is a failed attempt.
 TRIAGE_TYPES = ("bug", "feature", "task", "chore", "improvement",
                 "documentation", "other")
@@ -11932,6 +11990,17 @@ def _triage_key(site_key, issue_key):
 # The normalized priority band a triage assessment carries (XERK-481); the
 # tracker's own label rides separately as `priorityName`.
 TRIAGE_PRIORITIES = ("P0", "P1", "P2", "P3")
+# XERK-483: the tracker value a triage band maps to when written back. Jira's
+# standard priority names (validated against the org's live priority options
+# before writing); ADO's 1-4 scale, 1 = most urgent — the board reports ADO
+# tickets as "P<value>", so the hub's sweep can compare band and tracker
+# value without knowing the tracker.
+JIRA_PRIORITY_FOR_BAND = {"P0": "Highest", "P1": "High", "P2": "Medium", "P3": "Low"}
+AZDO_PRIORITY_FOR_BAND = {"P0": 1, "P1": 2, "P2": 3, "P3": 4}
+# ADO's standard default for Microsoft.VSTS.Common.Priority: a ticket still at
+# 2 is one nobody has prioritised, so it counts as "still default" and may be
+# filled in.
+AZDO_DEFAULT_PRIORITY = 2
 
 
 def build_ticket_triage(assessment):
@@ -12682,6 +12751,10 @@ class SessionManager:
         # same held-across-a-failed-POST lifecycle as jira_issue_results.
         self.create_meta_results = []
         self.create_ticket_results = []
+        # Staged `setTicketPriority` results (XERK-483: the triage band written
+        # back to the tracker's priority field) — same held-across-a-failed-POST
+        # lifecycle as ticket_status_results above.
+        self.ticket_priority_results = []
         # Staged refusals of a command that was supposed to PRODUCE a session
         # (XERK-265) — each `{cmdId, migrationId, error, at}`, same lifecycle as
         # the results above. A resume/import this agent declined used to be a
@@ -12802,6 +12875,10 @@ class SessionManager:
         # at a time, same shared login.
         self.ticket_triage_ledger = self._load_ticket_triage_ledger()
         self.ticket_triage_job = None
+        # Durable record of the tracker priority values THIS host has written
+        # (XERK-483): what the host may correct on re-triage, as opposed to a
+        # value a human set, which is left alone.
+        self.priority_writes = self._load_priority_writes()
         # Durable transcript -> ticket attribution (persisted). Keeps the board's
         # ticket chips answerable after the session record behind them is gone —
         # killed, aged out of closed.json, or never in either. Backfilled from the
@@ -13182,6 +13259,31 @@ class SessionManager:
             os.replace(tmp, TICKET_TRIAGE_LEDGER_PATH)
         except OSError as e:
             log(f"ticket triage ledger save failed: {e}")
+
+    def _load_priority_writes(self):
+        try:
+            with open(PRIORITY_WRITE_LEDGER_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_priority_writes(self):
+        """Persist the host's own priority writes (XERK-483). Updated keys are
+        re-inserted (moved to the tail), so at the cap the oldest writes are
+        the ones dropped — losing a record can only make the rule MORE
+        conservative (a stale value reads as "not ours" and the write is
+        skipped), never less."""
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            while len(self.priority_writes) > PRIORITY_WRITE_LEDGER_MAX:
+                self.priority_writes.pop(next(iter(self.priority_writes)))
+            tmp = PRIORITY_WRITE_LEDGER_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.priority_writes, f, indent=2)
+            os.replace(tmp, PRIORITY_WRITE_LEDGER_PATH)
+        except OSError as e:
+            log(f"priority write ledger save failed: {e}")
 
     def _ticket_triage_due(self, tickets, now, site_key):
         """The tickets wanting an assessment right now: stale (never assessed,
@@ -19599,6 +19701,150 @@ class SessionManager:
         log(f"setTicketStatus: {k} -> {match['name']}")
         stage(ok=True, status=match["name"], statusCategory=match["category"])
 
+    # --- Triage priority write-back (XERK-483) -----------------------------
+    # The third agent->tracker write, after create (XERK-137) and status
+    # (XERK-138): the triage band's tracker value, written back to the ticket
+    # so the tracker's own priority field matches the triage. Opt-in per org at
+    # the hub (which decides WHEN to queue this command); the agent decides
+    # WHETHER to write at all, against a fresh read:
+    #
+    #   current == target              -> no-op (idempotent)
+    #   current == a value this host wrote -> correct it
+    #   current is the tracker's default   -> fill it
+    #   otherwise (a human's value)        -> leave it alone, report "skipped"
+    #
+    # Same staged-result / never-raise discipline as set_board_status.
+
+    def set_ticket_priority(self, cmd_id, issue_key, band):
+        """Handle a {type:"setTicketPriority"} command. Stages the outcome in
+        ticket_priority_results keyed by cmdId; the hub's poll route answers
+        from it. Every failure path stages an error, never raises (the
+        heartbeat loop must not die on one poisoned command), and the
+        tracker's own refusal words survive (BoardHttpError carries
+        _http_error_detail)."""
+        k = (issue_key or "").strip()
+        band = str(band or "").strip().upper()
+        result = {
+            "cmdId": cmd_id,
+            "key": k[:50],
+            "siteKey": None,
+            "band": band or None,
+            "ok": False,
+            "error": None,
+            "action": None,
+            "priority": None,
+        }
+
+        def stage(ok=False, action=None, priority=None, err=None):
+            if err is not None:
+                result["error"] = err
+            result["ok"] = ok and err is None
+            result["action"] = action
+            result["priority"] = priority
+            self.ticket_priority_results.append(result)
+
+        if not valid_issue_key(k):
+            return stage(err="not a valid issue key")
+        if not board_configured():
+            return stage(err="no board credentials on this host")
+        if band not in TRIAGE_PRIORITIES:
+            return stage(err=f"not a triage priority band: {band!r}")
+        result["siteKey"] = board_site_key()
+        lkey = _triage_key(result["siteKey"], k)
+        try:
+            detail = fetch_board_issue(k)
+        except Exception as e:
+            log(f"priority write: issue fetch failed for {k}: {e}")
+            return stage(err=str(e)[:200])
+
+        if not azure_configured():
+            # ---- Jira: write the standard priority name the band maps to.
+            opts = jira_priority_options()
+            if not opts:
+                return stage(err="couldn't read available priorities")
+            names = [o["name"] for o in opts]
+            target = JIRA_PRIORITY_FOR_BAND[band]
+            if target not in names:
+                # The org's priority scheme doesn't offer this name: saying so
+                # beats staging a write the tracker will refuse.
+                return stage(err=f"no '{target}' priority option in this org")
+            # The shaped detail exposes the priority name flat (like the
+            # board's wire shape), not under a raw "fields" key.
+            current = str(detail.get("priority") or "").strip()
+            if current == target:
+                return stage(ok=True, action="no-op", priority=current)
+            default = next((o["name"] for o in opts if o.get("default")), None)
+            if current and current != self.priority_writes.get(lkey) and current != default:
+                # A value neither this host wrote nor the tracker's default: a
+                # human's choice, and overwriting it is exactly what the opt-in
+                # exists to avoid. The hub's sweep stops re-queueing on this.
+                log(f"setTicketPriority: {k} priority {current!r} was not set by "
+                    f"this host and is not the default; leaving it (band {band})")
+                return stage(ok=True, action="skipped", priority=current)
+            try:
+                jira_req(
+                    f"/rest/api/3/issue/{urllib.parse.quote(k)}", {},
+                    body={"fields": {"priority": {"name": target}}})
+            except Exception as e:
+                log(f"priority change failed for {k}: {e}")
+                return stage(err=str(e)[:200])
+            self.priority_writes.pop(lkey, None)
+            self.priority_writes[lkey] = target
+            self._save_priority_writes()
+            log(f"setTicketPriority: {k} -> {target} (band {band})")
+            return stage(ok=True, action="written", priority=target)
+
+        # ---- Azure DevOps: write the 1-4 value into the field the type has.
+        # The shaped detail exposes project/type flat, like the board wire shape.
+        project = str(detail.get("project") or "").strip()
+        wtype = str(detail.get("type") or "").strip()
+        field = _azure_priority_field(result["siteKey"], project, wtype)
+        if field is None:
+            return stage(err=f"work-item type {wtype!r} has no priority or "
+                             f"severity field to write")
+        target = AZDO_PRIORITY_FOR_BAND[band]
+        try:
+            wi = azure_req(
+                f"/_apis/wit/workitems/{urllib.parse.quote(k)}",
+                {"fields": field})
+            current = (wi.get("fields") or {}).get(field)
+        except Exception as e:
+            log(f"priority write: work item read failed for {k}: {e}")
+            return stage(err=str(e)[:200])
+        if isinstance(current, str):
+            current = int(current) if current.strip().isdigit() else None
+        # Outgoing `priority` is the BOARD WIRE shape (f"P{n}", like
+        # _shape_azure_item), not the raw int, so hub-side comparisons and the
+        # poll route can compare it against board rows without knowing ADO.
+        wire = lambda v: f"P{v}"
+        if current == target:
+            return stage(ok=True, action="no-op", priority=wire(target))
+        mine = self.priority_writes.get(lkey)
+        # "Still default": Priority at its standard 2, or a Severity the type
+        # never set (empty). Anything else is a value a human chose.
+        still_default = (
+            current is None
+            or (field == AZDO_PRIORITY_FIELDS[0] and current == AZDO_DEFAULT_PRIORITY)
+        )
+        if current is not None and current != mine and not still_default:
+            log(f"setTicketPriority: {k} {field} {current!r} was not set by this "
+                f"host and is not the default; leaving it (band {band})")
+            return stage(ok=True, action="skipped", priority=wire(current))
+        try:
+            azure_req(
+                f"/_apis/wit/workitems/{urllib.parse.quote(k)}", {},
+                body=[{"op": "add", "path": f"/fields/{field}", "value": target}],
+                method="PATCH",
+                content_type="application/json-patch+json")
+        except Exception as e:
+            log(f"priority change failed for {k}: {e}")
+            return stage(err=str(e)[:200])
+        self.priority_writes.pop(lkey, None)
+        self.priority_writes[lkey] = target
+        self._save_priority_writes()
+        log(f"setTicketPriority: {k} {field} -> {target} (band {band})")
+        return stage(ok=True, action="written", priority=wire(target))
+
     # --- New-ticket creation (XERK-137) -----------------------------------
     # The board's create form. Two staged results, same fail-into-`error`
     # discipline as _stage_jira_issue (the form is waiting on an answer either
@@ -22901,6 +23147,9 @@ class SessionManager:
                     self._stage_create_meta(cmd.get("project"))
                 elif ctype == "createTicket":
                     self._stage_create_ticket(cmd)
+                elif ctype == "setTicketPriority":
+                    self.set_ticket_priority(
+                        cid, cmd.get("issueKey"), cmd.get("priority"))
                 elif ctype == "setJiraRepo":
                     self.set_jira_repo(
                         cmd.get("issueKey"), cmd.get("repo"),
@@ -23950,6 +24199,8 @@ class SessionManager:
             payload["createMetaResults"] = list(self.create_meta_results)
         if self.create_ticket_results:
             payload["createTicketResults"] = list(self.create_ticket_results)
+        if self.ticket_priority_results:
+            payload["ticketPriorityResults"] = list(self.ticket_priority_results)
         if self.spawn_failures:
             payload["spawnFailures"] = list(self.spawn_failures)
         # Archive sync manifest on the slow cadence: the inactive transcripts the
@@ -24018,6 +24269,7 @@ class SessionManager:
             self.ticket_status_results.clear()  # delivered — same lifecycle
             self.create_meta_results.clear()  # delivered — same lifecycle
             self.create_ticket_results.clear()  # delivered — same lifecycle
+            self.ticket_priority_results.clear()  # delivered — same lifecycle
             self.spawn_failures.clear()  # delivered — same lifecycle
             return reply if isinstance(reply, dict) else {}
         except urllib.error.HTTPError as e:

@@ -163,6 +163,12 @@ const TICKET_RUNTIMES_MAX = 500;
 // /data volume, not the best-effort state.json, because the opt-in must survive a
 // hub restart.
 const AUTOSTART_ORGS_FILE = process.env.AUTOSTART_ORGS_FILE || "/data/autostart-orgs.json";
+// Per-org opt-in for triage priority write-back (XERK-483): when ON for an org,
+// the hub's sweep queues a setTicketPriority command so the tracker's own
+// priority field matches the triage band. Same hub-owned-durable rationale as
+// the auto-start opt-in: per-org, tiny, must survive a hub restart.
+const PRIORITY_WRITEBACK_ORGS_FILE =
+  process.env.PRIORITY_WRITEBACK_ORGS_FILE || "/data/priority-writeback-orgs.json";
 // Manual org-color pins (XERK-145): siteKey -> palette slot 1..8, the operator's
 // override of the hash-assigned org color. Hub-owned durable state like the
 // auto-start opt-in (same reasons: per-org, tiny, must survive a restart, and
@@ -827,6 +833,7 @@ const STATE_FILE_MAX = positiveEnv(
 // temporal dead zone and the restore's own `catch {}` swallows the throw.
 const AGENT_CACHE_KEYS = [
   "history", "subagentHistory", "jiraIssues", "statusResults",
+  "priorityResults",
   "createMeta", "createTypes", "createResults", "resultWaits",
 ];
 
@@ -1442,6 +1449,45 @@ function setAutoStartOrg(siteKey, enabled) {
   sseBroadcast("autoStartOrgs", autoStartOrgs);
 }
 
+// ---- per-org priority write-back opt-in (XERK-483) -------------------------
+// The set of orgs the operator has switched triage priority write-back ON for,
+// keyed by siteKey with the value simply `true` (presence = enabled; disabling
+// deletes the key). Writing priority into someone's tracker is intrusive, so
+// this is OFF by default everywhere. Same shape and lifecycle as autoStartOrgs.
+let priorityWriteBackOrgs = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(PRIORITY_WRITEBACK_ORGS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) if (v) priorityWriteBackOrgs[k] = true;
+  }
+} catch {
+  /* first boot or no volume mounted */
+}
+let pwSaveTimer = null;
+function schedulePriorityWriteBackSave() {
+  if (pwSaveTimer) return;
+  pwSaveTimer = setTimeout(() => {
+    pwSaveTimer = null;
+    fs.mkdir(path.dirname(PRIORITY_WRITEBACK_ORGS_FILE), { recursive: true }, () => {
+      fs.writeFile(PRIORITY_WRITEBACK_ORGS_FILE, JSON.stringify(priorityWriteBackOrgs), (err) => {
+        if (err) console.error(`priority-writeback-orgs save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  pwSaveTimer.unref();
+}
+// Flip an org's priority write-back opt-in. The caller has already validated the
+// siteKey is one the fleet actually reports; this owns the map's bookkeeping.
+function setPriorityWriteBackOrg(siteKey, enabled) {
+  if (enabled) priorityWriteBackOrgs[siteKey] = true;
+  else delete priorityWriteBackOrgs[siteKey];
+  schedulePriorityWriteBackSave();
+  // Rides the /api/agents payload (and its own SSE event), like the auto-start
+  // opt-in, so open boards reflect the toggle without waiting out an ETag match.
+  invalidateAgentsCache();
+  sseBroadcast("priorityWriteBackOrgs", priorityWriteBackOrgs);
+}
+
 // ---- manual org colors (XERK-145) ------------------------------------------
 // The operator's per-org palette pins, keyed by siteKey with the value the slot
 // number (1..8). Loaded like the auto-start opt-in: only well-formed entries
@@ -1934,6 +1980,7 @@ function serializeAgent(key, agent, now) {
   // `unsupported` is NOT: it's a tiny, rarely-changing map of what this host's
   // agent can't do, worth reading.
   const { history, subagentHistory, jiraIssues, statusResults,
+          priorityResults,
           createMeta, createTypes, createResults, resultWaits, tokenBound,
           orgBound, ...a } = agent;
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
@@ -1970,7 +2017,7 @@ function buildAgentsCache() {
   // board-scoped, and hub-owned, so this is their one read channel (plus their
   // own SSE events for open boards).
   const body = JSON.stringify({
-    now, agents: list, ticketAgents, ticketModels, ticketRuntimes, autoStartOrgs, orgColors,
+    now, agents: list, ticketAgents, ticketModels, ticketRuntimes, autoStartOrgs, priorityWriteBackOrgs, orgColors,
     // Per-repo importance tiers (XERK-487), hub-owned durable state keyed by
     // repo name. Only non-default tiers ride here; an absent repo is the default
     // middle tier. Board reads it to show/set a repo's tier; the ordering and
@@ -3327,6 +3374,46 @@ function ingestStatusResults(agent, ticketStatusResults) {
   }
 }
 
+// Per-cmdId cache of triage-priority write outcomes (XERK-483), mirroring
+// ingestStatusResults: keyed by cmdId so the /priority poll route answers the
+// specific write it made, pruned oldest-first on the same bounds as the
+// status cache. ALSO folds each outcome into the sweep's suppression map: an
+// ERROR suppresses unconditionally for the retry window (a refusing tracker
+// must not be hammered), while a successful "skipped" (the value was a
+// human's) suppresses only while the tracker still shows the value the agent
+// reported — once that changes, the sweep re-evaluates. "written"/"no-op"
+// need no suppression of their own: the tracker value now equals the target,
+// so the sweep's primary match-check skips the ticket.
+function ingestPriorityResults(agent, ticketPriorityResults) {
+  const now = Date.now();
+  for (const r of ticketPriorityResults || []) {
+    if (!r || !r.cmdId) continue;
+    agent.priorityResults[r.cmdId] = {
+      key: r.key || null, siteKey: r.siteKey || null, band: r.band || null,
+      ok: !!r.ok, error: r.error || null, action: r.action || null,
+      priority: r.priority ?? null, at: now,
+    };
+    if (r.siteKey && r.key && r.band) {
+      const suppressValue = r.ok && r.action === "skipped"
+        ? (r.priority ?? null)
+        : null;
+      priorityWriteBackSkips.set(
+        r.siteKey + "\x00" + r.key + "\x00" + r.band,
+        { at: now, prio: suppressValue });
+    }
+  }
+  for (const [id, e] of Object.entries(agent.priorityResults)) {
+    if (now - e.at > JIRA_ISSUE_MAX_AGE_MS) delete agent.priorityResults[id];
+  }
+  const over = Object.keys(agent.priorityResults).length - JIRA_ISSUE_MAX;
+  if (over > 0) {
+    Object.entries(agent.priorityResults)
+      .sort((a, b) => a[1].at - b[1].at)
+      .slice(0, over)
+      .forEach(([id]) => delete agent.priorityResults[id]);
+  }
+}
+
 // How long a staged session-start refusal (XERK-265) stays readable, and how
 // many one host may hold. It exists to answer a wait that is already running —
 // the Sessions page's SPAWN_FOLLOW_MS, or a migration — so minutes is generous.
@@ -3490,6 +3577,7 @@ function resultLanded(agent, cmdId, wait) {
   }
   if (wait.kind === "createTicket") return !!(agent.createResults || {})[cmdId];
   if (wait.kind === "setTicketStatus") return !!(agent.statusResults || {})[cmdId];
+  if (wait.kind === "setTicketPriority") return !!(agent.priorityResults || {})[cmdId];
   return true;
 }
 
@@ -4068,6 +4156,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "sessions", "startedAt", "subscription", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
+  "ticketPriorityResults",
   "spawnFailures",
 ]);
 
@@ -6997,6 +7086,93 @@ function autoStartSweep() {
     }
   }
 }
+
+// --- Triage priority write-back (XERK-483) -----------------------------------
+// Per-org opt-in (see priorityWriteBackOrgs above): when ON for an org, this
+// sweep queues a setTicketPriority command for every ticket whose triage band
+// disagrees with the tracker's own priority, so the tracker field matches the
+// triage. The AGENT re-checks a fresh read before writing (it never overwrites
+// a human-set value); its staged result lands in priorityResults, where the
+// /priority poll route and this sweep's suppression map read it back.
+const PRIORITY_WRITEBACK_RETRY_MS = 10 * 60 * 1000;
+const PRIORITY_WRITEBACK_SKIP_MAX = 500;
+// (siteKey, key, band) -> {at, prio}: the tracker value an agent outcome
+// answered about. prio === null means "suppress regardless of value" (an
+// error, or a write/no-op that already matches the target); a non-null prio
+// suppresses only while the tracker still shows exactly that value, so a
+// later human change re-arms the sweep.
+const priorityWriteBackSkips = new Map();
+
+// The tracker value a triage band maps to, per source. Jira's standard
+// priority names; ADO's 1-4 scale spelled the way the board reports it
+// ("P1".."P4"), so comparisons run against the board row's own string.
+const BAND_TO_TRACKER_PRIORITY = {
+  jira: { P0: "Highest", P1: "High", P2: "Medium", P3: "Low" },
+  azure: { P0: "P1", P1: "P2", P2: "P3", P3: "P4" },
+};
+
+function orgsWithPriorityWriteBack() {
+  return new Set(
+    Object.keys(priorityWriteBackOrgs).filter((k) => priorityWriteBackOrgs[k]));
+}
+
+// Which tracker source a siteKey is polled from: the first reporting host
+// whose jira block names it. An org is only ever served by one source type;
+// "jira" is the safe default for an unknown source.
+function orgBoardSource(siteKey) {
+  for (const a of Object.values(agents)) {
+    const j = a && a.jira;
+    if (j && j.siteKey === siteKey && (j.source === "jira" || j.source === "azure"))
+      return j.source;
+  }
+  return "jira";
+}
+
+// A setTicketPriority for this ticket already riding some org host's queue.
+function setTicketPriorityInFlight(siteKey, issueKey) {
+  return Object.values(agents).some((a) =>
+    a.jira && a.jira.siteKey === siteKey &&
+    (a.commands || []).some(
+      (c) => c && c.type === "setTicketPriority" && c.issueKey === issueKey));
+}
+
+function priorityWriteBackSweep() {
+  const orgs = orgsWithPriorityWriteBack();
+  if (!orgs.size) return;
+  const now = Date.now();
+  // Expire the suppression map, then cap it oldest-first (Map keeps
+  // insertion order).
+  for (const [k, e] of priorityWriteBackSkips) {
+    if (now - e.at > PRIORITY_WRITEBACK_RETRY_MS) priorityWriteBackSkips.delete(k);
+  }
+  const over = priorityWriteBackSkips.size - PRIORITY_WRITEBACK_SKIP_MAX;
+  if (over > 0) {
+    for (const [k] of [...priorityWriteBackSkips].slice(0, over)) {
+      priorityWriteBackSkips.delete(k);
+    }
+  }
+  const rows = fleetTicketRows();
+  for (const siteKey of orgs) {
+    const map = BAND_TO_TRACKER_PRIORITY[orgBoardSource(siteKey)];
+    for (const { row: t, key } of ticketRowsForSite(rows, siteKey)) {
+      const band = t && t.triage && t.triage.priority;
+      if (!band || !map[band]) continue;             // no triage band, or unknown band
+      if (String(t.priority || "") === map[band]) continue; // tracker already agrees
+      const sk = siteKey + "\x00" + key + "\x00" + band;
+      const sup = priorityWriteBackSkips.get(sk);
+      if (sup && (sup.prio === null || String(t.priority || "") === String(sup.prio)))
+        continue;                                    // recently answered, value unchanged
+      if (setTicketPriorityInFlight(siteKey, key)) continue;
+      const host = pickBoardWriteHost(siteKey, "setTicketPriority");
+      if (!host) continue;
+      if (agentGapError(agents[host], "setTicketPriority", "write a ticket's priority"))
+        continue;
+      const cmdId = queueCommand(host, { type: "setTicketPriority", issueKey: key, priority: band });
+      awaitResult(agents[host], cmdId, "setTicketPriority");
+      rememberCmdHost(cmdId, host, "setTicketPriority");
+    }
+  }
+}
 // The lifecycle counterpart to autoStartSweep (XERK-45): when a ticket moves to
 // Done, stop the session(s) working it.
 //
@@ -7082,6 +7258,8 @@ setInterval(() => {
   reclaimStrandedTicketSpawns();
   autoStartSweep();
   autoStopSweep();
+  // Triage -> tracker priority (XERK-483): gated per org; no-op unless opted in.
+  priorityWriteBackSweep();
   // Drained AFTER the sweeps so a ticket the sweep just queued can go out in the
   // same tick, and a session auto-stop just freed is seen by the drain the beat
   // it lands. The heartbeat drains too (that's where capacity actually changes);
@@ -8218,6 +8396,11 @@ const server = http.createServer(async (req, res) => {
       delete payload.createMetaResults;
       const createTicketResults = payload.createTicketResults;
       delete payload.createTicketResults;
+      // Triage-priority write outcomes (XERK-483) — cached by cmdId below like
+      // ticketStatusResults, and folded into the sweep's suppression map so a
+      // human-set value (or a tracker error) isn't re-queued every 15s.
+      const ticketPriorityResults = payload.ticketPriorityResults;
+      delete payload.ticketPriorityResults;
       // Session-creating commands this agent REFUSED since the last beat
       // (XERK-265) — cached by cmdId below and applied to any migration they
       // name, so a refusal fails the move now rather than at its timeout.
@@ -8281,6 +8464,9 @@ const server = http.createServer(async (req, res) => {
         // Per-cmdId board-status-change outcome cache (see the /status route,
         // XERK-138); survives across beats like `jiraIssues`.
         statusResults: prev.statusResults || {},
+        // Per-cmdId triage-priority-write outcome cache (see the /priority
+        // route, XERK-483); survives across beats like `statusResults`.
+        priorityResults: prev.priorityResults || {},
         // Per-cmdId refusals of a session-creating command (XERK-265). Survives
         // across beats like the caches above, but is SERVED with the record
         // rather than stripped — the client following that spawn is who needs it.
@@ -8403,6 +8589,7 @@ const server = http.createServer(async (req, res) => {
       ingestSubagentHistory(next, subagentHistoryResults);
       ingestJiraIssues(next, jiraIssueResults);
       ingestStatusResults(next, ticketStatusResults);
+      ingestPriorityResults(next, ticketPriorityResults);
       ingestCreateMeta(next, createMetaResults);
       ingestCreateResults(next, createTicketResults);
       // Scoped to the commands this host was actually given: `prev.commands` is
@@ -9960,6 +10147,32 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // GET /api/jira/<siteKey>/<issueKey>/priority?cmdId=<id> — poll the outcome
+    // of a priority write queued by the sweep (XERK-483). {pending:true} until
+    // the agent's heartbeat carries the result for that cmdId, then
+    // {ok, error, action, priority}: action is "written" (the band was applied),
+    // "no-op" (already at that value), or "skipped" (a human-set value was left
+    // alone — the sweep stops re-queueing on this). Keyed by cmdId for the same
+    // reason the /status route is.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "priority") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      const cmdId = url.searchParams.get("cmdId");
+      if (!cmdId) return json(res, 400, { error: "cmdId required" });
+      const key = commandHost(siteKey, cmdId, "setTicketPriority", "priorityResults")
+        || findJiraHost(siteKey, false);
+      if (!key) return json(res, 404, { error: "no host reports that org" });
+      const r = (agents[key].priorityResults || {})[cmdId];
+      if (!r) return json(res, 200, { pending: true });
+      return json(res, 200, {
+        ok: r.ok, error: r.error, action: r.action, priority: r.priority,
+      });
+    }
+
     // POST /api/jira/<siteKey>/<issueKey>/session -> start a session to work
     // this ticket (the board card's start button).
     //
@@ -10283,6 +10496,27 @@ const server = http.createServer(async (req, res) => {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       setAutoStartOrg(siteKey, body.enabled);
+      return json(res, 200, { ok: true, enabled: body.enabled });
+    }
+
+    // POST /api/jira/<siteKey>/priority-writeback — flip an org's triage
+    // priority write-back opt-in (XERK-483). Body: {enabled:true|false}.
+    // Same posture as /autostart: hub-owned durable state, authoritative on
+    // return, the org must be one the fleet reports, the host need not be
+    // online. Writing tracker fields is intrusive, so it stays OFF until
+    // explicitly enabled here.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "priority-writeback") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      if (typeof body.enabled !== "boolean") {
+        return json(res, 400, { error: "body needs {enabled:true|false}" });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      setPriorityWriteBackOrg(siteKey, body.enabled);
       return json(res, 200, { ok: true, enabled: body.enabled });
     }
 
@@ -10926,6 +11160,11 @@ if (process.env.TURMA_TEST) {
     autoStopped,
     autoStartOrgs,
     setAutoStartOrg,
+    priorityWriteBackOrgs,
+    setPriorityWriteBackOrg,
+    orgsWithPriorityWriteBack,
+    priorityWriteBackSweep,
+    priorityWriteBackSkips,
     orgColors,
     setOrgColor,
     // Per-repo importance tiers (XERK-487): the store and the read seams [E]'s
