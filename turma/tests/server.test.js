@@ -177,6 +177,11 @@ const {
   TICKET_QUEUE_EXPIRED_TTL_MS, logQueueState, TICKET_QUEUE_NOTES_MAX,
   ticketQueueAdmission, TICKET_QUEUE_MAX, TICKET_QUEUE_ERROR_MAX, TICKET_QUEUE_STALE_MS,
   TICKET_QUEUE_BLOCKED_MAX_MS,
+  // XERK-485 [E]: triage gate, priority key, drain order, and the org rate limit.
+  triageGateReason, triageSortKey, ticketQueueOrder,
+  TRIAGE_PRIORITY_RANK, TRIAGE_TYPE_WEIGHT, NO_PRIORITY_RANK, NO_TYPE_WEIGHT,
+  TICKET_QUEUE_RATE_MAX, TICKET_QUEUE_RATE_WINDOW_MS, autoStartRate,
+  recordAutoStartRate, refundAutoStartRate,
   orgColors, setOrgColor,
   repoTiers, repoTier, repoTierRank, isRepoIgnored, setRepoTier,
   DEFAULT_REPO_TIER, REPO_TIERS,
@@ -6146,7 +6151,8 @@ const asBeat = async (device, site, {
   autoStart = true, repos = ["Turma"], capacity, user,
   sessions = [], closedSessions = [],
   tickets = [{ key: "ENG-5", summary: "Fix it", statusCategory: "todo",
-               repoGuess: { repo: "Turma", cloned: true } }],
+               repoGuess: { repo: "Turma", cloned: true },
+               triage: { priority: "P2", type: "task", actionable: true } }],
   fetchedAt = "2026-07-14T12:00:00Z",
   ticketPriorityResults,
   ticketLinkResults,
@@ -6176,6 +6182,7 @@ const asBeat = async (device, site, {
 // starts from a clean slate (no org left opted in by a prior test).
 const resetAutoStart = () => {
   autoStarted.clear();
+  autoStartRate.clear();
   ticketQueue.length = 0;
   for (const k of Object.keys(autoStartOrgs)) delete autoStartOrgs[k];
 };
@@ -6214,7 +6221,8 @@ test("auto-start: only To Do tickets, and only ones with a repo assigned", async
       { key: "ENG-3", statusCategory: "todo",
         repoGuess: { repo: null, cloned: false } },           // "no repo fits"
       { key: "ENG-4", statusCategory: "todo",
-        repoGuess: { repo: "Turma", cloned: true } },         // eligible
+        repoGuess: { repo: "Turma", cloned: true },
+        triage: { priority: "P2", type: "task", actionable: true } }, // eligible
     ],
   });
   autoStartRound();
@@ -6986,8 +6994,10 @@ test("XERK-296: a pinned agent that's full is waited for, not routed around", as
 test("XERK-296: turning Auto off clears that org's auto-queued tickets and nothing else", async () => {
   resetAutoStart();
   await asBeat("tqAuto", "tq8.atlassian.net", { capacity: FULL, tickets: [
-    { key: "ENG-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
-    { key: "ENG-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+    { key: "ENG-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } },
+    { key: "ENG-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } },
   ] });
   await asBeat("tqOther", "tq9.atlassian.net", { capacity: FULL });
   // A live session on the same host, to prove nothing here touches one.
@@ -7217,7 +7227,8 @@ test("XERK-487: an ignore-tier repo's tickets never enter the auto stream", asyn
   resetRepoTiers();
   await asBeat("rtIgnore", "rt1.atlassian.net", { repos: ["Junk"],
     tickets: [{ key: "ENG-7", statusCategory: "todo",
-      repoGuess: { repo: "Junk", cloned: true } }] });
+      repoGuess: { repo: "Junk", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } }] });
   setRepoTier("Junk", "ignore");
   // The SWEEP alone must not even enqueue it (not just rely on the drain drop):
   // a transient enqueue would flash a ticketQueue SSE frame and churn every
@@ -7236,15 +7247,17 @@ test("XERK-487: an ignore-tier repo's tickets never enter the auto stream", asyn
 test("XERK-487: two same-priority tickets take the auto slots in tier order", async () => {
   resetAutoStart();
   resetRepoTiers();
-  // One host, no free slots, three eligible To Do tickets in three repos. The
-  // board order deliberately runs LOW→HIGH, so a pass that honors tier must
-  // reorder it high→low.
+  // One host, no free slots, three eligible To Do tickets in three repos. All
+  // three share the same triage band and type, so the tier tiebreak is what
+  // decides. The board order deliberately runs LOW→HIGH, so a pass that honors
+  // tier must reorder it high→low.
+  const triage = { priority: "P2", type: "task", actionable: true };
   await asBeat("rtOrder", "rt2.atlassian.net", { capacity: FULL,
     repos: ["Live", "Arch", "Mystery"],
     tickets: [
-      { key: "ENG-1", statusCategory: "todo", repoGuess: { repo: "Arch", cloned: true } },
-      { key: "ENG-2", statusCategory: "todo", repoGuess: { repo: "Mystery", cloned: true } },
-      { key: "ENG-3", statusCategory: "todo", repoGuess: { repo: "Live", cloned: true } },
+      { key: "ENG-1", statusCategory: "todo", repoGuess: { repo: "Arch", cloned: true }, triage },
+      { key: "ENG-2", statusCategory: "todo", repoGuess: { repo: "Mystery", cloned: true }, triage },
+      { key: "ENG-3", statusCategory: "todo", repoGuess: { repo: "Live", cloned: true }, triage },
     ] });
   setRepoTier("Live", "live");
   setRepoTier("Arch", "archive");            // "Mystery" stays unset -> active
@@ -7263,7 +7276,8 @@ test("XERK-487: a repo retiered to ignore while its ticket waits drops from the 
   resetRepoTiers();
   await asBeat("rtLate", "rt5.atlassian.net", { capacity: FULL, repos: ["Late"],
     tickets: [{ key: "ENG-9", statusCategory: "todo",
-      repoGuess: { repo: "Late", cloned: true } }] });
+      repoGuess: { repo: "Late", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } }] });
   autoStartRound();                          // queues (host full, repo routable)
   assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["ENG-9"]);
   setRepoTier("Late", "ignore");             // operator marks it ignore mid-wait
@@ -7304,6 +7318,267 @@ test("XERK-487: the tier route rejects a bad tier and a phantom repo", async () 
     { body: { tier: "live" }, headers: userHeaders });
   assert.equal(r.status, 404);
   assert.equal("Ghost" in repoTiers, false);
+});
+
+// ---- triage gate, priority-ordered drain, P0 preemption, rate limit (XERK-485) ----
+// The sweep previously started every To Do ticket that had a repo, in board
+// order: untriaged noise spent attempts, chores beat P0 bugs, and a 50-ticket
+// backlog could fan out 50 sessions on one beat. Now the gate keeps untriaged,
+// non-actionable and duplicate work out of the stream, the queue drains by
+// triage band -> type weight -> repo tier -> FIFO, a P0 breaks through the
+// org's auto share (the fleet cap is its only bound), and each org gets at
+// most N auto starts per rolling window.
+
+test("XERK-485: untriaged, non-actionable and duplicate tickets render but are never swept", async () => {
+  // They stay on the board; they just take no attempt and no place in line.
+  resetAutoStart();
+  const site = "x485g.atlassian.net";
+  const lines = [];
+  const real = console.log;
+  console.log = (...a) => lines.push(a.join(" "));
+  try {
+    await asBeat("gGate", site, { capacity: FULL, tickets: [
+      { key: "G-1", statusCategory: "todo",
+        repoGuess: { repo: "Turma", cloned: true } },
+      { key: "G-2", statusCategory: "todo",
+        repoGuess: { repo: "Turma", cloned: true },
+        triage: { priority: "P1", type: "bug", actionable: false } },
+      { key: "G-3", statusCategory: "todo",
+        repoGuess: { repo: "Turma", cloned: true },
+        triage: { priority: "P1", type: "bug", actionable: true, dedupeOf: "G-9" } },
+      { key: "G-4", statusCategory: "todo",
+        repoGuess: { repo: "Turma", cloned: true },
+        triage: { priority: "P2", type: "task", actionable: true } },
+    ] });
+    autoStartSweep();
+  } finally {
+    console.log = real;
+  }
+  assert.deepEqual(ticketQueue.map((e) => [e.siteKey, e.issueKey]), [[site, "G-4"]],
+    "only the triaged, actionable, non-duplicate ticket enters the line");
+  assert.equal(autoStarted.size, 0, "a gated ticket spends no attempt");
+  assert.ok(lines.some((l) => l.includes("G-1") && l.includes("untriaged")));
+  assert.ok(lines.some((l) => l.includes("G-2") && l.includes("not actionable")));
+  assert.ok(lines.some((l) => l.includes("G-3") && l.includes("duplicate")));
+  // The gate, unit-level: strict `actionable === true`, dedupeOf wins over it.
+  assert.equal(triageGateReason({}), "untriaged");
+  assert.equal(triageGateReason({ triage: [] }), "untriaged");
+  assert.equal(triageGateReason({ triage: { actionable: false } }), "not actionable");
+  assert.equal(triageGateReason({ triage: { actionable: true, dedupeOf: "G-9" } }), "duplicate");
+  assert.equal(triageGateReason({ triage: { priority: "P0", actionable: true } }), null);
+  ticketQueue.length = 0;
+});
+
+test("XERK-485: the auto stream orders by triage band, type, repo tier — then FIFO", async () => {
+  resetAutoStart();
+  resetRepoTiers();
+  const site = "x485o.atlassian.net";
+  // Board order deliberately runs LOW -> HIGH priority: a sweep that honoured
+  // board order would queue chores ahead of the P0, exactly as before.
+  const tri = (o) => Object.assign({ priority: "P2", type: "task", actionable: true }, o);
+  await asBeat("oOrder", site, { capacity: FULL, repos: ["Turma", "Live", "Arch"],
+    tickets: [
+      { key: "O-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        triage: tri({ priority: "P3", type: "chore" }) },
+      { key: "O-3", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        triage: tri({ priority: "P1", type: "feature" }) },
+      { key: "O-5", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        triage: tri({ priority: "P1", type: "bug" }) },
+      { key: "O-7", statusCategory: "todo", repoGuess: { repo: "Live", cloned: true },
+        triage: tri({}) },
+      { key: "O-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        triage: tri({}) },
+      { key: "O-6", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        triage: tri({}) },
+      { key: "O-8", statusCategory: "todo", repoGuess: { repo: "Arch", cloned: true },
+        triage: tri({}) },
+      { key: "O-4", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        triage: tri({ priority: "P0", type: "bug" }) },
+    ] });
+  setRepoTier("Live", "live");
+  setRepoTier("Arch", "archive");           // "Turma" stays default (active)
+  autoStartSweep();
+  // band -> type -> tier -> FIFO: the P0 leads; in P1 the bug beats the
+  // feature; in P2 the live-tier ticket leads, O-2 precedes its identical-key
+  // twin O-6 only because the board listed it first, and the archive-tier
+  // ticket trails.
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey),
+    ["O-4", "O-5", "O-3", "O-7", "O-2", "O-6", "O-8", "O-1"]);
+  // So when the single slot frees, the P0 bug is the one that goes out.
+  agents.oOrder.capacity = { ...ROOMY };
+  drainTicketQueue();
+  assert.deepEqual((agents.oOrder.commands || []).map((c) => c.issueKey), ["O-4"]);
+  resetRepoTiers();
+});
+
+test("XERK-485: a P0 breaks through the org's auto share, bounded only by the fleet cap", async () => {
+  resetAutoStart();
+  const site = "x485p.atlassian.net";
+  const fill = [];
+  for (let i = 0; i < TICKET_QUEUE_PER_ORG_AUTO_MAX; i++) {
+    fill.push({ key: `F-${i}`, statusCategory: "todo",
+      repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } });
+  }
+  await asBeat("pPreempt", site, { capacity: FULL, tickets: fill });
+  autoStartSweep();
+  assert.equal(ticketQueue.filter((e) => e.source === "auto").length,
+    TICKET_QUEUE_PER_ORG_AUTO_MAX, "the sweep takes its share and no more");
+  // The P0 lands in the same org's To Do afterwards.
+  const lines = [];
+  const real = console.log;
+  console.log = (...a) => lines.push(a.join(" "));
+  try {
+    await asBeat("pPreempt", site, { autoStart: false, capacity: FULL,
+      tickets: [...fill,
+        { key: "P0-1", statusCategory: "todo",
+          repoGuess: { repo: "Turma", cloned: true },
+          triage: { priority: "P0", type: "bug", actionable: true } }] });
+    autoStartSweep();
+  } finally {
+    console.log = real;
+  }
+  assert.equal(ticketQueue.filter((e) => e.source === "auto").length,
+    TICKET_QUEUE_PER_ORG_AUTO_MAX + 1, "the P0 queues past the org's auto share");
+  assert.ok(queuedTicket(site, "P0-1"), "the P0 is in the line");
+  assert.ok(lines.some((l) => l.includes('"P0-1" (P0) is preempting')),
+    "the preemption is logged");
+  // And it goes out before all 20 of its P2 siblings when a slot frees.
+  agents.pPreempt.capacity = { ...ROOMY };
+  drainTicketQueue();
+  assert.deepEqual((agents.pPreempt.commands || []).map((c) => c.issueKey), ["P0-1"]);
+  // The fleet cap is the only bound left: at TICKET_QUEUE_MAX live entries a
+  // P0 is refused just like anything else.
+  resetAutoStart();
+  for (let s = 0; s < 8; s++) {
+    const org = `x485f${s}.atlassian.net`;
+    for (let i = 0; i < TICKET_QUEUE_PER_ORG_MAX; i++) {
+      assert.ok(enqueueTicketStart(org, `FL-${i}`, "manual"),
+        `${org} FL-${i} should still be admitted`);
+    }
+  }
+  assert.equal(liveQueueCount(), TICKET_QUEUE_MAX);
+  assert.equal(ticketQueueAdmission("x485z.atlassian.net", "P0-9", "auto", "P0"),
+    "fleet-full", "P0 preemption stops at the fleet cap");
+  assert.equal(ticketQueueAdmission("x485z.atlassian.net", "M-9", "manual"), "fleet-full");
+  ticketQueue.length = 0;
+});
+
+test("XERK-485: a 50-ticket burst starts at most the window's auto slots; the rest hold", async () => {
+  // Over the limit -> entries HOLD under reason "rate": they keep their place
+  // in line instead of being dropped or dropped-and-re-queued every sweep.
+  resetAutoStart();
+  const site = "x485r.atlassian.net";
+  const tickets = [];
+  for (let i = 0; i < 50; i++) {
+    tickets.push({ key: `B-${i}`, statusCategory: "todo",
+      repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } });
+  }
+  const lines = [];
+  const real = console.log;
+  console.log = (...a) => lines.push(a.join(" "));
+  try {
+    await asBeat("rBurst", site, { capacity: ROOMY, tickets });
+    for (let i = 0; i < 8; i++) {
+      autoStartRound();
+      // The hub counts a host's pending spawnTicket commands against its free
+      // slots; each round, the host "takes" its command (an ack with the
+      // session still starting) so the next ticket can claim a slot.
+      agents.rBurst.commands = [];
+    }
+  } finally {
+    console.log = real;
+  }
+  const autoLines = lines.filter((l) =>
+    l.startsWith("ticket queue: dispatched") && l.includes("(auto,"));
+  assert.equal(autoLines.length, TICKET_QUEUE_RATE_MAX,
+    "the burst starts exactly the window's worth of auto sessions");
+  assert.deepEqual(
+    autoLines.map((l) => l.split(" ")[3].replace(/"/g, "")),
+    ["B-0", "B-1", "B-2", "B-3", "B-4"], "the first ones in line start, FIFO");
+  const held = ticketQueue.filter((e) => e.siteKey === site);
+  assert.equal(held.length, TICKET_QUEUE_PER_ORG_AUTO_MAX,
+    "the org's line holds at its auto share");
+  for (const e of held) assert.equal(e.reason, "rate", "held, not dropped");
+  assert.equal(autoStartRate.get(site).length, TICKET_QUEUE_RATE_MAX,
+    "each auto dispatch stamped the window");
+  // A manual click is deliberate intent: it cuts straight through the full
+  // window and does not stamp it.
+  const r = await startTicket(site, "B-49");
+  assert.equal(r.status, 200);
+  assert.ok((agents.rBurst.commands || []).some(
+    (c) => c.type === "spawnTicket" && c.issueKey === "B-49" && c.ticketSource === "manual"),
+    "the manual start is dispatched");
+  assert.equal(autoStartRate.get(site).length, TICKET_QUEUE_RATE_MAX,
+    "a manual start did not stamp the org's auto window");
+});
+
+test("XERK-485: an auto entry re-triaged to held or duplicate while waiting drops; a manual one survives", async () => {
+  // The drain re-reads the ticket's CURRENT triage: the sweep's gate only sees
+  // tickets at sweep time, so a re-triage landing mid-wait must be caught here
+  // or the ticket dispatches on a stale "go ahead".
+  resetAutoStart();
+  const site = "x485d.atlassian.net";
+  // 4 free slots: three dispatches (D-1, D-4, D-2) each leave a PENDING spawn
+  // command on the host, and the hub counts those against the free slots.
+  await asBeat("dRecheck", site, { autoStart: false,
+    capacity: { maxSessions: 4, running: 0, queued: 0, free: 4 }, tickets: [
+    { key: "D-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } },
+    { key: "D-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: false } },
+    { key: "D-3", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true, dedupeOf: "D-1" } },
+    { key: "D-4", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+  ] });
+  setAutoStartOrg(site, true);
+  // Enqueued directly: this test exercises the DRAIN's re-check, not the gate.
+  enqueueTicketStart(site, "D-1", "auto");
+  enqueueTicketStart(site, "D-2", "auto");
+  enqueueTicketStart(site, "D-3", "auto");
+  enqueueTicketStart(site, "D-4", "auto");
+  drainTicketQueue();
+  assert.ok(!queuedTicket(site, "D-2"),
+    "actionable:false while waiting -> dropped (the gate won't re-queue it)");
+  assert.ok(!queuedTicket(site, "D-3"), "flagged a duplicate while waiting -> dropped");
+  assert.deepEqual((agents.dRecheck.commands || []).map((c) => c.issueKey), ["D-1"],
+    "the still-actionable ticket took the slot");
+  // D-4 has no triage block at all: "can't tell" is not "held" — it stays
+  // dispatchable. It skipped this pass only because D-1 claimed the host.
+  drainTicketQueue();
+  assert.deepEqual((agents.dRecheck.commands || []).map((c) => c.issueKey),
+    ["D-1", "D-4"]);
+  // A manual entry is deliberate intent: the same held re-triage does not drop it.
+  enqueueTicketStart(site, "D-2", "manual");
+  drainTicketQueue();
+  assert.deepEqual((agents.dRecheck.commands || []).map((c) => c.issueKey),
+    ["D-1", "D-4", "D-2"], "manual work ignores the triage gate");
+});
+
+test("XERK-485: a flaked dispatch refunds the org's rate slot when the retry re-queues", async () => {
+  // A spawn that was acked but left no session spent its rate slot for nothing.
+  // Without the refund, one flapping ticket would burn the whole window on its
+  // retries and starve the org's other tickets until the stamps aged out.
+  resetAutoStart();
+  const site = "x485v.atlassian.net";
+  await asBeat("vRefund", site, { capacity: ROOMY });   // default triaged To Do ENG-5
+  autoStartRound();
+  const k = site + "\x00" + "ENG-5";
+  assert.equal(autoStartRate.get(site).length, 1, "the dispatch stamped the window");
+  // Fill the rest of the window with other tickets' stamps: the org is now AT
+  // its limit, so only the refund can let the retry through.
+  for (let i = 1; i < TICKET_QUEUE_RATE_MAX; i++) {
+    recordAutoStartRate(site, `${site}\x00OTHER-${i}`, Date.now());
+  }
+  assert.equal(autoStartRate.get(site).length, TICKET_QUEUE_RATE_MAX);
+  agents.vRefund.commands = [];           // the agent took the command...
+  autoStarted.get(k).nextAt = 0;          // ...but left no session; backoff elapsed
+  autoStartRound();
+  assert.deepEqual((agents.vRefund.commands || []).map((c) => c.issueKey), ["ENG-5"],
+    "the retry dispatches instead of holding behind its own spent slot");
+  assert.equal(autoStartRate.get(site).length, TICKET_QUEUE_RATE_MAX,
+    "refund + re-stamp keeps the window honest (4 others + this retry)");
 });
 
 test("XERK-296: a terminal note counts against NO line — per org or fleet-wide", async () => {
@@ -7408,11 +7683,12 @@ test("XERK-296: one unqueueable ticket row doesn't stop the rest of the org's sw
   // queue is full", it truncated that org's auto-start at the bad row — every
   // sweep, forever — and blamed a queue that was empty.
   resetAutoStart();
+  const g = { priority: "P2", type: "task", actionable: true };
   await asBeat("tqBadRow", "tq26.atlassian.net", { capacity: FULL, tickets: [
-    { key: "OK-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
-    { key: { evil: 1 }, statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
-    { key: "OK-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
-    { key: "OK-3", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+    { key: "OK-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: g },
+    { key: { evil: 1 }, statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: g },
+    { key: "OK-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: g },
+    { key: "OK-3", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: g },
   ] });
   autoStartSweep();
   assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["OK-1", "OK-2", "OK-3"]);
@@ -7424,7 +7700,8 @@ test("XERK-296: an org whose hosts are all offline HOLDS, it doesn't churn", asy
   // as long as the org stayed down.
   resetAutoStart();
   await asBeat("tqChurn", "tq27.atlassian.net", { capacity: FULL, tickets: [
-    { key: "CH-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+    { key: "CH-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } },
   ] });
   autoStartSweep();
   drainTicketQueue();
@@ -7449,7 +7726,8 @@ test("XERK-296: the sweep cannot fill an org's whole line — a person can alway
   const tickets = [];
   for (let i = 0; i < 40; i++) {
     tickets.push({ key: `AUT-${i}`, statusCategory: "todo",
-      repoGuess: { repo: "Turma", cloned: true } });
+      repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } });
   }
   tickets.push({ key: "MINE-1", statusCategory: "todo",
     repoGuess: { repo: "Turma", cloned: true } });
@@ -7516,7 +7794,8 @@ test("XERK-296: a hostile or wrong-typed issue key never enters the queue", asyn
   // And the sweep itself drops such a ticket rather than dispatching it.
   await asBeat("tqBad", site, { capacity: FULL, tickets: [
     { key: "../../../etc/passwd", statusCategory: "todo",
-      repoGuess: { repo: "Turma", cloned: true } },
+      repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } },
   ] });
   autoStartSweep();
   drainTicketQueue();
@@ -7886,7 +8165,8 @@ test("XERK-303: an AUTO entry that reaches giveUp still leaves outright, with no
   // This drives the routing-failure timer, which is a path giveUp really governs.
   resetAutoStart();
   await asBeat("tqAutoNote", "tq58.atlassian.net", { tickets: [
-    { key: "ENG-7", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+    { key: "ENG-7", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } },
   ] });
   autoStartSweep();
   const e = queuedTicket("tq58.atlassian.net", "ENG-7");
@@ -8398,12 +8678,14 @@ test("XERK-325: auto-start reads the ticket list the BOARD shows, not a dead hos
   await asBeat("tq325jDown", site, { autoStart: false, capacity: ROOMY, user,
     fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
     tickets: [{ key: "GHOST-1", statusCategory: "todo",
-                repoGuess: { repo: "Turma", cloned: true } }] });
+                repoGuess: { repo: "Turma", cloned: true },
+                triage: { priority: "P2", type: "task", actionable: true } }] });
   agents.tq325jDown.lastSeen = Date.now() - 10 * 60 * 1000;
   await asBeat("tq325jUp", site, { autoStart: false, capacity: ROOMY, user,
     fetchedAt: "2026-07-14T12:00:00Z",                                // staler
     tickets: [{ key: "SEEN-1", statusCategory: "todo",
-                repoGuess: { repo: "Turma", cloned: true } }] });
+                repoGuess: { repo: "Turma", cloned: true },
+                triage: { priority: "P2", type: "task", actionable: true } }] });
   setAutoStartOrg(site, true);
   autoStartSweep();
   assert.deepEqual(ticketQueue.filter((e) => e.siteKey === site).map((e) => e.issueKey),
@@ -8506,13 +8788,15 @@ test("XERK-325: the sweep and drain honour the newer `updated` too, not just the
     fetchedAt: "2026-07-14T12:00:00Z", repos: ["Turma"],
     tickets: [{ key: "ENG-5", statusCategory: "todo",
                 updated: "2026-07-14T11:00:00.000+0000",
-                repoGuess: { repo: "Turma", cloned: true } }] });
+                repoGuess: { repo: "Turma", cloned: true },
+                triage: { priority: "P2", type: "task", actionable: true } }] });
   // Fresher block, older copy — the answer a block rank would give.
   await asBeat("tq325rRank", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
     fetchedAt: "2026-07-14T12:30:00Z", repos: ["Veiller"],
     tickets: [{ key: "ENG-5", statusCategory: "todo",
                 updated: "2026-07-14T08:00:00.000+0000",
-                repoGuess: { repo: "Veiller", cloned: true } }] });
+                repoGuess: { repo: "Veiller", cloned: true },
+                triage: { priority: "P2", type: "task", actionable: true } }] });
   // The DRAIN route.
   assert.ok(enqueueTicketStart(site, "ENG-5", "manual"));
   drainTicketQueue();
@@ -8661,11 +8945,13 @@ test("XERK-325: auto-start sees BOTH Jira users' tickets, as the board does", as
   await asBeat("tq325mA", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
     fetchedAt: "2026-07-14T12:30:00Z",
     tickets: [{ key: "AAA-1", statusCategory: "todo",
-                repoGuess: { repo: "Turma", cloned: true } }] });
+                repoGuess: { repo: "Turma", cloned: true },
+                triage: { priority: "P2", type: "task", actionable: true } }] });
   await asBeat("tq325mB", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
     fetchedAt: "2026-07-14T12:00:00Z",
     tickets: [{ key: "BBB-1", statusCategory: "todo",
-                repoGuess: { repo: "Turma", cloned: true } }] });
+                repoGuess: { repo: "Turma", cloned: true },
+                triage: { priority: "P2", type: "task", actionable: true } }] });
   setAutoStartOrg(site, true);
   autoStartSweep();
   assert.deepEqual(
