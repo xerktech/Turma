@@ -430,6 +430,11 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 .kanban-col .kc-list { display: flex; flex-direction: column; gap: 8px; }
 .kanban-col .kc-none { color: var(--muted); font-size: 12px; text-align: center; padding: 18px 0; border: 1px dashed var(--hairline); border-radius: var(--radius-md); }
 .kanban-done .kanban-card { opacity: 0.72; }
+/* The Triage lane (XERK-486 [F]) is a view, not a tracker column: a dashed
+   top rule keeps it visually apart from the real status columns beside it. */
+.kanban-col.kanban-triage > .kc-head {
+  border-bottom: 1px dashed var(--hairline); padding-bottom: 6px;
+}
 
 .kanban-card {
   /* Subtle, opaque org tint (XERK-142): --org (var(--sN), set inline per card)
@@ -493,6 +498,21 @@ button:disabled .spin { border-top-color: var(--ink-2); }
   max-width: 15ch;
 }
 .kc-dup a { color: inherit; text-decoration: none; }
+/* The operator's triage verdict (XERK-486 [F]): same chip metrics as .kc-dup;
+   the verdict outranks the model's triage, so it gets its own tint — green for
+   an explicit approve, amber for hold (the card parks in the Triage lane), red
+   for reject. */
+.kc-triage {
+  display: inline-block; vertical-align: middle;
+  padding: 1px 7px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--page);
+  font-family: var(--font-mono); font-size: 10.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 15ch;
+}
+.kc-triage-approve { color: var(--good); border-color: var(--good); }
+.kc-triage-hold { color: var(--warning); border-color: var(--warning); }
+.kc-triage-reject { color: var(--critical); border-color: var(--critical); }
 /* Start-a-session-on-this-ticket, and the sessions it started. Both sit in
    .kc-meta between the repo chip and the org, i.e. before the margin-left:auto
    that pins .kc-org right. */
@@ -745,6 +765,25 @@ body.td-open { overflow: hidden; }
 /* A ticket created but not assigned: still a success, so it sits in the same
    confirmation line rather than the error slot — just marked. */
 .cf-warn { color: var(--warning); }
+/* Per-org triage policy panel (XERK-486): narrow modal reusing the detail
+   panel's backdrop/padding plus the form-field and action-button styles above. */
+.td-panel.td-narrow { max-width: 520px; }
+.tp-title { font-family: var(--font-display); font-size: 16px; font-weight: 600; }
+.tp-field { display: block; margin: 0 0 12px; }
+.tp-field > span {
+  display: block; font-size: 11px; font-weight: 600; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 4px;
+}
+.tp-field input[type="text"], .tp-field input[type="number"], .tp-field select {
+  font: inherit; font-size: 12.5px; width: 100%; padding: 6px 8px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--ink);
+}
+.tp-checks { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.tp-check { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); }
+.tp-check input { accent-color: var(--accent); }
+.tp-note { font-size: 12px; color: var(--muted); line-height: 1.5; margin: 0 0 14px; }
+.tp-err { font-size: 12.5px; color: var(--critical); margin: 0 0 12px; }
 
 @media (max-width: 600px) {
   .td-backdrop { padding: 0; }

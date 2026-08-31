@@ -6,6 +6,7 @@
 // testable without a browser.
 (() => {
   const CATEGORIES = [
+    ["triage", "Triage"],
     ["todo", "To Do"],
     ["inprogress", "In Progress"],
     ["review", "In Review"],
@@ -88,6 +89,50 @@
   // has actually caught up (moveSweepVerdict), so the card never moves backward.
   function boardColumnOf(t, move) {
     return move && (move.pending || move.settled) && !move.error ? move.category : categoryOf(t);
+  }
+
+  // XERK-486 [F]: the operator's per-ticket triage verdict, off the hub's
+  // ticketTriageActions map (the /api/agents payload key of the same name).
+  // Mirrors the agent/model/runtime pin readers: key "<siteKey>/<issueKey>",
+  // value {action, at}; anything malformed or unknown reads as "no verdict",
+  // so a bad entry degrades to the default (model + org policy decide) rather
+  // than blocking a ticket.
+  function triageActionOf(ticketTriageActions, siteKey, issueKey) {
+    const v = (ticketTriageActions || {})[`${siteKey || ""}/${issueKey || ""}`];
+    const a = v && v.action;
+    return a === "approve" || a === "hold" || a === "reject" ? a : null;
+  }
+
+  // XERK-486 [F]: the Triage lane — a board column of its own for To Do tickets
+  // that need an operator's eye: UNTRIAGED (no triage assessment yet, so the
+  // auto stream can't touch them) or HELD by the operator's verdict. It is a
+  // view over the To Do column, not a tracker category: nothing about it is
+  // written back to the tracker, which is why categoryOf and its mirrors are
+  // untouched. A card here is still a todo ticket (a session can be started on
+  // it, and dragging it to a real column works); board.html just refuses drops
+  // ON the lane, since it maps to no tracker status.
+  function triageLaneOf(t, action) {
+    if (!t || categoryOf(t) !== "todo") return null;
+    if (action === "hold") return "triage";
+    if (!t.triage || typeof t.triage !== "object") return "triage";
+    return null;
+  }
+
+  // The operator's verdict on the card (XERK-486 [F]). It outranks everything
+  // the model said, so it gets a chip of its own: approve reads green (it
+  // forces auto-start), hold amber (it parks the card in the Triage lane),
+  // reject red.
+  function triageChipHtml(action) {
+    if (!action) return "";
+    const tip = action === "approve"
+      ? "Approved — auto-starts even if the triage model or the org policy say no"
+      : action === "hold"
+        ? "Held — never auto-starts until you release it (shown in the Triage lane)"
+        : "Rejected — dropped from the auto stream; start it by hand if you want it";
+    const text = action === "approve" ? "✓ approved"
+      : action === "hold" ? "⏸ held"
+      : "✕ rejected";
+    return `<span class="kc-triage kc-triage-${action}" title="${esc(tip)}">${text}</span>`;
   }
 
   // Whether a drag override should still be held, be dropped, or has settled —
@@ -724,6 +769,11 @@
     // at the other ticket; the detail view spells it out as a field.
     const dup = dedupeChipHtml(t, site);
     if (dup) bits.push(dup);
+    // The operator's triage verdict (XERK-486 [F]) rides in as opts.triageAction
+    // (boardHtml reads it off the payload's ticketTriageActions); absent means
+    // no chip — "no verdict" is the default and not worth a chip.
+    const triageChip = triageChipHtml(o.triageAction);
+    if (triageChip) bits.push(triageChip);
     const start = ticketStartHtml(t, o.sessions, o.start, o.queued);
     if (start) bits.push(start);
     // A drag in flight / just landed (XERK-141) shows a "moving…" chip; a failed
@@ -1138,6 +1188,54 @@
     </div>`;
   }
 
+  // ---- ticket triage verdict (XERK-486 [F]) ----------------------------------
+  // The operator's per-ticket call on the auto stream: approve (force
+  // eligibility past the triage gate and the org policy), hold (never auto-
+  // start until released), reject (drop from the auto stream). Hub-owned
+  // durable state (the ticketTriageActions map, the /triage route) — like the
+  // agent/model/runtime pins, changing it needs no online host, and the
+  // sweep/drain read it, not the tracker.
+
+  // The Triage row: the verdict, or what "no verdict" means (the triage model
+  // and the org's policy decide), plus the Change control and an inline error.
+  function triageFieldHtml(action, opts) {
+    const o = opts || {};
+    const bits = [];
+    if (!action) {
+      bits.push(`<span class="td-dim">Auto — the triage model + the org's policy decide</span>`);
+    } else {
+      bits.push(triageChipHtml(action));
+      bits.push(`<span class="td-dim">— set by you</span>`);
+    }
+    if (o.editable) {
+      bits.push(`<button type="button" class="td-edit" data-triage-edit="1">Change</button>`);
+    }
+    if (o.error) bits.push(`<span class="td-err-inline">Couldn't save — ${esc(o.error)}</span>`);
+    return bits.join(" ");
+  }
+
+  // The picker's current answer — the change handler compares a pick against
+  // this, so it must derive exactly the way triagePickerHtml preselects.
+  function triagePickerValue(action) {
+    return action || "__auto__";
+  }
+
+  // The verdict picker, swapped in for the row on "Change". Choosing an option
+  // IS the save, like the repo/agent pickers; "Auto" is the release (drops the
+  // verdict back to the model + policy).
+  function triagePickerHtml(action) {
+    const cur = action || "__auto__";
+    const sel = `<select class="td-repo-select" data-triage-select="1">
+      <option value="__auto__"${cur === "__auto__" ? " selected" : ""}>Auto — triage model + org policy</option>
+      <option value="approve"${cur === "approve" ? " selected" : ""}>Approve — auto-start even if triage/policy say no</option>
+      <option value="hold"${cur === "hold" ? " selected" : ""}>Hold — never auto-start until released</option>
+      <option value="reject"${cur === "reject" ? " selected" : ""}>Reject — drop from the auto stream</option>
+    </select>`;
+    return `<div class="td-repo-edit">${sel}
+      <button type="button" class="td-edit" data-triage-cancel="1">Cancel</button>
+    </div>`;
+  }
+
   // ---- ticket status change (XERK-138) --------------------------------------
   // The board's one write-back: the operator picks a status the ticket can move
   // to and it's pushed to Jira/Azure. The changeable statuses are the fetched
@@ -1263,6 +1361,16 @@
             editable: !!(o.runtimePin || o.dshAvailable || o.qwenAvailable),
             error: o.runtimeError,
           })),
+      // The operator's per-ticket triage verdict (XERK-486 [F]). Hub-owned like
+      // the agent/model pins (o.triageAction, off the payload's
+      // ticketTriageActions), so it needs no online host to change — the
+      // verdict rides a hub POST that the sweep and the drain read.
+      fieldRow("Triage", o.triageEditing
+        ? triagePickerHtml(o.triageAction)
+        : triageFieldHtml(o.triageAction, {
+            editable: true,
+            error: o.triageError,
+          })),
       fieldRow("Assignee", d.assignee ? esc(d.assignee) : ""),
       fieldRow("Reporter", d.reporter ? esc(d.reporter) : ""),
       fieldRow("Project", v("projectName")
@@ -1334,7 +1442,7 @@
       <div class="td-foot"><a href="${safeUrl(v("url"))}" target="_blank" rel="noopener">Open in ${srcName} ↗</a></div>`;
   }
 
-  // The three-column board for the selected sites (filter = a siteKey, an
+  // The five-column board for the selected sites (filter = a siteKey, an
   // array/Set of siteKeys — the header's multi-select (XERK-222) — or null/""
   // for all). Sites are the mergeSites() output; org colors come from
   // orgColorMap over the FULL org set (opts.allKeys) — computed once here, not
@@ -1348,14 +1456,21 @@
       : filter ? [filter] : [];
     const shown = sites.filter(s => !fkeys.length || fkeys.includes(s.siteKey));
     const moves = o.moves || null;
-    const cards = { todo: [], inprogress: [], review: [], done: [] };
+    const cards = { triage: [], todo: [], inprogress: [], review: [], done: [] };
     for (const site of shown) {
       const color = colorMap.get(site.siteKey) || orgColor(site.siteKey);
       for (const t of site.tickets) {
         // A live drag override (XERK-141) lands the card in the dropped column
         // meanwhile; boardColumnOf falls back to the real category otherwise.
         const mv = moves && moves.get((site.siteKey || "") + "\x00" + t.key);
-        cards[boardColumnOf(t, mv)].push({ t, site, color, mv });
+        // XERK-486 [F]: the operator's verdict for this ticket, and whether it
+        // parks in the Triage lane (untriaged or held To Do). The lane is a
+        // board-only view — categoryOf and its mirrors never know it — and a
+        // live drag override always wins: a card mid-move shows where it's
+        // going, and board.html keeps the lane itself a non-drop-target.
+        const triageAction = triageActionOf(o.triageActions, site.siteKey, t.key);
+        const lane = mv ? null : triageLaneOf(t, triageAction);
+        cards[lane || boardColumnOf(t, mv)].push({ t, site, color, mv, triageAction });
       }
     }
     const cols = CATEGORIES.map(([cat, label]) => {
@@ -1368,10 +1483,13 @@
             queued: queuedTicketOf(o.ticketQueue, c.site.siteKey, c.t.key),
             moving: !!(c.mv && c.mv.pending && !c.mv.error),
             moveError: c.mv && c.mv.error,
+            triageAction: c.triageAction,
           })).join("")
         : `<div class="kc-none">none</div>`;
       // data-cat lets the drag handler read which column a card was dropped on.
-      return `<div class="kanban-col${cat === "done" ? " kanban-done" : ""}" data-cat="${cat}">
+      // The Triage lane is board-only (XERK-486 [F]): kanban-triage marks it for
+      // styling, and the drag handler refuses it as a drop target.
+      return `<div class="kanban-col${cat === "done" ? " kanban-done" : ""}${cat === "triage" ? " kanban-triage" : ""}" data-cat="${cat}">
         <div class="kc-head">${label} <span class="kc-count">${list.length}</span></div>
         <div class="kc-list">${body}</div>
       </div>`;
@@ -1617,6 +1735,7 @@
     modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
     runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
     statusFieldHtml, statusPickerHtml, statusPickerValue,
+    triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
     boardColumnOf, moveSweepVerdict,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
     queuedTicketOf, queuedLabel, queuedTip,

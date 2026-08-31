@@ -18,6 +18,7 @@ const {
   modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
   runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
   statusFieldHtml, statusPickerHtml, statusPickerValue,
+  triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
   boardColumnOf, moveSweepVerdict,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
   queuedTicketOf, queuedTip,
@@ -486,7 +487,10 @@ test("boardHtml: each org's cards carry its unique tint (XERK-142)", () => {
   assert.notEqual(map.get(sites[0].siteKey), map.get(sites[1].siteKey));
 });
 
-test("boardHtml: four columns with counts, org filter scopes tickets", () => {
+test("boardHtml: five columns with counts, org filter scopes tickets", () => {
+  // XERK-486 [F]: the board renders a 5th "Triage" lane ahead of To Do for
+  // untriaged/held To Do tickets. T-1 and O-1 are untriaged To Do, so they
+  // render in the Triage lane, but they are still present in the output.
   const sites = mergeSites([
     agent("hostA", block({ tickets: [
       ticket("T-1", { status: "To Do", statusCategory: "todo" }),
@@ -499,8 +503,9 @@ test("boardHtml: four columns with counts, org filter scopes tickets", () => {
   ]);
   const all = boardHtml(sites, null, {});
   assert.ok(all.includes("T-1") && all.includes("O-1"));
-  assert.equal((all.match(/kanban-col[ "]/g) || []).length, 4);
+  assert.equal((all.match(/kanban-col[ "]/g) || []).length, 5);
   assert.ok(all.includes("In Review"), "the In Review column heading renders");
+  assert.ok(all.includes("Triage"), "the Triage lane heading renders");
   const one = boardHtml(sites, "other.atlassian.net", {});
   assert.ok(one.includes("O-1") && !one.includes("T-1"));
   // The header's multi-select (XERK-222) passes an array of siteKeys — every
@@ -2215,6 +2220,137 @@ test("createFormHtml: the created state shows a link and hides the form", () => 
   assert.match(html, /href="https:\/\/o\/browse\/ENG-9"[^>]*>ENG-9/);
   assert.match(html, /data-cf-another/);
   assert.doesNotMatch(html, /data-cf-submit/);
+});
+
+// ---- Triage lane + verdict (XERK-486 [F]) ----------------------------------
+
+test("triageActionOf: reads the hub verdict, degrades malformed entries to null", () => {
+  const actions = {
+    "o.atlassian.net/A-1": { action: "hold", at: 0 },
+    "o.atlassian.net/A-2": { action: "approve", at: 0 },
+    "o.atlassian.net/A-3": { action: "reject", at: 0 },
+    "o.atlassian.net/A-4": { action: "banana", at: 0 },
+    "o.atlassian.net/A-5": { bogus: true },
+  };
+  assert.equal(triageActionOf(actions, "o.atlassian.net", "A-1"), "hold");
+  assert.equal(triageActionOf(actions, "o.atlassian.net", "A-2"), "approve");
+  assert.equal(triageActionOf(actions, "o.atlassian.net", "A-3"), "reject");
+  assert.equal(triageActionOf(actions, "o.atlassian.net", "A-4"), null, "unknown action degrades to no verdict");
+  assert.equal(triageActionOf(actions, "o.atlassian.net", "A-5"), null, "malformed entry degrades to no verdict");
+  assert.equal(triageActionOf(actions, "o.atlassian.net", "A-9"), null);
+  assert.equal(triageActionOf(null, "o.atlassian.net", "A-1"), null, "no map at all is no verdict");
+  assert.equal(triageActionOf(undefined, "o.atlassian.net", "A-1"), null);
+});
+
+test("triageLaneOf: untriaged or held To Do land in the lane; nothing else does", () => {
+  const todo = { status: "To Do", statusCategory: "todo" };
+  const tri = { priority: "P2", type: "task", actionable: true };
+  // Untriaged: the auto stream cannot touch it, so it needs an operator's eye.
+  assert.equal(triageLaneOf({ ...todo }, null), "triage");
+  // A held To Do parks in the lane even when triaged.
+  assert.equal(triageLaneOf({ ...todo, triage: tri }, "hold"), "triage");
+  assert.equal(triageLaneOf({ ...todo }, "hold"), "triage");
+  // Triaged To Do with no verdict stays in To Do — it is the auto stream's to take.
+  assert.equal(triageLaneOf({ ...todo, triage: tri }, null), null);
+  assert.equal(triageLaneOf({ ...todo, triage: tri }, "approve"), null);
+  assert.equal(triageLaneOf({ ...todo, triage: tri }, "reject"), null,
+    "reject only drops it from the auto stream; it stays in To Do");
+  // A triage value that is not an object reads as untriaged.
+  assert.equal(triageLaneOf({ ...todo, triage: "garbage" }, null), "triage");
+  assert.equal(triageLaneOf({ ...todo, triage: null }, null), "triage");
+  // Non-todo tickets never enter the lane, even when held.
+  assert.equal(triageLaneOf({ status: "In Progress", statusCategory: "inprogress" }, "hold"), null);
+  assert.equal(triageLaneOf({ status: "Done", statusCategory: "done" }, null), null);
+  assert.equal(triageLaneOf(null, null), null);
+});
+
+test("triageChipHtml: a colored chip per verdict, empty for no verdict", () => {
+  assert.equal(triageChipHtml(null), "");
+  assert.equal(triageChipHtml(undefined), "");
+  const ap = triageChipHtml("approve");
+  assert.ok(ap.includes('class="kc-triage kc-triage-approve"'), "approve chip class");
+  assert.ok(ap.includes("approved"), "approve label");
+  const ho = triageChipHtml("hold");
+  assert.ok(ho.includes("kc-triage-hold"), "hold chip class");
+  assert.ok(ho.includes("held"), "hold label");
+  const re = triageChipHtml("reject");
+  assert.ok(re.includes("kc-triage-reject"), "reject chip class");
+  assert.ok(re.includes("rejected"), "reject label");
+});
+
+test("triageFieldHtml: no verdict shows the auto note; a verdict shows chip + change + error", () => {
+  const auto = triageFieldHtml(null, {});
+  assert.ok(auto.includes("Auto"), "no verdict explains the default");
+  assert.ok(!auto.includes("data-triage-edit"), "no Change control when not editable");
+  const editable = triageFieldHtml(null, { editable: true });
+  assert.ok(editable.includes('data-triage-edit="1"'), "Change control when editable");
+  const held = triageFieldHtml("hold", { editable: true, error: "no host" });
+  assert.ok(held.includes("kc-triage-hold"), "the verdict chip is shown");
+  assert.ok(held.includes("set by you"), "the verdict is attributed to the operator");
+  assert.ok(held.includes("Couldn't save"), "the error renders inline");
+  assert.ok(held.includes("no host"), "the error text is included");
+});
+
+test("triagePickerValue: mirrors the picker's preselect", () => {
+  assert.equal(triagePickerValue(null), "__auto__");
+  assert.equal(triagePickerValue(undefined), "__auto__");
+  assert.equal(triagePickerValue("hold"), "hold");
+  assert.equal(triagePickerValue("approve"), "approve");
+});
+
+test("triagePickerHtml: one option per verdict plus auto, preselecting the current", () => {
+  const sel = triagePickerHtml("hold");
+  assert.ok(sel.includes('data-triage-select="1"'), "the select is wired for the change handler");
+  assert.ok(sel.includes('value="__auto__"'), "the auto option is present");
+  assert.match(sel, /value="hold" selected/, "the current verdict is preselected");
+  assert.ok(!/value="__auto__" selected/.test(sel), "auto is not preselected while a verdict is set");
+  assert.ok(sel.includes('data-triage-cancel="1"'), "the cancel control is present");
+
+  const auto = triagePickerHtml(null);
+  assert.match(auto, /value="__auto__" selected/, "auto is preselected when there is no verdict");
+});
+
+test("boardHtml: the Triage lane gathers untriaged and held To Do, and only those", () => {
+  const todo = { status: "To Do", statusCategory: "todo" };
+  const tri = { priority: "P2", type: "task", actionable: true };
+  const sites = mergeSites([agent("hostA", block({ tickets: [
+    ticket("T-1", todo),                                          // untriaged -> lane
+    ticket("T-2", { ...todo, triage: tri }),                      // triaged, no verdict -> To Do
+    ticket("T-3", { ...todo, triage: tri }),                      // triaged, held -> lane
+    ticket("T-4", { ...todo, triage: tri }),                      // triaged, rejected -> To Do
+    ticket("T-5", { ...todo, triage: tri }),                      // triaged, approved -> To Do
+  ] }))]);
+  const actions = {
+    "myorg.atlassian.net/T-3": { action: "hold", at: 0 },
+    "myorg.atlassian.net/T-4": { action: "reject", at: 0 },
+    "myorg.atlassian.net/T-5": { action: "approve", at: 0 },
+  };
+  const html = boardHtml(sites, null, { triageActions: actions });
+  const triageCol = html.slice(html.indexOf('data-cat="triage"'), html.indexOf('data-cat="todo"'));
+  assert.ok(triageCol.includes("T-1"), "untriaged To Do sits in the lane");
+  assert.ok(triageCol.includes("T-3"), "a held ticket sits in the lane");
+  for (const k of ["T-2", "T-4", "T-5"]) {
+    assert.ok(!triageCol.includes(k), `${k} stays out of the lane`);
+  }
+  const todoCol = html.slice(html.indexOf('data-cat="todo"'), html.indexOf('data-cat="inprogress"'));
+  for (const k of ["T-2", "T-4", "T-5"]) {
+    assert.ok(todoCol.includes(k), `${k} stays in To Do`);
+  }
+  assert.match(html, /kanban-col kanban-triage" data-cat="triage"/, "the lane is marked for styling/non-drop");
+  assert.ok(triageCol.includes("kc-triage-hold"), "the held card carries its verdict chip");
+});
+
+test("boardHtml: a live drag beats the Triage lane", () => {
+  const sites = mergeSites([agent("hostA", block({ tickets: [
+    ticket("T-1", { status: "To Do", statusCategory: "todo" }),
+  ] }))]);
+  const actions = { "myorg.atlassian.net/T-1": { action: "hold", at: 0 } };
+  const moves = new Map([["myorg.atlassian.net\x00T-1", { category: "inprogress", pending: true }]]);
+  const html = boardHtml(sites, null, { triageActions: actions, moves });
+  const ipCol = html.slice(html.indexOf('data-cat="inprogress"'), html.indexOf('data-cat="review"'));
+  assert.ok(ipCol.includes("T-1"), "the card renders where it is being dropped, not in the lane");
+  const triageCol = html.slice(html.indexOf('data-cat="triage"'), html.indexOf('data-cat="todo"'));
+  assert.ok(!triageCol.includes("T-1"), "the lane does not hold a card mid-drag");
 });
 
 // ---- The columns are one horizontal row at every width (XERK-253) ----------
