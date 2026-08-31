@@ -158,6 +158,7 @@ const {
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
   TERM_OSC52_JS,
+  TERM_SCROLL_BOTTOM_JS,
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStartOrgs, setAutoStartOrg,
   ticketQueue, ticketQueuePayload, enqueueTicketStart, dropQueuedTicket,
@@ -544,6 +545,100 @@ test("OSC 52 bridge survives a malformed payload", () => {
   const t = runOsc52();
   assert.equal(t.fire("c;!!!not-base64!!!"), true);
   assert.deepEqual(t.writes, []);
+});
+
+// TERM_SCROLL_BOTTOM_JS is injected into a qwen session's ttyd page; exercise it
+// the way the browser does — a fake xterm whose on-screen rows redraw as it
+// scrolls, and a queued setTimeout the test drains by hand. scrollPos models
+// qwen's OWN scroll (viewportY stays 0, the drawn rows change), clamped at
+// maxScroll so an over-scroll is a no-op, exactly as the real TUI clamps.
+function runScrollBottom({ maxScroll = 5, rows = 24, startAt = 0, withTerm = true } = {}) {
+  let scrollPos = startAt;
+  const wheelDeltas = [];
+  const timers = [];
+  let clickHandler = null, globalWheel = null, appended = null;
+  const term = {
+    rows,
+    buffer: { active: {
+      viewportY: 0,
+      getLine: (i) => ({ translateToString: () => "row" + (scrollPos + i) }),
+    } },
+  };
+  const xterm = {
+    dispatchEvent: (ev) => {
+      wheelDeltas.push(ev.deltaY);
+      if (ev.deltaY > 0) scrollPos = Math.min(maxScroll, scrollPos + 1);
+      else if (ev.deltaY < 0) scrollPos = Math.max(0, scrollPos - 1);
+      return true;
+    },
+  };
+  const button = { style: {}, addEventListener: (t, fn) => { if (t === "click") clickHandler = fn; } };
+  const sandbox = {
+    window: { term: withTerm ? term : undefined },
+    document: {
+      body: { appendChild: (el) => { appended = el; } },
+      querySelector: (sel) => (sel === ".xterm" ? xterm : null),
+      createElement: () => button,
+    },
+    addEventListener: (t, fn) => { if (t === "wheel") globalWheel = fn; },
+    WheelEvent: class { constructor(type, opts) { Object.assign(this, opts || {}); this.type = type; } },
+    setTimeout: (fn) => { timers.push(fn); return 0; },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(TERM_SCROLL_BOTTOM_JS, sandbox);
+  return {
+    button, appended, wheelDeltas,
+    scrollPos: () => scrollPos,
+    click: () => clickHandler && clickHandler(),
+    wheel: (deltaY) => globalWheel && globalWheel({ deltaY }),
+    drain: (max = 1000) => { let n = 0; while (timers.length && n++ < max) timers.shift()(); },
+  };
+}
+
+test("scroll-to-bottom: wires a hidden Bottom button into the page", () => {
+  const t = runScrollBottom();
+  assert.equal(t.appended, t.button, "the button is appended to the body");
+  assert.equal(t.button.id, "turmaToBottom");
+  assert.equal(t.button.type, "button");
+  assert.match(t.button.textContent, /Bottom/);
+  // Initially hidden by the injected CSS (#turmaToBottom{display:none}), not an
+  // inline style, so nothing is set on the element until show()/hide() runs.
+  assert.notEqual(t.button.style.display, "flex", "not shown until the user scrolls up");
+});
+
+test("scroll-to-bottom: clicking drives qwen's scroll to the tail with wheel-DOWN only", () => {
+  const t = runScrollBottom({ maxScroll: 5, startAt: 0 });
+  t.click();
+  t.drain();
+  assert.equal(t.scrollPos(), 5, "reaches the bottom (clamped at maxScroll)");
+  assert.ok(t.wheelDeltas.length > 0, "dispatched wheel events");
+  assert.ok(t.wheelDeltas.every((d) => d > 0), "every dispatched wheel is DOWN — never up");
+  // Stops on the first pass where the screen no longer changes, so it never
+  // approaches the MAX safety cap on an ordinary scroll.
+  assert.ok(t.wheelDeltas.length <= 40, "settles quickly rather than spinning to the cap");
+  assert.equal(t.button.style.display, "none", "hides itself once it clamps at the bottom");
+});
+
+test("scroll-to-bottom: already at the tail is a harmless no-op", () => {
+  const t = runScrollBottom({ maxScroll: 0, startAt: 0 });
+  t.click();
+  t.drain();
+  assert.equal(t.scrollPos(), 0);
+});
+
+test("scroll-to-bottom: the pill reveals itself when the user scrolls UP", () => {
+  const t = runScrollBottom();
+  assert.notEqual(t.button.style.display, "flex");
+  t.wheel(-3); // scroll up off the tail
+  assert.equal(t.button.style.display, "flex", "revealed on scroll-up");
+});
+
+test("scroll-to-bottom: a missing xterm instance stops rather than spinning", () => {
+  const t = runScrollBottom({ withTerm: false });
+  t.click();
+  t.drain();
+  // snap() returns null with no window.term, so the routine bails after one pass.
+  assert.ok(t.wheelDeltas.length <= 8, "no runaway loop when the terminal isn't ready");
 });
 
 test("sessionWorking: transcript freshness plus heartbeat staleness", () => {
@@ -3333,14 +3428,21 @@ test("http: session commands 404 for unknown hosts", async () => {
 });
 
 test("findSession routes a sessionId to its host and ttyd port", async () => {
+  hub.__setQwenEnabled(true); // afterEach resets it; qwen agentType is coerced off otherwise
   await request("POST", "/api/heartbeat", {
     body: {
       device: "h3",
-      sessions: [{ id: "zz111", ttydPort: 7705 }, { id: "zz222", ttydPort: 7706 }],
+      sessions: [
+        { id: "zz111", ttydPort: 7705 },
+        { id: "zz222", ttydPort: 7706, agentType: "qwen" },
+      ],
     },
     headers: agentHeaders,
   });
-  assert.deepEqual(findSession("zz222"), { host: "h3", port: 7706 });
+  // agentType rides along so proxyTerm can gate the qwen-only scroll-to-bottom
+  // control; a session that reports none resolves to undefined (i.e. Claude).
+  assert.deepEqual(findSession("zz222"), { host: "h3", port: 7706, agentType: "qwen" });
+  assert.deepEqual(findSession("zz111"), { host: "h3", port: 7705, agentType: undefined });
   assert.equal(findSession("nope"), null);
 });
 
@@ -11011,6 +11113,10 @@ test("term: terminal HTML serves JBMNerd with font-display:swap (not block)", as
     text.indexOf("@font-face") < text.indexOf("</head>"),
     "@font-face must be injected before </head>"
   );
+  // fs1 reports no agentType (a Claude session), so the qwen-only jump-to-bottom
+  // control must NOT be injected — Claude's alt-screen TUI is always at the tail.
+  assert.ok(!text.includes("turmaToBottom"),
+    "the scroll-to-bottom control must not leak into a non-qwen terminal");
   data.socket.destroy();
   ctrl.socket.destroy();
 
@@ -11021,6 +11127,71 @@ test("term: terminal HTML serves JBMNerd with font-display:swap (not block)", as
   assert.match(font.headers["content-type"], /^font\/woff2/);
   assert.match(font.headers["cache-control"], /max-age=31536000/);
   assert.ok(font.headers["cache-control"].includes("immutable"), "font must be immutable");
+});
+
+
+test("term: a qwen session's terminal HTML injects the scroll-to-bottom control", async () => {
+  // Qwen Code's TUI keeps its own scrollable conversation (unlike Claude's
+  // always-at-bottom alt screen), so its terminal — and only its — gets the
+  // jump-to-bottom pill. Drives the same real proxyTerm path as the font test.
+  hub.__setQwenEnabled(true); // afterEach resets it; qwen agentType is coerced off otherwise
+  const host = "qwenTermHost";
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: host,
+      sessions: [{ id: "qt1", repo: "Turma", status: "running", ttydPort: 7911,
+        agentType: "qwen", worktreePath: "/git/.turma/worktrees/Turma/qt1",
+        transcriptId: "t-qt1" }],
+    },
+    headers: agentHeaders,
+  });
+  const ctrl = await wsConnect(`/agent/control?name=${host}&token=${hostAgentToken(host)}`);
+  const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
+
+  const docP = request("GET", "/term/qt1/", { headers: userHeaders });
+
+  await waitFor(() => ctrlFrames.some((f) => {
+    try { return JSON.parse(f.payload).open; } catch { return false; }
+  }));
+  const ch = ctrlFrames
+    .map((f) => { try { return JSON.parse(f.payload).open; } catch { return null; } })
+    .find(Boolean);
+  assert.ok(ch, "hub should request a data channel for the terminal");
+
+  const data = await wsConnect(`/agent/data?ch=${ch}&token=${hostAgentToken(host)}`, 1500);
+  const dataFrames = collectFrames(data.socket, data.leftover);
+
+  await waitFor(() => dataFrames.some((f) => f.payload.length), 3000);
+  const sent = Buffer.concat(dataFrames.map((f) => f.payload));
+  assert.match(sent.toString("utf8"), /GET \/term\/qt1\/ HTTP\/1\.1/);
+
+  const html = "<!doctype html><html><head><title>t</title></head><body>x</body></html>";
+  const resp =
+    "HTTP/1.1 200 OK\r\n" +
+    "Content-Type: text/html\r\n" +
+    `Content-Length: ${html.length}\r\n` +
+    "\r\n" + html;
+  data.socket.write(wsClientFrame(0x2, Buffer.from(resp, "utf8")));
+
+  const doc = await Promise.race([
+    docP,
+    new Promise((_, rej) => {
+      const t = setTimeout(() => rej(new Error("terminal document timed out")), 5000);
+      t.unref?.();
+    }),
+  ]);
+  assert.equal(doc.status, 200);
+  const text = doc.raw;
+  assert.ok(text.includes("turmaToBottom"),
+    "a qwen terminal must inject the scroll-to-bottom control");
+  // It must land in <head> (before </head>), like the other injections.
+  assert.ok(text.indexOf("turmaToBottom") < text.indexOf("</head>"),
+    "the control must be injected before </head>");
+  // The other injections must survive alongside it.
+  assert.ok(text.includes("@font-face") && text.includes("registerOscHandler"),
+    "font + clipboard injections must coexist with the scroll control");
+  data.socket.destroy();
+  ctrl.socket.destroy();
 });
 
 

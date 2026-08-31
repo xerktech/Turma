@@ -4024,7 +4024,7 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
 function findSession(sessionId) {
   for (const [key, a] of Object.entries(agents)) {
     for (const s of a.sessions || []) {
-      if (s.id === sessionId) return { host: key, port: s.ttydPort };
+      if (s.id === sessionId) return { host: key, port: s.ttydPort, agentType: s.agentType };
     }
   }
   return null;
@@ -7341,6 +7341,71 @@ const TERM_OSC52_JS =
   "wire();})();";
 const TERM_OSC52_CLIPBOARD = "<script>" + TERM_OSC52_JS + "</script>";
 
+// "Jump to bottom" control injected into ttyd's page for a QWEN session only.
+// Claude's TUI owns the alternate screen and stays pinned to its last line, so
+// there is nothing to scroll back down to — hence it has never needed one. Qwen
+// Code's TUI keeps its conversation in an IN-APP scroll region with its own
+// scrollbar (the vertical block/bar glyph column _PANE_SCROLLBAR_RE strips in
+// hub-agent's pane parser), so a wheel- or touch-scroll UP parks the pane above
+// the tail with no affordance to get back — the operator has to reverse the
+// whole scroll by hand. This adds a floating pill that drives qwen's own scroll
+// to the bottom by dispatching wheel-DOWN events on the .xterm element: the same
+// primitive TERM_TOUCH_SCROLL already uses, and the same gesture the operator
+// scrolls qwen with today, so it needs no knowledge of qwen's internal key map
+// and works whether xterm forwards the wheel as mouse events or translates it to
+// arrow keys. It repeats bursts until the visible screen stops changing (qwen
+// clamps at the bottom), comparing all but the last few rows so an animating
+// footer spinner can't defeat the "reached bottom" test.
+//
+// Gated to qwen SERVER-SIDE in proxyTerm, so Claude's composer never takes a
+// stray Down-arrow from a control it has no use for. window.term is ttyd's own
+// xterm instance (the same handle TERM_OSC52_JS wires onto); it appears a beat
+// after parse, so every read guards on it.
+const TERM_SCROLL_BOTTOM_STYLE =
+  "<style>#turmaToBottom{position:fixed;right:16px;bottom:16px;z-index:2147483647;" +
+  "display:none;align-items:center;gap:5px;padding:7px 13px;border:0;border-radius:999px;" +
+  "font:600 12px/1 -apple-system,system-ui,sans-serif;color:#fff;" +
+  "background:rgba(37,99,235,.92);box-shadow:0 2px 10px rgba(0,0,0,.45);cursor:pointer;}" +
+  "#turmaToBottom:hover{background:#2563eb;}</style>";
+// Bare JS (exported for the sandbox test), embedded in TERM_SCROLL_BOTTOM below.
+const TERM_SCROLL_BOTTOM_JS =
+  "(function(){" +
+  // BURST wheel-downs per pass; TAIL rows excluded from the change test (the
+  // spinner/composer footer); MAX bounds the arrow-keys sent to qwen when the
+  // change test can't settle (e.g. mid-stream), where qwen auto-follows anyway.
+  "var STEP=40,BURST=8,TAIL=3,MAX=800,busy=false,btn=null;" +
+  "function xterm(){return document.querySelector('.xterm');}" +
+  // The visible screen as text, minus the last TAIL rows. In qwen's alt buffer
+  // viewportY is 0 and getLine walks the on-screen rows; when the pane scrolls
+  // these rows change, and when it clamps at the bottom they stop.
+  "function snap(){var t=window.term;if(!t||!t.buffer||!t.buffer.active)return null;" +
+  "var b=t.buffer.active,rows=(t.rows||24),base=(b.viewportY||0),out=[];" +
+  "for(var i=0;i<rows-TAIL;i++){var ln=b.getLine(base+i);" +
+  "out.push(ln?ln.translateToString(true):'');}return out.join('\\n');}" +
+  "function wheelDown(n){var t=xterm();if(!t)return;for(var i=0;i<n;i++){" +
+  "t.dispatchEvent(new WheelEvent('wheel',{deltaY:STEP,deltaMode:0," +
+  "bubbles:true,cancelable:true}));}}" +
+  "function toBottom(){if(busy)return;busy=true;var sent=0;" +
+  "(function pass(){var before=snap();wheelDown(BURST);sent+=BURST;" +
+  "setTimeout(function(){var after=snap();" +
+  // Keep going while the screen is still moving and we're under the cap; a null
+  // snap (term not ready) also stops rather than spins.
+  "if(sent<MAX&&before!==null&&after!==null&&after!==before){pass();}" +
+  "else{busy=false;hide();}},45);})();}" +
+  "function show(){if(btn)btn.style.display='flex';}" +
+  "function hide(){if(btn)btn.style.display='none';}" +
+  "function wire(){btn=document.createElement('button');btn.id='turmaToBottom';" +
+  "btn.type='button';btn.textContent='\\u2193 Bottom';" +
+  "btn.title='Scroll this Qwen Code session to the latest output';" +
+  "btn.addEventListener('click',toBottom);document.body.appendChild(btn);" +
+  // Reveal the pill the instant the operator scrolls UP off the tail (mirrors the
+  // chat view's jump-to-latest pill); toBottom hides it again once it clamps.
+  "addEventListener('wheel',function(e){if(!busy&&e.deltaY<0)show();},{passive:true});}" +
+  "if(document.body)wire();else addEventListener('DOMContentLoaded',wire);" +
+  "})();";
+const TERM_SCROLL_BOTTOM =
+  TERM_SCROLL_BOTTOM_STYLE + "<script>" + TERM_SCROLL_BOTTOM_JS + "</script>";
+
 // ---- minimal WebSocket server framing (RFC 6455) ----------------------------
 // We only need enough to carry an opaque byte stream (the agent's ttyd TCP
 // wire) plus text control JSON, ping/pong keepalive, and close. Frames FROM the
@@ -7637,7 +7702,7 @@ function dropTermAgents(name) {
     }
   }
 }
-async function proxyTerm(req, res, name, port) {
+async function proxyTerm(req, res, name, port, agentType) {
   const headers = { ...req.headers, host: "ttyd", authorization: ttydAuth(name) };
   // Keep-alive over the pooled channel — drop any client-sent Connection header
   // so ttyd keeps the tunnel channel open for the next asset instead of closing.
@@ -7658,7 +7723,8 @@ async function proxyTerm(req, res, name, port) {
           let html = Buffer.concat(chunks).toString("utf8");
           // Insert the @font-face + touch-scroll shim + clipboard bridge before
           // </head> (fall back to prepending).
-          const inject = TERM_FONT_STYLE + TERM_TOUCH_SCROLL + TERM_OSC52_CLIPBOARD;
+          const inject = TERM_FONT_STYLE + TERM_TOUCH_SCROLL + TERM_OSC52_CLIPBOARD +
+            (agentType === "qwen" ? TERM_SCROLL_BOTTOM : "");
           html = html.includes("</head>")
             ? html.replace("</head>", inject + "</head>")
             : inject + html;
@@ -10263,7 +10329,7 @@ const server = http.createServer(async (req, res) => {
       if (parts.length === 2 && !url.pathname.endsWith("/") && req.url.startsWith(url.pathname)) {
         req.url = `${url.pathname}/${req.url.slice(url.pathname.length)}`;
       }
-      return proxyTerm(req, res, loc.host, loc.port);
+      return proxyTerm(req, res, loc.host, loc.port, loc.agentType);
     }
 
     json(res, 404, { error: "not found" });
@@ -10813,6 +10879,7 @@ if (process.env.TURMA_TEST) {
     sessionTokenValid,
     fmtDur,
     TERM_OSC52_JS,
+    TERM_SCROLL_BOTTOM_JS,
     pcmToWav,
     transcribePcm,
     issueWsToken,
