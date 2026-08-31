@@ -552,16 +552,19 @@ test("OSC 52 bridge survives a malformed payload", () => {
 // scrolls, and a queued setTimeout the test drains by hand. scrollPos models
 // qwen's OWN scroll (viewportY stays 0, the drawn rows change), clamped at
 // maxScroll so an over-scroll is a no-op, exactly as the real TUI clamps.
-// `animate` models qwen's real busy footer: a "esc to cancel" line 6 rows above
-// the bottom (INSIDE the compare region) whose token changes every wheel event,
-// exactly as QA found in docs/qwen-g0/pane/02-busy.txt.
+// `footer` places a text line 6 rows above the bottom (INSIDE the compare
+// region), modelling a real TUI footer as QA captured in docs/qwen-g0/pane/. With
+// `animate` it also carries a per-frame token that changes every wheel event, so
+// the settle test never trips — the case that forces the streaming cap. Set a
+// runtime's busy marker there to exercise active(); a non-busy string (a
+// permission dialog) must NOT read as busy.
 // `stallAtCall` models a late repaint (QA's ~1/10 stop-short): on that Nth full
 // screen read, the fake returns the PREVIOUS frame's content — as if the scroll's
 // redraw hadn't landed by the poll — so that one `after` read equals its `before`
 // even though the pane is still mid-scroll. Reads are counted per screen scan
-// (each starts at row 0): pass K does before(2K-1... actually before/after/active),
-// so callers target the read they want to stall.
-function runScrollBottom({ maxScroll = 5, rows = 24, startAt = 0, withTerm = true, animate = false, stallAtCall = 0 } = {}) {
+// (each starts at row 0): a pass does before/after/active, so callers target the
+// read they want to stall.
+function runScrollBottom({ maxScroll = 5, rows = 24, startAt = 0, withTerm = true, animate = false, footer = null, stallAtCall = 0 } = {}) {
   let scrollPos = startAt, frame = 0;
   let cycle = 0, useScroll = startAt, lastCycleScroll = startAt;
   const wheelDeltas = [];
@@ -582,8 +585,8 @@ function runScrollBottom({ maxScroll = 5, rows = 24, startAt = 0, withTerm = tru
       viewportY: 0,
       getLine: (i) => ({ translateToString: () => {
         if (i === 0) beginCycle();
-        return animate && i === rows - 6 ? "working… esc to cancel (" + frame + " tokens)"
-          : "row" + (useScroll + i);
+        if (i === rows - 6 && footer !== null) return footer + (animate ? " " + frame : "");
+        return "row" + (useScroll + i);
       } }),
     } },
   };
@@ -657,16 +660,32 @@ test("scroll-to-bottom: a single late-landing repaint frame does not stop it sho
   assert.equal(t.scrollPos(), 40, "reaches the tail despite one stale repaint frame");
 });
 
-test("scroll-to-bottom: an active streaming turn stops at the tight cap, not the runaway MAX", () => {
-  // The regression QA caught: an animating busy footer changes the snapshot every
-  // pass regardless of scroll, so the settle test never trips. With an unbounded
-  // scroll and a live turn, the loop must stop at ACTIVE_MAX (64), NOT MAX (800).
-  const t = runScrollBottom({ maxScroll: 100000, startAt: 0, animate: true });
+// One code path for both runtimes: active() unions Claude's and qwen's busy
+// footers, and must NOT misread Claude's permission dialog as busy.
+for (const marker of ["esc to interrupt", "enter to steer", "esc to cancel)"]) {
+  test(`scroll-to-bottom: a streaming turn (${marker}) stops at the tight cap, not the runaway MAX`, () => {
+    // An animating busy footer changes the snapshot every pass regardless of
+    // scroll, so the settle test never trips. With an unbounded scroll and a live
+    // turn, the loop must stop at ACTIVE_MAX (64), NOT MAX (800).
+    const t = runScrollBottom({ maxScroll: 100000, startAt: 0, animate: true, footer: marker });
+    t.click();
+    t.drain();
+    assert.ok(t.wheelDeltas.length <= 64, "capped at ACTIVE_MAX during a streaming turn");
+    assert.ok(t.wheelDeltas.length < 100, "nowhere near the 800-event runaway");
+    assert.ok(t.wheelDeltas.every((d) => d > 0), "still only wheel-DOWN");
+  });
+}
+
+test("scroll-to-bottom: Claude's permission dialog is NOT read as a streaming turn", () => {
+  // "Esc to cancel · Tab to amend" (no closing paren) must not match the busy
+  // regex — otherwise the pill would cap at ACTIVE_MAX when it shouldn't. With an
+  // animating (non-settling) screen carrying only that text, active() must stay
+  // false so the loop uses the idle MAX, running well past ACTIVE_MAX.
+  const t = runScrollBottom({ maxScroll: 100000, startAt: 0, animate: true,
+    footer: "Esc to cancel · Tab to amend" });
   t.click();
   t.drain();
-  assert.ok(t.wheelDeltas.length <= 64, "capped at ACTIVE_MAX during a streaming turn");
-  assert.ok(t.wheelDeltas.length < 100, "nowhere near the 800-event runaway");
-  assert.ok(t.wheelDeltas.every((d) => d > 0), "still only wheel-DOWN");
+  assert.ok(t.wheelDeltas.length > 64, "not capped — the dialog is not a busy turn");
 });
 
 test("scroll-to-bottom: already at the tail is a harmless no-op", () => {
@@ -3478,33 +3497,15 @@ test("http: session commands 404 for unknown hosts", async () => {
 });
 
 test("findSession routes a sessionId to its host and ttyd port", async () => {
-  hub.__setQwenEnabled(true); // afterEach resets it; qwen agentType is coerced off otherwise
   await request("POST", "/api/heartbeat", {
     body: {
       device: "h3",
-      sessions: [
-        { id: "zz111", ttydPort: 7705 },
-        { id: "zz222", ttydPort: 7706, agentType: "qwen" },
-      ],
+      sessions: [{ id: "zz111", ttydPort: 7705 }, { id: "zz222", ttydPort: 7706 }],
     },
     headers: agentHeaders,
   });
-  // agentType rides along so proxyTerm can gate the qwen-only scroll-to-bottom
-  // control; a session that reports none resolves to undefined (i.e. Claude).
-  assert.deepEqual(findSession("zz222"), { host: "h3", port: 7706, agentType: "qwen" });
-  assert.deepEqual(findSession("zz111"), { host: "h3", port: 7705, agentType: undefined });
+  assert.deepEqual(findSession("zz222"), { host: "h3", port: 7706 });
   assert.equal(findSession("nope"), null);
-});
-
-test("findSession: QWEN_ENABLED off coerces agentType away, suppressing the scroll pill", async () => {
-  // afterEach leaves QWEN_ENABLED false, so this runs with the kill-switch off.
-  // normalizeSessions blanks a reported agentType:"qwen" to "" on ingest, so
-  // findSession — and therefore proxyTerm — sees "" and injects no pill.
-  await request("POST", "/api/heartbeat", {
-    body: { device: "qoff", sessions: [{ id: "qq1", ttydPort: 7799, agentType: "qwen" }] },
-    headers: agentHeaders,
-  });
-  assert.deepEqual(findSession("qq1"), { host: "qoff", port: 7799, agentType: "" });
 });
 
 // ---- CORS on /api and /term (glasses WebView client) --------------------------
@@ -11174,10 +11175,15 @@ test("term: terminal HTML serves JBMNerd with font-display:swap (not block)", as
     text.indexOf("@font-face") < text.indexOf("</head>"),
     "@font-face must be injected before </head>"
   );
-  // fs1 reports no agentType (a Claude session), so the qwen-only jump-to-bottom
-  // control must NOT be injected — Claude's alt-screen TUI is always at the tail.
-  assert.ok(!text.includes("turmaToBottom"),
-    "the scroll-to-bottom control must not leak into a non-qwen terminal");
+  // The jump-to-bottom pill is a UNIVERSAL injection — one code path for every
+  // runtime (fs1 reports no agentType, i.e. a Claude session). It lands in <head>
+  // beside the other injections, which must all coexist.
+  assert.ok(text.includes("turmaToBottom"),
+    "the scroll-to-bottom control is injected for every session");
+  assert.ok(text.indexOf("turmaToBottom") < text.indexOf("</head>"),
+    "the control must be injected before </head>");
+  assert.ok(text.includes("@font-face") && text.includes("registerOscHandler"),
+    "font + clipboard injections must coexist with the scroll control");
   data.socket.destroy();
   ctrl.socket.destroy();
 
@@ -11188,71 +11194,6 @@ test("term: terminal HTML serves JBMNerd with font-display:swap (not block)", as
   assert.match(font.headers["content-type"], /^font\/woff2/);
   assert.match(font.headers["cache-control"], /max-age=31536000/);
   assert.ok(font.headers["cache-control"].includes("immutable"), "font must be immutable");
-});
-
-
-test("term: a qwen session's terminal HTML injects the scroll-to-bottom control", async () => {
-  // Qwen Code's TUI keeps its own scrollable conversation (unlike Claude's
-  // always-at-bottom alt screen), so its terminal — and only its — gets the
-  // jump-to-bottom pill. Drives the same real proxyTerm path as the font test.
-  hub.__setQwenEnabled(true); // afterEach resets it; qwen agentType is coerced off otherwise
-  const host = "qwenTermHost";
-  await request("POST", "/api/heartbeat", {
-    body: {
-      device: host,
-      sessions: [{ id: "qt1", repo: "Turma", status: "running", ttydPort: 7911,
-        agentType: "qwen", worktreePath: "/git/.turma/worktrees/Turma/qt1",
-        transcriptId: "t-qt1" }],
-    },
-    headers: agentHeaders,
-  });
-  const ctrl = await wsConnect(`/agent/control?name=${host}&token=${hostAgentToken(host)}`);
-  const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
-
-  const docP = request("GET", "/term/qt1/", { headers: userHeaders });
-
-  await waitFor(() => ctrlFrames.some((f) => {
-    try { return JSON.parse(f.payload).open; } catch { return false; }
-  }));
-  const ch = ctrlFrames
-    .map((f) => { try { return JSON.parse(f.payload).open; } catch { return null; } })
-    .find(Boolean);
-  assert.ok(ch, "hub should request a data channel for the terminal");
-
-  const data = await wsConnect(`/agent/data?ch=${ch}&token=${hostAgentToken(host)}`, 1500);
-  const dataFrames = collectFrames(data.socket, data.leftover);
-
-  await waitFor(() => dataFrames.some((f) => f.payload.length), 3000);
-  const sent = Buffer.concat(dataFrames.map((f) => f.payload));
-  assert.match(sent.toString("utf8"), /GET \/term\/qt1\/ HTTP\/1\.1/);
-
-  const html = "<!doctype html><html><head><title>t</title></head><body>x</body></html>";
-  const resp =
-    "HTTP/1.1 200 OK\r\n" +
-    "Content-Type: text/html\r\n" +
-    `Content-Length: ${html.length}\r\n` +
-    "\r\n" + html;
-  data.socket.write(wsClientFrame(0x2, Buffer.from(resp, "utf8")));
-
-  const doc = await Promise.race([
-    docP,
-    new Promise((_, rej) => {
-      const t = setTimeout(() => rej(new Error("terminal document timed out")), 5000);
-      t.unref?.();
-    }),
-  ]);
-  assert.equal(doc.status, 200);
-  const text = doc.raw;
-  assert.ok(text.includes("turmaToBottom"),
-    "a qwen terminal must inject the scroll-to-bottom control");
-  // It must land in <head> (before </head>), like the other injections.
-  assert.ok(text.indexOf("turmaToBottom") < text.indexOf("</head>"),
-    "the control must be injected before </head>");
-  // The other injections must survive alongside it.
-  assert.ok(text.includes("@font-face") && text.includes("registerOscHandler"),
-    "font + clipboard injections must coexist with the scroll control");
-  data.socket.destroy();
-  ctrl.socket.destroy();
 });
 
 

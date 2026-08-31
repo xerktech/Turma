@@ -237,26 +237,39 @@ the total is measured.
   into the ORIGINAL request target, only for origin-form requests, so the query survives byte-for-byte
   and an absolute-form/backslash target still 404s rather than resolving. Tests: the base-path cases
   in `server.test.js`.
-- **`proxyTerm` rewrites the top-level ttyd HTML to inject font + touch-scroll + OSC52 clipboard on
-  EVERY session, plus a qwen-ONLY jump-to-bottom pill** (`TERM_SCROLL_BOTTOM`). Claude's TUI owns the
-  alternate screen and stays pinned to its last line — nothing to scroll — so it gets no pill; qwen's
-  TUI keeps an IN-APP scroll region with its own scrollbar (the glyph column `_PANE_SCROLLBAR_RE`
-  strips), which a scroll-up leaves parked above the tail. The pill drives qwen's own scroll down by
-  dispatching wheel-DOWN events on `.xterm` (the SAME primitive `TERM_TOUCH_SCROLL` uses, and the
-  gesture the operator scrolls qwen with — so it needs no knowledge of qwen's key map). qwen keeps
-  **SGR mouse tracking on** (verified end-to-end in a real browser), so the wheel events reach it as
-  real mouse reports and it scrolls its own region. It repeats bursts until the screen is unchanged
-  for **STABLE consecutive polls** — a single read is not enough, because a redraw makes a full
-  browser↔tunnel↔qwen round trip and one poll can catch the pre-scroll frame and look "settled"
-  when it isn't (a ~1/10 stop-short, worse over the tunnel). **A STREAMING turn's footer animates
-  every frame so the settle test never trips; an active turn (busy-footer regex) stops at a tight
-  cap. qwen does NOT auto-follow mid-stream** — it pins to the TOP of new output and snaps to the
-  tail only at turn COMPLETION, which is why stopping early there is safe.
-  **Gated by `agentType` server-side**
-  (`findSession` carries it), never client-side, so Claude's composer never takes a stray Down-arrow.
-- **Android's `TerminalScreen` loads the same `/term/<id>/` in a WebView**, so this injection reaches
-  it with no android change — it is server plumbing, not a `turma/public/` control, so parity-exempt.
-  Tests: the `term:`/`scroll-to-bottom:` cases in `server.test.js`.
+- **Terminal scroll is unified at the TMUX layer, but routed by SCREEN MODEL — the two runtimes
+  render into DIFFERENT screens, so one unconditional rule can't fit both.** Sessions run inside tmux,
+  which repaints a fixed region (verified: xterm.js's `baseY` stays 0 through tmux). The runtimes
+  differ: **Claude runs on the ALTERNATE screen** (`#{alternate_on}`=1, `history_size` 0) with its
+  OWN scroll handler + SGR mouse; **qwen renders APPEND-ONLY on the MAIN screen**
+  (`ui.useTerminalBuffer:false`, the flicker fix in `.claude/rules/qwen.md` [Qwen B]), so its history
+  lives in TMUX's buffer. So the WHEEL must reach the APP for Claude but tmux copy-mode for qwen.
+  - **`agent/tmux.conf` sets `mouse on` + rebinds `WheelUp/DownPane` CONDITIONALLY on
+    `#{alternate_on}`** — `send -M` (forward to app) on the alt screen; `copy-mode -e` (tmux history,
+    auto-exits at the live tail) on the main screen. Keyed on the screen model, NOT `agentType`, so
+    it needs no runtime knowledge. **An UNCONDITIONAL copy-mode binding is a Claude REGRESSION** (QA
+    caught it: steals Claude's wheel into an empty `[0/0]` copy-mode). Verified end-to-end in a real
+    browser for both: Claude scrolls its own history, qwen scrolls tmux's; WheelDown off the bottom is
+    a no-op.
+  - **Trade-off:** `mouse on` means plain click-drag is tmux's copy-mode selection (copied out via the
+    existing OSC52 bridge / `set-clipboard on`), not the browser's native selection. **Shift+drag**
+    is the native-selection escape hatch (xterm.js honours it). Confirm OSC52 copy-out when touching
+    this (QA confirmed both work).
+  - **`proxyTerm` injects `TERM_SCROLL_BOTTOM` (a jump-to-bottom pill) on EVERY session** — one code
+    path, no `agentType` gate (that gate + the `findSession`/`proxyTerm` `agentType` plumbing were
+    removed). The pill dispatches wheel-DOWN on `.xterm`, which lands on whichever wheel path the
+    screen model selects and drives it to the live bottom. It repeats bursts until the screen is
+    unchanged for **STABLE consecutive polls** — a single read isn't enough: a redraw makes a full
+    browser↔tunnel↔app/tmux round trip, so one poll can catch the pre-scroll frame and look "settled"
+    when it isn't (a ~1/10 stop-short, worse over the tunnel). At a STREAMING live tail the busy
+    footer animates every frame so the settle never trips; the busy-footer regex (unions Claude's
+    "esc to interrupt" and qwen's "enter to steer"/"esc to cancel)") caps it rather than spinning to
+    MAX.
+  - **Android's `TerminalScreen` loads the same `/term/<id>/` WebView and tmux serves the same
+    config**, so both reach it with no client change — server/agent plumbing, parity-exempt.
+  - Tests: the `term:`/`scroll-to-bottom:` cases in `server.test.js` (mechanism-agnostic — model
+    wheel-down + settle); the conditional tmux binding + real-browser pill (both screen models) are
+    host-verified (no CI tmux).
 
 ## Auth and the glasses surface
 
