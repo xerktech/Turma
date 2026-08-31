@@ -154,11 +154,21 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
                 else -> AndroidView(
                     factory = { ctx ->
                         WebView(ctx).apply {
-                            // ttyd renders with xterm's CANVAS renderer (agent launches
-                            // it `-t rendererType=canvas`), which paints BLACK in a
-                            // hardware-accelerated Android WebView. A software layer
-                            // composites the 2D canvas on the CPU so it draws correctly.
-                            setLayerType(android.view.View.LAYER_TYPE_SOFTWARE, null)
+                            // ttyd now renders with xterm's WEBGL renderer (agent launches
+                            // it `-t rendererType=webgl`). WebGL REQUIRES hardware
+                            // acceleration: an Android WebView on LAYER_TYPE_SOFTWARE cannot
+                            // create a GL context, so the terminal painted nothing at all —
+                            // a fully blank screen. So we keep this WebView on the default
+                            // hardware-accelerated layer (LAYER_TYPE_NONE); the app is
+                            // hardware-accelerated by default, and this is the same GPU path
+                            // desktop Chromium uses to render the web terminal's WebGL.
+                            //
+                            // The old LAYER_TYPE_SOFTWARE here was a workaround for the CANVAS
+                            // renderer, which paints black on a hardware layer — but ttyd left
+                            // canvas (canvas -> dom -> webgl) and no longer requests it. If a
+                            // device ever lacks a GL context, ttyd falls back to xterm's DOM
+                            // renderer, which also draws correctly on a hardware layer; only
+                            // the 2D canvas renderer was ever black there, and it is gone.
                             setBackgroundColor(AndroidColor.parseColor("#0D0D0D"))
                             with(this.settings) {
                                 javaScriptEnabled = true
