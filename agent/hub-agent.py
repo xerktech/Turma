@@ -81,6 +81,17 @@ _AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _AGENT_DIR not in sys.path:
     sys.path.insert(0, _AGENT_DIR)
 
+# The bundled tmux config, a SIBLING of this file. The agent launches every
+# session with a bare `tmux new-session` (no `-f`), and tmux reads a config only
+# from /etc/tmux.conf or ~/.tmux.conf at SERVER start — neither reliably present
+# (the container image ships /etc/tmux.conf, but a native/pod install may have
+# neither), so without loading it ourselves the ENTIRE config silently never
+# applies: mouse-wheel scroll routing (else the wheel reaches the app — a qwen
+# session then scrolls its input-prompt history instead of the conversation),
+# OSC52 copy-out, truecolor, history-limit. `load_tmux_config()` sources it into
+# the default-socket server the sessions share (see there).
+_TMUX_CONF = os.path.join(_AGENT_DIR, "tmux.conf")
+
 # Set by a SIGUSR1 handler (installed in run_forever). tunnel-agent.js sends
 # SIGUSR1 when the hub pokes it over the control channel because a command was
 # just queued, so the heartbeat loop cuts its interval sleep short and delivers
@@ -840,6 +851,38 @@ def run_ok(cmd, cwd=None, timeout=30):
         return out.returncode, (out.stderr or "").strip()
     except Exception as e:
         return None, str(e)
+
+
+def load_tmux_config(socket=None):
+    """Load `_TMUX_CONF` into the tmux SERVER the agent's sessions share, so its
+    options and key bindings actually take effect (see `_TMUX_CONF` for why they
+    otherwise silently don't). Two invocations cover the two boot states:
+
+    * `-f <conf> start-server` handles a COLD boot (no server yet — the usual
+      `run_forever` case). It STARTS the server WITH the config loaded; the config
+      sets `exit-empty off` so that server persists (empty) instead of vanishing
+      the instant it is created, so the sessions launched moments later inherit it
+      with a bare `tmux new-session`. (A bare `start-server` then a SEPARATE
+      `source-file` does NOT work — the empty server exits between the two calls,
+      and the second fails "no server running". That was the shipped bug.)
+    * `source-file` handles a WARM/ADOPTED server (a manager restart left tmux
+      alive, possibly one a PRE-fix agent started without the config): `-f
+      start-server` is a no-op on an existing server, so this applies the config
+      to it LIVE — existing sessions included — without touching a session.
+
+    `socket` is for tests only (an isolated `-L <name>` so a real-tmux test can
+    exercise the cold-boot path without touching the production default socket).
+    Best-effort and non-fatal: a tmux hiccup must never stop the agent booting."""
+    if not os.path.exists(_TMUX_CONF):
+        log(f"tmux config not found at {_TMUX_CONF}; using tmux defaults")
+        return
+    base = ["tmux"] + (["-L", socket] if socket else [])
+    run_ok(base + ["-f", _TMUX_CONF, "start-server"], timeout=10)
+    rc, err = run_ok(base + ["source-file", _TMUX_CONF], timeout=10)
+    if rc == 0:
+        log(f"loaded tmux config from {_TMUX_CONF}")
+    else:
+        log(f"could not load tmux config ({_TMUX_CONF}): {err}")
 
 
 def _port_open(port, host="127.0.0.1", timeout=0.3):
@@ -24489,6 +24532,12 @@ class SessionManager:
         # bring us back. Must be set on the main thread, like SIGUSR1 above.
         signal.signal(signal.SIGTERM, self._handle_shutdown)
         signal.signal(signal.SIGINT, self._handle_shutdown)
+        # Load the bundled tmux config into the shared server BEFORE any session
+        # launches or `resume_on_boot` adopts — otherwise the whole config (the
+        # mouse-wheel scroll routing especially) silently never applies, since the
+        # agent's `tmux new-session` passes no `-f` and neither /etc/tmux.conf nor
+        # ~/.tmux.conf is reliably present. See load_tmux_config().
+        load_tmux_config()
         # Probe the qwen runtime (binary + model route) on a WORKER THREAD when
         # this host offers qwen — the `qwen --version` subprocess stays off-beat
         # (XERK-395). It must start BEFORE resume_on_boot below: a boot relaunch

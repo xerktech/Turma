@@ -2208,6 +2208,58 @@ class TestDshState(unittest.TestCase):
             {"status": "running", "pendingInteraction": True}), False)
 
 
+class TestLoadTmuxConfig(unittest.TestCase):
+    def test_starts_the_server_with_the_conf_then_sources_it(self):
+        calls = []
+        with mock.patch.object(ha.os.path, "exists", lambda p: True), \
+             mock.patch.object(ha, "run_ok",
+                               lambda cmd, **k: calls.append(cmd) or (0, "")):
+            ha.load_tmux_config()
+        # `-f <conf> start-server` starts the server WITH the config (cold boot);
+        # `source-file` applies it to an already-running server (warm/adopted).
+        self.assertEqual(calls[0], ["tmux", "-f", ha._TMUX_CONF, "start-server"])
+        self.assertEqual(calls[1], ["tmux", "source-file", ha._TMUX_CONF])
+
+    def test_skips_and_runs_no_tmux_when_the_conf_is_absent(self):
+        calls = []
+        with mock.patch.object(ha.os.path, "exists", lambda p: False), \
+             mock.patch.object(ha, "run_ok",
+                               lambda cmd, **k: calls.append(cmd) or (0, "")):
+            ha.load_tmux_config()
+        self.assertEqual(calls, [])
+
+    def test_never_raises_on_a_tmux_failure(self):
+        with mock.patch.object(ha.os.path, "exists", lambda p: True), \
+             mock.patch.object(ha, "run_ok", lambda *a, **k: (1, "boom")):
+            ha.load_tmux_config()  # must not raise — booting continues on defaults
+
+    def test_cold_boot_actually_applies_the_conf_on_a_real_tmux(self):
+        # The mock tests above assert the CALL shape but can't catch the real
+        # cold-boot trap (start-server on an empty socket exits, so a separate
+        # source-file fails "no server running"). Drive real tmux on an ISOLATED
+        # socket to prove the config actually lands on a fresh server, and that a
+        # bare `new-session` afterwards inherits it — exactly what the agent does.
+        if ha.run_ok(["tmux", "-V"])[0] != 0:
+            self.skipTest("tmux not available")
+        sock = "turmatest_ldcfg_%d" % os.getpid()
+        # `run` returns STDOUT (where `show`/`list-keys` print); `run_ok` returns
+        # (rc, stderr), so it is used only where the exit code is what matters.
+        try:
+            ha.run_ok(["tmux", "-L", sock, "kill-server"])
+            ha.load_tmux_config(socket=sock)  # COLD: no server yet
+            self.assertEqual(ha.run(["tmux", "-L", sock, "show", "-gv", "mouse"]).strip(),
+                             "on", "config must be loaded on the fresh cold-boot server")
+            # A bare new-session (no -f, like the agent) must inherit the config.
+            ha.run_ok(["tmux", "-L", sock, "new-session", "-d", "-s", "s", "sleep 30"])
+            self.assertEqual(ha.run(["tmux", "-L", sock, "show", "-gv", "mouse"]).strip(),
+                             "on", "a bare new-session must inherit the loaded config")
+            self.assertIn("alternate_on",
+                          ha.run(["tmux", "-L", sock, "list-keys", "-T", "root"]),
+                          "the screen-model wheel binding must be active")
+        finally:
+            ha.run_ok(["tmux", "-L", sock, "kill-server"])
+
+
 class TestDshWeb(unittest.TestCase):
     """The host-wide read-only `dsh web` viewer supervisor (XERK-501): the URL
     advertise rule, the enable gate, the payload, the launch command and the
