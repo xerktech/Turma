@@ -2292,6 +2292,27 @@ def write_local_model_env(path, model=None, context=None):
     return path
 
 
+def write_session_env_file(path, env_map, what):
+    """Write a per-session 0600 env file a launch line SOURCES (`set -a; . file;
+    set +a`), one `export KEY=<shlex-quoted>` per item — the shared writer for the
+    qwen and dsh launchers (XERK-528). The credential must not appear in ANY
+    process's argv (/proc/<pid>/cmdline is world-readable), so only the file PATH
+    ever hits a command line; 0600 stops other uids reading the key. Raises
+    RuntimeError named by `what` (e.g. "qwen"/"dsh") on an IO failure, so the
+    launcher's error handling marks the session rather than running it half-wired.
+
+    NOT the same writer as `write_local_model_env` above: that one is atomic
+    (tmp + os.replace), writes bare `KEY=VALUE` (no `export`, `set -a` exports
+    them), and derives its pairs — deliberately kept separate."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for k, v in env_map.items():
+                f.write(f"export {k}={shlex.quote(str(v))}\n")
+    except OSError as e:
+        raise RuntimeError(f"{what} env file: {e}")
+
+
 def discard_local_model_env(path):
     """Remove the settings file when the host no longer has a local model.
 
@@ -2305,6 +2326,17 @@ def discard_local_model_env(path):
         pass
     except OSError as e:
         log(f"could not remove {path}: {e}")
+
+
+def unlink_quietly(paths):
+    """Best-effort removal of per-session files, ignoring a missing/unreadable
+    one — the shared unlink loop the qwen and dsh runtime teardowns use (XERK-528)
+    to drop their transient 0600 env files, sockets and prompt files."""
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
 
 def local_model_env_pairs(model=None, context=None):
@@ -4927,7 +4959,7 @@ PR_CONFLICT_RETRY_SEC = int(os.environ.get("TURMA_PR_CONFLICT_RETRY_SEC", "1800"
 
 # Open-PR nudge (XERK-526): a session that has finished a turn holding code work
 # that is not on an open PR gets nudged to commit, push, and open a PR — the
-# hub-side complement to the in-session Stop-hook backstop (XERK-525). Same
+# hub-side complement to the in-session Stop-hook backstop (XERK-528). Same
 # edge-triggered, cooldown, attempt-capped shape as the conflict nudge: one nudge
 # per episode, re-sent only past the retry interval while attempts remain.
 PR_OPEN_NUDGE = os.environ.get("TURMA_PR_OPEN_NUDGE", "1") != "0"
@@ -14600,6 +14632,92 @@ class SessionManager:
         if ev is not None:
             ev.set()
 
+    # ---- shared launcher spine (XERK-528) ---------------------------------
+    # Extracted from the three launchers so a change to any of these lands once.
+    # `_launch_tmux` (claude) is the baseline; qwen/dsh reuse the pieces that were
+    # byte-for-byte the same. What is NOT shared stays inline: claude's OWN 3-way
+    # conversation-id pin (it resolves against on-disk transcripts, unlike the
+    # qwen/dsh 2-way pin below) and each runtime's model-route / process wiring.
+
+    def _pin_conversation_id(self, sess, resume, resume_id):
+        """Pin WHICH conversation a qwen/dsh session is — the 2-way form of the
+        claude-side pin in `_launch_tmux`. A resume keeps the existing id (the
+        picker's specific transcript, else the session's own) so the runtime's
+        persisted session and the projection transcript line up; a fresh launch
+        mints one. Stamps it on the record and remembers the ticket link
+        (idempotent, no-op without a ticket). Returns the id, which NAMES the
+        native/projection transcript. Claude's pin is 3-way and stays inline."""
+        claude_sid = None
+        if resume:
+            if resume_id and VALID_CLAUDE_SID_RE.fullmatch(resume_id):
+                claude_sid = resume_id
+            elif sess.get("claudeSessionId"):
+                claude_sid = sess["claudeSessionId"]
+        if not claude_sid:
+            claude_sid = str(uuid.uuid4())
+        sess["claudeSessionId"] = claude_sid
+        self._remember_ticket(sess)
+        return claude_sid
+
+    def _session_directive(self, sess, addendum=""):
+        """The new-work / ticket-branch / peers directive every launcher gives its
+        session, as ONE string. Claude appends it via --append-system-prompt; qwen
+        writes it to its context file and dsh to a system-prompt file, and both add
+        a runtime `addendum` correcting the peer tool names for a runtime that has
+        no SendMessage/ListAgents. Unconditional — peers are a host property, so a
+        resumed or migrated session needs it exactly as much as a fresh one."""
+        policy = NEW_WORK_SYSTEM_PROMPT
+        ticket = sess.get("ticket") or {}
+        if ticket.get("branch"):
+            policy += TICKET_BRANCH_PROMPT.format(
+                key=ticket.get("key") or "this session's ticket",
+                branch=ticket["branch"])
+        policy += PEERS_SYSTEM_PROMPT.format(
+            path=PEERS_FILE, sid=sess["id"], host=self.device)
+        return policy + addendum
+
+    def _spawn_in_tmux(self, sess, cmd, what=""):
+        """Kill any stale tmux for this session and start `cmd` detached in a fresh
+        one at the session's worktree, with the fixed 220x50 geometry every
+        launcher uses. Raises RuntimeError on a tmux failure (`what` names the
+        runtime in the message; empty for the claude path)."""
+        run(["tmux", "kill-session", "-t", sess["tmuxName"]])  # ensure clean slate
+        rc, err = run_ok([
+            "tmux", "new-session", "-d", "-s", sess["tmuxName"],
+            "-c", sess["worktreePath"], "-x", "220", "-y", "50", cmd,
+        ])
+        if rc != 0:
+            prefix = f"{what} " if what else ""
+            raise RuntimeError(f"{prefix}tmux launch failed: {err}")
+
+    def _confirm_launch(self, sess, timeout, poll, probe, timeout_reason):
+        """The shared launch-confirmation poll (XERK-492) behind
+        `_confirm_qwen_launch` / `_confirm_dsh_launch`: a bound socket / started
+        tmux is NOT proof the runtime came up. Fail fast if the tmux process is
+        gone (the runtime is its tmux session's only command, so a vanished
+        session crashed on load), else call `probe()` each tick — it returns True
+        (up), False (a fatal wedge it has ALREADY logged; refuse now) or None (not
+        up yet, keep waiting). Refuse on timeout with `timeout_reason`. The runtime
+        name in the log lines comes from the session's own agentType."""
+        tmux = sess.get("tmuxName")
+        sid = sess.get("id")
+        what = sess.get("agentType") or "session"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self._tmux_alive(tmux):
+                log(f"{what} session {sid}: process exited during startup "
+                    "(crashed on load) — refusing the launch")
+                return False
+            verdict = probe()
+            if verdict is True:
+                return True
+            if verdict is False:
+                return False   # a fatal wedge the probe already logged
+            time.sleep(poll)
+        log(f"{what} session {sid}: {timeout_reason} within {timeout:g}s — "
+            "refusing the launch")
+        return False
+
     def _launch_qwen(self, sess, resume=False, prompt=None, resume_id=None):
         """Launch a session on the qwen (Qwen Code, XERK-504) runtime: an
         interactive qwen TUI in the session's own tmux + worktree, with a PINNED
@@ -14639,30 +14757,14 @@ class SessionManager:
         # _launch_tmux pins claudeSessionId. A resume keeps the existing id so
         # qwen's persisted session and the transcript line up (qwen --resume <id>
         # appends to the SAME <id>.jsonl — G0 spike); a fresh launch mints one.
-        claude_sid = None
-        if resume:
-            if resume_id and VALID_CLAUDE_SID_RE.fullmatch(resume_id):
-                claude_sid = resume_id
-            elif sess.get("claudeSessionId"):
-                claude_sid = sess["claudeSessionId"]
-        if not claude_sid:
-            claude_sid = str(uuid.uuid4())
-        sess["claudeSessionId"] = claude_sid
-        self._remember_ticket(sess)
+        claude_sid = self._pin_conversation_id(sess, resume, resume_id)
         worktree = sess["worktreePath"]
         sid = sess["id"]
         # 2. The new-work / ticket-branch / peers directive (the SAME text the
-        # claude path appends via --append-system-prompt) — written to qwen's
-        # context file, which qwen loads into the system prompt.
-        policy = NEW_WORK_SYSTEM_PROMPT
-        ticket = sess.get("ticket") or {}
-        if ticket.get("branch"):
-            policy += TICKET_BRANCH_PROMPT.format(
-                key=ticket.get("key") or "this session's ticket",
-                branch=ticket["branch"])
-        policy += PEERS_SYSTEM_PROMPT.format(
-            path=PEERS_FILE, sid=sid, host=self.device)
-        policy += QWEN_PEERS_ADDENDUM   # correct SendMessage/ListAgents for qwen (XERK-518)
+        # claude path appends via --append-system-prompt), plus the qwen addendum
+        # correcting SendMessage/ListAgents (XERK-518) — written to qwen's context
+        # file, which qwen loads into the system prompt.
+        policy = self._session_directive(sess, QWEN_PEERS_ADDENDUM)
         # 3. Per-worktree qwen config (settings.json + the context file), both
         # git-excluded so they never read as uncommitted work or get committed.
         self._write_qwen_worktree_config(sess, policy)
@@ -14709,13 +14811,7 @@ class SessionManager:
         api_key_val = os.environ.get(QWEN_MODEL_API_KEY_ENV)
         if api_key_val:
             env_map["OPENAI_API_KEY"] = api_key_val
-        try:
-            fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                for k, v in env_map.items():
-                    f.write(f"export {k}={shlex.quote(str(v))}\n")
-        except OSError as e:
-            raise RuntimeError(f"qwen env file: {e}")
+        write_session_env_file(env_file, env_map, "qwen")
         # 5. Build the interactive TUI command. Endpoint auth is `openai` + the
         # sourced OPENAI_* env (the ticket's form, proven in the G0 spike).
         parts = [QWEN_BIN, "--auth-type", "openai"]
@@ -14731,13 +14827,7 @@ class SessionManager:
             parts += ["-i", prompt]
         qwen_cmd = (f"set -a; . {shlex.quote(env_file)}; set +a; "
                     + shlex.join(parts))
-        run(["tmux", "kill-session", "-t", sess["tmuxName"]])
-        rc, err = run_ok([
-            "tmux", "new-session", "-d", "-s", sess["tmuxName"],
-            "-c", worktree, "-x", "220", "-y", "50", qwen_cmd,
-        ])
-        if rc != 0:
-            raise RuntimeError(f"qwen tmux launch failed: {err}")
+        self._spawn_in_tmux(sess, qwen_cmd, "qwen")
         # 6. Confirm the session actually came up before recording it (XERK-492):
         # a started tmux is not proof qwen bound its session (a bad config, a
         # failed load, an unreachable endpoint). A failed confirm tears down and
@@ -14886,10 +14976,7 @@ class SessionManager:
             except Exception:
                 pass
         # Drop the per-session env file (holds the model API key, 0600).
-        try:
-            os.remove(os.path.join(QWEN_RUNTIME_DIR, f"{sid}.env"))
-        except OSError:
-            pass
+        unlink_quietly([os.path.join(QWEN_RUNTIME_DIR, f"{sid}.env")])
         # Peer messaging (XERK-518 [Qwen L]): stop the inbox forger and drop this
         # session's rendezvous dir (any never-delivered files are stale by now).
         self._stop_qwen_peer_inbox(sid)
@@ -15217,24 +15304,17 @@ class SessionManager:
           keeps that stale file from confirming a session that has not come up.
 
         Returns True once confirmed alive, False on a dead or wedged launch."""
-        tmux = sess.get("tmuxName")
-        sid = sess.get("id")
-        deadline = time.time() + QWEN_LAUNCH_CONFIRM_SEC
-        while time.time() < deadline:
-            if not self._tmux_alive(tmux):
-                log(f"qwen session {sid}: process exited during startup "
-                    "(crashed on load) — refusing the launch")
-                return False
+        def probe():
             # A live runtime.json can appear WHILE the per-server MCP trust dialog
             # blocks (qwen has started, but the initial prompt never runs), so a
             # bare pid check would confirm a wedged session (XERK-507 D1, the
             # XERK-492 "a bound thing is not a live thing" class). Pre-auth should
             # prevent the dialog; if it is up anyway it never clears itself, so
-            # fail fast with a reason rather than record it running.
-            if QWEN_MCP_APPROVAL_PANE_SIG in (_capture_pane(tmux) or ""):
-                log(f"qwen session {sid}: wedged at the MCP server-approval "
-                    "dialog (pre-authorization did not take) — refusing the "
-                    "launch")
+            # fail fast (a fatal-wedge False) with a reason rather than record it.
+            if QWEN_MCP_APPROVAL_PANE_SIG in (_capture_pane(sess.get("tmuxName")) or ""):
+                log(f"qwen session {sess.get('id')}: wedged at the MCP "
+                    "server-approval dialog (pre-authorization did not take) — "
+                    "refusing the launch")
                 return False
             rt = self._qwen_runtime_file(claude_sid)
             if rt:
@@ -15244,10 +15324,10 @@ class SessionManager:
                 # wrote the registry — take that as up rather than false-fail.
                 if pid is None or _pid_alive(pid):
                     return True
-            time.sleep(QWEN_LAUNCH_CONFIRM_POLL_SEC)
-        log(f"qwen session {sid}: tmux started but no live session registry "
-            f"appeared within {QWEN_LAUNCH_CONFIRM_SEC:g}s — refusing the launch")
-        return False
+            return None
+        return self._confirm_launch(
+            sess, QWEN_LAUNCH_CONFIRM_SEC, QWEN_LAUNCH_CONFIRM_POLL_SEC, probe,
+            "tmux started but no live session registry appeared")
 
     def _launch_dsh(self, sess, resume=False, prompt=None, resume_id=None):
         """Launch a session on the dsh runtime: a headless per-session dsh process
@@ -15287,16 +15367,7 @@ class SessionManager:
         # 1. Pin the conversation id — it NAMES the projection transcript, exactly
         # as _launch_tmux pins claudeSessionId. A resume keeps the existing id so
         # dsh's persisted session and the transcript line up; a fresh launch mints.
-        claude_sid = None
-        if resume:
-            if resume_id and VALID_CLAUDE_SID_RE.fullmatch(resume_id):
-                claude_sid = resume_id
-            elif sess.get("claudeSessionId"):
-                claude_sid = sess["claudeSessionId"]
-        if not claude_sid:
-            claude_sid = str(uuid.uuid4())
-        sess["claudeSessionId"] = claude_sid
-        self._remember_ticket(sess)
+        claude_sid = self._pin_conversation_id(sess, resume, resume_id)
         # 2. Paths. The native event log (D3's canonical record) lives UNDER the
         # project-slug session dir at <tid>/dsh/ (DSH_STORE_DIRNAME), NOT the
         # worktree: the raw archive layer (XERK-469 [E]) EXCLUDES the worktree, so
@@ -15329,17 +15400,10 @@ class SessionManager:
             except OSError:
                 pass
         # 3. The new-work / ticket-branch / peers directive (the SAME text the
-        # claude path appends) — written to a file the driver registers as a
+        # claude path appends), plus the dsh addendum correcting SendMessage/
+        # ListAgents (XERK-476) — written to a file the driver registers as a
         # system-prompt section (dsh has no --append-system-prompt).
-        policy = NEW_WORK_SYSTEM_PROMPT
-        ticket = sess.get("ticket") or {}
-        if ticket.get("branch"):
-            policy += TICKET_BRANCH_PROMPT.format(
-                key=ticket.get("key") or "this session's ticket",
-                branch=ticket["branch"])
-        policy += PEERS_SYSTEM_PROMPT.format(
-            path=PEERS_FILE, sid=sid, host=self.device)
-        policy += DSH_PEERS_ADDENDUM   # correct SendMessage/ListAgents for dsh (XERK-476)
+        policy = self._session_directive(sess, DSH_PEERS_ADDENDUM)
         try:
             with open(sysprompt_path, "w", encoding="utf-8") as f:
                 f.write(policy)
@@ -15379,13 +15443,7 @@ class SessionManager:
         api_key_val = os.environ.get(DSH_MODEL_API_KEY_ENV)
         if api_key_val:
             env_map[DSH_MODEL_API_KEY_ENV] = api_key_val
-        try:
-            fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                for k, v in env_map.items():
-                    f.write(f"export {k}={shlex.quote(str(v))}\n")
-        except OSError as e:
-            raise RuntimeError(f"dsh env file: {e}")
+        write_session_env_file(env_file, env_map, "dsh")
         # 5. Launch the minimal profile (XERK-498): NO `--no-open`/`--port` —
         # those are dsh-web-app flags, and this profile has no web app. The
         # driver's control socket keeps the headless process alive; the process
@@ -15393,13 +15451,7 @@ class SessionManager:
         dsh_cmd = (
             f"set -a; . {shlex.quote(env_file)}; set +a; "
             + shlex.join([DSH_BIN, "--profile", profile]))
-        run(["tmux", "kill-session", "-t", sess["tmuxName"]])
-        rc, err = run_ok([
-            "tmux", "new-session", "-d", "-s", sess["tmuxName"],
-            "-c", worktree, "-x", "220", "-y", "50", dsh_cmd,
-        ])
-        if rc != 0:
-            raise RuntimeError(f"dsh tmux launch failed: {err}")
+        self._spawn_in_tmux(sess, dsh_cmd, "dsh")
         # 6. Wire the control-socket client (waits for the plugin to bind) and the
         # projection tail. A socket that never comes up is a failed launch.
         transcript_path = os.path.join(
@@ -15528,14 +15580,7 @@ class SessionManager:
         usable state reply == responsive == up", so this never false-fails an
         older plugin; a new driver's explicit readiness is authoritative and also
         exits the process on create failure, so that case reads as a dead tmux."""
-        tmux = sess.get("tmuxName")
-        sid = sess.get("id")
-        deadline = time.time() + DSH_LAUNCH_CONFIRM_SEC
-        while time.time() < deadline:
-            if not self._tmux_alive(tmux):
-                log(f"dsh session {sid}: process exited during startup "
-                    "(crashed on load) — refusing the launch")
-                return False
+        def probe():
             ack = ctl.state()
             if isinstance(ack, dict):
                 if ack.get("agentUp"):
@@ -15544,10 +15589,10 @@ class SessionManager:
                     # An older driver that does not report readiness: a usable
                     # state reply is the strongest liveness signal it offers.
                     return True
-            time.sleep(DSH_LAUNCH_CONFIRM_POLL_SEC)
-        log(f"dsh session {sid}: control socket bound but the agent never came "
-            f"up within {DSH_LAUNCH_CONFIRM_SEC:g}s — refusing the launch")
-        return False
+            return None
+        return self._confirm_launch(
+            sess, DSH_LAUNCH_CONFIRM_SEC, DSH_LAUNCH_CONFIRM_POLL_SEC, probe,
+            "control socket bound but the agent never came up")
 
     def _dsh_guard_config(self):
         """The dsh safety-guard config for this host (XERK-470), memoized on the
@@ -15628,9 +15673,9 @@ class SessionManager:
             # The qwen runtime (XERK-504). [Qwen A] establishes the field, the
             # flag and the dispatch; the LAUNCHER is [Qwen B], which fills in
             # _launch_qwen — the swap is that method's body alone, this dispatch
-            # line stays. Unreachable today (QWEN_ENABLED is False, so
-            # resolve_agent_type refuses an agentType="qwen" spawn before any
-            # record carries it); the stub raises defensively if ever reached.
+            # line stays. Reachable only where qwen_configured() holds (QWEN_ENABLED
+            # + TURMA_QWEN + the runtime files present); resolve_agent_type refuses
+            # an agentType="qwen" spawn on any host without it.
             self._launch_qwen(sess, resume=resume, prompt=prompt, resume_id=resume_id)
             return
         self._drop_bridge_pointer(sess["worktreePath"])
@@ -15769,25 +15814,14 @@ class SessionManager:
         if settings:
             parts.append(f"--settings {shlex.quote(settings)}")
         # Tell the agent to fork new work off the LATEST default branch rather
-        # than this (possibly stale) checkout — see NEW_WORK_SYSTEM_PROMPT. Rides
-        # every launch, including resume: it's session policy, not spawn state.
-        # A ticket-backed session extends that policy with the exact branch name
-        # reserved for it at spawn (TICKET_BRANCH_PROMPT) — concatenated onto the
-        # same flag rather than passed as a second one, since it's a continuation
-        # of the same policy, and the reserved name is read from the persisted
-        # record so a resume repeats the name spawn chose.
-        policy = NEW_WORK_SYSTEM_PROMPT
-        ticket = sess.get("ticket") or {}
-        if ticket.get("branch"):
-            policy += TICKET_BRANCH_PROMPT.format(
-                key=ticket.get("key") or "this session's ticket",
-                branch=ticket["branch"])
-        # And tell it about the sessions running beside it (XERK-339), pointing
-        # at the roster this manager publishes rather than at ListAgents. Same
-        # flag again, and unconditional: peers are a property of the host, so a
-        # resumed or migrated session needs it exactly as much as a fresh one.
-        policy += PEERS_SYSTEM_PROMPT.format(
-            path=PEERS_FILE, sid=sess["id"], host=self.device)
+        # than this (possibly stale) checkout (NEW_WORK_SYSTEM_PROMPT), extend that
+        # with a ticket-backed session's reserved branch name (TICKET_BRANCH_PROMPT)
+        # and tell it about the sessions running beside it (XERK-339, pointing at
+        # the roster this manager publishes rather than at ListAgents) — the shared
+        # `_session_directive`, appended here via --append-system-prompt (qwen/dsh
+        # deliver the same text through a file). Rides every launch including
+        # resume: it's session policy, not spawn state.
+        policy = self._session_directive(sess)
         parts.append(f"--append-system-prompt {shlex.quote(policy)}")
         claude_cmd = " ".join(parts)
         if prompt:
@@ -15819,13 +15853,7 @@ class SessionManager:
             # every tool subprocess it spawns.
             claude_cmd = (f"set -a; . {shlex.quote(local_env_file)}; set +a; "
                           + claude_cmd)
-        run(["tmux", "kill-session", "-t", sess["tmuxName"]])  # ensure clean slate
-        rc, err = run_ok([
-            "tmux", "new-session", "-d", "-s", sess["tmuxName"],
-            "-c", sess["worktreePath"], "-x", "220", "-y", "50", claude_cmd,
-        ])
-        if rc != 0:
-            raise RuntimeError(f"tmux launch failed: {err}")
+        self._spawn_in_tmux(sess, claude_cmd)
 
     def _launch_ttyd(self, sess):
         """Ensure a ttyd is serving this session's tmux on its stable port.
@@ -15974,14 +16002,10 @@ class SessionManager:
         # Drop the per-session control socket and its env file. The env file holds
         # the model API key (0600); leaving it would accumulate a credential file
         # per session id. The plugin unlinks the socket on a clean exit, but a hard
-        # _kill_tmux may leave it — remove both here. Best-effort.
-        for p in (os.path.join(DSH_SOCKET_DIR, f"{sid}.sock"),
-                  os.path.join(DSH_SOCKET_DIR, f"{sid}.env"),
-                  os.path.join(DSH_SOCKET_DIR, f"{sid}-prompt.txt")):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+        # _kill_tmux may leave it — remove all three here. Best-effort.
+        unlink_quietly([os.path.join(DSH_SOCKET_DIR, f"{sid}.sock"),
+                        os.path.join(DSH_SOCKET_DIR, f"{sid}.env"),
+                        os.path.join(DSH_SOCKET_DIR, f"{sid}-prompt.txt")])
 
     def _forget_session_caches(self, sid):
         # Safety net for any teardown path that reaches here without the explicit
@@ -21589,7 +21613,7 @@ class SessionManager:
         """Nudge a session that has finished a turn holding code work that is
         not on an open PR (XERK-526): commit, push, open a PR, watch CI.
 
-        The operator's complaint this addresses (XERK-525 is the in-session
+        The operator's complaint this addresses (XERK-528 is the in-session
         Stop-hook backstop; this is the hub-side half) is having to type
         "make a PR" after every finished turn. So: a session that is IDLE
         (finished a turn), holds undelivered code work, and has NO open PR gets

@@ -4,6 +4,8 @@ paths:
   - "agent/hub-agent.py"
   - "agent/dsh_transcript.py"
   - "agent/dsh_session.py"
+  - "agent/runtime_projection.py"
+  - "agent/runtime_tail.py"
   - "agent/dsh/**"
   - "agent/dsh-session-driver/**"
   - "agent/tests/test_hub_agent.py"
