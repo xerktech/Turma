@@ -6497,15 +6497,81 @@ const TICKET_QUEUE_NOTES_MAX = TICKET_QUEUE_MAX;
 // How long a dispatch is remembered, so a cancel that LOST to it can say so
 // rather than 404ing as if the ticket had never been queued.
 const TICKET_DISPATCH_MEMO_MS = 5 * 60 * 1000;
+// XERK-485 [E]: the auto stream and the queue are ordered by the model's
+// triage, not just by repo tier. Lower rank comes first. An unknown band or
+// type (no triage yet, or one whose field survived sanitization as something
+// else) sorts AFTER every real one — an unassessed ticket never outranks one
+// the model actually assessed.
+const TRIAGE_PRIORITY_RANK = { P0: 0, P1: 1, P2: 2, P3: 3 };
+const NO_PRIORITY_RANK = 9;
+// Within one band, the KIND of work: a P1 bug ahead of a P1 doc nit. Same
+// unknown-sorts-last rule as the band.
+const TRIAGE_TYPE_WEIGHT = {
+  bug: 0, task: 1, feature: 2, improvement: 3, chore: 4, documentation: 5, other: 6,
+};
+const NO_TYPE_WEIGHT = 7;
+// XERK-485 [E]: the per-org RATE LIMIT on auto-started sessions. A burst of
+// ready tickets (a backlog the fleet just freed up) must not start them all in
+// the same beat: the shared login, the clone storms and the tracker load all
+// argue for a trickle. The limit counts DISPATCHES (an auto entry handed to a
+// host), not queue entries — sitting in line commits nothing, exactly as with
+// the attempt backoff. A manual click is a deliberate intent and is never
+// rate-held. Over the limit an entry HOLDS (`reason:"rate"`) rather than
+// dropping: a hold is not a give-up, and the max-wait backstop is what ends it.
+// A dispatch that turns out to have started no session refunds its slot on the
+// next backoff re-attempt, so a flapping ticket cannot starve the org's budget.
+const TICKET_QUEUE_RATE_MAX = 5;
+const TICKET_QUEUE_RATE_WINDOW_MS = 15 * 60 * 1000;
 // FIFO. Entries: {siteKey, issueKey, source:"auto"|"manual", at, reason, error,
 // blockedSince, unknownSince, expiredAt}. `reason` is why it is STILL waiting, as of the
 // last drain: "capacity" (some host will free up), "blocked" (something the
-// operator has to fix — the text is in `error`), or null before the first drain
+// operator has to fix — the text is in `error`), "rate" (the org's auto-start
+// rate window is still full — also self-clears), or null before the first drain
 // has judged it.
 const ticketQueue = [];
 // "<siteKey>\x00<issueKey>" -> when its spawn was handed to a host. Bounded by
 // the prune in rememberDispatch; read only by the cancel route.
 const ticketDispatchedAt = new Map();
+
+// XERK-485 [E]: per-org rolling-window rate limit on AUTO dispatches.
+// siteKey -> [{at, key}] of the auto dispatches still inside the window.
+// In-memory like the queue itself: a hub restart resets the window, which is
+// the safe side (a fresh hub starting a few extra sessions is far less harmful
+// than replaying a stale budget). `key` is the ticket's queue key, so a refund
+// removes THIS ticket's own stamp, never somebody else's.
+const autoStartRate = new Map();
+
+// The org's live stamps, with anything older than the window pruned. Callers
+// read `.length` only; stamping goes through recordAutoStartRate so an org's
+// first stamp is always stored, not pushed into a throwaway array.
+function autoStartRateLive(siteKey, now) {
+  const live = (autoStartRate.get(siteKey) || []).filter(
+    (s) => now - s.at < TICKET_QUEUE_RATE_WINDOW_MS);
+  if (live.length) autoStartRate.set(siteKey, live);
+  else autoStartRate.delete(siteKey);
+  return live;
+}
+
+function recordAutoStartRate(siteKey, key, now) {
+  const live = (autoStartRate.get(siteKey) || []).filter(
+    (s) => now - s.at < TICKET_QUEUE_RATE_WINDOW_MS);
+  live.push({ at: now, key });
+  autoStartRate.set(siteKey, live);
+}
+
+// A dispatch that was acked but left no session spent its rate slot for nothing
+// — hand this ticket's own newest stamp back so a flapping ticket cannot
+// starve the org's window. (If the stamp already aged out of the window there
+// is nothing to refund and this is a no-op.)
+function refundAutoStartRate(siteKey, key, now) {
+  const live = (autoStartRate.get(siteKey) || []).filter(
+    (s) => now - s.at < TICKET_QUEUE_RATE_WINDOW_MS);
+  for (let i = live.length - 1; i >= 0; i--) {
+    if (live[i].key === key) { live.splice(i, 1); break; }
+  }
+  if (live.length) autoStartRate.set(siteKey, live);
+  else autoStartRate.delete(siteKey);
+}
 
 function ticketQueueKey(siteKey, issueKey) {
   return (siteKey || "") + "\x00" + issueKey;
@@ -6570,7 +6636,10 @@ function sweepExpiredNotes() {
 // it (reporting it as a full queue made one bad row truncate an org's auto-start
 // at that row, every sweep, forever), while a full line is the whole org's.
 //   "ok" | "invalid" | "org-auto-full" | "org-full" | "fleet-full"
-function ticketQueueAdmission(siteKey, issueKey, source) {
+// `priority` (optional, "P0".."P3"): XERK-485 preemption — a P0 AUTO ticket may
+// exceed the sweep's share AND the org's line; only the fleet's memory bound
+// still stops it. Manual entries and lower bands are unaffected.
+function ticketQueueAdmission(siteKey, issueKey, source, priority) {
   if (typeof siteKey !== "string" || !siteKey || siteKey.length > TICKET_SITE_MAX) return "invalid";
   if (typeof issueKey !== "string" || issueKey.length > TICKET_KEY_MAX
       || !isIssueKey(issueKey)) {
@@ -6581,11 +6650,13 @@ function ticketQueueAdmission(siteKey, issueKey, source) {
   // A terminal entry holds no place, so it neither blocks its own re-queue nor
   // counts toward the lines below.
   const mine = ticketQueue.filter((e) => e.siteKey === siteKey && !e.expiredAt);
-  if (source === "auto"
+  const preempt = source === "auto" && priority === "P0";
+  if (!preempt
+      && source === "auto"
       && mine.filter((e) => e.source === "auto").length >= TICKET_QUEUE_PER_ORG_AUTO_MAX) {
     return "org-auto-full";
   }
-  if (mine.length >= TICKET_QUEUE_PER_ORG_MAX) return "org-full";
+  if (!preempt && mine.length >= TICKET_QUEUE_PER_ORG_MAX) return "org-full";
   // The fleet cap is a LINE'S LENGTH, and a terminal note is not in the line —
   // counting it let dead notes 429 a live click from an unrelated org, which is
   // the refusal this ticket exists to remove. Notes are bounded separately, by
@@ -6660,9 +6731,10 @@ function dispatchedRecently(siteKey, issueKey) {
 // `issueKey` as a String and decodes the whole payload atomically. An object or
 // a 20k-char key from one buggy host would break every phone's fleet decode,
 // hub-wide rather than per-host, and no `normalize*` covers this list: this
-// check is that coercion.
-function enqueueTicketStart(siteKey, issueKey, source) {
-  if (ticketQueueAdmission(siteKey, issueKey, source) !== "ok") return null;
+// check is that coercion. `priority` (optional) carries the ticket's triage
+// band so a P0 auto ticket can preempt a full org line (XERK-485).
+function enqueueTicketStart(siteKey, issueKey, source, priority) {
+  if (ticketQueueAdmission(siteKey, issueKey, source, priority) !== "ok") return null;
   const existing = queuedTicket(siteKey, issueKey);
   if (existing && !existing.expiredAt) {
     if (source === "manual" && existing.source !== "manual") {
@@ -6798,7 +6870,10 @@ function holdQueued(e, reason, error) {
   return true;
 }
 
-// Hand the oldest waiting tickets to whichever hosts can actually start them.
+// Hand the highest-priority waiting tickets to whichever hosts can actually
+// start them. Visit order (XERK-485 [E]): within an org's line the priority key
+// — triage band -> type weight -> repo tier -> FIFO — decides, and across orgs
+// the lines interleave round-robin so one backlog can't starve another.
 // Runs on every heartbeat (a beat is when capacity changes) and on the 15s
 // sweep, so a freed slot is filled within a beat rather than a sweep interval.
 //
@@ -6831,7 +6906,7 @@ function drainTicketQueue() {
   const usedHosts = new Set();
   let started = null;
   let changed = false;
-  for (const e of [...ticketQueue]) {
+  for (const e of ticketQueueOrder(rows)) {
     const k = ticketQueueKey(e.siteKey, e.issueKey);
     const drop = (why) => {
       const i = ticketQueue.indexOf(e);
@@ -6936,6 +7011,17 @@ function drainTicketQueue() {
       drop("its repo is now ignore-tier");
       continue;
     }
+    // XERK-485 [E]: the model re-triaged this ticket while it waited and the new
+    // assessment says held/rejected (actionable !== true) or names a duplicate.
+    // An AUTO entry drops without churn (the sweep's gate won't re-queue it —
+    // same rule as a retiered repo above); a MANUAL entry is a deliberate intent
+    // and keeps draining. No triage block at all means "can't tell", so it stays
+    // dispatchable — the same rule a missing capacity block follows.
+    if (e.source === "auto" && row.triage &&
+        (row.triage.actionable !== true || row.triage.dedupeOf)) {
+      drop("its triage no longer says actionable");
+      continue;
+    }
     const { host, error, full } = findTicketHost(
       e.siteKey, repo, e.issueKey, { requireFree: true });
     if (!host) {
@@ -6955,6 +7041,16 @@ function drainTicketQueue() {
       continue;
     }
     if (e.blockedSince) { e.blockedSince = 0; changed = true; }
+    // XERK-485 [E]: the org's auto-start rate window is full — the entry HOLDS
+    // (reason "rate", self-clearing like capacity) instead of dropping, and it
+    // must NOT claim this host: another org's entry may still take the slot in
+    // the same pass. Manual clicks are deliberate intent and are never held.
+    if (e.source === "auto" &&
+        autoStartRateLive(e.siteKey, now).length >= TICKET_QUEUE_RATE_MAX) {
+      changed = holdQueued(e, "rate",
+        "waiting out the org's auto-start rate limit") || changed;
+      continue;
+    }
     if (usedHosts.has(host)) continue;   // that host already took one this pass
     usedHosts.add(host);
     // The operator's model pin (XERK-123) rides the command, exactly as it does
@@ -6988,6 +7084,8 @@ function drainTicketQueue() {
       const attempts = Math.min((prior ? prior.attempts : 0) + 1,
         AUTO_START_BACKOFF_STEPS);
       autoStarted.set(k, { attempts, nextAt: autoStartRetryAt(now, attempts) });
+      // XERK-485 [E]: this dispatch counts against the org's rate window.
+      recordAutoStartRate(e.siteKey, k, now);
       if (attempts > 1) {
         console.log(`auto-start: retrying ${logName(e.issueKey)} on ${logName(host)} — the previous `
           + "spawnTicket was acked but left no session (backing off, but the hub "
@@ -7083,7 +7181,8 @@ function reclaimStrandedTicketSpawns() {
       const source = c.ticketSource;
       if (!siteKey || !c.issueKey) continue;
       if (source !== "manual" && source !== "auto") continue;
-      const repo = ticketRepo(siteKey, c.issueKey);
+      const rows = fleetTicketRows();
+      const repo = ticketRepo(siteKey, c.issueKey, rows);
       if (!repo) continue;
       const { host: free } =
         findTicketHost(siteKey, repo, c.issueKey, { requireFree: true });
@@ -7099,9 +7198,16 @@ function reclaimStrandedTicketSpawns() {
         const prior = autoStarted.get(ticketQueueKey(siteKey, c.issueKey));
         if (prior && now < prior.nextAt) continue;
       }
-      if (ticketQueueAdmission(siteKey, c.issueKey, source) !== "ok") continue;
+      // Re-admit under the ticket's CURRENT triage band, not a fixed one, so a
+      // P0 auto ticket keeps its preemption through the re-queue even if the
+      // org's auto share is full the moment the dead host's spawn is reclaimed.
+      const row = rows.get(ticketQueueKey(siteKey, c.issueKey));
+      const tri = row && row.row && row.row.triage && typeof row.row.triage === "object"
+        ? row.row.triage : null;
+      const prio = tri ? tri.priority : undefined;
+      if (ticketQueueAdmission(siteKey, c.issueKey, source, prio) !== "ok") continue;
       if (!dropQueuedCommand(host, c.cmdId, "spawnTicket")) continue;
-      if (!enqueueTicketStart(siteKey, c.issueKey, source)) {
+      if (!enqueueTicketStart(siteKey, c.issueKey, source, prio)) {
         // Unreachable: admission answered "ok" one line ago and nothing between
         // the two touches the queue. Said out loud anyway, because the one thing
         // this function must never do quietly is lose the work.
@@ -7116,6 +7222,82 @@ function reclaimStrandedTicketSpawns() {
   }
 }
 
+// XERK-485 [E]: the triage gate. Why the sweep must NOT queue this ticket, or
+// null when it may. Triage (XERK-481/482) is the hub's only evidence that a
+// ticket is worth a session, so the sweep acts on its verdict:
+//   no triage block at all  -> "untriaged"   (the model hasn't assessed it)
+//   actionable !== true     -> "not actionable" (the model held or rejected it)
+//   dedupeOf set            -> "duplicate"   (a confirmed duplicate of another ticket)
+// A gated ticket still renders on the board — it simply is never swept, and
+// spends no attempt, exactly like a ticket with no triaged repo. The block was
+// coerced at ingest (sanitizeTicketTriage), so `actionable` is a strict boolean
+// when present and `dedupeOf` a string when present; a host that sent junk has
+// already had it dropped at the door.
+function triageGateReason(t) {
+  const tri = t && typeof t === "object" ? t.triage : null;
+  if (!tri || typeof tri !== "object" || Array.isArray(tri)) return "untriaged";
+  if (tri.actionable !== true) return "not actionable";
+  if (tri.dedupeOf) return "duplicate";
+  return null;
+}
+
+// XERK-485 [E]: the priority key as a comparable array —
+// [triage band, type weight, -repo tier]. A caller's STABLE sort on this is the
+// full ordering: priority -> type -> repo tier (XERK-487's [G], the tiebreak
+// below priority+type) -> the caller's insertion order (board order for the
+// sweep, FIFO for the queue).
+function triageSortKey(triage, repo) {
+  const tr = triage && typeof triage === "object" ? triage : null;
+  return [
+    tr && TRIAGE_PRIORITY_RANK[tr.priority] !== undefined
+      ? TRIAGE_PRIORITY_RANK[tr.priority] : NO_PRIORITY_RANK,
+    tr && TRIAGE_TYPE_WEIGHT[tr.type] !== undefined
+      ? TRIAGE_TYPE_WEIGHT[tr.type] : NO_TYPE_WEIGHT,
+    -repoTierRank(repo),
+  ];
+}
+
+// XERK-485 [E]: the drain's visit order. Within an org's line the priority key
+// decides (band -> type -> tier -> FIFO by `at`); across orgs the lines
+// interleave round-robin, each org's turn anchored on its OLDEST entry, so one
+// org's backlog can't starve another's. Hosts never cross orgs, so in practice
+// this decides which ticket in an org claims a host's one-per-pass dispatch —
+// the round-robin keeps the cross-org fairness explicit rather than an
+// accident of array order.
+function ticketQueueOrder(rows) {
+  if (ticketQueue.length <= 1) return [...ticketQueue];
+  const lines = new Map();                    // siteKey -> [{e, key}], FIFO order
+  for (const e of ticketQueue) {
+    const hit = rows.get(ticketQueueKey(e.siteKey, e.issueKey));
+    const row = hit ? hit.row : null;
+    const key = triageSortKey(
+      row ? row.triage : null, ticketRepo(e.siteKey, e.issueKey, rows));
+    let line = lines.get(e.siteKey);
+    if (!line) lines.set(e.siteKey, (line = []));
+    line.push({ e, key });
+  }
+  for (const line of lines.values()) {
+    line.sort((a, b) => {
+      for (let i = 0; i < a.key.length; i++) {
+        if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
+      }
+      return a.e.at - b.e.at;                 // FIFO within an identical key
+    });
+  }
+  const byAge = [...lines.values()].sort((x, y) => x[0].e.at - y[0].e.at);
+  const out = [];
+  let depth = 0;
+  for (;;) {
+    let any = false;
+    for (const line of byAge) {
+      if (depth < line.length) { out.push(line[depth].e); any = true; }
+    }
+    if (!any) break;
+    depth++;
+  }
+  return out;
+}
+
 function autoStartSweep() {
   const orgs = orgsWithAutoStart();
   if (!orgs.size) return;
@@ -7126,28 +7308,40 @@ function autoStartSweep() {
     // The board's own view of this org's tickets — see `fleetTicketRows`. Never
     // walk `agents` for a ticket list here: this sweep STARTS work, so acting on
     // a copy the operator was not shown is a session nobody asked for.
-    // XERK-487: among the tickets ready in one pass, the more important repo's
-    // tickets take the scarce auto slots first. Tier is a TIEBREAKER — [E]'s
-    // priority key will sort by ticket priority+type ahead of it — but until
-    // that lands it is the only ordering the auto stream has. STABLE, so
-    // same-tier tickets keep the board's own order (V8 sort is stable).
-    const candidates = ticketRowsForSite(rows, siteKey).sort((a, b) =>
-      repoTierRank((b.row.repoGuess || {}).repo) - repoTierRank((a.row.repoGuess || {}).repo));
-    for (const { row: t } of candidates) {
-      if (!t || !t.key) continue;
-      if (t.statusCategory !== "todo") continue;      // only "To Do" tickets
-      const repo = ticketRepo(siteKey, t.key, rows);   // a repo must be assigned
-      if (!repo) continue;
-      // An ignore-tier repo is never auto-started (XERK-487): its tickets stay
-      // off the auto stream entirely. A human can still Start one by hand — that
-      // is deliberate intent, which this gate does not touch (the queue's manual
-      // path is not tier-gated).
-      if (isRepoIgnored(repo)) continue;
+    // XERK-485 [E]: the full priority key orders the auto stream —
+    // triage band -> type weight -> repo tier (XERK-487's [G], now a
+    // tiebreak below priority+type) -> board order (stable sort).
+    // A P0 bug takes the scarce auto slots ahead of a P3 chore.
+    const candidates = ticketRowsForSite(rows, siteKey)
+      .map((r) => {
+        const repo = r.row ? ticketRepo(siteKey, r.row.key, rows) : null;
+        return { t: r.row, repo, key: triageSortKey(r.row && r.row.triage, repo) };
+      })
+      .filter((c) => c.t && c.t.key && c.t.statusCategory === "todo"
+        && c.repo && !isRepoIgnored(c.repo))
+      .sort((a, b) => {
+        for (let i = 0; i < a.key.length; i++) {
+          if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
+        }
+        return 0;   // stable: board order within an identical key
+      });
+    for (const { t, repo } of candidates) {
       const k = siteKey + "\x00" + t.key;
       // A session exists on some channel — the work is under way (or was, and
       // was deliberately killed). Done with this ticket for good; drop any
       // attempt record so the map only ever holds tickets still failing.
       if (started.has(k)) { autoStarted.delete(k); continue; }
+      // XERK-485 [E]: the triage gate. A ticket without a triage assessment, or
+      // one the model held/rejected/flagged as a confirmed duplicate, still
+      // renders on the board but is never swept — it spends no attempt, exactly
+      // like a ticket with no triaged repo. Throttled: this is a state line,
+      // re-derived every 15s.
+      const gated = triageGateReason(t);
+      if (gated) {
+        logQueueState(`held\x00${siteKey}\x00${logName(t.key)}`,
+          `auto-start: ${logName(t.key)} is ${gated} — not swept, no attempt spent`);
+        continue;
+      }
       // Already waiting in the hub queue — its place in line IS the pending
       // attempt, and drainTicketQueue owns everything from here (XERK-296).
       if (liveQueuedTicket(siteKey, t.key)) continue;
@@ -7164,6 +7358,10 @@ function autoStartSweep() {
       // recovers on its own the moment the block clears (XERK-109).
       const prior = autoStarted.get(k);
       if (prior && now < prior.nextAt) continue;
+      // XERK-485 [E]: if we are past backoff the previous attempt produced no
+      // session, so refund the rate slot it spent — otherwise a flapping ticket
+      // would permanently burn its org's budget.
+      if (prior) refundAutoStartRate(siteKey, k, now);
       // The sweep DECIDES the ticket should run; it no longer picks the host.
       // That is drainTicketQueue's, at the moment an agent can actually take it,
       // so a slot freeing anywhere in the org claims the oldest waiting ticket
@@ -7174,7 +7372,19 @@ function autoStartSweep() {
       // through — reporting it as a full queue truncated an org's auto-start at
       // its first bad row, every sweep, forever. A full line IS the org's
       // problem, and only the fleet cap ends the sweep outright.
-      const verdict = ticketQueueAdmission(siteKey, t.key, "auto");
+      // XERK-485 [E]: a P0 may exceed the org's auto share (and the org line);
+      // the fleet cap is the only bound. Say so, throttled.
+      const tri = t.triage && typeof t.triage === "object" ? t.triage : null;
+      const prio = tri ? tri.priority : undefined;
+      if (prio === "P0") {
+        const mine = ticketQueue.filter((e) => e.siteKey === siteKey && !e.expiredAt);
+        if (mine.length >= TICKET_QUEUE_PER_ORG_AUTO_MAX) {
+          logQueueState(`p0preempt\x00${logName(siteKey)}\x00${logName(t.key)}`,
+            `auto-start: ${logName(t.key)} (P0) is preempting the ${logName(siteKey)} auto share `
+            + `(${TICKET_QUEUE_PER_ORG_AUTO_MAX} auto already in line) — bounded only by the fleet cap`);
+        }
+      }
+      const verdict = ticketQueueAdmission(siteKey, t.key, "auto", prio);
       if (verdict === "invalid") {
         // Keyed on the SANITISED name: t.key is agent-supplied and this map
         // outlives the call, so an unbounded key would be an unbounded entry.
@@ -7193,7 +7403,11 @@ function autoStartSweep() {
           `auto-start: the hub's ticket queue is full (${TICKET_QUEUE_MAX})`);
         return;                      // nothing fits anywhere this sweep
       }
-      enqueueTicketStart(siteKey, t.key, "auto");
+      // Pass the band so the admission re-check inside enqueueTicketStart sees
+      // the same preemption verdict the sweep just decided on — without it a
+      // P0 auto-start is re-judged as a plain ticket and refused at a full
+      // org share.
+      enqueueTicketStart(siteKey, t.key, "auto", prio);
     }
   }
 }
@@ -11463,6 +11677,21 @@ if (process.env.TURMA_TEST) {
     TICKET_QUEUE_ERROR_MAX,
     TICKET_QUEUE_STALE_MS,
     TICKET_QUEUE_BLOCKED_MAX_MS,
+    // XERK-485 [E]: the triage gate, the priority key and the drain's visit
+    // order, plus the org rate limit and its state — exported so a test can
+    // hold each rule directly rather than only through a full sweep.
+    triageGateReason,
+    triageSortKey,
+    ticketQueueOrder,
+    TRIAGE_PRIORITY_RANK,
+    TRIAGE_TYPE_WEIGHT,
+    NO_PRIORITY_RANK,
+    NO_TYPE_WEIGHT,
+    TICKET_QUEUE_RATE_MAX,
+    TICKET_QUEUE_RATE_WINDOW_MS,
+    autoStartRate,
+    recordAutoStartRate,
+    refundAutoStartRate,
     migrations,
     advanceMigrations,
     // The relay spools bundles here rather than holding them in the record
