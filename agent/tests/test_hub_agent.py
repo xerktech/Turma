@@ -8549,7 +8549,7 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
         # Canvas left after-images on the TUI's full alt-screen repaints, and
         # the DOM renderer (one span per cell) flickered on every streamed line
         # of the busy qwen TUI. WebGL is ttyd's own default — GPU-blitted and
-        # subpixel-accurate. fontSize is pinned at 13px at operator request
+        # subpixel-accurate. fontSize is pinned at 12px at operator request
         # (2026-08-31: smaller terminal text; 15px was the pixel-exact value
         # before that). Pinned the same way the Mac selection option is above,
         # so a revert is a visible test failure.
@@ -8568,7 +8568,7 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
         self.assertIn("rendererType=webgl", args)
         self.assertNotIn("rendererType=canvas", args)
         self.assertNotIn("rendererType=dom", args)
-        self.assertIn("fontSize=13", args)
+        self.assertIn("fontSize=12", args)
 
     def test_kill_ttyd_reaps_adopted_orphan_by_pid(self):
         # An adopted ttyd isn't in self.ttyd; _kill_ttyd must still reap it via

@@ -16072,11 +16072,11 @@ class SessionManager:
             "ttyd", "-p", str(sess["ttydPort"]), "-i", "127.0.0.1",
             "-b", f"/term/{sess['id']}", "-W", "-m", "8",
             "-t", 'fontFamily=JBMNerd, "JetBrainsMono Nerd Font Mono", "DejaVu Sans Mono", monospace',
-            # 13px at operator request (2026-08-31): smaller terminal text.
+            # 12px at operator request (2026-08-31): smaller terminal text.
             # The Nerd Font's 0.6em advance makes only multiples of 5px land on
-            # integer cells (15px -> 9.0px); 13px -> 7.8px is fractional, so a
+            # integer cells (15px -> 9.0px); 12px -> 7.2px is fractional, so a
             # faint subpixel row drift can remain in the TUI — accepted trade.
-            "-t", "fontSize=13",
+            "-t", "fontSize=12",
             # WebGL, not canvas or DOM: canvas left after-images on the TUI's
             # full alt-screen repaints, and DOM (one span per cell) flickered
             # on every streamed line of the busy qwen TUI. WebGL is ttyd's own
