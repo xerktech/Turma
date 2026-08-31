@@ -4059,6 +4059,29 @@ test("http: a running session with nothing in the archive yet still 202s (cold s
   assert.equal(res.body.pending, true);
 });
 
+test("http: a STOPPED session is NOT served from the archive even when its transcript is there", async () => {
+  // The archive-serve path is gated on the LIVE session (`status === "running"`);
+  // a stopped/killed session's /history takes the old queue-and-202 path, so it
+  // never reads archive content as if it were the live conversation.
+  const meta = { remoteKey: "github.com/x/r2", repo: "r2", worktree: "/w/dead",
+    slug: "-w-dead", createdAt: "2026-08-30T00:00:00Z", summary: "Dead chat" };
+  const push = await request("POST", "/api/agents/hh9/archive/tdead", {
+    headers: agentHeaders,
+    body: { startOffset: 0, endOffset: 40, size: 40, meta, entries: [
+      { uuid: "z1", role: "user", ts: "2026-08-30T00:00:00Z", text: "bye" },
+    ] },
+  });
+  assert.equal(push.status, 200);
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: "hh9",
+    sessions: [{ id: "sc", status: "stopped", repo: "r2", worktreePath: "/w/dead",
+      transcriptId: "tdead", session: { transcriptAgeSec: 1 } }],
+  } });
+  const res = await request("GET", "/api/agents/hh9/sessions/sc/history", { headers: userHeaders });
+  assert.equal(res.status, 202);
+  assert.notEqual(res.body.fromArchive, true);
+});
+
 test("http: history cache eviction — entries older than 10 minutes dropped on ingest", async () => {
   await request("POST", "/api/heartbeat", { body: { device: "hh4" }, headers: agentHeaders });
   await request("POST", "/api/heartbeat", {
