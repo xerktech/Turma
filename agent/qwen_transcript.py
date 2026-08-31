@@ -80,10 +80,25 @@ Stdlib only — imported by the Qwen launcher/tail in `hub-agent.py`, kept
 dependency-free like the rest of `agent/`.
 """
 
-import json
-import math
+import os
 import re
+import sys
 import uuid as _uuidlib
+
+# Import the shared projector scaffolding as a sibling module — the identical
+# envelope/uuid/emit core and the batch drivers live in runtime_projection.py
+# (XERK-528). Ensure this dir is on sys.path first: a transcript test execs THIS
+# module by path before hub-agent.py runs, so the dir is not yet on the path
+# (same idiom hub-agent.py uses for its own siblings).
+_AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _AGENT_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_DIR)
+from runtime_projection import (  # noqa: E402
+    BaseProjector,
+    coerce_int as _int,
+    project_log as _project_log,
+    project_log_lines as _project_log_lines,
+)
 
 # A fixed namespace so a given (session id, event seq, sub-index) always projects
 # to the SAME entry uuid — see the DETERMINISTIC UUIDS note above.
@@ -139,34 +154,6 @@ def _iso(ts):
     if isinstance(ts, str) and _ISO_TS_RE.match(ts):
         return ts
     return ""
-
-
-def _mk_uuid(session_id, seq, index=0):
-    """Deterministic per-entry uuid (see _UUID_NS)."""
-    return str(_uuidlib.uuid5(_UUID_NS, f"{session_id}:{seq}:{index}"))
-
-
-def _int(v):
-    """A token count coerced to a non-negative int (the ledger re-coerces, but a
-    clean projection keeps a float/None from ever reaching the wire). Unusable ->
-    0; a fractional value truncates; a bool is not a count.
-
-    `feed()` runs per streamed event in the launcher, so this must NEVER raise —
-    a single bad usage field must not abort the projection. Two non-finite floats
-    are the trap the codebase has hit before (`_token_count`, `read_limits_snapshot`,
-    `_archive_known`): `1e999` is legal RFC-8259 JSON that `json.loads` yields as
-    `inf`, and `int(inf)` raises OverflowError — NOT one of the obvious two — while
-    `int(nan)` raises ValueError. isfinite screens both, and OverflowError is
-    caught as a backstop for any other numeric type `int()` cannot render."""
-    if isinstance(v, bool):
-        return 0
-    if isinstance(v, float) and not math.isfinite(v):
-        return 0
-    try:
-        n = int(v)
-    except (TypeError, ValueError, OverflowError):
-        return 0
-    return n if n >= 0 else 0
 
 
 def _map_usage(usage):
@@ -298,50 +285,30 @@ def _subagent_launch(fr, resp, tcr, call_id):
     return aid, subagent_type, description, backgrounded
 
 
-class QwenProjector:
+class QwenProjector(BaseProjector):
     """Stateful, single-pass projector: `feed(event)` returns the Claude-JSONL
     entry dicts one Qwen native-log event projects to (usually 0 or 1), so a
     launcher can append them to the pinned transcript as events stream in. State
-    is only the running `parentUuid` chain and the per-feed sequence counter — the
-    projection is otherwise a pure per-event map.
+    is only the running `parentUuid` chain (BaseProjector) and the per-feed
+    sequence counter — the projection is otherwise a pure per-event map.
 
     `context` carries the pinned session id and the display envelope the read side
-    stamps but does not depend on (cwd, git branch, version)."""
+    stamps but does not depend on (cwd, git branch, version). The envelope, the
+    deterministic uuid and the parentUuid threading are BaseProjector's; only the
+    per-event mapping below is Qwen-specific."""
+
+    UUID_NS = _UUID_NS
+    # A visible, qwen-tagged version so a projected transcript is never mistaken
+    # for a native Claude one and clients that surface `version` say what wrote it.
+    # Not parsed by any reader.
+    VERSION_TAG = "qwen"
 
     def __init__(self, session_id, cwd=None, git_branch=None, version=None):
-        self.session_id = session_id
-        self.cwd = cwd
-        self.git_branch = git_branch
-        # A visible, qwen-tagged version so a projected transcript is never
-        # mistaken for a native Claude one and clients that surface `version` say
-        # what wrote it. Not parsed by any reader.
-        self.version = version or "qwen"
-        self._parent = None
+        super().__init__(session_id, cwd=cwd, git_branch=git_branch, version=version)
         # Increments per fed event (whether or not it projects), so the seq the
         # deterministic uuid is derived from is the event's position in the log —
         # stable across a replay of the same log in the same order.
         self._seq = -1
-
-    def _envelope(self, entry_type, index=0):
-        e = {
-            "type": entry_type,
-            "uuid": _mk_uuid(self.session_id, self._seq, index),
-            "parentUuid": self._parent,
-            "sessionId": self.session_id,
-            "isSidechain": False,
-            "userType": "external",
-            "version": self.version,
-        }
-        if self.cwd is not None:
-            e["cwd"] = self.cwd
-        if self.git_branch is not None:
-            e["gitBranch"] = self.git_branch
-        return e
-
-    def _emit(self, entry):
-        """Thread the parentUuid chain and hand the finished entry back."""
-        self._parent = entry["uuid"]
-        return entry
 
     def feed(self, event):
         """Project one Qwen native-log event. Returns a list of entry dicts
@@ -367,7 +334,7 @@ class QwenProjector:
         blocks = _user_content(msg.get("parts"))
         if not blocks:
             return []
-        entry = self._envelope("user")
+        entry = self._envelope("user", self._seq)
         entry["timestamp"] = ts
         entry["message"] = {"role": "user", "content": blocks}
         return [self._emit(entry)]
@@ -376,7 +343,7 @@ class QwenProjector:
         blocks = _assistant_content(msg.get("parts"))
         if not blocks:
             return []
-        entry = self._envelope("assistant")
+        entry = self._envelope("assistant", self._seq)
         entry["timestamp"] = ts
         # requestId completes the (message id, requestId) usage-dedup key; a stable
         # per-seq value keeps a re-projected turn from double-counting.
@@ -462,7 +429,7 @@ class QwenProjector:
         result_block["content"] = text
         if is_error:
             result_block["is_error"] = True
-        entry = self._envelope("user")
+        entry = self._envelope("user", self._seq)
         entry["timestamp"] = ts
         entry["message"] = {"role": "user", "content": [result_block]}
         if tool_use_result is not None:
@@ -474,17 +441,11 @@ def project_log(events, session_id, cwd=None, git_branch=None, version=None):
     """Batch convenience: project a whole Qwen event log (an iterable of event
     dicts) into the list of Claude-JSONL entry dicts. Equivalent to feeding each
     event to a fresh QwenProjector in order."""
-    proj = QwenProjector(session_id, cwd=cwd, git_branch=git_branch, version=version)
-    out = []
-    for ev in events:
-        out.extend(proj.feed(ev))
-    return out
+    return _project_log(QwenProjector, events, session_id, cwd=cwd,
+                        git_branch=git_branch, version=version)
 
 
 def project_log_lines(events, session_id, **ctx):
     """As project_log, but serialized to newline-terminated JSONL strings ready to
     append to a transcript file (`ensure_ascii=False`, matching Claude Code)."""
-    return [
-        json.dumps(e, ensure_ascii=False) + "\n"
-        for e in project_log(events, session_id, **ctx)
-    ]
+    return _project_log_lines(QwenProjector, events, session_id, **ctx)

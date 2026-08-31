@@ -657,6 +657,15 @@ install_payload() {  # <tgz> <version>
   rm -rf "$PREFIX/hooks"; mv -f "$src/hooks" "$PREFIX/hooks"
   mv -f "$src/tunnel-agent.js" "$PREFIX/tunnel-agent.js"
   [ -f "$src/tmux.conf" ] && mv -f "$src/tmux.conf" "$PREFIX/tmux.conf"
+  # Shared runtime scaffolding (XERK-528): runtime_projection.py + runtime_tail.py
+  # are imported by BOTH the dsh and qwen transcript/tail siblings and ship
+  # UNCONDITIONALLY beside hub-agent.py, so they swap with the payload like the
+  # qwen siblings below. Conditional (not in the completeness refusal above): a
+  # payload without them makes dsh/qwen run DARK (transcript import fails, the
+  # projector is None) — a degraded runtime, not the fail-open safety hole a
+  # missing hook is. Every release from XERK-528 on ships them.
+  [ -f "$src/runtime_projection.py" ] && mv -f "$src/runtime_projection.py" "$PREFIX/runtime_projection.py"
+  [ -f "$src/runtime_tail.py" ] && mv -f "$src/runtime_tail.py" "$PREFIX/runtime_tail.py"
   # qwen runtime (XERK-504+): the Python siblings + agent/qwen/ ship
   # UNCONDITIONALLY beside hub-agent.py (core-enabled, stdlib-only), so they swap
   # with the payload like hub-agent.py itself — no $PREFIX/.qwen marker gate.

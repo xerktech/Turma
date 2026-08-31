@@ -52,10 +52,26 @@ kept dependency-free like the rest of `agent/`.
 """
 
 import json
-import math
+import os
 import re
+import sys
 import uuid as _uuidlib
 from datetime import datetime, timezone
+
+# Import the shared projector scaffolding as a sibling module — the identical
+# envelope/uuid/emit core and the batch drivers live in runtime_projection.py
+# (XERK-528). Ensure this dir is on sys.path first: a transcript test execs THIS
+# module by path before hub-agent.py runs, so the dir is not yet on the path
+# (same idiom hub-agent.py uses for its own siblings).
+_AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _AGENT_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_DIR)
+from runtime_projection import (  # noqa: E402
+    BaseProjector,
+    coerce_int as _int,
+    project_log as _project_log,
+    project_log_lines as _project_log_lines,
+)
 
 # A synthesized launch's child id / run id names a LIVE-AGENT id and (for a run)
 # a directory, and is embedded verbatim into the `agentId:`/`<task-id>` text the
@@ -162,11 +178,6 @@ def _iso(ms):
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
-def _mk_uuid(session_id, seq, index=0):
-    """Deterministic per-entry uuid (see _UUID_NS)."""
-    return str(_uuidlib.uuid5(_UUID_NS, f"{session_id}:{seq}:{index}"))
-
-
 def _map_usage(usage):
     """dsh TokenUsage -> Claude Code `message.usage`, the shape `_accumulate_usage`
     / `_token_count` read (`input_tokens`, `output_tokens`,
@@ -198,27 +209,6 @@ def _map_usage(usage):
     if not any(out.values()):
         return None
     return out
-
-
-def _int(v):
-    """A dsh count coerced to a non-negative int (the ledger re-coerces, but a
-    clean projection keeps a float/None from ever reaching the wire). Unusable ->
-    0; a fractional value truncates.
-
-    `feed()` runs per streamed event, so this must NEVER raise — a single bad
-    usage field must not abort the projection. A non-finite float is the trap the
-    codebase has hit before (`_token_count`, `read_limits_snapshot`,
-    `_archive_known`, and `_iso` just above): `1e999` is legal RFC-8259 JSON that
-    `json.loads` yields as `inf`, and `int(inf)` raises OverflowError — NOT one of
-    the two obvious exceptions — while `int(nan)` raises ValueError. isfinite
-    screens both, and OverflowError is caught as a backstop."""
-    if isinstance(v, float) and not math.isfinite(v):
-        return 0
-    try:
-        n = int(v)
-    except (TypeError, ValueError, OverflowError):
-        return 0
-    return n if n >= 0 else 0
 
 
 def _content_to_text_blocks(content):
@@ -290,50 +280,31 @@ def _assistant_content(content):
     return blocks
 
 
-class DshProjector:
+class DshProjector(BaseProjector):
     """Stateful, single-pass projector: `feed(event)` returns the Claude-JSONL
     entry dicts one dsh event projects to (usually 0 or 1), so a launcher can
     append them to the pinned transcript as events stream in. State is only the
-    running `parentUuid` chain — the projection is otherwise a pure per-event map.
+    running `parentUuid` chain (BaseProjector) plus the delegation skip-set — the
+    projection is otherwise a pure per-event map.
 
     `context` carries the pinned session id and the display envelope the read side
-    stamps but does not depend on (cwd, git branch, harness version)."""
+    stamps but does not depend on (cwd, git branch, harness version). The
+    envelope, the deterministic uuid and the parentUuid threading are
+    BaseProjector's; only the per-event mapping below is dsh-specific."""
+
+    UUID_NS = _UUID_NS
+    # A visible, dsh-tagged version so a projected transcript is never mistaken
+    # for a native Claude one and clients that surface `version` say what wrote it.
+    # Not parsed by any reader.
+    VERSION_TAG = "dsh"
 
     def __init__(self, session_id, cwd=None, git_branch=None, version=None):
-        self.session_id = session_id
-        self.cwd = cwd
-        self.git_branch = git_branch
-        # A visible, dsh-tagged version so a projected transcript is never mistaken
-        # for a native Claude one and clients that surface `version` say what wrote
-        # it. Not parsed by any reader.
-        self.version = version or "dsh"
-        self._parent = None
+        super().__init__(session_id, cwd=cwd, git_branch=git_branch, version=version)
         # Call ids of the raw delegation tool-calls (subagent/workflow) whose
         # paired tool/result must also be dropped — the launch is synthesized
         # from the lifecycle events instead. Populated in _assistant_message,
         # consumed once each in _tool_result.
         self._skip_calls = set()
-
-    def _envelope(self, entry_type, seq, index=0):
-        e = {
-            "type": entry_type,
-            "uuid": _mk_uuid(self.session_id, seq, index),
-            "parentUuid": self._parent,
-            "sessionId": self.session_id,
-            "isSidechain": False,
-            "userType": "external",
-            "version": self.version,
-        }
-        if self.cwd is not None:
-            e["cwd"] = self.cwd
-        if self.git_branch is not None:
-            e["gitBranch"] = self.git_branch
-        return e
-
-    def _emit(self, entry):
-        """Thread the parentUuid chain and hand the finished entry back."""
-        self._parent = entry["uuid"]
-        return entry
 
     def feed(self, event):
         """Project one dsh session event. Returns a list of entry dicts (possibly
@@ -694,17 +665,11 @@ def project_log(events, session_id, cwd=None, git_branch=None, version=None):
     """Batch convenience: project a whole dsh event log (an iterable of event
     dicts) into the list of Claude-JSONL entry dicts. Equivalent to feeding each
     event to a fresh DshProjector in order."""
-    proj = DshProjector(session_id, cwd=cwd, git_branch=git_branch, version=version)
-    out = []
-    for ev in events:
-        out.extend(proj.feed(ev))
-    return out
+    return _project_log(DshProjector, events, session_id, cwd=cwd,
+                        git_branch=git_branch, version=version)
 
 
 def project_log_lines(events, session_id, **ctx):
     """As project_log, but serialized to newline-terminated JSONL strings ready to
     append to a transcript file (`ensure_ascii=False`, matching Claude Code)."""
-    return [
-        json.dumps(e, ensure_ascii=False) + "\n"
-        for e in project_log(events, session_id, **ctx)
-    ]
+    return _project_log_lines(DshProjector, events, session_id, **ctx)

@@ -46,6 +46,9 @@ import time
 try:
     # Imported as a sibling module by hub-agent.py (same dir on sys.path).
     from dsh_transcript import DshProjector, DshWorkflowRuns, workflow_run_id
+    # The per-child projection cursor + the file-ensure/append helpers are shared
+    # with the qwen tail (XERK-528); dsh keeps its own workflow re-home + records.
+    from runtime_tail import ChildProjection, append_entries, ensure_transcript_file
 except ImportError:  # pragma: no cover - only when run outside the agent dir
     DshProjector = None
     DshWorkflowRuns = None
@@ -613,12 +616,7 @@ class DshProjectionTail:
         return bool(child) and self._wf.run_of_child(child) is not None
 
     def _append(self, path, entries):
-        try:
-            with open(path, "a", encoding="utf-8") as fh:
-                for e in entries:
-                    fh.write(json.dumps(e, ensure_ascii=False) + "\n")
-        except OSError as e:
-            self._log(f"dsh projection append failed: {e}")
+        append_entries(path, entries, self._log, "dsh projection")
 
     # ---- workflow run records (XERK-474 [J]) -------------------------------
 
@@ -694,67 +692,28 @@ class DshProjectionTail:
         if st is None:
             if DshProjector is None:
                 return
-            st = {"proj": DshProjector(child_id, cwd=self._cwd,
-                                       git_branch=self._git_branch),
-                  "offset": 0, "partial": b"", "dest": self._child_dest(child_id)}
+            # The shared per-child cursor (`ChildProjection`, XERK-528) owns the
+            # offset/rewrite/split/feed loop; dsh keeps the run-aware `dest` and
+            # the flat->run re-home below.
+            st = ChildProjection(
+                lambda: DshProjector(child_id, cwd=self._cwd,
+                                     git_branch=self._git_branch),
+                self._child_dest(child_id))
             self._children[child_id] = st
-            self._ensure_child_file(st["dest"])
+            self._ensure_child_file(st.dest)
         else:
             # A workflow agent's run assignment may only now have arrived (its
             # `tool-workflow/agent-start` was folded this pump), moving its home
             # from the flat subagents/ dir into the run dir. Move the file we have
             # and repoint — the projector's offset is unchanged (same bytes).
             desired = self._child_dest(child_id)
-            if desired != st["dest"]:
-                self._move_child_file(st["dest"], desired)
-                st["dest"] = desired
-        try:
-            size = os.path.getsize(src)
-        except OSError:
-            return
-        if size < st["offset"]:      # rewritten under us — re-project from 0
-            st["offset"] = 0
-            st["partial"] = b""
-            st["proj"] = DshProjector(child_id, cwd=self._cwd,
-                                      git_branch=self._git_branch)
-            try:
-                open(st["dest"], "w").close()   # start the destination over too
-            except OSError:
-                pass
-        try:
-            with open(src, "rb") as fh:
-                fh.seek(st["offset"])
-                data = fh.read()
-        except OSError:
-            return
-        if not data:
-            return
-        st["offset"] += len(data)
-        st["partial"] += data
-        entries = []
-        while b"\n" in st["partial"]:
-            line, st["partial"] = st["partial"].split(b"\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line.decode("utf-8", "replace"))
-            except ValueError:
-                continue
-            entries.extend(st["proj"].feed(event))
-        if entries:
-            self._append(st["dest"], entries)
+            if desired != st.dest:
+                self._move_child_file(st.dest, desired)
+                st.dest = desired
+        st.pump(src, self._append)
 
     def _ensure_child_file(self, dest):
-        """Create the destination transcript (empty) so a picker resolving the
-        child mid-run finds a file — an empty one reads as an empty conversation,
-        the same guarantee the main transcript gets at launch."""
-        try:
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            if not os.path.exists(dest):
-                open(dest, "a", encoding="utf-8").close()
-        except OSError as e:
-            self._log(f"dsh child transcript create failed: {e}")
+        ensure_transcript_file(dest, self._log, "dsh child transcript")
 
     def _move_child_file(self, old, new):
         try:

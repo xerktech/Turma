@@ -31,6 +31,14 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   `try-restart`s.
   - **`have_sudo` ASKS when needed**, never `sudo -n`-only (a password-sudo host would look
     sudo-less and skip every apt prereq under `curl | bash`). Gated on `[ -t 2 ]`; cached.
+  - **A new `agent/*.py` sibling must land in ALL THREE packaging paths, or a runtime runs DARK on
+    release/update** (XERK-528, the XERK-496/523 lockstep class): `release.yml` staging `cp`,
+    `install.sh` copy + `--verify` list, AND `turma-agent-update` payload swap. `hub-agent.py`
+    imports the siblings by their own-dir path; nothing in CI/tests stages the tarball, so a miss is
+    invisible until a real host updates. `runtime_projection.py`/`runtime_tail.py` (shared by the dsh
+    AND qwen transcript/tail siblings) ship UNCONDITIONALLY with the core. Note `dsh_configured()`
+    does NOT presence-gate on its files (unlike `qwen_configured`→`qwen_runtime_present`), so a dsh
+    host missing a projector runs dark rather than refusing.
   - **`--with-dsh`/`TURMA_DSH=1` ships the dsh toolchain (XERK-496)**: lays `dsh_session.py`/
     `dsh_transcript.py` + `dsh-session-driver/dist/` + `dsh/guard/` at `hub-agent.py`'s own dir
     (`DSH_PLUGIN_DIR`), installs LATEST `@deepseek-ai/dsh` into `~/.local` with native-build scripts

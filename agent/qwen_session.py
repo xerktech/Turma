@@ -50,6 +50,10 @@ import time
 try:
     # Imported as a sibling module by hub-agent.py (same dir on sys.path).
     from qwen_transcript import QwenProjector
+    # The per-child projection cursor + the file-ensure/append helpers are shared
+    # with the dsh tail (XERK-528); only WHERE a child lands and the parent-pump /
+    # native-log mirror below are qwen-specific.
+    from runtime_tail import ChildProjection, append_entries, ensure_transcript_file
 except ImportError:  # pragma: no cover - only when run outside the agent dir
     QwenProjector = None
 
@@ -337,7 +341,8 @@ class QwenProjectionTail:
     def _pump_child(self, child_id, src):
         """Project the new bytes of one subagent's native log through a fresh
         QwenProjector into `subagents/agent-<child_id>.jsonl`, incrementally on
-        its own offset — the same discipline the parent projection uses."""
+        its own offset — the shared per-child cursor (`ChildProjection`) the dsh
+        tail uses too. qwen's children are always flat (no workflow re-home)."""
         st = self._children.get(child_id)
         if st is None:
             if QwenProjector is None:
@@ -345,58 +350,16 @@ class QwenProjectionTail:
             dest = os.path.join(self._subagents_dir, "agent-%s.jsonl" % child_id)
             # The child's events carry the PARENT's sessionId, so the projector is
             # seeded on the CHILD id — unique uuids, no collision with the parent.
-            st = {"proj": QwenProjector(child_id, cwd=self._cwd,
-                                        git_branch=self._git_branch),
-                  "offset": 0, "partial": b"", "dest": dest}
+            st = ChildProjection(
+                lambda: QwenProjector(child_id, cwd=self._cwd,
+                                      git_branch=self._git_branch),
+                dest)
             self._children[child_id] = st
             self._ensure_child_file(dest)
-        try:
-            size = os.path.getsize(src)
-        except OSError:
-            return
-        if size < st["offset"]:      # rewritten under us — re-project from 0
-            st["offset"] = 0
-            st["partial"] = b""
-            st["proj"] = QwenProjector(child_id, cwd=self._cwd,
-                                       git_branch=self._git_branch)
-            try:
-                open(st["dest"], "w").close()   # start the destination over too
-            except OSError:
-                pass
-        try:
-            with open(src, "rb") as fh:
-                fh.seek(st["offset"])
-                data = fh.read()
-        except OSError:
-            return
-        if not data:
-            return
-        st["offset"] += len(data)
-        st["partial"] += data
-        entries = []
-        while b"\n" in st["partial"]:
-            line, st["partial"] = st["partial"].split(b"\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line.decode("utf-8", "replace"))
-            except ValueError:
-                continue
-            entries.extend(st["proj"].feed(event))
-        if entries:
-            self._append(st["dest"], entries)
+        st.pump(src, self._append)
 
     def _ensure_child_file(self, dest):
-        """Create the destination transcript (empty) so a picker resolving the
-        child mid-run finds a file — an empty one reads as an empty conversation,
-        the same guarantee the main transcript gets at launch."""
-        try:
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            if not os.path.exists(dest):
-                open(dest, "a", encoding="utf-8").close()
-        except OSError as e:
-            self._log(f"qwen child transcript create failed: {e}")
+        ensure_transcript_file(dest, self._log, "qwen child transcript")
 
     def _mirror_native(self, events_path):
         """Copy qwen's native event log, byte for byte and append-only, into the
@@ -487,9 +450,4 @@ class QwenProjectionTail:
                     return
 
     def _append(self, path, entries):
-        try:
-            with open(path, "a", encoding="utf-8") as fh:
-                for e in entries:
-                    fh.write(json.dumps(e, ensure_ascii=False) + "\n")
-        except OSError as e:
-            self._log(f"qwen projection append failed: {e}")
+        append_entries(path, entries, self._log, "qwen projection")

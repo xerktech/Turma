@@ -3,6 +3,8 @@ paths:
   - "agent/hub-agent.py"
   - "agent/qwen_transcript.py"
   - "agent/qwen_session.py"
+  - "agent/runtime_projection.py"
+  - "agent/runtime_tail.py"
   - "agent/qwen/**"
   - "agent/tunnel-agent.js"
   - "agent/tests/test_qwen_transcript.py"
