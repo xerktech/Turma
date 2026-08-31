@@ -65,6 +65,14 @@ process.env.AUTOSTART_ORGS_FILE = path.join(
   os.tmpdir(),
   `turma-test-autostart-orgs-${process.pid}.json`
 );
+process.env.TRIAGE_POLICIES_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-triage-policies-${process.pid}.json`
+);
+process.env.TRIAGE_ACTIONS_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-triage-actions-${process.pid}.json`
+);
 process.env.PRIORITY_WRITEBACK_ORGS_FILE = path.join(
   os.tmpdir(),
   `turma-test-priority-writeback-orgs-${process.pid}.json`
@@ -182,6 +190,10 @@ const {
   TRIAGE_PRIORITY_RANK, TRIAGE_TYPE_WEIGHT, NO_PRIORITY_RANK, NO_TYPE_WEIGHT,
   TICKET_QUEUE_RATE_MAX, TICKET_QUEUE_RATE_WINDOW_MS, autoStartRate,
   recordAutoStartRate, refundAutoStartRate,
+  // XERK-486 [F]: per-org triage policy and per-ticket triage verdicts.
+  triagePolicies, setTriagePolicy, triagePolicyReason, autoStartRateMax,
+  ticketTriageActions, ticketTriageAction, setTicketTriageAction,
+  TRIAGE_ACTIONS_MAX,
   orgColors, setOrgColor,
   repoTiers, repoTier, repoTierRank, isRepoIgnored, setRepoTier,
   DEFAULT_REPO_TIER, REPO_TIERS,
@@ -7916,6 +7928,379 @@ test("XERK-296: a hold reason from the hub is length-capped on the entry", async
   holdQueued(e, "blocked", "x".repeat(TICKET_QUEUE_ERROR_MAX + 500));
   assert.equal(e.error.length, TICKET_QUEUE_ERROR_MAX);
   ticketQueue.length = 0;
+});
+
+// ---- per-org triage policy + per-ticket verdicts (XERK-486 [F]) -------------
+// The policy shapes WHAT an opted-in org's auto sweep queues (minPriority,
+// excludeTypes, repo allow/deny, rateMax); a per-ticket verdict (approve /
+// hold / reject) sits on top of both — hold and reject keep a ticket out of the
+// auto stream at sweep AND drain time, approve forces it past gate and policy.
+// Both maps are hub-owned durable state riding /api/agents, like the pins.
+const resetTriagePolicy = () => {
+  for (const k of Object.keys(triagePolicies)) delete triagePolicies[k];
+};
+const resetTriageActions = () => {
+  for (const k of Object.keys(ticketTriageActions)) delete ticketTriageActions[k];
+};
+
+test("XERK-486 [F]: triagePolicyReason enforces the min-priority / type / repo knobs", () => {
+  resetTriagePolicy();
+  // No policy at all -> unrestricted (the common org stays exactly as it was).
+  assert.equal(triagePolicyReason("x486u.com", { priority: "P2", type: "chore" }, "Turma"), null);
+  // minPriority: this band and HIGHER pass; the band below fails; an
+  // untriaged ticket (no band at all) fails too.
+  setTriagePolicy("x486u.com", { minPriority: "P1" });
+  assert.equal(triagePolicyReason("x486u.com", { priority: "P0", type: "bug" }, "Turma"), null);
+  assert.equal(triagePolicyReason("x486u.com", { priority: "P1", type: "bug" }, "Turma"), null);
+  assert.match(triagePolicyReason("x486u.com", { priority: "P2", type: "task" }, "Turma"),
+    /minimum auto-start priority \(P1\+\)/);
+  assert.match(triagePolicyReason("x486u.com", null, "Turma"),
+    /minimum auto-start priority \(P1\+\)/, "an untriaged ticket has no band to pass");
+  // excludeTypes matches the triage TYPE only; an untriaged ticket has no type,
+  // so it is not excluded by a type filter.
+  setTriagePolicy("x486u.com", { minPriority: null, excludeTypes: ["chore"] });
+  assert.match(triagePolicyReason("x486u.com", { priority: "P1", type: "chore" }, "Turma"),
+    /excluded by policy/);
+  assert.equal(triagePolicyReason("x486u.com", { priority: "P1", type: "bug" }, "Turma"), null);
+  assert.equal(triagePolicyReason("x486u.com", { priority: "P1" }, "Turma"), null);
+  // repoDeny beats repoAllow; an allow list blocks everything it omits.
+  setTriagePolicy("x486u.com", { minPriority: null, excludeTypes: null,
+    repoAllow: ["Turma", "Hub"], repoDeny: ["Hub"] });
+  assert.match(triagePolicyReason("x486u.com", { priority: "P0", type: "bug" }, "Hub"),
+    /denied by policy/);
+  assert.equal(triagePolicyReason("x486u.com", { priority: "P0", type: "bug" }, "Turma"), null);
+  setTriagePolicy("x486u.com", { repoDeny: null });
+  assert.match(triagePolicyReason("x486u.com", { priority: "P0", type: "bug" }, "Other"),
+    /not on the allow list/);
+  // The knobs are per-org: an org with no policy is untouched by them.
+  assert.equal(triagePolicyReason("x486-none.com", { priority: "P2", type: "chore" }, "Other"), null);
+});
+
+test("XERK-486 [F]: setTriagePolicy merges patches; null clears a knob; an empty org clears", () => {
+  resetTriagePolicy();
+  setTriagePolicy("x486m.com", { minPriority: "P0", excludeTypes: ["chore"], rateMax: 3 });
+  assert.deepEqual(triagePolicies["x486m.com"],
+    { minPriority: "P0", excludeTypes: ["chore"], rateMax: 3 });
+  setTriagePolicy("x486m.com", { rateMax: null, repoDeny: ["Bad"] });
+  assert.deepEqual(triagePolicies["x486m.com"],
+    { minPriority: "P0", excludeTypes: ["chore"], repoDeny: ["Bad"] });
+  setTriagePolicy("x486m.com", { minPriority: null, excludeTypes: null, repoDeny: null });
+  assert.equal("x486m.com" in triagePolicies, false, "all knobs cleared -> no policy object");
+  // autoStartRateMax reads the org's knob, else the fleet default.
+  assert.equal(autoStartRateMax("x486m.com"), TICKET_QUEUE_RATE_MAX);
+  setTriagePolicy("x486m.com", { rateMax: 2 });
+  assert.equal(autoStartRateMax("x486m.com"), 2);
+  setTriagePolicy("x486m.com", { rateMax: null });
+  assert.equal(autoStartRateMax("x486m.com"), TICKET_QUEUE_RATE_MAX);
+});
+
+test("XERK-486 [F]: a ticket verdict sets, clears, and evicts oldest-first at the cap", () => {
+  resetTriageActions();
+  setTicketTriageAction("x486v.com", "T-1", "hold");
+  assert.equal(ticketTriageAction("x486v.com", "T-1"), "hold");
+  setTicketTriageAction("x486v.com", "T-1", null);
+  assert.equal(ticketTriageAction("x486v.com", "T-1"), null);
+  for (let i = 0; i <= TRIAGE_ACTIONS_MAX + 2; i++) {
+    setTicketTriageAction("x486v.com", `EV-${i}`, "approve");
+  }
+  assert.equal(Object.keys(ticketTriageActions).length, TRIAGE_ACTIONS_MAX);
+  assert.equal(ticketTriageAction("x486v.com", "EV-0"), null, "the oldest verdict evicted");
+  assert.equal(ticketTriageAction("x486v.com", `EV-${TRIAGE_ACTIONS_MAX + 2}`), "approve");
+  // An unknown key or a malformed stored value reads as "no verdict".
+  assert.equal(ticketTriageAction("x486v.com", "T-9"), null);
+  ticketTriageActions["x486v.com/T-9"] = { action: "yolo" };
+  assert.equal(ticketTriageAction("x486v.com", "T-9"), null);
+  delete ticketTriageActions["x486v.com/T-9"];
+});
+
+test("XERK-486 [F]: 'auto-start highs+ only' queues P0/P1 and leaves mediums unqueued", async () => {
+  resetAutoStart();
+  resetTriagePolicy();
+  const site = "x486m.atlassian.net";
+  await asBeat("x486m", site, { capacity: FULL,
+    tickets: [
+      { key: "M-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        triage: { priority: "P0", type: "bug", actionable: true } },
+      { key: "M-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        triage: { priority: "P1", type: "task", actionable: true } },
+      { key: "M-3", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        triage: { priority: "P2", type: "task", actionable: true } },
+      { key: "M-4", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        triage: { priority: "P3", type: "chore", actionable: true } },
+    ] });
+  setTriagePolicy(site, { minPriority: "P1" });   // "highs+ only"
+  autoStartSweep();
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["M-1", "M-2"],
+    "highs and above queue; the mediums render but take no place in line");
+  // Lifting the knob lets the rest in on the next sweep.
+  setTriagePolicy(site, { minPriority: null });
+  autoStartSweep();
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["M-1", "M-2", "M-3", "M-4"]);
+  ticketQueue.length = 0;
+});
+
+test("XERK-486 [F]: an excluded triage type never enters the auto stream", async () => {
+  resetAutoStart();
+  resetTriagePolicy();
+  const site = "x486x.atlassian.net";
+  await asBeat("x486x", site, { capacity: FULL,
+    tickets: [
+      { key: "X-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        triage: { priority: "P1", type: "chore", actionable: true } },
+      { key: "X-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        triage: { priority: "P1", type: "bug", actionable: true } },
+    ] });
+  setTriagePolicy(site, { excludeTypes: ["chore"] });
+  const lines = [];
+  const real = console.log;
+  console.log = (...a) => lines.push(a.join(" "));
+  try { autoStartSweep(); } finally { console.log = real; }
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["X-2"]);
+  assert.ok(lines.some((l) => l.includes("X-1") && l.includes("excluded by policy")),
+    "the skip is logged, throttled like the other held lines");
+  ticketQueue.length = 0;
+});
+
+test("XERK-486 [F]: repo deny beats repo allow, and the allow list blocks the rest", async () => {
+  resetAutoStart();
+  resetTriagePolicy();
+  const site = "x486r.atlassian.net";
+  const tri = { priority: "P1", type: "task", actionable: true };
+  await asBeat("x486r", site, { capacity: FULL, repos: ["Turma", "Hub", "Bad"],
+    tickets: [
+      { key: "R-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: tri },
+      { key: "R-2", statusCategory: "todo", repoGuess: { repo: "Hub", cloned: true }, triage: tri },
+      { key: "R-3", statusCategory: "todo", repoGuess: { repo: "Bad", cloned: true }, triage: tri },
+    ] });
+  setTriagePolicy(site, { repoAllow: ["Turma", "Bad"], repoDeny: ["Bad"] });
+  const lines = [];
+  const real = console.log;
+  console.log = (...a) => lines.push(a.join(" "));
+  try { autoStartSweep(); } finally { console.log = real; }
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["R-1"]);
+  assert.ok(lines.some((l) => l.includes("R-3") && l.includes("denied by policy")));
+  assert.ok(lines.some((l) => l.includes("R-2") && l.includes("not on the allow list")));
+  ticketQueue.length = 0;
+});
+
+test("XERK-486 [F]: hold and reject keep a ticket out of the sweep; approve overrides", async () => {
+  resetAutoStart();
+  resetTriagePolicy();
+  resetTriageActions();
+  const site = "x486v.atlassian.net";
+  const hi = { priority: "P0", type: "bug", actionable: true };
+  const mid = { priority: "P1", type: "task", actionable: true };
+  await asBeat("x486v", site, { capacity: FULL,
+    tickets: [
+      { key: "V-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: hi },
+      { key: "V-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: hi },
+      { key: "V-3", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: mid },
+      { key: "V-4", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } }, // untriaged
+      { key: "V-5", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: mid },
+    ] });
+  setTicketTriageAction(site, "V-1", "hold");
+  setTicketTriageAction(site, "V-2", "reject");
+  setTicketTriageAction(site, "V-3", "approve");   // past the policy's P0 floor
+  setTicketTriageAction(site, "V-4", "approve");   // past the "untriaged" gate
+  setTriagePolicy(site, { minPriority: "P0" });
+  const lines = [];
+  const real = console.log;
+  console.log = (...a) => lines.push(a.join(" "));
+  try { autoStartSweep(); autoStartSweep(); } finally { console.log = real; }
+  // The hold survives a second sweep (the 15s interval) exactly as the first.
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["V-3", "V-4"],
+    "hold and reject are never swept; approve forces past gate and policy");
+  assert.ok(lines.some((l) => l.includes("V-1") && l.includes("hold by triage")));
+  assert.ok(lines.some((l) => l.includes("V-2") && l.includes("reject by triage")));
+  assert.ok(lines.some((l) => l.includes("V-5") && l.includes("skipped by")),
+    "the unapproved P1 is still skipped by the policy");
+  // Releasing the hold lets the held ticket sweep in.
+  setTicketTriageAction(site, "V-1", null);
+  autoStartSweep();
+  assert.deepEqual([...ticketQueue.map((e) => e.issueKey)].sort(), ["V-1", "V-3", "V-4"]);
+  ticketQueue.length = 0;
+  resetTriageActions();
+});
+
+test("XERK-486 [F]: approve still respects the ignore-tier / missing-repo candidate filter", async () => {
+  resetAutoStart();
+  resetRepoTiers();
+  resetTriagePolicy();
+  resetTriageActions();
+  const site = "x486i.atlassian.net";
+  await asBeat("x486i", site, { capacity: FULL, repos: ["Junk"],
+    tickets: [
+      { key: "I-1", statusCategory: "todo", repoGuess: { repo: "Junk", cloned: true },
+        triage: { priority: "P0", type: "bug", actionable: true } },
+      { key: "I-2", statusCategory: "todo", repoGuess: null,
+        triage: { priority: "P0", type: "bug", actionable: true } },
+    ] });
+  setRepoTier("Junk", "ignore");
+  setTicketTriageAction(site, "I-1", "approve");
+  setTicketTriageAction(site, "I-2", "approve");
+  autoStartSweep();
+  assert.equal(ticketQueue.length, 0,
+    "approve bypasses gate and policy, not the candidate filter");
+  ticketQueue.length = 0;
+  resetRepoTiers();
+  resetTriageActions();
+});
+
+test("XERK-486 [F]: a verdict changed while the ticket waits is honoured at drain", async () => {
+  resetAutoStart();
+  resetTriagePolicy();
+  resetTriageActions();
+  const site = "x486d.atlassian.net";
+  const tri = { priority: "P2", type: "task", actionable: true };
+  await asBeat("x486d", site, { autoStart: false, capacity: FULL,
+    tickets: [
+      { key: "D-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: tri },
+      { key: "D-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: tri },
+      { key: "D-3", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: tri },
+      { key: "D-4", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: tri },
+    ] });
+  setAutoStartOrg(site, true);
+  // Enqueued directly: this test exercises the DRAIN's re-check, not the sweep.
+  enqueueTicketStart(site, "D-1", "auto");
+  enqueueTicketStart(site, "D-2", "auto");
+  enqueueTicketStart(site, "D-3", "manual");
+  enqueueTicketStart(site, "D-4", "manual");
+  setTicketTriageAction(site, "D-1", "hold");
+  setTicketTriageAction(site, "D-2", "reject");
+  setTicketTriageAction(site, "D-4", "hold");
+  agents.x486d.capacity = { ...ROOMY };
+  drainTicketQueue();
+  assert.equal(queuedTicket(site, "D-1"), null, "the held auto entry drops at drain");
+  assert.equal(queuedTicket(site, "D-2"), null, "the rejected auto entry drops at drain");
+  const cmds = (agents.x486d.commands || []).map((c) => c.issueKey);
+  assert.ok(cmds.includes("D-3"), "the manual entry is unaffected by any verdict");
+  assert.ok(queuedTicket(site, "D-4"),
+    "one ticket per host per pass: the held MANUAL D-4 still waits");
+  // Release D-1's hold and re-queue it: a dropped entry is gone, and the sweep
+  // won't re-queue it while the verdict said hold — the drain must honour the
+  // NEW verdict on the fresh entry. D-4 is older in line, so it dispatches
+  // first; D-1 takes the next pass.
+  agents.x486d.commands = [];
+  setTicketTriageAction(site, "D-1", "approve");
+  enqueueTicketStart(site, "D-1", "auto");
+  drainTicketQueue();
+  assert.ok((agents.x486d.commands || []).some((c) => c.issueKey === "D-4"),
+    "a held MANUAL entry is deliberate intent and keeps draining");
+  agents.x486d.commands = [];
+  drainTicketQueue();
+  assert.ok((agents.x486d.commands || []).some((c) => c.issueKey === "D-1"),
+    "a hold released to approve dispatches at drain");
+  resetTriageActions();
+});
+
+test("XERK-486 [F]: the policy's rateMax caps the org's auto window (read live)", async () => {
+  resetAutoStart();
+  resetTriagePolicy();
+  const site = "x486q.atlassian.net";
+  const tri = { priority: "P2", type: "task", actionable: true };
+  await asBeat("x486q", site, { capacity: ROOMY,
+    tickets: [
+      { key: "Q-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: tri },
+      { key: "Q-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: tri },
+      { key: "Q-3", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true }, triage: tri },
+    ] });
+  setTriagePolicy(site, { rateMax: 2 });
+  autoStartRound();           // Q-1 out
+  agents.x486q.commands = []; // the host "takes" it, freeing the slot again
+  drainTicketQueue();         // Q-2 out — the org's window is now full
+  agents.x486q.commands = [];
+  drainTicketQueue();         // Q-3: the rate window is full, so it HOLDS
+  const e = queuedTicket(site, "Q-3");
+  assert.ok(e, "the third auto entry stays in line");
+  assert.equal(e.reason, "rate");
+  assert.equal(autoStartRate.get(site).length, 2, "each dispatch stamped the window");
+  // And the org's knob is live: raising it frees the hold on the next drain.
+  setTriagePolicy(site, { rateMax: 3 });
+  drainTicketQueue();
+  assert.equal(queuedTicket(site, "Q-3"), null, "a raised rateMax lets it out");
+  resetTriagePolicy();
+});
+
+test("XERK-486 [F]: POST /api/jira/<site>/<key>/triage sets and clears a verdict, rides the payload", async () => {
+  resetTriageActions();
+  await asBeat("x486api", "x486a.atlassian.net", { autoStart: false });
+  let r = await request("POST", "/api/jira/x486a.atlassian.net/ENG-5/triage",
+    { body: { action: "hold" }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { ok: true, action: "hold" });
+  assert.equal(ticketTriageAction("x486a.atlassian.net", "ENG-5"), "hold");
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.body.ticketTriageActions["x486a.atlassian.net/ENG-5"].action, "hold");
+  // {clear:true} releases the verdict — the key leaves the map, so the
+  // payload's entry goes with it.
+  r = await request("POST", "/api/jira/x486a.atlassian.net/ENG-5/triage",
+    { body: { clear: true }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.action, null);
+  assert.equal(ticketTriageAction("x486a.atlassian.net", "ENG-5"), null);
+  const list2 = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal("x486a.atlassian.net/ENG-5" in list2.body.ticketTriageActions, false);
+});
+
+test("XERK-486 [F]: the triage route rejects a bad action, a bad key, and a phantom org", async () => {
+  await asBeat("x486api2", "x486b.atlassian.net", { autoStart: false });
+  let r = await request("POST", "/api/jira/x486b.atlassian.net/ENG-5/triage",
+    { body: { action: "yolo" }, headers: userHeaders });
+  assert.equal(r.status, 400);
+  r = await request("POST", "/api/jira/x486b.atlassian.net/bad/triage",
+    { body: { action: "hold" }, headers: userHeaders });
+  assert.equal(r.status, 400, "not an issue key");
+  r = await request("POST", "/api/jira/nobody486.atlassian.net/ENG-5/triage",
+    { body: { action: "hold" }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  assert.equal("nobody486.atlassian.net/ENG-5" in ticketTriageActions, false);
+});
+
+test("XERK-486 [F]: POST /api/jira/<site>/triage-policy upserts, merges, and rides the payload", async () => {
+  resetTriagePolicy();
+  await asBeat("x486p", "x486c.atlassian.net", { autoStart: false });
+  let r = await request("POST", "/api/jira/x486c.atlassian.net/triage-policy",
+    { body: { minPriority: "P1", excludeTypes: ["chore"], rateMax: 3 }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { ok: true,
+    policy: { minPriority: "P1", excludeTypes: ["chore"], rateMax: 3 } });
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.deepEqual(list.body.triagePolicies["x486c.atlassian.net"],
+    { minPriority: "P1", excludeTypes: ["chore"], rateMax: 3 });
+  // A null knob clears just that knob — the rest of the policy survives.
+  r = await request("POST", "/api/jira/x486c.atlassian.net/triage-policy",
+    { body: { rateMax: null }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.policy, { minPriority: "P1", excludeTypes: ["chore"] });
+});
+
+test("XERK-486 [F]: the triage-policy route rejects bad knobs and a phantom org", async () => {
+  await asBeat("x486p2", "x486d.atlassian.net", { autoStart: false });
+  for (const body of [
+    { minPriority: "P4" },
+    { rateMax: 0 },
+    { rateMax: 51 },
+    { rateMax: 2.5 },
+    { excludeTypes: [42] },
+    { repoAllow: "Turma" },
+  ]) {
+    const r = await request("POST", "/api/jira/x486d.atlassian.net/triage-policy",
+      { body, headers: userHeaders });
+    assert.equal(r.status, 400, JSON.stringify(body));
+  }
+  assert.equal("x486d.atlassian.net" in triagePolicies, false, "no partial state on refusal");
+  const r = await request("POST", "/api/jira/nobody486p.atlassian.net/triage-policy",
+    { body: { minPriority: "P0" }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  assert.equal("nobody486p.atlassian.net" in triagePolicies, false);
+});
+
+test("POST /api/jira/<site>/<key>/triage needs the user login", async () => {
+  await asBeat("x486auth", "x486auth.atlassian.net", { autoStart: false });
+  const r = await request("POST", "/api/jira/x486auth.atlassian.net/ENG-5/triage",
+    { body: { action: "hold" } });
+  assert.equal(r.status, 401);
+  assert.equal(ticketTriageAction("x486auth.atlassian.net", "ENG-5"), null);
 });
 
 // ---- reclaiming a spawn stranded on a dead host (XERK-303) ------------------

@@ -163,6 +163,25 @@ const TICKET_RUNTIMES_MAX = 500;
 // /data volume, not the best-effort state.json, because the opt-in must survive a
 // hub restart.
 const AUTOSTART_ORGS_FILE = process.env.AUTOSTART_ORGS_FILE || "/data/autostart-orgs.json";
+// Per-org triage policy (XERK-486 [F]): the knobs that govern WHAT an org's
+// auto stream will start, now that the single on/off switch (autoStartOrgs) has
+// become "policy enabled". siteKey -> {minPriority?, excludeTypes?, repoAllow?,
+// repoDeny?, rateMax?}. minPriority: auto-start this band and higher (P0 > P1 >
+// P2 > P3); excludeTypes: triage types never auto-started; repoAllow: only these
+// repos auto-start (empty = any); repoDeny: these repos never auto-start (wins
+// over allow); rateMax: per-org auto dispatches per rate window (defaults to
+// TICKET_QUEUE_RATE_MAX). Hub-owned durable state like autostart-orgs.json:
+// per-org, tiny, must survive a hub restart, rides the fleet payload + SSE.
+const TRIAGE_POLICIES_FILE = process.env.TRIAGE_POLICIES_FILE || "/data/triage-policies.json";
+// Per-ticket operator triage decision (XERK-486 [F]): "<siteKey>/<issueKey>" ->
+// "approve" | "hold" | "reject". approve forces auto-start eligibility past the
+// org policy and the model's triage gate; hold keeps the ticket out of the auto
+// stream until released; reject drops it from the auto stream. Same key shape as
+// the agent/model pins (ticketAgents / ticketModels): hub-owned durable state
+// that must survive a restart, bounded like the other pin maps.
+const TRIAGE_ACTIONS_FILE = process.env.TRIAGE_ACTIONS_FILE || "/data/triage-actions.json";
+const TRIAGE_ACTIONS_MAX = 500;
+const TRIAGE_ACTIONS = new Set(["approve", "hold", "reject"]);
 // Per-org opt-in for triage priority write-back (XERK-483): when ON for an org,
 // the hub's sweep queues a setTicketPriority command so the tracker's own
 // priority field matches the triage band. Same hub-owned-durable rationale as
@@ -1460,6 +1479,133 @@ function setAutoStartOrg(siteKey, enabled) {
   sseBroadcast("autoStartOrgs", autoStartOrgs);
 }
 
+// ---- per-ticket triage actions (XERK-486 [F]) -------------------------------
+// The operator's per-ticket verdict: "approve" (force auto-start eligibility
+// past the org policy and the triage gate), "hold" (never auto-start until
+// released), or "reject" (drop from the auto stream). Keyed and bounded exactly
+// like the agent/model pins, with {action, at} so the 500-entry cap evicts the
+// oldest decision. The sweep (decision time) and the drain (dispatch time) both
+// consult ticketTriageAction so a verdict holds across both.
+let ticketTriageActions = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(TRIAGE_ACTIONS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) {
+      if (v && TRIAGE_ACTIONS.has(v.action)) ticketTriageActions[k] = v;
+    }
+  }
+} catch {
+  /* first boot or no volume mounted */
+}
+let ttSaveTimer = null;
+function scheduleTriageActionsSave() {
+  if (ttSaveTimer) return;
+  ttSaveTimer = setTimeout(() => {
+    ttSaveTimer = null;
+    fs.mkdir(path.dirname(TRIAGE_ACTIONS_FILE), { recursive: true }, () => {
+      fs.writeFile(TRIAGE_ACTIONS_FILE, JSON.stringify(ticketTriageActions), (err) => {
+        if (err) console.error(`triage-actions save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  ttSaveTimer.unref();
+}
+function ticketTriageAction(siteKey, issueKey) {
+  const a = ticketTriageActions[`${siteKey}/${issueKey}`];
+  return a && TRIAGE_ACTIONS.has(a.action) ? a.action : null;
+}
+// Set or clear (action=null) a ticket's triage verdict. The caller has already
+// validated the siteKey is one the fleet reports; this owns the map's bookkeeping.
+function setTicketTriageAction(siteKey, issueKey, action) {
+  const k = `${siteKey}/${issueKey}`;
+  if (!action) {
+    delete ticketTriageActions[k];
+  } else {
+    ticketTriageActions[k] = { action, at: Date.now() };
+    const keys = Object.keys(ticketTriageActions);
+    if (keys.length > TRIAGE_ACTIONS_MAX) {
+      keys.sort((a, b) => (ticketTriageActions[a].at || 0) - (ticketTriageActions[b].at || 0));
+      for (const old of keys.slice(0, keys.length - TRIAGE_ACTIONS_MAX)) {
+        delete ticketTriageActions[old];
+      }
+    }
+  }
+  scheduleTriageActionsSave();
+  invalidateAgentsCache();
+  sseBroadcast("triageActions", ticketTriageActions);
+}
+
+// ---- per-org triage policy (XERK-486 [F]) ----------------------------------
+// The org's auto-start policy: minPriority (auto-start this band and higher),
+// excludeTypes, repoAllow/repoDeny, rateMax. siteKey -> policy object. Loaded
+// with per-field sanitization at boot so a hand-edited file can't smuggle a
+// non-string into a .includes() or a float into a rate comparison.
+let triagePolicies = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(TRIAGE_POLICIES_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) {
+      const p = {};
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        if (v.minPriority && ["P0", "P1", "P2", "P3"].includes(v.minPriority)) p.minPriority = v.minPriority;
+        if (Array.isArray(v.excludeTypes)) p.excludeTypes = v.excludeTypes.filter(x => typeof x === "string");
+        if (Array.isArray(v.repoAllow)) p.repoAllow = v.repoAllow.filter(x => typeof x === "string");
+        if (Array.isArray(v.repoDeny)) p.repoDeny = v.repoDeny.filter(x => typeof x === "string");
+        if (Number.isInteger(v.rateMax) && v.rateMax >= 1 && v.rateMax <= 50) p.rateMax = v.rateMax;
+      }
+      if (Object.keys(p).length) triagePolicies[k] = p;
+    }
+  }
+} catch {
+  /* first boot or no volume mounted */
+}
+function sanitizeTriagePolicy(patch) {
+  // Returns a sanitized partial policy or null if the patch is malformed.
+  if (typeof patch !== "object" || patch === null || Array.isArray(patch)) return null;
+  const p = {};
+  if ("minPriority" in patch) {
+    if (patch.minPriority != null && !["P0", "P1", "P2", "P3"].includes(patch.minPriority)) return null;
+    p.minPriority = patch.minPriority || null;
+  }
+  for (const f of ["excludeTypes", "repoAllow", "repoDeny"]) {
+    if (f in patch) {
+      if (patch[f] != null && (!Array.isArray(patch[f]) || !patch[f].every(x => typeof x === "string"))) return null;
+      p[f] = patch[f] || null;
+    }
+  }
+  if ("rateMax" in patch) {
+    if (patch.rateMax != null && (!Number.isInteger(patch.rateMax) || patch.rateMax < 1 || patch.rateMax > 50)) return null;
+    p.rateMax = patch.rateMax || null;
+  }
+  return p;
+}
+let tpSaveTimer = null;
+function scheduleTriagePolicySave() {
+  if (tpSaveTimer) return;
+  tpSaveTimer = setTimeout(() => {
+    tpSaveTimer = null;
+    fs.mkdir(path.dirname(TRIAGE_POLICIES_FILE), { recursive: true }, () => {
+      fs.writeFile(TRIAGE_POLICIES_FILE, JSON.stringify(triagePolicies), (err) => {
+        if (err) console.error(`triage-policies save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  tpSaveTimer.unref();
+}
+// Merge a sanitized patch into an org's policy (null values clear a knob).
+function setTriagePolicy(siteKey, patch) {
+  const p = { ...(triagePolicies[siteKey] || {}) };
+  for (const [k, v] of Object.entries(patch)) {
+    if (v == null) delete p[k];
+    else p[k] = v;
+  }
+  if (Object.keys(p).length) triagePolicies[siteKey] = p;
+  else delete triagePolicies[siteKey];
+  scheduleTriagePolicySave();
+  invalidateAgentsCache();
+  sseBroadcast("triagePolicies", triagePolicies);
+}
+
 // ---- per-org priority write-back opt-in (XERK-483) -------------------------
 // The set of orgs the operator has switched triage priority write-back ON for,
 // keyed by siteKey with the value simply `true` (presence = enabled; disabling
@@ -2068,6 +2214,11 @@ function buildAgentsCache() {
   // own SSE events for open boards).
   const body = JSON.stringify({
     now, agents: list, ticketAgents, ticketModels, ticketRuntimes, autoStartOrgs, priorityWriteBackOrgs, dedupeLinkOrgs, orgColors,
+    // Per-org triage policy (XERK-486 [F]) and the per-ticket triage verdicts
+    // (approve/hold/reject): hub-owned like the pins above, and the board's one
+    // read channel for both — the policy panel and the card chips read them
+    // straight off the payload (plus their own SSE events for live boards).
+    triagePolicies, ticketTriageActions,
     // Per-repo importance tiers (XERK-487), hub-owned durable state keyed by
     // repo name. Only non-default tiers ride here; an absent repo is the default
     // middle tier. Board reads it to show/set a repo's tier; the ordering and
@@ -7016,10 +7167,23 @@ function drainTicketQueue() {
     // An AUTO entry drops without churn (the sweep's gate won't re-queue it —
     // same rule as a retiered repo above); a MANUAL entry is a deliberate intent
     // and keeps draining. No triage block at all means "can't tell", so it stays
-    // dispatchable — the same rule a missing capacity block follows.
-    if (e.source === "auto" && row.triage &&
+    // dispatchable — the same rule a missing capacity block follows. An explicit
+    // operator approve (XERK-486 [F]) overrides this gate.
+    const triageAction = e.source === "auto"
+      ? ticketTriageAction(e.siteKey, e.issueKey)
+      : null;
+    if (e.source === "auto" && triageAction !== "approve" && row.triage &&
         (row.triage.actionable !== true || row.triage.dedupeOf)) {
       drop("its triage no longer says actionable");
+      continue;
+    }
+    // XERK-486 [F]: the operator held or rejected this ticket while it waited.
+    // The sweep's verdict check won't re-queue it, so drop with no churn — a
+    // hold must survive the drain exactly like a retriage. MANUAL entries are
+    // deliberate intent and keep draining (same rule as every other auto guard).
+    if (e.source === "auto" &&
+        (triageAction === "hold" || triageAction === "reject")) {
+      drop(`it was ${triageAction} by triage while it waited`);
       continue;
     }
     const { host, error, full } = findTicketHost(
@@ -7046,7 +7210,7 @@ function drainTicketQueue() {
     // must NOT claim this host: another org's entry may still take the slot in
     // the same pass. Manual clicks are deliberate intent and are never held.
     if (e.source === "auto" &&
-        autoStartRateLive(e.siteKey, now).length >= TICKET_QUEUE_RATE_MAX) {
+        autoStartRateLive(e.siteKey, now).length >= autoStartRateMax(e.siteKey)) {
       changed = holdQueued(e, "rate",
         "waiting out the org's auto-start rate limit") || changed;
       continue;
@@ -7257,6 +7421,49 @@ function triageSortKey(triage, repo) {
   ];
 }
 
+// XERK-486 [F]: the org triage policy. Why the sweep must NOT auto-start this
+// ticket because of its ORG's policy, or null when the policy allows it. An org
+// with no policy object has no constraint at all (the policy panel only adds
+// knobs; it never removes the default "anything actionable goes"). Each knob is
+// independent, and the first violated one is reported — the text rides the
+// queue-state log, not the board, so it just needs to be true, not pretty.
+//   minPriority  -> auto-start this band and HIGHER only (rank <= min's rank)
+//   excludeTypes -> these triage types never auto-start
+//   repoDeny     -> these repos never auto-start (checked first: deny beats allow)
+//   repoAllow    -> non-empty: only these repos auto-start
+function triagePolicyReason(siteKey, tri, repo) {
+  const p = triagePolicies[siteKey];
+  if (!p || typeof p !== "object") return null;
+  if (p.minPriority) {
+    const rank = tri && TRIAGE_PRIORITY_RANK[tri.priority] !== undefined
+      ? TRIAGE_PRIORITY_RANK[tri.priority] : NO_PRIORITY_RANK;
+    if (rank > TRIAGE_PRIORITY_RANK[p.minPriority]) {
+      return `below its minimum auto-start priority (${p.minPriority}+)`;
+    }
+  }
+  if (p.excludeTypes && p.excludeTypes.length) {
+    const type = tri && tri.type;
+    if (type && p.excludeTypes.includes(type)) {
+      return `its triage type (${type}) is excluded by policy`;
+    }
+  }
+  if (p.repoDeny && p.repoDeny.length && p.repoDeny.includes(repo)) {
+    return `its repo (${repo}) is denied by policy`;
+  }
+  if (p.repoAllow && p.repoAllow.length && !p.repoAllow.includes(repo)) {
+    return `its repo (${repo}) is not on the allow list`;
+  }
+  return null;
+}
+
+// XERK-486 [F]: the org's auto dispatches per rate window — its policy's
+// rateMax when set, else the fleet default. A per-org knob on a global guard:
+// the window itself (TICKET_QUEUE_RATE_WINDOW_MS) stays shared.
+function autoStartRateMax(siteKey) {
+  const p = triagePolicies[siteKey];
+  return p && Number.isInteger(p.rateMax) && p.rateMax >= 1 ? p.rateMax : TICKET_QUEUE_RATE_MAX;
+}
+
 // XERK-485 [E]: the drain's visit order. Within an org's line the priority key
 // decides (band -> type -> tier -> FIFO by `at`); across orgs the lines
 // interleave round-robin, each org's turn anchored on its OLDEST entry, so one
@@ -7331,15 +7538,38 @@ function autoStartSweep() {
       // was deliberately killed). Done with this ticket for good; drop any
       // attempt record so the map only ever holds tickets still failing.
       if (started.has(k)) { autoStarted.delete(k); continue; }
+      // XERK-486 [F]: the operator's per-ticket verdict outranks everything the
+      // model said. Hold and reject keep the ticket out of the auto stream no
+      // matter its triage block; approve forces eligibility past the triage
+      // gate AND the org policy below (but not past the ignore-tier/missing-
+      // repo filter above — that gate still applies).
+      const action = ticketTriageAction(siteKey, t.key);
+      if (action === "hold" || action === "reject") {
+        logQueueState(`triaged\x00${siteKey}\x00${logName(t.key)}`,
+          `auto-start: ${logName(t.key)} is ${action} by triage — not swept, no attempt spent`);
+        continue;
+      }
       // XERK-485 [E]: the triage gate. A ticket without a triage assessment, or
       // one the model held/rejected/flagged as a confirmed duplicate, still
       // renders on the board but is never swept — it spends no attempt, exactly
-      // like a ticket with no triaged repo. Throttled: this is a state line,
-      // re-derived every 15s.
-      const gated = triageGateReason(t);
+      // like a ticket with no triaged repo. An explicit operator approve
+      // (XERK-486) overrides it. Throttled: this is a state line, re-derived
+      // every 15s.
+      const gated = action === "approve" ? null : triageGateReason(t);
       if (gated) {
         logQueueState(`held\x00${siteKey}\x00${logName(t.key)}`,
           `auto-start: ${logName(t.key)} is ${gated} — not swept, no attempt spent`);
+        continue;
+      }
+      // XERK-486 [F]: the org's triage policy (minPriority / excludeTypes /
+      // repo allow+deny). An approve above bypasses the policy; the policy only
+      // ever adds constraints, so an org with no policy object is unrestricted.
+      const policyReason = action === "approve"
+        ? null
+        : triagePolicyReason(siteKey, t.triage, repo);
+      if (policyReason) {
+        logQueueState(`policy\x00${siteKey}\x00${logName(t.key)}`,
+          `auto-start: ${logName(t.key)} skipped by ${logName(siteKey)} triage policy — ${policyReason}`);
         continue;
       }
       // Already waiting in the hub queue — its place in line IS the pending
@@ -10909,6 +11139,32 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, runtime: auto ? "claude" : raw });
     }
 
+    // POST /api/jira/<siteKey>/<issueKey>/triage — the operator's per-ticket
+    // triage verdict (XERK-486 [F]). Body: {action:"approve"|"hold"|"reject"}
+    // to set it, {action:null} (or {clear:true}) to release back to the
+    // triage-model's call + the org policy. Hub-owned durable state exactly like
+    // the /agent /model /runtime pins: keyed "<siteKey>/<issueKey>", authoritative
+    // on return (a 200), the org must be one the fleet reports.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "triage") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const action = body.clear === true || body.action == null ? null : body.action;
+      if (action != null && !TRIAGE_ACTIONS.has(action)) {
+        return json(res, 400, { error: "body needs {action:approve|hold|reject} or {clear:true}" });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      setTicketTriageAction(siteKey, issueKey, action);
+      return json(res, 200, { ok: true, action });
+    }
+
     // POST /api/jira/<siteKey>/autostart — flip an org's auto-start opt-in
     // (XERK-41). Body: {enabled:true|false}. Hub-owned durable state, so — like
     // the /agent pin and unlike the /repo override — the save is authoritative
@@ -10971,6 +11227,30 @@ const server = http.createServer(async (req, res) => {
       }
       setDedupeLinkOrg(siteKey, body.enabled);
       return json(res, 200, { ok: true, enabled: body.enabled });
+    }
+
+    // POST /api/jira/<siteKey>/triage-policy — upsert an org's triage policy
+    // (XERK-486 [F]). Body: a patch of {minPriority?, excludeTypes?, repoAllow?,
+    // repoDeny?, rateMax?}; null values clear a knob. Hub-owned durable state
+    // like /autostart: authoritative on return, the org must be one the fleet
+    // reports, the host need not be online. The auto-start switch itself stays
+    // the on/off gate; this only shapes WHAT an enabled org auto-starts.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "triage-policy") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const p = sanitizeTriagePolicy(body);
+      if (p === null) {
+        return json(res, 400, {
+          error: "policy knobs must be {minPriority:P0|P1|P2|P3|null, excludeTypes:string[]|null, repoAllow:string[]|null, repoDeny:string[]|null, rateMax:int 1..50|null}",
+        });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      setTriagePolicy(siteKey, p);
+      return json(res, 200, { ok: true, policy: triagePolicies[siteKey] || null });
     }
 
     // POST /api/jira/<siteKey>/color — pin an org's palette color (XERK-145).
@@ -11613,6 +11893,18 @@ if (process.env.TURMA_TEST) {
     autoStopped,
     autoStartOrgs,
     setAutoStartOrg,
+    // Triage policy + per-ticket verdict (XERK-486 [F]): the stores, the policy
+    // evaluator the sweep and drain consult, the per-org rate cap, and the
+    // setters the /triage-policy and /triage routes drive.
+    triagePolicies,
+    setTriagePolicy,
+    sanitizeTriagePolicy,
+    triagePolicyReason,
+    autoStartRateMax,
+    ticketTriageActions,
+    ticketTriageAction,
+    setTicketTriageAction,
+    TRIAGE_ACTIONS_MAX,
     priorityWriteBackOrgs,
     setPriorityWriteBackOrg,
     orgsWithPriorityWriteBack,

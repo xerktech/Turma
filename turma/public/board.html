@@ -21,10 +21,17 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
       <span id="refreshLabel">Refresh</span>
     </button>
+    <button id="triagePolicy" class="board-refresh"
+      title="Decides which To Do tickets each org's auto-start sweep qualifies: minimum priority, excluded types, repo allow/deny, auto-start rate (XERK-486)">
+      Triage policy
+    </button>
   </div>
   <div id="board"></div>
   <div class="td-backdrop" id="detailBackdrop" hidden>
     <div class="td-panel" id="detailPanel" role="dialog" aria-modal="true" aria-label="Ticket detail"></div>
+  </div>
+  <div class="td-backdrop" id="policyBackdrop" hidden>
+    <div class="td-panel td-narrow" id="policyPanel" role="dialog" aria-modal="true" aria-label="Triage policy"></div>
   </div>
   <div class="footer">Each host agent polls its org's tracker — Jira Cloud (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code>) or a self-hosted/cloud Azure DevOps board (<code>AZDO_URL</code> / <code>AZDO_TOKEN</code>) in the agent's env — for tickets assigned to that user, active work plus the last two weeks of Done, and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns follow the tracker's universal status categories, with an In Review column carved out for review/testing statuses; each card's pill shows the org's own status name. The header's org filter scopes this board — and every other page — to one org; each org is labelled from its site unless the agent sets <code>BOARD_ORG_NAME</code>. The board reads the tracker; the one write it makes is creating a ticket via the New ticket button.</div>
 </div>
@@ -126,6 +133,9 @@ function render(data) {
       // Manual org-color pins (XERK-145), via TurmaOrg so the SSE event and the
       // poll feed one map.
       orgColors: TurmaOrg.orgColors(),
+      // Per-ticket triage verdicts (XERK-486 [F]): the card chip and the Triage
+      // lane read them off this map, patched by the SSE event below.
+      triageActions: data.ticketTriageActions,
     });
   });
 }
@@ -421,7 +431,10 @@ function positionGhost(g, x, y) {
 function highlightColAt(x, y) {
   if (drag.ghost) drag.ghost.style.pointerEvents = "none";
   const el = document.elementFromPoint(x, y);
-  const col = el && el.closest && el.closest(".kanban-col");
+  let col = el && el.closest && el.closest(".kanban-col");
+  // The Triage lane (XERK-486) is a computed view, not a tracker status — a
+  // drop onto it would have nowhere to move the ticket, so it never targets.
+  if (col && col.dataset.cat === "triage") col = null;
   if (col === drag.targetCol) return;
   if (drag.targetCol) drag.targetCol.classList.remove("kc-drop-into");
   drag.targetCol = col || null;
@@ -521,11 +534,15 @@ function paintDetail() {
   const agentPin = B.agentPinOf(cache && cache.ticketAgents, s.siteKey, s.key);
   const modelPin = B.modelPinOf(cache && cache.ticketModels, s.siteKey, s.key);
   const runtimePin = B.runtimePinOf(cache && cache.ticketRuntimes, s.siteKey, s.key);
+  // The operator's triage verdict (XERK-486 [F]), off the payload's
+  // ticketTriageActions like the other hub-owned pins.
+  const triageAction = B.triageActionOf(cache && cache.ticketTriageActions, s.siteKey, s.key);
   // What the Agent/Model/Runtime rows are showing, so refreshOpenTicket can
   // repaint only when a pin actually moved (same story as the repoGuess `shown`).
   s.agentPinShown = agentPin ? agentPin.host : "";
   s.modelPinShown = modelPin ? modelPin.model : "";
   s.runtimePinShown = runtimePin ? runtimePin.runtime : "";
+  s.triageActionShown = triageAction || "";
   $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
     color: B.orgColor(s.siteKey, lastAllKeys, TurmaOrg.orgColors()),
     siteKey: s.siteKey,
@@ -557,6 +574,11 @@ function paintDetail() {
     runtimeError: s.runtimeError,
     dshAvailable: !!(site && site.dshAvailable),
     qwenAvailable: !!(site && site.qwenAvailable),
+    // The triage verdict (XERK-486 [F]) is hub-owned like the pins above — the
+    // POST is authoritative the moment it returns, no online host required.
+    triageAction,
+    triageEditing: s.triageEditing,
+    triageError: s.triageError,
     // The status change writes back to Jira/Azure via the heartbeat command
     // path, so — like the Repo override, unlike the hub-owned agent/model pins —
     // it needs an online host AND the fetched detail (its statusOptions) to be
@@ -581,6 +603,10 @@ function paintDetail() {
   }
   if (s.runtimeEditing) {
     const sel = $panel.querySelector("[data-runtime-select]");
+    if (sel) sel.focus();
+  }
+  if (s.triageEditing) {
+    const sel = $panel.querySelector("[data-triage-select]");
     if (sel) sel.focus();
   }
   if (s.statusEditing) {
@@ -632,14 +658,16 @@ function refreshOpenTicket() {
   const pin = B.agentPinOf(cache && cache.ticketAgents, s.siteKey, s.key);
   const mpin = B.modelPinOf(cache && cache.ticketModels, s.siteKey, s.key);
   const rpin = B.runtimePinOf(cache && cache.ticketRuntimes, s.siteKey, s.key);
+  const tpin = B.triageActionOf(cache && cache.ticketTriageActions, s.siteKey, s.key) || "";
   const changed = shown(fresh.repoGuess) !== shown(s.ticket.repoGuess) ||
     (pin ? pin.host : "") !== (s.agentPinShown || "") ||
     (mpin ? mpin.model : "") !== (s.modelPinShown || "") ||
-    (rpin ? rpin.runtime : "") !== (s.runtimePinShown || "");
+    (rpin ? rpin.runtime : "") !== (s.runtimePinShown || "") ||
+    tpin !== (s.triageActionShown || "");
   s.ticket = fresh;
   // No picker may be swapped out from under an operator mid-edit.
   if (changed && !s.editing && !s.agentEditing && !s.modelEditing &&
-      !s.runtimeEditing && !s.statusEditing) paintDetail();
+      !s.runtimeEditing && !s.triageEditing && !s.statusEditing) paintDetail();
 }
 
 // The operator's own answer to which HOST the ticket's sessions spawn on
@@ -747,6 +775,47 @@ async function saveRuntime(value) {
     else tr[k] = { runtime: value, at: Date.now() };
   } else if (openTicketState === s) {
     s.runtimeError = err;
+  }
+  if (openTicketState === s) paintDetail();
+}
+
+// The operator's triage verdict on this ticket (XERK-486 [F]). Hub-owned like
+// the pins above: the POST is authoritative on return, and the SSE event keeps
+// every other open board in step. "Auto" releases the verdict back to the
+// triage model + the org's policy. A refusal toasts the hub's own words
+// (XERK-264) AND lands inline on the row — the optimistic paint is rolled back
+// either way, since only a 200 wrote anything.
+async function saveTriage(value) {
+  const s = openTicketState;
+  if (!s) return;
+  const body = value === "__auto__" ? { clear: true } : { action: value };
+  const k = `${s.siteKey}/${s.key}`;
+  s.triageEditing = false;
+  s.triageError = "";
+  let ok = false, err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/triage`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    ok = r.ok;
+    if (!ok) {
+      let d = {};
+      try { d = await r.json(); } catch { /* non-JSON error body */ }
+      err = d.error || `HTTP ${r.status}`;
+    }
+  } catch { err = "the hub is unreachable"; }
+  if (ok) {
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    const ta = cache.ticketTriageActions || (cache.ticketTriageActions = {});
+    if (body.clear) delete ta[k];
+    else ta[k] = { action: body.action, at: Date.now() };
+  } else if (openTicketState === s) {
+    s.triageError = err;
+    // XERK-264: a refusal reaches the operator in the hub's own words, on every
+    // page that can see it, not just on the row it failed on.
+    TurmaNav.toast(TurmaNav.refusalText(`Triage ${body.clear ? "release" : "set"} for ${s.key}`, r.status, err));
   }
   if (openTicketState === s) paintDetail();
 }
@@ -886,7 +955,7 @@ function closeDetail() {
   openTicketState = null;
   $backdrop.hidden = true;
   $panel.replaceChildren();
-  document.body.classList.remove("td-open");
+  syncOverlayLock();
   if (lastFocus && document.contains(lastFocus)) lastFocus.focus();
   lastFocus = null;
 }
@@ -934,6 +1003,171 @@ async function openDetail(key, siteKey, fromEl) {
   openTicketState.error = d.issue ? null : (d.error || "the host reported no issue");
   paintDetail();
 }
+
+// --- Per-org triage policy panel (XERK-486 [F]) --------------------------------
+// Hub-owned durable state, same posture as the org color pin: the POST is
+// authoritative on return and the SSE event (triagePolicies) keeps every other
+// open board in step. The panel paints the selected org's current knobs; Save
+// POSTs a full patch (empty knobs send null, which clears them) and the hub's
+// answer — the merged policy — becomes the local truth.
+const $policyBackdrop = document.getElementById("policyBackdrop");
+const $policyPanel = document.getElementById("policyPanel");
+const $policyBtn = document.getElementById("triagePolicy");
+let policySiteKey = null;
+let policyBusy = false;
+let policyErr = "";
+
+const POLICY_TYPES = ["bug", "task", "feature", "improvement", "chore", "documentation", "other"];
+
+// The orgs this panel can edit: those in scope under the header's org filter
+// (empty filter = every org the fleet reports).
+function policySites() {
+  const keys = TurmaOrg.getKeys();
+  return keys.length ? lastSites.filter(s => keys.includes(s.siteKey)) : lastSites;
+}
+
+function policyPanelHtml() {
+  const sites = policySites();
+  if (!sites.length) return "";
+  if (!policySiteKey || !sites.some(s => s.siteKey === policySiteKey)) {
+    policySiteKey = sites[0].siteKey;
+  }
+  const single = sites.length === 1;
+  const p = (cache && cache.triagePolicies && cache.triagePolicies[policySiteKey]) || {};
+  const orgRow = single
+    ? `<div class="tp-field"><span>Org</span><input type="text" value="${esc(B.orgName(policySiteKey, sites[0].orgName))}" disabled></div>`
+    : `<label class="tp-field"><span>Org</span><select data-policy-org="1">` +
+      sites.map(s => `<option value="${esc(s.siteKey)}"${s.siteKey === policySiteKey ? " selected" : ""}>${esc(B.orgName(s.siteKey, s.orgName))}</option>`).join("") +
+      `</select></label>`;
+  const prioOpts = ["", "P0", "P1", "P2", "P3"].map(v =>
+    `<option value="${v}"${(p.minPriority || "") === v ? " selected" : ""}>${v ? `${v} and higher` : "Any priority"}</option>`).join("");
+  const typeChecks = POLICY_TYPES.map(t =>
+    `<label class="tp-check"><input type="checkbox" data-policy-type="${esc(t)}"${(p.excludeTypes || []).includes(t) ? " checked" : ""}> ${esc(t)}</label>`).join("");
+  const csv = (arr) => (arr || []).join(", ");
+  return `<div class="td-head">
+      <span class="tp-title">Triage policy</span>
+      <button type="button" class="td-close" data-policy-close="1" aria-label="Close">✕</button>
+    </div>
+    ${orgRow}
+    <p class="tp-note">Decides which To Do tickets the org's auto-start sweep queues.
+      The org's auto-start switch (header, org menu) must be on for anything to
+      auto-start; a per-ticket approve / hold / reject verdict overrides this policy.</p>
+    <label class="tp-field"><span>Minimum auto-start priority</span>
+      <select data-policy-minprio="1">${prioOpts}</select></label>
+    <div class="tp-field"><span>Excluded triage types</span>
+      <div class="tp-checks">${typeChecks}</div></div>
+    <label class="tp-field"><span>Allowed repos (comma-separated, empty = all)</span>
+      <input type="text" data-policy-allow="1" placeholder="acme/web, acme/api" value="${esc(csv(p.repoAllow))}"></label>
+    <label class="tp-field"><span>Denied repos (comma-separated, deny wins)</span>
+      <input type="text" data-policy-deny="1" placeholder="acme/scratch" value="${esc(csv(p.repoDeny))}"></label>
+    <label class="tp-field"><span>Max auto-starts per 15 min (empty = default)</span>
+      <input type="number" min="1" max="50" data-policy-rate="1" value="${p.rateMax != null ? p.rateMax : ""}"></label>
+    ${policyErr ? `<div class="tp-err">${esc(policyErr)}</div>` : ""}
+    <div class="cf-actions">
+      <button type="button" class="cf-btn" data-policy-cancel="1">Cancel</button>
+      <button type="button" class="cf-btn cf-primary" data-policy-save="1"${policyBusy ? " disabled" : ""}>${policyBusy ? "Saving…" : "Save policy"}</button>
+    </div>`;
+}
+
+function paintPolicyPanel() {
+  const html = policyPanelHtml();
+  if (html) $policyPanel.innerHTML = html;
+}
+
+function openPolicyPanel() {
+  if (!policySites().length) return;
+  policyErr = "";
+  paintPolicyPanel();
+  $policyBackdrop.hidden = false;
+  syncOverlayLock();
+  const sel = $policyPanel.querySelector("[data-policy-org]") || $policyPanel.querySelector("[data-policy-minprio]");
+  if (sel) sel.focus();
+}
+
+function closePolicyPanel() {
+  $policyBackdrop.hidden = true;
+  policyErr = "";
+  syncOverlayLock();
+}
+
+// Either overlay locks the page scroll; release it only when both are closed.
+function syncOverlayLock() {
+  document.body.classList.toggle("td-open", !!(openTicketState || !$policyBackdrop.hidden));
+}
+
+// Read the current form fields into the patch shape the hub expects; empty
+// knobs become null, and setTriagePolicy clears them. Returns null on an
+// in-form validation failure (rate out of range), after painting the error.
+function readPolicyPatch() {
+  const minP = $policyPanel.querySelector("[data-policy-minprio]");
+  const types = [...$policyPanel.querySelectorAll("[data-policy-type]:checked")].map(c => c.dataset.policyType);
+  const csv = (sel) => (sel.value || "").split(",").map(s => s.trim()).filter(Boolean);
+  const rateRaw = ($policyPanel.querySelector("[data-policy-rate]") || {}).value;
+  const rate = rateRaw === "" ? null : Number(rateRaw);
+  if (rateRaw !== "" && (!Number.isInteger(rate) || rate < 1 || rate > 50)) {
+    policyErr = "max auto-starts must be a whole number between 1 and 50 (or empty for the default)";
+    return null;
+  }
+  const allow = csv($policyPanel.querySelector("[data-policy-allow]"));
+  const deny = csv($policyPanel.querySelector("[data-policy-deny]"));
+  return {
+    minPriority: (minP && minP.value) || null,
+    excludeTypes: types.length ? types : null,
+    repoAllow: allow.length ? allow : null,
+    repoDeny: deny.length ? deny : null,
+    rateMax: rate,
+  };
+}
+
+async function savePolicy() {
+  if (policyBusy || !policySiteKey) return;
+  const patch = readPolicyPatch();
+  if (patch === null) return void paintPolicyPanel();
+  const siteKey = policySiteKey;
+  const prevPolicies = cache && cache.triagePolicies;
+  policyBusy = true;
+  paintPolicyPanel();
+  let ok = false, err = "", status = 0, policy = null;
+  try {
+    const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/triage-policy`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(patch) });
+    status = r.status;
+    if (r.status === 401) { location.href = "/login"; return; }
+    let d = {};
+    try { d = await r.json(); } catch { /* non-JSON error body */ }
+    ok = r.ok;
+    if (!ok) err = d.error || `HTTP ${r.status}`;
+    else policy = d.policy;
+  } catch { err = "the hub is unreachable"; }
+  policyBusy = false;
+  if (ok) {
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    const tp = cache.triagePolicies || (cache.triagePolicies = {});
+    if (policy) tp[siteKey] = policy; else delete tp[siteKey];
+    policyErr = "";
+    paintPolicyPanel();
+    return;
+  }
+  // XERK-264: roll the optimistic paint back and toast the hub's own words.
+  if (cache && prevPolicies) cache.triagePolicies = prevPolicies;
+  policyErr = err;
+  paintPolicyPanel();
+  TurmaNav.toast(TurmaNav.refusalText(`Triage policy for ${siteKey}`, status, err));
+}
+
+$policyBtn.addEventListener("click", openPolicyPanel);
+$policyPanel.addEventListener("click", (e) => {
+  if (e.target.closest("[data-policy-close]") || e.target.closest("[data-policy-cancel]")) {
+    return closePolicyPanel();
+  }
+  if (e.target.closest("[data-policy-save]")) savePolicy();
+});
+$policyPanel.addEventListener("change", (e) => {
+  const org = e.target.closest("[data-policy-org]");
+  if (org) { policySiteKey = org.value; policyErr = ""; paintPolicyPanel(); }
+});
+$policyBackdrop.addEventListener("click", (e) => { if (e.target === $policyBackdrop) closePolicyPanel(); });
 
 // Delegated: the board re-renders on every beat, so per-card listeners would be
 // re-bound constantly (and leak). The card's own interactive children are left
@@ -1032,6 +1266,15 @@ $panel.addEventListener("click", (e) => {
     openTicketState.runtimeEditing = false;
     return paintDetail();
   }
+  if (e.target.closest("[data-triage-edit]")) {
+    openTicketState.triageEditing = true;
+    openTicketState.triageError = "";   // a new attempt clears the old complaint
+    return paintDetail();
+  }
+  if (e.target.closest("[data-triage-cancel]")) {
+    openTicketState.triageEditing = false;
+    return paintDetail();
+  }
   if (e.target.closest("[data-status-edit]")) {
     openTicketState.statusEditing = true;
     openTicketState.statusError = "";   // a new attempt clears the old complaint
@@ -1089,6 +1332,18 @@ $panel.addEventListener("change", (e) => {
     }
     return void saveRuntime(rsel.value);
   }
+  // The triage verdict follows the same contract (XERK-486): a pick IS the
+  // save, a re-pick of the current verdict saves nothing but closes the picker.
+  const tsel = e.target.closest("[data-triage-select]");
+  if (tsel) {
+    const pin = B.triageActionOf(cache && cache.ticketTriageActions,
+      openTicketState.siteKey, openTicketState.key);
+    if (tsel.value === B.triagePickerValue(pin)) {
+      openTicketState.triageEditing = false;
+      return paintDetail();
+    }
+    return void saveTriage(tsel.value);
+  }
   // The status picker follows the same contract; its "keep current" first
   // option is the no-op (XERK-138).
   const ssel = e.target.closest("[data-status-select]");
@@ -1108,7 +1363,11 @@ $panel.addEventListener("change", (e) => {
   saveRepo(sel.value);
 });
 $backdrop.addEventListener("click", (e) => { if (e.target === $backdrop) closeDetail(); });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && openTicketState) closeDetail(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (!openTicketState && !$policyBackdrop.hidden) return closePolicyPanel();
+  if (openTicketState) closeDetail();
+});
 
 // --- Manual refresh ---------------------------------------------------------
 // The board is a merge of every host's Jira block, so the button re-polls the
@@ -1265,6 +1524,28 @@ function connectSSE() {
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.orgColors = oc;
     scheduleRender();
+  });
+  // A per-ticket triage verdict changed (XERK-486 [F]) — same tiny-whole-map
+  // pattern. Repaints the card chips and moves a held ticket into the Triage
+  // lane (or back out of it) on every open board.
+  es.addEventListener("triageActions", (e) => {
+    let ta;
+    try { ta = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.ticketTriageActions = ta;
+    scheduleRender();
+  });
+  // An org's triage policy changed (XERK-486 [F]) — same pattern; the policy
+  // panel re-reads this on open and the next render picks it up.
+  es.addEventListener("triagePolicies", (e) => {
+    let tp;
+    try { tp = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.triagePolicies = tp;
+    scheduleRender();
+    // A policy changed from another tab: re-paint the open panel in place so
+    // it shows the hub's new truth (same posture as the org color pins).
+    if (!$policyBackdrop.hidden) paintPolicyPanel();
   });
   // An org's auto-start opt-in changed (XERK-41) — same tiny-whole-map pattern
   // as ticketAgents; keeps every open page's switches in step. The switches live
