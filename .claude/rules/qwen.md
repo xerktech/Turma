@@ -102,6 +102,20 @@ Deliberately CLOSE to `_launch_tmux`, not the dsh driver.
   `chatRecording:true` (REQUIRED for the on-disk transcript + resume), `disableAutoUpdate` (a pinned
   fleet must not let the binary drift under the parsers), `folderTrust:false`, and
   `approvalMode:"auto"` + `autoAccept:true` (hands-off, the `--permission-mode auto` analogue).
+- **`ui.useTerminalBuffer:false` is a FLICKER pin, not a preference.** qwen's default alt-screen
+  "virtualized viewport" is gated only on `isInteractiveTerminal()` (real TTY + `TERM!="dumb"`),
+  which the tmux pane satisfies, so it turns ON with a heavy full-region repaint: `?1049` + `?2J` +
+  cursor-home at entry, `?2J` recurring on stream/resize, plus per-frame erase-line (`?2K`) churn
+  (~4.6x append-only's byte volume under real streaming). Append-only emits none of the alt-screen/
+  `?2J`/cursor-home and far less churn. qwen wraps frames in synchronized-output (`?2026`) to hide
+  the repaint, but ttyd 1.7.4's xterm.js has NO mode-2026 support, so that churn renders
+  progressively in the browser = flicker. Claude Code is smooth in this SAME pipeline only because
+  it writes history incrementally to scrollback; `false` gives qwen that discipline. The trade is
+  qwen's in-app viewport extras (in-app scroll, click-a-menu-option, hover) — xterm.js owns
+  scrollback and a Claude session never had them. Host-proof only (qwen not in CI): the render-mode
+  flip is measured off the real binary's escape output; QA confirmed the byte-churn mechanism under
+  real model streaming but headless browsers cannot capture the sub-frame TEARING that IS the
+  flicker, so the perceptual symptom is proven-by-mechanism, not directly observed.
 - **The safety guard ([Qwen F]) is wired into `_qwen_settings`.** `approvalMode:"auto"` runs tools
   unattended, so a launcher WITHOUT the guard is unguarded — the load-bearing reason `QWEN_ENABLED`
   stays False.

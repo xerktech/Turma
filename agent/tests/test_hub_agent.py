@@ -4373,6 +4373,11 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         self.assertTrue(settings["general"]["disableAutoUpdate"])
         self.assertEqual(settings["tools"]["approvalMode"], "auto")
         self.assertFalse(settings["security"]["folderTrust"]["enabled"])
+        # Append-only scrollback rendering, NOT qwen's alt-screen "virtualized
+        # viewport" — the viewport does heavy full-region repaints that flicker
+        # through ttyd's xterm.js (no mode-2026 batching); false gives Claude's
+        # smooth incremental style in the same pipeline (XERK-flicker).
+        self.assertFalse(settings["ui"]["useTerminalBuffer"])
         # The context file is a TURMA-specific name (never the conventional
         # QWEN.md), so it can't clobber a repo's own tracked QWEN.md.
         self.assertEqual(settings["context"]["fileName"], ha.QWEN_CONTEXT_FILENAME)
