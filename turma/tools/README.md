@@ -73,6 +73,14 @@ estimate can never lower a measured day.
   under-count its per-host view by that much, and the spend was real. Expect that
   host's repo list to grow several-fold, permanently.
 
+  The **`hub-agent-mgr-*` scratch slugs and `.turma`** (agent overhead, never a real
+  repo) are now **folded at serve time** into one `Turma-System-Usage` block on the
+  Usage page — `isSystemUsageRepo`/`repoBlocks` in `usage-ledger.js`, non-destructive
+  (the stored series are untouched). The other bare names the recover run can produce
+  (`git`, a home-dir username, `tmp`) are host-specific, so add them to
+  `USAGE_SYSTEM_REPOS` (CSV, hub env) to fold them too — after confirming from the
+  archive each is not real repo work.
+
 ### Running it
 
 Dry run (the default) prints the estimate and writes nothing:

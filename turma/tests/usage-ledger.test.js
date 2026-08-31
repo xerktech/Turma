@@ -702,6 +702,114 @@ test("ingesting never aliases or mutates the record it was handed", () => {
   assert.equal(JSON.stringify(record), before);
 });
 
+// ---- the system-usage fold --------------------------------------------------
+//
+// Agent-overhead repo series (the manager's own `claude -p` helpers, banked here
+// as phantom repos by a `recover-usage-from-archive` run) fold at SERVE time into
+// one `Turma-System-Usage` block instead of listing dozens of junk repos on the
+// Usage page. Non-destructive: the stored series are untouched, so this runs in
+// `repoBlocks`, the choke point both `fold` and `retiredAgents` reach.
+
+const { SYSTEM_USAGE_REPO, isSystemUsageRepo } = ledger;
+
+// A heartbeat whose repos key remoteKey === repo, the shape the recover tool
+// bank (no `rk-` origin, since these have no git remote).
+function overheadBeat(repos, opts = {}) {
+  return {
+    device: opts.device || "maxai",
+    jira: { siteKey: "XERK" },
+    usage: usage({ [DAY]: 100 }),
+    repoUsage: Object.entries(repos).map(([repo, d]) => ({
+      repo, remoteKey: repo, remote: "", usage: usage(d),
+    })),
+  };
+}
+const names = (list) => list.map((r) => r.remoteKey).sort();
+
+test("isSystemUsageRepo matches the manager's overhead, never a real repo", () => {
+  // Overhead: the temp-dir repo name, its worktree-shaped slug forms, and the
+  // agent's own home dir.
+  for (const v of ["hub-agent-mgr-z2rtwr4", "hub-agent-mgr-00d_zcu0",
+                   "-tmp-hub-agent-mgr-abcd1234", "-tmp-claude-0-tmp-hub-agent-mgr-x",
+                   ".turma"]) {
+    assert.equal(isSystemUsageRepo(v, v), true, v);
+  }
+  // A real repo that merely CONTAINS the substring, and ordinary repos, are not.
+  for (const v of ["my-hub-agent-mgr-tool", "hub-agent-manager", "turma", "Turma",
+                   "git", "AgentHub", "ArgoCD"]) {
+    assert.equal(isSystemUsageRepo(v, v), false, v);
+  }
+  // Either field triggers it — the classifier checks remoteKey AND repo.
+  assert.equal(isSystemUsageRepo("rk-x", "hub-agent-mgr-x"), true);
+  assert.equal(isSystemUsageRepo("hub-agent-mgr-x", "rk-x"), true);
+});
+
+test("retired: overhead repos fold into one Turma-System-Usage block", () => {
+  reset();
+  ledger.ingest("maxai", overheadBeat({
+    Turma: { [DAY]: 100 },
+    "hub-agent-mgr-aaa": { [DAY]: 5 },
+    "hub-agent-mgr-bbb": { [DAY]: 7 },
+    ".turma": { [DAY]: 3 },
+  }), now);
+  const [rec] = ledger.retiredAgents([], now);
+  // The three phantom repos are gone; one honest system block replaces them.
+  assert.deepEqual(names(rec.repoUsage), ["Turma", SYSTEM_USAGE_REPO]);
+  // ADDITIVE across distinct repos (5+7+3), not a high-water max.
+  assert.equal(repoTotal(rec.repoUsage, SYSTEM_USAGE_REPO), 15);
+  assert.equal(bucketTokens(
+    rec.repoUsage.find((r) => r.remoteKey === SYSTEM_USAGE_REPO).usage.days[DAY]), 15);
+  // The real repo is untouched.
+  assert.equal(repoTotal(rec.repoUsage, "Turma"), 100);
+});
+
+test("live-augmented: overhead banked in the store but no longer reported still folds", () => {
+  reset();
+  // Beat 1 reports a real repo and two overhead ones; beat 2 (the sanitized
+  // agent) reports only the real repo — so the store holds overhead the report
+  // does not, `augments` is true, and `fold` runs.
+  ledger.ingest("h", overheadBeat({
+    Turma: { [DAY]: 40 }, "hub-agent-mgr-aaa": { [DAY]: 5 }, "hub-agent-mgr-bbb": { [DAY]: 7 },
+  }), now);
+  const beat2 = overheadBeat({ Turma: { [DAY]: 40 } });
+  ledger.ingest("h", beat2, now);
+  const out = ledger.fold("h", beat2, now);
+  assert.notEqual(out, null);
+  assert.deepEqual(names(out.repoUsage), ["Turma", SYSTEM_USAGE_REPO]);
+  assert.equal(repoTotal(out.repoUsage, SYSTEM_USAGE_REPO), 12);
+});
+
+test("foldSystemRepos is pure, idempotent, and unchanged-ref when nothing folds", () => {
+  const block = (repo, n) => ({ repo, remoteKey: repo, remote: "", usage: usage({ [DAY]: n }) });
+  // No overhead → the SAME array reference back (byte-for-byte served payload).
+  const clean = [block("Turma", 100), block("git-tool", 5)];
+  assert.equal(ledger.foldSystemRepos(clean), clean);
+  // Overhead present → a new list, phantoms replaced by one system block.
+  const mixed = [block("Turma", 100), block("hub-agent-mgr-a", 5), block(".turma", 3)];
+  const folded = ledger.foldSystemRepos(mixed);
+  assert.notEqual(folded, mixed);
+  assert.deepEqual(folded.map((r) => r.remoteKey).sort(), ["Turma", SYSTEM_USAGE_REPO]);
+  assert.equal(totalOf(folded.find((r) => r.remoteKey === SYSTEM_USAGE_REPO).usage), 8);
+  // Idempotent: re-folding the folded list makes no second system block.
+  const again = ledger.foldSystemRepos(folded);
+  assert.equal(again, folded);
+  // A non-array is passed through untouched.
+  assert.equal(ledger.foldSystemRepos(undefined), undefined);
+});
+
+test("a fleet with no overhead is unchanged — no system block, still served raw", () => {
+  reset();
+  const b = beat({ [DAY]: 100 }, { r: { [DAY]: 100 } });
+  ledger.ingest("h", b, now);
+  // Nothing beyond the report → null → the record reaches the client as sent.
+  assert.equal(ledger.fold("h", b, now), null);
+  // And a retired host with only real repos grows no system block.
+  reset();
+  ledger.ingest("h", beat({ [DAY]: 100 }, { r: { [DAY]: 100 } }), now);
+  const [rec] = ledger.retiredAgents([], now);
+  assert.deepEqual(names(rec.repoUsage), ["rk-r"]);
+});
+
 test.after(() => {
   for (const f of [LEDGER, `${LEDGER}.oversized`]) {
     try { fs.unlinkSync(f); } catch { /* already gone */ }
