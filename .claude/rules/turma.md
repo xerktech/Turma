@@ -244,7 +244,10 @@ the total is measured.
   strips), which a scroll-up leaves parked above the tail. The pill drives qwen's own scroll down by
   dispatching wheel-DOWN events on `.xterm` (the SAME primitive `TERM_TOUCH_SCROLL` uses, and the
   gesture the operator scrolls qwen with — so it needs no knowledge of qwen's key map), repeating
-  until the visible screen stops changing (qwen clamps). **Gated by `agentType` server-side**
+  until the visible screen stops changing (qwen clamps). **A STREAMING turn's footer animates every
+  frame and never "settles", so during an active turn (detected from the busy footer) it stops at a
+  tight cap and lets qwen auto-follow the tail — without that it spins to the idle safety cap.**
+  **Gated by `agentType` server-side**
   (`findSession` carries it), never client-side, so Claude's composer never takes a stray Down-arrow.
 - **Android's `TerminalScreen` loads the same `/term/<id>/` in a WebView**, so this injection reaches
   it with no android change — it is server plumbing, not a `turma/public/` control, so parity-exempt.

@@ -552,8 +552,12 @@ test("OSC 52 bridge survives a malformed payload", () => {
 // scrolls, and a queued setTimeout the test drains by hand. scrollPos models
 // qwen's OWN scroll (viewportY stays 0, the drawn rows change), clamped at
 // maxScroll so an over-scroll is a no-op, exactly as the real TUI clamps.
-function runScrollBottom({ maxScroll = 5, rows = 24, startAt = 0, withTerm = true } = {}) {
-  let scrollPos = startAt;
+// `animate` models qwen's real busy footer: a "esc to cancel" line 6 rows above
+// the bottom (INSIDE the compare region) whose token changes every wheel event,
+// exactly as QA found in docs/qwen-g0/pane/02-busy.txt — the case that made the
+// old fixed-TAIL settle test spin to the cap.
+function runScrollBottom({ maxScroll = 5, rows = 24, startAt = 0, withTerm = true, animate = false } = {}) {
+  let scrollPos = startAt, frame = 0;
   const wheelDeltas = [];
   const timers = [];
   let clickHandler = null, globalWheel = null, appended = null;
@@ -561,12 +565,16 @@ function runScrollBottom({ maxScroll = 5, rows = 24, startAt = 0, withTerm = tru
     rows,
     buffer: { active: {
       viewportY: 0,
-      getLine: (i) => ({ translateToString: () => "row" + (scrollPos + i) }),
+      getLine: (i) => ({ translateToString: () => (
+        animate && i === rows - 6 ? "working… esc to cancel (" + frame + " tokens)"
+          : "row" + (scrollPos + i)
+      ) }),
     } },
   };
   const xterm = {
     dispatchEvent: (ev) => {
       wheelDeltas.push(ev.deltaY);
+      frame++; // a streaming turn redraws every frame regardless of scroll
       if (ev.deltaY > 0) scrollPos = Math.min(maxScroll, scrollPos + 1);
       else if (ev.deltaY < 0) scrollPos = Math.max(0, scrollPos - 1);
       return true;
@@ -607,16 +615,31 @@ test("scroll-to-bottom: wires a hidden Bottom button into the page", () => {
 });
 
 test("scroll-to-bottom: clicking drives qwen's scroll to the tail with wheel-DOWN only", () => {
-  const t = runScrollBottom({ maxScroll: 5, startAt: 0 });
+  // maxScroll (20) exceeds one BURST (8), so reaching the tail genuinely needs
+  // several passes — the test exercises the multi-pass settle loop, not a single
+  // burst that happens to clamp.
+  const t = runScrollBottom({ maxScroll: 20, startAt: 0 });
   t.click();
   t.drain();
-  assert.equal(t.scrollPos(), 5, "reaches the bottom (clamped at maxScroll)");
-  assert.ok(t.wheelDeltas.length > 0, "dispatched wheel events");
+  assert.equal(t.scrollPos(), 20, "reaches the bottom (clamped at maxScroll)");
+  assert.ok(t.wheelDeltas.length >= 24, "took multiple bursts to get there");
   assert.ok(t.wheelDeltas.every((d) => d > 0), "every dispatched wheel is DOWN — never up");
-  // Stops on the first pass where the screen no longer changes, so it never
-  // approaches the MAX safety cap on an ordinary scroll.
-  assert.ok(t.wheelDeltas.length <= 40, "settles quickly rather than spinning to the cap");
+  // Stops the first pass the screen no longer changes, so it never approaches the
+  // MAX safety cap on an ordinary idle scroll.
+  assert.ok(t.wheelDeltas.length <= 40, "settles once clamped rather than spinning to the cap");
   assert.equal(t.button.style.display, "none", "hides itself once it clamps at the bottom");
+});
+
+test("scroll-to-bottom: an active streaming turn stops at the tight cap, not the runaway MAX", () => {
+  // The regression QA caught: an animating busy footer changes the snapshot every
+  // pass regardless of scroll, so the settle test never trips. With an unbounded
+  // scroll and a live turn, the loop must stop at ACTIVE_MAX (64), NOT MAX (800).
+  const t = runScrollBottom({ maxScroll: 100000, startAt: 0, animate: true });
+  t.click();
+  t.drain();
+  assert.ok(t.wheelDeltas.length <= 64, "capped at ACTIVE_MAX during a streaming turn");
+  assert.ok(t.wheelDeltas.length < 100, "nowhere near the 800-event runaway");
+  assert.ok(t.wheelDeltas.every((d) => d > 0), "still only wheel-DOWN");
 });
 
 test("scroll-to-bottom: already at the tail is a harmless no-op", () => {
@@ -3444,6 +3467,17 @@ test("findSession routes a sessionId to its host and ttyd port", async () => {
   assert.deepEqual(findSession("zz222"), { host: "h3", port: 7706, agentType: "qwen" });
   assert.deepEqual(findSession("zz111"), { host: "h3", port: 7705, agentType: undefined });
   assert.equal(findSession("nope"), null);
+});
+
+test("findSession: QWEN_ENABLED off coerces agentType away, suppressing the scroll pill", async () => {
+  // afterEach leaves QWEN_ENABLED false, so this runs with the kill-switch off.
+  // normalizeSessions blanks a reported agentType:"qwen" to "" on ingest, so
+  // findSession — and therefore proxyTerm — sees "" and injects no pill.
+  await request("POST", "/api/heartbeat", {
+    body: { device: "qoff", sessions: [{ id: "qq1", ttydPort: 7799, agentType: "qwen" }] },
+    headers: agentHeaders,
+  });
+  assert.deepEqual(findSession("qq1"), { host: "qoff", port: 7799, agentType: "" });
 });
 
 // ---- CORS on /api and /term (glasses WebView client) --------------------------
