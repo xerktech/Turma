@@ -54,7 +54,12 @@
     display: flex; align-items: baseline; justify-content: space-between;
     gap: 10px; margin-bottom: 10px;
   }
-  .lim-host { font-weight: 600; font-size: 13px; color: var(--ink); }
+  /* The heading now carries a subscription NAME (XERK-541), not just short host
+     names, so it must wrap rather than shove the age out of the flex row. */
+  .lim-host {
+    font-weight: 600; font-size: 13px; color: var(--ink);
+    min-width: 0; word-break: break-word;
+  }
   /* The hosts on a NAMED subscription card (XERK-541): a subtitle under the
      name, since the name has taken the heading. Pulled up under the head's
      bottom margin so it reads as a pair with it. */
