@@ -644,10 +644,11 @@ function codingAgent(a) {
   const m = raw.match(/^(\S+)\s+\((.+)\)$/);
   return m ? `${m[2]} ${m[1]}` : `Claude Code ${raw}`;
 }
-// The one-line "what this host runs, at what version" summary for a COLLAPSED
-// host header (XERK-539): the coding agent and its version, plus the Turma agent
-// version — the same two facts Android shows in its collapsed card header. The
-// expanded card repeats them in `.host-meta` alongside memory/uptime/repos root.
+// The one-line "what this host runs, at what version" summary shown under the
+// hostname in every host header (XERK-539): the coding agent and its version,
+// plus the Turma agent version — the same two facts Android shows in its card
+// header. Rendered whether the card is collapsed or expanded so it never moves;
+// `.host-meta` no longer repeats them.
 function hostVerLine(a) {
   return `${codingAgent(a)} · Turma ${a.agentVersion || "–"}`;
 }
