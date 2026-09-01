@@ -2674,12 +2674,17 @@ HEARTBEAT_REPLY_MAX = 8 * 1024 * 1024
 # and repeat forever, discarding every command the hub sent (XERK-365). We
 # raise the limit deliberately: the reply is already bounded to
 # HEARTBEAT_REPLY_MAX bytes by the read below, so no literal in it can exceed
-# that many digits, and parsing an int that large is measured at ~4s worst
-# case — well under the hub's OFFLINE_AFTER_MS, so this respects the beat-loop
-# budget (XERK-395). Process-global (there is no scoped form), which is safe:
-# every other JSON the agent parses is a bounded read too. A truncated read or
-# genuinely malformed body still fails to parse, which post() now reports
-# distinctly from a beat that never reached the hub.
+# that many digits. Parsing an int that large is O(n^2) in the digit count —
+# ~12s worst case measured on x86 for a full 8 MiB single literal — so it stays
+# under the hub's 75s OFFLINE_AFTER_MS and respects the beat-loop budget
+# (XERK-395), but the margin is real, not the trivial cost a small limit would
+# give: only a compromised/broken hub reaches it, and even then a bounded slow
+# beat beats the pre-fix infinite wedge. Process-global (there is no scoped
+# form), which is why the same O(n^2) cost now applies to the other on-beat
+# external-JSON parses too (refresh_jira/pr/github) — bounded reads all, first-
+# party APIs, so an equally unlikely trigger. A truncated read or genuinely
+# malformed body still fails to parse, which post() now reports distinctly from
+# a beat that never reached the hub.
 if hasattr(sys, "set_int_max_str_digits"):
     try:
         sys.set_int_max_str_digits(max(HEARTBEAT_REPLY_MAX,
