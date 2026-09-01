@@ -46,10 +46,10 @@ class SessionsTest {
     // The card's wording, which no test covered — a QA mutation pass removed the
     // background-agent branch of liveStateLabel and every gate stayed green.
     @Test fun `liveStateLabel names background agents and pluralizes them`() {
-        val one = LiveSignals(agents = listOf(com.xerktech.turma.model.LiveAgent(type = "qa")))
+        val one = LiveSignals(agents = listOf(com.xerktech.turma.model.LiveAgent(type = "Explore")))
         val two = LiveSignals(agents = listOf(
-            com.xerktech.turma.model.LiveAgent(type = "qa"),
             com.xerktech.turma.model.LiveAgent(type = "Explore"),
+            com.xerktech.turma.model.LiveAgent(type = "general-purpose"),
         ))
         assertEquals("1 background agent",
             com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, one))
@@ -61,6 +61,21 @@ class SessionsTest {
         assertEquals("working", com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, null))
         assertEquals("idle", com.xerktech.turma.ui.liveStateLabel(LiveState.IDLE, one))
         assertEquals("waiting", com.xerktech.turma.ui.liveStateLabel(LiveState.WAITING, one))
+    }
+
+    // XERK-538: a QA / QA-delta pass reads "QA Review" while the card stays
+    // WORKING (Active) — matching the web's qaReviewing/agentWorkLabel.
+    @Test fun `liveStateLabel reads QA Review for a QA agent`() {
+        val qa = LiveSignals(agents = listOf(com.xerktech.turma.model.LiveAgent(type = "qa")))
+        // qa-delta wins even beside an ordinary agent.
+        val delta = LiveSignals(agents = listOf(
+            com.xerktech.turma.model.LiveAgent(type = "Explore"),
+            com.xerktech.turma.model.LiveAgent(type = "qa-delta"),
+        ))
+        assertEquals("QA Review", com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, qa))
+        assertEquals("QA Review", com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, delta))
+        // Only while WORKING — an idle/waiting card keeps its plain word.
+        assertEquals("idle", com.xerktech.turma.ui.liveStateLabel(LiveState.IDLE, qa))
     }
 
     @Test fun `a session waiting on background agents is not ready for review`() {
