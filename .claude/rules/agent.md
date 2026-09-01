@@ -30,6 +30,20 @@ Safety-guard policy: `agent-hooks.md`.
   persisted `ttydPid` is alive; `_kill_ttyd` reaps that pid so an adopted ttyd isn't leaked. Tests:
   `TestResumeOnBootAdopt`.
 
+- **No call on the BEAT LOOP may raise** — `run_forever` is the container's MAIN process
+  (`entrypoint.sh` execs it with no retry loop of its own, unlike the tunnel's `while :`), so an
+  exception reaching it is not a skipped cycle: the container exits and every session on the host
+  goes with it. A field/thread-start/parse on the beat that can throw needs a try/except (or a
+  `.get()`), logging + letting the next beat retry. This is the RAISE half; the TIME half (a call's
+  worst case must stay under `OFFLINE_AFTER_MS`) is in `CLAUDE.md`. Known-guarded beat-loop sites:
+  `queue_archive_sync` + `_archive_known` (XERK-395/424, `agent-archive.md`), and
+  `_start_limits_probe`'s thread start + `_session_payload`'s registry-field reads (XERK-402 — a
+  legacy/hand-edited/partial `~/.turma/sessions.json` missing a key; every field is read `.get()`
+  with `None` the "can't tell" value, matching `_closed_payload`). Tests:
+  `test_staging_never_raises_onto_the_beat`,
+  `TestLimitsSnapshot.test_the_thread_start_never_raises_onto_the_beat`,
+  `TestSessionPayloadNeverRaises`.
+
 ## Commands
 
 Lifecycle (`spawn`/`kill`/`start`/`restart`/`delete`/`resume`/`resumeTranscript`) per the session

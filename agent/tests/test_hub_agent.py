@@ -6330,6 +6330,104 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         self.assertFalse(ha._looks_like_internal_tool_prompt("ok"))
         self.assertFalse(ha._looks_like_internal_tool_prompt("ok, ship the probe"))
 
+    def test_the_thread_start_never_raises_onto_the_beat(self):
+        # _start_limits_probe is called from build_payload ON THE BEAT LOOP, the
+        # agent's main process with no retry (entrypoint.sh execs run_forever).
+        # Thread.start() raises RuntimeError("can't start new thread") at the
+        # pid/thread ceiling — a live possibility on a host at the compose
+        # pids_limit — and unguarded that would exit the container and take every
+        # session on the host down (XERK-402). The guard swallows it, logs, and
+        # leaves the probe retryable (a never-started thread's is_alive() False).
+        sm = self.make_manager()
+
+        class _CeilingThread:
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+            def is_alive(self):
+                return False
+
+        with mock.patch.object(ha.threading, "Thread", _CeilingThread):
+            sm._start_limits_probe()  # must not raise
+        # The failed start left no live probe thread, so the next beat retries.
+        self.assertFalse(getattr(sm, "_limits_probe", None).is_alive())
+        # And a subsequent beat is free to start a real one (single-flight sees
+        # the dead thread and proceeds rather than short-circuiting forever).
+        with mock.patch.object(sm, "_run_limits_probe", lambda settings: None):
+            sm._start_limits_probe()
+            probe = sm._limits_probe
+            probe.join(5)
+        self.assertFalse(probe.is_alive())
+
+
+class TestSessionPayloadNeverRaises(ManagerMixin, unittest.TestCase):
+    """_session_payload builds one dict per registry record ON THE BEAT LOOP, the
+    agent's main process with no retry, so a partial/legacy/hand-edited
+    ~/.turma/sessions.json record (missing repoPath/branch/etc.) must degrade to
+    None, never raise KeyError and take the whole host down (XERK-402). Only
+    reachable from a sessions.json the agent did not write itself — precisely the
+    situation an operator is in while editing that file to recover a host."""
+
+    def test_a_record_with_only_an_id_yields_none_fields(self):
+        sm = self.make_manager()
+        sess = {"id": "sess-1", "status": "stopped"}
+        # refresh=True drives the SLOW branch of _session_git too, which is where
+        # sess["repoPath"]/sess["worktreePath"] would blow up.
+        payload = sm._session_payload(sess, refresh=True)
+        self.assertEqual(payload["id"], "sess-1")
+        for k in ("repo", "repoPath", "worktreePath", "branch", "rcName"):
+            self.assertIsNone(payload[k], k)
+        # No claudeSessionId AND no worktreePath: the transcript-id fallback must
+        # not try to slugify a None path.
+        self.assertIsNone(payload["transcriptId"])
+        # The git helper degraded rather than crashed.
+        self.assertIsNone(payload["git"])
+        self.assertIsNone(payload["work"])
+
+    def test_an_empty_record_does_not_raise(self):
+        # The extreme: a truncated/garbage entry with not even an id. Still no
+        # crash — the whole point is that NOTHING on the beat loop raises.
+        sm = self.make_manager()
+        payload = sm._session_payload({}, refresh=True)
+        self.assertIsNone(payload["id"])
+        self.assertIsNone(payload["repoPath"])
+        self.assertIsNone(payload["branch"])
+
+    def test_a_claude_session_id_still_becomes_the_transcript_id(self):
+        # A partial record that DOES carry the pinned id resolves to it without
+        # ever touching the worktree-path fallback (which would be None here).
+        sm = self.make_manager()
+        payload = sm._session_payload(
+            {"id": "s", "status": "stopped", "claudeSessionId": "abc-123"},
+            refresh=True)
+        self.assertEqual(payload["transcriptId"], "abc-123")
+
+    def test_a_wrong_type_worktree_path_does_not_crash_the_transcript_id(self):
+        # A hand-edit readily produces "worktreePath": 123 (or a list). With no
+        # claudeSessionId to short-circuit the `or`, the transcript-id fallback
+        # would slugify it through re.sub and raise TypeError straight onto the
+        # beat loop — the wrong-TYPE twin of the missing-key crash (XERK-402 QA).
+        sm = self.make_manager()
+        for wt in (123, 4.5, ["/a/b"], {"x": 1}, True):
+            for status in ("stopped", "running"):
+                sess = {"id": "s", "status": status, "worktreePath": wt}
+                payload = sm._session_payload(sess, refresh=True)  # must not raise
+                self.assertIsNone(payload["transcriptId"], (wt, status))
+
+    def test_an_unhashable_id_does_not_crash_the_cache_lookups(self):
+        # A record whose id is a list/dict is unhashable, so the sid-keyed cache
+        # lookups in the return dict (usage_cache.get(sid) / _session_prs(sid),
+        # outside every try) would raise TypeError on the beat loop. A non-str id
+        # degrades to None, behaving as the id-less record (XERK-402 QA).
+        sm = self.make_manager()
+        for bad_id in (["x"], {"k": "v"}, 42, 3.5):
+            payload = sm._session_payload(
+                {"id": bad_id, "status": "stopped"}, refresh=True)  # must not raise
+            self.assertIsNone(payload["id"], bad_id)
+
 
 class TestSubscriptionIdentity(unittest.TestCase):
     """Which subscription a host's login is on (XERK-301). The limits above are a
