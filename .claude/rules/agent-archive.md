@@ -84,8 +84,22 @@ paths:
       - **Both paths that can GROW the map also trim** (the normal window and the under-cap
         passthrough, since the passthrough runs every beat below the cap and the hard cap must hold
         there too); the two early-return paths that trim nothing also never stamp.
-      - **State is in MEMORY, so a restart LOOP starves the rotation** (XERK-430) — the durable
-        "what the hub already has" lives on the hub, which XERK-431 proposes moving the choice to.
+      - **The position is PERSISTED under `~/.turma`, so a restart LOOP no longer starves the
+        rotation** (XERK-430). In memory the stamps start empty on every manager start, so a manager
+        restarting faster than the rotation can walk its pool re-offered the same head forever and
+        the tail never shipped (measured: 600 of 1300 never offered restarting every 10 beats).
+        `_load_archive_offered`/`_save_archive_offered` round-trip `_archive_offered` +
+        `_archive_offer_seq` + `_archive_cand_hwm` through `ARCHIVE_OFFERED_PATH`
+        (`archive-offered.json`). The file is LOSABLE with no correctness cost — losing it degrades
+        to the old empty-on-start behaviour — so the load is fully defensive (bad shapes →
+        `({},0,0)`, same `Infinity`/oversize-key care as `_note_archive_known`) and the save is
+        best-effort + time-throttled (`ARCHIVE_OFFERED_SAVE_SEC`) off the beat's stamping path,
+        never raising. The restored `seq` is floored at the max restored stamp, or the next stamp
+        would sort ahead of already-offered ids. The DURABLE "what the hub already has" still lives
+        on the hub (XERK-431 proposes moving the CHOICE server-side, which fixes this for free); this
+        is the cheaper local fix. Tests: `test_rotation_position_persists_across_a_restart`,
+        `test_rotation_survives_a_restart_loop`, `test_load_archive_offered_is_defensive`,
+        `test_save_archive_offered_is_throttled_and_never_raises`.
       - Sharing `ARCHIVE_KNOWN_MAX` with this map was also wrong — it coupled the off-switches.
       - **Ties break oldest-first** (closest to lost wins); a re-stamp POPS before re-inserting.
     - **The stamps are NEVER cleared**, including under the cap — a root slug's session count swings

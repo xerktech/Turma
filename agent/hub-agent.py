@@ -371,6 +371,26 @@ ARCHIVE_KNOWN_KEY_MAX = 256
 # at which we stop paying memory for the guarantee — 32.5 MB RSS measured at this
 # cap with real UUID keys, which needs about 100k transcripts on one host.
 ARCHIVE_OFFERED_HARD_MAX = _env_int("ARCHIVE_OFFERED_HARD_MAX", 200000, minimum=0)
+# The last-offered stamps are the rotation's POSITION in the pool, and in memory
+# they start empty on every manager start (XERK-430). A single restart is safe —
+# the map and the high-water mark are both empty, so nothing evicts prematurely.
+# A restart LOOP is not: the rotation never walks far enough through the pool to
+# reach its tail before its memory is wiped, so the same head is re-offered
+# forever (measured: 600 of 1300 transcripts never offered restarting every 10
+# beats, 900 restarting every 2-4). So the stamps are persisted under ~/.turma
+# and the rotation resumes where it left off across a restart. The file is
+# LOSABLE with no correctness cost — losing it degrades to the in-memory-only
+# behaviour above — so the load is fully defensive and the save is best-effort
+# and throttled. (The durable "what the hub already holds" lives on the hub, not
+# here; XERK-431 proposes moving the CHOICE server-side, which fixes this for
+# free. This is the cheaper local fix the ticket names.)
+ARCHIVE_OFFERED_PATH = os.path.join(REGISTRY_DIR, "archive-offered.json")
+# How often that flush happens, at most. The save runs on the beat from the path
+# that mutates the stamps, so it is time-throttled to keep a large map's write
+# off every beat; under the default this saves about once per beat, which bounds
+# a restart's lost progress to roughly one beat's rotation. Raise it on a host
+# past ARCHIVE_OFFERED_HARD_MAX where the map is large and the write is not free.
+ARCHIVE_OFFERED_SAVE_SEC = _env_float("ARCHIVE_OFFERED_SAVE_SEC", 15.0, minimum=0.0)
 ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read-ahead window per delta
 ARCHIVE_CHUNK_TIMEOUT_SEC = 15  # one rendered-delta POST
 ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
@@ -13081,13 +13101,19 @@ class SessionManager:
         # rather than a place in the candidate list, and bounded against how many
         # candidates there are rather than by a flat number — see _archive_window
         # for why each of those is the difference between a queue and a cliff.
-        self._archive_offered = {}
-        self._archive_offer_seq = 0
+        # RESTORED from ~/.turma so the rotation resumes across a restart instead
+        # of starving under a restart loop (XERK-430). The cand_hwm restores with
+        # it so the trim's bound does not transiently collapse to the first
+        # post-restart beat's universe. All three are losable; a missing file
+        # degrades to empty-on-start, which is exactly the old behaviour.
+        (self._archive_offered, self._archive_offer_seq,
+         self._archive_cand_hwm) = self._load_archive_offered()
+        # Throttle for the flush; 0.0 so the first stamping beat saves at once.
+        self._archive_offered_saved_at = 0.0
         # The largest transcript UNIVERSE seen (every eligible slug's *.jsonl,
         # running ones included), which is what _trim_archive_offered sizes
         # against — never this beat's candidate count, which drops a running slug
         # whole. Plus the once-only flag for the hard-cap warning.
-        self._archive_cand_hwm = 0
         self._archive_cap_logged = False
         # Throttle for the "cannot be named by the archive" line (see
         # _session_files): the manifest is rebuilt every beat.
@@ -20805,6 +20831,84 @@ class SessionManager:
         while len(self._archive_known) > ARCHIVE_KNOWN_MAX:
             self._archive_known.pop(next(iter(self._archive_known)))
 
+    def _load_archive_offered(self):
+        """Restore the backlog rotation's position from ~/.turma (XERK-430).
+
+        Returns `(offered, seq, hwm)`. In memory these stamps start empty on
+        every manager start, so a manager caught in a RESTART LOOP re-offers the
+        same head of the pool forever and never reaches its tail. The durable
+        answer to "what the hub already holds" lives on the hub, but THIS side's
+        rotation cursor is the agent's own, so it is persisted here and read back
+        at construction.
+
+        Fully defensive and never raises — a missing, unreadable, or malformed
+        file degrades to `({}, 0, 0)`, exactly the old empty-on-start behaviour,
+        which is why the file is safe to lose. INSERTION ORDER is load-bearing
+        (eviction pops the least-recently-offered = the oldest inserted), and
+        json preserves object order both ways. Values are ints; the same
+        `int()`/`OverflowError` care `_note_archive_known` documents applies —
+        `1e400`/`Infinity` is valid JSON reachable from a hand-edited file.
+        """
+        try:
+            with open(ARCHIVE_OFFERED_PATH) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}, 0, 0
+        if not isinstance(data, dict):
+            return {}, 0, 0
+        offered = {}
+        raw = data.get("offered")
+        if isinstance(raw, dict):
+            for tid, seq in raw.items():
+                if not isinstance(tid, str) or not tid or len(tid) > ARCHIVE_KNOWN_KEY_MAX:
+                    continue
+                try:
+                    offered[tid] = max(0, int(seq))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+
+        def _nat(key):
+            try:
+                return max(0, int(data.get(key) or 0))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        seq = _nat("seq")
+        # The counter must sit at or above every restored stamp: otherwise the
+        # next stamp (seq+1) sorts as LESS-recently-offered than a persisted one
+        # and jumps the queue. A truncated or edited file can break that.
+        if offered:
+            seq = max(seq, max(offered.values()))
+        # Enforce the same hard cap the live trim does, in case the file predates
+        # a lowered ARCHIVE_OFFERED_HARD_MAX — oldest-inserted first, as there.
+        while len(offered) > ARCHIVE_OFFERED_HARD_MAX:
+            offered.pop(next(iter(offered)))
+        return offered, seq, _nat("hwm")
+
+    def _save_archive_offered(self):
+        """Flush the rotation's position to ~/.turma, throttled and best-effort
+        (XERK-430). Called only from the path that MUTATES the stamps.
+
+        **Never raises** — it runs on the beat (the container's main process),
+        and a lost write costs the rotation at most a restart's worth of
+        progress, never correctness. Throttled by wall-clock so a large map's
+        write stays off every beat; the tmp+os.replace keeps a restart from
+        reading a half-written file."""
+        now = time.time()
+        if now - self._archive_offered_saved_at < ARCHIVE_OFFERED_SAVE_SEC:
+            return
+        self._archive_offered_saved_at = now
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = ARCHIVE_OFFERED_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"offered": self._archive_offered,
+                           "seq": self._archive_offer_seq,
+                           "hwm": self._archive_cand_hwm}, f)
+            os.replace(tmp, ARCHIVE_OFFERED_PATH)
+        except OSError as e:
+            log(f"archive-offered save failed: {e}")
+
     def _archive_window(self, cands, universe):
         """Pick the ARCHIVE_MANIFEST_MAX entries to offer, from every candidate
         sorted newest-first (XERK-424).
@@ -20926,6 +21030,10 @@ class SessionManager:
             self._archive_offered.pop(m["transcriptId"], None)
             self._archive_offered[m["transcriptId"]] = self._archive_offer_seq
         self._trim_archive_offered(universe)
+        # Persist the advanced rotation position so a restart resumes it rather
+        # than starving the tail (XERK-430). Throttled + best-effort; only this
+        # stamping path advances the rotation, so it is the only one that saves.
+        self._save_archive_offered()
         return window, backlog_start
 
     def _trim_archive_offered(self, universe):
