@@ -399,8 +399,9 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     `MIGRATE_INFLIGHT_MAX`, and `state.json` by nothing — which is why the other two have ceilings.
   - `ARCHIVE_TRANSCRIPT_MAX_BYTES` bounds one transcript's rendered entries and
     `ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES` its raw copy, rather than the store. Neither counts `index.db`,
-    which lives on the same volume and is unbounded across fill/wipe cycles (XERK-332) — size the
-    volume for that too.
+    which lives on the same volume at ~3x the first-fill archive; it is reclaimed across fill/wipe
+    cycles (XERK-332, `maybeReclaimIndex`) so it no longer grows without bound — size the volume for
+    that ~3x overhead.
 - Local-model failover is per host: `LOCAL_MODEL_BASE_URL` / `LOCAL_MODEL_API_KEY` / `LOCAL_MODEL_NAME`
   / `LOCAL_MODEL_CONTEXT` in the
   agent's env. Unset = off, and the agent reports `localModel.available:false` so clients hide it.
