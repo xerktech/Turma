@@ -46,7 +46,7 @@ function loadHeaderModule() {
   // Suppress render(): the module body kicks off its own poll on load, whose
   // fetch resolves after the test and would paint into a DOM that isn't there.
   const exportTail = `
-    ;globalThis.__hdr = { codingAgent, restartBtn, pending, confirming, pendKey, boardHealthBadge, claudeAuthBadge };
+    ;globalThis.__hdr = { codingAgent, hostVerLine, restartBtn, pending, confirming, pendKey, boardHealthBadge, claudeAuthBadge };
     render = () => {};
   `;
   const fn = new Function(
@@ -109,6 +109,21 @@ test("codingAgent: the parsed field wins over the raw string both report", () =>
     }),
     "Claude Code 2.1.211",
   );
+});
+
+// --- hostVerLine (XERK-539) -------------------------------------------------
+
+test("hostVerLine: the collapsed header shows the coding agent AND Turma version", () => {
+  const { hostVerLine } = loadHeaderModule();
+  assert.equal(
+    hostVerLine({ codingAgent: { name: "Claude Code", version: "2.1.211" }, agentVersion: "1.2.3" }),
+    "Claude Code 2.1.211 · Turma 1.2.3",
+  );
+});
+
+test("hostVerLine: a host reporting neither version reads unknown on both sides", () => {
+  const { hostVerLine } = loadHeaderModule();
+  assert.equal(hostVerLine({}), "– · Turma –");
 });
 
 test("restartBtn: offered only on a live host that isn't already restarting", () => {
