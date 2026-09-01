@@ -679,14 +679,15 @@ function boardHealthBadge(a) {
   return `<span class="host-auth req" title="${esc(j.error)}">📋 Board unreachable</span>`;
 }
 // Auto-start-paused chip for a host header (XERK-544): the hub pauses auto mode
-// for a host whose Claude subscription is at or past the weekly pace line, and
-// reports it as `autoPaused`. Amber (informational, not an error) and — like
-// claudeAuthBadge/boardHealthBadge — shown only when the hub is asserting it;
-// an absent field is "not paused". No bypass control by design: new tickets can
-// still be started manually, and it resumes on its own as the week elapses.
+// for a host whose Claude subscription has hit a limit — the weekly pace line
+// (XERK-544) or the 5-hour window at/above 90% (XERK-548) — and reports it as
+// `autoPaused`. Amber (informational, not an error) and — like claudeAuthBadge/
+// boardHealthBadge — shown only when the hub is asserting it; an absent field is
+// "not paused". No bypass control by design: new tickets can still be started
+// manually, and it resumes on its own as the window recovers.
 function autoPausedBadge(a) {
   if (!a.autoPaused) return "";
-  return `<span class="host-auth warn" title="Auto-start is paused for this host — its Claude subscription is past the even weekly pace line. Manual starts still work; it resumes on its own as the week elapses or the window resets.">⏸ Auto paused</span>`;
+  return `<span class="host-auth warn" title="Auto-start is paused for this host — its Claude subscription has hit a usage limit (past the even weekly pace line, or the 5-hour window at/above 90%). Manual starts still work; it resumes on its own as the window elapses or resets.">⏸ Auto paused</span>`;
 }
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({

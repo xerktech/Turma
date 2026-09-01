@@ -172,12 +172,13 @@ data class AgentInfo(
     val online: Boolean = false,
     val terminalOnline: Boolean = false,
     /**
-     * Auto-start paused because this host's Claude subscription is at or past the
-     * even weekly pace line (XERK-544). HUB-DERIVED from [limits]/[subscription]/
-     * defaultRuntime, not the agent's word, and emitted only when true — so the
-     * default `false` is exactly the "not paused / older hub can't tell" value.
-     * Shown as a header chip (mirrors index.html's autoPausedBadge); there is no
-     * bypass control — manual starts still work and it resumes on its own.
+     * Auto-start paused because this host's Claude subscription has hit a limit —
+     * the even weekly pace line (XERK-544) or the 5-hour window at/above 90%
+     * (XERK-548). HUB-DERIVED from [limits]/[subscription]/defaultRuntime, not the
+     * agent's word, and emitted only when true — so the default `false` is exactly
+     * the "not paused / older hub can't tell" value. Shown as a header chip
+     * (mirrors index.html's autoPausedBadge); there is no bypass control — manual
+     * starts still work and it resumes on its own.
      */
     val autoPaused: Boolean = false,
     // Set (non-null) during an ANNOUNCED update restart (XERK-29): the host is
