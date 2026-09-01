@@ -27328,6 +27328,37 @@ class TestEnvNumHelpers(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(val, "20", err)
 
+    def test_context_knobs_survive_a_junk_value(self):
+        # XERK-523: DSH_MODEL_CONTEXT was a BARE int() at module scope; a junk
+        # value in it — or in LOCAL_MODEL_CONTEXT, its fallback — crashed the whole
+        # agent at import. Both now route through _env_int, so a hostile value
+        # falls back to the default rather than exiting non-zero.
+        def reimport(env_overrides):
+            env = dict(os.environ, **env_overrides)
+            out = subprocess.run(
+                [sys.executable, "-c",
+                 "import importlib.util,sys;"
+                 f"spec=importlib.util.spec_from_file_location('ha', {ha.__file__!r});"
+                 "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);"
+                 "print(m.DSH_MODEL_CONTEXT)"],
+                capture_output=True, text=True, env=env)
+            # hub-agent's log() writes to stdout, and a junk LOCAL_MODEL_CONTEXT
+            # emits one such line during import — the printed value is the LAST.
+            lines = out.stdout.strip().splitlines()
+            return out.returncode, (lines[-1] if lines else ""), out.stderr[-300:]
+
+        # the ticket's exact repro: DSH_MODEL_CONTEXT=lots (and the fallback junk too)
+        rc, val, err = reimport({"DSH_MODEL_CONTEXT": "lots"})
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(val, "200000", err)
+        rc, val, err = reimport({"LOCAL_MODEL_CONTEXT": "lots"})
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(val, "200000", err)
+        # a valid DSH_MODEL_CONTEXT still applies
+        rc, val, err = reimport({"DSH_MODEL_CONTEXT": "128000"})
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(val, "128000", err)
+
 
 if __name__ == "__main__":
     unittest.main()

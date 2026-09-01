@@ -46,13 +46,25 @@ import time
 try:
     # Imported as a sibling module by hub-agent.py (same dir on sys.path).
     from dsh_transcript import DshProjector, DshWorkflowRuns, workflow_run_id
-    # The per-child projection cursor + the file-ensure/append helpers are shared
-    # with the qwen tail (XERK-528); dsh keeps its own workflow re-home + records.
-    from runtime_tail import ChildProjection, append_entries, ensure_transcript_file
+    # The per-child projection cursor, the file-ensure/append helpers and the
+    # crash-safe numeric-env parser are shared with the qwen tail (XERK-528); dsh
+    # keeps its own workflow re-home + records.
+    from runtime_tail import (
+        ChildProjection, append_entries, ensure_transcript_file, env_float, env_int,
+    )
 except ImportError:  # pragma: no cover - only when run outside the agent dir
     DshProjector = None
     DshWorkflowRuns = None
     workflow_run_id = None
+
+    # Degraded standalone import (runtime_tail absent): the tail is a no-op here,
+    # but the module-scope knobs below still evaluate, so keep the safe-parse
+    # contract (never raise on a junk value) with a default-returning stub.
+    def env_int(name, default, **_kw):
+        return default
+
+    def env_float(name, default, **_kw):
+        return default
 
 # A child (subagent / workflow-agent) native log filename validates as this — it
 # is the child's dsh SessionId, and it names both the file the DRIVER wrote under
@@ -66,20 +78,20 @@ _CHILD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # send happens on the beat (send_input / notify_session / answer_question run in
 # handle_commands), so a wedged plugin must not hold the beat. A lost ack is
 # logged and the op reported failed, never retried inline.
-DSH_ACK_TIMEOUT_SEC = float(os.environ.get("DSH_ACK_TIMEOUT_SEC", "5"))
+DSH_ACK_TIMEOUT_SEC = env_float("DSH_ACK_TIMEOUT_SEC", 5.0)
 # The startup window the socket has to appear in: the plugin binds it a moment
 # after the dsh process starts, so the first connect retries briefly.
-DSH_CONNECT_TIMEOUT_SEC = float(os.environ.get("DSH_CONNECT_TIMEOUT_SEC", "20"))
+DSH_CONNECT_TIMEOUT_SEC = env_float("DSH_CONNECT_TIMEOUT_SEC", 20.0)
 # Backoff bounds for the reader's reconnect loop while the control is open.
 DSH_RECONNECT_MIN_SEC = 0.5
 DSH_RECONNECT_MAX_SEC = 5.0
 # One control frame is bounded so a malformed/hostile plugin line cannot grow the
 # reader's buffer without limit. A real input frame is capped by INPUT_MAX_CHARS
 # (100k) hub-side; this is generous above that and applies to a SINGLE line.
-DSH_LINE_MAX_BYTES = int(os.environ.get("DSH_LINE_MAX_BYTES", str(4 << 20)))
+DSH_LINE_MAX_BYTES = env_int("DSH_LINE_MAX_BYTES", 4 << 20)
 # How often the projection tail wakes to look for new native events, when it is
 # not being poked. Cheap: it only reads bytes appended since its last offset.
-DSH_PROJECTION_POLL_SEC = float(os.environ.get("DSH_PROJECTION_POLL_SEC", "0.5"))
+DSH_PROJECTION_POLL_SEC = env_float("DSH_PROJECTION_POLL_SEC", 0.5)
 # Cap on the childIds a tail remembers for the workflow-child reclaim (XERK-474
 # [J]): an ordinary subagent's id is never reclaimed, so the set is bounded here
 # rather than growing one entry per subagent over a long session.

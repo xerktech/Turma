@@ -9,13 +9,48 @@ pins the tail's own behaviour: incremental projection, resume re-projection from
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, AGENT_DIR)
 
 import qwen_session as qs  # noqa: E402
+
+
+class ModuleEnvKnobsTest(unittest.TestCase):
+    """QWEN_PROJECTION_POLL_SEC falls back instead of raising on a junk value
+    (XERK-523): qwen_session.py is imported by hub-agent's qwen launch path, so a
+    mistyped value must never crash the import (and the spawn)."""
+
+    def _reimport(self, value):
+        env = dict(os.environ)
+        if value is None:
+            env.pop("QWEN_PROJECTION_POLL_SEC", None)
+        else:
+            env["QWEN_PROJECTION_POLL_SEC"] = value
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r);" % AGENT_DIR +
+             "import importlib.util as u;"
+             "s=u.spec_from_file_location('qwen_session', %r);" % os.path.join(
+                 AGENT_DIR, "qwen_session.py") +
+             "m=u.module_from_spec(s); s.loader.exec_module(m);"
+             "print(m.QWEN_PROJECTION_POLL_SEC)"],
+            capture_output=True, text=True, env=env)
+        return out.returncode, out.stdout.strip(), out.stderr[-400:]
+
+    def test_junk_falls_back_without_crashing_the_import(self):
+        rc, val, err = self._reimport("half a second")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(val, "0.5", err)
+
+    def test_valid_value_applies(self):
+        rc, val, err = self._reimport("1.5")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(val, "1.5", err)
 
 
 class QwenProjectionTailTest(unittest.TestCase):
