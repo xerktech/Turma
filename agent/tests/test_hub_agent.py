@@ -18847,6 +18847,33 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
                       {rel for rel, _ in (by_tid["d1"].get("rawFiles") or [])})
         self.assertFalse(by_tid["c1"].get("rawFiles"))  # claude raw deferred
 
+    def test_manifest_refuses_a_transcriptId_two_slugs_both_hold(self):
+        # XERK-428: two DIFFERENT project slugs each holding a file with the
+        # SAME transcriptId (a copied/restored ~/.claude/projects tree, or a
+        # deliberately chosen id). The manifest keys nothing on the slug and
+        # _archive_pending is keyed on the id ALONE, so both would enter and one
+        # would silently win the cursor slot — the hub's per-id archive row/
+        # cursor then interleaves two unrelated files' byte ranges into one
+        # stored transcript. There is no way to tell which copy the hub's row
+        # belongs to, so the manifest offers NEITHER copy of a colliding id.
+        sm = self.make_manager()
+        wt_a = "/w/.turma/worktrees/Turma/aaa"
+        wt_b = "/w/.turma/worktrees/Turma/bbb"
+        self._write_transcript(wt_a, "dup.jsonl", [_text_entry("u1", "user", "a")])
+        self._write_transcript(wt_b, "dup.jsonl", [_text_entry("u2", "user", "b")])
+        # A non-colliding transcript in one of the slugs is still offered.
+        self._write_transcript(wt_a, "solo.jsonl", [_text_entry("u3", "user", "c")])
+        sm.usage_ledger = {
+            wt_a: {"repo": "Turma", "remote": "git@github.com:xerk/Turma.git",
+                   "slug": ha._project_slug(wt_a)},
+            wt_b: {"repo": "Turma", "remote": "git@github.com:xerk/Turma.git",
+                   "slug": ha._project_slug(wt_b)},
+        }
+        sm.registry = []
+        sm.closed = []
+        ids = {m["transcriptId"] for m in sm._archive_manifest()}
+        self.assertEqual(ids, {"solo"})
+
     # --- the manifest WINDOW (XERK-424) ---------------------------------
 
     def _many_transcripts(self, sm, n, wt="/w/.turma/worktrees/Turma/win"):

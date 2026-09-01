@@ -13020,6 +13020,9 @@ class SessionManager:
         # Throttle for the "cannot be named by the archive" line (see
         # _session_files): the manifest is rebuilt every beat.
         self._unnameable_logged_at = 0.0
+        # Throttle for the transcriptId-collision line (XERK-428, see
+        # _archive_manifest): same reason — the manifest is rebuilt every beat.
+        self._archive_collision_logged_at = 0.0
         # Archive sync runs on its OWN thread (XERK-395), never the beat. The
         # beat stages the newest reply's cursors as _archive_job under
         # _archive_lock and sets _archive_wake; the worker takes it from there.
@@ -20931,6 +20934,40 @@ class SessionManager:
                     "createdAt": sm.get("createdAt"),
                     "summary": sm.get("summary"),
                 })
+        # Two different project slugs holding a file with the SAME transcriptId
+        # (XERK-428). This manifest keys nothing on the slug, and
+        # `_archive_pending` (built from it, in build_payload) is keyed on the
+        # transcriptId ALONE — so both copies enter the manifest, one silently
+        # wins the pending slot, and the hub's per-id archive row/cursor ends up
+        # describing whichever copy was offered, interleaving two unrelated
+        # files' byte ranges into one stored transcript. There is no way to tell
+        # which copy the hub's existing row belongs to, so keying `_archive_pending`
+        # on (slug, id) would only move the collision to the hub, whose row IS
+        # keyed on id. The honest answer is to offer NEITHER copy of a colliding
+        # id and log it once.
+        #
+        # transcriptIds are agent-chosen from the filename and uuid4, so this
+        # never occurs naturally (0 duplicates across 848 slugs / 2332 transcripts
+        # on the reference host) — it needs a copied/restored ~/.claude/projects
+        # tree, a hand-made fixture, or a deliberately chosen id, the same reason
+        # the raw layer already treats transcriptId as forgeable hub-side
+        # (`.claude/rules/turma-archive.md`). A collision WITHIN one slug is
+        # impossible (filenames are unique in a directory), so this only ever
+        # fires across slugs.
+        seen = {}
+        for m in out:
+            seen.setdefault(m["transcriptId"], 0)
+            seen[m["transcriptId"]] += 1
+        collisions = {tid for tid, n in seen.items() if n > 1}
+        if collisions:
+            out = [m for m in out if m["transcriptId"] not in collisions]
+            now = time.time()
+            if now - getattr(self, "_archive_collision_logged_at", 0) > 3600:
+                self._archive_collision_logged_at = now
+                log(f"archive: {len(collisions)} transcriptId(s) held by more "
+                    f"than one project slug; offering neither copy of each, "
+                    f"since the hub's per-id cursor cannot tell them apart "
+                    f"(XERK-428): {sorted(collisions)[:5]}")
         out.sort(key=lambda m: m["mtime"], reverse=True)
         out, backlog_start = self._archive_window(out, universe)
         # The raw layer's file list (XERK-338), newest transcript first so the
