@@ -4807,6 +4807,35 @@ def _finite_epoch(value, limit):
     return int(value)
 
 
+# The 7-day weekly window is overlaid on the Usage page with 7 even-pace day
+# markers (XERK-536), each labelled with the calendar weekday it covers. The
+# labels are computed HERE, on the reporting host, in that host's LOCAL time —
+# `datetime.fromtimestamp` (no tz argument) reads the agent machine's own zone,
+# which is the decision the ticket pins: a viewer in another timezone must still
+# see the host's days, so the label cannot be a client-side computation off a
+# bare epoch. The window is a fixed 7-day span ending at `resetsAt`, split into
+# seven 1/7 slices measured BACK from it (the boundary anchors to the reset
+# stamp, not local midnight); slice i is labelled with the weekday its start day
+# falls on. English abbreviations only — never `strftime("%a")`, which is
+# locale-dependent, so a non-English host would ship weekday names no client
+# expects and every bar would disagree. Returns None on any error: this sits on
+# read_limits_snapshot's beat-critical path, which must never raise.
+_WEEKDAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+SEVEN_DAY_SLICES = 7
+
+
+def _seven_day_labels(resets_at):
+    try:
+        window_start = int(resets_at) - SEVEN_DAY_SLICES * 86400
+        labels = []
+        for i in range(SEVEN_DAY_SLICES):
+            day = datetime.datetime.fromtimestamp(window_start + i * 86400)
+            labels.append(_WEEKDAY_ABBR[day.weekday()])
+        return labels
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
 def read_limits_snapshot(path=None, now=None, max_age=None):
     """The heartbeat's `limits` block, read from the snapshot file — or None when
     there is no usable one (no file, unreadable, unparseable, no window, or a
@@ -4868,6 +4897,12 @@ def read_limits_snapshot(path=None, now=None, max_age=None):
             resets = _finite_epoch(win.get("resetsAt"), LIMITS_EPOCH_MAX)
             if resets is not None and abs(resets - now) <= LIMITS_RESET_HORIZON_SEC:
                 clean["resetsAt"] = resets
+                # The even-pace day markers (XERK-536) only apply to the 7-day
+                # window and only when there is a reset stamp to anchor them to.
+                if key == "sevenDay":
+                    labels = _seven_day_labels(resets)
+                    if labels:
+                        clean["dayLabels"] = labels
             if "usedPct" in clean:  # a reset time with no percentage draws nothing
                 out[key] = clean
         if not out:

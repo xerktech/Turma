@@ -35,6 +35,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -314,6 +316,13 @@ private fun LimitRow(label: String, view: UsageViewModel.LimitView?, readAgeSec:
                 color = if (view.expired) muted else MaterialTheme.colorScheme.onSurface,
             )
         }
+        // Even-pace day markers on the 7-day bar (XERK-536): a reference grid,
+        // not a limit. A daily-boundary tick in the surface colour so it reads
+        // as a notch over both the filled and unfilled parts, plus a stronger
+        // continuous pace line at the fraction of the week elapsed.
+        val pacing = view.pacing
+        val tickColor = MaterialTheme.colorScheme.surface
+        val paceColor = muted
         Box(
             Modifier.fillMaxWidth().height(6.dp).padding(top = 2.dp)
                 .clip(RoundedCornerShape(3.dp))
@@ -327,6 +336,38 @@ private fun LimitRow(label: String, view: UsageViewModel.LimitView?, readAgeSec:
                     Modifier.fillMaxWidth(fraction).fillMaxHeight()
                         .clip(RoundedCornerShape(3.dp)).background(color)
                 )
+            }
+            if (pacing != null && !view.expired) {
+                Canvas(Modifier.matchParentSize()) {
+                    val w = size.width
+                    val h = size.height
+                    for (s in pacing.slices) {
+                        // The 7th boundary is the bar's own right edge.
+                        if (s.end < 1.0) {
+                            val x = (s.end * w).toFloat()
+                            drawRect(tickColor, Offset(x - 0.5f, 0f), Size(1f, h))
+                        }
+                    }
+                    val px = (pacing.paceFrac * w).toFloat()
+                    drawRect(paceColor, Offset(px - 1f, 0f), Size(2f, h))
+                }
+            }
+        }
+        // The weekday labels: seven equal columns so each centres over its slice,
+        // today's distinguished. Drawn only when the bar carries pacing.
+        if (pacing != null && !view.expired) {
+            Row(Modifier.fillMaxWidth().padding(top = 3.dp)) {
+                for (s in pacing.slices) {
+                    Text(
+                        s.label,
+                        modifier = Modifier.weight(1f),
+                        textAlign = TextAlign.Center,
+                        maxLines = 1,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = if (s.isToday) FontWeight.SemiBold else null,
+                        color = if (s.isToday) MaterialTheme.colorScheme.primary else muted,
+                    )
+                }
             }
         }
     }

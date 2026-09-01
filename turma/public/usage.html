@@ -76,6 +76,32 @@
      window that no longer exists, so the bar is greyed rather than believed. */
   .lim-row.expired .lim-fill { background: var(--muted); }
   .lim-row.expired .lim-pct { color: var(--muted); }
+  /* Even-pace day markers on the 7-day bar (XERK-536): a REFERENCE GRID, not a
+     limit — nothing here is enforced. Seven 1/7 daily boundaries (ticks), a
+     weekday label under each day, and a continuous "pace line" at the fraction
+     of the week elapsed. The gap between the fill and the pace line is how much
+     of an even 1/7-per-day budget is still available today. */
+  .lim-track { position: relative; }
+  /* A daily boundary, drawn in the card colour so it reads as a notch across
+     both the filled (accent) and unfilled (hairline) parts of the bar. */
+  .lim-tick {
+    position: absolute; top: 0; bottom: 0; width: 1px;
+    background: var(--surface); opacity: 0.75; pointer-events: none;
+  }
+  /* The moving "you should be here by now" line. Distinct from the ticks: a
+     stronger, wider neutral bar so it doesn't read as just another boundary. */
+  .lim-pace {
+    position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px;
+    background: var(--ink-2); pointer-events: none;
+  }
+  .lim-days {
+    display: flex; margin-top: 3px; font-size: 10px; color: var(--muted);
+    font-variant-numeric: tabular-nums; line-height: 1.2;
+  }
+  /* Seven equal columns, so each label centres over its own 1/7 slice — the
+     same geometry the ticks divide the bar into. */
+  .lim-day { flex: 1 1 0; min-width: 0; text-align: center; }
+  .lim-day.today { color: var(--accent); font-weight: 600; }
   .lim-empty {
     color: var(--muted); font-size: 12.5px; background: var(--surface);
     border: 1px dashed var(--hairline); border-radius: var(--radius-md);
@@ -430,6 +456,39 @@ function limitWindowView(win, nowSec) {
       : expired ? "window has since reset" : "resets in " + fmtDuration(resetsIn),
     level: pct >= 90 ? "crit" : pct >= 75 ? "warn" : "",
   };
+}
+
+// The even-pace day markers overlaid on the 7-day WEEKLY bar (XERK-536). The
+// window is a fixed 7-day span ending at `resetsAt`, split into seven 1/7 slices
+// measured BACK from it (the boundary anchors to the reset stamp, not local
+// midnight). Returns the geometry a bar draws — the seven day cells (each with
+// its weekday label and whether NOW falls in it) and `paceFrac`, how far through
+// the whole week we are (the continuous "on-pace" line) — or null when the
+// window can't be paced: no reset stamp, no labels, or `now` outside the window
+// (already reset, which the caller also guards via `view.expired`).
+//
+// Everything here is ARITHMETIC on the reset stamp: which slice is "today" and
+// where the pace line sits are timezone-free and computed at RENDER time, so
+// they stay correct as the snapshot ages. Only the WEEKDAY NAMES depend on a
+// timezone, and those are computed by the reporting AGENT in ITS OWN local time
+// (`dayLabels`) — never here — so a viewer in another zone still sees the host's
+// days, and two bars never disagree about which day a boundary is.
+const SEVEN_DAY_SLICES = 7;
+function sevenDayPacing(win, nowSec) {
+  if (!win || typeof win.resetsAt !== "number") return null;
+  const labels = win.dayLabels;
+  if (!Array.isArray(labels) || labels.length !== SEVEN_DAY_SLICES) return null;
+  const windowLen = SEVEN_DAY_SLICES * 86400;
+  const windowStart = win.resetsAt - windowLen;
+  const elapsed = nowSec - windowStart;
+  if (elapsed < 0 || elapsed >= windowLen) return null;
+  const todayIdx = Math.min(SEVEN_DAY_SLICES - 1, Math.floor(elapsed / 86400));
+  const slices = labels.map((label, i) => ({
+    label,
+    end: (i + 1) / SEVEN_DAY_SLICES,   // cumulative 0..1 boundary after this day
+    isToday: i === todayIdx,
+  }));
+  return { slices, paceFrac: elapsed / windowLen };
 }
 
 const TOKEN_KEYS = ["input", "output", "cacheWrite", "cacheRead"];
@@ -853,6 +912,43 @@ function limitCard(group, nowSec) {
     track.append(fill);
 
     row.append(line, track);
+
+    // Overlay the WEEKLY bar with its even-pace day markers (XERK-536), only
+    // when the window is still live (an expired one describes a window that has
+    // rolled over, so its pacing is meaningless). The 5-hour window has no daily
+    // pacing analogue and is deliberately left plain.
+    if (key === "sevenDay" && !view.expired) {
+      const pacing = sevenDayPacing(held.win, nowSec);
+      if (pacing) {
+        for (const s of pacing.slices) {
+          // The 7th boundary is the bar's own right edge — no tick needed.
+          if (s.end < 1) {
+            const tick = document.createElement("div");
+            tick.className = "lim-tick";
+            tick.style.left = (s.end * 100) + "%";
+            track.append(tick);
+          }
+        }
+        const pace = document.createElement("div");
+        pace.className = "lim-pace";
+        pace.style.left = (pacing.paceFrac * 100) + "%";
+        pace.title = "On-pace line — an even 1/7 of the weekly limit per day. "
+          + "Fill ahead of it is faster than even pace; behind it is banked "
+          + "headroom. Informational only; nothing is throttled.";
+        track.append(pace);
+
+        const days = document.createElement("div");
+        days.className = "lim-days";
+        for (const s of pacing.slices) {
+          const d = document.createElement("span");
+          d.className = "lim-day" + (s.isToday ? " today" : "");
+          d.textContent = s.label;
+          days.append(d);
+        }
+        row.append(days);
+      }
+    }
+
     card.append(row);
   }
   return card;

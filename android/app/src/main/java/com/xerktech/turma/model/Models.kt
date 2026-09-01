@@ -996,6 +996,14 @@ data class LimitWindow(
     val usedPct: Double? = null,
     /** Epoch seconds the window resets. Null when unreported. */
     val resetsAt: Long? = null,
+    /**
+     * Seven weekday abbreviations for the even-pace day markers on the 7-day
+     * bar (XERK-536), computed by the reporting agent in ITS OWN timezone.
+     * Present only on the 7-day window and only with a reset stamp; empty
+     * otherwise. The hub coerces it to exactly seven short strings or drops it,
+     * so a non-empty list is always renderable.
+     */
+    val dayLabels: List<String> = emptyList(),
 )
 
 @Serializable

@@ -3118,6 +3118,43 @@ test("http: a malformed limits block is coerced at ingest, not fanned out", asyn
   }
 });
 
+test("http: the 7-day day markers are coerced as a whitelist of seven strings", async () => {
+  // XERK-536: the even-pace markers ride the sevenDay window as `dayLabels`.
+  // Android TYPES it as List<String>, so one bad element would fail the WHOLE
+  // /api/agents decode — the field passes only as exactly seven short strings,
+  // is length-capped per label, and is never carried on the 5-hour window.
+  const beat = (body) =>
+    request("POST", "/api/heartbeat", { body, headers: agentHeaders });
+  const read = async () =>
+    (await request("GET", "/api/agents", { headers: userHeaders }))
+      .body.agents.find((a) => a.key === "labels-host");
+  const days = ["Wed", "Thu", "Fri", "Sat", "Sun", "Mon", "Tue"];
+  const capturedAt = 1_786_400_000;
+
+  // A well-formed set survives, length-capped, and only on the 7-day window.
+  await beat({
+    device: "labels-host",
+    limits: {
+      fiveHour: { usedPct: 20, resetsAt: 1, dayLabels: days },  // stripped: 5h has none
+      sevenDay: { usedPct: 40, resetsAt: 2, dayLabels: [...days.slice(0, 6), "x".repeat(20)] },
+      capturedAt,
+    },
+  });
+  let got = (await read()).limits;
+  assert.equal(got.fiveHour.dayLabels, undefined);
+  assert.deepEqual(got.sevenDay.dayLabels, [...days.slice(0, 6), "x".repeat(8)]);
+
+  // Any malformed shape drops the field but keeps the window itself.
+  for (const dayLabels of [days.slice(0, 6), [...days, "extra"], [1, 2, 3, 4, 5, 6, 7], "nope", {}]) {
+    await beat({
+      device: "labels-host",
+      limits: { sevenDay: { usedPct: 40, resetsAt: 2, dayLabels }, capturedAt },
+    });
+    got = (await read()).limits;
+    assert.deepEqual(got.sevenDay, { usedPct: 40, resetsAt: 2 }, JSON.stringify(dayLabels));
+  }
+});
+
 test("http: the subscription key reaches the clients, coerced and bounded", async () => {
   // XERK-301: the usage page groups limit cards on this key, so it is pure
   // carriage — but it is also a MAP KEY on every client and Android TYPES it,
