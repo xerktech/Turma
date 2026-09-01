@@ -6112,6 +6112,24 @@ test("XERK-331: an UNDELIVERED spawn on an offline host does NOT block a fresh s
   assert.equal((agents[otherHost].commands || []).length, 1);
 });
 
+test("XERK-331: the start guard is org-scoped — a colliding key in another org is not reused", async () => {
+  // Two different Jira orgs both have an ENG-5. A spawn in flight for org A's
+  // ENG-5 must not make org B's ENG-5 reuse it (issue keys are unique only within
+  // an org). Guards the `a.jira.siteKey !== siteKey` filter in committedTicketSpawn.
+  await ticketBeat("sf331xA", "sf331xa.atlassian.net");
+  await ticketBeat("sf331xB", "sf331xb.atlassian.net");
+  const a = await request("POST", "/api/jira/sf331xa.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  const b = await request("POST", "/api/jira/sf331xb.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(a.body.host, "sf331xA");
+  assert.equal(b.body.host, "sf331xB");
+  // Distinct spawns, one per org — not a reuse across the org boundary.
+  assert.notEqual(b.body.cmdId, a.body.cmdId);
+  assert.equal((agents.sf331xA.commands || []).length, 1);
+  assert.equal((agents.sf331xB.commands || []).length, 1);
+});
+
 test("http: the host must have the ticket's repo, not just the org's creds", async () => {
   // Two hosts share the org; only one has the repo. Routing on siteKey alone
   // would spawn on a host that would just log a refusal nobody sees.
