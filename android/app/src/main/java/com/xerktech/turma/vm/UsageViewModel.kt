@@ -140,8 +140,9 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val capturedAt: Long,
         /**
          * The subscription's human-readable name (XERK-541), or blank. When set
-         * it heads the card and [host] (the machine list) becomes the subtitle,
-         * answering "which machines are in which subscription".
+         * it heads the card ALONE — the phone has no hover to reveal the agents
+         * behind it as web does, so [host] (the machine list) is not shown. Blank
+         * → [host] heads the card, as it did before names existed.
          */
         val label: String = "",
         val fiveHour: LimitView? = null,
