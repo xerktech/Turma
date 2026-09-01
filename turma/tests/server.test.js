@@ -12182,6 +12182,48 @@ test("a malformed refusal can't poison the cache or break the beat", async () =>
   assert.equal(bad.status, 200);
 });
 
+// ---- the queued-command cap (XERK-261) --------------------------------------
+
+test("queueCommand caps the per-host queue, dropping the oldest", async () => {
+  // An operator hammering a control against an OFFLINE host: nothing drains the
+  // queue, so without a cap the record grows until it 413s the host out of the
+  // fleet on the beat that would have drained it. The cap holds the depth and
+  // drops the OLDEST (already-stale) command, not the just-enqueued one.
+  await request("POST", "/api/heartbeat", { body: { device: "floodH" }, headers: agentHeaders });
+  const ids = [];
+  for (let i = 0; i < hub.AGENT_COMMAND_QUEUE_MAX + 50; i++) {
+    ids.push(queueCommand("floodH", { type: "kill", sessionId: `s${i}` }));
+  }
+  assert.equal(agents.floodH.commands.length, hub.AGENT_COMMAND_QUEUE_MAX,
+    "queue is held at the cap");
+  const queued = new Set(agents.floodH.commands.map((c) => c.cmdId));
+  assert.ok(queued.has(ids[ids.length - 1]), "the newest command survives");
+  assert.ok(!queued.has(ids[0]), "the oldest command was dropped");
+  // The record stays well under the ceiling, so the host can still beat.
+  assert.ok(hub.agentRecordSize(agents.floodH) < hub.AGENT_RECORD_MAX);
+  assert.equal((await request("POST", "/api/heartbeat",
+    { body: { device: "floodH" }, headers: agentHeaders })).status, 200);
+});
+
+test("queueCommand never grows a record past AGENT_RECORD_MAX, even with fat payloads", async () => {
+  // A command payload is not fixed-size (a spawn `label` is taken up to 100k),
+  // so the COUNT cap alone does not hold the byte ceiling — the general
+  // invariant is that no hub-side write leaves a record over AGENT_RECORD_MAX.
+  await request("POST", "/api/heartbeat", { body: { device: "fatH" }, headers: agentHeaders });
+  const big = "x".repeat(200 * 1024);
+  let last;
+  for (let i = 0; i < 100; i++) {
+    last = queueCommand("fatH", { type: "spawn", label: big, sessionId: `s${i}` });
+  }
+  assert.ok(hub.agentRecordSize(agents.fatH) <= hub.AGENT_RECORD_MAX,
+    "record trimmed to fit under the ceiling");
+  assert.ok(agents.fatH.commands.length >= 1, "the queue is never emptied below the last command");
+  assert.equal(agents.fatH.commands[agents.fatH.commands.length - 1].cmdId, last,
+    "the just-enqueued command is the one kept");
+  assert.equal((await request("POST", "/api/heartbeat",
+    { body: { device: "fatH" }, headers: agentHeaders })).status, 200);
+});
+
 test("migrate: the blob relay rejects an unauthenticated caller", async () => {
   await migHost("auA", "au.atlassian.net");
   await migHost("auB", "au.atlassian.net");

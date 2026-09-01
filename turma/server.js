@@ -2517,6 +2517,40 @@ function queueCommand(key, cmd) {
   const cmdId = crypto.randomBytes(6).toString("hex");
   a.commands = a.commands || [];
   a.commands.push({ ...cmd, cmdId });
+  // Bound the queue so a hub-side write can never grow this record without limit
+  // and lock the host out with permanent 413s (XERK-261). Two bounds, oldest
+  // dropped first:
+  //   1. COUNT — the common flood is many small commands (the ticket's repro was
+  //      1316 queued model-source commands against an offline host); the count
+  //      cap alone bounds those with a length check, no serialization.
+  //   2. BYTES — a command payload is not fixed-size (a spawn `label` is taken up
+  //      to 100k), so the count cap is not enough to hold AGENT_RECORD_MAX, and a
+  //      record already near the ceiling for legitimate reasons can be pushed
+  //      over by even one command. The general invariant this ticket asks for —
+  //      no hub-side write leaves a record past the ceiling — is enforced by
+  //      trimming until it fits, always leaving the command just enqueued
+  //      (dropping it would make queueCommand silently no-op its own caller).
+  // queueCommand is a low-frequency path (operator actions, at most one ticket
+  // dispatch per host per beat), so measuring the record once here is cheap; the
+  // measurement doubles as the `recordBytes` update that keeps the aggregate
+  // budget honest for an OFFLINE host, which never re-measures on its own beat.
+  if (a.commands.length > AGENT_COMMAND_QUEUE_MAX) {
+    const dropped = a.commands.length - AGENT_COMMAND_QUEUE_MAX;
+    a.commands.splice(0, dropped);
+    logCommandTrim(`${logName(a.device || key)} over ${AGENT_COMMAND_QUEUE_MAX} queued `
+      + `commands — dropped ${dropped} oldest`);
+  }
+  let size = agentRecordSize(a);
+  if (size > AGENT_RECORD_MAX && a.commands.length > 1) {
+    let dropped = 0;
+    while (a.commands.length > 1 && (size = agentRecordSize(a)) > AGENT_RECORD_MAX) {
+      a.commands.shift();
+      dropped += 1;
+    }
+    logCommandTrim(`${logName(a.device || key)} record over ${AGENT_RECORD_MAX} bytes with `
+      + `commands queued — dropped ${dropped} oldest to fit`);
+  }
+  recordBytes.set(key, size);
   scheduleSave();
   // The queued command is part of the serialized record — refresh the cache and
   // push it so other open dashboards reflect the in-flight command right away.
@@ -4680,6 +4714,38 @@ const HEARTBEAT_UNKNOWN_MAX = 64 << 10; // 64 KiB
 // the payload and which are separately bounded by count: a legitimate ~5 MiB
 // `/history` delivery lands there and must not cost the host its heartbeat.
 const AGENT_RECORD_MAX = 8 << 20; // 8 MiB
+
+// The most queued commands one host's record may hold (XERK-261). `queueCommand`
+// appends to `a.commands` and every append re-serializes the whole record and
+// SSE-broadcasts it, so the queue is a HUB-SIDE write that grows a record with
+// no bound of its own: an operator hammering a control (e.g. `/model-source`)
+// against an OFFLINE host — nothing drains the queue until it returns — could
+// pile up commands until the record crossed AGENT_RECORD_MAX, after which that
+// host's OWN heartbeats 413 forever (the drain needs a beat, and the beat is
+// what gets refused). A queue already this deep for an offline host has no
+// legitimate reading — the commands are stale by the time it returns — so the
+// cap drops the OLDEST past it rather than refusing the enqueue (which would
+// change every call site's return contract). Sized far above any legitimate
+// depth: an online host drains one per beat, so it never approaches this; only
+// a flood or a long-offline host does.
+const AGENT_COMMAND_QUEUE_MAX = positiveEnv("AGENT_COMMAND_QUEUE_MAX", 256);
+
+// Throttled log for the queue-cap trim, same discipline as logRegistryFull: the
+// flood this exists to survive is exactly the traffic that would write the line,
+// so an unthrottled log turns a bounded queue into disk pressure.
+const COMMAND_TRIM_LOG_EVERY_MS = 60 * 1000;
+let commandTrimLogAt = 0;
+let commandTrimSinceLog = 0;
+function logCommandTrim(detail) {
+  commandTrimSinceLog += 1;
+  const now = Date.now();
+  if (now - commandTrimLogAt < COMMAND_TRIM_LOG_EVERY_MS) return;
+  const also = commandTrimSinceLog > 1
+    ? ` (+${commandTrimSinceLog - 1} more trims since the last line)` : "";
+  commandTrimLogAt = now;
+  commandTrimSinceLog = 0;
+  console.warn(`queued-command cap: ${detail}${also}`);
+}
 
 // Which hosts are already over half the ceiling, so the warning above fires on
 // the crossing rather than on every beat.
@@ -12257,6 +12323,11 @@ if (process.env.TURMA_TEST) {
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
     HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
+    // XERK-261: the per-host queued-command cap. Exported so a test can pin that
+    // a hub-side flood against an offline host cannot grow its record past
+    // AGENT_RECORD_MAX and 413 it out of the fleet — the suite stayed green while
+    // an unbounded queue could.
+    AGENT_COMMAND_QUEUE_MAX,
     // XERK-272 registry bounds. Exported for the same reason as the group above:
     // the per-record ceiling stayed green while an unbounded NUMBER of records
     // OOM-killed the hub, so the aggregate has to be pinned by name too.
