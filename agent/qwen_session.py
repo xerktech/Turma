@@ -50,12 +50,19 @@ import time
 try:
     # Imported as a sibling module by hub-agent.py (same dir on sys.path).
     from qwen_transcript import QwenProjector
-    # The per-child projection cursor + the file-ensure/append helpers are shared
-    # with the dsh tail (XERK-528); only WHERE a child lands and the parent-pump /
-    # native-log mirror below are qwen-specific.
-    from runtime_tail import ChildProjection, append_entries
+    # The per-child projection cursor, the file-ensure/append helpers and the
+    # crash-safe numeric-env parser are shared with the dsh tail (XERK-528); only
+    # WHERE a child lands and the parent-pump / native-log mirror below are
+    # qwen-specific.
+    from runtime_tail import ChildProjection, append_entries, env_float
 except ImportError:  # pragma: no cover - only when run outside the agent dir
     QwenProjector = None
+
+    # Degraded standalone import (runtime_tail absent): the tail is a no-op here,
+    # but the module-scope knob below still evaluates, so keep the safe-parse
+    # contract (never raise on a junk value) with a default-returning stub.
+    def env_float(name, default, **_kw):
+        return default
 
 # A child subagent's id names both the Qwen native log file
 # (`subagents/<parent>/agent-<id>.jsonl`) and the projected `agent-<id>.jsonl`
@@ -66,7 +73,7 @@ _CHILD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # How often the projection tail wakes to look for new native events, when it is
 # not being poked. Cheap: it only reads bytes appended since its last offset.
-QWEN_PROJECTION_POLL_SEC = float(os.environ.get("QWEN_PROJECTION_POLL_SEC", "0.5"))
+QWEN_PROJECTION_POLL_SEC = env_float("QWEN_PROJECTION_POLL_SEC", 0.5)
 
 # The event `type`s a Qwen native log MIGHT carry a generated session title on.
 # The G0 spike found NO native title mechanism in the corpus (Qwen emits no

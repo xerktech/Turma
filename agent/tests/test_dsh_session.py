@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -590,6 +591,47 @@ class DshDelegationTailTest(unittest.TestCase):
         dest = os.path.join(self.transcript[:-len(".jsonl")], "subagents",
                             "agent-b0b0b0b0.jsonl")
         self.assertFalse(os.path.exists(dest))
+
+
+class ModuleEnvKnobsTest(unittest.TestCase):
+    """The module-scope numeric knobs fall back instead of raising on a junk
+    value (XERK-523). dsh_session.py is imported by hub-agent's dsh launch paths,
+    so a mistyped DSH_* value must never crash the import (and the spawn), the way
+    a bare float(os.environ.get(...)) did."""
+
+    def _reimport(self, env_overrides):
+        """Re-exec dsh_session.py in a subprocess (import-time is when the knobs
+        parse) with the given env, returning (returncode, stdout, stderr_tail)."""
+        env = dict(os.environ, **env_overrides)
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r);" % AGENT_DIR +
+             "import importlib.util as u;"
+             "s=u.spec_from_file_location('dsh_session', %r);" % os.path.join(
+                 AGENT_DIR, "dsh_session.py") +
+             "m=u.module_from_spec(s); s.loader.exec_module(m);"
+             "print(m.DSH_ACK_TIMEOUT_SEC, m.DSH_CONNECT_TIMEOUT_SEC, "
+             "m.DSH_LINE_MAX_BYTES, m.DSH_PROJECTION_POLL_SEC)"],
+            capture_output=True, text=True, env=env)
+        return out.returncode, out.stdout.strip(), out.stderr[-400:]
+
+    def test_junk_knobs_fall_back_without_crashing_the_import(self):
+        rc, val, err = self._reimport({
+            "DSH_ACK_TIMEOUT_SEC": "lots",
+            "DSH_CONNECT_TIMEOUT_SEC": "20s",
+            "DSH_LINE_MAX_BYTES": '"4"',
+            "DSH_PROJECTION_POLL_SEC": "nan",
+        })
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(val, "5.0 20.0 4194304 0.5", err)
+
+    def test_valid_knobs_still_apply(self):
+        rc, val, err = self._reimport({
+            "DSH_ACK_TIMEOUT_SEC": "3",
+            "DSH_LINE_MAX_BYTES": "1024",
+        })
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(val, "3.0 20.0 1024 0.5", err)
 
 
 if __name__ == "__main__":

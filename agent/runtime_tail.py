@@ -10,6 +10,9 @@ incremental-offset state machine was, by construction, near-identical between th
 two (the qwen tail was copied from the dsh one). This holds the identical part
 ONCE:
 
+  * `env_num`/`env_int`/`env_float` — parse a numeric env knob at import time,
+    falling back to the default instead of raising on junk (the XERK-372 crash-
+    loop guard, for the stdlib-only siblings that can't reach hub-agent's copy).
   * `ensure_transcript_file` — create an empty transcript (+ parent dir) so a
     pinned/child path resolves the moment a session/child launches.
   * `append_entries` — append projected entry dicts as JSONL, `ensure_ascii=False`.
@@ -27,6 +30,7 @@ retries.
 """
 
 import json
+import math
 import os
 import sys
 
@@ -35,6 +39,56 @@ import sys
 _AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _AGENT_DIR not in sys.path:
     sys.path.insert(0, _AGENT_DIR)
+
+
+def env_num(name, default, cast, *, minimum=None, maximum=None):
+    """Read a numeric env var, FALLING BACK to `default` instead of raising.
+
+    The shared twin of hub-agent.py's `_env_num` (XERK-372), for the stdlib-only
+    per-runtime sibling modules (`dsh_session.py`, `qwen_session.py`) that parse
+    their own numeric knobs at IMPORT time and cannot reach hub-agent's private
+    copy. A bare `int(os.environ.get(...))` / `float(...)` RAISES on anything that
+    is not a clean number — an empty string, a stray space, "10m", a value that
+    kept its YAML quotes as `"20"`. These modules are imported by the agent's
+    dsh/qwen launch paths, so a mistyped value would crash the spawn (and, for a
+    knob read at hub-agent import time, the whole host) rather than fall back
+    cleanly (XERK-523). So a bad value is warned to stderr and IGNORED: running
+    the default beats crashing. `default` is the already-typed fallback (an
+    int/float, not a string); `minimum`/`maximum`, where given, clamp a
+    parseable-but-absurd value. The `[hub-agent] ` prefix matches the format the
+    fleet already greps its boot warnings by."""
+    raw = os.environ.get(name)
+    set_by_operator = raw is not None and raw.strip() != ""
+    if set_by_operator:
+        try:
+            val = cast(raw.strip())
+            if isinstance(val, float) and not math.isfinite(val):
+                raise ValueError("non-finite")
+        except (ValueError, TypeError):
+            print(f"[hub-agent] WARNING: {name}={raw!r} is not a valid number "
+                  f"— falling back to {default}", file=sys.stderr, flush=True)
+            val = default
+    else:
+        val = default
+    if minimum is not None and val < minimum:
+        if set_by_operator:
+            print(f"[hub-agent] WARNING: {name}={val} is below the minimum "
+                  f"{minimum} — using {minimum}", file=sys.stderr, flush=True)
+        val = minimum
+    if maximum is not None and val > maximum:
+        if set_by_operator:
+            print(f"[hub-agent] WARNING: {name}={val} is above the maximum "
+                  f"{maximum} — using {maximum}", file=sys.stderr, flush=True)
+        val = maximum
+    return val
+
+
+def env_int(name, default, *, minimum=None, maximum=None):
+    return env_num(name, default, int, minimum=minimum, maximum=maximum)
+
+
+def env_float(name, default, *, minimum=None, maximum=None):
+    return env_num(name, default, float, minimum=minimum, maximum=maximum)
 
 
 def ensure_transcript_file(path, log, what="transcript"):
