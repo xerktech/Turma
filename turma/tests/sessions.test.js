@@ -240,7 +240,7 @@ test("background agents keep a session Active and name what is running", () => {
   const { now, host: h } = host([
     running("11111", "Delegating Task", {
       paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false,
-      agents: [{ type: "qa", label: "QA the parity change" }],
+      agents: [{ type: "general-purpose", label: "Research the parity change" }],
     }),
   ]);
   render({ now, agents: [h] });
@@ -258,7 +258,7 @@ test("background agents: the count is pluralized, and an empty list changes noth
   const { now, host: h } = host([
     running("11111", "Fan Out", {
       paneBusy: false, transcriptAgeSec: 5,
-      agents: [{ type: "qa", label: "QA it" }, { type: "Explore", label: "Map it" }],
+      agents: [{ type: "Explore", label: "Search it" }, { type: "Explore", label: "Map it" }],
     }),
     // An agent predating the field reports none: unchanged, still Idle.
     idle("22222", "Quiet Task"),
@@ -266,6 +266,41 @@ test("background agents: the count is pluralized, and an empty list changes noth
   render({ now, agents: [h] });
   assert.ok(els.active.innerHTML.includes("2 background agents"));
   assert.ok(els.idle.innerHTML.includes("Quiet Task"));
+});
+
+// XERK-538. A running QA / QA-delta subagent is the operator's own change being
+// adversarially exercised — a distinct thing to watch. The card stays Active (it
+// is still working) but says "QA Review" rather than a bare agent count.
+test("a QA agent reads 'QA Review' and stays Active", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    running("11111", "Ship the fix", {
+      paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false,
+      agents: [{ type: "qa", label: "QA the change" }],
+    }),
+  ]);
+  render({ now, agents: [h] });
+  assert.match(els.active.innerHTML, /Active <span class="count">1<\/span>/);
+  assert.ok(els.active.innerHTML.includes("QA Review"), "the card names the QA pass");
+  assert.ok(!els.active.innerHTML.includes("background agent"),
+    "QA Review replaces the bare count, it does not sit beside it");
+  assert.ok(!els.review.innerHTML.includes("Ship the fix"),
+    "a session under QA is not itself ready for review");
+});
+
+// qa-delta is every pass after the first, and it wins over a co-running ordinary
+// agent — the QA pass is what the operator is waiting on.
+test("qa-delta reads 'QA Review', even beside another agent", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    running("11111", "Ship the fix", {
+      paneBusy: false, transcriptAgeSec: 5,
+      agents: [{ type: "Explore", label: "Map it" }, { type: "qa-delta", label: "Re-QA" }],
+    }),
+  ]);
+  render({ now, agents: [h] });
+  assert.ok(els.active.innerHTML.includes("QA Review"));
+  assert.ok(!els.active.innerHTML.includes("2 background agents"));
 });
 
 test("running sessions split: working -> Active, quiet-with-nothing-pending -> Idle", () => {
@@ -2412,4 +2447,37 @@ test("sessions: mergeSnapshot honours a host the snapshot dropped and one it rem
   p.mergeSnapshot({ now: Date.now(), agents: [rec("stay"), rec("gone")], migrations: [] }, since2);
   assert.deepEqual(p.getCache().agents.map((a) => a.key), ["stay"],
     "the host removed mid-fetch is not resurrected");
+});
+
+// XERK-545: `migrations` and `orgColors` are ALSO SSE-live-patched top-level keys,
+// so an in-flight snapshot must not clobber a patch that landed after the fetch
+// started — the same XERK-444 race, on the two keys the agents merge deliberately
+// left scope-out. The SSE handlers stamp them; mergeSnapshot keeps the live value
+// when it was patched after `since`, else takes the snapshot's.
+test("sessions: mergeSnapshot keeps a migrations patch that landed mid-fetch (XERK-545)", () => {
+  const p = loadPage();
+  p.setCache({ now: Date.now(), agents: [], migrations: [{ id: "m", phase: "exporting" }] });
+
+  const since = p.sseClock();                                     // refresh() captures this before its fetch
+  p.sse.emit("migrations", [{ id: "m", phase: "importing" }]);   // the move advances mid-fetch
+  p.mergeSnapshot({ now: Date.now(), agents: [], migrations: [{ id: "m", phase: "exporting" }] }, since);
+  assert.equal(p.getCache().migrations[0].phase, "importing",
+    "the live migrations patch survives the older snapshot");
+
+  // With no patch this window the snapshot is authoritative on migrations again.
+  const since2 = p.sseClock();
+  p.mergeSnapshot({ now: Date.now(), agents: [], migrations: [{ id: "m", phase: "exporting" }] }, since2);
+  assert.equal(p.getCache().migrations[0].phase, "exporting",
+    "an unraced snapshot still replaces migrations");
+});
+
+test("sessions: mergeSnapshot keeps an orgColors patch that landed mid-fetch (XERK-545)", () => {
+  const p = loadPage();
+  p.setCache({ now: Date.now(), agents: [], migrations: [], orgColors: { o: "red" } });
+
+  const since = p.sseClock();
+  p.sse.emit("orgColors", { o: "blue" });                        // a pin flips mid-fetch
+  p.mergeSnapshot({ now: Date.now(), agents: [], migrations: [], orgColors: { o: "red" } }, since);
+  assert.deepEqual(p.getCache().orgColors, { o: "blue" },
+    "the live orgColors patch survives the older snapshot");
 });

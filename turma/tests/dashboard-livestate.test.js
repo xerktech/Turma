@@ -73,16 +73,33 @@ test("dashboard liveState: paneBusy still decides when no agents are reported", 
 test("dashboard liveState: background agents read as working and are named", () => {
   const { liveState } = loadDashboard();
   const one = liveState(
-    sess({ paneBusy: false, transcriptAgeSec: 900, agents: [{ type: "qa", label: "QA it" }] }),
+    sess({ paneBusy: false, transcriptAgeSec: 900, agents: [{ type: "Explore", label: "Search it" }] }),
     onlineHost, NOW);
   assert.equal(one.label, "1 background agent");
   assert.equal(one.cls, "sess-working");
   assert.equal(one.busy, true);
 
   const many = liveState(
-    sess({ paneBusy: false, transcriptAgeSec: 900, agents: [{ type: "qa" }, { type: "Explore" }] }),
+    sess({ paneBusy: false, transcriptAgeSec: 900, agents: [{ type: "Explore" }, { type: "general-purpose" }] }),
     onlineHost, NOW);
   assert.equal(many.label, "2 background agents");
+});
+
+// XERK-538: a QA / QA-delta pass reads "QA Review" while staying working (Active).
+test("dashboard liveState: a QA agent reads 'QA Review' and stays working", () => {
+  const { liveState } = loadDashboard();
+  const qa = liveState(
+    sess({ paneBusy: false, transcriptAgeSec: 900, agents: [{ type: "qa", label: "QA it" }] }),
+    onlineHost, NOW);
+  assert.equal(qa.label, "QA Review");
+  assert.equal(qa.cls, "sess-working");
+  assert.equal(qa.busy, true);
+
+  // qa-delta wins over a co-running ordinary agent.
+  const delta = liveState(
+    sess({ paneBusy: false, transcriptAgeSec: 900, agents: [{ type: "Explore" }, { type: "qa-delta" }] }),
+    onlineHost, NOW);
+  assert.equal(delta.label, "QA Review");
 });
 
 test("dashboard liveState: empty list is 'no agents'; a missing field changes nothing", () => {

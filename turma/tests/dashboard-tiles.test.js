@@ -509,3 +509,25 @@ test("XERK-544: autoPausedBadge shows only when the hub flags the host paused", 
   assert.equal(D.autoPausedBadge({ autoPaused: false }), "");
   assert.equal(D.autoPausedBadge({}), "");   // absent = not paused / can't tell
 });
+
+// XERK-545: `orgColors` is a top-level key SSE ALSO live-patches, so an in-flight
+// snapshot can clobber a pin that landed after the fetch started — the same
+// XERK-444 race, on a key the agents merge doesn't cover. The handler stamps it;
+// mergeSnapshot keeps the live value when patched after `since`.
+test("dashboard: an in-flight snapshot does not clobber a newer orgColors SSE patch (XERK-545)", () => {
+  const D = loadDashboard();
+  D.setCache({ now: Date.now(), agents: [], orgColors: { o: "red" }, retiredUsage: [] });
+  const since = D.sseClock();     // what the in-flight refresh() captured before its fetch
+  D.connectSSE();
+  const es = D.sse[D.sse.length - 1];
+  es.handlers.orgColors({ data: JSON.stringify({ o: "blue" }) });   // a pin flips mid-fetch
+  D.mergeSnapshot({ now: Date.now(), agents: [], orgColors: { o: "red" }, retiredUsage: [] }, since);
+  assert.deepEqual(D.getCache().orgColors, { o: "blue" },
+    "the live orgColors patch survives the older snapshot");
+
+  // With no patch this window the snapshot is authoritative on orgColors again.
+  const since2 = D.sseClock();
+  D.mergeSnapshot({ now: Date.now(), agents: [], orgColors: { o: "green" }, retiredUsage: [] }, since2);
+  assert.deepEqual(D.getCache().orgColors, { o: "green" },
+    "an unraced snapshot still replaces orgColors");
+});

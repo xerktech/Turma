@@ -198,6 +198,17 @@ CODING_AGENT_NAME = "Claude Code"
 # Where worktrees live: under a dot-dir so the repo scan never lists them, and
 # on the mounted tree so they survive a container restart.
 WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".turma", "worktrees")
+# Where an in-flight `git clone` writes before it is renamed into place
+# (XERK-374). A clone lands here — under the same .turma dot-dir scan_repos
+# skips, on the SAME filesystem as REPOS_ROOT so the final os.rename is atomic —
+# and only appears at REPOS_ROOT/<name> once it is complete and forkable. A clone
+# is a bare subprocess (not tmux-hosted), so KillMode=process CAN leave it running
+# across an in-place restart — but nothing tracks it across the restart, so a
+# survivor can never be promoted into place (only _poll_clones does that, and it
+# died with its manager). So it is reaped at shutdown (_kill_clones), and whatever
+# a crash skipped is mopped up by _sweep_clone_tmp at boot. Either way the
+# abandoned dir is here, never a half-repo under REPOS_ROOT that blocks a re-clone.
+CLONES_TMP_ROOT = os.path.join(REPOS_ROOT, ".turma", "clones")
 # Persisted session registry (survives container restart).
 REGISTRY_DIR = os.path.expanduser("~/.turma")
 REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
@@ -9533,6 +9544,15 @@ CLONE_TIMEOUT_SEC = 600     # reap a `git clone` subprocess stuck this long
 CLONE_PROGRESS_MAX = 120
 CLONE_DONE_LINGER_SEC = 30  # keep a finished clone job visible this long...
 CLONE_ERROR_LINGER_SEC = 300  # ...longer for a failed one (operator reads it)
+# The boot sweep of abandoned clone staging dirs (XERK-374) leaves alone any dir
+# written this recently — an orphaned `git clone` that outlived a CRASH (one that
+# skipped _handle_shutdown, so _kill_clones didn't reap it) may still be writing,
+# and rmtree'ing it out from under a live git is the corruption we refuse to do.
+# Freshness is the newest mtime ANYWHERE under the dir, not the dir's own: git
+# streams incoming objects into one deep pack file whose appends bump that file's
+# mtime but no parent directory's, so a slow fetch leaves the top-level mtime
+# stale while git is alive. A dir whose newest file is this old is finished/dead.
+CLONE_TMP_MIN_AGE_SEC = 120
 PRUNE_RESULT_LINGER_SEC = 60  # keep a FINISHED repo's prune summary in the heartbeat
 # A prune runs on its own worker thread (XERK-256), so its git commands are NOT
 # on the heartbeat's critical path and can be bounded generously instead of
@@ -16712,16 +16732,17 @@ class SessionManager:
                                   f"nothing to fork a session from")
                     elif sess.get("awaitCloneOwner") and os.path.exists(
                             sess["repoPath"]):
-                        # No job of ours, but a directory: the clone was lost with
-                        # the manager that launched it (the native launcher runs
-                        # hub-agent.py as its managed foreground process, so
-                        # nothing of ours survives a restart). `clone()` refuses a
-                        # dest that exists, so nothing here can retry — say so in
-                        # one beat rather than spin the card out to the deadline.
-                        # Removing that directory is the operator's call, and the
-                        # cause is stated as the condition it actually is: after a
-                        # restart we cannot tell an aborted clone from an empty
-                        # repo, so this claims neither.
+                        # No job of ours, but a directory sits at the dest that is
+                        # not forkable. Since XERK-374 a clone stages under
+                        # .turma/clones and only renames into place complete, so
+                        # OUR own interrupted clones no longer land here (the
+                        # re-clone branch below handles them, and the boot sweep
+                        # reaps the staging dir) — what remains is a directory
+                        # Turma did not put there: a hand-run clone, a bare `git
+                        # init`, or a legacy partial from before that change.
+                        # `clone()` refuses a dest that exists, so nothing here
+                        # can retry — say so in one beat rather than spin the card
+                        # out to the deadline. Removing it is the operator's call.
                         self._set_error(
                             sess, f"{name} has no commit to fork from and "
                                   f"{sess['repoPath']} already exists, so a "
@@ -22382,14 +22403,36 @@ class SessionManager:
             src = "github"
             name = repo_id.split("/")[1]
             url = f"https://github.com/{repo_id}.git"
+        # A clone of this repo already in flight? Leave it strictly alone
+        # (XERK-374). Before staging, git created <dest>/.git on the first beat,
+        # so a duplicate request (a double-click, a second operator, the board's
+        # on-demand path racing the composer) hit the os.path.exists(dest) refusal
+        # below. Staging keeps dest empty for the whole clone, so that check no
+        # longer catches it — and both requests compute the SAME staging path
+        # (slug + this manager's pid), so the second's pre-clean rmtree would
+        # delete the first's live checkout out from under a running git. Refuse
+        # the duplicate here instead. A terminal ("done"/"error") job for this
+        # name does NOT block a fresh clone — that is an ordinary re-clone.
+        existing = self.clones.get(name)
+        if existing and existing.get("status") == "cloning":
+            log(f"clone: {name} is already being cloned; ignoring duplicate")
+            return
+        dest = os.path.join(REPOS_ROOT, name)
+        # Clone into a private staging dir and rename into place only once it is
+        # complete (XERK-374). REPOS_ROOT/<name> therefore only ever appears as a
+        # finished repo — never the `.git`-with-unborn-HEAD half-clone a restart
+        # mid-clone used to strand, which scan_repos still listed, no session
+        # could fork from, and clone() itself refused to re-clone over. The tmp
+        # dir carries the pid so a same-name re-clone by a later manager never
+        # meets this one's staging dir (the dedup above rules out same-pid ones).
+        tmp = os.path.join(CLONES_TMP_ROOT, f"{slugify(name)}-{os.getpid()}")
         job = {
             "name": name, "repo": repo_id, "status": "cloning", "error": None,
             "source": src, "startedAt": now_iso(), "startedMono": time.time(),
-            "proc": None, "logf": None,
+            "proc": None, "logf": None, "dest": dest, "tmp": tmp,
             "logPath": os.path.join(REGISTRY_DIR, f"clone-{slugify(name)}.log"),
         }
         self.clones[name] = job
-        dest = os.path.join(REPOS_ROOT, name)
         if os.path.exists(dest):
             job["status"] = "error"
             job["error"] = f"'{name}' already exists under the repos root"
@@ -22404,6 +22447,11 @@ class SessionManager:
             env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
+            os.makedirs(CLONES_TMP_ROOT, exist_ok=True)
+            # A leftover tmp from an interrupted clone of THIS repo would make git
+            # refuse a non-empty target; the boot sweep normally clears it, but a
+            # same-name retry within one manager's life could still meet it.
+            shutil.rmtree(tmp, ignore_errors=True)
             logf = open(job["logPath"], "w")
             proc = subprocess.Popen(
                 # `--progress` because stdout is a FILE, not a terminal, and
@@ -22412,7 +22460,7 @@ class SessionManager:
                 # bytes for ArgoCD, measured — so the UI has nothing to show
                 # while a clone runs and a big one looks indistinguishable from
                 # a hang.
-                ["git", "clone", "--progress", "--", url, dest],
+                ["git", "clone", "--progress", "--", url, tmp],
                 stdout=logf, stderr=subprocess.STDOUT, env=env,
             )
         except Exception as e:
@@ -22423,7 +22471,7 @@ class SessionManager:
             return
         job["proc"] = proc
         job["logf"] = logf
-        log(f"cloning {repo_id} ({src}) into {dest}")
+        log(f"cloning {repo_id} ({src}) into {tmp} -> {dest}")
 
     def _clone_progress(self, job):
         """The most recent line git wrote, for the UI's cloning row.
@@ -22478,7 +22526,36 @@ class SessionManager:
         if status == "done":
             log(f"cloned {job['repo']} -> {job['name']}")
         else:
+            # A failed clone's staging dir is disposable and ours (XERK-374) —
+            # remove it so it doesn't accumulate under .turma/clones or block a
+            # retry of the same repo within this manager's life. A "done" job
+            # already moved its tmp into place (_promote_clone), so there is
+            # nothing to remove there.
+            tmp = job.get("tmp")
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
             log(f"clone failed for {job['repo']}: {job.get('error')}")
+
+    def _promote_clone(self, job):
+        """Atomically move a finished clone from its staging dir into place under
+        REPOS_ROOT (XERK-374). Returns None on success, or an operator-facing
+        error string. tmp and dest are on the same filesystem (both under
+        REPOS_ROOT), so the rename is atomic: REPOS_ROOT/<name> never exists as a
+        partial repo. A dest that appeared meanwhile (a hand-run clone, a manual
+        mkdir) is NOT clobbered — the staged clone is dropped and the collision
+        reported, the same refusal clone() gives on entry."""
+        tmp, dest = job.get("tmp"), job.get("dest")
+        if not tmp or not dest:
+            return "clone staging path missing"
+        if os.path.exists(dest):
+            shutil.rmtree(tmp, ignore_errors=True)
+            return f"'{job['name']}' appeared under the repos root during its clone"
+        try:
+            os.rename(tmp, dest)
+        except OSError as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return f"could not move the finished clone into place: {e}"
+        return None
 
     def _cloning(self, repo_name):
         """Whether a clone THIS manager launched is running for <repo_name>. The
@@ -22503,8 +22580,16 @@ class SessionManager:
                             pass
                         self._finish_clone(job, "error", "clone timed out")
                     continue
-                if rc == 0 and os.path.isdir(os.path.join(REPOS_ROOT, name, ".git")):
-                    self._finish_clone(job, "done", None)
+                tmp = job.get("tmp") or ""
+                if rc == 0 and os.path.isdir(os.path.join(tmp, ".git")):
+                    # Move the staging dir into place before calling it done — a
+                    # failed rename is a failed clone, not a repo the drain will
+                    # then try to fork from an empty dir (XERK-374).
+                    err = self._promote_clone(job)
+                    if err:
+                        self._finish_clone(job, "error", err)
+                    else:
+                        self._finish_clone(job, "done", None)
                 else:
                     self._finish_clone(
                         job, "error",
@@ -22514,6 +22599,98 @@ class SessionManager:
             linger = CLONE_DONE_LINGER_SEC if job.get("status") == "done" else CLONE_ERROR_LINGER_SEC
             if now - job.get("finishedMono", job.get("startedMono", now)) > linger:
                 self.clones.pop(name, None)
+
+    def _kill_clones(self):
+        """Reap in-flight `git clone` subprocesses and drop their staging dirs.
+        Called from _handle_shutdown (XERK-374).
+
+        A clone is a bare subprocess, so KillMode=process would otherwise leave it
+        running when this manager exits for an in-place restart — but nothing
+        tracks it across the restart, so a survivor can NEVER be promoted into
+        place (only _poll_clones does that, and it dies with us). Killing it here
+        therefore loses no usable work; leaving it orphaned only wastes
+        network/disk and races the next boot's _sweep_clone_tmp for its dir.
+        Best-effort; never raises."""
+        for job in list(self.clones.values()):
+            proc = job.get("proc")
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            tmp = job.get("tmp")
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    def _staging_recent_mtime(self, path, cap=2000):
+        """Newest mtime anywhere under a clone staging dir (XERK-374), for the
+        sweep's still-being-written check. The dir's OWN mtime is not enough: git
+        streams incoming objects into a single deep pack file under
+        .git/objects/pack/, and appends to that file bump only ITS mtime, no
+        parent directory's — so a slow fetch can leave the top-level mtime stale
+        while git is very much alive. Walk for the max instead, bounded: an
+        in-progress fetch has only a handful of files, and a tree already large
+        enough to hit `cap` is reported as fresh (the SAFE direction — keep a
+        maybe-live dir, reap it a boot later). lstat, so a symlink is measured,
+        never followed. Returns None only if the dir itself is unreadable."""
+        try:
+            newest = os.path.getmtime(path)
+        except OSError:
+            return None
+        seen = 0
+        for root, _dirs, files in os.walk(path):  # followlinks False by default
+            for name in files:
+                try:
+                    m = os.lstat(os.path.join(root, name)).st_mtime
+                except OSError:
+                    continue
+                if m > newest:
+                    newest = m
+                seen += 1
+                if seen >= cap:
+                    return time.time()  # too big to scan cheaply — treat as fresh
+        return newest
+
+    def _sweep_clone_tmp(self):
+        """Remove staging dirs left by clones that didn't finish (XERK-374).
+
+        The staging dir lives under .turma/clones, invisible to scan_repos and
+        never renamed into place, so it strands no repo — but it must not
+        accumulate. A graceful restart reaps its own in-flight clones
+        (_kill_clones), so at boot the common case is that these dirs belong to
+        clones that are already dead; this mops up whatever a CRASH skipped.
+
+        Two dirs are left ALONE: one belonging to a job THIS manager still has in
+        self.clones (there is none at boot, but the guard keeps the sweep safe on
+        any later call), and one whose NEWEST file was written within
+        CLONE_TMP_MIN_AGE_SEC (_staging_recent_mtime, not the dir's own mtime) —
+        an orphaned git that outlived a crash may still be writing, and rmtree'ing
+        it mid-write is the one corruption this sweep must never cause. Such a dir
+        is harmless (invisible, bounded) and is reaped on a later boot once its
+        git has finished or died and its files go stale. Best-effort; never raises
+        onto the caller."""
+        try:
+            entries = os.listdir(CLONES_TMP_ROOT)
+        except OSError:
+            return  # not created yet, or unreadable — nothing to sweep
+        live = {j.get("tmp") for j in self.clones.values()}
+        now = time.time()
+        for entry in entries:
+            path = os.path.join(CLONES_TMP_ROOT, entry)
+            if path in live:
+                continue
+            try:
+                if not os.path.isdir(path):
+                    continue
+                # A dir a live orphan git is still writing must not be deleted
+                # from under it — err toward keeping a harmless dir a cycle longer.
+                recent = self._staging_recent_mtime(path)
+                if recent is None or now - recent < CLONE_TMP_MIN_AGE_SEC:
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+                log(f"clone: swept abandoned staging dir {path}")
+            except Exception as e:
+                log(f"clone: sweep of {path} failed: {e}")
 
     def _clones_payload(self):
         """Serializable view of clone jobs for the heartbeat (no Popen/file)."""
@@ -23644,6 +23821,12 @@ class SessionManager:
         # nothing is waiting on. Reaped here so a crash mid-probe can't leave one
         # sitting until the next probe happens to be due.
         self._kill_limits_probe()
+        # Mop up clone staging dirs a crash left behind (XERK-374) — a graceful
+        # restart reaps its own via _kill_clones, so this covers what skipped that
+        # (SIGKILL, OOM, reboot). Never a half-repo under REPOS_ROOT, which is the
+        # whole point of staging: the drain re-clones cleanly instead of
+        # dead-ending. Guarded against a still-writing orphan by mtime.
+        self._sweep_clone_tmp()
         self.save()
 
     # --- command handling (heartbeat reply) -------------------------------
@@ -25115,6 +25298,14 @@ class SessionManager:
         # through this exit — so its tmux (and the claude in it) is reaped here
         # instead. Sessions are deliberately left alone; this is only ours.
         self._kill_limits_probe()
+        # In-flight `git clone` children are bare subprocesses, not tmux-hosted,
+        # so KillMode=process would leave them running when we exit — but nothing
+        # tracks them across the restart, so a survivor can never be promoted into
+        # place (XERK-374). Reap them here so an in-place update doesn't leave an
+        # orphaned git writing into a staging dir the next boot would race to
+        # sweep. Unlike sessions/dsh-web (deliberately adopted), a clone has no
+        # adoption path, so killing it loses no landable work.
+        self._kill_clones()
         # The host-wide dsh web viewer is DELIBERATELY left running: like a dsh
         # session's tmux it outlives an in-place update (KillMode=process), and
         # the next boot's supervisor adopts the surviving instance (has-session

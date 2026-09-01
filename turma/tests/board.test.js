@@ -2447,3 +2447,170 @@ test("board: the strip carries the id preserveScroll anchors its sideways scroll
   }], "", { now: Date.parse("2026-01-01T00:00:00Z"), allKeys: ["o"] });
   assert.match(html, /class="kanban-cols" id="kanbanCols"/);
 });
+
+// ---------------------------------------------------------------------------
+// XERK-546: board.html's inline-script in-flight /api/agents snapshot merge
+// ---------------------------------------------------------------------------
+// board.html was scoped out of XERK-444 (agents-record clobber) and XERK-545
+// (orgColors/migrations clobber). This ports the sseClock/patchedAt/mergeSnapshot
+// machinery the other three pages carry, so a snapshot that left the hub before a
+// live SSE patch can no longer revert `cache` on arrival. Unlike board.test.js's
+// other cases (which unit-test the board.js module), these load board.html's real
+// inline <script> into a minimal DOM — the same technique dashboard-tiles.test.js /
+// sessions.test.js / usage.test.js use for their pages.
+
+const BOARD_HTML = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
+const BOARD_SCRIPT = [...BOARD_HTML.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
+const TurmaBoardModule = require("../public/board.js");
+
+function loadBoardPage() {
+  const noop = () => {};
+  const els = {};
+  function makeEl(id) {
+    const el = {
+      id, _html: "", textContent: "", value: "", hidden: true, style: {}, dataset: {}, children: [],
+      classList: { add: noop, remove: noop, toggle: noop, contains: () => false },
+      addEventListener: noop, removeEventListener: noop, appendChild(c) { this.children.push(c); return c; },
+      querySelector: () => null, querySelectorAll: () => [], closest: () => null,
+      focus: noop, blur: noop, select: noop, setAttribute: noop, getAttribute: () => null,
+      getBoundingClientRect: () => ({ top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0 }),
+      scrollIntoView: noop, remove: noop,
+    };
+    Object.defineProperty(el, "innerHTML", { get() { return this._html; }, set(v) { this._html = String(v); } });
+    return el;
+  }
+  // Records the page's SSE listeners so a test can deliver one hub event mid-fetch
+  // (the fleet payload is polled ONCE at load while the stream is healthy).
+  const sse = {
+    streams: [],
+    emit(name, data) {
+      const payload = { data: JSON.stringify(data) };
+      for (const s of sse.streams) for (const fn of (s._ls[name] || [])) fn(payload);
+    },
+  };
+  const document = {
+    getElementById(id) { return (els[id] ||= makeEl(id)); },
+    querySelector: () => null, querySelectorAll: () => [], createElement: (t) => makeEl("<" + t + ">"),
+    addEventListener: noop, removeEventListener: noop, body: makeEl("body"), documentElement: makeEl("html"),
+    activeElement: null,
+  };
+  const orgNoop = { get() { return ""; }, getKeys() { return []; }, filter(a) { return a || []; },
+    update: noop, subscribe: noop, sse: noop, orgColors: () => ({}) };
+  const stubs = {
+    document,
+    localStorage: { _m: {}, getItem(k) { return this._m[k] ?? null; }, setItem(k, v) { this._m[k] = String(v); }, removeItem(k) { delete this._m[k]; } },
+    location: { href: "", search: "", pathname: "/board" },
+    navigator: { userAgent: "node" },
+    // The boot refresh() is inert: its fetch never resolves, so a test drives the
+    // merge by calling mergeSnapshot() directly (as the real refresh() would on
+    // the reply), with the sseClock it captured before the "fetch".
+    fetch: () => new Promise(() => {}),
+    EventSource: class {
+      constructor() { this._ls = {}; sse.streams.push(this); }
+      addEventListener(name, fn) { (this._ls[name] ||= []).push(fn); }
+      close() {}
+      static get CLOSED() { return 2; }
+    },
+    setInterval: () => 0, clearInterval: noop, setTimeout: () => 0, clearTimeout: noop,
+    requestAnimationFrame: () => 0, cancelAnimationFrame: noop,
+    history: { replaceState: noop, pushState: noop, back: noop },
+    URL: global.URL, URLSearchParams: global.URLSearchParams,
+    console, Date, Math, JSON, encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
+    addEventListener: noop, removeEventListener: noop,
+    matchMedia: () => ({ matches: false, addEventListener: noop }),
+    TurmaBoard: TurmaBoardModule,
+    TurmaOrg: orgNoop,
+    TurmaNewTicket: { update: noop },
+    TurmaNav: { toast: noop, refusalText: () => "", preserveScroll: (c, paint) => paint() },
+    scrollTo: noop, innerWidth: 1200, innerHeight: 800,
+  };
+  const names = Object.keys(stubs);
+  const fn = new Function(...names, "window",
+    BOARD_SCRIPT + "\n;return { mergeSnapshot, applyAgent, sseClock: () => sseClock,"
+      + " setCache: (c) => { cache = c; }, getCache: () => cache };");
+  const api = fn(...names.map((k) => stubs[k]), stubs);
+  return { ...api, sse };
+}
+
+// Every top-level map board.html live-patches from SSE, paired with the event that
+// carries it. Driving EACH proves the "@"-stamp key each handler passes matches its
+// LIVE_MAPS entry — a typo there silently disables the keep-live for that key.
+const BOARD_LIVE_MAPS = [
+  ["ticketAgents", "ticketAgents"],
+  ["ticketModels", "ticketModels"],
+  ["ticketRuntimes", "ticketRuntimes"],
+  ["ticketQueue", "ticketQueue"],
+  ["orgColors", "orgColors"],
+  ["ticketTriageActions", "triageActions"],   // event name differs from the cache key
+  ["triagePolicies", "triagePolicies"],
+];
+
+for (const [key, event] of BOARD_LIVE_MAPS) {
+  test(`board.html: an in-flight snapshot does not clobber a newer ${event} SSE patch (XERK-546)`, () => {
+    const p = loadBoardPage();
+    p.setCache({ now: Date.now(), agents: [], [key]: { v: "old" } });
+
+    const since = p.sseClock();                     // what the in-flight refresh() captured pre-fetch
+    p.sse.emit(event, { v: "new" });                // a patch lands mid-fetch
+    p.mergeSnapshot({ now: Date.now(), agents: [], [key]: { v: "old" } }, since);
+    assert.deepEqual(p.getCache()[key], { v: "new" },
+      `the live ${key} patch must survive the older snapshot`);
+
+    // With no patch this window the snapshot is authoritative again.
+    const since2 = p.sseClock();
+    p.mergeSnapshot({ now: Date.now(), agents: [], [key]: { v: "snap" } }, since2);
+    assert.deepEqual(p.getCache()[key], { v: "snap" },
+      `an unraced snapshot still replaces ${key}`);
+  });
+}
+
+test("board.html: an in-flight snapshot does not clobber a newer agent SSE patch (XERK-444)", () => {
+  const p = loadBoardPage();
+  p.setCache({ now: Date.now(), agents: [{ key: "h", v: 1 }] });
+
+  const since = p.sseClock();
+  p.sse.emit("agent", { key: "h", v: 2 });          // a fresher record for h lands mid-fetch
+  p.mergeSnapshot({ now: Date.now(), agents: [{ key: "h", v: 1 }] }, since);
+  assert.equal(p.getCache().agents.find((a) => a.key === "h").v, 2,
+    "the live agent patch survives the older snapshot");
+
+  // An unraced snapshot still replaces the record.
+  const since2 = p.sseClock();
+  p.mergeSnapshot({ now: Date.now(), agents: [{ key: "h", v: 3 }] }, since2);
+  assert.equal(p.getCache().agents.find((a) => a.key === "h").v, 3,
+    "an unraced snapshot still replaces the record");
+});
+
+test("board.html: a host removed mid-fetch is not resurrected by the older snapshot (XERK-444)", () => {
+  const p = loadBoardPage();
+  p.setCache({ now: Date.now(), agents: [{ key: "gone", v: 1 }, { key: "stay", v: 1 }] });
+
+  const since = p.sseClock();
+  p.sse.emit("removed", { key: "gone" });           // the host leaves mid-fetch
+  p.mergeSnapshot({ now: Date.now(), agents: [{ key: "gone", v: 1 }, { key: "stay", v: 1 }] }, since);
+  assert.deepEqual(p.getCache().agents.map((a) => a.key), ["stay"],
+    "the host removed mid-fetch is not resurrected by the stale snapshot");
+});
+
+test("board.html: a host that ARRIVED via SSE mid-fetch is carried past the older snapshot (XERK-444)", () => {
+  const p = loadBoardPage();
+  p.setCache({ now: Date.now(), agents: [] });
+
+  const since = p.sseClock();
+  p.sse.emit("agent", { key: "newhost", v: 1 });    // a host the snapshot predates
+  p.mergeSnapshot({ now: Date.now(), agents: [] }, since);
+  assert.deepEqual(p.getCache().agents.map((a) => a.key), ["newhost"],
+    "the live host absent from the older snapshot is carried, not dropped");
+});
+
+test("board.html: refresh() merges rather than wholesale-replacing the snapshot (XERK-546)", () => {
+  // Guards against a revert to `cache = await r.json()`, which is exactly the
+  // clobber this ticket fixes — the merge must go through mergeSnapshot with the
+  // clock captured BEFORE the fetch.
+  assert.match(BOARD_SCRIPT, /const since = sseClock;[\s\S]{0,400}mergeSnapshot\(await r\.json\(\), since\)/,
+    "refresh() must capture sseClock before the fetch and mergeSnapshot the reply");
+  // The `;` anchors this to the code form; the machinery comment mentions the
+  // old `cache = await r.json()` in backticked prose (no trailing semicolon).
+  assert.doesNotMatch(BOARD_SCRIPT, /\bcache = await r\.json\(\);/,
+    "the wholesale `cache = await r.json();` must be gone");
+});
