@@ -3232,6 +3232,64 @@ test("http: spawn route forwards composer options; bare spawn stays minimal", as
   ]);
 });
 
+test("http: XERK-309 bypassPermissions refused for a repos-root session", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  const repos = [{ name: "Turma" }, { name: "(root)" }];
+  await beat({ device: "hroot", repos });
+
+  // Root repo + bypass -> 409 in the hub's own words (XERK-264), never queued.
+  const refused = await request("POST", "/api/agents/hroot/sessions", {
+    body: { repo: "(root)", permissionMode: "bypassPermissions" },
+    headers: userHeaders,
+  });
+  assert.equal(refused.status, 409);
+  assert.match(refused.body.error, /repos-root/);
+
+  // Root repo + any other mode is fine…
+  const okRoot = await request("POST", "/api/agents/hroot/sessions", {
+    body: { repo: "(root)", permissionMode: "plan" }, headers: userHeaders,
+  });
+  assert.equal(okRoot.status, 200);
+  // …and a WORKTREE repo + bypass is still allowed (the capability the mode
+  // exists for — the gate is scoped to root, XERK-309).
+  const okWorktree = await request("POST", "/api/agents/hroot/sessions", {
+    body: { repo: "Turma", permissionMode: "bypassPermissions" }, headers: userHeaders,
+  });
+  assert.equal(okWorktree.status, 200);
+
+  // Only the two 200s queued a spawn; the refused one queued nothing.
+  const q = await beat({ device: "hroot", repos });
+  const spawns = q.body.commands.filter((c) => c.type === "spawn");
+  assert.equal(spawns.length, 2);
+  assert.ok(spawns.every((c) =>
+    !(c.repo === "(root)" && c.permissionMode === "bypassPermissions")));
+
+  // The /api/trigger route shares the same gate.
+  const trig = await request("POST", "/api/trigger", {
+    body: { hostname: "hroot", repo: "(root)", prompt: "x",
+            permissionMode: "bypassPermissions" },
+    headers: { authorization: "Bearer triggertok", "content-type": "application/json" },
+  });
+  assert.equal(trig.status, 409);
+
+  // The live /mode route refuses a switch INTO bypass for a running root
+  // session, but allows it for a worktree session.
+  await beat({ device: "hroot", repos, sessions: [
+    { id: "rs1", repo: "(root)", root: true, status: "running" },
+    { id: "ws1", repo: "Turma", root: false, status: "running" },
+  ] });
+  const modeRefused = await request("POST", "/api/agents/hroot/sessions/rs1/mode", {
+    body: { permissionMode: "bypassPermissions" }, headers: userHeaders,
+  });
+  assert.equal(modeRefused.status, 409);
+  assert.match(modeRefused.body.error, /repos-root/);
+  const modeOk = await request("POST", "/api/agents/hroot/sessions/ws1/mode", {
+    body: { permissionMode: "bypassPermissions" }, headers: userHeaders,
+  });
+  assert.equal(modeOk.status, 200);
+});
+
 test("triggerAuthorized: trigger token OR user login, nothing else", () => {
   const req = (h) => ({ headers: h });
   // The dedicated trigger token passes.

@@ -107,6 +107,19 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     defeats that). Under `bypassPermissions` a session can write anywhere in `~/.claude`; other modes
     prompt. Predates the hook. **Don't describe `~/.claude` as protected without qualifying it: only
     against the file-editing tools.**
+    - **The PERMISSION MODE is the determinant, so XERK-309 gates the most exposed class**: a
+      REPOS-ROOT session (runs directly in `REPOS_ROOT`, no worktree, on the host's own checkout) is
+      refused `bypassPermissions` at spawn AND at a live mode switch. `spawn` enforces it via
+      `resolve_permission_mode(mode, is_root=)`; `set_mode` refuses the same case up front (before its
+      own `resolve_permission_mode`, so an unknown mode still raises as before). Matching hub 409s
+      (`checkSpawnPermissionMode` + the `/mode` route) and every composer/mode picker hides the option
+      for a root repo/session (web `sessions.html`/`index.html`/`chat.js`, Android
+      `FleetDialogs.kt`/`ChatScreen.kt`).
+    - **A WORKTREE session may still choose bypass** — deliberately, so the offered unattended-run
+      capability survives. That class stays exposed to this hole; closing it is the filesystem/uid
+      change XERK-309 weighs (make `~/.claude` unwritable to the session uid), not a mode gate.
+      Tests: `test_resolve_permission_mode_refuses_bypass_for_root` in `test_hub_agent.py`, the
+      `XERK-309:` cases in `server.test.js`.
   - Tests: `test_fileguard.py` (behavioural — resolved paths, asserts `decide()`, not rule strings),
     `test_guard_settings.py`.
   - **A rule's STRING is not an oracle — run `test_matcher_oracle.py` when you change one.** Four

@@ -73,10 +73,11 @@ class SpawnComposerTest {
         localModel: LocalModelInfo? = null,
         dshInfo: DshInfo? = null,
         qwenInfo: com.xerktech.turma.model.QwenInfo? = null,
+        isRoot: Boolean = false,
         onSpawn: (Spawn) -> Unit = {},
     ) = compose.setContent {
         SpawnDialog(
-            host = "nas01", repo = "Turma", isRoot = false,
+            host = "nas01", repo = "Turma", isRoot = isRoot,
             localModel = localModel, dsh = dshInfo, qwen = qwenInfo, onDismiss = {},
             onSpawn = { _, _, _, model, mode, source, lm, agentType ->
                 onSpawn(Spawn(model, mode, source, lm, agentType))
@@ -118,6 +119,17 @@ class SpawnComposerTest {
         show(dshInfo = dsh)
         compose.onNodeWithText("Claude Code").performScrollTo().performClick()
         compose.onNodeWithText("dsh").assertIsDisplayed()
+    }
+
+    @Test
+    fun `a repos-root session hides bypassPermissions`() {
+        // XERK-309: a root session runs directly in REPOS_ROOT with no worktree,
+        // so bypassPermissions is not offered (web hides it too, the hub 409s it).
+        show(isRoot = true)
+        compose.onNodeWithText("Permission mode").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("auto").performScrollTo().performClick()   // open the menu
+        compose.onNodeWithText("plan").assertIsDisplayed()
+        compose.onNodeWithText("bypassPermissions").assertDoesNotExist()
     }
 
     // ---- the wire mapping ----------------------------------------------------

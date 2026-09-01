@@ -530,6 +530,20 @@ class TestSpawnOptionHelpers(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ha.resolve_permission_mode(bad)
 
+    def test_resolve_permission_mode_refuses_bypass_for_root(self):
+        # XERK-309: a repos-root session runs directly in REPOS_ROOT with no
+        # worktree, so it is denied the one mode (bypassPermissions) that opens
+        # the ~/.claude write hole a Bash redirect can reach.
+        with self.assertRaises(ValueError):
+            ha.resolve_permission_mode("bypassPermissions", is_root=True)
+        # Every other mode is still fine for a root session…
+        for ok in ("", "auto", "acceptEdits", "plan", "default"):
+            ha.resolve_permission_mode(ok, is_root=True)
+        # …and a WORKTREE session may still choose bypass (is_root defaults False).
+        self.assertEqual(
+            ha.resolve_permission_mode("bypassPermissions", is_root=False),
+            "bypassPermissions")
+
     def test_dsh_configured_is_off_by_default_and_env_gated(self):
         # The in-code DSH_ENABLED kill switch wins over the env: while it is
         # False (the shipped default), every TURMA_DSH value reads as off, so the
@@ -13251,6 +13265,19 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self._session(sm, perm="auto", status="stopped")
         sm.set_mode("abcde", "plan")
         self.assertEqual(self.run_calls, [])
+
+    def test_set_mode_refuses_bypass_for_root(self):
+        # XERK-309: a running repos-root session may not switch INTO bypass. It
+        # refuses up front — no BTab presses, mode unchanged. A root session
+        # switching to a NON-bypass mode is unaffected (the early return keys on
+        # exactly bypass+root), covered by the plan/default cases above.
+        pane = _ModePane(["default", "acceptEdits", "plan", "auto"], cur=3)
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, perm="auto")
+        sess["root"] = True
+        sm.set_mode("abcde", "bypassPermissions")
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(sess["permissionMode"], "auto")
 
 
 class TestLocalModelConfig(unittest.TestCase):

@@ -397,6 +397,23 @@ function checkSpawnAgentType(cmd, hostKey) {
   return null;
 }
 
+// A repos-root session may not run under bypassPermissions (XERK-309): it works
+// directly in REPOS_ROOT with no worktree, and under bypass a Bash redirect can
+// write anywhere under the shared ~/.claude (the file-edit guard walks past
+// Bash). The agent re-validates and errors the card, but refusing here gives the
+// operator the hub's own message (XERK-264) instead of a silent errored session.
+// Deliberately scoped to root: a worktree session may still choose bypass —
+// closing that needs the filesystem/uid change the ticket weighs.
+function checkSpawnPermissionMode(cmd) {
+  if (cmd.permissionMode === "bypassPermissions" && cmd.repo === ROOT_REPO_NAME) {
+    return {
+      status: 409,
+      error: "bypassPermissions is not allowed for a repos-root session",
+    };
+  }
+  return null;
+}
+
 // ---- file attachments (XERK-234) --------------------------------------------
 // The composer's 📎 uploads a file, which lands on the agent's host as a real
 // file the session can Read; the message typed into the pane carries its path.
@@ -10048,6 +10065,8 @@ const server = http.createServer(async (req, res) => {
       if (spawnSourceErr) return json(res, spawnSourceErr.status, { error: spawnSourceErr.error });
       const spawnTypeErr = checkSpawnAgentType(cmd, hostname);
       if (spawnTypeErr) return json(res, spawnTypeErr.status, { error: spawnTypeErr.error });
+      const spawnModeErr = checkSpawnPermissionMode(cmd);
+      if (spawnModeErr) return json(res, spawnModeErr.status, { error: spawnModeErr.error });
       const cmdId = queueCommand(hostname, cmd);
       return json(res, 200, { ok: true, cmdId });
     }
@@ -10097,6 +10116,8 @@ const server = http.createServer(async (req, res) => {
         if (spawnSourceErr) return json(res, spawnSourceErr.status, { error: spawnSourceErr.error });
         const spawnTypeErr = checkSpawnAgentType(cmd, key);
         if (spawnTypeErr) return json(res, spawnTypeErr.status, { error: spawnTypeErr.error });
+        const spawnModeErr = checkSpawnPermissionMode(cmd);
+        if (spawnModeErr) return json(res, spawnModeErr.status, { error: spawnModeErr.error });
         const cmdId = queueCommand(key, cmd);
         return json(res, 200, { ok: true, cmdId });
       }
@@ -10344,6 +10365,16 @@ const server = http.createServer(async (req, res) => {
         const body = JSON.parse((await readBody(req)) || "{}");
         const permissionMode = typeof body.permissionMode === "string" ? body.permissionMode : "";
         if (!permissionMode) return json(res, 400, { error: "permissionMode required" });
+        // A repos-root session may not switch INTO bypassPermissions live either
+        // (XERK-309) — the spawn gate would be pointless if a live switch reopened
+        // it. Refused only when we can see the session is root; if the record
+        // isn't in the payload yet the agent's own set_mode gate still refuses.
+        const modeSess = (agents[key].sessions || []).find((x) => x.id === sessionId);
+        if (modeSess && modeSess.root && permissionMode === "bypassPermissions") {
+          return json(res, 409, {
+            error: "bypassPermissions is not allowed for a repos-root session",
+          });
+        }
         const cmdId = queueCommand(key, { type: "setMode", sessionId, permissionMode });
         return json(res, 200, { ok: true, cmdId });
       }

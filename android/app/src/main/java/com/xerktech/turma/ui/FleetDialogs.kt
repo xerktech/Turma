@@ -139,6 +139,11 @@ fun SpawnDialog(
                         optionLabel = { v -> runtimeOpts.firstOrNull { it.first == v }?.second ?: v },
                     ) { runtime = it }
                 }
+                // A repos-root session may not run under bypassPermissions
+                // (XERK-309, matching web `sessions.html`/`index.html`): it works
+                // directly in REPOS_ROOT with no worktree, and the hub 409s the
+                // spawn either way. Drop it from the offered modes for root.
+                val modeOpts = if (isRoot) MODES.filter { it != "bypassPermissions" } else MODES
                 when (runtime) {
                     Runtime.DSH -> {
                         // A dsh session offers the endpoint's DISCOVERED models,
@@ -176,11 +181,11 @@ fun SpawnDialog(
                                 optionLabel = { v -> localOpts.firstOrNull { it.first == v }?.second ?: v },
                             ) { localModelId = it }
                         }
-                        DropdownField("Permission mode", MODES, mode) { mode = it }
+                        DropdownField("Permission mode", modeOpts, mode) { mode = it }
                     }
                     else -> {   // Claude Code (subscription)
                         DropdownField("Model", MODELS, model) { model = it }
-                        DropdownField("Permission mode", MODES, mode) { mode = it }
+                        DropdownField("Permission mode", modeOpts, mode) { mode = it }
                     }
                 }
             }
