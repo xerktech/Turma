@@ -93,8 +93,15 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
 
 - **Start button**: `POST /api/jira/<siteKey>/<issueKey>/session` → `spawnTicket`. **The hub's job
   is ROUTING** — sends just the issue key; `findTicketHost` picks the host, online **required**
-  (unlike the read-only GET). `ticketRepo` resolves the repo from the freshest block; single-flight
-  per ticket.
+  (unlike the read-only GET). `ticketRepo` resolves the repo from the freshest block.
+- **The Start single-flight is ORG-WIDE, not per-host** (XERK-331, `committedTicketSpawn`). The guard
+  runs AHEAD of the queue/refuse branches on the org's whole fleet, so a spawn stranded on a busy,
+  offline or lower-ranked host can't let a second click route a duplicate onto a sibling (the D3
+  double-start) or into a second queue entry. It reasons about DELIVERY as `reclaimStrandedTicketSpawns`
+  (XERK-303) does — the exact COMPLEMENT of what that withdraws: a **delivered** command anywhere, or
+  an **undelivered** one on an **online** host, blocks (reuse its cmdId); an **undelivered** one on an
+  **offline** host does NOT (reclaim owns it — blocking would strand the ticket forever). It stays a
+  double-CLICK guard, never "one session per ticket ever" — the `+` button and a fresh Start still work.
 - Button states (`ticketStartHtml`): triaged = live button (uncloned reads "☐ Start (clone first)",
   clones on demand); "no repo"/untriaged = none. A failed start shows its reason beside a live button.
 - In-flight state clears on **evidence, not a timer**: the spawn's `cmdId` reported, or the command

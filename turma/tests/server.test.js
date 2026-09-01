@@ -6049,6 +6049,69 @@ test("http: a mashed start button is single-flighted into one spawn", async () =
   assert.equal(agents.ts3.commands.length, 1);
 });
 
+test("XERK-331: the start single-flight spans the org, not one host", async () => {
+  // The D3 double-start: a spawn is committed to hostA, but the second click's
+  // routing picks hostB (hostA now scores lower for the in-flight spawn). A
+  // per-host guard sees nothing on hostB and mints a SECOND spawn — one ticket,
+  // two sessions. The guard must find hostA's in-flight spawn and reuse it.
+  await ticketBeat("sf331A", "sf331.atlassian.net");
+  await ticketBeat("sf331B", "sf331.atlassian.net");
+  agents.sf331A.capacity = { maxSessions: 6, running: 0, queued: 0, free: 6 };
+  agents.sf331B.capacity = { maxSessions: 6, running: 0, queued: 0, free: 6 };
+  // First: a tie, insertion order gives hostA.
+  const first = await request("POST", "/api/jira/sf331.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(first.body.host, "sf331A");
+  // Second, before any beat delivers the spawn: hostA's in-flight command drops
+  // its availability below hostB's, so routing now prefers hostB.
+  const second = await request("POST", "/api/jira/sf331.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(second.body.cmdId, first.body.cmdId);
+  assert.equal(second.body.host, "sf331A");
+  // The reuse landed nothing new anywhere: one command total, on hostA.
+  assert.equal((agents.sf331A.commands || []).length, 1);
+  assert.equal((agents.sf331B.commands || []).length, 0);
+});
+
+test("XERK-331: a DELIVERED spawn on an offline host still blocks a second start", async () => {
+  // Delivered means the agent may already be mid-spawn, so a second session must
+  // not be started even though its host has since gone offline — the session is
+  // coming when the host returns (delivery is at-least-once).
+  await ticketBeat("sf331d", "sf331d.atlassian.net");
+  const first = await request("POST", "/api/jira/sf331d.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  agents.sf331d.commands[0].deliveredAt = Date.now();
+  agents.sf331d.lastSeen = Date.now() - 10 * 60 * 1000;
+  const second = await request("POST", "/api/jira/sf331d.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(second.status, 200);
+  assert.equal(second.body.cmdId, first.body.cmdId);
+  assert.equal(second.body.host, "sf331d");
+  assert.equal((agents.sf331d.commands || []).length, 1);
+});
+
+test("XERK-331: an UNDELIVERED spawn on an offline host does NOT block a fresh start", async () => {
+  // The complement of reclaimStrandedTicketSpawns: an undelivered command on a
+  // dead host is safe to disregard (reclaim withdraws it), so a Start goes
+  // through to a live host rather than being blocked forever.
+  await ticketBeat("sf331oA", "sf331o.atlassian.net");
+  await ticketBeat("sf331oB", "sf331o.atlassian.net");
+  const first = await request("POST", "/api/jira/sf331o.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  // Strand the first spawn on its (now offline) host, undelivered.
+  const strandedHost = first.body.host;
+  const otherHost = strandedHost === "sf331oA" ? "sf331oB" : "sf331oA";
+  agents[strandedHost].lastSeen = Date.now() - 10 * 60 * 1000;
+  assert.ok(!("deliveredAt" in agents[strandedHost].commands[0]));
+  // A fresh click routes to the live sibling and mints a NEW spawn there.
+  const second = await request("POST", "/api/jira/sf331o.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(second.status, 200);
+  assert.equal(second.body.host, otherHost);
+  assert.notEqual(second.body.cmdId, first.body.cmdId);
+  assert.equal((agents[otherHost].commands || []).length, 1);
+});
+
 test("http: the host must have the ticket's repo, not just the org's creds", async () => {
   // Two hosts share the org; only one has the repo. Routing on siteKey alone
   // would spawn on a host that would just log a refusal nobody sees.

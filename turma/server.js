@@ -7309,6 +7309,50 @@ function spawnTicketInFlight(siteKey, issueKey) {
       (c) => c && c.type === "spawnTicket" && c.issueKey === issueKey));
 }
 
+// The Start route's single-flight guard (XERK-331): is a spawnTicket for this
+// ticket already COMMITTED to running on some org host — so a second Start would
+// double-start it into a second session and worktree?
+//
+// spawnTicketInFlight above is the COARSE test — "riding any org host's queue" —
+// and it is right for the sweep and the drain, which each pair it with their own
+// guards. It is the WRONG test for the Start route on its own: a spawn stranded
+// on a long-offline host rides a queue forever (up to PRUNE_AFTER_MS), so
+// blocking on it would refuse every legitimate Start for that ticket
+// indefinitely — turning a duplicate-session bug into a can't-start-at-all one,
+// the exact class XERK-303 exists to remove.
+//
+// So this reasons about DELIVERY exactly as reclaimStrandedTicketSpawns (XERK-303)
+// does, and its answer is the complement of what that function withdraws:
+//   - a DELIVERED command means the agent may already be mid-spawn -> a block,
+//     wherever its host now is (online or offline);
+//   - an UNDELIVERED command on an ONLINE host is a spawn about to be handed
+//     over -> a block;
+//   - an UNDELIVERED command on an OFFLINE host is precisely what
+//     reclaimStrandedTicketSpawns will withdraw, so it is NOT a block — a Start
+//     is let through to a live host and the stranded command is reclaimed.
+//
+// Delivery is read by PRESENCE of `deliveredAt`, the same test publicCommands
+// strips on (a stamp in any form means "handed over"). The org is matched off
+// the host's jira block, like spawnTicketInFlight — this only asks "is a spawn
+// for THIS ticket in flight", never routes work onto a self-asserted org.
+//
+// Returns {host, cmdId} of the blocking command (so a double-click echoes the
+// first spawn's handle rather than minting a second) or null when a fresh Start
+// is allowed. It is a double-CLICK guard, not a one-session-per-ticket rule: the
+// board's + button and any genuinely fresh Start still work.
+function committedTicketSpawn(siteKey, issueKey) {
+  const now = Date.now();
+  for (const [host, a] of Object.entries(agents)) {
+    if (!a || !a.jira || a.jira.siteKey !== siteKey) continue;
+    const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
+    for (const c of a.commands || []) {
+      if (!c || c.type !== "spawnTicket" || c.issueKey !== issueKey) continue;
+      if (online || "deliveredAt" in c) return { host, cmdId: c.cmdId };
+    }
+  }
+  return null;
+}
+
 function holdQueued(e, reason, error) {
   const msg = error ? String(error).slice(0, TICKET_QUEUE_ERROR_MAX) : null;
   if (e.reason === reason && e.error === msg) return false;
@@ -11250,6 +11294,26 @@ const server = http.createServer(async (req, res) => {
       }
       const { host, error, status, needsClone, full } =
         findTicketHost(siteKey, repo, issueKey, { requireFree: true });
+      // Single-flight per ticket, ORG-WIDE (XERK-331). A spawnTicket already
+      // committed to running somewhere in the org — delivered on any host, or
+      // undelivered on an online one — means this ticket's session is already
+      // coming up, so a second Start must reuse that spawn's cmdId rather than
+      // mint a duplicate on the host THIS click happened to pick. Checked ahead
+      // of the queue/refuse branches so a busy or offline in-flight host can't
+      // route the second start onto a sibling (the D3 double-start) or into a
+      // second queue entry. An undelivered command on an OFFLINE host is
+      // deliberately not a block — reclaimStrandedTicketSpawns owns that case, so
+      // counting it here would strand the ticket forever (see committedTicketSpawn).
+      const committed = committedTicketSpawn(siteKey, issueKey);
+      if (committed) {
+        // Its session is starting, so spend any place it holds in the hub queue,
+        // exactly as the fresh-start path below does — leaving it there would
+        // dispatch it AGAIN on the next free slot, hours later and unasked.
+        dropQueuedTicket(siteKey, issueKey, "dispatched by a direct start");
+        rememberDispatch(siteKey, issueKey);
+        return json(res, 200,
+          { ok: true, cmdId: committed.cmdId, host: committed.host, repo });
+      }
       // Every org host is up but none has a free slot — the ticket waits in the
       // hub's queue (XERK-296) instead of being nailed to a host now and turned
       // into a session that only waits. Whichever agent frees a slot first takes
@@ -11275,11 +11339,8 @@ const server = http.createServer(async (req, res) => {
           position: (pos && pos.position) || 1 });
       }
       if (!host) return json(res, status, { error });
-      // Single-flight per ticket, like the jiraIssue fetch above: a double-click
-      // (or a click while the first spawn is still riding the queue) must not
-      // start two sessions on one ticket.
-      const pending = (agents[host].commands || [])
-        .find((c) => c.type === "spawnTicket" && c.issueKey === issueKey);
+      // No spawn is in flight for this ticket (committedTicketSpawn above), so
+      // this is a genuine fresh start — queue one.
       // The operator's model pin (XERK-123) rides the command the hub already
       // routes — the agent has no per-ticket ledger of its own to read it from.
       // Omitted when unpinned, so a ticket with no model choice spawns exactly as
@@ -11288,8 +11349,7 @@ const server = http.createServer(async (req, res) => {
       // The runtime pin (XERK-473) rides as `agentType`; findTicketHost above
       // already ensured `host` offers it. Omitted (claude) when unpinned.
       const rpin = ticketRuntimePin(siteKey, issueKey);
-      const cmdId = pending ? pending.cmdId
-        : queueCommand(host, { type: "spawnTicket", issueKey,
+      const cmdId = queueCommand(host, { type: "spawnTicket", issueKey,
             ticketSource: "manual", ticketSite: siteKey,
             ...(mpin ? { model: mpin.model } : {}),
             ...(rpin ? { agentType: rpin.runtime } : {}) });
