@@ -250,6 +250,43 @@ class TestQwenGuardShimEndToEnd(unittest.TestCase):
             "file_path": os.path.join("esc", "authorized_keys"), "content": "x"}))
         self.assertIsNotNone(reason)
 
+    def test_a_credential_file_symlinked_out_of_the_store_is_denied(self):
+        # XERK-497: ~/.kube is a real dir but ~/.kube/config is a symlink to
+        # elsewhere (WSL /mnt/c). _resolve_target realpaths the leaf OUT of the
+        # store, so the realpath'd target alone no longer matches the store's
+        # deny glob (its literal prefix is a real dir, unchanged by realpath);
+        # the literal-target match is what still catches it. Driven over the real
+        # shim with a custom store glob, since the host's own stores may not be
+        # symlinked.
+        store = tempfile.mkdtemp(prefix="qwen-store-")        # a real "store" dir
+        outside = tempfile.mkdtemp(prefix="qwen-outside-")
+        real_leaf = os.path.join(outside, "config")
+        open(real_leaf, "w").close()
+        link = os.path.join(store, "config")
+        try:
+            os.symlink(real_leaf, link)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        cfg_path = os.path.join(self.tmp, "symlink-leaf.json")
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump({"denyWrite": [store + "/**"], "denyRead": [],
+                       "allowRead": []}, fh)
+        rc, reason = self._run(self._ev("write_file",
+                                        {"file_path": link, "content": "x"}),
+                               config_path=cfg_path)
+        self.assertIsNotNone(reason,
+                             "a store file symlinked out of the store must be denied")
+        # A control: a non-store file symlinked elsewhere is still allowed.
+        benign = os.path.join(self.cwd, "benign-link")
+        try:
+            os.symlink(real_leaf, benign)
+        except (OSError, NotImplementedError):
+            return
+        rc, reason = self._run(self._ev("write_file",
+                                        {"file_path": benign, "content": "x"}),
+                               config_path=cfg_path)
+        self.assertIsNone(reason)
+
     # --- reads (the credential read globs + carve-outs) ---
     def test_read_local_model_secret_is_denied(self):
         rc, reason = self._run(self._ev("read_file", {

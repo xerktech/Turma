@@ -197,6 +197,33 @@ def _resolve_target(p, cwd):
     return os.path.realpath(p)
 
 
+def _literal_target(p, cwd):
+    """The absolute, lexically-normalized target WITHOUT symlink resolution — the
+    path the tool NAMED, `..` collapsed but every symlink left intact. Matched
+    BESIDE the realpath'd target (XERK-497): a credential store symlinked OUT of
+    $HOME (WSL's ``~/.aws`` -> ``/mnt/c/...``, or ``~/.kube/config`` a symlink)
+    realpaths to a location no $HOME-relative deny glob covers, so the realpath'd
+    target alone reads as ALLOWED. Denying if EITHER form matches catches the
+    store whichever way its symlink points; realpath still closes a symlink used
+    to DODGE a rule. ``_realpath_glob_prefix`` on the rule side (XERK-503) is the
+    complementary half."""
+    if not isinstance(p, str) or not p:
+        return None
+    if not os.path.isabs(p):
+        p = os.path.join(cwd or os.getcwd(), p)
+    return os.path.normpath(p)
+
+
+def _matches_target(literal, real, regexps):
+    """Deny if the literal OR the realpath'd target matches (XERK-497). ``real``
+    is always present here; ``literal`` is skipped when equal."""
+    if real is not None and _matches_any(real, regexps):
+        return True
+    if literal is not None and literal != real and _matches_any(literal, regexps):
+        return True
+    return False
+
+
 # --- the shared py deny policy (guard.py / fileguard.py) ------------------
 
 
@@ -297,6 +324,7 @@ def decide(event, cfg):
             real = _resolve_target(tgt, cwd)
             if real is None:
                 continue
+            literal = _literal_target(tgt, cwd)
             # ~/.claude "everything except the memory trees" — fileguard.py owns
             # this predicate (a glob list cannot express it). Missing fileguard
             # degrades to the write-deny globs below (defence in depth), matching
@@ -306,7 +334,8 @@ def decide(event, cfg):
                                {"file_path": real}, cwd, session_id)
             if reason:
                 return reason
-            if _matches_any(real, cfg["_denyWriteRe"]):
+            # Matched against the literal AND the realpath'd target (XERK-497).
+            if _matches_target(literal, real, cfg["_denyWriteRe"]):
                 return _deny_write_reason(real)
         return None
 
@@ -315,12 +344,14 @@ def decide(event, cfg):
             real = _resolve_target(tgt, cwd)
             if real is None:
                 continue
+            literal = _literal_target(tgt, cwd)
             # Read carve-outs win over every read deny: the per-session uploads
             # tree and the peer roster are files the session is MEANT to read
-            # (XERK-234/348).
+            # (XERK-234/348). Matched on the realpath'd target only — widening an
+            # ALLOW on a literal path is the wrong direction for a guard.
             if _matches_any(real, cfg["_allowReadRe"]):
                 continue
-            if _matches_any(real, cfg["_denyReadRe"]):
+            if _matches_target(literal, real, cfg["_denyReadRe"]):
                 return _deny_read_reason(real)
         return None
 
