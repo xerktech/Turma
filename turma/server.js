@@ -712,9 +712,12 @@ let agents = {};
 //     rather than picked.
 //   * AGENTS_MAX — the record COUNT. The byte budget measures what
 //     `agentRecordSize` measures, which deliberately EXCLUDES the on-demand
-//     caches (history, subagent history, Jira issues, create results). Those are
-//     capped per host by COUNT, not by bytes, so this bounds their multiple and
-//     nothing here bounds their size — one host can still park a lot in them.
+//     caches (history, subagent history, Jira issues, create results): XERK-235
+//     keeps them off the record ceiling so a legit ~6 MiB /history delivery can
+//     never cost a host its heartbeat. So AGENTS_MAX bounds only their MULTIPLE;
+//     their SIZE is bounded separately by AGENT_CACHE_HOST_MAX /
+//     AGENT_CACHE_TOTAL_MAX (XERK-292), enforced by eviction — one host can no
+//     longer park unbounded bytes in them.
 //
 // The aggregate is what a NEWCOMER is admitted against, and what an OVER-SHARE
 // host is refused against — never a host beating a normal-sized record, whose
@@ -904,6 +907,132 @@ function registryBytes() {
     }
   }
   return total;
+}
+
+// ---- the on-demand caches' own byte budget (XERK-292) ----------------------
+//
+// AGENT_CACHE_KEYS are deliberately excluded from `agentRecordSize`, and so from
+// the per-record ceiling (AGENT_RECORD_MAX) AND the aggregate registry budget
+// (AGENTS_TOTAL_MAX) — XERK-235, so a legitimate ~6 MiB /history delivery can
+// never cost a host its heartbeat. That left them bounded only by COUNT
+// (HISTORY_MAX_SESSIONS, JIRA_ISSUE_MAX, …), never by BYTES: one device name
+// sending 8 oversized `historyResults` parked HISTORY_MAX_SESSIONS entries of
+// arbitrary size for HISTORY_MAX_AGE_MS (10 min), which OOM-killed a 256 MiB hub
+// with no concurrency and no name churn (XERK-292). The count cap bounded their
+// MULTIPLE; nothing bounded their SIZE.
+//
+// So the caches carry their own byte budget, enforced by EVICTION — dropping the
+// oldest-`fetchedAt` entry until under, NEVER refusing a beat. Refusing would
+// undo the XERK-235 exclusion that is the whole point of keeping them off the
+// record ceiling. Two bounds, container-sized, the same shape the registry uses
+// (XERK-272): a PER-HOST cap so one host cannot park a large multiple of the
+// container, and an AGGREGATE cap so many hosts cannot either — the invariant is
+// on the aggregate, sized from the container.
+//
+// A restart drops the caches entirely (serializeAgentsForSave strips them, since
+// their <=30-min TTL makes persisting them worthless and is what let state.json
+// grow past STATE_FILE_MAX), so these bounds hold only what lives in memory.
+
+// One host's cache ceiling. Floored ABOVE a legitimate delivery: the agent caps
+// a /history reply at HISTORY_MAX_BYTES (6 MiB) and stages up to 12 MiB, and a
+// host may hold a few sessions' histories within the TTL. The floor is 14 MiB,
+// not 12 — a staged 12 MiB delivery serializes with JSON wrapper overhead to
+// slightly OVER 12 MiB, so a 12 MiB floor would evict a legitimate delivery on
+// its way in on a small (<192 MiB) container where the floor is what binds; the
+// 2 MiB of headroom keeps the "a legit delivery always lands" guarantee true at
+// every container size. A fraction of the container caps the rest. This is what
+// closes the XERK-292 repro (one host, sequential beats): the host is held to
+// this instead of growing without bound.
+function defaultCacheHostMax() {
+  const limit = containerMemoryLimit();
+  if (!limit) return 16 << 20;
+  return Math.max(14 << 20, Math.min(24 << 20, Math.floor(limit / 16)));
+}
+const AGENT_CACHE_HOST_MAX = positiveEnv("AGENT_CACHE_HOST_MAX", defaultCacheHostMax());
+
+// The fleet-wide cache ceiling — the aggregate the XERK-258/272 invariant
+// demands, derived from the cgroup (an eighth of the container, the same
+// fraction as AGENTS_TOTAL_MAX: the caches get the same aggregate byte budget as
+// the records). Enforced across every host by evicting the globally-oldest
+// entries, so a legit just-delivered entry (the freshest) always survives.
+function defaultCacheTotalMax() {
+  const limit = containerMemoryLimit();
+  if (!limit) return 32 << 20;
+  return Math.max(16 << 20, Math.min(64 << 20, Math.floor(limit / 8)));
+}
+const AGENT_CACHE_TOTAL_MAX = positiveEnv("AGENT_CACHE_TOTAL_MAX", defaultCacheTotalMax());
+
+// A cache entry's fetch time — `fetchedAt` on the history/issue/create caches,
+// `at` on the cmdId-keyed outcome caches. Missing reads as epoch, so an unstamped
+// entry is evicted first.
+function cacheEntryTs(e) {
+  return (e && typeof e === "object" && (e.fetchedAt || e.at)) || 0;
+}
+
+// Every on-demand cache entry a host holds, flattened for oldest-first eviction:
+// the map-shaped caches contribute one row per key; `createMeta` is a single
+// blob, contributed under a null entryKey (evicted as a whole). Each row carries
+// its serialized byte size (measured once here) and its fetch timestamp. Scoped
+// to exactly AGENT_CACHE_KEYS — the set excluded from the record ceiling, so the
+// byte budget covers precisely what that ceiling does not.
+function cacheEntryRows(agent) {
+  const rows = [];
+  const measure = (e) => { try { return JSON.stringify(e).length; } catch { return 0; } };
+  for (const cacheKey of AGENT_CACHE_KEYS) {
+    const c = agent[cacheKey];
+    if (!c || typeof c !== "object") continue;
+    if (cacheKey === "createMeta") {
+      rows.push({ cacheKey, entryKey: null, ts: cacheEntryTs(c), bytes: measure(c) });
+      continue;
+    }
+    for (const [entryKey, e] of Object.entries(c)) {
+      rows.push({ cacheKey, entryKey, ts: cacheEntryTs(e), bytes: measure(e) });
+    }
+  }
+  return rows;
+}
+
+function evictCacheRow(agent, r) {
+  if (r.entryKey === null) agent[r.cacheKey] = r.cacheKey === "createMeta" ? null : {};
+  else if (agent[r.cacheKey]) delete agent[r.cacheKey][r.entryKey];
+}
+
+// Hold ONE host's caches under AGENT_CACHE_HOST_MAX, evicting its oldest entries.
+// Eviction, never beat refusal (see the budget note above).
+function enforceCacheHostBudget(agent) {
+  const rows = cacheEntryRows(agent);
+  let total = rows.reduce((n, r) => n + r.bytes, 0);
+  if (total <= AGENT_CACHE_HOST_MAX) return;
+  rows.sort((a, b) => a.ts - b.ts);
+  for (const r of rows) {
+    if (total <= AGENT_CACHE_HOST_MAX) break;
+    evictCacheRow(agent, r);
+    total -= r.bytes;
+  }
+}
+
+// Hold the WHOLE fleet's caches under AGENT_CACHE_TOTAL_MAX, evicting the
+// globally-oldest entries across every host. This is the aggregate bound the
+// XERK-258/272 invariant requires; the per-host cap above bites first for a
+// single flooder, this catches many hosts at once.
+function enforceCacheTotalBudget() {
+  const rows = [];
+  let total = 0;
+  for (const [hostKey, agent] of Object.entries(agents)) {
+    for (const r of cacheEntryRows(agent)) {
+      r.hostKey = hostKey;
+      rows.push(r);
+      total += r.bytes;
+    }
+  }
+  if (total <= AGENT_CACHE_TOTAL_MAX) return;
+  rows.sort((a, b) => a.ts - b.ts);
+  for (const r of rows) {
+    if (total <= AGENT_CACHE_TOTAL_MAX) break;
+    const agent = agents[r.hostKey];
+    if (agent) evictCacheRow(agent, r);
+    total -= r.bytes;
+  }
 }
 
 // A refusal is one line per window, not one per beat: a flood is exactly the
@@ -1141,7 +1270,16 @@ try {
 // failure path is reachable from a test.
 function serializeAgentsForSave() {
   try {
-    return JSON.stringify(agents);
+    // Strip the on-demand caches (AGENT_CACHE_KEYS) — the SAME replacer
+    // agentRecordSize uses, so the saved blob matches what the byte budgets
+    // measure. They carry a <=30-min TTL, so persisting them across a restart
+    // buys nothing, and they are the one part of a record NOT bounded by
+    // AGENT_RECORD_MAX — leaving them in is what let state.json grow far past
+    // STATE_FILE_MAX on a single flooding host (XERK-292). A restart therefore
+    // starts every cache empty, which the heartbeat rebuilds on demand.
+    return JSON.stringify(agents, (k, v) =>
+      AGENT_CACHE_KEYS.includes(k) && v && typeof v === "object" ? undefined : v
+    );
   } catch (e) {
     console.error(`state save skipped — could not serialize agent state: ${e.message}`);
     return null;
@@ -9259,6 +9397,26 @@ const server = http.createServer(async (req, res) => {
       // Ordered after every ingest above: an ack settles against what this same
       // beat delivered, which is the whole basis of the gap detection.
       resolveResultWaits(prev, next, commands);
+      // Bound the on-demand caches by BYTES, not just by count (XERK-292). The
+      // ingests above cap each cache by entry COUNT (HISTORY_MAX_SESSIONS, …),
+      // but AGENT_CACHE_KEYS are excluded from every byte gate a beat passes
+      // through (XERK-235), so nothing stopped one host parking 8 arbitrarily
+      // large history entries for their TTL and OOM-killing the hub. Run only on
+      // a beat that actually delivered cache results — a quiet beat changes no
+      // cache bytes — and always by eviction, never by refusing the beat, or the
+      // XERK-235 exclusion is undone. Placed AFTER resolveResultWaits, which
+      // reads the result caches (createResults/statusResults/…) to detect a
+      // capability gap: evicting a just-delivered result before it is consumed
+      // would misfire the gap detection. The per-host pass bites first for a
+      // single flooder; the aggregate pass is the container-sized invariant
+      // across the fleet.
+      if ([historyResults, subagentHistoryResults, jiraIssueResults,
+           ticketStatusResults, ticketPriorityResults, ticketLinkResults,
+           createMetaResults, createTicketResults].some(
+             (a) => Array.isArray(a) && a.length)) {
+        enforceCacheHostBudget(next);
+        enforceCacheTotalBudget();
+      }
       heartbeatAlerts(key, prev, next);
       rearmMovedWatches(key, prev, next);
       // A migration finishes the instant its target session heartbeats in — do
@@ -11800,6 +11958,13 @@ if (process.env.TURMA_TEST) {
     STATE_FILE_MAX, positiveEnv, logName, recordSizeWarned, shareWarned, fairShare,
     registryBytes, makeRegistryRoom, trimRestoredAgents, containerMemoryLimit,
     defaultRegistryBudget, recordBytes,
+    // XERK-292 on-demand-cache byte budget. Exported for the same reason as the
+    // registry bounds above: the caches were bounded only by COUNT while a single
+    // host parked arbitrary BYTES in them and OOM-killed the hub, so the per-host
+    // and aggregate byte ceilings — and the eviction that enforces them without
+    // ever refusing a beat (XERK-235) — have to be pinnable by name.
+    AGENT_CACHE_KEYS, AGENT_CACHE_HOST_MAX, AGENT_CACHE_TOTAL_MAX,
+    cacheEntryRows, enforceCacheHostBudget, enforceCacheTotalBudget,
     // Ingest coercion, exported for the same reason as the rest of this group:
     // Android decodes /api/agents atomically, so one host's wrong-typed field
     // hides the WHOLE fleet from that phone (XERK-246). `normalizeRecord` is
@@ -12060,6 +12225,14 @@ if (process.env.TURMA_TEST) {
       `agent registry: <=${AGENTS_MAX} hosts, <=${AGENTS_TOTAL_MAX} bytes ` +
         `(${AGENT_FAIR_SHARE}/host), container limit ` +
         `${containerMemoryLimit() ?? "unknown"}`
+    );
+    // The on-demand caches' byte budget (XERK-292), derived from the same cgroup
+    // limit — printed for the same reason as the registry budget above: it is
+    // enforced, not configured, so this is the only way to see what it came out
+    // as on a hub whose mem_limit moved under it.
+    console.log(
+      `agent on-demand caches: <=${AGENT_CACHE_TOTAL_MAX} bytes fleet-wide, ` +
+        `<=${AGENT_CACHE_HOST_MAX} bytes/host`
     );
     if (push.fcmEnabled()) console.log("FCM push alerts -> Android devices");
     // A warning, not an info line: a hub running without FCM delivers ZERO mobile

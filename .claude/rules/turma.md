@@ -304,9 +304,23 @@ the total is measured.
   `legacy` master, or an unstable name-derivation can still grow records with no attacker.
 - Two budgets: **`AGENTS_TOTAL_MAX`** (aggregate bytes, an eighth of the container's cgroup limit,
   clamped 8–64 MiB) and **`AGENTS_MAX`** (record count, default 64) — the byte budget excludes
-  on-demand caches, so it bounds their multiple, not their size; the count cap covers that. **Size
-  both from the container, never pick a number** — a ceiling above the kernel's own OOM limit isn't
-  one.
+  on-demand caches (XERK-235), so it bounds their MULTIPLE, not their size; the count cap covers that
+  and **their SIZE is bounded separately** (XERK-292, below). **Size both from the container, never
+  pick a number** — a ceiling above the kernel's own OOM limit isn't one.
+- **The on-demand caches (`AGENT_CACHE_KEYS`) carry their OWN byte budget** (XERK-292): they are
+  excluded from `agentRecordSize` so a legit ~6 MiB `/history` delivery never costs a heartbeat
+  (XERK-235), which left them bounded only by COUNT (`HISTORY_MAX_SESSIONS` …) — one device name
+  parking 8 oversized `historyResults` for their TTL OOM-killed a 256 MiB hub with no concurrency.
+  - Two eviction bounds, container-sized like the registry: **`AGENT_CACHE_HOST_MAX`** (per host,
+    floored ≥14 MiB — a staged 12 MiB delivery serializes with wrapper overhead to just over 12 MiB,
+    so the floor clears it with headroom at every container size) and **`AGENT_CACHE_TOTAL_MAX`** (fleet-
+    wide, container/8). Enforced by **eviction of the oldest-`fetchedAt` entry, NEVER by refusing a
+    beat** — refusing would undo the XERK-235 exclusion. The just-delivered (freshest) entry survives;
+    only run on a beat that actually delivered cache results.
+  - **`serializeAgentsForSave` STRIPS `AGENT_CACHE_KEYS`** (same replacer as `agentRecordSize`): their
+    ≤30-min TTL makes persisting them worthless, and leaving them in let `state.json` grow past
+    `STATE_FILE_MAX` on one flooding host. A restart starts every cache empty; the heartbeat rebuilds.
+  - Tests: `cache-budget.test.js`.
 - **A newcomer never displaces a host that is still around.** Reclaimed only past
   `AGENT_EVICT_IDLE_MS` (1h) of silence; a host already IN the registry is always admitted (else the
   cap becomes a wall for the fleet's own hosts). Accepted cost: a name-flood can squat slots and block
