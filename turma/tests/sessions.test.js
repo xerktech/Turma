@@ -2413,3 +2413,36 @@ test("sessions: mergeSnapshot honours a host the snapshot dropped and one it rem
   assert.deepEqual(p.getCache().agents.map((a) => a.key), ["stay"],
     "the host removed mid-fetch is not resurrected");
 });
+
+// XERK-545: `migrations` and `orgColors` are ALSO SSE-live-patched top-level keys,
+// so an in-flight snapshot must not clobber a patch that landed after the fetch
+// started — the same XERK-444 race, on the two keys the agents merge deliberately
+// left scope-out. The SSE handlers stamp them; mergeSnapshot keeps the live value
+// when it was patched after `since`, else takes the snapshot's.
+test("sessions: mergeSnapshot keeps a migrations patch that landed mid-fetch (XERK-545)", () => {
+  const p = loadPage();
+  p.setCache({ now: Date.now(), agents: [], migrations: [{ id: "m", phase: "exporting" }] });
+
+  const since = p.sseClock();                                     // refresh() captures this before its fetch
+  p.sse.emit("migrations", [{ id: "m", phase: "importing" }]);   // the move advances mid-fetch
+  p.mergeSnapshot({ now: Date.now(), agents: [], migrations: [{ id: "m", phase: "exporting" }] }, since);
+  assert.equal(p.getCache().migrations[0].phase, "importing",
+    "the live migrations patch survives the older snapshot");
+
+  // With no patch this window the snapshot is authoritative on migrations again.
+  const since2 = p.sseClock();
+  p.mergeSnapshot({ now: Date.now(), agents: [], migrations: [{ id: "m", phase: "exporting" }] }, since2);
+  assert.equal(p.getCache().migrations[0].phase, "exporting",
+    "an unraced snapshot still replaces migrations");
+});
+
+test("sessions: mergeSnapshot keeps an orgColors patch that landed mid-fetch (XERK-545)", () => {
+  const p = loadPage();
+  p.setCache({ now: Date.now(), agents: [], migrations: [], orgColors: { o: "red" } });
+
+  const since = p.sseClock();
+  p.sse.emit("orgColors", { o: "blue" });                        // a pin flips mid-fetch
+  p.mergeSnapshot({ now: Date.now(), agents: [], migrations: [], orgColors: { o: "red" } }, since);
+  assert.deepEqual(p.getCache().orgColors, { o: "blue" },
+    "the live orgColors patch survives the older snapshot");
+});
