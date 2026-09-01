@@ -4068,9 +4068,12 @@ def repo_forkable(repo_path):
     matters. It costs one shape: a DANGLING origin/HEAD names a default branch
     whose ref is only on the remote, which reads unforkable here and which
     resolve_base_ref's fetch would land. That is the whole gap (any other name
-    comes from a ref that is already local), and a session waiting on it pays
-    the deadline before its error card. Adding a fetch here is not the trade:
-    this runs per queued session per beat, on the loop the heartbeat is on."""
+    comes from a ref that is already local). Adding a fetch HERE is not the
+    trade: this runs per queued session per beat, on the loop the heartbeat is
+    on. Instead _drain_queue spends one fetch on that shape at the deadline the
+    session would otherwise die to (XERK-375) — for a DYING session, and at most
+    once per beat — so a real dangling origin/HEAD is rescued while the common
+    path stays fetch-free."""
     if repo_head_ready(repo_path):
         return True
     name = default_branch_name(repo_path)
@@ -16679,6 +16682,12 @@ class SessionManager:
         clone doesn't hold up a capacity-only one behind it."""
         if self._running_count() >= MAX_SESSIONS:
             return  # no slot to drain into; nothing below can change that
+        # The XERK-375 deadline rescue is the ONE place this loop touches the
+        # network (a `git fetch`), so it is capped at one per beat: a second
+        # expired session defers its rescue to the next beat rather than stack
+        # another FETCH_TIMEOUT_SEC onto this one, keeping the loop's worst case
+        # well under OFFLINE_AFTER_MS (CLAUDE.md's beat-loop budget).
+        rescue_fetched = False
         for sess in self.registry:
             if sess.get("status") != "queued":
                 continue
@@ -16741,6 +16750,39 @@ class SessionManager:
                         # Deliberately below the retry — with a LIVE job we never
                         # get here at all, and every other branch is a better
                         # answer than a deadline.
+                        #
+                        # But first spend ONE fetch on the single shape
+                        # repo_forkable under-counts by design (XERK-375): a
+                        # DANGLING refs/remotes/origin/HEAD — origin/HEAD names a
+                        # default branch whose ref is only on the remote — reads
+                        # unforkable here yet resolve_base_ref's own fetch would
+                        # land it, so the repo IS forkable and this session would
+                        # have died to a deadline it never actually had.
+                        # repo_forkable skips that fetch on purpose (it runs per
+                        # queued session per beat, on the heartbeat loop); this one
+                        # is per DYING session at the deadline it's already reached
+                        # — and once per BEAT (rescue_fetched), so the beat-loop
+                        # budget (CLAUDE.md) holds even with several expired at
+                        # once. A second expired session defers, staying queued.
+                        if rescue_fetched:
+                            continue
+                        rescue_fetched = True
+                        landed = default_base_ref(sess["repoPath"])
+                        if repo_forkable(sess["repoPath"]):
+                            # The fetch already resolved the default branch, so
+                            # hand it to _provision_session (via _pendingBaseRef)
+                            # rather than let resolve_base_ref fetch it a SECOND
+                            # time — but never override an operator's explicit
+                            # base, which resolve_base_ref validates on its own.
+                            if landed and not (
+                                    sess.get("_pendingBaseRef") or "").strip():
+                                sess["_pendingBaseRef"] = landed
+                            self._provision_session(sess)
+                            return  # a provision is one-per-beat, like below
+                        # The repo really has nothing to fork from; the error
+                        # stands. Fall to the shared `continue` (NOT a return) so
+                        # a capacity-only session queued behind this one still
+                        # provisions this beat — head-of-line stays non-blocking.
                         self._set_error(
                             sess, f"{name} still has no commit to fork from — "
                                   f"an unfinished clone, or a repo with no "
