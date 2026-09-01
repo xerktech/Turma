@@ -2862,6 +2862,15 @@ function startArchiveRestore(row, files, targetHost) {
   migrations.set(id, m);
   publishMigrations();
 
+  // A restore resumes this transcript on a host that may be in ANOTHER org (a
+  // restore is deliberately not org-scoped — the dead source has no org to
+  // compare against). The resumed session keeps the same transcript id, so its
+  // later archival is a cross-host re-point that XERK-344's ownership gate would
+  // refuse unless the row's org already matches the new home. Re-stamp it to the
+  // target's org now, so the target's first archive push re-points cleanly rather
+  // than silently dropping the restored session's new turns from the archive.
+  archive.restampOrg(row.transcriptId, siteKeyOf(tgt));
+
   const spool = migrationSpoolPath(id);
   tar.packGzipTar(files, spool, MIGRATE_BLOB_MAX, { mtimeSec: Date.now() / 1000 })
     .then((out) => {

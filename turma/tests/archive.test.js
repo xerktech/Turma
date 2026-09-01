@@ -418,6 +418,35 @@ test("XERK-344: a legacy row (no recorded org) admits the first writer once, the
   assert.equal(archive.getTranscript(tid).host, "hostB", "the stamped org re-locks the row");
 });
 
+test("XERK-344: restampOrg lets a cross-org restore continuation archive (XERK-441)", () => {
+  // A restore resumes an archived org-A session on an org-B host — deliberately
+  // allowed (the archive is not org-scoped). The resumed session keeps the same
+  // transcript id, so its later archival is a cross-org re-point the gate would
+  // refuse; restampOrg is what keeps the restored session's new turns reachable.
+  const tid = "xerk344-restore-aaaa";
+  archive.ingestChunk("srchost", tid, { ...RAW_META, summary: "Restore" }, 0, 20,
+    [ent("r1", "user", "before restore")], "orgA.atlassian.net");
+  // Without the restamp the org-B continuation is refused (the very data loss).
+  const blocked = archive.ingestChunk("tgthost", tid, { ...RAW_META, summary: "Restore" }, 20, 40,
+    [ent("x", "user", "blocked")], "orgB.atlassian.net");
+  assert.deepEqual(blocked, { bytesStored: 20 }, "cross-org continuation refused before restamp");
+  // The restore stamps the target's org; then it archives cleanly.
+  assert.equal(archive.restampOrg(tid, "orgB.atlassian.net"), true);
+  const cont = archive.ingestChunk("tgthost", tid, { ...RAW_META, summary: "Restore" }, 20, 40,
+    [ent("r2", "user", "after restore")], "orgB.atlassian.net");
+  assert.equal(cont.bytesStored, 40);
+  const t = archive.getTranscript(tid);
+  assert.equal(t.host, "tgthost");
+  assert.equal(t.entries.length, 2);
+  // The stamp survives a rebuild (sidecar updated), so a THIRD org stays refused.
+  archive.rebuildIndex();
+  const evil = archive.ingestChunk("evil", tid, { ...RAW_META, summary: "Restore" }, 40, 60,
+    [ent("e", "user", "nope")], "orgC.atlassian.net");
+  assert.deepEqual(evil, { bytesStored: 40 });
+  // An unknown transcript is a no-op.
+  assert.equal(archive.restampOrg("never-seen-restore", "orgX"), false);
+});
+
 test("the per-transcript raw ceiling stops that session, not the archive", () => {
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");

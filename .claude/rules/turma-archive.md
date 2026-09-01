@@ -80,8 +80,14 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
       the first writer once and stamps it** — trust-on-first-sight, since it cannot be proven
       cross-org. `rebuildIndex` uses `meta.siteKey ?? null` so a recorded `""` (a real no-org owner,
       still gated) is kept distinct from a legacy NULL.
+    - **A cross-org RESTORE (XERK-441) re-stamps the row's org to the target** (`restampOrg`, called
+      by `startArchiveRestore`) — a restore is deliberately not org-scoped, and the resumed session
+      keeps the same transcript id, so without the re-stamp its later archival is exactly the
+      cross-org re-point this gate refuses, silently dropping the restored session's new turns. The
+      re-stamp keeps the HOST as-is (the target's first push re-points it, org already matching) and
+      updates the sidecar so a rebuild preserves it.
     - Refused like an offset mismatch: store nothing, return the real cursor — never an error status
-      (XERK-255). Tests: the `XERK-344:` cases in `archive.test.js`.
+      (XERK-255). Tests: the `XERK-344:` cases in `archive.test.js` + `restore.test.js`.
   - **The agent never OFFERS a file the hub cannot name** (`_archivable_rel` mirrors `safeRawRel`) —
     an unnameable offer 400s FOREVER and isn't distinguishable from transient failure, so it can
     starve every other transcript on the host. **The two allowlists must agree.** The agent uses
@@ -212,5 +218,8 @@ reason the raw layer exists in a form nothing else reads (the rendered entries a
 - **Not org-scoped, unlike a move** — `/migrate` compares two agents' orgs; an archived session has
   no agent left to compare against, and the archive is hub-wide and already gated by login. Don't
   invent an org for the archive row.
+  - **But it DOES re-stamp the row's org to the target** (`restampOrg`) so the resumed session can
+    archive back across orgs — see the XERK-344 ownership gate above. This is a stamp for a later
+    write, not an admission gate: restore itself stays org-agnostic.
 - Tests: `restore.test.js` (route + refusals + bundle bytes), `tar.test.js` (format, read back with
   python's `tarfile`), the Restore cases in `sessions.test.js`.

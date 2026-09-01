@@ -871,6 +871,35 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
   return shed ? { bytesStored, shed: true } : { bytesStored };
 }
 
+// Re-point an archived transcript's OWNER ORG to `siteKey`, keeping the sidecar
+// in step so a rebuild preserves it. Returns false if the transcript is unknown.
+//
+// A restore (XERK-441) resumes an ENDED session on a host in ANOTHER org — this
+// is deliberately allowed (the archive is hub-wide and login-gated, and the dead
+// source host has no org left to compare against). The resumed session keeps the
+// SAME transcript id, so when it later archives, its push is a cross-host
+// re-point that ingestChunk's ownership gate (XERK-344) refuses unless the row's
+// org already matches the new home — otherwise the restored session's new turns
+// silently never reach the durable archive. So the restore stamps the target's
+// org here, exactly as a migration's rendered re-point carries the target's org.
+// The row's HOST is left alone: the target's first archive push re-points it, and
+// by then the org matches (the same ordering the raw layer depends on).
+function restampOrg(transcriptId, siteKey) {
+  openDb();
+  const org = String(siteKey == null ? "" : siteKey).slice(0, META_TEXT_MAX);
+  const row = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(transcriptId);
+  if (!row) return false;
+  db.prepare("UPDATE sessions SET siteKey=?, updatedAt=? WHERE transcriptId=?")
+    .run(org, new Date().toISOString(), transcriptId);
+  // Keep the sidecar honest so rebuildIndex re-derives the new org, not the old.
+  if (row.filePath) {
+    const metaPath = filePaths(row.filePath).meta;
+    const sc = readSidecar(metaPath);
+    if (sc) { sc.siteKey = org; try { writeSidecar(metaPath, sc); } catch { /* best-effort */ } }
+  }
+  return true;
+}
+
 // ---- the raw layer ----------------------------------------------------------
 
 /**
@@ -1567,7 +1596,7 @@ module.exports = {
   ingestRaw, rawCursors, rawLimits, listRawFiles, rawFileFor,
   safeRawRel, rawDirFor, rawFilePath,
   totalArchiveBytes, totalForCeiling, __resetTotalCache,
-  searchArchive, listArchive, getTranscript, sessionRow,
+  searchArchive, listArchive, getTranscript, sessionRow, restampOrg,
   // Test seam. The raw layer's own `.jsonl` files carry no `.meta`, so the
   // rebuild would skip them anyway — this is exported so the SKIP itself can be
   // pinned rather than that backstop, because the skip is what stops a rebuild
