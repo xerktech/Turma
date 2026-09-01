@@ -98,7 +98,8 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   g.window = g; g.globalThis = g;
   const keys = Object.keys(g);
   const fn = new Function(...keys, src +
-    "\n;return { render, fmtTokens, applyAgent, connectSSE, contextMeterHtml," +
+    "\n;return { render, fmtTokens, applyAgent, connectSSE, contextMeterHtml, refresh, mergeSnapshot," +
+    " sseClock: () => sseClock," +
     " setCache: (c) => { cache = c; }, getCache: () => cache };");
   const api = fn(...keys.map((k) => g[k]));
   // Run every queued timer callback, as the browser would once they fire.
@@ -441,4 +442,60 @@ test("dashboard: a flushed repaint disarms itself", async () => {
   await D.runTimers();
   await D.runTimers();
   assert.match(D.els.tiles.innerHTML, /2 \/ 2/, "and the flag did not stay armed");
+});
+
+// --- XERK-444: an in-flight /api/agents snapshot must not clobber a newer SSE
+// patch. Both refresh() and refetchSoon() replaced `cache` wholesale with a body
+// that could have left the hub before a per-host record the stream has since
+// patched in. mergeSnapshot() keeps the live patch and takes membership from the
+// snapshot. The harness's fetch resolves on the microtask queue, so calling
+// refresh() and delivering an SSE event before awaiting it models the race.
+
+test("dashboard: an in-flight snapshot does not clobber a newer SSE patch (XERK-444)", async () => {
+  // The body left the hub carrying the host at 100; its 500-spend beat arrives by
+  // SSE while that body is still in flight. A wholesale replace would roll it back.
+  const D = loadDashboard(undefined, () => ({
+    now: Date.now(), agents: [liveHost("h", 100)], retiredUsage: [],
+  }));
+  await settle();                 // boot refresh settles at 100
+  D.connectSSE();
+  const es = D.sse[D.sse.length - 1];
+  const p = D.refresh();          // a fresh fetch is now in flight (snapshot = 100)
+  es.handlers.agent({ data: JSON.stringify(liveHost("h", 500)) });  // newer beat, mid-fetch
+  await p;
+  await settle();
+  assert.equal(tileOf(D.els.tiles.innerHTML, "Tokens all-time").value, D.fmtTokens(500),
+    "the live patch survives the older snapshot");
+});
+
+test("dashboard: a merged snapshot still drops a host it no longer lists (XERK-444)", async () => {
+  // Membership comes from the snapshot; the per-key merge must not resurrect a
+  // host the snapshot removed just because the cache still held a stale copy.
+  const D = loadDashboard(undefined, () => ({
+    now: Date.now(), agents: [liveHost("stay", 1)], retiredUsage: [],
+  }));
+  await settle();
+  D.setCache({ now: Date.now(), agents: [liveHost("stay", 1), liveHost("gone", 1)], retiredUsage: [] });
+  await D.refresh();              // snapshot lists only `stay`; no SSE patch this window
+  await settle();
+  assert.deepEqual(D.getCache().agents.map(a => a.key), ["stay"],
+    "the dropped host is not carried back in");
+});
+
+test("dashboard: a host removed mid-fetch is not resurrected by the older snapshot (XERK-444)", () => {
+  // The `removed` event lands while a snapshot that still lists the host is in
+  // flight; the removal is newer, so the merge must honour it. Driven directly:
+  // the coalescing refetch's own re-poll would otherwise mask what the ORIGINAL
+  // in-flight body does on arrival.
+  const D = loadDashboard();
+  D.setCache({ now: Date.now(), agents: [liveHost("stay", 1), liveHost("gone", 900)], retiredUsage: [] });
+  const since = D.sseClock();     // what the in-flight refresh() captured before its fetch
+  // The removed handler filters the cache AND stamps the key.
+  D.setCache({ now: Date.now(), agents: [liveHost("stay", 1)], retiredUsage: [] });
+  D.applyAgent(liveHost("gone", 900));                                  // stamps gone this window…
+  D.getCache().agents = D.getCache().agents.filter(a => a.key !== "gone");  // …then removed
+  // The older snapshot resolves, still carrying gone.
+  D.mergeSnapshot({ now: Date.now(), agents: [liveHost("stay", 1), liveHost("gone", 900)], retiredUsage: [] }, since);
+  assert.deepEqual(D.getCache().agents.map(a => a.key), ["stay"],
+    "the host removed mid-fetch is not resurrected");
 });

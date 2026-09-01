@@ -193,7 +193,8 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
       + " openSubagentView, transcriptBack,"
       + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
-      + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
+      + " applyAgent, mergeSnapshot, sseClock: () => sseClock,"
+      + " setCache: (c) => { cache = c; }, getCache: () => cache, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
@@ -2371,4 +2372,44 @@ test("Restore is not offered on a row that can never be restored", () => {
     showRestore({ ...archived, worktree: wt });
     assert.equal(els.trRestoreWrap.hidden, false, wt);
   }
+});
+
+// XERK-444: an in-flight /api/agents snapshot must not clobber a newer SSE patch.
+// The Sessions page's fetch stub never resolves (its cache is driven by setCache),
+// so this exercises the merge directly: capture the SSE clock a refresh() would
+// hold, land a live patch, then resolve the older snapshot through mergeSnapshot.
+test("sessions: mergeSnapshot keeps a live patch that landed while a snapshot was in flight (XERK-444)", () => {
+  const p = loadPage();
+  const rec = (key, v) => ({ key, device: key, online: true, sessions: [], repos: [], version: v });
+  p.setCache({ now: Date.now(), agents: [rec("h", "1.0.0")], migrations: [] });
+
+  const since = p.sseClock();                 // what refresh() captures before its fetch
+  p.applyAgent(rec("h", "1.0.1"));            // a newer beat arrives mid-fetch
+  p.mergeSnapshot({ now: Date.now(), agents: [rec("h", "1.0.0")], migrations: [] }, since);
+
+  assert.equal(p.getCache().agents.find((a) => a.key === "h").version, "1.0.1",
+    "the live patch survives the older snapshot");
+});
+
+test("sessions: mergeSnapshot honours a host the snapshot dropped and one it removed mid-fetch (XERK-444)", () => {
+  const p = loadPage();
+  const rec = (key) => ({ key, device: key, online: true, sessions: [], repos: [] });
+  p.setCache({ now: Date.now(), agents: [rec("stay"), rec("gone")], migrations: [] });
+
+  // A snapshot with no recent patch is authoritative on membership: `gone` is
+  // dropped, not resurrected from the stale cache.
+  const since = p.sseClock();
+  p.mergeSnapshot({ now: Date.now(), agents: [rec("stay")], migrations: [] }, since);
+  assert.deepEqual(p.getCache().agents.map((a) => a.key), ["stay"]);
+
+  // A host removed by SSE mid-fetch stays gone even though the older snapshot
+  // still lists it. The `removed` handler filters the cache AND stamps the key;
+  // applyAgent stamps it here, and the filter drops the re-added copy.
+  p.setCache({ now: Date.now(), agents: [rec("stay"), rec("gone")], migrations: [] });
+  const since2 = p.sseClock();
+  p.applyAgent(rec("gone"));                                   // stamps gone as patched this window
+  p.getCache().agents = p.getCache().agents.filter((a) => a.key !== "gone");   // …then removed
+  p.mergeSnapshot({ now: Date.now(), agents: [rec("stay"), rec("gone")], migrations: [] }, since2);
+  assert.deepEqual(p.getCache().agents.map((a) => a.key), ["stay"],
+    "the host removed mid-fetch is not resurrected");
 });
