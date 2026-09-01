@@ -1527,6 +1527,51 @@ test("http: a refused beat does not leak into the on-demand caches", async () =>
     "a refused beat's history must not be served");
 });
 
+test("http: a non-array ingest field degrades to 200, not a 400 offline loop (XERK-529)", async () => {
+  // Every ingest*Results loop iterates a payload field with `for (const r of
+  // ...)`, and the ack path does `new Set(payload.ackedCommands || [])`. A
+  // truthy-but-non-iterable value (a plain object, a number) makes `field ||
+  // []` that value, so the for-of / Set() throws `TypeError: ... is not
+  // iterable`. That throw is SYNCHRONOUS inside the request handler's outer
+  // try/catch, so it does NOT crash the hub — it returns 400. But a 400 on
+  // every beat is a self-inflicted per-host offline loop (the XERK-235 shape;
+  // see the ackedCommands filter comment). The Array.isArray guard turns each
+  // malformed field into "no results this beat" so the beat lands 200 and the
+  // host stays online. (The ticket framed this as a hub crash / fleet-wide
+  // DoS; the outer catch means it is neither — this test pins the 400->200
+  // behavior change, not crash-resistance.)
+  const host = "isarray-host";
+  assert.equal((await request("POST", "/api/heartbeat", {
+    headers: agentHeaders, body: { device: host, sessions: [{ id: "sa", status: "running" }] },
+  })).status, 200);
+
+  // Each field arrives straight off the wire with only a `delete` to strip it,
+  // so exercise every one of the ten iterations at once with the object/number
+  // shapes the ticket calls out (plus ackedCommands, the same class).
+  const malformed = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: {
+      device: host,
+      historyResults: {},
+      subagentHistoryResults: 7,
+      jiraIssueResults: {},
+      ticketStatusResults: "nope",
+      ticketPriorityResults: 42,
+      ticketLinkResults: {},
+      createMetaResults: true,
+      createTicketResults: {},
+      spawnFailures: {},
+      ackedCommands: {},
+    },
+  });
+  assert.equal(malformed.status, 200,
+    "a malformed-field beat must degrade to 200, not 400 the host into an offline loop");
+
+  // The hub is still up and serving.
+  const after = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(after.status, 200);
+});
+
 test("http: the on-demand deliveries are ingested but never persisted", async () => {
   const host = "transient-host";
   assert.equal((await request("POST", "/api/heartbeat", {
