@@ -14844,36 +14844,6 @@ class SessionManager:
         as 'that host can't triage', never as 'triaged, unknown result'."""
         return {"available": board_configured()}
 
-    def _qwen_version_pin(self):
-        """Env that forces qwen to run the INSTALLED base package, never a
-        cached self-update under ``~/.qwen/updates`` (XERK-507 D3).
-
-        A background self-update downloads a newer build (e.g. 0.22.3) and the
-        launcher shim (``bin/qwen``) then dispatches to IT — so both ``qwen
-        --version`` and a launched session drift off the version the [Qwen S1]
-        projectors were validated against, while the workspace
-        ``disableAutoUpdate`` only governs the per-session process, not the
-        shim's version dispatch. The shim honours ``QWEN_CODE_MANAGED_NPM_PIN``
-        with ``version:null`` by selecting the base package — but ONLY when its
-        ``bootstrap`` equals the realpath of the entry node runs, so this is
-        best-effort: an entry we cannot resolve to an absolute path (or a
-        standalone-shim install whose bootstrap differs) yields NO pin and the
-        current behavior, never a broken launch. Applied to BOTH the readiness
-        probe and the session's sourced env file so the two never disagree; the
-        shim re-publishes the null pin to the interactive relaunch, keeping it on
-        the base build too."""
-        entry = shutil.which(QWEN_BIN) or (QWEN_BIN if os.path.isabs(QWEN_BIN)
-                                           else None)
-        if not entry:
-            return {}
-        try:
-            entry = os.path.realpath(entry)
-        except OSError:
-            return {}
-        update_root = os.path.normpath(os.path.join(QWEN_HOME, "updates", "npm"))
-        return {"QWEN_CODE_MANAGED_NPM_PIN": json.dumps(
-            {"bootstrap": entry, "version": None, "updateRoot": update_root})}
-
     def _ensure_qwen_ready(self):
         """Probe whether this host can LAUNCH qwen — the qwen binary runs and a
         model route is configured — returning True/False.
@@ -14908,8 +14878,7 @@ class SessionManager:
             return False
         try:
             r = subprocess.run([QWEN_BIN, "--version"], capture_output=True,
-                               text=True, timeout=30,
-                               env={**os.environ, **self._qwen_version_pin()})
+                               text=True, timeout=30)
             if r.returncode == 0:
                 self._qwen_ready = True
                 log(f"qwen: ready ({(r.stdout or '').strip()[:40]}, model "
@@ -15115,19 +15084,15 @@ class SessionManager:
             log(f"qwen session {sid}: carried model {carried_model!r} is not a "
                 f"valid qwen model id on this host; using the host default "
                 f"{QWEN_MODEL!r}")
+        # qwen is NOT version-pinned — it auto-updates like Claude Code
+        # (XERK-525), so no QWEN_CODE_SKIP_UPDATE_CHECK_ONCE and no
+        # QWEN_CODE_MANAGED_NPM_PIN base-build force here. A newer build's
+        # Stop-hook fix reaches the fleet on its own; the accepted cost is
+        # possible [Qwen S1] parser drift (see _qwen_settings).
         env_map = {
             "OPENAI_BASE_URL": QWEN_MODEL_BASE_URL,
             "OPENAI_MODEL": model,
-            # A pinned fleet must not let qwen auto-update the binary out from
-            # under the parsers (the G0 spike caught it upgrading mid-run) — belt
-            # and suspenders with settings.general.disableAutoUpdate.
-            "QWEN_CODE_SKIP_UPDATE_CHECK_ONCE": "1",
         }
-        # Force the base build even if a self-update was ALREADY cached: skipping
-        # the update CHECK does not un-select an already-downloaded newer build
-        # the shim dispatches to (XERK-507 D3). Best-effort — no-op if the entry
-        # can't be resolved to a pin the shim accepts.
-        env_map.update(self._qwen_version_pin())
         api_key_val = os.environ.get(QWEN_MODEL_API_KEY_ENV)
         if api_key_val:
             env_map["OPENAI_API_KEY"] = api_key_val
@@ -15340,9 +15305,15 @@ class SessionManager:
             "general": {
                 # REQUIRED for the on-disk transcript + --resume to work (G0).
                 "chatRecording": True,
-                # A pinned fleet must not let the binary drift under the parsers
-                # (G0: it auto-updated mid-spike). Both keys, plus the env var.
-                "disableAutoUpdate": True,
+                # qwen auto-updates like Claude Code (XERK-525) — the fleet is NOT
+                # version-pinned, so a Stop-hook/behaviour fix in a newer build
+                # reaches every host without a manual bump. The accepted risk is
+                # parser drift: the [Qwen S1] projectors are validated against a
+                # captured corpus, so a native-log format change in a new qwen can
+                # silently degrade chat/history/PR/usage (the ttyd TUI stays live).
+                # `disableAutoUpdate` is deliberately OMITTED (default = update on).
+                # The NAG stays suppressed: an "update available" banner painted
+                # into the pane would disturb capture-pane busy/prompt parsing.
                 "disableUpdateNag": True,
             },
             "tools": {
@@ -22682,7 +22653,6 @@ class SessionManager:
         env = dict(os.environ)
         env["OPENAI_BASE_URL"] = QWEN_MODEL_BASE_URL
         env["OPENAI_MODEL"] = str(model)
-        env["QWEN_CODE_SKIP_UPDATE_CHECK_ONCE"] = "1"
         api_key_val = os.environ.get(QWEN_MODEL_API_KEY_ENV)
         if api_key_val:
             env["OPENAI_API_KEY"] = api_key_val

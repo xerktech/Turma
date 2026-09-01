@@ -4468,7 +4468,11 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         with open(os.path.join(self.wt, ".qwen", "settings.json")) as f:
             settings = json.load(f)
         self.assertTrue(settings["general"]["chatRecording"])
-        self.assertTrue(settings["general"]["disableAutoUpdate"])
+        # qwen auto-updates like Claude Code (XERK-525): NOT version-pinned, so
+        # disableAutoUpdate is absent (default = update on). The update NAG stays
+        # suppressed so an "update available" banner can't disturb pane parsing.
+        self.assertNotIn("disableAutoUpdate", settings["general"])
+        self.assertTrue(settings["general"]["disableUpdateNag"])
         self.assertEqual(settings["tools"]["approvalMode"], "auto")
         self.assertFalse(settings["security"]["folderTrust"]["enabled"])
         # Append-only scrollback rendering, NOT qwen's alt-screen "virtualized
@@ -4738,37 +4742,21 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
              mock.patch.object(ha, "_capture_pane", return_value=cap):
             self.assertFalse(sm._confirm_qwen_launch(self._sess(), "dddd"))
 
-    # --- version pin: run the INSTALLED base build, never a self-update (D3) --
+    # --- auto-update like Claude (XERK-525): NO version pin in the env file ---
 
-    def test_version_pin_forces_the_base_build_and_rides_the_env_file(self):
-        # Mock only `which` (to an ABSOLUTE path realpath passes through
-        # unchanged) for the WHOLE body, so the assertion holds on a CI host with
-        # no qwen on PATH without disturbing the realpath the launch uses to key
-        # the MCP approvals. The real entry resolution is covered by the
-        # empty-when-unresolvable case.
+    def test_session_env_carries_no_version_pin_or_skip_update(self):
+        # qwen auto-updates like Claude Code: neither the base-build force
+        # (QWEN_CODE_MANAGED_NPM_PIN) nor the skip-update flag
+        # (QWEN_CODE_SKIP_UPDATE_CHECK_ONCE) is written into the sourced env file,
+        # so a newer build's Stop-hook fix (XERK-525) reaches the fleet on its own.
         sm = self.make_manager()
         with mock.patch.object(ha.shutil, "which",
                                return_value="/opt/qwen/bin/qwen"):
-            pin = sm._qwen_version_pin()
-            # version:null is what makes the shim select the base package, not
-            # the cached self-update; bootstrap is the realpath of the entry.
-            parsed = json.loads(pin["QWEN_CODE_MANAGED_NPM_PIN"])
-            self.assertIsNone(parsed["version"])
-            self.assertEqual(parsed["bootstrap"], "/opt/qwen/bin/qwen")
-            # It must reach the SESSION too (not just the readiness probe),
-            # sourced from the 0600 env file like every other qwen var.
             self._launch(sm, self._sess(), prompt="hi")
         with open(os.path.join(self.tmp, "qwen", "q1.env")) as f:
             body = f.read()
-        self.assertIn("QWEN_CODE_MANAGED_NPM_PIN", body)
-
-    def test_version_pin_is_empty_when_the_entry_cannot_be_resolved(self):
-        # Best-effort: an unresolvable bare command yields NO pin (the shim would
-        # reject a bad bootstrap anyway) rather than a broken launch.
-        sm = self.make_manager()
-        with mock.patch.object(ha, "QWEN_BIN", "qwen"), \
-             mock.patch.object(ha.shutil, "which", return_value=None):
-            self.assertEqual(sm._qwen_version_pin(), {})
+        self.assertNotIn("QWEN_CODE_MANAGED_NPM_PIN", body)
+        self.assertNotIn("QWEN_CODE_SKIP_UPDATE_CHECK_ONCE", body)
 
     # --- git-exclude against a REAL linked worktree --------------------------
 

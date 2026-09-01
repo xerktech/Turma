@@ -143,6 +143,10 @@ against the LiteLLM gateway:
   successful! The new version will be used on your next run."*). A fleet pinned to a version and a
   corpus **must** disable it: `general.disableAutoUpdate:true` (and `general.disableUpdateNag:true`),
   or env `QWEN_CODE_SKIP_UPDATE_CHECK_ONCE`. Otherwise the binary drifts under the parsers.
+  **SUPERSEDED by XERK-525**: the fleet is no longer version-pinned — qwen auto-updates like Claude
+  Code, so only `disableUpdateNag` is kept and the pin is gone. This spike note records the original
+  reasoning; see `docs/qwen-adr.md` and `.claude/rules/qwen.md` for current behaviour and the accepted
+  parser-drift trade.
 - **A cleaner parse channel than the pane exists: `--json-file <path>` / `--json-fd <n>`** —
   "dual output mode": the TUI renders normally on stdout while **structured JSON events** are written
   to the file/fd. For liveness and turn/tool structure this is more robust than `capture-pane`
@@ -207,5 +211,8 @@ None block the GO. Recorded for the epic:
    bake-off is separate (`docs/local-model-failover.md`, `bench/`).
 2. **Pin + auto-update policy** needs a fleet decision: which Qwen version to pin, and setting
    `general.disableAutoUpdate` on every host so the corpus/parsers stay valid.
+   **RESOLVED (XERK-525): do NOT pin — qwen auto-updates like Claude Code**, accepting the
+   parser-drift risk (re-verify the projectors host-side after a qwen format change). Only
+   `disableUpdateNag` is kept.
 3. **`--json-file` vs pane parsing** is a drive-child design call: prefer the structured stream for
    liveness/structure, keep pane parse as the fallback. Both are proven-viable here.

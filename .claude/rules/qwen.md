@@ -108,9 +108,11 @@ Deliberately CLOSE to `_launch_tmux`, not the dsh driver.
 - **The per-worktree config (`.qwen/settings.json` + the context file) is git-EXCLUDED** via the
   repo's COMMON `info/exclude` (shared by every worktree) so it never reads as uncommitted work
   (prune/delete key on `git status`) nor gets committed; it is regenerated every launch. Settings pin
-  `chatRecording:true` (REQUIRED for the on-disk transcript + resume), `disableAutoUpdate` (a pinned
-  fleet must not let the binary drift under the parsers), `folderTrust:false`, and
-  `approvalMode:"auto"` + `autoAccept:true` (hands-off, the `--permission-mode auto` analogue).
+  `chatRecording:true` (REQUIRED for the on-disk transcript + resume), `disableUpdateNag:true` (keep
+  an update banner out of the pane so it can't disturb `capture-pane` parsing), `folderTrust:false`,
+  and `approvalMode:"auto"` + `autoAccept:true` (hands-off, the `--permission-mode auto` analogue).
+  **`disableAutoUpdate` is deliberately OMITTED — qwen auto-updates like Claude Code (XERK-525);
+  see the auto-update bullet below.**
 - **`ui.useTerminalBuffer:false` is a FLICKER pin, not a preference.** qwen's default alt-screen
   "virtualized viewport" is gated only on `isInteractiveTerminal()` (real TTY + `TERM!="dumb"`),
   which the tmux pane satisfies, so it turns ON with a heavy full-region repaint: `?1049` + `?2J` +
@@ -141,15 +143,20 @@ Deliberately CLOSE to `_launch_tmux`, not the dsh driver.
   binary. Merges into the shared file; RAISES on write failure (a wedged session reads running but
   runs nothing). `_confirm_qwen_launch` also fails on a pane still showing the dialog — defense if the
   hash ever stops matching after a qwen upgrade.
-- **The binary is PINNED to the installed base build, not a cached self-update** (`_qwen_version_pin`,
-  XERK-507 D3). qwen background-downloads a newer build under `~/.qwen/updates` and the launcher shim
-  dispatches to it, so BOTH `qwen --version` and a session drift off the [Qwen S1] corpus version —
-  and `QWEN_CODE_SKIP_UPDATE_CHECK_ONCE` only skips the CHECK, it does not un-select an
-  already-cached build, nor does workspace `disableAutoUpdate` (that governs the per-session process,
-  not the shim's dispatch). The fix sets `QWEN_CODE_MANAGED_NPM_PIN` with `version:null` (+ `bootstrap`
-  = realpath of the entry node runs) on BOTH the probe and the session env file; the shim then selects
-  the base package and re-publishes the null pin to the interactive relaunch. Best-effort — an
-  unresolvable entry yields no pin, never a broken launch.
+- **qwen AUTO-UPDATES like Claude Code — the binary is NOT version-pinned** (XERK-525, reversing the
+  XERK-507 D3 pin). So a Stop-hook / behaviour fix in a newer build (e.g. the XERK-525 Stop-hook skip)
+  reaches every host on its own, without a manual bump. Concretely: `disableAutoUpdate` is omitted
+  from the workspace settings, `QWEN_CODE_SKIP_UPDATE_CHECK_ONCE` is not set on the probe/session/
+  summary env, and there is no `QWEN_CODE_MANAGED_NPM_PIN` base-build force (`_qwen_version_pin` is
+  gone). The launcher shim's normal `~/.qwen/updates` self-update dispatch is left to run, exactly as
+  Claude Code's own updater does.
+  - **Accepted risk: [Qwen S1] parser drift.** Unlike Claude's de-facto-standard format, qwen's
+    native log is parsed by OUR projectors, validated against a CAPTURED corpus at a specific version.
+    A native-log format change in a newer qwen can SILENTLY degrade chat/history/PR/usage while the
+    ttyd TUI stays live (the projector's `except`-swallowed failure mode). This is a deliberate
+    trade the operator chose (currency over the pin); a version-compatibility gate is possible future
+    work, tracked separately. Re-verify the projectors host-side after a qwen major/format change —
+    host-proof only, qwen is not in CI.
 - **Config readiness is primed OFF THE BEAT** (`_ensure_qwen_ready` on a worker at startup): a `qwen
   --version` probe + model-route validation cached on `_qwen_ready`. `_launch_qwen` only READS the
   cached flag and refuses if unset — never the probe on the beat (XERK-395).
@@ -165,7 +172,7 @@ Deliberately CLOSE to `_launch_tmux`, not the dsh driver.
 - Tests: `TestLaunchQwen` (readiness gate, pinned id, 0600 env file with no credential on the command
   line, settings/context-file content, `-i` initial prompt, `--resume` in place, teardown-on-failed-
   confirm, `_confirm_qwen_launch`, the MCP pre-auth golden hash + merge + write-failure-refuses +
-  dialog-fails-confirm cases, the version-pin cases).
+  dialog-fails-confirm cases, the no-version-pin/no-skip-update env case).
 
 ## [Qwen S1] (XERK-508) the projection (`agent/qwen_transcript.py`)
 

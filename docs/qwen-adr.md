@@ -56,8 +56,20 @@ Recorded in full in `docs/qwen-g0-spike.md`; these five drove concrete code:
    reused directly, with only a thin shim to bridge tool names.
 5. **Hook `timeout` is MILLISECONDS**, not seconds — a too-small value silently disables the guard.
 
-An auto-update trap also surfaced: a pinned fleet must not let the binary drift under the parsers,
-hence `disableAutoUpdate` in the per-worktree settings.
+An auto-update trap surfaced during the G0 spike (qwen upgraded the binary mid-run), and the runtime
+was originally version-pinned to protect the [Qwen S1] projectors — `disableAutoUpdate` in the
+per-worktree settings plus a `QWEN_CODE_MANAGED_NPM_PIN` base-build force (`_qwen_version_pin`).
+
+**XERK-525 reverses that pin: qwen now AUTO-UPDATES like Claude Code**, so a Stop-hook / behaviour fix
+in a newer build reaches every host without a manual bump (the ticket's driver was qwen 0.22.2's Stop
+hook being skipped on steer/queued/aborted turn-ends, which a newer build is expected to fix). The
+accepted cost is that a native-log format change in a future qwen can silently degrade
+chat/history/PR/usage while the ttyd TUI stays live — the projectors are corpus-validated per version
+and are the reason the pin existed. Currency was chosen over the pin deliberately; the projectors
+must be re-verified host-side after a qwen major/format change (host-proof only — qwen is not in CI),
+and a version-compatibility gate (degrade qwen availability outside a known-good version set) is
+possible future work. Only `disableUpdateNag` is kept, to keep an update banner out of the pane where
+it would disturb `capture-pane` parsing.
 
 ## Why `QWEN_ENABLED` shipped False
 
