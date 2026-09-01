@@ -54,6 +54,17 @@ launch choke point** so the guard is wired before the process runs. The launcher
   unknown verb → WRITE.
 - **Paths are realpath-resolved** (existing-prefix walk for a not-yet-created target) — a symlink or
   `..` cannot dodge a rule.
+  - **A credential deny is matched against BOTH the literal and the realpath'd target** (XERK-497,
+    `matchesTarget` in `policy.mjs` / `_matches_target` in the qwen shim). A store symlinked OUT of
+    $HOME (WSL's `~/.aws`, `~/.kube/config` → `/mnt/c/...`) realpaths to a path no $HOME-relative deny
+    glob covers, so the realpath'd target ALONE reads as allowed. The literal (pre-realpath, `..`-
+    collapsed) target is what still catches a symlinked-out leaf; realpath still closes a symlink used
+    to DODGE a rule. The RULE-side half is `_realpath_glob_prefix` (XERK-503), which resolves a
+    symlinked store DIRECTORY in the glob's prefix — the two together cover dir-symlinked-out,
+    file-symlinked-out-under-a-real-dir, and an unrelated symlink into a symlinked-out store.
+    ALLOW carve-outs (uploads/roster) stay realpath-only — widening an allow on a literal path is the
+    wrong direction. `sandbox: workspace-write` (`dsh-fs-sandbox`/landlock) independently blocks the
+    actual write, so this is defence in depth, not the sole barrier.
 - **Reads of credential STORES are allowed, matching Claude exactly** — Claude's rules are
   write-deny-only except `~/.turma/local-model.env`. Fidelity over intuition.
 

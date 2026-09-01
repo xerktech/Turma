@@ -97,9 +97,15 @@ Every one of these is unit-tested against its contract and awaits host confirmat
 - **A credential-store glob dodge via a symlinked HOME subdirectory is FIXED** (XERK-503,
   `_realpath_glob_prefix`) — `~/.aws` itself being a bind mount, or on WSL the Windows-side profile,
   no longer dodges its deny rule; the glob's literal prefix is realpath'd the same way `fileguard.py`
-  already realpaths its `~/.claude` base. **Still open: a credential FILE itself symlinked**
-  (`~/.kube/config` elsewhere, `~/.kube` itself real) — nothing to realpath in the prefix, so that
-  leaf still dodges. Closing it needs a nominal-path check alongside the realpath one, in
-  qwen/dsh/fileguard alike — a bigger change, not yet done. Same limitation applies to the dsh guard.
+  already realpaths its `~/.claude` base.
+- **A credential FILE itself symlinked out is now also caught** (XERK-497, `_matches_target`) — a
+  `~/.kube/config` pointing elsewhere with `~/.kube` itself real has nothing to realpath in the glob
+  prefix, so the realpath'd target alone missed it. The shim (and dsh's `policy.mjs`) now match the
+  deny globs against BOTH the literal (pre-realpath, `..`-collapsed) and the realpath'd target, deny
+  if either matches. With XERK-503's prefix realpath this covers dir-symlinked-out,
+  file-symlinked-out, and an unrelated symlink into a symlinked-out store. `fileguard.py`'s
+  `~/.claude` predicate is unaffected (it realpaths base and target together, so a symlinked
+  `~/.claude` dir already matched). Verified on MaxAI the dsh/qwen sandbox independently blocks the
+  actual /mnt/c write, so this closed a defence-in-depth gap, not a live credential write.
 - **The project's own `QWEN.md` is not auto-loaded**, since `context.fileName` points at Turma's own
   context file instead. Accepted trade.

@@ -115,6 +115,33 @@ function matchesAny(target, regexps) {
   return regexps.some((r) => r.test(target))
 }
 
+// The absolute, lexically-normalized target WITHOUT symlink resolution — the
+// path the tool actually NAMED, with `..` collapsed but every symlink left
+// intact. Matched BESIDE the realpath'd target (XERK-497): a credential store
+// symlinked OUT of $HOME defeats a $HOME-relative deny glob when only the
+// realpath'd target is checked, because realpath rewrites the target to a
+// location the glob no longer covers. The classic case is WSL, where `~/.aws`,
+// `~/.azure` and `~/.kube/config` point at `/mnt/c/Users/<u>/…`. Denying if
+// EITHER the literal or the realpath'd target matches catches the store
+// whichever way its symlink points, while realpath still closes a symlink used
+// to DODGE a rule from inside the worktree (the anti-symlink-dodge resolveTarget
+// exists for). `_realpath_glob_prefix` on the RULE side (XERK-503) is the
+// complementary half: together they cover a store DIR symlinked out, a store
+// FILE symlinked out under a real dir, and an unrelated symlink pointing into a
+// symlinked-out store.
+function literalTarget(p, cwd) {
+  if (typeof p !== 'string' || !p) return null
+  return path.resolve(cwd || process.cwd(), p)
+}
+
+// Deny if the literal OR the realpath'd target matches — the both-sides check
+// XERK-497 adds. `real` is always present here; `literal` is skipped when equal.
+function matchesTarget(literal, real, regexps) {
+  if (real != null && matchesAny(real, regexps)) return true
+  if (literal != null && literal !== real && matchesAny(literal, regexps)) return true
+  return false
+}
+
 // Resolve a tool's path argument to an absolute, symlink-canonical path the way
 // the py guards do (`os.path.realpath`), so a rule cannot be dodged by a symlink
 // or a `..`. A write target may not exist yet, so realpath the longest existing
@@ -210,13 +237,17 @@ export function decideDeny(execution, cfg) {
   if (c.kind === 'write') {
     const target = resolveTarget(c.target, cfg.cwd)
     if (!target) return null
+    const literal = literalTarget(c.target, cfg.cwd)
     // ~/.claude "everything except the memory trees" — fileguard.py owns this
-    // predicate; a glob list cannot express it (agent-hooks.md).
+    // predicate; a glob list cannot express it (agent-hooks.md). It realpaths
+    // both its base and the target itself, so a symlinked `~/.claude` DIR cannot
+    // dodge it — the both-sides match below is for the flat globs, not this.
     const claudeReason = runHook(cfg, cfg.fileguardScript, 'Write', { file_path: target }, cfg.cwd)
     if (claudeReason) return claudeReason
     // Credential / config / runtime-code stores — the flat write-deny globs
-    // (Claude's `Edit(...)` rules), defence in depth beside fileguard.
-    if (matchesAny(target, cfg._denyWriteRe)) {
+    // (Claude's `Edit(...)` rules), defence in depth beside fileguard. Matched
+    // against the literal AND the realpath'd target (XERK-497).
+    if (matchesTarget(literal, target, cfg._denyWriteRe)) {
       return denyWriteReason(target)
     }
     return null
@@ -225,11 +256,14 @@ export function decideDeny(execution, cfg) {
   if (c.kind === 'read') {
     const target = resolveTarget(c.target, cfg.cwd)
     if (!target) return null
+    const literal = literalTarget(c.target, cfg.cwd)
     // Read carve-outs win over every read deny: the per-session uploads tree and
     // the peer roster are files the session is MEANT to read (XERK-234/348), and
     // pre-approving them is the cross-child contract [C] (XERK-467) depends on.
+    // Matched on the realpath'd target only — widening an ALLOW on a literal
+    // path is the wrong direction for a guard.
     if (matchesAny(target, cfg._allowReadRe)) return null
-    if (matchesAny(target, cfg._denyReadRe)) return denyReadReason(target)
+    if (matchesTarget(literal, target, cfg._denyReadRe)) return denyReadReason(target)
     return null
   }
 
@@ -272,4 +306,4 @@ export function compileConfig(cfg) {
 }
 
 // Exported for tests only.
-export const _internals = { globToRegExp, resolveTarget, matchesAny, runHook }
+export const _internals = { globToRegExp, resolveTarget, literalTarget, matchesAny, matchesTarget, runHook }

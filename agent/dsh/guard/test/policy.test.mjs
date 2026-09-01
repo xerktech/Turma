@@ -184,6 +184,46 @@ test('a symlink into a credential store still resolves to a DENIED write', () =>
   assert.ok(r, 'symlinked write into a credential store must be denied')
 })
 
+// --- a credential store symlinked OUT of $HOME (XERK-497, WSL /mnt/c) -----
+//
+// The store is reached through a symlink pointing outside $HOME, so the
+// realpath'd target lands somewhere no $HOME-relative deny glob covers. The
+// literal-target match is what still catches it; `realpathGlobPrefix` on the
+// rule side (XERK-503) covers the complementary dir-symlink shape.
+
+test('a credential FILE symlinked out of the store is still DENIED (XERK-497)', () => {
+  // ~/.kube is a REAL dir but ~/.kube/config is a symlink to elsewhere (on WSL,
+  // /mnt/c/Users/<u>/.kube/config). resolveTarget realpaths the leaf OUT of the
+  // store, so the realpath'd target no longer matches the store's ~/.kube/**
+  // deny glob (whose literal prefix is a real dir, unchanged by realpath).
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-guard-outside-'))
+  const realLeaf = path.join(outside, 'config')
+  fs.writeFileSync(realLeaf, 'stub')
+  const store = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-guard-store-')) // a real "store" dir
+  const link = path.join(store, 'config')
+  try { fs.symlinkSync(realLeaf, link) } catch { return } // skip if unsupported
+  const c = compileConfig({ ...cfg, denyWrite: [`${store}/**`].map(realpathGlobPrefix) })
+  const r = decideDeny(ex('write', { path: link, content: 'x' }), c)
+  assert.ok(r, 'a write to a store file symlinked out of the store must be denied')
+  // A control: a non-store file symlinked elsewhere is still allowed.
+  const benign = path.join(CWD, 'benign-link')
+  try { fs.symlinkSync(realLeaf, benign) } catch { return }
+  assert.equal(decideDeny(ex('write', { path: benign, content: 'x' }), c), null)
+})
+
+test('a store DIR symlinked out of $HOME is still DENIED (XERK-497)', () => {
+  // ~/.aws itself is a symlink to /mnt/c/... — the store DIRECTORY, not a leaf.
+  // realpathGlobPrefix resolves the glob's prefix to the physical dir, and the
+  // realpath'd target lands there too, so the deny holds.
+  const physical = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-guard-phys-'))
+  const homeish = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-guard-home-'))
+  const storeLink = path.join(homeish, '.aws')
+  try { fs.symlinkSync(physical, storeLink) } catch { return }
+  const c = compileConfig({ ...cfg, denyWrite: [`${storeLink}/**`].map(realpathGlobPrefix) })
+  const r = decideDeny(ex('write', { path: path.join(storeLink, 'credentials'), content: 'x' }), c)
+  assert.ok(r, 'a write into a store directory symlinked out of $HOME must be denied')
+})
+
 // --- fail-closed on a broken hook ----------------------------------------
 
 test('a missing guard script fails CLOSED (denies)', () => {
