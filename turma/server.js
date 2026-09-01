@@ -3186,6 +3186,17 @@ function normalizeLimits(payload) {
     const clean = { usedPct: Math.min(100, Math.max(0, pct)) };
     const resets = num(win.resetsAt);
     if (resets !== undefined) clean.resetsAt = resets;
+    // The 7-day window's even-pace day markers (XERK-536): the agent ships
+    // seven weekday labels computed in ITS OWN timezone. Coerced like every
+    // other agent-authored field here — Android TYPES it as List<String>, so
+    // one bad element would fail the WHOLE /api/agents decode, not just this
+    // card. Anything but exactly seven short strings drops the field, which
+    // reads on every client as "no markers", never a fabricated grid.
+    if (key === "sevenDay" && Array.isArray(win.dayLabels)
+        && win.dayLabels.length === 7
+        && win.dayLabels.every((s) => typeof s === "string")) {
+      clean.dayLabels = win.dayLabels.map((s) => s.slice(0, 8));
+    }
     out[key] = clean;
   }
   const captured = num(lim.capturedAt);

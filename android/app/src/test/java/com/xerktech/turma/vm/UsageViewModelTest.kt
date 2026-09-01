@@ -310,6 +310,47 @@ class UsageViewModelTest {
         assertEquals(listOf("fresh", "stale"), UsageViewModel.compute(fleet, now).limits.map { it.host })
     }
 
+    // --- the 7-day even-pace day markers (XERK-536) -------------------------
+    // Port of usage.html's sevenDayPacing; mirrors turma/tests/usage.test.js.
+
+    private val dayLabels = listOf("Wed", "Thu", "Fri", "Sat", "Sun", "Mon", "Tue")
+
+    @Test fun `sevenDayPacing places today's slice and the pace line by the reset`() {
+        val day = 86400L
+        val win = LimitWindow(usedPct = 40.0, resetsAt = now + (45 * day) / 10, dayLabels = dayLabels)
+        val p = UsageViewModel.sevenDayPacing(win, now)!!
+        assertEquals(dayLabels, p.slices.map { it.label })
+        assertEquals(listOf(1, 2, 3, 4, 5, 6, 7), p.slices.map { Math.round(it.end * 7).toInt() })
+        // 2.5 days into the window → the third slice (index 2) is today.
+        assertEquals(2, p.slices.indexOfFirst { it.isToday })
+        assertEquals(1, p.slices.count { it.isToday })
+        assertEquals(2.5 / 7, p.paceFrac, 1e-9)
+    }
+
+    @Test fun `sevenDayPacing needs a reset stamp, seven labels, and a live window`() {
+        assertEquals(null, UsageViewModel.sevenDayPacing(LimitWindow(dayLabels = dayLabels), now))
+        assertEquals(null, UsageViewModel.sevenDayPacing(LimitWindow(resetsAt = now + 86400), now))
+        assertEquals(null, UsageViewModel.sevenDayPacing(
+            LimitWindow(resetsAt = now + 86400, dayLabels = listOf("Mon")), now))
+        // Already reset — nothing to pace.
+        assertEquals(null, UsageViewModel.sevenDayPacing(
+            LimitWindow(resetsAt = now - 60, dayLabels = dayLabels), now))
+    }
+
+    @Test fun `only the 7-day window's LimitView carries pacing`() {
+        // The 5-hour window carries dayLabels here too — a shape the hub strips,
+        // but the guard must be the WINDOW, not that stripping: even fed labels,
+        // the 5h bar stays plain (web limitCard gates the same draw on the key).
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "h", device = "h", limits = limits(
+                five = LimitWindow(usedPct = 20.0, resetsAt = now + 3600, dayLabels = dayLabels),
+                seven = LimitWindow(usedPct = 40.0, resetsAt = now + 4 * 86400, dayLabels = dayLabels))),
+        ))
+        val card = UsageViewModel.compute(fleet, now).limits.single()
+        assertEquals(null, card.fiveHour?.pacing)
+        assertEquals(dayLabels, card.sevenDay?.pacing?.slices?.map { it.label })
+    }
+
     // --- one card per subscription (XERK-301) -------------------------------
     // Ports of usage.html's limitGroups / limitHostLabel.
 

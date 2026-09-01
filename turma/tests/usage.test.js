@@ -105,6 +105,7 @@ function loadHelpers(fetchReply = null) {
   const keys = Object.keys(stubs);
   const body = `${script}\n;return { tokenCell, cacheSubLine, cacheLineText, cacheHitRate,
     blankBucket, limitEntries, limitGroups, limitHostLabel, limitCard, limitWindowView,
+    sevenDayPacing,
     fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC, fmtTokens,
     blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render,
     hostLabel, hostSeries, repoSeries,
@@ -803,6 +804,88 @@ test("limitWindowView renders a window that reports no reset time", () => {
 test("limitWindowView has nothing to draw without a percentage", () => {
   assert.equal(H.limitWindowView({ resetsAt: NOW + 60 }, NOW), null);
   assert.equal(H.limitWindowView(null, NOW), null);
+});
+
+// --- the 7-day even-pace day markers (XERK-536) ------------------------------
+// Seven days ending at `resetsAt`, the labels sent by the agent (its own zone).
+const DAY = 86400;
+const LABELS = ["Wed", "Thu", "Fri", "Sat", "Sun", "Mon", "Tue"];
+
+test("sevenDayPacing places today's slice and the pace line by the reset stamp", () => {
+  // NOW sits 2.5 days into a window that resets in 4.5 days.
+  const resetsAt = NOW + 4.5 * DAY;
+  const p = H.sevenDayPacing({ resetsAt, dayLabels: LABELS }, NOW);
+  assert.equal(p.slices.length, 7);
+  assert.deepEqual(p.slices.map((s) => s.label), LABELS);
+  // Boundaries are the cumulative 1/7 fractions.
+  assert.deepEqual(p.slices.map((s) => Math.round(s.end * 7)), [1, 2, 3, 4, 5, 6, 7]);
+  // 2.5 days elapsed → the current slice is index 2 (the third day).
+  assert.deepEqual(p.slices.map((s) => s.isToday), [false, false, true, false, false, false, false]);
+  // The continuous pace line is the fraction of the whole week elapsed.
+  assert.ok(Math.abs(p.paceFrac - 2.5 / 7) < 1e-9);
+});
+
+test("sevenDayPacing needs a reset stamp and exactly seven labels", () => {
+  assert.equal(H.sevenDayPacing({ dayLabels: LABELS }, NOW), null);
+  assert.equal(H.sevenDayPacing({ resetsAt: NOW + DAY }, NOW), null);
+  assert.equal(H.sevenDayPacing({ resetsAt: NOW + DAY, dayLabels: ["Mon"] }, NOW), null);
+});
+
+test("sevenDayPacing gives up on a window that has already reset", () => {
+  // Past the reset there is no pace to show; the caller also greys the bar.
+  assert.equal(H.sevenDayPacing({ resetsAt: NOW - 60, dayLabels: LABELS }, NOW), null);
+});
+
+test("the 7-day bar draws day markers, a pace line and labels; the 5-hour bar does not", () => {
+  const card = H.limitCard(H.limitGroups([
+    { device: "h", subscription: { key: "k1" }, limits: {
+      capturedAt: NOW,
+      fiveHour: { usedPct: 20, resetsAt: NOW + 3600 },
+      sevenDay: { usedPct: 40, resetsAt: NOW + 4.5 * DAY, dayLabels: LABELS },
+    } },
+  ], NOW)[0], NOW);
+  const walk = (el) => [el, ...(el.children || []).flatMap(walk)];
+  const nodes = walk(card);
+  const cls = (name) => nodes.filter((el) => (el.className || "").split(" ").includes(name));
+  // Six internal ticks (the 7th boundary is the bar's own right edge), one pace
+  // line, and a seven-cell label row — all belonging to the 7-day window only.
+  assert.equal(cls("lim-tick").length, 6);
+  assert.equal(cls("lim-pace").length, 1);
+  assert.equal(cls("lim-day").length, 7);
+  assert.equal(cls("lim-day").filter((el) => (el.className || "").includes("today")).length, 1);
+  assert.deepEqual(cls("lim-day").map((el) => el.textContent), LABELS);
+});
+
+test("the 5-hour bar stays plain even if its window carries day labels", () => {
+  // The guard is the WINDOW, not the hub stripping fiveHour.dayLabels: limitCard
+  // draws markers only for key === "sevenDay", so a fiveHour window fed labels
+  // (a shape normalizeLimits removes, pinned here in case a payload bypasses it)
+  // never sprouts a grid.
+  const card = H.limitCard(H.limitGroups([
+    { device: "h", subscription: { key: "k1" }, limits: {
+      capturedAt: NOW,
+      fiveHour: { usedPct: 20, resetsAt: NOW + 4.5 * DAY, dayLabels: LABELS },
+      sevenDay: { usedPct: 40, resetsAt: NOW + 4.5 * DAY, dayLabels: LABELS },
+    } },
+  ], NOW)[0], NOW);
+  const nodes = [card, ...(function w(e){return (e.children||[]).flatMap((c)=>[c,...w(c)]);})(card)];
+  // Token match, not substring — ".lim-days" (the label container) contains the
+  // substring "lim-day". Exactly one bar's worth of markers, the weekly one.
+  const has = (el, name) => (el.className || "").split(" ").includes(name);
+  assert.equal(nodes.filter((el) => has(el, "lim-tick")).length, 6);
+  assert.equal(nodes.filter((el) => has(el, "lim-day")).length, 7);
+});
+
+test("an expired 7-day window draws no markers", () => {
+  const card = H.limitCard(H.limitGroups([
+    { device: "h", subscription: { key: "k1" }, limits: {
+      capturedAt: NOW,
+      sevenDay: { usedPct: 40, resetsAt: NOW - 60, dayLabels: LABELS },
+    } },
+  ], NOW)[0], NOW);
+  const nodes = [card, ...(function w(e){return (e.children||[]).flatMap((c)=>[c,...w(c)]);})(card)];
+  assert.equal(nodes.filter((el) => (el.className || "").includes("lim-tick")).length, 0);
+  assert.equal(nodes.filter((el) => (el.className || "").includes("lim-day")).length, 0);
 });
 
 test("fmtDuration reads as an age or a countdown at every scale", () => {

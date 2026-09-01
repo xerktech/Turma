@@ -175,10 +175,24 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val pctLabel: String,
         val reset: String,
         val level: Level,
+        /**
+         * The even-pace day markers for the 7-day bar (XERK-536), or null when
+         * this window can't be paced (the 5-hour window, no reset stamp, no
+         * labels, or already reset). Purely informational.
+         */
+        val pacing: SevenDayPacing? = null,
     ) {
         /** Bar colour band — earned from headroom, not from branding. */
         enum class Level { NORMAL, WARN, CRIT }
     }
+
+    /** One day slice of the 7-day even-pace grid. [end] is its cumulative 0..1
+     *  boundary; [isToday] marks the slice the current moment falls in. */
+    data class SevenDaySlice(val label: String, val end: Double, val isToday: Boolean)
+
+    /** The 7-day bar's day markers plus [paceFrac], the fraction of the week
+     *  elapsed — the continuous "you should be here by now" line. */
+    data class SevenDayPacing(val slices: List<SevenDaySlice>, val paceFrac: Double)
 
     data class UsageUi(
         val byRepo: List<RepoTotal> = emptyList(),
@@ -360,8 +374,19 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
             return "${hours / 24}d ${hours % 24}h"
         }
 
-        /** One window's rendered state, or null when it carries no percentage. */
-        fun limitView(win: com.xerktech.turma.model.LimitWindow?, nowSec: Long): LimitView? {
+        /**
+         * One window's rendered state, or null when it carries no percentage.
+         * [pace] draws the even-pace day markers (XERK-536) — set ONLY for the
+         * 7-day window (web `limitCard` gates the same draw on `key ===
+         * "sevenDay"`). This is the guard, not the hub's `dayLabels` stripping:
+         * the 5-hour bar must stay plain even if a `fiveHour.dayLabels` ever
+         * reached a client past `normalizeLimits`.
+         */
+        fun limitView(
+            win: com.xerktech.turma.model.LimitWindow?,
+            nowSec: Long,
+            pace: Boolean = false,
+        ): LimitView? {
             val raw = win?.usedPct ?: return null
             val pct = raw.coerceIn(0.0, 100.0)
             val resetsIn = win.resetsAt?.let { it - nowSec }
@@ -383,7 +408,37 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                     pct >= 75 -> LimitView.Level.WARN
                     else -> LimitView.Level.NORMAL
                 },
+                pacing = if (pace) sevenDayPacing(win, nowSec) else null,
             )
+        }
+
+        /** How many even-pace slices the 7-day window is split into (web
+         *  usage.html SEVEN_DAY_SLICES). */
+        const val SEVEN_DAY_SLICES = 7
+
+        /**
+         * The even-pace day markers overlaid on the 7-day bar (web usage.html
+         * `sevenDayPacing`). A fixed 7-day window ending at `resetsAt`, split
+         * into seven 1/7 slices measured back from it; returns each day cell
+         * (its agent-supplied weekday label and whether NOW falls in it) plus
+         * the fraction of the week elapsed, or null when the window can't be
+         * paced. The weekday NAMES come from the agent (its own timezone); which
+         * slice is "today" and the pace fraction are timezone-free arithmetic
+         * computed here at render time so they stay correct as the snapshot ages.
+         */
+        fun sevenDayPacing(win: com.xerktech.turma.model.LimitWindow?, nowSec: Long): SevenDayPacing? {
+            val resets = win?.resetsAt ?: return null
+            val labels = win.dayLabels
+            if (labels.size != SEVEN_DAY_SLICES) return null
+            val windowLen = SEVEN_DAY_SLICES.toLong() * 86400
+            val windowStart = resets - windowLen
+            val elapsed = nowSec - windowStart
+            if (elapsed < 0 || elapsed >= windowLen) return null
+            val todayIdx = minOf(SEVEN_DAY_SLICES - 1, (elapsed / 86400).toInt())
+            val slices = labels.mapIndexed { i, label ->
+                SevenDaySlice(label, (i + 1).toDouble() / SEVEN_DAY_SLICES, i == todayIdx)
+            }
+            return SevenDayPacing(slices, elapsed.toDouble() / windowLen)
         }
 
         /** How many host names a card's heading spells out before counting them. */
@@ -452,7 +507,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                     hosts = g.hosts,
                     capturedAt = g.capturedAt,
                     fiveHour = limitView(g.fiveHour, nowSec),
-                    sevenDay = limitView(g.sevenDay, nowSec),
+                    sevenDay = limitView(g.sevenDay, nowSec, pace = true),
                     fiveHourAt = if (g.fiveHour != null) g.fiveHourAt else g.capturedAt,
                     sevenDayAt = if (g.sevenDay != null) g.sevenDayAt else g.capturedAt,
                 )

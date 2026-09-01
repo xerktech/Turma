@@ -5974,8 +5974,46 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
                                    sevenDay={"usedPct": 41.2, "resetsAt": seven}))
         snap = ha.read_limits_snapshot()
         self.assertEqual(snap["fiveHour"], {"usedPct": 23.5, "resetsAt": five})
-        self.assertEqual(snap["sevenDay"], {"usedPct": 41.2, "resetsAt": seven})
+        # The 7-day window also carries the even-pace day markers (XERK-536);
+        # the labels themselves are asserted below. The 5-hour window never does.
+        self.assertNotIn("dayLabels", snap["fiveHour"])
+        self.assertEqual(snap["sevenDay"]["usedPct"], 41.2)
+        self.assertEqual(snap["sevenDay"]["resetsAt"], seven)
+        self.assertEqual(len(snap["sevenDay"]["dayLabels"]), 7)
         self.assertEqual(snap["source"], "statusline")
+
+    def test_seven_day_labels_are_the_weekdays_measured_back_from_the_reset(self):
+        # A fixed Wednesday 00:00 UTC reset. The window is the seven days ending
+        # there, so slice 1 is the Wednesday it STARTED on and slice 7 the Tuesday
+        # before it resets. Computed in the reporting host's own zone (XERK-536),
+        # pinned here with TZ=UTC. weekday() is locale-independent, unlike %a.
+        if not hasattr(time, "tzset"):
+            self.skipTest("tzset is Unix-only")
+        old_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "UTC"
+        time.tzset()
+        try:
+            wed_midnight = 1609891200  # 2021-01-06 00:00:00 UTC, a Wednesday
+            self.assertEqual(
+                ha._seven_day_labels(wed_midnight),
+                ["Wed", "Thu", "Fri", "Sat", "Sun", "Mon", "Tue"])
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
+
+    def test_seven_day_markers_need_a_reset_stamp(self):
+        # No reset time to anchor the window, no markers — the caller draws none.
+        self._write(self._snapshot(sevenDay={"usedPct": 30}))
+        snap = ha.read_limits_snapshot()
+        self.assertEqual(snap["sevenDay"], {"usedPct": 30.0})
+
+    def test_seven_day_labels_never_crash_the_beat(self):
+        # On the beat's critical path; a wild reset stamp must yield no labels,
+        # never an exception.
+        self.assertIsNone(ha._seven_day_labels(10 ** 18))
 
     def test_missing_or_unreadable_file_reports_nothing(self):
         self.assertIsNone(ha.read_limits_snapshot())

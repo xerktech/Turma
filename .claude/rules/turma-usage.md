@@ -43,6 +43,15 @@ paths:
     "captured" not "updated" (there is deliberately no fleet-wide last-refreshed stamp).
   - **A window whose `resetsAt` has passed renders as `—`**, not its last percentage — that window
     has since rolled over. Bar colours: 75% warn, 90% crit.
+  - **The 7-day bar carries even-pace day markers** (XERK-536): 7 daily 1/7 boundaries, a weekday
+    label under each, today's slice distinguished, and a continuous pace line at the fraction of the
+    week elapsed. Purely informational — nothing is throttled. Only the WEEKDAY NAMES need a
+    timezone, so the reporting AGENT computes them in ITS OWN local time and ships `sevenDay.dayLabels`
+    (7 strings); "today" and the pace line are timezone-free arithmetic done at render, so they stay
+    correct as the snapshot ages. `normalizeLimits` coerces `dayLabels` as a WHITELIST — exactly 7
+    short strings or the field drops (Android TYPES it, so one bad element would fail the whole
+    `/api/agents` decode). `sevenDayPacing` is the one pacing helper, mirrored web (`usage.html`) +
+    Android (`UsageViewModel`). Only the 7-day window has markers; the 5-hour one is left plain.
   - A host reporting no window gets **no card** (older agent / non-subscription / unprobed all mean
     "can't tell", never 0%).
   - **One card per SUBSCRIPTION, not per host** (XERK-301, `limitGroups`, keyed on the agent's opaque
