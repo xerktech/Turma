@@ -168,6 +168,30 @@ test("getTranscript reads the canonical file", () => {
   assert.equal(archive.getTranscript("nope"), null);
 });
 
+test("XERK-422: a transcript that rendered ZERO entries reads back as empty, not a 404", () => {
+  // A transcript whose lines are all non-renderable (mode/permission-mode/
+  // system/last-prompt records) projects to no entries: the agent read the bytes
+  // and advanced its cursor to size, so ingestChunk gets an empty entry list at a
+  // real endOffset. It appends nothing (no `.jsonl` is ever written) but still
+  // upserts the row with a filePath and bytesStored = size.
+  const r = archive.ingestChunk("nas", "empty1", { ...META }, 0, 1025, []);
+  assert.equal(r.bytesStored, 1025, "the cursor reaches size even with no entries");
+  const rel = archive.archiveRelPath("empty1", { ...META, host: "nas" });
+  assert.ok(!fs.existsSync(path.join(process.env.ARCHIVE_DIR, rel)),
+    "no organized .jsonl is written when there are no renderable entries");
+  // It lists (the row exists) ...
+  assert.ok(archive.listArchive({ host: "nas" }).sessions.some((s) => s.transcriptId === "empty1"),
+    "the row is listable");
+  // ... and now reads back as an honest empty conversation rather than 404ing
+  // forever. `null` (an unknown transcript) stays reserved for a row that isn't
+  // there at all.
+  const t = archive.getTranscript("empty1");
+  assert.ok(t, "the row reads back instead of 404ing");
+  assert.deepEqual(t.entries, [], "with an empty entry list");
+  assert.equal(t.transcriptId, "empty1");
+  assert.equal(t.repo, "turma", "carrying the row's metadata so the viewer can name it");
+});
+
 test("ingestChunk persists blocks[] and getTranscript returns them", () => {
   const blocks = [
     { t: "thinking", text: "hmm" },

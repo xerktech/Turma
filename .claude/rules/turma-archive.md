@@ -118,6 +118,15 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
   answering null is served as a 404 carrying `refused`, worded differently from "not here yet".
   Keyed on HOST + transcript, evicted within-a-host-first so one host can't crowd out every other
   host's diagnostic. The reason is a fixed set of HUB-authored strings, never an exception's text.
+- **A transcript that rendered ZERO entries reads back 200-with-`entries:[]`, never 404** (XERK-422)
+  — a conversation of only non-renderable records (mode/permission-mode/system/last-prompt, no
+  user/assistant turn) projects to nothing, so `ingestChunk` advances the cursor to size but appends
+  no line and the `.jsonl` is never created, while the row (with a `filePath`) IS upserted. So it
+  lists but `getTranscript` used to 404 forever. `getTranscript` now returns null ONLY for an absent
+  row or a NULL-`filePath` placeholder (a manifest row still awaiting its owner's first chunk — "still
+  syncing" is the honest 404); a filePath'd row whose file is ENOENT reads back empty. Distinguishes
+  "recorded no conversation" from "never heard of", and keeps the RAW layer (which may hold real
+  material) reachable. Any OTHER read error stays null — a transient EIO must not read as empty.
 - **`meta` is COERCED before it is bound** (`normalizeMeta`) — every field is agent-supplied and goes
   straight into sqlite (scalars only); a non-scalar stores as nothing rather than poisoning every
   later beat with a 500. The length cap is the receiving half of the same XERK-235 rule as above.
