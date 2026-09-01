@@ -509,6 +509,50 @@ test("two transcripts sharing a prefix keep separate raw directories (XERK-338)"
   assert.equal(archive.rawFileFor(A, `${B}.jsonl`), null, "A served B's file");
 });
 
+test("a deleted .jsonl whose row survives still OWNS its path — no interleave onto the gap (XERK-277/XERK-280)", () => {
+  // relPathOwner consults the sessions TABLE first, not just the on-disk sidecar,
+  // exactly so that a transcript whose .jsonl (and .meta) was deleted out from
+  // under a surviving row keeps its path. A disk-only check would call the path
+  // free and hand it to a colliding transcript, which — since ingest appends —
+  // would then interleave onto the surviving row's cursor gap.
+  const A = "gaprow01-aaaa-bbbb-cccc-000000000001";
+  const B = "gaprow01-aaaa-bbbb-cccc-000000000002";
+  archive.ingestChunk("nas", A, { ...RAW_META, summary: "Gap" }, 0, 10, [ent("u1", "user", "a-secret")]);
+  const db = archive.openDb();
+  const relA = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(A).filePath;
+  // Delete BOTH files, leave the row (XERK-280).
+  fs.rmSync(path.join(process.env.ARCHIVE_DIR, relA), { force: true });
+  fs.rmSync(path.join(process.env.ARCHIVE_DIR, relA + ".meta"), { force: true });
+  archive.ingestChunk("nas", B, { ...RAW_META, summary: "Gap" }, 0, 10, [ent("u1", "user", "b-secret")]);
+  const relB = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(B).filePath;
+  assert.notEqual(relB, relA, "B was handed A's still-owned path");
+});
+
+test("the fallback past the readable probes stays ownership-checked — no leak (XERK-277)", () => {
+  // Fill base + -2..-N so a further collision has to reach the id-seeded
+  // fallback, then push two ids whose slugify() collapses to the SAME token
+  // (they differ only by a leading '-'). The fallback must NOT hand both one
+  // file — an earlier version returned the id-seeded name unchecked.
+  const fam = { ...RAW_META, summary: "Fallback" };
+  // A tiny probe cap would make this cheap, but the module reads it at load; N is
+  // 1000, so seed enough distinct owners to exhaust the readable band.
+  const N = archive.__RELPATH_PROBE_MAX;
+  for (let i = 1; i <= N; i++) {
+    // 8-alnum prefix "floodpre" shared; the rest keeps each id distinct.
+    archive.ingestChunk("nas", `floodpre-fill-${i}`, fam, 0, 10, [ent("u", "user", `fill${i}`)]);
+  }
+  const X = "-floodpre-tail-zzz";
+  const Y = "floodpre-tail-zzz";
+  archive.ingestChunk("nas", X, fam, 0, 10, [ent("u", "user", "X-SECRET")]);
+  archive.ingestChunk("nas", Y, fam, 0, 10, [ent("u", "user", "Y-SECRET")]);
+  const db = archive.openDb();
+  const px = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(X).filePath;
+  const py = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(Y).filePath;
+  assert.notEqual(px, py, "two slug-colliding ids shared one fallback file");
+  assert.equal(archive.getTranscript(X).entries[0].text, "X-SECRET");
+  assert.equal(archive.getTranscript(Y).entries[0].text, "Y-SECRET");
+});
+
 test("rebuildIndex re-derives two disambiguated files without merging them (XERK-277)", () => {
   const A = "rebuild1-aaaa-bbbb-cccc-000000000001";
   const B = "rebuild1-aaaa-bbbb-cccc-000000000002";

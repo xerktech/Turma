@@ -54,7 +54,10 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     agreeing on repo/date/summary/host + that prefix computed ONE `.jsonl`; ingest APPENDS, so each
     read-back served the other's entries. `transcriptId` is agent-chosen under one shared token, so
     it's forceable, not just an accident. On a collision with a DIFFERENT transcript the suffix gets
-    a `-2`/`-3`/… (full id past `RELPATH_PROBE_MAX`) until unowned. The **sessions table is
+    a `-2`/`-3`/… (an id-seeded suffix past `RELPATH_PROBE_MAX`) until unowned. **Every candidate,
+    the id-seeded fallback included, is re-checked against `relPathOwner`** — `slugify` is not
+    injective, so returning the id-seeded name unchecked reopened the same leak (QA). The **sessions
+    table is
     authoritative** for ownership (it survives a deleted `.jsonl` whose row keeps its `filePath`,
     XERK-280 — a disk-only check would re-hand that path and interleave onto the gap); the `.meta`
     sidecar is the backstop for a not-yet-rebuilt index. Additive on collision — the result is baked

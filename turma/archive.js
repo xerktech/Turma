@@ -684,13 +684,28 @@ function resolveNewRelPath(transcriptId, full) {
   const base = archiveRelPath(transcriptId, full);
   if (!relPathOwner(base, transcriptId)) return base;
   const stem = base.slice(0, -".jsonl".length);
+  // Readable first: <base>-2.jsonl, -3, …
   for (let n = 2; n <= RELPATH_PROBE_MAX; n++) {
     const cand = `${stem}-${n}.jsonl`;
     if (!relPathOwner(cand, transcriptId)) return cand;
   }
-  // Pathological (a forced flood on one prefix): the full id is unique by
-  // construction and route-allowlisted; slugify keeps it a single component.
-  return `${stem}-${slugify(transcriptId, "x")}.jsonl`;
+  // Only a forced flood on one prefix reaches here. Seed the suffix with the
+  // full id — but slugify is NOT injective (it lowercases, strips leading/
+  // trailing [-.], and truncates to 60), so two distinct ids in one collision
+  // family can slug alike. So this candidate is STILL run through relPathOwner
+  // and STILL counts up on a hit: returning it unchecked would re-open the exact
+  // cross-session leak this function exists to close.
+  const idStem = `${stem}-${slugify(transcriptId, "x")}`;
+  for (let n = 0; n <= RELPATH_PROBE_MAX; n++) {
+    const cand = n === 0 ? `${idStem}.jsonl` : `${idStem}-${n}.jsonl`;
+    if (!relPathOwner(cand, transcriptId)) return cand;
+  }
+  // Both families exhausted against DIFFERENT owners — needs thousands of
+  // pre-placed collisions, i.e. a deliberate flood. Refuse to NAME it rather
+  // than hand back an unchecked (leak-prone) path; the caller stores nothing and
+  // reports its real cursor, the same "no progress" answer an offset mismatch
+  // gives (never an error status, which an agent re-sends forever, XERK-255).
+  return null;
 }
 
 function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) {
@@ -728,6 +743,14 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
 
   const full = { ...meta, host, transcriptId };
   let relPath = row && row.filePath ? row.filePath : resolveNewRelPath(transcriptId, full);
+  // null only when resolveNewRelPath could not find an unowned name after a
+  // deliberate collision flood — store nothing and report the real cursor rather
+  // than write into another transcript's file.
+  if (!relPath) {
+    console.error(`archive: could not place ${transcriptId} — its canonical name ` +
+      `collides and every disambiguation is owned; storing nothing this beat`);
+    return { bytesStored: have };
+  }
   const paths = filePaths(relPath);
   fs.mkdirSync(paths.dir, { recursive: true });
 
@@ -1490,7 +1513,8 @@ module.exports = {
   dshTrajectory, dshEventsFile,
   ARCHIVE_RAW_TRANSCRIPT_MAX, ARCHIVE_RAW_CURSOR_MAX, ARCHIVE_MANIFEST_CURSOR_MAX,
   RAW_DIR_SUFFIX,
-  slugify, archiveRelPath, resolveNewRelPath, ftsQuery, byteCeiling, shedFilePayloads,
+  slugify, archiveRelPath, resolveNewRelPath, __RELPATH_PROBE_MAX: RELPATH_PROBE_MAX,
+  ftsQuery, byteCeiling, shedFilePayloads,
   openDb, closeDb, rebuildIndex,
   ingestChunk, manifestCursors, archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).
