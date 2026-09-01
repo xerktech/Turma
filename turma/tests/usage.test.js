@@ -744,25 +744,40 @@ test("limitGroups leaves an unnamed subscription's label blank", () => {
   assert.equal(groups[0].label, "");
 });
 
-test("limitCard leads with the subscription name and drops hosts to a subtitle", () => {
-  // XERK-541: a named card answers "which machines are in which subscription".
+test("limitCard leads with the subscription name and reveals its agents on hover", () => {
+  // XERK-541: a named card shows the NAME, and hovering the heading lists the
+  // agents on the subscription — never an inline host subtitle.
   const card = H.limitCard(H.limitGroups([
     { device: "maxai", subscription: { key: "k1", label: "XerkTech" },
       limits: { capturedAt: NOW - 600, fiveHour: { usedPct: 30 } } },
     { device: "truenas", subscription: { key: "k1", label: "XerkTech" },
       limits: { capturedAt: NOW - 60, sevenDay: { usedPct: 12 } } },
   ], NOW)[0], NOW);
-  assert.equal(card.children[0].children[0].textContent, "XerkTech");   // heading
-  const subtitle = [...card.children].find((el) => el.className === "lim-hosts");
-  assert.ok(subtitle, "a named card carries a hosts subtitle");
-  assert.equal(subtitle.textContent, "truenas · maxai");
+  const heading = card.children[0].children[0];
+  assert.equal(heading.textContent, "XerkTech");
+  assert.ok(heading.className.includes("lim-host-named"), "carries the hover affordance");
+  assert.match(heading.title, /truenas/);          // the agents live in the hover
+  assert.match(heading.title, /maxai/);
+  // and nowhere is there an inline host subtitle any more.
+  assert.equal([...card.children].some((el) => el.className === "lim-hosts"), false);
 });
 
-test("an unnamed card keeps the hosts as its heading and grows no subtitle", () => {
+test("a single-agent named card names its one agent in the hover", () => {
+  const card = H.limitCard(H.limitGroups([
+    { device: "solo", subscription: { key: "k1", label: "XerkTech" },
+      limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } },
+  ], NOW)[0], NOW);
+  assert.equal(card.children[0].children[0].textContent, "XerkTech");
+  assert.match(card.children[0].children[0].title, /solo/);
+});
+
+test("an unnamed card keeps the hosts as its heading, with no hover affordance", () => {
   const card = H.limitCard(H.limitGroups([
     { device: "solo", ...sub("k1"), limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } },
   ], NOW)[0], NOW);
-  assert.equal(card.children[0].children[0].textContent, "solo");
+  const heading = card.children[0].children[0];
+  assert.equal(heading.textContent, "solo");
+  assert.equal(heading.className.includes("lim-host-named"), false);
   assert.equal([...card.children].some((el) => el.className === "lim-hosts"), false);
 });
 

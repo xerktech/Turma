@@ -61,11 +61,14 @@ paths:
       is the only right answer. **Both clients sort freshest-first, replacing only on a STRICTLY
       newer read** — fold order or an equal timestamp resolves differently per client otherwise.
     - **A card is NAMED by `subscription.label`** when the agent reports one (XERK-541,
-      `subscriptionLabelOf`): the name heads the card and the hosts drop to a subtitle (`.lim-hosts`),
-      answering "which machines are in which subscription". No label → hosts stay the heading
-      (XERK-301). The label folds by the **same freshest-first + strict-`>`** rule as the windows, so
-      two hosts that ever disagree resolve identically on web and Android. Agent-supplied, so it lands
-      as TEXT (never markup). Android mirror: `LimitCard.label`, headed in `UsageScreen`.
+      `subscriptionLabelOf`): the name heads the card and the AGENTS on it move into the heading's
+      HOVER (a `title`; `.lim-host-named` carries the dotted-underline affordance) — not an inline
+      list. No label → hosts stay the heading (XERK-301), no hover affordance. The label folds by the
+      **same freshest-first + strict-`>`** rule as the windows, so two hosts that ever disagree
+      resolve identically on web and Android. Agent-supplied, so it lands as TEXT (never markup).
+    - **Android shows the NAME ONLY on a named card** (no hover on a phone) — a justified platform
+      difference in `android/PARITY.md`. `LimitCard.label` heads it (`UsageScreen`); an unnamed card
+      still lists its hosts. Same fold, tested in `UsageViewModelTest`.
   - **`normalizeSpawnRefusals` coerces the served refusal map** (XERK-325) — the first typed-and-
     served field deliberately NOT stripped from the payload, since the `state.json` restore (unlike
     the heartbeat path) can produce a bad one. Keeps the ingest path's PLAIN object shape (an explicit

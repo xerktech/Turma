@@ -274,18 +274,11 @@ private fun LimitCardView(card: UsageViewModel.LimitCard, nowSec: Long) {
                 else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        // With a name heading the card, the machines it covers become the
-        // subtitle so the card still says which are on it (XERK-541).
-        if (card.label.isNotBlank()) {
-            Text(
-                card.host,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        // Only worth saying when the card IS a consolidation: with one host the
-        // heading already names it and its age is the line above.
-        if (card.hosts.size > 1) {
+        // On a NAMED card the phone shows the subscription name only (XERK-541):
+        // there is no hover to reveal the agents behind it as on web, and the
+        // name is the identity the operator asked to see. An UNNAMED card still
+        // lists its hosts below, since the name is all that would replace them.
+        if (card.label.isBlank() && card.hosts.size > 1) {
             Text(
                 "shared by " + card.hosts.joinToString(", ") {
                     "${it.host} (${UsageViewModel.fmtDuration(nowSec - it.capturedAt)} ago)"
