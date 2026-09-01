@@ -38,12 +38,18 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     store-wide raw ceiling** — `ARCHIVE_TOTAL_MAX_BYTES` covers the whole store, and two independent
     budgets both passing can still fill the disk together. Past the per-session cap that session's
     raw sync stops; the rendered transcript stays readable.
-  - **The per-beat cursor loop is bounded by the HUB** (`ARCHIVE_RAW_CURSOR_MAX`, 2000), charged for
-    EVERY offer BEFORE validation — charging only survivors lets a caller walk around the cap with
-    ids the allowlist would reject. **The budget bounds the WORK, and every offer costs work.** The
-    agent's own `ARCHIVE_RAW_MANIFEST_FILES_MAX` is NOT this bound — a bound the receiving path
-    doesn't enforce is not a bound (XERK-235). Past it a file gets no cursor and the agent re-pushes
-    from 0 (safe, just wasteful — logged, throttled).
+  - **The per-beat cursor loop is bounded by the HUB**, charged for EVERY offer BEFORE validation —
+    charging only survivors lets a caller walk around the cap with ids the allowlist would reject.
+    **The budget bounds the WORK, and every offer costs work** — both the per-FILE stat AND the
+    per-manifest-ENTRY row lookup (the lookup is real work; charging only files just moved the stall,
+    QA F4). So it has TWO terms: `ARCHIVE_RAW_CURSOR_MAX` (2000, mirrors the agent's
+    `ARCHIVE_RAW_MANIFEST_FILES_MAX` files) + `ARCHIVE_RAW_CURSOR_LOOKUP_MAX` (200, mirrors its
+    `ARCHIVE_MANIFEST_MAX` entries). **The budget is their SUM** so an in-cap agent is never
+    truncated (XERK-427: charging the N lookups against the file cap alone truncated a well-behaved
+    agent by exactly its transcript count N — silently dropping the backlog slice XERK-424 reserves).
+    The agent's own caps are NOT this bound — a bound the receiving path doesn't enforce is not a
+    bound (XERK-235). Past the SUM a file gets no cursor and the agent re-pushes from 0 (safe, just
+    wasteful — logged, throttled).
   - **The raw directory is keyed on the FULL transcript id**, not the canonical filename (which
     truncates to 8 chars and can collide) — a shared raw directory would leak one transcript's files
     through another's read-back route. Belt-and-braces since XERK-277 also disambiguates the RENDERED
