@@ -128,6 +128,17 @@ Cross-component contract in `CLAUDE.md` ("The peer roster IS the org boundary");
   token tiles); `applyAgent` drops that key from cached `retiredUsage` (a returning host would
   otherwise double-count). Both coalesced per open tab. Tests: the live-update cases in
   `dashboard-tiles.test.js`, `usage.test.js`.
+- **A `/api/agents` fetch MERGES, never `cache = await r.json()`** (XERK-444, all three of
+  `index.html`/`usage.html`/`sessions.html`). A body left the hub before an SSE patch that lands
+  mid-fetch, so a wholesale replace clobbers the newer per-host record with the older snapshot
+  (bounded self-heal on a live host, unbounded for one that just went quiet). `sseClock` stamps every
+  SSE mutation of `cache.agents` (`applyAgent` + the `removed` handler); `refresh`/`refetchSoon`
+  capture it BEFORE the `await` and `mergeSnapshot` keeps any record patched since — taking membership
+  and every other key from the snapshot otherwise. **A naive per-key merge resurrects a host the
+  snapshot dropped**: membership is the snapshot's, and a key a same-window `removed` evicted (patched
+  since, absent from `cache.agents`) is dropped, not re-added. Android is structurally immune (it polls
+  whole snapshots, never interleaving a partial patch). Tests: the XERK-444 cases in the three
+  `*.test.js`.
 - **A background repaint the `<select>` guard skips is RE-ARMED** (`bgRender` + `flushSkippedRender`
   on `focusout`) — a full `#groups` swap would close a native popup mid-selection, and without the
   re-arm, hosts removed while SSE is healthy paint as still-present for the rest of the tab's life.

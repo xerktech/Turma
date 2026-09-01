@@ -109,7 +109,7 @@ function loadHelpers(fetchReply = null) {
     fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC, fmtTokens,
     blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render,
     hostLabel, hostSeries, repoSeries,
-    applyAgent, connectSSE, setCache: (c) => { cache = c; }, getCache: () => cache };`;
+    applyAgent, connectSSE, refresh, mergeSnapshot, setCache: (c) => { cache = c; }, getCache: () => cache };`;
   // `els` rides along so the render-level tests can reach the containers the
   // page paints INTO — the strip is written to #totals rather than returned.
   const api = new Function(...keys, body)(...keys.map((k) => stubs[k]));
@@ -1117,6 +1117,37 @@ test("a retired host that comes back is not charted twice", () => {
   H2.applyAgent({ key: "back", device: "back", online: true, usage: hostUsage(7, 7, 7), repoUsage: [] });
   assert.equal((H2.getCache().retiredUsage || []).length, 0);
   assert.equal(H2.getCache().agents.length, 1);
+});
+
+test("an in-flight snapshot does not clobber a newer SSE patch (XERK-444)", async () => {
+  // The /api/agents body left the hub carrying the host at 100 all-time; the SSE
+  // patch with its 500 beat lands while that body is still in flight. Replacing
+  // `cache` wholesale on the reply would roll the chart back to 100 — self-heals
+  // on the next beat, but is unbounded for a host that has since gone quiet.
+  const liveH = (n) => ({ key: "h", device: "h", online: true, usage: hostUsage(n, n, n), repoUsage: [] });
+  const H2 = loadHelpers(() => ({ now: Date.now(), agents: [liveH(100)], retiredUsage: [] }));
+  await new Promise((r) => setImmediate(r));   // boot refresh settles at 100
+  H2.connectSSE();
+  const es = H2.sse[H2.sse.length - 1];
+  const p = H2.refresh();                       // a fresh fetch is in flight (snapshot = 100)
+  es.handlers.agent({ data: JSON.stringify(liveH(500)) });   // newer beat, mid-fetch
+  await p;
+  await new Promise((r) => setImmediate(r));
+  assert.equal(H2.fleetTotals(H2.getCache().agents).totals.input, 500,
+    "the live patch survives the older snapshot");
+});
+
+test("a merged snapshot still drops a host it no longer lists (XERK-444)", async () => {
+  // Membership comes from the snapshot; the per-key merge must not resurrect a
+  // host the snapshot removed just because the cache still held a stale copy.
+  const liveH = (key, n) => ({ key, device: key, online: true, usage: hostUsage(n, n, n), repoUsage: [] });
+  const H2 = loadHelpers(() => ({ now: Date.now(), agents: [liveH("stay", 1)], retiredUsage: [] }));
+  await new Promise((r) => setImmediate(r));
+  H2.setCache({ now: Date.now(), agents: [liveH("stay", 1), liveH("gone", 1)], retiredUsage: [] });
+  await H2.refresh();                            // snapshot lists only `stay`; no SSE patch
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(H2.getCache().agents.map((a) => a.key), ["stay"],
+    "the dropped host is not carried back in");
 });
 
 test("a removal re-polls once, however many hosts the hub evicts", async () => {
