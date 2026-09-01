@@ -12,6 +12,15 @@ Safety-guard policy: `agent-hooks.md`.
 
 ## `hub-agent.py` — session manager and heartbeat in one process
 
+- **Every numeric env knob at module scope goes through `_env_int`/`_env_float`, NEVER a bare
+  `int(os.environ.get(...))` / `float(...)`** (XERK-372). These parse at import, before `main()`, and
+  a bare cast RAISES on any non-number (empty, a stray space, `10m`, a YAML-quoted `"20"`) — the
+  process is PID 1's exec target under `restart: unless-stopped`, so one typo crash-loops the whole
+  host with the symptom pointing nowhere near the cause. The helpers fall back to the default and warn
+  to stderr; `minimum`/`maximum` clamp the few knobs a parseable-but-absurd value still breaks
+  (`MAX_SESSIONS`=0, `TTYD_PORT_BASE`=70000, ports, `INTERVAL`). The server-side twin is
+  `positiveEnv` (`turma.md`). Tests: `TestEnvNumHelpers`; the `BLOCK_CAPS` parity regex in
+  `tunnel-agent.test.js` reads the `_env_int("X", N)` shape, so keep it.
 - Scans `REPOS_ROOT`; owns a persisted registry (`~/.turma/sessions.json`); executes hub commands
   riding the heartbeat reply (at-least-once, `cmdId` de-dup); drives each session's worktree + tmux
   + ttyd; heartbeats repos, one record per session, and a container-log tail.

@@ -27022,5 +27022,109 @@ class TestQwenSessionArms(ManagerMixin, unittest.TestCase):
         sm._teardown_qwen("q1")  # idempotent
 
 
+class TestEnvNumHelpers(unittest.TestCase):
+    """`_env_int`/`_env_float` fall back instead of raising (XERK-372): one
+    mistyped numeric env var must never crash-loop the host at import."""
+
+    def _read(self, fn, name, default, **kw):
+        """Call the helper with `name` present/absent in os.environ, capturing
+        the stderr warning it may emit."""
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            val = fn(name, default, **kw)
+        return val, buf.getvalue()
+
+    def _with_env(self, name, value):
+        env = {k: v for k, v in os.environ.items() if k != name}
+        if value is not None:
+            env[name] = value
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def test_valid_value_parses(self):
+        with self._with_env("X", "42"):
+            self.assertEqual(self._read(ha._env_int, "X", 7)[0], 42)
+        with self._with_env("X", "1.5"):
+            self.assertEqual(self._read(ha._env_float, "X", 0.0)[0], 1.5)
+
+    def test_unset_uses_default_silently(self):
+        with self._with_env("X", None):
+            val, err = self._read(ha._env_int, "X", 7)
+        self.assertEqual(val, 7)
+        self.assertEqual(err, "")
+
+    def test_empty_and_whitespace_use_default_silently(self):
+        for raw in ("", "   "):
+            with self._with_env("X", raw):
+                val, err = self._read(ha._env_int, "X", 7)
+            self.assertEqual(val, 7, raw)
+            self.assertEqual(err, "", raw)
+
+    def test_garbage_falls_back_and_warns(self):
+        # The exact shapes the ticket lists: a word, a suffixed number, a
+        # YAML-quoted value, a value with a stray space, an int knob given a
+        # float. Each RAISED before XERK-372; now each falls back + warns.
+        for raw in ("abc", "10m", '"20"', "2 0", "1.5"):
+            with self._with_env("X", raw):
+                val, err = self._read(ha._env_int, "X", 7)
+            self.assertEqual(val, 7, raw)
+            self.assertIn("WARNING", err, raw)
+            self.assertIn("X=", err, raw)
+
+    def test_non_finite_float_falls_back(self):
+        for raw in ("inf", "-inf", "nan", "Infinity"):
+            with self._with_env("X", raw):
+                val, err = self._read(ha._env_float, "X", 2.5)
+            self.assertEqual(val, 2.5, raw)
+            self.assertIn("WARNING", err, raw)
+
+    def test_minimum_clamps_and_warns_when_operator_set(self):
+        with self._with_env("X", "0"):
+            val, err = self._read(ha._env_int, "X", 6, minimum=1)
+        self.assertEqual(val, 1)
+        self.assertIn("below the minimum", err)
+
+    def test_maximum_clamps_and_warns_when_operator_set(self):
+        with self._with_env("X", "70000"):
+            val, err = self._read(ha._env_int, "X", 7700, minimum=1, maximum=65535)
+        self.assertEqual(val, 65535)
+        self.assertIn("above the maximum", err)
+
+    def test_clamped_default_is_silent(self):
+        # A sane default outside the band would clamp too — but that is a code
+        # bug, not operator input, so it must not spam a warning every boot.
+        with self._with_env("X", None):
+            val, err = self._read(ha._env_int, "X", 6, minimum=1)
+        self.assertEqual(val, 6)
+        self.assertEqual(err, "")
+
+    def test_the_operator_facing_constants_carry_their_guards(self):
+        # A subprocess re-import with a hostile value must SURVIVE and clamp,
+        # never exit non-zero (the crash-loop the ticket is about).
+        def reimport(var, value):
+            env = dict(os.environ, **{var: value})
+            out = subprocess.run(
+                [sys.executable, "-c",
+                 "import importlib.util,sys;"
+                 f"spec=importlib.util.spec_from_file_location('ha', {ha.__file__!r});"
+                 "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);"
+                 f"print(m.{var == 'TURMA_INTERVAL' and 'INTERVAL' or var})"],
+                capture_output=True, text=True, env=env)
+            return out.returncode, out.stdout.strip(), out.stderr[-300:]
+        # a typo — must not crash, falls back to the default
+        rc, val, err = reimport("MAX_SESSIONS", "six")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(val, "6", err)
+        # a parseable-but-host-breaking value — clamped, still up
+        rc, val, err = reimport("MAX_SESSIONS", "0")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(val, "1", err)
+        rc, val, err = reimport("TTYD_PORT_BASE", "70000")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(val, "65535", err)
+        rc, val, err = reimport("TURMA_INTERVAL", "")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(val, "20", err)
+
+
 if __name__ == "__main__":
     unittest.main()
