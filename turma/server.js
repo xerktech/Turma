@@ -3540,7 +3540,7 @@ function archiveHistory(transcriptId) {
 
 function ingestHistory(agent, historyResults) {
   const now = Date.now();
-  for (const r of historyResults || []) {
+  for (const r of (Array.isArray(historyResults) ? historyResults : [])) {
     if (!r || !r.sessionId) continue;
     agent.history[r.sessionId] = { entries: r.entries, truncated: r.truncated,
       queued: Array.isArray(r.queued) ? r.queued : [], fetchedAt: now };
@@ -3614,7 +3614,7 @@ function sanitizeWorkflowAgents(raw) {
 // cache.
 function ingestSubagentHistory(agent, results) {
   const now = Date.now();
-  for (const r of results || []) {
+  for (const r of (Array.isArray(results) ? results : [])) {
     if (!r || !r.sessionId) continue;
     agent.subagentHistory[subagentKey(r.sessionId, r.type, r.label, r.agentId)] =
       { entries: r.entries, truncated: r.truncated,
@@ -3640,7 +3640,7 @@ function ingestSubagentHistory(agent, results) {
 // every poll for as long as the ticket stays open.
 function ingestJiraIssues(agent, jiraIssueResults) {
   const now = Date.now();
-  for (const r of jiraIssueResults || []) {
+  for (const r of (Array.isArray(jiraIssueResults) ? jiraIssueResults : [])) {
     if (!r || !r.key) continue;
     agent.jiraIssues[r.key] = { issue: r.issue || null, error: r.error || null, fetchedAt: now };
   }
@@ -3663,7 +3663,7 @@ function ingestJiraIssues(agent, jiraIssueResults) {
 // first exactly like the issue cache.
 function ingestStatusResults(agent, ticketStatusResults) {
   const now = Date.now();
-  for (const r of ticketStatusResults || []) {
+  for (const r of (Array.isArray(ticketStatusResults) ? ticketStatusResults : [])) {
     if (!r || !r.cmdId) continue;
     agent.statusResults[r.cmdId] = {
       key: r.key || null, ok: !!r.ok, error: r.error || null,
@@ -3695,7 +3695,7 @@ function ingestStatusResults(agent, ticketStatusResults) {
 // so the sweep's primary match-check skips the ticket.
 function ingestPriorityResults(agent, ticketPriorityResults) {
   const now = Date.now();
-  for (const r of ticketPriorityResults || []) {
+  for (const r of (Array.isArray(ticketPriorityResults) ? ticketPriorityResults : [])) {
     if (!r || !r.cmdId) continue;
     agent.priorityResults[r.cmdId] = {
       key: r.key || null, siteKey: r.siteKey || null, band: r.band || null,
@@ -3732,7 +3732,7 @@ function ingestPriorityResults(agent, ticketPriorityResults) {
 // is re-tried after DEDUPE_LINK_RETRY_MS instead of every sweep.
 function ingestTicketLinkResults(agent, ticketLinkResults) {
   const now = Date.now();
-  for (const r of ticketLinkResults || []) {
+  for (const r of (Array.isArray(ticketLinkResults) ? ticketLinkResults : [])) {
     if (!r || !r.cmdId) continue;
     agent.linkResults[r.cmdId] = {
       key: r.key || null, twinKey: r.twinKey || null, siteKey: r.siteKey || null,
@@ -3844,7 +3844,7 @@ function ingestSpawnFailures(hostKey, agent, ownCmdIds, results) {
 // an `error` is cached too (a doomed fetch mustn't re-queue every poll).
 function ingestCreateMeta(agent, results) {
   const now = Date.now();
-  for (const r of results || []) {
+  for (const r of (Array.isArray(results) ? results : [])) {
     if (!r) continue;
     if (r.project) {
       agent.createTypes[r.project] = {
@@ -3874,7 +3874,7 @@ function ingestCreateMeta(agent, results) {
 // submitting client polls with (GET /api/jira/<siteKey>/tickets/<cmdId>).
 function ingestCreateResults(agent, results) {
   const now = Date.now();
-  for (const r of results || []) {
+  for (const r of (Array.isArray(results) ? results : [])) {
     if (!r || !r.cmdId) continue;
     agent.createResults[r.cmdId] = {
       key: r.key || null, url: r.url || null, error: r.error || null,
@@ -9120,7 +9120,7 @@ const server = http.createServer(async (req, res) => {
       const prev = agents[key] || {};
       // At-least-once command delivery: drop any queued command the agent
       // reports as executed; keep re-sending the rest until acked.
-      const acked = new Set(payload.ackedCommands || []);
+      const acked = new Set(Array.isArray(payload.ackedCommands) ? payload.ackedCommands : []);
       // `c && typeof c === "object"` is the same guard publicCommands needs, and
       // for the same reason: `null.cmdId` throws HERE, before a reply is built,
       // 400ing this host's every beat with the internal error text — XERK-235's
