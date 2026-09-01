@@ -15110,8 +15110,11 @@ class SessionManager:
         # append the derived Claude-Code JSONL projection to the pinned transcript
         # INCREMENTALLY, off the beat. Until it runs the chat/history/PR/usage
         # surfaces read a blank <id>.jsonl (the ttyd terminal is fully live
-        # meanwhile). A resume starts at the native log's EOF so it never
-        # re-projects the kept history (qwen --resume appends in place).
+        # meanwhile). A resume RE-PROJECTS the native log from 0 over a reset
+        # transcript (XERK-530): the deterministic uuid's per-feed seq restarts
+        # with a fresh projector, so skipping to EOF would collide the first
+        # post-resume turn's uuid with the conversation's first turn; re-reading
+        # from 0 continues the seq/parentUuid chain and self-heals any gap.
         self._start_qwen_tail(sess, claude_sid, resume=resume)
         # 8. Cross-session peer messaging RECEIVE (XERK-518 [Qwen L]): start the
         # inbox forger so a native Claude peer's SendMessage can reach this qwen

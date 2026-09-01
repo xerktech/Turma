@@ -16,9 +16,15 @@ migration carries the native log itself. Full mechanics: the `QWEN_STORE_ARCNAME
 
 - **RESUME was already wired by [Qwen B]/[Qwen C]; [K] only PINS it.** `_launch_tmux(resume=True)` →
   `_launch_qwen(resume=True)` → `qwen --resume <id>` at the transcript's origin cwd, and
-  `_start_qwen_tail(resume=True)` restarts the projection at the native log's EOF so it never
-  re-projects/doubles the kept JSONL. Boot-adopt reattaches the same way. **Never re-read the native
-  log from 0 on resume.**
+  `_start_qwen_tail(resume=True)` **RE-PROJECTS the whole native log from 0 over a RESET transcript**
+  (XERK-530, design 1) — the deterministic uuid `uuid5(session:seq:index)` derives from a per-feed
+  `seq` that restarts at 0 with every fresh `QwenProjector`, so a tail that skipped to EOF would mint
+  `seq=0` for the FIRST post-resume event and collide its uuid with the conversation's first turn
+  (the chat merge keys on uuid → mis-update). Re-reading from 0 continues the `seq`/`parentUuid`
+  chain unbroken; the determinism reproduces the kept history BYTE-IDENTICALLY (no fork, usage de-dup
+  exact) and self-heals any events written while the tail was dead. Boot-adopt reattaches the same
+  way. **Re-reading from 0 on resume is REQUIRED — the old "never re-read from 0" rule is superseded**
+  (the resume-at-EOF optimization skipped `seq` continuity and was the bug).
 - **MIGRATION carries the NATIVE LOG, not the projection feed.** `export_session` GLOB-locates it
   (`_qwen_native_log`, slug-rule-independent) and packs it under `.qwen-store/chat.jsonl` (twin of
   dsh's `.dsh-store/`), truncated to its last complete line. `_unpack_transcript` routes that member
@@ -26,8 +32,8 @@ migration carries the native log itself. Full mechanics: the `QWEN_STORE_ARCNAME
   cwd-cohabiting session's log. Un-droppable resumable data — an oversized bundle is refused, not
   shipped un-resumable.
 - **The `<slug>/<sid>/qwen/` raw-archive mirror ([Qwen E]) is NEVER carried by migration** — it's the
-  display/metrics feed; the target rebuilds it from new events past the log's EOF. Resume reads the
-  native log, never the mirror.
+  display/metrics feed; the target rebuilds it on its own cursor by mirroring the migrated native log
+  (whole, then new events). Resume reads the native log, never the mirror.
 - **Cross-mount re-key is MANDATORY** (upstream #2373: qwen keys the store on the working dir). The
   log lands under the TARGET cwd's slug (`_project_slug`, every non-alnum→`-`, verified against real
   on-disk dirs). `_reconcile_qwen_store_cwd` re-points the `cwd` on EVERY native-log row (qwen has no
