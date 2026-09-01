@@ -7051,8 +7051,12 @@ const TICKET_QUEUE_RATE_WINDOW_MS = 15 * 60 * 1000;
 // rate window is still full — also self-clears), or null before the first drain
 // has judged it.
 const ticketQueue = [];
-// "<siteKey>\x00<issueKey>" -> when its spawn was handed to a host. Bounded by
-// the prune in rememberDispatch; read only by the cancel route.
+// "<siteKey>\x00<issueKey>" -> {at, cmdId} of the ticket's NEWEST spawn dispatch.
+// `at` is when it was handed to a host (the cancel route reads only this);
+// `cmdId` is which command that dispatch was, so reclaim can tell a stranded
+// command that is STILL the newest dispatch (re-route it) from one a fresher
+// Start has superseded (withdraw it, never re-queue — XERK-540). Bounded by the
+// prune in rememberDispatch.
 const ticketDispatchedAt = new Map();
 
 // XERK-485 [E]: per-org rolling-window rate limit on AUTO dispatches.
@@ -7226,17 +7230,32 @@ function publishTicketQueue() {
 // already cancelled this" from "this started a moment ago" — the queue entry is
 // gone in both cases, and answering the second like the first told an operator
 // their cancel worked while a session was starting.
-function rememberDispatch(siteKey, issueKey) {
+function rememberDispatch(siteKey, issueKey, cmdId) {
   const now = Date.now();
-  for (const [k, at] of ticketDispatchedAt) {
-    if (now - at > TICKET_DISPATCH_MEMO_MS) ticketDispatchedAt.delete(k);
+  for (const [k, rec] of ticketDispatchedAt) {
+    if (now - rec.at > TICKET_DISPATCH_MEMO_MS) ticketDispatchedAt.delete(k);
   }
-  ticketDispatchedAt.set(ticketQueueKey(siteKey, issueKey), now);
+  ticketDispatchedAt.set(ticketQueueKey(siteKey, issueKey), { at: now, cmdId });
 }
 
 function dispatchedRecently(siteKey, issueKey) {
-  const at = ticketDispatchedAt.get(ticketQueueKey(siteKey, issueKey));
-  return !!at && Date.now() - at <= TICKET_DISPATCH_MEMO_MS;
+  const rec = ticketDispatchedAt.get(ticketQueueKey(siteKey, issueKey));
+  return !!rec && Date.now() - rec.at <= TICKET_DISPATCH_MEMO_MS;
+}
+
+// XERK-540: has a spawn for this ticket been dispatched RECENTLY under a
+// DIFFERENT cmdId than `cmdId`? That means a fresh Start (or a prior reclaim)
+// routed this ticket to a live host while `cmdId` sat stranded and undelivered
+// on a dead one. committedTicketSpawn (XERK-331) deliberately lets that Start
+// through — blocking on an undelivered-offline command would strand the ticket
+// forever — and the Start records its own cmdId here. So when the newest
+// dispatch is NOT `cmdId`, that command has been superseded: re-queueing it
+// would hand drainTicketQueue a MANUAL entry that skips the in-flight guard by
+// design and start a SECOND session for the one ticket.
+function dispatchSupersedes(siteKey, issueKey, cmdId) {
+  const rec = ticketDispatchedAt.get(ticketQueueKey(siteKey, issueKey));
+  return !!rec && rec.cmdId !== cmdId
+    && Date.now() - rec.at <= TICKET_DISPATCH_MEMO_MS;
 }
 
 // Put a ticket in line. Returns the entry, or null when it can't be queued (a
@@ -7646,11 +7665,11 @@ function drainTicketQueue() {
     // the only record of what KIND of work this was and WHOSE org it was
     // dispatched for, if the command has to be reclaimed from a host that dies
     // before taking it (XERK-303).
-    queueCommand(host, { type: "spawnTicket", issueKey: e.issueKey,
+    const dispatchedCmdId = queueCommand(host, { type: "spawnTicket", issueKey: e.issueKey,
       ticketSource: e.source, ticketSite: e.siteKey,
       ...(mpin ? { model: mpin.model } : {}),
       ...(rpin ? { agentType: rpin.runtime } : {}) });
-    rememberDispatch(e.siteKey, e.issueKey);
+    rememberDispatch(e.siteKey, e.issueKey, dispatchedCmdId);
     const wait = Math.round((now - e.at) / 1000);
     console.log(`ticket queue: dispatched ${logName(e.issueKey)} to ${logName(host)}`
       + ` (${e.source}, waited ${wait}s)`);
@@ -7760,6 +7779,23 @@ function reclaimStrandedTicketSpawns() {
       const source = c.ticketSource;
       if (!siteKey || !c.issueKey) continue;
       if (source !== "manual" && source !== "auto") continue;
+      // XERK-540: a fresh Start (or a prior reclaim) already routed this ticket
+      // to a live host under a NEWER cmdId while this command sat stranded and
+      // undelivered here. committedTicketSpawn (XERK-331) let that Start through
+      // precisely because this command was undelivered on an offline host. That
+      // newer dispatch is the session the operator asked for, so re-queueing this
+      // one would double-start the ticket — a MANUAL entry skips drain's
+      // in-flight guard by design. Withdraw the superseded command (so the dead
+      // host can't run it on return, turning a transient double-start into a
+      // lasting one) and do NOT re-queue it.
+      if (dispatchSupersedes(siteKey, c.issueKey, c.cmdId)) {
+        if (dropQueuedCommand(host, c.cmdId, "spawnTicket")) {
+          console.log(`ticket queue: withdrew a superseded stranded spawn for `
+            + `${logName(c.issueKey)} from ${logName(host)} — a newer start already `
+            + "routed it to a live host, so re-queueing would double-start it");
+        }
+        continue;
+      }
       const rows = fleetTicketRows();
       const repo = ticketRepo(siteKey, c.issueKey, rows);
       if (!repo) continue;
@@ -11392,7 +11428,7 @@ const server = http.createServer(async (req, res) => {
         // exactly as the fresh-start path below does — leaving it there would
         // dispatch it AGAIN on the next free slot, hours later and unasked.
         dropQueuedTicket(siteKey, issueKey, "dispatched by a direct start");
-        rememberDispatch(siteKey, issueKey);
+        rememberDispatch(siteKey, issueKey, committed.cmdId);
         return json(res, 200,
           { ok: true, cmdId: committed.cmdId, host: committed.host, repo });
       }
@@ -11440,7 +11476,7 @@ const server = http.createServer(async (req, res) => {
       // starting now, so its place in line is spent — leaving it there would
       // dispatch it AGAIN on the next free slot, hours later and unasked.
       dropQueuedTicket(siteKey, issueKey, "dispatched by a direct start");
-      rememberDispatch(siteKey, issueKey);
+      rememberDispatch(siteKey, issueKey, cmdId);
       // needsClone tells the board the chosen host doesn't have the repo yet, so
       // it will clone on demand and the session starts queued behind the clone.
       return json(res, 200, { ok: true, cmdId, host, repo, needsClone });
