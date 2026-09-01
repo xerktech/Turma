@@ -102,6 +102,73 @@ def build_snapshot(payload, now=None):
     return snap
 
 
+# Bound the read of the prior snapshot: it is our own couple-hundred-byte file,
+# but ~/.turma is writable by every session on the host (the same threat model
+# read_limits_snapshot guards against), so a path pointed at something enormous
+# must not become an unbounded allocation.
+PREV_READ_MAX = 64 << 10
+
+
+def _read_prev_snapshot(path=None):
+    """The snapshot currently on disk, or None. Never raises."""
+    path = path or snapshot_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read(PREV_READ_MAX + 1)
+        if len(text) > PREV_READ_MAX:
+            return None
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def carry_window_high_water(snap, path=None):
+    """Floor each window's ``usedPct`` at the highest value already recorded for
+    THAT window instance (keyed on ``resetsAt``), and return ``snap``.
+
+    A fixed window's used percentage only RISES until it resets — usage
+    accumulates — so a reading that DROPS while the window has not reset is not
+    headroom coming back, it is a bad reading. Claude Code 2.1.x intermittently
+    hands the statusLine a window whose ``used_percentage`` is 0 on a fresh probe
+    session even when the real figure is well above zero: observed on one host as
+    a 7-day window read ``14%`` then ``0%`` thirty minutes later with 130+ hours
+    still to reset (an impossible drop), which then overwrote the good snapshot
+    and painted the Usage page at 0%. Flooring at the per-window high-water mark
+    makes one such zero unable to wipe a good reading.
+
+    Keyed on ``resetsAt`` so a genuine RESET — which brings a new reset stamp —
+    starts a fresh mark and is free to drop (a 5-hour window resetting to ~0 is
+    real; the same 7-day figure dropping mid-window is not). The floor only ever
+    raises toward MORE usage, i.e. LESS headroom, so a residual bad reading errs
+    on the safe side of a headroom gauge rather than hiding a nearly-spent limit.
+
+    Never raises — it runs on write_snapshot's path, whose contract is that a
+    statusLine command never fails loudly. A missing, unreadable, or
+    reset-mismatched prior just means there is no floor to apply."""
+    if not isinstance(snap, dict):
+        return snap
+    prev = _read_prev_snapshot(path)
+    if not isinstance(prev, dict):
+        return snap
+    for _, dst in WINDOWS:
+        cur = snap.get(dst)
+        old = prev.get(dst)
+        if not isinstance(cur, dict) or not isinstance(old, dict):
+            continue
+        # Same window instance only. Both must carry a reset stamp and agree on
+        # it; without one there is no way to tell a reset from a spurious drop,
+        # so the floor is not applied.
+        if "resetsAt" not in cur or cur.get("resetsAt") != old.get("resetsAt"):
+            continue
+        cur_pct, old_pct = cur.get("usedPct"), old.get("usedPct")
+        if (isinstance(cur_pct, (int, float)) and not isinstance(cur_pct, bool)
+                and isinstance(old_pct, (int, float)) and not isinstance(old_pct, bool)
+                and old_pct > cur_pct):
+            cur["usedPct"] = old_pct
+    return snap
+
+
 def write_snapshot(snap, path=None):
     """Write the snapshot atomically. Returns True on success, False on any
     failure — the caller prints its status line either way."""
@@ -170,6 +237,9 @@ def main():
         payload = None
     snap = build_snapshot(payload)
     if snap:
+        # Floor each window against the snapshot already on disk before writing,
+        # so an intermittent Claude Code zero can't clobber a good reading.
+        snap = carry_window_high_water(snap)
         write_snapshot(snap)
     print(status_text(snap))
     return 0

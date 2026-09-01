@@ -88,6 +88,19 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
 - `hooks/statusline.py` captures the blob into `~/.turma/limits.json`; the beat re-validates
   (`read_limits_snapshot`). **A snapshot older than `LIMITS_MAX_AGE_SEC` is refused outright** — wrong
   data, not stale data. Absent = "can't tell", never 0% used.
+- **A window's `usedPct` is floored at its per-window HIGH-WATER MARK, keyed on `resetsAt`**
+  (`carry_window_high_water`, statusline write-time). A fixed window's used % only RISES until it
+  resets, so a reading that DROPS while `resetsAt` is unchanged is spurious — Claude Code 2.1.x
+  intermittently reports a window's `used_percentage` as **0** on a fresh probe session (observed: a
+  7-day window read 14% then 0% 30 min later with 130h still to reset, which then painted the Usage
+  page at 0%). Flooring stops one bad zero clobbering a good reading; a genuine reset brings a NEW
+  `resetsAt` and starts a fresh mark (so a 5-hour window rolling over to ~0 still shows), and the floor
+  only ever raises toward MORE usage / LESS headroom — the safe direction for a headroom gauge.
+  **Exact `resetsAt` match** (no tolerance): erring toward not-flooring never crosses a real reset.
+  Sound because `resets_at` is a **fixed window boundary, not a sliding `now + remaining`** — verified
+  on a real 2.1.257 host: `seven_day.resets_at` was byte-identical across probe reads seconds and
+  ~30 min apart, so a window's used % only accumulates until that fixed instant (a rolling window
+  would show a drifting `resets_at`, which it does not). Tests: `TestCarryWindowHighWater`.
 - **The statusLine is NEVER wired into a session's settings**, only the probe's own
   (`build_limits_settings`, separate from `build_guard_settings`) — configuring one on a session stops
   Claude Code painting the footer's `esc to interrupt`, breaking busy detection for every session on
