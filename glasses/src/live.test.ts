@@ -243,9 +243,31 @@ describe("LiveTail", () => {
     expect(events).toHaveLength(1); // still exactly one refusal, no strobe
   });
 
-  it("a refusal after stop()/switch is dropped (generation guard)", async () => {
-    // The fetch is in flight when the wearer leaves the session; its refusal
-    // must not fire against the dead generation.
+  it("a refusal from a superseded fetch never leaks onto the session that replaced it (XERK-335 generation guard)", async () => {
+    // The dangerous race the guard exists for: s1's ws-token fetch is still in
+    // flight when the wearer SWITCHES to s2. Without the generation check, s1's
+    // 401 would fire against the (now s2) listener and paint s2 with a refusal
+    // that isn't its own. A plain stop() would null the listener and hide this,
+    // so the switch case is what must be tested.
+    const rejects: ((e: unknown) => void)[] = [];
+    const wsToken = vi.fn(
+      () => new Promise<{ token: string; expiresInSec: number }>((_r, rj) => { rejects.push(rj); })
+    );
+    const { lt, sched } = makeLiveTail({ hubClient: { wsToken } });
+    const s1: LiveEvent[] = [];
+    const s2: LiveEvent[] = [];
+    lt.start("h", "s1", (ev) => s1.push(ev));
+    await flush();
+    lt.start("h", "s2", (ev) => s2.push(ev)); // switch before s1's fetch settles
+    await flush();
+    rejects[0]!(Object.assign(new Error("wrong hub password"), { status: 401 })); // s1's doomed fetch
+    await flush();
+    expect(s2).toEqual([]); // the refusal does NOT leak onto s2
+    expect(s1).toEqual([]); // and s1's own listener is gone
+    expect(sched.count()).toBe(0);
+  });
+
+  it("a refusal after stop() is dropped (listener gone)", async () => {
     let reject!: (e: unknown) => void;
     const wsToken = vi.fn(() => new Promise<{ token: string; expiresInSec: number }>((_r, rj) => { reject = rj; }));
     const { lt, sched } = makeLiveTail({ hubClient: { wsToken } });

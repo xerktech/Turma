@@ -101,12 +101,18 @@ class FakeDictation implements Dictation {
 class FakeLiveTail {
   started: { hostKey: string; sessionId: string }[] = [];
   stops = 0;
+  // Every listener ever registered, in order — so a test can fire a STALE one
+  // (the listener for a session no longer focused, or after leaving the screen)
+  // to exercise App.onLiveRefused's own session/screen guard, which the real
+  // LiveTail's generation guard normally shields.
+  callbacks: ((ev: import("./live.ts").LiveEvent) => void)[] = [];
   private cb: ((ev: import("./live.ts").LiveEvent) => void) | null = null;
   private current: string | null = null;
 
   start(hostKey: string, sessionId: string, onEvent: (ev: import("./live.ts").LiveEvent) => void): void {
     this.started.push({ hostKey, sessionId });
     this.cb = onEvent;
+    this.callbacks.push(onEvent);
     this.current = sessionId;
   }
   stop(): void {
@@ -128,6 +134,12 @@ class FakeLiveTail {
   // A terminal ws-token refusal (XERK-335) — LiveTail has already stopped.
   deliverRefused(message: string): void {
     this.cb?.({ type: "refused", message });
+  }
+  // Fire a refusal into a specific past listener (by registration order), even
+  // after a switch or a stop() replaced/cleared the live one — used to prove
+  // App.onLiveRefused ignores a refusal that no longer matches the focus.
+  deliverRefusedVia(index: number, message: string): void {
+    this.callbacks[index]?.({ type: "refused", message });
   }
 }
 
@@ -1637,6 +1649,16 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       const app = await enterSession();
       liveTail.deliverRefused("x".repeat(500));
       expect(app.getState().liveRefusal?.message.length).toBe(300);
+    });
+
+    it("ignores a refusal that arrives after leaving the session screen (onLiveRefused guard)", async () => {
+      const app = await enterSession();
+      display.emit({ type: "doubleTap" }); // session -> home
+      expect(app.getState().screen).toBe("home");
+      // A late refusal from the (now stale) s1 listener must not paint a sticky
+      // line onto a screen that is no longer a session.
+      liveTail.deliverRefusedVia(0, "wrong hub password");
+      expect(app.getState().liveRefusal).toBe(null);
     });
 
     it("pins the visible window when scrolled up and new text lands, but auto-scrolls at the tail", async () => {
