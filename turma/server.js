@@ -2370,7 +2370,7 @@ function publicCommands(cmds) {
   });
 }
 
-function serializeAgent(key, agent, now, overPace) {
+function serializeAgent(key, agent, now, pausedSubs) {
   // `resultWaits` is per-command bookkeeping with timestamps (XERK-151) — pure
   // internal state, stripped like the caches. `tokenBound` likewise: it is the
   // hub's note of which credential this host beat with (XERK-268), read only by
@@ -2383,9 +2383,9 @@ function serializeAgent(key, agent, now, overPace) {
           priorityResults, linkResults,
           createMeta, createTypes, createResults, resultWaits, tokenBound,
           orgBound, autoPaused: _forgedAutoPaused, ...a } = agent;
-  // The over-pace subscription set (XERK-544). buildAgentsCache computes it once
+  // The paused-subscription set (XERK-544/548). buildAgentsCache computes it once
   // and passes it; the per-agent SSE broadcast has none and derives its own.
-  if (!overPace) overPace = subscriptionsOverPace(now);
+  if (!pausedSubs) pausedSubs = pausedSubscriptions(now);
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
   // Earlier epochs of this host's spend added back (XERK-338). Null — and so
   // free — for every host that has never lost transcripts, which is all of them
@@ -2420,11 +2420,12 @@ function serializeAgent(key, agent, now, overPace) {
     updating: !online && a.updating && now < a.updating.until ? a.updating : null,
     // Only true when this container's reverse tunnel is live right now.
     terminalOnline: !!controlChannels[key],
-    // Auto-start paused because this host's Claude subscription is past the
-    // weekly pace line (XERK-544). Emitted ONLY when true, so an absent field is
-    // "not paused / can't tell" — the value every client (and an older one that
-    // never typed it) treats as running. Hub-derived; never the agent's word.
-    ...(hostAutoPaused(key, a, overPace) ? { autoPaused: true } : {}),
+    // Auto-start paused because this host's Claude subscription has hit a limit —
+    // the weekly pace line (XERK-544) or the 5-hour cap (XERK-548). Emitted ONLY
+    // when true, so an absent field is "not paused / can't tell" — the value every
+    // client (and an older one that never typed it) treats as running.
+    // Hub-derived; never the agent's word.
+    ...(hostAutoPaused(key, a, pausedSubs) ? { autoPaused: true } : {}),
   };
 }
 
@@ -2432,11 +2433,11 @@ function serializeAgent(key, agent, now, overPace) {
 function buildAgentsCache() {
   prune();
   const now = Date.now();
-  // Computed ONCE for the whole payload (XERK-544): serializeAgent needs the
-  // over-pace subscription set to stamp each host's `autoPaused`, and deriving
-  // it per host would rescan the fleet O(n) times.
-  const overPace = subscriptionsOverPace(now);
-  const list = Object.entries(agents).map(([key, a]) => serializeAgent(key, a, now, overPace));
+  // Computed ONCE for the whole payload (XERK-544/548): serializeAgent needs the
+  // paused-subscription set to stamp each host's `autoPaused`, and deriving it
+  // per host would rescan the fleet O(n) times.
+  const pausedSubs = pausedSubscriptions(now);
+  const list = Object.entries(agents).map(([key, a]) => serializeAgent(key, a, now, pausedSubs));
   list.sort((x, y) => (x.device + x.key).localeCompare(y.device + y.key));
   // ticketAgents (the ticket->host pins) and autoStartOrgs (the per-org
   // auto-start opt-in, XERK-41) ride the same payload: both are tiny,
@@ -3469,25 +3470,34 @@ function normalizeSubscription(payload) {
   payload.subscription = out;
 }
 
-// --- Pausing auto-start past the weekly pace line (XERK-544) -----------------
+// --- Pausing auto-start on a maxed Claude subscription (XERK-544, XERK-548) ---
 //
-// The Usage page draws an "on-pace" line on the 7-day window (XERK-536): the
-// fraction of the fixed 7-day span elapsed at `now`. Until XERK-544 it was
-// purely informational; this is its first CONSUMER. When a Claude subscription's
-// consumed fraction (usedPct/100) has reached that elapsed fraction, auto-start
-// PAUSES for the hosts on that subscription — new tickets can still be started
-// manually, auto mode stays enabled, and it resumes on its own as the window
-// elapses (the pace line moves out ahead of the fill) or resets. Nothing is
+// Auto-start PAUSES for the hosts on a Claude subscription that has hit either of
+// its limits — new tickets can still be started manually, auto mode stays
+// enabled, and it RESUMES on its own as the relevant window recovers. Nothing is
 // persisted: it is re-derived every read from live `limits` + `now`, which is
-// exactly what makes the resume automatic.
+// exactly what makes the resume automatic. Two triggers:
+//   - **7-day PACE line** (XERK-544): the consumed fraction (`sevenDay.usedPct/
+//     100`) has reached the fraction of the fixed 7-day window elapsed at `now`
+//     — the "on-pace" line the Usage page draws (XERK-536, until now purely
+//     informational). Resumes as the window elapses (the line moves out ahead of
+//     the fill) or resets.
+//   - **5-hour CAP** (XERK-548): `fiveHour.usedPct` is at or past
+//     `FIVE_HOUR_PAUSE_PCT` (90%). Resumes when the 5-hour window RESETS —
+//     detected without waiting for the next probe by treating a `resetsAt` that
+//     has passed as "already rolled over".
 //
-// A snapshot older than this is "can't tell", never a pause — the hub keeps an
-// offline host's last heartbeat for days, so an ancient `capturedAt` is not a
-// fact about now. Mirrors usage.html's LIMIT_MAX_AGE_SEC (the age at which it
-// drops a limit card entirely). Reached only from request-time helpers, never
-// the hoisted restore loop, so a module const is safe here.
+// A snapshot older than LIMIT_MAX_AGE_SEC is "can't tell", never a pause — the
+// hub keeps an offline host's last heartbeat for days, so an ancient
+// `capturedAt` is not a fact about now. Mirrors usage.html's LIMIT_MAX_AGE_SEC
+// (the age at which it drops a limit card entirely). Reached only from
+// request-time helpers, never the hoisted restore loop, so a module const is
+// safe here.
 const LIMIT_MAX_AGE_SEC = 24 * 60 * 60;
 const SEVEN_DAY_WINDOW_SEC = 7 * 86400;
+// The 5-hour window used-% at or above which auto-start pauses (XERK-548). The
+// ticket's line, "at or past 90%", so the compare is `>=`.
+const FIVE_HOUR_PAUSE_PCT = 90;
 
 // The fraction (0..1) of the 7-day window elapsed at `nowSec` — the pace line
 // the Usage page draws (sevenDayPacing). Hub mirror needing only `resetsAt`:
@@ -3515,6 +3525,29 @@ function limitsPastPace(limits, nowMs) {
   return win.usedPct / 100 >= pace;
 }
 
+// Is this snapshot's 5-hour window at or past the pause cap (XERK-548)? Stale/
+// absent/typeless all read as NOT maxed ("can't tell" never pauses). A window
+// whose `resetsAt` has PASSED has since rolled over — the used-% is a stale
+// high-water mark for a window that no longer exists, so it reads not-maxed and
+// the host RESUMES the instant the window resets, without waiting for the next
+// probe to report a fresh low reading (the auto-resume the ticket asks for).
+function limitsFiveHourMaxed(limits, nowMs) {
+  if (!limits || typeof limits !== "object") return false;
+  const nowSec = Math.floor(nowMs / 1000);
+  if (nowSec - (limits.capturedAt || 0) > LIMIT_MAX_AGE_SEC) return false;
+  const win = limits.fiveHour;
+  if (!win || typeof win.usedPct !== "number" || typeof win.resetsAt !== "number") return false;
+  if (win.resetsAt <= nowSec) return false;   // window already reset → resumed
+  return win.usedPct >= FIVE_HOUR_PAUSE_PCT;
+}
+
+// Does this subscription snapshot pause auto-start, for EITHER reason? The one
+// predicate the per-subscription set and the tests go through, so the two
+// triggers can never drift apart.
+function subscriptionLimitsPaused(limits, nowMs) {
+  return limitsPastPace(limits, nowMs) || limitsFiveHourMaxed(limits, nowMs);
+}
+
 // The subscription grouping key a host paces against — its opaque
 // `subscription.key` (XERK-301), or a per-host fallback so a host that can't
 // identify its account paces only against itself, never merged with another.
@@ -3522,13 +3555,13 @@ function subscriptionKeyOf(key, a) {
   return (a.subscription && a.subscription.key) || ("host:" + key);
 }
 
-// The set of subscription keys whose FRESHEST 7-day reading is at or past the
-// pace line. Grouped like the Usage page's limitGroups (by subscription key),
-// so two hosts sharing one Claude account pace against ONE pool and the freshest
-// non-stale reading decides — a sibling with a good snapshot pauses one whose
-// probe is missing or stale. Offline hosts contribute (their last reading is
-// still evidence about the shared pool, bounded by the staleness gate).
-function subscriptionsOverPace(nowMs) {
+// The set of subscription keys a limit pauses (XERK-544 pace line OR XERK-548
+// 5-hour cap). Grouped like the Usage page's limitGroups (by subscription key),
+// so two hosts sharing one Claude account judge against ONE pool and the
+// freshest non-stale reading decides — a sibling with a good snapshot pauses one
+// whose probe is missing or stale. Offline hosts contribute (their last reading
+// is still evidence about the shared pool, bounded by the staleness gate).
+function pausedSubscriptions(nowMs) {
   const nowSec = Math.floor(nowMs / 1000);
   const freshest = new Map();  // subKey -> {capturedAt, limits}
   for (const [key, a] of Object.entries(agents)) {
@@ -3543,21 +3576,21 @@ function subscriptionsOverPace(nowMs) {
   }
   const out = new Set();
   for (const [subKey, v] of freshest) {
-    if (limitsPastPace(v.limits, nowMs)) out.add(subKey);
+    if (subscriptionLimitsPaused(v.limits, nowMs)) out.add(subKey);
   }
   return out;
 }
 
-// Is this host's UNPINNED/claude auto-start paused (XERK-544)? Only a host whose
-// EFFECTIVE default runtime is claude (an absent field already coerced to
+// Is this host's UNPINNED/claude auto-start paused (XERK-544/548)? Only a host
+// whose EFFECTIVE default runtime is claude (an absent field already coerced to
 // "claude") spends the Claude pool for an unpinned auto ticket — a qwen/dsh
-// default host spends none, so it NEVER pauses however far past pace the account
-// is. Claude-only by construction: dsh/qwen have no subscription window, so
-// their spend never reaches `limits` (agent-usage.md). `overPace` is the set
-// from subscriptionsOverPace, computed once by the caller.
-function hostAutoPaused(key, a, overPace) {
+// default host spends none, so it NEVER pauses however maxed the account is.
+// Claude-only by construction: dsh/qwen have no subscription window, so their
+// spend never reaches `limits` (agent-usage.md). `paused` is the set from
+// pausedSubscriptions, computed once by the caller.
+function hostAutoPaused(key, a, paused) {
   if ((a.defaultRuntime || "claude") !== "claude") return false;
-  return overPace.has(subscriptionKeyOf(key, a));
+  return paused.has(subscriptionKeyOf(key, a));
 }
 
 // Coerce the local-model block at ingest, for exactly the reason normalizeLimits
@@ -4625,7 +4658,7 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
   // over-pace set is only needed on the auto path, so it is derived only there.
   const auto = !!(opts && opts.auto);
   const now = Date.now();
-  const overPace = auto ? subscriptionsOverPace(now) : null;
+  const pausedSubs = auto ? pausedSubscriptions(now) : null;
   // Which runtime this ticket is pinned to run on (XERK-473 dsh, XERK-515 qwen).
   // A non-default runtime ("dsh"/"qwen") restricts the pool to hosts that offer
   // it — a host without it can no more run the ticket than one that triaged a
@@ -4666,15 +4699,15 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
     // age out on the blocked timer instead of waiting for the slot it needs.
     if (issueKey && !hostTriagedTicket(a, issueKey, repo)) continue;
     anyTriaged = true;
-    // XERK-544: an AUTO ticket that would run on THIS host's Claude subscription
-    // is paused while that subscription is at or past the weekly pace line. Only
-    // an UNPINNED/claude ticket (no `wantRuntime`) on a claude-default host
-    // spends the pool — a qwen/dsh pin or default spends none, so it is never
-    // paused. Checked ahead of the capacity filter so it reads BLOCKED (a freed
-    // slot would not un-pause it — only time or usage does), not full; the pause
-    // self-clears as the window elapses or resets.
+    // XERK-544/548: an AUTO ticket that would run on THIS host's Claude
+    // subscription is paused while that subscription has hit a limit (weekly pace
+    // line or 5-hour cap). Only an UNPINNED/claude ticket (no `wantRuntime`) on a
+    // claude-default host spends the pool — a qwen/dsh pin or default spends none,
+    // so it is never paused. Checked ahead of the capacity filter so it reads
+    // BLOCKED (a freed slot would not un-pause it — only the window recovering
+    // does), not full; the pause self-clears as the window elapses or resets.
     const wouldSpendPool = !wantRuntime && (a.defaultRuntime || "claude") === "claude";
-    if (auto && wouldSpendPool && hostAutoPaused(key, a, overPace)) continue;
+    if (auto && wouldSpendPool && hostAutoPaused(key, a, pausedSubs)) continue;
     anyUnpaused = true;
     // A host with no room is out of the running entirely under requireFree —
     // including out of the "has the repo cloned" preference, so a full cloned
@@ -4723,14 +4756,14 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
       return { status: 503, error:
         `this ticket is pinned to agent "${pin.host}", which has not triaged it to ${repo}` };
     }
-    // XERK-544: an AUTO dispatch to a pinned host whose Claude subscription is
-    // past the weekly pace line is paused — the same rule as the unpinned path,
-    // reported not routed around. Blocked, self-clearing. Only an unpinned/claude
-    // ticket on a claude-default host spends the pool.
+    // XERK-544/548: an AUTO dispatch to a pinned host whose Claude subscription
+    // has hit a limit (weekly pace or 5-hour cap) is paused — the same rule as
+    // the unpinned path, reported not routed around. Blocked, self-clearing. Only
+    // an unpinned/claude ticket on a claude-default host spends the pool.
     if (auto && !wantRuntime && (a.defaultRuntime || "claude") === "claude"
-        && hostAutoPaused(pin.host, a, overPace)) {
+        && hostAutoPaused(pin.host, a, pausedSubs)) {
       return { status: 503, error:
-        `this ticket is pinned to agent "${pin.host}", whose Claude subscription is past the weekly pace line — auto-start is paused` };
+        `this ticket is pinned to agent "${pin.host}", whose Claude subscription has hit its usage limit — auto-start is paused` };
     }
     return { host: pin.host,
       needsClone: !(a.repos || []).some((r) => r && r.name === repo) };
@@ -4752,13 +4785,13 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
     return { status: 503, error:
       `no online host has triaged that ticket to ${repo}` };
   }
-  // XERK-544: every host that could run this auto ticket has its Claude
-  // subscription past the weekly pace line. Not `full`: a freed slot would not
-  // un-pause it — only time elapsing or usage falling below pace does, so it
-  // holds as `blocked` and self-clears rather than waiting for capacity.
+  // XERK-544/548: every host that could run this auto ticket has its Claude
+  // subscription at a limit (weekly pace or 5-hour cap). Not `full`: a freed slot
+  // would not un-pause it — only the window recovering does, so it holds as
+  // `blocked` and self-clears rather than waiting for capacity.
   if (!anyUnpaused) {
     return { status: 503, error:
-      "every host that could run that ticket has auto-start paused — its Claude subscription is past the weekly pace line" };
+      "every host that could run that ticket has auto-start paused — its Claude subscription has hit its usage limit" };
   }
   if (requireFree && !cloned.length && !uncloned.length) {
     // The pool is the hosts that TRIAGED this ticket to `repo`, not the org's
@@ -12667,13 +12700,16 @@ if (process.env.TURMA_TEST) {
     orgOffersQwen,
     findTicketHost,
     hostHasFreeSlot,
-    // XERK-544 auto-start pause on the weekly subscription pace line. Exported so
-    // a test can hold the pace predicate and the per-subscription set directly,
-    // not only through a full findTicketHost/sweep.
+    // XERK-544/548 auto-start pause on a maxed subscription (7-day pace line OR
+    // 5-hour cap). Exported so a test can hold each predicate and the
+    // per-subscription set directly, not only through a full findTicketHost/sweep.
     sevenDayPaceFrac,
     limitsPastPace,
-    subscriptionsOverPace,
+    limitsFiveHourMaxed,
+    subscriptionLimitsPaused,
+    pausedSubscriptions,
     hostAutoPaused,
+    FIVE_HOUR_PAUSE_PCT,
     LIMIT_MAX_AGE_SEC,
     // The hub-side ticket queue (XERK-296) — the array itself, so a test can see
     // what is waiting and in what order.

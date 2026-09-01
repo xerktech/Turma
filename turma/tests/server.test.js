@@ -6610,8 +6610,11 @@ test("findTicketHost routes a qwen ticket only to a host that offers qwen", asyn
 // usedPct 3 well under it. Carries a triage block so the auto sweep enqueues it.
 const NOW = () => Math.floor(Date.now() / 1000);
 const paceBeat = (device, site, {
-  usedPct, key = "ENG-5", repo = "Turma", sub = null, defaultRuntime = null,
+  usedPct = 0, key = "ENG-5", repo = "Turma", sub = null, defaultRuntime = null,
   capturedAgeSec = 0, resetsInDays = 6, qwen = false, free = 5,
+  // XERK-548: the 5-hour window. Defaults are well UNDER the 90% cap with a
+  // window still open, so a 7-day-only test is never accidentally 5h-paused.
+  fiveHourPct = 0, fiveHourResetsInSec = 3 * 3600,
 } = {}) => request("POST", "/api/heartbeat", {
   body: {
     device,
@@ -6623,6 +6626,7 @@ const paceBeat = (device, site, {
     limits: {
       capturedAt: NOW() - capturedAgeSec,
       sevenDay: { usedPct, resetsAt: NOW() + resetsInDays * 86400 },
+      fiveHour: { usedPct: fiveHourPct, resetsAt: NOW() + fiveHourResetsInSec },
     },
     jira: {
       available: true, configured: true, siteKey: site, user: `${device}@x.com`,
@@ -6660,18 +6664,18 @@ test("XERK-544: limitsPastPace compares usedPct against the elapsed fraction", (
   assert.equal(hub.limitsPastPace(null, now), false);
 });
 
-test("XERK-544: subscriptionsOverPace groups by subscription, freshest reading wins", async () => {
+test("XERK-544: pausedSubscriptions groups by subscription, freshest reading wins", async () => {
   const now = Date.now();
   // Two hosts on ONE account 'ppAcctA'; the FRESHEST reading decides.
   await paceBeat("ppA1", "pp1.atlassian.net", { usedPct: 3, sub: "ppAcctA", capturedAgeSec: 0 });     // fresh, under
   await paceBeat("ppA2", "pp1.atlassian.net", { usedPct: 90, sub: "ppAcctA", capturedAgeSec: 3600 }); // older, over
-  assert.equal(hub.subscriptionsOverPace(now).has("ppAcctA"), false);
+  assert.equal(hub.pausedSubscriptions(now).has("ppAcctA"), false);
   // The freshest reading flips over-pace when a newer over-pace read lands.
   await paceBeat("ppA1", "pp1.atlassian.net", { usedPct: 90, sub: "ppAcctA", capturedAgeSec: 0 });
-  assert.equal(hub.subscriptionsOverPace(now).has("ppAcctA"), true);
+  assert.equal(hub.pausedSubscriptions(now).has("ppAcctA"), true);
   // A host with no subscription block paces against itself under "host:<key>".
   await paceBeat("ppC1", "pp3.atlassian.net", { usedPct: 80, capturedAgeSec: 0 });
-  assert.equal(hub.subscriptionsOverPace(now).has("host:ppC1"), true);
+  assert.equal(hub.pausedSubscriptions(now).has("host:ppC1"), true);
 });
 
 test("XERK-544: findTicketHost pauses an AUTO ticket on a claude host past pace, never a manual one", async () => {
@@ -6681,7 +6685,7 @@ test("XERK-544: findTicketHost pauses an AUTO ticket on a claude host past pace,
     { requireFree: true, auto: true });
   assert.equal(autoBlocked.host, undefined);
   assert.ok(!autoBlocked.full);
-  assert.match(autoBlocked.error, /pace line/);
+  assert.match(autoBlocked.error, /usage limit/);
   // MANUAL (no auto flag): always allowed.
   const manual = hub.findTicketHost("fp1.atlassian.net", "Turma", "ENG-5", { requireFree: true });
   assert.equal(manual.host, "fpPaused");
@@ -6749,12 +6753,79 @@ test("XERK-544: auto-start holds a ticket whose only claude host is past pace; m
   assert.equal((agents.dpPaced.commands || []).length, 0);
   const q = queuedTicket("dp1.atlassian.net", "ENG-5");
   assert.equal(q.reason, "blocked");
-  assert.match(q.error, /pace line/);
+  assert.match(q.error, /usage limit/);
   // A MANUAL start on the same ticket is never paused — it dispatches at once.
   const r = await startTicket("dp1.atlassian.net", "ENG-5");
   assert.equal(r.status, 200);
   assert.equal(r.body.host, "dpPaced");
   setAutoStartOrg("dp1.atlassian.net", false);   // leave global state clean
+});
+
+// ---- XERK-548: also pause at 90% of the 5-hour window, resume on its reset ----
+
+test("XERK-548: limitsFiveHourMaxed pauses at/above 90% and clears when the window resets", () => {
+  const now = Date.now();
+  const nowSec = Math.floor(now / 1000);
+  const snap = (usedPct, resetsInSec, ageSec = 0) => ({
+    capturedAt: nowSec - ageSec,
+    fiveHour: { usedPct, resetsAt: nowSec + resetsInSec },
+  });
+  assert.equal(hub.limitsFiveHourMaxed(snap(90, 3600), now), true);    // exactly 90% (at-or-past)
+  assert.equal(hub.limitsFiveHourMaxed(snap(95, 3600), now), true);
+  assert.equal(hub.limitsFiveHourMaxed(snap(89, 3600), now), false);   // under the cap
+  // The window has already reset (resetsAt passed) → resumed, even at 99%.
+  assert.equal(hub.limitsFiveHourMaxed(snap(99, -60), now), false);
+  // Stale snapshot is "can't tell" — never a pause, even at 99%.
+  assert.equal(hub.limitsFiveHourMaxed(snap(99, 3600, 25 * 3600), now), false);
+  // Absent window / missing resetsAt → not maxed.
+  assert.equal(hub.limitsFiveHourMaxed({ capturedAt: nowSec }, now), false);
+  assert.equal(hub.limitsFiveHourMaxed(
+    { capturedAt: nowSec, fiveHour: { usedPct: 99 } }, now), false);
+  // The combined predicate fires on EITHER trigger and neither.
+  const paced = { capturedAt: nowSec, sevenDay: { usedPct: 99, resetsAt: nowSec + 6 * 86400 } };
+  const maxed = { capturedAt: nowSec, fiveHour: { usedPct: 92, resetsAt: nowSec + 3600 } };
+  const fine  = { capturedAt: nowSec, sevenDay: { usedPct: 1, resetsAt: nowSec + 6 * 86400 },
+                  fiveHour: { usedPct: 1, resetsAt: nowSec + 3600 } };
+  assert.equal(hub.subscriptionLimitsPaused(paced, now), true);
+  assert.equal(hub.subscriptionLimitsPaused(maxed, now), true);
+  assert.equal(hub.subscriptionLimitsPaused(fine, now), false);
+});
+
+test("XERK-548: a 5-hour-maxed claude host pauses auto-start and flags autoPaused, qwen exempt", async () => {
+  hub.__setQwenEnabled(true);
+  // 7-day well under pace, but the 5-hour window at 95% → paused.
+  await paceBeat("fhPaused", "fh1.atlassian.net", { usedPct: 2, sub: "fhSub", fiveHourPct: 95 });
+  const blocked = hub.findTicketHost("fh1.atlassian.net", "Turma", "ENG-5",
+    { requireFree: true, auto: true });
+  assert.equal(blocked.host, undefined);
+  assert.ok(!blocked.full);                       // blocked, self-clearing — not full
+  assert.match(blocked.error, /usage limit/);
+  // Manual is never paused.
+  assert.equal(hub.findTicketHost("fh1.atlassian.net", "Turma", "ENG-5",
+    { requireFree: true }).host, "fhPaused");
+  // A qwen-default host at 95% of its 5-hour window is not paused (spends no Claude pool).
+  await paceBeat("fhQwen", "fh2.atlassian.net",
+    { usedPct: 2, sub: "fhQwenSub", fiveHourPct: 95, defaultRuntime: "qwen" });
+  assert.equal(hub.findTicketHost("fh2.atlassian.net", "Turma", "ENG-5",
+    { requireFree: true, auto: true }).host, "fhQwen");
+  // The served flag reflects the 5-hour pause on /api/agents.
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const byKey = Object.fromEntries(res.body.agents.map((a) => [a.key, a]));
+  assert.equal(byKey.fhPaused.autoPaused, true);
+  assert.ok(!("autoPaused" in byKey.fhQwen));
+});
+
+test("XERK-548: auto-start RESUMES the moment the 5-hour window resets", async () => {
+  // Host at 95% with the 5-hour window still open → paused.
+  await paceBeat("frHost", "fr1.atlassian.net", { usedPct: 2, sub: "frSub", fiveHourPct: 95 });
+  assert.equal(hub.findTicketHost("fr1.atlassian.net", "Turma", "ENG-5",
+    { requireFree: true, auto: true }).host, undefined);
+  // Re-beat with the SAME high used-% but a window that has already rolled over
+  // (resetsAt in the past): the pause clears without waiting for a fresh reading.
+  await paceBeat("frHost", "fr1.atlassian.net",
+    { usedPct: 2, sub: "frSub", fiveHourPct: 95, fiveHourResetsInSec: -60 });
+  assert.equal(hub.findTicketHost("fr1.atlassian.net", "Turma", "ENG-5",
+    { requireFree: true, auto: true }).host, "frHost");
 });
 
 test("ticket-model pins survive a hub restart (read back from their own file)", () => {

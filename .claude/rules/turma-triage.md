@@ -79,37 +79,45 @@ attempt** (no retry budget burned, exactly like a repo-less ticket):
    to 30 min) and the **rate window** (`autoStartRateLive >= autoStartRateMax` holds with reason
    "rate", self-clearing; a manual click is never held).
 
-## Pausing auto-start past the weekly subscription pace line (XERK-544)
+## Pausing auto-start on a maxed subscription (XERK-544 pace line, XERK-548 5-hour cap)
 
-- **A host whose Claude subscription is at or past the 7-day pace line PAUSES for auto-start** — the
-  first consumer of XERK-536's pace line (`sevenDayPacing`, informational until now). Past-pace =
-  `sevenDay.usedPct/100 >= elapsed-fraction-of-the-window`. It does NOT disable auto mode or block
-  manual Start; auto tickets that would land on the host just HOLD, and it self-clears (auto-resume)
-  as the window elapses or resets — nothing is persisted, it is re-derived every read from live
-  `limits` + `now`.
+- **A host whose Claude subscription has hit a LIMIT pauses for auto-start**, for either of two
+  triggers (`subscriptionLimitsPaused` = the OR of both, the one predicate the set + tests go
+  through):
+  - **7-day pace line** (XERK-544, `limitsPastPace`): `sevenDay.usedPct/100 >=` the fraction of the
+    fixed 7-day window elapsed at now — XERK-536's `sevenDayPacing`, informational until this became
+    its consumer. Resumes as the window elapses (the line moves ahead of the fill) or resets.
+  - **5-hour cap** (XERK-548, `limitsFiveHourMaxed`): `fiveHour.usedPct >= FIVE_HOUR_PAUSE_PCT` (90).
+    Resumes when the 5-hour window RESETS — detected without waiting for the next probe by treating a
+    `resetsAt` that has PASSED as already-rolled-over (its used-% is then a stale high-water mark for
+    a window that no longer exists).
+- It does NOT disable auto mode or block manual Start; auto tickets that would land on the host just
+  HOLD, and it self-clears (auto-resume) — nothing is persisted, it is re-derived every read from
+  live `limits` + `now`.
 - **The filter lives in `findTicketHost`, gated to `opts.auto`** (threaded from `drainTicketQueue` /
   the reclaim precondition as `e.source === "auto"`; the manual Start route passes no `auto`). Checked
-  ahead of capacity like the runtime filter, so "every host that could run it is paced-out" reads
+  ahead of capacity like the runtime filter, so "every host that could run it is maxed" reads
   **blocked** (`!anyUnpaused`), not full — a freed slot would not un-pause it. The pin branch reports
   the same, never routes around it.
 - **Only a host that would SPEND the pool is paused**: `!wantRuntime && (a.defaultRuntime||"claude")
   === "claude"`. A qwen/dsh pin, or a qwen/dsh-default host, spends no Claude subscription and is
   never paused (dsh/qwen have no window — `agent-usage.md`).
-- **Per-SUBSCRIPTION, not per-host** (`subscriptionsOverPace`): grouped by `subscription.key` (a
+- **Per-SUBSCRIPTION, not per-host** (`pausedSubscriptions`): grouped by `subscription.key` (a
   keyless host keyed on itself) like the Usage page's `limitGroups`, the freshest non-stale reading
   decides — so a sibling with a good probe pauses one whose probe is missing/stale, and two hosts on
   SEPARATE accounts pause independently.
 - **Staleness = "can't tell", never a pause** (`LIMIT_MAX_AGE_SEC`, hub mirror of usage.html's
-  card-drop age): an ancient `capturedAt`, an absent/expired window, or a missing `usedPct` all read
-  as not-past.
-- **The UI is a HUB-DERIVED per-agent `autoPaused` flag** on `/api/agents`, stripped from any
-  agent-forged heartbeat value in `serializeAgent` and recomputed there (emitted only when true, so
-  absent = not paused). Rendered as a dashboard host-header chip beside the login/board chips
-  (`autoPausedBadge` in `index.html`; `FleetScreen.kt` Pill on Android). **No bypass control** by
-  design. Not a board/glasses surface — the fleet dashboard has no glasses mirror.
-- Tests: the `XERK-544:` cases in `server.test.js` (`limitsPastPace`/`subscriptionsOverPace`, the
-  auto-vs-manual `findTicketHost`, the qwen exemptions, the served flag + forged-flag strip, the
-  auto-hold drain), `dashboard-tiles.test.js` (the chip), android `AgentDecodeTest`.
+  card-drop age): an ancient `capturedAt`, an absent/expired window, or a missing `usedPct` read as
+  not-paused for that trigger.
+- **The UI is a HUB-DERIVED per-agent `autoPaused` flag** on `/api/agents` (true for EITHER trigger),
+  stripped from any agent-forged heartbeat value in `serializeAgent` and recomputed there (emitted
+  only when true, so absent = not paused). Rendered as a dashboard host-header chip beside the
+  login/board chips (`autoPausedBadge` in `index.html`; `FleetScreen.kt` Pill on Android). **No bypass
+  control** by design. Not a board/glasses surface — the fleet dashboard has no glasses mirror.
+- Tests: the `XERK-544:`/`XERK-548:` cases in `server.test.js` (`limitsPastPace`/`limitsFiveHourMaxed`/
+  `subscriptionLimitsPaused`/`pausedSubscriptions`, the auto-vs-manual `findTicketHost`, the 5-hour
+  reset auto-resume, the qwen exemptions, the served flag + forged-flag strip, the auto-hold drain),
+  `dashboard-tiles.test.js` (the chip), android `AgentDecodeTest`.
 
 Drain order is the stable sort on `triageSortKey` = `[priorityRank, typeWeight, -repoTierRank]`:
 band → type → repo tier (XERK-487 [G] tiebreak) → board order. **A P0 may exceed the org's auto

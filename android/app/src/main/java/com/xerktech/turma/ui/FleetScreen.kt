@@ -316,10 +316,11 @@ private fun HostSection(
                         Pill("📋 board", color = com.xerktech.turma.ui.theme.TurmaColors.critical)
                     }
                 }
-                // Auto-start paused because this host's Claude subscription is at
-                // or past the even weekly pace line (XERK-544). Amber and shown
-                // only when the hub asserts it; mirrors index.html's
-                // autoPausedBadge. No bypass — manual starts still work.
+                // Auto-start paused because this host's Claude subscription has
+                // hit a limit — the even weekly pace line (XERK-544) or the 5-hour
+                // window at/above 90% (XERK-548). Amber and shown only when the hub
+                // asserts it; mirrors index.html's autoPausedBadge. No bypass —
+                // manual starts still work.
                 if (agent.autoPaused) {
                     Pill("⏸ auto paused", color = com.xerktech.turma.ui.theme.TurmaColors.warning)
                 }
