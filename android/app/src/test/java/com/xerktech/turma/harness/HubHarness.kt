@@ -8,8 +8,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -156,24 +160,6 @@ class HubHarness : ExternalResource() {
     }
 
     /**
-     * Collect a ViewModel's `messages` into a list that grows as they arrive.
-     *
-     * It BLOCKS until the collector is actually subscribed, which is the whole
-     * point: these are zero-replay `SharedFlow`s emitted with `tryEmit`, so a
-     * message sent before the collector attaches is dropped on the floor and the
-     * test would fail intermittently, on machine speed rather than on behaviour.
-     */
-    fun collectMessages(flow: SharedFlow<String>): MutableList<String> {
-        val out = java.util.Collections.synchronizedList(mutableListOf<String>())
-        val subscribed = CompletableDeferred<Unit>()
-        scope.launch {
-            flow.onSubscription { subscribed.complete(Unit) }.collect { out.add(it) }
-        }
-        runBlocking { withTimeout(5_000) { subscribed.await() } }
-        return out
-    }
-
-    /**
      * Spin until [read] returns non-null, or fail after [timeoutMs].
      *
      * For the paths that genuinely cannot be awaited: a ViewModel action whose
@@ -190,6 +176,63 @@ class HubHarness : ExternalResource() {
             Thread.sleep(10)
         }
         throw AssertionError("nothing arrived within ${timeoutMs}ms")
+    }
+
+    /**
+     * Suspend until [flow] emits a value matching [pred], returning it — or fail
+     * after [timeoutMs] (XERK-308).
+     *
+     * The event-driven counterpart to [awaitValue]'s 10ms poll, and the one to
+     * reach for whenever the value under test is a `Flow`. It subscribes and is
+     * resumed the INSTANT the value flips, so it spends no wall-clock spinning a
+     * poll loop the scheduler can starve — which is what reddened these on a
+     * loaded runner: a 10s deadline raced a poll slice against work the box was
+     * too busy to schedule, and lost. Because a `StateFlow` replays its current
+     * value to a new collector, a condition ALREADY satisfied returns at once
+     * with no missed-emission race — the reason this is safe where a bare
+     * `SharedFlow` await would not be (see [expectMessage]).
+     *
+     * Keep [awaitValue] only for a plain value with no flow behind it.
+     */
+    fun <T> awaitFlow(flow: Flow<T>, timeoutMs: Long = 10_000, pred: (T) -> Boolean): T =
+        runBlocking {
+            try {
+                withTimeout(timeoutMs) { flow.first(pred) }
+            } catch (e: TimeoutCancellationException) {
+                throw AssertionError("no matching value within ${timeoutMs}ms", e)
+            }
+        }
+
+    /**
+     * Subscribe to [flow] NOW and return a getter that blocks for the first
+     * message matching [pred] (XERK-308).
+     *
+     * The event-driven form of the `collectMessages` + `awaitValue { list
+     * .firstOrNull() }` pair: the same subscribe-BEFORE-the-action discipline a
+     * zero-replay `SharedFlow` demands (a message emitted before the collector
+     * attaches is dropped), but the getter is resumed by the emission rather
+     * than polling a list against a 10s deadline. Call it before the ViewModel
+     * action, invoke the returned getter after.
+     */
+    fun expectMessage(
+        flow: SharedFlow<String>,
+        timeoutMs: Long = 10_000,
+        pred: (String) -> Boolean = { true },
+    ): () -> String {
+        val hit = CompletableDeferred<String>()
+        val subscribed = CompletableDeferred<Unit>()
+        scope.launch {
+            flow.onSubscription { subscribed.complete(Unit) }
+                .collect { if (pred(it)) hit.complete(it) }
+        }
+        runBlocking { withTimeout(5_000) { subscribed.await() } }
+        return {
+            try {
+                runBlocking { withTimeout(timeoutMs) { hit.await() } }
+            } catch (e: TimeoutCancellationException) {
+                throw AssertionError("no matching message within ${timeoutMs}ms", e)
+            }
+        }
     }
 
     /**

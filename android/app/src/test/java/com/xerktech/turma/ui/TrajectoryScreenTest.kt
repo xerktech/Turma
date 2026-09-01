@@ -23,7 +23,7 @@ import java.util.Locale
  * reach. Two deliberate choices keep it deterministic on a slow CI runner where
  * a warm local run hid the flakiness:
  *  - the `/api/dsh/<tid>/trajectory` fetch is a real async round trip, so the VM
- *    is loaded and AWAITED (`HubHarness.awaitValue`) BEFORE the screen is
+ *    is loaded and AWAITED (`HubHarness.awaitFlow`) BEFORE the screen is
  *    composed — `waitForIdle` settles composition, not the network, so composing
  *    first races the loading spinner against the response;
  *  - the turn card is exercised as an ISOLATED composable, so a short viewport
@@ -74,8 +74,8 @@ class TrajectoryScreenTest {
      *  tests (never the synchronous `TurnCard` one).
      *
      *  So the fetch is driven and AWAITED off the compose surface entirely
-     *  (`awaitValue` reads `StateFlow.value` on the test thread, which the OkHttp
-     *  thread settles independently of any looper), and only THEN is the screen
+     *  (`awaitFlow` suspends on the VM's `StateFlow`, resumed by the OkHttp
+     *  thread's settle independently of any looper), and only THEN is the screen
      *  composed. `collectAsStateWithLifecycle`'s INITIAL value is read
      *  synchronously at first composition, so the settled outcome paints on the
      *  first frame — the same main-thread, no-cross-thread path the `TurnCard`
@@ -86,10 +86,7 @@ class TrajectoryScreenTest {
         hub.json("/api/dsh/$tid/trajectory", json, code = code)
         val vm = TrajectoryViewModel(hub.app)
         vm.load(tid)
-        hub.awaitValue {
-            val s = vm.state.value
-            if (s.data != null || s.notSynced || s.error != null) Unit else null
-        }
+        hub.awaitFlow(vm.state) { it.data != null || it.notSynced || it.error != null }
         compose.setContent { TrajectoryScreen(host = "nas01", transcriptId = tid, onBack = {}, vm = vm) }
         compose.waitForIdle()   // paint the already-settled state (LaunchedEffect load is a no-op)
     }

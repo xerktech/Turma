@@ -110,10 +110,10 @@ class ChatModelSourceTest {
             HubHarness.refusal("host has no local model configured")
         }
         val vm = vm()
-        val seen = hub.collectMessages(vm.messages)
+        val message = hub.expectMessage(vm.messages)
 
         runBlocking { vm.setModelSource(ModelSource.LOCAL).join() }
-        val msg = hub.awaitValue { seen.firstOrNull() }
+        val msg = message()
 
         assertTrue("reported \"$msg\" instead of the hub's reason", msg.contains("no local model"))
     }
@@ -148,9 +148,13 @@ class ChatModelSourceTest {
             )
         )
 
-        // awaitValue rather than a bare assert: the retirement rides the fleet
-        // collector, which runs on the repository's own scope.
-        hub.awaitValue { if (memo() == null) "retired" else null }
+        // Await the STORE flow rather than poll a clock (XERK-308): the
+        // retirement rides the fleet collector, and `settle` writes the memo
+        // through this same MutableStateFlow — so a wait resumed by that write
+        // (and returning at once when it has already happened, since a
+        // StateFlow replays its value) is deterministic where a 10s timed poll
+        // reddened on a loaded runner.
+        hub.awaitFlow(hub.container.modelSwitches.of(host, session)) { it == null }
         vm.onLeave()
     }
 
