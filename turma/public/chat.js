@@ -1640,7 +1640,13 @@
     return allOpts.filter((o) => available.indexOf(o.value) !== -1 || o.value === current);
   }
   function availableModeOpts() {
-    return filterModeOpts(MODE_OPTS, sess && sess.permissionModes, currentModeValue());
+    let opts = filterModeOpts(MODE_OPTS, sess && sess.permissionModes, currentModeValue());
+    // A repos-root session may never switch INTO bypassPermissions (XERK-309):
+    // it runs directly in the repos root with no worktree, so don't offer it even
+    // if an older agent's permissionModes list still carries it. A root session
+    // is launched without bypass, so it can never be the current mode here.
+    if (sess && sess.root) opts = opts.filter((o) => o.value !== "bypassPermissions");
+    return opts;
   }
   function optLabel(opts, val) { const o = opts.find((x) => x.value === val); return o ? o.label : val; }
   function menuHtml(opts, current, attr) {

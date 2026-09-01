@@ -1459,7 +1459,7 @@ function composer(a, repo, rk, spawning) {
         <div>
           <label>Permission mode</label>
           <select id="${cid(rk, "perm")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
-            ${opt("auto", "auto", selPerm)}${opt("bypassPermissions", "bypassPermissions", selPerm)}${opt("acceptEdits", "acceptEdits", selPerm)}${opt("plan", "plan", selPerm)}${opt("default", "default", selPerm)}
+            ${opt("auto", "auto", selPerm)}${repo.isRoot ? "" : opt("bypassPermissions", "bypassPermissions", selPerm)}${opt("acceptEdits", "acceptEdits", selPerm)}${opt("plan", "plan", selPerm)}${opt("default", "default", selPerm)}
           </select>
         </div>
       </div>

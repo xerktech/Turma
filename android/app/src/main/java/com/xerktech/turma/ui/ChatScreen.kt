@@ -688,7 +688,12 @@ private fun ChatFooter(
                     why = "This host's self-hosted model. Its model list has not been discovered yet.",
                 )
             }
-            MenuChip("mode: ${session?.permissionMode?.ifBlank { "auto" } ?: "auto"}", listOf("auto", "acceptEdits", "plan", "bypassPermissions", "default"), onMode)
+            // A repos-root session may never switch INTO bypassPermissions
+            // (XERK-309, matching web `chat.js`): it runs directly in the repos
+            // root with no worktree; the hub 409s the live switch either way.
+            val modeChoices = listOf("auto", "acceptEdits", "plan", "bypassPermissions", "default")
+                .filter { it != "bypassPermissions" || session?.root != true }
+            MenuChip("mode: ${session?.permissionMode?.ifBlank { "auto" } ?: "auto"}", modeChoices, onMode)
             // "Run against" — the local-model failover (XERK-246). Hidden on a
             // host whose agent doesn't report one, exactly as the 📎 is hidden on
             // one that can't take files: the hub 409s the command either way.

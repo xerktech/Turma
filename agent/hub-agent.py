@@ -2525,15 +2525,32 @@ def resolve_dsh_model(model):
     return model
 
 
-def resolve_permission_mode(mode):
+def resolve_permission_mode(mode, is_root=False):
     """Validate a UI permission-mode choice against a fixed enum. Blank ->
-    auto (claude's classifier-gated hands-off default)."""
+    auto (claude's classifier-gated hands-off default).
+
+    A repos-root session is refused ``bypassPermissions`` (XERK-309). Under
+    bypass a session's Bash calls run with no prompt, and a Bash redirect into
+    ``~/.claude`` is invisible to the file-edit guard (fileguard.py sees only
+    Write/Edit/…; a `python3 -c "open(...)"` defeats any command-string check) —
+    so bypass is the one mode that opens the shared-config write hole this ticket
+    is about. The permission MODE is the actual determinant of exposure, and a
+    repos-root session is the most exposed class: it runs directly in REPOS_ROOT
+    (the repo dirs themselves, no worktree), unattended, on the host's own
+    checkout. So the most dangerous session class is denied the one mode that
+    opens the hole. A worktree session may still choose bypass — narrowing that
+    class too is the filesystem/uid change the ticket weighs, not a mode gate,
+    and is stated as the remaining gap in .claude/rules/agent-hooks.md."""
     mode = (mode or "").strip()
     if not mode:
         return "auto"
-    if mode in PERMISSION_MODES:
-        return mode
-    raise ValueError(f"unknown permission mode {mode!r}")
+    if mode not in PERMISSION_MODES:
+        raise ValueError(f"unknown permission mode {mode!r}")
+    if is_root and mode == "bypassPermissions":
+        raise ValueError(
+            "bypassPermissions is not allowed for a repos-root session — it runs "
+            "directly in the repos root with no worktree (XERK-309)")
+    return mode
 
 
 def perm_cycle_for(launch_mode):
@@ -16428,7 +16445,8 @@ class SessionManager:
         # or permission mode fails the spawn cleanly whether it runs now or waits
         # in the queue. Model and permission mode apply to root too.
         try:
-            sess["permissionMode"] = resolve_permission_mode(permission_mode)
+            sess["permissionMode"] = resolve_permission_mode(
+                permission_mode, is_root=is_root)
             # The ONE fresh-spawn call: a blank agentType here (unpinned ticket
             # or a bare "+ New session" whose dropdown was untouched) resolves to
             # THIS host's TURMA_DEFAULT_RUNTIME (XERK-521), not a hardcoded
@@ -18709,6 +18727,16 @@ class SessionManager:
         predates)."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
+            return
+        # A repos-root session may not switch INTO bypassPermissions (XERK-309).
+        # It is launched without bypass, so it is not in this session's live
+        # Shift+Tab cycle and the loop below would wrap to a no-op anyway — but
+        # refuse it up front with a clean log line rather than pressing BTab in a
+        # doomed circle. Checked before resolve_permission_mode so an unknown mode
+        # still raises to handle_commands exactly as before (it acks + logs).
+        if (mode or "").strip() == "bypassPermissions" and sess.get("root"):
+            log(f"set mode of {sid} refused: bypassPermissions is not allowed "
+                f"for a repos-root session (XERK-309)")
             return
         target = resolve_permission_mode(mode)  # validated enum; raises on junk
         tmux_name = sess["tmuxName"]
