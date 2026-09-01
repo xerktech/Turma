@@ -99,7 +99,7 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   const keys = Object.keys(g);
   const fn = new Function(...keys, src +
     "\n;return { render, fmtTokens, applyAgent, connectSSE, contextMeterHtml, refresh, mergeSnapshot," +
-    " autoPausedBadge," +
+    " autoPausedBadge, refusedBadge," +
     " sseClock: () => sseClock," +
     " setCache: (c) => { cache = c; }, getCache: () => cache };");
   const api = fn(...keys.map((k) => g[k]));
@@ -508,6 +508,18 @@ test("XERK-544: autoPausedBadge shows only when the hub flags the host paused", 
   assert.match(D.autoPausedBadge({ autoPaused: true }), /Auto paused/);
   assert.equal(D.autoPausedBadge({ autoPaused: false }), "");
   assert.equal(D.autoPausedBadge({}), "");   // absent = not paused / can't tell
+});
+
+// XERK-298: the hub stamps `refused` when it refuses a known host's beat, and the
+// badge makes it visible — otherwise the host freezes and reads offline exactly
+// like an outage. Shown only when the hub asserts it; absent = not refused.
+test("XERK-298: refusedBadge shows only when the hub stamped a refusal", () => {
+  const D = loadDashboard();
+  const html = D.refusedBadge({ refused: { at: Date.now(), reason: "registry-full", detail: "over its share" } });
+  assert.match(html, /Hub refused/);
+  assert.match(html, /over its share/);            // the hub's own words carry through
+  assert.equal(D.refusedBadge({}), "");            // absent = not refused
+  assert.equal(D.refusedBadge({ refused: null }), "");
 });
 
 // XERK-545: `orgColors` is a top-level key SSE ALSO live-patches, so an in-flight

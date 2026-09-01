@@ -366,6 +366,22 @@ the total is measured.
   Refusal logs throttle to one/minute with a suppressed count.
 - **A host is warned crossing half its share** (`shareWarned`) — the per-record warning fires too late
   (4 MiB vs a 512 KiB share) to give notice before a record starts being refused.
+- **A refused KNOWN host is stamped `refused:{at,reason,detail}` on its record, not just logged**
+  (XERK-298, `stampRefusal`). A refused beat rolls back to `prev` and the host freezes there and ages
+  to `offline`, reading exactly like a network outage — this is the one hub refusal that was operator-
+  facing in CONSEQUENCE but had no operator SURFACE (XERK-264 covered command refusals, not beats).
+  Both memory-refusal paths stamp it (413 `refuseOversized`, 429 over-share) and `publishAgent` so the
+  chip appears this beat, not on the next unrelated fleet event. A NEW host has no record to hang it
+  on and stays a log line only (accepted).
+  - **HUB-OWNED like `tokenBound`/`autoPaused`**: `sanitizeHeartbeat` STRIPS an incoming `refused`
+    (else a host forges its own chip), but `serializeAgent` does NOT strip it (the operator watching
+    that host is who needs it). Cleared with no explicit un-stamp: an accepted beat rebuilds the
+    record from the (stripped) payload, so the field simply isn't there — absent = "not refused".
+  - **It rides the wire contract**: `normalizeRefused` is a `normalizeRecord` whitelist member (a bad
+    `at` drops the whole block → reads as not-refused; Android TYPES `RefusedInfo`), and it renders on
+    BOTH `index.html` (`refusedBadge`, shown regardless of `online` — that is the point) and Android
+    (`FleetScreen` pill). Tests: the `XERK-298` cases in `server.test.js`/`registry-cap.test.js`,
+    `AgentDecodeTest`.
 - Byte accounting is a side map (`recordBytes`), never a record field (anything on a record is served
   to every client); `registryBytes()` re-measures/forgets so deletion sites needn't remember it. New
   env knobs go through `positiveEnv` (a silent negative cap refuses the whole fleet). The effective

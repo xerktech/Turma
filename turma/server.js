@@ -1124,6 +1124,38 @@ function logRegistryFull(detail) {
   );
 }
 
+// Cap on the operator-facing detail stamped by `stampRefusal` (XERK-298).
+// Declared HERE, above `loadState`'s restore loop, so `normalizeRefused` — which
+// runs from that loop — can read it without landing in the TDZ that empties the
+// whole registry on boot (XERK-301). It is the hub's OWN words, not the agent's,
+// but it is served and restored from `state.json`, so it is bounded like any
+// field on the wire.
+const REFUSED_DETAIL_MAX = 200;
+
+// Stamp WHY the hub just refused a KNOWN host's heartbeat onto the record it
+// keeps and continues to serve (XERK-298), so the operator sees "the hub is
+// refusing this host, and here is why" instead of a host that silently freezes
+// at its last record and ages past OFFLINE_AFTER_MS, reading exactly like a
+// network outage. This is the one class of hub refusal that was operator-facing
+// in its CONSEQUENCE but had no operator SURFACE — XERK-264 brought command
+// refusals under that rule but heartbeat refusals were left out.
+//
+// `record` is the rolled-back `prev`: a host the registry already has. A NEW
+// host has no record to hang this on and stays a log line only (the ticket's
+// accepted residual). Cleared naturally on the next ACCEPTED beat, which
+// rebuilds the record from the payload without it — so an absent `refused` reads
+// as "not being refused / this hub can't tell", the value every client already
+// defaults to. Never fabricates a record: a `prev` with no keys is left alone
+// (there is nothing to serve).
+function stampRefusal(record, reason, detail) {
+  if (!record || typeof record !== "object" || !Object.keys(record).length) return;
+  record.refused = {
+    at: Date.now(),
+    reason: String(reason).slice(0, 40),
+    detail: String(detail).slice(0, REFUSED_DETAIL_MAX),
+  };
+}
+
 // Hosts whose slot may be reclaimed for a newcomer, least-recently-seen first.
 function evictableAgents(now) {
   return Object.entries(agents)
@@ -4984,6 +5016,14 @@ function sanitizeHeartbeat(payload, key) {
   // another's key. Stripped here so it can't be stored at all; serializeAgent's
   // stamp-last order is the second, independent guard.
   if ("key" in payload) delete payload.key;
+  // `refused` is HUB-OWNED (XERK-298): the hub stamps it when it REFUSES a beat,
+  // and it is served with the record rather than stripped (the operator watching
+  // that host is who needs it). Left in the payload it would ride `{...payload}`
+  // onto the accepted record, letting any host forge its own "the hub is
+  // refusing me" chip — the same posture `key`/`tokenBound`/`orgBound`/
+  // `autoPaused` take. Stripped on ingest so it can only ever be the hub's word;
+  // `normalizeRefused` coerces the one it wrote back off `state.json` on restore.
+  if ("refused" in payload) delete payload.refused;
   for (const k of Object.keys(payload)) {
     if (HEARTBEAT_KNOWN_KEYS.has(k)) continue;
     let size = 0;
@@ -5220,6 +5260,7 @@ function normalizeRecord(a) {
   normalizeDefaultRuntime(a);
   normalizeModels(a);
   normalizeSpawnRefusals(a);
+  normalizeRefused(a);
   normalizeRetired(a);
   normalizeJira(a);
   normalizeClones(a);
@@ -5273,6 +5314,31 @@ function normalizeClones(a) {
       c.progress = c.progress.slice(0, 120);
     }
   }
+}
+
+// The hub-stamped heartbeat-refusal marker (XERK-298) coerced to the shape the
+// clients type. `stampRefusal` writes a well-formed one, but it is served AND
+// persisted to `state.json`, so the restore path can hand back a hand-edited or
+// older-build shape — and Android TYPES it, so one wrong-typed value would fail
+// the WHOLE atomic /api/agents decode (the heartbeat contract). `at` is the
+// required anchor (an Int/Long on the clients): a bad or missing `at` drops the
+// whole block, reading as "not refused". `reason`/`detail` are strings, dropped
+// (not stringified) if wrong-typed so the client default applies, and `detail`
+// is re-capped — a corrupt state.json is the one door the ingest cap does not
+// cover. Bound is an INLINE literal for the loadState-TDZ reason normalizeClones
+// gives; a function declaration, guarding its own input shape, never throwing.
+function normalizeRefused(a) {
+  if (!a || typeof a !== "object") return;
+  if (!("refused" in a)) return;
+  const r = a.refused;
+  if (!r || typeof r !== "object" || Array.isArray(r) || !wireLong(r.at)) {
+    delete a.refused;
+    return;
+  }
+  for (const k of ["reason", "detail"]) {
+    if (k in r && typeof r[k] !== "string") delete r[k];
+  }
+  if (typeof r.detail === "string" && r.detail.length > 200) r.detail = r.detail.slice(0, 200);
 }
 
 // ============================================================================
@@ -10144,12 +10210,22 @@ const server = http.createServer(async (req, res) => {
       // mutated — a refused beat still poisoned the caches and its content came
       // back out of /history with a 413 on the wire.
       const refuseOversized = (size) => {
-        if (prev && Object.keys(prev).length) agents[key] = prev;
-        else delete agents[key];
-        console.error(
-          `heartbeat from ${logName(key)}: record is ${size} bytes, over the ` +
-            `${AGENT_RECORD_MAX} limit — beat refused`
-        );
+        const detail = `record is ${size} bytes, over the ${AGENT_RECORD_MAX}-byte ` +
+          `per-host limit — shrink this host's report (fewer/smaller sessions, repos)`;
+        if (prev && Object.keys(prev).length) {
+          agents[key] = prev;
+          // Stamp WHY onto the record still being served (XERK-298), so the host
+          // shows a "hub refused" chip instead of silently freezing and aging to
+          // offline. Re-measure and publish so the chip appears on open
+          // dashboards this beat rather than on the next unrelated fleet event —
+          // a refused beat otherwise invalidates nothing.
+          stampRefusal(prev, "record-too-large", detail);
+          recordBytes.set(key, agentRecordSize(prev));
+          publishAgent(key);
+        } else {
+          delete agents[key];
+        }
+        console.error(`heartbeat from ${logName(key)}: ${detail} — beat refused`);
         return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
       };
       // TWO measurements, one ceiling. The RAW size is the amplifier check: a
@@ -10220,17 +10296,22 @@ const server = http.createServer(async (req, res) => {
         // beat, with nothing to distinguish that from a network failure. See
         // AGENT_FAIR_SHARE. This host is never what gets EVICTED either: it was
         // just seen, so the idle rule excludes it.
+        const detail = `record is ${recordSize} bytes, over its ${AGENT_FAIR_SHARE}-byte ` +
+          `share of a full registry — shrink this host's report, or raise ` +
+          `AGENTS_TOTAL_MAX`;
         if (prev && Object.keys(prev).length) {
           agents[key] = prev;
+          // Same as the 413 path (XERK-298): stamp the record still being served
+          // and publish, so this refusal is a visible chip, not a host that
+          // silently freezes and reads offline.
+          stampRefusal(prev, "registry-full", detail);
           recordBytes.set(key, agentRecordSize(prev));
+          publishAgent(key);
         } else {
           delete agents[key];
           recordBytes.delete(key);
         }
-        logRegistryFull(
-          `${logName(key)} refused — its record is ${recordSize} bytes, over the ` +
-            `${AGENT_FAIR_SHARE}-byte per-host share`
-        );
+        logRegistryFull(`${logName(key)} refused — its ${detail}`);
         return json(res, 429, {
           error: "agent registry full", bytes: AGENTS_TOTAL_MAX, share: AGENT_FAIR_SHARE,
         });
@@ -12915,6 +12996,10 @@ if (process.env.TURMA_TEST) {
     normalizeRetired,
     normalizeJira,
     normalizeClones,
+    // XERK-298: the hub-stamped heartbeat-refusal marker coercion + its writer.
+    normalizeRefused,
+    stampRefusal,
+    REFUSED_DETAIL_MAX,
     // XERK-455: the typed-but-uncoerced blocks, exported alongside the rest of
     // the ingest coercions so a test can hold each guard directly.
     normalizeCodingAgent,
