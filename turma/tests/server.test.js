@@ -11378,6 +11378,12 @@ test("control WS: a channel that never pongs is dropped, so terminalOnline stops
     // This raw socket answers nothing — a half-open channel to a host that died
     // without a FIN. The hub must reap it rather than keep reporting the host's
     // terminal as online while every Attach hangs.
+    //
+    // This direction is robust against event-loop jitter (unlike the "kept"
+    // test below, XERK-450): it only needs the drop to land INSIDE a window many
+    // times the dead-after (CONTROL_DEAD_AFTER_MS≈400ms, drop observed ~450ms,
+    // window 3000ms), and a stall only ever DELAYS the drop — so a real timer is
+    // fine here where a survival assertion would flake.
     const closed = await new Promise((resolve) => {
       socket.on("close", () => resolve(true));
       setTimeout(() => resolve(false), 3000);
@@ -11388,24 +11394,59 @@ test("control WS: a channel that never pongs is dropped, so terminalOnline stops
   }
 });
 
-test("control WS: a channel that pongs is kept past the dead-after window", async () => {
+// Yield to the REAL event loop so socket bytes queued by the last mocked tick get
+// read/written; setImmediate is deliberately left un-mocked below so this pumps
+// real I/O without advancing the mocked clock.
+const pumpIO = async (turns = 4) => {
+  for (let i = 0; i < turns; i++) await new Promise((r) => setImmediate(r));
+};
+
+// The wound-down liveness env (set at the top of this file), read so the tick
+// math below stays in step with it.
+const CONTROL_PING_EVERY_MS = Number(process.env.CONTROL_PING_EVERY_MS);
+const CONTROL_DEAD_AFTER_MS = Number(process.env.CONTROL_DEAD_AFTER_MS);
+
+// XERK-450: the ONE liveness test that asserts SURVIVAL, driven by node:test
+// mock timers instead of a wall-clock wait. The hub's sweep is a setInterval
+// computing `idle = Date.now() - lastSeen` and drops the channel once idle
+// passes CONTROL_DEAD_AFTER_MS. The old form slept 1500ms of real time and
+// asserted "not closed": a single >CONTROL_DEAD_AFTER_MS event-loop stall (a GC
+// pause on this suite's large heap, even on an idle box) made the sweep fire
+// with a stale `idle` and drop a peer that was in fact answering — a ~7-10%
+// flake that silently poisons any benchmark grading on this suite. Mocking Date
+// + setInterval ADVANCES the clock deterministically: only those two APIs are
+// faked, so real socket I/O still pumps and the pongs round-trip between ticks,
+// while no real stall can advance the mocked `idle`.
+//
+// This MUST stay the only mock-timers test in the suite: node:test's mock timers
+// do not re-capture an interval created inside a pre-existing server's
+// connection handler on a SECOND consecutive mock-timers test (the hub's ping
+// interval then never fires on ticks). It is the sole such test here on purpose;
+// the two liveness tests above deliberately stay on real timers because their
+// assertions are robust without it.
+test("control WS: a channel that pongs is kept past the dead-after window", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "Date"] });
   const { socket, leftover } = await wsConnect(CONTROL_PATH);
   try {
+    let closed = false;
+    socket.on("close", () => { closed = true; });
     // Mirror what a real agent's WebSocket does for free: auto-pong every ping.
-    // Client->server frames must be masked, so encode by hand.
+    // Client->server frames must be masked, so encode the empty pong by hand.
     const parse = wsParser((op) => {
       if (op !== 0x9) return;
-      const mask = Buffer.from([1, 2, 3, 4]);
-      socket.write(Buffer.concat([Buffer.from([0x80 | 0xa, 0x80]), mask]));
+      socket.write(Buffer.concat([Buffer.from([0x80 | 0xa, 0x80]), Buffer.from([1, 2, 3, 4])]));
     });
     if (leftover && leftover.length) parse(leftover);
     socket.on("data", parse);
-    const closed = await new Promise((resolve) => {
-      socket.on("close", () => resolve(true));
-      // Well past CONTROL_DEAD_AFTER_MS: a ponging peer must survive.
-      setTimeout(() => resolve(false), 1500);
-    });
-    assert.ok(!closed, "hub dropped a live channel that was answering its pings");
+    // Advance well PAST CONTROL_DEAD_AFTER_MS in ping-sized steps, letting each
+    // ping's pong round-trip (real I/O) before the next tick — so `lastSeen`
+    // stays fresh and the channel must survive every step.
+    const steps = Math.ceil((CONTROL_DEAD_AFTER_MS * 3) / CONTROL_PING_EVERY_MS);
+    for (let i = 0; i < steps; i++) {
+      t.mock.timers.tick(CONTROL_PING_EVERY_MS);
+      await pumpIO();
+      assert.ok(!closed, "hub dropped a live channel that was answering its pings");
+    }
   } finally {
     socket.destroy();
   }
