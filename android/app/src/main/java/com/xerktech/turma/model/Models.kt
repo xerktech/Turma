@@ -997,6 +997,12 @@ data class SubscriptionInfo(
     val key: String = "",
     /** "login" (read from the host's Claude config) or "env" (pinned by hand). */
     val source: String = "",
+    /**
+     * A human-readable name for the subscription (XERK-541) — the account's org
+     * name, so the usage card can say WHICH subscription it is rather than only
+     * listing its hosts. Blank when the host reports none; the hub coerces it.
+     */
+    val label: String = "",
 )
 
 @Serializable

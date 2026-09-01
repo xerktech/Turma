@@ -144,10 +144,18 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
   a PLAN two different accounts share.
   - **Every path is tried until one ANSWERS, not until one EXISTS** — falling through only on a
     missing path lets an accountless first file permanently suppress the layout holding the login.
-- **What rides the wire is a hash, never the uuid, org uuid or email** — grouping only ever asks
-  whether two hosts are equal.
+- **The grouping KEY that rides the wire is a hash, never the uuid, org uuid or email** — grouping
+  only ever asks whether two hosts are equal.
+- **A separate `label` is the card's human-readable NAME** (XERK-541) — the account's own
+  `organizationName` (`_subscription_label`, else displayName/fullName/emailAddress), so the usage
+  page can say WHICH subscription instead of only listing its hosts. Unlike the key it is meant to be
+  read, so it carries a real name — a personal Max plan's org name embeds the login email.
+  - **`TURMA_SUBSCRIPTION_LABEL` overrides it** on both sources — the privacy/friendliness escape
+    hatch, and the ONLY label an env-pinned key (no account to derive from) ever gets. An empty
+    override never blanks a derived one. Bounded (`SUBSCRIPTION_LABEL_MAX`), re-bounded at the hub.
 - **Absent means "can't tell"** — such a host gets its own card, never merged by default.
-  `TURMA_SUBSCRIPTION_KEY` pins a group by hand, hashed the same way.
+  `TURMA_SUBSCRIPTION_KEY` pins a group by hand, hashed the same way; a login with no nameable field
+  carries no label (the card falls back to its hosts).
 - `subscription_identity` **never raises and never blocks** — `_subscription_from_config` takes
   **regular files ONLY** (a FIFO blocks `open()` forever) and bounds the **READ**, never `st_size` (a
   char device reports 0 then hands over bytes forever).

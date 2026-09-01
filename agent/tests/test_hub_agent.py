@@ -6574,6 +6574,59 @@ class TestSubscriptionIdentity(unittest.TestCase):
         os.utime(self.path, (0, 0))   # force a different mtime than the write
         self.assertNotEqual(self._read()["key"], first)
 
+    def test_the_label_is_the_org_name_for_the_usage_card(self):
+        # XERK-541: the card needs a human-readable name for the subscription,
+        # and the account's own org name is exactly "which subscription is this".
+        self._write({"oauthAccount": {"accountUuid": "acc-1",
+                                      "organizationName": "XerkTech",
+                                      "displayName": "Mal",
+                                      "emailAddress": "a@b.c"}})
+        self.assertEqual(self._read()["label"], "XerkTech")
+
+    def test_the_label_falls_back_past_a_missing_org_name(self):
+        # No org name → the person, then the email; each only when non-empty, so
+        # a blank field never suppresses the next.
+        self._write({"oauthAccount": {"accountUuid": "acc-1", "organizationName": "",
+                                      "displayName": "Mal", "emailAddress": "a@b.c"}})
+        self.assertEqual(self._read()["label"], "Mal")
+        ha._subscription_cache = {}
+        self._write({"oauthAccount": {"accountUuid": "acc-1", "emailAddress": "a@b.c"}})
+        self.assertEqual(self._read()["label"], "a@b.c")
+
+    def test_a_login_with_no_nameable_field_carries_no_label(self):
+        # Absent, never a fabricated one — the card falls back to the hosts.
+        self._write({"oauthAccount": {"accountUuid": "acc-1"}})
+        self.assertNotIn("label", self._read())
+
+    def test_the_env_label_overrides_the_derived_one(self):
+        # The privacy / friendliness override: an operator who would rather not
+        # ship the org name (a personal plan's embeds the email) names it here.
+        self._write({"oauthAccount": {"accountUuid": "acc-1",
+                                      "organizationName": "a@b.c's Organization"}})
+        block = self._read({ha.SUBSCRIPTION_LABEL_ENV: "  My laptops  "})
+        self.assertEqual(block["label"], "My laptops")     # trimmed
+        self.assertEqual(block["source"], "login")         # key still derived
+        # An empty override never blanks a real derived label.
+        ha._subscription_cache = {}
+        self.assertEqual(
+            self._read({ha.SUBSCRIPTION_LABEL_ENV: "   "})["label"],
+            "a@b.c's Organization")
+
+    def test_the_env_label_is_the_only_name_a_pinned_key_gets(self):
+        # An env-pinned key has no account to derive from; the label env names it.
+        self._write({"oauthAccount": {"accountUuid": "acc-1", "organizationName": "X"}})
+        pinned = self._read({ha.SUBSCRIPTION_KEY_ENV: "team",
+                             ha.SUBSCRIPTION_LABEL_ENV: "Team Max"})
+        self.assertEqual(pinned["source"], "env")
+        self.assertEqual(pinned["label"], "Team Max")      # not the config's "X"
+        self.assertNotIn(
+            "label", self._read({ha.SUBSCRIPTION_KEY_ENV: "team"}))  # none without it
+
+    def test_the_label_is_length_bounded(self):
+        self._write({"oauthAccount": {"accountUuid": "acc-1",
+                                      "organizationName": "z" * 5000}})
+        self.assertEqual(len(self._read()["label"]), ha.SUBSCRIPTION_LABEL_MAX)
+
 
 class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
     """Usage counts EVERY transcript on disk, not only ledger-known slugs: an

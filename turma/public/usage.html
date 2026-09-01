@@ -54,7 +54,19 @@
     display: flex; align-items: baseline; justify-content: space-between;
     gap: 10px; margin-bottom: 10px;
   }
-  .lim-host { font-weight: 600; font-size: 13px; color: var(--ink); }
+  /* The heading now carries a subscription NAME (XERK-541), not just short host
+     names, so it must wrap rather than shove the age out of the flex row. */
+  .lim-host {
+    font-weight: 600; font-size: 13px; color: var(--ink);
+    min-width: 0; word-break: break-word;
+  }
+  /* A NAMED card's heading (XERK-541) hides its agents behind a hover: signal
+     that with the conventional dotted underline + help cursor. */
+  .lim-host-named {
+    cursor: help;
+    text-decoration: underline dotted var(--border);
+    text-underline-offset: 3px;
+  }
   .lim-age { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
   .lim-age.stale { color: var(--warning); }
   .lim-row + .lim-row { margin-top: 10px; }
@@ -388,6 +400,8 @@ function limitEntries(agents, nowSec) {
       // The subscription this host's login is on (XERK-301), or null when it
       // can't say — see limitGroups.
       subKey: subscriptionKeyOf(a),
+      // Its human-readable name (XERK-541), when the host reports one.
+      subLabel: subscriptionLabelOf(a),
       limits: a.limits,
     }))
     .sort((x, y) => (y.limits.capturedAt || 0) - (x.limits.capturedAt || 0));
@@ -396,6 +410,11 @@ function limitEntries(agents, nowSec) {
 function subscriptionKeyOf(agent) {
   const key = agent && agent.subscription && agent.subscription.key;
   return typeof key === "string" && key ? key : null;
+}
+
+function subscriptionLabelOf(agent) {
+  const label = agent && agent.subscription && agent.subscription.label;
+  return typeof label === "string" && label ? label : null;
 }
 
 // One card per SUBSCRIPTION, not per host (XERK-301). Hosts logged into one
@@ -421,12 +440,21 @@ function limitGroups(agents, nowSec) {
     const capturedAt = entry.limits.capturedAt || 0;
     let group = entry.subKey ? byKey.get(entry.subKey) : null;
     if (!group) {
-      group = { key: entry.subKey, hosts: [], capturedAt: 0, windows: {} };
+      group = { key: entry.subKey, hosts: [], capturedAt: 0, windows: {},
+                label: "", labelAt: -1 };
       groups.push(group);
       if (entry.subKey) byKey.set(entry.subKey, group);
     }
     group.hosts.push({ host: entry.host, capturedAt });
     group.capturedAt = Math.max(group.capturedAt, capturedAt);
+    // The card's name takes the FRESHEST reporter's label, the same rule the
+    // windows use: hosts on one account report the same name, but should they
+    // ever disagree (one pins TURMA_SUBSCRIPTION_LABEL), the newest wins and
+    // both clients resolve it the same way. Strict `>` over freshest-first.
+    if (entry.subLabel && capturedAt > group.labelAt) {
+      group.label = entry.subLabel;
+      group.labelAt = capturedAt;
+    }
     for (const [key] of LIMIT_WINDOWS) {
       const win = entry.limits[key];
       if (!win || typeof win.usedPct !== "number") continue;
@@ -829,9 +857,10 @@ function renderLimits(agents) {
 // counts them. Every name is still in the tooltip, with its own capture age.
 const LIMIT_HOSTS_SHOWN = 3;
 
-// The card's heading: the one host on this subscription, or the hosts sharing
-// it. There is no better name to give a subscription — the key is a hash by
-// design (XERK-301) — and the hosts are what the operator actually recognises.
+// The card's heading falls back to the host(s) on the subscription when it has
+// no name (XERK-301: the grouping key is a hash, so the hosts are what the
+// operator recognises). With a name (XERK-541) that leads instead, and the
+// agents on the subscription move into the heading's hover tooltip.
 function limitHostLabel(group) {
   const names = group.hosts.map(h => h.host);
   if (names.length <= LIMIT_HOSTS_SHOWN) return names.join(" · ");
@@ -847,14 +876,26 @@ function limitCard(group, nowSec) {
   head.className = "lim-head";
   const host = document.createElement("span");
   host.className = "lim-host";
-  host.textContent = limitHostLabel(group);
-  if (group.hosts.length > 1) {
+  host.textContent = group.label || limitHostLabel(group);
+  // The agents on this subscription, each with its own capture age.
+  const agentLines = group.hosts
+    .map(h => h.host + " — captured " + fmtDuration(nowSec - h.capturedAt) + " ago")
+    .join("\n");
+  if (group.label) {
+    // Named card: the name leads, and hovering the heading reveals which agents
+    // are on this subscription (XERK-541) rather than listing them inline.
+    host.title = (group.hosts.length > 1
+      ? "Agents on this subscription — logged into one Claude account, so they "
+        + "share one 5-hour and 7-day pool (each window below shows the freshest "
+        + "reading):\n"
+      : "Agent on this subscription:\n") + agentLines;
+    host.className = "lim-host lim-host-named";   // the hover affordance
+  } else if (group.hosts.length > 1) {
+    // No name to lead with, so the heading IS the hosts; the tooltip only adds
+    // their capture ages and the shared-pool note.
     host.title = "These hosts are logged into the same Claude account, so they "
       + "share one 5-hour and 7-day pool. Each window below shows the freshest "
-      + "reading of it:\n"
-      + group.hosts
-        .map(h => h.host + " — captured " + fmtDuration(nowSec - h.capturedAt) + " ago")
-        .join("\n");
+      + "reading of it:\n" + agentLines;
   }
   const age = document.createElement("span");
   const ageSec = nowSec - (group.capturedAt || 0);

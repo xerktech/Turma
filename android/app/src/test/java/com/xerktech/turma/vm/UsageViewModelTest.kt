@@ -442,6 +442,32 @@ class UsageViewModelTest {
         assertEquals(21.0, card.sevenDay!!.pct, 0.001)
     }
 
+    @Test fun `a card takes the freshest reporter's subscription name (XERK-541)`() {
+        // Hosts on one account report the same name, but should they disagree
+        // the newest wins — the same strict-`>`-over-freshest-first rule the web
+        // uses, so both clients resolve it identically. The name heads the card;
+        // the machine list stays available as host for the subtitle.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "a", device = "a",
+                subscription = SubscriptionInfo(key = "k1", label = "Old Name"),
+                limits = limits(now - 600, five = LimitWindow(usedPct = 30.0))),
+            AgentInfo(key = "b", device = "b",
+                subscription = SubscriptionInfo(key = "k1", label = "XerkTech"),
+                limits = limits(now - 60, five = LimitWindow(usedPct = 42.0))),
+        ))
+        val card = UsageViewModel.compute(fleet, now).limits.single()
+        assertEquals("XerkTech", card.label)
+        assertEquals("b · a", card.host)   // the machines, for the subtitle
+    }
+
+    @Test fun `an unnamed subscription leaves the card label blank`() {
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "solo", device = "solo", subscription = sub("k1"),
+                limits = limits(now, five = LimitWindow(usedPct = 5.0))),
+        ))
+        assertEquals("", UsageViewModel.compute(fleet, now).limits.single().label)
+    }
+
     @Test fun `a window read before the card's stamp carries its own read time`() {
         // The head shows the group's FRESHEST capture, so a window the freshest
         // host didn't report must not be presented under it.

@@ -138,6 +138,13 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
     data class LimitCard(
         val hosts: List<LimitHost>,
         val capturedAt: Long,
+        /**
+         * The subscription's human-readable name (XERK-541), or blank. When set
+         * it heads the card ALONE — the phone has no hover to reveal the agents
+         * behind it as web does, so [host] (the machine list) is not shown. Blank
+         * → [host] heads the card, as it did before names existed.
+         */
+        val label: String = "",
         val fiveHour: LimitView? = null,
         val sevenDay: LimitView? = null,
         /**
@@ -493,6 +500,14 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 group.hosts.add(LimitHost(a.device.ifBlank { a.key }, lim.capturedAt))
                 group.capturedAt = maxOf(group.capturedAt, lim.capturedAt)
+                // The card's name takes the FRESHEST reporter's label (XERK-541),
+                // the same freshest-first + strict-`>` rule the windows use, so
+                // hosts that ever disagree resolve identically on both clients.
+                val label = a.subscription?.label?.takeIf { it.isNotBlank() }
+                if (label != null && lim.capturedAt > group.labelAt) {
+                    group.label = label
+                    group.labelAt = lim.capturedAt
+                }
                 if (lim.fiveHour?.usedPct != null && lim.capturedAt > group.fiveHourAt) {
                     group.fiveHour = lim.fiveHour
                     group.fiveHourAt = lim.capturedAt
@@ -506,6 +521,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 LimitCard(
                     hosts = g.hosts,
                     capturedAt = g.capturedAt,
+                    label = g.label,
                     fiveHour = limitView(g.fiveHour, nowSec),
                     sevenDay = limitView(g.sevenDay, nowSec, pace = true),
                     fiveHourAt = if (g.fiveHour != null) g.fiveHourAt else g.capturedAt,
@@ -518,6 +534,8 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         private class MutableLimitGroup {
             val hosts = mutableListOf<LimitHost>()
             var capturedAt = 0L
+            var label = ""
+            var labelAt = Long.MIN_VALUE
             var fiveHour: com.xerktech.turma.model.LimitWindow? = null
             var fiveHourAt = Long.MIN_VALUE
             var sevenDay: com.xerktech.turma.model.LimitWindow? = null

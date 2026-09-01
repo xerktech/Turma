@@ -261,7 +261,9 @@ private fun LimitsSection(cards: List<UsageViewModel.LimitCard>, anyAgents: Bool
 private fun LimitCardView(card: UsageViewModel.LimitCard, nowSec: Long) {
     Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(card.host, style = MaterialTheme.typography.bodyMedium)
+            // The subscription's name heads the card when it has one (XERK-541),
+            // else the machine(s) on it (XERK-301: the key is a hash).
+            Text(card.label.ifBlank { card.host }, style = MaterialTheme.typography.bodyMedium)
             val ageSec = nowSec - card.capturedAt
             Text(
                 // "captured", not "updated": this is when the host last read the
@@ -272,9 +274,11 @@ private fun LimitCardView(card: UsageViewModel.LimitCard, nowSec: Long) {
                 else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        // Only worth saying when the card IS a consolidation: with one host the
-        // heading already names it and its age is the line above.
-        if (card.hosts.size > 1) {
+        // On a NAMED card the phone shows the subscription name only (XERK-541):
+        // there is no hover to reveal the agents behind it as on web, and the
+        // name is the identity the operator asked to see. An UNNAMED card still
+        // lists its hosts below, since the name is all that would replace them.
+        if (card.label.isBlank() && card.hosts.size > 1) {
             Text(
                 "shared by " + card.hosts.joinToString(", ") {
                     "${it.host} (${UsageViewModel.fmtDuration(nowSec - it.capturedAt)} ago)"

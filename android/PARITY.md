@@ -267,6 +267,12 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   UTC day for the selected grouping, with a legend that is the filter — per-series + group toggles,
   persisted (the web's `turma-hidden-sessions`), rescoping chart and rows; paint is assigned by stable
   order so toggling never repaints survivors. The grouping tab pick persists too (`turma-usage-mode`).
+- **Subscription-limit card name (XERK-541).** Both surfaces title a card by the subscription's
+  `label` when it reports one (`LimitCard.label`), falling back to the hosts on it when it does not.
+  Justified platform difference: the WEB card shows only the name and reveals the agents on it via a
+  hover tooltip on the heading; a phone has no hover, so ANDROID shows the name alone (no host list)
+  on a named card, and still lists hosts on an unnamed one. Fold logic parity-tested in
+  `UsageViewModelTest`.
 
 ## Done (XERK-126 — the clone bar)
 
