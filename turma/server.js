@@ -9384,7 +9384,10 @@ const server = http.createServer(async (req, res) => {
       let archiveHave, archiveShed, archiveFull, archiveRawHave, archiveRawSkip;
       if (Array.isArray(archiveManifest) && archiveManifest.length) {
         try {
-          archiveHave = archive.manifestCursors(key, archiveManifest);
+          // This beat's CLAIMED org is stamped on every placeholder row the
+          // manifest creates, so the ingestChunk gate (XERK-344) protects a
+          // not-yet-filled transcript from a cross-org first chunk.
+          archiveHave = archive.manifestCursors(key, archiveManifest, siteKeyOf(payload));
           // The budget state that goes back with the cursors (XERK-267): which
           // transcripts have spent their per-transcript budget, so the agent
           // strips the inline file payloads before shipping them, and whether
@@ -9731,7 +9734,11 @@ const server = http.createServer(async (req, res) => {
         const r = archive.ingestChunk(
           key, transcriptId, body.meta || {},
           Number(body.startOffset) || 0, Number(body.endOffset) || 0,
-          Array.isArray(body.entries) ? body.entries : []
+          Array.isArray(body.entries) ? body.entries : [],
+          // The pushing host's CLAIMED org, hub-derived — never the agent-supplied
+          // `body.meta`. Gates a cross-host row re-point (XERK-344), compared the
+          // same way POST .../migrate compares two hosts' orgs.
+          siteKeyOf(agents[key])
         );
         // It landed, so whatever this host last failed with here is history.
         archiveRefusals.delete(refusalKey(key, transcriptId));

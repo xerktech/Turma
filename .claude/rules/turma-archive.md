@@ -64,8 +64,24 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     into `filePath` + the sidecar, so `ingestChunk` reuses it and `rebuildIndex` re-derives it from
     the on-disk name; existing files are never renamed.
   - **Only the session's OWN host may write its raw files** — the credential (XERK-268) proves WHO is
-    calling, not whose session they may write into. (`ingestChunk` has no such check yet —
-    pre-existing, XERK-344.)
+    calling, not whose session they may write into. The raw layer requires `row.host === host`
+    EXACTLY, which works because `ingestChunk` re-points the row on a migration FIRST (below).
+  - **A host RE-POINT in `ingestChunk` is gated on the owner's ORG** (XERK-344) — else any host with
+    its own token could append arbitrary entries to another host's archived transcript AND
+    re-attribute the row to itself (`host=excluded.host`), served back through `GET /api/archive` as
+    that host's history. A same-host append never re-points, so it is never gated. A host CHANGE is a
+    migration (XERK-101, same-org), so it is allowed exactly when the pushing host shares the current
+    owner's `siteKey` — the CLAIMED org, compared as `POST .../migrate` does, inheriting XERK-349's
+    accepted hole that two org-less hosts match. The owner's org is STORED on the row (schema v5,
+    hub-supplied via `siteKeyOf` — never agent-`meta`), so the check survives the owner going offline.
+    - **`manifestCursors` stamps the org on the placeholder row it creates**, or a cross-org first
+      chunk would hijack a not-yet-filled transcript via the legacy escape below.
+    - **A row whose `siteKey` is NULL (rebuilt from a pre-XERK-344 sidecar, which has no field) admits
+      the first writer once and stamps it** — trust-on-first-sight, since it cannot be proven
+      cross-org. `rebuildIndex` uses `meta.siteKey ?? null` so a recorded `""` (a real no-org owner,
+      still gated) is kept distinct from a legacy NULL.
+    - Refused like an offset mismatch: store nothing, return the real cursor — never an error status
+      (XERK-255). Tests: the `XERK-344:` cases in `archive.test.js`.
   - **The agent never OFFERS a file the hub cannot name** (`_archivable_rel` mirrors `safeRawRel`) —
     an unnameable offer 400s FOREVER and isn't distinguishable from transient failure, so it can
     starve every other transcript on the host. **The two allowlists must agree.** The agent uses
