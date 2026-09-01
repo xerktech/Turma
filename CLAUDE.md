@@ -335,8 +335,8 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     **`TURMA_AGENT_STRICT` retires it**, and the hub warns at boot until it is set. Detail in
     `turma.md`; the agent needs no code change, only the right `TURMA_TOKEN`.
 - **The hub's memory ceilings are FRACTIONS OF ITS CONTAINER LIMIT, never fixed numbers** (XERK-258,
-  XERK-273). It runs at `mem_limit: 256m`, so a flat constant larger than that can never refuse
-  anything before the OOM killer fires. `containerMemoryLimit()` reads the cgroup; everything derives
+  XERK-273). It runs at `mem_limit: 512m` (raised from 256m for XERK-287), so a flat constant larger
+  than that can never refuse anything before the OOM killer fires. `containerMemoryLimit()` reads the cgroup; everything derives
   from it and is logged at boot. Raising `mem_limit` widens them with no code change. Mechanics:
   `turma-limits.md`. What spans components:
   - **413 and 503 mean opposite things and must not be collapsed**: 413 is "your body is too big,
@@ -348,9 +348,16 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     close the connection under a request still being written, and a client that writes before reading
     — python urllib, which is what `hub-agent.py` posts with — loses the response and sees a socket
     error (XERK-235's offline loop). **Test agent refusals with urllib, never with fetch.**
-  - **Known gap (XERK-287): held UPLOADS are a budget of their own, outside the in-flight ceiling**, so
-    the true worst case is `in-flight + uploads` — 192 MiB of a 256 MiB container. Closing it is a
-    sizing decision with user-visible cost, not a code fix.
+  - **XERK-287 (closed by the raise): uploads are a budget SEPARATE from the in-flight ceiling**, so
+    the hub's worst-case heap is `in-flight + uploads` = ¾ of the container — 192 MiB at 256m, which
+    OOM'd. `mem_limit` was raised to **512m** (co-peak 384 + baseline, ~68 MiB margin) rather than
+    shrink either budget (the raise widens every derived ceiling with no code change). **The
+    chunked-body / socket-error halves (findings 2/3) need NO code**: the k8s NGINX ingress fronting
+    the hub buffers every request body (`proxy_request_buffering on`) and forwards it DECLARED-LENGTH,
+    so the hub's declared-length pre-check always fires and an oversize body always gets a readable 413
+    — the direct-tunnel topology those findings (and XERK-235) assumed is gone. The one residual is an
+    in-cluster agent posting to the Service directly, bypassing nginx. Mechanics + evidence:
+    `turma-limits.md`.
 
 ## Conventions
 
