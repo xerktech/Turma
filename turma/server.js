@@ -973,6 +973,7 @@ function makeRegistryRoom(addBytes, addSlots) {
     // admits and evicts forever leaks a per-host entry per name it ever saw.
     recordSizeWarned.delete(key);
     shareWarned.delete(key);
+    deviceCollisionWarned.delete(key);
     invalidateAgentsCache();
     sseBroadcast("removed", { key });
   }
@@ -4455,6 +4456,36 @@ const AGENT_RECORD_MAX = 8 << 20; // 8 MiB
 // Which hosts are already over half the ceiling, so the warning above fires on
 // the crossing rather than on every beat.
 const recordSizeWarned = new Map();
+
+// When a device-name collision (XERK-289) was last warned about, per host key.
+// A real collision flip-flops the record every beat as the two hosts overwrite
+// each other, so an edge test would fire every beat — this is a time throttle.
+const deviceCollisionWarned = new Map();
+const DEVICE_COLLISION_WARN_EVERY_MS = 5 * 60 * 1000;
+
+// Two DIFFERENT physical hosts reporting the SAME device name key the SAME hub
+// record, so the later beat silently REPLACES the earlier and commands queued
+// for one host are handed to the other (XERK-289). The device name is the only
+// identity on the wire so the hub cannot key them apart, but the agent reports
+// its own host/container id as `agentId`, which DOES differ — a beat whose
+// agentId differs from the stored one is the collision. Surface it (routing
+// itself can't be fixed without a wire-identity change, XERK-289's option 2) so
+// an operator chasing a misrouted kill/spawn finds the cause instead of one
+// healthy-looking host. Values are agent-supplied and only HEARTBEAT_MAX-bounded,
+// so log them through logName (control-strip) after a length slice.
+function warnDeviceCollision(key, prevAgentId, curAgentId) {
+  if (!prevAgentId || !curAgentId || prevAgentId === curAgentId) return;
+  const now = Date.now();
+  if (now - (deviceCollisionWarned.get(key) || 0) < DEVICE_COLLISION_WARN_EVERY_MS) return;
+  deviceCollisionWarned.set(key, now);
+  console.warn(
+    `device-name collision: ${logName(key)} is being reported by two different ` +
+      `agents (agentId ${logName(String(prevAgentId).slice(0, 80))} then ` +
+      `${logName(String(curAgentId).slice(0, 80))}) — their heartbeats overwrite ` +
+      `one record and commands may route to the wrong host (XERK-289). Give the ` +
+      `hosts distinct DEVICE_NAMEs.`
+  );
+}
 
 // `AGENT_CACHE_KEYS` and `agentRecordSize` are declared with the registry
 // budget instead (see `let agents`), because the state.json restore enforces
@@ -9004,6 +9035,10 @@ const server = http.createServer(async (req, res) => {
         });
       }
       const prev = agents[key] || {};
+      // XERK-289: warn when a second physical host beats under an existing
+      // host's name (its agentId differs from the stored one). Read BEFORE the
+      // record is overwritten below, so `prev` still holds the incumbent's id.
+      if (known) warnDeviceCollision(key, prev.agentId, payload.agentId);
       // At-least-once command delivery: drop any queued command the agent
       // reports as executed; keep re-sending the rest until acked.
       const acked = new Set(payload.ackedCommands || []);

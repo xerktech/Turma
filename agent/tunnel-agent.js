@@ -1676,6 +1676,15 @@ function usableHostname(name) {
   return n;
 }
 
+// A stable per-host suffix for the terminal fallback name (XERK-289). Two hosts
+// that both fall back to a bare "unknown-device" key the SAME hub record and
+// silently merge, misrouting commands; the rejected OS hostname (a container id)
+// is unique per host, so it disambiguates them. MUST mirror hub-agent.py
+// _device_discriminator().
+function deviceDiscriminator(raw) {
+  return (raw || "").trim().toLowerCase().replace(/[^0-9a-z-]/g, "").slice(0, 12);
+}
+
 // The Docker daemon's own hostname via the bind-mounted socket — the automated
 // cross-OS source (bare Linux -> host hostname; Docker-in-WSL -> the Windows
 // machine name). See hub-agent.py docker_host_name().
@@ -1716,18 +1725,25 @@ function deviceName() {
   }
   const dockerName = usableHostname(dockerHostName());
   if (dockerName) return dockerName;
+  let rawHost = "";
   try {
-    const n = usableHostname(os.hostname());
+    rawHost = os.hostname();
+    const n = usableHostname(rawHost);
     if (n) return n;
   } catch {
     /* fall through */
   }
+  // Make the fallback unique per host where possible (XERK-289): a bare
+  // "unknown-device" from two hosts silently merges their hub records. Mirrors
+  // hub-agent.py device_name().
+  const disc = deviceDiscriminator(rawHost);
+  const fallback = disc ? `unknown-device-${disc}` : "unknown-device";
   log(
     "device name unresolved: DEVICE_NAME unset, no /host/etc/hostname, no usable " +
       "`docker info` name, and the OS hostname is a container id — falling back " +
-      "to 'unknown-device'",
+      `to ${JSON.stringify(fallback)}`,
   );
-  return "unknown-device";
+  return fallback;
 }
 
 const NAME = deviceName();
@@ -1869,5 +1885,5 @@ if (require.main === module) {
   module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS,
     toolUseDetail, todoItems, fmtDshElapsed, dshStatus,
-    usableHostname, deviceName };
+    usableHostname, deviceName, deviceDiscriminator };
 }

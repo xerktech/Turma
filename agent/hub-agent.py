@@ -3647,6 +3647,20 @@ def _usable_hostname(name):
     return name
 
 
+def _device_discriminator(raw):
+    """A stable per-host suffix for the terminal fallback name (XERK-289). When
+    no source yields a usable host name the agent falls back to 'unknown-device'
+    — but two hosts that both do so key the SAME hub record and silently merge,
+    misrouting commands between them. The kernel-assigned container id
+    (socket.gethostname(), rejected as a standalone name by _usable_hostname
+    because it is opaque) is still UNIQUE per host, so it disambiguates them by
+    construction. Sanitised to a plain lowercase token and truncated; empty when
+    nothing usable remains, in which case the bare fallback stands and the hub's
+    collision warning is the backstop. MUST mirror tunnel-agent.js
+    deviceDiscriminator()."""
+    return re.sub(r"[^0-9a-z-]", "", (raw or "").strip().lower())[:12]
+
+
 def docker_host_name():
     """The Docker daemon's own hostname, read through the bind-mounted docker
     socket (`docker info`). This is the automated, zero-config way to learn the
@@ -3798,18 +3812,27 @@ def device_name():
     name = _usable_hostname(smb_host_name())
     if name:
         return name
+    raw_host = ""
     try:
-        name = _usable_hostname(socket.gethostname())
+        raw_host = socket.gethostname()
+        name = _usable_hostname(raw_host)
         if name:
             return name
     except OSError:
         pass
+    # The terminal fallback is made UNIQUE PER HOST where possible (XERK-289): a
+    # bare 'unknown-device' from two hosts silently merges their hub records and
+    # misroutes commands. The rejected OS hostname (a container id) is a per-host
+    # discriminator, so append it; only when nothing usable remains do we emit
+    # the bare name and lean on the hub's collision detection.
+    disc = _device_discriminator(raw_host)
+    fallback = f"unknown-device-{disc}" if disc else "unknown-device"
     log(
         "device name unresolved: no /host/etc/hostname, no usable `docker info` "
         "name, no SMB reply from the host, and the OS hostname is a container id "
-        "— falling back to 'unknown-device' (set DEVICE_NAME to override)"
+        f"— falling back to {fallback!r} (set DEVICE_NAME to override)"
     )
-    return "unknown-device"
+    return fallback
 
 
 def agent_version():
