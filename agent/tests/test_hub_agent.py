@@ -21885,14 +21885,23 @@ class TestBeatLoopBudget(unittest.TestCase):
                  * ha.SessionManager.MIGRATION_UPLOAD_TIMEOUT_SEC)
         self.assertGreater(worst * 1000, self._offline_after_ms())
 
+    def test_pr_comment_fetch_worst_case_exceeds_the_offline_threshold(self):
+        """WHY the PR-comment FETCH is off the beat (XERK-543): PR_COMMENTS_MAX
+        sequential gh/GitLab/ADO comment fetches, each bounded only by run()'s
+        15s, is the same OFFLINE_AFTER_MS class as refresh_pr_status. Only the
+        FETCH moved onto its own worker (_fetch_pr_comments); the registry-
+        mutating DELIVERY stays on the beat, which is why this is a fetch/deliver
+        split and not a plain move onto the slow-refresh worker."""
+        worst = ha.PR_COMMENTS_MAX * 15   # run()'s default per-call timeout
+        self.assertGreater(worst * 1000, self._offline_after_ms())
+
     def test_what_stays_on_the_beat_fits_under_the_threshold(self):
         """What IS inline — the interval plus the beat's own POSTs, two of them
         on a cycle that executed commands — has to leave real margin under the
         threshold. This covers the beat's network cost; it does not bound
-        `handle_commands` (a migration export is now off the beat, XERK-397) nor
-        `_poll_pr_comments`, whose own gh fetch is still inline and is the next
-        thing to measure if a host flaps again with these refreshes off the
-        loop."""
+        `handle_commands` (a migration export is now off the beat, XERK-397). The
+        PR-comment fetch is off the beat too now (XERK-543); only its delivery,
+        which touches no network, remains inline."""
         worst_ms = (ha.INTERVAL + 2 * ha.HEARTBEAT_TIMEOUT_SEC) * 1000
         self.assertLess(worst_ms, self._offline_after_ms())
 
@@ -21978,6 +21987,121 @@ class TestSlowRefreshWorker(ManagerMixin, unittest.TestCase):
         # Mutating the live ticket after the snapshot must not touch the payload.
         sm.jira["tickets"][0]["repoGuess"] = {"repo": "late"}
         self.assertNotIn("repoGuess", block["tickets"][0])
+
+
+class TestPrCommentFetchWorker(ManagerMixin, unittest.TestCase):
+    """The PR-comment gh/GitLab/ADO fetch runs on its own worker, not the beat
+    (XERK-543): the beat STAGES the fetch and DELIVERS the previous one, which is
+    what keeps up to PR_COMMENTS_MAX 15s calls off the heartbeat while the
+    registry-mutating delivery stays on the beat."""
+
+    def test_build_payload_stages_the_fetch_and_delivers_not_fetches_inline(self):
+        # Beat 0 is on the PR_COMMENTS cadence (0 % PR_COMMENTS_REFRESH_EVERY),
+        # so the beat must STAGE the fetch and DELIVER, never run the network
+        # fetch inline.
+        sm = self.make_manager()
+        sm._stage_pr_comment_fetch = mock.Mock()
+        sm._deliver_pr_comments = mock.Mock()
+        sm._fetch_pr_comments = mock.Mock()
+        sm.build_payload(0)
+        sm._stage_pr_comment_fetch.assert_called_once_with()
+        sm._deliver_pr_comments.assert_called_once_with()
+        sm._fetch_pr_comments.assert_not_called()
+
+    def test_the_light_beat_neither_stages_nor_delivers(self):
+        sm = self.make_manager()
+        sm._stage_pr_comment_fetch = mock.Mock()
+        sm._deliver_pr_comments = mock.Mock()
+        sm.build_payload(0, light=True)
+        sm._stage_pr_comment_fetch.assert_not_called()
+        sm._deliver_pr_comments.assert_not_called()
+
+    def test_the_worker_runs_the_staged_fetch(self):
+        sm = self.make_manager()
+        ran = threading.Event()
+        sm._fetch_pr_comments = lambda: ran.set()
+        sm._stage_pr_comment_fetch()
+        self.assertTrue(ran.wait(2))
+
+    def test_staging_never_raises_onto_the_beat(self):
+        # A Thread.start() blowing up (pids_limit, XERK-402) must be swallowed —
+        # this runs on the beat, the PID-1 main process with no retry.
+        sm = self.make_manager()
+        with mock.patch.object(ha.threading, "Thread",
+                               side_effect=RuntimeError("no threads")):
+            sm._stage_pr_comment_fetch()   # must not raise
+
+    def test_a_fetch_failing_keeps_the_worker_alive_for_the_next_beat(self):
+        sm = self.make_manager()
+        calls = []
+        first, second = threading.Event(), threading.Event()
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                first.set()
+                raise RuntimeError("boom")
+            second.set()
+
+        sm._fetch_pr_comments = flaky
+        with mock.patch.object(ha, "log"):
+            sm._stage_pr_comment_fetch()
+            self.assertTrue(first.wait(2))
+            # The same long-lived worker services a second stage despite the
+            # first fetch raising.
+            sm._pr_comments_wake.set()
+            self.assertTrue(second.wait(2))
+
+    def test_fetch_stages_events_and_deliver_applies_them(self):
+        # The split's end-to-end contract: the worker's fetch stages raw events
+        # keyed by session, and a later deliver applies the baseline/new-key
+        # logic against them, mutating prCommentBase.
+        sm = self.make_manager()
+        sm.github = {"available": True, "login": "botlogin", "repos": []}
+        url = "https://github.com/o/r/pull/9"
+        sess = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+                "worktreePath": os.path.join(self.tmp, "wt"),
+                "prCommentBase": {url: ["c1"]}}
+        sm.registry = [sess]
+        sm.session_pr_urls = {"s1": [url]}
+        events = [{"key": "c1", "author": "a", "body": "x", "kind": "comment",
+                   "loc": None, "is_self": False},
+                  {"key": "c2", "author": "a", "body": "rename it",
+                   "kind": "comment", "loc": None, "is_self": False}]
+        delivered = []
+        with mock.patch.object(ha, "_pr_comment_events", return_value=events):
+            sm._fetch_pr_comments()
+        # The fetch only STAGED — it did not touch prCommentBase.
+        self.assertEqual(sm._pr_comments_fetched, {"s1": {url: events}})
+        self.assertEqual(sess["prCommentBase"], {url: ["c1"]})
+        with mock.patch.object(sm, "notify_session",
+                               side_effect=lambda sid, msg: delivered.append(msg)):
+            sm._deliver_pr_comments()
+        # The deliver applied it: c2 reached the session, both keys baselined,
+        # and the staging was drained so a second deliver is a no-op.
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("rename it", delivered[0])
+        self.assertEqual(set(sess["prCommentBase"][url]), {"c1", "c2"})
+        self.assertEqual(sm._pr_comments_fetched, {})
+        sm._deliver_pr_comments()
+        self.assertEqual(len(delivered), 1)
+
+    def test_fetch_is_bounded_by_pr_comments_max_across_sessions(self):
+        # The cap is a total across all running sessions' PRs, so a fetch never
+        # makes more than PR_COMMENTS_MAX network calls per pass.
+        sm = self.make_manager()
+        sm.github = {"available": True, "login": "me", "repos": []}
+        sm.registry, sm.session_pr_urls = [], {}
+        for i in range(ha.PR_COMMENTS_MAX + 5):
+            sid = f"s{i}"
+            sm.registry.append({"id": sid, "status": "running",
+                                 "worktreePath": os.path.join(self.tmp, sid)})
+            sm.session_pr_urls[sid] = [f"https://github.com/o/r/pull/{i}"]
+        calls = []
+        with mock.patch.object(ha, "_pr_comment_events",
+                               side_effect=lambda u, l: calls.append(u) or []):
+            sm._fetch_pr_comments()
+        self.assertEqual(len(calls), ha.PR_COMMENTS_MAX)
 
 
 class TestPrStatus(unittest.TestCase):
