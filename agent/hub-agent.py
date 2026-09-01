@@ -13079,6 +13079,15 @@ class SessionManager:
         # or on a hub `refreshJira` command, reported every beat; stays the
         # empty shape on unconfigured hosts).
         self.jira = board_empty()
+        # _apply_triage stamps repoGuess/triage KEYS onto the ticket dicts in
+        # self.jira, and with the jira refresh off the beat (XERK-397) that
+        # stamping can run on the slow-refresh worker while the BEAT serializes
+        # those same ticket dicts in post(). CPython's C json encoder wouldn't
+        # crash on the concurrent key add/remove (no size-guard in PyDict_Next),
+        # but it could emit a half-applied chip for one beat. This lock makes
+        # _apply_triage's stamping and _jira_payload's snapshot-of-the-tickets
+        # mutually exclusive, so the beat serializes an independent copy.
+        self._jira_lock = threading.Lock()
         # Per-repo prune state (merged branches + safe worktrees swept), keyed by
         # repo name: queued/running while the worker is on it, then the summary
         # lingered briefly so the UI can show it. Written by the prune WORKER
@@ -13806,7 +13815,16 @@ class SessionManager:
         no-repo chip.
 
         A `manual` decision is the operator's own and reads identically apart from
-        the flag, which the board uses to say who chose."""
+        the flag, which the board uses to say who chose.
+
+        Holds `_jira_lock` while it mutates the ticket dicts: with the jira
+        refresh off the beat (XERK-397) this can run on the slow-refresh worker
+        while _jira_payload snapshots those same dicts for the beat's post(), so
+        the two must not overlap (see the lock's comment)."""
+        with self._jira_lock:
+            self._apply_triage_locked()
+
+    def _apply_triage_locked(self):
         site_key = self.jira.get("siteKey")
         by_name = {c["name"]: c for c in (self.triage_cands or [])}
         for t in self.jira.get("tickets") or []:
@@ -19992,7 +20010,19 @@ class SessionManager:
                  "nameWithOwner": c.get("nameWithOwner"),
                  "source": c.get("source")}
                 for c in (self.triage_cands or [])]
-        return dict(self.jira, repoOptions=opts)
+        # Copy the ticket dicts under _jira_lock so the beat serializes an
+        # INDEPENDENT snapshot (XERK-397): _apply_triage on the slow-refresh
+        # worker adds/removes repoGuess/triage keys on the live ticket dicts, and
+        # without this the beat's post() would json-serialize a dict being
+        # mutated on another thread. A shallow dict(t) suffices — _apply_triage
+        # REPLACES the repoGuess/triage values with fresh dicts rather than
+        # mutating them in place, so the copy's refs stay frozen.
+        with self._jira_lock:
+            block = dict(self.jira, repoOptions=opts)
+            tickets = self.jira.get("tickets")
+            if tickets:
+                block["tickets"] = [dict(t) for t in tickets]
+        return block
 
     def _stage_jira_issue(self, key):
         """Handle a {type:"jiraIssue"} command: fetch that issue's full detail
@@ -21723,9 +21753,13 @@ class SessionManager:
         top-level cache object (self.github/self.git_sources entries/self.jira)
         or key-mutates self.pr_status_cache in ways a concurrent .get() on the
         beat tolerates, and the beat never ITERATES a dict this worker grows or
-        shrinks. _apply_triage still runs on the beat too, but it only stamps
-        VALUES onto ticket dicts — never changing the tickets list's membership
-        — so it cannot collide with this worker's rebind of self.jira.
+        shrinks. _apply_triage is the one exception: it adds/removes repoGuess/
+        triage KEYS on the ticket dicts inside self.jira, and running here it can
+        do so while the beat serializes those same dicts in post(). That is why
+        _apply_triage and _jira_payload's ticket snapshot share _jira_lock — the
+        beat serializes an independent copy, never a dict this worker is
+        mutating. (Rebinds of self.jira itself never collide: the copy is frozen
+        the moment it is taken.)
 
         The wake is cleared BEFORE the due set is taken, mirroring the archive
         worker: a spurious extra loop (due already drained, event still set) is

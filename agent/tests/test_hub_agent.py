@@ -21393,6 +21393,34 @@ class TestSlowRefreshWorker(ManagerMixin, unittest.TestCase):
             sm._stage_slow_refresh("github", "pr")
         self.assertTrue(ran.wait(2))   # pr still ran despite github raising
 
+    def test_the_worker_jira_arm_gates_on_configured(self):
+        # "unset creds = zero tracker HTTP, ever" is a property of the AGENT, so
+        # the worker's jira arm re-checks board_configured even though the beat
+        # only stages jira when configured (defense in depth).
+        sm = self.make_manager()
+        sm.refresh_jira = mock.Mock()
+        with mock.patch.object(ha, "board_configured", return_value=False):
+            sm._refresh_jira_if_configured()
+        sm.refresh_jira.assert_not_called()
+        with mock.patch.object(ha, "board_configured", return_value=True):
+            sm._refresh_jira_if_configured()
+        sm.refresh_jira.assert_called_once_with()
+
+    def test_jira_payload_serializes_an_independent_ticket_snapshot(self):
+        # The beat serializes _jira_payload's output in post() while the worker's
+        # _apply_triage mutates the live ticket dicts (XERK-397). The payload must
+        # carry COPIES, not the live dicts, or post()'s json.dumps races the
+        # worker's key add/remove.
+        sm = self.make_manager()
+        sm.jira = {"configured": True, "siteKey": "s",
+                   "tickets": [{"key": "X-1"}]}
+        sm.triage_cands = []
+        block = sm._jira_payload()
+        self.assertIsNot(block["tickets"][0], sm.jira["tickets"][0])
+        # Mutating the live ticket after the snapshot must not touch the payload.
+        sm.jira["tickets"][0]["repoGuess"] = {"repo": "late"}
+        self.assertNotIn("repoGuess", block["tickets"][0])
+
 
 class TestPrStatus(unittest.TestCase):
     """The `gh pr view` status helpers: check-rollup classification, the compact
