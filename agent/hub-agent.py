@@ -198,6 +198,14 @@ CODING_AGENT_NAME = "Claude Code"
 # Where worktrees live: under a dot-dir so the repo scan never lists them, and
 # on the mounted tree so they survive a container restart.
 WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".turma", "worktrees")
+# Where an in-flight `git clone` writes before it is renamed into place
+# (XERK-374). A clone lands here — under the same .turma dot-dir scan_repos
+# skips, on the SAME filesystem as REPOS_ROOT so the final os.rename is atomic —
+# and only appears at REPOS_ROOT/<name> once it is complete and forkable. A clone
+# does not outlive its manager, so a restart mid-clone abandons a directory here
+# (never a half-repo under REPOS_ROOT that blocks a re-clone); _sweep_clone_tmp
+# reaps it at boot.
+CLONES_TMP_ROOT = os.path.join(REPOS_ROOT, ".turma", "clones")
 # Persisted session registry (survives container restart).
 REGISTRY_DIR = os.path.expanduser("~/.turma")
 REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
@@ -16709,16 +16717,17 @@ class SessionManager:
                                   f"nothing to fork a session from")
                     elif sess.get("awaitCloneOwner") and os.path.exists(
                             sess["repoPath"]):
-                        # No job of ours, but a directory: the clone was lost with
-                        # the manager that launched it (the native launcher runs
-                        # hub-agent.py as its managed foreground process, so
-                        # nothing of ours survives a restart). `clone()` refuses a
-                        # dest that exists, so nothing here can retry — say so in
-                        # one beat rather than spin the card out to the deadline.
-                        # Removing that directory is the operator's call, and the
-                        # cause is stated as the condition it actually is: after a
-                        # restart we cannot tell an aborted clone from an empty
-                        # repo, so this claims neither.
+                        # No job of ours, but a directory sits at the dest that is
+                        # not forkable. Since XERK-374 a clone stages under
+                        # .turma/clones and only renames into place complete, so
+                        # OUR own interrupted clones no longer land here (the
+                        # re-clone branch below handles them, and the boot sweep
+                        # reaps the staging dir) — what remains is a directory
+                        # Turma did not put there: a hand-run clone, a bare `git
+                        # init`, or a legacy partial from before that change.
+                        # `clone()` refuses a dest that exists, so nothing here
+                        # can retry — say so in one beat rather than spin the card
+                        # out to the deadline. Removing it is the operator's call.
                         self._set_error(
                             sess, f"{name} has no commit to fork from and "
                                   f"{sess['repoPath']} already exists, so a "
@@ -22345,14 +22354,21 @@ class SessionManager:
             src = "github"
             name = repo_id.split("/")[1]
             url = f"https://github.com/{repo_id}.git"
+        dest = os.path.join(REPOS_ROOT, name)
+        # Clone into a private staging dir and rename into place only once it is
+        # complete (XERK-374). REPOS_ROOT/<name> therefore only ever appears as a
+        # finished repo — never the `.git`-with-unborn-HEAD half-clone a restart
+        # mid-clone used to strand, which scan_repos still listed, no session
+        # could fork from, and clone() itself refused to re-clone over. The tmp
+        # dir carries the pid so two clones of the same repo can't collide on it.
+        tmp = os.path.join(CLONES_TMP_ROOT, f"{slugify(name)}-{os.getpid()}")
         job = {
             "name": name, "repo": repo_id, "status": "cloning", "error": None,
             "source": src, "startedAt": now_iso(), "startedMono": time.time(),
-            "proc": None, "logf": None,
+            "proc": None, "logf": None, "dest": dest, "tmp": tmp,
             "logPath": os.path.join(REGISTRY_DIR, f"clone-{slugify(name)}.log"),
         }
         self.clones[name] = job
-        dest = os.path.join(REPOS_ROOT, name)
         if os.path.exists(dest):
             job["status"] = "error"
             job["error"] = f"'{name}' already exists under the repos root"
@@ -22367,6 +22383,11 @@ class SessionManager:
             env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
+            os.makedirs(CLONES_TMP_ROOT, exist_ok=True)
+            # A leftover tmp from an interrupted clone of THIS repo would make git
+            # refuse a non-empty target; the boot sweep normally clears it, but a
+            # same-name retry within one manager's life could still meet it.
+            shutil.rmtree(tmp, ignore_errors=True)
             logf = open(job["logPath"], "w")
             proc = subprocess.Popen(
                 # `--progress` because stdout is a FILE, not a terminal, and
@@ -22375,7 +22396,7 @@ class SessionManager:
                 # bytes for ArgoCD, measured — so the UI has nothing to show
                 # while a clone runs and a big one looks indistinguishable from
                 # a hang.
-                ["git", "clone", "--progress", "--", url, dest],
+                ["git", "clone", "--progress", "--", url, tmp],
                 stdout=logf, stderr=subprocess.STDOUT, env=env,
             )
         except Exception as e:
@@ -22386,7 +22407,7 @@ class SessionManager:
             return
         job["proc"] = proc
         job["logf"] = logf
-        log(f"cloning {repo_id} ({src}) into {dest}")
+        log(f"cloning {repo_id} ({src}) into {tmp} -> {dest}")
 
     def _clone_progress(self, job):
         """The most recent line git wrote, for the UI's cloning row.
@@ -22441,7 +22462,36 @@ class SessionManager:
         if status == "done":
             log(f"cloned {job['repo']} -> {job['name']}")
         else:
+            # A failed clone's staging dir is disposable and ours (XERK-374) —
+            # remove it so it doesn't accumulate under .turma/clones or block a
+            # retry of the same repo within this manager's life. A "done" job
+            # already moved its tmp into place (_promote_clone), so there is
+            # nothing to remove there.
+            tmp = job.get("tmp")
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
             log(f"clone failed for {job['repo']}: {job.get('error')}")
+
+    def _promote_clone(self, job):
+        """Atomically move a finished clone from its staging dir into place under
+        REPOS_ROOT (XERK-374). Returns None on success, or an operator-facing
+        error string. tmp and dest are on the same filesystem (both under
+        REPOS_ROOT), so the rename is atomic: REPOS_ROOT/<name> never exists as a
+        partial repo. A dest that appeared meanwhile (a hand-run clone, a manual
+        mkdir) is NOT clobbered — the staged clone is dropped and the collision
+        reported, the same refusal clone() gives on entry."""
+        tmp, dest = job.get("tmp"), job.get("dest")
+        if not tmp or not dest:
+            return "clone staging path missing"
+        if os.path.exists(dest):
+            shutil.rmtree(tmp, ignore_errors=True)
+            return f"'{job['name']}' appeared under the repos root during its clone"
+        try:
+            os.rename(tmp, dest)
+        except OSError as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return f"could not move the finished clone into place: {e}"
+        return None
 
     def _cloning(self, repo_name):
         """Whether a clone THIS manager launched is running for <repo_name>. The
@@ -22466,8 +22516,16 @@ class SessionManager:
                             pass
                         self._finish_clone(job, "error", "clone timed out")
                     continue
-                if rc == 0 and os.path.isdir(os.path.join(REPOS_ROOT, name, ".git")):
-                    self._finish_clone(job, "done", None)
+                tmp = job.get("tmp") or ""
+                if rc == 0 and os.path.isdir(os.path.join(tmp, ".git")):
+                    # Move the staging dir into place before calling it done — a
+                    # failed rename is a failed clone, not a repo the drain will
+                    # then try to fork from an empty dir (XERK-374).
+                    err = self._promote_clone(job)
+                    if err:
+                        self._finish_clone(job, "error", err)
+                    else:
+                        self._finish_clone(job, "done", None)
                 else:
                     self._finish_clone(
                         job, "error",
@@ -22477,6 +22535,36 @@ class SessionManager:
             linger = CLONE_DONE_LINGER_SEC if job.get("status") == "done" else CLONE_ERROR_LINGER_SEC
             if now - job.get("finishedMono", job.get("startedMono", now)) > linger:
                 self.clones.pop(name, None)
+
+    def _sweep_clone_tmp(self):
+        """Remove staging dirs left by clones that didn't finish (XERK-374).
+
+        A clone does not outlive its manager — the native launcher runs
+        hub-agent.py as its managed foreground process, so a restart takes the
+        `git clone` child with it. What survives is the staging dir under
+        .turma/clones, invisible to scan_repos and never renamed into place, so
+        it strands no repo — but it would accumulate. Called at boot, where any
+        such dir is unambiguously an abandoned clone of ours: nothing is in
+        flight yet (clones don't survive the restart), and the dir lives under
+        the agent-owned .turma tree, not the operator's REPOS_ROOT/<repo>. A
+        live job's tmp (there is none at boot, but be safe on any later call) is
+        never touched. Best-effort; never raises onto the caller."""
+        try:
+            entries = os.listdir(CLONES_TMP_ROOT)
+        except OSError:
+            return  # not created yet, or unreadable — nothing to sweep
+        live = {j.get("tmp") for j in self.clones.values()}
+        for entry in entries:
+            path = os.path.join(CLONES_TMP_ROOT, entry)
+            if path in live:
+                continue
+            try:
+                if not os.path.isdir(path):
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+                log(f"clone: swept abandoned staging dir {path}")
+            except Exception as e:
+                log(f"clone: sweep of {path} failed: {e}")
 
     def _clones_payload(self):
         """Serializable view of clone jobs for the heartbeat (no Popen/file)."""
@@ -23607,6 +23695,11 @@ class SessionManager:
         # nothing is waiting on. Reaped here so a crash mid-probe can't leave one
         # sitting until the next probe happens to be due.
         self._kill_limits_probe()
+        # A clone the previous manager was running died with it, leaving only its
+        # staging dir under .turma/clones (XERK-374) — reap it so those don't
+        # accumulate. Never a half-repo under REPOS_ROOT, which is the whole
+        # point of staging: the drain re-clones cleanly instead of dead-ending.
+        self._sweep_clone_tmp()
         self.save()
 
     # --- command handling (heartbeat reply) -------------------------------
