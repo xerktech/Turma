@@ -13037,6 +13037,28 @@ class SessionManager:
         self._archive_pass_at = None
         self._archive_progress_at = 0.0
         self._archive_stall_logged_at = -3600.0
+        # Slow-cadence cache refreshes (github/git-sources, jira, pr status) run
+        # on their OWN worker thread, never the beat (XERK-397). Each is a loop
+        # of network calls bounded only by a per-call timeout — refresh_pr_status
+        # alone is PR_STATUS_MAX × run()'s 15s = 300s worst case — and the beat
+        # is the only thing that tells the hub this host is alive
+        # (OFFLINE_AFTER_MS = 75s), so a lossy link flapped a healthy host
+        # offline. Same precedent as prune (XERK-256) and archive sync
+        # (XERK-395). The beat STAGES which kinds are due and wakes the worker;
+        # the worker owns running them, making it the SINGLE writer of
+        # self.github/self.git_sources/self.jira/self.pr_status_cache — which is
+        # what keeps the beat's reads of those caches safe without a lock (see
+        # _slow_refresh_worker_loop).
+        self._slow_lock = threading.Lock()
+        self._slow_wake = threading.Event()
+        self._slow_worker = None
+        self._slow_due = set()
+        # spawn_failures (XERK-265) gained an OFF-BEAT writer with XERK-397: a
+        # migration export now runs on its own thread and stages any refusal via
+        # _refuse_start. This lock makes that append safe against the beat's
+        # snapshot-into-payload and deliver-and-clear, so a refusal appended
+        # mid-beat can't be cleared without being sent.
+        self._spawn_failures_lock = threading.Lock()
         # GitHub clone-into-root state: the cached availability/repo-list block
         # (refreshed on a slow cadence, reported every beat) and in-flight/recent
         # clone jobs keyed by dest name (the Popen lives here; only a serializable
@@ -13057,6 +13079,15 @@ class SessionManager:
         # or on a hub `refreshJira` command, reported every beat; stays the
         # empty shape on unconfigured hosts).
         self.jira = board_empty()
+        # _apply_triage stamps repoGuess/triage KEYS onto the ticket dicts in
+        # self.jira, and with the jira refresh off the beat (XERK-397) that
+        # stamping can run on the slow-refresh worker while the BEAT serializes
+        # those same ticket dicts in post(). CPython's C json encoder wouldn't
+        # crash on the concurrent key add/remove (no size-guard in PyDict_Next),
+        # but it could emit a half-applied chip for one beat. This lock makes
+        # _apply_triage's stamping and _jira_payload's snapshot-of-the-tickets
+        # mutually exclusive, so the beat serializes an independent copy.
+        self._jira_lock = threading.Lock()
         # Per-repo prune state (merged branches + safe worktrees swept), keyed by
         # repo name: queued/running while the worker is on it, then the summary
         # lingered briefly so the UI can show it. Written by the prune WORKER
@@ -13784,7 +13815,16 @@ class SessionManager:
         no-repo chip.
 
         A `manual` decision is the operator's own and reads identically apart from
-        the flag, which the board uses to say who chose."""
+        the flag, which the board uses to say who chose.
+
+        Holds `_jira_lock` while it mutates the ticket dicts: with the jira
+        refresh off the beat (XERK-397) this can run on the slow-refresh worker
+        while _jira_payload snapshots those same dicts for the beat's post(), so
+        the two must not overlap (see the lock's comment)."""
+        with self._jira_lock:
+            self._apply_triage_locked()
+
+    def _apply_triage_locked(self):
         site_key = self.jira.get("siteKey")
         by_name = {c["name"]: c for c in (self.triage_cands or [])}
         for t in self.jira.get("tickets") or []:
@@ -14357,7 +14397,11 @@ class SessionManager:
                            if s in live_slugs}
 
     def _find(self, sid):
-        return next((s for s in self.registry if s.get("id") == sid), None)
+        # list() snapshots the registry in one C-level step so this is safe to
+        # call from an off-beat worker (the migration export thread, XERK-397)
+        # while the beat appends/removes sessions — a bare generator over
+        # self.registry would raise "changed size during iteration".
+        return next((s for s in list(self.registry) if s.get("id") == sid), None)
 
     def _new_id(self):
         existing = {s.get("id") for s in self.registry}
@@ -17144,16 +17188,20 @@ class SessionManager:
         log(f"{context} refused: {reason}")
         if not cmd_id and not migration_id:
             return
-        self.spawn_failures.append({
-            "cmdId": cmd_id,
-            "migrationId": migration_id,
-            # Truncated for the same reason _set_error truncates errorMsg: a
-            # reason can carry an exception's text, and this one rides the beat
-            # into a hub cache that counts against the record ceiling.
-            "error": reason[:SPAWN_FAILURE_REASON_MAX],
-            "at": now_iso(),
-        })
-        del self.spawn_failures[:-SPAWN_FAILURES_MAX]
+        # Lock-guarded: a migration export refuses from its OWN thread now
+        # (XERK-397), so this append races the beat's snapshot/clear of the same
+        # list (post()). Under the lock a refusal is never lost.
+        with self._spawn_failures_lock:
+            self.spawn_failures.append({
+                "cmdId": cmd_id,
+                "migrationId": migration_id,
+                # Truncated for the same reason _set_error truncates errorMsg: a
+                # reason can carry an exception's text, and this one rides the
+                # beat into a hub cache that counts against the record ceiling.
+                "error": reason[:SPAWN_FAILURE_REASON_MAX],
+                "at": now_iso(),
+            })
+            del self.spawn_failures[:-SPAWN_FAILURES_MAX]
 
     def _resume_at_cwd(self, transcript_id, cwd, *, cmd_id=None, extra=None,
                        migration_id=None):
@@ -17300,6 +17348,30 @@ class SessionManager:
             return None
 
     # --- session migration across hosts (XERK-101) ------------------------
+
+    def _export_session_async(self, session_id, migration_id):
+        """Run export_session (transcript pack + blob upload) on its OWN thread,
+        never the beat (XERK-397). The upload retries a busy hub — 3 × 30s plus
+        backoff ≈ 96s worst case — and it dispatches from handle_commands, on the
+        heartbeat loop, so inline it could stall the beat past OFFLINE_AFTER_MS
+        and flap the host offline mid-migration. Off the beat, the host keeps
+        heartbeating while the bundle uploads.
+
+        A refusal still reaches the hub: export_session stages every failure via
+        _refuse_start (XERK-265), whose spawn_failures append is lock-guarded so
+        a refusal raised on this thread can't be lost against the beat's
+        deliver-and-clear. A failed Thread.start() (pids_limit, XERK-402) is
+        caught and refused synchronously HERE — on the beat, which is safe — so
+        the move learns why instead of sitting in `exporting` until
+        MIGRATE_TIMEOUT_MS. Fire-and-forget: migrations are single-flight per
+        session hub-side, so no tracking/join is needed."""
+        try:
+            threading.Thread(
+                target=self.export_session, args=(session_id, migration_id),
+                name="migration-export", daemon=True).start()
+        except Exception as e:
+            self._refuse_start(f"could not start the export worker: {e}",
+                               migration_id=migration_id, context="exportSession")
 
     def export_session(self, session_id, migration_id):
         """Source half of a migration: snapshot this running session's raw
@@ -17732,6 +17804,9 @@ class SessionManager:
     # the same bytes again would be refused the same way.
     MIGRATION_UPLOAD_ATTEMPTS = 3
     MIGRATION_UPLOAD_BACKOFF_SEC = 2
+    # Per-attempt socket timeout. Named so TestBeatLoopBudget can assert WHY the
+    # export runs off the beat: ATTEMPTS × this ≈ the worst-case blocking time.
+    MIGRATION_UPLOAD_TIMEOUT_SEC = 30
 
     def _migration_upload(self, migration_id, blob):
         """POST a transcript bundle to the hub's migration relay (octet-stream,
@@ -17757,7 +17832,8 @@ class SessionManager:
             try:
                 req = urllib.request.Request(url, data=blob, headers=headers,
                                              method="POST")
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                with urllib.request.urlopen(
+                        req, timeout=self.MIGRATION_UPLOAD_TIMEOUT_SEC) as resp:
                     resp.read()
                 log(f"migration {migration_id}: uploaded {len(blob)} bytes")
                 return True
@@ -19937,7 +20013,19 @@ class SessionManager:
                  "nameWithOwner": c.get("nameWithOwner"),
                  "source": c.get("source")}
                 for c in (self.triage_cands or [])]
-        return dict(self.jira, repoOptions=opts)
+        # Copy the ticket dicts under _jira_lock so the beat serializes an
+        # INDEPENDENT snapshot (XERK-397): _apply_triage on the slow-refresh
+        # worker adds/removes repoGuess/triage keys on the live ticket dicts, and
+        # without this the beat's post() would json-serialize a dict being
+        # mutated on another thread. A shallow dict(t) suffices — _apply_triage
+        # REPLACES the repoGuess/triage values with fresh dicts rather than
+        # mutating them in place, so the copy's refs stay frozen.
+        with self._jira_lock:
+            block = dict(self.jira, repoOptions=opts)
+            tickets = self.jira.get("tickets")
+            if tickets:
+                block["tickets"] = [dict(t) for t in tickets]
+        return block
 
     def _stage_jira_issue(self, key):
         """Handle a {type:"jiraIssue"} command: fetch that issue's full detail
@@ -21620,6 +21708,96 @@ class SessionManager:
             # _warn_if_archive_pass_stalled draws.
             self._note_archive_progress()
 
+    # --- Slow-cadence cache refreshes, off the beat (XERK-397) ------------
+
+    # The slow refreshes, and the method each runs. The worker dispatches on
+    # these names; the beat and the manual refreshJira command stage them.
+    _SLOW_REFRESHERS = ("github", "jira", "pr")
+
+    def _stage_slow_refresh(self, *kinds):
+        """Mark one or more slow refreshes due and wake the worker (XERK-397).
+        Called from the beat (on each cadence) and the manual refreshJira
+        command. Jobs COALESCE — a kind already staged or mid-run is simply
+        re-run next loop, so a host pushing slower than the cadence never
+        queues a backlog aimed at work the next beat supersedes.
+
+        MUST NOT raise onto the beat: this runs on the heartbeat loop, the
+        agent's PID-1 main process with no retry, so an exception here is the
+        host and every session on it going down. Thread.start() raising
+        RuntimeError at the pids_limit (XERK-402) is the realistic way that
+        happens; a failed start leaves the kinds staged and a dead worker whose
+        is_alive() is False, so the next beat retries — the same shape as
+        queue_archive_sync."""
+        try:
+            with self._slow_lock:
+                self._slow_due.update(kinds)
+                worker = self._slow_worker
+                if worker is None or not worker.is_alive():
+                    worker = threading.Thread(
+                        target=self._slow_refresh_worker_loop,
+                        name="slow-refresh", daemon=True)
+                    self._slow_worker = worker
+                    worker.start()
+            self._slow_wake.set()
+        except Exception as e:
+            log(f"slow refresh could not be staged: {type(e).__name__}: {e}")
+
+    def _slow_refresh_worker_loop(self):
+        """Run the staged slow refreshes, then wait for the beat to stage more.
+
+        Long-lived like the archive worker (a job arrives on every slow beat),
+        and daemon / never joined on shutdown for the same reason: each refresh
+        is a best-effort cache the next beat re-derives, so a pass cut short by
+        a restart costs nothing, whereas waiting out an in-flight 15s call would
+        put the very stall this moved off the beat back onto shutdown.
+
+        This is the SINGLE writer of the three caches, which is what makes the
+        beat's reads of them safe without a lock: each refresh REBINDS its
+        top-level cache object (self.github/self.git_sources entries/self.jira)
+        or key-mutates self.pr_status_cache in ways a concurrent .get() on the
+        beat tolerates, and the beat never ITERATES a dict this worker grows or
+        shrinks. _apply_triage is the one exception: it adds/removes repoGuess/
+        triage KEYS on the ticket dicts inside self.jira, and running here it can
+        do so while the beat serializes those same dicts in post(). That is why
+        _apply_triage and _jira_payload's ticket snapshot share _jira_lock — the
+        beat serializes an independent copy, never a dict this worker is
+        mutating. (Rebinds of self.jira itself never collide: the copy is frozen
+        the moment it is taken.)
+
+        The wake is cleared BEFORE the due set is taken, mirroring the archive
+        worker: a spurious extra loop (due already drained, event still set) is
+        absorbed by the empty-set pass, but a job staged while a pass runs is
+        never dropped."""
+        handlers = {
+            "github": self.refresh_github,
+            "jira": self._refresh_jira_if_configured,
+            "pr": self.refresh_pr_status,
+        }
+        while True:
+            self._slow_wake.wait()
+            self._slow_wake.clear()
+            with self._slow_lock:
+                due, self._slow_due = self._slow_due, set()
+            # Fixed order so a re-triage reading the gh candidate list (jira)
+            # sees the freshest github sweep within a single drained batch.
+            for kind in self._SLOW_REFRESHERS:
+                if kind not in due:
+                    continue
+                try:
+                    handlers[kind]()
+                except Exception as e:
+                    # Each refresh already fails soft internally; this is the
+                    # backstop that keeps one kind's failure from skipping the
+                    # rest, and keeps the worker alive for the next beat.
+                    log(f"slow refresh {kind} failed: {e}")
+
+    def _refresh_jira_if_configured(self):
+        """The worker's jira arm. The configured() re-check keeps 'unset creds =
+        zero tracker HTTP, ever' a property of the AGENT, not just of where the
+        beat stages from — matching the manual refreshJira command's own gate."""
+        if board_configured():
+            self.refresh_jira()
+
     # --- GitHub clone-into-root -------------------------------------------
 
     def refresh_github(self):
@@ -21717,9 +21895,13 @@ class SessionManager:
     def refresh_pr_status(self):
         """Refresh cached state + CI checks for the PRs live sessions opened, via
         `gh pr view`. Slow-ish cadence, best-effort; skipped when gh has no
-        login. Only RUNNING sessions' PRs are re-polled (bounded by
-        PR_STATUS_MAX so a host with many PRs never stalls the beat), but a
-        stopped session keeps its last-known status — cache entries are pruned
+        login. **Runs on the slow-refresh WORKER, never the beat** (XERK-397):
+        PR_STATUS_MAX sequential `gh pr view`s, each bounded only by run()'s
+        15s, is a 300s worst case — four times OFFLINE_AFTER_MS. Only RUNNING
+        sessions' PRs are re-polled (PR_STATUS_MAX bounds the COUNT of PRs a
+        pass touches, NOT its time — moving it off the beat is what keeps that
+        count from stalling the heartbeat), but a stopped session keeps its
+        last-known status — cache entries are pruned
         only when NO session (running or not) references them anymore, so a
         killed session's card still shows the merged/closed state it reached.
 
@@ -23477,7 +23659,7 @@ class SessionManager:
                     self.resume_transcript(
                         cmd.get("transcriptId"), cmd.get("cwd"), cmd_id=cid)
                 elif ctype == "exportSession":
-                    self.export_session(
+                    self._export_session_async(
                         cmd.get("sessionId"), cmd.get("migrationId"))
                 elif ctype == "importSession":
                     self.import_session(cmd)
@@ -23544,12 +23726,14 @@ class SessionManager:
                     # (the hub already targets configured hosts) keeps the
                     # "unset env = zero Jira HTTP calls, ever" guarantee a
                     # property of the agent rather than of hub-side targeting.
-                    # Runs inline like the scheduled poll it short-circuits, so
-                    # it costs the beat exactly what that poll already does, and
-                    # handle_commands' immediate follow-up beat carries the
-                    # fresh block straight back.
+                    # STAGES onto the slow-refresh worker rather than polling
+                    # inline (XERK-397) — a manual refresh is the same
+                    # network-bound board fetch as the scheduled one and must
+                    # not stall the beat either; keeping it on the worker also
+                    # keeps that worker the single writer of self.jira. The
+                    # fresh block rides a later beat once the worker publishes.
                     if board_configured():
-                        self.refresh_jira()
+                        self._stage_slow_refresh("jira")
                 elif ctype == "restartAgent":
                     # The dashboard's "Restart agent" button (XERK-157). We only
                     # arm a flag here — the actual exit happens in run_forever
@@ -24376,14 +24560,26 @@ class SessionManager:
                     not light and _usage_slot(sid) == slot):
                 self._refresh_usage(sid, s["worktreePath"])
 
-        # GitHub availability/repo list refreshes on its own slow cadence (a few
-        # gh calls); clone jobs are reaped every beat (cheap poll()s).
-        if not light and beat % GITHUB_REFRESH_EVERY == 0:
-            self.refresh_github()
-        # Assigned tickets (Jira or Azure DevOps) on their own slow cadence; the
-        # configured() guard keeps unconfigured hosts at zero board HTTP calls forever.
-        if not light and beat % JIRA_REFRESH_EVERY == 0 and board_configured():
-            self.refresh_jira()
+        # The slow cache refreshes — github availability/repo list, assigned
+        # tickets, and PR state/CI below — do NOT run here (XERK-397). Each is a
+        # loop of network calls bounded only by a per-call timeout, and inline a
+        # lossy link or slow gh stalled the beat past OFFLINE_AFTER_MS and
+        # flapped a healthy host offline (the same class as XERK-395's archive
+        # sync). The beat only STAGES which are due and wakes the slow-refresh
+        # worker, which owns running them and publishing the caches this payload
+        # reads. One beat may be stale — the accepted trade for never stalling
+        # the heartbeat. The configured() gate keeps an unconfigured host at zero
+        # board HTTP; clone jobs are still reaped every beat (cheap poll()s).
+        if not light:
+            due = []
+            if beat % GITHUB_REFRESH_EVERY == 0:
+                due.append("github")
+            if beat % JIRA_REFRESH_EVERY == 0 and board_configured():
+                due.append("jira")
+            if beat % PR_STATUS_REFRESH_EVERY == 0:
+                due.append("pr")
+            if due:
+                self._stage_slow_refresh(*due)
         # Ticket -> repo triage and ticket ASSESSMENT (XERK-482). Attempted every
         # beat rather than on the slow jira cadence: it's one batch in flight at a
         # time, so a freshly-polled board would otherwise take an hour of 10-minute
@@ -24401,17 +24597,16 @@ class SessionManager:
                 self._start_ticket_triage()
             except Exception as e:
                 log(f"jira triage failed: {e}")
-        # PR state + CI checks for the links live sessions opened, on a faster
-        # cadence than the github block so a card's merge/CI status stays live.
+        # PR consumers, on the same cadence refresh_pr_status is staged above.
+        # refresh_pr_status itself runs on the slow-refresh worker now
+        # (XERK-397), so these read the pr_status_cache it PUBLISHED — up to a
+        # beat stale rather than "just fetched", the accepted trade for keeping
+        # the gh sweep off the heartbeat. They stay on the beat because each
+        # MUTATES session records (and calls save()), which is the beat's to own.
         if not light and beat % PR_STATUS_REFRESH_EVERY == 0:
-            try:
-                self.refresh_pr_status()
-            except Exception as e:
-                log(f"pr status refresh failed: {e}")
-            # A PR that just came back CONFLICTING is told to the session that
-            # opened it (XERK-223) — same beat, off the status we just fetched,
-            # so no extra call. Wrapped separately: a nudge failing must not
-            # cost the refresh above, nor take the host's sessions down.
+            # A PR that came back CONFLICTING is told to the session that opened
+            # it (XERK-223), off the cached status. Wrapped: a nudge failing must
+            # not take the host's sessions down.
             try:
                 self._poll_pr_conflicts()
             except Exception as e:
@@ -24625,7 +24820,12 @@ class SessionManager:
         if self.ticket_link_results:
             payload["ticketLinkResults"] = list(self.ticket_link_results)
         if self.spawn_failures:
-            payload["spawnFailures"] = list(self.spawn_failures)
+            # Snapshotted under the lock the export thread's _refuse_start
+            # appends under (XERK-397): post() removes exactly these delivered
+            # entries by identity, so a refusal appended between here and the
+            # clear survives to the next beat.
+            with self._spawn_failures_lock:
+                payload["spawnFailures"] = list(self.spawn_failures)
         # Archive sync manifest on the slow cadence: the inactive transcripts the
         # hub could pull. Remember it by id so the reply's archiveHave cursors map
         # back to each one for the delta push (in run_forever).
@@ -24709,7 +24909,16 @@ class SessionManager:
             self.create_ticket_results.clear()  # delivered — same lifecycle
             self.ticket_priority_results.clear()  # delivered — same lifecycle
             self.ticket_link_results.clear()  # delivered — same lifecycle
-            self.spawn_failures.clear()  # delivered — same lifecycle
+            # spawn_failures has an OFF-BEAT writer (the migration export thread,
+            # XERK-397), so it can't blanket-clear like the beat-only lists
+            # above: remove only the entries THIS payload delivered, by identity,
+            # leaving any the thread appended since the snapshot for the next beat.
+            staged = payload.get("spawnFailures")
+            if staged:
+                delivered = {id(x) for x in staged}
+                with self._spawn_failures_lock:
+                    self.spawn_failures[:] = [
+                        x for x in self.spawn_failures if id(x) not in delivered]
             return reply if isinstance(reply, dict) else {}
         except urllib.error.HTTPError as e:
             # urllib stringifies an HTTPError to just its status line and throws

@@ -244,12 +244,22 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - Inline may cost `INTERVAL` plus the beat's own POSTs (`HEARTBEAT_TIMEOUT_SEC`, twice on a cycle
     that executed commands) — 40s of the 75s. Anything else with a network or disk worst case belongs
     on a worker, as archive sync and `prune` (XERK-256) were moved.
-  - **It is the rule for new work, and NOT yet true everywhere** — say so rather than reading it as a
-    description. Still inline and still over: `refresh_pr_status` (`PR_STATUS_MAX` x `run()`'s 15s),
-    `refresh_jira`, `refresh_github`
-    (all in `build_payload`), and `_migration_upload` under `handle_commands`. **XERK-397** carries
-    them; a fix there extends `TestBeatLoopBudget` rather than adding its own pin.
-  - Tests: `TestBeatLoopBudget`, `TestArchiveSyncWorker`.
+  - The slow-cadence cache refreshes are OFF the beat too (XERK-397): `refresh_github`,
+    `refresh_jira`, `refresh_pr_status` run on ONE shared **slow-refresh worker** — the beat only
+    STAGES which are due (`_stage_slow_refresh`) and reads the caches it publishes. That worker is the
+    SINGLE writer of `self.github`/`self.git_sources`/`self.jira`/`self.pr_status_cache`, which is
+    what keeps the beat's reads of them lock-free: each refresh REBINDS its top-level cache object, or
+    key-mutates `pr_status_cache` in a way a beat `.get()` tolerates, and the beat never ITERATES a
+    dict the worker grows or shrinks. The manual `refreshJira` command stages the same worker, never
+    polls inline. A migration `export_session` (with its ≈96s `_migration_upload` retry) runs on its
+    OWN thread (`_export_session_async`); its refusal still reaches the hub because the
+    `spawn_failures` append is lock-guarded and `post()` clears only the entries THIS payload
+    delivered, by identity, so a refusal appended mid-beat is never lost.
+  - **The PR-COMMENT poller is still an inline violator, tracked separately** — `_poll_pr_comments`
+    fetches `gh`/API comment activity on the beat (PR_COMMENTS_MAX per beat), same class as
+    `refresh_pr_status`, but it MUTATES session records (so it cannot ride the worker) and the fix is
+    a fetch/deliver split, not a move. Not folded into XERK-397; filed as its own ticket.
+  - Tests: `TestBeatLoopBudget`, `TestSlowRefreshWorker`, `TestArchiveSyncWorker`.
 - **`readyForReview` has FOUR mirrors that must agree**: `turma/public/sessions.html`,
   `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`. Changing the rule means
   changing all four.
