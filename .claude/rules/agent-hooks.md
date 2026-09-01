@@ -58,6 +58,16 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     blanket deny is necessary but NOT sufficient for a session's own auto-memory — keep the
     `projects/` hole open anyway (costs nothing; `test_matcher_oracle.py` reports if a future release
     lifts the gate).
+  - **That gate is ANCHORED to `~/.claude`, not structural on memory dirs** (XERK-315, measured on
+    2.1.258): the SAME allow-rule shape refused inside (`Edit(~/.claude/projects/**)`) LANDS the write
+    once the target is relocated OUT of the config dir (`Edit(~/.turma/session-memory/**)`, `auto`).
+    So the documented **`autoMemoryDirectory`** setting pointed outside `~/.claude` + an allow rule is
+    a VIABLE fix for session auto-memory under `auto`. **Deliberately NOT adopted** (XERK-315
+    decision): `autoMemoryDirectory`'s per-project separation is unverified — a flat shared dir would
+    bleed one repo's memory into every session on the host (this carve-out is already fleet-wide
+    readable) — the per-worktree slug still churns so it would not restore durable repo knowledge, and
+    committed `.claude/rules/*.md` stays the substitute. Pinned by
+    `test_the_projects_gate_is_anchored_to_the_claude_dir` (bypassPermissions stays the only way in).
   - **A hook, not a pattern, because glob attempts fail three ways**: too big (matches the
     `agent-memory` carve-out too), too small (misses `shell-snapshots/`, sourced on every Bash call —
     RCE across sessions), and can't track a growing vendor directory set. Do not go back to patterns.
