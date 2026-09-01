@@ -1291,6 +1291,12 @@ try {
   for (const key of dropUnusableHostKeys(agents)) {
     console.warn(`dropping restored agent under unusable device name ${hostKeyLabel(key)}`);
   }
+  // A non-object record (a torn write leaving `"host":null` as valid JSON) is
+  // dropped BEFORE anything below iterates it — every per-field guard passes it
+  // through, and serializing it later empties the whole fleet (XERK-297).
+  for (const key of dropNonObjectRecords(agents)) {
+    console.warn(`dropping restored agent with a non-object record under ${hostKeyLabel(key)}`);
+  }
   for (const a of Object.values(agents)) normalizeRecord(a);
   // A RESTORED command cannot be proven undelivered (XERK-303), so it is stamped
   // as delivered here. `deliveredAt` is written when the reply hands the command
@@ -1363,9 +1369,22 @@ function scheduleSave() {
     // not (XERK-235).
     const blob = serializeAgentsForSave();
     if (blob === null) return;
+    // Write to a sibling temp file then rename over STATE_FILE (XERK-297). rename
+    // is atomic within a filesystem, so a reader (this hub's own next-boot
+    // restore) sees either the whole old file or the whole new one — never a
+    // half-written blob left as valid-but-null-ish JSON, which was how a torn
+    // record arose in the first place. The temp file is in the SAME directory so
+    // the rename stays same-filesystem; PID-tagged so two writers can't collide.
     fs.mkdir(path.dirname(STATE_FILE), { recursive: true }, () => {
-      fs.writeFile(STATE_FILE, blob, (err) => {
-        if (err) console.error(`state save failed: ${err.message}`);
+      const tmp = `${STATE_FILE}.tmp-${process.pid}`;
+      fs.writeFile(tmp, blob, (err) => {
+        if (err) { console.error(`state save failed: ${err.message}`); return; }
+        fs.rename(tmp, STATE_FILE, (rerr) => {
+          if (rerr) {
+            console.error(`state save failed: ${rerr.message}`);
+            fs.unlink(tmp, () => {});
+          }
+        });
       });
     });
   }, 30 * 1000);
@@ -2489,6 +2508,18 @@ function buildAgentsCache() {
 // PRUNE_AFTER_MS. Serving the last good payload (or an empty fleet) keeps the
 // UI alive and puts the reason in the log (XERK-235).
 let lastGoodAgentsCache = null;
+// The `error` for the empty-fleet body served when serialization fails AND no
+// last-good cache exists to fall back on. Name the failure by its CLASS
+// (XERK-297): only V8's ~512 MiB string ceiling is genuinely a size problem (a
+// RangeError); any other throw — e.g. the TypeError a malformed record produces
+// (`Cannot read properties of null`) — is NOT about size, and the blanket
+// "payload too large" sent whoever debugged it hunting AGENT_RECORD_MAX, which is
+// not involved. The full `e.message` is in the console.error line either way;
+// pure + exported so the classification is tested without nulling the cache.
+function degradedAgentsError(e) {
+  return e instanceof RangeError ? "payload too large"
+    : "agents payload could not be serialized";
+}
 function safeAgentsCache() {
   try {
     return buildAgentsCache();
@@ -2499,7 +2530,7 @@ function safeAgentsCache() {
     // remembered separately or this branch is dead and every host vanishes from
     // the dashboard, which is a more alarming failure than the one it replaces.
     if (lastGoodAgentsCache) return lastGoodAgentsCache;
-    const body = JSON.stringify({ now: Date.now(), agents: [], error: "payload too large" });
+    const body = JSON.stringify({ now: Date.now(), agents: [], error: degradedAgentsError(e) });
     return { body, etag: '"' + crypto.createHash("sha1").update(body).digest("base64") + '"' };
   }
   return agentsCache;
@@ -5109,6 +5140,34 @@ function dropUnusableHostKeys(store) {
   if (!store || typeof store !== "object" || Array.isArray(store)) return dropped;
   for (const key of Object.keys(store)) {
     if (isPlainHostKey(key)) continue;
+    dropped.push(key);
+    delete store[key];
+  }
+  return dropped;
+}
+
+/**
+ * Drop every VALUE that is not a plain object — the record-shape twin of
+ * `dropUnusableHostKeys` (XERK-297). The restore validates the top-level shape
+ * and the record KEYS, and `normalizeRecord` guards each record's FIELDS, but
+ * NOTHING checked a record was an object at all: a single `null` (or array, or
+ * scalar) alongside healthy hosts sailed through every per-field guard (they all
+ * early-return on a non-object) and reached `serializeAgent`, where `a.lastSeen`
+ * threw a TypeError that emptied the WHOLE fleet payload — every host gone, not
+ * just the bad one, persisting across restarts because the junk record re-saved.
+ * The dangerous shape is a torn write left as VALID JSON with a null-ish value
+ * (a truncated file fails JSON.parse and is already handled); `scheduleSave`'s
+ * atomic temp-file+rename stops such a write arising, this makes it survivable.
+ *
+ * Runs BEFORE `normalizeRecord`/`sanitizeRestoredCommands`/`trimRestoredAgents`,
+ * so none of them — nor the payload build — ever sees a non-object record. Same
+ * non-object-input guard as its twin, for the same reason.
+ */
+function dropNonObjectRecords(store) {
+  const dropped = [];
+  if (!store || typeof store !== "object" || Array.isArray(store)) return dropped;
+  for (const [key, val] of Object.entries(store)) {
+    if (objectish(val)) continue;
     dropped.push(key);
     delete store[key];
   }
@@ -12936,6 +12995,12 @@ if (process.env.TURMA_TEST) {
     // green while restoring the ghost. `hostKeyLabel` because a refused key is
     // attacker-controlled and unbounded.
     isPlainHostKey, dropUnusableHostKeys, hostKeyLabel,
+    // The record-shape twin of that pair (XERK-297): drops a non-object record a
+    // torn write left behind, before it can crash the payload build. Exported for
+    // the same reason as its sibling — a source-regex proves the CALL, not that it
+    // drops anything. `degradedAgentsError` classifies the serialization-failure
+    // body so the misleading "payload too large" is pinned by a direct test.
+    dropNonObjectRecords, degradedAgentsError,
     // The holder the heartbeat's coercion step goes through, exported so a test
     // can make it throw and hold the rollback that follows (XERK-262). See its
     // declaration for why that rollback cannot be reached from the wire.

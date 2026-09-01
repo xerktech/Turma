@@ -106,34 +106,43 @@ test("an oversized state.json does not get parsed, and the hub still boots", () 
   assert.equal(typeof hub.server.listen, "function");
 });
 
-test("a restore that fails PART WAY through serves nothing, not half a registry", () => {
-  // The size ceiling throws BEFORE the parse, so it cannot reach this state.
-  // What can: a file small enough to open whose CONTENT breaks the walk —
-  // `agents = JSON.parse(...)` installs the whole thing before `normalizeRecord`
-  // or `trimRestoredAgents` ever looks at it, so a throw in either used to leave
-  // the raw, uncoerced, unbounded parse installed and being served. That is the
-  // one state the restore exists to prevent, so it needs its own boot.
+test("a non-object record is dropped per-record, not left to crash the whole fleet (XERK-297)", () => {
+  // A torn write can leave state.json as valid JSON with a null-ish value beside
+  // healthy hosts. Before XERK-297 the null crashed the walk (the trim's sort and
+  // serializeAgent both read `.lastSeen` off each record), which either failed the
+  // whole restore or — worse — emptied the served payload for the ENTIRE fleet.
+  // Now `dropNonObjectRecords` strips such a record BEFORE anything walks it, so
+  // the healthy host beside it survives and boot is a clean, successful load.
   const poisoned = tmp("state-poisoned");
-  // Null records: the trim's sort reads `.lastSeen` off each and throws.
-  fs.writeFileSync(poisoned, JSON.stringify({ h1: null, h2: null, h3: null }));
+  fs.writeFileSync(poisoned, JSON.stringify({
+    bad: null, arr: [1], num: 7, good: { device: "good", lastSeen: 1 },
+  }));
+  // A marker delimits the probe's own JSON from the restore's "loaded N agents"
+  // log line, which also lands on stdout.
   const probe = `
     process.env.STATE_FILE = ${JSON.stringify(poisoned)};
     const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
-    process.stdout.write(JSON.stringify({
+    process.stdout.write("<<<" + JSON.stringify({
       keys: Object.keys(hub.agents), bytes: hub.registryBytes(),
-    }));
+    }) + ">>>");
   `;
   const env = { ...process.env, STATE_FILE: poisoned };
   const r = require("child_process").spawnSync(process.execPath, ["-e", probe], {
     env, encoding: "utf8",
   });
   assert.equal(r.status, 0, `the hub must still boot:\n${r.stderr}`);
-  const out = JSON.parse(r.stdout);
-  assert.deepEqual(out.keys, [], "a failed restore must leave an EMPTY registry, not the raw parse");
-  // And the accounting agrees, so the first beat is measured against an empty
-  // registry rather than a phantom one.
-  assert.equal(out.bytes, 0);
-  assert.ok(r.stderr.includes("state restore skipped"), r.stderr);
+  const out = JSON.parse(r.stdout.slice(
+    r.stdout.indexOf("<<<") + 3, r.stdout.lastIndexOf(">>>")));
+  // The one healthy host is what survives — never the raw parse, and never an
+  // empty registry that threw away the good record with the bad ones.
+  assert.deepEqual(out.keys, ["good"],
+    "the healthy host survives; every non-object record is dropped");
+  assert.ok(out.bytes > 0, "the surviving host is measured into the registry accounting");
+  // A per-record DROP, not a whole-restore skip: the good host loaded, so the
+  // catch's `state restore skipped` must NOT have fired.
+  assert.ok(!r.stderr.includes("state restore skipped"),
+    `a droppable record must not fail the whole restore:\n${r.stderr}`);
+  assert.ok(r.stdout.includes("loaded 1 agents"), r.stdout);
 });
 
 // ROOT CANNOT RUN THIS ONE, and the reason is the mechanism it tests. The case
