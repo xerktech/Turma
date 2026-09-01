@@ -2683,6 +2683,32 @@ PEERS_FLEET_TTL_SEC = 6 * INTERVAL
 # maximum rather than a working limit.
 HEARTBEAT_REPLY_MAX = 8 * 1024 * 1024
 
+# Python 3.11+ refuses to parse an integer literal of more than 4300 digits
+# (`ValueError: Exceeds the limit (4300 digits)`), a DoS guard against the
+# quadratic cost of the decimal->int conversion. json.loads inherits it, so a
+# single huge integer ANYWHERE in the heartbeat reply — even under a key we
+# never read — makes the parse raise, which post() would log as a failed beat
+# and repeat forever, discarding every command the hub sent (XERK-365). We
+# raise the limit deliberately: the reply is already bounded to
+# HEARTBEAT_REPLY_MAX bytes by the read below, so no literal in it can exceed
+# that many digits. Parsing an int that large is O(n^2) in the digit count —
+# ~12s worst case measured on x86 for a full 8 MiB single literal — so it stays
+# under the hub's 75s OFFLINE_AFTER_MS and respects the beat-loop budget
+# (XERK-395), but the margin is real, not the trivial cost a small limit would
+# give: only a compromised/broken hub reaches it, and even then a bounded slow
+# beat beats the pre-fix infinite wedge. Process-global (there is no scoped
+# form), which is why the same O(n^2) cost now applies to the other on-beat
+# external-JSON parses too (refresh_jira/pr/github) — bounded reads all, first-
+# party APIs, so an equally unlikely trigger. A truncated read or genuinely
+# malformed body still fails to parse, which post() now reports distinctly from
+# a beat that never reached the hub.
+if hasattr(sys, "set_int_max_str_digits"):
+    try:
+        sys.set_int_max_str_digits(max(HEARTBEAT_REPLY_MAX,
+                                       sys.get_int_max_str_digits()))
+    except (ValueError, OverflowError):  # pragma: no cover - defensive
+        pass
+
 # Rides --append-system-prompt beside NEW_WORK_SYSTEM_PROMPT on every launch, so
 # it reaches resumed sessions too. Kept deliberately short: every session pays it
 # on every launch, and its whole job is to trade an 18 KB tool call for a file
@@ -24570,10 +24596,25 @@ class SessionManager:
                 # so it is no longer a handful of commands, and an agent that
                 # slurps whatever arrives makes the hub's reply size this
                 # process's memory ceiling too. The hub caps the roster; this is
-                # the independent backstop on the receiving side. A truncated
-                # read fails the JSON parse, which this method already treats as
-                # "no reply" — a skipped beat rather than a wedged agent.
-                reply = json.loads(resp.read(HEARTBEAT_REPLY_MAX).decode() or "{}")
+                # the independent backstop on the receiving side.
+                raw = resp.read(HEARTBEAT_REPLY_MAX)
+            # The parse is its OWN failure, distinct from the transport failure
+            # the outer handler catches (XERK-365). The hub answered — 200, a
+            # body in hand — so this is "the hub said something we could not
+            # read" (a truncated read past HEARTBEAT_REPLY_MAX, or a malformed/
+            # hostile body), NOT "the hub never answered". Conflated, the agent
+            # could never tell a broken reply from an unreachable hub, and a
+            # single unparseable reply read as a dead host to its operator. A
+            # huge integer literal no longer lands here — sys.set_int_max_str_
+            # digits above lets the bounded reply parse — so this branch is now
+            # only truncation or genuinely malformed JSON.
+            try:
+                reply = json.loads(raw.decode() or "{}")
+            except (ValueError, UnicodeDecodeError) as e:
+                log(f"heartbeat reply could not be parsed ({len(raw)} bytes, "
+                    f"HTTP 200): {e}")
+                self._note_beat_failure()
+                return None
             self._note_body_max(reply)
             # The ARCHIVE route's own ceiling, off the same reply and before
             # _archive_deltas runs on it (XERK-356).
