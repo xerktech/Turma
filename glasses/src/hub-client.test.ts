@@ -53,6 +53,131 @@ describe("HubClient request timeout (XERK-235)", () => {
   });
 });
 
+// XERK-336: the timer race SETTLES the caller but never CANCELLED the fetch —
+// the abandoned request held its socket and a half-buffered body open with no
+// reference left to close them. timeoutFetch now passes an AbortController's
+// signal through init and abort()s it on timeout, closing the socket and
+// tearing down any stalled body read, while the timer race stays as the
+// settlement guarantee for a runtime/fetch that ignores the signal.
+describe("HubClient request abort on timeout (XERK-336)", () => {
+  // Capture the init a wrapped fetch is actually handed. The request never
+  // settles, so the signal is the only observable — exactly the stalled peer
+  // this ticket is about.
+  function hangCapturing(sink: { signal?: AbortSignal | null }) {
+    return vi.fn((_input: unknown, init?: RequestInit) => {
+      sink.signal = init?.signal ?? null;
+      return new Promise<Response>(() => {});
+    }) as unknown as typeof fetch;
+  }
+
+  it("passes an AbortSignal through init and fires it on timeout, not just rejects", async () => {
+    vi.useFakeTimers();
+    try {
+      const sink: { signal?: AbortSignal | null } = {};
+      const client = new HubClient({ config, fetchFn: hangCapturing(sink), timeoutMs: 1000 });
+
+      const pending = client.listAgents();
+      const settled = vi.fn();
+      void pending.then(settled, settled);
+
+      // The executor runs synchronously, so the signal is present and unaborted
+      // the instant the request is in flight.
+      expect(sink.signal).toBeInstanceOf(AbortSignal);
+      expect(sink.signal?.aborted).toBe(false);
+      expect(settled).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1001);
+
+      expect(sink.signal?.aborted).toBe(true); // the socket was actually cancelled
+      await expect(pending).rejects.toThrow(/timed out/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves the signal unaborted when the response arrives in time", async () => {
+    vi.useFakeTimers();
+    try {
+      const sink: { signal?: AbortSignal | null } = {};
+      const ok = vi.fn((_input: unknown, init?: RequestInit) => {
+        sink.signal = init?.signal ?? null;
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ agents: [] }) } as Response);
+      }) as unknown as typeof fetch;
+      const client = new HubClient({ config, fetchFn: ok, timeoutMs: 1000 });
+
+      await expect(client.listAgents()).resolves.toEqual({ agents: [] });
+      await vi.advanceTimersByTimeAsync(5000); // the timer is cleared, so abort never fires
+      expect(sink.signal?.aborted).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still settles on the timer when AbortController is unavailable, fabricating no signal", async () => {
+    vi.useFakeTimers();
+    const saved = globalThis.AbortController;
+    try {
+      // The Even Hub runtime may lack AbortController; the guard must degrade to
+      // the old timer-only behaviour rather than throw or hang.
+      (globalThis as { AbortController?: typeof AbortController }).AbortController = undefined;
+      const sink: { signal?: AbortSignal | null } = {};
+      const client = new HubClient({ config, fetchFn: hangCapturing(sink), timeoutMs: 1000 });
+
+      const pending = client.listAgents();
+      const settled = vi.fn();
+      void pending.then(settled, settled);
+
+      expect(sink.signal).toBeNull(); // no signal invented when we can't abort
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(settled).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2);
+      await expect(pending).rejects.toThrow(/timed out/);
+    } finally {
+      globalThis.AbortController = saved;
+      vi.useRealTimers();
+    }
+  });
+
+  it("forwards a caller-supplied signal so cancelling it aborts the request too", async () => {
+    vi.useFakeTimers();
+    try {
+      const sink: { signal?: AbortSignal | null } = {};
+      const client = new HubClient({ config, fetchFn: hangCapturing(sink), timeoutMs: 10_000 });
+      const caller = new AbortController();
+
+      // Reach the wrapped fetch directly with a caller signal — no HubClient
+      // method passes one, but the wrapper must not silently drop it.
+      const wrapped = (client as unknown as { fetchFn: typeof fetch }).fetchFn;
+      const pending = wrapped("https://hub.example.com/x", { signal: caller.signal });
+      void pending.then(() => {}, () => {});
+
+      expect(sink.signal?.aborted).toBe(false);
+      caller.abort();
+      expect(sink.signal?.aborted).toBe(true);
+      await vi.advanceTimersByTimeAsync(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops the forwarded caller-abort listener once the request settles", async () => {
+    const caller = new AbortController();
+    const removeSpy = vi.spyOn(caller.signal, "removeEventListener");
+    const ok = vi.fn(() =>
+      Promise.resolve({ ok: true, status: 200, json: async () => ({}) } as Response),
+    ) as unknown as typeof fetch;
+    const client = new HubClient({ config, fetchFn: ok, timeoutMs: 1000 });
+
+    const wrapped = (client as unknown as { fetchFn: typeof fetch }).fetchFn;
+    await wrapped("https://hub.example.com/x", { signal: caller.signal });
+
+    // The listener the wrapper attached is gone, so a later abort of a reused
+    // caller signal can't fire into a completed request's controller.
+    expect(removeSpy).toHaveBeenCalledWith("abort", expect.any(Function));
+  });
+});
+
 describe("HubClient", () => {
   it("listAgents GETs /api/agents with the Basic auth header", async () => {
     const payload = { now: 123, agents: [] };
