@@ -9548,8 +9548,10 @@ CLONE_ERROR_LINGER_SEC = 300  # ...longer for a failed one (operator reads it)
 # written this recently — an orphaned `git clone` that outlived a CRASH (one that
 # skipped _handle_shutdown, so _kill_clones didn't reap it) may still be writing,
 # and rmtree'ing it out from under a live git is the corruption we refuse to do.
-# git touches its objects/index continuously, so a live clone's dir is never this
-# stale; a dir this old belongs to a clone that is finished or dead.
+# Freshness is the newest mtime ANYWHERE under the dir, not the dir's own: git
+# streams incoming objects into one deep pack file whose appends bump that file's
+# mtime but no parent directory's, so a slow fetch leaves the top-level mtime
+# stale while git is alive. A dir whose newest file is this old is finished/dead.
 CLONE_TMP_MIN_AGE_SEC = 120
 PRUNE_RESULT_LINGER_SEC = 60  # keep a FINISHED repo's prune summary in the heartbeat
 # A prune runs on its own worker thread (XERK-256), so its git commands are NOT
@@ -22583,6 +22585,35 @@ class SessionManager:
             if tmp:
                 shutil.rmtree(tmp, ignore_errors=True)
 
+    def _staging_recent_mtime(self, path, cap=2000):
+        """Newest mtime anywhere under a clone staging dir (XERK-374), for the
+        sweep's still-being-written check. The dir's OWN mtime is not enough: git
+        streams incoming objects into a single deep pack file under
+        .git/objects/pack/, and appends to that file bump only ITS mtime, no
+        parent directory's — so a slow fetch can leave the top-level mtime stale
+        while git is very much alive. Walk for the max instead, bounded: an
+        in-progress fetch has only a handful of files, and a tree already large
+        enough to hit `cap` is reported as fresh (the SAFE direction — keep a
+        maybe-live dir, reap it a boot later). lstat, so a symlink is measured,
+        never followed. Returns None only if the dir itself is unreadable."""
+        try:
+            newest = os.path.getmtime(path)
+        except OSError:
+            return None
+        seen = 0
+        for root, _dirs, files in os.walk(path):  # followlinks False by default
+            for name in files:
+                try:
+                    m = os.lstat(os.path.join(root, name)).st_mtime
+                except OSError:
+                    continue
+                if m > newest:
+                    newest = m
+                seen += 1
+                if seen >= cap:
+                    return time.time()  # too big to scan cheaply — treat as fresh
+        return newest
+
     def _sweep_clone_tmp(self):
         """Remove staging dirs left by clones that didn't finish (XERK-374).
 
@@ -22594,11 +22625,12 @@ class SessionManager:
 
         Two dirs are left ALONE: one belonging to a job THIS manager still has in
         self.clones (there is none at boot, but the guard keeps the sweep safe on
-        any later call), and one written within CLONE_TMP_MIN_AGE_SEC — an
-        orphaned git that outlived a crash may still be writing, and rmtree'ing it
-        mid-write is the one corruption this sweep must never cause. Such a dir is
-        harmless (invisible, bounded) and is reaped on a later boot once its git
-        has finished or died and the mtime goes stale. Best-effort; never raises
+        any later call), and one whose NEWEST file was written within
+        CLONE_TMP_MIN_AGE_SEC (_staging_recent_mtime, not the dir's own mtime) —
+        an orphaned git that outlived a crash may still be writing, and rmtree'ing
+        it mid-write is the one corruption this sweep must never cause. Such a dir
+        is harmless (invisible, bounded) and is reaped on a later boot once its
+        git has finished or died and its files go stale. Best-effort; never raises
         onto the caller."""
         try:
             entries = os.listdir(CLONES_TMP_ROOT)
@@ -22615,7 +22647,8 @@ class SessionManager:
                     continue
                 # A dir a live orphan git is still writing must not be deleted
                 # from under it — err toward keeping a harmless dir a cycle longer.
-                if now - os.path.getmtime(path) < CLONE_TMP_MIN_AGE_SEC:
+                recent = self._staging_recent_mtime(path)
+                if recent is None or now - recent < CLONE_TMP_MIN_AGE_SEC:
                     continue
                 shutil.rmtree(path, ignore_errors=True)
                 log(f"clone: swept abandoned staging dir {path}")

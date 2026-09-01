@@ -16167,6 +16167,30 @@ class TestCloneStaging(ManagerMixin, unittest.TestCase):
         sm._sweep_clone_tmp()
         self.assertFalse(os.path.isdir(fresh))
 
+    def test_sweep_keeps_a_dir_with_a_fresh_deep_file(self):
+        # The residual the mtime guard must close: git streams into a deep pack
+        # file, bumping ITS mtime but not the staging dir's. A stale TOP-LEVEL
+        # mtime must not fool the sweep into deleting a dir a live orphan git is
+        # still writing — freshness is the newest file anywhere under it.
+        sm = self.make_manager()
+        os.makedirs(ha.CLONES_TMP_ROOT)
+        staging = os.path.join(ha.CLONES_TMP_ROOT, "Turma-1")
+        pack = os.path.join(staging, ".git", "objects", "pack")
+        os.makedirs(pack)
+        packfile = os.path.join(pack, "tmp_pack_incoming")
+        open(packfile, "w").close()
+        # Age every DIRECTORY mtime well past the window; leave the file fresh.
+        old = time.time() - (ha.CLONE_TMP_MIN_AGE_SEC + 60)
+        for d in (staging, os.path.join(staging, ".git"),
+                  os.path.join(staging, ".git", "objects"), pack):
+            os.utime(d, (old, old))
+        sm._sweep_clone_tmp()
+        self.assertTrue(os.path.isdir(staging))  # kept: the deep file is fresh
+        # Once the deep file goes stale too, it is reaped.
+        os.utime(packfile, (old, old))
+        sm._sweep_clone_tmp()
+        self.assertFalse(os.path.isdir(staging))
+
     def test_a_duplicate_in_flight_clone_is_a_no_op(self):
         # Staging keeps dest empty for the whole clone, so a second request for a
         # repo already being cloned must be refused WITHOUT touching the live job
