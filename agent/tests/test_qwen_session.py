@@ -175,6 +175,44 @@ class QwenProjectionTailTest(unittest.TestCase):
         texts = [e["message"]["content"][0]["text"] for e in self._read_transcript()]
         self.assertEqual(texts, ["before restart", "during the gap", "after restart"])
 
+    def test_resume_rebuild_is_atomic_and_leaves_no_temp(self):
+        # The resume rebuild replaces the transcript via a temp file + os.replace
+        # so no reader ever sees a truncate->append window; the temp must not
+        # linger afterwards.
+        self._append_native(self._user("t1"))
+        self._append_native(self._assistant("t2"))
+        resumed = self._tail(resume=True, use_glob=False)
+        self.addCleanup(resumed.stop)
+        resumed._pump()
+        self.assertEqual(len(self._read_transcript()), 2)
+        leftovers = [n for n in os.listdir(os.path.dirname(self.transcript))
+                     if ".rebuild." in n]
+        self.assertEqual(leftovers, [])
+
+    def test_resume_holds_a_trailing_partial_line_then_completes_it(self):
+        # qwen may be mid-write at resume, leaving an unterminated last line. The
+        # rebuild must hold that fragment (not project a truncated event) and
+        # project it once it is completed on a later pump.
+        self._append_native(self._user("complete turn"))
+        # An unterminated trailing line (no newline) — a half-written event.
+        frag = json.dumps(self._assistant("half written", uuid="a9"))
+        with open(self.native_log, "a", encoding="utf-8") as fh:
+            fh.write(frag[:len(frag) // 2])   # only the first half, no newline
+        resumed = self._tail(resume=True, use_glob=False)
+        self.addCleanup(resumed.stop)
+        resumed._pump()
+        # Only the one complete turn projected; the fragment is held, not doubled.
+        self.assertEqual(len(self._read_transcript()), 1)
+        # Complete the half-written line (+ its newline) and add another turn.
+        with open(self.native_log, "a", encoding="utf-8") as fh:
+            fh.write(frag[len(frag) // 2:] + "\n")
+        resumed._pump()
+        entries = self._read_transcript()
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[1]["message"]["content"][0]["text"], "half written")
+        uuids = [e["uuid"] for e in entries]
+        self.assertEqual(len(uuids), len(set(uuids)))   # no collision/double
+
     def test_fresh_tail_projects_existing_events_from_zero(self):
         # The contrast to resume: a non-resume tail starts at 0 and projects the
         # existing events (a fresh launch writes a new log, so this never doubles).

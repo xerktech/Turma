@@ -23343,9 +23343,10 @@ class SessionManager:
                         self._reattach_dsh(sess)
                     # A qwen session's projection tail also lived in THIS manager
                     # and died with it, while the qwen TUI in tmux kept running and
-                    # appending to its native log — so re-start the tail at the
-                    # native log's EOF (resume=True) or the adopted session's chat
-                    # stays frozen at the pre-restart transcript (XERK-509 [Qwen C]).
+                    # appending to its native log — so re-start the tail (resume=True,
+                    # which RE-PROJECTS the native log from 0 over a reset transcript,
+                    # XERK-530) or the adopted session's chat stays frozen at the
+                    # pre-restart transcript (XERK-509 [Qwen C]).
                     if sess.get("agentType") == "qwen" and sess.get("claudeSessionId"):
                         try:
                             self._start_qwen_tail(

@@ -276,24 +276,76 @@ class QwenProjectionTail:
         except Exception as e:      # never let it kill the tail thread
             self._log(f"qwen child projection error: {e}")
 
-    def _reset_projection(self):
-        """Start the parent projection over: truncate the transcript, reset the
-        read cursor / partial buffer and mint a FRESH projector, so a read from
-        offset 0 rebuilds the whole projection with the same deterministic uuids
-        (no fork), an unbroken seq / parentUuid chain, and any missed history
-        self-healed. Used on a resume/adopt (the transcript already holds the
-        history, which the rebuild would otherwise double) and on the defensive
-        shrunk-log path. Never raises — an IO error is logged and the rebuild
-        simply retries on the next poll."""
-        self._offset = 0
-        self._partial = b""
-        self._proj = QwenProjector(self._session_id, cwd=self._cwd,
-                                   git_branch=self._git_branch)
+    def _project_bytes(self, proj, partial, data):
+        """Split `partial + data` on newlines, project each COMPLETE line through
+        `proj`, and return `(entries, new_partial)` — the projected entry dicts
+        and the unterminated trailing fragment held for the next read. Also
+        best-effort captures a generated session title (log-only for the
+        transcript, read by the naming seeder). Shared by the incremental pump and
+        the resume rebuild so the two never diverge. Tolerant of a malformed line
+        (skipped)."""
+        buf = partial + data
+        entries = []
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            self._maybe_capture_title(event)
+            entries.extend(proj.feed(event))
+        return entries, buf
+
+    def _rebuild_transcript(self, events_path):
+        """Re-project the WHOLE native log from 0 with a fresh projector and
+        REPLACE the transcript ATOMICALLY (temp file + os.replace), returning True
+        on success. This is design 1's resume/adopt path (XERK-530): the fresh
+        projector restarts the per-feed seq at 0 so the deterministic uuids
+        reproduce the already-projected history BYTE-IDENTICALLY (no fork), the
+        seq / parentUuid chain is unbroken past the resume seam, and any events
+        the pre-restart tail died before projecting self-heal.
+
+        The replace is atomic on purpose: a plain truncate-then-append would leave
+        a window in which a CONCURRENT reader (a beat's `_seed_prs` / PR scan /
+        usage walk, the rendered archive, the live tail) sees an empty or partial
+        transcript — and `_seed_prs` reads it ONCE at resume and primes the
+        per-beat scan past whatever it found, so a mis-timed read would drop the
+        session's PR chips permanently. os.replace swaps the inode so every reader
+        sees either the old complete transcript or the new one, never between.
+
+        State (`_proj`, `_partial`, `_offset`) is committed ONLY after the replace
+        succeeds, so a failed write leaves the tail to retry on the next poll
+        rather than stranding a fresh projector at EOF (which would re-introduce
+        the seq-0 collision on the next event). Never raises."""
         try:
-            with open(self.transcript_path, "w", encoding="utf-8"):
-                pass
+            with open(events_path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            return False
+        proj = QwenProjector(self._session_id, cwd=self._cwd,
+                             git_branch=self._git_branch)
+        entries, partial = self._project_bytes(proj, b"", data)
+        tmp = "%s.rebuild.%d.tmp" % (self.transcript_path, os.getpid())
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                for e in entries:
+                    fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+            os.replace(tmp, self.transcript_path)
         except OSError as e:
-            self._log(f"qwen projection: cannot reset transcript: {e}")
+            self._log(f"qwen projection: transcript rebuild failed: {e}")
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+        # Committed atomically — advance the live cursors past the rebuilt bytes.
+        self._proj = proj
+        self._partial = partial
+        self._offset = len(data)
+        return True
 
     def _pump_parent(self, events_path):
         try:
@@ -301,21 +353,24 @@ class QwenProjectionTail:
         except OSError:
             return
         if self._offset is None:
-            # First sight of the log. On a resume the transcript already holds
-            # the projected history; re-project the WHOLE log from 0 (see the
-            # `_resume` note in __init__) over a reset transcript so the seq /
-            # parentUuid chain continues unbroken and the file does not double. A
-            # fresh launch's transcript is empty, so it just starts at 0.
+            # First sight of the log. On a resume the transcript already holds the
+            # projected history; re-project the WHOLE log from 0 and REPLACE the
+            # transcript atomically (see `_rebuild_transcript` and the `_resume`
+            # note in __init__) so the seq / parentUuid chain continues unbroken
+            # and the file neither doubles nor blinks empty under a reader. A
+            # fresh launch's transcript is empty, so it just starts at 0. Retry on
+            # the next poll if the rebuild could not write.
             if self._resume:
-                self._reset_projection()
+                if not self._rebuild_transcript(events_path):
+                    return
             else:
                 self._offset = 0
-        if size < self._offset:
+        elif size < self._offset:
             # The native log was rewritten/truncated under us (append-only qwen
-            # --resume never does this, so it is defensive). Re-project from 0 —
-            # deterministic uuids reproduce the entries and the reset transcript
-            # keeps the rebuild from doubling.
-            self._reset_projection()
+            # --resume never does this, so it is defensive). Same atomic full
+            # re-projection; retry on the next poll if it could not write.
+            if not self._rebuild_transcript(events_path):
+                return
         try:
             with open(events_path, "rb") as fh:
                 fh.seek(self._offset)
@@ -325,22 +380,8 @@ class QwenProjectionTail:
         if not data:
             return
         self._offset += len(data)
-        self._partial += data
-        entries = []
-        while b"\n" in self._partial:
-            line, self._partial = self._partial.split(b"\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line.decode("utf-8", "replace"))
-            except ValueError:
-                continue
-            # Capture a generated session title if Qwen ever writes one — it is
-            # log-only for the TRANSCRIPT (QwenProjector projects only the three
-            # surface types) and kept here so the naming seeder can prefer it.
-            self._maybe_capture_title(event)
-            entries.extend(self._proj.feed(event))
+        entries, self._partial = self._project_bytes(
+            self._proj, self._partial, data)
         if entries:
             self._append(self.transcript_path, entries)
 
