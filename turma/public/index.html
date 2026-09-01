@@ -702,7 +702,11 @@ function refusedBadge(a) {
   const r = a.refused;
   if (!r) return "";
   const when = r.at ? ` (last ${ago(Date.now() - r.at)} ago)` : "";
-  const why = r.detail ? ": " + r.detail : "";
+  // esc(): `detail` is the hub's own plain text today, but it comes off the
+  // served record (and via a hand-edited state.json could hold a `"`), so escape
+  // it before it lands in the title attribute — the discipline every other badge
+  // here follows for agent/tracker-sourced strings.
+  const why = r.detail ? ": " + esc(r.detail) : "";
   return `<span class="host-auth req" title="The hub is refusing this host's heartbeats${why}${when}. The host looks offline but is up — it just cannot register. Shrink its report or raise the registry budget; the chip clears when the hub accepts a beat again.">⛔ Hub refused</span>`;
 }
 function esc(s) {
