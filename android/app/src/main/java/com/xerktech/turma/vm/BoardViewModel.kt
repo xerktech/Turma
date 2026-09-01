@@ -31,6 +31,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
@@ -293,6 +294,72 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
             val ok = runCatching { container.client.api.setTicketRuntime(siteKey, issueKey, body) }.isSuccess
             _messages.tryEmit(if (ok) "✓ runtime updated" else "✗ hub unreachable")
             container.fleet.nudge()
+        }
+    }
+
+    /**
+     * Set or release a ticket's triage verdict (XERK-486): "approve", "hold" or
+     * "reject"; `action = null` releases back to auto (the triage model + the
+     * org's policy decide). Hub-owned and durable like the pins above — the POST
+     * is authoritative and the fleet payload's ticketTriageActions reflects it on
+     * the next poll/SSE event. Returns the hub's own words on a refusal
+     * (XERK-264) so the detail row can show it inline, or null on success.
+     */
+    suspend fun setTicketTriage(siteKey: String, issueKey: String, action: String?): String? {
+        val body = buildJsonObject {
+            if (action == null) put("clear", JsonPrimitive(true))
+            else put("action", JsonPrimitive(action))
+        }
+        return try {
+            val r = container.client.api.setTicketTriage(siteKey, issueKey, body)
+            val b = r.body()
+            if (!r.isSuccessful || b?.ok != true) {
+                b?.error?.takeIf { it.isNotBlank() } ?: r.hubError() ?: "HTTP ${r.code()}"
+            } else {
+                _messages.tryEmit("✓ triage updated")
+                container.fleet.nudge()
+                null
+            }
+        } catch (_: Exception) {
+            "the hub is unreachable"
+        }
+    }
+
+    /**
+     * Patch an org's triage policy (XERK-486): the knobs the hub's auto-start
+     * sweep applies after the triage gate. All five knobs are sent (full patch,
+     * like the web's savePolicy): [minPriority] null = any priority, [rateMax]
+     * null = the hub's default cap; empty lists mean unconstrained. Returns the
+     * hub's own words on a refusal, null on success (the nudge pulls the merged
+     * policy from the payload).
+     */
+    suspend fun saveTriagePolicy(
+        siteKey: String,
+        minPriority: String?,
+        excludeTypes: List<String>,
+        repoAllow: List<String>,
+        repoDeny: List<String>,
+        rateMax: Int?,
+    ): String? {
+        val body = buildJsonObject {
+            put("minPriority", minPriority?.let { JsonPrimitive(it) } ?: JsonNull)
+            put("excludeTypes", buildJsonArray { excludeTypes.forEach { add(JsonPrimitive(it)) } })
+            put("repoAllow", buildJsonArray { repoAllow.forEach { add(JsonPrimitive(it)) } })
+            put("repoDeny", buildJsonArray { repoDeny.forEach { add(JsonPrimitive(it)) } })
+            put("rateMax", rateMax?.let { JsonPrimitive(it) } ?: JsonNull)
+        }
+        return try {
+            val r = container.client.api.setTriagePolicy(siteKey, body)
+            val b = r.body()
+            if (!r.isSuccessful || b?.ok != true) {
+                b?.error?.takeIf { it.isNotBlank() } ?: r.hubError() ?: "HTTP ${r.code()}"
+            } else {
+                _messages.tryEmit("✓ triage policy saved")
+                container.fleet.nudge()
+                null
+            }
+        } catch (_: Exception) {
+            "the hub is unreachable"
         }
     }
 

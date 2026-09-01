@@ -26,6 +26,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `turma-usage.md` | `turma/public/usage.html`, `usage-ledger.js` | token chart, durable ledger, sub-agent split, limit cards, ingest coercions |
 | `turma-board.md` | `turma/public/board.*` | Kanban, ticket panel, routing, auto-start/stop |
+| `turma-triage.md` | `turma/public/board.*`, `turma/server.js` | Triage lane, per-ticket verdicts, org triage policy, auto-start gate |
 | `turma-ticket-queue.md` | `turma/server.js`, `board.*` | hub ticket queue: admission, drain, expiries, caps |
 | `board-ticket-view.md` | `server.js`, `hub-agent.py`, `board.js` + vendored copies, `Board.kt` | routing a ticket to a capable host; hub resolving a ticket as the board does |
 | `turma-sessions.md` | `turma/public/sessions.html`, `chat.js` | Sessions page, chat engine, live tail, composer, terminal |
@@ -265,6 +266,13 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   `vendor.test.ts`), and the two ports — `_board_column` in `hub-agent.py` and `categoryOf` in
   android's `core/Board.kt`. The agent resolves a dropped column against its OWN read, so drift
   silently refuses valid drops. Tests: `TestBoardColumn`, `board.test.js`, `BoardTest.kt`.
+- **The Triage lane + verdict chip ride the SAME mirrors** — `triageLaneOf`/`triageChipHtml` in
+  `board.js` reach the glasses + Veiller-fork vendored `board.cjs` (byte-identity pinned by their
+  vendor tests, a third mirror beyond the column rule's four) and Android's `Board.kt` port. The
+  verdicts themselves are HUB-OWNED wire state (`ticketTriageActions` on `/api/agents`, set via
+  `POST /api/jira/<site>/<key>/triage`), so glasses/Veiller render them PASSIVELY with no verdict
+  or policy controls; the lane is a board view that never writes to the tracker. Change the lane
+  or chip → re-vendor and re-port in the same PR. Mechanics: `.claude/rules/turma-triage.md`.
 - **`hub-agent.py` ↔ `tunnel-agent.js` are a parity contract** for everything both parse:
   `_entry_blocks`/`entryBlocks`, `_entry_text`, `transcript_tail`, `_busy_from_capture`/
   `paneShowsBusy`, `_fold_queue_op`/`foldQueueOp`, `_send_user_file_detail`/`sendUserFileDetail`.

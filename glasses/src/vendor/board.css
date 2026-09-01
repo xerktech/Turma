@@ -340,3 +340,55 @@ body.td-open { overflow: hidden; }
 .kanban-col { flex: 0 0 82%; max-width: 340px; }
 .td-backdrop { position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,0.4); display: flex; padding: 0; }
 .td-panel { max-width: none; width: 100%; min-height: 100vh; margin: 0; border: 0; border-radius: 0; background: var(--page); overflow-y: auto; padding: 16px; }
+
+/* XERK-488: board styles added to app.css after this file's XERK-484
+   snapshot — Triage lane + verdict chip (XERK-486), queue/unqueue (XERK-296),
+   dirty-close confirm (XERK-218), detail repo width (XERK-235). */
+/* The Triage lane (XERK-486 [F]) is a view, not a tracker column: a dashed
+   top rule keeps it visually apart from the real status columns beside it. */
+.kanban-col.kanban-triage > .kc-head {
+  border-bottom: 1px dashed var(--hairline); padding-bottom: 6px;
+}
+/* The detail panel has more room — but not unlimited. Uncapped, an ordinary
+   long repo directory name overflowed the detail panel's field column and
+   painted on top of the AGENT column beside it (XERK-235). 100% keeps it
+   inside whatever column it is in. */
+.td-field .kc-repo, .td-fields .kc-repo { max-width: 100%; }
+/* The operator's triage verdict (XERK-486 [F]): same chip metrics as .kc-dup;
+   the verdict outranks the model's triage, so it gets its own tint — green for
+   an explicit approve, amber for hold (the card parks in the Triage lane), red
+   for reject. */
+.kc-triage {
+  display: inline-block; vertical-align: middle;
+  padding: 1px 7px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--page);
+  font-family: var(--font-mono); font-size: 10.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 15ch;
+}
+.kc-triage-approve { color: var(--good); border-color: var(--good); }
+.kc-triage-hold { color: var(--warning); border-color: var(--warning); }
+.kc-triage-reject { color: var(--critical); border-color: var(--critical); }
+/* A ticket waiting in the hub's queue for a free session slot (XERK-296). Same
+   chip metrics as the start button it replaces, dashed like the other "not a
+   thing yet" states; the ✕ beside it takes the ticket back out of the line. */
+.kc-queued {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 7px; border-radius: var(--radius-sm);
+  border: 1px dashed var(--border); background: var(--page);
+  color: var(--muted); font-size: 10.5px; line-height: 1.5; white-space: nowrap;
+}
+.kc-queued.kc-queued-blocked { color: var(--warning); border-color: var(--warning); }
+.kc-unqueue {
+  padding: 1px 6px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--page);
+  color: var(--muted); font: inherit; font-size: 10.5px; line-height: 1.5;
+  cursor: pointer;
+}
+.kc-unqueue:hover { border-color: var(--critical); color: var(--critical); }
+.kc-unqueue:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+/* The dirty-close confirmation row (XERK-218): the question fills the space the
+   right-aligned buttons leave. */
+.cf-discard-q { margin-right: auto; align-self: center; }
+.cf-btn.cf-danger { color: #fff; background: var(--critical); border-color: var(--critical); }
+.cf-btn.cf-danger:hover:not(:disabled) { filter: brightness(1.06); color: #fff; }

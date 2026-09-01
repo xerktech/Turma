@@ -261,6 +261,26 @@ describe("phone render", () => {
     expect(todoCol).not.toContain("ACME-9");
   });
 
+  it("a held To Do ticket renders in the Triage lane with its verdict chip (XERK-486 [F])", () => {
+    const st = state({
+      ticketTriageActions: { "acme.atlassian.net/ACME-9": { action: "hold", at: 0 } },
+      agents: [
+        agent({ key: "h1", jira: { available: true, siteKey: "acme.atlassian.net", user: "me", fetchedAt: "2026-08-01T00:00:00Z",
+          tickets: [
+            { key: "ACME-9", summary: "Held ticket", statusCategory: "todo", status: "To Do", triage: { priority: "P1", type: "bug", actionable: true }, updated: "2026-08-01T00:00:00Z", project: "ACME" },
+            { key: "ACME-10", summary: "Cleared ticket", statusCategory: "todo", status: "To Do", triage: { priority: "P2", type: "task", actionable: true }, updated: "2026-08-01T00:00:00Z", project: "ACME" },
+          ] } }),
+      ],
+    });
+    const html = boardBodyHtml(st);
+    const lane = html.slice(html.indexOf('data-cat="triage"'), html.indexOf('data-cat="todo"'));
+    expect(lane).toContain("ACME-9");
+    expect(lane).toContain("kc-triage-hold");
+    expect(lane).not.toContain("ACME-10");
+    const todoCol = html.slice(html.indexOf('data-cat="todo"'), html.indexOf('data-cat="inprogress"'));
+    expect(todoCol).toContain("ACME-10");
+  });
+
   it("phoneHtml shows the shell (header org menu + bottom nav) on the sessions tab", () => {
     const st = state({ agents: [agent({ jira: { siteKey: "acme.atlassian.net" } })] });
     const html = phoneHtml(st, VIEW(), false);

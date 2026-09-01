@@ -494,6 +494,41 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - Still open: the **glasses** client (`hub-client.ts`) exposes the terminal for a dsh session — the
   same suppression + Trajectory render, tracked under P2 above.
 
+## Done (XERK-488 — client triage parity: Triage lane, verdicts, org policy)
+
+- **Android has FULL triage parity** with the web (XERK-485/486): all four surfaces ported.
+  - **Triage lane** — `core/Board.kt` mirrors `board.js` `triageLaneOf`/`triageActionOf` (pure,
+    tested in `core/BoardTest.kt`); `ui/BoardScreen.kt` renders the lane FIRST in the column strip
+    (`listOf("triage" to "Triage") + BOARD_CATEGORIES`), holds untriaged + held To Do cards, and is
+    **never a drop target** (the drag target resolver does `takeIf { c -> c != "triage" }`, like
+    web `board.html`'s drop guard).
+  - **Verdict chip + Triage row** — `TriageSection`/`TriagePicker` in the detail sheet mirror
+    `triageFieldHtml`/`triagePickerHtml`: Auto / Approve / Hold / Reject, a pick IS the save
+    (`vm.setTicketTriage` → `POST /api/jira/<site>/<key>/triage`), "Auto" is the release; the card
+    chip renders the `TriageActionPin` (`model/Models.kt`) read off the fleet payload's
+    `ticketTriageActions`.
+  - **Per-ticket approve/hold/reject** rides the same durable hub state as the pins — works with
+    the org's hosts offline; the fleet payload + SSE keep the verdict fresh.
+  - **Org triage policy sheet** — `TriagePolicySheet` (header "Triage policy" button, like the web
+    board bar): the five knobs (minPriority / excluded types / repo allow / repo deny / rateMax)
+    via `vm.saveTriagePolicy` → `POST /api/jira/<site>/triage-policy`; `null` clears a knob.
+- **Glasses + Veiller fork: PASSIVE read only** — both decode `ticketTriageActions` from
+  `/api/agents` (new `AppState` field, refreshed by poll) and pass `triageActions` into the
+  re-vendored `board.cjs` `boardHtml`, so the Triage lane + verdict chips render exactly as on
+  web/Android. No verdict/policy controls on the phones (they set no hub state). `board.cjs` was
+  re-vendored byte-identical from `turma/public/board.js` in `glasses/src/vendor/` and the Veiller
+  fork's `miniapps/turma/src/ui/vendor/` (both vendor tests pin byte-identity); `board.css` on both
+  phones gained the `.kanban-triage`/`.kc-triage*`/`.kc-queued*`/`.kc-dup` rules.
+- **Platform-form notes (parity by intent, not omission):** Android's lane is the first item of
+  the same horizontal `LazyRow` strip (no separate scroll surface); the verdict picker is a
+  dropdown dialog in the detail sheet rather than the web's in-place inline swap (sheet rows do not
+  reflow); the policy editor is a full sheet vs the web's header-bar menu — same wire calls, same
+  semantics, different gesture chrome.
+- Tests: `core/BoardTest.kt` (lane/chip pure functions), `ui/BoardTriageTest.kt` (4 Robolectric
+  cases: lane placement incl. held card, chip rendering, verdict save over MockWebServer, policy
+  editor); glasses `phone/render.test.ts` (untriaged + held in-lane); Veiller
+  `ui/phone/render.test.ts` (same pair). All suites green.
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
@@ -570,6 +605,15 @@ those are marked `[MODEL]`.
   has no pane-Escape interrupt). Android's chat working bar should read the same `status.verb`/
   `elapsed` and suppress its Stop control on `status.noStop`. Glasses gets the checklist free (the
   vendored `chat.cjs`/`chat.css`); its live bar should honour `noStop` too.
+- **P2 Phone `chat.css` class coverage (XERK-488 follow-up).** Both phones' `chat.css` is a curated
+  extraction of `turma/public/app.css` taken when it was at v0.6.45, with phone overrides appended.
+  The re-vendored `chat.cjs` (this installment on the Veiller fork; earlier on glasses) is the
+  v1.1.67 engine and renders ~50 chat-feature classes the stale extraction never had (attachment
+  chips, the TodoWrite checklist card, the `noStop` live-bar state, …), so those elements fall back
+  to unstyled/default rendering. Pre-existing on glasses (the extraction went stale); surfaced on
+  Veiller by the XERK-488 re-vendor. Fix = re-extract the missing rules from the current
+  `app.css` into BOTH phones' `chat.css` (keeping the phone-override append) and re-run their
+  builds; the `board.css` half is already at parity (this PR's re-vendor).
 - ~~P2 dsh runtime badge on session CARDS (XERK-465 remainder).~~ Removed: the `⚙ dsh` session-card
   chip was dropped from every surface (web, Android, glasses) — see the Done section below.
 - ~~P2 board ticket "Runtime" row (XERK-473 → XERK-477).~~ Done (XERK-477, see Done below): the board

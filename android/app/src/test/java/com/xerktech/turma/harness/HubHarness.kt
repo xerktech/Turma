@@ -3,6 +3,7 @@ package com.xerktech.turma.harness
 import androidx.test.core.app.ApplicationProvider
 import com.xerktech.turma.AppContainer
 import com.xerktech.turma.TurmaApplication
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -191,6 +192,38 @@ class HubHarness : ExternalResource() {
         throw AssertionError("nothing arrived within ${timeoutMs}ms")
     }
 
+    /**
+     * Drain recorded requests until one whose path contains [pathContains]
+     * appears, or fail after [timeoutMs].
+     *
+     * MockWebServer 4.x exposes no request-list getter, only the blocking
+     * `takeRequest`. This drains intervening requests (fleet polls, SSE
+     * retries) in short slices until the matching one is dequeued.
+     */
+    fun findRequest(pathContains: String, timeoutMs: Long = 10_000): RecordedRequest {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val slice = (deadline - System.currentTimeMillis()).coerceIn(1L, 500L)
+            val req = server.takeRequest(slice, TimeUnit.MILLISECONDS) ?: continue
+            if (req.path?.contains(pathContains) == true) return req
+        }
+        throw AssertionError("no request matching '$pathContains' within ${timeoutMs}ms")
+    }
+
+    /**
+     * Like [findRequest] but returns null instead of throwing when no matching
+     * request was recorded within [timeoutMs] — for negative assertions.
+     */
+    fun findRequestOrNull(pathContains: String, timeoutMs: Long = 1_500): RecordedRequest? {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val slice = (deadline - System.currentTimeMillis()).coerceIn(1L, 500L)
+            val req = server.takeRequest(slice, TimeUnit.MILLISECONDS) ?: continue
+            if (req.path?.contains(pathContains) == true) return req
+        }
+        return null
+    }
+
     companion object {
         /** A refusal in the hub's own shape: the reason lives in the BODY. */
         fun refusal(reason: String, code: Int = 409) = MockResponse()
@@ -216,13 +249,26 @@ class HubHarness : ExternalResource() {
             sessions: String = "",
             repo: String = "Turma",
             now: Long = 1,
-        ): String = """
-            { "now": $now, "agents": [ { "key": "$host", "device": "$host",
-              "online": true, "terminalOnline": true,
-              "repos": [ { "name": "$repo", "lastActivity": "2026-08-12T00:00:00Z" } ],
-              ${if (localModel != null) "\"localModel\": $localModel," else ""}
-              ${if (dsh != null) "\"dsh\": $dsh," else ""}
-              "sessions": [ $sessions ] } ] }
-        """.trimIndent()
+            // The host's `jira` heartbeat block (the board's org) — a raw JSON
+            // object; null for the no-board fixtures the other screens use.
+            jira: String? = null,
+            // Hub-owned triage maps (XERK-486): ticketTriageActions is keyed
+            // "<siteKey>/<issueKey>", triagePolicies is keyed by siteKey. Raw
+            // JSON objects, null for fixtures predating the feature.
+            triageActions: String? = null,
+            triagePolicies: String? = null,
+        ): String = buildString {
+            append("""{"now": $now, "agents": [{"key": "$host", "device": "$host", """)
+            append("\"online\": true, \"terminalOnline\": true, ")
+            append("\"repos\": [{\"name\": \"$repo\", \"lastActivity\": \"2026-08-12T00:00:00Z\"}],")
+            if (localModel != null) append(" \"localModel\": $localModel,")
+            if (dsh != null) append(" \"dsh\": $dsh,")
+            append(" \"sessions\": [ $sessions ]")
+            if (jira != null) append(", \"jira\": $jira")
+            append(" }]")
+            if (triageActions != null) append(", \"ticketTriageActions\": $triageActions")
+            if (triagePolicies != null) append(", \"triagePolicies\": $triagePolicies")
+            append(" }")
+        }
     }
 }

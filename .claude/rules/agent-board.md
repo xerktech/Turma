@@ -93,6 +93,15 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
      HTTP error) stages `ok:false` with a bounded error, so the hub's suppression map can retry
      (errors) or drop (oks) instead of re-queuing every sweep. Staged on `ticketLinkResults`,
      same held-across-a-failed-POST lifecycle as the other results. Tests: `TestCreateDuplicateLink`.
+- `setTicketPriority` (XERK-483) is the third agent→tracker write: the hub's sweep queues it for
+  opted-in orgs when the tracker's priority field disagrees with the triage band; the agent decides
+  WHETHER to actually write, against a fresh read — `current == target` → `no-op`; `current` == a
+  value THIS host wrote (its `priority_writes` ledger) or the tracker's default → write; any other
+  value is a human's choice → `skipped`, never overwritten (the hub stops re-queueing on either a
+  `skipped` or an error result). Jira: band → `JIRA_PRIORITY_FOR_BAND` name, which must exist in the
+  org's `jira_priority_options()` or the command refuses with the missing name; ADO path analogous.
+  Same staged-result / never-raise discipline as `set_board_status` (keyed by cmdId on
+  `ticket_priority_results`). Tests: `TestSetTicketPriority`.
 - Tests: `TestSetBoardStatus`, `TestAzureStatusOptions`, `TestCreateAzureIssue`,
   `TestAzure*Identit*`, `TestHttpErrorDetail`, `TestBoardColumn`.
 
@@ -127,6 +136,12 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
   `TestJiraTriage` (`build_ticket_triage`, `_apply_triage` stamping), `TestSpawnOptionHelpers`
   (`_triage_payload`); hub `normalizeTriage`/`normalizeJira` cases in `server.test.js`; Android
   `AgentDecodeTest`.
+- **The hub now consumes the block** (XERK-485/486): `actionable !== true`, a set `dedupeOf`, or a
+  missing `triage` block gates a To Do ticket OUT of the auto stream (it still renders on the board
+  and spends no retry attempt), and the operator's per-ticket verdict (`ticketTriageActions`) plus
+  the org's `triagePolicies` override or constrain the sweep. Full gate order, verdict semantics,
+  policy knobs and P0 preemption live in `.claude/rules/turma-triage.md` — the agent's contract is
+  unchanged: keep stamping the block faithfully, absence means "not assessed".
 
 ### The triage ledger
 

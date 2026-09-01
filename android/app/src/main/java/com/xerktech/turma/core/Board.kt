@@ -89,6 +89,66 @@ data class MoveState(
 fun boardColumnOf(t: JiraTicket, move: MoveState?): String =
     if (move != null && (move.pending || move.settled) && move.error == null) move.category else categoryOf(t)
 
+// --- Triage lane + verdict (XERK-486) ----------------------------------------
+// The Triage lane is a client-side-only view ahead of To Do: untriaged To Do
+// tickets (no agent triage assessment) and HELD ones. It is NOT a tracker
+// category — [categoryOf] and its mirrors are untouched, and drops onto the
+// lane are rejected. A live drag override always wins over the lane. Pure port
+// of board.js triageActionOf / triageLaneOf.
+
+private val TRIAGE_VERDICTS = setOf("approve", "hold", "reject")
+
+/**
+ * The operator's verdict for a ticket out of the hub's ticketTriageActions map,
+ * keyed "<siteKey>/<issueKey>". A missing key or an unknown action value reads
+ * as no verdict (auto).
+ */
+fun triageActionOf(
+    actions: Map<String, com.xerktech.turma.model.TriageActionPin>,
+    siteKey: String,
+    issueKey: String,
+): String? {
+    val v = actions["$siteKey/$issueKey"] ?: return null
+    return if (v.action in TRIAGE_VERDICTS) v.action else null
+}
+
+/**
+ * "triage" when the ticket belongs in the client-side Triage lane — a To Do
+ * ticket with no agent triage assessment yet, or one carrying a "hold" verdict.
+ * Null otherwise. A live drag override is handled by the caller, which only
+ * consults the lane when no override is active.
+ */
+fun triageLaneOf(t: JiraTicket?, action: String?): String? {
+    if (t == null || categoryOf(t) != "todo") return null
+    if (action == "hold") return "triage"
+    if (t.triage == null) return "triage"
+    return null
+}
+
+/**
+ * The column a card renders in (board.js `cards[lane || boardColumnOf(t, mv)]`):
+ * a live drag override wins outright, then the Triage lane, then the real
+ * category.
+ */
+fun displayColumnOf(t: JiraTicket, move: MoveState?, action: String?): String {
+    val override = move != null && (move.pending || move.settled) && move.error == null
+    return if (override) move!!.category else (triageLaneOf(t, action) ?: categoryOf(t))
+}
+
+/**
+ * The policy sheet's "Max auto-starts per 15 min" field: empty means the hub
+ * default, otherwise a whole number in 1..50 (the web `savePolicy` bound).
+ * Returns the inline error to show, or null when the value is acceptable.
+ */
+fun rateMaxError(s: String): String? {
+    val v = s.trim()
+    if (v.isEmpty()) return null
+    val n = v.toIntOrNull()
+    return if (n == null || n !in 1..50)
+        "Max auto-starts must be a whole number between 1 and 50 (or empty for the default)"
+    else null
+}
+
 /**
  * The per-beat sweep verdict for a drag override (board.js `moveSweepVerdict`):
  *   pending -> HOLD  (the POST/poll loop owns it);

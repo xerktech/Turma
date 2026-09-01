@@ -52,6 +52,13 @@ data class AgentsResponse(
     // the Dashboard shows a "push is off" banner. Defaults true so an older hub
     // (no such field) never false-alarms; a real hub always reports it.
     val pushEnabled: Boolean = true,
+    // Per-ticket triage verdict (XERK-486), keyed "<siteKey>/<issueKey>":
+    // approve / hold / reject. Hub-owned and durable like the other pins;
+    // absent on older hubs.
+    val ticketTriageActions: Map<String, TriageActionPin> = emptyMap(),
+    // Per-org triage policy (XERK-486), keyed by siteKey; the knobs the hub's
+    // auto-start sweep applies after the triage gate. Absent on older hubs.
+    val triagePolicies: Map<String, TriagePolicy> = emptyMap(),
 )
 
 /** One ticket->agent pin (the web board's Agent row; hub ticket-agents store). */
@@ -65,6 +72,36 @@ data class TicketModelPin(val model: String = "", val at: Long = 0)
 /** One ticket->runtime pin (the web board's Runtime row; hub ticket-runtimes store). */
 @Serializable
 data class TicketRuntimePin(val runtime: String = "", val at: Long = 0)
+
+/**
+ * One ticket->triage-verdict pin (the web board's Triage row; hub
+ * ticket-triage-actions store, XERK-486). [action] is "approve", "hold" or
+ * "reject"; the key is simply absent when no verdict has been set.
+ */
+@Serializable
+data class TriageActionPin(val action: String = "", val at: Long = 0)
+
+/**
+ * One org's triage policy (XERK-486) — the knobs the hub's auto-start sweep
+ * applies to that org's To Do tickets after the triage gate, before the org's
+ * rate cap. Every knob is optional; null/empty means unconstrained (the hub's
+ * default). Clients send a PATCH of changed keys; a null clears one.
+ */
+@Serializable
+data class TriagePolicy(
+    // "P0".."P3": only tickets at this priority or higher qualify.
+    val minPriority: String? = null,
+    // Issue types the sweep never auto-starts.
+    val excludeTypes: List<String> = emptyList(),
+    // When non-empty: only tickets whose repo is in this list qualify.
+    val repoAllow: List<String> = emptyList(),
+    // A repo in this list never qualifies, even if repoAllow is non-empty —
+    // deny beats allow.
+    val repoDeny: List<String> = emptyList(),
+    // Per-org auto-start rate cap (auto dispatches only, rolling window);
+    // overrides the hub-wide default. Valid range 1..50.
+    val rateMax: Int? = null,
+)
 
 /**
  * One ticket waiting in the hub's queue for a free session slot (XERK-296).
