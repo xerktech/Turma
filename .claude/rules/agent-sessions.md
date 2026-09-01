@@ -96,8 +96,13 @@ agent-side runtime detail. `.claude/rules/agent.md` carries the process model an
     prunes it (30s) that's indistinguishable from an interrupted clone, so neither message claims a
     cause after that point.
   - `repo_forkable` skips the fetch, so it only ever UNDER-counts, never releases a session that then
-    fails — except a DANGLING `origin/HEAD` (default branch only on the remote), which costs that
-    session the deadline. Adding a fetch isn't the trade: it would run per queued session per beat.
+    fails — except a DANGLING `origin/HEAD` (default branch only on the remote), which reads
+    unforkable there yet `resolve_base_ref`'s own fetch would land. Adding the fetch to `repo_forkable`
+    isn't the trade: it would run per queued session per beat. Instead the deadline branch does ONE
+    `default_base_ref()` before it errors (XERK-375) — for a DYING session, at most once per beat
+    (`rescue_fetched`), handing the landed ref to `_provision_session` so it doesn't re-fetch — so a
+    real dangling `origin/HEAD` provisions instead of eating `CLONE_TIMEOUT_SEC`. Only the PROVISION
+    path returns; the error path falls through so a capacity-queued session behind it still runs.
 - **`scan_repos()` never sees a repo mid-clone since XERK-374** — the in-flight clone lives under
   `.turma/clones` (which `scan_repos` skips like `.turma/worktrees`), so `REPOS_ROOT/<name>` appears
   only when the clone is complete and forkable. The `repo_forkable` gates above still stand as

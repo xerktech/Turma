@@ -16606,6 +16606,113 @@ class TestSpawnDuringAnUnfinishedClone(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["status"], "error")
         self.assertIn("still has no commit to fork from", sess["errorMsg"])
 
+    def _expire(self, sess):
+        # Shape a queued session as an awaiting-clone wait past its deadline.
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gdt-files",
+                    awaitCloneSince=time.time() - (ha.CLONE_TIMEOUT_SEC + 1))
+
+    def test_a_dangling_origin_head_is_rescued_by_one_fetch_at_the_deadline(self):
+        # XERK-375: repo_forkable skips the spawn-time fetch, so a DANGLING
+        # origin/HEAD (the default branch's ref only on the remote) reads
+        # unforkable and the session would sit out CLONE_TIMEOUT_SEC before
+        # erroring — even though resolve_base_ref's own fetch would land the
+        # ref. At the deadline the drain spends that ONE fetch itself and
+        # provisions the session instead of killing it.
+        sm = self._manager(cloning=False)
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        self._expire(sess)
+        calls = []
+
+        def landed(path):
+            # The fetch lands refs/remotes/origin/main; head_ready flipping True
+            # is the same effect on repo_forkable as the real ref landing.
+            calls.append(path)
+            self.head_ready = True
+            return "origin/main"
+
+        # branch_exists True for the landed ref lets the REAL resolve_base_ref
+        # inside _provision_session resolve origin/main with NO second fetch —
+        # which is what the calls==[path] assertion pins (the double-fetch fix).
+        with mock.patch.object(ha, "default_base_ref", landed), \
+             mock.patch.object(ha, "branch_exists",
+                               lambda path, ref: ref == "origin/main"):
+            sm._drain_queue()
+        self.assertEqual(sess["status"], "running")
+        self.assertEqual(calls, [self.repo["path"]])   # ONE fetch, not two
+        self.assertEqual(len(self._worktree_adds()), 1)
+        self.assertEqual(self._worktree_adds()[-1][-1], "origin/main")
+        for k in ("awaitClone", "awaitCloneSince", "queuedReason"):
+            self.assertNotIn(k, sess)
+
+    def test_the_deadline_still_errors_when_the_rescue_fetch_lands_nothing(self):
+        # The rescue is best-effort: a genuinely empty repo (the fetch adds no
+        # default-branch ref) still errors at the deadline exactly as before.
+        sm = self._manager(cloning=False)
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        self._expire(sess)
+        calls = []
+
+        def no_ref(path):
+            calls.append(path)  # the fetch ran, but nothing to land
+            return None
+
+        with mock.patch.object(ha, "default_base_ref", no_ref):
+            sm._drain_queue()
+        self.assertEqual(calls, [self.repo["path"]])
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("still has no commit to fork from", sess["errorMsg"])
+        self.assertEqual(self._worktree_adds(), [])
+
+    def test_only_one_expired_session_is_rescue_fetched_per_beat(self):
+        # The rescue fetch is the drain's ONLY network call, so it is capped at
+        # one per beat: two expired unforkable sessions -> the first is handled
+        # (one default_base_ref), the second DEFERS to a later beat rather than
+        # stacking a second FETCH_TIMEOUT_SEC onto this one. That the second is
+        # reached at all also shows the error path does NOT return early.
+        sm = self._manager(cloning=False)
+        sm.spawn("gdt-files")
+        a = sm.registry[0]
+        b = dict(a)
+        b["id"] = a["id"] + "-b"
+        sm.registry.append(b)
+        for s in (a, b):
+            self._expire(s)
+        calls = []
+        with mock.patch.object(ha, "default_base_ref",
+                               lambda p: calls.append(p) or None):
+            sm._drain_queue()
+        self.assertEqual(len(calls), 1)          # one fetch this beat, not two
+        self.assertEqual(a["status"], "error")   # first handled...
+        self.assertEqual(b["status"], "queued")  # ...second deferred, untouched
+
+    def test_a_rescued_session_still_provisions_only_one_per_beat(self):
+        # The rescue's provision keeps the one-per-beat rule: a rescued session
+        # returns, so a capacity-queued session behind it waits for the next
+        # beat (provisioning hammers the one shared ~/.claude login).
+        sm = self._manager(cloning=False)
+        sm.spawn("gdt-files")
+        a = sm.registry[0]
+        b = dict(a)
+        b["id"] = a["id"] + "-b"
+        sm.registry.append(b)
+        self._expire(a)
+        b.update(status="queued", queuedReason="capacity")
+        b.pop("awaitClone", None)
+
+        def landed(path):
+            self.head_ready = True
+            return "origin/main"
+
+        with mock.patch.object(ha, "default_base_ref", landed), \
+             mock.patch.object(ha, "resolve_base_ref",
+                               lambda path, base: "origin/main"):
+            sm._drain_queue()
+        self.assertEqual(a["status"], "running")   # the rescued one provisions
+        self.assertEqual(b["status"], "queued")    # and the drain stops there
+
     def test_the_worktree_add_refuses_an_unborn_head_in_plain_words(self):
         # The last line of defence, for the resume/import paths that add a
         # worktree without going through spawn's wait.
