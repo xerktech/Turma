@@ -727,16 +727,19 @@ function overheadBeat(repos, opts = {}) {
 const names = (list) => list.map((r) => r.remoteKey).sort();
 
 test("isSystemUsageRepo matches the manager's overhead, never a real repo", () => {
-  // Overhead: the temp-dir repo name, its worktree-shaped slug forms, and the
-  // agent's own home dir.
+  // Overhead: the temp-dir repo name, its worktree-shaped slug forms, and any
+  // leading-dot name (`scan_repos` skips dot-dirs, so a live agent never reports
+  // one — only the recover tool / an orphan cwd slug produces them here).
   for (const v of ["hub-agent-mgr-z2rtwr4", "hub-agent-mgr-00d_zcu0",
                    "-tmp-hub-agent-mgr-abcd1234", "-tmp-claude-0-tmp-hub-agent-mgr-x",
-                   ".turma"]) {
+                   ".turma", ".switchboard", ".config"]) {
     assert.equal(isSystemUsageRepo(v, v), true, v);
   }
-  // A real repo that merely CONTAINS the substring, and ordinary repos, are not.
+  // A real repo that merely CONTAINS the substring, and ordinary repos, are not —
+  // including one whose name embeds a dot but does not START with one.
   for (const v of ["my-hub-agent-mgr-tool", "hub-agent-manager", "turma", "Turma",
-                   "git", "AgentHub", "ArgoCD"]) {
+                   "git", "AgentHub", "ArgoCD", "SwitchBoard", "tmp.hMHoC0PYr4",
+                   "github.com/x/y"]) {
     assert.equal(isSystemUsageRepo(v, v), false, v);
   }
   // Either field triggers it — the classifier checks remoteKey AND repo.
