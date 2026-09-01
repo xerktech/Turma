@@ -1150,6 +1150,23 @@ test("a merged snapshot still drops a host it no longer lists (XERK-444)", async
     "the dropped host is not carried back in");
 });
 
+// XERK-545: `orgColors` is a top-level key SSE ALSO live-patches, so an in-flight
+// snapshot can clobber a pin that landed after the fetch started — the same
+// XERK-444 race, on a key the agents merge doesn't cover. The handler stamps it;
+// mergeSnapshot keeps the live value patched after the fetch's captured `since`.
+test("an in-flight snapshot does not clobber a newer orgColors SSE patch (XERK-545)", async () => {
+  const H2 = loadHelpers(() => ({ now: Date.now(), agents: [], orgColors: { o: "red" }, retiredUsage: [] }));
+  await new Promise((r) => setImmediate(r));    // boot refresh settles at red
+  H2.connectSSE();
+  const es = H2.sse[H2.sse.length - 1];
+  const p = H2.refresh();                        // a fresh fetch is in flight (snapshot = red)
+  es.handlers.orgColors({ data: JSON.stringify({ o: "blue" }) });   // a pin flips mid-fetch
+  await p;
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(H2.getCache().orgColors, { o: "blue" },
+    "the live orgColors patch survives the older snapshot");
+});
+
 test("a removal re-polls once, however many hosts the hub evicts", async () => {
   // A removed host's spend MOVES to `retiredUsage`, which no SSE event carries —
   // so this handler is the only thing that keeps the chart honest while the

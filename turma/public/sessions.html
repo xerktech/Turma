@@ -3598,6 +3598,12 @@ let cache = { now: Date.now(), agents: [] };
 let sseClock = 0;
 const patchedAt = new Map();   // host key -> sseClock when SSE last touched it
 function stampPatch(key) { patchedAt.set(key, ++sseClock); }
+// XERK-545: `migrations` and `orgColors` are top-level keys SSE ALSO live-patches,
+// so an in-flight snapshot clobbers a patch that landed after the fetch started —
+// the XERK-444 race, on the two keys the agents merge doesn't cover. They ride the
+// same `patchedAt`/`since` machinery under "@"-prefixed stamp keys, which can't
+// collide with an agent record's key (a hostname).
+const LIVE_MIGRATIONS = "@migrations", LIVE_ORGCOLORS = "@orgColors";
 function mergeSnapshot(body, since) {
   if (!body || !Array.isArray(body.agents)) { cache = body; return; }
   const live = new Map((cache.agents || []).map(a => [a.key, a]));
@@ -3618,6 +3624,12 @@ function mergeSnapshot(body, since) {
     if (!snapKeys.has(key) && (patchedAt.get(key) || 0) > since) merged.push(rec);
   }
   body.agents = merged;
+  // XERK-545: keep a live migrations/orgColors patch that landed after the fetch
+  // started. Single values, so a whole-value "keep if patched since `since`"
+  // suffices, unlike the keyed agents merge above; otherwise take the snapshot's.
+  for (const [k, stamp] of [["migrations", LIVE_MIGRATIONS], ["orgColors", LIVE_ORGCOLORS]]) {
+    if ((patchedAt.get(stamp) || 0) > since && cache && k in cache) body[k] = cache[k];
+  }
   cache = body;
 }
 
@@ -3670,6 +3682,7 @@ function connectSSE() {
     try { ms = JSON.parse(e.data); } catch { return; }
     if (!cache) return;
     cache.migrations = ms;
+    stampPatch(LIVE_MIGRATIONS);   // so an in-flight snapshot can't clobber this (XERK-545)
     render(cache);
   });
   // An org's color pin changed (XERK-145): org.js owns the live map; patching
@@ -3680,6 +3693,7 @@ function connectSSE() {
     try { oc = JSON.parse(e.data); } catch { return; }
     if (!cache) return;   // org.js already took the event; nothing painted yet
     cache.orgColors = oc;
+    stampPatch(LIVE_ORGCOLORS);   // so an in-flight snapshot can't clobber this (XERK-545)
     render(cache);
   });
   // The header's per-org auto-start switches (XERK-41) ride the same socket —

@@ -1468,6 +1468,12 @@ let cache = null;
 let sseClock = 0;
 const patchedAt = new Map();   // host key -> sseClock when SSE last touched it
 function stampPatch(key) { patchedAt.set(key, ++sseClock); }
+// XERK-545: `orgColors` is a top-level key SSE ALSO live-patches, so an in-flight
+// snapshot clobbers a pin that landed after the fetch started — the XERK-444 race,
+// on a key the agents merge doesn't cover. It rides the same `patchedAt`/`since`
+// machinery under an "@"-prefixed stamp key, which can't collide with an agent
+// record's key (a hostname).
+const LIVE_ORGCOLORS = "@orgColors";
 function mergeSnapshot(body, since) {
   if (!body || !Array.isArray(body.agents)) { cache = body; return; }
   const live = new Map(((cache && cache.agents) || []).map(a => [a.key, a]));
@@ -1494,6 +1500,11 @@ function mergeSnapshot(body, since) {
   if (Array.isArray(body.retiredUsage) && body.retiredUsage.length) {
     const liveKeys = new Set(merged.map(a => a.key));
     body.retiredUsage = body.retiredUsage.filter(r => !liveKeys.has(r.key));
+  }
+  // XERK-545: keep a live orgColors pin that landed after the fetch started; a
+  // single value, so a whole-value "keep if patched since `since`" suffices.
+  if ((patchedAt.get(LIVE_ORGCOLORS) || 0) > since && cache && "orgColors" in cache) {
+    body.orgColors = cache.orgColors;
   }
   cache = body;
 }
@@ -1570,7 +1581,7 @@ function connectSSE() {
   es.addEventListener("orgColors", (e) => {
     let oc;
     try { oc = JSON.parse(e.data); } catch { return; }
-    if (cache) cache.orgColors = oc;
+    if (cache) { cache.orgColors = oc; stampPatch(LIVE_ORGCOLORS); }   // in-flight snapshot can't clobber (XERK-545)
     scheduleRender();
   });
   // The header's per-org auto-start switches (XERK-41) ride the same socket —
