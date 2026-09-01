@@ -267,14 +267,21 @@ fun liveStateLabel(state: LiveState): String = when (state) {
     LiveState.STOPPED -> "stopped"
 }
 
+/** The oppositional QA agents (`qa` first pass, `qa-delta` after) — see the web's
+ * `qaReviewing` (sessions.html). Their presence flips a working card to a
+ * "QA Review" status while it stays Active (XERK-538). */
+private val QA_AGENT_TYPES = setOf("qa", "qa-delta")
+
 /**
  * The same word, except that a session working because of BACKGROUND AGENTS
  * rather than its own turn says which — matching the web's `agentWorkLabel`
  * (sessions.html). Without it a session whose own turn has ended reads a bare
  * "working" with nothing on screen explaining what is still running (XERK-245).
+ * A QA/QA-delta agent in the fan-out reads "QA Review" instead (XERK-538).
  */
 fun liveStateLabel(state: LiveState, live: LiveSignals?): String {
     if (state == LiveState.WORKING && hasLiveAgents(live)) {
+        if (live?.agents?.any { it.type in QA_AGENT_TYPES } == true) return "QA Review"
         val n = live?.agents?.size ?: 0
         return if (n == 1) "1 background agent" else "$n background agents"
     }

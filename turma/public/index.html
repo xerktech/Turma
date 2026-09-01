@@ -859,6 +859,14 @@ function prBadgeHtml(pr) {
 // transcript-freshness heuristic only when the agent didn't report paneBusy
 // (older agent, or the pane couldn't be captured). Freshness is relative to
 // the host's last heartbeat (host.lastSeen).
+// The oppositional QA agents (`qa` first pass, `qa-delta` after). A card running
+// one is still working — stays Active — but says "QA Review" instead of a bare
+// agent count (XERK-538). Same rule and wording as sessions.html.
+const QA_AGENT_TYPES = new Set(["qa", "qa-delta"]);
+function qaReviewing(s) {
+  return (Array.isArray(s?.agents) ? s.agents : []).some(a => a && QA_AGENT_TYPES.has(a.type));
+}
+
 function liveState(sess, host, now) {
   const s = sess.session;
   // Both waiting checks come FIRST, ahead of the no-transcript return — the
@@ -882,7 +890,8 @@ function liveState(sess, host, now) {
   // agent was still running (XERK-245). Same rule and wording as sessions.html.
   const agentsLive = Array.isArray(s.agents) ? s.agents.length : 0;
   if (host.online && agentsLive)
-    return { label: agentsLive === 1 ? "1 background agent" : agentsLive + " background agents",
+    return { label: qaReviewing(s) ? "QA Review"
+                    : (agentsLive === 1 ? "1 background agent" : agentsLive + " background agents"),
              cls: "sess-working", detail: "last write " + ago(age), busy: true };
   const working = s.paneBusy != null
     ? (host.online && s.paneBusy)

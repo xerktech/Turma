@@ -4119,6 +4119,10 @@ class ManagerMixin:
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", os.path.join(self.tmp, "worktrees")),
+            # Derived from REPOS_ROOT at import, so it needs redirecting too — a
+            # clone stages here before renaming into place (XERK-374), and it
+            # must sit on the same filesystem as REPOS_ROOT for that rename.
+            ("CLONES_TMP_ROOT", os.path.join(self.tmp, "clones")),
             # Derived from REGISTRY_DIR at import, so it needs redirecting too —
             # delete() rmtree's a session's attachment dir (XERK-234).
             ("UPLOADS_DIR", os.path.join(self.tmp, "uploads")),
@@ -15967,29 +15971,44 @@ class TestClone(ManagerMixin, unittest.TestCase):
     def test_clone_launches_git_and_finishes_on_poll(self):
         sm = self.make_manager()
         dest = os.path.join(self.repos_root, "Turma")
+        captured = {}
 
         class FakeProc:
             def poll(self_inner):
-                # Simulate git materializing the checkout, then exiting 0.
-                os.makedirs(os.path.join(dest, ".git"), exist_ok=True)
+                # Simulate git materializing the checkout in the STAGING dir, then
+                # exiting 0 — _poll_clones renames it into place (XERK-374).
+                os.makedirs(os.path.join(captured["tmp"], ".git"), exist_ok=True)
                 return 0
 
             def kill(self_inner):
                 pass
 
-        with mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()) as popen:
+        def fake_popen(args, **kw):
+            captured["tmp"] = args[-1]  # git clone --progress -- <url> <tmp>
+            return FakeProc()
+
+        with mock.patch.object(ha.subprocess, "Popen",
+                               side_effect=fake_popen) as popen:
             sm.clone("xerktech/Turma")
-            # git clone <url> <dest> was launched (not a session run_ok call).
+            # git clone <url> <tmp> was launched (not a session run_ok call).
             args = popen.call_args[0][0]
             self.assertEqual(args[:2], ["git", "clone"])
             # stdout is a FILE here, and git says nothing about progress unless
             # asked — without this the UI has no sign a clone is moving.
             self.assertIn("--progress", args)
             self.assertIn("https://github.com/xerktech/Turma.git", args)
-            self.assertIn(dest, args)
+            # It clones into the private staging dir, NEVER REPOS_ROOT/<name>:
+            # that path appears only once the clone is complete (XERK-374).
+            self.assertTrue(args[-1].startswith(ha.CLONES_TMP_ROOT))
+            self.assertNotIn(dest, args)
+            self.assertFalse(os.path.exists(dest))
         self.assertEqual(sm.clones["Turma"]["status"], "cloning")
         sm._poll_clones()
         self.assertEqual(sm.clones["Turma"]["status"], "done")
+        # Renamed into place: the finished repo now lives at REPOS_ROOT/<name>...
+        self.assertTrue(os.path.isdir(os.path.join(dest, ".git")))
+        # ...and the staging dir is gone (the rename moved it).
+        self.assertFalse(os.path.isdir(captured["tmp"]))
         # The serializable view never leaks the Popen/file handles.
         payload = sm._clones_payload()[0]
         self.assertEqual(set(payload),
@@ -16012,6 +16031,233 @@ class TestClone(ManagerMixin, unittest.TestCase):
             sm.clone("xerktech/Turma")
         sm._poll_clones()
         self.assertEqual(sm.clones["Turma"]["status"], "error")
+
+
+class TestCloneStaging(ManagerMixin, unittest.TestCase):
+    """XERK-374: a clone stages under .turma/clones and renames into
+    REPOS_ROOT/<name> only when complete, so an interrupted clone never leaves a
+    `.git`-with-unborn-HEAD half-repo that blocks the repo forever. The staging
+    dir it does abandon is invisible to scan_repos and swept at boot."""
+
+    def setUp(self):
+        super().setUp()
+        self.repos_root = os.path.join(self.tmp, "root")
+        os.makedirs(self.repos_root)
+        p = mock.patch.object(ha, "REPOS_ROOT", self.repos_root)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _clone_into_staging(self, sm, make_git=True):
+        """Run clone() with a fake git that materializes .git in the staging dir
+        but is still 'running' (poll -> None). Returns the staging path."""
+        captured = {}
+
+        class RunningProc:
+            def poll(self_inner):
+                return None  # still cloning
+
+            def kill(self_inner):
+                pass
+
+        def fake_popen(args, **kw):
+            captured["tmp"] = args[-1]
+            if make_git:
+                os.makedirs(os.path.join(args[-1], ".git"), exist_ok=True)
+            return RunningProc()
+
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=fake_popen):
+            sm.clone("xerktech/Turma")
+        return captured["tmp"]
+
+    def test_an_interrupted_clone_leaves_no_half_repo_under_repos_root(self):
+        # The whole point: git has written <tmp>/.git, but REPOS_ROOT/Turma does
+        # NOT exist — so nothing lists a mid-clone repo, and a re-clone is not
+        # refused for a dest that exists.
+        sm = self.make_manager()
+        tmp = self._clone_into_staging(sm)
+        self.assertTrue(os.path.isdir(os.path.join(tmp, ".git")))
+        self.assertFalse(os.path.exists(os.path.join(self.repos_root, "Turma")))
+        self.assertTrue(tmp.startswith(ha.CLONES_TMP_ROOT))
+        # A restart drops the in-memory job; a boot after a crash whose orphan
+        # git has since gone stale reaps the leftover staging dir (the mtime
+        # guard leaves a still-writing one for a later boot — proven separately).
+        sm.clones = {}
+        old = time.time() - (ha.CLONE_TMP_MIN_AGE_SEC + 5)
+        os.utime(tmp, (old, old))
+        sm._sweep_clone_tmp()
+        self.assertFalse(os.path.isdir(tmp))
+
+    def test_sweep_keeps_a_live_jobs_staging_dir(self):
+        # A staging dir belonging to a clone still in self.clones is never swept
+        # (there is none at boot, but the sweep must be safe on any later call).
+        sm = self.make_manager()
+        tmp = self._clone_into_staging(sm)
+        sm._sweep_clone_tmp()
+        self.assertTrue(os.path.isdir(tmp))
+
+    def test_a_failed_clone_removes_its_staging_dir(self):
+        sm = self.make_manager()
+
+        class FailProc:
+            def poll(self_inner):
+                return 128
+
+            def kill(self_inner):
+                pass
+
+        captured = {}
+
+        def fake_popen(args, **kw):
+            captured["tmp"] = args[-1]
+            os.makedirs(args[-1], exist_ok=True)  # a partial checkout, no .git
+            return FailProc()
+
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=fake_popen):
+            sm.clone("xerktech/Turma")
+        sm._poll_clones()
+        self.assertEqual(sm.clones["Turma"]["status"], "error")
+        self.assertFalse(os.path.isdir(captured["tmp"]))
+
+    def test_promote_refuses_a_dest_that_appeared_mid_clone(self):
+        # A hand-run clone (or mkdir) landed at the dest while ours was staging:
+        # the finished staging clone is dropped, not merged over it, and the job
+        # errors the same way clone() refuses an existing dest on entry.
+        sm = self.make_manager()
+        captured = {}
+
+        class DoneProc:
+            def poll(self_inner):
+                os.makedirs(os.path.join(captured["tmp"], ".git"), exist_ok=True)
+                return 0
+
+            def kill(self_inner):
+                pass
+
+        def fake_popen(args, **kw):
+            captured["tmp"] = args[-1]
+            return DoneProc()
+
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=fake_popen):
+            sm.clone("xerktech/Turma")
+        # Something else claims the dest before the poll reaps the clone.
+        os.makedirs(os.path.join(self.repos_root, "Turma"))
+        sm._poll_clones()
+        self.assertEqual(sm.clones["Turma"]["status"], "error")
+        self.assertIn("appeared under the repos root", sm.clones["Turma"]["error"])
+        self.assertFalse(os.path.isdir(captured["tmp"]))
+
+    def test_sweep_survives_a_missing_clones_dir(self):
+        sm = self.make_manager()
+        self.assertFalse(os.path.isdir(ha.CLONES_TMP_ROOT))
+        sm._sweep_clone_tmp()  # must not raise
+
+    def test_sweep_leaves_a_recently_written_staging_dir(self):
+        # A crash-orphaned git may still be writing its staging dir; rmtree'ing it
+        # mid-write is the corruption the sweep must never cause, so a dir touched
+        # within CLONE_TMP_MIN_AGE_SEC is left for a later boot.
+        sm = self.make_manager()
+        os.makedirs(ha.CLONES_TMP_ROOT)
+        fresh = os.path.join(ha.CLONES_TMP_ROOT, "Turma-999")
+        os.makedirs(fresh)  # just created -> recent mtime
+        sm._sweep_clone_tmp()
+        self.assertTrue(os.path.isdir(fresh))
+        # Aged past the window, it is reaped.
+        old = time.time() - (ha.CLONE_TMP_MIN_AGE_SEC + 5)
+        os.utime(fresh, (old, old))
+        sm._sweep_clone_tmp()
+        self.assertFalse(os.path.isdir(fresh))
+
+    def test_sweep_keeps_a_dir_with_a_fresh_deep_file(self):
+        # The residual the mtime guard must close: git streams into a deep pack
+        # file, bumping ITS mtime but not the staging dir's. A stale TOP-LEVEL
+        # mtime must not fool the sweep into deleting a dir a live orphan git is
+        # still writing — freshness is the newest file anywhere under it.
+        sm = self.make_manager()
+        os.makedirs(ha.CLONES_TMP_ROOT)
+        staging = os.path.join(ha.CLONES_TMP_ROOT, "Turma-1")
+        pack = os.path.join(staging, ".git", "objects", "pack")
+        os.makedirs(pack)
+        packfile = os.path.join(pack, "tmp_pack_incoming")
+        open(packfile, "w").close()
+        # Age every DIRECTORY mtime well past the window; leave the file fresh.
+        old = time.time() - (ha.CLONE_TMP_MIN_AGE_SEC + 60)
+        for d in (staging, os.path.join(staging, ".git"),
+                  os.path.join(staging, ".git", "objects"), pack):
+            os.utime(d, (old, old))
+        sm._sweep_clone_tmp()
+        self.assertTrue(os.path.isdir(staging))  # kept: the deep file is fresh
+        # Once the deep file goes stale too, it is reaped.
+        os.utime(packfile, (old, old))
+        sm._sweep_clone_tmp()
+        self.assertFalse(os.path.isdir(staging))
+
+    def test_a_duplicate_in_flight_clone_is_a_no_op(self):
+        # Staging keeps dest empty for the whole clone, so a second request for a
+        # repo already being cloned must be refused WITHOUT touching the live job
+        # — the two share a staging path, and clobbering it kills the first git.
+        sm = self.make_manager()
+
+        class RunningProc:
+            killed = False
+
+            def poll(self_inner):
+                return None
+
+            def kill(self_inner):
+                self_inner.killed = True
+
+        procs = []
+
+        def fake_popen(args, **kw):
+            os.makedirs(os.path.join(args[-1], ".git"), exist_ok=True)
+            p = RunningProc()
+            procs.append(p)
+            return p
+
+        with mock.patch.object(ha.subprocess, "Popen",
+                               side_effect=fake_popen) as popen:
+            sm.clone("xerktech/Turma")
+            first = sm.clones["Turma"]
+            tmp = first["tmp"]
+            sm.clone("xerktech/Turma")  # duplicate while the first is in flight
+            # Only ONE git launched; the live job and its staging dir untouched.
+            self.assertEqual(popen.call_count, 1)
+        self.assertIs(sm.clones["Turma"], first)
+        self.assertTrue(os.path.isdir(os.path.join(tmp, ".git")))
+        self.assertFalse(procs[0].killed)
+        # A terminal job does NOT block a fresh re-clone.
+        first["status"] = "error"
+        with mock.patch.object(ha.subprocess, "Popen",
+                               side_effect=fake_popen) as popen2:
+            sm.clone("xerktech/Turma")
+            self.assertEqual(popen2.call_count, 1)
+        self.assertEqual(sm.clones["Turma"]["status"], "cloning")
+
+    def test_kill_clones_reaps_live_clones_at_shutdown(self):
+        sm = self.make_manager()
+
+        class RunningProc:
+            killed = False
+
+            def poll(self_inner):
+                return None
+
+            def kill(self_inner):
+                self_inner.killed = True
+
+        captured = {}
+
+        def fake_popen(args, **kw):
+            os.makedirs(os.path.join(args[-1], ".git"), exist_ok=True)
+            captured["tmp"] = args[-1]
+            captured["proc"] = RunningProc()
+            return captured["proc"]
+
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=fake_popen):
+            sm.clone("xerktech/Turma")
+        sm._kill_clones()
+        self.assertTrue(captured["proc"].killed)
+        self.assertFalse(os.path.isdir(captured["tmp"]))
 
 
 class TestRepoHeadReady(unittest.TestCase):
@@ -16206,10 +16452,12 @@ class TestSpawnDuringAnUnfinishedClone(ManagerMixin, unittest.TestCase):
         self.assertEqual(self._worktree_adds()[-1][-1], "origin/main")
 
     def test_an_interrupted_clone_says_so_at_once(self):
-        # A clone does NOT outlive its manager — the native launcher runs
-        # hub-agent.py as its managed foreground process — and `clone()`
+        # A directory Turma did not create sits at the dest (a hand-run clone, a
+        # bare `git init`, or a legacy pre-XERK-374 partial) and `clone()`
         # refuses a dest that exists, so nothing here can retry. One beat, not
-        # the deadline, and the message names the partial checkout.
+        # the deadline, and the message names it. (Since XERK-374 our OWN
+        # interrupted clones no longer land here — they stage under
+        # .turma/clones and the re-clone branch handles them.)
         sm = self._manager(cloning=False)
         sm.clone = mock.Mock()
         sm.spawn("gdt-files", await_clone_owner="xerktech/gdt-files")
@@ -27203,6 +27451,16 @@ class TestUpdatingAnnounce(ManagerMixin, unittest.TestCase):
             with self.assertRaises(SystemExit):
                 sm._handle_shutdown(ha.signal.SIGTERM, None)
         self.assertEqual(calls, [("restart", None)])
+
+    def test_shutdown_reaps_in_flight_clones(self):
+        # A clone can't be adopted across a restart (XERK-374), so a graceful
+        # shutdown must kill it rather than orphan a git the boot sweep races.
+        sm = self.make_manager()
+        with mock.patch.object(sm, "_announce_updating"), \
+             mock.patch.object(sm, "_kill_clones") as kill_clones:
+            with self.assertRaises(SystemExit):
+                sm._handle_shutdown(ha.signal.SIGTERM, None)
+        kill_clones.assert_called_once_with()
 
 
 class TestRestartAgent(ManagerMixin, unittest.TestCase):
