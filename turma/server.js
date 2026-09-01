@@ -405,7 +405,15 @@ function checkSpawnAgentType(cmd, hostKey) {
 // Deliberately scoped to root: a worktree session may still choose bypass —
 // closing that needs the filesystem/uid change the ticket weighs.
 function checkSpawnPermissionMode(cmd) {
-  if (cmd.permissionMode === "bypassPermissions" && cmd.repo === ROOT_REPO_NAME) {
+  // Trim before the compare so the hub agrees with the AGENT, which strips
+  // whitespace before its enum check (resolve_permission_mode). Without this a
+  // padded " bypassPermissions " on a root repo would 200 here and then land as
+  // an errored session card instead of the clean 409 (XERK-264). Casing/other
+  // non-enum spellings the agent rejects as "unknown mode" are not this gate's
+  // job — the hub never validated the mode enum; it only owns the root+bypass
+  // refusal, and that is the one value both sides must normalize identically.
+  const mode = typeof cmd.permissionMode === "string" ? cmd.permissionMode.trim() : "";
+  if (mode === "bypassPermissions" && cmd.repo === ROOT_REPO_NAME) {
     return {
       status: 409,
       error: "bypassPermissions is not allowed for a repos-root session",
@@ -10370,7 +10378,8 @@ const server = http.createServer(async (req, res) => {
         // it. Refused only when we can see the session is root; if the record
         // isn't in the payload yet the agent's own set_mode gate still refuses.
         const modeSess = (agents[key].sessions || []).find((x) => x.id === sessionId);
-        if (modeSess && modeSess.root && permissionMode === "bypassPermissions") {
+        // Trim to match the agent's own strip (set_mode) — see checkSpawnPermissionMode.
+        if (modeSess && modeSess.root && permissionMode.trim() === "bypassPermissions") {
           return json(res, 409, {
             error: "bypassPermissions is not allowed for a repos-root session",
           });

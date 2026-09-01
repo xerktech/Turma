@@ -3258,6 +3258,14 @@ test("http: XERK-309 bypassPermissions refused for a repos-root session", async 
   });
   assert.equal(okWorktree.status, 200);
 
+  // A whitespace-padded value is normalized like the agent's own strip, so a
+  // padded " bypassPermissions " on root still 409s (XERK-264) rather than 200ing
+  // and landing as an errored card. The sessions route forwards the field raw.
+  const padded = await request("POST", "/api/agents/hroot/sessions", {
+    body: { repo: "(root)", permissionMode: " bypassPermissions " }, headers: userHeaders,
+  });
+  assert.equal(padded.status, 409);
+
   // Only the two 200s queued a spawn; the refused one queued nothing.
   const q = await beat({ device: "hroot", repos });
   const spawns = q.body.commands.filter((c) => c.type === "spawn");
@@ -3284,6 +3292,11 @@ test("http: XERK-309 bypassPermissions refused for a repos-root session", async 
   });
   assert.equal(modeRefused.status, 409);
   assert.match(modeRefused.body.error, /repos-root/);
+  // Padded value on the live route is normalized the same way.
+  const modePadded = await request("POST", "/api/agents/hroot/sessions/rs1/mode", {
+    body: { permissionMode: " bypassPermissions " }, headers: userHeaders,
+  });
+  assert.equal(modePadded.status, 409);
   const modeOk = await request("POST", "/api/agents/hroot/sessions/ws1/mode", {
     body: { permissionMode: "bypassPermissions" }, headers: userHeaders,
   });
