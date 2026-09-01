@@ -4976,6 +4976,18 @@ function normalizeRecord(a) {
   normalizeRetired(a);
   normalizeJira(a);
   normalizeClones(a);
+  // XERK-455: the AgentInfo blocks that were TYPED on the clients but never
+  // coerced, so each was served raw and one wrong-typed value threw the whole
+  // atomic /api/agents decode on Android.
+  normalizeCodingAgent(a);
+  normalizeClaudeAuth(a);
+  normalizeCapacity(a);
+  normalizeGithub(a);
+  normalizeGitSources(a);
+  normalizeRepos(a);
+  normalizeClosedSessions(a);
+  normalizeUploadMax(a);
+  normalizeUpdating(a);
 }
 
 /**
@@ -5016,6 +5028,251 @@ function normalizeClones(a) {
   }
 }
 
+// ============================================================================
+// XERK-455: the typed-but-uncoerced /api/agents blocks.
+//
+// A field becomes decode-fatal the moment a client TYPES it (CLAUDE.md's
+// heartbeat contract). A full /api/agents decode is ATOMIC on Android, so ONE
+// host beating a wrong-typed value throws for the WHOLE array and every OTHER
+// host silently disappears from that phone while the tile still reads "N / N
+// online" (per-host SSE decodes individually, so with SSE healthy the bad host
+// is merely missing; with SSE down the raw decoder exception replaces the
+// screen). These blocks were typed on AgentInfo/SessionInfo but never coerced.
+//
+// Each coerces to the "can't tell" value the client already handles for an
+// absent/older-agent block: a non-object block DROPPED (→ null default), a
+// wrong-typed typed sub-field DROPPED (→ its default), a non-array list
+// REWRITTEN to [] and a non-object element FILTERED — never a fabricated
+// plausible value. String sub-fields are LEFT to the decoder's leniency: it
+// coerces a number into a String (`startedAt: 5` survives), so a String field
+// is not fatal and coercing it would fight the decoder for no gain.
+//
+// All are hoisted `function` declarations and every bound is an INLINE literal:
+// they run from loadState's restore loop near the top of the file, where a
+// module `const` is in its TDZ and the ReferenceError lands in the restore's
+// catch and empties the WHOLE registry (XERK-301). Each guards its own input
+// shape and never throws, so a bad value in one cannot abandon the record
+// before the others run (see normalizeRecord's ordering comment).
+// ============================================================================
+
+// A JSON number that decodes into a Kotlin Int (int32) / Long. Anything else —
+// a string, object, array, bool, non-integer, or out-of-range value — is fatal
+// for the typed field, so the caller drops the key and the client's default (0)
+// applies. Long takes any JS-safe integer; Int is held to the 32-bit range a
+// larger value would overflow on decode.
+function wireInt32(v) {
+  return typeof v === "number" && Number.isSafeInteger(v) &&
+    v >= -2147483648 && v <= 2147483647;
+}
+function wireLong(v) {
+  return typeof v === "number" && Number.isSafeInteger(v);
+}
+// A JSON number that decodes into a Kotlin Double (transcriptAgeSec), integers
+// included. A non-number is fatal for the typed field.
+function wireDouble(v) {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+// Coerce one GithubRepo-shaped element (github.repos / gitSources[].repos): its
+// only non-string typed field is `isPrivate` (Boolean on Android).
+function coerceGithubRepoElem(r) {
+  if (objectish(r) && "isPrivate" in r && typeof r.isPrivate !== "boolean") {
+    delete r.isPrivate;
+  }
+}
+
+// Rewrite a typed List<Object> field to an array of plain objects (a non-array
+// is decode-fatal, a non-object element as fatal as a wrong-typed field inside
+// one — same rule normalizeSessions states for the sessions array). Returns the
+// cleaned array, or null when the key is absent (absent stays absent).
+function coerceObjectList(owner, key) {
+  if (!(key in owner)) return null;
+  if (!Array.isArray(owner[key])) { owner[key] = []; return owner[key]; }
+  owner[key] = owner[key].filter(objectish);
+  return owner[key];
+}
+
+// Coerce a List<String> field: non-array → [], and DROP any element that is not
+// a string or a number — a number decodes leniently into a String, but an
+// object/array/bool/null element is decode-fatal (Android `labels`,
+// `questionOptions`, `newPrUrls`).
+function coerceStringList(owner, key) {
+  if (!(key in owner)) return;
+  if (!Array.isArray(owner[key])) { owner[key] = []; return; }
+  owner[key] = owner[key].filter((x) => typeof x === "string" || typeof x === "number");
+}
+
+// Coerce one PrInfo element (session.prs / closedSessions[].prs /
+// repos[].resumable[].prs). url/state/title/checks/mergeable/ready are Strings
+// (lenient); its one non-string typed leaf is `number` (Int) — and a PR number
+// comes from scraping `gh pr`, so a parse hiccup, not just malice, can flip it.
+function coercePrElem(p) {
+  if (objectish(p) && "number" in p && !wireInt32(p.number)) delete p.number;
+}
+
+// Coerce one transcript block (LiveSignals.tail[].blocks[], polymorphic on `t`,
+// unknown types → UnknownBlock so the type itself is safe). Its typed non-string
+// leaves are the `truncated`/`isError` booleans and the tool_use `files` list
+// (each SendFile's `shed` a boolean).
+function coerceBlockElem(b) {
+  if (!objectish(b)) return;
+  for (const k of ["truncated", "isError"]) {
+    if (k in b && typeof b[k] !== "boolean") delete b[k];
+  }
+  const files = coerceObjectList(b, "files");
+  if (files) for (const f of files) {
+    if ("shed" in f && typeof f.shed !== "boolean") delete f.shed;
+  }
+}
+
+// Coerce a session's live TUI probe (LiveSignals on Android) in place — the
+// `.agents` list is sanitized separately by the caller. Its non-null booleans
+// (lastHasToolUse/bridgeAttached/questionMulti) are fatal if non-bool; its
+// nullable primitives (paneBusy Boolean?, questionIndex/questionTotal Int?,
+// transcriptAgeSec Double?) survive a PRIMITIVE mismatch (coerceInputValues →
+// null) but an object/array in one is fatal, so keep only the right type; its
+// lists are fatal if non-array or holding a non-object element.
+function coerceLiveSignals(live) {
+  if (!objectish(live)) return;
+  for (const k of ["lastHasToolUse", "bridgeAttached", "questionMulti", "paneBusy"]) {
+    if (k in live && typeof live[k] !== "boolean") delete live[k];
+  }
+  for (const k of ["questionIndex", "questionTotal"]) {
+    if (k in live && !wireInt32(live[k])) delete live[k];
+  }
+  if ("transcriptAgeSec" in live && !wireDouble(live.transcriptAgeSec)) delete live.transcriptAgeSec;
+  coerceStringList(live, "questionOptions");
+  coerceStringList(live, "newPrUrls");
+  coerceObjectList(live, "questionOptionsRich"); // QuestionOption leaves are all Strings
+  const tail = coerceObjectList(live, "tail");
+  if (tail) for (const e of tail) {
+    const blocks = coerceObjectList(e, "blocks");
+    if (blocks) blocks.forEach(coerceBlockElem);
+  }
+}
+
+// `codingAgent` (CodingAgent? on Android, TIER 2). Only the top-level shape is
+// fatal — its name/version are Strings, so a number in one survives leniently.
+function normalizeCodingAgent(a) {
+  if (!a || typeof a !== "object") return;
+  if ("codingAgent" in a && !objectish(a.codingAgent)) delete a.codingAgent;
+}
+
+// `claudeAuth` (ClaudeAuth? on Android, XERK-98). TIER 1 for likelihood: read
+// straight out of ~/.claude/.credentials.json, a file Claude Code owns and can
+// reshape on any upgrade, guarded agent-side by a single isinstance. present/
+// needsLogin/expiringSoon are non-null Boolean; refreshExpiresAt is Long? (ms).
+function normalizeClaudeAuth(a) {
+  if (!a || typeof a !== "object") return;
+  if (!("claudeAuth" in a)) return;
+  if (!objectish(a.claudeAuth)) { delete a.claudeAuth; return; }
+  const c = a.claudeAuth;
+  for (const k of ["present", "needsLogin", "expiringSoon"]) {
+    if (k in c && typeof c[k] !== "boolean") delete c[k];
+  }
+  if ("refreshExpiresAt" in c && !wireLong(c.refreshExpiresAt)) delete c.refreshExpiresAt;
+}
+
+// `capacity` (Capacity? on Android). maxSessions/running/queued/free are Int,
+// rootRunning is Boolean.
+function normalizeCapacity(a) {
+  if (!a || typeof a !== "object") return;
+  if (!("capacity" in a)) return;
+  if (!objectish(a.capacity)) { delete a.capacity; return; }
+  const c = a.capacity;
+  for (const k of ["maxSessions", "running", "queued", "free"]) {
+    if (k in c && !wireInt32(c[k])) delete c[k];
+  }
+  if ("rootRunning" in c && typeof c.rootRunning !== "boolean") delete c.rootRunning;
+}
+
+// `github` (GithubInfo? on Android, TIER 2). available is the Boolean gate the
+// clone bar reads; repos is List<GithubRepo>.
+function normalizeGithub(a) {
+  if (!a || typeof a !== "object") return;
+  if (!("github" in a)) return;
+  if (!objectish(a.github)) { delete a.github; return; }
+  const g = a.github;
+  if ("available" in g && typeof g.available !== "boolean") delete g.available;
+  const repos = coerceObjectList(g, "repos");
+  if (repos) repos.forEach(coerceGithubRepoElem);
+}
+
+// `gitSources` (List<GitSourceInfo> on Android, XERK-155). Non-array → [],
+// non-object element dropped; each element's available is Boolean and its
+// repos is List<GithubRepo>.
+function normalizeGitSources(a) {
+  if (!a || typeof a !== "object") return;
+  const list = coerceObjectList(a, "gitSources");
+  if (!list) return;
+  for (const s of list) {
+    if ("available" in s && typeof s.available !== "boolean") delete s.available;
+    const repos = coerceObjectList(s, "repos");
+    if (repos) repos.forEach(coerceGithubRepoElem);
+  }
+}
+
+// `repos` (List<RepoInfo> on Android). Non-array → [], non-object element
+// dropped; each element's root is Boolean and its resumable is a
+// List<ResumableInfo> whose own root is Boolean and ticket a nullable object.
+function normalizeRepos(a) {
+  if (!a || typeof a !== "object") return;
+  const list = coerceObjectList(a, "repos");
+  if (!list) return;
+  for (const r of list) {
+    if ("root" in r && typeof r.root !== "boolean") delete r.root;
+    const res = coerceObjectList(r, "resumable");
+    if (res) {
+      for (const t of res) {
+        if ("root" in t && typeof t.root !== "boolean") delete t.root;
+        if ("ticket" in t && !objectish(t.ticket)) delete t.ticket;
+        const prs = coerceObjectList(t, "prs");
+        if (prs) prs.forEach(coercePrElem);
+      }
+    }
+  }
+}
+
+// `closedSessions` (List<ClosedSessionInfo> on Android). Non-array → [],
+// non-object element dropped; root/summaryManual are Boolean, ticket a nullable
+// object, prs a List<PrInfo>.
+function normalizeClosedSessions(a) {
+  if (!a || typeof a !== "object") return;
+  const list = coerceObjectList(a, "closedSessions");
+  if (!list) return;
+  for (const c of list) {
+    for (const k of ["root", "summaryManual"]) {
+      if (k in c && typeof c[k] !== "boolean") delete c[k];
+    }
+    if ("ticket" in c && !objectish(c.ticket)) delete c.ticket;
+    const prs = coerceObjectList(c, "prs");
+    if (prs) prs.forEach(coercePrElem);
+  }
+}
+
+// `uploadMaxBytes` (Long on Android — the attachment cap AND the capability
+// flag). A non-numeric value drops to 0, which every client reads as "this host
+// cannot take attachments", the same as an agent predating the feature.
+function normalizeUploadMax(a) {
+  if (!a || typeof a !== "object") return;
+  if ("uploadMaxBytes" in a && !wireLong(a.uploadMaxBytes)) delete a.uploadMaxBytes;
+}
+
+// `updating` (UpdatingInfo? on Android, XERK-29) — an announced-update marker.
+// Found by the second QA pass. It is NOT a HEARTBEAT_KNOWN_KEYS member, so
+// sanitizeHeartbeat's unknown-key sweep only size-bounds it; it is spread onto
+// the record and served RAW for an offline host whose `until` is still in the
+// future, so a wrong shape fails the atomic /api/agents decode. `version` is a
+// String (an object/array in it is fatal — a number is lenient), `until` a Long.
+function normalizeUpdating(a) {
+  if (!a || typeof a !== "object") return;
+  if (!("updating" in a)) return;
+  if (!objectish(a.updating)) { delete a.updating; return; }
+  const u = a.updating;
+  if ("until" in u && !wireLong(u.until)) delete u.until;
+  if ("version" in u && u.version !== null && typeof u.version === "object") delete u.version;
+}
+
 /**
  * `jira.siteKey` coerced to a string, or dropped (XERK-348).
  *
@@ -5031,19 +5288,56 @@ function normalizeClones(a) {
  */
 function normalizeJira(a) {
   if (!a || typeof a !== "object") return;
+  if (!("jira" in a)) return;
+  // A non-object `jira` (JiraBlock? on Android) is itself decode-fatal and must
+  // be DROPPED, not merely skipped (XERK-455) — the old early `return` left the
+  // raw value on the served record. Absent stays absent (an agent with no
+  // tracker reports no block).
+  if (!objectish(a.jira)) { delete a.jira; return; }
   const j = a.jira;
-  if (!j || typeof j !== "object" || Array.isArray(j)) return;
   if ("siteKey" in j && typeof j.siteKey !== "string") delete j.siteKey;
+  // available/configured/truncated are non-null Boolean on Android — `available`
+  // is TIER 2 (built from tracker tool output, so a schema change or an error
+  // payload can flip its shape). Drop a non-bool to the client's `false`.
+  for (const k of ["available", "configured", "truncated"]) {
+    if (k in j && typeof j[k] !== "boolean") delete j[k];
+  }
   // Per-ticket triage assessment (XERK-481). `jira` is a KNOWN heartbeat key, so
   // sanitizeHeartbeat's unknown-field sweep never looks inside it — a field
   // typed under a ticket has to be coerced HERE, the same rule normalizeSessions
   // states for the `sessions` array. Android TYPES `JiraTicket.triage`, so one
   // host beating a malformed block would fail the whole fleet decode; coercing
   // it in normalizeRecord covers the state.json restore too.
-  if (Array.isArray(j.tickets)) {
-    for (const t of j.tickets) {
-      if (t && typeof t === "object" && !Array.isArray(t)) sanitizeTicketTriage(t);
+  //
+  // `tickets` is List<JiraTicket>: a non-array is fatal (→ []), and a non-object
+  // element is as fatal as a wrong-typed field inside one — the old loop only
+  // SKIPPED a non-object element, leaving it in the served array (XERK-455).
+  // Read `j.tickets` directly (not the generic list helper) so the XERK-325
+  // tripwire keeps attributing this coercion pass to normalizeJira.
+  if ("tickets" in j) {
+    if (!Array.isArray(j.tickets)) {
+      j.tickets = [];
+    } else {
+      j.tickets = j.tickets.filter(objectish);
+      for (const t of j.tickets) {
+        coerceStringList(t, "labels"); // List<String>: non-array or object element is fatal
+        if ("repoGuess" in t && !objectish(t.repoGuess)) {
+          delete t.repoGuess; // RepoGuess?
+        } else if (objectish(t.repoGuess)) {
+          // cloned/manual are non-null Booleans inside a well-shaped block.
+          for (const k of ["cloned", "manual"]) {
+            if (k in t.repoGuess && typeof t.repoGuess[k] !== "boolean") delete t.repoGuess[k];
+          }
+        }
+        sanitizeTicketTriage(t);
+      }
     }
+  }
+  // repoOptions is List<RepoOption> (the manual repo picker's options); its
+  // `cloned` is a non-null Boolean. Entirely uncoerced before XERK-455.
+  const opts = coerceObjectList(j, "repoOptions");
+  if (opts) for (const o of opts) {
+    if ("cloned" in o && typeof o.cloned !== "boolean") delete o.cloned;
   }
 }
 
@@ -5238,6 +5532,9 @@ function normalizeSessions(payload) {
     if (live && "agents" in live) {
       live.agents = sanitizeLiveAgents(live.agents) || [];
     }
+    // XERK-455: the rest of LiveSignals' typed leaves (its non-null booleans,
+    // nullable int/double, and lists) — `.agents` was already sanitized above.
+    coerceLiveSignals(live);
     for (const k of ["modelSource", "modelSourceAt", "agentType"]) {
       if (k in s && typeof s[k] !== "string") s[k] = "";
     }
@@ -5280,6 +5577,39 @@ function normalizeSessions(payload) {
         s[k] = (typeof c === "number" && Number.isSafeInteger(c) &&
           c > 0 && c <= 2_147_483_647) ? c : null;
       }
+    }
+    // XERK-455: the rest of SessionInfo's typed-but-uncoerced fields.
+    // git/ticket/work are nullable objects (GitState?/TicketRef?/WorkInfo?); a
+    // non-object is decode-fatal, coerced to the null every client handles.
+    // (A non-object per-session `usage` is already dropped by normalizeUsage's
+    // dropUnusableUsage, so it is not repeated here.)
+    for (const k of ["git", "ticket", "work"]) {
+      if (k in s && !objectish(s[k])) s[k] = null;
+    }
+    // git.dirtyFiles is a non-null Int inside that block; work's aheadOfBase/
+    // aheadOfRemote are Int? and pushed a Boolean? — a well-shaped block with a
+    // wrong-typed leaf survives the shape check above, so coerce the leaves too.
+    if (objectish(s.git) && "dirtyFiles" in s.git && !wireInt32(s.git.dirtyFiles)) {
+      delete s.git.dirtyFiles;
+    }
+    if (objectish(s.work)) {
+      for (const k of ["aheadOfBase", "aheadOfRemote"]) {
+        if (k in s.work && !wireInt32(s.work[k])) delete s.work[k];
+      }
+      if ("pushed" in s.work && typeof s.work.pushed !== "boolean") delete s.work.pushed;
+    }
+    // prs is List<PrInfo>: a non-object element is decode-fatal, and so is a
+    // non-int `number` INSIDE an element. The non-array container cannot reach
+    // the ingest (the hub 400s that heartbeat), but the state.json restore path
+    // and defence-in-depth coerce it the same way.
+    { const prs = coerceObjectList(s, "prs"); if (prs) prs.forEach(coercePrElem); }
+    // root and newWorkSincePrs are non-null Boolean; ttydPort and restartCount
+    // are Int. A wrong type drops to the client's default (false / 0).
+    for (const k of ["root", "newWorkSincePrs"]) {
+      if (k in s && typeof s[k] !== "boolean") delete s[k];
+    }
+    for (const k of ["ttydPort", "restartCount"]) {
+      if (k in s && !wireInt32(s[k])) delete s[k];
     }
   }
 }
@@ -12297,6 +12627,18 @@ if (process.env.TURMA_TEST) {
     normalizeRetired,
     normalizeJira,
     normalizeClones,
+    // XERK-455: the typed-but-uncoerced blocks, exported alongside the rest of
+    // the ingest coercions so a test can hold each guard directly.
+    normalizeCodingAgent,
+    normalizeClaudeAuth,
+    normalizeCapacity,
+    normalizeGithub,
+    normalizeGitSources,
+    normalizeRepos,
+    normalizeClosedSessions,
+    normalizeUploadMax,
+    normalizeUpdating,
+    normalizeSessions,
     CLONE_PROGRESS_MAX: 120,
     normalizeSpawnRefusals,
     // The KEY half of that pair, shared by the ingest and the restore for the

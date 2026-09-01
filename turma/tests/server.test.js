@@ -2626,6 +2626,165 @@ test("http: an agent cannot put `retired` on its own record (XERK-338)", async (
   delete agents["retired-forger"];
 });
 
+test("XERK-455: typed /api/agents fields are coerced at ingest, not served raw", async () => {
+  // A field is decode-fatal on Android the moment a client TYPES it: /api/agents
+  // decodes atomically, so one host beating a wrong-typed value throws the whole
+  // array and every OTHER host vanishes from the phone while the tile still reads
+  // "N / N online". These blocks were typed on AgentInfo/SessionInfo but never
+  // coerced. Beat every confirmed-fatal shape at once and assert the served
+  // record carries the "can't tell" value, never the raw junk.
+  const bad = {
+    device: "xerk455-forger",
+    codingAgent: "not-an-object",
+    claudeAuth: { present: "yes", needsLogin: 1, expiringSoon: {}, refreshExpiresAt: "soon" },
+    capacity: { maxSessions: "lots", running: [], queued: {}, free: "0", rootRunning: "no" },
+    github: { available: "yes", repos: "nope" },
+    gitSources: "not-an-array",
+    repos: ["bare-string", { name: "Turma", root: "yes", resumable: "nope" }],
+    closedSessions: [5, { id: "c1", root: "yes", summaryManual: 1, ticket: "x", prs: "nope" }],
+    uploadMaxBytes: "unlimited",
+    jira: "not-an-object",
+    sessions: [{
+      id: "s1", git: "x", ticket: [], work: 5, prs: "nope",
+      root: "yes", newWorkSincePrs: 1, ttydPort: "80", restartCount: {},
+    }],
+  };
+  const r = await request("POST", "/api/heartbeat", { body: bad, headers: agentHeaders });
+  assert.equal(r.status, 200);
+  const rec = (await request("GET", "/api/agents", { headers: userHeaders }))
+    .body.agents.find((a) => a.key === "xerk455-forger");
+
+  // A non-object block is DROPPED (→ null default); a wrong-typed sub-field gone.
+  assert.equal("codingAgent" in rec, false);
+  assert.equal("jira" in rec, false);
+  assert.equal("uploadMaxBytes" in rec, false);
+  assert.deepEqual(rec.claudeAuth, {});
+  assert.deepEqual(rec.capacity, {});
+  assert.deepEqual(rec.github, { repos: [] });
+  // A non-array list becomes [], a non-object element is filtered out.
+  assert.deepEqual(rec.gitSources, []);
+  assert.deepEqual(rec.repos, [{ name: "Turma", resumable: [] }]);
+  assert.deepEqual(rec.closedSessions, [{ id: "c1", prs: [] }]);
+  // SessionInfo: nullable objects → null, non-array prs → [], bad bool/int gone.
+  const s = rec.sessions[0];
+  assert.equal(s.git, null);
+  assert.equal(s.ticket, null);
+  assert.equal(s.work, null);
+  assert.deepEqual(s.prs, []);
+  assert.equal("root" in s, false);
+  assert.equal("newWorkSincePrs" in s, false);
+  assert.equal("ttydPort" in s, false);
+  assert.equal("restartCount" in s, false);
+
+  // A legitimate record rides through untouched — the coercion validates, it
+  // does not repair.
+  const good = {
+    device: "xerk455-honest",
+    codingAgent: { name: "claude", version: "1.2" },
+    claudeAuth: { present: true, needsLogin: false, expiringSoon: false, refreshExpiresAt: 1786400000000 },
+    capacity: { maxSessions: 4, running: 1, queued: 0, free: 3, rootRunning: false },
+    github: { available: true, login: "octo", repos: [{ nameWithOwner: "x/y", name: "y", isPrivate: true }] },
+    gitSources: [{ source: "azure", label: "AZ", available: true, user: "u", repos: [] }],
+    repos: [{ name: "Turma", root: false, lastActivity: "2026-08-01", resumable: [] }],
+    closedSessions: [{ id: "c2", root: false, summaryManual: false, prs: [] }],
+    uploadMaxBytes: 5000000,
+    jira: { available: true, configured: true, siteKey: "acme.atlassian.net", tickets: [] },
+    sessions: [{
+      id: "s2", git: { repoName: "Turma", branch: "main", dirtyFiles: 0 },
+      root: false, newWorkSincePrs: false, ttydPort: 8080, restartCount: 2, prs: [],
+    }],
+  };
+  assert.equal((await request("POST", "/api/heartbeat", { body: good, headers: agentHeaders })).status, 200);
+  const kept = (await request("GET", "/api/agents", { headers: userHeaders }))
+    .body.agents.find((a) => a.key === "xerk455-honest");
+  assert.deepEqual(kept.codingAgent, { name: "claude", version: "1.2" });
+  assert.deepEqual(kept.capacity, { maxSessions: 4, running: 1, queued: 0, free: 3, rootRunning: false });
+  assert.equal(kept.uploadMaxBytes, 5000000);
+  assert.equal(kept.jira.available, true);
+  assert.equal(kept.sessions[0].ttydPort, 8080);
+  assert.equal(kept.sessions[0].restartCount, 2);
+  assert.deepEqual(kept.sessions[0].git, { repoName: "Turma", branch: "main", dirtyFiles: 0 });
+
+  // The restore path runs the SAME coercion (normalizeRecord, ingest AND
+  // state.json restore). Prove every guard directly, INCLUDING the nested typed
+  // leaves a container-only coercion walks past — the holes QA found: PrInfo
+  // `number`, LiveSignals booleans/int/double/lists, WorkInfo ints/pushed, and
+  // the jira ticket internals (labels object element, repoGuess bools,
+  // repoOptions.cloned). registry-restore.test.js pins the boot-time TDZ half.
+  const restored = {
+    device: "xerk455-restore",
+    codingAgent: [], claudeAuth: 7, capacity: "x", github: [], gitSources: 5,
+    repos: "x", closedSessions: 9, uploadMaxBytes: {},
+    // updating is NOT a known heartbeat key — it rides the unknown-key spread and
+    // is served raw for an offline host (found by the second QA pass).
+    updating: { version: {}, until: "soon" },
+    jira: { available: "yes", tickets: [
+      { key: "K", labels: [{}, "keep", 3], repoGuess: { repo: "R", cloned: {}, manual: "no" } },
+      "bad-ticket",
+    ], repoOptions: [{ name: "r", cloned: {} }, 5] },
+    sessions: [{
+      id: "s", prs: [{ url: "u", number: {} }, 9],
+      work: { aheadOfBase: {}, aheadOfRemote: 3, pushed: "x", baseRef: "main" },
+      session: { lastHasToolUse: 5, bridgeAttached: "x", questionMulti: {},
+        paneBusy: {}, questionIndex: {}, transcriptAgeSec: {},
+        questionOptions: "no", questionOptionsRich: [7], newPrUrls: "no",
+        tail: [{ id: "t", blocks: [{ t: "text", text: "hi", truncated: 5 }, 9] }] },
+    }],
+  };
+  hub.normalizeRecord(restored);
+  for (const k of ["codingAgent", "claudeAuth", "capacity", "github", "uploadMaxBytes"]) {
+    assert.equal(k in restored, false, `restore left raw ${k}`);
+  }
+  // updating: object shape kept, but the bad version (object) and until dropped.
+  assert.deepEqual(restored.updating, {});
+  assert.deepEqual(restored.gitSources, []);
+  assert.deepEqual(restored.repos, []);
+  assert.deepEqual(restored.closedSessions, []);
+  // jira internals: a bad ticket element filtered, a labels object element
+  // dropped (string + number kept), repoGuess bools dropped, repoOptions.cloned
+  // dropped, and a non-bool `available` gone.
+  assert.deepEqual(restored.jira.tickets, [
+    { key: "K", labels: ["keep", 3], repoGuess: { repo: "R" } },
+  ]);
+  assert.deepEqual(restored.jira.repoOptions, [{ name: "r" }]);
+  assert.equal("available" in restored.jira, false);
+  // session leaves: PrInfo.number dropped + non-object element filtered; WorkInfo
+  // ints/pushed; every LiveSignals bad leaf, down to a tail block's `truncated`.
+  const rs = restored.sessions[0];
+  assert.deepEqual(rs.prs, [{ url: "u" }]);
+  assert.deepEqual(rs.work, { aheadOfRemote: 3, baseRef: "main" });
+  const live = rs.session;
+  for (const k of ["lastHasToolUse", "bridgeAttached", "questionMulti", "paneBusy",
+    "questionIndex", "transcriptAgeSec"]) {
+    assert.equal(k in live, false, `live left raw ${k}`);
+  }
+  assert.deepEqual(live.questionOptions, []);
+  assert.deepEqual(live.questionOptionsRich, []);
+  assert.deepEqual(live.newPrUrls, []);
+  assert.deepEqual(live.tail, [{ id: "t", blocks: [{ t: "text", text: "hi" }] }]);
+
+  // A legitimate record with all those leaves populated is unchanged — validate,
+  // never repair.
+  const goodDeep = {
+    device: "xerk455-gooddeep",
+    updating: { version: "1.2.3", until: 1786400000000 },
+    jira: { available: true, tickets: [{ key: "K", labels: ["a", "b"],
+      repoGuess: { repo: "R", cloned: true, manual: false } }],
+      repoOptions: [{ name: "r", cloned: true }] },
+    sessions: [{ id: "s", prs: [{ url: "u", number: 42, state: "OPEN" }],
+      work: { baseRef: "main", aheadOfBase: 3, pushed: true, aheadOfRemote: 0 },
+      session: { paneBusy: true, lastHasToolUse: false, transcriptAgeSec: 4.5,
+        questionOptions: ["a"], questionIndex: 1, questionTotal: 2,
+        tail: [{ id: "t", blocks: [{ t: "text", text: "hi", truncated: true }] }] } }],
+  };
+  const snapshot = JSON.parse(JSON.stringify(goodDeep));
+  hub.normalizeRecord(goodDeep);
+  assert.deepEqual(goodDeep, snapshot, "a legitimate record must ride through unchanged");
+
+  delete agents["xerk455-forger"];
+  delete agents["xerk455-honest"];
+});
+
 test("http: a raw push is agent-authed and lands byte for byte", async () => {
   // tr1 was ingested by the rendered-layer test above, so its row (and the
   // canonical file the raw directory hangs off) already exists.

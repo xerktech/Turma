@@ -220,10 +220,39 @@ test("every field the restore coerces is reachable from the restore's own line",
       subscription: { key: "abc123", source: "login" },
       localModel: { available: true, model: "qwen", contextTokens: 128000 },
       models: { available: ["opus", "sonnet"], defaultLabel: "Opus 5", at: "2026-08-01" },
+      // XERK-455 blocks, usable half.
+      codingAgent: { name: "claude", version: "1" },
+      claudeAuth: { present: true, needsLogin: false, expiringSoon: false, refreshExpiresAt: 1_786_400_000_000 },
+      capacity: { maxSessions: 4, running: 1, queued: 0, free: 3, rootRunning: false },
+      github: { available: true, login: "octo", repos: [{ nameWithOwner: "x/y", name: "y", isPrivate: false }] },
+      gitSources: [{ source: "azure", label: "AZ", available: true, user: "u", repos: [] }],
+      closedSessions: [{ id: "c", root: false, summaryManual: false, prs: [] }],
+      uploadMaxBytes: 5_000_000,
+      jira: { available: true, configured: true, siteKey: "acme.atlassian.net", tickets: [] },
     },
     junk: {
-      key: "junk", device: "junk", lastSeen: Date.now(), repos: [],
-      sessions: [{ id: "s2", usage: { models: "nope" } }],
+      key: "junk", device: "junk", lastSeen: Date.now(),
+      // XERK-455 blocks, unusable half: a non-object block, a non-array list, a
+      // non-object element, and wrong-typed bool/int sub-fields — every one of
+      // which is decode-fatal on Android and was served raw before this coercion.
+      repos: ["bad", { name: "R", root: "yes", resumable: "no" }],
+      codingAgent: "nope",
+      claudeAuth: 7,
+      capacity: "x",
+      github: [],
+      gitSources: 5,
+      closedSessions: 9,
+      uploadMaxBytes: {},
+      // A WELL-SHAPED jira with unusable internals, so the ticket/repoGuess/
+      // repoOptions leaf coercions run at BOOT (not just the top-level shape).
+      jira: { available: "yes",
+        tickets: [{ key: "K", labels: [{}, "x"], repoGuess: { cloned: {} } }, "bad"],
+        repoOptions: [{ name: "r", cloned: {} }, 5] },
+      sessions: [{ id: "s2", usage: { models: "nope" },
+        git: "x", ticket: [], work: { aheadOfBase: {}, pushed: "x" },
+        prs: [{ url: "u", number: {} }], root: "yes", ttydPort: "80", restartCount: {},
+        session: { lastHasToolUse: 5, transcriptAgeSec: {}, questionOptions: "no",
+          tail: [{ id: "t", blocks: [{ t: "text", text: "hi", truncated: 5 }, 9] }] } }],
       // Every branch of the token-figure walk (XERK-306), including the one
       // that LOGS: its throttle state is a module binding too, so a record that
       // only ever coerces silently would not prove it is reachable.
@@ -253,6 +282,17 @@ test("every field the restore coerces is reachable from the restore's own line",
       junkLimits: hub.agents.junk && hub.agents.junk.limits,
       junkUsage: hub.agents.junk && hub.agents.junk.usage,
       junkRepoUsage: hub.agents.junk && hub.agents.junk.repoUsage,
+      // XERK-455: the blocks whose coercion runs at BOOT from the restore line.
+      junkKeys: hub.agents.junk && Object.keys(hub.agents.junk).sort(),
+      junkRepos: hub.agents.junk && hub.agents.junk.repos,
+      junkGitSources: hub.agents.junk && hub.agents.junk.gitSources,
+      junkClosed: hub.agents.junk && hub.agents.junk.closedSessions,
+      junkSession: hub.agents.junk && hub.agents.junk.sessions,
+      junkJira: hub.agents.junk && hub.agents.junk.jira,
+      soloKept: hub.agents.solo && {
+        codingAgent: hub.agents.solo.codingAgent, capacity: hub.agents.solo.capacity,
+        uploadMaxBytes: hub.agents.solo.uploadMaxBytes,
+      },
     }) + ">>");
   `;
   const r = require("child_process").spawnSync(process.execPath, ["-e", probe], {
@@ -271,4 +311,38 @@ test("every field the restore coerces is reachable from the restore's own line",
   // the nameless model dropped — and `days` kept as the empty map it became.
   assert.deepEqual(out.junkUsage, { totals: { input: 0 }, days: {}, models: [] });
   assert.deepEqual(out.junkRepoUsage, [{}]);
+
+  // XERK-455: a non-object block is DROPPED, a non-array list becomes [], a
+  // non-object element is filtered, and wrong-typed sub-fields are gone — all at
+  // boot, so a bad value could NOT have emptied the registry from the restore's
+  // catch (the TDZ trap the inline helpers avoid).
+  for (const k of ["codingAgent", "claudeAuth", "capacity", "github", "uploadMaxBytes"]) {
+    assert.equal(out.junkKeys.includes(k), false, `restore left raw ${k}`);
+  }
+  assert.deepEqual(out.junkRepos, [{ name: "R", resumable: [] }]);
+  assert.deepEqual(out.junkGitSources, []);
+  assert.deepEqual(out.junkClosed, []);
+  // jira internals coerced at boot: bad ticket filtered, labels object dropped,
+  // repoGuess/repoOptions cloned dropped, non-bool `available` gone.
+  assert.deepEqual(out.junkJira.tickets, [{ key: "K", labels: ["x"], repoGuess: {} }]);
+  assert.deepEqual(out.junkJira.repoOptions, [{ name: "r" }]);
+  assert.equal("available" in out.junkJira, false);
+  // session leaves coerced at boot (the new helpers reached from the restore).
+  assert.equal(out.junkSession[0].git, null);
+  assert.equal(out.junkSession[0].ticket, null);
+  assert.deepEqual(out.junkSession[0].work, {}); // aheadOfBase/pushed dropped
+  assert.deepEqual(out.junkSession[0].prs, [{ url: "u" }]); // number dropped
+  assert.equal("root" in out.junkSession[0], false);
+  assert.equal("ttydPort" in out.junkSession[0], false);
+  assert.equal("restartCount" in out.junkSession[0], false);
+  const live = out.junkSession[0].session;
+  assert.equal("lastHasToolUse" in live, false);
+  assert.equal("transcriptAgeSec" in live, false);
+  assert.deepEqual(live.questionOptions, []);
+  assert.deepEqual(live.tail, [{ id: "t", blocks: [{ t: "text", text: "hi" }] }]);
+  // And the usable half survived untouched (both branches of each guard ran).
+  assert.deepEqual(out.soloKept.codingAgent, { name: "claude", version: "1" });
+  assert.deepEqual(out.soloKept.capacity,
+    { maxSessions: 4, running: 1, queued: 0, free: 3, rootRunning: false });
+  assert.equal(out.soloKept.uploadMaxBytes, 5_000_000);
 });
