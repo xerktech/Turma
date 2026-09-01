@@ -22217,7 +22217,15 @@ class SessionManager:
             (`dsh_pane_busy`), with a pending interaction suppressed the way a
             blocking dialog is. True=busy (mid-turn) or None=unknown
             (uncapturable) is never nudged, matching the tri-state convention
-            every other poller uses.
+            every other poller uses. **Idle also means no LIVE BACKGROUND
+            AGENTS** (XERK-547): "Working" is `paneBusy` OR live agents
+            (XERK-245), and a session that delegates work — a QA/verify
+            subagent, a workflow — ENDS ITS OWN TURN, so the pane drops the
+            interrupt hint and reads idle while the delegated work keeps going.
+            Nudging it to open a PR while it is still waiting on that subagent
+            is the false trigger this ticket closes, so a session with any live
+            agent in its scan state is skipped the same way a busy pane is
+            (all runtimes — every runtime's projection folds `liveAgents`).
           - UNDELIVERED WORK: dirty files, a local branch that was never
             pushed, or commits still ahead of origin, read FRESH — this poller
             runs on the faster PR-status cadence, so it requests a recompute
@@ -22273,6 +22281,18 @@ class SessionManager:
                     sess.get("tmuxName"), self.sess_state.setdefault(sid, {}))
                 if busy is not False or prompt is not None:
                     continue
+            # "Working" is paneBusy OR live background agents (XERK-245): a
+            # session that delegates work (a QA/verify subagent, a workflow)
+            # ENDS ITS OWN TURN — the pane drops the interrupt hint and reads
+            # idle — while the agent it launched keeps running. Nudging it to
+            # deliver a PR while it is still waiting on that work is the false
+            # trigger XERK-547 closes, so a live agent skips the nudge the same
+            # way a busy pane does. Read from the SAME per-session scan state
+            # session_report accumulates liveAgents into (populated for every
+            # runtime, dsh/qwen included — the projection folds it), so this is
+            # up to date by the time this poller runs on the PR-status cadence.
+            if live_agents_report(self.sess_state.get(sid) or {}):
+                continue
             # Force a fresh read of the branch-sync facts: the poller runs more
             # often than the slow facts refresh (USAGE_EVERY), and the undelivered
             # check (pushed / aheadOfRemote) must not be up to a beat stale.

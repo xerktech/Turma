@@ -12824,6 +12824,31 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
             sm._poll_open_pr_nudges()
         self.assertEqual(self._typed(), [])
 
+    def test_live_background_agent_is_not_nudged(self):
+        # XERK-547: the pane reads idle while a delegated agent (e.g. QA) keeps
+        # running, because launching one ends the session's own turn. "Working"
+        # is paneBusy OR live agents, so a live agent must skip the nudge.
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sm.sess_state = {"s1": {"liveAgents": {"a1": {"type": "qa",
+                                                      "label": "QA"}}}}
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+        self.assertNotIn("prOpenNudged", sess)
+
+    def test_no_live_agents_still_nudges(self):
+        # The complement: an empty liveAgents map is not "working" and must not
+        # block a nudge that is otherwise due.
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sm.sess_state = {"s1": {"liveAgents": {}}}
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(len(self._typed()), 1)
+
     def test_unpushed_branch_is_nudged(self):
         sm = self.make_manager()
         sess = self._session(sm, dirty=0, pushed=False, ahead_remote=0)
