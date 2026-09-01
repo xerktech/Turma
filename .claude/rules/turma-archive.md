@@ -139,10 +139,21 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     full store, and it works because the walk sees the bytes gone.
     - **The walk is the BASELINE only**; `writtenSinceWalk` adds every byte appended since, so growth
       is exact (overshoot ≤ one chunk) and only DELETION is stale — `TOTAL_CACHE_MS` can be minutes.
-    - **Deliberately excludes `index.db`** (~2.4x the archive's own size and growing unbounded across
-      fill/wipe cycles, XERK-332) — a ceiling enforced by refusing INGEST can only bound what
-      refusing can reclaim, and refusing can't shrink a database (nothing VACUUMs). Size the volume
-      for the index too.
+    - **Deliberately excludes `index.db`** (~2.4x the archive's own size) — a ceiling enforced by
+      refusing INGEST can only bound what refusing can reclaim, and refusing can't shrink a database.
+      Size the volume for that ~3x-first-fill overhead too.
+    - **`maybeReclaimIndex` reaps the index across fill/wipe cycles** (XERK-332) — nothing reaps a
+      `sessions`/`entries_fts` row when a `.jsonl` is DELETED and openDb rebuilds only on a schema
+      bump or an empty table, so a repeatedly-wiped store grew the index without bound (61x the
+      ceiling after 38 cycles, a restart not helping). Off the SAME store walk (near-free — it already
+      enumerated every file), when the walk finds FAR fewer files than the index has FILED
+      (`filePath IS NOT NULL`) rows it runs `rebuildIndex()` + `VACUUM`. Guards, each load-bearing:
+      excluding NULL-`filePath` placeholder rows keeps an initial bulk sync from reading as a wipe; a
+      `partial` walk (any unreadable dir, or the root gone) NEVER reclaims (an under-count would drop
+      live rows and, since ingest appends, duplicate on re-push — XERK-280); "far fewer" bounds the
+      reindex cost (it re-reads only surviving files, ~0 after a wipe) and the absolute floor
+      (`ARCHIVE_INDEX_RECLAIM_MIN_GAP`, 64) leaves a tiny store's noise alone. Tests:
+      `archive-reclaim.test.js`.
     - **A walk that THROWS is not a measurement of zero** — only ENOENT on `ARCHIVE_DIR` itself is
       (the store genuinely absent). Any other error (EMFILE, EACCES, EIO) keeps the last baseline AND
       stamps the cache so it isn't retried per call — treating a blip as zero hands out a fresh

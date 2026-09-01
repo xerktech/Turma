@@ -422,6 +422,30 @@ const TOTAL_CACHE_MS = 5 * 60 * 1000;
 // and this is what bounds how long an operator waits after freeing space.
 const FULL_RECHECK_MS = 30 * 1000;
 
+// XERK-332: reclaim index.db when the store has been wiped. The index holds a
+// `sessions` row and the FTS entries for EVERY transcript, and nothing reaps
+// them when a `.jsonl` is DELETED off disk — so a store that is repeatedly
+// filled and wiped grows the index without bound (measured 61x the ceiling
+// after 38 fill/wipe cycles), and a restart does not help (openDb rebuilds only
+// on a schema bump or an EMPTY `sessions` table, and a wipe leaves the rows
+// behind so the table is never empty). The store walk below already enumerates
+// every rendered file each window, so it is the natural, near-free trigger:
+// when it finds far fewer files than the index has FILED rows, the difference is
+// transcripts an operator deleted, and rebuildIndex() + VACUUM reaps them (see
+// maybeReclaimIndex).
+//   - A large ABSOLUTE gap so a tiny store's collision-doubles or raced deletes
+//     never trip it (a store below this floor keeps a small, bounded index).
+//   - "Far fewer files than rows" so the rebuild only runs when the SURVIVING
+//     store is small, which is what bounds its cost — it re-reads only the files
+//     still on disk, ~0 after a full wipe (the case the ticket measured).
+const ARCHIVE_INDEX_RECLAIM_MIN_GAP =
+  positiveEnvInt("ARCHIVE_INDEX_RECLAIM_MIN_GAP", 64);
+// Belt-and-braces against churn: a reclaim drops the gap to zero, so it is
+// single-shot per wipe already, but bound it so nothing re-firing during an
+// abnormal walk can rebuild in a tight loop on the one event loop.
+const RECLAIM_MIN_INTERVAL_MS = 60 * 1000;
+let lastReclaimAt = 0;
+
 // The archive's own per-transcript bytes under ARCHIVE_DIR: the `.jsonl` files.
 //
 // NOT `index.db`. It lives in this directory and is genuinely large — a second
@@ -436,16 +460,17 @@ const FULL_RECHECK_MS = 30 * 1000;
 // ratcheting 429 transcripts down to 4). A budget may only bound what its
 // enforcement can actually reclaim.
 //
-// So the index is OVERHEAD the operator sizes the volume for, not budget — and
-// that overhead is AT LEAST 3x the ceiling and is NOT bounded. Measured 3.0-3.2x
-// at first fill, but nothing reaps a deleted file's rows and rebuildIndex() only
-// runs on a schema bump or an empty table, so a store that is repeatedly filled
-// and wiped keeps growing the index: ~13 MB per fill/wipe cycle at an 8 MiB
-// ceiling, reaching 61x by cycle 38, with the .jsonl total pinned at the ceiling
-// throughout, and a hub restart does not reclaim it. Reclaiming that is XERK-332;
-// until then, size the volume for the churn, not for one fill. The `.meta`
-// sidecars are uncounted too: 267 bytes each, bounded by transcript count, and
-// rewritten in place rather than grown.
+// So the index is OVERHEAD the operator sizes the volume for, not budget, and it
+// is ~3x the ceiling at first fill (measured 3.0-3.2x). It was ALSO unbounded
+// across fill/wipe cycles — nothing reaps a deleted file's rows and openDb
+// rebuilds only on a schema bump or an empty table, so a repeatedly-filled-and-
+// wiped store grew the index ~13 MB per cycle to 61x the ceiling by cycle 38,
+// with the .jsonl total pinned at the ceiling throughout and a restart not
+// reclaiming it. That is now capped: `maybeReclaimIndex` reaps the deleted rows
+// and VACUUMs off this same store walk when far fewer files than rows remain
+// (XERK-332). Size the volume for the ~3x first-fill overhead; the churn no
+// longer accumulates. The `.meta` sidecars are uncounted too: 267 bytes each,
+// bounded by transcript count, and rewritten in place rather than grown.
 //
 // A subdirectory we cannot read is SKIPPED, not fatal. It costs us that subtree
 // (an under-measure, which the ceiling errs toward anyway), where letting it
@@ -459,7 +484,14 @@ const FULL_RECHECK_MS = 30 * 1000;
 // append; a 0755 one readdirs fine). Unreadable-but-WRITABLE — mode 0333, or an
 // ACL — under-measures without bound instead, since each walk both misses those
 // bytes and zeroes the charge that would have carried them.
-function walkJsonlBytes(dir, depth) {
+// `stats` (optional) accumulates, ALONGSIDE the byte total, the two facts the
+// XERK-332 index reclaim needs off this same walk: `files`, the count of
+// rendered `.jsonl` transcripts on disk (one per `sessions` row), and `partial`,
+// set whenever a directory could not be read. A `partial` walk under-counts
+// files, so the reclaim MUST NOT act on it — dropping live rows for a
+// transiently-unmounted volume would, since ingest appends, duplicate the
+// conversation on re-push (the XERK-280 hazard).
+function walkJsonlBytes(dir, depth, stats) {
   let names;
   try {
     names = fs.readdirSync(dir, { withFileTypes: true });
@@ -467,6 +499,10 @@ function walkJsonlBytes(dir, depth) {
     // ENOENT at the root is the store genuinely absent: 0 is right, and is what
     // lets a removed directory be recreated instead of latching full forever.
     if (depth === 0 && e.code !== "ENOENT") throw e;
+    // But the file count is now an UNDER-count — the root vanished mid-life
+    // (unmounted/renamed, not a fresh empty store) or a subtree was skipped — so
+    // mark the walk untrustworthy for the reclaim.
+    if (stats) stats.partial = true;
     return 0;
   }
   let bytes = 0;
@@ -480,13 +516,18 @@ function walkJsonlBytes(dir, depth) {
       // a session's own files are `.jsonl`, `.json` and `.txt` (the
       // `tool-results/` overflow), and counting only `.jsonl` there would leave
       // most of the raw layer's bytes outside the ceiling that exists to keep
-      // this volume writable (XERK-338).
+      // this volume writable (XERK-338). Raw files are NOT `sessions` rows, so
+      // they are never counted into `stats.files`.
       bytes += isRawDir(d.name, depth)
-        ? walkAllBytes(full) : walkJsonlBytes(full, depth + 1);
+        ? walkAllBytes(full) : walkJsonlBytes(full, depth + 1, stats);
     } else if (d.isFile() && d.name.endsWith(".jsonl")) {
       // One unreadable file must not abandon the measurement and hand back a
-      // total far under the truth — skip it and keep counting.
-      try { bytes += fs.statSync(full).size; } catch { /* raced with a delete */ }
+      // total far under the truth — skip it and keep counting. An ENOENT is a
+      // raced delete (the honest signal the reclaim looks for); any other stat
+      // failure is an under-count that, like a skipped directory, must not drive
+      // the reclaim.
+      try { bytes += fs.statSync(full).size; if (stats) stats.files++; }
+      catch (e) { if (stats && e && e.code !== "ENOENT") stats.partial = true; }
     }
   }
   return bytes;
@@ -545,8 +586,9 @@ function totalArchiveBytes(now, maxAgeMs) {
   const age = maxAgeMs === undefined ? TOTAL_CACHE_MS : maxAgeMs;
   if (now - totalCache.at < age) return totalCache.bytes + writtenSinceWalk;
   let bytes;
+  const stats = { files: 0, partial: false };
   try {
-    bytes = walkJsonlBytes(ARCHIVE_DIR, 0);
+    bytes = walkJsonlBytes(ARCHIVE_DIR, 0, stats);
   } catch (e) {
     // A measurement we FAILED to take is not a measurement of zero. Recording
     // it would re-baseline to nothing and zero the charge, so each such blip
@@ -564,7 +606,61 @@ function totalArchiveBytes(now, maxAgeMs) {
   }
   totalCache = { at: now, bytes };
   writtenSinceWalk = 0;
+  // The walk just enumerated every rendered transcript on disk, so this is the
+  // one moment we cheaply know whether the index is holding rows for files an
+  // operator has since deleted (XERK-332). Reclaim runs AFTER the cache is set —
+  // it does not change the byte total, only the DB — so a caller's total is
+  // unaffected whether or not it fires.
+  maybeReclaimIndex(now, stats);
   return bytes;
+}
+
+// Reap the index rows (and their FTS entries) of transcripts that have been
+// DELETED off disk, and VACUUM the freed pages back to the volume (XERK-332).
+// Runs only off a fresh, CLEAN store walk, so it is bounded to once per walk
+// window and never acts on an under-count. See ARCHIVE_INDEX_RECLAIM_MIN_GAP.
+//
+// This is on the heartbeat path (via totalForCeiling) and rebuildIndex is
+// synchronous, but the trigger's "far fewer files than rows" condition means it
+// only fires when the surviving store is SMALL — after a full wipe the rebuild
+// re-reads ~0 files. At a pathological scale (hundreds of thousands of surviving
+// files) the reindex is a longer synchronous stall, the same class as the walk
+// itself and with the same future mitigation (walk/reclaim only near the ceiling
+// rather than making it async); nothing real approaches it.
+function maybeReclaimIndex(now, stats) {
+  // Never act on a walk that skipped an unreadable directory or found the store
+  // root gone: the file count is then an UNDER-count, and reclaiming on it would
+  // drop live rows for a transiently-unmounted volume and, since ingest appends,
+  // duplicate the conversation on re-push (XERK-280). Wait for a clean walk;
+  // reclaim is never urgent. `db` is always open here in practice (every caller
+  // openDb()s first), but a null handle has nothing to reap regardless.
+  if (stats.partial || !db) return;
+  if (now - lastReclaimAt < RECLAIM_MIN_INTERVAL_MS) return;
+  let filedRows;
+  try {
+    filedRows = db.prepare(
+      "SELECT COUNT(*) AS n FROM sessions WHERE filePath IS NOT NULL").get().n;
+  } catch { return; }   // an index hiccup must never break the heartbeat's walk
+  // Orphans = rows that NAME a rendered file the walk did not find. Placeholder
+  // rows (a manifest entry not yet filled by a chunk) have filePath NULL and are
+  // excluded, so an initial bulk sync — many rows, few files yet — never reads
+  // as a wipe.
+  const orphans = filedRows - stats.files;
+  if (orphans < ARCHIVE_INDEX_RECLAIM_MIN_GAP) return;
+  if (stats.files * 2 >= filedRows) return;   // not "far fewer" — a small delete
+  lastReclaimAt = now;
+  try {
+    const kept = rebuildIndex();   // drops the orphaned sessions + FTS rows
+    db.exec("VACUUM");             // and returns the freed pages to the volume
+    console.error(
+      `archive: reclaimed index.db — ${orphans} rows for deleted transcripts ` +
+      `dropped, ${kept} live transcripts reindexed and the file VACUUMed ` +
+      `(XERK-332)`);
+  } catch (e) {
+    // Not fatal: a failed reclaim leaves the index oversized but correct, and
+    // `lastReclaimAt` is already stamped so it won't retry-storm on the beat.
+    console.error(`archive: index reclaim failed: ${e.code || e.message}`);
+  }
 }
 
 // The ceiling's own read of the total: once it says full, re-measure on the
