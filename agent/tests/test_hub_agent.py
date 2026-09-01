@@ -8111,6 +8111,58 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
         self.assertEqual([f["migrationId"] for f in sm.spawn_failures], ["mig1"])
         self.assertIn("transcript", sm.spawn_failures[0]["error"])
 
+    def test_export_command_runs_off_the_beat_but_still_acks(self):
+        """The exportSession command dispatches export_session to a THREAD
+        (XERK-397) — the 96s-worst-case upload must not stall the beat — and the
+        command is ACKed the same beat, whether the export ran or declined."""
+        sm = self._manager()
+        started = {}
+
+        class FakeThread:
+            def __init__(self, target=None, args=(), **kw):
+                started["target"] = target
+                started["args"] = args
+            def start(self):
+                started["started"] = True
+
+        with mock.patch.object(ha.threading, "Thread", FakeThread):
+            self.assertTrue(sm.handle_commands([{
+                "cmdId": "e1", "type": "exportSession",
+                "sessionId": "s", "migrationId": "mig1"}]))
+        self.assertEqual(started["target"], sm.export_session)
+        self.assertEqual(started["args"], ("s", "mig1"))
+        self.assertTrue(started["started"])
+        self.assertEqual(sm.acked, {"e1"})           # acked regardless
+        self.assertEqual(sm.spawn_failures, [])      # nothing refused inline
+
+    def test_a_failed_export_thread_start_is_refused_synchronously(self):
+        """A Thread.start() that raises (pids_limit, XERK-402) must not leave the
+        move sitting in `exporting` — it is refused on the beat, where it is
+        safe, so the hub learns why (XERK-265)."""
+        sm = self._manager()
+        with mock.patch.object(ha.threading, "Thread",
+                               side_effect=RuntimeError("can't start thread")):
+            sm._export_session_async("s", "mig9")
+        self.assertEqual([f["migrationId"] for f in sm.spawn_failures], ["mig9"])
+        self.assertIn("export worker", sm.spawn_failures[0]["error"])
+
+    def test_a_refusal_appended_after_the_snapshot_survives_the_clear(self):
+        """The off-beat export thread can append a refusal AFTER build_payload
+        snapshots spawn_failures into the payload but BEFORE post() clears it.
+        post() removes only the delivered entries by identity (XERK-397), so the
+        late one rides the next beat instead of being lost."""
+        sm = self._manager()
+        sm._refuse_start("first", migration_id="migA", context="exportSession")
+        payload = sm.build_payload(1)
+        self.assertEqual([f["migrationId"] for f in payload["spawnFailures"]],
+                         ["migA"])
+        # A second refusal lands from the export thread mid-beat.
+        sm._refuse_start("second", migration_id="migB", context="exportSession")
+        with mock.patch.object(ha.urllib.request, "urlopen") as uo:
+            uo.return_value.__enter__.return_value.read.return_value = b"{}"
+            sm.post(payload)
+        self.assertEqual([f["migrationId"] for f in sm.spawn_failures], ["migB"])
+
     def test_a_failed_upload_is_reported(self):
         sm = self._manager()
         wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "sessU")
@@ -8143,10 +8195,14 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "MAX_SESSIONS", 0):
             sm._resume_at_cwd("t", os.path.join(ha.WORKTREES_ROOT, "Turma", "w4"),
                               cmd_id="c4")
-        self.assertEqual(len(sm.build_payload(1)["spawnFailures"]), 1)
+        # Post the payload that actually CARRIES the failures: post() now clears
+        # only the entries it delivered, by identity (XERK-397), so an off-beat
+        # export refusal appended after the snapshot survives the clear.
+        payload = sm.build_payload(1)
+        self.assertEqual(len(payload["spawnFailures"]), 1)
         with mock.patch.object(ha.urllib.request, "urlopen") as uo:
             uo.return_value.__enter__.return_value.read.return_value = b"{}"
-            sm.post({"device": "hostA"})
+            sm.post(payload)
         self.assertEqual(sm.spawn_failures, [])
 
     def test_the_prune_race_is_reported(self):
@@ -8247,7 +8303,15 @@ class TestHeartbeatReplyParse(ManagerMixin, unittest.TestCase):
     def test_a_huge_integer_clears_staged_results_like_any_delivered_beat(self):
         sm = self.make_manager()
         sm.spawn_failures = [{"cmdId": "c1", "error": "nope"}]
-        self._post(sm, ('{"x": %s}' % ("9" * 6000)).encode())
+        # spawn_failures now clear per-payload, by identity (XERK-397), so
+        # deliver the payload that actually carries them (build_payload stages
+        # them) rather than the bare probe body _post sends.
+        payload = sm.build_payload(1)
+        self.assertEqual(len(payload["spawnFailures"]), 1)
+        with mock.patch.object(ha.urllib.request, "urlopen") as uo:
+            uo.return_value.__enter__.return_value.read.return_value = (
+                '{"x": %s}' % ("9" * 6000)).encode()
+            sm.post(payload)
         self.assertEqual(sm.spawn_failures, [])  # delivered, like any good beat
 
     def test_an_unparseable_reply_is_a_parse_failure_not_a_lost_beat(self):
@@ -8431,26 +8495,28 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.spawn.assert_not_called()
         sm.kill.assert_not_called()
 
-    def test_refresh_jira_command_polls_when_configured(self):
+    def test_refresh_jira_command_stages_the_worker_when_configured(self):
+        # The manual refresh now STAGES the slow-refresh worker rather than
+        # polling inline (XERK-397) — same network fetch, off the beat.
         sm = self.make_manager()
-        sm.refresh_jira = mock.Mock()
+        sm._stage_slow_refresh = mock.Mock()
         sm.save = mock.Mock()
         with mock.patch.object(ha, "jira_configured", return_value=True):
             self.assertTrue(sm.handle_commands(
                 [{"cmdId": "j1", "type": "refreshJira"}]))
-        sm.refresh_jira.assert_called_once_with()
+        sm._stage_slow_refresh.assert_called_once_with("jira")
         self.assertEqual(sm.acked, {"j1"})
 
     def test_refresh_jira_command_is_a_noop_when_unconfigured(self):
         # The "unset env = zero Jira HTTP calls, ever" guarantee has to hold
         # even against a command an older/confused hub aimed at this host.
         sm = self.make_manager()
-        sm.refresh_jira = mock.Mock()
+        sm._stage_slow_refresh = mock.Mock()
         sm.save = mock.Mock()
         with mock.patch.object(ha, "jira_configured", return_value=False):
             self.assertTrue(sm.handle_commands(
                 [{"cmdId": "j2", "type": "refreshJira"}]))
-        sm.refresh_jira.assert_not_called()
+        sm._stage_slow_refresh.assert_not_called()
         # Still acked — an unexecutable command must not redeliver forever.
         self.assertEqual(sm.acked, {"j2"})
 
@@ -21242,14 +21308,90 @@ class TestBeatLoopBudget(unittest.TestCase):
                  + ha.ARCHIVE_RAW_FAILURES_MAX * ha.ARCHIVE_RAW_TIMEOUT_SEC)
         self.assertGreaterEqual(worst * 1000, self._offline_after_ms())
 
+    def test_pr_status_worst_case_exceeds_the_offline_threshold(self):
+        """WHY refresh_pr_status is off the beat (XERK-397): PR_STATUS_MAX
+        sequential `gh pr view`s, each bounded only by run()'s 15s default, is
+        300s — four times the hub's patience. PR_STATUS_MAX bounds the COUNT of
+        PRs a pass touches, never its TIME, so moving it onto the slow-refresh
+        worker is the only thing that keeps that count off the heartbeat."""
+        worst = ha.PR_STATUS_MAX * 15   # run()'s default per-call timeout
+        self.assertGreater(worst * 1000, self._offline_after_ms())
+
+    def test_migration_upload_worst_case_exceeds_the_offline_threshold(self):
+        """WHY a migration export is off the beat (XERK-397): the blob upload
+        retries a busy hub ATTEMPTS times at MIGRATION_UPLOAD_TIMEOUT_SEC each
+        (plus backoff) ≈ 96s, and it dispatches from handle_commands on the
+        heartbeat loop, so inline one migration export could flap the host
+        offline. _export_session_async runs it on its own thread instead."""
+        worst = (ha.SessionManager.MIGRATION_UPLOAD_ATTEMPTS
+                 * ha.SessionManager.MIGRATION_UPLOAD_TIMEOUT_SEC)
+        self.assertGreater(worst * 1000, self._offline_after_ms())
+
     def test_what_stays_on_the_beat_fits_under_the_threshold(self):
         """What IS inline — the interval plus the beat's own POSTs, two of them
         on a cycle that executed commands — has to leave real margin under the
         threshold. This covers the beat's network cost; it does not bound
-        `handle_commands`, which is the next thing to measure if a host flaps
-        again with the archive already off the loop."""
+        `handle_commands` (a migration export is now off the beat, XERK-397) nor
+        `_poll_pr_comments`, whose own gh fetch is still inline and is the next
+        thing to measure if a host flaps again with these refreshes off the
+        loop."""
         worst_ms = (ha.INTERVAL + 2 * ha.HEARTBEAT_TIMEOUT_SEC) * 1000
         self.assertLess(worst_ms, self._offline_after_ms())
+
+
+class TestSlowRefreshWorker(ManagerMixin, unittest.TestCase):
+    """The slow cache refreshes (github/jira/pr) run on their own worker, not
+    the beat (XERK-397): the beat STAGES which are due, the worker runs them."""
+
+    def test_build_payload_stages_the_due_refreshes_not_runs_them_inline(self):
+        # On beat 0 github (%15) and pr (%3) are due; jira needs a configured
+        # board, which a clean test host has not got, so it is not staged.
+        sm = self.make_manager()
+        sm.refresh_github = mock.Mock()
+        sm.refresh_jira = mock.Mock()
+        sm.refresh_pr_status = mock.Mock()
+        sm._stage_slow_refresh = mock.Mock()
+        sm.build_payload(0)
+        # None of the network refreshes ran on the beat...
+        sm.refresh_github.assert_not_called()
+        sm.refresh_jira.assert_not_called()
+        sm.refresh_pr_status.assert_not_called()
+        # ...they were staged for the worker instead.
+        sm._stage_slow_refresh.assert_called_once_with("github", "pr")
+
+    def test_the_light_beat_stages_nothing(self):
+        sm = self.make_manager()
+        sm._stage_slow_refresh = mock.Mock()
+        sm.build_payload(0, light=True)
+        sm._stage_slow_refresh.assert_not_called()
+
+    def test_the_worker_runs_the_staged_refreshes(self):
+        sm = self.make_manager()
+        ran = {"github": threading.Event(), "pr": threading.Event()}
+        sm.refresh_github = lambda: ran["github"].set()
+        sm.refresh_pr_status = lambda: ran["pr"].set()
+        sm._stage_slow_refresh("github", "pr")
+        self.assertTrue(ran["github"].wait(2))
+        self.assertTrue(ran["pr"].wait(2))
+
+    def test_staging_coalesces_and_never_raises_onto_the_beat(self):
+        # A Thread.start() blowing up (pids_limit, XERK-402) must be swallowed —
+        # this runs on the beat, the PID-1 main process with no retry.
+        sm = self.make_manager()
+        with mock.patch.object(ha.threading, "Thread",
+                               side_effect=RuntimeError("no threads")):
+            sm._stage_slow_refresh("github")   # must not raise
+        # The kind stayed staged for the next beat's retry.
+        self.assertIn("github", sm._slow_due)
+
+    def test_one_refresh_failing_does_not_skip_the_others(self):
+        sm = self.make_manager()
+        ran = threading.Event()
+        sm.refresh_github = mock.Mock(side_effect=RuntimeError("boom"))
+        sm.refresh_pr_status = lambda: ran.set()
+        with mock.patch.object(ha, "log"):
+            sm._stage_slow_refresh("github", "pr")
+        self.assertTrue(ran.wait(2))   # pr still ran despite github raising
 
 
 class TestPrStatus(unittest.TestCase):
