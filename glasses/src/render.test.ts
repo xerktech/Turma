@@ -213,6 +213,35 @@ describe("render: session", () => {
     expect(model.bottom.mode).toBe("input");
   });
 
+  it("pins a sticky live-tail refusal atop the focused session's transcript (XERK-335)", () => {
+    const state = base({
+      screen: "session",
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+      liveRefusal: { sessionId: "s1", message: "wrong hub password" },
+    });
+
+    const model = asSession(render(state));
+
+    // The hub's own words sit above the transcript content, not strobed as a flash.
+    expect(model.transcriptLines[0]).toBe("✗ wrong hub password");
+    expect(model.transcriptLines).toContain("» hi");
+  });
+
+  it("ignores a refusal pinned to a different session", () => {
+    const state = base({
+      screen: "session",
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+      liveRefusal: { sessionId: "s2", message: "stale from another session" },
+    });
+
+    const model = asSession(render(state));
+
+    expect(model.transcriptLines.some((l) => l.includes("stale"))).toBe(false);
+    expect(model.transcriptLines[0]).toBe("» hi");
+  });
+
   it("shows a sheet-mode bottom bar with numbered options and a Dictate answer row when a question is pending", () => {
     const s = session({ id: "s1", session: signals({ question: "Deploy now?", questionOptions: ["Yes", "No"] }) });
     const agents = [agent({ sessions: [s] })];

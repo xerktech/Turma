@@ -125,6 +125,10 @@ class FakeLiveTail {
   deliverTurn(text: string): void {
     this.cb?.({ type: "turn", text });
   }
+  // A terminal ws-token refusal (XERK-335) — LiveTail has already stopped.
+  deliverRefused(message: string): void {
+    this.cb?.({ type: "refused", message });
+  }
 }
 
 function fakeClient(overrides: Record<string, ReturnType<typeof vi.fn>> = {}) {
@@ -1615,6 +1619,24 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       expect(app.getState().liveTurn).not.toBe(null);
       display.emit({ type: "doubleTap" }); // session -> home
       expect(app.getState().liveTurn).toBe(null);
+    });
+
+    it("pins a terminal ws-token refusal as a sticky line, then clears it on leaving (XERK-335)", async () => {
+      const app = await enterSession();
+      // The hub refused the ws-token (a wrong hub password 401s it); LiveTail
+      // surfaces the reason once rather than reconnecting forever in silence.
+      liveTail.deliverRefused("wrong hub password");
+      expect(app.getState().liveRefusal).toEqual({ sessionId: "s1", message: "wrong hub password" });
+      expect(display.lines.some((l) => l.includes("✗ wrong hub password"))).toBe(true);
+
+      display.emit({ type: "doubleTap" }); // session -> home
+      expect(app.getState().liveRefusal).toBe(null);
+    });
+
+    it("clamps a refusal message to the render-safe ceiling", async () => {
+      const app = await enterSession();
+      liveTail.deliverRefused("x".repeat(500));
+      expect(app.getState().liveRefusal?.message.length).toBe(300);
     });
 
     it("pins the visible window when scrolled up and new text lands, but auto-scrolls at the tail", async () => {

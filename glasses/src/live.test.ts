@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { buildLiveWsUrl, LiveTail, NoopLiveTail, type LiveTailOptions } from "./live.ts";
+import { buildLiveWsUrl, LiveTail, NoopLiveTail, type LiveEvent, type LiveTailOptions } from "./live.ts";
 import type { WebSocketEvent, WebSocketEventName, WebSocketLike } from "./audio.ts";
 import type { TailEntry } from "./types.ts";
 
@@ -209,13 +209,54 @@ describe("LiveTail", () => {
 
   it("a ws-token fetch failure schedules a reconnect (poll keeps working)", async () => {
     const wsToken = vi.fn(async () => {
-      throw new Error("nope");
+      throw new Error("nope"); // a transport failure — no .status
     });
     const { lt, sched } = makeLiveTail({ hubClient: { wsToken } });
-    lt.start("h", "s", () => {});
+    const events: LiveEvent[] = [];
+    lt.start("h", "s", (ev) => events.push(ev));
     await flush();
     expect(FakeSocket.instances.length).toBe(0);
-    expect(sched.count()).toBe(1);
+    expect(sched.count()).toBe(1); // a transport failure IS retried
+    expect(events).toEqual([]); // and is NOT surfaced as a refusal
+  });
+
+  it("a ws-token REFUSAL surfaces once and does not spin (XERK-335)", async () => {
+    // A wrong hub password 401s the ws-token fetch on every attempt. The old
+    // catch dropped the error and rescheduled forever — a silent infinite loop
+    // that looked exactly like a dead network. It must instead surface the hub's
+    // own words once and stop retrying (the 6s poll still keeps the session live
+    // enough to read).
+    const wsToken = vi.fn(async () => {
+      throw Object.assign(new Error("wrong hub password"), { status: 401 });
+    });
+    const { lt, sched } = makeLiveTail({ hubClient: { wsToken } });
+    const events: LiveEvent[] = [];
+    lt.start("h", "s", (ev) => events.push(ev));
+    await flush();
+    expect(events).toEqual([{ type: "refused", message: "wrong hub password" }]); // surfaced once
+    expect(sched.count()).toBe(0); // no reconnect scheduled — it will not spin
+    expect(FakeSocket.instances.length).toBe(0); // never opened a socket
+    // Even if the poll grace timers fire, nothing re-attempts the doomed fetch.
+    sched.fireAll();
+    await flush();
+    expect(wsToken).toHaveBeenCalledTimes(1);
+    expect(events).toHaveLength(1); // still exactly one refusal, no strobe
+  });
+
+  it("a refusal after stop()/switch is dropped (generation guard)", async () => {
+    // The fetch is in flight when the wearer leaves the session; its refusal
+    // must not fire against the dead generation.
+    let reject!: (e: unknown) => void;
+    const wsToken = vi.fn(() => new Promise<{ token: string; expiresInSec: number }>((_r, rj) => { reject = rj; }));
+    const { lt, sched } = makeLiveTail({ hubClient: { wsToken } });
+    const events: LiveEvent[] = [];
+    lt.start("h", "s", (ev) => events.push(ev));
+    await flush();
+    lt.stop();
+    reject(Object.assign(new Error("wrong hub password"), { status: 401 }));
+    await flush();
+    expect(events).toEqual([]); // superseded — nothing surfaced
+    expect(sched.count()).toBe(0);
   });
 
   it("reuses the cached ws-token across a reconnect (no refetch)", async () => {

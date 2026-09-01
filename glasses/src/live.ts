@@ -22,10 +22,19 @@ import type { TailEntry } from "./types.ts";
 // A live delta: either committed transcript entries (`tail`) or the current
 // in-progress assistant turn scraped from the TUI (`turn`; real-time
 // streaming, empty text = the turn completed and the committed tail owns it).
+// `refused` is a terminal signal, not a delta: the hub refused the ws-token
+// with the carried words (a wrong hub password 401s it), so live tail is off
+// for this session and retrying is pointless — see connect() (XERK-335). The
+// poll still runs, so the session isn't dead, just not live.
 export type LiveEvent =
   | { type: "tail"; entries: TailEntry[] }
-  | { type: "turn"; text: string };
+  | { type: "turn"; text: string }
+  | { type: "refused"; message: string };
 export type LiveListener = (ev: LiveEvent) => void;
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 export interface LiveTailLike {
   start(hostKey: string, sessionId: string, onEvent: LiveListener): void;
@@ -177,8 +186,22 @@ export class LiveTail implements LiveTailLike {
     let token: string;
     try {
       token = await this.getToken();
-    } catch {
-      if (gen === this.generation) this.scheduleReconnect(gen);
+    } catch (err) {
+      if (gen !== this.generation) return; // stop()/newer start() landed mid-fetch
+      // A REFUSAL (the hub answered with a status) will never succeed on retry:
+      // a wrong hub password 401s every ws-token fetch, so reconnecting forever
+      // just spins in silence and the wearer stares at a session that never
+      // goes live — indistinguishable from a dead network (XERK-335). Surface
+      // the hub's own words ONCE (like dictation.ts, not the old bare catch that
+      // dropped them) and STOP; the 6s poll still runs. A TRANSPORT failure (no
+      // status — tunnel offline, dead socket, fetch timeout) is transient, so
+      // keep the silent capped-backoff retry the poll-only fallback relies on.
+      if (typeof (err as { status?: unknown } | null)?.status === "number") {
+        this.cachedToken = null; // a bad/rejected credential — don't reuse it
+        this.onEvent?.({ type: "refused", message: errorMessage(err) });
+        return;
+      }
+      this.scheduleReconnect(gen);
       return;
     }
     if (gen !== this.generation) return; // stop()/newer start() landed mid-fetch
