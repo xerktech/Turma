@@ -22,10 +22,16 @@
      so the black .stage spilled below the fold and the document scrolled to reveal
      it; `100dvh` (+ `interactive-widget=resizes-content` in the viewport meta)
      tracks the live visible height instead. Both html and body clip so nothing
-     scrolls at the document level — only .chat-scroll / the lists scroll. */
+     scrolls at the document level — only .chat-scroll / the lists scroll.
+     `--app-height` (set by syncAppHeight from window.visualViewport) is the final
+     override: on some tablets/foldables the keyboard shrinks the *layout* viewport
+     by MORE than it occludes, so `100dvh` resolves shorter than the real area above
+     the keyboard and the flex column ends early — a black .stage gap between the
+     composer and the keyboard. The visual viewport reports the true visible height,
+     closing the gap; it's unset (→ 100dvh) on browsers without visualViewport. */
   html { height: 100%; overflow: hidden; }
   body {
-    height: 100vh; height: 100dvh;
+    height: 100vh; height: 100dvh; height: var(--app-height, 100dvh);
     display: flex; flex-direction: column;
     overflow: hidden; overscroll-behavior: none;
   }
@@ -1045,6 +1051,30 @@ const $sidebar = document.querySelector(".sidebar");
 // The header slot nav.js mounts for this page's running/waiting counts.
 // See public/nav.js.
 const $counts = document.getElementById("hdrMeta");
+
+// Keyboard-aware app-shell height (see the body{} rule). `100dvh` +
+// `interactive-widget=resizes-content` is right on phones, but some Android
+// tablets/foldables shrink the LAYOUT viewport by more than the keyboard
+// occludes, so `100dvh` resolves shorter than the real space above the keyboard
+// and the composer floats up leaving a black .stage gap below it. The VISUAL
+// viewport reports the true visible height, so we pin the shell to it. Pinch-zoom
+// also shrinks the visual viewport, so we skip that case (scale > 1) and fall
+// back to `100dvh`. No-op where visualViewport is unsupported (the var stays
+// unset). offsetTop is folded in so the shell tracks the visible band even if the
+// keyboard scrolls the visual viewport rather than resizing it.
+const _vv = window.visualViewport;
+function syncAppHeight() {
+  if (!_vv) return;
+  const root = document.documentElement.style;
+  if (_vv.scale > 1.01) { root.removeProperty("--app-height"); return; }
+  root.setProperty("--app-height", Math.round(_vv.height + _vv.offsetTop) + "px");
+}
+if (_vv) {
+  _vv.addEventListener("resize", syncAppHeight);
+  _vv.addEventListener("scroll", syncAppHeight);
+  window.addEventListener("orientationchange", syncAppHeight);
+  syncAppHeight();
+}
 
 // Open/closed state of the collapsible sections survives the 5s re-render.
 // Ended sessions start collapsed: they're history, and the list only grows.

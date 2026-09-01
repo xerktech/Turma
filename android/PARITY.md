@@ -28,6 +28,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Hub-URL field on Login.** The web is same-origin; a phone app must point at any hub, so Login has
   an extra Hub-URL field.
 - **Voice dictation** into the spawn/compose fields — a phone-only addition.
+- **On-screen-keyboard viewport handling.** `sessions.html` pins its app-shell height to
+  `window.visualViewport` so the composer docks just above the keyboard on tablets/foldables where
+  `100dvh` over-shrinks (a black `.stage` gap below the input). No Android counterpart: Compose
+  applies the IME window insets natively, so the composer already sits above the keyboard with no
+  gap. Web-only viewport quirk, nothing to mirror.
 - **No hover tooltips on the two compose-bar model chips** (XERK-246); a phone has no hover, so the
   web's `title=` text goes to the accessibility layer or nowhere.
   - The **"run against"** chip: nowhere. Its tooltip only names the self-hosted model, which is
