@@ -205,6 +205,7 @@ const {
   archiveRefusals, archiveRefusalFor,
   noteArchiveRefusal, ARCHIVE_REFUSALS_MAX, ARCHIVE_REFUSALS_PER_HOST,
   chargeBody, releaseBody, BODY_PARSE_COST, BODY_INFLIGHT_TOTAL_MAX,
+  HEARTBEAT_MAX, HEARTBEAT_PARSE_COST,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -2307,6 +2308,64 @@ test("the archive ceiling leaves concurrent pushes room inside the budget", () =
     delete env.BODY_INFLIGHT_TOTAL_MAX;
   });
   assert.ok(small.ARCHIVE_CHUNK_BODY_MAX < deployed.ARCHIVE_CHUNK_BODY_MAX);
+});
+
+// XERK-376: /api/heartbeat was charged BODY_PARSE_COST's 3x while a beat really
+// costs ~5.5x its wire size at peak RSS (measured in a real 256 MiB cgroup: a
+// lone 30 MiB beat peaks ~185 MiB over a ~20 MiB baseline). So the in-flight
+// budget admitted about twice what the container could hold, and a couple of
+// concurrent large-but-legal beats (32 MiB is inside HEARTBEAT_MAX) OOM-killed
+// the hub on the ONE route every host beats. Charged honestly, the exclusive
+// big lane serializes large beats and a second one is refused 503, not OOM'd.
+test("http: the heartbeat route is charged what it costs, not BODY_PARSE_COST", async () => {
+  // A wire body whose charge lands between 3x and 6x of the room left, so it
+  // WOULD have fit at the old 3x and does NOT at the honest cost — the only way
+  // to tell the two charges apart from the outside.
+  const filler = "q".repeat(100_000);
+  const room = 500_000;      // 100k x 3 = 300k fits; 100k x 6 = 600k does not
+  chargeBody(BODY_INFLIGHT_TOTAL_MAX - room, "shared");
+  chargeBody(1, "big");      // and the exclusive lane is occupied, so nothing escapes there
+  try {
+    const beat = await request("POST", "/api/heartbeat",
+      { body: { device: "nas", label: filler }, headers: agentHeaders });
+    // 503 "come back", never 413 "shrink": the beat is well inside HEARTBEAT_MAX,
+    // it is the hub that is momentarily too full to parse it. At the old 3x this
+    // same body fit the room left and co-resided beside the big-lane holder —
+    // the concurrent buffering the honest charge now refuses.
+    assert.equal(beat.status, 503, "a beat charged only 3x would have fit the room left");
+  } finally {
+    releaseBody(BODY_INFLIGHT_TOTAL_MAX - room, "shared");
+    releaseBody(1, "big");
+  }
+});
+
+test("one honest max heartbeat is serialized by the big lane and fits the container", () => {
+  assert.ok(HEARTBEAT_PARSE_COST > BODY_PARSE_COST, "a beat costs more than an ordinary body");
+  // Held at the DEPLOYED size — this box's own memory makes every derived ceiling
+  // trivially generous, so the arithmetic only means anything at 256 MiB.
+  const deployed = freshServerModule((env) => {
+    env.MEMORY_LIMIT_BYTES = String(256 << 20);
+    delete env.BODY_INFLIGHT_MAX;
+    delete env.BODY_INFLIGHT_TOTAL_MAX;
+  });
+  const worst = deployed.HEARTBEAT_MAX * deployed.HEARTBEAT_PARSE_COST;
+  // Because a max beat's honest charge EXCEEDS the whole shared budget, NOTHING
+  // else can buffer beside it while it holds the big lane (the lane's occupancy
+  // counts against shared admission). At the old 3x charge the same beat left
+  // ~38 units of shared room, so other bodies co-resided and their buffers stacked
+  // onto its peak — the co-residence that OOM'd the hub. This inequality is the fix.
+  assert.ok(
+    worst > deployed.BODY_INFLIGHT_TOTAL_MAX,
+    `an honest max beat (${worst}) must exceed the shared budget ` +
+      `(${deployed.BODY_INFLIGHT_TOTAL_MAX}) so nothing co-resides beside it`
+  );
+  // ...yet the one beat the big lane DOES admit still fits the container it is
+  // sized against — HEARTBEAT_MAX stays 32 MiB (XERK-235's shape must not
+  // re-open), so this is the thin-but-accepted headroom the sizing decision took.
+  assert.ok(
+    worst < deployed.MEMORY_LIMIT,
+    `one max beat (${worst}) must fit the container (${deployed.MEMORY_LIMIT})`
+  );
 });
 
 test("the boot line states a sub-MiB archive ceiling as KiB, not as 0 MiB", () => {
