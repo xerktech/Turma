@@ -43,6 +43,16 @@ paths:
   - **A BLACKHOLED hub does NOT trip it, by design** — every push still returns at its own timeout
     and logs its own failure. Only a peer answering slowly enough to keep the socket alive evades it.
     Tests: `TestArchiveSyncWorker`, `TestBeatLoopBudget`.
+- **Two slugs sharing a transcriptId are OFFERED NEITHER** (XERK-428). The manifest keys nothing on
+  the slug and `_archive_pending` (built from it) is keyed on the transcriptId ALONE, so two project
+  slugs each holding a `<id>.jsonl` would both enter, one would silently win the cursor slot, and the
+  hub's per-id archive row/cursor would interleave two unrelated files' byte ranges into one stored
+  transcript. Keying `_archive_pending` on `(slug, id)` only MOVES the collision to the hub (its row
+  is id-keyed too), so `_archive_manifest` drops every entry whose id is shared and logs once (there
+  is no way to tell which copy the hub's existing row describes). uuid4 ids never collide naturally —
+  this needs a copied/restored `~/.claude/projects` tree or a chosen id, the same forgeable-id premise
+  the raw-directory keying rule guards hub-side. A collision within one slug is impossible (unique
+  filenames). Tests: `test_manifest_refuses_a_transcriptId_two_slugs_both_hold`.
 - **The manifest window is a QUEUE, not a cliff** (XERK-424). `_archive_window` splits
   `ARCHIVE_MANIFEST_MAX` into the newest `ARCHIVE_MANIFEST_RECENT` (so an ending session archives
   promptly), then what the hub is KNOWN to be short of oldest-first, then a **rotation** over
