@@ -129,6 +129,27 @@ test("the index no longer grows across fill/wipe cycles (the ticket's scenario)"
     `index grew across cycles: one fill ${oneFill}, after 5 cycles ${afterCycles}`);
 });
 
+test("a bulk sync's placeholder rows are never read as a wipe", () => {
+  // manifestCursors creates a `sessions` row (filePath NULL) for every inactive
+  // transcript a host offers, a beat or more before its rendered chunk lands. So
+  // an initial sync legitimately has many rows and few files — which must NOT
+  // look like a wipe. The guard is that the trigger counts only FILED rows
+  // (`filePath IS NOT NULL`); this pins it (removing that clause makes the walk
+  // below reap all 50 placeholders mid-sync).
+  reset();
+  const manifest = [];
+  for (let i = 0; i < 50; i++) manifest.push({ transcriptId: `p${i}`, repo: "turma" });
+  archive.manifestCursors("nas", manifest, "");
+  assert.equal(rowCount(), 50, "placeholder rows exist");
+  freshWalk();                                   // 50 rows, 0 files on disk
+  assert.equal(rowCount(), 50, "a bulk sync must not be reaped as a wipe");
+  // And once a couple fill in, still no reap (the filled ones now have files).
+  archive.ingestChunk("nas", "p0", { ...META }, 0, 100,
+    [{ uuid: "x", role: "user", ts: "2026-07-10T00:00:00Z", text: "hi" }]);
+  freshWalk();
+  assert.equal(rowCount(), 50, "a partially-filled sync must not be reaped either");
+});
+
 test("a walk that skipped an unreadable subtree never reclaims", { skip: process.getuid && process.getuid() === 0 ? "runs as root; chmod is a no-op" : false }, () => {
   reset();
   fill(10);

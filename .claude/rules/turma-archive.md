@@ -152,7 +152,10 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
       `partial` walk (any unreadable dir, or the root gone) NEVER reclaims (an under-count would drop
       live rows and, since ingest appends, duplicate on re-push — XERK-280); "far fewer" bounds the
       reindex cost (it re-reads only surviving files, ~0 after a wipe) and the absolute floor
-      (`ARCHIVE_INDEX_RECLAIM_MIN_GAP`, 64) leaves a tiny store's noise alone. Tests:
+      (`ARCHIVE_INDEX_RECLAIM_MIN_GAP`, 64) leaves a tiny store's noise alone. Accepted residual (the
+      same ENOENT ambiguity the walk lives with): a lazy unmount leaving ARCHIVE_DIR present-but-empty
+      reads as a wipe — safe unless a deployment makes ARCHIVE_DIR the exact mountpoint AND puts
+      ARCHIVE_DB on a separate surviving filesystem (the default co-locates them). Tests:
       `archive-reclaim.test.js`.
     - **A walk that THROWS is not a measurement of zero** — only ENOENT on `ARCHIVE_DIR` itself is
       (the store genuinely absent). Any other error (EMFILE, EACCES, EIO) keeps the last baseline AND

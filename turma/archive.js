@@ -634,6 +634,15 @@ function maybeReclaimIndex(now, stats) {
   // duplicate the conversation on re-push (XERK-280). Wait for a clean walk;
   // reclaim is never urgent. `db` is always open here in practice (every caller
   // openDb()s first), but a null handle has nothing to reap regardless.
+  //
+  // Accepted residual, the same ENOENT ambiguity walkJsonlBytes already lives
+  // with: a lazy unmount that leaves ARCHIVE_DIR itself present-but-EMPTY (rather
+  // than gone) reads files=0, partial=false, and is indistinguishable from a real
+  // wipe — so if ARCHIVE_DB is on a SEPARATE surviving filesystem, its open
+  // handle answers while the store reads empty, and the rows are reaped. Safe in
+  // the default layout (ARCHIVE_DB lives UNDER ARCHIVE_DIR, and the k8s mount is a
+  // PARENT of it, so an unmount is ENOENT → partial): it bites only a deployment
+  // that makes ARCHIVE_DIR the exact mountpoint AND puts ARCHIVE_DB elsewhere.
   if (stats.partial || !db) return;
   if (now - lastReclaimAt < RECLAIM_MIN_INTERVAL_MS) return;
   let filedRows;
