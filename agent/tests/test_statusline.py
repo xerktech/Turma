@@ -11,6 +11,7 @@ windows all come from blobs Claude Code actually handed a status line.
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -193,6 +194,33 @@ class TestCarryWindowHighWater(unittest.TestCase):
             sl.write_snapshot(sl.carry_window_high_water(snap, path), path)
             with open(path) as fh:
                 self.assertEqual(json.load(fh)["sevenDay"]["usedPct"], 14.0)
+
+    def test_the_REAL_hook_floors_end_to_end_through_main(self):
+        # Drives the ACTUAL hook exactly as Claude Code does — a blob on stdin,
+        # the same `python3 -SsE statusline.py` command line the probe wires —
+        # so it guards main()'s wiring of the floor, not just the helper in
+        # isolation (removing the call from main() must fail a test).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._prior(tmp, {
+                "sevenDay": {"usedPct": 14.0, "resetsAt": 1_786_950_000},
+                "fiveHour": {"usedPct": 30.0, "resetsAt": 1_786_405_200},
+                "capturedAt": NOW - 1800,
+            })
+            blob = json.dumps({"version": "2.1.257", "session_id": "x", "rate_limits": {
+                "five_hour": {"used_percentage": 0, "resets_at": 1_786_405_200},
+                "seven_day": {"used_percentage": 0, "resets_at": 1_786_950_000},
+            }})
+            proc = subprocess.run(
+                [sys.executable, "-SsE", MODULE_PATH],
+                input=blob, capture_output=True, text=True,
+                env={**os.environ, "TURMA_LIMITS_PATH": path},
+            )
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stderr, "")   # a statusLine never paints a traceback
+            with open(path) as fh:
+                written = json.load(fh)
+            self.assertEqual(written["sevenDay"]["usedPct"], 14.0)
+            self.assertEqual(written["fiveHour"]["usedPct"], 30.0)
 
 
 class TestStatusText(unittest.TestCase):

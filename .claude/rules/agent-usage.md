@@ -97,7 +97,10 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
   `resetsAt` and starts a fresh mark (so a 5-hour window rolling over to ~0 still shows), and the floor
   only ever raises toward MORE usage / LESS headroom — the safe direction for a headroom gauge.
   **Exact `resetsAt` match** (no tolerance): erring toward not-flooring never crosses a real reset.
-  Tests: `TestCarryWindowHighWater`.
+  Sound because `resets_at` is a **fixed window boundary, not a sliding `now + remaining`** — verified
+  on a real 2.1.257 host: `seven_day.resets_at` was byte-identical across probe reads seconds and
+  ~30 min apart, so a window's used % only accumulates until that fixed instant (a rolling window
+  would show a drifting `resets_at`, which it does not). Tests: `TestCarryWindowHighWater`.
 - **The statusLine is NEVER wired into a session's settings**, only the probe's own
   (`build_limits_settings`, separate from `build_guard_settings`) — configuring one on a session stops
   Claude Code painting the footer's `esc to interrupt`, breaking busy detection for every session on
