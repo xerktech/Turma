@@ -324,6 +324,15 @@ private fun HostSection(
                 if (agent.autoPaused) {
                     Pill("⏸ auto paused", color = com.xerktech.turma.ui.theme.TurmaColors.warning)
                 }
+                // The hub is REFUSING this host's beats (XERK-298): its record is
+                // over the per-host ceiling or its registry share. Shown REGARDLESS
+                // of online state — a refused host freezes and reads "offline"
+                // exactly like an outage, and this red chip is what tells them
+                // apart. Cleared by the hub on the first accepted beat; mirrors
+                // index.html's refusedBadge.
+                if (agent.refused != null) {
+                    Pill("⛔ hub refused", color = com.xerktech.turma.ui.theme.TurmaColors.critical)
+                }
                 // An announced update restart reads as "updating" (warning), not
                 // the outage-looking "offline" (XERK-29).
                 when {

@@ -299,10 +299,26 @@ test("http: an over-share refusal leaves the host's PREVIOUS record intact", asy
   const refused = await beat(chunky("grower", 300));
   assert.equal(refused.status, 429);
   assert.deepEqual(agents["grower"].repos, [{ name: "r1" }]);
+  // XERK-298: the refusal is now a VISIBLE marker on the record the hub keeps —
+  // otherwise the host freezes at its last beat and ages to "offline", reading
+  // exactly like a network outage. Stamped on `prev`, so it rides `recordBytes`.
+  assert.ok(agents["grower"].refused, "an over-share refusal stamps `refused`");
+  assert.equal(agents["grower"].refused.reason, "registry-full");
   assert.equal(recordBytes.get("grower"), agentRecordSize(agents["grower"]));
-  // A normal-sized beat from the same host still lands.
+  // A normal-sized beat from the same host still lands AND clears the marker.
   assert.equal((await beat({ device: "grower", repos: [{ name: "r3" }] })).status, 200);
   assert.deepEqual(agents["grower"].repos, [{ name: "r3" }]);
+  assert.equal(agents["grower"].refused, undefined, "an accepted beat clears the marker");
+});
+
+test("http: a NEW host refused for a full registry stays a log line, not a marker (XERK-298)", async () => {
+  resetRegistry();
+  for (let i = 0; i < AGENTS_MAX; i++) assert.equal((await beat({ device: `seat-${i}` })).status, 200);
+  // A name the hub has never seen has no record to hang a marker on — the
+  // ticket's accepted residual. It is refused with no slot taken.
+  const refused = await beat({ device: "brand-new" });
+  assert.equal(refused.status, 429);
+  assert.equal("brand-new" in agents, false, "no record, so nothing to mark");
 });
 
 test("registryBytes tracks deletes it never saw, and matches a full re-measure", async () => {

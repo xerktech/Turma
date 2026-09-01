@@ -184,6 +184,15 @@ data class AgentInfo(
     // Set (non-null) during an ANNOUNCED update restart (XERK-29): the host is
     // briefly silent on purpose, so this reads as "updating", not an outage.
     val updating: UpdatingInfo? = null,
+    /**
+     * Set (non-null) while the hub is REFUSING this host's heartbeats (XERK-298):
+     * the host looks offline but is up — its record just won't fit the registry.
+     * HUB-DERIVED and cleared on the first accepted beat, so the default null is
+     * "not refused / older hub can't tell". Shown as a header chip regardless of
+     * [online] (mirrors index.html's refusedBadge) — the refusal is exactly why
+     * the host reads offline.
+     */
+    val refused: RefusedInfo? = null,
     val repos: List<RepoInfo> = emptyList(),
     val sessions: List<SessionInfo> = emptyList(),
     // The login's probed model list (XERK-33), for the ticket model picker's
@@ -365,6 +374,23 @@ data class Capacity(
 data class UpdatingInfo(
     val version: String = "",
     val until: Long = 0,
+)
+
+/**
+ * The hub is REFUSING this host's heartbeats (XERK-298): its record is over the
+ * per-host byte ceiling or over its share of a full registry. Stamped by the hub
+ * on the record it keeps and continues to serve, so a refused host — which
+ * otherwise freezes at its last record and ages to "offline" exactly like a
+ * network outage — shows a chip saying so. HUB-OWNED (the hub strips any forged
+ * value on ingest), null on an accepted beat and on an agent/hub predating it.
+ * [detail] is the hub's own words; [reason] a stable machine code
+ * ("record-too-large" / "registry-full").
+ */
+@Serializable
+data class RefusedInfo(
+    val at: Long = 0,
+    val reason: String = "",
+    val detail: String = "",
 )
 
 @Serializable

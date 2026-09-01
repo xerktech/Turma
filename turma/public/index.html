@@ -689,6 +689,22 @@ function autoPausedBadge(a) {
   if (!a.autoPaused) return "";
   return `<span class="host-auth warn" title="Auto-start is paused for this host — its Claude subscription has hit a usage limit (past the even weekly pace line, or the 5-hour window at/above 90%). Manual starts still work; it resumes on its own as the window elapses or resets.">⏸ Auto paused</span>`;
 }
+// The hub is REFUSING this host's heartbeats (XERK-298): its record is over the
+// per-host byte ceiling or over its share of a full registry. Unlike every other
+// badge here this is shown REGARDLESS of online state — that is the whole point.
+// A refused host freezes at its last record and ages past OFFLINE_AFTER_MS, so it
+// reads as "offline" exactly like a network outage; without this chip the only
+// way to tell the two apart is the hub's container logs. Red: it needs operator
+// action (shrink the host's report, or raise the registry budget). The hub clears
+// the field on the first accepted beat, so the chip disappears once the host
+// recovers. `detail` is the hub's own words; `reason` is a stable machine code.
+function refusedBadge(a) {
+  const r = a.refused;
+  if (!r) return "";
+  const when = r.at ? ` (last ${ago(Date.now() - r.at)} ago)` : "";
+  const why = r.detail ? ": " + r.detail : "";
+  return `<span class="host-auth req" title="The hub is refusing this host's heartbeats${why}${when}. The host looks offline but is up — it just cannot register. Shrink its report or raise the registry budget; the chip clears when the hub accepts a beat again.">⛔ Hub refused</span>`;
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -1139,6 +1155,7 @@ function hostCard(a, now) {
         <h3>${esc(a.key)}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
       </button>
       ${collapsedMeta}
+      ${refusedBadge(a)}
       ${boardHealthBadge(a)}
       ${claudeAuthBadge(a)}
       ${autoPausedBadge(a)}

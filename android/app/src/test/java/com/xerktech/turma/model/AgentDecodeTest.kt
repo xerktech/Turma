@@ -142,6 +142,25 @@ class AgentDecodeTest {
         assertEquals(false, resp.agents[1].autoPaused)
     }
 
+    // XERK-298: the hub-stamped heartbeat-refusal marker. Typing it is what makes
+    // a wrong value decode-fatal for the whole fleet, so the present/absent shape
+    // is pinned. An absent `refused` is null ("not refused"); a present one keeps
+    // its fields so the header chip can read them.
+    @Test fun `the refused marker decodes, null when absent`() {
+        val body = """
+            { "now": 1, "agents": [
+              { "key": "refused", "device": "refused", "online": false,
+                "refused": { "at": 1700000000000, "reason": "registry-full",
+                             "detail": "record is over its share" } },
+              { "key": "ok", "device": "ok", "online": true }
+            ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertEquals("registry-full", resp.agents[0].refused?.reason)
+        assertEquals(1700000000000L, resp.agents[0].refused?.at)
+        assertNull(resp.agents[1].refused)
+    }
+
     // XERK-460: the dsh capability flag + per-session runtime. Typing these is
     // what makes them decode-fatal if wrong, so the shape is pinned here — the
     // available/absent block and the session's agentType.

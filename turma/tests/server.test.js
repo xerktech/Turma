@@ -163,7 +163,7 @@ const {
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
   serializeAgentsForSave,
-  HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
+  HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, REFUSED_DETAIL_MAX,
   userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
   agentBearerKind, agentHostRefusal, agentPresentedRefusal, hostAgentToken, tokenHost, ttydAuth,
   controlChannels, pendingChannels,
@@ -1525,6 +1525,97 @@ test("http: a refused beat does not leak into the on-demand caches", async () =>
   const hist = await request("GET", `/api/agents/${host}/sessions/leaked/history`, { headers: userHeaders });
   assert.equal(hist.raw.includes("LEAKED-THROUGH-A-413"), false,
     "a refused beat's history must not be served");
+});
+
+// ---- XERK-298: a hub-refused heartbeat is VISIBLE to the operator ----------
+
+// Fetch one host's SERVED record (via /api/agents, not the in-memory store) so
+// the assertions prove the marker actually rides the wire the client reads.
+async function servedAgent(host) {
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  return res.body.agents.find((a) => a.key === host);
+}
+
+test("http: a 413-refused KNOWN host is stamped `refused` on the served record (XERK-298)", async () => {
+  const host = "refused-413-host";
+  assert.equal((await request("POST", "/api/heartbeat", {
+    headers: agentHeaders, body: { device: host, repos: [{ name: "r1" }] },
+  })).status, 200);
+  // No chip while the host is healthy.
+  assert.equal((await servedAgent(host)).refused, undefined);
+
+  const fat = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders, body: { device: host, sessions: "A".repeat(AGENT_RECORD_MAX + 1024) },
+  });
+  assert.equal(fat.status, 413);
+
+  // The refusal is now an operator-visible marker on the record the hub keeps —
+  // NOT just a log line and a host that silently ages to offline.
+  const a = await servedAgent(host);
+  assert.ok(a, "the known host is still served");
+  assert.ok(a.refused, "a refused known host carries a `refused` marker");
+  assert.equal(a.refused.reason, "record-too-large");
+  assert.equal(typeof a.refused.at, "number");
+  assert.ok(a.refused.detail && a.refused.detail.length <= REFUSED_DETAIL_MAX);
+  // The prior good record is still what's served underneath the marker.
+  assert.deepEqual(a.repos, [{ name: "r1" }]);
+});
+
+test("http: the next ACCEPTED beat clears `refused` (XERK-298)", async () => {
+  const host = "refused-clears-host";
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: host } });
+  assert.equal((await request("POST", "/api/heartbeat", {
+    headers: agentHeaders, body: { device: host, sessions: "A".repeat(AGENT_RECORD_MAX + 1024) },
+  })).status, 413);
+  assert.ok((await servedAgent(host)).refused, "stamped by the refusal");
+
+  // A beat that fits rebuilds the record from the payload, which carries no
+  // `refused` — so recovery clears the chip with no explicit un-stamp.
+  assert.equal((await request("POST", "/api/heartbeat", {
+    headers: agentHeaders, body: { device: host, repos: [{ name: "back" }] },
+  })).status, 200);
+  const a = await servedAgent(host);
+  assert.equal(a.refused, undefined, "an accepted beat clears the marker");
+  assert.deepEqual(a.repos, [{ name: "back" }]);
+});
+
+test("http: a host cannot FORGE its own `refused` chip (XERK-298)", async () => {
+  const host = "refused-forge-host";
+  const res = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, refused: { at: 1, reason: "record-too-large", detail: "fake" } },
+  });
+  assert.equal(res.status, 200);
+  // `refused` is hub-owned: stripped on ingest like `key`, so an accepted beat
+  // asserting one is served without it.
+  assert.equal((await servedAgent(host)).refused, undefined);
+  assert.equal(agents[host].refused, undefined);
+});
+
+test("normalizeRefused coerces the restored/hand-edited shape (XERK-298)", () => {
+  // A well-formed marker survives, detail re-capped.
+  const ok = { refused: { at: 5, reason: "registry-full", detail: "x".repeat(500) } };
+  hub.normalizeRefused(ok);
+  assert.equal(ok.refused.at, 5);
+  assert.equal(ok.refused.detail.length, REFUSED_DETAIL_MAX);
+
+  // A missing/bad `at` (the required anchor Android types) drops the whole block
+  // — reading as "not refused", never a fabricated value.
+  for (const bad of [{ reason: "x" }, { at: "5" }, { at: null }]) {
+    const r = { refused: bad };
+    hub.normalizeRefused(r);
+    assert.equal(r.refused, undefined);
+  }
+  // A non-object block is dropped; a wrong-typed sub-field is dropped, not
+  // stringified (so the client default applies).
+  const arr = { refused: [] };
+  hub.normalizeRefused(arr);
+  assert.equal(arr.refused, undefined);
+  const sub = { refused: { at: 1, reason: 7, detail: {} } };
+  hub.normalizeRefused(sub);
+  assert.equal(sub.refused.reason, undefined);
+  assert.equal(sub.refused.detail, undefined);
+  assert.equal(sub.refused.at, 1);
 });
 
 test("http: a non-array ingest field degrades to 200, not a 400 offline loop (XERK-529)", async () => {
