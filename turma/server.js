@@ -8718,14 +8718,30 @@ const server = http.createServer(async (req, res) => {
     // before any auth gate — they're credential-less by spec and must not 401.
     const origin = req.headers.origin;
     if ((parts[0] === "api" || parts[0] === "term") && origin) {
-      // Reflection (not "*") is required for credentialed CORS, and the
-      // glasses WebView's origin isn't fixed; auth still gates every route.
+      // Reflection (not "*") lets the cross-origin glasses WebView read /api/*
+      // and /term/* responses; the origin isn't fixed. Every glasses REST call
+      // authenticates with an explicit Authorization header (no cookie), which
+      // needs the reflected origin + Allow-Headers but NOT credentialed CORS.
       // nosemgrep: javascript.express.security.cors-misconfiguration.cors-misconfiguration
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Vary", "Origin");
-      res.setHeader("Access-Control-Allow-Credentials", "true");
       res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
       res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+      // Credentialed (cookie-bearing) cross-origin access is confined to the
+      // TWO endpoints that need it: the glasses WebView plants/clears the hub
+      // session cookie via POST /api/login | /api/logout with
+      // `credentials:"include"` so its same-origin terminal iframe
+      // authenticates. Every OTHER /api/* and /term/* read is Authorization-
+      // header auth, so NOT emitting Allow-Credentials there is what stops a
+      // logged-in victim's browser being driven from an attacker page to read
+      // /api/agents (enumerate session ids) and then /term/<id>/token — which
+      // returns the host's own agent credential (XERK-268), the thing ttyd is
+      // started with (`-c term:$TURMA_TOKEN`). Without Allow-Credentials the
+      // browser blocks that cross-origin credentialed read regardless of
+      // whether it honours the cookie's `Partitioned` attribute (XERK-314).
+      if (url.pathname === "/api/login" || url.pathname === "/api/logout") {
+        res.setHeader("Access-Control-Allow-Credentials", "true");
+      }
       if (req.method === "OPTIONS") {
         res.writeHead(204);
         return res.end();
