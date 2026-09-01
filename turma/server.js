@@ -5208,6 +5208,38 @@ function chargeBody(n, lane) {
  */
 const BODY_PARSE_COST = 3;
 
+// What a HEARTBEAT body really costs the hub, which is far more than an ordinary
+// JSON body's 3x (XERK-376). `sanitizeHeartbeat` walks a deep tree — sessions,
+// their live-agent rows, per-repo usage, staged historyResults (the ~22 MiB
+// XERK-235 exists for) — and holds the accumulated wire string, `JSON.parse`'s
+// object graph AND the sanitized copy it builds beside it all at once. Measured
+// in a real 256 MiB cgroup on a REAL DISK (never tmpfs — see turma-limits.md): a
+// lone 30 MiB beat peaks ~185 MiB over a ~20 MiB baseline, i.e. ~5.5x the wire,
+// while `readBody`'s default charged it 3x. So the in-flight budget admitted
+// about twice what the container could hold and a couple of concurrent
+// large-but-legal beats (32 MiB is inside HEARTBEAT_MAX) OOM-killed the hub —
+// `restart: unless-stopped` then looping the outage, the exact class XERK-258/
+// XERK-273/XERK-356 exist to stop, on the ROUTE EVERY HOST BEATS.
+//
+// Charged honestly, the fix rides machinery already built. The two-lane budget
+// already lets at most ONE beat outgrow the shared budget into the exclusive big
+// lane, at either cost — so what changes is NOT how many big beats are admitted.
+// It is how much OTHER traffic co-resides beside the one that is: the big lane's
+// occupancy counts against shared admission, so an HONEST 32 x 6 = 192-unit beat
+// exceeds the whole 128-unit shared budget and leaves ZERO room for any other
+// body to buffer beside it. At the old 3x charge one 30 MiB beat held ~90 units,
+// leaving ~38 of shared room, so small "slop" bodies stacked their buffers onto
+// the big beat's peak — and THAT co-residence is what crossed the container
+// ceiling (measured in a real 256 MiB budget: three concurrent 30 MiB beats peak
+// ~287 MiB on the 3x charge — OOM — vs ~245 MiB honest). HEARTBEAT_MAX stays
+// 32 MiB (XERK-235's shape must not re-open), so the container is sized against
+// exactly one max beat plus a shared lane the beat has now fully claimed. The
+// accepted cost is control-plane 503s WHILE a large beat is in flight — a rare,
+// retryable moment on a route whose bodies are usually a few hundred bytes —
+// traded against an OOM that took the whole fleet's control plane down. 6, not
+// the measured 5.5, for headroom over the peak.
+const HEARTBEAT_PARSE_COST = 6;
+
 /**
  * Give `n` bytes back. Both readers call this the moment the body stops being
  * held — on end, on error, and on either refusal — because a charge that
@@ -8951,7 +8983,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/heartbeat") {
-      const raw = JSON.parse((await readBody(req, HEARTBEAT_MAX)) || "{}");
+      const raw = JSON.parse((await readBody(req, HEARTBEAT_MAX, HEARTBEAT_PARSE_COST)) || "{}");
       const payload = sanitizeHeartbeat(raw, (raw && raw.device) || "unknown host");
       // Coerce an old agent's per-model usage lists to the current shape before
       // anything (the record, the cache, every client) sees them.
@@ -11787,6 +11819,10 @@ if (process.env.TURMA_TEST) {
     archiveRefusals, archiveRefusalFor,
     noteArchiveRefusal, ARCHIVE_REFUSALS_MAX, ARCHIVE_REFUSALS_PER_HOST,
     bodyLaneFor, chargeBody, releaseBody, bodyInflightHeld, BODY_PARSE_COST,
+    // Heartbeat is charged its true ~5.5x cost, not BODY_PARSE_COST (XERK-376) —
+    // a test pins that it exceeds the ordinary cost and that its worst case is
+    // what the container is sized against.
+    HEARTBEAT_MAX, HEARTBEAT_PARSE_COST,
     DRAIN_CONCURRENCY_MAX, BODY_IDLE_TIMEOUT_MS, BODY_MIN_PROGRESS_BYTES,
     BIG_LANE_MAX_HOLD_MS, budgetUnderPressure,
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these
@@ -12050,7 +12086,8 @@ if (process.env.TURMA_TEST) {
     console.log(
       `memory limit ${mib(MEMORY_LIMIT)} -> body in-flight ${mib(BODY_INFLIGHT_MAX)}/request, ` +
         `${mib(BODY_INFLIGHT_TOTAL_MAX)} across both lanes; uploads held ` +
-        `${mib(UPLOAD_TOTAL_MAX_BYTES)}; archive chunk ${archiveChunkLabel()} ` +
+        `${mib(UPLOAD_TOTAL_MAX_BYTES)}; heartbeat ${mib(HEARTBEAT_MAX)} at ` +
+        `${HEARTBEAT_PARSE_COST}x; archive chunk ${archiveChunkLabel()} ` +
         `at ${ARCHIVE_PARSE_COST}x`
     );
     // The effective registry budget, printed for the same reason: it is DERIVED

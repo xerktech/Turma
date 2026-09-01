@@ -72,17 +72,34 @@ The hub is the fleet's sole control plane under `mem_limit: 256m`, with `restart
   agents build deltas from an 8 MiB window since an ended session's first delta is its whole
   transcript — XERK-356).
 - **A route costing more than `BODY_PARSE_COST` must declare that too** (`readBody`'s third arg).
-  `ARCHIVE_PARSE_COST` is 20 (accumulated body + parsed entries + re-serialized lines + append
-  buffer, all charged at once); the ceiling is `min(2 MiB, MEMORY_LIMIT / 60)`.
-- **KNOWN, pre-existing gap: `/api/heartbeat` is under-charged the same way archive was**
-  (XERK-376) — charging it honestly trades control-plane 503s against OOM on the route that carries
-  every host's liveness, so fixing it is a sizing decision, not a code fix.
-  - **The ceiling rides the heartbeat reply** (`archiveChunkMax`), a fraction of THIS container's
-    limit — an agent guessing it guesses wrong. A predating agent keeps a default under the old
-    1 MiB cap.
-  - **Read at the route, not the generic handler** — 413 vs 503 stay distinct, and refusals are
-    RECORDED (`archiveRefusals`, bounded, oldest evicted) so `GET /api/archive/<id>` 404s can say
-    `refused` instead of leaving the operator thinking it's merely late.
+  Two routes do: the archive ingest and the heartbeat.
+  - `ARCHIVE_PARSE_COST` is 20 (accumulated body + parsed entries + re-serialized lines + append
+    buffer, all charged at once); the ceiling is `min(2 MiB, MEMORY_LIMIT / 60)`.
+    - **The ceiling rides the heartbeat reply** (`archiveChunkMax`), a fraction of THIS container's
+      limit — an agent guessing it guesses wrong. A predating agent keeps a default under the old
+      1 MiB cap.
+    - **Read at the route, not the generic handler** — 413 vs 503 stay distinct, and refusals are
+      RECORDED (`archiveRefusals`, bounded, oldest evicted) so `GET /api/archive/<id>` 404s can say
+      `refused` instead of leaving the operator thinking it's merely late.
+  - `HEARTBEAT_PARSE_COST` is **6** (XERK-376) — a beat measures ~5.5x its wire at peak RSS
+    (`sanitizeHeartbeat` walks sessions/live-agents/usage/staged-history and holds the wire string,
+    `JSON.parse`'s graph AND the sanitized copy at once), 6 for headroom. Charged 3x, the budget
+    admitted ~2x what a 256 MiB container held and a couple of concurrent large-but-legal beats
+    OOM-killed the hub on the route EVERY host beats.
+    - **`HEARTBEAT_MAX` stays 32 MiB** — lowering it re-opens XERK-235's shape. So one honest max
+      beat charges `32 x 6 = 192`, which EXCEEDS `BODY_INFLIGHT_TOTAL_MAX` (128). That inequality is
+      the fix, but NOT because it changes how many big beats are admitted — the two-lane budget
+      already admits at most one big beat and 503s a second at EITHER cost. It changes how much OTHER
+      traffic co-resides: the big lane's occupancy counts against shared admission, so a 192-unit
+      beat leaves ZERO shared room for any body to buffer beside it, where the old 90-unit (3x) charge
+      left ~38 units and small "slop" bodies stacked their buffers onto the big beat's peak — the
+      co-residence that crossed the ceiling (QA measured 3 concurrent 30 MiB beats at ~287 MiB on 3x —
+      OOM — vs ~245 MiB honest, in a real 256 MiB budget).
+    - **The accepted sizing trade** (the ticket's "sizing decision"): while a large beat is in flight
+      the shared lane has no room, so other bodies briefly 503+retry, and one 192-unit beat leaves
+      thin container headroom (one 30 MiB beat alone measures ~185 MiB real RSS). Rare + retryable on
+      the liveness route, versus a fleet-wide OOM. Tests pin `worst > TOTAL_MAX` (nothing co-resides)
+      and `worst < MEMORY_LIMIT` (the one beat still fits).
 
 ## Verifying a change here
 
