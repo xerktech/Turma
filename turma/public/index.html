@@ -48,10 +48,11 @@
   /* The host's Jira org, alongside the hostname: a descriptor of the row, not a
      second name for it, so it reads lighter than the hostname it follows. */
   .host-name h3 .host-org { color: var(--muted); font-weight: 500; }
-  /* Agent + Turma version under the hostname, shown while the card is COLLAPSED
-     so the header still tells you what a host runs and at what version without
-     expanding it (XERK-539, matching the Android card's collapsed header). When
-     expanded the fuller `.host-meta` row carries the same facts. */
+  /* Agent + Turma version under the hostname, ALWAYS shown (collapsed and
+     expanded alike) so it never moves between the header and `.host-meta` as the
+     card toggles — it sits in one fixed place and stays visible when collapsed
+     (XERK-539, matching the Android card's collapsed header). `.host-meta` no
+     longer repeats these two; it carries only memory/uptime/repos root/sessions. */
   .host-name .host-ver { color: var(--muted); font-size: 12px; font-weight: 400; word-break: break-word; }
   .host-name .caret { color: var(--muted); font-size: 11px; flex-shrink: 0; transition: transform 0.15s; }
   .host-card.collapsed .host-name .caret { transform: rotate(-90deg); }
@@ -1088,8 +1089,6 @@ function hostCard(a, now) {
   const collapsed = collapsedHosts.has(a.key);
   const body = collapsed ? "" : `
     <div class="host-meta">
-      <span><span class="m-label">Agent</span> <b>${esc(codingAgent(a))}</b></span>
-      <span><span class="m-label">Turma</span> <b>${esc(a.agentVersion || "–")}</b></span>
       <span><span class="m-label">Memory</span> <b>${esc(mem)}</b></span>
       <span><span class="m-label">Uptime</span> <b>${esc(uptime(a.startedAt, now))}</b> · last seen ${esc(ago(now - a.lastSeen))}</span>
       <span><span class="m-label">Repos root</span> <span class="path">${esc(a.reposRoot || "–")}</span></span>
@@ -1131,7 +1130,7 @@ function hostCard(a, now) {
         <span class="caret">▼</span>
         <span class="host-name-text">
           <h3>${esc(a.key)}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
-          ${collapsed ? `<span class="host-ver">${esc(hostVerLine(a))}</span>` : ""}
+          <span class="host-ver">${esc(hostVerLine(a))}</span>
         </span>
       </button>
       ${collapsedMeta}
