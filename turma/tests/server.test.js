@@ -15298,6 +15298,99 @@ test("a corrupt state file restores nothing, rather than a registry of character
   assert.match(ok, /loaded 1 agents from/);
 });
 
+test("XERK-297: one null record in state.json does not blank the whole fleet", () => {
+  // The failure this fixes: a single non-object record (a torn write leaving
+  // `"bad":null` as valid JSON) alongside healthy hosts passed every per-field
+  // guard — they all early-return on a non-object — and reached serializeAgent,
+  // where `a.lastSeen` threw a TypeError that emptied the ENTIRE payload. Every
+  // host vanished, not just the bad one, and it persisted across restarts.
+  //
+  // Written as raw JSON, not a stringified literal: an object literal's `null`
+  // value is fine, but the array/scalar shapes below are the ones a hand-edit or
+  // torn write also produce, and all four must be dropped per-record, not fail
+  // the whole restore. The healthy host beside them must survive.
+  const out = bootWithState(this, '{' +
+    '"bad":null,' +
+    '"arr":[1,2],' +
+    '"num":7,' +
+    '"str":"x",' +
+    '"truenas":{"device":"truenas"}}');
+  const { agents: restored, warns } = JSON.parse(
+    out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>")));
+  assert.deepEqual(Object.keys(restored), ["truenas"],
+    "the healthy host must survive; every non-object record is dropped");
+  // The operator is told, once per dropped record — not left to infer it from a
+  // fleet that silently emptied.
+  assert.equal(
+    warns.filter((w) => /dropping restored agent with a non-object record/.test(w)).length, 4);
+  // ...and the restore reports a SUCCESSFUL load of the one real host, not a
+  // wholesale skip.
+  assert.match(out, /loaded 1 agents from/);
+});
+
+test("XERK-297: dropNonObjectRecords removes non-object records, in every position", () => {
+  // The behavioural twin of the dropUnusableHostKeys test — a source regex over
+  // the restore loop proves only that the CALL is there, not that it drops the
+  // right things. A bad record FIRST, in the MIDDLE and LAST, so an early break
+  // couldn't pass on a fixture whose junk merely leads.
+  const store = {
+    bad: null, truenas: { device: "truenas" }, arr: [1],
+    ok2: { device: "ok2" }, num: 3, str: "x",
+  };
+  const dropped = hub.dropNonObjectRecords(store);
+  assert.deepEqual(dropped.sort(), ["arr", "bad", "num", "str"]);
+  assert.deepEqual(Object.keys(store).sort(), ["ok2", "truenas"],
+    "the non-object records are GONE and every real record survived");
+
+  // Nothing to do reports nothing; a non-object STORE is left alone, not iterated
+  // (Object.entries("hi") would otherwise restore a two-record fleet).
+  assert.deepEqual(hub.dropNonObjectRecords({ truenas: {} }), []);
+  for (const junk of ["hello", [], null, undefined, 12, true]) {
+    assert.deepEqual(hub.dropNonObjectRecords(junk), [],
+      `${JSON.stringify(junk)} must be left alone, not iterated`);
+  }
+
+  // And the restore actually CALLS it, between the parsed blob and the record
+  // walk that would crash on a non-object.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const loStart = src.indexOf("---- persistence");
+  const loEnd = src.indexOf("first boot or no volume");
+  const loader = src.slice(loStart, loEnd);
+  assert.ok(/dropNonObjectRecords\(agents\)/.test(loader),
+    "the restore must drop non-object records before serializing them");
+});
+
+test("XERK-297: the degraded fleet body names the failure class, not always 'payload too large'", () => {
+  // Only V8's ~512 MiB string ceiling (a RangeError) is genuinely a size problem;
+  // the null-record TypeError this ticket is about is NOT, and the blanket
+  // "payload too large" sent whoever debugged it hunting AGENT_RECORD_MAX.
+  assert.equal(hub.degradedAgentsError(new RangeError("Invalid string length")),
+    "payload too large");
+  assert.equal(
+    hub.degradedAgentsError(new TypeError("Cannot read properties of null (reading 'lastSeen')")),
+    "agents payload could not be serialized");
+  // The default for any other throw is the honest one, not the size claim.
+  assert.equal(hub.degradedAgentsError(new Error("nope")),
+    "agents payload could not be serialized");
+});
+
+test("XERK-297: scheduleSave writes atomically — temp file then rename", () => {
+  // A non-atomic fs.writeFile is how a torn state.json arises in the first place:
+  // a reader (this hub's own next-boot restore) can catch a half-written blob
+  // that is still valid-but-null-ish JSON. Held structurally — the write is a
+  // 30-second debounced timer, so driving it end-to-end is not a unit test — but
+  // the shape is unambiguous: write to a sibling temp path, then rename over it.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const fn = src.slice(src.indexOf("function scheduleSave"),
+    src.indexOf("function prune"));
+  assert.match(fn, /STATE_FILE\}\.tmp-/,
+    "the save must write to a sibling temp file, not STATE_FILE directly");
+  const iWrite = fn.indexOf("fs.writeFile(tmp");
+  const iRename = fn.indexOf("fs.rename(tmp, STATE_FILE");
+  assert.ok(iWrite > -1 && iRename > iWrite,
+    "the save must writeFile the temp path THEN rename it over STATE_FILE");
+});
+
 test("normalizeLocalModel bounds the name BEFORE spreading it", () => {
   // `[...s]` allocates per code point over the WHOLE string, so an unbounded
   // spread let one agent-authed heartbeat with a 24 MiB name OOM-kill the hub
