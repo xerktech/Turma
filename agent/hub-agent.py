@@ -24014,7 +24014,17 @@ class SessionManager:
         # never raise KeyError and take the host down (XERK-402). None threads
         # through the caches and the payload harmlessly, as every OTHER read of a
         # record's id in this file already does with .get().
+        #
+        # A minted id is always a str; keep ONLY a str. A hand-edited record can
+        # carry any JSON type here, and an UNHASHABLE one (a list/dict) would
+        # raise TypeError at the sid-keyed cache lookups in the return dict below
+        # (usage_cache.get(sid) / _session_prs(sid)) — outside every try — which
+        # is the same beat-loop crash under a wrong TYPE that this ticket closes
+        # under a missing KEY (XERK-402 QA). Non-str -> None makes it behave as
+        # the (already covered) id-less record.
         sid = sess.get("id")
+        if not isinstance(sid, str):
+            sid = None
         running = sess.get("status") == "running"
         signals = None
         if running:
@@ -24216,9 +24226,15 @@ class SessionManager:
             # Deliberately not _session_transcript_id, which answers None until
             # the file exists: the pinned id is the conversation this session
             # WILL have, and the hub needs it before the first turn lands.
+            # isinstance str, not just truthy: _latest_transcript_id slugifies the
+            # path through re.sub, which raises TypeError on a NON-STRING — a
+            # hand-edited record's "worktreePath": 123 would crash the beat here,
+            # outside any try, the wrong-TYPE twin of the missing-key case above
+            # (XERK-402 QA). A non-str/empty worktree degrades to no transcript.
             "transcriptId": (sess.get("claudeSessionId")
                              or (self._latest_transcript_id(sess["worktreePath"])
-                                 if sess.get("worktreePath") else None)),
+                                 if isinstance(sess.get("worktreePath"), str)
+                                 and sess.get("worktreePath") else None)),
             "session": signals,                      # running only; null otherwise
         }
 

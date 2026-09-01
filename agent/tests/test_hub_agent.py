@@ -6417,6 +6417,29 @@ class TestSessionPayloadNeverRaises(ManagerMixin, unittest.TestCase):
             refresh=True)
         self.assertEqual(payload["transcriptId"], "abc-123")
 
+    def test_a_wrong_type_worktree_path_does_not_crash_the_transcript_id(self):
+        # A hand-edit readily produces "worktreePath": 123 (or a list). With no
+        # claudeSessionId to short-circuit the `or`, the transcript-id fallback
+        # would slugify it through re.sub and raise TypeError straight onto the
+        # beat loop — the wrong-TYPE twin of the missing-key crash (XERK-402 QA).
+        sm = self.make_manager()
+        for wt in (123, 4.5, ["/a/b"], {"x": 1}, True):
+            for status in ("stopped", "running"):
+                sess = {"id": "s", "status": status, "worktreePath": wt}
+                payload = sm._session_payload(sess, refresh=True)  # must not raise
+                self.assertIsNone(payload["transcriptId"], (wt, status))
+
+    def test_an_unhashable_id_does_not_crash_the_cache_lookups(self):
+        # A record whose id is a list/dict is unhashable, so the sid-keyed cache
+        # lookups in the return dict (usage_cache.get(sid) / _session_prs(sid),
+        # outside every try) would raise TypeError on the beat loop. A non-str id
+        # degrades to None, behaving as the id-less record (XERK-402 QA).
+        sm = self.make_manager()
+        for bad_id in (["x"], {"k": "v"}, 42, 3.5):
+            payload = sm._session_payload(
+                {"id": bad_id, "status": "stopped"}, refresh=True)  # must not raise
+            self.assertIsNone(payload["id"], bad_id)
+
 
 class TestSubscriptionIdentity(unittest.TestCase):
     """Which subscription a host's login is on (XERK-301). The limits above are a
