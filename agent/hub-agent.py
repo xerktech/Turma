@@ -13134,6 +13134,24 @@ class SessionManager:
         # snapshot-into-payload and deliver-and-clear, so a refusal appended
         # mid-beat can't be cleared without being sent.
         self._spawn_failures_lock = threading.Lock()
+        # PR-comment review activity is FETCHED off the beat (XERK-543): up to
+        # PR_COMMENTS_MAX gh/GitLab/ADO calls, each at run()'s 15s, is the same
+        # OFFLINE_AFTER_MS class as refresh_pr_status — inline it could stall the
+        # heartbeat and flap a healthy host offline. It could not simply ride the
+        # slow-refresh worker (XERK-397), which is the SINGLE writer of caches the
+        # beat reads lock-free: delivery MUTATES session records and calls save(),
+        # which is the beat's to own. So it is a FETCH/DELIVER SPLIT — the fetch
+        # worker stages raw events here (sessionId -> {url: events|None}); the beat
+        # drains this, applies the baseline/new-key logic, mutates prCommentBase
+        # and delivers via notify_session. Written off-beat / read on-beat, so the
+        # staging is REBOUND under this lock rather than mutated in place — the
+        # discipline spawn_failures uses. Coalescing: the wake Event is idempotent
+        # and each fetch rebinds the whole dict, so a beat pushing faster than a
+        # fetch completes never backs up a queue.
+        self._pr_comments_lock = threading.Lock()
+        self._pr_comments_wake = threading.Event()
+        self._pr_comments_worker = None
+        self._pr_comments_fetched = {}
         # GitHub clone-into-root state: the cached availability/repo-list block
         # (refreshed on a slow cadence, reported every beat) and in-flight/recent
         # clone jobs keyed by dest name (the Popen lives here; only a serializable
@@ -22126,10 +22144,104 @@ class SessionManager:
             return None
         return [self.pr_status_cache.get(u) or {"url": u} for u in urls]
 
-    def _poll_pr_comments(self):
-        """Deliver new PR review activity into the RUNNING session that opened
-        the PR (XERK-49): a reply asking for corrections is delivered to that
-        session so the agent continues the work, with no operator relaying it.
+    def _stage_pr_comment_fetch(self):
+        """Wake the PR-comment fetch worker (XERK-543). Called from the beat on
+        the PR_COMMENTS cadence, which STAGES the network fetch off-beat and
+        DELIVERS the previous fetch inline (_deliver_pr_comments).
+
+        MUST NOT raise onto the beat: this runs on the heartbeat loop, the
+        agent's PID-1 main process with no retry, so an exception here takes the
+        host and every session on it down. Thread.start() raising RuntimeError at
+        the pids_limit (XERK-402) is the realistic way that happens; a failed
+        start leaves a dead worker whose is_alive() is False, so the next
+        PR_COMMENTS beat retries — the same shape as _stage_slow_refresh."""
+        try:
+            with self._pr_comments_lock:
+                worker = self._pr_comments_worker
+                if worker is None or not worker.is_alive():
+                    worker = threading.Thread(
+                        target=self._pr_comment_fetch_worker_loop,
+                        name="pr-comment-fetch", daemon=True)
+                    self._pr_comments_worker = worker
+                    worker.start()
+            self._pr_comments_wake.set()
+        except Exception as e:
+            log(f"pr comment fetch could not be staged: "
+                f"{type(e).__name__}: {e}")
+
+    def _pr_comment_fetch_worker_loop(self):
+        """Run the PR-comment fetch, then wait for the beat to stage the next.
+
+        Long-lived and daemon like the archive/slow-refresh workers (a job
+        arrives on every PR_COMMENTS beat), and never joined on shutdown: the
+        staged events are best-effort and the beat re-derives what a cut-short
+        pass would have found, whereas waiting out an in-flight 15s gh call would
+        put the very stall this moved off the beat back onto shutdown.
+
+        The wake is cleared BEFORE the fetch runs, mirroring the other workers: a
+        spurious extra loop (already fetched, event still set) is absorbed by a
+        cheap re-fetch, but a stage that lands while a fetch runs is never
+        dropped."""
+        while True:
+            self._pr_comments_wake.wait()
+            self._pr_comments_wake.clear()
+            try:
+                self._fetch_pr_comments()
+            except Exception as e:
+                # Best-effort like every refresh; this backstop keeps the worker
+                # alive for the next beat.
+                log(f"pr comment fetch failed: {e}")
+
+    def _fetch_pr_comments(self):
+        """FETCH new PR review activity for every running session's PRs, OFF THE
+        BEAT (XERK-543). Stages raw events (sessionId -> {url: events|None}) for
+        the beat to apply; it does NOT touch prCommentBase, notify_session or
+        save() — all registry mutation stays the beat's (_deliver_pr_comments).
+
+        Same OFFLINE_AFTER_MS class as refresh_pr_status: up to PR_COMMENTS_MAX
+        gh/GitLab/ADO calls, each bounded only by run()'s 15s, is why the fetch
+        may not run inline. Each URL polls only through the source that can answer
+        for it (_pr_source_ok — gh for GitHub PRs, the configured GitLab for MRs
+        (XERK-162), the configured Azure DevOps org for its own PRs (XERK-226)),
+        capped at PR_COMMENTS_MAX PRs per pass.
+
+        Reads self.registry/self.session_pr_urls off-beat exactly as
+        refresh_pr_status does; the beat only APPENDS/REBINDS them, so a snapshot
+        read is safe. The staging is REBOUND (never mutated in place) under
+        _pr_comments_lock so a concurrent drain on the beat sees a whole dict."""
+        if not PR_COMMENTS_DELIVER or not (
+                self.github.get("available") or gitlab_configured()
+                or azure_configured()):
+            return
+        self_login = self.github.get("login") or ""
+        polled = 0
+        fetched = {}
+        for sess in list(self.registry):
+            if polled >= PR_COMMENTS_MAX:
+                break
+            if sess.get("status") != "running":
+                continue
+            urls = self.session_pr_urls.get(sess["id"]) or []
+            if not urls:
+                continue
+            for url in urls:
+                if not self._pr_source_ok(url):
+                    continue
+                if polled >= PR_COMMENTS_MAX:
+                    break
+                polled += 1
+                # None is preserved — the beat reads a failed fetch as "keep the
+                # baseline", distinct from an empty comment set.
+                fetched.setdefault(sess["id"], {})[url] = _pr_comment_events(
+                    url, self_login)
+        with self._pr_comments_lock:
+            self._pr_comments_fetched = fetched
+
+    def _deliver_pr_comments(self):
+        """DELIVER new PR review activity into the RUNNING session that opened
+        the PR (XERK-49), applying what _fetch_pr_comments staged off the beat.
+        This is the registry-mutating half and stays ON THE BEAT (XERK-543):
+        prCommentBase updates + save() + notify_session are the beat's to own.
 
         Only running sessions, only their OWN PRs (`session_pr_urls`, the same
         map the status pill reads). Delivery goes through notify_session, so it
@@ -22145,35 +22257,31 @@ class SessionManager:
         session's own comments are still folded into the seen-set so they are
         never mistaken for someone else's on a later beat.
 
-        Best-effort and bounded: each URL polls only through the source that
-        can answer for it (_pr_source_ok — gh for GitHub PRs, the configured
-        GitLab for MRs (XERK-162), the configured Azure DevOps org for its own
-        PRs (XERK-226)), capped at PR_COMMENTS_MAX PRs per beat, and a fetch
-        failure leaves that PR's baseline untouched (a fetch error is not
-        evidence the comments vanished)."""
-        if not PR_COMMENTS_DELIVER or not (
-                self.github.get("available") or gitlab_configured()
-                or azure_configured()):
+        A fetch failure (staged None) leaves that PR's baseline untouched — a
+        fetch error is not evidence the comments vanished."""
+        # DRAIN under the lock: take the staged fetch and rebind to empty, so a
+        # re-fetch mid-drain lands in a fresh dict and this pass never delivers
+        # the same events twice.
+        with self._pr_comments_lock:
+            fetched, self._pr_comments_fetched = self._pr_comments_fetched, {}
+        if not fetched:
             return
-        self_login = self.github.get("login") or ""
-        polled = 0
         for sess in self.registry:
             if sess.get("status") != "running":
                 continue
-            urls = self.session_pr_urls.get(sess["id"]) or []
-            if not urls:
+            staged = fetched.get(sess["id"])
+            if not staged:
                 continue
             base = sess.get("prCommentBase")
             if not isinstance(base, dict):
                 base = {}
             changed = False
-            for url in urls:
-                if not self._pr_source_ok(url):
+            # Iterate the session's CURRENT urls so a PR dropped between fetch
+            # and deliver is not delivered for; look each up in the staging.
+            for url in (self.session_pr_urls.get(sess["id"]) or []):
+                if url not in staged:
                     continue
-                if polled >= PR_COMMENTS_MAX:
-                    break
-                polled += 1
-                events = _pr_comment_events(url, self_login)
+                events = staged[url]
                 if events is None:
                     continue                       # fetch failed — keep baseline
                 seen = set(base.get(url) or [])
@@ -22196,6 +22304,17 @@ class SessionManager:
             if changed:
                 sess["prCommentBase"] = base
                 self.save()
+
+    def _poll_pr_comments(self):
+        """Fetch-then-deliver in one synchronous call. The BEAT no longer calls
+        this — it stages the fetch off-beat (_stage_pr_comment_fetch /
+        _fetch_pr_comments) and drains it on the beat (_deliver_pr_comments),
+        because the fetch is the same OFFLINE_AFTER_MS class as refresh_pr_status
+        (XERK-543). This synchronous form is kept because it exercises the whole
+        baseline/new-key/delivery contract end to end, which the behavioural
+        tests assert."""
+        self._fetch_pr_comments()
+        self._deliver_pr_comments()
 
     def _poll_prs_landed(self):
         """Stamp WHEN a session's PRs all landed, so "merging IS the review" can
@@ -24958,15 +25077,21 @@ class SessionManager:
             except Exception as e:
                 log(f"open-pr nudge poll failed: {e}")
         # New review activity on a session's PR is typed back into that session
-        # so a reply asking for corrections continues the work (XERK-49). Own
-        # cadence + per-beat cap; wrapped, because a PR comment is never worth
-        # taking the host's sessions down for.
+        # so a reply asking for corrections continues the work (XERK-49). The
+        # gh/GitLab/ADO FETCH runs OFF THE BEAT (XERK-543 — up to PR_COMMENTS_MAX
+        # calls at run()'s 15s, the same OFFLINE_AFTER_MS class as
+        # refresh_pr_status); the beat STAGES that fetch and DELIVERS what the
+        # previous one produced, since delivery mutates session records + save()
+        # and must stay the beat's. One beat stale, the accepted trade. The stage
+        # is wrapped internally; the delivery is wrapped here, because a PR
+        # comment is never worth taking the host's sessions down for.
         if not light and PR_COMMENTS_DELIVER and (
                 beat % PR_COMMENTS_REFRESH_EVERY == 0):
+            self._stage_pr_comment_fetch()
             try:
-                self._poll_pr_comments()
+                self._deliver_pr_comments()
             except Exception as e:
-                log(f"pr comment poll failed: {e}")
+                log(f"pr comment delivery failed: {e}")
         self._poll_clones()
         self._poll_prunes()
         # Start any queued session that can now run — a freed slot or a

@@ -255,11 +255,18 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     OWN thread (`_export_session_async`); its refusal still reaches the hub because the
     `spawn_failures` append is lock-guarded and `post()` clears only the entries THIS payload
     delivered, by identity, so a refusal appended mid-beat is never lost.
-  - **The PR-COMMENT poller is still an inline violator, tracked separately** — `_poll_pr_comments`
-    fetches `gh`/API comment activity on the beat (PR_COMMENTS_MAX per beat), same class as
-    `refresh_pr_status`, but it MUTATES session records (so it cannot ride the worker) and the fix is
-    a fetch/deliver split, not a move. Not folded into XERK-397; filed as its own ticket.
-  - Tests: `TestBeatLoopBudget`, `TestSlowRefreshWorker`, `TestArchiveSyncWorker`.
+  - **The PR-COMMENT poller is a FETCH/DELIVER SPLIT** (XERK-543), not on the slow-refresh worker.
+    Its `gh`/GitLab/ADO fetch (PR_COMMENTS_MAX per pass, same class as `refresh_pr_status`) runs on
+    its OWN worker (`_fetch_pr_comments`, staged by `_stage_pr_comment_fetch`), which stages raw
+    events (`_pr_comments_fetched`, REBOUND under `_pr_comments_lock` like `spawn_failures`); the beat
+    only DRAINS that and DELIVERS (`_deliver_pr_comments` — the baseline/new-key logic, `prCommentBase`
+    mutation, `save()`, `notify_session`). It could NOT ride the slow-refresh worker: that worker is
+    the single lock-free writer of caches the beat READS, whereas delivery MUTATES session records,
+    which is the beat's to own — so the network half moved off, the registry half stayed on. The
+    synchronous `_poll_pr_comments` (fetch-then-deliver) is kept only as the behavioural-test entry
+    point. One beat stale, accepted.
+  - Tests: `TestBeatLoopBudget`, `TestSlowRefreshWorker`, `TestPrCommentFetchWorker`,
+    `TestArchiveSyncWorker`.
 - **`readyForReview` has FOUR mirrors that must agree**: `turma/public/sessions.html`,
   `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`. Changing the rule means
   changing all four.
