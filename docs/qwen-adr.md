@@ -83,7 +83,14 @@ Every one of these is unit-tested against its contract and awaits host confirmat
   matching confirmed by static bundle inspection, XERK-520; live confirmation gated on D1);
 - whether qwen honours a `permissions.deny` block at all (the G0 catalogue found no `permissions`
   key) — it is emitted as defence in depth, and the shim does not depend on it;
-- that hooks fire under `approvalMode:"auto"` (above).
+- that hooks fire under `approvalMode:"auto"` (above);
+- **PostToolUse hooks in headless `qwen -p`** — XERK-533 reports (from log deltas on the user's own
+  global hooks) that qwen 0.22.x fires PreToolUse and Stop but NOT PostToolUse in `-p`; a 0.22.3
+  bundle read shows the scheduler gates both identically (`hooksEnabled && messageBus`), so the
+  asymmetry is UNCONFIRMED here. Immaterial to the guard — the launcher runs `-i` (interactive, hooks
+  fire) and the guard is PreToolUse regardless — but the reason any hook Turma ever wires into a qwen
+  session must be **PreToolUse or Stop, never PostToolUse**: a PostToolUse hook would be silently dead
+  the moment a qwen session were driven headless.
 
 ## Accepted residual gaps
 
