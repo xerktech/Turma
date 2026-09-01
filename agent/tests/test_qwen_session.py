@@ -3,8 +3,8 @@
 
 Drives the REAL QwenProjector over real Qwen native-log event shapes (the G0
 corpus shapes), the no-mock discipline the runtime children ship under, and
-pins the tail's own behaviour: incremental projection, resume-at-EOF, native-log
-discovery by glob, and best-effort title capture.
+pins the tail's own behaviour: incremental projection, resume re-projection from 0
+(XERK-530), native-log discovery by glob, and best-effort title capture.
 """
 
 import json
@@ -120,22 +120,98 @@ class QwenProjectionTailTest(unittest.TestCase):
         tail._pump()
         self.assertEqual(self._read_transcript(), [])
 
-    def test_resume_starts_past_already_projected_history(self):
-        # On resume the kept native log's history is already in the transcript;
-        # qwen --resume appends in place, so the tail must start at EOF and
-        # project only NEW events, never re-project the history.
-        self._append_native(self._user("old turn"))
-        self._append_native(self._assistant("old reply"))
+    def test_resume_reprojects_from_zero_and_continues_the_chain(self):
+        # XERK-530 (design 1): on resume the tail re-projects the WHOLE native log
+        # from 0 over a reset transcript. A tail that skipped to EOF would mint
+        # seq=0 for the first post-resume event, colliding its deterministic
+        # uuid5(session:0:0) with the conversation's FIRST turn (the chat merge
+        # keys on uuid, so it mis-updates). Re-reading from 0 continues the seq /
+        # parentUuid chain unbroken.
+        self._append_native(self._user("old turn", uuid="u1"))
+        self._append_native(self._assistant("old reply", uuid="a1"))
+        # A pre-restart tail already projected that history into the transcript.
+        first = self._tail(resume=False, use_glob=False)
+        first._pump()
+        first.stop()
+        history = self._read_transcript()
+        self.assertEqual(len(history), 2)
+        hist_uuids = [e["uuid"] for e in history]
+
+        # A resumed tail adopts the same native log (+ a new turn), re-projecting.
+        self._append_native(self._user("new turn", uuid="u2"))
         resumed = self._tail(resume=True, use_glob=False)
         self.addCleanup(resumed.stop)
-        resumed._pump()   # primes offset to EOF; projects nothing
-        self.assertEqual(self._read_transcript(), [])
-        # A NEW event after resume IS projected.
-        self._append_native(self._user("new turn"))
         resumed._pump()
         entries = self._read_transcript()
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["message"]["content"][0]["text"], "new turn")
+
+        # The history was re-projected BYTE-IDENTICALLY (determinism, no fork)...
+        self.assertEqual(entries[:2], history)
+        # ...the new turn is appended once...
+        self.assertEqual(len(entries), 3)
+        self.assertEqual(entries[2]["message"]["content"][0]["text"], "new turn")
+        # ...its uuid does NOT collide with any early turn (the bug's symptom)...
+        self.assertNotIn(entries[2]["uuid"], hist_uuids)
+        # ...and the parentUuid chain is continuous across the resume seam.
+        self.assertEqual(entries[2]["parentUuid"], entries[1]["uuid"])
+        # No uuid appears twice — the transcript did not double on re-projection.
+        all_uuids = [e["uuid"] for e in entries]
+        self.assertEqual(len(all_uuids), len(set(all_uuids)))
+
+    def test_resume_self_heals_events_the_dead_tail_never_projected(self):
+        # A manager restart leaves a window in which qwen keeps appending while no
+        # tail is running. resume-at-EOF would skip those events forever; design 1
+        # re-reads from 0, so they land in the projection (self-heal).
+        self._append_native(self._user("before restart", uuid="u1"))
+        first = self._tail(resume=False, use_glob=False)
+        first._pump()
+        first.stop()
+        self.assertEqual(len(self._read_transcript()), 1)
+        # qwen writes two more turns while the tail is dead, then a tail adopts.
+        self._append_native(self._assistant("during the gap", uuid="a1"))
+        self._append_native(self._user("after restart", uuid="u2"))
+        resumed = self._tail(resume=True, use_glob=False)
+        self.addCleanup(resumed.stop)
+        resumed._pump()
+        texts = [e["message"]["content"][0]["text"] for e in self._read_transcript()]
+        self.assertEqual(texts, ["before restart", "during the gap", "after restart"])
+
+    def test_resume_rebuild_is_atomic_and_leaves_no_temp(self):
+        # The resume rebuild replaces the transcript via a temp file + os.replace
+        # so no reader ever sees a truncate->append window; the temp must not
+        # linger afterwards.
+        self._append_native(self._user("t1"))
+        self._append_native(self._assistant("t2"))
+        resumed = self._tail(resume=True, use_glob=False)
+        self.addCleanup(resumed.stop)
+        resumed._pump()
+        self.assertEqual(len(self._read_transcript()), 2)
+        leftovers = [n for n in os.listdir(os.path.dirname(self.transcript))
+                     if ".rebuild." in n]
+        self.assertEqual(leftovers, [])
+
+    def test_resume_holds_a_trailing_partial_line_then_completes_it(self):
+        # qwen may be mid-write at resume, leaving an unterminated last line. The
+        # rebuild must hold that fragment (not project a truncated event) and
+        # project it once it is completed on a later pump.
+        self._append_native(self._user("complete turn"))
+        # An unterminated trailing line (no newline) — a half-written event.
+        frag = json.dumps(self._assistant("half written", uuid="a9"))
+        with open(self.native_log, "a", encoding="utf-8") as fh:
+            fh.write(frag[:len(frag) // 2])   # only the first half, no newline
+        resumed = self._tail(resume=True, use_glob=False)
+        self.addCleanup(resumed.stop)
+        resumed._pump()
+        # Only the one complete turn projected; the fragment is held, not doubled.
+        self.assertEqual(len(self._read_transcript()), 1)
+        # Complete the half-written line (+ its newline) and add another turn.
+        with open(self.native_log, "a", encoding="utf-8") as fh:
+            fh.write(frag[len(frag) // 2:] + "\n")
+        resumed._pump()
+        entries = self._read_transcript()
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[1]["message"]["content"][0]["text"], "half written")
+        uuids = [e["uuid"] for e in entries]
+        self.assertEqual(len(uuids), len(set(uuids)))   # no collision/double
 
     def test_fresh_tail_projects_existing_events_from_zero(self):
         # The contrast to resume: a non-resume tail starts at 0 and projects the
@@ -218,19 +294,21 @@ class QwenProjectionTailTest(unittest.TestCase):
         # The second pump appended; it did not rewrite the prefix.
         self.assertTrue(full.startswith(after_first))
 
-    def test_mirror_is_complete_even_when_the_projection_resumes_at_eof(self):
-        # The mirror is INDEPENDENT of the projection cursor: on resume the
-        # projection starts at EOF (to avoid doubling the transcript), but the
-        # mirror does not yet exist, so it must still copy the WHOLE native log —
-        # the canonical record for metrics must be complete regardless.
+    def test_mirror_is_complete_and_independent_of_the_projection_on_resume(self):
+        # The mirror is INDEPENDENT of the projection cursor. On resume the
+        # projection re-reads from 0 over a RESET transcript (XERK-530 design 1),
+        # while the mirror runs on its OWN cursor: it must copy the WHOLE native
+        # log regardless of what the projection does, and truncating the
+        # transcript must never touch the mirror.
         self._append_native(self._user("old turn"))
         self._append_native(self._assistant("old reply"))
         resumed = self._tail(resume=True, use_glob=False, store=True)
         self.addCleanup(resumed.stop)
         resumed._pump()
-        # Projection skipped the history (resume-at-EOF)...
-        self.assertEqual(self._read_transcript(), [])
-        # ...but the raw mirror carries it in full.
+        # The projection re-materialized the history (not skipped)...
+        self.assertEqual(len(self._read_transcript()), 2)
+        # ...and the raw mirror carries the native log in full, untouched by the
+        # transcript reset.
         self.assertEqual(self._read_mirror(), self._native_bytes())
 
     def test_mirror_resumes_from_its_own_size_across_a_restart(self):
@@ -382,6 +460,29 @@ class QwenDelegationTailTest(unittest.TestCase):
             full = [json.loads(l) for l in f if l.strip()]
         self.assertGreater(len(full), len(first))
         self.assertEqual(full[0], first[0])   # prefix not re-projected
+
+    def test_child_projection_does_not_double_across_a_restart(self):
+        # XERK-530: a manager restart makes a NEW tail (empty self._children) over
+        # a child dest the pre-restart tail already wrote. A fresh ChildProjection
+        # re-reads the child native log from offset 0, so without resetting the
+        # dest the deterministic re-projection would DOUBLE it. The tail truncates
+        # the dest on first sight, so the restart rebuilds it byte-identically.
+        self._write(self.native_log, self._fixture("qwen_delegation_corpus.json"))
+        self._write(self.child_native, self._fixture("qwen_delegation_child.json"))
+        first = self._tail()
+        first._pump()
+        first.stop()
+        with open(self.projected_child, encoding="utf-8") as f:
+            before = [json.loads(l) for l in f if l.strip()]
+        self.assertGreater(len(before), 0)
+        # A fresh tail adopts the same logs (nothing new appended).
+        adopted = self._tail()
+        self.addCleanup(adopted.stop)
+        adopted._pump()
+        with open(self.projected_child, encoding="utf-8") as f:
+            after = [json.loads(l) for l in f if l.strip()]
+        # Re-projected, not doubled — identical content and count.
+        self.assertEqual(after, before)
 
     def test_no_subagents_dir_is_a_clean_no_op(self):
         # A session that never delegates has no subagents dir — the tail projects

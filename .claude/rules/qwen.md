@@ -279,10 +279,14 @@ control socket. The ONE net-new module is the projection tail.
   appends the projection to the pinned `<claudeSessionId>.jsonl`, incrementally, off the beat, never
   raising. **It LOCATES the native log by GLOB (`<id>.jsonl` across project dirs), not a computed
   slug** — the same discipline `_qwen_runtime_file` uses, load-bearing because the cwd→slug rule is
-  uncertain. Resume starts at the native log's EOF (qwen `--resume` appends in place). Wired in
+  uncertain. **Resume RE-PROJECTS the native log from 0 over a reset transcript** (XERK-530): the
+  deterministic uuid's per-feed `seq` restarts with a fresh projector, so skipping to EOF collides
+  the first post-resume turn's uuid with the first turn; re-reading from 0 continues the
+  `seq`/`parentUuid` chain and self-heals a gap (children reset their dest the same way). Wired in
   `_launch_qwen` (`_start_qwen_tail`), **reattached on the resume-on-boot ADOPT path** (the tail died
   with the manager while the TUI kept appending), stopped in `_forget_session_caches`/`_teardown_qwen`.
-- Tests: `test_qwen_session.py` (glob discovery, resume-at-EOF, incremental, title),
+- Tests: `test_qwen_session.py` (glob discovery, resume re-projection + no-collision + self-heal,
+  child no-double, incremental, title),
   `test_qwen_ask_mcp.py` (MCP round-trip + rendezvous-file shape), `TestQwenSessionArms` (busy
   markers, the `›` approval parse, digit+Enter, ask-MCP registration, the native-ask exclusion, the
   three naming tiers, teardown), the qwen busy cases in `tunnel-agent.test.js`.
@@ -325,11 +329,11 @@ WHO writes the native log into the store.
   feed directly into `<sid>/dsh/`, but qwen owns its native log and writes it under its OWN home,
   which the raw layer does not reach. So `QwenProjectionTail` — already reading that log off the beat
   — copies its bytes into the store. **The mirror is APPEND-ONLY and on its OWN cursor** (the mirror
-  file's size), independent of the projection cursor: the projection may start at EOF on resume to
-  avoid doubling the transcript, but the mirror always copies the WHOLE native log, and a manager
-  restart/adopt resumes from the mirror's size — catching up every native byte written while the tail
-  was dead (a superset of what the projection can safely re-read). A native log rewritten SHORTER than
-  the mirror leaves the archived copy intact (the raw layer's shrunk-source rule).
+  file's size), independent of the projection cursor: the projection re-reads from 0 on resume and
+  resets the transcript (XERK-530), but that never touches the mirror — the mirror always copies the
+  WHOLE native log, and a manager restart/adopt resumes from the mirror's size, catching up every
+  native byte written while the tail was dead. A native log rewritten SHORTER than the mirror leaves
+  the archived copy intact (the raw layer's shrunk-source rule).
 - **Only the append-only event log rides raw** — any SQLite/index qwen rebuilds must NOT be mirrored
   (the per-file cursor ships bytes past an offset, wrong for a page-mutating DB).
 - **A running qwen session ships its RENDERED projection while running but DEFERS its RAW native log
