@@ -856,6 +856,26 @@ test("the 7-day bar draws day markers, a pace line and labels; the 5-hour bar do
   assert.deepEqual(cls("lim-day").map((el) => el.textContent), LABELS);
 });
 
+test("the 5-hour bar stays plain even if its window carries day labels", () => {
+  // The guard is the WINDOW, not the hub stripping fiveHour.dayLabels: limitCard
+  // draws markers only for key === "sevenDay", so a fiveHour window fed labels
+  // (a shape normalizeLimits removes, pinned here in case a payload bypasses it)
+  // never sprouts a grid.
+  const card = H.limitCard(H.limitGroups([
+    { device: "h", subscription: { key: "k1" }, limits: {
+      capturedAt: NOW,
+      fiveHour: { usedPct: 20, resetsAt: NOW + 4.5 * DAY, dayLabels: LABELS },
+      sevenDay: { usedPct: 40, resetsAt: NOW + 4.5 * DAY, dayLabels: LABELS },
+    } },
+  ], NOW)[0], NOW);
+  const nodes = [card, ...(function w(e){return (e.children||[]).flatMap((c)=>[c,...w(c)]);})(card)];
+  // Token match, not substring — ".lim-days" (the label container) contains the
+  // substring "lim-day". Exactly one bar's worth of markers, the weekly one.
+  const has = (el, name) => (el.className || "").split(" ").includes(name);
+  assert.equal(nodes.filter((el) => has(el, "lim-tick")).length, 6);
+  assert.equal(nodes.filter((el) => has(el, "lim-day")).length, 7);
+});
+
 test("an expired 7-day window draws no markers", () => {
   const card = H.limitCard(H.limitGroups([
     { device: "h", subscription: { key: "k1" }, limits: {

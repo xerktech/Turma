@@ -338,9 +338,12 @@ class UsageViewModelTest {
     }
 
     @Test fun `only the 7-day window's LimitView carries pacing`() {
+        // The 5-hour window carries dayLabels here too — a shape the hub strips,
+        // but the guard must be the WINDOW, not that stripping: even fed labels,
+        // the 5h bar stays plain (web limitCard gates the same draw on the key).
         val fleet = FleetState(agents = listOf(
             AgentInfo(key = "h", device = "h", limits = limits(
-                five = LimitWindow(usedPct = 20.0, resetsAt = now + 3600),
+                five = LimitWindow(usedPct = 20.0, resetsAt = now + 3600, dayLabels = dayLabels),
                 seven = LimitWindow(usedPct = 40.0, resetsAt = now + 4 * 86400, dayLabels = dayLabels))),
         ))
         val card = UsageViewModel.compute(fleet, now).limits.single()

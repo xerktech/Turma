@@ -374,8 +374,19 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
             return "${hours / 24}d ${hours % 24}h"
         }
 
-        /** One window's rendered state, or null when it carries no percentage. */
-        fun limitView(win: com.xerktech.turma.model.LimitWindow?, nowSec: Long): LimitView? {
+        /**
+         * One window's rendered state, or null when it carries no percentage.
+         * [pace] draws the even-pace day markers (XERK-536) — set ONLY for the
+         * 7-day window (web `limitCard` gates the same draw on `key ===
+         * "sevenDay"`). This is the guard, not the hub's `dayLabels` stripping:
+         * the 5-hour bar must stay plain even if a `fiveHour.dayLabels` ever
+         * reached a client past `normalizeLimits`.
+         */
+        fun limitView(
+            win: com.xerktech.turma.model.LimitWindow?,
+            nowSec: Long,
+            pace: Boolean = false,
+        ): LimitView? {
             val raw = win?.usedPct ?: return null
             val pct = raw.coerceIn(0.0, 100.0)
             val resetsIn = win.resetsAt?.let { it - nowSec }
@@ -397,7 +408,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                     pct >= 75 -> LimitView.Level.WARN
                     else -> LimitView.Level.NORMAL
                 },
-                pacing = sevenDayPacing(win, nowSec),
+                pacing = if (pace) sevenDayPacing(win, nowSec) else null,
             )
         }
 
@@ -496,7 +507,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                     hosts = g.hosts,
                     capturedAt = g.capturedAt,
                     fiveHour = limitView(g.fiveHour, nowSec),
-                    sevenDay = limitView(g.sevenDay, nowSec),
+                    sevenDay = limitView(g.sevenDay, nowSec, pace = true),
                     fiveHourAt = if (g.fiveHour != null) g.fiveHourAt else g.capturedAt,
                     sevenDayAt = if (g.sevenDay != null) g.sevenDayAt else g.capturedAt,
                 )
