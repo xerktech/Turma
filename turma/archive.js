@@ -285,6 +285,12 @@ function createSchema() {
      filePath TEXT, updatedAt TEXT)`);
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
      text, transcriptId UNINDEXED, uuid UNINDEXED, role UNINDEXED, ts UNINDEXED)`);
+  // filePath is looked up by VALUE on first-sight to detect a canonical-name
+  // collision (resolveNewRelPath, XERK-277). Not a UNIQUE index — a collided
+  // file that predates the fix legitimately has two rows on one path, and a
+  // UNIQUE would make rebuildIndex throw over the existing store rather than
+  // re-derive it. Created outside the schema bump so an already-open DB gains it.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_filePath ON sessions(filePath)`);
 }
 
 // Open (once) and ensure the schema. If the DB was absent/empty but organized
@@ -636,6 +642,57 @@ function normalizeMeta(meta) {
   return out;
 }
 
+// The transcriptId that already OWNS a canonical relative path, or null if it is
+// free (or owned by this same transcript). Used only on first-sight, to keep two
+// different transcripts off one .jsonl (XERK-277).
+//
+// The sessions table is AUTHORITATIVE — it survives a `.jsonl` deleted out from
+// under a row that keeps its filePath (XERK-280), where a disk-only check would
+// call the path free and hand it to a second transcript, which then appends onto
+// the surviving row's gap: the exact interleave this exists to stop. The disk
+// sidecar is the backstop for an index that was wiped and has not rebuilt yet.
+function relPathOwner(relPath, transcriptId) {
+  const row = db.prepare("SELECT transcriptId FROM sessions WHERE filePath=?").get(relPath);
+  if (row && row.transcriptId && row.transcriptId !== transcriptId) return row.transcriptId;
+  const sc = readSidecar(filePaths(relPath).meta);
+  if (sc && sc.transcriptId && sc.transcriptId !== transcriptId) return sc.transcriptId;
+  return null;
+}
+
+// How many `-N` suffixes to probe before falling back to the full id. A real
+// collision needs a repo/date/summary/host match AND an 8-char id-prefix match,
+// so even a handful is generous; the cap only bounds a pathological forced flood.
+const RELPATH_PROBE_MAX = 1000;
+
+// The canonical relative path for a transcript seen for the FIRST time (no
+// filePath row yet, so nothing to be consistent with). archiveRelPath keys the
+// filename on only the first 8 alnum characters of the id, and any id with fewer
+// than 8 alnum characters collapses to the literal "unknown" — so two distinct
+// transcripts agreeing on repo/date/summary/host and that prefix compute the
+// SAME path. Left unresolved they interleave into one .jsonl (ingestChunk
+// APPENDS) and each session's read-back serves the merged file for either id, a
+// cross-session content leak in the durable store (XERK-277). transcriptId is
+// agent-chosen and every agent shares one token, so it can be forced, not just
+// hit by accident.
+//
+// On a collision with a DIFFERENT transcript, disambiguate the suffix until the
+// path is unowned. The result is written into filePath AND the .meta sidecar, so
+// it is stable for the life of the transcript (ingestChunk reuses row.filePath
+// thereafter) and rebuildIndex re-derives it from the on-disk name unchanged —
+// additive on collision, never a rename of what is already there.
+function resolveNewRelPath(transcriptId, full) {
+  const base = archiveRelPath(transcriptId, full);
+  if (!relPathOwner(base, transcriptId)) return base;
+  const stem = base.slice(0, -".jsonl".length);
+  for (let n = 2; n <= RELPATH_PROBE_MAX; n++) {
+    const cand = `${stem}-${n}.jsonl`;
+    if (!relPathOwner(cand, transcriptId)) return cand;
+  }
+  // Pathological (a forced flood on one prefix): the full id is unique by
+  // construction and route-allowlisted; slugify keeps it a single component.
+  return `${stem}-${slugify(transcriptId, "x")}.jsonl`;
+}
+
 function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) {
   openDb();
   meta = normalizeMeta(meta);
@@ -670,7 +727,7 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
   }
 
   const full = { ...meta, host, transcriptId };
-  let relPath = row && row.filePath ? row.filePath : archiveRelPath(transcriptId, full);
+  let relPath = row && row.filePath ? row.filePath : resolveNewRelPath(transcriptId, full);
   const paths = filePaths(relPath);
   fs.mkdirSync(paths.dir, { recursive: true });
 
@@ -1433,7 +1490,7 @@ module.exports = {
   dshTrajectory, dshEventsFile,
   ARCHIVE_RAW_TRANSCRIPT_MAX, ARCHIVE_RAW_CURSOR_MAX, ARCHIVE_MANIFEST_CURSOR_MAX,
   RAW_DIR_SUFFIX,
-  slugify, archiveRelPath, ftsQuery, byteCeiling, shedFilePayloads,
+  slugify, archiveRelPath, resolveNewRelPath, ftsQuery, byteCeiling, shedFilePayloads,
   openDb, closeDb, rebuildIndex,
   ingestChunk, manifestCursors, archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).

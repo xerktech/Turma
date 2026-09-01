@@ -437,28 +437,98 @@ test("the per-beat cursor stat loop is bounded by the HUB, not by the agent", ()
   assert.match(fresh.stderr, /ARCHIVE_RAW_CURSOR_MAX/);
 });
 
-test("two transcripts sharing a canonical file do not share a raw directory", () => {
+test("two transcripts that would collide on 8 alnum chars get separate canonical files (XERK-277)", () => {
   // `archiveRelPath` keeps only the first 8 alnum characters of the id, so two
-  // transcripts agreeing on repo/date/summary/host and that prefix land on ONE
-  // canonical .jsonl. Their raw layers must still be separate, or each one's
-  // /raw listing returns the other's files and the read-back route serves them
-  // (XERK-338 QA D6). `transcriptId` is agent-chosen, so this can be forced.
+  // transcripts agreeing on repo/date/summary/host and that prefix WOULD land on
+  // ONE canonical .jsonl — and ingestChunk APPENDS, so each session's read-back
+  // then serves the other's entries. `transcriptId` is agent-chosen, so this can
+  // be forced, not just hit by accident. resolveNewRelPath disambiguates the
+  // second one's filename on first sight.
   const A = "collide1-aaaa-bbbb-cccc-000000000001";
   const B = "collide1-aaaa-bbbb-cccc-000000000002";
   for (const tid of [A, B]) {
     archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Collide" }, 0, 10,
+      [ent("u1", "user", `secret of ${tid}`)]);
+  }
+  const db = archive.openDb();
+  const byId = new Map(
+    db.prepare("SELECT transcriptId, filePath FROM sessions WHERE transcriptId IN (?,?)")
+      .all(A, B).map((r) => [r.transcriptId, r.filePath]));
+  assert.notEqual(byId.get(A), byId.get(B), "the two transcripts still share one file");
+  // The disambiguated name still carries the readable prefix; only a suffix differs.
+  assert.match(byId.get(B), /-2\.jsonl$/);
+  // Neither read-back leaks the other's content.
+  assert.equal(archive.getTranscript(A).entries.length, 1);
+  assert.equal(archive.getTranscript(A).entries[0].text, `secret of ${A}`);
+  assert.equal(archive.getTranscript(B).entries[0].text, `secret of ${B}`);
+});
+
+test("ids with fewer than 8 alnum chars don't collapse onto one 'unknown' file (XERK-277)", () => {
+  // Any id with <8 alnum characters slugs to the literal "unknown", so ids like
+  // "..." and ".-." landed on one file even without a prefix collision.
+  const A = "...";
+  const B = ".-.";
+  for (const tid of [A, B]) {
+    archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Short" }, 0, 10,
+      [ent("u1", "user", `content of ${tid}`)]);
+  }
+  const db = archive.openDb();
+  const rows = db.prepare("SELECT transcriptId, filePath FROM sessions WHERE transcriptId IN (?,?)").all(A, B);
+  assert.notEqual(rows[0].filePath, rows[1].filePath, "two short ids share one 'unknown' file");
+  assert.equal(archive.getTranscript(A).entries[0].text, `content of ${A}`);
+  assert.equal(archive.getTranscript(B).entries[0].text, `content of ${B}`);
+});
+
+test("a re-pushed transcript reuses its filePath rather than disambiguating again (XERK-277)", () => {
+  // Disambiguation runs ONLY on first sight. A second delta for the same id must
+  // find its row.filePath and append to the same file, never fork a new one.
+  const tid = "reuse01-aaaa-bbbb-cccc-000000000001";
+  archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Reuse" }, 0, 10, [ent("u1", "user", "one")]);
+  const db = archive.openDb();
+  const first = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(tid).filePath;
+  archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Reuse" }, 10, 20, [ent("u2", "user", "two")]);
+  const second = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(tid).filePath;
+  assert.equal(first, second);
+  assert.equal(archive.getTranscript(tid).entries.length, 2);
+});
+
+test("two transcripts sharing a prefix keep separate raw directories (XERK-338)", () => {
+  // Belt to resolveNewRelPath's braces: rawDirFor is keyed on the FULL id, so
+  // even a forced canonical collision could never cross raw layers — each one's
+  // /raw listing returns only its own files.
+  const A = "collide2-aaaa-bbbb-cccc-000000000001";
+  const B = "collide2-aaaa-bbbb-cccc-000000000002";
+  for (const tid of [A, B]) {
+    archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Collide2" }, 0, 10,
       [ent("u1", "user", "hi")]);
     archive.ingestRaw("nas", tid, `${tid}.jsonl`, 0, Buffer.from(tid));
   }
-  // Same canonical file — the collision is real, not hypothetical.
-  const db = archive.openDb();
-  const rows = db.prepare("SELECT filePath FROM sessions WHERE transcriptId IN (?,?)").all(A, B);
-  assert.equal(rows[0].filePath, rows[1].filePath, "the fixture no longer collides");
-  // ...but each raw layer holds only its own file.
   assert.deepEqual(archive.listRawFiles(A).map((f) => f.path), [`${A}.jsonl`]);
   assert.deepEqual(archive.listRawFiles(B).map((f) => f.path), [`${B}.jsonl`]);
   assert.deepEqual(fs.readFileSync(archive.rawFileFor(A, `${A}.jsonl`)), Buffer.from(A));
   assert.equal(archive.rawFileFor(A, `${B}.jsonl`), null, "A served B's file");
+});
+
+test("rebuildIndex re-derives two disambiguated files without merging them (XERK-277)", () => {
+  const A = "rebuild1-aaaa-bbbb-cccc-000000000001";
+  const B = "rebuild1-aaaa-bbbb-cccc-000000000002";
+  for (const tid of [A, B]) {
+    archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Rebuilt" }, 0, 10,
+      [ent("u1", "user", `body of ${tid}`)]);
+  }
+  const db = archive.openDb();
+  const before = new Map(
+    db.prepare("SELECT transcriptId, filePath FROM sessions WHERE transcriptId IN (?,?)")
+      .all(A, B).map((r) => [r.transcriptId, r.filePath]));
+  // Wipe and rebuild from the files on disk (their .meta sidecars).
+  archive.rebuildIndex();
+  const after = new Map(
+    db.prepare("SELECT transcriptId, filePath FROM sessions WHERE transcriptId IN (?,?)")
+      .all(A, B).map((r) => [r.transcriptId, r.filePath]));
+  assert.equal(after.get(A), before.get(A));
+  assert.equal(after.get(B), before.get(B));
+  assert.notEqual(after.get(A), after.get(B));
+  assert.equal(archive.getTranscript(B).entries[0].text, `body of ${B}`);
 });
 
 test("a repo folder named like a raw directory is still archived", () => {

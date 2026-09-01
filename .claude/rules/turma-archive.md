@@ -46,7 +46,20 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     from 0 (safe, just wasteful — logged, throttled).
   - **The raw directory is keyed on the FULL transcript id**, not the canonical filename (which
     truncates to 8 chars and can collide) — a shared raw directory would leak one transcript's files
-    through another's read-back route.
+    through another's read-back route. Belt-and-braces since XERK-277 also disambiguates the RENDERED
+    filename (below), but keep it: the full-id keying is the guarantee, the rendered fix is a second.
+  - **A new transcript's RENDERED canonical filename is disambiguated on first sight**
+    (`resolveNewRelPath`, XERK-277) — `archiveRelPath` keys the name on only the first 8 alnum chars
+    of the id (an id with <8 alnum chars collapses to the literal `unknown`), so two transcripts
+    agreeing on repo/date/summary/host + that prefix computed ONE `.jsonl`; ingest APPENDS, so each
+    read-back served the other's entries. `transcriptId` is agent-chosen under one shared token, so
+    it's forceable, not just an accident. On a collision with a DIFFERENT transcript the suffix gets
+    a `-2`/`-3`/… (full id past `RELPATH_PROBE_MAX`) until unowned. The **sessions table is
+    authoritative** for ownership (it survives a deleted `.jsonl` whose row keeps its `filePath`,
+    XERK-280 — a disk-only check would re-hand that path and interleave onto the gap); the `.meta`
+    sidecar is the backstop for a not-yet-rebuilt index. Additive on collision — the result is baked
+    into `filePath` + the sidecar, so `ingestChunk` reuses it and `rebuildIndex` re-derives it from
+    the on-disk name; existing files are never renamed.
   - **Only the session's OWN host may write its raw files** — the credential (XERK-268) proves WHO is
     calling, not whose session they may write into. (`ingestChunk` has no such check yet —
     pre-existing, XERK-344.)
