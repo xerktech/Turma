@@ -1429,13 +1429,71 @@ $refresh.addEventListener("click", async () => {
 });
 
 let cache = null, etag = null;
+
+// XERK-444/XERK-545: a /api/agents body left the hub BEFORE a live SSE patch that
+// arrives mid-fetch, so replacing `cache` wholesale on the reply CLOBBERS the newer
+// state with the older snapshot. board.html was deliberately scoped out of both — it
+// still did a wholesale `cache = await r.json()` — and so had the identical race on
+// `cache.agents` AND on every top-level map SSE also live-patches. The worst of these
+// is `orgColors`: render's `TurmaOrg.update(cache)` pushes it back into org.js's LIVE
+// map, so a stale snapshot doesn't just revert this page's copy, it regresses the pins
+// every open surface reads. This brings board.html to parity with the other three
+// pages. `sseClock` stamps every SSE mutation of `cache.agents` (`applyAgent` + the
+// `removed` handler) and of each top-level map (the handlers below, under "@"-prefixed
+// stamp keys that can't collide with an agent record's key — a hostname). A fetch
+// captures the clock at START; `mergeSnapshot` keeps anything a patch has touched
+// SINCE, taking membership and every unpatched key from the snapshot otherwise (so a
+// host the snapshot legitimately DROPPED is not resurrected). The reconnect re-read
+// (`connectSSE` below) is unaffected: with no event mid-fetch a key's stamp predates
+// `since`, so the fresh snapshot still wins. Bounded by the distinct keys the tab sees.
+let sseClock = 0;
+const patchedAt = new Map();   // key (host or "@map") -> sseClock when SSE last touched it
+function stampPatch(key) { patchedAt.set(key, ++sseClock); }
+// The top-level keys SSE live-patches, each a whole-value replace (no per-key merge).
+// The stamp key each handler passes to stampPatch must match its entry here, or the
+// keep-live below never fires for it (a test drives each one mid-fetch).
+const LIVE_MAPS = [
+  ["ticketAgents", "@ticketAgents"], ["ticketModels", "@ticketModels"],
+  ["ticketRuntimes", "@ticketRuntimes"], ["ticketQueue", "@ticketQueue"],
+  ["orgColors", "@orgColors"], ["ticketTriageActions", "@ticketTriageActions"],
+  ["triagePolicies", "@triagePolicies"],
+];
+function mergeSnapshot(body, since) {
+  if (!body || !Array.isArray(body.agents)) { cache = body; return; }
+  const live = new Map(((cache && cache.agents) || []).map(a => [a.key, a]));
+  const snapKeys = new Set(body.agents.map(a => a.key));
+  const merged = [];
+  for (const rec of body.agents) {
+    if ((patchedAt.get(rec.key) || 0) > since) {
+      // A live patch is newer than this snapshot: keep the patched record, and
+      // DROP a key a same-window `removed` evicted (the snapshot still lists it).
+      if (live.has(rec.key)) merged.push(live.get(rec.key));
+    } else {
+      merged.push(rec);
+    }
+  }
+  // A host that arrived via SSE during the fetch is absent from the older snapshot —
+  // carry its live record so the merge doesn't drop it.
+  for (const [key, rec] of live) {
+    if (!snapKeys.has(key) && (patchedAt.get(key) || 0) > since) merged.push(rec);
+  }
+  body.agents = merged;
+  // Keep a live top-level map patched after the fetch started (a whole-value keep,
+  // unlike the keyed agents merge above); otherwise the snapshot's value stands.
+  for (const [k, stamp] of LIVE_MAPS) {
+    if ((patchedAt.get(stamp) || 0) > since && cache && k in cache) body[k] = cache[k];
+  }
+  cache = body;
+}
+
 async function refresh() {
+  const since = sseClock;   // captured BEFORE the fetch — the write window is its RTT
   try {
     const r = await fetch("/api/agents", { headers: etag ? { "If-None-Match": etag } : {} });
     if (r.status === 401) return void (location.href = "/login");
     if (r.status === 304) return;
     etag = r.headers.get("ETag");
-    cache = await r.json();
+    mergeSnapshot(await r.json(), since);
   } catch { /* keep last render */ }
   if (cache) render(cache);
 }
@@ -1452,6 +1510,7 @@ function applyAgent(rec) {
   const list = cache.agents || (cache.agents = []);
   const i = list.findIndex(a => a.key === rec.key);
   if (i >= 0) list[i] = rec; else list.push(rec);
+  stampPatch(rec.key);   // so an in-flight snapshot can't clobber this (XERK-444)
 }
 function connectSSE() {
   let es;
@@ -1474,7 +1533,7 @@ function connectSSE() {
     scheduleRender();
   });
   es.addEventListener("removed", (e) => {
-    try { const { key } = JSON.parse(e.data); if (cache) cache.agents = (cache.agents || []).filter(a => a.key !== key); }
+    try { const { key } = JSON.parse(e.data); if (cache) cache.agents = (cache.agents || []).filter(a => a.key !== key); stampPatch(key); }
     catch { return; }
     scheduleRender();
   });
@@ -1486,6 +1545,7 @@ function connectSSE() {
     try { ta = JSON.parse(e.data); } catch { return; }
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.ticketAgents = ta;
+    stampPatch("@ticketAgents");   // in-flight snapshot can't clobber this (XERK-546)
     scheduleRender();
   });
   // A ticket->model pin changed (XERK-123) — same tiny-whole-map pattern.
@@ -1494,6 +1554,7 @@ function connectSSE() {
     try { tm = JSON.parse(e.data); } catch { return; }
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.ticketModels = tm;
+    stampPatch("@ticketModels");   // in-flight snapshot can't clobber this (XERK-546)
     scheduleRender();
   });
   // A ticket->runtime pin changed (XERK-473) — same tiny-whole-map pattern.
@@ -1502,6 +1563,7 @@ function connectSSE() {
     try { tr = JSON.parse(e.data); } catch { return; }
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.ticketRuntimes = tr;
+    stampPatch("@ticketRuntimes");   // in-flight snapshot can't clobber this (XERK-546)
     scheduleRender();
   });
   // The hub's ticket queue changed (XERK-296) — a ticket queued, dispatched or
@@ -1512,6 +1574,7 @@ function connectSSE() {
     try { tq = JSON.parse(e.data); } catch { return; }
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.ticketQueue = tq;
+    stampPatch("@ticketQueue");   // in-flight snapshot can't clobber this (XERK-546)
     scheduleRender();
   });
   // An org's color pin changed (XERK-145) — same tiny-whole-map pattern. org.js
@@ -1523,6 +1586,7 @@ function connectSSE() {
     try { oc = JSON.parse(e.data); } catch { return; }
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.orgColors = oc;
+    stampPatch("@orgColors");   // in-flight snapshot can't clobber this (XERK-546)
     scheduleRender();
   });
   // A per-ticket triage verdict changed (XERK-486 [F]) — same tiny-whole-map
@@ -1533,6 +1597,7 @@ function connectSSE() {
     try { ta = JSON.parse(e.data); } catch { return; }
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.ticketTriageActions = ta;
+    stampPatch("@ticketTriageActions");   // in-flight snapshot can't clobber this (XERK-546)
     scheduleRender();
   });
   // An org's triage policy changed (XERK-486 [F]) — same pattern; the policy
@@ -1542,6 +1607,7 @@ function connectSSE() {
     try { tp = JSON.parse(e.data); } catch { return; }
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.triagePolicies = tp;
+    stampPatch("@triagePolicies");   // in-flight snapshot can't clobber this (XERK-546)
     scheduleRender();
     // A policy changed from another tab: re-paint the open panel in place so
     // it shows the hub's new truth (same posture as the org color pins).
