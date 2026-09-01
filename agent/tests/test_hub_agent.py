@@ -8144,6 +8144,70 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
                          f"c{ha.SPAWN_FAILURES_MAX + 9}")
 
 
+class TestHeartbeatReplyParse(ManagerMixin, unittest.TestCase):
+    """A heartbeat REPLY that fails to parse must be told apart from a beat that
+    never reached the hub, and a single huge integer ANYWHERE in the reply must
+    not wedge the beat forever (XERK-365). QA's fakehub4 proved the wedge: a
+    >4300-digit literal makes json.loads raise, the beat is logged failed while
+    the hub answered 200, and every command the reply carried is discarded — on
+    every beat, so the host reads as dead to its operator."""
+
+    def _post(self, sm, body_bytes):
+        with mock.patch.object(ha.urllib.request, "urlopen") as uo:
+            uo.return_value.__enter__.return_value.read.return_value = body_bytes
+            return sm.post({"device": "hostA"})
+
+    def test_the_int_str_digit_limit_is_raised_for_the_bounded_reply(self):
+        # The reply is bounded to HEARTBEAT_REPLY_MAX bytes, so no literal in it
+        # can carry more digits than that — raising the limit to match reintro-
+        # duces no unbounded parse, and lets the whole bounded reply parse.
+        self.assertTrue(hasattr(sys, "set_int_max_str_digits"))
+        self.assertGreaterEqual(sys.get_int_max_str_digits(),
+                                ha.HEARTBEAT_REPLY_MAX)
+
+    def test_a_huge_integer_under_an_unrelated_key_still_parses(self):
+        # The broad case fakehub4 found: bodyMax is perfectly sane and the
+        # huge literal sits under a key the agent never reads. It must parse and
+        # the beat must succeed — not fail as it did before the limit was raised.
+        sm = self.make_manager()
+        huge = "9" * 5000  # well past Python's default 4300-digit ceiling
+        body = ('{"bodyMax": 1000000, "commands": [], "junk": %s}' % huge).encode()
+        reply = self._post(sm, body)
+        self.assertIsNotNone(reply)
+        self.assertIsInstance(reply["junk"], int)
+        self.assertGreater(reply["junk"], 10 ** 4999)
+        self.assertEqual(sm._beat_failures, 0)  # a clean, successful beat
+
+    def test_a_huge_integer_clears_staged_results_like_any_delivered_beat(self):
+        sm = self.make_manager()
+        sm.spawn_failures = [{"cmdId": "c1", "error": "nope"}]
+        self._post(sm, ('{"x": %s}' % ("9" * 6000)).encode())
+        self.assertEqual(sm.spawn_failures, [])  # delivered, like any good beat
+
+    def test_an_unparseable_reply_is_a_parse_failure_not_a_lost_beat(self):
+        # The hub answered 200 with a body we cannot read (a truncated read past
+        # HEARTBEAT_REPLY_MAX, or a malformed/hostile body). It counts as a
+        # failed beat but leaves staged results UNTOUCHED — they were never
+        # delivered — and never falls through to the transport handler.
+        sm = self.make_manager()
+        sm.spawn_failures = [{"cmdId": "c1", "error": "nope"}]
+        reply = self._post(sm, b"not json at all")
+        self.assertIsNone(reply)
+        self.assertEqual(sm._beat_failures, 1)
+        self.assertEqual(sm.spawn_failures, [{"cmdId": "c1", "error": "nope"}])
+
+    def test_the_parse_failure_log_names_the_answered_but_unreadable_reply(self):
+        # The whole value of splitting the parse out is that the operator can
+        # tell "the hub said something I could not read" from "the hub never
+        # answered" — so the log must say so.
+        sm = self.make_manager()
+        with mock.patch.object(ha, "log") as logged:
+            self._post(sm, b"{ truncated")
+        msg = " ".join(str(c.args[0]) for c in logged.call_args_list)
+        self.assertIn("could not be parsed", msg)
+        self.assertIn("200", msg)
+
+
 class TestRegistryPersistence(ManagerMixin, unittest.TestCase):
     def test_save_load_round_trip(self):
         sm = self.make_manager()
