@@ -294,6 +294,17 @@ the total is measured.
     hub on the next property access.
   - `ttydAuth(host)` sends the token that host's ttyd is ACTUALLY running (`tokenBound`), so a
     half-rolled fleet keeps every terminal working; hub-derived, stripped from the fleet payload.
+  - **ttyd's `/token` returns that same credential** (ttyd echoes its `-c term:<token>` basic-auth as
+    the WS token), so the credentialed CORS on `/api|/term` is DELIBERATELY confined to `/api/login`
+    and `/api/logout` (XERK-314). Those two are the only endpoints the glasses WebView hits with
+    `credentials:"include"` (to plant/clear the hub cookie for its same-origin terminal iframe); every
+    other cross-origin read is Authorization-header auth, which needs the reflected origin but NOT
+    `Allow-Credentials`. **Do not add `Access-Control-Allow-Credentials` back onto the general
+    `/api|/term` surface** — it lets a logged-in operator's browser be driven from an attacker page to
+    read `/api/agents` then `/term/<id>/token` and lift the host's agent credential, regardless of the
+    cookie's `Partitioned` attribute. Origin reflection stays (glasses relies on it) and is safe
+    without credentials. Residual, accepted: the SAME-ORIGIN operator can still read `/token` — not an
+    escalation on a single-user hub. Tests: the `XERK-314:` cases in `server.test.js`.
   - Tests: the `XERK-268:` cases in `server.test.js`.
 
 ### The agent registry's ceiling (XERK-272)

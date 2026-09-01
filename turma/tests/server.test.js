@@ -3572,7 +3572,9 @@ test("CORS: OPTIONS preflight on /api/* answers 204 with the CORS headers, no au
   assert.equal(res.raw, "");
   assert.equal(res.headers["access-control-allow-origin"], "http://glasses.local");
   assert.equal(res.headers["vary"], "Origin");
-  assert.equal(res.headers["access-control-allow-credentials"], "true");
+  // XERK-314: credentialed CORS is NOT offered on ordinary reads — only the
+  // cookie-planting login/logout endpoints get Allow-Credentials.
+  assert.equal(res.headers["access-control-allow-credentials"], undefined);
   assert.equal(res.headers["access-control-allow-headers"], "Authorization, Content-Type");
   assert.equal(res.headers["access-control-allow-methods"], "GET, POST, DELETE, OPTIONS");
 });
@@ -3581,6 +3583,38 @@ test("CORS: OPTIONS preflight on /term/* also answers 204 without auth", async (
   const res = await request("OPTIONS", "/term/whatever", { headers: { origin: "http://glasses.local" } });
   assert.equal(res.status, 204);
   assert.equal(res.headers["access-control-allow-origin"], "http://glasses.local");
+});
+
+// XERK-314: /term/<id>/token hands the browser the host's agent credential, and
+// the CORS reflection + Allow-Credentials on the whole /api|/term surface let an
+// attacker page read it cross-origin off a logged-in victim's cookie. The fix
+// confines Allow-Credentials to the cookie-planting login/logout endpoints, so a
+// cross-origin credentialed read of any other route is blocked by the browser.
+test("XERK-314: /api and /term reads do NOT get Allow-Credentials", async () => {
+  for (const path of ["/api/agents", "/term/whatever", "/term/sl7/token"]) {
+    const res = await request("GET", path, {
+      headers: { ...userHeaders, origin: "http://evil.example" },
+    });
+    assert.equal(
+      res.headers["access-control-allow-credentials"], undefined,
+      `${path} must not offer credentialed CORS`,
+    );
+    // Reflection stays (glasses' Authorization-header reads rely on it), but a
+    // browser cannot turn it into a credentialed read without Allow-Credentials.
+    assert.equal(res.headers["access-control-allow-origin"], "http://evil.example");
+  }
+});
+
+test("XERK-314: login and logout keep Allow-Credentials for the glasses cookie plant", async () => {
+  for (const path of ["/api/login", "/api/logout"]) {
+    const res = await request("OPTIONS", path, { headers: { origin: "http://glasses.local" } });
+    assert.equal(res.status, 204);
+    assert.equal(res.headers["access-control-allow-origin"], "http://glasses.local");
+    assert.equal(
+      res.headers["access-control-allow-credentials"], "true",
+      `${path} must keep credentialed CORS`,
+    );
+  }
 });
 
 test("CORS: authenticated GET on /api reflects Origin + Vary", async () => {
