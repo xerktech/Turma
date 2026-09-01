@@ -126,6 +126,22 @@ class AgentDecodeTest {
         assertEquals("subscription", off.sessions[0].modelSource)
     }
 
+    // XERK-544: the hub-derived auto-start-paused flag. Emitted only when true,
+    // so the default `false` must cover an absent field (an older hub, or any
+    // host not past the weekly pace line) — typing it makes a wrong value
+    // decode-fatal for the whole fleet, so the true/absent shape is pinned here.
+    @Test fun `the autoPaused flag decodes, defaulting false when absent`() {
+        val body = """
+            { "now": 1, "agents": [
+              { "key": "paused", "device": "paused", "online": true, "autoPaused": true },
+              { "key": "running", "device": "running", "online": true }
+            ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertEquals(true, resp.agents[0].autoPaused)
+        assertEquals(false, resp.agents[1].autoPaused)
+    }
+
     // XERK-460: the dsh capability flag + per-session runtime. Typing these is
     // what makes them decode-fatal if wrong, so the shape is pinned here — the
     // available/absent block and the session's agentType.

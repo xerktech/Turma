@@ -678,6 +678,16 @@ function boardHealthBadge(a) {
   if (!a.online || !j || !j.configured || !j.error) return "";
   return `<span class="host-auth req" title="${esc(j.error)}">📋 Board unreachable</span>`;
 }
+// Auto-start-paused chip for a host header (XERK-544): the hub pauses auto mode
+// for a host whose Claude subscription is at or past the weekly pace line, and
+// reports it as `autoPaused`. Amber (informational, not an error) and — like
+// claudeAuthBadge/boardHealthBadge — shown only when the hub is asserting it;
+// an absent field is "not paused". No bypass control by design: new tickets can
+// still be started manually, and it resumes on its own as the week elapses.
+function autoPausedBadge(a) {
+  if (!a.autoPaused) return "";
+  return `<span class="host-auth warn" title="Auto-start is paused for this host — its Claude subscription is past the even weekly pace line. Manual starts still work; it resumes on its own as the week elapses or the window resets.">⏸ Auto paused</span>`;
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -1121,6 +1131,7 @@ function hostCard(a, now) {
       ${collapsedMeta}
       ${boardHealthBadge(a)}
       ${claudeAuthBadge(a)}
+      ${autoPausedBadge(a)}
       ${restartBtn(a)}
       <span class="status"${statusTitle ? ` title="${esc(statusTitle)}"` : ""}><span class="dot ${dot}"></span>${esc(state)}</span>
     </div>${body}

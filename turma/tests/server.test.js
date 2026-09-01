@@ -6602,6 +6602,161 @@ test("findTicketHost routes a qwen ticket only to a host that offers qwen", asyn
   hub.setTicketRuntime("trqRoute.atlassian.net", "ENG-9", null);   // cleanup
 });
 
+// ---- XERK-544: pause auto-start past the weekly subscription pace line -------
+
+// A ticket host that reports a 7-day subscription window, so its pace can be
+// judged. The window is opened `7 - resetsInDays` days ago, so with the default
+// (resets in 6) the pace fraction is ~1/7 (~14%): usedPct 80 is well PAST pace,
+// usedPct 3 well under it. Carries a triage block so the auto sweep enqueues it.
+const NOW = () => Math.floor(Date.now() / 1000);
+const paceBeat = (device, site, {
+  usedPct, key = "ENG-5", repo = "Turma", sub = null, defaultRuntime = null,
+  capturedAgeSec = 0, resetsInDays = 6, qwen = false, free = 5,
+} = {}) => request("POST", "/api/heartbeat", {
+  body: {
+    device,
+    repos: [{ name: repo, path: `/git/${repo}` }],
+    capacity: { maxSessions: 6, running: 6 - free, queued: 0, free },
+    ...(qwen ? { qwen: { available: true } } : {}),
+    ...(defaultRuntime ? { defaultRuntime } : {}),
+    ...(sub ? { subscription: { key: sub } } : {}),
+    limits: {
+      capturedAt: NOW() - capturedAgeSec,
+      sevenDay: { usedPct, resetsAt: NOW() + resetsInDays * 86400 },
+    },
+    jira: {
+      available: true, configured: true, siteKey: site, user: `${device}@x.com`,
+      fetchedAt: "2026-07-14T12:00:00Z",
+      tickets: [{ key, summary: "Fix it", statusCategory: "todo",
+                  repoGuess: { repo, cloned: true },
+                  triage: { priority: "P2", type: "task", actionable: true } }],
+    },
+  },
+  headers: agentHeaders,
+});
+
+test("XERK-544: limitsPastPace compares usedPct against the elapsed fraction", () => {
+  const now = Date.now();
+  const nowSec = Math.floor(now / 1000);
+  const snap = (usedPct, resetsInDays, ageSec = 0) => ({
+    capturedAt: nowSec - ageSec,
+    sevenDay: { usedPct, resetsAt: nowSec + resetsInDays * 86400 },
+  });
+  // Window opened 1 day ago → pace ≈ 14%.
+  assert.equal(hub.limitsPastPace(snap(80, 6), now), true);   // 80% ≫ 14%
+  assert.equal(hub.limitsPastPace(snap(3, 6), now), false);   // 3% < 14%
+  // EXACTLY at pace counts as past ("at or past"): reset in 3.5 days ⇒ elapsed
+  // is exactly half the window ⇒ pace 0.5, and usedPct 50 == 0.5.
+  const half = { capturedAt: nowSec, sevenDay: { usedPct: 50, resetsAt: nowSec + 302400 } };
+  assert.ok(Math.abs(hub.sevenDayPaceFrac(half.sevenDay, nowSec) - 0.5) < 1e-9);
+  assert.equal(hub.limitsPastPace(half, now), true);
+  // A stale snapshot is "can't tell" — never a pause, even at 99%.
+  assert.equal(hub.limitsPastPace(snap(99, 6, 25 * 3600), now), false);
+  // An expired window (already reset) can't be paced → not past.
+  assert.equal(hub.limitsPastPace(
+    { capturedAt: nowSec, sevenDay: { usedPct: 99, resetsAt: nowSec - 3600 } }, now), false);
+  // No window / no snapshot → not past.
+  assert.equal(hub.limitsPastPace({ capturedAt: nowSec }, now), false);
+  assert.equal(hub.limitsPastPace(null, now), false);
+});
+
+test("XERK-544: subscriptionsOverPace groups by subscription, freshest reading wins", async () => {
+  const now = Date.now();
+  // Two hosts on ONE account 'ppAcctA'; the FRESHEST reading decides.
+  await paceBeat("ppA1", "pp1.atlassian.net", { usedPct: 3, sub: "ppAcctA", capturedAgeSec: 0 });     // fresh, under
+  await paceBeat("ppA2", "pp1.atlassian.net", { usedPct: 90, sub: "ppAcctA", capturedAgeSec: 3600 }); // older, over
+  assert.equal(hub.subscriptionsOverPace(now).has("ppAcctA"), false);
+  // The freshest reading flips over-pace when a newer over-pace read lands.
+  await paceBeat("ppA1", "pp1.atlassian.net", { usedPct: 90, sub: "ppAcctA", capturedAgeSec: 0 });
+  assert.equal(hub.subscriptionsOverPace(now).has("ppAcctA"), true);
+  // A host with no subscription block paces against itself under "host:<key>".
+  await paceBeat("ppC1", "pp3.atlassian.net", { usedPct: 80, capturedAgeSec: 0 });
+  assert.equal(hub.subscriptionsOverPace(now).has("host:ppC1"), true);
+});
+
+test("XERK-544: findTicketHost pauses an AUTO ticket on a claude host past pace, never a manual one", async () => {
+  await paceBeat("fpPaused", "fp1.atlassian.net", { usedPct: 80, sub: "fpSub" });
+  // AUTO: paused → BLOCKED (not full — a freed slot would not un-pause it).
+  const autoBlocked = hub.findTicketHost("fp1.atlassian.net", "Turma", "ENG-5",
+    { requireFree: true, auto: true });
+  assert.equal(autoBlocked.host, undefined);
+  assert.ok(!autoBlocked.full);
+  assert.match(autoBlocked.error, /pace line/);
+  // MANUAL (no auto flag): always allowed.
+  const manual = hub.findTicketHost("fp1.atlassian.net", "Turma", "ENG-5", { requireFree: true });
+  assert.equal(manual.host, "fpPaused");
+  // A claude host UNDER pace is not paused for auto either.
+  await paceBeat("fpUnder", "fp1u.atlassian.net", { usedPct: 3, sub: "fpUnderSub" });
+  const okUnder = hub.findTicketHost("fp1u.atlassian.net", "Turma", "ENG-5",
+    { requireFree: true, auto: true });
+  assert.equal(okUnder.host, "fpUnder");
+});
+
+test("XERK-544: a qwen-default host and a qwen-pinned ticket are never pace-paused", async () => {
+  hub.__setQwenEnabled(true);
+  // A qwen-DEFAULT host past pace still takes an auto ticket — it spends no Claude pool.
+  await paceBeat("fpQwen", "fp2.atlassian.net",
+    { usedPct: 90, sub: "fpQwenSub", defaultRuntime: "qwen" });
+  const okQwenDefault = hub.findTicketHost("fp2.atlassian.net", "Turma", "ENG-5",
+    { requireFree: true, auto: true });
+  assert.equal(okQwenDefault.host, "fpQwen");
+  // A claude-DEFAULT host past pace, but the ticket is qwen-PINNED → not paused
+  // (the host must OFFER qwen for the pin to route there).
+  await paceBeat("fpClaudeQ", "fp3.atlassian.net",
+    { usedPct: 90, sub: "fpCQSub", key: "ENG-7", qwen: true });
+  hub.setTicketRuntime("fp3.atlassian.net", "ENG-7", "qwen");
+  const okQwenPin = hub.findTicketHost("fp3.atlassian.net", "Turma", "ENG-7",
+    { requireFree: true, auto: true });
+  assert.equal(okQwenPin.host, "fpClaudeQ");
+  hub.setTicketRuntime("fp3.atlassian.net", "ENG-7", null);   // cleanup
+});
+
+test("XERK-544: /api/agents flags a paused claude host, not a qwen-default or under-pace one", async () => {
+  hub.__setQwenEnabled(true);
+  await paceBeat("apPaused", "ap1.atlassian.net", { usedPct: 85, sub: "apSub1" });
+  await paceBeat("apQwen", "ap2.atlassian.net",
+    { usedPct: 85, sub: "apSub2", defaultRuntime: "qwen" });
+  await paceBeat("apUnder", "ap3.atlassian.net", { usedPct: 3, sub: "apSub3" });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const byKey = Object.fromEntries(res.body.agents.map((a) => [a.key, a]));
+  assert.equal(byKey.apPaused.autoPaused, true);
+  assert.ok(!("autoPaused" in byKey.apQwen), "a qwen-default host is never paused");
+  assert.ok(!("autoPaused" in byKey.apUnder), "an under-pace host is not paused");
+});
+
+test("XERK-544: a heartbeat cannot forge its own autoPaused flag", async () => {
+  // A host UNDER pace that asserts autoPaused:true — the hub strips the forged
+  // field and recomputes it (false), so it never rides the payload.
+  await request("POST", "/api/heartbeat", { body: {
+    device: "apForge", autoPaused: true,
+    capacity: { maxSessions: 6, running: 1, queued: 0, free: 5 },
+    limits: { capturedAt: NOW(), sevenDay: { usedPct: 2, resetsAt: NOW() + 6 * 86400 } },
+    jira: { available: true, configured: true, siteKey: "apf.atlassian.net",
+            user: "apForge@x.com", fetchedAt: "2026-07-14T12:00:00Z", tickets: [] },
+  }, headers: agentHeaders });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const a = res.body.agents.find((x) => x.key === "apForge");
+  assert.ok(!("autoPaused" in a), "a forged autoPaused is stripped, not served");
+});
+
+test("XERK-544: auto-start holds a ticket whose only claude host is past pace; manual still starts", async () => {
+  resetAutoStart();
+  await paceBeat("dpPaced", "dp1.atlassian.net", { usedPct: 85, sub: "dpSub" });
+  setAutoStartOrg("dp1.atlassian.net", true);
+  autoStartRound();
+  // The sweep queued it (it decides WHICH), but the drain found the only host
+  // paused, so nothing was handed over and the entry HOLDS as blocked.
+  assert.equal((agents.dpPaced.commands || []).length, 0);
+  const q = queuedTicket("dp1.atlassian.net", "ENG-5");
+  assert.equal(q.reason, "blocked");
+  assert.match(q.error, /pace line/);
+  // A MANUAL start on the same ticket is never paused — it dispatches at once.
+  const r = await startTicket("dp1.atlassian.net", "ENG-5");
+  assert.equal(r.status, 200);
+  assert.equal(r.body.host, "dpPaced");
+  setAutoStartOrg("dp1.atlassian.net", false);   // leave global state clean
+});
+
 test("ticket-model pins survive a hub restart (read back from their own file)", () => {
   const file = path.join(os.tmpdir(), `turma-test-tm-persist-${process.pid}.json`);
   fs.writeFileSync(file, JSON.stringify({

@@ -99,6 +99,7 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   const keys = Object.keys(g);
   const fn = new Function(...keys, src +
     "\n;return { render, fmtTokens, applyAgent, connectSSE, contextMeterHtml, refresh, mergeSnapshot," +
+    " autoPausedBadge," +
     " sseClock: () => sseClock," +
     " setCache: (c) => { cache = c; }, getCache: () => cache };");
   const api = fn(...keys.map((k) => g[k]));
@@ -498,4 +499,13 @@ test("dashboard: a host removed mid-fetch is not resurrected by the older snapsh
   D.mergeSnapshot({ now: Date.now(), agents: [liveHost("stay", 1), liveHost("gone", 900)], retiredUsage: [] }, since);
   assert.deepEqual(D.getCache().agents.map(a => a.key), ["stay"],
     "the host removed mid-fetch is not resurrected");
+});
+
+// XERK-544: the auto-start-paused header chip renders only on the hub-asserted
+// `autoPaused` flag — never invented by the client, never shown otherwise.
+test("XERK-544: autoPausedBadge shows only when the hub flags the host paused", () => {
+  const D = loadDashboard();
+  assert.match(D.autoPausedBadge({ autoPaused: true }), /Auto paused/);
+  assert.equal(D.autoPausedBadge({ autoPaused: false }), "");
+  assert.equal(D.autoPausedBadge({}), "");   // absent = not paused / can't tell
 });
