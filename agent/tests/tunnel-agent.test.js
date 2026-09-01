@@ -2015,7 +2015,7 @@ test("deviceName refuses a dot-segment DEVICE_NAME override", () => {
 test("BLOCK_CAPS matches hub-agent.py's, value for value", () => {
   const py = fs.readFileSync(path.join(__dirname, "..", "hub-agent.py"), "utf8");
   const pyCap = (name) => {
-    const m = py.match(new RegExp(`^${name} = int\\(os\\.environ\\.get\\("[A-Z_]+", "(\\d+)"\\)\\)`, "m"));
+    const m = py.match(new RegExp(`^${name} = _env_int\\("[A-Z_]+", (\\d+)\\)`, "m"));
     assert.ok(m, `hub-agent.py no longer declares ${name} the way this parity check reads it`);
     return Number(m[1]);
   };

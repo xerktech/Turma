@@ -100,12 +100,68 @@ _TMUX_CONF = os.path.join(_AGENT_DIR, "tmux.conf")
 # wouldn't wake on the signal).
 _poke = threading.Event()
 
+def _env_num(name, default, cast, *, minimum=None, maximum=None):
+    """Read a numeric env var, FALLING BACK to `default` instead of raising.
+
+    Every numeric knob below is parsed at IMPORT time. A bare
+    `int(os.environ.get(...))` / `float(...)` RAISES on anything that is not a
+    clean number — an empty string, a stray space, "10m", "1_0 00", a value that
+    kept its YAML quotes as `"20"` — and because that happens during import,
+    before main(), the process exits non-zero every time. entrypoint.sh execs
+    this file as the container's PID-1 target, so under `restart: unless-stopped`
+    one mistyped variable crash-loops the whole fleet host, with the symptom
+    (a restart loop) pointing nowhere near the cause (XERK-372).
+
+    So a bad value is logged loudly and IGNORED: a host that is up and running
+    the default beats a fleet host that is down. `default` is the already-typed
+    fallback (an int/float, not a string). `minimum`/`maximum`, where given,
+    clamp the result into a sane band — the few knobs where a parseable-but-
+    absurd value (MAX_SESSIONS=0, TTYD_PORT_BASE=70000) takes the host down as
+    surely as a typo would; the helper cannot know which knobs those are, so the
+    caller names the bounds. `log` is not defined this early, so warn directly to
+    stderr in the same `[hub-agent] ` format it uses (stdout is reserved for
+    values some callers read back).
+    """
+    raw = os.environ.get(name)
+    set_by_operator = raw is not None and raw.strip() != ""
+    if set_by_operator:
+        try:
+            val = cast(raw.strip())
+            if isinstance(val, float) and not math.isfinite(val):
+                raise ValueError("non-finite")
+        except (ValueError, TypeError):
+            print(f"[hub-agent] WARNING: {name}={raw!r} is not a valid number "
+                  f"— falling back to {default}", file=sys.stderr, flush=True)
+            val = default
+    else:
+        val = default
+    if minimum is not None and val < minimum:
+        if set_by_operator:
+            print(f"[hub-agent] WARNING: {name}={val} is below the minimum "
+                  f"{minimum} — using {minimum}", file=sys.stderr, flush=True)
+        val = minimum
+    if maximum is not None and val > maximum:
+        if set_by_operator:
+            print(f"[hub-agent] WARNING: {name}={val} is above the maximum "
+                  f"{maximum} — using {maximum}", file=sys.stderr, flush=True)
+        val = maximum
+    return val
+
+
+def _env_int(name, default, *, minimum=None, maximum=None):
+    return _env_num(name, default, int, minimum=minimum, maximum=maximum)
+
+
+def _env_float(name, default, *, minimum=None, maximum=None):
+    return _env_num(name, default, float, minimum=minimum, maximum=maximum)
+
+
 TURMA_URL = os.environ.get("TURMA_URL", "http://turma:8300")
 # Bearer token for the hub's /api/heartbeat (the UI itself sits behind basic
 # auth; this lets agents report without those user credentials). Must match
 # the hub's TURMA_AGENT_TOKEN.
 TURMA_TOKEN = os.environ.get("TURMA_TOKEN", "")
-INTERVAL = int(os.environ.get("TURMA_INTERVAL", "20"))
+INTERVAL = _env_int("TURMA_INTERVAL", 20, minimum=1)
 # How long ONE heartbeat POST may block the beat loop. This and INTERVAL are
 # the whole of what a healthy beat cycle costs, and their sum has to stay well
 # under the hub's OFFLINE_AFTER_MS (turma/server.js) or the host reads as dead
@@ -116,8 +172,8 @@ HEARTBEAT_TIMEOUT_SEC = 10
 
 # Host-multiplexer configuration (see CONTRACT / agent/native/turma-agent).
 REPOS_ROOT = os.environ.get("REPOS_ROOT", "/mnt/data/Docker/git")
-MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "6"))
-TTYD_PORT_BASE = int(os.environ.get("TTYD_PORT_BASE", "7700"))
+MAX_SESSIONS = _env_int("MAX_SESSIONS", 6, minimum=1)
+TTYD_PORT_BASE = _env_int("TTYD_PORT_BASE", 7700, minimum=1, maximum=65535)
 
 # Reserved pseudo-repo name for a session that runs directly at REPOS_ROOT
 # (spanning every repo) instead of inside one repo's worktree. It is NOT a git
@@ -154,8 +210,7 @@ REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
 # enrich the announcement with; a container update (Watchtower) leaves no file
 # and we announce a generic restart. Lives beside the other ~/.turma ledgers.
 UPDATING_FLAG_PATH = os.path.join(REGISTRY_DIR, "updating.json")
-UPDATING_ANNOUNCE_TIMEOUT_SEC = float(
-    os.environ.get("TURMA_UPDATING_ANNOUNCE_TIMEOUT_SEC", "4"))
+UPDATING_ANNOUNCE_TIMEOUT_SEC = _env_float("TURMA_UPDATING_ANNOUNCE_TIMEOUT_SEC", 4.0)
 # Rendezvous dir for the AskUserQuestion bridge (agent/hooks/ask.py). A pending
 # question lives here as `<sessionId>.req.json`; the answer the glasses client
 # sends rides back as `<sessionId>.ans.json`. See _hook_question / answer_question.
@@ -255,8 +310,7 @@ CLAUDE_CREDS_PATH = os.environ.get(
 # Nudge the operator this long before the refresh token lapses, so a "re-login
 # soon" warning lands before sessions actually start failing. Env override in
 # seconds; 0 disables the early warning (the hard needsLogin edge still fires).
-CLAUDE_AUTH_WARN_MS = int(
-    os.environ.get("TURMA_CLAUDE_AUTH_WARN_SEC", str(3 * 24 * 3600)) or 0) * 1000
+CLAUDE_AUTH_WARN_MS = _env_int("TURMA_CLAUDE_AUTH_WARN_SEC", 3 * 24 * 3600, minimum=0) * 1000
 
 # Claude Code's own config file, which is where the logged-in ACCOUNT is
 # recorded (XERK-301). Two layouts are real, so both are tried in order: with
@@ -275,7 +329,7 @@ CLAUDE_CONFIG_PATHS = tuple(p for p in (
 # each as append-only byte-range deltas the hub asks for (via the archiveHave map on
 # the heartbeat reply). Bounded so a big backfill trickles in rather than flooding
 # the tunnel or blocking a beat.
-ARCHIVE_MANIFEST_MAX = int(os.environ.get("ARCHIVE_MANIFEST_MAX", "200"))
+ARCHIVE_MANIFEST_MAX = _env_int("ARCHIVE_MANIFEST_MAX", 200, minimum=1)
 # Of those slots, how many are reserved for the NEWEST transcripts (XERK-424).
 # The manifest used to be newest-by-mtime and nothing else, so a transcript that
 # fell out of the window was never offered again: on the reference host, 10
@@ -288,7 +342,7 @@ ARCHIVE_MANIFEST_MAX = int(os.environ.get("ARCHIVE_MANIFEST_MAX", "200"))
 # So the window is split: this many for the newest (which is what keeps today's
 # work archiving promptly), and the rest for the BACKLOG — what the hub has said
 # it does not have, then a rotation over everything else so nothing can starve.
-ARCHIVE_MANIFEST_RECENT = int(os.environ.get("ARCHIVE_MANIFEST_RECENT", "100"))
+ARCHIVE_MANIFEST_RECENT = _env_int("ARCHIVE_MANIFEST_RECENT", 100, minimum=0)
 # What the hub last said it holds, per transcript, so the backlog slice can
 # prefer what is genuinely missing. Bounded like every other agent-side map: it
 # is keyed on every transcript this host has ever offered, which only grows.
@@ -297,7 +351,7 @@ ARCHIVE_MANIFEST_RECENT = int(os.environ.get("ARCHIVE_MANIFEST_RECENT", "100"))
 # `_note_archive_known` — which the beat's try/except catches, silently ending
 # archive sync for that host forever, under a log line that says nothing at all
 # because StopIteration stringifies to "" (XERK-424 QA delta, finding 2).
-ARCHIVE_KNOWN_MAX = max(0, int(os.environ.get("ARCHIVE_KNOWN_MAX", "5000")))
+ARCHIVE_KNOWN_MAX = _env_int("ARCHIVE_KNOWN_MAX", 5000, minimum=0)
 # ...and the longest id worth remembering. Bounding ENTRIES bounds no bytes when
 # one key may be a megabyte, and this map outlives the reply that filled it.
 ARCHIVE_KNOWN_KEY_MAX = 256
@@ -305,7 +359,7 @@ ARCHIVE_KNOWN_KEY_MAX = 256
 # matters is derived from the high-water transcript universe; this is the point
 # at which we stop paying memory for the guarantee — 32.5 MB RSS measured at this
 # cap with real UUID keys, which needs about 100k transcripts on one host.
-ARCHIVE_OFFERED_HARD_MAX = max(0, int(os.environ.get("ARCHIVE_OFFERED_HARD_MAX", "200000")))
+ARCHIVE_OFFERED_HARD_MAX = _env_int("ARCHIVE_OFFERED_HARD_MAX", 200000, minimum=0)
 ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read-ahead window per delta
 ARCHIVE_CHUNK_TIMEOUT_SEC = 15  # one rendered-delta POST
 ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
@@ -330,8 +384,7 @@ ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttl
 # fallback nor the skip below can fire — the agent sees a broken pipe and the
 # pass stops. A knob that can raise this is a knob that can walk an operator
 # straight into that band against a hub that states nothing (XERK-356 QA pass 2).
-ARCHIVE_BODY_MAX_DEFAULT = min(
-    int(os.environ.get("TURMA_ARCHIVE_BODY_MAX", str(768 << 10))), 768 << 10)
+ARCHIVE_BODY_MAX_DEFAULT = _env_int("TURMA_ARCHIVE_BODY_MAX", 768 << 10, maximum=768 << 10)
 # How much of the hub's stated ceiling to actually use, and the largest stated
 # one worth remembering — see HEARTBEAT_BODY_MARGIN / HEARTBEAT_BODY_STATED_MAX,
 # which this mirrors deliberately. `archiveChunkMax` is untrusted wire input too.
@@ -346,7 +399,7 @@ ARCHIVE_BODY_STATED_MAX = 1 << 30
 # hub could mean: under it a delta cannot carry a single ordinary turn, so a
 # ceiling below it would shed the whole conversation a line at a time while every
 # POST still answered 200.
-ARCHIVE_BODY_MIN = int(os.environ.get("TURMA_ARCHIVE_BODY_MIN", str(64 << 10)))
+ARCHIVE_BODY_MIN = _env_int("TURMA_ARCHIVE_BODY_MIN", 64 << 10)
 # How far past a chunk's start we will hunt for the newline ending a single
 # over-long line. A transcript line longer than the read window used to end the
 # pass with `break` and no log at all, so that transcript never advanced again
@@ -544,7 +597,7 @@ ARCHIVE_PAYLOAD_MAX = _byte_ceiling(
 # pathologically long conversation fails loudly rather than OOM-ing the hub's
 # in-memory relay. Transcripts are JSON and compress ~10x, so this covers very
 # large sessions; the guard is a backstop, not an expected limit (XERK-101).
-MIGRATION_BLOB_MAX = int(os.environ.get("TURMA_MIGRATION_BLOB_MAX", str(1 << 26)))  # 64 MiB
+MIGRATION_BLOB_MAX = _env_int("TURMA_MIGRATION_BLOB_MAX", 1 << 26)  # 64 MiB
 
 # How many staged session-start refusals (XERK-265) a beat may carry, and how
 # long one reason may be. Neither is a normal limit — a refusal only exists where
@@ -575,15 +628,15 @@ VALID_CLAUDE_SID_RE = re.compile(r"[A-Za-z0-9-]+")
 VALID_MIGRATION_ID_RE = re.compile(r"[A-Za-z0-9-]+")
 # Glasses-client transcript tail: how many surviving messages to report per
 # beat, and how many chars of each to keep (payload-size bounds).
-TAIL_MSGS = int(os.environ.get("SESSION_TAIL_MSGS", "30"))
-TAIL_MSG_CHARS = int(os.environ.get("SESSION_TAIL_MSG_CHARS", "500"))
+TAIL_MSGS = _env_int("SESSION_TAIL_MSGS", 30)
+TAIL_MSG_CHARS = _env_int("SESSION_TAIL_MSG_CHARS", 500)
 # The per-beat tail above is a bounded *preview* shipped for every session on
 # every heartbeat, so a long message is clipped to keep the payload small. The
 # single-session reading paths — the live tail (tunnel-agent.js) and on-demand
 # `history` — instead keep this many chars per message, so a full assistant
 # response never shows up cut off mid-sentence on the glasses. The client keeps
 # whichever copy of a message is longer, so the preview never clobbers it.
-TAIL_MSG_CHARS_FULL = int(os.environ.get("SESSION_TAIL_MSG_CHARS_FULL", "16000"))
+TAIL_MSG_CHARS_FULL = _env_int("SESSION_TAIL_MSG_CHARS_FULL", 16000)
 # Rich-block caps (native chat UI). _entry_blocks() preserves the thinking,
 # tool_use inputs and tool_result outputs that _entry_text() flattens away, so
 # the web chat can show/hide each component by verbosity. A block cut to its cap
@@ -604,12 +657,12 @@ TAIL_MSG_CHARS_FULL = int(os.environ.get("SESSION_TAIL_MSG_CHARS_FULL", "16000")
 # caps: a build log or a whole-file Read is not a message, and it is what these
 # ceilings exist to bound. The `history` read's own aggregate is bounded
 # separately by HISTORY_MAX_BYTES.
-BLOCK_TEXT_CHARS = int(os.environ.get("SESSION_BLOCK_TEXT_CHARS", "100000"))
-BLOCK_TOOL_INPUT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_INPUT_CHARS", "4000"))
-BLOCK_TOOL_RESULT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_RESULT_CHARS", "8000"))
+BLOCK_TEXT_CHARS = _env_int("SESSION_BLOCK_TEXT_CHARS", 100000)
+BLOCK_TOOL_INPUT_CHARS = _env_int("SESSION_BLOCK_TOOL_INPUT_CHARS", 4000)
+BLOCK_TOOL_RESULT_CHARS = _env_int("SESSION_BLOCK_TOOL_RESULT_CHARS", 8000)
 # Defensive per-entry block cap so one pathological turn can't blow the tail
 # frame (each block is already char-capped above).
-BLOCK_MAX_PER_ENTRY = int(os.environ.get("SESSION_BLOCK_MAX_PER_ENTRY", "48"))
+BLOCK_MAX_PER_ENTRY = _env_int("SESSION_BLOCK_MAX_PER_ENTRY", 48)
 BLOCK_CAPS = {
     "text": BLOCK_TEXT_CHARS,
     "input": BLOCK_TOOL_INPUT_CHARS,
@@ -623,8 +676,8 @@ BLOCK_CAPS = {
 # to SEND_FILE_MAX_BYTES; a bigger/unreadable/non-renderable file degrades to a
 # name-only chip. Keep the extension→mime map and caps in lockstep with
 # tunnel-agent.js (sendUserFileDetail).
-SEND_FILE_MAX_FILES = int(os.environ.get("SESSION_SEND_FILE_MAX_FILES", "16"))
-SEND_FILE_MAX_BYTES = int(os.environ.get("SESSION_SEND_FILE_MAX_BYTES", str(512 * 1024)))
+SEND_FILE_MAX_FILES = _env_int("SESSION_SEND_FILE_MAX_FILES", 16)
+SEND_FILE_MAX_BYTES = _env_int("SESSION_SEND_FILE_MAX_BYTES", 512 * 1024)
 SEND_FILE_IMG_MIME = {
     ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
@@ -645,8 +698,8 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 # ~16 KiB), which costs the same handful of milliseconds at 100 KiB as at 100
 # bytes. Keep this at or below the hub's own INPUT_MAX_CHARS, which rejects an
 # over-long message with an error the composer shows rather than truncating it.
-INPUT_MAX_CHARS = int(os.environ.get("SESSION_INPUT_MAX_CHARS", "100000"))
-HISTORY_MAX_MSGS = int(os.environ.get("SESSION_HISTORY_MSGS", "200"))
+INPUT_MAX_CHARS = _env_int("SESSION_INPUT_MAX_CHARS", 100000)
+HISTORY_MAX_MSGS = _env_int("SESSION_HISTORY_MSGS", 200)
 # Ceiling on ONE `history` delivery, in the BYTES it will occupy on the wire.
 # The per-block caps bound a BLOCK, never the reply: the window is
 # HISTORY_MAX_MSGS entries and the operator-message fold below scans the WHOLE
@@ -661,14 +714,14 @@ HISTORY_MAX_MSGS = int(os.environ.get("SESSION_HISTORY_MSGS", "200"))
 # a character budget under-states a non-ASCII transcript by up to 12x, and a
 # reply comfortably "inside" such a ceiling still blew HEARTBEAT_MAX. _json_bytes
 # measures the serialized form, which is exactly what post() will send.
-HISTORY_MAX_BYTES = int(os.environ.get("SESSION_HISTORY_MAX_BYTES", str(6 << 20)))
+HISTORY_MAX_BYTES = _env_int("SESSION_HISTORY_MAX_BYTES", 6 << 20)
 # ...and the ceiling on EVERYTHING one beat has staged, across sessions. The
 # per-delivery bound above says nothing about three sessions' histories landing
 # on one beat, which reaches the same refusal and the same permanent loop. The
 # oldest staged results are DROPPED rather than held: the hub answers a fetch it
 # has no result for with its "not ready" 202 and the client asks again, whereas
 # an oversize body is refused whole, forever.
-HISTORY_STAGED_MAX_BYTES = int(os.environ.get("SESSION_HISTORY_STAGED_MAX_BYTES", str(12 << 20)))
+HISTORY_STAGED_MAX_BYTES = _env_int("SESSION_HISTORY_STAGED_MAX_BYTES", 12 << 20)
 # The biggest body this agent will POST at all. The hub answers an oversize body
 # with 413 only NEAR its ceiling: measured, roughly to 1.1x, a coin flip at 1.5x
 # and never at 2x — past that Node destroys the socket under a request still
@@ -689,11 +742,11 @@ HISTORY_STAGED_MAX_BYTES = int(os.environ.get("SESSION_HISTORY_STAGED_MAX_BYTES"
 # the rule that these ceilings are never fixed numbers. This constant is only
 # the floor used before the first reply lands, and the cap on what a hub can
 # talk us into.
-# Bounded on read: the derivation below divides by the margin, and a float
-# division of an absurd override raises at IMPORT — a process that will not
-# start rather than one that heartbeats badly. 1 GiB is far above any hub.
-HEARTBEAT_BODY_MAX = min(int(os.environ.get("TURMA_HEARTBEAT_BODY_MAX", str(24 << 20))),
-                         1 << 30)
+# Bounded on read: capped at 1 GiB (far above any hub) so the derivation below,
+# which divides by the margin, cannot blow up on an absurd override — and, since
+# XERK-372, a non-numeric override falls back to the default rather than raising
+# at import and crash-looping the host.
+HEARTBEAT_BODY_MAX = _env_int("TURMA_HEARTBEAT_BODY_MAX", 24 << 20, maximum=1 << 30)
 # How much of the hub's stated ceiling to actually use. A body AT the ceiling is
 # refused; the margin keeps the last beat before the cliff a 413 we can read
 # rather than a socket that dies unread.
@@ -703,7 +756,7 @@ HEARTBEAT_BODY_MARGIN = 0.75
 # still returned 200, so the operator's chat would simply never load its history
 # and nothing anywhere would look wrong. Below this the hub cannot serve a
 # session at all, so treating the value as nonsense is the honest reading.
-HEARTBEAT_BODY_MIN = int(os.environ.get("TURMA_HEARTBEAT_BODY_MIN", str(1 << 20)))
+HEARTBEAT_BODY_MIN = _env_int("TURMA_HEARTBEAT_BODY_MIN", 1 << 20)
 # The largest stated ceiling worth REMEMBERING. Past this the margin already
 # lands on HEARTBEAT_BODY_MAX, so a bigger number changes nothing — and it keeps
 # an unbounded int off the arithmetic below (see _note_body_max).
@@ -726,14 +779,14 @@ HEARTBEAT_FAILURES_BEFORE_SHED = 2
 # _settings pre-approves Read on this tree so an attachment never costs a
 # permission prompt.
 UPLOADS_DIR = os.path.join(REGISTRY_DIR, "uploads")
-UPLOAD_MAX_BYTES = int(os.environ.get("TURMA_UPLOAD_MAX_BYTES", str(1 << 25)))  # 32 MiB
-UPLOAD_MAX_PER_MESSAGE = int(os.environ.get("TURMA_UPLOAD_MAX_PER_MESSAGE", "10"))
-UPLOAD_DOWNLOAD_TIMEOUT_SEC = int(os.environ.get("TURMA_UPLOAD_TIMEOUT_SEC", "60"))
+UPLOAD_MAX_BYTES = _env_int("TURMA_UPLOAD_MAX_BYTES", 1 << 25)  # 32 MiB
+UPLOAD_MAX_PER_MESSAGE = _env_int("TURMA_UPLOAD_MAX_PER_MESSAGE", 10)
+UPLOAD_DOWNLOAD_TIMEOUT_SEC = _env_int("TURMA_UPLOAD_TIMEOUT_SEC", 60)
 # How long an ended session's attachments stay on disk. They are part of a
 # conversation that is still resumable (and still references their paths), so
 # they outlive the session by a good margin; only a session DELETE drops them at
 # once. Swept on the slow usage cadence.
-UPLOAD_RETENTION_SEC = int(os.environ.get("TURMA_UPLOAD_RETENTION_SEC", str(30 * 86400)))
+UPLOAD_RETENTION_SEC = _env_int("TURMA_UPLOAD_RETENTION_SEC", 30 * 86400)
 # Filename charset, mirrored from the hub's safeUploadName. The hub sanitizes
 # first so the operator's chip shows the landing name; this repeats it because a
 # name arriving over the wire must never be able to escape UPLOADS_DIR.
@@ -745,13 +798,10 @@ UPLOAD_NAME_MAX = 100
 # uploads directory, exactly where a chat attachment lands, and their paths go in
 # the initial prompt. Bounded separately from the composer's: nobody chose these
 # file by file, so a ticket carrying a 200 MB capture must not stall a spawn.
-TICKET_ATTACH_MAX = int(os.environ.get("TURMA_TICKET_ATTACH_MAX", "10"))
-TICKET_ATTACH_MAX_BYTES = int(
-    os.environ.get("TURMA_TICKET_ATTACH_MAX_BYTES", str(1 << 24)))   # 16 MiB each
-TICKET_ATTACH_TOTAL_BYTES = int(
-    os.environ.get("TURMA_TICKET_ATTACH_TOTAL_BYTES", str(1 << 26)))  # 64 MiB total
-TICKET_ATTACH_TIMEOUT_SEC = int(
-    os.environ.get("TURMA_TICKET_ATTACH_TIMEOUT_SEC", "20"))
+TICKET_ATTACH_MAX = _env_int("TURMA_TICKET_ATTACH_MAX", 10)
+TICKET_ATTACH_MAX_BYTES = _env_int("TURMA_TICKET_ATTACH_MAX_BYTES", 1 << 24)   # 16 MiB each
+TICKET_ATTACH_TOTAL_BYTES = _env_int("TURMA_TICKET_ATTACH_TOTAL_BYTES", 1 << 26)  # 64 MiB total
+TICKET_ATTACH_TIMEOUT_SEC = _env_int("TURMA_TICKET_ATTACH_TIMEOUT_SEC", 20)
 # ...and a HARD wall-clock budget for the whole batch, not just per file. This
 # runs on the manager's one loop, inside a spawn, so a tracker that stays on the
 # line would otherwise hold the beat and take the host OFFLINE (the hub gives up
@@ -759,8 +809,7 @@ TICKET_ATTACH_TIMEOUT_SEC = int(
 # FETCH_TIMEOUT_SEC, JIRA_TIMEOUT_SEC. The timeout above is NOT what enforces
 # this: it caps the wait for the next byte, which a server dribbling bytes resets
 # forever. fetch_board_attachment's chunked read is what makes this a real bound.
-TICKET_ATTACH_DEADLINE_SEC = int(
-    os.environ.get("TURMA_TICKET_ATTACH_DEADLINE_SEC", "40"))
+TICKET_ATTACH_DEADLINE_SEC = _env_int("TURMA_TICKET_ATTACH_DEADLINE_SEC", 40)
 # How much of a body one read1() may ask for. Small enough that a trickling
 # server is cut off promptly by the deadline check between chunks, big enough
 # that a real download costs a handful of iterations per MiB.
@@ -773,7 +822,7 @@ ATTACH_CHUNK_BYTES = 1 << 16
 # folds every operator text turn in the WHOLE transcript back into its reply,
 # so the chat always shows every message the operator sent. This cap bounds
 # only that exempt set (newest first), a payload backstop, not a window.
-HISTORY_USER_MSGS = int(os.environ.get("SESSION_HISTORY_USER_MSGS", "200"))
+HISTORY_USER_MSGS = _env_int("SESSION_HISTORY_USER_MSGS", 200)
 
 # Transcript parsing is the expensive part; refresh each session's usage every N
 # heartbeats — but staggered (see _usage_slot) so they don't all reparse on the
@@ -935,13 +984,11 @@ CC_SOCK_NAME_RE = re.compile(r"^([0-9]{1,10})\.sock\Z")
 # step there has one (see TICKET_ATTACH_DEADLINE_SEC for the reasoning). The
 # ~9k backlog this was written for clears well inside it; a directory big enough
 # to exhaust the budget just finishes on the next slow beat.
-CC_SOCK_SWEEP_DEADLINE_SEC = float(
-    os.environ.get("TURMA_CC_SOCK_SWEEP_DEADLINE_SEC", "5"))
+CC_SOCK_SWEEP_DEADLINE_SEC = _env_float("TURMA_CC_SOCK_SWEEP_DEADLINE_SEC", 5.0)
 # How long the confirming connect() may wait. A refused connect answers at once,
 # and anything slower is a socket we KEEP, so this only bounds the pathological
 # case rather than the normal one.
-CC_SOCK_PROBE_TIMEOUT_SEC = float(
-    os.environ.get("TURMA_CC_SOCK_PROBE_TIMEOUT_SEC", "0.25"))
+CC_SOCK_PROBE_TIMEOUT_SEC = _env_float("TURMA_CC_SOCK_PROBE_TIMEOUT_SEC", 0.25)
 
 
 def cc_socket_dirs():
@@ -1243,8 +1290,7 @@ DSH_MODEL = (os.environ.get("DSH_MODEL")
 DSH_MODEL_BASE_URL = (os.environ.get("DSH_MODEL_BASE_URL")
                       or os.environ.get("LOCAL_MODEL_BASE_URL") or "")
 DSH_MODEL_API_KEY_ENV = os.environ.get("DSH_MODEL_API_KEY_ENV", "LOCAL_MODEL_API_KEY")
-DSH_MODEL_CONTEXT = int(os.environ.get("DSH_MODEL_CONTEXT")
-                        or os.environ.get("LOCAL_MODEL_CONTEXT") or "200000")
+DSH_MODEL_CONTEXT = _env_int("DSH_MODEL_CONTEXT", _env_int("LOCAL_MODEL_CONTEXT", 200000), minimum=1)
 # The built driver plugin (agent/dsh-session-driver/dist), installed into the
 # profile as a bundle by _ensure_dsh_profile.
 DSH_PLUGIN_DIR = os.path.join(_AGENT_DIR, "dsh-session-driver")
@@ -1386,20 +1432,19 @@ QWEN_IDENT_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,80}$")
 # Launch confirmation window (XERK-492): a tmux that STARTED is not proof qwen
 # actually came up (a bad config, a failed load), so the launch waits for the
 # session's `<id>.runtime.json` to appear with a live pid before recording it.
-QWEN_LAUNCH_CONFIRM_SEC = float(os.environ.get("QWEN_LAUNCH_CONFIRM_SEC", "12"))
-QWEN_LAUNCH_CONFIRM_POLL_SEC = float(
-    os.environ.get("QWEN_LAUNCH_CONFIRM_POLL_SEC", "0.4"))
+QWEN_LAUNCH_CONFIRM_SEC = _env_float("QWEN_LAUNCH_CONFIRM_SEC", 12.0)
+QWEN_LAUNCH_CONFIRM_POLL_SEC = _env_float("QWEN_LAUNCH_CONFIRM_POLL_SEC", 0.4)
 # A launch can reach _launch_qwen while the boot probe is still running on its
 # worker thread (a boot-time relaunch of a qwen session whose tmux died is
 # exactly that case): the gate WAITS for the in-flight probe's verdict instead
 # of refusing a host that is in fact ready. The wait is bounded so a wedged
 # probe cannot stall the launch path (the probe itself is bounded at 30s, so
 # this only fires when the probe is slow or still queued).
-QWEN_READY_WAIT_SEC = float(os.environ.get("QWEN_READY_WAIT_SEC", "30"))
+QWEN_READY_WAIT_SEC = _env_float("QWEN_READY_WAIT_SEC", 30.0)
 # How long the priming worker waits before RE-PROBING a transient probe
 # failure (binary mid-update, a blip). Config-level refusals (no model route)
 # never retry — they are stable for the manager's lifetime.
-QWEN_READY_RETRY_SEC = float(os.environ.get("QWEN_READY_RETRY_SEC", "60"))
+QWEN_READY_RETRY_SEC = _env_float("QWEN_READY_RETRY_SEC", 60.0)
 
 # --- Host-wide read-only `dsh web` viewer (XERK-501) ----------------------
 # ONE `dsh web` per host (never one per session — that was XERK-498's blocker),
@@ -1416,20 +1461,20 @@ DSH_WEB_ENABLED = (os.environ.get("DSH_WEB", "1").strip().lower()
 # Bind host: LOOPBACK by default — `dsh web` is UNAUTHENTICATED (it has only a
 # browser-trust fence), so exposing it on a LAN address is a deliberate opt-in.
 DSH_WEB_HOST = os.environ.get("DSH_WEB_HOST", "127.0.0.1")
-DSH_WEB_PORT = int(os.environ.get("DSH_WEB_PORT") or "7788")
+DSH_WEB_PORT = _env_int("DSH_WEB_PORT", 7788, minimum=1, maximum=65535)
 # The URL the UI links to. Explicit override wins (a reverse proxy / hostname);
 # otherwise a concrete routable bind host yields one, and loopback/wildcard
 # yields none (the operator reaches it themselves — SSH-forward / on-host).
 DSH_WEB_URL = os.environ.get("DSH_WEB_URL", "").strip()
-DSH_WEB_POLL_SEC = float(os.environ.get("DSH_WEB_POLL_SEC") or "10")
-DSH_WEB_RESTART_SEC = float(os.environ.get("DSH_WEB_RESTART_SEC") or "5")
-DSH_WEB_RESTART_MAX_SEC = float(os.environ.get("DSH_WEB_RESTART_MAX_SEC") or "60")
+DSH_WEB_POLL_SEC = _env_float("DSH_WEB_POLL_SEC", 10.0)
+DSH_WEB_RESTART_SEC = _env_float("DSH_WEB_RESTART_SEC", 5.0)
+DSH_WEB_RESTART_MAX_SEC = _env_float("DSH_WEB_RESTART_MAX_SEC", 60.0)
 # After a tmux launch, how long to wait for the viewer to actually BIND its port
 # before reporting it up. A tmux that started is NOT proof the dsh process
 # survived (EADDRINUSE, crash-on-boot) — the XERK-492 "a bound thing is not a
 # live thing" lesson, applied to the port instead of a control socket.
-DSH_WEB_CONFIRM_SEC = float(os.environ.get("DSH_WEB_CONFIRM_SEC") or "8")
-DSH_WEB_CONFIRM_POLL_SEC = float(os.environ.get("DSH_WEB_CONFIRM_POLL_SEC") or "0.3")
+DSH_WEB_CONFIRM_SEC = _env_float("DSH_WEB_CONFIRM_SEC", 8.0)
+DSH_WEB_CONFIRM_POLL_SEC = _env_float("DSH_WEB_CONFIRM_POLL_SEC", 0.3)
 
 
 def _dsh_web_enabled():
@@ -1604,10 +1649,8 @@ def _dsh_cordis_patch(provider, models, base_url, api_key_env, default_model,
 # exactly the reason archive-sync and prune moved off the beat (XERK-395), so the
 # poll runs on its own daemon thread with a bounded per-request timeout and the
 # beat only ever reads the cache below.
-LOCAL_MODEL_DISCOVERY_TIMEOUT_SEC = int(
-    os.environ.get("LOCAL_MODEL_DISCOVERY_TIMEOUT_SEC") or "10")
-LOCAL_MODEL_DISCOVERY_EVERY_SEC = int(
-    os.environ.get("LOCAL_MODEL_DISCOVERY_EVERY_SEC") or "300")
+LOCAL_MODEL_DISCOVERY_TIMEOUT_SEC = _env_int("LOCAL_MODEL_DISCOVERY_TIMEOUT_SEC", 10)
+LOCAL_MODEL_DISCOVERY_EVERY_SEC = _env_int("LOCAL_MODEL_DISCOVERY_EVERY_SEC", 300)
 # Bound the discovered list — it rides the heartbeat and every client decodes
 # /api/agents atomically, so an endpoint answering thousands of ids must not
 # grow the beat without limit (the PEER_CELL_MAX / retiredUsage failure class).
@@ -2201,9 +2244,8 @@ DSH_SOCK_LINE_MAX = 64 * 1024
 # resolves on the first poll once the driver reports `agentUp`, and a crash is
 # caught the instant the tmux process is seen gone, so only a wedged-but-alive
 # plugin pays the whole window.
-DSH_LAUNCH_CONFIRM_SEC = float(os.environ.get("DSH_LAUNCH_CONFIRM_SEC", "12"))
-DSH_LAUNCH_CONFIRM_POLL_SEC = float(
-    os.environ.get("DSH_LAUNCH_CONFIRM_POLL_SEC", "0.4"))
+DSH_LAUNCH_CONFIRM_SEC = _env_float("DSH_LAUNCH_CONFIRM_SEC", 12.0)
+DSH_LAUNCH_CONFIRM_POLL_SEC = _env_float("DSH_LAUNCH_CONFIRM_POLL_SEC", 0.4)
 
 
 def dsh_sock_path(sid):
@@ -4808,7 +4850,7 @@ LIMITS_SETTINGS_PATH = os.path.join(REGISTRY_DIR, "limits-settings.json")
 # and marks it stale on its own (capturedAt rides along), but a snapshot from
 # last week describes a window that has since reset several times over — it is
 # not stale data, it is wrong data.
-LIMITS_MAX_AGE_SEC = int(os.environ.get("TURMA_LIMITS_MAX_AGE_SEC", "86400") or 86400)
+LIMITS_MAX_AGE_SEC = _env_int("TURMA_LIMITS_MAX_AGE_SEC", 86400)
 LIMITS_WINDOW_KEYS = ("fiveHour", "sevenDay")
 # The snapshot is a couple of hundred bytes; anything near this is not one.
 LIMITS_MAX_BYTES = 64 << 10
@@ -5063,7 +5105,7 @@ PR_CALLS_MAX = 20
 # (~INTERVAL*N sec). Faster than the github-block cadence so CI/merge state on a
 # session card stays reasonably live, but not every beat (each is a gh network
 # call). Bounded per refresh so a host with many PRs never stalls a beat.
-PR_STATUS_REFRESH_EVERY = int(os.environ.get("TURMA_PR_REFRESH_EVERY", "3"))
+PR_STATUS_REFRESH_EVERY = _env_int("TURMA_PR_REFRESH_EVERY", 3)
 PR_STATUS_MAX = 20
 
 # PR-comment delivery (XERK-49): poll the PRs running sessions opened for new
@@ -5072,7 +5114,7 @@ PR_STATUS_MAX = 20
 # in the loop. Same cadence and per-beat cap as the status poll (one gh call per
 # PR, or two when the inline-review-thread fetch runs). Disable with =0.
 PR_COMMENTS_DELIVER = os.environ.get("TURMA_PR_COMMENTS", "1") != "0"
-PR_COMMENTS_REFRESH_EVERY = int(os.environ.get("TURMA_PR_COMMENTS_EVERY", "3"))
+PR_COMMENTS_REFRESH_EVERY = _env_int("TURMA_PR_COMMENTS_EVERY", 3)
 PR_COMMENTS_MAX = 20               # PRs polled per beat, like PR_STATUS_MAX
 PR_COMMENTS_SEEN_MAX = 500         # per-PR seen-key ceiling (newest kept)
 PR_COMMENTS_BODY_CAP = 1200        # per-comment body chars folded into the message
@@ -5086,8 +5128,8 @@ PR_CONFLICT_RESOLVE = os.environ.get("TURMA_PR_CONFLICTS", "1") != "0"
 # Bounded nudging: a session that tried and failed must not be told the same
 # thing every beat forever, and one that ignored the first message deserves more
 # than one chance. Spaced, and capped per conflict episode.
-PR_CONFLICT_MAX_ATTEMPTS = int(os.environ.get("TURMA_PR_CONFLICT_ATTEMPTS", "3"))
-PR_CONFLICT_RETRY_SEC = int(os.environ.get("TURMA_PR_CONFLICT_RETRY_SEC", "1800"))
+PR_CONFLICT_MAX_ATTEMPTS = _env_int("TURMA_PR_CONFLICT_ATTEMPTS", 3)
+PR_CONFLICT_RETRY_SEC = _env_int("TURMA_PR_CONFLICT_RETRY_SEC", 1800)
 
 # Open-PR nudge (XERK-526): a session that has finished a turn holding code work
 # that is not on an open PR gets nudged to commit, push, and open a PR — the
@@ -5095,8 +5137,8 @@ PR_CONFLICT_RETRY_SEC = int(os.environ.get("TURMA_PR_CONFLICT_RETRY_SEC", "1800"
 # edge-triggered, cooldown, attempt-capped shape as the conflict nudge: one nudge
 # per episode, re-sent only past the retry interval while attempts remain.
 PR_OPEN_NUDGE = os.environ.get("TURMA_PR_OPEN_NUDGE", "1") != "0"
-PR_OPEN_NUDGE_RETRY_SEC = int(os.environ.get("TURMA_PR_OPEN_NUDGE_RETRY_SEC", "1800"))
-PR_OPEN_NUDGE_MAX_ATTEMPTS = int(os.environ.get("TURMA_PR_OPEN_NUDGE_ATTEMPTS", "3"))
+PR_OPEN_NUDGE_RETRY_SEC = _env_int("TURMA_PR_OPEN_NUDGE_RETRY_SEC", 1800)
+PR_OPEN_NUDGE_MAX_ATTEMPTS = _env_int("TURMA_PR_OPEN_NUDGE_ATTEMPTS", 3)
 
 
 def _check_class(entry):
@@ -7336,10 +7378,10 @@ def _queued_display(queue):
 # `compact_boundary` system entry (written when a compaction completes), not by
 # scraping the pane for an undocumented "Compacting…" string.
 PENDING_INPUT_MAX = 20                # cap the per-session outbox
-PENDING_INPUT_MAX_ATTEMPTS = int(os.environ.get("SESSION_INPUT_RESEND_MAX", "3"))
+PENDING_INPUT_MAX_ATTEMPTS = _env_int("SESSION_INPUT_RESEND_MAX", 3)
 # Drop an outbox entry that never lands and never sees a compaction (some
 # non-compaction loss, e.g. a tmux hiccup) so the record can't leak forever.
-PENDING_INPUT_TTL_SEC = float(os.environ.get("SESSION_INPUT_PENDING_TTL_SEC", "900"))
+PENDING_INPUT_TTL_SEC = _env_float("SESSION_INPUT_PENDING_TTL_SEC", 900.0)
 
 
 def _pending_scan(path):
@@ -8371,7 +8413,7 @@ def _busy_from_capture(cap):
 # 0 disables (report the raw single read). The delay must clear one repaint
 # cycle — a couple hundred ms — without meaningfully taxing the beat, and it is
 # spent only on the transition, not every idle beat.
-PANE_IDLE_CONFIRM_SEC = float(os.environ.get("TURMA_PANE_IDLE_CONFIRM_SEC", "0.2"))
+PANE_IDLE_CONFIRM_SEC = _env_float("TURMA_PANE_IDLE_CONFIRM_SEC", 0.2)
 
 
 def _stable_pane_busy(tmux_name, state):
@@ -9757,10 +9799,7 @@ def collect_azure_repos():
 JIRA_SITE = os.environ.get("JIRA_SITE", "").strip()
 JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "").strip()
 JIRA_TOKEN = os.environ.get("JIRA_TOKEN", "").strip()
-try:
-    JIRA_REFRESH_EVERY = int(os.environ.get("TURMA_JIRA_REFRESH_EVERY", "30"))
-except ValueError:
-    JIRA_REFRESH_EVERY = 30   # beats between polls (30 × 20s beat ≈ 10 min)
+JIRA_REFRESH_EVERY = _env_int("TURMA_JIRA_REFRESH_EVERY", 30)  # beats between polls (30 × 20s beat ≈ 10 min)
 # Ticket auto-start (XERK-32) is opt-in PER ORG so the hub starts a session for
 # every "To Do" ticket the moment it has a repo assigned (by the model's triage or
 # a manual pin). The opt-in is HUB-ONLY (XERK-41): the operator flips it from the
@@ -11998,10 +12037,7 @@ def build_ticket_prompt(detail, attachments=None):
 # hashes only repo NAMES — the gh block's `updatedAt` churns constantly and would
 # otherwise re-triage the whole board on every sweep.
 JIRA_TRIAGE_MODEL = os.environ.get("JIRA_TRIAGE_MODEL", "haiku").strip() or "haiku"
-try:
-    JIRA_TRIAGE_TIMEOUT_SEC = int(os.environ.get("JIRA_TRIAGE_TIMEOUT_SEC", "120"))
-except ValueError:
-    JIRA_TRIAGE_TIMEOUT_SEC = 120
+JIRA_TRIAGE_TIMEOUT_SEC = _env_int("JIRA_TRIAGE_TIMEOUT_SEC", 120)
 JIRA_TRIAGE_BATCH = 25          # tickets per `claude -p` call (one call in flight)
 JIRA_TRIAGE_CANDIDATES = 200    # candidate repos shown to the model (bounds the prompt)
 JIRA_TRIAGE_MAX_ATTEMPTS = 3    # tries before a ticket stays unclassified for good
@@ -12495,10 +12531,7 @@ def _ticket_triage_prompt(batch, board):
 # Handed straight to `claude --model`; validated only against claude's own
 # aliases, but this is a fixed operator-set env, not free-form spawn input.
 SESSION_SUMMARY_MODEL = os.environ.get("SESSION_SUMMARY_MODEL", "haiku").strip() or "haiku"
-try:
-    SUMMARY_TIMEOUT_SEC = int(os.environ.get("SESSION_SUMMARY_TIMEOUT_SEC", "45"))
-except ValueError:
-    SUMMARY_TIMEOUT_SEC = 45
+SUMMARY_TIMEOUT_SEC = _env_int("SESSION_SUMMARY_TIMEOUT_SEC", 45)
 SUMMARY_MAX_WORDS = 6          # cap a chatty reply so it can't bloat the card
 SUMMARY_MAX_CHARS = 48
 SUMMARY_PROMPT_CAP = 2000      # cap the task text handed to the summarizer
@@ -12576,25 +12609,20 @@ LIMITS_PROBE_MODEL = (os.environ.get("TURMA_LIMITS_PROBE_MODEL", "haiku").strip(
 # How stale a snapshot may get before a running host spends another probe.
 # 0 disables the probe entirely (the Usage page then shows its empty state, or
 # whatever a hand-wired statusLine last left in the snapshot file).
-LIMITS_PROBE_SEC = int(os.environ.get("TURMA_LIMITS_PROBE_SEC", "1800") or 0)
-LIMITS_PROBE_TIMEOUT_SEC = int(
-    os.environ.get("TURMA_LIMITS_PROBE_TIMEOUT_SEC", "120") or 120)
+LIMITS_PROBE_SEC = _env_int("TURMA_LIMITS_PROBE_SEC", 1800)
+LIMITS_PROBE_TIMEOUT_SEC = _env_int("TURMA_LIMITS_PROBE_TIMEOUT_SEC", 120)
 # Backoff after a probe that captured nothing, doubling to the cap. The failure
 # that matters is the PERMANENT one — a login with no subscription windows can
 # never produce a snapshot, and without a backoff that host spends a real turn
 # every beat forever, chasing a number it will never have.
-LIMITS_PROBE_RETRY_SEC = int(
-    os.environ.get("TURMA_LIMITS_PROBE_RETRY_SEC", "900") or 900)
-LIMITS_PROBE_MAX_BACKOFF_SEC = int(
-    os.environ.get("TURMA_LIMITS_PROBE_MAX_BACKOFF_SEC", "21600") or 21600)
+LIMITS_PROBE_RETRY_SEC = _env_int("TURMA_LIMITS_PROBE_RETRY_SEC", 900)
+LIMITS_PROBE_MAX_BACKOFF_SEC = _env_int("TURMA_LIMITS_PROBE_MAX_BACKOFF_SEC", 21600)
 LIMITS_PROBE_TRUST_SEC = 4  # let the TUI paint before answering its trust dialog
 
 MODEL_PROBE_PROMPT = "/model"
-MODELS_REFRESH_EVERY = int(os.environ.get("TURMA_MODELS_REFRESH_EVERY", "1080")
-                           or 1080)   # beats (~6h at the 20s interval)
+MODELS_REFRESH_EVERY = _env_int("TURMA_MODELS_REFRESH_EVERY", 1080)   # beats (~6h at the 20s interval)
 MODELS_RETRY_EVERY = 45               # beats (~15 min) until the first success
-MODELS_PROBE_TIMEOUT_SEC = int(
-    os.environ.get("TURMA_MODELS_PROBE_TIMEOUT_SEC", "90") or 90)
+MODELS_PROBE_TIMEOUT_SEC = _env_int("TURMA_MODELS_PROBE_TIMEOUT_SEC", 90)
 # How long set_model waits for the /model picker to paint after opening it:
 # up to TRIES polls, WAIT_SEC apart. Runs on the command path of the heartbeat
 # loop, so the worst case (a few seconds) is bounded well under a spawn's git

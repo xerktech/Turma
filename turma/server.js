@@ -45,7 +45,7 @@ const push = require("./push.js");
 // its file at require time (like the other /data stores below).
 const usageLedger = require("./usage-ledger.js");
 
-const PORT = parseInt(process.env.PORT || "8300", 10);
+const PORT = positiveEnv("PORT", 8300);
 
 // dsh (DeepSeek Harness runtime, XERK-460) fleet-wide KILL SWITCH. This is an
 // in-CODE flag — deliberately not an env var or a build flag — that turns OFF all
@@ -88,9 +88,9 @@ let QWEN_ENABLED = true; // [Qwen B] launcher + XERK-520 end-to-end gate verifie
  * cannot be the binding constraint — both fall back to the host's memory, or the
  * derived ceilings come out absurd.
  */
-const MEMORY_LIMIT =
-  Number(process.env.MEMORY_LIMIT_BYTES) ||
-  Math.min(containerMemoryLimit() || os.totalmem(), os.totalmem());
+const MEMORY_LIMIT = positiveEnv(
+  "MEMORY_LIMIT_BYTES",
+  Math.min(containerMemoryLimit() || os.totalmem(), os.totalmem()));
 // One request may hold an eighth of the container; everything being read at once
 // may hold a quarter. The gap between them is deliberate — it leaves room for the
 // response, the parsed object (a JSON body costs several times its wire size once
@@ -104,9 +104,9 @@ const MEMORY_LIMIT =
 // number is the sanity bound. The TOTAL budget is the one that genuinely wants
 // to widen with mem_limit, because that buys CONCURRENCY.
 const BODY_INFLIGHT_ABSOLUTE_MAX = 32 << 20; // 32 MiB — the largest one body may be
-const BODY_INFLIGHT_MAX =
-  Number(process.env.BODY_INFLIGHT_MAX) ||
-  Math.min(BODY_INFLIGHT_ABSOLUTE_MAX, Math.floor(MEMORY_LIMIT / 8));
+const BODY_INFLIGHT_MAX = positiveEnv(
+  "BODY_INFLIGHT_MAX",
+  Math.min(BODY_INFLIGHT_ABSOLUTE_MAX, Math.floor(MEMORY_LIMIT / 8)));
 // The ceiling on EVERYTHING being read at once, across BOTH lanes.
 //
 // It has to be one number covering both, because two independent ceilings have
@@ -120,8 +120,8 @@ const BODY_INFLIGHT_MAX =
 // Half the container, so that one max-size body (BODY_INFLIGHT_MAX at
 // BODY_PARSE_COST, i.e. three quarters of this) plus the shared traffic beside
 // it still leaves room for the response, the working set and the sockets.
-const BODY_INFLIGHT_TOTAL_MAX =
-  Number(process.env.BODY_INFLIGHT_TOTAL_MAX) || Math.floor(MEMORY_LIMIT / 2);
+const BODY_INFLIGHT_TOTAL_MAX = positiveEnv(
+  "BODY_INFLIGHT_TOTAL_MAX", Math.floor(MEMORY_LIMIT / 2));
 
 // The largest WebSocket frame the hub will buffer before refusing (XERK-357).
 //
@@ -157,9 +157,9 @@ const BODY_INFLIGHT_TOTAL_MAX =
 // each holding a near-max partial frame — far narrower than the single unbounded
 // frame this closes; shrinking it further is a sizing decision, not a code fix.
 const WS_FRAME_ABSOLUTE_MAX = 16 << 20; // 16 MiB — the largest one frame may be
-const WS_FRAME_MAX =
-  Number(process.env.WS_FRAME_MAX) ||
-  Math.min(WS_FRAME_ABSOLUTE_MAX, Math.floor(MEMORY_LIMIT / 16));
+const WS_FRAME_MAX = positiveEnv(
+  "WS_FRAME_MAX",
+  Math.min(WS_FRAME_ABSOLUTE_MAX, Math.floor(MEMORY_LIMIT / 16)));
 
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
 const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
@@ -256,13 +256,13 @@ const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // than an unexpected-outage `offline` (XERK-29). We hold that status for this
 // grace window; if the agent never comes back within it the update is stuck and
 // the host correctly falls through to offline (and alerts).
-const UPDATING_GRACE_MS = Number(process.env.UPDATING_GRACE_MS) || 5 * 60 * 1000;
+const UPDATING_GRACE_MS = positiveEnv("UPDATING_GRACE_MS", 5 * 60 * 1000);
 // Control-channel liveness. A heartbeat is a fresh HTTP POST and so proves
 // nothing about the tunnel: the two die independently, and a host whose tunnel
 // is wedged still reports `online` while every Attach on it reads "terminal
 // offline". Both ends therefore prove the channel rather than assume it.
-const CONTROL_PING_EVERY_MS = Number(process.env.CONTROL_PING_EVERY_MS) || 30 * 1000;
-const CONTROL_DEAD_AFTER_MS = Number(process.env.CONTROL_DEAD_AFTER_MS) || 90 * 1000; // 3 missed beats
+const CONTROL_PING_EVERY_MS = positiveEnv("CONTROL_PING_EVERY_MS", 30 * 1000);
+const CONTROL_DEAD_AFTER_MS = positiveEnv("CONTROL_DEAD_AFTER_MS", 90 * 1000); // 3 missed beats
 const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
 const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
@@ -271,7 +271,7 @@ const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted 
 // (a running session materializes there — see the /history route). The archive
 // holds the WHOLE transcript; this bounds the payload to the same order of
 // magnitude as an agent `/history` window (SESSION_HISTORY_MSGS defaults to 200).
-const HISTORY_ARCHIVE_MSGS = Number(process.env.HISTORY_ARCHIVE_MSGS) || 200;
+const HISTORY_ARCHIVE_MSGS = positiveEnv("HISTORY_ARCHIVE_MSGS", 200);
 // Bounds for a session's live agent rows (sanitizeLiveAgents, far below). They
 // live UP HERE, away from their function, because the state.json restore runs
 // at module init and calls that function: a `const` declared later is in its
@@ -298,7 +298,7 @@ const WORKFLOW_AGENTS_MAX = 200;
 // as a tmux paste, which has no length limit of its own — not a product limit.
 // Kept under readBody's 1 MiB request cap, and refused explicitly so the composer
 // can say "too long" instead of the generic "Send failed".
-const INPUT_MAX_CHARS = Number(process.env.INPUT_MAX_CHARS) || 100000;
+const INPUT_MAX_CHARS = positiveEnv("INPUT_MAX_CHARS", 100000);
 // What an agent that doesn't report `inputMaxChars` can take. Such an agent
 // predates the paste delivery: it types the message as a tmux `send-keys`
 // argument and CLIPS it to 4k first, silently, so a longer message arrives with
@@ -467,7 +467,7 @@ function checkSpawnPermissionMode(cmd) {
 // POSTs the bytes here, they sit in memory under an id, and the agent GETs them
 // when it picks up the `input` command carrying that id. Nothing touches /data —
 // an upload that is never collected simply expires.
-const UPLOAD_MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES) || (1 << 25); // 32 MiB per file
+const UPLOAD_MAX_BYTES = positiveEnv("UPLOAD_MAX_BYTES", 1 << 25); // 32 MiB per file
 // The whole relay's memory ceiling. Held blobs are RAM, so this is the number
 // that keeps a hub with a fat pipe and a slow agent from being OOM'd; a POST
 // arriving over it is refused rather than evicting someone else's pending file.
@@ -480,9 +480,9 @@ const UPLOAD_MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES) || (1 << 25); // 3
 //
 // A SEPARATE budget from the in-flight quarter, deliberately: these blobs are
 // held for MINUTES (UPLOAD_TTL_MS), not for the length of one request.
-const UPLOAD_TOTAL_MAX_BYTES =
-  Number(process.env.UPLOAD_TOTAL_MAX_BYTES) ||
-  Math.min(1 << 27, Math.floor(MEMORY_LIMIT / 4));
+const UPLOAD_TOTAL_MAX_BYTES = positiveEnv(
+  "UPLOAD_TOTAL_MAX_BYTES",
+  Math.min(1 << 27, Math.floor(MEMORY_LIMIT / 4)));
 // How long a staged blob waits to be collected. Generous, because the operator
 // attaches files and then keeps typing before pressing Send — the clock starts
 // at the upload, not at the message.
@@ -720,7 +720,7 @@ const WHISPER_API_KEY = process.env.WHISPER_API_KEY || LITELLM_API_KEY;
 // multilingual ASR like Parakeet-tdt-0.6b-v3, whose auto language detection a
 // forced `language=en` would silently defeat.
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE ?? "en";
-const WHISPER_TIMEOUT_MS = parseInt(process.env.WHISPER_TIMEOUT_MS || "30000", 10);
+const WHISPER_TIMEOUT_MS = positiveEnv("WHISPER_TIMEOUT_MS", 30000);
 
 // A session counts as "working" while its transcript was written to within
 // this window (agents report the age at beat time; add staleness since).
@@ -1901,7 +1901,7 @@ function fleetRepoNames() {
 // State is in-memory and short-lived; a hub restart mid-migration aborts it,
 // leaving the source session intact.
 const migrations = new Map(); // migrationId -> record (see startMigration)
-const MIGRATE_TIMEOUT_MS = Number(process.env.MIGRATE_TIMEOUT_MS) || 5 * 60 * 1000;
+const MIGRATE_TIMEOUT_MS = positiveEnv("MIGRATE_TIMEOUT_MS", 5 * 60 * 1000);
 const MIGRATE_DONE_KEEP_MS = 30 * 1000; // keep a done/failed record briefly so UI can observe
 const MIGRATIONS_MAX = 40; // backstop against unbounded growth
 // Upload cap for the relay: a hair above the agent's own 64 MiB pack limit so a
@@ -1967,9 +1967,9 @@ const ARCHIVE_PARSE_COST = 20;
 // keeps the EXCLUSIVE lane's worst case at 40 MiB of charge rather than 80, and
 // a whole-transcript backfill is a handful more POSTs in one sync pass.
 const ARCHIVE_CHUNK_ABSOLUTE_MAX = 2 << 20;   // 2 MiB of rendered entries per delta
-const ARCHIVE_CHUNK_BODY_MAX =
-  Number(process.env.ARCHIVE_CHUNK_BODY_MAX) ||
-  Math.min(ARCHIVE_CHUNK_ABSOLUTE_MAX, Math.floor(MEMORY_LIMIT / (ARCHIVE_PARSE_COST * 3)));
+const ARCHIVE_CHUNK_BODY_MAX = positiveEnv(
+  "ARCHIVE_CHUNK_BODY_MAX",
+  Math.min(ARCHIVE_CHUNK_ABSOLUTE_MAX, Math.floor(MEMORY_LIMIT / (ARCHIVE_PARSE_COST * 3))));
 // How the boot line states it. A MiB formatter FLOORS, and this is the one
 // derived ceiling that can land under a MiB on a small container — printed as
 // "0 MiB" the boot line stops being the way the number is discoverable, which is
@@ -2041,7 +2041,7 @@ const MIGRATE_SPOOL_DIR = process.env.MIGRATE_SPOOL_DIR || "/data/migrations";
 // where a move STARTS, not on the relay upload: an agent's upload is
 // best-effort with no retry, so refusing one strands a migration, while
 // refusing the operator's click just says "not right now" on the Move control.
-const MIGRATE_INFLIGHT_MAX = Number(process.env.MIGRATE_INFLIGHT_MAX) || 4;
+const MIGRATE_INFLIGHT_MAX = positiveEnv("MIGRATE_INFLIGHT_MAX", 4);
 // How many names an incomplete restore lists on its record. It rides /api/agents
 // and every SSE frame, and the names come from the archive's raw layer — bounded
 // per name but not in COUNT, so a session with thousands of subagent files could
@@ -4116,8 +4116,8 @@ const createInFlight = new Map(); // fingerprint -> {cmdId, host, at}
 // Env-tunable for the same reason CONTROL_PING_EVERY_MS is: a multi-minute
 // expiry can only be tested by winding it down to milliseconds.
 const CREATE_INFLIGHT_TTL_DEFAULT_MS = RESULT_WAIT_MAX_MS;
-const CREATE_INFLIGHT_TTL_MS =
-  Number(process.env.CREATE_INFLIGHT_TTL_MS) || CREATE_INFLIGHT_TTL_DEFAULT_MS;
+const CREATE_INFLIGHT_TTL_MS = positiveEnv(
+  "CREATE_INFLIGHT_TTL_MS", CREATE_INFLIGHT_TTL_DEFAULT_MS);
 // Hashed, and over the WHOLE body rather than the title alone: two tickets that
 // share a title but differ in description or labels are DIFFERENT tickets, and
 // folding them would not just suppress a retry — it would discard the second
@@ -5484,7 +5484,7 @@ const RAW_BODY_DRAIN_SLACK = 1 << 20; // 1 MiB
 // one when a host's staged history has outgrown HEARTBEAT_MAX. That one still
 // drains, still gets its 413, and still resizes against it (XERK-235); only a
 // flood is cut off, and only past the point where draining is what is killing us.
-const DRAIN_CONCURRENCY_MAX = Number(process.env.DRAIN_CONCURRENCY_MAX) || 8;
+const DRAIN_CONCURRENCY_MAX = positiveEnv("DRAIN_CONCURRENCY_MAX", 8);
 let drainingNow = 0;
 
 // The same courtesy, rationed, for a body refused on BUDGET rather than on size.
@@ -5507,7 +5507,7 @@ const BUDGET_DRAIN_SLACK = 64 << 10; // 64 KiB
 // Only armed while a read actually holds a charge, and reset by every chunk, so
 // a genuinely slow client on a bad link is untouched — it keeps sending. The
 // window is generous for that reason: this is not a throughput floor.
-const BODY_IDLE_TIMEOUT_MS = Number(process.env.BODY_IDLE_TIMEOUT_MS) || 20 * 1000;
+const BODY_IDLE_TIMEOUT_MS = positiveEnv("BODY_IDLE_TIMEOUT_MS", 20 * 1000);
 
 // ...and how much must ARRIVE in that window for the body to count as making
 // progress. This is the half that matters.
@@ -5525,7 +5525,7 @@ const BODY_IDLE_TIMEOUT_MS = Number(process.env.BODY_IDLE_TIMEOUT_MS) || 20 * 10
 // never reclaimed for the sake of a few last bytes; an attacker cannot use that,
 // since holding a big charge requires a large body with a large remainder.
 const BODY_MIN_PROGRESS_BYTES =
-  Number(process.env.BODY_MIN_PROGRESS_BYTES) || 64 << 10; // 64 KiB per window
+  positiveEnv("BODY_MIN_PROGRESS_BYTES", 64 << 10); // 64 KiB per window
 
 // The longest any ONE body may occupy the exclusive big lane, however well it
 // behaves. The progress floor cannot close this on its own: a body dribbling AT
@@ -5540,7 +5540,7 @@ const BODY_MIN_PROGRESS_BYTES =
 // to disk and is not charged here at all.) What this denies is the indefinite
 // hold — an attacker must re-establish rather than sit there forever.
 const BIG_LANE_MAX_HOLD_MS =
-  Number(process.env.BIG_LANE_MAX_HOLD_MS) || 10 * 60 * 1000;
+  positiveEnv("BIG_LANE_MAX_HOLD_MS", 10 * 60 * 1000);
 
 // Thrown when a body holding budget stops arriving. Its socket is destroyed —
 // a caller that stopped mid-body is not waiting to read a status, and by this
@@ -8733,7 +8733,7 @@ async function proxyTerm(req, res, name, port) {
 // A refused connection is DESTROYED by Node before any HTTP parsing, so there is
 // no way to answer it with a 503 — the client sees a reset. That is the accepted
 // cost, and the reason the `drop` log below is the only diagnosable trace.
-const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS) || 256;
+const MAX_CONNECTIONS = positiveEnv("MAX_CONNECTIONS", 256);
 // Refusals are logged rate-limited: a flood is thousands of drops per second and
 // a line each would make the log its own resource problem. The FIRST drop of a
 // burst prints immediately (that edge is the diagnosis), then at most one
