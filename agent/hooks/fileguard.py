@@ -22,6 +22,19 @@ auto-memory needs ``bypassPermissions`` regardless of what this hook permits.
 The hole stays open because it costs nothing and a later release may lift that
 gate; the oracle fails if it does, so the note gets corrected rather than rotting.
 
+That gate is ANCHORED TO ``~/.claude``, not structural on memory dirs (XERK-315,
+measured on 2.1.258): the SAME allow-rule shape refused inside
+(``Edit(~/.claude/projects/**)``) LANDS the write when the target is relocated
+out of the config dir (``Edit(~/.turma/session-memory/**)``, ``auto`` mode). So a
+documented ``autoMemoryDirectory`` setting pointed outside ``~/.claude`` + an
+allow rule WOULD make session auto-memory reachable under ``auto`` -- a viable
+fix, DELIBERATELY NOT ADOPTED (XERK-315 decision): ``autoMemoryDirectory``'s
+per-project-separation semantics are unverified (a flat shared dir would bleed one
+repo's memory into every session on the host, since this carve-out is already
+fleet-wide readable), the per-worktree slug still churns so it would not restore
+durable repo knowledge anyway, and committed ``.claude/rules/*.md`` remains the
+substitute. Pinned by ``test_the_projects_gate_is_anchored_to_the_claude_dir``.
+
 **Why a hook and not `permissions.deny` patterns.** The rule wanted here is
 "everything under X except Y". Deny beats allow, so the exception cannot be an
 allow rule — it has to be a hole in the deny, and a glob list cannot cut that

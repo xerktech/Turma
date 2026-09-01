@@ -497,7 +497,9 @@ class TestGuardedClaudeDir(unittest.TestCase):
         auto-memory -- the subagent store is what this change delivers.
 
         Both arms are needed to say that precisely: the binary refuses it, and
-        OUR layer does not. Tracked in XERK-315.
+        OUR layer does not. Tracked in XERK-315. WHERE that gate lives -- anchored
+        to ~/.claude, not structural on memory dirs -- is pinned separately by
+        test_the_projects_gate_is_anchored_to_the_claude_dir.
         """
         rel = ".claude/projects/slug/memory/MEMORY.md"
         self.assertEqual(self._case(rel, self.EMPTY, mode="acceptEdits"), DENIED,
@@ -505,6 +507,58 @@ class TestGuardedClaudeDir(unittest.TestCase):
                          "whether our layer is now what blocks session memory")
         self.assertEqual(self._case(rel, self.REAL), ALLOWED,
                          "our own rules refuse it, which the carve-out must not")
+
+    def _auto_write(self, target_rel, allow):
+        """One `auto`-mode Write under REAL guard settings + one allow rule.
+
+        `auto` never auto-grants an unruled write (measured: an in-cwd write with
+        no rule is refused), so the allow rule is what lands it -- which is what
+        isolates the config-dir gate. An allow that is EFFECTIVE outside
+        ~/.claude and INERT inside it can only be a gate anchored to the config
+        dir, not a rule that fails to match.
+        """
+        self._n += 1
+        base = os.path.join(self.tmp, f"anchor{self._n}")
+        home = _fake_home(base, trust_cwd=os.path.join(base, "home"))
+        target = os.path.join(home, target_rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        s = ha.build_guard_settings(
+            local_settings_path=os.path.join(base, "no-operator-settings.json"))
+        s.setdefault("permissions", {}).setdefault("allow", []).append(allow)
+        sp = _settings(os.path.join(base, "turma"), s)
+        got = _attempt(home, sp, target, mode="auto",
+                       env=dict(os.environ, HOME=home))
+        self.assertNotEqual(got, INCONCLUSIVE,
+                            f"model never attempted the write at {target_rel}; "
+                            "inconclusive is not a verdict about the gate")
+        return got
+
+    def test_the_projects_gate_is_anchored_to_the_claude_dir(self):
+        """XERK-315: the projects gate is ANCHORED to ~/.claude, not structural.
+
+        The SAME allow-rule shape is INERT inside the config dir and EFFECTIVE
+        outside it, so relocating a session's auto-memory out of ~/.claude (via a
+        documented `autoMemoryDirectory`) + an allow rule WOULD make it reachable
+        under `auto` -- the ticket's option (3), measured feasible on 2.1.258 and
+        deliberately NOT adopted (fileguard.py / agent-hooks.md carry why).
+
+        The outside-ALLOWED arm doubles as the harness's proof it can SEE an allow
+        at all, so the inside-DENIED arm is a real refusal, not a blind harness.
+        If a release lets allow rules reach inside ~/.claude/projects/ the inside
+        arm flips red; if it makes the gate structural (refusing outside too) the
+        outside arm does. Either way this fails rather than rotting -- the same
+        contract as test_project_auto_memory_is_gated_by_the_binary_not_by_us.
+        """
+        self.assertEqual(
+            self._auto_write(".claude/projects/slug/memory/MEMORY.md",
+                             "Edit(~/.claude/projects/**)"),
+            DENIED, "an allow inside ~/.claude is no longer inert -- the gate "
+            "moved or lifted; re-measure option (3) and the caveat docs")
+        self.assertEqual(
+            self._auto_write(".turma/session-memory/slug/memory/MEMORY.md",
+                             "Edit(~/.turma/session-memory/**)"),
+            ALLOWED, "the SAME allow shape outside ~/.claude no longer lands -- "
+            "the gate went structural, or the harness stopped seeing allows")
 
 
 class TestAttemptRetryLogic(unittest.TestCase):
