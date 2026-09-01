@@ -2934,6 +2934,32 @@ test("XERK-289: a second host beating under an existing host's name is warned ab
   }
 });
 
+test("XERK-282: a heartbeat cannot publish a record under another host's key", async () => {
+  // `key` is hub-owned — the registry identity every client keys hosts by and
+  // every control routes on. A heartbeat that echoes a `key` field must not
+  // override it, or one agent's payload is served under another host's key and
+  // silently displaces the victim on the dashboard/Android/glasses.
+  assert.equal((await request("POST", "/api/heartbeat", {
+    body: { device: "victim-282", repos: [{ name: "Turma" }] }, headers: agentHeaders,
+  })).status, 200);
+  assert.equal((await request("POST", "/api/heartbeat", {
+    body: { device: "attacker-282", key: "victim-282", repos: [{ name: "EVIL" }] },
+    headers: agentHeaders,
+  })).status, 200);
+
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const victims = res.body.agents.filter((a) => a.key === "victim-282");
+  const attackers = res.body.agents.filter((a) => a.key === "attacker-282");
+  // Exactly one record under each key — the attacker's `key:"victim-282"` was
+  // stripped on ingest and could not override the authoritative registry key.
+  assert.equal(victims.length, 1, "only the real victim is served under its key");
+  assert.equal(attackers.length, 1, "the impersonating beat keeps its OWN key");
+  assert.equal(victims[0].device, "victim-282");
+  assert.deepEqual(victims[0].repos, [{ name: "Turma" }]);
+  assert.equal(attackers[0].device, "attacker-282");
+  assert.deepEqual(attackers[0].repos, [{ name: "EVIL" }]);
+});
+
 test("http: a malformed top-level models block cannot empty every phone's fleet", async () => {
   // The same failure class as usage.models, one field up and a different shape.
   // Android types `models` as `ModelsInfo?` and decodes /api/agents atomically,

@@ -2389,9 +2389,16 @@ function serializeAgent(key, agent, now) {
   // stays the agent's raw report, and so a purge takes effect on the next read.
   const durable = usageLedger.fold(key, a, now);
   return {
-    key,
     ...a,
     ...(durable || {}),
+    // `key` is the hub-owned registry identity every client keys hosts by and
+    // every control routes on. Stamped AFTER the spreads so a `key` that leaked
+    // into the stored record (a heartbeat payload, a restored state.json) can
+    // never override the authoritative registry key — one record served under
+    // another host's key silently displaces the victim on every surface
+    // (XERK-282). `sanitizeHeartbeat` strips it on ingest too, so this is the
+    // second of two independent guards.
+    key,
     // Fold agent-overhead scratch repos (`hub-agent-mgr-*`, `.turma`) into one
     // `Turma-System-Usage` block (XERK-338). `durable.repoUsage` is already folded
     // (repoBlocks), so this only bites the raw path — a live host whose OWN
@@ -4714,6 +4721,13 @@ function warnDeviceCollision(key, prevAgentId, curAgentId) {
 // compromised agent could take down the fleet's control plane (XERK-235).
 function sanitizeHeartbeat(payload, key) {
   if (!payload || typeof payload !== "object") return payload;
+  // `key` is HUB-OWNED — the registry identity, derived from `device` below and
+  // stamped by serializeAgent. A payload must not carry it: left in, it rides
+  // `{...payload}` onto the stored record and (before XERK-282) overrode the
+  // authoritative key in serializeAgent, publishing one host's record under
+  // another's key. Stripped here so it can't be stored at all; serializeAgent's
+  // stamp-last order is the second, independent guard.
+  if ("key" in payload) delete payload.key;
   for (const k of Object.keys(payload)) {
     if (HEARTBEAT_KNOWN_KEYS.has(k)) continue;
     let size = 0;
