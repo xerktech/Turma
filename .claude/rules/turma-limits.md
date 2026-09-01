@@ -161,6 +161,28 @@ with `restart: unless-stopped`
   - **cloudflared's framing is irrelevant** to what the hub sees — it is upstream of nginx, which
     normalizes. The ticket's "measure cloudflared" question was moot once nginx was in the path.
 
+## The queued-command cap (XERK-261)
+
+- **`queueCommand` bounds `a.commands` so a HUB-SIDE write can never grow a record past
+  `AGENT_RECORD_MAX`.** Every append re-serializes and SSE-broadcasts the whole record, and the queue
+  drains only when the host BEATS — so a flood of commands at an OFFLINE host (an operator hammering a
+  control; the repro was 1316 queued `model-source` commands) grew the record until its next beat
+  413'd, locking the host out permanently (the drain needs the beat the 413 refuses). Records live 7
+  days, so the lockout is durable.
+- **Two bounds, oldest dropped first** (a queue already thousands deep for an offline host is stale by
+  the time it returns, so oldest-drop loses nothing; dropping keeps every caller's cmdId return
+  contract, where a 429-refuse would not): `AGENT_COMMAND_QUEUE_MAX` (count, 256, `positiveEnv`) holds
+  the common small-command flood with a length check; then a BYTE trim (`agentRecordSize` >
+  `AGENT_RECORD_MAX`) covers fat payloads (a spawn `label` is up to 100k) AND a record already near
+  the ceiling that one command would tip over. The byte loop always leaves the just-enqueued command.
+- **The single `agentRecordSize` measure doubles as the `recordBytes` update** — an offline host never
+  re-measures on its own beat, so without it its accruing queue is invisible to `registryBytes` until
+  it returns. `queueCommand` is low-frequency (operator actions, ≤one ticket dispatch per host per
+  beat), so one serialization per call is cheap on a normal (<0.3 MiB) record.
+- **The trim log is throttled** (`logCommandTrim`, one line/min) — the flood that trips it is exactly
+  the traffic that would flood the log, same discipline as `logRegistryFull`.
+- Tests: the `queued-command cap` cases in `server.test.js`.
+
 ## Verifying a change here
 
 - **The unit suite has never caught a defect here** — every one was found flooding a real
