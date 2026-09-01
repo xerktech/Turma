@@ -75,12 +75,22 @@ agent-side runtime detail. `.claude/rules/agent.md` carries the process model an
     (XERK-374, `_promote_clone`; same-filesystem so the rename is atomic). So `REPOS_ROOT/<name>` never
     exists as a `.git`-with-unborn-HEAD half-repo — the state that used to permanently block a repo:
     `scan_repos` listed it, no session could fork it, and `clone()` refused to re-clone over it.
-  - **A clone does NOT outlive its manager** — a restart mid-clone abandons only the STAGING dir
-    (invisible to `scan_repos`, reaped at boot by `_sweep_clone_tmp`), leaving nothing at
-    `REPOS_ROOT/<name>`, so the drain's re-clone branch lands cleanly (nothing-on-disk, once, via
-    `awaitCloneRetried`). The dead-end `awaitCloneOwner`+dir-exists error now only names a directory
-    Turma did NOT create (a hand-run clone, a bare `git init`, a legacy pre-XERK-374 partial);
-    removing it stays the operator's call.
+  - **A restart mid-clone abandons only the STAGING dir**, never a half-repo at `REPOS_ROOT/<name>`,
+    so the drain's re-clone branch lands cleanly (nothing-on-disk, once, via `awaitCloneRetried`).
+    The dead-end `awaitCloneOwner`+dir-exists error now only names a directory Turma did NOT create (a
+    hand-run clone, a bare `git init`, a legacy pre-XERK-374 partial); removing it stays the
+    operator's call.
+  - **A clone is a bare subprocess, so `KillMode=process` CAN leave it running across an in-place
+    restart** — but nothing tracks it across the restart, so a survivor can never be promoted
+    (`_poll_clones` died with its manager). So `_handle_shutdown` REAPS in-flight clones
+    (`_kill_clones`) — losing no landable work — and `_sweep_clone_tmp` at boot mops up what a crash
+    skipped. The sweep leaves alone a dir written within `CLONE_TMP_MIN_AGE_SEC` (a still-writing
+    orphan git) and any tmp of a job still in `self.clones`; it never rmtree's a live clone's dir.
+  - **`clone()` refuses a DUPLICATE in-flight request for the same repo** — since the dest stays empty
+    during a staged clone, the `os.path.exists(dest)` refusal no longer catches a double-request, and
+    both would compute the same `slug+pid` staging path (the second's pre-clean `rmtree` killing the
+    first's live checkout). An in-flight `cloning` job blocks a second `clone()`; a terminal one does
+    not (an ordinary re-clone).
   - **The drain branches on the clone job's STATUS; a `done` job is its own answer** — a clone of an
     empty upstream exits 0, so the job finishes while the repo stays unforkable; once `_poll_clones`
     prunes it (30s) that's indistinguishable from an interrupted clone, so neither message claims a
