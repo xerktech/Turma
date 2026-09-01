@@ -52,6 +52,11 @@ paths:
     short strings or the field drops (Android TYPES it, so one bad element would fail the whole
     `/api/agents` decode). `sevenDayPacing` is the one pacing helper, mirrored web (`usage.html`) +
     Android (`UsageViewModel`). Only the 7-day window has markers; the 5-hour one is left plain.
+    - **The pace line drives auto-start PAUSING hub-side** (XERK-544, `turma-triage.md`): once
+      informational, it now has a consumer. `server.js`'s `limitsPastPace`/`subscriptionsOverPace`
+      re-derive the SAME consumed-vs-elapsed comparison (needing only `resetsAt`+`usedPct`, not
+      `dayLabels`) to pause a claude host on an over-pace subscription. Keep both pace computations
+      answering the same question.
   - A host reporting no window gets **no card** (older agent / non-subscription / unprobed all mean
     "can't tell", never 0%).
   - **One card per SUBSCRIPTION, not per host** (XERK-301, `limitGroups`, keyed on the agent's opaque
