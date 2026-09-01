@@ -9756,10 +9756,7 @@ def collect_azure_repos():
 JIRA_SITE = os.environ.get("JIRA_SITE", "").strip()
 JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "").strip()
 JIRA_TOKEN = os.environ.get("JIRA_TOKEN", "").strip()
-try:
-    JIRA_REFRESH_EVERY = _env_int("TURMA_JIRA_REFRESH_EVERY", 30)
-except ValueError:
-    JIRA_REFRESH_EVERY = 30   # beats between polls (30 × 20s beat ≈ 10 min)
+JIRA_REFRESH_EVERY = _env_int("TURMA_JIRA_REFRESH_EVERY", 30)  # beats between polls (30 × 20s beat ≈ 10 min)
 # Ticket auto-start (XERK-32) is opt-in PER ORG so the hub starts a session for
 # every "To Do" ticket the moment it has a repo assigned (by the model's triage or
 # a manual pin). The opt-in is HUB-ONLY (XERK-41): the operator flips it from the
@@ -11997,10 +11994,7 @@ def build_ticket_prompt(detail, attachments=None):
 # hashes only repo NAMES — the gh block's `updatedAt` churns constantly and would
 # otherwise re-triage the whole board on every sweep.
 JIRA_TRIAGE_MODEL = os.environ.get("JIRA_TRIAGE_MODEL", "haiku").strip() or "haiku"
-try:
-    JIRA_TRIAGE_TIMEOUT_SEC = _env_int("JIRA_TRIAGE_TIMEOUT_SEC", 120)
-except ValueError:
-    JIRA_TRIAGE_TIMEOUT_SEC = 120
+JIRA_TRIAGE_TIMEOUT_SEC = _env_int("JIRA_TRIAGE_TIMEOUT_SEC", 120)
 JIRA_TRIAGE_BATCH = 25          # tickets per `claude -p` call (one call in flight)
 JIRA_TRIAGE_CANDIDATES = 200    # candidate repos shown to the model (bounds the prompt)
 JIRA_TRIAGE_MAX_ATTEMPTS = 3    # tries before a ticket stays unclassified for good
@@ -12494,10 +12488,7 @@ def _ticket_triage_prompt(batch, board):
 # Handed straight to `claude --model`; validated only against claude's own
 # aliases, but this is a fixed operator-set env, not free-form spawn input.
 SESSION_SUMMARY_MODEL = os.environ.get("SESSION_SUMMARY_MODEL", "haiku").strip() or "haiku"
-try:
-    SUMMARY_TIMEOUT_SEC = _env_int("SESSION_SUMMARY_TIMEOUT_SEC", 45)
-except ValueError:
-    SUMMARY_TIMEOUT_SEC = 45
+SUMMARY_TIMEOUT_SEC = _env_int("SESSION_SUMMARY_TIMEOUT_SEC", 45)
 SUMMARY_MAX_WORDS = 6          # cap a chatty reply so it can't bloat the card
 SUMMARY_MAX_CHARS = 48
 SUMMARY_PROMPT_CAP = 2000      # cap the task text handed to the summarizer
