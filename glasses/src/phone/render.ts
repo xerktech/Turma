@@ -396,6 +396,9 @@ export function boardBodyHtml(state: AppState, moves: Map<string, unknown> = new
     starts: new Map(),
     moves,
     orgColors: state.orgColors,
+    // The hub's per-ticket triage verdicts (XERK-486 [F]), so the Triage lane
+    // (held cards) + verdict chips render exactly as on the web/Android.
+    triageActions: state.ticketTriageActions,
   });
   // The detail modal (filled + shown by the controller on a card tap).
   const modal = `<div class="td-backdrop" id="ph-detail" hidden><div class="td-panel" id="ph-detail-panel"></div></div>`;

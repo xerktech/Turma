@@ -165,6 +165,10 @@ export interface AgentsResponse {
   // The hub's per-org auto-start opt-in (XERK-41): siteKey -> true when the org
   // auto-starts a session for every To Do ticket with a repo. Presence = enabled.
   autoStartOrgs?: Record<string, boolean>;
+  // The hub's per-ticket triage verdicts (XERK-486 [F]): "<siteKey>/<issueKey>"
+  // -> {action: "approve"|"hold"|"reject", at}. Feeds boardHtml's triageActions
+  // so the Triage lane + verdict chips match the web/Android (passive read only).
+  ticketTriageActions?: Record<string, { action: string; at: number }>;
 }
 
 // GET .../sessions/<id>/history — the "resolved" 200 response.

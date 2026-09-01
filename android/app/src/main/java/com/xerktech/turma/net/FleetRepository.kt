@@ -60,6 +60,14 @@ data class FleetState(
     // "push is off" banner. Poll-only (no SSE event); defaults true so an older
     // hub never false-alarms.
     val pushEnabled: Boolean = true,
+    // Per-ticket triage verdict (XERK-486), keyed "<siteKey>/<issueKey>"; the
+    // board's Triage lane + card chip + detail row read it. Refreshed by the
+    // poll and the "triageActions" SSE event.
+    val ticketTriageActions: Map<String, com.xerktech.turma.model.TriageActionPin> = emptyMap(),
+    // Per-org triage policy (XERK-486), keyed by siteKey; the board's Triage
+    // policy sheet reads it. Refreshed by the poll and the "triagePolicies"
+    // SSE event.
+    val triagePolicies: Map<String, com.xerktech.turma.model.TriagePolicy> = emptyMap(),
 )
 
 class FleetRepository(
@@ -114,6 +122,8 @@ class FleetRepository(
             ticketQueue = resp.ticketQueue
             retiredUsage = resp.retiredUsage
             pushEnabled = resp.pushEnabled
+            ticketTriageActions = resp.ticketTriageActions
+            triagePolicies = resp.triagePolicies
             emit(resp.now, error = null)
         } catch (e: Exception) {
             emit(_state.value.now, error = e.message ?: "hub unreachable")
@@ -144,6 +154,12 @@ class FleetRepository(
     @Volatile
     private var pushEnabled: Boolean = true
 
+    @Volatile
+    private var ticketTriageActions: Map<String, com.xerktech.turma.model.TriageActionPin> = emptyMap()
+
+    @Volatile
+    private var triagePolicies: Map<String, com.xerktech.turma.model.TriagePolicy> = emptyMap()
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
@@ -156,6 +172,8 @@ class FleetRepository(
             ticketQueue = ticketQueue,
             retiredUsage = retiredUsage,
             pushEnabled = pushEnabled,
+            ticketTriageActions = ticketTriageActions,
+            triagePolicies = triagePolicies,
         )
     }
 
@@ -205,6 +223,15 @@ class FleetRepository(
                     "ticketQueue" -> runCatching {
                         TurmaJson.decodeFromString<List<com.xerktech.turma.model.QueuedTicket>>(data)
                     }.getOrNull()?.let { ticketQueue = it; emit(_state.value.now, null) }
+                    // A per-ticket triage verdict changed (XERK-486); the event
+                    // carries the whole (tiny) map, like the other pins.
+                    "triageActions" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TriageActionPin>>(data)
+                    }.getOrNull()?.let { ticketTriageActions = it; emit(_state.value.now, null) }
+                    // An org's triage policy changed (XERK-486); whole tiny map.
+                    "triagePolicies" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TriagePolicy>>(data)
+                    }.getOrNull()?.let { triagePolicies = it; emit(_state.value.now, null) }
                 }
             }
 

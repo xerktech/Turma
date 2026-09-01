@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -27,12 +28,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -69,6 +73,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.input.KeyboardType
 import kotlinx.coroutines.launch
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
@@ -76,6 +81,8 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
+import android.os.Handler
+import android.os.Looper
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.BOARD_CATEGORIES
@@ -92,6 +99,7 @@ import com.xerktech.turma.core.boardColumnOf
 import com.xerktech.turma.core.categoryOf
 import com.xerktech.turma.core.createDirty
 import com.xerktech.turma.core.createLabelWord
+import com.xerktech.turma.core.displayColumnOf
 import com.xerktech.turma.core.edgeScrollStep
 import com.xerktech.turma.core.filterSites
 import com.xerktech.turma.core.mergeSites
@@ -99,6 +107,7 @@ import com.xerktech.turma.core.orgColorMap
 import com.xerktech.turma.core.orgName
 import com.xerktech.turma.core.overdueOf
 import com.xerktech.turma.core.prioClass
+import com.xerktech.turma.core.rateMaxError
 import com.xerktech.turma.core.splitLabels
 import com.xerktech.turma.core.ticketSessionIndex
 import com.xerktech.turma.core.ticketSessionLabel
@@ -107,9 +116,11 @@ import com.xerktech.turma.core.ticketSessionsOf
 import com.xerktech.turma.core.queueView
 import com.xerktech.turma.core.queuedTicketOf
 import com.xerktech.turma.core.ticketStartControl
+import com.xerktech.turma.core.triageActionOf
 import com.xerktech.turma.model.CreateTicketRequest
 import com.xerktech.turma.model.JiraTicket
 import com.xerktech.turma.model.QueuedTicket
+import com.xerktech.turma.model.TriageActionPin
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.BoardViewModel
 import kotlinx.coroutines.launch
@@ -166,15 +177,32 @@ fun BoardScreen(
     // no org still reports, exactly as `effectiveOrgs` does for the other screens.
     val shown = remember(sites, orgFilter) { filterSites(sites, orgFilter) }
     var detail by remember { mutableStateOf<Pair<BoardSite, JiraTicket>?>(null) }
+    // The per-org triage policy sheet (XERK-486), opened from the header — the
+    // board bar's "Triage policy" button on the web.
+    var policyOpen by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
-    LaunchedEffect(Unit) { vm.messages.collect { Toast.makeText(context, it, Toast.LENGTH_SHORT).show() } }
+    LaunchedEffect(Unit) {
+        // VMs may emit messages from network-completion threads (Retrofit
+        // resumes on OkHttp's dispatcher); Toast demands a prepared looper,
+        // so hop to main before showing.
+        vm.messages.collect { msg ->
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
 
     Column(modifier.fillMaxSize()) {
         ScreenHeader("Board") {
             // The New-ticket button moved into the shared ScreenHeader (XERK-150),
-            // so it's on every screen — see NewTicketAction. Only Refresh is
-            // board-specific now.
+            // so it's on every screen — see NewTicketAction. Refresh and the
+            // triage policy are board-specific now.
+            if (sites.isNotEmpty()) {
+                IconButton(onClick = { policyOpen = true }) {
+                    Icon(Icons.Filled.Tune, "Triage policy")
+                }
+            }
             IconButton(onClick = { vm.refresh() }, enabled = !refreshing) {
                 if (refreshing) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                 else Icon(Icons.Filled.Refresh, "Refresh")
@@ -204,6 +232,13 @@ fun BoardScreen(
             val colBounds = remember { mutableStateMapOf<String, Rect>() }
             var boxBounds by remember { mutableStateOf(Rect.Zero) }
             val hScroll = rememberScrollState()
+            // The Triage lane (XERK-486) is a view, not a drop target — a pointer
+            // over it resolves to no column (board.html: `if (col &&
+            // col.dataset.cat === "triage") col = null;`). Cards may still be
+            // dragged OUT of the lane into a real column.
+            val resolveOver: (Offset) -> String? = { p ->
+                colBounds.entries.firstOrNull { it.value.contains(p) }?.key?.takeIf { c -> c != "triage" }
+            }
             // Auto-scroll the strip while the drag hovers near an edge (XERK-179,
             // board.html edgeScroll): the long-press drag owns the gesture, so the
             // strip must scroll itself for a card to reach an off-screen column —
@@ -224,7 +259,7 @@ fun BoardScreen(
                     val d = drag ?: break
                     val step = edgeScrollStep(d.pointer.x, boxBounds.left, boxBounds.right, edgePx, speedPx * dt)
                     if (step != 0f) hScroll.scrollBy(step)
-                    val over = colBounds.entries.firstOrNull { it.value.contains(d.pointer) }?.key
+                    val over = resolveOver(d.pointer)
                     if (over != d.overCat) drag = d.copy(overCat = over)
                 }
             }
@@ -235,12 +270,22 @@ fun BoardScreen(
                     Modifier.fillMaxSize().horizontalScroll(hScroll).padding(horizontal = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    for ((cat, title) in BOARD_CATEGORIES) {
+                    // The client-only Triage lane (XERK-486) leads the strip;
+                    // the four tracker columns follow it unchanged.
+                    for ((cat, title) in (listOf("triage" to "Triage") + BOARD_CATEGORIES)) {
                         // Newest-updated first, matching board.js `ticketSort`; a
-                        // live drag override lands the card in its dropped column.
+                        // live drag override lands the card in its dropped column,
+                        // and (XERK-486) untriaged/held To Do tickets sit in the
+                        // Triage lane unless a live drag overrides them.
                         val cards = shown
                             .flatMap { site -> site.tickets
-                                .filter { boardColumnOf(it, moves[BoardViewModel.startKey(site.siteKey, it.key)]) == cat }
+                                .filter {
+                                    displayColumnOf(
+                                        it,
+                                        moves[BoardViewModel.startKey(site.siteKey, it.key)],
+                                        triageActionOf(fleet.ticketTriageActions, site.siteKey, it.key),
+                                    ) == cat
+                                }
                                 .map { site to it } }
                             .sortedByDescending { it.second.updated }
                         KanbanColumn(
@@ -249,6 +294,7 @@ fun BoardScreen(
                             starts = starts,
                             moves = moves,
                             queue = ticketQueue,
+                            triageActions = fleet.ticketTriageActions,
                             dropTarget = drag != null && drag!!.overCat == cat && drag!!.fromCat != cat,
                             draggingKey = drag?.let { BoardViewModel.startKey(it.site.siteKey, it.ticket.key) },
                             onBounds = { r -> colBounds[cat] = r },
@@ -265,8 +311,7 @@ fun BoardScreen(
                             onDragDelta = { delta ->
                                 drag = drag?.let { d ->
                                     val p = d.pointer + delta
-                                    d.copy(pointer = p,
-                                        overCat = colBounds.entries.firstOrNull { it.value.contains(p) }?.key)
+                                    d.copy(pointer = p, overCat = resolveOver(p))
                                 }
                             },
                             onDragEnd = {
@@ -307,10 +352,23 @@ fun BoardScreen(
     detail?.let { (site, ticket) ->
         // The Agent/Model/Runtime pins live on the fleet payload (hub-owned), not
         // the ticket, so they're resolved here where the fleet state is in scope.
+        // The triage verdict (XERK-486) rides the same payload.
         val pin = com.xerktech.turma.core.agentPinOf(fleet.ticketAgents, site.siteKey, ticket.key)
         val modelPin = com.xerktech.turma.core.modelPinOf(fleet.ticketModels, site.siteKey, ticket.key)
         val runtimePin = com.xerktech.turma.core.runtimePinOf(fleet.ticketRuntimes, site.siteKey, ticket.key)
-        TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, vm, onDismiss = { detail = null })
+        val triageAction = triageActionOf(fleet.ticketTriageActions, site.siteKey, ticket.key)
+        TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, triageAction, vm, onDismiss = { detail = null })
+    }
+
+    // The policy sheet edits the orgs in scope under the header filter — the
+    // web panel's policySites.
+    if (policyOpen && shown.isNotEmpty()) {
+        TriagePolicySheet(
+            shown,
+            initialSiteKey = shown.first().siteKey,
+            vm = vm,
+            onDismiss = { policyOpen = false },
+        )
     }
 }
 
@@ -369,6 +427,7 @@ private fun KanbanColumn(
     starts: Map<String, StartState>,
     moves: Map<String, MoveState>,
     queue: List<QueuedTicket>,
+    triageActions: Map<String, TriageActionPin>,
     dropTarget: Boolean,
     draggingKey: String?,
     onBounds: (Rect) -> Unit,
@@ -397,6 +456,11 @@ private fun KanbanColumn(
             Spacer(Modifier.width(6.dp))
             Text("${cards.size}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
+        if (cat == "triage") {
+            // The web marks the lane with a dashed rule under its header; a thin
+            // solid divider is the phone's read of it.
+            HorizontalDivider(Modifier.padding(top = 4.dp), thickness = 1.dp, color = MaterialTheme.colorScheme.outlineVariant)
+        }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             items(cards, key = { it.second.key }) { (site, t) ->
                 val moveKey = BoardViewModel.startKey(site.siteKey, t.key)
@@ -407,6 +471,7 @@ private fun KanbanColumn(
                     sessions = ticketSessionsOf(sessionIndex, site.siteKey, t.key),
                     start = starts[moveKey],
                     move = moves[moveKey],
+                    triageAction = triageActionOf(triageActions, site.siteKey, t.key),
                     queued = queuedTicketOf(queue, site.siteKey, t.key),
                     dragging = draggingKey == moveKey,
                     onOpenSession = onOpenSession,
@@ -432,6 +497,7 @@ private fun TicketCard(
     sessions: List<TicketSession>,
     start: StartState?,
     move: MoveState?,
+    triageAction: String?,
     queued: QueuedTicket?,
     dragging: Boolean,
     onStart: () -> Unit,
@@ -498,6 +564,22 @@ private fun TicketCard(
                     Pill("due $due", color = if (overdueOf(t, now)) MaterialTheme.colorScheme.error else null)
                 }
                 RepoChip(t)
+                // The operator's triage verdict (XERK-486) — "no verdict" is the
+                // default and renders nothing, matching the web card.
+                triageAction?.let { action ->
+                    Pill(
+                        when (action) {
+                            "approve" -> "✓ approved"
+                            "hold" -> "⏸ held"
+                            else -> "✕ rejected"
+                        },
+                        color = when (action) {
+                            "approve" -> TurmaColors.good
+                            "hold" -> TurmaColors.warning
+                            else -> TurmaColors.critical
+                        },
+                    )
+                }
                 sessions.forEach { s -> TicketSessionChip(s, onClick = { onOpenSession(s) }) }
                 TicketStartControl(t, sessions, start, queued, onStart, onCancelQueued)
                 // A drag in flight / just landed, or a failed one (XERK-141).
@@ -914,6 +996,89 @@ private fun RuntimePicker(
     }
 }
 
+/**
+ * The Triage row of the detail sheet (XERK-486): the operator's per-ticket
+ * verdict — auto (the triage model + the org's policy decide), approve, hold or
+ * reject. Hub-owned like the agent/model/runtime pins, so it needs no online
+ * host; a pick IS the save and the fleet's ticketTriageActions reflects it on
+ * the next beat. Mirrors board.js triageFieldHtml + triagePickerHtml; a refusal
+ * shows inline in the hub's own words (XERK-264), like the Status row.
+ */
+@Composable
+private fun TriageSection(
+    site: BoardSite,
+    t: JiraTicket,
+    action: String?,
+    vm: BoardViewModel,
+) {
+    val scope = rememberCoroutineScope()
+    var pending by remember(t.key) { mutableStateOf<String?>(null) }
+    var error by remember(t.key) { mutableStateOf<String?>(null) }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        SectionLabel("Triage")
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            when {
+                pending != null -> {
+                    Pill(pending!!)
+                    Text("— saving…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                else -> {
+                    TriagePicker(action) { new ->
+                        error = null
+                        pending = triagePickerLabel(new)
+                        scope.launch {
+                            val err = vm.setTicketTriage(site.siteKey, t.key, new)
+                            if (err != null) error = err
+                            pending = null
+                        }
+                    }
+                    if (action != null) {
+                        Text("— set by you", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+        }
+        error?.let {
+            Text("Couldn't save — $it", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+        }
+    }
+}
+
+private fun triagePickerLabel(action: String?): String = when (action) {
+    "approve" -> "✓ approved"
+    "hold" -> "⏸ held"
+    "reject" -> "✕ rejected"
+    else -> "Auto"
+}
+
+/** The triage verdict rendered as the picker; a pick IS the save. "Auto"
+ *  releases the verdict back to the model + the org's policy. */
+@Composable
+private fun TriagePicker(action: String?, onPick: (String?) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        SelectableValue(triagePickerLabel(action), onClick = { open = true })
+        androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text("Auto — triage model + org policy") },
+                onClick = { open = false; onPick(null) },
+            )
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text("Approve — auto-start even if triage/policy say no") },
+                onClick = { open = false; onPick("approve") },
+            )
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text("Hold — never auto-start until released") },
+                onClick = { open = false; onPick("hold") },
+            )
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text("Reject — drop from the auto stream") },
+                onClick = { open = false; onPick("reject") },
+            )
+        }
+    }
+}
+
 /** The agent value rendered as the picker; a pick IS the save, null = auto. */
 @Composable
 private fun AgentPicker(
@@ -1032,6 +1197,7 @@ private fun TicketDetailSheet(
     pin: com.xerktech.turma.model.TicketAgentPin?,
     modelPin: com.xerktech.turma.model.TicketModelPin?,
     runtimePin: com.xerktech.turma.model.TicketRuntimePin?,
+    triageAction: String?,
     vm: BoardViewModel,
     onDismiss: () -> Unit,
 ) {
@@ -1057,6 +1223,7 @@ private fun TicketDetailSheet(
             AgentSection(site, t, pin, vm)
             ModelSection(site, t, modelPin, vm)
             RuntimeSection(site, t, runtimePin, vm)
+            TriageSection(site, t, triageAction, vm)
             val d = detail
             if (d == null) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1342,4 +1509,140 @@ private fun ErrorRow(text: String) {
 @Composable
 private fun DimRow(text: String) {
     Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
+/** The triage types the hub's classifier can emit (agent hub-agent.py TRIAGE_TYPES). */
+private val POLICY_TYPES = listOf("bug", "task", "feature", "improvement", "chore", "documentation", "other")
+
+/**
+ * The per-org triage policy sheet (XERK-486): the knobs the hub's auto-start
+ * sweep applies to an org's To Do tickets after the triage gate. Hub-owned and
+ * durable like the org color pin — the POST is authoritative (200 carries the
+ * merged policy back) and the fleet's triagePolicies reflects it on the next
+ * beat. A port of board.html's policy panel: the same five knobs, the same
+ * rateMax validation, and a full patch (empty knobs send null, which clears
+ * them). The web's dashed-header "panel" becomes a modal sheet on the phone.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TriagePolicySheet(
+    sites: List<BoardSite>,
+    initialSiteKey: String,
+    vm: BoardViewModel,
+    onDismiss: () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    val fleet by vm.fleet.collectAsStateWithLifecycle()
+
+    var siteKey by remember { mutableStateOf(initialSiteKey) }
+    var minPrio by remember { mutableStateOf("") }
+    var excludeTypes by remember { mutableStateOf(setOf<String>()) }
+    var repoAllow by remember { mutableStateOf("") }
+    var repoDeny by remember { mutableStateOf("") }
+    var rateMax by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf("") }
+
+    // Paint the selected org's current knobs (absent policy = all defaults).
+    LaunchedEffect(siteKey) {
+        val p = fleet.triagePolicies[siteKey]
+        minPrio = p?.minPriority ?: ""
+        excludeTypes = p?.excludeTypes?.toSet().orEmpty()
+        repoAllow = (p?.repoAllow.orEmpty()).joinToString(", ")
+        repoDeny = (p?.repoDeny.orEmpty()).joinToString(", ")
+        rateMax = p?.rateMax?.toString() ?: ""
+        error = ""
+    }
+
+    val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet) {
+        Column(
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp, 0.dp, 20.dp, 32.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("Triage policy", style = MaterialTheme.typography.titleMedium)
+            if (sites.size > 1) {
+                CreatePicker(
+                    "Org",
+                    sites.map { it.siteKey to (orgName(it.siteKey, it.orgName) + if (!it.online) " (offline)" else "") },
+                    siteKey,
+                ) { siteKey = it }
+            }
+            Text(
+                "Decides which To Do tickets the org's auto-start sweep queues. " +
+                    "The org's auto-start switch must be on for anything to auto-start; " +
+                    "a per-ticket approve / hold / reject verdict overrides this policy.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            CreatePicker(
+                "Minimum auto-start priority",
+                listOf("" to "Any priority", "P0" to "P0 and higher", "P1" to "P1 and higher", "P2" to "P2 and higher", "P3" to "P3 and higher"),
+                minPrio,
+            ) { minPrio = it }
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("Excluded triage types", style = MaterialTheme.typography.labelLarge)
+                for (type in POLICY_TYPES) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = type in excludeTypes,
+                            onCheckedChange = { on -> excludeTypes = if (on) excludeTypes + type else excludeTypes - type },
+                        )
+                        Text(type, style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+            }
+            OutlinedTextField(
+                repoAllow, { repoAllow = it },
+                label = { Text("Allowed repos (comma-separated, empty = all)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                repoDeny, { repoDeny = it },
+                label = { Text("Denied repos (comma-separated, deny wins)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                rateMax, { rateMax = it },
+                label = { Text("Max auto-starts per 15 min (empty = default)") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            if (error.isNotBlank()) ErrorRow(error)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") }
+                Spacer(Modifier.weight(1f))
+                PrimaryButton(
+                    if (busy) "Saving…" else "Save policy",
+                    enabled = !busy,
+                    onClick = {
+                        val rate = rateMax.trim()
+                        val parsed = rate.toIntOrNull()
+                        val rateErr = rateMaxError(rate)
+                        if (rateErr != null) {
+                            error = rateErr
+                        } else {
+                            busy = true
+                            error = ""
+                            scope.launch {
+                                val err = vm.saveTriagePolicy(
+                                    siteKey,
+                                    minPriority = minPrio.ifBlank { null },
+                                    excludeTypes = excludeTypes.sorted(),
+                                    repoAllow = repoAllow.split(",").map { it.trim() }.filter { it.isNotEmpty() },
+                                    repoDeny = repoDeny.split(",").map { it.trim() }.filter { it.isNotEmpty() },
+                                    rateMax = parsed,
+                                )
+                                busy = false
+                                if (err != null) error = err else onDismiss()
+                            }
+                        }
+                    },
+                )
+            }
+        }
+    }
 }

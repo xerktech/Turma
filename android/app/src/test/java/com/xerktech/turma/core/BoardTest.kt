@@ -13,6 +13,7 @@ import com.xerktech.turma.model.RepoOption
 import com.xerktech.turma.model.StatusOption
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -1027,5 +1028,84 @@ class BoardTest {
         assertTrue(classifyCreateResult(500, null) is CreateResultFetch.Error)
         // A 200 with neither key nor error is an error, not a false success.
         assertTrue(classifyCreateResult(200, CreateResultEnvelope()) is CreateResultFetch.Error)
+    }
+
+    // ---- Triage lane + verdict (XERK-486): parity with board.js
+    // triageActionOf / triageLaneOf / cards[lane || boardColumnOf] ----------------
+
+    @Test fun `triageActionOf reads the hub's siteKey-issueKey-keyed map`() {
+        val actions = mapOf(
+            "org.atlassian.net/X-1" to com.xerktech.turma.model.TriageActionPin(action = "hold", at = 1),
+            "org.atlassian.net/X-2" to com.xerktech.turma.model.TriageActionPin(action = "approve", at = 1),
+            "org.atlassian.net/X-3" to com.xerktech.turma.model.TriageActionPin(action = "reject", at = 1),
+            "org.atlassian.net/X-4" to com.xerktech.turma.model.TriageActionPin(action = "bogus", at = 1),
+            "org.atlassian.net/X-5" to com.xerktech.turma.model.TriageActionPin(),
+        )
+        assertEquals("hold", triageActionOf(actions, "org.atlassian.net", "X-1"))
+        assertEquals("approve", triageActionOf(actions, "org.atlassian.net", "X-2"))
+        assertEquals("reject", triageActionOf(actions, "org.atlassian.net", "X-3"))
+        // Unknown action value and blank action both read as no verdict (auto).
+        assertEquals(null, triageActionOf(actions, "org.atlassian.net", "X-4"))
+        assertEquals(null, triageActionOf(actions, "org.atlassian.net", "X-5"))
+        assertEquals(null, triageActionOf(actions, "org.atlassian.net", "X-9"))
+    }
+
+    @Test fun `triageLaneOf sends untriaged To Do tickets to the triage lane`() {
+        // No triage assessment yet -> the lane.
+        assertEquals("triage", triageLaneOf(ticket("A", "todo"), null))
+        // A triage assessment present -> the normal column.
+        val triaged = ticket("A", "todo").copy(
+            triage = com.xerktech.turma.model.TicketTriage(priority = "P2", type = "task", reason = "x", at = "2026-09-01T00:00:00Z"),
+        )
+        assertEquals(null, triageLaneOf(triaged, null))
+        // Non-To-Do tickets never land in the lane, whatever their state.
+        assertEquals(null, triageLaneOf(ticket("A", "inprogress"), null))
+        assertEquals(null, triageLaneOf(ticket("A", "done"), null))
+        // Null ticket is safe.
+        assertEquals(null, triageLaneOf(null, null))
+    }
+
+    @Test fun `triageLaneOf always wins over triage for held tickets`() {
+        // "hold" moves a triaged To Do ticket back into the lane — the operator's
+        // verdict overrides the agent's assessment, exactly like the web.
+        val triaged = ticket("A", "todo").copy(
+            triage = com.xerktech.turma.model.TicketTriage(priority = "P1", type = "bug", reason = "x", at = "2026-09-01T00:00:00Z"),
+        )
+        assertEquals("triage", triageLaneOf(triaged, "hold"))
+        // Approve/reject keep the ticket in its normal column.
+        assertEquals(null, triageLaneOf(triaged, "approve"))
+        assertEquals(null, triageLaneOf(triaged, "reject"))
+        // A held non-To-Do ticket stays put (the lane is To-Do-only).
+        assertEquals(null, triageLaneOf(ticket("A", "inprogress"), "hold"))
+    }
+
+    @Test fun `displayColumnOf - lane beats category, live drag override beats lane`() {
+        val untriaged = ticket("A", "todo")
+        // No override: the untriaged To Do ticket sits in the Triage lane.
+        assertEquals("triage", displayColumnOf(untriaged, null, null))
+        // Triaged To Do ticket without a verdict: normal To Do column.
+        val triaged = ticket("A", "todo").copy(
+            triage = com.xerktech.turma.model.TicketTriage(priority = "P2", type = "task", reason = "x", at = "2026-09-01T00:00:00Z"),
+        )
+        assertEquals("todo", displayColumnOf(triaged, null, null))
+        // Held: lane again.
+        assertEquals("triage", displayColumnOf(triaged, null, "hold"))
+        // A live drag override always wins — even for a held ticket (mirrors
+        // board.js `mv ? null : triageLaneOf`).
+        assertEquals("inprogress", displayColumnOf(triaged, MoveState("inprogress", pending = true), "hold"))
+        assertEquals("done", displayColumnOf(untriaged, MoveState("done", settled = true), null))
+        // A move in error does not pin the card (reverts to lane/category).
+        assertEquals("triage", displayColumnOf(untriaged, MoveState("done", error = "nope"), null))
+    }
+
+    @Test fun `rateMaxError validates the policy-sheet rate field`() {
+        assertNull(rateMaxError(""))
+        assertNull(rateMaxError("  "))
+        assertNull(rateMaxError("5"))
+        assertNull(rateMaxError("50"))
+        assertEquals("Max auto-starts must be a whole number between 1 and 50 (or empty for the default)", rateMaxError("99"))
+        assertEquals("Max auto-starts must be a whole number between 1 and 50 (or empty for the default)", rateMaxError("0"))
+        assertEquals("Max auto-starts must be a whole number between 1 and 50 (or empty for the default)", rateMaxError("abc"))
+        assertEquals("Max auto-starts must be a whole number between 1 and 50 (or empty for the default)", rateMaxError("-1"))
     }
 }

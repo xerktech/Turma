@@ -289,6 +289,27 @@ interface HubApi {
         @Body body: kotlinx.serialization.json.JsonObject,
     ): OkResponse
 
+    // Set or clear a ticket's triage verdict (XERK-486): approve / hold /
+    // reject, or no verdict. Hub-owned and durable like the other pins, so an
+    // authoritative 200. Body: {action:"<verdict>"} to set, {clear:true} to
+    // release back to auto (triage model + org policy).
+    @POST("api/jira/{siteKey}/{issueKey}/triage")
+    suspend fun setTicketTriage(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): retrofit2.Response<OkResponse>
+
+    // Patch an org's triage policy (XERK-486): the knobs the hub's auto-start
+    // sweep applies after the triage gate. Body is a partial patch — only the
+    // changed keys, a null value clears a knob. 200 {ok, policy} with the
+    // merged policy; the returned policy is authoritative.
+    @POST("api/jira/{siteKey}/triage-policy")
+    suspend fun setTriagePolicy(
+        @Path("siteKey") siteKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): retrofit2.Response<OkResponse>
+
     // Change a ticket's status and push it to the board (XERK-138) — the one
     // thing Turma writes back. Body: {value:"<transition id / state name>"}
     // from the detail's statusOptions. Needs an online host (it's a write);
