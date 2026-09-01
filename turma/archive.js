@@ -120,7 +120,11 @@ const ARCHIVE_TOTAL_MAX = byteCeiling(
 // individually still fill the disk together.
 const ARCHIVE_RAW_TRANSCRIPT_MAX = byteCeiling(
   process.env.ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES, 128 * 1024 * 1024);
-// The most raw files ONE heartbeat's manifest may have stat-ed for its cursors.
+// The per-beat WORK budget for the raw-cursor loop, in TWO terms: one unit per
+// file the manifest offers PLUS one per manifest entry whose row it looks up (the
+// lookup is real work and is charged too — see rawCursors, QA F4). Split into two
+// knobs so each mirrors the agent cap it bounds and their SUM is the true worst
+// case a well-behaved agent presents (XERK-427).
 //
 // `rawCursors` is synchronous and runs on the heartbeat path, and the hub is one
 // event loop — so this spends the same hub-wide-stall budget the store-total walk
@@ -130,13 +134,19 @@ const ARCHIVE_RAW_TRANSCRIPT_MAX = byteCeiling(
 // per beat, per host, with every dashboard, SSE tail and other host's beat queued
 // behind it.
 //
-// The agent caps itself at ARCHIVE_RAW_MANIFEST_FILES_MAX, and that is NOT this
-// bound: a bound the receiving path does not enforce is not a bound (XERK-235).
-// Past it the extra files simply get no cursor, which the agent reads as zero and
-// pushes from the start — refused by `ingestRaw`'s offset check, so the stored
-// data is safe and the cost is one small wasted POST per over-cap file per pass.
-// That only ever happens to an agent already ignoring its own cap.
+// ARCHIVE_RAW_CURSOR_MAX mirrors the agent's ARCHIVE_RAW_MANIFEST_FILES_MAX (2000
+// FILES); ARCHIVE_RAW_CURSOR_LOOKUP_MAX mirrors its ARCHIVE_MANIFEST_MAX (200
+// ENTRIES). The agent's caps are NOT this bound — a bound the receiving path does
+// not enforce is not a bound (XERK-235). Past the SUM the extra offers get no
+// cursor, which the agent reads as zero and pushes from the start — refused by
+// `ingestRaw`'s offset check, so the stored data is safe and the cost is one small
+// wasted POST per over-budget file per pass. Sizing the budget for FILES alone (the
+// pre-XERK-427 bug) charged the N entry lookups against it as well and truncated an
+// in-cap agent by exactly its transcript count N — silently dropping the very
+// backlog slice XERK-424 reserves. With the budget sized to the SUM, an agent
+// inside its own caps never reaches it.
 const ARCHIVE_RAW_CURSOR_MAX = positiveEnvInt("ARCHIVE_RAW_CURSOR_MAX", 2000);
+const ARCHIVE_RAW_CURSOR_LOOKUP_MAX = positiveEnvInt("ARCHIVE_RAW_CURSOR_LOOKUP_MAX", 200);
 // The same bound for the RENDERED layer's manifest, which is the costlier of the
 // two (a SELECT + an INSERT per entry, against one stat). The agent sends at most
 // ARCHIVE_MANIFEST_MAX (200); this is generous headroom over that and still ~35x
@@ -940,9 +950,12 @@ function rawCursors(manifest) {
   openDb();
   const out = {};
   // Bounded across the WHOLE manifest, not per transcript — see
-  // ARCHIVE_RAW_CURSOR_MAX. The manifest arrives newest-transcript-first, so a
-  // truncation drops the oldest history rather than the live sessions.
-  let budget = ARCHIVE_RAW_CURSOR_MAX;
+  // ARCHIVE_RAW_CURSOR_MAX. Sized for BOTH terms an in-cap agent presents: its
+  // ARCHIVE_RAW_MANIFEST_FILES_MAX files plus its ARCHIVE_MANIFEST_MAX entry
+  // lookups, so a well-behaved agent is never truncated (XERK-427). The manifest
+  // arrives newest-transcript-first, so a truncation of a MISBEHAVING agent drops
+  // the oldest history rather than the live sessions.
+  let budget = ARCHIVE_RAW_CURSOR_MAX + ARCHIVE_RAW_CURSOR_LOOKUP_MAX;
   let dropped = 0;
   // Prepared ONCE. It was recompiled per iteration inside the loop below.
   const lookup = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?");
@@ -1001,9 +1014,11 @@ function warnRawCursorCap(dropped) {
   if (now - lastRawCursorWarnAt < 60 * 60 * 1000) return;
   lastRawCursorWarnAt = now;
   console.error(
-    `archive: a manifest offered more than ${ARCHIVE_RAW_CURSOR_MAX} raw files ` +
-    `(ARCHIVE_RAW_CURSOR_MAX); ${dropped} got no cursor this beat. An agent inside ` +
-    `its own limits never reaches this — check that host's ARCHIVE_RAW_* config.`);
+    `archive: a manifest's raw cursors exceeded the per-beat work budget ` +
+    `(${ARCHIVE_RAW_CURSOR_MAX} files + ${ARCHIVE_RAW_CURSOR_LOOKUP_MAX} lookups, ` +
+    `ARCHIVE_RAW_CURSOR_MAX/ARCHIVE_RAW_CURSOR_LOOKUP_MAX); ${dropped} got no cursor ` +
+    `this beat. An agent inside its own limits never reaches this — check that ` +
+    `host's ARCHIVE_RAW_* config.`);
 }
 
 /**
@@ -1586,7 +1601,8 @@ function dshTrajectory(transcriptId) {
 module.exports = {
   ARCHIVE_DIR, ARCHIVE_DB, ARCHIVE_TRANSCRIPT_MAX, ARCHIVE_TOTAL_MAX,
   dshTrajectory, dshEventsFile,
-  ARCHIVE_RAW_TRANSCRIPT_MAX, ARCHIVE_RAW_CURSOR_MAX, ARCHIVE_MANIFEST_CURSOR_MAX,
+  ARCHIVE_RAW_TRANSCRIPT_MAX, ARCHIVE_RAW_CURSOR_MAX, ARCHIVE_RAW_CURSOR_LOOKUP_MAX,
+  ARCHIVE_MANIFEST_CURSOR_MAX,
   RAW_DIR_SUFFIX,
   slugify, archiveRelPath, resolveNewRelPath, __RELPATH_PROBE_MAX: RELPATH_PROBE_MAX,
   ftsQuery, byteCeiling, shedFilePayloads,

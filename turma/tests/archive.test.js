@@ -517,14 +517,17 @@ test("the per-beat cursor stat loop is bounded by the HUB, not by the agent", ()
   // The budget covers the manifest ENTRY's row lookup as well as the per-file
   // stats — charging only the files left the outer loop free, which just moved
   // the stall (QA F4). Held deterministically rather than by wall clock: with a
-  // cap of 3, one entry lookup plus two stats spends it, so the THIRD stored
-  // file gets no cursor even though it is on disk.
+  // FILE budget of 2 and a LOOKUP budget of 1, one entry lookup plus two stats
+  // spends the sum, so the THIRD stored file gets no cursor even though it is on
+  // disk. Sizing the two knobs separately is XERK-427 (below); this proves the
+  // lookup is still charged, so the loop stays bounded.
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-statcap-"));
     process.env.ARCHIVE_DIR = path.join(tmp, "archive");
     process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
-    process.env.ARCHIVE_RAW_CURSOR_MAX = "3";
+    process.env.ARCHIVE_RAW_CURSOR_MAX = "2";
+    process.env.ARCHIVE_RAW_CURSOR_LOOKUP_MAX = "1";
     const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
     const meta = { repo: "r", endedTs: "2026-08-18T00:00:00Z", summary: "s" };
     a.ingestChunk("nas", "cap", meta, 0, 10, [{ uuid: "u", role: "user", text: "hi" }]);
@@ -540,6 +543,46 @@ test("the per-beat cursor stat loop is bounded by the HUB, not by the agent", ()
   // And the truncation is LOUD: silence would read as "the hub holds nothing",
   // which is a re-ship rather than a refusal.
   assert.match(fresh.stderr, /ARCHIVE_RAW_CURSOR_MAX/);
+});
+
+test("an in-cap agent keeps every cursor even with files spread across transcripts (XERK-427)", () => {
+  // The per-entry lookup and the per-file stat used to share ONE budget sized to
+  // the FILE cap alone, so N files spread across N transcripts cost N + files and
+  // overran by exactly N — the last N offers got no cursor though the agent was
+  // inside its own ARCHIVE_RAW_MANIFEST_FILES_MAX. The lookups now have their own
+  // term, so a well-behaved agent is never truncated. Set the FILE budget to the
+  // exact file count (4) and leave the lookup budget at its default: under the old
+  // single-budget-of-4 arithmetic the two lookups would eat into it and the SECOND
+  // transcript's files would be dropped; both transcripts' files must survive now.
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-cursor427-"));
+    process.env.ARCHIVE_DIR = path.join(tmp, "archive");
+    process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
+    process.env.ARCHIVE_RAW_CURSOR_MAX = "4";        // exactly the 4 files offered
+    delete process.env.ARCHIVE_RAW_CURSOR_LOOKUP_MAX; // default (200) covers the 2 lookups
+    const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
+    const meta = { repo: "r", endedTs: "2026-08-18T00:00:00Z", summary: "s" };
+    for (const tid of ["t1", "t2"]) {
+      a.ingestChunk("nas", tid, meta, 0, 10, [{ uuid: "u", role: "user", text: "hi" }]);
+      for (const r of ["a.jsonl", "b.jsonl"]) a.ingestRaw("nas", tid, r, 0, Buffer.from("xx"));
+    }
+    const out = a.rawCursors([
+      { transcriptId: "t1", rawFiles: [["a.jsonl", 2], ["b.jsonl", 2]] },
+      { transcriptId: "t2", rawFiles: [["a.jsonl", 2], ["b.jsonl", 2]] },
+    ]) || {};
+    console.log(JSON.stringify({
+      t1: Object.keys(out.t1 || {}).sort(),
+      t2: Object.keys(out.t2 || {}).sort(),
+    }));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const got = JSON.parse(fresh.stdout.trim().split("\n").pop());
+  assert.deepEqual(got.t1, ["a.jsonl", "b.jsonl"], "t1 lost a cursor");
+  assert.deepEqual(got.t2, ["a.jsonl", "b.jsonl"],
+    "t2 was truncated — the entry lookups ate the file budget (the XERK-427 bug)");
+  // No truncation happened, so the over-budget warning must NOT have fired.
+  assert.doesNotMatch(fresh.stderr, /got no cursor/);
 });
 
 test("two transcripts that would collide on 8 alnum chars get separate canonical files (XERK-277)", () => {
@@ -733,13 +776,16 @@ test("the cursor budget is charged for REJECTED paths and unknown ids too", () =
   // The budget bounds WORK, and validating a path costs work — a max-length
   // depth-10 path failing on its last character measured 700 ms per 780k entries.
   // Charging only what survives validation (or only what resolves to a row) left
-  // the cap walk-around-able and just moved the stall (QA D4/F4).
+  // the cap walk-around-able and just moved the stall (QA D4/F4). The lookup term
+  // is what bounds unknown ids (they resolve to no row, so they cost a lookup and
+  // no stats); set it so the 4 total lookups exhaust the SUM before the real file.
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-charge-"));
     process.env.ARCHIVE_DIR = path.join(tmp, "archive");
     process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
-    process.env.ARCHIVE_RAW_CURSOR_MAX = "4";
+    process.env.ARCHIVE_RAW_CURSOR_MAX = "1";
+    process.env.ARCHIVE_RAW_CURSOR_LOOKUP_MAX = "3";  // sum = 4: three unknown + one real lookup
     const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
     const meta = { repo: "r", endedTs: "2026-08-18T00:00:00Z", summary: "s" };
     a.ingestChunk("nas", "chg", meta, 0, 10, [{ uuid: "u", role: "user", text: "hi" }]);
