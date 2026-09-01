@@ -43,10 +43,16 @@
      of the clickable area so tapping it doesn't collapse the card. */
   .host-name { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
     cursor: pointer; background: none; border: 0; padding: 0; text-align: left; color: inherit; font: inherit; }
+  .host-name .host-name-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
   .host-name h3 { font-size: 15px; margin: 0; font-weight: 600; word-break: break-all; }
   /* The host's Jira org, alongside the hostname: a descriptor of the row, not a
      second name for it, so it reads lighter than the hostname it follows. */
   .host-name h3 .host-org { color: var(--muted); font-weight: 500; }
+  /* Agent + Turma version under the hostname, shown while the card is COLLAPSED
+     so the header still tells you what a host runs and at what version without
+     expanding it (XERK-539, matching the Android card's collapsed header). When
+     expanded the fuller `.host-meta` row carries the same facts. */
+  .host-name .host-ver { color: var(--muted); font-size: 12px; font-weight: 400; word-break: break-word; }
   .host-name .caret { color: var(--muted); font-size: 11px; flex-shrink: 0; transition: transform 0.15s; }
   .host-card.collapsed .host-name .caret { transform: rotate(-90deg); }
   /* Claude subscription-login health chip (XERK-98) — only ever rendered when
@@ -637,6 +643,13 @@ function codingAgent(a) {
   const m = raw.match(/^(\S+)\s+\((.+)\)$/);
   return m ? `${m[2]} ${m[1]}` : `Claude Code ${raw}`;
 }
+// The one-line "what this host runs, at what version" summary for a COLLAPSED
+// host header (XERK-539): the coding agent and its version, plus the Turma agent
+// version — the same two facts Android shows in its collapsed card header. The
+// expanded card repeats them in `.host-meta` alongside memory/uptime/repos root.
+function hostVerLine(a) {
+  return `${codingAgent(a)} · Turma ${a.agentVersion || "–"}`;
+}
 // Claude subscription-login health chip for a host header (XERK-98): a red chip
 // when the login has lapsed (sessions can't authenticate) and an amber one when
 // it's about to. Nothing when the login is healthy, or when an older agent
@@ -1116,7 +1129,10 @@ function hostCard(a, now) {
       <button class="host-name" onclick="hostToggle('${escJs(a.key)}')"
           aria-expanded="${collapsed ? "false" : "true"}" title="${collapsed ? "Expand" : "Collapse"} host">
         <span class="caret">▼</span>
-        <h3>${esc(a.key)}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
+        <span class="host-name-text">
+          <h3>${esc(a.key)}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
+          ${collapsed ? `<span class="host-ver">${esc(hostVerLine(a))}</span>` : ""}
+        </span>
       </button>
       ${collapsedMeta}
       ${boardHealthBadge(a)}
