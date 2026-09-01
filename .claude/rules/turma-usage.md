@@ -152,7 +152,8 @@ paths:
   (`repoBlocks`/`isSystemUsageRepo` in `usage-ledger.js`) instead of listing dozens of phantom repos
   on "By repo". The class is the manager's own `claude -p` helpers (naming/triage/probe, cwd under a
   temp `REGISTRY_DIR`) that a recover run banked here — `hub-agent-mgr-<rand>` names / their
-  `-tmp-hub-agent-mgr-` slugs / `.turma`.
+  `-tmp-hub-agent-mgr-` slugs / any LEADING-DOT name (`.turma`, `.switchboard`; `scan_repos` skips
+  dot-dirs so a live agent never reports one).
 - **Hub-side analogue of `hub-agent.py`'s `_sanitize_junk_repo_entries`** — those fold the same class
   into `(root)` on the AGENT's ledger, which can NEVER reach this durable HUB store, so a phantom
   already banked here (recover tool, or an agent predating those sanitizers) needs a hub-side fold.
@@ -165,7 +166,8 @@ paths:
 - **DISTINCT repos are ADDITIVE** in the fold (`addUsageBlock`), unlike the per-day high-water raise a
   single series takes across its OWN reports. Client `repoSeries` then merges every host's system
   block into one cross-fleet line, so no client change is needed (parity-exempt: an ordinary block).
-- **The structural signatures (`hub-agent-mgr-*`/slug, `.turma`) can never name a real repo**;
+- **The structural signatures (`hub-agent-mgr-*`/slug, any leading-dot name) can never name a real
+  repo** (`scan_repos` skips dot-dirs; a normalized git origin never starts with `.`);
   host-specific junk (a home-dir username, `git`, `tmp` the recover tool slugified from an orphan cwd)
   is OPERATOR-CONFIGURED via `USAGE_SYSTEM_REPOS` (CSV) after confirming from the archive it is not
   real work — "reattribute the real ones, fold the rest". Tests: the system-usage cases in

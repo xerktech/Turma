@@ -120,7 +120,8 @@ const LEDGER_NAME_MAX = positiveEnv("USAGE_LEDGER_NAME_MAX", 200);
 // limits probes) run with cwd under a temp REGISTRY_DIR, and when a test/verify
 // harness boots the manager they land in ~/.claude/projects under a
 // worktree-shaped-but-not-real slug (`…-tmp-hub-agent-mgr-<rand>`, repo name
-// `hub-agent-mgr-<rand>`) — plus `.turma`, the agent's own home dir. A
+// `hub-agent-mgr-<rand>`) — plus any LEADING-DOT name (`.turma`, `.switchboard`,
+// …), which `scan_repos()` skips so a live agent never reports one. A
 // `recover-usage-from-archive` run banked a fleet of these here as phantom repo
 // series (its README predicts "45 hub-agent-mgr-* scratch slugs … bare names no
 // live report can produce"), so the Usage page's "By repo" view listed dozens of
@@ -160,7 +161,11 @@ const HUB_AGENT_MGR_RE = /^hub-agent-mgr-|(?:^|-)tmp-hub-agent-mgr-/;
 function isSystemUsageRepo(remoteKey, repo) {
   for (const v of [remoteKey, repo]) {
     if (!v || typeof v !== "string") continue;
-    if (v === ".turma" || HUB_AGENT_MGR_RE.test(v) || SYSTEM_USAGE_EXTRA.has(v)) return true;
+    // A LEADING-DOT name (`.turma`, `.switchboard`, …) can never be a real repo:
+    // `scan_repos()` skips every dot-dir, so a live agent never reports one, and
+    // a normalized git origin (the real-repo remoteKey) never starts with `.`.
+    // Only the recover tool / an orphan cwd slug produces one here.
+    if (v.startsWith(".") || HUB_AGENT_MGR_RE.test(v) || SYSTEM_USAGE_EXTRA.has(v)) return true;
   }
   return false;
 }
