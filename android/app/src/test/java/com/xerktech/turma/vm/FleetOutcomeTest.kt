@@ -35,11 +35,11 @@ class FleetOutcomeTest {
 
     private val host = "nas01"
 
-    private fun spawnAnd(read: () -> String?): String {
+    private fun spawn(): String {
         val vm = FleetViewModel(hub.app)
-        val seen = hub.collectMessages(vm.messages)
+        val message = hub.expectMessage(vm.messages)
         vm.spawn(host = host, repo = "Turma", modelSource = "local")
-        return hub.awaitValue { seen.firstOrNull() ?: read() }
+        return message()
     }
 
     /** The hub's own words, taken from the body of its refusal. */
@@ -48,7 +48,7 @@ class FleetOutcomeTest {
         hub.route("/api/agents/$host/sessions") {
             HubHarness.refusal("host has no local model configured")
         }
-        val msg = spawnAnd { null }
+        val msg = spawn()
         assertTrue(
             "reported \"$msg\" instead of the hub's own reason",
             msg.contains("no local model configured"),
@@ -64,7 +64,7 @@ class FleetOutcomeTest {
     @Test
     fun `a 200 carrying an error is not reported as queued`() {
         hub.json("/api/agents/$host/sessions", """{"ok":false,"error":"repo is not cloned here"}""")
-        val msg = spawnAnd { null }
+        val msg = spawn()
         assertTrue("reported \"$msg\"", msg.contains("repo is not cloned here"))
     }
 
@@ -77,7 +77,7 @@ class FleetOutcomeTest {
         hub.route("/api/agents/$host/sessions") {
             MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_START)
         }
-        val msg = spawnAnd { null }
+        val msg = spawn()
         assertTrue("reported \"$msg\"", msg.contains("unreachable") || msg.startsWith("✗"))
     }
 
@@ -85,7 +85,7 @@ class FleetOutcomeTest {
     @Test
     fun `an accepted spawn reports queued`() {
         hub.json("/api/agents/$host/sessions", """{"ok":true}""")
-        val msg = spawnAnd { null }
+        val msg = spawn()
         assertTrue("reported \"$msg\"", msg.startsWith("✓"))
     }
 }

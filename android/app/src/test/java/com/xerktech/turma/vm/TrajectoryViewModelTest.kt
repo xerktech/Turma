@@ -48,7 +48,7 @@ class TrajectoryViewModelTest {
         hub.json("/api/dsh/$tid/trajectory", trajectoryJson)
         val vm = TrajectoryViewModel(hub.app)
         vm.load(tid)
-        val d = hub.awaitValue { vm.state.value.data }
+        val d = hub.awaitFlow(vm.state) { it.data != null }.data!!
         assertEquals("my dsh session", d.title)
         assertEquals(2, d.totals.turns)
         assertEquals(1, d.totals.toolCalls)
@@ -65,7 +65,7 @@ class TrajectoryViewModelTest {
         hub.json("/api/dsh/$tid/trajectory", """{"error":"no dsh trajectory for this session"}""", code = 404)
         val vm = TrajectoryViewModel(hub.app)
         vm.load(tid)
-        hub.awaitValue { if (vm.state.value.loading) null else Unit }
+        hub.awaitFlow(vm.state) { !it.loading }
         assertTrue("a 404 must read as not-synced-yet", vm.state.value.notSynced)
         assertNull("a 404 is not an error", vm.state.value.error)
         assertNull(vm.state.value.data)
@@ -76,7 +76,7 @@ class TrajectoryViewModelTest {
         hub.json("/api/dsh/$tid/trajectory", """{"error":"boom"}""", code = 500)
         val vm = TrajectoryViewModel(hub.app)
         vm.load(tid)
-        val err = hub.awaitValue { vm.state.value.error }
+        val err = hub.awaitFlow(vm.state) { it.error != null }.error!!
         assertTrue("the HTTP status should be surfaced", err.contains("500"))
         assertTrue(!vm.state.value.notSynced)
     }
@@ -90,7 +90,7 @@ class TrajectoryViewModelTest {
         hub.json("/api/dsh/$tid/trajectory", """{"error":"not yet"}""", code = 404)
         val vm = TrajectoryViewModel(hub.app)
         vm.load(tid)
-        hub.awaitValue { if (vm.state.value.loading) null else Unit }
+        hub.awaitFlow(vm.state) { !it.loading }
         assertTrue(vm.state.value.notSynced)
 
         // The log has since synced — but a NON-force reload of the same id is a
@@ -102,7 +102,7 @@ class TrajectoryViewModelTest {
 
         // ↻ Refresh (force=true) is the retry path, and it does re-fetch.
         vm.load(tid, force = true)
-        val d = hub.awaitValue { vm.state.value.data }
+        val d = hub.awaitFlow(vm.state) { it.data != null }.data!!
         assertEquals("my dsh session", d.title)
         assertTrue(!vm.state.value.notSynced)
     }
