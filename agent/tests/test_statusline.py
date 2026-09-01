@@ -98,6 +98,103 @@ class TestWriteSnapshot(unittest.TestCase):
         self.assertFalse(sl.write_snapshot({"capturedAt": NOW}, "/proc/nope/limits.json"))
 
 
+class TestCarryWindowHighWater(unittest.TestCase):
+    """A window's used percentage only rises until it resets, so a reading that
+    DROPS while the window has not reset (same resets_at) is spurious — Claude
+    Code 2.1.x hands the statusLine an intermittent 0. carry_window_high_water
+    floors each window at the highest value seen for that window instance."""
+
+    def _prior(self, tmp, snap):
+        path = os.path.join(tmp, "limits.json")
+        with open(path, "w") as fh:
+            json.dump(snap, fh)
+        return path
+
+    def test_a_spurious_drop_within_a_window_is_floored_to_the_prior_high(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._prior(tmp, {
+                "sevenDay": {"usedPct": 14.0, "resetsAt": 1_786_950_000},
+                "fiveHour": {"usedPct": 30.0, "resetsAt": 1_786_405_200},
+                "capturedAt": NOW - 1800,
+            })
+            # A later probe reads 0 for BOTH, same reset stamps — impossible for a
+            # window 130h from reset, so both are floored back up.
+            snap = sl.build_snapshot(payload(
+                five_hour={"used_percentage": 0, "resets_at": 1_786_405_200},
+                seven_day={"used_percentage": 0, "resets_at": 1_786_950_000},
+            ), now=NOW)
+            sl.carry_window_high_water(snap, path)
+            self.assertEqual(snap["sevenDay"]["usedPct"], 14.0)
+            self.assertEqual(snap["fiveHour"]["usedPct"], 30.0)
+
+    def test_a_genuine_reset_is_not_floored(self):
+        # A NEW reset stamp is a new window instance; dropping to ~0 there is real
+        # (a 5-hour window that just rolled over), so the floor must not cross it.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._prior(tmp, {
+                "fiveHour": {"usedPct": 30.0, "resetsAt": 1_786_405_200},
+                "capturedAt": NOW - 1800,
+            })
+            snap = sl.build_snapshot(payload(
+                five_hour={"used_percentage": 1, "resets_at": 1_786_405_200 + 18000},
+            ), now=NOW)
+            sl.carry_window_high_water(snap, path)
+            self.assertEqual(snap["fiveHour"]["usedPct"], 1.0)
+
+    def test_a_legitimate_rise_passes_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._prior(tmp, {
+                "sevenDay": {"usedPct": 14.0, "resetsAt": 1_786_950_000}, "capturedAt": NOW - 60})
+            snap = sl.build_snapshot(payload(
+                seven_day={"used_percentage": 22, "resets_at": 1_786_950_000}), now=NOW)
+            sl.carry_window_high_water(snap, path)
+            self.assertEqual(snap["sevenDay"]["usedPct"], 22.0)
+
+    def test_no_reset_stamp_cannot_be_matched_so_is_not_floored(self):
+        # Without a reset stamp there is no way to tell a reset from a drop.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._prior(tmp, {"sevenDay": {"usedPct": 14.0}, "capturedAt": NOW - 60})
+            snap = sl.build_snapshot(payload(seven_day={"used_percentage": 0}), now=NOW)
+            sl.carry_window_high_water(snap, path)
+            self.assertEqual(snap["sevenDay"]["usedPct"], 0.0)
+
+    def test_no_prior_or_garbage_prior_never_raises_and_leaves_the_reading(self):
+        snap = sl.build_snapshot(payload(
+            seven_day={"used_percentage": 0, "resets_at": 1_786_950_000}), now=NOW)
+        # No file at all.
+        sl.carry_window_high_water(dict(snap), os.path.join("/nonexistent-dir", "x.json"))
+        with tempfile.TemporaryDirectory() as tmp:
+            for junk in ("not json", json.dumps(["a", "list"]), json.dumps("a string")):
+                path = os.path.join(tmp, "limits.json")
+                with open(path, "w") as fh:
+                    fh.write(junk)
+                out = sl.carry_window_high_water(sl.build_snapshot(payload(
+                    seven_day={"used_percentage": 0, "resets_at": 1_786_950_000}), now=NOW), path)
+                self.assertEqual(out["sevenDay"]["usedPct"], 0.0)
+
+    def test_an_oversize_prior_file_is_ignored_not_read_whole(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "limits.json")
+            with open(path, "w") as fh:
+                fh.write(" " * (sl.PREV_READ_MAX + 1))
+            snap = sl.build_snapshot(payload(
+                seven_day={"used_percentage": 0, "resets_at": 1_786_950_000}), now=NOW)
+            sl.carry_window_high_water(snap, path)
+            self.assertEqual(snap["sevenDay"]["usedPct"], 0.0)
+
+    def test_main_flow_floors_before_writing(self):
+        # End to end: a good snapshot on disk, then a payload reporting a spurious
+        # 0 for the same window — the WRITTEN file keeps the good value.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._prior(tmp, {
+                "sevenDay": {"usedPct": 14.0, "resetsAt": 1_786_950_000}, "capturedAt": NOW - 1800})
+            snap = sl.build_snapshot(payload(
+                seven_day={"used_percentage": 0, "resets_at": 1_786_950_000}), now=NOW)
+            sl.write_snapshot(sl.carry_window_high_water(snap, path), path)
+            with open(path) as fh:
+                self.assertEqual(json.load(fh)["sevenDay"]["usedPct"], 14.0)
+
+
 class TestStatusText(unittest.TestCase):
     def test_renders_both_windows_with_countdowns(self):
         snap = sl.build_snapshot(payload(
