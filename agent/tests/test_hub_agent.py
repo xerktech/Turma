@@ -15463,6 +15463,107 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
             [r["sessionId"] for r in payload["historyResults"]], ["s1", "s2"],
         )
 
+    def test_a_bookkeeping_bug_does_not_discard_the_delivered_reply(self):
+        """XERK-299: the beat was DELIVERED (a 200 that parsed), so a bug in the
+        post-delivery clears must NOT read as a failed beat. The old code ran the
+        clears inside the transport try under a blanket except, so a late raise
+        returned None — discarding the reply and its command queue (a ~20s stall)
+        AND leaving staged work half-cleared. Now the reply is returned
+        regardless."""
+        sm = self.make_manager()
+        sm.history_results.append({"sessionId": "s1", "entries": [], "truncated": False})
+        payload = sm.build_payload(0)
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, *a):
+                return b'{"commands": [{"cmdId": "c1"}]}'
+
+        boom = mock.Mock(side_effect=RuntimeError("bookkeeping blew up"))
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                                return_value=FakeResp()), \
+                mock.patch.object(sm, "_clear_delivered_staged", boom):
+            reply = sm.post(payload)
+        # The delivered reply (with its commands) survives the bookkeeping bug.
+        self.assertEqual(reply, {"commands": [{"cmdId": "c1"}]})
+        # A delivered beat still resets the failure counter — it is set ahead of
+        # the bookkeeping precisely so a bug there cannot skip it.
+        self.assertEqual(sm._beat_failures, 0)
+        boom.assert_called_once()
+
+    def test_delivered_clears_are_atomic_never_half_done(self):
+        """XERK-299: the beat-only collections are cleared off a single list
+        built BEFORE any mutation, so a missing/renamed attribute aborts the
+        whole clear rather than emptying some collections and leaving the rest."""
+        sm = self.make_manager()
+        sm.history_results.append({"sessionId": "s1", "entries": [], "truncated": False})
+        sm.ticket_link_results.append({"cmdId": "x"})
+        payload = sm.build_payload(0)
+        # Simulate a renamed/removed collection: the list build must raise before
+        # any .clear() runs.
+        del sm.ticket_link_results
+        with self.assertRaises(AttributeError):
+            sm._clear_delivered_staged(payload)
+        # Nothing was half-cleared — the earlier collection is untouched.
+        self.assertEqual(len(sm.history_results), 1)
+
+    def test_a_non_value_error_parse_failure_returns_None_not_crash(self):
+        """XERK-299 regression guard: splitting the reply parse out of the
+        transport try must keep its safety net. A deeply nested reply raises
+        RecursionError (a RuntimeError, NOT a ValueError), which must read as an
+        unreadable reply (None) so staged work is kept for a retry — never escape
+        post() and crash the beat loop as it would with no catch."""
+        sm = self.make_manager()
+        sm.history_results.append({"sessionId": "s1", "entries": [], "truncated": False})
+        payload = sm.build_payload(0)
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, *a):
+                return b"[[[deeply nested]]]"
+
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                                return_value=FakeResp()), \
+                mock.patch.object(ha.json, "loads",
+                                  side_effect=RecursionError("too deep")):
+            reply = sm.post(payload)
+        self.assertIsNone(reply)
+        self.assertEqual(len(sm.history_results), 1)
+
+    def test_delivered_clears_empty_every_staged_collection(self):
+        """The happy path of _clear_delivered_staged: on delivery every beat-only
+        collection is emptied, and only the spawn_failures entries THIS payload
+        carried are removed (by identity, XERK-397)."""
+        sm = self.make_manager()
+        for name in ("history_results", "subagent_history_results",
+                     "jira_issue_results", "ticket_status_results",
+                     "create_meta_results", "create_ticket_results",
+                     "ticket_priority_results", "ticket_link_results"):
+            getattr(sm, name).append({"cmdId": name})
+        delivered = {"migrationId": "m1"}
+        late = {"migrationId": "m2"}
+        sm.spawn_failures[:] = [delivered]
+        payload = {"spawnFailures": [delivered]}
+        # A second refusal lands after the snapshot; it must survive the clear.
+        sm.spawn_failures.append(late)
+        sm._clear_delivered_staged(payload)
+        for name in ("history_results", "subagent_history_results",
+                     "jira_issue_results", "ticket_status_results",
+                     "create_meta_results", "create_ticket_results",
+                     "ticket_priority_results", "ticket_link_results"):
+            self.assertEqual(getattr(sm, name), [], name)
+        self.assertEqual(sm.spawn_failures, [late])
+
 
 class TestStagedHistoryCeiling(ManagerMixin, unittest.TestCase):
     """XERK-347: a beat that the hub refuses as too large is the ONE failure
