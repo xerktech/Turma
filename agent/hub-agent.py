@@ -25177,9 +25177,58 @@ class SessionManager:
         for urls in self.pending_prs.values():
             urls.clear()
 
+    def _clear_delivered_staged(self, payload):
+        """Clear every piece of staged work a DELIVERED beat carried — once, and
+        atomically (XERK-299).
+
+        Called only after transport + parse have returned, and OUTSIDE post()'s
+        transport try: a bug here must not read as a failed beat (which discards
+        the reply and re-sends the whole command queue) and must not half-clear.
+        The beat-only collections are gathered into a list FIRST, so a missing or
+        renamed attribute raises while naming it — before any .clear() runs —
+        rather than emptying some and leaving the rest. Adding a field to the
+        list therefore cannot half-clear.
+
+        pending_prs is a nested clear, not a bare .clear(), so it stays its own
+        call. spawn_failures has an OFF-BEAT writer (the migration export thread,
+        XERK-397), so it can't blanket-clear: only the entries THIS payload
+        delivered are removed, by identity, leaving any the thread appended since
+        the snapshot for the next beat."""
+        # All delivered by this beat, same lifecycle. Built before any mutation
+        # so a bad attribute name aborts the whole clear, never half of it.
+        collections = [
+            self.history_results,
+            self.subagent_history_results,
+            self.jira_issue_results,
+            self.ticket_status_results,
+            self.create_meta_results,
+            self.create_ticket_results,
+            self.ticket_priority_results,
+            self.ticket_link_results,
+        ]
+        self._clear_pending_prs()
+        for coll in collections:
+            coll.clear()
+        staged = payload.get("spawnFailures")
+        if staged:
+            delivered = {id(x) for x in staged}
+            with self._spawn_failures_lock:
+                self.spawn_failures[:] = [
+                    x for x in self.spawn_failures if id(x) not in delivered]
+
     def post(self, payload):
         """POST one heartbeat. Returns the parsed reply dict, or None on failure
-        (pending PR links are kept so they aren't lost on a failed beat)."""
+        (staged work is kept so it isn't lost on a failed beat).
+
+        Transport, reply-parse and post-delivery bookkeeping are THREE distinct
+        failures. Only the first two return None — the beat did not land. Once
+        the reply parses the beat is DELIVERED (the hub stamped a fresh
+        lastSeen), so the bookkeeping that clears staged work runs OUTSIDE the
+        transport try (XERK-299): a bug there must not be reported as a failed
+        beat, which would BOTH discard the reply (dropping this beat's commands,
+        stalling the loop ~20s) AND leave staged work half-cleared. It is logged
+        and the reply returned regardless; the clears are atomic (see
+        _clear_delivered_staged)."""
         try:
             # Explicit User-Agent: TURMA_URL rides the Cloudflare tunnel, and
             # Cloudflare's Browser Integrity Check 403s (error 1010) the default
@@ -25209,48 +25258,6 @@ class SessionManager:
                 # process's memory ceiling too. The hub caps the roster; this is
                 # the independent backstop on the receiving side.
                 raw = resp.read(HEARTBEAT_REPLY_MAX)
-            # The parse is its OWN failure, distinct from the transport failure
-            # the outer handler catches (XERK-365). The hub answered — 200, a
-            # body in hand — so this is "the hub said something we could not
-            # read" (a truncated read past HEARTBEAT_REPLY_MAX, or a malformed/
-            # hostile body), NOT "the hub never answered". Conflated, the agent
-            # could never tell a broken reply from an unreachable hub, and a
-            # single unparseable reply read as a dead host to its operator. A
-            # huge integer literal no longer lands here — sys.set_int_max_str_
-            # digits above lets the bounded reply parse — so this branch is now
-            # only truncation or genuinely malformed JSON.
-            try:
-                reply = json.loads(raw.decode() or "{}")
-            except (ValueError, UnicodeDecodeError) as e:
-                log(f"heartbeat reply could not be parsed ({len(raw)} bytes, "
-                    f"HTTP 200): {e}")
-                self._note_beat_failure()
-                return None
-            self._note_body_max(reply)
-            # The ARCHIVE route's own ceiling, off the same reply and before
-            # _archive_deltas runs on it (XERK-356).
-            self._note_archive_chunk_max(reply)
-            self._beat_failures = 0
-            self._clear_pending_prs()  # delivered
-            self.history_results.clear()  # delivered — same lifecycle
-            self.subagent_history_results.clear()  # delivered — same lifecycle
-            self.jira_issue_results.clear()  # delivered — same lifecycle
-            self.ticket_status_results.clear()  # delivered — same lifecycle
-            self.create_meta_results.clear()  # delivered — same lifecycle
-            self.create_ticket_results.clear()  # delivered — same lifecycle
-            self.ticket_priority_results.clear()  # delivered — same lifecycle
-            self.ticket_link_results.clear()  # delivered — same lifecycle
-            # spawn_failures has an OFF-BEAT writer (the migration export thread,
-            # XERK-397), so it can't blanket-clear like the beat-only lists
-            # above: remove only the entries THIS payload delivered, by identity,
-            # leaving any the thread appended since the snapshot for the next beat.
-            staged = payload.get("spawnFailures")
-            if staged:
-                delivered = {id(x) for x in staged}
-                with self._spawn_failures_lock:
-                    self.spawn_failures[:] = [
-                        x for x in self.spawn_failures if id(x) not in delivered]
-            return reply if isinstance(reply, dict) else {}
         except urllib.error.HTTPError as e:
             # urllib stringifies an HTTPError to just its status line and throws
             # the body away — and for a REFUSED beat that body is the only thing
@@ -25273,6 +25280,54 @@ class SessionManager:
             log(f"heartbeat failed: {e}")
             self._note_beat_failure()
             return None
+        # The parse is its OWN failure, distinct from the transport failures the
+        # handlers above catch (XERK-365). The hub answered — 200, a body in
+        # hand — so this is "the hub said something we could not read" (a
+        # truncated read past HEARTBEAT_REPLY_MAX, or a malformed/hostile body),
+        # NOT "the hub never answered". Conflated, the agent could never tell a
+        # broken reply from an unreachable hub, and a single unparseable reply
+        # read as a dead host to its operator. A huge integer literal no longer
+        # lands here — sys.set_int_max_str_digits above lets the bounded reply
+        # parse — so this branch is now only truncation or genuinely malformed
+        # JSON.
+        try:
+            reply = json.loads(raw.decode() or "{}")
+        except (ValueError, UnicodeDecodeError) as e:
+            log(f"heartbeat reply could not be parsed ({len(raw)} bytes, "
+                f"HTTP 200): {e}")
+            self._note_beat_failure()
+            return None
+        except Exception as e:
+            # json/decoding can raise beyond ValueError/UnicodeDecodeError — a
+            # deeply nested reply raises RecursionError (a RuntimeError, NOT a
+            # ValueError), same class agent-workflows.md warns of for json.load.
+            # It must still read as an unreadable reply (return None), never
+            # escape post() and crash the beat loop as it would with no catch
+            # here. The old single-try structure caught it in the blanket
+            # transport handler; splitting parse out (XERK-299) means parse owns
+            # this net itself.
+            log(f"heartbeat reply could not be read ({len(raw)} bytes, "
+                f"HTTP 200): {e}")
+            self._note_beat_failure()
+            return None
+        # DELIVERED. run_forever calls reply.get(...), so an unusual non-dict
+        # reply is coerced to {} here rather than crashing the beat loop; the
+        # failure counter resets on any delivered beat, ahead of the bookkeeping
+        # so a bug there cannot skip it.
+        reply = reply if isinstance(reply, dict) else {}
+        self._beat_failures = 0
+        try:
+            self._note_body_max(reply)
+            # The ARCHIVE route's own ceiling, off the same reply and before
+            # _archive_deltas runs on it (XERK-356).
+            self._note_archive_chunk_max(reply)
+            # Staged work is cleared ONCE, atomically, only on delivery — and
+            # OUTSIDE the transport try (XERK-299), so a bug in the clears cannot
+            # be reported as a failed beat and discard the reply returned below.
+            self._clear_delivered_staged(payload)
+        except Exception as e:
+            log(f"heartbeat delivered but post-delivery bookkeeping failed: {e}")
+        return reply
 
     def _note_beat_failure(self):
         """Count a failed beat and, past HEARTBEAT_FAILURES_BEFORE_SHED in a
