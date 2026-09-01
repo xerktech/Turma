@@ -74,6 +74,17 @@ ticket panel). Read this before touching `findTicketHost`, the `/session` routes
     one that isn't).
   - **Passes `issueKey`, inheriting XERK-325's triage rule** (`board-ticket-view.md`) — an untriaged
     host can't satisfy the precondition, so reclaim never withdraws into a refusing host.
+  - **A command a FRESHER dispatch already superseded is withdrawn but NOT re-queued** (XERK-540,
+    `dispatchSupersedes`). `committedTicketSpawn` (XERK-331) deliberately lets a manual Start through
+    while THIS command sits undelivered on the offline host, routing a fresh spawn to a live one; that
+    fresh Start records its own cmdId in `ticketDispatchedAt`. Reclaim compares the memo's cmdId to the
+    stranded command's: equal = still the newest dispatch (re-route it normally); different + within
+    `TICKET_DISPATCH_MEMO_MS` = superseded, so re-queueing would hand `drainTicketQueue` a MANUAL entry
+    that skips the in-flight guard and start a SECOND session for the one ticket. Withdrawing without
+    re-queue also stops the dead host running it on return (a lasting double-start). Checked BEFORE the
+    repo/free-host/backoff preconditions — the superseded command is cleaned up whether or not a host
+    is free right now. `rememberDispatch` records the cmdId at every dispatch site (both Start paths +
+    `drainTicketQueue`), so the newest always wins.
   - Residue accepted: once reclaimed, an ordinary queue entry can be beaten to the slot by an older
     one and can itself expire — both now leave a terminal note, which is what makes it acceptable.
   - Admission is checked BEFORE withdrawal — a full org line can still refuse the re-queue.

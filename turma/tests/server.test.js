@@ -8835,6 +8835,50 @@ test("XERK-303: an undelivered spawn on a dead host is reclaimed and re-routed",
   assert.equal(queuedTicket("tq40.atlassian.net", "ENG-5"), null, "dispatched again");
 });
 
+test("XERK-540: a stranded spawn a concurrent Start already re-routed is withdrawn, not re-queued", async () => {
+  // The transient double-start QA found on XERK-331: a MANUAL spawn stranded
+  // undelivered on an offline host, then Start clicked. committedTicketSpawn lets
+  // that Start through (an undelivered-offline command is reclaim's to own), so a
+  // fresh session comes up on a live host under a new cmdId. Reclaim must NOT
+  // then re-queue the stranded command — a manual entry skips drain's in-flight
+  // guard by design, so it would start a SECOND session for the one ticket.
+  resetAutoStart();
+  const site = "tq61.atlassian.net";
+  const stranded = await strandOn(site, "tq61A", "tq61B");
+
+  // The operator clicks Start again. A is offline holding an UNDELIVERED command,
+  // so the org-wide single-flight guard does not fire and a fresh spawn routes to
+  // the now-free B under a brand-new cmdId.
+  const again = await startTicket(site, "ENG-5");
+  assert.equal(again.body.host, "tq61B", "the fresh Start routes to the live host");
+  assert.notEqual(again.body.cmdId, stranded.cmdId, "under a brand-new cmdId");
+
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+
+  assert.equal((agents.tq61A.commands || []).length, 0,
+    "the superseded command is withdrawn from the dead host");
+  assert.equal(ticketQueue.length, 0, "and it is NOT re-queued");
+  assert.deepEqual((agents.tq61B.commands || []).map((c) => [c.type, c.issueKey]),
+    [["spawnTicket", "ENG-5"]],
+    "so exactly ONE session comes up — the fresh Start's, no second one");
+});
+
+test("XERK-540: an ordinary stranded spawn (no fresh Start) is still reclaimed", async () => {
+  // The supersession check must fire ONLY when a DIFFERENT cmdId superseded this
+  // one. The stranded command's own dispatch stamped the memo under its own
+  // cmdId, so a plain reclaim (no concurrent Start) must still re-route it —
+  // dispatchSupersedes returns false when the newest dispatch IS this command.
+  resetAutoStart();
+  const stranded = await strandOn("tq62.atlassian.net", "tq62A", "tq62B");
+  assert.ok(stranded.cmdId, "the stranded command has a cmdId");
+  reclaimStrandedTicketSpawns();
+  assert.equal((agents.tq62A.commands || []).length, 0, "withdrawn from the dead host");
+  assert.ok(queuedTicket("tq62.atlassian.net", "ENG-5"), "and re-queued for any org host");
+  drainTicketQueue();
+  assert.deepEqual((agents.tq62B.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
 test("XERK-303: a DELIVERED spawn is never withdrawn — a double start beats no start", async () => {
   // The case the whole gate exists for: a host routinely goes silent BETWEEN
   // delivery and ack, so "it is offline" is not evidence the command didn't run.
