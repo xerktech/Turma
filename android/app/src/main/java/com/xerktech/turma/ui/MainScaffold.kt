@@ -1,5 +1,6 @@
 package com.xerktech.turma.ui
 
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
@@ -42,7 +43,19 @@ fun MainScaffold(
         containerColor = MaterialTheme.colorScheme.background,
         bottomBar = { TurmaBottomNav(current, onNavigate) },
     ) { pad ->
-        content(Modifier.fillMaxSize().padding(pad))
+        // consumeWindowInsets(pad) is load-bearing, not decorative: `pad` reserves
+        // the bottom-nav height (plus the system bar insets), and a plain
+        // padding(pad) applies it WITHOUT marking those insets consumed. A nested
+        // child that lifts itself for the keyboard — the wide (tablet/foldable)
+        // layout renders ChatScreen, whose own Scaffold carries Modifier.imePadding()
+        // — then re-applies the FULL ime inset on top of the already-reserved nav-bar
+        // band, docking the composer a nav-bar height ABOVE the keyboard (the empty
+        // gap). Consuming pad makes that imePadding subtract the nav-bar height it
+        // already sits above, so the composer lands flush on the keyboard. The phone
+        // chat is a separate full-screen route outside this Scaffold, so it was never
+        // affected; this is inert for the list-only / dashboard / board / usage
+        // screens, which don't lift for the IME.
+        content(Modifier.fillMaxSize().padding(pad).consumeWindowInsets(pad))
     }
 }
 
