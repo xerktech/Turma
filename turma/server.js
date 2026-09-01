@@ -3452,6 +3452,14 @@ function normalizeSubscription(payload) {
   }
   const out = { key: key.slice(0, 128) };
   if (typeof sub.source === "string") out.source = sub.source.slice(0, 32);
+  // The human-readable card name (XERK-541). A display string on every client
+  // and TYPED on Android, so it is coerced to a bounded string or dropped, like
+  // the key — an unusable one is simply absent, which every client renders by
+  // naming the card's hosts instead. 256 mirrors the key's boundary bound (the
+  // agent sends at most 200); an empty/blank label is nothing to show.
+  if (typeof sub.label === "string" && sub.label.trim()) {
+    out.label = sub.label.trim().slice(0, 256);
+  }
   payload.subscription = out;
 }
 

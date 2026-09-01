@@ -4220,11 +4220,30 @@ def claude_auth_status(path=None, now_ms=None):
 # credentials file beside it is no use here: its tokens rotate, and
 # `subscriptionType` names a PLAN ("max"), which two different accounts share.
 #
-# What rides the wire is a HASH of that uuid, never the uuid, the org uuid or
-# the email. The hub persists every heartbeat into state.json and fans it out
-# to web, Android and glasses, and grouping only ever asks whether two hosts
-# are equal — so there is nothing to gain by shipping the identifier itself.
+# The GROUPING key that rides the wire is a HASH of that uuid, never the uuid,
+# the org uuid or the email. The hub persists every heartbeat into state.json
+# and fans it out to web, Android and glasses, and grouping only ever asks
+# whether two hosts are equal — so there is nothing to gain by shipping the
+# identifier itself.
+#
+# The LABEL is a separate, human-readable answer to XERK-541 — "which
+# subscription is this?" — so the usage page can NAME each per-subscription card
+# instead of falling back to the hosts on it. Unlike the key it is meant to be
+# read, so it carries the account's own `organizationName` (a team/enterprise
+# plan's real name; a personal Max plan's is "<email>'s Organization", which
+# embeds the login email). An operator who would rather not ship that sets
+# `TURMA_SUBSCRIPTION_LABEL` to any string, which overrides the derived one on
+# both sources; it is the only display name an env-pinned key ever gets.
 SUBSCRIPTION_KEY_ENV = "TURMA_SUBSCRIPTION_KEY"
+SUBSCRIPTION_LABEL_ENV = "TURMA_SUBSCRIPTION_LABEL"
+# The label rides the wire and is a display string on every client (Android
+# TYPES it), so it is bounded here and re-bounded at the hub, like the key.
+SUBSCRIPTION_LABEL_MAX = 200
+# oauthAccount fields tried, in order, for the derived label — the org name
+# first (the "subscription name" the ticket asks for), then the person, then the
+# email as a last resort. Each is only used when it is a non-empty string.
+SUBSCRIPTION_LABEL_FIELDS = (
+    "organizationName", "displayName", "fullName", "emailAddress")
 # The config file is ~120 KiB of caches on a real host and grows; this is the
 # "that is not the file I think it is" bound, not a size anyone should approach.
 SUBSCRIPTION_CONFIG_MAX_BYTES = 8 << 20
@@ -4261,8 +4280,8 @@ def _subscription_key(value):
 
 
 def subscription_identity(paths=None, env=None):
-    """The heartbeat's `subscription` block — ``{key, source}`` — or None when
-    this host cannot say which subscription it is on.
+    """The heartbeat's `subscription` block — ``{key, source, label?}`` — or None
+    when this host cannot say which subscription it is on.
 
     None is the heartbeat contract's "that agent can't tell you" value, and the
     usage page keeps such a host on a card of its own rather than guessing:
@@ -4274,18 +4293,45 @@ def subscription_identity(paths=None, env=None):
     two hosts given the same string land in the same group and neither source
     leaks its input.
 
+    `label` (XERK-541) is the group's human-readable name for the usage card.
+    A login derives it from the account's own fields; an env-pinned key has none
+    to derive from. `TURMA_SUBSCRIPTION_LABEL` overrides either — the only label
+    an env-pinned key ever carries, and a privacy or friendliness override for a
+    login whose derived name an operator would rather not use.
+
     Every candidate path is tried until one ANSWERS — a path that exists but
     carries no account must not suppress the layout that does, since the two are
     routinely both present (`~/.claude/` is a directory beside `~/.claude.json`).
     """
     env = os.environ if env is None else env
+    env_label = (env.get(SUBSCRIPTION_LABEL_ENV) or "").strip()[:SUBSCRIPTION_LABEL_MAX]
     pinned = (env.get(SUBSCRIPTION_KEY_ENV) or "").strip()
+    block = None
     if pinned:
-        return {"key": _subscription_key("env:" + pinned), "source": "env"}
-    for path in (paths if paths is not None else CLAUDE_CONFIG_PATHS):
-        block = _subscription_from_config(path)
-        if block:
-            return block
+        block = {"key": _subscription_key("env:" + pinned), "source": "env"}
+    else:
+        for path in (paths if paths is not None else CLAUDE_CONFIG_PATHS):
+            block = _subscription_from_config(path)
+            if block:
+                break
+    if block is None:
+        return None
+    # The env override wins over any derived label; a login with neither keeps
+    # the name it derived. Never overwrite a real label with an empty override.
+    if env_label:
+        block = dict(block, label=env_label)
+    return block
+
+
+def _subscription_label(account):
+    """A human-readable name for a login's subscription from its oauthAccount
+    block, or None — the first non-empty string among SUBSCRIPTION_LABEL_FIELDS,
+    length-bounded. Pure `.get()`s off the already-parsed dict, so like the rest
+    of this path it never raises and never blocks."""
+    for field in SUBSCRIPTION_LABEL_FIELDS:
+        value = account.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:SUBSCRIPTION_LABEL_MAX]
     return None
 
 
@@ -4332,6 +4378,9 @@ def _subscription_from_config(path):
             if isinstance(account_uuid, str) and account_uuid.strip():
                 block = {"key": _subscription_key("account:" + account_uuid.strip()),
                          "source": "login"}
+                label = _subscription_label(account)
+                if label:
+                    block["label"] = label
     except Exception as e:
         _log_subscription_problem(
             path, f"claude config at {path} unreadable ({e}); "

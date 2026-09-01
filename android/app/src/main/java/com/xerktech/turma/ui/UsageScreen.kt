@@ -261,7 +261,9 @@ private fun LimitsSection(cards: List<UsageViewModel.LimitCard>, anyAgents: Bool
 private fun LimitCardView(card: UsageViewModel.LimitCard, nowSec: Long) {
     Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(card.host, style = MaterialTheme.typography.bodyMedium)
+            // The subscription's name heads the card when it has one (XERK-541),
+            // else the machine(s) on it (XERK-301: the key is a hash).
+            Text(card.label.ifBlank { card.host }, style = MaterialTheme.typography.bodyMedium)
             val ageSec = nowSec - card.capturedAt
             Text(
                 // "captured", not "updated": this is when the host last read the
@@ -270,6 +272,15 @@ private fun LimitCardView(card: UsageViewModel.LimitCard, nowSec: Long) {
                 style = MaterialTheme.typography.bodySmall,
                 color = if (ageSec > UsageViewModel.LIMIT_STALE_SEC) TurmaColors.warning
                 else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        // With a name heading the card, the machines it covers become the
+        // subtitle so the card still says which are on it (XERK-541).
+        if (card.label.isNotBlank()) {
+            Text(
+                card.host,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
         // Only worth saying when the card IS a consolidation: with one host the

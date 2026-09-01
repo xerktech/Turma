@@ -55,6 +55,13 @@
     gap: 10px; margin-bottom: 10px;
   }
   .lim-host { font-weight: 600; font-size: 13px; color: var(--ink); }
+  /* The hosts on a NAMED subscription card (XERK-541): a subtitle under the
+     name, since the name has taken the heading. Pulled up under the head's
+     bottom margin so it reads as a pair with it. */
+  .lim-hosts {
+    font-size: 11.5px; color: var(--muted); margin: -6px 0 10px;
+    word-break: break-word;
+  }
   .lim-age { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
   .lim-age.stale { color: var(--warning); }
   .lim-row + .lim-row { margin-top: 10px; }
@@ -388,6 +395,8 @@ function limitEntries(agents, nowSec) {
       // The subscription this host's login is on (XERK-301), or null when it
       // can't say — see limitGroups.
       subKey: subscriptionKeyOf(a),
+      // Its human-readable name (XERK-541), when the host reports one.
+      subLabel: subscriptionLabelOf(a),
       limits: a.limits,
     }))
     .sort((x, y) => (y.limits.capturedAt || 0) - (x.limits.capturedAt || 0));
@@ -396,6 +405,11 @@ function limitEntries(agents, nowSec) {
 function subscriptionKeyOf(agent) {
   const key = agent && agent.subscription && agent.subscription.key;
   return typeof key === "string" && key ? key : null;
+}
+
+function subscriptionLabelOf(agent) {
+  const label = agent && agent.subscription && agent.subscription.label;
+  return typeof label === "string" && label ? label : null;
 }
 
 // One card per SUBSCRIPTION, not per host (XERK-301). Hosts logged into one
@@ -421,12 +435,21 @@ function limitGroups(agents, nowSec) {
     const capturedAt = entry.limits.capturedAt || 0;
     let group = entry.subKey ? byKey.get(entry.subKey) : null;
     if (!group) {
-      group = { key: entry.subKey, hosts: [], capturedAt: 0, windows: {} };
+      group = { key: entry.subKey, hosts: [], capturedAt: 0, windows: {},
+                label: "", labelAt: -1 };
       groups.push(group);
       if (entry.subKey) byKey.set(entry.subKey, group);
     }
     group.hosts.push({ host: entry.host, capturedAt });
     group.capturedAt = Math.max(group.capturedAt, capturedAt);
+    // The card's name takes the FRESHEST reporter's label, the same rule the
+    // windows use: hosts on one account report the same name, but should they
+    // ever disagree (one pins TURMA_SUBSCRIPTION_LABEL), the newest wins and
+    // both clients resolve it the same way. Strict `>` over freshest-first.
+    if (entry.subLabel && capturedAt > group.labelAt) {
+      group.label = entry.subLabel;
+      group.labelAt = capturedAt;
+    }
     for (const [key] of LIMIT_WINDOWS) {
       const win = entry.limits[key];
       if (!win || typeof win.usedPct !== "number") continue;
@@ -829,9 +852,10 @@ function renderLimits(agents) {
 // counts them. Every name is still in the tooltip, with its own capture age.
 const LIMIT_HOSTS_SHOWN = 3;
 
-// The card's heading: the one host on this subscription, or the hosts sharing
-// it. There is no better name to give a subscription — the key is a hash by
-// design (XERK-301) — and the hosts are what the operator actually recognises.
+// The card's heading falls back to the host(s) on the subscription when it has
+// no name (XERK-301: the grouping key is a hash, so the hosts are what the
+// operator recognises). With a name (XERK-541) that leads and the hosts move to
+// a subtitle, answering "which machines are in which subscription".
 function limitHostLabel(group) {
   const names = group.hosts.map(h => h.host);
   if (names.length <= LIMIT_HOSTS_SHOWN) return names.join(" · ");
@@ -847,7 +871,7 @@ function limitCard(group, nowSec) {
   head.className = "lim-head";
   const host = document.createElement("span");
   host.className = "lim-host";
-  host.textContent = limitHostLabel(group);
+  host.textContent = group.label || limitHostLabel(group);
   if (group.hosts.length > 1) {
     host.title = "These hosts are logged into the same Claude account, so they "
       + "share one 5-hour and 7-day pool. Each window below shows the freshest "
@@ -868,6 +892,16 @@ function limitCard(group, nowSec) {
     + "the real server-side counter.";
   head.append(host, age);
   card.append(head);
+
+  // With a subscription name leading the head, the host(s) it covers become the
+  // subtitle — so the card still says which machines are on it (XERK-541).
+  if (group.label) {
+    const hosts = document.createElement("div");
+    hosts.className = "lim-hosts";
+    hosts.textContent = limitHostLabel(group);
+    if (group.hosts.length > 1) hosts.title = host.title;
+    card.append(hosts);
+  }
 
   for (const [key, label] of LIMIT_WINDOWS) {
     const held = group.windows[key];

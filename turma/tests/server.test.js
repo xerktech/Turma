@@ -3413,6 +3413,20 @@ test("http: the subscription key reaches the clients, coerced and bounded", asyn
   assert.deepEqual((await read()).subscription,
     { key: "x".repeat(128), source: "y".repeat(32) });
 
+  // XERK-541: the human-readable card name rides beside the key, trimmed and
+  // bounded like it; an unusable one is simply absent (the card names its hosts).
+  await beat({ device: "sub-host",
+    subscription: { key: "abc123", source: "login", label: "  XerkTech  " } });
+  assert.deepEqual((await read()).subscription,
+    { key: "abc123", source: "login", label: "XerkTech" });
+  await beat({ device: "sub-host",
+    subscription: { key: "abc123", label: "z".repeat(500) } });
+  assert.equal((await read()).subscription.label, "z".repeat(256));
+  for (const label of ["", "   ", 7, {}, null]) {
+    await beat({ device: "sub-host", subscription: { key: "abc123", label } });
+    assert.equal("label" in (await read()).subscription, false, JSON.stringify(label));
+  }
+
   for (const subscription of [{ key: "" }, { key: 7 }, {}, [], "nope", 7, null]) {
     await beat({ device: "sub-host", subscription });
     assert.equal((await read()).subscription, null, JSON.stringify(subscription));

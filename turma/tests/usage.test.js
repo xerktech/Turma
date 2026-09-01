@@ -722,6 +722,61 @@ test("limitGroups breaks a capturedAt TIE the same way the Android port does", (
   assert.equal(groups[0].windows.sevenDay.win.usedPct, 21);
 });
 
+test("limitGroups takes the FRESHEST reporter's subscription name (XERK-541)", () => {
+  // Hosts on one account report the same name, but should they disagree (one
+  // pins TURMA_SUBSCRIPTION_LABEL) the newest wins, resolved the same on both
+  // clients — the strict-`>`-over-freshest-first rule the windows use.
+  const subL = (key, label) => ({ subscription: { key, label } });
+  const groups = H.limitGroups([
+    { device: "a", ...subL("k1", "Old Name"),
+      limits: { capturedAt: NOW - 600, fiveHour: { usedPct: 30 } } },
+    { device: "b", ...subL("k1", "XerkTech"),
+      limits: { capturedAt: NOW - 60, fiveHour: { usedPct: 42 } } },
+  ], NOW);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].label, "XerkTech");
+});
+
+test("limitGroups leaves an unnamed subscription's label blank", () => {
+  const groups = H.limitGroups([
+    { device: "a", ...sub("k1"), limits: { capturedAt: NOW, fiveHour: { usedPct: 30 } } },
+  ], NOW);
+  assert.equal(groups[0].label, "");
+});
+
+test("limitCard leads with the subscription name and drops hosts to a subtitle", () => {
+  // XERK-541: a named card answers "which machines are in which subscription".
+  const card = H.limitCard(H.limitGroups([
+    { device: "maxai", subscription: { key: "k1", label: "XerkTech" },
+      limits: { capturedAt: NOW - 600, fiveHour: { usedPct: 30 } } },
+    { device: "truenas", subscription: { key: "k1", label: "XerkTech" },
+      limits: { capturedAt: NOW - 60, sevenDay: { usedPct: 12 } } },
+  ], NOW)[0], NOW);
+  assert.equal(card.children[0].children[0].textContent, "XerkTech");   // heading
+  const subtitle = [...card.children].find((el) => el.className === "lim-hosts");
+  assert.ok(subtitle, "a named card carries a hosts subtitle");
+  assert.equal(subtitle.textContent, "truenas · maxai");
+});
+
+test("an unnamed card keeps the hosts as its heading and grows no subtitle", () => {
+  const card = H.limitCard(H.limitGroups([
+    { device: "solo", ...sub("k1"), limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } },
+  ], NOW)[0], NOW);
+  assert.equal(card.children[0].children[0].textContent, "solo");
+  assert.equal([...card.children].some((el) => el.className === "lim-hosts"), false);
+});
+
+test("a hostile subscription label lands as TEXT, never as markup (XERK-541)", () => {
+  const evil = '<img src=x onerror="window.__xss=1">';
+  const card = H.limitCard(H.limitGroups([
+    { device: "alpha", subscription: { key: "k1", label: evil },
+      limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } },
+  ], NOW)[0], NOW);
+  assert.equal(card.children[0].children[0].textContent, evil);
+  const walk = (el) => [el, ...(el.children || []).flatMap(walk)];
+  for (const el of walk(card)) assert.equal(el.innerHTML, "");
+});
+
 test("a window read earlier than the card's stamp says so on its own row", () => {
   // The head shows the group's FRESHEST capture. A window the freshest host
   // didn't report comes from an older read, and presenting it under that head
