@@ -159,7 +159,7 @@ const {
   orgDriftWarned, warnOrgDrift, siteKeyOf, normalizeJira, normalizeClones,
   normalizeTriage,
   CLONE_PROGRESS_MAX,
-  wsAccept, wsEncode, wsParser, channelDuplex,
+  wsAccept, wsEncode, wsParser, WS_FRAME_MAX, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
   serializeAgentsForSave,
@@ -315,6 +315,79 @@ test("wsParser waits for a frame split across the header boundary", () => {
   parse(wire.subarray(3));
   assert.equal(frames.length, 1);
   assert.equal(frames[0].payload.length, 300);
+});
+
+// XERK-357: the frame ceiling. A 10-byte 64-bit length header declaring `len`,
+// with NO payload appended — the whole point is that an oversize frame is
+// refused on its header, before the parser buffers the declared bytes.
+function frameHeader(len, { masked = true, opcode = 0x2 } = {}) {
+  const h = Buffer.alloc(masked ? 14 : 10);
+  h[0] = 0x80 | opcode;
+  h[1] = (masked ? 0x80 : 0) | 127;
+  h.writeBigUInt64BE(BigInt(len), 2);
+  return h; // mask key bytes (if any) left zero — never reached on an oversize frame
+}
+
+test("wsParser refuses a frame declaring more than the default ceiling (XERK-357)", () => {
+  // The ticket's exact evidence: one 300 MiB masked frame on a control socket.
+  const frames = [];
+  const overs = [];
+  const parse = wsParser(
+    (op, payload) => frames.push({ op, payload }),
+    { onOverflow: (len) => overs.push(len) }
+  );
+  const declared = 300 * 1024 * 1024;
+  parse(frameHeader(declared)); // header only — payload never sent
+  assert.equal(frames.length, 0, "no frame delivered");
+  assert.deepEqual(overs, [declared], "onOverflow got the declared length");
+  assert.ok(declared > WS_FRAME_MAX);
+});
+
+test("wsParser overflow is decided on the header, before the payload is buffered", () => {
+  // With a small ceiling, feed ONLY the header declaring over it; the parser must
+  // fire onOverflow without waiting for (or allocating) the declared bytes.
+  let held = null;
+  const frames = [];
+  const parse = wsParser(
+    (op, payload) => frames.push({ op, payload }),
+    { max: 100, onOverflow: (len) => { held = len; } }
+  );
+  parse(frameHeader(1_000_000)); // 1 MB declared, ceiling 100
+  assert.equal(held, 1_000_000);
+  assert.equal(frames.length, 0);
+});
+
+test("wsParser goes dead after an overflow and ignores every later chunk", () => {
+  let overs = 0;
+  const frames = [];
+  const parse = wsParser(
+    (op, payload) => frames.push({ op, payload }),
+    { max: 100, onOverflow: () => overs++ }
+  );
+  parse(frameHeader(1_000_000));
+  assert.equal(overs, 1);
+  // A perfectly valid small frame after the overflow is NOT processed — the
+  // stream is unrecoverable (we can't find the next frame boundary), so the
+  // socket is closed by the caller and the parser must not resurrect.
+  parse(wsEncode(0x1, "after"));
+  assert.equal(frames.length, 0, "post-overflow frame ignored");
+  assert.equal(overs, 1, "onOverflow fires once, not per chunk");
+});
+
+test("wsParser admits a frame at exactly the ceiling, refuses one past it", () => {
+  for (const [len, refused] of [[100, false], [101, true]]) {
+    const frames = [];
+    let over = false;
+    const parse = wsParser(
+      (op, payload) => frames.push({ op, payload }),
+      { max: 100, onOverflow: () => { over = true; } }
+    );
+    // A real, complete masked frame of `len` bytes (needs the payload for the
+    // allowed case to actually deliver).
+    parse(maskedFrame(0x2, Buffer.alloc(len, 1)));
+    assert.equal(over, refused, `len ${len}`);
+    assert.equal(frames.length, refused ? 0 : 1, `len ${len} delivery`);
+  }
 });
 
 test("wsAccept derives the RFC 6455 handshake key", () => {

@@ -21,6 +21,35 @@ The hub is the fleet's sole control plane under `mem_limit: 256m`, with `restart
 - **The in-flight body budget bounds BYTES**, which no connection cap can (a cap safe against a
   32 MiB worst case would have to be ~4).
 
+## WebSocket frame ceiling (XERK-357)
+
+- **`wsParser` caps a frame's DECLARED length at `WS_FRAME_MAX`** — a fraction of the container
+  (`min(16 MiB, MEMORY_LIMIT/16)`), not a fixed number, like every ceiling here. Without it the
+  parser's `Buffer.concat` accumulator grows to the declared size: one 300 MiB frame took the hub
+  RSS 58→327 MiB in 4s, OOM + `unless-stopped` loop. All four WS surfaces reach it — `/agent/control`
+  and `/agent/data` (agent-authed), `/live/*` and `/audio` (logged-in browser) — so it was exempt
+  from every XERK-258 ceiling.
+- **The refusal is decided on the ≤10-byte length HEADER, before the payload is buffered** — that is
+  the whole point; catching it after `buf` grew to the declared size defeats it. `wsParser(onFrame,
+  {max, onOverflow})`: over `max` → the parser goes DEAD (drops its buffer, ignores every later
+  chunk — the stream is unrecoverable, no next frame boundary) and calls `onOverflow(len)`. The
+  parser can't reach the socket, so the CALLER closes it and logs — a WS peer gets no 413, so the
+  close code + log line are the only trace (the 413-vs-close asymmetry).
+- **The partial frame is NOT charged against the HTTP in-flight budget** (`chargeBody`) — that
+  budget's shape (two lanes, 3x parse cost, stalled-request reclaim) is a request/response stream's,
+  wrong for a raw, never-parsed, long-lived frame. At most ONE partial frame per socket (bounded by
+  `WS_FRAME_MAX`) and socket count is bounded by `MAX_CONNECTIONS`, so the two ceilings bound the
+  parser the way the connection cap bounds per-socket read buffers.
+  - **KNOWN residual, the XERK-287 shape**: the aggregate worst case is
+    `MAX_CONNECTIONS × WS_FRAME_MAX`, a budget separate from and ADDED to the in-flight ceiling.
+    Reaching it needs `MAX_CONNECTIONS` authenticated sockets each holding a near-max partial frame —
+    far narrower than the single unbounded frame this closes; shrinking it further is a sizing
+    decision, not a code fix.
+- **The parity mirror does NOT apply**: `tunnel-agent.js` uses Node's built-in WebSocket client (which
+  bounds frames itself), so the hand-rolled parser — and this ceiling — live only in `server.js`.
+- Tests: the `XERK-357` / `wsParser refuses…` cases in `server.test.js` (header-only overflow,
+  dead-after-overflow, exact-ceiling boundary).
+
 ## In-flight body budget
 
 - **A body is charged `BODY_PARSE_COST` (3x) its wire size** — the bill is the JS string plus the

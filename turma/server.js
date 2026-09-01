@@ -123,6 +123,44 @@ const BODY_INFLIGHT_MAX =
 const BODY_INFLIGHT_TOTAL_MAX =
   Number(process.env.BODY_INFLIGHT_TOTAL_MAX) || Math.floor(MEMORY_LIMIT / 2);
 
+// The largest WebSocket frame the hub will buffer before refusing (XERK-357).
+//
+// `wsParser` concatenates socket chunks until a whole frame has arrived. With no
+// cap on the frame's DECLARED length that buffer grows without bound: one masked
+// frame declaring 300 MiB on /agent/control took the deployed 256 MiB hub from
+// RSS 58 MiB to 327 MiB in four seconds and the OOM killer (with
+// `restart: unless-stopped`) turns that into a fleet-wide control-plane loop —
+// the same outage shape as XERK-258/XERK-235. Both an agent token and a
+// logged-in browser session reach this parser (/agent/control, /agent/data,
+// /live/*, /audio), so it was exempt from every ceiling XERK-258 installed.
+//
+// So the frame ceiling is a FRACTION OF THE CONTAINER (XERK-258), never a fixed
+// number — raising `mem_limit` widens it with no code change, and a smaller hub
+// tightens it. It sits far above any legitimate frame (the largest is a
+// control-channel transcript-tail delta, comfortably under a megabyte) and far
+// below the tens of megabytes that threaten the container. A frame declaring
+// more is refused the moment its <=10-byte length header is read — before the
+// payload is buffered — the socket is closed and the refusal logged: a
+// WebSocket peer cannot be told "too large" with a status, so the close and the
+// log line are the only trace an operator gets (the 413-vs-close asymmetry).
+//
+// The partial frame is NOT charged against the HTTP in-flight body budget
+// (`chargeBody`): that budget's shape — two lanes, a 3x parse multiplier,
+// stalled-request reclaim — is a request/response stream's, and none of it fits
+// a raw, never-parsed, long-lived WebSocket frame. The parser holds at most ONE
+// partial frame per socket (bounded by this ceiling), and the socket count is
+// already bounded by `MAX_CONNECTIONS`, so the two ceilings bound the parser the
+// way the connection cap bounds the per-socket read buffers (XERK-273). KNOWN,
+// deliberate residual, the XERK-287 shape: the aggregate worst case is
+// `MAX_CONNECTIONS x WS_FRAME_MAX`, a budget separate from and added to the HTTP
+// in-flight ceiling. Reaching it needs `MAX_CONNECTIONS` authenticated sockets
+// each holding a near-max partial frame — far narrower than the single unbounded
+// frame this closes; shrinking it further is a sizing decision, not a code fix.
+const WS_FRAME_ABSOLUTE_MAX = 16 << 20; // 16 MiB — the largest one frame may be
+const WS_FRAME_MAX =
+  Number(process.env.WS_FRAME_MAX) ||
+  Math.min(WS_FRAME_ABSOLUTE_MAX, Math.floor(MEMORY_LIMIT / 16));
+
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
 const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
 // Ticket -> agent pins (XERK-38): which HOST a ticket's sessions spawn on,
@@ -8297,9 +8335,17 @@ function wsEncode(opcode, payload) {
   return Buffer.concat([header, payload]);
 }
 // Returns a stateful function fed raw socket chunks; invokes onFrame(op, data).
-function wsParser(onFrame) {
+//
+// `opts.max` caps a frame's DECLARED length (XERK-357, defaulting to
+// WS_FRAME_MAX). A frame over it is refused before its payload is buffered — the
+// parser goes dead (drops its buffer, ignores every later chunk) and calls
+// `opts.onOverflow(len)` so the CALLER, which owns the socket, can close it and
+// log. The parser cannot reach the socket itself, hence the callback.
+function wsParser(onFrame, { max = WS_FRAME_MAX, onOverflow } = {}) {
   let buf = Buffer.alloc(0);
+  let dead = false; // a frame overran `max`; the stream is unrecoverable
   return (chunk) => {
+    if (dead) return;
     buf = Buffer.concat([buf, chunk]);
     for (;;) {
       if (buf.length < 2) return;
@@ -8315,6 +8361,17 @@ function wsParser(onFrame) {
         if (buf.length < 10) return;
         len = Number(buf.readBigUInt64BE(2));
         off = 10;
+      }
+      // The length is known from the <=10-byte header, so an oversize frame is
+      // caught while `buf` still holds only that header — NEVER after it has
+      // grown to the declared size, which is the whole point. `Number(...)` of a
+      // 64-bit length past 2^53 loses precision but stays far above `max`, so it
+      // is refused too. Kill the parser and hand the refusal to the caller.
+      if (len > max) {
+        dead = true;
+        buf = Buffer.alloc(0);
+        if (onOverflow) onOverflow(len);
+        return;
       }
       let mask;
       if (masked) {
@@ -8420,6 +8477,11 @@ function channelDuplex(socket) {
     else if (op === 0x9) socket.write(wsEncode(0xa, payload)); // ping -> pong
     else if (op === 0xa) { /* pong */ }
     else if (payload.length) d.push(payload);              // binary/text/cont
+  }, {
+    onOverflow: (len) => {
+      console.log(`ws frame over ceiling (${len} > ${WS_FRAME_MAX}); dropping agent data channel`);
+      try { socket.destroy(); } catch {} // -> "close" -> d.push(null); d.destroy()
+    },
   });
   socket.on("data", parse);
   socket.on("close", () => { d.push(null); d.destroy(); });
@@ -11500,6 +11562,12 @@ server.on("upgrade", async (req, socket, head) => {
         liveFanout(name, msg.turn, { type: "turn", text: msg.text, status: msg.status || null,
           agents: sanitizeLiveAgents(msg.agents) });
       }
+    }, {
+      onOverflow: (len) => {
+        console.log(`ws frame over ceiling (${len} > ${WS_FRAME_MAX}) on control channel; dropping: ${logName(name)}`);
+        try { socket.destroy(); } catch {}
+        cleanup();
+      },
     });
     socket.on("data", parse);
     const cleanup = () => {
@@ -11581,6 +11649,11 @@ server.on("upgrade", async (req, socket, head) => {
     const parse = wsParser((op, payload) => {
       if (op === 0x8) return socket.end();
       if (op === 0x9) { try { socket.write(wsEncode(0xa, payload)); } catch {} } // ping -> pong
+    }, {
+      onOverflow: (len) => {
+        console.log(`ws frame over ceiling (${len} > ${WS_FRAME_MAX}) on /live/${logName(host)}; dropping`);
+        try { socket.destroy(); } catch {} // -> "error"/"close" -> cleanup
+      },
     });
     socket.on("data", parse);
 
@@ -11681,6 +11754,11 @@ server.on("upgrade", async (req, socket, head) => {
         send(0x8, Buffer.alloc(0));
         try { socket.end(); } catch {}
       }
+    }, {
+      onOverflow: (len) => {
+        console.log(`ws frame over ceiling (${len} > ${WS_FRAME_MAX}) on /audio; dropping`);
+        try { socket.destroy(); } catch {} // -> "close" -> cleanup (clears idle timer)
+      },
     });
     socket.on("data", parse);
     socket.on("close", cleanup);
@@ -11850,6 +11928,7 @@ if (process.env.TURMA_TEST) {
     wsAccept,
     wsEncode,
     wsParser,
+    WS_FRAME_MAX,
     channelDuplex,
     heartbeatAlerts,
     prAlertDecision,
