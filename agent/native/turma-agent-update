@@ -45,6 +45,10 @@ set -eu
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"   # $PREFIX/bin
 PREFIX="$(dirname "$SELF_DIR")"
+# Our own absolute path, so with_lock can re-exec us as the bounded worker
+# (see run_locked). Derived from SELF_DIR (already an absolute realpath) rather
+# than $0 so a relative or `bash <script>` invocation still re-execs cleanly.
+SELF="$SELF_DIR/$(basename "$0")"
 
 # The same PATH guarantee the launcher makes (XERK-94), for the same reason: a
 # systemd --user unit inherits the user manager's default PATH, which does NOT
@@ -66,6 +70,28 @@ LOCK="$HOME/.turma/update.lock"
 STAMP="$HOME/.turma/last-update-check"
 CLAUDE_STAMP="$HOME/.turma/last-claude-check"
 DSH_STAMP="$HOME/.turma/last-dsh-check"
+# XERK-549. The update lock's holder (pid + acquire epoch), rewritten each time
+# the lock is taken, so a wedged run can be identified and reclaimed by a later
+# one; and a consecutive-skip counter so a stuck poller shows up in the log
+# rather than only under a `flock` inspection of a live pod.
+LOCK_HOLDER="$HOME/.turma/update.lock.holder"
+SKIP_COUNT="$HOME/.turma/update-skip-count"
+# Overall deadline for ONE agent self-update run (--loop/--boot/timer), so a
+# hung child cannot hold the lock forever and strand the host on a stale build.
+# A FIXED generous number (like the launcher's own bound), NOT derived from the
+# per-call timeouts — deriving it coupled the caller to the call graph and bred
+# defects (see the launcher). It only has to sit above the legitimate worst case
+# (a download + verify + swap) and below TURMA_UPDATE_INTERVAL so a --loop run
+# never overlaps the next. claude/dsh checks keep the launcher's outer bound and
+# take no inner deadline here (wrapping them risks firing mid-install).
+RUN_DEADLINE="${TURMA_RUN_DEADLINE:-900}"
+# A lock held this long is presumed wedged and is reclaimed (holder killed, lock
+# retaken). Must stay well above RUN_DEADLINE so a legitimately slow run is never
+# reclaimed; 2x the interval by default, the "N x INTERVAL" the ticket asks for.
+LOCK_RECLAIM_AFTER="${TURMA_LOCK_RECLAIM_AFTER:-7200}"
+# Warn to the log once this many agent checks skip/error in a row (and every
+# multiple after), so a stuck poller is noticed without inspecting the pod.
+STRAND_WARN_AT="${TURMA_UPDATE_STRAND_WARN_AT:-3}"
 # The raw `claude --version` output of a repair that did NOT make it readable,
 # so the same futile reinstall isn't attempted on every start forever.
 CLAUDE_UNPARSEABLE="$HOME/.turma/claude-unparseable"
@@ -873,12 +899,100 @@ throttled() {  # <stampfile> <label>
   return 1
 }
 
+# The three things a locked run can be. Named tokens rather than passing the
+# function itself, because run_locked may re-exec us to bound the work (a shell
+# function can't be handed to `timeout`), and a token survives that round trip.
+dispatch_locked() {  # <run|claude|dsh>
+  case "$1" in
+    run)    run_once ;;
+    claude) claude_check ;;
+    dsh)    dsh_check ;;
+    *)      return 2 ;;
+  esac
+}
+
+# Run the locked work with the lock fd CLOSED for it and any child it spawns
+# (9>&-), and — for the agent self-update — under an OVERALL deadline (XERK-549).
+#
+# Two failures this addresses:
+#   * A hung child (a network/subprocess call that outruns or bypasses its own
+#     bounded timeout, or one that isn't wrapped) held fd 9 by INHERITANCE, so it
+#     kept the lock alive after this process was gone. `9>&-` means no descendant
+#     ever sees the lock fd, so the lock is held ONLY by this process and drops
+#     the moment `exec 9>&-` runs below.
+#   * Even so, THIS process would wait on the work forever. For the self-update
+#     paths (--loop/--boot/timer, which run unbounded — only --claude-only and
+#     --dsh-only get the launcher's outer bound) we re-exec ourselves as the
+#     worker under `timeout`, which puts it in its own process group and
+#     escalates to SIGKILL, so the run cannot outlive the deadline.
+run_locked() {  # <deadline_or_0> <run|claude|dsh>
+  local deadline="$1" mode="$2" rc=0
+  # A literal 0 (claude/dsh, and the operator escape hatch) selects the subshell
+  # path; any other value is sanitised before it reaches `timeout` — an
+  # unsanitised knob makes `timeout -k 30 abc` exit 125 without running the work,
+  # turning one config typo into every check failing (the num() discipline).
+  if [ "$deadline" != 0 ] && command -v timeout >/dev/null 2>&1; then
+    deadline="$(num "$deadline" 900)"
+    timeout -k "$(num "${TURMA_RUN_KILL_GRACE:-30}" 30)" "$deadline" \
+      "$SELF" "--locked-$mode" 9>&- || rc=$?
+    if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+      logmsg "update run '$mode' exceeded ${deadline}s and was force-terminated" \
+        "(XERK-549 watchdog); the lock is released so the next check can run"
+    fi
+  else
+    # No inner deadline (claude/dsh, already launcher-bounded) or no `timeout`
+    # binary: still run with the lock fd closed for the work + its children, so a
+    # hung child can't hold the lock after this process releases it.
+    ( dispatch_locked "$mode" ) 9>&- || rc=$?
+  fi
+  return "$rc"
+}
+
+# Is the lock's recorded holder wedged, and if so, reclaim it? Called only when
+# flock -n has already FAILED, i.e. something holds the lock right now. Because
+# the holder is the only process with fd 9 (run_locked closes it for every
+# child), killing that one pid releases the lock. A dead holder would already
+# have freed it — so if we're here, the pid is expected to be live.
+reclaim_stale_lock() {
+  local holder pid started now age reclaim i
+  holder="$(safe_read "$LOCK_HOLDER")"
+  pid="${holder%% *}"; started="${holder##* }"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  case "$started" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1          # holder gone; not ours to reclaim
+  # PID reuse guard: only a process whose cmdline is THIS updater is a real lock
+  # holder. /proc is a kernel pseudo-fs (never a planted FIFO), safe to read;
+  # without it (non-Linux) fall through best-effort.
+  if [ -r "/proc/$pid/cmdline" ]; then
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'turma-agent-update' || return 1
+  fi
+  now="$(date +%s)"
+  age=$(( now - 10#$started ))
+  reclaim="$(num "$LOCK_RECLAIM_AFTER" 7200)"
+  # Too young (a healthy concurrent run) or a future stamp (clock skew): leave it.
+  [ "$age" -ge "$reclaim" ] || return 1
+  logmsg "update.lock held by pid $pid for ${age}s (>= ${reclaim}s) — presumed wedged," \
+    "reclaiming (XERK-549)"
+  kill -TERM "$pid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 5 ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i + 1)); done
+  kill -KILL "$pid" 2>/dev/null || true
+  # The holder's fd 9 is now closed; take the lock on our own fd 9 (still open).
+  if flock -w 10 9; then
+    logmsg "reclaimed update.lock from wedged pid $pid"
+    return 0
+  fi
+  logmsg "could not reclaim update.lock from pid $pid after killing it; skipping"
+  return 1
+}
+
 # Single-flight: never let two update runs race on the swap. Taken and RELEASED
 # per run, never held across a sleep — the --loop poller sleeps for an hour
 # between runs, and holding the lock through that made every start-fired check
 # on a non-systemd host exit immediately as "another update run holds the lock",
 # i.e. silently never run at all.
-with_lock() {  # <cmd...>
+with_lock() {  # <deadline_or_0> <run|claude|dsh>
+  local deadline="$1" mode="$2" rc
   # Same surface as the log: `exec 9>` on a FIFO planted at the lock path blocks
   # before flock is ever reached. Nothing but this script owns that path, so a
   # non-regular file there is removed rather than opened.
@@ -888,13 +1002,49 @@ with_lock() {  # <cmd...>
   fi
   exec 9>"$LOCK"
   if ! flock -n 9; then
-    logmsg "another update run holds the lock; skipping"
-    exec 9>&-
-    return 1
+    # Held. Reclaim it if the holder is wedged (XERK-549); else stand aside, as
+    # single-flight requires.
+    if ! reclaim_stale_lock; then
+      logmsg "another update run holds the lock; skipping"
+      exec 9>&-
+      return 1
+    fi
   fi
-  "$@"
-  local rc=$?
+  # Record who holds it and since when, so a LATER run can reclaim us if we wedge.
+  safe_write "$LOCK_HOLDER" "$$ $(date +%s)"
+  run_locked "$deadline" "$mode"
+  rc=$?
+  rm -f "$LOCK_HOLDER" 2>/dev/null || true
   exec 9>&-
+  return "$rc"
+}
+
+# Consecutive skipped/errored AGENT checks -> a log warning, so a poller stuck
+# on a stale build is visible without inspecting the pod (XERK-549). Reset on the
+# first clean run.
+note_agent_check() {  # <rc>
+  local rc="$1" n prev threshold
+  threshold="$(num "$STRAND_WARN_AT" 3)"
+  if [ "$rc" = 0 ]; then
+    prev="$(safe_read "$SKIP_COUNT" | tr -cd '0-9')"
+    [ -n "$prev" ] && [ "$prev" -ge "$threshold" ] \
+      && logmsg "agent update checks recovered after $prev consecutive skips/errors"
+    rm -f "$SKIP_COUNT" 2>/dev/null || true
+    return 0
+  fi
+  n="$(safe_read "$SKIP_COUNT" | tr -cd '0-9')"; n=$(( 10#${n:-0} + 1 ))
+  safe_write "$SKIP_COUNT" "$n"
+  if [ "$n" -ge "$threshold" ] && [ $(( n % threshold )) -eq 0 ]; then
+    logmsg "WARNING: $n consecutive agent update checks skipped/errored — this host may be" \
+      "stranded on $(installed_version); see ~/.turma/update.log (XERK-549)"
+  fi
+}
+
+# The agent self-update, wrapped: lock + overall deadline + health signal.
+run_agent_check() {
+  local rc=0
+  with_lock "$RUN_DEADLINE" run || rc=$?
+  note_agent_check "$rc"
   return "$rc"
 }
 
@@ -914,6 +1064,18 @@ dsh_check() {
 }
 
 main() {
+  # Internal re-exec entrypoints (XERK-549): run_locked invokes us as
+  # `turma-agent-update --locked-<mode>` under `timeout` to bound the work. These
+  # do the work directly — the lock is already held by our parent, so they never
+  # re-enter with_lock or throttle. Not for humans; deliberately absent from usage().
+  local rc=0
+  case "${1:-}" in
+    --locked-run|--locked-claude|--locked-dsh)
+      dispatch_locked "${1#--locked-}" || rc=$?
+      return "$rc" ;;
+    --locked-*) usage ;;
+  esac
+
   local loop=no boot=no claude_only=no dsh_only=no
   # `sleep 0` in the poller loop is not "no delay", it is a HOT loop — a full
   # release check several times a second, which rate-limits the host against
@@ -939,7 +1101,7 @@ main() {
   # independently instead of one suppressing the other.
   if [ "$claude_only" = yes ]; then
     if throttled "$CLAUDE_STAMP" "claude check"; then return 0; fi
-    with_lock claude_check || return 0
+    with_lock 0 claude || return 0
     return 0
   fi
 
@@ -949,21 +1111,21 @@ main() {
   # (or get throttled by) the claude or agent checks.
   if [ "$dsh_only" = yes ]; then
     if throttled "$DSH_STAMP" "dsh check"; then return 0; fi
-    with_lock dsh_check || return 0
+    with_lock 0 dsh || return 0
     return 0
   fi
 
   if [ "$loop" = yes ]; then
     logmsg "auto-update poller started (every ${INTERVAL}s, repo $REPO)"
     while true; do
-      with_lock run_once || logmsg "update check skipped/errored (continuing)"
+      run_agent_check || logmsg "update check skipped/errored (continuing)"
       sleep "$INTERVAL"
     done
   elif [ "$boot" = yes ]; then
     if throttled "$STAMP" "boot check"; then return 0; fi
-    with_lock run_once || return 0
+    run_agent_check || return 0
   else
-    with_lock run_once || return 0
+    run_agent_check || return 0
   fi
 }
 

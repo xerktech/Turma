@@ -64,6 +64,23 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   `test_turma_agent_update.sh`.
   - **Lock taken per run, released before the sleep** — `--loop` holding it for its whole life made
     every `turma-agentctl start`-fired check exit as "another update run holds the lock".
+  - **A run cannot WEDGE holding the lock (XERK-549)** — a hung child once held it forever (a
+    network/subprocess call that outran its own `timeout`), stranding the host on a stale build
+    silently. Three guards, all in `with_lock`/`run_locked`:
+    - The locked work runs with the **lock fd CLOSED for it (`9>&-`)**, so NO descendant inherits the
+      lock — only the `with_lock` process holds it, and it drops the moment that process releases fd 9.
+    - The **agent self-update** (`--loop`/`--boot`/timer — the unbounded paths; `--claude-only`/
+      `--dsh-only` already get the launcher's outer bound) is re-exec'd as `--locked-run` under an
+      overall `timeout` (`TURMA_RUN_DEADLINE`, default 900s, **< `TURMA_UPDATE_INTERVAL`** so a poll
+      never overlaps the next), so a hung run is force-terminated instead of held.
+    - **Staleness-aware reclaim**: the holder's `pid`+acquire-epoch is recorded (`update.lock.holder`);
+      when `flock -n` fails and the holder is older than `TURMA_LOCK_RECLAIM_AFTER` (default 7200s, **>>
+      the deadline** so a healthy slow run is never a target) AND its `/proc/<pid>/cmdline` is this
+      updater (PID-reuse guard), it is killed and the lock retaken. Killing the single holder pid
+      suffices *because* of `9>&-`.
+    - Telemetry: `note_agent_check` counts consecutive skipped/errored agent checks
+      (`update-skip-count`) and logs a WARNING every `TURMA_UPDATE_STRAND_WARN_AT` (default 3) so a
+      stuck poller shows in `update.log` without a live pod inspection.
   - `install_payload` **requires `hooks/` in the payload before swapping** — the swap deletes
     installed hooks first, and a missing hook command is a non-blocking hook (guard fails open
     silently while VERSION/restart/log all report clean).
