@@ -240,7 +240,7 @@ test("background agents keep a session Active and name what is running", () => {
   const { now, host: h } = host([
     running("11111", "Delegating Task", {
       paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false,
-      agents: [{ type: "qa", label: "QA the parity change" }],
+      agents: [{ type: "general-purpose", label: "Research the parity change" }],
     }),
   ]);
   render({ now, agents: [h] });
@@ -258,7 +258,7 @@ test("background agents: the count is pluralized, and an empty list changes noth
   const { now, host: h } = host([
     running("11111", "Fan Out", {
       paneBusy: false, transcriptAgeSec: 5,
-      agents: [{ type: "qa", label: "QA it" }, { type: "Explore", label: "Map it" }],
+      agents: [{ type: "Explore", label: "Search it" }, { type: "Explore", label: "Map it" }],
     }),
     // An agent predating the field reports none: unchanged, still Idle.
     idle("22222", "Quiet Task"),
@@ -266,6 +266,41 @@ test("background agents: the count is pluralized, and an empty list changes noth
   render({ now, agents: [h] });
   assert.ok(els.active.innerHTML.includes("2 background agents"));
   assert.ok(els.idle.innerHTML.includes("Quiet Task"));
+});
+
+// XERK-538. A running QA / QA-delta subagent is the operator's own change being
+// adversarially exercised — a distinct thing to watch. The card stays Active (it
+// is still working) but says "QA Review" rather than a bare agent count.
+test("a QA agent reads 'QA Review' and stays Active", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    running("11111", "Ship the fix", {
+      paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false,
+      agents: [{ type: "qa", label: "QA the change" }],
+    }),
+  ]);
+  render({ now, agents: [h] });
+  assert.match(els.active.innerHTML, /Active <span class="count">1<\/span>/);
+  assert.ok(els.active.innerHTML.includes("QA Review"), "the card names the QA pass");
+  assert.ok(!els.active.innerHTML.includes("background agent"),
+    "QA Review replaces the bare count, it does not sit beside it");
+  assert.ok(!els.review.innerHTML.includes("Ship the fix"),
+    "a session under QA is not itself ready for review");
+});
+
+// qa-delta is every pass after the first, and it wins over a co-running ordinary
+// agent — the QA pass is what the operator is waiting on.
+test("qa-delta reads 'QA Review', even beside another agent", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    running("11111", "Ship the fix", {
+      paneBusy: false, transcriptAgeSec: 5,
+      agents: [{ type: "Explore", label: "Map it" }, { type: "qa-delta", label: "Re-QA" }],
+    }),
+  ]);
+  render({ now, agents: [h] });
+  assert.ok(els.active.innerHTML.includes("QA Review"));
+  assert.ok(!els.active.innerHTML.includes("2 background agents"));
 });
 
 test("running sessions split: working -> Active, quiet-with-nothing-pending -> Idle", () => {
