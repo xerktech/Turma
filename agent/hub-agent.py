@@ -22900,17 +22900,32 @@ class SessionManager:
         thread = getattr(self, "_limits_probe", None)
         if thread is not None and thread.is_alive():
             return
-        settings = self._ensure_limits_settings()
-        if not settings:
-            self._limits_probe_outcome(False)
-            return
-        # Stamped BEFORE the thread starts, so the backoff also spaces attempts
-        # that die without reaching _limits_probe_outcome.
-        self._limits_probe_at = time.time()
-        self._limits_probe = threading.Thread(
-            target=self._run_limits_probe, args=(settings,),
-            name="limits-probe", daemon=True)
-        self._limits_probe.start()
+        # NOTHING below may raise onto the beat loop: build_payload calls this on
+        # the beat, the agent's MAIN PROCESS with no retry loop of its own
+        # (entrypoint.sh execs run_forever), so an exception here is not a skipped
+        # probe — it is the host and every session on it going down. `Thread.start()`
+        # raising RuntimeError at the pid/thread ceiling (a host at the compose
+        # pids_limit sized against MAX_SESSIONS) is the realistic way that happens;
+        # _ensure_limits_settings does disk I/O too. Same guard, same reason as
+        # queue_archive_sync (XERK-395); this is the sibling site XERK-402 closed.
+        # A failed start leaves a never-started thread (or none), whose is_alive()
+        # is False, so the next beat retries automatically.
+        try:
+            settings = self._ensure_limits_settings()
+            if not settings:
+                self._limits_probe_outcome(False)
+                return
+            # Stamped BEFORE the thread starts, so the backoff also spaces attempts
+            # that die without reaching _limits_probe_outcome.
+            self._limits_probe_at = time.time()
+            self._limits_probe = threading.Thread(
+                target=self._run_limits_probe, args=(settings,),
+                name="limits-probe", daemon=True)
+            self._limits_probe.start()
+        except Exception as e:
+            # `{e}` alone is empty for the message-less exceptions, so name the
+            # type too (the XERK-424 lesson queue_archive_sync's guard carries).
+            log(f"limits probe could not be started: {type(e).__name__}: {e}")
 
     def _run_limits_probe(self, settings):
         """The probe, start to finish: launch a throwaway claude, let one turn
@@ -23994,7 +24009,12 @@ class SessionManager:
         return bool(now_ts and str(now_ts) > str(landed))
 
     def _session_payload(self, sess, refresh=True):
-        sid = sess["id"]
+        # .get(), not sess["id"] — this runs per record on the beat loop, so a
+        # partial/legacy/hand-edited registry record with no "id" must degrade,
+        # never raise KeyError and take the host down (XERK-402). None threads
+        # through the caches and the payload harmlessly, as every OTHER read of a
+        # record's id in this file already does with .get().
+        sid = sess.get("id")
         running = sess.get("status") == "running"
         signals = None
         if running:
@@ -24067,15 +24087,33 @@ class SessionManager:
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
-        gi, work = self._session_git(sess, refresh)
+        # _session_git reads repoPath/worktreePath and shells out to git; on the
+        # beat loop a record missing those keys (a legacy/hand-edited/partial
+        # ~/.turma/sessions.json) must degrade to "no git info", never raise and
+        # take the host down (XERK-402). Both fields are nullable on every client.
+        try:
+            gi, work = self._session_git(sess, refresh)
+        except Exception as e:
+            log(f"session git failed for {sid}: {e}")
+            gi, work = None, None
         return {
             "id": sid,
-            "repo": sess["repo"],
-            "repoPath": sess["repoPath"],
-            "worktreePath": sess["worktreePath"],
-            "branch": sess["branch"],           # app branch: always None now
+            # Read with .get(), NEVER a bare sess["..."] — this dict is built on
+            # the beat loop (build_payload → _session_payload per record), the
+            # agent's main process with no retry, so a registry record missing a
+            # key would raise KeyError straight out and take the host down. A
+            # ~/.turma/sessions.json the agent did not write itself (a legacy
+            # record, a hand-edited file, a partial restore) is exactly the case,
+            # and is precisely the situation an operator is in while editing that
+            # file to recover a host. None is the "can't tell" value every client
+            # already handles (Android coerces null → the field default), matching
+            # _closed_payload, which has always read these defensively. (XERK-402)
+            "repo": sess.get("repo"),
+            "repoPath": sess.get("repoPath"),
+            "worktreePath": sess.get("worktreePath"),
+            "branch": sess.get("branch"),       # app branch: always None now
             "root": sess.get("root", False),
-            "rcName": sess["rcName"],
+            "rcName": sess.get("rcName"),
             "restartCount": sess.get("restartCount", 0),  # bumps on clear-context restart
             "label": sess.get("label"),
             "summary": sess.get("summary"),   # few-word task name (or None)
@@ -24179,7 +24217,8 @@ class SessionManager:
             # the file exists: the pinned id is the conversation this session
             # WILL have, and the hub needs it before the first turn lands.
             "transcriptId": (sess.get("claudeSessionId")
-                             or self._latest_transcript_id(sess["worktreePath"])),
+                             or (self._latest_transcript_id(sess["worktreePath"])
+                                 if sess.get("worktreePath") else None)),
             "session": signals,                      # running only; null otherwise
         }
 

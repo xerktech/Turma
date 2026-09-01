@@ -24,7 +24,9 @@ paths:
     REBINDS rather than mutates it, and each pass snapshots once.
   - **`queue_archive_sync` may not raise** — it runs on the beat loop, the agent's MAIN PROCESS with
     no retry loop of its own; an exception there takes the whole host down. `Thread.start()` at
-    `pids_limit` is the realistic one (XERK-402, `_start_limits_probe` still has this shape).
+    `pids_limit` is the realistic one. **The same guard now wraps `_start_limits_probe`'s thread start
+    and `_session_payload`'s registry-field reads** (XERK-402) — the two sibling beat-loop raise sites
+    XERK-395's QA pass found; the general rule they share is in `.claude/rules/agent.md`.
   - A pass whose cursors predate the previous pass's stores re-offers one chunk per transcript; the
     hub rejects at `startOffset !== have` before storing anything and answers its real cursor.
     Wasted bytes, never a double-store. **A pass is bounded in BYTES, not time**
