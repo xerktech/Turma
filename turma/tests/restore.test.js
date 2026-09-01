@@ -661,3 +661,26 @@ test("restore: the transcript-dir check does not swallow a legitimate path", () 
   for (const wt of ["/root/.claude/projects", "/root/.claude/projects/", "/root/.claude/projects/slug"])
     assert.equal(/(^|\/)\.claude\/projects(\/|$)/.test(wt), true, wt);
 });
+
+test("restore: re-stamps the archived row's org to the target so it can archive back (XERK-344)", async () => {
+  // A restore resumes an archived session on a host that may be in ANOTHER org
+  // (restore is deliberately not org-scoped). The resumed session keeps the same
+  // transcript id, so without this its later archival would be the cross-org
+  // re-point XERK-344 refuses — silently dropping its new turns from the archive.
+  const tid = "bbbbbbbb-1111-2222-3333-444444444444";
+  seedArchive(tid);
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: {
+      device: "k8x", agentId: "k8x", repos: [{ name: "Widget" }], sessions: [],
+      jira: { siteKey: "restore-target.atlassian.net" },
+    },
+  });
+  const r = await request("POST", `/api/archive/${tid}/restore`,
+    { headers: userHeaders, body: { host: "k8x" } });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const row = archive.openDb()
+    .prepare("SELECT siteKey FROM sessions WHERE transcriptId=?").get(tid);
+  assert.equal(row.siteKey, "restore-target.atlassian.net",
+    "the resumed session's later archival is now same-org, so its new turns still archive");
+});

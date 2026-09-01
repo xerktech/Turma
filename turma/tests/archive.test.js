@@ -342,6 +342,111 @@ test("a MIGRATED session keeps writing raw as its new host", () => {
   assert.deepEqual(fs.readFileSync(full), Buffer.concat([a, b]));
 });
 
+test("XERK-344: a host from another org cannot append to or re-point a transcript", () => {
+  // `<host>` is credential-bound (XERK-268), but proving WHO is calling says
+  // nothing about WHOSE archived transcript they may write into. Without the
+  // ownership gate, any host holding its own token could append arbitrary entries
+  // to another host's durable record AND re-attribute the row to itself.
+  archive.ingestChunk("victim", "xerk344-corrupt", { ...RAW_META, summary: "Victim" },
+    0, 20, [ent("v1", "user", "victim-secret")], "orgA.atlassian.net");
+  assert.equal(archive.getTranscript("xerk344-corrupt").host, "victim");
+  // Attacker (org B) holds a valid token for its OWN host and knows the id (a
+  // compromised/buggy host); it pushes at the real cursor.
+  const evil = archive.ingestChunk("evil", "xerk344-corrupt", { ...RAW_META, summary: "Evil" },
+    20, 40, [ent("e1", "user", "evil-injected")], "orgB.atlassian.net");
+  // Refused like an offset mismatch: no progress, no error status.
+  assert.deepEqual(evil, { bytesStored: 20 });
+  const after = archive.getTranscript("xerk344-corrupt");
+  assert.equal(after.host, "victim", "the row must not be re-attributed to the attacker");
+  assert.equal(after.entries.length, 1, "no injected entry");
+  assert.ok(!after.entries.some((e) => (e.text || "").includes("evil-injected")));
+});
+
+test("XERK-344: a same-org host CAN re-point the row (a migration continues)", () => {
+  archive.ingestChunk("src", "xerk344-move", { ...RAW_META, summary: "Move" },
+    0, 20, [ent("s1", "user", "before move")], "orgA.atlassian.net");
+  const cont = archive.ingestChunk("tgt", "xerk344-move", { ...RAW_META, summary: "Move" },
+    20, 40, [ent("t1", "user", "after move")], "orgA.atlassian.net");
+  assert.equal(cont.bytesStored, 40);
+  const t = archive.getTranscript("xerk344-move");
+  assert.equal(t.host, "tgt", "the migration target legitimately owns the row");
+  assert.equal(t.entries.length, 2);
+});
+
+test("XERK-344: a manifest placeholder is stamped, so a cross-org first chunk can't hijack it", () => {
+  const tid = "xerk344-placeholder";
+  // The owner's heartbeat manifest creates the 0-byte placeholder row (org A).
+  archive.manifestCursors("owner", [{ transcriptId: tid, ...RAW_META }], "orgA.atlassian.net");
+  // Before the owner's first content chunk lands, an attacker (org B) that knows
+  // the id pushes content at offset 0.
+  const evil = archive.ingestChunk("evil", tid, { ...RAW_META }, 0, 20,
+    [ent("e", "user", "hijack")], "orgB.atlassian.net");
+  assert.equal(evil.bytesStored, 0, "the cross-org first chunk is refused, not stored");
+  assert.equal(archive.getTranscript(tid), null, "nothing stored under the placeholder");
+  // The owner's own first chunk is accepted.
+  const ok = archive.ingestChunk("owner", tid, { ...RAW_META }, 0, 20,
+    [ent("o", "user", "real")], "orgA.atlassian.net");
+  assert.equal(ok.bytesStored, 20);
+  assert.equal(archive.getTranscript(tid).host, "owner");
+});
+
+test("XERK-344: a legacy row (no recorded org) admits the first writer once, then re-locks", () => {
+  // A pre-XERK-344 archive has sidecars with no siteKey; the schema bump rebuilds
+  // its rows with siteKey NULL. Such an owner can't be proven cross-org, so the
+  // first host to touch it stamps the org — after which the gate is in force.
+  const tid = "xerk344-legacy-aaaa-bbbb-cccc-000000000001";
+  archive.ingestChunk("hostA", tid, { ...RAW_META, summary: "Legacy" }, 0, 20,
+    [ent("l1", "user", "legacy body")], "orgA.atlassian.net");
+  const rel = archive.getTranscript(tid);
+  const metaPath = path.join(process.env.ARCHIVE_DIR,
+    archive.archiveRelPath(tid, { ...RAW_META, summary: "Legacy", host: "hostA" }) + ".meta");
+  const sc = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+  assert.equal(sc.siteKey, "orgA.atlassian.net");
+  delete sc.siteKey;                       // simulate a pre-XERK-344 sidecar
+  fs.writeFileSync(metaPath, JSON.stringify(sc));
+  archive.rebuildIndex();                   // row rebuilds with siteKey NULL
+  assert.equal(rel.host, "hostA");
+  // A different-org host may take the NULL-org row once (trust-on-first-sight)...
+  const first = archive.ingestChunk("hostB", tid, { ...RAW_META, summary: "Legacy" }, 20, 40,
+    [ent("l2", "user", "continued")], "orgB.atlassian.net");
+  assert.equal(first.bytesStored, 40);
+  assert.equal(archive.getTranscript(tid).host, "hostB");
+  // ...but the org is now stamped, so a THIRD org is refused.
+  const third = archive.ingestChunk("hostC", tid, { ...RAW_META, summary: "Legacy" }, 40, 60,
+    [ent("l3", "user", "nope")], "orgC.atlassian.net");
+  assert.deepEqual(third, { bytesStored: 40 });
+  assert.equal(archive.getTranscript(tid).host, "hostB", "the stamped org re-locks the row");
+});
+
+test("XERK-344: restampOrg lets a cross-org restore continuation archive (XERK-441)", () => {
+  // A restore resumes an archived org-A session on an org-B host — deliberately
+  // allowed (the archive is not org-scoped). The resumed session keeps the same
+  // transcript id, so its later archival is a cross-org re-point the gate would
+  // refuse; restampOrg is what keeps the restored session's new turns reachable.
+  const tid = "xerk344-restore-aaaa";
+  archive.ingestChunk("srchost", tid, { ...RAW_META, summary: "Restore" }, 0, 20,
+    [ent("r1", "user", "before restore")], "orgA.atlassian.net");
+  // Without the restamp the org-B continuation is refused (the very data loss).
+  const blocked = archive.ingestChunk("tgthost", tid, { ...RAW_META, summary: "Restore" }, 20, 40,
+    [ent("x", "user", "blocked")], "orgB.atlassian.net");
+  assert.deepEqual(blocked, { bytesStored: 20 }, "cross-org continuation refused before restamp");
+  // The restore stamps the target's org; then it archives cleanly.
+  assert.equal(archive.restampOrg(tid, "orgB.atlassian.net"), true);
+  const cont = archive.ingestChunk("tgthost", tid, { ...RAW_META, summary: "Restore" }, 20, 40,
+    [ent("r2", "user", "after restore")], "orgB.atlassian.net");
+  assert.equal(cont.bytesStored, 40);
+  const t = archive.getTranscript(tid);
+  assert.equal(t.host, "tgthost");
+  assert.equal(t.entries.length, 2);
+  // The stamp survives a rebuild (sidecar updated), so a THIRD org stays refused.
+  archive.rebuildIndex();
+  const evil = archive.ingestChunk("evil", tid, { ...RAW_META, summary: "Restore" }, 40, 60,
+    [ent("e", "user", "nope")], "orgC.atlassian.net");
+  assert.deepEqual(evil, { bytesStored: 40 });
+  // An unknown transcript is a no-op.
+  assert.equal(archive.restampOrg("never-seen-restore", "orgX"), false);
+});
+
 test("the per-transcript raw ceiling stops that session, not the archive", () => {
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");

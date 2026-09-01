@@ -40,9 +40,12 @@ const ARCHIVE_DIR = process.env.ARCHIVE_DIR || "/data/archive";
 const ARCHIVE_DB = process.env.ARCHIVE_DB || path.join(ARCHIVE_DIR, "index.db");
 // 2: dropped the never-populated `cost` column when the product went
 // token-only. 3: added archiveBytes (the budget below reads it). 4: added
-// rawBytes, the same for the raw layer (XERK-338). A bump recreates the tables
-// and refills them from the files.
-const SCHEMA_VERSION = 4;
+// rawBytes, the same for the raw layer (XERK-338). 5: added siteKey — the
+// owner's org, which gates a cross-host row RE-POINT so one host cannot corrupt
+// or re-attribute another's archived transcript (XERK-344). A bump recreates the
+// tables and refills them from the files (an old sidecar has no siteKey, so a
+// rebuilt row's is NULL — see the ownership gate in ingestChunk).
+const SCHEMA_VERSION = 5;
 
 // The largest byte offset a transcript may claim (1 TiB). Far above any real
 // conversation, far below the 2^53 point where a stored value stops being
@@ -278,7 +281,7 @@ function createSchema() {
   db.exec(`CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)`);
   db.exec(`CREATE TABLE IF NOT EXISTS sessions(
      transcriptId TEXT PRIMARY KEY,
-     host TEXT, remoteKey TEXT, repo TEXT, worktree TEXT, slug TEXT,
+     host TEXT, siteKey TEXT, remoteKey TEXT, repo TEXT, worktree TEXT, slug TEXT,
      createdAt TEXT, endedTs TEXT, summary TEXT,
      msgCount INTEGER DEFAULT 0, bytesStored INTEGER DEFAULT 0,
      archiveBytes INTEGER DEFAULT 0, rawBytes INTEGER DEFAULT 0,
@@ -708,13 +711,44 @@ function resolveNewRelPath(transcriptId, full) {
   return null;
 }
 
-function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) {
+function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, siteKey) {
   openDb();
   meta = normalizeMeta(meta);
+  // The pushing host's org, supplied by the HUB (siteKeyOf), never agent-asserted
+  // `meta` — trusting the agent's own `jira.siteKey` here would let any host claim
+  // any org, the same objection XERK-268/348 make. Bounded like every
+  // agent-influenced string that reaches this durable store (XERK-235); "" is the
+  // narrow "no org" answer siteKeyOf already returns.
+  const pushOrg = String(siteKey == null ? "" : siteKey).slice(0, META_TEXT_MAX);
   const row = db.prepare(
-    "SELECT bytesStored, archiveBytes, filePath FROM sessions WHERE transcriptId=?"
+    "SELECT bytesStored, archiveBytes, filePath, host, siteKey FROM sessions WHERE transcriptId=?"
   ).get(transcriptId);
   const have = row ? row.bytesStored : 0;
+  // Ownership (XERK-344). `<host>` is proved by the credential at the route
+  // (XERK-268), but proving WHO is calling says nothing about WHOSE archived
+  // transcript they may write into: without this, any host holding its own token
+  // could APPEND arbitrary entries to another host's durable record AND
+  // re-attribute the row to itself (`host=excluded.host` in the upsert below),
+  // served straight back through GET /api/archive as that host's history. The raw
+  // layer closed the identical hole in XERK-338 (`ingestRaw` requires
+  // row.host === host); this is the rendered layer's version, and it also unblocks
+  // the raw layer's check, which DEPENDS on this re-point happening.
+  //
+  // A host legitimately CHANGES on a migration (XERK-101): the target carries the
+  // same transcript id, continues the conversation, and its rendered push is what
+  // re-points the row. A migration is same-org, so a re-point is allowed exactly
+  // when the pushing host shares the current owner's org — compared as the CLAIMED
+  // org, exactly as POST .../migrate does (turma.md), inheriting its accepted hole
+  // that two org-less hosts match (XERK-349). A same-host append never re-points,
+  // so it is never gated. A row whose owner org predates this column (rebuilt from
+  // a pre-XERK-344 sidecar, siteKey NULL) can't be proven cross-org, so the first
+  // writer stamps it — one-time trust-on-first-sight. Refused exactly like an
+  // offset mismatch: store nothing, hand back the real cursor — never an error
+  // status, which an agent re-sends forever (XERK-255).
+  if (row && row.host && row.host !== host &&
+      row.siteKey != null && String(row.siteKey) !== pushOrg) {
+    return { bytesStored: have };
+  }
   // Store full: hand back the cursor we already hold and store nothing. Not an
   // error status — the agent must read this as "no progress" and move on, never
   // as a chunk to retry (XERK-267). Deleting archives is what reopens it, and
@@ -798,18 +832,18 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
       writtenSinceWalk += Buffer.byteLength(lines);
     }
     db.prepare(`INSERT INTO sessions(
-        transcriptId, host, remoteKey, repo, worktree, slug, createdAt, endedTs,
+        transcriptId, host, siteKey, remoteKey, repo, worktree, slug, createdAt, endedTs,
         summary, msgCount, bytesStored, archiveBytes, filePath, updatedAt)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(transcriptId) DO UPDATE SET
-        host=excluded.host, remoteKey=excluded.remoteKey, repo=excluded.repo,
-        worktree=excluded.worktree, slug=excluded.slug,
+        host=excluded.host, siteKey=excluded.siteKey, remoteKey=excluded.remoteKey,
+        repo=excluded.repo, worktree=excluded.worktree, slug=excluded.slug,
         createdAt=COALESCE(excluded.createdAt, sessions.createdAt),
         endedTs=excluded.endedTs, summary=COALESCE(excluded.summary, sessions.summary),
         msgCount=excluded.msgCount, bytesStored=excluded.bytesStored,
         archiveBytes=excluded.archiveBytes,
         filePath=excluded.filePath, updatedAt=excluded.updatedAt`).run(
-      transcriptId, host, meta.remoteKey || null, meta.repo || null,
+      transcriptId, host, pushOrg, meta.remoteKey || null, meta.repo || null,
       meta.worktree || null, meta.slug || null, meta.createdAt || null,
       meta.endedTs || null, meta.summary || null, msgCount, bytesStored,
       archiveBytes, relPath, nowIso
@@ -823,7 +857,8 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
   }
 
   writeSidecar(paths.meta, {
-    transcriptId, host, remoteKey: meta.remoteKey || null, repo: meta.repo || null,
+    transcriptId, host, siteKey: pushOrg,
+    remoteKey: meta.remoteKey || null, repo: meta.repo || null,
     worktree: meta.worktree || null, slug: meta.slug || null,
     createdAt: meta.createdAt || null, endedTs: meta.endedTs || null,
     summary: meta.summary || null, msgCount, bytesStored, archiveBytes,
@@ -834,6 +869,35 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
   // the payloads on the wire at all; the hub sheds regardless, since an agent
   // too old to read the flag still pushes them.
   return shed ? { bytesStored, shed: true } : { bytesStored };
+}
+
+// Re-point an archived transcript's OWNER ORG to `siteKey`, keeping the sidecar
+// in step so a rebuild preserves it. Returns false if the transcript is unknown.
+//
+// A restore (XERK-441) resumes an ENDED session on a host in ANOTHER org — this
+// is deliberately allowed (the archive is hub-wide and login-gated, and the dead
+// source host has no org left to compare against). The resumed session keeps the
+// SAME transcript id, so when it later archives, its push is a cross-host
+// re-point that ingestChunk's ownership gate (XERK-344) refuses unless the row's
+// org already matches the new home — otherwise the restored session's new turns
+// silently never reach the durable archive. So the restore stamps the target's
+// org here, exactly as a migration's rendered re-point carries the target's org.
+// The row's HOST is left alone: the target's first archive push re-points it, and
+// by then the org matches (the same ordering the raw layer depends on).
+function restampOrg(transcriptId, siteKey) {
+  openDb();
+  const org = String(siteKey == null ? "" : siteKey).slice(0, META_TEXT_MAX);
+  const row = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(transcriptId);
+  if (!row) return false;
+  db.prepare("UPDATE sessions SET siteKey=?, updatedAt=? WHERE transcriptId=?")
+    .run(org, new Date().toISOString(), transcriptId);
+  // Keep the sidecar honest so rebuildIndex re-derives the new org, not the old.
+  if (row.filePath) {
+    const metaPath = filePaths(row.filePath).meta;
+    const sc = readSidecar(metaPath);
+    if (sc) { sc.siteKey = org; try { writeSidecar(metaPath, sc); } catch { /* best-effort */ } }
+  }
+  return true;
 }
 
 // ---- the raw layer ----------------------------------------------------------
@@ -1093,9 +1157,16 @@ function rawFileFor(transcriptId, rel) {
 
 // Upsert metadata rows for a manifest and return the bytes-have cursor map the
 // heartbeat reply carries back (transcriptId -> bytesStored we already hold).
-function manifestCursors(host, manifest) {
+function manifestCursors(host, manifest, siteKey) {
   openDb();
   const have = {};
+  // The row this creates is a placeholder (0 bytes) that the OWNER's first chunk
+  // fills. Stamp its org here too, or that row's `siteKey` is NULL and the
+  // ingestChunk gate (XERK-344) would treat a cross-org host's first chunk as a
+  // legacy trust-on-first-sight write and let it HIJACK the not-yet-filled
+  // transcript. Only INSERT is reached (the loop guards on `!row`), so this never
+  // re-points an existing row — same hub-supplied org, bounded, as ingestChunk.
+  const pushOrg = String(siteKey == null ? "" : siteKey).slice(0, META_TEXT_MAX);
   // Capped like the raw cursors beside it, and for the same reason — it is the
   // same handler, the same beat and the same single event loop. Pre-existing but
   // strictly worse: one SELECT + INSERT per entry, measured at 6.9 SECONDS of
@@ -1112,12 +1183,12 @@ function manifestCursors(host, manifest) {
     list = list.slice(0, ARCHIVE_MANIFEST_CURSOR_MAX);
   }
   const upsert = db.prepare(`INSERT INTO sessions(
-      transcriptId, host, remoteKey, repo, worktree, slug, createdAt, endedTs,
+      transcriptId, host, siteKey, remoteKey, repo, worktree, slug, createdAt, endedTs,
       summary, updatedAt)
-    VALUES(?,?,?,?,?,?,?,?,?,?)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(transcriptId) DO UPDATE SET
-      host=excluded.host, remoteKey=excluded.remoteKey, repo=excluded.repo,
-      worktree=excluded.worktree, slug=excluded.slug,
+      host=excluded.host, siteKey=excluded.siteKey, remoteKey=excluded.remoteKey,
+      repo=excluded.repo, worktree=excluded.worktree, slug=excluded.slug,
       createdAt=COALESCE(excluded.createdAt, sessions.createdAt),
       endedTs=excluded.endedTs, summary=COALESCE(excluded.summary, sessions.summary),
       updatedAt=excluded.updatedAt`);
@@ -1128,7 +1199,7 @@ function manifestCursors(host, manifest) {
       const row = db.prepare("SELECT bytesStored FROM sessions WHERE transcriptId=?").get(m.transcriptId);
       have[m.transcriptId] = row ? row.bytesStored : 0;
       if (!row) {
-        upsert.run(m.transcriptId, host, m.remoteKey || null, m.repo || null,
+        upsert.run(m.transcriptId, host, pushOrg, m.remoteKey || null, m.repo || null,
           m.worktree || null, m.slug || null, m.createdAt || null,
           m.endedTs || null, m.summary || null, nowIso);
       }
@@ -1297,9 +1368,9 @@ function rebuildIndex() {
     "INSERT INTO entries_fts(text, transcriptId, uuid, role, ts) VALUES(?,?,?,?,?)"
   );
   const upsert = db.prepare(`INSERT OR REPLACE INTO sessions(
-      transcriptId, host, remoteKey, repo, worktree, slug, createdAt, endedTs,
+      transcriptId, host, siteKey, remoteKey, repo, worktree, slug, createdAt, endedTs,
       summary, msgCount, bytesStored, archiveBytes, rawBytes, filePath, updatedAt)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   for (const jsonl of files) {
     const meta = readSidecar(jsonl + ".meta") || {};
     const transcriptId = meta.transcriptId;
@@ -1328,7 +1399,11 @@ function rebuildIndex() {
         insertEntry.run(String(e.text || ""), transcriptId, e.uuid || null, e.role || null, e.ts || null);
         msgCount++;
       }
-      upsert.run(transcriptId, meta.host || null, meta.remoteKey || null,
+      // `?? null` KEEPS a recorded "" (a no-org owner, still protected by the
+      // gate) and maps only a missing field to NULL — a pre-XERK-344 sidecar has
+      // no siteKey, so its row rebuilds NULL (legacy trust-on-first-sight).
+      upsert.run(transcriptId, meta.host || null, meta.siteKey ?? null,
+        meta.remoteKey || null,
         meta.repo || null, meta.worktree || null, meta.slug || null,
         meta.createdAt || null, meta.endedTs || null, meta.summary || null,
         msgCount, meta.bytesStored || 0, archiveBytes, rawBytes, relPath,
@@ -1521,7 +1596,7 @@ module.exports = {
   ingestRaw, rawCursors, rawLimits, listRawFiles, rawFileFor,
   safeRawRel, rawDirFor, rawFilePath,
   totalArchiveBytes, totalForCeiling, __resetTotalCache,
-  searchArchive, listArchive, getTranscript, sessionRow,
+  searchArchive, listArchive, getTranscript, sessionRow, restampOrg,
   // Test seam. The raw layer's own `.jsonl` files carry no `.meta`, so the
   // rebuild would skip them anyway — this is exported so the SKIP itself can be
   // pinned rather than that backstop, because the skip is what stops a rebuild
