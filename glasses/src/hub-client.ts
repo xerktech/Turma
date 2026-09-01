@@ -154,20 +154,61 @@ export interface HubClientOptions {
 // through instead of at one call site.
 export const HUB_FETCH_TIMEOUT_MS = 30_000;
 
-/** Race `base` against a timer so a never-settling fetch becomes a normal error. */
+// Race `base` against a timer so a never-settling fetch becomes a normal error,
+// AND abort() the underlying request when the timer wins (XERK-336).
+//
+// The timer race alone SETTLES the caller but never CANCELS the fetch: the
+// abandoned request keeps its socket and a partially-buffered body open until
+// the peer drops them, with no reference left to close them. On the G2's tight
+// runtime, polling every 6s, a wedged origin holding sockets open accumulates
+// that leak. Passing an AbortController's signal and abort()ing it on timeout
+// closes the socket AND tears down the response the body is being read from, so
+// it cancels a stalled `readJson` for free.
+//
+// The timer race STAYS as the settlement guarantee, independent of abort:
+//   - The Even Hub JS runtime may lack AbortController; when it does we fabricate
+//     no signal and fall back to exactly the old behaviour (guarded below).
+//   - An injected fetchFn may ignore the signal it is handed — veiller's RPC
+//     proxy marshals across a boundary and cannot honour it — so the caller must
+//     still settle on the timer whether or not the abort took effect.
 export function timeoutFetch(
   base: typeof fetch,
   timeoutMs: number = HUB_FETCH_TIMEOUT_MS,
 ): typeof fetch {
   if (!timeoutMs || timeoutMs <= 0) return base;
+  const AbortCtor =
+    typeof globalThis.AbortController !== "undefined" ? globalThis.AbortController : undefined;
   const wrapped = (input: unknown, init?: RequestInit): Promise<Response> =>
     new Promise<Response>((resolve, reject) => {
+      const controller = AbortCtor ? new AbortCtor() : undefined;
+      // Forward a caller-supplied signal onto ours so cancelling either one
+      // still tears the request down. No caller passes one today; kept so a
+      // future one isn't silently overridden by the signal we inject.
+      const caller = init?.signal;
+      let onCallerAbort: (() => void) | undefined;
+      if (controller && caller) {
+        if (caller.aborted) controller.abort();
+        else {
+          onCallerAbort = () => controller.abort();
+          caller.addEventListener("abort", onCallerAbort, { once: true });
+        }
+      }
+      const nextInit = controller ? { ...init, signal: controller.signal } : init;
       const timer = setTimeout(() => {
+        controller?.abort();
         reject(new Error(`hub fetch timed out after ${timeoutMs}ms`));
       }, timeoutMs);
-      base(input as never, init).then(
-        (res) => { clearTimeout(timer); resolve(res); },
-        (err) => { clearTimeout(timer); reject(err); },
+      // Settle → drop the timer AND the caller-abort listener. `{ once: true }`
+      // only self-removes when it FIRES, so a request that finishes without the
+      // caller ever aborting would otherwise leave the listener (and its
+      // captured controller) attached to a caller signal reused across requests.
+      const cleanup = () => {
+        clearTimeout(timer);
+        if (onCallerAbort && caller) caller.removeEventListener("abort", onCallerAbort);
+      };
+      base(input as never, nextInit).then(
+        (res) => { cleanup(); resolve(res); },
+        (err) => { cleanup(); reject(err); },
       );
     });
   return wrapped as unknown as typeof fetch;
