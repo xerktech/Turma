@@ -9,7 +9,8 @@ paths:
 Split out of `CLAUDE.md`. Cross-component principles (container-limit derivation, the 413/503
 contract, the XERK-287 gap) stay there. This file is the `turma/server.js` mechanics.
 
-The hub is the fleet's sole control plane under `mem_limit: 256m`, with `restart: unless-stopped`
+The hub is the fleet's sole control plane under `mem_limit: 512m` (raised from 256m for XERK-287),
+with `restart: unless-stopped`
 (a crash loop, not a safety net). Two bounds are needed; neither substitutes for the other.
 
 ## Two bounds
@@ -129,6 +130,36 @@ The hub is the fleet's sole control plane under `mem_limit: 256m`, with `restart
       thin container headroom (one 30 MiB beat alone measures ~185 MiB real RSS). Rare + retryable on
       the liveness route, versus a fleet-wide OOM. Tests pin `worst > TOTAL_MAX` (nothing co-resides)
       and `worst < MEMORY_LIMIT` (the one beat still fits).
+
+## The XERK-287 co-peak, and why the ingress closes findings 2/3
+
+- **The staged-upload relay is a budget SEPARATE from the in-flight ceiling** (`UPLOAD_TOTAL_MAX_BYTES`
+  = `min(128 MiB, MEMORY_LIMIT/4)`, held for MINUTES not one request), so the hub's true worst-case
+  heap is `BODY_INFLIGHT_TOTAL_MAX + UPLOAD_TOTAL_MAX_BYTES` = ¾ of the container. At 256m that was
+  128 + 64 = 192 MiB and OOM'd. **Closed by raising `mem_limit` to 512m** (ArgoCD `ai/turma/
+  deployment.yaml`) — co-peak 256 + 128 = 384 MiB + ~60 baseline ≈ 444, ~68 MiB margin — NOT by
+  shrinking either budget (the two rejected levers were halving the upload relay and halving
+  `HEARTBEAT_MAX`, both with user-visible cost). The parse-cost model means held memory ≈ the budget,
+  so the raise is safe by design; the 256m OOM was the ~6 MiB margin being eaten by transient churn.
+- **The chunked-body and socket-error halves (findings 2/3) are neutralized by the DEPLOYMENT
+  topology, and need no hub code.** In k8s the hub is fronted by an NGINX Inc ingress with
+  `proxy_request_buffering on` (its default, unoverridden): nginx buffers each request body IN FULL,
+  then forwards it upstream DECLARED-LENGTH and relays the hub's response back.
+  - So the hub's declared-length pre-check (`readBody`, the `Content-Length > budget` refusal) always
+    fires — a client sending **chunked** cannot bypass it, because nginx re-frames chunked → declared
+    before the hub sees a byte. **Do NOT add an "undeclared-body concurrency cap"** — it would guard a
+    path that does not exist through the ingress and could refuse legitimate beats.
+  - And an oversize body always gets a **readable 413**, never XERK-235's bare socket error: nginx has
+    the whole body buffered, so the hub's drain-slack socket cut never strands the agent's urllib POST.
+    Verified against the real prod URL: 0.5–8 MiB bodies, declared AND chunked, via python-urllib →
+    every one a clean `HTTP 413 {"limit":…}`, zero socket errors (8 MiB = 4× the cap, 4× past the
+    drain window). The direct client↔hub topology XERK-235/finding 3 assumed was the OLD DockerOps
+    cloudflared→hub path; the k8s migration put nginx in front.
+  - **Residual:** an IN-CLUSTER agent posts to the Service directly (`http://turma.ai.svc…`), bypassing
+    nginx. Finding 2 still never applies (urllib always sets Content-Length); finding 3 is a bounded
+    residual for that trusted host. The `readBody` urllib caveat below still holds for that direct path.
+  - **cloudflared's framing is irrelevant** to what the hub sees — it is upstream of nginx, which
+    normalizes. The ticket's "measure cloudflared" question was moot once nginx was in the path.
 
 ## Verifying a change here
 
