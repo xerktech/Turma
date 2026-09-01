@@ -2160,3 +2160,18 @@ test("scanAgentEntry: a synthesized dsh workflow launch is a workflow row, its s
     "<task-notification><task-id>" + RUN + "</task-id><status>completed</status></task-notification>" } };
   assert.deepEqual(scan(launch.concat([stop])), []);
 });
+
+const { deviceDiscriminator } = require("../tunnel-agent.js");
+
+// The discriminator is the parity-critical half of the XERK-289 fallback: py and
+// js must build the SAME "unknown-device-<disc>" or a host's tunnel and manager
+// register under different names (a working-commands / dead-terminal host). The
+// device_name() end-to-end fallback is stubbed and asserted in the Python suite
+// (test_hub_agent.py TestDeviceName), which can fully stub its naming sources.
+test("deviceDiscriminator mirrors hub-agent.py: lowercase, keep [0-9a-z-], truncate 12 (XERK-289)", () => {
+  assert.equal(deviceDiscriminator("fe0e38df73b4"), "fe0e38df73b4");
+  assert.equal(deviceDiscriminator("WIN_DESK.01"), "windesk01");
+  assert.equal(deviceDiscriminator("a".repeat(64)), "a".repeat(12));
+  assert.equal(deviceDiscriminator("  "), "");
+  assert.equal(deviceDiscriminator(null), "");
+});

@@ -214,11 +214,37 @@ class TestDeviceName(unittest.TestCase):
     def test_os_hostname_used_when_real(self):
         self.assertEqual(self._run(gethostname="bare-linux"), "bare-linux")
 
-    def test_container_id_hostname_falls_back_to_placeholder(self):
-        # The reported bug: no env, no mount, docker=docker-desktop, SMB blocked,
-        # and gethostname() is the container id -> unknown-device, never the id.
+    def test_container_id_hostname_falls_back_to_unique_placeholder(self):
+        # No env, no mount, docker=docker-desktop, SMB blocked, gethostname() is
+        # the container id -> a UNIQUE-per-host fallback (never the bare id as a
+        # name), so two such hosts don't merge into one hub record (XERK-289).
         self.assertEqual(
-            self._run(docker_name="docker-desktop", smb_name=""), "unknown-device")
+            self._run(docker_name="docker-desktop", smb_name=""),
+            "unknown-device-fe0e38df73b4")
+
+    def test_fallback_is_bare_when_no_discriminator(self):
+        # With nothing usable to disambiguate (gethostname empty), the bare
+        # fallback stands — the hub's collision detection is the backstop there.
+        self.assertEqual(
+            self._run(docker_name="docker-desktop", smb_name="", gethostname=""),
+            "unknown-device")
+
+    def test_fallbacks_of_two_collided_hosts_are_distinct(self):
+        # The whole point: two containers that both exhaust every naming source
+        # land on DISTINCT keys, not one merged record.
+        a = self._run(docker_name="docker-desktop", smb_name="", gethostname="aaaaaaaaaaaa")
+        b = self._run(docker_name="docker-desktop", smb_name="", gethostname="bbbbbbbbbbbb")
+        self.assertNotEqual(a, b)
+        self.assertEqual((a, b), ("unknown-device-aaaaaaaaaaaa", "unknown-device-bbbbbbbbbbbb"))
+
+    def test_device_discriminator_sanitises_and_truncates(self):
+        # Mirror of tunnel-agent.js deviceDiscriminator: lowercase, keep
+        # [0-9a-z-], drop the rest, truncate to 12.
+        self.assertEqual(ha._device_discriminator("fe0e38df73b4"), "fe0e38df73b4")
+        self.assertEqual(ha._device_discriminator("WIN_DESK.01"), "windesk01")
+        self.assertEqual(ha._device_discriminator("a" * 64), "a" * 12)
+        self.assertEqual(ha._device_discriminator("  "), "")
+        self.assertEqual(ha._device_discriminator(None), "")
 
 
 class TestCodingAgent(unittest.TestCase):

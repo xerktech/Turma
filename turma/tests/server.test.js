@@ -2838,6 +2838,43 @@ test("a dropped models block is TALLIED, not silently deleted", async () => {
   }
 });
 
+test("XERK-289: a second host beating under an existing host's name is warned about", async () => {
+  // Two DIFFERENT physical hosts reporting the SAME device name silently share
+  // one registry record; the device name is the only wire identity so the hub
+  // can't key them apart, but `agentId` differs — that mismatch is the signal.
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (...a) => warnings.push(a.join(" "));
+  try {
+    // First host claims the name — no incumbent, so no warning.
+    assert.equal((await request("POST", "/api/heartbeat", {
+      body: { device: "shared-name", agentId: "host-A" }, headers: agentHeaders,
+    })).status, 200);
+    assert.equal(warnings.length, 0, "first beat is not a collision");
+    // Same host beats again — same agentId, no warning.
+    assert.equal((await request("POST", "/api/heartbeat", {
+      body: { device: "shared-name", agentId: "host-A" }, headers: agentHeaders,
+    })).status, 200);
+    assert.equal(warnings.length, 0, "an incumbent re-beat is not a collision");
+    // A DIFFERENT host beats under the same name — warned, and named.
+    assert.equal((await request("POST", "/api/heartbeat", {
+      body: { device: "shared-name", agentId: "host-B" }, headers: agentHeaders,
+    })).status, 200);
+    assert.equal(warnings.length, 1, "the collision is surfaced");
+    assert.match(warnings[0], /collision/);
+    assert.match(warnings[0], /shared-name/);
+    assert.match(warnings[0], /host-A/);
+    assert.match(warnings[0], /host-B/);
+    // Throttled: an immediate repeat of the collision does not re-warn.
+    assert.equal((await request("POST", "/api/heartbeat", {
+      body: { device: "shared-name", agentId: "host-A" }, headers: agentHeaders,
+    })).status, 200);
+    assert.equal(warnings.length, 1, "the warning is time-throttled");
+  } finally {
+    console.warn = realWarn;
+  }
+});
+
 test("http: a malformed top-level models block cannot empty every phone's fleet", async () => {
   // The same failure class as usage.models, one field up and a different shape.
   // Android types `models` as `ModelsInfo?` and decodes /api/agents atomically,
