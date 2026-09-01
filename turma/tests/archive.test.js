@@ -437,28 +437,142 @@ test("the per-beat cursor stat loop is bounded by the HUB, not by the agent", ()
   assert.match(fresh.stderr, /ARCHIVE_RAW_CURSOR_MAX/);
 });
 
-test("two transcripts sharing a canonical file do not share a raw directory", () => {
+test("two transcripts that would collide on 8 alnum chars get separate canonical files (XERK-277)", () => {
   // `archiveRelPath` keeps only the first 8 alnum characters of the id, so two
-  // transcripts agreeing on repo/date/summary/host and that prefix land on ONE
-  // canonical .jsonl. Their raw layers must still be separate, or each one's
-  // /raw listing returns the other's files and the read-back route serves them
-  // (XERK-338 QA D6). `transcriptId` is agent-chosen, so this can be forced.
+  // transcripts agreeing on repo/date/summary/host and that prefix WOULD land on
+  // ONE canonical .jsonl — and ingestChunk APPENDS, so each session's read-back
+  // then serves the other's entries. `transcriptId` is agent-chosen, so this can
+  // be forced, not just hit by accident. resolveNewRelPath disambiguates the
+  // second one's filename on first sight.
   const A = "collide1-aaaa-bbbb-cccc-000000000001";
   const B = "collide1-aaaa-bbbb-cccc-000000000002";
   for (const tid of [A, B]) {
     archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Collide" }, 0, 10,
+      [ent("u1", "user", `secret of ${tid}`)]);
+  }
+  const db = archive.openDb();
+  const byId = new Map(
+    db.prepare("SELECT transcriptId, filePath FROM sessions WHERE transcriptId IN (?,?)")
+      .all(A, B).map((r) => [r.transcriptId, r.filePath]));
+  assert.notEqual(byId.get(A), byId.get(B), "the two transcripts still share one file");
+  // The disambiguated name still carries the readable prefix; only a suffix differs.
+  assert.match(byId.get(B), /-2\.jsonl$/);
+  // Neither read-back leaks the other's content.
+  assert.equal(archive.getTranscript(A).entries.length, 1);
+  assert.equal(archive.getTranscript(A).entries[0].text, `secret of ${A}`);
+  assert.equal(archive.getTranscript(B).entries[0].text, `secret of ${B}`);
+});
+
+test("ids with fewer than 8 alnum chars don't collapse onto one 'unknown' file (XERK-277)", () => {
+  // Any id with <8 alnum characters slugs to the literal "unknown", so ids like
+  // "..." and ".-." landed on one file even without a prefix collision.
+  const A = "...";
+  const B = ".-.";
+  for (const tid of [A, B]) {
+    archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Short" }, 0, 10,
+      [ent("u1", "user", `content of ${tid}`)]);
+  }
+  const db = archive.openDb();
+  const rows = db.prepare("SELECT transcriptId, filePath FROM sessions WHERE transcriptId IN (?,?)").all(A, B);
+  assert.notEqual(rows[0].filePath, rows[1].filePath, "two short ids share one 'unknown' file");
+  assert.equal(archive.getTranscript(A).entries[0].text, `content of ${A}`);
+  assert.equal(archive.getTranscript(B).entries[0].text, `content of ${B}`);
+});
+
+test("a re-pushed transcript reuses its filePath rather than disambiguating again (XERK-277)", () => {
+  // Disambiguation runs ONLY on first sight. A second delta for the same id must
+  // find its row.filePath and append to the same file, never fork a new one.
+  const tid = "reuse01-aaaa-bbbb-cccc-000000000001";
+  archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Reuse" }, 0, 10, [ent("u1", "user", "one")]);
+  const db = archive.openDb();
+  const first = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(tid).filePath;
+  archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Reuse" }, 10, 20, [ent("u2", "user", "two")]);
+  const second = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(tid).filePath;
+  assert.equal(first, second);
+  assert.equal(archive.getTranscript(tid).entries.length, 2);
+});
+
+test("two transcripts sharing a prefix keep separate raw directories (XERK-338)", () => {
+  // Belt to resolveNewRelPath's braces: rawDirFor is keyed on the FULL id, so
+  // even a forced canonical collision could never cross raw layers — each one's
+  // /raw listing returns only its own files.
+  const A = "collide2-aaaa-bbbb-cccc-000000000001";
+  const B = "collide2-aaaa-bbbb-cccc-000000000002";
+  for (const tid of [A, B]) {
+    archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Collide2" }, 0, 10,
       [ent("u1", "user", "hi")]);
     archive.ingestRaw("nas", tid, `${tid}.jsonl`, 0, Buffer.from(tid));
   }
-  // Same canonical file — the collision is real, not hypothetical.
-  const db = archive.openDb();
-  const rows = db.prepare("SELECT filePath FROM sessions WHERE transcriptId IN (?,?)").all(A, B);
-  assert.equal(rows[0].filePath, rows[1].filePath, "the fixture no longer collides");
-  // ...but each raw layer holds only its own file.
   assert.deepEqual(archive.listRawFiles(A).map((f) => f.path), [`${A}.jsonl`]);
   assert.deepEqual(archive.listRawFiles(B).map((f) => f.path), [`${B}.jsonl`]);
   assert.deepEqual(fs.readFileSync(archive.rawFileFor(A, `${A}.jsonl`)), Buffer.from(A));
   assert.equal(archive.rawFileFor(A, `${B}.jsonl`), null, "A served B's file");
+});
+
+test("a deleted .jsonl whose row survives still OWNS its path — no interleave onto the gap (XERK-277/XERK-280)", () => {
+  // relPathOwner consults the sessions TABLE first, not just the on-disk sidecar,
+  // exactly so that a transcript whose .jsonl (and .meta) was deleted out from
+  // under a surviving row keeps its path. A disk-only check would call the path
+  // free and hand it to a colliding transcript, which — since ingest appends —
+  // would then interleave onto the surviving row's cursor gap.
+  const A = "gaprow01-aaaa-bbbb-cccc-000000000001";
+  const B = "gaprow01-aaaa-bbbb-cccc-000000000002";
+  archive.ingestChunk("nas", A, { ...RAW_META, summary: "Gap" }, 0, 10, [ent("u1", "user", "a-secret")]);
+  const db = archive.openDb();
+  const relA = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(A).filePath;
+  // Delete BOTH files, leave the row (XERK-280).
+  fs.rmSync(path.join(process.env.ARCHIVE_DIR, relA), { force: true });
+  fs.rmSync(path.join(process.env.ARCHIVE_DIR, relA + ".meta"), { force: true });
+  archive.ingestChunk("nas", B, { ...RAW_META, summary: "Gap" }, 0, 10, [ent("u1", "user", "b-secret")]);
+  const relB = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(B).filePath;
+  assert.notEqual(relB, relA, "B was handed A's still-owned path");
+});
+
+test("the fallback past the readable probes stays ownership-checked — no leak (XERK-277)", () => {
+  // Fill base + -2..-N so a further collision has to reach the id-seeded
+  // fallback, then push two ids whose slugify() collapses to the SAME token
+  // (they differ only by a leading '-'). The fallback must NOT hand both one
+  // file — an earlier version returned the id-seeded name unchecked.
+  const fam = { ...RAW_META, summary: "Fallback" };
+  // A tiny probe cap would make this cheap, but the module reads it at load; N is
+  // 1000, so seed enough distinct owners to exhaust the readable band.
+  const N = archive.__RELPATH_PROBE_MAX;
+  for (let i = 1; i <= N; i++) {
+    // 8-alnum prefix "floodpre" shared; the rest keeps each id distinct.
+    archive.ingestChunk("nas", `floodpre-fill-${i}`, fam, 0, 10, [ent("u", "user", `fill${i}`)]);
+  }
+  const X = "-floodpre-tail-zzz";
+  const Y = "floodpre-tail-zzz";
+  archive.ingestChunk("nas", X, fam, 0, 10, [ent("u", "user", "X-SECRET")]);
+  archive.ingestChunk("nas", Y, fam, 0, 10, [ent("u", "user", "Y-SECRET")]);
+  const db = archive.openDb();
+  const px = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(X).filePath;
+  const py = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(Y).filePath;
+  assert.notEqual(px, py, "two slug-colliding ids shared one fallback file");
+  assert.equal(archive.getTranscript(X).entries[0].text, "X-SECRET");
+  assert.equal(archive.getTranscript(Y).entries[0].text, "Y-SECRET");
+});
+
+test("rebuildIndex re-derives two disambiguated files without merging them (XERK-277)", () => {
+  const A = "rebuild1-aaaa-bbbb-cccc-000000000001";
+  const B = "rebuild1-aaaa-bbbb-cccc-000000000002";
+  for (const tid of [A, B]) {
+    archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Rebuilt" }, 0, 10,
+      [ent("u1", "user", `body of ${tid}`)]);
+  }
+  const db = archive.openDb();
+  const before = new Map(
+    db.prepare("SELECT transcriptId, filePath FROM sessions WHERE transcriptId IN (?,?)")
+      .all(A, B).map((r) => [r.transcriptId, r.filePath]));
+  // Wipe and rebuild from the files on disk (their .meta sidecars).
+  archive.rebuildIndex();
+  const after = new Map(
+    db.prepare("SELECT transcriptId, filePath FROM sessions WHERE transcriptId IN (?,?)")
+      .all(A, B).map((r) => [r.transcriptId, r.filePath]));
+  assert.equal(after.get(A), before.get(A));
+  assert.equal(after.get(B), before.get(B));
+  assert.notEqual(after.get(A), after.get(B));
+  assert.equal(archive.getTranscript(B).entries[0].text, `body of ${B}`);
 });
 
 test("a repo folder named like a raw directory is still archived", () => {

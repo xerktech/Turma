@@ -285,6 +285,12 @@ function createSchema() {
      filePath TEXT, updatedAt TEXT)`);
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
      text, transcriptId UNINDEXED, uuid UNINDEXED, role UNINDEXED, ts UNINDEXED)`);
+  // filePath is looked up by VALUE on first-sight to detect a canonical-name
+  // collision (resolveNewRelPath, XERK-277). Not a UNIQUE index — a collided
+  // file that predates the fix legitimately has two rows on one path, and a
+  // UNIQUE would make rebuildIndex throw over the existing store rather than
+  // re-derive it. Created outside the schema bump so an already-open DB gains it.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_filePath ON sessions(filePath)`);
 }
 
 // Open (once) and ensure the schema. If the DB was absent/empty but organized
@@ -636,6 +642,72 @@ function normalizeMeta(meta) {
   return out;
 }
 
+// The transcriptId that already OWNS a canonical relative path, or null if it is
+// free (or owned by this same transcript). Used only on first-sight, to keep two
+// different transcripts off one .jsonl (XERK-277).
+//
+// The sessions table is AUTHORITATIVE — it survives a `.jsonl` deleted out from
+// under a row that keeps its filePath (XERK-280), where a disk-only check would
+// call the path free and hand it to a second transcript, which then appends onto
+// the surviving row's gap: the exact interleave this exists to stop. The disk
+// sidecar is the backstop for an index that was wiped and has not rebuilt yet.
+function relPathOwner(relPath, transcriptId) {
+  const row = db.prepare("SELECT transcriptId FROM sessions WHERE filePath=?").get(relPath);
+  if (row && row.transcriptId && row.transcriptId !== transcriptId) return row.transcriptId;
+  const sc = readSidecar(filePaths(relPath).meta);
+  if (sc && sc.transcriptId && sc.transcriptId !== transcriptId) return sc.transcriptId;
+  return null;
+}
+
+// How many `-N` suffixes to probe before falling back to the full id. A real
+// collision needs a repo/date/summary/host match AND an 8-char id-prefix match,
+// so even a handful is generous; the cap only bounds a pathological forced flood.
+const RELPATH_PROBE_MAX = 1000;
+
+// The canonical relative path for a transcript seen for the FIRST time (no
+// filePath row yet, so nothing to be consistent with). archiveRelPath keys the
+// filename on only the first 8 alnum characters of the id, and any id with fewer
+// than 8 alnum characters collapses to the literal "unknown" — so two distinct
+// transcripts agreeing on repo/date/summary/host and that prefix compute the
+// SAME path. Left unresolved they interleave into one .jsonl (ingestChunk
+// APPENDS) and each session's read-back serves the merged file for either id, a
+// cross-session content leak in the durable store (XERK-277). transcriptId is
+// agent-chosen and every agent shares one token, so it can be forced, not just
+// hit by accident.
+//
+// On a collision with a DIFFERENT transcript, disambiguate the suffix until the
+// path is unowned. The result is written into filePath AND the .meta sidecar, so
+// it is stable for the life of the transcript (ingestChunk reuses row.filePath
+// thereafter) and rebuildIndex re-derives it from the on-disk name unchanged —
+// additive on collision, never a rename of what is already there.
+function resolveNewRelPath(transcriptId, full) {
+  const base = archiveRelPath(transcriptId, full);
+  if (!relPathOwner(base, transcriptId)) return base;
+  const stem = base.slice(0, -".jsonl".length);
+  // Readable first: <base>-2.jsonl, -3, …
+  for (let n = 2; n <= RELPATH_PROBE_MAX; n++) {
+    const cand = `${stem}-${n}.jsonl`;
+    if (!relPathOwner(cand, transcriptId)) return cand;
+  }
+  // Only a forced flood on one prefix reaches here. Seed the suffix with the
+  // full id — but slugify is NOT injective (it lowercases, strips leading/
+  // trailing [-.], and truncates to 60), so two distinct ids in one collision
+  // family can slug alike. So this candidate is STILL run through relPathOwner
+  // and STILL counts up on a hit: returning it unchecked would re-open the exact
+  // cross-session leak this function exists to close.
+  const idStem = `${stem}-${slugify(transcriptId, "x")}`;
+  for (let n = 0; n <= RELPATH_PROBE_MAX; n++) {
+    const cand = n === 0 ? `${idStem}.jsonl` : `${idStem}-${n}.jsonl`;
+    if (!relPathOwner(cand, transcriptId)) return cand;
+  }
+  // Both families exhausted against DIFFERENT owners — needs thousands of
+  // pre-placed collisions, i.e. a deliberate flood. Refuse to NAME it rather
+  // than hand back an unchecked (leak-prone) path; the caller stores nothing and
+  // reports its real cursor, the same "no progress" answer an offset mismatch
+  // gives (never an error status, which an agent re-sends forever, XERK-255).
+  return null;
+}
+
 function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) {
   openDb();
   meta = normalizeMeta(meta);
@@ -670,7 +742,15 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
   }
 
   const full = { ...meta, host, transcriptId };
-  let relPath = row && row.filePath ? row.filePath : archiveRelPath(transcriptId, full);
+  let relPath = row && row.filePath ? row.filePath : resolveNewRelPath(transcriptId, full);
+  // null only when resolveNewRelPath could not find an unowned name after a
+  // deliberate collision flood — store nothing and report the real cursor rather
+  // than write into another transcript's file.
+  if (!relPath) {
+    console.error(`archive: could not place ${transcriptId} — its canonical name ` +
+      `collides and every disambiguation is owned; storing nothing this beat`);
+    return { bytesStored: have };
+  }
   const paths = filePaths(relPath);
   fs.mkdirSync(paths.dir, { recursive: true });
 
@@ -1433,7 +1513,8 @@ module.exports = {
   dshTrajectory, dshEventsFile,
   ARCHIVE_RAW_TRANSCRIPT_MAX, ARCHIVE_RAW_CURSOR_MAX, ARCHIVE_MANIFEST_CURSOR_MAX,
   RAW_DIR_SUFFIX,
-  slugify, archiveRelPath, ftsQuery, byteCeiling, shedFilePayloads,
+  slugify, archiveRelPath, resolveNewRelPath, __RELPATH_PROBE_MAX: RELPATH_PROBE_MAX,
+  ftsQuery, byteCeiling, shedFilePayloads,
   openDb, closeDb, rebuildIndex,
   ingestChunk, manifestCursors, archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).
