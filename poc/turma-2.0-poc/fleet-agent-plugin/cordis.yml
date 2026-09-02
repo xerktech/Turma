@@ -1,9 +1,0 @@
-# Turma Fleet Agent plugin bundle
-# Inserts the fleet agent plugin that connects dsh to Turma Fleet Hub
-
-- insert:
-    - id: turma-fleet-agent
-      name: '@turma/dsh-fleet-agent'
-      config:
-        hubUrl: ws://localhost:3000/ws
-        device: dsh-test-host
