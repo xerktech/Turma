@@ -15603,8 +15603,10 @@ test("the state.json restore coerces too, not just the ingest path", () => {
   const loEnd = src.indexOf("first boot or no volume");
   assert.ok(loStart > -1 && loEnd > loStart, "the loader block must be locatable");
   const loader = src.slice(loStart, loEnd);
-  assert.ok(/normalizeRecord\(a\)/.test(loader),
-    "the state.json restore must go through normalizeRecord, like the ingest path");
+  // Pins the `"restore"` source too (XERK-429): the restore re-coerces PERSISTED
+  // values with no beat, so its coercion log lines must not read "heartbeat from".
+  assert.ok(/normalizeRecord\(a,\s*"restore"\)/.test(loader),
+    "the state.json restore must go through normalizeRecord with the restore source");
   const ingest = src.slice(src.indexOf('url.pathname === "/api/heartbeat"'),
     src.indexOf("ingestHistory(next, historyResults)"));
   // The ingest reaches it through `recordCoercion` (XERK-262) so a test can
@@ -15989,6 +15991,44 @@ test("a null usage is dropped in silence; a wrong-typed one still warns", () => 
     hub.normalizeRecord({ device: "broken-host", usage: "lots" });
     assert.equal(warnings.length, 1, "a non-object, non-null usage must still warn");
     assert.match(warnings[0], /broken-host/, "the warning must name the host");
+  } finally {
+    console.warn = realWarn;
+  }
+});
+
+test("the usage-coercion warning names its SOURCE — heartbeat vs restore (XERK-429)", () => {
+  // normalizeRecord runs on the ingest AND the state.json restore, but the log
+  // line hardcoded "heartbeat from". On the restore path no beat happened — the
+  // hub is re-coercing a bad value it PERSISTED, at boot — so wording it as a
+  // heartbeat sends an operator hunting a misreporting host to a live agent and
+  // a beat that never occurred. The source arg is threaded from the two call
+  // sites so the prefix tells them apart.
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (...a) => warnings.push(a.join(" "));
+  try {
+    // Default (no source) keeps the ingest wording — an older caller and the
+    // leaf tests above rely on it.
+    hub.resetUsageCoercionLog();
+    hub.normalizeRecord({ device: "beating-host", usage: "lots" });
+    assert.match(warnings.at(-1), /^heartbeat from .*beating-host/,
+      "the default (ingest) source stays 'heartbeat from'");
+
+    // "heartbeat" explicitly — same prefix.
+    hub.resetUsageCoercionLog();
+    hub.normalizeRecord({ device: "beating-host2", usage: "lots" }, "heartbeat");
+    assert.match(warnings.at(-1), /^heartbeat from .*beating-host2/,
+      "an explicit heartbeat source is 'heartbeat from'");
+
+    // "restore" — the state.json boot path. Not a heartbeat, and it must not
+    // read as one.
+    hub.resetUsageCoercionLog();
+    hub.normalizeRecord({ device: "qa-broken-restore", usage: "lots" }, "restore");
+    const line = warnings.at(-1);
+    assert.match(line, /^restored record for .*qa-broken-restore/,
+      "the restore source reads 'restored record for'");
+    assert.doesNotMatch(line, /heartbeat/,
+      "the restore line must not mention a heartbeat at all");
   } finally {
     console.warn = realWarn;
   }
