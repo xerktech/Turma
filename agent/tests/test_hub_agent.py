@@ -4117,6 +4117,10 @@ class ManagerMixin:
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
+            # Derived from REGISTRY_DIR at import (XERK-430). Without redirecting
+            # it, __init__ would restore the rotation position from the real
+            # host's ~/.turma and every beat would overwrite it.
+            ("ARCHIVE_OFFERED_PATH", os.path.join(self.tmp, "archive-offered.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", os.path.join(self.tmp, "worktrees")),
             # Derived from REPOS_ROOT at import, so it needs redirecting too — a
@@ -18971,6 +18975,10 @@ class TestPruneRepo(unittest.TestCase):
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
+            # Derived from REGISTRY_DIR at import (XERK-430). Without redirecting
+            # it, __init__ would restore the rotation position from the real
+            # host's ~/.turma and every beat would overwrite it.
+            ("ARCHIVE_OFFERED_PATH", os.path.join(self.tmp, "archive-offered.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", self.wt_root),
             ("REPOS_ROOT", self.tmp),
@@ -20082,6 +20090,104 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         backlog = {m["transcriptId"] for m in out[5:]}
         self.assertFalse(recent & set(sm._archive_offered), "the recent slice is not stamped")
         self.assertEqual(backlog, set(sm._archive_offered))
+
+    def test_rotation_position_persists_across_a_restart(self):
+        # XERK-430: the stamps live in memory and start empty on every manager
+        # start, so a manager in a restart LOOP re-offers the same head of the
+        # pool forever and the tail never ships. The position is persisted under
+        # ~/.turma and read back at construction, so a fresh manager resumes it.
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5), \
+             mock.patch.object(ha, "ARCHIVE_OFFERED_SAVE_SEC", 0.0):
+            sm = self.make_manager()
+            self._many_transcripts(sm, 40)
+            for _ in range(3):
+                sm._archive_manifest()
+            self.assertTrue(os.path.exists(ha.ARCHIVE_OFFERED_PATH), "position is written")
+            offered, seq, hwm = dict(sm._archive_offered), sm._archive_offer_seq, sm._archive_cand_hwm
+            self.assertTrue(offered)
+            # A fresh manager (same registry dir) restores exactly what was saved.
+            sm2 = self.make_manager()
+            self.assertEqual(sm2._archive_offered, offered, "stamps restored in order")
+            self.assertEqual(list(sm2._archive_offered), list(offered), "insertion order preserved")
+            self.assertEqual(sm2._archive_offer_seq, seq)
+            self.assertEqual(sm2._archive_cand_hwm, hwm)
+
+    def test_rotation_survives_a_restart_loop(self):
+        # The measured symptom (XERK-430): restarting the manager every few beats
+        # stranded most of a 1300-transcript pool because the rotation never
+        # reached its tail before its memory was wiped. With the position
+        # persisted, restarting every 3 beats must still reach the whole pool.
+        seen = set()
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5), \
+             mock.patch.object(ha, "ARCHIVE_OFFERED_SAVE_SEC", 0.0):
+            for _restart in range(20):
+                sm = self.make_manager()          # loads the persisted position
+                self._many_transcripts(sm, 40)
+                for _ in range(3):
+                    seen |= {m["transcriptId"] for m in sm._archive_manifest()}
+        self.assertEqual(len(seen), 40, "the rotation resumes across restarts")
+
+    def test_load_archive_offered_is_defensive(self):
+        # The file is losable with no correctness cost, so every bad shape must
+        # degrade to empty-on-start rather than raise (the beat is the main
+        # process). Mirrors _note_archive_known's Infinity/oversize-key care.
+        sm = self.make_manager()
+        # Missing file → empty.
+        self.assertEqual(sm._load_archive_offered(), ({}, 0, 0))
+
+        def write(obj):
+            with open(ha.ARCHIVE_OFFERED_PATH, "w") as f:
+                f.write(obj if isinstance(obj, str) else json.dumps(obj))
+
+        write("not json {")
+        self.assertEqual(sm._load_archive_offered(), ({}, 0, 0), "unparseable")
+        write([1, 2, 3])
+        self.assertEqual(sm._load_archive_offered(), ({}, 0, 0), "not an object")
+        write('{"offered": {"a": 5, "b": "x", "c": Infinity, "": 2}, "seq": 5, "hwm": 12}')
+        offered, seq, hwm = sm._load_archive_offered()
+        self.assertEqual(offered, {"a": 5}, "junk/empty-key/Infinity values dropped")
+        self.assertEqual((seq, hwm), (5, 12))
+        # seq must never sit below a restored stamp, or the next stamp jumps the
+        # queue ahead of already-offered ids.
+        write('{"offered": {"a": 9}, "seq": 3, "hwm": 0}')
+        _, seq, _ = sm._load_archive_offered()
+        self.assertEqual(seq, 9, "the counter is floored at the max restored stamp")
+        write('{"offered": {}, "seq": "boom", "hwm": 1e400}')
+        self.assertEqual(sm._load_archive_offered(), ({}, 0, 0), "bad scalars → 0")
+        # Deeply nested JSON raises RecursionError (a RuntimeError, NOT a
+        # ValueError) past the parser's depth limit; the file is session-writable
+        # and this runs in __init__, so it must degrade, not crash the host.
+        write("[" * 20000 + "]" * 20000)
+        self.assertEqual(sm._load_archive_offered(), ({}, 0, 0), "deep nesting must not raise")
+        # An oversized file is refused before it is parsed into memory.
+        write('{"offered": {"a": 1}}' + " " * (ha.ARCHIVE_OFFERED_MAX_BYTES + 1))
+        self.assertEqual(sm._load_archive_offered(), ({}, 0, 0), "oversize → empty")
+        # A FIFO at the path would block a plain open() in __init__ forever; the
+        # untrusted reader refuses it (O_NONBLOCK|O_NOFOLLOW + a regular-file check).
+        os.remove(ha.ARCHIVE_OFFERED_PATH)
+        os.mkfifo(ha.ARCHIVE_OFFERED_PATH)
+        self.addCleanup(lambda: os.path.exists(ha.ARCHIVE_OFFERED_PATH)
+                        and os.remove(ha.ARCHIVE_OFFERED_PATH))
+        self.assertEqual(sm._load_archive_offered(), ({}, 0, 0), "a FIFO is refused, not blocked on")
+
+    def test_save_archive_offered_is_throttled_and_never_raises(self):
+        sm = self.make_manager()
+        sm._archive_offered = {"a": 1}
+        sm._archive_offer_seq = 1
+        with mock.patch.object(ha, "ARCHIVE_OFFERED_SAVE_SEC", 10_000):
+            sm._archive_offered_saved_at = 0.0
+            sm._save_archive_offered()
+            self.assertTrue(os.path.exists(ha.ARCHIVE_OFFERED_PATH), "first call writes")
+            sm._archive_offered = {"a": 1, "b": 2}
+            sm._save_archive_offered()               # within the window → skipped
+            with open(ha.ARCHIVE_OFFERED_PATH) as f:
+                self.assertEqual(json.load(f)["offered"], {"a": 1}, "throttled, not re-written")
+        # A write error is swallowed (beat-loop main process).
+        with mock.patch.object(ha, "ARCHIVE_OFFERED_SAVE_SEC", 0.0), \
+             mock.patch.object(ha.os, "replace", side_effect=OSError("nope")):
+            sm._save_archive_offered()               # must not raise
 
     def test_rotation_does_not_depend_on_the_known_map(self):
         # Sharing a bound with `_archive_known` once coupled that map's
