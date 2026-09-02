@@ -6,9 +6,10 @@ paths:
 
 # `hub-agent.py` — how a session actually runs
 
-Split out of `CLAUDE.md` to keep that file under its size ceiling. The session model itself, which
-transcript is a session's, migration and the refused-start contract stay there; this is the
-agent-side runtime detail. `.claude/rules/agent.md` carries the process model and command table.
+Split out of `CLAUDE.md` to keep that file under its size ceiling. The session model itself stays
+there; which transcript is a session's is in `.claude/rules/session-transcript.md`, and migration
+plus the refused-start contract in `.claude/rules/session-migration.md`. This is the agent-side
+runtime detail. `.claude/rules/agent.md` carries the process model and command table.
 
 ## How a session runs
 
@@ -32,7 +33,7 @@ agent-side runtime detail. `.claude/rules/agent.md` carries the process model an
 - All root sessions share one cwd/slug/bridge pointer, so **at most one root session runs per host**
   (enforced on spawn/start/resume).
 - That one slug dir holds EVERY root session's transcript — why the transcript pin exists
-  (`CLAUDE.md`, "Which transcript is a session's").
+  (`.claude/rules/session-transcript.md`, "Which transcript is a session's").
 
 ## The session queue (XERK-14)
 
