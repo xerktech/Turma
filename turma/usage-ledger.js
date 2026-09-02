@@ -403,6 +403,35 @@ function cloneSeries(s) {
   return out;
 }
 
+// Merge one stored series' history into another, IN PLACE, by the HIGH-WATER rule
+// (XERK-448). The only caller combines a physical host's ledger entries that
+// differ solely in the CASE of their operator-set DEVICE_NAME (`MaxAI`/`MAXAI`)
+// for the "By host" display — the two casings are the same disk reported at
+// different times, so every figure is the per-key MAXIMUM ever reported, never a
+// SUM (which would double-count the days both casings saw). This is exactly the
+// store's own high-water discipline, so the merged figure never over-states; the
+// one bounded inexactness is `pre`'s (an opaque scalar with no day detail to
+// reconcile), the same one a single host's own `pre`/`cutoff` already carries.
+function mergeSeries(dst, src) {
+  if (!src) return dst;
+  // `cutoff` is the newest date already folded into `pre`. Take the LATER of the
+  // two: a day at or before it lives in `pre`, so it must not ALSO sit in `days`
+  // — render's total is `pre + sum(days)`, and a day counted in both is doubled.
+  if (src.cutoff && (!dst.cutoff || src.cutoff > dst.cutoff)) dst.cutoff = src.cutoff;
+  raiseBucket(dst.pre, src.pre);
+  for (const [d, b] of Object.entries(src.days)) raiseBucket(dst.days[d] || (dst.days[d] = blankBucket()), b);
+  // Any day at or before the merged cutoff is accounted in `pre` already (raised
+  // above) — DELETE it (not fold, which would add it a second time).
+  if (dst.cutoff) for (const d of Object.keys(dst.days)) if (d <= dst.cutoff) delete dst.days[d];
+  for (const [m, b] of Object.entries(src.models)) raiseBucket(dst.models[m] || (dst.models[m] = blankBucket()), b);
+  if (src.subagent) raiseBucket(dst.subagent || (dst.subagent = blankBucket()), src.subagent);
+  if (src.sessions > dst.sessions) dst.sessions = src.sessions;
+  if (src.lastActivity && (!dst.lastActivity || src.lastActivity > dst.lastActivity)) dst.lastActivity = src.lastActivity;
+  trimModels(dst);
+  trimDays(dst);
+  return dst;
+}
+
 // Hold a series' model map to its cap, biggest spender first. Unlike a trimmed
 // DAY, a dropped model is not folded anywhere: it is a BREAKDOWN of totals that
 // are kept in full elsewhere, so dropping the smallest loses a row of detail and
@@ -1031,14 +1060,64 @@ function repoBlocks(entry, liveRepos, now) {
  * transcript, so the common path costs one map lookup and the record reaches the
  * client exactly as its agent sent it.
  */
-function fold(key, record, now = Date.now()) {
+// The case-folded grouping key for one physical host (XERK-448). DEVICE_NAME is
+// operator-set and unvalidated, so a casing change (`MaxAI` -> `MAXAI`, or a
+// compose-env edit) starts a SECOND ledger entry for one machine and halves every
+// per-host figure. This folds them back FOR DISPLAY only — the stored key is never
+// rewritten, so every identity comparison (the registry key controls route on, the
+// archive raw-write owner check, the migration/re-point org gates) stays byte-exact.
+// Locale-independent lowercase (`toLowerCase`, not `toLocaleLowerCase`) so the fold
+// is stable regardless of the hub's locale.
+function foldKey(k) {
+  return String(k == null ? "" : k).toLowerCase();
+}
+
+// Combine several ledger entries (same `foldKey`) into ONE synthetic entry for the
+// merged view. `host`/`repos` are fresh, so `hosts` is never mutated; the canonical
+// key/device/siteKey/lastSeen come from the most-recently-seen member so the merged
+// row reads under the host's current casing.
+function mergeEntries(keys) {
+  let host = null;
+  const repos = Object.create(null);
+  let device = "", siteKey = "", lastSeen = -1, canonKey = keys[0];
+  for (const k of keys) {
+    const e = hosts[k];
+    if (!e) continue;
+    if (e.host) { if (host) mergeSeries(host, e.host); else host = cloneSeries(e.host); }
+    for (const [rk, r] of Object.entries(e.repos)) {
+      if (rk === "__proto__") continue;
+      if (repos[rk]) { mergeSeries(repos[rk].series, r.series); if (r.repo && !repos[rk].repo) repos[rk].repo = r.repo; }
+      else repos[rk] = { repo: r.repo, remote: r.remote, series: cloneSeries(r.series) };
+    }
+    if ((e.lastSeen || 0) >= lastSeen) { lastSeen = e.lastSeen || 0; device = e.device || device; canonKey = k; }
+    if (!siteKey && e.siteKey) siteKey = e.siteKey;
+  }
+  return { host, repos, device, siteKey, lastSeen: Math.max(0, lastSeen), augments: true, key: canonKey };
+}
+
+function fold(key, record, now = Date.now(), liveKeys = null) {
   const entry = hosts[key];
-  if (!entry || !entry.augments) return null;
-  const live = usageOf(record && record.usage);
+  if (!entry) return null;
+  // Case-twin siblings the registry does NOT currently list (truly retired) fold
+  // into this live host's card; a sibling STILL in the registry keeps its own card
+  // this beat, so merging it here would double the fleet total — hence liveKeys.
+  const f = foldKey(key);
+  const live = liveKeys ? (liveKeys instanceof Set ? liveKeys : new Set(liveKeys)) : null;
+  const group = [key];
+  for (const k of Object.keys(hosts)) {
+    if (k === key || foldKey(k) !== f) continue;
+    if (live && live.has(k)) continue;
+    group.push(k);
+  }
+  // Common case: no case-twin AND nothing lost — serve the record as its agent
+  // sent it (one map lookup), exactly as before.
+  if (group.length === 1 && !entry.augments) return null;
+  const merged = group.length > 1 ? mergeEntries(group) : entry;
+  const liveUsage = usageOf(record && record.usage);
   const liveRepos = new Map(reposOf(record && record.repoUsage).map((r) => [r.remoteKey, r]));
   return {
-    usage: entry.host ? servedSeries(entry.host, live, now) : (record && record.usage) || null,
-    repoUsage: repoBlocks(entry, liveRepos, now),
+    usage: merged.host ? servedSeries(merged.host, liveUsage, now) : (record && record.usage) || null,
+    repoUsage: repoBlocks(merged, liveRepos, now),
   };
 }
 
@@ -1054,14 +1133,26 @@ let retiredTruncLogAt = 0;
  */
 function retiredAgents(liveKeys, now = Date.now()) {
   const live = new Set(liveKeys || []);
-  const keys = Object.keys(hosts)
-    .filter((k) => !live.has(k))
-    .sort((a, b) => (hosts[b].lastSeen || 0) - (hosts[a].lastSeen || 0));
+  // A retired case-twin of a LIVE host folds into that host's card via `fold`, so
+  // it is not emitted here (XERK-448); the rest group by `foldKey` and merge, so a
+  // wholly-removed host that changed casing shows as ONE retired row, not two.
+  const liveFolds = new Set([...live].map(foldKey));
+  const groups = new Map(); // foldKey -> [ledger keys]
+  for (const k of Object.keys(hosts)) {
+    if (live.has(k)) continue;
+    const f = foldKey(k);
+    if (liveFolds.has(f)) continue;
+    let g = groups.get(f);
+    if (!g) groups.set(f, g = []);
+    g.push(k);
+  }
+  const merged = [...groups.values()]
+    .map((keys) => mergeEntries(keys))
+    .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
   const out = [];
   let bytes = 0;
   let dropped = 0;
-  for (const key of keys) {
-    const entry = hosts[key];
+  for (const entry of merged) {
     // Once ONE host has been dropped for size, stop rendering the rest. Keys are
     // newest-first, so the remainder is older history that is worth less than
     // what already shipped, and rendering it only to discard it is pure cost on
@@ -1080,7 +1171,7 @@ function retiredAgents(liveKeys, now = Date.now()) {
     const repoUsage = repoBlocks(entry, null, now);
     if (!usage && !repoUsage.length) continue;
     const rec = {
-      key, device: entry.device || key,
+      key: entry.key, device: entry.device || entry.key,
       retired: true,
       lastSeen: entry.lastSeen,
       online: false, terminalOnline: false,
@@ -1144,6 +1235,6 @@ module.exports = {
     // about), so an absolute assertion is order-dependent on the whole file.
     shareChecks: () => shareChecks,
     load, writeNow, absorb, render, servedSeries, blankSeries, seriesTotals, usageOf, reposOf,
-    weekWindow, utcToday, bucketTokens,
+    weekWindow, utcToday, bucketTokens, foldKey, mergeSeries, mergeEntries,
   },
 };

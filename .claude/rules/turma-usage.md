@@ -140,6 +140,33 @@ paths:
 - **Removing a host is not a purge** — `DELETE /api/agents/<host>` keeps history
   (`usagePurged:false`); `?usage=purge` is the deliberate, irreversible second step.
 
+### One host across two DEVICE_NAME casings (XERK-448)
+
+- **`DEVICE_NAME` is operator-set and unvalidated** (the `device_name`/`deviceName` parity contract in
+  `CLAUDE.md`), so a casing change (`MaxAI` -> `MAXAI`) starts a SECOND ledger entry + registry key
+  for one machine and HALVES every per-host figure. The fix folds them **only where hosts are grouped
+  FOR DISPLAY** — the ledger serve path — leaving every identity comparison (the registry key controls
+  route on, the archive raw-write owner check, migration/re-point org gates) BYTE-EXACT.
+- **`foldKey(k)` = locale-independent lowercase** (`toLowerCase`, never `toLocaleLowerCase`). The
+  STORED ledger key is NEVER rewritten — the fold is a serve-time view. `fold`/`retiredAgents` merge
+  case-twin series by the **HIGH-WATER rule** (`mergeSeries`), never a SUM: two casings are the same
+  disk, so a shared day is `max`, and summing would double-count it (and re-open the tile over-count
+  the split created). `pre` carries the same bounded inexactness a single host's `pre`/`cutoff` does.
+- **`fold` folds in a case-twin ONLY when it is NOT itself a live registry key** (`liveKeys`, threaded
+  from `serializeAgent`) — during the window between a casing change and the old key being pruned BOTH
+  are live, and folding either into the other would double the machine's spend; each keeps its own
+  card until the old one is pruned, then it becomes a retired twin that folds in. `retiredAgents`
+  drops a retired twin whose fold matches a LIVE key (it folds into that live card) and merges the
+  rest, emitting ONE row per machine under its **newest** casing.
+- **Not an archive fix**: `archive.js`'s `sessions.host` splits the same way, but archive browsing has
+  NO per-host display grouping (only an exact `host=` filter with no UI, per-session host labels) — the
+  ticket's `group by host` was an inventory query, not a rendered surface. Leave `row.host === host`
+  and the `host=` filter byte-exact; add normalization there only if a host facet is ever built.
+- **No client change** — the merge is hub serve-side plumbing, so the Usage "By host" view (web +
+  Android) gets it with no parity change; the dashboard token TILES sum fleet-wide, so the merge
+  correcting the split (removing the overlap double-count) is the only movement they see.
+- Tests: the `XERK-448:` cases in `usage-ledger.test.js`.
+
 ### Recovering a wiped host's history (`turma/tools/recover-usage-from-archive.js`)
 
 - **A host wiped before the ledger ever saw it cannot be recovered from anything measured** — the
