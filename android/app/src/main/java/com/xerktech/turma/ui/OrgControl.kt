@@ -9,7 +9,9 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
@@ -17,8 +19,6 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -33,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -246,23 +247,35 @@ private fun OrgMenuRow(
 }
 
 /**
- * One labelled trailing switch on an org row — the platform-idiomatic form of
- * the web's `org-chip-auto` / `org-chip-merge` pills. The track fills with the
- * org's own color when on, so the two switches match the pill highlight the web
- * shows.
+ * One trailing toggle on an org row — the auto-start / auto-merge opt-in. A
+ * COMPACT pill (dot + label) rather than a Material `Switch`: two switches plus
+ * the org name overflowed a phone menu row and truncated the name to "…"
+ * (XERK-564). This is the platform-idiomatic form of the web's `org-chip-auto` /
+ * `org-chip-merge` chips — it fills with the org's own color when on, exactly as
+ * the web pill highlights, and stays narrow enough that both toggles and a
+ * readable org name fit one row. Kept `toggleable` (not merely clickable) so it
+ * reads as a switch to accessibility and to the tests' `isToggleable()`.
  */
 @Composable
 private fun OrgToggle(label: String, on: Boolean, onToggle: (Boolean) -> Unit, color: Color) {
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+    val shape = RoundedCornerShape(percent = 50)
+    val edge = if (on) color else MaterialTheme.colorScheme.outlineVariant
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier
+            .clip(shape)
+            .background(if (on) color.copy(alpha = 0.22f) else Color.Transparent)
+            .border(1.dp, edge, shape)
+            .toggleable(value = on, role = Role.Switch, onValueChange = onToggle)
+            .padding(horizontal = 7.dp, vertical = 3.dp),
+    ) {
+        Box(Modifier.size(6.dp).clip(CircleShape).background(edge))
         Text(
             label,
             style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Switch(
-            checked = on,
-            onCheckedChange = onToggle,
-            colors = SwitchDefaults.colors(checkedTrackColor = color),
+            color = if (on) MaterialTheme.colorScheme.onSurface
+            else MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
@@ -277,9 +290,21 @@ private fun OrgRowLabel(label: String, color: Color?, count: Int, note: String?,
             fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
+            // The name yields space first: it ellipsizes rather than pushing the
+            // count onto a second line or clipping it (XERK-564 — the count "21"
+            // wrapped, then clipped, beside the longest org name before this).
+            modifier = Modifier.weight(1f, fill = false),
         )
-        Text("$count", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (note != null) Text(note, style = MaterialTheme.typography.labelSmall, color = TurmaColors.waiting)
+        Text(
+            "$count",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            softWrap = false,
+        )
+        if (note != null) {
+            Text(note, style = MaterialTheme.typography.labelSmall, color = TurmaColors.waiting, maxLines = 1, softWrap = false)
+        }
     }
 }
 
