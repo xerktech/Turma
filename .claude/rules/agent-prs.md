@@ -78,9 +78,22 @@ DevOps, and what gets typed back because of it.
 
 - The hub decides a PR of an auto-merge-opted org is merge-ready and queues a **`{type:"mergePr",
   sessionId, url}`**; `merge_pr` runs **`gh pr merge <url> --squash --delete-branch`** (method +
-  branch-delete env-overridable). Outcome staged on `merge_pr_results` (`{cmdId, url, ok, error}`),
-  keyed by cmdId, so the hub stops retrying a merge `gh` refuses. The hub half (the two sweeps, the
-  eligibility gate, the backoff): `.claude/rules/turma-board.md`.
+  branch-delete env-overridable). Outcome staged on `merge_pr_results`
+  (`{cmdId, url, ok, error, retryable}`), keyed by cmdId, so the hub stops retrying a merge `gh`
+  refuses. The hub half (the two sweeps, the eligibility gate, the backoff):
+  `.claude/rules/turma-board.md`.
+- **The merge runs from a NEUTRAL, non-repo cwd (`REGISTRY_DIR`), NEVER the session worktree**
+  (XERK-563). gh resolves owner/repo from the URL, so it needs no repo context — and `--delete-branch`
+  from INSIDE a git worktree runs a local `git checkout <base>` for cleanup that collides with
+  Turma's multi-worktree checkout (`fatal: 'main' is already used by worktree at ...`), failing the
+  whole merge. From a non-repo cwd gh deletes the REMOTE branch via the API and skips the local step.
+- **A TRANSIENT failure is flagged `retryable` so the hub RETRIES rather than gives up** (XERK-563,
+  `_merge_error_retryable`): GitHub's optimistic-concurrency race (`Base branch was modified. Review
+  and try the merge again.` — the base advanced between the readiness read and the merge, which
+  auto-merge also provokes against itself), a `subprocess` timeout, and server 5xx. A conflict, a
+  draft, a permission error or an unknown repo is NOT retryable — those never fix themselves. Only
+  meaningful on a failure; a success is never retryable. The hub still bounds retries by
+  `AUTO_MERGE_MAX_ATTEMPTS`.
 - **Runs as the MANAGER, off the beat.** `_merge_pr_async` spawns a worker thread — `gh pr merge` is
   a blocking network call and `handle_commands` is on the heartbeat loop (XERK-395). A failed
   `Thread.start()` (pids_limit) is caught and staged synchronously on the beat, which is safe.

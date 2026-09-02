@@ -4193,6 +4193,9 @@ function ingestMergeResults(agent, mergePrResults) {
     agent.mergeResults[r.cmdId] = {
       url: typeof r.url === "string" ? r.url.slice(0, 500) : null,
       ok: !!r.ok, error: r.error ? String(r.error).slice(0, 300) : null,
+      // A transient failure the agent flagged for retry (XERK-563); an older
+      // agent omits it, so it defaults false and the hub gives up as before.
+      retryable: !!r.retryable,
       at: now,
     };
   }
@@ -9295,6 +9298,16 @@ function autoMergeRowIndex(rows) {
   return byKey;
 }
 
+// owner/repo (lower-cased) of a GitHub PR url, or null. Auto-merge serializes
+// merges PER BASE REPO so it never races ITSELF (XERK-563): a squash-merge moves
+// the base branch, so a second concurrent merge to the same repo hits GitHub's
+// "Base branch was modified" refusal and burns an attempt for nothing. One merge
+// per repo in flight at a time lets them land one per sweep instead.
+function prRepoKey(url) {
+  const m = /^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/\d+/i.exec(url || "");
+  return m ? (m[1] + "/" + m[2]).toLowerCase() : null;
+}
+
 // A mergePr for this PR already riding this host's queue — a second would just
 // duplicate it (the backoff below also stops a re-queue, but only after it).
 function mergePrInFlight(a, url) {
@@ -9322,6 +9335,28 @@ function autoMergeSweep() {
   const now = Date.now();
   const rows = fleetTicketRows();
   const byKey = autoMergeRowIndex(rows);
+  // At most ONE merge per base repo in flight at a time — across the fleet and
+  // within this sweep (XERK-563). A second concurrent merge to the same repo
+  // races the first's base advance and is refused; serializing lands them one
+  // per sweep instead of burning attempts. `inflightRepos` is the merges already
+  // riding a queue; `dispatchedRepos` is what THIS sweep has just sent.
+  const inflightRepos = new Set();
+  for (const a of Object.values(agents)) {
+    // Only an ONLINE host's un-acked mergePr actually holds the base. A dead
+    // host's STRANDED command would otherwise block every other host's PR to
+    // that repo until it returns or is pruned (~a week), and there is no mergePr
+    // reclaim (XERK-563). If that stale merge ever does run on the host's return
+    // it hits the base-race — now retryable — so excluding offline hosts is safe
+    // and only costs the returning host one retry.
+    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    for (const c of a.commands || []) {
+      if (c && c.type === "mergePr") {
+        const rk = prRepoKey(c.url);
+        if (rk) inflightRepos.add(rk);
+      }
+    }
+  }
+  const dispatchedRepos = new Set();
   for (const [host, a] of Object.entries(agents)) {
     for (const s of a.sessions || []) {
       if (!autoMergeSession(s, byKey, rows)) continue;
@@ -9348,6 +9383,11 @@ function autoMergeSweep() {
         const st = autoMergeState.get(p.url);
         if (st && st.gaveUp) continue;
         if (st && now - st.at < AUTO_MERGE_RETRY_MS) continue;
+        // One merge per base repo at a time (XERK-563) — checked BEFORE the
+        // attempt is counted or dispatched, so a PR that just waits its turn on
+        // a busy repo spends no attempt.
+        const repoKey = prRepoKey(p.url);
+        if (repoKey && (inflightRepos.has(repoKey) || dispatchedRepos.has(repoKey))) continue;
         const attempts = (st ? st.attempts : 0) + 1;
         if (attempts > AUTO_MERGE_MAX_ATTEMPTS) {
           autoMergeState.set(p.url, { at: now, attempts, gaveUp: true });
@@ -9358,6 +9398,7 @@ function autoMergeSweep() {
         awaitResult(a, cmdId, "mergePr");
         rememberCmdHost(cmdId, host, "mergePr");
         autoMergeState.set(p.url, { at: now, attempts });
+        if (repoKey) dispatchedRepos.add(repoKey);
       }
     }
   }
@@ -9366,12 +9407,17 @@ function autoMergeSweep() {
   // every host's mergeResults each sweep is cheap (bounded per host).
   for (const a of Object.values(agents)) {
     for (const r of Object.values(a.mergeResults || {})) {
-      if (r && r.url && r.ok === false) {
-        const st = autoMergeState.get(r.url);
-        if (!st || !st.gaveUp) {
-          autoMergeState.set(r.url, { at: now, attempts: (st ? st.attempts : 0), gaveUp: true });
-          console.error(`auto-merge: ${r.url} refused by gh (${r.error || "unknown"}) — not retried`);
-        }
+      if (!r || !r.url || r.ok !== false) continue;
+      // A TRANSIENT failure (base-branch race, 5xx, timeout — the agent flags
+      // it) is left for the backoff to retry; only a PERMANENT refusal gives up
+      // (XERK-563). An older agent sends no `retryable`, so it gives up as
+      // before. The PR still stops after AUTO_MERGE_MAX_ATTEMPTS (the dispatch
+      // loop's own ceiling), so a base that never settles isn't retried forever.
+      if (r.retryable) continue;
+      const st = autoMergeState.get(r.url);
+      if (!st || !st.gaveUp) {
+        autoMergeState.set(r.url, { at: now, attempts: (st ? st.attempts : 0), gaveUp: true });
+        console.error(`auto-merge: ${r.url} refused by gh (${r.error || "unknown"}) — not retried`);
       }
     }
   }

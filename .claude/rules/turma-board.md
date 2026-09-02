@@ -215,6 +215,15 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
     required, a fresh conflict) is marked `gaveUp` and never retried; a silent failure retries to a
     cap then gives up. The merge runs OFF the agent's beat (`_merge_pr_async`, a worker thread) — a
     blocking network call from `handle_commands` would risk the XERK-395 budget.
+    - **A TRANSIENT gh failure (`mergePrResults` `retryable:true`) is NOT gaveUp** (XERK-563): the
+      base-branch-modified race, a timeout, a 5xx. Only a PERMANENT refusal (`retryable` absent/false,
+      the older-agent default too) gives up; a transient one rides the normal backoff up to
+      `AUTO_MERGE_MAX_ATTEMPTS`. The agent classifies it (`_merge_error_retryable`); the hub reads the
+      flag off the result.
+    - **At most ONE merge per base repo in flight at a time, fleet-wide** (`prRepoKey`,
+      `inflightRepos`/`dispatchedRepos`, XERK-563): a squash-merge moves the base, so a second
+      concurrent merge to the same repo hits `Base branch was modified` and burns an attempt.
+      Serializing lands several ready PRs to one repo one-per-sweep instead of racing them.
   - **`autoCloseSweep`** — once EVERY PR a session opened has **landed** and at least one actually
     **MERGED** (a purely-CLOSED PR never closes its ticket), move the ticket to **Done** (the
     XERK-138 status-writeback, routed to a `pickBoardWriteHost` of the org) AND **kill** the session

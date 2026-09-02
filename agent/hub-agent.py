@@ -5224,6 +5224,30 @@ PR_STATUS_MAX = 20
 MERGE_PR_TIMEOUT_SEC = _env_int("TURMA_AUTOMERGE_TIMEOUT_SEC", 60, minimum=5)
 MERGE_PR_RESULTS_MAX = _env_int("TURMA_AUTOMERGE_RESULTS_MAX", 50, minimum=1)
 
+# Transient `gh pr merge` failures worth ANOTHER attempt rather than a permanent
+# give-up (XERK-563). The dominant one is GitHub's optimistic-concurrency race:
+# the base advanced between the hub's readiness read and the merge, so GitHub
+# answers "Base branch was modified. Review and try the merge again." — which
+# auto-merge also provokes against ITSELF when several ready PRs share a base
+# (the hub now serializes per repo, but an unrelated human push races too).
+# Server 5xx and timeouts are transient as well. A conflict, a draft, a
+# permission error or an unknown repo is NOT here — those never fix themselves,
+# so the hub gives up on them. Matched case-insensitively against gh's stderr.
+_MERGE_RETRYABLE_SIGNS = (
+    "base branch was modified",
+    "try the merge again",
+    "please try again",
+    "try again later",
+    "was submitted too quickly",
+    "500 internal", "502 bad gateway", "503 service", "504 gateway",
+    "timed out", "timeout",
+)
+
+
+def _merge_error_retryable(err):
+    e = (err or "").lower()
+    return any(s in e for s in _MERGE_RETRYABLE_SIGNS)
+
 # PR-comment delivery (XERK-49): poll the PRs running sessions opened for new
 # review activity and TYPE it into the authoring session, so a reply asking for
 # corrections continues the work in the session that made the PR — no operator
@@ -20468,11 +20492,14 @@ class SessionManager:
         a merge this path can't do. Never raises (runs on a worker thread)."""
         u = str(url or "").strip()
 
-        def stage(err=None, ok=False):
+        def stage(err=None, ok=False, retryable=False):
             with self._merge_pr_lock:
                 self.merge_pr_results.append({
                     "cmdId": cmd_id, "url": u[:500], "ok": ok,
                     "error": (err[:300] if err else None),
+                    # A TRANSIENT failure the hub should retry rather than give
+                    # up on permanently (XERK-563). Only meaningful on a failure.
+                    "retryable": bool(retryable) and not ok,
                 })
                 del self.merge_pr_results[:-MERGE_PR_RESULTS_MAX]
 
@@ -20487,18 +20514,21 @@ class SessionManager:
             cmd = ["gh", "pr", "merge", u, f"--{method}"]
             if os.environ.get("TURMA_AUTOMERGE_DELETE_BRANCH", "1") != "0":
                 cmd.append("--delete-branch")
-            # cwd the session's worktree when it still exists (repo context for
-            # gh); gh resolves owner/repo from the URL either way, so a missing
-            # worktree is fine.
-            cwd = None
-            sess = self._find(session_id) if session_id else None
-            if sess:
-                wt = sess.get("worktreePath")
-                if wt and os.path.isdir(wt):
-                    cwd = wt
+            # Run from a NEUTRAL, non-repo cwd (REGISTRY_DIR), NEVER the session
+            # worktree (XERK-563). gh resolves owner/repo from the URL, so it
+            # needs no repo context — and `--delete-branch` from INSIDE a git
+            # worktree runs a local `git checkout <base>` for cleanup that
+            # collides with Turma's multi-worktree checkout, failing the whole
+            # merge with "fatal: 'main' is already used by worktree at ...". From
+            # a non-repo cwd gh deletes the REMOTE branch via the API and skips
+            # the local step, so the merge lands.
             try:
-                out = subprocess.run(cmd, cwd=cwd, capture_output=True,
+                out = subprocess.run(cmd, cwd=REGISTRY_DIR, capture_output=True,
                                      text=True, timeout=MERGE_PR_TIMEOUT_SEC)
+            except subprocess.TimeoutExpired:
+                log(f"auto-merge timed out for {u}")
+                return stage(f"gh pr merge timed out after {MERGE_PR_TIMEOUT_SEC}s",
+                             retryable=True)
             except Exception as e:
                 log(f"auto-merge failed to run for {u}: {e}")
                 return stage(f"gh pr merge failed to run: {str(e)[:150]}")
@@ -20508,7 +20538,7 @@ class SessionManager:
             err = ((out.stderr or "") + (out.stdout or "")).strip() \
                 or f"gh pr merge exited {out.returncode}"
             log(f"auto-merge refused for {u}: {err[:200]}")
-            return stage(err)
+            return stage(err, retryable=_merge_error_retryable(err))
         except Exception as e:
             # A worker thread swallowing this would leave the hub waiting; stage
             # it so the backoff eventually gives up with a reason.
