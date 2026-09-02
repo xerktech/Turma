@@ -165,10 +165,13 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   (`POST /api/jira/<site>/automerge`; the hub then merges a merge-ready PR of an auto-start-eligible
   ticket, closes the ticket, and frees the slot). `autoMergeOrgs` is typed in `model/Models.kt` +
   ingested in `net/FleetRepository.kt` (payload + `autoMergeOrgs` SSE), `autoMergeOn` ports the read
-  into `core/Board.kt` (tested in `BoardTest`), and `ui/OrgControl.kt`/`vm/OrgViewModel.kt` render the
-  second `Switch` (+ its POST via `net/HubApi.kt`) beside auto-start — reading its OWN INDEPENDENT
-  map, never auto-start's. Web source: `turma/public/org.js` (`setAutoMerge`, the `data-org-merge`
-  chip). The two switches are the platform-idiomatic form of the web's `auto`/`merge` pills.
+  into `core/Board.kt` (tested in `BoardTest`), and `ui/OrgControl.kt`/`vm/OrgViewModel.kt` render a
+  second toggle (+ its POST via `net/HubApi.kt`) beside auto-start — reading its OWN INDEPENDENT map,
+  never auto-start's. Web source: `turma/public/org.js` (`setAutoMerge`, the `data-org-merge` chip).
+  Both toggles are compact `auto`/`merge` PILLS (dot + label, filled in the org's color when on),
+  mirroring the web's `org-chip-auto`/`org-chip-merge` — a Material `Switch` per toggle overflowed the
+  phone menu row and truncated the org name (XERK-564); the pill keeps both toggles and a readable
+  name on one line. Emulator-verified.
 - **Fleet-wide org filter (XERK-62).** The board's org chip strip is gone; one org control lives in
   the shared `ScreenHeader` and so is on all four top-level screens, scoping each of them from the one
   persisted pick — Dashboard hosts + tiles, Sessions lists + new-session host picker, Board tickets,
