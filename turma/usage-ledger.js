@@ -1089,8 +1089,15 @@ function mergeEntries(keys) {
       if (repos[rk]) { mergeSeries(repos[rk].series, r.series); if (r.repo && !repos[rk].repo) repos[rk].repo = r.repo; }
       else repos[rk] = { repo: r.repo, remote: r.remote, series: cloneSeries(r.series) };
     }
-    if ((e.lastSeen || 0) >= lastSeen) { lastSeen = e.lastSeen || 0; device = e.device || device; canonKey = k; }
-    if (!siteKey && e.siteKey) siteKey = e.siteKey;
+    // key/device/siteKey all follow the most-recently-seen member so the merged
+    // row reads under the host's CURRENT casing AND its current org (XERK-448 D1:
+    // a host that changed both casing and org must scope to the new org, or its
+    // removed spend vanishes under the live org filter). `siteKey` falls back to
+    // any member's when the newest reported none.
+    if ((e.lastSeen || 0) >= lastSeen) {
+      lastSeen = e.lastSeen || 0; device = e.device || device; canonKey = k;
+      if (e.siteKey) siteKey = e.siteKey;
+    } else if (!siteKey && e.siteKey) siteKey = e.siteKey;
   }
   return { host, repos, device, siteKey, lastSeen: Math.max(0, lastSeen), augments: true, key: canonKey };
 }

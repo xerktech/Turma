@@ -861,6 +861,22 @@ test("XERK-448: a wholly-removed host that changed casing is ONE retired row", (
   assert.equal(retired[0].device, "MAXAI");
 });
 
+test("XERK-448 D1: the merged retired row scopes to the NEWEST casing's org", () => {
+  // A host that changed BOTH casing and org: the merged row must read under the
+  // new org, or its removed spend vanishes under the live org filter. Proven in
+  // the realistic order (old casing persisted first) AND the reverse.
+  ledger.ingest("MaxAI", beat({ "2026-08-16": 500 }, {}, { siteKey: "OLDORG" }), now);
+  ledger.ingest("MAXAI", beat({ [DAY]: 400 }, {}, { device: "MAXAI", siteKey: "NEWORG" }), now + 1000);
+  const [rec] = ledger.retiredAgents([], now);
+  assert.equal(rec.device, "MAXAI");
+  assert.equal(rec.jira.siteKey, "NEWORG", "org follows the newest casing, not insertion order");
+  // Reverse ingest order: newest casing first, then the older one.
+  reset();
+  ledger.ingest("MAXAI", beat({ [DAY]: 400 }, {}, { device: "MAXAI", siteKey: "NEWORG" }), now + 1000);
+  ledger.ingest("MaxAI", beat({ "2026-08-16": 500 }, {}, { siteKey: "OLDORG" }), now);
+  assert.equal(ledger.retiredAgents([], now)[0].jira.siteKey, "NEWORG");
+});
+
 test("XERK-448: a shared day is HIGH-WATER, never summed (same disk)", () => {
   ledger.ingest("MaxAI", beat({ [DAY]: 100 }), now);
   const live = beat({ [DAY]: 300 }, {}, { device: "MAXAI" });
