@@ -232,6 +232,13 @@ const PRIORITY_WRITEBACK_ORGS_FILE =
 // hub-owned-durable rationale as the priority write-back opt-in above.
 const DEDUPE_LINK_ORGS_FILE =
   process.env.DEDUPE_LINK_ORGS_FILE || "/data/dedupe-link-orgs.json";
+// Per-org opt-in for hands-off PR auto-merge + ticket close (XERK-550): when ON
+// for an org, the hub MERGES a merge-ready PR of an auto-start-eligible ticket
+// session, then moves the ticket to Done and frees its slot — no human in the
+// loop. Same hub-owned-durable rationale as the opt-ins above: per-org, tiny,
+// must survive a hub restart, and takes effect with the org's hosts offline.
+const AUTOMERGE_ORGS_FILE =
+  process.env.AUTOMERGE_ORGS_FILE || "/data/automerge-orgs.json";
 // Manual org-color pins (XERK-145): siteKey -> palette slot 1..8, the operator's
 // override of the hash-assigned org color. Hub-owned durable state like the
 // auto-start opt-in (same reasons: per-org, tiny, must survive a restart, and
@@ -929,7 +936,7 @@ const STATE_FILE_MAX = positiveEnv(
 // temporal dead zone and the restore's own `catch {}` swallows the throw.
 const AGENT_CACHE_KEYS = [
   "history", "subagentHistory", "jiraIssues", "statusResults",
-  "priorityResults", "linkResults",
+  "priorityResults", "linkResults", "mergeResults",
   "createMeta", "createTypes", "createResults", "resultWaits",
 ];
 
@@ -1752,6 +1759,46 @@ function setAutoStartOrg(siteKey, enabled) {
   sseBroadcast("autoStartOrgs", autoStartOrgs);
 }
 
+// ---- per-org auto-merge opt-in (XERK-550) ----------------------------------
+// The set of orgs the operator has switched hands-off auto-merge ON for, keyed
+// by siteKey with the value `true` (presence = enabled). Same shape and
+// lifecycle as autoStartOrgs; OFF by default everywhere, since it MERGES code to
+// the default branch with no human review — the operator's deliberate,
+// per-project trust decision, mirroring the auto-start switch it sits beside.
+let autoMergeOrgs = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(AUTOMERGE_ORGS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) if (v) autoMergeOrgs[k] = true;
+  }
+} catch {
+  /* first boot or no volume mounted */
+}
+let amSaveTimer = null;
+function scheduleAutoMergeSave() {
+  if (amSaveTimer) return;
+  amSaveTimer = setTimeout(() => {
+    amSaveTimer = null;
+    fs.mkdir(path.dirname(AUTOMERGE_ORGS_FILE), { recursive: true }, () => {
+      fs.writeFile(AUTOMERGE_ORGS_FILE, JSON.stringify(autoMergeOrgs), (err) => {
+        if (err) console.error(`automerge-orgs save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  amSaveTimer.unref();
+}
+// Flip an org's hub-side auto-merge opt-in. The caller has already validated the
+// siteKey is one the fleet reports; this owns the map's bookkeeping. Switching
+// OFF simply stops the sweep from acting — nothing already merged or closed is
+// undone, and no queued work is dropped (unlike auto-start, this queues none).
+function setAutoMergeOrg(siteKey, enabled) {
+  if (enabled) autoMergeOrgs[siteKey] = true;
+  else delete autoMergeOrgs[siteKey];
+  scheduleAutoMergeSave();
+  invalidateAgentsCache();
+  sseBroadcast("autoMergeOrgs", autoMergeOrgs);
+}
+
 // ---- per-ticket triage actions (XERK-486 [F]) -------------------------------
 // The operator's per-ticket verdict: "approve" (force auto-start eligibility
 // past the org policy and the triage gate), "hold" (never auto-start until
@@ -2451,7 +2498,7 @@ function serializeAgent(key, agent, now, pausedSubs) {
   // heartbeat cannot assert it (a forged one would let a host fake its own
   // pause), so it is stripped here and recomputed authoritatively below.
   const { history, subagentHistory, jiraIssues, statusResults,
-          priorityResults, linkResults,
+          priorityResults, linkResults, mergeResults,
           createMeta, createTypes, createResults, resultWaits, tokenBound,
           orgBound, autoPaused: _forgedAutoPaused, ...a } = agent;
   // The paused-subscription set (XERK-544/548). buildAgentsCache computes it once
@@ -2515,7 +2562,7 @@ function buildAgentsCache() {
   // board-scoped, and hub-owned, so this is their one read channel (plus their
   // own SSE events for open boards).
   const body = JSON.stringify({
-    now, agents: list, ticketAgents, ticketModels, ticketRuntimes, autoStartOrgs, priorityWriteBackOrgs, dedupeLinkOrgs, orgColors,
+    now, agents: list, ticketAgents, ticketModels, ticketRuntimes, autoStartOrgs, autoMergeOrgs, priorityWriteBackOrgs, dedupeLinkOrgs, orgColors,
     // Per-org triage policy (XERK-486 [F]) and the per-ticket triage verdicts
     // (approve/hold/reject): hub-owned like the pins above, and the board's one
     // read channel for both — the policy panel and the card chips read them
@@ -4112,6 +4159,32 @@ function ingestStatusResults(agent, ticketStatusResults) {
   }
 }
 
+// Per-cmdId cache of PR auto-merge outcomes (XERK-550), mirroring
+// ingestStatusResults. Keyed by cmdId and stripped from the fleet payload; the
+// only reader is autoMergeSweep, which uses an `ok:false` result to STOP
+// retrying a PR the agent's `gh pr merge` refused (its `url` names which PR).
+function ingestMergeResults(agent, mergePrResults) {
+  const now = Date.now();
+  for (const r of (Array.isArray(mergePrResults) ? mergePrResults : [])) {
+    if (!r || !r.cmdId) continue;
+    agent.mergeResults[r.cmdId] = {
+      url: typeof r.url === "string" ? r.url.slice(0, 500) : null,
+      ok: !!r.ok, error: r.error ? String(r.error).slice(0, 300) : null,
+      at: now,
+    };
+  }
+  for (const [id, e] of Object.entries(agent.mergeResults)) {
+    if (now - e.at > JIRA_ISSUE_MAX_AGE_MS) delete agent.mergeResults[id];
+  }
+  const over = Object.keys(agent.mergeResults).length - JIRA_ISSUE_MAX;
+  if (over > 0) {
+    Object.entries(agent.mergeResults)
+      .sort((a, b) => a[1].at - b[1].at)
+      .slice(0, over)
+      .forEach(([id]) => delete agent.mergeResults[id]);
+  }
+}
+
 // Per-cmdId cache of triage-priority write outcomes (XERK-483), mirroring
 // ingestStatusResults: keyed by cmdId so the /priority poll route answers the
 // specific write it made, pruned oldest-first on the same bounds as the
@@ -4350,6 +4423,7 @@ function resultLanded(agent, cmdId, wait) {
   if (wait.kind === "setTicketStatus") return !!(agent.statusResults || {})[cmdId];
   if (wait.kind === "setTicketPriority") return !!(agent.priorityResults || {})[cmdId];
   if (wait.kind === "createDuplicateLink") return !!(agent.linkResults || {})[cmdId];
+  if (wait.kind === "mergePr") return !!(agent.mergeResults || {})[cmdId];
   return true;
 }
 
@@ -9019,6 +9093,214 @@ function autoStopSweep() {
   }
 }
 
+// --- Auto-merge + auto-close (XERK-550) -------------------------------------
+// The bottleneck the operator hit: a fleet that auto-STARTS bug tickets still
+// stalls on a human reviewing+merging each PR and then closing each ticket (a
+// closed ticket is what auto-stops the session and frees the slot). For orgs
+// that opt in, the hub takes both steps for the class of tickets it auto-starts.
+//
+// The gate below is deliberately the SAME content gate autoStartSweep applies
+// (repo present + not ignore-tier, triage actionable/not-held/not-duplicate, org
+// policy), so auto-merge acts on exactly the tickets the auto stream would start
+// — the "bug class" the operator described — and NEVER on a feature ticket a
+// human started a session on by hand (it fails the org's triage type/policy).
+// `autoStartSweep` keeps its own inline gates (their per-drop log lines differ);
+// a cross-check test pins that this composition agrees with that one.
+function autoStartContentGate(siteKey, t, repo) {
+  if (!repo || isRepoIgnored(repo)) return { kind: "repo", reason: "no eligible repo" };
+  if (!t || !t.key) return { kind: "repo", reason: "no ticket row" };
+  const action = ticketTriageAction(siteKey, t.key);
+  if (action === "hold" || action === "reject") {
+    return { kind: "triaged", reason: `${action} by triage` };
+  }
+  const gated = action === "approve" ? null : triageGateReason(t);
+  if (gated) return { kind: "held", reason: gated };
+  const policyReason = action === "approve"
+    ? null
+    : triagePolicyReason(siteKey, t.triage, repo);
+  if (policyReason) return { kind: "policy", reason: policyReason };
+  return null;
+}
+
+function orgsWithAutoMerge() {
+  return new Set(Object.keys(autoMergeOrgs).filter((k) => autoMergeOrgs[k]));
+}
+
+// A RUNNING ticket session the hub may act on hands-off: its org opted into
+// auto-merge and its ticket is one the auto stream would start. Returns
+// {siteKey, key, row, repo} or null. `byKey` is the board's own row per ticket
+// (siteKey\x00key -> row) so eligibility reads the SAME triage block the board
+// shows, never `s.ticket` (which carries no triage).
+function autoMergeSession(s, byKey, rows) {
+  if (!s || s.status !== "running") return null;
+  const t = s.ticket;
+  if (!t || !t.key) return null;
+  const siteKey = t.siteKey || "";
+  if (!autoMergeOrgs[siteKey]) return null;
+  const row = byKey.get(siteKey + "\x00" + t.key);
+  if (!row) return null;                    // the board doesn't list it (yet)
+  // A ticket a HUMAN moved to Done is a "stop / abandon this work" gesture
+  // (autoStopSweep kills its session): never merge its PR. autoStopSweep only
+  // QUEUES the kill, so the session still reads running for a beat or two — the
+  // column, not the session status, is what tells us to stand down. (autoClose
+  // reaches Done only THROUGH this gate, so it never needs to act on an
+  // already-Done ticket either.)
+  if (row.statusCategory === "done") return null;
+  const repo = ticketRepo(siteKey, t.key, rows);
+  if (autoStartContentGate(siteKey, row, repo)) return null;
+  // HARD floor: auto-merge acts ONLY on triage type "bug", independent of the
+  // org's triage policy (XERK-550). The content gate above matches whatever the
+  // AUTO-START stream would start — which an operator can widen past bugs via
+  // the triage policy (or leave wide with no excludeTypes). Auto-merge lands
+  // unreviewed code on the default branch, so it stays strictly bugs even when
+  // the org auto-starts other types: every non-bug (task/feature/chore/…) PR
+  // still waits for a human. The triage policy can NARROW auto-merge (exclude
+  // some bugs) but can never WIDEN it past bugs. `triage.type` is the
+  // classifier's own normalized assessment (TRIAGE_TYPE_WEIGHT keys), the same
+  // field the policy's excludeTypes matches on.
+  const tri = row.triage && typeof row.triage === "object" ? row.triage : null;
+  if (!tri || tri.type !== "bug") return null;
+  return { siteKey, key: t.key, row, repo };
+}
+
+function autoMergeRowIndex(rows) {
+  const byKey = new Map();
+  for (const { row, siteKey } of rows.values()) {
+    if (row && row.key) byKey.set((siteKey || "") + "\x00" + row.key, row);
+  }
+  return byKey;
+}
+
+// A mergePr for this PR already riding this host's queue — a second would just
+// duplicate it (the backoff below also stops a re-queue, but only after it).
+function mergePrInFlight(a, url) {
+  return (a.commands || []).some(
+    (c) => c && c.type === "mergePr" && c.url === url);
+}
+
+// url -> {at, attempts, gaveUp}: what the hub has tried for a PR. A merge-ready
+// PR is dispatched, then left alone until AUTO_MERGE_RETRY_MS elapses (a merge
+// that worked drops the PR out of "ready" and into MERGED, so it is never seen
+// again); a `gaveUp` PR is never retried. Bounded oldest-first.
+const AUTO_MERGE_RETRY_MS = 2 * 60 * 1000;
+const AUTO_MERGE_MAX_ATTEMPTS = 6;
+const AUTO_MERGE_STATE_MAX = 500;
+const autoMergeState = new Map();
+// "<siteKey>\x00<key>" tickets already moved to Done by autoCloseSweep, so the
+// Done write fires at most once per hub lifetime (like autoStopped for the kill).
+const autoClosed = new Set();
+
+// PHASE 1: merge every merge-ready PR of an eligible, FINISHED session. The
+// merge itself is the agent's job (it holds `gh` auth + the branch), so this
+// only routes a mergePr to the session's own host.
+function autoMergeSweep() {
+  if (!orgsWithAutoMerge().size) return;
+  const now = Date.now();
+  const rows = fleetTicketRows();
+  const byKey = autoMergeRowIndex(rows);
+  for (const [host, a] of Object.entries(agents)) {
+    for (const s of a.sessions || []) {
+      if (!autoMergeSession(s, byKey, rows)) continue;
+      // Act only on a session that has FINISHED its own turn — never mid-work
+      // (it may still be pushing commits, which drops the PR out of "ready"
+      // anyway) and never while it is blocked asking the operator something.
+      if (sessionWorking(s, a.lastSeen, now)) continue;
+      const ss = s.session || {};
+      if (ss.question || (ss.panePrompt && ss.panePrompt.prompt)) continue;
+      // The agent has to be new enough to run the command; an older one would
+      // ack-and-ignore it and this PR would retry to give-up for nothing.
+      if (agentGapError(a, "mergePr", "merge a pull request")) continue;
+      for (const p of s.prs || []) {
+        if (!p || !p.url || prLanded(p)) continue;
+        // Only an OPEN PR can be merged. `_merge_ready` returns "ready" for a
+        // DRAFT whose CI is green + MERGEABLE, but `gh pr merge` refuses a draft
+        // — which would stage an ok:false and mark the PR gaveUp FOREVER, so a
+        // session that opened a draft would be silently excluded even after it
+        // marks the PR ready. Exclude DRAFT here (prLanded already drops
+        // MERGED/CLOSED).
+        if (String((p.state || "")).toUpperCase() !== "OPEN") continue;
+        if (p.ready !== "ready") continue;           // green CI + MERGEABLE + no conflict
+        if (mergePrInFlight(a, p.url)) continue;
+        const st = autoMergeState.get(p.url);
+        if (st && st.gaveUp) continue;
+        if (st && now - st.at < AUTO_MERGE_RETRY_MS) continue;
+        const attempts = (st ? st.attempts : 0) + 1;
+        if (attempts > AUTO_MERGE_MAX_ATTEMPTS) {
+          autoMergeState.set(p.url, { at: now, attempts, gaveUp: true });
+          console.error(`auto-merge: giving up on ${p.url} after ${attempts - 1} attempts`);
+          continue;
+        }
+        const cmdId = queueCommand(host, { type: "mergePr", sessionId: s.id, url: p.url });
+        awaitResult(a, cmdId, "mergePr");
+        rememberCmdHost(cmdId, host, "mergePr");
+        autoMergeState.set(p.url, { at: now, attempts });
+      }
+    }
+  }
+  // A gaveUp result comes back keyed by cmdId with the PR's url; fold it into the
+  // state so we stop retrying a PR the agent's `gh pr merge` refused. Scanning
+  // every host's mergeResults each sweep is cheap (bounded per host).
+  for (const a of Object.values(agents)) {
+    for (const r of Object.values(a.mergeResults || {})) {
+      if (r && r.url && r.ok === false) {
+        const st = autoMergeState.get(r.url);
+        if (!st || !st.gaveUp) {
+          autoMergeState.set(r.url, { at: now, attempts: (st ? st.attempts : 0), gaveUp: true });
+          console.error(`auto-merge: ${r.url} refused by gh (${r.error || "unknown"}) — not retried`);
+        }
+      }
+    }
+  }
+  if (autoMergeState.size > AUTO_MERGE_STATE_MAX) {
+    const over = autoMergeState.size - AUTO_MERGE_STATE_MAX;
+    for (const [k] of [...autoMergeState].sort((a, b) => a[1].at - b[1].at).slice(0, over)) {
+      autoMergeState.delete(k);
+    }
+  }
+}
+
+// PHASE 2: once every PR a session opened has LANDED (and at least one actually
+// MERGED, so a purely-CLOSED PR never closes its ticket), move the ticket to
+// Done AND kill the session. The Done write routes to a board-cred host of the
+// org (like the /status route); the kill goes to the session's host and frees
+// the slot NOW rather than waiting out the ~10-min Jira poll that would surface
+// Done to autoStopSweep — the promptness the whole feature is about.
+function autoCloseSweep() {
+  if (!orgsWithAutoMerge().size) return;
+  const rows = fleetTicketRows();
+  const byKey = autoMergeRowIndex(rows);
+  for (const [host, a] of Object.entries(agents)) {
+    for (const s of a.sessions || []) {
+      const elig = autoMergeSession(s, byKey, rows);
+      if (!elig) continue;
+      const prs = s.prs || [];
+      if (!prs.length || !prs.every(prLanded)) continue;
+      if (!prs.some((p) => String((p && p.state) || "").toUpperCase() === "MERGED")) continue;
+      const tkey = elig.siteKey + "\x00" + elig.key;
+      // The Done write must be QUEUED before the kill — killing a session whose
+      // ticket we can't move to Done orphans it (In Progress, merged PR, no
+      // session, forever, since the killed session then leaves the sweep). So if
+      // no board-cred host can take the write (none reports the org, or every one
+      // is too old for setTicketStatus), stand down this beat and retry — never
+      // kill. Once `autoClosed` holds the ticket the write is on its way (this
+      // beat or a prior one), so the kill is safe.
+      if (!autoClosed.has(tkey)) {
+        const wh = pickBoardWriteHost(elig.siteKey, "setTicketStatus");
+        if (!wh || agentGapError(agents[wh], "setTicketStatus", "close a ticket")) continue;
+        const cmdId = queueCommand(wh, { type: "setTicketStatus", issueKey: elig.key, category: "done" });
+        awaitResult(agents[wh], cmdId, "setTicketStatus");
+        rememberCmdHost(cmdId, wh, "setTicketStatus");
+        autoClosed.add(tkey);
+      }
+      const dk = host + "\x00" + s.id;
+      if (!autoStopped.has(dk)) {
+        queueCommand(host, { type: "kill", sessionId: s.id });
+        autoStopped.add(dk);
+      }
+    }
+  }
+}
+
 // Don't act on freshly-loaded (possibly stale) state right after a hub boot, the
 // same reason the offline sweep waits: let agents re-report first. (The opt-in map
 // loads from disk at boot, but the sweeps only act on orgs with a live reporting
@@ -9038,6 +9320,11 @@ setInterval(() => {
   // Triage -> duplicate links (XERK-484): gated per org and Jira-only; no-op
   // unless opted in.
   dedupeLinkSweep();
+  // Hands-off PR merge + ticket close (XERK-550): gated per org; no-op unless
+  // opted in. Merge first, so a PR that just landed is seen by the close pass —
+  // though the close normally waits a beat for the PR poll to read MERGED.
+  autoMergeSweep();
+  autoCloseSweep();
   // Drained AFTER the sweeps so a ticket the sweep just queued can go out in the
   // same tick, and a session auto-stop just freed is seen by the drain the beat
   // it lands. The heartbeat drains too (that's where capacity actually changes);
@@ -10228,6 +10515,12 @@ const server = http.createServer(async (req, res) => {
       // linked (or human-removed) pair is not re-queued every 15s.
       const ticketLinkResults = payload.ticketLinkResults;
       delete payload.ticketLinkResults;
+      // PR auto-merge outcomes (XERK-550) — cached by cmdId below like the
+      // status/priority results, and read by autoMergeSweep to stop retrying a
+      // PR the agent's `gh pr merge` refused (branch protection, review required,
+      // a conflict that appeared): those need a human, not another attempt.
+      const mergePrResults = payload.mergePrResults;
+      delete payload.mergePrResults;
       // Session-creating commands this agent REFUSED since the last beat
       // (XERK-265) — cached by cmdId below and applied to any migration they
       // name, so a refusal fails the move now rather than at its timeout.
@@ -10300,6 +10593,9 @@ const server = http.createServer(async (req, res) => {
         // Per-cmdId duplicate-link outcome cache (XERK-484); survives across
         // beats like `priorityResults` and is stripped from the fleet payload.
         linkResults: prev.linkResults || {},
+        // Per-cmdId PR auto-merge outcome cache (XERK-550); survives across
+        // beats like `linkResults` and is stripped from the fleet payload.
+        mergeResults: prev.mergeResults || {},
         // Per-cmdId refusals of a session-creating command (XERK-265). Survives
         // across beats like the caches above, but is SERVED with the record
         // rather than stripped — the client following that spawn is who needs it.
@@ -10439,6 +10735,7 @@ const server = http.createServer(async (req, res) => {
       ingestStatusResults(next, ticketStatusResults);
       ingestPriorityResults(next, ticketPriorityResults);
       ingestTicketLinkResults(next, ticketLinkResults);
+      ingestMergeResults(next, mergePrResults);
       ingestCreateMeta(next, createMetaResults);
       ingestCreateResults(next, createTicketResults);
       // Scoped to the commands this host was actually given: `prev.commands` is
@@ -10470,7 +10767,7 @@ const server = http.createServer(async (req, res) => {
       // across the fleet.
       if ([historyResults, subagentHistoryResults, jiraIssueResults,
            ticketStatusResults, ticketPriorityResults, ticketLinkResults,
-           createMetaResults, createTicketResults].some(
+           mergePrResults, createMetaResults, createTicketResults].some(
              (a) => Array.isArray(a) && a.length)) {
         enforceCacheHostBudget(next);
         enforceCacheTotalBudget();
@@ -12448,6 +12745,26 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, enabled: body.enabled });
     }
 
+    // POST /api/jira/<siteKey>/automerge — flip an org's hands-off auto-merge
+    // opt-in (XERK-550). Body: {enabled:true|false}. Same posture as /autostart:
+    // hub-owned durable state, authoritative on return, the org must be one the
+    // fleet reports, the host need not be online. It MERGES to the default branch
+    // with no review, so it stays OFF until explicitly enabled here.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "automerge") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      if (typeof body.enabled !== "boolean") {
+        return json(res, 400, { error: "body needs {enabled:true|false}" });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      setAutoMergeOrg(siteKey, body.enabled);
+      return json(res, 200, { ok: true, enabled: body.enabled });
+    }
+
     // POST /api/jira/<siteKey>/priority-writeback — flip an org's triage
     // priority write-back opt-in (XERK-483). Body: {enabled:true|false}.
     // Same posture as /autostart: hub-owned durable state, authoritative on
@@ -13210,6 +13527,17 @@ if (process.env.TURMA_TEST) {
     autoStopped,
     autoStartOrgs,
     setAutoStartOrg,
+    // Hands-off auto-merge + close (XERK-550): the two sweeps, the shared
+    // content gate, the per-org toggle + setter, and the state the tests drive.
+    autoMergeSweep,
+    autoCloseSweep,
+    autoStartContentGate,
+    orgsWithAutoMerge,
+    autoMergeOrgs,
+    setAutoMergeOrg,
+    autoMergeState,
+    autoClosed,
+    ingestMergeResults,
     // Triage policy + per-ticket verdict (XERK-486 [F]): the stores, the policy
     // evaluator the sweep and drain consult, the per-org rate cap, and the
     // setters the /triage-policy and /triage routes drive.

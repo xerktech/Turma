@@ -139,7 +139,7 @@
   // that org's membership in the selection and the row stays highlighted while
   // it's in; any number can be on at once. `colorFor` is the org whose swatch
   // strip is expanded.
-  function menuHtml(sites, keys, colorMap, autoMap, ageStr, colorPins, colorFor) {
+  function menuHtml(sites, keys, colorMap, autoMap, mergeMap, ageStr, colorPins, colorFor) {
     const B = board();
     const sel = keysOf(keys);
     const total = (sites || []).reduce((n, s) => n + (s.tickets || []).length, 0);
@@ -153,6 +153,7 @@
     for (const s of sites || []) {
       const color = colorMap.get(s.siteKey) || B.orgColor(s.siteKey, null, colorPins);
       const on = autoOn(autoMap, s.siteKey);
+      const mergeOn = autoOn(mergeMap, s.siteKey);
       const hosts = (s.hosts || []).length;
       const age = s.online ? "" : (ageStr ? ageStr(s.lastFetched) : "");
       const picked = sel.includes(s.siteKey);
@@ -172,7 +173,11 @@
         `<button type="button" class="org-chip-auto${on ? " on" : ""}" data-org-auto="${esc(s.siteKey)}"` +
         ` aria-pressed="${on ? "true" : "false"}"` +
         ` title="Auto-start ${on ? "ON: the org's triage policy (board → Triage policy) decides which To Do tickets auto-start; click to turn off" : "OFF: nothing auto-starts; click to turn on — which tickets qualify is set by the org's triage policy"} (Done tickets always kill their session)">` +
-        `<span class="org-auto-dot" aria-hidden="true"></span>auto</button></div>`);
+        `<span class="org-auto-dot" aria-hidden="true"></span>auto</button>` +
+        `<button type="button" class="org-chip-auto org-chip-merge${mergeOn ? " on" : ""}" data-org-merge="${esc(s.siteKey)}"` +
+        ` aria-pressed="${mergeOn ? "true" : "false"}"` +
+        ` title="Auto-merge ${mergeOn ? "ON: the hub MERGES a merge-ready PR (green CI, mergeable, no conflict) of a BUG ticket, then closes the ticket and frees the slot — no review, bugs only; click to turn off" : "OFF: you review + merge PRs and close tickets yourself; click to turn on hands-off merge + close for BUG tickets only"}">` +
+        `<span class="org-auto-dot" aria-hidden="true"></span>merge</button></div>`);
       if (colorFor === s.siteKey) {
         // orgSlotPin validates (0-based or null); the strip marks the 1-based slot.
         const pin = B.orgSlotPin ? B.orgSlotPin(colorPins, s.siteKey) : null;
@@ -182,10 +187,10 @@
     return `<div class="org-menu" role="menu">${rows.join("")}</div>`;
   }
 
-  function controlHtml(sites, keys, colorMap, autoMap, open, ageStr, colorPins, colorFor) {
+  function controlHtml(sites, keys, colorMap, autoMap, mergeMap, open, ageStr, colorPins, colorFor) {
     return `<span class="org-filter${open ? " open" : ""}">` +
       buttonHtml(sites, keys, colorMap, open) +
-      (open ? menuHtml(sites, keys, colorMap, autoMap, ageStr, colorPins, colorFor) : "") +
+      (open ? menuHtml(sites, keys, colorMap, autoMap, mergeMap, ageStr, colorPins, colorFor) : "") +
       `</span>`;
   }
 
@@ -202,6 +207,7 @@
   let stored = [];        // what localStorage says, whether or not it applies
   let sites = [];         // the orgs the fleet currently reports
   let autoMap = {};       // the hub's per-org auto-start opt-in
+  let mergeMap = {};      // the hub's per-org auto-merge opt-in (XERK-550)
   let colorPins = {};     // the hub's manual org-color pins (XERK-145)
   let colorFor = null;    // the org whose swatch strip is expanded, or null
   let open = false;
@@ -297,6 +303,7 @@
     const B = board();
     sites = B.mergeSites((data && data.agents) || []);
     if (data && data.autoStartOrgs) autoMap = data.autoStartOrgs;
+    if (data && data.autoMergeOrgs) mergeMap = data.autoMergeOrgs;
     if (data && data.orgColors) colorPins = data.orgColors;
     paint();
   }
@@ -309,7 +316,7 @@
     // Nothing to scope by until at least one host reports a tracker org, so the
     // slot stays empty and collapses (#hdrOrg:empty in app.css) rather than
     // offering a menu whose only entry is "All orgs".
-    const html = sites.length ? controlHtml(sites, keys, colorMap, autoMap, open, B.ageStr, colorPins, colorFor) : "";
+    const html = sites.length ? controlHtml(sites, keys, colorMap, autoMap, mergeMap, open, B.ageStr, colorPins, colorFor) : "";
     if (html === painted) return;
     painted = html;
     slot.innerHTML = html;
@@ -335,6 +342,29 @@
     if (!ok) {
       autoMap = Object.assign({}, autoMap);
       if (had) autoMap[siteKey] = true; else delete autoMap[siteKey];
+      paint();
+    }
+  }
+
+  // Flip an org's hub-side auto-merge opt-in (XERK-550) — the same optimistic
+  // paint + rollback as setAutoStart. Consequential (it merges to the default
+  // branch unreviewed), so it stays its own switch beside auto-start.
+  async function setAutoMerge(siteKey, enabled) {
+    const had = autoOn(mergeMap, siteKey);
+    mergeMap = Object.assign({}, mergeMap);
+    if (enabled) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
+    paint();
+    let ok = false;
+    try {
+      const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/automerge`,
+        { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ enabled }) });
+      if (r.status === 401) { location.href = "/login"; return; }
+      ok = r.ok;
+    } catch { /* network error — fall through to rollback */ }
+    if (!ok) {
+      mergeMap = Object.assign({}, mergeMap);
+      if (had) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
       paint();
     }
   }
@@ -380,6 +410,12 @@
       autoMap = m || {};
       paint();
     });
+    es.addEventListener("autoMergeOrgs", (e) => {
+      let m;
+      try { m = JSON.parse(e.data); } catch { return; }
+      mergeMap = m || {};
+      paint();
+    });
     es.addEventListener("orgColors", (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
@@ -408,6 +444,8 @@
       // false — and the menu closed itself on the very click that opened it.
       // A flag on the event is the one signal a repaint can't invalidate.
       e.turmaOrgHandled = true;
+      const merge = e.target.closest("[data-org-merge]");
+      if (merge) { setAutoMerge(merge.dataset.orgMerge, !merge.classList.contains("on")); return; }
       const auto = e.target.closest("[data-org-auto]");
       if (auto) { setAutoStart(auto.dataset.orgAuto, !auto.classList.contains("on")); return; }
       const swatch = e.target.closest("[data-org-swatch]");
@@ -450,7 +488,7 @@
     KEY, LEGACY_KEY, esc,
     siteKeyOf, keysOf, filterAgents, effectiveKeys, autoOn, parseStored, encodeStored,
     buttonHtml, menuHtml, controlHtml, swatchRowHtml,
-    get, getKeys, set, toggle, subscribe, update, sse, setAutoStart, setOrgColor, orgColors, mount,
+    get, getKeys, set, toggle, subscribe, update, sse, setAutoStart, setAutoMerge, setOrgColor, orgColors, mount,
     // The common call site: scope the beat's fleet to the current selection.
     filter(agents) { return filterAgents(agents, getKeys()); },
   };

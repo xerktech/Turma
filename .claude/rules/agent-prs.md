@@ -74,6 +74,26 @@ DevOps, and what gets typed back because of it.
   clears it) so the hub can tell "merged and done" from "merged, then handed new work" — a
   **transcript timestamp**, not the mtime a synced `~/.claude` inflates. Tests: `TestPrsLanded`.
 
+## PR auto-merge — the `mergePr` command (XERK-550)
+
+- The hub decides a PR of an auto-merge-opted org is merge-ready and queues a **`{type:"mergePr",
+  sessionId, url}`**; `merge_pr` runs **`gh pr merge <url> --squash --delete-branch`** (method +
+  branch-delete env-overridable). Outcome staged on `merge_pr_results` (`{cmdId, url, ok, error}`),
+  keyed by cmdId, so the hub stops retrying a merge `gh` refuses. The hub half (the two sweeps, the
+  eligibility gate, the backoff): `.claude/rules/turma-board.md`.
+- **Runs as the MANAGER, off the beat.** `_merge_pr_async` spawns a worker thread — `gh pr merge` is
+  a blocking network call and `handle_commands` is on the heartbeat loop (XERK-395). A failed
+  `Thread.start()` (pids_limit) is caught and staged synchronously on the beat, which is safe.
+- The merge is NOT inside a guarded session — the session guard forbids self-merging a PR (work is
+  meant to land via a human, `agent-hooks.md`), and the operator's per-org auto-merge opt-in is the
+  deliberate override of exactly that. Do not route the merge through a session.
+- Results carry an OFF-BEAT writer, so they ride the heartbeat snapshotted under `_merge_pr_lock` and
+  are cleared BY IDENTITY (like `spawn_failures`), never a blanket `.clear()`, or a result the worker
+  appends mid-beat is lost.
+- **GitHub only** — a GitLab MR / ADO PR stages a refusal (`ok:false`) so the hub gives up; widen by
+  teaching `merge_pr` the source dispatch (`glab mr merge`/`az repos pr`), never by loosening the
+  URL guard. Tests: `TestMergePr`.
+
 ## dsh and qwen sessions get the same PR chips, with NO runtime-specific PR code
 
 (XERK-472 [H] / XERK-514 [Qwen H])

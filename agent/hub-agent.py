@@ -5218,6 +5218,12 @@ PR_CALLS_MAX = 20
 PR_STATUS_REFRESH_EVERY = _env_int("TURMA_PR_REFRESH_EVERY", 3)
 PR_STATUS_MAX = 20
 
+# PR auto-merge (XERK-550): how long a single `gh pr merge` may block on its
+# worker thread, and how many outcomes stay staged (each is a small dict keyed
+# by cmdId, bounded oldest-first so a flapping merge can't grow the payload).
+MERGE_PR_TIMEOUT_SEC = _env_int("TURMA_AUTOMERGE_TIMEOUT_SEC", 60, minimum=5)
+MERGE_PR_RESULTS_MAX = _env_int("TURMA_AUTOMERGE_RESULTS_MAX", 50, minimum=1)
+
 # PR-comment delivery (XERK-49): poll the PRs running sessions opened for new
 # review activity and TYPE it into the authoring session, so a reply asking for
 # corrections continues the work in the session that made the PR — no operator
@@ -13273,6 +13279,14 @@ class SessionManager:
         # linked" (link it). Same staging lifecycle as ticket_priority_results.
         self.duplicate_links = self._load_duplicate_links()
         self.ticket_link_results = []
+        # Staged {type:"mergePr"} outcomes (XERK-550: PR auto-merge) — each
+        # {cmdId, url, ok, error}. Its writer is an OFF-BEAT worker thread
+        # (_merge_pr_async runs `gh pr merge`, a blocking network call that must
+        # not sit on the beat, XERK-395), so appends are lock-guarded and the
+        # beat clears only what it delivered BY IDENTITY, exactly like
+        # spawn_failures — a result the worker appends mid-beat is never lost.
+        self._merge_pr_lock = threading.Lock()
+        self.merge_pr_results = []
         # Durable transcript -> ticket attribution (persisted). Keeps the board's
         # ticket chips answerable after the session record behind them is gone —
         # killed, aged out of closed.json, or never in either. Backfilled from the
@@ -20287,6 +20301,88 @@ class SessionManager:
         log(f"setTicketStatus: {k} -> {match['name']}")
         stage(ok=True, status=match["name"], statusCategory=match["category"])
 
+    # --- PR auto-merge (XERK-550) ------------------------------------------
+    # The hub decided a PR of an auto-merge-enabled org is merge-ready (green CI,
+    # MERGEABLE, no conflict) and dispatched this command; the agent MERGES it.
+    # The merge runs as the MANAGER, not inside a guarded session — the session
+    # guard forbids self-merging a PR because work is meant to land via a human
+    # (agent-hooks.md), which the operator's per-org auto-merge opt-in is the
+    # deliberate override of. The outcome is staged so the hub stops retrying a
+    # merge `gh` refuses (branch protection, review required, a fresh conflict).
+
+    def _merge_pr_async(self, cmd_id, session_id, url):
+        """Run the merge on its OWN thread, never the beat (XERK-395): `gh pr
+        merge` is a blocking network call dispatched from handle_commands, which
+        runs on the heartbeat loop, so inline it could stall the beat past
+        OFFLINE_AFTER_MS. A failed Thread.start() (pids_limit, XERK-402) is
+        caught and staged HERE — on the beat, which is safe — so the hub still
+        learns the merge didn't happen. Fire-and-forget: the hub's autoMergeState
+        backoff bounds re-dispatch, so no tracking/join is needed."""
+        try:
+            threading.Thread(
+                target=self.merge_pr, args=(cmd_id, session_id, url),
+                name="pr-merge", daemon=True).start()
+        except Exception as e:
+            with self._merge_pr_lock:
+                self.merge_pr_results.append({
+                    "cmdId": cmd_id, "url": str(url or "")[:500],
+                    "ok": False, "error": f"could not start the merge worker: {e}"[:300],
+                })
+                del self.merge_pr_results[:-MERGE_PR_RESULTS_MAX]
+
+    def merge_pr(self, cmd_id, session_id, url):
+        """Merge one PR the hub judged ready. GitHub only for now: a GitLab MR or
+        Azure DevOps PR stages a refusal so the hub gives up rather than retrying
+        a merge this path can't do. Never raises (runs on a worker thread)."""
+        u = str(url or "").strip()
+
+        def stage(err=None, ok=False):
+            with self._merge_pr_lock:
+                self.merge_pr_results.append({
+                    "cmdId": cmd_id, "url": u[:500], "ok": ok,
+                    "error": (err[:300] if err else None),
+                })
+                del self.merge_pr_results[:-MERGE_PR_RESULTS_MAX]
+
+        try:
+            if not u.startswith(("http://", "https://")):
+                return stage("no PR url")
+            if MR_URL_RE.match(u) or AZDO_PR_URL_RE.match(u):
+                return stage("auto-merge is only implemented for GitHub PRs")
+            method = os.environ.get("TURMA_AUTOMERGE_METHOD", "squash").strip().lower()
+            if method not in ("squash", "merge", "rebase"):
+                method = "squash"
+            cmd = ["gh", "pr", "merge", u, f"--{method}"]
+            if os.environ.get("TURMA_AUTOMERGE_DELETE_BRANCH", "1") != "0":
+                cmd.append("--delete-branch")
+            # cwd the session's worktree when it still exists (repo context for
+            # gh); gh resolves owner/repo from the URL either way, so a missing
+            # worktree is fine.
+            cwd = None
+            sess = self._find(session_id) if session_id else None
+            if sess:
+                wt = sess.get("worktreePath")
+                if wt and os.path.isdir(wt):
+                    cwd = wt
+            try:
+                out = subprocess.run(cmd, cwd=cwd, capture_output=True,
+                                     text=True, timeout=MERGE_PR_TIMEOUT_SEC)
+            except Exception as e:
+                log(f"auto-merge failed to run for {u}: {e}")
+                return stage(f"gh pr merge failed to run: {str(e)[:150]}")
+            if out.returncode == 0:
+                log(f"auto-merged {u}")
+                return stage(ok=True)
+            err = ((out.stderr or "") + (out.stdout or "")).strip() \
+                or f"gh pr merge exited {out.returncode}"
+            log(f"auto-merge refused for {u}: {err[:200]}")
+            return stage(err)
+        except Exception as e:
+            # A worker thread swallowing this would leave the hub waiting; stage
+            # it so the backoff eventually gives up with a reason.
+            log(f"auto-merge crashed for {u}: {e}")
+            return stage(f"merge worker error: {str(e)[:150]}")
+
     # --- Triage priority write-back (XERK-483) -----------------------------
     # The third agent->tracker write, after create (XERK-137) and status
     # (XERK-138): the triage band's tracker value, written back to the ticket
@@ -24283,6 +24379,9 @@ class SessionManager:
                 elif ctype == "createDuplicateLink":
                     self.create_duplicate_link(
                         cid, cmd.get("issueKey"), cmd.get("twinKey"))
+                elif ctype == "mergePr":
+                    self._merge_pr_async(
+                        cid, cmd.get("sessionId"), cmd.get("url"))
                 elif ctype == "setJiraRepo":
                     self.set_jira_repo(
                         cmd.get("issueKey"), cmd.get("repo"),
@@ -25395,6 +25494,13 @@ class SessionManager:
             payload["ticketPriorityResults"] = list(self.ticket_priority_results)
         if self.ticket_link_results:
             payload["ticketLinkResults"] = list(self.ticket_link_results)
+        # Snapshotted under the lock the merge worker appends under (XERK-550,
+        # same shape as spawn_failures below): _clear_delivered_staged removes
+        # exactly these delivered entries by identity, so a result the worker
+        # appends between here and the clear survives to the next beat.
+        with self._merge_pr_lock:
+            if self.merge_pr_results:
+                payload["mergePrResults"] = list(self.merge_pr_results)
         if self.spawn_failures:
             # Snapshotted under the lock the export thread's _refuse_start
             # appends under (XERK-397): post() removes exactly these delivered
@@ -25460,6 +25566,15 @@ class SessionManager:
             with self._spawn_failures_lock:
                 self.spawn_failures[:] = [
                     x for x in self.spawn_failures if id(x) not in delivered]
+        # Same OFF-BEAT-writer discipline for the merge worker's results
+        # (XERK-550): clear only what THIS beat delivered, by identity, so a
+        # result appended by a merge that finished mid-beat is not lost.
+        mstaged = payload.get("mergePrResults")
+        if mstaged:
+            delivered = {id(x) for x in mstaged}
+            with self._merge_pr_lock:
+                self.merge_pr_results[:] = [
+                    x for x in self.merge_pr_results if id(x) not in delivered]
 
     def post(self, payload):
         """POST one heartbeat. Returns the parsed reply dict, or None on failure
