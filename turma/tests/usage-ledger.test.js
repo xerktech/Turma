@@ -828,6 +828,95 @@ test("a fleet with no overhead is unchanged — no system block, still served ra
   assert.deepEqual(names(rec.repoUsage), ["rk-r"]);
 });
 
+// ---- XERK-448: one host split across two DEVICE_NAME casings ----------------
+//
+// DEVICE_NAME is operator-set and unvalidated, so `MaxAI` -> `MAXAI` starts a
+// SECOND ledger entry for one machine and halves every per-host figure. These
+// hold that the two casings fold together FOR DISPLAY — the live host absorbs a
+// retired twin, a wholly-removed host shows as one retired row — while the STORED
+// keys stay byte-exact (identity comparisons elsewhere must not see the fold), and
+// the fold is a HIGH-WATER merge (same disk, so a shared day is max, never summed).
+
+test("XERK-448: a live host absorbs the spend of its retired case-twin", () => {
+  // Old casing, only in the ledger now (pruned from the registry).
+  ledger.ingest("MaxAI", beat({ "2026-08-16": 500 }, { r: { "2026-08-16": 500 } }), now);
+  // New casing, the live host.
+  const live = beat({ [DAY]: 400 }, { r: { [DAY]: 400 } }, { device: "MAXAI" });
+  ledger.ingest("MAXAI", live, now + 1000);
+  const out = ledger.fold("MAXAI", live, now, new Set(["MAXAI"]));
+  assert.equal(totalOf(out.usage), 900, "the live card carries both casings' spend");
+  assert.equal(repoTotal(out.repoUsage, "rk-r"), 900, "the shared repo folds too");
+  // ...and the retired twin is NOT also emitted, or the fleet total doubles.
+  assert.deepEqual(ledger.retiredAgents(["MAXAI"], now), []);
+});
+
+test("XERK-448: a wholly-removed host that changed casing is ONE retired row", () => {
+  ledger.ingest("MaxAI", beat({ "2026-08-16": 500 }), now);
+  ledger.ingest("MAXAI", beat({ [DAY]: 400 }, {}, { device: "MAXAI" }), now + 1000);
+  const retired = ledger.retiredAgents([], now); // neither casing is live
+  assert.equal(retired.length, 1, "not two rows for one machine");
+  assert.equal(totalOf(retired[0].usage), 900);
+  // Canonical identity is the most-recently-seen casing.
+  assert.equal(retired[0].key, "MAXAI");
+  assert.equal(retired[0].device, "MAXAI");
+});
+
+test("XERK-448 D1: the merged retired row scopes to the NEWEST casing's org", () => {
+  // A host that changed BOTH casing and org: the merged row must read under the
+  // new org, or its removed spend vanishes under the live org filter. Proven in
+  // the realistic order (old casing persisted first) AND the reverse.
+  ledger.ingest("MaxAI", beat({ "2026-08-16": 500 }, {}, { siteKey: "OLDORG" }), now);
+  ledger.ingest("MAXAI", beat({ [DAY]: 400 }, {}, { device: "MAXAI", siteKey: "NEWORG" }), now + 1000);
+  const [rec] = ledger.retiredAgents([], now);
+  assert.equal(rec.device, "MAXAI");
+  assert.equal(rec.jira.siteKey, "NEWORG", "org follows the newest casing, not insertion order");
+  // Reverse ingest order: newest casing first, then the older one.
+  reset();
+  ledger.ingest("MAXAI", beat({ [DAY]: 400 }, {}, { device: "MAXAI", siteKey: "NEWORG" }), now + 1000);
+  ledger.ingest("MaxAI", beat({ "2026-08-16": 500 }, {}, { siteKey: "OLDORG" }), now);
+  assert.equal(ledger.retiredAgents([], now)[0].jira.siteKey, "NEWORG");
+});
+
+test("XERK-448: a shared day is HIGH-WATER, never summed (same disk)", () => {
+  ledger.ingest("MaxAI", beat({ [DAY]: 100 }), now);
+  const live = beat({ [DAY]: 300 }, {}, { device: "MAXAI" });
+  ledger.ingest("MAXAI", live, now + 1000);
+  const out = ledger.fold("MAXAI", live, now, new Set(["MAXAI"]));
+  assert.equal(totalOf(out.usage), 300, "max of the two reports of one day, not 400");
+});
+
+test("XERK-448: two casings BOTH still live keep their own cards (no double-count)", () => {
+  // The window between a casing change and the old key being pruned: both are in
+  // the registry. Folding either into the other would double the machine's spend.
+  const a = beat({ "2026-08-16": 500 }, {}, { device: "MaxAI" });
+  const b = beat({ [DAY]: 400 }, {}, { device: "MAXAI" });
+  ledger.ingest("MaxAI", a, now);
+  ledger.ingest("MAXAI", b, now + 1000);
+  const live = new Set(["MaxAI", "MAXAI"]);
+  // Each live host has extra history beyond its own report only via its twin —
+  // which is excluded — so each serves exactly what it reported (fold → null).
+  assert.equal(ledger.fold("MaxAI", a, now, live), null);
+  assert.equal(ledger.fold("MAXAI", b, now, live), null);
+  assert.deepEqual(ledger.retiredAgents(["MaxAI", "MAXAI"], now), []);
+});
+
+test("XERK-448: the fold is DISPLAY only — stored keys stay byte-exact", () => {
+  ledger.ingest("MaxAI", beat({ "2026-08-16": 500 }), now);
+  ledger.ingest("MAXAI", beat({ [DAY]: 400 }, {}, { device: "MAXAI" }), now + 1000);
+  ledger.fold("MAXAI", beat({ [DAY]: 400 }, {}, { device: "MAXAI" }), now, new Set(["MAXAI"]));
+  ledger.retiredAgents([], now);
+  // Both raw casings survive in storage; the fold never rewrites a key.
+  assert.deepEqual(Object.keys(ledger._internals.hosts()).sort(), ["MAXAI", "MaxAI"]);
+});
+
+test("XERK-448: foldKey is locale-independent lowercase", () => {
+  const { foldKey } = ledger._internals;
+  assert.equal(foldKey("MaxAI"), "maxai");
+  assert.equal(foldKey("MAXAI"), "maxai");
+  assert.equal(foldKey(""), "");
+  assert.equal(foldKey(null), "");
+});
+
 test.after(() => {
   for (const f of [LEDGER, `${LEDGER}.oversized`]) {
     try { fs.unlinkSync(f); } catch { /* already gone */ }

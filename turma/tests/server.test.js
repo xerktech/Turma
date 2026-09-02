@@ -2041,6 +2041,25 @@ function request(method, pathName, { body, headers } = {}) {
 const agentHeaders = { authorization: "Bearer agenttok", "content-type": "application/json" };
 const userHeaders = { authorization: basic("hubuser", "hubpass") };
 
+// An oversize heartbeat body sized to land INSIDE the hub's drain window, so a
+// `request()` for it gets its 413 deterministically even under machine load
+// (XERK-313). readBody drains an oversize body up to `HEARTBEAT_MAX +
+// RAW_BODY_DRAIN_SLACK` and then DESTROYS the socket; a 33 MiB body sat a hair
+// past that window, so the destroy fired at the very end of the transfer and
+// raced the 413 the hub had already queued -- which the client lost as `read
+// ECONNRESET` when the box was busy (the flake this ticket fixes). A body a
+// touch over `HEARTBEAT_MAX` but well within the drain window is refused 413 the
+// identical way AND is drained to its end, so the socket is never destroyed and
+// the status always reaches the caller. This does NOT weaken XERK-235 (an
+// oversize body is answered, never a bare reset) -- it makes the answer the only
+// outcome; the end-to-end proof against a real container + real urllib named in
+// these tests' comments stays the strong guard. The pad must clear the JSON
+// wrapper too, so half the slack leaves ample room.
+function oversizeHeartbeatBody(device) {
+  const padLen = hub.HEARTBEAT_MAX + Math.floor(hub.RAW_BODY_DRAIN_SLACK / 2);
+  return { device, pad: "y".repeat(padLen) };
+}
+
 test("http: /healthz is unauthenticated; everything else is gated", async () => {
   assert.equal((await request("GET", "/healthz")).status, 200);
   assert.equal((await request("GET", "/api/agents")).status, 401);
@@ -2090,10 +2109,10 @@ test("http: a fat heartbeat gets a 413 it can act on, not a dropped socket", asy
 });
 
 test("http: past the heartbeat cap the hub still ANSWERS (413), never a bare reset", async () => {
-  const huge = { device: "huge-host", pad: "y".repeat(33 << 20) };
-  // `connection: close`: node's default agent keep-alives, so a doomed socket
-  // pooled after this over-cap beat would fail the NEXT test with a bogus
-  // "socket hang up".
+  const huge = oversizeHeartbeatBody("huge-host"); // oversize, but drainable (XERK-313)
+  // `connection: close`: node's default agent keep-alives, so even a cleanly
+  // drained-and-closed socket would be pooled and fail the NEXT test with a
+  // bogus "socket hang up".
   const res = await request("POST", "/api/heartbeat", {
     body: huge, headers: { ...agentHeaders, connection: "close" },
   });
@@ -2102,27 +2121,12 @@ test("http: past the heartbeat cap the hub still ANSWERS (413), never a bare res
   assert.ok(res.body.limit > 0, "the agent needs the limit to resize against");
 });
 
-// XERK-291: the 413 above used to race the socket teardown — the drained
-// refusal answered mid-stream and then cut the socket, and under CPU contention
-// the destroy beat the response onto the wire, reaching the agent as ECONNRESET
-// instead of the status it exists to resize against. An over-cap body within the
-// drain window now drains to `end` and is answered there, on a quiet connection
-// that closes cleanly, so the status is guaranteed rather than probable. This
-// serial test pins that the honest over-cap path never DEGRADES to a bare reset
-// or a 400; the race itself only reproduces under load (see the PR's stress run).
-test("http: an over-cap heartbeat within the drain window always answers 413 (XERK-291)", async () => {
-  // Comfortably over the 32 MiB cap but inside the drain slack, so it drains to
-  // end rather than being cut as a flood — the honest "my beat outgrew the cap"
-  // case an agent must read a 413 to recover from.
-  const body = { device: "overcap-host", pad: "y".repeat((32 << 20) + (2 << 20)) };
-  for (let i = 0; i < 6; i++) {
-    const res = await request("POST", "/api/heartbeat", {
-      body, headers: { ...agentHeaders, connection: "close" },
-    });
-    assert.equal(res.status, 413, `attempt ${i}: a drained over-cap beat must get a status, not a reset`);
-    assert.ok(res.body && res.body.limit > 0, `attempt ${i}: the 413 carries the limit`);
-  }
-});
+// XERK-291 hardens the PRODUCTION side of the race XERK-313 sized the tests
+// around: the drained 413 is now answered at the body's `end` (never mid-stream)
+// and the drain slot is released on settle, so an honest over-cap beat gets its
+// status even at the drain-window boundary and under a concurrent refusal flood
+// — see tests/drain-slot.test.js (the slot-leak regression) and the PR's
+// real-container flood. The deterministic-sizing above stays as belt-and-braces.
 
 test("http: a heartbeat whose device is not a plain host name is refused, not silently dropped", async () => {
   // `__proto__` 200'd while the beat was discarded AND the registry's prototype
@@ -14859,7 +14863,7 @@ test("budget: a body refused for being too large also gives its charge back", as
   // its own way for the budget to leak.
   assert.equal(hub.bodyInflightHeld(), 0);
   const res = await request("POST", "/api/heartbeat", {
-    body: { device: "big-host", pad: "y".repeat((33 << 20)) },
+    body: oversizeHeartbeatBody("big-host"),
     headers: { ...agentHeaders, connection: "close" },
   });
   assert.equal(res.status, 413);
@@ -14954,7 +14958,7 @@ test("http: an oversize body is NOT refused on its declaration", async () => {
   // are charged like any other, so a flood is refused 503 before buffering and
   // only what the hub can afford ever buffers its way to a 413.
   const res = await request("POST", "/api/heartbeat", {
-    body: { device: "declared-oversize", pad: "y".repeat(33 << 20) },
+    body: oversizeHeartbeatBody("declared-oversize"),
     headers: { ...agentHeaders, connection: "close" },
   });
   assert.equal(res.status, 413, "the caller must get a status, not a reset");
@@ -14971,8 +14975,12 @@ test("drain: only so many refused bodies may drain at once", async () => {
   assert.ok(hub.DRAIN_CONCURRENCY_MAX >= 1);
   // The one oversize body a healthy fleet produces still drains and still gets
   // its status back, which is the whole reason the cap is a count and not zero.
+  // Sized inside the drain window (oversizeHeartbeatBody, XERK-313) so the hub
+  // drains it to its end and answers rather than destroying the socket at the
+  // window's edge -- the mid-transfer reset that made this flake `read
+  // ECONNRESET` on a loaded box, corrupting suites that key off its pass/fail.
   const res = await request("POST", "/api/heartbeat", {
-    body: { device: "oversize-host", pad: "y".repeat((33 << 20)) },
+    body: oversizeHeartbeatBody("oversize-host"),
     headers: { ...agentHeaders, connection: "close" },
   });
   assert.equal(res.status, 413);
@@ -15602,8 +15610,10 @@ test("the state.json restore coerces too, not just the ingest path", () => {
   const loEnd = src.indexOf("first boot or no volume");
   assert.ok(loStart > -1 && loEnd > loStart, "the loader block must be locatable");
   const loader = src.slice(loStart, loEnd);
-  assert.ok(/normalizeRecord\(a\)/.test(loader),
-    "the state.json restore must go through normalizeRecord, like the ingest path");
+  // Pins the `"restore"` source too (XERK-429): the restore re-coerces PERSISTED
+  // values with no beat, so its coercion log lines must not read "heartbeat from".
+  assert.ok(/normalizeRecord\(a,\s*"restore"\)/.test(loader),
+    "the state.json restore must go through normalizeRecord with the restore source");
   const ingest = src.slice(src.indexOf('url.pathname === "/api/heartbeat"'),
     src.indexOf("ingestHistory(next, historyResults)"));
   // The ingest reaches it through `recordCoercion` (XERK-262) so a test can
@@ -15988,6 +15998,44 @@ test("a null usage is dropped in silence; a wrong-typed one still warns", () => 
     hub.normalizeRecord({ device: "broken-host", usage: "lots" });
     assert.equal(warnings.length, 1, "a non-object, non-null usage must still warn");
     assert.match(warnings[0], /broken-host/, "the warning must name the host");
+  } finally {
+    console.warn = realWarn;
+  }
+});
+
+test("the usage-coercion warning names its SOURCE — heartbeat vs restore (XERK-429)", () => {
+  // normalizeRecord runs on the ingest AND the state.json restore, but the log
+  // line hardcoded "heartbeat from". On the restore path no beat happened — the
+  // hub is re-coercing a bad value it PERSISTED, at boot — so wording it as a
+  // heartbeat sends an operator hunting a misreporting host to a live agent and
+  // a beat that never occurred. The source arg is threaded from the two call
+  // sites so the prefix tells them apart.
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (...a) => warnings.push(a.join(" "));
+  try {
+    // Default (no source) keeps the ingest wording — an older caller and the
+    // leaf tests above rely on it.
+    hub.resetUsageCoercionLog();
+    hub.normalizeRecord({ device: "beating-host", usage: "lots" });
+    assert.match(warnings.at(-1), /^heartbeat from .*beating-host/,
+      "the default (ingest) source stays 'heartbeat from'");
+
+    // "heartbeat" explicitly — same prefix.
+    hub.resetUsageCoercionLog();
+    hub.normalizeRecord({ device: "beating-host2", usage: "lots" }, "heartbeat");
+    assert.match(warnings.at(-1), /^heartbeat from .*beating-host2/,
+      "an explicit heartbeat source is 'heartbeat from'");
+
+    // "restore" — the state.json boot path. Not a heartbeat, and it must not
+    // read as one.
+    hub.resetUsageCoercionLog();
+    hub.normalizeRecord({ device: "qa-broken-restore", usage: "lots" }, "restore");
+    const line = warnings.at(-1);
+    assert.match(line, /^restored record for .*qa-broken-restore/,
+      "the restore source reads 'restored record for'");
+    assert.doesNotMatch(line, /heartbeat/,
+      "the restore line must not mention a heartbeat at all");
   } finally {
     console.warn = realWarn;
   }

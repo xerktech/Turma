@@ -1336,7 +1336,10 @@ try {
   for (const key of dropNonObjectRecords(agents)) {
     console.warn(`dropping restored agent with a non-object record under ${hostKeyLabel(key)}`);
   }
-  for (const a of Object.values(agents)) normalizeRecord(a);
+  // "restore", not the default "heartbeat" — no beat happened; the hub is
+  // re-coercing values it PERSISTED (XERK-429). The source-regex test pins the
+  // literal `normalizeRecord(a` here, so keep the call recognisable.
+  for (const a of Object.values(agents)) normalizeRecord(a, "restore");
   // A RESTORED command cannot be proven undelivered (XERK-303), so it is stamped
   // as delivered here. `deliveredAt` is written when the reply hands the command
   // over, and `scheduleSave` is a 30-SECOND DEBOUNCE: a save that landed between
@@ -2488,7 +2491,7 @@ function publicCommands(cmds) {
   });
 }
 
-function serializeAgent(key, agent, now, pausedSubs) {
+function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
   // `resultWaits` is per-command bookkeeping with timestamps (XERK-151) — pure
   // internal state, stripped like the caches. `tokenBound` likewise: it is the
   // hub's note of which credential this host beat with (XERK-268), read only by
@@ -2504,13 +2507,19 @@ function serializeAgent(key, agent, now, pausedSubs) {
   // The paused-subscription set (XERK-544/548). buildAgentsCache computes it once
   // and passes it; the per-agent SSE broadcast has none and derives its own.
   if (!pausedSubs) pausedSubs = pausedSubscriptions(now);
+  // The live registry key set (XERK-448): a host's case-twin ledger entries fold
+  // into its card only when they are NOT themselves live registry keys, or a host
+  // mid-casing-change (both keys still in the registry) would double-serve its own
+  // durable history. Derived here for the single-agent SSE path; buildAgentsCache
+  // passes its own precomputed set so the fleet build doesn't rebuild it per host.
+  if (!liveKeys) liveKeys = new Set(Object.keys(agents));
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
   // Earlier epochs of this host's spend added back (XERK-338). Null — and so
   // free — for every host that has never lost transcripts, which is all of them
   // until one is wiped; only then does the served block stop being the agent's
   // own. Applied HERE rather than at ingest so what is stored and size-budgeted
   // stays the agent's raw report, and so a purge takes effect on the next read.
-  const durable = usageLedger.fold(key, a, now);
+  const durable = usageLedger.fold(key, a, now, liveKeys);
   return {
     ...a,
     ...(durable || {}),
@@ -2555,7 +2564,9 @@ function buildAgentsCache() {
   // paused-subscription set to stamp each host's `autoPaused`, and deriving it
   // per host would rescan the fleet O(n) times.
   const pausedSubs = pausedSubscriptions(now);
-  const list = Object.entries(agents).map(([key, a]) => serializeAgent(key, a, now, pausedSubs));
+  // One live-key set for the whole build (XERK-448 case-twin fold); see serializeAgent.
+  const liveKeys = new Set(Object.keys(agents));
+  const list = Object.entries(agents).map(([key, a]) => serializeAgent(key, a, now, pausedSubs, liveKeys));
   list.sort((x, y) => (x.device + x.key).localeCompare(y.device + y.key));
   // ticketAgents (the ticket->host pins) and autoStartOrgs (the per-org
   // auto-start opt-in, XERK-41) ride the same payload: both are tiny,
@@ -3440,7 +3451,7 @@ function dropUnusableUsage(owner, tally) {
 
 // Every place a usage block rides the heartbeat: the host-wide aggregate, the
 // per-repo ones, and each live session's own.
-function normalizeUsage(payload) {
+function normalizeUsage(payload, source) {
   if (!payload || typeof payload !== "object") return;
   const tally = { count: 0, first: "" };
   dropUnusableUsage(payload, tally);
@@ -3484,7 +3495,7 @@ function normalizeUsage(payload) {
       normalizeUsageBlock(s && s.usage, tally);
     }
   }
-  logUsageCoercion(payload, tally);
+  logUsageCoercion(payload, tally, source);
 }
 
 function noteUsageCoercion(tally, where) {
@@ -3506,7 +3517,15 @@ function resetUsageCoercionLog() {
 // state is declared with the other log throttles, above `loadState`, because
 // the restore reaches this too. The example path goes through logName: a `days`
 // key is agent-authored text that would otherwise forge a log line.
-function logUsageCoercion(payload, tally) {
+//
+// `source` is what actually happened, threaded from the two `normalizeRecord`
+// call sites (XERK-429): a live heartbeat ("heartbeat from") vs the state.json
+// restore ("restored record for"), which coerces a bad value the hub had
+// PERSISTED and re-reads at boot with no host and no beat involved. Wording it
+// as a heartbeat there points an operator hunting a misreporting host at a live
+// agent and a beat that never happened. Defaults to the heartbeat wording so an
+// older caller (and the leaf tests) keep the ingest-path prefix.
+function logUsageCoercion(payload, tally, source = "heartbeat") {
   if (!tally.count) return;
   usageCoercionSuppressed += 1;
   const now = Date.now();
@@ -3515,8 +3534,12 @@ function logUsageCoercion(payload, tally) {
     ? ` (+${usageCoercionSuppressed - 1} more beats coerced since the last line)` : "";
   usageCoercionLogAt = now;
   usageCoercionSuppressed = 0;
+  const who = logName(payload.device || payload.agentId || "?");
+  const prefix = source === "restore"
+    ? `restored record for ${who}`
+    : `heartbeat from ${who}`;
   console.warn(
-    `heartbeat from ${logName(payload.device || payload.agentId || "?")}: ` +
+    `${prefix}: ` +
       `${tally.count} unusable usage field(s) coerced (first ${logName(tally.first)}) — ` +
       `this host's token figures understate what it really spent${also}`
   );
@@ -5423,7 +5446,12 @@ function normalizeSpawnRefusals(a) {
   a.spawnRefusals = out;
 }
 
-function normalizeRecord(a) {
+// `source` distinguishes the two call sites for the operator-facing log lines a
+// coercion can emit (XERK-429): "heartbeat" from the ingest, "restore" from the
+// state.json load. Only `logUsageCoercion` words itself from it today; it
+// defaults to the heartbeat wording so a caller (or leaf test) that omits it
+// keeps the ingest-path prefix.
+function normalizeRecord(a, source = "heartbeat") {
   // Order is NOT load-bearing, and must not become so: each of these guards its
   // own input shape (`Array.isArray`, not `|| []`), because a throw anywhere in
   // here lands in the restore's silent `catch {}` and abandons every host after
@@ -5431,7 +5459,7 @@ function normalizeRecord(a) {
   // one that rewrites a shape the others iterate.
   normalizeSessions(a);
   normalizeSubagentHistory(a);
-  normalizeUsage(a);
+  normalizeUsage(a, source);
   normalizeLimits(a);
   normalizeSubscription(a);
   normalizeLocalModel(a);
@@ -13474,7 +13502,7 @@ if (process.env.TURMA_TEST) {
     // a test pins that it exceeds the ordinary cost and that its worst case is
     // what the container is sized against.
     HEARTBEAT_MAX, HEARTBEAT_PARSE_COST,
-    DRAIN_CONCURRENCY_MAX, BODY_IDLE_TIMEOUT_MS, BODY_MIN_PROGRESS_BYTES,
+    DRAIN_CONCURRENCY_MAX, RAW_BODY_DRAIN_SLACK, BODY_IDLE_TIMEOUT_MS, BODY_MIN_PROGRESS_BYTES,
     BIG_LANE_MAX_HOLD_MS, budgetUnderPressure,
     // XERK-291: the live drain-slot count, so a test can pin that refused bodies
     // (budget-refused ones especially) release their slot instead of leaking it.
