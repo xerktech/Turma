@@ -7,9 +7,9 @@
 
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const { mkdtemp } = require("./tmpdirs");
 const zlib = require("zlib");
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -17,7 +17,7 @@ const { execFileSync } = require("child_process");
 
 const { packGzipTar, splitUstarName } = require("../tar.js");
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), "turma-tar-"));
+const dir = mkdtemp("turma-tar-");
 function file(name, content) {
   const p = path.join(dir, name.replace(/\//g, "_"));
   fs.writeFileSync(p, content);

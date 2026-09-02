@@ -11,13 +11,13 @@
 
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const { mkdtemp } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "turma-archive-reclaim-"));
+const TMP = mkdtemp("turma-archive-reclaim-");
 process.env.ARCHIVE_DIR = path.join(TMP, "archive");
 process.env.ARCHIVE_DB = path.join(TMP, "archive", "index.db");
 // Big ceilings — this file is about reclaiming the INDEX, not refusing ingest.

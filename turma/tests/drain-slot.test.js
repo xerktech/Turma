@@ -15,6 +15,7 @@
 const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const { mkdtemp } = require("./tmpdirs");
 const http = require("http");
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -37,8 +38,8 @@ process.env.AUTOSTART_ORGS_FILE = tmp("autostart-orgs");
 process.env.TICKET_MODELS_FILE = tmp("ticket-models");
 process.env.ORG_COLORS_FILE = tmp("org-colors");
 process.env.USAGE_LEDGER_FILE = tmp("usage-ledger");
-process.env.MIGRATE_SPOOL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-drain-migrations-"));
-process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-drain-archive-"));
+process.env.MIGRATE_SPOOL_DIR = mkdtemp("turma-drain-migrations-");
+process.env.ARCHIVE_DIR = mkdtemp("turma-drain-archive-");
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
 
 const hub = require("../server.js");

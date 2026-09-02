@@ -9,14 +9,14 @@
 
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const { mkdtemp } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { DatabaseSync } = require("node:sqlite");
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "turma-archive-budget-"));
+const TMP = mkdtemp("turma-archive-budget-");
 process.env.ARCHIVE_DIR = path.join(TMP, "archive");
 // INSIDE ARCHIVE_DIR, matching the production default — the ceiling must be
 // exercised in the layout it actually runs in. It works with these small

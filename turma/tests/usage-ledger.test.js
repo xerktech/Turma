@@ -18,6 +18,7 @@
 const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const { mkdtemp } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
@@ -279,8 +280,9 @@ test("the serve budget truncates newest-first, loudly, without rendering the res
   // shipped. Stopping at the first drop takes that to 13.6 ms.
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
     process.env.USAGE_LEDGER_FILE = path.join(
-      fs.mkdtempSync(path.join(os.tmpdir(), "turma-serve-")), "l.json");
+      mkdtemp("turma-serve-"), "l.json");
     process.env.USAGE_LEDGER_SERVE_MAX = "700";   // room for roughly one host
     const l = require(${JSON.stringify(path.join(__dirname, "..", "usage-ledger.js"))});
     const b = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
@@ -312,8 +314,9 @@ test("the serve budget truncates newest-first, loudly, without rendering the res
   // for the third.
   const squeeze = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
     process.env.USAGE_LEDGER_FILE = path.join(
-      fs.mkdtempSync(path.join(os.tmpdir(), "turma-squeeze-")), "l.json");
+      mkdtemp("turma-squeeze-"), "l.json");
     process.env.USAGE_LEDGER_SERVE_MAX = "1500";
     const l = require(${JSON.stringify(path.join(__dirname, "..", "usage-ledger.js"))});
     const b = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
@@ -375,8 +378,9 @@ test("a host is trimmed to its share of the store, keeping its all-time total", 
   // INNOCENT host evicted (QA F2/F3).
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
     process.env.USAGE_LEDGER_FILE = path.join(
-      fs.mkdtempSync(path.join(os.tmpdir(), "turma-share-")), "l.json");
+      mkdtemp("turma-share-"), "l.json");
     // Pinned explicitly: this subprocess INHERITS the parent's env, where
     // USAGE_LEDGER_HOSTS is wound down to 3 — so leaving it out silently changes
     // the share this is asserting against.
@@ -413,8 +417,9 @@ test("the byte ceiling drops the BIGGEST host, never an innocent bystander", () 
   // history while the host that caused the overflow stayed (QA F3).
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
     process.env.USAGE_LEDGER_FILE = path.join(
-      fs.mkdtempSync(path.join(os.tmpdir(), "turma-evict-")), "l.json");
+      mkdtemp("turma-evict-"), "l.json");
     process.env.USAGE_LEDGER_MAX = "200000";
     process.env.USAGE_LEDGER_HOSTS = "2";         // inherited otherwise; see above
     process.env.USAGE_LEDGER_REPOS = "400";       // let one host get genuinely fat
@@ -449,8 +454,9 @@ test("the save path survives a store that cannot be trimmed under its ceiling", 
   // reached branch that THROWS when reached is worse than no branch.
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
     process.env.USAGE_LEDGER_FILE = path.join(
-      fs.mkdtempSync(path.join(os.tmpdir(), "turma-tiny-")), "l.json");
+      mkdtemp("turma-tiny-"), "l.json");
     // Smaller than a single host can serialize to, so eviction runs out of hosts
     // and the last-host-still-over branch is genuinely REACHED. At 1000 the store
     // fits once one host is dropped and the branch never runs — that fixture
@@ -537,8 +543,9 @@ test("trimming reaches the share by dropping MODELS, before it costs any spend",
   // turned red for removing it.
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
     process.env.USAGE_LEDGER_FILE = path.join(
-      fs.mkdtempSync(path.join(os.tmpdir(), "turma-order-")), "l.json");
+      mkdtemp("turma-order-"), "l.json");
     process.env.USAGE_LEDGER_MAX = "3000000";
     process.env.USAGE_LEDGER_HOSTS = "32";
     const l = require(${JSON.stringify(path.join(__dirname, "..", "usage-ledger.js"))});
@@ -571,8 +578,9 @@ test("the share and evict warnings quantify, and are throttled", () => {
   // an unthrottled one buries the rest (XERK-338 QA G7/H4).
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
     process.env.USAGE_LEDGER_FILE = path.join(
-      fs.mkdtempSync(path.join(os.tmpdir(), "turma-warn-")), "l.json");
+      mkdtemp("turma-warn-"), "l.json");
     process.env.USAGE_LEDGER_MAX = "70000";
     process.env.USAGE_LEDGER_HOSTS = "32";
     const l = require(${JSON.stringify(path.join(__dirname, "..", "usage-ledger.js"))});

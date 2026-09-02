@@ -5,13 +5,13 @@
 
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const { mkdtemp } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "turma-archive-"));
+const TMP = mkdtemp("turma-archive-");
 process.env.ARCHIVE_DIR = path.join(TMP, "archive");
 process.env.ARCHIVE_DB = path.join(TMP, "archive", "index.db");
 
@@ -499,7 +499,8 @@ test("XERK-344: restampOrg lets a cross-org restore continuation archive (XERK-4
 test("the per-transcript raw ceiling stops that session, not the archive", () => {
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-rawcap-"));
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
+    const tmp = mkdtemp("turma-rawcap-");
     process.env.ARCHIVE_DIR = path.join(tmp, "archive");
     process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
     process.env.ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES = "32";
@@ -572,7 +573,8 @@ test("the per-beat cursor stat loop is bounded by the HUB, not by the agent", ()
   // lookup is still charged, so the loop stays bounded.
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-statcap-"));
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
+    const tmp = mkdtemp("turma-statcap-");
     process.env.ARCHIVE_DIR = path.join(tmp, "archive");
     process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
     process.env.ARCHIVE_RAW_CURSOR_MAX = "2";
@@ -605,7 +607,8 @@ test("an in-cap agent keeps every cursor even with files spread across transcrip
   // transcript's files would be dropped; both transcripts' files must survive now.
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-cursor427-"));
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
+    const tmp = mkdtemp("turma-cursor427-");
     process.env.ARCHIVE_DIR = path.join(tmp, "archive");
     process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
     process.env.ARCHIVE_RAW_CURSOR_MAX = "4";        // exactly the 4 files offered
@@ -805,7 +808,8 @@ test("manifestCursors is capped, and the cap bounds ROWS WRITTEN", () => {
   // this bound.
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-mancap-"));
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
+    const tmp = mkdtemp("turma-mancap-");
     process.env.ARCHIVE_DIR = path.join(tmp, "archive");
     process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
     process.env.ARCHIVE_MANIFEST_CURSOR_MAX = "5";
@@ -830,7 +834,8 @@ test("the cursor budget is charged for REJECTED paths and unknown ids too", () =
   // no stats); set it so the 4 total lookups exhaust the SUM before the real file.
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-charge-"));
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
+    const tmp = mkdtemp("turma-charge-");
     process.env.ARCHIVE_DIR = path.join(tmp, "archive");
     process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
     process.env.ARCHIVE_RAW_CURSOR_MAX = "1";

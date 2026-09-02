@@ -17,6 +17,7 @@
 const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const { mkdtemp } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
@@ -42,8 +43,8 @@ process.env.TICKET_MODELS_FILE = tmp("ticket-models");
 process.env.ORG_COLORS_FILE = tmp("org-colors");
 // Durable token-usage history (XERK-338), a /data file of its own.
 process.env.USAGE_LEDGER_FILE = tmp("usage-ledger");
-process.env.MIGRATE_SPOOL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-regrestore-migrations-"));
-process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-regrestore-archive-"));
+process.env.MIGRATE_SPOOL_DIR = mkdtemp("turma-regrestore-migrations-");
+process.env.ARCHIVE_DIR = mkdtemp("turma-regrestore-archive-");
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
 
 process.env.STATE_FILE = tmp("state");
@@ -165,7 +166,7 @@ test("when it CANNOT move the file, it says that instead of naming one that isn'
   // fails, and pointing them at a `.oversized` that was never created sends
   // them looking for a file the hub did not write — reading as "the hub ate my
   // state".
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "turma-regrestore-ro-"));
+  const dir = mkdtemp("turma-regrestore-ro-");
   const locked = path.join(dir, "state.json");
   fs.writeFileSync(locked, JSON.stringify({ h: { device: "h", lastSeen: 1, pad: "x".repeat(8000) } }));
   fs.chmodSync(dir, 0o555); // read-only DIRECTORY: the file is readable, unrenamable
