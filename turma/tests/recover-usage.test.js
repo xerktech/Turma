@@ -9,9 +9,9 @@
 
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const { mkdtemp } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { execFileSync } = require("child_process");
@@ -19,7 +19,7 @@ const { execFileSync } = require("child_process");
 const TOOL = path.join(__dirname, "..", "tools", "recover-usage-from-archive.js");
 
 function tmp() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "turma-recover-"));
+  return mkdtemp("turma-recover-");
 }
 
 /** One archived session: rendered projection, `.meta` sidecar, optional raw copy. */

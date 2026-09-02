@@ -15,6 +15,7 @@ const os = require("os");
 const vm = require("vm");
 const fs = require("fs");
 const path = require("path");
+const { mkdtemp } = require("./tmpdirs");
 const http = require("http");
 const net = require("net");
 const crypto = require("crypto");
@@ -99,9 +100,9 @@ process.env.USAGE_LEDGER_FILE = path.join(
 // its whole directory at boot, so it gets a throwaway one of its own — sharing
 // /data/migrations, or one dir across test files, would have each sweep delete
 // the others' spools.
-process.env.MIGRATE_SPOOL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-migrations-"));
+process.env.MIGRATE_SPOOL_DIR = mkdtemp("turma-test-migrations-");
 // Archive (durable, searchable ended-session store) writes under a throwaway dir.
-process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-archive-"));
+process.env.ARCHIVE_DIR = mkdtemp("turma-test-archive-");
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
 // LiteLLM backend (Whisper STT derives its endpoint from this): configured so
 // the "enabled" code paths are exercised. The "unset" branch is tested via a
@@ -15775,7 +15776,7 @@ test("the restore actually RUNS — it must not throw into its own catch", () =>
   // process. An earlier version asserted the line order of two constants BY
   // NAME, which a third constant walks straight past — the same enumerate-the-
   // instances mistake that let the original hole exist.
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "restore-"));
+  const dir = mkdtemp("restore-");
   const state = {
     h1: {
       device: "h1", online: true,
@@ -15823,7 +15824,7 @@ test("the restore actually RUNS — it must not throw into its own catch", () =>
 // Shares the child-process approach of "the restore actually RUNS" above: the
 // restore happens at module init, so nothing short of a real load exercises it.
 function bootWithState(t, raw) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "restore-key-"));
+  const dir = mkdtemp("restore-key-");
   fs.writeFileSync(path.join(dir, "state.json"), raw);
   // console.warn goes to stderr, which this harness discards, so it is captured
   // BEFORE the require — the restore runs during module init — and handed back

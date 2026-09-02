@@ -10,13 +10,13 @@
 
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const { mkdtemp } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "turma-archive-nolimit-"));
+const TMP = mkdtemp("turma-archive-nolimit-");
 process.env.ARCHIVE_DIR = path.join(TMP, "archive");
 // INSIDE ARCHIVE_DIR, matching the production default.
 process.env.ARCHIVE_DB = path.join(TMP, "archive", "index.db");

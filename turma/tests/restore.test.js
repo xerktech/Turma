@@ -14,6 +14,7 @@
 const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const { mkdtemp } = require("./tmpdirs");
 const http = require("http");
 const zlib = require("zlib");
 const test = require("node:test");
@@ -34,7 +35,7 @@ process.env.USAGE_LEDGER_FILE = path.join(os.tmpdir(), `turma-restore-ledger-${p
 // that does not exist is what keeps that honest.
 process.env.MIGRATE_SPOOL_DIR = path.join(
   os.tmpdir(), `turma-restore-spool-${process.pid}`, "migrations");
-process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-restore-archive-"));
+process.env.ARCHIVE_DIR = mkdtemp("turma-restore-archive-");
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
 
 const hub = require("../server.js");
