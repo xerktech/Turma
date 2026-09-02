@@ -13,6 +13,8 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `agent.md` | `agent/hub-agent.py` | process model, commands, heartbeat, live-session signals, summaries, transcript blocks |
 | `agent-input.md` | `agent/hub-agent.py` | `send_input`'s pane path + compaction outbox, `notify_session`'s inbox |
 | `agent-sessions.md` | `agent/hub-agent.py` | session launch, repos-root sessions, queue, kill/resume/delete, new-work directive, local-model failover |
+| `session-transcript.md` | `agent/hub-agent.py`, `agent/tunnel-agent.js`, `turma/server.js`, `turma/public/sessions.html` | which transcript is a session's: id pinning, `_session_transcript_path`, root-session isolation |
+| `session-migration.md` | `agent/hub-agent.py`, `turma/server.js`, `sessions.html`, android `Sessions.kt` | migrating a session between agents (XERK-101); a refused start is REPORTED (XERK-265) |
 | `agent-workflows.md` | `agent/hub-agent.py` | workflow runs: run-dir layout, resolving a `workflow` row, journal/label reads |
 | `agent-archive.md` | `agent/hub-agent.py` | archive sync: manifest, rendered + raw delta pushes, payload shed, off-beat sync worker |
 | `agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |
@@ -28,7 +30,6 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `turma-board.md` | `turma/public/board.*` | Kanban, ticket panel, routing, auto-start/stop |
 | `turma-triage.md` | `turma/public/board.*`, `turma/server.js` | Triage lane, per-ticket verdicts, org triage policy, auto-start gate |
 | `turma-ticket-queue.md` | `turma/server.js`, `board.*` | hub ticket queue: admission, drain, expiries, caps |
-| `session-migration.md` | `hub-agent.py`, `server.js`, `sessions.html`, android `Sessions.kt` | moving a running session between agents (XERK-101); reporting a refused start (XERK-265) |
 | `board-ticket-view.md` | `server.js`, `hub-agent.py`, `board.js` + vendored copies, `Board.kt` | routing a ticket to a capable host; hub resolving a ticket as the board does |
 | `turma-sessions.md` | `turma/public/sessions.html`, `chat.js` | Sessions page, chat engine, live tail, composer, terminal |
 | `android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
@@ -103,32 +104,14 @@ One native agent per host, multiplexing sessions across every repo it scans. Age
   ticket exists; `DELETE /api/jira/<siteKey>/<issueKey>/session` cancels one and can never touch a
   running session. Mechanics: `turma-ticket-queue.md`.
 
-### Which transcript is a session's
+### Which transcript is a session's · migration · refused-start
 
-- Every launch **pins claude's session id** — `--session-id <uuid4>` in `_launch_tmux`, or the
-  `--resume` id — persisted as `claudeSessionId`, so the conversation is `<claudeSessionId>.jsonl`
-  under its cwd's project slug, known by name before its first byte.
-- `_session_transcript_path()` is the one resolver every surface goes through; the hub heartbeats the
-  id so `tunnel-agent.js`'s live tail agrees. **Never go back to a newest-mtime rule** (XERK-6): a
-  root session's dir holds every root session's transcript, so the newest is the PREVIOUS session's.
-- **A pinned session with no transcript on disk resolves to nothing.** Never add a newest-mtime
-  fallback — an empty conversation before the first turn is the truth. A session from an agent
-  predating the pin carries no id and keeps the newest-mtime rule.
-- A watch is sent once and held, so `rearmMovedWatches` re-sends it when a watched session's
-  `transcriptId` moves. Only "Restart (clear context)" moves it; without the re-arm that session's
-  chat freezes on the pre-restart conversation.
-- Two things stay slug-keyed, sharing one identity across a root session's neighbours: archival's
-  `_running_slugs` exclusion and the summary/date an archived transcript inherits.
-- Tests: `TestRootSessionIsolation`, `sessionTranscript` in `tunnel-agent.test.js`, `server.test.js`.
-
-### Migrating a session, and refused starts
-
-- **Moving a running session between agents (XERK-101) and reporting a refused start on that path
-  (XERK-265) live in `.claude/rules/session-migration.md`** — they span agent + hub + Sessions page +
-  android, and that rule is scoped to every side. The invariants that OTHER root sections depend on:
-  a migrated session re-derives its PR chips from the transcript, not the command (see "Which
-  transcript is a session's"); and a refused start is surfaced through `spawnFailures`/`spawnRefusals`
-  rather than a bare `log()`, which the "hub refusal reaches the operator" contract below assumes.
+Moved to keep this file under its ceiling; all three span hub + agent (+ `tunnel-agent.js`), so a
+`paths:`-scoped file legitimately carries them:
+- **Which transcript is a session's** (id pinning, `_session_transcript_path`, root-session
+  isolation) → `.claude/rules/session-transcript.md`.
+- **Migrating a session to another agent** (XERK-101) and **a refused session start is REPORTED**
+  (XERK-265) → `.claude/rules/session-migration.md`.
 
 ## Cross-cutting contracts
 
