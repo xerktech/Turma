@@ -427,8 +427,10 @@ class TestQwenSubagentDelegation(unittest.TestCase):
         entries = self._parent()
         launch = ha._async_launch(next(
             e for e in entries if e.get("toolUseResult")))
+        # resolveId (XERK-333) = the agentId that names agent-<id>.jsonl.
         self.assertEqual(launch, {"id": self.AID, "type": "Explore",
-                                  "label": "Find org selector dropdown"})
+                                  "label": "Find org selector dropdown",
+                                  "resolveId": self.AID})
         result = next(e for e in entries if e.get("toolUseResult"))
         self.assertIn("agentId: %s" % self.AID,
                       result["message"]["content"][0]["content"])

@@ -28,6 +28,21 @@ a nested agent dir.
   of those ids returns a transcript. A started run with nothing written yet is an empty list; an
   unresolved row carries no `agents` key at all — collapsing the two loses "nothing running" vs
   "this row is broken".
+- **A clicked row resolves from the IN-MEMORY scan index first, NOT the transcript window** (XERK-333).
+  `_resolve_subagent`/`_resolve_workflow_run` read only the last 8 MiB of the main transcript, so a
+  launch that has scrolled further back (a long-running workflow — the LONGEST-lived work on a host)
+  is still LISTED (`liveAgents` spans the whole file) but no longer resolvable BY THEM: the row stays
+  clickable and opens "unavailable". So `_scan_agent_entry` carries each launch's on-disk handle as
+  `resolveId` on its `liveAgents` entry (a subagent's agentId, a workflow run's runId — NOT the
+  taskId the row is keyed on), and `_live_agent_resolve_id` maps a clicked type+label back to it;
+  `_stage_subagent_history` uses `_workflow_run_dir`/`_subagent_transcript_path` on that handle and
+  falls to the windowed `_resolve_*` scan only for a row the index doesn't know (a pane-scraped
+  `status.agents` row from an older agent, or a launch predating a manager restart's EOF-primed
+  offsets). **Do not "simplify" by dropping the index and widening the 8 MiB window — that just
+  moves the cliff, and a full-transcript scan per click is what the window exists to avoid.** The
+  wire stays `[{type,label}]` (`live_agents_report` unchanged); `resolveId` is agent-internal, so the
+  `tunnel-agent.js` mirror does not carry it (it never resolves). Tests: the `_past_the_window_`
+  cases in `TestStageSubagentHistory`, `TestLiveAgentResolveId`, `TestWorkflowRunDir`.
 - **The run dir is named after the launch record's `runId`, NOT its `taskId`** — different handles
   on the same launch (`wf_86e01141-7bc` vs `we1gtmfyd`), and `_async_launch` keys the ROW on taskId
   (XERK-304's bug). The record's absolute `transcriptDir` is ignored too: untrusted input on a path
