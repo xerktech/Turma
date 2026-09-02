@@ -183,8 +183,9 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
     NOT deduped across hosts (a shared `~/.claude` transcript id isn't fleet-unique); a
     restart-clear-context session legitimately chips twice.
 - **A chip links by run state, not channel**: running → `?session=<id>`; else → `?ended=<id>`; no
-  transcript → no link. `?session=`'s wait only resolves a **running** session and never times out,
-  so a stopped/killed chip pointed at it parks on "Opening session…" forever.
+  transcript → no link. `?session=`'s wait only resolves a **running** session, so a stopped/killed
+  chip must use `?ended=` — the by-id wait is now bounded (`SELECT_FOLLOW_MS`, XERK-293) but only
+  ever lands on the EMPTY stage with a "never came up" toast, never on the ended read-only view.
 - Chip is **labelled with the BRANCH**, not the session name (tells two sessions on one ticket
   apart); a manual rename leads once it exists.
 - Reverse link: Sessions card meta shows the ticket key; chat footer carries a linked `jira-chip`

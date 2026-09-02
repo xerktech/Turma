@@ -194,7 +194,8 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " openSubagentView, transcriptBack,"
       + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
       + " applyAgent, mergeSnapshot, sseClock: () => sseClock,"
-      + " setCache: (c) => { cache = c; }, getCache: () => cache, setDraft: (t) => { renameDraft = t; } };");
+      + " setCache: (c) => { cache = c; }, getCache: () => cache, setDraft: (t) => { renameDraft = t; },"
+      + " setPendingSelectAt: (t) => { pendingSelectAt = t; }, SELECT_FOLLOW_MS };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
@@ -1392,6 +1393,184 @@ test("?session=<id>: waits for a session that isn't running yet, then opens it",
   h.sessions = [working("55555", "Resumed")];
   beat({ now, agents: [h] });
   assert.deepEqual(opened, ["55555"]);
+});
+
+// XERK-293. The by-id wait had no deadline: a session that never came up (an
+// offline host, a lost heartbeat, an agent too old to report a refusal, a
+// stale/hand-edited id) left the stage on "Opening session…" forever. Bound it
+// like its two siblings — SPAWN_FOLLOW_MS/ENDED_FOLLOW_MS — landing on the empty
+// stage with a one-line toast.
+test("?session=<id>: an id that never comes up times out to the empty stage (XERK-293)", () => {
+  const { beat, els, opened, toasts, setPendingSelectAt, SELECT_FOLLOW_MS } = loadPage({ search: "?session=ghost" });
+  const { now, host: h } = host([working("11111", "Someone Else")]);
+
+  // Beat 1: still waiting, worded as opening — the wait is generous on purpose.
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, []);
+  assert.match(els.stageEmptyBig.innerHTML, /Opening session/);
+
+  // Rewind the wait's start past the deadline; the next beat gives up.
+  setPendingSelectAt(Date.now() - SELECT_FOLLOW_MS - 1000);
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, [], "a session that never arrived is never opened");
+  assert.match(els.stageEmptyBig.innerHTML, /No session attached/, "fell back to the empty stage");
+  assert.deepEqual(toasts, ["That session never came up."], "and said so, once");
+
+  // One-shot: a later beat neither re-toasts nor re-opens.
+  beat({ now, agents: [h] });
+  assert.deepEqual(toasts, ["That session never came up."]);
+  assert.deepEqual(opened, []);
+});
+
+test("?session=<id>: a session that arrives before the deadline still opens (XERK-293)", () => {
+  const { beat, els, opened, toasts, setPendingSelectAt, SELECT_FOLLOW_MS } = loadPage({ search: "?session=77777" });
+  const { now, host: h } = host([working("11111", "Someone Else")]);
+
+  // The clock is well into the window but not past it: a slow-arriving session
+  // must not be dropped.
+  setPendingSelectAt(Date.now() - (SELECT_FOLLOW_MS - 5000));
+  h.sessions = [...h.sessions, working("77777", "Arrived Late")];
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, ["77777"], "still opened — the deadline hadn't passed");
+  assert.deepEqual(toasts, [], "and nothing was said");
+});
+
+test("?session=<id>: the by-id deadline never fires while a paired spawn follow is live (XERK-293)", () => {
+  // A hand-crafted ?session=&spawn= (or the load-time id lingering under a spawn
+  // wait): SPAWN_FOLLOW_MS owns the window until the spawn resolves or times out,
+  // so the select deadline must stay quiet even with its own clock long expired.
+  const { beat, els, opened, toasts, setPendingSelectAt, SELECT_FOLLOW_MS } =
+    loadPage({ search: "?session=ghost&spawn=cmd-x" });
+  const { now, host: h } = host([]);
+  setPendingSelectAt(Date.now() - SELECT_FOLLOW_MS - 1000);
+  beat({ now, agents: [h] });
+  assert.deepEqual(toasts, [], "the spawn follow's timeout owns this window, not the select one");
+  assert.deepEqual(opened, []);
+  assert.match(els.stageEmptyBig.innerHTML, /Starting your session/);
+});
+
+test("?session=<id>: a running session whose terminal tunnel is down is not timed out (XERK-293)", () => {
+  // A session the fleet reports RUNNING but whose host's terminal tunnel is
+  // offline (a real XERK-252 state that heals in place) fails sessionHit() only
+  // because of the tunnel, not because it never came up. Timing it out — toasting
+  // "never came up" and clearing the deep link — would falsely evict a live
+  // session that will open the moment the tunnel returns.
+  const { beat, els, opened, toasts, setPendingSelectAt, SELECT_FOLLOW_MS } = loadPage({ search: "?session=55555" });
+  const { now, host: h } = host([working("55555", "Live But Unreachable")]);
+  h.terminalOnline = false; // tunnel down; the manager still heartbeats
+
+  setPendingSelectAt(Date.now() - SELECT_FOLLOW_MS - 1000);
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, [], "still held — sessionHit needs the tunnel");
+  assert.deepEqual(toasts, [], "but never falsely reported as a no-show");
+  assert.match(els.stageEmptyBig.innerHTML, /Opening session/, "keeps holding, not the empty stage");
+
+  // The tunnel heals: the deep link still opens it.
+  h.terminalOnline = true;
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, ["55555"], "opens once the tunnel returns");
+});
+
+test("?session=<id>: an OFFLINE host's stale running record still times out (XERK-293)", () => {
+  // The `running` exemption is only for a tunnel FLAP (online host, terminal
+  // down — heals in place). An OFFLINE host still serving a stale `running`
+  // record is the "host went offline between the click and the resume" no-show
+  // the bound exists for; it must NOT be exempted into another spin-forever.
+  const { beat, els, opened, toasts, setPendingSelectAt, SELECT_FOLLOW_MS } = loadPage({ search: "?session=55555" });
+  const { now, host: h } = host([working("55555", "Was Running")]);
+  h.online = false;          // host stopped heartbeating
+  h.terminalOnline = false;
+
+  // Beat 1: within the window — held (the record still exists, so it might yet heal).
+  beat({ now, agents: [h] });
+  assert.match(els.stageEmptyBig.innerHTML, /Opening session/);
+
+  // Beat 2: past the deadline — an offline host's stale record is a no-show.
+  setPendingSelectAt(Date.now() - SELECT_FOLLOW_MS - 1000);
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, [], "an offline host's stale record never opens");
+  assert.deepEqual(toasts, ["That session never came up."], "it times out like any other no-show");
+  assert.match(els.stageEmptyBig.innerHTML, /No session attached/, "and falls back to the empty stage");
+});
+
+test("?session=<id>: a stale copy on an offline host can't shadow a live flapping copy (XERK-293)", () => {
+  // The same id on two hosts (the XERK-101 migration window: the source lingers
+  // `running` until KILLed). If the offline stale copy is enumerated first and no
+  // host has a live terminal, a first-record-only liveness read would time out
+  // even though the live copy is merely flapping its tunnel. The whole-fleet scan
+  // must hold on the live copy regardless of order.
+  const { beat, els, opened, toasts, setPendingSelectAt, SELECT_FOLLOW_MS } = loadPage({ search: "?session=dup" });
+  const now = Date.now();
+  const stale = { key: "hostOff", device: "hostOff", online: false, terminalOnline: false,
+    lastSeen: now, repos: [{ name: "repoX" }], sessions: [working("dup", "Migration Source")] };
+  const live = { key: "hostLive", device: "hostLive", online: true, terminalOnline: false,
+    lastSeen: now, repos: [{ name: "repoX" }], sessions: [working("dup", "Migration Target")] };
+
+  setPendingSelectAt(Date.now() - SELECT_FOLLOW_MS - 1000);
+  beat({ now, agents: [stale, live] }); // offline copy first
+  assert.deepEqual(opened, [], "sessionHit misses — no terminal is up yet");
+  assert.deepEqual(toasts, [], "but the live flapping copy holds the wait, not a false no-show");
+  assert.match(els.stageEmptyBig.innerHTML, /Opening session/);
+
+  // The live host's tunnel heals: the deep link opens it.
+  live.terminalOnline = true;
+  beat({ now, agents: [stale, live] });
+  assert.deepEqual(opened, ["dup"], "opens on the live copy once its tunnel returns");
+});
+
+test("?session=<id>: resumeEnded resets the wait clock so a long-open page doesn't false-timeout (XERK-293)", () => {
+  // The page has been open longer than SELECT_FOLLOW_MS when the operator Resumes
+  // a killed session. resumeEnded sets pendingSelect AND must reset pendingSelectAt,
+  // or the very next beat times the fresh wait out against the stale load-time clock.
+  const { beat, resumeEnded, els, opened, toasts, setPendingSelectAt, SELECT_FOLLOW_MS } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [closed("66666", "Killed Earlier", "2026-07-15T09:00:00Z")];
+  h.online = true;
+  beat({ now, agents: [h] });
+
+  setPendingSelectAt(Date.now() - SELECT_FOLLOW_MS - 1000); // the page has been open a long time
+  resumeEnded(null, "66666"); // deep-links ?session=66666 by id, resetting the clock
+  beat({ now, agents: [h] });
+  assert.deepEqual(toasts, [], "the fresh wait is not timed out against the old clock");
+  assert.match(els.stageEmptyBig.innerHTML, /Opening session/, "it holds for the relaunch");
+
+  h.sessions = [working("66666", "Resumed")];
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, ["66666"]);
+});
+
+test("?spawn=<cmdId>: a spawn resolving to a tunnel-down session holds, then opens on heal (XERK-293)", () => {
+  // A spawn resolves into the by-id wait (pendingSpawn -> pendingSelect, with a
+  // fresh pendingSelectAt clock). If the minted session's terminal tunnel isn't
+  // up yet it fails sessionHit but is reported RUNNING, so the deadline exempts
+  // it (it came up) and it opens once the tunnel heals — never a false no-show.
+  const { beat, opened, toasts } = loadPage({ search: "?spawn=cmd-slow" });
+  const { now, host: h } = host([]);
+  beat({ now, agents: [h] }); // waiting on the spawn
+
+  const s = { ...working("aaaaa", "Minted"), spawnCmdId: "cmd-slow" };
+  const hOff = { ...h, terminalOnline: false, sessions: [s] };
+  beat({ now, agents: [hOff] });
+  assert.deepEqual(opened, [], "held: reported running but tunnel not up");
+  assert.deepEqual(toasts, [], "and never falsely reported as a no-show");
+  beat({ now, agents: [{ ...hOff, terminalOnline: true }] });
+  assert.deepEqual(opened, ["aaaaa"], "opens once the tunnel heals");
+});
+
+test("?session=<id>: a queued session is not timed out by the by-id deadline (XERK-293)", () => {
+  // A queued session has a legitimate long wait and its own stage text; the
+  // deadline must leave it alone.
+  const { beat, els, opened, toasts, setPendingSelectAt, SELECT_FOLLOW_MS } = loadPage({ search: "?session=q1" });
+  const { now, host: h } = host([
+    { id: "q1", status: "queued", repo: "repoX", summary: "Waiting",
+      queuedReason: "capacity", queuedAt: new Date().toISOString() },
+  ]);
+  setPendingSelectAt(Date.now() - SELECT_FOLLOW_MS - 1000);
+  beat({ now, agents: [h] });
+  assert.deepEqual(toasts, [], "a queued session is never dropped by the deadline");
+  assert.deepEqual(opened, []);
+  assert.ok(!/No session attached/.test(els.stageEmptyBig.innerHTML),
+    "it keeps its queued stage text, not the empty stage");
 });
 
 test("the archive BROWSER is still gone from the sidebar markup", () => {
