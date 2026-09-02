@@ -5851,6 +5851,14 @@ function normalizeJira(a) {
             if (k in t.repoGuess && typeof t.repoGuess[k] !== "boolean") delete t.repoGuess[k];
           }
         }
+        // `type` is the tracker Issue Type — non-null String (default "") on
+        // Android, and since XERK-560 the auto-merge gate keys on it. A non-string
+        // would BOTH slip that safety gate (`String(["bug"]) === "bug"`) AND, as a
+        // wrong-typed non-null, fail the whole /api/agents decode on Android. Drop
+        // it to absent (Android's "" default; the gate then reads it as not-a-bug).
+        // The collector only ever emits string-or-null, so this bites a malformed
+        // host, not a real one — but the gate must not trust the field's shape.
+        if ("type" in t && typeof t.type !== "string") delete t.type;
         sanitizeTicketTriage(t);
       }
     }
@@ -9247,20 +9255,37 @@ function autoMergeSession(s, byKey, rows) {
   if (row.statusCategory === "done") return null;
   const repo = ticketRepo(siteKey, t.key, rows);
   if (autoStartContentGate(siteKey, row, repo)) return null;
-  // HARD floor: auto-merge acts ONLY on triage type "bug", independent of the
-  // org's triage policy (XERK-550). The content gate above matches whatever the
-  // AUTO-START stream would start — which an operator can widen past bugs via
-  // the triage policy (or leave wide with no excludeTypes). Auto-merge lands
-  // unreviewed code on the default branch, so it stays strictly bugs even when
-  // the org auto-starts other types: every non-bug (task/feature/chore/…) PR
-  // still waits for a human. The triage policy can NARROW auto-merge (exclude
-  // some bugs) but can never WIDEN it past bugs. `triage.type` is the
-  // classifier's own normalized assessment (TRIAGE_TYPE_WEIGHT keys), the same
-  // field the policy's excludeTypes matches on.
-  const tri = row.triage && typeof row.triage === "object" ? row.triage : null;
-  if (!tri || tri.type !== "bug") return null;
+  // HARD floor: auto-merge acts ONLY on tickets whose TRACKER ISSUE TYPE is a
+  // bug (Jira/ADO `type`, e.g. "Bug"), independent of the org's triage policy
+  // (XERK-560). The content gate above matches whatever the AUTO-START stream
+  // would start — which an operator can widen past bugs via the triage policy
+  // (or leave wide with no excludeTypes). Auto-merge lands UNREVIEWED code on
+  // the default branch, so it stays strictly bugs even when the org auto-starts
+  // other types: every non-bug PR still waits for a human. The policy can NARROW
+  // auto-merge (exclude some bugs) but can never WIDEN it past bugs.
+  //
+  // Keys on the OPERATOR-SET tracker Issue Type (`row.type`), NOT the triage
+  // CLASSIFIER's `row.triage.type` — the model labels a content-bug Task a
+  // "bug" and would auto-merge it (XERK-560's defect). `AUTO_MERGE_ISSUE_TYPES`
+  // is case-insensitive, default just "bug"; widen it (TURMA_AUTOMERGE_ISSUE_TYPES)
+  // for a tracker that names its bug type differently (e.g. "Defect").
+  // `typeof` guard is load-bearing, not just `String(row.type||"")`: a
+  // safety-critical merge decision must never trust the field's SHAPE, and
+  // `String(["bug"])` is `"bug"` — a single-element array would slip an
+  // un-normalized row (normalizeJira strips it on the wire, but the gate stands
+  // on its own). A non-string reads as not-a-bug.
+  if (typeof row.type !== "string"
+      || !AUTO_MERGE_ISSUE_TYPES.has(row.type.trim().toLowerCase())) return null;
   return { siteKey, key: t.key, row, repo };
 }
+
+// Tracker Issue Type names auto-merge treats as a bug (lower-cased). Default
+// just "bug"; override for a tracker that uses another name. Declared here (a
+// module const referenced only inside functions the 15s interval calls) so it
+// is initialized before any sweep runs.
+const AUTO_MERGE_ISSUE_TYPES = new Set(
+  String(process.env.TURMA_AUTOMERGE_ISSUE_TYPES || "bug")
+    .split(",").map((x) => x.trim().toLowerCase()).filter(Boolean));
 
 function autoMergeRowIndex(rows) {
   const byKey = new Map();

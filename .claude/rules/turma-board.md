@@ -186,16 +186,23 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
   the class that auto-merges is exactly the class the auto stream would START. It is a SEPARATE
   composition from `autoStartSweep`'s inline gates (their per-drop log lines differ); a cross-check
   test pins the two agree.
-  - **HARD floor: auto-merge acts ONLY on triage type `"bug"`, independent of the org's triage
-    policy.** The shared content gate matches whatever the AUTO-START stream would start — which the
-    operator can widen past bugs via the policy (or leave wide with no `excludeTypes`) — so on top of
-    it `autoMergeSession` requires `triage.type === "bug"`. Even an org that auto-STARTS other types
-    (task/feature/chore/…) only ever has its BUG PRs merged + closed hands-off; every other type's PR
-    still waits for a human. The triage policy can NARROW auto-merge (exclude some bugs) but can never
-    WIDEN it past bugs. `triage.type` is the classifier's normalized assessment
-    (`TRIAGE_TYPE_WEIGHT` keys), the same field `excludeTypes` matches on. (The gate is also
-    provenance-agnostic — a hand-started bug session in an opted-in org auto-merges too, which is the
-    same class — so do not describe it as "only sessions the hub started".)
+  - **HARD floor: auto-merge acts ONLY on tickets whose TRACKER ISSUE TYPE is a bug (XERK-560),
+    independent of the org's triage policy.** The shared content gate matches whatever the AUTO-START
+    stream would start — which the operator can widen past bugs via the policy (or leave wide with no
+    `excludeTypes`) — so on top of it `autoMergeSession` requires `row.type` (the tracker Issue Type:
+    Jira `issuetype`, ADO `System.WorkItemType`) to be in `AUTO_MERGE_ISSUE_TYPES` (case-insensitive,
+    default `{"bug"}`, `TURMA_AUTOMERGE_ISSUE_TYPES` widens it for a "Defect"-named tracker). Even an
+    org that auto-STARTS other types only ever has its BUG PRs merged + closed hands-off; every other
+    type's PR waits for a human. The policy can NARROW auto-merge but never WIDEN it past bugs.
+    - **Keys on the OPERATOR-SET tracker type, NOT the triage classifier's `row.triage.type`**
+      (XERK-560's defect): `triage.type` is a `claude -p` model ASSESSMENT ("the assessed work type
+      bug/feature/…") that labels a content-bug Jira **Task** a "bug" — so gating on it auto-merged
+      Tasks. `row.type` is deterministic and what the operator sets. (`triage.type`/`excludeTypes`
+      still govern auto-START, so a liberal classifier can auto-start non-Bug tickets — that is the
+      auto-start policy's concern, not auto-merge's.)
+    - The gate is also **provenance-agnostic** — a hand-started Bug-type session in an opted-in org
+      auto-merges too, which is the same class — so do not describe it as "only sessions the hub
+      started". It is independent of the auto-START switch (`autoMergeOrgs`, never `autoStartOrgs`).
   - **A Done ticket is excluded** (`statusCategory === "done"`): moving to Done is the abandon/stop
     gesture (autoStopSweep kills the session), and autoStopSweep only QUEUES that kill, so the
     session still reads running for a beat — the column, not the run state, stands the merge down.
