@@ -1846,7 +1846,20 @@ function resumeSession(key, id) {
     // with the toast saying why, rather than on a session page that has nothing
     // to open (XERK-264).
     () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/resume`, null, "Resume")
-      .then(r => { if (r) location.href = `/sessions?session=${enc(id)}`; return r; }));
+      .then(r => {
+        if (r) {
+          // Carry the queued command's id alongside the session id: the by-id
+          // wait resolves the SUCCESS, and the cmdId lets the sessions page end
+          // that wait with the agent's REASON should the resume be refused (the
+          // XERK-256 prune race) rather than spin "Opening session…" forever
+          // (XERK-276). A hub too old to answer a cmdId falls back to by-id only.
+          const q = r.cmdId
+            ? `?session=${enc(id)}&spawn=${enc(r.cmdId)}`
+            : `?session=${enc(id)}`;
+          location.href = `/sessions${q}`;
+        }
+        return r;
+      }));
 }
 // Resume ANY prior Claude session by its transcript id (the broadened picker,
 // repo.resumable). The origin cwd is looked up from cached state (kept out of
