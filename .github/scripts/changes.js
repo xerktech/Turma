@@ -19,11 +19,38 @@ const PREFIX_MAP = [
   { prefix: "android/", components: ["android"] },
 ];
 
-// Which components a single changed path touches. Anything matching no prefix
-// (VERSION, CHANGELOG.md, .github/**, README.md, CLAUDE.md, ...) returns [] and
+// Sub-paths under a component prefix that never reach that component's SHIPPED
+// artifact — its test suite and operator tooling. A change confined to these
+// touches no component: it builds nothing and lands under "Other" in the
+// changelog. The turma image COPYs only server.js/archive.js/tar.js/push.js/
+// usage-ledger.js/public/ (turma/tests, turma/tools stay out); the native
+// tarball cp's a curated list that excludes agent/tests; the .ehpk packs from
+// dist (not glasses/tests); the .apk is built from app/src/main (not
+// app/src/test). Checked longest-match FIRST, so an exclude always wins over the
+// bare prefix that contains it.
+//
+// XERK-426: mapping the bare `turma/` prefix meant a test-only turma/ merge
+// rebuilt AND — since XERK-425 — REDEPLOYED a runtime-identical hub, which
+// `Recreate`+`replicas: 1` pays for by dropping every tunnel/SSE/terminal
+// channel. release.yml's `push:` filter mirrors these as `!`-negation globs so
+// such a merge starts no release at all; the parity test asserts the mirror.
+const EXCLUDE_PREFIXES = [
+  "turma/tests/",
+  "turma/tools/",
+  "agent/tests/",
+  "glasses/tests/",
+  "android/app/src/test/",
+];
+
+// Which components a single changed path touches. A path under an EXCLUDE_PREFIX
+// (a component's tests/tooling), or matching no component prefix at all
+// (VERSION, CHANGELOG.md, .github/**, README.md, CLAUDE.md, ...), returns [] and
 // is surfaced as "Other" in the changelog — never dropped, never a build.
 function componentsForPath(p) {
   const s = String(p).replace(/^\.?\/+/, "");
+  for (const ex of EXCLUDE_PREFIXES) {
+    if (s.startsWith(ex)) return [];
+  }
   for (const { prefix, components } of PREFIX_MAP) {
     if (s.startsWith(prefix)) return components.slice();
   }
@@ -51,4 +78,18 @@ function componentPrefixes() {
   return PREFIX_MAP.map(({ prefix }) => prefix);
 }
 
-module.exports = { COMPONENTS, componentsForPath, detectChanges, componentPrefixes };
+// The sub-paths carved back OUT of the component dirs (tests + tooling that
+// never ships). release.yml's push:main filter restates these as `!`-negation
+// globs following the component-dir globs, so a merge confined to them starts no
+// release; the parity test in tests/changes.test.js asserts the two agree.
+function componentExcludes() {
+  return EXCLUDE_PREFIXES.slice();
+}
+
+module.exports = {
+  COMPONENTS,
+  componentsForPath,
+  detectChanges,
+  componentPrefixes,
+  componentExcludes,
+};
