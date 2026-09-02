@@ -584,12 +584,16 @@ those are marked `[MODEL]`.
   is a button, an eligible-host list (online + has the repo, deliberately NOT org-scoped: an archived
   session has no agent left to compare an org against), and following the returned `migrationId`
   through the `migrations` payload exactly as the existing Move flow does.
-- **P2 Say when a start was REFUSED (XERK-265).** Agents now report a declined resume/import on the
-  heartbeat, and the hub serves it per cmdId as `agent.spawnRefusals[cmdId] = {error, at}`. The web
-  ends its spawn-follow wait and toasts the reason ("Couldn't start session: the host is at
-  MAX_SESSIONS (4)"); Android's Resume is fire-and-forget ("resume queued") and follows no cmdId, so
-  a refusal there is still silent — the row simply never reappears. The cheapest port is to keep the
-  cmdId a resume POST answers with and surface a matching refusal as a snackbar.
+- **P2 Say when a start was REFUSED (XERK-265, XERK-276).** Agents now report a declined resume/import
+  on the heartbeat, and the hub serves it per cmdId as `agent.spawnRefusals[cmdId] = {error, at}`. The
+  web ends its spawn-follow wait and toasts the reason ("Couldn't start session: the host is at
+  MAX_SESSIONS (4)"); XERK-276 extended that to the KILLED-resume path too — the dashboard now carries
+  the resume command's cmdId through the deep link (`/sessions?session=<id>&spawn=<cmdId>`) so a
+  refused resume ends the by-id wait with the reason instead of spinning "Opening session…" forever.
+  Android's Resume is fire-and-forget ("resume queued") and follows no cmdId, so a refusal there is
+  still silent — the row simply never reappears, for BOTH the spawn and the killed-resume paths. The
+  cheapest port is to keep the cmdId a resume POST answers with and surface a matching refusal as a
+  snackbar.
 - **P2 Local-model mark on session CARDS (XERK-246 remainder).** The two controls are done (see Done
   above); what's left is the web's 🏠 + warn-colour mark on live and ended session cards, so a
   glance at the list says which sessions are on the weaker model without opening each one. Read

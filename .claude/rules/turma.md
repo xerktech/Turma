@@ -169,7 +169,12 @@ merge-readiness pill (`prBadgeHtml`). Per-session Attach/Restart/Kill/Start/Dele
   POST time, so `spawn()`/`resume_transcript()` echo the hub's queued-command id
   (`session.spawnCmdId`); the POST's `{ok,cmdId}` goes to `/sessions?spawn=<cmdId>`, which waits for
   that `spawnCmdId` and selects it. Resuming a **killed** session keeps its id, deep-linking
-  `/sessions?session=<id>` directly.
+  `/sessions?session=<id>&spawn=<cmdId>` — the by-id wait resolves the success (the resumed record
+  carries NO `spawnCmdId`, so the spawn scan never matches it), and the cmdId is carried ONLY so a
+  refused resume (the XERK-256 prune race) ends that wait with the agent's reason instead of spinning
+  "Opening session…" forever (XERK-276). Once the by-id session comes up, `tryPendingSelect` stops
+  following the spawn; a refusal drops the by-id wait too (else it re-toasts "never came up" over the
+  real reason). An older hub answering no cmdId falls back to `?session=<id>` alone.
 - Both waits are one-shot, "Starting your session…", expire at `SPAWN_FOLLOW_MS`, cancel on manual
   pick. `/sessions?ended=<transcriptId>` opens an ENDED session read-only (bounded by
   `ENDED_FOLLOW_MS`, cannot fold into `?session=`, which only resolves a running one). Tests:
@@ -177,7 +182,8 @@ merge-readiness pill (`prBadgeHtml`). Per-session Attach/Restart/Kill/Start/Dele
 - **The by-id `?session=<id>` wait is ALSO bounded** (`SELECT_FOLLOW_MS`, XERK-293) — a session that
   never comes up (offline host, lost heartbeat, an agent too old to report a refusal, a stale id)
   otherwise spun "Opening session…" forever. It lands on the empty stage with a one-line toast (a
-  timeout, not a reason — the cmdId route, XERK-276, is where a reason exists). It must NOT fire while
+  timeout, not a reason — a killed resume carries a cmdId that DOES surface the reason, XERK-276; a
+  bare ticket chip or hand-edited id has only this timeout). It must NOT fire while
   the paired spawn follow is still live (that window is `SPAWN_FOLLOW_MS`'s), nor for a session
   reported `queued` (a legitimate long wait with its own stage text), nor for one reported `running`
   ON AN ONLINE host (it came up; `sessionHit` is only held off by a terminal-tunnel FLAP that heals in

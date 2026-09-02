@@ -2495,7 +2495,15 @@ function resumeEnded(ev, id) {
     : { kind: "start", host: e.a.key, id };
   busy(pendKey("start", e.a.key, id), val,
     () => post(url, body, "Resume").then(r => {
-      if (e.kind === "resumable") followSpawn(r && r.cmdId);
+      // Follow the queued command's cmdId for EVERY kind (XERK-276). A resumable
+      // transcript has no known id, so this is its ONLY resolver; a killed/stopped
+      // session keeps its id (the by-id wait above opens it on success), so here
+      // the cmdId serves only to surface a REFUSAL — the same prune-race the
+      // dashboard's Resume now carries — instead of spinning the by-id wait out to
+      // SELECT_FOLLOW_MS with no reason. Safe for the by-id kinds because
+      // tryPendingSelect lets a session that comes up beat the lingering spawn
+      // follow. A falsy cmdId (older hub, refused POST) is a no-op → plain by-id.
+      followSpawn(r && r.cmdId);
       return r;
     }));
 }
@@ -2625,6 +2633,13 @@ function tryPendingSelect() {
   }
   if (pendingSpawn) {
     if (Date.now() - pendingSpawnAt > SPAWN_FOLLOW_MS) pendingSpawn = null;
+    // A resume of a KILLED session keeps its id, so it is followed BOTH by id
+    // (?session=<id>, the SUCCESS path) and by the resume command's cmdId
+    // (?spawn=<cmdId>, carried ONLY to surface a refusal — XERK-276). Its
+    // resumed record carries no `spawnCmdId`, so once that session comes up the
+    // by-id wait below selects it: stop following the spawn, exactly as a
+    // reported session beats a cached refusal for a normal spawn.
+    else if (pendingSelect && sessionHit(pendingSelect)) pendingSpawn = null;
     else {
       // A reported session ALWAYS wins, exactly as it does in the hub's
       // advanceMigrations — so the lookup runs FIRST and clears `pendingSpawn`.
@@ -2640,6 +2655,11 @@ function tryPendingSelect() {
       const ref = spawnRefusal(pendingSpawn);
       if (ref) {
         pendingSpawn = null;
+        // A refused resume never comes up under its id either, so drop the by-id
+        // wait too (XERK-276) — otherwise it spins "Opening session…" out to
+        // SELECT_FOLLOW_MS and then toasts a second, less useful "never came up",
+        // burying the real reason. A no-op for a plain spawn (pendingSelect null).
+        pendingSelect = null;
         // A refused MIGRATION import already toasts through advanceMigrationFollow
         // (which words it as a failed move); don't say it twice.
         if (!ref.migration) toast("Couldn't start session: " + ref.error);

@@ -966,6 +966,53 @@ test("a spawn the agent refused stops the wait and says why (XERK-265)", () => {
   assert.deepEqual(opened, []);
 });
 
+// XERK-276. Resuming a KILLED session keeps its id, so the dashboard deep-links
+// BOTH the id and the resume command's cmdId (?session=<id>&spawn=<cmdId>). The
+// by-id wait resolves the success — the resumed record carries no spawnCmdId —
+// and the cmdId is there only to surface a refusal (the XERK-256 prune race),
+// which previously spun "Opening session…" forever with no reason.
+test("a killed resume opens on arrival, not after the spawn follow times out (XERK-276)", () => {
+  const { beat, opened } = loadPage({ search: "?session=55555&spawn=cmd-r" });
+  const { now, host: h } = host([{ id: "55555", status: "stopped", repo: "repoX", summary: "Killed" }]);
+
+  // Beat 1: not relaunched yet — held, nothing opened.
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, []);
+
+  // Beat 2: the agent relaunched it under its kept id — with NO spawnCmdId, so
+  // the spawn scan can't match it; the by-id wait must open it right away rather
+  // than sit on "Starting…" until SPAWN_FOLLOW_MS clears the carried cmdId.
+  h.sessions = [working("55555", "Resumed")];
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, ["55555"], "opens the moment the session comes up");
+
+  // One-shot, like every other follow.
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, ["55555"]);
+});
+
+test("a refused killed resume ends the by-id wait with the reason (XERK-276)", () => {
+  const { beat, els, opened, toasts } = loadPage({ search: "?session=55555&spawn=cmd-r" });
+  const { now, host: h } = host([{ id: "55555", status: "stopped", repo: "repoX", summary: "Killed" }]);
+
+  // Beat 1: the ordinary wait.
+  beat({ now, agents: [h] });
+  assert.match(els.stageEmptyBig.innerHTML, /Starting your session/);
+
+  // Beat 2: the host reports it declined the resume (a prune took the worktree).
+  h.spawnRefusals = { "cmd-r": { error: "a prune is removing the worktree", at: now } };
+  beat({ now, agents: [h] });
+  assert.deepEqual(toasts, ["Couldn't start session: a prune is removing the worktree"]);
+  assert.match(els.stageEmptyBig.innerHTML, /No session attached/,
+    "the wait ends instead of spinning 'Opening session…' forever");
+  assert.deepEqual(opened, []);
+
+  // The by-id wait was dropped too, so no later beat re-toasts "never came up"
+  // over the real reason.
+  beat({ now, agents: [h] });
+  assert.deepEqual(toasts, ["Couldn't start session: a prune is removing the worktree"]);
+});
+
 test("a followed move advances on its SSE event, not just on a page reload", async () => {
   // The fleet payload is polled ONCE at load while SSE is healthy (fastPoll
   // returns early, the fallback interval only runs when it isn't), so without a
@@ -1607,6 +1654,31 @@ test("the archive BROWSER is still gone from the sidebar markup", () => {
 // A killed session, as the agent's closed history reports it.
 const closed = (id, summary, closedAt, extra) => ({
   id, repo: "repoX", summary, closedAt, worktreePath: "/g/.turma/worktrees/" + id, ...extra,
+});
+
+// XERK-276 (in-page half). The Sessions page's own Ended-list Resume has the
+// same shape as the dashboard's: a killed session keeps its id, so it took the
+// by-id wait but followed no cmdId — a refused resume spun "Opening session…"
+// forever with no reason. resumeEnded now follows the resume command's cmdId for
+// EVERY kind, so the refusal ends the wait with the agent's reason.
+test("resumeEnded surfaces a refused killed resume, not a forever spinner (XERK-276)", async () => {
+  const { beat, resumeEnded, els, opened, toasts } =
+    loadPage({ postReply: { ok: true, cmdId: "cmd-r2" } });
+  const { now, host: h } = host([]);
+  h.closedSessions = [closed("66666", "Killed", "2026-07-15T09:00:00Z")];
+  beat({ now, agents: [h] });
+
+  resumeEnded(null, "66666");        // deep-links by id AND arms followSpawn(cmd-r2)
+  for (let i = 0; i < 5; i++) await Promise.resolve();  // let the POST's .then run
+
+  beat({ now, agents: [h] });
+  assert.match(els.stageEmptyBig.innerHTML, /Starting your session/, "holds while it relaunches");
+
+  h.spawnRefusals = { "cmd-r2": { error: "a prune is removing the worktree", at: now } };
+  beat({ now, agents: [h] });
+  assert.deepEqual(toasts, ["Couldn't start session: a prune is removing the worktree"]);
+  assert.match(els.stageEmptyBig.innerHTML, /No session attached/, "the wait ends with a reason");
+  assert.deepEqual(opened, []);
 });
 
 test("Ended sessions merges killed + stopped, newest-ended first", () => {
