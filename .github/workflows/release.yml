@@ -33,10 +33,20 @@ on:
   push:
     branches: [main]
     paths:
+      # Mirrors changes.js PREFIX_MAP; the `!` lines mirror its EXCLUDE_PREFIXES
+      # (a component's tests/tooling never reaches its shipped artifact), so a
+      # merge confined to them starts no release — no runtime-identical rebuild,
+      # and (XERK-425) no runtime-identical hub REDEPLOY. Negations must follow
+      # the positives; the changes.test.js parity test asserts both halves.
       - "turma/**"
       - "agent/**"
       - "glasses/**"
       - "android/**"
+      - "!turma/tests/**"
+      - "!turma/tools/**"
+      - "!agent/tests/**"
+      - "!glasses/tests/**"
+      - "!android/app/src/test/**"
   workflow_dispatch:
     inputs:
       release_type:

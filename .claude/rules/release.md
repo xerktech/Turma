@@ -50,9 +50,12 @@ paths:
 - Auths with a **write deploy key**, never a PAT (`GITHUB_TOKEN` can't reach another repo; a classic
   PAT carries the whole account; a fine-grained one expires silently). GitHub's host key is pinned,
   not accepted on first use.
-- Skipped on a dry run and off **main**. **"Built" is not "changed"**: `changes.js` maps the whole
-  `turma/` prefix, so a test-only merge rebuilds + redeploys a runtime-identical hub, which
-  `Recreate`+`replicas: 1` pays for with every tunnel/SSE/terminal channel (XERK-426).
+- Skipped on a dry run and off **main**. **"Built" IS "changed"**: `changes.js` carves each
+  component's non-shipped tests/tooling out of its prefix (`EXCLUDE_PREFIXES`; e.g. `turma/tests/**`,
+  `turma/tools/**`), and `release.yml`'s `push:` filter mirrors them as `!`-negation globs, so a
+  test-only merge builds nothing and never REDEPLOYS a runtime-identical hub — the `Recreate`+
+  `replicas: 1` drop of every tunnel/SSE/terminal channel is reserved for a real image change
+  (XERK-426). Widening the exclude list means widening BOTH the map and those globs together.
 
 ## PR gates (pre-merge to main)
 
