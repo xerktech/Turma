@@ -26,6 +26,15 @@ fail() { echo "  FAIL: $1"; FAILED=1; }
 # assert <expected> <actual> <ok-msg> <fail-msg>
 assert_eq() { if [ "$1" = "$2" ]; then pass "$3"; else fail "$4"; fi; }
 
+# Mirror turma-agent-update's prefix_tag (XERK-551): the lock, holder, throttle
+# stamps and skip counter are SCOPED to a hash of the install $PREFIX, so distinct
+# installs under one $HOME never share them (a shared lock could starve the real
+# poller forever). Tests that plant or read those files must use the same tag.
+# Derived from the realpath, exactly as the script derives $PREFIX from $0.
+prefix_tag() {  # <prefix>
+  printf '%s' "$(cd "$1" && pwd)" | sha256sum | cut -c1-12
+}
+
 # --- Build a valid native tarball + sha256 sidecar for a given version -------
 # The payload must satisfy install_payload's completeness check (hub-agent.py +
 # tunnel-agent.js + hooks/). [4th arg = withdsh] adds the dsh toolchain flat in
@@ -821,10 +830,14 @@ if command -v mkfifo >/dev/null 2>&1; then
   install_fake_claude_toolchain "$bin" "2.0.1" "2.0.1" yes
   d="$(new_gh_dir)"; add_unified_release "$d" "v0.3.0" "0.3.0" "v0.3.0"
   mkdir -p "$root/home/.turma"
-  mkfifo "$root/home/.turma/last-claude-check" \
+  # The stamp and lock are prefix-scoped (XERK-551); plant the FIFOs at the paths
+  # this install actually opens, so the guard is genuinely exercised. The log and
+  # unparseable marker stay per-user (unscoped).
+  ptag="$(prefix_tag "$prefix")"
+  mkfifo "$root/home/.turma/last-claude-check.$ptag" \
          "$root/home/.turma/claude-unparseable" \
          "$root/home/.turma/update.log" \
-         "$root/home/.turma/update.lock" 2>/dev/null || true
+         "$root/home/.turma/update.$ptag.lock" 2>/dev/null || true
   rc=0
   env FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:/usr/bin:/bin" \
     TURMA_REPO="xerktech/turma" CLAUDE_LOG="$root/claude.log" \
@@ -1003,7 +1016,7 @@ run_boot_case() {  # <installed_version> <fake_gh_dir> <stamp_age_sec|none>
   install_fake_restart "$bin"; install_fake_gh "$bin"
   mkdir -p "$root/home/.turma"
   if [ "$age" != none ]; then
-    echo $(( $(date +%s) - age )) > "$root/home/.turma/last-update-check"
+    echo $(( $(date +%s) - age )) > "$root/home/.turma/last-update-check.$(prefix_tag "$prefix")"
   fi
   FAKE_GH_DIR="$ghdir" HOME="$root/home" PATH="$bin:$PATH" \
     TURMA_REPO="xerktech/turma" TURMA_CLAUDE_AUTO_UPDATE=0 \
@@ -1054,7 +1067,7 @@ echo "0.3.0" >"$prefix/VERSION"
 install_fake_restart "$bin"; install_fake_gh "$bin"
 FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
   TURMA_CLAUDE_AUTO_UPDATE=0 "$bin/turma-agent-update" >/dev/null 2>&1 || true
-if [ -s "$root/home/.turma/last-update-check" ]; then
+if [ -s "$root/home/.turma/last-update-check.$(prefix_tag "$prefix")" ]; then
   pass "a plain run stamps the last-check time"
 else
   fail "no last-update-check stamp after a run"
@@ -1125,7 +1138,7 @@ FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma"
 got="$(tr -d '[:space:]' < "$prefix/VERSION")"
 assert_eq "0.4.0" "$got" "a claude check doesn't throttle the agent check (-> $got)" \
   "the claude check's stamp suppressed the agent check, VERSION stayed $got"
-if [ -s "$root/home/.turma/last-claude-check" ]; then
+if [ -s "$root/home/.turma/last-claude-check.$(prefix_tag "$prefix")" ]; then
   pass "the claude check keeps its own stamp"
 else
   fail "no last-claude-check stamp after --claude-only"
@@ -1383,7 +1396,7 @@ if grep -q 'force-terminated' "$root/home/.turma/update.log" 2>/dev/null; then
 else
   fail "no watchdog log line: $(cat "$root/home/.turma/update.log" 2>/dev/null)"
 fi
-if [ ! -e "$root/home/.turma/update.lock.holder" ]; then
+if [ ! -e "$root/home/.turma/update.$(prefix_tag "$prefix").lock.holder" ]; then
   pass "the lock holder record is cleared once the deadline fires (lock released)"
 else
   fail "a holder record lingered after the run was killed — the lock may still be held"
@@ -1407,7 +1420,7 @@ FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma"
   TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_RUN_DEADLINE=999999 TURMA_LOCK_RECLAIM_AFTER=2 \
   "$bin/turma-agent-update" --loop --interval 999 >"$root/loop.log" 2>&1 &
 loop_pid=$!
-for _ in $(seq 1 50); do [ -e "$root/home/.turma/update.lock.holder" ] && break; sleep 0.1; done
+for _ in $(seq 1 50); do [ -e "$root/home/.turma/update.$(prefix_tag "$prefix").lock.holder" ] && break; sleep 0.1; done
 sleep 3   # age the holder past the 2s reclaim threshold
 # The reclaiming check needs a WORKING gh; the wedged poller keeps its own hung
 # `gh sleep` running (overwriting the file on disk can't affect it).
@@ -1443,7 +1456,7 @@ FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma"
   TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_RUN_DEADLINE=999999 \
   "$bin/turma-agent-update" --loop --interval 999 >"$root/loop.log" 2>&1 &
 loop_pid=$!
-for _ in $(seq 1 50); do [ -e "$root/home/.turma/update.lock.holder" ] && break; sleep 0.1; done
+for _ in $(seq 1 50); do [ -e "$root/home/.turma/update.$(prefix_tag "$prefix").lock.holder" ] && break; sleep 0.1; done
 sleep 1
 out="$(FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
   TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_BOOT_UPDATE_MIN_INTERVAL=0 \
@@ -1454,6 +1467,97 @@ if [ "$still_alive" = yes ] && printf '%s' "$out" | grep -q 'holds the lock'; th
   pass "a healthy holder is not reclaimed — single-flight preserved"
 else
   fail "a young holder was reclaimed/killed (alive=$still_alive): $out"
+fi
+rm -rf "$root" "$d"
+
+# --- The poller doesn't forfeit an interval, and installs don't fight (XERK-551)
+# Two failures behind a host silently stranded on a stale build: a --loop poll
+# lost to lock contention slept the WHOLE interval (one lost poll = an hour, and
+# sustained contention = the poller never running), and every updater under one
+# $HOME shared ONE lock regardless of its install prefix, so a leaked/staged loop
+# could hold or fight over it forever.
+
+# 37. A poll lost to contention RETRIES after a short backoff instead of forfeiting
+#     the full INTERVAL. Hold the lock from a separate process for the whole
+#     window (its holder file is absent, so the reclaim path stands aside rather
+#     than killing our holder), and confirm the poller retries several times in a
+#     few seconds despite a 3600s interval.
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_fake_gh "$bin"
+mkdir -p "$root/home/.turma"
+lockpath="$root/home/.turma/update.$(prefix_tag "$prefix").lock"
+( exec 9>"$lockpath"; flock 9; sleep 20 ) &
+hold_pid=$!
+d="$(new_gh_dir)"; add_unified_release "$d" "v0.4.0" "0.4.0" "v0.4.0"
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_POLL_RETRY_SEC=1 TURMA_UPDATE_INTERVAL=3600 \
+  "$bin/turma-agent-update" --loop >"$root/loop.log" 2>&1 &
+loop_pid=$!
+for _ in $(seq 1 50); do
+  n="$(grep -c 'retrying in' "$root/loop.log" 2>/dev/null || true)"
+  [ "${n:-0}" -ge 3 ] && break
+  sleep 0.2
+done
+kill "$loop_pid" 2>/dev/null || true; wait "$loop_pid" 2>/dev/null || true
+kill "$hold_pid" 2>/dev/null || true; wait "$hold_pid" 2>/dev/null || true
+n="$(grep -c 'retrying in' "$root/loop.log" 2>/dev/null || true)"; n="${n:-0}"
+if [ "$n" -ge 3 ]; then
+  pass "a poll lost to contention retries in seconds, not after the full interval ($n retries)"
+else
+  fail "the poller forfeited the interval on contention (only $n retry lines in the window)"
+fi
+rm -rf "$root" "$d"
+
+# 38. The lock is SCOPED to the install prefix: a second install under the SAME
+#     $HOME updates normally while another install holds ITS lock. Keyed off $HOME
+#     (the bug), install B would lose A's lock and skip forever.
+root="$(mktemp -d)"; home="$root/home"; mkdir -p "$home/.turma"
+prefixA="$root/a"; prefixB="$root/b"
+for p in "$prefixA" "$prefixB"; do
+  mkdir -p "$p/bin"
+  cp "$SCRIPT" "$p/bin/turma-agent-update"; chmod +x "$p/bin/turma-agent-update"
+  echo "# old" >"$p/hub-agent.py"; echo "// old" >"$p/tunnel-agent.js"
+  mkdir -p "$p/hooks"; echo "# old" >"$p/hooks/guard.py"
+  echo "0.3.0" >"$p/VERSION"
+  install_fake_restart "$p/bin"; install_fake_gh "$p/bin"
+done
+d="$(new_gh_dir)"; add_unified_release "$d" "v0.4.0" "0.4.0" "v0.4.0"
+lockA="$home/.turma/update.$(prefix_tag "$prefixA").lock"
+( exec 9>"$lockA"; flock 9; sleep 20 ) &
+hold_pid=$!
+FAKE_GH_DIR="$d" HOME="$home" PATH="$prefixB/bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 "$prefixB/bin/turma-agent-update" >"$root/b.log" 2>&1 || true
+kill "$hold_pid" 2>/dev/null || true; wait "$hold_pid" 2>/dev/null || true
+got="$(tr -d '[:space:]' < "$prefixB/VERSION")"
+assert_eq "0.4.0" "$got" "a second install updates while another holds ITS own lock (-> $got)" \
+  "install B was starved by install A's lock — it is not prefix-scoped (VERSION $got)"
+if [ "$(prefix_tag "$prefixA")" != "$(prefix_tag "$prefixB")" ]; then
+  pass "distinct prefixes hash to distinct lock/stamp files"
+else
+  fail "two different prefixes produced the same tag — scoping is ineffective"
+fi
+rm -rf "$root" "$d"
+
+# 39. Every log line is tagged with the install $PREFIX. The LOG stays shared
+#     across installs under one $HOME (deliberately), so the tag is what tells two
+#     concurrent updaters apart instead of every line reading as a duplicate.
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_fake_gh "$bin"
+d="$(new_gh_dir)"; add_unified_release "$d" "v0.3.0" "0.3.0" "v0.3.0"
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 "$bin/turma-agent-update" >/dev/null 2>&1 || true
+if grep -qF "[$(cd "$prefix" && pwd)]" "$root/home/.turma/update.log"; then
+  pass "each log line carries the install prefix tag"
+else
+  fail "log lines are not prefix-tagged: $(cat "$root/home/.turma/update.log" 2>/dev/null)"
 fi
 rm -rf "$root" "$d"
 
