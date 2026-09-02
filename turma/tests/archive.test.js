@@ -979,11 +979,25 @@ test("XERK-280: a healthy transcript is never mutated on read", () => {
   ]);
   const jsonl = jsonlFor("x280c", M, "nas280");
   const before = fs.statSync(jsonl).mtimeMs;
-  const t = archive.getTranscript("x280c");
+  // Capture the heal's own log line: reconcileRow only reaches it PAST its no-op
+  // guard, so its absence pins that a healthy read takes the early return and
+  // runs no FTS delete/re-insert + row UPDATE on the hot browse/search path
+  // (drop the guard and every healthy read churns the tx — this catches it).
+  const origErr = console.error;
+  const logs = [];
+  console.error = (...a) => logs.push(a.join(" "));
+  let t;
+  try {
+    t = archive.getTranscript("x280c");
+    archive.listArchive({ host: "nas280" });
+    archive.searchArchive("hello");
+  } finally { console.error = origErr; }
   assert.equal(t.entries.length, 2);
   assert.equal(archive.listArchive({ host: "nas280" }).sessions
     .find((s) => s.transcriptId === "x280c").msgCount, 2);
-  // No heal ran, so the file was not rewritten and the count held.
+  // No heal ran: no reconcile log, and the file was not rewritten.
+  assert.equal(logs.filter((l) => l.includes("reconciled x280c")).length, 0,
+    "healthy read must not trigger a heal");
   assert.equal(fs.statSync(jsonl).mtimeMs, before);
 });
 
