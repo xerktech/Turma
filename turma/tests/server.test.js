@@ -10853,6 +10853,14 @@ const resetMerge = () => {
   autoClosed.clear();
   autoStopped.clear();
   for (const k of Object.keys(autoMergeOrgs)) delete autoMergeOrgs[k];
+  // XERK-563: the per-repo merge guard (inflightRepos) scans the WHOLE fleet, so
+  // a prior test's leftover mergePr command would serialize a later test's PR to
+  // the same repo (many tests share PR1 = x/y/pull/1). Drop them for isolation.
+  for (const a of Object.values(agents)) {
+    if (Array.isArray(a.commands)) {
+      a.commands = a.commands.filter((c) => c && c.type !== "mergePr");
+    }
+  }
 };
 // A running ticket session in an opted-in org with one PR. Defaults: idle
 // (paneBusy false), an actionable bug (auto-start-eligible), a merge-ready OPEN
@@ -11093,6 +11101,66 @@ test("XERK-550: auto-merge gives up after too many attempts", async () => {
   autoMergeSweep();
   assert.equal((agents.am10.commands || []).filter((c) => c.type === "mergePr").length, 0);
   assert.equal(autoMergeState.get(PR1).gaveUp, true);
+});
+
+test("XERK-563: a transient (retryable) gh failure is NOT gaveUp — it retries", async () => {
+  // The base advanced between the readiness read and the merge; gh says "try the
+  // merge again". The agent flags the result retryable, and the hub must leave it
+  // to the backoff rather than the permanent give-up a real refusal earns.
+  // Unique repo: inflightRepos (XERK-563) scans the whole fleet, so a shared
+  // repo would be held by other tests' leftover mergePr commands.
+  resetMerge();
+  const u = "https://github.com/am563b/r/pull/1";
+  await mergeBeat("am563b", "am563b.atlassian.net", { url: u });
+  autoMergeSweep(); // attempt 1, dispatched
+  ingestMergeResults(agents.am563b, [{ cmdId: "c1", url: u, ok: false, retryable: true,
+    error: "GraphQL: Base branch was modified. Review and try the merge again." }]);
+  autoMergeSweep(); // folds the failure — must NOT set gaveUp
+  assert.notEqual(autoMergeState.get(u).gaveUp, true);
+  // Past the backoff window (and with the in-flight command drained) it
+  // re-dispatches a fresh attempt instead of standing down forever.
+  autoMergeState.get(u).at = 0;
+  agents.am563b.commands = [];
+  autoMergeSweep();
+  assert.equal((agents.am563b.commands || []).filter((c) => c.type === "mergePr").length, 1);
+  assert.equal(autoMergeState.get(u).attempts, 2);
+});
+
+test("XERK-563: at most one merge per base repo per sweep (no self-race)", async () => {
+  // A squash-merge moves the base, so a second concurrent merge to the SAME repo
+  // hits GitHub's "Base branch was modified". Serialize per repo: one merge to
+  // the shared repo this sweep, while a DIFFERENT repo proceeds in parallel.
+  // Unique repos so the fleet-wide inflightRepos isn't held by other tests.
+  resetMerge();
+  await mergeBeat("am563d", "am563d.atlassian.net", { prs: [
+    { url: "https://github.com/am563d/one/pull/1", state: "OPEN", ready: "ready", mergeable: "MERGEABLE" },
+    { url: "https://github.com/am563d/one/pull/2", state: "OPEN", ready: "ready", mergeable: "MERGEABLE" },
+    { url: "https://github.com/am563d/two/pull/9", state: "OPEN", ready: "ready", mergeable: "MERGEABLE" },
+  ] });
+  autoMergeSweep();
+  const merges = (agents.am563d.commands || [])
+    .filter((c) => c.type === "mergePr").map((c) => c.url);
+  assert.equal(merges.filter((u) => u.includes("/am563d/one/")).length, 1,
+    `one merge to the shared repo only, got ${JSON.stringify(merges)}`);
+  assert.equal(merges.filter((u) => u.includes("/am563d/two/")).length, 1,
+    `the other repo proceeds in parallel, got ${JSON.stringify(merges)}`);
+});
+
+test("XERK-563: a repo with an in-flight merge is not re-raced next sweep", async () => {
+  // The per-repo guard reads commands already queued (inflightRepos), not just
+  // this sweep's dispatches — so a still-running merge holds the second same-repo
+  // PR even after its own backoff has elapsed.
+  resetMerge();
+  await mergeBeat("am563e", "am563e.atlassian.net", { prs: [
+    { url: "https://github.com/am563e/r/pull/1", state: "OPEN", ready: "ready", mergeable: "MERGEABLE" },
+    { url: "https://github.com/am563e/r/pull/2", state: "OPEN", ready: "ready", mergeable: "MERGEABLE" },
+  ] });
+  autoMergeSweep();
+  const first = (agents.am563e.commands || []).filter((c) => c.type === "mergePr");
+  assert.equal(first.length, 1);
+  autoMergeState.get(first[0].url).at = 0;  // clear backoff — only serialization should hold PR2
+  autoMergeSweep();
+  assert.equal((agents.am563e.commands || []).filter((c) => c.type === "mergePr").length, 1);
 });
 
 test("XERK-550: ingestMergeResults caches by cmdId and is stripped from the payload", async () => {

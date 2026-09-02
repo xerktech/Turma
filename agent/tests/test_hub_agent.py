@@ -24753,10 +24753,13 @@ class TestMergePr(ManagerMixin, unittest.TestCase):
             sm.merge_pr("c1", None, self.URL)
         self.assertEqual(seen["cmd"],
                          ["gh", "pr", "merge", self.URL, "--squash", "--delete-branch"])
-        self.assertIsNone(seen["cwd"])
+        # Never the worktree (XERK-563): a neutral non-repo cwd so --delete-branch
+        # doesn't run a local `git checkout` that collides with the worktree.
+        self.assertEqual(seen["cwd"], ha.REGISTRY_DIR)
         r = sm.merge_pr_results[0]
         self.assertEqual((r["cmdId"], r["url"], r["ok"], r["error"]),
                          ("c1", self.URL, True, None))
+        self.assertFalse(r["retryable"])  # a success is never retryable
 
     def test_a_refused_merge_stages_the_gh_error(self):
         sm = self.make_manager()
@@ -24811,7 +24814,13 @@ class TestMergePr(ManagerMixin, unittest.TestCase):
         sm.merge_pr("c", None, "not a url")
         self.assertFalse(sm.merge_pr_results[0]["ok"])
 
-    def test_the_session_worktree_is_the_cwd_when_it_exists(self):
+    def test_the_merge_runs_from_the_neutral_registry_dir_never_the_worktree(self):
+        # XERK-563: `gh pr merge --delete-branch` from inside the session
+        # worktree ran a local `git checkout <base>` for cleanup that collided
+        # with Turma's multi-worktree checkout ("fatal: 'main' is already used by
+        # worktree at ..."), failing the whole merge. The merge now runs from a
+        # non-repo cwd so gh deletes the remote branch via the API only — so even
+        # WITH a live worktree the cwd is REGISTRY_DIR, not the worktree.
         sm = self.make_manager()
         wt = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, wt, ignore_errors=True)
@@ -24820,13 +24829,55 @@ class TestMergePr(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha.subprocess, "run",
                                lambda cmd, cwd=None, **kw: seen.update(cwd=cwd) or self._fake_run()):
             sm.merge_pr("c", "s1", self.URL)
-        self.assertEqual(seen["cwd"], wt)
+        self.assertEqual(seen["cwd"], ha.REGISTRY_DIR)
+        self.assertNotEqual(seen["cwd"], wt)
 
-    def test_a_subprocess_crash_is_staged_never_raised(self):
+    def test_a_base_branch_modified_race_is_flagged_retryable(self):
+        # XERK-563: GitHub's optimistic-concurrency race — the base advanced
+        # between the readiness read and the merge. gh says "try the merge
+        # again", so the hub must RETRY, not give up. The agent flags it.
+        sm = self.make_manager()
+        err = "GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)"
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(ha.subprocess, "run",
+                               return_value=self._fake_run(rc=1, stderr=err)):
+            sm.merge_pr("c", None, self.URL)
+        r = sm.merge_pr_results[0]
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["retryable"])
+
+    def test_a_conflict_or_permission_refusal_is_not_retryable(self):
+        # A conflict / review-required never fixes itself — give up, don't retry.
+        sm = self.make_manager()
+        for msg in ("Pull request is not mergeable: review required",
+                    "merge conflict between base and head",
+                    "GraphQL: Resource not accessible by integration"):
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(ha.subprocess, "run",
+                                   return_value=self._fake_run(rc=1, stderr=msg)):
+                sm.merge_pr("c", None, self.URL)
+        self.assertTrue(all(not r["ok"] and not r["retryable"]
+                            for r in sm.merge_pr_results))
+
+    def test_a_merge_timeout_is_retryable(self):
+        # A timed-out gh call is transient — retry it.
+        sm = self.make_manager()
+        with mock.patch.object(
+                ha.subprocess, "run",
+                side_effect=ha.subprocess.TimeoutExpired(cmd="gh", timeout=60)):
+            sm.merge_pr("c", None, self.URL)  # must not raise
+        r = sm.merge_pr_results[0]
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["retryable"])
+        self.assertIn("timed out", r["error"])
+
+    def test_a_subprocess_crash_is_staged_never_raised_and_not_retryable(self):
         sm = self.make_manager()
         with mock.patch.object(ha.subprocess, "run", side_effect=OSError("boom")):
             sm.merge_pr("c", None, self.URL)  # must not raise
-        self.assertFalse(sm.merge_pr_results[0]["ok"])
+        r = sm.merge_pr_results[0]
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["retryable"])  # a non-transient run failure gives up
 
     def test_dispatch_routes_mergePr_to_the_async_worker(self):
         sm = self.make_manager()
