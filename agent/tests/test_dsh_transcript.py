@@ -439,8 +439,11 @@ class TestDshSubagentProjection(unittest.TestCase):
         state = {}
         for e in entries:
             ha._scan_agent_entry(e, state)
+        # resolveId (XERK-333) = the child id that names agent-<child>.jsonl, so
+        # a dsh subagent far behind the head resolves from the index too.
         self.assertEqual(state["liveAgents"],
-                         {CHILD: {"type": "subagent", "label": "Investigate the flake"}})
+                         {CHILD: {"type": "subagent", "label": "Investigate the flake",
+                                  "resolveId": CHILD}})
 
     def test_end_retires_the_agent(self):
         proj = dt.DshProjector(SID)
@@ -534,8 +537,9 @@ class TestDshWorkflowProjection(unittest.TestCase):
         self.assertEqual(tur["taskId"], "wf_" + RUN)
         # folds into the live-agent scan as a workflow row
         launch = ha._async_launch(entries[1])
+        # resolveId (XERK-333) = the runId that names the run dir (== taskId here).
         self.assertEqual(launch, {"id": "wf_" + RUN, "type": "workflow",
-                                  "label": "review"})
+                                  "label": "review", "resolveId": "wf_" + RUN})
 
     def test_run_end_retires_the_workflow(self):
         proj = dt.DshProjector(SID)
