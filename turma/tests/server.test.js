@@ -11163,6 +11163,23 @@ test("XERK-563: a repo with an in-flight merge is not re-raced next sweep", asyn
   assert.equal((agents.am563e.commands || []).filter((c) => c.type === "mergePr").length, 1);
 });
 
+test("XERK-563: an OFFLINE host's stranded mergePr does not block another host's PR to that repo", async () => {
+  // Serialization is fleet-wide, but a dead host's un-acked mergePr must not hold
+  // a base repo hostage (no mergePr reclaim exists). An OFFLINE host is excluded
+  // from inflightRepos, so a live host's ready PR to the SAME repo still merges.
+  resetMerge();
+  const shared1 = "https://github.com/am563f/shared/pull/1";
+  const shared2 = "https://github.com/am563f/shared/pull/2";
+  await asBeat("am563fA", "am563fa.atlassian.net", { autoStart: false });
+  agents.am563fA.commands = [{ cmdId: "stuck", type: "mergePr", url: shared1 }];
+  agents.am563fA.lastSeen = Date.now() - 10 * 60 * 1000;  // well past OFFLINE_AFTER_MS
+  await mergeBeat("am563fB", "am563fb.atlassian.net", { url: shared2 });
+  autoMergeSweep();
+  assert.equal((agents.am563fB.commands || [])
+    .filter((c) => c.type === "mergePr" && c.url === shared2).length, 1,
+    "live host's PR must dispatch despite the dead host's stranded same-repo merge");
+});
+
 test("XERK-550: ingestMergeResults caches by cmdId and is stripped from the payload", async () => {
   resetMerge();
   await mergeBeat("am11", "am11.atlassian.net", {});

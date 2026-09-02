@@ -9342,6 +9342,13 @@ function autoMergeSweep() {
   // riding a queue; `dispatchedRepos` is what THIS sweep has just sent.
   const inflightRepos = new Set();
   for (const a of Object.values(agents)) {
+    // Only an ONLINE host's un-acked mergePr actually holds the base. A dead
+    // host's STRANDED command would otherwise block every other host's PR to
+    // that repo until it returns or is pruned (~a week), and there is no mergePr
+    // reclaim (XERK-563). If that stale merge ever does run on the host's return
+    // it hits the base-race — now retryable — so excluding offline hosts is safe
+    // and only costs the returning host one retry.
+    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
     for (const c of a.commands || []) {
       if (c && c.type === "mergePr") {
         const rk = prRepoKey(c.url);
