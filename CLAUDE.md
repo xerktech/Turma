@@ -14,7 +14,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `agent-input.md` | `agent/hub-agent.py` | `send_input`'s pane path + compaction outbox, `notify_session`'s inbox |
 | `agent-sessions.md` | `agent/hub-agent.py` | session launch, repos-root sessions, queue, kill/resume/delete, new-work directive, local-model failover |
 | `session-transcript.md` | `agent/hub-agent.py`, `agent/tunnel-agent.js`, `turma/server.js`, `turma/public/sessions.html` | which transcript is a session's: id pinning, `_session_transcript_path`, root-session isolation |
-| `session-migration.md` | `agent/hub-agent.py`, `turma/server.js`, `turma/public/sessions.html` | migrating a session between agents (XERK-101); a refused start is REPORTED (XERK-265) |
+| `session-migration.md` | `agent/hub-agent.py`, `turma/server.js`, `sessions.html`, android `Sessions.kt` | migrating a session between agents (XERK-101); a refused start is REPORTED (XERK-265) |
 | `agent-workflows.md` | `agent/hub-agent.py` | workflow runs: run-dir layout, resolving a `workflow` row, journal/label reads |
 | `agent-archive.md` | `agent/hub-agent.py` | archive sync: manifest, rendered + raw delta pushes, payload shed, off-beat sync worker |
 | `agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |

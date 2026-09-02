@@ -6,13 +6,18 @@ paths:
   - "agent/tests/test_hub_agent.py"
   - "turma/tests/server.test.js"
   - "turma/tests/sessions.test.js"
+  - "android/app/src/main/java/com/xerktech/turma/core/Sessions.kt"
+  - "android/app/src/main/java/com/xerktech/turma/ui/SessionsScreen.kt"
+  - "android/app/src/test/java/com/xerktech/turma/core/SessionsTest.kt"
 ---
 
 # Migrating a session, and reporting a refused start
 
-Split out of `CLAUDE.md` to keep that file under its size ceiling. Both blocks span
-`turma/server.js` + `agent/hub-agent.py`. The transcript-identity contract migration preserves is in
-`.claude/rules/session-transcript.md`.
+Split out of `CLAUDE.md` to keep that file under its size ceiling. The blocks span
+`turma/server.js` + `agent/hub-agent.py` + the Sessions page, and the migration's move-target parity
+reaches android (`eligibleMoveTargets`/`SessionsTest`), so the scope lists every side — a
+`paths:`-scoped file does not load on the other side of the contract it carries. The transcript-identity
+contract migration preserves is in `.claude/rules/session-transcript.md`.
 
 ## Migrating a session to another agent (XERK-101)
 
