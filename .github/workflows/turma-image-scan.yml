@@ -36,6 +36,9 @@ jobs:
       # to stop concurrent scans from clobbering each other's image — but it
       # still names the run a scan's output came from.
       SCAN_TAG: local/turma:pr-${{ github.run_id }}
+      # Job-level so the cache key and the install step share one source of
+      # truth; bump this and the cache misses, downloads once, re-primes.
+      TRIVY_VERSION: "0.70.0"
     steps:
       - uses: actions/checkout@v7
 
@@ -53,23 +56,53 @@ jobs:
           cache-from: type=gha,scope=turma
           cache-to: type=gha,mode=max,scope=turma
 
+      # Reuse the trivy binary across runs, keyed on the pinned version. A good
+      # download is saved to the actions cache and restored here, so the release
+      # CDN is touched once per version bump instead of every scan (XERK-283) —
+      # which also removes ~7s from the common path.
+      - name: Cache Trivy binary
+        id: trivy-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/trivy
+          key: trivy-${{ runner.os }}-${{ env.TRIVY_VERSION }}
+
       - name: Install Trivy
         run: |
           set -euo pipefail
-          VERSION=0.70.0
-          mkdir -p "$HOME/.local/bin"
-          # Retry the whole download+extract: the release download has been
-          # seen arriving truncated with a success status, which curl --retry
-          # alone can't catch — only the extract proves the archive is whole.
-          for attempt in 1 2 3; do
-            curl -fsSL --retry 3 -o /tmp/trivy.tgz \
-              "https://github.com/aquasecurity/trivy/releases/download/v${VERSION}/trivy_${VERSION}_Linux-64bit.tar.gz" \
-              && tar -xzf /tmp/trivy.tgz -C "$HOME/.local/bin" trivy && break
-            echo "trivy download/extract failed (attempt ${attempt})"; sleep 5
-          done
-          chmod +x "$HOME/.local/bin/trivy"
+          BIN="$HOME/.local/bin/trivy"
+          URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          if [ -x "$BIN" ]; then
+            echo "trivy restored from cache"
+          else
+            mkdir -p "$HOME/.local/bin"
+            # Download+extract with exponential backoff over minutes, not seconds.
+            # The release CDN has bad patches that last minutes (XERK-283); the old
+            # 3×5s ladder burned through inside one and failed clean PRs. Six
+            # attempts spread over ~4.5 min wait a patch out instead. Retrying the
+            # whole extract (not just curl --retry) also proves the archive is whole
+            # — the download has been seen arriving truncated with a 200 status,
+            # which curl alone can't catch.
+            ok=
+            for delay in 0 5 15 45 90 120; do
+              if [ "$delay" -gt 0 ]; then
+                echo "trivy download/extract failed; retrying in ${delay}s"
+                sleep "$delay"
+              fi
+              if curl -fsSL --retry 3 --retry-delay 2 -o /tmp/trivy.tgz "$URL" \
+                 && tar -xzf /tmp/trivy.tgz -C "$HOME/.local/bin" trivy; then
+                ok=1
+                break
+              fi
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::Trivy download exhausted all retries — likely a transient CDN outage, re-run the job (XERK-283)"
+              exit 1
+            fi
+            chmod +x "$BIN"
+          fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/trivy" --version
+          "$BIN" --version
 
       # TMPDIR/--cache-dir → runner.temp for Trivy's uncompressed-layer scratch
       # export. On the self-hosted box this kept it off the runner container's
