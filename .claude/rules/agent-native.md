@@ -64,6 +64,20 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   `test_turma_agent_update.sh`.
   - **Lock taken per run, released before the sleep** — `--loop` holding it for its whole life made
     every `turma-agentctl start`-fired check exit as "another update run holds the lock".
+  - **The lock + stamps are SCOPED to the install `$PREFIX` (XERK-551)** — keyed off `$HOME` (as they
+    were), EVERY updater under one user shared one lock regardless of prefix, so a leaked/staged
+    `--loop` (or an NFS-shared home) could hold or fight over it and starve the real poller forever,
+    silently disabling auto-update on a non-systemd host (the `--loop` poller is the only updater
+    there). `prefix_tag` (sha256 of `$PREFIX`, cksum fallback) tags `update.<tag>.lock`,
+    its `.holder`, the three throttle stamps, and `update-skip-count`. **`LOG` stays per-USER** (the
+    session identity writes it) but each line is tagged `[$PREFIX]` so concurrent updaters are
+    distinguishable instead of doubling. `claude-unparseable` and `updating.json` stay unscoped — the
+    former is about the one shared `claude`, the latter is a fixed contract the manager reads on boot.
+  - **A `--loop` poll lost to contention RETRIES after `TURMA_POLL_RETRY_SEC` (default 60s), never
+    forfeits the whole `INTERVAL` (XERK-551)** — sleeping the full hour on a skip is what let one
+    contended poll strand the host for an hour and sustained contention strand it forever. The retry
+    is capped at `INTERVAL` and floored at 1s; `note_agent_check`'s `STRAND_WARN_AT` escalation still
+    fires. Tests: cases 37–39 in `test_turma_agent_update.sh`.
   - **A run cannot WEDGE holding the lock (XERK-549)** — a hung child once held it forever (a
     network/subprocess call that outran its own `timeout`), stranding the host on a stale build
     silently. Three guards, all in `with_lock`/`run_locked`:

@@ -61,21 +61,46 @@ export PATH="$PREFIX/bin:$HOME/.local/bin:$PATH"
 REPO="${TURMA_REPO:-xerktech/turma}"
 LEGACY_TAG_PREFIX="agent-native-v"
 INTERVAL="${TURMA_UPDATE_INTERVAL:-3600}"   # 1h default for --loop
+
+# XERK-551: a short, stable token derived from THIS install's $PREFIX, so the
+# per-install state files below (lock, holder, throttle stamps, skip counter) are
+# SCOPED to the install that owns them. Keyed off $HOME instead — as they were —
+# EVERY updater under one user shared one lock regardless of which prefix it ran
+# from, so a leaked/staged loop (or an NFS-shared home across hosts) could hold or
+# fight over that single lock and starve the real poller forever, silently
+# disabling auto-update on a non-systemd host. sha256sum is already a hard
+# dependency of the native install (install.sh/bootstrap.sh verify with it); cksum
+# (POSIX) is a fallback so a host without it still gets a stable-enough tag.
+prefix_tag() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$PREFIX" | sha256sum | cut -c1-12
+  else
+    printf '%s' "$PREFIX" | cksum | tr -cd '0-9' | cut -c1-12
+  fi
+}
+PREFIX_TAG="$(prefix_tag)"
+
+# The LOG is deliberately per-USER, not per-prefix (the identity the SESSIONS run
+# as writes it), so distinct installs share it — but each line is tagged with the
+# prefix (see logmsg) so concurrent updaters are distinguishable instead of every
+# line reading as an unattributable duplicate.
 LOG="$HOME/.turma/update.log"
-LOCK="$HOME/.turma/update.lock"
+LOCK="$HOME/.turma/update.$PREFIX_TAG.lock"
 # When each kind of check last ran (epoch seconds), read only by the start-fired
 # runs. Three files, because the agent check, the Claude Code check and the dsh
 # check are fired separately by the launcher and must not throttle each other.
+# Prefix-scoped (XERK-551) so a second install's checks don't throttle this one's.
 # See throttled().
-STAMP="$HOME/.turma/last-update-check"
-CLAUDE_STAMP="$HOME/.turma/last-claude-check"
-DSH_STAMP="$HOME/.turma/last-dsh-check"
+STAMP="$HOME/.turma/last-update-check.$PREFIX_TAG"
+CLAUDE_STAMP="$HOME/.turma/last-claude-check.$PREFIX_TAG"
+DSH_STAMP="$HOME/.turma/last-dsh-check.$PREFIX_TAG"
 # XERK-549. The update lock's holder (pid + acquire epoch), rewritten each time
 # the lock is taken, so a wedged run can be identified and reclaimed by a later
 # one; and a consecutive-skip counter so a stuck poller shows up in the log
-# rather than only under a `flock` inspection of a live pod.
-LOCK_HOLDER="$HOME/.turma/update.lock.holder"
-SKIP_COUNT="$HOME/.turma/update-skip-count"
+# rather than only under a `flock` inspection of a live pod. Both are paired with
+# LOCK, so they carry the same prefix scope (XERK-551).
+LOCK_HOLDER="$HOME/.turma/update.$PREFIX_TAG.lock.holder"
+SKIP_COUNT="$HOME/.turma/update-skip-count.$PREFIX_TAG"
 # Overall deadline for ONE agent self-update run (--loop/--boot/timer), so a
 # hung child cannot hold the lock forever and strand the host on a stale build.
 # A FIXED generous number (like the launcher's own bound), NOT derived from the
@@ -92,8 +117,16 @@ LOCK_RECLAIM_AFTER="${TURMA_LOCK_RECLAIM_AFTER:-7200}"
 # Warn to the log once this many agent checks skip/error in a row (and every
 # multiple after), so a stuck poller is noticed without inspecting the pod.
 STRAND_WARN_AT="${TURMA_UPDATE_STRAND_WARN_AT:-3}"
+# XERK-551: how long the --loop poller waits before RETRYING a poll that was
+# skipped or errored (most importantly, lost to lock contention), instead of
+# sleeping the full INTERVAL. A single contended poll used to forfeit a whole
+# hour, and sustained contention forfeited every hour — the poller silently never
+# ran. Seconds, capped at INTERVAL and floored at 1s in the loop.
+POLL_RETRY_SEC="${TURMA_POLL_RETRY_SEC:-60}"
 # The raw `claude --version` output of a repair that did NOT make it readable,
-# so the same futile reinstall isn't attempted on every start forever.
+# so the same futile reinstall isn't attempted on every start forever. Left
+# per-USER (not prefix-scoped like the lock/stamps, XERK-551): it is about the one
+# `claude` binary this host runs, which every install shares.
 CLAUDE_UNPARSEABLE="$HOME/.turma/claude-unparseable"
 BOOT_MIN_INTERVAL="${TURMA_BOOT_UPDATE_MIN_INTERVAL:-300}"
 CLAUDE_PKG="@anthropic-ai/claude-code"
@@ -113,7 +146,11 @@ mkdir -p "$HOME/.turma" 2>/dev/null || true
 # simply not opened; the line still reaches stderr, which is the journal.
 logmsg() {
   local line
-  line="[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*"
+  # Tag each line with the install $PREFIX (XERK-551): the LOG is shared across
+  # every updater under one $HOME, so without this two concurrent installs' lines
+  # interleave into one indistinguishable stream (the "every log line is doubled"
+  # symptom in the incident). The prefix says which install wrote the line.
+  line="[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [$PREFIX] $*"
   if [ -e "$LOG" ] && [ ! -f "$LOG" ]; then
     printf '%s\n' "$line" >&2
   else
@@ -1117,9 +1154,27 @@ main() {
 
   if [ "$loop" = yes ]; then
     logmsg "auto-update poller started (every ${INTERVAL}s, repo $REPO)"
+    local retry
+    retry="$(num "$POLL_RETRY_SEC" 60)"
+    # Never hot-loop, and never wait LONGER on a retry than the normal interval
+    # (a small INTERVAL, e.g. in tests, must not be overtaken by the backoff).
+    [ "$retry" -lt 1 ] && retry=1
+    [ "$retry" -gt "$INTERVAL" ] && retry="$INTERVAL"
     while true; do
-      run_agent_check || logmsg "update check skipped/errored (continuing)"
-      sleep "$INTERVAL"
+      if run_agent_check; then
+        sleep "$INTERVAL"
+      else
+        # A poll SKIPPED or ERRORED — most importantly one lost to lock
+        # contention — must NOT forfeit the whole interval. Sleeping the full
+        # hour here is exactly what let a single contended poll strand the host
+        # for an hour, and sustained contention strand it forever with no floor
+        # (XERK-551). Retry after a short bounded backoff instead: it is cheap on
+        # the common cause (a lost `flock -n` makes no network call), and
+        # note_agent_check still escalates to a WARNING after STRAND_WARN_AT in a
+        # row so a genuinely stuck poller is still surfaced.
+        logmsg "update check skipped/errored; retrying in ${retry}s (continuing)"
+        sleep "$retry"
+      fi
     done
   elif [ "$boot" = yes ]; then
     if throttled "$STAMP" "boot check"; then return 0; fi
