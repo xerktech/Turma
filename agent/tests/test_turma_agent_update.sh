@@ -1512,33 +1512,38 @@ else
 fi
 rm -rf "$root" "$d"
 
-# 38. The lock is SCOPED to the install prefix: a second install under the SAME
-#     $HOME updates normally while another install holds ITS lock. Keyed off $HOME
-#     (the bug), install B would lose A's lock and skip forever.
+# 38. The lock is SCOPED to the install prefix, so distinct installs under one
+#     $HOME don't fight. To genuinely reproduce the bug this must hold the lock at
+#     the pre-fix, $HOME-keyed path ($HOME/.turma/update.lock) — the one the
+#     UNSCOPED code computes for EVERY install. Under the fix, this install uses
+#     its own prefix-scoped lock and updates regardless; under the bug it would
+#     contend on that shared path and skip forever. Holding the install's OWN
+#     scoped path instead would let the buggy code through too, so it wouldn't
+#     discriminate.
 root="$(mktemp -d)"; home="$root/home"; mkdir -p "$home/.turma"
-prefixA="$root/a"; prefixB="$root/b"
-for p in "$prefixA" "$prefixB"; do
-  mkdir -p "$p/bin"
-  cp "$SCRIPT" "$p/bin/turma-agent-update"; chmod +x "$p/bin/turma-agent-update"
-  echo "# old" >"$p/hub-agent.py"; echo "// old" >"$p/tunnel-agent.js"
-  mkdir -p "$p/hooks"; echo "# old" >"$p/hooks/guard.py"
-  echo "0.3.0" >"$p/VERSION"
-  install_fake_restart "$p/bin"; install_fake_gh "$p/bin"
-done
+prefixB="$root/b"; mkdir -p "$prefixB/bin"
+cp "$SCRIPT" "$prefixB/bin/turma-agent-update"; chmod +x "$prefixB/bin/turma-agent-update"
+echo "# old" >"$prefixB/hub-agent.py"; echo "// old" >"$prefixB/tunnel-agent.js"
+mkdir -p "$prefixB/hooks"; echo "# old" >"$prefixB/hooks/guard.py"
+echo "0.3.0" >"$prefixB/VERSION"
+install_fake_restart "$prefixB/bin"; install_fake_gh "$prefixB/bin"
 d="$(new_gh_dir)"; add_unified_release "$d" "v0.4.0" "0.4.0" "v0.4.0"
-lockA="$home/.turma/update.$(prefix_tag "$prefixA").lock"
-( exec 9>"$lockA"; flock 9; sleep 20 ) &
+legacy_lock="$home/.turma/update.lock"   # the path the UNSCOPED (buggy) code used
+( exec 9>"$legacy_lock"; flock 9; sleep 20 ) &
 hold_pid=$!
 FAKE_GH_DIR="$d" HOME="$home" PATH="$prefixB/bin:$PATH" TURMA_REPO="xerktech/turma" \
   TURMA_CLAUDE_AUTO_UPDATE=0 "$prefixB/bin/turma-agent-update" >"$root/b.log" 2>&1 || true
 kill "$hold_pid" 2>/dev/null || true; wait "$hold_pid" 2>/dev/null || true
 got="$(tr -d '[:space:]' < "$prefixB/VERSION")"
-assert_eq "0.4.0" "$got" "a second install updates while another holds ITS own lock (-> $got)" \
-  "install B was starved by install A's lock — it is not prefix-scoped (VERSION $got)"
-if [ "$(prefix_tag "$prefixA")" != "$(prefix_tag "$prefixB")" ]; then
-  pass "distinct prefixes hash to distinct lock/stamp files"
+assert_eq "0.4.0" "$got" "an install updates while the legacy shared lock is held (-> $got)" \
+  "the install was starved by the $HOME-shared lock — it is not prefix-scoped (VERSION $got)"
+# And a plain unscoped path is NOT what this install opens: its scoped lock must
+# differ from the legacy one, or the isolation above is coincidental.
+if [ "$(prefix_tag "$prefixB")" != "" ] \
+   && [ "$home/.turma/update.$(prefix_tag "$prefixB").lock" != "$legacy_lock" ]; then
+  pass "the install's lock path is prefix-scoped, distinct from the legacy shared path"
 else
-  fail "two different prefixes produced the same tag — scoping is ineffective"
+  fail "the install's lock path is not distinct from the legacy shared path — scoping is ineffective"
 fi
 rm -rf "$root" "$d"
 
