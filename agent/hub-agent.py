@@ -6947,11 +6947,21 @@ def _async_launch(entry):
     ident = tur.get("agentId") or tur.get("taskId")
     if not ident:
         return None
+    # `resolveId` is the handle that names the launch's transcript ON DISK, kept
+    # beside the row so a click resolves it DIRECTLY instead of re-deriving it
+    # from a windowed transcript scan (XERK-333) — the scan that goes blind once
+    # the launch falls >8 MiB behind the head. It differs from `id` (the
+    # stop-matching key) for a workflow: the RUN dir is named after `runId`, NOT
+    # the `taskId` the `<task-notification>` stop edge carries (XERK-304).
     if tur.get("taskType") == "local_workflow":
         return {"id": str(ident), "type": "workflow",
-                "label": str(tur.get("workflowName") or tur.get("summary") or "").strip()}
+                "label": str(tur.get("workflowName") or tur.get("summary") or "").strip(),
+                "resolveId": str(tur.get("runId") or "").strip()}
+    # A background agent's transcript is subagents/agent-<agentId>.jsonl, and
+    # `agentId` IS this id — so the row's own id names its file directly.
     return {"id": str(ident), "type": str(tur.get("agentType") or "agent"),
-            "label": str(tur.get("description") or "").strip()}
+            "label": str(tur.get("description") or "").strip(),
+            "resolveId": str(ident)}
 
 
 def _scan_agent_entry(entry, state):
@@ -6994,8 +7004,15 @@ def _scan_agent_entry(entry, state):
             # The call's subagent_type is the only place a real agent TYPE
             # appears — the launch record never carries one — so it wins when we
             # saw the call.
+            # resolveId (XERK-333) rides the entry so _live_agent_resolve_id can
+            # map a clicked row back to its on-disk transcript from THIS in-memory
+            # index — which spans the whole conversation — rather than the 8 MiB
+            # window the resolvers read. The JS mirror (scanAgentEntry) does not
+            # carry it: resolution lives only here, and its liveAgentsReport emits
+            # the same {type,label} rows onto the wire, so parity is unaffected.
             live[launch["id"]] = {"type": tasks.get(tool_id) or launch["type"],
-                                  "label": launch["label"]}
+                                  "label": launch["label"],
+                                  "resolveId": launch.get("resolveId") or ""}
     # The notification rides a queued operation, the user turn it becomes once
     # dequeued, or an attachment — never an ASSISTANT turn, which is skipped so
     # that a session merely QUOTING a notification (this feature's own fixtures,
@@ -7034,6 +7051,49 @@ def live_agents_report(state):
     internal, and the chat resolves a row back to its transcript by type+label)."""
     return [{"type": a["type"], "label": a["label"]}
             for a in (state.get("liveAgents") or {}).values()]
+
+
+def _live_agent_resolve_id(state, agent_type, label):
+    """The on-disk RESOLVE HANDLE of the newest live background-agent row matching
+    a clicked row's type+label, or None (XERK-333).
+
+    The row is clickable because it is LIVE in `state["liveAgents"]`, which
+    _scan_agent_entry folds incrementally from the WHOLE transcript — so it still
+    holds the launch's own handle (a subagent's agentId, a workflow run's runId)
+    long after the launch itself has scrolled past the 8 MiB window
+    _resolve_subagent/_resolve_workflow_run read, which is EXACTLY the row those
+    resolvers can no longer reach ("listed but unresolvable"). Using this index
+    resolves it without either widening the window or re-scanning the whole file.
+
+    Matching mirrors the resolvers: the row's type equals the entry's, with the
+    generic "agent" a wildcard over non-workflow rows (a background Agent launch
+    carries no subagent_type, so its row type is "agent"), and a pane-truncated
+    cell allowed as a prefix; the newest matching launch wins (dict insertion
+    order), as the resolvers pick the newest in-window launch.
+
+    A row this index does not know — a pane-scraped `status.agents` row from an
+    older agent, or one whose launch predates a manager restart's EOF-primed scan
+    offsets — yields None, and the caller falls back to the windowed scan."""
+    want_type, _ = _strip_pane_ellipsis((agent_type or "").strip())
+    want_label, _ = _strip_pane_ellipsis((label or "").strip())
+    if not want_type:
+        return None
+    found = None
+    for entry in (state.get("liveAgents") or {}).values():
+        have_type = str(entry.get("type") or "")
+        if want_type == "agent":
+            # The subagent-branch wildcard is over Task/Agent rows only — a
+            # workflow row is clicked as "workflow", never through it.
+            if have_type == "workflow":
+                continue
+        elif have_type != want_type:
+            continue
+        if not _row_label_matches(want_label, str(entry.get("label") or "")):
+            continue
+        rid = str(entry.get("resolveId") or "").strip()
+        if rid:
+            found = rid   # keep scanning: newest matching launch wins
+    return found
 
 
 def _entry_blocks(entry, caps):
@@ -7740,6 +7800,24 @@ def _subagents_dir(main_path):
     return os.path.join(stem, "subagents")
 
 
+# A background agent's id names its transcript file, so it is pattern-checked
+# before being joined (XERK-333) — the in-memory index's resolveId comes from the
+# structured toolUseResult, which is otherwise unconstrained; _resolve_subagent's
+# own id is already charset-bounded by _AGENT_ID_RE.
+VALID_SUBAGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _subagent_transcript_path(main_path, agent_id):
+    """The transcript of one background agent named by its `agentId`
+    (subagents/agent-<agentId>.jsonl), or None when the id is malformed or the
+    file is absent. The direct counterpart to _resolve_subagent's window scan."""
+    aid = (agent_id or "").strip()
+    if not VALID_SUBAGENT_ID_RE.match(aid):
+        return None
+    path = os.path.join(_subagents_dir(main_path), f"agent-{aid}.jsonl")
+    return path if os.path.isfile(path) else None
+
+
 def _strip_pane_ellipsis(cell):
     """(text, truncated) for a cell scraped off a pane row: the TUI ellipsizes
     a long cell with its own "…" on a narrow window, and that ellipsis is not
@@ -7906,6 +7984,20 @@ def _workflow_runs_dir(main_path):
     return os.path.join(_subagents_dir(main_path), WORKFLOW_RUNS_SUBDIR)
 
 
+def _workflow_run_dir(main_path, run_id):
+    """The transcript dir of one workflow run named by its `runId`, or None.
+
+    The id arrives from a clicked row / the in-memory index and is about to name
+    a directory, so it is pattern-checked (`wf_…`) before being joined — a forged
+    id can never escape the runs dir. Shared by _resolve_workflow_run (window
+    scan) and the in-memory resolve path (XERK-333)."""
+    rid = (run_id or "").strip()
+    if not VALID_WORKFLOW_RUN_ID_RE.match(rid):
+        return None
+    path = os.path.join(_workflow_runs_dir(main_path), rid)
+    return path if os.path.isdir(path) else None
+
+
 def _resolve_workflow_run(main_path, label):
     """Directory holding the agent transcripts of the workflow run a clicked
     `workflow` row names, or None when nothing matches / the dir is absent.
@@ -7943,8 +8035,8 @@ def _resolve_workflow_run(main_path, label):
         if VALID_WORKFLOW_RUN_ID_RE.match(run_id):
             runs.append(run_id)
     for run_id in reversed(runs):  # newest matching launch wins
-        path = os.path.join(_workflow_runs_dir(main_path), run_id)
-        if os.path.isdir(path):
+        path = _workflow_run_dir(main_path, run_id)
+        if path:
             return path
     return None
 
@@ -7984,6 +8076,16 @@ JOURNAL_HEAD_BYTES = 1024
 # Reading forward means hitting it drops the NEWEST results, so the agents it
 # loses read as still running — the safe direction, and the same one a miss
 # takes everywhere else here.
+#
+# XERK-333 asked whether this cap can go entirely (it is the third member of the
+# fixed-window family the resolvers' 8 MiB window belonged to). Decision: KEEP it.
+# Unlike those resolvers, this read is already the RIGHT shape — forward over the
+# whole file, bounded per line — so it has no window cliff to remove; the number
+# is a guard against a pathological/endless journal, and _journal_finished runs
+# SYNCHRONOUSLY in handle_commands' beat loop, where an unbounded read would be a
+# beat-loop-time hazard (XERK-395). 512 MiB is far past any real journal (200
+# agents x 500 KiB return values measured at ~95 MiB), so it never bites in
+# practice while still bounding the runaway.
 JOURNAL_READ_MAX = 1 << 29
 # ANCHORED at the start of the record on purpose. A `result` marker found
 # anywhere in the line would also match one sitting inside a corrupt or
@@ -20066,7 +20168,15 @@ class SessionManager:
         answers `agents`, and a second request naming one of those ids returns
         that agent's transcript. **`agents` present — even empty — is what tells
         the client this is a list**, so a run with nothing written yet says "no
-        agents yet" rather than the "unavailable" an unresolved row gets."""
+        agents yet" rather than the "unavailable" an unresolved row gets.
+
+        The row is resolved from the in-memory scan index FIRST (XERK-333) — it
+        holds the launch's on-disk handle across the whole conversation, so a
+        launch that has scrolled >8 MiB behind the head (a long-running workflow's
+        exactly the case) still resolves, where the windowed _resolve_* scans have
+        gone blind. The windowed scan stays the fallback for a row the index does
+        not know: a pane-scraped `status.agents` row from an older agent, or one
+        whose launch predates a manager restart's EOF-primed scan offsets."""
         result = {"sessionId": sid, "type": agent_type or "",
                   "label": label or "", "agentId": agent_id or "",
                   "entries": [], "truncated": False}
@@ -20075,8 +20185,11 @@ class SessionManager:
         if not main:
             self.subagent_history_results.append(result)
             return
+        row_id = _live_agent_resolve_id(self.sess_state.get(sid) or {}, agent_type, label)
         if (agent_type or "").strip() == "workflow":
-            run_dir = _resolve_workflow_run(main, label)
+            # row_id is the run's runId; fall back to the windowed launch scan.
+            run_dir = (_workflow_run_dir(main, row_id) if row_id else None) \
+                or _resolve_workflow_run(main, label)
             if not run_dir:
                 self.subagent_history_results.append(result)
                 return
@@ -20089,7 +20202,9 @@ class SessionManager:
                 return
             path = _workflow_agent_path(run_dir, agent_id)
         else:
-            path = _resolve_subagent(main, agent_type, label)
+            # row_id is the agentId that names the transcript file directly.
+            path = (_subagent_transcript_path(main, row_id) if row_id else None) \
+                or _resolve_subagent(main, agent_type, label)
         if not path:
             self.subagent_history_results.append(result)
             return

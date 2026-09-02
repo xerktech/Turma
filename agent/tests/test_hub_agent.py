@@ -17956,6 +17956,220 @@ class TestStageSubagentHistory(ManagerMixin, unittest.TestCase):
         self.assertEqual(r["entries"], [])
         self.assertNotIn("agents", r)
 
+    # ---- resolving past the resolvers' 8 MiB window (XERK-333) --------------
+    #
+    # Both _resolve_subagent and _resolve_workflow_run read only the last 8 MiB of
+    # the main transcript, so a launch that has scrolled further back than that is
+    # listed (liveAgents spans the whole file) but no longer resolvable by them.
+    # _stage_subagent_history now resolves from the in-memory scan index first,
+    # which holds the launch's on-disk handle regardless of transcript size.
+
+    def _fold(self, sm, sid, *entries):
+        """Populate sess_state[sid] exactly as a beat's session_report would, by
+        folding these transcript entries through the real scan."""
+        st = sm.sess_state.setdefault(sid, {})
+        for e in entries:
+            ha._scan_entry_line(json.dumps(e), st,
+                                {"prUrls": [], "modelActual": None})
+
+    def _pad(self, f, min_bytes):
+        """Append filler user turns until the file is at least min_bytes — the
+        launch above them then sits outside the resolvers' 8 MiB tail window."""
+        line = json.dumps({"type": "user", "message": {"content": "x" * 900}}) + "\n"
+        written = f.tell()
+        while written < min_bytes:
+            f.write(line)
+            written += len(line)
+
+    def _setup_far_back_subagent(self, sm):
+        wt = "/w/.turma/worktrees/repo/ccc"
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj)
+        main = os.path.join(proj, "trans3.jsonl")
+        launch = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_far", "name": "Agent",
+                 "input": {"description": "long QA run", "prompt": "go",
+                           "run_in_background": True}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_far",
+                 "content": "agentId: far999"}]},
+             "toolUseResult": {"isAsync": True, "status": "async_launched",
+                               "agentId": "far999", "description": "long QA run"}},
+        ]
+        with open(main, "w") as f:
+            for e in launch:
+                f.write(json.dumps(e) + "\n")
+            self._pad(f, (1 << 23) + (1 << 20))   # >8 MiB after the launch
+        subdir = os.path.join(proj, "trans3", "subagents")
+        os.makedirs(subdir)
+        with open(os.path.join(subdir, "agent-far999.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "assistant", "uuid": "u1", "message": {
+                "content": [{"type": "text", "text": "still exploring"}]}}) + "\n")
+        sm.registry = [{"id": "s1", "status": "running", "worktreePath": wt}]
+        return main
+
+    def test_a_subagent_past_the_window_resolves_via_the_index(self):
+        sm = self.make_manager()
+        main = self._setup_far_back_subagent(sm)
+        # The windowed scan alone has gone blind — this is the reported bug.
+        self.assertIsNone(ha._resolve_subagent(main, "agent", "long QA run"))
+        # The in-memory index still carries the launch, so the row resolves.
+        self._fold(sm, "s1", *[
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_far", "name": "Agent",
+                 "input": {"description": "long QA run"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_far",
+                 "content": "agentId: far999"}]},
+             "toolUseResult": {"status": "async_launched", "agentId": "far999",
+                               "description": "long QA run"}}])
+        sm._stage_subagent_history("s1", "agent", "long QA run")
+        r = sm.subagent_history_results[0]
+        self.assertTrue(any("still exploring" in (e.get("text") or "")
+                            for e in r["entries"]))
+
+    def test_without_the_index_a_far_back_subagent_stays_unresolvable(self):
+        # Proves the index is what fixes it: with no folded scan state the code
+        # falls back to the windowed scan, which misses — the pre-fix symptom.
+        sm = self.make_manager()
+        self._setup_far_back_subagent(sm)
+        sm._stage_subagent_history("s1", "agent", "long QA run")
+        self.assertEqual(sm.subagent_history_results[0]["entries"], [])
+
+    def _setup_far_back_workflow(self, sm):
+        wt = "/w/.turma/worktrees/repo/ddd"
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj)
+        main = os.path.join(proj, "trans4.jsonl")
+        launch = {"type": "user", "toolUseResult": {
+            "status": "async_launched", "taskId": "we1gtmfyd",
+            "taskType": "local_workflow", "workflowName": "code-review",
+            "runId": "wf_86e01141-7bc"}, "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_wf",
+                 "content": "launched"}]}}
+        with open(main, "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_wf", "name": "Workflow",
+                 "input": {"script": "x"}}]}}) + "\n")
+            f.write(json.dumps(launch) + "\n")
+            self._pad(f, (1 << 23) + (1 << 20))   # >8 MiB after the launch
+        run = os.path.join(proj, "trans4", "subagents", "workflows", "wf_86e01141-7bc")
+        os.makedirs(run)
+        with open(os.path.join(run, "agent-ag1.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "user", "uuid": "u1",
+                                "timestamp": "2026-08-18T03:31:07.583Z",
+                                "message": {"content": "review the diff"}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "uuid": "u2", "message": {
+                "content": [{"type": "text", "text": "found a bug"}]}}) + "\n")
+        with open(os.path.join(run, "journal.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "result", "agentId": "ag1"}) + "\n")
+        sm.registry = [{"id": "s1", "status": "running", "worktreePath": wt}]
+        self._fold(sm, "s1", launch)
+        return main
+
+    def test_a_workflow_run_past_the_window_lists_via_the_index(self):
+        sm = self.make_manager()
+        main = self._setup_far_back_workflow(sm)
+        self.assertIsNone(ha._resolve_workflow_run(main, "code-review"))
+        sm._stage_subagent_history("s1", "workflow", "code-review")
+        r = sm.subagent_history_results[0]
+        self.assertEqual([a["id"] for a in r["agents"]], ["ag1"])
+
+    def test_a_workflow_drilldown_past_the_window_resolves_via_the_index(self):
+        sm = self.make_manager()
+        self._setup_far_back_workflow(sm)
+        sm._stage_subagent_history("s1", "workflow", "code-review", "ag1")
+        r = sm.subagent_history_results[0]
+        self.assertNotIn("agents", r)
+        self.assertTrue(any("found a bug" in (e.get("text") or "")
+                            for e in r["entries"]))
+
+
+class TestLiveAgentResolveId(unittest.TestCase):
+    """_live_agent_resolve_id maps a clicked row (type+label) back to its launch
+    handle from the in-memory scan index (XERK-333)."""
+
+    def _state(self, *entries):
+        # entries: (key, type, label, resolveId) in insertion (launch) order.
+        live = {}
+        for key, typ, label, rid in entries:
+            live[key] = {"type": typ, "label": label, "resolveId": rid}
+        return {"liveAgents": live}
+
+    def test_resolves_a_subagent_row_to_its_agent_id(self):
+        st = self._state(("far999", "qa", "long QA run", "far999"))
+        self.assertEqual(ha._live_agent_resolve_id(st, "qa", "long QA run"), "far999")
+
+    def test_generic_agent_type_is_a_wildcard_over_non_workflow_rows(self):
+        st = self._state(("a1", "explore", "map it", "a1"))
+        self.assertEqual(ha._live_agent_resolve_id(st, "agent", "map it"), "a1")
+
+    def test_the_agent_wildcard_never_matches_a_workflow_row(self):
+        st = self._state(("we1", "workflow", "code-review", "wf_abc"))
+        self.assertIsNone(ha._live_agent_resolve_id(st, "agent", "code-review"))
+
+    def test_a_workflow_row_resolves_to_its_run_id(self):
+        st = self._state(("we1", "workflow", "code-review", "wf_abc"))
+        self.assertEqual(ha._live_agent_resolve_id(st, "workflow", "code-review"), "wf_abc")
+
+    def test_newest_matching_launch_wins(self):
+        st = self._state(("we1", "workflow", "nightly", "wf_old"),
+                         ("we2", "workflow", "nightly", "wf_new"))
+        self.assertEqual(ha._live_agent_resolve_id(st, "workflow", "nightly"), "wf_new")
+
+    def test_a_pane_truncated_label_matches_by_prefix(self):
+        st = self._state(("a1", "explore", "map the whole repository", "a1"))
+        self.assertEqual(ha._live_agent_resolve_id(st, "explore", "map the whole…"), "a1")
+
+    def test_unknown_row_or_empty_index_yields_none(self):
+        self.assertIsNone(ha._live_agent_resolve_id({}, "qa", "x"))
+        st = self._state(("a1", "qa", "here", "a1"))
+        self.assertIsNone(ha._live_agent_resolve_id(st, "qa", "elsewhere"))
+
+    def test_an_entry_without_a_resolve_id_is_skipped(self):
+        # A pre-XERK-333 in-memory entry (no resolveId) yields None so the caller
+        # falls back to the windowed scan rather than resolving to "".
+        st = {"liveAgents": {"a1": {"type": "qa", "label": "here"}}}
+        self.assertIsNone(ha._live_agent_resolve_id(st, "qa", "here"))
+
+
+class TestWorkflowRunDir(unittest.TestCase):
+    """_workflow_run_dir / _subagent_transcript_path — the direct (window-free)
+    counterparts to the two resolvers (XERK-333)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-wfdir-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _main(self):
+        main = os.path.join(self.tmp, "m.jsonl")
+        open(main, "w").close()
+        return main
+
+    def test_resolves_an_existing_run_dir_by_id(self):
+        main = self._main()
+        run = os.path.join(main[:-len(".jsonl")], "subagents", "workflows", "wf_ok1")
+        os.makedirs(run)
+        self.assertEqual(ha._workflow_run_dir(main, "wf_ok1"), run)
+
+    def test_a_forged_run_id_can_never_name_a_directory(self):
+        main = self._main()
+        for bad in ("../../etc", "wf_../x", "not-a-run", "", "wf_missing"):
+            self.assertIsNone(ha._workflow_run_dir(main, bad))
+
+    def test_resolves_a_subagent_transcript_by_id(self):
+        main = self._main()
+        sub = os.path.join(main[:-len(".jsonl")], "subagents", "agent-ok9.jsonl")
+        os.makedirs(os.path.dirname(sub))
+        open(sub, "w").close()
+        self.assertEqual(ha._subagent_transcript_path(main, "ok9"), sub)
+
+    def test_a_forged_subagent_id_is_refused(self):
+        main = self._main()
+        for bad in ("../../../etc/passwd", "a/b", "", "x" * 65):
+            self.assertIsNone(ha._subagent_transcript_path(main, bad))
+
 
 class TestSetSummary(ManagerMixin, unittest.TestCase):
     def test_renames_and_pins_the_name(self):
