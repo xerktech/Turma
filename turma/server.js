@@ -2488,7 +2488,7 @@ function publicCommands(cmds) {
   });
 }
 
-function serializeAgent(key, agent, now, pausedSubs) {
+function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
   // `resultWaits` is per-command bookkeeping with timestamps (XERK-151) — pure
   // internal state, stripped like the caches. `tokenBound` likewise: it is the
   // hub's note of which credential this host beat with (XERK-268), read only by
@@ -2504,13 +2504,19 @@ function serializeAgent(key, agent, now, pausedSubs) {
   // The paused-subscription set (XERK-544/548). buildAgentsCache computes it once
   // and passes it; the per-agent SSE broadcast has none and derives its own.
   if (!pausedSubs) pausedSubs = pausedSubscriptions(now);
+  // The live registry key set (XERK-448): a host's case-twin ledger entries fold
+  // into its card only when they are NOT themselves live registry keys, or a host
+  // mid-casing-change (both keys still in the registry) would double-serve its own
+  // durable history. Derived here for the single-agent SSE path; buildAgentsCache
+  // passes its own precomputed set so the fleet build doesn't rebuild it per host.
+  if (!liveKeys) liveKeys = new Set(Object.keys(agents));
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
   // Earlier epochs of this host's spend added back (XERK-338). Null — and so
   // free — for every host that has never lost transcripts, which is all of them
   // until one is wiped; only then does the served block stop being the agent's
   // own. Applied HERE rather than at ingest so what is stored and size-budgeted
   // stays the agent's raw report, and so a purge takes effect on the next read.
-  const durable = usageLedger.fold(key, a, now);
+  const durable = usageLedger.fold(key, a, now, liveKeys);
   return {
     ...a,
     ...(durable || {}),
@@ -2555,7 +2561,9 @@ function buildAgentsCache() {
   // paused-subscription set to stamp each host's `autoPaused`, and deriving it
   // per host would rescan the fleet O(n) times.
   const pausedSubs = pausedSubscriptions(now);
-  const list = Object.entries(agents).map(([key, a]) => serializeAgent(key, a, now, pausedSubs));
+  // One live-key set for the whole build (XERK-448 case-twin fold); see serializeAgent.
+  const liveKeys = new Set(Object.keys(agents));
+  const list = Object.entries(agents).map(([key, a]) => serializeAgent(key, a, now, pausedSubs, liveKeys));
   list.sort((x, y) => (x.device + x.key).localeCompare(y.device + y.key));
   // ticketAgents (the ticket->host pins) and autoStartOrgs (the per-org
   // auto-start opt-in, XERK-41) ride the same payload: both are tiny,
