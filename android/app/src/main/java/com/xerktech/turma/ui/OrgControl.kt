@@ -40,6 +40,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.BoardSite
 import com.xerktech.turma.core.ageStr
+import com.xerktech.turma.core.autoMergeOn
 import com.xerktech.turma.core.autoStartOn
 import com.xerktech.turma.core.effectiveOrgs
 import com.xerktech.turma.core.mergeSites
@@ -131,6 +132,10 @@ fun OrgFilterAction(vm: OrgViewModel = viewModel()) {
                     now = now,
                     autoOn = autoStartOn(fleet.autoStartOrgs, s.siteKey),
                     onToggleAuto = { vm.setAutoStart(s.siteKey, it) },
+                    // The second switch (XERK-550), reading its OWN map — the two
+                    // opt-ins are independent, so merge must never read autoMap.
+                    mergeOn = autoMergeOn(fleet.autoMergeOrgs, s.siteKey),
+                    onToggleMerge = { vm.setAutoMerge(s.siteKey, it) },
                     // A toggle keeps the menu OPEN (XERK-222): multi-select
                     // means picking several in one visit, and the row shows its
                     // check flip in place.
@@ -187,10 +192,11 @@ private fun OrgSwatchRow(pinned: Int?, onPick: (Int?) -> Unit) {
 }
 
 /**
- * One org's row: the scope pick, plus its color dot (XERK-145) and auto-start
- * switch as the trailing controls (the segments of the old divided chip). Each
- * trailing control handles its own tap, so touching it doesn't also re-scope
- * the fleet.
+ * One org's row: the scope pick, plus its color dot (XERK-145), auto-start
+ * switch (XERK-41) and auto-merge switch (XERK-550) as the trailing controls
+ * (the segments of the web's divided chip — an `auto` pill then a `merge` pill).
+ * Each trailing control handles its own tap, so touching it doesn't also
+ * re-scope the fleet.
  */
 @Composable
 private fun OrgMenuRow(
@@ -200,6 +206,8 @@ private fun OrgMenuRow(
     now: Long,
     autoOn: Boolean,
     onToggleAuto: (Boolean) -> Unit,
+    mergeOn: Boolean,
+    onToggleMerge: (Boolean) -> Unit,
     onPick: () -> Unit,
     onToggleColor: () -> Unit,
 ) {
@@ -230,19 +238,33 @@ private fun OrgMenuRow(
                         .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
                         .clickable(onClick = onToggleColor),
                 )
-                Text(
-                    "auto",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Switch(
-                    checked = autoOn,
-                    onCheckedChange = onToggleAuto,
-                    colors = SwitchDefaults.colors(checkedTrackColor = color),
-                )
+                OrgToggle("auto", autoOn, onToggleAuto, color)
+                OrgToggle("merge", mergeOn, onToggleMerge, color)
             }
         },
     )
+}
+
+/**
+ * One labelled trailing switch on an org row — the platform-idiomatic form of
+ * the web's `org-chip-auto` / `org-chip-merge` pills. The track fills with the
+ * org's own color when on, so the two switches match the pill highlight the web
+ * shows.
+ */
+@Composable
+private fun OrgToggle(label: String, on: Boolean, onToggle: (Boolean) -> Unit, color: Color) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Switch(
+            checked = on,
+            onCheckedChange = onToggle,
+            colors = SwitchDefaults.colors(checkedTrackColor = color),
+        )
+    }
 }
 
 /** Dot + name + ticket count + offline note, shared by the "All orgs" row. */

@@ -23,6 +23,12 @@ data class AgentsResponse(
     // (presence = enabled). The hub-owned switch on each board org chip; hub-only
     // (no agent flag). Absent on older hubs.
     val autoStartOrgs: Map<String, Boolean> = emptyMap(),
+    // Per-org auto-MERGE opt-in (XERK-550), keyed by siteKey, value always true
+    // (presence = enabled). The hub-owned second switch beside auto-start on each
+    // org row: when on, the hub merges a merge-ready PR of an auto-start-eligible
+    // ticket, closes the ticket and frees the slot. Hub-only (no agent flag).
+    // Absent on older hubs, which reads the same as "no org opted in".
+    val autoMergeOrgs: Map<String, Boolean> = emptyMap(),
     // Ticket -> pinned MODEL (XERK-123), keyed "<siteKey>/<issueKey>": which model
     // a ticket's session runs, when the operator overrode the login's default.
     // Hub-owned and durable like ticketAgents; absent on older hubs.

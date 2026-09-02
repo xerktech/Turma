@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.net.AutoMergeRequest
 import com.xerktech.turma.net.AutoStartRequest
 import com.xerktech.turma.net.OrgColorRequest
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -44,6 +45,22 @@ class OrgViewModel(app: Application) : AndroidViewModel(app) {
                 container.client.api.setAutoStart(siteKey, AutoStartRequest(enabled))
             }.isSuccess
             _messages.tryEmit(if (ok) "✓ auto-start updated" else "✗ hub unreachable")
+            container.fleet.nudge()
+        }
+    }
+
+    /**
+     * Flip an org's hands-off auto-merge opt-in (XERK-550) — the second org-row
+     * switch beside auto-start. Hub-owned and durable like auto-start: the POST
+     * is authoritative, and the fleet payload's autoMergeOrgs (plus its SSE
+     * event) reflects it on the next poll.
+     */
+    fun setAutoMerge(siteKey: String, enabled: Boolean) {
+        viewModelScope.launch {
+            val ok = runCatching {
+                container.client.api.setAutoMerge(siteKey, AutoMergeRequest(enabled))
+            }.isSuccess
+            _messages.tryEmit(if (ok) "✓ auto-merge updated" else "✗ hub unreachable")
             container.fleet.nudge()
         }
     }

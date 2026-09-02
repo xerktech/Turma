@@ -301,6 +301,24 @@ class AgentDecodeTest {
         assertTrue(bare.ticketRuntimes.isEmpty())
     }
 
+    @Test fun `the autoStartOrgs and autoMergeOrgs maps decode independently (XERK-550)`() {
+        // The two per-org opt-ins are separate top-level maps; auto-merge must
+        // not be inferred from auto-start.
+        val body = """
+            { "now": 1, "agents": [],
+              "autoStartOrgs": { "a.atlassian.net": true },
+              "autoMergeOrgs": { "b.atlassian.net": true } }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertEquals(true, resp.autoStartOrgs["a.atlassian.net"])
+        assertEquals(null, resp.autoStartOrgs["b.atlassian.net"])
+        assertEquals(true, resp.autoMergeOrgs["b.atlassian.net"])
+        assertEquals(null, resp.autoMergeOrgs["a.atlassian.net"])
+        // A hub predating auto-merge sends none; it defaults to an empty map.
+        val bare = TurmaJson.decodeFromString<AgentsResponse>("""{ "now": 1, "agents": [] }""")
+        assertTrue(bare.autoMergeOrgs.isEmpty())
+    }
+
     // XERK-489: the discovered model list + defaultModel on the block, and the
     // per-session localModelName/localModelContext. Both are typed now, so the
     // hub coerces them (normalizeLocalModel / normalizeSessions) and this decode

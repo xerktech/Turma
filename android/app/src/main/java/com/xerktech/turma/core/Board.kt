@@ -362,6 +362,16 @@ fun orgName(siteKey: String, override: String = ""): String {
 fun autoStartOn(autoStartOrgs: Map<String, Boolean>, siteKey: String): Boolean =
     autoStartOrgs[siteKey] == true
 
+/**
+ * Whether an org is opted in to hands-off auto-merge (XERK-550), for the second
+ * org-row switch beside auto-start. The web reads both maps through one generic
+ * `autoOn(map, siteKey)`; this mirrors that predicate over the INDEPENDENT
+ * `AgentsResponse.autoMergeOrgs` map — the two toggles must never share a map,
+ * or one bleeds into the other.
+ */
+fun autoMergeOn(autoMergeOrgs: Map<String, Boolean>, siteKey: String): Boolean =
+    autoMergeOrgs[siteKey] == true
+
 fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
     // Step 1: within each (siteKey, user) group keep only the freshest block.
     data class Block(val j: com.xerktech.turma.model.JiraBlock, val online: Boolean)
