@@ -10057,8 +10057,9 @@ const server = http.createServer(async (req, res) => {
     // injects into ttyd's page). Served under a fixed, editable name, so it
     // revalidates with an ETag (XERK-330) — a 304 keeps the ~1 MB file fetched
     // once in the steady state, while an in-place swap becomes visible on the
-    // next open instead of caching hard for a year.
-    if (req.method === "GET" && url.pathname === "/term-font.woff2") {
+    // next open instead of caching hard for a year. HEAD is answered like the
+    // STATIC_ASSETS routes (headers, no body) so a conditional HEAD revalidates.
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/term-font.woff2") {
       const headers = {
         "Content-Type": "font/woff2",
         "Cache-Control": REVALIDATE_CACHE,
@@ -10069,7 +10070,7 @@ const server = http.createServer(async (req, res) => {
         return res.end();
       }
       res.writeHead(200, headers);
-      return res.end(TERM_FONT);
+      return res.end(req.method === "HEAD" ? undefined : TERM_FONT);
     }
 
     // Short-lived token for the /audio WebSocket (browser WebSocket can't set

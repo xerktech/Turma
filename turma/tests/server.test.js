@@ -13545,6 +13545,13 @@ test("term: terminal HTML serves JBMNerd with font-display:swap (not block)", as
   assert.ok(font.headers.etag, "font must carry an ETag so a revalidation is a 304, not a re-download");
   const revalidated = await request("GET", "/term-font.woff2", { headers: { ...userHeaders, "If-None-Match": font.headers.etag } });
   assert.equal(revalidated.status, 304, "a matching conditional GET must 304, not re-send the font");
+  // HEAD is answered like the STATIC_ASSETS routes (headers, no body) — the
+  // sibling asset routes all answer HEAD, and it lets a conditional HEAD
+  // revalidate the ETag without pulling the ~1 MB body.
+  const head = await request("HEAD", "/term-font.woff2", { headers: userHeaders });
+  assert.equal(head.status, 200, "HEAD must be answered, not 404'd");
+  assert.equal(head.headers.etag, font.headers.etag);
+  assert.equal(head.raw, "", "HEAD must carry no body");
 });
 
 
