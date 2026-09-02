@@ -174,17 +174,29 @@ read-only UI too. Decision + legality vs XERK-498: `dsh.md`.
 - **Always-on when `_dsh_web_enabled()`, supervised OFF THE BEAT** (`_dsh_web_loop` on a daemon
   thread, beat only reads cached status — XERK-395). Relaunches a crashed instance with capped
   backoff.
-- **`running` means SERVING, not just launched** (XERK-492 lesson, on the port) — `has-session` alone
-  isn't proof; `_confirm_dsh_web` requires the port to ACCEPT (`_dsh_web_port_open`), and steady-state
-  pairs both checks.
-  - Residual gap (LOW, XERK-502): a blind TCP connect reads an unrelated port-holder as "up".
+- **`running` means SERVING OUR dsh, not just launched** (XERK-492 lesson, on the port) —
+  `has-session` alone isn't proof; `_confirm_dsh_web` and steady-state require `_dsh_web_serving`.
+  - **`_dsh_web_serving` is an HTTP identity check, NOT a bare TCP connect** (XERK-502): it GETs the
+    viewer's root and matches a dsh page marker (`DSH_WEB_MARKERS` — the `@deepseek-ai/dsh` client-
+    module bootstrap in the first KB, or the `DeepSeek Harness` title), byte-bounded + short-timeout,
+    off the beat. A blind connect (`_dsh_web_port_open`, kept as the connect primitive) reads ANY
+    listener as up, so a service squatting `DSH_WEB_PORT` while dsh dies on EADDRINUSE misreported
+    `running:true` and relaunched the doomed dsh at a flat cadence (backoff reset). Any probe failure
+    (refused / non-200 / no marker) reads NOT serving, which engages the backoff. Host-verified against
+    real `dsh web` 0.1.1-rc.2 (serving) and a dumb HTTP squatter on the port (not serving).
+    - **The markers are COUPLED to dsh's rendered page** (same drift class as qwen's parser). A future
+      dsh that renames its client-module id or `<title>` would read a genuinely-serving dsh as NOT
+      serving, and the supervisor would kill+relaunch it in a backoff loop reporting `running:false`.
+      Re-verify `DSH_WEB_MARKERS` against the real page (`curl http://<host>:<port>/`) after a dsh
+      upgrade; host-proof only, dsh is not in CI.
 - **Adopts an in-place-updated instance**; `_handle_shutdown` does NOT kill it (like a dsh session's
   tmux).
 - **Wire: `dsh.web = {running, port, url}`, OMITTED when down** — same capability-flag discipline as
   `available`. `normalizeDsh` whitelists it and length-caps `url` (XERK-348 peer-cell lesson).
   Android is decode-safe untyped (`android/PARITY.md`).
-- Tests: `TestDshWeb` (URL rule, enable gate, payload, launch command, persistence patch). Adopt/
-  relaunch/plaintext-read are REAL-dsh QA, no CI.
+- Tests: `TestDshWeb` (URL rule, enable gate, payload, launch command, persistence patch, and the
+  `_dsh_web_serving` HTTP identity check — dsh page marker vs. a squatter/500/dead port, over a real
+  loopback HTTP server). Adopt/relaunch/plaintext-read are REAL-dsh QA, no CI.
 
 ## Tests
 

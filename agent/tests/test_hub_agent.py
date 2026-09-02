@@ -2431,25 +2431,93 @@ class TestDshWeb(unittest.TestCase):
              mock.patch.object(ha, "DSH_WEB_PORT", port):
             self.assertFalse(sm._dsh_web_port_open())
 
-    def test_confirm_requires_the_port_bound_not_just_the_tmux(self):
-        # D1: a tmux that started is NOT proof the viewer bound its port
-        # (EADDRINUSE / crash-on-boot). `running` must mean SERVING, so confirm
-        # returns False when the port never opens — which is what engages the
-        # backoff instead of a flat relaunch of a doomed process.
+    def _serve_http(self, handler_body, *, status=200,
+                    content_type="text/html; charset=utf-8"):
+        """Bind a one-request-at-a-time HTTP server on loopback answering GET /
+        with `handler_body` (bytes). Returns its port; torn down at test end."""
+        body = handler_body
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(srv.server_close)
+        return srv.server_address[1]
+
+    def test_serving_confirms_the_answering_thing_IS_dsh(self):
+        # XERK-502: a bare TCP connect reads ANY listener as up; _dsh_web_serving
+        # must instead prove the served page is actually dsh web.
+        sm = ha.SessionManager()
+        # A real dsh-web page (its client-module bootstrap marker) -> serving.
+        dsh_page = (b"<!doctype html><html><head><script>"
+                    b'window.__ModuleLoader__.load({id:"@deepseek-ai/dsh-client'
+                    b'-modules"})</script></head></html>')
+        port = self._serve_http(dsh_page)
+        with mock.patch.object(ha, "DSH_WEB_HOST", "127.0.0.1"), \
+             mock.patch.object(ha, "DSH_WEB_PORT", port):
+            self.assertTrue(sm._dsh_web_serving())
+            self.assertTrue(sm._dsh_web_port_open())     # port IS open, both agree
+        # The title alone also identifies it (marker set covers both).
+        port = self._serve_http(b"<html><head><title>DeepSeek Harness</title>")
+        with mock.patch.object(ha, "DSH_WEB_HOST", "127.0.0.1"), \
+             mock.patch.object(ha, "DSH_WEB_PORT", port):
+            self.assertTrue(sm._dsh_web_serving())
+
+    def test_serving_rejects_a_port_squatter_and_a_dead_port(self):
+        # An UNRELATED service holding DSH_WEB_PORT answers HTTP but carries no
+        # dsh marker -> NOT serving, even though the raw connect succeeds. This
+        # is the bug (a doomed dsh relaunched at a flat cadence): the connect
+        # said up, the HTTP identity check says down and engages the backoff.
+        sm = ha.SessionManager()
+        port = self._serve_http(b"<html><body>some other app</body></html>")
+        with mock.patch.object(ha, "DSH_WEB_HOST", "127.0.0.1"), \
+             mock.patch.object(ha, "DSH_WEB_PORT", port):
+            self.assertTrue(sm._dsh_web_port_open())     # a squatter IS listening
+            self.assertFalse(sm._dsh_web_serving())      # ...but it is not dsh
+        # A 500 from the port (dsh half-up / a broken squatter) is not serving.
+        port = self._serve_http(b"@deepseek-ai/dsh", status=500)
+        with mock.patch.object(ha, "DSH_WEB_HOST", "127.0.0.1"), \
+             mock.patch.object(ha, "DSH_WEB_PORT", port):
+            self.assertFalse(sm._dsh_web_serving())
+        # Nothing listening at all (connection refused) -> not serving, no raise.
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); dead = s.getsockname()[1]
+        s.close()
+        with mock.patch.object(ha, "DSH_WEB_HOST", "127.0.0.1"), \
+             mock.patch.object(ha, "DSH_WEB_PORT", dead), \
+             mock.patch.object(ha, "DSH_WEB_PROBE_TIMEOUT_SEC", 0.5):
+            self.assertFalse(sm._dsh_web_serving())
+
+    def test_confirm_requires_dsh_actually_serving_not_just_the_tmux(self):
+        # D1 + XERK-502: a tmux that started is NOT proof the viewer serves dsh
+        # (EADDRINUSE / crash-on-boot, or a squatter on the port). `running` must
+        # mean SERVING OUR dsh, so confirm returns False until _dsh_web_serving
+        # does — which is what engages the backoff instead of a flat relaunch of
+        # a doomed process.
         sm = ha.SessionManager()
         sm._dsh_web_stop = threading.Event()
         with mock.patch.object(ha, "DSH_WEB_CONFIRM_SEC", 0.2), \
              mock.patch.object(ha, "DSH_WEB_CONFIRM_POLL_SEC", 0.02), \
              mock.patch.object(sm, "_dsh_web_running", lambda: True), \
-             mock.patch.object(sm, "_dsh_web_port_open", lambda: False):
-            self.assertFalse(sm._confirm_dsh_web())      # tmux up, port never binds
-        # Port comes up -> confirmed.
+             mock.patch.object(sm, "_dsh_web_serving", lambda: False):
+            self.assertFalse(sm._confirm_dsh_web())      # tmux up, dsh never serves
+        # dsh comes up serving -> confirmed.
         with mock.patch.object(sm, "_dsh_web_running", lambda: True), \
-             mock.patch.object(sm, "_dsh_web_port_open", lambda: True):
+             mock.patch.object(sm, "_dsh_web_serving", lambda: True):
             self.assertTrue(sm._confirm_dsh_web())
         # tmux already gone (the dsh process exited) -> bail fast, do not wait.
         with mock.patch.object(sm, "_dsh_web_running", lambda: False), \
-             mock.patch.object(sm, "_dsh_web_port_open", lambda: True):
+             mock.patch.object(sm, "_dsh_web_serving", lambda: True):
             self.assertFalse(sm._confirm_dsh_web())
 
 
