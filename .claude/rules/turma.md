@@ -174,6 +174,19 @@ merge-readiness pill (`prBadgeHtml`). Per-session Attach/Restart/Kill/Start/Dele
   pick. `/sessions?ended=<transcriptId>` opens an ENDED session read-only (bounded by
   `ENDED_FOLLOW_MS`, cannot fold into `?session=`, which only resolves a running one). Tests:
   `sessions.test.js`, `TestHandleCommands`.
+- **The by-id `?session=<id>` wait is ALSO bounded** (`SELECT_FOLLOW_MS`, XERK-293) — a session that
+  never comes up (offline host, lost heartbeat, an agent too old to report a refusal, a stale id)
+  otherwise spun "Opening session…" forever. It lands on the empty stage with a one-line toast (a
+  timeout, not a reason — the cmdId route, XERK-276, is where a reason exists). It must NOT fire while
+  the paired spawn follow is still live (that window is `SPAWN_FOLLOW_MS`'s), nor for a session
+  reported `queued` (a legitimate long wait with its own stage text), nor for one reported `running`
+  ON AN ONLINE host (it came up; `sessionHit` is only held off by a terminal-tunnel FLAP that heals in
+  place, XERK-252). An OFFLINE host serving a stale `running` record IS bounded — that is the "host
+  went offline between the click and the resume" no-show. The exemption test (`sessionArrivedAnywhere`)
+  scans the WHOLE fleet, not the first record, so a stale copy lingering on an offline host (a
+  migration source still reading `running`, XERK-101) can't shadow a live copy flapping its tunnel on
+  another. The clock resets whenever a new id enters the wait (a resumed ended session, a spawn
+  resolving to its minted id).
 
 ## Usage page (`/usage`)
 

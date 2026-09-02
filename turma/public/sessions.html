@@ -2450,6 +2450,7 @@ function resumeEnded(ev, id) {
   pendingSpawn = null;
   followedSpawn = false;
   pendingSelect = e.kind === "resumable" ? null : id;
+  pendingSelectAt = Date.now();
   // Only drop the stage if it's showing the very session being resumed; a
   // Resume clicked from the sidebar must not clear something else being read.
   if (endedViewId === id) clearStage();
@@ -2515,11 +2516,19 @@ let viewPushed = false; // a history entry the back button will consume (mobile)
 // undone). Survives the async /api/agents load and any SSE-delivered arrival.
 const params = new URLSearchParams(location.search);
 let pendingSelect = params.get("session");
+// When the by-id wait began (XERK-293), so it can be BOUNDED like its two
+// siblings below rather than spin "Opening session…" forever for a session that
+// never comes up (an offline host, a heartbeat that never lands, a refusal from
+// an agent too old to report one, a stale/hand-edited id). Reset whenever a new
+// id enters the wait — a resumed ended session, or a followed spawn resolving to
+// the id the agent minted — so each gets its own full window.
+let pendingSelectAt = Date.now();
 // Deep link to an ENDED session's read-only view, keyed by its conversation:
 // /sessions?ended=<transcriptId>, which the board's ticket chips use for any
 // session that isn't running. Separate from ?session=, whose wait only ever
-// resolves a RUNNING session — pointing a killed session at that one parks the
-// stage on "Opening session…" indefinitely. Held until the ended list reports the
+// resolves a RUNNING session — pointing a killed session at that one drops to
+// the empty stage once its bounded wait expires (SELECT_FOLLOW_MS, XERK-293),
+// never to this read-only view. Held until the ended list reports the
 // transcript (a killed session is in the very next heartbeat; one recovered by
 // the transcript scan can take a slow beat), then opened once.
 let pendingEnded = params.get("ended");
@@ -2536,6 +2545,12 @@ const ENDED_FOLLOW_MS = 30000;
 // Give up after SPAWN_FOLLOW_MS so a spawn the agent refused (at MAX_SESSIONS,
 // unknown repo) can't hijack a selection the operator makes minutes later.
 const SPAWN_FOLLOW_MS = 90000;
+// The by-id wait's own deadline (XERK-293), generous like SPAWN_FOLLOW_MS since
+// a session legitimately takes a few beats to come up and a tight bound would
+// drop the operator off one that was about to arrive. It NEVER fires while the
+// paired spawn follow is still live (that window is SPAWN_FOLLOW_MS's to own)
+// nor for a session reported queued (its own long wait, with its own stage text).
+const SELECT_FOLLOW_MS = 90000;
 let pendingSpawn = params.get("spawn");
 let pendingSpawnAt = Date.now();
 let followedSpawn = !!pendingSpawn; // sticky: keeps the wait worded as a start
@@ -2592,7 +2607,7 @@ function tryPendingSelect() {
       // would let a stale one abandon a spawn that has since landed.
       for (const a of (cache.agents || [])) {
         const s = (a.sessions || []).find(x => x.spawnCmdId === pendingSpawn);
-        if (s) { pendingSpawn = null; pendingSelect = s.id; break; }
+        if (s) { pendingSpawn = null; pendingSelect = s.id; pendingSelectAt = Date.now(); break; }
       }
       // Else: the agent said it REFUSED this one (XERK-265). Stop waiting and
       // say why — otherwise the wait below spins out the whole SPAWN_FOLLOW_MS
@@ -2614,6 +2629,29 @@ function tryPendingSelect() {
     // says so rather than "Starting…", which reads as if it were already
     // launching. It flips to the live session the moment it provisions.
     const sel = pendingSelect ? findSession(pendingSelect) : null;
+    // Bound the by-id wait (XERK-293) so a session that never comes up drops
+    // back to the idle stage rather than spinning "Opening session…" forever.
+    // It reports a timeout, not a reason — the cmdId route (XERK-276) is where a
+    // reason exists. Three cases are exempt, each a legitimate hold, not a
+    // no-show:
+    //  - a live spawn follow (SPAWN_FOLLOW_MS owns that window);
+    //  - a session reported `queued` (a long wait with its own stage text);
+    //  - a session reported `running` ON AN ONLINE HOST — it DID come up, and
+    //    sessionHit() is only held off because that host's terminal tunnel is
+    //    down (XERK-252), a flap that heals in place, so timing it out would
+    //    falsely evict a live one. An OFFLINE host serving a stale `running`
+    //    record is the "host went offline between the click and the resume"
+    //    no-show this bound exists for, so it is NOT exempt — and the check
+    //    scans the WHOLE fleet (not the first record), so a stale copy lingering
+    //    on an offline host (a migration source, XERK-101) can't shadow a live
+    //    copy flapping its tunnel on another.
+    if (!pendingSpawn && pendingSelect && !sessionArrivedAnywhere(pendingSelect)
+        && Date.now() - pendingSelectAt > SELECT_FOLLOW_MS) {
+      pendingSelect = null;
+      toast("That session never came up.");
+      stageWaiting(null);
+      return;
+    }
     if (sel && sel.status === "queued") stageWaiting(queuedStageText(sel));
     else stageWaiting(followedSpawn ? "Starting your session…" : "Opening session…");
     return;
@@ -2694,6 +2732,18 @@ function sessionHit(id) {
   const now = cache.now || Date.now();
   const { running } = collect(cache.agents || [], now);
   return running.find(x => x.s.id === id && x.a.terminalOnline) || null;
+}
+// Is `id` reported anywhere in a state that justifies HOLDING the by-id wait
+// (XERK-293) rather than timing it out — queued, or running on an ONLINE host
+// (a live session whose terminal tunnel is merely flapping, XERK-252)? Scans
+// the whole fleet so a stale copy on an offline host (a migration source still
+// reading `running`, XERK-101) can't shadow a live copy on another host.
+function sessionArrivedAnywhere(id) {
+  for (const a of (cache.agents || [])) {
+    const s = (a.sessions || []).find(x => x.id === id);
+    if (s && (s.status === "queued" || (s.status === "running" && a.online))) return true;
+  }
+  return false;
 }
 // Picking a running session now opens the NATIVE CHAT view by default (the live
 // transcript, streamed over /live, rendered as chat bubbles + tool cards). The
