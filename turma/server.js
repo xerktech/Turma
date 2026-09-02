@@ -5851,6 +5851,14 @@ function normalizeJira(a) {
             if (k in t.repoGuess && typeof t.repoGuess[k] !== "boolean") delete t.repoGuess[k];
           }
         }
+        // `type` is the tracker Issue Type — non-null String (default "") on
+        // Android, and since XERK-560 the auto-merge gate keys on it. A non-string
+        // would BOTH slip that safety gate (`String(["bug"]) === "bug"`) AND, as a
+        // wrong-typed non-null, fail the whole /api/agents decode on Android. Drop
+        // it to absent (Android's "" default; the gate then reads it as not-a-bug).
+        // The collector only ever emits string-or-null, so this bites a malformed
+        // host, not a real one — but the gate must not trust the field's shape.
+        if ("type" in t && typeof t.type !== "string") delete t.type;
         sanitizeTicketTriage(t);
       }
     }
@@ -9190,7 +9198,13 @@ function autoMergeSession(s, byKey, rows) {
   // "bug" and would auto-merge it (XERK-560's defect). `AUTO_MERGE_ISSUE_TYPES`
   // is case-insensitive, default just "bug"; widen it (TURMA_AUTOMERGE_ISSUE_TYPES)
   // for a tracker that names its bug type differently (e.g. "Defect").
-  if (!AUTO_MERGE_ISSUE_TYPES.has(String(row.type || "").trim().toLowerCase())) return null;
+  // `typeof` guard is load-bearing, not just `String(row.type||"")`: a
+  // safety-critical merge decision must never trust the field's SHAPE, and
+  // `String(["bug"])` is `"bug"` — a single-element array would slip an
+  // un-normalized row (normalizeJira strips it on the wire, but the gate stands
+  // on its own). A non-string reads as not-a-bug.
+  if (typeof row.type !== "string"
+      || !AUTO_MERGE_ISSUE_TYPES.has(row.type.trim().toLowerCase())) return null;
   return { siteKey, key: t.key, row, repo };
 }
 

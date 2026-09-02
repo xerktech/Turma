@@ -11030,6 +11030,22 @@ test("XERK-560: auto-merge gates on the tracker ISSUE TYPE, not the triage class
   autoMergeSweep();
   assert.equal((agents.amRealBug.commands || []).filter((c) => c.type === "mergePr").length, 1,
     "a tracker Bug must auto-merge regardless of the classifier's assessment");
+  // A malformed non-string `type` must fail safe (QA: `String(["bug"])==="bug"`
+  // would otherwise slip the gate). normalizeJira strips it on ingest AND the
+  // gate's typeof guard stands alone — either way it never merges.
+  resetMerge();
+  await mergeBeat("amBadType", "ambadtype.atlassian.net",
+    { issueType: ["bug"], url: "https://github.com/x/y/pull/bt" });
+  autoMergeSweep();
+  autoCloseSweep();
+  assert.equal((agents.amBadType.commands || []).length, 0,
+    "a non-string tracker type must never auto-merge");
+  // And it was coerced OFF the served payload (Android decode safety).
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  const rec = list.body.agents.find((a) => a.key === "amBadType");
+  const badT = (rec.jira.tickets || []).find((t) => t.key === "ENG-9");
+  assert.ok(!badT || typeof badT.type === "undefined" || typeof badT.type === "string",
+    "a non-string ticket type must be coerced off the wire");
 });
 
 test("XERK-550: auto-merge skips a ticket the auto stream would NOT start (untriaged)", async () => {
