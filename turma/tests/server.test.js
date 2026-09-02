@@ -13856,13 +13856,26 @@ test("term: terminal HTML serves JBMNerd with font-display:swap (not block)", as
   data.socket.destroy();
   ctrl.socket.destroy();
 
-  // The font route itself: content-typed + immutable, so the preloaded fetch
-  // hits the browser cache on every repeat load (the swap only matters cold).
+  // The font route itself: content-typed and revalidating with an ETag
+  // (XERK-330). It is served under a fixed, editable name, so `immutable` for a
+  // year meant a swapped font stayed cached with no invalidation short of a
+  // rename; `no-cache` + the ETag keeps the preloaded ~1 MB fetch a cheap 304 on
+  // repeat loads while making a swap visible on the next open.
   const font = await request("GET", "/term-font.woff2", { headers: userHeaders });
   assert.equal(font.status, 200);
   assert.match(font.headers["content-type"], /^font\/woff2/);
-  assert.match(font.headers["cache-control"], /max-age=31536000/);
-  assert.ok(font.headers["cache-control"].includes("immutable"), "font must be immutable");
+  assert.equal(font.headers["cache-control"], "public, no-cache");
+  assert.ok(!font.headers["cache-control"].includes("immutable"), "font must not cache immutable under its editable name");
+  assert.ok(font.headers.etag, "font must carry an ETag so a revalidation is a 304, not a re-download");
+  const revalidated = await request("GET", "/term-font.woff2", { headers: { ...userHeaders, "If-None-Match": font.headers.etag } });
+  assert.equal(revalidated.status, 304, "a matching conditional GET must 304, not re-send the font");
+  // HEAD is answered like the STATIC_ASSETS routes (headers, no body) — the
+  // sibling asset routes all answer HEAD, and it lets a conditional HEAD
+  // revalidate the ETag without pulling the ~1 MB body.
+  const head = await request("HEAD", "/term-font.woff2", { headers: userHeaders });
+  assert.equal(head.status, 200, "HEAD must be answered, not 404'd");
+  assert.equal(head.headers.etag, font.headers.etag);
+  assert.equal(head.raw, "", "HEAD must carry no body");
 });
 
 

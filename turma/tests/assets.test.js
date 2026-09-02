@@ -176,11 +176,35 @@ test("assets: a conditional GET for an asset is a 304, weak or listed", async ()
   assert.ok(stale.raw.length > 0);
 });
 
-test("assets: icons and fonts still cache hard under their stable names", () => {
-  for (const p of ["/favicon.svg", "/icon-512.png", "/fonts/inter-latin-wght-normal.woff2"]) {
-    assert.equal(STATIC_ASSETS[p].cache, IMMUTABLE_CACHE, p);
+test("assets: icons, fonts and the manifest revalidate under their mutable names (XERK-330)", async () => {
+  // They are served under their OWN editable names (no fingerprinted twin), so
+  // `immutable` for a year meant an in-place edit — a rebrand, a favicon tweak,
+  // a regenerated font subset — stayed invisible to every warm browser for up
+  // to a year, unfixable short of renaming the file. `no-cache` + an ETag makes
+  // such an edit visible on the next navigation while keeping the 304 cheap.
+  const mutableByName = [
+    "/favicon.svg", "/favicon.ico", "/favicon-16.png", "/favicon-32.png",
+    "/apple-touch-icon.png", "/icon-192.png", "/icon-512.png",
+    "/site.webmanifest",
+    "/fonts/inter-latin-wght-normal.woff2",
+    "/fonts/space-grotesk-latin-wght-normal.woff2",
+  ];
+  for (const p of mutableByName) {
+    assert.equal(STATIC_ASSETS[p].cache, REVALIDATE_CACHE, p);
+    // Asserted as a LITERAL too: `immutable` is the exact bug — a test that only
+    // read the constant would stay green if someone set these back to it.
+    assert.notEqual(STATIC_ASSETS[p].cache, "public, max-age=31536000, immutable", p);
     assert.ok(STATIC_ASSETS[p].etag, `${p} lost its ETag`);
   }
+  // The invalidation path an in-place edit relies on: a cache holding the OLD
+  // body revalidates and is handed the new bytes; a matching tag is a cheap 304.
+  const icon = await request("/favicon.svg");
+  assert.equal(icon.status, 200);
+  assert.equal(icon.headers["cache-control"], "public, no-cache");
+  assert.equal((await request("/favicon.svg", { "if-none-match": icon.headers.etag })).status, 304);
+  const edited = await request("/favicon.svg", { "if-none-match": '"deadbeefcafe"' });
+  assert.equal(edited.status, 200, "a warm browser holding the old icon must get the new one");
+  assert.ok(edited.raw.length > 0);
 });
 
 // ---- a fingerprint from a PREVIOUS release ----------------------------------
