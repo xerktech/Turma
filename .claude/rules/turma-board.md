@@ -174,6 +174,44 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
   (`<host>\x00<sessionId>`, once per hub lifetime).
 - Tests: the `auto-stop:` cases in `server.test.js`.
 
+#### Auto-merging + auto-closing (XERK-550)
+
+- **Removes the review/merge/close bottleneck for the class an org already auto-starts.** Opt-in
+  **PER ORG** via a SECOND hub-only toggle (`autoMergeOrgs`, `AUTOMERGE_ORGS_FILE`, its own SSE +
+  payload key), the sibling of `autoStartOrgs` in the header org menu. **OFF by default** — it MERGES
+  to the default branch with no human review, so it is a deliberate per-project trust decision.
+  Independent of the auto-start switch (either can be on without the other).
+- **The eligibility gate is the SAME content gate auto-start uses** (`autoStartContentGate`: repo
+  present + not ignore-tier, triage actionable/not-held/not-duplicate, org policy). So it acts on
+  exactly the tickets the auto stream would start — the "bug class" — and **never on a
+  human-started feature session** (a feature ticket fails the org's triage type/policy). It is a
+  SEPARATE composition from `autoStartSweep`'s inline gates (their per-drop log lines differ); a
+  cross-check test pins the two agree. **Not scoped by whether the hub started the session** — the
+  triage gate is the scope.
+- Two sweeps on the 15s timer, both no-op unless an org opted in:
+  - **`autoMergeSweep`** — for a **running, idle** eligible session (not `sessionWorking`, not blocked
+    on a `question`/`panePrompt`), queue a **`mergePr`** command to the SESSION's host (it holds `gh`
+    auth + the branch) for each PR reading `ready === "ready"` (green CI + `MERGEABLE` + no conflict,
+    the flag the agent already computes). Backoff per PR url (`autoMergeState`: `{at, attempts,
+    gaveUp}`); a merge `gh` refuses (`mergePrResults` `ok:false` — branch protection, review
+    required, a fresh conflict) is marked `gaveUp` and never retried; a silent failure retries to a
+    cap then gives up. The merge runs OFF the agent's beat (`_merge_pr_async`, a worker thread) — a
+    blocking network call from `handle_commands` would risk the XERK-395 budget.
+  - **`autoCloseSweep`** — once EVERY PR a session opened has **landed** and at least one actually
+    **MERGED** (a purely-CLOSED PR never closes its ticket), move the ticket to **Done** (the
+    XERK-138 status-writeback, routed to a `pickBoardWriteHost` of the org) AND **kill** the session
+    (reusing `autoStopped`). The kill is DIRECT, not via `autoStopSweep` observing Done — that would
+    wait out the ~10-min Jira poll, and freeing the slot promptly is the whole point. Guards:
+    `autoClosed` (`<siteKey>\x00<key>`, the Done write once) + `autoStopped` (the kill once).
+- **GitHub only for now** — the agent's `merge_pr` refuses a GitLab MR / ADO PR (staged `ok:false`)
+  so the hub gives up rather than retrying. Merge method is `--squash --delete-branch`,
+  env-overridable (`TURMA_AUTOMERGE_METHOD`/`_DELETE_BRANCH`).
+- **Web ⇄ Android parity gap**: the org-menu auto-merge switch shipped on WEB only; Android ignores
+  the `autoMergeOrgs` payload key (safe — unknown key) and has no switch yet. Tracked in
+  `android/PARITY.md`; the hub route works from web regardless.
+- Tests: the `XERK-550:`/`automerge route:` cases in `server.test.js`, `TestMergePr` in
+  `test_hub_agent.py`, the auto-merge switch case in `org.test.js`.
+
 ### Ticket ↔ session chips
 
 - A ticket's session chips come from `ticketSessionIndex` — a reverse index of the fleet payload's

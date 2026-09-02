@@ -129,7 +129,7 @@ test("org: several selected orgs read as a count, with one dot per org (XERK-222
 test("org: the menu lists All orgs plus every reporting org, with ticket counts", () => {
   const sites = [site("acme.atlassian.net", 3), site("dev.azure.com/xerk", 4)];
   const colors = window.TurmaBoard.orgColorMap(sites.map(s => s.siteKey));
-  const html = Org.menuHtml(sites, "", colors, {}, () => "");
+  const html = Org.menuHtml(sites, "", colors, {}, {}, () => "");
   assert.equal((html.match(/data-org-key=/g) || []).length, 3);
   assert.match(html, /data-org-key=""[\s\S]*?All orgs[\s\S]*?<span class="chip-n">7<\/span>/);
   assert.match(html, /data-org-key="acme\.atlassian\.net"/);
@@ -140,19 +140,19 @@ test("org: every selected org's row is checked and highlighted, none else (XERK-
   const sites = [site("acme.atlassian.net"), site("dev.azure.com/xerk")];
   const colors = window.TurmaBoard.orgColorMap(sites.map(s => s.siteKey));
   // Rows are checkboxes, not radios: any subset can be on at once.
-  assert.doesNotMatch(Org.menuHtml(sites, [], colors, {}, () => ""), /menuitemradio/);
+  assert.doesNotMatch(Org.menuHtml(sites, [], colors, {}, {}, () => ""), /menuitemradio/);
   // Nothing selected: only the "All orgs" row is checked.
-  const none = Org.menuHtml(sites, [], colors, {}, () => "");
+  const none = Org.menuHtml(sites, [], colors, {}, {}, () => "");
   assert.equal((none.match(/aria-checked="true"/g) || []).length, 1);
   assert.equal((none.match(/class="org-row active"/g) || []).length, 1);
   assert.match(none, /data-org-key="" role="menuitemcheckbox" aria-checked="true"/);
   // One selected: that row alone.
-  const one = Org.menuHtml(sites, ["acme.atlassian.net"], colors, {}, () => "");
+  const one = Org.menuHtml(sites, ["acme.atlassian.net"], colors, {}, {}, () => "");
   assert.equal((one.match(/aria-checked="true"/g) || []).length, 1);
   assert.match(one, /data-org-key="acme\.atlassian\.net"[^>]*aria-checked="true"/);
   assert.match(one, /data-org-key="" role="menuitemcheckbox" aria-checked="false"/);
   // Both selected: both rows checked and highlighted, All orgs not.
-  const both = Org.menuHtml(sites, ["acme.atlassian.net", "dev.azure.com/xerk"], colors, {}, () => "");
+  const both = Org.menuHtml(sites, ["acme.atlassian.net", "dev.azure.com/xerk"], colors, {}, {}, () => "");
   assert.equal((both.match(/aria-checked="true"/g) || []).length, 2);
   assert.equal((both.match(/class="org-row active"/g) || []).length, 2);
   assert.match(both, /data-org-key="" role="menuitemcheckbox" aria-checked="false"/);
@@ -161,7 +161,7 @@ test("org: every selected org's row is checked and highlighted, none else (XERK-
 test("org: each org row carries its auto-start switch, reflecting the hub map", () => {
   const sites = [site("acme.atlassian.net"), site("dev.azure.com/xerk")];
   const colors = window.TurmaBoard.orgColorMap(sites.map(s => s.siteKey));
-  const html = Org.menuHtml(sites, "", colors, { "acme.atlassian.net": true }, () => "");
+  const html = Org.menuHtml(sites, "", colors, { "acme.atlassian.net": true }, {}, () => "");
   // One switch per ORG — never on the "All orgs" row, which is a scope, not an
   // org the hub can be opted in for.
   assert.equal((html.match(/data-org-auto=/g) || []).length, 2);
@@ -170,10 +170,24 @@ test("org: each org row carries its auto-start switch, reflecting the hub map", 
   assert.equal((html.match(/org-chip-auto on/g) || []).length, 1);
 });
 
+test("org: each org row carries its auto-merge switch, reflecting the hub map (XERK-550)", () => {
+  const sites = [site("acme.atlassian.net"), site("dev.azure.com/xerk")];
+  const colors = window.TurmaBoard.orgColorMap(sites.map(s => s.siteKey));
+  // auto-start OFF for both; auto-merge ON only for acme — the two toggles are
+  // independent maps, so the merge switch must read its OWN map, not autoMap.
+  const html = Org.menuHtml(sites, "", colors, {}, { "acme.atlassian.net": true }, () => "");
+  assert.equal((html.match(/data-org-merge=/g) || []).length, 2);
+  assert.match(html, /data-org-merge="acme\.atlassian\.net" aria-pressed="true"/);
+  assert.match(html, /data-org-merge="dev\.azure\.com\/xerk" aria-pressed="false"/);
+  assert.equal((html.match(/org-chip-merge on/g) || []).length, 1);
+  // The auto-start switches stay OFF — the merge map must not bleed into them.
+  assert.doesNotMatch(html, /data-org-auto="[^"]*" aria-pressed="true"/);
+});
+
 test("org: an org with no online host is marked stale, with how old its report is", () => {
   const offline = Object.assign(site("acme.atlassian.net"), { online: false, lastFetched: "x" });
   const colors = window.TurmaBoard.orgColorMap(["acme.atlassian.net"]);
-  const html = Org.menuHtml([offline, site("dev.azure.com/xerk")], "", colors, {}, () => "4m");
+  const html = Org.menuHtml([offline, site("dev.azure.com/xerk")], "", colors, {}, {}, () => "4m");
   assert.match(html, /⚠ offline · synced 4m ago/);
   assert.equal((html.match(/chip-stale/g) || []).length, 1);
 });
@@ -181,14 +195,14 @@ test("org: an org with no online host is marked stale, with how old its report i
 test("org: the menu only exists while it's open", () => {
   const sites = [site("acme.atlassian.net")];
   const colors = window.TurmaBoard.orgColorMap(["acme.atlassian.net"]);
-  assert.doesNotMatch(Org.controlHtml(sites, "", colors, {}, false, () => ""), /org-menu/);
-  assert.match(Org.controlHtml(sites, "", colors, {}, true, () => ""), /org-menu/);
+  assert.doesNotMatch(Org.controlHtml(sites, "", colors, {}, {}, false, () => ""), /org-menu/);
+  assert.match(Org.controlHtml(sites, "", colors, {}, {}, true, () => ""), /org-menu/);
 });
 
 test("org: org names and site keys are escaped into the markup", () => {
   const evil = Object.assign(site('a"><script>x</script>'), { orgName: "<b>boom</b>" });
   const colors = window.TurmaBoard.orgColorMap([evil.siteKey]);
-  const html = Org.menuHtml([evil], "", colors, {}, () => "");
+  const html = Org.menuHtml([evil], "", colors, {}, {}, () => "");
   assert.doesNotMatch(html, /<script>/);
   assert.doesNotMatch(html, /<b>boom<\/b>/);
   assert.match(html, /&lt;b&gt;boom&lt;\/b&gt;/);
@@ -364,10 +378,10 @@ test("org: the auto switch flips optimistically and rolls back on a failed POST"
 test("org: each org row carries a color chip; the swatch strip only when expanded", () => {
   const sites = [site("acme.atlassian.net"), site("dev.azure.com/xerk")];
   const colors = window.TurmaBoard.orgColorMap(sites.map(s => s.siteKey));
-  const closed = Org.menuHtml(sites, "", colors, {}, () => "", {}, null);
+  const closed = Org.menuHtml(sites, "", colors, {}, {}, () => "", {},null);
   assert.equal((closed.match(/data-org-color=/g) || []).length, 2);
   assert.doesNotMatch(closed, /org-swatch-row/);
-  const open = Org.menuHtml(sites, "", colors, {}, () => "", {}, "acme.atlassian.net");
+  const open = Org.menuHtml(sites, "", colors, {}, {}, () => "", {},"acme.atlassian.net");
   assert.equal((open.match(/class="org-swatch-row"/g) || []).length, 1);
   // 8 slot swatches + the auto release, keyed to the expanded org.
   assert.equal((open.match(/data-org-swatch="\d+"/g) || []).length, 8);
@@ -378,10 +392,10 @@ test("org: each org row carries a color chip; the swatch strip only when expande
 test("org: the swatch strip marks the pinned slot, else the auto release", () => {
   const sites = [site("acme.atlassian.net")];
   const colors = window.TurmaBoard.orgColorMap(["acme.atlassian.net"], { "acme.atlassian.net": 3 });
-  const pinned = Org.menuHtml(sites, "", colors, {}, () => "", { "acme.atlassian.net": 3 }, "acme.atlassian.net");
+  const pinned = Org.menuHtml(sites, "", colors, {}, {}, () => "", { "acme.atlassian.net": 3 },"acme.atlassian.net");
   assert.match(pinned, /class="org-swatch picked"[^>]*data-org-swatch="3"/);
   assert.doesNotMatch(pinned, /org-swatch-auto picked/);
-  const unpinned = Org.menuHtml(sites, "", colors, {}, () => "", {}, "acme.atlassian.net");
+  const unpinned = Org.menuHtml(sites, "", colors, {}, {}, () => "", {},"acme.atlassian.net");
   assert.doesNotMatch(unpinned, /org-swatch picked/);
   assert.match(unpinned, /org-swatch-auto picked/);
 });

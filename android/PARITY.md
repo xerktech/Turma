@@ -160,6 +160,16 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `BoardTest`); `model/Models.kt`, `net/FleetRepository.kt` (payload + `autoStartOrgs` SSE),
   `net/HubApi.kt`. It rode the board's org chips until XERK-62 moved it onto the header control's
   org rows, following the web.
+- **Per-org auto-MERGE switch (XERK-550) — WEB ONLY, GAP.** The header org menu gained a second
+  switch beside auto-start that flips the hub's hands-off auto-merge opt-in
+  (`POST /api/jira/<site>/automerge`; the hub then merges a merge-ready PR of an auto-start-eligible
+  ticket, closes the ticket, and frees the slot). Android does NOT render it yet: it ignores the new
+  top-level `autoMergeOrgs` payload key (unknown-key-safe, `ignoreUnknownKeys`) and the org control
+  shows only the auto-start `Switch`. Closing the gap: type `autoMergeOrgs` in `model/Models.kt` +
+  its `net/FleetRepository.kt` SSE, port an `autoMergeOn` read into `core/Board.kt`, add the second
+  `Switch` (+ its POST via `net/HubApi.kt`) to `ui/OrgControl.kt`/`vm/OrgViewModel.kt`, mirroring the
+  auto-start switch above. Web source: `turma/public/org.js` (`setAutoMerge`, the `data-org-merge`
+  chip). The hub route works from web regardless, so the feature is fully usable without the phone.
 - **Fleet-wide org filter (XERK-62).** The board's org chip strip is gone; one org control lives in
   the shared `ScreenHeader` and so is on all four top-level screens, scoping each of them from the one
   persisted pick — Dashboard hosts + tiles, Sessions lists + new-session host picker, Board tickets,

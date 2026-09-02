@@ -24487,6 +24487,128 @@ class TestSetBoardStatus(ManagerMixin, unittest.TestCase):
         self.assertTrue(sm.ticket_status_results[0]["ok"])
 
 
+class TestMergePr(ManagerMixin, unittest.TestCase):
+    """XERK-550: the hub judged a PR merge-ready and dispatched a mergePr; the
+    agent runs `gh pr merge` and stages {cmdId, url, ok, error}. Runs as the
+    manager (not a guarded session), off the beat on a worker thread. GitHub
+    only; a GitLab/ADO url stages a refusal so the hub gives up."""
+
+    URL = "https://github.com/x/y/pull/1"
+
+    def _fake_run(self, rc=0, stdout="", stderr=""):
+        # Stand in for subprocess.run's CompletedProcess.
+        proc = mock.Mock()
+        proc.returncode, proc.stdout, proc.stderr = rc, stdout, stderr
+        return proc
+
+    def test_github_squash_merge_is_the_default_command(self):
+        sm = self.make_manager()
+        seen = {}
+
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None):
+            seen["cmd"], seen["cwd"] = cmd, cwd
+            return self._fake_run(rc=0)
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(ha.subprocess, "run", fake_run):
+            sm.merge_pr("c1", None, self.URL)
+        self.assertEqual(seen["cmd"],
+                         ["gh", "pr", "merge", self.URL, "--squash", "--delete-branch"])
+        self.assertIsNone(seen["cwd"])
+        r = sm.merge_pr_results[0]
+        self.assertEqual((r["cmdId"], r["url"], r["ok"], r["error"]),
+                         ("c1", self.URL, True, None))
+
+    def test_a_refused_merge_stages_the_gh_error(self):
+        sm = self.make_manager()
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(ha.subprocess, "run",
+                               return_value=self._fake_run(rc=1, stderr="Pull request is not mergeable: review required")):
+            sm.merge_pr("c2", None, self.URL)
+        r = sm.merge_pr_results[0]
+        self.assertFalse(r["ok"])
+        self.assertIn("review required", r["error"])
+
+    def test_method_and_delete_branch_are_env_overridable(self):
+        sm = self.make_manager()
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return self._fake_run(rc=0)
+        with mock.patch.dict(os.environ,
+                             {"TURMA_AUTOMERGE_METHOD": "merge",
+                              "TURMA_AUTOMERGE_DELETE_BRANCH": "0"}, clear=True), \
+             mock.patch.object(ha.subprocess, "run", fake_run):
+            sm.merge_pr("c3", None, self.URL)
+        self.assertEqual(seen["cmd"], ["gh", "pr", "merge", self.URL, "--merge"])
+
+    def test_a_bad_method_falls_back_to_squash(self):
+        sm = self.make_manager()
+        seen = {}
+        with mock.patch.dict(os.environ, {"TURMA_AUTOMERGE_METHOD": "rm -rf"}, clear=True), \
+             mock.patch.object(ha.subprocess, "run",
+                               lambda cmd, **kw: seen.setdefault("cmd", cmd) or self._fake_run()):
+            sm.merge_pr("c4", None, self.URL)
+        self.assertIn("--squash", seen["cmd"])
+
+    def test_gitlab_and_azure_urls_are_refused_without_running_gh(self):
+        sm = self.make_manager()
+        called = {"n": 0}
+
+        def fake_run(*a, **kw):
+            called["n"] += 1
+            return self._fake_run()
+        for url in ("https://gitlab.example.com/g/p/-/merge_requests/3",
+                    "https://dev.azure.com/org/proj/_git/repo/pullrequest/7"):
+            with mock.patch.object(ha.subprocess, "run", fake_run):
+                sm.merge_pr("c", None, url)
+        self.assertEqual(called["n"], 0)
+        self.assertTrue(all(not r["ok"] for r in sm.merge_pr_results))
+        self.assertTrue(all("GitHub" in r["error"] for r in sm.merge_pr_results))
+
+    def test_a_non_http_url_is_refused(self):
+        sm = self.make_manager()
+        sm.merge_pr("c", None, "not a url")
+        self.assertFalse(sm.merge_pr_results[0]["ok"])
+
+    def test_the_session_worktree_is_the_cwd_when_it_exists(self):
+        sm = self.make_manager()
+        wt = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, wt, ignore_errors=True)
+        sm.registry.append({"id": "s1", "worktreePath": wt})
+        seen = {}
+        with mock.patch.object(ha.subprocess, "run",
+                               lambda cmd, cwd=None, **kw: seen.update(cwd=cwd) or self._fake_run()):
+            sm.merge_pr("c", "s1", self.URL)
+        self.assertEqual(seen["cwd"], wt)
+
+    def test_a_subprocess_crash_is_staged_never_raised(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.subprocess, "run", side_effect=OSError("boom")):
+            sm.merge_pr("c", None, self.URL)  # must not raise
+        self.assertFalse(sm.merge_pr_results[0]["ok"])
+
+    def test_dispatch_routes_mergePr_to_the_async_worker(self):
+        sm = self.make_manager()
+        seen = {}
+        with mock.patch.object(sm, "_merge_pr_async",
+                               lambda cid, sid, url: seen.update(cid=cid, sid=sid, url=url)):
+            sm.handle_commands([{"cmdId": "c5", "type": "mergePr",
+                                 "sessionId": "s1", "url": self.URL}])
+        self.assertEqual(seen, {"cid": "c5", "sid": "s1", "url": self.URL})
+        self.assertIn("c5", sm.acked)
+
+    def test_a_failed_thread_start_stages_a_result_on_the_beat(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.threading, "Thread",
+                               side_effect=RuntimeError("pids_limit")):
+            sm._merge_pr_async("c6", None, self.URL)
+        r = sm.merge_pr_results[0]
+        self.assertEqual(r["cmdId"], "c6")
+        self.assertFalse(r["ok"])
+        self.assertIn("could not start", r["error"])
+
+
 class TestSetTicketPriority(ManagerMixin, unittest.TestCase):
     """XERK-483: the third agent->tracker write. setTicketPriority re-reads the
     ticket and writes the triage band's tracker value only when the field is

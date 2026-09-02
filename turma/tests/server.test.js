@@ -173,6 +173,8 @@ const {
   TERM_SCROLL_BOTTOM_JS,
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStartOrgs, setAutoStartOrg,
+  autoMergeSweep, autoCloseSweep, autoStartContentGate, orgsWithAutoMerge,
+  autoMergeOrgs, setAutoMergeOrg, autoMergeState, autoClosed, ingestMergeResults,
   priorityWriteBackOrgs, setPriorityWriteBackOrg, orgsWithPriorityWriteBack,
   priorityWriteBackSweep, priorityWriteBackSkips,
   dedupeLinkOrgs, setDedupeLinkOrg, orgsWithDedupeLink,
@@ -10723,6 +10725,257 @@ test("auto-stop: fires each session at most once, across repeated sweeps", async
   autoStopSweep();
   autoStopSweep();
   assert.equal((agents.apOnce.commands || []).filter((c) => c.type === "kill").length, 1);
+});
+
+// ---- auto-merge + auto-close (XERK-550) ------------------------------------
+// For orgs that opt in, the hub MERGES a merge-ready PR of an auto-start-eligible
+// ticket session, then moves the ticket to Done and kills the session to free
+// its slot — the review/merge/close bottleneck removed for the bug class the org
+// already auto-starts. The merge itself is an agent command (gh auth lives
+// there); the hub decides which PRs and does the close+kill.
+const PR1 = "https://github.com/x/y/pull/1";
+const resetMerge = () => {
+  autoMergeState.clear();
+  autoClosed.clear();
+  autoStopped.clear();
+  for (const k of Object.keys(autoMergeOrgs)) delete autoMergeOrgs[k];
+};
+// A running ticket session in an opted-in org with one PR. Defaults: idle
+// (paneBusy false), an actionable bug (auto-start-eligible), a merge-ready OPEN
+// PR — the state the hub acts on.
+const mergeBeat = async (device, site, {
+  autoMerge = true, ready = "ready", state = "OPEN", mergeable = "MERGEABLE",
+  paneBusy = false, ticketType = "bug", statusCategory = "inprogress",
+  question, prs, tickets, url = PR1,
+} = {}) => {
+  const r = await asBeat(device, site, {
+    autoStart: false,
+    tickets: tickets || [{ key: "ENG-9", summary: "A bug", statusCategory,
+      repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: ticketType, actionable: true } }],
+    sessions: [{ id: "sm1", status: "running",
+      ticket: { key: "ENG-9", siteKey: site },
+      prs: prs || [{ url, state, ready, mergeable }],
+      session: { transcriptAgeSec: 30, paneBusy,
+                 ...(question ? { question } : {}) } }],
+  });
+  setAutoMergeOrg(site, autoMerge);
+  return r;
+};
+const cmds = (device) => (agents[device].commands || []).map((c) => [c.type, c.sessionId || c.issueKey, c.url || c.category]);
+
+test("automerge route: sets/clears the org opt-in and rides the payload + SSE", async () => {
+  resetMerge();
+  await asBeat("amR", "amr.atlassian.net", { autoStart: false });
+  let r = await request("POST", "/api/jira/amr.atlassian.net/automerge",
+    { body: { enabled: true }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { ok: true, enabled: true });
+  assert.equal(autoMergeOrgs["amr.atlassian.net"], true);
+  let list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.body.autoMergeOrgs["amr.atlassian.net"], true);
+  // Distinct from auto-start: flipping merge on must not turn auto-start on.
+  assert.equal(orgsWithAutoStart().has("amr.atlassian.net"), false);
+
+  r = await request("POST", "/api/jira/amr.atlassian.net/automerge",
+    { body: { enabled: false }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal("amr.atlassian.net" in autoMergeOrgs, false);
+  list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal("amr.atlassian.net" in (list.body.autoMergeOrgs || {}), false);
+});
+
+test("automerge route: rejects a bad body, an unknown org, and no login", async () => {
+  resetMerge();
+  await asBeat("amV", "amv.atlassian.net", { autoStart: false });
+  for (const body of [{}, { enabled: "yes" }, { enabled: 1 }]) {
+    const r = await request("POST", "/api/jira/amv.atlassian.net/automerge",
+      { body, headers: userHeaders });
+    assert.equal(r.status, 400, JSON.stringify(body));
+  }
+  let r = await request("POST", "/api/jira/nobody.atlassian.net/automerge",
+    { body: { enabled: true }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  assert.equal("nobody.atlassian.net" in autoMergeOrgs, false);
+  r = await request("POST", "/api/jira/amv.atlassian.net/automerge",
+    { body: { enabled: true } });
+  assert.equal(r.status, 401);
+  assert.equal("amv.atlassian.net" in autoMergeOrgs, false);
+});
+
+test("XERK-550: the auto-merge content gate agrees with what auto-start would sweep", async () => {
+  resetAutoStart();
+  // Four To Do tickets: an eligible bug, a held one, a policy-excluded type, and
+  // an untriaged one. Opt the org into BOTH auto-start and auto-merge, run the
+  // auto-start round, and assert: a ticket is queued for auto-start IFF the
+  // auto-merge content gate calls it eligible. Same predicate, no drift.
+  setTriagePolicy("xcheck.atlassian.net", { excludeTypes: ["chore"] });
+  setTicketTriageAction("xcheck.atlassian.net", "BUG-2", "hold");
+  const tickets = [
+    { key: "BUG-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "bug", actionable: true } },
+    { key: "BUG-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "bug", actionable: true } },
+    { key: "CHORE-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "chore", actionable: true } },
+    { key: "RAW-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+  ];
+  await asBeat("xc", "xcheck.atlassian.net", { autoStart: true, tickets });
+  setAutoMergeOrg("xcheck.atlassian.net", true);
+  autoStartRound();
+  const queued = new Set((agents.xc.commands || [])
+    .filter((c) => c.type === "spawnTicket").map((c) => c.issueKey));
+  const rows = new Map(tickets.map((t) => [t.key, t]));
+  for (const key of rows.keys()) {
+    const t = rows.get(key);
+    const gate = autoStartContentGate("xcheck.atlassian.net", t, "Turma");
+    assert.equal(gate === null, queued.has(key),
+      `${key}: gate ${gate ? gate.reason : "null"} vs queued=${queued.has(key)}`);
+  }
+  // The eligible bug is the only one that both queued and gates clean.
+  assert.equal(autoStartContentGate("xcheck.atlassian.net", rows.get("BUG-1"), "Turma"), null);
+  resetAutoStart();
+  delete triagePolicies["xcheck.atlassian.net"];
+});
+
+test("XERK-550: an ignore-tier repo is never eligible, even opted in", () => {
+  setRepoTier("Junk", "ignore");
+  assert.ok(autoStartContentGate("z.atlassian.net",
+    { key: "K-1", triage: { type: "bug", actionable: true } }, "Junk"));
+  setRepoTier("Junk", "active");
+});
+
+test("XERK-550: auto-merge dispatches mergePr for a ready, idle, eligible session", async () => {
+  resetMerge();
+  await mergeBeat("am1", "am1.atlassian.net", {});
+  autoMergeSweep();
+  const c = (agents.am1.commands || []).find((x) => x.type === "mergePr");
+  assert.ok(c, "expected a mergePr command");
+  assert.equal(c.url, PR1);
+  assert.equal(c.sessionId, "sm1");
+  assert.equal(autoMergeState.get(PR1).attempts, 1);
+});
+
+test("XERK-550: auto-merge skips when the org has NOT opted in", async () => {
+  resetMerge();
+  await mergeBeat("am2", "am2.atlassian.net", { autoMerge: false });
+  autoMergeSweep();
+  assert.equal((agents.am2.commands || []).filter((c) => c.type === "mergePr").length, 0);
+});
+
+test("XERK-550: auto-merge skips a session that is still WORKING", async () => {
+  resetMerge();
+  await mergeBeat("am3", "am3.atlassian.net", { paneBusy: true });
+  autoMergeSweep();
+  assert.equal((agents.am3.commands || []).filter((c) => c.type === "mergePr").length, 0);
+});
+
+test("XERK-550: auto-merge skips a session blocked on a pending question", async () => {
+  resetMerge();
+  await mergeBeat("am4", "am4.atlassian.net", { question: { prompt: "which?" } });
+  autoMergeSweep();
+  assert.equal((agents.am4.commands || []).filter((c) => c.type === "mergePr").length, 0);
+});
+
+test("XERK-550: auto-merge skips a PR that is not merge-ready or already landed", async () => {
+  resetMerge();
+  await mergeBeat("am5", "am5.atlassian.net", { ready: "pending" });
+  autoMergeSweep();
+  assert.equal((agents.am5.commands || []).filter((c) => c.type === "mergePr").length, 0);
+  resetMerge();
+  await mergeBeat("am6", "am6.atlassian.net", { state: "MERGED" });
+  autoMergeSweep();
+  assert.equal((agents.am6.commands || []).filter((c) => c.type === "mergePr").length, 0);
+});
+
+test("XERK-550: auto-merge skips a ticket the auto stream would NOT start (untriaged)", async () => {
+  resetMerge();
+  await mergeBeat("am7", "am7.atlassian.net", {
+    tickets: [{ key: "ENG-9", statusCategory: "inprogress",
+      repoGuess: { repo: "Turma", cloned: true } }] });  // no triage block
+  autoMergeSweep();
+  assert.equal((agents.am7.commands || []).filter((c) => c.type === "mergePr").length, 0);
+});
+
+test("XERK-550: auto-merge backs off — a second sweep does not re-dispatch", async () => {
+  resetMerge();
+  await mergeBeat("am8", "am8.atlassian.net", {});
+  autoMergeSweep();
+  autoMergeSweep();
+  assert.equal((agents.am8.commands || []).filter((c) => c.type === "mergePr").length, 1);
+});
+
+test("XERK-550: a gh merge refusal (ok:false) marks the PR gaveUp and stops retrying", async () => {
+  resetMerge();
+  await mergeBeat("am9", "am9.atlassian.net", {});
+  autoMergeSweep(); // attempt 1
+  // The agent reports the merge was refused (branch protection, review required…).
+  ingestMergeResults(agents.am9, [{ cmdId: "c1", url: PR1, ok: false, error: "review required" }]);
+  autoMergeSweep(); // folds the failure -> gaveUp
+  assert.equal(autoMergeState.get(PR1).gaveUp, true);
+  // Even past the backoff window it never retries a gaveUp PR.
+  autoMergeState.get(PR1).at = 0;
+  autoMergeSweep();
+  assert.equal((agents.am9.commands || []).filter((c) => c.type === "mergePr").length, 1);
+});
+
+test("XERK-550: auto-merge gives up after too many attempts", async () => {
+  resetMerge();
+  await mergeBeat("am10", "am10.atlassian.net", {});
+  autoMergeState.set(PR1, { at: 0, attempts: 99 }); // already past the cap, backoff elapsed
+  autoMergeSweep();
+  assert.equal((agents.am10.commands || []).filter((c) => c.type === "mergePr").length, 0);
+  assert.equal(autoMergeState.get(PR1).gaveUp, true);
+});
+
+test("XERK-550: ingestMergeResults caches by cmdId and is stripped from the payload", async () => {
+  resetMerge();
+  await mergeBeat("am11", "am11.atlassian.net", {});
+  ingestMergeResults(agents.am11, [{ cmdId: "cX", url: PR1, ok: true }]);
+  assert.deepEqual(
+    { url: agents.am11.mergeResults.cX.url, ok: agents.am11.mergeResults.cX.ok },
+    { url: PR1, ok: true });
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  const rec = list.body.agents.find((a) => a.key === "am11");
+  assert.ok(!("mergeResults" in rec), "mergeResults leaked into /api/agents");
+});
+
+test("XERK-550: auto-close moves an all-merged ticket to Done AND kills the session", async () => {
+  resetMerge();
+  await mergeBeat("amC", "amc.atlassian.net", { state: "MERGED" });
+  autoCloseSweep();
+  const got = cmds("amC");
+  assert.ok(got.some(([t, , cat]) => t === "setTicketStatus" && cat === "done"),
+    `expected a Done write, got ${JSON.stringify(got)}`);
+  assert.ok(got.some(([t, sid]) => t === "kill" && sid === "sm1"),
+    `expected a kill, got ${JSON.stringify(got)}`);
+});
+
+test("XERK-550: auto-close is idempotent across repeated sweeps", async () => {
+  resetMerge();
+  await mergeBeat("amC2", "amc2.atlassian.net", { state: "MERGED" });
+  autoCloseSweep();
+  autoCloseSweep();
+  const got = cmds("amC2");
+  assert.equal(got.filter(([t]) => t === "setTicketStatus").length, 1);
+  assert.equal(got.filter(([t]) => t === "kill").length, 1);
+});
+
+test("XERK-550: auto-close waits until EVERY PR has landed", async () => {
+  resetMerge();
+  await mergeBeat("amC3", "amc3.atlassian.net", { prs: [
+    { url: PR1, state: "MERGED", ready: "ready", mergeable: "MERGEABLE" },
+    { url: "https://github.com/x/y/pull/2", state: "OPEN", ready: "ready", mergeable: "MERGEABLE" },
+  ] });
+  autoCloseSweep();
+  assert.equal((agents.amC3.commands || []).length, 0);
+});
+
+test("XERK-550: auto-close does nothing without an actually-merged PR (all CLOSED)", async () => {
+  resetMerge();
+  await mergeBeat("amC4", "amc4.atlassian.net", { state: "CLOSED" });
+  autoCloseSweep();
+  assert.equal((agents.amC4.commands || []).length, 0);
 });
 
 test("http: /api/agents does not serialize the jiraIssues cache (served only by /api/jira)", async () => {
