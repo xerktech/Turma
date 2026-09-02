@@ -28,6 +28,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `turma-board.md` | `turma/public/board.*` | Kanban, ticket panel, routing, auto-start/stop |
 | `turma-triage.md` | `turma/public/board.*`, `turma/server.js` | Triage lane, per-ticket verdicts, org triage policy, auto-start gate |
 | `turma-ticket-queue.md` | `turma/server.js`, `board.*` | hub ticket queue: admission, drain, expiries, caps |
+| `session-migration.md` | `hub-agent.py`, `server.js`, `sessions.html`, android `Sessions.kt` | moving a running session between agents (XERK-101); reporting a refused start (XERK-265) |
 | `board-ticket-view.md` | `server.js`, `hub-agent.py`, `board.js` + vendored copies, `Board.kt` | routing a ticket to a capable host; hub resolving a ticket as the board does |
 | `turma-sessions.md` | `turma/public/sessions.html`, `chat.js` | Sessions page, chat engine, live tail, composer, terminal |
 | `android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
@@ -120,59 +121,14 @@ One native agent per host, multiplexing sessions across every repo it scans. Age
   `_running_slugs` exclusion and the summary/date an archived transcript inherits.
 - Tests: `TestRootSessionIsolation`, `sessionTranscript` in `tunnel-agent.test.js`, `server.test.js`.
 
-### Migrating a session to another agent (XERK-101)
+### Migrating a session, and refused starts
 
-- **Moves a running session to another agent in the SAME org.** The conversation moves; committed
-  work rides git; uncommitted work stays on the source (KILLED, so resumable).
-- The hub can't touch a worktree and agents are outbound-only, so a migration is composed hub-side
-  from agent commands + a hub-brokered relay of the **RAW transcript bytes** (what `claude --resume`
-  needs and the archive lacks): `exportSession` packs the transcript (+ `subagents/`, truncated to its
-  last complete line) and POSTs the gzip-tar to `POST /api/agents/<host>/migrations/<id>/blob`,
-  queueing `importSession` on the target (recording `importCmdId`); the target reporting up
-  (`spawnCmdId` == `importCmdId`) makes `advanceMigrations` KILL the source and finish.
-- **Hosts may mount `REPOS_ROOT` at DIFFERENT paths**, so `import_session` first
-  `_localize_migrated_cwd`s the source's worktree path onto THIS host's `REPOS_ROOT` (the
-  `.turma/worktrees/<repo>/<dir>` tail is mount-independent). Without the remap a cross-mount move
-  wedges in `importing` forever.
-- The tar extract guards against `..`/absolute members — untrusted, it crosses a host boundary.
-- **A migrated session keeps its PR chips**, re-derived from the transcript rather than carried in the
-  command: the per-beat scan PRIMES a resumed transcript's byte offset to EOF, so `gh pr create`
-  events sit past it. `_resume_at_cwd` calls `_seed_prs` once at launch to scan the whole transcript,
-  keyed by the PRESERVED transcript id. Idempotent.
-- Blob relay is agent-authed; `POST .../sessions/<id>/migrate {host}` validates same-org + online +
-  repo-cloned + running/non-root/has-conversation, single-flight per session. State is in-memory; a
-  hub restart mid-move aborts it, leaving the source intact. **The target must already have the repo
-  cloned** (v1).
-- **The bundle NEVER rides in the hub's heap** (XERK-263): the relay spools it to `MIGRATE_SPOOL_DIR`
-  (`/data/migrations`) and streams it out; the record keeps only path/size. Every settle, timeout and
-  failure unlinks it, and boot sweeps the dir. `MIGRATE_INFLIGHT_MAX` bounds that burst — refused
-  where a move STARTS, since the agent's upload is best-effort with no retry.
-- Tests: `TestMigrateSession`, `server.test.js`, the Move cases in `sessions.test.js`,
-  `eligibleMoveTargets` in android `SessionsTest`.
-
-### A refused session start is REPORTED, never just logged (XERK-265)
-
-- **A command is ACKed whether the agent ran it or declined it**, so a refusal the agent only `log()`s
-  is indistinguishable from a slow spawn — the move sits in `importing` until `MIGRATE_TIMEOUT_MS`
-  with no reason.
-- Every refusal in `_resume_at_cwd`, `import_session` and `export_session` goes through
-  **`_refuse_start`**, staging `{cmdId, migrationId, error}` onto the beat's **`spawnFailures`**. The
-  `error` is operator-facing — it is what the UI and the migration record show.
-- Hub-side `ingestSpawnFailures` caches it per cmdId as **`spawnRefusals`** (served with the record,
-  NOT stripped like the other caches) and stamps `m.refusal`, which `advanceMigrations` applies
-  **after** its handoff check, so a success always wins the tie. Absent = "that agent can't tell",
-  i.e. the old timeout wait. The Sessions page mirrors that order: the session lookup runs first and
-  clears `pendingSpawn`.
-- **Both handles are checked against what the HUB knows, never taken on the agent's word** — the
-  migrationId against that move's own src/target, the cmdId against the queue that host was given.
-  All agents share one token, so unchecked either one lets any host fail another host's move.
-- **The reason is length-capped at both ends** (`SPAWN_FAILURE_REASON_MAX`, `SPAWN_FAILURE_ERROR_MAX`).
-  It interpolates exception text, and `spawnRefusals` is counted by `agentRecordSize` while the
-  ceiling check runs BEFORE the ingest: one unbounded reason lands, pushes the record past
-  `AGENT_RECORD_MAX`, then 413s every later beat from that host — including the sweeps.
-- A refusal with neither handle stays a log line: the id being rejected IS the correlation.
-- **Every refusal on a session-creating path must go through it**, including `resume()`'s — the prune
-  handshake (`_claim_worktree`, XERK-256) is ordinary timing, not operator error.
+- **Moving a running session between agents (XERK-101) and reporting a refused start on that path
+  (XERK-265) live in `.claude/rules/session-migration.md`** — they span agent + hub + Sessions page +
+  android, and that rule is scoped to every side. The invariants that OTHER root sections depend on:
+  a migrated session re-derives its PR chips from the transcript, not the command (see "Which
+  transcript is a session's"); and a refused start is surfaced through `spawnFailures`/`spawnRefusals`
+  rather than a bare `log()`, which the "hub refusal reaches the operator" contract below assumes.
 
 ## Cross-cutting contracts
 
