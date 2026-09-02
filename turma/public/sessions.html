@@ -57,8 +57,14 @@
   .sidebar h2 .count { color: var(--muted); font-weight: 400; }
   .s-list { display: flex; flex-direction: column; gap: 8px; }
 
-  /* Session card: the auto task name leads; the 5-digit id + repo sit small below. */
-  button.s-card {
+  /* Session card: the auto task name leads; the 5-digit id + repo sit small below.
+     The card is a <div> whose click target is a stretched, absolutely-positioned
+     .s-hit <button> painted BEHIND the content (XERK-553). That lets the PR chips
+     inside be real <a> links — interactive content a <button> ancestor may not
+     legally hold — while a click anywhere else falls through to .s-hit and selects
+     the card exactly as the old whole-card <button> did. */
+  .s-card {
+    position: relative;
     display: flex; align-items: flex-start; gap: 10px; width: 100%; text-align: left;
     /* Subtle, opaque org tint (XERK-142): --org (set inline on .s-card-wrap by
        orgTintStyle) mixed a little into --surface, so a session's org reads at a
@@ -67,22 +73,36 @@
     border: 1px solid var(--border); border-radius: var(--radius-md);
     padding: 10px 12px; cursor: pointer; font: inherit; color: var(--ink);
   }
-  button.s-card:hover:not(:disabled) { border-color: var(--accent); }
-  button.s-card:disabled { cursor: default; opacity: 0.6; }
+  /* The whole-card hit target: transparent, stretched over the card, painted behind
+     the content. The content passes its clicks through to it (pointer-events below). */
+  .s-hit {
+    position: absolute; inset: 0; z-index: 0; width: 100%;
+    margin: 0; padding: 0; border: 0; border-radius: inherit;
+    background: none; color: inherit; font: inherit; cursor: inherit;
+  }
+  /* The body sits above the hit so its links are hit-testable, but stays inert so a
+     click on its text still reaches the hit; the links (PR chips, XERK-553) opt back
+     in, so clicking one opens the PR instead of selecting the card. The dot is left
+     below the transparent hit, so a click on it still selects. */
+  .s-card > .body { position: relative; z-index: 1; pointer-events: none; }
+  .s-card > .body a { pointer-events: auto; }
+  /* An enabled hit highlights on hover; a disabled one (terminal offline) dims the
+     card and drops the affordance, as :hover:not(:disabled) / :disabled did before. */
+  .s-card:has(> .s-hit:not(:disabled)):hover { border-color: var(--accent); }
+  .s-card:has(> .s-hit:disabled) { opacity: 0.6; cursor: default; }
+  .s-hit:disabled { cursor: default; }
   /* Selected: a thicker accent border, but KEEP the org tint as the fill (XERK-142)
      rather than washing it to accent-soft — the org colour still has to read on the
      open card. box-sizing:border-box (app.css) means the 2px border adds no layout
      shift. Mirrors the Android selected card's 2dp border over the tint. */
   .s-card.cur { border-color: var(--accent); border-width: 2px; }
-  /* A queued session card is a static <div>, not a selecting <button> (no pane to
-     attach to yet), so it needs the card's flex layout spelled out here. It gets
-     a dashed border + amber dot to read as "about to start", distinct from both a
-     live card and a muted ended one. */
+  /* A queued session card carries no .s-hit (no pane to attach to yet), so it is not
+     clickable — cursor stays default, not the base card's pointer. A dashed border +
+     amber dot read it as "about to start", distinct from a live or a muted ended one.
+     The right padding clears its own Cancel trigger (it has no .s-hit for the shared
+     padding rule to key on). */
   .s-card.queued {
-    display: flex; align-items: flex-start; gap: 10px; width: 100%;
-    background: color-mix(in srgb, var(--org, var(--surface)) 12%, var(--surface));
-    border: 1px dashed var(--border);
-    border-radius: var(--radius-md); padding: 10px 72px 10px 12px; color: var(--ink);
+    border-style: dashed; padding-right: 72px; cursor: default;
   }
   .s-card.queued .dot { background: var(--warning); box-shadow: none; }
   .s-card-wrap > .s-dots { font-size: 11.5px; font-weight: 600; }
@@ -115,11 +135,12 @@
   .s-card .state-row .pr-badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 
   /* Per-card overflow menu (⋯ → Rename / Kill). The trigger and its popover are
-     SIBLINGS of button.s-card, absolutely positioned over its top-right corner —
-     the card is itself a <button>, and a nested button is invalid HTML the parser
-     hoists out. The card's right padding keeps its text clear of the trigger. */
+     SIBLINGS of .s-card, absolutely positioned over its top-right corner — a live/
+     ended card carries the stretched .s-hit button, and nesting the trigger inside it
+     would be a button inside a button. The card's right padding keeps text clear of
+     the trigger (only on cards that have a hit — a queued card sets its own). */
   .s-card-wrap { position: relative; }
-  .s-card-wrap button.s-card { padding-right: 36px; }
+  .s-card-wrap > .s-card:has(> .s-hit) { padding-right: 36px; }
   .s-dots {
     position: absolute; top: 5px; right: 5px; z-index: 2;
     background: none; border: 0; border-radius: 6px; cursor: pointer;
@@ -164,10 +185,10 @@
   /* Ended sessions (killed, or exited on their own): the same clickable card as
      a live session — clicking one opens its conversation read-only on the stage
      — with a Resume button as an absolutely-positioned SIBLING, exactly like the
-     live card's ⋯ trigger and for the same reason (the card is a <button>, and a
-     nested button is invalid HTML the parser hoists out). */
+     live card's ⋯ trigger and for the same reason (the card carries the stretched
+     .s-hit button, and nesting Resume in it would be a button inside a button). */
   .s-card.ended .dot { background: none; border: 1.5px solid var(--muted); box-sizing: border-box; }
-  .s-card-wrap.ended-wrap button.s-card { padding-right: 78px; }
+  .s-card-wrap.ended-wrap > .s-card { padding-right: 78px; }
   .s-resume {
     position: absolute; top: 7px; right: 6px; z-index: 2;
     font: inherit; font-size: 11.5px; font-weight: 600; padding: 4px 10px;
@@ -2154,8 +2175,8 @@ function activeCard({ a, s, live }) {
   const attachable = a.terminalOnline;
   const cur = s.id === currentId;
   // The ticket this session works, when it was started from the board. A plain
-  // span, not a link out to Jira: the whole card is a <button>, which can't
-  // legally hold one — the chat footer's chip is where the ticket is clickable.
+  // span, not a link out to Jira: the meta line is already dense, and the chat
+  // footer's chip is where the ticket links out.
   const ticket = s.ticket?.key ? ` · <span class="s-ticket">${esc(s.ticket.key)}</span>` : "";
   const meta = `<span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}${ticket}`;
   // A move in progress: show where it's going until the stage follows it over.
@@ -2163,9 +2184,11 @@ function activeCard({ a, s, live }) {
   const moving = mig
     ? `<div class="s-moving"><span class="spin"></span> Moving to ${esc(mig.targetHost)}…</div>` : "";
   return `<div class="s-card-wrap"${orgTintStyle(a)}>
-    <button class="s-card ${cur ? "cur" : ""}" ${attachable ? "" : "disabled"}
-        onclick="selectSession('${escJs(s.id)}')"
-        ${attachable ? "" : 'title="Terminal tunnel offline"'}>
+    <div class="s-card ${cur ? "cur" : ""}">
+      <button class="s-hit" ${attachable ? "" : "disabled"}
+          aria-label="${esc("Open session " + sessTitle(s))}"
+          onclick="selectSession('${escJs(s.id)}')"
+          ${attachable ? "" : 'title="Terminal tunnel offline"'}></button>
       <span class="dot ${live.kind}"></span>
       <span class="body">
         <div class="title">${esc(sessTitle(s))}</div>
@@ -2176,12 +2199,12 @@ function activeCard({ a, s, live }) {
             esc("Running on this host's self-hosted model, not the Claude subscription"
                 + (s.modelSourceAt ? ` — since ${new Date(s.modelSourceAt).toLocaleString()}` : ""))
           }">🏠 local</span>` : ""}
-          ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeHtml).join("")}</span>` : ""}
+          ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeLinkHtml).join("")}</span>` : ""}
         </div>
         ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
         ${moving}
       </span>
-    </button>
+    </div>
     <button class="s-dots ${menuOpenId === s.id ? "open" : ""}" title="Session actions"
         aria-label="Session actions" onclick="toggleCardMenu(event,'${escJs(s.id)}')">⋯</button>
     ${menuOpenId === s.id ? cardMenu(a, s) : ""}
@@ -2263,7 +2286,9 @@ function endedRow(e) {
     : (s.status === "error" ? "failed" : "stopped"))
     + (when ? " " + when : "");
   return `<div class="s-card-wrap ended-wrap"${orgTintStyle(a)}>
-    <button class="s-card ended ${cur ? "cur" : ""}" onclick="openEndedSession('${escJs(e.id)}')">
+    <div class="s-card ended ${cur ? "cur" : ""}">
+      <button class="s-hit" aria-label="${esc("Open session " + sessTitle(s))}"
+          onclick="openEndedSession('${escJs(e.id)}')"></button>
       <span class="dot"></span>
       <span class="body">
         <div class="title">${esc(sessTitle(s))}</div>
@@ -2273,11 +2298,11 @@ function endedRow(e) {
           ${s.modelSource === "local" ? `<span class="local-mark" title="${
             esc("Ran on this host's self-hosted model, not the Claude subscription")
           }">🏠 local</span>` : ""}
-          ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeHtml).join("")}</span>` : ""}
+          ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeLinkHtml).join("")}</span>` : ""}
         </div>
         ${s.status === "error" && s.errorMsg ? `<div class="err">${esc(s.errorMsg)}</div>` : ""}
       </span>
-    </button>
+    </div>
     <button class="s-resume" ${a.online && !resuming ? "" : "disabled"}
         ${a.online ? "" : 'title="Host offline"'}
         onclick="resumeEnded(event,'${escJs(e.id)}')">
@@ -3193,10 +3218,10 @@ function renderSearch() {
     </div>`).join("");
 }
 
-// Clickable PR pill for the STAGE. Identical to prBadgeHtml above but rendered
-// as a real <a>: that copy has to be an inert <span> because it lives inside the
-// session card's <button>, and this one doesn't — an ended session's PR is often
-// the whole reason you opened it, so it links out to GitHub.
+// Clickable PR pill: prBadgeHtml's inert <span> reworked into a real <a> that
+// links out to the PR. Used on the stage bar AND on the session cards (XERK-553) —
+// the cards drive the click through a stretched .s-hit button, so their content is
+// free to hold real links now, matching the Android app and every other surface.
 function prBadgeLinkHtml(pr) {
   const span = prBadgeHtml(pr);
   if (!span) return "";

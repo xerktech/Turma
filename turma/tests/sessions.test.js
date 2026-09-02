@@ -348,6 +348,12 @@ test("ready for review: question, open PR and a finished turn all qualify", () =
   assert.ok(r.includes("Waiting Task"), "a pending question is waiting on you");
   assert.ok(r.includes("Research Task"), "a finished turn with no PR still qualifies");
   assert.ok(r.includes("PR Task"), "an open PR qualifies");
+  // The PR chip on a live card is a real link out to the PR (XERK-553), not the
+  // inert span it used to be when the card was itself a <button>.
+  assert.match(r, /<a href="https:\/\/github\.com\/o\/r\/pull\/7"[^>]*class="pr-badge/,
+    "the live card's PR chip is a link");
+  assert.match(r, /<div class="s-card[^"]*">\s*<button class="s-hit"/,
+    "a live card is a <div> with a stretched hit button, not a <button>");
   // A question is the most urgent, so it leads the section (collect()'s ranking
   // survives the filter).
   assert.ok(r.indexOf("Waiting Task") < r.indexOf("Research Task"), "waiting leads the section");
@@ -1531,9 +1537,12 @@ test("an ended session's card carries Resume and its PR chips", () => {
   assert.match(e, /class="s-resume"/, "Resume button present");
   assert.match(e, /resumeEnded\(event,'33333'\)/);
   assert.ok(e.includes("#7 Merged"), "the PR state it reached still shows");
-  // The card is a <button>, so its chips must stay inert spans — a nested <a>
-  // is invalid HTML the parser hoists out of the button.
-  assert.ok(!/<a class="pr-badge/.test(e), "card chips are spans, not links");
+  // The card's click now rides a stretched .s-hit button, so its PR chips are real
+  // <a> links out to the PR (XERK-553), matching the Android app and the stage bar.
+  assert.match(e, /<a href="https:\/\/github\.com\/o\/r\/pull\/7"[^>]*class="pr-badge/,
+    "card PR chip is a link, not an inert span");
+  assert.match(e, /<div class="s-card ended[^"]*">\s*<button class="s-hit"/,
+    "the ended card is a <div> with a stretched hit button, not a <button>");
 });
 
 // --- Ended sessions: the durable channel -------------------------------------
