@@ -20156,6 +20156,21 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         self.assertEqual(seq, 9, "the counter is floored at the max restored stamp")
         write('{"offered": {}, "seq": "boom", "hwm": 1e400}')
         self.assertEqual(sm._load_archive_offered(), ({}, 0, 0), "bad scalars → 0")
+        # Deeply nested JSON raises RecursionError (a RuntimeError, NOT a
+        # ValueError) past the parser's depth limit; the file is session-writable
+        # and this runs in __init__, so it must degrade, not crash the host.
+        write("[" * 20000 + "]" * 20000)
+        self.assertEqual(sm._load_archive_offered(), ({}, 0, 0), "deep nesting must not raise")
+        # An oversized file is refused before it is parsed into memory.
+        write('{"offered": {"a": 1}}' + " " * (ha.ARCHIVE_OFFERED_MAX_BYTES + 1))
+        self.assertEqual(sm._load_archive_offered(), ({}, 0, 0), "oversize → empty")
+        # A FIFO at the path would block a plain open() in __init__ forever; the
+        # untrusted reader refuses it (O_NONBLOCK|O_NOFOLLOW + a regular-file check).
+        os.remove(ha.ARCHIVE_OFFERED_PATH)
+        os.mkfifo(ha.ARCHIVE_OFFERED_PATH)
+        self.addCleanup(lambda: os.path.exists(ha.ARCHIVE_OFFERED_PATH)
+                        and os.remove(ha.ARCHIVE_OFFERED_PATH))
+        self.assertEqual(sm._load_archive_offered(), ({}, 0, 0), "a FIFO is refused, not blocked on")
 
     def test_save_archive_offered_is_throttled_and_never_raises(self):
         sm = self.make_manager()

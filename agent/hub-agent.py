@@ -391,6 +391,10 @@ ARCHIVE_OFFERED_PATH = os.path.join(REGISTRY_DIR, "archive-offered.json")
 # a restart's lost progress to roughly one beat's rotation. Raise it on a host
 # past ARCHIVE_OFFERED_HARD_MAX where the map is large and the write is not free.
 ARCHIVE_OFFERED_SAVE_SEC = _env_float("ARCHIVE_OFFERED_SAVE_SEC", 15.0, minimum=0.0)
+# Ceiling on the persisted file's size (it is session-writable, so untrusted).
+# Generous: at the hard cap of 200k UUID-keyed stamps the legitimate file is
+# ~10 MB, so 32 MiB accepts every real map while still refusing an unbounded one.
+ARCHIVE_OFFERED_MAX_BYTES = 32 << 20
 ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read-ahead window per delta
 ARCHIVE_CHUNK_TIMEOUT_SEC = 15  # one rendered-delta POST
 ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
@@ -9031,7 +9035,14 @@ def _read_untrusted_json(path, max_bytes):
         if len(blob) > max_bytes:
             return None                   # never parse an unbounded file
         data = json.loads(blob)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # RecursionError (a RuntimeError, NOT a ValueError) is what json raises on
+        # a deeply-NESTED document, and the size cap above does not stop it — the
+        # interpreter's recursion limit trips at ~1k nested brackets, i.e. ~1 KB.
+        # Every caller reads a file under ~/.turma or the same-uid session
+        # registry, both session-writable, and all of them run on the heartbeat
+        # thread or in __init__ where an escape takes the whole agent down
+        # (agent-workflows.md documents this exact json.load trap).
         return None
     return data if isinstance(data, dict) else None
 
@@ -20843,17 +20854,18 @@ class SessionManager:
 
         Fully defensive and never raises — a missing, unreadable, or malformed
         file degrades to `({}, 0, 0)`, exactly the old empty-on-start behaviour,
-        which is why the file is safe to lose. INSERTION ORDER is load-bearing
-        (eviction pops the least-recently-offered = the oldest inserted), and
-        json preserves object order both ways. Values are ints; the same
-        `int()`/`OverflowError` care `_note_archive_known` documents applies —
-        `1e400`/`Infinity` is valid JSON reachable from a hand-edited file.
+        which is why the file is safe to lose. Read through `_read_untrusted_json`
+        because `~/.turma` is session-writable: it bounds the size, refuses a FIFO
+        (a plain `open()` of one would block __init__ FOREVER, before the agent
+        ever starts) or a symlink, and swallows the deeply-nested-JSON
+        `RecursionError` that `json.load` raises past the parser's depth limit.
+        INSERTION ORDER is load-bearing (eviction pops the least-recently-offered
+        = the oldest inserted), and json preserves object order both ways. Values
+        are ints; the same `int()`/`OverflowError` care `_note_archive_known`
+        documents applies — `1e400`/`Infinity` is valid JSON from a hand-edited
+        file.
         """
-        try:
-            with open(ARCHIVE_OFFERED_PATH) as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            return {}, 0, 0
+        data = _read_untrusted_json(ARCHIVE_OFFERED_PATH, ARCHIVE_OFFERED_MAX_BYTES)
         if not isinstance(data, dict):
             return {}, 0, 0
         offered = {}
