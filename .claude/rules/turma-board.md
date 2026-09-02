@@ -182,12 +182,20 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
   to the default branch with no human review, so it is a deliberate per-project trust decision.
   Independent of the auto-start switch (either can be on without the other).
 - **The eligibility gate is the SAME content gate auto-start uses** (`autoStartContentGate`: repo
-  present + not ignore-tier, triage actionable/not-held/not-duplicate, org policy). So it acts on
-  exactly the tickets the auto stream would start — the "bug class" — and **never on a
-  human-started feature session** (a feature ticket fails the org's triage type/policy). It is a
-  SEPARATE composition from `autoStartSweep`'s inline gates (their per-drop log lines differ); a
-  cross-check test pins the two agree. **Not scoped by whether the hub started the session** — the
-  triage gate is the scope.
+  present + not ignore-tier, triage actionable/not-held/not-duplicate/not-rejected, org policy), so
+  the class that auto-merges is exactly the class the auto stream would START. It is a SEPARATE
+  composition from `autoStartSweep`'s inline gates (their per-drop log lines differ); a cross-check
+  test pins the two agree.
+  - **The gate is CONTENT-only, not provenance.** It does NOT check who started the session, so a
+    ticket a human started a session on by hand is auto-merged too IF it passes the same gate. What
+    keeps FEATURES out is the org's triage policy (`excludeTypes`) — the very thing that limits
+    auto-start to bugs — NOT the type by itself: an actionable feature with no `excludeTypes` policy
+    is content-eligible for BOTH auto-start and auto-merge. **So auto-merge only means "bugs" in an
+    org whose triage policy already limits the auto stream to bugs; enabling it without that policy
+    auto-merges whatever auto-start would.** Do not describe it as "never merges a feature".
+  - **A Done ticket is excluded** (`statusCategory === "done"`): moving to Done is the abandon/stop
+    gesture (autoStopSweep kills the session), and autoStopSweep only QUEUES that kill, so the
+    session still reads running for a beat — the column, not the run state, stands the merge down.
 - Two sweeps on the 15s timer, both no-op unless an org opted in:
   - **`autoMergeSweep`** — for a **running, idle** eligible session (not `sessionWorking`, not blocked
     on a `question`/`panePrompt`), queue a **`mergePr`** command to the SESSION's host (it holds `gh`

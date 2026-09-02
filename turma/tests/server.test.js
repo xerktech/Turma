@@ -150,7 +150,18 @@ const hub = require("../server.js");
 // The dsh tests below flip it ON to exercise the retained machinery; this resets
 // it after EVERY test (runs even on a thrown assertion) so that ON state can
 // never leak into the non-dsh tests that surround them.
-test.afterEach(() => { hub.__setDshEnabled(false); hub.__setQwenEnabled(false); });
+test.afterEach(() => {
+  hub.__setDshEnabled(false);
+  hub.__setQwenEnabled(false);
+  // Release the XERK-550 auto-merge opt-in so server.js's LIVE 15s sweep
+  // interval (which runs autoMergeSweep/autoCloseSweep) idles outside the exact
+  // test that set it up — otherwise a populated map keeps those sweeps churning
+  // the global `agents` map during unrelated timing-sensitive tests later in the
+  // run (the control-WS liveness cases).
+  for (const k of Object.keys(autoMergeOrgs)) delete autoMergeOrgs[k];
+  autoMergeState.clear();
+  autoClosed.clear();
+});
 // notify() no-ops when no device is registered; register one so the alert tests
 // see the fan-out. Real fan-out/pruning is exercised separately below.
 hub.registerDevice("capture-device", "android", ["dismiss"]);
@@ -10976,6 +10987,48 @@ test("XERK-550: auto-close does nothing without an actually-merged PR (all CLOSE
   await mergeBeat("amC4", "amc4.atlassian.net", { state: "CLOSED" });
   autoCloseSweep();
   assert.equal((agents.amC4.commands || []).length, 0);
+});
+
+// --- regressions the QA pass caught (XERK-550) ---
+
+test("XERK-550: a ticket a human moved to Done is NOT auto-merged", async () => {
+  // autoStopSweep only QUEUES the kill, so the session still reads running this
+  // beat — the Done column, not the run state, must stand the merge down. Else a
+  // human's abandon/reject gesture would still land the PR on main.
+  resetMerge();
+  await mergeBeat("amD", "amd.atlassian.net", { statusCategory: "done" });
+  autoMergeSweep();
+  autoCloseSweep();
+  assert.equal((agents.amD.commands || []).filter((c) => c.type === "mergePr").length, 0);
+  assert.equal((agents.amD.commands || []).filter((c) => c.type === "setTicketStatus").length, 0);
+});
+
+test("XERK-550: a DRAFT PR is never auto-merged (would gaveUp forever)", async () => {
+  // _merge_ready calls a green+MERGEABLE DRAFT "ready", but gh refuses to merge a
+  // draft — which would mark it gaveUp permanently, excluding the session for
+  // good even after it marks the PR ready. Only OPEN PRs are merged.
+  resetMerge();
+  const draftUrl = "https://github.com/x/y/pull/990";  // unique: other tests' leftover sessions share PR1
+  await mergeBeat("amDr", "amdr.atlassian.net", { state: "DRAFT", ready: "ready", url: draftUrl });
+  autoMergeSweep();
+  assert.equal((agents.amDr.commands || []).filter((c) => c.type === "mergePr").length, 0);
+  assert.equal(autoMergeState.has(draftUrl), false);  // not even attempted
+});
+
+test("XERK-550: auto-close does NOT kill when the Done write cannot be dispatched", async () => {
+  // No board-cred host can take the setTicketStatus (here: the only host is too
+  // old for it). Killing anyway would orphan the ticket In Progress with a merged
+  // PR and no session, forever. So stand down and retry — never kill.
+  resetMerge();
+  await mergeBeat("amO", "amo.atlassian.net", { state: "MERGED" });
+  agents.amO.unsupported = { setTicketStatus: Date.now() };  // agentGapError -> truthy
+  autoCloseSweep();
+  assert.equal((agents.amO.commands || []).length, 0, "must neither write Done nor kill");
+  // Once the host can write again, it closes + kills.
+  delete agents.amO.unsupported;
+  autoCloseSweep();
+  const types = (agents.amO.commands || []).map((c) => c.type).sort();
+  assert.deepEqual(types, ["kill", "setTicketStatus"]);
 });
 
 test("http: /api/agents does not serialize the jiraIssues cache (served only by /api/jira)", async () => {

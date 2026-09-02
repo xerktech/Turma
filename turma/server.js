@@ -9085,6 +9085,13 @@ function autoMergeSession(s, byKey, rows) {
   if (!autoMergeOrgs[siteKey]) return null;
   const row = byKey.get(siteKey + "\x00" + t.key);
   if (!row) return null;                    // the board doesn't list it (yet)
+  // A ticket a HUMAN moved to Done is a "stop / abandon this work" gesture
+  // (autoStopSweep kills its session): never merge its PR. autoStopSweep only
+  // QUEUES the kill, so the session still reads running for a beat or two — the
+  // column, not the session status, is what tells us to stand down. (autoClose
+  // reaches Done only THROUGH this gate, so it never needs to act on an
+  // already-Done ticket either.)
+  if (row.statusCategory === "done") return null;
   const repo = ticketRepo(siteKey, t.key, rows);
   if (autoStartContentGate(siteKey, row, repo)) return null;
   return { siteKey, key: t.key, row, repo };
@@ -9139,6 +9146,13 @@ function autoMergeSweep() {
       if (agentGapError(a, "mergePr", "merge a pull request")) continue;
       for (const p of s.prs || []) {
         if (!p || !p.url || prLanded(p)) continue;
+        // Only an OPEN PR can be merged. `_merge_ready` returns "ready" for a
+        // DRAFT whose CI is green + MERGEABLE, but `gh pr merge` refuses a draft
+        // — which would stage an ok:false and mark the PR gaveUp FOREVER, so a
+        // session that opened a draft would be silently excluded even after it
+        // marks the PR ready. Exclude DRAFT here (prLanded already drops
+        // MERGED/CLOSED).
+        if (String((p.state || "")).toUpperCase() !== "OPEN") continue;
         if (p.ready !== "ready") continue;           // green CI + MERGEABLE + no conflict
         if (mergePrInFlight(a, p.url)) continue;
         const st = autoMergeState.get(p.url);
@@ -9197,14 +9211,20 @@ function autoCloseSweep() {
       if (!prs.length || !prs.every(prLanded)) continue;
       if (!prs.some((p) => String((p && p.state) || "").toUpperCase() === "MERGED")) continue;
       const tkey = elig.siteKey + "\x00" + elig.key;
-      if (elig.row.statusCategory !== "done" && !autoClosed.has(tkey)) {
+      // The Done write must be QUEUED before the kill — killing a session whose
+      // ticket we can't move to Done orphans it (In Progress, merged PR, no
+      // session, forever, since the killed session then leaves the sweep). So if
+      // no board-cred host can take the write (none reports the org, or every one
+      // is too old for setTicketStatus), stand down this beat and retry — never
+      // kill. Once `autoClosed` holds the ticket the write is on its way (this
+      // beat or a prior one), so the kill is safe.
+      if (!autoClosed.has(tkey)) {
         const wh = pickBoardWriteHost(elig.siteKey, "setTicketStatus");
-        if (wh && !agentGapError(agents[wh], "setTicketStatus", "close a ticket")) {
-          const cmdId = queueCommand(wh, { type: "setTicketStatus", issueKey: elig.key, category: "done" });
-          awaitResult(agents[wh], cmdId, "setTicketStatus");
-          rememberCmdHost(cmdId, wh, "setTicketStatus");
-          autoClosed.add(tkey);
-        }
+        if (!wh || agentGapError(agents[wh], "setTicketStatus", "close a ticket")) continue;
+        const cmdId = queueCommand(wh, { type: "setTicketStatus", issueKey: elig.key, category: "done" });
+        awaitResult(agents[wh], cmdId, "setTicketStatus");
+        rememberCmdHost(cmdId, wh, "setTicketStatus");
+        autoClosed.add(tkey);
       }
       const dk = host + "\x00" + s.id;
       if (!autoStopped.has(dk)) {
