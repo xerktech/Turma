@@ -2121,6 +2121,13 @@ test("http: past the heartbeat cap the hub still ANSWERS (413), never a bare res
   assert.ok(res.body.limit > 0, "the agent needs the limit to resize against");
 });
 
+// XERK-291 hardens the PRODUCTION side of the race XERK-313 sized the tests
+// around: the drained 413 is now answered at the body's `end` (never mid-stream)
+// and the drain slot is released on settle, so an honest over-cap beat gets its
+// status even at the drain-window boundary and under a concurrent refusal flood
+// — see tests/drain-slot.test.js (the slot-leak regression) and the PR's
+// real-container flood. The deterministic-sizing above stays as belt-and-braces.
+
 test("http: a heartbeat whose device is not a plain host name is refused, not silently dropped", async () => {
   // `__proto__` 200'd while the beat was discarded AND the registry's prototype
   // was replaced; an object key landed as "[object Object]".

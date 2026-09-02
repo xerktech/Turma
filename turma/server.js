@@ -6415,6 +6415,15 @@ function readBody(req, cap = BODY_MAX, costPerByte = BODY_PARSE_COST) {
     // cost the hub the very read time the budget exists to avoid spending.
     let drainLimit = cap + RAW_BODY_DRAIN_SLACK;
     const release = () => { releaseBody(held, lane); held = 0; lane = null; };
+    // Releases the drain slot claimed in refuse(). Called on EVERY settle path
+    // (reject/resolve) AND on `close` — not `close` alone: a refused body that
+    // PAUSES (budget, or a size refusal past the concurrency cap) is closed by
+    // the route destroying the socket, and that paused request's `close` does
+    // not reliably fire, so a slot claimed for it would leak until restart and
+    // wedge `drainingNow` at DRAIN_CONCURRENCY_MAX — after which every over-cap
+    // body takes the no-drain path and resets, defeating XERK-291's own fix
+    // under concurrent load. Idempotent (guarded by `draining`), so the settle
+    // call and the `close` backstop can both run.
     const endDrain = () => { if (draining) { draining = false; drainingNow--; } };
     // Armed only while this read holds budget, and reset by every chunk: a slow
     // client keeps sending and is never touched; an abandoned one is.
@@ -6450,6 +6459,10 @@ function readBody(req, cap = BODY_MAX, costPerByte = BODY_PARSE_COST) {
       if (idleTimer.unref) idleTimer.unref();
     };
     req.on("close", () => { endDrain(); disarmIdle(); });
+    // A drainable SIZE refusal holds its BodyTooLarge here and defers the reject
+    // (and thus the route's 413) until the body has finished arriving — see the
+    // refuse() comment below. Budget/no-drain refusals reject at once.
+    let pendingTooLarge = null;
     const refuse = (err, from = cap) => {
       over = true;
       data = ""; // release it — it is not going to be used
@@ -6471,10 +6484,23 @@ function readBody(req, cap = BODY_MAX, costPerByte = BODY_PARSE_COST) {
       // even "destroy on the first chunk" costs a chunk per socket, and 256 of
       // those OOM-killed the hub with not one body being buffered. Paused, the
       // bytes stop at the kernel's socket buffer and TCP backpressure tells the
-      // client to stop; the 503 already queued still flushes, and Node closes
-      // the connection once it has.
-      if (err.budgetExceeded || err.noDrain) req.pause();
-      reject(err);
+      // client to stop; the 503 already queued still flushes, and the route
+      // closes the connection once it has. A no-drain size refusal (past the
+      // concurrency cap) is the same: read nothing more, answer now, close.
+      // endDrain() here (not just on `close`) releases the slot this paused
+      // request claimed above, whose `close` may never fire (see endDrain).
+      if (err.budgetExceeded || err.noDrain) { endDrain(); req.pause(); reject(err); return; }
+      // A drainable OVERSIZE body keeps reading, but the 413 is DEFERRED to the
+      // body's `end` rather than sent from here. A client streaming a large body
+      // writes it in FULL before it reads (python urllib, which is what the
+      // agents post with); answering mid-stream and then closing the connection
+      // reaches it as a bare ECONNRESET, not the 413 it must resize against —
+      // the very socket-hang-up draining was added to prevent (XERK-235),
+      // resurfacing as a race under CPU load (XERK-291). Draining to `end` first
+      // means the client has finished writing before the status goes out and no
+      // unread bytes remain to force a reset when the socket closes. The drain
+      // slack bounds an honest overshoot; a flood past drainLimit is cut below.
+      pendingTooLarge = err;
     };
 
     const declared = Number(req.headers["content-length"]);
@@ -6509,7 +6535,17 @@ function readBody(req, cap = BODY_MAX, costPerByte = BODY_PARSE_COST) {
     req.on("data", (c) => {
       len += c.length;
       if (over) {
-        if (len > drainLimit) req.destroy();
+        // Past the drain window the courtesy is what is killing the hub: give up
+        // on delivering the deferred 413 cleanly, raise it now with `noDrain` so
+        // the route answers and closes (a reset the flooder retries beats
+        // reading a runaway body forever). Fires once — pendingTooLarge nulls.
+        if (len > drainLimit && pendingTooLarge) {
+          pendingTooLarge.noDrain = true;
+          endDrain();
+          req.pause();
+          reject(pendingTooLarge);
+          pendingTooLarge = null;
+        }
         return;
       }
       if (len > cap) return refuse(new BodyTooLarge(cap));
@@ -6536,17 +6572,30 @@ function readBody(req, cap = BODY_MAX, costPerByte = BODY_PARSE_COST) {
       }
       data += c;
     });
-    req.on("end", () => { if (!over) { disarmIdle(); release(); resolve(data); } });
-    req.on("error", (e) => { disarmIdle(); release(); reject(e); });
+    req.on("end", () => {
+      // Body fully arrived. A deferred size refusal answers NOW — the client has
+      // finished writing and is waiting to read, so the 413 goes out on a quiet
+      // connection that closes cleanly (XERK-291). endDrain() releases the slot
+      // the drain held from refuse() to here.
+      if (over) { if (pendingTooLarge) { endDrain(); reject(pendingTooLarge); pendingTooLarge = null; } return; }
+      endDrain(); disarmIdle(); release(); resolve(data);
+    });
+    req.on("error", (e) => { endDrain(); disarmIdle(); release(); reject(e); });
   });
 }
 
-// How much past `cap` readRawBody keeps draining before it gives up on saying
-// anything and cuts the socket. Draining is what lets the route answer 413 on
-// the same connection — destroying it mid-body reaches the client as a socket
-// hang up, and "the network broke" is the wrong thing to tell someone whose
-// file was simply too big (XERK-234).
-const RAW_BODY_DRAIN_SLACK = 1 << 20; // 1 MiB
+// How much past `cap` the body readers keep draining before they give up on
+// saying anything and cut the socket. Draining is what lets a refused body's
+// 413 reach the client on the same connection instead of a socket hang up, and
+// "the network broke" is the wrong thing to tell someone whose file was simply
+// too big (XERK-234). An honest overshoot within this window drains to `end` and
+// the 413 is answered there, cleanly (XERK-291); only a body PAST it is cut. So
+// it must clear a realistic honest overshoot — an agent whose one beat outgrew
+// HEARTBEAT_MAX and must read the 413 to resize — with margin over the 1 MiB
+// that left the repro landing exactly on the old boundary. Raising it only lets
+// each of at most DRAIN_CONCURRENCY_MAX drains read a little further before the
+// cut; the bytes are discarded as they arrive, never buffered.
+const RAW_BODY_DRAIN_SLACK = 4 << 20; // 4 MiB
 // How many refused bodies may be draining at once. Draining is unbuffered, but
 // it is not free: Node allocates for every read it hands us, and 256 sockets
 // each streaming past an oversize refusal out-allocated the collector and
@@ -6646,6 +6695,8 @@ function readRawBody(req, cap) {
     let draining = false;
     let drainLimit = cap + RAW_BODY_DRAIN_SLACK;
     const release = () => { releaseBody(held, lane); held = 0; lane = null; };
+    // Released on every settle path AND on `close` — mirrors readBody's endDrain
+    // (see there for why `close` alone leaks a paused refusal's drain slot).
     const endDrain = () => { if (draining) { draining = false; drainingNow--; } };
     // Armed only while this read holds budget, and reset by every chunk: a slow
     // client keeps sending and is never touched; an abandoned one is.
@@ -6681,6 +6732,8 @@ function readRawBody(req, cap) {
       if (idleTimer.unref) idleTimer.unref();
     };
     req.on("close", () => { endDrain(); disarmIdle(); });
+    // Mirrors readBody: a drainable SIZE refusal defers its reject to `end`.
+    let pendingTooLarge = null;
     const refuse = (err, from = cap) => {
       over = true;
       chunks = []; // release what we'd buffered — it is not going to be used
@@ -6702,10 +6755,15 @@ function readRawBody(req, cap) {
       // even "destroy on the first chunk" costs a chunk per socket, and 256 of
       // those OOM-killed the hub with not one body being buffered. Paused, the
       // bytes stop at the kernel's socket buffer and TCP backpressure tells the
-      // client to stop; the 503 already queued still flushes, and Node closes
-      // the connection once it has.
-      if (err.budgetExceeded || err.noDrain) req.pause();
-      reject(err);
+      // client to stop; the 503 already queued still flushes, and the route
+      // closes the connection once it has. endDrain() releases the slot this
+      // paused request claimed, whose `close` may never fire (see endDrain).
+      if (err.budgetExceeded || err.noDrain) { endDrain(); req.pause(); reject(err); return; }
+      // A drainable OVERSIZE body defers the 413 to `end` so the client (which
+      // streams its whole body before reading) has finished writing before the
+      // status goes out — a mid-stream answer + close reaches it as a bare
+      // ECONNRESET, not the 413 (XERK-291, and see readBody's refuse).
+      pendingTooLarge = err;
     };
 
     // Same rule readBody follows: checked against the budget, charged to nothing,
@@ -6718,8 +6776,16 @@ function readRawBody(req, cap) {
       len += c.length;
       if (over) {
         // Still coming after we've said no: read and throw it away up to a
-        // point, then stop paying for a client that won't.
-        if (len > drainLimit) req.destroy();
+        // point, then give up on the deferred 413 and answer now with `noDrain`
+        // so the route closes — a reset the flooder retries beats reading a
+        // runaway body forever. Fires once (pendingTooLarge nulls).
+        if (len > drainLimit && pendingTooLarge) {
+          pendingTooLarge.noDrain = true;
+          endDrain();
+          req.pause();
+          reject(pendingTooLarge);
+          pendingTooLarge = null;
+        }
         return;
       }
       // BodyTooLarge, like readBody (and spoolRawBody): callers test `.tooLarge`
@@ -6747,8 +6813,13 @@ function readRawBody(req, cap) {
       }
       chunks.push(c);
     });
-    req.on("end", () => { if (!over) { disarmIdle(); release(); resolve(Buffer.concat(chunks)); } });
-    req.on("error", (e) => { disarmIdle(); release(); reject(e); });
+    req.on("end", () => {
+      // Body fully arrived: a deferred size refusal answers now, on a quiet
+      // connection the client is waiting to read (XERK-291).
+      if (over) { if (pendingTooLarge) { endDrain(); reject(pendingTooLarge); pendingTooLarge = null; } return; }
+      endDrain(); disarmIdle(); release(); resolve(Buffer.concat(chunks));
+    });
+    req.on("error", (e) => { endDrain(); disarmIdle(); release(); reject(e); });
   });
 }
 
@@ -13433,6 +13504,9 @@ if (process.env.TURMA_TEST) {
     HEARTBEAT_MAX, HEARTBEAT_PARSE_COST,
     DRAIN_CONCURRENCY_MAX, RAW_BODY_DRAIN_SLACK, BODY_IDLE_TIMEOUT_MS, BODY_MIN_PROGRESS_BYTES,
     BIG_LANE_MAX_HOLD_MS, budgetUnderPressure,
+    // XERK-291: the live drain-slot count, so a test can pin that refused bodies
+    // (budget-refused ones especially) release their slot instead of leaking it.
+    get drainingNow() { return drainingNow; },
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,

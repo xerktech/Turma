@@ -95,6 +95,22 @@ with `restart: unless-stopped`
   (`endRefusedConnection`, after `finish`).
 - **A refused body must be CLOSED, not paused** — Node dumps (reads) an unread body when the response
   finishes to keep the connection alive, so a pause still reads the whole thing into memory.
+- **A drainable SIZE (413) refusal DEFERS its response to the body's `end`, never mid-stream**
+  (XERK-291). A client that streams a large body writes it in FULL before it reads (python urllib,
+  which the agents post with); answering at `cap` and then closing reaches it as a bare ECONNRESET,
+  not the 413 it must resize against — the exact XERK-235 hang-up, back as a race under CPU load.
+  Draining to `end` first means the client has finished writing and no unread bytes remain to force
+  an RST on close. `RAW_BODY_DRAIN_SLACK` (4 MiB) must clear a realistic honest overshoot so it
+  drains fully rather than being cut. A BUDGET (503) refusal still answers at once — it cannot drain
+  (out of the very resource draining costs), so a mid-write client may still see a reset there, by
+  design; the agent retries on 503-or-reset alike.
+- **The drain slot (`drainingNow`) is released on every SETTLE path, not on `close` alone**
+  (XERK-291). A refused body that PAUSES (budget, or a size refusal past the concurrency cap) is
+  closed by the route destroying the socket, and that paused request's `close` does not reliably
+  fire — so a slot released only on `close` LEAKS, wedging `drainingNow` at the cap for the life of
+  the process, after which every over-cap body takes the no-drain path and resets. `endDrain()` runs
+  on reject/resolve/drain-cut/error too (idempotent, `close` stays a backstop). Tests:
+  `drain-slot.test.js` (own process, small budget so beats are budget-refused).
 
 ## Per-route ceilings
 
