@@ -27,8 +27,9 @@ ticket panel). Read this before touching `findTicketHost`, the `/session` routes
   pinned agent gone) still answers status + `{error}`; `{full:true}` is what tells the two apart. A
   pinned-but-full host is waited for, never routed around.
 - Entry: `{siteKey, issueKey, source, at, reason, error, blockedSince, unknownSince, expiredAt}`.
-  `reason` is why it's STILL waiting — `capacity` (self-clears) or `blocked` (operator clears it,
-  wording in `error`).
+  `reason` is why it's STILL waiting — `capacity` and `paused` (XERK-555: every host that could run
+  it has its Claude 5-hour usage limit maxed) both self-clear; `blocked` needs the operator; `rate`
+  is the org's auto-start window; wording in `error` for the two that carry one (`paused`, `blocked`).
 - **`ticketQueueAdmission` validates the key** (`isIssueKey` + `TICKET_KEY_MAX`, bounded `siteKey`)
   — the sweep path's fields come straight off an agent's `jira` block, and Android TYPES `issueKey`
   atomically, so an object/20k key from one host would break every phone's decode fleet-wide. Also

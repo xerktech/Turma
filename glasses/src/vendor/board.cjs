@@ -667,7 +667,9 @@
   // org's line, so it is only worth printing past the first. A "blocked" hold
   // means the queue can't route it for a reason the operator has to clear (no
   // triaged repo, a pinned agent that's offline) rather than one that clears
-  // itself — same text either way, but it says which.
+  // itself — same text either way, but it says which. A "paused" hold (XERK-555)
+  // is self-clearing like capacity: every host that could run it has its Claude
+  // 5-hour usage limit maxed, so it starts on its own when the window resets.
   function queuedLabel(q) {
     if (!q) return "";
     // Terminal: it waited as long as the hub allows and gave up. Said out loud,
@@ -675,6 +677,7 @@
     // it — the ✕ beside this dismisses the note.
     if (q.reason === "expired") return "⌛ gave up waiting";
     if (q.reason === "blocked") return "⏳ queued · blocked";
+    if (q.reason === "paused") return "⏳ queued · usage paused";
     if (q.reason === "rate") return "⏳ queued · rate-limited";
     return "⏳ queued" + (q.position > 1 ? " · #" + q.position : "");
   }
@@ -686,6 +689,9 @@
     }
     if (q.reason === "blocked") {
       return `${issueKey} is waiting: ${q.error || "the hub can't route it right now"}`;
+    }
+    if (q.reason === "paused") {
+      return `${issueKey} is waiting: ${q.error || "every host that can run it has its Claude 5-hour usage limit maxed — it starts when the window resets"}`;
     }
     if (q.reason === "rate") {
       return `${issueKey} is waiting: the org's auto-start rate limit is full — it starts when the window frees a slot`;
