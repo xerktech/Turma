@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createInitialState, newSessionState, type AppState } from "./app.ts";
-import { render, sessionContentLines, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
+import { render, sessionContentLines, sessionTranscriptArea, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
 import { charMeasure, setDefaultMeasure, type Measure } from "./text-wrap.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
@@ -211,6 +211,51 @@ describe("render: session", () => {
     expect(model.transcriptLines[0]).toBe("» hi");
     expect(model.transcriptLines.some((l) => l.includes("host-a"))).toBe(false);
     expect(model.bottom.mode).toBe("input");
+  });
+
+  it("pins a sticky live-tail refusal atop the focused session's transcript (XERK-335)", () => {
+    const state = base({
+      screen: "session",
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+      liveRefusal: { sessionId: "s1", message: "wrong hub password" },
+    });
+
+    const model = asSession(render(state));
+
+    // The hub's own words sit above the transcript content, not strobed as a flash.
+    expect(model.transcriptLines[0]).toBe("✗ wrong hub password");
+    expect(model.transcriptLines).toContain("» hi");
+  });
+
+  it("ignores a refusal pinned to a different session", () => {
+    const state = base({
+      screen: "session",
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+      liveRefusal: { sessionId: "s2", message: "stale from another session" },
+    });
+
+    const model = asSession(render(state));
+
+    expect(model.transcriptLines.some((l) => l.includes("stale"))).toBe(false);
+    expect(model.transcriptLines[0]).toBe("» hi");
+  });
+
+  it("folds the sticky refusal line into the scroll area so it stays in sync with the render window (XERK-335)", () => {
+    const sess = newSessionState("host-a", "s1");
+    const transcripts = { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } };
+    const without = base({ screen: "session", session: sess, transcripts });
+    const withRefusal = base({
+      screen: "session",
+      session: sess,
+      transcripts,
+      liveRefusal: { sessionId: "s1", message: "wrong hub password" }, // one wrapped line
+    });
+
+    // The persistent sticky line eats exactly one row from the scrollable area,
+    // so app.ts's offset clamp matches what renderSession actually windows.
+    expect(sessionTranscriptArea(withRefusal, sess)).toBe(sessionTranscriptArea(without, sess) - 1);
   });
 
   it("shows a sheet-mode bottom bar with numbered options and a Dictate answer row when a question is pending", () => {

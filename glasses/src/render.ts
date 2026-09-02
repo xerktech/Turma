@@ -363,12 +363,26 @@ export function boxLineCount(bottom: BottomModel): number {
   return bottom.mode === "menu" ? Math.max(1, bottom.lines.length) : bottomBoxLines(bottom.lines);
 }
 
+// The sticky live-tail refusal line(s) pinned atop this session's transcript,
+// or [] when the focused session's tail hasn't been refused (XERK-335). Unlike
+// the transient flash, this is persistent, so it must be reflected in the
+// scroll-offset math too (see sessionTranscriptArea) — otherwise the transcript
+// could scroll a line or two past what's actually visible.
+function sessionRefusalLines(state: AppState, sess: SessionScreenState): string[] {
+  const refusal = state.liveRefusal?.sessionId === sess.sessionId ? state.liveRefusal.message : null;
+  return refusal ? wrap(`✗ ${refusal}`) : [];
+}
+
 // The transcript's visible line-count for a given session — the bottom box
-// (input or sheet) grows/shrinks with its content, so app.ts's scroll-offset
-// math needs this exact figure to stay in sync with what renderSession
-// actually windows. Shared rather than duplicated so the two never drift.
+// (input or sheet) grows/shrinks with its content, and a sticky refusal line
+// eats into it, so app.ts's scroll-offset math needs this exact figure to stay
+// in sync with what renderSession actually windows. Shared rather than
+// duplicated so the two never drift. (The transient flash is deliberately NOT
+// subtracted here — it comes and goes on a 4s timer, so folding it into the
+// scroll area would make the transcript jump under a scrolled reader.)
 export function sessionTranscriptArea(state: AppState, sess: SessionScreenState): number {
-  return DISPLAY_LINES - bottomBoxLines(renderSessionBottom(state, sess).lines);
+  const sticky = sessionRefusalLines(state, sess).length;
+  return Math.max(1, DISPLAY_LINES - bottomBoxLines(renderSessionBottom(state, sess).lines) - sticky);
 }
 
 function renderSession(state: AppState): ScreenModel {
@@ -398,12 +412,17 @@ function renderSession(state: AppState): ScreenModel {
   // borrowing from the content window the same way a header line would.
   const flash = activeFlash(state);
   const flashLines = flash ? wrap(flash) : [];
-  const area = Math.max(1, DISPLAY_LINES - bottomBoxLines(bottom.lines) - flashLines.length);
+  // A terminal live-tail refusal (XERK-335) is STICKY, not a 4s flash: the tail
+  // won't recover on its own (a wrong hub password 401s every reconnect), so its
+  // reason stays pinned atop the transcript — below any transient flash — until
+  // the wearer leaves the session. The poll keeps the content below it current.
+  const stickyLines = [...flashLines, ...sessionRefusalLines(state, sess)];
+  const area = Math.max(1, DISPLAY_LINES - bottomBoxLines(bottom.lines) - stickyLines.length);
   const maxOffset = Math.max(0, content.length - area);
   const offset = Math.min(sess.offset, maxOffset);
   const end = content.length - offset;
   const start = Math.max(0, end - area);
-  const transcriptLines = [...flashLines, ...content.slice(start, end)];
+  const transcriptLines = [...stickyLines, ...content.slice(start, end)];
 
   return { type: "session", transcriptLines, bottom };
 }

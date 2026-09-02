@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { buildLiveWsUrl, LiveTail, NoopLiveTail, type LiveTailOptions } from "./live.ts";
+import { buildLiveWsUrl, LiveTail, NoopLiveTail, type LiveEvent, type LiveTailOptions } from "./live.ts";
 import type { WebSocketEvent, WebSocketEventName, WebSocketLike } from "./audio.ts";
 import type { TailEntry } from "./types.ts";
 
@@ -209,13 +209,76 @@ describe("LiveTail", () => {
 
   it("a ws-token fetch failure schedules a reconnect (poll keeps working)", async () => {
     const wsToken = vi.fn(async () => {
-      throw new Error("nope");
+      throw new Error("nope"); // a transport failure — no .status
     });
     const { lt, sched } = makeLiveTail({ hubClient: { wsToken } });
-    lt.start("h", "s", () => {});
+    const events: LiveEvent[] = [];
+    lt.start("h", "s", (ev) => events.push(ev));
     await flush();
     expect(FakeSocket.instances.length).toBe(0);
-    expect(sched.count()).toBe(1);
+    expect(sched.count()).toBe(1); // a transport failure IS retried
+    expect(events).toEqual([]); // and is NOT surfaced as a refusal
+  });
+
+  it("a ws-token REFUSAL surfaces once and does not spin (XERK-335)", async () => {
+    // A wrong hub password 401s the ws-token fetch on every attempt. The old
+    // catch dropped the error and rescheduled forever — a silent infinite loop
+    // that looked exactly like a dead network. It must instead surface the hub's
+    // own words once and stop retrying (the 6s poll still keeps the session live
+    // enough to read).
+    const wsToken = vi.fn(async () => {
+      throw Object.assign(new Error("wrong hub password"), { status: 401 });
+    });
+    const { lt, sched } = makeLiveTail({ hubClient: { wsToken } });
+    const events: LiveEvent[] = [];
+    lt.start("h", "s", (ev) => events.push(ev));
+    await flush();
+    expect(events).toEqual([{ type: "refused", message: "wrong hub password" }]); // surfaced once
+    expect(sched.count()).toBe(0); // no reconnect scheduled — it will not spin
+    expect(FakeSocket.instances.length).toBe(0); // never opened a socket
+    // Even if the poll grace timers fire, nothing re-attempts the doomed fetch.
+    sched.fireAll();
+    await flush();
+    expect(wsToken).toHaveBeenCalledTimes(1);
+    expect(events).toHaveLength(1); // still exactly one refusal, no strobe
+  });
+
+  it("a refusal from a superseded fetch never leaks onto the session that replaced it (XERK-335 generation guard)", async () => {
+    // The dangerous race the guard exists for: s1's ws-token fetch is still in
+    // flight when the wearer SWITCHES to s2. Without the generation check, s1's
+    // 401 would fire against the (now s2) listener and paint s2 with a refusal
+    // that isn't its own. A plain stop() would null the listener and hide this,
+    // so the switch case is what must be tested.
+    const rejects: ((e: unknown) => void)[] = [];
+    const wsToken = vi.fn(
+      () => new Promise<{ token: string; expiresInSec: number }>((_r, rj) => { rejects.push(rj); })
+    );
+    const { lt, sched } = makeLiveTail({ hubClient: { wsToken } });
+    const s1: LiveEvent[] = [];
+    const s2: LiveEvent[] = [];
+    lt.start("h", "s1", (ev) => s1.push(ev));
+    await flush();
+    lt.start("h", "s2", (ev) => s2.push(ev)); // switch before s1's fetch settles
+    await flush();
+    rejects[0]!(Object.assign(new Error("wrong hub password"), { status: 401 })); // s1's doomed fetch
+    await flush();
+    expect(s2).toEqual([]); // the refusal does NOT leak onto s2
+    expect(s1).toEqual([]); // and s1's own listener is gone
+    expect(sched.count()).toBe(0);
+  });
+
+  it("a refusal after stop() is dropped (listener gone)", async () => {
+    let reject!: (e: unknown) => void;
+    const wsToken = vi.fn(() => new Promise<{ token: string; expiresInSec: number }>((_r, rj) => { reject = rj; }));
+    const { lt, sched } = makeLiveTail({ hubClient: { wsToken } });
+    const events: LiveEvent[] = [];
+    lt.start("h", "s", (ev) => events.push(ev));
+    await flush();
+    lt.stop();
+    reject(Object.assign(new Error("wrong hub password"), { status: 401 }));
+    await flush();
+    expect(events).toEqual([]); // superseded — nothing surfaced
+    expect(sched.count()).toBe(0);
   });
 
   it("reuses the cached ws-token across a reconnect (no refetch)", async () => {
