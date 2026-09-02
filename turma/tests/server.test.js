@@ -10852,12 +10852,16 @@ const resetMerge = () => {
 // PR — the state the hub acts on.
 const mergeBeat = async (device, site, {
   autoMerge = true, ready = "ready", state = "OPEN", mergeable = "MERGEABLE",
-  paneBusy = false, ticketType = "bug", statusCategory = "inprogress",
+  paneBusy = false, ticketType = "bug", issueType = "Bug", statusCategory = "inprogress",
   question, prs, tickets, url = PR1,
 } = {}) => {
+  // `issueType` is the TRACKER Issue Type (`type`, what auto-merge now gates on,
+  // XERK-560); `ticketType` is the triage classifier's assessment (`triage.type`,
+  // no longer the gate) — kept distinct so a test can drive them apart.
   const r = await asBeat(device, site, {
     autoStart: false,
     tickets: tickets || [{ key: "ENG-9", summary: "A bug", statusCategory,
+      type: issueType,
       repoGuess: { repo: "Turma", cloned: true },
       triage: { priority: "P2", type: ticketType, actionable: true } }],
     sessions: [{ id: "sm1", status: "running",
@@ -10995,22 +10999,37 @@ test("XERK-550: auto-merge skips a PR that is not merge-ready or already landed"
   assert.equal((agents.am6.commands || []).filter((c) => c.type === "mergePr").length, 0);
 });
 
-test("XERK-550: auto-merge is HARD bug-only, even when the org auto-starts other types", async () => {
-  // A non-bug ticket that IS content-eligible (actionable, no excludeTypes
-  // policy — so auto-start WOULD start it) must still never be auto-merged. The
-  // bug-only floor is independent of the triage policy; only bugs land hands-off.
+test("XERK-560: auto-merge gates on the tracker ISSUE TYPE, not the triage classifier", async () => {
+  // A ticket that IS content-eligible (actionable, no excludeTypes policy — so
+  // auto-start WOULD start it) must never be auto-merged unless its TRACKER
+  // Issue Type is Bug. The floor is independent of the triage policy.
   resetMerge();
-  for (const type of ["task", "feature", "chore", "improvement", "other"]) {
-    await mergeBeat("amT-" + type, `amt-${type}.atlassian.net`, { ticketType: type, url: `https://github.com/x/y/pull/${type}` });
+  let n = 0;
+  for (const issueType of ["Task", "Story", "Chore", "Improvement", "Epic"]) {
+    const dev = "amT-" + issueType;
+    await mergeBeat(dev, `amt-${issueType}.atlassian.net`, { issueType, url: `https://github.com/x/y/pull/${n++}` });
     autoMergeSweep();
     autoCloseSweep();
-    assert.equal((agents["amT-" + type].commands || []).length, 0,
-      `a ${type} ticket must not be auto-merged or auto-closed`);
+    assert.equal((agents[dev].commands || []).length, 0,
+      `a ${issueType} issue-type ticket must not be auto-merged or auto-closed`);
   }
-  // And the bug case (same setup) DOES merge — proving it's the type, not the fixture.
-  await mergeBeat("amT-bug", "amt-bug.atlassian.net", { ticketType: "bug", url: "https://github.com/x/y/pull/bug" });
+  // THE PRODUCTION DEFECT (XERK-560): a Jira TASK the classifier assessed as a
+  // "bug" (triage.type==="bug") must NOT auto-merge — the tracker type wins.
+  resetMerge();
+  await mergeBeat("amTaskBug", "amtaskbug.atlassian.net",
+    { issueType: "Task", ticketType: "bug", url: "https://github.com/x/y/pull/tb" });
   autoMergeSweep();
-  assert.equal((agents["amT-bug"].commands || []).filter((c) => c.type === "mergePr").length, 1);
+  autoCloseSweep();
+  assert.equal((agents.amTaskBug.commands || []).length, 0,
+    "a Task the classifier called a bug must not auto-merge");
+  // Case-insensitive: a real Bug (issue type "Bug") DOES merge, even if the
+  // classifier assessed it as something else.
+  resetMerge();
+  await mergeBeat("amRealBug", "amrealbug.atlassian.net",
+    { issueType: "bug", ticketType: "task", url: "https://github.com/x/y/pull/rb" });
+  autoMergeSweep();
+  assert.equal((agents.amRealBug.commands || []).filter((c) => c.type === "mergePr").length, 1,
+    "a tracker Bug must auto-merge regardless of the classifier's assessment");
 });
 
 test("XERK-550: auto-merge skips a ticket the auto stream would NOT start (untriaged)", async () => {
