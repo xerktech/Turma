@@ -176,7 +176,7 @@
         `<span class="org-auto-dot" aria-hidden="true"></span>auto</button>` +
         `<button type="button" class="org-chip-auto org-chip-merge${mergeOn ? " on" : ""}" data-org-merge="${esc(s.siteKey)}"` +
         ` aria-pressed="${mergeOn ? "true" : "false"}"` +
-        ` title="Auto-merge ${mergeOn ? "ON: the hub MERGES a merge-ready PR (green CI, mergeable, no conflict) of an auto-start-eligible ticket, then closes the ticket and frees the slot — no review; click to turn off" : "OFF: you review + merge PRs and close tickets yourself; click to turn on hands-off merge + close for the tickets this org auto-starts"}">` +
+        ` title="Auto-merge ${mergeOn ? "ON: the hub MERGES a merge-ready PR (green CI, mergeable, no conflict) of a BUG ticket, then closes the ticket and frees the slot — no review, bugs only; click to turn off" : "OFF: you review + merge PRs and close tickets yourself; click to turn on hands-off merge + close for BUG tickets only"}">` +
         `<span class="org-auto-dot" aria-hidden="true"></span>merge</button></div>`);
       if (colorFor === s.siteKey) {
         // orgSlotPin validates (0-based or null); the strip marks the 1-based slot.

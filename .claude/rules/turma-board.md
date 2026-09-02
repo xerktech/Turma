@@ -186,13 +186,16 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
   the class that auto-merges is exactly the class the auto stream would START. It is a SEPARATE
   composition from `autoStartSweep`'s inline gates (their per-drop log lines differ); a cross-check
   test pins the two agree.
-  - **The gate is CONTENT-only, not provenance.** It does NOT check who started the session, so a
-    ticket a human started a session on by hand is auto-merged too IF it passes the same gate. What
-    keeps FEATURES out is the org's triage policy (`excludeTypes`) — the very thing that limits
-    auto-start to bugs — NOT the type by itself: an actionable feature with no `excludeTypes` policy
-    is content-eligible for BOTH auto-start and auto-merge. **So auto-merge only means "bugs" in an
-    org whose triage policy already limits the auto stream to bugs; enabling it without that policy
-    auto-merges whatever auto-start would.** Do not describe it as "never merges a feature".
+  - **HARD floor: auto-merge acts ONLY on triage type `"bug"`, independent of the org's triage
+    policy.** The shared content gate matches whatever the AUTO-START stream would start — which the
+    operator can widen past bugs via the policy (or leave wide with no `excludeTypes`) — so on top of
+    it `autoMergeSession` requires `triage.type === "bug"`. Even an org that auto-STARTS other types
+    (task/feature/chore/…) only ever has its BUG PRs merged + closed hands-off; every other type's PR
+    still waits for a human. The triage policy can NARROW auto-merge (exclude some bugs) but can never
+    WIDEN it past bugs. `triage.type` is the classifier's normalized assessment
+    (`TRIAGE_TYPE_WEIGHT` keys), the same field `excludeTypes` matches on. (The gate is also
+    provenance-agnostic — a hand-started bug session in an opted-in org auto-merges too, which is the
+    same class — so do not describe it as "only sessions the hub started".)
   - **A Done ticket is excluded** (`statusCategory === "done"`): moving to Done is the abandon/stop
     gesture (autoStopSweep kills the session), and autoStopSweep only QUEUES that kill, so the
     session still reads running for a beat — the column, not the run state, stands the merge down.

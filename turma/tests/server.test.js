@@ -10899,6 +10899,24 @@ test("XERK-550: auto-merge skips a PR that is not merge-ready or already landed"
   assert.equal((agents.am6.commands || []).filter((c) => c.type === "mergePr").length, 0);
 });
 
+test("XERK-550: auto-merge is HARD bug-only, even when the org auto-starts other types", async () => {
+  // A non-bug ticket that IS content-eligible (actionable, no excludeTypes
+  // policy — so auto-start WOULD start it) must still never be auto-merged. The
+  // bug-only floor is independent of the triage policy; only bugs land hands-off.
+  resetMerge();
+  for (const type of ["task", "feature", "chore", "improvement", "other"]) {
+    await mergeBeat("amT-" + type, `amt-${type}.atlassian.net`, { ticketType: type, url: `https://github.com/x/y/pull/${type}` });
+    autoMergeSweep();
+    autoCloseSweep();
+    assert.equal((agents["amT-" + type].commands || []).length, 0,
+      `a ${type} ticket must not be auto-merged or auto-closed`);
+  }
+  // And the bug case (same setup) DOES merge — proving it's the type, not the fixture.
+  await mergeBeat("amT-bug", "amt-bug.atlassian.net", { ticketType: "bug", url: "https://github.com/x/y/pull/bug" });
+  autoMergeSweep();
+  assert.equal((agents["amT-bug"].commands || []).filter((c) => c.type === "mergePr").length, 1);
+});
+
 test("XERK-550: auto-merge skips a ticket the auto stream would NOT start (untriaged)", async () => {
   resetMerge();
   await mergeBeat("am7", "am7.atlassian.net", {
