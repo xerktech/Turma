@@ -1348,5 +1348,114 @@ else
   pass "a non-dsh host is never given the dsh CLI"
 fi
 
+# --- The update run cannot wedge holding the lock (XERK-549) -----------------
+# A single poll whose child hung (a network/subprocess call that outran or
+# bypassed its per-call timeout) held the lock forever, and every later hourly
+# check then aborted with "another update run holds the lock" — the host stayed
+# silently stranded on a stale build. Two independent guards, tested here: an
+# overall deadline on the run, and a staleness-aware reclaim of a wedged holder.
+
+# A `gh` that HANGS on every call, so run_once wedges while holding the lock.
+install_hanging_gh() {  # <bindir>
+  printf '#!/bin/sh\nsleep 300\n' > "$1/gh"; chmod +x "$1/gh"
+}
+
+# 34. The overall deadline force-terminates a wedged run and releases the lock,
+#     so the run cannot hold it indefinitely (RUN_DEADLINE=2 << the 300s hang).
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_hanging_gh "$bin"
+start=$(date +%s)
+HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" TURMA_CLAUDE_AUTO_UPDATE=0 \
+  TURMA_RUN_DEADLINE=2 TURMA_RUN_KILL_GRACE=1 \
+  "$bin/turma-agent-update" --boot >"$root/out.log" 2>&1 || true
+elapsed=$(( $(date +%s) - start ))
+if [ "$elapsed" -lt 30 ]; then
+  pass "a wedged run is force-terminated by the overall deadline (${elapsed}s, not 300s)"
+else
+  fail "the overall deadline never fired; the run held the lock for ${elapsed}s"
+fi
+if grep -q 'force-terminated' "$root/home/.turma/update.log" 2>/dev/null; then
+  pass "the watchdog logs the force-termination"
+else
+  fail "no watchdog log line: $(cat "$root/home/.turma/update.log" 2>/dev/null)"
+fi
+if [ ! -e "$root/home/.turma/update.lock.holder" ]; then
+  pass "the lock holder record is cleared once the deadline fires (lock released)"
+else
+  fail "a holder record lingered after the run was killed — the lock may still be held"
+fi
+rm -rf "$root"
+
+# 35. A holder that is ALREADY wedged (deadline disabled, so only the reclaim can
+#     save it) is detected by age, killed, and the lock retaken — and the
+#     reclaiming check then completes a real update. This is the end-to-end path
+#     out of the permanent-strand state the ticket describes.
+d="$(new_gh_dir)"; add_unified_release "$d" "v0.4.0" "0.4.0" "v0.4.0"
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_hanging_gh "$bin"
+# Wedge a --loop poller: a huge deadline so the watchdog can't rescue it, so only
+# the reclaim path is exercised; a tiny reclaim threshold so it ages out fast.
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_RUN_DEADLINE=999999 TURMA_LOCK_RECLAIM_AFTER=2 \
+  "$bin/turma-agent-update" --loop --interval 999 >"$root/loop.log" 2>&1 &
+loop_pid=$!
+for _ in $(seq 1 50); do [ -e "$root/home/.turma/update.lock.holder" ] && break; sleep 0.1; done
+sleep 3   # age the holder past the 2s reclaim threshold
+# The reclaiming check needs a WORKING gh; the wedged poller keeps its own hung
+# `gh sleep` running (overwriting the file on disk can't affect it).
+install_fake_gh "$bin"
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_LOCK_RECLAIM_AFTER=2 TURMA_BOOT_UPDATE_MIN_INTERVAL=0 \
+  "$bin/turma-agent-update" --boot >"$root/boot.log" 2>&1 || true
+kill "$loop_pid" 2>/dev/null || true; wait "$loop_pid" 2>/dev/null || true
+got="$(tr -d '[:space:]' < "$prefix/VERSION")"
+if grep -q 'reclaimed update.lock' "$root/home/.turma/update.log" 2>/dev/null; then
+  pass "a wedged lock holder is reclaimed once it ages past the threshold"
+else
+  fail "the wedged holder was not reclaimed: $(cat "$root/home/.turma/update.log" 2>/dev/null)"
+fi
+assert_eq "0.4.0" "$got" "the reclaiming check then completes the update (-> $got)" \
+  "reclaim happened but the update never ran, VERSION stayed $got"
+rm -rf "$root" "$d"
+
+# 36. Single-flight is preserved: a HEALTHY holder (younger than the threshold)
+#     is left alone, never killed. A stray reclaim would break the swap-race
+#     guarantee the lock exists for. Also guards the PID-reuse case — the default
+#     threshold means a normal concurrent run is never a reclaim target.
+d="$(new_gh_dir)"; add_unified_release "$d" "v0.4.0" "0.4.0" "v0.4.0"
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_hanging_gh "$bin"
+# A wedged poller, but with the DEFAULT reclaim threshold (7200s) — far above the
+# holder's age — so a concurrent check must stand aside, not reclaim.
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_RUN_DEADLINE=999999 \
+  "$bin/turma-agent-update" --loop --interval 999 >"$root/loop.log" 2>&1 &
+loop_pid=$!
+for _ in $(seq 1 50); do [ -e "$root/home/.turma/update.lock.holder" ] && break; sleep 0.1; done
+sleep 1
+out="$(FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_BOOT_UPDATE_MIN_INTERVAL=0 \
+  "$bin/turma-agent-update" --boot 2>&1 || true)"
+still_alive=no; kill -0 "$loop_pid" 2>/dev/null && still_alive=yes
+kill "$loop_pid" 2>/dev/null || true; wait "$loop_pid" 2>/dev/null || true
+if [ "$still_alive" = yes ] && printf '%s' "$out" | grep -q 'holds the lock'; then
+  pass "a healthy holder is not reclaimed — single-flight preserved"
+else
+  fail "a young holder was reclaimed/killed (alive=$still_alive): $out"
+fi
+rm -rf "$root" "$d"
+
 if [ "$FAILED" = 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
 exit "$FAILED"
