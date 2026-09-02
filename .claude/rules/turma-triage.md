@@ -79,11 +79,10 @@ attempt** (no retry budget burned, exactly like a repo-less ticket):
    to 30 min) and the **rate window** (`autoStartRateLive >= autoStartRateMax` holds with reason
    "rate", self-clearing; a manual click is never held).
 
-## Pausing auto-start on a maxed subscription (XERK-544 pace line, XERK-548 5-hour cap)
+## Pausing on a maxed subscription (XERK-544 pace line, XERK-548 5-hour cap, XERK-555 manual)
 
-- **A host whose Claude subscription has hit a LIMIT pauses for auto-start**, for either of two
-  triggers (`subscriptionLimitsPaused` = the OR of both, the one predicate the set + tests go
-  through):
+- **A host whose Claude subscription has hit a LIMIT pauses**, for either of two triggers
+  (`subscriptionLimitsPaused` = the OR of both, the one predicate the auto set + tests go through):
   - **7-day pace line** (XERK-544, `limitsPastPace`): `sevenDay.usedPct/100 >=` the fraction of the
     fixed 7-day window elapsed at now — XERK-536's `sevenDayPacing`, informational until this became
     its consumer. Resumes as the window elapses (the line moves ahead of the fill) or resets.
@@ -91,14 +90,28 @@ attempt** (no retry budget burned, exactly like a repo-less ticket):
     Resumes when the 5-hour window RESETS — detected without waiting for the next probe by treating a
     `resetsAt` that has PASSED as already-rolled-over (its used-% is then a stale high-water mark for
     a window that no longer exists).
-- It does NOT disable auto mode or block manual Start; auto tickets that would land on the host just
-  HOLD, and it self-clears (auto-resume) — nothing is persisted, it is re-derived every read from
-  live `limits` + `now`.
-- **The filter lives in `findTicketHost`, gated to `opts.auto`** (threaded from `drainTicketQueue` /
-  the reclaim precondition as `e.source === "auto"`; the manual Start route passes no `auto`). Checked
-  ahead of capacity like the runtime filter, so "every host that could run it is maxed" reads
-  **blocked** (`!anyUnpaused`), not full — a freed slot would not un-pause it. The pin branch reports
-  the same, never routes around it.
+- **AUTO pauses on EITHER trigger; a MANUAL Start pauses ONLY on the 5-hour cap** (XERK-555). The
+  5-hour cap is a "will run out mid-window" wall — starting a fresh ticket into a near-exhausted
+  window spends the headroom the running sessions need to finish it — so a deliberate manual click is
+  held there too. The weekly pace line is a soft ration and never blocks a manual click. It never
+  disables auto mode.
+- It self-clears (auto-resume) for both — nothing is persisted, it is re-derived every read from live
+  `limits` + `now`. A paused MANUAL start is not lost: it QUEUES (the POST route treats `paused` like
+  `full`) and HOLDS in the hub queue until the window resets, bounded only by `TICKET_QUEUE_MAX_WAIT_MS`.
+- **The filter lives in `findTicketHost`; the PATH decides WHICH triggers count, not whether the
+  filter runs.** `pausedSubscriptions(now, {fiveHourOnly})` builds the set — the full OR for auto
+  (`opts.auto`, threaded from `drainTicketQueue` / the reclaim precondition as `e.source === "auto"`),
+  the 5-hour cap alone for a manual Start (no `auto`). Checked ahead of capacity like the runtime
+  filter, so "every host that could run it is maxed" reads **paused** (`!anyUnpaused`, its own
+  self-clearing return flag), not full — a freed slot would not un-pause it, only the window
+  recovering. The pin branch reports the same, never routes around it.
+- **`paused` is a SELF-CLEARING queue hold, distinct from `blocked`** (which only the operator can
+  clear). `drainTicketQueue` holds it like `capacity` (waits to the max wait, never the 30-min blocked
+  timer) but keeps its error so the card says WHY. Reason string `"paused"`, rendered
+  "⏳ queued · usage paused" on web/glasses (`board.js` `queuedLabel`/`queuedTip`, re-vendored
+  `board.cjs`) and Android (`Board.kt` `Queued.paused`, `BoardScreen.kt`). This also changed the AUTO
+  pause hold from `blocked` to `paused` — more correct (the pause is self-clearing) and less churny
+  (no 30-min drop + re-sweep cycle).
 - **Only a host that would SPEND the pool is paused**: `!wantRuntime && (a.defaultRuntime||"claude")
   === "claude"`. A qwen/dsh pin, or a qwen/dsh-default host, spends no Claude subscription and is
   never paused (dsh/qwen have no window — `agent-usage.md`).
@@ -114,10 +127,13 @@ attempt** (no retry budget burned, exactly like a repo-less ticket):
   only when true, so absent = not paused). Rendered as a dashboard host-header chip beside the
   login/board chips (`autoPausedBadge` in `index.html`; `FleetScreen.kt` Pill on Android). **No bypass
   control** by design. Not a board/glasses surface — the fleet dashboard has no glasses mirror.
-- Tests: the `XERK-544:`/`XERK-548:` cases in `server.test.js` (`limitsPastPace`/`limitsFiveHourMaxed`/
-  `subscriptionLimitsPaused`/`pausedSubscriptions`, the auto-vs-manual `findTicketHost`, the 5-hour
-  reset auto-resume, the qwen exemptions, the served flag + forged-flag strip, the auto-hold drain),
-  `dashboard-tiles.test.js` (the chip), android `AgentDecodeTest`.
+- Tests: the `XERK-544:`/`XERK-548:`/`XERK-555:` cases in `server.test.js` (`limitsPastPace`/
+  `limitsFiveHourMaxed`/`subscriptionLimitsPaused`/`pausedSubscriptions` incl. the `fiveHourOnly`
+  narrowing, the auto-vs-manual `findTicketHost` with the manual 5-hour gate + unpaused-sibling
+  routing, the manual queue-and-hold-then-run-on-reset, the 5-hour reset auto-resume, the qwen
+  exemptions, the served flag + forged-flag strip, the paused-hold drain), `board.test.js` +
+  `BoardTest.kt` (the `paused` queued reason), `dashboard-tiles.test.js` (the chip), android
+  `AgentDecodeTest`.
 
 Drain order is the stable sort on `triageSortKey` = `[priorityRank, typeWeight, -repoTierRank]`:
 band → type → repo tier (XERK-487 [G] tiebreak) → board order. **A P0 may exceed the org's auto

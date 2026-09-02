@@ -665,6 +665,8 @@ private fun TicketStartControl(
                 when {
                     c.expired -> "⌛ gave up waiting"
                     c.blocked -> "⏳ queued · blocked"
+                    // XERK-555: a self-clearing usage pause, not an error state.
+                    c.paused -> "⏳ queued · usage paused"
                     c.position > 1 -> "⏳ queued · #${c.position}"
                     else -> "⏳ queued"
                 },
@@ -676,7 +678,10 @@ private fun TicketStartControl(
                 Text(
                     it,
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.error,
+                    // Blocked is operator-actionable (error red); a usage pause is
+                    // informational and clears itself, so it stays muted.
+                    color = if (c.blocked) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2,
                 )
             }

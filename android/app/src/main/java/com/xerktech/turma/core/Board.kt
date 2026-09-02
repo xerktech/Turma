@@ -831,6 +831,12 @@ sealed interface StartControl {
          * cancelling it. The ✕ dismisses the note and a live start sits beside it.
          */
         val expired: Boolean = false,
+        /**
+         * XERK-555: every host that could run it has its Claude 5-hour usage
+         * limit maxed. Self-clearing like capacity (the window resets on its
+         * own), so NOT [blocked] — it just carries its own label and message.
+         */
+        val paused: Boolean = false,
     ) : StartControl
     /**
      * A live start button. [clone] marks the repo as not cloned anywhere (the
@@ -861,6 +867,7 @@ fun ticketStartControl(
         reason = queued.error,
         error = start?.error,
         expired = queued.reason == "expired",
+        paused = queued.reason == "paused",
     )
     if (start?.pending == true) return StartControl.Busy
     return StartControl.Button(

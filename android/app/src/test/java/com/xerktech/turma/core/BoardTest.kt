@@ -856,6 +856,15 @@ class BoardTest {
             ticketStartControl(guessed(true), 0, null,
                 queued(position = 0, reason = "expired", error = "no agent had a free slot")),
         )
+        // XERK-555: a "paused" hold (every host's Claude 5-hour limit maxed) is
+        // self-clearing like capacity, so it is NOT blocked — it carries its own
+        // flag and the hub's wording, and the window resetting starts it.
+        assertEquals(
+            StartControl.Queued(position = 1, blocked = false,
+                reason = "5-hour usage limit is maxed", paused = true),
+            ticketStartControl(guessed(true), 0, null,
+                queued(reason = "paused", error = "5-hour usage limit is maxed")),
+        )
         // Still nothing to start against without a triaged repo.
         assertEquals(null, ticketStartControl(JiraTicket(key = "X-1"), 0, null, queued()))
     }

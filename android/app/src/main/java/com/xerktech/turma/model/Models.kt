@@ -107,8 +107,10 @@ data class TriagePolicy(
  * One ticket waiting in the hub's queue for a free session slot (XERK-296).
  * [position] is its place in its OWN org's line (capacity is per org, so that is
  * the only line that means anything). [reason] is why it is still waiting as of
- * the hub's last pass — "capacity" clears itself; "blocked" needs the operator,
- * and [error] is the hub's own wording for what to fix. [source] is "auto" (the
+ * the hub's last pass — "capacity" and "paused" (XERK-555, every host that could
+ * run it has its Claude 5-hour usage limit maxed) clear themselves; "blocked"
+ * needs the operator, and [error] is the hub's own wording for what to fix.
+ * [source] is "auto" (the
  * org's auto-start sweep queued it) or "manual" (an operator pressed Start);
  * only auto entries are swept away when the org's Auto switch goes off.
  */

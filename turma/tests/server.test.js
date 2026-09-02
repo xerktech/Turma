@@ -7023,18 +7023,21 @@ test("XERK-544: a heartbeat cannot forge its own autoPaused flag", async () => {
   assert.ok(!("autoPaused" in a), "a forged autoPaused is stripped, not served");
 });
 
-test("XERK-544: auto-start holds a ticket whose only claude host is past pace; manual still starts", async () => {
+test("XERK-544: auto-start holds a past-pace ticket as 'paused'; a manual start (pace only) still runs", async () => {
   resetAutoStart();
+  // Over the 7-day PACE line, but the 5-hour window is fine (fiveHourPct 0).
   await paceBeat("dpPaced", "dp1.atlassian.net", { usedPct: 85, sub: "dpSub" });
   setAutoStartOrg("dp1.atlassian.net", true);
   autoStartRound();
   // The sweep queued it (it decides WHICH), but the drain found the only host
-  // paused, so nothing was handed over and the entry HOLDS as blocked.
+  // paused, so nothing was handed over and the entry HOLDS. XERK-555: the pause
+  // is a SELF-CLEARING hold, so its reason is "paused" (not "blocked").
   assert.equal((agents.dpPaced.commands || []).length, 0);
   const q = queuedTicket("dp1.atlassian.net", "ENG-5");
-  assert.equal(q.reason, "blocked");
+  assert.equal(q.reason, "paused");
   assert.match(q.error, /usage limit/);
-  // A MANUAL start on the same ticket is never paused — it dispatches at once.
+  // A MANUAL start is gated ONLY by the 5-hour cap (XERK-555), never the weekly
+  // pace line — so with the 5-hour window fine it dispatches at once.
   const r = await startTicket("dp1.atlassian.net", "ENG-5");
   assert.equal(r.status, 200);
   assert.equal(r.body.host, "dpPaced");
@@ -7078,11 +7081,15 @@ test("XERK-548: a 5-hour-maxed claude host pauses auto-start and flags autoPause
   const blocked = hub.findTicketHost("fh1.atlassian.net", "Turma", "ENG-5",
     { requireFree: true, auto: true });
   assert.equal(blocked.host, undefined);
-  assert.ok(!blocked.full);                       // blocked, self-clearing — not full
+  assert.ok(!blocked.full);                       // paused, self-clearing — not full
+  assert.ok(blocked.paused);
   assert.match(blocked.error, /usage limit/);
-  // Manual is never paused.
-  assert.equal(hub.findTicketHost("fh1.atlassian.net", "Turma", "ENG-5",
-    { requireFree: true }).host, "fhPaused");
+  // XERK-555: a MANUAL start is ALSO gated by the 5-hour cap — no host, paused.
+  const manual = hub.findTicketHost("fh1.atlassian.net", "Turma", "ENG-5",
+    { requireFree: true });
+  assert.equal(manual.host, undefined);
+  assert.ok(manual.paused);
+  assert.match(manual.error, /5-hour/);
   // A qwen-default host at 95% of its 5-hour window is not paused (spends no Claude pool).
   await paceBeat("fhQwen", "fh2.atlassian.net",
     { usedPct: 2, sub: "fhQwenSub", fiveHourPct: 95, defaultRuntime: "qwen" });
@@ -7106,6 +7113,76 @@ test("XERK-548: auto-start RESUMES the moment the 5-hour window resets", async (
     { usedPct: 2, sub: "frSub", fiveHourPct: 95, fiveHourResetsInSec: -60 });
   assert.equal(hub.findTicketHost("fr1.atlassian.net", "Turma", "ENG-5",
     { requireFree: true, auto: true }).host, "frHost");
+});
+
+// ---- XERK-555: extend the 5-hour pause to MANUALLY-started tickets ----------
+
+test("XERK-555: pausedSubscriptions({fiveHourOnly}) narrows the set to the 5-hour cap", async () => {
+  const now = Date.now();
+  // Over the 7-day PACE line, but the 5-hour window is fine.
+  await paceBeat("poPace", "po1.atlassian.net", { usedPct: 80, sub: "poPaceSub" });
+  // The 5-hour window maxed, weekly fine.
+  await paceBeat("poFive", "po2.atlassian.net", { usedPct: 2, sub: "poFiveSub", fiveHourPct: 95 });
+  const full = hub.pausedSubscriptions(now);
+  const fiveOnly = hub.pausedSubscriptions(now, { fiveHourOnly: true });
+  assert.ok(full.has("poPaceSub"));        // the pace line pauses the full (auto) set
+  assert.ok(!fiveOnly.has("poPaceSub"));   // …but NOT the 5-hour-only (manual) set
+  assert.ok(full.has("poFiveSub"));        // the 5-hour cap is in both
+  assert.ok(fiveOnly.has("poFiveSub"));
+});
+
+test("XERK-555: a manual start is paused by the 5-hour cap, never the weekly pace line", async () => {
+  // Over PACE only → a manual start runs (a deliberate click may spend the ration).
+  await paceBeat("m5Pace", "m5p.atlassian.net", { usedPct: 85, sub: "m5PaceSub" });
+  assert.equal(hub.findTicketHost("m5p.atlassian.net", "Turma", "ENG-5",
+    { requireFree: true }).host, "m5Pace");
+  // 5-hour maxed → a manual start is paused: no host, self-clearing (not full).
+  await paceBeat("m5Five", "m5f.atlassian.net", { usedPct: 2, sub: "m5FiveSub", fiveHourPct: 95 });
+  const r = hub.findTicketHost("m5f.atlassian.net", "Turma", "ENG-5", { requireFree: true });
+  assert.equal(r.host, undefined);
+  assert.ok(r.paused);
+  assert.ok(!r.full);
+  assert.match(r.error, /5-hour/);
+});
+
+test("XERK-555: a manual start routes past a 5-hour-maxed host to an unpaused sibling", async () => {
+  // Two hosts in ONE org: one 5-hour-maxed, one fine. The maxed host is skipped.
+  await paceBeat("m5Max", "m5s.atlassian.net", { usedPct: 2, sub: "m5MaxSub", fiveHourPct: 95 });
+  await paceBeat("m5Ok",  "m5s.atlassian.net", { usedPct: 2, sub: "m5OkSub", fiveHourPct: 10 });
+  assert.equal(hub.findTicketHost("m5s.atlassian.net", "Turma", "ENG-5",
+    { requireFree: true }).host, "m5Ok");
+});
+
+test("XERK-555: a qwen-default host is never 5-hour-paused for a manual start", async () => {
+  hub.__setQwenEnabled(true);
+  await paceBeat("m5Qwen", "m5w.atlassian.net",
+    { usedPct: 2, sub: "m5QwenSub", fiveHourPct: 95, defaultRuntime: "qwen" });
+  assert.equal(hub.findTicketHost("m5w.atlassian.net", "Turma", "ENG-5",
+    { requireFree: true }).host, "m5Qwen");
+});
+
+test("XERK-555: a manual start whose only host is 5-hour-maxed QUEUES and holds, then runs on reset", async () => {
+  resetAutoStart();
+  await paceBeat("m5Q", "m5q.atlassian.net", { usedPct: 2, sub: "m5QSub", fiveHourPct: 95 });
+  // The POST QUEUES it (a wait that can outlast the window) rather than hard-refusing.
+  const r = await startTicket("m5q.atlassian.net", "ENG-5");
+  assert.equal(r.status, 200);
+  assert.ok(r.body.queued);
+  // A drain finds the host still paused and HOLDS the entry as self-clearing
+  // "paused" — never the operator-only "blocked" timer — with the reason on it.
+  drainTicketQueue();
+  const q = queuedTicket("m5q.atlassian.net", "ENG-5");
+  assert.equal(q.source, "manual");
+  assert.equal(q.reason, "paused");
+  assert.match(q.error, /5-hour/);
+  assert.equal((agents.m5Q.commands || []).length, 0);   // nothing handed over
+  // The 5-hour window resets → the pause clears → the entry dispatches.
+  await paceBeat("m5Q", "m5q.atlassian.net",
+    { usedPct: 2, sub: "m5QSub", fiveHourPct: 95, fiveHourResetsInSec: -60 });
+  drainTicketQueue();
+  assert.deepEqual((agents.m5Q.commands || []).map((c) => [c.type, c.issueKey]),
+    [["spawnTicket", "ENG-5"]]);
+  ticketQueue.length = 0;   // leave the queue clean for later tests
 });
 
 test("ticket-model pins survive a hub restart (read back from their own file)", () => {

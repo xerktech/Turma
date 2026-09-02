@@ -3652,7 +3652,15 @@ function subscriptionKeyOf(key, a) {
 // freshest non-stale reading decides — a sibling with a good snapshot pauses one
 // whose probe is missing or stale. Offline hosts contribute (their last reading
 // is still evidence about the shared pool, bounded by the staleness gate).
-function pausedSubscriptions(nowMs) {
+//
+// `opts.fiveHourOnly` narrows the set to the 5-hour cap alone (XERK-555): a
+// MANUAL Start is gated ONLY by the 5-hour cap, never the weekly pace line. The
+// 5-hour cap is a "will run out mid-window" wall — starting a fresh ticket into
+// a near-exhausted window spends the headroom the running sessions need to
+// finish; the weekly pace line is a soft ration, which a deliberate manual click
+// is allowed to spend. AUTO uses the full set (both triggers), as it always has.
+function pausedSubscriptions(nowMs, opts) {
+  const fiveHourOnly = !!(opts && opts.fiveHourOnly);
   const nowSec = Math.floor(nowMs / 1000);
   const freshest = new Map();  // subKey -> {capturedAt, limits}
   for (const [key, a] of Object.entries(agents)) {
@@ -3667,7 +3675,10 @@ function pausedSubscriptions(nowMs) {
   }
   const out = new Set();
   for (const [subKey, v] of freshest) {
-    if (subscriptionLimitsPaused(v.limits, nowMs)) out.add(subKey);
+    const paused = fiveHourOnly
+      ? limitsFiveHourMaxed(v.limits, nowMs)
+      : subscriptionLimitsPaused(v.limits, nowMs);
+    if (paused) out.add(subKey);
   }
   return out;
 }
@@ -4744,12 +4755,17 @@ function hostTriagedTicket(a, issueKey, repo) {
 }
 function findTicketHost(siteKey, repo, issueKey, opts) {
   const requireFree = !!(opts && opts.requireFree);
-  // AUTO dispatches (the sweep/queue) pause on the subscription pace line
-  // (XERK-544); a MANUAL Start is deliberate intent and is never paused. The
-  // over-pace set is only needed on the auto path, so it is derived only there.
+  // AUTO dispatches (the sweep/queue) pause on EITHER subscription trigger — the
+  // weekly pace line (XERK-544) or the 5-hour cap (XERK-548). A MANUAL Start is
+  // paused ONLY by the 5-hour cap (XERK-555): starting a fresh ticket into a
+  // near-exhausted 5-hour window spends the headroom the running sessions need
+  // to finish it, so it routes to an unpaused sibling if one exists and
+  // otherwise HOLDS in the queue until the window resets. The weekly pace line
+  // is a soft ration and never blocks a deliberate manual click. A paused host
+  // is skipped either way — the two paths differ only in WHICH triggers count.
   const auto = !!(opts && opts.auto);
   const now = Date.now();
-  const pausedSubs = auto ? pausedSubscriptions(now) : null;
+  const pausedSubs = pausedSubscriptions(now, auto ? undefined : { fiveHourOnly: true });
   // Which runtime this ticket is pinned to run on (XERK-473 dsh, XERK-515 qwen).
   // A non-default runtime ("dsh"/"qwen") restricts the pool to hosts that offer
   // it — a host without it can no more run the ticket than one that triaged a
@@ -4767,9 +4783,12 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
   // Vacuously satisfied when there is no ticket to have triaged / no runtime need.
   let anyTriaged = !issueKey;
   let anyRuntimeCapable = !wantRuntime;
-  // XERK-544: did some host that could otherwise run this auto ticket survive
-  // the subscription-pace pause? Vacuously satisfied off the auto path.
-  let anyUnpaused = !auto;
+  // XERK-544/548/555: did some host that could otherwise run this ticket survive
+  // the subscription pause? Tracked on BOTH paths now — auto pauses on either
+  // trigger, a manual start on the 5-hour cap — so it starts false and the loop
+  // sets it for any host that reaches the capacity check unpaused. A host that
+  // spends no Claude pool (qwen/dsh) never hits the pause and counts as unpaused.
+  let anyUnpaused = false;
   const cloned = [], uncloned = [];
   for (const [key, a] of Object.entries(agents)) {
     if (!a.jira || a.jira.siteKey !== siteKey) continue;
@@ -4790,15 +4809,17 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
     // age out on the blocked timer instead of waiting for the slot it needs.
     if (issueKey && !hostTriagedTicket(a, issueKey, repo)) continue;
     anyTriaged = true;
-    // XERK-544/548: an AUTO ticket that would run on THIS host's Claude
-    // subscription is paused while that subscription has hit a limit (weekly pace
-    // line or 5-hour cap). Only an UNPINNED/claude ticket (no `wantRuntime`) on a
-    // claude-default host spends the pool — a qwen/dsh pin or default spends none,
-    // so it is never paused. Checked ahead of the capacity filter so it reads
-    // BLOCKED (a freed slot would not un-pause it — only the window recovering
-    // does), not full; the pause self-clears as the window elapses or resets.
+    // XERK-544/548/555: a ticket that would run on THIS host's Claude
+    // subscription is paused while that subscription has hit a limit. `pausedSubs`
+    // already encodes WHICH triggers count for this path (both for auto, the
+    // 5-hour cap alone for a manual start), so this check is path-agnostic. Only
+    // an UNPINNED/claude ticket (no `wantRuntime`) on a claude-default host spends
+    // the pool — a qwen/dsh pin or default spends none, so it is never paused.
+    // Checked ahead of the capacity filter so it reads BLOCKED (a freed slot would
+    // not un-pause it — only the window recovering does), not full; the pause
+    // self-clears as the window elapses or resets.
     const wouldSpendPool = !wantRuntime && (a.defaultRuntime || "claude") === "claude";
-    if (auto && wouldSpendPool && hostAutoPaused(key, a, pausedSubs)) continue;
+    if (wouldSpendPool && hostAutoPaused(key, a, pausedSubs)) continue;
     anyUnpaused = true;
     // A host with no room is out of the running entirely under requireFree —
     // including out of the "has the repo cloned" preference, so a full cloned
@@ -4847,14 +4868,18 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
       return { status: 503, error:
         `this ticket is pinned to agent "${pin.host}", which has not triaged it to ${repo}` };
     }
-    // XERK-544/548: an AUTO dispatch to a pinned host whose Claude subscription
-    // has hit a limit (weekly pace or 5-hour cap) is paused — the same rule as
-    // the unpinned path, reported not routed around. Blocked, self-clearing. Only
-    // an unpinned/claude ticket on a claude-default host spends the pool.
-    if (auto && !wantRuntime && (a.defaultRuntime || "claude") === "claude"
+    // XERK-544/548/555: a dispatch to a pinned host whose Claude subscription has
+    // hit a limit is paused — the same rule as the unpinned path, reported not
+    // routed around (a pin says WHICH host, never around it). `paused`, not full:
+    // a freed slot does not un-pause it, only the window recovering does, so it
+    // self-clears and the queue HOLDS it rather than ageing it out (drain treats
+    // `paused` like capacity). `pausedSubs` already encodes which triggers count
+    // for this path, so auto pauses on both and a manual start on the 5-hour cap.
+    if (!wantRuntime && (a.defaultRuntime || "claude") === "claude"
         && hostAutoPaused(pin.host, a, pausedSubs)) {
-      return { status: 503, error:
-        `this ticket is pinned to agent "${pin.host}", whose Claude subscription has hit its usage limit — auto-start is paused` };
+      return { status: 503, paused: true, error: auto
+        ? `this ticket is pinned to agent "${pin.host}", whose Claude subscription has hit its usage limit — auto-start is paused`
+        : `this ticket is pinned to agent "${pin.host}", whose Claude 5-hour usage limit is maxed — it waits until the window resets` };
     }
     return { host: pin.host,
       needsClone: !(a.repos || []).some((r) => r && r.name === repo) };
@@ -4876,13 +4901,16 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
     return { status: 503, error:
       `no online host has triaged that ticket to ${repo}` };
   }
-  // XERK-544/548: every host that could run this auto ticket has its Claude
-  // subscription at a limit (weekly pace or 5-hour cap). Not `full`: a freed slot
-  // would not un-pause it — only the window recovering does, so it holds as
-  // `blocked` and self-clears rather than waiting for capacity.
+  // XERK-544/548/555: every host that could run this ticket has its Claude
+  // subscription at a limit — for auto, either trigger; for a manual start, the
+  // 5-hour cap. Not `full`: a freed slot would not un-pause it — only the window
+  // recovering does. `paused`, so the POST route QUEUES a manual start (rather
+  // than hard-refusing it) and the drain HOLDS it self-clearing until the window
+  // resets, rather than ageing it out on the blocked timer.
   if (!anyUnpaused) {
-    return { status: 503, error:
-      "every host that could run that ticket has auto-start paused — its Claude subscription has hit its usage limit" };
+    return { status: 503, paused: true, error: auto
+      ? "every host that could run that ticket has auto-start paused — its Claude subscription has hit its usage limit"
+      : "every host that could run that ticket has its Claude 5-hour usage limit maxed — it waits in the queue until the window resets" };
   }
   if (requireFree && !cloned.length && !uncloned.length) {
     // The pool is the hosts that TRIAGED this ticket to `repo`, not the org's
@@ -8276,12 +8304,18 @@ function drainTicketQueue() {
       drop(`it was ${triageAction} by triage while it waited`);
       continue;
     }
-    const { host, error, full } = findTicketHost(
+    const { host, error, full, paused } = findTicketHost(
       e.siteKey, repo, e.issueKey, { requireFree: true, auto: e.source === "auto" });
     if (!host) {
-      changed = holdQueued(e, full ? "capacity" : "blocked", full ? null : error) || changed;
-      // "capacity" clears itself, so it waits (up to the max wait above).
-      if (full) { if (e.blockedSince) { e.blockedSince = 0; changed = true; } continue; }
+      // XERK-555: a subscription pause is a SELF-CLEARING hold like capacity — a
+      // freed slot won't help, but the window resetting will — so it is its own
+      // reason ("paused"), waits up to the max wait, and is never aged out on the
+      // 30-min blocked timer (which is for holds only the operator can clear).
+      // It keeps its error so the card can say WHY it is waiting; capacity's is
+      // null (the client words "waiting for a free slot" generically).
+      changed = holdQueued(e, full ? "capacity" : paused ? "paused" : "blocked",
+        full ? null : error) || changed;
+      if (full || paused) { if (e.blockedSince) { e.blockedSince = 0; changed = true; } continue; }
       // A routing failure HOLDS, whatever queued it. Dropping an auto entry here
       // dropped it into the sweep's arms: an org whose hosts are all offline was
       // re-queued 15s later, every 15s, churning the log, the payload and the
@@ -12081,7 +12115,7 @@ const server = http.createServer(async (req, res) => {
       if (!repo) {
         return json(res, 409, { error: "that ticket has no triaged repo yet" });
       }
-      const { host, error, status, needsClone, full } =
+      const { host, error, status, needsClone, full, paused } =
         findTicketHost(siteKey, repo, issueKey, { requireFree: true });
       // Single-flight per ticket, ORG-WIDE (XERK-331). A spawnTicket already
       // committed to running somewhere in the org — delivered on any host, or
@@ -12103,13 +12137,16 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200,
           { ok: true, cmdId: committed.cmdId, host: committed.host, repo });
       }
-      // Every org host is up but none has a free slot — the ticket waits in the
-      // hub's queue (XERK-296) instead of being nailed to a host now and turned
-      // into a session that only waits. Whichever agent frees a slot first takes
+      // Every org host is up but none can take it right now — either none has a
+      // free slot (`full`), or every host that could run it has its Claude 5-hour
+      // usage limit maxed (`paused`, XERK-555). Both are waits that clear
+      // themselves (a freed slot, or the window resetting), so the ticket waits
+      // in the hub's queue (XERK-296) instead of being nailed to a host now, or
+      // hard-refused and lost. Whichever agent frees up or un-pauses first takes
       // it; the operator can cancel it with the DELETE below. A HARD failure (no
       // org, everything offline, a pinned host that's gone) still refuses here:
       // queuing can't fix any of those, and a refusal has to reach the operator.
-      if (!host && full) {
+      if (!host && (full || paused)) {
         const e = enqueueTicketStart(siteKey, issueKey, "manual");
         if (!e) {
           // Which line is full decides the wording, and there are two: this org's
