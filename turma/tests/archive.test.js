@@ -168,6 +168,55 @@ test("getTranscript reads the canonical file", () => {
   assert.equal(archive.getTranscript("nope"), null);
 });
 
+test("XERK-422: a transcript that rendered ZERO entries reads back as empty, not a 404", () => {
+  // A transcript whose lines are all non-renderable (mode/permission-mode/
+  // system/last-prompt records) projects to no entries: the agent read the bytes
+  // and advanced its cursor to size, so ingestChunk gets an empty entry list at a
+  // real endOffset. It appends nothing (no `.jsonl` is ever written) but still
+  // upserts the row with a filePath and bytesStored = size.
+  const r = archive.ingestChunk("nas", "empty1", { ...META }, 0, 1025, []);
+  assert.equal(r.bytesStored, 1025, "the cursor reaches size even with no entries");
+  const rel = archive.archiveRelPath("empty1", { ...META, host: "nas" });
+  assert.ok(!fs.existsSync(path.join(process.env.ARCHIVE_DIR, rel)),
+    "no organized .jsonl is written when there are no renderable entries");
+  // It lists (the row exists) ...
+  assert.ok(archive.listArchive({ host: "nas" }).sessions.some((s) => s.transcriptId === "empty1"),
+    "the row is listable");
+  // ... and now reads back as an honest empty conversation rather than 404ing
+  // forever. `null` (an unknown transcript) stays reserved for a row that isn't
+  // there at all.
+  const t = archive.getTranscript("empty1");
+  assert.ok(t, "the row reads back instead of 404ing");
+  assert.deepEqual(t.entries, [], "with an empty entry list");
+  assert.equal(t.transcriptId, "empty1");
+  assert.equal(t.repo, "turma", "carrying the row's metadata so the viewer can name it");
+});
+
+test("XERK-422: only ENOENT reads back empty — a present-but-unreadable file stays a 404", () => {
+  // The empty-conversation rescue is ENOENT-SPECIFIC on purpose: a transient
+  // read failure on a file that IS present (EIO/EACCES/EISDIR) must NOT be
+  // served as a false "recorded no conversation". `t1` has a real .jsonl; force
+  // its read to fail with a non-ENOENT error and confirm getTranscript answers
+  // null (→ 404), not empty.
+  const realRead = fs.readFileSync;
+  fs.readFileSync = (p, ...rest) => {
+    if (typeof p === "string" && p.endsWith(".jsonl")) {
+      const err = new Error("simulated I/O error");
+      err.code = "EIO";
+      throw err;
+    }
+    return realRead(p, ...rest);
+  };
+  try {
+    assert.equal(archive.getTranscript("t1"), null,
+      "a non-ENOENT read failure is 'not here', never a false empty conversation");
+  } finally {
+    fs.readFileSync = realRead;
+  }
+  // And with the stub gone it reads normally again.
+  assert.equal(archive.getTranscript("t1").entries.length, 3);
+});
+
 test("ingestChunk persists blocks[] and getTranscript returns them", () => {
   const blocks = [
     { t: "thinking", text: "hmm" },

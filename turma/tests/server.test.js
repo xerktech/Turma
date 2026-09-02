@@ -2337,6 +2337,22 @@ test("http: archive ingest is agent-authed; search/browse/view are user-authed",
   assert.equal(view.status, 200);
   assert.equal(view.body.entries.length, 2);
   assert.equal((await request("GET", "/api/archive/nope", { headers: userHeaders })).status, 404);
+
+  // XERK-422: a transcript whose lines all render to zero entries (mode/system/
+  // last-prompt records, no user/assistant turn) advances the cursor to size but
+  // writes no `.jsonl`. It used to get a listable row that 404'd on read-back
+  // forever. It now reads back 200 with an empty entry list — an honest "recorded
+  // no conversation", distinct from a transcript the hub never heard of (still
+  // 404). The raw layer may still hold real material for it.
+  const empty = await request("POST", "/api/agents/nas/archive/tr-empty",
+    { body: { startOffset: 0, endOffset: 1025, size: 1025,
+      meta: { remoteKey: "github.com/xerk/turma", repo: "turma", slug: "-w-ab" }, entries: [] },
+      headers: agentHeaders });
+  assert.equal(empty.status, 200);
+  assert.equal(empty.body.bytesStored, 1025);
+  const emptyView = await request("GET", "/api/archive/tr-empty", { headers: userHeaders });
+  assert.equal(emptyView.status, 200, "a zero-entry transcript reads back, it does not 404");
+  assert.deepEqual(emptyView.body.entries, []);
 });
 
 test("http: heartbeat carries archiveHave cursors back for a manifest", async () => {

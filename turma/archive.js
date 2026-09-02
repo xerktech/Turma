@@ -1431,10 +1431,36 @@ function getTranscript(transcriptId) {
   openDb();
   const row = db.prepare("SELECT filePath, repo, host, worktree, summary, endedTs, createdAt "
     + "FROM sessions WHERE transcriptId=?").get(transcriptId);
-  if (!row || !row.filePath) return null;
+  // No row at all — the hub has genuinely never heard of this transcript.
+  if (!row) return null;
+  // A row with no organized file is a manifest PLACEHOLDER (manifestCursors)
+  // whose owner has not pushed a content chunk yet — still syncing, so the
+  // client's "syncs within a few minutes of ending" 404 wording is correct.
+  if (!row.filePath) return null;
+  const meta = {
+    transcriptId, repo: row.repo, host: row.host, summary: row.summary,
+    // The recorded cwd, so the page can tell a session that CAN be restored from
+    // one whose "worktree" is really a transcript store — the majority of the
+    // archive — instead of offering a control that always refuses.
+    worktree: row.worktree, endedTs: row.endedTs, createdAt: row.createdAt,
+  };
   const paths = filePaths(row.filePath);
   let raw;
-  try { raw = fs.readFileSync(paths.jsonl, "utf8"); } catch { return null; }
+  try {
+    raw = fs.readFileSync(paths.jsonl, "utf8");
+  } catch (e) {
+    // A transcript whose lines are ALL non-renderable (mode/permission-mode/
+    // bridge-session/system/last-prompt records, no user/assistant turn) rendered
+    // to zero entries, so ingestChunk advanced the cursor to size but appended
+    // nothing and never created the `.jsonl` — yet the row is real and its RAW
+    // layer may hold material (XERK-422). Serve it with an empty entry list so
+    // the viewer says "this session recorded no conversation", distinguishing it
+    // from a transcript the hub never heard of, rather than a permanent 404.
+    // Any OTHER read failure (a transient EIO on a file that IS present) stays a
+    // null → not-here answer, never a false "empty conversation".
+    if (e && e.code === "ENOENT") return { ...meta, entries: [] };
+    return null;
+  }
   const entries = [];
   for (const line of raw.split("\n")) {
     const s = line.trim();
@@ -1447,13 +1473,7 @@ function getTranscript(transcriptId) {
       });
     } catch { /* skip a torn line */ }
   }
-  return {
-    transcriptId, repo: row.repo, host: row.host, summary: row.summary,
-    // The recorded cwd, so the page can tell a session that CAN be restored from
-    // one whose "worktree" is really a transcript store — the majority of the
-    // archive — instead of offering a control that always refuses.
-    worktree: row.worktree, endedTs: row.endedTs, createdAt: row.createdAt, entries,
-  };
+  return { ...meta, entries };
 }
 
 // ---- rebuild ----------------------------------------------------------------
