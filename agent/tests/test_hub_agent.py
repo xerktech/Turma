@@ -25355,6 +25355,30 @@ class TestHttpErrorDetail(unittest.TestCase):
             self.assertEqual(ha._board_urlopen(urllib.request.Request("http://x")), {})
 
 
+class TestUrlopenErrorDetail(unittest.TestCase):
+    """The migration relay and the other agent->hub urllib calls log a failure
+    for an operator who is looking at THIS host's log (a move wedged, a bundle
+    lost). A REFUSAL carries the hub's JSON {error} body, which urllib's
+    HTTPError.__str__ throws away; a transport failure (DNS/TLS/timeout) has no
+    body and urllib already stringifies it usefully (XERK-300)."""
+
+    def test_http_error_recovers_the_hub_body(self):
+        err = urllib.error.HTTPError(
+            "http://hub", 409, "Conflict", {},
+            io.BytesIO(json.dumps(
+                {"error": "another migration is already in flight"}).encode()))
+        detail = ha._urlopen_error_detail(err)
+        self.assertIn("HTTP 409", detail)
+        self.assertIn("another migration is already in flight", detail)
+        # The reason urllib's own rendering is not enough: it drops the body.
+        self.assertNotIn("already in flight", str(err))
+
+    def test_non_http_failure_keeps_urllibs_own_wording(self):
+        err = urllib.error.URLError("timed out")
+        self.assertEqual(ha._urlopen_error_detail(err), str(err))
+        self.assertIn("timed out", ha._urlopen_error_detail(err))
+
+
 class TestAzureDescriptionField(unittest.TestCase):
     """The Agile/Scrum Bug keeps its description in ReproSteps and has no
     System.Description, and patching a field a type doesn't have fails the whole

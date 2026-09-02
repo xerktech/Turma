@@ -10081,6 +10081,21 @@ def _http_error_detail(err):
     return f"HTTP {code}: {msg}" if msg else f"HTTP {code}"
 
 
+def _urlopen_error_detail(err):
+    """Best operator-facing text for a urllib call failure.
+
+    A REFUSAL is an HTTPError, whose `__str__` renders only the status line and
+    discards the JSON `{error}` body the hub (or a tracker) sent — the one place
+    the real reason lives (a 409 single-flight, 413 too large, 503 host
+    offline). `_http_error_detail` recovers it. Everything else urllib raises
+    (DNS, TLS, a socket timeout) it already stringifies usefully and has no such
+    body, so `str(e)` is kept for those — mirroring `_board_urlopen`'s split of
+    HTTPError from the rest (XERK-300)."""
+    if isinstance(err, urllib.error.HTTPError):
+        return _http_error_detail(err)
+    return str(err)
+
+
 class BoardHttpError(RuntimeError):
     """A tracker request the server REFUSED, carrying its status. The code is
     what lets a caller tell "rejected, nothing happened" (4xx) from "we don't
@@ -18026,10 +18041,11 @@ class SessionManager:
                 transient = not isinstance(code, int) or code >= 500
                 last = attempt >= self.MIGRATION_UPLOAD_ATTEMPTS
                 if not transient or last:
-                    log(f"migration upload failed for {migration_id}: {e}")
+                    log(f"migration upload failed for {migration_id}: "
+                        f"{_urlopen_error_detail(e)}")
                     return False
                 log(f"migration {migration_id}: upload attempt {attempt} failed "
-                    f"({e}) — retrying")
+                    f"({_urlopen_error_detail(e)}) — retrying")
                 time.sleep(self.MIGRATION_UPLOAD_BACKOFF_SEC * attempt)
         return False
 
@@ -18047,7 +18063,8 @@ class SessionManager:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return resp.read()
         except Exception as e:
-            log(f"migration download failed for {migration_id}: {e}")
+            log(f"migration download failed for {migration_id}: "
+                f"{_urlopen_error_detail(e)}")
             return None
 
     def restart(self, sid):
@@ -18305,7 +18322,7 @@ class SessionManager:
                     req, timeout=UPLOAD_DOWNLOAD_TIMEOUT_SEC) as resp:
                 return resp.read(UPLOAD_MAX_BYTES + 1)
         except Exception as e:
-            log(f"upload {upload_id}: download failed: {e}")
+            log(f"upload {upload_id}: download failed: {_urlopen_error_detail(e)}")
             return None
 
     def _store_uploads(self, sess, uploads):
@@ -21781,7 +21798,10 @@ class SessionManager:
                 log(f"archive raw: the hub refused {transcript_id} {rel} "
                     f"permanently (HTTP {e.code}); not retrying it")
                 return {"skip": True}
-            log(f"archive raw push failed for {transcript_id} {rel}: {e}")
+            # 5xx (or an odd non-4xx status): the hub's own words, not the bare
+            # status line, matching the chunk sibling above (XERK-300).
+            log(f"archive raw push failed for {transcript_id} {rel}: "
+                f"{_http_error_detail(e)}")
             return None
         except Exception as e:
             log(f"archive raw push failed for {transcript_id} {rel}: {e}")
