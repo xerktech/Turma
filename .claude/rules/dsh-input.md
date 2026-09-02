@@ -184,6 +184,11 @@ read-only UI too. Decision + legality vs XERK-498: `dsh.md`.
     `running:true` and relaunched the doomed dsh at a flat cadence (backoff reset). Any probe failure
     (refused / non-200 / no marker) reads NOT serving, which engages the backoff. Host-verified against
     real `dsh web` 0.1.1-rc.2 (serving) and a dumb HTTP squatter on the port (not serving).
+    - **The markers are COUPLED to dsh's rendered page** (same drift class as qwen's parser). A future
+      dsh that renames its client-module id or `<title>` would read a genuinely-serving dsh as NOT
+      serving, and the supervisor would kill+relaunch it in a backoff loop reporting `running:false`.
+      Re-verify `DSH_WEB_MARKERS` against the real page (`curl http://<host>:<port>/`) after a dsh
+      upgrade; host-proof only, dsh is not in CI.
 - **Adopts an in-place-updated instance**; `_handle_shutdown` does NOT kill it (like a dsh session's
   tmux).
 - **Wire: `dsh.web = {running, port, url}`, OMITTED when down** — same capability-flag discipline as
