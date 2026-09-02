@@ -9057,15 +9057,24 @@ setInterval(() => {
 // Space Grotesk), and the icon/favicon set + web manifest. Read once into memory
 // and served UNAUTHENTICATED from an explicit allowlist (see the router) — the
 // login page must render its CSS/fonts/icon before any session cookie exists,
-// and none of this leaks anything (same rationale as /healthz). Icons and fonts
-// are content-stable under their own names, so they cache hard; the stylesheet
-// and scripts change every deploy and are fingerprinted instead (below).
+// and none of this leaks anything (same rationale as /healthz). The stylesheet
+// and scripts change every deploy and are fingerprinted (below); the icons,
+// fonts and manifest are served under their OWN mutable names and REVALIDATE
+// with an ETag instead (XERK-330).
 const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
-// The BARE name of a fingerprinted asset revalidates on every request: the only
-// thing still asking for it is an HTML page a cache handed back from before the
-// deploy, and that page is precisely the one that must not be given a stale
-// body. `no-cache` is store-and-revalidate, not don't-store, so with the ETag
-// below the usual answer is a 304 (XERK-312).
+// `no-cache` is store-and-revalidate (NOT don't-store), so with the ETag below
+// the usual answer is a cheap 304. Two kinds of URL carry it:
+//   - the BARE name of a fingerprinted asset — the only thing still asking for
+//     it is a pre-deploy HTML page a cache handed back, precisely the page that
+//     must not be given a stale body (XERK-312); and
+//   - the icons/fonts/manifest, which have no fingerprinted twin: they are
+//     referenced three different ways (HTML <link>, app.css url(), manifest
+//     JSON) so fingerprinting them was a design widening deferred out of
+//     XERK-312. Immutable-for-a-year under an editable name meant an in-place
+//     edit (a rebrand, a favicon tweak, a regenerated font subset) stayed
+//     invisible to every warm browser for up to a year, unfixable short of
+//     renaming the file. Revalidating makes such an edit visible on the next
+//     navigation (XERK-330).
 const REVALIDATE_CACHE = "public, no-cache";
 // A fingerprint no release ever minted is still a 200 (see `supersededAsset`),
 // and an unauthenticated caller can ask for 2^48 of them. `private` keeps a
@@ -9090,16 +9099,16 @@ const staticAsset = (body, type, cache) => ({ body, type, cache, etag: `"${asset
 // Filenames are hardcoded string literals (no request data reaches path.join) so
 // there's no path-traversal surface; the request only ever indexes this fixed map.
 const STATIC_ASSETS = {
-  "/favicon.svg":          staticAsset(readAsset("favicon.svg"),          "image/svg+xml",                            IMMUTABLE_CACHE),
-  "/favicon.ico":          staticAsset(readAsset("favicon.ico"),          "image/x-icon",                             IMMUTABLE_CACHE),
-  "/favicon-16.png":       staticAsset(readAsset("favicon-16.png"),       "image/png",                                IMMUTABLE_CACHE),
-  "/favicon-32.png":       staticAsset(readAsset("favicon-32.png"),       "image/png",                                IMMUTABLE_CACHE),
-  "/apple-touch-icon.png": staticAsset(readAsset("apple-touch-icon.png"), "image/png",                                IMMUTABLE_CACHE),
-  "/icon-192.png":         staticAsset(readAsset("icon-192.png"),         "image/png",                                IMMUTABLE_CACHE),
-  "/icon-512.png":         staticAsset(readAsset("icon-512.png"),         "image/png",                                IMMUTABLE_CACHE),
-  "/site.webmanifest":     staticAsset(readAsset("site.webmanifest"),     "application/manifest+json; charset=utf-8", "public, max-age=3600"),
-  "/fonts/inter-latin-wght-normal.woff2":         staticAsset(readAsset("fonts", "inter-latin-wght-normal.woff2"),         "font/woff2", IMMUTABLE_CACHE),
-  "/fonts/space-grotesk-latin-wght-normal.woff2": staticAsset(readAsset("fonts", "space-grotesk-latin-wght-normal.woff2"), "font/woff2", IMMUTABLE_CACHE),
+  "/favicon.svg":          staticAsset(readAsset("favicon.svg"),          "image/svg+xml",                            REVALIDATE_CACHE),
+  "/favicon.ico":          staticAsset(readAsset("favicon.ico"),          "image/x-icon",                             REVALIDATE_CACHE),
+  "/favicon-16.png":       staticAsset(readAsset("favicon-16.png"),       "image/png",                                REVALIDATE_CACHE),
+  "/favicon-32.png":       staticAsset(readAsset("favicon-32.png"),       "image/png",                                REVALIDATE_CACHE),
+  "/apple-touch-icon.png": staticAsset(readAsset("apple-touch-icon.png"), "image/png",                                REVALIDATE_CACHE),
+  "/icon-192.png":         staticAsset(readAsset("icon-192.png"),         "image/png",                                REVALIDATE_CACHE),
+  "/icon-512.png":         staticAsset(readAsset("icon-512.png"),         "image/png",                                REVALIDATE_CACHE),
+  "/site.webmanifest":     staticAsset(readAsset("site.webmanifest"),     "application/manifest+json; charset=utf-8", REVALIDATE_CACHE),
+  "/fonts/inter-latin-wght-normal.woff2":         staticAsset(readAsset("fonts", "inter-latin-wght-normal.woff2"),         "font/woff2", REVALIDATE_CACHE),
+  "/fonts/space-grotesk-latin-wght-normal.woff2": staticAsset(readAsset("fonts", "space-grotesk-latin-wght-normal.woff2"), "font/woff2", REVALIDATE_CACHE),
 };
 
 // The shared stylesheet and scripts are MUTABLE — they change with every deploy
@@ -9211,6 +9220,12 @@ function sendPage(req, res, page) {
 // proxyTerm() injects the matching @font-face. A Nerd Font gives the TUI full
 // Unicode + icon coverage regardless of what fonts the viewer's machine has.
 const TERM_FONT = fs.readFileSync(path.join(__dirname, "public", "jbm-nerd-mono.woff2"));
+// Served under its own fixed, editable name like the icons/fonts above, so it
+// carries an ETag and revalidates (XERK-330) rather than caching immutable for a
+// year — else swapping the bundled font leaves every warm terminal on the old
+// ~1 MB file with no invalidation short of a rename. The ETag keeps the common
+// answer a cheap 304, so the file is still fetched once in the steady state.
+const TERM_FONT_ETAG = `"${assetFingerprint(TERM_FONT)}"`;
 // <link preload> + <style> injected into ttyd's HTML document defining that
 // font as 'JBMNerd' — the family name the agent points ttyd's fontFamily at.
 // The preload starts the 1 MB fetch at parse time, and the /term-font.woff2
@@ -10039,13 +10054,21 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Web font for the live terminal (referenced by the @font-face proxyTerm
-    // injects into ttyd's page). Immutable + long-lived so the browser fetches
-    // the ~1 MB file once and caches it.
+    // injects into ttyd's page). Served under a fixed, editable name, so it
+    // revalidates with an ETag (XERK-330) — a 304 keeps the ~1 MB file fetched
+    // once in the steady state, while an in-place swap becomes visible on the
+    // next open instead of caching hard for a year.
     if (req.method === "GET" && url.pathname === "/term-font.woff2") {
-      res.writeHead(200, {
+      const headers = {
         "Content-Type": "font/woff2",
-        "Cache-Control": "public, max-age=31536000, immutable",
-      });
+        "Cache-Control": REVALIDATE_CACHE,
+        ETag: TERM_FONT_ETAG,
+      };
+      if (etagMatches(req, TERM_FONT_ETAG)) {
+        res.writeHead(304, headers);
+        return res.end();
+      }
+      res.writeHead(200, headers);
       return res.end(TERM_FONT);
     }
 
