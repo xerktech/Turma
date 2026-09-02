@@ -1,6 +1,5 @@
 ---
 paths:
-  - "poc/turma-2.0-poc/**"
   - "agent/hub-agent.py"
   - "agent/dsh_transcript.py"
   - "agent/dsh_session.py"
