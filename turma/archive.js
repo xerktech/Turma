@@ -1416,21 +1416,117 @@ function listArchive(opts) {
   const args = [];
   if (opts.repo) { where.push("repo = ?"); args.push(opts.repo); }
   if (opts.host) { where.push("host = ?"); args.push(opts.host); }
+  // filePath + archiveBytes are fetched only to verify each row against its file
+  // (XERK-280); they are stripped before the row is returned.
   const sql = `SELECT transcriptId, host, remoteKey, repo, worktree, summary,
-      createdAt, endedTs, msgCount
+      createdAt, endedTs, msgCount, filePath, archiveBytes
     FROM sessions ${where.length ? "WHERE " + where.join(" AND ") : ""}
     ORDER BY COALESCE(endedTs, createdAt, '') DESC, transcriptId DESC
     LIMIT ? OFFSET ?`;
   const sessions = db.prepare(sql).all(...args, limit, offset);
+  for (const row of sessions) {
+    reconcileListedRow(row);
+    delete row.filePath;
+    delete row.archiveBytes;
+  }
   return { sessions };
+}
+
+// Verify one browse row against its `.jsonl` and self-heal a stale msgCount
+// (XERK-280). A stat is cheap and the .jsonl's size EQUALS its cached
+// archiveBytes on a healthy transcript (both are the append-only line bytes), so
+// a size mismatch is the tell that the file was deleted-and-recreated or
+// truncated under a surviving row — the only case we then pay a full read to
+// recount. An absent file (ENOENT) or a stat error is left untouched: it cannot
+// be told from a mount blip, and a browse must never mutate on an absence
+// (heal happens on the transcript read, which is positive proof). A placeholder
+// row (no filePath) has nothing on disk to check.
+function reconcileListedRow(row) {
+  if (!row.filePath) return;
+  const jsonl = filePaths(row.filePath).jsonl;
+  let st;
+  try { st = fs.statSync(jsonl); } catch { return; }
+  if (!st.isFile() || st.size === row.archiveBytes) return;
+  let raw;
+  try { raw = fs.readFileSync(jsonl, "utf8"); } catch { return; }
+  row.msgCount = reconcileRow(row.transcriptId, row.msgCount, row.archiveBytes,
+    parseEntries(raw), Buffer.byteLength(raw));
+}
+
+// Parse a stored `.jsonl`'s text into the entry list a viewer renders. One JSON
+// object per line (torn/blank lines skipped); the file is the source of truth for
+// a transcript's content, so this count IS the true msgCount for what's on disk.
+function parseEntries(raw) {
+  const entries = [];
+  for (const line of raw.split("\n")) {
+    const s = line.trim();
+    if (!s) continue;
+    try {
+      const e = JSON.parse(s);
+      if (e && typeof e === "object") entries.push({
+        uuid: e.uuid, role: e.role, ts: e.ts, text: e.text || "",
+        blocks: Array.isArray(e.blocks) ? e.blocks : [],
+      });
+    } catch { /* skip a torn line */ }
+  }
+  return entries;
+}
+
+// Verify a transcript's cached metadata against its file ON READ, and self-heal
+// when they disagree (XERK-280). The organized `.jsonl` is the source of truth
+// for a transcript's content; the sessions row's msgCount/archiveBytes and the
+// entries_fts rows are a cache of it. An operator deleting a `.jsonl` by hand
+// leaves that cache describing bytes no longer on disk — the next delta appends
+// at the old cursor onto a shorter file, so msgCount over-counts and search
+// returns snippets from messages that are gone.
+//
+// This is deliberately a READ-path repair, never a write-path one. A failed stat
+// cannot tell a deletion from a mount blip / renamed parent / ESTALE, and guessing
+// wrong on the write path duplicates a re-pushed conversation or latches the store
+// full (XERK-267 built and reproduced both). A read heals only on POSITIVE PROOF —
+// `entries`/`trueBytes` come from a file we just read IN FULL — never on an
+// absence, so a transient unmount yields the honest empty/unknown answer of the
+// moment and mutates nothing. The row and FTS are rebuilt from exactly the entries
+// the file yields, matching what a full rebuildIndex would derive for this id.
+//
+// It does NOT resurrect the deleted prefix: `bytesStored` (the agent-facing
+// cursor) is left alone, so the agent does not re-push bytes it believes we hold,
+// and future deltas append contiguously after the current file — the accepted
+// consequence is a truncated view of one already-ended session, matching the
+// bytes actually on disk, rather than an index that lies about them. Returns the
+// true msgCount. No-op (and no write) when the cache already agrees, which is
+// every healthy transcript, so a read is only charged the tx for a stale row.
+function reconcileRow(transcriptId, storedCount, storedBytes, entries, trueBytes) {
+  const trueCount = entries.length;
+  if (trueCount === storedCount && trueBytes === storedBytes) return trueCount;
+  const insert = db.prepare(
+    "INSERT INTO entries_fts(text, transcriptId, uuid, role, ts) VALUES(?,?,?,?,?)"
+  );
+  tx(() => {
+    // entries_fts carries no per-transcript cursor we track, so replace the whole
+    // set for this id — the file is bounded (ARCHIVE_TRANSCRIPT_MAX) and this runs
+    // only for the rare stale row, never on a healthy read.
+    db.prepare("DELETE FROM entries_fts WHERE transcriptId=?").run(transcriptId);
+    for (const e of entries) {
+      insert.run(String(e.text || ""), transcriptId, e.uuid || null,
+        e.role || null, e.ts || null);
+    }
+    db.prepare("UPDATE sessions SET msgCount=?, archiveBytes=? WHERE transcriptId=?")
+      .run(trueCount, trueBytes, transcriptId);
+  });
+  console.error(
+    `archive: reconciled ${transcriptId} on read — index claimed ${storedCount} ` +
+    `msgs/${storedBytes}B, file holds ${trueCount}/${trueBytes}B (a .jsonl was ` +
+    `deleted or truncated under a surviving row; cursor left as-is)`);
+  return trueCount;
 }
 
 // The full stored transcript of one archived session, read from its canonical
 // organized file (not the index). null when unknown/missing.
 function getTranscript(transcriptId) {
   openDb();
-  const row = db.prepare("SELECT filePath, repo, host, worktree, summary, endedTs, createdAt "
-    + "FROM sessions WHERE transcriptId=?").get(transcriptId);
+  const row = db.prepare("SELECT filePath, repo, host, worktree, summary, endedTs, createdAt, "
+    + "msgCount, archiveBytes FROM sessions WHERE transcriptId=?").get(transcriptId);
   // No row at all — the hub has genuinely never heard of this transcript.
   if (!row) return null;
   // A row with no organized file is a manifest PLACEHOLDER (manifestCursors)
@@ -1461,18 +1557,13 @@ function getTranscript(transcriptId) {
     if (e && e.code === "ENOENT") return { ...meta, entries: [] };
     return null;
   }
-  const entries = [];
-  for (const line of raw.split("\n")) {
-    const s = line.trim();
-    if (!s) continue;
-    try {
-      const e = JSON.parse(s);
-      if (e && typeof e === "object") entries.push({
-        uuid: e.uuid, role: e.role, ts: e.ts, text: e.text || "",
-        blocks: Array.isArray(e.blocks) ? e.blocks : [],
-      });
-    } catch { /* skip a torn line */ }
-  }
+  const entries = parseEntries(raw);
+  // A successful full read is positive proof of what's on disk: heal the cached
+  // msgCount/archiveBytes + FTS if a deleted/truncated file left them stale
+  // (XERK-280). The transcript view already returns the true entries below; this
+  // stops listArchive/search claiming the vanished ones going forward.
+  reconcileRow(transcriptId, row.msgCount, row.archiveBytes, entries,
+    Buffer.byteLength(raw));
   return { ...meta, entries };
 }
 

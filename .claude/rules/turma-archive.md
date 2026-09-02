@@ -179,8 +179,21 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     - **Do not "improve" this into an indexed column reconciled against disk** — a failed stat can't
       tell "deleted" from "unmounted/renamed/ESTALE", and guessing wrong either duplicates a
       re-pushed conversation or latches the ceiling shut forever. Both were built and reproduced.
-  - **A deleted `.jsonl` whose index row survives leaves the cursor alone** and the next delta appends
-    onto the gap — pre-existing, XERK-280.
+  - **A deleted/truncated `.jsonl` under a surviving row is HEALED ON READ, never on write** (XERK-280).
+    `getTranscript` and `listArchive` compare the row's cached `msgCount`/`archiveBytes` (and the
+    `entries_fts` rows) against the file and re-derive them from it when they disagree — so the index
+    stops lying after an operator hand-deletes a `.jsonl`. The write path is UNTOUCHED on purpose: a
+    failed stat can't tell a deletion from a mount blip/ESTALE, and guessing there duplicates or bricks
+    (the two XERK-267 attempts). A read heals only on POSITIVE PROOF — a file it read IN FULL (its
+    successful-read count equals `archiveBytes`; `listArchive` stats first and reads only a proven
+    mismatch), never on an ENOENT/EIO absence, so a transient unmount mutates nothing.
+    - **`bytesStored` (the agent cursor) is LEFT ALONE** — the deleted prefix is gone and not re-fetched
+      (the accepted consequence: a truncated view of one ended session, matching disk). The heal only
+      makes the count/search honest and repairs `archiveBytes`'s relationship to the file going forward.
+    - **Residual, deliberate:** a file fully deleted and NEVER re-pushed stays ENOENT — indistinguishable
+      from a blip — so its browse `msgCount` is left stale (its transcript view still reads honestly
+      empty, XERK-422). Only a file we can positively read (recreated/truncated) is healed. Tests: the
+      `XERK-280:` cases in `archive.test.js`.
 - **`manifestCursors` is bounded too** (`ARCHIVE_MANIFEST_CURSOR_MAX`, 2000) — the costlier of the two
   (a SELECT + INSERT per entry); uncapped it also makes the raw cursor cap pointless (same caller
   sends manifest entries instead, for a much bigger stall).

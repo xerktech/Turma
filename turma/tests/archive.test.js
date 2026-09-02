@@ -913,3 +913,92 @@ test("dshTrajectory returns null when a session has no dsh native log (XERK-498)
   assert.equal(archive.dshTrajectory("nodsh"), null);
   assert.equal(archive.dshTrajectory("never-seen-at-all"), null);
 });
+
+// --- XERK-280: a deleted/truncated .jsonl under a surviving row is healed on read ---
+
+// The canonical .jsonl path for an id, as ingestChunk placed it.
+function jsonlFor(id, meta, host) {
+  return path.join(process.env.ARCHIVE_DIR, archive.archiveRelPath(id, { ...meta, host }));
+}
+
+test("XERK-280: getTranscript heals msgCount + FTS after a delete+recreate", () => {
+  const M = { ...META, summary: "x280 recreate" };
+  archive.ingestChunk("nas280", "x280a", { ...M }, 0, 100, [
+    ent("a1", "user", "one alpha280"), ent("a2", "assistant", "two beta280"),
+  ]);
+  archive.ingestChunk("nas280", "x280a", { ...M }, 100, 200, [ent("a3", "user", "three gamma280")]);
+  // Index believes 3 messages are stored.
+  assert.equal(archive.listArchive({ host: "nas280" }).sessions
+    .find((s) => s.transcriptId === "x280a").msgCount, 3);
+
+  // Operator deletes the .jsonl by hand; the row survives, cursor untouched.
+  fs.unlinkSync(jsonlFor("x280a", M, "nas280"));
+  // The next delta appends at the old cursor onto the now-recreated (short) file.
+  archive.ingestChunk("nas280", "x280a", { ...M }, 200, 300, [ent("a4", "user", "after deletion x280")]);
+
+  // On disk: only the post-deletion line survives.
+  const t = archive.getTranscript("x280a");
+  assert.equal(t.entries.length, 1);
+  assert.equal(t.entries[0].text, "after deletion x280");
+
+  // The read healed the row: msgCount now matches disk, not the lie.
+  assert.equal(archive.listArchive({ host: "nas280" }).sessions
+    .find((s) => s.transcriptId === "x280a").msgCount, 1);
+  // And search no longer returns the vanished messages.
+  const hitsGamma = archive.searchArchive("gamma280").groups
+    .flatMap((g) => g.matches).filter((m) => m.transcriptId === "x280a");
+  assert.equal(hitsGamma.length, 0, "deleted message dropped from FTS");
+  const hitsAfter = archive.searchArchive("after").groups
+    .flatMap((g) => g.matches).filter((m) => m.transcriptId === "x280a");
+  assert.equal(hitsAfter.length, 1, "surviving message still searchable");
+});
+
+test("XERK-280: listArchive heals a stale row on its own (before any transcript view)", () => {
+  const M = { ...META, summary: "x280 listheal" };
+  archive.ingestChunk("nas280", "x280b", { ...M }, 0, 100, [
+    ent("b1", "user", "one"), ent("b2", "assistant", "two"), ent("b3", "user", "three"),
+  ]);
+  fs.unlinkSync(jsonlFor("x280b", M, "nas280"));
+  archive.ingestChunk("nas280", "x280b", { ...M }, 100, 200, [ent("b4", "user", "survivor")]);
+  // listArchive alone (no getTranscript first) reports the true, healed count.
+  const row = archive.listArchive({ host: "nas280" }).sessions.find((s) => s.transcriptId === "x280b");
+  assert.equal(row.msgCount, 1);
+  // Helper columns never leak onto the wire.
+  assert.equal("filePath" in row, false);
+  assert.equal("archiveBytes" in row, false);
+  // Healed values match a full rebuild-from-disk (the file is the source of truth).
+  archive.rebuildIndex();
+  assert.equal(archive.listArchive({ host: "nas280" }).sessions
+    .find((s) => s.transcriptId === "x280b").msgCount, 1);
+});
+
+test("XERK-280: a healthy transcript is never mutated on read", () => {
+  const M = { ...META, summary: "x280 healthy" };
+  archive.ingestChunk("nas280", "x280c", { ...M }, 0, 100, [
+    ent("c1", "user", "hello"), ent("c2", "assistant", "world"),
+  ]);
+  const jsonl = jsonlFor("x280c", M, "nas280");
+  const before = fs.statSync(jsonl).mtimeMs;
+  const t = archive.getTranscript("x280c");
+  assert.equal(t.entries.length, 2);
+  assert.equal(archive.listArchive({ host: "nas280" }).sessions
+    .find((s) => s.transcriptId === "x280c").msgCount, 2);
+  // No heal ran, so the file was not rewritten and the count held.
+  assert.equal(fs.statSync(jsonl).mtimeMs, before);
+});
+
+test("XERK-280: a fully-deleted file (ENOENT) is NOT mutated on read — blip-safe residual", () => {
+  const M = { ...META, summary: "x280 enoent" };
+  archive.ingestChunk("nas280", "x280d", { ...M }, 0, 100, [
+    ent("d1", "user", "one"), ent("d2", "assistant", "two"),
+  ]);
+  fs.unlinkSync(jsonlFor("x280d", M, "nas280"));
+  // getTranscript serves the honest empty view (XERK-422) but must NOT heal:
+  // ENOENT cannot be told from a mount blip, so a read mutates nothing.
+  const t = archive.getTranscript("x280d");
+  assert.deepEqual(t.entries, []);
+  // The row's count is deliberately left as-is (the ambiguous case the ticket
+  // isolates); it is not zeroed on an absence.
+  assert.equal(archive.listArchive({ host: "nas280" }).sessions
+    .find((s) => s.transcriptId === "x280d").msgCount, 2);
+});
