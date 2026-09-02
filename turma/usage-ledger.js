@@ -799,6 +799,16 @@ function scheduleSnapshot() {
   snapshotTimer.unref();
 }
 
+// Write NOW, cancelling any pending debounce/snapshot — the hub's graceful
+// shutdown flushes here so a rolling deploy never drops the unsaved deltas the
+// 5s debounce / 5min snapshot were still holding (this is the only copy of a
+// year of spend). Async like writeNow; `done(err|null)` fires on completion.
+function flush(done) {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
+  writeNow(done);
+}
+
 // A host name reaches the log from an agent-supplied field, so it gets the same
 // treatment server.js's logName gives it: JSON.stringify does the line-forging
 // half, and the sweep after it covers the control characters JSON leaves intact
@@ -1114,7 +1124,7 @@ function has(key) {
 load();
 
 module.exports = {
-  ingest, fold, retiredAgents, forget, has,
+  ingest, fold, retiredAgents, forget, has, flush,
   LEDGER_FILE, LEDGER_MAX, LEDGER_DAYS, LEDGER_HOSTS, LEDGER_REPOS, RETIRED_MAX,
   LEDGER_MODELS, LEDGER_NAME_MAX, hostShare,
   SYSTEM_USAGE_REPO, isSystemUsageRepo, foldSystemRepos,

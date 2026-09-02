@@ -1425,6 +1425,26 @@ function scheduleSave() {
   saveTimer.unref();
 }
 
+// Write state.json NOW, synchronously — the graceful-shutdown path (SIGTERM on a
+// rolling deploy). `scheduleSave` debounces 30s, so a hard exit drops up to that
+// much of the registry: queued commands, refusal stamps, org bindings. A blocking
+// write is right HERE (nothing else runs during drain) and its renameSync is
+// atomic like the async path's, so a half-written file can never be left for the
+// next boot's restore. Cancels the pending debounce so it can't fire post-exit.
+function flushStateNow() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  const blob = serializeAgentsForSave();
+  if (blob === null) return; // unserializable — same give-up as the debounced path
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    const tmp = `${STATE_FILE}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, blob);
+    fs.renameSync(tmp, STATE_FILE);
+  } catch (e) {
+    console.error(`state flush on shutdown failed: ${e.message}`);
+  }
+}
+
 function prune() {
   const now = Date.now();
   for (const [key, a] of Object.entries(agents)) {
@@ -12980,6 +13000,7 @@ if (process.env.TURMA_TEST) {
     supersededAsset,
     invalidateAgentsCache,
     serializeAgentsForSave,
+    flushStateNow, // graceful-shutdown synchronous state flush (XERK-552)
     // The usage-coercion warning is rate-limited to one line a minute across the
     // WHOLE fleet, on module state. Exported so a test can hold BOTH halves of
     // the rule — that a deliberate `null` stays silent AND that a wrong-typed
@@ -13303,6 +13324,56 @@ if (process.env.TURMA_TEST) {
   if (TURMA_AGENT_TOKEN && !TURMA_AGENT_STRICT) {
     console.warn("WARNING: TURMA_AGENT_STRICT not set — the shared TURMA_AGENT_TOKEN is still accepted, so an agent can act as any host. Give each agent `node server.js --agent-token <host>` as its TURMA_TOKEN, then set TURMA_AGENT_STRICT=1");
   }
+
+  // ---- Graceful shutdown (XERK-552) --------------------------------------
+  // The hub is single-replica on an RWO volume, so a rolling deploy is a
+  // stop-then-start: k8s sends SIGTERM, waits terminationGracePeriodSeconds,
+  // then SIGKILL. Node's DEFAULT SIGTERM action is an instant exit with no
+  // flush — which drops the last <=30s of registry state (queued commands,
+  // refusal stamps, org bindings) and the unsaved usage-ledger deltas, and
+  // leaves every SSE stream and agent tunnel to die on a timeout instead of
+  // reconnecting. This handler makes the deploy quiet and lossless: flush the
+  // durable stores, close the long-lived streams so clients reconnect at once
+  // to the next pod, and exit promptly so the volume frees and the new pod can
+  // mount it. It is NOT high availability — a single replica still has a brief
+  // reconnect gap — it is the floor that removes the state loss and the hang.
+  // Rationale and the multi-replica options above it: docs/turma-ha-design.md.
+  const SHUTDOWN_DRAIN_MS = positiveEnv("SHUTDOWN_DRAIN_MS", 10 * 1000);
+  let draining = false;
+  const gracefulShutdown = (signal) => {
+    if (draining) return; // a second signal must not race the first drain
+    draining = true;
+    console.log(`${signal} received — draining before exit`);
+    // Stop accepting new connections; in-flight HTTP requests finish on their own.
+    try { server.close(); } catch {}
+    // End the long-lived streams ourselves — server.close() waits on open SSE
+    // responses and never tracks upgraded WebSockets, so neither ends without
+    // this. Browsers' EventSource and each agent's tunnel both reconnect on
+    // their own; ending now beats waiting out an idle timeout.
+    for (const res of sseClients) { try { res.end(); } catch {} }
+    for (const name of Object.keys(controlChannels)) {
+      try { controlChannels[name].socket.destroy(); } catch {}
+    }
+    for (const host of Object.keys(liveClients)) {
+      for (const sid of Object.keys(liveClients[host] || {})) {
+        for (const sock of liveClients[host][sid] || []) { try { sock.destroy(); } catch {} }
+      }
+    }
+    // Flush every durable store. state.json is synchronous (nothing else runs
+    // now); the archive SQLite handle is closed so its last writes land; the
+    // usage ledger's write is async, and its callback is what ends the process.
+    flushStateNow();
+    try { archive.closeDb(); } catch {}
+    const finish = () => { console.log("drain complete — exiting"); process.exit(0); };
+    let done = false;
+    const once = () => { if (!done) { done = true; finish(); } };
+    try { usageLedger.flush(() => once()); } catch { once(); }
+    // Never overrun terminationGracePeriodSeconds — force out if a flush hangs.
+    setTimeout(() => { if (!done) { done = true; console.error("drain timed out — forcing exit"); process.exit(0); } }, SHUTDOWN_DRAIN_MS).unref();
+  };
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
   server.listen(PORT, () => {
     console.log(`turma listening on :${PORT} (max ${MAX_CONNECTIONS} concurrent connections)`);
     // Every one of these is derived from the container limit, so print what they

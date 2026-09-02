@@ -500,6 +500,21 @@ test("a repo or model literally named `added` still persists", () => {
   }));
 });
 
+test("XERK-552: flush() writes the store now, so a graceful shutdown loses no deltas", () => {
+  reset();
+  try { fs.unlinkSync(LEDGER); } catch { /* fresh */ }
+  ledger.ingest("h", beat({ [DAY]: 100 }, { r: { [DAY]: 100 } }), now);
+  // The 5s debounce has not fired — nothing is on disk yet — but flush must land it.
+  return new Promise((resolve, reject) => ledger.flush((err) => {
+    try {
+      assert.equal(err, null);
+      const onDisk = JSON.parse(fs.readFileSync(LEDGER, "utf8"));
+      assert.ok(onDisk.hosts.h, "the ingested host is flushed to disk");
+      resolve();
+    } catch (e) { reject(e); }
+  }));
+});
+
 test("hostShare leaves room for the JSON envelope", () => {
   // An EXACT even split means a store of hosts each perfectly inside their share
   // still overflows on the wrapper alone (XERK-338 QA F3). Nothing turned red if

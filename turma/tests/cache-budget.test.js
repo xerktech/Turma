@@ -52,6 +52,7 @@ const {
   server, agents, recordBytes,
   AGENT_CACHE_KEYS, AGENT_CACHE_HOST_MAX, AGENT_CACHE_TOTAL_MAX,
   cacheEntryRows, agentRecordSize, serializeAgentsForSave, AGENT_RECORD_MAX,
+  flushStateNow,
 } = hub;
 
 // ---- HTTP ------------------------------------------------------------------
@@ -187,4 +188,22 @@ test("save: serializeAgentsForSave strips the on-demand caches", async () => {
   }
   // The blob is far smaller than the live record's cache would make it.
   assert.ok(blob.length < 150 << 10);
+});
+
+test("XERK-552: flushStateNow writes state.json synchronously on the current thread", async () => {
+  resetRegistry();
+  await beat({ device: "shutdownhost" });
+  // No debounce, no await — the file must be on disk the instant the call returns.
+  flushStateNow();
+  const onDisk = JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8"));
+  assert.ok(onDisk["shutdownhost"], "the beaten host is persisted");
+  // And it strips the on-demand caches exactly as the debounced path does.
+  await beat({ device: "shutdownhost", historyResults: [historyDelivery("s1", 150)] });
+  flushStateNow();
+  const after = JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8"));
+  for (const cacheKey of AGENT_CACHE_KEYS) {
+    const v = after["shutdownhost"] && after["shutdownhost"][cacheKey];
+    assert.ok(v === undefined || (v && Object.keys(v).length === 0) || v === null,
+      `${cacheKey} must not be persisted by flushStateNow`);
+  }
 });
