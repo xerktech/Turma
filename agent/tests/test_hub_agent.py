@@ -18170,6 +18170,32 @@ class TestWorkflowRunDir(unittest.TestCase):
         for bad in ("../../../etc/passwd", "a/b", "", "x" * 65):
             self.assertIsNone(ha._subagent_transcript_path(main, bad))
 
+    # The two cases above assert the malformed-id CONTRACT, but each escape target
+    # is absent on disk — so the isfile/isdir gate refuses them too, and the test
+    # would still pass with the charset regex removed. These plant a REAL file/dir
+    # AT the escape target through intermediate real dirs, so the id genuinely
+    # resolves there once os.path collapses its `..`, and only the regex refuses
+    # it — the assertion now depends on the guard, not on the target's absence.
+
+    def test_a_forged_run_id_cannot_reach_a_real_dir_outside_the_tree(self):
+        main = self._main()
+        runs = os.path.join(main[:-len(".jsonl")], "subagents", "workflows")
+        os.makedirs(os.path.join(runs, "wf_x"))                # real intermediate
+        os.makedirs(os.path.join(os.path.dirname(runs), "pwned"))  # real target
+        # os.path.join(runs, "wf_x/../../pwned") collapses to subagents/pwned, a
+        # real dir — but "/" and "." fail VALID_WORKFLOW_RUN_ID_RE, so: None.
+        self.assertIsNone(ha._workflow_run_dir(main, "wf_x/../../pwned"))
+
+    def test_a_forged_subagent_id_cannot_reach_a_real_file_outside_the_tree(self):
+        main = self._main()
+        stem = main[:-len(".jsonl")]
+        os.makedirs(os.path.join(stem, "subagents", "agent-x"))   # real intermediate
+        with open(os.path.join(stem, "pwned.jsonl"), "w") as f:   # real target
+            f.write("secret")
+        # agent-<id>.jsonl with id "x/../../pwned" collapses to <stem>/pwned.jsonl,
+        # a real file — refused only because "/" and "." fail the id regex.
+        self.assertIsNone(ha._subagent_transcript_path(main, "x/../../pwned"))
+
 
 class TestSetSummary(ManagerMixin, unittest.TestCase):
     def test_renames_and_pins_the_name(self):
