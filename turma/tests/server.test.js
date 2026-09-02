@@ -2091,15 +2091,37 @@ test("http: a fat heartbeat gets a 413 it can act on, not a dropped socket", asy
 
 test("http: past the heartbeat cap the hub still ANSWERS (413), never a bare reset", async () => {
   const huge = { device: "huge-host", pad: "y".repeat(33 << 20) };
-  // `connection: close`: past cap + drain slack the hub destroys the socket, and
-  // node's default agent keep-alives, so a pooled-and-doomed socket would fail
-  // the NEXT test with a bogus "socket hang up".
+  // `connection: close`: node's default agent keep-alives, so a doomed socket
+  // pooled after this over-cap beat would fail the NEXT test with a bogus
+  // "socket hang up".
   const res = await request("POST", "/api/heartbeat", {
     body: huge, headers: { ...agentHeaders, connection: "close" },
   });
   assert.equal(res.status, 413);
   assert.equal(res.body.error, "body too large");
   assert.ok(res.body.limit > 0, "the agent needs the limit to resize against");
+});
+
+// XERK-291: the 413 above used to race the socket teardown — the drained
+// refusal answered mid-stream and then cut the socket, and under CPU contention
+// the destroy beat the response onto the wire, reaching the agent as ECONNRESET
+// instead of the status it exists to resize against. An over-cap body within the
+// drain window now drains to `end` and is answered there, on a quiet connection
+// that closes cleanly, so the status is guaranteed rather than probable. This
+// serial test pins that the honest over-cap path never DEGRADES to a bare reset
+// or a 400; the race itself only reproduces under load (see the PR's stress run).
+test("http: an over-cap heartbeat within the drain window always answers 413 (XERK-291)", async () => {
+  // Comfortably over the 32 MiB cap but inside the drain slack, so it drains to
+  // end rather than being cut as a flood — the honest "my beat outgrew the cap"
+  // case an agent must read a 413 to recover from.
+  const body = { device: "overcap-host", pad: "y".repeat((32 << 20) + (2 << 20)) };
+  for (let i = 0; i < 6; i++) {
+    const res = await request("POST", "/api/heartbeat", {
+      body, headers: { ...agentHeaders, connection: "close" },
+    });
+    assert.equal(res.status, 413, `attempt ${i}: a drained over-cap beat must get a status, not a reset`);
+    assert.ok(res.body && res.body.limit > 0, `attempt ${i}: the 413 carries the limit`);
+  }
 });
 
 test("http: a heartbeat whose device is not a plain host name is refused, not silently dropped", async () => {
