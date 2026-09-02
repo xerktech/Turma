@@ -11393,24 +11393,38 @@ test("live WS: a watched session whose transcript MOVES is re-armed onto the new
   const live = await wsConnect(`/live/movehost/ms1?auth=${token}`);
   assert.match(live.statusLine, /^HTTP\/1\.1 101/);
 
+  // Select the arm/re-arm frames by CONTENT, never by frame index. The control
+  // channel also multiplexes keepalive {ping} frames, and under the full-tree
+  // CI run's load a ping can interleave between the arm and the re-arm — a fixed
+  // index then picks up the ping and the test flakes (XERK-454, a timing flake,
+  // not an ordering bug: the re-arm itself is always correct). Watch frames are
+  // the only ones carrying a `watch` field, so filter to those.
+  const watchArms = () =>
+    ctrlFrames
+      .filter((f) => f.op === 0x1)
+      .map((f) => { try { return JSON.parse(f.payload.toString("utf8")); } catch { return null; } })
+      .filter((m) => m && m.watch === "ms1");
+
   // finally, not a tail of straight-line destroys: an open socket keeps the
   // run's event loop alive, so a failing assertion here would hang the suite
   // instead of reporting itself.
   try {
-    const first = await nextTextJson(ctrlFrames, 0);
-    assert.equal(first.transcriptId, "conv-one");
+    await waitFor(() => watchArms().length >= 1);
+    assert.equal(watchArms()[0].transcriptId, "conv-one");
 
     // A beat reporting the same transcript is not a move — nothing is re-sent.
     await beat("conv-one");
     // The restart lands: a new conversation, so the watch follows it.
     await beat("conv-two");
-    // Frame 1 is the SECOND control frame ever sent. Asserting the move landed
-    // there is also what proves the unchanged beat above sent nothing: had it
-    // re-armed, this would read conv-one.
-    const rearm = await nextTextJson(ctrlFrames, 1);
-    assert.equal(rearm.watch, "ms1");
-    assert.equal(rearm.worktreePath, "/wt/ms1");
-    assert.equal(rearm.transcriptId, "conv-two");
+    await waitFor(() => watchArms().some((m) => m.transcriptId === "conv-two"));
+
+    // Exactly two watch frames — the initial conv-one arm and the conv-two
+    // re-arm — which is also what proves the unchanged beat above re-sent
+    // nothing: a spurious re-arm would add a second conv-one frame.
+    const arms = watchArms();
+    assert.deepEqual(arms.map((m) => m.transcriptId), ["conv-one", "conv-two"]);
+    assert.equal(arms[1].watch, "ms1");
+    assert.equal(arms[1].worktreePath, "/wt/ms1");
   } finally {
     live.socket.destroy();
     ctrl.socket.destroy();
@@ -15396,12 +15410,16 @@ test("normalizeLocalModel bounds the name BEFORE spreading it", () => {
   // spread let one agent-authed heartbeat with a 24 MiB name OOM-kill the hub
   // at its deployed `mem_limit: 256m`, on repeat.
   //
-  // Two assertions, because neither is sufficient alone. A RESOURCE BUDGET is
-  // the honest behavioural check but is nondeterministic at close margins — an
-  // earlier version used 8 MiB against 50ms/64MB and caught the reintroduced
-  // bug only 5 runs in 8, decided by whether a GC landed between the samples.
-  // So the budget runs at 32 MiB (`HEARTBEAT_MAX`, the largest a beat can carry)
-  // with ~10x headroom, and a STRUCTURAL assertion holds the ordering exactly.
+  // Two DETERMINISTIC assertions, because neither is sufficient alone: a
+  // STRUCTURAL one that the slice precedes the spread, and a BEHAVIOURAL one on
+  // the coerced OUTPUT. There used to be a third — a wall-clock RESOURCE BUDGET
+  // (`coercing a 32 MiB name must take < 60ms`) — but it flaked in the full-tree
+  // CI run (XERK-454): `node --test` runs every suite in parallel, and on a
+  // loaded box a bounded coercion measured 90-170ms with no bug present. The
+  // budget was nondeterministic at any margin (an earlier 8 MiB/50ms version
+  // caught the reintroduced bug only 5 runs in 8, decided by whether a GC landed
+  // between the samples) and added no signal the two assertions below lack, so
+  // it was dropped rather than have an arbitrary threshold redden green PRs.
   const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   // The name coercion now lives in the shared sanitizeModelName helper (reused
   // for every discovered id too, XERK-489). It must slice(0, 512) BEFORE the
@@ -15411,13 +15429,14 @@ test("normalizeLocalModel bounds the name BEFORE spreading it", () => {
   assert.match(fn, /\[\.\.\.s\.slice\(0, 512\)/,
     "the model name must be bounded BEFORE the per-code-point spread");
 
+  // The behavioural half: a 32 MiB name (`HEARTBEAT_MAX`, the largest a beat can
+  // carry) coerces to the bounded 60-char value. A reintroduced unbounded spread
+  // still produces this output, so this alone doesn't catch the bug — the
+  // structural assertion above does — but it proves the coercion runs and bounds
+  // the served value, deterministically at any load.
   const huge = { device: "h", localModel: { available: true, model: "x".repeat(32 << 20) } };
-  const t0 = process.hrtime.bigint();
   hub.normalizeRecord(huge);
-  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   assert.equal(huge.localModel.model, "x".repeat(60));
-  // Bounded: ~0.1ms. Unbounded at this size: several hundred ms and ~600 MB.
-  assert.ok(ms < 60, `coercing a 32 MiB name took ${ms.toFixed(1)}ms — is it spreading first?`);
 });
 
 test("http: an EXPANDING coercion cannot escape the record ceiling", async () => {
