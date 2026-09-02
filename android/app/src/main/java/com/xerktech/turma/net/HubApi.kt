@@ -338,6 +338,15 @@ interface HubApi {
         @Body body: AutoStartRequest,
     ): OkResponse
 
+    // Flip an org's hands-off auto-merge opt-in (XERK-550), the second org-row
+    // switch. Hub-owned durable state like /autostart, an authoritative 200.
+    // Body: {enabled:true|false}.
+    @POST("api/jira/{siteKey}/automerge")
+    suspend fun setAutoMerge(
+        @Path("siteKey") siteKey: String,
+        @Body body: AutoMergeRequest,
+    ): OkResponse
+
     // Pin an org's palette color, or release it back to auto (XERK-145).
     // Hub-owned durable state like /autostart, an authoritative 200.
     // Body: {slot:1..8} or {auto:true}.
@@ -488,6 +497,9 @@ data class SummaryRequest(val summary: String)
 
 @Serializable
 data class AutoStartRequest(val enabled: Boolean)
+
+@Serializable
+data class AutoMergeRequest(val enabled: Boolean)
 
 /** Pin an org's palette slot (1..8), or `auto = true` to release the pin. */
 @Serializable

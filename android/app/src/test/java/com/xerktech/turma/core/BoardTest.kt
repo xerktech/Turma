@@ -652,6 +652,17 @@ class BoardTest {
         assertEquals(false, autoStartOn(mapOf(site to true), "other.atlassian.net"))
     }
 
+    @Test fun `autoMergeOn reads its own map, independent of auto-start`() {
+        val site = "acme.atlassian.net"
+        assertEquals(false, autoMergeOn(emptyMap(), site))
+        assertEquals(true, autoMergeOn(mapOf(site to true), site))
+        assertEquals(false, autoMergeOn(mapOf(site to true), "other.atlassian.net"))
+        // The two opt-ins are independent maps (XERK-550): an org opted into
+        // auto-start reads its own map, not the merge one, and vice-versa.
+        assertEquals(true, autoStartOn(mapOf(site to true), site))
+        assertEquals(false, autoMergeOn(emptyMap(), site))
+    }
+
     // XERK-83: the on-demand issue detail response envelope.
     @Test fun `a 202 pending response asks to poll again`() {
         assertEquals(IssueFetch.Pending, classifyIssueResponse(202, null))
