@@ -2028,6 +2028,25 @@ function request(method, pathName, { body, headers } = {}) {
 const agentHeaders = { authorization: "Bearer agenttok", "content-type": "application/json" };
 const userHeaders = { authorization: basic("hubuser", "hubpass") };
 
+// An oversize heartbeat body sized to land INSIDE the hub's drain window, so a
+// `request()` for it gets its 413 deterministically even under machine load
+// (XERK-313). readBody drains an oversize body up to `HEARTBEAT_MAX +
+// RAW_BODY_DRAIN_SLACK` and then DESTROYS the socket; a 33 MiB body sat a hair
+// past that window, so the destroy fired at the very end of the transfer and
+// raced the 413 the hub had already queued -- which the client lost as `read
+// ECONNRESET` when the box was busy (the flake this ticket fixes). A body a
+// touch over `HEARTBEAT_MAX` but well within the drain window is refused 413 the
+// identical way AND is drained to its end, so the socket is never destroyed and
+// the status always reaches the caller. This does NOT weaken XERK-235 (an
+// oversize body is answered, never a bare reset) -- it makes the answer the only
+// outcome; the end-to-end proof against a real container + real urllib named in
+// these tests' comments stays the strong guard. The pad must clear the JSON
+// wrapper too, so half the slack leaves ample room.
+function oversizeHeartbeatBody(device) {
+  const padLen = hub.HEARTBEAT_MAX + Math.floor(hub.RAW_BODY_DRAIN_SLACK / 2);
+  return { device, pad: "y".repeat(padLen) };
+}
+
 test("http: /healthz is unauthenticated; everything else is gated", async () => {
   assert.equal((await request("GET", "/healthz")).status, 200);
   assert.equal((await request("GET", "/api/agents")).status, 401);
@@ -2077,10 +2096,10 @@ test("http: a fat heartbeat gets a 413 it can act on, not a dropped socket", asy
 });
 
 test("http: past the heartbeat cap the hub still ANSWERS (413), never a bare reset", async () => {
-  const huge = { device: "huge-host", pad: "y".repeat(33 << 20) };
-  // `connection: close`: past cap + drain slack the hub destroys the socket, and
-  // node's default agent keep-alives, so a pooled-and-doomed socket would fail
-  // the NEXT test with a bogus "socket hang up".
+  const huge = oversizeHeartbeatBody("huge-host"); // oversize, but drainable (XERK-313)
+  // `connection: close`: node's default agent keep-alives, so even a cleanly
+  // drained-and-closed socket would be pooled and fail the NEXT test with a
+  // bogus "socket hang up".
   const res = await request("POST", "/api/heartbeat", {
     body: huge, headers: { ...agentHeaders, connection: "close" },
   });
@@ -14500,7 +14519,7 @@ test("budget: a body refused for being too large also gives its charge back", as
   // its own way for the budget to leak.
   assert.equal(hub.bodyInflightHeld(), 0);
   const res = await request("POST", "/api/heartbeat", {
-    body: { device: "big-host", pad: "y".repeat((33 << 20)) },
+    body: oversizeHeartbeatBody("big-host"),
     headers: { ...agentHeaders, connection: "close" },
   });
   assert.equal(res.status, 413);
@@ -14595,7 +14614,7 @@ test("http: an oversize body is NOT refused on its declaration", async () => {
   // are charged like any other, so a flood is refused 503 before buffering and
   // only what the hub can afford ever buffers its way to a 413.
   const res = await request("POST", "/api/heartbeat", {
-    body: { device: "declared-oversize", pad: "y".repeat(33 << 20) },
+    body: oversizeHeartbeatBody("declared-oversize"),
     headers: { ...agentHeaders, connection: "close" },
   });
   assert.equal(res.status, 413, "the caller must get a status, not a reset");
@@ -14612,8 +14631,12 @@ test("drain: only so many refused bodies may drain at once", async () => {
   assert.ok(hub.DRAIN_CONCURRENCY_MAX >= 1);
   // The one oversize body a healthy fleet produces still drains and still gets
   // its status back, which is the whole reason the cap is a count and not zero.
+  // Sized inside the drain window (oversizeHeartbeatBody, XERK-313) so the hub
+  // drains it to its end and answers rather than destroying the socket at the
+  // window's edge -- the mid-transfer reset that made this flake `read
+  // ECONNRESET` on a loaded box, corrupting suites that key off its pass/fail.
   const res = await request("POST", "/api/heartbeat", {
-    body: { device: "oversize-host", pad: "y".repeat((33 << 20)) },
+    body: oversizeHeartbeatBody("oversize-host"),
     headers: { ...agentHeaders, connection: "close" },
   });
   assert.equal(res.status, 413);

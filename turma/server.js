@@ -13062,7 +13062,7 @@ if (process.env.TURMA_TEST) {
     // a test pins that it exceeds the ordinary cost and that its worst case is
     // what the container is sized against.
     HEARTBEAT_MAX, HEARTBEAT_PARSE_COST,
-    DRAIN_CONCURRENCY_MAX, BODY_IDLE_TIMEOUT_MS, BODY_MIN_PROGRESS_BYTES,
+    DRAIN_CONCURRENCY_MAX, RAW_BODY_DRAIN_SLACK, BODY_IDLE_TIMEOUT_MS, BODY_MIN_PROGRESS_BYTES,
     BIG_LANE_MAX_HOLD_MS, budgetUnderPressure,
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these
     // and the suite stayed green, so they are exported to be pinned.
