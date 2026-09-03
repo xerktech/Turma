@@ -14298,6 +14298,34 @@ test("XERK-578: tokenRoll is coerced to a strict boolean; absent stays absent", 
   assert.equal("tokenRoll" in row("trNone"), false);
 });
 
+test("XERK-578: tokenBound is coerced to a strict boolean on the restore path", () => {
+  // normalizeRecord runs on the state.json restore, where a hand-edited or
+  // forged tokenBound could be any shape; it must land as a real boolean or an
+  // Android decode (typed) would throw the whole fleet array. (The heartbeat
+  // path re-derives tokenBound hub-side, so this is the restore half.)
+  const a = { tokenBound: "yes", tokenRoll: "yes" };
+  hub.normalizeRecord(a, "restore");
+  assert.equal(a.tokenBound, false);
+  assert.equal(a.tokenRoll, false);
+  const b = { tokenBound: true, tokenRoll: true };
+  hub.normalizeRecord(b, "restore");
+  assert.equal(b.tokenBound, true);
+  assert.equal(b.tokenRoll, true);
+});
+
+test("XERK-578: tokenBound is served only when the hub has a fleet master", () => {
+  const now = Date.now();
+  const rec = { device: "tbGate", lastSeen: now, tokenBound: true, commands: [] };
+  // This suite's hub HAS a master, so the field is served (a boolean).
+  assert.equal(hub.serializeAgent("tbGate", rec, now).tokenBound, true);
+  // A hub with NO master derives no per-host tokens, so it OMITS the field
+  // entirely — clients read absent as "no per-host tokens here" (no chip, no
+  // Roll button), never a misleading "shared token" warning on every host.
+  const noMaster = freshServerModule((env) => { delete env.TURMA_AGENT_TOKEN; });
+  const served = noMaster.serializeAgent("tbGate", { ...rec }, now);
+  assert.equal("tokenBound" in served, false);
+});
+
 // Build a client->server (masked, FIN) binary WebSocket frame. The hub's
 // wsParser accepts masked or unmasked frames; masking matches what a real
 // WS client (the tunnel-agent) sends, so this exercises the same wire bytes.

@@ -14164,6 +14164,7 @@ if (process.env.TURMA_TEST) {
     agentHostRefusal,
     agentPresentedRefusal,
     resolveEnrollToken,
+    serializeAgent,
     tokenHost,
     // The reverse-tunnel maps, exported so their null prototype can be asserted
     // directly. Reaching it through a socket instead means the regression is
