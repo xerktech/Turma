@@ -60,10 +60,45 @@ def prepare_worktree(repo, task, dest):
     return None
 
 
+def test_dir(task, dest):
+    """Directory the test command runs in: the worktree root, or a subdir.
+
+    Monorepo tasks (npm workspaces, a nested Python project) grade from inside
+    the component, not the repo root — a `test_cwd` names that component,
+    relative to the worktree. Absent, tests run at the root as before.
+    """
+    return os.path.join(dest, task["test_cwd"]) if task.get("test_cwd") else dest
+
+
+def setup(task, dest):
+    """Run a task's optional dependency bootstrap in the pristine worktree.
+
+    Returns (ok, detail). A task with no `setup_cmd` bootstraps nothing and is
+    always (True, "") — that keeps the harness-comparison tasks dependency-free
+    and comparable, which is the whole point of the flag being opt-in.
+
+    A bootstrap FAILURE is reported by the caller as its own outcome, never as a
+    test failure: a monorepo whose install step could not run is not an
+    unsolvable task, and conflating the two is exactly what made every Tenir
+    candidate read as "not solvable as specified" (XERK-449).
+    """
+    cmd = task.get("setup_cmd")
+    if not cmd:
+        return True, ""
+    try:
+        rc, out = run(cmd, cwd=dest, timeout=task.get("setup_timeout", 900))
+    except subprocess.TimeoutExpired:
+        return False, "setup command timed out"
+    if rc != 0:
+        return False, f"setup command failed (exit {rc}): {out.strip()[-300:]}"
+    return True, ""
+
+
 def verify(task, dest):
     """Run the task's test command. Returns (passed, output)."""
     try:
-        rc, out = run(task["test_cmd"], cwd=dest, timeout=task.get("test_timeout", 300))
+        rc, out = run(task["test_cmd"], cwd=test_dir(task, dest),
+                      timeout=task.get("test_timeout", 300))
     except subprocess.TimeoutExpired:
         return False, "test command timed out"
     return rc == 0, out
@@ -76,28 +111,37 @@ def cleanup(repo, dest):
 
 
 def validate(repo, task, workroot):
-    """Assert the red->green transition. Returns (ok, detail)."""
+    """Assert the red->green transition.
+
+    Returns (status, detail) where status is "pass", "fail" or "setup" — a
+    "setup" outcome is a bootstrap that could not run, kept distinct from a
+    "fail" (a genuine red->green miss) so a missing dependency is never counted
+    as an unsolvable task.
+    """
     dest = os.path.join(workroot, "validate-" + task["id"])
     cleanup(repo, dest)
     err = prepare_worktree(repo, task, dest)
     if err:
-        return False, err
+        return "fail", err
     try:
+        setup_ok, setup_detail = setup(task, dest)
+        if not setup_ok:
+            return "setup", setup_detail
         broken_pass, broken_out = verify(task, dest)
         if broken_pass:
-            return False, "tests PASS with the fix reverted — the task does not detect its own fix"
+            return "fail", "tests PASS with the fix reverted — the task does not detect its own fix"
 
         # Restore the implementation; the same tests must now pass.
         rc, out = run(["git", "checkout", task["commit"], "--"] + task["revert_paths"], cwd=dest)
         if rc != 0:
-            return False, f"restore failed: {out.strip()[:200]}"
+            return "fail", f"restore failed: {out.strip()[:200]}"
         fixed_pass, fixed_out = verify(task, dest)
         if not fixed_pass:
-            return False, "tests FAIL even with the real fix applied — task is not solvable as specified"
+            return "fail", "tests FAIL even with the real fix applied — task is not solvable as specified"
 
         failing = [ln for ln in broken_out.splitlines()
                    if ln.strip().startswith(("not ok", "FAIL", "✖", "AssertionError"))]
-        return True, f"red->green OK ({len(failing)} failing lines when broken)"
+        return "pass", f"red->green OK ({len(failing)} failing lines when broken)"
     finally:
         cleanup(repo, dest)
 
@@ -116,14 +160,22 @@ def main():
         tasks = [t for t in tasks if t["id"] in args.id]
     os.makedirs(args.workroot, exist_ok=True)
 
-    failures = 0
+    passed = failed = setup_failed = 0
+    label = {"pass": "PASS", "fail": "FAIL", "setup": "SETUP"}
     for task in tasks:
-        ok, detail = validate(args.repo, task, args.workroot)
-        print(f"{'PASS' if ok else 'FAIL'}  {task['id']:<34} {detail}", flush=True)
-        if not ok:
-            failures += 1
-    print(f"\n{len(tasks) - failures}/{len(tasks)} tasks valid")
-    return 1 if failures else 0
+        status, detail = validate(args.repo, task, args.workroot)
+        print(f"{label[status]}  {task['id']:<34} {detail}", flush=True)
+        if status == "pass":
+            passed += 1
+        elif status == "setup":
+            setup_failed += 1
+        else:
+            failed += 1
+    extra = f" ({setup_failed} could not bootstrap)" if setup_failed else ""
+    print(f"\n{passed}/{len(tasks)} tasks valid{extra}")
+    # A SETUP outcome is an environment gap, not a broken task, so it does not
+    # fail the gate the way a red->green miss does.
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
