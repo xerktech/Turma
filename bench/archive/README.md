@@ -39,7 +39,7 @@ client context. Keep it outside the repo. Only `scrub.py` output is committable.
 | `curate.py` | builds replay tasks from sessions that landed a merge commit |
 | `scrub.py` | redacts secrets and marks client-sensitive tasks `local-only` |
 | `tasks-archive.json` | the full curated pool, 57 accepted tasks |
-| `tasks-validated.json` | **the eval set** — 25 tasks proven red-then-green and leak-free |
+| `tasks-validated.json` | **the eval set** — 47 tasks (25 Turma + 22 Tenir) proven red-then-green and leak-free |
 
 Benchmark against `tasks-validated.json`. The pool file holds the curated tasks
 that did NOT pass validation as well as those that did — it does not hold the
@@ -57,7 +57,11 @@ python3 bench/validate_tasks.py --repo ~/git/Turma \
 ```
 
 `validate_tasks.py` takes a single `--repo`, so split the task file per repo
-before validating.
+before validating. The Turma tasks need only a Turma checkout; the Tenir tasks
+need a Tenir checkout plus the tooling their `setup_cmd` invokes — `npm` for the
+JS suites, and `uv` (preferred) or `python3-venv` for the `api` suites — since
+each Tenir task bootstraps its own dependencies (XERK-449). A bootstrap that
+cannot run is reported as `SETUP`, not `FAIL`, and does not fail the gate.
 
 ## Two things that will bite you
 

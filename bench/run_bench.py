@@ -193,6 +193,12 @@ def run(cmd, cwd=None, timeout=600, env=None):
     return proc.returncode, proc.stdout
 
 
+class SetupError(RuntimeError):
+    """A task's dependency bootstrap could not run — an environment gap, not a
+    harness/model failure and not an unsolved task, so it is recorded on its own
+    `setup_failed` flag and never counted as a capability result (XERK-449)."""
+
+
 # Instruction files every one of these harnesses auto-loads into its context.
 # They are removed from the prepared worktree — see strip_agent_instructions.
 AGENT_INSTRUCTION_FILES = ("CLAUDE.md", "AGENTS.md", "CRUSH.md", "GEMINI.md",
@@ -224,7 +230,15 @@ def strip_agent_instructions(dest):
 
 
 def prepare(repo, task, dest):
-    """Fresh worktree at the fix commit with the implementation rolled back."""
+    """Fresh worktree at the fix commit with the implementation rolled back.
+
+    A task's optional `setup_cmd` (a dependency bootstrap — `npm ci`, a venv
+    install) runs here, AFTER the broken-baseline commit and BEFORE the harness
+    starts, so the agent sees an installed tree and the bootstrap's artifacts
+    (node_modules, .venv) never land in the baseline it diffs against. It is
+    opt-in: a task without one bootstraps nothing, keeping the default runs
+    dependency-free and comparable across harnesses (XERK-449).
+    """
     if os.path.exists(dest):
         run(["git", "worktree", "remove", "--force", dest], cwd=repo)
         shutil.rmtree(dest, ignore_errors=True)
@@ -237,14 +251,24 @@ def prepare(repo, task, dest):
     strip_agent_instructions(dest)
     run(["git", "-c", "user.email=bench@turma", "-c", "user.name=bench",
          "commit", "-qam", "bench: broken baseline"], cwd=dest)
+    if task.get("setup_cmd"):
+        try:
+            rc, out = run(task["setup_cmd"], cwd=dest, timeout=task.get("setup_timeout", 900))
+        except subprocess.TimeoutExpired:
+            raise SetupError("setup_cmd timed out")
+        if rc != 0:
+            # Distinct from a test failure: the task could not be bootstrapped,
+            # so it was never given a fair chance and must not score as unsolved.
+            raise SetupError(f"setup_cmd failed (exit {rc}): {out.strip()[-200:]}")
     rc, head = run(["git", "rev-parse", "HEAD"], cwd=dest)
     return head.strip()
 
 
 def score(task, dest, baseline):
     """Did the tests go green, and did the agent commit anything?"""
+    test_cwd = os.path.join(dest, task["test_cwd"]) if task.get("test_cwd") else dest
     try:
-        rc, out = run(task["test_cmd"], cwd=dest, timeout=task.get("test_timeout", 600))
+        rc, out = run(task["test_cmd"], cwd=test_cwd, timeout=task.get("test_timeout", 600))
         solved = rc == 0
     except subprocess.TimeoutExpired:
         solved, out = False, "tests timed out"
@@ -366,6 +390,10 @@ def one_run(repo, task, hname, attempt, args, workroot, infra_try=1):
         os.makedirs(args.runs, exist_ok=True)
         with open(os.path.join(args.runs, f"{hname}-{task['id']}-{attempt}.log"), "w") as fh:
             fh.write(" ".join(cmd[:4]) + "\n\n" + out)
+    except SetupError as exc:                                   # bootstrap never ran
+        rec.update({"error": str(exc)[:300], "setup_failed": True,
+                    "solved": False, "committed": False,
+                    "seconds": round(time.time() - started, 1)})
     except Exception as exc:                                    # harness/setup blew up
         rec.update({"error": str(exc)[:300], "solved": False, "committed": False,
                     "seconds": round(time.time() - started, 1)})
@@ -377,6 +405,10 @@ def one_run(repo, task, hname, attempt, args, workroot, infra_try=1):
               f"INFRA FAILURE (never reached the model) — retry "
               f"{infra_try + 1}/{args.infra_retries}", flush=True)
         return one_run(repo, task, hname, attempt, args, workroot, infra_try + 1)
+    if rec.get("setup_failed"):
+        print(f"  {hname:<9} {task['id']:<28} attempt {attempt} "
+              f"SETUP FAILED (bootstrap never ran) — {rec.get('error')}", flush=True)
+        return rec
     print(f"  {hname:<9} {task['id']:<28} attempt {attempt} "
           f"solved={rec.get('solved')} committed={rec.get('committed')} "
           f"{rec.get('seconds')}s"
@@ -430,9 +462,19 @@ def main():
     print("\n" + "=" * 74)
     print(f"{'harness':<10} {'solved':>10} {'committed':>11} {'abandoned':>10} {'median s':>9}")
     print("-" * 74)
+    setup_failed_total = 0
     for h in args.harness:
-        rs = [r for r in records if r["harness"] == h]
+        all_rs = [r for r in records if r["harness"] == h]
+        if not all_rs:
+            continue
+        # A run whose bootstrap never ran tells us nothing about the harness, so
+        # it is held out of the pass rates and reported on its own line instead.
+        setup_bad = [r for r in all_rs if r.get("setup_failed")]
+        setup_failed_total += len(setup_bad)
+        rs = [r for r in all_rs if not r.get("setup_failed")]
         if not rs:
+            print(f"{h:<10} {'—':>10} {'—':>11} {'—':>10} {'—':>9}"
+                  f"   {len(setup_bad)} SETUP-FAIL")
             continue
         secs = sorted(r.get("seconds", 0) for r in rs)
         med = secs[len(secs) // 2] if secs else 0
@@ -441,7 +483,12 @@ def main():
         print(f"{h:<10} {sum(bool(r.get('solved')) for r in rs):>4}/{len(rs):<5} "
               f"{sum(bool(r.get('committed')) for r in rs):>6}/{len(rs):<4}{note:<2}"
               f"{sum(bool(r.get('abandoned')) for r in rs):>9} {med:>9}"
-              f"{('   ' + str(infra) + ' INFRA') if infra else ''}")
+              f"{('   ' + str(infra) + ' INFRA') if infra else ''}"
+              f"{('   ' + str(len(setup_bad)) + ' SETUP-FAIL') if setup_bad else ''}")
+    if setup_failed_total:
+        print(f"\nSETUP-FAIL: {setup_failed_total} run(s) whose dependency bootstrap "
+              "could not run — an environment gap, not a harness result; held out "
+              "of the rates above.")
     if set(args.harness) & AUTO_COMMITS:
         print("\n* commits its own edits by default — its 'committed' count is a tool")
         print("  capability, not the model choosing to honor the delivery contract.")

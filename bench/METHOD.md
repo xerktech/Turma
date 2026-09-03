@@ -40,6 +40,29 @@ every harness (work unattended, never end on a question, verify with the repo's
 own tests, finish on a branch + commit, do not push). It lives in the runner,
 not in `tasks.json`, so no harness can be measured against different wording.
 
+## Optional dependency bootstrap (XERK-449)
+
+Most tasks grade with a dependency-free suite, and that is deliberate: no install
+step runs by default, so every harness starts from the same pristine tree and the
+comparison stays fair. But a task mined from a monorepo (Tenir's npm workspaces,
+its `api` Python project) needs its dependencies present before its suite can
+resolve at all. Three optional per-task keys cover that, all off unless set:
+
+| key | meaning |
+|---|---|
+| `setup_cmd` | argv run once in the worktree root, AFTER the broken-baseline commit and BEFORE the red/green check (validate) or the harness (run_bench). Its artifacts — `node_modules`, `.venv` — are never in the tree the agent diffs against. |
+| `setup_timeout` | seconds `setup_cmd` may take (default 900). |
+| `test_cwd` | directory the `test_cmd` runs in, relative to the worktree — the workspace (`mobile`) or nested project (`api`) a monorepo suite grades from. Absent → the root, as before. |
+
+**A bootstrap failure is reported distinctly from a test failure.** `validate_tasks.py`
+prints `SETUP` (not `FAIL`) and holds it out of the gate; `run_bench.py` records
+`setup_failed` and keeps that run out of the pass rates. A missing dependency is an
+environment gap, not an unsolvable task — conflating the two is exactly what made all
+29 Tenir candidates read as "not solvable as specified" before this existed.
+
+Keep `setup_cmd` off for any task whose suite is already dependency-free, so the
+harness-comparison runs stay comparable.
+
 ## Scoring
 
 Mechanical only — no model judges anything:
@@ -99,7 +122,10 @@ up in `docs/`.
 
 - 8 tasks is a small n; treat single-run differences of one task as noise. Use
   `--attempts 2+` before concluding anything from a gap that size.
-- Tasks are all from this repo, so they measure "works on Turma-shaped code" —
-  a JS/Python codebase with a dependency-free test suite.
+- The archive-sourced eval set (`bench/archive/tasks-validated.json`) now spans
+  two repos — 25 Turma + 22 Tenir (XERK-449) — adding TypeScript and an
+  npm-workspaces monorepo shape. The 8 tasks in this directory's `tasks.json`
+  are still Turma-only and dependency-free, and remain the harness-comparison
+  set precisely because they need no bootstrap.
 - Test-writing tasks were deliberately excluded: scoring them honestly needs
   mutation validation, which this harness does not do.

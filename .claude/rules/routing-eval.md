@@ -34,10 +34,19 @@ still governs how a task is graded — this directory changes where tasks come f
 - **Never believe a single red — re-run that task alone** (XERK-450). `server.test.js`'s dead-channel
   test fails ~1/10 runs on an idle box; ~70% of a full pass shows a spurious fail indistinguishable
   from a broken task. Contention worsens it but is NOT the cause — "validate serially" is wrong.
-- **`tasks-validated.json` is the eval set (25 tasks), not `tasks-archive.json` (57 curated)** — only
-  the validated file is proven red-then-green.
-- **The eval set is Turma-only until XERK-449** — Tenir validated 0/29 (npm-workspaces monorepo, no
-  `node_modules`; the harness does no install step by design).
+- **`tasks-validated.json` is the eval set (47 tasks: 25 Turma + 22 Tenir), not `tasks-archive.json`
+  (57 curated)** — only the validated file is proven red-then-green.
+- **A monorepo task carries an opt-in bootstrap, off by default** (XERK-449). `setup_cmd` (with
+  `setup_timeout`) runs in the pristine worktree BEFORE the red/green check; `test_cwd` grades from a
+  workspace/subproject. A bootstrap failure is reported DISTINCTLY (`SETUP`, not `FAIL`) — a missing
+  dependency is an environment gap, not an unsolvable task. Absent → the old dependency-free path, so
+  the harness-comparison runs stay comparable. Detail in `bench/METHOD.md`'s bootstrap section.
+- **Tenir's derived commands were wrong on more than deps** — they ran from the repo root, but its JS
+  suites grade with `npx vitest` from inside a workspace and its `api` suite with pytest from `api/`
+  (curate.py derived root-level `npx vitest`/`python3 -m unittest`). The 22 survivors were corrected
+  to those real conventions; the 7 drops each span multiple workspaces or projects in one command,
+  which no single `test_cwd` can grade. **Re-deriving these needs the repo, not the corpus** —
+  correcting a committed command is not re-mining.
 - **`sensitivity()` is checked on RAW text, before scrubbing** — redaction would hide that a task
   touches sensitive client work at all. A `local-only` task must never reach a cloud endpoint; none
   has survived curation yet, so this path is unexercised — do not call it proven.

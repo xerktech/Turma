@@ -204,6 +204,13 @@ jobs:
       # test rots silently.
       - name: Python unit tests (bench/archive routing-eval tooling)
         run: python3 -m unittest discover -s bench/archive -p "test_*.py" -t bench/archive -v
+      # bench/validate_tasks.py + bench/run_bench.py: the XERK-449 dependency
+      # bootstrap (setup_cmd/setup_timeout), the per-task test_cwd, and the rule
+      # that a bootstrap failure is reported DISTINCTLY from a red->green miss.
+      # Stdlib unittest + a throwaway git repo; no npm/uv/net (mirrors the no-pip
+      # constraint). Nothing under bench/ (vs bench/archive/) was gated before.
+      - name: Python unit tests (bench harness)
+        run: python3 -m unittest discover -s bench/tests -p "test_*.py" -t bench -v
       - name: Node unit tests (turma/server.js + agent/tunnel-agent.js + release scripts)
         run: node --test turma/tests/*.test.js agent/tests/*.test.js .github/scripts/tests/*.test.js
       - name: Node unit tests (dsh safety guard)
