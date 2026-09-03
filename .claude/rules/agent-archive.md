@@ -172,6 +172,25 @@ paths:
   as gzipped, append-only ranges against a PER-FILE cursor (`archiveRawHave`).
   - **Deliberately not filtered to `*.jsonl`** — the point is that nobody has to predict what's worth
     keeping. `<slug>/memory/` is excluded (project-owned; one copy per conversation has no owner).
+  - **Validated against real Claude Code output, not inferred fixtures** (XERK-346): the allowlist
+    (`_archivable_rel` / hub `safeRawRel`) and the caps were checked against every session on a real
+    host — 2077 files across 1584 sessions — plus a real Workflow run generated to exercise the one
+    shape no session there had. **Zero rejects on either side; max 42 files/session (cap 200), max
+    depth 5 (cap 10), longest component well under 255.** The two things the design had only reasoned
+    about both hold BY CONSTRUCTION, not by luck:
+    - **Author-supplied names are SLUGIFIED by Claude Code before they touch disk.** A workflow named
+      `XERK 346 Réview probe` was written as `workflows/scripts/xerk-346-r-view-probe-<runId>.js`
+      (lowercased, spaces→`-`, accent dropped) — a pure `[a-z0-9-]` token. The embedded subagent
+      TYPE name (`agent-<type>-call_<id>.jsonl`) is verbatim, but every registered type is kebab/alnum
+      (`qa`, `qa-delta`, `general-purpose`, `Explore`, `statusline-setup`). So the `<name>` component
+      the allowlist worried about arrives already safe.
+    - **Unlisted shapes fold in automatically, as intended** — a real depth-2 loose file
+      `<tid>/auto-mode-classifier-error.txt` (not in the `subagents/`/`workflows/`/`tool-results/`
+      list) is carried by the depth-capped walk with no special case.
+    - Residual, unobserved: a user-defined `.claude/agents/*.md` whose `name:` carries an odd char is
+      the one author token not seen on that host; the workflow evidence suggests it too is slugified,
+      but that is inferred. If a real name ever IS rejected, widen `_archivable_rel` AND `safeRawRel`
+      together (they are a parity pair — widening one silently keeps files out of the log too).
   - Only regular files, **never through a symlink** (same hardening as `_project_transcripts`) — a
     link at `PROJECTS_ROOT` would drag every transcript on the host into one session's archive.
   - A source file SHORTER than the hub's cursor means a rewrite happened underneath — log and leave
