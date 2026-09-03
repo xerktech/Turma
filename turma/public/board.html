@@ -30,8 +30,17 @@
   <div class="td-backdrop" id="detailBackdrop" hidden>
     <div class="td-panel" id="detailPanel" role="dialog" aria-modal="true" aria-label="Ticket detail"></div>
   </div>
-  <div class="td-backdrop" id="policyBackdrop" hidden>
-    <div class="td-panel td-narrow" id="policyPanel" role="dialog" aria-modal="true" aria-label="Triage policy"></div>
+  <!-- XERK-587: these ids MUST NOT be `policyBackdrop`/`policyPanel`. An unrelated
+       site uses `#policyPanel` for a cookie/privacy-policy popup, so EasyList (and
+       thus Brave Shields' default cosmetic filtering, uBlock Origin, etc.) ships an
+       exact-id rule `###policyPanel` that injects a user-origin `display:none
+       !important` — invisible to page JS and unbeatable by inline styles. The panel
+       then built its content and the backdrop dimmed, but the panel itself never
+       showed (the reported "screen dims, nothing there", Brave-only). The match is
+       EXACT-id, so an app-unique id dodges it; keep `triage` out front and never
+       rename these back to a bare `policy*`. -->
+  <div class="td-backdrop" id="triageRulesBackdrop" hidden>
+    <div class="td-panel td-narrow" id="triageRulesPanel" role="dialog" aria-modal="true" aria-label="Triage policy"></div>
   </div>
   <div class="footer">Each host agent polls its org's tracker — Jira Cloud (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code>) or a self-hosted/cloud Azure DevOps board (<code>AZDO_URL</code> / <code>AZDO_TOKEN</code>) in the agent's env — for tickets assigned to that user, active work plus the last two weeks of Done, and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns follow the tracker's universal status categories, with an In Review column carved out for review/testing statuses; each card's pill shows the org's own status name. The header's org filter scopes this board — and every other page — to one org; each org is labelled from its site unless the agent sets <code>BOARD_ORG_NAME</code>. The board reads the tracker; the one write it makes is creating a ticket via the New ticket button.</div>
 </div>
@@ -1010,8 +1019,12 @@ async function openDetail(key, siteKey, fromEl) {
 // open board in step. The panel paints the selected org's current knobs; Save
 // POSTs a full patch (empty knobs send null, which clears them) and the hub's
 // answer — the merged policy — becomes the local truth.
-const $policyBackdrop = document.getElementById("policyBackdrop");
-const $policyPanel = document.getElementById("policyPanel");
+// The DOM ids are `triageRules*`, not `policy*`: a bare `#policyPanel` is hidden
+// by an EasyList exact-id cosmetic filter (Brave Shields / uBlock). See the note
+// on the elements in the markup above. The JS names stay `$policy*` — they are not
+// DOM-visible, so they cannot collide with a filter.
+const $policyBackdrop = document.getElementById("triageRulesBackdrop");
+const $policyPanel = document.getElementById("triageRulesPanel");
 const $policyBtn = document.getElementById("triagePolicy");
 let policySiteKey = null;
 let policyBusy = false;

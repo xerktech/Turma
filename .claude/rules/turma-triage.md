@@ -62,6 +62,12 @@ machinery is in `.claude/rules/turma-board.md`.
   green, hold amber, reject red. The detail panel's **Triage row** (`triageFieldHtml` +
   `triagePickerHtml`, `data-triage-select`) follows the row-picker pattern: "Change" swaps the
   row for the picker, choosing an option IS the save, "Auto" is the release.
+- **The org triage-policy modal's DOM ids are `triageRules*`, NEVER `policy*`** (XERK-587). EasyList
+  ships an exact-id cosmetic rule `###policyPanel` (an unrelated site's cookie/policy popup), so a
+  bare `#policyPanel` is hidden by a user-origin `display:none !important` under Brave Shields /
+  uBlock — invisible to page JS, so the panel builds its content and the backdrop dims but the panel
+  never shows (Brave-only "screen dims, nothing there"). The match is exact-id; the JS names stay
+  `$policyPanel`/`policyPanelHtml` (not DOM-visible). Do not rename the ids back to `policy*`.
 
 ## Gate ordering (autoStartSweep → drainTicketQueue)
 
