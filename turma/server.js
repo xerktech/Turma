@@ -9165,6 +9165,14 @@ function dedupeLinkSweep() {
 // re-issued kill of an already-dead session is a harmless no-op the agent
 // ignores, and a still-live session re-derives into the sweep on its own.
 const autoStopped = new Set(); // "<host>\x00<sessionId>" already auto-stopped
+// "<host>\x00<sessionId>" of a session the operator deliberately resumed while
+// its ticket was Done (XERK-561) — exempt from autoStopSweep's re-kill. Kept
+// SEPARATE from autoStopped on purpose: autoCloseSweep also reads autoStopped,
+// and a resume exemption must NOT suppress a legitimate auto-close (a resumed
+// session whose ticket is later reopened, worked, and its PR auto-merged). Like
+// autoStopped it needs no durability — a hub restart clears it, and the worst a
+// lost entry costs is one re-kill the operator resumes past again.
+const autoStopResumeExempt = new Set();
 
 function autoStopSweep() {
   // The set of now-Done tickets across EVERY reporting org — no opt-in gate —
@@ -9196,9 +9204,42 @@ function autoStopSweep() {
       if (!t || !t.key) continue;
       if (!doneKeys.has((t.siteKey || "") + "\x00" + t.key)) continue;
       const dk = host + "\x00" + s.id;
-      if (autoStopped.has(dk)) continue;
+      if (autoStopped.has(dk) || autoStopResumeExempt.has(dk)) continue;
       queueCommand(host, { type: "kill", sessionId: s.id });
       autoStopped.add(dk);
+    }
+  }
+}
+
+// Deliberately resuming/starting a session whose ticket is ALREADY Done is the
+// operator OVERRIDING auto-stop — they want it running again despite Done. Seat
+// the once-per-lifetime kill guard now so autoStopSweep leaves the resumed
+// session alone (XERK-561). Without this, autoStopSweep re-kills the just-resumed
+// session within one 15s sweep — it kills any LIVE session on a Done ticket — so
+// the session "comes back then ends", and only a SECOND resume sticks (the guard
+// having been seated by the first sweep's kill). Called from the resume/start
+// route, so the FIRST resume survives.
+//
+// Scoped to a ticket that is Done RIGHT NOW (the same union-and-rank
+// autoStopSweep reads): a later human Done TRANSITION on a session resumed while
+// its ticket was NOT Done still auto-stops it as intended. The exemption goes in
+// autoStopResumeExempt, NOT autoStopped — so it stands autoStopSweep down but
+// never suppresses autoCloseSweep, which also reads autoStopped (a resumed
+// session whose ticket is later reopened, worked and auto-merged must still be
+// auto-closed).
+function markResumedTicketAutoStopExempt(host, sessionId) {
+  const a = agents[host];
+  if (!a) return;
+  const s = (a.sessions || []).find((x) => x && x.id === sessionId)
+    || (a.closedSessions || []).find((x) => x && x.id === sessionId);
+  const t = s && s.ticket;
+  if (!t || !t.key) return;
+  const tk = ticketQueueKey(t.siteKey || "", t.key);
+  for (const { row, siteKey } of fleetTicketRows().values()) {
+    if (row && row.statusCategory === "done"
+        && ticketQueueKey(siteKey, row.key) === tk) {
+      autoStopResumeExempt.add(host + "\x00" + sessionId);
+      return;
     }
   }
 }
@@ -11822,6 +11863,12 @@ const server = http.createServer(async (req, res) => {
       // the agent re-registers it and relaunches its prior conversation.)
       if (req.method === "POST" && parts.length === 6 &&
           (parts[5] === "kill" || parts[5] === "start" || parts[5] === "restart" || parts[5] === "resume")) {
+        // A deliberate resume/start of a session whose ticket is already Done is
+        // the operator overriding auto-stop; seat its guard so autoStopSweep does
+        // not immediately re-kill it (XERK-561).
+        if (parts[5] === "resume" || parts[5] === "start") {
+          markResumedTicketAutoStopExempt(key, sessionId);
+        }
         const cmdId = queueCommand(key, { type: parts[5], sessionId });
         return json(res, 200, { ok: true, cmdId });
       }
@@ -13722,6 +13769,7 @@ if (process.env.TURMA_TEST) {
     orgsWithAutoStart,
     autoStarted,
     autoStopped,
+    autoStopResumeExempt,
     autoStartOrgs,
     setAutoStartOrg,
     // Hands-off auto-merge + close (XERK-550): the two sweeps, the shared

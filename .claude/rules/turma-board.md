@@ -172,6 +172,15 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
 - `autoStopSweep()` (15s) reads every org's Done tickets, scans the fleet for sessions naming one,
   kills each **live** one (`running`/`queued`) on its host. Guard: `autoStopped`
   (`<host>\x00<sessionId>`, once per hub lifetime).
+- **Deliberately RESUMING a session whose ticket is already Done overrides auto-stop** (XERK-561):
+  the resume/start route pre-seats a dedicated `autoStopResumeExempt` guard
+  (`markResumedTicketAutoStopExempt`, scoped to a ticket Done AT RESUME TIME) so the sweep leaves the
+  resumed session alone. It is its OWN set, NOT the shared `autoStopped` (which `autoCloseSweep` also
+  reads) — so the exemption never suppresses a legitimate auto-close. Without it the
+  sweep re-killed the just-resumed session within one beat, so it "came back then ended" and only a
+  SECOND resume stuck (the first sweep's kill having seated the guard). A LATER human Done TRANSITION
+  on a session resumed while its ticket was NOT Done still auto-stops it (the guard is not seated
+  then); `resumeTranscript` carries no ticket, so it is unaffected.
 - Tests: the `auto-stop:` cases in `server.test.js`.
 
 #### Auto-merging + auto-closing (XERK-550)
