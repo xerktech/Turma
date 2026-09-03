@@ -318,11 +318,12 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
       half isn't its own `DEVICE_NAME` — never a silent invalidation. Env write is a single-key atomic
       rewrite (`rewrite_env_var`, preserves operator edits); the launcher exports `TURMA_AGENT_ENV` so
       the manager knows which file to roll.
-    - **`tokenBound` is now SERVED** (was stripped) as the onboarding signal — the dashboard's
-      `🔐 own token` / `⚠ shared token` chip, replacing the "curl twice to verify" step. Still
-      HUB-DERIVED (forge-proof, re-stamped in `serializeAgent`), and served ONLY when the hub has a
-      master (absent = no per-host tokens here). `tokenRoll` is the agent capability that gates the
-      Roll button. Android types NEITHER yet (`ignoreUnknownKeys` skips them — safe); web-only, in
+    - **`tokenBound` is now SERVED** (was stripped) as the onboarding signal, replacing the "curl
+      twice to verify" step. The dashboard flags ONLY a host still on the master (`⚠ shared token`);
+      a bound host shows no chip (a positive chip on every host is noise). Still HUB-DERIVED
+      (forge-proof, re-stamped in `serializeAgent`), and served ONLY when the hub has a master
+      (absent = no per-host tokens here). `tokenRoll` is the agent capability that gates the Roll
+      button. Android types NEITHER yet (`ignoreUnknownKeys` skips them — safe); web-only, in
       `PARITY.md`. Native/agent detail in `agent-native.md`.
 - **The hub's memory ceilings are FRACTIONS OF ITS CONTAINER LIMIT, never fixed numbers** (XERK-258,
   XERK-273). It runs at `mem_limit: 512m` (raised from 256m for XERK-287), so a flat constant larger
