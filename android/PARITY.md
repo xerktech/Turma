@@ -566,6 +566,14 @@ those are marked `[MODEL]`.
   the composer's toast today) — P2.
 - P1 `[MODEL]` Host meta (memory, uptime/last-seen, repos-root, session counts), container-log toggle.
 - P1 Host collapse persistence; Jira org label beside hostname; Remove-host for offline hosts.
+- P1 Token binding (XERK-578, WEB ONLY for now): the host header shows a `🔐 own token` / `⚠ shared
+  token` chip from the served `tokenBound`, and offers a **Roll token** button on a live, unbound
+  host reporting the `tokenRoll` capability (rolls it onto its derived token, XERK-268/284). Both
+  new fields ride `/api/agents`; Android does not type them yet, so `ignoreUnknownKeys` skips them
+  (no decode risk). Mirror as a `FleetScreen` chip + a `FleetViewModel.rollToken` → `HubApi`
+  `@POST("api/agents/{host}/roll-token")` trio (the same shape as `restartAgent`). A host can also
+  self-enroll with no app at all (`turma-agentctl enroll` / `TURMA_AGENT_SELF_ENROLL=1`), so this is
+  a convenience, not the only path.
 - ~~P1 Clone bar: collapse + search + multi-select + `🔒` private marker + clone-job status rows.~~
   Done (XERK-126, see Done below).
 - P1 `[MODEL]` Repo blocks: branch/dirty meta, remote link, orphan repos, prune-note, empty state.

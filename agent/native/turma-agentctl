@@ -101,14 +101,69 @@ status() {
   if _alive "$upid"; then echo "auto-update poller: running (pid $upid)"; else echo "auto-update poller: stopped"; fi
 }
 
+# Manager-only restart across the three install scopes (mirrors
+# turma-agent-update's restart block): a systemd --user unit, a system unit (a
+# root install with no user bus), or this pidfile fallback. All preserve
+# tmux/claude/ttyd (KillMode=process / manager-only kill) so a token roll keeps
+# every session running.
+restart_manager() {
+  if [ -d /run/systemd/system ] && systemctl --user show-environment >/dev/null 2>&1; then
+    systemctl --user restart turma-agent
+  elif [ -d /run/systemd/system ] && [ "$(id -u)" = 0 ] \
+       && [ -f /etc/systemd/system/turma-agent.service ]; then
+    systemctl restart turma-agent
+  else
+    restart
+  fi
+}
+
+# enroll — self-enroll onto this host's OWN derived agent token (XERK-578).
+# Replaces the per-host onboarding ritual (SSH in, mint on the hub over kubectl,
+# hand-edit the dotenv, restart, curl to verify) with one local command: source
+# the config, ask the hub for this host's derived token (authenticated with the
+# CURRENT token), persist it atomically, and restart to re-authenticate on it.
+# Idempotent: a host already on its derived token is a no-op (no restart).
+enroll() {
+  CFG="${TURMA_AGENT_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/turma-agent/turma-agent.env}"
+  if [ ! -f "$CFG" ]; then
+    echo "enroll: no config at $CFG" >&2
+    exit 1
+  fi
+  # Load the same values the launcher does (TURMA_URL / TURMA_TOKEN / DEVICE_NAME),
+  # and resolve DEVICE_NAME the SAME way (blank -> hostname) so we enroll the
+  # exact name this host beats as — a mismatch would fetch the wrong token.
+  set -a
+  # shellcheck disable=SC1090
+  . "$CFG"
+  set +a
+  export TURMA_AGENT_ENV="$CFG"
+  export DEVICE_NAME="${DEVICE_NAME:-$(hostname)}"
+  # hub-agent.py --enroll does the fetch + verify + atomic write and exits:
+  # 0 success/no-op, 2 hub too old (soft skip), 1 failure.
+  set +e
+  python3 "$PREFIX/hub-agent.py" --enroll
+  rc=$?
+  set -e
+  if [ "$rc" = 0 ]; then
+    echo "enroll: restarting to re-authenticate (sessions preserved)"
+    restart_manager
+  elif [ "$rc" = 2 ]; then
+    echo "enroll: hub does not offer self-enroll yet — left on the current token" >&2
+    exit 0
+  else
+    exit "$rc"
+  fi
+}
+
 case "${1:-}" in
   start)    start ;;
   stop)     stop ;;
   restart)  restart ;;
   status)   status ;;
+  enroll)   enroll ;;
   logs)     exec tail -n "${2:-200}" -f "$LOG" ;;
   update)   exec "$PREFIX/bin/turma-agent-update" ;;
   *)
-    echo "usage: turma-agentctl {start|stop|restart|status|logs [N]|update}" >&2
+    echo "usage: turma-agentctl {start|stop|restart|status|enroll|logs [N]|update}" >&2
     exit 2 ;;
 esac

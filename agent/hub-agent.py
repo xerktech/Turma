@@ -2469,6 +2469,178 @@ def discard_local_model_env(path):
         log(f"could not remove {path}: {e}")
 
 
+# ---- per-host token rollover (XERK-578) -------------------------------------
+# The hub's "Roll token" button (design A) mints hostAgentToken(<this host>) and
+# delivers it here over the tunnel (the setToken command), so an operator moves
+# a host onto its derived credential (XERK-268/284) with no SSH, no kubectl and
+# no hand-edited dotenv. The three helpers below verify, locate and persist it.
+
+# The token grammar: `<base64url(device)>.<hex hmac>` (turma/server.js
+# hostAgentToken). base64url is [A-Za-z0-9_-] with no padding, the hmac is hex,
+# so the whole value is source-safe unquoted in the env file both the launcher
+# (`set -a; . file`) and systemd's EnvironmentFile source.
+_AGENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+\.[0-9a-f]+$")
+
+
+def token_device_name(token):
+    """The host a `<base64url(device)>.<hmac>` agent token NAMES, or None. The
+    hub proves the hmac half; we only decode the NAME half — enough to confirm a
+    pushed token is meant for THIS host before we persist it, so a DEVICE_NAME
+    mismatch is caught and surfaced rather than silently invalidating us the
+    moment it is written (an acceptance criterion of XERK-578)."""
+    if not isinstance(token, str) or "." not in token:
+        return None
+    head = token.split(".", 1)[0]
+    try:
+        pad = "=" * (-len(head) % 4)
+        # validate=True so a non-alphabet char (base64's default is to SILENTLY
+        # DROP them, which would turn garbage into an empty/wrong name) raises
+        # here instead — the whole point is an injective name half.
+        raw = base64.b64decode(head + pad, altchars=b"-_", validate=True)
+        return raw.decode("utf-8")
+    except Exception:
+        return None
+
+
+def agent_env_path():
+    """The env file the native launcher SOURCES (where TURMA_TOKEN lives), or ""
+    when there is none to roll. The launcher exports TURMA_AGENT_ENV=<resolved
+    path>; we fall back to the same default it computes so a roll works even
+    against a launcher that predates the export. Returns "" when the file does
+    not exist — a container/non-native install has no such dotenv, and setToken
+    is deliberately a native-onboarding path (the hub sizes its refusal on the
+    ack, XERK-151)."""
+    p = os.environ.get("TURMA_AGENT_ENV", "").strip()
+    if p:
+        return p if os.path.isfile(p) else ""
+    cfg_home = os.environ.get("XDG_CONFIG_HOME", "").strip() \
+        or os.path.join(os.path.expanduser("~"), ".config")
+    default = os.path.join(cfg_home, "turma-agent", "turma-agent.env")
+    return default if os.path.isfile(default) else ""
+
+
+def rewrite_env_var(path, key, value):
+    """Rewrite ONE `KEY=value` line in the launcher's env file atomically,
+    preserving every other line (operator edits, comments, blanks) and its 0600
+    mode — install.sh writes this file once and never overwrites it, so a roll
+    must MERGE, not clobber. The value must be a source-safe bare token (checked
+    by the caller): it is written UNQUOTED, the format both readers of this file
+    expect, and a value carrying anything else is refused rather than written
+    (it would break the launcher's `. file` under `set -e`, wedging every
+    session). Per-process temp + os.replace, exactly like write_local_model_env,
+    so a concurrent launch/systemd read never sees a partial file.
+
+    Raises OSError on an unreadable file or an unexpected value; the caller
+    surfaces it rather than restarting onto a half-written credential."""
+    if not _AGENT_TOKEN_RE.match(value or ""):
+        raise OSError(f"refusing to write {key}: value is not a plain agent token")
+    with open(path, "r", encoding="utf-8") as fh:
+        lines = fh.read().split("\n")
+    assignment = f"{key}={value}"
+    out = []
+    replaced = False
+    # Match `KEY=` (tolerating a leading indent or an `export ` prefix, the two
+    # forms the launcher's config_errors accepts). A commented `#KEY=` is left
+    # untouched. A duplicate later assignment is dropped — last-wins on source,
+    # so leaving both would keep the OLD value effective.
+    key_re = re.compile(rf"^\s*(export\s+)?{re.escape(key)}=")
+    for ln in lines:
+        if key_re.match(ln):
+            if not replaced:
+                out.append(assignment)
+                replaced = True
+        else:
+            out.append(ln)
+    if not replaced:
+        # No line to rewrite (a config missing the key). Append it — the file is
+        # otherwise preserved. A trailing "" from the split keeps the file
+        # newline-terminated when we join.
+        if out and out[-1] == "":
+            out.insert(len(out) - 1, assignment)
+        else:
+            out.append(assignment)
+    data = "\n".join(out)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(data)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)          # atomic: a reader never sees a partial file
+
+
+def enroll_self():
+    """Self-enroll onto this host's derived agent token (XERK-578, design B).
+
+    Trades the CURRENT TURMA_TOKEN for this host's own derived token via
+    GET {TURMA_URL}/api/agent/token, confirms the returned token is OURS, and
+    writes it to the sourced env file atomically — so `turma-agentctl enroll`
+    (and the opt-in automatic-on-start path) rolls a host off the shared master
+    with one LOCAL command, no hub/kubectl access and no hand-edited dotenv.
+
+    Returns 0 on success (an already-enrolled no-op included), 2 when the hub is
+    too old to offer the endpoint (a 404 — the caller may treat that as a soft
+    skip on boot), and 1 on any other failure. Prints a one-line human result to
+    stdout on success, an error to stderr otherwise; NEVER prints a token."""
+    device = device_name()
+    if not TURMA_URL:
+        print("enroll: TURMA_URL is not set", file=sys.stderr)
+        return 1
+    if not TURMA_TOKEN:
+        print("enroll: TURMA_TOKEN is not set — nothing to authenticate with",
+              file=sys.stderr)
+        return 1
+    headers = {"User-Agent": "hub-agent/1.0",
+               "Authorization": f"Bearer {TURMA_TOKEN}"}
+    # Always name our OWN device: a request already on a derived token has it
+    # ignored (the hub returns the proved host's token), and a request on the
+    # master needs it to bootstrap. So one call covers both rollover states.
+    url = (f"{TURMA_URL}/api/agent/token"
+           f"?device={urllib.parse.quote(device, safe='')}")
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=HEARTBEAT_TIMEOUT_SEC) as resp:
+            data = json.loads(resp.read(65536).decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        print(f"enroll: hub refused ({e.code}): {_http_error_detail(e)}",
+              file=sys.stderr)
+        # 404 = a hub predating the endpoint; the boot path treats it as a soft
+        # skip (stay on the current token) rather than a failure.
+        return 2 if e.code == 404 else 1
+    except Exception as e:
+        print(f"enroll: could not reach the hub at {TURMA_URL}: {e}",
+              file=sys.stderr)
+        return 1
+    token = (data or {}).get("token")
+    host = (data or {}).get("host")
+    if not isinstance(token, str) or not token:
+        print("enroll: hub returned no token", file=sys.stderr)
+        return 1
+    # Defence: the hub derives the token from a NAME; confirm it is ours before
+    # persisting, so a DEVICE_NAME mismatch can't be written silently.
+    named = token_device_name(token)
+    if named != device:
+        print(f"enroll: hub returned a token for {named!r}, not this host "
+              f"({device!r}); not writing it", file=sys.stderr)
+        return 1
+    if token == TURMA_TOKEN:
+        print(f"enroll: already on this host's derived token ({device}); "
+              "nothing to do")
+        return 0
+    path = agent_env_path()
+    if not path:
+        print("enroll: no env file to update (set TURMA_AGENT_ENV, or run this "
+              "against an installed config)", file=sys.stderr)
+        return 1
+    try:
+        rewrite_env_var(path, "TURMA_TOKEN", token)
+    except OSError as e:
+        print(f"enroll: could not update {path}: {e}", file=sys.stderr)
+        return 1
+    print(f"enroll: wrote {host}'s derived token to {path} — restart to "
+          "re-authenticate on it")
+    return 0
+
+
 def unlink_quietly(paths):
     """Best-effort removal of per-session files, ignoring a missing/unreadable
     one — the shared unlink loop the qwen and dsh runtime teardowns use (XERK-528)
@@ -24612,6 +24784,12 @@ class SessionManager:
                     # fresh block rides a later beat once the worker publishes.
                     if board_configured():
                         self._stage_slow_refresh("jira")
+                elif ctype == "setToken":
+                    # The dashboard's "Roll token" button (XERK-578): adopt the
+                    # hub-pushed per-host derived token, then restart to
+                    # re-authenticate on it. Writes the env file atomically and
+                    # verifies the token is ours before persisting.
+                    self.set_token(cid, cmd.get("token"))
                 elif ctype == "restartAgent":
                     # The dashboard's "Restart agent" button (XERK-157). We only
                     # arm a flag here — the actual exit happens in run_forever
@@ -25601,6 +25779,16 @@ class SessionManager:
             # operator believes they sent whole. Rises on its own as hosts
             # update, with no hub-side version table to keep in step.
             "inputMaxChars": INPUT_MAX_CHARS,
+            # Whether this agent understands the setToken command (XERK-578), so
+            # the dashboard offers "Roll token" only where a click actually
+            # rolls. A capability flag exactly like inputMaxChars/uploadMaxBytes:
+            # an agent predating it reports nothing, and the hub hides the button
+            # rather than queue a setToken this host would ack (XERK-151) and
+            # silently drop. Always True here — every build carrying this line
+            # has the handler; whether a roll is MEANINGFUL (the hub uses derived
+            # tokens at all) is the hub's own gate (it serves tokenBound only
+            # when TURMA_AGENT_TOKEN is set).
+            "tokenRoll": True,
             # Whether this host can fail a session over to a self-hosted model
             # (XERK-246). Doubles as the capability flag, exactly like
             # inputMaxChars and uploadMaxBytes: an agent predating the failover —
@@ -25971,6 +26159,49 @@ class SessionManager:
         except Exception as e:
             log(f"updating announce failed (continuing shutdown): {e}")
 
+    def set_token(self, cid, token):
+        """Adopt a hub-pushed per-host agent token (XERK-578, design A). The
+        dashboard's "Roll token" button mints hostAgentToken(<this host>) and
+        delivers it here over the tunnel, so an operator moves this host from the
+        shared fleet master onto its own derived credential (XERK-268/284)
+        without SSHing in, hand-editing the dotenv, or running kubectl on the
+        hub. We write it to the sourced env file ATOMICALLY, then request a
+        MANAGER-ONLY restart — the new manager sources the file and
+        re-authenticates on the new token, sessions preserved (KillMode=process,
+        the same session-preserving path restartAgent uses).
+
+        Refused and SURFACED (log-only, never a silent write) when the pushed
+        token is not for THIS host: the token names the device it is derived from
+        (XERK-268), so a name that isn't our DEVICE_NAME would only invalidate us
+        the instant it took effect — the exact 'silently token-invalidating'
+        failure the ticket calls out. In practice the hub mints for the very name
+        this host beats as, so the mismatch is a rename mid-flight, not an
+        attack; either way we do not persist a dead credential."""
+        named = token_device_name(token)
+        if named is None:
+            log("setToken: refused — payload is not an agent token")
+            return
+        if named != self.device:
+            log(f"setToken: refused — token is derived for {named!r}, not this "
+                f"host ({self.device!r}); NOT writing it (a host's token is "
+                "derived from its DEVICE_NAME, so re-check DEVICE_NAME if the "
+                "host was renamed)")
+            return
+        path = agent_env_path()
+        if not path:
+            log("setToken: no native env file to update (TURMA_AGENT_ENV unset "
+                "and no default present) — this install rolls its token another "
+                "way; not restarting")
+            return
+        try:
+            rewrite_env_var(path, "TURMA_TOKEN", token)
+        except OSError as e:
+            log(f"setToken: could not update {path}: {e}; not restarting")
+            return
+        log(f"setToken: wrote this host's derived token to {path}; restarting "
+            "the manager to re-authenticate (sessions preserved)")
+        self.request_restart()
+
     def request_restart(self):
         """Arm a dashboard-requested manager restart (restartAgent command). We
         do NOT restart inline in handle_commands: run_forever calls
@@ -26177,6 +26408,11 @@ if __name__ == "__main__":
     if "--print-device" in sys.argv:
         print("DEVICE_NAME=" + device_name())
         sys.exit(0)
+    if "--enroll" in sys.argv:
+        # XERK-578 design B: fetch + persist this host's derived token, then let
+        # the caller (turma-agentctl enroll) restart. Exit codes: 0 success/no-op,
+        # 2 hub too old (soft skip on boot), 1 failure.
+        sys.exit(enroll_self())
     if "--wire-azure-git" in sys.argv:
         # Writes --system git config so plain git can push to a non-GitHub Azure
         # DevOps org using the PAT the board already has. This was invoked at boot
