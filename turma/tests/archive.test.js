@@ -548,6 +548,26 @@ test("XERK-573: an ORG-LESS restore still continues (restampOrg re-points the ho
   assert.equal(t.entries.length, 2);
 });
 
+test("XERK-573: accepted LOW residual — an org-less manifest squat blocks the owner's first push", () => {
+  // Documented, not closed (QA): on a no-Jira fleet a rogue org-less host that knows
+  // a victim's uuid4 id can list it in its manifest, creating the 0-byte placeholder
+  // as its own — after which the org-less owner's first push is a cross-host re-point
+  // with no shared non-empty org, so it is refused. Availability-only: the placeholder
+  // is EMPTY (manifestCursors only INSERTs), so nothing of the victim is read or
+  // injected. It makes the org-less case behave like every other org, where a
+  // cross-org squat was already denied. Pinned so the behaviour can't drift silently.
+  const tid = "xerk573-orgless-squat";
+  archive.manifestCursors("roguel", [{ transcriptId: tid, ...RAW_META }], ""); // org-less squat
+  const owner = archive.ingestChunk("ownerl", tid, { ...RAW_META, summary: "Squat" }, 0, 20,
+    [ent("o", "user", "mine")], "");
+  assert.deepEqual(owner, { bytesStored: 0 }, "the org-less owner is refused over the squatted placeholder");
+  assert.equal(archive.getTranscript(tid), null, "nothing stored — an empty squat, no content leaked");
+  // Clean up the fileless placeholder this test deliberately leaves, so a later
+  // rebuild-count invariant isn't skewed by it (a real rebuild drops it too, since
+  // it has no on-disk file).
+  archive.openDb().prepare("DELETE FROM sessions WHERE transcriptId=?").run(tid);
+});
+
 test("the per-transcript raw ceiling stops that session, not the archive", () => {
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");

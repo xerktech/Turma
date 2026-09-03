@@ -91,6 +91,15 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     - The owner's decided org is STORED on the row (schema v5, hub-supplied — never agent-`meta`), so
       the check survives the owner going offline. **Do not re-key this on the CLAIMED `siteKeyOf`** —
       that reopens the org-less hole (the same objection XERK-349 makes to the migrate route).
+    - **Accepted LOW residual on an ORG-LESS fleet** (QA): a rogue org-less host that knows a victim's
+      uuid4 `transcriptId` can list it in its heartbeat manifest, creating the 0-byte placeholder row
+      as its own — after which the real org-less owner's first push is refused as a cross-host
+      re-point (both read "", so no shared non-empty org). Availability-only: `manifestCursors` only
+      INSERTs, so the rogue injects NOTHING and reads nothing; it just squats the id, and the owner
+      re-pushes from 0 while the read-back 404s "still syncing". It needs the unguessable id (never
+      exposed cross-host) and only bites a no-Jira fleet — and it makes the org-less case behave like
+      every other org, where a cross-org squat was already denied. No signal distinguishes owner
+      reclaim from rogue squat (both org-less), so there is no cheap fix; documented, not closed.
     - **`manifestCursors` stamps the org on the placeholder row it creates**, or a cross-org first
       chunk would hijack a not-yet-filled transcript via the legacy escape below.
     - **A row whose `siteKey` is NULL (rebuilt from a pre-XERK-344 sidecar, which has no field) admits
