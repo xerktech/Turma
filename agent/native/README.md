@@ -138,8 +138,9 @@ this file → restart → curl twice to verify). Any one of these does it:
 - **From the dashboard** — the host header shows `⚠ shared token` while it rides
   the master; click **Roll token**. The hub pushes the derived token over the
   existing command tunnel; the agent writes it here atomically and restarts to
-  adopt it (running sessions are re-adopted). The chip flips to `🔐 own token`
-  when it beats back bound — that IS the verification.
+  adopt it (running sessions are re-adopted). The `⚠ shared token` chip clears
+  when it beats back bound — that IS the verification (a bound host shows no
+  chip).
 - **On the host** — `turma-agentctl enroll`: fetches this host's derived token
   from the hub (authenticated with the current token), persists it here, and
   restarts. Idempotent; refuses to write a token for the wrong `DEVICE_NAME`.
