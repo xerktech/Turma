@@ -2541,13 +2541,17 @@ function publicCommands(cmds) {
 
 function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
   // `resultWaits` is per-command bookkeeping with timestamps (XERK-151) — pure
-  // internal state, stripped like the caches. `tokenBound` likewise: it is the
-  // hub's note of which credential this host beat with (XERK-268), read only by
-  // ttydAuth, and putting it on the wire would make it a client contract.
-  // `unsupported` is NOT: it's a tiny, rarely-changing map of what this host's
-  // agent can't do, worth reading. `autoPaused` (XERK-544) is HUB-DERIVED — a
-  // heartbeat cannot assert it (a forged one would let a host fake its own
-  // pause), so it is stripped here and recomputed authoritatively below.
+  // internal state, stripped like the caches. `tokenBound` is HUB-OWNED (the
+  // hub's note of which credential this host beat with, XERK-268): it is
+  // destructured out of the spread here so a forged/restored one never leaks,
+  // then re-stamped below from this authoritative value — XERK-578 SERVES it as
+  // the onboarding signal (which hosts still ride the shared master, and the
+  // "it bound" confirmation that replaces the manual curl), superseding the
+  // earlier decision to keep it off the wire. `unsupported` is served too: a
+  // tiny, rarely-changing map of what this host's agent can't do. `autoPaused`
+  // (XERK-544) is HUB-DERIVED — a heartbeat cannot assert it (a forged one would
+  // let a host fake its own pause), so it is stripped here and recomputed
+  // authoritatively below.
   const { history, subagentHistory, jiraIssues, statusResults,
           priorityResults, linkResults, mergeResults,
           createMeta, createTypes, createResults, resultWaits, tokenBound,
@@ -2616,6 +2620,17 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
     // which the clients must honour, and only an ABSENT field (an older hub)
     // falls them back to `jira.siteKey`.
     org: decidedOrgOf(agent),
+    // Whether this host beat with its OWN derived token vs. the shared fleet
+    // master (XERK-578, surfacing XERK-268's binding). Served ONLY when this hub
+    // uses per-host tokens (a master is configured) — otherwise every host is
+    // "legacy" and a roll is meaningless, so the field is OMITTED and clients
+    // read absent as "can't tell / no per-host tokens here" (no chip, no "Roll
+    // token" button). Re-stamped from the destructured hub value, so a forged
+    // heartbeat/restored `tokenBound` never reaches the wire. The dashboard
+    // shows "own token" vs. "shared token" from it, and offers Roll on an
+    // unbound host that reports the setToken capability — replacing the "curl
+    // the hub twice to verify it bound" step of the old onboarding ritual.
+    ...(TURMA_AGENT_TOKEN ? { tokenBound: !!tokenBound } : {}),
   };
 }
 
@@ -4103,6 +4118,22 @@ function normalizeDefaultRuntime(a) {
   a.defaultRuntime = r;
 }
 
+// The setToken capability flag (XERK-578) and the hub's own tokenBound note,
+// both coerced at ingest/restore exactly like normalizeQwen/normalizeDsh and for
+// the same reason: a client TYPES them (AgentInfo.tokenRoll/tokenBound: Boolean?)
+// and `/api/agents` decodes atomically on Android, so one host's `tokenRoll:
+// "yes"` would fail the whole fleet decode. Strictly boolean when present, absent
+// stays absent ("this host can't tell", never a fabricated value). `tokenRoll` is
+// agent-supplied (whether it understands setToken); `tokenBound` is HUB-owned
+// (which credential the host beat with, XERK-268) and re-derived on every live
+// beat — coercing it only matters on the state.json restore path, where a
+// hand-edited file could carry a non-boolean.
+function normalizeTokenRoll(a) {
+  if (!a || typeof a !== "object") return;
+  if ("tokenRoll" in a) a.tokenRoll = a.tokenRoll === true;
+  if ("tokenBound" in a) a.tokenBound = a.tokenBound === true;
+}
+
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
 // into the host's per-session cache, then bound its memory: drop entries older
 // than HISTORY_MAX_AGE_MS and cap the cache at HISTORY_MAX_SESSIONS, evicting
@@ -5175,7 +5206,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
   "dsh", "qwen", "triage", "defaultRuntime", "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
-  "sessions", "startedAt", "subscription", "uploadMaxBytes", "usage",
+  "sessions", "startedAt", "subscription", "tokenRoll", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "ticketPriorityResults", "ticketLinkResults",
@@ -5568,6 +5599,7 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeQwen(a);
   normalizeTriage(a);
   normalizeDefaultRuntime(a);
+  normalizeTokenRoll(a);
   normalizeModels(a);
   normalizeSpawnRefusals(a);
   normalizeRefused(a);
@@ -7287,6 +7319,54 @@ function agentHostRefusal(req, host) {
     };
   }
   return null;
+}
+
+// The decision behind GET /api/agent/token (XERK-578, self-enroll), factored out
+// of the route so it can be unit-tested under strict AND non-strict alike (the
+// route is HTTP; this is the logic). Returns {status, body}. An agent trades its
+// CURRENT token for its OWN derived one, and it returns ONLY the token for the
+// identity the request PROVED — never a caller-named host, which is the security
+// property. `device` is the ?device= query value (the host's own DEVICE_NAME),
+// used ONLY on the master bootstrap where the credential proves no host.
+function resolveEnrollToken(req, device) {
+  if (!TURMA_AGENT_TOKEN) {
+    return { status: 409,
+      body: { error: "this hub derives no per-host tokens (no TURMA_AGENT_TOKEN set)" } };
+  }
+  const header = req.headers.authorization || "";
+  const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const proved = bearer ? tokenHost(bearer) : null;
+  if (proved) {
+    // Already on its derived token: hand back its OWN, whatever ?device says. A
+    // proved host can never obtain a DIFFERENT host's token — the escalation
+    // "never a caller-named device" really guards. Works under strict too (it
+    // is the host's own credential), so a re-enroll is idempotent.
+    return { status: 200, body: { host: proved, token: hostAgentToken(proved), bound: true } };
+  }
+  const isMaster = bearer && safeEqual(bearer, TURMA_AGENT_TOKEN);
+  if (!isMaster) return { status: 401, body: { error: "unauthorized" } };
+  if (TURMA_AGENT_STRICT) {
+    // The master is not a credential under strict, so the bootstrap closes —
+    // enroll exists only to roll OFF the master. Worded like the other strict
+    // refusals so an agent can act on it.
+    return { status: 403,
+      body: { error: "this hub requires each agent's own token (TURMA_AGENT_STRICT is " +
+        "set), not the fleet master — enroll only rolls OFF the master" } };
+  }
+  // Master + the host's own name: the bootstrap. Deriving <device>'s token is
+  // exactly what `node server.js --agent-token <device>` already mints for a
+  // master holder, so it grants nothing new.
+  if (!device) {
+    return { status: 400,
+      body: { error: "device required: on the fleet master, name this host's DEVICE_NAME " +
+        "so the hub derives its token (?device=<name>)" } };
+  }
+  const token = hostAgentToken(device);
+  if (!token) {
+    return { status: 409,
+      body: { error: `cannot derive a token for ${device} — it is not a usable host key` } };
+  }
+  return { status: 200, body: { host: device, token, bound: false } };
 }
 
 // Trigger auth (POST /api/trigger). A caller passes either the dedicated
@@ -10684,6 +10764,12 @@ const server = http.createServer(async (req, res) => {
     // browser-only userAuthorized gate below.
     const isTrigger = req.method === "POST" && url.pathname === "/api/trigger";
 
+    // Agent self-enroll (XERK-578, design B): an agent trades its CURRENT token
+    // for its OWN derived one. Agent-authed in the handler (resolves the host
+    // the credential proves), so it is exempt from the user-login gate below.
+    const isAgentTokenEndpoint =
+      req.method === "GET" && url.pathname === "/api/agent/token";
+
     // The migration transcript relay is agent-pushed/pulled (bearer token) like
     // the heartbeat/archive — a source agent POSTs the bundle, the target agent
     // GETs it (XERK-101). The user-triggered /migrate endpoint that starts it
@@ -10722,6 +10808,12 @@ const server = http.createServer(async (req, res) => {
       if (refusal) return json(res, refusal.status, { error: refusal.error });
     } else if (isTrigger) {
       if (!triggerAuthorized(req)) return json(res, 401, { error: "unauthorized" });
+    } else if (isAgentTokenEndpoint) {
+      // GET /api/agent/token (XERK-578, self-enroll) authenticates itself in the
+      // handler: it resolves which host the AGENT credential proves and hands
+      // back only THAT host's derived token, so it can neither ride the user
+      // login nor be gated by it (an enrolling agent has no login). Fall
+      // through, like the login route.
     } else if (isLoginRoute) {
       // fall through to the handlers below
     } else if (!userAuthorized(req)) {
@@ -11962,6 +12054,70 @@ const server = http.createServer(async (req, res) => {
       const pending = (agents[key].commands || []).find((c) => c.type === "restartAgent");
       const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "restartAgent" });
       return json(res, 200, { ok: true, cmdId });
+    }
+
+    // POST /api/agents/<host>/roll-token — hand this host its OWN derived agent
+    // token and have it adopt it (XERK-578, design A). Replaces the per-host
+    // onboarding ritual (SSH in, `--agent-token` mint on the hub over kubectl,
+    // hand-edit the dotenv, restart, curl twice to verify) with one dashboard
+    // click: the hub RE-DERIVES the token from the master + this host's name and
+    // pushes it over the existing command tunnel (setToken); the agent writes it
+    // atomically and does a session-preserving restart to re-authenticate. The
+    // value is deterministic (not a fresh secret), so a second click is
+    // idempotent, and it collapses like the restart button — one setToken in
+    // flight at a time. Operator-authed (it lives among the user routes, gated
+    // by the single user check upstream); this is NOT driveable by a bare master
+    // holder. Once TURMA_AGENT_STRICT retires the master the whole fleet is
+    // already bound, so the button self-hides (tokenBound below).
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "roll-token" && parts.length === 4) {
+      const key = decodeURIComponent(parts[2]);
+      if (!agents[key]) return json(res, 404, { error: "unknown agent" });
+      // No master configured → there is no per-host derivation to hand out;
+      // saying so beats queuing a setToken with an empty token (XERK-264).
+      if (!TURMA_AGENT_TOKEN) {
+        return json(res, 409, {
+          error: "this hub has no fleet master token set (TURMA_AGENT_TOKEN), " +
+            "so it derives no per-host tokens to roll",
+        });
+      }
+      const token = hostAgentToken(key);
+      if (!token) {
+        // The host name doesn't derive a token (a dot segment, a name that
+        // doesn't UTF-8 round-trip) — the same names hostAgentToken refuses to
+        // mint for so a host can't rename itself into a dead credential.
+        return json(res, 409, {
+          error: `cannot derive a token for host name ${key} — it is not a ` +
+            "usable host key, so rename the host to a plain name first",
+        });
+      }
+      // Collapse a mashed button: don't queue a second setToken while one is
+      // already unacked in flight (mirrors the restart route). A retry reuses
+      // the pending cmdId; the token itself is the same value either way.
+      const pending = (agents[key].commands || []).find((c) => c.type === "setToken");
+      const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "setToken", token });
+      return json(res, 200, { ok: true, cmdId });
+    }
+
+    // GET /api/agent/token — agent self-enroll (XERK-578, design B). An agent
+    // authenticated with its CURRENT token asks for its OWN derived token, so a
+    // `turma-agentctl enroll` (or an opt-in automatic-on-start) rolls a host off
+    // the shared master onto its per-host credential with a single LOCAL command
+    // and no hub/kubectl access. It returns ONLY the token for the identity the
+    // request PROVED, never a caller-named host — that is the whole security
+    // property:
+    //   - a request already on a DERIVED token gets its OWN host's token back
+    //     (idempotent, and works under strict too — it is the host's own);
+    //   - a request on the fleet MASTER (the rollover state) names its own
+    //     DEVICE_NAME (?device=) and gets THAT host's token, which is exactly
+    //     what a master holder could already mint on the hub with
+    //     `--agent-token <device>` — so it grants nothing new.
+    // TURMA_AGENT_STRICT retires the master, so once strict is set the bootstrap
+    // is refused and only the idempotent derived-token path answers: the
+    // endpoint self-closes with the master it exists to roll away from.
+    if (isAgentTokenEndpoint) {
+      const r = resolveEnrollToken(req, url.searchParams.get("device") || "");
+      return json(res, r.status, r.body);
     }
 
     // POST /api/jira/refresh — the /board page's manual refresh: re-poll Jira
@@ -14007,6 +14163,8 @@ if (process.env.TURMA_TEST) {
     agentBearerKind,
     agentHostRefusal,
     agentPresentedRefusal,
+    resolveEnrollToken,
+    serializeAgent,
     tokenHost,
     // The reverse-tunnel maps, exported so their null prototype can be asserted
     // directly. Reaching it through a socket instead means the regression is

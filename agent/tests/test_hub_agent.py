@@ -28836,5 +28836,165 @@ class TestEnvNumHelpers(unittest.TestCase):
         self.assertEqual(val, "128000", err)
 
 
+class TestSetToken(unittest.TestCase):
+    """XERK-578: adopting a hub-pushed per-host derived token (design A) and the
+    self-enroll fetch (design B)."""
+
+    def _derived(self, device):
+        # Mirror the hub's hostAgentToken: base64url(device) (no padding) + "." +
+        # 64 hex chars. The agent never re-derives the hmac (it can't — no
+        # master), so the hex just has to LOOK like one.
+        head = base64.urlsafe_b64encode(device.encode()).decode().rstrip("=")
+        return head + "." + ("a" * 64)
+
+    def test_token_device_name_decodes_the_name_half(self):
+        self.assertEqual(ha.token_device_name(self._derived("nas01")), "nas01")
+        self.assertEqual(ha.token_device_name(self._derived("Häst-1")), "Häst-1")
+        # Not a token / no dot / undecodable -> None (never a wrong host name).
+        for bad in [None, 5, "", "no-dot", "%%%.abc"]:
+            self.assertIsNone(ha.token_device_name(bad))
+
+    def test_rewrite_env_var_replaces_one_line_and_preserves_the_rest(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "turma-agent.env")
+            with open(p, "w") as f:
+                f.write("# comment\nTURMA_URL=https://h\nTURMA_TOKEN=old\n"
+                        "DEVICE_NAME=nas01\n")
+            tok = self._derived("nas01")
+            ha.rewrite_env_var(p, "TURMA_TOKEN", tok)
+            body = open(p).read()
+            self.assertIn(f"TURMA_TOKEN={tok}\n", body)
+            self.assertNotIn("TURMA_TOKEN=old", body)
+            # Every other line, comment included, is preserved verbatim.
+            self.assertIn("# comment\n", body)
+            self.assertIn("TURMA_URL=https://h\n", body)
+            self.assertIn("DEVICE_NAME=nas01\n", body)
+            # 0600 (holds a credential).
+            self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+
+    def test_rewrite_env_var_appends_when_the_key_is_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            with open(p, "w") as f:
+                f.write("TURMA_URL=https://h\n")
+            tok = self._derived("h")
+            ha.rewrite_env_var(p, "TURMA_TOKEN", tok)
+            body = open(p).read()
+            self.assertIn("TURMA_URL=https://h\n", body)
+            self.assertIn(f"TURMA_TOKEN={tok}\n", body)
+            # Still newline-terminated (the launcher sources this).
+            self.assertTrue(body.endswith("\n"))
+
+    def test_rewrite_env_var_refuses_a_non_token_value(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=old\n")
+            for bad in ["has space", "quote'd", "semi;colon", "new\nline", ""]:
+                with self.assertRaises(OSError):
+                    ha.rewrite_env_var(p, "TURMA_TOKEN", bad)
+            # The file is untouched by a refused write.
+            self.assertEqual(open(p).read(), "TURMA_TOKEN=old\n")
+
+    def test_set_token_writes_and_restarts_for_our_own_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=agenttok\n")
+            sm = ha.SessionManager()
+            sm.device = "nas01"
+            tok = self._derived("nas01")
+            with mock.patch.dict(os.environ, {"TURMA_AGENT_ENV": p}), \
+                 mock.patch.object(sm, "request_restart") as restart:
+                sm.set_token("c1", tok)
+            self.assertIn(f"TURMA_TOKEN={tok}\n", open(p).read())
+            restart.assert_called_once()
+
+    def test_set_token_refuses_a_token_for_another_host(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=agenttok\n")
+            sm = ha.SessionManager()
+            sm.device = "nas01"
+            other = self._derived("nas99")  # NOT this host
+            with mock.patch.dict(os.environ, {"TURMA_AGENT_ENV": p}), \
+                 mock.patch.object(sm, "request_restart") as restart:
+                sm.set_token("c1", other)
+            # Untouched, and no restart — a wrong-host token is never persisted.
+            self.assertEqual(open(p).read(), "TURMA_TOKEN=agenttok\n")
+            restart.assert_not_called()
+
+    def test_set_token_no_env_file_does_not_restart(self):
+        sm = ha.SessionManager()
+        sm.device = "nas01"
+        tok = self._derived("nas01")
+        # No TURMA_AGENT_ENV and no default file present -> nothing to roll.
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(ha, "agent_env_path", return_value=""), \
+             mock.patch.object(sm, "request_restart") as restart:
+            sm.set_token("c1", tok)
+            restart.assert_not_called()
+
+    def test_enroll_self_writes_the_returned_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=agenttok\n")
+            tok = self._derived("nas01")
+            resp = io.BytesIO(json.dumps({"host": "nas01", "token": tok}).encode())
+            resp.__enter__ = lambda s=resp: s
+            resp.__exit__ = lambda *a: False
+            with mock.patch.dict(os.environ, {
+                    "TURMA_AGENT_ENV": p, "TURMA_URL": "https://h",
+                    "TURMA_TOKEN": "agenttok", "DEVICE_NAME": "nas01"}), \
+                 mock.patch.object(ha, "TURMA_URL", "https://h"), \
+                 mock.patch.object(ha, "TURMA_TOKEN", "agenttok"), \
+                 mock.patch.object(ha, "device_name", return_value="nas01"), \
+                 mock.patch.object(ha.urllib.request, "urlopen", return_value=resp):
+                rc = ha.enroll_self()
+            self.assertEqual(rc, 0)
+            self.assertIn(f"TURMA_TOKEN={tok}\n", open(p).read())
+
+    def test_enroll_self_no_op_when_already_on_the_derived_token(self):
+        tok = self._derived("nas01")
+        resp = io.BytesIO(json.dumps({"host": "nas01", "token": tok}).encode())
+        resp.__enter__ = lambda s=resp: s
+        resp.__exit__ = lambda *a: False
+        # The current token IS the derived one -> nothing to write, still rc 0.
+        with mock.patch.object(ha, "TURMA_URL", "https://h"), \
+             mock.patch.object(ha, "TURMA_TOKEN", tok), \
+             mock.patch.object(ha, "device_name", return_value="nas01"), \
+             mock.patch.object(ha, "rewrite_env_var") as rw, \
+             mock.patch.object(ha.urllib.request, "urlopen", return_value=resp):
+            rc = ha.enroll_self()
+        self.assertEqual(rc, 0)
+        rw.assert_not_called()
+
+    def test_enroll_self_soft_skips_a_hub_too_old(self):
+        err = ha.urllib.error.HTTPError("u", 404, "Not Found", {}, io.BytesIO(b"{}"))
+        with mock.patch.object(ha, "TURMA_URL", "https://h"), \
+             mock.patch.object(ha, "TURMA_TOKEN", "agenttok"), \
+             mock.patch.object(ha, "device_name", return_value="nas01"), \
+             mock.patch.object(ha.urllib.request, "urlopen", side_effect=err):
+            rc = ha.enroll_self()
+        # 2 = soft skip (the launcher stays on the current token, never blocks).
+        self.assertEqual(rc, 2)
+
+    def test_enroll_self_refuses_a_wrong_host_token(self):
+        wrong = self._derived("nas99")
+        resp = io.BytesIO(json.dumps({"host": "nas99", "token": wrong}).encode())
+        resp.__enter__ = lambda s=resp: s
+        resp.__exit__ = lambda *a: False
+        with mock.patch.object(ha, "TURMA_URL", "https://h"), \
+             mock.patch.object(ha, "TURMA_TOKEN", "agenttok"), \
+             mock.patch.object(ha, "device_name", return_value="nas01"), \
+             mock.patch.object(ha, "rewrite_env_var") as rw, \
+             mock.patch.object(ha.urllib.request, "urlopen", return_value=resp):
+            rc = ha.enroll_self()
+        self.assertEqual(rc, 1)
+        rw.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -59,6 +59,23 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   - `turma-agentctl` keys pidfiles on `XDG_RUNTIME_DIR`, falling back to `~/.turma` unless that dir
     exists AND is writable — WSL-without-logind points at a never-created `/run/user/<uid>`, so a
     bare fallback would orphan the old manager and spawn a second. Tests: `test_turma_agentctl.sh`.
+- **Per-host token rollover (XERK-578) — the native half.** Onboarding a host onto its derived token
+  (XERK-268) is one action; cross-cutting contract in `CLAUDE.md`. What lives under `native/`:
+  - **The launcher EXPORTS `TURMA_AGENT_ENV=$CFG`** (the resolved env-file path) — the manager
+    otherwise sees only the sourced VALUES, not where they came from, so it could not know which file
+    to rewrite when it rolls the token. `hub-agent.py`'s `agent_env_path()` reads it, falling back to
+    the same `${XDG_CONFIG_HOME:-~/.config}/turma-agent/turma-agent.env` default the launcher computes.
+  - **`turma-agentctl enroll`** sources the config (applying the SAME `DEVICE_NAME:-$(hostname)`
+    default the launcher does, or it would enroll the wrong name), runs `hub-agent.py --enroll`
+    (fetch + verify + atomic write), and restarts on success via `restart_manager` — the three-scope
+    (user/system-systemd/pidfile) block, session-preserving like the updater's. Exit 2 = hub too old,
+    a SOFT skip (stay on the current token), never a failure.
+  - **`TURMA_AGENT_SELF_ENROLL=1`** makes the launcher run `--enroll` on every start (best-effort,
+    never blocks start), then re-read ONLY `TURMA_TOKEN` from `$CFG` — re-sourcing the WHOLE file
+    would reset every blank HOME-relative default. Default off; every current host is unchanged.
+  - The actual `set_token`/`enroll_self`/`rewrite_env_var`/`token_device_name` live in `hub-agent.py`
+    (see `CLAUDE.md`); nothing under `native/` edits the shared runtime files, per the top of this
+    file. Tests: `test_turma_agent.sh`, `test_turma_agentctl.sh`, `TestSetToken` (agent).
 - `turma-agent-update` — self-updater: compares the manifest's **component version, never the tag**,
   verifies sha256, swaps files, restarts. Falls back to the legacy `agent-native-v*` stream. Tests:
   `test_turma_agent_update.sh`.

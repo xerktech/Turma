@@ -299,6 +299,31 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - The master still authenticates as `legacy` so a fleet mid-rollover keeps beating;
     **`TURMA_AGENT_STRICT` retires it**, and the hub warns at boot until it is set. Detail in
     `turma.md`; the agent needs no code change, only the right `TURMA_TOKEN`.
+  - **Onboarding onto that derived token is ONE action, not a per-host ritual** (XERK-578), spanning
+    hub + agent + native. The hub re-derives `hostAgentToken(host)` and delivers it two ways:
+    - **Roll (design A):** `POST /api/agents/<host>/roll-token` (operator-authed) queues a `setToken`
+      command over the existing tunnel; the agent (`set_token`) writes it to its env file atomically
+      and does a session-preserving restart. Deterministic, so a re-roll is idempotent.
+    - **Enroll (design B):** `GET /api/agent/token` (AGENT-authed) returns ONLY the token for the
+      identity the request proved — a derived-token caller gets its own (never another host's); a
+      MASTER caller names its own `?device=` and gets that, which is exactly master-mintable. Driven
+      by `turma-agentctl enroll` or opt-in `TURMA_AGENT_SELF_ENROLL=1` on start.
+    - **`resolveEnrollToken` is the endpoint's decision** (exported, unit-tested strict + non-strict).
+      Both self-close under `TURMA_AGENT_STRICT` — the master is no longer a credential, so neither
+      can be driven by a master holder; during rollover they hand out only what a master holder could
+      already mint, so no new exposure. **Never re-key the endpoint on a caller-named device for a
+      PROVED caller** — that reopens the cross-host escalation the whole thing guards.
+    - **DEVICE_NAME mismatch is impossible-by-construction AND checked**: the hub mints for the name
+      the agent beats as, and the agent (`token_device_name`) refuses to persist a token whose name
+      half isn't its own `DEVICE_NAME` — never a silent invalidation. Env write is a single-key atomic
+      rewrite (`rewrite_env_var`, preserves operator edits); the launcher exports `TURMA_AGENT_ENV` so
+      the manager knows which file to roll.
+    - **`tokenBound` is now SERVED** (was stripped) as the onboarding signal — the dashboard's
+      `🔐 own token` / `⚠ shared token` chip, replacing the "curl twice to verify" step. Still
+      HUB-DERIVED (forge-proof, re-stamped in `serializeAgent`), and served ONLY when the hub has a
+      master (absent = no per-host tokens here). `tokenRoll` is the agent capability that gates the
+      Roll button. Android types NEITHER yet (`ignoreUnknownKeys` skips them — safe); web-only, in
+      `PARITY.md`. Native/agent detail in `agent-native.md`.
 - **The hub's memory ceilings are FRACTIONS OF ITS CONTAINER LIMIT, never fixed numbers** (XERK-258,
   XERK-273). It runs at `mem_limit: 512m` (raised from 256m for XERK-287), so a flat constant larger
   than that can never refuse anything before the OOM killer fires. `containerMemoryLimit()` reads the cgroup; everything derives

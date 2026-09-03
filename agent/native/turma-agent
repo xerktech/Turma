@@ -43,6 +43,12 @@ fi
 # Load config. Same plain KEY=value format systemd's EnvironmentFile consumes;
 # `set -a` exports every assignment so it reaches hub-agent.py as an env var.
 CFG="${TURMA_AGENT_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/turma-agent/turma-agent.env}"
+# Export the RESOLVED path so the manager (hub-agent.py) knows which file to
+# rewrite when it rolls this host's token (XERK-578, the setToken command / the
+# `enroll` flow) — the manager otherwise only sees the sourced VALUES, not where
+# they came from. Exported before sourcing so it holds even for a bad/idle
+# config; the config never sets this key itself.
+export TURMA_AGENT_ENV="$CFG"
 
 # Every non-assignment line in the config, as `<line#>:<text>`. We SOURCE this
 # file, so such a line is not an inert typo — it RUNS. A YAML-style
@@ -138,6 +144,27 @@ export PATH="$PREFIX/bin:$HOME/.local/bin:$PATH"
 export CLAUDE_PROJECTS_ROOT="${CLAUDE_PROJECTS_ROOT:-$HOME/.claude/projects}"
 export REPOS_ROOT="${REPOS_ROOT:-$HOME/git}"
 export DEVICE_NAME="${DEVICE_NAME:-$(hostname)}"
+
+# Optional zero-touch onboarding (XERK-578): when opted in, roll this host onto
+# its OWN derived agent token (XERK-268/284) on start, so a fleet self-rolls off
+# the shared master on its next restart with no per-host ritual. IDEMPOTENT (a
+# host already on its derived token is a no-op) and BEST-EFFORT (never blocks
+# start): a hub too old to offer the endpoint, or any failure, just leaves the
+# current token in place. hub-agent.py --enroll writes the new token to $CFG
+# atomically; on success we re-read ONLY TURMA_TOKEN from the file (re-sourcing
+# the whole file would reset every HOME-relative default it leaves blank) so the
+# tunnel and the manager below start authenticated on the new token.
+case "${TURMA_AGENT_SELF_ENROLL:-}" in
+  1|true|yes|on|TRUE|YES|ON)
+    if [ -f "$CFG" ] && python3 "$PREFIX/hub-agent.py" --enroll; then
+      _rolled="$(grep -E '^[[:space:]]*(export[[:space:]]+)?TURMA_TOKEN=' "$CFG" \
+                 | tail -1 | sed -E 's/^[^=]*=//')"
+      [ -n "$_rolled" ] && export TURMA_TOKEN="$_rolled"
+      unset _rolled
+    fi
+    ;;
+esac
+
 TUNNEL_RETRY_SEC="${TUNNEL_RETRY_SEC:-10}"
 
 CREDS="$HOME/.claude/.credentials.json"

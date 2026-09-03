@@ -579,7 +579,9 @@ info "preflight:"
 "$PREFIX/bin/turma-agent" --preflight || true
 echo
 info "Done. Next steps:"
-info "  1) Edit $CFG — set TURMA_URL and TURMA_TOKEN."
+info "  1) Edit $CFG — set TURMA_URL and TURMA_TOKEN (the hub's shared token to"
+info "     start; then roll onto this host's own token from the dashboard, with"
+info "     'turma-agentctl enroll', or by setting TURMA_AGENT_SELF_ENROLL=1)."
 info "  2) Log in to Claude on this host if you haven't:  claude /login"
 info "  3) (optional) gh auth login   — for private git and 'gh pr create'."
 if systemd_user_ok; then

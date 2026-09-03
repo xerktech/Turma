@@ -113,15 +113,42 @@ Edit `~/.config/turma-agent/turma-agent.env` (created `chmod 600` — it holds a
 token):
 
 - **`TURMA_URL`** — the hub's public URL.
-- **`TURMA_TOKEN`** — this host's own agent token, printed on the hub by `node
-  turma/server.js --agent-token <DEVICE_NAME>`. It is derived from the hub's
-  `TURMA_AGENT_TOKEN` **and the device name below**, so the two must agree —
-  re-derive it if you change `DEVICE_NAME`. The hub's raw `TURMA_AGENT_TOKEN`
-  also works unless the hub sets `TURMA_AGENT_STRICT`, but then this agent can
-  act as any host in the fleet.
+- **`TURMA_TOKEN`** — this host's agent credential. Set it to the hub's shared
+  `TURMA_AGENT_TOKEN` to start; then move it onto this host's OWN derived token
+  (XERK-268/284) — you no longer hand-edit this line for that (see **Onboarding
+  onto the per-host token** below). A derived token is `node turma/server.js
+  --agent-token <DEVICE_NAME>` on the hub, tied to the device name below, so the
+  two must agree — re-derive it if you change `DEVICE_NAME`. The shared master
+  keeps working unless the hub sets `TURMA_AGENT_STRICT`, but until then this
+  agent can act as any host in the fleet.
 - **`DEVICE_NAME`** — seeded to `$(hostname)`; the hub keys the agent by it.
+- **`TURMA_AGENT_SELF_ENROLL`** — set to `1` for zero-touch onboarding: on every
+  start the agent rolls itself onto its derived token (idempotent, best-effort —
+  a hub too old, or any failure, just leaves it on the current token). Unset =
+  the current behaviour, unchanged.
 - Leave `REPOS_ROOT` / `CLAUDE_PROJECTS_ROOT` **blank** to accept the
   HOME-relative defaults (`$HOME/git`, `$HOME/.claude/projects`).
+
+## Onboarding onto the per-host token (XERK-578)
+
+Moving a host from the shared master onto its own derived token is now **one
+action**, not the old ritual (SSH in → mint on the hub over kubectl → hand-edit
+this file → restart → curl twice to verify). Any one of these does it:
+
+- **From the dashboard** — the host header shows `⚠ shared token` while it rides
+  the master; click **Roll token**. The hub pushes the derived token over the
+  existing command tunnel; the agent writes it here atomically and restarts to
+  adopt it (running sessions are re-adopted). The chip flips to `🔐 own token`
+  when it beats back bound — that IS the verification.
+- **On the host** — `turma-agentctl enroll`: fetches this host's derived token
+  from the hub (authenticated with the current token), persists it here, and
+  restarts. Idempotent; refuses to write a token for the wrong `DEVICE_NAME`.
+- **Automatically** — set `TURMA_AGENT_SELF_ENROLL=1` and the whole fleet
+  self-rolls on its next restart.
+
+All of these are inert once `TURMA_AGENT_STRICT` retires the master (the fleet
+is bound by then), and none hands out more than a master holder could already
+mint.
 
 ## Log in
 

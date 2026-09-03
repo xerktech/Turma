@@ -177,7 +177,7 @@ const {
   serializeAgentsForSave,
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, REFUSED_DETAIL_MAX,
   userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
-  agentBearerKind, agentHostRefusal, agentPresentedRefusal, hostAgentToken, tokenHost, ttydAuth,
+  agentBearerKind, agentHostRefusal, agentPresentedRefusal, resolveEnrollToken, hostAgentToken, tokenHost, ttydAuth,
   controlChannels, pendingChannels,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
@@ -14206,10 +14206,124 @@ test("XERK-268: ttyd is proxied with the token that host actually runs", async (
     headers: { authorization: "Bearer agenttok", "content-type": "application/json" },
   });
   assert.equal(cred("ttLegacy"), "term:agenttok");
-  // ...nor does it reach the clients as a wire field.
+  // XERK-578 SERVES tokenBound (the onboarding signal that replaces the manual
+  // "curl to verify it bound"), but it stays HUB-DERIVED: a bound host reads
+  // true, and the host that forged tokenBound:true on the legacy master still
+  // reads false — the forge never reaches the wire.
   const fleet = await request("GET", "/api/agents", { headers: userHeaders });
-  const row = fleet.body.agents.find((a) => a.key === "ttBound");
-  assert.ok(row && !("tokenBound" in row));
+  const bound = fleet.body.agents.find((a) => a.key === "ttBound");
+  const legacy = fleet.body.agents.find((a) => a.key === "ttLegacy");
+  assert.equal(bound && bound.tokenBound, true);
+  assert.equal(legacy && legacy.tokenBound, false);
+});
+
+test("XERK-578: roll-token mints this host's derived token and queues one setToken", async () => {
+  // A host beating on the master (legacy) is the one that needs rolling.
+  await beatAs("rollHost", { authorization: "Bearer agenttok" });
+  const ok = await request("POST", "/api/agents/rollHost/roll-token",
+    { body: {}, headers: userHeaders });
+  assert.equal(ok.status, 200);
+  assert.ok(ok.body.cmdId);
+  // A mashed button reuses the same setToken — one roll in flight, not a queue.
+  const again = await request("POST", "/api/agents/rollHost/roll-token",
+    { body: {}, headers: userHeaders });
+  assert.equal(again.body.cmdId, ok.body.cmdId);
+  // It rides the next reply carrying exactly THIS host's derived token.
+  const reply = await beatAs("rollHost", { authorization: "Bearer agenttok" });
+  assert.deepEqual(reply.body.commands, [
+    { type: "setToken", token: hostAgentToken("rollHost"), cmdId: ok.body.cmdId },
+  ]);
+  // Unknown host -> 404; and it needs the operator login (no anonymous access).
+  assert.equal((await request("POST", "/api/agents/ghost578/roll-token",
+    { body: {}, headers: userHeaders })).status, 404);
+  assert.equal((await request("POST", "/api/agents/rollHost/roll-token",
+    { body: {} })).status, 401);
+});
+
+test("XERK-578: self-enroll returns ONLY the identity the request proved", () => {
+  const bearer = (t) => ({ headers: { authorization: `Bearer ${t}` } });
+  // A host already on its derived token gets its OWN back (idempotent) and can
+  // NOT name another host — the escalation "never a caller-named device" guards.
+  const own = resolveEnrollToken(bearer(hostAgentToken("hOwn")), "someoneelse");
+  assert.equal(own.status, 200);
+  assert.deepEqual(own.body, { host: "hOwn", token: hostAgentToken("hOwn"), bound: true });
+  // The fleet master (rollover) names its OWN device and gets that host's token
+  // — exactly what `--agent-token <device>` mints, nothing more.
+  const boot = resolveEnrollToken(bearer("agenttok"), "hBoot");
+  assert.equal(boot.status, 200);
+  assert.deepEqual(boot.body, { host: "hBoot", token: hostAgentToken("hBoot"), bound: false });
+  // Master with no device can't bootstrap (which host?) -> 400.
+  assert.equal(resolveEnrollToken(bearer("agenttok"), "").status, 400);
+  // A master naming an UNUSABLE host name (a URL dot segment the hub refuses to
+  // register, XERK-269) -> 409, never a dead token.
+  assert.equal(resolveEnrollToken(bearer("agenttok"), "..").status, 409);
+  // A non-agent bearer is unauthorized.
+  assert.equal(resolveEnrollToken(bearer("not-a-token"), "x").status, 401);
+  // The HTTP route wires the same logic and is exempt from the user login.
+  return request("GET", `/api/agent/token?device=hBoot`,
+    { headers: { authorization: "Bearer agenttok" } }).then((res) => {
+    assert.equal(res.status, 200);
+    assert.equal(res.body.token, hostAgentToken("hBoot"));
+  });
+});
+
+test("XERK-578: self-enroll self-closes under TURMA_AGENT_STRICT", () => {
+  const strict = freshServerModule((env) => { env.TURMA_AGENT_STRICT = "1"; });
+  const bearer = (t) => ({ headers: { authorization: `Bearer ${t}` } });
+  // The master can no longer bootstrap — enroll only rolls OFF the master, so
+  // once strict retires it the endpoint hands out nothing to a master holder.
+  const refused = strict.resolveEnrollToken(bearer("agenttok"), "hX");
+  assert.equal(refused.status, 403);
+  assert.match(refused.body.error, /TURMA_AGENT_STRICT is set/);
+  // An already-rolled host still gets its own token back (idempotent), so a
+  // re-enroll after strict is a harmless no-op rather than a lockout.
+  const own = strict.resolveEnrollToken(bearer(strict.hostAgentToken("hX")), "");
+  assert.equal(own.status, 200);
+  assert.equal(own.body.token, strict.hostAgentToken("hX"));
+});
+
+test("XERK-578: tokenRoll is coerced to a strict boolean; absent stays absent", async () => {
+  await request("POST", "/api/heartbeat",
+    { body: { device: "trCoerce", tokenRoll: "yes" }, headers: agentHeaders });
+  await request("POST", "/api/heartbeat",
+    { body: { device: "trTrue", tokenRoll: true }, headers: agentHeaders });
+  await beatAs("trNone", { authorization: "Bearer agenttok" });
+  const fleet = await request("GET", "/api/agents", { headers: userHeaders });
+  const row = (k) => fleet.body.agents.find((a) => a.key === k);
+  // A truthy string never reads as the capability — strict boolean only.
+  assert.equal(row("trCoerce").tokenRoll, false);
+  assert.equal(row("trTrue").tokenRoll, true);
+  // Absent means absent — a pre-XERK-578 agent reports nothing, and the button
+  // stays hidden rather than showing on a host that would ack-and-drop setToken.
+  assert.equal("tokenRoll" in row("trNone"), false);
+});
+
+test("XERK-578: tokenBound is coerced to a strict boolean on the restore path", () => {
+  // normalizeRecord runs on the state.json restore, where a hand-edited or
+  // forged tokenBound could be any shape; it must land as a real boolean or an
+  // Android decode (typed) would throw the whole fleet array. (The heartbeat
+  // path re-derives tokenBound hub-side, so this is the restore half.)
+  const a = { tokenBound: "yes", tokenRoll: "yes" };
+  hub.normalizeRecord(a, "restore");
+  assert.equal(a.tokenBound, false);
+  assert.equal(a.tokenRoll, false);
+  const b = { tokenBound: true, tokenRoll: true };
+  hub.normalizeRecord(b, "restore");
+  assert.equal(b.tokenBound, true);
+  assert.equal(b.tokenRoll, true);
+});
+
+test("XERK-578: tokenBound is served only when the hub has a fleet master", () => {
+  const now = Date.now();
+  const rec = { device: "tbGate", lastSeen: now, tokenBound: true, commands: [] };
+  // This suite's hub HAS a master, so the field is served (a boolean).
+  assert.equal(hub.serializeAgent("tbGate", rec, now).tokenBound, true);
+  // A hub with NO master derives no per-host tokens, so it OMITS the field
+  // entirely — clients read absent as "no per-host tokens here" (no chip, no
+  // Roll button), never a misleading "shared token" warning on every host.
+  const noMaster = freshServerModule((env) => { delete env.TURMA_AGENT_TOKEN; });
+  const served = noMaster.serializeAgent("tbGate", { ...rec }, now);
+  assert.equal("tokenBound" in served, false);
 });
 
 // Build a client->server (masked, FIN) binary WebSocket frame. The hub's
