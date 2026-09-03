@@ -184,7 +184,7 @@ const {
   TERM_OSC52_JS,
   TERM_SCROLL_BOTTOM_JS,
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
-  autoStopped, autoStartOrgs, setAutoStartOrg,
+  autoStopped, autoStopResumeExempt, autoStartOrgs, setAutoStartOrg,
   autoMergeSweep, autoCloseSweep, autoStartContentGate, orgsWithAutoMerge,
   autoMergeOrgs, setAutoMergeOrg, autoMergeState, autoClosed, ingestMergeResults,
   priorityWriteBackOrgs, setPriorityWriteBackOrg, orgsWithPriorityWriteBack,
@@ -10840,6 +10840,61 @@ test("auto-stop: fires each session at most once, across repeated sweeps", async
   autoStopSweep();
   autoStopSweep();
   assert.equal((agents.apOnce.commands || []).filter((c) => c.type === "kill").length, 1);
+});
+
+// ---- resuming a Done-ticket session overrides auto-stop (XERK-561) ------------
+// Deliberately resuming an ended session whose ticket is already Done is the
+// operator overriding auto-stop — they want it running again despite Done.
+// Without seating the once-per-lifetime kill guard at resume time, autoStopSweep
+// re-kills the just-resumed session within one 15s sweep, so it "comes back then
+// ends" and only a SECOND resume (after the first sweep's kill sets the guard)
+// sticks — the exact reported bug.
+
+test("auto-stop: a deliberately RESUMED Done-ticket session is NOT re-killed (XERK-561)", async () => {
+  autoStopped.clear();
+  autoStopResumeExempt.clear();
+  await doneBeat("apResume", "ap8.atlassian.net");
+  // The operator's Resume seats the exemption (the ticket is Done right now).
+  const r = await request("POST", "/api/agents/apResume/sessions/sd1/resume",
+    { headers: userHeaders });
+  assert.equal(r.status, 200);
+  // The very next sweep must leave the resumed session alone — the FIRST resume
+  // sticks, no second attempt needed.
+  autoStopSweep();
+  assert.equal((agents.apResume.commands || []).filter((c) => c.type === "kill").length, 0);
+  // The exemption lives in its OWN set, never the shared autoStopped — so it
+  // stands autoStopSweep down without also suppressing autoCloseSweep (which reads
+  // autoStopped alone). This is the guard that keeps the residual closed.
+  assert.equal(autoStopped.has("apResume\x00sd1"), false);
+  assert.equal(autoStopResumeExempt.has("apResume\x00sd1"), true);
+});
+
+test("auto-stop: a Done-ticket session resumed via START is also exempt (XERK-561)", async () => {
+  autoStopped.clear();
+  // A stopped/error session carrying a Done ticket, resumed via `start`.
+  await doneBeat("apStart", "ap10.atlassian.net", { status: "error" });
+  const r = await request("POST", "/api/agents/apStart/sessions/sd1/start",
+    { headers: userHeaders });
+  assert.equal(r.status, 200);
+  // The agent brings it back running; the sweep must still leave it alone.
+  await doneBeat("apStart", "ap10.atlassian.net");
+  autoStopSweep();
+  assert.equal((agents.apStart.commands || []).filter((c) => c.type === "kill").length, 0);
+});
+
+test("auto-stop: resuming a NON-Done ticket does not exempt a LATER Done (XERK-561)", async () => {
+  // The exemption is scoped to a ticket that is Done AT RESUME TIME, so a human
+  // moving the ticket to Done AFTER the resume still auto-stops the session — the
+  // feature working as intended, not a permanent opt-out.
+  autoStopped.clear();
+  await doneBeat("apResume2", "ap9.atlassian.net", { statusCategory: "inprogress" });
+  const r = await request("POST", "/api/agents/apResume2/sessions/sd1/resume",
+    { headers: userHeaders });
+  assert.equal(r.status, 200);
+  await doneBeat("apResume2", "ap9.atlassian.net");   // human later moves it to Done
+  autoStopSweep();
+  assert.deepEqual((agents.apResume2.commands || []).filter((c) => c.type === "kill")
+    .map((c) => c.sessionId), ["sd1"]);
 });
 
 // ---- auto-merge + auto-close (XERK-550) ------------------------------------
