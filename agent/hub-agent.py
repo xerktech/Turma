@@ -12388,6 +12388,33 @@ def _ticket_attachment_lines(detail, attachments):
     return lines
 
 
+def _ticket_is_bug(detail):
+    """True when the ticket's issue type reads as a bug (XERK-370). `type` is the
+    tracker's OWN issue-type name — Jira `issuetype`, Azure `System.WorkItemType` —
+    so it is matched loosely: any type whose name contains "bug" or "defect",
+    case-insensitively (covers "Bug", "Sub-bug", ADO/CMMI "Bug", orgs that call it
+    "Defect"). A ticket with no type reads as not-a-bug."""
+    t = str((detail or {}).get("type") or "").lower()
+    return "bug" in t or "defect" in t
+
+
+# XERK-370: a bug REPORT is a spawn-time snapshot like the rest of the prompt, and
+# by the time a session picks it up the bug may already be fixed or no longer
+# reproducible. So a bug-typed ticket session is told, plainly and first, to
+# reproduce it before touching anything and to STOP (report, don't change) if it
+# can't — the tracker's own text can't tell it that, and a "fix" for a bug that no
+# longer exists is worse than no work at all.
+TICKET_BUG_VERIFY_DIRECTIVE = (
+    "**This is a bug ticket, so your FIRST step is to verify the bug is still a "
+    "real, current issue** — reproduce it against the up-to-date default branch "
+    "before you change anything. The report above is a snapshot from when this "
+    "session spawned; the bug may already be fixed or no longer reproducible. If "
+    "you confirm it is no longer an issue, STOP there: do NOT change code or open "
+    "a PR — say so plainly and give the evidence (what you ran, what you saw) so it "
+    "can be closed. Only once you have reproduced it do you go on to fix it."
+)
+
+
 def build_ticket_prompt(detail, attachments=None):
     """A fetched ticket -> the initial task prompt for its session: everything the
     agent would otherwise have to go and read, inlined.
@@ -12464,6 +12491,9 @@ def build_ticket_prompt(detail, attachments=None):
             out.append(f"**{who}**{f' — {when}' if when else ''}\n{body}\n")
 
     out += _ticket_attachment_lines(d, attachments)
+
+    if _ticket_is_bug(d):
+        out += ["", TICKET_BUG_VERIFY_DIRECTIVE]
 
     out += [
         "",

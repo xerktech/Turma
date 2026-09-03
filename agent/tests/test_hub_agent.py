@@ -27755,6 +27755,33 @@ class TestBuildTicketPrompt(unittest.TestCase):
                      {"key": "P-1", "attachments": [None, "x"]}):
             self.assertIsInstance(ha.build_ticket_prompt(junk), str)
 
+    # --- bug verification (XERK-370) ----------------------------------------
+
+    def test_a_bug_ticket_is_told_to_verify_first(self):
+        # A bug report is a snapshot; the session must reproduce it before
+        # changing anything and stop if it's already resolved.
+        p = ha.build_ticket_prompt(self._detail(type="Bug"))
+        self.assertIn("verify the bug is still", p)
+        self.assertIn("STOP", p)
+        # It reads as the FIRST step, ahead of the generic "then do it" close.
+        self.assertLess(p.index("verify the bug is still"),
+                        p.index("Start by working out"))
+
+    def test_a_non_bug_ticket_gets_no_verify_directive(self):
+        for t in ("Task", "Story", "Epic", None, ""):
+            p = ha.build_ticket_prompt(self._detail(type=t))
+            self.assertNotIn("verify the bug is still", p)
+
+    def test_bug_type_is_matched_loosely(self):
+        # The type is the tracker's own issue-type name (a controlled vocabulary,
+        # not free text), which varies by org.
+        for t in ("Bug", "bug", "Sub-bug", "Defect", "Production Defect"):
+            self.assertTrue(ha._ticket_is_bug({"type": t}), t)
+        for t in ("Task", "Story", "Epic", "Feature", "Sub-task"):
+            self.assertFalse(ha._ticket_is_bug({"type": t}), t)
+        self.assertFalse(ha._ticket_is_bug({}))
+        self.assertFalse(ha._ticket_is_bug(None))
+
     # --- attachments (XERK-242) ---------------------------------------------
 
     def _with_files(self, **over):
