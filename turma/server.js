@@ -755,6 +755,42 @@ const PR_ALERT_MAX_WAIT_MS = 30 * 60 * 1000;
 // Per-session ceiling on both PR bookkeeping lists (newest kept).
 const PR_ALERT_MAX_TRACKED = 20;
 
+// Token ceilings at which a single session's spend is worth interrupting the
+// operator for. A session's cost is otherwise invisible until somebody opens
+// /usage and adds it up, so a run that goes away with the fleet's whole day is
+// only ever found afterwards — one measured session spent 252M tokens on one
+// ticket, 31% of that day across every host. The heartbeat already carries
+// per-session usage, so the check costs nothing.
+//
+// ABSOLUTE, not a multiple of any rolling median: a threshold that drifts up
+// with spend stops firing exactly as spend gets worse. Two stages, so a session
+// still climbing after the first notice says so; the second is the one that
+// says "this is not going to stop on its own".
+//
+// These are notification thresholds ONLY. Nothing here throttles, interrupts or
+// kills a session — the operator decides what to do, and a session mid-repro on
+// a genuinely expensive bug is allowed to be expensive.
+const SESSION_SPEND_WARN_TOKENS = spendThresholdEnv("SESSION_SPEND_WARN_TOKENS", 100_000_000);
+const SESSION_SPEND_HIGH_TOKENS = spendThresholdEnv("SESSION_SPEND_HIGH_TOKENS", 200_000_000);
+
+// The active stage thresholds, ascending, with any DISABLED (0) stage dropped.
+// Sorted so a MISCONFIGURED pair (an operator who sets WARN above HIGH) can
+// never produce a stage-1 body naming a ceiling ABOVE the token figure in the
+// title (XERK-310 D7) — the alert always names the threshold it actually
+// crossed, `SESSION_SPEND_STAGES[stage - 1]`. Both/one/neither may be present.
+const SESSION_SPEND_STAGES = [SESSION_SPEND_WARN_TOKENS, SESSION_SPEND_HIGH_TOKENS]
+  .filter((t) => Number.isFinite(t) && t > 0)
+  .sort((a, b) => a - b);
+
+// How many session ids the per-host `alerts.spendSeen` map remembers (XERK-310
+// D3), newest kept — the prSeen/`slice(-MAX)` idiom. spendSeen records the
+// stage each session has already been alerted at and, unlike the per-session
+// `sa`, is NOT dropped by the liveIds sweep, so a momentarily empty beat can't
+// re-announce a still-expensive session. A crossing is rare (100M+ tokens), so
+// this is generous; the bound only stops the map growing without limit as
+// ephemeral worktree sessions come and go on a long-lived host.
+const SPEND_SEEN_MAX = positiveEnv("SPEND_SEEN_MAX", 200);
+
 // Keyed by the host name (`device`), value = last heartbeat payload +
 // bookkeeping. One container per host, so the host name is the stable identity.
 let agents = {};
@@ -809,6 +845,18 @@ function positiveEnv(name, fallback) {
   if (Number.isFinite(n) && n > 0) return Math.floor(n);
   console.warn(`WARNING: ${name}=${JSON.stringify(raw)} is not a positive number — using ${fallback}`);
   return fallback;
+}
+
+// Like positiveEnv, but an explicit `0` DISABLES the stage (returns 0) rather
+// than falling back to the default (XERK-310 D7). `positiveEnv` refuses 0
+// fleet-wide, so without this a spend stage could only be silenced by setting
+// it absurdly high; an operator who wants a single-stage alert unsets one and
+// sets the other to `0`. Absent still takes the fallback; a negative/garbage
+// value warns and falls back exactly as positiveEnv does.
+function spendThresholdEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw !== undefined && raw.trim() === "0") return 0;
+  return positiveEnv(name, fallback);
 }
 
 // A host name is agent-supplied and reaches the hub's log; it is validated for
@@ -7516,6 +7564,68 @@ function readyForReview(session, working) {
   return s.lastRole === "assistant" && !s.lastHasToolUse;
 }
 
+// The four token counters the agent reports, summed. Deliberately the SAME
+// four `usage.html` totals (`TOKEN_KEYS` there), so the number in an alert and
+// the number on the usage page can never disagree — cacheRead included, which
+// is ~97% of real spend and the whole reason a long session gets expensive.
+function sessionSpendTokens(bucket) {
+  if (!bucket || typeof bucket !== "object") return 0;
+  let n = 0;
+  for (const k of ["input", "output", "cacheWrite", "cacheRead"]) {
+    const v = bucket[k];
+    if (typeof v === "number" && Number.isFinite(v) && v > 0) n += v;
+  }
+  // The SUM must be finite too, not just each field (XERK-310 D2): two
+  // individually valid, finite, positive counters (e.g. two `Number.MAX_VALUE`
+  // from a buggy host) overflow to `Infinity`, which `sessionSpendStage` then
+  // reads as "past every threshold" and `fmtSpendTokens` renders as a bogus
+  // "InfinityB". A non-finite sum is agent-junk, so it contributes 0 — the same
+  // "a malformed bucket fabricates no figure" rule the per-field guard follows.
+  return Number.isFinite(n) ? n : 0;
+}
+
+// Tokens as a short human figure for an alert body ("142M"). Whole millions:
+// this is a "come and look" number, and a decimal implies a precision the
+// staggered per-session usage refresh does not have. Guards its own input
+// (XERK-310 D2): sessionSpendTokens already zeroes a non-finite sum, but a
+// direct caller must never turn `Infinity`/`NaN` into an "InfinityB" body.
+function fmtSpendTokens(n) {
+  if (typeof n !== "number" || !Number.isFinite(n)) return "0";
+  if (n >= 1e9) return `${Math.round(n / 1e8) / 10}B`;
+  if (n >= 1e6) return `${Math.round(n / 1e6)}M`;
+  if (n >= 1e3) return `${Math.round(n / 1e3)}k`;
+  return String(n);
+}
+
+// Which spend stage a session has reached: 0 none, then one per crossed
+// threshold. Counted over the ASCENDING SESSION_SPEND_STAGES, so a session that
+// blows straight past every threshold between two beats lands on the top stage
+// and never emits the ones it skipped, and a misconfigured pair still yields a
+// stage that maps to the threshold actually crossed (XERK-310 D7).
+function sessionSpendStage(tokens) {
+  let stage = 0;
+  for (const t of SESSION_SPEND_STAGES) {
+    if (tokens >= t) stage += 1;
+  }
+  return stage;
+}
+
+// Record the stage a session has been alerted at on the per-HOST `alerts`
+// bookkeeping (XERK-310 D3), bounding the map to SPEND_SEEN_MAX ids newest-first
+// — the prSeen idiom, here as an insertion-ordered object. delete-then-set moves
+// a re-recorded id to the newest slot so a still-live session isn't evicted
+// while other sessions cross their thresholds. Kept off `sa` on purpose: `sa` is
+// swept the moment a beat omits its session, this must outlive that.
+function recordSpendStage(alerts, id, stage) {
+  const seen = alerts.spendSeen || (alerts.spendSeen = {});
+  delete seen[id];
+  seen[id] = stage;
+  const ids = Object.keys(seen);
+  if (ids.length > SPEND_SEEN_MAX) {
+    for (const old of ids.slice(0, ids.length - SPEND_SEEN_MAX)) delete seen[old];
+  }
+}
+
 // Alert checks that key off a fresh heartbeat. `next.alerts` is per-agent
 // bookkeeping carried across beats (and persisted, so hub restarts don't
 // re-fire or drop edges).
@@ -7743,6 +7853,78 @@ function heartbeatAlerts(key, prev, next) {
     if (working && sa.turnAlerted) {
       dismiss(`turn:${key}:${session.id}`);
       delete sa.turnAlerted;
+    }
+
+    // Runaway spend. Absolute stages (SESSION_SPEND_STAGES), each fired once, on
+    // the crossing.
+    //
+    // This is the one session alert that is NOT about the work being ready, so
+    // it deliberately sits outside the XERK-224 one-alert-per-piece-of-work
+    // rule: a session can be both mid-turn and far too expensive, and the
+    // review alert would not be the thing to say. Both stages ride ONE
+    // `notifKey`, so the escalation REPLACES the first notice on the phone
+    // instead of stacking beside it.
+    //
+    // Never retracted: spend only ever grows, so unlike a question or a landed
+    // PR there is no addressed edge a dismiss could fire on.
+    //
+    // The stage a session has already been alerted at is remembered on
+    // `alerts.spendSeen`, NOT on the per-session `sa` (XERK-310 D3): `sa` is
+    // dropped the instant a beat omits the session (the liveIds sweep below),
+    // and a momentarily empty beat — an agent restart whose ~/.turma registry
+    // did not survive, or a session migrated away and back — would otherwise
+    // re-announce the same still-high spend at stage 2. `spendSeen` survives the
+    // sweep and is persisted with the rest of `alerts`, so the crossing fires
+    // exactly once across empty beats and restarts.
+    //
+    // Gated on `running`: a stopped session's total is history, and its record
+    // keeps reporting `usage` for as long as it is listed. A session that
+    // crossed while stopped is announced if it resumes, which is when the
+    // number can still change.
+    //
+    // Gated on NOT `root` (XERK-310 D1): a repos-root session's `usage.totals`
+    // is not its own cost — every root session's worktreePath is REPOS_ROOT, so
+    // _refresh_usage folds every transcript in that one project slug, and the
+    // total reads as the whole root-session history on the host. Alerting on it
+    // would buzz every new root session at stage 2 on its first beat for spend
+    // it did not incur. Root sessions are UNCOVERED until the agent can report a
+    // per-session figure; worktree-backed sessions (where big spend is just as
+    // plausible) are unaffected.
+    if (session.status === "running" && !session.root) {
+      const spent = sessionSpendTokens(session.usage?.totals);
+      const stage = sessionSpendStage(spent);
+      const seen = alerts.spendSeen || (alerts.spendSeen = {});
+      const recorded = seen[session.id] || 0;
+      if (stage > recorded) {
+        recordSpendStage(alerts, session.id, stage);
+        const repo = session.git?.repoName
+          ? ` · ${session.git.repoName}@${session.git.branch}` : "";
+        // Name the threshold actually crossed, not a fixed WARN/HIGH — with the
+        // pair sorted (D7) `stage` maps to `SESSION_SPEND_STAGES[stage - 1]`, so
+        // the body can never claim a ceiling above the figure in the title. The
+        // TOP stage is the urgent one ("still climbing"); any lower stage is the
+        // proactive nudge.
+        const crossed = fmtSpendTokens(SESSION_SPEND_STAGES[stage - 1]);
+        const top = stage >= SESSION_SPEND_STAGES.length;
+        notify(
+          `${label} has spent ${fmtSpendTokens(spent)} tokens`,
+          `${top ? "Still climbing past" : "Past"} ${crossed}${repo}`,
+          {
+            tags: "money_with_wings",
+            ...(top ? { priority: "high" } : {}),
+            route,
+            notifKey: `spend:${key}:${session.id}`,
+          },
+        );
+      } else if (recorded > 0) {
+        // Already alerted at its top stage and not climbing further — but STILL
+        // listed, so refresh its slot in the bounded map (XERK-310 D3). Without
+        // this a maxed session is never re-recorded, ages to the oldest slot,
+        // and is evicted once SPEND_SEEN_MAX other sessions cross a threshold on
+        // this host — then re-announces on its next beat. Refreshing a live
+        // session keeps eviction to sessions the host no longer reports.
+        recordSpendStage(alerts, session.id, recorded);
+      }
     }
     sa.wasWorking = working;
   }
@@ -13805,6 +13987,14 @@ if (process.env.TURMA_TEST) {
     heartbeatAlerts,
     prAlertDecision,
     readyForReview,
+    sessionSpendTokens,
+    sessionSpendStage,
+    fmtSpendTokens,
+    recordSpendStage,
+    SESSION_SPEND_WARN_TOKENS,
+    SESSION_SPEND_HIGH_TOKENS,
+    SESSION_SPEND_STAGES,
+    SPEND_SEEN_MAX,
     sessionWorking,
     hasLiveAgents,
     sanitizeLiveAgents,
