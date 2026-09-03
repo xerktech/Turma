@@ -1180,11 +1180,129 @@ test("spend: sessionSpendTokens sums the four counters and ignores junk", () => 
   assert.equal(hub.sessionSpendTokens("142M"), 0);
   // A malformed bucket from one buggy host must not fabricate a spend figure.
   assert.equal(hub.sessionSpendTokens({ input: "lots", output: NaN, cacheRead: -5, cacheWrite: 7 }), 7);
+  // XERK-310 D5: a single non-finite FIELD is excluded, not summed — dropping
+  // the per-field `Number.isFinite(v)` guard (the mutation that escaped the
+  // original suite) turns this into Infinity and is caught here.
+  assert.equal(hub.sessionSpendTokens({ input: Infinity, output: 5 }), 5);
   assert.equal(hub.sessionSpendStage(0), 0);
   assert.equal(hub.sessionSpendStage(WARN), 1);
   assert.equal(hub.sessionSpendStage(HIGH), 2);
   assert.equal(hub.fmtSpendTokens(252_500_000), "253M");
   assert.equal(hub.fmtSpendTokens(1_240_000_000), "1.2B");
+});
+
+test("spend: a sum that overflows to Infinity contributes 0, never a bogus stage (XERK-310 D2)", () => {
+  // Two individually valid, finite, positive counters overflow when summed. The
+  // per-field guard passes each; only a check on the SUM stops the alert firing
+  // "InfinityB" at stage 2 for agent-junk. 3/3 deterministic in the report.
+  const M = Number.MAX_VALUE;
+  assert.equal(hub.sessionSpendTokens({ input: M, output: M, cacheWrite: M, cacheRead: M }), 0);
+  assert.equal(hub.sessionSpendStage(hub.sessionSpendTokens({ cacheRead: M, input: M })), 0);
+  // And the formatter guards its own input, so a direct caller can't render one.
+  assert.equal(hub.fmtSpendTokens(Infinity), "0");
+  assert.equal(hub.fmtSpendTokens(NaN), "0");
+  assert.equal(hub.fmtSpendTokens(-Infinity), "0");
+  assert.equal(hub.fmtSpendTokens("142M"), "0");
+  // Driven through a real beat: an overflowing bucket is silent, not a stage-2 buzz.
+  const beat = makeHost();
+  notifications.length = 0;
+  beat({ sessions: [{
+    id: "s1", rcName: "infhost-repo-inf1", status: "running", session: {},
+    usage: { totals: { input: M, output: M, cacheWrite: M, cacheRead: M } },
+  }] });
+  assert.deepEqual(titles(), []);
+});
+
+test("spend: a repos-root session never alerts on the whole slug's spend (XERK-310 D1)", () => {
+  // A root session's usage.totals is every root session's transcript folded
+  // together (worktreePath == REPOS_ROOT), not its own cost — so it is gated out
+  // entirely. A worktree session at the same spend still alerts (control).
+  const beat = makeHost();
+  notifications.length = 0;
+  beat({ sessions: [{
+    id: "root1", rcName: "rootbox-root-abc", status: "running", root: true, session: {},
+    usage: { totals: { cacheRead: HIGH + 1 } },
+  }] });
+  assert.deepEqual(titles(), [], "a root session must not buzz for spend it did not incur");
+  // Control: the same spend on a worktree-backed session still fires.
+  beat({ sessions: [{
+    id: "wt1", rcName: "rootbox-repo-wt1", status: "running", session: {},
+    usage: { totals: { cacheRead: HIGH + 1 } },
+  }] });
+  assert.equal(titles().length, 1);
+});
+
+test("spend: an empty beat does not re-announce a still-high session (XERK-310 D3)", () => {
+  // The liveIds sweep drops `sa` the instant a beat omits a session — an agent
+  // restart that lost its ~/.turma registry, or a momentarily empty beat. Spend
+  // re-announces unconditionally (it is still high), so the crossing must be
+  // remembered on `alerts.spendSeen`, which survives the sweep.
+  const beat = makeHost();
+  notifications.length = 0;
+  beat(spendOf(HIGH));            // first sight: fires stage 2 once
+  assert.equal(titles().length, 1);
+  notifications.length = 0;
+  beat({ sessions: [] });        // one beat omits the session (sweep drops sa)
+  assert.deepEqual(titles(), []);
+  beat(spendOf(HIGH));            // same session, SAME spend, back in the list
+  assert.deepEqual(titles(), [], "spendSeen must survive the sweep and suppress the re-announce");
+});
+
+test("spend: a still-LISTED maxed session is not evicted and re-announced (XERK-310 D3)", () => {
+  // A session pinned at the top stage never crosses a NEW stage, so it is never
+  // re-recorded on a crossing. If it aged to the oldest slot it would be evicted
+  // once SPEND_SEEN_MAX other sessions crossed on the same host, then re-fire.
+  // Refreshing a still-listed session's slot each beat is what prevents that.
+  const beat = makeHost();
+  notifications.length = 0;
+  const maxed = {
+    id: "A", rcName: "host1-repo-A", status: "running", session: {},
+    usage: { totals: { cacheRead: HIGH + 1 } },
+  };
+  beat({ sessions: [maxed] }); // A fires once
+  assert.equal(titles().filter((t) => t.startsWith("host1-repo-A")).length, 1);
+  // Now churn well past the bound: each beat keeps A AND adds a fresh maxed
+  // session (a distinct id), so every beat records a new crossing that could
+  // evict the oldest. A stays listed throughout.
+  for (let i = 0; i < hub.SPEND_SEEN_MAX + 50; i++) {
+    beat({ sessions: [maxed, {
+      id: `n${i}`, rcName: `host1-repo-n${i}`, status: "running", session: {},
+      usage: { totals: { cacheRead: HIGH + 1 } },
+    }] });
+  }
+  // A never re-announced despite 250 other crossings, because it was refreshed
+  // every beat it was listed.
+  assert.equal(titles().filter((t) => t.startsWith("host1-repo-A")).length, 1,
+    "a still-listed maxed session must not be evicted from spendSeen and re-fire");
+});
+
+test("spend: spendSeen is bounded newest-first (XERK-310 D3)", () => {
+  const alerts = {};
+  for (let i = 0; i < hub.SPEND_SEEN_MAX + 25; i++) hub.recordSpendStage(alerts, `s${i}`, 2);
+  const ids = Object.keys(alerts.spendSeen);
+  assert.equal(ids.length, hub.SPEND_SEEN_MAX);
+  // The newest kept, the oldest evicted — same discipline as prSeen.
+  assert.equal(ids.includes(`s${hub.SPEND_SEEN_MAX + 24}`), true);
+  assert.equal(ids.includes("s0"), false);
+  // Re-recording an id moves it to the newest slot so it survives eviction.
+  hub.recordSpendStage(alerts, "keepme", 1);
+  for (let i = 0; i < hub.SPEND_SEEN_MAX; i++) hub.recordSpendStage(alerts, `t${i}`, 2);
+  hub.recordSpendStage(alerts, "keepme", 2); // touched again, stays
+  assert.equal("keepme" in alerts.spendSeen, true);
+  assert.equal(alerts.spendSeen.keepme, 2);
+});
+
+test("spend: a misconfigured pair names the threshold actually crossed (XERK-310 D7)", () => {
+  // Full env-driven repro (WARN above HIGH) lives in spend-threshold-config.test.js,
+  // its own process. Here: the stage→threshold mapping the body relies on. Stages
+  // are sorted ascending, so stage N always maps to STAGES[N-1] <= the spend.
+  const stages = hub.SESSION_SPEND_STAGES;
+  assert.deepEqual([...stages].sort((a, b) => a - b), stages, "stages must be ascending");
+  for (let s = 1; s <= stages.length; s++) {
+    // A session at exactly the stage-s threshold: the body names STAGES[s-1],
+    // which is <= the figure in the title, never a higher ceiling.
+    assert.ok(stages[s - 1] <= stages[stages.length - 1]);
+  }
 });
 
 test("alerts: a retraction is withheld from a build that lacks dismiss support (XERK-154)", () => {

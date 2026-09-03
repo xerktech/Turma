@@ -196,6 +196,78 @@ test("it says so, and keeps the file rather than deleting it", () => {
   assert.equal(fs.existsSync(process.env.STATE_FILE), false, "and moved out of the way");
 });
 
+test("a flagged spend stage survives save + restart + restore (XERK-310 D5)", () => {
+  // The runaway-spend alert (XERK-310) remembers, per host, the stage each
+  // session has already been alerted at (`alerts.spendSeen`), so a hub restart
+  // does not re-announce every expensive session it already flagged. server.js's
+  // heartbeatAlerts tests run in-process and never SAVE, so a mutation that keeps
+  // the record only in memory (the escaped one: making the stored stage
+  // non-enumerable so JSON.stringify drops it) passes them while a real restart
+  // re-announces. This boots a hub for BOTH halves — save then restore.
+  //
+  // SAVE half: an isolated child crosses a stage over a real beat, then writes
+  // state.json through serializeAgentsForSave (the SAME replacer the live save
+  // uses). RESTORE half: a second child boots over that file and drives the same
+  // spend — a re-announce means the stage did not survive the round trip.
+  const savePath = tmp("state-spend-save");
+  const saveProbe = `
+    const fs = require("fs");
+    const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
+    const HIGH = hub.SESSION_SPEND_HIGH_TOKENS;
+    // A host record with a running session that has crossed the top stage.
+    const rec = { device: "spendbox", lastSeen: Date.now(), alerts: {} };
+    hub.agents.spendbox = rec;
+    const next = { ...rec, lastSeen: Date.now(), alerts: rec.alerts, sessions: [{
+      id: "s1", rcName: "spendbox-repo-s1", status: "running", session: {},
+      usage: { totals: { cacheRead: HIGH + 1 } },
+    }] };
+    hub.heartbeatAlerts("spendbox", rec, next);
+    fs.writeFileSync(${JSON.stringify(savePath)}, hub.serializeAgentsForSave());
+    // Prove the SAVE actually persisted the stage — the non-enumerable mutation
+    // fails right here, before any restore.
+    const onDisk = JSON.parse(fs.readFileSync(${JSON.stringify(savePath)}, "utf8"));
+    process.stdout.write("<<" + JSON.stringify({
+      savedStage: onDisk.spendbox && onDisk.spendbox.alerts && onDisk.spendbox.alerts.spendSeen,
+    }) + ">>");
+  `;
+  const saveRun = require("child_process").spawnSync(process.execPath, ["-e", saveProbe], {
+    env: { ...process.env, STATE_FILE: tmp("state-spend-ignored") }, encoding: "utf8",
+  });
+  assert.equal(saveRun.status, 0, saveRun.stderr);
+  const saved = JSON.parse(saveRun.stdout.match(/<<([\s\S]*)>>/)[1]);
+  assert.deepEqual(saved.savedStage, { s1: 2 },
+    "the crossed stage must be written to state.json, not held only in memory");
+
+  // RESTORE half: boot over the saved file, register a device so notify() fans
+  // out, drive the same spend, and count alerts. Zero = the stage was restored.
+  const restoreProbe = `
+    const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
+    const push = require(${JSON.stringify(path.join(__dirname, "..", "push.js"))});
+    let fired = 0;
+    push.sendFcm = (t, { title } = {}) => { if (title != null) fired++; return Promise.resolve({ sent: 0, dead: [] }); };
+    hub.registerDevice("d", "android", ["dismiss"]);
+    const HIGH = hub.SESSION_SPEND_HIGH_TOKENS;
+    const rec = hub.agents.spendbox;
+    const next = { ...rec, lastSeen: Date.now(), alerts: rec.alerts, sessions: [{
+      id: "s1", rcName: "spendbox-repo-s1", status: "running", session: {},
+      usage: { totals: { cacheRead: HIGH + 1 } },
+    }] };
+    hub.heartbeatAlerts("spendbox", rec, next);
+    process.stdout.write("<<" + JSON.stringify({
+      restored: !!(rec && rec.alerts && rec.alerts.spendSeen), fired,
+    }) + ">>");
+  `;
+  const restoreRun = require("child_process").spawnSync(process.execPath, ["-e", restoreProbe], {
+    env: { ...process.env, STATE_FILE: savePath }, encoding: "utf8",
+  });
+  assert.equal(restoreRun.status, 0, restoreRun.stderr);
+  assert.ok(restoreRun.stdout.includes("loaded 1 agents"), restoreRun.stdout);
+  const out = JSON.parse(restoreRun.stdout.match(/<<([\s\S]*)>>/)[1]);
+  assert.equal(out.restored, true, "the spendSeen map must survive the restore");
+  assert.equal(out.fired, 0,
+    "a restarted hub must NOT re-announce a session it already flagged before the restart");
+});
+
 test("every field the restore coerces is reachable from the restore's own line", () => {
   // The restore loop lives near the top of server.js and reaches each
   // normalize* only because FUNCTION DECLARATIONS hoist. Anything one of them

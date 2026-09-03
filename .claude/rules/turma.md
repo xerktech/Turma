@@ -246,13 +246,15 @@ the total is measured.
 - A session's cost is invisible until somebody opens `/usage` and adds it up, so a run that takes
   the fleet's whole day is only ever found afterwards. The heartbeat already carries per-session
   usage, so `heartbeatAlerts` checks it for free.
-- **Two ABSOLUTE stages** (`SESSION_SPEND_WARN_TOKENS` 100M, `SESSION_SPEND_HIGH_TOKENS` 200M, both
-  `positiveEnv`), each fired once on the crossing. Deliberately not a multiple of a rolling median:
-  a threshold that drifts up with spend stops firing exactly as spend gets worse.
-- **The pair is validated and SORTED at load** (`sessionSpendThresholds`): if an operator sets
-  WARN above HIGH, the stages are re-ordered ascending so the stage-1 body can never name a ceiling
-  above the number in the title. A stage set to `0`/absent is dropped, so a single stage can be
-  disabled by unsetting it — `positiveEnv` still refuses a literal `0`, so unsetting is the lever.
+- **Two ABSOLUTE stages** (`SESSION_SPEND_WARN_TOKENS` 100M, `SESSION_SPEND_HIGH_TOKENS` 200M, read
+  by `spendThresholdEnv`), each fired once on the crossing. Deliberately not a multiple of a rolling
+  median: a threshold that drifts up with spend stops firing exactly as spend gets worse.
+- **The pair is validated and SORTED at load** into `SESSION_SPEND_STAGES`: if an operator sets WARN
+  above HIGH, the stages are re-ordered ascending so the stage-1 body can never name a ceiling above
+  the number in the title (D7), and the alert names `SESSION_SPEND_STAGES[stage-1]`, the threshold
+  actually crossed. A stage set to an explicit **`0` is dropped (disabled)** — `spendThresholdEnv`
+  reads `0` as "off" where `positiveEnv` would refuse it — so a single-stage alert is set by zeroing
+  one; an ABSENT var still takes the default, never disables.
 - **`sessionSpendTokens` sums the same four counters `usage.html` does**, `cacheRead` included —
   that is ~97% of real spend and the whole reason a long session gets expensive. A malformed bucket
   contributes 0 rather than a plausible figure. **The SUM is finite-checked too, not just each
@@ -270,6 +272,11 @@ the total is measured.
   would otherwise re-announce the same still-high spend at stage 2. `spendSeen` is a bounded
   `{id: stage}` map (`SPEND_SEEN_MAX`, newest kept, same idiom as `prSeen`) that survives the sweep
   and is persisted, so the crossing fires exactly once across restarts, empty beats and re-listing.
+  - **A still-LISTED session refreshes its slot every beat** (`recordSpendStage` on the no-crossing
+    branch): a session pinned at its top stage never crosses again, so without the refresh it would
+    age to the oldest slot and be evicted — then re-announce — once `SPEND_SEEN_MAX` OTHER sessions
+    crossed on the host. Eviction is thus kept to ids the host no longer reports. `spendSeen` is
+    per-HOST, so a migration to another host does re-announce there (new host, still expensive).
 - **`spendSeen` and `sa` both persist, but persistence has a 30s debounce** (`scheduleSave`): a hub
   killed within 30s of the flagging beat, before `state.json` is written, re-announces on reboot.
   Same window the command queue already carries; acceptable, since the alert is informational and a

@@ -46,7 +46,11 @@ object Notifications {
         }
     }
 
-    private fun channelFor(tags: String): String = when {
+    // `internal` (not private) so a plain JVM unit test can pin the routing —
+    // it is pure string logic touching no Android API (XERK-310 D6). A reorder
+    // (e.g. money_with_wings falling below the moneybag/host row) would ship
+    // green otherwise.
+    internal fun channelFor(tags: String): String = when {
         tags.contains("question") -> CH_QUESTION
         // "mag" is the ready-for-review alert (XERK-224), which replaced the
         // separate turn-finished ("checkered_flag") and PR ("rocket") ones — both
