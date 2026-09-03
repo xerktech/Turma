@@ -372,8 +372,10 @@ test("a MIGRATED session keeps writing raw as its new host", () => {
   // what re-points the row (`ingestChunk` sets `host`), and the beat pushes the
   // rendered layer BEFORE the raw one — so by the time the target's raw push
   // lands, the row is already its own. Held here so the ordering cannot drift.
+  // A migration is a shared NON-EMPTY decided org on both sides (XERK-349/573), so
+  // the re-point is gated on that org, never the org-less "" a no-Jira fleet reads.
   archive.ingestChunk("srchost", "moved", { ...RAW_META, summary: "Moved" }, 0, 10,
-    [ent("u1", "user", "before the move")]);
+    [ent("u1", "user", "before the move")], "orgM.atlassian.net");
   const a = Buffer.from("first half\n");
   assert.equal(archive.ingestRaw("srchost", "moved", "moved.jsonl", 0, a).stored, a.length);
   // The move: the target carries the same transcript id and a byte-identical
@@ -381,7 +383,7 @@ test("a MIGRATED session keeps writing raw as its new host", () => {
   assert.equal(archive.ingestRaw("tgthost", "moved", "moved.jsonl", a.length,
     Buffer.from("x")).skip, true, "the target must not write before it owns the row");
   archive.ingestChunk("tgthost", "moved", { ...RAW_META, summary: "Moved" }, 10, 20,
-    [ent("u2", "user", "after the move")]);
+    [ent("u2", "user", "after the move")], "orgM.atlassian.net");
   const b = Buffer.from("second half\n");
   assert.equal(archive.ingestRaw("tgthost", "moved", "moved.jsonl", a.length, b).stored,
     a.length + b.length);
@@ -471,7 +473,8 @@ test("XERK-344: restampOrg lets a cross-org restore continuation archive (XERK-4
   // A restore resumes an archived org-A session on an org-B host — deliberately
   // allowed (the archive is not org-scoped). The resumed session keeps the same
   // transcript id, so its later archival is a cross-org re-point the gate would
-  // refuse; restampOrg is what keeps the restored session's new turns reachable.
+  // refuse; restampOrg re-points the row (host + org) to the target so its new
+  // turns land as a same-host append.
   const tid = "xerk344-restore-aaaa";
   archive.ingestChunk("srchost", tid, { ...RAW_META, summary: "Restore" }, 0, 20,
     [ent("r1", "user", "before restore")], "orgA.atlassian.net");
@@ -479,8 +482,9 @@ test("XERK-344: restampOrg lets a cross-org restore continuation archive (XERK-4
   const blocked = archive.ingestChunk("tgthost", tid, { ...RAW_META, summary: "Restore" }, 20, 40,
     [ent("x", "user", "blocked")], "orgB.atlassian.net");
   assert.deepEqual(blocked, { bytesStored: 20 }, "cross-org continuation refused before restamp");
-  // The restore stamps the target's org; then it archives cleanly.
-  assert.equal(archive.restampOrg(tid, "orgB.atlassian.net"), true);
+  // The restore re-points to the target (host + decided org); then it archives
+  // cleanly as a same-host append.
+  assert.equal(archive.restampOrg(tid, "orgB.atlassian.net", "tgthost"), true);
   const cont = archive.ingestChunk("tgthost", tid, { ...RAW_META, summary: "Restore" }, 20, 40,
     [ent("r2", "user", "after restore")], "orgB.atlassian.net");
   assert.equal(cont.bytesStored, 40);
@@ -489,11 +493,79 @@ test("XERK-344: restampOrg lets a cross-org restore continuation archive (XERK-4
   assert.equal(t.entries.length, 2);
   // The stamp survives a rebuild (sidecar updated), so a THIRD org stays refused.
   archive.rebuildIndex();
+  assert.equal(archive.getTranscript(tid).host, "tgthost", "the re-pointed host survives a rebuild");
   const evil = archive.ingestChunk("evil", tid, { ...RAW_META, summary: "Restore" }, 40, 60,
     [ent("e", "user", "nope")], "orgC.atlassian.net");
   assert.deepEqual(evil, { bytesStored: 40 });
   // An unknown transcript is a no-op.
-  assert.equal(archive.restampOrg("never-seen-restore", "orgX"), false);
+  assert.equal(archive.restampOrg("never-seen-restore", "orgX", "someHost"), false);
+});
+
+test("XERK-573: two ORG-LESS hosts do NOT pool — a re-point needs a shared non-empty org", () => {
+  // The residual XERK-349 closed on the migrate route but deferred here: with the
+  // gate keyed on the CLAIMED org, two hosts that both read "" (a genuinely
+  // org-less pair, or a bound host momentarily omitting its `jira` block) matched
+  // each other, so one could APPEND to and re-attribute the other's durable
+  // transcript. The DECIDED-org gate requires a shared NON-EMPTY org, so an
+  // org-less re-point is refused — exactly as `sameDecidedOrg` refuses an org-less
+  // migration.
+  const tid = "xerk573-orgless";
+  archive.ingestChunk("ownerless", tid, { ...RAW_META, summary: "Orgless" }, 0, 20,
+    [ent("o1", "user", "owner-secret")], "");           // decided org ""
+  const evil = archive.ingestChunk("evilless", tid, { ...RAW_META, summary: "Orgless" }, 20, 40,
+    [ent("e1", "user", "evil-injected")], "");           // also decided org ""
+  assert.deepEqual(evil, { bytesStored: 20 }, "an org-less re-point is refused, no progress");
+  const after = archive.getTranscript(tid);
+  assert.equal(after.host, "ownerless", "the row must not be re-attributed to the org-less attacker");
+  assert.equal(after.entries.length, 1);
+  assert.ok(!after.entries.some((e) => (e.text || "").includes("evil-injected")));
+  // The owner itself keeps appending (a same-host push never re-points, never gated).
+  assert.equal(
+    archive.ingestChunk("ownerless", tid, { ...RAW_META, summary: "Orgless" }, 20, 40,
+      [ent("o2", "user", "more")], "").bytesStored, 40);
+});
+
+test("XERK-573: an ORG-LESS restore still continues (restampOrg re-points the host)", () => {
+  // The flip side of the strict gate: an org-less fleet has no shared non-empty
+  // org for the gate to match on, so an org-less restore could never continue on
+  // the org compare alone — its restored turns would be stranded, the loss this
+  // ticket exists to avoid. restampOrg re-points the HOST too, so the target's
+  // push is a same-host append the gate never touches.
+  const tid = "xerk573-orgless-restore";
+  archive.ingestChunk("srcless", tid, { ...RAW_META, summary: "OrglessRestore" }, 0, 20,
+    [ent("r1", "user", "before restore")], "");
+  // Before the restamp, a cross-host org-less push is refused (the strict gate).
+  const blocked = archive.ingestChunk("tgtless", tid, { ...RAW_META, summary: "OrglessRestore" }, 20, 40,
+    [ent("x", "user", "blocked")], "");
+  assert.deepEqual(blocked, { bytesStored: 20 });
+  // The restore re-points host + (empty) org to the target; the continuation lands.
+  assert.equal(archive.restampOrg(tid, "", "tgtless"), true);
+  const cont = archive.ingestChunk("tgtless", tid, { ...RAW_META, summary: "OrglessRestore" }, 20, 40,
+    [ent("r2", "user", "after restore")], "");
+  assert.equal(cont.bytesStored, 40);
+  const t = archive.getTranscript(tid);
+  assert.equal(t.host, "tgtless");
+  assert.equal(t.entries.length, 2);
+});
+
+test("XERK-573: accepted LOW residual — an org-less manifest squat blocks the owner's first push", () => {
+  // Documented, not closed (QA): on a no-Jira fleet a rogue org-less host that knows
+  // a victim's uuid4 id can list it in its manifest, creating the 0-byte placeholder
+  // as its own — after which the org-less owner's first push is a cross-host re-point
+  // with no shared non-empty org, so it is refused. Availability-only: the placeholder
+  // is EMPTY (manifestCursors only INSERTs), so nothing of the victim is read or
+  // injected. It makes the org-less case behave like every other org, where a
+  // cross-org squat was already denied. Pinned so the behaviour can't drift silently.
+  const tid = "xerk573-orgless-squat";
+  archive.manifestCursors("roguel", [{ transcriptId: tid, ...RAW_META }], ""); // org-less squat
+  const owner = archive.ingestChunk("ownerl", tid, { ...RAW_META, summary: "Squat" }, 0, 20,
+    [ent("o", "user", "mine")], "");
+  assert.deepEqual(owner, { bytesStored: 0 }, "the org-less owner is refused over the squatted placeholder");
+  assert.equal(archive.getTranscript(tid), null, "nothing stored — an empty squat, no content leaked");
+  // Clean up the fileless placeholder this test deliberately leaves, so a later
+  // rebuild-count invariant isn't skewed by it (a real rebuild drops it too, since
+  // it has no on-disk file).
+  archive.openDb().prepare("DELETE FROM sessions WHERE transcriptId=?").run(tid);
 });
 
 test("the per-transcript raw ceiling stops that session, not the archive", () => {

@@ -3176,10 +3176,15 @@ function startArchiveRestore(row, files, targetHost) {
   // restore is deliberately not org-scoped — the dead source has no org to
   // compare against). The resumed session keeps the same transcript id, so its
   // later archival is a cross-host re-point that XERK-344's ownership gate would
-  // refuse unless the row's org already matches the new home. Re-stamp it to the
-  // target's org now, so the target's first archive push re-points cleanly rather
-  // than silently dropping the restored session's new turns from the archive.
-  archive.restampOrg(row.transcriptId, siteKeyOf(tgt));
+  // refuse. Re-point the row to the target — its DECIDED org (XERK-573, the basis
+  // the gate now compares) AND its HOST — so the target's first archive push is a
+  // same-host append rather than a gated re-point. Re-pointing the host is what
+  // keeps an ORG-LESS restore working: the gate now requires a shared NON-EMPTY
+  // org for a cross-host re-point (`sameDecidedOrg`), so an org-less target could
+  // never continue on the org compare alone, and its restored turns would be
+  // stranded (the loss XERK-573 exists to avoid). This mutates the row before the
+  // pack/import completes, the same shape the org-only restamp already had.
+  archive.restampOrg(row.transcriptId, decidedOrgOf(tgt), targetHost);
 
   const spool = migrationSpoolPath(id);
   tar.packGzipTar(files, spool, MIGRATE_BLOB_MAX, { mtimeSec: Date.now() / 1000 })
@@ -11116,10 +11121,18 @@ const server = http.createServer(async (req, res) => {
       let archiveHave, archiveShed, archiveFull, archiveRawHave, archiveRawSkip;
       if (Array.isArray(archiveManifest) && archiveManifest.length) {
         try {
-          // This beat's CLAIMED org is stamped on every placeholder row the
-          // manifest creates, so the ingestChunk gate (XERK-344) protects a
-          // not-yet-filled transcript from a cross-org first chunk.
-          archiveHave = archive.manifestCursors(key, archiveManifest, siteKeyOf(payload));
+          // This beat's DECIDED org is stamped on every placeholder row the
+          // manifest creates, so the ingestChunk gate (XERK-344/573) protects a
+          // not-yet-filled transcript from a cross-org first chunk on the SAME
+          // basis the re-point gate compares. NOT the CLAIMED `siteKeyOf`, which
+          // pooled two org-less hosts (XERK-573). `orgBound` is assigned to
+          // `next` below (after the spread), so this reconstructs the same value
+          // the record will carry from `prev` + this beat's declaration.
+          const beatDecidedOrg = decidedOrgOf({
+            orgBound: prev.orgBound || siteKeyOf(payload),
+            jira: payload.jira,
+          });
+          archiveHave = archive.manifestCursors(key, archiveManifest, beatDecidedOrg);
           // The budget state that goes back with the cursors (XERK-267): which
           // transcripts have spent their per-transcript budget, so the agent
           // strips the inline file payloads before shipping them, and whether
@@ -11486,10 +11499,15 @@ const server = http.createServer(async (req, res) => {
           key, transcriptId, body.meta || {},
           Number(body.startOffset) || 0, Number(body.endOffset) || 0,
           Array.isArray(body.entries) ? body.entries : [],
-          // The pushing host's CLAIMED org, hub-derived — never the agent-supplied
-          // `body.meta`. Gates a cross-host row re-point (XERK-344), compared the
-          // same way POST .../migrate compares two hosts' orgs.
-          siteKeyOf(agents[key])
+          // The pushing host's DECIDED org, hub-derived — never the agent-supplied
+          // `body.meta`, and never the CLAIMED `siteKeyOf`. Gates a cross-host row
+          // re-point (XERK-344), compared exactly the way POST .../migrate compares
+          // two hosts' orgs — `decidedOrgOf`/`sameDecidedOrg` (XERK-349/573). The
+          // claimed compare pooled two org-less hosts (a genuinely no-org pair, or
+          // a bound host momentarily omitting its `jira` block); the decided compare
+          // reads a bound-but-quiet host as its bound org and refuses a re-point that
+          // is not a shared NON-EMPTY org on both sides.
+          decidedOrgOf(agents[key])
         );
         // It landed, so whatever this host last failed with here is history.
         archiveRefusals.delete(refusalKey(key, transcriptId));

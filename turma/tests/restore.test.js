@@ -663,13 +663,17 @@ test("restore: the transcript-dir check does not swallow a legitimate path", () 
     assert.equal(/(^|\/)\.claude\/projects(\/|$)/.test(wt), true, wt);
 });
 
-test("restore: re-stamps the archived row's org to the target so it can archive back (XERK-344)", async () => {
+test("restore: re-points the archived row to the target so it can archive back (XERK-344/573)", async () => {
   // A restore resumes an archived session on a host that may be in ANOTHER org
   // (restore is deliberately not org-scoped). The resumed session keeps the same
   // transcript id, so without this its later archival would be the cross-org
   // re-point XERK-344 refuses — silently dropping its new turns from the archive.
+  // XERK-573 moved the gate to the DECIDED org and made an org-less re-point need a
+  // shared non-empty org, so the restore now re-points the HOST too (not just the
+  // org): the target's push is a same-host append the gate never touches, which is
+  // the only way an org-less restore continues.
   const tid = "bbbbbbbb-1111-2222-3333-444444444444";
-  seedArchive(tid);
+  seedArchive(tid);                                    // owner host "truenas"
   await request("POST", "/api/heartbeat", {
     headers: agentHeaders,
     body: {
@@ -681,7 +685,9 @@ test("restore: re-stamps the archived row's org to the target so it can archive 
     { headers: userHeaders, body: { host: "k8x" } });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   const row = archive.openDb()
-    .prepare("SELECT siteKey FROM sessions WHERE transcriptId=?").get(tid);
+    .prepare("SELECT siteKey, host FROM sessions WHERE transcriptId=?").get(tid);
   assert.equal(row.siteKey, "restore-target.atlassian.net",
     "the resumed session's later archival is now same-org, so its new turns still archive");
+  assert.equal(row.host, "k8x",
+    "the row is re-pointed to the target host, so its first push is a same-host append");
 });

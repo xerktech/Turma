@@ -72,30 +72,50 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
   - **Only the session's OWN host may write its raw files** — the credential (XERK-268) proves WHO is
     calling, not whose session they may write into. The raw layer requires `row.host === host`
     EXACTLY, which works because `ingestChunk` re-points the row on a migration FIRST (below).
-  - **A host RE-POINT in `ingestChunk` is gated on the owner's ORG** (XERK-344) — else any host with
-    its own token could append arbitrary entries to another host's archived transcript AND
-    re-attribute the row to itself (`host=excluded.host`), served back through `GET /api/archive` as
-    that host's history. A same-host append never re-points, so it is never gated. A host CHANGE is a
-    migration (XERK-101, same-org), so it is allowed exactly when the pushing host shares the current
-    owner's `siteKey` — the CLAIMED org, kept internally consistent (stored on the row, re-stamped on
-    a restore, all `siteKeyOf`). **This is NO LONGER the rule `POST .../migrate` uses**: XERK-349 moved
-    that route to the hub-DECIDED org (`sameDecidedOrg`), which the archive does not mirror — so the
-    org-less residual (two hosts reading "" match) lives on HERE alone, tracked as its own ticket
-    (closing it is a coordinated store/restamp/rebuild change). The owner's org is STORED on the row
-    (schema v5, hub-supplied via `siteKeyOf` — never agent-`meta`), so the check survives the owner
-    going offline.
+  - **A host RE-POINT in `ingestChunk` is gated on the owner's DECIDED ORG** (XERK-344, moved to the
+    decided org by XERK-573) — else any host with its own token could append arbitrary entries to
+    another host's archived transcript AND re-attribute the row to itself (`host=excluded.host`),
+    served back through `GET /api/archive` as that host's history. A same-host append never re-points,
+    so it is never gated. A host CHANGE is a migration (XERK-101, same-org), allowed exactly when the
+    pushing host and the current owner share a **NON-EMPTY decided org** — the SAME rule
+    `POST .../migrate` uses (`sameDecidedOrg`, XERK-349). The route passes `decidedOrgOf(agents[key])`
+    (and `manifestCursors` the beat's decided org); the archive stores/compares/re-stamps/rebuilds all
+    on that basis, kept internally consistent end to end.
+    - **XERK-573 closed the org-less residual the CLAIMED-org compare left**: two hosts that both read
+      "" — a genuinely org-less pair, OR a bound host momentarily omitting its `jira` block so
+      `siteKeyOf` coerced to "" — used to satisfy the gate for each other. Keyed on the decided org, a
+      bound-but-quiet host reads its bound org (not ""), and a genuinely org-less re-point is refused
+      (no shared non-empty org), exactly as an org-less migration is. **Cost, deliberate and mirroring
+      the migrate route: a no-Jira fleet's cross-host archive re-points are all refused** — which is
+      why the RESTORE path re-points the HOST (below), the one legitimate org-less cross-host case.
+    - The owner's decided org is STORED on the row (schema v5, hub-supplied — never agent-`meta`), so
+      the check survives the owner going offline. **Do not re-key this on the CLAIMED `siteKeyOf`** —
+      that reopens the org-less hole (the same objection XERK-349 makes to the migrate route).
+    - **Accepted LOW residual on an ORG-LESS fleet** (QA): a rogue org-less host that knows a victim's
+      uuid4 `transcriptId` can list it in its heartbeat manifest, creating the 0-byte placeholder row
+      as its own — after which the real org-less owner's first push is refused as a cross-host
+      re-point (both read "", so no shared non-empty org). Availability-only: `manifestCursors` only
+      INSERTs, so the rogue injects NOTHING and reads nothing; it just squats the id, and the owner
+      re-pushes from 0 while the read-back 404s "still syncing". It needs the unguessable id (never
+      exposed cross-host) and only bites a no-Jira fleet — and it makes the org-less case behave like
+      every other org, where a cross-org squat was already denied. No signal distinguishes owner
+      reclaim from rogue squat (both org-less), so there is no cheap fix; documented, not closed.
     - **`manifestCursors` stamps the org on the placeholder row it creates**, or a cross-org first
       chunk would hijack a not-yet-filled transcript via the legacy escape below.
     - **A row whose `siteKey` is NULL (rebuilt from a pre-XERK-344 sidecar, which has no field) admits
       the first writer once and stamps it** — trust-on-first-sight, since it cannot be proven
       cross-org. `rebuildIndex` uses `meta.siteKey ?? null` so a recorded `""` (a real no-org owner,
       still gated) is kept distinct from a legacy NULL.
-    - **A cross-org RESTORE (XERK-441) re-stamps the row's org to the target** (`restampOrg`, called
-      by `startArchiveRestore`) — a restore is deliberately not org-scoped, and the resumed session
-      keeps the same transcript id, so without the re-stamp its later archival is exactly the
-      cross-org re-point this gate refuses, silently dropping the restored session's new turns. The
-      re-stamp keeps the HOST as-is (the target's first push re-points it, org already matching) and
-      updates the sidecar so a rebuild preserves it.
+    - **A cross-org RESTORE (XERK-441) re-points the row to the target** (`restampOrg(tid, decidedOrg,
+      host)`, called by `startArchiveRestore`) — a restore is deliberately not org-scoped, and the
+      resumed session keeps the same transcript id, so without the re-point its later archival is
+      exactly the cross-host re-point this gate refuses, silently dropping the restored session's new
+      turns. **It re-points the HOST as well as the decided org** (XERK-573): the strict gate needs a
+      shared non-empty org for a cross-host re-point, which an ORG-LESS target has not — so re-pointing
+      the host makes the target's first push a same-host append the gate never touches, the only way an
+      org-less restore continues. The sidecar is updated (host + org) so a rebuild preserves both. This
+      also removes the old rendered-before-raw ordering dependency: the row is already the target's, so
+      its raw push (`row.host === host`) passes whatever the push order.
     - Refused like an offset mismatch: store nothing, return the real cursor — never an error status
       (XERK-255). Tests: the `XERK-344:` cases in `archive.test.js` + `restore.test.js`.
   - **The agent never OFFERS a file the hub cannot name** (`_archivable_rel` mirrors `safeRawRel`) —
@@ -264,8 +284,9 @@ reason the raw layer exists in a form nothing else reads (the rendered entries a
 - **Not org-scoped, unlike a move** — `/migrate` compares two agents' orgs; an archived session has
   no agent left to compare against, and the archive is hub-wide and already gated by login. Don't
   invent an org for the archive row.
-  - **But it DOES re-stamp the row's org to the target** (`restampOrg`) so the resumed session can
-    archive back across orgs — see the XERK-344 ownership gate above. This is a stamp for a later
-    write, not an admission gate: restore itself stays org-agnostic.
+  - **But it DOES re-point the row (host + decided org) to the target** (`restampOrg`) so the resumed
+    session can archive back across orgs — see the XERK-344/573 ownership gate above. This is a
+    re-point for a later write, not an admission gate: restore itself stays org-agnostic, and
+    re-pointing the host is what keeps an org-less restore's turns reachable under the strict gate.
 - Tests: `restore.test.js` (route + refusals + bundle bytes), `tar.test.js` (format, read back with
   python's `tarfile`), the Restore cases in `sessions.test.js`.
