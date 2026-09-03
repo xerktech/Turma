@@ -88,16 +88,32 @@ Cross-component contract in `CLAUDE.md` ("The peer roster IS the org boundary");
 - **Drift is declaring a DIFFERENT org, never failing to declare one** — a host whose tracker goes
   quiet keeps its binding and its peers (treating silence as drift previously locked a host out of its
   own roster AND migration).
-- **The migrate route is UNCHANGED by the binding: it compares the claimed org.** Do not bind-gate it
-  — two attempts were reverted (comparing `orgBound` broke the UI both directions, since it's stripped
-  from the served payload and no client can mirror it; refusing a drifted host bought almost nothing,
-  one beat deep). **Neither closes the real hole**: two hosts that both declare NO org match each
-  other regardless of binding — that, and the fix, are **XERK-349**. Pin any fix with a REQUEST
-  against the route, not a copied predicate (that passed with the route reverted, twice) — and assert
-  the exact status (a 503 from the shared in-flight cap is not the same as a 409).
+- **The DECIDED org is SERVED as `org`, and the migrate route keys on it** (XERK-349, closed).
+  `decidedOrgOf` = the bound org, "" for a drifted or never-bound host; `serializeAgent` stamps it
+  after the spread (like `key`/`autoPaused`), `normalizeOrg` strips a forged one on ingest AND restore
+  (Android TYPES `org: String?`, so typing it and coercing it are one change — the heartbeat contract).
+  Served UNCONDITIONALLY, "" included, so a present "" is "no org" and only an ABSENT field (older hub)
+  falls a client back to `jira.siteKey`.
+- **A migration needs a shared NON-EMPTY decided org on both sides (`sameDecidedOrg`).** CLOSES the
+  org-less hole: two hosts that both declare no org no longer pool (a bound-to-acme host declaring
+  nothing reads "acme", not the "" a bound-to-rival one does). FIXES the over-refusal: two same-org
+  hosts, one momentarily quiet, are now allowed (the claimed-org compare wrongly 409'd). Does NOT make
+  drift quarantine permanent: an ACTIVELY-drifting host is refused (decided ""), but that heals in ONE
+  beat — the same as the reverted drift-refusal, not better — because silence is not drift (XERK-348)
+  and the binding never moves, so a drifted-then-quiet host is `boundOrgOf` again and a legal target.
+  Permanent quarantine would need drift history the record lacks and would undo the over-refusal fix;
+  don't claim it holds past one beat. **Cost: a no-Jira fleet cannot migrate.** **Never re-key on
+  `jira.siteKey`.**
+- **Pin the route with a REQUEST, then run the CLIENT predicate over the SERVED payload** (the reverted
+  attempts diverged precisely because a client could not see the rule): `menuTargets` in
+  `server.test.js`. Assert the EXACT status — a 503 from the shared in-flight cap is not a 409 — and a
+  fixture whose rogue host has a **second live member in its bound org**, or the guard is dead code.
 - **THREE client mirrors of "an agent's org" exist**, not one: `org.js`'s `siteKeyOf`,
-  `sessions.html`'s `siteKeyOfAgent` (what the Move menu uses), and Android's. Only the first mirrors
-  the hub's coercion; `normalizeJira` server-side is what makes that safe.
+  `sessions.html`'s `siteKeyOfAgent`, and Android's `siteKeyOf`. These are the ORG-FILTER/tint reads —
+  still the claimed `jira.siteKey`, and only `org.js`'s mirrors the hub's coercion (`normalizeJira`
+  makes that safe). **MOVE eligibility is separate**: `sessions.html`'s `orgOfAgent` + `eligibleMoveTargets`
+  and android's `orgOf` + `eligibleMoveTargets` read the served `org` (XERK-349). Glasses has no Move
+  UI, so no move mirror there.
 - **`boundOrgOf`/`siteKeyOf` coerce to string** — `orgBound` is persisted, so an uncoerced value
   400'd every heartbeat from that host on restore, forever.
 - **`orgPeers` bounds what it BUILDS, not what it returns** — building every row before slicing to

@@ -142,6 +142,26 @@ class AgentDecodeTest {
         assertEquals(false, resp.agents[1].autoPaused)
     }
 
+    // XERK-349: the hub-decided `org`, served for move eligibility. Typing it is
+    // what makes a wrong value decode-fatal for the whole fleet, so the
+    // present-""/present-value/absent shape is pinned. A present "" is "the hub
+    // says no org" (a drifted or never-bound host) and must survive as "", not
+    // null; only an ABSENT field (an older hub) decodes to null, the one case
+    // `orgOf` falls back to `jira.siteKey`.
+    @Test fun `the decided org decodes, empty distinct from absent`() {
+        val body = """
+            { "now": 1, "agents": [
+              { "key": "bound", "device": "bound", "online": true, "org": "acme" },
+              { "key": "noOrg", "device": "noOrg", "online": true, "org": "" },
+              { "key": "old", "device": "old", "online": true }
+            ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertEquals("acme", resp.agents[0].org)
+        assertEquals("", resp.agents[1].org)
+        assertNull(resp.agents[2].org)
+    }
+
     // XERK-298: the hub-stamped heartbeat-refusal marker. Typing it is what makes
     // a wrong value decode-fatal for the whole fleet, so the present/absent shape
     // is pinned. An absent `refused` is null ("not refused"); a present one keeps

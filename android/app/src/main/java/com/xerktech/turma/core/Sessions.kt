@@ -233,9 +233,20 @@ fun findHost(agents: List<AgentInfo>, sessionId: String): String? =
     agents.firstOrNull { a -> a.sessions.any { it.id == sessionId } }?.key
 
 /**
+ * The org the HUB DECIDED a host is in (XERK-349) — the bound org, or "" for a
+ * drifted or never-bound host — which is what the migrate route enforces, not the
+ * claimed [siteKeyOf]. The hub serves it as [AgentInfo.org]; an older hub omits it
+ * (null), so fall back to the claimed key then. A PRESENT "" means "no org" and
+ * must be honoured, so only a null (absent) field triggers the fallback.
+ */
+fun orgOf(agent: AgentInfo): String = agent.org ?: siteKeyOf(agent)
+
+/**
  * The hosts a running session at [srcHost] could move to (XERK-101): online,
- * in the same org, a different host, with the session's repo already cloned —
- * the exact predicate the hub enforces and web `eligibleMoveTargets` renders.
+ * in the same DECIDED org, a different host, with the session's repo already
+ * cloned — the exact predicate the hub enforces (`sameDecidedOrg`) and web
+ * `eligibleMoveTargets` renders. An empty org offers NOTHING: a drifted or
+ * never-bound host is not pooled with any other.
  */
 fun eligibleMoveTargets(
     agents: List<AgentInfo>,
@@ -243,9 +254,10 @@ fun eligibleMoveTargets(
     session: SessionInfo,
 ): List<AgentInfo> {
     val src = agents.firstOrNull { it.key == srcHost } ?: return emptyList()
-    val org = siteKeyOf(src)
+    val org = orgOf(src)
+    if (org.isEmpty()) return emptyList()
     return agents.filter { t ->
-        t.key != srcHost && t.online && siteKeyOf(t) == org &&
+        t.key != srcHost && t.online && orgOf(t) == org &&
             t.repos.any { it.name == session.repo }
     }
 }

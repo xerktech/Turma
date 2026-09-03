@@ -625,6 +625,36 @@ test("Move excludes offline, other-org, and repo-less hosts", () => {
     "offline / other-org / repo-less hosts are excluded");
 });
 
+test("Move keys on the hub-decided `org`, not the claimed siteKey (XERK-349)", () => {
+  // The hub serves an `org` field (its DECISION) that the migrate route enforces.
+  // The menu must key on it, not `jira.siteKey`: two hosts bound to acme but
+  // declaring stale/other siteKeys still match, and a drifted host that CLAIMS
+  // acme but the hub decided "" is hidden — mirroring `sameDecidedOrg`.
+  const { beat, toggleCardMenu, openMove, els } = loadPage();
+  const now = Date.now();
+  const src = {
+    key: "hostA", device: "hostA", online: true, terminalOnline: true, lastSeen: now,
+    jira: { siteKey: "stale.atlassian.net" }, org: "acme",  // bound acme, claiming stale
+    repos: [{ name: "repoX" }], sessions: [working("11111", "Log Task")],
+  };
+  const peer = {
+    key: "hostB", device: "hostB", online: true, terminalOnline: true, lastSeen: now,
+    jira: { siteKey: "other.atlassian.net" }, org: "acme",  // decided acme too
+    repos: [{ name: "repoX" }], sessions: [],
+  };
+  const drifted = {
+    key: "hostD", device: "hostD", online: true, terminalOnline: true, lastSeen: now,
+    jira: { siteKey: "acme" }, org: "",                     // claims acme, decided ""
+    repos: [{ name: "repoX" }], sessions: [],
+  };
+  beat({ now, agents: [src, peer, drifted] });
+  toggleCardMenu(click, "11111");
+  openMove(click, "11111");
+  const menu = els.active.innerHTML;
+  assert.ok(menu.includes("hostB"), "a shared decided org is offered though claimed siteKeys differ");
+  assert.ok(!menu.includes("hostD"), "a host the hub decided has no org is hidden even claiming acme");
+});
+
 // ---- restoring an archived session (XERK-441) --------------------------------
 // The archive outlives the host, so this control's targets are NOT the move's:
 // there is no source agent left to compare an org against.

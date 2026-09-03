@@ -853,9 +853,14 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
   // same transcript id, continues the conversation, and its rendered push is what
   // re-points the row. A migration is same-org, so a re-point is allowed exactly
   // when the pushing host shares the current owner's org — compared as the CLAIMED
-  // org, exactly as POST .../migrate does (turma.md), inheriting its accepted hole
-  // that two org-less hosts match (XERK-349). A same-host append never re-points,
-  // so it is never gated. A row whose owner org predates this column (rebuilt from
+  // org (`pushOrg`), which is what this subsystem stores on the row and re-stamps
+  // on a restore, kept internally consistent end to end. It is NO LONGER the same
+  // rule POST .../migrate uses: XERK-349 moved that route to the hub-DECIDED org
+  // (`sameDecidedOrg`), which the archive does not mirror — so the org-less
+  // residual (two hosts reading "" match) lives on HERE alone, tracked separately
+  // (the same coordinated store/restamp/rebuild change it would take to close it).
+  // A same-host append never re-points, so it is never gated. A row whose owner
+  // org predates this column (rebuilt from
   // a pre-XERK-344 sidecar, siteKey NULL) can't be proven cross-org, so the first
   // writer stamps it — one-time trust-on-first-sight. Refused exactly like an
   // offset mismatch: store nothing, hand back the real cursor — never an error

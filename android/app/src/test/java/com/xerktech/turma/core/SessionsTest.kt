@@ -267,10 +267,14 @@ class SessionsTest {
         key: String,
         online: Boolean = true,
         org: String = "org.a",
+        // The hub-decided org (XERK-349). Null models an older hub that never
+        // served it, so `orgOf` falls back to the claimed `jira.siteKey` (=[org]).
+        decidedOrg: String? = null,
         repos: List<String> = listOf("repoX"),
         sessions: List<SessionInfo> = emptyList(),
     ) = com.xerktech.turma.model.AgentInfo(
         key = key, device = key, online = online,
+        org = decidedOrg,
         jira = com.xerktech.turma.model.JiraBlock(siteKey = org),
         repos = repos.map { com.xerktech.turma.model.RepoInfo(name = it) },
         sessions = sessions,
@@ -292,6 +296,47 @@ class SessionsTest {
     @Test fun `no eligible targets when the org has only the source host`() {
         val sess = SessionInfo(id = "s1", status = "running", repo = "repoX")
         val agents = listOf(agent("src", sessions = listOf(sess)))
+        assertEquals(emptyList<String>(), eligibleMoveTargets(agents, "src", sess).map { it.key })
+    }
+
+    // --- XERK-349: keys on the hub-decided `org`, not the claimed siteKey ------
+
+    @Test fun `the decided org is preferred over the claimed siteKey`() {
+        // Both hosts are BOUND to acme (decided "acme") but declaring a stale/
+        // absent siteKey this beat — the hub still serves org="acme". The move is
+        // eligible on the decision, though the claimed siteKeys differ, matching
+        // the hub's `sameDecidedOrg`. A claimed-siteKey rule would wrongly hide it.
+        val sess = SessionInfo(id = "s1", status = "running", repo = "repoX")
+        val agents = listOf(
+            agent("src", org = "stale.a", decidedOrg = "acme", sessions = listOf(sess)),
+            agent("ok", org = "stale.b", decidedOrg = "acme"),
+        )
+        assertEquals(listOf("ok"), eligibleMoveTargets(agents, "src", sess).map { it.key })
+    }
+
+    @Test fun `a host the hub decided has no org is never a target`() {
+        // A drifted or never-bound host is served org="" (present, empty). It must
+        // NOT be pooled with a host that merely CLAIMS the same siteKey — the hub
+        // refuses that move (`sameDecidedOrg` needs a non-empty shared org), so
+        // the menu must hide it too. Here the drifted host still claims acme.
+        val sess = SessionInfo(id = "s1", status = "running", repo = "repoX")
+        val agents = listOf(
+            agent("src", decidedOrg = "acme", sessions = listOf(sess)),
+            agent("peer", decidedOrg = "acme"),                 // eligible
+            agent("drifted", org = "acme", decidedOrg = ""),    // claims acme, decided ""
+        )
+        assertEquals(listOf("peer"), eligibleMoveTargets(agents, "src", sess).map { it.key })
+    }
+
+    @Test fun `an org-less source offers nothing`() {
+        // The source's own decided org is "" (never bound). Even a peer claiming
+        // the same siteKey is not offered — org-less hosts are alone, mirroring
+        // the peer roster and the hub's non-empty requirement.
+        val sess = SessionInfo(id = "s1", status = "running", repo = "repoX")
+        val agents = listOf(
+            agent("src", decidedOrg = "", sessions = listOf(sess)),
+            agent("peer", decidedOrg = ""),
+        )
         assertEquals(emptyList<String>(), eligibleMoveTargets(agents, "src", sess).map { it.key })
     }
 }

@@ -77,9 +77,13 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     re-attribute the row to itself (`host=excluded.host`), served back through `GET /api/archive` as
     that host's history. A same-host append never re-points, so it is never gated. A host CHANGE is a
     migration (XERK-101, same-org), so it is allowed exactly when the pushing host shares the current
-    owner's `siteKey` — the CLAIMED org, compared as `POST .../migrate` does, inheriting XERK-349's
-    accepted hole that two org-less hosts match. The owner's org is STORED on the row (schema v5,
-    hub-supplied via `siteKeyOf` — never agent-`meta`), so the check survives the owner going offline.
+    owner's `siteKey` — the CLAIMED org, kept internally consistent (stored on the row, re-stamped on
+    a restore, all `siteKeyOf`). **This is NO LONGER the rule `POST .../migrate` uses**: XERK-349 moved
+    that route to the hub-DECIDED org (`sameDecidedOrg`), which the archive does not mirror — so the
+    org-less residual (two hosts reading "" match) lives on HERE alone, tracked as its own ticket
+    (closing it is a coordinated store/restamp/rebuild change). The owner's org is STORED on the row
+    (schema v5, hub-supplied via `siteKeyOf` — never agent-`meta`), so the check survives the owner
+    going offline.
     - **`manifestCursors` stamps the org on the placeholder row it creates**, or a cross-org first
       chunk would hijack a not-yet-filled transcript via the legacy escape below.
     - **A row whose `siteKey` is NULL (rebuilt from a pre-XERK-344 sidecar, which has no field) admits

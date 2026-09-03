@@ -1147,6 +1147,16 @@ let pendingMigrationFollowed = false;
 
 function siteKeyOfAgent(a) { return (a && a.jira && a.jira.siteKey) || ""; }
 
+// The org the HUB DECIDED a host is in (XERK-349), which is what the migrate
+// route enforces — not the claimed `jira.siteKey` the org tint/colour above use.
+// The hub serves it as `org` (bound org, or "" for a drifted or never-bound
+// host); an older hub omits it, so fall back to the claimed key then. A PRESENT
+// "" means "the hub says this host has no org" and must be honoured, so only a
+// null/undefined (absent) field triggers the fallback.
+function orgOfAgent(a) {
+  return a && a.org != null ? a.org : siteKeyOfAgent(a);
+}
+
 // Org tint (XERK-142): a session card is subtly background-coloured by the org its
 // host polls, so which org a session belongs to reads at a glance — the same tint,
 // from the same orgColorMap, the board paints its ticket cards with. Built over the
@@ -1165,13 +1175,17 @@ function orgTintStyle(a) {
   const c = orgColorByKey.get(siteKeyOfAgent(a));
   return c ? ` style="--org:${c}"` : "";
 }
-// The online hosts a running session could move to: same org, a different host,
-// with the session's repo already cloned (the hub requires it — the target
-// resumes off that repo's default branch).
+// The online hosts a running session could move to: same DECIDED org (XERK-349),
+// a different host, with the session's repo already cloned (the hub requires it —
+// the target resumes off that repo's default branch). Keys on the hub-decided
+// `org`, not the claimed `jira.siteKey`, so the menu offers exactly what the
+// migrate route accepts. An empty org offers NOTHING: a drifted or never-bound
+// host (decided "") is not pooled with any other, mirroring `sameDecidedOrg`.
 function eligibleMoveTargets(a, s) {
-  const org = siteKeyOfAgent(a);
+  const org = orgOfAgent(a);
+  if (!org) return [];
   return (cache.agents || []).filter(x =>
-    x.key !== a.key && x.online && siteKeyOfAgent(x) === org &&
+    x.key !== a.key && x.online && orgOfAgent(x) === org &&
     (x.repos || []).some(r => r && r.name === s.repo));
 }
 // Is this session mid-move? (Shown as a "moving…" hint on its card so the

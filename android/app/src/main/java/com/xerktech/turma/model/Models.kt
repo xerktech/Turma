@@ -180,6 +180,16 @@ data class AgentInfo(
     val online: Boolean = false,
     val terminalOnline: Boolean = false,
     /**
+     * The org the hub DECIDED this host is in (XERK-349): the bound org, or ""
+     * for a drifted or never-bound host. HUB-DERIVED (the hub strips any an agent
+     * forges and stamps it fresh), so a present "" means "no org" and must be
+     * honoured. Null on an agent predating the field — the only case
+     * [core.orgOf] falls back to the claimed `jira.siteKey`. Drives
+     * `eligibleMoveTargets` so the Move menu offers exactly what the migrate
+     * route accepts.
+     */
+    val org: String? = null,
+    /**
      * Auto-start paused because this host's Claude subscription has hit a limit —
      * the even weekly pace line (XERK-544) or the 5-hour window at/above 90%
      * (XERK-548). HUB-DERIVED from [limits]/[subscription]/defaultRuntime, not the
