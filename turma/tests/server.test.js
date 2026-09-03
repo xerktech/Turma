@@ -12789,6 +12789,104 @@ test("migrate: drift quarantine is SELF-HEALING — a drifted host that goes qui
   assert.deepEqual(menuTargets(served, "mHealSrc", "Turma"), ["mHeal"]);
 });
 
+// The archive re-point gate (XERK-344) is driven against the REAL route here, not
+// a copied predicate — XERK-348/349 showed a copied predicate passes even with the
+// route reverted. `beatOrg` establishes a host's org binding (decided org); the
+// gate the archive POST route enforces reads that binding via `decidedOrgOf`.
+const beatOrg = (device, site) =>
+  request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: {
+      device,
+      repos: [{ name: "Turma", path: "/git/Turma" }],
+      jira: site
+        ? { available: true, configured: true, siteKey: site, user: `${device}@x.com`, tickets: [] }
+        : { available: false, configured: false, tickets: [] },
+      sessions: [],
+    },
+  });
+const archivePush = (host, tid, start, end, entries) =>
+  request("POST", `/api/agents/${host}/archive/${tid}`, {
+    headers: agentHeaders,
+    body: {
+      startOffset: start, endOffset: end, size: end - start,
+      meta: { repo: "Turma", slug: "-w-x", remoteKey: "github.com/xerk/turma", summary: "Arch" },
+      entries,
+    },
+  });
+const archiveView = (tid) => request("GET", `/api/archive/${tid}`, { headers: userHeaders });
+
+test("archive re-point: two ORG-LESS hosts do NOT pool (XERK-573)", async () => {
+  // The residual XERK-349 closed on the migrate route but deferred here: the gate
+  // keyed on the CLAIMED org, so two hosts that both read "" (a never-bound pair)
+  // matched each other — one could APPEND to and re-attribute the other's durable
+  // transcript, served straight back as its own history. The DECIDED-org gate now
+  // requires a shared NON-EMPTY org, exactly as `sameDecidedOrg` does.
+  await beatOrg("arFreeA", null);
+  await beatOrg("arFreeB", null);
+  const tid = "xerk573-route-orgless";
+  const own = await archivePush("arFreeA", tid, 0, 20,
+    [{ uuid: "o1", role: "user", ts: "t", text: "owner-secret" }]);
+  assert.equal(own.body.bytesStored, 20);
+  // The org-less attacker knows the id and pushes at the real cursor.
+  const evil = await archivePush("arFreeB", tid, 20, 40,
+    [{ uuid: "e1", role: "user", ts: "t", text: "evil-injected" }]);
+  assert.equal(evil.status, 200, "refused like an offset mismatch, never an error status");
+  assert.equal(evil.body.bytesStored, 20, "no progress — the re-point is refused");
+  const view = await archiveView(tid);
+  assert.equal(view.body.host, "arFreeA", "the row must not be re-attributed to the org-less attacker");
+  assert.equal(view.body.entries.length, 1);
+  assert.ok(!view.body.entries.some((e) => (e.text || "").includes("evil-injected")));
+});
+
+test("archive re-point: keyed on the DECIDED org — a same-org host CAN continue, a cross-org host cannot (XERK-573)", async () => {
+  // Pins the fix AND guards a dead-code fixture: the rogue's BOUND org has a
+  // SECOND live member, so a legit same-org re-point succeeds — proving the guard
+  // refuses on the ORG boundary specifically, not because a re-point is always
+  // refused (the ticket's fixture warning, mirroring the migrate suite).
+  await beatOrg("arA", "orgA.atlassian.net");
+  await beatOrg("arB1", "orgB.atlassian.net");
+  await beatOrg("arB2", "orgB.atlassian.net");        // the second live orgB member
+  // arA owns tA (org A); arB1 owns tB (org B).
+  const tA = "xerk573-route-tA";
+  const tB = "xerk573-route-tB";
+  assert.equal((await archivePush("arA", tA, 0, 20,
+    [{ uuid: "a1", role: "user", ts: "t", text: "orgA-secret" }])).body.bytesStored, 20);
+  assert.equal((await archivePush("arB1", tB, 0, 20,
+    [{ uuid: "b1", role: "user", ts: "t", text: "orgB-first" }])).body.bytesStored, 20);
+  // Positive control: arB2 continues arB1's transcript (same decided org B) — allowed.
+  const cont = await archivePush("arB2", tB, 20, 40,
+    [{ uuid: "b2", role: "user", ts: "t", text: "orgB-continued" }]);
+  assert.equal(cont.body.bytesStored, 40, "a same-decided-org re-point IS allowed (not dead code)");
+  assert.equal((await archiveView(tB)).body.host, "arB2", "the org-B target owns the row");
+  // Negative: arB1 (org B) cannot re-point arA's org-A transcript.
+  const evil = await archivePush("arB1", tA, 20, 40,
+    [{ uuid: "x", role: "user", ts: "t", text: "cross-org-injected" }]);
+  assert.equal(evil.body.bytesStored, 20, "a cross-org re-point is refused");
+  const viewA = await archiveView(tA);
+  assert.equal(viewA.body.host, "arA");
+  assert.equal(viewA.body.entries.length, 1);
+  assert.ok(!viewA.body.entries.some((e) => (e.text || "").includes("cross-org-injected")));
+});
+
+test("archive re-point: a bound-but-quiet owner is still in its org, so its continuation is allowed (XERK-573)", async () => {
+  // The case the old CLAIMED-org compare wrongly refused — the archive twin of the
+  // migrate "bound but declaring nothing is STILL in its org" test. arQ2 is bound
+  // to orgQ but omits its `jira` block on the push beat (claimed ""); its DECIDED
+  // org is still orgQ, so it may continue arQ1's orgQ transcript. Under `siteKeyOf`
+  // it read "" and the re-point was refused (an over-refusal / silent data loss).
+  await beatOrg("arQ1", "orgQ.atlassian.net");
+  await beatOrg("arQ2", "orgQ.atlassian.net");
+  const tid = "xerk573-route-quiet";
+  assert.equal((await archivePush("arQ1", tid, 0, 20,
+    [{ uuid: "q1", role: "user", ts: "t", text: "orgQ-first" }])).body.bytesStored, 20);
+  await beatOrg("arQ2", null);                         // still bound orgQ, declaring nothing
+  const cont = await archivePush("arQ2", tid, 20, 40,
+    [{ uuid: "q2", role: "user", ts: "t", text: "orgQ-continued" }]);
+  assert.equal(cont.body.bytesStored, 40, "the bound-but-quiet host's decided org still matches");
+  assert.equal((await archiveView(tid)).body.host, "arQ2", "the continuation re-points the row cleanly");
+});
+
 test("http: the served `org` is the hub-DECIDED org, and a forged one is stripped (XERK-349)", async () => {
   // `org` is hub-owned: the hub strips any an agent puts in its heartbeat
   // (`normalizeOrg`) and stamps its own decision in serializeAgent. So a host

@@ -829,11 +829,12 @@ function resolveNewRelPath(transcriptId, full) {
 function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, siteKey) {
   openDb();
   meta = normalizeMeta(meta);
-  // The pushing host's org, supplied by the HUB (siteKeyOf), never agent-asserted
-  // `meta` — trusting the agent's own `jira.siteKey` here would let any host claim
-  // any org, the same objection XERK-268/348 make. Bounded like every
-  // agent-influenced string that reaches this durable store (XERK-235); "" is the
-  // narrow "no org" answer siteKeyOf already returns.
+  // The pushing host's DECIDED org, supplied by the HUB (decidedOrgOf), never
+  // agent-asserted `meta` — trusting the agent's own `jira.siteKey` here would let
+  // any host claim any org, the same objection XERK-268/348 make. Bounded like
+  // every agent-influenced string that reaches this durable store (XERK-235); ""
+  // is the narrow "no org" answer decidedOrgOf returns for an org-less or
+  // actively-drifted host.
   const pushOrg = String(siteKey == null ? "" : siteKey).slice(0, META_TEXT_MAX);
   const row = db.prepare(
     "SELECT bytesStored, archiveBytes, filePath, host, siteKey FROM sessions WHERE transcriptId=?"
@@ -852,21 +853,27 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
   // A host legitimately CHANGES on a migration (XERK-101): the target carries the
   // same transcript id, continues the conversation, and its rendered push is what
   // re-points the row. A migration is same-org, so a re-point is allowed exactly
-  // when the pushing host shares the current owner's org — compared as the CLAIMED
-  // org (`pushOrg`), which is what this subsystem stores on the row and re-stamps
-  // on a restore, kept internally consistent end to end. It is NO LONGER the same
-  // rule POST .../migrate uses: XERK-349 moved that route to the hub-DECIDED org
-  // (`sameDecidedOrg`), which the archive does not mirror — so the org-less
-  // residual (two hosts reading "" match) lives on HERE alone, tracked separately
-  // (the same coordinated store/restamp/rebuild change it would take to close it).
-  // A same-host append never re-points, so it is never gated. A row whose owner
-  // org predates this column (rebuilt from
-  // a pre-XERK-344 sidecar, siteKey NULL) can't be proven cross-org, so the first
-  // writer stamps it — one-time trust-on-first-sight. Refused exactly like an
-  // offset mismatch: store nothing, hand back the real cursor — never an error
-  // status, which an agent re-sends forever (XERK-255).
-  if (row && row.host && row.host !== host &&
-      row.siteKey != null && String(row.siteKey) !== pushOrg) {
+  // when the pushing host shares the current owner's org — and that org is now the
+  // hub-DECIDED org (`pushOrg` = `decidedOrgOf`), requiring a shared NON-EMPTY org
+  // on both sides, EXACTLY as POST .../migrate does (`sameDecidedOrg`, XERK-349).
+  // This closes the org-less pooling hole the CLAIMED-org compare left (XERK-573):
+  // two hosts that both read "" — a genuinely org-less pair, or a bound host
+  // momentarily omitting its `jira` block so its claimed org coerced to "" — used
+  // to satisfy the gate for each other, letting one APPEND to and re-attribute the
+  // other's durable transcript. A same-host append never re-points, so it is never
+  // gated. A row whose owner org predates this column (rebuilt from a pre-XERK-344
+  // sidecar, siteKey NULL) can't be proven cross-org, so the first writer stamps it
+  // — one-time trust-on-first-sight, unchanged. A cross-org RESTORE (XERK-441) is
+  // not gated here either: `restampOrg` re-points the row (host + decided org) to
+  // the target, so the target's push is a same-host append — the org-agnostic
+  // admission an org-less fleet needs, since it has no shared non-empty org for
+  // this gate to match on. Refused exactly like an offset mismatch: store nothing,
+  // hand back the real cursor — never an error status, which an agent re-sends
+  // forever (XERK-255).
+  const rePoint = !!(row && row.host && row.host !== host);
+  const legacyNull = !!(row && row.siteKey == null);
+  const sharedOrg = !!(pushOrg && row && String(row.siteKey) === pushOrg);
+  if (rePoint && !legacyNull && !sharedOrg) {
     return { bytesStored: have };
   }
   // Store full: hand back the cursor we already hold and store nothing. Not an
@@ -991,31 +998,42 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
   return shed ? { bytesStored, shed: true } : { bytesStored };
 }
 
-// Re-point an archived transcript's OWNER ORG to `siteKey`, keeping the sidecar
-// in step so a rebuild preserves it. Returns false if the transcript is unknown.
+// Re-point an archived transcript's OWNER to the restore target — its `siteKey`
+// (the target's DECIDED org, XERK-573) AND its `host` — keeping the sidecar in
+// step so a rebuild preserves both. Returns false if the transcript is unknown.
 //
 // A restore (XERK-441) resumes an ENDED session on a host in ANOTHER org — this
 // is deliberately allowed (the archive is hub-wide and login-gated, and the dead
 // source host has no org left to compare against). The resumed session keeps the
 // SAME transcript id, so when it later archives, its push is a cross-host
-// re-point that ingestChunk's ownership gate (XERK-344) refuses unless the row's
-// org already matches the new home — otherwise the restored session's new turns
-// silently never reach the durable archive. So the restore stamps the target's
-// org here, exactly as a migration's rendered re-point carries the target's org.
-// The row's HOST is left alone: the target's first archive push re-points it, and
-// by then the org matches (the same ordering the raw layer depends on).
-function restampOrg(transcriptId, siteKey) {
+// re-point that ingestChunk's ownership gate (XERK-344/573) refuses unless it is a
+// shared NON-EMPTY decided org on both sides — otherwise the restored session's
+// new turns silently never reach the durable archive. Re-pointing the HOST here
+// (not just the org) makes the target's first push a same-host append, which the
+// gate never touches — the ONLY way an ORG-LESS restore continues, since an
+// org-less target has no shared non-empty org for the gate to match on. It also
+// removes the old rendered-before-raw ordering dependency: the row is already the
+// target's, so its raw push (`row.host === host`) passes regardless of push order.
+// The org is still stamped so a LATER migration of the restored session is gated
+// on the right (decided) org. `host` defaults to leaving the owner as-is for a
+// caller that only wants the org restamped.
+function restampOrg(transcriptId, siteKey, host) {
   openDb();
   const org = String(siteKey == null ? "" : siteKey).slice(0, META_TEXT_MAX);
-  const row = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(transcriptId);
+  const row = db.prepare("SELECT filePath, host FROM sessions WHERE transcriptId=?").get(transcriptId);
   if (!row) return false;
-  db.prepare("UPDATE sessions SET siteKey=?, updatedAt=? WHERE transcriptId=?")
-    .run(org, new Date().toISOString(), transcriptId);
-  // Keep the sidecar honest so rebuildIndex re-derives the new org, not the old.
+  const newHost = host == null ? row.host : String(host).slice(0, META_TEXT_MAX);
+  db.prepare("UPDATE sessions SET siteKey=?, host=?, updatedAt=? WHERE transcriptId=?")
+    .run(org, newHost, new Date().toISOString(), transcriptId);
+  // Keep the sidecar honest so rebuildIndex re-derives the new org+host, not the old.
   if (row.filePath) {
     const metaPath = filePaths(row.filePath).meta;
     const sc = readSidecar(metaPath);
-    if (sc) { sc.siteKey = org; try { writeSidecar(metaPath, sc); } catch { /* best-effort */ } }
+    if (sc) {
+      sc.siteKey = org;
+      sc.host = newHost;
+      try { writeSidecar(metaPath, sc); } catch { /* best-effort */ }
+    }
   }
   return true;
 }
@@ -1290,7 +1308,8 @@ function manifestCursors(host, manifest, siteKey) {
   // ingestChunk gate (XERK-344) would treat a cross-org host's first chunk as a
   // legacy trust-on-first-sight write and let it HIJACK the not-yet-filled
   // transcript. Only INSERT is reached (the loop guards on `!row`), so this never
-  // re-points an existing row — same hub-supplied org, bounded, as ingestChunk.
+  // re-points an existing row — same hub-supplied DECIDED org (XERK-573), bounded,
+  // as ingestChunk, so the placeholder and the gate agree on the basis.
   const pushOrg = String(siteKey == null ? "" : siteKey).slice(0, META_TEXT_MAX);
   // Capped like the raw cursors beside it, and for the same reason — it is the
   // same handler, the same beat and the same single event loop. Pre-existing but
