@@ -8908,10 +8908,13 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
 
     def test_launch_ttyd_adopts_our_surviving_ttyd(self):
         # A ttyd WE launched that survived a manager restart still holds the port
-        # and its pid is alive. _launch_ttyd must adopt it (no rebind, no Popen).
+        # and its pid is alive. _launch_ttyd must adopt it (no rebind, no Popen) —
+        # PROVIDED its baked-in token still matches (XERK-578: a mismatch, e.g.
+        # after a token roll, forces a relaunch instead; covered separately).
         sm = self.make_manager()
         sess = self._running_sess()
         sess["ttydPid"] = 5150
+        sess["ttydTokenFp"] = ha._token_fp(ha.TURMA_TOKEN)
         with mock.patch.object(ha, "_pid_alive", return_value=True), \
              mock.patch.object(ha, "_port_open", return_value=True), \
              mock.patch.object(ha.subprocess, "Popen") as popen:
@@ -28994,6 +28997,82 @@ class TestSetToken(unittest.TestCase):
             rc = ha.enroll_self()
         self.assertEqual(rc, 1)
         rw.assert_not_called()
+
+
+class TestTtydTokenRelaunch(unittest.TestCase):
+    """XERK-578 follow-up: ttyd bakes its basic-auth token in at launch and
+    outlives a manager-only restart (KillMode=process), so after a token ROLL the
+    adopt path must RELAUNCH it (not adopt the stale-password survivor) or the
+    hub's now-derived credential 401s the terminal into a browser password
+    prompt."""
+
+    def _mgr(self):
+        sm = ha.SessionManager.__new__(ha.SessionManager)
+        sm.ttyd = {}
+        return sm
+
+    def test_adopts_when_the_token_fingerprint_still_matches(self):
+        sm = self._mgr()
+        sess = {"id": "s1", "ttydPort": 7700, "ttydPid": 4242,
+                "tmuxName": "agent-s1", "ttydTokenFp": ha._token_fp("derivedtok")}
+        with mock.patch.object(ha, "TURMA_TOKEN", "derivedtok"), \
+             mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_port_open", return_value=True), \
+             mock.patch.object(sm, "_kill_ttyd") as kill, \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm._launch_ttyd(sess)
+        # An unchanged token -> adopt the survivor, no kill, no relaunch.
+        kill.assert_not_called()
+        popen.assert_not_called()
+
+    def test_relaunches_when_the_token_changed_under_a_survivor(self):
+        sm = self._mgr()
+        # ttyd was launched with the OLD (master) token; TURMA_TOKEN is now the
+        # rolled derived one, so the survivor's baked-in password is stale.
+        sess = {"id": "s1", "ttydPort": 7700, "ttydPid": 4242,
+                "tmuxName": "agent-s1", "ttydTokenFp": ha._token_fp("oldmaster")}
+        ports = iter([True, False])  # open at the adopt check, freed after kill
+        with mock.patch.object(ha, "TURMA_TOKEN", "deriveNEW"), \
+             mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_port_open",
+                               side_effect=lambda *a, **k: next(ports, False)), \
+             mock.patch.object(ha, "time"), \
+             mock.patch.object(sm, "_kill_ttyd") as kill, \
+             mock.patch.object(ha.subprocess, "Popen",
+                               return_value=mock.Mock(pid=9999)) as popen:
+            sm._launch_ttyd(sess)
+        kill.assert_called_once_with("s1")
+        popen.assert_called_once()
+        # The relaunched ttyd carries the NEW token, and the record re-fingerprints.
+        self.assertIn("term:deriveNEW", popen.call_args[0][0])
+        self.assertEqual(sess["ttydTokenFp"], ha._token_fp("deriveNEW"))
+
+    def test_relaunches_when_a_survivor_recorded_no_fingerprint(self):
+        # A ttyd launched by pre-XERK-578 code (an ALREADY-rolled host) recorded
+        # no fingerprint, so it must relaunch to pick up the current token —
+        # this is what self-heals hosts rolled before the fix shipped.
+        sm = self._mgr()
+        sess = {"id": "s1", "ttydPort": 7700, "ttydPid": 4242, "tmuxName": "agent-s1"}
+        ports = iter([True, False])
+        with mock.patch.object(ha, "TURMA_TOKEN", "derivedtok"), \
+             mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_port_open",
+                               side_effect=lambda *a, **k: next(ports, False)), \
+             mock.patch.object(ha, "time"), \
+             mock.patch.object(sm, "_kill_ttyd") as kill, \
+             mock.patch.object(ha.subprocess, "Popen",
+                               return_value=mock.Mock(pid=9999)) as popen:
+            sm._launch_ttyd(sess)
+        kill.assert_called_once_with("s1")
+        popen.assert_called_once()
+
+    def test_token_fp_is_short_one_way_and_never_the_token(self):
+        fp = ha._token_fp("some.secret-token")
+        self.assertEqual(len(fp), 16)
+        self.assertNotIn("secret", fp)
+        self.assertEqual(fp, ha._token_fp("some.secret-token"))       # stable
+        self.assertNotEqual(fp, ha._token_fp("some.secret-token2"))   # sensitive
+        self.assertEqual(ha._token_fp(None), ha._token_fp(""))        # never raises
 
 
 if __name__ == "__main__":

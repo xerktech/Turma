@@ -2641,6 +2641,15 @@ def enroll_self():
     return 0
 
 
+def _token_fp(token):
+    """A short, one-way fingerprint of the ttyd basic-auth token (XERK-578), so
+    the adopt path can tell whether a surviving ttyd's baked-in `-c term:<token>`
+    still matches the CURRENT TURMA_TOKEN — WITHOUT storing the secret on the
+    heartbeated session record. Truncated sha256: it only ever gates a relaunch,
+    so a collision would at worst skip one, never expose anything."""
+    return hashlib.sha256((token or "").encode()).hexdigest()[:16]
+
+
 def unlink_quietly(paths):
     """Best-effort removal of per-session files, ignoring a missing/unreadable
     one — the shared unlink loop the qwen and dsh runtime teardowns use (XERK-528)
@@ -16726,7 +16735,29 @@ class SessionManager:
         # and reallocated here can't be mistaken for a survivor to adopt.
         adopted = sess.get("ttydPid")
         if adopted and _pid_alive(adopted) and _port_open(sess.get("ttydPort")):
-            return
+            # Adopt that survivor ONLY if its baked-in basic-auth password still
+            # matches the token we'd hand it now (XERK-578). ttyd bakes
+            # `-c term:<TURMA_TOKEN>` in at launch and outlives a manager-only
+            # restart (KillMode=process), so after a token ROLL it keeps demanding
+            # the OLD token while the hub — seeing the host now beat BOUND —
+            # injects the NEW derived one, and the terminal 401s into a browser
+            # password prompt. A fingerprint mismatch (or an older ttyd that
+            # recorded none) means the token changed under it: kill it and fall
+            # through to relaunch with the current token. This SELF-HEALS a host
+            # already rolled (its next restart relaunches ttyd) as well as every
+            # future roll.
+            if sess.get("ttydTokenFp") == _token_fp(TURMA_TOKEN):
+                return
+            log(f"ttyd for {sess['id']}: basic-auth token changed under a "
+                "surviving ttyd (post-roll); relaunching with the current token")
+            self._kill_ttyd(sess["id"])
+            # Wait for the old ttyd to release the port before rebinding it, or
+            # the relaunch below races it and fails to bind (leaving the terminal
+            # down). Bounded; SIGTERM'd ttyd exits promptly.
+            for _ in range(20):
+                if not _port_open(sess.get("ttydPort")):
+                    break
+                time.sleep(0.1)
         args = [
             "ttyd", "-p", str(sess["ttydPort"]), "-i", "127.0.0.1",
             "-b", f"/term/{sess['id']}", "-W", "-m", "8",
@@ -16762,6 +16793,10 @@ class SessionManager:
             )
             self.ttyd[sess["id"]] = proc
             sess["ttydPid"] = proc.pid  # persisted so a later manager can reap it
+            # The token this ttyd baked into its `-c term:` basic-auth (XERK-578).
+            # Persisted so the adopt path above can tell, after a manager-only
+            # restart, whether the token changed under it and a relaunch is due.
+            sess["ttydTokenFp"] = _token_fp(TURMA_TOKEN)
         except Exception as e:
             raise RuntimeError(f"ttyd launch failed: {e}")
 
