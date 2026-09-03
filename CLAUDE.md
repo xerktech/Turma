@@ -161,11 +161,20 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     any org and read its roster. The binding is hub-owned; mechanics in `turma.md`.
   - **Drift is declaring a DIFFERENT org, never failing to declare one** — a host whose tracker goes
     quiet keeps its binding and its peers.
-  - **The binding gates the peer roster and NOTHING else.** The MIGRATION route still compares the
-    claimed org. **Do not bind-gate it**: `orgBound` is stripped from the served payload, so no client
-    can mirror a rule keyed on it and the hub and every Move menu disagree. Reverted twice. Serving
-    the decided org to clients is **XERK-349**, which also carries the pre-existing hole: two hosts
-    that both declare NO org match each other whatever they are bound to.
+  - **The hub SERVES its decided org as `org`, and the migrate route + every Move menu key on it**
+    (XERK-349). `decidedOrgOf` = the bound org, or "" for an actively-drifted host or a never-bound
+    one; `serializeAgent` stamps it after the spread (like `key`), `normalizeOrg` strips any an agent
+    forges. A migration needs a shared NON-EMPTY decided org on BOTH sides (`sameDecidedOrg`). What it
+    CLOSES: two hosts that both declare NO org no longer pool (the org-less hole — a bound-to-acme host
+    declaring nothing now reads "acme", not the same "" a bound-to-rival one does). What it FIXES: the
+    over-refusal where two same-org hosts, one momentarily quiet, wrongly 409'd. What it does NOT do:
+    an actively-drifting host is refused (decided ""), but that quarantine is **self-healing, one beat
+    deep** — the SAME as the reverted drift-refusal, not better — since silence is not drift (XERK-348)
+    and the binding never moved, so a drifted-then-quiet host is `boundOrgOf` again; permanent drift
+    quarantine would need drift history the record lacks and would undo the over-refusal fix. Clients
+    mirror the served `org` (older-hub fallback to `jira.siteKey`), so hub and menus agree — the piece
+    the two reverted `orgBound` attempts lacked (it was stripped from the payload). Cost: a no-Jira
+    fleet cannot migrate. **Do not re-key this on the claimed `jira.siteKey`** — that reopens the holes.
   - **Every roster cell is capped on the wire** (`PEER_CELL_MAX`), not just the free-text one —
     nothing else bounds `rcName`, and the spawn route takes a 100k `label`.
   - **Both sides fail NARROW.** No `peers` on a reply forgets the roster; a silent hub expires it;

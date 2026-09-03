@@ -12370,6 +12370,28 @@ const migrate = (host, session, body) =>
   request("POST", `/api/agents/${host}/sessions/${session}/migrate`,
     { body, headers: userHeaders });
 
+// sessions.html's `eligibleMoveTargets` (and its android `orgOf` twin), VERBATIM,
+// run over the payload the hub really SERVES (XERK-349). The reverted attempts
+// diverged precisely because the client could not see the rule the hub enforced,
+// so proving agreement means running the client predicate over the served bytes,
+// never a copy of the hub's own helper. Keys on the hub-decided `org`, with the
+// SAME older-hub fallback to `jira.siteKey` the clients use, and the same
+// empty-org = no-targets rule as `sameDecidedOrg`.
+const orgOfServed = (a) => (a && a.org != null ? a.org : ((a && a.jira && a.jira.siteKey) || ""));
+const servedAgents = async () =>
+  (await request("GET", "/api/agents", { headers: userHeaders })).body.agents;
+function menuTargets(served, srcDevice, repo) {
+  const src = served.find((x) => x.device === srcDevice);
+  assert.ok(src, `${srcDevice} is not in the served payload — this assertion is vacuous`);
+  const org = orgOfServed(src);
+  if (!org) return [];
+  return served
+    .filter((x) => x.key !== src.key && x.online && orgOfServed(x) === org &&
+      (x.repos || []).some((r) => r && r.name === repo))
+    .map((x) => x.device)
+    .sort();
+}
+
 test("migrate: rejects a bad source, target, or org mismatch", async () => {
   await migHost("mSrc", "m1.atlassian.net");
   await migHost("mTgt", "m1.atlassian.net");
@@ -12411,87 +12433,125 @@ test("orgPeers still serves a host that stopped declaring its org", () => {
   }
 });
 
-test("migrate: an ORG-LESS fleet can still move sessions", async () => {
-  // Parity with what this route did before it compared bound orgs: two hosts
-  // with no tracker configured are not "in a different org", they are in no
-  // org, and refusing them is a regression. The clients cannot mirror such a
-  // rule either — `orgBound` is stripped from the served payload — so their
-  // Move menus would keep offering a host the hub then refuses.
+test("migrate: two ORG-LESS hosts do NOT pool (XERK-349), and the Move menu agrees", async () => {
+  // The org-less hole this ticket closes: two hosts with no tracker configured
+  // have decided org "" each, and `sameDecidedOrg` requires a shared NON-EMPTY
+  // org — so a never-bound pair no longer matches (the same "" a bound-to-acme
+  // host declaring nothing used to read, which is how a session crossed a
+  // binding boundary). A no-Jira fleet losing migration is the deliberate cost.
   await migHost("mFreeA", null);
   await migHost("mFreeB", null);
   const r = await migrate("mFreeA", "s1", { host: "mFreeB" });
-  // `notEqual(409)` passes on ANY other status — including the 503 the fleet-wide
-  // in-flight cap really returns, since every migrate test holds a slot. Assert
-  // the success, or this pins nothing.
-  assert.equal(r.status, 200, JSON.stringify(r.body));
-  // A started move stays in flight until it settles, and the in-flight cap is
-  // shared with every other migrate test — drop it rather than leaking a slot.
-  if (r.body && r.body.migrationId) migrations.delete(r.body.migrationId);
+  // `notEqual(...)` would pass on the 503 the fleet-wide in-flight cap returns —
+  // assert the EXACT 409 the org check gives, or this pins nothing.
+  assert.equal(r.status, 409, JSON.stringify(r.body));
+  assert.match(r.body.error, /different org/);
+  // The client agrees: both are served org="" and an empty org offers nothing.
+  const served = await servedAgents();
+  assert.equal(orgOfServed(served.find((x) => x.device === "mFreeA")), "");
+  assert.equal(orgOfServed(served.find((x) => x.device === "mFreeB")), "");
+  assert.deepEqual(menuTargets(served, "mFreeA", "Turma"), []);
 });
 
-test("migrate: a DRIFTED host is still a legal target — the binding is not here", async () => {
-  // Pins the REVERT, in the one direction it can regress. Two attempts to
-  // bind-gate this route were made and reverted (see .claude/rules/turma.md);
-  // re-inserting `if (orgDrifted(src) || orgDrifted(tgt)) return 409` above the
-  // claim compare escaped the whole suite, so a future session could ship the
-  // thing the docs warn against, green.
-  //
-  // A drifted host that still CLAIMS the source's org is the only case the two
-  // candidate predicates disagree on, so it is the only case that pins this.
-  // Refusing it is not wrong on its own — it is wrong without XERK-349, because
-  // no client can mirror it and every Move menu would keep offering this host.
-  await migHost("mDriftT", "dt1.atlassian.net");     // binds dt1
-  await migHost("mDriftT", "dt2.atlassian.net");     // now claims dt2: drifted
-  await migHost("mDriftS", "dt2.atlassian.net");     // claims dt2 too
-  const r = await migrate("mDriftS", "s1", { host: "mDriftT" });
+test("migrate: a host bound but declaring nothing is STILL in its org (XERK-349), menu offers it", async () => {
+  // The case the old CLAIMED-org compare wrongly refused, and the reason the
+  // route could not move to the binding until the decision was served: a host
+  // BOUND to bq that omits its `jira` block this beat is not drifted — it keeps
+  // its binding, decided "bq". Two such hosts share a non-empty decided org, so
+  // the move is allowed, and every Move menu (keyed on the served `org`) offers
+  // it. Under `siteKeyOf` one side read "" and the move 409'd.
+  await migHost("mBoundP", "bq.atlassian.net");
+  await migHost("mBoundQ", "bq.atlassian.net");
+  await migHost("mBoundQ", null);          // still bound to bq, declaring nothing
+  const r = await migrate("mBoundP", "s1", { host: "mBoundQ" });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   if (r.body && r.body.migrationId) migrations.delete(r.body.migrationId);
+  const served = await servedAgents();
+  // The quiet host is served its BOUND org, not "".
+  assert.equal(orgOfServed(served.find((x) => x.device === "mBoundQ")), "bq.atlassian.net");
+  assert.deepEqual(menuTargets(served, "mBoundP", "Turma"), ["mBoundQ"]);
 });
 
-test("migrate: matches on the CLAIMED org, and the client predicate agrees", async () => {
-  // The org binding gates the peer roster and NOT this route. No client can
-  // mirror a rule keyed on `orgBound` — it is stripped from the served payload,
-  // so `eligibleMoveTargets` and its Android/glasses twins see only
-  // `jira.siteKey`. A host BOUND to an org but declaring none this beat is where
-  // a binding-keyed rule would diverge from every Move menu.
-  //
-  // The hole this leaves is real and deliberate (XERK-349): two hosts that both
-  // declare NO org match each other whatever they are bound to. The second half
-  // of this test asserts that, so the day it is closed this test fails loudly
-  // rather than the behaviour changing unnoticed.
-  await migHost("mQuietA", "q1.atlassian.net");
-  await migHost("mQuietB", "q1.atlassian.net");
-  await migHost("mQuietB", null);          // still bound to q1, declaring nothing
-  const toQuiet = await migrate("mQuietA", "s1", { host: "mQuietB" });
-  assert.equal(toQuiet.status, 409, JSON.stringify(toQuiet.body));
-  // `sessions.html`'s own predicate, verbatim, over what the client is really
-  // served — this test was once titled "the clients agree" while running no
-  // client code at all. `eligibleMoveTargets` keys on this, so if it disagrees
-  // with the hub the Move menu offers a host that 409s (or hides a legal one).
-  const siteKeyOfAgent = (a) => (a && a.jira && a.jira.siteKey) || "";
-  // Fetched FRESH per assertion, and every host asserted to be PRESENT in it.
-  // A snapshot taken before a host's first beat makes `find` undefined, which
-  // the client-style `|| ""` turns into "" — so `"" === ""` passed while proving
-  // nothing about the host it named.
-  const keysOf = async (...devices) => {
-    const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.agents;
-    return devices.map((d) => {
-      const a = served.find((x) => x.device === d);
-      assert.ok(a, `${d} is not in the served payload — this assertion is vacuous`);
-      return siteKeyOfAgent(a);
-    });
-  };
-  const [kA, kB] = await keysOf("mQuietA", "mQuietB");
-  assert.notEqual(kA, kB);                               // the UI hides it too
-  // And the org-less pair the clients DO offer is allowed, so agreement holds
-  // in both directions.
-  await migHost("mQuietC", null);
-  const bothQuiet = await migrate("mQuietC", "s1", { host: "mQuietB" });
-  assert.equal(bothQuiet.status, 200, JSON.stringify(bothQuiet.body));
-  const [kC, kB2] = await keysOf("mQuietC", "mQuietB");
-  assert.equal(kC, kB2);
-  if (bothQuiet.body && bothQuiet.body.migrationId)
-    migrations.delete(bothQuiet.body.migrationId);
+test("migrate: a DRIFTED host matches no one on either side (XERK-349), and the menu hides it", async () => {
+  // Pins the fix AND guards against a dead-code fixture: the drifted host's
+  // BOUND org has a second, live member (mPeerOk), so a legit move within that
+  // org succeeds — proving the guard refuses the DRIFTED host specifically, not
+  // an org that was empty for unrelated reasons (the ticket's fixture warning).
+  await migHost("mSrcOk", "dso.atlassian.net");        // bound dso
+  await migHost("mPeerOk", "dso.atlassian.net");       // bound dso — a real target
+  await migHost("mDrift", "dso.atlassian.net");        // binds dso
+  await migHost("mDrift", "dso2.atlassian.net");       // now claims dso2: drifted, decided ""
+
+  // The legit same-org move works (the guard is not dead code).
+  const ok = await migrate("mSrcOk", "s1", { host: "mPeerOk" });
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+  if (ok.body && ok.body.migrationId) migrations.delete(ok.body.migrationId);
+
+  // Drifted as the TARGET: refused, even though it still has the repo cloned and
+  // is bound to the source's org. Unlike the reverted one-beat-deep drift
+  // refusal, this holds because it keys on the binding via the decided org.
+  const toDrift = await migrate("mSrcOk", "s1", { host: "mDrift" });
+  assert.equal(toDrift.status, 409, JSON.stringify(toDrift.body));
+  assert.match(toDrift.body.error, /different org/);
+
+  // Drifted as the SOURCE: also refused (its own decided org is "").
+  const fromDrift = await migrate("mDrift", "s1", { host: "mPeerOk" });
+  assert.equal(fromDrift.status, 409, JSON.stringify(fromDrift.body));
+
+  // The menu offers the legit peer and hides the drifted host — hub and client
+  // agree in both directions.
+  const served = await servedAgents();
+  assert.equal(orgOfServed(served.find((x) => x.device === "mDrift")), "");
+  assert.deepEqual(menuTargets(served, "mSrcOk", "Turma"), ["mPeerOk"]);
+});
+
+test("migrate: drift quarantine is SELF-HEALING — a drifted host that goes quiet is a legal target again (XERK-349)", async () => {
+  // The behaviour QA pinned against the false "holds past one beat" claim. An
+  // ACTIVELY-drifting host is refused (decided ""), but the quarantine is one
+  // beat deep: silence is not drift (XERK-348) and the binding never moves, so
+  // the moment it stops claiming a different org it is `boundOrgOf` again — the
+  // SAME as the reverted drift-refusal, and the price of the bound-but-quiet
+  // allowance. Documented so nobody re-asserts a permanent quarantine.
+  await migHost("mHealSrc", "dsh.atlassian.net");   // bound dsh — the source
+  await migHost("mHeal", "dsh.atlassian.net");      // binds dsh
+  await migHost("mHeal", "dsh2.atlassian.net");     // now claims dsh2: drifting
+
+  // While actively drifting: decided "" → refused, menu hides it.
+  const drifting = await migrate("mHealSrc", "s1", { host: "mHeal" });
+  assert.equal(drifting.status, 409, JSON.stringify(drifting.body));
+  let served = await servedAgents();
+  assert.equal(orgOfServed(served.find((x) => x.device === "mHeal")), "");
+  assert.deepEqual(menuTargets(served, "mHealSrc", "Turma"), []);
+
+  // One quiet beat (no org declared) and it is `dsh` again — 200, menu offers it.
+  await migHost("mHeal", null);
+  const healed = await migrate("mHealSrc", "s1", { host: "mHeal" });
+  assert.equal(healed.status, 200, JSON.stringify(healed.body));
+  if (healed.body && healed.body.migrationId) migrations.delete(healed.body.migrationId);
+  served = await servedAgents();
+  assert.equal(orgOfServed(served.find((x) => x.device === "mHeal")), "dsh.atlassian.net");
+  assert.deepEqual(menuTargets(served, "mHealSrc", "Turma"), ["mHeal"]);
+});
+
+test("http: the served `org` is the hub-DECIDED org, and a forged one is stripped (XERK-349)", async () => {
+  // `org` is hub-owned: the hub strips any an agent puts in its heartbeat
+  // (`normalizeOrg`) and stamps its own decision in serializeAgent. So a host
+  // cannot forge its org, and a never-bound host reads "".
+  await migHost("orgFreeH", null);
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "orgForgeH",
+      jira: { available: true, configured: true, siteKey: "of.atlassian.net", tickets: [] },
+      org: "acme-forged",                 // the lie
+    },
+    headers: agentHeaders,
+  });
+  const served = await servedAgents();
+  assert.equal(served.find((x) => x.device === "orgFreeH").org, "");
+  // Its OWN bound org (first declared), never the forged value.
+  assert.equal(served.find((x) => x.device === "orgForgeH").org, "of.atlassian.net");
+  // And the stored record never carries the forged value either.
+  assert.ok(!("org" in agents.orgForgeH), "a forged org must not survive onto the record");
 });
 
 

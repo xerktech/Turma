@@ -2553,6 +2553,21 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
     // client (and an older one that never typed it) treats as running.
     // Hub-derived; never the agent's word.
     ...(hostAutoPaused(key, a, pausedSubs) ? { autoPaused: true } : {}),
+    // The org the hub DECIDED this host is in (XERK-349) — the bound org, or ""
+    // for a drifted or never-bound host. Served so the three client move-target
+    // predicates (sessions.html `eligibleMoveTargets`, android `Sessions.kt`,
+    // and any glasses twin) can agree with what the migrate route enforces;
+    // before this the route could only compare the CLAIMED `jira.siteKey`,
+    // because `orgBound` was stripped from the payload and no client could
+    // mirror a binding-keyed rule (the two reverted attempts). Computed off the
+    // FULL record `agent`, not the stripped `a` (which has had `orgBound`
+    // destructured out). Stamped AFTER the spreads, like `key`/`autoPaused`, so
+    // a heartbeat that forged an `org` cannot make itself one — the second guard
+    // behind `normalizeOrg`, which strips it on ingest and restore. Emitted
+    // UNCONDITIONALLY, "" included: a present "" means "the hub says no org",
+    // which the clients must honour, and only an ABSENT field (an older hub)
+    // falls them back to `jira.siteKey`.
+    org: decidedOrgOf(agent),
   };
 }
 
@@ -2882,6 +2897,40 @@ function orgDrifted(a) {
   return !!bound && !!claimed && claimed !== bound;
 }
 
+// The org the hub has DECIDED this host is in, the one authoritative answer the
+// peer roster and the migrate route both partition on (XERK-349). It is the
+// BOUND org (never the claimed one — see boundOrgOf), except that an ACTIVELY
+// DRIFTED host reads as no-org: it is claiming a different org, so it is
+// quarantined from both its own org's peers and any migration WHILE it does so.
+// The quarantine is self-healing and one beat deep: the moment it stops claiming
+// a different org — re-declares its bound org OR simply goes quiet (silence is
+// not drift, XERK-348) — it is `boundOrgOf` again, since the binding never moved.
+// This is the value SERVED to clients as `org` (serializeAgent), so a
+// Move menu keys on exactly what the hub will enforce — the whole point of
+// XERK-349, which is what finally let the migrate route move off the claimed org
+// (the two reverted attempts could not, because `orgBound` was invisible to
+// every client). A host bound to NOTHING (never declared an org) reads "" here,
+// same as a drifted one, and two such hosts are NOT pooled: a migration needs a
+// shared NON-EMPTY decided org on both sides (`sameDecidedOrg`), matching the
+// roster's "an org-less host is alone" rule and closing the org-less hole the
+// claimed-org compare left open.
+function decidedOrgOf(a) {
+  return orgDrifted(a) ? "" : boundOrgOf(a);
+}
+
+// May a session move from `src` to `tgt`? Only within one decided org, and only
+// a NON-EMPTY one — so a drifted host (decided ""), a never-bound host (decided
+// ""), and a pair of either never match. The clients mirror this predicate over
+// the served `org` field (eligibleMoveTargets + its Android twin), so hub and
+// every Move menu agree in both directions (measured across ordered pairs in
+// XERK-348/349; a claimed-org compare disagreed both ways). The non-empty gate
+// is what closes the hole XERK-349 was split off to close: two hosts that both
+// declare no org used to match "whatever they are bound to".
+function sameDecidedOrg(src, tgt) {
+  const org = decidedOrgOf(src);
+  return !!org && org === decidedOrgOf(tgt);
+}
+
 // One host's running sessions, appended until the roster is FULL. The cap has to
 // bound what is BUILT, not what is returned: capping cell width alone left the
 // row COUNT unbounded, and nothing limits how many running sessions a heartbeat
@@ -2911,8 +2960,9 @@ function orgPeers(key) {
   const me = agents[key];
   if (!me) return [];
   // A drifted host is treated exactly as an org-less one: it still sees its own
-  // sessions, which it already knows, and nothing else.
-  const org = orgDrifted(me) ? "" : boundOrgOf(me);
+  // sessions, which it already knows, and nothing else — this is the same
+  // decided org the migrate route and the served `org` field key on.
+  const org = decidedOrgOf(me);
   const now = Date.now();
   const rows = [];
   // This host FIRST, so its own rows are the ones that survive a full roster:
@@ -5474,6 +5524,7 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeSpawnRefusals(a);
   normalizeRefused(a);
   normalizeRetired(a);
+  normalizeOrg(a);
   normalizeJira(a);
   normalizeClones(a);
   // XERK-455: the AgentInfo blocks that were TYPED on the clients but never
@@ -5796,6 +5847,26 @@ function normalizeUpdating(a) {
   const u = a.updating;
   if ("until" in u && !wireLong(u.until)) delete u.until;
   if ("version" in u && u.version !== null && typeof u.version === "object") delete u.version;
+}
+
+/**
+ * `org` is HUB-OWNED and stripped on ingest and restore (XERK-349).
+ *
+ * The hub DECIDES a host's org (`decidedOrgOf`) and stamps it fresh in
+ * serializeAgent on every serve, so the record must never carry one: a heartbeat
+ * that put `org: "acme"` in its payload would otherwise ride `{...payload}` onto
+ * the stored record and let a host forge its own org — the same posture `key`
+ * and `refused` take. serializeAgent's stamp-last order already overrides it at
+ * serve, so this is the second, independent guard, and it is what makes typing
+ * `org` on Android safe (the heartbeat contract in CLAUDE.md: typing a field and
+ * adding its hub-side coercion are one change). `delete`, never coerce — the hub
+ * owns the value outright, so any incoming one is meaningless, not merely
+ * mis-typed. Running it in `normalizeRecord` covers the `state.json` restore as
+ * well as the ingest.
+ */
+function normalizeOrg(a) {
+  if (!a || typeof a !== "object") return;
+  if ("org" in a) delete a.org;
 }
 
 /**
@@ -11855,25 +11926,34 @@ const server = http.createServer(async (req, res) => {
           return json(res, 400, { error: "a different target host is required" });
         const tgt = agents[target];
         if (!tgt) return json(res, 404, { error: "unknown target host" });
-        // The CLAIMED org on both sides, deliberately UNCHANGED by XERK-348's
-        // org binding, which gates the peer roster and nothing else.
+        // The DECIDED org on both sides (XERK-349), not the CLAIMED one. Since
+        // the hub now SERVES that decision as `org` (serializeAgent), the three
+        // client move-target predicates key on exactly what this refuses, so hub
+        // and every Move menu agree — the missing piece the two reverted attempts
+        // lacked (`orgBound` was invisible to clients, so comparing it made them
+        // disagree in both directions).
         //
-        // Two attempts to bind-gate this route were reverted, and neither should
-        // be retried without the missing piece. Comparing `orgBound` made the hub
-        // and every Move menu disagree in both directions, because `orgBound` is
-        // stripped from the served payload and no client can mirror a rule keyed
-        // on it. Refusing a DRIFTED host on top of a claim match is what is left
-        // of that, and it buys almost nothing: the refusal is one beat deep — a
-        // drifted host that simply omits its `jira` block on the next beat is a
-        // legal target again — while being the only surviving hub/client
-        // divergence. It also does not close the real hole, which predates this
-        // and is measured in XERK-349: two hosts that BOTH declare no org match
-        // each other whatever they are bound to, so a session can be relayed
-        // across a binding boundary with no drift anywhere.
-        //
-        // Closing that means serving the DECIDED org so the three client mirrors
-        // can agree with the hub. That is a parity change, and it is XERK-349.
-        if (siteKeyOf(src) !== siteKeyOf(tgt))
+        // `sameDecidedOrg` requires a shared NON-EMPTY org. What XERK-349 closes,
+        // and what it deliberately does NOT:
+        //   - CLOSED, the org-less hole: two hosts that both declare NO org
+        //     (decided "" on each) no longer pool — where a bound-to-acme host
+        //     declaring nothing used to read the same "" as a bound-to-rival one
+        //     and relay a session across the binding boundary. A never-bound host
+        //     is alone, matching the peer roster's rule. Cost: a no-Jira fleet
+        //     cannot migrate at all (see .claude/rules/turma.md).
+        //   - FIXED, the over-refusal: two hosts bound to one org, one omitting
+        //     its `jira` block this beat, now match (decided = bound on both) —
+        //     the claimed-org compare wrongly 409'd that.
+        //   - an ACTIVELY drifting host (declaring a different org than it is
+        //     bound to) reads decided "" and is refused. This quarantine is
+        //     SELF-HEALING, exactly one beat deep — the SAME behaviour the
+        //     reverted drift refusal had, not an improvement on it: the moment the
+        //     host stops claiming a different org (re-declares its bound org, or
+        //     goes quiet) it is `boundOrgOf` again and a legal target, because the
+        //     binding never moved and silence is not drift (XERK-348). Making it
+        //     PERMANENT would need drift history the record does not keep and would
+        //     undo the over-refusal fix — do not claim it holds past one beat.
+        if (!sameDecidedOrg(src, tgt))
           return json(res, 409, { error: "the target agent is in a different org" });
         if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)
           return json(res, 503, { error: "the target agent is offline" });
@@ -13849,6 +13929,8 @@ if (process.env.TURMA_TEST) {
     orgPeers,
     boundOrgOf,
     orgDrifted,
+    decidedOrgOf,
+    sameDecidedOrg,
     orgDriftWarned,
     warnOrgDrift,
   };
