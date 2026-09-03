@@ -214,6 +214,13 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
 - The fetched ticket becomes the **initial prompt** (`build_ticket_prompt`: fields, description, the
   newest `TICKET_PROMPT_COMMENTS` comments, its attachments) — the session has no board creds of its
   own, so that text is all it sees.
+- **A BUG-typed ticket's prompt tells the session to verify the bug is still real FIRST** (XERK-370,
+  `_ticket_is_bug` + `TICKET_BUG_VERIFY_DIRECTIVE`): reproduce it against the up-to-date default
+  branch before changing anything, and STOP (report + evidence, no code change, no PR) if it's
+  already fixed/unreproducible — the prompt is a spawn-time snapshot and the bug may be stale. `type`
+  is the tracker's own issue-type name (Jira `issuetype` / Azure `System.WorkItemType`), matched
+  loosely on `bug`/`defect`. The directive sits just ahead of the generic "start by..." close so it
+  reads as step one. Tests: the bug cases in `TestBuildTicketPrompt`.
 - **A ticket's own attachments come with it** (XERK-242): downloaded into the uploads tree on
   XERK-234's terms, paths named in the prompt (`ticket_detail=`, not `prompt=`). Tests:
   `TestStoreTicketAttachments`.
