@@ -808,10 +808,23 @@ those are marked `[MODEL]`.
 
 ### Nav / Login
 - P3 Optional header descriptor/meta slot (e.g. Sessions running/waiting counts).
-- **OIDC/SSO is browser-only** (the `/auth/oidc/*` redirect + passkey flow), so `login.html`'s
-  SSO-outcome messages — `?error=forbidden` (signed in but not in an access group, XERK-594) and
-  `?error=oidc` (flow failed) — have **no Android analogue**: `LoginScreen.kt` is the Hub-URL + local
-  credential (Basic-auth) path and never initiates the OIDC browser flow. Group-based access
-  (XERK-594) is enforced hub-side in the OIDC callback and gates only the session that flow issues;
-  the local credential Android uses is the IdP-independent break-glass path, deliberately not
-  group-gated. Justified platform difference, no Android change.
+- **Native Authentik SSO is IMPLEMENTED on Android (XERK-591).** `LoginScreen.kt` shows a "Sign in
+  with SSO" button beside the Hub-URL + break-glass credential fields. It opens the hub's existing
+  `/auth/oidc/login` in a **Chrome Custom Tab** (system browser, so passkeys/WebAuthn work — a plain
+  WebView breaks them) with a PKCE `mobile` challenge; the hub deep-links a single-use code back to
+  `turma://oidc-callback`, which the app redeems (with its verifier) at `/api/oidc/mobile/exchange`
+  for the SAME opaque `hub_session` token the web cookie carries. Thereafter requests authenticate as
+  `Cookie: hub_session=<token>` (`HubClient`), NOT Basic. `core/Oidc.kt` (PKCE + deep-link parse) +
+  `net/OidcController.kt` (probe/exchange) + `Config` (session token, pending verifier). The `turma://`
+  redirect is hub↔app only — never sent to the IdP — so it needs no Authentik change.
+  - **The SSO-outcome messages have Android analogues now**: `?error=forbidden` (signed in but not in
+    an access group, XERK-594) and a failed exchange surface on the login screen via
+    `OidcController.ui.error`, worded from `login.html`'s `OIDC_ERRORS`.
+  - **Group-based access (XERK-594) stays hub-side** in the OIDC callback and gates only the session
+    that flow issues. The break-glass username/password path is unchanged and deliberately not
+    group-gated (the IdP-independent local credential).
+  - **OIDC sessions are the hub's shorter `OIDC_SESSION_TTL_MS`** (default 8h): a 401 on an SSO token
+    drops it (`HubClient` → `Config.clearSession`), and `TurmaApp` returns to the login screen to
+    re-authenticate. A break-glass password login keeps the 30-day session.
+  - Tests: `core/OidcTest` (PKCE golden vector, deep-link parse), `net/OidcControllerTest` (probe /
+    exchange / cookie auth / forbidden / 401-drop over MockWebServer).

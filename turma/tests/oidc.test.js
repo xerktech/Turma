@@ -523,3 +523,97 @@ test("XERK-593: an agent WebSocket with NO token is refused at the socket, never
     "an unauthenticated tunnel is dropped, not redirected"
   );
 });
+
+// ---- XERK-591: native-app SSO handoff (Custom Tab + PKCE deep link) ----------
+//
+// A mobile app can't run a browser-cookie redirect flow. It starts the SAME
+// hub OIDC flow with a PKCE `mobile` challenge; on success the callback hands
+// the session token back over the app deep link as a single-use code the app
+// redeems (with its verifier) at /api/oidc/mobile/exchange. The `turma://`
+// redirect is hub<->app only and never reaches the IdP.
+
+test("XERK-591: GET /api/oidc/config reports OIDC enabled, WITHOUT a hub login", async () => {
+  const res = await req("GET", "/api/oidc/config");
+  assert.equal(res.status, 200);
+  assert.deepEqual(JSON.parse(res.raw), { enabled: true });
+});
+
+test("XERK-591: a mobile login carries the challenge into the tx", async () => {
+  hub.__setOidcCaches(DISCOVERY, jwksKeys);
+  hub.oidcTx.clear();
+  const challenge = hub.pkceChallenge("app-verifier-abc-1234567890");
+  const res = await get(`/auth/oidc/login?mobile=${encodeURIComponent(challenge)}`);
+  assert.equal(res.status, 302);
+  const state = new URL(res.headers.location).searchParams.get("state");
+  assert.equal(hub.oidcTx.get(state).mobile, challenge);
+});
+
+test("XERK-591: an over-long mobile challenge is dropped (treated as non-mobile)", async () => {
+  hub.__setOidcCaches(DISCOVERY, jwksKeys);
+  hub.oidcTx.clear();
+  const res = await get(`/auth/oidc/login?mobile=${"x".repeat(500)}`);
+  const state = new URL(res.headers.location).searchParams.get("state");
+  assert.equal(hub.oidcTx.get(state).mobile, "");
+});
+
+test("XERK-591: the mobile flow deep-links a code, exchanges it once, and the token authorises", async () => {
+  hub.__setOidcCaches(DISCOVERY, jwksKeys);
+  hub.oidcHandoffs.clear();
+  const state = "mstate-1";
+  const verifier = "mobile-verifier-xyz-1234567890";
+  const challenge = hub.pkceChallenge(verifier);
+  hub.oidcTx.set(state, { nonce: "the-nonce", verifier: "pkce-v", next: "/", mobile: challenge, at: Date.now() });
+
+  const saved = global.fetch;
+  global.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ id_token: signJwt(goodClaims()) }) });
+  try {
+    // The callback deep-links a code, and sets NO hub_session cookie (the Custom
+    // Tab is throwaway; the app redeems the code instead).
+    const cb = await get(`/auth/oidc/callback?state=${state}&code=the-code`, { cookie: `hub_oidc_state=${state}` });
+    assert.equal(cb.status, 302);
+    assert.ok(cb.headers.location.startsWith(hub.OIDC_MOBILE_REDIRECT + "?code="));
+    const setCookie = (cb.headers["set-cookie"] || []).join("\n");
+    assert.doesNotMatch(setCookie, /hub_session=[^;]/, "no session cookie on the mobile path");
+    const code = new URL(cb.headers.location).searchParams.get("code");
+    assert.ok(hub.oidcHandoffs.has(code));
+
+    // Redeem the code with the verifier -> the token + its ttl.
+    const ex = await req("POST", "/api/oidc/mobile/exchange", { body: { code, verifier } });
+    assert.equal(ex.status, 200);
+    const { token, ttlMs } = JSON.parse(ex.raw);
+    assert.ok(token);
+    assert.equal(ttlMs, hub.OIDC_SESSION_TTL_MS);
+
+    // That token authorises an API call as `Cookie: hub_session=<token>`.
+    const authed = await req("GET", "/api/agents", { headers: { cookie: `hub_session=${token}` } });
+    assert.equal(authed.status, 200);
+
+    // Single use: the code is gone, a second exchange is refused.
+    const again = await req("POST", "/api/oidc/mobile/exchange", { body: { code, verifier } });
+    assert.equal(again.status, 400);
+  } finally {
+    global.fetch = saved;
+  }
+});
+
+test("XERK-591: a hijacked code with the WRONG verifier is refused AND burned", async () => {
+  hub.oidcHandoffs.clear();
+  hub.oidcPutHandoff("code-1", { token: "sekret-token", challenge: hub.pkceChallenge("real-verifier-123456"), at: Date.now() });
+  // Another app that intercepted the deep link has the code but not the verifier.
+  const bad = await req("POST", "/api/oidc/mobile/exchange", { body: { code: "code-1", verifier: "guessed-wrong" } });
+  assert.equal(bad.status, 400);
+  // The wrong guess burned the code — the real app now can't redeem it either
+  // (no oracle to brute-force the verifier against).
+  assert.equal(hub.oidcHandoffs.has("code-1"), false);
+  const real = await req("POST", "/api/oidc/mobile/exchange", { body: { code: "code-1", verifier: "real-verifier-123456" } });
+  assert.equal(real.status, 400);
+});
+
+test("XERK-591: a mobile flow reports an IdP error over the deep link, not the /login page", async () => {
+  hub.__setOidcCaches(DISCOVERY, jwksKeys);
+  const state = "mstate-err";
+  hub.oidcTx.set(state, { nonce: "n", verifier: "v", next: "/", mobile: hub.pkceChallenge("verf-123456"), at: Date.now() });
+  const res = await get(`/auth/oidc/callback?state=${state}&error=access_denied`, { cookie: `hub_oidc_state=${state}` });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.location.startsWith(hub.OIDC_MOBILE_REDIRECT + "?error=oidc"));
+});

@@ -342,6 +342,20 @@ private fun TerminalInputBar(
 /** POST /api/login and copy the Set-Cookie into the WebView CookieManager. */
 private fun plantCookie(container: com.xerktech.turma.AppContainer, baseUrl: String): Boolean {
     val s = container.config.current
+    // An SSO session (XERK-591) has no password to POST — plant the stored
+    // hub_session token straight into the WebView so ttyd's subresources + its
+    // WebSocket authenticate the same way an API call does.
+    if (s.sessionToken.isNotBlank()) {
+        return try {
+            val cm = CookieManager.getInstance()
+            cm.setAcceptCookie(true)
+            cm.setCookie(baseUrl, "hub_session=${s.sessionToken}; Path=/")
+            cm.flush()
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
     return try {
         val body = "{\"username\":${jsonStr(s.user)},\"password\":${jsonStr(s.password)}}"
             .toRequestBody("application/json".toMediaType())
