@@ -688,6 +688,51 @@ const SESSION_KEY =
   process.env.TURMA_SESSION_SECRET ||
   crypto.createHash("sha256").update(`${TURMA_USER}\n${TURMA_PASSWORD}`).digest("hex");
 
+// ---- OIDC relying-party (XERK-592, foundation for the XERK-591 epic) --------
+// Optional native OIDC login: when the four env vars below are all set, the hub
+// becomes an OIDC relying-party against Authentik (or any compliant issuer).
+// A browser can sign in through the Authorization Code + PKCE flow, the ID
+// token is validated (RS256, via the issuer's JWKS), and the SAME `hub_session`
+// cookie the password login issues is handed back — so OIDC slots in behind the
+// existing auth gate with no change to how authorization is decided. Unset =
+// disabled, and the password login is untouched.
+//
+// This ticket is the RP CORE only. Gating the human-facing routes while leaving
+// the agent WebSocket transport on token auth, group-claim RBAC, and the local
+// break-glass login are separate tasks in the epic and are NOT wired here — the
+// flow issues an ordinary session, exactly as `POST /api/login` does.
+//
+// `TURMA_OIDC_ISSUER` is the Authentik issuer, e.g.
+// https://auth.xerktech.com/application/o/turma/ . We keep the raw value (its
+// trailing slash is part of the `iss` claim Authentik mints) AND a slash-
+// stripped copy used only to BUILD the discovery URL.
+const OIDC_ISSUER_RAW = (process.env.TURMA_OIDC_ISSUER || "").trim();
+const OIDC_ISSUER = OIDC_ISSUER_RAW.replace(/\/+$/, "");
+const OIDC_CLIENT_ID = process.env.TURMA_OIDC_CLIENT_ID || "";
+const OIDC_CLIENT_SECRET = process.env.TURMA_OIDC_CLIENT_SECRET || "";
+const OIDC_REDIRECT_URI = (process.env.TURMA_OIDC_REDIRECT_URI || "").trim();
+// `groups` is requested so the follow-on RBAC task (XERK-582 claim) has it; the
+// core neither reads nor enforces it. Overridable, but must keep `openid`.
+const OIDC_SCOPES = (process.env.TURMA_OIDC_SCOPES || "openid profile email groups").trim();
+// Where the IdP sends the browser after RP-initiated logout. Defaults to the
+// hub's own /login (derived from the redirect URI's origin) so a logout lands
+// back on the sign-in page rather than on Authentik.
+const OIDC_POST_LOGOUT_REDIRECT_URI = (process.env.TURMA_OIDC_POST_LOGOUT_REDIRECT_URI || "").trim();
+const OIDC_HTTP_TIMEOUT_MS = Math.max(1000, parseInt(process.env.TURMA_OIDC_TIMEOUT_MS, 10) || 10000);
+const OIDC_ENABLED = !!(OIDC_ISSUER && OIDC_CLIENT_ID && OIDC_CLIENT_SECRET && OIDC_REDIRECT_URI);
+// A second, small cookie naming a server-side record that holds this browser's
+// last ID token, used only as the `id_token_hint` on RP-initiated logout so the
+// IdP ends the right session without a confirmation prompt. Kept off the session
+// cookie so an ID token with a large `groups` claim never has to fit in a cookie.
+const OIDC_SID_COOKIE = "hub_oidc";
+// Binds a pending auth transaction to the BROWSER that started it (login-CSRF
+// defence): login sets this to the `state`, the callback requires the cookie to
+// match the `state` it was handed back. Without it, an attacker who completes
+// their OWN IdP auth could deliver their `code`+`state` to a victim and plant a
+// session in the victim's browser — harmless while the session is the generic
+// single-user one, but a real hole once the epic adds identity-based authz.
+const OIDC_STATE_COOKIE = "hub_oidc_state";
+
 // Injected on every proxied ttyd request so ttyd's own basic-auth
 // (-c term:$TURMA_TOKEN, loopback-bound in the container) is satisfied without
 // the browser ever seeing the credentials. The terminal shares the agent
@@ -7194,15 +7239,26 @@ function cookies(req) {
 // blocked AND is never shared with any other embedder — it doesn't broaden
 // the hub's cross-site exposure the way a bare SameSite=None would. Plain
 // HTTP (LAN/dev) can't use SameSite=None (it requires Secure), so it stays Lax.
-function sessionSetCookie(req, token) {
-  const https =
+function reqIsHttps(req) {
+  return (
     (req.headers["x-forwarded-proto"] || "").split(",")[0].trim() === "https" ||
-    !!(req.socket && req.socket.encrypted);
-  const maxAge = token ? Math.floor(SESSION_TTL_MS / 1000) : 0;
-  const base = `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; Max-Age=${maxAge}`;
-  return https
+    !!(req.socket && req.socket.encrypted)
+  );
+}
+
+// A HttpOnly cookie with the same cross-site flags the session cookie uses (see
+// the block comment above). `maxAgeSec` 0 clears it. Factored out so the OIDC
+// logout-hint cookie (XERK-592) carries identical flags without duplicating the
+// HTTPS/SameSite logic.
+function authCookie(req, name, value, maxAgeSec) {
+  const base = `${name}=${value}; Path=/; HttpOnly; Max-Age=${maxAgeSec}`;
+  return reqIsHttps(req)
     ? `${base}; SameSite=None; Secure; Partitioned`
     : `${base}; SameSite=Lax`;
+}
+
+function sessionSetCookie(req, token) {
+  return authCookie(req, SESSION_COOKIE, token, token ? Math.floor(SESSION_TTL_MS / 1000) : 0);
 }
 
 // Browser/user auth (UI + all API except the heartbeat). A valid login cookie
@@ -7217,6 +7273,242 @@ function userAuthorized(req) {
   const sep = decoded.indexOf(":");
   if (sep < 0) return false;
   return credentialsMatch(decoded.slice(0, sep), decoded.slice(sep + 1));
+}
+
+// ---- OIDC relying-party core (XERK-592) -------------------------------------
+// Everything below is inert unless OIDC_ENABLED. Stdlib only — Node 24's global
+// fetch for the three outbound calls (discovery, JWKS, token exchange) and
+// `crypto` for PKCE, the RS256 signature check, and the state/nonce nonces.
+
+// Pending authorization transactions: state -> {nonce, verifier, next, at}. A
+// login mints one; its callback consumes it (single use). In-memory by design —
+// the hub is single-instance, and a login interrupted by a restart just retries.
+const oidcTx = new Map();
+const OIDC_TX_TTL_MS = 10 * 60 * 1000; // an auth round trip is minutes, not hours
+const OIDC_TX_MAX = 2000; // bound the map so a flood of /login hits can't grow it unboundedly
+
+// Established browser sessions, keyed by the random sid in the OIDC_SID cookie:
+// sid -> {idToken, sub, at}. Holds only the last ID token, used as the
+// `id_token_hint` on RP-initiated logout so the IdP ends the right session
+// without a confirmation prompt. Also in-memory; losing it on restart only
+// means a logout falls back to a hintless end-session (still logs out).
+const oidcSessions = new Map();
+const OIDC_SESSIONS_MAX = 5000;
+
+// Discovery + JWKS caches. The discovery doc and signing keys change rarely, so
+// cache them; an ID token whose `kid` misses the cache forces one JWKS refetch
+// (key rotation) before the token is rejected.
+let oidcDiscoveryCache = null; // {at, doc}
+let oidcJwksCache = null; // {at, keys: Map(kid -> KeyObject)}
+const OIDC_CACHE_TTL_MS = 60 * 60 * 1000;
+
+function oidcSweep(now = Date.now()) {
+  for (const [k, v] of oidcTx) if (now - v.at > OIDC_TX_TTL_MS) oidcTx.delete(k);
+  for (const [k, v] of oidcSessions) if (now - v.at > SESSION_TTL_MS) oidcSessions.delete(k);
+}
+
+// Store a pending transaction, sweeping expired ones and dropping the oldest if
+// the map is somehow at its ceiling (a Map preserves insertion order).
+function oidcPutTx(state, rec) {
+  oidcSweep();
+  while (oidcTx.size >= OIDC_TX_MAX) {
+    const oldest = oidcTx.keys().next().value;
+    if (oldest === undefined) break;
+    oidcTx.delete(oldest);
+  }
+  oidcTx.set(state, rec);
+}
+
+function oidcPutSession(sid, rec) {
+  while (oidcSessions.size >= OIDC_SESSIONS_MAX) {
+    const oldest = oidcSessions.keys().next().value;
+    if (oldest === undefined) break;
+    oidcSessions.delete(oldest);
+  }
+  oidcSessions.set(sid, rec);
+}
+
+// PKCE (RFC 7636): the challenge is base64url(SHA-256(verifier)).
+function pkceChallenge(verifier) {
+  return crypto.createHash("sha256").update(verifier).digest("base64url");
+}
+
+// base64url decode helpers for the compact JWT segments.
+function b64urlBuf(s) {
+  return Buffer.from(String(s), "base64url");
+}
+function b64urlJson(s) {
+  return JSON.parse(b64urlBuf(s).toString("utf8"));
+}
+
+// A JSON GET/POST with a hard timeout, so a hung IdP can never wedge a request.
+async function oidcHttpJson(url, opts = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), OIDC_HTTP_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { ...opts, signal: ctrl.signal, redirect: "error" });
+    const text = await res.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : {}; } catch { body = null; }
+    return { ok: res.ok, status: res.status, body };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// OIDC discovery (§4). The configured issuer only LOCATES the metadata; the
+// document's own `issuer` is authoritative for the `iss` claim, so we return the
+// whole doc and validate tokens against `doc.issuer` verbatim. We still sanity-
+// check that it matches the configured issuer (slash-normalized) to catch a
+// grossly wrong URL.
+async function oidcDiscovery() {
+  const now = Date.now();
+  if (oidcDiscoveryCache && now - oidcDiscoveryCache.at < OIDC_CACHE_TTL_MS) {
+    return oidcDiscoveryCache.doc;
+  }
+  const url = `${OIDC_ISSUER}/.well-known/openid-configuration`;
+  const { ok, status, body } = await oidcHttpJson(url, { headers: { Accept: "application/json" } });
+  if (!ok || !body || typeof body.issuer !== "string") {
+    throw new Error(`OIDC discovery failed (HTTP ${status})`);
+  }
+  if (body.issuer.replace(/\/+$/, "") !== OIDC_ISSUER) {
+    throw new Error("OIDC discovery issuer does not match the configured issuer");
+  }
+  for (const k of ["authorization_endpoint", "token_endpoint", "jwks_uri"]) {
+    if (typeof body[k] !== "string") throw new Error(`OIDC discovery missing ${k}`);
+  }
+  oidcDiscoveryCache = { at: now, doc: body };
+  return body;
+}
+
+// Fetch + parse the issuer's JWKS into a kid -> public-key map. Only RS256/RSA
+// keys are kept — this RP validates RS256 exclusively (the ticket's contract).
+async function oidcJwks(disco, forceRefresh) {
+  const now = Date.now();
+  if (!forceRefresh && oidcJwksCache && now - oidcJwksCache.at < OIDC_CACHE_TTL_MS) {
+    return oidcJwksCache.keys;
+  }
+  const { ok, status, body } = await oidcHttpJson(disco.jwks_uri, {
+    headers: { Accept: "application/json" },
+  });
+  if (!ok || !body || !Array.isArray(body.keys)) {
+    throw new Error(`OIDC JWKS fetch failed (HTTP ${status})`);
+  }
+  const keys = new Map();
+  for (const jwk of body.keys) {
+    if (!jwk || jwk.kty !== "RSA") continue;
+    if (jwk.alg && jwk.alg !== "RS256") continue;
+    if (jwk.use && jwk.use !== "sig") continue;
+    try {
+      keys.set(jwk.kid || "", crypto.createPublicKey({ key: jwk, format: "jwk" }));
+    } catch {
+      // A malformed key is skipped, not fatal — the others may still verify.
+    }
+  }
+  oidcJwksCache = { at: now, keys };
+  return keys;
+}
+
+// Verify an ID token's RS256 signature against a kid->key map. Returns the
+// decoded claims or throws. Split from claim validation so both halves are
+// unit-testable offline with a locally-minted key (no network). Rejecting a
+// non-RS256 `alg` here is what closes the `alg:"none"` / algorithm-confusion
+// attacks — we never trust the token's own algorithm choice beyond RS256.
+function oidcVerifySignature(idToken, keys) {
+  const parts = String(idToken).split(".");
+  if (parts.length !== 3) throw new Error("malformed ID token");
+  const [h, p, s] = parts;
+  let header;
+  try { header = b64urlJson(h); } catch { throw new Error("unreadable ID token header"); }
+  if (header.alg !== "RS256") throw new Error(`unsupported ID token alg ${header.alg}`);
+  // A token that names a `kid` MUST match a JWKS entry exactly — a miss triggers
+  // one refetch (rotation) then rejection, never a silent fall-through to some
+  // other key. Only a keyless token falls back to the sole key, and only when
+  // there is exactly one (no ambiguity).
+  let key;
+  if (header.kid) key = keys.get(header.kid);
+  else if (keys.size === 1) key = keys.values().next().value;
+  if (!key) throw new Error("no JWKS key matches the ID token kid");
+  const ok = crypto.verify("RSA-SHA256", Buffer.from(`${h}.${p}`), key, b64urlBuf(s));
+  if (!ok) throw new Error("ID token signature is invalid");
+  try { return b64urlJson(p); } catch { throw new Error("unreadable ID token payload"); }
+}
+
+// Validate the standard claims (OIDC §3.1.3.7). `expected` = {iss, aud, nonce}.
+// A 2-minute clock skew is allowed on exp/iat.
+function oidcValidateClaims(claims, expected, now = Math.floor(Date.now() / 1000)) {
+  const SKEW = 120;
+  if (!claims || typeof claims !== "object") throw new Error("ID token has no claims");
+  if (claims.iss !== expected.iss) throw new Error("ID token iss mismatch");
+  const auds = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (!auds.includes(expected.aud)) throw new Error("ID token aud mismatch");
+  // With multiple audiences, azp MUST be present and equal our client_id; with
+  // one, an azp (if present) must still be us.
+  if (auds.length > 1 && claims.azp !== expected.aud) throw new Error("ID token azp mismatch");
+  if (claims.azp && claims.azp !== expected.aud) throw new Error("ID token azp mismatch");
+  if (typeof claims.exp !== "number" || claims.exp + SKEW < now) throw new Error("ID token expired");
+  if (typeof claims.iat === "number" && claims.iat - SKEW > now) throw new Error("ID token iat is in the future");
+  if (expected.nonce && claims.nonce !== expected.nonce) throw new Error("ID token nonce mismatch");
+  return claims;
+}
+
+// Full ID-token verification: discovery + JWKS (refetched once on a kid miss to
+// ride key rotation) + signature + claims.
+async function oidcVerifyIdToken(idToken, expected) {
+  const disco = await oidcDiscovery();
+  let keys = await oidcJwks(disco, false);
+  let claims;
+  try {
+    claims = oidcVerifySignature(idToken, keys);
+  } catch (e) {
+    if (!/no JWKS key matches/.test(e.message)) throw e;
+    keys = await oidcJwks(disco, true); // key may have rotated in
+    claims = oidcVerifySignature(idToken, keys);
+  }
+  return oidcValidateClaims(claims, expected);
+}
+
+// Exchange the authorization code for tokens (confidential client, PKCE). We
+// authenticate with client_secret_basic — Authentik's default for a confidential
+// provider — so the secret rides the Authorization header, never the body.
+async function oidcExchangeCode(disco, code, verifier) {
+  const form = new URLSearchParams({
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: OIDC_REDIRECT_URI,
+    code_verifier: verifier,
+  });
+  const basic = Buffer.from(
+    `${encodeURIComponent(OIDC_CLIENT_ID)}:${encodeURIComponent(OIDC_CLIENT_SECRET)}`
+  ).toString("base64");
+  const { ok, status, body } = await oidcHttpJson(disco.token_endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization: `Basic ${basic}`,
+      Accept: "application/json",
+    },
+    body: form.toString(),
+  });
+  if (!ok || !body || typeof body.id_token !== "string") {
+    throw new Error(`OIDC token exchange failed (HTTP ${status})`);
+  }
+  return body;
+}
+
+// Only local, same-origin paths are allowed as the post-login `next`, so the
+// login flow can never be turned into an open redirect. Anything else → "/".
+function oidcSafeNext(next) {
+  if (typeof next !== "string" || !next.startsWith("/") || next.startsWith("//") || next.startsWith("/\\")) {
+    return "/";
+  }
+  return next;
+}
+
+// The origin the hub is reached at, derived from the redirect URI, for building
+// the default post-logout redirect.
+function oidcOrigin() {
+  try { return new URL(OIDC_REDIRECT_URI).origin; } catch { return ""; }
 }
 
 // Did this request carry a VALID agent credential, whatever host it is for?
@@ -10744,7 +11036,11 @@ const server = http.createServer(async (req, res) => {
       url.pathname === "/login" ||
       url.pathname === "/login.html" ||
       url.pathname === "/api/login" ||
-      url.pathname === "/api/logout";
+      url.pathname === "/api/logout" ||
+      // OIDC login/callback/logout (XERK-592) need no existing session — a
+      // browser starting the flow has none, and the callback lands with the
+      // IdP's code before one exists. They authenticate themselves.
+      url.pathname.startsWith("/auth/oidc/");
 
     // The archive-ingest endpoint is agent-pushed (bearer token), like the
     // heartbeat — it must not require the user login the rest of /api/* does.
@@ -10874,6 +11170,129 @@ const server = http.createServer(async (req, res) => {
         "Set-Cookie": sessionSetCookie(req, ""),
       });
       return res.end(JSON.stringify({ ok: true }));
+    }
+
+    // ---- OIDC relying-party routes (XERK-592) --------------------------------
+    // Begin the Authorization Code + PKCE flow: mint a transaction and redirect
+    // the browser to the IdP's authorization endpoint.
+    if (req.method === "GET" && url.pathname === "/auth/oidc/login") {
+      if (!OIDC_ENABLED) return json(res, 404, { error: "OIDC is not configured" });
+      try {
+        const disco = await oidcDiscovery();
+        const state = crypto.randomBytes(32).toString("base64url");
+        const nonce = crypto.randomBytes(32).toString("base64url");
+        const verifier = crypto.randomBytes(32).toString("base64url");
+        const next = oidcSafeNext(url.searchParams.get("next"));
+        oidcPutTx(state, { nonce, verifier, next, at: Date.now() });
+        const auth = new URL(disco.authorization_endpoint);
+        auth.searchParams.set("response_type", "code");
+        auth.searchParams.set("client_id", OIDC_CLIENT_ID);
+        auth.searchParams.set("redirect_uri", OIDC_REDIRECT_URI);
+        auth.searchParams.set("scope", OIDC_SCOPES);
+        auth.searchParams.set("state", state);
+        auth.searchParams.set("nonce", nonce);
+        auth.searchParams.set("code_challenge", pkceChallenge(verifier));
+        auth.searchParams.set("code_challenge_method", "S256");
+        res.writeHead(302, {
+          Location: auth.toString(),
+          "Cache-Control": "no-store",
+          // Bind this flow to the browser: the callback requires this cookie to
+          // equal the returned `state` (login-CSRF defence).
+          "Set-Cookie": authCookie(req, OIDC_STATE_COOKIE, state, Math.floor(OIDC_TX_TTL_MS / 1000)),
+        });
+        return res.end();
+      } catch (e) {
+        console.log(`OIDC login failed: ${e.message}`);
+        return json(res, 502, { error: "OIDC login is unavailable" });
+      }
+    }
+
+    // The IdP redirects the browser back here with `code` + `state`. Exchange
+    // the code (PKCE), validate the ID token, and issue the hub session.
+    if (req.method === "GET" && url.pathname === "/auth/oidc/callback") {
+      if (!OIDC_ENABLED) return json(res, 404, { error: "OIDC is not configured" });
+      const idpError = url.searchParams.get("error");
+      if (idpError) {
+        console.log(`OIDC callback error from IdP: ${logName(idpError)}`);
+        res.writeHead(302, { Location: "/login?error=oidc", "Cache-Control": "no-store" });
+        return res.end();
+      }
+      const state = url.searchParams.get("state") || "";
+      const code = url.searchParams.get("code") || "";
+      const stateCookie = cookies(req)[OIDC_STATE_COOKIE] || "";
+      const tx = state ? oidcTx.get(state) : null;
+      if (tx) oidcTx.delete(state); // single use, whatever happens next
+      const clearState = authCookie(req, OIDC_STATE_COOKIE, "", 0);
+      // Reject unless the transaction is live AND the browser presented the same
+      // `state` in its bound cookie as came back in the query (login-CSRF).
+      if (!state || !code || !tx || Date.now() - tx.at > OIDC_TX_TTL_MS || stateCookie !== state) {
+        res.writeHead(400, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "Set-Cookie": clearState,
+        });
+        return res.end(JSON.stringify({ error: "invalid or expired OIDC state" }));
+      }
+      try {
+        const disco = await oidcDiscovery();
+        const tokens = await oidcExchangeCode(disco, code, tx.verifier);
+        const claims = await oidcVerifyIdToken(tokens.id_token, {
+          iss: disco.issuer,
+          aud: OIDC_CLIENT_ID,
+          nonce: tx.nonce,
+        });
+        const sid = crypto.randomBytes(32).toString("base64url");
+        oidcPutSession(sid, { idToken: tokens.id_token, sub: claims.sub, at: Date.now() });
+        res.writeHead(302, {
+          Location: oidcSafeNext(tx.next),
+          "Cache-Control": "no-store",
+          "Set-Cookie": [
+            sessionSetCookie(req, issueSessionToken()),
+            authCookie(req, OIDC_SID_COOKIE, sid, Math.floor(SESSION_TTL_MS / 1000)),
+            clearState,
+          ],
+        });
+        return res.end();
+      } catch (e) {
+        console.log(`OIDC callback failed: ${e.message}`);
+        res.writeHead(502, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "Set-Cookie": clearState,
+        });
+        return res.end(JSON.stringify({ error: "OIDC sign-in failed" }));
+      }
+    }
+
+    // RP-initiated logout: drop the local session, then bounce to the IdP's
+    // end-session endpoint (with an id_token_hint when we still hold one) so the
+    // IdP session is ended too. Falls back to /login if OIDC isn't configured or
+    // the issuer advertises no end-session endpoint.
+    if (url.pathname === "/auth/oidc/logout") {
+      const sid = cookies(req)[OIDC_SID_COOKIE];
+      const rec = sid ? oidcSessions.get(sid) : null;
+      if (sid) oidcSessions.delete(sid);
+      const clear = [sessionSetCookie(req, ""), authCookie(req, OIDC_SID_COOKIE, "", 0)];
+      const fallback = () => {
+        res.writeHead(302, { Location: "/login", "Cache-Control": "no-store", "Set-Cookie": clear });
+        return res.end();
+      };
+      if (!OIDC_ENABLED) return fallback();
+      try {
+        const disco = await oidcDiscovery();
+        if (typeof disco.end_session_endpoint !== "string") return fallback();
+        const out = new URL(disco.end_session_endpoint);
+        if (rec && rec.idToken) out.searchParams.set("id_token_hint", rec.idToken);
+        out.searchParams.set("client_id", OIDC_CLIENT_ID);
+        const origin = oidcOrigin();
+        const postLogout = OIDC_POST_LOGOUT_REDIRECT_URI || (origin ? `${origin}/login` : "");
+        if (postLogout) out.searchParams.set("post_logout_redirect_uri", postLogout);
+        res.writeHead(302, { Location: out.toString(), "Cache-Control": "no-store", "Set-Cookie": clear });
+        return res.end();
+      } catch (e) {
+        console.log(`OIDC logout failed: ${e.message}`);
+        return fallback();
+      }
     }
 
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
@@ -14198,6 +14617,24 @@ if (process.env.TURMA_TEST) {
     credentialsMatch,
     issueSessionToken,
     sessionTokenValid,
+    // OIDC relying-party core (XERK-592). The pure pieces are exported so the
+    // security-critical validation is unit-tested offline with a locally-minted
+    // RSA key; the caches + tx map are exported so a route test can seed
+    // discovery/JWKS without a live IdP.
+    OIDC_ENABLED,
+    pkceChallenge,
+    oidcVerifySignature,
+    oidcValidateClaims,
+    oidcVerifyIdToken,
+    oidcSafeNext,
+    oidcOrigin,
+    oidcTx,
+    oidcSessions,
+    authCookie,
+    __setOidcCaches(discovery, jwks) {
+      oidcDiscoveryCache = discovery ? { at: Date.now(), doc: discovery } : null;
+      oidcJwksCache = jwks ? { at: Date.now(), keys: jwks } : null;
+    },
     fmtDur,
     TERM_OSC52_JS,
     TERM_SCROLL_BOTTOM_JS,
@@ -14470,5 +14907,18 @@ if (process.env.TURMA_TEST) {
     console.log(
       WHISPER_URL ? `whisper STT -> ${WHISPER_URL}` : "whisper STT disabled (LITELLM_URL/WHISPER_URL not set)"
     );
+    // OIDC login (XERK-592) — say whether it is on, and against which issuer, so
+    // a misconfigured (partially-set) env is visible at boot rather than as a
+    // 404 on /auth/oidc/login.
+    if (OIDC_ENABLED) {
+      console.log(`OIDC login enabled -> issuer ${OIDC_ISSUER}, client ${OIDC_CLIENT_ID}`);
+    } else if (OIDC_ISSUER || OIDC_CLIENT_ID || OIDC_CLIENT_SECRET || OIDC_REDIRECT_URI) {
+      console.warn(
+        "WARNING: OIDC login is partially configured and therefore DISABLED — need all of " +
+          "TURMA_OIDC_ISSUER, TURMA_OIDC_CLIENT_ID, TURMA_OIDC_CLIENT_SECRET, TURMA_OIDC_REDIRECT_URI"
+      );
+    } else {
+      console.log("OIDC login disabled (TURMA_OIDC_* not set)");
+    }
   });
 }
