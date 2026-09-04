@@ -2346,6 +2346,32 @@ test("XERK-595: the login form is reachable with no session and carries the brea
   assert.ok(bg.raw.includes('breakglass'), "serves the breakglass entry handling");
 });
 
+// ---- XERK-593: with OIDC OFF, the human gate is unchanged -------------------
+// The agent-exclusion + IdP-bounce behaviour with OIDC ENABLED is in
+// oidc.test.js (OIDC env is read at require time, so it needs its own process).
+// This file's module has no OIDC wired, so it pins the OFF branch: the human
+// gate still routes to the LOCAL login form and never to /auth/oidc/*.
+
+test("XERK-593: humanLoginRedirect targets the local form when OIDC is off", () => {
+  assert.equal(hub.OIDC_ENABLED, false);
+  assert.equal(hub.humanLoginRedirect("/"), "/login");
+  assert.equal(hub.humanLoginRedirect(""), "/login");
+  assert.equal(hub.humanLoginRedirect("/board"), "/login?next=%2Fboard");
+});
+
+test("XERK-593: an unauthenticated browser page redirects to the local form (OIDC off)", async () => {
+  const res = await request("GET", "/board", { headers: { accept: "text/html" } });
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.location, "/login?next=%2Fboard");
+  assert.ok(!/oidc/.test(res.headers.location), "never bounced to the IdP when OIDC is off");
+});
+
+test("XERK-593: a bare /login serves the local form (OIDC off), not a bounce", async () => {
+  const res = await request("GET", "/login");
+  assert.equal(res.status, 200);
+  assert.ok(res.raw.includes("Sign in"), "renders the local login form");
+});
+
 // ---- XERK-235: defects a full QA pass found ---------------------------------
 
 test("http: a fat heartbeat gets a 413 it can act on, not a dropped socket", async () => {
