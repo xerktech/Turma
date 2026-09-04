@@ -7427,6 +7427,25 @@ async function oidcHttpJson(url, opts = {}) {
   }
 }
 
+// An OAuth2/OIDC error response carries a machine `error` code (RFC 6749 §5.2 —
+// e.g. `invalid_client`, `invalid_grant`) plus a human `error_description`. The
+// endpoint helpers below used to discard the body and throw a bare HTTP status,
+// which turned an ordinary misconfig (a rotated client secret the IdP has not
+// reconciled, a redirect_uri mismatch) into an opaque "failed (HTTP 400)" in the
+// hub log and a generic 502 to the user — the real cause reachable only by reading
+// the IdP's own logs. Fold the two standard fields into the message so it names its
+// own cause. Standard fields only (never the whole body); `logName` strips the
+// C0/DEL/C1 control chars (this text is logged) and caps the length.
+function oidcErrorDetail(status, body) {
+  let detail = "";
+  if (body && typeof body === "object") {
+    const code = typeof body.error === "string" ? body.error : "";
+    const desc = typeof body.error_description === "string" ? body.error_description : "";
+    detail = [code, desc].filter(Boolean).join(": ");
+  }
+  return detail ? `HTTP ${status} — ${logName(detail)}` : `HTTP ${status}`;
+}
+
 // OIDC discovery (§4). The configured issuer only LOCATES the metadata; the
 // document's own `issuer` is authoritative for the `iss` claim, so we return the
 // whole doc and validate tokens against `doc.issuer` verbatim. We still sanity-
@@ -7440,7 +7459,7 @@ async function oidcDiscovery() {
   const url = `${OIDC_ISSUER}/.well-known/openid-configuration`;
   const { ok, status, body } = await oidcHttpJson(url, { headers: { Accept: "application/json" } });
   if (!ok || !body || typeof body.issuer !== "string") {
-    throw new Error(`OIDC discovery failed (HTTP ${status})`);
+    throw new Error(`OIDC discovery failed (${oidcErrorDetail(status, body)})`);
   }
   if (body.issuer.replace(/\/+$/, "") !== OIDC_ISSUER) {
     throw new Error("OIDC discovery issuer does not match the configured issuer");
@@ -7463,7 +7482,7 @@ async function oidcJwks(disco, forceRefresh) {
     headers: { Accept: "application/json" },
   });
   if (!ok || !body || !Array.isArray(body.keys)) {
-    throw new Error(`OIDC JWKS fetch failed (HTTP ${status})`);
+    throw new Error(`OIDC JWKS fetch failed (${oidcErrorDetail(status, body)})`);
   }
   const keys = new Map();
   for (const jwk of body.keys) {
@@ -7585,7 +7604,7 @@ async function oidcExchangeCode(disco, code, verifier) {
     body: form.toString(),
   });
   if (!ok || !body || typeof body.id_token !== "string") {
-    throw new Error(`OIDC token exchange failed (HTTP ${status})`);
+    throw new Error(`OIDC token exchange failed (${oidcErrorDetail(status, body)})`);
   }
   return body;
 }
@@ -14812,6 +14831,7 @@ if (process.env.TURMA_TEST) {
     oidcValidateClaims,
     oidcVerifyIdToken,
     oidcSafeNext,
+    oidcErrorDetail,
     oidcOrigin,
     oidcTx,
     oidcSessions,
