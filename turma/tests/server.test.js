@@ -2289,6 +2289,63 @@ test("http: heartbeat auth (bearer or user basic, nothing else)", async () => {
   );
 });
 
+// ---- XERK-595: break-glass local login --------------------------------------
+
+test("XERK-595: breakGlassEnabled reflects whether a local credential is set", () => {
+  // The primary suite runs with TURMA_PASSWORD set, so break-glass exists.
+  assert.equal(hub.breakGlassEnabled(), true);
+  // Unset it and the hub reports no IdP-independent way in (the lockout risk a
+  // mandatory-OIDC change must not create).
+  const open = freshServerModule((env) => { env.TURMA_PASSWORD = ""; env.TURMA_USER = ""; });
+  assert.equal(open.breakGlassEnabled(), false);
+});
+
+test("XERK-595: local login works with the IdP unreachable (no OIDC configured)", async () => {
+  // This module has no OIDC wired at all — the "IdP unreachable/absent" baseline.
+  // A correct local credential still signs in and issues the hub_session cookie.
+  const bad = await request("POST", "/api/login", {
+    body: { username: "hubuser", password: "WRONG" },
+    headers: { "content-type": "application/json" },
+  });
+  assert.equal(bad.status, 401);
+
+  const ok = await request("POST", "/api/login", {
+    body: { username: "hubuser", password: "hubpass" },
+    headers: { "content-type": "application/json" },
+  });
+  assert.equal(ok.status, 200);
+  const setCookie = ok.headers["set-cookie"];
+  assert.ok(setCookie && /hub_session=/.test(setCookie[0]), "issues a hub_session cookie");
+
+  // And that break-glass cookie authorises the browser API, no IdP involved.
+  const cookie = setCookie[0].split(";")[0];
+  const authed = await request("GET", "/api/agents", { headers: { cookie } });
+  assert.equal(authed.status, 200);
+});
+
+test("XERK-595: Basic-auth is the headless break-glass channel", async () => {
+  // The curl/headless way in when the IdP (and a browser flow) is unavailable.
+  assert.equal(
+    (await request("GET", "/api/agents", { headers: { authorization: basic("hubuser", "hubpass") } })).status,
+    200
+  );
+  assert.equal(
+    (await request("GET", "/api/agents", { headers: { authorization: basic("hubuser", "WRONG") } })).status,
+    401
+  );
+});
+
+test("XERK-595: the login form is reachable with no session and carries the break-glass entry", async () => {
+  // /login and /login?breakglass=1 must be reachable unauthenticated (the exempt
+  // seam OIDC extends), and the page must carry the deliberate break-glass entry.
+  const plain = await request("GET", "/login");
+  assert.equal(plain.status, 200);
+  const bg = await request("GET", "/login?breakglass=1");
+  assert.equal(bg.status, 200);
+  assert.ok(bg.raw.includes("Break-glass local login"), "serves the break-glass banner");
+  assert.ok(bg.raw.includes('breakglass'), "serves the breakglass entry handling");
+});
+
 // ---- XERK-235: defects a full QA pass found ---------------------------------
 
 test("http: a fat heartbeat gets a 413 it can act on, not a dropped socket", async () => {
