@@ -1217,7 +1217,15 @@
     return false;
   }
 
-  function repaint() {
+  // `force` bypasses the mid-selection deferral below. It is set ONLY by the
+  // seed paint in open() (XERK-604): the selection-defer exists so a live `turn`
+  // frame can't nuke a reader's copy selection, but a session SWITCH is a
+  // deliberate teardown of the whole view — a stale selection anchored in the
+  // OUTGOING transcript must not hold back the incoming session's first paint.
+  // Without this, the header (setHeader) updated while the chat stayed frozen on
+  // the previous session, and every further switch re-deferred against the same
+  // stale selection until a full page reload cleared it.
+  function repaint(force) {
     const scroll = $("chatScroll");
     if (!scroll) return;
     const pin = stickBottom;
@@ -1251,8 +1259,9 @@
       return;
     }
     // Something DID change, but the reader is mid-selection — hold the paint and
-    // flush it once the selection clears (selectionchange, below).
-    if (selectionInScroll()) {
+    // flush it once the selection clears (selectionchange, below). A forced paint
+    // (a session switch) never holds: see repaint()'s header.
+    if (!force && selectionInScroll()) {
       repaintDeferred = true;
       updateLiveStatus();
       return;
@@ -2753,7 +2762,7 @@
     // Instant paint from the heartbeat's cached (text-only) tail, then upgrade.
     const seed = (s && s.session && s.session.tail) || [];
     if (seed.length) buffer = mergeTail(buffer, seed);
-    repaint();
+    repaint(true);   // force past a stale selection in the outgoing view (XERK-604)
     loadHistory(myGen);
     startWs(myGen);
     startPollFallback(myGen);
