@@ -168,6 +168,23 @@ test("getTranscript reads the canonical file", () => {
   assert.equal(archive.getTranscript("nope"), null);
 });
 
+test("XERK-453: getTranscript serves the row's origin org (siteKey) for the restore cross-org warning", () => {
+  // The restore picker compares the archived row's ORIGIN org against a target's
+  // decided org to warn on a cross-org restore. That comparison needs the origin
+  // org on the served transcript — the hub-decided `siteKey` stored on the row
+  // (7th ingest arg), NOT the agent-claimed one.
+  archive.ingestChunk("orgabox", "xorg1", { ...META }, 0, 40,
+    [ent("u1", "user", "restore me later")], "orga.atlassian.net");
+  const t = archive.getTranscript("xorg1");
+  assert.equal(t.siteKey, "orga.atlassian.net",
+    "the served transcript carries its recorded origin org");
+  // A legacy/org-less row (no siteKey ingested) serves "" — read by the client as
+  // "no org to compare", so the warning never fires on it (never null/undefined,
+  // which the `from && to` guard would also skip, but "" is the honest value).
+  assert.equal(archive.getTranscript("t1").siteKey, "",
+    "an org-less row serves an empty origin org, never null");
+});
+
 test("XERK-422: a transcript that rendered ZERO entries reads back as empty, not a 404", () => {
   // A transcript whose lines are all non-renderable (mode/permission-mode/
   // system/last-prompt records) projects to no entries: the agent read the bytes

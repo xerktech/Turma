@@ -288,5 +288,25 @@ reason the raw layer exists in a form nothing else reads (the rendered entries a
     session can archive back across orgs — see the XERK-344/573 ownership gate above. This is a
     re-point for a later write, not an admission gate: restore itself stays org-agnostic, and
     re-pointing the host is what keeps an org-less restore's turns reachable under the strict gate.
+- **A cross-org restore is ALLOWED BY DESIGN, warned but never refused (XERK-453).** The decision
+  raised by XERK-441's QA (finding D5): a restore writes org A's conversation bytes onto org B's host
+  filesystem, where a different Claude login can read them — crossing the "one Claude login per org"
+  soft boundary (XERK-348). It is left open, deliberately, not by omission:
+  - **Refusing it fails closed for exactly the population the feature serves** — a host whose org
+    binding was reset by `DELETE /api/agents/<host>` is the archetypal restore target, and a hard
+    org gate would refuse it. It would also contradict XERK-573, which re-points a restore's row
+    specifically to keep an org-less restore's turns reachable.
+  - **The operator login is already hub-wide** — the archive is readable by whoever is logged in, so
+    the restore crosses no new READ boundary; what it adds is a WRITE of those bytes onto the other
+    org's disk. That is the operator's call to make, so the picker WARNS (a `⚠ <org>` badge on a
+    cross-org target, a `confirm()` before the POST) and never blocks.
+  - **The warning compares the SERVED `org` (decidedOrgOf) on both sides**, never the client-stripped
+    `orgBound` (the trap this ticket flags, and the reason the two XERK-348/349 client mirrors were
+    reverted): the target's org is the served `org`, the origin's is the archive row's stored
+    `siteKey` (schema v5, hub-decided at archive time), now surfaced on `getTranscript`. A legacy/
+    org-less row (`siteKey` "") or an org-less target reads "no org to compare" and never warns.
+  - Web-only, like the restore control itself (`android/PARITY.md`'s P1 restore gap). Tests: the
+    XERK-453 cross-org cases in `restore.test.js` (served `siteKey`) and `sessions.test.js`
+    (`restoreCrossOrg` + the picker badge).
 - Tests: `restore.test.js` (route + refusals + bundle bytes), `tar.test.js` (format, read back with
   python's `tarfile`), the Restore cases in `sessions.test.js`.
