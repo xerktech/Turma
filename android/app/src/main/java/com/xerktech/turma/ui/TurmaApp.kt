@@ -112,7 +112,13 @@ fun TurmaApp(
     // Route an FCM tap to the exact session once we're signed in.
     LaunchedEffect(pendingDeepLink, settings.configured) {
         val dl = pendingDeepLink ?: return@LaunchedEffect
-        if (settings.configured && !dl.host.isNullOrEmpty() && !dl.sessionId.isNullOrEmpty()) {
+        // Wait for sign-in before consuming: a notification tapped while signed
+        // out must still open its session once the user logs in. Consuming it
+        // here (as this did unconditionally) left nothing to navigate to after
+        // login. settings.configured is an effect key, so this re-runs and
+        // navigates the moment it flips true.
+        if (!settings.configured) return@LaunchedEffect
+        if (!dl.host.isNullOrEmpty() && !dl.sessionId.isNullOrEmpty()) {
             // Root the jumped-to session on the Sessions list rather than stacking
             // it atop whatever chat was open (XERK-66): pop everything above the
             // dashboard root, put a fresh Sessions list under the chat, then open

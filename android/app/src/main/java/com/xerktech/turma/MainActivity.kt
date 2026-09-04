@@ -10,6 +10,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSizeClassApi
 import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
 import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
+import androidx.annotation.VisibleForTesting
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -23,12 +24,26 @@ class MainActivity : ComponentActivity() {
         const val EXTRA_HOST = "host"
         const val EXTRA_SESSION = "sessionId"
         const val EXTRA_URL = "url"
+        // The identity of the deep link we've already navigated for, persisted
+        // across recreation so the sticky launching intent isn't re-fired.
+        private const val KEY_CONSUMED = "deepLinkConsumed"
     }
 
-    private var deepLink by mutableStateOf<DeepLink?>(null)
+    @VisibleForTesting
+    internal var deepLink by mutableStateOf<DeepLink?>(null)
     private var oidcLink by mutableStateOf<OidcLink?>(null)
 
-    data class DeepLink(val host: String?, val sessionId: String?, val url: String?)
+    // The key of the deep link already navigated for (null = none yet). Remembered
+    // across recreation so a config change / process-death restore re-reading the
+    // SAME sticky intent doesn't re-fire it, while a genuinely NEW notification
+    // (a different target) delivered through a cold onCreate still opens.
+    @VisibleForTesting
+    internal var consumedKey: String? = null
+
+    data class DeepLink(val host: String?, val sessionId: String?, val url: String?) {
+        /** Stable identity of the navigation target, for de-duping re-reads. */
+        fun key(): String = "${host.orEmpty()} ${sessionId.orEmpty()} ${url.orEmpty()}"
+    }
 
     /** The native SSO callback (XERK-591): the outcome the hub deep-linked back. */
     data class OidcLink(val code: String?, val error: String?)
@@ -40,7 +55,17 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        deepLink = intent?.toDeepLink()
+        // The launching intent is sticky (getIntent() keeps returning it), so
+        // re-reading it on every recreation — rotation, fold/unfold,
+        // night-mode/font-size change, process-death restore — re-fired the
+        // notification's chat and yanked the user off whatever screen they had
+        // navigated to (XERK-603). Arm a deep link only when it isn't the one we
+        // already navigated for: a recreation re-reads the SAME intent (its key
+        // matches the restored consumedKey → skip), while a fresh launch or a new
+        // notification carries a different (or no) key. A live re-tap arrives
+        // through onNewIntent, handled there.
+        consumedKey = savedInstanceState?.getString(KEY_CONSUMED)
+        intent?.toDeepLink()?.let { if (it.key() != consumedKey) deepLink = it }
         oidcLink = intent?.toOidcLink()
         maybeRequestNotifications()
 
@@ -57,7 +82,12 @@ class MainActivity : ComponentActivity() {
                     container = container,
                     wide = wide,
                     pendingDeepLink = deepLink,
-                    onDeepLinkConsumed = { deepLink = null },
+                    onDeepLinkConsumed = {
+                        // Remember what we navigated for so a later recreation
+                        // reading the same sticky intent doesn't re-fire it.
+                        deepLink?.let { consumedKey = it.key() }
+                        deepLink = null
+                    },
                     pendingOidc = oidcLink,
                     onOidcConsumed = { oidcLink = null },
                 )
@@ -65,8 +95,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(KEY_CONSUMED, consumedKey)
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        // An explicit tap while the task is alive: always navigate, even to a
+        // target already consumed once (the user asked again).
         setIntent(intent)
         deepLink = intent.toDeepLink()
         oidcLink = intent.toOidcLink()
