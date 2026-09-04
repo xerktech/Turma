@@ -733,6 +733,31 @@ const OIDC_SID_COOKIE = "hub_oidc";
 // single-user one, but a real hole once the epic adds identity-based authz.
 const OIDC_STATE_COOKIE = "hub_oidc_state";
 
+// ---- Group-based access (XERK-594, epic XERK-591) ---------------------------
+// The `groups` claim (requested via OIDC_SCOPES above) IS the authorization: an
+// AD group maps to hub access, and removing a user from that group revokes
+// access on the next Authentik sync — re-checked at every OIDC login. Two roles:
+//   k8x-ai     -> ordinary user access
+//   k8x-admins -> admin access (recorded on the session; Turma has no admin-only
+//                 route yet, so it grants the same access as a user for now)
+// Admin membership implies access AND outranks user. Membership in NEITHER group
+// is denied a session entirely. Setting BOTH names to empty opts out of group
+// enforcement (any authenticated OIDC user is admitted as a plain user) — the
+// defaults ARE the real groups, so enforcement is ON by default when OIDC is on.
+// `?? default` leaves an explicit "" untouched, so the opt-out is deliberate.
+const OIDC_USER_GROUP = (process.env.TURMA_OIDC_USER_GROUP ?? "k8x-ai").trim();
+const OIDC_ADMIN_GROUP = (process.env.TURMA_OIDC_ADMIN_GROUP ?? "k8x-admins").trim();
+const OIDC_GROUPS_ENFORCED = !!(OIDC_USER_GROUP || OIDC_ADMIN_GROUP);
+// OIDC-issued browser sessions are shorter-lived than the 30-day password
+// session so a revoked user must re-authenticate — and be re-checked against
+// their CURRENT groups — within a bounded window. This is the app-side half of
+// "loses access on the next sync"; password/break-glass sessions keep
+// SESSION_TTL_MS (the IdP outage path must not force re-login every few hours).
+const OIDC_SESSION_TTL_MS = Math.max(
+  60 * 1000,
+  parseInt(process.env.TURMA_OIDC_SESSION_TTL_MS, 10) || 8 * 3600 * 1000
+);
+
 // Injected on every proxied ttyd request so ttyd's own basic-auth
 // (-c term:$TURMA_TOKEN, loopback-bound in the container) is satisfied without
 // the browser ever seeing the credentials. The terminal shares the agent
@@ -7196,8 +7221,8 @@ function breakGlassEnabled() {
 // ---- Login sessions (signed cookie) -----------------------------------------
 // A session token is "<expiryMs>.<hmac>" — the browser can't forge it and it
 // self-expires. HttpOnly keeps it out of reach of any injected script.
-function issueSessionToken() {
-  const expiry = Date.now() + SESSION_TTL_MS;
+function issueSessionToken(ttlMs = SESSION_TTL_MS) {
+  const expiry = Date.now() + ttlMs;
   const mac = crypto.createHmac("sha256", SESSION_KEY).update(String(expiry)).digest("base64url");
   return `${expiry}.${mac}`;
 }
@@ -7299,8 +7324,12 @@ function authCookie(req, name, value, maxAgeSec) {
     : `${base}; SameSite=Lax`;
 }
 
-function sessionSetCookie(req, token) {
-  return authCookie(req, SESSION_COOKIE, token, token ? Math.floor(SESSION_TTL_MS / 1000) : 0);
+// `ttlMs` sets the cookie's Max-Age to match the token's own HMAC expiry — the
+// OIDC path issues a shorter-lived session (XERK-594) and the browser should
+// stop presenting the cookie when it dies, not linger 30 days. Clearing (empty
+// token) is always Max-Age 0.
+function sessionSetCookie(req, token, ttlMs = SESSION_TTL_MS) {
+  return authCookie(req, SESSION_COOKIE, token, token ? Math.floor(ttlMs / 1000) : 0);
 }
 
 // Browser/user auth (UI + all API except the heartbeat). A valid login cookie
@@ -7508,6 +7537,29 @@ async function oidcVerifyIdToken(idToken, expected) {
     claims = oidcVerifySignature(idToken, keys);
   }
   return oidcValidateClaims(claims, expected);
+}
+
+// ---- Group-based access decision (XERK-594) ---------------------------------
+// The `groups` claim's shape varies by IdP: Authentik sends an array of group
+// names, a single-group user can arrive as a bare string, and a mis-mapped
+// scope can omit it entirely. Normalize to a plain string[] of names, dropping
+// anything that isn't a non-empty string (so a forged non-string can't match).
+function oidcGroupsFromClaims(claims) {
+  const g = claims && claims.groups;
+  const arr = Array.isArray(g) ? g : g == null ? [] : [g];
+  return arr.filter((x) => typeof x === "string" && x.length > 0);
+}
+
+// Decide access + role from the user's groups. Admin membership implies access
+// AND outranks user membership (a user in both is an admin). With enforcement
+// off (both group names empty) any authenticated OIDC user is a plain user.
+// Returns { allowed, role } — role is "admin" | "user", null when denied.
+function oidcAccessDecision(groups) {
+  const set = new Set(groups || []);
+  if (OIDC_ADMIN_GROUP && set.has(OIDC_ADMIN_GROUP)) return { allowed: true, role: "admin" };
+  if (OIDC_USER_GROUP && set.has(OIDC_USER_GROUP)) return { allowed: true, role: "user" };
+  if (!OIDC_GROUPS_ENFORCED) return { allowed: true, role: "user" };
+  return { allowed: false, role: null };
 }
 
 // Exchange the authorization code for tokens (confidential client, PKCE). We
@@ -11313,14 +11365,42 @@ const server = http.createServer(async (req, res) => {
           aud: OIDC_CLIENT_ID,
           nonce: tx.nonce,
         });
+        // Group-based access (XERK-594): the `groups` claim is the authorization.
+        // A user in neither the user nor admin group gets NO session — enforced
+        // here, at the one point a fresh token is read, so removal from the AD
+        // group takes effect on the user's next login. The break-glass local
+        // login is untouched (a denied OIDC user can still reach it if they hold
+        // the local credential, but never a hub session from OIDC alone).
+        const groups = oidcGroupsFromClaims(claims);
+        const access = oidcAccessDecision(groups);
+        if (!access.allowed) {
+          console.log(
+            `OIDC access denied for ${logName(String(claims.sub || "?"))}: in none of ` +
+              `[${logName(OIDC_USER_GROUP)}, ${logName(OIDC_ADMIN_GROUP)}]`
+          );
+          res.writeHead(302, {
+            Location: "/login?error=forbidden",
+            "Cache-Control": "no-store",
+            "Set-Cookie": clearState,
+          });
+          return res.end();
+        }
         const sid = crypto.randomBytes(32).toString("base64url");
-        oidcPutSession(sid, { idToken: tokens.id_token, sub: claims.sub, at: Date.now() });
+        // Record the resolved role + groups for a future admin-only surface; the
+        // session cookie itself stays opaque (no identity on the wire).
+        oidcPutSession(sid, {
+          idToken: tokens.id_token,
+          sub: claims.sub,
+          role: access.role,
+          groups,
+          at: Date.now(),
+        });
         res.writeHead(302, {
           Location: oidcSafeNext(tx.next),
           "Cache-Control": "no-store",
           "Set-Cookie": [
-            sessionSetCookie(req, issueSessionToken()),
-            authCookie(req, OIDC_SID_COOKIE, sid, Math.floor(SESSION_TTL_MS / 1000)),
+            sessionSetCookie(req, issueSessionToken(OIDC_SESSION_TTL_MS), OIDC_SESSION_TTL_MS),
+            authCookie(req, OIDC_SID_COOKIE, sid, Math.floor(OIDC_SESSION_TTL_MS / 1000)),
             clearState,
           ],
         });
@@ -14719,6 +14799,14 @@ if (process.env.TURMA_TEST) {
     // RSA key; the caches + tx map are exported so a route test can seed
     // discovery/JWKS without a live IdP.
     OIDC_ENABLED,
+    // Group-based access (XERK-594): the pure decision helpers + the resolved
+    // config, so enforcement is unit-tested offline (oidc-groups.test.js).
+    OIDC_USER_GROUP,
+    OIDC_ADMIN_GROUP,
+    OIDC_GROUPS_ENFORCED,
+    OIDC_SESSION_TTL_MS,
+    oidcGroupsFromClaims,
+    oidcAccessDecision,
     pkceChallenge,
     oidcVerifySignature,
     oidcValidateClaims,
@@ -15021,6 +15109,22 @@ if (process.env.TURMA_TEST) {
     // /login?breakglass=1 (logged separately above).
     if (OIDC_ENABLED) {
       console.log(`OIDC login enabled (gates human routes; agents stay on token auth) -> issuer ${OIDC_ISSUER}, client ${OIDC_CLIENT_ID}`);
+      // Group-based access + the shorter OIDC session TTL (XERK-594): visible at
+      // boot so an operator can tell an ENFORCING hub from one that admits any
+      // authenticated user (both group names emptied), and knows the re-check
+      // cadence. A hub with enforcement OFF is a deliberate opt-out, warned about.
+      const ttlH = Math.round((OIDC_SESSION_TTL_MS / 3600000) * 10) / 10;
+      if (OIDC_GROUPS_ENFORCED) {
+        console.log(
+          `OIDC group access ENFORCED -> user "${OIDC_USER_GROUP || "(none)"}", ` +
+            `admin "${OIDC_ADMIN_GROUP || "(none)"}"; session re-checks groups every ${ttlH}h`
+        );
+      } else {
+        console.warn(
+          "WARNING: OIDC group access DISABLED (TURMA_OIDC_USER_GROUP and _ADMIN_GROUP both " +
+            `empty) — ANY authenticated user is admitted; session TTL ${ttlH}h`
+        );
+      }
     } else if (OIDC_ISSUER || OIDC_CLIENT_ID || OIDC_CLIENT_SECRET || OIDC_REDIRECT_URI) {
       console.warn(
         "WARNING: OIDC login is partially configured and therefore DISABLED — need all of " +
