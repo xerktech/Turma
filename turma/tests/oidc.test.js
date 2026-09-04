@@ -15,6 +15,7 @@ const os = require("os");
 const path = require("path");
 const { mkdtemp } = require("./tmpdirs");
 const http = require("http");
+const net = require("net");
 const crypto = require("crypto");
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -344,4 +345,181 @@ test("the OIDC routes are reachable WITHOUT a hub login (public gate)", async ()
   const res = await get("/auth/oidc/login");
   assert.equal(res.status, 302);
   assert.match(res.headers.location, /idp\.test/);
+});
+
+// ---- XERK-593: OIDC gates HUMAN routes only; agents stay on token auth -------
+//
+// The acceptance bar for the whole epic (XERK-591): with OIDC ENABLED, a human
+// browser is gated (bounced to the IdP), while the fleet agents keep their
+// existing token auth and are NEVER redirected into a browser/interactive flow
+// — the XERK-585 forward-auth regression must not recur. OIDC is read at
+// require time, so these run in THIS file (OIDC on), not server.test.js.
+
+const basic = (u, p) => "Basic " + Buffer.from(`${u}:${p}`).toString("base64");
+
+function req(method, pathName, { headers = {}, body } = {}) {
+  return new Promise((resolve, reject) => {
+    const data = body == null ? null : (typeof body === "string" ? body : JSON.stringify(body));
+    const h = { ...headers };
+    if (data != null && !Object.keys(h).some((k) => k.toLowerCase() === "content-type")) {
+      h["content-type"] = "application/json";
+    }
+    const r = http.request(baseUrl + pathName, { method, headers: h }, (res) => {
+      let out = "";
+      res.on("data", (c) => (out += c));
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, raw: out }));
+    });
+    r.on("error", reject);
+    if (data != null) r.write(data);
+    r.end();
+  });
+}
+
+// A raw HTTP Upgrade handshake against the live server; resolves with the status
+// line (e.g. "HTTP/1.1 101 Switching Protocols") once headers are in, or on a
+// close/timeout (a refused upgrade just destroys the socket).
+function wsUpgrade(pathAndQuery, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(server.address().port, "127.0.0.1", () => {
+      const key = Buffer.from("test-key-0123456789").toString("base64");
+      socket.write(
+        `GET ${pathAndQuery} HTTP/1.1\r\n` +
+          "Host: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+          `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`
+      );
+    });
+    let buf = Buffer.alloc(0);
+    let settled = false;
+    const finish = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { socket.destroy(); } catch {}
+      fn(val);
+    };
+    socket.on("data", (c) => {
+      buf = Buffer.concat([buf, c]);
+      const end = buf.indexOf("\r\n\r\n");
+      if (end >= 0) finish(resolve, buf.subarray(0, end).toString("utf8").split("\r\n")[0]);
+    });
+    socket.on("close", () => finish(reject, new Error(`upgrade socket closed (${buf.length}B)`)));
+    socket.on("error", (e) => finish(reject, e));
+    const timer = setTimeout(() => finish(reject, new Error("wsUpgrade timed out")), timeoutMs);
+  });
+}
+
+const isRedirect = (r) => r.status >= 300 && r.status < 400;
+
+test("XERK-593: humanLoginRedirect bounces to the IdP when OIDC is on", () => {
+  assert.equal(hub.humanLoginRedirect("/"), "/auth/oidc/login");
+  assert.equal(hub.humanLoginRedirect(""), "/auth/oidc/login");
+  assert.equal(hub.humanLoginRedirect("/board"), "/auth/oidc/login?next=%2Fboard");
+  assert.equal(hub.humanLoginRedirect("/usage?x=1"), "/auth/oidc/login?next=%2Fusage%3Fx%3D1");
+});
+
+test("XERK-593: an unauthenticated browser page is bounced to the IdP, carrying next", async () => {
+  const res = await req("GET", "/board", { headers: { accept: "text/html" } });
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.location, "/auth/oidc/login?next=%2Fboard");
+});
+
+test("XERK-593: a bare /login bounces to the IdP; ?breakglass=1 always renders the local form", async () => {
+  const bare = await req("GET", "/login", { headers: { accept: "text/html" } });
+  assert.equal(bare.status, 302);
+  assert.equal(bare.headers.location, "/auth/oidc/login");
+  // A /login carrying a next preserves it through the bounce.
+  const withNext = await req("GET", "/login?next=/usage", { headers: { accept: "text/html" } });
+  assert.equal(withNext.status, 302);
+  assert.equal(withNext.headers.location, "/auth/oidc/login?next=%2Fusage");
+  // Break-glass is NEVER bounced — the local form must stay reachable when the
+  // IdP is down (XERK-595), even with OIDC the mandatory human gate.
+  const bg = await req("GET", "/login?breakglass=1", { headers: { accept: "text/html" } });
+  assert.equal(bg.status, 200);
+  assert.ok(bg.raw.includes("Break-glass local login"), "renders the break-glass banner");
+});
+
+test("XERK-593: a FAILED OIDC flow lands on the local form, never a redirect loop", async () => {
+  // The callback bounces an IdP error to /login?error=oidc. That URL must NOT
+  // bounce back to the IdP (a loop when the IdP auto-returns the error) — it
+  // renders the local form so the human reaches a page and can use break-glass.
+  const res = await req("GET", "/login?error=oidc", { headers: { accept: "text/html" } });
+  assert.equal(res.status, 200);
+  assert.ok(res.raw.includes("Sign in"), "renders the local login form, not a bounce");
+});
+
+test("XERK-593: the local break-glass login still works with OIDC enabled", async () => {
+  // POST /api/login is in the exempt set, so the IdP being the human gate does
+  // not disable the IdP-independent credential (the anti-lockout guarantee).
+  const bad = await req("POST", "/api/login", { body: { username: "hubuser", password: "WRONG" } });
+  assert.equal(bad.status, 401);
+  const ok = await req("POST", "/api/login", { body: { username: "hubuser", password: "hubpass" } });
+  assert.equal(ok.status, 200);
+  const cookie = ok.headers["set-cookie"][0].split(";")[0];
+  assert.match(cookie, /^hub_session=/);
+  // That break-glass session authorises the browser API — no IdP round-trip.
+  const authed = await req("GET", "/api/agents", { headers: { cookie } });
+  assert.equal(authed.status, 200);
+  // And a page load with the session is served, never bounced.
+  const page = await req("GET", "/board", { headers: { cookie, accept: "text/html" } });
+  assert.equal(page.status, 200);
+});
+
+test("XERK-593: Basic-auth break-glass authorises headless callers with OIDC on", async () => {
+  const good = await req("GET", "/api/agents", { headers: { authorization: basic("hubuser", "hubpass") } });
+  assert.equal(good.status, 200);
+});
+
+test("XERK-593: a non-browser API caller gets 401, never a redirect into a browser flow", async () => {
+  // An XHR / header-auth client (glasses, curl) with no session must get a plain
+  // 401 it can act on — being bounced to the IdP would be the XERK-585 shape.
+  const res = await req("GET", "/api/agents");
+  assert.equal(res.status, 401);
+  assert.ok(!res.headers.location, "no Location redirect on the API 401");
+});
+
+test("XERK-593: the agent heartbeat is never redirected — token auth, no interactive challenge", async () => {
+  // No credential: refused with a status the agent's urllib can read (401),
+  // NOT a 302 into an OIDC/browser flow.
+  const anon = await req("POST", "/api/heartbeat", { body: { device: "h1" } });
+  assert.equal(anon.status, 401);
+  assert.ok(!isRedirect(anon) && !anon.headers.location, "no redirect for an unauthenticated agent");
+  // With the agent token it passes the auth gate and is handled on the agent
+  // path (its body outcome is not what we assert) — the point is it is NEVER a
+  // redirect to the IdP or the login form.
+  const authed = await req("POST", "/api/heartbeat", {
+    headers: { authorization: "Bearer agenttok" },
+    body: { device: "h1" },
+  });
+  assert.ok(!isRedirect(authed), `heartbeat must not redirect (got ${authed.status})`);
+  assert.ok(!authed.headers.location, "no Location on the authenticated heartbeat");
+});
+
+test("XERK-593: the agent self-enroll token endpoint is token-authed, never redirected", async () => {
+  const anon = await req("GET", "/api/agent/token");
+  assert.ok(!isRedirect(anon) && !anon.headers.location, "no redirect for the enroll endpoint");
+  // A host already on its own derived token trades for it with no challenge.
+  const derived = hub.hostAgentToken("h1");
+  const authed = await req("GET", "/api/agent/token", { headers: { authorization: `Bearer ${derived}` } });
+  assert.equal(authed.status, 200, "the agent trades its token with no interactive challenge");
+  assert.ok(!authed.headers.location);
+});
+
+test("XERK-593: an agent tunnel establishes with NO interactive challenge (the acceptance bar)", async () => {
+  // The core regression guard: a persistent agent WebSocket tunnel must complete
+  // its 101 handshake on token auth alone, even with OIDC the human gate. A
+  // forward-auth-style gate in front of the whole host (XERK-585) would have
+  // answered this upgrade with a redirect/challenge the non-browser agent cannot
+  // satisfy, and the tunnel would die.
+  const control = await wsUpgrade("/agent/control?name=h1&token=agenttok");
+  assert.match(control, /^HTTP\/1\.1 101 /, `control tunnel established (got "${control}")`);
+});
+
+test("XERK-593: an agent WebSocket with NO token is refused at the socket, never redirected", async () => {
+  // The exclusion is not a hole: a tunnel with no/invalid credential is dropped
+  // by agentWsAuthorized (the socket is destroyed), NOT handed an OIDC redirect.
+  await assert.rejects(
+    wsUpgrade("/agent/control?name=h1", 1500),
+    /closed|timed out/,
+    "an unauthenticated tunnel is dropped, not redirected"
+  );
 });

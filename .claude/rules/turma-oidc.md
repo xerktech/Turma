@@ -72,6 +72,9 @@ Read `.claude/rules/turma.md` "Auth and the glasses surface" for the auth model 
 
 XERK-592 requested `groups` but neither read nor enforced it; **XERK-594 is the enforcement**. It
 consumes the shared `groups` claim (XERK-582) as the authorization — the AD group IS the access.
+(XERK-593 decides WHERE an unauthenticated human is sent; XERK-594 decides WHICH groups may enter —
+and a group-denied user lands on `/login?error=forbidden`, which the XERK-593 gate treats as a failed
+flow and renders the local form for, never re-bouncing to the IdP.)
 
 - **The decision is at the CALLBACK, the one point a fresh token is read** — so removal from the AD
   group takes effect on the user's NEXT login (after the Authentik sync), which is the app-side half
@@ -104,15 +107,52 @@ consumes the shared `groups` claim (XERK-582) as the authorization — the AD gr
   login if they hold the credential; group enforcement never gates `/api/login`, Basic auth, or
   `userAuthorized`. This is additive, exactly as XERK-592 was.
 
+## Gating human routes only — agents stay on token auth (XERK-593)
+
+The core design constraint of the epic (XERK-591): the hub serves TWO audiences on one host/port, and
+OIDC gates ONLY the humans. This is the app-side fix for the XERK-585 regression, where a forward-auth
+outpost in front of the WHOLE host answered the agents' persistent WebSocket tunnels with an interactive
+redirect they cannot complete, and the fleet went dead.
+
+- **When `OIDC_ENABLED`, the human gate bounces an unauthenticated BROWSER to the IdP; agents are
+  NEVER redirected.** `humanLoginRedirect(next)` is the ONE place the human gate picks its target
+  (`/auth/oidc/login` when OIDC is on, `/login` otherwise). It is called ONLY on the human branch of
+  the request handler — the `else if (!userAuthorized(req))` HTML redirect — which is reached AFTER
+  every agent-token route has already been resolved, so it can never intercept an agent.
+- **The exclusion is STRUCTURAL, not a per-route allowlist.** The agent-transport routes are decided
+  in the `else if` chain BEFORE the human gate: `/api/heartbeat` (`agentPresentedRefusal`), the
+  archive/updating/migration/upload blobs and `/api/agent/token` (`agentHostRefusal` /
+  `resolveEnrollToken`), and — in the `upgrade` handler — `/agent/control` + `/agent/data`
+  (`agentWsAuthorized`). None of them ever reaches `humanLoginRedirect`. **Do not move the OIDC
+  redirect earlier in the chain, and do not add an "OIDC middleware" wrapping the whole handler** —
+  that is precisely the XERK-585 shape.
+- **A non-browser HUMAN caller (glasses, curl) still gets a plain 401, never a redirect** — the
+  redirect is gated on `Accept: text/html` + GET. A WebSocket upgrade that fails auth is dropped at
+  the socket (no HTTP body), so it is never an "interactive challenge" either.
+- **Break-glass is exempt and stays reachable with OIDC on** (XERK-595, `turma-break-glass.md`):
+  `/api/login` + Basic auth are in `isLoginRoute`, and `/login?breakglass=1` ALWAYS renders the local
+  form — a bare `/login` bounces to the IdP, but the `breakglass` param never does. `oidcSafeNext`
+  guards the `next` carried through the bounce.
+- **RBAC is still separate** (XERK-594): this ticket decides only WHERE an unauthenticated human is
+  sent, not WHICH `groups` may enter. Authorization stays the single `userAuthorized` decision.
+- Acceptance bar (XERK-591): an agent tunnel establishes with NO interactive challenge — pinned by
+  the `XERK-593:` tunnel-establishes case, and verified against a real agent in XERK-600.
+
 ## Tests
 
 - `turma/tests/oidc-groups.test.js` (own process — group + OIDC env read at require time): the two
   pure helpers (claim-shape normalization, allow/role incl. admin-outranks-user), and the callback
   driven for a user-group / admin-group / neither-group / no-claim token (admit-with-role vs
   302→`/login?error=forbidden` with no session/record), plus the shorter session-cookie Max-Age.
+- The `XERK-593:` cases in `oidc.test.js` (OIDC ON): the IdP bounce for a browser page + bare `/login`
+  carrying `next`, `?breakglass=1` never bounced, break-glass cookie + Basic auth still authorise, the
+  API-401-not-redirect rule, the heartbeat / self-enroll / `/agent/control` tunnel establishing on
+  token auth with no redirect, and an unauthenticated tunnel dropped (not redirected). The OIDC-OFF
+  branch (`humanLoginRedirect` → local form, no `/auth/oidc` bounce) is pinned by the `XERK-593:` cases
+  in `server.test.js`, since that module runs with OIDC unset.
 - `turma/tests/oidc.test.js` (own process — OIDC env read at require time). It **opts OUT of group
-  enforcement** (both group names empty) so the flow tests run on claims with no `groups`; that
-  doubles as the opt-out coverage. Covers the RFC 7636 PKCE
+  enforcement** (both group names empty) so its flow cases run on claims with no `groups`, doubling as
+  the XERK-594 opt-out coverage; it also holds the `XERK-593:` cases above. Covers the RFC 7636 PKCE
   vector, signature verify (valid/tampered/`alg:none`/wrong-key/unknown-kid), claim validation
   (iss/aud/exp/iat/nonce/azp + array aud), end-to-end verify with seeded discovery/JWKS, the
   kid-miss→refetch rotation path, `oidcSafeNext`, and the three routes driven against the real server

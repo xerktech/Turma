@@ -7227,6 +7227,24 @@ function issueSessionToken(ttlMs = SESSION_TTL_MS) {
   return `${expiry}.${mac}`;
 }
 
+// Where an unauthenticated HUMAN browser is sent to sign in (XERK-593). This is
+// the ONE place the human gate chooses between the IdP and the local form, and
+// it is only ever reached on the human branch of the request handler — AFTER
+// every agent-token / WebSocket-transport route has been excluded — so making
+// OIDC the human gate here can never redirect an agent into a browser flow
+// (the XERK-585 regression, whose whole point this ticket guards against).
+//   - OIDC enabled  -> bounce straight to the IdP (`/auth/oidc/login`), which
+//     itself is in the `isLoginRoute` exempt set so the browser reaches it with
+//     no session. `next` rides through and is re-validated by `oidcSafeNext`.
+//   - OIDC disabled -> the local login form, exactly as before OIDC existed.
+// The local break-glass form is always reachable at `/login?breakglass=1`
+// regardless (XERK-595), so the IdP being down is never a total lockout.
+function humanLoginRedirect(nextPathAndSearch) {
+  const next = nextPathAndSearch && nextPathAndSearch !== "/" ? nextPathAndSearch : "";
+  const base = OIDC_ENABLED ? "/auth/oidc/login" : "/login";
+  return next ? `${base}?next=${encodeURIComponent(next)}` : base;
+}
+
 function sessionTokenValid(token) {
   if (!token) return false;
   const dot = token.indexOf(".");
@@ -11194,17 +11212,26 @@ const server = http.createServer(async (req, res) => {
     } else if (isLoginRoute) {
       // fall through to the handlers below
     } else if (!userAuthorized(req)) {
-      // Everything else — UI, browser API, and the /term/ terminal proxy —
+      // The HUMAN gate (XERK-593). Reached only after every agent-transport
+      // route above (heartbeat, archive/updating/migration/upload blobs, the
+      // self-enroll token, and — in the upgrade handler — /agent/control and
+      // /agent/data) has already been resolved on the agent-token path, so the
+      // OIDC redirect this branch performs applies to browsers ONLY and can
+      // never intercept an agent (the XERK-585 forward-auth regression, where a
+      // single interactive gate in front of the whole host killed the tunnels).
+      //
+      // Everything here — UI, browser API, and the /term/ terminal proxy —
       // rides the login cookie (the browser attaches it to iframe asset
       // requests and WebSocket upgrades automatically). We deliberately do NOT
       // send a WWW-Authenticate header, so browsers never raise the native
-      // Basic popup: page navigations bounce to the login form; XHR/asset
-      // requests get a plain 401 the client-side code turns into a redirect.
+      // Basic popup: page navigations bounce to the login (the IdP when OIDC is
+      // the human gate, else the local form); XHR/asset requests get a plain
+      // 401 the client-side code turns into a redirect. A non-browser client on
+      // the header-auth path (glasses, curl) gets that same 401, never a
+      // redirect into a browser flow.
       const wantsHtml = req.method === "GET" && (req.headers.accept || "").includes("text/html");
       if (wantsHtml) {
-        const next = url.pathname + url.search;
-        const to = next && next !== "/" ? `/login?next=${encodeURIComponent(next)}` : "/login";
-        res.writeHead(302, { Location: to, "Cache-Control": "no-store" });
+        res.writeHead(302, { Location: humanLoginRedirect(url.pathname + url.search), "Cache-Control": "no-store" });
         return res.end();
       }
       res.writeHead(401, { "Content-Type": "application/json", "Cache-Control": "no-store" });
@@ -11218,6 +11245,27 @@ const server = http.createServer(async (req, res) => {
     if (isAssetRead && (url.pathname === "/login" || url.pathname === "/login.html")) {
       if (userAuthorized(req)) {
         res.writeHead(302, { Location: "/", "Cache-Control": "no-store" });
+        return res.end();
+      }
+      // When OIDC is the human gate (XERK-593), a bare /login bounces straight
+      // to the IdP so a browser lands on the passkey flow, not the local form.
+      // TWO exceptions render the local form instead of bouncing:
+      //  - `?breakglass=1` (XERK-595): the deliberate break-glass entry, so the
+      //    hub stays reachable when Authentik is down.
+      //  - `?error=` present: the OIDC callback bounces a FAILED IdP flow here
+      //    (`/login?error=oidc`). Bouncing that straight back to the IdP is a
+      //    redirect LOOP when the IdP auto-returns the error (e.g. a misconfig
+      //    or a denied consent), so a failed flow lands on the local form
+      //    instead — the human sees a reachable page and can use break-glass.
+      // `/api/login` (and Basic auth) are never bounced either — they are in the
+      // isLoginRoute exempt set above.
+      const breakglass = url.searchParams.get("breakglass") === "1";
+      const flowFailed = url.searchParams.has("error");
+      if (OIDC_ENABLED && !breakglass && !flowFailed) {
+        res.writeHead(302, {
+          Location: humanLoginRedirect(oidcSafeNext(url.searchParams.get("next"))),
+          "Cache-Control": "no-store",
+        });
         return res.end();
       }
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
@@ -14743,6 +14791,7 @@ if (process.env.TURMA_TEST) {
     safeEqual,
     credentialsMatch,
     breakGlassEnabled,
+    humanLoginRedirect,
     issueSessionToken,
     sessionTokenValid,
     // OIDC relying-party core (XERK-592). The pure pieces are exported so the
@@ -15054,9 +15103,12 @@ if (process.env.TURMA_TEST) {
     );
     // OIDC login (XERK-592) — say whether it is on, and against which issuer, so
     // a misconfigured (partially-set) env is visible at boot rather than as a
-    // 404 on /auth/oidc/login.
+    // 404 on /auth/oidc/login. When on, it now GATES the human routes (XERK-593):
+    // a browser is bounced to the IdP; the fleet agents stay on token auth and
+    // are never redirected; the local break-glass form stays at
+    // /login?breakglass=1 (logged separately above).
     if (OIDC_ENABLED) {
-      console.log(`OIDC login enabled -> issuer ${OIDC_ISSUER}, client ${OIDC_CLIENT_ID}`);
+      console.log(`OIDC login enabled (gates human routes; agents stay on token auth) -> issuer ${OIDC_ISSUER}, client ${OIDC_CLIENT_ID}`);
       // Group-based access + the shorter OIDC session TTL (XERK-594): visible at
       // boot so an operator can tell an ENFORCING hub from one that admits any
       // authenticated user (both group names emptied), and knows the re-check

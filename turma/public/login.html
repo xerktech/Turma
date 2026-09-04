@@ -90,9 +90,10 @@
   const submit = document.getElementById("submit");
 
   // Break-glass mode (XERK-595): a stable, IdP-independent entry an operator can
-  // bookmark for an SSO outage. It only surfaces the banner + heading today; a
-  // future mandatory-OIDC gate must honour it by NOT redirecting this URL to the
-  // IdP, so the local login stays reachable when Authentik is down.
+  // bookmark for an SSO outage. It surfaces the banner + heading; the hub's
+  // mandatory-OIDC human gate (XERK-593) honours it by NOT redirecting
+  // /login?breakglass=1 to the IdP, so the local login stays reachable when
+  // Authentik is down.
   if (new URLSearchParams(location.search).get("breakglass") === "1") {
     document.getElementById("breakglass").classList.add("show");
     document.getElementById("sub").textContent = "Break-glass sign-in — local credential only.";

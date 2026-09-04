@@ -12,15 +12,19 @@ does not depend on the IdP, so it keeps the hub reachable when Authentik/OIDC is
 same role Argo CD's local `admin` and Grafana's built-in `admin` play — see the ArgoCD repo's
 `.claude/rules/break-glass.md` for the fleet-wide pattern this follows.
 
-Native OIDC (XERK-592, `.claude/rules/turma-oidc.md`) is **purely additive**: the Authorization-Code
-+ PKCE flow issues the SAME `hub_session` cookie `POST /api/login` issues, and authorization stays
-the single `userAuthorized` decision. OIDC never replaces or gates the local login. **Making OIDC
-the mandatory human login is a SEPARATE, later task** — this ticket exists so that task cannot lock
-everyone out.
+Native OIDC (XERK-592, `.claude/rules/turma-oidc.md`) issues the SAME `hub_session` cookie
+`POST /api/login` issues, and authorization stays the single `userAuthorized` decision. OIDC never
+replaces the local login — it only decides WHERE an unauthenticated human browser is sent.
 
-## The invariant (what a mandatory-OIDC change must never break)
+**The mandatory-OIDC human gate has LANDED (XERK-593)**: when `OIDC_ENABLED`, an unauthenticated
+browser is bounced to the IdP (`humanLoginRedirect`), while the fleet agents stay on token auth and
+are never redirected. That change was built to honour every invariant below — this file is the
+regression guard it must keep green, not a description of pending work. Gate mechanics + the
+agent-exclusion seam: `.claude/rules/turma-oidc.md` ("Gating human routes only").
 
-A future change that makes OIDC the required human login MUST preserve all of:
+## The invariant (what the mandatory-OIDC gate must never break)
+
+The XERK-593 gate (and any change to it) MUST preserve all of:
 
 - **`userAuthorized` keeps accepting the local break-glass credential** — the `hub_session` cookie
   from `POST /api/login`, AND the Basic-auth header (`TURMA_USER:TURMA_PASSWORD`). Basic is the
