@@ -11541,6 +11541,13 @@ const server = http.createServer(async (req, res) => {
         return res.end();
       } catch (e) {
         console.log(`OIDC callback failed: ${e.message}`);
+        // A MOBILE flow deep-links EVERY outcome (XERK-591): a token-exchange /
+        // ID-token-validation failure here must reach the app as ?error=oidc,
+        // not a raw JSON page the user would be stranded on in the Custom Tab.
+        if (mobile) {
+          res.writeHead(302, { Location: failLocation("oidc"), "Cache-Control": "no-store", "Set-Cookie": clearState });
+          return res.end();
+        }
         res.writeHead(502, {
           "Content-Type": "application/json",
           "Cache-Control": "no-store",

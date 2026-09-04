@@ -617,3 +617,20 @@ test("XERK-591: a mobile flow reports an IdP error over the deep link, not the /
   assert.equal(res.status, 302);
   assert.ok(res.headers.location.startsWith(hub.OIDC_MOBILE_REDIRECT + "?error=oidc"));
 });
+
+test("XERK-591: a mobile flow deep-links when the token exchange itself fails", async () => {
+  hub.__setOidcCaches(DISCOVERY, jwksKeys);
+  const state = "mstate-fail";
+  hub.oidcTx.set(state, { nonce: "n", verifier: "v", next: "/", mobile: hub.pkceChallenge("verf-123456"), at: Date.now() });
+  const saved = global.fetch;
+  // The IdP's token endpoint 500s mid-flow: the callback must NOT strand the app
+  // on a JSON page — it deep-links ?error=oidc like every other mobile outcome.
+  global.fetch = async () => ({ ok: false, status: 500, text: async () => "boom" });
+  try {
+    const res = await get(`/auth/oidc/callback?state=${state}&code=the-code`, { cookie: `hub_oidc_state=${state}` });
+    assert.equal(res.status, 302);
+    assert.ok(res.headers.location.startsWith(hub.OIDC_MOBILE_REDIRECT + "?error=oidc"));
+  } finally {
+    global.fetch = saved;
+  }
+});
