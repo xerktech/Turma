@@ -104,6 +104,21 @@
     errBox.classList.add("show");
   }
 
+  // Surface an OIDC outcome the callback bounced back here (XERK-594/592):
+  // `forbidden` = signed in, but not in a group with access; `oidc` = the SSO
+  // flow itself failed. A denied SSO user can still use the break-glass local
+  // credential below, so the message points them at it rather than dead-ending.
+  const OIDC_ERRORS = {
+    forbidden:
+      "You signed in, but your account isn’t in a group with access to this hub. " +
+      "Ask an administrator to be added, or use the local credential below.",
+    oidc: "Single sign-on failed. Please try again, or use the local credential below.",
+  };
+  const errParam = new URLSearchParams(location.search).get("error");
+  if (errParam && Object.prototype.hasOwnProperty.call(OIDC_ERRORS, errParam)) {
+    showError(OIDC_ERRORS[errParam]);
+  }
+
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     errBox.classList.remove("show");

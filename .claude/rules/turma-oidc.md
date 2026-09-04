@@ -2,6 +2,8 @@
 paths:
   - "turma/server.js"
   - "turma/tests/oidc.test.js"
+  - "turma/tests/oidc-groups.test.js"
+  - "turma/public/login.html"
 ---
 
 # OIDC relying-party in the hub (XERK-592, epic XERK-591)
@@ -66,9 +68,51 @@ Read `.claude/rules/turma.md` "Auth and the glasses surface" for the auth model 
   bypass `userAuthorized` (a browser starting the flow has no session; the callback lands with the
   IdP's code before one exists). They authenticate themselves.
 
+## Group-based access from the `groups` claim (XERK-594, epic XERK-591)
+
+XERK-592 requested `groups` but neither read nor enforced it; **XERK-594 is the enforcement**. It
+consumes the shared `groups` claim (XERK-582) as the authorization — the AD group IS the access.
+
+- **The decision is at the CALLBACK, the one point a fresh token is read** — so removal from the AD
+  group takes effect on the user's NEXT login (after the Authentik sync), which is the app-side half
+  of "loses access on the next sync" (the end-to-end is verified IdP-side in task I). Enforced AFTER
+  `oidcVerifyIdToken`, BEFORE any session is issued.
+- **Two pure helpers, unit-tested offline**: `oidcGroupsFromClaims` normalizes the claim (array /
+  bare single string / absent → `string[]`, dropping non-string members so a forged number can't
+  match a name); `oidcAccessDecision(groups)` → `{allowed, role}`. `role` is `"admin"` for
+  `OIDC_ADMIN_GROUP` (which OUTRANKS user — a user in both is admin), `"user"` for `OIDC_USER_GROUP`,
+  else denied. **A denied user gets NO session and no `oidcSessions` record** — a 302 to
+  `/login?error=forbidden` (which `login.html` surfaces, pointing them at the break-glass local
+  credential). The tx is still consumed (single use).
+- **Config, env only**: `TURMA_OIDC_USER_GROUP` (default `k8x-ai`), `TURMA_OIDC_ADMIN_GROUP` (default
+  `k8x-admins`). The defaults ARE the real groups, so **enforcement is ON by default whenever OIDC is
+  on**. Setting BOTH to empty is the deliberate opt-out (`OIDC_GROUPS_ENFORCED` false → any
+  authenticated OIDC user admitted as a plain `user`); `?? default` leaves an explicit `""` untouched
+  so unset ≠ empty. Boot logs which (a warn on the opt-out).
+- **`role`/`groups` are recorded on the `oidcSessions` record for a future admin-only surface; NO
+  route is gated on `admin` yet** (Turma has one `userAuthorized` level — admin currently grants the
+  same access as user). The session cookie stays opaque (no identity on the wire); admin gating, when
+  it comes, reads the record via the `hub_oidc` sid cookie. Do NOT put the role on the `hub_session`
+  cookie.
+- **OIDC-issued sessions are SHORTER-lived** so a revoked user re-authenticates (and is re-checked
+  against current groups) within a bounded window: `issueSessionToken(ttlMs)` +
+  `sessionSetCookie(req, token, ttlMs)` take `OIDC_SESSION_TTL_MS` (`TURMA_OIDC_SESSION_TTL_MS`,
+  default 8h) on the OIDC path; **password/break-glass logins keep the 30-day `SESSION_TTL_MS`** (the
+  IdP-outage path must not force re-login every few hours). The cookie Max-Age matches the token's
+  own HMAC expiry.
+- **Break-glass is untouched** (`turma-break-glass.md`): a denied OIDC user can still reach the local
+  login if they hold the credential; group enforcement never gates `/api/login`, Basic auth, or
+  `userAuthorized`. This is additive, exactly as XERK-592 was.
+
 ## Tests
 
-- `turma/tests/oidc.test.js` (own process — OIDC env read at require time). Covers the RFC 7636 PKCE
+- `turma/tests/oidc-groups.test.js` (own process — group + OIDC env read at require time): the two
+  pure helpers (claim-shape normalization, allow/role incl. admin-outranks-user), and the callback
+  driven for a user-group / admin-group / neither-group / no-claim token (admit-with-role vs
+  302→`/login?error=forbidden` with no session/record), plus the shorter session-cookie Max-Age.
+- `turma/tests/oidc.test.js` (own process — OIDC env read at require time). It **opts OUT of group
+  enforcement** (both group names empty) so the flow tests run on claims with no `groups`; that
+  doubles as the opt-out coverage. Covers the RFC 7636 PKCE
   vector, signature verify (valid/tampered/`alg:none`/wrong-key/unknown-kid), claim validation
   (iss/aud/exp/iat/nonce/azp + array aud), end-to-end verify with seeded discovery/JWKS, the
   kid-miss→refetch rotation path, `oidcSafeNext`, and the three routes driven against the real server

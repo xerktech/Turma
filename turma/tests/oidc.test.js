@@ -35,6 +35,13 @@ process.env.TURMA_OIDC_ISSUER = ISSUER;
 process.env.TURMA_OIDC_CLIENT_ID = CLIENT_ID;
 process.env.TURMA_OIDC_CLIENT_SECRET = CLIENT_SECRET;
 process.env.TURMA_OIDC_REDIRECT_URI = REDIRECT_URI;
+// This file exercises the FLOW MECHANISM (XERK-592). Group-based access
+// (XERK-594) is OPTED OUT here — both group names empty — so goodClaims without
+// a `groups` claim still completes the flow, and this doubles as the coverage
+// that the opt-out admits any authenticated user. Enforcement itself lives in
+// oidc-groups.test.js. (Env is read at require time, hence per-file.)
+process.env.TURMA_OIDC_USER_GROUP = "";
+process.env.TURMA_OIDC_ADMIN_GROUP = "";
 
 const tmp = (name) => path.join(os.tmpdir(), `turma-oidc-${name}-${process.pid}.json`);
 process.env.STATE_FILE = tmp("state");

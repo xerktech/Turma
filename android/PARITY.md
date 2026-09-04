@@ -808,3 +808,10 @@ those are marked `[MODEL]`.
 
 ### Nav / Login
 - P3 Optional header descriptor/meta slot (e.g. Sessions running/waiting counts).
+- **OIDC/SSO is browser-only** (the `/auth/oidc/*` redirect + passkey flow), so `login.html`'s
+  SSO-outcome messages — `?error=forbidden` (signed in but not in an access group, XERK-594) and
+  `?error=oidc` (flow failed) — have **no Android analogue**: `LoginScreen.kt` is the Hub-URL + local
+  credential (Basic-auth) path and never initiates the OIDC browser flow. Group-based access
+  (XERK-594) is enforced hub-side in the OIDC callback and gates only the session that flow issues;
+  the local credential Android uses is the IdP-independent break-glass path, deliberately not
+  group-gated. Justified platform difference, no Android change.
