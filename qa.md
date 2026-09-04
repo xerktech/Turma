@@ -18,8 +18,8 @@ The fleet runs the agent natively; the two hosts you QA on differ in toolchain:
 | | TrueNAS native | WSL workstation (`MaxAI`) |
 |---|---|---|
 | `npm` / `npx` | **not on PATH** — see below | on PATH |
-| `java`, `gradle`, Android SDK | **absent** | **installed** — see §2.4 |
-| emulator / `adb` | absent | **a running AVD** |
+| `java`, `gradle`, Android SDK | **absent** — use the `mingc` container, §2.4 | **installed** — see §2.4 |
+| emulator / `adb` | absent (no viable x86_64 AVD — §2.4) | **a running AVD** |
 | `apt`, writable `/usr` | **no** — read-only, no sudo | yes, with sudo |
 | `ps` / `pkill` | present | present |
 | `~/.claude`, `~/.turma` | the operator's real ones | the operator's real ones |
@@ -228,20 +228,29 @@ mutating one byte.
 
 ### 2.4 Android (`android/`) — inside a JDK/Android toolchain container, and it does work
 
-> **NOTE (agent image removed):** the `ghcr.io/xerktech/turma-agent` image this
-> section used to build Android in is **no longer built** — the agent is
-> native-only now. On a host with a JDK the WSL-native path below is the reliable
-> route, and `.github/workflows/android-ci.yml` is the authoritative spec. To
-> build inside a container on TrueNAS, use a **public JDK 17 + Android SDK image**
-> that carries Gradle 8.11.1, `platforms/android-35` and `build-tools/35.0.0`; the
-> mechanics below still apply, minus the agent image's own-entrypoint trap.
-> Revisiting this section for the native-only model is tracked separately.
+> **The agent is native-only — no `ghcr.io/xerktech/turma-agent` image bundles a
+> toolchain any more (XERK-495).** Two decided routes for local Android QA:
+> - **WSL workstation (`MaxAI`) — the reliable, canonical route.** JDK/Gradle/SDK
+>   and an x86_64 AVD are installed natively; see "On the WSL workstation" below,
+>   and drive the UI there.
+> - **TrueNAS-native fallback — the public `mingc/android-build-box:latest` image**
+>   (Docker Hub, ~5.5 GB, pullable without auth). It carries
+>   `ANDROID_HOME=/opt/android-sdk` with `platforms;android-35` + `build-tools;35.0.0`
+>   and JDK 8/11/17/21 via jEnv — the exact image this project's `android-ci` used
+>   to build in before it moved to a hosted runner (see the history note in
+>   `android-ci.yml`). Two catches, both handled in the recipe: it **defaults to
+>   JDK 21** (AGP 8.x needs 17 → `jenv global 17`) and ships **no standalone
+>   Gradle** (pin 8.11.1 by download, as `android-ci.yml` does). Its emulator is
+>   ARM-only, so this image builds but does NOT drive a KVM AVD — see the AVD note
+>   below. `.github/workflows/android-ci.yml` stays the authoritative spec; read it
+>   before inventing an invocation.
 
-The **whole `android-ci` gate runs locally** in a JDK 17 + Android SDK container
-in ~3.5 min. Do not report Android as unbuildable — that is only true of the
-*UI*, below. The toolchain it needs: JDK 17.0.20, Gradle **8.11.1** (the version
-android-ci pins) and an SDK with `platforms/android-35` + `build-tools/35.0.0`,
-so nothing needs downloading in-job:
+The **whole `android-ci` gate runs locally** in the `mingc/android-build-box`
+container in ~3.5 min (once pulled). Do not report Android as unbuildable — that
+is only true of the *UI*, below. The toolchain it needs: JDK 17, Gradle **8.11.1**
+(the version android-ci pins) and an SDK with `platforms/android-35` +
+`build-tools/35.0.0` — all present in the image except the pinned Gradle, which
+the recipe downloads so the build version is fixed by you, not the image:
 
 ```bash
 mkdir -p /mnt/data/tmp-qa/andhome /mnt/data/tmp-qa/gradlehome
@@ -249,8 +258,14 @@ docker run --rm \
   -v <checkout>/android:/work \
   -v /mnt/data/tmp-qa/andhome:/andhome -v /mnt/data/tmp-qa/gradlehome:/gradlehome \
   -e ANDROID_USER_HOME=/andhome -e GRADLE_USER_HOME=/gradlehome \
-  <jdk17-android-sdk-image> bash -c \
-  'cd /work && gradle :app:testDebugUnitTest --no-daemon && gradle :app:assembleDebug --no-daemon'
+  mingc/android-build-box:latest bash -lc '
+    set -eux
+    jenv global 17          # image defaults to JDK 21; AGP 8.x needs 17
+    curl -fsSL https://services.gradle.org/distributions/gradle-8.11.1-bin.zip -o /tmp/gradle.zip
+    unzip -q /tmp/gradle.zip -d /opt && export PATH=/opt/gradle-8.11.1/bin:$PATH
+    cd /work
+    gradle :app:testDebugUnitTest --no-daemon --stacktrace
+    gradle :app:assembleDebug --no-daemon --stacktrace'
 ```
 
 Baseline: **281 JVM unit tests** (was 278 before XERK-252), 0 failures, and a ~21 MB
@@ -262,8 +277,16 @@ Traps:
 - `assembleDebug` needs `ANDROID_USER_HOME` somewhere writable, or
   `validateSigningDebug` fails creating a debug keystore in `/root/.android`.
   Mount `GRADLE_USER_HOME` too, or every run re-resolves dependencies.
-- The SDK in the image ships **build-tools 35.0.0 only**, and
-  `app/build.gradle.kts` pins it.
+- **mingc defaults to JDK 21**; AGP 8.x needs 17. `jenv global 17` in a **login
+  shell** (`bash -lc`, so jenv's shims are on PATH) selects it; if jenv isn't
+  initialised in your shell, `export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64`
+  instead. Build under 21 and Gradle/AGP fails or warns loudly.
+- **mingc ships no standalone `gradle`** — only per-project wrappers, and this repo
+  has **no committed wrapper** (CI generates one). Pin 8.11.1 by download exactly
+  as `android-ci.yml` does, so the build version is fixed by you, not the image.
+- mingc carries **many** build-tools versions (29–37) and platforms 28–35, so
+  `build-tools;35.0.0` + `platforms;android-35` (what `app/build.gradle.kts` pins)
+  are present with nothing to download in-job.
 - Kotlin does **not** treat warnings as errors here, so an import left dangling
   by a deletion compiles clean — grep for the removed symbol as well as building.
 - **There is no `app/src/androidTest`, and `android-ci.yml` runs only
@@ -280,14 +303,22 @@ Traps:
   know the tests really ran against the tree in front of you, add
   `--rerun-tasks` (~46s).
 
-A base JDK+SDK image carries no emulator or system image, but `/dev/kvm` exists
-on this host, so add the emulator to a throwaway container and boot an AVD
-(~4 min, mostly download):
+**The AVD/UI route on TrueNAS is deliberately NOT `mingc`.** Its bundled emulator
+is ARM-only (`x86_64 not supported`), so on this x86_64 host it cannot use
+`/dev/kvm` and an ARM AVD runs unusably slowly. **The canonical way to drive the
+app is the WSL workstation's native x86_64 AVD** ("On the WSL workstation", below)
+— that is the decided route. Running an AVD on TrueNAS would need a separate,
+x86_64-KVM-capable emulator image (e.g. `budtmo/docker-android`, a public
+x86-emulator image — verify it before relying on it; not pinned here). Until one
+is pinned, treat driving the Android UI on TrueNAS as **unverified** (§6). The
+recipe below is kept as reference for such an image — it assumes an SDK at
+`/opt/android-sdk`, `/dev/kvm`, and an x86_64 system image (~4 min, mostly
+download):
 
 ```bash
 docker run -d --name qa-emu --device /dev/kvm --network host -v /mnt/data/tmp-qa:/gh \
   -e PATH=/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/emulator:/usr/bin:/bin \
-  <jdk17-android-sdk-image> sleep 100000
+  <x86_64-kvm-emulator-image> sleep 100000
 docker exec qa-emu sh -c 'ANDROID_USER_HOME=/gh/andhome HOME=/gh/emuhome \
   yes | sdkmanager --sdk_root=/opt/android-sdk "emulator" "system-images;android-35;google_apis;x86_64" &&
   ANDROID_USER_HOME=/gh/andhome avdmanager create avd -n qa35 -k "system-images;android-35;google_apis;x86_64" -d pixel_5 --force'
@@ -872,10 +903,12 @@ Mutation-testing mechanics, since a broken harness reads as a passing one:
 
 Say these are unverified rather than implying otherwise:
 
-- **The Android UI.** A base JDK+SDK image has no emulator or system image.
-  Build, unit tests, lint and APK inspection are reachable; installing and
-  driving the app is not, without adding an emulator + system image (see §2.4)
-  or a real device over `adb connect`.
+- **The Android UI on TrueNAS.** The `mingc/android-build-box` image reaches
+  build, unit tests and APK inspection, but its emulator is ARM-only, so it cannot
+  drive a KVM-accelerated AVD on this x86_64 host (§2.4). Driving the UI is the
+  **WSL workstation's** job (native x86_64 AVD) or a real device over
+  `adb connect`; on TrueNAS it stays unverified unless a purpose-built x86_64-KVM
+  emulator image is stood up.
 - **Real G2 glasses / the Even phone app.** No hardware or Even Hub on this host.
 - **Real FCM delivery** (needs a device + a service account) and **real Whisper
   STT** (needs `LITELLM_URL`).
