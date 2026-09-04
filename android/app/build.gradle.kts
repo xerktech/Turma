@@ -159,6 +159,11 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
+    // Custom Tabs for the native Authentik SSO flow (XERK-591): the OIDC login
+    // runs in the system browser (so passkeys/WebAuthn work) rather than an
+    // in-app WebView, then deep-links the session back to the app.
+    implementation("androidx.browser:browser:1.8.0")
+
     // Inline image/SVG rendering in chat (XERK-221): Coil for <img>-style loading
     // of data: URIs + remote URLs, with the SVG decoder for data:image/svg+xml.
     // Reuses the app's OkHttp for remote fetches; SVG renders in Coil's secure

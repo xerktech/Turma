@@ -75,6 +75,40 @@ Read `.claude/rules/turma.md` "Auth and the glasses surface" for the auth model 
   bypass `userAuthorized` (a browser starting the flow has no session; the callback lands with the
   IdP's code before one exists). They authenticate themselves.
 
+## Native-app SSO handoff (XERK-591, Android)
+
+The Android app can't run a browser-cookie flow: after the callback sets `hub_session` in the Custom
+Tab's browser, the app's own HTTP client can't read that cookie. So a MOBILE-initiated OIDC flow ends
+by handing the token back over an app deep link, PKCE-protected. The hub stays the SOLE Authentik RP.
+
+- **The `turma://` redirect is hub↔app ONLY — it is NEVER sent to the IdP** (the IdP's registered
+  `redirect_uri` stays `OIDC_REDIRECT_URI`, the hub callback), so this adds NO Authentik config.
+  `TURMA_OIDC_MOBILE_REDIRECT` (default `turma://oidc-callback`) is the app deep link.
+- **The flow reuses `/auth/oidc/login` + `/auth/oidc/callback` unchanged** — the app just sends
+  `mobile=<code_challenge>` (SHA-256 of a secret verifier it keeps). It rides the tx to the callback;
+  a callback whose tx carries `mobile` deep-links every outcome (`oidcMobileRedirect`) instead of the
+  hub's HTML `/login` page — a browser page would strand the user in the Custom Tab. Length-capped
+  (`OIDC_CHALLENGE_MAX`); an over-long one is dropped (treated as non-mobile).
+- **On success the callback mints a single-use handoff `code`** bound to `{token, challenge}`
+  (`oidcPutHandoff`, bounded `OIDC_HANDOFF_MAX`, TTL `OIDC_HANDOFF_TTL_MS`) and redirects to
+  `<redirect>?code=<code>`. It sets NO session/sid cookie (the Custom Tab is throwaway).
+- **`POST /api/oidc/mobile/exchange {code, verifier}`** releases the token ONLY if
+  `SHA-256(verifier) === challenge` (`oidcTakeHandoff`, `timingSafeEqual`). **The code is single-use
+  and burned on ANY exchange attempt** — a wrong verifier deletes it too, so there is no oracle to
+  brute-force against, and a deep link intercepted by another app is useless without the verifier.
+  The token returned IS the same opaque `hub_session` value, so it rides `userAuthorized` unchanged.
+- **Both new routes are in `isLoginRoute`** (the app has no session yet): `/api/oidc/config` (public
+  probe — `{enabled}` only, tells the app whether to offer the SSO button) and the exchange
+  (self-authenticating on the code+verifier). Do NOT gate them behind `userAuthorized`.
+- **A dead/forged tx does NOT deep-link** — the state-CSRF 400 and the exchange 400 fall through, and
+  the app treats a non-deep-link outcome as a failed sign-in. Do not add a mobile deep-link to the
+  invalid-state branch (an untrusted redirect must not carry a token).
+- Android side (Custom Tab, `Cookie` auth, 401-drop) is in `android/PARITY.md` + `android.md`; the
+  client PKCE mirrors `pkceChallenge` byte-for-byte (`core/Oidc.kt`).
+- Tests: the `XERK-591:` cases in `oidc.test.js` (config probe, challenge carried into the tx,
+  over-long dropped, deep-link + single-use exchange + token authorises, wrong-verifier burns the
+  code, IdP-error deep-linked).
+
 ## Group-based access from the `groups` claim (XERK-594, epic XERK-591)
 
 XERK-592 requested `groups` but neither read nor enforced it; **XERK-594 is the enforcement**. It

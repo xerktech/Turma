@@ -26,8 +26,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private var deepLink by mutableStateOf<DeepLink?>(null)
+    private var oidcLink by mutableStateOf<OidcLink?>(null)
 
     data class DeepLink(val host: String?, val sessionId: String?, val url: String?)
+
+    /** The native SSO callback (XERK-591): the outcome the hub deep-linked back. */
+    data class OidcLink(val code: String?, val error: String?)
 
     private val notifPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* best-effort */ }
@@ -37,6 +41,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         deepLink = intent?.toDeepLink()
+        oidcLink = intent?.toOidcLink()
         maybeRequestNotifications()
 
         val container = (application as TurmaApplication).container
@@ -53,6 +58,8 @@ class MainActivity : ComponentActivity() {
                     wide = wide,
                     pendingDeepLink = deepLink,
                     onDeepLinkConsumed = { deepLink = null },
+                    pendingOidc = oidcLink,
+                    onOidcConsumed = { oidcLink = null },
                 )
             }
         }
@@ -62,6 +69,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         deepLink = intent.toDeepLink()
+        oidcLink = intent.toOidcLink()
     }
 
     private fun Intent.toDeepLink(): DeepLink? {
@@ -70,6 +78,17 @@ class MainActivity : ComponentActivity() {
         val url = getStringExtra(EXTRA_URL)
         return if (host == null && session == null && url == null) null
         else DeepLink(host, session, url)
+    }
+
+    // The SSO Custom Tab returns via a `turma://oidc-callback?code=…|error=…`
+    // VIEW intent (XERK-591). Parsed here off the intent data; the flow's PKCE
+    // verifier is held in Config, so only the outcome needs to travel.
+    private fun Intent.toOidcLink(): OidcLink? {
+        val data = this.data ?: return null
+        if (data.scheme != "turma" || data.host != "oidc-callback") return null
+        val code = data.getQueryParameter("code")
+        val error = data.getQueryParameter("error")
+        return if (code == null && error == null) null else OidcLink(code, error)
     }
 
     private fun maybeRequestNotifications() {

@@ -10,10 +10,12 @@ import com.xerktech.turma.model.TurmaJson
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import retrofit2.Retrofit
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -29,10 +31,29 @@ class HubClient(private val config: Config) {
     // Stamps the STORED credentials on every call — but leaves a request that
     // already carries its own Authorization alone, so probeCredentials() can
     // test creds that aren't stored yet (XERK-228) over this same client.
+    //
+    // Two credential shapes: an SSO session token rides as `Cookie:
+    // hub_session=<token>` (the SAME opaque value the web cookie carries,
+    // XERK-591), and a break-glass password rides as Basic auth. A request that
+    // already carries either is left alone.
     private val authInterceptor = Interceptor { chain ->
-        val req = chain.request()
-        if (req.header("Authorization") != null) return@Interceptor chain.proceed(req)
-        chain.proceed(req.newBuilder().header("Authorization", config.current.authHeader).build())
+        val original = chain.request()
+        if (original.header("Authorization") != null || original.header("Cookie") != null) {
+            return@Interceptor chain.proceed(original)
+        }
+        val s = config.current
+        val req = if (s.sessionToken.isNotBlank())
+            original.newBuilder().header("Cookie", "hub_session=${s.sessionToken}").build()
+        else
+            original.newBuilder().header("Authorization", s.authHeader).build()
+        val resp = chain.proceed(req)
+        // An SSO session's shorter OIDC TTL can lapse (or the user is dropped
+        // from an access group) mid-use; a 401 then means re-authenticate. Drop
+        // the token so `configured` flips false and the app returns to the login
+        // screen. A Basic (break-glass) 401 is a wrong password the login screen
+        // already surfaces, so it is left alone.
+        if (resp.code == 401 && s.sessionToken.isNotBlank()) config.clearSession()
+        resp
     }
 
     val http: OkHttpClient = OkHttpClient.Builder()
@@ -105,6 +126,52 @@ class HubClient(private val config: Config) {
             }
         } catch (_: IOException) {
             SignInResult.Unreachable
+        }
+    }
+
+    /**
+     * GET /api/oidc/config — whether this hub offers native SSO (XERK-591), so
+     * the login screen knows to offer "Sign in with SSO". A raw call (no stored
+     * creds needed; the route is public). Returns null when the hub can't be
+     * reached, false when it's reachable but SSO is off or the hub is too old to
+     * report it (an older hub 404s the route).
+     */
+    suspend fun oidcEnabled(baseUrl: String): Boolean? = withContext(Dispatchers.IO) {
+        val req = runCatching { Request.Builder().url(baseUrl + "api/oidc/config").build() }.getOrNull()
+            ?: return@withContext null
+        try {
+            http.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use false
+                val body = resp.body?.string().orEmpty()
+                runCatching { TurmaJson.decodeFromString<OidcConfig>(body).enabled }.getOrDefault(false)
+            }
+        } catch (_: IOException) {
+            null
+        }
+    }
+
+    /**
+     * POST /api/oidc/mobile/exchange {code, verifier} — redeem the single-use
+     * handoff code the hub deep-linked back for the opaque hub_session token
+     * (XERK-591). Returns null on any refusal (a bad/expired/hijacked code) or a
+     * network failure. A raw call — the app has no session yet, and the route
+     * authenticates itself with the code + PKCE verifier.
+     */
+    suspend fun oidcExchange(baseUrl: String, code: String, verifier: String): String? = withContext(Dispatchers.IO) {
+        val payload = TurmaJson.encodeToString(OidcExchangeRequest(code, verifier))
+        val req = runCatching {
+            Request.Builder().url(baseUrl + "api/oidc/mobile/exchange")
+                .post(payload.toRequestBody("application/json".toMediaType())).build()
+        }.getOrNull() ?: return@withContext null
+        try {
+            http.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                val body = resp.body?.string().orEmpty()
+                runCatching { TurmaJson.decodeFromString<OidcExchangeResponse>(body).token }
+                    .getOrNull()?.ifEmpty { null }
+            }
+        } catch (_: IOException) {
+            null
         }
     }
 

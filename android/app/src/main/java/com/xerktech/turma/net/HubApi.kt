@@ -522,6 +522,18 @@ data class CloneRequest(val repo: String, val source: String? = null)
 @Serializable
 data class ResumeRequest(val cwd: String = "")
 
+// Native-app SSO (XERK-591). `GET /api/oidc/config` reports whether the hub
+// offers Authentik SSO; the exchange redeems the deep-linked handoff code for
+// the hub_session token, proving the flow's origin with the PKCE verifier.
+@Serializable
+data class OidcConfig(val enabled: Boolean = false)
+
+@Serializable
+data class OidcExchangeRequest(val code: String, val verifier: String)
+
+@Serializable
+data class OidcExchangeResponse(val token: String = "", val ttlMs: Long = 0)
+
 @Serializable
 data class DeviceRequest(
     val token: String,

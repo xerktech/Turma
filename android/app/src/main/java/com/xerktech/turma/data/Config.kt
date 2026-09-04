@@ -22,8 +22,13 @@ class Config private constructor(private val prefs: SharedPreferences) {
         val hubUrl: String = DEFAULT_HUB_URL,
         val user: String = "",
         val password: String = "",
+        // The opaque hub_session token obtained via the native Authentik SSO
+        // flow (XERK-591). When present, requests authenticate with it as a
+        // Cookie instead of Basic auth — the SAME token the web cookie carries.
+        val sessionToken: String = "",
     ) {
-        val configured: Boolean get() = hubUrl.isNotBlank() && password.isNotBlank()
+        // Signed in either way: a break-glass password OR an SSO session token.
+        val configured: Boolean get() = hubUrl.isNotBlank() && (password.isNotBlank() || sessionToken.isNotBlank())
 
         /**
          * Base URL guaranteed to end with a single '/' and carry a scheme, for
@@ -50,19 +55,64 @@ class Config private constructor(private val prefs: SharedPreferences) {
         hubUrl = prefs.getString(KEY_URL, DEFAULT_HUB_URL) ?: DEFAULT_HUB_URL,
         user = prefs.getString(KEY_USER, "") ?: "",
         password = prefs.getString(KEY_PASS, "") ?: "",
+        sessionToken = prefs.getString(KEY_SESSION, "") ?: "",
     )
 
     fun save(hubUrl: String, user: String, password: String) {
+        // A break-glass password login supersedes any prior SSO session token.
         prefs.edit()
             .putString(KEY_URL, hubUrl.trim())
             .putString(KEY_USER, user.trim())
             .putString(KEY_PASS, password)
+            .remove(KEY_SESSION)
             .apply()
         _state.value = read()
     }
 
+    /**
+     * Persist the hub URL and stash the PKCE verifier before launching the SSO
+     * Custom Tab (XERK-591). Deliberately does NOT set a credential, so the app
+     * stays UNCONFIGURED until the handoff code is exchanged — a flow abandoned
+     * in the browser leaves no half-signed-in state.
+     */
+    fun startOidc(hubUrl: String, verifier: String) {
+        prefs.edit()
+            .putString(KEY_URL, hubUrl.trim())
+            .putString(KEY_OIDC_VERIFIER, verifier)
+            .apply()
+        _state.value = read()
+    }
+
+    /** The verifier stashed by [startOidc], read when the deep link returns. */
+    val pendingOidcVerifier: String get() = prefs.getString(KEY_OIDC_VERIFIER, "") ?: ""
+
+    /** Store the SSO session token and clear the one-shot pending verifier. */
+    fun saveSession(token: String) {
+        prefs.edit()
+            .putString(KEY_SESSION, token)
+            .remove(KEY_OIDC_VERIFIER)
+            .apply()
+        _state.value = read()
+    }
+
+    /**
+     * Drop ONLY the SSO session token — used when the hub 401s an SSO session
+     * (the shorter OIDC TTL lapsed, or the user was removed from an access
+     * group). Leaves a break-glass password intact, so a hub that has both stays
+     * signed in. `configured` flips false when no password remains, sending the
+     * app back to the login screen to re-authenticate.
+     */
+    fun clearSession() {
+        if (prefs.getString(KEY_SESSION, "").isNullOrEmpty()) return
+        prefs.edit().remove(KEY_SESSION).apply()
+        _state.value = read()
+    }
+
     fun clear() {
-        prefs.edit().remove(KEY_USER).remove(KEY_PASS).apply()
+        prefs.edit()
+            .remove(KEY_USER).remove(KEY_PASS)
+            .remove(KEY_SESSION).remove(KEY_OIDC_VERIFIER)
+            .apply()
         _state.value = read()
     }
 
@@ -74,6 +124,8 @@ class Config private constructor(private val prefs: SharedPreferences) {
         private const val KEY_URL = "hub_url"
         private const val KEY_USER = "hub_user"
         private const val KEY_PASS = "hub_pass"
+        private const val KEY_SESSION = "hub_session_token"
+        private const val KEY_OIDC_VERIFIER = "oidc_pending_verifier"
 
         private const val SECURE_PREFS = "turma_secure_prefs"
         private const val PLAIN_PREFS = "turma_prefs"
