@@ -10,6 +10,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSizeClassApi
 import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
 import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
+import androidx.annotation.VisibleForTesting
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -25,7 +26,8 @@ class MainActivity : ComponentActivity() {
         const val EXTRA_URL = "url"
     }
 
-    private var deepLink by mutableStateOf<DeepLink?>(null)
+    @VisibleForTesting
+    internal var deepLink by mutableStateOf<DeepLink?>(null)
 
     data class DeepLink(val host: String?, val sessionId: String?, val url: String?)
 
@@ -36,7 +38,14 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        deepLink = intent?.toDeepLink()
+        // Consume the launching intent's deep link ONLY on a fresh start. The
+        // intent is sticky (getIntent() keeps returning it), so re-reading it on
+        // every recreation — rotation, fold/unfold, night-mode/font-size change,
+        // process-death restore, all of which pass a non-null savedInstanceState
+        // — re-fired the notification's chat and yanked the user off whatever
+        // screen they had navigated to (XERK-603). A live re-tap arrives through
+        // onNewIntent instead, which is unaffected.
+        if (savedInstanceState == null) deepLink = intent?.toDeepLink()
         maybeRequestNotifications()
 
         val container = (application as TurmaApplication).container
