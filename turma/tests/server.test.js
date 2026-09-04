@@ -2674,6 +2674,31 @@ test("http: heartbeat carries archiveHave cursors back for a manifest", async ()
   assert.equal("archiveFull" in r2.body, false);
 });
 
+test("http: XERK-431 the inverted path — an inventory gets back only what the hub is SHORT of", async () => {
+  // tr1 is fully stored at 120 bytes (above). An inventory reporting its current
+  // size as 120 must NOT be wanted; the same id at 500 IS wanted from 120; a
+  // brand-new id is wanted from 0.
+  const beat = {
+    device: "nas",
+    archiveInventory: [
+      { i: "tr1", s: 120, r: 0 },      // complete -> not wanted
+      { i: "tr-inv-new", s: 300, r: 0 },  // new -> wanted from 0
+    ],
+  };
+  const r = await request("POST", "/api/heartbeat", { body: beat, headers: agentHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.archiveOffer, "hub");
+  assert.ok(!("tr1" in r.body.archiveHave), "a complete transcript is not wanted");
+  assert.equal(r.body.archiveHave["tr-inv-new"], 0);
+  // The inventory is transient, never persisted onto the record.
+  assert.equal(agents.nas.archiveInventory, undefined);
+
+  // Now the same tr1 reported SHORT (the hub holds 120, host has grown to 500).
+  const beat2 = { device: "nas", archiveInventory: [{ i: "tr1", s: 500, r: 0 }] };
+  const r2 = await request("POST", "/api/heartbeat", { body: beat2, headers: agentHeaders });
+  assert.equal(r2.body.archiveHave.tr1, 120, "wanted from the stored cursor");
+});
+
 // XERK-356. The rendered archive route read with `readBody`'s DEFAULT 1 MiB
 // while the agent builds each delta out of an 8 MiB window — and archival
 // excludes RUNNING sessions, so an ended session's FIRST delta is its whole
@@ -4015,7 +4040,11 @@ test("http: command queue rides the reply until acked", async () => {
   // its container limit, so only the hub knows it — and an agent that guesses a
   // fixed number posts into the band where an oversize body gets no status at
   // all, which is XERK-235's permanent offline loop.
-  assert.deepEqual(Object.keys(res.body).sort(), ["bodyMax", "commands", "peers"]);
+  // `archiveOffer:"hub"` rides EVERY reply (XERK-431) so a fresh agent learns to
+  // ship an inventory and let the hub choose what to archive, before its first
+  // archive beat — present even with no archiveHave, as here.
+  assert.deepEqual(Object.keys(res.body).sort(), ["archiveOffer", "bodyMax", "commands", "peers"]);
+  assert.equal(res.body.archiveOffer, "hub");
   assert.deepEqual(res.body.commands, []);
   assert.deepEqual(res.body.peers, []);
   assert.ok(res.body.bodyMax > 0, "the hub states a positive body ceiling");

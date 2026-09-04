@@ -1110,3 +1110,61 @@ test("XERK-280: a fully-deleted file (ENOENT) is NOT mutated on read — blip-sa
   assert.equal(archive.listArchive({ host: "nas280" }).sessions
     .find((s) => s.transcriptId === "x280d").msgCount, 2);
 });
+
+// ---- XERK-431: the hub-driven inventory / want path -------------------------
+
+test("inventoryCursors names back only the transcripts the hub is SHORT of", () => {
+  // Seed: inv-a fully stored (bytesStored==s), inv-b partially stored, inv-c new.
+  archive.ingestChunk("invh", "inv-a", { ...META }, 0, 100, [ent("a1", "user", "hello there world")]);
+  archive.ingestChunk("invh", "inv-b", { ...META }, 0, 40, [ent("b1", "user", "partial start")]);
+  const have = archive.inventoryCursors("invh", [
+    { i: "inv-a", s: 100, r: 0 },   // complete -> not wanted
+    { i: "inv-b", s: 150, r: 0 },   // 40 < 150 -> wanted from 40
+    { i: "inv-c", s: 80, r: 0 },    // brand new -> wanted from 0, row created
+  ], "");
+  assert.deepEqual(Object.keys(have).sort(), ["inv-b", "inv-c"]);
+  assert.equal(have["inv-b"], 40);
+  assert.equal(have["inv-c"], 0);
+  assert.ok(!("inv-a" in have), "a complete transcript is never wanted");
+  // The new id got a placeholder row (so a raw/rendered push has one to hang off).
+  assert.ok(archive.sessionRow("inv-c"), "wanted-new id gets a placeholder row");
+});
+
+test("inventoryCursors wants a rendered-COMPLETE transcript that is raw-SHORT", () => {
+  // inv-d rendered-complete but the hub holds none of its raw sidecars, so r>0
+  // must still pull it into the want set — the exact case the old rotation had to
+  // reach because a raw-short/rendered-complete transcript reads as "done".
+  archive.ingestChunk("invh", "inv-d", { ...META }, 0, 60, [ent("d1", "user", "complete rendered")]);
+  const have = archive.inventoryCursors("invh", [
+    { i: "inv-d", s: 60, r: 5000 },  // rendered done, raw 0<5000 -> wanted
+  ], "");
+  assert.deepEqual(Object.keys(have), ["inv-d"]);
+  assert.equal(have["inv-d"], 60, "the cursor is the rendered bytesStored");
+});
+
+test("inventoryCursors NEVER re-points a row another host owns (squat protection)", () => {
+  archive.ingestChunk("ownerH", "inv-owned", { ...META }, 0, 30, [ent("o1", "user", "owned by ownerH")]);
+  // A different host lists the same id in its inventory: not wanted, not touched.
+  const have = archive.inventoryCursors("rogueH", [{ i: "inv-owned", s: 999, r: 0 }], "");
+  assert.ok(!("inv-owned" in have), "another host's transcript is never wanted for us");
+  assert.equal(archive.sessionRow("inv-owned").host, "ownerH", "owner is unchanged");
+});
+
+test("inventoryCursors wants EVERY short entry in the window (no starving prefix-cap)", () => {
+  // The window is bounded by the AGENT (ARCHIVE_INVENTORY_MAX) and, against a
+  // hostile oversize, by ARCHIVE_MANIFEST_CURSOR_MAX — never a smaller want-cap,
+  // which would take the same prefix every beat and starve the tail.
+  const many = [];
+  for (let i = 0; i < 300; i++) many.push({ i: `wm-${i}`, s: 10, r: 0 });  // all new -> all short
+  const have = archive.inventoryCursors("wmh", many, "");
+  assert.equal(Object.keys(have).length, 300, "all short entries are wanted, not a prefix");
+});
+
+test("rawCursorsForIds reads back the hub's own stored raw files", () => {
+  // Give inv-b a rendered file (so it has a filePath/raw dir) then a raw sidecar.
+  archive.ingestRaw("invh", "inv-b", "inv-b/tool-results/x.txt", 0, Buffer.from("abcde"));
+  const cur = archive.rawCursorsForIds(["inv-b", "inv-a"]);
+  assert.ok(cur && cur["inv-b"], "raw cursor present for the transcript with raw bytes");
+  assert.equal(cur["inv-b"]["inv-b/tool-results/x.txt"], 5);
+  assert.ok(!("inv-a" in (cur || {})), "no raw bytes -> no entry");
+});

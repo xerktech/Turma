@@ -221,6 +221,30 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
 - **`manifestCursors` is bounded too** (`ARCHIVE_MANIFEST_CURSOR_MAX`, 2000) — the costlier of the two
   (a SELECT + INSERT per entry); uncapped it also makes the raw cursor cap pointless (same caller
   sends manifest entries instead, for a much bigger stall).
+- **The hub CHOOSES what to offer (XERK-431), the inverted path.** A NEW agent ships a cheap INVENTORY
+  `archiveInventory: [{i, s, r}]` (id, current rendered size, current raw total) instead of guessing a
+  manifest; `inventoryCursors` names back EVERY short entry in the window (`bytesStored < s` OR
+  `rawBytes < r`) as the SAME `archiveHave` map. So the agent's delta push is unchanged — only the
+  SELECTION moved server-side, deleting the agent's whole in-RAM offer-rotation. Why + rollover:
+  `docs/archive-offer-inversion-adr.md`.
+  - **NO smaller want-cap** — the window is already bounded by the agent (`ARCHIVE_INVENTORY_MAX`) and,
+    against a hostile oversize, by `ARCHIVE_MANIFEST_CURSOR_MAX`; the push is byte-bounded regardless.
+    A prefix-cap under the window size would take the SAME prefix every beat and STARVE the tail — the
+    XERK-424 cliff one layer up.
+  - **No schema change:** `s`/`r` are compared against the `bytesStored`/`rawBytes` already stored and
+    NEVER persisted. Completeness over the universe is carried by the agent ROTATING its bounded
+    inventory window; the hub's durable cursors re-identify a short transcript in every window.
+  - **Same INSERT-only + decided-org discipline as `manifestCursors`**: a placeholder row is created
+    for a wanted NEW id (so the ingestChunk gate XERK-344/573 and the raw-owner check XERK-338 hold),
+    and an id another host owns is IGNORED — never re-pointed, never wanted for the caller (squat
+    protection). Capped by `ARCHIVE_MANIFEST_CURSOR_MAX` like `manifestCursors`.
+  - **Raw cursors come from OUR OWN store** (`rawCursorsForIds` -> `listRawFiles`), since the inventory
+    carried no per-file list, only the total `r`. Bounded by the wanted (short) set, itself bounded by
+    the agent's inventory window.
+  - **`archiveOffer:"hub"` rides EVERY reply** (both branches, even with no `archiveHave`) so a fresh
+    agent learns to send an inventory before its first archive beat. `manifestCursors`/`rawCursors`
+    are kept for an older agent; the two paths are mutually exclusive per beat. Tests: the `XERK-431`
+    cases in `archive.test.js`/`server.test.js`.
 - `rebuildIndex` derives `rawBytes`/`archiveBytes` from the files, never a sidecar, and **skips a raw
   directory whole** during its file walk (its contents carry no `.meta` and would be skipped as rows
   anyway, but only after being read into memory first).
