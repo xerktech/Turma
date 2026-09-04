@@ -708,6 +708,103 @@ test("picking a host posts the restore to the ARCHIVE, not to a source agent", (
   assert.deepEqual(posts[0].body, { host: "hostA" });
 });
 
+// XERK-453: a cross-org restore is ALLOWED but warned. The picker badges a target
+// whose decided org differs from the archived row's origin org, and restoreTo()
+// confirms before POSTing. Both compare the served `org` (orgOfAgent), never the
+// stripped orgBound.
+const archivedOrgA = { transcriptId: "tid-x", repo: "repoX", host: "gone-host",
+  worktree: "/repos/.turma/worktrees/repoX/ab12c", siteKey: "orga.atlassian.net", entries: [] };
+
+test("XERK-453: the picker badges a cross-org target and leaves a same-org one plain", () => {
+  const { beat, showRestore, toggleRestoreMenu, els } = loadPage();
+  beat(restoreFleet([
+    { key: "sameOrg", device: "sameOrg", online: true, lastSeen: Date.now(),
+      org: "orga.atlassian.net", repos: [{ name: "repoX" }], sessions: [] },
+    { key: "otherOrg", device: "otherOrg", online: true, lastSeen: Date.now(),
+      org: "orgb.atlassian.net", repos: [{ name: "repoX" }], sessions: [] },
+  ]));
+  showRestore(archivedOrgA);
+  toggleRestoreMenu(click);
+  const menu = els.trRestoreMenu.innerHTML;
+  // The other-org host carries the ⚠ badge naming its org; the same-org host does not.
+  assert.match(menu, /otherOrg[\s\S]*restore-xorg[\s\S]*orgb/,
+    "a cross-org target is badged with its org");
+  assert.doesNotMatch(menu.split("sameOrg")[1] || "", /restore-xorg/,
+    "a same-org target is not badged");
+  // hostA in restoreFleet has no org at all — "no org to compare", never badged.
+  assert.doesNotMatch(menu.split("hostA")[1].split("sameOrg")[0], /restore-xorg/,
+    "an org-less target is not badged");
+});
+
+test("XERK-453: picking a cross-org target confirms first — decline aborts, accept posts", () => {
+  const realConfirm = global.confirm;
+  try {
+    // Decline: the POST must not fire.
+    let asked = null;
+    global.confirm = (m) => { asked = m; return false; };
+    const declined = loadPage({ postReply: { migrationId: "mig9" } });
+    declined.beat(restoreFleet([
+      { key: "otherOrg", device: "otherOrg", online: true, lastSeen: Date.now(),
+        org: "orgb.atlassian.net", repos: [{ name: "repoX" }], sessions: [] },
+    ]));
+    declined.showRestore(archivedOrgA);
+    declined.toggleRestoreMenu(click);
+    declined.restoreTo(click, "otherOrg");
+    assert.ok(asked && /orga/.test(asked) && /orgb/.test(asked),
+      "the confirm names both orgs");
+    assert.equal(declined.posts.length, 0, "declining the confirm aborts the restore");
+
+    // Accept: the POST fires as normal.
+    global.confirm = () => true;
+    const accepted = loadPage({ postReply: { migrationId: "mig9" } });
+    accepted.beat(restoreFleet([
+      { key: "otherOrg", device: "otherOrg", online: true, lastSeen: Date.now(),
+        org: "orgb.atlassian.net", repos: [{ name: "repoX" }], sessions: [] },
+    ]));
+    accepted.showRestore(archivedOrgA);
+    accepted.toggleRestoreMenu(click);
+    accepted.restoreTo(click, "otherOrg");
+    assert.equal(accepted.posts.length, 1, "accepting proceeds with the restore");
+    assert.equal(accepted.posts[0].url, "/api/archive/tid-x/restore");
+  } finally {
+    global.confirm = realConfirm;
+  }
+});
+
+test("XERK-453: a same-org (and an org-less) restore never prompts", () => {
+  const realConfirm = global.confirm;
+  try {
+    let asked = false;
+    global.confirm = () => { asked = true; return true; };
+    // Same-org target, org-carrying archived row: no crossing, no prompt.
+    const p = loadPage({ postReply: { migrationId: "mig9" } });
+    p.beat(restoreFleet([
+      { key: "sameOrg", device: "sameOrg", online: true, lastSeen: Date.now(),
+        org: "orga.atlassian.net", repos: [{ name: "repoX" }], sessions: [] },
+    ]));
+    p.showRestore(archivedOrgA);
+    p.toggleRestoreMenu(click);
+    p.restoreTo(click, "sameOrg");
+    assert.equal(p.posts.length, 1, "same-org restore proceeds");
+    assert.equal(asked, false, "and never prompts");
+
+    // Org-less archived row (siteKey ""): nothing to compare, no prompt even onto an org host.
+    asked = false;
+    const q = loadPage({ postReply: { migrationId: "mig9" } });
+    q.beat(restoreFleet([
+      { key: "otherOrg", device: "otherOrg", online: true, lastSeen: Date.now(),
+        org: "orgb.atlassian.net", repos: [{ name: "repoX" }], sessions: [] },
+    ]));
+    q.showRestore(archived); // no siteKey
+    q.toggleRestoreMenu(click);
+    q.restoreTo(click, "otherOrg");
+    assert.equal(q.posts.length, 1, "an org-less origin restore proceeds");
+    assert.equal(asked, false, "and never prompts");
+  } finally {
+    global.confirm = realConfirm;
+  }
+});
+
 test("Restore is hidden until an archived transcript is open", () => {
   const { beat, showRestore, hideRestore, toggleRestoreMenu, els } = loadPage();
   beat(restoreFleet());

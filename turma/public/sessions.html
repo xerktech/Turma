@@ -246,6 +246,10 @@
   .term-bar .restore-menu .restore-empty {
     font-size: 11px; color: var(--muted); padding: 6px 9px 3px;
   }
+  /* Cross-org restore warning on a picker target (XERK-453) — a heads-up, not a block. */
+  .term-bar .restore-menu button .restore-xorg {
+    font-size: 10.5px; color: var(--warn, #d98f2b); margin-left: 6px; white-space: nowrap;
+  }
 
   /* New-session picker (top of the sidebar): each online host, its repos as spawn buttons. */
   details.spawn-wrap > summary {
@@ -3436,7 +3440,7 @@ function resetEndedBar() {
 //
 // Only the archive view offers it. The live/ended views have Resume, which is
 // the cheaper thing — the session's own host still has its worktree.
-let restoreMeta = null;     // {transcriptId, repo, host} of the open archived view
+let restoreMeta = null;     // {transcriptId, repo, host, siteKey} of the open archived view
 let restoreMenuOpen = false;
 function hideRestore() {
   restoreMeta = null;
@@ -3454,6 +3458,22 @@ function eligibleRestoreTargets(repo) {
   return (cache.agents || []).filter(a =>
     a.online && (a.repos || []).some(r => r && r.name === repo));
 }
+// A restore is deliberately not refused across an org boundary (XERK-453) — but
+// writing org A's conversation bytes onto org B's host, where a different Claude
+// login can read them, is worth a heads-up. So the picker WARNS (never blocks)
+// when the target's decided org differs from the archived row's recorded org.
+// Both must be non-empty to differ: an org-less/legacy row (siteKey "") or an
+// org-less target has "no org to compare", so the warning stays silent rather
+// than fire on every restore. Uses the served `org` (decidedOrgOf, the value the
+// hub's own gates key on), same as eligibleMoveTargets, NOT the claimed siteKey.
+function restoreCrossOrg(a) {
+  const from = (restoreMeta && restoreMeta.siteKey) || "";
+  const to = orgOfAgent(a);
+  return !!from && !!to && from !== to;
+}
+function orgLabel(siteKey) {
+  return (window.TurmaBoard && TurmaBoard.orgName) ? TurmaBoard.orgName(siteKey) : siteKey;
+}
 // Whether this row is restorable AT ALL, mirroring the route's own first two
 // refusals. Most archived rows are not: `repo == "(root)"` is the agent's
 // catch-all for a cwd it could not attribute, so what they record is a
@@ -3468,7 +3488,8 @@ function restorableRow(t) {
 }
 function showRestore(t) {
   if (!restorableRow(t)) return hideRestore();
-  restoreMeta = { transcriptId: t.transcriptId, repo: t.repo || "", host: t.host || "" };
+  restoreMeta = { transcriptId: t.transcriptId, repo: t.repo || "", host: t.host || "",
+    siteKey: t.siteKey || "" };
   restoreMenuOpen = false;
   const $w = document.getElementById("trRestoreWrap");
   const $m = document.getElementById("trRestoreMenu");
@@ -3488,7 +3509,11 @@ function renderRestoreMenu() {
   $m.innerHTML = `<div class="restore-menu" onclick="event.stopPropagation()">
     <div class="restore-head">Restore onto…</div>
     ${targets.length
-      ? targets.map(a => `<button onclick="restoreTo(event,'${escJs(a.key)}')">${esc(a.device || a.key)}</button>`).join("")
+      ? targets.map(a => {
+          const cross = restoreCrossOrg(a);
+          return `<button onclick="restoreTo(event,'${escJs(a.key)}')">${esc(a.device || a.key)}${
+            cross ? ` <span class="restore-xorg" title="Different org — this session's bytes would be written onto a host in ${esc(orgLabel(orgOfAgent(a)))}">⚠ ${esc(orgLabel(orgOfAgent(a)))}</span>` : ""}</button>`;
+        }).join("")
       : `<div class="restore-empty">No online agent has ${esc(restoreMeta.repo || "this repo")} cloned.</div>`}
     <button onclick="toggleRestoreMenu(event)">Cancel</button>
   </div>`;
@@ -3499,6 +3524,18 @@ async function restoreTo(ev, host) {
   restoreMenuOpen = false;
   renderRestoreMenu();
   if (!meta) return;
+  // Cross-org restore is allowed (XERK-453), but confirm it first — it writes this
+  // session's conversation bytes onto a host in a DIFFERENT org, where a different
+  // Claude login can read them. Compare the served `org` the same way the picker's
+  // badge does; both orgs non-empty to count as a crossing.
+  const tgt = (cache.agents || []).find(a => a && a.key === host);
+  const tgtOrg = tgt ? orgOfAgent(tgt) : "";
+  if (meta.siteKey && tgtOrg && meta.siteKey !== tgtOrg &&
+      !confirm(`This session was archived from the "${orgLabel(meta.siteKey)}" org. ` +
+        `Restoring onto ${tgt ? (tgt.device || tgt.key) : host} writes its conversation ` +
+        `onto a host in "${orgLabel(tgtOrg)}", where that org's Claude login can read it.\n\nRestore anyway?`)) {
+    return;
+  }
   // `post` toasts the hub's own refusal text and resolves null (XERK-264) — and
   // the refusals here are the informative ones ("no raw copy", "already running
   // on <host>"), so there is nothing to word locally.

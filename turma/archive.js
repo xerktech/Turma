@@ -1549,7 +1549,7 @@ function reconcileRow(transcriptId, storedCount, storedBytes, entries, trueBytes
 // organized file (not the index). null when unknown/missing.
 function getTranscript(transcriptId) {
   openDb();
-  const row = db.prepare("SELECT filePath, repo, host, worktree, summary, endedTs, createdAt, "
+  const row = db.prepare("SELECT filePath, repo, host, siteKey, worktree, summary, endedTs, createdAt, "
     + "msgCount, archiveBytes FROM sessions WHERE transcriptId=?").get(transcriptId);
   // No row at all — the hub has genuinely never heard of this transcript.
   if (!row) return null;
@@ -1559,6 +1559,12 @@ function getTranscript(transcriptId) {
   if (!row.filePath) return null;
   const meta = {
     transcriptId, repo: row.repo, host: row.host, summary: row.summary,
+    // The row's hub-DECIDED org at archive time (schema v5, hub-supplied — never
+    // agent `meta`). The restore picker compares it to a target's org to WARN on a
+    // cross-org restore (XERK-453); NULL for a legacy/org-less row reads as "no org
+    // to compare", so the warning never fires on it. Restore itself stays
+    // org-agnostic — this is display-only, not an admission gate.
+    siteKey: row.siteKey == null ? "" : row.siteKey,
     // The recorded cwd, so the page can tell a session that CAN be restored from
     // one whose "worktree" is really a transcript store — the majority of the
     // archive — instead of offering a control that always refuses.
