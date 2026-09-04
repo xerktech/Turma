@@ -108,6 +108,33 @@ test("a changed repaint is deferred while text is selected, then flushes", () =>
   assert.match(scroll.innerHTML, /again/);
 });
 
+// XERK-604: a session SWITCH must paint the incoming transcript even if a stale
+// selection is still live in the outgoing one. open()'s seed paint calls
+// repaint(true), which bypasses the mid-selection defer — otherwise the header
+// updated while the chat stayed frozen on the previous session, and every
+// further switch re-deferred against the same selection until a page reload.
+test("a forced repaint paints through a live in-scroll selection (session switch)", () => {
+  chat.__setBuffer([entry("a", "old session")]);
+  chat.repaint();
+  assert.equal(scroll.writes, 1);
+
+  // A selection is left live inside the (outgoing) transcript, and we switch to a
+  // different session whose seed content is genuinely different.
+  selectInside();
+  chat.__setBuffer([entry("z", "new session")]);
+  chat.repaint(true);
+  assert.equal(scroll.writes, 2, "the forced paint is NOT held by the selection");
+  assert.match(scroll.innerHTML, /new session/, "the incoming session reached the DOM");
+  assert.doesNotMatch(scroll.innerHTML, /old session/);
+
+  // And an UNFORCED repaint still defers while the selection is live — the guard
+  // that makes copy reliable is unchanged for in-place live repaints.
+  chat.__setBuffer([entry("z", "new session"), entry("y", "later delta")]);
+  chat.repaint();
+  assert.equal(scroll.writes, 2, "an ordinary live repaint still holds during selection");
+  assert.doesNotMatch(scroll.innerHTML, /later delta/);
+});
+
 // XERK-251: the live turn no longer types in — the bubble shows every character
 // the classifier accepted, the frame it arrives.
 test("the live turn paints in full, with no typewriter holding text back", () => {

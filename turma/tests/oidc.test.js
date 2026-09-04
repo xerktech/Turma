@@ -634,3 +634,57 @@ test("XERK-591: a mobile flow deep-links when the token exchange itself fails", 
     global.fetch = saved;
   }
 });
+
+test("XERK-600: oidcErrorDetail folds the IdP's error into the message, sanitizes it, and degrades", () => {
+  // The standard OAuth2 error body (RFC 6749 §5.2) -> code + description.
+  const d1 = hub.oidcErrorDetail(400, { error: "invalid_grant", error_description: "code expired" });
+  assert.ok(d1.startsWith("HTTP 400 "), d1);
+  assert.match(d1, /"invalid_grant: code expired"/);
+  // Just a code (Authentik's "Invalid client secret" answers `invalid_client`).
+  assert.match(hub.oidcErrorDetail(401, { error: "invalid_client" }), /"invalid_client"/);
+  // No body / no standard fields -> a bare status, never "undefined" or "[object …]".
+  assert.equal(hub.oidcErrorDetail(500, null), "HTTP 500");
+  assert.equal(hub.oidcErrorDetail(503, { nonsense: true }), "HTTP 503");
+  // Non-string fields are ignored — a forged number/object can't smuggle content.
+  assert.equal(hub.oidcErrorDetail(400, { error: 42, error_description: {} }), "HTTP 400");
+  // Control chars in the IdP text never reach the (logged) line raw.
+  const desc = "a" + String.fromCharCode(0) + "b" + String.fromCharCode(0x1f) + "c";
+  const d3 = hub.oidcErrorDetail(400, { error: "bad", error_description: desc });
+  assert.ok([...d3].every((ch) => ch.charCodeAt(0) >= 0x20), `no raw control chars: ${JSON.stringify(d3)}`);
+  assert.match(d3, /bad/);
+});
+
+test("XERK-600: a failed token exchange NAMES the IdP's error in the hub log, not a bare HTTP 400", async () => {
+  // A rotated/mismatched client secret makes Authentik answer the token endpoint
+  // 400 {error:"invalid_client"}. The hub must name that in its log so the cause
+  // is a one-line read, not an IdP-log dive — while the user still gets the
+  // generic 502 (no IdP detail leaks to the browser) and the tx is consumed.
+  hub.__setOidcCaches(DISCOVERY, jwksKeys);
+  const state = "state-exch-fail";
+  hub.oidcTx.set(state, { nonce: "the-nonce", verifier: "v-1234567890", next: "/", at: Date.now() });
+
+  const savedFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: false,
+    status: 400,
+    text: async () =>
+      JSON.stringify({ error: "invalid_client", error_description: "Client authentication failed." }),
+  });
+  const savedLog = console.log;
+  const logs = [];
+  console.log = (...a) => logs.push(a.join(" "));
+  let res;
+  try {
+    res = await get(`/auth/oidc/callback?state=${state}&code=the-code`, { cookie: `hub_oidc_state=${state}` });
+  } finally {
+    global.fetch = savedFetch;
+    console.log = savedLog;
+  }
+  assert.equal(res.status, 502, "the user still gets the generic 502");
+  assert.doesNotMatch(res.raw, /invalid_client/, "no IdP detail leaks to the browser body");
+  const line = logs.find((l) => l.includes("OIDC callback failed"));
+  assert.ok(line, "the callback failure is logged");
+  assert.match(line, /invalid_client/, "the IdP's error CODE is named in the log");
+  assert.match(line, /Client authentication failed/, "the IdP's DESCRIPTION is named too");
+  assert.equal(hub.oidcTx.has(state), false, "the tx is consumed on failure (single use)");
+});

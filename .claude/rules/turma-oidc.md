@@ -64,6 +64,13 @@ Read `.claude/rules/turma.md` "Auth and the glasses surface" for the auth model 
   issuer advertises none).
 - **Token exchange authenticates client_secret_basic** (Authentik confidential-provider default) —
   the secret rides the `Authorization: Basic` header, never the body.
+- **The endpoint helpers NAME the IdP's error, but only in the log** (`oidcErrorDetail`): a failed
+  discovery / JWKS / token exchange folds the standard OAuth2 `error` + `error_description`
+  (RFC 6749 §5.2 — `invalid_client`, `invalid_grant`, …) into the thrown message, so a misconfig
+  (a rotated client secret the IdP has not reconciled, a `redirect_uri` mismatch) reads as its actual
+  cause in the hub log instead of a bare `HTTP 400`. **The browser still gets only the generic 502**
+  (`{"error":"OIDC sign-in failed"}`) — no IdP detail leaks to the caller. Detail is sanitized via
+  `logName` (C0/DEL/C1 stripped — it is logged) and standard fields only, never the whole body.
 - **Routes are `/auth/oidc/{login,callback,logout}`, added to the `isLoginRoute` EXEMPT set** so they
   bypass `userAuthorized` (a browser starting the flow has no session; the callback lands with the
   IdP's code before one exists). They authenticate themselves.
