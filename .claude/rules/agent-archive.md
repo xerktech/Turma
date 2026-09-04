@@ -11,6 +11,38 @@ paths:
   ledger slug's `*.jsonl`, minus any backing a running session); the hub replies with per-transcript
   byte cursors (`archiveHave`), and `_archive_deltas()` POSTs the missing append-only deltas
   (pre-parsed through `_entry_text`), bounded per chunk/beat.
+
+## The hub chooses what to offer (XERK-431) — the inverted path
+
+- **When the hub advertises `archiveOffer:"hub"` on its reply, the agent STOPS guessing which
+  transcripts to offer and ships a cheap INVENTORY** (`_archive_inventory` -> `archiveInventory:
+  [{i, s, r}]` = transcript id, current rendered size, current raw total); the hub answers with the
+  subset it is SHORT of, delivered as the SAME `archiveHave` cursor map, and the agent pushes exactly
+  those. This is the inverse of the guess-and-rotate model below. Why + rollover:
+  `docs/archive-offer-inversion-adr.md`.
+  - **The candidate scan is SHARED** (`_archive_candidates`, newest-mtime-first, collisions dropped);
+    `_archive_manifest` (old) and `_archive_inventory` (new) window it differently.
+  - **The inventory window is `recent + a single-position round-robin`** (`_inventory_window`,
+    `ARCHIVE_INVENTORY_MAX`), NOT the `_archive_offered` per-id memory. `_archive_inventory_pos` is one
+    integer, reset-safe: fairness lives in the hub's DURABLE cursors now, so a restart cannot starve
+    the tail (XERK-430 fixed for free). The recent slice always covers the oscillation-prone active
+    work; the round-robin only walks the stable old backlog, so no oscillation limit cycle is possible.
+  - **`r` is 0 for a deferred-raw (running non-dsh) transcript** so the hub never raw-wants what the
+    agent will not push while it runs. `rawFiles` are computed LOCALLY (for the push) but NEVER ride
+    the inventory wire — only `r` does; there is no manifest raw-file budget on this path.
+  - **`_archive_pending` is built in `queue_archive_sync`** from the reply's `archiveHave` keys
+    intersected with `_archive_catalog` (this beat's window). REBOUND, never mutated (the sync-pass
+    contract). A wanted id the window dropped is skipped this beat, re-offered when it next rotates in.
+  - **`_archive_sent_inventory` records which path build_payload took THIS beat**, so
+    `queue_archive_sync` reads the reply correctly across the one-beat capability flip; a hub rollback
+    (marker gone) reverts to the manifest path within one refresh beat.
+  - **The old rotation (`_archive_offered`/`_archive_cand_hwm`/`ARCHIVE_OFFERED_HARD_MAX`/
+    `archive-offered.json`/`_archive_known`/`_note_archive_known`/`_archive_window`) is KEPT behind
+    the `archiveOffer` flag for an older/rolled-back hub; a follow-up removes it once the fleet has
+    rolled over.** Do not delete it in this state.
+  - Tests: `TestArchiveInventory` (inventory shape/catalog, defer_raw r=0, window rotation, the
+    capability handshake + one-beat transition, want->pending), the `XERK-431` cases in
+    `archive.test.js`/`server.test.js`.
 - **Both passes run on a WORKER THREAD, never the beat** (XERK-395, same fix as `prune`): their
   combined worst case (`ARCHIVE_CHUNK_TIMEOUT_SEC` + `ARCHIVE_RAW_FAILURES_MAX` x
   `ARCHIVE_RAW_TIMEOUT_SEC`) exceeds the hub's offline threshold. `run_forever` only calls

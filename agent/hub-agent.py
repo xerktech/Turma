@@ -354,6 +354,14 @@ ARCHIVE_MANIFEST_MAX = _env_int("ARCHIVE_MANIFEST_MAX", 200, minimum=1)
 # work archiving promptly), and the rest for the BACKLOG — what the hub has said
 # it does not have, then a rotation over everything else so nothing can starve.
 ARCHIVE_MANIFEST_RECENT = _env_int("ARCHIVE_MANIFEST_RECENT", 100, minimum=0)
+# XERK-431: how many transcripts the hub-driven INVENTORY reports per refresh beat
+# (the newest ARCHIVE_MANIFEST_RECENT plus a round-robin slice of the backlog). The
+# hub answers with the subset of THIS window it is short of, so this bounds the
+# per-beat cost (one raw-total walk per entry, one hub SELECT per entry) while the
+# rotation carries universe coverage across beats. Larger than the manifest cap
+# because the wire cost per entry is tiny (id + two ints) and the raw walk is the
+# real cost — sized to the same class as the old manifest's raw-file offer budget.
+ARCHIVE_INVENTORY_MAX = _env_int("ARCHIVE_INVENTORY_MAX", 400, minimum=1)
 # What the hub last said it holds, per transcript, so the backlog slice can
 # prefer what is genuinely missing. Bounded like every other agent-side map: it
 # is keyed on every transcript this host has ever offered, which only grows.
@@ -13466,6 +13474,24 @@ class SessionManager:
         # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
         # back we know each one's size/slug/meta to push deltas for.
         self._archive_pending = {}
+        # XERK-431: the hub-driven "want" path. `_archive_hub_offer` tracks whether
+        # the current hub advertised `archiveOffer:"hub"` on its last reply — when
+        # it did, this side stops GUESSING which transcripts to offer (the whole
+        # `_archive_offered` rotation below) and instead ships a cheap INVENTORY,
+        # letting the hub name what it is short of. Tracked off EVERY reply so a hub
+        # rollback (the marker vanishing) reverts to the manifest path in one beat.
+        # `_archive_inventory_pos` is a SINGLE round-robin position over the backlog
+        # (no per-transcript memory, losable on restart with no cost — the hub's
+        # durable cursors carry fairness now, which is what fixes XERK-430 for
+        # free). `_archive_catalog` maps a windowed transcriptId to the entry the
+        # delta push needs, so a reply's wanted ids resolve back to files.
+        # `_archive_sent_inventory` records which path build_payload took THIS beat
+        # so queue_archive_sync reads the reply correctly across the one-beat flag
+        # transition. Full design: docs/archive-offer-inversion-adr.md.
+        self._archive_hub_offer = False
+        self._archive_inventory_pos = 0
+        self._archive_catalog = {}
+        self._archive_sent_inventory = False
         # XERK-424. `_archive_known` is transcriptId -> the byte cursor the hub
         # last reported for it, which is the only way this side can tell "the hub
         # has this" from "the hub has never seen it" — the reply only carries
@@ -21656,15 +21682,15 @@ class SessionManager:
         while len(self._archive_offered) > keep:
             self._archive_offered.pop(next(iter(self._archive_offered)))
 
-    def _archive_manifest(self):
-        """Manifest of inactive-session transcripts eligible for archive: enumerate
-        every ledger slug's *.jsonl, attribute it to a repo via the durable usage
-        ledger, skip transcripts backing a running session, and cap to
-        ARCHIVE_MANIFEST_MAX entries (scalars only — bounds the heartbeat).
-
-        Which ones is `_archive_window`: the newest, then the backlog the hub is
-        known to be missing, then a rotation over the rest (XERK-424). It is not
-        newest-by-mtime alone, because that never re-offers what falls out."""
+    def _archive_candidates(self):
+        """Every inactive-session transcript eligible for archive, as a
+        manifest-shaped entry sorted newest-mtime-first, with colliding
+        transcriptIds dropped (XERK-428). SHARED by the agent's own guessed
+        manifest (`_archive_manifest`, the pre-XERK-431 rotation, kept behind the
+        `archiveOffer` capability flag) and the hub-driven INVENTORY
+        (`_archive_inventory`). Returns `(out, defer_raw, universe)`; `universe`
+        (every eligible slug's *.jsonl, running ones included) is only used by the
+        old rotation's `_trim_archive_offered` bound."""
         running = self._running_slugs()
         # A running non-dsh session ships its RENDERED transcript (for instant chat
         # scrollback) but DEFERS its raw sidecars to session end — bounding the
@@ -21758,6 +21784,80 @@ class SessionManager:
                     f"since the hub's per-id cursor cannot tell them apart "
                     f"(XERK-428): {sorted(collisions)[:5]}")
         out.sort(key=lambda m: m["mtime"], reverse=True)
+        return out, defer_raw, universe
+
+    def _inventory_window(self, out):
+        """The bounded, ROTATING slice of `out` (newest-mtime-first) the inventory
+        reports this beat (XERK-431): the newest ARCHIVE_MANIFEST_RECENT, then a
+        round-robin over the backlog by a SINGLE position (`_archive_inventory_pos`,
+        no per-transcript memory — losable on restart with no cost, because the
+        hub's durable cursors carry fairness now). The recent slice always covers
+        the oscillation-prone active work (a just-ended session is newest by
+        mtime); the round-robin only walks the stable old backlog, so it cannot
+        form the limit cycles the old per-id rotation had to guard against."""
+        if len(out) <= ARCHIVE_INVENTORY_MAX:
+            return list(out)
+        recent_n = min(ARCHIVE_MANIFEST_RECENT, ARCHIVE_INVENTORY_MAX)
+        window = list(out[:recent_n])
+        rest = out[recent_n:]
+        slots = ARCHIVE_INVENTORY_MAX - len(window)
+        if slots > 0 and rest:
+            pos = self._archive_inventory_pos % len(rest)
+            for k in range(min(slots, len(rest))):
+                window.append(rest[(pos + k) % len(rest)])
+            self._archive_inventory_pos = (pos + slots) % len(rest)
+        return window
+
+    def _archive_inventory(self):
+        """The hub-driven replacement for `_archive_manifest` (XERK-431): a cheap
+        `[{i, s, r}]` inventory of what this host HAS — transcript id, current
+        rendered size, current raw total — over a bounded rotating window. The hub
+        answers with the subset it is short of; this side pushes exactly those.
+
+        Deletes the agent's whole offer-rotation memory: no `_archive_offered`, no
+        `_archive_cand_hwm`, no `_archive_known`, no persisted position — a single
+        `_archive_inventory_pos` integer, reset-safe. Returns `(inventory, catalog)`
+        where `catalog` maps every WINDOWED transcriptId to the entry the delta
+        push needs (slug/size/meta/rawFiles), so a reply's wanted ids resolve back
+        to files. `r` is 0 for a deferred-raw (running non-dsh) transcript, so the
+        hub never raw-wants what this side will not push while it runs.
+
+        Design + rollover: docs/archive-offer-inversion-adr.md."""
+        out, defer_raw, _universe = self._archive_candidates()
+        window = self._inventory_window(out)
+        inventory = []
+        catalog = {}
+        for m in window:
+            tid = m["transcriptId"]
+            # The same raw walk offer_raw does, but LOCAL: rawFiles never ride the
+            # inventory wire (only the total `r`), so there is no manifest raw-file
+            # budget to juggle — the push itself is bounded by ARCHIVE_RAW_BEAT_BUDGET.
+            r = 0
+            if m["slug"] not in defer_raw:
+                files = self._session_files(
+                    os.path.join(PROJECTS_ROOT, m["slug"]), tid)
+                if files:
+                    m["rawFiles"] = [[rel, size] for rel, size in files]
+                    r = sum(int(size) for _rel, size in files)
+            # endedTs/path finalized exactly as _archive_manifest does, so a catalog
+            # entry is a byte-for-byte substitute for a manifest entry downstream.
+            m["endedTs"] = _last_activity_ts(m["path"]) or time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(m["mtime"]))
+            m.pop("mtime", None)
+            m.pop("path", None)
+            catalog[tid] = m
+            inventory.append({"i": tid, "s": int(m.get("size", 0)), "r": int(r)})
+        return inventory, catalog
+
+    def _archive_manifest(self):
+        """Manifest of inactive-session transcripts eligible for archive: the
+        agent's OWN guess at what to offer, kept for a hub too old to advertise
+        `archiveOffer:"hub"` (XERK-431 keeps this behind that flag; a follow-up
+        removes it once the fleet has rolled over). Candidates come from
+        `_archive_candidates`; `_archive_window` picks the newest, then the backlog
+        the hub is known to be missing, then a rotation over the rest (XERK-424) —
+        the in-RAM bookkeeping the inverted path exists to delete."""
+        out, defer_raw, universe = self._archive_candidates()
         out, backlog_start = self._archive_window(out, universe)
         # The raw layer's file list (XERK-338), newest transcript first so the
         # aggregate cap drops the oldest offers rather than a random slice of
@@ -21978,9 +22078,27 @@ class SessionManager:
         # failed start leaves the job staged and a never-started thread in
         # _archive_worker, whose is_alive() is False, so the next beat retries.
         try:
-            # Inside the try, with everything else that must not reach the beat
-            # loop — it parses untrusted numbers off the reply (XERK-424 QA D1).
-            if job is not None:
+            # Track the hub's capability off EVERY reply (XERK-431), so the NEXT
+            # build_payload ships an inventory (or reverts to a manifest if a
+            # rolled-back hub stops advertising it). Cheap, and inside the try
+            # because it reads the untrusted reply.
+            self._archive_hub_offer = (reply.get("archiveOffer") == "hub")
+            if job is not None and self._archive_sent_inventory:
+                # The inverted path: the reply's `archiveHave` IS the hub's want,
+                # so `_archive_pending` becomes exactly the wanted ids resolved
+                # against this beat's catalog. REBOUND, never mutated — the sync
+                # pass snapshots it once (same contract as the manifest path). An
+                # id the hub wants but the catalog lacks (a transcript that fell
+                # out of this window) is simply skipped this beat and re-offered
+                # when it next rotates in. No `_note_archive_known` here — the hub
+                # owns the choice now, so the old "what does the hub have" map is
+                # dead on this path.
+                cat = self._archive_catalog
+                self._archive_pending = {
+                    tid: cat[tid] for tid in job["have"] if tid in cat}
+            elif job is not None:
+                # The manifest path still needs the old bookkeeping. It parses
+                # untrusted numbers off the reply (XERK-424 QA D1).
                 self._note_archive_known(job["have"])
             with self._archive_lock:
                 self._warn_if_archive_pass_stalled()
@@ -25970,14 +26088,26 @@ class SessionManager:
             # clear survives to the next beat.
             with self._spawn_failures_lock:
                 payload["spawnFailures"] = list(self.spawn_failures)
-        # Archive sync manifest on the slow cadence: the inactive transcripts the
-        # hub could pull. Remember it by id so the reply's archiveHave cursors map
-        # back to each one for the delta push (in run_forever).
+        # Archive sync on the slow cadence: the inactive transcripts the hub could
+        # pull. When the hub advertises `archiveOffer:"hub"` (XERK-431) this ships a
+        # cheap INVENTORY and lets the hub choose what it is short of — the reply's
+        # wanted ids resolve back through `_archive_catalog` in queue_archive_sync.
+        # Otherwise it falls back to GUESSING a manifest (kept for an older/rolled-
+        # back hub), remembered by id so the reply's cursors map back for the push.
+        # `_archive_sent_inventory` tells queue_archive_sync which path this beat
+        # took, so it reads the reply correctly across the one-beat flag transition.
         if refresh:
-            manifest = self._archive_manifest()
-            self._archive_pending = {m["transcriptId"]: m for m in manifest}
-            if manifest:
-                payload["archiveManifest"] = manifest
+            if self._archive_hub_offer:
+                inventory, self._archive_catalog = self._archive_inventory()
+                self._archive_sent_inventory = True
+                if inventory:
+                    payload["archiveInventory"] = inventory
+            else:
+                self._archive_sent_inventory = False
+                manifest = self._archive_manifest()
+                self._archive_pending = {m["transcriptId"]: m for m in manifest}
+                if manifest:
+                    payload["archiveManifest"] = manifest
         # Publish the peer roster the sessions themselves read (XERK-339). Off
         # the payload just assembled, so it adds no git or transcript work of its
         # own, and on the light beat too — a session spawned by the command that

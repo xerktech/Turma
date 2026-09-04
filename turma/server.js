@@ -11118,11 +11118,19 @@ const server = http.createServer(async (req, res) => {
       // an archive/DB hiccup must never break the heartbeat.
       const archiveManifest = payload.archiveManifest;
       delete payload.archiveManifest;
+      // XERK-431: a NEW agent instead ships a cheap INVENTORY of what it HAS and
+      // WE name back the subset we are short of (see inventoryCursors). The two
+      // are mutually exclusive per beat — an agent sends one or the other — but
+      // both land here so a host mid-rollover is handled either way.
+      const archiveInventory = payload.archiveInventory;
+      delete payload.archiveInventory;
       let archiveHave, archiveShed, archiveFull, archiveRawHave, archiveRawSkip;
-      if (Array.isArray(archiveManifest) && archiveManifest.length) {
+      const haveManifest = Array.isArray(archiveManifest) && archiveManifest.length;
+      const haveInventory = Array.isArray(archiveInventory) && archiveInventory.length;
+      if (haveManifest || haveInventory) {
         try {
-          // This beat's DECIDED org is stamped on every placeholder row the
-          // manifest creates, so the ingestChunk gate (XERK-344/573) protects a
+          // This beat's DECIDED org is stamped on every placeholder row either
+          // path creates, so the ingestChunk gate (XERK-344/573) protects a
           // not-yet-filled transcript from a cross-org first chunk on the SAME
           // basis the re-point gate compares. NOT the CLAIMED `siteKeyOf`, which
           // pooled two org-less hosts (XERK-573). `orgBound` is assigned to
@@ -11132,23 +11140,32 @@ const server = http.createServer(async (req, res) => {
             orgBound: prev.orgBound || siteKeyOf(payload),
             jira: payload.jira,
           });
-          archiveHave = archive.manifestCursors(key, archiveManifest, beatDecidedOrg);
+          if (haveInventory) {
+            // The inverted path: we choose which of the agent's inventory window
+            // we are short of, and the raw cursors come from OUR OWN store (the
+            // inventory carried no per-file list, only the raw total).
+            archiveHave = archive.inventoryCursors(key, archiveInventory, beatDecidedOrg);
+            archiveRawHave = archive.rawCursorsForIds(Object.keys(archiveHave));
+          } else {
+            archiveHave = archive.manifestCursors(key, archiveManifest, beatDecidedOrg);
+            // The raw layer's own cursors, per session-relative file (XERK-338).
+            // Computed AFTER manifestCursors, which is what creates the rows the
+            // raw directories hang off. Absent for every transcript this hub holds
+            // nothing of, which the agent reads as zero and ships from the start.
+            archiveRawHave = archive.rawCursors(archiveManifest);
+          }
           // The budget state that goes back with the cursors (XERK-267): which
           // transcripts have spent their per-transcript budget, so the agent
           // strips the inline file payloads before shipping them, and whether
           // the store is full, so it doesn't push at all this pass. Advisory —
-          // archive.ingestChunk enforces both on its own.
+          // archive.ingestChunk enforces both on its own. Same for both paths —
+          // it keys on the wanted ids, however they were chosen.
           const limits = archive.archiveLimits(Object.keys(archiveHave));
           archiveShed = limits.shed.length ? limits.shed : undefined;
           archiveFull = limits.full || undefined;
-          // The raw layer's own cursors, per session-relative file (XERK-338).
-          // Computed AFTER manifestCursors, which is what creates the rows the
-          // raw directories hang off. Absent for every transcript this hub holds
-          // nothing of, which the agent reads as zero and ships from the start.
-          archiveRawHave = archive.rawCursors(archiveManifest);
           const rawSkip = archive.rawLimits(Object.keys(archiveHave));
           archiveRawSkip = rawSkip.length ? rawSkip : undefined;
-        } catch (e) { console.error(`archive manifest ingest failed: ${e.message}`); }
+        } catch (e) { console.error(`archive ingest failed: ${e.message}`); }
       }
       const next = (agents[key] = {
         ...payload,
@@ -11418,10 +11435,16 @@ const server = http.createServer(async (req, res) => {
       // agent sizes each delta to it instead of posting a body that is refused,
       // which is why the durable archive was empty for every real session. It
       // rides the archive branch because that is the reply an agent pushes off.
+      // `archiveOffer: "hub"` rides EVERY reply (XERK-431), including one with no
+      // archiveHave, so a fresh agent learns before its first archive beat that it
+      // should ship a cheap INVENTORY and let the hub choose what to push, rather
+      // than guess with an in-RAM rotation. A hub rollback (marker gone) reverts
+      // the agent to the manifest path within one refresh beat.
       return json(res, 200, archiveHave
-        ? { commands: reply, peers, bodyMax, archiveHave, archiveShed, archiveFull,
-            archiveRawHave, archiveRawSkip, archiveChunkMax: ARCHIVE_CHUNK_BODY_MAX }
-        : { commands: reply, peers, bodyMax });
+        ? { commands: reply, peers, bodyMax, archiveOffer: "hub", archiveHave,
+            archiveShed, archiveFull, archiveRawHave, archiveRawSkip,
+            archiveChunkMax: ARCHIVE_CHUNK_BODY_MAX }
+        : { commands: reply, peers, bodyMax, archiveOffer: "hub" });
     }
 
     // POST /api/agents/<host>/updating — an agent announcing an EXPECTED restart

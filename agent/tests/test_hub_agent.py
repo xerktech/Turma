@@ -21942,6 +21942,133 @@ class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm._archive_body_max(), int((8 << 20) * ha.ARCHIVE_BODY_MARGIN))
 
 
+class TestArchiveInventory(ManagerMixin, unittest.TestCase):
+    """The hub-driven inventory / want path (XERK-431): the agent ships a cheap
+    `[{i,s,r}]` inventory and the hub names what it is short of, deleting the
+    agent's whole in-RAM offer-rotation. A standalone class (NOT a TestArchiveSync
+    subclass, which TestDshArchiveSync extends) with its own tiny helpers."""
+
+    def _write_transcript(self, worktree, fname, entries):
+        slug = ha._project_slug(worktree)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, fname), entries)
+        return slug
+
+    def _ledger(self, sm, worktree):
+        sm.usage_ledger = {worktree: {"repo": "Turma",
+                                      "remote": "git@github.com:xerk/Turma.git",
+                                      "slug": ha._project_slug(worktree)}}
+
+    def test_inventory_is_cheap_ids_sizes_and_a_local_catalog(self):
+        # The agent ships `{i,s,r}` and keeps a LOCAL catalog so a reply's wanted
+        # ids resolve back to files. No metadata rides the inventory wire.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/inv"
+        self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._ledger(sm, wt)
+        sm.registry = []
+        inv, catalog = sm._archive_inventory()
+        self.assertEqual(len(inv), 1)
+        self.assertEqual(set(inv[0].keys()), {"i", "s", "r"})
+        self.assertEqual(inv[0]["i"], "t1")
+        self.assertGreater(inv[0]["s"], 0)
+        # `r` counts the raw total; a bare transcript's own .jsonl is a raw file
+        # too, so r >= s here.
+        self.assertGreaterEqual(inv[0]["r"], inv[0]["s"])
+        # The catalog is the delta push's map: manifest-shaped, id-keyed, local.
+        self.assertIn("t1", catalog)
+        self.assertEqual(catalog["t1"]["slug"], ha._project_slug(wt))
+        self.assertGreater(catalog["t1"]["size"], 0)
+
+    def test_inventory_defers_raw_for_a_running_nondsh_session(self):
+        # A running non-dsh session ships rendered while running but DEFERS raw, so
+        # its inventory `r` is 0 — the hub must not raw-want what we won't push.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/live"
+        self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._ledger(sm, wt)
+        sm.registry = [{"id": "s", "worktreePath": wt, "status": "running"}]
+        inv, _cat = sm._archive_inventory()
+        self.assertEqual(len(inv), 1)
+        self.assertEqual(inv[0]["r"], 0)
+
+    def test_inventory_window_rotates_by_a_single_position(self):
+        # Over-cap candidates are covered by a rotating round-robin (a single
+        # position, no per-transcript memory) plus the always-covered recent slice.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/rot"
+        slug = ha._project_slug(wt)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        os.makedirs(d, exist_ok=True)
+        ids = []
+        for i in range(6):
+            fn = f"t{i}.jsonl"
+            write_jsonl(os.path.join(d, fn), [_text_entry(f"u{i}", "user", "hi")])
+            os.utime(os.path.join(d, fn), (1000 + i, 1000 + i))  # deterministic order
+            ids.append(f"t{i}")
+        self._ledger(sm, wt)
+        sm.registry = []
+        with mock.patch.object(ha, "ARCHIVE_INVENTORY_MAX", 3), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 1):
+            seen = set()
+            for _ in range(4):
+                inv, _cat = sm._archive_inventory()
+                self.assertEqual(len(inv), 3)
+                seen.update(e["i"] for e in inv)
+            # Rotation eventually offers every transcript, not just the newest.
+            self.assertEqual(seen, set(ids))
+
+    def test_build_payload_ships_inventory_only_once_the_hub_advertises_it(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/bp"
+        self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._ledger(sm, wt)
+        sm.registry = []
+        # Default: no capability seen yet -> the old manifest path.
+        sm._archive_hub_offer = False
+        payload = sm.build_payload(0)
+        self.assertIn("archiveManifest", payload)
+        self.assertNotIn("archiveInventory", payload)
+        self.assertFalse(sm._archive_sent_inventory)
+        # Once the hub advertised it -> the inventory path.
+        sm._archive_hub_offer = True
+        payload = sm.build_payload(0)
+        self.assertIn("archiveInventory", payload)
+        self.assertNotIn("archiveManifest", payload)
+        self.assertTrue(sm._archive_sent_inventory)
+
+    def test_queue_sync_tracks_capability_and_builds_pending_from_the_want(self):
+        sm = self.make_manager()
+        # A reply advertising the capability flips the flag on; one without it off
+        # (a hub rollback reverts the agent within one beat).
+        sm.queue_archive_sync({"archiveOffer": "hub"})
+        self.assertTrue(sm._archive_hub_offer)
+        sm.queue_archive_sync({"commands": []})
+        self.assertFalse(sm._archive_hub_offer)
+        # With an inventory sent this beat, the reply's archiveHave IS the want:
+        # _archive_pending becomes exactly the wanted ids resolved against the
+        # catalog. An id the hub wants but the window dropped is skipped.
+        sm._archive_sent_inventory = True
+        sm._archive_catalog = {
+            "a": {"transcriptId": "a", "slug": "s", "size": 10},
+            "b": {"transcriptId": "b", "slug": "s", "size": 10},
+        }
+        sm.queue_archive_sync({"archiveOffer": "hub",
+                               "archiveHave": {"a": 0, "gone": 5}})
+        self.assertEqual(set(sm._archive_pending), {"a"})
+
+    def test_queue_sync_leaves_pending_alone_on_the_manifest_path(self):
+        # When build_payload sent a MANIFEST this beat, _archive_pending was set
+        # there and must NOT be rebuilt from the catalog (which is stale).
+        sm = self.make_manager()
+        sm._archive_sent_inventory = False
+        sm._archive_pending = {"m1": {"transcriptId": "m1", "slug": "s", "size": 5}}
+        sm._archive_catalog = {"other": {"transcriptId": "other", "slug": "s"}}
+        sm.queue_archive_sync({"archiveOffer": "hub", "archiveHave": {"m1": 0}})
+        self.assertEqual(set(sm._archive_pending), {"m1"})
+
+
 class TestArchiveSyncWorker(ManagerMixin, unittest.TestCase):
     """Archive sync runs on its OWN thread, never the beat loop (XERK-395).
 

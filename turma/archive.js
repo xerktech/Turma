@@ -1352,6 +1352,98 @@ function manifestCursors(host, manifest, siteKey) {
   return have;
 }
 
+// The hub-driven inverse of manifestCursors (XERK-431): instead of the agent
+// GUESSING which transcripts to offer and us answering their cursors, a NEW agent
+// ships a cheap INVENTORY of what it HAS — `[{i, s, r}]` = transcript id, its
+// current rendered size, its current raw-total — and WE name back the subset we
+// are SHORT of. That deletes the agent's whole in-RAM offer-rotation
+// (`_archive_offered`/`_archive_cand_hwm`/…), whose bound had to be estimated
+// against a universe the agent could only guess at and was wrong four times
+// (XERK-424); our `sessions` table already knows exactly what we hold. Full
+// reasoning + rollover: `docs/archive-offer-inversion-adr.md`.
+//
+// The return shape IS `manifestCursors`' `archiveHave` map, so the agent's delta
+// push is unchanged — it just contains only the WANTED ids (`bytesStored < s` OR
+// `rawBytes < r`). `s`/`r` are compared against what we already store and NEVER
+// persisted, so this needs no schema change: completeness over the universe is
+// carried by the agent ROTATING its bounded inventory window, and our durable
+// cursors re-identify a short transcript in every window with no agent memory.
+//
+// We want EVERY short entry in the window — NOT a smaller prefix. The window is
+// already bounded by the agent (ARCHIVE_INVENTORY_MAX) and by us against a hostile
+// oversize (ARCHIVE_MANIFEST_CURSOR_MAX), and the push is byte-bounded
+// (ARCHIVE_BEAT_BUDGET) regardless. A separate smaller want-cap would take the
+// SAME prefix every beat and STARVE the window's tail, because once the window
+// already covers the backlog the round-robin is a no-op — the exact cliff XERK-424
+// spent six passes closing, reintroduced one layer up.
+//
+// Placeholder rows are created for wanted NEW ids exactly as manifestCursors does
+// (same INSERT-only discipline + decided-org stamp, so the ingestChunk gate
+// XERK-344/573 and the raw-owner check XERK-338 both hold), and an id whose row
+// another host owns is IGNORED — never re-pointed, never wanted for us (the same
+// squat protection). Capped like manifestCursors, and for the same reason: it is
+// the same handler on the same event loop.
+function inventoryCursors(host, inventory, siteKey) {
+  openDb();
+  const have = {};
+  const pushOrg = String(siteKey == null ? "" : siteKey).slice(0, META_TEXT_MAX);
+  let list = Array.isArray(inventory) ? inventory : [];
+  if (list.length > ARCHIVE_MANIFEST_CURSOR_MAX) {
+    warnManifestCap(list.length - ARCHIVE_MANIFEST_CURSOR_MAX);
+    list = list.slice(0, ARCHIVE_MANIFEST_CURSOR_MAX);
+  }
+  const lookup = db.prepare(
+    "SELECT bytesStored, rawBytes, host FROM sessions WHERE transcriptId=?");
+  const insert = db.prepare(`INSERT INTO sessions(
+      transcriptId, host, siteKey, bytesStored, rawBytes, updatedAt)
+    VALUES(?,?,?,0,0,?)
+    ON CONFLICT(transcriptId) DO NOTHING`);
+  const nowIso = new Date().toISOString();
+  tx(() => {
+    for (const m of list) {
+      // Inventory entries are the compact `{i, s, r}` the agent ships — id, its
+      // current rendered size, its current raw total — NOT the manifest shape.
+      const tid = m && m.i;
+      if (!tid) continue;
+      const s = Number(m.s);
+      const r = Number(m.r);
+      const row = lookup.get(tid);
+      // Another host owns this id: never re-point here (manifestCursors' rule),
+      // and never want it for the caller — the owner drives its own sync.
+      if (row && row.host && row.host !== host) continue;
+      const bytesStored = row ? row.bytesStored : 0;
+      const rawBytes = row ? row.rawBytes : 0;
+      const rShort = Number.isFinite(r) && r > 0 && rawBytes < r;
+      const sShort = Number.isFinite(s) && s > 0 && bytesStored < s;
+      if (!sShort && !rShort) continue;
+      if (!row) insert.run(tid, host, pushOrg, nowIso);
+      have[tid] = bytesStored;
+    }
+  });
+  return have;
+}
+
+// The raw-layer cursors for a set of transcript ids (XERK-431) — the inverse-path
+// twin of `rawCursors`, which reads the offered manifest's `rawFiles`. Here the
+// agent sent no per-file list (only the raw TOTAL `r`), so we walk OUR OWN stored
+// raw copy of each wanted transcript (`listRawFiles`) and hand back `{rel: bytes}`;
+// the agent diffs its local files against it exactly as before. `ids` is the
+// wanted (short) set from `inventoryCursors`, itself bounded by the agent's
+// inventory window and by ARCHIVE_MANIFEST_CURSOR_MAX, so no separate work budget
+// is needed here.
+function rawCursorsForIds(ids) {
+  openDb();
+  const out = {};
+  for (const id of Array.isArray(ids) ? ids : []) {
+    const files = listRawFiles(id);
+    if (!files || !files.length) continue;
+    const have = {};
+    for (const f of files) if (f && f.path && f.bytes > 0) have[f.path] = f.bytes;
+    if (Object.keys(have).length) out[id] = have;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 // The budget state the heartbeat reply carries back beside archiveHave (XERK-267):
 // which of these transcripts have already spent their per-transcript budget, and
 // whether the store as a whole is full. It lets the agent shed BEFORE the bytes
@@ -1847,7 +1939,8 @@ module.exports = {
   slugify, archiveRelPath, resolveNewRelPath, __RELPATH_PROBE_MAX: RELPATH_PROBE_MAX,
   ftsQuery, byteCeiling, shedFilePayloads,
   openDb, closeDb, rebuildIndex,
-  ingestChunk, manifestCursors, archiveLimits, normalizeMeta, META_TEXT_MAX,
+  ingestChunk, manifestCursors, inventoryCursors, rawCursorsForIds,
+  archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).
   ingestRaw, rawCursors, rawLimits, listRawFiles, rawFileFor,
   safeRawRel, rawDirFor, rawFilePath,
