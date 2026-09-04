@@ -10,6 +10,7 @@ import com.xerktech.turma.net.Dictation
 import com.xerktech.turma.net.FleetRepository
 import com.xerktech.turma.net.HubClient
 import com.xerktech.turma.net.LiveTail
+import com.xerktech.turma.net.OidcController
 import com.xerktech.turma.net.Updater
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -25,6 +26,14 @@ class AppContainer(context: Context) {
     val client = HubClient(config)
     val fleet = FleetRepository(client, config, appScope)
     val liveTail = LiveTail(client, config)
+
+    /**
+     * Native Authentik SSO (XERK-591). Here rather than in the LoginViewModel
+     * because the flow spans a Custom Tab round-trip — it is started on the login
+     * screen but its deep-link outcome arrives on the Activity, possibly after
+     * process death — so its state must outlive any one composable.
+     */
+    val oidc = OidcController(client, config)
 
     /**
      * The org scope (XERK-62). Held here rather than in a ViewModel because it is

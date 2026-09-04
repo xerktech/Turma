@@ -4,6 +4,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -60,12 +63,40 @@ fun TurmaApp(
     wide: Boolean,
     pendingDeepLink: MainActivity.DeepLink?,
     onDeepLinkConsumed: () -> Unit,
+    pendingOidc: MainActivity.OidcLink? = null,
+    onOidcConsumed: () -> Unit = {},
 ) {
     val nav = rememberNavController()
     val ctx = LocalContext.current
     val settings by container.config.state.collectAsStateWithLifecycle()
     val textSize by container.textSize.size.collectAsStateWithLifecycle()
     val start = if (settings.configured) TopDest.DASHBOARD.route else Routes.LOGIN
+
+    // The native SSO Custom Tab returns here as a deep link (XERK-591): redeem
+    // the handoff code for the session token. On success `configured` flips true
+    // and LoginScreen navigates on; register push as the password path does.
+    LaunchedEffect(pendingOidc) {
+        val o = pendingOidc ?: return@LaunchedEffect
+        container.oidc.complete(o.code, o.error)
+        if (container.config.current.configured) PushRegistrar.register(ctx, container)
+        onOidcConsumed()
+    }
+
+    // Return to the login screen the moment we lose our credential (XERK-591): an
+    // SSO session whose shorter TTL lapsed is dropped by HubClient on a 401,
+    // flipping `configured` false — without this the app would sit on a screen of
+    // failed calls until relaunch. Fires only on the true→false edge, so it never
+    // interferes with the initial unconfigured start or a normal sign-in.
+    var wasConfigured by rememberSaveable { mutableStateOf(settings.configured) }
+    LaunchedEffect(settings.configured) {
+        if (wasConfigured && !settings.configured) {
+            nav.navigate(Routes.LOGIN) {
+                popUpTo(0) { inclusive = true }
+                launchSingleTop = true
+            }
+        }
+        wasConfigured = settings.configured
+    }
 
     // Unregister push, drop the stored credentials, and return to the login
     // screen clearing the whole back stack (so Back can't re-enter the app).

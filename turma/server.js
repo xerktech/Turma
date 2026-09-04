@@ -733,6 +733,35 @@ const OIDC_SID_COOKIE = "hub_oidc";
 // single-user one, but a real hole once the epic adds identity-based authz.
 const OIDC_STATE_COOKIE = "hub_oidc_state";
 
+// ---- Native-app SSO handoff (XERK-591, Android) -----------------------------
+// A mobile app can't run a browser-cookie redirect flow: after the callback sets
+// `hub_session` in the system browser (Custom Tab), the app's own HTTP client
+// cannot read that cookie. So a MOBILE-initiated OIDC flow ends by handing the
+// session token back to the app over an app deep link, PKCE-protected so a
+// hijacked link is useless:
+//   - the app sends `mobile=<code_challenge>` (SHA-256 of a secret verifier it
+//     keeps) when starting `/auth/oidc/login`; it rides the tx to the callback,
+//   - on success the callback mints a single-use handoff `code`, stores it
+//     against {token, challenge}, and 302s to `<redirect>?code=<code>`,
+//   - the app then POSTs {code, verifier} to `/api/oidc/mobile/exchange`; the hub
+//     releases the token only if SHA-256(verifier) === the stored challenge.
+// The `turma://` redirect is between hub and app only — it is NEVER sent to the
+// IdP (the IdP's registered redirect_uri stays OIDC_REDIRECT_URI), so this adds
+// no Authentik configuration. The token the app receives is the SAME opaque
+// `hub_session` value the cookie carries, so it rides the existing
+// `userAuthorized` gate with no new authorization decision.
+const OIDC_MOBILE_REDIRECT = (process.env.TURMA_OIDC_MOBILE_REDIRECT || "turma://oidc-callback").trim();
+// Pending mobile handoffs: code -> {token, challenge, at}. Single-use, short TTL
+// (the app exchanges immediately after the deep link fires). Bounded so a flood
+// of mobile logins can't grow it. In-memory like oidcTx — a login interrupted by
+// a restart just retries.
+const oidcHandoffs = new Map();
+const OIDC_HANDOFF_TTL_MS = 2 * 60 * 1000; // deep link -> exchange is seconds
+const OIDC_HANDOFF_MAX = 2000;
+// A mobile challenge is base64url(SHA-256(verifier)); bound its length so a
+// malformed one can't sit in a tx. 43 chars is a 32-byte base64url digest.
+const OIDC_CHALLENGE_MAX = 200;
+
 // ---- Group-based access (XERK-594, epic XERK-591) ---------------------------
 // The `groups` claim (requested via OIDC_SCOPES above) IS the authorization: an
 // AD group maps to hub access, and removing a user from that group revokes
@@ -7376,6 +7405,46 @@ const OIDC_CACHE_TTL_MS = 60 * 60 * 1000;
 function oidcSweep(now = Date.now()) {
   for (const [k, v] of oidcTx) if (now - v.at > OIDC_TX_TTL_MS) oidcTx.delete(k);
   for (const [k, v] of oidcSessions) if (now - v.at > SESSION_TTL_MS) oidcSessions.delete(k);
+  for (const [k, v] of oidcHandoffs) if (now - v.at > OIDC_HANDOFF_TTL_MS) oidcHandoffs.delete(k);
+}
+
+// Store a pending mobile handoff (XERK-591), sweeping expired ones and dropping
+// the oldest at the ceiling — same discipline as oidcPutTx.
+function oidcPutHandoff(code, rec) {
+  oidcSweep();
+  while (oidcHandoffs.size >= OIDC_HANDOFF_MAX) {
+    const oldest = oidcHandoffs.keys().next().value;
+    if (oldest === undefined) break;
+    oidcHandoffs.delete(oldest);
+  }
+  oidcHandoffs.set(code, rec);
+}
+
+// Consume a handoff: return its record if the code is live and the presented
+// verifier hashes to the stored challenge, else null. Single use — the code is
+// deleted whatever the verifier, so a wrong guess burns it (no oracle to retry
+// against). A constant-time compare guards the challenge check.
+function oidcTakeHandoff(code, verifier, now = Date.now()) {
+  const rec = code ? oidcHandoffs.get(code) : null;
+  if (rec) oidcHandoffs.delete(code);
+  if (!rec || now - rec.at > OIDC_HANDOFF_TTL_MS) return null;
+  const got = pkceChallenge(String(verifier || ""));
+  const want = String(rec.challenge || "");
+  if (got.length !== want.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want))) return null;
+  return rec;
+}
+
+// Build the app deep-link URL the mobile callback redirects to, appending the
+// outcome params (a handoff `code` on success, or an `error` kind). Built by
+// string concatenation rather than `new URL` so an unusual custom scheme
+// (turma://…) is preserved verbatim; the values are query-encoded.
+function oidcMobileRedirect(params) {
+  const q = Object.entries(params)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join("&");
+  const sep = OIDC_MOBILE_REDIRECT.includes("?") ? "&" : "?";
+  return q ? `${OIDC_MOBILE_REDIRECT}${sep}${q}` : OIDC_MOBILE_REDIRECT;
 }
 
 // Store a pending transaction, sweeping expired ones and dropping the oldest if
@@ -11153,7 +11222,14 @@ const server = http.createServer(async (req, res) => {
       // OIDC login/callback/logout (XERK-592) need no existing session — a
       // browser starting the flow has none, and the callback lands with the
       // IdP's code before one exists. They authenticate themselves.
-      url.pathname.startsWith("/auth/oidc/");
+      url.pathname.startsWith("/auth/oidc/") ||
+      // The native-app SSO handoff (XERK-591): `/api/oidc/config` is a public
+      // capability probe (the app asks whether to show the SSO button before it
+      // has any session), and `/api/oidc/mobile/exchange` authenticates itself
+      // with the single-use handoff code + PKCE verifier — the app has no
+      // session until it succeeds.
+      url.pathname === "/api/oidc/config" ||
+      url.pathname === "/api/oidc/mobile/exchange";
 
     // The archive-ingest endpoint is agent-pushed (bearer token), like the
     // heartbeat — it must not require the user login the rest of /api/* does.
@@ -11315,6 +11391,35 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ ok: true }));
     }
 
+    // ---- Native-app SSO handoff (XERK-591) -----------------------------------
+    // Public capability probe: tells a native app whether to offer "Sign in with
+    // SSO" before it holds any session. No secrets — only whether OIDC is on.
+    if (req.method === "GET" && url.pathname === "/api/oidc/config") {
+      return json(res, 200, { enabled: OIDC_ENABLED });
+    }
+
+    // Exchange a single-use handoff code (delivered to the app over its deep
+    // link) for the hub_session token. The app proves it started this flow by
+    // presenting the PKCE `verifier` whose SHA-256 the callback stored as the
+    // challenge — so a deep link intercepted by another app is useless without
+    // it. Self-authenticating, so it sits in the isLoginRoute exempt set.
+    if (req.method === "POST" && url.pathname === "/api/oidc/mobile/exchange") {
+      if (!OIDC_ENABLED) return json(res, 404, { error: "OIDC is not configured" });
+      let body;
+      try {
+        body = JSON.parse((await readBody(req)) || "{}");
+      } catch {
+        return json(res, 400, { error: "invalid request body" });
+      }
+      const rec = oidcTakeHandoff(String(body.code || ""), String(body.verifier || ""));
+      if (!rec) return json(res, 400, { error: "invalid or expired handoff code" });
+      // The app sends this token as `Cookie: hub_session=<token>` on every
+      // request — the SAME value the browser cookie carries, so it rides the
+      // existing userAuthorized gate. ttlMs lets the app re-prompt SSO before it
+      // lapses (OIDC sessions are deliberately shorter-lived, XERK-594).
+      return json(res, 200, { token: rec.token, ttlMs: OIDC_SESSION_TTL_MS });
+    }
+
     // ---- OIDC relying-party routes (XERK-592) --------------------------------
     // Begin the Authorization Code + PKCE flow: mint a transaction and redirect
     // the browser to the IdP's authorization endpoint.
@@ -11326,7 +11431,12 @@ const server = http.createServer(async (req, res) => {
         const nonce = crypto.randomBytes(32).toString("base64url");
         const verifier = crypto.randomBytes(32).toString("base64url");
         const next = oidcSafeNext(url.searchParams.get("next"));
-        oidcPutTx(state, { nonce, verifier, next, at: Date.now() });
+        // A native app starts the flow with `mobile=<code_challenge>` (XERK-591).
+        // It rides the tx so the callback knows to hand the session back over the
+        // app deep link instead of setting a browser cookie + redirecting.
+        const mobileRaw = url.searchParams.get("mobile") || "";
+        const mobile = mobileRaw && mobileRaw.length <= OIDC_CHALLENGE_MAX ? mobileRaw : "";
+        oidcPutTx(state, { nonce, verifier, next, mobile, at: Date.now() });
         const auth = new URL(disco.authorization_endpoint);
         auth.searchParams.set("response_type", "code");
         auth.searchParams.set("client_id", OIDC_CLIENT_ID);
@@ -11354,20 +11464,29 @@ const server = http.createServer(async (req, res) => {
     // the code (PKCE), validate the ID token, and issue the hub session.
     if (req.method === "GET" && url.pathname === "/auth/oidc/callback") {
       if (!OIDC_ENABLED) return json(res, 404, { error: "OIDC is not configured" });
-      const idpError = url.searchParams.get("error");
-      if (idpError) {
-        console.log(`OIDC callback error from IdP: ${logName(idpError)}`);
-        res.writeHead(302, { Location: "/login?error=oidc", "Cache-Control": "no-store" });
-        return res.end();
-      }
       const state = url.searchParams.get("state") || "";
       const code = url.searchParams.get("code") || "";
+      const idpError = url.searchParams.get("error");
       const stateCookie = cookies(req)[OIDC_STATE_COOKIE] || "";
       const tx = state ? oidcTx.get(state) : null;
       if (tx) oidcTx.delete(state); // single use, whatever happens next
       const clearState = authCookie(req, OIDC_STATE_COOKIE, "", 0);
+      // A MOBILE flow (XERK-591) reports every outcome over the app deep link,
+      // never the hub's HTML /login page — the app is waiting on the deep link,
+      // and dropping it into a web page strands the user in the Custom Tab. Only
+      // a flow whose tx we recognise is trusted to deep-link; a dead/forged tx
+      // falls to the plain outcome (the app times out and reports failure).
+      const mobile = tx && tx.mobile ? tx.mobile : "";
+      const failLocation = (kind) => (mobile ? oidcMobileRedirect({ error: kind }) : `/login?error=${kind}`);
+      if (idpError) {
+        console.log(`OIDC callback error from IdP: ${logName(idpError)}`);
+        res.writeHead(302, { Location: failLocation("oidc"), "Cache-Control": "no-store", "Set-Cookie": clearState });
+        return res.end();
+      }
       // Reject unless the transaction is live AND the browser presented the same
-      // `state` in its bound cookie as came back in the query (login-CSRF).
+      // `state` in its bound cookie as came back in the query (login-CSRF). A
+      // mobile flow reaching here has no trusted redirect (tx is null/dead), so
+      // it deliberately falls to the JSON 400 rather than deep-linking.
       if (!state || !code || !tx || Date.now() - tx.at > OIDC_TX_TTL_MS || stateCookie !== state) {
         res.writeHead(400, {
           "Content-Type": "application/json",
@@ -11398,7 +11517,22 @@ const server = http.createServer(async (req, res) => {
               `[${logName(OIDC_USER_GROUP)}, ${logName(OIDC_ADMIN_GROUP)}]`
           );
           res.writeHead(302, {
-            Location: "/login?error=forbidden",
+            Location: failLocation("forbidden"),
+            "Cache-Control": "no-store",
+            "Set-Cookie": clearState,
+          });
+          return res.end();
+        }
+        // A MOBILE flow ends here: the app can't read a browser cookie, so mint a
+        // single-use handoff code bound to the app's PKCE challenge and hand the
+        // session token back over the deep link (exchanged at /api/oidc/mobile/
+        // exchange). No session/sid cookie is set — the Custom Tab is throwaway.
+        if (mobile) {
+          const token = issueSessionToken(OIDC_SESSION_TTL_MS);
+          const handoff = crypto.randomBytes(32).toString("base64url");
+          oidcPutHandoff(handoff, { token, challenge: mobile, at: Date.now() });
+          res.writeHead(302, {
+            Location: oidcMobileRedirect({ code: handoff }),
             "Cache-Control": "no-store",
             "Set-Cookie": clearState,
           });
@@ -11426,6 +11560,13 @@ const server = http.createServer(async (req, res) => {
         return res.end();
       } catch (e) {
         console.log(`OIDC callback failed: ${e.message}`);
+        // A MOBILE flow deep-links EVERY outcome (XERK-591): a token-exchange /
+        // ID-token-validation failure here must reach the app as ?error=oidc,
+        // not a raw JSON page the user would be stranded on in the Custom Tab.
+        if (mobile) {
+          res.writeHead(302, { Location: failLocation("oidc"), "Cache-Control": "no-store", "Set-Cookie": clearState });
+          return res.end();
+        }
         res.writeHead(502, {
           "Content-Type": "application/json",
           "Cache-Control": "no-store",
@@ -14835,6 +14976,13 @@ if (process.env.TURMA_TEST) {
     oidcOrigin,
     oidcTx,
     oidcSessions,
+    // Native-app SSO handoff (XERK-591): the map + pure helpers, so the
+    // PKCE-bound code exchange is unit-tested offline.
+    OIDC_MOBILE_REDIRECT,
+    oidcHandoffs,
+    oidcPutHandoff,
+    oidcTakeHandoff,
+    oidcMobileRedirect,
     authCookie,
     __setOidcCaches(discovery, jwks) {
       oidcDiscoveryCache = discovery ? { at: Date.now(), doc: discovery } : null;
@@ -15129,6 +15277,9 @@ if (process.env.TURMA_TEST) {
     // /login?breakglass=1 (logged separately above).
     if (OIDC_ENABLED) {
       console.log(`OIDC login enabled (gates human routes; agents stay on token auth) -> issuer ${OIDC_ISSUER}, client ${OIDC_CLIENT_ID}`);
+      // Native-app SSO handoff (XERK-591): the deep link the Android app is
+      // handed the session token over. Hub<->app only, never sent to the IdP.
+      console.log(`OIDC native-app SSO handoff enabled -> mobile redirect ${OIDC_MOBILE_REDIRECT}`);
       // Group-based access + the shorter OIDC session TTL (XERK-594): visible at
       // boot so an operator can tell an ENFORCING hub from one that admits any
       // authenticated user (both group names emptied), and knows the re-check

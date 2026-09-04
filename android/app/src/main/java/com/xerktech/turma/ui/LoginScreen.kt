@@ -23,15 +23,19 @@ import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import android.net.Uri
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.onFocusChanged
@@ -47,16 +51,36 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.R
+import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.vm.LoginViewModel
+import kotlinx.coroutines.launch
 
 @Composable
 fun LoginScreen(onSignedIn: () -> Unit, vm: LoginViewModel = viewModel()) {
+    val ctx = LocalContext.current
+    val container = (ctx.applicationContext as TurmaApplication).container
     val ui by vm.state.collectAsStateWithLifecycle()
-    LaunchedEffect(ui.done) { if (ui.done) onSignedIn() }
+    val oidc by container.oidc.ui.collectAsStateWithLifecycle()
+    val settings by container.config.state.collectAsStateWithLifecycle()
+    val scope = rememberCoroutineScope()
+    // Signed in EITHER way — a break-glass password (vm) OR an SSO session token
+    // (container.oidc) — flips `configured`. Observing it here covers both paths
+    // with one navigation, instead of a per-path `done` flag (XERK-591).
+    LaunchedEffect(settings.configured) { if (settings.configured) onSignedIn() }
+
+    // begin() produces the Custom Tab URL asynchronously (after probing the hub);
+    // launch it in the system browser so passkeys/WebAuthn work, then consume it
+    // so a recomposition doesn't relaunch.
+    LaunchedEffect(oidc.launchUrl) {
+        val u = oidc.launchUrl ?: return@LaunchedEffect
+        runCatching { CustomTabsIntent.Builder().build().launchUrl(ctx, Uri.parse(u)) }
+        container.oidc.launchConsumed()
+    }
 
     var url by rememberSaveable { mutableStateOf(vm.current.hubUrl) }
     var user by rememberSaveable { mutableStateOf(vm.current.user) }
     var pass by rememberSaveable { mutableStateOf("") }
+    val busy = ui.busy || oidc.busy
 
     Box(
         // imePadding (XERK-76): shrink the scroll area above the soft keyboard so
@@ -90,17 +114,34 @@ fun LoginScreen(onSignedIn: () -> Unit, vm: LoginViewModel = viewModel()) {
                     modifier = Modifier.padding(top = 10.dp, bottom = 22.dp),
                 )
 
-                ui.error?.let { ErrorBox(it) }
+                (ui.error ?: oidc.error)?.let { ErrorBox(it) }
 
                 Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
                     WebField(url, { url = it }, "Hub URL", keyboardType = KeyboardType.Uri)
+                    // Single sign-on (XERK-591): opens the hub's Authentik flow in
+                    // a Custom Tab; the hub deep-links the session back. Shown
+                    // first — it's the primary path where an org uses SSO — and
+                    // needs only the hub URL. begin() reports if this hub has no SSO.
+                    PrimaryButton(
+                        if (oidc.busy) "Signing in…" else "Sign in with SSO",
+                        onClick = { scope.launch { container.oidc.begin(url) } },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !busy && url.isNotBlank(),
+                    )
+                    Text(
+                        "or sign in with a local credential",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    )
                     WebField(user, { user = it }, "Username")
                     WebField(pass, { pass = it }, "Password", password = true)
                     PrimaryButton(
                         if (ui.busy) "Signing in…" else "Sign in",
                         onClick = { vm.signIn(url, user, pass) },
                         modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                        enabled = !ui.busy && url.isNotBlank() && user.isNotBlank() && pass.isNotBlank(),
+                        enabled = !busy && url.isNotBlank() && user.isNotBlank() && pass.isNotBlank(),
                     )
                 }
 

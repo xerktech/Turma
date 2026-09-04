@@ -38,6 +38,15 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Native Authentik SSO (XERK-591): the hub redirects the OIDC
+                 Custom Tab back here with the single-use session handoff code.
+                 Must match the hub's TURMA_OIDC_MOBILE_REDIRECT + core.Oidc.REDIRECT. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="turma" android:host="oidc-callback" />
+            </intent-filter>
         </activity>
 
         <!-- FCM. Guarded at runtime: with no google-services.json the default
