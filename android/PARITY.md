@@ -593,7 +593,10 @@ those are marked `[MODEL]`.
   control, so on a phone an archived session is still read-only. The hub does all the work — the port
   is a button, an eligible-host list (online + has the repo, deliberately NOT org-scoped: an archived
   session has no agent left to compare an org against), and following the returned `migrationId`
-  through the `migrations` payload exactly as the existing Move flow does.
+  through the `migrations` payload exactly as the existing Move flow does. XERK-453 added a soft
+  cross-org WARNING to the web picker (a `⚠ <org>` badge + a `confirm()` when the target's decided
+  `org` differs from the archived row's served `siteKey`) — a heads-up, never a block; the port
+  should carry it when the restore control is built.
 - **P2 Say when a start was REFUSED (XERK-265, XERK-276).** Agents now report a declined resume/import
   on the heartbeat, and the hub serves it per cmdId as `agent.spawnRefusals[cmdId] = {error, at}`. The
   web ends its spawn-follow wait and toasts the reason ("Couldn't start session: the host is at

@@ -7169,6 +7169,30 @@ function credentialsMatch(user, pass) {
   return safeEqual(user || "", TURMA_USER) && safeEqual(pass || "", TURMA_PASSWORD);
 }
 
+// The break-glass local login (XERK-595, epic XERK-591). TURMA_USER/TURMA_PASSWORD
+// is a LOCAL credential that does not depend on the IdP, so it is the fallback
+// that keeps the hub reachable when Authentik/OIDC is down — the same role Argo
+// CD's local `admin` and Grafana's built-in `admin` play (the pattern in the
+// ArgoCD repo's .claude/rules/break-glass.md; ours is .claude/rules/turma-break-glass.md).
+//
+// Native OIDC (XERK-592) only ADDS a way to obtain the SAME `hub_session` cookie
+// this login issues — it never replaces or gates it, and authorization stays the
+// single `userAuthorized` decision. The guarantee this ticket makes, exercised
+// by the tests below, is that a LATER change making OIDC the mandatory human
+// login MUST NOT be able to lock everyone out: it may not stop `userAuthorized`
+// accepting this credential (cookie or Basic, the headless channel), and it may
+// not drop `/login`/`/api/login` from the `isLoginRoute` exempt set nor redirect
+// `/login?breakglass=1` at the IdP. So the IdP being unreachable can never be a
+// total lockout while a break-glass credential is configured.
+//
+// Enabled == a local credential is configured. Unset means "no local login"
+// (fully open access, already warned about at boot) — which is ALSO no
+// break-glass, so making OIDC mandatory against an unset password would be the
+// lockout this guards; boot logs whether it is set.
+function breakGlassEnabled() {
+  return !!TURMA_PASSWORD;
+}
+
 // ---- Login sessions (signed cookie) -----------------------------------------
 // A session token is "<expiryMs>.<hmac>" — the browser can't forge it and it
 // self-expires. HttpOnly keeps it out of reach of any injected script.
@@ -14615,6 +14639,7 @@ if (process.env.TURMA_TEST) {
     triggerAuthorized,
     safeEqual,
     credentialsMatch,
+    breakGlassEnabled,
     issueSessionToken,
     sessionTokenValid,
     // OIDC relying-party core (XERK-592). The pure pieces are exported so the
@@ -14809,6 +14834,15 @@ if (process.env.TURMA_TEST) {
   }
 } else {
   if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");
+  // The local login is the break-glass path (XERK-595): the IdP-independent way
+  // in when SSO is down, and the thing a future mandatory-OIDC switch must never
+  // disable. Say at boot whether one exists, so a lockout risk is visible before
+  // OIDC is made mandatory rather than discovered during an outage.
+  console.log(
+    breakGlassEnabled()
+      ? "Break-glass local login ENABLED (TURMA_USER/TURMA_PASSWORD) — reachable at /login?breakglass=1 or via Basic auth if the IdP is down"
+      : "WARNING: no break-glass login — TURMA_PASSWORD is unset, so there is no IdP-independent way in; set it before OIDC is made mandatory"
+  );
   if (!TURMA_AGENT_TOKEN) console.warn("WARNING: TURMA_AGENT_TOKEN not set — heartbeat and tunnel endpoints are unauthenticated");
   if (!TURMA_TRIGGER_TOKEN) console.warn("WARNING: TURMA_TRIGGER_TOKEN not set — POST /api/trigger accepts only the user login (no dedicated token)");
   // The fleet master proves only "some agent", never WHICH one, so until every
