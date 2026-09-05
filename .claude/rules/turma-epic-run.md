@@ -4,12 +4,13 @@ paths:
   - turma/tests/server.test.js
 ---
 
-# Epic auto-orchestration run (XERK-635/636, epic XERK-633)
+# Epic auto-orchestration run (XERK-635/636/637, epic XERK-633)
 
 The hub's machinery for "work an epic's children in dependency order, start/close hands-off".
 XERK-635 (B) is the HUB STATE — the durable run record, its dependency DAG, the manual-start route,
-and the never-auto-start gate. XERK-636 (C) is the DRIVER that dispatches ready children. The board
-UI (E) is a later subtask; do not add it here.
+and the never-auto-start gate. XERK-636 (C) is the DRIVER that dispatches ready children. XERK-637
+(D) ADVANCES + COMPLETES the run — auto-merge/close a run's children and write the epic Done. The
+board UI (E) is a later subtask; do not add it here.
 
 Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every ticket
 (`normalizeJira` coerces them). This subtask consumes those fields; it collects nothing itself.
@@ -111,6 +112,50 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   keeps it out of the org AUTO-MERGE stream (`autoMergeSession`) — correct: the epic run owns a
   child's whole lifecycle, close included.
 
+## Advancing + completing the run (XERK-637 [D])
+
+D advances an ARMED run and completes it. It reads B's run record and reacts to the LIVE board's Done
+edges — it NEVER recomputes the DAG (that is C's readiness job, XERK-636); B's `waves`/`children` are
+static and the only thing that changes is a child's board Done-ness.
+
+- **A child of an armed, non-terminal run rides the SAME XERK-550 sweeps.** `epicRunChildSession`
+  returns the `{siteKey,key,row,repo}` shape `autoMergeSession` does, and both `autoMergeSweep` +
+  `autoCloseSweep` act on `autoMergeSession(s) || epicRunChildSession(s)`. The two are DISJOINT by
+  construction (autoMergeSession nulls on any epic child via the content gate), so the OR is safe.
+- **Arming the run is the hands-off opt-in — it OVERRIDES the org auto-merge toggle AND the bug-only
+  floor.** An epic's children are tasks/stories, not just bugs, and the operator armed the run
+  deliberately (operator-confirmed for XERK-637). So `epicRunChildSession` requires neither
+  `autoMergeOrgs[site]` nor `AUTO_MERGE_ISSUE_TYPES` — only membership in an armed run's `children`
+  and a non-Done row. This is why XERK-635 excludes epic children from the ORG stream: the run owns
+  their whole lifecycle (merge + close), and an UNARMED epic's child stays fully excluded (regression-
+  pinned).
+- **Both sweeps early-return unless `orgsWithAutoMerge().size || anyArmedEpicRun()`** — an armed run
+  is the second reason to run them. `anyArmedEpicRun` = any run whose `state !== "done"`.
+- **Chaining is C's, not D's.** The Done edge D produces (auto-close) or a human move is what C's
+  driver re-evaluates to start the next wave. D adds NO wave-start code.
+- **Epic completion (`epicRunCompleteSweep`, on the 15s interval after `autoCloseSweep`)**: once every
+  `run.children` is Done on the board (reusing C's `epicRunAllChildrenDone`), write the EPIC to Done
+  (XERK-138 write-back via `pickBoardWriteHost`) and ensure the run is terminal (`state:"done"`). The
+  epic is an ORGANIZER — this is the ONLY step that transitions it, and the never-auto-start gate
+  keeps it off every spawn path.
+  - **The epic-Done WRITE is keyed off the BOARD + a once-guard, NOT the run's `state` — load-bearing
+    next to C's `advanceEpicRunState`.** C sets a completed run's `state:"done"` in the SAME tick
+    (`epicRunDriveSweep` runs before this sweep), and `armEpicRun` sets it for a run ARMED
+    already-complete (which C then skips) — either would suppress the write if it gated on `state`. So
+    D fires when `!epicIsDone(epic) && !epicDoneWritten.has(tkey)`. **C owns the run-STATE lifecycle;
+    D owns the epic-Done tracker WRITE** — C never writes the epic, D's `state:"done"` set is only a
+    fallback (a no-op once C ran, but it still completes a CYCLE-blocked run whose children a human all
+    moved Done, which C deliberately leaves blocked).
+  - **Orphan guard (autoCloseSweep's):** queue the epic-Done write BEFORE going terminal — if no
+    board-cred host can take it (`agentGapError`), stand down and retry, never mark the run done behind
+    an unmade write.
+  - **Once-per-run:** `epicDoneWritten` (in-memory, this lifetime) + the epic row's own board Done
+    (durable, survives a restart that empties the Set). A rare double-write in the restart window is a
+    harmless no-op — the agent re-validates the transition against a fresh read, exactly like
+    `autoClosed`.
+  - A run with NO children never auto-completes (`epicRunAllChildrenDone` returns false for an empty
+    list — an empty run was armed against nothing).
+
 ## Tests
 
 - The `XERK-635:` cases in `server.test.js`: `buildEpicWaves` (diamond, external-blocker/self-block,
@@ -123,3 +168,9 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   `pausedSubscriptions`), the double-start guards (existing session, repeated passes, sweep + manual
   click reusing the in-flight cmdId), the acked-no-session backoff (no 15s re-dispatch), the run
   advancing to `done`, and `epicChildBlockersDone`.
+- The `XERK-637:` cases in `server.test.js`: an armed child auto-merges past the opt-in + bug floor,
+  auto-closes (Done + kill) past the opt-in, an UNARMED epic child stays excluded, a child added
+  after arming (not in `run.children`) stays excluded, chain-advance (auto-close unblocks dependents
+  without completing the epic), epic-Done-written-once + run terminal, mixed auto/human completion,
+  the gapped-host stand-down, and a run armed already-complete still writing the epic Done (with the
+  board stopping a post-restart re-fire).

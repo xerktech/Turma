@@ -10530,6 +10530,46 @@ function autoMergeRowIndex(rows) {
   return byKey;
 }
 
+// A RUNNING ticket session that belongs to an ARMED, non-terminal epic run
+// (XERK-637, epic XERK-633). The epic run OWNS its children's whole lifecycle —
+// merge AND close — which is exactly why XERK-635 excludes epic children from the
+// org auto-merge stream (autoMergeSession returns null for them via the content
+// gate). Arming a run is the operator's deliberate hands-off opt-in, so a child's
+// merge-ready PR is auto-merged and the child auto-closed regardless of the org
+// auto-merge toggle OR the bug-only floor (an epic's children are tasks/stories,
+// not just bugs). Returns {siteKey, key, row, repo} shaped IDENTICALLY to
+// autoMergeSession so the XERK-550 sweeps act on it with no other change; null if
+// the session is not an armed-run child. Disjoint from autoMergeSession by
+// construction (that one nulls on any epic child), so the two OR together safely.
+function epicRunChildSession(s, byKey, rows) {
+  if (!s || s.status !== "running") return null;
+  const t = s.ticket;
+  if (!t || !t.key) return null;
+  const siteKey = t.siteKey || "";
+  const row = byKey.get(siteKey + "\x00" + t.key);
+  if (!row) return null;                          // the board doesn't list it yet
+  const epicKey = row.epicKey;
+  if (typeof epicKey !== "string" || !epicKey) return null;   // not an epic child
+  const run = epicRuns[epicRunKey(siteKey, epicKey)];
+  if (!run || run.state === "done") return null;  // no armed, non-terminal run
+  // Only a child the run was ARMED against (present in its DAG) — a child added to
+  // the epic after arming, without a re-arm, is not part of this run.
+  if (!Array.isArray(run.children) || !run.children.includes(t.key)) return null;
+  // A child a human already moved to Done needs neither merge nor close — the
+  // auto-close pass skips a done row anyway, but bail early so its PR is never
+  // merged after the ticket was abandoned/finished out of band.
+  if (row.statusCategory === "done") return null;
+  const repo = ticketRepo(siteKey, t.key, rows);
+  return { siteKey, key: t.key, row, repo };
+}
+
+// Any epic run still in flight (armed and not yet terminal). The XERK-550 sweeps
+// early-return unless an org opted into auto-merge; an armed epic run is a SECOND
+// reason to run them, since it drives its own children's merge/close (XERK-637).
+function anyArmedEpicRun() {
+  return Object.values(epicRuns).some((r) => r && r.state !== "done");
+}
+
 // owner/repo (lower-cased) of a GitHub PR url, or null. Auto-merge serializes
 // merges PER BASE REPO so it never races ITSELF (XERK-563): a squash-merge moves
 // the base branch, so a second concurrent merge to the same repo hits GitHub's
@@ -10558,12 +10598,22 @@ const autoMergeState = new Map();
 // "<siteKey>\x00<key>" tickets already moved to Done by autoCloseSweep, so the
 // Done write fires at most once per hub lifetime (like autoStopped for the kill).
 const autoClosed = new Set();
+// "<siteKey>\x00<epicKey>" epics already written to Done by epicRunCompleteSweep,
+// so the epic-Done write fires at most once per hub lifetime (like autoClosed for
+// a child). The DURABLE guard is the run's own persisted state:"done" — this Set
+// only stops a re-fire within one hub lifetime; after a restart a run already
+// marked done is skipped by state, and the setTicketStatus write is re-validated
+// against a fresh read agent-side, so a rare double-write is a harmless no-op.
+const epicDoneWritten = new Set();
 
 // PHASE 1: merge every merge-ready PR of an eligible, FINISHED session. The
 // merge itself is the agent's job (it holds `gh` auth + the branch), so this
 // only routes a mergePr to the session's own host.
 function autoMergeSweep() {
-  if (!orgsWithAutoMerge().size) return;
+  // Run when an org opted into auto-merge OR an epic run is in flight — an armed
+  // run drives its own children's merge/close regardless of the org toggle
+  // (XERK-637), routed below through the same machinery via epicRunChildSession.
+  if (!orgsWithAutoMerge().size && !anyArmedEpicRun()) return;
   const now = Date.now();
   const rows = fleetTicketRows();
   const byKey = autoMergeRowIndex(rows);
@@ -10591,7 +10641,9 @@ function autoMergeSweep() {
   const dispatchedRepos = new Set();
   for (const [host, a] of Object.entries(agents)) {
     for (const s of a.sessions || []) {
-      if (!autoMergeSession(s, byKey, rows)) continue;
+      // An org-opt-in bug session OR an armed epic run's child (XERK-637) — the
+      // two are disjoint (autoMergeSession nulls on any epic child).
+      if (!(autoMergeSession(s, byKey, rows) || epicRunChildSession(s, byKey, rows))) continue;
       // Act only on a session that has FINISHED its own turn — never mid-work
       // (it may still be pushing commits, which drops the PR out of "ready"
       // anyway) and never while it is blocked asking the operator something.
@@ -10668,12 +10720,14 @@ function autoMergeSweep() {
 // the slot NOW rather than waiting out the ~10-min Jira poll that would surface
 // Done to autoStopSweep — the promptness the whole feature is about.
 function autoCloseSweep() {
-  if (!orgsWithAutoMerge().size) return;
+  // As with autoMergeSweep: an org opt-in OR an armed epic run (XERK-637).
+  if (!orgsWithAutoMerge().size && !anyArmedEpicRun()) return;
   const rows = fleetTicketRows();
   const byKey = autoMergeRowIndex(rows);
   for (const [host, a] of Object.entries(agents)) {
     for (const s of a.sessions || []) {
-      const elig = autoMergeSession(s, byKey, rows);
+      const elig = autoMergeSession(s, byKey, rows)
+        || epicRunChildSession(s, byKey, rows);
       if (!elig) continue;
       const prs = s.prs || [];
       if (!prs.length || !prs.every(prLanded)) continue;
@@ -10699,6 +10753,69 @@ function autoCloseSweep() {
         queueCommand(host, { type: "kill", sessionId: s.id });
         autoStopped.add(dk);
       }
+    }
+  }
+}
+
+// PHASE 3 (XERK-637): complete an epic run. Once EVERY child in an armed run has
+// reached Done — whether auto-closed above (a landed PR) or moved by a human out
+// of band — move the EPIC ITSELF to Done (the XERK-138 status write-back, routed
+// to a board-cred host of the org like autoCloseSweep) and mark the run terminal.
+//
+// The epic is an ORGANIZER: this is the ONLY step that ever transitions it, and
+// it never gets a work session (XERK-635's never-auto-start gate keeps it out of
+// every spawn path). The Done write is guarded once-per-run by `epicDoneWritten`
+// plus the durable state:"done" it sets, so a restart never re-fires it.
+//
+// The DAG is NOT recomputed here (that is C's readiness job, XERK-636) — the run
+// record's static waves/children are B's; D only reads them and reacts to the
+// live board's Done edges. Chaining (starting the newly-unblocked wave) is C's:
+// the Done edge this and autoCloseSweep produce is what C re-evaluates against.
+function epicRunCompleteSweep() {
+  if (!Object.keys(epicRuns).length) return;
+  const rows = fleetTicketRows();
+  const epicIsDone = (siteKey, key) => {
+    const r = rows.get(ticketQueueKey(siteKey, key));
+    return !!(r && r.row && r.row.statusCategory === "done");
+  };
+  for (const run of Object.values(epicRuns)) {
+    if (!run) continue;
+    const { siteKey, epicKey } = run;
+    // Reuse XERK-636's children-Done check — it returns false for an EMPTY child
+    // list too, so a run armed against nothing never auto-completes.
+    if (!epicRunAllChildrenDone(run, rows)) continue;   // a wave still in flight
+    const tkey = siteKey + "\x00" + epicKey;
+    // Every child is Done: the epic must reach Done exactly once. The write is
+    // keyed on the epic NOT already being Done on the board and NOT already
+    // written this lifetime — NOT on the run's `state`. Keying off `state` is
+    // wrong TWO ways here: XERK-636's advanceEpicRunState sets a completed run's
+    // state to "done" in this SAME tick (epicRunDriveSweep runs before this), so
+    // a state gate would let C's transition suppress this write; and armEpicRun
+    // sets state:"done" for a run ARMED already-complete (which C then skips)
+    // without ever writing the epic. Board + once-guard covers both, plus a
+    // human moving the epic Done out of band.
+    if (!epicIsDone(siteKey, epicKey) && !epicDoneWritten.has(tkey)) {
+      const wh = pickBoardWriteHost(siteKey, "setTicketStatus");
+      // Queue the epic-Done write BEFORE going terminal (autoCloseSweep's orphan
+      // guard): if no board-cred host can take it, stand down and retry — never
+      // let a run report finished with its epic still open behind an unmade write.
+      if (!wh || agentGapError(agents[wh], "setTicketStatus", "close an epic")) continue;
+      const cmdId = queueCommand(wh, { type: "setTicketStatus", issueKey: epicKey, category: "done" });
+      awaitResult(agents[wh], cmdId, "setTicketStatus");
+      rememberCmdHost(cmdId, wh, "setTicketStatus");
+      epicDoneWritten.add(tkey);
+    }
+    // The epic is Done or its write is on its way — ensure the run is terminal.
+    // Usually a no-op (advanceEpicRunState already set state:"done" this tick),
+    // but it still fires for a CYCLE-blocked run whose children a human all moved
+    // Done: C deliberately leaves a cycle run blocked, yet an epic whose work is
+    // genuinely finished must still complete.
+    if (run.state !== "done") {
+      run.state = "done";
+      run.updatedAt = Date.now();
+      scheduleEpicRunsSave();
+      invalidateAgentsCache();
+      sseBroadcast("epicRuns", epicRuns);
     }
   }
 }
@@ -10733,6 +10850,9 @@ setInterval(() => {
   // though the close normally waits a beat for the PR poll to read MERGED.
   autoMergeSweep();
   autoCloseSweep();
+  // Epic completion (XERK-637): after autoCloseSweep has produced any child Done
+  // edges this tick, move an all-children-Done epic to Done and retire its run.
+  epicRunCompleteSweep();
   // Drained AFTER the sweeps so a ticket the sweep just queued can go out in the
   // same tick, and a session auto-stop just freed is seen by the drain the beat
   // it lands. The heartbeat drains too (that's where capacity actually changes);
@@ -15446,6 +15566,13 @@ if (process.env.TURMA_TEST) {
     epicChildBlockersDone,
     epicRunAllChildrenDone,
     epicChildAttempts,
+    // Auto-close chaining + epic completion (XERK-637): the armed-run child
+    // eligibility the XERK-550 sweeps OR in, the completion sweep, and its
+    // once-per-run epic-Done guard.
+    epicRunChildSession,
+    anyArmedEpicRun,
+    epicRunCompleteSweep,
+    epicDoneWritten,
     // Hands-off auto-merge + close (XERK-550): the two sweeps, the shared
     // content gate, the per-org toggle + setter, and the state the tests drive.
     autoMergeSweep,
