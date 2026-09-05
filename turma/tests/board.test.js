@@ -2448,6 +2448,36 @@ test("board: the strip carries the id preserveScroll anchors its sideways scroll
   assert.match(html, /class="kanban-cols" id="kanbanCols"/);
 });
 
+// ---- The board widens its column area past the shared reading width (XERK-606) ----
+// The fixed-300px columns scroll off-screen at the shared --wrap long before a
+// wide monitor is full, so the board page alone widens its CONTENT column to
+// --wrap-board. The header must not move (it lives outside .wrap and caps itself
+// at --wrap), and the toolbar + footer are re-centred back at --wrap so they
+// still sit under it — only #board takes the extra width.
+test("board: the page widens only its column area; header/toolbar/footer stay at --wrap", () => {
+  const wrap = /--wrap:\s*(\d+)px/.exec(APP_CSS);
+  const wide = /--wrap-board:\s*(\d+)px/.exec(APP_CSS);
+  assert.ok(wrap && wide, "both --wrap and --wrap-board must be defined");
+  assert.ok(Number(wide[1]) > Number(wrap[1]),
+    "--wrap-board must be wider than the shared --wrap, or the board doesn't expand");
+  assert.match(APP_CSS, /\.wrap\.board-page\s*\{[^}]*max-width:\s*var\(--wrap-board\)/,
+    "the board page's .wrap must widen to --wrap-board");
+  // The toolbar + footer are pulled back to the reading width, centred, so they
+  // still line up under the header.
+  assert.match(APP_CSS,
+    /\.wrap\.board-page\s*>\s*\.board-bar[\s\S]*?max-width:\s*var\(--wrap\)[^}]*margin-inline:\s*auto/,
+    "the toolbar (and footer) must re-centre at --wrap");
+  assert.match(APP_CSS, /\.wrap\.board-page\s*>\s*\.footer/,
+    "the footer must be re-centred with the toolbar");
+  // The header is never given the wide width — that is what keeps it in place.
+  assert.doesNotMatch(APP_CSS, /\.site-header-in\s*\{[^}]*var\(--wrap-board\)/,
+    "the site header must never take the wide board width");
+  // The board page actually opts in.
+  const boardHtmlSrc = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
+  assert.match(boardHtmlSrc, /class="wrap board-page"/,
+    "board.html must apply the board-page class to opt into the wide column");
+});
+
 // ---------------------------------------------------------------------------
 // XERK-546: board.html's inline-script in-flight /api/agents snapshot merge
 // ---------------------------------------------------------------------------

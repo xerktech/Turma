@@ -61,8 +61,10 @@
   --shadow-sm: 0 1px 2px rgba(0,0,0,0.04), 0 2px 8px rgba(0,0,0,0.05);
   --shadow-md: 0 8px 24px rgba(0,0,0,0.10);
 
-  /* per-page content width (sessions narrows this) */
+  /* per-page content width (sessions narrows this; the board widens its own
+     column area to --wrap-board — see .wrap.board-page below) */
   --wrap: 1180px;
+  --wrap-board: 1640px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -106,6 +108,21 @@ h1, h2, h3 { font-family: var(--font-display); }
 /* The page's content column. Its top padding lives on .site-header-in above,
    which sits outside .wrap so the header can be full-bleed. */
 .wrap { max-width: var(--wrap); margin: 0 auto; padding: 0 20px 48px; }
+
+/* The board's Kanban strip is a row of FIXED 300px columns (see .kanban-col),
+   so at the shared 1180px --wrap a fourth/fifth column is scrolled off-screen
+   long before a wide monitor runs out of room. The board page widens ONLY its
+   content column to --wrap-board so those columns can show without scrolling
+   (XERK-606). The site header is unaffected — it lives OUTSIDE .wrap and caps
+   its own row at --wrap (see .site-header-in), so it stays put at every width.
+   The toolbar and footer are re-centred back at the reading width so they still
+   line up under the header (the footer is a long paragraph that must not stretch
+   to 1640px, and the toolbar keeps its buttons above the header's right edge);
+   both stay centred in the viewport at --wrap exactly as the header does, since
+   the wide .wrap is itself centred. Only #board takes the extra width. */
+.wrap.board-page { max-width: var(--wrap-board); }
+.wrap.board-page > .board-bar,
+.wrap.board-page > .footer { max-width: var(--wrap); margin-inline: auto; }
 
 h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 
