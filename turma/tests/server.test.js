@@ -11768,6 +11768,19 @@ test("XERK-636: a child's spawn that is acked but leaves no session backs off, i
   epicDriveRound();
   assert.deepEqual(spawnedKeys("edLoop"), ["C-1"]);
   assert.equal(epicChildAttempts.get(k).attempts, 2);
+
+  // A session for C-1 finally appears while the Jira poll still reads it To Do:
+  // started.has(k) clears the backoff entry outright (not just the cat!=="todo"
+  // path), and the child is not re-dispatched.
+  agents.edLoop.commands = [];
+  await asBeat("edLoop", "ed8.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 1, queued: 0, free: 5 },
+      tickets: driveTickets(),
+      sessions: [{ id: "sC1", transcriptId: "t-c1",
+                   ticket: { key: "C-1", siteKey: "ed8.atlassian.net" } }] });
+  epicDriveRound();
+  assert.equal(epicChildAttempts.has(k), false, "a session clears the child's backoff");
+  assert.equal((agents.edLoop.commands || []).length, 0);
   ticketQueue.length = 0;
   resetEpicRuns();
 });
