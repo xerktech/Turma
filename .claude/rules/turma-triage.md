@@ -75,6 +75,9 @@ A To Do ticket is swept into the auto stream only when ALL of these pass; each d
 a throttled state line (`held`/`triaged`/`policy`/`p0preempt`), and a gated ticket spends **no
 attempt** (no retry budget burned, exactly like a repo-less ticket):
 
+0. **Not an epic or an epic child** (`isEpicOrEpicChild`, XERK-635) — excluded before the numbered
+   gates, in both the sweep filter and `autoStartContentGate`. A child is driven by its epic run, not
+   this stream; an epic is never a work ticket. See `.claude/rules/turma-epic-run.md`.
 1. **Repo present and not ignore-tier** (`repoGuess` or a manual pin; `isRepoIgnored`). Applies
    even to an `approve`.
 2. **Retriage gate** (`triageGateReason`): no `triage` block → "untriaged"; `actionable !== true`
