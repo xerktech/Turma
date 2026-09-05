@@ -14723,8 +14723,13 @@ const server = http.createServer(async (req, res) => {
       // already exist — pausing a nothing is a 404, not a silent arm. {pause:true}
       // holds it (no new child starts; running sessions and their merge/close are
       // left alone); {resume:true} continues it. Both preserve the DAG + progress,
-      // so this is NOT a re-arm and never rebuilds the DAG.
-      if (body.pause === true || body.resume === true) {
+      // so this is NOT a re-arm and never rebuilds the DAG. A body carrying either
+      // key is ALWAYS a pause/resume intent — an explicit {pause:false} etc. is a
+      // 400, never a silent fall-through to the arm path below.
+      if ("pause" in body || "resume" in body) {
+        if (body.pause !== true && body.resume !== true) {
+          return json(res, 400, { error: "use {pause:true} or {resume:true}" });
+        }
         const run = setEpicRunPaused(siteKey, epicKey, body.pause === true);
         if (!run) return json(res, 404, { error: "no epic run is armed for that key" });
         return json(res, 200, { ok: true, run });

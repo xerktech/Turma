@@ -12214,6 +12214,71 @@ test("XERK-641: a paused run never auto-completes its epic (epicRunCompleteSweep
   assert.equal(epicRuns["e641d.atlassian.net/E-1"].state, "done");
 });
 
+test("XERK-641: a paused run's child stays untouched even while ANOTHER active run keeps the sweeps live", async () => {
+  resetEpicD();
+  // The case the single-run test can't reach: the XERK-550 sweeps early-return on
+  // anyArmedEpicRun()===false, so with only a paused run they never even call
+  // epicRunChildSession. Here EP-A stays ARMED+active (keeping the sweeps running)
+  // and EP-B is PAUSED — EP-B's MERGED-PR child must STILL be left alone, proving
+  // the per-run `if (run.paused) return null` guard in epicRunChildSession, not just
+  // the anyArmedEpicRun early-return, does the work.
+  const urlA = "https://github.com/ep/a/pull/1";
+  const urlB = "https://github.com/ep/b/pull/1";
+  await asBeat("edMulti", "e641e.atlassian.net", { autoStart: false,
+    tickets: [
+      { key: "EP-A", statusCategory: "todo", isEpic: true, repoGuess: { repo: "Turma", cloned: true } },
+      { key: "A-1", statusCategory: "inprogress", epicKey: "EP-A", blockedBy: [], type: "Task",
+        repoGuess: { repo: "Turma", cloned: true }, triage: { priority: "P2", type: "task", actionable: true } },
+      { key: "EP-B", statusCategory: "todo", isEpic: true, repoGuess: { repo: "Turma", cloned: true } },
+      { key: "B-1", statusCategory: "inprogress", epicKey: "EP-B", blockedBy: [], type: "Task",
+        repoGuess: { repo: "Turma", cloned: true }, triage: { priority: "P2", type: "task", actionable: true } },
+    ],
+    sessions: [
+      dChildSession("s-a1", "A-1", "e641e.atlassian.net", "OPEN", urlA),
+      dChildSession("s-b1", "B-1", "e641e.atlassian.net", "MERGED", urlB),
+    ] });
+  armEpicRun("e641e.atlassian.net", "EP-A");
+  armEpicRun("e641e.atlassian.net", "EP-B");
+  setEpicRunPaused("e641e.atlassian.net", "EP-B", true);
+  assert.equal(anyArmedEpicRun(), true);   // EP-A is active -> the sweeps DO run
+  autoMergeSweep();
+  autoCloseSweep();
+  const cmds = dCmds("edMulti");
+  // Proof the sweeps actually ran: EP-A's OPEN-PR child auto-merges.
+  assert.ok(cmds.some(([t, sid]) => t === "mergePr" && sid === "s-a1"),
+    `expected EP-A's child to auto-merge (sweeps ran), got ${JSON.stringify(cmds)}`);
+  // EP-B is paused: its MERGED-PR child B-1 is NOT closed or killed, though live.
+  assert.equal(cmds.filter(([t, k]) => t === "setTicketStatus" && k === "B-1").length, 0);
+  assert.equal(cmds.filter(([t, sid]) => t === "kill" && sid === "s-b1").length, 0);
+});
+
+test("XERK-641: the epic-run route pauses/resumes an armed run, and refuses cleanly", async () => {
+  resetEpicRuns();
+  await epicBeat("edRoute", "e641f.atlassian.net");
+  await request("POST", "/api/jira/e641f.atlassian.net/E-1/epic-run",
+    { body: {}, headers: userHeaders });   // arm first — pause needs an existing run
+  // {pause:true} -> 200 with paused:true on the record.
+  let r = await request("POST", "/api/jira/e641f.atlassian.net/E-1/epic-run",
+    { body: { pause: true }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.run.paused, true);
+  // {resume:true} -> 200, the flag is cleared.
+  r = await request("POST", "/api/jira/e641f.atlassian.net/E-1/epic-run",
+    { body: { resume: true }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal("paused" in r.body.run, false);
+  // {pause:true} on a key with NO armed run -> 404, and it does NOT arm one.
+  r = await request("POST", "/api/jira/e641f.atlassian.net/E-2/epic-run",
+    { body: { pause: true }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  assert.equal("e641f.atlassian.net/E-2" in epicRuns, false);
+  // An explicit {pause:false} is a 400 — never a silent fall-through to a re-arm.
+  r = await request("POST", "/api/jira/e641f.atlassian.net/E-1/epic-run",
+    { body: { pause: false }, headers: userHeaders });
+  assert.equal(r.status, 400);
+  resetEpicRuns();
+});
+
 test("XERK-550: an ignore-tier repo is never eligible, even opted in", () => {
   setRepoTier("Junk", "ignore");
   assert.ok(autoStartContentGate("z.atlassian.net",
