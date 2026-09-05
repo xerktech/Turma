@@ -198,7 +198,7 @@
     const cycleChildren = cycleKeys.map(node);
     const state = run.state === "done" || run.state === "blocked" ? run.state : "running";
     return {
-      state, total: keys.length, done: counts.done, counts,
+      state, paused: run.paused === true, total: keys.length, done: counts.done, counts,
       waves, cycleChildren, cycle: cycleKeys.length > 0,
     };
   }
@@ -207,7 +207,7 @@
   // repaint only when the run actually moved (the same trick the pin rows use).
   function epicRunSig(view) {
     if (!view) return "";
-    return `${view.state}|${view.done}/${view.total}`
+    return `${view.state}|${view.paused ? "p" : ""}|${view.done}/${view.total}`
       + `|${view.counts.running},${view.counts.ready},${view.counts.blocked}`;
   }
 
@@ -224,12 +224,14 @@
       return `<button class="kc-epic-start" type="button" data-epic-start="${esc(key)}"
         title="${esc(tip)}" aria-label="Start epic run for ${esc(key)}">▶ Start epic</button>`;
     }
-    const word = view.state === "done" ? "done"
+    const word = view.paused ? "paused"
+      : view.state === "done" ? "done"
       : view.state === "blocked" ? "blocked" : "running";
+    const cls = view.paused ? "paused" : view.state;
     const tip = `Epic run ${word} — ${view.done} of ${view.total} children Done`
       + (view.counts.running ? `, ${view.counts.running} in progress` : "")
       + (view.counts.ready ? `, ${view.counts.ready} ready` : "");
-    return `<span class="kc-epic-run kc-epic-${esc(view.state)}"
+    return `<span class="kc-epic-run kc-epic-${esc(cls)}"
       title="${esc(tip)}">▷ ${esc(word)} ${view.done}/${view.total}</span>`;
   }
 
@@ -266,7 +268,8 @@
           ${err}<div class="epic-actions">${btn}</div>
         </section>`;
     }
-    const stateLabel = view.state === "done" ? "Done"
+    const stateLabel = view.paused ? "Paused"
+      : view.state === "done" ? "Done"
       : view.state === "blocked" ? "Blocked" : "Running";
     const childLi = (c) => {
       const st = c.status === "done" ? "Done"
@@ -295,17 +298,32 @@
     const cycleNote = view.cycle
       ? `<div class="td-note td-err">Some children form a dependency cycle and can never become
            ready — untangle the blocks in the tracker, then re-arm.</div>` : "";
+    // Pause (XERK-641) holds the run: no new children start, running sessions are
+    // left alone. Resume continues it. A done run offers neither. Buttons:
+    //   paused        → Resume · Cancel
+    //   running/blocked → Re-arm · Pause · Cancel
+    //   done          → Re-arm · Cancel
+    const pausedNote = view.paused
+      ? `<div class="td-note epic-paused-note">Paused — no new children will start, and running
+           child sessions are left alone. Resume to continue orchestrating.</div>` : "";
+    const armBtn = `<button class="epic-btn epic-btn-ghost" type="button" data-epic-arm="${esc(key)}"
+             title="Rebuild the run's dependency DAG from the current board">↻ Re-arm</button>`;
+    const pauseBtn = `<button class="epic-btn epic-btn-pause" type="button" data-epic-pause="${esc(key)}"
+             title="Hold the run — no new children start; running sessions keep going">⏸ Pause</button>`;
+    const resumeBtn = `<button class="epic-btn" type="button" data-epic-resume="${esc(key)}"
+             title="Resume the run — ready children start again in dependency order">▶ Resume</button>`;
+    const cancelBtn = `<button class="epic-btn epic-btn-cancel" type="button" data-epic-cancel="${esc(key)}"
+             title="Stop orchestrating this epic — running child sessions are left alone">Cancel run</button>`;
     const actions = o.pending
       ? `<span class="epic-btn epic-btn-busy">⏳ working…</span>`
-      : `<button class="epic-btn epic-btn-ghost" type="button" data-epic-arm="${esc(key)}"
-             title="Rebuild the run's dependency DAG from the current board">↻ Re-arm</button>
-           <button class="epic-btn epic-btn-cancel" type="button" data-epic-cancel="${esc(key)}"
-             title="Stop orchestrating this epic — running child sessions are left alone">Cancel run</button>`;
+      : view.paused
+        ? resumeBtn + cancelBtn
+        : armBtn + (view.state === "done" ? "" : pauseBtn) + cancelBtn;
     return `<section class="td-section epic-run">
-        <h3>Epic run <span class="epic-state epic-${esc(view.state)}">${stateLabel}</span></h3>
+        <h3>Epic run <span class="epic-state epic-${esc(view.paused ? "paused" : view.state)}">${stateLabel}</span></h3>
         <div class="epic-prog"><span class="epic-prog-num">${view.done} / ${view.total} done</span>
           ${epicProgressBarHtml(view)}</div>
-        ${cycleNote}${err}${emptyNote}
+        ${pausedNote}${cycleNote}${err}${emptyNote}
         <ul class="epic-children">${waveHtml}${cycleHtml}</ul>
         <div class="epic-actions">${actions}</div>
       </section>`;

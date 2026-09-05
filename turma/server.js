@@ -2132,6 +2132,7 @@ function sanitizeEpicRunRecord(v) {
     updatedAt: Number.isFinite(v.updatedAt) ? v.updatedAt : now,
   };
   if (cycle.length) rec.cycle = cycle;
+  if (v.paused === true) rec.paused = true;   // operator hold survives a restart (XERK-641)
   return rec;
 }
 let epicRuns = {};
@@ -2250,6 +2251,10 @@ function armEpicRun(siteKey, epicKey, rows) {
     updatedAt: now,
   };
   if (cycle.length) rec.cycle = cycle.slice(0, EPIC_RUN_CHILDREN_MAX);
+  // A re-arm rebuilds the DAG but PRESERVES an operator hold (XERK-641): arming is
+  // "rebuild the plan", not "resume it" — Resume is the only thing that lifts a
+  // pause. Preserved like startedAt.
+  if (prev && prev.paused) rec.paused = true;
   epicRuns[k] = rec;
   // Bound the run map: evict the least-recently-updated once over the cap, like
   // the ticket-triage-action map. Epics are few, so this is a backstop.
@@ -2274,6 +2279,27 @@ function clearEpicRun(siteKey, epicKey) {
   invalidateAgentsCache();
   sseBroadcast("epicRuns", epicRuns);
   return true;
+}
+// Pause or resume an armed run WITHOUT tearing it down (XERK-641 — the operator's
+// hands-off "hold" that a cancel is too destructive for). A paused run is INERT to
+// the automation: the driver dispatches no new children (epicRunDriveSweep skips
+// it) and the XERK-550 sweeps skip its children (epicRunChildSession returns null),
+// so already-running child sessions are LEFT ALONE — neither auto-merged/closed nor
+// killed — until the operator resumes. The DAG / state / children / progress are
+// all preserved (unlike clearEpicRun), so Resume continues from exactly where the
+// run held. No-op when already in the wanted state (still returns the run); null
+// when no run is armed for the key. Persists + broadcasts like the arm/clear.
+function setEpicRunPaused(siteKey, epicKey, paused) {
+  const run = epicRuns[epicRunKey(siteKey, epicKey)];
+  if (!run) return null;
+  const want = !!paused;
+  if (!!run.paused === want) return run;   // idempotent
+  if (want) run.paused = true; else delete run.paused;
+  run.updatedAt = Date.now();
+  scheduleEpicRunsSave();
+  invalidateAgentsCache();
+  sseBroadcast("epicRuns", epicRuns);
+  return run;
 }
 
 // ---- the epic-run DRIVER (XERK-636, epic XERK-633) --------------------------
@@ -2387,6 +2413,11 @@ function epicRunDriveSweep() {
   for (const runKey of runKeys) {
     const run = epicRuns[runKey];
     if (!run || run.state === "done") continue;   // a finished run drives nothing
+    // A paused run (XERK-641) dispatches NOTHING and advances NOTHING — the
+    // operator is holding it. Already-running children keep running as sessions
+    // (the XERK-550 sweeps skip a paused run's children too), and Resume picks the
+    // run back up on the next sweep. Fully inert, so just skip it.
+    if (run.paused) continue;
     const siteKey = run.siteKey;
     for (const childKey of run.children || []) {
       const k = ticketQueueKey(siteKey, childKey);
@@ -10552,6 +10583,7 @@ function epicRunChildSession(s, byKey, rows) {
   if (typeof epicKey !== "string" || !epicKey) return null;   // not an epic child
   const run = epicRuns[epicRunKey(siteKey, epicKey)];
   if (!run || run.state === "done") return null;  // no armed, non-terminal run
+  if (run.paused) return null;                    // paused: leave running children alone (XERK-641)
   // Only a child the run was ARMED against (present in its DAG) — a child added to
   // the epic after arming, without a re-arm, is not part of this run.
   if (!Array.isArray(run.children) || !run.children.includes(t.key)) return null;
@@ -10563,11 +10595,14 @@ function epicRunChildSession(s, byKey, rows) {
   return { siteKey, key: t.key, row, repo };
 }
 
-// Any epic run still in flight (armed and not yet terminal). The XERK-550 sweeps
-// early-return unless an org opted into auto-merge; an armed epic run is a SECOND
-// reason to run them, since it drives its own children's merge/close (XERK-637).
+// Any epic run that is ACTIVELY DRIVING (armed, not terminal, not paused). The
+// XERK-550 sweeps early-return unless an org opted into auto-merge; such a run is a
+// SECOND reason to run them, since it drives its own children's merge/close
+// (XERK-637). A PAUSED run is excluded (XERK-641): it drives no merge/close, so it
+// is not a reason to run the sweeps — and epicRunChildSession skips its children
+// anyway, so counting it here would only spin the sweeps for nothing.
 function anyArmedEpicRun() {
-  return Object.values(epicRuns).some((r) => r && r.state !== "done");
+  return Object.values(epicRuns).some((r) => r && r.state !== "done" && !r.paused);
 }
 
 // owner/repo (lower-cased) of a GitHub PR url, or null. Auto-merge serializes
@@ -10780,6 +10815,7 @@ function epicRunCompleteSweep() {
   };
   for (const run of Object.values(epicRuns)) {
     if (!run) continue;
+    if (run.paused) continue;   // held: a paused run never auto-completes (XERK-641)
     const { siteKey, epicKey } = run;
     // Reuse XERK-636's children-Done check — it returns false for an EMPTY child
     // list too, so a run armed against nothing never auto-completes.
@@ -14683,6 +14719,21 @@ const server = http.createServer(async (req, res) => {
         const existed = clearEpicRun(siteKey, epicKey);
         return json(res, 200, { ok: true, cleared: existed, run: null });
       }
+      // Pause/resume an armed run without tearing it down (XERK-641). The run must
+      // already exist — pausing a nothing is a 404, not a silent arm. {pause:true}
+      // holds it (no new child starts; running sessions and their merge/close are
+      // left alone); {resume:true} continues it. Both preserve the DAG + progress,
+      // so this is NOT a re-arm and never rebuilds the DAG. A body carrying either
+      // key is ALWAYS a pause/resume intent — an explicit {pause:false} etc. is a
+      // 400, never a silent fall-through to the arm path below.
+      if ("pause" in body || "resume" in body) {
+        if (body.pause !== true && body.resume !== true) {
+          return json(res, 400, { error: "use {pause:true} or {resume:true}" });
+        }
+        const run = setEpicRunPaused(siteKey, epicKey, body.pause === true);
+        if (!run) return json(res, 404, { error: "no epic run is armed for that key" });
+        return json(res, 200, { ok: true, run });
+      }
       // Arm: the epic must be a ticket the board actually lists AND be an epic
       // (XERK-634's `isEpic`), so a run is never armed for a non-epic or a key no
       // host reports. The run's children are resolved from the same board rows.
@@ -15555,6 +15606,7 @@ if (process.env.TURMA_TEST) {
     epicRuns,
     armEpicRun,
     clearEpicRun,
+    setEpicRunPaused,
     buildEpicWaves,
     epicChildRows,
     isEpicOrEpicChild,

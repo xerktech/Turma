@@ -179,6 +179,7 @@ data class EpicChild(val key: String, val summary: String, val status: EpicChild
  */
 data class EpicRunView(
     val state: String,
+    val paused: Boolean,
     val total: Int,
     val done: Int,
     val counts: Map<EpicChildStatus, Int>,
@@ -222,7 +223,7 @@ fun epicRunView(
     val cycleChildren = cycleKeys.map { node(it) }
     val state = if (run.state == "done" || run.state == "blocked") run.state else "running"
     return EpicRunView(
-        state = state, total = keys.size, done = counts[EpicChildStatus.DONE] ?: 0,
+        state = state, paused = run.paused, total = keys.size, done = counts[EpicChildStatus.DONE] ?: 0,
         counts = counts, waves = waves, cycleChildren = cycleChildren,
         cycle = cycleKeys.isNotEmpty(),
     )
@@ -234,7 +235,7 @@ fun epicRunView(
  */
 fun epicRunSig(view: EpicRunView?): String {
     if (view == null) return ""
-    return "${view.state}|${view.done}/${view.total}" +
+    return "${view.state}|${if (view.paused) "p" else ""}|${view.done}/${view.total}" +
         "|${view.count(EpicChildStatus.RUNNING)},${view.count(EpicChildStatus.READY)}," +
         "${view.count(EpicChildStatus.BLOCKED)}"
 }

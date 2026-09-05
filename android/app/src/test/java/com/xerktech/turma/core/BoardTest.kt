@@ -1135,8 +1135,10 @@ class BoardTest {
         children: List<String> = listOf("C-1", "C-2", "C-3"),
         waves: List<List<String>> = listOf(listOf("C-1"), listOf("C-2", "C-3")),
         cycle: List<String> = emptyList(),
+        paused: Boolean = false,
     ) = com.xerktech.turma.model.EpicRun(
-        epicKey = "E-1", siteKey = "org", state = state, children = children, waves = waves, cycle = cycle)
+        epicKey = "E-1", siteKey = "org", state = state, children = children, waves = waves,
+        cycle = cycle, paused = paused)
 
     private fun epicSess(status: String) = TicketSession(
         host = "h", id = "s", transcriptId = "t", status = status, gitBranch = "", ticketBranch = "",
@@ -1225,6 +1227,16 @@ class BoardTest {
         val after = epicRunSig(epicRunView(mkRun(), b, emptyMap()))
         assertTrue(before != after)
         assertEquals("", epicRunSig(null))
+    }
+
+    @Test fun `epicRunView surfaces the run's paused hold and the sig reflects it (XERK-641)`() {
+        val site = epicSite(listOf(child("C-1"), child("C-2"), child("C-3")))
+        assertFalse(epicRunView(mkRun(), site, emptyMap()).paused)
+        assertTrue(epicRunView(mkRun(paused = true), site, emptyMap()).paused)
+        // The signature changes when the hold toggles, so the open panel repaints.
+        val running = epicRunSig(epicRunView(mkRun(), site, emptyMap()))
+        val held = epicRunSig(epicRunView(mkRun(paused = true), site, emptyMap()))
+        assertTrue(running != held)
     }
 
     @Test fun `rateMaxError validates the policy-sheet rate field`() {
