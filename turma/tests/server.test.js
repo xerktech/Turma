@@ -185,6 +185,8 @@ const {
   TERM_SCROLL_BOTTOM_JS,
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStopResumeExempt, autoStartOrgs, setAutoStartOrg,
+  epicRuns, armEpicRun, clearEpicRun, buildEpicWaves, epicChildRows,
+  isEpicOrEpicChild, sanitizeEpicRunRecord,
   autoMergeSweep, autoCloseSweep, autoStartContentGate, orgsWithAutoMerge,
   autoMergeOrgs, setAutoMergeOrg, autoMergeState, autoClosed, ingestMergeResults,
   priorityWriteBackOrgs, setPriorityWriteBackOrg, orgsWithPriorityWriteBack,
@@ -11337,6 +11339,226 @@ test("XERK-550: the auto-merge content gate agrees with what auto-start would sw
   assert.equal(autoStartContentGate("xcheck.atlassian.net", rows.get("BUG-1"), "Turma"), null);
   resetAutoStart();
   delete triagePolicies["xcheck.atlassian.net"];
+});
+
+// ---- epic auto-orchestration run (XERK-635, epic XERK-633) ------------------
+
+const resetEpicRuns = () => { for (const k of Object.keys(epicRuns)) delete epicRuns[k]; };
+
+test("XERK-635: buildEpicWaves layers a diamond dependency into topological waves", () => {
+  // A blocks B and C; B and C both block D. blockedBy is the reverse edge.
+  const kids = [
+    { key: "E-A", blockedBy: [] },
+    { key: "E-B", blockedBy: ["E-A"] },
+    { key: "E-C", blockedBy: ["E-A"] },
+    { key: "E-D", blockedBy: ["E-B", "E-C"] },
+  ];
+  const { waves, cycle } = buildEpicWaves(kids);
+  assert.deepEqual(waves, [["E-A"], ["E-B", "E-C"], ["E-D"]]);
+  assert.deepEqual(cycle, []);
+});
+
+test("XERK-635: buildEpicWaves waits for EVERY blocker, not just one (staggered chain)", () => {
+  // N3 is blocked by N1 AND N2, and N2 is itself blocked by N1 — so N1, N2, N3
+  // land in THREE distinct waves. This is the fixture the diamond can't provide
+  // (there both of D's blockers share one wave), and it is what pins the core
+  // "ready only when ALL blockers are placed" rule: a `.some` bug would start N3
+  // in wave 1 alongside N2, giving [[N1],[N2,N3]].
+  const kids = [
+    { key: "N1", blockedBy: [] },
+    { key: "N2", blockedBy: ["N1"] },
+    { key: "N3", blockedBy: ["N1", "N2"] },
+  ];
+  const { waves, cycle } = buildEpicWaves(kids);
+  assert.deepEqual(waves, [["N1"], ["N2"], ["N3"]]);
+  assert.deepEqual(cycle, []);
+});
+
+test("XERK-635: buildEpicWaves ignores blockers OUTSIDE the child set, and drops self-blocks", () => {
+  // E-2 is blocked by E-1 (in set) and by OTHER-9 (outside the epic) and itself.
+  const kids = [
+    { key: "E-1", blockedBy: [] },
+    { key: "E-2", blockedBy: ["E-1", "OTHER-9", "E-2"] },
+  ];
+  const { waves, cycle } = buildEpicWaves(kids);
+  assert.deepEqual(waves, [["E-1"], ["E-2"]]);
+  assert.deepEqual(cycle, []);
+});
+
+test("XERK-635: buildEpicWaves annotates a dependency cycle instead of deadlocking", () => {
+  // X <-> Y is a loop; Z depends on nothing and still lays out.
+  const kids = [
+    { key: "E-Z", blockedBy: [] },
+    { key: "E-X", blockedBy: ["E-Y"] },
+    { key: "E-Y", blockedBy: ["E-X"] },
+  ];
+  const { waves, cycle } = buildEpicWaves(kids);
+  assert.deepEqual(waves, [["E-Z"]]);
+  assert.deepEqual(cycle.sort(), ["E-X", "E-Y"]);
+});
+
+test("XERK-635: isEpicOrEpicChild flags epics and epic children, not plain tickets", () => {
+  assert.equal(isEpicOrEpicChild({ key: "E-1", isEpic: true }), true);
+  assert.equal(isEpicOrEpicChild({ key: "C-1", epicKey: "E-1" }), true);
+  assert.equal(isEpicOrEpicChild({ key: "W-1" }), false);
+  assert.equal(isEpicOrEpicChild({ key: "W-1", epicKey: "" }), false);
+  assert.equal(isEpicOrEpicChild({ key: "W-1", isEpic: false }), false);
+});
+
+// A host reporting an epic (E-1) with three assignee-scoped children carrying
+// blocks-links, plus one ordinary To Do ticket. Every ticket has a repo so the
+// repo gate never masks the epic exclusion.
+const epicBeat = (device, site, extraTickets = []) => request("POST", "/api/heartbeat", {
+  body: {
+    device,
+    repos: [{ name: "Turma", path: "/git/Turma" }],
+    jira: {
+      available: true, configured: true, siteKey: site, user: `${device}@x.com`,
+      fetchedAt: "2026-07-14T12:00:00Z",
+      tickets: [
+        { key: "E-1", statusCategory: "todo", isEpic: true,
+          repoGuess: { repo: "Turma", cloned: true },
+          triage: { priority: "P2", type: "task", actionable: true } },
+        { key: "C-1", statusCategory: "todo", epicKey: "E-1", blockedBy: [],
+          repoGuess: { repo: "Turma", cloned: true },
+          triage: { priority: "P2", type: "task", actionable: true } },
+        { key: "C-2", statusCategory: "todo", epicKey: "E-1", blockedBy: ["C-1"],
+          repoGuess: { repo: "Turma", cloned: true },
+          triage: { priority: "P2", type: "task", actionable: true } },
+        { key: "C-3", statusCategory: "todo", epicKey: "E-1", blockedBy: ["C-1"],
+          repoGuess: { repo: "Turma", cloned: true },
+          triage: { priority: "P2", type: "task", actionable: true } },
+        ...extraTickets,
+      ],
+    },
+  },
+  headers: agentHeaders,
+});
+
+test("XERK-635: neither an epic nor an epic child is ever swept for auto-start", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  await epicBeat("epSweep", "ep1.atlassian.net", [
+    { key: "W-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } },
+  ]);
+  setAutoStartOrg("ep1.atlassian.net", true);
+  autoStartRound();
+  // Only the plain work ticket is queued — the epic and all three children are
+  // excluded, even though each has a repo and a clean triage block.
+  const queued = (agents.epSweep.commands || [])
+    .filter((c) => c.type === "spawnTicket").map((c) => c.issueKey);
+  assert.deepEqual(queued, ["W-1"]);
+  resetAutoStart();
+});
+
+test("XERK-635: the content gate rejects an epic/child and agrees with the sweep", () => {
+  // The XERK-550 cross-check relies on autoStartContentGate matching the sweep.
+  assert.ok(autoStartContentGate("ep1.atlassian.net",
+    { key: "E-1", isEpic: true, triage: { type: "task", actionable: true } }, "Turma"));
+  assert.equal(autoStartContentGate("ep1.atlassian.net",
+    { key: "E-1", isEpic: true, triage: { type: "task", actionable: true } }, "Turma").kind, "epic");
+  assert.equal(autoStartContentGate("ep1.atlassian.net",
+    { key: "C-1", epicKey: "E-1", triage: { type: "task", actionable: true } }, "Turma").kind, "epic");
+  // A plain ticket still gates clean.
+  assert.equal(autoStartContentGate("ep1.atlassian.net",
+    { key: "W-1", triage: { type: "task", actionable: true } }, "Turma"), null);
+});
+
+test("XERK-635: POST .../epic-run arms a durable run whose DAG matches the blocks-links", async () => {
+  resetEpicRuns();
+  await epicBeat("epRun", "ep2.atlassian.net");
+  const r = await request("POST", "/api/jira/ep2.atlassian.net/E-1/epic-run",
+    { body: {}, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.run.state, "running");
+  assert.deepEqual(r.body.run.children.sort(), ["C-1", "C-2", "C-3"]);
+  // C-1 first, then C-2 and C-3 which both depend on it.
+  assert.deepEqual(r.body.run.waves, [["C-1"], ["C-2", "C-3"]]);
+  assert.equal("cycle" in r.body.run, false);
+  assert.ok(r.body.run.startedAt > 0);
+  // It rides /api/agents under its own top-level key, keyed "<site>/<epic>".
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.body.epicRuns["ep2.atlassian.net/E-1"].state, "running");
+  assert.deepEqual(list.body.epicRuns["ep2.atlassian.net/E-1"].waves, [["C-1"], ["C-2", "C-3"]]);
+});
+
+test("XERK-635: an epic-run with a dependency cycle is armed as blocked, annotated", async () => {
+  resetEpicRuns();
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "epCycle", repos: [{ name: "Turma", path: "/git/Turma" }],
+      jira: { available: true, configured: true, siteKey: "ep3.atlassian.net",
+        user: "epCycle@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+        tickets: [
+          { key: "E-9", statusCategory: "todo", isEpic: true },
+          { key: "C-A", statusCategory: "todo", epicKey: "E-9", blockedBy: ["C-B"] },
+          { key: "C-B", statusCategory: "todo", epicKey: "E-9", blockedBy: ["C-A"] },
+        ] },
+    },
+    headers: agentHeaders,
+  });
+  const r = await request("POST", "/api/jira/ep3.atlassian.net/E-9/epic-run",
+    { body: {}, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.run.state, "blocked");
+  assert.deepEqual(r.body.run.cycle.sort(), ["C-A", "C-B"]);
+  assert.deepEqual(r.body.run.waves, []);
+});
+
+test("XERK-635: epic-run rejects a bad key, a phantom org, and a non-epic key", async () => {
+  resetEpicRuns();
+  await epicBeat("epBad", "ep4.atlassian.net", [
+    { key: "W-7", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+  ]);
+  let r = await request("POST", "/api/jira/ep4.atlassian.net/not_a_key!/epic-run",
+    { body: {}, headers: userHeaders });
+  assert.equal(r.status, 400);
+  r = await request("POST", "/api/jira/nobody635.atlassian.net/E-1/epic-run",
+    { body: {}, headers: userHeaders });
+  assert.equal(r.status, 404);
+  // A real key that is NOT an epic is refused — a run is never armed for a work ticket.
+  r = await request("POST", "/api/jira/ep4.atlassian.net/W-7/epic-run",
+    { body: {}, headers: userHeaders });
+  assert.equal(r.status, 404);
+  assert.equal("ep4.atlassian.net/W-7" in epicRuns, false);
+});
+
+test("XERK-635: {clear:true} cancels an armed run and drops it from the payload", async () => {
+  resetEpicRuns();
+  await epicBeat("epClr", "ep5.atlassian.net");
+  await request("POST", "/api/jira/ep5.atlassian.net/E-1/epic-run",
+    { body: {}, headers: userHeaders });
+  assert.equal("ep5.atlassian.net/E-1" in epicRuns, true);
+  const r = await request("POST", "/api/jira/ep5.atlassian.net/E-1/epic-run",
+    { body: { clear: true }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.cleared, true);
+  assert.equal(r.body.run, null);
+  assert.equal("ep5.atlassian.net/E-1" in epicRuns, false);
+});
+
+test("XERK-635: an armed run survives a hub restart (read back from its own file)", () => {
+  const file = path.join(os.tmpdir(), `turma-test-epicruns-${process.pid}.json`);
+  fs.writeFileSync(file, JSON.stringify({
+    "o.atlassian.net/E-1": {
+      epicKey: "E-1", siteKey: "o.atlassian.net", state: "running",
+      children: ["C-1", "C-2"], waves: [["C-1"], ["C-2"]],
+      startedAt: 123, updatedAt: 456,
+    },
+    // A malformed record (no epicKey) must be DROPPED, not restored.
+    "o.atlassian.net/bad": { siteKey: "o.atlassian.net", state: "running" },
+  }));
+  try {
+    const mod = freshServerModule((env) => { env.EPIC_RUNS_FILE = file; });
+    assert.equal(mod.epicRuns["o.atlassian.net/E-1"].state, "running");
+    assert.deepEqual(mod.epicRuns["o.atlassian.net/E-1"].waves, [["C-1"], ["C-2"]]);
+    assert.equal(mod.epicRuns["o.atlassian.net/E-1"].startedAt, 123);
+    assert.equal("o.atlassian.net/bad" in mod.epicRuns, false);
+  } finally {
+    fs.unlinkSync(file);
+  }
 });
 
 test("XERK-550: an ignore-tier repo is never eligible, even opted in", () => {

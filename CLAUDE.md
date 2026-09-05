@@ -32,6 +32,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `turma-board.md` | `turma/public/board.*` | Kanban, ticket panel, routing, auto-start/stop |
 | `turma-triage.md` | `turma/public/board.*`, `turma/server.js` | Triage lane, per-ticket verdicts, org triage policy, auto-start gate |
 | `turma-ticket-queue.md` | `turma/server.js`, `board.*` | hub ticket queue: admission, drain, expiries, caps |
+| `turma-epic-run.md` | `turma/server.js` | epic auto-orchestration: durable run store, dependency DAG, manual-start route, never-auto-start gate (XERK-635) |
 | `board-ticket-view.md` | `server.js`, `hub-agent.py`, `board.js` + vendored copies, `Board.kt` | routing a ticket to a capable host; hub resolving a ticket as the board does |
 | `turma-sessions.md` | `turma/public/sessions.html`, `chat.js` | Sessions page, chat engine, live tail, composer, terminal |
 | `android.md` | `android/**` | Kotlin client, page→screen map, in-app update |

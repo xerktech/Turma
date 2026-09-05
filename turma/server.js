@@ -256,6 +256,13 @@ const REPO_TIERS_FILE = process.env.REPO_TIERS_FILE || "/data/repo-tiers.json";
 // {repo: tier} applied only to repos the durable file does not already carry, so
 // operator edits made through the API always win over the seed.
 const REPO_TIER_SEED = process.env.REPO_TIER_SEED || "";
+// Epic auto-orchestration run records (XERK-635, epic XERK-633): a durable,
+// per-epic run keyed "<siteKey>/<epicKey>" holding its computed dependency DAG.
+// Hub-owned durable state exactly like the auto-start opt-in / triage policies
+// above — tiny, per-epic, and it MUST survive a restart: an in-memory-only run
+// would replay stale intent as a burst of session starts after every hub reboot,
+// which is the whole reason it lives on the /data volume and not state.json.
+const EPIC_RUNS_FILE = process.env.EPIC_RUNS_FILE || "/data/epic-runs.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -2076,6 +2083,199 @@ function setTriagePolicy(siteKey, patch) {
   sseBroadcast("triagePolicies", triagePolicies);
 }
 
+// ---- epic auto-orchestration run records (XERK-635, epic XERK-633) ----------
+// The core orchestration STATE for "work an epic's children in dependency order,
+// hands-off". Keyed "<siteKey>/<epicKey>", each entry is a durable run record:
+//   {epicKey, siteKey, state, children[], waves[][], cycle?[], startedAt, updatedAt}
+// where `waves` is the topological layering of the children computed from their
+// blocks-links (XERK-634): wave 0 is the children no other child blocks, wave 1
+// the children only those block, and so on — a child is "ready" (for the driver
+// a later subtask adds) once every one of its blockers is Done. `cycle` lists any
+// children that could not be ordered because a dependency loop stalls them, so a
+// cycle is ANNOTATED and the run flagged `blocked`, never left to deadlock
+// silently.
+//
+// Hub-owned durable state, same shape/lifecycle as autoStartOrgs / triagePolicies
+// above: a /data JSON file (not state.json), its own SSE frame, and a top-level
+// key on /api/agents. It MUST persist — an in-memory-only run would re-fire stale
+// intent as a burst of child starts after every hub restart.
+const EPIC_RUN_STATES = new Set(["running", "blocked", "done"]);
+// Bound the run map (per-epic, so orgs x epics — small) and each run's own lists,
+// like the sibling caps. These ride /api/agents, so an unbounded child list or an
+// unbounded number of runs would grow the payload and every SSE frame.
+const EPIC_RUNS_MAX = positiveEnv("EPIC_RUNS_MAX", 1000);
+const EPIC_RUN_CHILDREN_MAX = 500;
+// Coerce ONE persisted run record to the fixed shape the payload serves. Inline
+// literal bounds (64 key / 200 site), NOT the TICKET_KEY_MAX / TICKET_SITE_MAX
+// consts declared far below: this runs at module-init from the load loop, where a
+// const below is in its TDZ — the same reason the ingest normalizers inline
+// theirs. Returns the sanitized record or null (dropped) for a malformed one.
+function sanitizeEpicRunRecord(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  if (typeof v.epicKey !== "string" || !v.epicKey) return null;
+  if (typeof v.siteKey !== "string" || !v.siteKey) return null;
+  const strList = (x) => Array.isArray(x)
+    ? x.filter((s) => typeof s === "string" && s).slice(0, EPIC_RUN_CHILDREN_MAX)
+    : [];
+  const waves = Array.isArray(v.waves)
+    ? v.waves.slice(0, EPIC_RUN_CHILDREN_MAX).map(strList).filter((w) => w.length)
+    : [];
+  const cycle = strList(v.cycle);
+  const now = Date.now();
+  const rec = {
+    epicKey: v.epicKey.slice(0, 64),
+    siteKey: v.siteKey.slice(0, 200),
+    state: EPIC_RUN_STATES.has(v.state) ? v.state : "running",
+    children: strList(v.children),
+    waves,
+    startedAt: Number.isFinite(v.startedAt) ? v.startedAt : now,
+    updatedAt: Number.isFinite(v.updatedAt) ? v.updatedAt : now,
+  };
+  if (cycle.length) rec.cycle = cycle;
+  return rec;
+}
+let epicRuns = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(EPIC_RUNS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) {
+      const rec = sanitizeEpicRunRecord(v);
+      if (rec) epicRuns[k] = rec;
+    }
+  }
+} catch {
+  /* first boot or no volume mounted */
+}
+let erSaveTimer = null;
+function scheduleEpicRunsSave() {
+  if (erSaveTimer) return;
+  erSaveTimer = setTimeout(() => {
+    erSaveTimer = null;
+    fs.mkdir(path.dirname(EPIC_RUNS_FILE), { recursive: true }, () => {
+      fs.writeFile(EPIC_RUNS_FILE, JSON.stringify(epicRuns), (err) => {
+        if (err) console.error(`epic-runs save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  erSaveTimer.unref();
+}
+function epicRunKey(siteKey, epicKey) {
+  return (siteKey || "") + "/" + epicKey;
+}
+// A ticket is off-limits to the org auto-start stream (XERK-635) if it is an epic
+// (never a work ticket) or an epic's child (its start is the epic run's job, in
+// dependency order, not the org stream's). Reads the XERK-634 `isEpic`/`epicKey`
+// ticket fields (already coerced by normalizeJira). Both the sweep and the shared
+// content gate consult this, so the two stay in agreement.
+function isEpicOrEpicChild(t) {
+  return !!(t && (t.isEpic === true
+    || (typeof t.epicKey === "string" && t.epicKey)));
+}
+// Layer a set of child tickets into dependency waves from their blocks-links.
+// `childRows` is the epic's children (each a ticket row with `key` + `blockedBy`,
+// XERK-634). Only blockers WITHIN the child set order the waves — an external
+// blocker is a readiness concern for the driver, not a wave-ordering one. Returns
+// {waves: [[key]], cycle: [key]}: `waves` in topological order (input order kept
+// stable within a wave, so a diamond A->{B,C}->D yields [[A],[B,C],[D]]), `cycle`
+// the children that could never be placed because a dependency loop stalls them.
+function buildEpicWaves(childRows) {
+  const keys = [];
+  const seen = new Set();
+  for (const r of childRows || []) {
+    if (r && typeof r.key === "string" && r.key && !seen.has(r.key)) {
+      seen.add(r.key);
+      keys.push(r.key);
+    }
+  }
+  const inSet = new Set(keys);
+  const byKey = new Map();
+  for (const r of childRows || []) if (r && r.key) byKey.set(r.key, r);
+  const blockers = new Map();  // key -> [blocker keys within the child set]
+  for (const k of keys) {
+    const r = byKey.get(k);
+    const bs = Array.isArray(r && r.blockedBy) ? r.blockedBy : [];
+    blockers.set(k, [...new Set(bs.filter(
+      (b) => typeof b === "string" && inSet.has(b) && b !== k))]);
+  }
+  const waves = [];
+  const placed = new Set();
+  let remaining = keys.slice();
+  while (remaining.length) {
+    const wave = remaining.filter((k) => blockers.get(k).every((b) => placed.has(b)));
+    if (!wave.length) break;   // nothing new can be placed -> the rest is a cycle
+    for (const k of wave) placed.add(k);
+    waves.push(wave);
+    remaining = remaining.filter((k) => !placed.has(k));
+  }
+  return { waves, cycle: remaining };
+}
+// The epic's assignee-scoped children among the board's rows: the tickets whose
+// XERK-634 `epicKey` names this epic. `rows` is fleetTicketRows() (the board's own
+// resolved view), so the run works "on what the board shows", never a raw walk of
+// `agents`.
+function epicChildRows(siteKey, epicKey, rows) {
+  const out = [];
+  for (const r of rows.values()) {
+    if (r && r.siteKey === siteKey && r.row && r.row.epicKey === epicKey) {
+      out.push(r.row);
+    }
+  }
+  return out;
+}
+// Arm (or re-arm) an epic's run: rebuild its DAG from the current board rows,
+// derive its state, persist, and broadcast. This is the SOLE trigger for the run
+// — its route calls it after validating the epic is one the fleet reports. State:
+// `blocked` if a dependency cycle stalls any child (annotated), `done` if every
+// child is already Done, else `running`. `startedAt` is preserved across re-arms.
+function armEpicRun(siteKey, epicKey, rows) {
+  rows = rows || fleetTicketRows();
+  const kids = epicChildRows(siteKey, epicKey, rows);
+  const { waves, cycle } = buildEpicWaves(kids);
+  const children = kids
+    .map((k) => k.key)
+    .filter((k, i, a) => typeof k === "string" && k && a.indexOf(k) === i)
+    .slice(0, EPIC_RUN_CHILDREN_MAX);
+  const isDone = (key) => {
+    const r = rows.get(ticketQueueKey(siteKey, key));
+    return !!(r && r.row && r.row.statusCategory === "done");
+  };
+  const allDone = children.length > 0 && children.every(isDone);
+  const state = cycle.length ? "blocked" : allDone ? "done" : "running";
+  const k = epicRunKey(siteKey, epicKey);
+  const prev = epicRuns[k];
+  const now = Date.now();
+  const rec = {
+    epicKey, siteKey, state, children, waves,
+    startedAt: prev && Number.isFinite(prev.startedAt) ? prev.startedAt : now,
+    updatedAt: now,
+  };
+  if (cycle.length) rec.cycle = cycle.slice(0, EPIC_RUN_CHILDREN_MAX);
+  epicRuns[k] = rec;
+  // Bound the run map: evict the least-recently-updated once over the cap, like
+  // the ticket-triage-action map. Epics are few, so this is a backstop.
+  const all = Object.keys(epicRuns);
+  if (all.length > EPIC_RUNS_MAX) {
+    all.sort((a, b) => (epicRuns[a].updatedAt || 0) - (epicRuns[b].updatedAt || 0));
+    for (const old of all.slice(0, all.length - EPIC_RUNS_MAX)) {
+      if (old !== k) delete epicRuns[old];
+    }
+  }
+  scheduleEpicRunsSave();
+  invalidateAgentsCache();
+  sseBroadcast("epicRuns", epicRuns);
+  return rec;
+}
+// Clear an epic's run (operator cancels the orchestration).
+function clearEpicRun(siteKey, epicKey) {
+  const k = epicRunKey(siteKey, epicKey);
+  if (!(k in epicRuns)) return false;
+  delete epicRuns[k];
+  scheduleEpicRunsSave();
+  invalidateAgentsCache();
+  sseBroadcast("epicRuns", epicRuns);
+  return true;
+}
+
 // ---- per-org priority write-back opt-in (XERK-483) -------------------------
 // The set of orgs the operator has switched triage priority write-back ON for,
 // keyed by siteKey with the value simply `true` (presence = enabled; disabling
@@ -2761,6 +2961,12 @@ function buildAgentsCache() {
     // middle tier. Board reads it to show/set a repo's tier; the ordering and
     // ignore-gate it drives are hub-side.
     repoTiers,
+    // Epic auto-orchestration run records (XERK-635): "<siteKey>/<epicKey>" ->
+    // run record with the computed dependency DAG. Hub-owned durable state like
+    // the pins above, and its one read channel for the board UI (subtask E) plus
+    // its own SSE event. A NEW top-level key — an older web/Android client just
+    // ignores it, so they degrade cleanly.
+    epicRuns,
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -9672,8 +9878,13 @@ function autoStartSweep() {
         const repo = r.row ? ticketRepo(siteKey, r.row.key, rows) : null;
         return { t: r.row, repo, key: triageSortKey(r.row && r.row.triage, repo) };
       })
+      // XERK-635: an epic and its children never ride the org auto-start stream —
+      // an epic is not a work ticket, and a child is started by its epic run in
+      // dependency order, not here. Dropped silently at the filter (spending no
+      // attempt) exactly like a repo-less ticket; the shared content gate below
+      // rejects the same set, so the two stay in agreement (XERK-550 cross-check).
       .filter((c) => c.t && c.t.key && c.t.statusCategory === "todo"
-        && c.repo && !isRepoIgnored(c.repo))
+        && c.repo && !isRepoIgnored(c.repo) && !isEpicOrEpicChild(c.t))
       .sort((a, b) => {
         for (let i = 0; i < a.key.length; i++) {
           if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
@@ -10083,6 +10294,10 @@ function markResumedTicketAutoStopExempt(host, sessionId) {
 function autoStartContentGate(siteKey, t, repo) {
   if (!repo || isRepoIgnored(repo)) return { kind: "repo", reason: "no eligible repo" };
   if (!t || !t.key) return { kind: "repo", reason: "no ticket row" };
+  // XERK-635: an epic or an epic child is never eligible for the org auto stream —
+  // the epic run drives its children in dependency order. Kept in lock-step with
+  // the autoStartSweep candidate filter above (the XERK-550 cross-check pins it).
+  if (isEpicOrEpicChild(t)) return { kind: "epic", reason: "epic or epic child (driven by the epic run)" };
   const action = ticketTriageAction(siteKey, t.key);
   if (action === "hold" || action === "reject") {
     return { kind: "triaged", reason: `${action} by triage` };
@@ -14165,6 +14380,42 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, action });
     }
 
+    // POST /api/jira/<siteKey>/<epicKey>/epic-run — arm the epic's auto-
+    // orchestration run (XERK-635, epic XERK-633). This is the SOLE trigger for
+    // the whole run. Body: {} (or omitted) to ARM/re-arm, {clear:true} (or
+    // {cancel:true}) to cancel. Hub-owned durable state exactly like the pins:
+    // authoritative on return (a 200), the org must be one the fleet reports, and
+    // the epic must be a real epic the fleet lists (so a run can't be armed for a
+    // phantom or a non-epic ticket). Arming rebuilds the run's dependency DAG from
+    // the current board rows and returns the run record.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "epic-run") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const epicKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(epicKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}");
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      if (body.clear === true || body.cancel === true) {
+        const existed = clearEpicRun(siteKey, epicKey);
+        return json(res, 200, { ok: true, cleared: existed, run: null });
+      }
+      // Arm: the epic must be a ticket the board actually lists AND be an epic
+      // (XERK-634's `isEpic`), so a run is never armed for a non-epic or a key no
+      // host reports. The run's children are resolved from the same board rows.
+      const rows = fleetTicketRows();
+      const epicRow = rows.get(ticketQueueKey(siteKey, epicKey));
+      if (!epicRow || !epicRow.row || epicRow.row.isEpic !== true) {
+        return json(res, 404, { error: "no epic by that key is reported for that org" });
+      }
+      const run = armEpicRun(siteKey, epicKey, rows);
+      return json(res, 200, { ok: true, run });
+    }
+
     // POST /api/jira/<siteKey>/autostart — flip an org's auto-start opt-in
     // (XERK-41). Body: {enabled:true|false}. Hub-owned durable state, so — like
     // the /agent pin and unlike the /repo override — the save is authoritative
@@ -15019,6 +15270,17 @@ if (process.env.TURMA_TEST) {
     autoStopResumeExempt,
     autoStartOrgs,
     setAutoStartOrg,
+    // Epic auto-orchestration (XERK-635): the durable run store, the DAG builder
+    // + child resolver, the arm/clear helpers the route drives, the never-auto-
+    // start predicate, and the state whitelist.
+    epicRuns,
+    armEpicRun,
+    clearEpicRun,
+    buildEpicWaves,
+    epicChildRows,
+    isEpicOrEpicChild,
+    sanitizeEpicRunRecord,
+    EPIC_RUN_STATES,
     // Hands-off auto-merge + close (XERK-550): the two sweeps, the shared
     // content gate, the per-org toggle + setter, and the state the tests drive.
     autoMergeSweep,
