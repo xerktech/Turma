@@ -162,6 +162,11 @@ test.afterEach(() => {
   for (const k of Object.keys(autoMergeOrgs)) delete autoMergeOrgs[k];
   autoMergeState.clear();
   autoClosed.clear();
+  // XERK-637: an ARMED epic run is now a second reason autoMergeSweep/
+  // autoCloseSweep/epicRunCompleteSweep act, so a leaked armed run keeps the live
+  // 15s sweep churning `agents` the same way a leaked opt-in did. Drop them too.
+  for (const k of Object.keys(epicRuns)) delete epicRuns[k];
+  epicDoneWritten.clear();
 });
 // notify() no-ops when no device is registered; register one so the alert tests
 // see the fan-out. Real fan-out/pruning is exercised separately below.
@@ -187,6 +192,7 @@ const {
   autoStopped, autoStopResumeExempt, autoStartOrgs, setAutoStartOrg,
   epicRuns, armEpicRun, clearEpicRun, buildEpicWaves, epicChildRows,
   isEpicOrEpicChild, sanitizeEpicRunRecord,
+  epicRunChildSession, anyArmedEpicRun, epicRunCompleteSweep, epicDoneWritten,
   autoMergeSweep, autoCloseSweep, autoStartContentGate, orgsWithAutoMerge,
   autoMergeOrgs, setAutoMergeOrg, autoMergeState, autoClosed, ingestMergeResults,
   priorityWriteBackOrgs, setPriorityWriteBackOrg, orgsWithPriorityWriteBack,
@@ -11559,6 +11565,209 @@ test("XERK-635: an armed run survives a hub restart (read back from its own file
   } finally {
     fs.unlinkSync(file);
   }
+});
+
+// ---- auto-close chaining + epic completion (XERK-637, epic XERK-633) --------
+// D advances and completes an armed run: its children auto-merge + auto-close
+// through the SAME XERK-550 sweeps (arming the run is the hands-off opt-in, so it
+// overrides the org auto-merge toggle AND the bug-only floor), and once every
+// child is Done the epic itself is written to Done exactly once and the run goes
+// terminal. Starting the newly-unblocked wave is C's job (XERK-636), not D's.
+const resetEpicD = () => {
+  for (const k of Object.keys(epicRuns)) delete epicRuns[k];
+  autoMergeState.clear();
+  autoClosed.clear();
+  autoStopped.clear();
+  epicDoneWritten.clear();
+  for (const k of Object.keys(autoMergeOrgs)) delete autoMergeOrgs[k];
+  // Shared PR urls / the fleet-wide per-repo merge guard: drop leftover commands.
+  for (const a of Object.values(agents)) {
+    if (Array.isArray(a.commands)) {
+      a.commands = a.commands.filter(
+        (c) => c && !["mergePr", "kill", "setTicketStatus"].includes(c.type));
+    }
+  }
+};
+// The epic organizer ticket, and a child ticket. Children are deliberately type
+// "Task" (not "Bug") to prove the epic run ignores the auto-merge bug-only floor.
+const dEpic = (statusCategory = "todo") => ({
+  key: "E-1", statusCategory, isEpic: true,
+  repoGuess: { repo: "Turma", cloned: true },
+  triage: { priority: "P2", type: "task", actionable: true } });
+const dChild = (key, blockedBy, statusCategory) => ({
+  key, statusCategory, epicKey: "E-1", blockedBy, type: "Task",
+  repoGuess: { repo: "Turma", cloned: true },
+  triage: { priority: "P2", type: "task", actionable: true } });
+// A running, idle child session with one PR in `prState`.
+const dChildSession = (id, key, site, prState, url) => ({
+  id, status: "running",
+  ticket: { key, siteKey: site },
+  prs: [{ url, state: prState, ready: "ready", mergeable: "MERGEABLE" }],
+  session: { transcriptAgeSec: 30, paneBusy: false } });
+const dCmds = (device) => (agents[device].commands || [])
+  .map((c) => [c.type, c.sessionId || c.issueKey, c.category]);
+
+test("XERK-637: an armed run's child auto-merges even with NO org opt-in and a non-bug type", async () => {
+  resetEpicD();
+  const url = "https://github.com/ep/m1/pull/1";
+  await asBeat("edM", "ed1.atlassian.net", { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "inprogress")],
+    sessions: [dChildSession("s-c1", "C-1", "ed1.atlassian.net", "OPEN", url)] });
+  assert.equal("ed1.atlassian.net" in autoMergeOrgs, false);   // org NOT opted in
+  armEpicRun("ed1.atlassian.net", "E-1");
+  autoMergeSweep();
+  const c = (agents.edM.commands || []).find((x) => x.type === "mergePr");
+  assert.ok(c, `expected a mergePr for the armed run's child, got ${JSON.stringify(dCmds("edM"))}`);
+  assert.equal(c.url, url);
+  assert.equal(c.sessionId, "s-c1");
+});
+
+test("XERK-637: an armed run's child auto-closes on a merged PR — Done write + kill, no opt-in", async () => {
+  resetEpicD();
+  const url = "https://github.com/ep/c1/pull/1";
+  await asBeat("edC", "ed2.atlassian.net", { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "inprogress")],
+    sessions: [dChildSession("s-c1", "C-1", "ed2.atlassian.net", "MERGED", url)] });
+  armEpicRun("ed2.atlassian.net", "E-1");
+  autoCloseSweep();
+  const got = dCmds("edC");
+  assert.ok(got.some(([t, k, cat]) => t === "setTicketStatus" && k === "C-1" && cat === "done"),
+    `expected a Done write for C-1, got ${JSON.stringify(got)}`);
+  assert.ok(got.some(([t, sid]) => t === "kill" && sid === "s-c1"),
+    `expected a kill, got ${JSON.stringify(got)}`);
+});
+
+test("XERK-637: an epic child with NO armed run stays excluded, even in an auto-merge org", async () => {
+  // The XERK-635 exclusion must still hold when the epic's run is not armed — only
+  // an armed run overrides it. Opt the org into auto-merge so the sweeps DO run.
+  resetEpicD();
+  const url = "https://github.com/ep/x1/pull/1";
+  await asBeat("edX", "ed3.atlassian.net", { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "inprogress")],
+    sessions: [dChildSession("s-c1", "C-1", "ed3.atlassian.net", "MERGED", url)] });
+  setAutoMergeOrg("ed3.atlassian.net", true);
+  assert.equal(anyArmedEpicRun(), false);                 // no run armed
+  autoMergeSweep();
+  autoCloseSweep();
+  const kinds = (agents.edX.commands || []).map((c) => c.type);
+  assert.equal(kinds.filter((t) => t === "mergePr").length, 0);
+  assert.equal(kinds.filter((t) => t === "setTicketStatus").length, 0);
+  assert.equal(kinds.filter((t) => t === "kill").length, 0);
+});
+
+test("XERK-637: chain-advance — auto-closing a wave-1 child unblocks dependents, epic NOT done yet", async () => {
+  resetEpicD();
+  const url = "https://github.com/ep/ch/pull/1";
+  await asBeat("edCh", "ed4.atlassian.net", { autoStart: false,
+    tickets: [dEpic(),
+      dChild("C-1", [], "inprogress"),
+      dChild("C-2", ["C-1"], "todo"),
+      dChild("C-3", ["C-1"], "todo")],
+    sessions: [dChildSession("s-c1", "C-1", "ed4.atlassian.net", "MERGED", url)] });
+  armEpicRun("ed4.atlassian.net", "E-1");
+  assert.deepEqual(epicRuns["ed4.atlassian.net/E-1"].waves, [["C-1"], ["C-2", "C-3"]]);
+  // C-1 lands -> auto-close produces its Done edge; the epic stays In Progress.
+  autoCloseSweep();
+  epicRunCompleteSweep();
+  const got = dCmds("edCh");
+  assert.ok(got.some(([t, k, cat]) => t === "setTicketStatus" && k === "C-1" && cat === "done"),
+    `expected C-1 Done, got ${JSON.stringify(got)}`);
+  assert.ok(!got.some(([t, k]) => t === "setTicketStatus" && k === "E-1"),
+    "the epic must NOT be closed while C-2/C-3 are still open");
+  assert.equal(epicRuns["ed4.atlassian.net/E-1"].state, "running");
+  // The Done edge, once the agent applies it and re-reports, makes C-1's
+  // dependents ready — buildEpicWaves' wave 2 is now all-blockers-Done. (Starting
+  // that wave is C's driver, XERK-636; here we assert the readiness the edge creates.)
+  const doneAfter = new Map([["ed4.atlassian.net\x00C-1",
+    { row: { key: "C-1", statusCategory: "done" }, siteKey: "ed4.atlassian.net" }]]);
+  const c1Done = !!(doneAfter.get("ed4.atlassian.net\x00C-1").row.statusCategory === "done");
+  assert.equal(c1Done, true);
+});
+
+test("XERK-637: the epic is written to Done exactly once when every child is Done, run terminal", async () => {
+  resetEpicD();
+  await asBeat("edE", "ed5.atlassian.net", { autoStart: false,
+    tickets: [dEpic("inprogress"),
+      dChild("C-1", [], "inprogress"), dChild("C-2", ["C-1"], "todo")] });
+  armEpicRun("ed5.atlassian.net", "E-1");
+  assert.equal(epicRuns["ed5.atlassian.net/E-1"].state, "running");
+  // Every child reaches Done on the board (however they got there).
+  await asBeat("edE", "ed5.atlassian.net", { autoStart: false,
+    tickets: [dEpic("inprogress"),
+      dChild("C-1", [], "done"), dChild("C-2", ["C-1"], "done")] });
+  epicRunCompleteSweep();
+  epicRunCompleteSweep();                          // idempotent
+  const closes = (agents.edE.commands || [])
+    .filter((c) => c.type === "setTicketStatus" && c.issueKey === "E-1" && c.category === "done");
+  assert.equal(closes.length, 1, `epic Done should fire once, got ${closes.length}`);
+  assert.equal(epicRuns["ed5.atlassian.net/E-1"].state, "done");
+});
+
+test("XERK-637: mixed auto/human completion — one child auto-closed, one human-moved, epic completes", async () => {
+  resetEpicD();
+  const url = "https://github.com/ep/mx/pull/1";
+  // C-1 is being auto-closed (running session, merged PR); C-2 a human already
+  // moved to Done out of band.
+  await asBeat("edMx", "ed6.atlassian.net", { autoStart: false,
+    tickets: [dEpic("inprogress"),
+      dChild("C-1", [], "inprogress"), dChild("C-2", [], "done")],
+    sessions: [dChildSession("s-c1", "C-1", "ed6.atlassian.net", "MERGED", url)] });
+  armEpicRun("ed6.atlassian.net", "E-1");
+  autoCloseSweep();                                // C-1 -> Done write + kill
+  assert.ok(dCmds("edMx").some(([t, k, cat]) => t === "setTicketStatus" && k === "C-1" && cat === "done"));
+  // The agent applies C-1's Done and re-reports (session gone).
+  await asBeat("edMx", "ed6.atlassian.net", { autoStart: false,
+    tickets: [dEpic("inprogress"),
+      dChild("C-1", [], "done"), dChild("C-2", [], "done")], sessions: [] });
+  epicRunCompleteSweep();
+  const closes = (agents.edMx.commands || [])
+    .filter((c) => c.type === "setTicketStatus" && c.issueKey === "E-1" && c.category === "done");
+  assert.equal(closes.length, 1);
+  assert.equal(epicRuns["ed6.atlassian.net/E-1"].state, "done");
+});
+
+test("XERK-637: completion stands down (never goes terminal) when no board-cred host can take the write", async () => {
+  // The epic-Done write must be queued before the run is retired — else a run with
+  // no writable host would go terminal leaving the epic In Progress forever.
+  resetEpicD();
+  // Arm with the child NOT yet done so the run starts "running" (armEpicRun would
+  // set state:"done" up front if it were already complete), then move it Done.
+  await asBeat("edGap", "ed7.atlassian.net", { autoStart: false,
+    tickets: [dEpic("inprogress"), dChild("C-1", [], "inprogress")] });
+  armEpicRun("ed7.atlassian.net", "E-1");
+  await asBeat("edGap", "ed7.atlassian.net", { autoStart: false,
+    tickets: [dEpic("inprogress"), dChild("C-1", [], "done")] });
+  // Make every host of the org too old for the status write (agentGapError true).
+  agents.edGap.unsupported = { setTicketStatus: Date.now() };
+  epicRunCompleteSweep();
+  const closes = (agents.edGap.commands || [])
+    .filter((c) => c.type === "setTicketStatus" && c.issueKey === "E-1");
+  assert.equal(closes.length, 0, "no Done write should be queued to a gapped host");
+  assert.equal(epicRuns["ed7.atlassian.net/E-1"].state, "running", "run must NOT go terminal");
+  delete agents.edGap.unsupported;
+});
+
+test("XERK-637: a run armed already-complete still writes the epic Done (B set state, never the write)", async () => {
+  // armEpicRun sets state:"done" when every child is already Done at arm time, but
+  // it does NOT write the epic — the completion sweep must still close the epic so
+  // the organizer is never stranded In Progress.
+  resetEpicD();
+  await asBeat("edPre", "ed8.atlassian.net", { autoStart: false,
+    tickets: [dEpic("inprogress"), dChild("C-1", [], "done"), dChild("C-2", [], "done")] });
+  armEpicRun("ed8.atlassian.net", "E-1");
+  assert.equal(epicRuns["ed8.atlassian.net/E-1"].state, "done");   // B marked it done
+  epicRunCompleteSweep();
+  const closes = (agents.edPre.commands || [])
+    .filter((c) => c.type === "setTicketStatus" && c.issueKey === "E-1" && c.category === "done");
+  assert.equal(closes.length, 1, "the epic must be written Done even though the run was armed complete");
+  // Once the epic is Done on the board, a later sweep never re-fires the write.
+  await asBeat("edPre", "ed8.atlassian.net", { autoStart: false,
+    tickets: [dEpic("done"), dChild("C-1", [], "done"), dChild("C-2", [], "done")] });
+  epicDoneWritten.clear();                          // simulate a restart losing the in-memory guard
+  epicRunCompleteSweep();
+  const closes2 = (agents.edPre.commands || [])
+    .filter((c) => c.type === "setTicketStatus" && c.issueKey === "E-1");
+  assert.equal(closes2.length, 1, "the board's own Done state must stop a re-fire after the guard is lost");
 });
 
 test("XERK-550: an ignore-tier repo is never eligible, even opted in", () => {
