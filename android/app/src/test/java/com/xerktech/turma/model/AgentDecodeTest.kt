@@ -284,6 +284,37 @@ class AgentDecodeTest {
         assertNull(resp.agents[2].jira?.tickets?.get(0)?.triage)
     }
 
+    // XERK-634: epic membership + blocks/blocked-by dependency links. Typing
+    // JiraTicket.epicKey/isEpic/blocks/blockedBy makes them decode-fatal if wrong
+    // (the /api/agents decode is atomic), so the full-and-absent shapes are pinned.
+    // An absent field reads as its default (null/false/empty), never fabricated.
+    @Test fun `epic membership and dependency links decode`() {
+        val body = """
+            { "now": 1, "agents": [
+              { "key": "on", "device": "on", "online": true,
+                "jira": { "siteKey": "acme", "tickets": [
+                  { "key": "ENG-1", "isEpic": true, "blocks": [], "blockedBy": [] },
+                  { "key": "ENG-2", "epicKey": "ENG-1", "isEpic": false,
+                    "blocks": ["ENG-3"], "blockedBy": ["ENG-4", "ENG-5"] },
+                  { "key": "ENG-6" }
+                ] } }
+            ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val t = resp.agents[0].jira?.tickets!!
+        assertEquals(true, t[0].isEpic)
+        assertNull(t[0].epicKey)
+        assertEquals("ENG-1", t[1].epicKey)
+        assertEquals(false, t[1].isEpic)
+        assertEquals(listOf("ENG-3"), t[1].blocks)
+        assertEquals(listOf("ENG-4", "ENG-5"), t[1].blockedBy)
+        // A ticket that carries none reads as the defaults, never a throw.
+        assertNull(t[2].epicKey)
+        assertEquals(false, t[2].isEpic)
+        assertEquals(emptyList<String>(), t[2].blocks)
+        assertEquals(emptyList<String>(), t[2].blockedBy)
+    }
+
     // XERK-477 [M]: an ENDED dsh session's runtime rides _closed_payload's
     // agentType too, so its ended card carries the same badge as the live one.
     // A record from an agent predating the field omits it and defaults to "".

@@ -6101,6 +6101,17 @@ function normalizeJira(a) {
       j.tickets = j.tickets.filter(objectish);
       for (const t of j.tickets) {
         coerceStringList(t, "labels"); // List<String>: non-array or object element is fatal
+        // Epic membership + blocks/blocked-by dependency links (XERK-634). Android
+        // TYPES all four, so a malformed one is decode-fatal for the whole
+        // /api/agents array — coerce here (the `jira` block is a known key, so
+        // sanitizeHeartbeat never looks inside it). `blocks`/`blockedBy` are
+        // List<String> (an object/bool element is fatal); `epicKey` is a nullable
+        // String (drop a non-string to absent → Android's null); `isEpic` is a
+        // non-null Boolean (drop a non-bool to the client's `false`).
+        coerceStringList(t, "blocks");
+        coerceStringList(t, "blockedBy");
+        if ("epicKey" in t && typeof t.epicKey !== "string") delete t.epicKey;
+        if ("isEpic" in t && typeof t.isEpic !== "boolean") delete t.isEpic;
         if ("repoGuess" in t && !objectish(t.repoGuess)) {
           delete t.repoGuess; // RepoGuess?
         } else if (objectish(t.repoGuess)) {

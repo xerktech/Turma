@@ -508,6 +508,17 @@ data class JiraTicket(
     val created: String = "",
     val dueDate: String? = null,
     val parentKey: String? = null,
+    // Epic membership + blocks/blocked-by dependency links (XERK-634). [epicKey] is
+    // the parent key ONLY when the parent is an epic (a subtask's story-parent
+    // still rides [parentKey] but leaves this null); [isEpic] flags this ticket's
+    // OWN type as an epic so it is treated as an organizer, never work. [blocks] is
+    // the keys this ticket blocks (outward "Blocks"), [blockedBy] the keys blocking
+    // it. Absent = "not collected" (an older agent, or Azure) → null/false/empty;
+    // the hub coerces a malformed field to that same default (normalizeJira).
+    val epicKey: String? = null,
+    val isEpic: Boolean = false,
+    val blocks: List<String> = emptyList(),
+    val blockedBy: List<String> = emptyList(),
     val repoGuess: RepoGuess? = null,
     val triage: TicketTriage? = null,
 )
@@ -567,6 +578,12 @@ data class JiraIssueDetail(
     val comments: List<JiraComment> = emptyList(),
     val commentTotal: Int = 0,
     val parentKey: String? = null,
+    // Epic membership + blocks/blocked-by links (XERK-634), for the epic panel —
+    // the same fields the heartbeat ticket carries, here off the on-demand fetch.
+    val epicKey: String? = null,
+    val isEpic: Boolean = false,
+    val blocks: List<String> = emptyList(),
+    val blockedBy: List<String> = emptyList(),
     val url: String = "",
     // The statuses this ticket can be moved to right now (XERK-138), from the
     // board's own workflow (Jira transitions / Azure states). `id` is what a
