@@ -77,6 +77,17 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   live place in line) — any one means the child is already coming up, whether the sweep or a board
   click put it there. Also skips a child that isn't To Do, or has no triaged / ignore-tier repo
   (silently — re-checked next sweep, never a churny blocked note).
+- **It carries its OWN growing backoff (`epicChildAttempts`), the twin of auto-start's `autoStarted`
+  (XERK-61/109) — the driver is a manual-source path, so `drainTicketQueue` never stamps `autoStarted`
+  for it.** The hub ACKS a `spawnTicket` whether the agent ran it or refused it, so a child dispatched
+  to a host that acks-without-a-session (an uncloneable repo, a per-host triage disagreement, a
+  mid-spawn error) reads un-started on the very next sweep; without the backoff the driver would
+  re-dispatch it every 15s forever. Stamped at enqueue (only reached when the child is NOT already
+  started/queued/in-flight), gated on `now < nextAt`, grown 1/2/4/8/10min capped, CLEARED the moment a
+  session appears or the child leaves To Do; queue-full spends no attempt (capacity is the queue's
+  concern, not the agent's). Also closes the ack-before-session-visible double-start window — a
+  just-dispatched child is backoff-held for the beat or two before its session first heartbeats.
+  Bounded by `EPIC_CHILD_ATTEMPTS_MAX` (oldest-first eviction, a re-stamp on next attempt).
 - **Readiness = all-blockers-Done** (`epicChildBlockersDone`): an in-epic blocker (a key in
   `run.children`) is AUTHORITATIVE and must be a confirmed Done row — a poll gap hiding it HOLDS the
   child, never races ahead. A VISIBLE external blocker holds only while it's not Done; an unresolvable
@@ -110,4 +121,5 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   completed blocker releases the next wave concurrently across two hosts), capacity backpressure (a
   flat wave queues, one-per-host-per-pass), the 5-hour paused-hold-then-resume (asserted via
   `pausedSubscriptions`), the double-start guards (existing session, repeated passes, sweep + manual
-  click reusing the in-flight cmdId), the run advancing to `done`, and `epicChildBlockersDone`.
+  click reusing the in-flight cmdId), the acked-no-session backoff (no 15s re-dispatch), the run
+  advancing to `done`, and `epicChildBlockersDone`.

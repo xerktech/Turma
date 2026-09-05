@@ -187,7 +187,7 @@ const {
   autoStopped, autoStopResumeExempt, autoStartOrgs, setAutoStartOrg,
   epicRuns, armEpicRun, clearEpicRun, buildEpicWaves, epicChildRows,
   isEpicOrEpicChild, sanitizeEpicRunRecord,
-  epicRunDriveSweep, epicChildBlockersDone, epicRunAllChildrenDone,
+  epicRunDriveSweep, epicChildBlockersDone, epicRunAllChildrenDone, epicChildAttempts,
   autoMergeSweep, autoCloseSweep, autoStartContentGate, orgsWithAutoMerge,
   autoMergeOrgs, setAutoMergeOrg, autoMergeState, autoClosed, ingestMergeResults,
   priorityWriteBackOrgs, setPriorityWriteBackOrg, orgsWithPriorityWriteBack,
@@ -11344,7 +11344,10 @@ test("XERK-550: the auto-merge content gate agrees with what auto-start would sw
 
 // ---- epic auto-orchestration run (XERK-635, epic XERK-633) ------------------
 
-const resetEpicRuns = () => { for (const k of Object.keys(epicRuns)) delete epicRuns[k]; };
+const resetEpicRuns = () => {
+  for (const k of Object.keys(epicRuns)) delete epicRuns[k];
+  epicChildAttempts.clear();
+};
 
 test("XERK-635: buildEpicWaves layers a diamond dependency into topological waves", () => {
   // A blocks B and C; B and C both block D. blockedBy is the reverse edge.
@@ -11734,6 +11737,37 @@ test("XERK-636: a child is never double-started — sweep passes, an existing se
   assert.equal(click.status, 200);
   assert.equal(click.body.cmdId, firstCmd.cmdId);          // reused, not minted
   assert.deepEqual(spawnedKeys("edClick"), ["C-1"]);       // still exactly one
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-636: a child's spawn that is acked but leaves no session backs off, it does not re-dispatch every sweep", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  await asBeat("edLoop", "ed8.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+      tickets: driveTickets() });
+  armEpicRun("ed8.atlassian.net", "E-1");
+  epicDriveRound();
+  assert.deepEqual(spawnedKeys("edLoop"), ["C-1"]);        // C-1 dispatched
+  const k = "ed8.atlassian.net\x00C-1";
+  assert.equal(epicChildAttempts.get(k).attempts, 1);
+
+  // The agent ACKS the spawn and produces NO session (a refusal, or a mid-spawn
+  // error — the hub acks either way): the command clears, C-1 is still To Do, and
+  // there is no session. Without a backoff the driver would re-dispatch it every
+  // 15s forever (the XERK-635/636 hot-loop). It must HOLD.
+  agents.edLoop.commands = [];
+  epicDriveRound();
+  epicDriveRound();
+  assert.equal((agents.edLoop.commands || []).length, 0,
+    "the retry waits out its backoff rather than re-dispatching every sweep");
+
+  // Once the backoff elapses it is tried again, and the attempt count grows.
+  epicChildAttempts.get(k).nextAt = 0;
+  epicDriveRound();
+  assert.deepEqual(spawnedKeys("edLoop"), ["C-1"]);
+  assert.equal(epicChildAttempts.get(k).attempts, 2);
   ticketQueue.length = 0;
   resetEpicRuns();
 });

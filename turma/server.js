@@ -2285,6 +2285,21 @@ function clearEpicRun(siteKey, epicKey) {
 // those is inherited by going through the SAME queue + findTicketHost the Start
 // button and auto-start use.
 
+// "<siteKey>\x00<childKey>" -> { attempts, nextAt }, the epic driver's own copy
+// of autoStarted's growing backoff (XERK-61/109). The hub ACKS a spawnTicket
+// whether the agent ran it or refused it (an uncloneable repo, a per-host triage
+// disagreement, a mid-spawn exception), so a child dispatched to a host that acks
+// without leaving a session looks un-started again on the very next sweep — and
+// without a backoff the driver would re-dispatch that unspawnable child every 15s
+// forever. Dropped the moment the child is seen started or settled, so it stays
+// as small as the set of children currently failing to start. Bounded below.
+const epicChildAttempts = new Map();
+// A backstop cap so a long series of arm/clear cycles cannot grow the map without
+// bound; in practice it only ever holds currently-failing children, cleared on
+// success. Oldest entry (Map insertion order) evicted first — it re-stamps on its
+// next attempt, so eviction only resets a backoff, never loses correctness.
+const EPIC_CHILD_ATTEMPTS_MAX = 2000;
+
 // Are all of a child's blockers Done, so it is ready to start? A blocker WITHIN
 // the run's own child set is authoritative: in-epic ordering is the whole point,
 // so a blocker that is not confirmed Done (including one momentarily unreported
@@ -2351,11 +2366,23 @@ function advanceEpicRunState(run, rows) {
 // channel (startedTicketKeys), a spawn already riding a queue (spawnTicketInFlight),
 // one committed to a host (committedTicketSpawn), or a live place in line — any
 // one of which means the child is already coming up, whether the sweep or a manual
-// click on the board put it there.
+// click on the board put it there. Past those, a growing backoff (epicChildAttempts,
+// XERK-61/109) stops a child the agent keeps acking-without-a-session from being
+// re-dispatched every 15s, and closes the ack-before-session-visible window that
+// would otherwise let a just-dispatched child re-queue for the beat or two before
+// its session first heartbeats.
 function epicRunDriveSweep() {
   const runKeys = Object.keys(epicRuns);
   if (!runKeys.length) return;
+  // Backstop the attempts map before the pass (see EPIC_CHILD_ATTEMPTS_MAX).
+  if (epicChildAttempts.size > EPIC_CHILD_ATTEMPTS_MAX) {
+    for (const key of [...epicChildAttempts.keys()]
+      .slice(0, epicChildAttempts.size - EPIC_CHILD_ATTEMPTS_MAX)) {
+      epicChildAttempts.delete(key);
+    }
+  }
   const rows = fleetTicketRows();
+  const now = Date.now();
   let started = null;   // startedTicketKeys(), computed at most once and only if needed
   for (const runKey of runKeys) {
     const run = epicRuns[runKey];
@@ -2368,20 +2395,35 @@ function epicRunDriveSweep() {
       const row = hit.row;
       const cat = row.statusCategory || null;
       // Only a To Do child is a fresh start; one already Done, in progress or in
-      // review is being handled (or finished) and must not gain a second session.
-      if (cat && cat !== "todo") continue;
+      // review is being handled (or finished) and must not gain a second session
+      // — and it is settled, so forget any backoff we were holding for it.
+      if (cat && cat !== "todo") { epicChildAttempts.delete(k); continue; }
       if (!epicChildBlockersDone(row, run, rows)) continue;   // a blocker isn't Done yet
       if (!started) started = startedTicketKeys();
-      if (started.has(k)) continue;                           // already has a session
+      // A session on any channel is the definitive "started" — clear the backoff
+      // so a child that later re-enters To Do (a rare human move) starts clean.
+      if (started.has(k)) { epicChildAttempts.delete(k); continue; }
       if (liveQueuedTicket(siteKey, childKey)) continue;      // already waiting in line
       if (spawnTicketInFlight(siteKey, childKey)) continue;   // a spawn is riding a queue
       if (committedTicketSpawn(siteKey, childKey)) continue;  // committed to a host
+      // Not started, not queued, not in flight: either never attempted, or a prior
+      // dispatch was ACKED and left no session (a refusal / mid-spawn error — the
+      // hub acks either way). Honour a growing backoff before re-queuing, exactly
+      // as autoStartSweep does with autoStarted; without it an unspawnable child
+      // re-dispatches every 15s forever (XERK-61/109).
+      const prior = epicChildAttempts.get(k);
+      if (prior && now < prior.nextAt) continue;
       // Needs a triaged repo like any ticket session; an ignore-tier repo never
       // auto-runs. Skipped silently (re-checked next sweep) rather than queued as
       // a blocked entry that would churn a terminal "gave up" note.
       const repo = ticketRepo(siteKey, childKey, rows);
       if (!repo || isRepoIgnored(repo)) continue;
-      enqueueTicketStart(siteKey, childKey, "manual");
+      // A full org line refuses the entry — retry next sweep, spending no attempt
+      // (queuing commits nothing; the backoff is for a spawn the AGENT can't
+      // complete, not for capacity backpressure the queue already handles).
+      if (!enqueueTicketStart(siteKey, childKey, "manual")) continue;
+      const attempts = Math.min((prior ? prior.attempts : 0) + 1, AUTO_START_BACKOFF_STEPS);
+      epicChildAttempts.set(k, { attempts, nextAt: autoStartRetryAt(now, attempts) });
     }
     advanceEpicRunState(run, rows);
   }
@@ -15398,10 +15440,12 @@ if (process.env.TURMA_TEST) {
     isEpicOrEpicChild,
     sanitizeEpicRunRecord,
     EPIC_RUN_STATES,
-    // XERK-636: the wave-dispatch driver + its readiness/state helpers.
+    // XERK-636: the wave-dispatch driver + its readiness/state helpers, and the
+    // per-child backoff map (XERK-61/109 hot-loop guard).
     epicRunDriveSweep,
     epicChildBlockersDone,
     epicRunAllChildrenDone,
+    epicChildAttempts,
     // Hands-off auto-merge + close (XERK-550): the two sweeps, the shared
     // content gate, the per-org toggle + setter, and the state the tests drive.
     autoMergeSweep,
