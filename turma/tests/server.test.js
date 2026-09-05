@@ -192,6 +192,7 @@ const {
   autoStopped, autoStopResumeExempt, autoStartOrgs, setAutoStartOrg,
   epicRuns, armEpicRun, clearEpicRun, buildEpicWaves, epicChildRows,
   isEpicOrEpicChild, sanitizeEpicRunRecord,
+  epicRunDriveSweep, epicChildBlockersDone, epicRunAllChildrenDone, epicChildAttempts,
   epicRunChildSession, anyArmedEpicRun, epicRunCompleteSweep, epicDoneWritten,
   autoMergeSweep, autoCloseSweep, autoStartContentGate, orgsWithAutoMerge,
   autoMergeOrgs, setAutoMergeOrg, autoMergeState, autoClosed, ingestMergeResults,
@@ -11349,7 +11350,10 @@ test("XERK-550: the auto-merge content gate agrees with what auto-start would sw
 
 // ---- epic auto-orchestration run (XERK-635, epic XERK-633) ------------------
 
-const resetEpicRuns = () => { for (const k of Object.keys(epicRuns)) delete epicRuns[k]; };
+const resetEpicRuns = () => {
+  for (const k of Object.keys(epicRuns)) delete epicRuns[k];
+  epicChildAttempts.clear();
+};
 
 test("XERK-635: buildEpicWaves layers a diamond dependency into topological waves", () => {
   // A blocks B and C; B and C both block D. blockedBy is the reverse edge.
@@ -11610,11 +11614,11 @@ const dCmds = (device) => (agents[device].commands || [])
 test("XERK-637: an armed run's child auto-merges even with NO org opt-in and a non-bug type", async () => {
   resetEpicD();
   const url = "https://github.com/ep/m1/pull/1";
-  await asBeat("edM", "ed1.atlassian.net", { autoStart: false,
+  await asBeat("edM", "d637-1.atlassian.net", { autoStart: false,
     tickets: [dEpic(), dChild("C-1", [], "inprogress")],
-    sessions: [dChildSession("s-c1", "C-1", "ed1.atlassian.net", "OPEN", url)] });
-  assert.equal("ed1.atlassian.net" in autoMergeOrgs, false);   // org NOT opted in
-  armEpicRun("ed1.atlassian.net", "E-1");
+    sessions: [dChildSession("s-c1", "C-1", "d637-1.atlassian.net", "OPEN", url)] });
+  assert.equal("d637-1.atlassian.net" in autoMergeOrgs, false);   // org NOT opted in
+  armEpicRun("d637-1.atlassian.net", "E-1");
   autoMergeSweep();
   const c = (agents.edM.commands || []).find((x) => x.type === "mergePr");
   assert.ok(c, `expected a mergePr for the armed run's child, got ${JSON.stringify(dCmds("edM"))}`);
@@ -11625,10 +11629,10 @@ test("XERK-637: an armed run's child auto-merges even with NO org opt-in and a n
 test("XERK-637: an armed run's child auto-closes on a merged PR — Done write + kill, no opt-in", async () => {
   resetEpicD();
   const url = "https://github.com/ep/c1/pull/1";
-  await asBeat("edC", "ed2.atlassian.net", { autoStart: false,
+  await asBeat("edC", "d637-2.atlassian.net", { autoStart: false,
     tickets: [dEpic(), dChild("C-1", [], "inprogress")],
-    sessions: [dChildSession("s-c1", "C-1", "ed2.atlassian.net", "MERGED", url)] });
-  armEpicRun("ed2.atlassian.net", "E-1");
+    sessions: [dChildSession("s-c1", "C-1", "d637-2.atlassian.net", "MERGED", url)] });
+  armEpicRun("d637-2.atlassian.net", "E-1");
   autoCloseSweep();
   const got = dCmds("edC");
   assert.ok(got.some(([t, k, cat]) => t === "setTicketStatus" && k === "C-1" && cat === "done"),
@@ -11642,10 +11646,10 @@ test("XERK-637: an epic child with NO armed run stays excluded, even in an auto-
   // an armed run overrides it. Opt the org into auto-merge so the sweeps DO run.
   resetEpicD();
   const url = "https://github.com/ep/x1/pull/1";
-  await asBeat("edX", "ed3.atlassian.net", { autoStart: false,
+  await asBeat("edX", "d637-3.atlassian.net", { autoStart: false,
     tickets: [dEpic(), dChild("C-1", [], "inprogress")],
-    sessions: [dChildSession("s-c1", "C-1", "ed3.atlassian.net", "MERGED", url)] });
-  setAutoMergeOrg("ed3.atlassian.net", true);
+    sessions: [dChildSession("s-c1", "C-1", "d637-3.atlassian.net", "MERGED", url)] });
+  setAutoMergeOrg("d637-3.atlassian.net", true);
   assert.equal(anyArmedEpicRun(), false);                 // no run armed
   autoMergeSweep();
   autoCloseSweep();
@@ -11658,14 +11662,14 @@ test("XERK-637: an epic child with NO armed run stays excluded, even in an auto-
 test("XERK-637: chain-advance — auto-closing a wave-1 child unblocks dependents, epic NOT done yet", async () => {
   resetEpicD();
   const url = "https://github.com/ep/ch/pull/1";
-  await asBeat("edCh", "ed4.atlassian.net", { autoStart: false,
+  await asBeat("edCh", "d637-4.atlassian.net", { autoStart: false,
     tickets: [dEpic(),
       dChild("C-1", [], "inprogress"),
       dChild("C-2", ["C-1"], "todo"),
       dChild("C-3", ["C-1"], "todo")],
-    sessions: [dChildSession("s-c1", "C-1", "ed4.atlassian.net", "MERGED", url)] });
-  armEpicRun("ed4.atlassian.net", "E-1");
-  assert.deepEqual(epicRuns["ed4.atlassian.net/E-1"].waves, [["C-1"], ["C-2", "C-3"]]);
+    sessions: [dChildSession("s-c1", "C-1", "d637-4.atlassian.net", "MERGED", url)] });
+  armEpicRun("d637-4.atlassian.net", "E-1");
+  assert.deepEqual(epicRuns["d637-4.atlassian.net/E-1"].waves, [["C-1"], ["C-2", "C-3"]]);
   // C-1 lands -> auto-close produces its Done edge; the epic stays In Progress.
   autoCloseSweep();
   epicRunCompleteSweep();
@@ -11674,13 +11678,13 @@ test("XERK-637: chain-advance — auto-closing a wave-1 child unblocks dependent
     `expected C-1 Done, got ${JSON.stringify(got)}`);
   assert.ok(!got.some(([t, k]) => t === "setTicketStatus" && k === "E-1"),
     "the epic must NOT be closed while C-2/C-3 are still open");
-  assert.equal(epicRuns["ed4.atlassian.net/E-1"].state, "running");
+  assert.equal(epicRuns["d637-4.atlassian.net/E-1"].state, "running");
   // The Done edge, once the agent applies it and re-reports, makes C-1's
   // dependents ready — buildEpicWaves' wave 2 is now all-blockers-Done. (Starting
   // that wave is C's driver, XERK-636; here we assert the readiness the edge creates.)
-  const doneAfter = new Map([["ed4.atlassian.net\x00C-1",
-    { row: { key: "C-1", statusCategory: "done" }, siteKey: "ed4.atlassian.net" }]]);
-  const c1Done = !!(doneAfter.get("ed4.atlassian.net\x00C-1").row.statusCategory === "done");
+  const doneAfter = new Map([["d637-4.atlassian.net\x00C-1",
+    { row: { key: "C-1", statusCategory: "done" }, siteKey: "d637-4.atlassian.net" }]]);
+  const c1Done = !!(doneAfter.get("d637-4.atlassian.net\x00C-1").row.statusCategory === "done");
   assert.equal(c1Done, true);
 });
 
@@ -11692,15 +11696,15 @@ test("XERK-637: a child ADDED to the epic after arming (not in run.children) is 
   // which the merge/close command assertions below fail without.
   resetEpicD();
   const url = "https://github.com/ep/late/pull/1";
-  await asBeat("edLate", "ed9.atlassian.net", { autoStart: false,
+  await asBeat("edLate", "d637-9.atlassian.net", { autoStart: false,
     tickets: [dEpic(), dChild("C-1", [], "todo")] });
-  armEpicRun("ed9.atlassian.net", "E-1");
-  assert.deepEqual(epicRuns["ed9.atlassian.net/E-1"].children, ["C-1"]);
+  armEpicRun("d637-9.atlassian.net", "E-1");
+  assert.deepEqual(epicRuns["d637-9.atlassian.net/E-1"].children, ["C-1"]);
   // C-2 joins the epic after arming and even lands a merged PR — but the run was
   // never armed against it, so it must NOT auto-merge or auto-close.
-  await asBeat("edLate", "ed9.atlassian.net", { autoStart: false,
+  await asBeat("edLate", "d637-9.atlassian.net", { autoStart: false,
     tickets: [dEpic(), dChild("C-1", [], "todo"), dChild("C-2", [], "inprogress")],
-    sessions: [dChildSession("s-c2", "C-2", "ed9.atlassian.net", "MERGED", url)] });
+    sessions: [dChildSession("s-c2", "C-2", "d637-9.atlassian.net", "MERGED", url)] });
   autoMergeSweep();
   autoCloseSweep();
   const kinds = (agents.edLate.commands || []).map((c) => c.type);
@@ -11711,13 +11715,13 @@ test("XERK-637: a child ADDED to the epic after arming (not in run.children) is 
 
 test("XERK-637: the epic is written to Done exactly once when every child is Done, run terminal", async () => {
   resetEpicD();
-  await asBeat("edE", "ed5.atlassian.net", { autoStart: false,
+  await asBeat("edE", "d637-5.atlassian.net", { autoStart: false,
     tickets: [dEpic("inprogress"),
       dChild("C-1", [], "inprogress"), dChild("C-2", ["C-1"], "todo")] });
-  armEpicRun("ed5.atlassian.net", "E-1");
-  assert.equal(epicRuns["ed5.atlassian.net/E-1"].state, "running");
+  armEpicRun("d637-5.atlassian.net", "E-1");
+  assert.equal(epicRuns["d637-5.atlassian.net/E-1"].state, "running");
   // Every child reaches Done on the board (however they got there).
-  await asBeat("edE", "ed5.atlassian.net", { autoStart: false,
+  await asBeat("edE", "d637-5.atlassian.net", { autoStart: false,
     tickets: [dEpic("inprogress"),
       dChild("C-1", [], "done"), dChild("C-2", ["C-1"], "done")] });
   epicRunCompleteSweep();
@@ -11725,7 +11729,7 @@ test("XERK-637: the epic is written to Done exactly once when every child is Don
   const closes = (agents.edE.commands || [])
     .filter((c) => c.type === "setTicketStatus" && c.issueKey === "E-1" && c.category === "done");
   assert.equal(closes.length, 1, `epic Done should fire once, got ${closes.length}`);
-  assert.equal(epicRuns["ed5.atlassian.net/E-1"].state, "done");
+  assert.equal(epicRuns["d637-5.atlassian.net/E-1"].state, "done");
 });
 
 test("XERK-637: mixed auto/human completion — one child auto-closed, one human-moved, epic completes", async () => {
@@ -11733,22 +11737,22 @@ test("XERK-637: mixed auto/human completion — one child auto-closed, one human
   const url = "https://github.com/ep/mx/pull/1";
   // C-1 is being auto-closed (running session, merged PR); C-2 a human already
   // moved to Done out of band.
-  await asBeat("edMx", "ed6.atlassian.net", { autoStart: false,
+  await asBeat("edMx", "d637-6.atlassian.net", { autoStart: false,
     tickets: [dEpic("inprogress"),
       dChild("C-1", [], "inprogress"), dChild("C-2", [], "done")],
-    sessions: [dChildSession("s-c1", "C-1", "ed6.atlassian.net", "MERGED", url)] });
-  armEpicRun("ed6.atlassian.net", "E-1");
+    sessions: [dChildSession("s-c1", "C-1", "d637-6.atlassian.net", "MERGED", url)] });
+  armEpicRun("d637-6.atlassian.net", "E-1");
   autoCloseSweep();                                // C-1 -> Done write + kill
   assert.ok(dCmds("edMx").some(([t, k, cat]) => t === "setTicketStatus" && k === "C-1" && cat === "done"));
   // The agent applies C-1's Done and re-reports (session gone).
-  await asBeat("edMx", "ed6.atlassian.net", { autoStart: false,
+  await asBeat("edMx", "d637-6.atlassian.net", { autoStart: false,
     tickets: [dEpic("inprogress"),
       dChild("C-1", [], "done"), dChild("C-2", [], "done")], sessions: [] });
   epicRunCompleteSweep();
   const closes = (agents.edMx.commands || [])
     .filter((c) => c.type === "setTicketStatus" && c.issueKey === "E-1" && c.category === "done");
   assert.equal(closes.length, 1);
-  assert.equal(epicRuns["ed6.atlassian.net/E-1"].state, "done");
+  assert.equal(epicRuns["d637-6.atlassian.net/E-1"].state, "done");
 });
 
 test("XERK-637: completion stands down (never goes terminal) when no board-cred host can take the write", async () => {
@@ -11757,10 +11761,10 @@ test("XERK-637: completion stands down (never goes terminal) when no board-cred 
   resetEpicD();
   // Arm with the child NOT yet done so the run starts "running" (armEpicRun would
   // set state:"done" up front if it were already complete), then move it Done.
-  await asBeat("edGap", "ed7.atlassian.net", { autoStart: false,
+  await asBeat("edGap", "d637-7.atlassian.net", { autoStart: false,
     tickets: [dEpic("inprogress"), dChild("C-1", [], "inprogress")] });
-  armEpicRun("ed7.atlassian.net", "E-1");
-  await asBeat("edGap", "ed7.atlassian.net", { autoStart: false,
+  armEpicRun("d637-7.atlassian.net", "E-1");
+  await asBeat("edGap", "d637-7.atlassian.net", { autoStart: false,
     tickets: [dEpic("inprogress"), dChild("C-1", [], "done")] });
   // Make every host of the org too old for the status write (agentGapError true).
   agents.edGap.unsupported = { setTicketStatus: Date.now() };
@@ -11768,7 +11772,7 @@ test("XERK-637: completion stands down (never goes terminal) when no board-cred 
   const closes = (agents.edGap.commands || [])
     .filter((c) => c.type === "setTicketStatus" && c.issueKey === "E-1");
   assert.equal(closes.length, 0, "no Done write should be queued to a gapped host");
-  assert.equal(epicRuns["ed7.atlassian.net/E-1"].state, "running", "run must NOT go terminal");
+  assert.equal(epicRuns["d637-7.atlassian.net/E-1"].state, "running", "run must NOT go terminal");
   delete agents.edGap.unsupported;
 });
 
@@ -11777,22 +11781,283 @@ test("XERK-637: a run armed already-complete still writes the epic Done (B set s
   // it does NOT write the epic — the completion sweep must still close the epic so
   // the organizer is never stranded In Progress.
   resetEpicD();
-  await asBeat("edPre", "ed8.atlassian.net", { autoStart: false,
+  await asBeat("edPre", "d637-8.atlassian.net", { autoStart: false,
     tickets: [dEpic("inprogress"), dChild("C-1", [], "done"), dChild("C-2", [], "done")] });
-  armEpicRun("ed8.atlassian.net", "E-1");
-  assert.equal(epicRuns["ed8.atlassian.net/E-1"].state, "done");   // B marked it done
+  armEpicRun("d637-8.atlassian.net", "E-1");
+  assert.equal(epicRuns["d637-8.atlassian.net/E-1"].state, "done");   // B marked it done
   epicRunCompleteSweep();
   const closes = (agents.edPre.commands || [])
     .filter((c) => c.type === "setTicketStatus" && c.issueKey === "E-1" && c.category === "done");
   assert.equal(closes.length, 1, "the epic must be written Done even though the run was armed complete");
   // Once the epic is Done on the board, a later sweep never re-fires the write.
-  await asBeat("edPre", "ed8.atlassian.net", { autoStart: false,
+  await asBeat("edPre", "d637-8.atlassian.net", { autoStart: false,
     tickets: [dEpic("done"), dChild("C-1", [], "done"), dChild("C-2", [], "done")] });
   epicDoneWritten.clear();                          // simulate a restart losing the in-memory guard
   epicRunCompleteSweep();
   const closes2 = (agents.edPre.commands || [])
     .filter((c) => c.type === "setTicketStatus" && c.issueKey === "E-1");
   assert.equal(closes2.length, 1, "the board's own Done state must stop a re-fire after the guard is lost");
+});
+
+// ---- the epic-run DRIVER — wave dispatch (XERK-636, epic XERK-633) ----------
+
+// The epic's children with controllable statuses: E-1 -> {C-1, then C-2 & C-3
+// which both depend on C-1}. Every ticket has a repo so the repo gate never
+// masks the readiness logic.
+const driveTickets = (statuses = {}) => [
+  { key: "E-1", statusCategory: statuses["E-1"] || "todo", isEpic: true,
+    repoGuess: { repo: "Turma", cloned: true } },
+  { key: "C-1", statusCategory: statuses["C-1"] || "todo", epicKey: "E-1", blockedBy: [],
+    repoGuess: { repo: "Turma", cloned: true },
+    triage: { priority: "P2", type: "task", actionable: true } },
+  { key: "C-2", statusCategory: statuses["C-2"] || "todo", epicKey: "E-1", blockedBy: ["C-1"],
+    repoGuess: { repo: "Turma", cloned: true },
+    triage: { priority: "P2", type: "task", actionable: true } },
+  { key: "C-3", statusCategory: statuses["C-3"] || "todo", epicKey: "E-1", blockedBy: ["C-1"],
+    repoGuess: { repo: "Turma", cloned: true },
+    triage: { priority: "P2", type: "task", actionable: true } },
+];
+
+const epicDriveRound = () => { epicRunDriveSweep(); drainTicketQueue(); };
+const spawnedKeys = (device) =>
+  (agents[device].commands || []).filter((c) => c.type === "spawnTicket").map((c) => c.issueKey);
+
+test("XERK-636: only ready children (all-blockers-Done) dispatch; blocked ones wait, then run", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  // Two hosts of ONE org so independents can run concurrently in a single pass.
+  await asBeat("edA", "ed1.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+      tickets: driveTickets() });
+  await asBeat("edB", "ed1.atlassian.net", { autoStart: false, user: "edB@x.com",
+    capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+    tickets: driveTickets() });
+  armEpicRun("ed1.atlassian.net", "E-1");
+
+  // WAVE 1: only C-1 (no blockers) is ready — C-2/C-3 are blocked by C-1 and
+  // must NOT start. The epic E-1 itself is never a candidate.
+  epicDriveRound();
+  const wave1 = [...spawnedKeys("edA"), ...spawnedKeys("edB")];
+  assert.deepEqual(wave1.sort(), ["C-1"]);
+  assert.equal(liveQueueCount(), 0);   // C-1 dispatched, nothing left waiting
+
+  // C-1 completes -> WAVE 2: C-2 and C-3 are both ready and INDEPENDENT, so a
+  // single drain pass dispatches them to DIFFERENT hosts (one per host per pass).
+  await asBeat("edA", "ed1.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+      tickets: driveTickets({ "C-1": "done" }) });
+  await asBeat("edB", "ed1.atlassian.net", { autoStart: false, user: "edB@x.com",
+    capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+    tickets: driveTickets({ "C-1": "done" }) });
+  epicDriveRound();
+  const a2 = spawnedKeys("edA"), b2 = spawnedKeys("edB");
+  assert.deepEqual([...a2, ...b2].filter((k) => k !== "C-1").sort(), ["C-2", "C-3"]);
+  // Concurrent: neither host took BOTH — they went out in the same pass.
+  assert.ok(!(a2.includes("C-2") && a2.includes("C-3")), "C-2 and C-3 ran in parallel");
+  assert.ok(!(b2.includes("C-2") && b2.includes("C-3")), "C-2 and C-3 ran in parallel");
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-636: a wave of independent children queues up to fleet capacity, rest wait for a slot", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  // Three independent children (a flat epic: no blocks-links), ONE host with a
+  // single free slot. The wave queues all three, but only one dispatches per pass
+  // per host — capacity backpressure inherited from the hub ticket queue.
+  const flat = [
+    { key: "E-9", statusCategory: "todo", isEpic: true, repoGuess: { repo: "Turma", cloned: true } },
+    { key: "F-1", statusCategory: "todo", epicKey: "E-9", blockedBy: [],
+      repoGuess: { repo: "Turma", cloned: true }, triage: { priority: "P2", type: "task", actionable: true } },
+    { key: "F-2", statusCategory: "todo", epicKey: "E-9", blockedBy: [],
+      repoGuess: { repo: "Turma", cloned: true }, triage: { priority: "P2", type: "task", actionable: true } },
+    { key: "F-3", statusCategory: "todo", epicKey: "E-9", blockedBy: [],
+      repoGuess: { repo: "Turma", cloned: true }, triage: { priority: "P2", type: "task", actionable: true } },
+  ];
+  await asBeat("edCap", "ed2.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 5, queued: 0, free: 1 }, tickets: flat });
+  armEpicRun("ed2.atlassian.net", "E-9");
+  epicDriveRound();
+  // All three ready children are in line; one went out this pass, two hold.
+  assert.equal(spawnedKeys("edCap").length, 1);
+  assert.equal(liveQueueCount(), 2);
+  // The two waiting entries are MANUAL (queue-and-hold like a manual Start) —
+  // the epic run is a deliberate commitment, so no weekly-pace rationing applies.
+  assert.ok(ticketQueue.every((e) => e.source === "manual"));
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-636: a ready child holds paused when the host's 5-hour window is maxed, then runs on reset", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  const beat = (fiveHourResetsInSec) => request("POST", "/api/heartbeat", {
+    body: {
+      device: "edPause", repos: [{ name: "Turma", path: "/git/Turma" }],
+      capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+      subscription: { key: "edPauseSub" },
+      limits: { capturedAt: NOW(),
+        sevenDay: { usedPct: 2, resetsAt: NOW() + 6 * 86400 },
+        fiveHour: { usedPct: 95, resetsAt: NOW() + fiveHourResetsInSec } },
+      jira: { available: true, configured: true, siteKey: "ed3.atlassian.net",
+        user: "edPause@x.com", fetchedAt: "2026-07-14T12:00:00Z", tickets: driveTickets() },
+    },
+    headers: agentHeaders,
+  });
+  await beat(3 * 3600);   // 5-hour window maxed, still open
+  armEpicRun("ed3.atlassian.net", "E-1");
+  // The subscription is 5-hour-paused for a MANUAL-class start (which is how the
+  // driver queues) — the acceptance's "assert via pausedSubscriptions".
+  assert.ok(hub.pausedSubscriptions(Date.now(), { fiveHourOnly: true }).has("edPauseSub"));
+
+  epicDriveRound();
+  // C-1 is ready and queued, but the only host is paused, so nothing is handed
+  // over and the entry HOLDS as self-clearing "paused" — never dropped.
+  assert.equal(spawnedKeys("edPause").length, 0);
+  const q = queuedTicket("ed3.atlassian.net", "C-1");
+  assert.equal(q.source, "manual");
+  assert.equal(q.reason, "paused");
+  assert.match(q.error, /5-hour/);
+
+  // The window resets -> the pause self-clears -> the held child dispatches.
+  await beat(-60);
+  assert.ok(!hub.pausedSubscriptions(Date.now(), { fiveHourOnly: true }).has("edPauseSub"));
+  drainTicketQueue();
+  assert.deepEqual(spawnedKeys("edPause"), ["C-1"]);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-636: a child is never double-started — sweep passes, an existing session, or a manual click", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+
+  // (a) A child that already has a session anywhere is never queued or started.
+  await asBeat("edDup", "ed4.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 1, queued: 0, free: 5 },
+      tickets: driveTickets(),
+      sessions: [{ id: "sC1", transcriptId: "t-c1",
+                   ticket: { key: "C-1", siteKey: "ed4.atlassian.net" } }] });
+  armEpicRun("ed4.atlassian.net", "E-1");
+  epicDriveRound();
+  assert.equal(spawnedKeys("edDup").length, 0);            // C-1 has a session; C-2/C-3 blocked by it
+  assert.equal(queuedTicket("ed4.atlassian.net", "C-1"), null);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+
+  // (b) Repeated driver passes never open a second session — the in-flight guard
+  // holds once C-1's spawn is riding the host's queue.
+  await asBeat("edOnce", "ed5.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+      tickets: driveTickets() });
+  armEpicRun("ed5.atlassian.net", "E-1");
+  epicDriveRound();
+  epicDriveRound();
+  epicDriveRound();
+  assert.deepEqual(spawnedKeys("edOnce"), ["C-1"]);        // exactly one, not three
+  ticketQueue.length = 0;
+  resetEpicRuns();
+
+  // (c) A manual Start that lands on a child the driver just dispatched reuses the
+  // in-flight spawn's cmdId (committedTicketSpawn) — no second session, no second
+  // queue entry, across sweep + a board click.
+  await asBeat("edClick", "ed6.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+      tickets: driveTickets() });
+  armEpicRun("ed6.atlassian.net", "E-1");
+  epicDriveRound();
+  const firstCmd = (agents.edClick.commands || []).find((c) => c.type === "spawnTicket");
+  const click = await startTicket("ed6.atlassian.net", "C-1");
+  assert.equal(click.status, 200);
+  assert.equal(click.body.cmdId, firstCmd.cmdId);          // reused, not minted
+  assert.deepEqual(spawnedKeys("edClick"), ["C-1"]);       // still exactly one
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-636: a child's spawn that is acked but leaves no session backs off, it does not re-dispatch every sweep", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  await asBeat("edLoop", "ed8.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+      tickets: driveTickets() });
+  armEpicRun("ed8.atlassian.net", "E-1");
+  epicDriveRound();
+  assert.deepEqual(spawnedKeys("edLoop"), ["C-1"]);        // C-1 dispatched
+  const k = "ed8.atlassian.net\x00C-1";
+  assert.equal(epicChildAttempts.get(k).attempts, 1);
+
+  // The agent ACKS the spawn and produces NO session (a refusal, or a mid-spawn
+  // error — the hub acks either way): the command clears, C-1 is still To Do, and
+  // there is no session. Without a backoff the driver would re-dispatch it every
+  // 15s forever (the XERK-635/636 hot-loop). It must HOLD.
+  agents.edLoop.commands = [];
+  epicDriveRound();
+  epicDriveRound();
+  assert.equal((agents.edLoop.commands || []).length, 0,
+    "the retry waits out its backoff rather than re-dispatching every sweep");
+
+  // Once the backoff elapses it is tried again, and the attempt count grows.
+  epicChildAttempts.get(k).nextAt = 0;
+  epicDriveRound();
+  assert.deepEqual(spawnedKeys("edLoop"), ["C-1"]);
+  assert.equal(epicChildAttempts.get(k).attempts, 2);
+
+  // A session for C-1 finally appears while the Jira poll still reads it To Do:
+  // started.has(k) clears the backoff entry outright (not just the cat!=="todo"
+  // path), and the child is not re-dispatched.
+  agents.edLoop.commands = [];
+  await asBeat("edLoop", "ed8.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 1, queued: 0, free: 5 },
+      tickets: driveTickets(),
+      sessions: [{ id: "sC1", transcriptId: "t-c1",
+                   ticket: { key: "C-1", siteKey: "ed8.atlassian.net" } }] });
+  epicDriveRound();
+  assert.equal(epicChildAttempts.has(k), false, "a session clears the child's backoff");
+  assert.equal((agents.edLoop.commands || []).length, 0);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-636: the run advances to done once every child is Done, and drives nothing more", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  await asBeat("edState", "ed7.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+      tickets: driveTickets({ "C-1": "done", "C-2": "inprogress" }) });
+  armEpicRun("ed7.atlassian.net", "E-1");
+  assert.equal(epicRuns["ed7.atlassian.net/E-1"].state, "running");
+  // C-2 is in progress (not a fresh start); C-3 is ready (C-1 done) and dispatches.
+  epicDriveRound();
+  assert.deepEqual(spawnedKeys("edState"), ["C-3"]);
+
+  // Every child reaches Done -> the run itself is done and stops driving.
+  await asBeat("edState", "ed7.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+      tickets: driveTickets({ "C-1": "done", "C-2": "done", "C-3": "done" }) });
+  epicRunDriveSweep();
+  assert.equal(epicRuns["ed7.atlassian.net/E-1"].state, "done");
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-636: epicChildBlockersDone — in-epic blocker authoritative, external only if visible", () => {
+  const run = { siteKey: "eb.atlassian.net", children: ["A", "B"] };
+  const rows = new Map([
+    ["eb.atlassian.net\x00A", { row: { key: "A", statusCategory: "todo" } }],
+    ["eb.atlassian.net\x00X", { row: { key: "X", statusCategory: "done" } }],
+    ["eb.atlassian.net\x00Y", { row: { key: "Y", statusCategory: "todo" } }],
+  ]);
+  // An in-epic blocker (A) that is not Done HOLDS the child.
+  assert.equal(epicChildBlockersDone({ key: "B", blockedBy: ["A"] }, run, rows), false);
+  // A VISIBLE external blocker still open (Y) HOLDS; a Done one (X) does not.
+  assert.equal(epicChildBlockersDone({ key: "B", blockedBy: ["Y"] }, run, rows), false);
+  assert.equal(epicChildBlockersDone({ key: "B", blockedBy: ["X"] }, run, rows), true);
+  // An UNRESOLVABLE external blocker (nobody reports it) does not deadlock the run.
+  assert.equal(epicChildBlockersDone({ key: "B", blockedBy: ["OUT-9"] }, run, rows), true);
+  // Self-block ignored; no blockers -> ready.
+  assert.equal(epicChildBlockersDone({ key: "B", blockedBy: ["B"] }, run, rows), true);
+  assert.equal(epicChildBlockersDone({ key: "B", blockedBy: [] }, run, rows), true);
 });
 
 test("XERK-550: an ignore-tier repo is never eligible, even opted in", () => {

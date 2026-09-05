@@ -4,12 +4,13 @@ paths:
   - turma/tests/server.test.js
 ---
 
-# Epic auto-orchestration run (XERK-635, epic XERK-633)
+# Epic auto-orchestration run (XERK-635/636/637, epic XERK-633)
 
-The hub's core state for "work an epic's children in dependency order, start/close hands-off". This
-subtask (B) is the HUB STATE ONLY — the durable run record, its dependency DAG, the manual-start
-route, and the never-auto-start gate. The driver that actually starts children (C) and the board UI
-(E) are later subtasks; do not add them here.
+The hub's machinery for "work an epic's children in dependency order, start/close hands-off".
+XERK-635 (B) is the HUB STATE — the durable run record, its dependency DAG, the manual-start route,
+and the never-auto-start gate. XERK-636 (C) is the DRIVER that dispatches ready children. XERK-637
+(D) ADVANCES + COMPLETES the run — auto-merge/close a run's children and write the epic Done. The
+board UI (E) is a later subtask; do not add it here.
 
 Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every ticket
 (`normalizeJira` coerces them). This subtask consumes those fields; it collects nothing itself.
@@ -56,6 +57,49 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
 - `armEpicRun(siteKey, epicKey, rows)` rebuilds the DAG from the current board rows, derives state
   (`blocked` if a cycle; `done` if every child already Done; else `running`), persists, broadcasts.
 
+## The driver — `epicRunDriveSweep` (XERK-636)
+
+- **The sibling of `autoStartSweep` / `drainTicketQueue`**: on the 15s sweep, just BEFORE
+  `drainTicketQueue` (so a child queued here dispatches in the same tick), it walks every run that is
+  not `done` and queues the READY children the fleet isn't already handling. Epics + children are
+  excluded from `autoStartSweep` (XERK-635), so the two streams never contend for one ticket.
+- **It adds NO launch code, NO routing of its own, and NO second pause path.** Every one of those is
+  inherited by going through the SAME hub ticket queue (XERK-296) + `findTicketHost` the Start button
+  and auto-start use: parallelism (multiple ready children routed to available hosts, one-per-host-
+  per-drain-pass), capacity/queue backpressure, and the subscription pause (XERK-544/548/555).
+- **Children are queued as `enqueueTicketStart(..., "manual")`** — arming a run is a deliberate
+  operator commitment to finish the epic, so a ready child queue-and-holds exactly like a manual
+  Start (XERK-555): paused ONLY by the 5-hour cap, never the weekly pace ration. Do NOT switch this
+  to `"auto"` — `drainTicketQueue`'s auto branch would DROP an epic child whenever the org's
+  `autoStartOrgs` switch is off (a run is independent of that switch) and re-gate it on triage policy.
+- **A manual entry SKIPS `drainTicketQueue`'s own auto guards, so the driver owns the whole double-
+  start defence itself**: `startedTicketKeys` (a session on any channel), `spawnTicketInFlight` (a
+  spawn riding a queue), `committedTicketSpawn` (one committed to a host), and `liveQueuedTicket` (a
+  live place in line) — any one means the child is already coming up, whether the sweep or a board
+  click put it there. Also skips a child that isn't To Do, or has no triaged / ignore-tier repo
+  (silently — re-checked next sweep, never a churny blocked note).
+- **It carries its OWN growing backoff (`epicChildAttempts`), the twin of auto-start's `autoStarted`
+  (XERK-61/109) — the driver is a manual-source path, so `drainTicketQueue` never stamps `autoStarted`
+  for it.** The hub ACKS a `spawnTicket` whether the agent ran it or refused it, so a child dispatched
+  to a host that acks-without-a-session (an uncloneable repo, a per-host triage disagreement, a
+  mid-spawn error) reads un-started on the very next sweep; without the backoff the driver would
+  re-dispatch it every 15s forever. Stamped at enqueue (only reached when the child is NOT already
+  started/queued/in-flight), gated on `now < nextAt`, grown 1/2/4/8/10min capped, CLEARED the moment a
+  session appears or the child leaves To Do; queue-full spends no attempt (capacity is the queue's
+  concern, not the agent's). Also closes the ack-before-session-visible double-start window — a
+  just-dispatched child is backoff-held for the beat or two before its session first heartbeats.
+  Bounded by `EPIC_CHILD_ATTEMPTS_MAX` (oldest-first eviction, a re-stamp on next attempt).
+- **Readiness = all-blockers-Done** (`epicChildBlockersDone`): an in-epic blocker (a key in
+  `run.children`) is AUTHORITATIVE and must be a confirmed Done row — a poll gap hiding it HOLDS the
+  child, never races ahead. A VISIBLE external blocker holds only while it's not Done; an unresolvable
+  external blocker (no host reports it) is treated as satisfied, so an invisible cross-project ticket
+  can't deadlock the run. This is the driver's readiness concern; `buildEpicWaves` only ORDERS by
+  in-set blockers.
+- **The driver re-derives run STATE as children complete** (`advanceEpicRunState`): a `running` run
+  whose every child has reached Done becomes `done` (and drives nothing more); a cycle-`blocked` run
+  is LEFT blocked (only a re-arm rebuilds the DAG — its acyclic children still drive while blocked,
+  since a cyclic child never becomes ready). Persists + broadcasts like `armEpicRun`, only on change.
+
 ## The never-auto-start gate
 
 - **An epic AND its children are excluded from the org auto-start stream** (`autoStartSweep`): an
@@ -90,13 +134,18 @@ static and the only thing that changes is a child's board Done-ness.
 - **Chaining is C's, not D's.** The Done edge D produces (auto-close) or a human move is what C's
   driver re-evaluates to start the next wave. D adds NO wave-start code.
 - **Epic completion (`epicRunCompleteSweep`, on the 15s interval after `autoCloseSweep`)**: once every
-  `run.children` is Done on the board, write the EPIC to Done (XERK-138 write-back via
-  `pickBoardWriteHost`) and retire the run (`state:"done"`). The epic is an ORGANIZER — this is the
-  ONLY step that transitions it, and the never-auto-start gate keeps it off every spawn path.
-  - **The write is keyed off the BOARD + a once-guard, NOT the run's `state`** — `armEpicRun` sets
-    `state:"done"` for a run ARMED already-complete but never writes the epic, and a human may move the
-    epic Done out of band. So the write fires when `!isDone(epic) && !epicDoneWritten.has(tkey)`, and
-    `state` is set from "did we get here", so the organizer is never stranded In Progress.
+  `run.children` is Done on the board (reusing C's `epicRunAllChildrenDone`), write the EPIC to Done
+  (XERK-138 write-back via `pickBoardWriteHost`) and ensure the run is terminal (`state:"done"`). The
+  epic is an ORGANIZER — this is the ONLY step that transitions it, and the never-auto-start gate
+  keeps it off every spawn path.
+  - **The epic-Done WRITE is keyed off the BOARD + a once-guard, NOT the run's `state` — load-bearing
+    next to C's `advanceEpicRunState`.** C sets a completed run's `state:"done"` in the SAME tick
+    (`epicRunDriveSweep` runs before this sweep), and `armEpicRun` sets it for a run ARMED
+    already-complete (which C then skips) — either would suppress the write if it gated on `state`. So
+    D fires when `!epicIsDone(epic) && !epicDoneWritten.has(tkey)`. **C owns the run-STATE lifecycle;
+    D owns the epic-Done tracker WRITE** — C never writes the epic, D's `state:"done"` set is only a
+    fallback (a no-op once C ran, but it still completes a CYCLE-blocked run whose children a human all
+    moved Done, which C deliberately leaves blocked).
   - **Orphan guard (autoCloseSweep's):** queue the epic-Done write BEFORE going terminal — if no
     board-cred host can take it (`agentGapError`), stand down and retry, never mark the run done behind
     an unmade write.
@@ -104,8 +153,8 @@ static and the only thing that changes is a child's board Done-ness.
     (durable, survives a restart that empties the Set). A rare double-write in the restart window is a
     harmless no-op — the agent re-validates the transition against a fresh read, exactly like
     `autoClosed`.
-  - A run with NO children never auto-completes (an empty `children.every` is vacuously true, but an
-    empty run was armed against nothing).
+  - A run with NO children never auto-completes (`epicRunAllChildrenDone` returns false for an empty
+    list — an empty run was armed against nothing).
 
 ## Tests
 
@@ -113,8 +162,15 @@ static and the only thing that changes is a child's board Done-ness.
   cycle annotation), `isEpicOrEpicChild`, the sweep exclusion, the content-gate agreement, the route
   (arm/DAG/payload, cycle→blocked, bad-key/phantom-org/non-epic refusals, `{clear:true}`), and the
   restart restore (malformed record dropped).
+- The `XERK-636:` cases in `server.test.js`: parallel-wave dispatch (only ready children go, then a
+  completed blocker releases the next wave concurrently across two hosts), capacity backpressure (a
+  flat wave queues, one-per-host-per-pass), the 5-hour paused-hold-then-resume (asserted via
+  `pausedSubscriptions`), the double-start guards (existing session, repeated passes, sweep + manual
+  click reusing the in-flight cmdId), the acked-no-session backoff (no 15s re-dispatch), the run
+  advancing to `done`, and `epicChildBlockersDone`.
 - The `XERK-637:` cases in `server.test.js`: an armed child auto-merges past the opt-in + bug floor,
-  auto-closes (Done + kill) past the opt-in, an UNARMED epic child stays excluded, chain-advance
-  (auto-close unblocks dependents without completing the epic), epic-Done-written-once + run terminal,
-  mixed auto/human completion, the gapped-host stand-down, and a run armed already-complete still
-  writing the epic Done (with the board stopping a post-restart re-fire).
+  auto-closes (Done + kill) past the opt-in, an UNARMED epic child stays excluded, a child added
+  after arming (not in `run.children`) stays excluded, chain-advance (auto-close unblocks dependents
+  without completing the epic), epic-Done-written-once + run terminal, mixed auto/human completion,
+  the gapped-host stand-down, and a run armed already-complete still writing the epic Done (with the
+  board stopping a post-restart re-fire).
