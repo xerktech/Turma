@@ -1118,6 +1118,115 @@ class BoardTest {
         assertEquals("triage", displayColumnOf(untriaged, MoveState("done", error = "nope"), null))
     }
 
+    // --- epic auto-orchestration (XERK-638) ---------------------------------
+
+    private fun epicTicket(key: String) =
+        JiraTicket(key = key, isEpic = true, type = "Epic", statusCategory = "todo", status = "To Do")
+
+    private fun child(key: String, cat: String = "todo", blockedBy: List<String> = emptyList(), summary: String = "") =
+        JiraTicket(key = key, statusCategory = cat, blockedBy = blockedBy, summary = summary)
+
+    private fun epicSite(children: List<JiraTicket>) =
+        BoardSite(siteKey = "org", site = "org", online = true, error = null, fetchedAt = "",
+            tickets = listOf(epicTicket("E-1")) + children)
+
+    private fun mkRun(
+        state: String = "running",
+        children: List<String> = listOf("C-1", "C-2", "C-3"),
+        waves: List<List<String>> = listOf(listOf("C-1"), listOf("C-2", "C-3")),
+        cycle: List<String> = emptyList(),
+    ) = com.xerktech.turma.model.EpicRun(
+        epicKey = "E-1", siteKey = "org", state = state, children = children, waves = waves, cycle = cycle)
+
+    private fun epicSess(status: String) = TicketSession(
+        host = "h", id = "s", transcriptId = "t", status = status, gitBranch = "", ticketBranch = "",
+        summary = "", summaryManual = false, label = "", ticketKey = "", siteKey = "org")
+
+    @Test fun `isEpicTicket is true only for an epic`() {
+        assertTrue(isEpicTicket(epicTicket("E-1")))
+        assertFalse(isEpicTicket(child("W-1")))
+        assertFalse(isEpicTicket(null))
+    }
+
+    @Test fun `epicRunOf resolves by site-slash-key, null when absent or childless`() {
+        val map = mapOf("org/E-1" to mkRun(), "org/E-2" to mkRun(children = emptyList()))
+        assertEquals("E-1", epicRunOf(map, "org", "E-1")?.epicKey)
+        assertNull(epicRunOf(map, "org", "E-2"))   // no children -> not a run
+        assertNull(epicRunOf(map, "org", "E-9"))
+        assertNull(epicRunOf(null, "org", "E-1"))
+    }
+
+    @Test fun `an epic is never parked in the Triage lane`() {
+        // An untriaged To Do work ticket lands in the lane; an untriaged To Do
+        // epic does not (it is an organizer, XERK-638).
+        assertEquals("triage", triageLaneOf(child("W-1"), null))
+        assertNull(triageLaneOf(epicTicket("E-1"), null))
+        assertNull(triageLaneOf(epicTicket("E-1"), "hold"))
+    }
+
+    @Test fun `an epic offers no per-ticket Start control`() {
+        // ticketStartControl returns null for an epic even with a repo/sessions.
+        val e = epicTicket("E-1").copy(repoGuess = com.xerktech.turma.model.RepoGuess(repo = "Turma", cloned = true))
+        assertNull(ticketStartControl(e, 0, null, null))
+    }
+
+    @Test fun `epicRunView derives child status from the live board`() {
+        // C-1 Done; C-2 has a running session; C-3 unstarted, its in-epic blocker
+        // C-2 not Done -> blocked.
+        val site = epicSite(listOf(
+            child("C-1", cat = "done"),
+            child("C-2"),
+            child("C-3", blockedBy = listOf("C-2")),
+        ))
+        val idx = mapOf("org\u0000C-2" to listOf(epicSess("running")))
+        val view = epicRunView(mkRun(), site, idx)
+        assertEquals("running", view.state)
+        assertEquals(3, view.total)
+        assertEquals(1, view.done)
+        val flat = (view.waves.flatten()).associate { it.key to it.status }
+        assertEquals(EpicChildStatus.DONE, flat["C-1"])
+        assertEquals(EpicChildStatus.RUNNING, flat["C-2"])
+        assertEquals(EpicChildStatus.BLOCKED, flat["C-3"])
+        assertEquals(1, view.count(EpicChildStatus.DONE))
+        assertEquals(1, view.count(EpicChildStatus.RUNNING))
+        assertEquals(1, view.count(EpicChildStatus.BLOCKED))
+        // Wave order preserved from the hub's layering.
+        assertEquals(listOf(listOf("C-1"), listOf("C-2", "C-3")), view.waves.map { w -> w.map { it.key } })
+    }
+
+    @Test fun `epicRunView marks a child ready when its in-epic blockers are Done`() {
+        val site = epicSite(listOf(
+            child("C-1", cat = "done"),
+            child("C-2", blockedBy = listOf("C-1")),
+            child("C-3", blockedBy = listOf("C-1")),
+        ))
+        val view = epicRunView(mkRun(), site, emptyMap())
+        val flat = view.waves.flatten().associate { it.key to it.status }
+        assertEquals(EpicChildStatus.READY, flat["C-2"])
+        assertEquals(EpicChildStatus.READY, flat["C-3"])
+        assertEquals(2, view.count(EpicChildStatus.READY))
+    }
+
+    @Test fun `epicRunView counts a queued child as running and a cycle child as blocked`() {
+        val site = epicSite(listOf(child("C-1"), child("C-2"), child("C-3")))
+        val q = listOf(com.xerktech.turma.model.QueuedTicket(siteKey = "org", issueKey = "C-1"))
+        val view = epicRunView(mkRun(state = "blocked", cycle = listOf("C-2", "C-3")), site, emptyMap(), q)
+        val flat = (view.waves.flatten() + view.cycleChildren).associate { it.key to it.status }
+        assertEquals(EpicChildStatus.RUNNING, flat["C-1"])
+        assertTrue(view.cycle)
+        assertEquals(2, view.cycleChildren.size)
+        assertTrue(view.cycleChildren.all { it.status == EpicChildStatus.BLOCKED })
+    }
+
+    @Test fun `epicRunSig changes when the run advances`() {
+        val a = epicSite(listOf(child("C-1"), child("C-2"), child("C-3")))
+        val before = epicRunSig(epicRunView(mkRun(), a, emptyMap()))
+        val b = epicSite(listOf(child("C-1", cat = "done"), child("C-2"), child("C-3")))
+        val after = epicRunSig(epicRunView(mkRun(), b, emptyMap()))
+        assertTrue(before != after)
+        assertEquals("", epicRunSig(null))
+    }
+
     @Test fun `rateMaxError validates the policy-sheet rate field`() {
         assertNull(rateMaxError(""))
         assertNull(rateMaxError("  "))

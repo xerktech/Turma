@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
@@ -37,8 +38,11 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ModalBottomSheet
@@ -101,6 +105,12 @@ import com.xerktech.turma.core.createDirty
 import com.xerktech.turma.core.createLabelWord
 import com.xerktech.turma.core.displayColumnOf
 import com.xerktech.turma.core.edgeScrollStep
+import com.xerktech.turma.core.EpicChild
+import com.xerktech.turma.core.EpicChildStatus
+import com.xerktech.turma.core.EpicRunView
+import com.xerktech.turma.core.epicRunOf
+import com.xerktech.turma.core.epicRunView
+import com.xerktech.turma.core.isEpicTicket
 import com.xerktech.turma.core.filterSites
 import com.xerktech.turma.core.mergeSites
 import com.xerktech.turma.core.orgColorMap
@@ -118,6 +128,7 @@ import com.xerktech.turma.core.queuedTicketOf
 import com.xerktech.turma.core.ticketStartControl
 import com.xerktech.turma.core.triageActionOf
 import com.xerktech.turma.model.CreateTicketRequest
+import com.xerktech.turma.model.EpicRun
 import com.xerktech.turma.model.JiraTicket
 import com.xerktech.turma.model.QueuedTicket
 import com.xerktech.turma.model.TriageActionPin
@@ -295,6 +306,8 @@ fun BoardScreen(
                             moves = moves,
                             queue = ticketQueue,
                             triageActions = fleet.ticketTriageActions,
+                            epicRuns = fleet.epicRuns,
+                            onStartEpic = { site, t -> vm.startEpicRun(site.siteKey, t.key) },
                             dropTarget = drag != null && drag!!.overCat == cat && drag!!.fromCat != cat,
                             draggingKey = drag?.let { BoardViewModel.startKey(it.site.siteKey, it.ticket.key) },
                             onBounds = { r -> colBounds[cat] = r },
@@ -357,7 +370,14 @@ fun BoardScreen(
         val modelPin = com.xerktech.turma.core.modelPinOf(fleet.ticketModels, site.siteKey, ticket.key)
         val runtimePin = com.xerktech.turma.core.runtimePinOf(fleet.ticketRuntimes, site.siteKey, ticket.key)
         val triageAction = triageActionOf(fleet.ticketTriageActions, site.siteKey, ticket.key)
-        TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, triageAction, vm, onDismiss = { detail = null })
+        // The epic-run view (XERK-638), only for an epic — resolved against the
+        // LIVE site so a child finishing while the sheet is open shows at once.
+        val epicView = if (isEpicTicket(ticket)) {
+            val liveSite = sites.find { it.siteKey == site.siteKey } ?: site
+            epicRunOf(fleet.epicRuns, site.siteKey, ticket.key)
+                ?.let { epicRunView(it, liveSite, sessionIndex, ticketQueue) }
+        } else null
+        TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, triageAction, epicView, vm, onDismiss = { detail = null })
     }
 
     // The policy sheet edits the orgs in scope under the header filter — the
@@ -428,6 +448,8 @@ private fun KanbanColumn(
     moves: Map<String, MoveState>,
     queue: List<QueuedTicket>,
     triageActions: Map<String, TriageActionPin>,
+    epicRuns: Map<String, EpicRun>,
+    onStartEpic: (BoardSite, JiraTicket) -> Unit,
     dropTarget: Boolean,
     draggingKey: String?,
     onBounds: (Rect) -> Unit,
@@ -464,6 +486,13 @@ private fun KanbanColumn(
         LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             items(cards, key = { it.second.key }) { (site, t) ->
                 val moveKey = BoardViewModel.startKey(site.siteKey, t.key)
+                // The epic-run view for an epic card (XERK-638): its armed run off
+                // the payload, resolved to live wave/child progress against this
+                // site's tickets + the fleet's sessions/queue. null for a work
+                // ticket, or an epic with no run armed yet (offers Start-epic).
+                val epicView = if (isEpicTicket(t))
+                    epicRunOf(epicRuns, site.siteKey, t.key)?.let { epicRunView(it, site, sessionIndex, queue) }
+                else null
                 TicketCard(
                     t,
                     TurmaColors.series[(colorMap[site.siteKey] ?: 0) % TurmaColors.series.size],
@@ -473,9 +502,11 @@ private fun KanbanColumn(
                     move = moves[moveKey],
                     triageAction = triageActionOf(triageActions, site.siteKey, t.key),
                     queued = queuedTicketOf(queue, site.siteKey, t.key),
+                    epicView = epicView,
                     dragging = draggingKey == moveKey,
                     onOpenSession = onOpenSession,
                     onStart = { onStart(site, t) },
+                    onStartEpic = { onStartEpic(site, t) },
                     onCancelQueued = { onCancelQueued(site, t) },
                     onDragStart = { size, pos -> onDragStart(site, t, size, pos) },
                     onDragDelta = onDragDelta,
@@ -499,8 +530,10 @@ private fun TicketCard(
     move: MoveState?,
     triageAction: String?,
     queued: QueuedTicket?,
+    epicView: EpicRunView?,
     dragging: Boolean,
     onStart: () -> Unit,
+    onStartEpic: () -> Unit,
     onCancelQueued: () -> Unit,
     onOpenSession: (TicketSession) -> Unit,
     onDragStart: (IntSize, Offset) -> Unit,
@@ -580,8 +613,22 @@ private fun TicketCard(
                         },
                     )
                 }
+                // Distinguish an epic (an organizer) from work tickets (XERK-638),
+                // and mark a work ticket that belongs to one.
+                if (isEpicTicket(t)) {
+                    Pill("EPIC", color = MaterialTheme.colorScheme.primary, mono = true)
+                } else if (!t.epicKey.isNullOrBlank()) {
+                    Pill("⧉ ${t.epicKey}", dashed = true, mono = true)
+                }
                 sessions.forEach { s -> TicketSessionChip(s, onClick = { onOpenSession(s) }) }
-                TicketStartControl(t, sessions, start, queued, onStart, onCancelQueued)
+                // An epic never offers the ordinary per-ticket Start — the epic-run
+                // control takes its place: Start-epic when unarmed, else a
+                // state-tinted progress chip (the card tap opens the full panel).
+                if (isEpicTicket(t)) {
+                    EpicCardControl(epicView, onStartEpic)
+                } else {
+                    TicketStartControl(t, sessions, start, queued, onStart, onCancelQueued)
+                }
                 // A drag in flight / just landed, or a failed one (XERK-141).
                 if (move?.error != null) {
                     Text("couldn't move", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
@@ -710,6 +757,163 @@ private fun TicketStartControl(
                 },
                 onClick = onStart,
             )
+        }
+    }
+}
+
+// --- epic auto-orchestration (XERK-638) --------------------------------------
+
+/** The state colour of an epic run / child, shared by the card chip and panel. */
+@Composable
+private fun epicStateColor(state: String): Color = when (state) {
+    "done" -> TurmaColors.good
+    "blocked" -> TurmaColors.warning
+    else -> MaterialTheme.colorScheme.primary
+}
+
+@Composable
+private fun epicChildColor(status: EpicChildStatus): Color = when (status) {
+    EpicChildStatus.DONE -> TurmaColors.good
+    EpicChildStatus.RUNNING -> MaterialTheme.colorScheme.primary
+    EpicChildStatus.READY -> MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
+    EpicChildStatus.BLOCKED -> TurmaColors.warning
+}
+
+private fun epicChildLabel(status: EpicChildStatus): String = when (status) {
+    EpicChildStatus.DONE -> "Done"
+    EpicChildStatus.RUNNING -> "In progress"
+    EpicChildStatus.READY -> "Ready"
+    EpicChildStatus.BLOCKED -> "Blocked"
+}
+
+/**
+ * The card's epic-run affordance (board.js epicCardControlHtml): "▶ Start epic"
+ * when no run is armed, else a state-tinted progress chip that opens the detail
+ * panel (the card tap already does) for the full breakdown.
+ */
+@Composable
+private fun EpicCardControl(view: EpicRunView?, onStartEpic: () -> Unit) {
+    if (view == null) {
+        GhostButton("▶ Start epic", onClick = onStartEpic)
+    } else {
+        val word = when (view.state) { "done" -> "done"; "blocked" -> "blocked"; else -> "running" }
+        Pill("▷ $word ${view.done}/${view.total}", color = epicStateColor(view.state), mono = true)
+    }
+}
+
+/**
+ * The epic-run section of the detail sheet (board.js epicRunPanelHtml): Start /
+ * Re-arm / Cancel plus the wave-by-wave child progress. Rendered only for an
+ * epic. A local busy flag covers the arm/cancel round trip; a refusal lands
+ * inline in the hub's own words (XERK-264).
+ */
+@Composable
+private fun EpicRunSection(site: BoardSite, t: JiraTicket, view: EpicRunView?, vm: BoardViewModel) {
+    val scope = rememberCoroutineScope()
+    var busy by remember(t.key) { mutableStateOf(false) }
+    var error by remember(t.key) { mutableStateOf<String?>(null) }
+    fun act(clear: Boolean) {
+        if (busy) return
+        busy = true; error = null
+        scope.launch {
+            error = vm.setEpicRun(site.siteKey, t.key, clear)
+            busy = false
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            SectionLabel("Epic run")
+            if (view != null) {
+                Pill(
+                    when (view.state) { "done" -> "Done"; "blocked" -> "Blocked"; else -> "Running" },
+                    color = epicStateColor(view.state),
+                )
+            }
+        }
+        error?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+        }
+        if (view == null) {
+            Text(
+                "This epic isn't being auto-orchestrated yet. Starting the run works its children in " +
+                    "dependency order — ready children start in parallel, each completed wave unlocks the " +
+                    "next, and the epic closes itself once every child is Done.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            if (busy) Text("⏳ starting…", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            else Button(onClick = { act(false) }) { Text("▶ Start epic run") }
+        } else {
+            // Progress line + a four-segment bar (done/running/ready/blocked).
+            Text("${view.done} / ${view.total} done", style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
+            EpicProgressBar(view)
+            if (view.cycle) {
+                Text(
+                    "Some children form a dependency cycle and can never become ready — untangle the " +
+                        "blocks in the tracker, then re-arm.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
+                )
+            }
+            if (view.total == 0) {
+                Text("This epic has no children on the board yet.", style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            view.waves.forEachIndexed { i, wave ->
+                EpicWaveGroup("Wave ${i + 1}", wave, cyclic = false)
+            }
+            if (view.cycleChildren.isNotEmpty()) {
+                EpicWaveGroup("Cyclic — never becomes ready", view.cycleChildren, cyclic = true)
+            }
+            if (busy) {
+                Text("⏳ working…", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { act(false) }) { Text("↻ Re-arm") }
+                    OutlinedButton(
+                        onClick = { act(true) },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                    ) { Text("Cancel run") }
+                }
+            }
+        }
+    }
+}
+
+/** The four-segment progress bar, sized by child count (board.js epicProgressBarHtml). */
+@Composable
+private fun EpicProgressBar(view: EpicRunView) {
+    val segs = listOf(
+        EpicChildStatus.DONE to TurmaColors.good,
+        EpicChildStatus.RUNNING to MaterialTheme.colorScheme.primary,
+        EpicChildStatus.READY to MaterialTheme.colorScheme.primary.copy(alpha = 0.45f),
+        EpicChildStatus.BLOCKED to TurmaColors.warning,
+    )
+    Row(
+        Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+        if (view.total == 0) return@Row
+        for ((status, color) in segs) {
+            val n = view.count(status)
+            if (n > 0) Box(Modifier.fillMaxHeight().weight(n.toFloat()).background(color))
+        }
+    }
+}
+
+/** One wave (or the cycle group) of the epic panel — a labelled list of child rows. */
+@Composable
+private fun EpicWaveGroup(title: String, children: List<EpicChild>, cyclic: Boolean) {
+    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Text(
+            title.uppercase(),
+            style = MaterialTheme.typography.labelSmall,
+            color = if (cyclic) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        for (c in children) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Box(Modifier.size(8.dp).clip(CircleShape).background(epicChildColor(c.status)))
+                Text(c.key, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(c.summary, style = MaterialTheme.typography.bodyMedium, maxLines = 1, modifier = Modifier.weight(1f))
+                Text(epicChildLabel(c.status), style = MaterialTheme.typography.labelSmall, color = epicChildColor(c.status))
+            }
         }
     }
 }
@@ -1203,6 +1407,7 @@ private fun TicketDetailSheet(
     modelPin: com.xerktech.turma.model.TicketModelPin?,
     runtimePin: com.xerktech.turma.model.TicketRuntimePin?,
     triageAction: String?,
+    epicView: EpicRunView?,
     vm: BoardViewModel,
     onDismiss: () -> Unit,
 ) {
@@ -1224,11 +1429,17 @@ private fun TicketDetailSheet(
             }
             Text(t.summary, style = MaterialTheme.typography.titleMedium)
             StatusSection(site, t, detail, vm, onDetailChange = { detail = it })
-            RepoSection(site, t, vm)
-            AgentSection(site, t, pin, vm)
-            ModelSection(site, t, modelPin, vm)
-            RuntimeSection(site, t, runtimePin, vm)
-            TriageSection(site, t, triageAction, vm)
+            // An epic is an organizer: it shows the epic-run panel (Start/progress),
+            // not the work-ticket pins (repo/agent/model/runtime), which don't apply.
+            if (isEpicTicket(t)) {
+                EpicRunSection(site, t, epicView, vm)
+            } else {
+                RepoSection(site, t, vm)
+                AgentSection(site, t, pin, vm)
+                ModelSection(site, t, modelPin, vm)
+                RuntimeSection(site, t, runtimePin, vm)
+                TriageSection(site, t, triageAction, vm)
+            }
             val d = detail
             if (d == null) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {

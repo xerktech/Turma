@@ -65,6 +65,32 @@ data class AgentsResponse(
     // Per-org triage policy (XERK-486), keyed by siteKey; the knobs the hub's
     // auto-start sweep applies after the triage gate. Absent on older hubs.
     val triagePolicies: Map<String, TriagePolicy> = emptyMap(),
+    // Armed epic auto-orchestration runs (XERK-635/638), keyed "<siteKey>/<epicKey>":
+    // the hub's computed dependency DAG for "work an epic's children in dependency
+    // order, start/close hands-off". The board reads it to distinguish an epic from
+    // a work ticket, offer the Start-epic control, and show wave/child progress.
+    // NEW top-level key, defaulted empty so an older hub reads as "no runs armed".
+    val epicRuns: Map<String, EpicRun> = emptyMap(),
+)
+
+/**
+ * One armed epic run (XERK-635/638; the web board's epicRuns entry). [state] is
+ * "running" | "blocked" (a dependency cycle stalls a child) | "done"; [children]
+ * are the member issue keys; [waves] is the hub's topological layering (each a
+ * list of keys ready together once the prior wave completes); [cycle] names any
+ * children stuck in a dependency loop. Every field is defaulted so a partial/older
+ * record decodes rather than failing the whole payload (the heartbeat contract).
+ */
+@Serializable
+data class EpicRun(
+    val epicKey: String = "",
+    val siteKey: String = "",
+    val state: String = "running",
+    val children: List<String> = emptyList(),
+    val waves: List<List<String>> = emptyList(),
+    val cycle: List<String> = emptyList(),
+    val startedAt: Long = 0,
+    val updatedAt: Long = 0,
 )
 
 /** One ticket->agent pin (the web board's Agent row; hub ticket-agents store). */

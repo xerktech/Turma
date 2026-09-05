@@ -5,6 +5,7 @@ import com.xerktech.turma.model.CreateMetaEnvelope
 import com.xerktech.turma.model.CreateProject
 import com.xerktech.turma.model.CreateResultEnvelope
 import com.xerktech.turma.model.CreateType
+import com.xerktech.turma.model.EpicRun
 import com.xerktech.turma.model.JiraIssueDetail
 import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.JiraTicket
@@ -120,6 +121,11 @@ fun triageActionOf(
  */
 fun triageLaneOf(t: JiraTicket?, action: String?): String? {
     if (t == null || categoryOf(t) != "todo") return null
+    // An epic is an organizer, never a work ticket the auto stream would start
+    // (XERK-635 keeps it off every spawn path), so it has nothing to triage —
+    // keep it out of the Triage lane and in its real column, where the epic-run
+    // control (XERK-638) is the affordance that applies.
+    if (isEpicTicket(t)) return null
     if (action == "hold") return "triage"
     if (t.triage == null) return "triage"
     return null
@@ -133,6 +139,104 @@ fun triageLaneOf(t: JiraTicket?, action: String?): String? {
 fun displayColumnOf(t: JiraTicket, move: MoveState?, action: String?): String {
     val override = move != null && (move.pending || move.settled) && move.error == null
     return if (override) move!!.category else (triageLaneOf(t, action) ?: categoryOf(t))
+}
+
+// --- epic auto-orchestration run (XERK-638, epic XERK-633) -------------------
+// The hub publishes a run record per armed epic on /api/agents `epicRuns`, keyed
+// "<siteKey>/<epicKey>": the computed dependency DAG for "work an epic's children
+// in dependency order, start/close hands-off" (XERK-635). The board reads it to
+// (a) DISTINGUISH an epic (an organizer) from a work ticket, (b) offer the
+// Start-epic control in place of the per-ticket Start, and (c) show wave/child
+// progress. A pure port of board.js isEpicTicket / epicRunOf / epicRunView.
+
+/** Whether a ticket is an epic (an organizer), not a work ticket — board.js isEpicTicket. */
+fun isEpicTicket(t: JiraTicket?): Boolean = t?.isEpic == true
+
+/**
+ * The armed run for an epic off the payload's `epicRuns` map, keyed
+ * "<siteKey>/<epicKey>", or null when none is armed. A record with no [children]
+ * reads as "no run" (the pin-reader pattern), so the card simply offers Start.
+ */
+fun epicRunOf(epicRuns: Map<String, EpicRun>?, siteKey: String, epicKey: String): EpicRun? =
+    epicRuns?.get("$siteKey/$epicKey")?.takeIf { it.children.isNotEmpty() }
+
+/** A child's live status in the run — the four states of board.js epicRunView. */
+enum class EpicChildStatus { DONE, RUNNING, READY, BLOCKED }
+
+/** One child in the run view: its key, summary and derived status. */
+data class EpicChild(val key: String, val summary: String, val status: EpicChildStatus)
+
+/**
+ * The run's LIVE progress, computed from the current board (never re-deriving the
+ * DAG — the hub owns [EpicRun.waves]/[EpicRun.children]/[EpicRun.cycle]). Each
+ * child gets one of four states, matching the hub driver's own readiness:
+ *   DONE     — the child ticket is in the Done column.
+ *   RUNNING  — a live/queued session names it (or a ticket-queue entry does).
+ *   READY    — not started, every IN-EPIC blocker Done (next to dispatch).
+ *   BLOCKED  — waiting on an in-epic blocker, or stuck in a dependency cycle.
+ * [waves] is the hub's topological layering, in order; [state] is [EpicRun.state]
+ * coerced to a known value. A pure port of board.js epicRunView.
+ */
+data class EpicRunView(
+    val state: String,
+    val total: Int,
+    val done: Int,
+    val counts: Map<EpicChildStatus, Int>,
+    val waves: List<List<EpicChild>>,
+    val cycleChildren: List<EpicChild>,
+    val cycle: Boolean,
+) {
+    fun count(s: EpicChildStatus): Int = counts[s] ?: 0
+}
+
+fun epicRunView(
+    run: EpicRun,
+    site: BoardSite,
+    sessionIndex: Map<String, List<TicketSession>>,
+    ticketQueue: List<QueuedTicket> = emptyList(),
+): EpicRunView {
+    val siteKey = site.siteKey.ifBlank { run.siteKey }
+    val byKey = site.tickets.associateBy { it.key }
+    val keys = run.children
+    val keySet = keys.toSet()
+    val cycleKeys = run.cycle
+    val cycleSet = cycleKeys.toSet()
+    fun isDone(k: String): Boolean = byKey[k]?.let { categoryOf(it) == "done" } == true
+    fun isRunning(k: String): Boolean {
+        if (queuedTicketOf(ticketQueue, siteKey, k) != null) return true
+        return ticketSessionsOf(sessionIndex, siteKey, k)
+            .any { it.status == "running" || it.status == "queued" }
+    }
+    fun statusOf(k: String): EpicChildStatus = when {
+        isDone(k) -> EpicChildStatus.DONE
+        isRunning(k) -> EpicChildStatus.RUNNING
+        cycleSet.contains(k) -> EpicChildStatus.BLOCKED
+        else -> {
+            val blockers = (byKey[k]?.blockedBy ?: emptyList()).filter { it in keySet }
+            if (blockers.all { isDone(it) }) EpicChildStatus.READY else EpicChildStatus.BLOCKED
+        }
+    }
+    fun node(k: String) = EpicChild(k, byKey[k]?.summary.orEmpty(), statusOf(k))
+    val counts = EpicChildStatus.entries.associateWith { s -> keys.count { statusOf(it) == s } }
+    val waves = run.waves.map { w -> w.map { node(it) } }
+    val cycleChildren = cycleKeys.map { node(it) }
+    val state = if (run.state == "done" || run.state == "blocked") run.state else "running"
+    return EpicRunView(
+        state = state, total = keys.size, done = counts[EpicChildStatus.DONE] ?: 0,
+        counts = counts, waves = waves, cycleChildren = cycleChildren,
+        cycle = cycleKeys.isNotEmpty(),
+    )
+}
+
+/**
+ * A short signature of what the epic-run surface renders, so a screen can tell
+ * when the run actually moved. Mirrors board.js epicRunSig.
+ */
+fun epicRunSig(view: EpicRunView?): String {
+    if (view == null) return ""
+    return "${view.state}|${view.done}/${view.total}" +
+        "|${view.count(EpicChildStatus.RUNNING)},${view.count(EpicChildStatus.READY)}," +
+        "${view.count(EpicChildStatus.BLOCKED)}"
 }
 
 /**
@@ -869,6 +973,10 @@ fun ticketStartControl(
     start: StartState?,
     queued: QueuedTicket? = null,
 ): StartControl? {
+    // An epic never offers the ordinary per-ticket Start — it is an organizer,
+    // not a work session (XERK-635/638). The card shows the epic-run control in
+    // its place (see [epicRunView] / the screen's EpicCardControl).
+    if (isEpicTicket(t)) return null
     val g = t.repoGuess
     if (g?.repo == null) return null
     if (queued != null) return StartControl.Queued(

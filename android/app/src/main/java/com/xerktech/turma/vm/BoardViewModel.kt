@@ -326,6 +326,41 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Fire-and-forget arm of an epic run from the CARD's "Start epic" button —
+     * the detail panel uses [setEpicRun] directly for inline busy/error. A
+     * refusal is toasted (the card has no inline row for it).
+     */
+    fun startEpicRun(siteKey: String, epicKey: String) {
+        viewModelScope.launch { setEpicRun(siteKey, epicKey, clear = false)?.let { _messages.tryEmit("✗ $it") } }
+    }
+
+    /**
+     * Arm/re-arm or cancel an epic's auto-orchestration run (XERK-635/638) — the
+     * SOLE trigger for the whole run. `clear = false` arms (rebuilds the DAG from
+     * the current board); `clear = true` cancels (running child sessions are left
+     * alone). Hub-owned and durable like the pins — the POST is authoritative and
+     * the fleet payload's `epicRuns` reflects it on the next poll/SSE, so the
+     * nudge pulls the new record. Returns the hub's own words on a refusal
+     * (XERK-264) so the panel can show it inline, or null on success.
+     */
+    suspend fun setEpicRun(siteKey: String, epicKey: String, clear: Boolean): String? {
+        val body = buildJsonObject { if (clear) put("clear", JsonPrimitive(true)) }
+        return try {
+            val r = container.client.api.setEpicRun(siteKey, epicKey, body)
+            val b = r.body()
+            if (!r.isSuccessful || b?.ok != true) {
+                b?.error?.takeIf { it.isNotBlank() } ?: r.hubError() ?: "HTTP ${r.code()}"
+            } else {
+                _messages.tryEmit(if (clear) "✓ epic run cancelled" else "✓ epic run started")
+                container.fleet.nudge()
+                null
+            }
+        } catch (_: Exception) {
+            "the hub is unreachable"
+        }
+    }
+
+    /**
      * Patch an org's triage policy (XERK-486): the knobs the hub's auto-start
      * sweep applies after the triage gate. All five knobs are sent (full patch,
      * like the web's savePolicy): [minPriority] null = any priority, [rateMax]

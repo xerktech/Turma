@@ -395,6 +395,33 @@ button and the auto-start sweep.
   for a version that doesn't move). Conclude nothing from a queued command. `resultWaits` is
   stripped from the payload; `unsupported` rides it. Tests: `server.test.js`.
 
+### Epic-run board surface (XERK-638, epic XERK-633)
+
+The operator-facing half of the epic auto-orchestration (the hub half is
+`.claude/rules/turma-epic-run.md`, server-scoped). Reads the run state B publishes on
+`/api/agents.epicRuns` (+ its own SSE event) and drives the `POST /api/jira/<siteKey>/<epicKey>/epic-run`
+route. **Purely ADDITIVE** — the column rule (`categoryOf`/`CATEGORIES`/`REVIEW_STATUS_RE`) is
+UNTOUCHED, so it triggers no column-mirror re-port. The ONE lane-rule change is below.
+
+- **An epic (`isEpicTicket` = `isEpic === true`) is an organizer, never a work session.** The card
+  carries an **EPIC badge** and, IN PLACE of the per-ticket Start (never `ticketStartHtml` for an
+  epic), the **epic-run control**: `▶ Start epic` (`data-epic-start`) when unarmed, else a
+  state-tinted `▷ <state> <done>/<total>` chip. A work ticket with `epicKey` gets a dim `⧉ <epicKey>`
+  chip. The full Start/Re-arm/Cancel + wave progress lives in the detail panel (`epicRunPanelHtml`).
+- **`triageLaneOf` excludes an epic** (an organizer has nothing to triage) — a lane-rule mirror, so
+  it re-vendored `glasses/src/vendor/board.cjs` (byte-identity) and re-ported `Board.kt`.
+- **`epicRunView(run, site, {sessionIndex, ticketQueue})` computes each child's status from the LIVE
+  board — done/running/ready/blocked — mirroring the hub driver's readiness (`epicChildBlockersDone`):
+  done = child in Done column; running = a running/queued session names it or it's ticket-queued;
+  ready = every IN-EPIC blocker (`blockedBy ∩ run.children`) Done; blocked = an in-epic blocker not
+  Done, or in `run.cycle`.** It NEVER re-derives the DAG — the hub owns `waves`/`children`/`cycle`;
+  the panel renders `waves` in order. `epicRunSig` is the repaint trigger for the open panel.
+- **The route is 200-authoritative like the pins**: `{}` arms/re-arms (returns `{ok, run}`),
+  `{clear:true}` cancels (`{ok, run:null}`); `epicOps` overlays only the click's round trip and toasts
+  the hub's own refusal (XERK-264). `epicRuns` rides the payload + is a `LIVE_MAPS`/SSE key.
+- Tests: the `XERK-638` cases in `board.test.js` (isEpicTicket/epicRunOf/epicRunView/lane-exclusion/
+  card+panel) and `BoardTest.kt`; the SSE keep-live for `epicRuns` in `board.test.js`.
+
 ### Refresh button
 
 - `POST /api/jira/refresh` fans `refreshJira` to every **`configured`** host (not `available` — a

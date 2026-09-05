@@ -113,9 +113,202 @@
   // ON the lane, since it maps to no tracker status.
   function triageLaneOf(t, action) {
     if (!t || categoryOf(t) !== "todo") return null;
+    // An epic is an organizer, never a work ticket the auto stream would start
+    // (XERK-635 excludes it from every spawn path), so it has nothing to triage —
+    // keep it out of the Triage lane and in its real column, where the epic-run
+    // control (XERK-638) is the affordance that applies.
+    if (isEpicTicket(t)) return null;
     if (action === "hold") return "triage";
     if (!t.triage || typeof t.triage !== "object") return "triage";
     return null;
+  }
+
+  // --- epic auto-orchestration run (XERK-638, epic XERK-633) ------------------
+  // The hub publishes a run record per armed epic on /api/agents `epicRuns`,
+  // keyed "<siteKey>/<epicKey>" (its own SSE event too): the computed dependency
+  // DAG for "work an epic's children in dependency order, start/close hands-off"
+  // (XERK-635). Shape: {epicKey, siteKey, state, children[], waves[][], cycle?[],
+  // startedAt, updatedAt}, state ∈ {running, blocked, done}. The board reads it to
+  // (a) DISTINGUISH an epic (an organizer) from a work ticket, (b) offer the
+  // Start-epic control in place of the per-ticket Start, and (c) show wave/child
+  // progress. Anything malformed reads as "no run" — degrade, never block.
+
+  // Is this ticket an epic (an organizer), not a work ticket? XERK-634 sets
+  // `isEpic` on the row, and the hub only ever arms a run for `isEpic === true`.
+  function isEpicTicket(t) {
+    return !!(t && t.isEpic === true);
+  }
+
+  // The armed run for an epic off the payload's `epicRuns` map, or null — the
+  // pin-reader pattern: a malformed/absent entry reads as "no run armed", so the
+  // card simply offers Start.
+  function epicRunOf(epicRuns, siteKey, epicKey) {
+    const r = (epicRuns || {})[`${siteKey || ""}/${epicKey || ""}`];
+    if (!r || typeof r !== "object" || !Array.isArray(r.children)) return null;
+    return r;
+  }
+
+  // The run's LIVE progress, computed from the current board — never re-deriving
+  // the DAG (the hub owns `waves`/`children`/`cycle`; only a re-arm rebuilds it).
+  // Each child gets one of four states, matching the hub driver's own readiness
+  // (epicChildBlockersDone / buildEpicWaves ordering):
+  //   done     — the child ticket is in the Done column.
+  //   running  — a live/queued session names it.
+  //   ready    — not started, every IN-EPIC blocker is Done (next to dispatch).
+  //   blocked  — waiting on an in-epic blocker, or stuck in a dependency cycle.
+  // Returns { state, total, done, counts, waves:[[{key,summary,status}]],
+  //   cycleChildren:[…], cycle:bool }. `waves` is the hub's topological layering,
+  //   so rendering them in order shows the wave-by-wave progression the ticket
+  //   asks for; `state` is the hub's run.state, coerced to a known value.
+  function epicRunView(run, site, opts) {
+    const o = opts || {};
+    const siteKey = (site && site.siteKey) || (run && run.siteKey) || "";
+    const byKey = new Map();
+    for (const t of (site && site.tickets) || []) byKey.set(t.key, t);
+    const keys = Array.isArray(run.children) ? run.children : [];
+    const keySet = new Set(keys);
+    const cycleKeys = Array.isArray(run.cycle) ? run.cycle : [];
+    const cycleSet = new Set(cycleKeys);
+    const isDone = (k) => {
+      const t = byKey.get(k);
+      return !!(t && categoryOf(t) === "done");
+    };
+    const isRunning = (k) => {
+      if (o.ticketQueue && queuedTicketOf(o.ticketQueue, siteKey, k)) return true;
+      return ticketSessionsOf(o.sessionIndex, siteKey, k)
+        .some((s) => s && (s.status === "running" || s.status === "queued"));
+    };
+    const statusOf = (k) => {
+      if (isDone(k)) return "done";
+      if (isRunning(k)) return "running";
+      if (cycleSet.has(k)) return "blocked";
+      const t = byKey.get(k);
+      const blockers = (t && Array.isArray(t.blockedBy) ? t.blockedBy : [])
+        .filter((b) => keySet.has(b));
+      return blockers.every(isDone) ? "ready" : "blocked";
+    };
+    const node = (k) => {
+      const t = byKey.get(k);
+      return { key: k, summary: (t && t.summary) || "", status: statusOf(k) };
+    };
+    const counts = { done: 0, running: 0, ready: 0, blocked: 0 };
+    for (const k of keys) { const s = statusOf(k); if (counts[s] != null) counts[s]++; }
+    const wavesSrc = Array.isArray(run.waves) ? run.waves : [];
+    const waves = wavesSrc.map((w) => (Array.isArray(w) ? w : []).map(node));
+    const cycleChildren = cycleKeys.map(node);
+    const state = run.state === "done" || run.state === "blocked" ? run.state : "running";
+    return {
+      state, total: keys.length, done: counts.done, counts,
+      waves, cycleChildren, cycle: cycleKeys.length > 0,
+    };
+  }
+
+  // A short signature of what the epic-run surface renders, so the open panel can
+  // repaint only when the run actually moved (the same trick the pin rows use).
+  function epicRunSig(view) {
+    if (!view) return "";
+    return `${view.state}|${view.done}/${view.total}`
+      + `|${view.counts.running},${view.counts.ready},${view.counts.blocked}`;
+  }
+
+  // The compact epic-run affordance on the CARD, in place of the per-ticket Start
+  // (an epic is an organizer, so it never offers a work-session Start). No run yet
+  // → a Start-epic button; an armed run → a state+progress chip that opens the
+  // detail panel (the card click already does), where Start/Cancel and the full
+  // wave breakdown live.
+  function epicCardControlHtml(t, view) {
+    const key = (t && t.key) || "";
+    if (!view) {
+      const tip = `Start the epic run for ${key} — its children work in dependency `
+        + `order, ready ones in parallel, hands-off`;
+      return `<button class="kc-epic-start" type="button" data-epic-start="${esc(key)}"
+        title="${esc(tip)}" aria-label="Start epic run for ${esc(key)}">▶ Start epic</button>`;
+    }
+    const word = view.state === "done" ? "done"
+      : view.state === "blocked" ? "blocked" : "running";
+    const tip = `Epic run ${word} — ${view.done} of ${view.total} children Done`
+      + (view.counts.running ? `, ${view.counts.running} in progress` : "")
+      + (view.counts.ready ? `, ${view.counts.ready} ready` : "");
+    return `<span class="kc-epic-run kc-epic-${esc(view.state)}"
+      title="${esc(tip)}">▷ ${esc(word)} ${view.done}/${view.total}</span>`;
+  }
+
+  // The four-state progress bar (done/running/ready/blocked), sized by child count.
+  function epicProgressBarHtml(view) {
+    const c = view.counts;
+    const seg = (n, cls) => (n > 0
+      ? `<span class="epic-seg ${cls}" style="flex:${n}"></span>` : "");
+    return `<span class="epic-bar" role="img"
+      aria-label="${c.done} done, ${c.running} in progress, ${c.ready} ready, ${c.blocked} blocked">`
+      + seg(c.done, "epic-done") + seg(c.running, "epic-running")
+      + seg(c.ready, "epic-ready") + seg(c.blocked, "epic-blocked")
+      + (view.total === 0 ? `<span class="epic-seg epic-empty" style="flex:1"></span>` : "")
+      + `</span>`;
+  }
+
+  // The epic-run panel in the ticket detail view (XERK-638): Start / Re-arm /
+  // Cancel plus the wave-by-wave child progress. Rendered only for an epic.
+  // `view` is epicRunView() or null (no run armed); `o.pending`/`o.error` carry
+  // the in-flight arm/cancel state. Pure string work like the rest of the panel.
+  function epicRunPanelHtml(t, view, opts) {
+    const o = opts || {};
+    const key = (t && t.key) || "";
+    const err = o.error ? `<div class="td-note td-err">${esc(o.error)}</div>` : "";
+    if (!view) {
+      const btn = o.pending
+        ? `<span class="epic-btn epic-btn-busy">⏳ starting…</span>`
+        : `<button class="epic-btn" type="button" data-epic-arm="${esc(key)}">▶ Start epic run</button>`;
+      return `<section class="td-section epic-run">
+          <h3>Epic run</h3>
+          <p class="epic-desc">This epic isn't being auto-orchestrated yet. Starting the run works its
+            children in dependency order — ready children start in parallel, each completed wave unlocks
+            the next, and the epic closes itself once every child is Done.</p>
+          ${err}<div class="epic-actions">${btn}</div>
+        </section>`;
+    }
+    const stateLabel = view.state === "done" ? "Done"
+      : view.state === "blocked" ? "Blocked" : "Running";
+    const childLi = (c) => {
+      const st = c.status === "done" ? "Done"
+        : c.status === "running" ? "In progress"
+        : c.status === "ready" ? "Ready" : "Blocked";
+      return `<li class="epic-child epic-${c.status}">
+          <span class="epic-child-dot"></span>
+          <span class="epic-child-key">${esc(c.key)}</span>
+          <span class="epic-child-sum">${esc(c.summary)}</span>
+          <span class="epic-child-st">${st}</span>
+        </li>`;
+    };
+    const waveHtml = view.waves.map((w, i) =>
+      `<li class="epic-wave">
+          <div class="epic-wave-h">Wave ${i + 1}</div>
+          <ul class="epic-wave-list">${w.map(childLi).join("")}</ul>
+        </li>`).join("");
+    const cycleHtml = view.cycleChildren.length
+      ? `<li class="epic-wave epic-wave-cycle">
+            <div class="epic-wave-h">Cyclic — never becomes ready</div>
+            <ul class="epic-wave-list">${view.cycleChildren.map(childLi).join("")}</ul>
+          </li>`
+      : "";
+    const emptyNote = view.total === 0
+      ? `<div class="td-none">This epic has no children on the board yet.</div>` : "";
+    const cycleNote = view.cycle
+      ? `<div class="td-note td-err">Some children form a dependency cycle and can never become
+           ready — untangle the blocks in the tracker, then re-arm.</div>` : "";
+    const actions = o.pending
+      ? `<span class="epic-btn epic-btn-busy">⏳ working…</span>`
+      : `<button class="epic-btn epic-btn-ghost" type="button" data-epic-arm="${esc(key)}"
+             title="Rebuild the run's dependency DAG from the current board">↻ Re-arm</button>
+           <button class="epic-btn epic-btn-cancel" type="button" data-epic-cancel="${esc(key)}"
+             title="Stop orchestrating this epic — running child sessions are left alone">Cancel run</button>`;
+    return `<section class="td-section epic-run">
+        <h3>Epic run <span class="epic-state epic-${esc(view.state)}">${stateLabel}</span></h3>
+        <div class="epic-prog"><span class="epic-prog-num">${view.done} / ${view.total} done</span>
+          ${epicProgressBarHtml(view)}</div>
+        ${cycleNote}${err}${emptyNote}
+        <ul class="epic-children">${waveHtml}${cycleHtml}</ul>
+        <div class="epic-actions">${actions}</div>
+      </section>`;
   }
 
   // The operator's verdict on the card (XERK-486 [F]). It outranks everything
@@ -780,8 +973,25 @@
     // no chip — "no verdict" is the default and not worth a chip.
     const triageChip = triageChipHtml(o.triageAction);
     if (triageChip) bits.push(triageChip);
-    const start = ticketStartHtml(t, o.sessions, o.start, o.queued);
-    if (start) bits.push(start);
+    // Distinguish an epic (an organizer) from work tickets (XERK-638), and mark a
+    // work ticket that belongs to one so its place in an epic reads at a glance.
+    if (isEpicTicket(t)) {
+      bits.push(`<span class="kc-epic-badge" title="This is an epic — an organizer. Start its run to work its children in dependency order.">EPIC</span>`);
+    } else if (t.epicKey) {
+      bits.push(`<span class="kc-epic-child" title="Part of epic ${esc(t.epicKey)}">⧉ ${esc(t.epicKey)}</span>`);
+    }
+    // An epic never offers the ordinary per-ticket Start — it is not a work
+    // session (XERK-635 keeps it off every spawn path). In its place the card
+    // carries the epic-run affordance: Start-epic when unarmed, a live
+    // state+progress chip when armed. Session chips still show if one somehow
+    // names the epic key.
+    if (isEpicTicket(t)) {
+      const chips = (o.sessions || []).map(sessionChipHtml).join("");
+      bits.push(chips + epicCardControlHtml(t, o.epicRun));
+    } else {
+      const start = ticketStartHtml(t, o.sessions, o.start, o.queued);
+      if (start) bits.push(start);
+    }
     // A drag in flight / just landed (XERK-141) shows a "moving…" chip; a failed
     // one shows why on the card (same inline convention as the start-error note).
     if (o.moving) bits.push(`<span class="kc-moving">moving…</span>`);
@@ -1444,6 +1654,7 @@
       </div>
       <h2 class="td-summary">${esc(v("summary") || "")}</h2>
       <dl class="td-fields">${fields}</dl>
+      ${isEpicTicket(t) ? epicRunPanelHtml(t, o.epicRun, { pending: o.epicRunPending, error: o.epicRunError }) : ""}
       ${body}
       <div class="td-foot"><a href="${safeUrl(v("url"))}" target="_blank" rel="noopener">Open in ${srcName} ↗</a></div>`;
   }
@@ -1476,7 +1687,18 @@
         // going, and board.html keeps the lane itself a non-drop-target.
         const triageAction = triageActionOf(o.triageActions, site.siteKey, t.key);
         const lane = mv ? null : triageLaneOf(t, triageAction);
-        cards[lane || boardColumnOf(t, mv)].push({ t, site, color, mv, triageAction });
+        // The epic-run view for an epic card (XERK-638): its armed run off the
+        // payload's epicRuns, resolved to live wave/child progress against this
+        // site's tickets + the fleet's sessions/queue. null for a work ticket, or
+        // an epic with no run armed yet (the card then offers Start-epic).
+        const epicRun = isEpicTicket(t)
+          ? (() => {
+              const run = epicRunOf(o.epicRuns, site.siteKey, t.key);
+              return run ? epicRunView(run, site,
+                { sessionIndex: o.sessionIndex, ticketQueue: o.ticketQueue }) : null;
+            })()
+          : null;
+        cards[lane || boardColumnOf(t, mv)].push({ t, site, color, mv, triageAction, epicRun });
       }
     }
     const cols = CATEGORIES.map(([cat, label]) => {
@@ -1490,6 +1712,7 @@
             moving: !!(c.mv && c.mv.pending && !c.mv.error),
             moveError: c.mv && c.mv.error,
             triageAction: c.triageAction,
+            epicRun: c.epicRun,
           })).join("")
         : `<div class="kc-none">none</div>`;
       // data-cat lets the drag handler read which column a card was dropped on.
@@ -1742,6 +1965,8 @@
     runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
     statusFieldHtml, statusPickerHtml, statusPickerValue,
     triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
+    isEpicTicket, epicRunOf, epicRunView, epicRunSig,
+    epicCardControlHtml, epicProgressBarHtml, epicRunPanelHtml,
     boardColumnOf, moveSweepVerdict,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
     queuedTicketOf, queuedLabel, queuedTip,

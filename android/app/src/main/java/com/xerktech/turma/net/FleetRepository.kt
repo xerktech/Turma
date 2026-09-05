@@ -72,6 +72,10 @@ data class FleetState(
     // policy sheet reads it. Refreshed by the poll and the "triagePolicies"
     // SSE event.
     val triagePolicies: Map<String, com.xerktech.turma.model.TriagePolicy> = emptyMap(),
+    // Armed epic auto-orchestration runs (XERK-635/638), keyed "<siteKey>/<epicKey>";
+    // the board's epic card control + detail panel read it. Refreshed by the poll
+    // and the "epicRuns" SSE event.
+    val epicRuns: Map<String, com.xerktech.turma.model.EpicRun> = emptyMap(),
 )
 
 class FleetRepository(
@@ -129,6 +133,7 @@ class FleetRepository(
             pushEnabled = resp.pushEnabled
             ticketTriageActions = resp.ticketTriageActions
             triagePolicies = resp.triagePolicies
+            epicRuns = resp.epicRuns
             emit(resp.now, error = null)
         } catch (e: Exception) {
             emit(_state.value.now, error = e.message ?: "hub unreachable")
@@ -168,6 +173,9 @@ class FleetRepository(
     @Volatile
     private var triagePolicies: Map<String, com.xerktech.turma.model.TriagePolicy> = emptyMap()
 
+    @Volatile
+    private var epicRuns: Map<String, com.xerktech.turma.model.EpicRun> = emptyMap()
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
@@ -183,6 +191,7 @@ class FleetRepository(
             pushEnabled = pushEnabled,
             ticketTriageActions = ticketTriageActions,
             triagePolicies = triagePolicies,
+            epicRuns = epicRuns,
         )
     }
 
@@ -245,6 +254,11 @@ class FleetRepository(
                     "triagePolicies" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TriagePolicy>>(data)
                     }.getOrNull()?.let { triagePolicies = it; emit(_state.value.now, null) }
+                    // An epic run was armed/advanced/cancelled (XERK-638); the
+                    // event carries the whole (small) map, like the other pins.
+                    "epicRuns" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.EpicRun>>(data)
+                    }.getOrNull()?.let { epicRuns = it; emit(_state.value.now, null) }
                 }
             }
 
