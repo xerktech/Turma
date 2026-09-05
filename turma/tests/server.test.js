@@ -3175,7 +3175,9 @@ test("XERK-455: typed /api/agents fields are coerced at ingest, not served raw",
     // is served raw for an offline host (found by the second QA pass).
     updating: { version: {}, until: "soon" },
     jira: { available: "yes", tickets: [
-      { key: "K", labels: [{}, "keep", 3], repoGuess: { repo: "R", cloned: {}, manual: "no" } },
+      { key: "K", labels: [{}, "keep", 3], repoGuess: { repo: "R", cloned: {}, manual: "no" },
+        // XERK-634: bad epic/link leaves must drop to their client defaults.
+        blocks: [{}, "B-1"], blockedBy: "nope", epicKey: 5, isEpic: "yes" },
       "bad-ticket",
     ], repoOptions: [{ name: "r", cloned: {} }, 5] },
     sessions: [{
@@ -3200,7 +3202,10 @@ test("XERK-455: typed /api/agents fields are coerced at ingest, not served raw",
   // dropped (string + number kept), repoGuess bools dropped, repoOptions.cloned
   // dropped, and a non-bool `available` gone.
   assert.deepEqual(restored.jira.tickets, [
-    { key: "K", labels: ["keep", 3], repoGuess: { repo: "R" } },
+    // blocks: object element dropped (string kept); blockedBy non-array → [];
+    // epicKey non-string and isEpic non-bool dropped to absent (client defaults).
+    { key: "K", labels: ["keep", 3], repoGuess: { repo: "R" },
+      blocks: ["B-1"], blockedBy: [] },
   ]);
   assert.deepEqual(restored.jira.repoOptions, [{ name: "r" }]);
   assert.equal("available" in restored.jira, false);
@@ -3225,7 +3230,8 @@ test("XERK-455: typed /api/agents fields are coerced at ingest, not served raw",
     device: "xerk455-gooddeep",
     updating: { version: "1.2.3", until: 1786400000000 },
     jira: { available: true, tickets: [{ key: "K", labels: ["a", "b"],
-      repoGuess: { repo: "R", cloned: true, manual: false } }],
+      repoGuess: { repo: "R", cloned: true, manual: false },
+      blocks: ["B-1"], blockedBy: ["B-2"], epicKey: "E-1", isEpic: false }],
       repoOptions: [{ name: "r", cloned: true }] },
     sessions: [{ id: "s", prs: [{ url: "u", number: 42, state: "OPEN" }],
       work: { baseRef: "main", aheadOfBase: 3, pushed: true, aheadOfRemote: 0 },

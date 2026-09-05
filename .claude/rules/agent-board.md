@@ -14,6 +14,20 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
   ADO PAT (`AZDO_URL`+`AZDO_TOKEN`, optional `AZDO_PROJECT`/`AZDO_USER`/`AZDO_API_VERSION`) heartbeat
   that user's tickets into the same `jira` block; `source:"jira"|"azure"` flags UI copy differences.
   **Azure emits the SAME wire contract as Jira** (XERK-43).
+- **Epic membership + blocks/blocked-by dependency links (XERK-634, epic XERK-633).** `_shape_issue`
+  fetches `issuelinks` and emits, on EVERY Jira ticket + the on-demand detail: `blocks`/`blockedBy`
+  (keys from the `Blocks` link type — outward = blocks, inward = is-blocked-by, capped
+  `JIRA_LINKS_MAX`, every other link type ignored), `epicKey` (the parent key ONLY when the parent's
+  own `issuetype` is an epic — a subtask's story-parent still rides `parentKey` but leaves `epicKey`
+  null), and `isEpic` (this ticket's OWN type is an Epic — `hierarchyLevel==1` or the "Epic" name).
+  It is an ADDITIVE collection change: assignee-scoped orchestration already returns epic children,
+  so no new query. Wire mirrors that must agree: agent shape → `normalizeJira` whitelist (blocks/
+  blockedBy `coerceStringList`, epicKey non-string→absent, isEpic non-bool→absent) → Android
+  `JiraTicket`/`JiraIssueDetail` typed decode (a malformed field is decode-fatal for the whole atomic
+  `/api/agents` array, so absence = "not collected"). Azure is out of scope — it emits none, and the
+  Android defaults (null/false/[]) read them as absent. Tests: `TestShapeIssue`
+  (`test_epic_membership`/`test_*_links`/`test_malformed_issuelinks_degrade`/`test_links_are_bounded`),
+  the XERK-455 `normalizeRecord` case, Android `AgentDecodeTest`.
 - **An agent serves exactly ONE org** (a host is Jira or Azure, never both).
   `board_source()`/`board_configured()`/`collect_board()`/`fetch_board_issue()`/`board_site_key()`/
   `valid_issue_key()` are the dispatch shims every gate goes through; downstream reads `self.jira`

@@ -23480,6 +23480,11 @@ class TestShapeIssue(unittest.TestCase):
         self.assertEqual(t["labels"], ["infra", "urgent"])
         self.assertEqual(t["dueDate"], "2026-07-20")
         self.assertEqual(t["parentKey"], "PROJ-100")
+        # A plain parent (no issuetype expansion) is not an epic; no links.
+        self.assertIsNone(t["epicKey"])
+        self.assertFalse(t["isEpic"])
+        self.assertEqual(t["blocks"], [])
+        self.assertEqual(t["blockedBy"], [])
 
     def test_category_mapping(self):
         for key, cat in (("new", "todo"), ("indeterminate", "inprogress"),
@@ -23496,7 +23501,11 @@ class TestShapeIssue(unittest.TestCase):
         self.assertIsNone(t["priority"])
         self.assertIsNone(t["dueDate"])
         self.assertIsNone(t["parentKey"])
+        self.assertIsNone(t["epicKey"])
+        self.assertFalse(t["isEpic"])
         self.assertEqual(t["labels"], [])
+        self.assertEqual(t["blocks"], [])
+        self.assertEqual(t["blockedBy"], [])
 
     def test_caps(self):
         issue = self._issue(summary="x" * 500,
@@ -23509,6 +23518,82 @@ class TestShapeIssue(unittest.TestCase):
         t = ha._shape_issue({}, "s")
         self.assertEqual(t["statusCategory"], "todo")
         self.assertEqual(t["summary"], "")
+        self.assertIsNone(t["epicKey"])
+        self.assertFalse(t["isEpic"])
+        self.assertEqual(t["blocks"], [])
+        self.assertEqual(t["blockedBy"], [])
+
+    def test_nondict_parent_or_project_degrade_not_raise(self):
+        # A truthy NON-dict parent/project (a malformed payload) must degrade to
+        # None, honouring the "degrades rather than raising" contract — not raise
+        # AttributeError on the .get() and abort the collection loop.
+        t = ha._shape_issue(self._issue(parent="PROJ-1", project="nope"), "s")
+        self.assertIsNone(t["parentKey"])
+        self.assertIsNone(t["epicKey"])
+        self.assertIsNone(t["project"])
+        self.assertIsNone(t["projectName"])
+
+    def test_epic_membership(self):
+        # This ticket's OWN type is an Epic (hierarchyLevel 1) -> organizer.
+        epic = self._issue(issuetype={"name": "Epic", "hierarchyLevel": 1})
+        self.assertTrue(ha._shape_issue(epic, "s")["isEpic"])
+        # A renamed level that keeps the "Epic" NAME still counts.
+        named = self._issue(issuetype={"name": "epic", "hierarchyLevel": 7})
+        self.assertTrue(ha._shape_issue(named, "s")["isEpic"])
+        # The hierarchyLevel==1 branch stands ALONE (an org that renamed the Epic
+        # issue type but kept its level) — assert it without a "Epic" name so the
+        # name branch can't mask a regression in the level branch.
+        leveled = self._issue(issuetype={"name": "Initiative", "hierarchyLevel": 1})
+        self.assertTrue(ha._shape_issue(leveled, "s")["isEpic"])
+        # A level-0 type with an unrelated name is not an epic.
+        self.assertFalse(ha._shape_issue(
+            self._issue(issuetype={"name": "Task", "hierarchyLevel": 0}), "s")["isEpic"])
+        # A story whose PARENT is an epic exposes it as epicKey; a subtask whose
+        # parent is a story does not (parent carries its own issuetype).
+        child = self._issue(parent={"key": "PROJ-1", "fields": {
+            "issuetype": {"name": "Epic", "hierarchyLevel": 1}}})
+        ct = ha._shape_issue(child, "s")
+        self.assertEqual(ct["epicKey"], "PROJ-1")
+        self.assertFalse(ct["isEpic"])
+        subtask = self._issue(parent={"key": "PROJ-2", "fields": {
+            "issuetype": {"name": "Story", "hierarchyLevel": 0}}})
+        st = ha._shape_issue(subtask, "s")
+        self.assertEqual(st["parentKey"], "PROJ-2")
+        self.assertIsNone(st["epicKey"])
+
+    def test_blocks_and_blocked_by_links(self):
+        issue = self._issue(issuelinks=[
+            {"type": {"name": "Blocks", "outward": "blocks",
+                      "inward": "is blocked by"},
+             "outwardIssue": {"key": "PROJ-200"}},
+            {"type": {"name": "Blocks"},
+             "inwardIssue": {"key": "PROJ-201"}},
+            # A non-Blocks relation is ignored entirely.
+            {"type": {"name": "Relates"},
+             "outwardIssue": {"key": "PROJ-999"}},
+        ])
+        t = ha._shape_issue(issue, "s")
+        self.assertEqual(t["blocks"], ["PROJ-200"])
+        self.assertEqual(t["blockedBy"], ["PROJ-201"])
+
+    def test_malformed_issuelinks_degrade(self):
+        # A non-list, and junk elements, never raise and yield empty lists.
+        self.assertEqual(ha._shape_issue(
+            self._issue(issuelinks="nope"), "s")["blocks"], [])
+        t = ha._shape_issue(self._issue(issuelinks=[
+            None, "x", {}, {"type": "notdict"},
+            {"type": {"name": "Blocks"}},                      # no linked issue
+            {"type": {"name": "Blocks"}, "outwardIssue": {}},  # no key
+        ]), "s")
+        self.assertEqual(t["blocks"], [])
+        self.assertEqual(t["blockedBy"], [])
+
+    def test_links_are_bounded(self):
+        many = [{"type": {"name": "Blocks"},
+                 "outwardIssue": {"key": f"PROJ-{i}"}}
+                for i in range(ha.JIRA_LINKS_MAX + 10)]
+        t = ha._shape_issue(self._issue(issuelinks=many), "s")
+        self.assertEqual(len(t["blocks"]), ha.JIRA_LINKS_MAX)
 
 
 def _jira_page(keys, next_token=None):
@@ -23763,6 +23848,23 @@ class TestShapeIssueDetail(unittest.TestCase):
         self.assertEqual(d["commentTotal"], 2)
         self.assertTrue(d["fetchedAt"])
 
+    def test_detail_carries_epic_and_links(self):
+        # The on-demand detail carries the same dependency/epic fields the
+        # heartbeat ticket does, for the epic panel (XERK-634).
+        d = ha._shape_issue_detail(_issue_detail_payload(fields={
+            "parent": {"key": "ENG-1", "fields": {
+                "summary": "the epic",
+                "issuetype": {"name": "Epic", "hierarchyLevel": 1}}},
+            "issuelinks": [
+                {"type": {"name": "Blocks"}, "outwardIssue": {"key": "ENG-9"}},
+                {"type": {"name": "Blocks"}, "inwardIssue": {"key": "ENG-8"}},
+            ],
+        }), "s")
+        self.assertEqual(d["epicKey"], "ENG-1")
+        self.assertFalse(d["isEpic"])
+        self.assertEqual(d["blocks"], ["ENG-9"])
+        self.assertEqual(d["blockedBy"], ["ENG-8"])
+
     def test_keeps_newest_comments_and_reports_total(self):
         many = [{"id": str(i), "author": {"displayName": "A"},
                  "body": _adf(_para(_txt(f"c{i}")))}
@@ -23897,7 +23999,8 @@ class TestFetchJiraIssue(unittest.TestCase):
              mock.patch.object(ha, "jira_get", fake_get):
             d = ha.fetch_jira_issue("ENG-42")
         self.assertEqual(seen["path"], "/rest/api/3/issue/ENG-42")
-        for f in ("description", "comment", "reporter", "assignee"):
+        for f in ("description", "comment", "reporter", "assignee",
+                  "issuelinks"):
             self.assertIn(f, seen["params"]["fields"])
         # The available status changes come back with the issue (XERK-138), not
         # in a second round trip.

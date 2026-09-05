@@ -10281,6 +10281,7 @@ JIRA_DESC_MAX_CHARS = 8000      # per-issue description text kept
 JIRA_COMMENT_MAX = 20           # newest comments kept
 JIRA_COMMENT_MAX_CHARS = 2000   # per-comment text kept
 JIRA_DETAIL_LABELS_MAX = 20     # labels kept (the card shape caps at 5)
+JIRA_LINKS_MAX = 30             # blocks/blocked-by keys kept per issue (XERK-634)
 
 # Ticket creation (XERK-137). The board's "New ticket" form fetches the create
 # metadata (projects, issue types, existing labels) on demand — the same
@@ -10743,6 +10744,46 @@ def jira_post(path, body):
     return _board_urlopen(req)
 
 
+def _is_epic_type(issuetype):
+    """True when an issuetype dict names an Epic — the organizer level in Jira's
+    hierarchy (hierarchyLevel 1), or an org that keeps the "Epic" name at a
+    renamed level. Downstream (XERK-634) treats an epic as an organizer, never
+    work. Total: a missing/malformed issuetype is simply not an epic."""
+    if not isinstance(issuetype, dict):
+        return False
+    if issuetype.get("hierarchyLevel") == 1:
+        return True
+    return (issuetype.get("name") or "").strip().lower() == "epic"
+
+
+def _shape_issue_links(issuelinks):
+    """The `issuelinks` field -> (blocks, blockedBy): the keys this issue BLOCKS
+    (outward "Blocks") and the keys BLOCKING it (inward "is blocked by") — the
+    only dependency relation the epic orchestration needs (XERK-634). Every other
+    link type is ignored. Total and bounded: a malformed/oversized block degrades
+    to what it could read rather than raising, each list capped at JIRA_LINKS_MAX
+    keys so a ticket with a pathological link count can't bloat the heartbeat."""
+    blocks, blocked_by = [], []
+    if not isinstance(issuelinks, list):
+        return blocks, blocked_by
+    for link in issuelinks:
+        if not isinstance(link, dict):
+            continue
+        ltype = link.get("type")
+        # Match the link TYPE by its canonical name, not the localized
+        # inward/outward phrase. One link object carries EITHER an outwardIssue
+        # (this issue blocks it) OR an inwardIssue (this issue is blocked by it).
+        if not isinstance(ltype, dict) or (ltype.get("name") or "") != "Blocks":
+            continue
+        out = link.get("outwardIssue")
+        if isinstance(out, dict) and out.get("key") and len(blocks) < JIRA_LINKS_MAX:
+            blocks.append(out["key"])
+        inw = link.get("inwardIssue")
+        if isinstance(inw, dict) and inw.get("key") and len(blocked_by) < JIRA_LINKS_MAX:
+            blocked_by.append(inw["key"])
+    return blocks, blocked_by
+
+
 def _shape_issue(issue, site_key):
     """One raw REST-v3 search issue -> the compact wire ticket the board
     renders. Everything optional degrades to None/[] rather than raising."""
@@ -10755,9 +10796,20 @@ def _shape_issue(issue, site_key):
         v = fields.get(field)
         return (v or {}).get("name") if isinstance(v, dict) else None
 
-    project = fields.get("project") or {}
-    parent = fields.get("parent") or {}
+    # isinstance-guarded (not `or {}`): a truthy NON-dict (a string, a list) would
+    # sail past `or {}` and raise on the `.get()` below, contradicting this
+    # function's "degrades rather than raising" contract.
+    project = fields.get("project") if isinstance(fields.get("project"), dict) else {}
+    parent = fields.get("parent") if isinstance(fields.get("parent"), dict) else {}
     labels = fields.get("labels")
+    # Epic membership (XERK-634): the parent's own issuetype (search results carry
+    # it under parent.fields.issuetype) tells an epic parent from a story parent,
+    # so `epicKey` is the parent key ONLY when the parent is an epic — a subtask's
+    # story-parent still rides `parentKey` but is not an epic. `isEpic` flags this
+    # ticket's OWN type so downstream treats the epic as an organizer, never work.
+    parent_fields = parent.get("fields") if isinstance(parent.get("fields"), dict) else {}
+    parent_is_epic = _is_epic_type(parent_fields.get("issuetype"))
+    blocks, blocked_by = _shape_issue_links(fields.get("issuelinks"))
     return {
         "key": key,
         "url": f"https://{site_key}/browse/{key}",
@@ -10773,6 +10825,10 @@ def _shape_issue(issue, site_key):
         "created": fields.get("created"),
         "dueDate": fields.get("duedate"),
         "parentKey": parent.get("key"),
+        "epicKey": parent.get("key") if parent_is_epic else None,
+        "isEpic": _is_epic_type(fields.get("issuetype")),
+        "blocks": blocks,               # keys this ticket blocks (outward "Blocks")
+        "blockedBy": blocked_by,        # keys blocking this ticket (inward)
     }
 
 
@@ -10788,7 +10844,7 @@ def fetch_jira_issues(jql, max_issues):
             "jql": jql,
             "maxResults": min(JIRA_PAGE_SIZE, max_issues - len(tickets)),
             "fields": "summary,status,priority,issuetype,updated,created,"
-                      "duedate,labels,project,parent",
+                      "duedate,labels,project,parent,issuelinks",
         }
         if token:
             params["nextPageToken"] = token
@@ -11076,8 +11132,8 @@ def fetch_jira_issue(key):
     data = jira_get(
         f"/rest/api/3/issue/{urllib.parse.quote(key)}",
         {"fields": "summary,status,priority,issuetype,updated,created,duedate,"
-                   "labels,project,parent,description,reporter,assignee,"
-                   "resolution,comment,attachment",
+                   "labels,project,parent,issuelinks,description,reporter,"
+                   "assignee,resolution,comment,attachment",
          "expand": "transitions"},
     )
     return _shape_issue_detail(data, site_key)
