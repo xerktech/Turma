@@ -129,6 +129,15 @@ static and the only thing that changes is a child's board Done-ness.
   and a non-Done row. This is why XERK-635 excludes epic children from the ORG stream: the run owns
   their whole lifecycle (merge + close), and an UNARMED epic's child stays fully excluded (regression-
   pinned).
+  - **This IS the run-scoped bug-floor bypass XERK-642 names** — the lifting of `AUTO_MERGE_ISSUE_TYPES`
+    for a run's children was already delivered by D (XERK-637); XERK-642 is the ticket that pins it as
+    a deliberate exception to turma-board.md's "never widen past bugs" floor and pins both directions in
+    one place (`XERK-642:` in `server.test.js`). The scope key is HUB-OWNED run membership
+    (`run.children.includes(t.key)`), never the agent-asserted `epicKey` alone — a ticket merely
+    claiming epic membership is NOT enough (a child not in `run.children`, or with no armed run, keeps
+    the bug floor). Do NOT re-implement this inside `autoMergeSession`: the disjoint-function + OR
+    keeps every other XERK-550 gate (readiness, per-repo serialization, retry classification, backoff)
+    shared and unduplicated.
 - **Both sweeps early-return unless `orgsWithAutoMerge().size || anyArmedEpicRun()`** — an armed run
   is the second reason to run them. `anyArmedEpicRun` = any run whose `state !== "done"`.
 - **Chaining is C's, not D's.** The Done edge D produces (auto-close) or a human move is what C's
