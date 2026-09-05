@@ -28,6 +28,12 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Hub-URL field on Login.** The web is same-origin; a phone app must point at any hub, so Login has
   an extra Hub-URL field.
 - **Voice dictation** into the spawn/compose fields — a phone-only addition.
+- **Wide board column area on large screens (XERK-606).** The web board widens ONLY its Kanban
+  column area past the shared reading width (`--wrap-board`, header/toolbar/footer stay centred at
+  `--wrap`) so more of the fixed-300px columns show without horizontal scroll on a desktop monitor.
+  No Android analog: the phone board is already a horizontally scroll-snapping strip of 300dp
+  columns sized to the device, with no separate centred header column to hold in place. Web-only
+  responsive/desktop layout; nothing for the phone to match.
 - **On-screen-keyboard composer docking** — same behaviour, platform-idiomatic mechanism on each
   side. Web (`sessions.html`) pins its app-shell height to `window.visualViewport` so the composer
   docks just above the keyboard on tablets/foldables where `100dvh` over-shrinks. Android drives it
