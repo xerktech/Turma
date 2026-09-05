@@ -571,6 +571,7 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 .kc-epic-run.kc-epic-running { color: var(--accent); border-color: var(--accent); }
 .kc-epic-run.kc-epic-blocked { color: var(--warning); border-color: var(--warning); }
 .kc-epic-run.kc-epic-done { color: var(--good); border-color: var(--good); }
+.kc-epic-run.kc-epic-paused { color: var(--muted); border-color: var(--muted); }
 /* Start-a-session-on-this-ticket, and the sessions it started. Both sit in
    .kc-meta between the repo chip and the org, i.e. before the margin-left:auto
    that pins .kc-org right. */
@@ -787,6 +788,8 @@ body.td-open { overflow: hidden; }
 .epic-state.epic-running { color: var(--accent); border-color: var(--accent); }
 .epic-state.epic-blocked { color: var(--warning); border-color: var(--warning); }
 .epic-state.epic-done { color: var(--good); border-color: var(--good); }
+.epic-state.epic-paused { color: var(--muted); border-color: var(--muted); }
+.epic-paused-note { color: var(--ink-2); }
 .epic-prog { display: flex; align-items: center; gap: 10px; margin: 4px 0 10px; }
 .epic-prog-num { font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); white-space: nowrap; }
 .epic-bar {
@@ -827,6 +830,7 @@ body.td-open { overflow: hidden; }
 .epic-btn:hover { filter: brightness(1.05); }
 .epic-btn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
 .epic-btn.epic-btn-ghost { background: var(--page); color: var(--accent); }
+.epic-btn.epic-btn-pause { background: var(--page); color: var(--warning); border-color: var(--warning); }
 .epic-btn.epic-btn-cancel { background: var(--page); color: var(--critical); border-color: var(--critical); }
 .epic-btn.epic-btn-busy { background: var(--page); color: var(--muted); border-color: var(--border); border-style: dashed; cursor: default; }
 /* New-ticket form (XERK-137). Reuses the detail panel's backdrop/panel chrome;

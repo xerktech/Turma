@@ -51,11 +51,35 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
 ## The manual-start route — `POST /api/jira/<site>/<epicKey>/epic-run`
 
 - **The SOLE trigger for the whole run.** Operator-authed, 200-authoritative like the pin/triage
-  routes. Body `{}` (or omitted) ARMS/re-arms; `{clear:true}`/`{cancel:true}` cancels.
+  routes. Body `{}` (or omitted) ARMS/re-arms; `{clear:true}`/`{cancel:true}` cancels;
+  `{pause:true}`/`{resume:true}` holds/continues an armed run (XERK-641, below).
 - Validation: `400` bad key; `404` no host reports the org; **`404` when the key is not a real epic
-  the fleet lists** (`isEpic !== true`) — a run is never armed for a phantom or a work ticket.
+  the fleet lists** (`isEpic !== true`) — a run is never armed for a phantom or a work ticket;
+  **`404` on pause/resume when no run is armed** (`setEpicRunPaused` returns null) — never a silent arm.
 - `armEpicRun(siteKey, epicKey, rows)` rebuilds the DAG from the current board rows, derives state
   (`blocked` if a cycle; `done` if every child already Done; else `running`), persists, broadcasts.
+
+## Pause / resume — the operator hold (XERK-641)
+
+- **`paused` is a boolean flag on the run record, ORTHOGONAL to `state`** (running/blocked/done are
+  DAG progress; `paused` is operator intent). Set by `setEpicRunPaused(siteKey, epicKey, bool)` off
+  the route; persisted, SSE-broadcast, and coerced by `sanitizeEpicRunRecord` (STRICT `=== true`
+  only) so a hold survives a restart. Omitted when false. Older clients ignore the new key.
+- **A paused run is FULLY INERT to the automation** — the kill-switch a Cancel is too destructive
+  for. It preserves the DAG + children + progress (unlike `clearEpicRun`), so Resume continues from
+  exactly where it held. Three sweeps skip it, and they MUST stay in agreement:
+  - `epicRunDriveSweep` — `continue`s a paused run, dispatching NOTHING and advancing NOTHING.
+  - `epicRunChildSession` — returns null for a paused run's children, so `autoMergeSweep` /
+    `autoCloseSweep` leave already-running child sessions ALONE (not merged, closed, or killed).
+  - `epicRunCompleteSweep` — `continue`s a paused run, so it never writes the epic Done while held.
+  - `anyArmedEpicRun` EXCLUDES paused runs (`state !== "done" && !paused`) — a paused run is not a
+    reason to run the XERK-550 sweeps, and its children are skipped anyway.
+- **A re-arm PRESERVES the hold** (like `startedAt`): arming is "rebuild the plan", not "resume it"
+  — only `{resume:true}` lifts a pause. So a paused-then-re-armed run stays held.
+- This is the "already-running sessions are left alone, just don't start more" contract: pause stops
+  NEW child starts and freezes the run's own merge/close, while in-flight child sessions keep running
+  untouched until Resume. Board UI + Android render a `paused` chip and a Pause/Resume control (Pause
+  on a running/blocked run, Resume on a paused one; a `done` run offers neither).
 
 ## The driver — `epicRunDriveSweep` (XERK-636)
 
@@ -177,6 +201,12 @@ static and the only thing that changes is a child's board Done-ness.
   `pausedSubscriptions`), the double-start guards (existing session, repeated passes, sweep + manual
   click reusing the in-flight cmdId), the acked-no-session backoff (no 15s re-dispatch), the run
   advancing to `done`, and `epicChildBlockersDone`.
+- The `XERK-641:` cases in `server.test.js`: pause halts new dispatch + resume restarts it, a paused
+  run's running child is not auto-merged/closed (then is on resume), pause preserves the DAG + a
+  missing run is null + a re-arm keeps the hold, `sanitizeEpicRunRecord` coerces `paused` strictly,
+  and a paused run never auto-completes its epic. Web: the `XERK-641` cases in `board.test.js`
+  (paused view/sig, the `kc-epic-paused` chip, Resume/Pause button visibility). Android:
+  `epicRunView surfaces the run's paused hold` in `BoardTest.kt`.
 - The `XERK-637:` cases in `server.test.js`: an armed child auto-merges past the opt-in + bug floor,
   auto-closes (Done + kill) past the opt-in, an UNARMED epic child stays excluded, a child added
   after arming (not in `run.children`) stays excluded, chain-advance (auto-close unblocks dependents

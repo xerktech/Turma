@@ -768,6 +768,7 @@ private fun TicketStartControl(
 private fun epicStateColor(state: String): Color = when (state) {
     "done" -> TurmaColors.good
     "blocked" -> TurmaColors.warning
+    "paused" -> MaterialTheme.colorScheme.onSurfaceVariant
     else -> MaterialTheme.colorScheme.primary
 }
 
@@ -796,8 +797,9 @@ private fun EpicCardControl(view: EpicRunView?, onStartEpic: () -> Unit) {
     if (view == null) {
         GhostButton("▶ Start epic", onClick = onStartEpic)
     } else {
-        val word = when (view.state) { "done" -> "done"; "blocked" -> "blocked"; else -> "running" }
-        Pill("▷ $word ${view.done}/${view.total}", color = epicStateColor(view.state), mono = true)
+        val word = when { view.paused -> "paused"; view.state == "done" -> "done"; view.state == "blocked" -> "blocked"; else -> "running" }
+        val stateKey = if (view.paused) "paused" else view.state
+        Pill("▷ $word ${view.done}/${view.total}", color = epicStateColor(stateKey), mono = true)
     }
 }
 
@@ -820,14 +822,21 @@ private fun EpicRunSection(site: BoardSite, t: JiraTicket, view: EpicRunView?, v
             busy = false
         }
     }
+    // Hold (pause) or resume the run without tearing it down (XERK-641).
+    fun hold(pause: Boolean) {
+        if (busy) return
+        busy = true; error = null
+        scope.launch {
+            error = vm.setEpicRunHold(site.siteKey, t.key, pause)
+            busy = false
+        }
+    }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             SectionLabel("Epic run")
             if (view != null) {
-                Pill(
-                    when (view.state) { "done" -> "Done"; "blocked" -> "Blocked"; else -> "Running" },
-                    color = epicStateColor(view.state),
-                )
+                val label = when { view.paused -> "Paused"; view.state == "done" -> "Done"; view.state == "blocked" -> "Blocked"; else -> "Running" }
+                Pill(label, color = epicStateColor(if (view.paused) "paused" else view.state))
             }
         }
         error?.let {
@@ -846,6 +855,13 @@ private fun EpicRunSection(site: BoardSite, t: JiraTicket, view: EpicRunView?, v
             // Progress line + a four-segment bar (done/running/ready/blocked).
             Text("${view.done} / ${view.total} done", style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
             EpicProgressBar(view)
+            if (view.paused) {
+                Text(
+                    "Paused — no new children will start, and running child sessions are left alone. " +
+                        "Resume to continue orchestrating.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             if (view.cycle) {
                 Text(
                     "Some children form a dependency cycle and can never become ready — untangle the " +
@@ -865,8 +881,20 @@ private fun EpicRunSection(site: BoardSite, t: JiraTicket, view: EpicRunView?, v
             if (busy) {
                 Text("⏳ working…", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
+                // paused → Resume · Cancel; running/blocked → Re-arm · Pause · Cancel;
+                // done → Re-arm · Cancel (a finished run offers no Pause/Resume). XERK-641.
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = { act(false) }) { Text("↻ Re-arm") }
+                    if (view.paused) {
+                        Button(onClick = { hold(false) }) { Text("▶ Resume") }
+                    } else {
+                        OutlinedButton(onClick = { act(false) }) { Text("↻ Re-arm") }
+                        if (view.state != "done") {
+                            OutlinedButton(
+                                onClick = { hold(true) },
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = TurmaColors.warning),
+                            ) { Text("⏸ Pause") }
+                        }
+                    }
                     OutlinedButton(
                         onClick = { act(true) },
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),

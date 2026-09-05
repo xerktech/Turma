@@ -2822,6 +2822,58 @@ test("epicRunPanelHtml: an armed run shows waves, progress, Re-arm + Cancel", ()
   assert.match(html, /data-epic-cancel="E-1"/);
 });
 
+test("epicRunView: surfaces the run's paused hold (XERK-641)", () => {
+  const site = epicSite([
+    ticket("C-1", { statusCategory: "todo", status: "To Do" }),
+    ticket("C-2", { statusCategory: "todo", status: "To Do", blockedBy: ["C-1"] }),
+    ticket("C-3", { statusCategory: "todo", status: "To Do", blockedBy: ["C-1"] }),
+  ]);
+  assert.equal(epicRunView(run(), site, { sessionIndex: new Map() }).paused, false);
+  assert.equal(epicRunView(run({ paused: true }), site, { sessionIndex: new Map() }).paused, true);
+  // The signature changes when the hold toggles, so the open panel repaints.
+  const running = epicRunSig(epicRunView(run(), site, { sessionIndex: new Map() }));
+  const held = epicRunSig(epicRunView(run({ paused: true }), site, { sessionIndex: new Map() }));
+  assert.notEqual(running, held);
+});
+
+test("epicCardControlHtml: a paused run reads 'paused' with its own chip class (XERK-641)", () => {
+  const html = epicCardControlHtml(epicTicket("E-1"),
+    { state: "running", paused: true, done: 2, total: 5, counts: { done: 2, running: 1, ready: 1, blocked: 1 } });
+  assert.match(html, /kc-epic-run kc-epic-paused/);
+  assert.match(html, /paused 2\/5/);
+});
+
+test("epicRunPanelHtml: a paused run offers Resume + Cancel, no Re-arm/Pause (XERK-641)", () => {
+  const view = {
+    state: "running", paused: true, total: 3, done: 1,
+    counts: { done: 1, running: 1, ready: 0, blocked: 1 },
+    waves: [[{ key: "C-1", summary: "first", status: "done" }]], cycleChildren: [], cycle: false,
+  };
+  const html = epicRunPanelHtml(epicTicket("E-1"), view, {});
+  assert.match(html, /epic-state epic-paused[^]*Paused/);
+  assert.match(html, /epic-paused-note/, "a paused run explains the hold");
+  assert.match(html, /data-epic-resume="E-1"/);
+  assert.match(html, /data-epic-cancel="E-1"/);
+  assert.doesNotMatch(html, /data-epic-pause/, "a paused run offers Resume, not Pause");
+  assert.doesNotMatch(html, /data-epic-arm/, "no Re-arm while paused");
+});
+
+test("epicRunPanelHtml: a running run offers Re-arm + Pause + Cancel; a done run has no Pause (XERK-641)", () => {
+  const base = {
+    total: 2, done: 1, counts: { done: 1, running: 1, ready: 0, blocked: 0 },
+    waves: [[{ key: "C-1", summary: "a", status: "done" }]], cycleChildren: [], cycle: false,
+  };
+  const running = epicRunPanelHtml(epicTicket("E-1"), { ...base, state: "running", paused: false }, {});
+  assert.match(running, /data-epic-arm="E-1"/);
+  assert.match(running, /data-epic-pause="E-1"/);
+  assert.match(running, /data-epic-cancel="E-1"/);
+  assert.doesNotMatch(running, /data-epic-resume/);
+  // A finished run keeps Re-arm + Cancel but never offers Pause.
+  const done = epicRunPanelHtml(epicTicket("E-1"), { ...base, state: "done", paused: false, done: 2 }, {});
+  assert.match(done, /data-epic-arm="E-1"/);
+  assert.doesNotMatch(done, /data-epic-pause/);
+});
+
 test("epicRunPanelHtml: a cyclic run flags the loop and lists cyclic children", () => {
   const view = {
     state: "blocked", total: 2, done: 0, counts: { done: 0, running: 0, ready: 0, blocked: 2 },

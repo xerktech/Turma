@@ -928,6 +928,16 @@ function startEpicRun(epicKey, siteKey) {
 function cancelEpicRun(epicKey, siteKey) {
   return postEpicRun(epicKey, siteKey, { clear: true }, "cancel");
 }
+// Pause the run (XERK-641): the hub HOLDS it without tearing it down — no new
+// children start and running child sessions are left alone (their PRs aren't
+// auto-merged/closed) until Resume. The DAG + progress are preserved.
+function pauseEpicRun(epicKey, siteKey) {
+  return postEpicRun(epicKey, siteKey, { pause: true }, "pause");
+}
+// Resume a paused run: the hub continues orchestrating from exactly where it held.
+function resumeEpicRun(epicKey, siteKey) {
+  return postEpicRun(epicKey, siteKey, { resume: true }, "resume");
+}
 
 // The operator's own repo answer. Painted optimistically: the pin only becomes
 // real on the agent's next beat (the command rides the heartbeat reply), and the
@@ -1357,9 +1367,13 @@ $board.addEventListener("keydown", (e) => {
 $panel.addEventListener("click", (e) => {
   if (e.target.closest(".td-close")) return closeDetail();
   if (!openTicketState) return;
-  // Epic run controls (XERK-638): Start / Re-arm (both arm) and Cancel.
+  // Epic run controls: Start / Re-arm (both arm), Pause / Resume (XERK-641), Cancel.
   const armBtn = e.target.closest("[data-epic-arm]");
   if (armBtn) { startEpicRun(armBtn.dataset.epicArm, openTicketState.siteKey); return; }
+  const pauseBtn = e.target.closest("[data-epic-pause]");
+  if (pauseBtn) { pauseEpicRun(pauseBtn.dataset.epicPause, openTicketState.siteKey); return; }
+  const resumeBtn = e.target.closest("[data-epic-resume]");
+  if (resumeBtn) { resumeEpicRun(resumeBtn.dataset.epicResume, openTicketState.siteKey); return; }
   const cancelBtn = e.target.closest("[data-epic-cancel]");
   if (cancelBtn) { cancelEpicRun(cancelBtn.dataset.epicCancel, openTicketState.siteKey); return; }
   if (e.target.closest("[data-repo-edit]")) {

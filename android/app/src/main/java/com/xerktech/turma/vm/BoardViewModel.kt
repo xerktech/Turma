@@ -361,6 +361,30 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Pause or resume an armed epic run WITHOUT tearing it down (XERK-641). The run
+     * must already exist. `pause = true` holds it — no new children start and running
+     * child sessions are left alone (their PRs aren't auto-merged/closed); `pause =
+     * false` resumes it. Both preserve the DAG + progress, so this is NOT a re-arm.
+     * Returns the hub's own words on a refusal (XERK-264), null on success.
+     */
+    suspend fun setEpicRunHold(siteKey: String, epicKey: String, pause: Boolean): String? {
+        val body = buildJsonObject { put(if (pause) "pause" else "resume", JsonPrimitive(true)) }
+        return try {
+            val r = container.client.api.setEpicRun(siteKey, epicKey, body)
+            val b = r.body()
+            if (!r.isSuccessful || b?.ok != true) {
+                b?.error?.takeIf { it.isNotBlank() } ?: r.hubError() ?: "HTTP ${r.code()}"
+            } else {
+                _messages.tryEmit(if (pause) "✓ epic run paused" else "✓ epic run resumed")
+                container.fleet.nudge()
+                null
+            }
+        } catch (_: Exception) {
+            "the hub is unreachable"
+        }
+    }
+
+    /**
      * Patch an org's triage policy (XERK-486): the knobs the hub's auto-start
      * sweep applies after the triage gate. All five knobs are sent (full patch,
      * like the web's savePolicy): [minPriority] null = any priority, [rateMax]

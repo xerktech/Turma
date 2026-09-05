@@ -190,7 +190,7 @@ const {
   TERM_SCROLL_BOTTOM_JS,
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStopResumeExempt, autoStartOrgs, setAutoStartOrg,
-  epicRuns, armEpicRun, clearEpicRun, buildEpicWaves, epicChildRows,
+  epicRuns, armEpicRun, clearEpicRun, setEpicRunPaused, buildEpicWaves, epicChildRows,
   isEpicOrEpicChild, sanitizeEpicRunRecord,
   epicRunDriveSweep, epicChildBlockersDone, epicRunAllChildrenDone, epicChildAttempts,
   epicRunChildSession, anyArmedEpicRun, epicRunCompleteSweep, epicDoneWritten,
@@ -12101,6 +12101,117 @@ test("XERK-636: epicChildBlockersDone — in-epic blocker authoritative, externa
   // Self-block ignored; no blockers -> ready.
   assert.equal(epicChildBlockersDone({ key: "B", blockedBy: ["B"] }, run, rows), true);
   assert.equal(epicChildBlockersDone({ key: "B", blockedBy: [] }, run, rows), true);
+});
+
+// ---- pause / resume an armed run (XERK-641, epic XERK-633) ------------------
+// The operator's hands-off HOLD, the kill-switch a Cancel is too destructive for:
+// a paused run starts NO new children AND its already-running children are left
+// alone (not auto-merged/closed/killed), yet its DAG + progress are preserved so
+// Resume continues from exactly where it held. Fully inert to every epic-run sweep.
+
+test("XERK-641: pausing a run halts new child dispatch; resuming restarts it", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  ticketQueue.length = 0;
+  await asBeat("edPz", "e641a.atlassian.net",
+    { autoStart: false, capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 },
+      tickets: driveTickets() });
+  armEpicRun("e641a.atlassian.net", "E-1");
+  // Pause BEFORE the first wave: the ready child C-1 must NOT dispatch, and the run
+  // stays `running` — `paused` is an orthogonal hold, not one of the DAG states.
+  const held = setEpicRunPaused("e641a.atlassian.net", "E-1", true);
+  assert.equal(held.paused, true);
+  assert.equal(held.state, "running");
+  epicDriveRound();
+  assert.deepEqual(spawnedKeys("edPz"), []);          // nothing dispatched while held
+  assert.equal(liveQueueCount(), 0);                  // and nothing queued either
+  // Resume -> C-1 (the only ready child) dispatches on the very next sweep.
+  const resumed = setEpicRunPaused("e641a.atlassian.net", "E-1", false);
+  assert.equal("paused" in resumed, false);
+  epicDriveRound();
+  assert.deepEqual(spawnedKeys("edPz"), ["C-1"]);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-641: a paused run's running child is NOT auto-merged/closed — left alone until resume", async () => {
+  resetEpicD();
+  const url = "https://github.com/ep/p1/pull/1";
+  await asBeat("edPm", "e641b.atlassian.net", { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "inprogress")],
+    sessions: [dChildSession("s-c1", "C-1", "e641b.atlassian.net", "MERGED", url)] });
+  armEpicRun("e641b.atlassian.net", "E-1");
+  setEpicRunPaused("e641b.atlassian.net", "E-1", true);
+  // A paused run is not "actively driving", so the XERK-550 sweeps early-return and
+  // its running child (a MERGED PR that WOULD auto-close) is untouched.
+  assert.equal(anyArmedEpicRun(), false);
+  autoMergeSweep();
+  autoCloseSweep();
+  const whileHeld = dCmds("edPm");
+  assert.equal(whileHeld.filter(([t]) => t === "mergePr").length, 0);
+  assert.equal(whileHeld.filter(([t]) => t === "setTicketStatus").length, 0);
+  assert.equal(whileHeld.filter(([t]) => t === "kill").length, 0);
+  // Resume -> the same MERGED-PR child now auto-closes: Done write + session kill.
+  setEpicRunPaused("e641b.atlassian.net", "E-1", false);
+  assert.equal(anyArmedEpicRun(), true);
+  autoCloseSweep();
+  const afterResume = dCmds("edPm");
+  assert.ok(afterResume.some(([t, k, cat]) => t === "setTicketStatus" && k === "C-1" && cat === "done"),
+    `expected a Done write for C-1 after resume, got ${JSON.stringify(afterResume)}`);
+  assert.ok(afterResume.some(([t, sid]) => t === "kill" && sid === "s-c1"),
+    `expected a kill after resume, got ${JSON.stringify(afterResume)}`);
+});
+
+test("XERK-641: pause preserves the DAG/state; a missing run is null; a re-arm keeps the hold", async () => {
+  resetEpicRuns();
+  await asBeat("edPk", "e641c.atlassian.net", { autoStart: false, tickets: driveTickets() });
+  const armed = armEpicRun("e641c.atlassian.net", "E-1");
+  const waves0 = JSON.stringify(armed.waves), kids0 = JSON.stringify(armed.children);
+  const held = setEpicRunPaused("e641c.atlassian.net", "E-1", true);
+  assert.equal(held.paused, true);
+  assert.equal(JSON.stringify(held.waves), waves0);   // DAG untouched by a pause
+  assert.equal(JSON.stringify(held.children), kids0);
+  assert.equal(held.state, "running");
+  // Idempotent: pausing an already-paused run returns it, no throw, still paused.
+  assert.equal(setEpicRunPaused("e641c.atlassian.net", "E-1", true).paused, true);
+  // A re-arm rebuilds the DAG but PRESERVES the operator hold (only Resume lifts it).
+  assert.equal(armEpicRun("e641c.atlassian.net", "E-1").paused, true);
+  // Resume clears the flag; pausing a run that doesn't exist is null (never a silent arm).
+  assert.equal("paused" in setEpicRunPaused("e641c.atlassian.net", "E-1", false), false);
+  assert.equal(setEpicRunPaused("e641c.atlassian.net", "NO-SUCH", true), null);
+  resetEpicRuns();
+});
+
+test("XERK-641: sanitizeEpicRunRecord coerces `paused`, and only for a strict true", () => {
+  const base = { epicKey: "E-1", siteKey: "s.atlassian.net", state: "running",
+    children: ["C-1"], waves: [["C-1"]], startedAt: 1, updatedAt: 2 };
+  assert.equal(sanitizeEpicRunRecord({ ...base, paused: true }).paused, true);
+  // A non-strict-true value is DROPPED, never coerced to a truthy hold.
+  assert.equal("paused" in sanitizeEpicRunRecord({ ...base, paused: "yes" }), false);
+  assert.equal("paused" in sanitizeEpicRunRecord({ ...base }), false);
+});
+
+test("XERK-641: a paused run never auto-completes its epic (epicRunCompleteSweep skips it)", async () => {
+  resetEpicD();
+  // Arm while the child is NOT done so the run is `running`, pause it, THEN mark the
+  // child Done: completion must not fire while held, then must fire on resume.
+  await asBeat("edPc", "e641d.atlassian.net", { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "inprogress")] });
+  armEpicRun("e641d.atlassian.net", "E-1");
+  setEpicRunPaused("e641d.atlassian.net", "E-1", true);
+  await asBeat("edPc", "e641d.atlassian.net", { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "done")] });
+  epicRunCompleteSweep();
+  const whileHeld = dCmds("edPc");
+  assert.equal(whileHeld.filter(([t, k]) => t === "setTicketStatus" && k === "E-1").length, 0);
+  assert.notEqual(epicRuns["e641d.atlassian.net/E-1"].state, "done");
+  // Resume -> the epic is written Done and the run goes terminal.
+  setEpicRunPaused("e641d.atlassian.net", "E-1", false);
+  epicRunCompleteSweep();
+  const afterResume = dCmds("edPc");
+  assert.ok(afterResume.some(([t, k, cat]) => t === "setTicketStatus" && k === "E-1" && cat === "done"),
+    `expected an epic Done write after resume, got ${JSON.stringify(afterResume)}`);
+  assert.equal(epicRuns["e641d.atlassian.net/E-1"].state, "done");
 });
 
 test("XERK-550: an ignore-tier repo is never eligible, even opted in", () => {
