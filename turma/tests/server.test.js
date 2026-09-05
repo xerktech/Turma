@@ -11684,6 +11684,31 @@ test("XERK-637: chain-advance — auto-closing a wave-1 child unblocks dependent
   assert.equal(c1Done, true);
 });
 
+test("XERK-637: a child ADDED to the epic after arming (not in run.children) is excluded from both sweeps", async () => {
+  // The run drives only the children it was ARMED against — its persisted DAG. A
+  // child added to the epic AFTER arming (no re-arm) is NOT in run.children and
+  // must be left alone, or the run acts on work outside its own dependency graph.
+  // This pins the `run.children.includes(t.key)` guard in epicRunChildSession,
+  // which the merge/close command assertions below fail without.
+  resetEpicD();
+  const url = "https://github.com/ep/late/pull/1";
+  await asBeat("edLate", "ed9.atlassian.net", { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "todo")] });
+  armEpicRun("ed9.atlassian.net", "E-1");
+  assert.deepEqual(epicRuns["ed9.atlassian.net/E-1"].children, ["C-1"]);
+  // C-2 joins the epic after arming and even lands a merged PR — but the run was
+  // never armed against it, so it must NOT auto-merge or auto-close.
+  await asBeat("edLate", "ed9.atlassian.net", { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "todo"), dChild("C-2", [], "inprogress")],
+    sessions: [dChildSession("s-c2", "C-2", "ed9.atlassian.net", "MERGED", url)] });
+  autoMergeSweep();
+  autoCloseSweep();
+  const kinds = (agents.edLate.commands || []).map((c) => c.type);
+  assert.equal(kinds.filter((t) => t === "mergePr").length, 0);
+  assert.equal(kinds.filter((t) => t === "setTicketStatus").length, 0);
+  assert.equal(kinds.filter((t) => t === "kill").length, 0);
+});
+
 test("XERK-637: the epic is written to Done exactly once when every child is Done, run terminal", async () => {
   resetEpicD();
   await asBeat("edE", "ed5.atlassian.net", { autoStart: false,
