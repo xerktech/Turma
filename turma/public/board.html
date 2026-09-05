@@ -145,6 +145,9 @@ function render(data) {
       // Per-ticket triage verdicts (XERK-486 [F]): the card chip and the Triage
       // lane read them off this map, patched by the SSE event below.
       triageActions: data.ticketTriageActions,
+      // Armed epic runs (XERK-638): the epic card's Start/progress control reads
+      // its run off this map (its own SSE event keeps it live).
+      epicRuns: data.epicRuns,
     });
   });
 }
@@ -552,6 +555,19 @@ function paintDetail() {
   s.modelPinShown = modelPin ? modelPin.model : "";
   s.runtimePinShown = runtimePin ? runtimePin.runtime : "";
   s.triageActionShown = triageAction || "";
+  // The epic-run panel (XERK-638), only for an epic. Its run comes off the
+  // payload's epicRuns, resolved to live child progress against this site's
+  // tickets + the fleet's sessions/queue; epicOps carries the in-flight
+  // arm/cancel state for this epic (keyed like `starts`).
+  let epicRun = null;
+  if (B.isEpicTicket(s.ticket) && site) {
+    const run = B.epicRunOf(cache && cache.epicRuns, s.siteKey, s.key);
+    epicRun = run ? B.epicRunView(run, site,
+      { sessionIndex: B.ticketSessionIndex((cache && cache.agents) || []),
+        ticketQueue: queueView(cache && cache.ticketQueue) }) : null;
+  }
+  const epicOp = epicOps.get(startKey(s.siteKey, s.key)) || null;
+  s.epicRunShown = B.epicRunSig(epicRun);
   $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
     color: B.orgColor(s.siteKey, lastAllKeys, TurmaOrg.orgColors()),
     siteKey: s.siteKey,
@@ -597,6 +613,9 @@ function paintDetail() {
     statusPending: s.statusPending,
     canChangeStatus: !!(site && site.online && s.detail &&
       Array.isArray(s.detail.statusOptions) && s.detail.statusOptions.length),
+    epicRun,
+    epicRunPending: !!(epicOp && epicOp.pending),
+    epicRunError: epicOp && epicOp.error,
   });
   if (s.editing) {
     const sel = $panel.querySelector("[data-repo-select]");
@@ -668,11 +687,24 @@ function refreshOpenTicket() {
   const mpin = B.modelPinOf(cache && cache.ticketModels, s.siteKey, s.key);
   const rpin = B.runtimePinOf(cache && cache.ticketRuntimes, s.siteKey, s.key);
   const tpin = B.triageActionOf(cache && cache.ticketTriageActions, s.siteKey, s.key) || "";
+  // The epic-run signature (XERK-638) isn't a ticket field either — it's derived
+  // from cache.epicRuns + the children's live state — so the open panel repaints
+  // when the run advances (a child finishes, the hub re-broadcasts) the same way
+  // it does for a moved pin. Uses the rebuilt `fresh` site (site.tickets carry the
+  // children), so it tracks a child that just went Done in this very beat.
+  let epicSig = "";
+  if (B.isEpicTicket(fresh) && site) {
+    const run = B.epicRunOf(cache && cache.epicRuns, s.siteKey, s.key);
+    epicSig = run ? B.epicRunSig(B.epicRunView(run, site,
+      { sessionIndex: B.ticketSessionIndex((cache && cache.agents) || []),
+        ticketQueue: queueView(cache && cache.ticketQueue) })) : "";
+  }
   const changed = shown(fresh.repoGuess) !== shown(s.ticket.repoGuess) ||
     (pin ? pin.host : "") !== (s.agentPinShown || "") ||
     (mpin ? mpin.model : "") !== (s.modelPinShown || "") ||
     (rpin ? rpin.runtime : "") !== (s.runtimePinShown || "") ||
-    tpin !== (s.triageActionShown || "");
+    tpin !== (s.triageActionShown || "") ||
+    epicSig !== (s.epicRunShown || "");
   s.ticket = fresh;
   // No picker may be swapped out from under an operator mid-edit.
   if (changed && !s.editing && !s.agentEditing && !s.modelEditing &&
@@ -801,17 +833,21 @@ async function saveTriage(value) {
   const k = `${s.siteKey}/${s.key}`;
   s.triageEditing = false;
   s.triageError = "";
-  let ok = false, err = "";
+  // `status`/`respBody` are hoisted to function scope: the refusal toast below
+  // sits OUTSIDE the try, where a `const r`/`let d` block-scoped to it would be a
+  // ReferenceError (so the refusal handling threw instead of toasting).
+  let ok = false, err = "", status = 0, respBody = null;
   try {
     const r = await fetch(
       `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/triage`,
       { method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify(body) });
     if (r.status === 401) { location.href = "/login"; return; }
-    ok = r.ok;
+    ok = r.ok; status = r.status;
     if (!ok) {
       let d = {};
       try { d = await r.json(); } catch { /* non-JSON error body */ }
+      respBody = d;
       err = d.error || `HTTP ${r.status}`;
     }
   } catch { err = "the hub is unreachable"; }
@@ -823,10 +859,74 @@ async function saveTriage(value) {
   } else if (openTicketState === s) {
     s.triageError = err;
     // XERK-264: a refusal reaches the operator in the hub's own words, on every
-    // page that can see it, not just on the row it failed on.
-    TurmaNav.toast(TurmaNav.refusalText(`Triage ${body.clear ? "release" : "set"} for ${s.key}`, r.status, err));
+    // page that can see it, not just on the row it failed on. refusalText reads
+    // `.error` off the RESPONSE BODY object, so pass `respBody`, not the string.
+    TurmaNav.toast(TurmaNav.refusalText(`Triage ${body.clear ? "release" : "set"} for ${s.key}`, status, respBody));
   }
   if (openTicketState === s) paintDetail();
+}
+
+// --- epic auto-orchestration run (XERK-638) --------------------------------
+// Arming an epic run is the operator's one deliberate "orchestrate this epic
+// hands-off" gesture: the hub builds the dependency DAG, starts ready children
+// in parallel, unlocks each wave as its blockers finish, and closes the epic
+// itself once every child is Done (XERK-635/636/637). This is the board's POST
+// into that machinery — the SOLE trigger for the whole run.
+//
+// Hub-owned durable state like the pins: the POST is authoritative the moment it
+// returns (200 with the run record), and the `epicRuns` SSE event keeps every
+// other open board in step. `epicOps` overlays only the round trip of a click,
+// keyed like `starts` — a busy marker while the POST is in flight, a reason
+// inline (and a toast, XERK-264) if the hub refuses.
+const epicOps = new Map();   // "<siteKey>\x00<epicKey>" -> {pending, at} | {error}
+
+async function postEpicRun(epicKey, siteKey, body, verb) {
+  const k = startKey(siteKey, epicKey);
+  if (epicOps.get(k)?.pending) return;         // ignore a double-press mid-flight
+  epicOps.set(k, { pending: true, at: Date.now() });
+  if (cache) render(cache);
+  let r, d = {};
+  try {
+    r = await fetch(
+      `/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(epicKey)}/epic-run`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body), keepalive: true });
+  } catch {
+    epicOps.set(k, { error: "the hub is unreachable" });
+    if (cache) render(cache);
+    return;
+  }
+  if (r.status === 401) return void (location.href = "/login");
+  try { d = await r.json(); } catch { /* non-JSON error body */ }
+  if (!r.ok) {
+    const err = d.error || `HTTP ${r.status}`;
+    epicOps.set(k, { error: err });
+    // refusalText reads `.error` off the RESPONSE BODY object (not a pre-extracted
+    // string), so the toast carries the hub's own words (XERK-264), not a bare
+    // HTTP status; the inline panel error keeps the extracted string.
+    TurmaNav.toast(TurmaNav.refusalText(`${verb} the epic run for ${epicKey}`, r.status, d));
+    if (cache) render(cache);
+    return;
+  }
+  // 200: the hub's word is authoritative. Land its run record (or clear it on a
+  // cancel) so the card + panel flip at once; the SSE event confirms it for the
+  // rest of the fleet.
+  epicOps.delete(k);
+  if (!cache) cache = { now: Date.now(), agents: [] };
+  const er = cache.epicRuns || (cache.epicRuns = {});
+  const mk = `${siteKey}/${epicKey}`;
+  if (d.run) er[mk] = d.run; else delete er[mk];
+  if (cache) render(cache);
+}
+
+// Arm (or re-arm) the run: rebuilds the DAG from the current board.
+function startEpicRun(epicKey, siteKey) {
+  return postEpicRun(epicKey, siteKey, {}, "start");
+}
+// Cancel the run: the hub stops orchestrating; running child sessions are left
+// alone (a Done move or a human still ends them).
+function cancelEpicRun(epicKey, siteKey) {
+  return postEpicRun(epicKey, siteKey, { clear: true }, "cancel");
 }
 
 // The operator's own repo answer. Painted optimistically: the pin only becomes
@@ -1140,7 +1240,7 @@ async function savePolicy() {
   const prevPolicies = cache && cache.triagePolicies;
   policyBusy = true;
   paintPolicyPanel();
-  let ok = false, err = "", status = 0, policy = null;
+  let ok = false, err = "", status = 0, policy = null, respBody = null;
   try {
     const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/triage-policy`,
       { method: "POST", headers: { "content-type": "application/json" },
@@ -1149,6 +1249,7 @@ async function savePolicy() {
     if (r.status === 401) { location.href = "/login"; return; }
     let d = {};
     try { d = await r.json(); } catch { /* non-JSON error body */ }
+    respBody = d;
     ok = r.ok;
     if (!ok) err = d.error || `HTTP ${r.status}`;
     else policy = d.policy;
@@ -1166,7 +1267,9 @@ async function savePolicy() {
   if (cache && prevPolicies) cache.triagePolicies = prevPolicies;
   policyErr = err;
   paintPolicyPanel();
-  TurmaNav.toast(TurmaNav.refusalText(`Triage policy for ${siteKey}`, status, err));
+  // refusalText reads `.error` off the RESPONSE BODY object (XERK-264), so pass
+  // `respBody`, not the extracted string, or the toast drops to a bare HTTP status.
+  TurmaNav.toast(TurmaNav.refusalText(`Triage policy for ${siteKey}`, status, respBody));
 }
 
 $policyBtn.addEventListener("click", openPolicyPanel);
@@ -1186,7 +1289,7 @@ $policyBackdrop.addEventListener("click", (e) => { if (e.target === $policyBackd
 // re-bound constantly (and leak). The card's own interactive children are left
 // alone — kc-key is the deliberate way out to Jira, kc-sess into the session —
 // and kc-start does its own thing below instead of opening the panel.
-const CARD_OWN = ".kc-key, .kc-sess, .kc-start, .kc-unqueue";
+const CARD_OWN = ".kc-key, .kc-sess, .kc-start, .kc-unqueue, .kc-epic-start";
 
 // The start button acts on POINTERDOWN, not click, and this is load-bearing:
 // the board innerHTML-replaces on every heartbeat beat, so a press that
@@ -1214,9 +1317,19 @@ function unqueueFrom(el) {
   if (card) cancelQueued(btn.dataset.unqueue, card.dataset.site);
   return true;
 }
+// The epic card's "▶ Start epic" (XERK-638). Same pointerdown treatment as the
+// start button — the board repaints every beat, so a press straddling one loses
+// its button between down and up.
+function epicStartFrom(el) {
+  const btn = el.closest(".kc-epic-start[data-epic-start]");
+  if (!btn || btn.disabled) return false;
+  const card = btn.closest(".kanban-card");
+  if (card) startEpicRun(btn.dataset.epicStart, card.dataset.site);
+  return true;
+}
 $board.addEventListener("pointerdown", (e) => {
   if (e.button != null && e.button !== 0) return;   // primary button only
-  if (startFrom(e.target) || unqueueFrom(e.target)) e.preventDefault();
+  if (startFrom(e.target) || unqueueFrom(e.target) || epicStartFrom(e.target)) e.preventDefault();
 });
 $board.addEventListener("click", (e) => {
   // A just-finished drag synthesizes a click on the captured card; swallow it so
@@ -1226,6 +1339,7 @@ $board.addEventListener("click", (e) => {
   // pending guard in startSession makes a double-fire a no-op.
   if (e.target.closest(".kc-start[data-start]")) { startFrom(e.target); return; }
   if (e.target.closest(".kc-unqueue[data-unqueue]")) { unqueueFrom(e.target); return; }
+  if (e.target.closest(".kc-epic-start[data-epic-start]")) { epicStartFrom(e.target); return; }
   if (e.target.closest(CARD_OWN)) return;
   const card = e.target.closest(".kanban-card");
   if (card) openDetail(card.dataset.key, card.dataset.site, card);
@@ -1243,6 +1357,11 @@ $board.addEventListener("keydown", (e) => {
 $panel.addEventListener("click", (e) => {
   if (e.target.closest(".td-close")) return closeDetail();
   if (!openTicketState) return;
+  // Epic run controls (XERK-638): Start / Re-arm (both arm) and Cancel.
+  const armBtn = e.target.closest("[data-epic-arm]");
+  if (armBtn) { startEpicRun(armBtn.dataset.epicArm, openTicketState.siteKey); return; }
+  const cancelBtn = e.target.closest("[data-epic-cancel]");
+  if (cancelBtn) { cancelEpicRun(cancelBtn.dataset.epicCancel, openTicketState.siteKey); return; }
   if (e.target.closest("[data-repo-edit]")) {
     openTicketState.editing = true;
     openTicketState.repoError = "";   // a new attempt clears the old complaint
@@ -1469,7 +1588,7 @@ const LIVE_MAPS = [
   ["ticketAgents", "@ticketAgents"], ["ticketModels", "@ticketModels"],
   ["ticketRuntimes", "@ticketRuntimes"], ["ticketQueue", "@ticketQueue"],
   ["orgColors", "@orgColors"], ["ticketTriageActions", "@ticketTriageActions"],
-  ["triagePolicies", "@triagePolicies"],
+  ["triagePolicies", "@triagePolicies"], ["epicRuns", "@epicRuns"],
 ];
 function mergeSnapshot(body, since) {
   if (!body || !Array.isArray(body.agents)) { cache = body; return; }
@@ -1625,6 +1744,17 @@ function connectSSE() {
     // A policy changed from another tab: re-paint the open panel in place so
     // it shows the hub's new truth (same posture as the org color pins).
     if (!$policyBackdrop.hidden) paintPolicyPanel();
+  });
+  // An epic run was armed/advanced/cancelled (XERK-638) — same tiny-whole-map
+  // pattern. The hub drives the run and re-broadcasts as children complete, so
+  // this keeps the card's progress chip and the open panel live across boards.
+  es.addEventListener("epicRuns", (e) => {
+    let er;
+    try { er = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.epicRuns = er;
+    stampPatch("@epicRuns");   // in-flight snapshot can't clobber this (XERK-546)
+    scheduleRender();
   });
   // An org's auto-start opt-in changed (XERK-41) — same tiny-whole-map pattern
   // as ticketAgents; keeps every open page's switches in step. The switches live

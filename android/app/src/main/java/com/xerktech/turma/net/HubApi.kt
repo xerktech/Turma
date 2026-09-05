@@ -300,6 +300,19 @@ interface HubApi {
         @Body body: kotlinx.serialization.json.JsonObject,
     ): retrofit2.Response<OkResponse>
 
+    // Arm / re-arm or cancel an epic's auto-orchestration run (XERK-635/638) —
+    // the SOLE trigger for the whole run. Hub-owned durable state, so an
+    // authoritative 200 {ok, run}. Body: {} to arm/re-arm (rebuilds the DAG from
+    // the current board), {clear:true} to cancel. The fleet payload's `epicRuns`
+    // reflects it on the next poll/SSE, so the client nudges rather than reading
+    // the returned record.
+    @POST("api/jira/{siteKey}/{epicKey}/epic-run")
+    suspend fun setEpicRun(
+        @Path("siteKey") siteKey: String,
+        @Path("epicKey") epicKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): retrofit2.Response<OkResponse>
+
     // Patch an org's triage policy (XERK-486): the knobs the hub's auto-start
     // sweep applies after the triage gate. Body is a partial patch — only the
     // changed keys, a null value clears a knob. 200 {ok, policy} with the

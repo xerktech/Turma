@@ -19,6 +19,8 @@ const {
   runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
   statusFieldHtml, statusPickerHtml, statusPickerValue,
   triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
+  isEpicTicket, epicRunOf, epicRunView, epicRunSig,
+  epicCardControlHtml, epicRunPanelHtml,
   boardColumnOf, moveSweepVerdict,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
   queuedTicketOf, queuedTip,
@@ -2573,6 +2575,7 @@ const BOARD_LIVE_MAPS = [
   ["orgColors", "orgColors"],
   ["ticketTriageActions", "triageActions"],   // event name differs from the cache key
   ["triagePolicies", "triagePolicies"],
+  ["epicRuns", "epicRuns"],
 ];
 
 for (const [key, event] of BOARD_LIVE_MAPS) {
@@ -2643,4 +2646,220 @@ test("board.html: refresh() merges rather than wholesale-replacing the snapshot 
   // old `cache = await r.json()` in backticked prose (no trailing semicolon).
   assert.doesNotMatch(BOARD_SCRIPT, /\bcache = await r\.json\(\);/,
     "the wholesale `cache = await r.json();` must be gone");
+});
+
+// --- epic auto-orchestration (XERK-638, epic XERK-633) ----------------------
+
+function epicTicket(key, over = {}) {
+  return ticket(key, { isEpic: true, type: "Epic", statusCategory: "todo", status: "To Do", ...over });
+}
+// A run record as the hub publishes it on /api/agents.epicRuns.
+function run(over = {}) {
+  return {
+    epicKey: "E-1", siteKey: "myorg.atlassian.net", state: "running",
+    children: ["C-1", "C-2", "C-3"], waves: [["C-1"], ["C-2", "C-3"]],
+    startedAt: 1, updatedAt: 2, ...over,
+  };
+}
+// A site with the epic + its children, as mergeSites would build.
+function epicSite(children) {
+  return { siteKey: "myorg.atlassian.net", online: true,
+    tickets: [epicTicket("E-1", { epicKey: null }), ...children] };
+}
+
+test("isEpicTicket: true only for isEpic === true", () => {
+  assert.equal(isEpicTicket(epicTicket("E-1")), true);
+  assert.equal(isEpicTicket(ticket("W-1")), false);
+  assert.equal(isEpicTicket(ticket("W-1", { isEpic: "yes" })), false);   // not a bool true
+  assert.equal(isEpicTicket(null), false);
+});
+
+test("epicRunOf: resolves by '<siteKey>/<epicKey>', null for malformed/absent", () => {
+  const map = { "myorg.atlassian.net/E-1": run(), "myorg.atlassian.net/E-2": { junk: true } };
+  assert.equal(epicRunOf(map, "myorg.atlassian.net", "E-1").epicKey, "E-1");
+  assert.equal(epicRunOf(map, "myorg.atlassian.net", "E-2"), null, "no children[] -> not a run");
+  assert.equal(epicRunOf(map, "myorg.atlassian.net", "E-9"), null);
+  assert.equal(epicRunOf(null, "s", "E-1"), null);
+});
+
+test("triageLaneOf: an epic is never parked in the Triage lane (XERK-638)", () => {
+  // An untriaged To Do work ticket lands in the lane; an untriaged To Do EPIC
+  // does not — it is an organizer, driven by its run, not the auto stream.
+  assert.equal(triageLaneOf(ticket("W-1", { statusCategory: "todo" }), null), "triage");
+  assert.equal(triageLaneOf(epicTicket("E-1"), null), null,
+    "an epic stays in its real column, where the epic-run control applies");
+  // A held verdict on an epic still doesn't drag it into the lane.
+  assert.equal(triageLaneOf(epicTicket("E-1"), "hold"), null);
+});
+
+test("epicRunView: derives per-child status from the live board (done/running/ready/blocked)", () => {
+  // C-1 is Done; C-2 has a running session; C-3 is not started and its only
+  // in-epic blocker (C-2) is not Done -> blocked. Waves come from the hub.
+  const site = epicSite([
+    ticket("C-1", { statusCategory: "done", status: "Done" }),
+    ticket("C-2", { statusCategory: "todo", status: "To Do" }),
+    ticket("C-3", { statusCategory: "todo", status: "To Do", blockedBy: ["C-2"] }),
+  ]);
+  const idx = new Map([["myorg.atlassian.net\x00C-2", [{ status: "running" }]]]);
+  const view = epicRunView(run(), site, { sessionIndex: idx });
+  assert.equal(view.state, "running");
+  assert.equal(view.total, 3);
+  assert.equal(view.done, 1);
+  const status = {};
+  for (const w of view.waves) for (const c of w) status[c.key] = c.status;
+  assert.equal(status["C-1"], "done");
+  assert.equal(status["C-2"], "running");
+  assert.equal(status["C-3"], "blocked", "an unstarted child whose in-epic blocker isn't Done is blocked");
+  assert.deepEqual(view.counts, { done: 1, running: 1, ready: 0, blocked: 1 });
+  // Wave order is preserved from the hub's topological layering.
+  assert.deepEqual(view.waves.map((w) => w.map((c) => c.key)), [["C-1"], ["C-2", "C-3"]]);
+});
+
+test("epicRunView: a child with all in-epic blockers Done reads ready (not blocked)", () => {
+  const site = epicSite([
+    ticket("C-1", { statusCategory: "done" }),
+    ticket("C-2", { statusCategory: "todo", blockedBy: ["C-1"] }),
+    ticket("C-3", { statusCategory: "todo", blockedBy: ["C-1"] }),
+  ]);
+  const view = epicRunView(run(), site, { sessionIndex: new Map() });
+  const status = {};
+  for (const w of view.waves) for (const c of w) status[c.key] = c.status;
+  assert.equal(status["C-2"], "ready");
+  assert.equal(status["C-3"], "ready");
+  assert.deepEqual(view.counts, { done: 1, running: 0, ready: 2, blocked: 0 });
+});
+
+test("epicRunView: a queued child counts as running; a cycle child is blocked", () => {
+  const site = epicSite([
+    ticket("C-1", { statusCategory: "todo" }),
+    ticket("C-2", { statusCategory: "todo" }),
+    ticket("C-3", { statusCategory: "todo" }),
+  ]);
+  const q = [{ siteKey: "myorg.atlassian.net", issueKey: "C-1" }];
+  const view = epicRunView(run({ state: "blocked", cycle: ["C-2", "C-3"] }), site,
+    { sessionIndex: new Map(), ticketQueue: q });
+  const flat = {};
+  for (const w of view.waves) for (const c of w) flat[c.key] = c.status;
+  for (const c of view.cycleChildren) flat[c.key] = c.status;
+  assert.equal(flat["C-1"], "running", "a ticket-queue entry reads as running");
+  assert.equal(view.cycle, true);
+  assert.equal(view.cycleChildren.length, 2);
+  assert.ok(view.cycleChildren.every((c) => c.status === "blocked"));
+});
+
+test("epicRunSig: changes when the run advances, so the open panel repaints", () => {
+  const site = epicSite([
+    ticket("C-1", { statusCategory: "todo" }),
+    ticket("C-2", { statusCategory: "todo" }),
+    ticket("C-3", { statusCategory: "todo" }),
+  ]);
+  const before = epicRunSig(epicRunView(run(), site, { sessionIndex: new Map() }));
+  const site2 = epicSite([
+    ticket("C-1", { statusCategory: "done" }),           // one child finished
+    ticket("C-2", { statusCategory: "todo" }),
+    ticket("C-3", { statusCategory: "todo" }),
+  ]);
+  const after = epicRunSig(epicRunView(run(), site2, { sessionIndex: new Map() }));
+  assert.notEqual(before, after);
+  assert.equal(epicRunSig(null), "");
+});
+
+test("epicCardControlHtml: Start-epic when unarmed, a state+progress chip when armed", () => {
+  const unarmed = epicCardControlHtml(epicTicket("E-1"), null);
+  assert.match(unarmed, /data-epic-start="E-1"/);
+  assert.match(unarmed, /Start epic/);
+  const armed = epicCardControlHtml(epicTicket("E-1"),
+    { state: "running", done: 2, total: 5, counts: { done: 2, running: 1, ready: 1, blocked: 1 } });
+  assert.match(armed, /kc-epic-run kc-epic-running/);
+  assert.match(armed, /2\/5/);
+  assert.doesNotMatch(armed, /data-epic-start/, "an armed epic shows progress, not the Start button");
+});
+
+test("cardHtml: an epic gets the EPIC badge, the epic-run control, and NO per-ticket Start", () => {
+  const site = { siteKey: "myorg.atlassian.net" };
+  const html = cardHtml(epicTicket("E-1"), site, { now: Date.now(), epicRun: null });
+  assert.match(html, /kc-epic-badge/);
+  assert.match(html, /EPIC/);
+  assert.match(html, /kc-epic-start/, "an unarmed epic offers Start-epic");
+  assert.doesNotMatch(html, /kc-start[^-]/, "an epic never shows the ordinary per-ticket Start");
+});
+
+test("cardHtml: a work ticket that belongs to an epic carries a dim epic-child chip", () => {
+  const site = { siteKey: "myorg.atlassian.net" };
+  const html = cardHtml(ticket("C-1", { epicKey: "E-1", repoGuess: { repo: "Turma", cloned: true } }),
+    site, { now: Date.now() });
+  assert.match(html, /kc-epic-child/);
+  assert.match(html, /E-1/);
+  assert.match(html, /kc-start/, "a work child still offers its own Start");
+});
+
+test("epicRunPanelHtml: no run armed -> a description and a Start-run button", () => {
+  const html = epicRunPanelHtml(epicTicket("E-1"), null, {});
+  assert.match(html, /data-epic-arm="E-1"/);
+  assert.match(html, /Start epic run/);
+  assert.doesNotMatch(html, /data-epic-cancel/);
+  // A pending arm shows a busy marker instead of the button.
+  assert.match(epicRunPanelHtml(epicTicket("E-1"), null, { pending: true }), /epic-btn-busy/);
+  // A refusal lands inline.
+  assert.match(epicRunPanelHtml(epicTicket("E-1"), null, { error: "nope" }), /td-err[^]*nope/);
+});
+
+test("epicRunPanelHtml: an armed run shows waves, progress, Re-arm + Cancel", () => {
+  const view = {
+    state: "running", total: 3, done: 1, counts: { done: 1, running: 1, ready: 0, blocked: 1 },
+    waves: [
+      [{ key: "C-1", summary: "first", status: "done" }],
+      [{ key: "C-2", summary: "second", status: "running" }, { key: "C-3", summary: "third", status: "blocked" }],
+    ],
+    cycleChildren: [], cycle: false,
+  };
+  const html = epicRunPanelHtml(epicTicket("E-1"), view, {});
+  assert.match(html, /1 \/ 3 done/);
+  assert.match(html, /Wave 1/);
+  assert.match(html, /Wave 2/);
+  assert.match(html, /epic-child epic-done[^]*C-1/);
+  assert.match(html, /data-epic-arm="E-1"/, "Re-arm rebuilds the DAG");
+  assert.match(html, /data-epic-cancel="E-1"/);
+});
+
+test("epicRunPanelHtml: a cyclic run flags the loop and lists cyclic children", () => {
+  const view = {
+    state: "blocked", total: 2, done: 0, counts: { done: 0, running: 0, ready: 0, blocked: 2 },
+    waves: [], cycleChildren: [{ key: "C-1", summary: "a", status: "blocked" }], cycle: true,
+  };
+  const html = epicRunPanelHtml(epicTicket("E-1"), view, {});
+  assert.match(html, /dependency cycle/);
+  assert.match(html, /epic-wave-cycle/);
+});
+
+test("boardHtml: an epic card wires its run through — badge, Start-epic, no per-ticket Start", () => {
+  const site = { siteKey: "myorg.atlassian.net", online: true,
+    tickets: [epicTicket("E-1", { epicKey: null }),
+      ticket("C-1", { epicKey: "E-1", statusCategory: "done" })] };
+  const html = boardHtml([site], "", {
+    now: Date.now(), allKeys: ["myorg.atlassian.net"],
+    epicRuns: { "myorg.atlassian.net/E-1": run({ state: "done", children: ["C-1"], waves: [["C-1"]] }) },
+  });
+  assert.match(html, /kc-epic-badge/);
+  // The run resolves done 1/1 -> a "done" progress chip, not the Start button.
+  assert.match(html, /kc-epic-run kc-epic-done/);
+  assert.match(html, /1\/1/);
+});
+
+test("board.html: refused-command toasts pass the RESPONSE BODY to refusalText, not a string (XERK-264)", () => {
+  // refusalText reads `.error` off its third arg (the response body OBJECT); a
+  // pre-extracted string drops the toast to a bare "HTTP <n>". The epic-run,
+  // triage and triage-policy handlers all must pass the body. Guard the form so
+  // a future handler doesn't silently reintroduce the string.
+  const calls = [...BOARD_SCRIPT.matchAll(/refusalText\([^;]*?,\s*([a-zA-Z]+)\)\)/g)]
+    .map((m) => m[1]);
+  assert.ok(calls.length >= 3, "expected the epic-run + triage + triage-policy toasts");
+  for (const arg of calls) {
+    assert.notEqual(arg, "err",
+      "refusalText's body arg must be the response object (d/respBody), never the extracted `err` string");
+  }
+  // And the scope fix: saveTriage's toast must not read `r.status` outside the
+  // try that block-scopes `r` (a ReferenceError that ate the refusal handling).
+  assert.doesNotMatch(BOARD_SCRIPT, /Triage \$\{body\.clear[^}]*\} for[^;]*?,\s*r\.status,/,
+    "saveTriage must use the hoisted `status`, not the block-scoped `r`");
 });
