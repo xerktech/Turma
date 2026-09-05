@@ -4,12 +4,12 @@ paths:
   - turma/tests/server.test.js
 ---
 
-# Epic auto-orchestration run (XERK-635, epic XERK-633)
+# Epic auto-orchestration run (XERK-635/636, epic XERK-633)
 
-The hub's core state for "work an epic's children in dependency order, start/close hands-off". This
-subtask (B) is the HUB STATE ONLY — the durable run record, its dependency DAG, the manual-start
-route, and the never-auto-start gate. The driver that actually starts children (C) and the board UI
-(E) are later subtasks; do not add them here.
+The hub's machinery for "work an epic's children in dependency order, start/close hands-off".
+XERK-635 (B) is the HUB STATE — the durable run record, its dependency DAG, the manual-start route,
+and the never-auto-start gate. XERK-636 (C) is the DRIVER that dispatches ready children. The board
+UI (E) is a later subtask; do not add it here.
 
 Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every ticket
 (`normalizeJira` coerces them). This subtask consumes those fields; it collects nothing itself.
@@ -56,6 +56,38 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
 - `armEpicRun(siteKey, epicKey, rows)` rebuilds the DAG from the current board rows, derives state
   (`blocked` if a cycle; `done` if every child already Done; else `running`), persists, broadcasts.
 
+## The driver — `epicRunDriveSweep` (XERK-636)
+
+- **The sibling of `autoStartSweep` / `drainTicketQueue`**: on the 15s sweep, just BEFORE
+  `drainTicketQueue` (so a child queued here dispatches in the same tick), it walks every run that is
+  not `done` and queues the READY children the fleet isn't already handling. Epics + children are
+  excluded from `autoStartSweep` (XERK-635), so the two streams never contend for one ticket.
+- **It adds NO launch code, NO routing of its own, and NO second pause path.** Every one of those is
+  inherited by going through the SAME hub ticket queue (XERK-296) + `findTicketHost` the Start button
+  and auto-start use: parallelism (multiple ready children routed to available hosts, one-per-host-
+  per-drain-pass), capacity/queue backpressure, and the subscription pause (XERK-544/548/555).
+- **Children are queued as `enqueueTicketStart(..., "manual")`** — arming a run is a deliberate
+  operator commitment to finish the epic, so a ready child queue-and-holds exactly like a manual
+  Start (XERK-555): paused ONLY by the 5-hour cap, never the weekly pace ration. Do NOT switch this
+  to `"auto"` — `drainTicketQueue`'s auto branch would DROP an epic child whenever the org's
+  `autoStartOrgs` switch is off (a run is independent of that switch) and re-gate it on triage policy.
+- **A manual entry SKIPS `drainTicketQueue`'s own auto guards, so the driver owns the whole double-
+  start defence itself**: `startedTicketKeys` (a session on any channel), `spawnTicketInFlight` (a
+  spawn riding a queue), `committedTicketSpawn` (one committed to a host), and `liveQueuedTicket` (a
+  live place in line) — any one means the child is already coming up, whether the sweep or a board
+  click put it there. Also skips a child that isn't To Do, or has no triaged / ignore-tier repo
+  (silently — re-checked next sweep, never a churny blocked note).
+- **Readiness = all-blockers-Done** (`epicChildBlockersDone`): an in-epic blocker (a key in
+  `run.children`) is AUTHORITATIVE and must be a confirmed Done row — a poll gap hiding it HOLDS the
+  child, never races ahead. A VISIBLE external blocker holds only while it's not Done; an unresolvable
+  external blocker (no host reports it) is treated as satisfied, so an invisible cross-project ticket
+  can't deadlock the run. This is the driver's readiness concern; `buildEpicWaves` only ORDERS by
+  in-set blockers.
+- **The driver re-derives run STATE as children complete** (`advanceEpicRunState`): a `running` run
+  whose every child has reached Done becomes `done` (and drives nothing more); a cycle-`blocked` run
+  is LEFT blocked (only a re-arm rebuilds the DAG — its acyclic children still drive while blocked,
+  since a cyclic child never becomes ready). Persists + broadcasts like `armEpicRun`, only on change.
+
 ## The never-auto-start gate
 
 - **An epic AND its children are excluded from the org auto-start stream** (`autoStartSweep`): an
@@ -74,3 +106,8 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   cycle annotation), `isEpicOrEpicChild`, the sweep exclusion, the content-gate agreement, the route
   (arm/DAG/payload, cycle→blocked, bad-key/phantom-org/non-epic refusals, `{clear:true}`), and the
   restart restore (malformed record dropped).
+- The `XERK-636:` cases in `server.test.js`: parallel-wave dispatch (only ready children go, then a
+  completed blocker releases the next wave concurrently across two hosts), capacity backpressure (a
+  flat wave queues, one-per-host-per-pass), the 5-hour paused-hold-then-resume (asserted via
+  `pausedSubscriptions`), the double-start guards (existing session, repeated passes, sweep + manual
+  click reusing the in-flight cmdId), the run advancing to `done`, and `epicChildBlockersDone`.

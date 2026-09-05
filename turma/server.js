@@ -2276,6 +2276,117 @@ function clearEpicRun(siteKey, epicKey) {
   return true;
 }
 
+// ---- the epic-run DRIVER (XERK-636, epic XERK-633) --------------------------
+// The sibling of autoStartSweep / drainTicketQueue that actually WORKS an armed
+// run's DAG: for each run that is not finished, it enumerates the children whose
+// every blocker is Done and hands each to the hub ticket queue, so the fleet
+// starts the ready ones in parallel and re-evaluates as they complete. It adds
+// NO launch code, NO routing of its own and NO second pause path — every one of
+// those is inherited by going through the SAME queue + findTicketHost the Start
+// button and auto-start use.
+
+// Are all of a child's blockers Done, so it is ready to start? A blocker WITHIN
+// the run's own child set is authoritative: in-epic ordering is the whole point,
+// so a blocker that is not confirmed Done (including one momentarily unreported
+// during a poll gap) HOLDS the child — never races ahead of it. An EXTERNAL
+// blocker (a key outside the epic) holds the child only while it is VISIBLE and
+// not Done; one no host reports is treated as satisfied, so an invisible
+// cross-project ticket cannot deadlock the whole run. Self-blocks are ignored,
+// matching buildEpicWaves.
+function epicChildBlockersDone(childRow, run, rows) {
+  const kids = new Set(run.children || []);
+  const blockers = Array.isArray(childRow.blockedBy) ? childRow.blockedBy : [];
+  for (const b of blockers) {
+    if (typeof b !== "string" || !b || b === childRow.key) continue;
+    const br = rows.get(ticketQueueKey(run.siteKey, b));
+    const done = !!(br && br.row && br.row.statusCategory === "done");
+    if (kids.has(b)) {
+      if (!done) return false;             // an in-epic blocker: must be Done
+    } else if (br && br.row && !done) {
+      return false;                        // a visible external blocker: hold
+    }
+    // an unresolvable external blocker does not hold (can't see it, don't deadlock)
+  }
+  return true;
+}
+
+// Has every one of the run's children reached Done?
+function epicRunAllChildrenDone(run, rows) {
+  const kids = run.children || [];
+  if (!kids.length) return false;
+  return kids.every((key) => {
+    const r = rows.get(ticketQueueKey(run.siteKey, key));
+    return !!(r && r.row && r.row.statusCategory === "done");
+  });
+}
+
+// Re-derive a running run's state as children complete: once every child is Done
+// the run is `done` (and drives nothing more), else it stays `running`. A
+// cycle-blocked run is left BLOCKED — only a re-arm (the route) rebuilds the DAG,
+// so the driver never silently un-blocks one; its acyclic children are still
+// driven while it is blocked (a cyclic child never becomes ready, so it self-
+// excludes). Persists + broadcasts exactly like armEpicRun, only on a change.
+function advanceEpicRunState(run, rows) {
+  if (run.cycle && run.cycle.length) return;
+  const want = epicRunAllChildrenDone(run, rows) ? "done" : "running";
+  if (run.state === want) return;
+  run.state = want;
+  run.updatedAt = Date.now();
+  scheduleEpicRunsSave();
+  invalidateAgentsCache();
+  sseBroadcast("epicRuns", epicRuns);
+}
+
+// Drive every armed run one pass (a sibling of autoStartSweep, run on the same
+// 15s timer just before drainTicketQueue, so a child queued here dispatches in
+// the same tick). For each not-yet-done run it queues the ready children the
+// fleet isn't already working, as MANUAL entries: arming a run is a deliberate
+// operator commitment to finish the epic, so a ready child queue-and-holds
+// exactly like a manual Start (XERK-555) — paused only by the 5-hour cap, never
+// the weekly pace ration — and drainTicketQueue routes it through findTicketHost,
+// inheriting capacity/queue backpressure AND the subscription pause for free.
+//
+// A manual entry deliberately SKIPS drainTicketQueue's own auto guards, so the
+// driver owns the whole double-start defence itself (XERK-636): a session on any
+// channel (startedTicketKeys), a spawn already riding a queue (spawnTicketInFlight),
+// one committed to a host (committedTicketSpawn), or a live place in line — any
+// one of which means the child is already coming up, whether the sweep or a manual
+// click on the board put it there.
+function epicRunDriveSweep() {
+  const runKeys = Object.keys(epicRuns);
+  if (!runKeys.length) return;
+  const rows = fleetTicketRows();
+  let started = null;   // startedTicketKeys(), computed at most once and only if needed
+  for (const runKey of runKeys) {
+    const run = epicRuns[runKey];
+    if (!run || run.state === "done") continue;   // a finished run drives nothing
+    const siteKey = run.siteKey;
+    for (const childKey of run.children || []) {
+      const k = ticketQueueKey(siteKey, childKey);
+      const hit = rows.get(k);
+      if (!hit || !hit.row) continue;             // not reported right now
+      const row = hit.row;
+      const cat = row.statusCategory || null;
+      // Only a To Do child is a fresh start; one already Done, in progress or in
+      // review is being handled (or finished) and must not gain a second session.
+      if (cat && cat !== "todo") continue;
+      if (!epicChildBlockersDone(row, run, rows)) continue;   // a blocker isn't Done yet
+      if (!started) started = startedTicketKeys();
+      if (started.has(k)) continue;                           // already has a session
+      if (liveQueuedTicket(siteKey, childKey)) continue;      // already waiting in line
+      if (spawnTicketInFlight(siteKey, childKey)) continue;   // a spawn is riding a queue
+      if (committedTicketSpawn(siteKey, childKey)) continue;  // committed to a host
+      // Needs a triaged repo like any ticket session; an ignore-tier repo never
+      // auto-runs. Skipped silently (re-checked next sweep) rather than queued as
+      // a blocked entry that would churn a terminal "gave up" note.
+      const repo = ticketRepo(siteKey, childKey, rows);
+      if (!repo || isRepoIgnored(repo)) continue;
+      enqueueTicketStart(siteKey, childKey, "manual");
+    }
+    advanceEpicRunState(run, rows);
+  }
+}
+
 // ---- per-org priority write-back opt-in (XERK-483) -------------------------
 // The set of orgs the operator has switched triage priority write-back ON for,
 // keyed by siteKey with the value simply `true` (presence = enabled; disabling
@@ -10564,6 +10675,12 @@ setInterval(() => {
   reclaimStrandedTicketSpawns();
   autoStartSweep();
   autoStopSweep();
+  // Epic auto-orchestration (XERK-636): work each armed run's DAG — queue the
+  // ready children (all-blockers-Done) the fleet isn't already handling. No-op
+  // with no armed run; the drain below routes what it queues, so a child goes out
+  // in this same tick. Epics + their children are excluded from autoStartSweep
+  // above (XERK-635), so the two streams never contend for the same ticket.
+  epicRunDriveSweep();
   // Triage -> tracker priority (XERK-483): gated per org; no-op unless opted in.
   priorityWriteBackSweep();
   // Triage -> duplicate links (XERK-484): gated per org and Jira-only; no-op
@@ -15281,6 +15398,10 @@ if (process.env.TURMA_TEST) {
     isEpicOrEpicChild,
     sanitizeEpicRunRecord,
     EPIC_RUN_STATES,
+    // XERK-636: the wave-dispatch driver + its readiness/state helpers.
+    epicRunDriveSweep,
+    epicChildBlockersDone,
+    epicRunAllChildrenDone,
     // Hands-off auto-merge + close (XERK-550): the two sweeps, the shared
     // content gate, the per-org toggle + setter, and the state the tests drive.
     autoMergeSweep,
