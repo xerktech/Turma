@@ -202,7 +202,11 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
     Jira `issuetype`, ADO `System.WorkItemType`) to be in `AUTO_MERGE_ISSUE_TYPES` (case-insensitive,
     default `{"bug"}`, `TURMA_AUTOMERGE_ISSUE_TYPES` widens it for a "Defect"-named tracker). Even an
     org that auto-STARTS other types only ever has its BUG PRs merged + closed hands-off; every other
-    type's PR waits for a human. The policy can NARROW auto-merge but never WIDEN it past bugs.
+    type's PR waits for a human. The policy can NARROW auto-merge but never WIDEN it past bugs — with
+    ONE run-scoped exception: a started epic run's children merge regardless of issue type (XERK-642,
+    via `epicRunChildSession` — arming the run IS the per-project trust decision, so it lifts the
+    bug floor for exactly that run's `run.children`; a non-bug ticket OUTSIDE any run still waits for
+    a human). See `.claude/rules/turma-epic-run.md`.
     - **Keys on the OPERATOR-SET tracker type, NOT the triage classifier's `row.triage.type`**
       (XERK-560's defect): `triage.type` is a `claude -p` model ASSESSMENT ("the assessed work type
       bug/feature/…") that labels a content-bug Jira **Task** a "bug" — so gating on it auto-merged

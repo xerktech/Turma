@@ -11799,6 +11799,49 @@ test("XERK-637: a run armed already-complete still writes the epic Done (B set s
   assert.equal(closes2.length, 1, "the board's own Done state must stop a re-fire after the guard is lost");
 });
 
+// ---- the run-scoped bug-floor bypass, both directions (XERK-642) -------------
+// XERK-642 pins, in ONE place, that lifting the AUTO_MERGE_ISSUE_TYPES bug floor
+// is RUN-SCOPED: a non-bug child of a STARTED epic run auto-merges, while a non-bug
+// ticket OUTSIDE any run in the SAME org still waits for a human (the XERK-560 floor
+// holds). The scope key is HUB-OWNED run membership (`run.children`), never the
+// agent-asserted `epicKey` alone — claiming epic membership is INERT without an
+// operator-armed run, and a child not captured in `run.children` (added after arming)
+// keeps the bug floor. The mechanism is XERK-637's `epicRunChildSession`; this is the
+// acceptance pin for the exception documented in turma-board.md / turma-epic-run.md.
+test("XERK-642: the bug-floor bypass is run-scoped — non-bug run child merges, non-run/added-later non-bug tickets do not", async () => {
+  resetEpicD();
+  const site = "d642.atlassian.net";
+  const childUrl = "https://github.com/ep/x642/pull/1";
+  const outsideUrl = "https://github.com/ep/y642/pull/2";
+  const lateUrl = "https://github.com/ep/z642/pull/3";
+  const nonRunTask = (key) => ({ key, statusCategory: "inprogress", type: "Task",
+    repoGuess: { repo: "Turma", cloned: true },
+    triage: { priority: "P2", type: "task", actionable: true } });
+  // Arm the run when only C-1 is a child. T-9 (no epic at all) is present too, so the
+  // org is opted into auto-merge and the sweep DOES run for it — proving the floor.
+  await asBeat("ed642", site, { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "inprogress"), nonRunTask("T-9")] });
+  setAutoMergeOrg(site, true);
+  armEpicRun(site, "E-1");
+  assert.deepEqual(epicRuns[site + "/E-1"].children, ["C-1"]);
+  // Now S-9 appears CLAIMING epicKey "E-1" AFTER arming — it is NOT in run.children,
+  // so it must not ride the bypass (the XERK-637 "added after arming" guard).
+  await asBeat("ed642", site, { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "inprogress"), nonRunTask("T-9"),
+      { ...nonRunTask("S-9"), epicKey: "E-1" }],
+    sessions: [
+      dChildSession("s-c1", "C-1", site, "OPEN", childUrl),
+      dChildSession("s-t9", "T-9", site, "OPEN", outsideUrl),
+      dChildSession("s-s9", "S-9", site, "OPEN", lateUrl),
+    ] });
+  autoMergeSweep();
+  const merged = new Set((agents.ed642.commands || [])
+    .filter((c) => c.type === "mergePr").map((c) => c.url));
+  assert.ok(merged.has(childUrl), "the armed run's non-bug child must auto-merge");
+  assert.ok(!merged.has(outsideUrl), "a non-bug ticket outside any run must NOT auto-merge (bug floor holds)");
+  assert.ok(!merged.has(lateUrl), "a non-bug child added AFTER arming (not in run.children) must NOT auto-merge");
+});
+
 // ---- the epic-run DRIVER — wave dispatch (XERK-636, epic XERK-633) ----------
 
 // The epic's children with controllable statuses: E-1 -> {C-1, then C-2 & C-3
