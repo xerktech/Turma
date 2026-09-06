@@ -176,6 +176,16 @@ static and the only thing that changes is a child's board Done-ness.
   merges a CONFLICTING/UNKNOWN-mergeable PR (both fail the `=== "MERGEABLE"` compare) or one with
   failing/pending checks (non-null `p.checks`); DRAFT is excluded by the caller's state gate. Do NOT
   broaden `_merge_ready` itself — that would auto-merge no-CI PRs in ordinary auto-merge orgs too.
+  - **`checks:null` is AMBIGUOUS, so the no-CI merge waits out `PR_NO_CI_GRACE_MS`** — the SAME floor
+    `prAlertDecision` applies to the identical signal. A just-opened PR reports an EMPTY check rollup
+    for a beat or two before GitHub registers its workflows, indistinguishable from a genuinely CI-less
+    repo; merging on FIRST sight would squash to the default branch BEFORE CI ran. So `autoMergeSweep`
+    stamps the url's first no-CI-mergeable sighting in `epicNoCiSeen` and only merges once it has HELD
+    that long (`prAutoMergeReady` is the SHAPE test; the grace is the sweep's). A green PR
+    (`ready === "ready"`) is proven and skips the wait; the stamp is dropped the moment the PR stops
+    being no-CI-mergeable (checks attached, or it left OPEN). An ABSENT `checks` KEY is "not fetched
+    yet" (older agent / first beat), never no-CI — `prAutoMergeReady` requires the key present-and-null.
+    `epicNoCiSeen` is bounded (`EPIC_NO_CI_SEEN_MAX`, oldest-first).
 - **Both sweeps early-return unless `orgsWithAutoMerge().size || anyArmedEpicRun()`** — an armed run
   is the second reason to run them. `anyArmedEpicRun` = any run whose `state !== "done"`.
 - **Chaining is C's, not D's.** The Done edge D produces (auto-close) or a human move is what C's
@@ -228,5 +238,7 @@ static and the only thing that changes is a child's board Done-ness.
   the gapped-host stand-down, and a run armed already-complete still writing the epic Done (with the
   board stopping a post-restart re-fire).
 - The `XERK-659:` cases in `server.test.js`: `prAutoMergeReady`'s truth table (no-CI mergeable passes
-  for an epic child, never the org stream; CONFLICTING/UNKNOWN/failing/pending all refused), an armed
-  child's mergeable no-CI PR dispatching a `mergePr`, and the org stream refusing the same PR.
+  SHAPE for an epic child, never the org stream; CONFLICTING/UNKNOWN/failing/pending and an ABSENT
+  `checks` key all refused), an armed child's no-CI PR HELD on first sight then merging after
+  `PR_NO_CI_GRACE_MS`, a green child merging immediately (grace only bites no-CI), and the org stream
+  refusing the same no-CI PR.
