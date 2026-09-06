@@ -10641,6 +10641,30 @@ const autoClosed = new Set();
 // against a fresh read agent-side, so a rare double-write is a harmless no-op.
 const epicDoneWritten = new Set();
 
+// Is a PR merge-ready for the auto-merge dispatch? The ORG auto-merge stream
+// requires the agent's full verdict (`ready:"ready"` = green CI AND an affirmative
+// MERGEABLE). An ARMED epic run's child (XERK-659, epic XERK-633) accepts ONE more
+// case: a PR GitHub calls MERGEABLE with NO CI checks at all — the no-CI case
+// `_merge_ready` deliberately leaves unmarked ("absent CI is not evidence of
+// anything"). Arming a run is the operator's hands-off commitment to finish the
+// epic (it already overrides the org toggle AND the bug floor, XERK-642), so a
+// child whose change triggers no workflow (docs/config, a path-filtered CI, a repo
+// with no CI) must not STALL THE WHOLE RUN behind it — which is exactly what a
+// docs child (XERK-648) did to epic XERK-646, its mergeable no-CI PR never
+// becoming "ready". Scoped to armed-run children, so the org stream's
+// green-CI-required bar is unchanged.
+//
+// Still never merges a CONFLICTING or UNKNOWN-mergeable PR (both fail the strict
+// MERGEABLE compare), nor one with failing/pending checks (those keep a non-"ready"
+// `p.ready` and a non-null `p.checks`). DRAFT is already excluded by the caller's
+// state gate. `p.checks` is null ONLY when the agent saw zero check-runs.
+function prAutoMergeReady(p, viaEpicRun) {
+  if (p.ready === "ready") return true;              // green CI + MERGEABLE (any stream)
+  if (!viaEpicRun) return false;                     // org stream: strict, nothing more
+  return (p.checks === null || p.checks === undefined)
+    && p.mergeable === "MERGEABLE";                  // epic child: no CI + affirmed mergeable
+}
+
 // PHASE 1: merge every merge-ready PR of an eligible, FINISHED session. The
 // merge itself is the agent's job (it holds `gh` auth + the branch), so this
 // only routes a mergePr to the session's own host.
@@ -10677,8 +10701,11 @@ function autoMergeSweep() {
   for (const [host, a] of Object.entries(agents)) {
     for (const s of a.sessions || []) {
       // An org-opt-in bug session OR an armed epic run's child (XERK-637) — the
-      // two are disjoint (autoMergeSession nulls on any epic child).
-      if (!(autoMergeSession(s, byKey, rows) || epicRunChildSession(s, byKey, rows))) continue;
+      // two are disjoint (autoMergeSession nulls on any epic child). Which one it
+      // is decides the merge-readiness bar below (XERK-659): an armed epic child
+      // also merges a mergeable no-CI PR, the org stream does not.
+      const viaEpicRun = !!epicRunChildSession(s, byKey, rows);
+      if (!(autoMergeSession(s, byKey, rows) || viaEpicRun)) continue;
       // Act only on a session that has FINISHED its own turn — never mid-work
       // (it may still be pushing commits, which drops the PR out of "ready"
       // anyway) and never while it is blocked asking the operator something.
@@ -10697,7 +10724,9 @@ function autoMergeSweep() {
         // marks the PR ready. Exclude DRAFT here (prLanded already drops
         // MERGED/CLOSED).
         if (String((p.state || "")).toUpperCase() !== "OPEN") continue;
-        if (p.ready !== "ready") continue;           // green CI + MERGEABLE + no conflict
+        // green CI + MERGEABLE + no conflict — OR, for an armed epic child, a
+        // mergeable PR with no CI checks at all (XERK-659, prAutoMergeReady).
+        if (!prAutoMergeReady(p, viaEpicRun)) continue;
         if (mergePrInFlight(a, p.url)) continue;
         const st = autoMergeState.get(p.url);
         if (st && st.gaveUp) continue;
@@ -15629,6 +15658,7 @@ if (process.env.TURMA_TEST) {
     // content gate, the per-org toggle + setter, and the state the tests drive.
     autoMergeSweep,
     autoCloseSweep,
+    prAutoMergeReady,
     autoStartContentGate,
     orgsWithAutoMerge,
     autoMergeOrgs,
