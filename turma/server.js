@@ -10640,6 +10640,45 @@ const autoClosed = new Set();
 // marked done is skipped by state, and the setTicketStatus write is re-validated
 // against a fresh read agent-side, so a rare double-write is a harmless no-op.
 const epicDoneWritten = new Set();
+// url -> the first sweep-time (ms) an armed epic child's PR was seen in the
+// "no CI checks + MERGEABLE" state (XERK-659). That state is AMBIGUOUS exactly as
+// prAlertDecision documents: a just-opened PR reports an EMPTY check rollup for a
+// beat or two before GitHub registers its workflows, indistinguishable from a
+// genuinely CI-less repo — so treating it as "no CI" on FIRST sight could
+// squash-merge to the default branch before CI ever ran. The no-CI merge only
+// qualifies once the state has HELD for PR_NO_CI_GRACE_MS (the same floor the
+// alert path applies to the identical signal). An entry is dropped the moment the
+// PR stops being no-CI-mergeable (checks attached, or it left OPEN); bounded so a
+// churn of urls can't grow it without limit.
+const epicNoCiSeen = new Map();
+const EPIC_NO_CI_SEEN_MAX = 500;
+
+// Is a PR SHAPE-eligible for the auto-merge dispatch? The ORG auto-merge stream
+// requires the agent's full verdict (`ready:"ready"` = green CI AND an affirmative
+// MERGEABLE). An ARMED epic run's child (XERK-659, epic XERK-633) accepts ONE more
+// SHAPE: a PR GitHub calls MERGEABLE with NO CI checks at all — the no-CI case
+// `_merge_ready` deliberately leaves unmarked ("absent CI is not evidence of
+// anything"). Arming a run is the operator's hands-off commitment to finish the
+// epic (it already overrides the org toggle AND the bug floor, XERK-642), so a
+// child whose change triggers no workflow (docs/config, a path-filtered CI, a repo
+// with no CI) must not STALL THE WHOLE RUN behind it — which is exactly what a
+// docs child (XERK-648) did to epic XERK-646, its mergeable no-CI PR never
+// becoming "ready". Scoped to armed-run children, so the org stream's
+// green-CI-required bar is unchanged.
+//
+// SHAPE only — the no-CI branch is gated in autoMergeSweep by PR_NO_CI_GRACE_MS on
+// top of this (a just-opened PR can look no-CI while its workflows attach). Still
+// never merges a CONFLICTING or UNKNOWN-mergeable PR (both fail the strict
+// MERGEABLE compare), nor one with failing/pending checks (non-null `checks`, and
+// `ready` not "ready"). DRAFT is already excluded by the caller's state gate.
+// `checks` present-and-null is the ONLY no-CI signal: an ABSENT `checks` key means
+// "not fetched yet" (older agent / first beat) — hold, never merge.
+function prAutoMergeReady(p, viaEpicRun) {
+  if (p.ready === "ready") return true;              // green CI + MERGEABLE (any stream)
+  if (!viaEpicRun) return false;                     // org stream: strict, nothing more
+  return "checks" in p && p.checks === null
+    && p.mergeable === "MERGEABLE";                  // epic child: no CI + affirmed mergeable
+}
 
 // PHASE 1: merge every merge-ready PR of an eligible, FINISHED session. The
 // merge itself is the agent's job (it holds `gh` auth + the branch), so this
@@ -10677,8 +10716,11 @@ function autoMergeSweep() {
   for (const [host, a] of Object.entries(agents)) {
     for (const s of a.sessions || []) {
       // An org-opt-in bug session OR an armed epic run's child (XERK-637) — the
-      // two are disjoint (autoMergeSession nulls on any epic child).
-      if (!(autoMergeSession(s, byKey, rows) || epicRunChildSession(s, byKey, rows))) continue;
+      // two are disjoint (autoMergeSession nulls on any epic child). Which one it
+      // is decides the merge-readiness bar below (XERK-659): an armed epic child
+      // also merges a mergeable no-CI PR, the org stream does not.
+      const viaEpicRun = !!epicRunChildSession(s, byKey, rows);
+      if (!(autoMergeSession(s, byKey, rows) || viaEpicRun)) continue;
       // Act only on a session that has FINISHED its own turn — never mid-work
       // (it may still be pushing commits, which drops the PR out of "ready"
       // anyway) and never while it is blocked asking the operator something.
@@ -10697,7 +10739,21 @@ function autoMergeSweep() {
         // marks the PR ready. Exclude DRAFT here (prLanded already drops
         // MERGED/CLOSED).
         if (String((p.state || "")).toUpperCase() !== "OPEN") continue;
-        if (p.ready !== "ready") continue;           // green CI + MERGEABLE + no conflict
+        // green CI + MERGEABLE + no conflict — OR, for an armed epic child, a
+        // mergeable PR with no CI checks at all (XERK-659, prAutoMergeReady).
+        if (!prAutoMergeReady(p, viaEpicRun)) { epicNoCiSeen.delete(p.url); continue; }
+        // The no-CI epic branch (shape-eligible but NOT green) qualifies only once
+        // the "no checks" state has HELD for PR_NO_CI_GRACE_MS — a just-opened PR
+        // looks no-CI while GitHub attaches its workflows, and merging then would
+        // squash to the default branch before CI ran (XERK-659). A green-CI PR
+        // (p.ready === "ready") is proven and skips the wait.
+        if (viaEpicRun && p.ready !== "ready") {
+          const firstSeen = epicNoCiSeen.get(p.url) || now;
+          epicNoCiSeen.set(p.url, firstSeen);
+          if (now - firstSeen < PR_NO_CI_GRACE_MS) continue;   // could still be CI-attaching
+        } else {
+          epicNoCiSeen.delete(p.url);                          // green / not-no-CI: reset the clock
+        }
         if (mergePrInFlight(a, p.url)) continue;
         const st = autoMergeState.get(p.url);
         if (st && st.gaveUp) continue;
@@ -10744,6 +10800,15 @@ function autoMergeSweep() {
     const over = autoMergeState.size - AUTO_MERGE_STATE_MAX;
     for (const [k] of [...autoMergeState].sort((a, b) => a[1].at - b[1].at).slice(0, over)) {
       autoMergeState.delete(k);
+    }
+  }
+  // Bound the no-CI grace map (XERK-659), oldest-first — entries are normally
+  // dropped as soon as a PR stops being no-CI-mergeable, so this only bites a
+  // churn of never-resolving urls.
+  if (epicNoCiSeen.size > EPIC_NO_CI_SEEN_MAX) {
+    const over = epicNoCiSeen.size - EPIC_NO_CI_SEEN_MAX;
+    for (const [k] of [...epicNoCiSeen].sort((a, b) => a[1] - b[1]).slice(0, over)) {
+      epicNoCiSeen.delete(k);
     }
   }
 }
@@ -15629,6 +15694,9 @@ if (process.env.TURMA_TEST) {
     // content gate, the per-org toggle + setter, and the state the tests drive.
     autoMergeSweep,
     autoCloseSweep,
+    prAutoMergeReady,
+    epicNoCiSeen,
+    PR_NO_CI_GRACE_MS,
     autoStartContentGate,
     orgsWithAutoMerge,
     autoMergeOrgs,

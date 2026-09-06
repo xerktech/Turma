@@ -194,7 +194,8 @@ const {
   isEpicOrEpicChild, sanitizeEpicRunRecord,
   epicRunDriveSweep, epicChildBlockersDone, epicRunAllChildrenDone, epicChildAttempts,
   epicRunChildSession, anyArmedEpicRun, epicRunCompleteSweep, epicDoneWritten,
-  autoMergeSweep, autoCloseSweep, autoStartContentGate, orgsWithAutoMerge,
+  autoMergeSweep, autoCloseSweep, prAutoMergeReady, epicNoCiSeen, PR_NO_CI_GRACE_MS,
+  autoStartContentGate, orgsWithAutoMerge,
   autoMergeOrgs, setAutoMergeOrg, autoMergeState, autoClosed, ingestMergeResults,
   priorityWriteBackOrgs, setPriorityWriteBackOrg, orgsWithPriorityWriteBack,
   priorityWriteBackSweep, priorityWriteBackSkips,
@@ -11580,6 +11581,7 @@ test("XERK-635: an armed run survives a hub restart (read back from its own file
 const resetEpicD = () => {
   for (const k of Object.keys(epicRuns)) delete epicRuns[k];
   autoMergeState.clear();
+  epicNoCiSeen.clear();
   autoClosed.clear();
   autoStopped.clear();
   epicDoneWritten.clear();
@@ -11797,6 +11799,99 @@ test("XERK-637: a run armed already-complete still writes the epic Done (B set s
   const closes2 = (agents.edPre.commands || [])
     .filter((c) => c.type === "setTicketStatus" && c.issueKey === "E-1");
   assert.equal(closes2.length, 1, "the board's own Done state must stop a re-fire after the guard is lost");
+});
+
+// ---- an armed epic child auto-merges a mergeable NO-CI PR (XERK-659) ---------
+// A child whose change triggers no CI (docs/config, a path-filtered workflow, a
+// repo with no CI) opens a PR the agent leaves UNMARKED (`ready:null`,
+// `checks:null`) because "absent CI is not evidence of anything". The org
+// auto-merge stream correctly waits for a human there, but an ARMED epic run is
+// the operator's hands-off commitment, so its child must merge on GitHub's
+// MERGEABLE alone — else the whole run stalls behind it (the live XERK-646/XERK-648
+// failure this fixes). Broadening is scoped to armed-run children by prAutoMergeReady.
+
+test("XERK-659: prAutoMergeReady — no-CI mergeable PR passes SHAPE for an epic child, never the org stream", () => {
+  const noCiMergeable = { state: "OPEN", ready: null, checks: null, mergeable: "MERGEABLE" };
+  // The org stream stays strict: only the agent's full `ready:"ready"` verdict.
+  assert.equal(prAutoMergeReady(noCiMergeable, false), false);
+  assert.equal(prAutoMergeReady({ ready: "ready" }, false), true);
+  // The epic child ALSO accepts a mergeable PR with no checks at all (the grace
+  // that gates WHEN it merges is autoMergeSweep's, tested separately below).
+  assert.equal(prAutoMergeReady(noCiMergeable, true), true);
+  assert.equal(prAutoMergeReady({ ready: "ready" }, true), true);
+  // ...but never a CONFLICTING or UNKNOWN-mergeable one, nor failing/pending CI —
+  // those keep a non-"ready" verdict and a non-null (or non-MERGEABLE) shape.
+  assert.equal(prAutoMergeReady({ ready: "blocked", checks: null, mergeable: "CONFLICTING" }, true), false);
+  assert.equal(prAutoMergeReady({ ready: "pending", checks: null, mergeable: "UNKNOWN" }, true), false);
+  assert.equal(prAutoMergeReady({ ready: "pending", checks: "pending", mergeable: "MERGEABLE" }, true), false);
+  assert.equal(prAutoMergeReady({ ready: "blocked", checks: "failing", mergeable: "MERGEABLE" }, true), false);
+  // An ABSENT `checks` key is "not fetched yet" (older agent / first beat), NOT
+  // "no CI" — must hold, never merge.
+  assert.equal(prAutoMergeReady({ ready: null, mergeable: "MERGEABLE" }, true), false);
+});
+
+test("XERK-659: an armed child's no-CI PR waits out PR_NO_CI_GRACE_MS, THEN auto-merges", async () => {
+  resetEpicD();
+  const url = "https://github.com/ep/noci/pull/143";
+  await asBeat("edNoCi", "d659-1.atlassian.net", { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "inprogress")],
+    // A docs child's PR: mergeable, but zero CI checks → agent leaves it unmarked.
+    sessions: [{ id: "s-c1", status: "running",
+      ticket: { key: "C-1", siteKey: "d659-1.atlassian.net" },
+      prs: [{ url, state: "OPEN", ready: null, checks: null, mergeable: "MERGEABLE" }],
+      session: { transcriptAgeSec: 30, paneBusy: false } }] });
+  assert.equal("d659-1.atlassian.net" in autoMergeOrgs, false);   // org NOT opted in
+  armEpicRun("d659-1.atlassian.net", "E-1");
+  // First sighting: the "no CI" state is still ambiguous (CI could be attaching),
+  // so it is STAMPED and held — no merge yet.
+  autoMergeSweep();
+  assert.equal((agents.edNoCi.commands || []).filter((c) => c.type === "mergePr").length, 0,
+    `no-CI PR must wait out the grace on first sight, got ${JSON.stringify(dCmds("edNoCi"))}`);
+  assert.ok(epicNoCiSeen.has(url), "the no-CI PR should be stamped for the grace clock");
+  // Back-date the stamp past the grace (real time is the sweep's Date.now()), then
+  // sweep again: now the no-CI state has "held" long enough and it merges.
+  epicNoCiSeen.set(url, Date.now() - PR_NO_CI_GRACE_MS - 1000);
+  autoMergeSweep();
+  const c = (agents.edNoCi.commands || []).find((x) => x.type === "mergePr");
+  assert.ok(c, `expected a mergePr after the grace elapsed, got ${JSON.stringify(dCmds("edNoCi"))}`);
+  assert.equal(c.url, url);
+  assert.equal(c.sessionId, "s-c1");
+});
+
+test("XERK-659: an armed child's GREEN PR merges immediately — the grace is only for no-CI", async () => {
+  resetEpicD();
+  const url = "https://github.com/ep/green/pull/1";
+  await asBeat("edGreen", "d659-3.atlassian.net", { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "inprogress")],
+    sessions: [{ id: "s-c1", status: "running",
+      ticket: { key: "C-1", siteKey: "d659-3.atlassian.net" },
+      prs: [{ url, state: "OPEN", ready: "ready", checks: "passing", mergeable: "MERGEABLE" }],
+      session: { transcriptAgeSec: 30, paneBusy: false } }] });
+  armEpicRun("d659-3.atlassian.net", "E-1");
+  autoMergeSweep();
+  const c = (agents.edGreen.commands || []).find((x) => x.type === "mergePr");
+  assert.ok(c, `a green epic child should merge on the first sweep, got ${JSON.stringify(dCmds("edGreen"))}`);
+  assert.equal(epicNoCiSeen.has(url), false, "a green PR must not sit in the no-CI grace map");
+});
+
+test("XERK-659: the ORG auto-merge stream never merges a no-CI PR (broadening is epic-scoped)", async () => {
+  resetEpicD();
+  const url = "https://github.com/org/noci/pull/9";
+  // A plain (non-epic) Bug session in an org that opted into auto-merge.
+  await asBeat("edOrgNoCi", "d659-2.atlassian.net", { autoStart: false,
+    tickets: [{ key: "B-1", statusCategory: "inprogress", type: "Bug",
+      repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "bug", actionable: true } }],
+    sessions: [{ id: "s-b1", status: "running",
+      ticket: { key: "B-1", siteKey: "d659-2.atlassian.net" },
+      prs: [{ url, state: "OPEN", ready: null, checks: null, mergeable: "MERGEABLE" }],
+      session: { transcriptAgeSec: 30, paneBusy: false } }] });
+  setAutoMergeOrg("d659-2.atlassian.net", true);
+  assert.equal(anyArmedEpicRun(), false);                          // no epic run in play
+  autoMergeSweep();
+  const merges = (agents.edOrgNoCi.commands || []).filter((c) => c.type === "mergePr");
+  assert.equal(merges.length, 0,
+    `org stream must wait for a human on a no-CI PR, got ${JSON.stringify(dCmds("edOrgNoCi"))}`);
 });
 
 // ---- the run-scoped bug-floor bypass, both directions (XERK-642) -------------
