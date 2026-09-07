@@ -114,6 +114,10 @@ function New-Fake { $f = Join-Path $Work ("fake-" + [guid]::NewGuid().ToString('
 # Run the real bootstrap in a child pwsh with the shim installed. Returns @{ Code; Out }.
 function Invoke-Bootstrap-Child([string]$Fake, [string]$Record, [string]$ForwardLiteral) {
   $outFile = Join-Path $Work ("out-" + [guid]::NewGuid().ToString('N') + '.log')
+  # A private TMPDIR per call so the assertion below can prove bootstrap's temp dir
+  # ([Path]::GetTempPath() honours TMPDIR on Unix) is swept even on the refusal paths.
+  $tmp = Join-Path $Work ("tmp-" + [guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   $inner = ". '$Bootstrap'; . '$Shim'; exit (Invoke-Bootstrap $ForwardLiteral)"
   $sh = "exec `"$PwshExe`" -NoProfile -Command `"$($inner.Replace('"','\"'))`" > `"$outFile`" 2>&1"
   $psi = [System.Diagnostics.ProcessStartInfo]::new()
@@ -123,10 +127,12 @@ function Invoke-Bootstrap-Child([string]$Fake, [string]$Record, [string]$Forward
   $psi.EnvironmentVariables['TURMA_BOOTSTRAP_NORUN'] = '1'
   $psi.EnvironmentVariables['FAKE_DIR']       = $Fake
   $psi.EnvironmentVariables['INSTALL_RECORD'] = $Record
+  $psi.EnvironmentVariables['TMPDIR']         = $tmp
   $p = [System.Diagnostics.Process]::Start($psi)
   $null = $p.WaitForExit(60000)
   $out = if (Test-Path -LiteralPath $outFile) { Get-Content -LiteralPath $outFile -Raw } else { '' }
-  return @{ Code = $p.ExitCode; Out = $out }
+  $leaked = @(Get-ChildItem -LiteralPath $tmp -Directory -Filter 'turma-bootstrap-*' -ErrorAction SilentlyContinue)
+  return @{ Code = $p.ExitCode; Out = $out; Leaked = $leaked.Count }
 }
 
 Note "test_bootstrap_ps1.ps1"
@@ -143,6 +149,7 @@ try {
   if ($r.Code -eq 0) {
     Assert-Eq '0.4.1' (Get-Content -LiteralPath "$rec.version" -Raw) "installed the newest windows build" "installed the wrong version"
     Assert-Eq '-Verify -Prefix D:\turma' (Get-Content -LiteralPath "$rec.args" -Raw) "forwarded its args to install.ps1" "dropped or mangled install.ps1 args"
+    if ($r.Leaked -eq 0) { Ok "cleaned its temp dir on the happy path" } else { Fail "leaked $($r.Leaked) temp dir(s) on the happy path" }
   } else { Fail "bootstrap exited $($r.Code) on a good release stream: $($r.Out)" }
 
   # --- Case 2: carried asset under an older name on a newer tag (the load-bearing one) ----
@@ -169,6 +176,9 @@ try {
   elseif ($r.Out -match 'checksum mismatch') { Ok "refused a tampered zip" }
   else { Fail "refused, but not for the checksum: $($r.Out)" }
   if (Test-Path -LiteralPath "$rec.version") { Fail "ran install.ps1 despite the bad checksum" } else { Ok "never reached install.ps1" }
+  # The refusal exits through Die, BEFORE Invoke-Bootstrap's finally — Die must still sweep
+  # the temp dir (the downloaded, tampered zip), the parity gap vs bootstrap.sh's EXIT trap.
+  if ($r.Leaked -eq 0) { Ok "swept its temp dir on the refusal path" } else { Fail "leaked $($r.Leaked) temp dir(s) after a refusal (Die did not clean up)" }
 
   # --- Case 4: a missing checksum sidecar must refuse too --------------------------------
   Note "case: missing checksum refuses"

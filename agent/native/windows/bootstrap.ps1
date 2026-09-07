@@ -56,7 +56,19 @@ $Api  = "https://api.github.com/repos/$Repo/releases?per_page=100"
 # .zip so the unpack is Expand-Archive — built into 5.1, no tar dependency.
 $AssetRe = '^turma-agent-windows-v([0-9]+(?:\.[0-9]+)*)\.zip$'
 
-function Die([string]$Message)  { [Console]::Error.WriteLine("[bootstrap] ERROR: $Message"); exit 1 }
+# The temp working dir, registered here the moment it exists so Die can sweep it. The
+# happy path is cleaned in Invoke-Bootstrap's finally; but a refusal (bad/missing
+# checksum, download or unpack failure, malformed asset) exits THROUGH Die, which is
+# before that finally, so without this the downloaded (possibly tampered) zip would be
+# left in %TEMP% forever — the parity gap vs bootstrap.sh's `trap 'rm -rf' EXIT`.
+$script:WorkDir = $null
+function Remove-WorkDir {
+  if ($script:WorkDir) {
+    Remove-Item -Recurse -Force -LiteralPath $script:WorkDir -ErrorAction SilentlyContinue
+    $script:WorkDir = $null
+  }
+}
+function Die([string]$Message)  { Remove-WorkDir; [Console]::Error.WriteLine("[bootstrap] ERROR: $Message"); exit 1 }
 function Info([string]$Message) { [Console]::Out.WriteLine("[bootstrap] $Message") }
 
 # TLS 1.2 for the GitHub API on Windows PowerShell 5.1, whose default can still be
@@ -118,6 +130,7 @@ function Resolve-Asset {
 function Get-VerifiedTree($Asset) {
   $work = Join-Path ([System.IO.Path]::GetTempPath()) ("turma-bootstrap-" + [guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force -Path $work | Out-Null
+  $script:WorkDir = $work   # register for Die's sweep before anything can refuse below
 
   $zip = Join-Path $work $Asset.Name
   $sha = "$zip.sha256"
@@ -214,10 +227,9 @@ function Invoke-Bootstrap([string[]]$ForwardArgs = @()) {
     return $LASTEXITCODE
   }
   finally {
-    # Best-effort cleanup of the whole temp tree, whatever install.ps1 did.
-    if ($tree -and $tree.Work) {
-      Remove-Item -Recurse -Force -LiteralPath $tree.Work -ErrorAction SilentlyContinue
-    }
+    # Best-effort cleanup of the whole temp tree, whatever install.ps1 did. Same dir Die
+    # would have swept — Remove-WorkDir is idempotent, so the two paths never conflict.
+    Remove-WorkDir
   }
 }
 

@@ -236,9 +236,11 @@ Read `agent-native.md`'s `bootstrap.sh` bullet for the contract it mirrors.
 - **Hands off `install.ps1` as a real FILE under pwsh 7** (`-NoProfile -ExecutionPolicy Bypass -File`)
   so its `$PSCommandPath` source-probe resolves the unpacked tree beside it — the analog of
   `bootstrap.sh` running `install.sh` THROUGH bash. Not copied into the prefix, so a later
-  `-Verify`/`-Uninstall` re-runs through this same download+unpack path. All `$InstallArgs` forward
-  verbatim (`ValueFromRemainingArguments`), the analog of `bash -s -- …`; the temp tree is cleaned in
-  `finally` regardless of the installer's outcome, and the installer's exit code is relayed.
+  `-Verify`/`-Uninstall` re-runs through this same download+unpack path. It captures passthrough via
+  the automatic `$args` (NO param block / `[CmdletBinding()]`, which would REJECT an unknown install
+  flag as a binding error), forwarding every option verbatim — the analog of `bash -s -- …`. The temp
+  tree is swept on BOTH exits (a normal `finally` AND `Die`'s own sweep, since a refusal exits before
+  the `finally` — the parity gap vs `bootstrap.sh`'s `trap … EXIT`); the installer's exit code is relayed.
 - **Testable seams**: `Get-ReleaseJson`/`Get-ReleaseFile`/`Resolve-Pwsh` are overridable functions and
   the main body is `Invoke-Bootstrap`, auto-run only when `TURMA_BOOTSTRAP_NORUN` is unset — so the
   suite dot-sources the real script and substitutes those three (there is no PATH-stubbable `curl`
