@@ -5084,6 +5084,20 @@ function resultLanded(agent, cmdId, wait) {
   return true;
 }
 
+// Command kinds whose result is produced OFF the agent's beat, so it arrives a
+// beat (or more) AFTER the command is acked — NOT in the same handle_commands
+// call the sync write-back commands stage their result into. `mergePr` runs
+// `gh pr merge` on a worker thread (`_merge_pr_async`, XERK-395/550), so its
+// result LAGS the ack. For these, an ack with no result is NOT evidence of a
+// capability gap (the assumption `resultLanded` encodes for the sync kinds) —
+// the result is simply not here yet. Concluding "unsupported" on the ack beat,
+// then deleting the wait so the real (late) result can never clear it, falsely
+// marked a CURRENT host "too old to merge a PR" for UNSUPPORTED_TTL_MS (30 min),
+// throttling auto-merge to ~one PR per host per 30 min (the XERK-659 stall was
+// this, not the no-CI grace). Only a genuinely-old agent — which stages a result
+// NEVER — reaches the RESULT_WAIT_MAX_MS timeout, and only then is it a real gap.
+const ASYNC_RESULT_KINDS = new Set(["mergePr"]);
+
 // Settle every awaited command this beat acked (i.e. that has just left the
 // queue). Runs AFTER the ingests, so `next` already holds anything the beat
 // carried. A landed result also CLEARS the gap — an agent must be able to earn
@@ -5105,9 +5119,28 @@ function resolveResultWaits(prev, next, commands) {
       if (now - w.at > RESULT_WAIT_MAX_MS) delete waits[cmdId];
       continue;
     }
+    // The command has been acked (it left the queue). A landed result settles it
+    // for ANY kind — clear the gap and drop the wait.
+    if (resultLanded(next, cmdId, w)) {
+      delete next.unsupported[w.kind];
+      delete waits[cmdId];
+      continue;
+    }
+    // Acked, but no result yet.
+    if (ASYNC_RESULT_KINDS.has(w.kind)) {
+      // Its result rides a LATER beat (see ASYNC_RESULT_KINDS). Keep the wait
+      // alive so that beat's result can clear it; conclude a gap ONLY once a
+      // genuinely-old agent has stayed resultless past RESULT_WAIT_MAX_MS.
+      if (now - w.at > RESULT_WAIT_MAX_MS) {
+        next.unsupported[w.kind] = now;
+        delete waits[cmdId];
+      }
+      continue;
+    }
+    // A sync-result kind stages its result in the SAME handle_commands ack, so
+    // its absence here is positive evidence the agent doesn't implement it.
+    next.unsupported[w.kind] = now;
     delete waits[cmdId];
-    if (resultLanded(next, cmdId, w)) delete next.unsupported[w.kind];
-    else next.unsupported[w.kind] = now;
   }
 }
 
@@ -15712,6 +15745,13 @@ if (process.env.TURMA_TEST) {
     autoMergeState,
     autoClosed,
     ingestMergeResults,
+    // The capability-gap resolver and its wait TTL. Exported so a test can hold
+    // the mergePr-specific rule directly: an ACK whose async worker-thread result
+    // lands a LATER beat must NOT stamp `unsupported.mergePr` (that false gap
+    // throttled auto-merge to ~1 PR/host/30min), while a sync-result kind acked
+    // with no result still stamps at once, and a genuinely-old agent still stamps
+    // after RESULT_WAIT_MAX_MS.
+    resolveResultWaits, RESULT_WAIT_MAX_MS,
     // Triage policy + per-ticket verdict (XERK-486 [F]): the stores, the policy
     // evaluator the sweep and drain consult, the per-org rate cap, and the
     // setters the /triage-policy and /triage routes drive.

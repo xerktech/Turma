@@ -197,6 +197,7 @@ const {
   autoMergeSweep, autoCloseSweep, prAutoMergeReady, epicNoCiSeen, PR_NO_CI_GRACE_MS,
   autoStartContentGate, orgsWithAutoMerge,
   autoMergeOrgs, setAutoMergeOrg, autoMergeState, autoClosed, ingestMergeResults,
+  resolveResultWaits, RESULT_WAIT_MAX_MS,
   priorityWriteBackOrgs, setPriorityWriteBackOrg, orgsWithPriorityWriteBack,
   priorityWriteBackSweep, priorityWriteBackSkips,
   dedupeLinkOrgs, setDedupeLinkOrg, orgsWithDedupeLink,
@@ -12600,6 +12601,65 @@ test("XERK-550: ingestMergeResults caches by cmdId and is stripped from the payl
   const list = await request("GET", "/api/agents", { headers: userHeaders });
   const rec = list.body.agents.find((a) => a.key === "am11");
   assert.ok(!("mergeResults" in rec), "mergeResults leaked into /api/agents");
+});
+
+// mergePr result is produced on a worker thread (_merge_pr_async), so it lands a
+// LATER beat than the ack. resolveResultWaits must NOT read that ack-without-result
+// as a capability gap — doing so falsely marked a CURRENT host "too old to merge"
+// for UNSUPPORTED_TTL_MS, throttling auto-merge to ~1 PR/host/30min (the real cause
+// of the XERK-659 stall, not the no-CI grace).
+test("mergePr acked without a same-beat result does NOT stamp unsupported (async result lags the ack)", () => {
+  const next = {
+    agentVersion: "1.3.6",
+    unsupported: {},
+    mergeResults: {},                                        // worker hasn't finished gh yet
+    resultWaits: { c1: { kind: "mergePr", at: Date.now() } },
+  };
+  resolveResultWaits({ agentVersion: "1.3.6" }, next, []);   // c1 not in queue => acked
+  assert.equal(next.unsupported.mergePr, undefined,
+    "no gap may be concluded from a mergePr ack whose worker-thread result hasn't landed");
+  assert.ok(next.resultWaits.c1, "the wait is kept alive so a later beat's result can clear it");
+});
+
+test("mergePr wait clears with no gap once the worker-thread result lands a later beat", () => {
+  const next = {
+    agentVersion: "1.3.6",
+    unsupported: {},
+    mergeResults: {},
+    resultWaits: { c1: { kind: "mergePr", at: Date.now() } },
+  };
+  resolveResultWaits({ agentVersion: "1.3.6" }, next, []);   // ack beat: still waiting
+  assert.ok(next.resultWaits.c1);
+  ingestMergeResults(next, [{ cmdId: "c1", url: "https://github.com/o/r/pull/1", ok: true }]);
+  resolveResultWaits({ agentVersion: "1.3.6" }, next, []);   // result beat
+  assert.equal(next.unsupported.mergePr, undefined, "a landed result must not leave a gap");
+  assert.equal(next.resultWaits.c1, undefined, "the wait is settled once its result lands");
+});
+
+test("a genuinely-old agent stamps mergePr unsupported only after RESULT_WAIT_MAX_MS with no result", () => {
+  const next = {
+    agentVersion: "0.9.0",
+    unsupported: {},
+    mergeResults: {},
+    resultWaits: { c1: { kind: "mergePr", at: Date.now() - (RESULT_WAIT_MAX_MS + 1000) } },
+  };
+  resolveResultWaits({ agentVersion: "0.9.0" }, next, []);
+  assert.ok(next.unsupported.mergePr,
+    "an agent that never stages a mergePr result IS too old — concluded at the timeout");
+  assert.equal(next.resultWaits.c1, undefined);
+});
+
+test("a sync-result command acked without a result still stamps unsupported at once", () => {
+  const next = {
+    agentVersion: "0.5.38",
+    unsupported: {},
+    statusResults: {},                                       // sync kinds stage their result in the SAME ack
+    resultWaits: { s1: { kind: "setTicketStatus", at: Date.now() } },
+  };
+  resolveResultWaits({ agentVersion: "0.5.38" }, next, []);
+  assert.ok(next.unsupported.setTicketStatus,
+    "a sync-result kind's absence on the ack beat is still positive evidence of a gap");
+  assert.equal(next.resultWaits.s1, undefined);
 });
 
 test("XERK-550: auto-close moves an all-merged ticket to Done AND kills the session", async () => {
