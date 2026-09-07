@@ -38,8 +38,9 @@
 
 [CmdletBinding()]
 param(
+  # NOT a [ValidateSet]: an unknown verb must print the usage line and exit 2 (the bash ctl's
+  # behaviour) via the switch's default arm, not fail at parameter binding with a stack trace.
   [Parameter(Position = 0)]
-  [ValidateSet('start', 'stop', 'restart', 'status', 'logs', 'install', 'uninstall')]
   [string]$Command = 'status',
   # Optional trailing argument (the line count for `logs`).
   [Parameter(Position = 1)]
@@ -139,7 +140,12 @@ function Test-PidAlive([int]$ProcId) {
 function Read-Pid {
   if (Test-Path -LiteralPath $PidFile) {
     $raw = (Get-Content -LiteralPath $PidFile -Raw -ErrorAction SilentlyContinue)
-    if ($raw -match '\d+') { return [int]$Matches[0] }
+    if ($raw -and ($raw -match '\d+')) {
+      # TryParse so a corrupt/oversize value (> Int32, tampered pidfile) degrades to "no pid"
+      # instead of throwing an Int32-overflow error on a status/stop.
+      $n = 0
+      if ([int]::TryParse($Matches[0], [ref]$n)) { return $n }
+    }
   }
   return 0
 }
@@ -180,8 +186,14 @@ function Stop-ControlPlane {
   Stop-ByCommandLine @($Launcher, '-TunnelSupervisor')   # supervisor FIRST
   Stop-ByCommandLine @($Tunnel)                          # then the tunnel
   Stop-ByCommandLine @($Manager)                         # then the manager
+  # Guard the destructive pidfile kill with the SAME command-line check status/start use
+  # (Test-PidAlive). On Windows a pid is reused fast, and a stale pidfile left by a CRASHED
+  # launcher (a clean stop/restart removes it) can point at an innocent process — worst case
+  # a pty-host, whose death would destroy the very session this reap must preserve. So kill
+  # only a pid we can still confirm is our launcher; drop the (stale/foreign) pidfile
+  # regardless so a fresh start is not blocked by it.
   $pidNum = Read-Pid
-  if ($pidNum -gt 0) {
+  if (Test-PidAlive $pidNum) {
     $p = Get-Process -Id $pidNum -ErrorAction SilentlyContinue
     if ($p) { try { $p.Kill() } catch { } }
   }
@@ -270,8 +282,11 @@ function Invoke-Logs([string]$LogArg) {
   # Follow the launcher's log (both the service and the fallback write here; WinSW's
   # <log> is pointed at the same file by turma-agent.xml). No file yet -> say so rather
   # than error, then wait for it to appear.
+  # -Wait THROWS on a not-yet-existent file rather than waiting for it, so return after the
+  # notice instead of erroring. Only reachable before the first start (start creates the log).
   if (-not (Test-Path -LiteralPath $Log)) {
     Log "no log yet at $Log (has the agent started?)"
+    return
   }
   Get-Content -LiteralPath $Log -Tail $n -Wait
 }

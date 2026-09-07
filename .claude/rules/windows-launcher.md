@@ -148,7 +148,14 @@ pidfile). Commands mirror the bash ctl: `start|stop|restart|status|logs`, plus t
 - **What the installer child owns, not this task**: bundling WinSW.exe (as `<service>.exe` beside the
   xml), the winget/npm provisioning, the service account, and laying these files down. The xml carries
   `%BASE%`/account placeholders the installer substitutes.
+- **The pidfile kill is GUARDED by the same command-line check `status`/`start` use**
+  (`Test-PidAlive`) — a crashed launcher leaves its pidfile, and a fast-reused pid could name an
+  innocent process (worst case a pty-host); `Stop-ControlPlane` kills only a pid it can confirm is the
+  launcher, and clears the stale pidfile regardless. `Read-Pid` `TryParse`s so a corrupt/oversize
+  value degrades to "no pid" instead of throwing on a status/stop.
 - Tests: `agent/tests/test_turma_agentctl_ps1.ps1` (PowerShell-on-POSIX, the `test_turma_agentctl.sh`
-  port) — the `~/.turma` fallback + the runtime-dir trap, the status/stop pidfile round-trip, and the
-  session-preserving stop/restart (control plane reaped, pty-host left alive, no doubled manager).
-  Static analysis: the same PSScriptAnalyzer gate as the launcher. Both in `code-scan.yml`.
+  port) — the `~/.turma` fallback + the runtime-dir trap, the status/stop pidfile round-trip, the
+  session-preserving stop/restart (control plane reaped, pty-host left alive, no doubled manager, the
+  supervisor actually reaped so a respawning-supervisor fixture's tunnel stays dead), and the
+  stale/foreign-pidfile guard (an innocent reused pid survives stop). Static analysis: the same
+  PSScriptAnalyzer gate as the launcher. Both in `code-scan.yml`.

@@ -16,15 +16,20 @@
 #   2. status/stop round-trip through the fallback pidfile (the property the bug destroyed:
 #      an unreadable pid made stop a no-op that orphaned the manager);
 #   3. a USABLE TURMA_RUNTIME_DIR is still honoured (the fix rescues the broken case only);
-#   4. SESSION-PRESERVING stop — the control plane (launcher/manager/tunnel/supervisor) is
-#      reaped while a detached pty-host is LEFT ALIVE (the KillMode=process guarantee);
+#   4. SESSION-PRESERVING stop — the control plane is reaped, a detached pty-host is LEFT ALIVE
+#      (KillMode=process), and the tunnel STAYS dead because the supervisor is actually reaped
+#      and not left respawning it (the strict supervisor-before-tunnel ordering is inspection-
+#      verified — it reuses the launcher's Stop-ByCommandLine order);
 #   5. SESSION-PRESERVING restart — same, and it leaves exactly ONE fresh launcher (no
-#      doubled manager) with the pty-host still alive.
+#      doubled manager) with the pty-host still alive;
+#   6. a STALE/FOREIGN pidfile is not blindly killed — a recorded pid whose command line is
+#      not our launcher (a crashed launcher's pid reused by an innocent process — worst case a
+#      pty-host) SURVIVES stop, and the stale pidfile is cleared.
 #
 # Like the launcher suite, the REAL controller runs; only the launcher it starts is stubbed
-# (by a stub turma-agent.ps1 that backgrounds faux control-plane + pty-host processes with
-# the command lines the reap keys on, then sleeps). PowerShell-on-POSIX, run on the same
-# ubuntu-latest runner.
+# (by a stub turma-agent.ps1 that backgrounds a faux MANAGER, a faux PTY-HOST, and a faux
+# tunnel SUPERVISOR that MAINTAINS a faux tunnel — respawning it when gone, so the reap
+# ORDER is a real property). PowerShell-on-POSIX, run on the same ubuntu-latest runner.
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -56,25 +61,33 @@ $Tunnel  = Join-Path $Prefix 'tunnel-agent.js'
 $PtyHost = Join-Path $Prefix 'pty-host.mjs'          # deliberately NOT a reap needle
 $StubLauncherPath = Join-Path $Bin 'turma-agent.ps1'
 
-# Stub launcher: backgrounds four faux long-lived processes whose command lines carry the
-# exact needles the ctl reaps on — a tunnel SUPERVISOR (launcher path + -TunnelSupervisor),
-# the TUNNEL (tunnel-agent.js), the MANAGER (hub-agent.py) and a PTY-HOST (pty-host.mjs, no
-# needle) — then sleeps so the ctl's recorded pid stays alive to be found and killed. The
-# fauxes are independent processes, so killing this stub does not cascade to them: the
-# pty-host survives a control-plane reap exactly as a detached pty-host survives on a real
-# host.
+# Stub launcher: backgrounds a faux MANAGER (hub-agent.py) and PTY-HOST (pty-host.mjs, no
+# needle), then a faux tunnel SUPERVISOR whose command line carries the launcher path +
+# -TunnelSupervisor (the ctl's supervisor needle) and which MAINTAINS a faux tunnel
+# (tunnel-agent.js) — spawning it and RESPAWNING it whenever it disappears, every ~40ms. That
+# respawn is what makes the reap ORDER a real property: reap the supervisor first and a killed
+# tunnel stays dead; reap it after the tunnel and the still-alive supervisor brings the tunnel
+# back. The tunnel path is passed to the supervisor via ENV so it never appears in the
+# supervisor's own command line (which would make the tunnel COUNT include the supervisor).
+# The fauxes are independent processes, so killing this stub does not cascade to them: a
+# pty-host survives a control-plane reap exactly as a detached pty-host does on a real host.
 $stubBody = @'
 Set-StrictMode -Version Latest
 $SelfDir = Split-Path -Parent $PSCommandPath
 $Prefix  = Split-Path -Parent $SelfDir
 $me      = (Get-Process -Id $PID).Path
-function Faux([string]$needle) {
-  Start-Process -FilePath $me -ArgumentList @('-NoProfile','-Command',"Start-Sleep -Seconds 300 # $needle") | Out-Null
-}
-Faux ((Join-Path $SelfDir 'turma-agent.ps1') + ' -TunnelSupervisor')
-Faux (Join-Path $Prefix 'tunnel-agent.js')
-Faux (Join-Path $Prefix 'hub-agent.py')
-Faux (Join-Path $Prefix 'pty-host.mjs')
+$launcher = Join-Path $SelfDir 'turma-agent.ps1'
+$env:FAUX_PWSH   = $me
+$env:FAUX_TUNNEL = (Join-Path $Prefix 'tunnel-agent.js')
+Start-Process -FilePath $me -ArgumentList @('-NoProfile','-Command',"Start-Sleep -Seconds 300 # $(Join-Path $Prefix 'hub-agent.py')") | Out-Null
+Start-Process -FilePath $me -ArgumentList @('-NoProfile','-Command',"Start-Sleep -Seconds 300 # $(Join-Path $Prefix 'pty-host.mjs')") | Out-Null
+# The supervisor -Command is ONE LINE with NO double-quotes: a multi-line ArgumentList element
+# does not round-trip through Start-Process on Linux (newlines mangled), and a nested double
+# quote breaks the child's argv reconstruction — so the tunnel-spawn string is single-quote
+# concatenation. The needle rides a harmless string literal ($null='...'), not a trailing '#'
+# comment (which would comment out the loop).
+$supCmd = "`$null='$launcher -TunnelSupervisor'; `$t=`$env:FAUX_TUNNEL; `$m=`$env:FAUX_PWSH; while(`$true){ `$alive=@(Get-Process -ErrorAction SilentlyContinue | Where-Object { `$cl=`$null; try{`$cl=`$_.CommandLine}catch{}; `$cl -and `$cl.Contains(`$t) -and (-not `$cl.Contains('-TunnelSupervisor')) }); if(`$alive.Count -eq 0){ Start-Process -FilePath `$m -ArgumentList @('-NoProfile','-Command',('Start-Sleep -Seconds 300 # ' + `$t)) | Out-Null }; Start-Sleep -Milliseconds 40 }"
+Start-Process -FilePath $me -ArgumentList @('-NoProfile','-Command',$supCmd) | Out-Null
 Start-Sleep -Seconds 300
 '@
 Set-Content -LiteralPath $StubLauncherPath -Value $stubBody
@@ -100,7 +113,8 @@ function Get-ByNeedle([string[]]$Needles) {
 function Count-Faux([string[]]$Needles) { @(Get-ByNeedle $Needles).Count }
 
 # Reap every fixture process (anything whose command line names $Work), between and after
-# cases, so a leftover cannot bleed into the next assertion.
+# cases, so a leftover cannot bleed into the next assertion. The respawning supervisor is
+# killed in the same pass, so once it is gone no tunnel comes back and the loop converges.
 function Reset-Fixture {
   for ($i = 0; $i -lt 40; $i++) {
     $procs = @(Get-ByNeedle @($Work))
@@ -134,7 +148,7 @@ function Set-BaseEnv {
   Remove-Item env:TURMA_SERVICE_NAME  -ErrorAction SilentlyContinue
 }
 
-$TurmaDir  = Join-Path $Home_ '.turma'
+$TurmaDir   = Join-Path $Home_ '.turma'
 $PidInTurma = Join-Path $TurmaDir 'turma-agent.pid'
 
 try {
@@ -157,7 +171,6 @@ try {
 
   # --- Case 2: status/stop round-trip through the fallback pidfile -----------------------
   Note "case: status/stop round-trip through the fallback pidfile"
-  # The launcher stub must have come up (its faux manager is the proof).
   if (Wait-For { (Count-Faux @($Manager)) -ge 1 }) { Ok "launcher stub came up (manager present)" }
   else { Fail "launcher stub never started its faux manager" }
   $mpid = 0
@@ -180,23 +193,29 @@ try {
   else { Fail "pidfile did not land in the usable runtime dir: $(Get-Content (Join-Path $Work 'start3.log') -Raw -ErrorAction SilentlyContinue)" }
   Invoke-Ctl 'stop' (Join-Path $Work 'stop3.log') | Out-Null
 
-  # --- Case 4: session-preserving stop — control plane reaped, pty-host left alive -------
-  Note "case: stop reaps the control plane but leaves the pty-host (sessions) alive"
+  # --- Case 4: session-preserving stop + reap order --------------------------------------
+  Note "case: stop reaps the control plane, leaves the pty-host, and the tunnel stays dead"
   Reset-Fixture
   Set-BaseEnv
   Invoke-Ctl 'start' (Join-Path $Work 'start4.log') | Out-Null
-  # Wait for the whole faux control plane + pty-host to be up.
-  if (Wait-For { (Count-Faux @($Manager)) -ge 1 -and (Count-Faux @($Tunnel)) -ge 1 -and (Count-Faux @($Work,'-TunnelSupervisor')) -ge 1 -and (Count-Faux @($PtyHost)) -ge 1 }) {
-    Ok "control plane + pty-host all up before stop"
+  if (Wait-For { (Count-Faux @($Manager)) -ge 1 -and (Count-Faux @($Tunnel)) -ge 1 -and (Count-Faux @($Work, '-TunnelSupervisor')) -ge 1 -and (Count-Faux @($PtyHost)) -ge 1 }) {
+    Ok "control plane (manager+tunnel+supervisor) + pty-host all up before stop"
   }
   else { Fail "not all faux processes came up (mgr=$(Count-Faux @($Manager)) tun=$(Count-Faux @($Tunnel)) sup=$(Count-Faux @($Work,'-TunnelSupervisor')) pty=$(Count-Faux @($PtyHost)))" }
   Invoke-Ctl 'stop' (Join-Path $Work 'stop4.log') | Out-Null
-  if (Wait-For { (Count-Faux @($Manager)) -eq 0 -and (Count-Faux @($Tunnel)) -eq 0 -and (Count-Faux @($Work,'-TunnelSupervisor')) -eq 0 }) {
-    Ok "stop reaped the launcher, manager, tunnel and supervisor"
+  if (Wait-For { (Count-Faux @($Manager)) -eq 0 -and (Count-Faux @($Work, '-TunnelSupervisor')) -eq 0 }) {
+    Ok "stop reaped the manager and the supervisor"
   }
-  else { Fail "control plane survived stop (mgr=$(Count-Faux @($Manager)) tun=$(Count-Faux @($Tunnel)) sup=$(Count-Faux @($Work,'-TunnelSupervisor')))" }
-  # Settle, then the pty-host must STILL be alive — the KillMode=process guarantee.
-  Start-Sleep -Milliseconds 400
+  else { Fail "control plane survived stop (mgr=$(Count-Faux @($Manager)) sup=$(Count-Faux @($Work,'-TunnelSupervisor')))" }
+  # Settle well past the supervisor's 40ms respawn tick: the tunnel STAYS dead only because the
+  # supervisor was reaped and is not left alive respawning it (a supervisor still running after
+  # stop would bring the tunnel back within one tick — a leaked control-plane process). And the
+  # pty-host is still alive — the KillMode=process guarantee. (The strict supervisor-BEFORE-
+  # tunnel ordering within the adjacent control-plane reap is inspection-verified; it reuses the
+  # launcher's own Stop-ByCommandLine order. This case proves the stronger no-respawn property.)
+  Start-Sleep -Milliseconds 700
+  if ((Count-Faux @($Tunnel)) -eq 0) { Ok "the tunnel stayed dead — the supervisor was reaped, not left respawning it" }
+  else { Fail "the tunnel was respawned after stop — the supervisor was left alive (a leaked control-plane process)" }
   if ((Count-Faux @($PtyHost)) -ge 1) { Ok "the pty-host survived stop (the session is preserved)" }
   else { Fail "stop killed the pty-host — a running session would have been destroyed" }
 
@@ -211,7 +230,6 @@ try {
   $launcherBefore = 0
   if (Test-Path -LiteralPath $PidInTurma) { $launcherBefore = [int]((Get-Content -LiteralPath $PidInTurma -Raw) -replace '\D', '') }
   Invoke-Ctl 'restart' (Join-Path $Work 'restart5.log') | Out-Null
-  # A fresh launcher pid is recorded, different from the old one.
   if (Wait-For { (Test-Path -LiteralPath $PidInTurma) -and ([int]((Get-Content -LiteralPath $PidInTurma -Raw) -replace '\D','') -ne $launcherBefore) -and (Count-Faux @($Manager)) -ge 1 }) {
     Ok "restart recorded a fresh launcher and a new manager came up"
   }
@@ -221,10 +239,30 @@ try {
   $mgrCount = Count-Faux @($Manager)
   if ($mgrCount -eq 1) { Ok "exactly one manager after restart (no doubled manager)" }
   else { Fail "expected 1 manager after restart, found $mgrCount (a doubled manager double-heartbeats)" }
-  # The pre-restart pty-host is still alive — restart is manager-only.
   if (Get-Process -Id $ptyPidBefore -ErrorAction SilentlyContinue) { Ok "the pre-restart pty-host survived (restart is manager-only)" }
   else { Fail "restart killed the running pty-host" }
   Invoke-Ctl 'stop' (Join-Path $Work 'stop5.log') | Out-Null
+
+  # --- Case 6: a stale/foreign pidfile is not blindly killed ----------------------------
+  # A crashed launcher leaves its pidfile behind; on Windows that pid is reused fast, so the
+  # recorded pid can end up naming an INNOCENT process — worst case a pty-host, killing which
+  # would destroy a live session. stop must not kill a pid whose command line is not our
+  # launcher (the guard status/start already apply), and must still clear the stale pidfile.
+  Note "case: a stale/foreign pidfile is not blindly killed by stop"
+  Reset-Fixture
+  Set-BaseEnv
+  New-Item -ItemType Directory -Force -Path $TurmaDir | Out-Null
+  # An innocent long-lived process WITHOUT 'turma-agent.ps1' in its command line, tracked so
+  # we can clean it up (it is not under $Work, so Reset-Fixture leaves it alone).
+  $innocent = Start-Process -FilePath $PwshExe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 300 # innocent-bystander') -PassThru
+  Set-Content -LiteralPath $PidInTurma -Value ([string]$innocent.Id)
+  Invoke-Ctl 'stop' (Join-Path $Work 'stop6.log') | Out-Null
+  Start-Sleep -Milliseconds 300
+  if (Get-Process -Id $innocent.Id -ErrorAction SilentlyContinue) { Ok "the innocent process (reused pid) survived stop" }
+  else { Fail "stop killed an innocent process whose pid a stale pidfile named — a pty-host here loses a session" }
+  if (-not (Test-Path -LiteralPath $PidInTurma)) { Ok "stop cleared the stale pidfile" }
+  else { Fail "stop left the stale pidfile in place (a fresh start would read it as running)" }
+  try { $innocent.Kill() } catch { }
 }
 finally {
   Reset-Fixture
