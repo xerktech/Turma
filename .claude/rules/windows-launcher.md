@@ -2,6 +2,7 @@
 paths:
   - "agent/native/windows/**"
   - "agent/tests/test_turma_agent_ps1.ps1"
+  - "agent/tests/test_turma_agentctl_ps1.ps1"
 ---
 
 # `agent/native/windows/` — native (no-WSL) Windows shell layer
@@ -11,6 +12,9 @@ rationale (D1-D5, the terminal spike, open questions) are in `docs/windows-agent
 it for *why*; this file is the rules. The shared runtime (`hub-agent.py`, `tunnel-agent.js`) stays
 ONE cross-platform codebase (ADR D5); nothing here forks it. The `hub-agent.py` half of the
 Windows port (paths, `%APPDATA%`, icacls, liveness/degradation — XERK-670) is `windows-agent.md`.
+
+This file covers the LAUNCHER (`turma-agent.ps1`, XERK-669) and the SERVICE + CONTROL SURFACE
+(`turma-agent.xml` + `turma-agentctl.ps1`, XERK-671).
 
 ## `turma-agent.ps1` — the launcher (XERK-669)
 
@@ -99,3 +103,52 @@ pass. This launcher exports the correct pid regardless.
 - **`hub-agent.py`'s `SIGUSR1` handler + other Unix seams** (tmux CLI, `os.setsid`, `/proc`) are the
   `IS_WINDOWS` dispatch in `windows-agent.md` (XERK-670) and the `TerminalBackend` seam (XERK-668);
   the launcher does not touch the shared runtime.
+
+## `turma-agent.xml` + `turma-agentctl.ps1` — service + control surface (XERK-671)
+
+The Windows equivalent of BOTH the systemd user unit AND the bash `turma-agentctl` nohup fallback
+(ADR D2). `turma-agent.xml` is the WinSW descriptor (the systemd-unit analog); `turma-agentctl.ps1`
+is the control surface that drives the WinSW SERVICE when installed and a pidfile-managed BACKGROUND
+launcher when not — the two-scope shape of the bash `restart_manager`, collapsed to (service /
+pidfile). Commands mirror the bash ctl: `start|stop|restart|status|logs`, plus thin WinSW
+`install|uninstall` wrappers for the installer child to call.
+
+- **Session-preserving restart is the KillMode=process guarantee, and it reaps the CONTROL PLANE
+  only** — the launcher, the manager (`hub-agent.py`), the tunnel + its supervisor — NEVER the
+  detached per-session pty-hosts, which survive and are re-adopted on boot (`resume_on_boot`,
+  XERK-668). Service path: WinSW restarts the launcher and the pty-hosts' job-object breakaway (ADR
+  D2, host-verified) keeps them alive. Pidfile path: reap by command line and simply never name a
+  pty-host (`pty-host.mjs` is not a reap needle).
+- **A Windows restart MUST reap the MANAGER, unlike the bash restart.** Bash exec's the launcher
+  INTO the manager, so `kill <manager-pid>` is the whole restart; on Windows launcher ≠ manager (the
+  launcher `Start-Process`es `python hub-agent.py` as a child and `WaitForExit`s it), so killing only
+  the launcher pid leaves the python manager running and the fresh launcher starts a SECOND — two
+  managers double-heartbeating. `Stop-ControlPlane` reaps the manager by command line for this reason.
+- **The supervisor is reaped BEFORE the tunnel** (`Stop-ControlPlane` order), the same ordering the
+  launcher uses on every start — else the just-killed tunnel is respawned by its own supervisor.
+- **The pidfile lives in a Windows-CORRECT per-user location — `%USERPROFILE%\.turma`, NOT `%TEMP%`.**
+  This is the Windows twin of the bash ctl guarding against the never-created `/run/user/<uid>`: a
+  Session-0 service identity and the interactive user can resolve `%TEMP%` DIFFERENTLY (and it gets
+  swept), so a pidfile the writer and reader disagree on — or one whose write silently fails — lets
+  stop/restart miss the pid they must kill and orphan-then-DOUBLE the manager. `Resolve-RunDir`
+  prefers a set-AND-usable `TURMA_RUNTIME_DIR` (writability probed, not just `${VAR:-default}`,
+  which the bash bug taught does not catch a set-but-unusable value) and falls back to the durable
+  `~/.turma`. The pidfile only governs the FALLBACK path; the service path uses machine-global service
+  state (`Get-Service`), which no identity divergence touches.
+- **`Get-Service` is undefined on Linux pwsh (and throws for a not-installed service)** — caught, so
+  `Test-ServiceMode` is false and every command takes the fallback path. This is what lets the POSIX
+  test drive the fallback, the same way the bash suite runs with no systemd; the WinSW service path is
+  host-verified only.
+- **The manager NEVER calls `turma-agentctl.ps1` on Windows.** `_perform_restart` treats `IS_WINDOWS`
+  as supervised and exits cleanly for WinSW to restart the launcher (XERK-675, `windows-agent.md`);
+  only a bash nohup install self-relaunches through the ctl script. So the ctl is operator- and
+  installer-facing only.
+- **`start` does NOT also spin up an auto-update poller** (the bash ctl does) — the Windows updater is
+  a later epic child; noted in the source where it wires in.
+- **What the installer child owns, not this task**: bundling WinSW.exe (as `<service>.exe` beside the
+  xml), the winget/npm provisioning, the service account, and laying these files down. The xml carries
+  `%BASE%`/account placeholders the installer substitutes.
+- Tests: `agent/tests/test_turma_agentctl_ps1.ps1` (PowerShell-on-POSIX, the `test_turma_agentctl.sh`
+  port) — the `~/.turma` fallback + the runtime-dir trap, the status/stop pidfile round-trip, and the
+  session-preserving stop/restart (control plane reaped, pty-host left alive, no doubled manager).
+  Static analysis: the same PSScriptAnalyzer gate as the launcher. Both in `code-scan.yml`.

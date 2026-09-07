@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WinSW service descriptor for the native (no-WSL) Windows Turma agent (XERK-671, epic
+  XERK-666; ADR D2 in docs/windows-agent-adr.md). The 1:1 Windows map of
+  agent/native/turma-agent.service (the systemd user unit):
+
+    systemd unit                         this descriptor
+    ....................................................................
+    Type=exec, ExecStart=turma-agent     <executable>pwsh</executable> + turma-agent.ps1
+    Restart=always / RestartSec=5        <onfailure action="restart" delay="5 sec"/>
+    WantedBy=default.target (boot)       <startmode>Automatic</startmode> (Session 0)
+    EnvironmentFile=-.../turma-agent.env (the LAUNCHER parses it — see below)
+    KillMode=process                     see "Session-preserving restart" below
+
+  WinSW convention: this file is turma-agent.xml and the WinSW binary sits beside it renamed
+  turma-agent.exe; `turma-agent.exe install` registers the Windows service. The INSTALLER
+  child (XERK, "Blocks: installer") bundles WinSW.exe and lays this file down, substituting
+  %BASE% / the service account; turma-agentctl.ps1 install|uninstall drives it.
+
+  Run WITHOUT an interactive login = Session 0 (the systemd-lingering equivalent), so the
+  agent survives logout and starts at boot. The service MUST run as the OPERATOR user, not
+  LocalSystem: Remote Control reads that user's ~/.claude subscription login, and the
+  pty-hosts write under their profile. The installer sets <serviceaccount>; a gMSA or the
+  interactive user both work. (Left unset here so the descriptor is account-agnostic.)
+-->
+<service>
+  <id>turma-agent</id>
+  <name>Turma per-host agent</name>
+  <description>Turma per-host agent: multiplexes worktree-backed Claude Code sessions and heartbeats the hub.</description>
+
+  <!--
+    pwsh is resolved from PATH by WinSW; the installer pins the absolute path if a Session-0
+    PATH cannot see it. The launcher does the rest (config validate/idle, PATH for claude,
+    tunnel supervision, manager start) exactly as under systemd — nothing service-specific
+    lives in the launcher.
+  -->
+  <executable>pwsh</executable>
+  <arguments>-NoProfile -File "%BASE%\bin\turma-agent.ps1"</arguments>
+
+  <!--
+    The launcher PARSES turma-agent.env itself (it does not source it, and a bad config
+    IDLES rather than exits so WinSW never sees a crash-loop) — so, unlike systemd's
+    EnvironmentFile, WinSW does not read it. TURMA_AGENT_ENV points the launcher (and the
+    manager's token-roll rewrite, XERK-578) at the right file; the installer sets it to the
+    %APPDATA%\turma-agent\turma-agent.env known-folder path (ADR D4).
+  -->
+  <env name="TURMA_AGENT_ENV" value="%BASE%\..\turma-agent.env" />
+
+  <!-- Start at boot, before an interactive login (Session 0). -->
+  <startmode>Automatic</startmode>
+
+  <!--
+    Restart=always / RestartSec=5. onfailure fires when the launcher EXITS non-zero (a real
+    crash) OR exits zero for a token-roll restart (hub-agent.py's _perform_restart exits
+    cleanly and the launcher relays that code — XERK-675), so WinSW brings a fresh manager
+    back on the rolled token. Capped restarts stop a genuinely-broken install from hot-
+    looping; a config fault never gets here because the launcher idles instead of exiting.
+  -->
+  <onfailure action="restart" delay="5 sec" />
+  <resetfailure>1 hour</resetfailure>
+
+  <!--
+    Session-preserving restart = the KillMode=process guarantee. On stop/restart WinSW ends
+    the launcher (and with it the manager + tunnel it started), but the per-session PTY-HOSTS
+    are spawned DETACHED / broken out of the service job object (ADR D2's
+    CREATE_BREAKAWAY_FROM_JOB), so they OUTLIVE the restart and the fresh manager re-adopts
+    them from the persisted {pid,termPort,ctrlPort} (resume_on_boot). stopparentprocessfirst
+    ends the launcher before its children so a dying supervisor cannot respawn the tunnel
+    (the reap-supervisor-before-tunnel ordering). The job-object breakaway is the ADR's
+    host-verified open question — the Linux terminal backend cannot exercise it; if a future
+    WinSW defeats the breakaway, this is the one knob to revisit.
+  -->
+  <stopparentprocessfirst>true</stopparentprocessfirst>
+  <stoptimeout>15 sec</stoptimeout>
+
+  <!--
+    WinSW writes the launcher's stdout/stderr here; turma-agentctl.ps1 logs tails the same
+    ~/.turma\agent.log the pidfile fallback writes, so `turma-agentctl logs` is identical
+    whichever supervisor is in play. roll-by-size keeps the file bounded without cron.
+  -->
+  <logpath>%USERPROFILE%\.turma</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>4</keepFiles>
+  </log>
+</service>

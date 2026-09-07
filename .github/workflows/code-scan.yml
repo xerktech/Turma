@@ -289,7 +289,13 @@ jobs:
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
           $settings = 'agent/native/windows/PSScriptAnalyzerSettings.psd1'
           $fail = 0
-          foreach ($f in @('agent/native/windows/turma-agent.ps1','agent/tests/test_turma_agent_ps1.ps1')) {
+          $files = @(
+            'agent/native/windows/turma-agent.ps1',
+            'agent/native/windows/turma-agentctl.ps1',
+            'agent/tests/test_turma_agent_ps1.ps1',
+            'agent/tests/test_turma_agentctl_ps1.ps1'
+          )
+          foreach ($f in $files) {
             $r = Invoke-ScriptAnalyzer -Path $f -Settings $settings -Severity Warning,Error
             if ($r) { Write-Host "::error::$f"; $r | Format-Table RuleName,Severity,Line,Message -AutoSize | Out-String | Write-Host; $fail = 1 }
             else { Write-Host "${f}: clean" }
@@ -298,3 +304,13 @@ jobs:
       - name: Native Windows launcher tests (agent/native/windows/turma-agent.ps1)
         shell: pwsh
         run: ./agent/tests/test_turma_agent_ps1.ps1
+      # The native WINDOWS controller (agent/native/windows/turma-agentctl.ps1, XERK-671)
+      # is the port of the bash turma-agentctl — the systemd unit + nohup fallback in one.
+      # Its failure is silent and destructive: a pidfile in the wrong place, or a stop that
+      # reaps a session's pty-host, orphans-then-doubles the manager or destroys running
+      # sessions. Covers the ~/.turma pidfile fallback (the /run/user trap), the status/stop
+      # round-trip, and the session-preserving stop/restart (control plane reaped, pty-host
+      # left alive). PowerShell-on-POSIX; the WinSW service path stays host proof.
+      - name: Native Windows controller tests (agent/native/windows/turma-agentctl.ps1)
+        shell: pwsh
+        run: ./agent/tests/test_turma_agentctl_ps1.ps1
