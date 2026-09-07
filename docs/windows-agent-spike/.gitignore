@@ -1,0 +1,4 @@
+node_modules/
+pty-host.state.json
+pty-host.log
+evidence.txt

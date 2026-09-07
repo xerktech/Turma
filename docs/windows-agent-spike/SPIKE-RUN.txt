@@ -1,0 +1,31 @@
+node v24.13.0 · platform linux/x64 · node-pty backend = forkpty
+
+[1] SPAWN — persistent pty-host, detached (survives manager exit)
+  [PASS] pty-host published state with loopback ports — pid=151780 term=38607 ctrl=44515
+  [PASS] pty-host pid is alive
+
+[2] ATTACH — ttyd-`tty` ws client A drives the pty
+  [PASS] negotiated ttyd 'tty' subprotocol — got 'tty'
+  [PASS] client A sees its own command output over the ws
+
+[3] DETACH — close client A; pty must keep running
+  [PASS] pty still alive after the only client detached — ptyPid=151787
+
+[4] REATTACH — new client B gets scrollback replay + live I/O
+  [PASS] client B receives the pre-detach scrollback on connect
+  [PASS] client B has live I/O after reattach
+
+[5] CONTROL — inject/capture/liveness without the terminal ws
+  [PASS] inject accepted (send-keys analog)
+  [PASS] capture returns injected output (capture-pane analog)
+  [PASS] injected input also reaches the live terminal (one shared pty)
+
+[6] ADOPT — a fresh manager re-adopts from the state file alone
+  [PASS] surviving host discoverable by persisted pid+port only
+  [PASS] re-adopted host still holds prior scrollback
+  [PASS] re-adopted terminal has live I/O
+
+[7] TEARDOWN — explicit kill stops the pty and the host exits
+  [PASS] host process exited after kill
+
+RESULT: 14/14 checks passed
