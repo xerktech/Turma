@@ -238,12 +238,33 @@ function Ensure-WinSW {
 # File lay-down — the shared runtime beside hub-agent.py, the pty layer, the Windows
 # shell scripts, VERSION. Pure file ops, so it runs on any OS (drives the POSIX suite).
 # =====================================================================================
-function Copy-Tree([string]$SrcDir, [string]$DstDir) {
-  New-Item -ItemType Directory -Force -Path $DstDir -ErrorAction SilentlyContinue | Out-Null
-  # Copy the directory's CONTENTS into $DstDir (a fresh destination, so remove first for a
-  # clean idempotent re-lay — a payload that stops shipping a file must not leave a stale one).
+# Re-lay $SrcDir onto $DstDir: remove the destination first for a CLEAN copy (a payload
+# that stops shipping a file must not leave a stale one), but PRESERVE any subdirs named in
+# $Preserve across the wipe — used to carry a built win\node_modules over a source re-lay
+# (the source tree has no node_modules, so a naive wipe would destroy the pty deps and,
+# under -NoInstallDeps, never rebuild them — a caught defect). Stashed to a SIBLING dir so
+# the move stays on one volume (an atomic rename), then restored into the fresh destination.
+function Copy-Tree([string]$SrcDir, [string]$DstDir, [string[]]$Preserve = @()) {
+  $stashRoot = $null
+  foreach ($name in $Preserve) {
+    $p = Join-Path $DstDir $name
+    if (Test-Path -LiteralPath $p) {
+      if (-not $stashRoot) {
+        $stashRoot = Join-Path (Split-Path -Parent $DstDir) (".turma-preserve-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $stashRoot -ErrorAction SilentlyContinue | Out-Null
+      }
+      Move-Item -LiteralPath $p -Destination (Join-Path $stashRoot $name)
+    }
+  }
   if (Test-Path -LiteralPath $DstDir) { Remove-Item -Recurse -Force -LiteralPath $DstDir -ErrorAction SilentlyContinue }
   Copy-Item -Recurse -Force -LiteralPath $SrcDir -Destination $DstDir
+  if ($stashRoot) {
+    foreach ($name in $Preserve) {
+      $stashed = Join-Path $stashRoot $name
+      if (Test-Path -LiteralPath $stashed) { Move-Item -LiteralPath $stashed -Destination (Join-Path $DstDir $name) }
+    }
+    Remove-Item -Recurse -Force -LiteralPath $stashRoot -ErrorAction SilentlyContinue
+  }
 }
 
 function Install-Files {
@@ -268,7 +289,9 @@ function Install-Files {
   # win/ — the ConPTY pty-host terminal layer (ADR D1), laid beside hub-agent.py so the
   # manager resolves <base>\win\pty-host.mjs (node_modules populated by Ensure-PtyLayer).
   $winSrcDir = Join-Path $RuntimeSrc 'win'
-  if (Test-Path -LiteralPath $winSrcDir) { Copy-Tree $winSrcDir (Join-Path $Prefix 'win') }
+  # PRESERVE a built node_modules across the re-lay: the source has none, so a plain wipe
+  # would destroy the pty deps and — under -NoInstallDeps — never rebuild them (QA finding).
+  if (Test-Path -LiteralPath $winSrcDir) { Copy-Tree $winSrcDir (Join-Path $Prefix 'win') @('node_modules') }
   else { Warn "source dir missing: $winSrcDir (the Windows terminal layer)" }
 
   # The Windows shell scripts into bin\ (the launcher + controller; the xml is rendered by

@@ -126,6 +126,25 @@ try {
   if (Get-Content -LiteralPath $Cfg | Where-Object { $_ -eq 'TURMA_TOKEN=SECRET123' }) { Ok "the edited config was preserved, not overwritten" }
   else { Fail "re-run overwrote the operator's config" }
 
+  # --- Case 4b: a re-run PRESERVES a built win\node_modules (the pty deps) ---------------
+  # The win/ source has no node_modules; a naive re-lay wiped it and -NoInstallDeps never
+  # rebuilt it, breaking the browser terminal on Windows (a caught defect). Seed what a real
+  # Windows deps run produces, re-run under -NoInstallDeps, assert it survives AND a stale
+  # source file that was removed is still dropped (the clean-relay property must not regress).
+  Note "case: a -NoInstallDeps re-run preserves the built pty node_modules"
+  $ptyMarker = Join-Path $Prefix 'win/node_modules/node-pty/index.js'
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ptyMarker) | Out-Null
+  Set-Content -LiteralPath $ptyMarker -Value 'built-native-addon'
+  $stale = Join-Path $Prefix 'win/STALE_SOURCE_FILE.txt'   # not in the source tree
+  Set-Content -LiteralPath $stale -Value 'x'
+  $c4b = Invoke-Install '-NoInstallDeps' (Join-Path $Work 'install3.log')
+  if ($c4b.ExitCode -eq 0) { Ok "re-run exited 0" } else { Fail "re-run exited $($c4b.ExitCode)" }
+  if ((Test-Path -LiteralPath $ptyMarker) -and ((Get-Content -LiteralPath $ptyMarker -Raw) -match 'built-native-addon')) {
+    Ok "the built win\node_modules survived the re-lay"
+  } else { Fail "re-run destroyed the built win\node_modules (the pty layer)" }
+  if (-not (Test-Path -LiteralPath $stale)) { Ok "a stale win\ source file was still dropped (clean re-lay intact)" }
+  else { Fail "re-run left a stale win\ source file behind" }
+
   # --- Case 5: -Verify reports laid files ok and a removed one MISSING -------------------
   Note "case: -Verify reports presence per file"
   $vlog = Join-Path $Work 'verify1.log'

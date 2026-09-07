@@ -196,6 +196,10 @@ bullets for the contract this mirrors.
   expects it), the bundled-binary analog of `install.sh`'s static ttyd/glab; a release build may
   bundle it instead. **The pty layer's `node-pty`+`ws` are `npm ci`'d into `$Prefix\win`**
   (`Ensure-PtyLayer`) — node-pty ships Windows prebuilds, so no VS build tools in the common case.
+  **A re-lay PRESERVES a built `win\node_modules`** (`Copy-Tree`'s `$Preserve`): the source has
+  none, so a naive wipe would destroy the pty deps and — under `-NoInstallDeps` — never rebuild
+  them (the terminal dies until a full re-run). Preserving it also skips a needless rebuild on an
+  ordinary re-run; stale SOURCE files are still dropped.
 - **Source resolution mirrors `install.sh`**: the shared runtime is at `..\..` (agent/) from a repo
   checkout, or BESIDE the script in a release tarball — probed via `hub-agent.py` next to the script.
 - **`-Uninstall` removes the prefix + service but PRESERVES config, `~/.turma`, `~/.claude`** — and
