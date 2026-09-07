@@ -28717,6 +28717,28 @@ class TestRestartAgent(ManagerMixin, unittest.TestCase):
         popen.assert_called_once()
         self.assertEqual(popen.call_args.args[0], [ctl, "restart"])
 
+    def test_perform_restart_exits_on_windows_without_agentctl(self):
+        # XERK-675: on native Windows there is no INVOCATION_ID and turma-agentctl
+        # is a POSIX-only bash script this host does not have. The WinSW service
+        # supervises the launcher (turma-agent.ps1), which WaitForExit()s the
+        # manager and relays its exit code, so a clean exit propagates up and WinSW
+        # restarts the launcher -> a fresh manager on the rolled token. So Roll/Enroll
+        # must EXIT here (like the systemd/container case), never shell out to the ctl
+        # script even if a stray copy sits beside hub-agent.py (fighting the supervisor).
+        sm = self.make_manager()
+        bindir = os.path.join(self.tmp, "bin")
+        os.makedirs(bindir, exist_ok=True)
+        open(os.path.join(bindir, "turma-agentctl"), "w").close()
+        with mock.patch.object(ha, "__file__", os.path.join(self.tmp, "hub-agent.py")), \
+             mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.dict(ha.os.environ, self._no_systemd_env(), clear=True), \
+             mock.patch.object(sm, "_announce_updating") as ann, \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
+            with self.assertRaises(SystemExit):
+                sm._perform_restart()
+        ann.assert_called_once_with("restart")
+        popen.assert_not_called()
+
 
 QWEN_IDLE_PANE = (
     "  ● The exact text I wrote was HELLO_QWEN.\n"

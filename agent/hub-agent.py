@@ -26576,16 +26576,27 @@ class SessionManager:
           `Restart=always` brings us back. KillMode=process keeps the sessions.
         - **In a container** — likewise; Docker's restart policy recreates us
           (there's no turma-agentctl to call).
+        - **On native Windows** (XERK-675) — the WinSW service supervises the
+          launcher (turma-agent.ps1), which `$mgr.WaitForExit()`s us and relays
+          our exit code, so our clean exit propagates up and WinSW restarts the
+          launcher → a fresh manager on the rolled token. `turma-agentctl` is a
+          bash script this host does not have, so we NEVER hand off to it here;
+          exiting is the whole restart, like the systemd/container case.
         - **Native without systemd** (turma-agentctl/nohup) — there is NO
           supervisor to restart us on exit, so we relaunch through the ctl
           script (detached so it outlives us). It SIGTERMs this manager, which
           `_handle_shutdown` turns into the announce + exit, then starts a fresh
           one that re-adopts the live sessions."""
         self._announce_updating("restart")
-        under_systemd = bool(os.environ.get("INVOCATION_ID"))
+        # A supervisor will bring us back on a clean exit: systemd (INVOCATION_ID),
+        # a container's restart policy, or — on Windows — the WinSW-supervised
+        # launcher relaying our exit code. Only a bash native/nohup install has no
+        # such supervisor and must self-relaunch via turma-agentctl, which is also
+        # the only place that (POSIX-only) script exists.
+        supervised = bool(os.environ.get("INVOCATION_ID")) or IS_WINDOWS
         ctl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "bin", "turma-agentctl")
-        if not under_systemd and os.path.isfile(ctl):
+        if not supervised and os.path.isfile(ctl):
             try:
                 subprocess.Popen([ctl, "restart"], start_new_session=True,
                                  stdout=subprocess.DEVNULL,

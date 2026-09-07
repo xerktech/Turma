@@ -59,6 +59,22 @@ dispatch on `IS_WINDOWS = os.name == "nt"` rather than living in a Windows copy.
   a planted symlink can't redirect the write; `_write_new_file` (uploads) uses the same `getattr`
   form. Never write bare `os.O_NOFOLLOW` — it does not exist on Windows and raises at call time.
 
+## Token-roll restart is a supervisor exit, never turma-agentctl (XERK-675)
+
+- A hub-pushed `setToken` (Roll) or `--enroll` (Enroll) ends in a manager restart. `_perform_restart`
+  brings the manager back per its supervisor: systemd (`INVOCATION_ID`), a container's restart policy,
+  or — on Windows — **the WinSW-supervised launcher**, which `WaitForExit`s the manager and relays its
+  exit code, so a clean exit propagates up and WinSW restarts the launcher → a fresh manager on the
+  rolled token.
+- **`IS_WINDOWS` counts as supervised**, alongside `INVOCATION_ID`: `turma-agentctl` is a POSIX-only
+  bash script a Windows host does not have, so `_perform_restart` must NEVER `subprocess.Popen` it
+  there (a stray copy would fight the supervisor). Only a bash native/nohup install with no supervisor
+  self-relaunches through the ctl script. Tests: `test_perform_restart_exits_on_windows_without_agentctl`.
+- The rest of Roll/Enroll is the SHARED `hub-agent.py` (`set_token`/`enroll_self`/`rewrite_env_var`/
+  `token_device_name`, XERK-578) — already `IS_WINDOWS`-aware for the env path (`agent_env_path`) and
+  the owner-only ACL (`restrict_file_to_owner` above). The Windows-launcher half (the
+  `TURMA_AGENT_SELF_ENROLL` loop, `TURMA_AGENT_ENV` export) is `windows-launcher.md`.
+
 ## Liveness & degradation (already hold — do not regress)
 
 - **`_pid_alive` uses `os.kill(pid, 0)`, which works on Windows** — the generic liveness primitive.

@@ -49,6 +49,22 @@ PowerShell port of the LAUNCHER ROLE of `agent/native/turma-agent`. Same job, sa
   up front because `exec` preserves it; Windows has no `exec`, so the launcher starts the manager
   (`Start-Process -PassThru`), exports its pid, THEN backgrounds the supervisor so the tunnel
   inherits the right pid.
+- **`TURMA_AGENT_SELF_ENROLL` self-enroll (XERK-675, the Windows half of XERK-578)** — `Invoke-SelfEnroll`
+  mirrors the bash launcher's block: when opted in (`1|true|yes|on`, off by default) and the config
+  exists, it runs `python hub-agent.py --enroll` (the SHARED fetch+verify+atomic-write+owner-ACL,
+  which refuses a token whose name half ≠ this host's `DEVICE_NAME`), then re-reads ONLY `TURMA_TOKEN`
+  from the rolled file — re-importing the WHOLE file would reset every blank Windows-relative default.
+  BEST-EFFORT: a hub too old (`--enroll` exit 2), a failure, or a `python` that won't run all leave
+  the current token in place and never block start. Called from the MAIN run path ONLY (not the
+  `-TunnelSupervisor` re-entry or `-Preflight`) and BEFORE the credential idle gate, so a host that
+  will idle for a missing Claude login still rolls; the manager + supervisor it starts inherit the
+  re-read token, and the supervisor's own `Import-Config` re-reads the rolled file anyway.
+- **Roll (design A) needs no launcher code — but its restart does**: the hub pushes `setToken` over
+  the tunnel, `hub-agent.py`'s `set_token` atomically rewrites `$TURMA_AGENT_ENV` and requests a
+  manager restart, which on Windows is a CLEAN MANAGER EXIT that WinSW-supervises back (the launcher
+  `WaitForExit`s the manager and relays its exit code, so WinSW restarts the launcher → a fresh
+  manager on the rolled token). The manager-side `IS_WINDOWS` half of that (`_perform_restart` never
+  shelling out to the POSIX `turma-agentctl`) is `windows-agent.md`.
 - **Puts the per-user tool dir on PATH itself** — `%APPDATA%\npm` (npm's global bin on Windows,
   where `claude.cmd` lands) plus the install prefix's bin. A Windows service without an interactive
   login does not inherit the user's shell PATH, so `claude` is otherwise unreachable and every
@@ -67,8 +83,6 @@ Kept out to stay on XERK-669's scope and testable; each is marked in the source 
   `-Preflight`'s tool list is claude/git/node/python (no tmux/ttyd).
 - **`turma-agent-update` + "every start is an update check"** — a Windows updater child. The bash
   launcher's update block has no analogue here yet.
-- **The `TURMA_AGENT_SELF_ENROLL` loop** — the token-onboarding child. The `TURMA_AGENT_ENV` export
-  above is the piece of XERK-578 this launcher owns.
 - **Windows INSTALL/packaging** (winget + npm + bundled WinSW, ADR D3) — the installer child. The
   Linux `install.sh`/`release.yml`/`turma-agent-update` do NOT lay these files down, so the
   `agent-native.md` "new sibling in all three packaging paths" rule does not apply until that child
