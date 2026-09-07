@@ -14,6 +14,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const V = require("./version.js");
 const changes = require("./changes.js");
+const manifest = require("./manifest.js");
 const git = require("./git.js");
 
 function main() {
@@ -41,6 +42,19 @@ function main() {
   const diffPaths = prevTag ? git.diffPaths(`${prevTag}..HEAD`) : [];
   const changed = changes.detectChanges(diffPaths, { forceAll });
 
+  // A component the previous release's manifest can't carry forward (a newly
+  // introduced one — agent-windows on a fleet whose last release predates it — or
+  // one dropped from an older manifest) MUST build this release, or publish's
+  // buildManifest hits its "unchanged but absent from prev" throw and the whole
+  // release fails. Force those on regardless of the diff. Read-only (gh); a
+  // missing/unreadable manifest treats every component as new -> force-build all,
+  // the same safe over-build direction forceAll takes. Skipped when forceAll
+  // already builds everything.
+  if (!forceAll) {
+    const prevManifest = git.fetchManifest(prevTag);
+    for (const c of manifest.newComponents(changes.COMPONENTS, prevManifest)) changed[c] = true;
+  }
+
   git.setOutputs({
     version,
     tag: `v${version}`,
@@ -53,6 +67,7 @@ function main() {
     force_all: forceAll,
     build_turma: changed.turma,
     build_agent_native: changed["agent-native"],
+    build_agent_windows: changed["agent-windows"],
     build_glasses: changed.glasses,
     build_android: changed.android,
   });

@@ -6,10 +6,21 @@ const fs = require("node:fs");
 const path = require("node:path");
 const C = require("../changes.js");
 
-test("componentsForPath maps top-level dirs; agent/** maps to agent-native", () => {
+test("componentsForPath maps top-level dirs; shared agent runtime -> both agent builds", () => {
   assert.deepEqual(C.componentsForPath("turma/server.js"), ["turma"]);
-  assert.deepEqual(C.componentsForPath("agent/hub-agent.py"), ["agent-native"]);
+  // The shared runtime ships in BOTH native builds.
+  assert.deepEqual(C.componentsForPath("agent/hub-agent.py"), ["agent-native", "agent-windows"]);
+  assert.deepEqual(C.componentsForPath("agent/tunnel-agent.js"), ["agent-native", "agent-windows"]);
+  assert.deepEqual(C.componentsForPath("agent/hooks/guard.py"), ["agent-native", "agent-windows"]);
+  assert.deepEqual(C.componentsForPath("agent/qwen/ask_mcp.py"), ["agent-native", "agent-windows"]);
+  // The Linux native shell + tmux + dsh are agent-native only.
   assert.deepEqual(C.componentsForPath("agent/native/install.sh"), ["agent-native"]);
+  assert.deepEqual(C.componentsForPath("agent/tmux.conf"), ["agent-native"]);
+  assert.deepEqual(C.componentsForPath("agent/dsh_session.py"), ["agent-native"]);
+  assert.deepEqual(C.componentsForPath("agent/dsh/guard/shim.py"), ["agent-native"]);
+  // The PowerShell shell + the ConPTY pty layer are agent-windows only.
+  assert.deepEqual(C.componentsForPath("agent/native/windows/install.ps1"), ["agent-windows"]);
+  assert.deepEqual(C.componentsForPath("agent/win/pty-host.mjs"), ["agent-windows"]);
   assert.deepEqual(C.componentsForPath("glasses/src/app.ts"), ["glasses"]);
   assert.deepEqual(C.componentsForPath("android/app/build.gradle.kts"), ["android"]);
 });
@@ -30,10 +41,16 @@ test("componentsForPath excludes a component's non-shipped tests/tooling (XERK-4
   assert.deepEqual(C.componentsForPath("glasses/tests/mock-hub.mjs"), []);
   assert.deepEqual(C.componentsForPath("android/app/src/test/AppTest.kt"), []);
   assert.deepEqual(C.componentsForPath("./turma/tests/server.test.js"), []);
+  // agent/win/test/ is the ConPTY pty-host's own test dir — excluded despite
+  // sitting under the agent-windows-mapped agent/win/ prefix.
+  assert.deepEqual(C.componentsForPath("agent/win/test/tty-protocol.test.mjs"), []);
+  // The PowerShell suite lives under the already-excluded agent/tests/.
+  assert.deepEqual(C.componentsForPath("agent/tests/test_install_ps1.ps1"), []);
   // The shipped siblings still map to their component — the exclude is scoped.
   assert.deepEqual(C.componentsForPath("turma/server.js"), ["turma"]);
   assert.deepEqual(C.componentsForPath("turma/public/board.js"), ["turma"]);
-  assert.deepEqual(C.componentsForPath("agent/hub-agent.py"), ["agent-native"]);
+  assert.deepEqual(C.componentsForPath("agent/hub-agent.py"), ["agent-native", "agent-windows"]);
+  assert.deepEqual(C.componentsForPath("agent/win/pty-host.mjs"), ["agent-windows"]);
   assert.deepEqual(C.componentsForPath("glasses/src/app.ts"), ["glasses"]);
   assert.deepEqual(C.componentsForPath("android/app/src/main/Main.kt"), ["android"]);
 });
@@ -69,9 +86,24 @@ test("detectChanges unions components across the diff", () => {
   assert.deepEqual(changed, {
     turma: true,
     "agent-native": false,
+    "agent-windows": false,
     glasses: false,
     android: true,
   });
+});
+
+test("detectChanges: a shared-runtime change builds both agent components; a Windows-only change builds only agent-windows", () => {
+  const shared = C.detectChanges(["agent/hub-agent.py"], {});
+  assert.equal(shared["agent-native"], true);
+  assert.equal(shared["agent-windows"], true);
+
+  const winOnly = C.detectChanges(["agent/native/windows/turma-agent.ps1"], {});
+  assert.equal(winOnly["agent-windows"], true);
+  assert.equal(winOnly["agent-native"], false);
+
+  const nativeOnly = C.detectChanges(["agent/native/install.sh"], {});
+  assert.equal(nativeOnly["agent-native"], true);
+  assert.equal(nativeOnly["agent-windows"], false);
 });
 
 test("detectChanges forceAll marks every component regardless of paths", () => {

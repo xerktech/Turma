@@ -38,6 +38,15 @@ function freshComponent(component, version, tag, opts) {
       const asset = `turma-agent-native-v${version}.tar.gz`;
       return { version, kind: "asset", asset, sha256_asset: `${asset}.sha256`, release_tag: tag, built: true };
     }
+    case "agent-windows": {
+      // The shared 3-way contract with bootstrap.ps1 (XERK-673) and the Windows
+      // updater (XERK-674): asset `turma-agent-windows-v<version>.zip` + a
+      // `.zip.sha256` sidecar, manifest component key `agent-windows`. The updater
+      // reads {version, asset, sha256_asset, release_tag} off this entry and
+      // compares the COMPONENT version, so a carried release is a correct no-op.
+      const asset = `turma-agent-windows-v${version}.zip`;
+      return { version, kind: "asset", asset, sha256_asset: `${asset}.sha256`, release_tag: tag, built: true };
+    }
     case "glasses":
       return {
         version,
@@ -119,4 +128,16 @@ function carryPlan(manifest, prevManifest) {
   return actions;
 }
 
-module.exports = { SCHEMA, DEFAULT_OWNER, DEFAULT_GLASSES_PACKAGE_ID, freshComponent, buildManifest, carryPlan };
+// The components that CANNOT be carried on this release because the previous
+// manifest has no entry to copy forward — a brand-new component (e.g. adding
+// agent-windows to a fleet whose last release predates it) or one dropped from an
+// older manifest. `plan` force-builds these so `buildManifest` never reaches its
+// "unchanged but absent from prev" throw; on the next release the entry exists and
+// carries normally. A missing/unreadable prevManifest returns EVERY component,
+// which force-builds the lot — the safe (over-build), never-emit-a-hole direction.
+function newComponents(components, prevManifest) {
+  const prev = (prevManifest && prevManifest.components) || {};
+  return components.filter((c) => !(c in prev));
+}
+
+module.exports = { SCHEMA, DEFAULT_OWNER, DEFAULT_GLASSES_PACKAGE_ID, freshComponent, buildManifest, carryPlan, newComponents };

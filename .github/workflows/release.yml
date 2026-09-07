@@ -45,6 +45,7 @@ on:
       - "!turma/tests/**"
       - "!turma/tools/**"
       - "!agent/tests/**"
+      - "!agent/win/test/**"
       - "!glasses/tests/**"
       - "!android/app/src/test/**"
   workflow_dispatch:
@@ -97,6 +98,7 @@ jobs:
       release_type: ${{ steps.plan.outputs.release_type }}
       build_turma: ${{ steps.plan.outputs.build_turma }}
       build_agent_native: ${{ steps.plan.outputs.build_agent_native }}
+      build_agent_windows: ${{ steps.plan.outputs.build_agent_windows }}
       build_glasses: ${{ steps.plan.outputs.build_glasses }}
       build_android: ${{ steps.plan.outputs.build_android }}
       dry_run: ${{ steps.flags.outputs.dry_run }}
@@ -134,6 +136,11 @@ jobs:
         env:
           RELEASE_TYPE: ${{ inputs.release_type || 'patch' }}
           FORCE_ALL: ${{ inputs.force_all || 'false' }}
+          # plan reads the previous release's manifest.json (gh) to force-build a
+          # component that manifest can't carry forward — a newly introduced one
+          # like agent-windows. Read-only; a fetch failure just force-builds
+          # everything (the safe direction). Needs a token like the publish job.
+          GH_TOKEN: ${{ github.token }}
         run: node .github/scripts/plan.js
       - name: Summary
         run: |
@@ -482,13 +489,81 @@ jobs:
             turma-agent-native-v${{ needs.plan.outputs.version }}.tar.gz.sha256
           if-no-files-found: error
 
+  # ------------------------------------------------- build: agent-windows -----
+  # GitHub-hosted (ubuntu, like every job): pure cp + zip + sha256. The no-WSL
+  # Windows build (XERK-666) — one shared runtime, a second distribution. It is
+  # the THIRD lockstep packaging path with install.ps1's lay-down + $VerifyFiles
+  # and the updater's payload swap (XERK-528 class): it MUST stage the SAME
+  # hub-agent.py Python siblings + hooks/ the Linux tarball does, or a Windows
+  # host updates into a DARK runtime (missing sibling -> import fails; missing
+  # hook -> the safety guard fails OPEN). A .zip (not .tar.gz) so bootstrap.ps1 /
+  # the updater unpack with Expand-Archive — no tar dependency on a clean box.
+  build-agent-windows:
+    needs: [plan, bump]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
+      && needs.plan.outputs.build_agent_windows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+      - name: Stage payload + zip + checksum
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -eux
+          STAGE="$RUNNER_TEMP/turma-agent-windows"
+          rm -rf "$STAGE"; mkdir -p "$STAGE/hooks"
+          # SHARED runtime — the SAME unconditional set the Linux tarball stages
+          # (kept in lockstep with install.ps1's $RuntimeFiles/$RuntimeDirs and the
+          # updater's swap). tmux.conf and the dsh toolchain are NOT carried onto
+          # Windows; the PowerShell shell + the ConPTY pty layer replace them.
+          cp agent/hub-agent.py agent/tunnel-agent.js "$STAGE/"
+          cp agent/runtime_projection.py agent/runtime_tail.py "$STAGE/"
+          cp agent/qwen_session.py agent/qwen_transcript.py "$STAGE/"
+          cp -a agent/qwen "$STAGE/qwen"
+          cp agent/hooks/*.py "$STAGE/hooks/"
+          # The Windows terminal layer (ADR D1): agent/win/ minus its test dir.
+          # node_modules is git-ignored (absent in a checkout) and rebuilt by
+          # install.ps1's Ensure-PtyLayer / preserved across an updater re-lay.
+          cp -a agent/win "$STAGE/win"; rm -rf "$STAGE/win/test"
+          # The Windows shell scripts, laid FLAT beside hub-agent.py so
+          # install.ps1's source-probe finds the runtime next to itself, exactly
+          # as bootstrap.ps1 unpacks it. bootstrap.ps1 is NOT staged (it is the
+          # irm|iex front door, fetched on its own — the .sh twin is likewise not
+          # in the Linux tarball); the analyzer settings are CI-only.
+          cp agent/native/windows/install.ps1 \
+             agent/native/windows/turma-agent.ps1 \
+             agent/native/windows/turma-agentctl.ps1 \
+             agent/native/windows/turma-agent-update.ps1 \
+             agent/native/windows/turma-agent.xml "$STAGE/"
+          # The config template — the SAME file the Linux tarball ships. install.ps1's
+          # Install-Config probes native/turma-agent.env then, in this FLAT zip, beside
+          # itself; without it a fresh host writes no turma-agent.env and cannot onboard
+          # (TURMA_URL/TURMA_TOKEN unset -> the launcher idles, and self-enroll only rolls
+          # a token into an EXISTING config). The .env is shared across bash + Windows hosts.
+          cp agent/native/turma-agent.env "$STAGE/"
+          echo "$VERSION" > "$STAGE/VERSION"
+          ASSET="turma-agent-windows-v${VERSION}.zip"
+          ( cd "$STAGE" && zip -r -q -X "$GITHUB_WORKSPACE/$ASSET" . )
+          ( cd "$GITHUB_WORKSPACE" && sha256sum "$ASSET" > "$ASSET.sha256" )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-agent-windows
+          path: |
+            turma-agent-windows-v${{ needs.plan.outputs.version }}.zip
+            turma-agent-windows-v${{ needs.plan.outputs.version }}.zip.sha256
+          if-no-files-found: error
+
   # --------------------------------------------------------------- publish ----
   # Runs last. Assembles manifest.json + release notes, carries unchanged assets
   # forward, and (unless dry_run) creates the tag + release. Runs unless a build
   # that was SUPPOSED to run failed (a skipped/carried component is fine).
   publish:
     needs:
-      [plan, bump, build-turma-image, build-glasses, build-android, build-agent-native]
+      [plan, bump, build-turma-image, build-glasses, build-android, build-agent-native, build-agent-windows]
     if: >-
       !cancelled() && needs.plan.result == 'success'
       && needs.bump.result != 'failure'
@@ -496,6 +571,7 @@ jobs:
       && needs.build-glasses.result != 'failure'
       && needs.build-android.result != 'failure'
       && needs.build-agent-native.result != 'failure'
+      && needs.build-agent-windows.result != 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -510,12 +586,12 @@ jobs:
         with:
           node-version: "24"
       # Collect the built release assets into dist/ (flattened). The Android
-      # .apk and native tarball are the only asset-* producers now (the .ehpk
-      # ships to the Even Hub portal from build-glasses), so only download when
-      # one of them actually built — a zero-match pattern must not be able to
-      # fail a hub/glasses-only release.
+      # .apk, the native tarball and the Windows zip are the asset-* producers
+      # (the .ehpk ships to the Even Hub portal from build-glasses), so only
+      # download when one of them actually built — a zero-match pattern must not
+      # be able to fail a hub/glasses-only release.
       - uses: actions/download-artifact@v4
-        if: needs.plan.outputs.build_android == 'true' || needs.plan.outputs.build_agent_native == 'true'
+        if: needs.plan.outputs.build_android == 'true' || needs.plan.outputs.build_agent_native == 'true' || needs.plan.outputs.build_agent_windows == 'true'
         with:
           pattern: asset-*
           path: dist
