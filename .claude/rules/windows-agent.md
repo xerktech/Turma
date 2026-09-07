@@ -1,0 +1,77 @@
+---
+paths:
+  - "agent/hub-agent.py"
+  - "agent/tests/test_hub_agent.py"
+---
+
+# Native Windows agent — `hub-agent.py` portability (XERK-670, epic XERK-666)
+
+The shared runtime is ONE cross-platform codebase — **never forked per OS** (ADR D5,
+`docs/windows-agent-adr.md`). Windows reuses the same `hub-agent.py`; the few Unix-only seams
+dispatch on `IS_WINDOWS = os.name == "nt"` rather than living in a Windows copy. Read the ADR for
+*why*; this is the operative rule.
+
+## Scope boundary — the terminal layer is NOT here (XERK-668)
+
+- **`hub-agent.py` never calls the tmux/ttyd CLI through an OS branch of its own.** The tmux/ttyd
+  call sites (`_spawn_in_tmux`, `_type_into_pane`, `_capture_pane`, `_tmux_alive`, `_launch_ttyd`)
+  and `resume_on_boot`'s adopt path are **XERK-668's `TerminalBackend` seam** (the ConPTY pty-host
+  replacing tmux+ttyd, ADR D1). XERK-670 is deliberately seam-INDEPENDENT and touches none of them.
+- So a Windows-portability change here must stay on the **paths / permissions / state-dir / liveness
+  / degradation** side. Anything that drives, captures, spawns or adopts a session's terminal belongs
+  to XERK-668 — do not add a `sys.platform` branch to those call sites from this side.
+
+## Paths & separators (ADR D4)
+
+- **Use `os.path`/`os.path.join`, never a hard-coded `/`.** Existing joins (`WORKTREES_ROOT`,
+  `CLONES_TMP_ROOT`, `REGISTRY_DIR = expanduser("~/.turma")`, socket/upload/questions dirs) already
+  hold on Windows — `expanduser("~")` resolves to `%USERPROFILE%`, and a dotdir (`.turma`) is fine on
+  NTFS.
+- **The only POSIX literals are the last-resort DEFAULTS** for `REPOS_ROOT` and `PROJECTS_ROOT`,
+  behind `_default_repos_root()` / `_default_projects_root()`. The native launcher normally sets
+  `REPOS_ROOT`/`CLAUDE_PROJECTS_ROOT`, so these fire only against an env that omits them; on Windows
+  they land under `%USERPROFILE%` (`~/.claude/projects` is where Claude Code itself writes there).
+  Keep the container default an explicit POSIX literal — a moved `$HOME` must not silently relocate it.
+- **`_project_slug` is already platform-agnostic** — it maps EVERY non-alphanumeric char (`\`, `:`,
+  `/`, `.`) to `-`, so a Windows cwd (drive letter + backslashes) slugs the same on both sides of the
+  wire. Do not re-introduce a `/`-only mapping. Transcript resolution rides this unchanged.
+
+## State dirs (ADR D4)
+
+- `~/.turma` stays `expanduser("~/.turma")` on both OSes (→ `%USERPROFILE%\.turma`).
+- `~/.config/turma-agent` → **`%APPDATA%\turma-agent`** on Windows: `agent_env_path()`'s fallback
+  branches on `IS_WINDOWS` (`%APPDATA%`, else `~/AppData/Roaming`) vs XDG (`$XDG_CONFIG_HOME`, else
+  `~/.config`). This fallback only fires for a launcher too old to export `TURMA_AGENT_ENV`.
+
+## Permissions — `chmod 600` → NTFS ACL (ADR D4)
+
+- **`restrict_file_to_owner(path)` is the cross-platform `chmod 600`.** POSIX: `os.chmod(0o600)`,
+  byte-identical to before. Windows: `icacls <path> /inheritance:r /grant:r <user>:F SYSTEM:F` — the
+  owner-only NTFS ACL. `os.chmod` on Windows only toggles the read-only bit and is NOT a substitute.
+- **Windows is BEST-EFFORT — an icacls failure is LOGGED, never raised.** The bytes are already on
+  disk; refusing here would strand XERK-578 token onboarding over a cosmetic ACL. POSIX still raises,
+  preserving the old contract for existing callers.
+- **It acts only on a REGULAR file (`lstat`, so a symlink is refused)** — the "guard against opening a
+  non-regular path" on the permissions side. Callers create the file first, so this never diverges on
+  the real path.
+- Routed through it: `write_local_model_env`, `rewrite_env_var` (the `TURMA_TOKEN` env file). The
+  per-pid credential-tmp opens carry **`getattr(os, "O_NOFOLLOW", 0)`** (a no-op flag on Windows) so
+  a planted symlink can't redirect the write; `_write_new_file` (uploads) uses the same `getattr`
+  form. Never write bare `os.O_NOFOLLOW` — it does not exist on Windows and raises at call time.
+
+## Liveness & degradation (already hold — do not regress)
+
+- **`_pid_alive` uses `os.kill(pid, 0)`, which works on Windows** — the generic liveness primitive.
+  The `/proc`-specific cc-socks sweep is a POSIX/dsh feature that already self-guards
+  (`getattr(os, "getuid", None)`, `os.path.isdir("/proc/self")`) and degrades to no-op on Windows.
+- **`startedAt` falls back to the manager's start time** (`run(["docker", ...]) or now_iso()`) and the
+  **container-log tail** to `LOG_TAIL_UNAVAILABLE` (`except Exception`) — both hold on Windows because
+  `run()` returns `""` on a missing binary. Keep these fallbacks; the restart-loop alert keys on a
+  non-empty changing `startedAt`.
+
+## Tests
+
+`TestWindowsPortability` in `test_hub_agent.py` MOCKS `IS_WINDOWS` so the Windows branch is verified
+on Linux CI: the icacls owner-only ACL, its best-effort swallow, the non-regular-path refusal, the
+`%APPDATA%` env-path fallback, and the profile-relative default roots. The POSIX branches stay pinned
+by the existing `TestSetToken`/local-model-env cases (0600 preserved).
