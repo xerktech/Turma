@@ -1,0 +1,6 @@
+# runtime artifacts — never committed (package-lock.json IS committed for `npm ci`)
+node_modules/
+*.state.json
+*.log
+drive-evidence.txt
+probe-result.txt
