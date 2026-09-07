@@ -217,16 +217,27 @@ function Invoke-SelfEnroll {
   if ($rc -ne 0) { return }
   # Re-read ONLY TURMA_TOKEN from the (now atomically-rewritten) config. Last assignment
   # wins, matching how the file is sourced/imported; one layer of surrounding quotes is
-  # stripped, as Import-Config does.
+  # stripped, as Import-Config does. Wrapped best-effort like the --enroll call above: on
+  # Windows a just-renamed file can be momentarily locked (AV/indexer/backup handle) or
+  # vanish in a TOCTOU window, and ReadAllLines throws — degrade with one log line and stay
+  # on the current token, not a stack trace to the service log (bash's grep degrades
+  # silently; parity). The enroll already persisted the new token, so the next start reads
+  # it via Import-Config regardless.
   $rolled = ''
-  foreach ($line in [System.IO.File]::ReadAllLines($Cfg)) {
-    if ($line -match '^\s*(export\s+)?TURMA_TOKEN=(.*)$') {
-      $v = $Matches[2]
-      if ($v.Length -ge 2 -and (($v[0] -eq '"' -and $v[-1] -eq '"') -or ($v[0] -eq "'" -and $v[-1] -eq "'"))) {
-        $v = $v.Substring(1, $v.Length - 2)
+  try {
+    foreach ($line in [System.IO.File]::ReadAllLines($Cfg)) {
+      if ($line -match '^\s*(export\s+)?TURMA_TOKEN=(.*)$') {
+        $v = $Matches[2]
+        if ($v.Length -ge 2 -and (($v[0] -eq '"' -and $v[-1] -eq '"') -or ($v[0] -eq "'" -and $v[-1] -eq "'"))) {
+          $v = $v.Substring(1, $v.Length - 2)
+        }
+        $rolled = $v
       }
-      $rolled = $v
     }
+  }
+  catch {
+    Log "[turma-agent] self-enroll: rolled the token but could not re-read $Cfg ($_); the next start picks it up"
+    return
   }
   if ($rolled) { $env:TURMA_TOKEN = $rolled }
 }
