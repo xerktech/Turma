@@ -1,0 +1,318 @@
+#!/usr/bin/env pwsh
+# Behavioural tests for the native WINDOWS launcher (agent/native/windows/turma-agent.ps1).
+#
+# The port of test_turma_agent.sh: it pins the same launcher decisions, none of which
+# PSScriptAnalyzer can see (it checks PowerShell correctness, not what the script does):
+#   1. the reverse-tunnel supervisor respawns a tunnel that exits,
+#   2. a missing node is SURVIVED and HEALED when node appears (no restart),
+#   3. the run path exports the manager pid the tunnel's poke targets,
+#   4. a re-launch replaces the supervisor rather than duplicating it,
+#   5. an invalid config line is reported (names + line numbers, no values) and IDLED on,
+#   6. -Preflight reports the same fault but never hangs,
+#   7. a valid config still loads (export + quoted values),
+#   8. the service PATH reaches claude at %APPDATA%\npm,
+#   9. a genuinely missing claude is a loud warning, not a silent failure,
+#  10. USERPROFILE unset (service context) does not kill the launcher.
+#
+# Like the bash suite, the REAL launcher runs with only what it hands off stubbed
+# (node, the tunnel, python/hub-agent.py, claude). It is a PowerShell-on-POSIX harness
+# (the launcher logic is OS-agnostic PowerShell; the stubs are /bin/sh), run on the same
+# ubuntu-latest runner the bash launcher tests use — WinSW / ConPTY / a real Windows
+# service are host-verified by later epic children, exactly as the bash suite leaves
+# systemd to a real host.
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$Here      = Split-Path -Parent $PSCommandPath
+$WinDir    = Join-Path (Split-Path -Parent $Here) 'native/windows'
+$Launcher  = Join-Path $WinDir 'turma-agent.ps1'
+$Work      = Join-Path ([System.IO.Path]::GetTempPath()) ("turma-ps1-" + [guid]::NewGuid().ToString('N'))
+$Script:Failed = 0
+$Script:Spawned = New-Object System.Collections.Generic.List[int]
+
+function Ok([string]$m)   { [Console]::Out.WriteLine("  ok: $m") }
+function Fail([string]$m) { [Console]::Out.WriteLine("  FAIL: $m"); $Script:Failed = 1 }
+function Note([string]$m) { [Console]::Out.WriteLine($m) }
+
+# The current pwsh, used to launch the script under test.
+$PwshExe = (Get-Process -Id $PID).Path
+
+# --- fixture: a PREFIX laid out the way the installer lays one out --------------------
+$Prefix   = Join-Path $Work 'prefix'
+$Bin      = Join-Path $Prefix 'bin'
+$StubBin  = Join-Path $Work 'stub-bin'
+$Home_    = Join-Path $Work 'home'
+$AppData  = Join-Path $Home_ 'AppData\Roaming'
+$NpmBin   = Join-Path $AppData 'npm'
+New-Item -ItemType Directory -Force -Path $Bin, $StubBin, (Join-Path $Home_ '.claude'), $NpmBin, (Join-Path $Home_ 'git') | Out-Null
+
+Copy-Item $Launcher (Join-Path $Bin 'turma-agent.ps1')
+$LauncherPath = Join-Path $Bin 'turma-agent.ps1'
+
+# Stub tunnel entrypoint (node is what runs it; the stub records each start then exits, so
+# the supervisor's respawn is observable, and records the manager pid it inherited so the
+# poke-target invariant can be checked).
+Set-Content -Path (Join-Path $Prefix 'tunnel-agent.js') -Value '// stub tunnel' -NoNewline
+
+$TunnelLog  = Join-Path $Work 'tunnel.log'
+$ManagerLog = Join-Path $Work 'manager.log'
+
+# Write a /bin/sh stub with LF endings and mark it executable.
+function New-ShStub([string]$Path, [string]$Body) {
+  $text = "#!/bin/sh`n" + ($Body -replace "`r`n", "`n")
+  [System.IO.File]::WriteAllText($Path, $text)
+  & chmod +x $Path
+}
+
+New-ShStub (Join-Path $StubBin 'node') @"
+echo "tunnel-start mgrpid=`${TURMA_MANAGER_PID:-unset}" >> "$TunnelLog"
+exit 0
+"@
+
+# Stands in for the session manager. Records the pid the tunnel would poke (its own `$$`,
+# which Start-Process reports as the launched pid) and where claude resolves on the PATH
+# it inherited (what every session launch uses), then blocks so the launcher stays alive
+# for inspection.
+New-ShStub (Join-Path $StubBin 'python') @"
+echo "mgrpid=`$`$" > "$ManagerLog"
+echo "claude=`$(command -v claude || echo missing)" >> "$ManagerLog"
+sleep 30
+"@
+
+function Cleanup {
+  # Reap any supervisor/tunnel/manager the cases left running, by command line.
+  Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    $cl = $null; try { $cl = $_.CommandLine } catch { }
+    $cl -and ($cl.Contains($LauncherPath) -or $cl.Contains((Join-Path $Prefix 'tunnel-agent.js')))
+  } | ForEach-Object { try { $_.Kill() } catch { } }
+  foreach ($p in $Script:Spawned) { try { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue } catch { } }
+  if (Test-Path $Work) { Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue }
+}
+
+# Poll a predicate up to ~ (Tries * 0.1)s rather than sleeping a fixed guess.
+function Wait-For([scriptblock]$Cond, [int]$Tries = 60) {
+  for ($i = 0; $i -lt $Tries; $i++) {
+    if (& $Cond) { return $true }
+    Start-Sleep -Milliseconds 100
+  }
+  return $false
+}
+
+function Count-TunnelStarts {
+  if (Test-Path $TunnelLog) { @(Get-Content $TunnelLog).Count } else { 0 }
+}
+function Count-Supervisors {
+  @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+      $cl = $null; try { $cl = $_.CommandLine } catch { }
+      $cl -and $cl.Contains($LauncherPath) -and $cl.Contains('-TunnelSupervisor')
+    }).Count
+}
+function Stop-Supervisors {
+  Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    $cl = $null; try { $cl = $_.CommandLine } catch { }
+    $cl -and $cl.Contains($LauncherPath) -and $cl.Contains('-TunnelSupervisor')
+  } | ForEach-Object { try { $_.Kill() } catch { } }
+}
+
+# Start the launcher (or a re-entry mode) as a child pwsh, inheriting the case's env.
+function Start-Launcher([string[]]$ExtraArgs, [string]$OutFile) {
+  $argv = @('-NoProfile', '-File', $LauncherPath) + $ExtraArgs
+  $p = Start-Process -FilePath $PwshExe -ArgumentList $argv -PassThru `
+    -RedirectStandardOutput $OutFile -RedirectStandardError "$OutFile.err"
+  $Script:Spawned.Add($p.Id)
+  return $p
+}
+
+function Set-BaseEnv {
+  $env:USERPROFILE      = $Home_
+  $env:APPDATA          = $AppData
+  $env:COMPUTERNAME     = 'TESTBOX'
+  $env:TUNNEL_RETRY_SEC = '1'
+  $env:REPOS_ROOT       = Join-Path $Home_ 'git'
+  # A curated PATH shaped like a service's: the stubs, plus the minimum the launcher and
+  # its helpers need, and NO claude (the host's own must not satisfy the lookup).
+  $env:PATH = @($StubBin, '/usr/bin', '/bin') -join ':'
+  Remove-Item env:TURMA_MANAGER_PID -ErrorAction SilentlyContinue
+}
+
+try {
+  # The launcher's one fatal check — without this it idles instead of running.
+  Set-Content -Path (Join-Path $Home_ '.claude/.credentials.json') -Value '{}'
+
+  $goodCfg = Join-Path $Work 'agent.env'
+  Set-Content -Path $goodCfg -Value "TURMA_URL=https://hub.invalid`nTURMA_TOKEN=t`n"
+
+  # --- Case 1: the supervisor respawns a tunnel that exits ----------------------------
+  Note "case: supervisor respawns the tunnel"
+  Set-BaseEnv
+  $env:TURMA_AGENT_ENV = $goodCfg
+  Remove-Item $TunnelLog -ErrorAction SilentlyContinue
+  Start-Launcher @('-TunnelSupervisor') (Join-Path $Work 'sup.log') | Out-Null
+  if (Wait-For { (Count-TunnelStarts) -ge 2 }) { Ok "tunnel restarted after it exited ($(Count-TunnelStarts) starts)" }
+  else { Fail "tunnel was not respawned (starts=$(Count-TunnelStarts)); see $Work/sup.log" }
+  if (Wait-For { (Test-Path (Join-Path $Work 'sup.log')) -and (Select-String -Quiet 'tunnel exited' (Join-Path $Work 'sup.log')) }) { Ok "logged the exit" }
+  else { Fail "no exit logged: $(Get-Content (Join-Path $Work 'sup.log') -Raw -ErrorAction SilentlyContinue)" }
+  Stop-Supervisors
+
+  # --- Case 2: node missing is survived, then HEALED when node appears -----------------
+  Note "case: node missing — survives, then heals when node appears"
+  Remove-Item $TunnelLog -ErrorAction SilentlyContinue
+  # A PATH with the launcher's needs but NO node. %APPDATA%\npm (which the launcher
+  # prepends) must not hold one either.
+  $noNodeBin = Join-Path $Work 'nonode-bin'
+  New-Item -ItemType Directory -Force -Path $noNodeBin | Out-Null
+  Set-BaseEnv
+  $env:TURMA_AGENT_ENV = $goodCfg
+  $env:PATH = @($noNodeBin, '/usr/bin', '/bin') -join ':'
+  $sup2 = Start-Launcher @('-TunnelSupervisor') (Join-Path $Work 'sup2.log')
+  if (Wait-For { (Test-Path (Join-Path $Work 'sup2.log')) -and (Select-String -Quiet 'node not on PATH' (Join-Path $Work 'sup2.log')) }) { Ok "said why the terminals are offline" }
+  else { Fail "no node guidance logged: $(Get-Content (Join-Path $Work 'sup2.log') -Raw -ErrorAction SilentlyContinue)" }
+  if (-not $sup2.HasExited) { Ok "supervisor survived the missing runtime" }
+  else { Fail "supervisor died on missing node — the failure would be permanent again" }
+  # node arrives (operator installs it) — no restart of anything.
+  Copy-Item (Join-Path $StubBin 'node') (Join-Path $noNodeBin 'node')
+  if (Wait-For { (Count-TunnelStarts) -ge 1 }) { Ok "healed without a restart once node existed" }
+  else { Fail "tunnel never started after node appeared" }
+  Stop-Supervisors
+
+  # --- Case 3: the run path names the manager pid and starts one supervisor ------------
+  Note "case: run path exports the manager pid and supervises the tunnel"
+  Remove-Item $TunnelLog, $ManagerLog -ErrorAction SilentlyContinue
+  Set-BaseEnv
+  $env:TURMA_AGENT_ENV = $goodCfg
+  Start-Launcher @() (Join-Path $Work 'run.log') | Out-Null
+  if (Wait-For { (Test-Path $ManagerLog) -and ((Get-Item $ManagerLog).Length -gt 0) }) {
+    if (Wait-For { (Count-TunnelStarts) -ge 1 }) {
+      $mgrpid  = (Select-String -Path $ManagerLog -Pattern 'mgrpid=(\d+)').Matches[0].Groups[1].Value
+      $tunpid  = (Select-String -Path $TunnelLog  -Pattern 'mgrpid=(\d+)').Matches[0].Groups[1].Value
+      if ($mgrpid -and $mgrpid -eq $tunpid) { Ok "TURMA_MANAGER_PID ($tunpid) is the manager's own pid — the poke can land" }
+      else { Fail "manager pid mismatch: manager=$mgrpid tunnel-saw=$tunpid (poke would mis-signal)" }
+    }
+    else { Fail "run path started no tunnel: $(Get-Content (Join-Path $Work 'run.log') -Raw -ErrorAction SilentlyContinue)" }
+  }
+  else { Fail "manager never started: $(Get-Content (Join-Path $Work 'run.log') -Raw -ErrorAction SilentlyContinue)" }
+
+  # --- Case 4: a re-run replaces the supervisor rather than duplicating it -------------
+  Note "case: a second launch leaves exactly one supervisor"
+  Set-BaseEnv
+  $env:TURMA_AGENT_ENV = $goodCfg
+  Start-Launcher @() (Join-Path $Work 'run2.log') | Out-Null
+  Start-Sleep -Seconds 1
+  $n = Count-Supervisors
+  if ($n -eq 1) { Ok "exactly one supervisor after a restart" }
+  else { Fail "expected 1 supervisor, found $n (a duplicate tunnel fights for the channel)" }
+  Stop-Supervisors
+  Get-Process -ErrorAction SilentlyContinue | Where-Object { $cl = $null; try { $cl = $_.CommandLine } catch { }; $cl -and $cl.Contains($LauncherPath) } | ForEach-Object { try { $_.Kill() } catch { } }
+
+  # --- Case 5: a non-assignment config line idles, does NOT crash-loop -----------------
+  Note "case: an invalid config line is reported and idled on"
+  $badCfg = Join-Path $Work 'bad.env'
+  Set-Content -Path $badCfg -Value @"
+# a comment, and a blank line, are both fine
+
+TURMA_URL=https://hub.invalid
+JIRA_SITE: "xerktech.atlassian.net"
+JIRA_TOKEN: "ATATT3xFf-s3cret-whose-value-contains=an-equals-sign"
+"@
+  Remove-Item $ManagerLog -ErrorAction SilentlyContinue
+  Set-BaseEnv
+  $env:TURMA_AGENT_ENV = $badCfg
+  $bad = Start-Launcher @() (Join-Path $Work 'bad.log')
+  $badLog = Join-Path $Work 'bad.log'
+  if (Wait-For { (Test-Path $badLog) -and (Select-String -Quiet 'Invalid line' $badLog) }) { Ok "named the file as the problem" }
+  else { Fail "no invalid-config report: $(Get-Content $badLog -Raw -ErrorAction SilentlyContinue)" }
+  # Both offending lines, by number — including the one whose VALUE holds an `=`.
+  if ((Select-String -Quiet 'line 4: JIRA_SITE' $badLog) -and (Select-String -Quiet 'line 5: JIRA_TOKEN' $badLog)) { Ok "named both bad lines with their line numbers" }
+  else { Fail "did not report both bad lines: $(Get-Content $badLog -Raw -ErrorAction SilentlyContinue)" }
+  # This banner goes to the service log; the config is ACL'd and holds tokens.
+  if (Select-String -Quiet 's3cret' $badLog) { Fail "the invalid-config report leaked a token value into the log" }
+  else { Ok "reported the bad lines without echoing their values" }
+  Start-Sleep -Seconds 1
+  if (-not $bad.HasExited) { Ok "idled instead of exiting — the service has nothing to restart-loop" }
+  else { Fail "launcher exited on a bad config; auto-restart would loop it forever" }
+  if ((Count-Supervisors) -eq 0) { Ok "started no tunnel against a config it never loaded" }
+  else { Fail "a supervisor was started despite the config being rejected" }
+  if (-not (Test-Path $ManagerLog)) { Ok "started no manager either" }
+  else { Fail "the manager was started with a config that never loaded" }
+  try { Stop-Process -Id $bad.Id -Force } catch { }
+
+  # --- Case 6: -Preflight reports the same fault but never hangs ------------------------
+  Note "case: -Preflight reports an invalid config and exits nonzero"
+  Set-BaseEnv
+  $env:TURMA_AGENT_ENV = $badCfg
+  $pre = Start-Launcher @('-Preflight') (Join-Path $Work 'pre.log')
+  if (Wait-For { $pre.HasExited } 100) {
+    if ($pre.ExitCode -eq 1) { Ok "exited 1 rather than idling" }
+    else { Fail "expected exit 1, got $($pre.ExitCode): $(Get-Content (Join-Path $Work 'pre.log') -Raw -ErrorAction SilentlyContinue)" }
+  }
+  else { Fail "-Preflight hung on a bad config — the installer --verify would never return"; try { Stop-Process -Id $pre.Id -Force } catch { } }
+
+  # --- Case 7: a valid config still loads, quotes/export and all -----------------------
+  Note "case: a valid config is unaffected"
+  $exportCfg = Join-Path $Work 'good2.env'
+  Set-Content -Path $exportCfg -Value "TURMA_URL=https://hub.invalid`nexport TURMA_TOKEN=`"t`"`nMAX_SESSIONS=6`n"
+  Set-BaseEnv
+  $env:TURMA_AGENT_ENV = $exportCfg
+  $pre2 = Start-Launcher @('-Preflight') (Join-Path $Work 'pre2.log')
+  if (Wait-For { $pre2.HasExited } 100) {
+    if ($pre2.ExitCode -eq 0) { Ok "a plain KEY=value config (with an export/quoted line) still passes" }
+    else { Fail "valid config rejected (rc=$($pre2.ExitCode)): $(Get-Content (Join-Path $Work 'pre2.log') -Raw -ErrorAction SilentlyContinue)" }
+  }
+  else { Fail "-Preflight hung on a valid config"; try { Stop-Process -Id $pre2.Id -Force } catch { } }
+
+  # --- Case 8: the service PATH reaches claude at %APPDATA%\npm ------------------------
+  Note "case: launcher puts %APPDATA%\npm on the runtime PATH"
+  # claude where npm installs it globally on Windows; the curated PATH has none.
+  New-ShStub (Join-Path $NpmBin 'claude') "exit 0"
+  Remove-Item $ManagerLog -ErrorAction SilentlyContinue
+  Set-BaseEnv
+  $env:TURMA_AGENT_ENV = $goodCfg
+  Start-Launcher @() (Join-Path $Work 'run3.log') | Out-Null
+  if (Wait-For { (Test-Path $ManagerLog) -and (Select-String -Quiet 'claude=' $ManagerLog) }) {
+    $resolved = (Select-String -Path $ManagerLog -Pattern '^claude=(.*)$').Matches[0].Groups[1].Value
+    if ($resolved -eq (Join-Path $NpmBin 'claude')) { Ok "manager resolves claude at %APPDATA%\npm despite a bare service PATH" }
+    else { Fail "claude resolved to '$resolved' — sessions would die with ENOENT: 'claude'" }
+  }
+  else { Fail "manager never started under the curated PATH: $(Get-Content (Join-Path $Work 'run3.log') -Raw -ErrorAction SilentlyContinue)" }
+  if (Select-String -Quiet 'claude not on PATH' (Join-Path $Work 'run3.log')) { Fail "warned about a claude it can actually reach" }
+  else { Ok "no spurious warning when claude is reachable" }
+  Get-Process -ErrorAction SilentlyContinue | Where-Object { $cl = $null; try { $cl = $_.CommandLine } catch { }; $cl -and $cl.Contains($LauncherPath) } | ForEach-Object { try { $_.Kill() } catch { } }
+
+  # --- Case 9: a genuinely missing claude is warned about, loudly ----------------------
+  Note "case: missing claude is a loud warning, not a silent failure"
+  Remove-Item (Join-Path $NpmBin 'claude'), $ManagerLog -ErrorAction SilentlyContinue
+  Set-BaseEnv
+  $env:TURMA_AGENT_ENV = $goodCfg
+  Start-Launcher @() (Join-Path $Work 'run4.log') | Out-Null
+  if (Wait-For { (Test-Path (Join-Path $Work 'run4.log')) -and (Select-String -Quiet 'claude not on PATH' (Join-Path $Work 'run4.log')) }) { Ok "said sessions will fail and how to fix it" }
+  else { Fail "no claude warning — the failure would be silent again: $(Get-Content (Join-Path $Work 'run4.log') -Raw -ErrorAction SilentlyContinue)" }
+  if (Wait-For { (Test-Path $ManagerLog) -and ((Get-Item $ManagerLog).Length -gt 0) }) { Ok "manager still started (log-only, self-heals when claude appears)" }
+  else { Fail "launcher refused to start over a missing claude" }
+  Get-Process -ErrorAction SilentlyContinue | Where-Object { $cl = $null; try { $cl = $_.CommandLine } catch { }; $cl -and $cl.Contains($LauncherPath) } | ForEach-Object { try { $_.Kill() } catch { } }
+
+  # --- Case 10: USERPROFILE unset (service context) does not kill the launcher ---------
+  # The Windows twin of the bash "HOME unset" trap: a Session-0 service can be launched
+  # without USERPROFILE, and StrictMode would abort on the first read. The launcher must
+  # derive one and carry on.
+  Note "case: USERPROFILE unset (service context) does not kill the launcher"
+  Set-BaseEnv
+  $env:TURMA_AGENT_ENV = $goodCfg
+  Remove-Item env:USERPROFILE -ErrorAction SilentlyContinue
+  $pre3 = Start-Launcher @('-Preflight') (Join-Path $Work 'pre3.log')
+  $ok = Wait-For { $pre3.HasExited } 100
+  $out = if (Test-Path (Join-Path $Work 'pre3.log')) { Get-Content (Join-Path $Work 'pre3.log') -Raw } else { '' }
+  if (-not $ok) { Fail "-Preflight hung with USERPROFILE unset"; try { Stop-Process -Id $pre3.Id -Force } catch { } }
+  elseif ($out -match 'unbound|StrictMode|not been set') { Fail "launcher still dies with USERPROFILE unset: $out" }
+  elseif ($out -match 'USERPROFILE was unset') { Ok "derived a USERPROFILE and said so" }
+  else { Fail "expected a USERPROFILE-was-unset notice, got: $out" }
+  if ($out -match 'preflight') { Ok "carried on into preflight rather than aborting" }
+  else { Fail "launcher did not reach preflight with USERPROFILE unset: $out" }
+}
+finally {
+  Cleanup
+}
+
+if ($Script:Failed -eq 0) { Note "all turma-agent (windows) launcher tests passed" }
+else { Note "FAILURES" }
+exit $Script:Failed
