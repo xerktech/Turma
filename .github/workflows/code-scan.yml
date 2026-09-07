@@ -293,9 +293,11 @@ jobs:
             'agent/native/windows/turma-agent.ps1',
             'agent/native/windows/turma-agentctl.ps1',
             'agent/native/windows/install.ps1',
+            'agent/native/windows/bootstrap.ps1',
             'agent/tests/test_turma_agent_ps1.ps1',
             'agent/tests/test_turma_agentctl_ps1.ps1',
-            'agent/tests/test_install_ps1.ps1'
+            'agent/tests/test_install_ps1.ps1',
+            'agent/tests/test_bootstrap_ps1.ps1'
           )
           foreach ($f in $files) {
             $r = Invoke-ScriptAnalyzer -Path $f -Settings $settings -Severity Warning,Error
@@ -327,3 +329,14 @@ jobs:
       - name: Native Windows installer tests (agent/native/windows/install.ps1)
         shell: pwsh
         run: ./agent/tests/test_install_ps1.ps1
+      # The native WINDOWS bootstrap (agent/native/windows/bootstrap.ps1, XERK-673) is the
+      # `irm | iex` front door — the port of bootstrap.sh. Like it, it runs off main on a
+      # host with no checkout, so a bug misfires on every new install with no deployed copy
+      # to fix. Covers the same decisions: newest-build + carried-asset resolution BY
+      # FILENAME (not tag), refusal to install on a bad/missing checksum, args passthrough,
+      # and the clear no-asset / unreachable-API failures. The child dot-sources the real
+      # script with its HTTP + pwsh seams stubbed (no PATH-stubbable curl here); winget/
+      # ConPTY stay host proof.
+      - name: Native Windows bootstrap tests (agent/native/windows/bootstrap.ps1)
+        shell: pwsh
+        run: ./agent/tests/test_bootstrap_ps1.ps1

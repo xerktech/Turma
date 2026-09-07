@@ -4,6 +4,7 @@ paths:
   - "agent/tests/test_turma_agent_ps1.ps1"
   - "agent/tests/test_turma_agentctl_ps1.ps1"
   - "agent/tests/test_install_ps1.ps1"
+  - "agent/tests/test_bootstrap_ps1.ps1"
 ---
 
 # `agent/native/windows/` — native (no-WSL) Windows shell layer
@@ -15,7 +16,8 @@ ONE cross-platform codebase (ADR D5); nothing here forks it. The `hub-agent.py` 
 Windows port (paths, `%APPDATA%`, icacls, liveness/degradation — XERK-670) is `windows-agent.md`.
 
 This file covers the LAUNCHER (`turma-agent.ps1`, XERK-669), the SERVICE + CONTROL SURFACE
-(`turma-agent.xml` + `turma-agentctl.ps1`, XERK-671) and the INSTALLER (`install.ps1`, XERK-672).
+(`turma-agent.xml` + `turma-agentctl.ps1`, XERK-671), the INSTALLER (`install.ps1`, XERK-672) and
+the `irm | iex` FRONT DOOR (`bootstrap.ps1`, XERK-673).
 
 ## `turma-agent.ps1` — the launcher (XERK-669)
 
@@ -205,3 +207,43 @@ bullets for the contract this mirrors.
 - **`-Uninstall` removes the prefix + service but PRESERVES config, `~/.turma`, `~/.claude`** — and
   warns that the detached pty-hosts (broken out of the service job) outlive it, re-adopted on the next
   install's boot. It does NOT sweep them (no `KillMode=process` teardown to run).
+
+## `bootstrap.ps1` — the `irm | iex` front door (XERK-673)
+
+PowerShell port of `agent/native/bootstrap.sh`: the one pasted line that resolves the newest
+windows-native asset, sha256-verifies it, unpacks it, and hands off to the unpacked `install.ps1`.
+Read `agent-native.md`'s `bootstrap.sh` bullet for the contract it mirrors.
+
+- **The windows release asset is `turma-agent-windows-v<version>.zip` + `.zip.sha256`, manifest
+  component `agent-windows`** (a SHARED CONTRACT across three tickets): `bootstrap.ps1` (XERK-673)
+  and the Windows updater (XERK-674) RESOLVE it; the release packaging (XERK-676) must EMIT exactly
+  that name/component (legacy tag prefix `agent-windows-v`). `.zip` not `.tar.gz` so the unpack is
+  `Expand-Archive` — built into Windows PowerShell 5.1, no tar dependency.
+- **Resolves by the ASSET's own filename version, never the release tag** — the same carried-forward
+  trap `bootstrap.sh` documents (a newer umbrella carries an unchanged build under its ORIGINAL older
+  name; a tag-derived name 404s). Scans every release's assets, picks the highest `[version]`.
+- **It MUST run under Windows PowerShell 5.1.** A clean box has 5.1 (`powershell.exe`), not pwsh 7 —
+  nothing has provisioned 7 yet — so `irm | iex` lands in 5.1. Hence 5.1-safe surface ONLY: no
+  `$IsWindows`, no ternary/`??`, no StrictMode-Latest reads of Core-only automatics. JSON is
+  `ConvertFrom-Json` (built into 5.1 — the Windows "parser-light", vs bash's grep before python).
+  Sets TLS 1.2 for the GitHub API (5.1's default can still be refused).
+- **The ONE prerequisite this front door owns is PowerShell 7 itself.** `install.ps1` is pwsh-7-only
+  (`$IsWindows` under StrictMode Latest), and PowerShell is the INTERPRETER the installer runs under —
+  an installer cannot provision its own interpreter (the one chicken-and-egg with no Linux analog).
+  `Resolve-Pwsh`: this process if already 7+, else `pwsh` on PATH, else the known Program Files
+  install dirs, else `winget install Microsoft.PowerShell` then re-probe; a clear message if winget
+  is absent. Everything else (git/node/python/gh/claude/service) stays `install.ps1`'s job.
+- **Hands off `install.ps1` as a real FILE under pwsh 7** (`-NoProfile -ExecutionPolicy Bypass -File`)
+  so its `$PSCommandPath` source-probe resolves the unpacked tree beside it — the analog of
+  `bootstrap.sh` running `install.sh` THROUGH bash. Not copied into the prefix, so a later
+  `-Verify`/`-Uninstall` re-runs through this same download+unpack path. It captures passthrough via
+  the automatic `$args` (NO param block / `[CmdletBinding()]`, which would REJECT an unknown install
+  flag as a binding error), forwarding every option verbatim — the analog of `bash -s -- …`. The temp
+  tree is swept on BOTH exits (a normal `finally` AND `Die`'s own sweep, since a refusal exits before
+  the `finally` — the parity gap vs `bootstrap.sh`'s `trap … EXIT`); the installer's exit code is relayed.
+- **Testable seams**: `Get-ReleaseJson`/`Get-ReleaseFile`/`Resolve-Pwsh` are overridable functions and
+  the main body is `Invoke-Bootstrap`, auto-run only when `TURMA_BOOTSTRAP_NORUN` is unset — so the
+  suite dot-sources the real script and substitutes those three (there is no PATH-stubbable `curl`
+  here, unlike `test_bootstrap.sh`). Tests: `agent/tests/test_bootstrap_ps1.ps1` (newest + carried-
+  asset resolution by filename, checksum-mismatch/missing-sidecar refusal, args passthrough, clear
+  no-asset/unreachable-API failures). Same PSScriptAnalyzer gate; winget/ConPTY stay host proof.
