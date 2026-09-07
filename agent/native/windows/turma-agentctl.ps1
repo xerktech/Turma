@@ -30,11 +30,11 @@
 #     a pidfile the writer and reader disagree on, or one whose write silently fails, lets
 #     stop/restart miss the pid they must kill and orphan-then-DOUBLE the manager.
 #
-# NOT here (each a later epic child): the WinSW service is DEFINED by the sibling
-# turma-agent.xml but INSTALLED/packaged (winget + npm + bundled WinSW.exe) by the
-# installer child; the Windows updater (turma-agent-update analog) is its own child, so
-# `start` does not also spin up an auto-update poller the way the bash ctl does — noted
-# where it would wire in.
+# NOT here (a later epic child): the WinSW service is DEFINED by the sibling turma-agent.xml
+# but INSTALLED/packaged (winget + npm + bundled WinSW.exe) by the installer child. The Windows
+# updater (turma-agent-update.ps1, XERK-674) IS wired now — but its poller is started by the
+# LAUNCHER (Invoke-UpdateChecks), not by this ctl's `start`, so both the service and pidfile
+# paths get it uniformly.
 
 [CmdletBinding()]
 param(
@@ -217,8 +217,9 @@ function Start-Fallback {
     -RedirectStandardOutput $Log -RedirectStandardError $ErrLog -PassThru
   Set-Content -LiteralPath $PidFile -Value ([string]$child.Id)
   Log "turma-agent started (pid $($child.Id)); logs: $Log"
-  # The auto-update poller the bash ctl also starts here is the Windows updater child's;
-  # nothing to start yet.
+  # The auto-update poller is not started here: the LAUNCHER starts it (Invoke-UpdateChecks in
+  # turma-agent.ps1, XERK-674), which covers both this pidfile path and the WinSW service path
+  # uniformly — unlike the bash ctl, which starts its own --loop poller on the nohup path.
 }
 
 # --- the commands ------------------------------------------------------------------------

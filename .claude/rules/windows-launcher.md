@@ -88,12 +88,14 @@ Kept out to stay on XERK-669's scope and testable; each is marked in the source 
 - **The WinSW service that supervises this script** — ADR D2, the service/supervisor child.
 - **The per-session pty-host** replacing tmux+ttyd — ADR D1 (the `TerminalBackend` seam, XERK-668).
   `-Preflight`'s tool list is claude/git/node/python (no tmux/ttyd).
-- **`turma-agent-update` + "every start is an update check"** — a Windows updater child. The bash
-  launcher's update block has no analogue here yet.
 - **Windows INSTALL/packaging** (winget + npm + bundled WinSW, ADR D3) — `install.ps1` (XERK-672,
   below). So the `agent-native.md` "new sibling in all three packaging paths" rule now HAS a Windows
   installer path: a new `agent/*.py` sibling that `hub-agent.py` imports must also land in
   `install.ps1`'s `$RuntimeFiles`/`$RuntimeDirs` copy AND its `$VerifyFiles` list.
+
+The self-updater IS wired now (`turma-agent-update.ps1`, XERK-674, below) — the launcher's
+`Invoke-UpdateChecks` fires it. Its swap is the FOURTH packaging path in that lockstep (see the
+updater section).
 
 ### Manager-side Windows gaps this launcher surfaces (NOT fixed here)
 
@@ -146,8 +148,10 @@ pidfile). Commands mirror the bash ctl: `start|stop|restart|status|logs`, plus t
   as supervised and exits cleanly for WinSW to restart the launcher (XERK-675, `windows-agent.md`);
   only a bash nohup install self-relaunches through the ctl script. So the ctl is operator- and
   installer-facing only.
-- **`start` does NOT also spin up an auto-update poller** (the bash ctl does) — the Windows updater is
-  a later epic child; noted in the source where it wires in.
+- **`start` does NOT spin up the auto-update poller — the LAUNCHER does** (`Invoke-UpdateChecks`,
+  XERK-674), which covers both the service and pidfile paths uniformly. Unlike the bash ctl (which
+  starts its own `--loop` on the nohup path), this ctl stays out of the updater's lifecycle so a
+  session-preserving restart the updater itself triggers cannot kill the poller mid-swap.
 - **What the installer child owns, not this task**: bundling WinSW.exe (as `<service>.exe` beside the
   xml), the winget/npm provisioning, the service account, and laying these files down. The xml carries
   `%BASE%`/account placeholders the installer substitutes.
@@ -207,6 +211,71 @@ bullets for the contract this mirrors.
 - **`-Uninstall` removes the prefix + service but PRESERVES config, `~/.turma`, `~/.claude`** — and
   warns that the detached pty-hosts (broken out of the service job) outlive it, re-adopted on the next
   install's boot. It does NOT sweep them (no `KillMode=process` teardown to run).
+
+## `turma-agent-update.ps1` — the self-updater (XERK-674)
+
+PowerShell port of `agent/native/turma-agent-update`. Updates two things on different schedules,
+the same safety argument as the bash updater — read `.claude/rules/agent-native.md`'s
+`turma-agent-update` bullets for the contract this mirrors. **dsh is NOT carried onto Windows**, so
+there is no `--dsh-only` analogue (unlike the bash updater).
+
+- **Entry points**: `-ClaudeOnly` (awaited, before the manager), `-Boot` (rate-limited start check),
+  `-Loop` (the periodic poller), `(none)` (one-shot), and the internal `-LockedRun`/`-LockedClaude`
+  (Invoke-RunLocked re-execs these under a deadline; the parent already holds the lock).
+- **WinSW has no timer, so the LAUNCHER runs the poller** (`Invoke-UpdateChecks` in `turma-agent.ps1`),
+  started detached and only if one is not already running for this install — its first pass is the
+  on-start agent check AND it polls every `TURMA_UPDATE_INTERVAL`. So it replaces BOTH the bash host's
+  systemd `.timer` and the nohup ctl's `--loop`. Claude Code is fired separately, AWAITED + bounded,
+  before the manager exists (a mid-install `claude` briefly off PATH would kill a session spawned in
+  that window; at start nothing is launching). `TURMA_BOOT_UPDATE=0` opts a host out.
+- **Component-version compare against `manifest.json`, never the release tag** — a carried release
+  (tag ahead, component unchanged) is a NO-OP; comparing the tag reinstalls every poll and mis-stamps
+  VERSION. The Windows COMPONENT key is **`agent-windows`** (`TURMA_MANIFEST_COMPONENT`), the asset
+  **`turma-agent-windows-v<version>.zip`** + a `.zip.sha256` sidecar. **This name + component are the
+  SHARED contract with the one-command installer (XERK-673, `bootstrap.ps1`) and CI packaging
+  (XERK-676, which this task BLOCKS)** — the three must resolve the identical asset; keep them in step.
+  The legacy stream (`agent-windows-v*`) is the pre-cutover/rollback fallback (normally finds nothing).
+- **The payload swap is the FOURTH lockstep packaging path on Windows** (installer copy, `-Verify`
+  list, release staging, updater swap) — it MUST carry `hub-agent.py`'s siblings + `hooks/`, kept in
+  lockstep with `install.ps1`'s `$RuntimeFiles`/`$RuntimeDirs` (a new imported `agent/*.py` sibling
+  added to only some paths is the silent-dark regression). **The swap DELETES the installed `hooks/`
+  before moving the staged one in**, so a payload missing a hook would leave the host with NO guard
+  hook — a missing hook command is a non-blocking hook, so the guard fails OPEN while VERSION, the
+  restart and the log all report clean. Hence `Install-Payload` REFUSES a payload lacking
+  `hub-agent.py` + `tunnel-agent.js` + `hooks/` before it deletes anything. `win/` source is refreshed
+  too, PRESERVING the built `node_modules` (node-pty is a binary dep the updater does not rebuild — the
+  twin of the bash updater leaving ttyd/tmux to `install.sh`; a lockfile bump is healed by a re-run).
+- **sha256-verify before install** (`Test-AndInstall`), atomic file swap via `Move-Item` on the same
+  volume (`$Prefix.update` staging is a sibling), VERSION stamp, and the `updating.json` expected-
+  restart hint (XERK-29) so the restart reads as `updating`, not an outage. Extraction is
+  `Expand-Archive` for the `.zip` asset, `tar` for a legacy `.tar.gz`.
+- **Session-preserving restart via the Windows control surface** — `turma-agentctl.ps1 restart`
+  (WinSW restarts the launcher, the detached pty-hosts break away and survive; the pidfile fallback
+  reaps the control plane and never names a pty-host). NEVER the POSIX `turma-agentctl`.
+- **Claude Code: version-COMPARE, repair-and-verify, remember an unhelpful repair** (XERK-254). ABSENT
+  and UNREADABLE both go to the same repair, VERIFIED afterwards (`Write-ClaudeInstallReport` reads
+  back what the agent now resolves). A repair that leaves the SAME unreadable output is remembered
+  (`~/.turma/claude-unparseable`) and not retried until the output changes — earned only by a repair
+  that actually ran, else a host restarted mid-repair with no network bricks Claude Code permanently.
+  Registry-unreachable / installed-ahead-of-published both stay put. `TURMA_CLAUDE_AUTO_UPDATE=0` pins.
+- **The lock is the bash flock design on Windows primitives** (XERK-549 + XERK-551): an exclusively-
+  opened `FileStream` (`FileShare None`) is the lock (a second updater's Open throws → contended); a
+  .NET file handle is NOT inherited by children, so a hung child never holds it (the bash `9>&-`
+  guarantee, for free), and the OS releases it when the holder dies (a crashed holder needs no
+  reclaim). Taken PER RUN, released BEFORE the sleep. **Prefix-scoped** (`Get-PrefixTag` = sha256 of
+  the resolved `$Prefix`, first 12) tags `update.<tag>.lock`, its `.holder`, and the throttle stamps,
+  so distinct installs never share one. **A wedged run cannot hold it forever**: the agent self-update
+  re-execs as `-LockedRun` under an overall `TURMA_RUN_DEADLINE` (Start-Process + WaitForExit + Kill
+  tree), and a staleness-aware reclaim (holder file = pid+epoch; `TURMA_LOCK_RECLAIM_AFTER`, PID-reuse
+  guard on the command line) kills a LIVE wedged holder past the threshold and retakes. A contended
+  `-Loop` poll RETRIES after `TURMA_POLL_RETRY_SEC`, never forfeits the whole interval; consecutive
+  skips escalate to a WARNING (`update-skip-count.<tag>`, `TURMA_UPDATE_STRAND_WARN_AT`).
+- Tests: `agent/tests/test_turma_agent_update_ps1.ps1` (PowerShell-on-POSIX; gh/npm/claude/the restart
+  stubbed) — the carried-release no-op, carried asset, checksum refusal, legacy fallback, up-to-date
+  no-op, `updating.json` hint, the `hooks/` completeness refusal, prefix-scoped lock, wedged-holder
+  reclaim vs. healthy-holder stand-aside, the boot throttle, and the Claude repair-and-remember path.
+  A real WinSW service / a real `.zip` release are host-verified by later epic children. Static
+  analysis: the same PSScriptAnalyzer gate as the launcher, in `code-scan.yml`.
 
 ## `bootstrap.ps1` — the `irm | iex` front door (XERK-673)
 

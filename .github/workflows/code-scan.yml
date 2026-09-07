@@ -294,10 +294,12 @@ jobs:
             'agent/native/windows/turma-agentctl.ps1',
             'agent/native/windows/install.ps1',
             'agent/native/windows/bootstrap.ps1',
+            'agent/native/windows/turma-agent-update.ps1',
             'agent/tests/test_turma_agent_ps1.ps1',
             'agent/tests/test_turma_agentctl_ps1.ps1',
             'agent/tests/test_install_ps1.ps1',
-            'agent/tests/test_bootstrap_ps1.ps1'
+            'agent/tests/test_bootstrap_ps1.ps1',
+            'agent/tests/test_turma_agent_update_ps1.ps1'
           )
           foreach ($f in $files) {
             $r = Invoke-ScriptAnalyzer -Path $f -Settings $settings -Severity Warning,Error
@@ -340,3 +342,14 @@ jobs:
       - name: Native Windows bootstrap tests (agent/native/windows/bootstrap.ps1)
         shell: pwsh
         run: ./agent/tests/test_bootstrap_ps1.ps1
+      # The native WINDOWS self-updater (agent/native/windows/turma-agent-update.ps1, XERK-674)
+      # is the port of turma-agent-update. Its failure mis-updates the whole native Windows
+      # fleet (hosts we can't push to): a tag-vs-component compare reinstalls every poll, a
+      # payload missing a hook fails the guard OPEN, a wedged lock strands a host on a stale
+      # build. Covers the release scheme (carried-release no-op, carried asset, checksum,
+      # legacy fallback), the hooks/ completeness refusal, the prefix-scoped lock + wedged-holder
+      # reclaim (XERK-549/551), the boot throttle, and the Claude Code repair-and-remember path.
+      # PowerShell-on-POSIX; gh/npm/claude/the restart are stubbed, a real service is host proof.
+      - name: Native Windows updater tests (agent/native/windows/turma-agent-update.ps1)
+        shell: pwsh
+        run: ./agent/tests/test_turma_agent_update_ps1.ps1
