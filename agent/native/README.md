@@ -87,6 +87,45 @@ sha256sum, since it runs before `install.sh` has installed anything — includin
 python3, which is why it reads the release stream with grep rather than a JSON
 parser.
 
+### Windows (native, no WSL)
+
+Same front door, one pasted PowerShell line — `bootstrap.ps1` resolves the newest
+windows-native asset, sha256-verifies it, unpacks it, and hands off to the
+`install.ps1` inside it:
+
+```powershell
+irm https://raw.githubusercontent.com/xerktech/turma/main/agent/native/windows/bootstrap.ps1 | iex
+```
+
+Paste it into the default **Windows PowerShell** — you do not need PowerShell 7
+first. `bootstrap.ps1` runs on 5.1, and because the installer itself requires
+PowerShell 7 (which nothing has provisioned yet), the front door installs it via
+`winget` if it's missing — the one prerequisite it owns, since an installer can't
+provision its own interpreter. Everything else (git, Node, Python, gh, claude, the
+service) is `install.ps1`'s job.
+
+A piped `iex` can't forward options; use the call form for the Windows analog of
+`bash -s -- …`:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/xerktech/turma/main/agent/native/windows/bootstrap.ps1))) -Verify
+& ([scriptblock]::Create((irm .../windows/bootstrap.ps1))) -Prefix 'D:\turma' -NoInstallDeps
+```
+
+Or, from a repo checkout / an extracted release asset, run the installer directly
+under PowerShell 7:
+
+```powershell
+pwsh -File .\install.ps1
+# options: -Prefix DIR  -NoInstallDeps  -Verify  -Uninstall
+```
+
+Default install prefix is `%LOCALAPPDATA%\turma-agent`; config is
+`%APPDATA%\turma-agent\turma-agent.env`. Like the Linux front door it is
+anonymous and resolves by the **asset's own filename version, not the release
+tag**; then `claude /login` once and the host is online. The Windows self-updater
+keeps it current from there.
+
 ### Appliance hosts (TrueNAS SCALE and kin)
 
 Hosts with a **present-but-disabled apt** (TrueNAS shims `apt-get` to an
