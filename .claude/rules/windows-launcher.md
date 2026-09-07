@@ -3,6 +3,7 @@ paths:
   - "agent/native/windows/**"
   - "agent/tests/test_turma_agent_ps1.ps1"
   - "agent/tests/test_turma_agentctl_ps1.ps1"
+  - "agent/tests/test_install_ps1.ps1"
 ---
 
 # `agent/native/windows/` — native (no-WSL) Windows shell layer
@@ -13,8 +14,8 @@ it for *why*; this file is the rules. The shared runtime (`hub-agent.py`, `tunne
 ONE cross-platform codebase (ADR D5); nothing here forks it. The `hub-agent.py` half of the
 Windows port (paths, `%APPDATA%`, icacls, liveness/degradation — XERK-670) is `windows-agent.md`.
 
-This file covers the LAUNCHER (`turma-agent.ps1`, XERK-669) and the SERVICE + CONTROL SURFACE
-(`turma-agent.xml` + `turma-agentctl.ps1`, XERK-671).
+This file covers the LAUNCHER (`turma-agent.ps1`, XERK-669), the SERVICE + CONTROL SURFACE
+(`turma-agent.xml` + `turma-agentctl.ps1`, XERK-671) and the INSTALLER (`install.ps1`, XERK-672).
 
 ## `turma-agent.ps1` — the launcher (XERK-669)
 
@@ -87,10 +88,10 @@ Kept out to stay on XERK-669's scope and testable; each is marked in the source 
   `-Preflight`'s tool list is claude/git/node/python (no tmux/ttyd).
 - **`turma-agent-update` + "every start is an update check"** — a Windows updater child. The bash
   launcher's update block has no analogue here yet.
-- **Windows INSTALL/packaging** (winget + npm + bundled WinSW, ADR D3) — the installer child. The
-  Linux `install.sh`/`release.yml`/`turma-agent-update` do NOT lay these files down, so the
-  `agent-native.md` "new sibling in all three packaging paths" rule does not apply until that child
-  builds the Windows installer.
+- **Windows INSTALL/packaging** (winget + npm + bundled WinSW, ADR D3) — `install.ps1` (XERK-672,
+  below). So the `agent-native.md` "new sibling in all three packaging paths" rule now HAS a Windows
+  installer path: a new `agent/*.py` sibling that `hub-agent.py` imports must also land in
+  `install.ps1`'s `$RuntimeFiles`/`$RuntimeDirs` copy AND its `$VerifyFiles` list.
 
 ### Manager-side Windows gaps this launcher surfaces (NOT fixed here)
 
@@ -159,3 +160,44 @@ pidfile). Commands mirror the bash ctl: `start|stop|restart|status|logs`, plus t
   supervisor actually reaped so a respawning-supervisor fixture's tunnel stays dead), and the
   stale/foreign-pidfile guard (an innocent reused pid survives stop). Static analysis: the same
   PSScriptAnalyzer gate as the launcher. Both in `code-scan.yml`.
+
+## `install.ps1` — the installer (XERK-672)
+
+PowerShell port of `agent/native/install.sh`: idempotent install / `-Verify` / `-Uninstall`. Same
+job, translated onto Windows per ADR D3/D4 — read `.claude/rules/agent-native.md`'s `install.sh`
+bullets for the contract this mirrors.
+
+- **The Windows-specific actions are `$IsWindows`-GATED so the POSIX suite drives the file logic**,
+  the same reason the controller's `Get-Service` is caught and the launcher leaves ConPTY to a host:
+  winget/npm provisioning, the icacls ACL, and WinSW registration all no-op off Windows, while the
+  lay-down / `-Verify` / `-Uninstall` (pure file ops) run identically. The suite runs `-NoInstallDeps`
+  so no provisioning fires. Tests: `agent/tests/test_install_ps1.ps1`.
+- **The lay-down keeps hub-agent.py's Python siblings + `hooks/` BESIDE it, or a runtime runs DARK**
+  (the XERK-528 class): `$RuntimeFiles`/`$RuntimeDirs` mirror `install.sh`'s UNCONDITIONAL set —
+  the two core siblings, `hooks/*.py`, the shared `runtime_projection.py`/`runtime_tail.py`
+  scaffolding, and `qwen_session.py`/`qwen_transcript.py` + the `qwen/` tree. **`tmux.conf` and the
+  dsh toolchain are NOT carried onto Windows.** Plus the Windows terminal layer (`win/`, ADR D1) and
+  the launcher/controller into `bin/`.
+- **`install.ps1`'s copy + `$VerifyFiles` list is ONE of the THREE packaging paths that must stay in
+  lockstep** (`agent-native.md`'s rule, now with a Windows path) — the Windows updater and the
+  release staging are the other two, in their own epic children. A new imported sibling added to only
+  one is the silent-dark regression that rule exists to catch.
+- **The token/config env file gets an OWNER-ONLY NTFS ACL** (`Restrict-FileToOwner`, the chmod-600
+  analog of ADR D4 / `restrict_file_to_owner`): icacls `/inheritance:r /grant:r <user>:F SYSTEM:F`,
+  Windows-only and BEST-EFFORT (the bytes are already on disk; a failure warns, never aborts). Config
+  lands at `%APPDATA%\turma-agent\turma-agent.env` — the launcher's default and `agent_env_path()`'s
+  Windows fallback — written ONCE (a re-run preserves an operator-edited token, never overwrites).
+- **The WinSW descriptor is RENDERED, not consumed raw**: `%BASE%` → the real prefix (WinSW's own
+  `%BASE%` would be `bin\` and mis-resolve `%BASE%\bin\turma-agent.ps1`), and the placeholder
+  `TURMA_AGENT_ENV` value → the real `%APPDATA%` config path. `%USERPROFILE%` in `<logpath>` is left
+  for WinSW to expand. Then `turma-agentctl install` + `restart` wires + session-preservingly
+  restarts it — the twin of `install.sh`'s `systemctl try-restart`.
+- **WinSW is a PINNED download** (`Get-WinSW`, into `bin\<service>.exe` where `turma-agentctl install`
+  expects it), the bundled-binary analog of `install.sh`'s static ttyd/glab; a release build may
+  bundle it instead. **The pty layer's `node-pty`+`ws` are `npm ci`'d into `$Prefix\win`**
+  (`Ensure-PtyLayer`) — node-pty ships Windows prebuilds, so no VS build tools in the common case.
+- **Source resolution mirrors `install.sh`**: the shared runtime is at `..\..` (agent/) from a repo
+  checkout, or BESIDE the script in a release tarball — probed via `hub-agent.py` next to the script.
+- **`-Uninstall` removes the prefix + service but PRESERVES config, `~/.turma`, `~/.claude`** — and
+  warns that the detached pty-hosts (broken out of the service job) outlive it, re-adopted on the next
+  install's boot. It does NOT sweep them (no `KillMode=process` teardown to run).

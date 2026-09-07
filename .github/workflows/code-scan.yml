@@ -292,8 +292,10 @@ jobs:
           $files = @(
             'agent/native/windows/turma-agent.ps1',
             'agent/native/windows/turma-agentctl.ps1',
+            'agent/native/windows/install.ps1',
             'agent/tests/test_turma_agent_ps1.ps1',
-            'agent/tests/test_turma_agentctl_ps1.ps1'
+            'agent/tests/test_turma_agentctl_ps1.ps1',
+            'agent/tests/test_install_ps1.ps1'
           )
           foreach ($f in $files) {
             $r = Invoke-ScriptAnalyzer -Path $f -Settings $settings -Severity Warning,Error
@@ -314,3 +316,14 @@ jobs:
       - name: Native Windows controller tests (agent/native/windows/turma-agentctl.ps1)
         shell: pwsh
         run: ./agent/tests/test_turma_agentctl_ps1.ps1
+      # The native WINDOWS installer (agent/native/windows/install.ps1, XERK-672) is the
+      # port of install.sh. Its silent failure is the XERK-528 class: a hub-agent.py sibling
+      # or hook missing from the lay-down runs that runtime DARK (blank chat/history while
+      # the TUI stays live), and the installer copy + -Verify list is one of the three
+      # packaging paths that must stay in lockstep. Covers the full lay-down, the config
+      # DEVICE_NAME seed + token-preserve, the rendered WinSW descriptor, idempotent heal,
+      # -Verify presence, and -Uninstall preservation. The winget/npm/icacls/WinSW halves
+      # are $IsWindows-gated (host proof); PowerShell-on-POSIX drives the file logic.
+      - name: Native Windows installer tests (agent/native/windows/install.ps1)
+        shell: pwsh
+        run: ./agent/tests/test_install_ps1.ps1
