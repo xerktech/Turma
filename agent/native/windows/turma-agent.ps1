@@ -19,14 +19,15 @@
 #   5. idle (never crash-loop) when the Claude subscription login is absent;
 #   6. start + wait on the shared manager (hub-agent.py) as the long-lived process.
 #
+# The self-updater (turma-agent-update.ps1, XERK-674) and its "every start is an update
+# check" ARE wired now — see Invoke-UpdateChecks below (Claude Code awaited before the
+# manager; the agent self-update poller started detached, the Windows stand-in for the
+# systemd .timer WinSW has no analogue for).
+#
 # Deliberately NOT here, each owned by a later epic child (kept out to keep this focused
 # and testable, and marked below where they wire in):
 #   * the Windows SERVICE wrapper (WinSW) that supervises THIS script — ADR D2;
-#   * the per-session pty-host that replaces tmux+ttyd — ADR D1;
-#   * `turma-agent-update` (the self-updater) and its "every start is an update check" —
-#     a Windows updater child; the bash launcher's update block has no analogue yet;
-#   * the token self-enroll loop (TURMA_AGENT_SELF_ENROLL) — the token-onboarding child.
-#     We still EXPORT TURMA_AGENT_ENV here, which is that flow's launcher-side hook.
+#   * the per-session pty-host that replaces tmux+ttyd — ADR D1.
 
 [CmdletBinding()]
 param(
@@ -69,6 +70,7 @@ $SelfDir  = Split-Path -Parent $SelfPath           # $Prefix\bin
 $Prefix   = Split-Path -Parent $SelfDir            # $Prefix
 $Manager  = Join-Path $Prefix 'hub-agent.py'
 $Tunnel   = Join-Path $Prefix 'tunnel-agent.js'
+$Updater  = Join-Path $SelfDir 'turma-agent-update.ps1'   # the self-updater (XERK-674)
 
 # USERPROFILE is the $HOME analog every default below hangs off. A Session-0 / SYSTEM
 # service can be launched without it in the environment (the Windows twin of the
@@ -321,6 +323,77 @@ if ($Preflight) {
 Invoke-SelfEnroll
 
 Report-Creds
+
+# --- update checks on every start (XERK-254 / XERK-674) --------------------------------
+# A restart — an operator's, WinSW's after a crash, the hub's token-roll, a host reboot — is
+# the moment to be running current code, so every start checks both halves of what this host
+# runs. They are fired DIFFERENTLY, and the difference is the whole safety argument:
+#   * Claude Code, AWAITED, right here, before the manager exists. Replacing the npm package
+#     leaves `claude` briefly absent from PATH and a session launched in that window dies on
+#     exec; before the manager starts nothing can be launching. Bounded by a deadline so a slow
+#     registry delays but cannot hang the start.
+#   * The agent self-update, via a DETACHED poller. WinSW has no timer (unlike the bash host's
+#     systemd .timer), so the launcher starts the poller itself; it does the on-start agent
+#     check (its first pass) AND the periodic poll. Started only if one is not already running,
+#     so a session-preserving restart (which the updater itself triggers) does not stack
+#     pollers, and its first pass is rate-limited so a crash-looping unit cannot turn WinSW's
+#     restart into a check every few seconds. TURMA_BOOT_UPDATE=0 opts out.
+# dsh is NOT provisioned on Windows, so there is no dsh check here (unlike the bash launcher).
+function Get-IntEnv([string]$Value, [int]$Default) {
+  if ($Value -and ($Value -match '^\d+$')) { $n = [int]$Value; if ($n -gt 0) { return $n } }
+  return $Default
+}
+# A running -Loop poller for THIS install (its command line names our updater + -Loop).
+function Get-UpdatePoller {
+  @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+      $cl = $null; try { $cl = $_.CommandLine } catch { return $false }
+      if (-not $cl) { return $false }
+      return ($cl.Contains($Updater) -and $cl.Contains('-Loop'))
+    })
+}
+function Invoke-UpdateChecks {
+  if ((Coalesce $env:TURMA_BOOT_UPDATE '1') -eq '0') { return }
+  if (-not (Test-Path -LiteralPath $Updater)) { return }
+  New-Item -ItemType Directory -Force -Path (Join-Path $env:USERPROFILE '.turma') -ErrorAction SilentlyContinue | Out-Null
+
+  # Claude Code, AWAITED + bounded. The deadline is a FIXED generous number floored well clear
+  # of the npm install budget (2.5x, as the bash launcher does) so it cannot fire mid-install —
+  # `Kill` would only interrupt a version read or a registry query, orphaning nothing, but an
+  # install killed halfway leaves NO claude where letting it be is merely stale.
+  $installBudget = Get-IntEnv $env:TURMA_NPM_INSTALL_TIMEOUT 300
+  $deadline = Get-IntEnv $env:TURMA_CLAUDE_UPDATE_TIMEOUT 1800
+  $min = [int]($installBudget * 5 / 2)
+  if ($deadline -lt $min) {
+    Log "[turma-agent] TURMA_CLAUDE_UPDATE_TIMEOUT=${deadline}s could fire mid-install; using ${min}s"
+    $deadline = $min
+  }
+  Log "[turma-agent] checking Claude Code before any session can launch (bounded at ${deadline}s)"
+  try {
+    $c = Start-Process -FilePath (Get-Process -Id $PID).Path `
+      -ArgumentList @('-NoProfile', '-File', $Updater, '-ClaudeOnly') -PassThru -NoNewWindow
+    if (-not $c.WaitForExit($deadline * 1000)) {
+      Log "[turma-agent] claude update check did not finish in ${deadline}s; carrying on (a mid-install claude may briefly be missing)"
+      try { $c.Kill($true) } catch { }
+    }
+  } catch {
+    Log "[turma-agent] claude update check could not run ($_); carrying on"
+  }
+
+  # The agent self-update poller (the WinSW-has-no-timer stand-in for the systemd .timer),
+  # started detached only if one is not already running for this install.
+  if ((Get-UpdatePoller).Count -eq 0) {
+    Log "[turma-agent] starting the auto-update poller (detached)"
+    try {
+      Start-Process -FilePath (Get-Process -Id $PID).Path `
+        -ArgumentList @('-NoProfile', '-File', $Updater, '-Loop') | Out-Null
+    } catch {
+      Log "[turma-agent] could not start the auto-update poller ($_); carrying on"
+    }
+  }
+}
+# Placed BEFORE the credential gate: a host idling for want of a Claude login is exactly a host
+# that should still be picking up new builds, and a MISSING claude is something this installs.
+Invoke-UpdateChecks
 
 # The one fatal check: Remote Control needs a subscription OAuth login. Idle rather than
 # crash-loop, so the service self-heals the moment the user logs in on the host without a
