@@ -42,10 +42,10 @@ paths:
 ### What a release builds vs carries
 
 - Only **changed** components build; **unchanged** are CARRIED at their prior version. Every release
-  publishes all four.
+  publishes all five.
 - Images: carried → manifest references the prior `:version` tag (no retag). Assets
-  (`.ehpk`/`.apk`/`.tar.gz`): carried → copied forward under the **ORIGINAL name** (installers and
-  the native bootstrap/updater resolve by filename, never by tag).
+  (`.ehpk`/`.apk`/`.tar.gz`/`.zip`): carried → copied forward under the **ORIGINAL name** (installers
+  and the native bootstrap/updater resolve by filename, never by tag).
 - Per-release **`manifest.json`** is the machine-readable source of truth (version + bits location),
   read by the next release's `plan`, the native updater, and humans. `CLAUDE_CODE_VERSION` is pinned
   but NOT part of the version.

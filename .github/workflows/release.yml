@@ -539,6 +539,12 @@ jobs:
              agent/native/windows/turma-agentctl.ps1 \
              agent/native/windows/turma-agent-update.ps1 \
              agent/native/windows/turma-agent.xml "$STAGE/"
+          # The config template — the SAME file the Linux tarball ships. install.ps1's
+          # Install-Config probes native/turma-agent.env then, in this FLAT zip, beside
+          # itself; without it a fresh host writes no turma-agent.env and cannot onboard
+          # (TURMA_URL/TURMA_TOKEN unset -> the launcher idles, and self-enroll only rolls
+          # a token into an EXISTING config). The .env is shared across bash + Windows hosts.
+          cp agent/native/turma-agent.env "$STAGE/"
           echo "$VERSION" > "$STAGE/VERSION"
           ASSET="turma-agent-windows-v${VERSION}.zip"
           ( cd "$STAGE" && zip -r -q -X "$GITHUB_WORKSPACE/$ASSET" . )
