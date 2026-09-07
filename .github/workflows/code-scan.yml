@@ -93,6 +93,11 @@ jobs:
       #     SHA (this repo's convention across all workflows).
       #   - using-http-server: the hub serves plain HTTP on purpose — TLS is
       #     terminated at the Cloudflare tunnel, behind HTTP Basic auth.
+      #   - detect-insecure-websocket: the websocket twin of using-http-server.
+      #     Every ws:// here is LOOPBACK or tunnel-internal — the agent↔ttyd bridge,
+      #     the XERK-668 pty-host's per-session terminal/control servers bound to
+      #     127.0.0.1 (basic-auth + a token), and its host-proof drive — none is an
+      #     external plaintext socket; browser↔hub is wss at the tunnel edge.
       #   - missing-user-entrypoint: the hub image carries no USER directive. It
       #     runs a single node server in its own container with no host bind
       #     mounts, behind TLS + Basic auth at the Cloudflare tunnel; there is no
@@ -109,6 +114,7 @@ jobs:
             --config=p/dockerfile \
             --exclude-rule yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag \
             --exclude-rule problem-based-packs.insecure-transport.js-node.using-http-server.using-http-server \
+            --exclude-rule javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket \
             --exclude-rule dockerfile.security.missing-user-entrypoint.missing-user-entrypoint \
             --exclude-rule python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected \
             --error
