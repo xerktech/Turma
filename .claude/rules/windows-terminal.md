@@ -110,5 +110,9 @@ to undo here. Detail: `agent/win/README.md`.
 - Host proof: `agent/win/drive.mjs` (`npm run drive`) — spawn (via a spawner that
   exits, proving the child outlives it) → HTTP surface (302/index/token/auth) →
   attach/detach/reattach with scrollback → control → adopt-from-state → teardown.
-  Linux/forkpty only; ConPTY-in-Session-0 + job-object breakaway stay host-proof
-  on real Windows (ADR open questions).
+  **OS-aware child** (`CHILD_CMD` = a POSIX shell on forkpty, `%COMSPEC%` on
+  ConPTY), so it runs on BOTH backends — do not re-hardcode `/bin/bash` (XERK-678).
+  Host-verified **24/24 on real Windows ConPTY** (XERK-678, node-pty 1.1.0 bundled
+  win32-x64 prebuild). Still un-exercised by the plain drive: ConPTY inside a
+  Session-0 WinSW service + job-object breakaway (need the real service; ADR open
+  questions).
