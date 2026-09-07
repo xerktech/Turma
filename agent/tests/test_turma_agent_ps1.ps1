@@ -387,6 +387,83 @@ JIRA_TOKEN: "ATATT3xFf-s3cret-whose-value-contains=an-equals-sign"
   else { Fail "a manager log appeared despite python being absent" }
   try { Stop-Process -Id $noPy.Id -Force } catch { }
   Stop-Supervisors
+
+  # --- XERK-578 token self-enroll (XERK-675, the Windows launcher half) ----------------
+  # A dedicated bin whose `python` stub stands in for BOTH hub-agent.py entrypoints: on
+  # `--enroll` it emulates a successful enroll_self (rewrite TURMA_TOKEN in $TURMA_AGENT_ENV
+  # to a derived token, exit $ENROLL_RC — the real one verifies the name half and writes
+  # atomically); with no --enroll it is the manager, recording the TURMA_TOKEN it inherited.
+  # The manager's recorded token is the round-trip's observable: it is the derived token iff
+  # the launcher enrolled AND re-read TURMA_TOKEN from the rolled file into the env the
+  # manager inherits.
+  Set-BaseEnv   # restore a PATH with chmod on it (case 11 scoped PATH to a node-only dir)
+  $enrollBin = Join-Path $Work 'enroll-bin'
+  New-Item -ItemType Directory -Force -Path $enrollBin | Out-Null
+  Copy-Item (Join-Path $StubBin 'node') (Join-Path $enrollBin 'node')
+  $EnrollLog = Join-Path $Work 'enroll.log'
+  New-ShStub (Join-Path $enrollBin 'python') @"
+case "`$*" in
+  *--enroll*)
+    echo "enroll-called rc=`${ENROLL_RC:-0}" >> "$EnrollLog"
+    rc="`${ENROLL_RC:-0}"
+    if [ "`$rc" = 0 ]; then
+      tmp="`$TURMA_AGENT_ENV.tmp"
+      grep -v -E '^[[:space:]]*(export[[:space:]]+)?TURMA_TOKEN=' "`$TURMA_AGENT_ENV" > "`$tmp" 2>/dev/null || true
+      printf 'TURMA_TOKEN=%s\n' "`${DERIVED_TOKEN}" >> "`$tmp"
+      mv "`$tmp" "`$TURMA_AGENT_ENV"
+    fi
+    exit "`$rc"
+    ;;
+  *)
+    echo "token=`${TURMA_TOKEN:-unset}" > "$ManagerLog"
+    sleep 30
+    ;;
+esac
+"@
+
+  # Helper: run the launcher against a fresh copy of $goodCfg with the enroll bin on PATH,
+  # returning the token the manager recorded (or '' if it never started).
+  function Invoke-EnrollCase([hashtable]$Env) {
+    Reset-Launchers
+    Remove-Item $ManagerLog, $EnrollLog -ErrorAction SilentlyContinue
+    $cfg = Join-Path $Work 'enroll.env'
+    Set-Content -Path $cfg -Value "TURMA_URL=https://hub.invalid`nTURMA_TOKEN=master-shared`n"
+    Set-BaseEnv
+    $env:TURMA_AGENT_ENV = $cfg
+    $env:PATH = @($enrollBin, '/usr/bin', '/bin') -join ':'
+    $env:DERIVED_TOKEN = 'VEVTVEJPWA.deadbeef'   # name half decodes to TESTBOX
+    Remove-Item env:TURMA_AGENT_SELF_ENROLL, env:ENROLL_RC -ErrorAction SilentlyContinue
+    foreach ($k in $Env.Keys) { Set-Item -Path "env:$k" -Value $Env[$k] }
+    Start-Launcher @() (Join-Path $Work 'enroll-run.log') | Out-Null
+    $started = Wait-For { (Test-Path $ManagerLog) -and ((Get-Item $ManagerLog).Length -gt 0) }
+    $tok = if ($started) { (Select-String -Path $ManagerLog -Pattern '^token=(.*)$').Matches[0].Groups[1].Value } else { '' }
+    Reset-Launchers
+    return $tok
+  }
+
+  # --- Case 12: opted in + hub succeeds → the manager runs on the DERIVED token ---------
+  Note "case: self-enroll rolls the host onto its derived token"
+  $tok = Invoke-EnrollCase @{ TURMA_AGENT_SELF_ENROLL = '1' }
+  if (Test-Path $EnrollLog) { Ok "ran hub-agent.py --enroll on start" }
+  else { Fail "self-enroll never invoked --enroll: $(Get-Content (Join-Path $Work 'enroll-run.log') -Raw -ErrorAction SilentlyContinue)" }
+  if ($tok -eq 'VEVTVEJPWA.deadbeef') { Ok "manager re-authenticated on the derived token (re-read from the rolled file)" }
+  else { Fail "manager ran on '$tok', not the derived token — the roll did not take effect" }
+
+  # --- Case 13: NOT opted in (default) → no enroll, master token untouched --------------
+  Note "case: self-enroll is off by default — no enroll, current token kept"
+  $tok = Invoke-EnrollCase @{ }
+  if (-not (Test-Path $EnrollLog)) { Ok "did not touch --enroll when TURMA_AGENT_SELF_ENROLL is unset" }
+  else { Fail "enrolled without opt-in" }
+  if ($tok -eq 'master-shared') { Ok "manager stayed on the existing token" }
+  else { Fail "token changed to '$tok' without opt-in" }
+
+  # --- Case 14: opted in but hub too old (exit 2) → soft skip, stay on current token ----
+  Note "case: a hub too old to enroll (exit 2) is a soft skip, not a failed start"
+  $tok = Invoke-EnrollCase @{ TURMA_AGENT_SELF_ENROLL = 'yes'; ENROLL_RC = '2' }
+  if (Test-Path $EnrollLog) { Ok "attempted --enroll (truthy 'yes' opted in)" }
+  else { Fail "did not attempt --enroll for a truthy opt-in" }
+  if ($tok -eq 'master-shared') { Ok "stayed on the current token and still started (soft skip)" }
+  else { Fail "exit 2 did not stay on the current token (got '$tok') — a soft skip must not roll or block" }
 }
 finally {
   Cleanup

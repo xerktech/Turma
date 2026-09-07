@@ -182,9 +182,65 @@ $env:PATH = @($SelfDir, $NpmBin, $env:PATH) -join [System.IO.Path]::PathSeparato
 $TunnelRetrySec = [int](Coalesce $env:TUNNEL_RETRY_SEC '10')
 $Creds = Join-Path $env:USERPROFILE '.claude\.credentials.json'
 
-# XERK-578 (token onboarding) self-enroll loop is intentionally NOT here — that is the
-# token-onboarding child's launcher hook. The TURMA_AGENT_ENV export above is the piece
-# of XERK-578 this launcher owns.
+# --- XERK-578 optional zero-touch token onboarding (self-enroll) ----------------------
+# When opted in (TURMA_AGENT_SELF_ENROLL truthy), roll this host onto its OWN derived agent
+# token (XERK-268/284) on start, so a fleet self-rolls off the shared master with no
+# per-host ritual — the Windows twin of the bash launcher's self-enroll block. IDEMPOTENT
+# (a host already on its derived token is a hub-side no-op) and BEST-EFFORT (never blocks
+# start): a hub too old to offer the endpoint (exit 2), or ANY failure, leaves the current
+# token in place. hub-agent.py --enroll fetches + verifies + writes the new token to $Cfg
+# ATOMICALLY with an owner-only NTFS ACL (restrict_file_to_owner's icacls, the chmod-600
+# analog), refusing to persist a token whose name half is not this host's DEVICE_NAME. On
+# success we re-read ONLY TURMA_TOKEN from the file — re-importing the WHOLE file would
+# reset every blank Windows-relative default we just applied — so the tunnel and manager
+# below start authenticated on the new token. Called from the MAIN run path only (below),
+# never the -TunnelSupervisor re-entry or -Preflight: the manager + supervisor we start
+# inherit the re-read token, and the supervisor's own Import-Config re-reads the rolled
+# file regardless, so one enroll per launcher start is enough.
+function Invoke-SelfEnroll {
+  switch -Regex ((Coalesce $env:TURMA_AGENT_SELF_ENROLL '')) {
+    '^(1|true|yes|on)$' { break }
+    default { return }
+  }
+  if (-not (Test-Path -LiteralPath $Cfg)) { return }
+  $rc = 1
+  try {
+    & python "$Manager" --enroll
+    $rc = $LASTEXITCODE
+  }
+  catch {
+    Log "[turma-agent] self-enroll: could not run the manager's --enroll ($_); staying on the current token"
+    return
+  }
+  # 2 = hub too old (soft skip); any other non-zero = a failure. Either way stay put — the
+  # manager still authenticates on the existing TURMA_TOKEN. --enroll never prints a token.
+  if ($rc -ne 0) { return }
+  # Re-read ONLY TURMA_TOKEN from the (now atomically-rewritten) config. Last assignment
+  # wins, matching how the file is sourced/imported; one layer of surrounding quotes is
+  # stripped, as Import-Config does. Wrapped best-effort like the --enroll call above: on
+  # Windows a just-renamed file can be momentarily locked (AV/indexer/backup handle) or
+  # vanish in a TOCTOU window, and ReadAllLines throws — degrade with one log line and stay
+  # on the current token, not a stack trace to the service log (bash's grep degrades
+  # silently; parity). The enroll already persisted the new token, so the next start reads
+  # it via Import-Config regardless.
+  $rolled = ''
+  try {
+    foreach ($line in [System.IO.File]::ReadAllLines($Cfg)) {
+      if ($line -match '^\s*(export\s+)?TURMA_TOKEN=(.*)$') {
+        $v = $Matches[2]
+        if ($v.Length -ge 2 -and (($v[0] -eq '"' -and $v[-1] -eq '"') -or ($v[0] -eq "'" -and $v[-1] -eq "'"))) {
+          $v = $v.Substring(1, $v.Length - 2)
+        }
+        $rolled = $v
+      }
+    }
+  }
+  catch {
+    Log "[turma-agent] self-enroll: rolled the token but could not re-read $Cfg ($_); the next start picks it up"
+    return
+  }
+  if ($rolled) { $env:TURMA_TOKEN = $rolled }
+}
 
 # --- reverse-tunnel supervisor --------------------------------------------------------
 # Re-entry point: `turma-agent.ps1 -TunnelSupervisor`, backgrounded by the run path. It
@@ -259,6 +315,10 @@ if ($Preflight) {
   }
   exit 0
 }
+
+# Optional token self-enroll (XERK-578), before the credential gate so a host that will
+# idle for a missing Claude login still rolls onto its derived token. Main run path only.
+Invoke-SelfEnroll
 
 Report-Creds
 
