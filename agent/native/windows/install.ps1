@@ -204,7 +204,19 @@ function Ensure-PtyLayer {
     return
   }
   if (-not (Have 'npm')) { Warn "npm not found — cannot install the pty layer (node-pty + ws); install Node first"; return }
-  if (Test-Path -LiteralPath (Join-Path $winDir 'node_modules\node-pty')) { Info "pty layer deps present"; return }
+  # Skip only when the built deps are present AND the lockfile they were built from is
+  # UNCHANGED (a fingerprint stamped inside node_modules, so it travels with the preserved
+  # tree across a re-lay). Bare presence would keep stale deps after a lockfile bump — a
+  # re-run is the interim upgrade path until the Windows updater child, so a bumped
+  # package-lock.json must trigger a rebuild, while an unchanged one skips the needless one.
+  $lockSrc = Join-Path $winDir 'package-lock.json'
+  if (-not (Test-Path -LiteralPath $lockSrc)) { $lockSrc = Join-Path $winDir 'package.json' }
+  $wantHash = (Get-FileHash -LiteralPath $lockSrc -Algorithm SHA256).Hash
+  $stamp = Join-Path $winDir 'node_modules\.turma-deps-lock'
+  $haveHash = if (Test-Path -LiteralPath $stamp) { (Get-Content -LiteralPath $stamp -Raw).Trim() } else { '' }
+  if ((Test-Path -LiteralPath (Join-Path $winDir 'node_modules\node-pty')) -and $haveHash -eq $wantHash) {
+    Info "pty layer deps present (lockfile unchanged)"; return
+  }
   Info "installing the pty terminal layer (node-pty + ws) into $winDir"
   try {
     if (Test-Path -LiteralPath (Join-Path $winDir 'package-lock.json')) {
@@ -213,7 +225,10 @@ function Ensure-PtyLayer {
       & npm --prefix $winDir install | Out-Null
     }
   } catch { }
-  if (-not (Test-Path -LiteralPath (Join-Path $winDir 'node_modules\node-pty'))) {
+  if (Test-Path -LiteralPath (Join-Path $winDir 'node_modules\node-pty')) {
+    # Stamp the lockfile fingerprint so the next re-run can tell a stale tree from a current one.
+    Set-Content -LiteralPath $stamp -Value $wantHash -NoNewline
+  } else {
     Warn "node-pty did not install. The browser terminal (per-session pty-host) will not start until it does."
     Warn "  Retry:  npm --prefix `"$winDir`" install"
   }
