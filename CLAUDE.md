@@ -47,6 +47,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `qwen-migration.md` | `agent/hub-agent.py` | qwen migration + resume: native log as the resumable store |
 | `qwen-delegation.md` | `agent/qwen_transcript.py` | qwen delegation rows + `subagentHistory` |
 | `qwen-peer.md` | `agent/hub-agent.py`, `agent/qwen/peer_*.py` | qwen peer roster + cross-session messaging ([Qwen L]) |
+| `windows-agent.md` | `agent/win/**` | native Windows agent terminal layer (XERK-668): the ttyd drop-in pty-host; rationale in `docs/windows-agent-adr.md` |
 
 ### Editing these files
 

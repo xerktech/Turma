@@ -218,6 +218,13 @@ jobs:
         # fileguard.py). drive-real-dsh.mjs needs a real dsh install and is a
         # host proof, not a CI test — the *.test.mjs glob excludes it.
         run: node --test agent/dsh/guard/test/*.test.mjs
+      - name: Node unit tests (Windows agent terminal layer)
+        # The pure ttyd-protocol module (XERK-668): frame bytes, basic-auth,
+        # /token, -t prefs, base-path redirect, scrollback ring, control protocol,
+        # and the vendored-ttyd hub-integration anchors. Stdlib only (no npm
+        # install) — node-pty is a native addon CI cannot build, so drive.mjs
+        # (which needs it) is a host proof and the *.test.mjs glob excludes it.
+        run: node --test agent/win/test/*.test.mjs
       # The native updater is the only runtime consumer of the release tag
       # scheme and runs on deployed hosts; ShellCheck covers its syntax, this
       # covers its decision (component-version vs tag comparison, carried-release

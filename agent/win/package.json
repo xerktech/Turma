@@ -1,0 +1,14 @@
+{
+  "name": "turma-pty-host",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "XERK-668 — per-session ConPTY-backed terminal layer for the native Windows agent (ttyd + tmux replacement).",
+  "scripts": {
+    "drive": "node drive.mjs"
+  },
+  "dependencies": {
+    "node-pty": "^1.1.0",
+    "ws": "^8.18.0"
+  }
+}
