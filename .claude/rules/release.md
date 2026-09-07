@@ -15,13 +15,29 @@ paths:
 
 ## Unified releases
 
-- **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all four components + a changelog**, cut by
+- **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all five components + a changelog**, cut by
   `release.yml`. **Never split back into per-component workflows** — independent `run_number`
   patches drift out of lockstep.
 - `VERSION` holds `MAJOR.MINOR` only. **Patch is derived from existing `v*` tags** (max+1), never
   committed. Bump `VERSION` only for minor/major.
-- Four components: `turma` (hub) image, native agent tarball, glasses `.ehpk`, android `.apk`. All
-  version math lives in tested `.github/scripts`.
+- Five components: `turma` (hub) image, native agent tarball (`agent-native`), the no-WSL Windows
+  agent zip (`agent-windows`), glasses `.ehpk`, android `.apk`. All version math lives in tested
+  `.github/scripts`.
+- **`agent-native` and `agent-windows` are two builds off ONE shared runtime** (XERK-666):
+  `changes.js`'s `AGENT_RULES` splits `agent/` into native-only (`agent/native/` bash + systemd +
+  tmux + dsh), windows-only (`agent/native/windows/` PowerShell + `agent/win/` pty layer), and the
+  SHARED runtime (`hub-agent.py`, `tunnel-agent.js`, `hooks/`, `qwen*`, `runtime_*`) that builds
+  BOTH. The Windows zip's staging in `release.yml` is the THIRD lockstep packaging path (with
+  `install.ps1`'s lay-down/`$VerifyFiles` and the updater's payload swap) — it MUST stage the same
+  `hub-agent.py` siblings + `hooks/`, or a host updates into a dark runtime (XERK-528).
+- **The Windows asset is the shared 3-way contract**: `turma-agent-windows-v<version>.zip` +
+  `.zip.sha256`, manifest component key **`agent-windows`**. `bootstrap.ps1` (XERK-673) and the
+  updater (XERK-674) resolve + verify exactly that; the updater compares the manifest COMPONENT
+  version (never the tag). A `.zip` (not `.tar.gz`) so a clean box unpacks with `Expand-Archive`.
+- **Introducing a component** (agent-windows on a fleet whose last release predates it): `plan`
+  reads the previous release's `manifest.json` and force-builds any component that manifest can't
+  carry (`manifest.newComponents`), so publish never hits its "unchanged but absent from prev"
+  throw. Self-limiting — the entry exists after that release and carries normally.
 
 ### What a release builds vs carries
 
@@ -60,9 +76,12 @@ paths:
 ## PR gates (pre-merge to main)
 
 - `code-scan.yml` — Semgrep SAST (JS/Python + hub Dockerfile + secret patterns), hadolint on
-  `turma/Dockerfile`, ShellCheck on every shell script, unit tests (`.github/scripts/tests`, native
-  updater/installer/bootstrap shell tests, Python + Node suites). Path-filtered to include
-  `CLAUDE.md`/`.claude/rules/**` so a docs-only PR still runs the size gate.
+  `turma/Dockerfile`, ShellCheck on every shell script, **PSScriptAnalyzer on the Windows agent's
+  PowerShell** (the ShellCheck analog, `PSScriptAnalyzerSettings.psd1`), unit tests
+  (`.github/scripts/tests`, native updater/installer/bootstrap shell tests, the Windows
+  PowerShell-on-POSIX suites + the `agent/win` pty-protocol test, Python + Node suites).
+  Path-filtered to include `CLAUDE.md`/`.claude/rules/**` so a docs-only PR still runs the size gate.
+  All jobs run on GitHub-hosted runners (`ubuntu-latest`; `pwsh` ships there).
 - **Instruction file size limits** — `CLAUDE.md` + every `.claude/rules/*.md` must stay under 40,000
   characters (Claude Code's own perf threshold). Measured in CHARS not bytes (`wc -m`). See
   `CLAUDE.md`'s "Editing these files".

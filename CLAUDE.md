@@ -399,14 +399,16 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 
 Full detail in `release.md`.
 
-- **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all four components + a changelog**, cut by
+- **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all five components + a changelog**, cut by
   `.github/workflows/release.yml`. Never split back into per-component workflows.
-- The four components: `turma` image, native agent tarball, glasses `.ehpk`, android `.apk`.
+- The five components: `turma` image, native agent tarball (`agent-native`), the no-WSL Windows agent
+  zip (`agent-windows`, XERK-666), glasses `.ehpk`, android `.apk`. The two agent builds share ONE
+  runtime; `changes.js`'s `AGENT_RULES` decides which build(s) a change feeds.
 - The root **`VERSION`** holds `MAJOR.MINOR` only; **the patch is derived from existing `v*` tags and
   never committed**. Bump `VERSION` only for a minor/major.
 - Only **changed** components build; unchanged ones are **carried** at their prior version. Every
-  release publishes all four.
-- PR gates that block a merge: `code-scan.yml` (Semgrep, hadolint, ShellCheck, unit tests, the
-  instruction-file size limits), `turma-image-scan.yml`, `glasses-ci.yml`, `android-ci.yml`.
+  release publishes all five.
+- PR gates that block a merge: `code-scan.yml` (Semgrep, hadolint, ShellCheck, PSScriptAnalyzer, unit
+  tests, the instruction-file size limits), `turma-image-scan.yml`, `glasses-ci.yml`, `android-ci.yml`.
 - **Every workflow runs on GitHub-hosted `ubuntu-latest`.** The self-hosted-box workarounds were
   deleted, not disabled — reintroducing any is a regression.

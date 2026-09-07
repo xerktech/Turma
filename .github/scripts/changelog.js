@@ -17,6 +17,10 @@
 const COMPONENT_HEADING = {
   turma: "Hub",
   "agent-native": "Agent",
+  // Both native builds share ONE changelog heading — a shared-runtime change
+  // touches both components and would otherwise list twice; the per-platform
+  // versions still show as separate rows in the summary table below.
+  "agent-windows": "Agent",
   glasses: "Glasses",
   android: "Android",
 };
@@ -26,10 +30,11 @@ const HEADING_ORDER = ["Hub", "Agent", "Glasses", "Android", "Other"];
 const COMPONENT_LABEL = {
   turma: "Hub (image)",
   "agent-native": "Agent (native)",
+  "agent-windows": "Agent (Windows)",
   glasses: "Glasses (Even Hub)",
   android: "Android",
 };
-const TABLE_ORDER = ["turma", "agent-native", "glasses", "android"];
+const TABLE_ORDER = ["turma", "agent-native", "agent-windows", "glasses", "android"];
 
 // First line, trimmed, internal whitespace collapsed — a PR title or commit
 // subject that somehow carries a newline can't break a markdown bullet/table.
@@ -131,6 +136,8 @@ const INSTALL_DETAILS = [
   "- **Hub** (image): deployed on the home lab by Watchtower from `:latest`.",
   "  Pin a specific build with the `ghcr.io/...` ref in the table above.",
   "- **Agent (native)**: WSL/Linux hosts self-update from this stream; see `agent/native/README.md`.",
+  "- **Agent (Windows)** (`.zip`): no-WSL Windows hosts; one-line install `irm .../bootstrap.ps1 | iex`,",
+  "  then self-updated from this stream. See `.claude/rules/windows-launcher.md`.",
   "- **Glasses**: published to the Even Hub developer portal (no release asset);",
   "  promote the build there, then update the app from the Even phone app.",
   "- **Android** (`.apk`): download below and install (enable \"install unknown apps\"). Debug-signed.",
