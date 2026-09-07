@@ -23,6 +23,9 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
 | `agent-hooks.md` | `agent/hooks/**` | safety-guard policy, guard + file-guard hooks, AskUserQuestion bridge |
 | `agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
+| `windows-agent.md` | `agent/hub-agent.py` | native Windows portability: paths, %APPDATA%, icacls ACL, liveness/degradation (XERK-670); ADR `docs/windows-agent-adr.md` |
+| `windows-launcher.md` | `agent/native/windows/**` | native Windows launcher (turma-agent.ps1): config-idle, tunnel supervision, PATH, PID/env export (XERK-669) |
+| `windows-terminal.md` | `agent/win/**` | native Windows terminal layer (XERK-668): the ttyd drop-in pty-host; rationale in `docs/windows-agent-adr.md` |
 | `turma.md` | `turma/**` | chrome, org filter, dashboard, notifications, auth |
 | `turma-archive.md` | `turma/archive.js` | durable archive: layers, size ceilings, how the total is measured |
 | `turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
@@ -47,7 +50,6 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `qwen-migration.md` | `agent/hub-agent.py` | qwen migration + resume: native log as the resumable store |
 | `qwen-delegation.md` | `agent/qwen_transcript.py` | qwen delegation rows + `subagentHistory` |
 | `qwen-peer.md` | `agent/hub-agent.py`, `agent/qwen/peer_*.py` | qwen peer roster + cross-session messaging ([Qwen L]) |
-| `windows-agent.md` | `agent/win/**` | native Windows agent terminal layer (XERK-668): the ttyd drop-in pty-host; rationale in `docs/windows-agent-adr.md` |
 
 ### Editing these files
 

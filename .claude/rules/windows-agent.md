@@ -1,109 +1,77 @@
-# Native Windows agent — terminal layer invariants (XERK-668, epic XERK-666)
+---
+paths:
+  - "agent/hub-agent.py"
+  - "agent/tests/test_hub_agent.py"
+---
 
-The per-session **pty-host** replaces the Linux `tmux + ttyd` stack on a native
-Windows host. **The decisions and their rationale (D1-D5, the spike, the open
-questions) are in [`docs/windows-agent-adr.md`](../../docs/windows-agent-adr.md)** —
-read it for *why*; this file is the rules. Code lives in `agent/win/`
-(`agent/win/README.md` is the operator guide + manual drive recipe).
+# Native Windows agent — `hub-agent.py` portability (XERK-670, epic XERK-666)
 
-The load-bearing finding the whole design descends from: on Linux **`tmux` and
-`ttyd` are two views of one session, and `ttyd` is the smaller half** — a Windows
-replacement must absorb ALL FOUR roles (terminal ws, the HTTP client, input,
-capture/persistence), not just the ws bridge.
+The shared runtime is ONE cross-platform codebase — **never forked per OS** (ADR D5,
+`docs/windows-agent-adr.md`). Windows reuses the same `hub-agent.py`; the few Unix-only seams
+dispatch on `IS_WINDOWS = os.name == "nt"` rather than living in a Windows copy. Read the ADR for
+*why*; this is the operative rule.
 
-## The pty-host is a ttyd DROP-IN, byte-for-byte — nothing hub-side changes
+## Scope boundary — the terminal layer is NOT here (XERK-668)
 
-- **`turma/server.js` proxies `/term/<id>/*` to the port unchanged** (`proxyTerm`
-  for HTTP, the ws-proxy for the upgrade). It **buffers the served HTML and injects
-  its font/scroll/OSC52 shims before `</head>`**, and those shims + the jump-to-
-  bottom pill drive ttyd's **`window.term`**. So the pty-host MUST serve a client
-  that keeps `</head>`, `window.term`, the `tty` subprotocol, `/token`, `/ws`, and
-  builds those URLs from `window.location.pathname`. **We do not author that client
-  — we vendor ttyd's real one** (`agent/win/vendor/ttyd-1.7.7/index.html`, captured
-  verbatim from the pinned binary; `PROVENANCE.md` reproduces it). Re-vendoring a
-  newer ttyd MUST re-run the protocol test — its "hub-integration anchor" case is
-  the guard that a new client didn't drop one of those.
-- **The `-c term:<token>` basic-auth is the contract**: the hub proxies every
-  `/term` request with `Authorization: Basic base64(term:<token>)` (`ttydAuth`),
-  so the pty-host validates exactly that on the HTTP surface AND the ws upgrade.
-  `/token` returns `base64("term:<token>")` (ttyd's shape — the value the browser
-  echoes back as the ws init `AuthToken`), verified against the real binary.
-- **The command bytes are DIRECTION-SPECIFIC** and were read off real ttyd 1.7.7,
-  not inferred: client `1`=RESIZE but server `1`=SET_WINDOW_TITLE; client `2`=PAUSE
-  but server `2`=SET_PREFERENCES. Getting one wrong silently breaks the terminal,
-  so they are pinned in `test/tty-protocol.test.mjs`. The server connect sequence
-  is title(`1`) → preferences(`2`) → scrollback(`0`), then live output.
-- **SET_PREFERENCES carries the `-t` flags** `_launch_ttyd` passes (font/fontSize/
-  webgl/…) — `DEFAULT_PREFS` is the fleet-parity set, so a Windows terminal renders
-  like the Linux one. Delivered over the ws on connect, NOT baked into the HTML
-  (ttyd does the same).
+- **`hub-agent.py` never calls the tmux/ttyd CLI through an OS branch of its own.** The tmux/ttyd
+  call sites (`_spawn_in_tmux`, `_type_into_pane`, `_capture_pane`, `_tmux_alive`, `_launch_ttyd`)
+  and `resume_on_boot`'s adopt path are **XERK-668's `TerminalBackend` seam** (the ConPTY pty-host
+  replacing tmux+ttyd, ADR D1). XERK-670 is deliberately seam-INDEPENDENT and touches none of them.
+- So a Windows-portability change here must stay on the **paths / permissions / state-dir / liveness
+  / degradation** side. Anything that drives, captures, spawns or adopts a session's terminal belongs
+  to XERK-668 — do not add a `sys.platform` branch to those call sites from this side.
 
-## Pure protocol vs. I/O shell — the split is a CI constraint, not style
+## Paths & separators (ADR D4)
 
-- **`agent/win/tty-protocol.mjs` owns every wire/auth/framing DECISION and imports
-  NO I/O** (no node-pty, no ws, no http, no fs writes). `code-scan.yml` runs its
-  tests with `node --test` and **installs zero npm deps** (node-pty is a native
-  addon CI cannot build), so anything CI must check lives here. This mirrors how
-  `server.js` hand-rolls its WS framing and the dsh guard splits pure `*.test.mjs`
-  from host-proof drives.
-- **`agent/win/pty-host.mjs` is only the node-pty + ws + http around it** — never
-  imported by CI, only run. Keep new protocol logic in the pure module with a test,
-  not in the shell.
-- **`drive.mjs` is host-proof** (needs the deps) and is EXCLUDED from CI by its
-  filename (not `*.test.mjs`), exactly like the XERK-667 spike. It proves the
-  end-to-end lifecycle on a real pty; re-run it after any shell change.
+- **Use `os.path`/`os.path.join`, never a hard-coded `/`.** Existing joins (`WORKTREES_ROOT`,
+  `CLONES_TMP_ROOT`, `REGISTRY_DIR = expanduser("~/.turma")`, socket/upload/questions dirs) already
+  hold on Windows — `expanduser("~")` resolves to `%USERPROFILE%`, and a dotdir (`.turma`) is fine on
+  NTFS.
+- **The only POSIX literals are the last-resort DEFAULTS** for `REPOS_ROOT` and `PROJECTS_ROOT`,
+  behind `_default_repos_root()` / `_default_projects_root()`. The native launcher normally sets
+  `REPOS_ROOT`/`CLAUDE_PROJECTS_ROOT`, so these fire only against an env that omits them; on Windows
+  they land under `%USERPROFILE%` (`~/.claude/projects` is where Claude Code itself writes there).
+  Keep the container default an explicit POSIX literal — a moved `$HOME` must not silently relocate it.
+- **`_project_slug` is already platform-agnostic** — it maps EVERY non-alphanumeric char (`\`, `:`,
+  `/`, `.`) to `-`, so a Windows cwd (drive letter + backslashes) slugs the same on both sides of the
+  wire. Do not re-introduce a `/`-only mapping. Transcript resolution rides this unchanged.
 
-## Lifecycle — detached, adopted, KillMode=process
+## State dirs (ADR D4)
 
-- **Spawned DETACHED so it outlives a manager restart** (the manager does
-  `spawn(..., {detached:true}); child.unref()`); a fresh manager re-adopts it from
-  the persisted `{pid,termPort,ctrlPort}` state file ALONE — the direct analog of
-  `resume_on_boot`'s `ttydPid`/`ttydPort` probe. The pty-host itself does not
-  "adopt"; it persists state (atomic temp+rename) and keeps running.
-- **Clean SIGTERM/SIGINT tears the pty down; any other spawner death leaves it
-  running** to be re-adopted. This is the `KillMode=process` invariant the D2
-  service child depends on — its job-object breakaway must actually deliver it on
-  real Windows (the ADR open question the Linux backend cannot exercise).
-- **The manager keys `session id → pty-host process` and caps at `MAX_SESSIONS`**,
-  exactly as it caps tmux sessions today. The pty-host is per-session; the cap is
-  the manager's, not the host's.
+- `~/.turma` stays `expanduser("~/.turma")` on both OSes (→ `%USERPROFILE%\.turma`).
+- `~/.config/turma-agent` → **`%APPDATA%\turma-agent`** on Windows: `agent_env_path()`'s fallback
+  branches on `IS_WINDOWS` (`%APPDATA%`, else `~/AppData/Roaming`) vs XDG (`$XDG_CONFIG_HOME`, else
+  `~/.config`). This fallback only fires for a launcher too old to export `TURMA_AGENT_ENV`.
 
-## The control channel is the tmux-CLI replacement (for D5, not wired here)
+## Permissions — `chmod 600` → NTFS ACL (ADR D4)
 
-- **`inject`/`capture`/`alive`/`resize`/`kill` map 1:1 to the tmux calls
-  `hub-agent.py` makes** (`_type_into_pane`/`_capture_pane`/`_tmux_alive`/…). D1
-  (this task) ships and pins that protocol; **wiring `hub-agent.py`'s tmux calls to
-  it is the manager portability pass (D5), a separate child** — do not grow a
-  Windows branch into the tmux paths here.
-- **`capture` returns the raw scrollback RING, not a rendered grid.** `_busy_from_
-  capture` reads the *rendered* pane today, so byte-for-byte parity there needs a
-  headless emulator (`@xterm/headless`) in the pty-host to render the ring — an
-  ADR open question flagged for the drive child, deliberately NOT built here.
-- Control is loopback + a `?token=<token>` shared secret (defence in depth); the
-  manager holds the token and reads `ctrlPort` from the state file.
-- **The pty-host REFUSES to start without `--auth-token`** — unlike ttyd's optional
-  `-c`, the control channel is ours and an empty token would accept unauthenticated
-  `inject`/`kill`; the manager always mints one (`_launch_ttyd`'s
-  `-c term:{TURMA_TOKEN}`), so an empty token is a misconfiguration, not a mode.
-- **The `-m` client cap counts RAW connections, not just inited ones** (`termWss.clients`),
-  or a socket that never sends its init frame bypasses it.
+- **`restrict_file_to_owner(path)` is the cross-platform `chmod 600`.** POSIX: `os.chmod(0o600)`,
+  byte-identical to before. Windows: `icacls <path> /inheritance:r /grant:r <user>:F SYSTEM:F` — the
+  owner-only NTFS ACL. `os.chmod` on Windows only toggles the read-only bit and is NOT a substitute.
+- **Windows is BEST-EFFORT — an icacls failure is LOGGED, never raised.** The bytes are already on
+  disk; refusing here would strand XERK-578 token onboarding over a cosmetic ACL. POSIX still raises,
+  preserving the old contract for existing callers.
+- **It acts only on a REGULAR file (`lstat`, so a symlink is refused)** — the "guard against opening a
+  non-regular path" on the permissions side. Callers create the file first, so this never diverges on
+  the real path.
+- Routed through it: `write_local_model_env`, `rewrite_env_var` (the `TURMA_TOKEN` env file). The
+  per-pid credential-tmp opens carry **`getattr(os, "O_NOFOLLOW", 0)`** (a no-op flag on Windows) so
+  a planted symlink can't redirect the write; `_write_new_file` (uploads) uses the same `getattr`
+  form. Never write bare `os.O_NOFOLLOW` — it does not exist on Windows and raises at call time.
 
-## Truecolor & OSC 52 — preserved, and simpler than the tmux stack
+## Liveness & degradation (already hold — do not regress)
 
-With no multiplexer in the middle, both pass straight through: the child env sets
-`COLORTERM=truecolor` (the analog of `tmux.conf`'s RGB override) so 24-bit color
-reaches truecolor xterm.js, and the app's OSC 52 copy escape reaches the hub's
-injected `TERM_OSC52_JS` handler as raw output. The `tmux.conf` `Ms` +
-`set-clipboard on` existed only to undo tmux's dropping of OSC 52; there is nothing
-to undo here. Detail: `agent/win/README.md`.
+- **`_pid_alive` uses `os.kill(pid, 0)`, which works on Windows** — the generic liveness primitive.
+  The `/proc`-specific cc-socks sweep is a POSIX/dsh feature that already self-guards
+  (`getattr(os, "getuid", None)`, `os.path.isdir("/proc/self")`) and degrades to no-op on Windows.
+- **`startedAt` falls back to the manager's start time** (`run(["docker", ...]) or now_iso()`) and the
+  **container-log tail** to `LOG_TAIL_UNAVAILABLE` (`except Exception`) — both hold on Windows because
+  `run()` returns `""` on a missing binary. Keep these fallbacks; the restart-loop alert keys on a
+  non-empty changing `startedAt`.
 
 ## Tests
 
-- CI: `agent/win/test/tty-protocol.test.mjs` (stdlib only) — pins the command
-  bytes against the capture, the auth/`/token`/prefs/redirect/ring/state/control
-  logic, and the vendored-client hub-integration anchors.
-- Host proof: `agent/win/drive.mjs` (`npm run drive`) — spawn (via a spawner that
-  exits, proving the child outlives it) → HTTP surface (302/index/token/auth) →
-  attach/detach/reattach with scrollback → control → adopt-from-state → teardown.
-  Linux/forkpty only; ConPTY-in-Session-0 + job-object breakaway stay host-proof
-  on real Windows (ADR open questions).
+`TestWindowsPortability` in `test_hub_agent.py` MOCKS `IS_WINDOWS` so the Windows branch is verified
+on Linux CI: the icacls owner-only ACL, its best-effort swallow, the non-regular-path refusal, the
+`%APPDATA%` env-path fallback, and the profile-relative default roots. The POSIX branches stay pinned
+by the existing `TestSetToken`/local-model-env cases (0600 preserved).

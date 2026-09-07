@@ -268,3 +268,27 @@ jobs:
       # unattended no-hang, NOPASSWD, and a declined password. Shell + sudo stubs.
       - name: Native installer sudo-probe tests (agent/native/install.sh)
         run: ./agent/tests/test_install_sudo.sh
+      # The native WINDOWS launcher (agent/native/windows/turma-agent.ps1, XERK-669)
+      # is the PowerShell port of the bash launcher, so it gets the same coverage:
+      # PSScriptAnalyzer is the ShellCheck analog (correctness rules on, tuned by the
+      # settings file beside it), and the behavioural suite pins the same launcher
+      # decisions the bash test does — supervisor respawn, missing-node heal, the
+      # manager pid the tunnel's poke targets, config-idle, PATH-reaches-claude. pwsh
+      # ships on ubuntu-latest; the harness is PowerShell-on-POSIX with /bin/sh stubs,
+      # exactly as the bash suite runs on the same runner (WinSW/ConPTY stay host proof).
+      - name: PowerShell static analysis (agent/native/windows)
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $settings = 'agent/native/windows/PSScriptAnalyzerSettings.psd1'
+          $fail = 0
+          foreach ($f in @('agent/native/windows/turma-agent.ps1','agent/tests/test_turma_agent_ps1.ps1')) {
+            $r = Invoke-ScriptAnalyzer -Path $f -Settings $settings -Severity Warning,Error
+            if ($r) { Write-Host "::error::$f"; $r | Format-Table RuleName,Severity,Line,Message -AutoSize | Out-String | Write-Host; $fail = 1 }
+            else { Write-Host "${f}: clean" }
+          }
+          exit $fail
+      - name: Native Windows launcher tests (agent/native/windows/turma-agent.ps1)
+        shell: pwsh
+        run: ./agent/tests/test_turma_agent_ps1.ps1
