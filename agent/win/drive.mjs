@@ -27,6 +27,12 @@ const EVIDENCE = join(HERE, 'drive-evidence.txt');
 function out(line) { process.stdout.write(line + '\n'); try { appendFileSync(EVIDENCE, line + '\n'); } catch {} }
 const SESSION = 'driveA';
 const TOKEN = 'drive-secret-token';
+// The pty child. node-pty binds forkpty on POSIX and ConPTY on Windows; the child
+// must be a shell that actually exists on the host (there is no `/bin/bash` on a
+// native Windows box), or ConPTY/CreateProcess fails at spawn and the whole drive
+// aborts. `echo <marker>` — the only child command the checks below rely on —
+// prints the marker in both cmd.exe and a POSIX shell.
+const CHILD_CMD = process.platform === 'win32' ? (process.env.COMSPEC || 'cmd.exe') : '/bin/bash';
 const BASE = `/term/${SESSION}`;
 const CRED = 'Basic ' + Buffer.from(`term:${TOKEN}`).toString('base64');
 const AUTH_TOKEN = Buffer.from(`term:${TOKEN}`).toString('base64'); // the /token value + ws init AuthToken
@@ -104,7 +110,7 @@ async function main() {
     `const c=spawn(process.execPath,` +
     `${JSON.stringify([join(HERE, 'pty-host.mjs'),
       '--session', SESSION, '--base-path', BASE, '--state', STATE, '--auth-token', TOKEN,
-      '--', '/bin/bash'])},` +
+      '--', CHILD_CMD])},` +
     `{detached:true,stdio:['ignore',fd,fd]});c.unref();process.exit(0);`;
   const spawner = spawn(process.execPath, ['-e', spawnerSrc], { stdio: 'ignore' });
   await new Promise((r) => spawner.on('exit', r));
