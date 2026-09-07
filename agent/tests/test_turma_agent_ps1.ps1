@@ -126,6 +126,22 @@ function Stop-Supervisors {
     $cl -and $cl.Contains($LauncherPath) -and $cl.Contains('-TunnelSupervisor')
   } | ForEach-Object { try { $_.Kill() } catch { } }
 }
+# Kill EVERY launcher/supervisor this suite spawned and WAIT until none remain. A supervisor
+# is backgrounded a beat after its launcher boots, so a fire-and-forget kill can race and
+# leak one into the next case (which then miscounts). Killing all $LauncherPath processes
+# converges — a killed launcher's manager stub never respawns a supervisor. Used to give the
+# supervisor-counting cases (4/5/11) a deterministic clean slate on a loaded CI runner.
+function Reset-Launchers {
+  for ($i = 0; $i -lt 40; $i++) {
+    $procs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $cl = $null; try { $cl = $_.CommandLine } catch { }
+        $cl -and $cl.Contains($LauncherPath)
+      })
+    if ($procs.Count -eq 0) { return }
+    foreach ($p in $procs) { try { $p.Kill() } catch { } }
+    Start-Sleep -Milliseconds 150
+  }
+}
 
 # Start the launcher (or a re-entry mode) as a child pwsh, inheriting the case's env, with
 # its combined stdout+stderr captured to $OutFile. The redirection is done by /bin/sh at
@@ -224,12 +240,15 @@ try {
   Set-BaseEnv
   $env:TURMA_AGENT_ENV = $goodCfg
   Start-Launcher @() (Join-Path $Work 'run2.log') | Out-Null
-  Start-Sleep -Seconds 1
+  # WAIT for the supervisor to appear (it is backgrounded a beat after the launcher boots —
+  # on a loaded CI runner that can exceed a fixed 1s), THEN settle briefly and assert there
+  # is exactly one (a duplicate would also have appeared by now).
+  $null = Wait-For { (Count-Supervisors) -ge 1 }
+  Start-Sleep -Milliseconds 500
   $n = Count-Supervisors
   if ($n -eq 1) { Ok "exactly one supervisor after a restart" }
   else { Fail "expected 1 supervisor, found $n (a duplicate tunnel fights for the channel)" }
-  Stop-Supervisors
-  Get-Process -ErrorAction SilentlyContinue | Where-Object { $cl = $null; try { $cl = $_.CommandLine } catch { }; $cl -and $cl.Contains($LauncherPath) } | ForEach-Object { try { $_.Kill() } catch { } }
+  Reset-Launchers
 
   # --- Case 5: a non-assignment config line idles, does NOT crash-loop -----------------
   Note "case: an invalid config line is reported and idled on"
@@ -242,6 +261,7 @@ JIRA_SITE: "xerktech.atlassian.net"
 JIRA_TOKEN: "ATATT3xFf-s3cret-whose-value-contains=an-equals-sign"
 "@
   Remove-Item $ManagerLog -ErrorAction SilentlyContinue
+  Reset-Launchers   # deterministic clean slate: no leftover supervisor from a prior case
   Set-BaseEnv
   $env:TURMA_AGENT_ENV = $badCfg
   $bad = Start-Launcher @() (Join-Path $Work 'bad.log')
@@ -305,7 +325,7 @@ JIRA_TOKEN: "ATATT3xFf-s3cret-whose-value-contains=an-equals-sign"
   else { Fail "manager never started under the curated PATH: $(Get-Content (Join-Path $Work 'run3.log') -Raw -ErrorAction SilentlyContinue)" }
   if (Select-String -Quiet 'claude not on PATH' (Join-Path $Work 'run3.log')) { Fail "warned about a claude it can actually reach" }
   else { Ok "no spurious warning when claude is reachable" }
-  Get-Process -ErrorAction SilentlyContinue | Where-Object { $cl = $null; try { $cl = $_.CommandLine } catch { }; $cl -and $cl.Contains($LauncherPath) } | ForEach-Object { try { $_.Kill() } catch { } }
+  Reset-Launchers
 
   # --- Case 9: a genuinely missing claude is warned about, loudly ----------------------
   Note "case: missing claude is a loud warning, not a silent failure"
@@ -317,7 +337,7 @@ JIRA_TOKEN: "ATATT3xFf-s3cret-whose-value-contains=an-equals-sign"
   else { Fail "no claude warning — the failure would be silent again: $(Get-Content (Join-Path $Work 'run4.log') -Raw -ErrorAction SilentlyContinue)" }
   if (Wait-For { (Test-Path $ManagerLog) -and ((Get-Item $ManagerLog).Length -gt 0) }) { Ok "manager still started (log-only, self-heals when claude appears)" }
   else { Fail "launcher refused to start over a missing claude" }
-  Get-Process -ErrorAction SilentlyContinue | Where-Object { $cl = $null; try { $cl = $_.CommandLine } catch { }; $cl -and $cl.Contains($LauncherPath) } | ForEach-Object { try { $_.Kill() } catch { } }
+  Reset-Launchers
 
   # --- Case 10: USERPROFILE unset (service context) does not kill the launcher ---------
   # The Windows twin of the bash "HOME unset" trap: a Session-0 service can be launched
@@ -348,6 +368,7 @@ JIRA_TOKEN: "ATATT3xFf-s3cret-whose-value-contains=an-equals-sign"
   New-Item -ItemType Directory -Force -Path $noPyBin | Out-Null
   Copy-Item (Join-Path $StubBin 'node') (Join-Path $noPyBin 'node')   # node present, python absent
   Remove-Item $ManagerLog -ErrorAction SilentlyContinue
+  Reset-Launchers   # deterministic clean slate before asserting NO supervisor
   Set-BaseEnv
   $env:TURMA_AGENT_ENV = $goodCfg
   # Deliberately NO python anywhere on PATH (this host has a real /usr/bin/python, so the
