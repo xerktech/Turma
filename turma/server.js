@@ -4387,7 +4387,15 @@ function hostAutoPaused(key, a, paused) {
 // atomically, so an endpoint answering thousands of ids, or one malformed
 // entry, from ONE host would drop the whole fleet from every phone (the
 // PEER_CELL_MAX / retiredUsage failure class the ticket calls out).
-const LOCAL_MODEL_LIST_MAX = 200;
+//
+// The bound is 200, written as an INLINE literal at each use below — NOT a
+// module const. normalizeLocalModel/normalizeDsh run from `loadState`'s restore
+// loop, which executes far above any const declared here; a `const` referenced
+// from there is in its temporal dead zone, and the ReferenceError it throws is
+// swallowed by loadState's catch (which sets `agents = {}`), emptying the WHOLE
+// restored registry on every boot (the XERK-301 loadState-TDZ class). The
+// sibling normalizers (normalizeClones, …) inline their bounds for the same
+// reason — keep this one inline too.
 // Bound a model name to 60 code points, stripping the XML-illegal class that
 // breaks Android's uiautomator dump, exactly like the single `model` field
 // below. Cut on CODE POINTS (after the strip) so a slice never manufactures a
@@ -4449,7 +4457,7 @@ function normalizeLocalModel(payload) {
   const seen = new Set();
   if (Array.isArray(lm.models)) {
     for (const m of lm.models) {
-      if (models.length >= LOCAL_MODEL_LIST_MAX) break;
+      if (models.length >= 200) break;   // inline literal — loadState-TDZ (see the models-bound note above)
       if (!m || typeof m !== "object" || Array.isArray(m)) continue;
       const id = sanitizeModelName(m.id);
       if (!id || seen.has(id)) continue;
@@ -4511,7 +4519,7 @@ function normalizeDsh(payload) {
   const seen = new Set();
   if (Array.isArray(d.models)) {
     for (const m of d.models) {
-      if (models.length >= LOCAL_MODEL_LIST_MAX) break;
+      if (models.length >= 200) break;   // inline literal — loadState-TDZ (see normalizeLocalModel)
       if (!m || typeof m !== "object" || Array.isArray(m)) continue;
       const id = sanitizeModelName(m.id);
       if (!id || seen.has(id)) continue;
