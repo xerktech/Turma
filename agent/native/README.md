@@ -89,6 +89,10 @@ parser.
 
 ### Windows (native, no WSL)
 
+> Full Windows install/configure/service/update/uninstall guide, with the
+> known-limitations table: **[`README-windows.md`](README-windows.md)**. The
+> summary below is the quick path.
+
 Same front door, one pasted PowerShell line — `bootstrap.ps1` resolves the newest
 windows-native asset, sha256-verifies it, unpacks it, and hands off to the
 `install.ps1` inside it:
