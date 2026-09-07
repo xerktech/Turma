@@ -317,7 +317,23 @@ $PwshExe = (Get-Process -Id $PID).Path
 # because `exec` preserves it, which has no Windows analog — but the invariant the poke
 # depends on (the tunnel targets the live manager) holds. -NoNewWindow keeps the manager's
 # output on the launcher's stdout so the service log captures it.
-$mgr = Start-Process -FilePath 'python' -ArgumentList @("`"$Manager`"") -NoNewWindow -PassThru
+#
+# If the manager cannot start at all (python genuinely absent from PATH), IDLE rather than
+# exit — an exit here reads to the service manager as a crash-loop worth restarting every
+# few seconds, the exact failure this launcher exists to avoid, and reading $mgr.Id on an
+# unset $mgr would abort under StrictMode. Idling BEFORE the supervisor is started also
+# means no orphaned tunnel pointing at a hub with no manager. Self-heals when python
+# appears (a restart relaunches this whole path); %APPDATA%\npm etc. are already on PATH.
+$mgr = $null
+try {
+  $mgr = Start-Process -FilePath 'python' -ArgumentList @("`"$Manager`"") -NoNewWindow -PassThru
+}
+catch { $mgr = $null }
+if (-not $mgr) {
+  Log "[turma-agent] could not start the session manager (is python on PATH? see the installer)."
+  Log "[turma-agent] Idling rather than crash-looping; a restart retries once python is present."
+  Enter-Idle
+}
 $env:TURMA_MANAGER_PID = $mgr.Id
 
 Start-Process -FilePath $PwshExe `

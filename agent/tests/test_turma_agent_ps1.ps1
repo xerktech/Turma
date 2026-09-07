@@ -29,7 +29,12 @@ $WinDir    = Join-Path (Split-Path -Parent $Here) 'native/windows'
 $Launcher  = Join-Path $WinDir 'turma-agent.ps1'
 $Work      = Join-Path ([System.IO.Path]::GetTempPath()) ("turma-ps1-" + [guid]::NewGuid().ToString('N'))
 $Script:Failed = 0
-$Script:Spawned = New-Object System.Collections.Generic.List[int]
+# Keep the Process OBJECTS (not just pids) of every redirected child: a Start-Process with
+# -RedirectStandardOutput spins up async stream readers, and if the process is killed and
+# the object disposed (or GC'd) while a reader is mid-flush, .NET throws
+# ObjectDisposedException on a background thread and crashes pwsh at exit. Cleanup drains
+# each (Kill → WaitForExit → Dispose) so the readers finish against a live writer first.
+$Script:Procs = New-Object System.Collections.Generic.List[System.Diagnostics.Process]
 
 function Ok([string]$m)   { [Console]::Out.WriteLine("  ok: $m") }
 function Fail([string]$m) { [Console]::Out.WriteLine("  FAIL: $m"); $Script:Failed = 1 }
@@ -86,7 +91,14 @@ function Cleanup {
     $cl = $null; try { $cl = $_.CommandLine } catch { }
     $cl -and ($cl.Contains($LauncherPath) -or $cl.Contains((Join-Path $Prefix 'tunnel-agent.js')))
   } | ForEach-Object { try { $_.Kill() } catch { } }
-  foreach ($p in $Script:Spawned) { try { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue } catch { } }
+  # Drain each redirected child before the harness exits: Kill, wait for it to actually
+  # exit (so its async output readers flush against a still-open writer), then Dispose —
+  # skipping this lets .NET crash pwsh with ObjectDisposedException on a reader thread.
+  foreach ($p in $Script:Procs) {
+    try { if (-not $p.HasExited) { $p.Kill() } } catch { }
+    try { $null = $p.WaitForExit(3000) } catch { }
+    try { $p.Dispose() } catch { }
+  }
   if (Test-Path $Work) { Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue }
 }
 
@@ -115,12 +127,26 @@ function Stop-Supervisors {
   } | ForEach-Object { try { $_.Kill() } catch { } }
 }
 
-# Start the launcher (or a re-entry mode) as a child pwsh, inheriting the case's env.
+# Start the launcher (or a re-entry mode) as a child pwsh, inheriting the case's env, with
+# its combined stdout+stderr captured to $OutFile. The redirection is done by /bin/sh at
+# the OS level (`exec pwsh ... > file 2>&1`), NOT by Start-Process's -RedirectStandard*
+# — the latter spins up async stream readers that crash pwsh with ObjectDisposedException
+# when a long-lived child is killed (which several cases do). `exec` means the returned pid
+# IS the pwsh, so HasExited / ExitCode / WaitForExit are the launcher's.
 function Start-Launcher([string[]]$ExtraArgs, [string]$OutFile) {
-  $argv = @('-NoProfile', '-File', $LauncherPath) + $ExtraArgs
-  $p = Start-Process -FilePath $PwshExe -ArgumentList $argv -PassThru `
-    -RedirectStandardOutput $OutFile -RedirectStandardError "$OutFile.err"
-  $Script:Spawned.Add($p.Id)
+  $extra = ($ExtraArgs -join ' ')
+  $cmd = "exec `"$PwshExe`" -NoProfile -File `"$LauncherPath`" $extra > `"$OutFile`" 2>&1"
+  # [Process]::Start with ArgumentList passes each element as a DISTINCT argv (no
+  # space-resplitting, unlike Start-Process -ArgumentList), so /bin/sh gets `-c` and the
+  # whole command string intact. UseShellExecute=$false inherits the case's $env:* and
+  # does no parent-side stream redirection, so there are no async readers to crash.
+  $psi = [System.Diagnostics.ProcessStartInfo]::new()
+  $psi.FileName = '/bin/sh'
+  $psi.ArgumentList.Add('-c')
+  $psi.ArgumentList.Add($cmd)
+  $psi.UseShellExecute = $false
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $Script:Procs.Add($p)
   return $p
 }
 
@@ -222,8 +248,10 @@ JIRA_TOKEN: "ATATT3xFf-s3cret-whose-value-contains=an-equals-sign"
   $badLog = Join-Path $Work 'bad.log'
   if (Wait-For { (Test-Path $badLog) -and (Select-String -Quiet 'Invalid line' $badLog) }) { Ok "named the file as the problem" }
   else { Fail "no invalid-config report: $(Get-Content $badLog -Raw -ErrorAction SilentlyContinue)" }
-  # Both offending lines, by number — including the one whose VALUE holds an `=`.
-  if ((Select-String -Quiet 'line 4: JIRA_SITE' $badLog) -and (Select-String -Quiet 'line 5: JIRA_TOKEN' $badLog)) { Ok "named both bad lines with their line numbers" }
+  # Both offending lines, by number — including the one whose VALUE holds an `=`. Wait for
+  # the LAST-written of the two (line 5) so the whole banner has flushed through the OS
+  # redirect before asserting.
+  if ((Wait-For { (Select-String -Quiet 'line 5: JIRA_TOKEN' $badLog) }) -and (Select-String -Quiet 'line 4: JIRA_SITE' $badLog)) { Ok "named both bad lines with their line numbers" }
   else { Fail "did not report both bad lines: $(Get-Content $badLog -Raw -ErrorAction SilentlyContinue)" }
   # This banner goes to the service log; the config is ACL'd and holds tokens.
   if (Select-String -Quiet 's3cret' $badLog) { Fail "the invalid-config report leaked a token value into the log" }
@@ -308,6 +336,36 @@ JIRA_TOKEN: "ATATT3xFf-s3cret-whose-value-contains=an-equals-sign"
   else { Fail "expected a USERPROFILE-was-unset notice, got: $out" }
   if ($out -match 'preflight') { Ok "carried on into preflight rather than aborting" }
   else { Fail "launcher did not reach preflight with USERPROFILE unset: $out" }
+
+  # --- Case 11: the manager failing to start IDLES, and orphans no supervisor ----------
+  # If python is genuinely absent from PATH, Start-Process fails and $mgr is never set.
+  # The launcher must IDLE (an exit reads as crash-loop to the service manager, the very
+  # failure this launcher exists to avoid) and must NOT have backgrounded a supervisor
+  # pointing at a hub with no manager. (A QA-found edge; the earlier code read $mgr.Id on
+  # an unset $mgr under StrictMode and exited.)
+  Note "case: a manager that cannot start idles instead of crash-looping"
+  $noPyBin = Join-Path $Work 'nopy-bin'
+  New-Item -ItemType Directory -Force -Path $noPyBin | Out-Null
+  Copy-Item (Join-Path $StubBin 'node') (Join-Path $noPyBin 'node')   # node present, python absent
+  Remove-Item $ManagerLog -ErrorAction SilentlyContinue
+  Set-BaseEnv
+  $env:TURMA_AGENT_ENV = $goodCfg
+  # Deliberately NO python anywhere on PATH (this host has a real /usr/bin/python, so the
+  # PATH is scoped to the node-only dir; the run path reaches manager-start with no other
+  # external binary needed).
+  $env:PATH = $noPyBin
+  $noPy = Start-Launcher @() (Join-Path $Work 'run5.log')
+  if (Wait-For { (Test-Path (Join-Path $Work 'run5.log')) -and (Select-String -Quiet 'could not start the session manager' (Join-Path $Work 'run5.log')) }) { Ok "said why the manager did not start" }
+  else { Fail "no manager-start-failure notice: $(Get-Content (Join-Path $Work 'run5.log') -Raw -ErrorAction SilentlyContinue)" }
+  Start-Sleep -Seconds 1
+  if (-not $noPy.HasExited) { Ok "idled instead of exiting on a manager that could not start" }
+  else { Fail "launcher exited (rc=$($noPy.ExitCode)) when the manager could not start — a crash loop" }
+  if ((Count-Supervisors) -eq 0) { Ok "started no tunnel supervisor to orphan" }
+  else { Fail "orphaned a tunnel supervisor pointing at a hub with no manager" }
+  if (-not (Test-Path $ManagerLog)) { Ok "no manager ran (python was absent)" }
+  else { Fail "a manager log appeared despite python being absent" }
+  try { Stop-Process -Id $noPy.Id -Force } catch { }
+  Stop-Supervisors
 }
 finally {
   Cleanup
