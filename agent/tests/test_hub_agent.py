@@ -29256,6 +29256,155 @@ class TestSetToken(unittest.TestCase):
         rw.assert_not_called()
 
 
+class TestWindowsPortability(unittest.TestCase):
+    """XERK-670 — hub-agent.py runs unforked on native Windows. These pin the
+    OS-dispatched seams (path defaults, the chmod-600 -> NTFS-ACL, the XDG ->
+    %APPDATA% state dir) by MOCKING the platform, so they verify the Windows
+    branch on the Linux CI too. The terminal layer (tmux/ttyd) is out of scope
+    here by design — that is XERK-668's TerminalBackend seam."""
+
+    def test_restrict_file_to_owner_posix_sets_0600(self):
+        # The chmod-600 contract every credential-file writer relied on, now
+        # routed through the shared helper, is unchanged on POSIX.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "secret")
+            with open(p, "w") as f:
+                f.write("x")
+            os.chmod(p, 0o644)
+            with mock.patch.object(ha, "IS_WINDOWS", False):
+                ha.restrict_file_to_owner(p)
+            self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+
+    def test_restrict_file_to_owner_windows_uses_icacls_owner_only(self):
+        # Disable inheritance and grant ONLY the running user + SYSTEM (ADR D4);
+        # os.chmod must NOT be used on Windows (it only toggles read-only).
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "token.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=x")
+            done = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch.object(ha, "IS_WINDOWS", True), \
+                 mock.patch.object(ha.getpass, "getuser", return_value="turma"), \
+                 mock.patch.object(ha.os, "chmod") as chmod, \
+                 mock.patch.object(ha.subprocess, "run",
+                                   return_value=done) as run:
+                ha.restrict_file_to_owner(p)
+            chmod.assert_not_called()
+            cmd = run.call_args.args[0]
+            self.assertEqual(cmd[0], "icacls")
+            self.assertIn(p, cmd)
+            self.assertIn("/inheritance:r", cmd)
+            self.assertIn("turma:F", cmd)
+            self.assertIn("SYSTEM:F", cmd)
+
+    def test_restrict_file_to_owner_windows_swallows_icacls_failure(self):
+        # Best-effort on Windows: a missing/failing icacls must NEVER raise onto
+        # a credential write — the bytes are already on disk (XERK-670 / XERK-151
+        # onboarding must not be stranded over a cosmetic ACL).
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "token.env")
+            with open(p, "w") as f:
+                f.write("x")
+            with mock.patch.object(ha, "IS_WINDOWS", True), \
+                 mock.patch.object(ha.subprocess, "run",
+                                   side_effect=FileNotFoundError("no icacls")):
+                ha.restrict_file_to_owner(p)      # must not raise
+            failed = subprocess.CompletedProcess([], 1, "", "denied")
+            with mock.patch.object(ha, "IS_WINDOWS", True), \
+                 mock.patch.object(ha.subprocess, "run", return_value=failed):
+                ha.restrict_file_to_owner(p)      # non-zero rc must not raise
+
+    def test_restrict_file_to_owner_refuses_a_non_regular_path(self):
+        # The "guard against opening a non-regular path" the ticket calls for, on
+        # the permissions side: a planted FIFO/symlink is neither chmod'd nor
+        # icacls'd, and a missing path is a silent no-op (never a raise here).
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no mkfifo on this platform")
+        with tempfile.TemporaryDirectory() as d:
+            fifo = os.path.join(d, "f")
+            os.mkfifo(fifo)
+            with mock.patch.object(ha.os, "chmod") as chmod:
+                ha.restrict_file_to_owner(fifo)          # POSIX branch
+                ha.restrict_file_to_owner(os.path.join(d, "missing"))
+                chmod.assert_not_called()
+            link = os.path.join(d, "link")
+            os.symlink(os.path.join(d, "real"), link)    # dangling symlink
+            with mock.patch.object(ha.os, "chmod") as chmod:
+                ha.restrict_file_to_owner(link)
+                chmod.assert_not_called()
+
+    def test_token_env_writer_is_owner_restricted_on_posix(self):
+        # rewrite_env_var (the TURMA_TOKEN file, XERK-578) still lands 0600 on
+        # POSIX after being routed through the shared helper.
+        tok = base64.urlsafe_b64encode(b"nas01").decode().rstrip("=") + ".deadbeef"
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "turma-agent.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=old\n")
+            with mock.patch.object(ha, "IS_WINDOWS", False):
+                ha.rewrite_env_var(p, "TURMA_TOKEN", tok)
+            self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+            self.assertIn(f"TURMA_TOKEN={tok}\n", open(p).read())
+
+    def test_local_model_env_tmp_refuses_a_symlink(self):
+        # XERK-670 (QA follow-up): the local-model credential tmp write carries
+        # O_NOFOLLOW like its sibling writers, so a symlink planted at the per-pid
+        # tmp name cannot redirect the gateway key elsewhere. POSIX-only (Windows
+        # degrades the flag to 0, no symlink protection there — accepted).
+        if not hasattr(os, "symlink") or ha.IS_WINDOWS:
+            self.skipTest("no O_NOFOLLOW symlink protection on this platform")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "lm.env")
+            tmp = f"{path}.{os.getpid()}.tmp"
+            victim = os.path.join(d, "victim")
+            open(victim, "w").close()
+            os.symlink(victim, tmp)          # planted redirect at the tmp name
+            with mock.patch.multiple(
+                    ha, LOCAL_MODEL_BASE_URL="https://gw.example.com/v1",
+                    LOCAL_MODEL_API_KEY="sk-secret", LOCAL_MODEL_NAME="m"):
+                with self.assertRaises(OSError):
+                    ha.write_local_model_env(path)
+            self.assertEqual(open(victim).read(), "")   # never written through
+
+    def test_agent_env_path_windows_falls_back_to_appdata(self):
+        # ADR D4: ~/.config/turma-agent -> %APPDATA%\turma-agent. Only fires for a
+        # launcher too old to export TURMA_AGENT_ENV.
+        with tempfile.TemporaryDirectory() as appdata:
+            envd = os.path.join(appdata, "turma-agent")
+            os.makedirs(envd)
+            p = os.path.join(envd, "turma-agent.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=x\n")
+            env = {"APPDATA": appdata}   # no TURMA_AGENT_ENV, no XDG_CONFIG_HOME
+            with mock.patch.object(ha, "IS_WINDOWS", True), \
+                 mock.patch.dict(ha.os.environ, env, clear=True):
+                self.assertEqual(ha.agent_env_path(), p)
+
+    def test_agent_env_path_posix_still_uses_xdg(self):
+        with tempfile.TemporaryDirectory() as cfg:
+            envd = os.path.join(cfg, "turma-agent")
+            os.makedirs(envd)
+            p = os.path.join(envd, "turma-agent.env")
+            with open(p, "w") as f:
+                f.write("TURMA_TOKEN=x\n")
+            with mock.patch.object(ha, "IS_WINDOWS", False), \
+                 mock.patch.dict(ha.os.environ,
+                                 {"XDG_CONFIG_HOME": cfg}, clear=True):
+                self.assertEqual(ha.agent_env_path(), p)
+
+    def test_default_roots_are_under_the_profile_on_windows(self):
+        home = os.path.expanduser("~")
+        with mock.patch.object(ha, "IS_WINDOWS", True):
+            self.assertTrue(ha._default_repos_root().startswith(home))
+            proj = ha._default_projects_root()
+        self.assertTrue(proj.startswith(home))
+        self.assertTrue(proj.endswith(os.path.join(".claude", "projects")))
+
+    def test_default_projects_root_is_the_posix_literal_off_windows(self):
+        with mock.patch.object(ha, "IS_WINDOWS", False):
+            self.assertEqual(ha._default_projects_root(), "/root/.claude/projects")
+
+
 class TestTtydTokenRelaunch(unittest.TestCase):
     """XERK-578 follow-up: ttyd bakes its basic-auth token in at launch and
     outlives a manager-only restart (KillMode=process), so after a token ROLL the

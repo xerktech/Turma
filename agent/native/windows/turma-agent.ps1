@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 # turma-agent.ps1 — native (no-WSL) Windows launcher for the Turma per-host agent
 # (XERK-669, epic XERK-666; the decisions it implements are in docs/windows-agent-adr.md,
-# the operative rules in .claude/rules/windows-agent.md).
+# the operative rules in .claude/rules/windows-launcher.md).
 #
 # This is the Windows port of the LAUNCHER ROLE of agent/native/turma-agent (the bash
 # launcher), rewritten in PowerShell per ADR D5 ("PowerShell for the OS-facing shell

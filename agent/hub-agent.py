@@ -42,6 +42,7 @@ stdlib only — no pip installs in the image.
 
 import base64
 import datetime
+import getpass
 import glob
 import gzip
 import hashlib
@@ -170,8 +171,39 @@ INTERVAL = _env_int("TURMA_INTERVAL", 20, minimum=1)
 # follow-up, so budget two of these per cycle.
 HEARTBEAT_TIMEOUT_SEC = 10
 
+# Windows portability (XERK-670, native no-WSL host, epic XERK-666). The shared
+# runtime is ONE cross-platform codebase — never forked per OS (ADR D5) — so the
+# few Unix-only seams (POSIX-path defaults, chmod-600 → NTFS ACL, XDG dirs)
+# dispatch on this flag rather than living in a Windows copy. Everything the
+# terminal layer touches (tmux/ttyd → the ConPTY pty-host) is deliberately NOT
+# here: that is XERK-668's TerminalBackend seam. `os.name == "nt"` is the stdlib
+# test that holds under a frozen exe and a service too, unlike sniffing sys.argv.
+IS_WINDOWS = os.name == "nt"
+
+
+def _default_repos_root():
+    """The scan root when REPOS_ROOT is unset. The native launcher normally sets
+    it (agent-native), so this is only the last-resort default: a POSIX mount in
+    the container, and a %USERPROFILE% subdir on Windows where there is no
+    /mnt (ADR D4 — operator-set, default under the profile)."""
+    if IS_WINDOWS:
+        return os.path.join(os.path.expanduser("~"), "turma", "repos")
+    return "/mnt/data/Docker/git"
+
+
+def _default_projects_root():
+    """Where Claude Code keeps per-project transcripts when CLAUDE_PROJECTS_ROOT
+    is unset. `~/.claude/projects` on both OSes — it resolves to /root/.claude on
+    the container's root uid and %USERPROFILE%\\.claude on Windows, which is where
+    Claude Code itself writes there (ADR D4). Kept as an explicit POSIX literal
+    for the container so a moved $HOME can't silently relocate the default."""
+    if IS_WINDOWS:
+        return os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    return "/root/.claude/projects"
+
+
 # Host-multiplexer configuration (see CONTRACT / agent/native/turma-agent).
-REPOS_ROOT = os.environ.get("REPOS_ROOT", "/mnt/data/Docker/git")
+REPOS_ROOT = os.environ.get("REPOS_ROOT", _default_repos_root())
 MAX_SESSIONS = _env_int("MAX_SESSIONS", 6, minimum=1)
 TTYD_PORT_BASE = _env_int("TTYD_PORT_BASE", 7700, minimum=1, maximum=65535)
 
@@ -308,7 +340,7 @@ PR_STATUS_LEDGER_PATH = os.path.join(REGISTRY_DIR, "pr-status.json")
 # Where Claude Code keeps per-project transcript JSONLs (slug = cwd via
 # _project_slug below). Overridable so the test suite can point it at
 # fixtures; unset in production, so the default is the real path.
-PROJECTS_ROOT = os.environ.get("CLAUDE_PROJECTS_ROOT", "/root/.claude/projects")
+PROJECTS_ROOT = os.environ.get("CLAUDE_PROJECTS_ROOT", _default_projects_root())
 # The subscription login every session and headless probe on this host shares.
 # Its refresh-token expiry is the "re-login required" signal the hub alerts on
 # (XERK-98). Derived from PROJECTS_ROOT's parent so the CLAUDE_PROJECTS_ROOT
@@ -2406,6 +2438,52 @@ def _messages_api_base(url):
     return base[:-3].rstrip("/") if base.endswith("/v1") else base
 
 
+def restrict_file_to_owner(path):
+    """Restrict a file to its owner only — the cross-platform chmod-600 (XERK-670).
+
+    POSIX: mode 0600, exactly as before. Windows: an icacls owner-only ACL —
+    disable inheritance, then grant only the running user and SYSTEM — the NTFS
+    analogue of 0600 chosen in the ADR (D4). os.chmod on Windows only toggles the
+    read-only bit and cannot restrict by principal, so it is NOT a substitute.
+
+    Acts only on a REGULAR file (lstat, so a symlink is refused): a token/env file
+    is created by its caller with O_CREAT (+ O_NOFOLLOW where the path is
+    attacker-influenced), so anything else reaching here is a planted
+    FIFO/device/symlink and tightening its ACL is neither meaningful nor safe —
+    the "guard against opening a non-regular path" the ticket calls for, on the
+    permissions side. This never diverges on the real path (the caller just
+    created a regular tmp), so the POSIX contract is unchanged.
+
+    Windows is BEST-EFFORT — an icacls failure is logged, not raised: the bytes
+    are already written, a native install runs as a single user, and refusing
+    here would strand onboarding over a cosmetic ACL. On POSIX the chmod still
+    raises, preserving the previous behaviour for every existing caller."""
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return
+    except OSError:
+        return
+    if not IS_WINDOWS:
+        os.chmod(path, 0o600)
+        return
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = (os.environ.get("USERNAME") or "").strip()
+    cmd = ["icacls", path, "/inheritance:r"]
+    if user:
+        cmd += ["/grant:r", f"{user}:F"]
+    cmd += ["/grant:r", "SYSTEM:F"]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, text=True, timeout=15)
+        if r.returncode != 0:
+            log(f"icacls could not restrict {path}: "
+                f"{(r.stderr or '').strip()[:200]}")
+    except Exception as e:  # no icacls, timeout, etc. — never fail a write on it
+        log(f"icacls could not restrict {path}: {e}")
+
+
 def write_local_model_env(path, model=None, context=None):
     """Write the self-hosted-model settings to a 0600 file and return its path.
 
@@ -2431,12 +2509,16 @@ def write_local_model_env(path, model=None, context=None):
     # Per-process temp name: a shared one makes two concurrent writers race on
     # os.replace, and the loser raises FileNotFoundError mid-launch.
     tmp = f"{path}.{os.getpid()}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # O_NOFOLLOW (a no-op flag on Windows via getattr) so a symlink planted at
+    # the per-pid tmp name can't redirect this credential (gateway key) write
+    # elsewhere — the same hardening as rewrite_env_var / _write_new_file.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                 | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "w") as fh:
         for pair in local_model_env_pairs(model, context):
             key, _, value = pair.partition("=")
             fh.write(f"{key}={shlex.quote(value)}\n")
-    os.chmod(tmp, 0o600)
+    restrict_file_to_owner(tmp)    # 0600 on POSIX; owner-only NTFS ACL on Windows
     os.replace(tmp, path)          # atomic: a launch never sees a partial file
     return path
 
@@ -2521,8 +2603,16 @@ def agent_env_path():
     p = os.environ.get("TURMA_AGENT_ENV", "").strip()
     if p:
         return p if os.path.isfile(p) else ""
-    cfg_home = os.environ.get("XDG_CONFIG_HOME", "").strip() \
-        or os.path.join(os.path.expanduser("~"), ".config")
+    # The launcher exports TURMA_AGENT_ENV, so this fallback only fires against an
+    # older launcher — and must land where THAT launcher put the file: the XDG
+    # config dir on POSIX, %APPDATA%\turma-agent on Windows (ADR D4 maps
+    # ~/.config/turma-agent → %APPDATA%\turma-agent).
+    if IS_WINDOWS:
+        cfg_home = os.environ.get("APPDATA", "").strip() \
+            or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+    else:
+        cfg_home = os.environ.get("XDG_CONFIG_HOME", "").strip() \
+            or os.path.join(os.path.expanduser("~"), ".config")
     default = os.path.join(cfg_home, "turma-agent", "turma-agent.env")
     return default if os.path.isfile(default) else ""
 
@@ -2569,10 +2659,14 @@ def rewrite_env_var(path, key, value):
             out.append(assignment)
     data = "\n".join(out)
     tmp = f"{path}.{os.getpid()}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # O_NOFOLLOW (a no-op flag on Windows via getattr): the per-pid tmp is ours to
+    # create, so a symlink already sitting at that name is an attempt to redirect
+    # this credential write elsewhere — refuse it rather than follow it.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                 | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(data)
-    os.chmod(tmp, 0o600)
+    restrict_file_to_owner(tmp)    # 0600 on POSIX; owner-only NTFS ACL on Windows
     os.replace(tmp, path)          # atomic: a reader never sees a partial file
 
 
@@ -9160,7 +9254,8 @@ def _write_new_file(path, blob):
     tree reads as a free name and a plain write would create its target instead.
     Creating the file outright is also what makes the mode 0600 from the start
     rather than for the moment after the bytes land."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                 | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(blob)

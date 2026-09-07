@@ -1,82 +1,77 @@
 ---
 paths:
-  - "agent/native/windows/**"
-  - "agent/tests/test_turma_agent_ps1.ps1"
+  - "agent/hub-agent.py"
+  - "agent/tests/test_hub_agent.py"
 ---
 
-# `agent/native/windows/` — native (no-WSL) Windows shell layer
+# Native Windows agent — `hub-agent.py` portability (XERK-670, epic XERK-666)
 
-The Windows port of the bash `agent/native/` shell layer, epic XERK-666. **Decisions +
-rationale (D1-D5, the terminal spike, open questions) are in `docs/windows-agent-adr.md`** — read
-it for *why*; this file is the rules. The shared runtime (`hub-agent.py`, `tunnel-agent.js`) stays
-ONE cross-platform codebase (ADR D5); nothing here forks it.
+The shared runtime is ONE cross-platform codebase — **never forked per OS** (ADR D5,
+`docs/windows-agent-adr.md`). Windows reuses the same `hub-agent.py`; the few Unix-only seams
+dispatch on `IS_WINDOWS = os.name == "nt"` rather than living in a Windows copy. Read the ADR for
+*why*; this is the operative rule.
 
-## `turma-agent.ps1` — the launcher (XERK-669)
+## Scope boundary — the terminal layer is NOT here (XERK-668)
 
-PowerShell port of the LAUNCHER ROLE of `agent/native/turma-agent`. Same job, same invariants —
-`.claude/rules/agent-native.md`'s launcher bullets are the contract, translated onto Windows:
+- **`hub-agent.py` never calls the tmux/ttyd CLI through an OS branch of its own.** The tmux/ttyd
+  call sites (`_spawn_in_tmux`, `_type_into_pane`, `_capture_pane`, `_tmux_alive`, `_launch_ttyd`)
+  and `resume_on_boot`'s adopt path are **XERK-668's `TerminalBackend` seam** (the ConPTY pty-host
+  replacing tmux+ttyd, ADR D1). XERK-670 is deliberately seam-INDEPENDENT and touches none of them.
+- So a Windows-portability change here must stay on the **paths / permissions / state-dir / liveness
+  / degradation** side. Anything that drives, captures, spawns or adopts a session's terminal belongs
+  to XERK-668 — do not add a `sys.platform` branch to those call sites from this side.
 
-- **Config is VALIDATED before use; a bad one IDLES, never exits.** An exit reads to the service
-  manager (WinSW) exactly like a crash worth restarting — the invisible crash-loop the whole
-  discipline exists to prevent. `-Preflight` is the one exception (exits 1, loads nothing). The
-  report carries line numbers + key names, **never values** (the file is ACL'd owner-only and holds
-  `TURMA_TOKEN`/`JIRA_TOKEN`). The launcher PARSES the env file (does not source it), so a
-  YAML-style `KEY: "x"` line is inert rather than an executed command — but the SAME validation is
-  kept, because the file format is shared with the bash/systemd hosts.
-- **Idle = `Enter-Idle` (sleep loop), never `exit`.** `Set-StrictMode` is the `set -u` analog; there
-  is no `set -e` equivalent (it fights idle-not-exit), so the two idle cases are explicit.
-- **Defaults map onto Windows known folders (ADR D4)**: `CLAUDE_PROJECTS_ROOT` →
-  `%USERPROFILE%\.claude\projects`, `REPOS_ROOT` → `%USERPROFILE%\git`, `DEVICE_NAME` →
-  `COMPUTERNAME` (the manager reads that as a fallback too). Applied only where the config left a key
-  blank.
-- **USERPROFILE is the `$HOME` analog and is DERIVED if unset** (`GetFolderPath('UserProfile')`) —
-  the Windows twin of the systemd-system-scope "HOME unset" trap that once cost a host its agent for
-  7.5 hours. StrictMode would otherwise abort on the first read.
-- **The tunnel is SUPERVISED with the node check INSIDE the retry loop** (`-TunnelSupervisor`
-  re-entry, `TUNNEL_RETRY_SEC`). Node is a setup-time prerequisite, not a baked layer, so it can be
-  genuinely absent; a fire-and-forget check makes a missing node BOTH silent (the manager keeps
-  heartbeating → host reads ONLINE) AND permanent (nothing retries). Checking each pass heals the
-  terminals within one retry the moment node is installed, no restart.
-- **The launcher reaps the supervisor BEFORE the tunnel** (`Stop-ByCommandLine`, prefix-scoped on
-  the command line) — the reverse order lets the old supervisor respawn the tunnel just killed.
-  Matching uses `Get-Process().CommandLine`, which PowerShell 7 exposes on Windows AND Linux, so the
-  behavioural test drives the same code.
-- **Exports `TURMA_AGENT_ENV`** (resolved env-file path, so the manager can rewrite this host's
-  token — XERK-578) and **`TURMA_MANAGER_PID`** (for the tunnel's heartbeat poke). Bash names `$$`
-  up front because `exec` preserves it; Windows has no `exec`, so the launcher starts the manager
-  (`Start-Process -PassThru`), exports its pid, THEN backgrounds the supervisor so the tunnel
-  inherits the right pid.
-- **Puts the per-user tool dir on PATH itself** — `%APPDATA%\npm` (npm's global bin on Windows,
-  where `claude.cmd` lands) plus the install prefix's bin. A Windows service without an interactive
-  login does not inherit the user's shell PATH, so `claude` is otherwise unreachable and every
-  session dies on exec — the exact twin of XERK-94's `~/.local/bin`. A genuinely missing `claude` is
-  a loud, log-only warning (self-heals when installed; the dir is already on PATH).
-- Tests: `agent/tests/test_turma_agent_ps1.ps1` (a PowerShell-on-POSIX harness with `/bin/sh` stubs,
-  run on `ubuntu-latest` like the bash launcher suite). Static analysis: PSScriptAnalyzer with
-  `PSScriptAnalyzerSettings.psd1` (the ShellCheck analog). Both gated in `code-scan.yml`.
+## Paths & separators (ADR D4)
 
-### What this launcher deliberately does NOT do — each owned by another epic child
+- **Use `os.path`/`os.path.join`, never a hard-coded `/`.** Existing joins (`WORKTREES_ROOT`,
+  `CLONES_TMP_ROOT`, `REGISTRY_DIR = expanduser("~/.turma")`, socket/upload/questions dirs) already
+  hold on Windows — `expanduser("~")` resolves to `%USERPROFILE%`, and a dotdir (`.turma`) is fine on
+  NTFS.
+- **The only POSIX literals are the last-resort DEFAULTS** for `REPOS_ROOT` and `PROJECTS_ROOT`,
+  behind `_default_repos_root()` / `_default_projects_root()`. The native launcher normally sets
+  `REPOS_ROOT`/`CLAUDE_PROJECTS_ROOT`, so these fire only against an env that omits them; on Windows
+  they land under `%USERPROFILE%` (`~/.claude/projects` is where Claude Code itself writes there).
+  Keep the container default an explicit POSIX literal — a moved `$HOME` must not silently relocate it.
+- **`_project_slug` is already platform-agnostic** — it maps EVERY non-alphanumeric char (`\`, `:`,
+  `/`, `.`) to `-`, so a Windows cwd (drive letter + backslashes) slugs the same on both sides of the
+  wire. Do not re-introduce a `/`-only mapping. Transcript resolution rides this unchanged.
 
-Kept out to stay on XERK-669's scope and testable; each is marked in the source where it wires in.
+## State dirs (ADR D4)
 
-- **The WinSW service that supervises this script** — ADR D2, the service/supervisor child.
-- **The per-session pty-host** replacing tmux+ttyd — ADR D1. `-Preflight`'s tool list is
-  claude/git/node/python (no tmux/ttyd).
-- **`turma-agent-update` + "every start is an update check"** — a Windows updater child. The bash
-  launcher's update block has no analogue here yet.
-- **The `TURMA_AGENT_SELF_ENROLL` loop** — the token-onboarding child. The `TURMA_AGENT_ENV` export
-  above is the piece of XERK-578 this launcher owns.
-- **Windows INSTALL/packaging** (winget + npm + bundled WinSW, ADR D3) — the installer child. The
-  Linux `install.sh`/`release.yml`/`turma-agent-update` do NOT lay these files down, so the
-  `agent-native.md` "new sibling in all three packaging paths" rule does not apply until that child
-  builds the Windows installer.
+- `~/.turma` stays `expanduser("~/.turma")` on both OSes (→ `%USERPROFILE%\.turma`).
+- `~/.config/turma-agent` → **`%APPDATA%\turma-agent`** on Windows: `agent_env_path()`'s fallback
+  branches on `IS_WINDOWS` (`%APPDATA%`, else `~/AppData/Roaming`) vs XDG (`$XDG_CONFIG_HOME`, else
+  `~/.config`). This fallback only fires for a launcher too old to export `TURMA_AGENT_ENV`.
 
-### Manager-side Windows gaps this launcher surfaces (NOT fixed here — ADR D5 portability pass)
+## Permissions — `chmod 600` → NTFS ACL (ADR D4)
 
-- **The tunnel's `pokeHeartbeat` uses `process.kill(pid, "SIGUSR1")`; Windows Node has no POSIX
-  signals**, so that call would terminate the manager rather than poke it. This launcher exports the
-  correct pid; making the poke a no-op / named-event on Windows is `tunnel-agent.js`'s portability
-  pass.
-- **`hub-agent.py` installs a `SIGUSR1` handler** (`signal.SIGUSR1` is absent on Windows Python) and
-  makes other Unix-only assumptions (tmux CLI, `os.setsid`, `/proc`). Its bounded Windows-portability
-  pass is ADR D5's own child; the launcher does not touch the shared runtime.
+- **`restrict_file_to_owner(path)` is the cross-platform `chmod 600`.** POSIX: `os.chmod(0o600)`,
+  byte-identical to before. Windows: `icacls <path> /inheritance:r /grant:r <user>:F SYSTEM:F` — the
+  owner-only NTFS ACL. `os.chmod` on Windows only toggles the read-only bit and is NOT a substitute.
+- **Windows is BEST-EFFORT — an icacls failure is LOGGED, never raised.** The bytes are already on
+  disk; refusing here would strand XERK-578 token onboarding over a cosmetic ACL. POSIX still raises,
+  preserving the old contract for existing callers.
+- **It acts only on a REGULAR file (`lstat`, so a symlink is refused)** — the "guard against opening a
+  non-regular path" on the permissions side. Callers create the file first, so this never diverges on
+  the real path.
+- Routed through it: `write_local_model_env`, `rewrite_env_var` (the `TURMA_TOKEN` env file). The
+  per-pid credential-tmp opens carry **`getattr(os, "O_NOFOLLOW", 0)`** (a no-op flag on Windows) so
+  a planted symlink can't redirect the write; `_write_new_file` (uploads) uses the same `getattr`
+  form. Never write bare `os.O_NOFOLLOW` — it does not exist on Windows and raises at call time.
+
+## Liveness & degradation (already hold — do not regress)
+
+- **`_pid_alive` uses `os.kill(pid, 0)`, which works on Windows** — the generic liveness primitive.
+  The `/proc`-specific cc-socks sweep is a POSIX/dsh feature that already self-guards
+  (`getattr(os, "getuid", None)`, `os.path.isdir("/proc/self")`) and degrades to no-op on Windows.
+- **`startedAt` falls back to the manager's start time** (`run(["docker", ...]) or now_iso()`) and the
+  **container-log tail** to `LOG_TAIL_UNAVAILABLE` (`except Exception`) — both hold on Windows because
+  `run()` returns `""` on a missing binary. Keep these fallbacks; the restart-loop alert keys on a
+  non-empty changing `startedAt`.
+
+## Tests
+
+`TestWindowsPortability` in `test_hub_agent.py` MOCKS `IS_WINDOWS` so the Windows branch is verified
+on Linux CI: the icacls owner-only ACL, its best-effort swallow, the non-regular-path refusal, the
+`%APPDATA%` env-path fallback, and the profile-relative default roots. The POSIX branches stay pinned
+by the existing `TestSetToken`/local-model-env cases (0600 preserved).
