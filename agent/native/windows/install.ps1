@@ -516,8 +516,22 @@ function Render-ServiceXml {
   if (-not (Test-Path -LiteralPath $src)) { Warn "service descriptor not found at $src; skipping service wiring"; return $false }
   New-Item -ItemType Directory -Force -Path $Bin -ErrorAction SilentlyContinue | Out-Null
   $xml = Get-Content -LiteralPath $src -Raw
-  $xml = $xml -replace [regex]::Escape('%BASE%\..\turma-agent.env'), ([System.Security.SecurityElement]::Escape($Cfg))
-  $xml = $xml -replace [regex]::Escape('%BASE%'), ([System.Security.SecurityElement]::Escape($Prefix))
+  # -replace's REPLACEMENT operand interprets .NET substitution tokens ($_, $&, $1, $$), and
+  # SecurityElement::Escape only escapes XML metacharacters -- not '$', which is legal in a
+  # Windows path and service name. So double every '$' (-> the literal-'$' token '$$') in each
+  # replacement value, or a '$' in $Cfg/$Prefix/$ServiceName would splice the match/input back
+  # in and corrupt the descriptor. Escape (XML) THEN double ('$$' has no XML metachar to escape).
+  $xmlRepl = { param($v) ([System.Security.SecurityElement]::Escape($v)).Replace('$', '$$') }
+  $xml = $xml -replace [regex]::Escape('%BASE%\..\turma-agent.env'), (& $xmlRepl $Cfg)
+  $xml = $xml -replace [regex]::Escape('%BASE%'), (& $xmlRepl $Prefix)
+  # The WinSW <id> IS the registered Windows service name, and WinSW derives the rolling-log
+  # basename from it -- so with a TURMA_SERVICE_NAME override the hardcoded <id>turma-agent</id>
+  # would register under 'turma-agent' while turma-agentctl's Get-Service/Stop-Service -Name
+  # $ServiceName (and the .exe/.xml basenames laid down here) target the override, missing the
+  # real service and desyncing the logs basename (XERK-699). Template it from $ServiceName so
+  # the registration, the ctl's service-name calls, and the logs basename all agree. The source
+  # xml keeps its real default <id>turma-agent</id>, so an unset override is byte-identical.
+  $xml = $xml -replace '<id>[^<]*</id>', ('<id>' + (& $xmlRepl $ServiceName) + '</id>')
   Set-Content -LiteralPath (Join-Path $Bin "$ServiceName.xml") -Value $xml
   return $true
 }

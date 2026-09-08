@@ -112,6 +112,10 @@ try {
   else { Fail "%BASE% not substituted in the descriptor" }
   if ($xml.Contains("value=`"$Cfg`"")) { Ok "TURMA_AGENT_ENV points at the real config path" }
   else { Fail "TURMA_AGENT_ENV not pointed at $Cfg" }
+  # Default (no TURMA_SERVICE_NAME) render keeps the <id>turma-agent</id> default byte-identical
+  # (XERK-699). The override render is driven directly in the Render-ServiceXml case below.
+  if ($xml.Contains('<id>turma-agent</id>')) { Ok "the default <id> is turma-agent" }
+  else { Fail "the default render lost <id>turma-agent</id>" }
 
   # --- Case 4: idempotent + heals a deleted sibling, preserves an edited config ----------
   Note "case: a re-run heals a deleted sibling and preserves the operator's token"
@@ -238,6 +242,51 @@ if ($fail -eq 0) { Write-Host 'TOOLPROBE_OK' }
   $probeOut = if (Test-Path $out) { Get-Content -Raw $out } else { '' }
   if ($probeOut -match 'TOOLPROBE_OK') { Ok "resolvers pick the arch-correct asset, newest eligible, and fail on a bad exit" }
   else { Fail "direct-installer resolution: $probeOut" }
+
+  # --- Case 8: TURMA_SERVICE_NAME templates the WinSW <id> (XERK-699) ---------------------
+  # The knob renames the .exe/.xml/log basenames AND drives turma-agentctl's Get-Service/
+  # Stop-Service -Name; the descriptor's <id> is the registered service name and the log
+  # basename, so it MUST follow the override or WinSW registers under 'turma-agent' while the
+  # ctl targets the override (missing the real service, desyncing the logs basename). This
+  # dot-sources the real installer under TURMA_INSTALL_NORUN with the override set, redirects
+  # $Bin to a scratch dir, and drives Render-ServiceXml directly (it is pure file ops, not
+  # $IsWindows-gated, so the POSIX runner exercises it fully).
+  Note "case: TURMA_SERVICE_NAME templates the WinSW <id> and xml basename"
+  $svcProbe = Join-Path $Work 'svcprobe.ps1'
+  Set-Content -LiteralPath $svcProbe -Value @'
+$env:TURMA_INSTALL_NORUN = '1'
+$env:TURMA_SERVICE_NAME  = 'turma-custom'
+. $args[0]
+$fail = 0
+$Bin = $args[1]                       # redirect the render target to a scratch dir
+New-Item -ItemType Directory -Force -Path $Bin | Out-Null
+if (-not (Render-ServiceXml)) { Write-Host 'FAIL render returned false'; exit 1 }
+$out = Join-Path $Bin 'turma-custom.xml'
+if (-not (Test-Path -LiteralPath $out)) { Write-Host "FAIL xml not written to $out"; exit 1 }
+$xml = Get-Content -LiteralPath $out -Raw
+if ($xml -notmatch '<id>turma-custom</id>') { Write-Host "FAIL <id> not templated: $xml"; $fail = 1 }
+if ($xml -match '<id>turma-agent</id>')     { Write-Host 'FAIL stale <id>turma-agent</id> remains'; $fail = 1 }
+# A '$' in the name is legal in a Windows service name and must land LITERALLY in <id> -- the
+# -replace replacement operand would otherwise treat $_/$&/$1 as substitution tokens and splice
+# the match or the whole input into the descriptor (XERK-699 QA residual). $ServiceName is
+# script-scoped, set from the env at dot-source; re-set the env AND re-derive it, then re-render.
+Set-Variable -Name ServiceName -Value 'svc$_x' -Scope Script
+$null = Render-ServiceXml
+$xml2 = Get-Content -LiteralPath (Join-Path $Bin 'svc$_x.xml') -Raw
+if ($xml2 -notmatch '<id>svc\$_x</id>')       { Write-Host "FAIL '`$' name not literal in <id>: $xml2"; $fail = 1 }
+if ($xml2 -match '<service>[\s\S]*<service>')  { Write-Host 'FAIL descriptor spliced into <id>'; $fail = 1 }
+if ($fail -eq 0) { Write-Host 'SVCPROBE_OK' }
+'@
+  $svcOut = Join-Path $Work 'svcprobe.out'
+  $svcBin = Join-Path $Work 'svcbin'
+  $cmd = "exec `"$PwshExe`" -NoProfile -File `"$svcProbe`" `"$Install`" `"$svcBin`" > `"$svcOut`" 2>&1"
+  $psi = [System.Diagnostics.ProcessStartInfo]::new()
+  $psi.FileName = '/bin/sh'; $psi.ArgumentList.Add('-c'); $psi.ArgumentList.Add($cmd)
+  $psi.UseShellExecute = $false
+  $p = [System.Diagnostics.Process]::Start($psi); $null = $p.WaitForExit(60000)
+  $svcProbeOut = if (Test-Path $svcOut) { Get-Content -Raw $svcOut } else { '' }
+  if ($svcProbeOut -match 'SVCPROBE_OK') { Ok "the override name reaches the WinSW <id> and the descriptor basename" }
+  else { Fail "service-name templating: $svcProbeOut" }
 }
 finally {
   if (Test-Path $Work) { Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue }
