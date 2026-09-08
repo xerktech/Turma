@@ -607,10 +607,16 @@ QWEN_STORE_DIRNAME = "qwen"
 
 
 def _archivable_rel(rel):
-    """Whether the hub's allowlist can name this session-relative path."""
+    """Whether the hub's allowlist can name this session-relative path.
+
+    Rels are normalized to FORWARD SLASHES on the wire (the hub's safeRawRel
+    splits on "/" only), so accept either separator here — a Windows-native
+    backslash rel that reached this must still validate by its components, not
+    read as one giant component and be refused (XERK-678: the hub 400'd every raw
+    sidecar on Windows because os.path.relpath handed it `<tid>\\tool-results\\x`)."""
     if not rel or len(rel.encode("utf-8", "surrogatepass")) > ARCHIVE_RAW_REL_LEN_MAX:
         return False
-    parts = rel.split(os.sep) if os.sep != "/" else rel.split("/")
+    parts = rel.replace(os.sep, "/").split("/")
     if not parts or len(parts) > ARCHIVE_RAW_REL_DEPTH_MAX:
         return False
     for p in parts:
@@ -22148,7 +22154,12 @@ class SessionManager:
                             continue
                     except OSError:
                         continue
-                    rel = os.path.relpath(full, proj)
+                    # FORWARD SLASHES on the wire, always: the raw-archive rel is the
+                    # hub's cursor + store key (safeRawRel splits on "/"), so a Windows
+                    # backslash rel from os.path.relpath got 400'd for every sidecar
+                    # (XERK-678). Windows accepts "/" for the local open below too, so this
+                    # one normalization covers the wire key, the cursor key AND the reopen.
+                    rel = os.path.relpath(full, proj).replace(os.sep, "/")
                     if not _archivable_rel(rel):
                         skipped.append(rel)
                         continue

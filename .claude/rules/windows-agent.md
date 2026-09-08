@@ -35,6 +35,13 @@ dispatch on `IS_WINDOWS = os.name == "nt"` rather than living in a Windows copy.
 - **`_project_slug` is already platform-agnostic** — it maps EVERY non-alphanumeric char (`\`, `:`,
   `/`, `.`) to `-`, so a Windows cwd (drive letter + backslashes) slugs the same on both sides of the
   wire. Do not re-introduce a `/`-only mapping. Transcript resolution rides this unchanged.
+- **A wire path is FORWARD SLASH, always — normalize `os.path.relpath` at the boundary (XERK-678).**
+  `_session_files`'s raw-archive rel is the hub's cursor + store key, and `safeRawRel` splits on "/"
+  only; the un-normalized `os.path.relpath` handed a Windows host `<tid>\tool-results\x`, which the
+  hub 400'd for EVERY raw sidecar. It is `.replace(os.sep, "/")`'d at construction (Windows accepts
+  "/" for the local reopen too), and `_archivable_rel` splits on "/" so a backslash rel still
+  validates by component. A no-op on POSIX. Any other agent→hub path key needs the same treatment.
+  Tests: `test_archivable_rel_accepts_a_windows_backslash_rel`.
 
 ## State dirs (ADR D4)
 

@@ -20862,6 +20862,29 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         self.assertTrue(ha._archivable_rel("a" * 255))
         self.assertFalse(ha._archivable_rel("n/" * 10 + "f.txt"))   # too deep
 
+    def test_archivable_rel_accepts_a_windows_backslash_rel(self):
+        """The raw-archive rel is normalized to FORWARD SLASHES on the wire (the
+        hub's safeRawRel splits on "/"), but os.path.relpath hands a Windows host a
+        BACKSLASH rel. _archivable_rel must validate that by its components, not read
+        `<tid>\\tool-results\\x.txt` as one giant component and refuse it — the bug
+        that 400'd every raw sidecar on a real Windows host (XERK-678)."""
+        # Forward-slash sidecar (the wire form) is accepted on any OS.
+        self.assertTrue(ha._archivable_rel("subagents/agent-x.jsonl"))
+        self.assertTrue(ha._archivable_rel("tool-results/bvskf84ti.txt"))
+        with mock.patch.object(ha.os, "sep", "\\"):
+            # THE distinguishing case (the one that actually flows): _session_files
+            # normalizes to "/", so the rel reaching here is FORWARD-SLASH even though
+            # os.sep is "\\". The pre-fix split (on os.sep) saw one giant component and
+            # REFUSED it — this assertion is True on the fix, False on the bug, so it
+            # is what makes the test guard the fix rather than pass on either.
+            self.assertTrue(ha._archivable_rel("subagents/agent-x.jsonl"))
+            self.assertTrue(ha._archivable_rel("tool-results/bvskf84ti.txt"))
+            self.assertFalse(ha._archivable_rel("../x"))             # traversal still refused
+            self.assertFalse(ha._archivable_rel("n/" * 10 + "f"))    # depth still enforced
+            # A Windows-native backslash rel validates the same too.
+            self.assertTrue(ha._archivable_rel("subagents\\agent-x.jsonl"))
+            self.assertTrue(ha._archivable_rel("tool-results\\bvskf84ti.txt"))
+
     def test_raw_push_refused_permanently_does_not_spend_the_failure_budget(self):
         """A 4xx is the hub saying THIS FILE is unacceptable. Counted as a
         failure, three of them ended the pass every beat — which is how one bad

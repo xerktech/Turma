@@ -1617,6 +1617,13 @@ function stopAllWatches() {
 // landing in about a round-trip. Still best-effort: a failed signal costs
 // latency, never correctness, since the scheduled beat delivers the command anyway.
 function pokeHeartbeat() {
+  // Windows Node has no POSIX signals: process.kill(pid, "SIGUSR1") does NOT poke —
+  // libuv rejects SIGUSR1 (EINVAL) or, worse, terminates the target. hub-agent.py also
+  // installs no SIGUSR1 handler on Windows (XERK-678), so there is nothing to poke: the
+  // manager beats on its normal TURMA_INTERVAL. Cost is the same latency the `|| 1`
+  // fallback already accepts — a hub command lands a beat later, never lost. Checked at
+  // call time (not a load-time const) so the suite can drive both platforms.
+  if (process.platform === "win32") return;
   const pid = Number(process.env.TURMA_MANAGER_PID) || 1;
   try {
     process.kill(pid, "SIGUSR1");

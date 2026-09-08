@@ -110,9 +110,13 @@ updater section).
 `hub-agent.py`'s own Windows portability is XERK-670 (`windows-agent.md`); the tunnel is its own
 pass. This launcher exports the correct pid regardless.
 
-- **The tunnel's `pokeHeartbeat` uses `process.kill(pid, "SIGUSR1")`; Windows Node has no POSIX
-  signals**, so that call would terminate the manager rather than poke it. Making the poke a no-op /
-  named-event on Windows is `tunnel-agent.js`'s portability pass.
+- **The tunnel's `pokeHeartbeat` is a NO-OP on Windows (XERK-678, done).** `process.kill(pid,
+  "SIGUSR1")` on Windows Node does not poke — libuv EINVALs SIGUSR1 or terminates the target — and
+  `hub-agent.py` installs no SIGUSR1 handler on Windows anyway (`windows-agent.md`), so there is
+  nothing to poke. `pokeHeartbeat` returns early on `process.platform === "win32"` (checked at call
+  time so the suite drives both); the manager beats on its normal `TURMA_INTERVAL`, the same latency
+  the `|| 1` fallback already accepts. Tests: the `pokeHeartbeat is a no-op on Windows` case in
+  `tunnel-agent.test.js`.
 - **`hub-agent.py`'s `SIGUSR1` handler + other Unix seams** (tmux CLI, `os.setsid`, `/proc`) are the
   `IS_WINDOWS` dispatch in `windows-agent.md` (XERK-670) and the `TerminalBackend` seam (XERK-668);
   the launcher does not touch the shared runtime.
