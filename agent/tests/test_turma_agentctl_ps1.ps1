@@ -25,6 +25,15 @@
 #   6. a STALE/FOREIGN pidfile is not blindly killed — a recorded pid whose command line is
 #      not our launcher (a crashed launcher's pid reused by an innocent process — worst case a
 #      pty-host) SURVIVES stop, and the stale pidfile is cleared.
+#   7. SERVICE-path stop reaps the broken-away tunnel + supervisor (XERK-698) — on a real host
+#      WinSW's Stop-Service reaps only the in-job launcher+manager, LEAVING the tunnel + its
+#      supervisor (which broke away from the job like the pty-hosts) orphaned; the fix runs the
+#      SAME command-line control-plane reap on the service path too. Driven via the test-only
+#      TURMA_FORCE_SERVICE_MODE hook (Get-Service is undefined on Linux pwsh): manager+supervisor
+#      reaped, tunnel stays dead, pty-host left alive.
+#   8. `logs` under the SERVICE reads the WinSW <service>.out.log, not agent.log (XERK-698) —
+#      the pidfile-fallback agent.log is empty under the service, so reading it printed
+#      "no log yet" while the service was running and logging to turma-agent.out.log.
 #
 # Like the launcher suite, the REAL controller runs; only the launcher it starts is stubbed
 # (by a stub turma-agent.ps1 that backgrounds a faux MANAGER, a faux PTY-HOST, and a faux
@@ -144,8 +153,9 @@ function Invoke-Ctl([string]$Command, [string]$OutFile) {
 
 function Set-BaseEnv {
   $env:USERPROFILE = $Home_
-  Remove-Item env:TURMA_RUNTIME_DIR   -ErrorAction SilentlyContinue
-  Remove-Item env:TURMA_SERVICE_NAME  -ErrorAction SilentlyContinue
+  Remove-Item env:TURMA_RUNTIME_DIR       -ErrorAction SilentlyContinue
+  Remove-Item env:TURMA_SERVICE_NAME      -ErrorAction SilentlyContinue
+  Remove-Item env:TURMA_FORCE_SERVICE_MODE -ErrorAction SilentlyContinue
 }
 
 $TurmaDir   = Join-Path $Home_ '.turma'
@@ -263,6 +273,66 @@ try {
   if (-not (Test-Path -LiteralPath $PidInTurma)) { Ok "stop cleared the stale pidfile" }
   else { Fail "stop left the stale pidfile in place (a fresh start would read it as running)" }
   try { $innocent.Kill() } catch { }
+
+  # --- Case 7: SERVICE-path stop reaps the broken-away tunnel + supervisor (XERK-698) ----
+  # On a real host WinSW's Stop-Service reaps only the in-job launcher+manager; the tunnel + its
+  # supervisor broke away from the job (ADR D2, like the pty-hosts) and SURVIVE it — the orphan
+  # bug (which on uninstall then locks the prefix). The fix runs the same command-line control-
+  # plane reap on the service path too. Bring the fixture up via the POSIX-drivable pidfile
+  # start, then drive the SERVICE-path stop with the test-only TURMA_FORCE_SERVICE_MODE hook.
+  Note "case: service-path stop reaps the tunnel + supervisor that break away from the job"
+  Reset-Fixture
+  Set-BaseEnv
+  Invoke-Ctl 'start' (Join-Path $Work 'start7.log') | Out-Null
+  if (Wait-For { (Count-Faux @($Manager)) -ge 1 -and (Count-Faux @($Tunnel)) -ge 1 -and (Count-Faux @($Work, '-TunnelSupervisor')) -ge 1 -and (Count-Faux @($PtyHost)) -ge 1 }) {
+    Ok "control plane + pty-host up before the service-path stop"
+  }
+  else { Fail "not all faux processes came up (mgr=$(Count-Faux @($Manager)) tun=$(Count-Faux @($Tunnel)) sup=$(Count-Faux @($Work,'-TunnelSupervisor')) pty=$(Count-Faux @($PtyHost)))" }
+  $env:TURMA_FORCE_SERVICE_MODE = '1'
+  Invoke-Ctl 'stop' (Join-Path $Work 'stop7.log') | Out-Null
+  Remove-Item env:TURMA_FORCE_SERVICE_MODE -ErrorAction SilentlyContinue
+  if (Wait-For { (Count-Faux @($Manager)) -eq 0 -and (Count-Faux @($Work, '-TunnelSupervisor')) -eq 0 }) {
+    Ok "service-path stop reaped the manager and the supervisor"
+  }
+  else { Fail "service-path stop left the control plane (mgr=$(Count-Faux @($Manager)) sup=$(Count-Faux @($Work,'-TunnelSupervisor')))" }
+  # Settle past the supervisor's respawn tick: the tunnel stays dead only because the supervisor
+  # was reaped on the service path too — the exact orphan the bug left running.
+  Start-Sleep -Milliseconds 700
+  if ((Count-Faux @($Tunnel)) -eq 0) { Ok "the tunnel stayed dead after the service-path stop (supervisor reaped, not orphaned)" }
+  else { Fail "the tunnel was respawned after the service-path stop — the supervisor was orphaned (the XERK-698 bug)" }
+  if ((Count-Faux @($PtyHost)) -ge 1) { Ok "the pty-host survived the service-path stop (the session is preserved)" }
+  else { Fail "service-path stop killed the pty-host — a running session would be destroyed" }
+
+  # --- Case 8: `logs` under the SERVICE tails <service>.out.log, not agent.log (XERK-698) -
+  # Under WinSW the launcher's output is captured to ~/.turma\turma-agent.out.log (the roll-by-
+  # size appender), NOT the agent.log the pidfile fallback writes — so `logs` reading agent.log
+  # printed "no log yet" over a running, logging service.
+  Note "case: logs under the service reads <service>.out.log, not agent.log"
+  Reset-Fixture
+  Set-BaseEnv
+  New-Item -ItemType Directory -Force -Path $TurmaDir | Out-Null
+  $svcOut   = Join-Path $TurmaDir 'turma-agent.out.log'   # WinSW basename = the service id
+  $agentLog = Join-Path $TurmaDir 'agent.log'
+  Remove-Item -LiteralPath $svcOut, $agentLog -Force -ErrorAction SilentlyContinue
+  # 8a: with no service log yet, the "not yet" notice names the SERVICE out log, not agent.log.
+  $env:TURMA_FORCE_SERVICE_MODE = '1'
+  Invoke-Ctl 'logs' (Join-Path $Work 'logs8a.log') | Out-Null
+  $out8a = (Get-Content (Join-Path $Work 'logs8a.log') -Raw -ErrorAction SilentlyContinue)
+  if ($out8a -and $out8a.Contains($svcOut) -and -not $out8a.Contains($agentLog)) {
+    Ok "logs under service names the WinSW out log (not agent.log) when nothing is written yet"
+  }
+  else { Fail "logs under service pointed at the wrong file: $out8a" }
+  # 8b: with the service out log PRESENT (agent.log still absent), logs proceeds to TAIL it —
+  # it blocks on Get-Content -Wait instead of printing the "no log" notice and exiting. A bug
+  # reading the absent agent.log would exit immediately with the notice.
+  Set-Content -LiteralPath $svcOut -Value ('svc-line-' + [guid]::NewGuid().ToString('N'))
+  $p8b = Start-Ctl 'logs' (Join-Path $Work 'logs8b.log')
+  $exited8b = $p8b.WaitForExit(2000)
+  if (-not $exited8b) { Ok "logs under service is tailing the out log (blocked on -Wait, did not exit with a 'no log' notice)" }
+  else { Fail "logs under service exited instead of tailing the present out log: $(Get-Content (Join-Path $Work 'logs8b.log') -Raw -ErrorAction SilentlyContinue)" }
+  try { $p8b.Kill() } catch { }
+  $null = $p8b.WaitForExit(3000)
+  Remove-Item env:TURMA_FORCE_SERVICE_MODE -ErrorAction SilentlyContinue
 }
 finally {
   Reset-Fixture

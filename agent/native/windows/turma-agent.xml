@@ -74,9 +74,11 @@
   <stoptimeout>15 sec</stoptimeout>
 
   <!--
-    WinSW writes the launcher's stdout/stderr here; turma-agentctl.ps1 logs tails the same
-    ~/.turma\agent.log the pidfile fallback writes, so `turma-agentctl logs` is identical
-    whichever supervisor is in play. roll-by-size keeps the file bounded without cron.
+    WinSW captures the launcher's stdout/stderr via its SizeBasedRollingLogAppender to
+    <logpath>\<id>.out.log / .err.log (i.e. ~/.turma\turma-agent.out.log) -- NOT the
+    ~/.turma\agent.log the pidfile fallback writes. `turma-agentctl logs` reads the service
+    out/err log under the service and agent.log on the fallback path (XERK-698), so it tails
+    the right file whichever supervisor is in play. roll-by-size keeps it bounded without cron.
   -->
   <logpath>%USERPROFILE%\.turma</logpath>
   <log mode="roll-by-size">
