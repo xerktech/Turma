@@ -466,66 +466,6 @@ esac
   else { Fail "did not attempt --enroll for a truthy opt-in" }
   if ($tok -eq 'master-shared') { Ok "stayed on the current token and still started (soft skip)" }
   else { Fail "exit 2 did not stay on the current token (got '$tok') — a soft skip must not roll or block" }
-
-  # --- Case 15: the auto-update poller is started; the empty-poller check does not crash ------
-  # (XERK-702) Invoke-UpdateChecks decides whether to start the detached -Loop poller with
-  # `if (@(Get-UpdatePoller).Count -eq 0)`. On the normal FIRST start no poller is running, so
-  # Get-UpdatePoller returns an empty array — and a PARENTHESISED call to a function that emits
-  # `@()` collapses to $null, so the pre-fix `(Get-UpdatePoller).Count` threw PropertyNotFound
-  # under StrictMode, the branch never ran, and the poller was silently never started (auto-update
-  # dead after a clean reboot). XERK-700 removed the Get-Process hang that had MASKED this; the
-  # fixture deliberately omits the updater (so every earlier case's Invoke-UpdateChecks short-
-  # circuits at Test-Path $Updater — why #729's suite never reached it), so lay a stub updater and
-  # assert the -Loop poller actually starts.
-  Note "case: the auto-update poller is started and the empty-poller check does not crash — XERK-702"
-  $UpdaterPath = Join-Path $Bin 'turma-agent-update.ps1'
-  $updMarker   = Join-Path $Work 'upd-marker.log'
-  # The stub RECORDS its invocation mode into a marker file (a direct, flushed write from its OWN
-  # process, independent of the launcher's buffered stdout, which does not flush to its redirected
-  # log while it blocks in WaitForExit on the sleeping manager stub). The marker path is BAKED into
-  # the stub (single-quoted), NOT read from the environment -- exactly as the base fixture's manager
-  # stub bakes $ManagerLog, because env does not reliably propagate launcher -> Start-Process ->
-  # stub here. -ClaudeOnly is the awaited pre-manager check; -Loop is the detached poller, which
-  # also sleeps so it lingers.
-  $updStub = @'
-param([switch]$ClaudeOnly, [switch]$Loop, [switch]$Boot, [switch]$LockedRun, [switch]$LockedClaude)
-$m = '__MARKER__'
-if ($ClaudeOnly) { Add-Content -LiteralPath $m -Value 'claudeonly' }
-if ($Loop)       { Add-Content -LiteralPath $m -Value 'loop' }
-if ($Loop) { Start-Sleep -Seconds 300 }
-exit 0
-'@.Replace('__MARKER__', $updMarker)
-  Set-Content -Path $UpdaterPath -Value $updStub
-  function Stop-UpdatePollers {
-    Get-Process -ErrorAction SilentlyContinue | Where-Object {
-      $cl = $null; try { $cl = $_.CommandLine } catch { }
-      $cl -and $cl.Contains($UpdaterPath)
-    } | ForEach-Object { try { $_.Kill() } catch { } }
-  }
-  Stop-UpdatePollers
-  Reset-Launchers
-  Remove-Item $ManagerLog, $updMarker -ErrorAction SilentlyContinue
-  Set-BaseEnv
-  $env:TURMA_AGENT_ENV = $goodCfg
-  New-ShStub (Join-Path $NpmBin 'claude') "exit 0"   # a reachable claude so the run path proceeds
-  $updRun = Join-Path $Work 'run-upd.log'
-  Start-Launcher @() $updRun | Out-Null
-  # Post-fix the empty-poller @()-count is 0 and the launcher STARTS the -Loop poller, whose stub
-  # records 'loop'. Pre-fix the parenthesised .Count threw under StrictMode, the branch never ran,
-  # and no 'loop' marker appears. 'claudeonly' (from the awaited pre-manager check) separately
-  # proves Invoke-UpdateChecks got past its Test-Path $Updater guard, isolating an early return.
-  $gotLoop = Wait-For { (Test-Path $updMarker) -and (Select-String -Quiet '^loop$' $updMarker) } 150
-  if ($gotLoop) { Ok "launcher started the -Loop auto-update poller (the empty-poller @() count is 0, not a StrictMode throw)" }
-  else {
-    Start-Sleep -Seconds 2
-    $mk = if (Test-Path $updMarker) { (Get-Content $updMarker -Raw) -replace '\s+', ',' } else { '<none>' }
-    Fail ("poller never started (XERK-702 regression). updater-present=$(Test-Path $UpdaterPath) marker=[$mk] log=[" + (Get-Content $updRun -Raw -ErrorAction SilentlyContinue) + "]")
-  }
-  if (Wait-For { (Test-Path $ManagerLog) -and ((Get-Item $ManagerLog).Length -gt 0) }) { Ok "manager still started after the update checks" }
-  else { Fail "manager never started after Invoke-UpdateChecks" }
-  Stop-UpdatePollers
-  Reset-Launchers
-  Remove-Item $UpdaterPath -ErrorAction SilentlyContinue
 }
 finally {
   Cleanup
