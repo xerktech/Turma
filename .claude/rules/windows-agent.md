@@ -11,15 +11,49 @@ The shared runtime is ONE cross-platform codebase — **never forked per OS** (A
 dispatch on `IS_WINDOWS = os.name == "nt"` rather than living in a Windows copy. Read the ADR for
 *why*; this is the operative rule.
 
-## Scope boundary — the terminal layer is NOT here (XERK-668)
+## The terminal seam IS wired (XERK-697, ADR D5)
 
-- **`hub-agent.py` never calls the tmux/ttyd CLI through an OS branch of its own.** The tmux/ttyd
-  call sites (`_spawn_in_tmux`, `_type_into_pane`, `_capture_pane`, `_tmux_alive`, `_launch_ttyd`)
-  and `resume_on_boot`'s adopt path are **XERK-668's `TerminalBackend` seam** (the ConPTY pty-host
-  replacing tmux+ttyd, ADR D1). XERK-670 is deliberately seam-INDEPENDENT and touches none of them.
-- So a Windows-portability change here must stay on the **paths / permissions / state-dir / liveness
-  / degradation** side. Anything that drives, captures, spawns or adopts a session's terminal belongs
-  to XERK-668 — do not add a `sys.platform` branch to those call sites from this side.
+The tmux/ttyd call sites now dispatch on `IS_WINDOWS` to the per-session ConPTY pty-host (agent/win/,
+XERK-668). Before this, they shelled `tmux`/`ttyd` unconditionally and every Windows session died at
+launch with `WinError 2` — the whole session surface was dead. The seam, in `hub-agent.py`:
+
+- **One pty-host process per session replaces BOTH tmux AND ttyd.** So `_spawn_in_tmux`+`_launch_ttyd`
+  COLLAPSE into `_spawn_pty_host` on Windows (the pty-host owns the pty and serves the terminal on the
+  same stable `ttydPort` the hub proxies `/term/<id>` to). `_launch_ttyd` and `_kill_ttyd` NO-OP on
+  Windows; `_kill_tmux` tears the pty-host down (kill+state-file removal). Every kill/delete/restart
+  path runs `_kill_tmux` before `_kill_ttyd`, so nothing leaks.
+- **The pty-host STATE FILE is the single source of truth — there is NO in-memory registry.** Every
+  terminal helper (`_capture_pane`/`_type_into_pane`/`_tmux_alive`/`_pane_send_keys`) resolves the
+  session from `<REGISTRY_DIR>/pty-hosts/<tmuxName>.state.json` (`{pid, ctrlPort, termPort}`) keyed by
+  the same `tmuxName` the Linux path passes around. So **resume-on-boot ADOPT is FREE**: a surviving
+  detached pty-host is reached by reading its state file — the adopt path needs no reattach code (the
+  qwen/dsh tail analog does not apply; the pty-host is stateless-per-op from the manager's side).
+- **The control channel is a PURE-PYTHON RFC 6455 client** (`_ws_control_rpc`/`_pty_control`, stdlib
+  socket/struct/base64/hashlib — no `ws` dep on the Python side), one connect per op like the per-op
+  `tmux` subprocess it replaces. `inject`/`capture`/`alive`/`resize`/`kill` are the tmux-CLI ops. It
+  authenticates with `TURMA_TOKEN or 'changeme'` = the pty-host's `--auth-token` = ttyd's `-c` token,
+  so nothing hub-side changes (`.claude/rules/windows-terminal.md`).
+- **`_launch_tmux` translates its POSIX shell command into argv + an env dict** on Windows (node-pty
+  spawns claude directly, no shell): the `VAR=x` env-assignment prefix → env entries; the failover
+  `set -a; . <local-model.env>` → `_read_env_file` merged into the env dict (the gateway credential
+  stays OFF the command line, as the source kept it); the claude flags → portable argv, the initial
+  prompt a positional after `--`. Keep `--settings` (wires the guard + AskUserQuestion bridge).
+- **`_windows_claude_launcher` resolves `.exe` (argv-spawn) vs `.cmd` (`cmd.exe /c claude`)** via
+  `shutil.which` (PATHEXT). The npm shim is not CreateProcess-spawnable, hence the `cmd.exe` wrap.
+- **`capture` returns the RAW scrollback ring**, so `_busy_from_capture`'s `esc to interrupt` scan is
+  an accepted approximation on Windows (the markers survive as substrings); details + the pane-drive
+  keystroke map (`_pane_send_keys`: Escape/BTab/Up/Down/… → terminal bytes for interrupt/set_mode/
+  set_model/answer_pane_prompt) in `windows-terminal.md`.
+- **Deps + lay-down are `install.ps1`'s** (node-pty + ws into `<base>\win\node_modules`, beside
+  `pty-host.mjs` at `<base>\win\`). Detached spawn = `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP`
+  (KillMode=process analog); `start_new_session` on POSIX lets the forkpty backend exercise the path.
+- **A Windows-portability change on the paths/permissions/state-dir/liveness side must still NOT grow
+  a SECOND OS branch into these call sites** — extend the existing `IS_WINDOWS` dispatch instead.
+- Tests: `TestWindowsTerminalBackend`/`TestWindowsTerminalBackendManager` (mock `IS_WINDOWS`: framing,
+  the shell→argv/env translation, every call-site dispatch). Host-proof (need node-pty, CI-excluded):
+  `agent/win/drive.mjs` (the pty-host, 24/24 on real ConPTY) and `agent/win/pty-control-drive.py` (the
+  manager's control client against a real pty-host); the Python client is also proven cross-language
+  against the real `ws` + `tty-protocol.mjs` control server.
 
 ## Paths & separators (ADR D4)
 

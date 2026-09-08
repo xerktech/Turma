@@ -73,17 +73,20 @@ capture/persistence), not just the ws bridge.
   exactly as it caps tmux sessions today. The pty-host is per-session; the cap is
   the manager's, not the host's.
 
-## The control channel is the tmux-CLI replacement (for D5, not wired here)
+## The control channel is the tmux-CLI replacement (D5 wired by XERK-697)
 
 - **`inject`/`capture`/`alive`/`resize`/`kill` map 1:1 to the tmux calls
   `hub-agent.py` makes** (`_type_into_pane`/`_capture_pane`/`_tmux_alive`/…). D1
-  (this task) ships and pins that protocol; **wiring `hub-agent.py`'s tmux calls to
-  it is the manager portability pass (D5), a separate child** — do not grow a
-  Windows branch into the tmux paths here.
+  ships and pins that protocol; the manager side that DRIVES it (D5) is now
+  wired — **the manager-side seam is `.claude/rules/windows-agent.md` ("The
+  terminal seam IS wired")**. Do not add a second Windows branch into the tmux
+  paths outside those `IS_WINDOWS` dispatches.
 - **`capture` returns the raw scrollback RING, not a rendered grid.** `_busy_from_
-  capture` reads the *rendered* pane today, so byte-for-byte parity there needs a
-  headless emulator (`@xterm/headless`) in the pty-host to render the ring — an
-  ADR open question flagged for the drive child, deliberately NOT built here.
+  capture` reads the *rendered* pane today; on Windows it scans that raw ring, and
+  the plain-text markers it looks for (`esc to interrupt`) survive as contiguous
+  substrings, so busy detection works as an ACCEPTED APPROXIMATION. Byte-for-byte
+  parity would need a headless emulator (`@xterm/headless`) in the pty-host to
+  render the ring — the ADR open question, still NOT built.
 - Control is loopback + a `?token=<token>` shared secret (defence in depth); the
   manager holds the token and reads `ctrlPort` from the state file.
 - **The pty-host REFUSES to start without `--auth-token`** — unlike ttyd's optional
