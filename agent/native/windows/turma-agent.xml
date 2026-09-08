@@ -81,7 +81,7 @@
 
   <!--
     WinSW captures the launcher's stdout/stderr via its SizeBasedRollingLogAppender to
-    <logpath>\<id>.out.log / .err.log (i.e. ~/.turma\turma-agent.out.log) -- NOT the
+    <logpath>\<id>.out.log / .err.log (i.e. ~/.turma\turma-agent.out.log), NOT the
     ~/.turma\agent.log the pidfile fallback writes. `turma-agentctl logs` reads the service
     out/err log under the service and agent.log on the fallback path (XERK-698), so it tails
     the right file whichever supervisor is in play. roll-by-size keeps it bounded without cron.
