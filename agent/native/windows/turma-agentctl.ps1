@@ -168,18 +168,51 @@ function Test-ServiceMode {
 }
 
 # --- reap by command line (the launcher's Stop-ByCommandLine, prefix-scoped) --------------
+# Enumerate every process with its command line, cross-platform (XERK-700). On a real Windows
+# host, reading Process.CommandLine (via Get-Process) opens each process and reads its PEB, and
+# on a protected/system process that read NEVER RETURNS -- so `Get-Process | %{ $_.CommandLine }`
+# HANGS INDEFINITELY, wedging uninstall/stop/restart, and the try/catch cannot rescue a hang.
+# Get-CimInstance Win32_Process is one WMI query, takes no per-process handle, and cannot block
+# on a protected process. The CIM cmdlets are Windows-only in PowerShell 7, so on Linux pwsh
+# (the POSIX harness) fall back to Get-Process, safe there. Normalized to Id + CommandLine so
+# the reap logic below is identical. (Single-pid Get-Process -Id reads, e.g. Test-PidAlive, open
+# one known process and are safe -- left as-is.)
+#
+# Windows is detected in a way SAFE under Windows PowerShell 5.1 too: $IsWindows is a pwsh-6+
+# automatic, and 5.1 lacks it -- under StrictMode Latest a bare read is a terminating error, and
+# an operator runs turma-agentctl in the box-default 5.1. So probe via Get-Variable (no throw when
+# the var is absent) and fall back to $env:OS ('Windows_NT' on every Windows, unset on Linux). On
+# pwsh 7 $IsWindows always wins, so Linux pwsh stays correctly false and drives the fallback.
+function Test-IsWindowsHost {
+  $iw = Get-Variable -Name IsWindows -ValueOnly -ErrorAction SilentlyContinue
+  if ($null -ne $iw) { return [bool]$iw }
+  return ($env:OS -eq 'Windows_NT')
+}
+function Get-ProcessCommandLines {
+  if (Test-IsWindowsHost) {
+    Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
+      [pscustomobject]@{ Id = [int]$_.ProcessId; CommandLine = $_.CommandLine }
+    }
+  }
+  else {
+    Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+      $cl = $null; try { $cl = $_.CommandLine } catch { $cl = $null }
+      [pscustomobject]@{ Id = $_.Id; CommandLine = $cl }
+    }
+  }
+}
 # Kills every process whose command line contains ALL the needles (never ourselves). Reused
 # for the tunnel supervisor, the tunnel and the manager on the pidfile stop path. A pty-host
-# is never a needle here, so it is never reaped -- the session-preserving property.
+# is never a needle here, so it is never reaped -- the session-preserving property. Kill by pid
+# (Stop-Process), since the normalized objects carry no .Kill() method.
 function Stop-ByCommandLine([string[]]$Needles) {
-  Get-Process -ErrorAction SilentlyContinue | Where-Object {
+  Get-ProcessCommandLines | Where-Object {
     if ($_.Id -eq $PID) { return $false }
-    $cl = $null
-    try { $cl = $_.CommandLine } catch { return $false }
+    $cl = $_.CommandLine
     if (-not $cl) { return $false }
     foreach ($n in $Needles) { if (-not $cl.Contains($n)) { return $false } }
     return $true
-  } | ForEach-Object { try { $_.Kill() } catch { } }
+  } | ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch { } }
 }
 
 # Reap the control plane BY COMMAND LINE, in the launcher's order, leaving pty-hosts (and thus
