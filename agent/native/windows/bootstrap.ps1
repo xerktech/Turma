@@ -34,8 +34,9 @@
 #    is the INTERPRETER the installer runs under, and an installer cannot provision the
 #    interpreter it is already running in — the one genuine chicken-and-egg with no
 #    Linux analog (bash is always present). So the single prerequisite this front door
-#    legitimately ensures is pwsh 7 itself (via winget, if missing), then it hands the
-#    unpacked install.ps1 to that pwsh. Everything else stays install.ps1's job.
+#    legitimately ensures is pwsh 7 itself — via winget when present, else a direct MSI
+#    download (XERK-678, so a winget-less box is not a manual dead-end) — then it hands
+#    the unpacked install.ps1 to that pwsh. Everything else stays install.ps1's job.
 # ---------------------------------------------------------------------------------
 
 # NO param()/[CmdletBinding()] on purpose. This is a passthrough front door: every
@@ -178,6 +179,45 @@ function Get-PwshCandidatePaths {
   $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }
   return $roots | ForEach-Object { Join-Path $_ 'PowerShell\7\pwsh.exe' }
 }
+# The winget-less PS7 fallback (XERK-678). winget ships as part of App Installer, which a
+# Windows Server image or a stripped/older Windows install may simply not have — there the
+# winget-only path DEAD-ENDED on a manual "install PowerShell 7 yourself" step, breaking the
+# "clean-machine install via the one-liner" DoD on exactly the hosts an agent runs on. This
+# resolves the latest PowerShell MSI for THIS host's arch from GitHub (the same anonymous,
+# ConvertFrom-Json style as our own asset resolution) and installs it silently with msiexec —
+# no App Installer, no winget. The msiexec call is behind Invoke-MsiInstall so the suite can
+# drive the resolve+download+arch logic without a real installer or a real Windows.
+$PwshApi = 'https://api.github.com/repos/PowerShell/PowerShell/releases/latest'
+function Invoke-MsiInstall([string]$MsiPath) {
+  # The one genuinely host-only step: a real msiexec, which needs elevation (the paste is
+  # meant to run in an elevated Windows PowerShell). Returns the process exit code; 0 is
+  # success and 3010 is success-pending-reboot, both fine for us here.
+  $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', "`"$MsiPath`"", '/quiet', '/norestart') -Wait -PassThru
+  return $p.ExitCode
+}
+function Install-PwshViaMsi {
+  $arch = switch -Regex ("$env:PROCESSOR_ARCHITECTURE") {
+    'ARM64'     { 'arm64'; break }
+    'AMD64|x64' { 'x64';   break }
+    default     { 'x64' }   # unknown/absent (e.g. the POSIX test runner) -> the common case
+  }
+  $assetRe = "^PowerShell-[0-9][0-9.]*-win-$arch\.msi$"
+  Info "installing PowerShell 7 via direct MSI (winget unavailable) — arch $arch"
+  $rel = $null
+  try { $rel = Get-ReleaseJson $PwshApi } catch { Info "cannot reach the PowerShell release API"; return $false }
+  $asset = $null
+  foreach ($a in @($rel.assets)) { if ("$($a.name)" -match $assetRe) { $asset = $a; break } }
+  if (-not $asset) { Info "no win-$arch MSI in the latest PowerShell release"; return $false }
+  $msi = Join-Path ([System.IO.Path]::GetTempPath()) $asset.name
+  try { Get-ReleaseFile $asset.browser_download_url $msi } catch { Info "PowerShell MSI download failed"; return $false }
+  try {
+    $code = Invoke-MsiInstall $msi
+    Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
+    if ($code -eq 0 -or $code -eq 3010) { return $true }
+    Info "msiexec exited $code (a silent MSI install needs an elevated shell — re-run the paste as Administrator)"
+    return $false
+  } catch { Info "msiexec failed: $_"; return $false }
+}
 function Resolve-Pwsh {
   # Already in pwsh 7+? Use this very process's own executable.
   if ($PSVersionTable.PSVersion.Major -ge 6) { return (Get-Process -Id $PID).Path }
@@ -188,20 +228,29 @@ function Resolve-Pwsh {
   # Common winget/MSI install locations that may not be on THIS shell's PATH yet.
   foreach ($p in (Get-PwshCandidatePaths)) { if (Test-Path -LiteralPath $p) { return $p } }
 
-  # Not present — install it. This is the ONE prerequisite the front door owns.
-  if (-not (Get-Command 'winget' -ErrorAction SilentlyContinue)) {
-    Die ("PowerShell 7 is required to run the installer and winget is unavailable to install it. " +
-         "Install PowerShell 7 (https://aka.ms/powershell) or 'winget install --id Microsoft.PowerShell', then re-run.")
+  # Not present — provision it. This is the ONE prerequisite the front door owns. Prefer
+  # winget when it is there; fall back to a direct MSI when it is not (XERK-678) so a
+  # winget-less box still gets a true one-paste install instead of a manual dead-end.
+  if (Get-Command 'winget' -ErrorAction SilentlyContinue) {
+    Info "installing PowerShell 7 (winget: Microsoft.PowerShell) — the installer requires it"
+    try {
+      & winget install --id Microsoft.PowerShell --exact --silent --accept-package-agreements --accept-source-agreements | Out-Null
+    } catch { }
+    $cmd = Get-Command 'pwsh' -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    foreach ($p in (Get-PwshCandidatePaths)) { if (Test-Path -LiteralPath $p) { return $p } }
   }
-  Info "installing PowerShell 7 (winget: Microsoft.PowerShell) — the installer requires it"
-  try {
-    & winget install --id Microsoft.PowerShell --exact --silent --accept-package-agreements --accept-source-agreements | Out-Null
-  } catch { }
 
-  $cmd = Get-Command 'pwsh' -ErrorAction SilentlyContinue
-  if ($cmd) { return $cmd.Source }
-  foreach ($p in (Get-PwshCandidatePaths)) { if (Test-Path -LiteralPath $p) { return $p } }
-  Die "PowerShell 7 still not found after winget install — install it from https://aka.ms/powershell, then re-run"
+  # winget absent, or it ran but pwsh still is not resolvable — direct MSI, then re-probe.
+  if (Install-PwshViaMsi) {
+    $cmd = Get-Command 'pwsh' -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    foreach ($p in (Get-PwshCandidatePaths)) { if (Test-Path -LiteralPath $p) { return $p } }
+  }
+
+  Die ("PowerShell 7 is required to run the installer and it could not be installed automatically " +
+       "(winget unavailable and the MSI fallback did not succeed — a silent MSI install needs an " +
+       "elevated shell). Install it from https://aka.ms/powershell, then re-run.")
 }
 
 # ===================================================================================

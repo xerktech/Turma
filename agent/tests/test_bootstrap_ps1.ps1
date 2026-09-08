@@ -223,6 +223,44 @@ try {
     try { & $sb -Verify -Prefix 'D:\turma' -NoInstallDeps; Ok "accepted -Verify/-Prefix/-NoInstallDeps verbatim" }
     catch { Fail "rejected passthrough flags at the entry (a param()/CmdletBinding regression?): $_" }
   } finally { Remove-Item Env:\TURMA_BOOTSTRAP_NORUN -ErrorAction SilentlyContinue }
+
+  # --- Case 8: the winget-less PS7 MSI fallback resolves the arch asset and installs it ----
+  # XERK-678: on a box without winget (Server images, stripped installs) the front door must
+  # still provision PS7 rather than dead-end. Dot-source the real script (NORUN, so main does
+  # not run) and drive Install-PwshViaMsi with the release JSON, the download, and the ONE
+  # host-only step (Invoke-MsiInstall) stubbed — proving it picks the right-arch MSI, downloads
+  # THAT url, and treats a clean msiexec exit as success. msiexec/winget themselves stay host
+  # proof; this covers the resolve+arch+download logic that a real box cannot re-verify cheaply.
+  Note "case: winget-less PS7 provisioning resolves the arch MSI and installs it"
+  $env:TURMA_BOOTSTRAP_NORUN = '1'
+  $savedArch = $env:PROCESSOR_ARCHITECTURE
+  try {
+    . $Bootstrap
+    $Script:MsiUrl = $null; $Script:MsiPath = $null
+    function Get-ReleaseJson([string]$Url) {
+      return [pscustomobject]@{ assets = @(
+        [pscustomobject]@{ name = 'PowerShell-7.4.6-win-x64.msi';   browser_download_url = 'https://gh/win-x64.msi' }
+        [pscustomobject]@{ name = 'PowerShell-7.4.6-win-arm64.msi'; browser_download_url = 'https://gh/win-arm64.msi' }
+        [pscustomobject]@{ name = 'PowerShell-7.4.6-win-x86.msi';   browser_download_url = 'https://gh/win-x86.msi' }
+      ) }
+    }
+    function Get-ReleaseFile([string]$Url, [string]$OutFile) { $Script:MsiUrl = $Url; Set-Content -LiteralPath $OutFile -Value 'msi' }
+    function Invoke-MsiInstall([string]$MsiPath) { $Script:MsiPath = $MsiPath; return 0 }
+
+    $env:PROCESSOR_ARCHITECTURE = 'ARM64'
+    $ok = Install-PwshViaMsi
+    if ($ok) { Ok "reported success on a clean msiexec exit" } else { Fail "reported failure despite msiexec exit 0" }
+    Assert-Eq 'https://gh/win-arm64.msi' $Script:MsiUrl "downloaded the arm64 MSI on an ARM64 host" "picked the wrong-arch MSI"
+    if ($Script:MsiPath -match 'PowerShell-7\.4\.6-win-arm64\.msi$') { Ok "handed msiexec the downloaded MSI" } else { Fail "installed a path other than the downloaded MSI: $($Script:MsiPath)" }
+
+    # A non-zero, non-3010 msiexec exit (e.g. a non-elevated shell) must be reported as failure.
+    function Invoke-MsiInstall([string]$MsiPath) { return 1603 }
+    $env:PROCESSOR_ARCHITECTURE = 'AMD64'
+    if (-not (Install-PwshViaMsi)) { Ok "treated a failed msiexec (1603) as failure, not success" } else { Fail "claimed success on a failed msiexec exit" }
+  } finally {
+    $env:PROCESSOR_ARCHITECTURE = $savedArch
+    Remove-Item Env:\TURMA_BOOTSTRAP_NORUN -ErrorAction SilentlyContinue
+  }
 }
 finally {
   Remove-Item -Recurse -Force -LiteralPath $Work -ErrorAction SilentlyContinue
