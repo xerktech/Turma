@@ -1,30 +1,30 @@
 #!/usr/bin/env pwsh
-# turma-agentctl.ps1 — native (no-WSL) Windows process control for the Turma per-host
+# turma-agentctl.ps1 -- native (no-WSL) Windows process control for the Turma per-host
 # agent (XERK-671, epic XERK-666; decisions in docs/windows-agent-adr.md D2, rules in
 # .claude/rules/windows-launcher.md).
 #
 # The Windows equivalent of BOTH halves the bash side has: the systemd user unit AND the
 # nohup `turma-agentctl` fallback. It drives the WinSW SERVICE (the systemd analog) when
 # one is installed, and falls back to a pidfile-managed BACKGROUND launcher (the nohup
-# analog) when it is not — the same two-scope shape as the bash ctl's `restart_manager`
+# analog) when it is not -- the same two-scope shape as the bash ctl's `restart_manager`
 # (systemd-user / systemd-system / pidfile), collapsed to (service / pidfile) here.
 #
 # Commands mirror the bash turma-agentctl: start | stop | restart | status | logs, plus
-# install | uninstall (thin WinSW wrappers, so the installer child — which bundles
-# WinSW.exe and this file — can register the service with one call).
+# install | uninstall (thin WinSW wrappers, so the installer child -- which bundles
+# WinSW.exe and this file -- can register the service with one call).
 #
 # Three invariants this file carries, all named in the ticket:
 #
 #   * SESSION-PRESERVING restart (the KillMode=process guarantee). A restart reaps only
-#     the control plane — the launcher, the manager (hub-agent.py), the tunnel + its
-#     supervisor — and NEVER the detached per-session pty-hosts, which survive and are
+#     the control plane -- the launcher, the manager (hub-agent.py), the tunnel + its
+#     supervisor -- and NEVER the detached per-session pty-hosts, which survive and are
 #     re-adopted on the next boot (resume_on_boot). On the service path WinSW restarts the
 #     launcher and the pty-hosts' job-object breakaway (ADR D2) keeps them alive; on the
 #     pidfile path we reap by command line and simply never name a pty-host.
 #   * The supervisor is reaped BEFORE the tunnel (else the just-killed tunnel is respawned
 #     by its own supervisor), the SAME ordering the launcher uses on every start.
-#   * The pidfile lives in a Windows-CORRECT per-user location — %USERPROFILE%\.turma, a
-#     durable per-user dir — NOT %TEMP% (which a Session-0 service identity and the
+#   * The pidfile lives in a Windows-CORRECT per-user location -- %USERPROFILE%\.turma, a
+#     durable per-user dir -- NOT %TEMP% (which a Session-0 service identity and the
 #     interactive user can resolve differently, and which gets swept). Keying it there is
 #     the Windows twin of the bash ctl guarding against the never-created /run/user/<uid>:
 #     a pidfile the writer and reader disagree on, or one whose write silently fails, lets
@@ -32,7 +32,7 @@
 #
 # NOT here (a later epic child): the WinSW service is DEFINED by the sibling turma-agent.xml
 # but INSTALLED/packaged (winget + npm + bundled WinSW.exe) by the installer child. The Windows
-# updater (turma-agent-update.ps1, XERK-674) IS wired now — but its poller is started by the
+# updater (turma-agent-update.ps1, XERK-674) IS wired now -- but its poller is started by the
 # LAUNCHER (Invoke-UpdateChecks), not by this ctl's `start`, so both the service and pidfile
 # paths get it uniformly.
 
@@ -53,7 +53,7 @@ param(
 Set-StrictMode -Version Latest
 
 # Log to the process stdout handle so a console, a WinSW capture and a test redirect all
-# pick it up identically (Write-Host lands on a stream a plain `>` does not) — same choice
+# pick it up identically (Write-Host lands on a stream a plain `>` does not) -- same choice
 # the launcher makes.
 function Log([string]$Message) { [Console]::Out.WriteLine($Message) }
 
@@ -74,7 +74,7 @@ $Tunnel    = Join-Path $Prefix 'tunnel-agent.js'    # reaped by command line on 
 
 # USERPROFILE is the $HOME analog every per-user path hangs off, and a Session-0 / SYSTEM
 # service can be launched without it in the environment (the Windows twin of the bash
-# "HOME unset" trap). Derive it rather than fail under StrictMode — exactly as the launcher
+# "HOME unset" trap). Derive it rather than fail under StrictMode -- exactly as the launcher
 # does, so the two agree on where the pidfile and logs live.
 if (-not $env:USERPROFILE) {
   $up = [Environment]::GetFolderPath('UserProfile')
@@ -93,7 +93,7 @@ $WinswXml = Join-Path $SelfDir "$ServiceName.xml"
 
 # The durable per-user state dir the manager itself uses (~/.turma). Always writable by its
 # owner, so both the launcher's logs and (in the pidfile path) both ends of a start/stop
-# see the same files. Never %TEMP% — see the header.
+# see the same files. Never %TEMP% -- see the header.
 $TurmaDir = Join-Path $env:USERPROFILE '.turma'
 $Log      = Join-Path $TurmaDir 'agent.log'
 $ErrLog   = Join-Path $TurmaDir 'agent.err.log'
@@ -103,7 +103,7 @@ $ErrLog   = Join-Path $TurmaDir 'agent.err.log'
 # so the SAME failure the bash ctl guards against cannot happen here: a set-but-unusable
 # TURMA_RUNTIME_DIR must fall back, not silently fail every pidfile write and leave stop/
 # restart unable to read the pid they kill (orphan-then-double). ${VAR:-default} only falls
-# back for an UNSET value — a set-but-unwritable dir is exactly the trap — so we probe
+# back for an UNSET value -- a set-but-unwritable dir is exactly the trap -- so we probe
 # writability explicitly.
 function Test-DirUsable([string]$Dir) {
   if (-not $Dir) { return $false }
@@ -163,7 +163,7 @@ function Test-ServiceMode { return $null -ne (Get-AgentService) }
 # --- reap by command line (the launcher's Stop-ByCommandLine, prefix-scoped) --------------
 # Kills every process whose command line contains ALL the needles (never ourselves). Reused
 # for the tunnel supervisor, the tunnel and the manager on the pidfile stop path. A pty-host
-# is never a needle here, so it is never reaped — the session-preserving property.
+# is never a needle here, so it is never reaped -- the session-preserving property.
 function Stop-ByCommandLine([string[]]$Needles) {
   Get-Process -ErrorAction SilentlyContinue | Where-Object {
     if ($_.Id -eq $PID) { return $false }
@@ -178,7 +178,7 @@ function Stop-ByCommandLine([string[]]$Needles) {
 # Reap the whole control plane, in the launcher's order, leaving pty-hosts (and thus the
 # sessions) alive. SUPERVISOR FIRST so it cannot respawn the tunnel we then kill; then the
 # tunnel; then the manager and the launcher pid itself. This is what BOTH `stop` and the
-# pidfile `restart` use — a Windows restart MUST reap the manager too (unlike the bash
+# pidfile `restart` use -- a Windows restart MUST reap the manager too (unlike the bash
 # restart, where the launcher IS the manager via exec, killing the launcher pid alone would
 # leave the python manager running and the fresh launcher would start a SECOND one:
 # two managers double-heartbeating, the very bug the pidfile discipline exists to prevent).
@@ -188,7 +188,7 @@ function Stop-ControlPlane {
   Stop-ByCommandLine @($Manager)                         # then the manager
   # Guard the destructive pidfile kill with the SAME command-line check status/start use
   # (Test-PidAlive). On Windows a pid is reused fast, and a stale pidfile left by a CRASHED
-  # launcher (a clean stop/restart removes it) can point at an innocent process — worst case
+  # launcher (a clean stop/restart removes it) can point at an innocent process -- worst case
   # a pty-host, whose death would destroy the very session this reap must preserve. So kill
   # only a pid we can still confirm is our launcher; drop the (stale/foreign) pidfile
   # regardless so a fresh start is not blocked by it.
@@ -219,7 +219,7 @@ function Start-Fallback {
   Log "turma-agent started (pid $($child.Id)); logs: $Log"
   # The auto-update poller is not started here: the LAUNCHER starts it (Invoke-UpdateChecks in
   # turma-agent.ps1, XERK-674), which covers both this pidfile path and the WinSW service path
-  # uniformly — unlike the bash ctl, which starts its own --loop poller on the nohup path.
+  # uniformly -- unlike the bash ctl, which starts its own --loop poller on the nohup path.
 }
 
 # --- the commands ------------------------------------------------------------------------
@@ -233,7 +233,7 @@ function Invoke-Start {
 
 function Invoke-Stop {
   # Full teardown of the CONTROL PLANE only; the sessions (pty-hosts) are left running and a
-  # later start re-adopts them — the bash ctl's "kill keeps the worktree/session" philosophy.
+  # later start re-adopts them -- the bash ctl's "kill keeps the worktree/session" philosophy.
   if (Test-ServiceMode) {
     # WinSW stops the launcher; the detached pty-hosts break away and survive (ADR D2).
     Stop-Service -Name $ServiceName

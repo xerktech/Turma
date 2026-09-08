@@ -19,6 +19,12 @@ This file covers the LAUNCHER (`turma-agent.ps1`, XERK-669), the SERVICE + CONTR
 (`turma-agent.xml` + `turma-agentctl.ps1`, XERK-671), the INSTALLER (`install.ps1`, XERK-672) and
 the `irm | iex` FRONT DOOR (`bootstrap.ps1`, XERK-673).
 
+- **Every `.ps1` here stays pure ASCII (XERK-678).** These files are read from disk, and Windows
+  PowerShell 5.1 (a clean box's default shell, which an operator runs `turma-agentctl` in) decodes a
+  no-BOM file as ANSI — so a UTF-8 em dash mojibakes into `â€"` and the script fails to parse. A BOM
+  is out (`PSUseBOMForUnicodeEncodedFile` is excluded — it would corrupt the `#!/usr/bin/env pwsh`
+  shebang), so the rule is ASCII: use `--`/`...`, never `—`/`…`.
+
 ## `turma-agent.ps1` — the launcher (XERK-669)
 
 PowerShell port of the LAUNCHER ROLE of `agent/native/turma-agent`. Same job, same invariants —
@@ -72,11 +78,13 @@ PowerShell port of the LAUNCHER ROLE of `agent/native/turma-agent`. Same job, sa
   `WaitForExit`s the manager and relays its exit code, so WinSW restarts the launcher → a fresh
   manager on the rolled token). The manager-side `IS_WINDOWS` half of that (`_perform_restart` never
   shelling out to the POSIX `turma-agentctl`) is `windows-agent.md`.
-- **Puts the per-user tool dir on PATH itself** — `%APPDATA%\npm` (npm's global bin on Windows,
-  where `claude.cmd` lands) plus the install prefix's bin. A Windows service without an interactive
-  login does not inherit the user's shell PATH, so `claude` is otherwise unreachable and every
-  session dies on exec — the exact twin of XERK-94's `~/.local/bin`. A genuinely missing `claude` is
-  a loud, log-only warning (self-heals when installed; the dir is already on PATH).
+- **Puts the per-user tool dirs on PATH itself** — a Windows service without an interactive login
+  does not inherit the user's shell PATH, so `claude` is otherwise unreachable and every session dies
+  on exec (the exact twin of XERK-94's `~/.local/bin`). Covers BOTH claude install locations, since
+  which one a host has is unpredictable: `%APPDATA%\npm` (npm's `claude.cmd`) **and**
+  `%USERPROFILE%\.local\bin` (the native installer's `claude.exe` — XERK-678: a real host had it
+  there). git/Node/Python ride the inherited system PATH (`install.ps1` installs them machine-wide).
+  A genuinely missing `claude` is a loud, log-only warning (self-heals when installed).
 - Tests: `agent/tests/test_turma_agent_ps1.ps1` (a PowerShell-on-POSIX harness with `/bin/sh` stubs,
   run on `ubuntu-latest` like the bash launcher suite). Static analysis: PSScriptAnalyzer with
   `PSScriptAnalyzerSettings.psd1` (the ShellCheck analog). Both gated in `code-scan.yml`.
@@ -193,11 +201,38 @@ bullets for the contract this mirrors.
   Windows-only and BEST-EFFORT (the bytes are already on disk; a failure warns, never aborts). Config
   lands at `%APPDATA%\turma-agent\turma-agent.env` — the launcher's default and `agent_env_path()`'s
   Windows fallback — written ONCE (a re-run preserves an operator-edited token, never overwrites).
+- **winget is NOT required for the base tools (XERK-678).** `Install-WingetPackage` prefers winget
+  but falls back to a DIRECT vendor install (`Install-ToolDirect` → `Install-{Node,Git,Python,Gh}Direct`)
+  when winget is absent (Server/stripped SKUs) OR ran but the tool still is not resolvable — else a
+  winget-less box dead-ended on a WARN and the agent ran broken. **Machine-wide** (Node/Python/gh MSI
+  `InstallAllUsers`/`ADDLOCAL=ALL`; Git `/VERYSILENT`) so the tools land on the SYSTEM PATH the
+  service inherits. Each vendor spells its arch DIFFERENTLY — node `x64`, python/gh `amd64`, git
+  `64-bit` — hence `Get-ToolArch` plus a per-tool tag; get one wrong and a clean install silently
+  installs nothing. `Invoke-ToolInstaller` is the seam the POSIX suite drives (the real installer +
+  winget stay host-proof); a non-0/3010 exit is a FAILURE, not success. `Update-ProcessPathFromMachine`
+  refreshes `$env:PATH` from the registry after each install so a later `Have`/`Ensure-Claude` in the
+  SAME run resolves the just-installed tool (a fresh machine install is not on the process's start-time
+  PATH). Tests: the direct-installer resolution case in `test_install_ps1.ps1` (dot-sourced under
+  `TURMA_INSTALL_NORUN`, the installer twin of `bootstrap.ps1`'s `TURMA_BOOTSTRAP_NORUN`).
+- **The service RUNS AS THE USER, never LocalSystem (XERK-678).** The agent reads the user's
+  `~/.claude` login / `gh` auth / per-user tools; `LocalSystem`'s profile
+  (`C:\Windows\System32\config\systemprofile`) can see none of them, so a LocalSystem service IDLES
+  "no Claude credentials" on a fully logged-in host — a real-host finding, and the reason the epic's
+  parity was never actually demonstrated before. `Render-ServiceXml` sets no `<serviceaccount>`, so
+  after WinSW registers (LocalSystem by default) `Set-ServiceRunAsUser` reconfigures the run-as
+  identity BEFORE the (re)start: it **grants `SeServiceLogonRight`** (`secedit`, since WinSW's Change
+  does not — a bare reconfigure leaves the service unable to START) and sets the credential via
+  **`sc.exe config obj= password=`** (the SCM stores it LSA-encrypted, NOT a plaintext file like
+  WinSW's `<serviceaccount>` would). The account comes from `-ServiceAccount`/`TURMA_SERVICE_ACCOUNT`
+  or an interactive prompt (default: the current user); the password from `TURMA_SERVICE_PASSWORD` or
+  a `SecureString` prompt — **never a plaintext CLI param** (PSSA `PSAvoidUsingPlainTextForPassword`).
+  No account non-interactively → left LocalSystem with a loud warn + the re-run fix. The one residual
+  exposure is the plaintext briefly on `sc.exe`'s argv, accepted over WinSW's on-disk persistence.
 - **The WinSW descriptor is RENDERED, not consumed raw**: `%BASE%` → the real prefix (WinSW's own
   `%BASE%` would be `bin\` and mis-resolve `%BASE%\bin\turma-agent.ps1`), and the placeholder
   `TURMA_AGENT_ENV` value → the real `%APPDATA%` config path. `%USERPROFILE%` in `<logpath>` is left
-  for WinSW to expand. Then `turma-agentctl install` + `restart` wires + session-preservingly
-  restarts it — the twin of `install.sh`'s `systemctl try-restart`.
+  for WinSW to expand. Then `turma-agentctl install` + (account reconfigure) + `restart` wires +
+  session-preservingly restarts it — the twin of `install.sh`'s `systemctl try-restart`.
 - **WinSW is a PINNED download** (`Get-WinSW`, into `bin\<service>.exe` where `turma-agentctl install`
   expects it), the bundled-binary analog of `install.sh`'s static ttyd/glab; a release build may
   bundle it instead. **The pty layer's `node-pty`+`ws` are `npm ci`'d into `$Prefix\win`**

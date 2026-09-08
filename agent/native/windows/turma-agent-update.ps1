@@ -1,56 +1,56 @@
 #!/usr/bin/env pwsh
-# turma-agent-update.ps1 — self-updater for the native (no-WSL) Windows Turma agent
+# turma-agent-update.ps1 -- self-updater for the native (no-WSL) Windows Turma agent
 # (XERK-674, epic XERK-666; decisions in docs/windows-agent-adr.md, rules in
 # .claude/rules/windows-launcher.md). The PowerShell port of agent/native/turma-agent-update.
 #
 # Updates TWO things, on DIFFERENT schedules, exactly as the bash updater does (XERK-254):
-#   * The agent itself — polls the release stream and, when a newer native build exists,
+#   * The agent itself -- polls the release stream and, when a newer native build exists,
 #     downloads + verifies it, swaps the runtime files into $Prefix, and restarts JUST the
 #     manager (via turma-agentctl.ps1 restart, which is session-preserving: the pty-hosts
 #     break away and the fresh manager re-adopts them). So an update never stops active
 #     sessions. Runs on an interval (-Loop, the WinSW-has-no-timer stand-in for the systemd
 #     .timer) AND on every agent start (-Boot).
-#   * Claude Code (-ClaudeOnly) — ONLY at agent start, before the manager exists. Replacing
+#   * Claude Code (-ClaudeOnly) -- ONLY at agent start, before the manager exists. Replacing
 #     the npm package leaves `claude` briefly absent from PATH, and a session launched in
 #     that window dies on exec; at start nothing is launching yet. See update_claude.
 #
 # Entry points (mirroring the bash --flags):
-#   (none)         one-shot agent self-update — by hand, or the internal poller pass
-#   -Loop          the same, on an interval (the Windows periodic poller — no systemd timer)
+#   (none)         one-shot agent self-update -- by hand, or the internal poller pass
+#   -Loop          the same, on an interval (the Windows periodic poller -- no systemd timer)
 #   -Boot          the same, rate-limited; fired detached by the launcher on every start
 #   -ClaudeOnly    the Claude Code check, rate-limited; fired by the launcher and AWAITED,
 #                  before it starts the manager
 # Internal (not for humans, used by Invoke-RunLocked to bound a run under a deadline):
-#   -LockedRun / -LockedClaude — do the work directly, the lock already held by the parent.
+#   -LockedRun / -LockedClaude -- do the work directly, the lock already held by the parent.
 #
-# dsh is deliberately NOT carried onto Windows (no Windows dsh toolchain — install.ps1 does
+# dsh is deliberately NOT carried onto Windows (no Windows dsh toolchain -- install.ps1 does
 # not provision it), so there is no -DshOnly here, unlike the bash updater.
 #
 # Two release schemes, tried in order (same as bash):
 #   1. UNIFIED (current): one `v<M>.<m>.<p>` release carries all components + a manifest.json.
-#      We compare the manifest's WINDOWS agent COMPONENT version against what is installed —
-#      never the release tag — because a release can CARRY an unchanged (older) tarball while
+#      We compare the manifest's WINDOWS agent COMPONENT version against what is installed --
+#      never the release tag -- because a release can CARRY an unchanged (older) tarball while
 #      its own tag moves ahead. Comparing the tag would reinstall the same bits every poll
 #      and mis-stamp VERSION forever; comparing the component version makes a carried release
 #      a correct no-op. The asset is downloaded by the exact name + release the manifest
 #      records (a carried asset lives on an older release under an older name).
 #   2. LEGACY (pre-cutover / rollback): the old per-component tag stream. Kept for parity; a
 #      Windows fleet has no such legacy assets yet, so this normally finds nothing and stays
-#      put — it is the survives-the-cutover-in-either-direction path the bash updater has.
+#      put -- it is the survives-the-cutover-in-either-direction path the bash updater has.
 #
 # The Windows manifest COMPONENT the updater reads is $ManifestComponent
-# (TURMA_MANIFEST_COMPONENT, default "agent-windows" — mirrors "agent-native"). CI packaging
+# (TURMA_MANIFEST_COMPONENT, default "agent-windows" -- mirrors "agent-native"). CI packaging
 # (the epic child this task BLOCKS) must emit that component with the same fields the bash one
 # uses: {version, asset, sha256_asset, release_tag}, where `asset` is the Windows tarball/zip
 # `turma-agent-windows-v<version>.zip` + a `.zip.sha256` sidecar. This name + component are the
 # SHARED contract with the one-command installer (XERK-673, bootstrap.ps1), which resolves the
-# SAME asset — keep the three in step. Until packaging ships a component, this updater correctly
+# SAME asset -- keep the three in step. Until packaging ships a component, this updater correctly
 # no-ops (no component -> "up to date").
 #
 # Auth reuses the host's `gh` login when present (private repo, higher rate limit); falls
 # back to the anonymous GitHub REST API (the repo is public) with an optional $GH_TOKEN, so
 # a host with no gh login still self-updates (XERK-151). Manifest JSON is parsed with
-# ConvertFrom-Json — no python3 needed on this path.
+# ConvertFrom-Json -- no python3 needed on this path.
 
 [CmdletBinding()]
 param(
@@ -66,7 +66,7 @@ param(
 
 # StrictMode is the `set -u` analog. ErrorActionPreference stays 'Continue' so best-effort
 # cleanup and probes never abort a run (the twin of the bash `2>/dev/null || true` this file
-# leans on freely) — the two idle/refuse cases are explicit.
+# leans on freely) -- the two idle/refuse cases are explicit.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
 
@@ -85,7 +85,7 @@ function Coalesce {
 
 # USERPROFILE is the $HOME analog every per-user path hangs off; a Session-0 / SYSTEM service
 # can be launched without it (the Windows twin of the bash "HOME unset" trap), so derive it
-# rather than fail under StrictMode — the same guard the launcher/ctl/installer make.
+# rather than fail under StrictMode -- the same guard the launcher/ctl/installer make.
 if (-not $env:USERPROFILE) {
   $up = [Environment]::GetFolderPath('UserProfile')
   if (-not $up) {
@@ -102,7 +102,7 @@ $Repo             = Coalesce $env:TURMA_REPO 'xerktech/turma'
 $ManifestComponent = Coalesce $env:TURMA_MANIFEST_COMPONENT 'agent-windows'
 $LegacyTagPrefix  = Coalesce $env:TURMA_LEGACY_TAG_PREFIX 'agent-windows-v'
 
-# num(): a plausible whole number of seconds within [1, cap], else the default — the bash
+# num(): a plausible whole number of seconds within [1, cap], else the default -- the bash
 # num() discipline. 0 is read as "use the default" (it disables a timeout in bash). Applied
 # wherever a knob reaches an arithmetic/deadline so one config typo cannot disable a check.
 function Get-Num([string]$Value, [int]$Default, [int]$Cap = 86400) {
@@ -139,7 +139,7 @@ function Get-PrefixTag {
 $PrefixTag = Get-PrefixTag
 
 # The LOG is per-USER (the identity the SESSIONS run as writes it), so distinct installs share
-# it — but each line is tagged with $Prefix so concurrent updaters are distinguishable rather
+# it -- but each line is tagged with $Prefix so concurrent updaters are distinguishable rather
 # than reading as unattributable duplicates.
 $Log             = Join-Path $TurmaDir 'update.log'
 $Lock            = Join-Path $TurmaDir "update.$PrefixTag.lock"
@@ -189,7 +189,7 @@ function Get-InstalledVersion {
 
 # Is $A strictly newer than $B (dotted numeric, e.g. 0.3.12)? Compares component-wise so 0.3.12
 # ranks above 0.3.9 (a lexical/string compare gets that wrong). A non-numeric or empty side
-# NEVER reads as newer — "stay put".
+# NEVER reads as newer -- "stay put".
 function Test-NewerThan([string]$A, [string]$B) {
   if (-not $A -or -not $B -or $A -eq $B) { return $false }
   $reA = [regex]::Match($A, '^\d+(\.\d+)*$'); $reB = [regex]::Match($B, '^\d+(\.\d+)*$')
@@ -206,13 +206,13 @@ function Test-NewerThan([string]$A, [string]$B) {
 }
 
 # =====================================================================================
-# Claude Code (XERK-254) — see the header. ONLY ever at agent start (-ClaudeOnly), never on
+# Claude Code (XERK-254) -- see the header. ONLY ever at agent start (-ClaudeOnly), never on
 # the poller/-Loop: replacing the package removes `claude` from PATH briefly and a session
 # launched in that window dies on exec. Version-COMPARED, never an unconditional @latest.
 # =====================================================================================
 function Test-HasCommand([string]$Name) { return [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
 
-# The bare semver claude reports ("2.0.14 (Claude Code)" -> 2.0.14). Empty when unparseable —
+# The bare semver claude reports ("2.0.14 (Claude Code)" -> 2.0.14). Empty when unparseable --
 # which is NOT the same as claude being absent (see the unreadable branch below).
 function Get-ClaudeVersion {
   if (-not (Test-HasCommand 'claude')) { return '' }
@@ -220,7 +220,7 @@ function Get-ClaudeVersion {
   $m = [regex]::Match($raw, '\d+\.\d+\.\d+')
   if ($m.Success) { return $m.Value } else { return '' }
 }
-# What claude actually printed, first line, whitespace-collapsed — tells a version this can't
+# What claude actually printed, first line, whitespace-collapsed -- tells a version this can't
 # PARSE from one it can (the unreadable branch).
 function Get-ClaudeRawVersion {
   if (-not (Test-HasCommand 'claude')) { return '' }
@@ -230,7 +230,7 @@ function Get-ClaudeRawVersion {
     return (($out -replace '\s+', ' ').Trim())
   } catch { return '' }
 }
-# Latest published version per the npm registry. Empty when unreachable OR non-version — both
+# Latest published version per the npm registry. Empty when unreachable OR non-version -- both
 # must read as "stay put": a `sort`-style compare ranks a non-version above a semver, so an
 # error line would otherwise look like an upgrade and replace the package every check.
 function Get-ClaudeLatest {
@@ -253,7 +253,7 @@ function Write-ClaudeInstallReport([string]$Before, [string]$Want) {
   if (-not $now) {
     Log "claude: install finished but claude still reports no readable version"
   } elseif ($now -eq $Before) {
-    Log "claude: install reported success but this agent still resolves $Before — that copy is not the one that was updated"
+    Log "claude: install reported success but this agent still resolves $Before -- that copy is not the one that was updated"
   } elseif ($Want -and $now -ne $Want) {
     Log "claude: now $now (wanted $Want)"
   } else {
@@ -263,7 +263,7 @@ function Write-ClaudeInstallReport([string]$Before, [string]$Want) {
 
 # npm install -g the package at @latest. On Windows npm's global bin is %APPDATA%\npm, which the
 # launcher puts on PATH. Run directly (no inner deadline): -ClaudeOnly relies on the LAUNCHER's
-# outer bound (Start-Process + WaitForExit + Kill), the bash `with_lock 0 claude` design — an
+# outer bound (Start-Process + WaitForExit + Kill), the bash `with_lock 0 claude` design -- an
 # install killed halfway leaves NO claude, so bounding it here would be the wrong place.
 function Install-ClaudeNpm {
   try {
@@ -314,26 +314,26 @@ function Update-Claude {
     Log "claude: auto-update disabled (TURMA_CLAUDE_AUTO_UPDATE=0)"
     return
   }
-  # ABSENT and UNREADABLE are different faults with the same repair — both kept off the version
+  # ABSENT and UNREADABLE are different faults with the same repair -- both kept off the version
   # COMPARE (nothing to compare) and both VERIFIED afterwards, which is what keeps a repair that
   # cannot work from being retried blindly forever.
   if (-not (Test-HasCommand 'claude')) {
     if (-not (Test-HasCommand 'npm')) {
-      Log "claude: MISSING and npm is not installed — every session launch will fail"
+      Log "claude: MISSING and npm is not installed -- every session launch will fail"
       return
     }
-    Log "claude: MISSING — installing $ClaudePkg"
+    Log "claude: MISSING -- installing $ClaudePkg"
     Install-Claude '' '' | Out-Null
     return
   }
 
   $cur = Get-ClaudeVersion
   if (-not $cur) {
-    # Present but unable to say what it is — usually a half-written install, which reinstalling
+    # Present but unable to say what it is -- usually a half-written install, which reinstalling
     # repairs. But it can equally be a claude that works and prints a shape this can't parse (a
     # future calver/2-component version): reinstalling that fixes nothing, so a repair leaving
     # the SAME unreadable output is REMEMBERED and not retried until the output changes. The
-    # marker is earned only by a repair that actually RAN — an install that never reached the
+    # marker is earned only by a repair that actually RAN -- an install that never reached the
     # registry (host restarted with no network) must not be remembered as "already tried", or
     # it would brick Claude Code permanently on an ordinary condition.
     $raw = Get-ClaudeRawVersion
@@ -342,7 +342,7 @@ function Update-Claude {
       Log "claude: still reports an unrecognised version ($raw); a repair already failed to change that, leaving it alone"
       return
     }
-    Log "claude: reports no readable version ($raw) — reinstalling"
+    Log "claude: reports no readable version ($raw) -- reinstalling"
     if (Install-Claude '' '') {
       $after = Get-ClaudeRawVersion
       if ($after -match '\d+\.\d+\.\d+') {
@@ -372,8 +372,8 @@ function Update-Claude {
 }
 
 # =====================================================================================
-# Release read — gh first (fresh token, private fork, higher rate limit), then the anonymous
-# GitHub REST API (the repo is public, so a host with no gh login still self-updates — XERK-151).
+# Release read -- gh first (fresh token, private fork, higher rate limit), then the anonymous
+# GitHub REST API (the repo is public, so a host with no gh login still self-updates -- XERK-151).
 # =====================================================================================
 function Test-HasGh {
   if (-not (Test-HasCommand 'gh')) { return $false }
@@ -462,10 +462,10 @@ function Get-ManifestField([string]$ManifestFile, [string]$Field) {
 }
 
 # =====================================================================================
-# Payload swap — the THIRD of the three lockstep packaging paths (installer copy, release
+# Payload swap -- the THIRD of the three lockstep packaging paths (installer copy, release
 # staging, updater swap). It MUST carry hub-agent.py's siblings + hooks/ (kept in lockstep
 # with install.ps1's $RuntimeFiles/$RuntimeDirs/$VerifyFiles): the swap DELETES the installed
-# hooks first, so a payload missing a hook would leave the host with NO guard hook — a missing
+# hooks first, so a payload missing a hook would leave the host with NO guard hook -- a missing
 # hook command is a non-blocking hook, so the safety guard would fail OPEN while VERSION, the
 # restart and the log all report a clean update. Hence the completeness refusal below.
 # =====================================================================================
@@ -477,7 +477,7 @@ $RuntimeDirs  = @('qwen')                          # recursive; hooks + win hand
 $BinScripts   = @('turma-agent.ps1', 'turma-agentctl.ps1', 'turma-agent-update.ps1')
 
 # Re-lay $SrcDir onto $DstDir, preserving named subdirs across the wipe (used to carry a built
-# win\node_modules over a source re-lay — the source tree has none). Same shape as install.ps1's
+# win\node_modules over a source re-lay -- the source tree has none). Same shape as install.ps1's
 # Copy-Tree; the stash sits on the same volume so the move is an atomic rename.
 function Copy-Tree([string]$SrcDir, [string]$DstDir, [string[]]$Preserve = @()) {
   $stashRoot = $null
@@ -502,7 +502,7 @@ function Copy-Tree([string]$SrcDir, [string]$DstDir, [string[]]$Preserve = @()) 
   }
 }
 
-# Extract a staged payload archive (.zip via Expand-Archive — no external dep on Windows — or
+# Extract a staged payload archive (.zip via Expand-Archive -- no external dep on Windows -- or
 # .tar.gz via tar.exe, which ships in Windows 10 1803+ and is on the POSIX runner too). $false
 # on any failure. The Windows release asset is a .zip (XERK-673 contract); .tar.gz is accepted
 # for the legacy-stream fallback.
@@ -527,7 +527,7 @@ function Install-Payload([string]$Archive, [string]$Version) {
 
   $src = $update
   if (-not (Test-Path -LiteralPath (Join-Path $src 'hub-agent.py'))) {
-    # Some tarballs wrap contents in a single top dir — descend to hub-agent.py.
+    # Some tarballs wrap contents in a single top dir -- descend to hub-agent.py.
     $found = Get-ChildItem -Path $update -Recurse -Filter 'hub-agent.py' -File -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($found) { $src = Split-Path -Parent $found.FullName }
   }
@@ -549,7 +549,7 @@ function Install-Payload([string]$Archive, [string]$Version) {
     $s = Join-Path $src $f
     if (Test-Path -LiteralPath $s) { Move-Item -LiteralPath $s -Destination (Join-Path $Prefix $f) -Force }
   }
-  # hooks/ moves together with hub-agent.py — DELETE installed first (the fail-open hazard the
+  # hooks/ moves together with hub-agent.py -- DELETE installed first (the fail-open hazard the
   # completeness check above guards), then move the staged tree in.
   $hooksDst = Join-Path $Prefix 'hooks'
   Remove-Item -Recurse -Force -LiteralPath $hooksDst -ErrorAction SilentlyContinue
@@ -560,10 +560,10 @@ function Install-Payload([string]$Archive, [string]$Version) {
     $s = Join-Path $src $d
     if (Test-Path -LiteralPath $s) { Copy-Tree $s (Join-Path $Prefix $d) }
   }
-  # win/ — the ConPTY terminal layer (ADR D1). Refresh the SOURCE files, PRESERVE a built
+  # win/ -- the ConPTY terminal layer (ADR D1). Refresh the SOURCE files, PRESERVE a built
   # node_modules across the re-lay (the source has none; a naive wipe would destroy the pty
   # deps and, until the next install.ps1 re-run, leave the terminal dead). node-pty is a binary
-  # dep the updater does not rebuild — the Windows twin of the bash updater leaving ttyd/tmux to
+  # dep the updater does not rebuild -- the Windows twin of the bash updater leaving ttyd/tmux to
   # install.sh; a lockfile bump is healed by an install.ps1 re-run.
   $winSrc = Join-Path $src 'win'
   if (Test-Path -LiteralPath $winSrc -PathType Container) {
@@ -580,7 +580,7 @@ function Install-Payload([string]$Archive, [string]$Version) {
   try {
     Set-Content -LiteralPath (Join-Path $Prefix 'VERSION') -Value $Version -NoNewline -ErrorAction Stop
   } catch {
-    Log "installed $Version but could NOT stamp VERSION — every later check will reinstall it; fix that file's permissions"
+    Log "installed $Version but could NOT stamp VERSION -- every later check will reinstall it; fix that file's permissions"
   }
   Log "installed $Version; restarting manager (sessions preserved)"
 
@@ -591,14 +591,14 @@ function Install-Payload([string]$Archive, [string]$Version) {
     Set-Content -LiteralPath $UpdatingFlag -Value ('{"reason":"update","version":"' + $Version + '"}') -ErrorAction Stop
   } catch { }
 
-  # Restart just the manager, session-preserving, via the Windows control surface — WinSW
+  # Restart just the manager, session-preserving, via the Windows control surface -- WinSW
   # restarts the launcher and the detached pty-hosts break away and survive; the pidfile
   # fallback reaps the control plane and never names a pty-host. NEVER the POSIX turma-agentctl.
   $ctl = Join-Path $Prefix 'bin' 'turma-agentctl.ps1'
   if (Test-Path -LiteralPath $ctl) {
     try { & $PwshExe -NoProfile -File $ctl restart *> $null } catch { Log "turma-agentctl restart failed ($_)" }
   } else {
-    Log "turma-agentctl.ps1 not found at $ctl — cannot restart; the swap is in place, restart the service by hand"
+    Log "turma-agentctl.ps1 not found at $ctl -- cannot restart; the swap is in place, restart the service by hand"
   }
   Remove-Item -Recurse -Force -LiteralPath $update -ErrorAction SilentlyContinue
   Log "update complete: now $Version"
@@ -681,7 +681,7 @@ function Invoke-TryLegacy([string]$Cur, [string]$Stage) {
   Test-AndInstall $dl $latest | Out-Null
 }
 
-# The agent self-update. Claude Code is NOT part of this — it runs only at agent start.
+# The agent self-update. Claude Code is NOT part of this -- it runs only at agent start.
 function Invoke-RunOnce {
   Set-StampNow $Stamp   # stamp FIRST, so a run that then wedges/dies still bounds the next check
   $cur = Get-InstalledVersion
@@ -702,7 +702,7 @@ function Invoke-ClaudeCheck {
 }
 
 # =====================================================================================
-# Lock (XERK-549 + XERK-551) — Windows primitives for the bash flock design. Single-flight,
+# Lock (XERK-549 + XERK-551) -- Windows primitives for the bash flock design. Single-flight,
 # taken PER RUN and released BEFORE the sleep (holding it across the poller's hour made every
 # start-fired check exit as "another update run holds the lock"). A wedged run cannot hold it
 # forever: an overall deadline force-terminates the worker, and a staleness-aware reclaim kills
@@ -741,7 +741,7 @@ function Invoke-ReclaimStaleLock {
   if (-not $holder) { return $false }
   $parts = $holder -split '\s+'
   if ($parts.Count -lt 2) { return $false }
-  # NB: $pid is a read-only automatic variable in PowerShell — use $holderPid.
+  # NB: $pid is a read-only automatic variable in PowerShell -- use $holderPid.
   $holderPid = 0; $started = [long]0
   if (-not [int]::TryParse($parts[0], [ref]$holderPid)) { return $false }
   if (-not [long]::TryParse($parts[1], [ref]$started)) { return $false }
@@ -753,7 +753,7 @@ function Invoke-ReclaimStaleLock {
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
   $age = $now - $started
   if ($age -lt $LockReclaimAfter) { return $false }   # young (healthy) or clock skew: leave it
-  Log "update.lock held by pid $holderPid for ${age}s (>= ${LockReclaimAfter}s) — presumed wedged, reclaiming (XERK-549)"
+  Log "update.lock held by pid $holderPid for ${age}s (>= ${LockReclaimAfter}s) -- presumed wedged, reclaiming (XERK-549)"
   try { $proc.Kill($true) } catch { }
   for ($i = 0; $i -lt 5 -and -not $proc.HasExited; $i++) { Start-Sleep -Seconds 1 }
   Log "reclaimed update.lock from wedged pid $holderPid"
@@ -763,7 +763,7 @@ function Invoke-ReclaimStaleLock {
 # Run the locked work under an OVERALL deadline (XERK-549). The agent self-update (-Loop/-Boot/
 # one-shot) is re-exec'd as -LockedRun via Start-Process and WaitForExit'd; on timeout the whole
 # child process tree is killed, so a hung run is force-terminated instead of held. deadline 0
-# (claude, or the escape hatch) runs the work in-process — the child never holds the lock.
+# (claude, or the escape hatch) runs the work in-process -- the child never holds the lock.
 function Invoke-RunLocked([int]$Deadline, [string]$Mode) {
   if ($Deadline -gt 0) {
     $arg = if ($Mode -eq 'run') { '-LockedRun' } else { '-LockedClaude' }
@@ -817,7 +817,7 @@ function Update-AgentCheckHealth([bool]$Ok) {
   $n = (if ($n) { [int]$n } else { 0 }) + 1
   Write-Safe $SkipCount ([string]$n)
   if ($n -ge $StrandWarnAt -and ($n % $StrandWarnAt) -eq 0) {
-    Log "WARNING: $n consecutive agent update checks skipped/errored — this host may be stranded on $(Get-InstalledVersion); see update.log (XERK-549)"
+    Log "WARNING: $n consecutive agent update checks skipped/errored -- this host may be stranded on $(Get-InstalledVersion); see update.log (XERK-549)"
   }
 }
 
@@ -884,7 +884,7 @@ if ($Loop) {
     if (Invoke-AgentCheck) {
       Start-Sleep -Seconds $IntervalSec
     } else {
-      # A poll SKIPPED or ERRORED — most importantly one lost to lock contention — must NOT
+      # A poll SKIPPED or ERRORED -- most importantly one lost to lock contention -- must NOT
       # forfeit the whole interval (XERK-551): sleeping the full hour on a skip is what let one
       # contended poll strand the host for an hour and sustained contention strand it forever.
       # Retry after a short bounded backoff instead; Update-AgentCheckHealth still escalates to a

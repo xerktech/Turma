@@ -171,6 +171,72 @@ try {
   else { Fail "uninstall lost the token" }
   if (Test-Path -LiteralPath (Join-Path $HomeDir '.turma/sessions.json')) { Ok "~/.turma preserved" } else { Fail "uninstall removed ~/.turma" }
   if (Test-Path -LiteralPath (Join-Path $HomeDir '.claude/.credentials.json')) { Ok "~/.claude preserved" } else { Fail "uninstall removed ~/.claude" }
+
+  # --- Case 7: winget-less direct-installer resolution (XERK-678) -------------------------
+  # On a box without winget the installer must provision git/node/python/gh DIRECTLY. This
+  # dot-sources the real installer (TURMA_INSTALL_NORUN, so main() does not run), stubs the
+  # three seams (Get-ToolJson / Get-ToolFile / Invoke-ToolInstaller), and asserts each
+  # resolver picks the RIGHT-ARCH asset and the newest eligible version. msiexec/winget/the
+  # real installers stay host-proof; this covers the arch + version + regex logic a real box
+  # cannot re-verify cheaply -- the same class bootstrap.ps1's MSI-fallback test covers.
+  Note "case: winget-less direct installers resolve the arch-correct asset"
+  $probe = Join-Path $Work 'toolprobe.ps1'
+  Set-Content -LiteralPath $probe -Value @'
+$env:TURMA_INSTALL_NORUN = '1'
+. $args[0]
+$fail = 0
+function Check($name, $got, $want) { if ("$got" -ne "$want") { Write-Host "FAIL ${name}: got '$got' want '$want'"; $script:fail = 1 } }
+
+$env:PROCESSOR_ARCHITECTURE = 'ARM64'; Check 'arch-arm64' (Get-ToolArch) 'arm64'
+$env:PROCESSOR_ARCHITECTURE = 'AMD64'; Check 'arch-amd64' (Get-ToolArch) 'x64'
+$env:PROCESSOR_ARCHITECTURE = '';      Check 'arch-empty' (Get-ToolArch) 'x64'
+
+$script:url = ''; $script:args = ''
+function Get-ToolFile($u, $o) { $script:url = $u }
+function Invoke-ToolInstaller($f, $a) { $script:args = ($a -join ' '); return 0 }
+
+# node: newest >= 24 WITH a win-<arch>-msi wins; older / wrong-arch skipped.
+$env:PROCESSOR_ARCHITECTURE = 'AMD64'
+function Get-ToolJson($u) { @(
+  [pscustomobject]@{ version = 'v25.0.0'; files = @('win-arm64-msi') }
+  [pscustomobject]@{ version = 'v24.4.1'; files = @('win-x64-msi', 'win-arm64-msi') }
+  [pscustomobject]@{ version = 'v22.9.0'; files = @('win-x64-msi') }
+) }
+Check 'node-ok' (Install-NodeDirect) 'True'
+Check 'node-url' $script:url 'https://nodejs.org/dist/v24.4.1/node-v24.4.1-x64.msi'
+
+# gh: amd64 MSI (NOT 'x64') on x64; the arm64 asset is not chosen.
+function Get-ToolJson($u) { [pscustomobject]@{ assets = @(
+  [pscustomobject]@{ name = 'gh_2.63.0_windows_arm64.msi'; browser_download_url = 'https://x/gh-arm64.msi' }
+  [pscustomobject]@{ name = 'gh_2.63.0_windows_amd64.msi'; browser_download_url = 'https://x/gh-amd64.msi' }
+) } }
+$script:url = ''; Check 'gh-ok' (Install-GhDirect) 'True'; Check 'gh-url' $script:url 'https://x/gh-amd64.msi'
+
+# git: the 64-bit .exe on x64, run silently.
+function Get-ToolJson($u) { [pscustomobject]@{ assets = @(
+  [pscustomobject]@{ name = 'Git-2.47.0-arm64.exe';  browser_download_url = 'https://x/git-arm64.exe' }
+  [pscustomobject]@{ name = 'Git-2.47.0-64-bit.exe';  browser_download_url = 'https://x/git-64.exe' }
+) } }
+$script:url = ''; $script:args = ''
+Check 'git-ok' (Install-GitDirect) 'True'; Check 'git-url' $script:url 'https://x/git-64.exe'
+if ($script:args -notmatch 'VERYSILENT') { Write-Host "FAIL git-silent: $($script:args)"; $fail = 1 }
+
+# a non-zero, non-3010 installer exit is a FAILURE, not success.
+function Invoke-ToolInstaller($f, $a) { return 1603 }
+function Get-ToolJson($u) { @([pscustomobject]@{ version = 'v24.4.1'; files = @('win-x64-msi') }) }
+Check 'node-fail-on-1603' (Install-NodeDirect) 'False'
+
+if ($fail -eq 0) { Write-Host 'TOOLPROBE_OK' }
+'@
+  $out = Join-Path $Work 'toolprobe.out'
+  $cmd = "exec `"$PwshExe`" -NoProfile -File `"$probe`" `"$Install`" > `"$out`" 2>&1"
+  $psi = [System.Diagnostics.ProcessStartInfo]::new()
+  $psi.FileName = '/bin/sh'; $psi.ArgumentList.Add('-c'); $psi.ArgumentList.Add($cmd)
+  $psi.UseShellExecute = $false
+  $p = [System.Diagnostics.Process]::Start($psi); $null = $p.WaitForExit(60000)
+  $probeOut = if (Test-Path $out) { Get-Content -Raw $out } else { '' }
+  if ($probeOut -match 'TOOLPROBE_OK') { Ok "resolvers pick the arch-correct asset, newest eligible, and fail on a bad exit" }
+  else { Fail "direct-installer resolution: $probeOut" }
 }
 finally {
   if (Test-Path $Work) { Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue }
