@@ -348,10 +348,44 @@ function Get-IntEnv([string]$Value, [int]$Default) {
   if ($Value -and ($Value -match '^\d+$')) { $n = [int]$Value; if ($n -gt 0) { return $n } }
   return $Default
 }
+# Enumerate every process with its command line, cross-platform (XERK-700). On a real
+# Windows host, reading Process.CommandLine (what `Get-Process | % CommandLine` does) opens
+# each process and reads its PEB, and on a protected/system process that read NEVER RETURNS --
+# so `Get-Process | %{ $_.CommandLine }` HANGS INDEFINITELY, and the try/catch below cannot
+# rescue a hang (it catches exceptions, not blocked time). Get-CimInstance Win32_Process is
+# one WMI query, takes no per-process handle, and cannot block on a protected process. The CIM
+# cmdlets are Windows-only in PowerShell 7, so on Linux pwsh (the POSIX behavioural harness)
+# fall back to Get-Process, which is safe there. Both are normalized to objects carrying an
+# integer Id + a CommandLine, so callers stay identical. (Single-pid `Get-Process -Id` reads
+# elsewhere open one known process and are safe -- they are left as-is.)
+#
+# Windows is detected in a way SAFE under Windows PowerShell 5.1 too: $IsWindows is a pwsh-6+
+# automatic, and 5.1 lacks it -- under StrictMode Latest a bare read is a terminating error, and
+# an operator may run this in the box-default 5.1. So probe via Get-Variable (no throw when the
+# var is absent) and fall back to $env:OS ('Windows_NT' on every Windows, unset on Linux). On
+# pwsh 7 $IsWindows always wins, so Linux pwsh stays correctly false and drives the fallback.
+function Test-IsWindowsHost {
+  $iw = Get-Variable -Name IsWindows -ValueOnly -ErrorAction SilentlyContinue
+  if ($null -ne $iw) { return [bool]$iw }
+  return ($env:OS -eq 'Windows_NT')
+}
+function Get-ProcessCommandLines {
+  if (Test-IsWindowsHost) {
+    Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
+      [pscustomobject]@{ Id = [int]$_.ProcessId; CommandLine = $_.CommandLine }
+    }
+  }
+  else {
+    Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+      $cl = $null; try { $cl = $_.CommandLine } catch { $cl = $null }
+      [pscustomobject]@{ Id = $_.Id; CommandLine = $cl }
+    }
+  }
+}
 # A running -Loop poller for THIS install (its command line names our updater + -Loop).
 function Get-UpdatePoller {
-  @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
-      $cl = $null; try { $cl = $_.CommandLine } catch { return $false }
+  @(Get-ProcessCommandLines | Where-Object {
+      $cl = $_.CommandLine
       if (-not $cl) { return $false }
       return ($cl.Contains($Updater) -and $cl.Contains('-Loop'))
     })
@@ -432,17 +466,19 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
 # prior tunnel can outlive a manager restart). The SUPERVISOR goes first and the tunnel
 # second: the reverse order lets the old supervisor respawn the tunnel we just killed.
 # Matching is on the command line and prefix-scoped (like the bash pkill keys), so a
-# second install only ever reaps its own. Get-Process exposes CommandLine on both Windows
-# and Linux in PowerShell 7, so this is the same code the tests drive.
+# second install only ever reaps its own. Enumeration is via Get-ProcessCommandLines, which
+# uses Get-CimInstance Win32_Process on a real Windows host (a per-process Get-Process
+# CommandLine read hangs forever on a protected process -- XERK-700) and Get-Process on Linux
+# pwsh, so this is the same code the behavioural tests drive. Kill by pid (Stop-Process),
+# since the normalized objects carry no .Kill() method.
 function Stop-ByCommandLine([string[]]$Needles) {
-  Get-Process -ErrorAction SilentlyContinue | Where-Object {
+  Get-ProcessCommandLines | Where-Object {
     if ($_.Id -eq $PID) { return $false }
-    $cl = $null
-    try { $cl = $_.CommandLine } catch { return $false }
+    $cl = $_.CommandLine
     if (-not $cl) { return $false }
     foreach ($n in $Needles) { if (-not $cl.Contains($n)) { return $false } }
     return $true
-  } | ForEach-Object { try { $_.Kill() } catch { } }
+  } | ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch { } }
 }
 Stop-ByCommandLine @($SelfPath, '-TunnelSupervisor')   # supervisor FIRST
 Stop-ByCommandLine @($Tunnel)                          # then the tunnel

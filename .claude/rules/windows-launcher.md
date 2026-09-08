@@ -55,8 +55,25 @@ PowerShell port of the LAUNCHER ROLE of `agent/native/turma-agent`. Same job, sa
   terminals within one retry the moment node is installed, no restart.
 - **The launcher reaps the supervisor BEFORE the tunnel** (`Stop-ByCommandLine`, prefix-scoped on
   the command line) — the reverse order lets the old supervisor respawn the tunnel just killed.
-  Matching uses `Get-Process().CommandLine`, which PowerShell 7 exposes on Windows AND Linux, so the
-  behavioural test drives the same code.
+- **Every ALL-process command-line enumeration goes through `Get-ProcessCommandLines`, NEVER
+  `Get-Process | %{ $_.CommandLine }` (XERK-700).** Reading `Process.CommandLine` opens each process
+  and reads its PEB; on a real Windows host that read NEVER RETURNS on a protected/system process, so
+  a full `Get-Process` sweep HANGS INDEFINITELY — wedging launcher startup (agent never comes online)
+  and `turma-agentctl uninstall|stop|restart`. The `try/catch` cannot rescue it (it catches
+  exceptions, not blocked time). `Get-ProcessCommandLines` uses `Get-CimInstance Win32_Process` on
+  Windows (one WMI query, no per-process handle, cannot block on a protected process) and falls back
+  to `Get-Process` on Linux pwsh (where it is safe, so the behavioural test drives the same code),
+  normalizing both to `Id`+`CommandLine`; the reap kills by pid (`Stop-Process -Id`). SINGLE-pid
+  `Get-Process -Id` reads (`Test-PidAlive`, `$PID` path) open one known process and are safe — leave
+  them. Applies to `Stop-ByCommandLine` and `Get-UpdatePoller` in the launcher and `Stop-ByCommandLine`
+  in `turma-agentctl.ps1`; CI never caught the original hang because the suite runs on Linux.
+  - **Windows is detected via `Test-IsWindowsHost`, NEVER a bare `$IsWindows`.** `$IsWindows` is a
+    pwsh-6+ automatic and Windows PowerShell **5.1** lacks it, so under `StrictMode Latest` a bare read
+    is a TERMINATING error — and an operator runs `turma-agentctl` in the box-default 5.1. The helper
+    probes `Get-Variable IsWindows -ErrorAction SilentlyContinue` (no throw when absent) and falls back
+    to `$env:OS -eq 'Windows_NT'` (set on every Windows, unset on Linux); on pwsh 7 `$IsWindows` wins,
+    so Linux stays correctly false and drives the `Get-Process` fallback. `Get-CimInstance` itself is
+    fine in 5.1 (v3+).
 - **Exports `TURMA_AGENT_ENV`** (resolved env-file path, so the manager can rewrite this host's
   token — XERK-578) and **`TURMA_MANAGER_PID`** (for the tunnel's heartbeat poke). Bash names `$$`
   up front because `exec` preserves it; Windows has no `exec`, so the launcher starts the manager
