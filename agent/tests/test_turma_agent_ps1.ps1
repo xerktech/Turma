@@ -480,20 +480,22 @@ esac
   Note "case: the auto-update poller is started and the empty-poller check does not crash — XERK-702"
   $UpdaterPath = Join-Path $Bin 'turma-agent-update.ps1'
   $updMarker   = Join-Path $Work 'upd-marker.log'
-  # The stub RECORDS its invocation mode into $env:UPD_MARKER from its OWN process (a direct,
-  # flushed write, independent of the launcher's buffered stdout, which does not flush to its
-  # redirected log while it blocks in WaitForExit on the sleeping manager stub). -ClaudeOnly is the
-  # awaited pre-manager check; -Loop is the detached poller, which also sleeps so it lingers.
-  Set-Content -Path $UpdaterPath -Value @'
+  # The stub RECORDS its invocation mode into a marker file (a direct, flushed write from its OWN
+  # process, independent of the launcher's buffered stdout, which does not flush to its redirected
+  # log while it blocks in WaitForExit on the sleeping manager stub). The marker path is BAKED into
+  # the stub (single-quoted), NOT read from the environment -- exactly as the base fixture's manager
+  # stub bakes $ManagerLog, because env does not reliably propagate launcher -> Start-Process ->
+  # stub here. -ClaudeOnly is the awaited pre-manager check; -Loop is the detached poller, which
+  # also sleeps so it lingers.
+  $updStub = @'
 param([switch]$ClaudeOnly, [switch]$Loop, [switch]$Boot, [switch]$LockedRun, [switch]$LockedClaude)
-$m = $env:UPD_MARKER
-if ($m) {
-  if ($ClaudeOnly) { Add-Content -LiteralPath $m -Value 'claudeonly' }
-  if ($Loop)       { Add-Content -LiteralPath $m -Value 'loop' }
-}
+$m = '__MARKER__'
+if ($ClaudeOnly) { Add-Content -LiteralPath $m -Value 'claudeonly' }
+if ($Loop)       { Add-Content -LiteralPath $m -Value 'loop' }
 if ($Loop) { Start-Sleep -Seconds 300 }
 exit 0
-'@
+'@.Replace('__MARKER__', $updMarker)
+  Set-Content -Path $UpdaterPath -Value $updStub
   function Stop-UpdatePollers {
     Get-Process -ErrorAction SilentlyContinue | Where-Object {
       $cl = $null; try { $cl = $_.CommandLine } catch { }
@@ -505,7 +507,6 @@ exit 0
   Remove-Item $ManagerLog, $updMarker -ErrorAction SilentlyContinue
   Set-BaseEnv
   $env:TURMA_AGENT_ENV = $goodCfg
-  $env:UPD_MARKER      = $updMarker
   New-ShStub (Join-Path $NpmBin 'claude') "exit 0"   # a reachable claude so the run path proceeds
   $updRun = Join-Path $Work 'run-upd.log'
   Start-Launcher @() $updRun | Out-Null
@@ -524,7 +525,6 @@ exit 0
   else { Fail "manager never started after Invoke-UpdateChecks" }
   Stop-UpdatePollers
   Reset-Launchers
-  Remove-Item env:UPD_MARKER -ErrorAction SilentlyContinue
   Remove-Item $UpdaterPath -ErrorAction SilentlyContinue
 }
 finally {
