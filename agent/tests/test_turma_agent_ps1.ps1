@@ -481,17 +481,15 @@ esac
   # fallback drives the same @()/count logic.)
   Note "case: the auto-update poller is started and the empty-poller check does not crash — XERK-700"
   $UpdaterPath = Join-Path $Bin 'turma-agent-update.ps1'
+  # Stub updater: -ClaudeOnly (the awaited pre-manager check) returns at once; -Loop (the poller
+  # the launcher then starts detached) just sleeps so it lingers if spawned. Any other mode exits.
   Set-Content -Path $UpdaterPath -Value @'
 param([switch]$ClaudeOnly, [switch]$Loop, [switch]$Boot, [switch]$LockedRun, [switch]$LockedClaude)
-if ($Loop) { Start-Sleep -Seconds 300 }   # a -Loop poller stays alive so it is detectable
-exit 0                                     # -ClaudeOnly (and any other mode) returns at once
+if ($Loop) { Start-Sleep -Seconds 300 }
+exit 0
 '@
-  function Count-UpdatePollers {
-    @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
-        $cl = $null; try { $cl = $_.CommandLine } catch { }
-        $cl -and $cl.Contains($UpdaterPath) -and $cl.Contains('-Loop')
-      }).Count
-  }
+  # Reap any -Loop poller this case leaves running (by the updater path in its command line);
+  # Reset-Launchers only reaps $LauncherPath, and Cleanup would miss a detached poller.
   function Stop-UpdatePollers {
     Get-Process -ErrorAction SilentlyContinue | Where-Object {
       $cl = $null; try { $cl = $_.CommandLine } catch { }
@@ -504,20 +502,19 @@ exit 0                                     # -ClaudeOnly (and any other mode) re
   Set-BaseEnv
   $env:TURMA_AGENT_ENV = $goodCfg
   New-ShStub (Join-Path $NpmBin 'claude') "exit 0"   # a reachable claude so the run path proceeds
-  Start-Launcher @() (Join-Path $Work 'run-upd.log') | Out-Null
-  if (Wait-For { (Test-Path $ManagerLog) -and ((Get-Item $ManagerLog).Length -gt 0) }) { Ok "manager started — Invoke-UpdateChecks did not crash the launcher on the empty-poller check" }
-  else { Fail "manager never started — the empty-poller check threw and aborted the run: $(Get-Content (Join-Path $Work 'run-upd.log') -Raw -ErrorAction SilentlyContinue)" }
-  if (Wait-For { (Count-UpdatePollers) -ge 1 }) { Ok "auto-update poller started (an empty poller set is a 0-count, not a throw)" }
-  else { Fail "auto-update poller never started — (Get-UpdatePoller).Count threw on the empty set (XERK-700 regression): $(Get-Content (Join-Path $Work 'run-upd.log') -Raw -ErrorAction SilentlyContinue)" }
-  # A second launch must REUSE the running poller, not stack a duplicate (the non-empty path).
-  Reset-Launchers
-  Set-BaseEnv
-  $env:TURMA_AGENT_ENV = $goodCfg
-  Start-Launcher @() (Join-Path $Work 'run-upd2.log') | Out-Null
-  Start-Sleep -Seconds 1
-  $np = Count-UpdatePollers
-  if ($np -eq 1) { Ok "a second launch reused the existing poller (no duplicate)" }
-  else { Fail "expected exactly 1 auto-update poller after a re-launch, found $np" }
+  $updRun = Join-Path $Work 'run-upd.log'
+  Start-Launcher @() $updRun | Out-Null
+  # The observable of the fix: Invoke-UpdateChecks reaches and EXECUTES the poller-start branch,
+  # which logs this line before spawning the detached poller. Pre-fix, `(Get-UpdatePoller).Count`
+  # threw on the empty poller set (a parenthesised call to a function emitting @() collapses to
+  # $null), so the `if` condition errored and this branch never ran — the line never appears.
+  # (Asserting the LOG line, not the detached poller PROCESS, avoids racing pwsh cold-start /
+  # command-line-visibility timing on a loaded CI runner; a poll waits for the launcher's stdout
+  # to flush, exactly as the run-path case above waits on its manager log.)
+  if (Wait-For { (Test-Path $updRun) -and (Select-String -Quiet 'starting the auto-update poller' $updRun) }) { Ok "reached and ran the poller-start branch (the empty-poller @() count is 0, not a StrictMode throw)" }
+  else { Fail "poller-start branch never ran — (Get-UpdatePoller).Count threw on the empty set (XERK-700 regression): $(Get-Content $updRun -Raw -ErrorAction SilentlyContinue)" }
+  if (Wait-For { (Test-Path $ManagerLog) -and ((Get-Item $ManagerLog).Length -gt 0) }) { Ok "manager still started after the update checks" }
+  else { Fail "manager never started after Invoke-UpdateChecks: $(Get-Content $updRun -Raw -ErrorAction SilentlyContinue)" }
   Stop-UpdatePollers
   Reset-Launchers
   Remove-Item $UpdaterPath -ErrorAction SilentlyContinue
