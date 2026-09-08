@@ -1422,6 +1422,59 @@
     </div>`;
   }
 
+  // ---- ticket/epic host-OS requirement (XERK-693) ----------------------------
+  // Which OS this ticket's (or epic's) session must run on. Hub-owned durable
+  // state (the ticketPlatforms map, the /platform route) exactly like the runtime
+  // pin — changing it needs no online host, and findTicketHost reads it to
+  // constrain routing. Set on an epic it applies to every subtask; a subtask's
+  // own pin overrides the epic's.
+  function platformPinOf(ticketPlatforms, siteKey, issueKey) {
+    const p = (ticketPlatforms || {})[`${siteKey}/${issueKey}`];
+    return p && (p.platform === "windows" || p.platform === "linux") ? p : null;
+  }
+  function prettyPlatform(v) {
+    return v === "windows" ? "Windows" : v === "linux" ? "Linux" : v;
+  }
+  // The Host OS row: "Any host" when unset, the pinned OS when the operator set
+  // one, or the epic's requirement (dimmed) when a subtask inherits it. Always
+  // editable — the pin is hub-owned, so no online host is needed.
+  function platformFieldHtml(pin, opts) {
+    const o = opts || {};
+    const bits = [];
+    if (pin) {
+      bits.push(`<span class="kc-repo">${esc(prettyPlatform(pin.platform))} only</span>`);
+      bits.push(`<span class="td-dim">— set by you</span>`);
+    } else if (o.inherited) {
+      bits.push(`<span class="kc-repo">${esc(prettyPlatform(o.inherited))} only</span>`);
+      bits.push(`<span class="td-dim">— inherited from ${esc(o.inheritedFrom || "the epic")}</span>`);
+    } else {
+      bits.push(`<span class="td-dim">Any host — runs on Windows or Linux</span>`);
+    }
+    if (o.editable) {
+      bits.push(`<button type="button" class="td-edit" data-platform-edit="1">Change</button>`);
+    }
+    if (o.error) bits.push(`<span class="td-err-inline">Couldn't save — ${esc(o.error)}</span>`);
+    return bits.join(" ");
+  }
+  // The picker's current answer — the change handler compares a pick against this,
+  // so it must derive the way platformPickerHtml preselects. Inheritance shows as
+  // "Any" here: choosing an explicit OS overrides the epic; choosing Any releases
+  // this ticket's own pin (so it falls back to inheriting the epic's, if any).
+  function platformPickerValue(pin) {
+    return pin ? pin.platform : "any";
+  }
+  function platformPickerHtml(pin) {
+    const cur = pin ? pin.platform : "any";
+    const sel = `<select class="td-repo-select" data-platform-select="1">
+      <option value="any"${cur === "any" ? " selected" : ""}>Any host</option>
+      <option value="windows"${cur === "windows" ? " selected" : ""}>Windows only</option>
+      <option value="linux"${cur === "linux" ? " selected" : ""}>Linux only</option>
+    </select>`;
+    return `<div class="td-repo-edit">${sel}
+      <button type="button" class="td-edit" data-platform-cancel="1">Cancel</button>
+    </div>`;
+  }
+
   // ---- ticket triage verdict (XERK-486 [F]) ----------------------------------
   // The operator's per-ticket call on the auto stream: approve (force
   // eligibility past the triage gate and the org policy), hold (never auto-
@@ -1594,6 +1647,19 @@
         : runtimeFieldHtml(o.runtimePin, {
             editable: !!(o.runtimePin || o.dshAvailable || o.qwenAvailable),
             error: o.runtimeError,
+          })),
+      // Which host OS this ticket (or epic) must run on (XERK-693). Hub-owned
+      // like the runtime pin (o.platformPin, from ticketPlatforms), so it needs
+      // no online host to edit. A subtask with no pin of its own inherits its
+      // epic's (o.platformInherited/o.platformInheritedFrom); setting it on an
+      // epic is what constrains all its subtasks.
+      fieldRow("Host OS", o.platformEditing
+        ? platformPickerHtml(o.platformPin)
+        : platformFieldHtml(o.platformPin, {
+            editable: true,
+            inherited: o.platformInherited,
+            inheritedFrom: o.platformInheritedFrom,
+            error: o.platformError,
           })),
       // The operator's per-ticket triage verdict (XERK-486 [F]). Hub-owned like
       // the agent/model pins (o.triageAction, off the payload's
@@ -1981,6 +2047,7 @@
     agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
     modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
     runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
+    platformPinOf, platformFieldHtml, platformPickerHtml, platformPickerValue, prettyPlatform,
     statusFieldHtml, statusPickerHtml, statusPickerValue,
     triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
     isEpicTicket, epicRunOf, epicRunView, epicRunSig,

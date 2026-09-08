@@ -510,6 +510,24 @@ class BoardTest {
         assertFalse(runtimeEditable(dshAvailable = false, qwenAvailable = false, pin = null))
     }
 
+    // ---- XERK-693: host-OS requirement pin, parity with the web -----------------
+
+    @Test fun `platformPinOf reads the map, treating junk as no pin`() {
+        val tp = mapOf(
+            "org.atlassian.net/X-1" to com.xerktech.turma.model.TicketPlatformPin(platform = "windows", at = 1),
+            "org.atlassian.net/X-2" to com.xerktech.turma.model.TicketPlatformPin(platform = "bsd", at = 1),
+        )
+        assertEquals("windows", platformPinOf(tp, "org.atlassian.net", "X-1")?.platform)
+        assertEquals(null, platformPinOf(tp, "org.atlassian.net", "X-2"))   // unknown OS
+        assertEquals(null, platformPinOf(tp, "org.atlassian.net", "X-9"))   // no pin
+        assertEquals(null, platformPinOf(mapOf("s/X-1" to com.xerktech.turma.model.TicketPlatformPin()), "s", "X-1"))
+    }
+
+    @Test fun `prettyPlatform names Windows and Linux`() {
+        assertEquals("Windows", prettyPlatform("windows"))
+        assertEquals("Linux", prettyPlatform("linux"))
+    }
+
     // ---- XERK-515 [Qwen I]: qwen is a second board runtime pin, parity with the web
 
     @Test fun `mergeSites marks qwenAvailable when ANY reporting host offers qwen`() {

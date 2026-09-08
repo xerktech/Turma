@@ -369,6 +369,12 @@ fun BoardScreen(
         val pin = com.xerktech.turma.core.agentPinOf(fleet.ticketAgents, site.siteKey, ticket.key)
         val modelPin = com.xerktech.turma.core.modelPinOf(fleet.ticketModels, site.siteKey, ticket.key)
         val runtimePin = com.xerktech.turma.core.runtimePinOf(fleet.ticketRuntimes, site.siteKey, ticket.key)
+        // Host-OS requirement (XERK-693): the ticket's own pin, plus the epic's
+        // requirement it inherits when it has none of its own.
+        val platformPin = com.xerktech.turma.core.platformPinOf(fleet.ticketPlatforms, site.siteKey, ticket.key)
+        val platformEpicKey = ticket.epicKey
+        val platformInherited = if (platformPin == null && !platformEpicKey.isNullOrBlank())
+            com.xerktech.turma.core.platformPinOf(fleet.ticketPlatforms, site.siteKey, platformEpicKey) else null
         val triageAction = triageActionOf(fleet.ticketTriageActions, site.siteKey, ticket.key)
         // The epic-run view (XERK-638), only for an epic — resolved against the
         // LIVE site so a child finishing while the sheet is open shows at once.
@@ -377,7 +383,7 @@ fun BoardScreen(
             epicRunOf(fleet.epicRuns, site.siteKey, ticket.key)
                 ?.let { epicRunView(it, liveSite, sessionIndex, ticketQueue) }
         } else null
-        TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, triageAction, epicView, vm, onDismiss = { detail = null })
+        TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, vm, onDismiss = { detail = null })
     }
 
     // The policy sheet edits the orgs in scope under the header filter — the
@@ -1234,6 +1240,73 @@ private fun RuntimePicker(
 }
 
 /**
+ * The Host OS row of the detail sheet (XERK-693): which OS this ticket (or epic)
+ * must run on — Any host (the default), Windows only, or Linux only. Mirrors
+ * board.js platformFieldHtml + platformPickerHtml. Hub-owned like the runtime
+ * pin, so always editable (no online host needed). A subtask with no pin of its
+ * own shows the epic's requirement it inherits; setting it on an epic constrains
+ * every subtask.
+ */
+@Composable
+private fun PlatformSection(
+    site: BoardSite,
+    t: JiraTicket,
+    pin: com.xerktech.turma.model.TicketPlatformPin?,
+    inherited: com.xerktech.turma.model.TicketPlatformPin?,
+    inheritedFrom: String?,
+    vm: BoardViewModel,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        SectionLabel("Host OS")
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            PlatformPicker(pin, inherited) { platform ->
+                vm.setTicketPlatform(site.siteKey, t.key, platform)
+            }
+            if (pin != null) {
+                Text("— set by you", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else if (inherited != null) {
+                Text("— inherited from ${inheritedFrom ?: "the epic"}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+/**
+ * The host-OS value rendered as the picker; a pick IS the save. "Any host" is the
+ * release (null); "windows"/"linux" pin. The displayed value reflects the
+ * EFFECTIVE requirement — the ticket's own pin, else the epic's inherited one,
+ * else Any — while the options always offer all three (choosing an explicit OS
+ * overrides an inherited one; Any releases this ticket's own pin).
+ */
+@Composable
+private fun PlatformPicker(
+    pin: com.xerktech.turma.model.TicketPlatformPin?,
+    inherited: com.xerktech.turma.model.TicketPlatformPin?,
+    onPick: (platform: String?) -> Unit,
+) {
+    var open by remember { mutableStateOf(false) }
+    val effective = pin?.platform ?: inherited?.platform
+    val current = if (effective != null) "${com.xerktech.turma.core.prettyPlatform(effective)} only" else "Any host"
+    Box {
+        SelectableValue(current, onClick = { open = true }, enabled = true, mono = pin != null)
+        androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text("Any host") },
+                onClick = { open = false; onPick(null) },
+            )
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text("Windows only") },
+                onClick = { open = false; onPick("windows") },
+            )
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text("Linux only") },
+                onClick = { open = false; onPick("linux") },
+            )
+        }
+    }
+}
+
+/**
  * The Triage row of the detail sheet (XERK-486): the operator's per-ticket
  * verdict — auto (the triage model + the org's policy decide), approve, hold or
  * reject. Hub-owned like the agent/model/runtime pins, so it needs no online
@@ -1434,6 +1507,9 @@ private fun TicketDetailSheet(
     pin: com.xerktech.turma.model.TicketAgentPin?,
     modelPin: com.xerktech.turma.model.TicketModelPin?,
     runtimePin: com.xerktech.turma.model.TicketRuntimePin?,
+    platformPin: com.xerktech.turma.model.TicketPlatformPin?,
+    platformInherited: com.xerktech.turma.model.TicketPlatformPin?,
+    platformInheritedFrom: String?,
     triageAction: String?,
     epicView: EpicRunView?,
     vm: BoardViewModel,
@@ -1461,11 +1537,15 @@ private fun TicketDetailSheet(
             // not the work-ticket pins (repo/agent/model/runtime), which don't apply.
             if (isEpicTicket(t)) {
                 EpicRunSection(site, t, epicView, vm)
+                // The host-OS requirement applies to an epic too (XERK-693) —
+                // setting it here is what constrains all the epic's subtasks.
+                PlatformSection(site, t, platformPin, null, null, vm)
             } else {
                 RepoSection(site, t, vm)
                 AgentSection(site, t, pin, vm)
                 ModelSection(site, t, modelPin, vm)
                 RuntimeSection(site, t, runtimePin, vm)
+                PlatformSection(site, t, platformPin, platformInherited, platformInheritedFrom, vm)
                 TriageSection(site, t, triageAction, vm)
             }
             val d = detail

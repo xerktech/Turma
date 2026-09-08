@@ -47,6 +47,9 @@ data class FleetState(
     // Ticket -> pinned runtime (XERK-473), from the same payload; the board's
     // Runtime row reads it. Refreshed by the poll and the "ticketRuntimes" SSE event.
     val ticketRuntimes: Map<String, com.xerktech.turma.model.TicketRuntimePin> = emptyMap(),
+    // Ticket/epic -> host-OS requirement (XERK-693), from the same payload; the
+    // board's Host OS row reads it. Refreshed by the poll and "ticketPlatforms" SSE.
+    val ticketPlatforms: Map<String, com.xerktech.turma.model.TicketPlatformPin> = emptyMap(),
     // Manual org-color pins (XERK-145), keyed by siteKey, value the palette slot
     // 1..8; every screen's org tint reads it. Refreshed by the poll and the
     // "orgColors" SSE event.
@@ -127,6 +130,7 @@ class FleetRepository(
             autoMergeOrgs = resp.autoMergeOrgs
             ticketModels = resp.ticketModels
             ticketRuntimes = resp.ticketRuntimes
+            ticketPlatforms = resp.ticketPlatforms
             orgColors = resp.orgColors
             ticketQueue = resp.ticketQueue
             retiredUsage = resp.retiredUsage
@@ -154,6 +158,9 @@ class FleetRepository(
 
     @Volatile
     private var ticketRuntimes: Map<String, com.xerktech.turma.model.TicketRuntimePin> = emptyMap()
+
+    @Volatile
+    private var ticketPlatforms: Map<String, com.xerktech.turma.model.TicketPlatformPin> = emptyMap()
 
     @Volatile
     private var orgColors: Map<String, Int> = emptyMap()
@@ -185,6 +192,7 @@ class FleetRepository(
             autoMergeOrgs = autoMergeOrgs,
             ticketModels = ticketModels,
             ticketRuntimes = ticketRuntimes,
+            ticketPlatforms = ticketPlatforms,
             orgColors = orgColors,
             ticketQueue = ticketQueue,
             retiredUsage = retiredUsage,
@@ -236,6 +244,10 @@ class FleetRepository(
                     "ticketRuntimes" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketRuntimePin>>(data)
                     }.getOrNull()?.let { ticketRuntimes = it; emit(_state.value.now, null) }
+                    // A ticket/epic host-OS requirement changed (XERK-693); whole tiny map.
+                    "ticketPlatforms" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketPlatformPin>>(data)
+                    }.getOrNull()?.let { ticketPlatforms = it; emit(_state.value.now, null) }
                     // An org's color pin changed (XERK-145); whole tiny map.
                     "orgColors" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, Int>>(data)

@@ -361,6 +361,32 @@ button and the auto-start sweep.
   `runtimePinOf`/`runtimeFieldHtml`/`runtimePickerHtml`/`mergeSites` (both runtimes); Android
   `BoardTest.kt`.
 
+##### Host OS row (XERK-693) — a ticket/epic must run on Windows or Linux
+
+- **Which host OS a ticket's (or epic's) session must run on** — Any host (default), Windows, or
+  Linux. Hub-owned durable like the Runtime pin (`ticketPlatforms` → a `findTicketHost` FILTER, not a
+  spawn arg): the OS is a hub-OBSERVED fact off each host's heartbeat (`hostOs`), so unlike the
+  runtime pin there is **no agent-side re-validation** — the hub only dispatches to a matching host.
+  `{platform:"windows"|"linux"}` pins, `{platform:"any"}`/`{auto:true}` releases (only a set value
+  stored). No online host needed to edit.
+- **Set on an EPIC it applies to every subtask; a subtask's own pin overrides the epic's**
+  (`effectiveTicketPlatform` = own pin ?? epic's pin ?? none — the single seam every routing site
+  reads). The picker + row render for a work ticket AND an epic (same `/platform` route, same key
+  space); a subtask with no pin shows the epic's requirement dimmed as inherited.
+- **The dispatch filters the pool by `hostOs`** (`findTicketHost`, ahead of capacity like the runtime
+  filter): "no online host runs `<os>`" reads **blocked** (ages out with a give-up note — a freed
+  slot can't change a host's OS), a pinned host of the wrong OS is reported not routed around. A host
+  that does NOT report `hostOs` (older agent) never matches a specific requirement.
+- **`hostOs` is a per-agent wire field**, `normalizeHostOs`-coerced to `windows`/`linux` or dropped
+  (typed on Android `AgentInfo.hostOs`, so coercion + typing are one change), and shown as a host
+  badge (`osBadge` in `index.html`, a Pill in `FleetScreen.kt`) — NOT a board surface on glasses.
+- **Web ⇄ Android parity**: the Host OS row shipped on Android too (`PlatformSection`/`PlatformPicker`,
+  `platformPinOf`/`prettyPlatform`). Vendored `board.cjs` stays byte-identical to `board.js`.
+- Tests: `server.test.js` (`normalizeHostOs`, `/platform` route, `effectiveTicketPlatform`,
+  `findTicketHost` OS filter incl. epic inheritance); `platformPinOf`/`platformFieldHtml`/
+  `platformPickerHtml` in `board.test.js`; Android `BoardTest.kt` + `AgentDecodeTest`; the `hostOs`
+  payload case in `test_hub_agent.py`.
+
 ##### Status row (XERK-138) — the one control that writes BACK to the tracker
 
 - Picker of statuses the ticket can move to, "keep current" first.

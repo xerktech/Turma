@@ -8294,6 +8294,16 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
         sm.device = "hostA"
         return sm
 
+    def test_payload_reports_host_os(self):
+        """XERK-693: the heartbeat carries hostOs, dispatched on IS_WINDOWS, so
+        the hub can badge the host and route an OS-pinned ticket. Everything that
+        is not Windows folds into 'linux'."""
+        sm = self._manager()
+        with mock.patch.object(ha, "IS_WINDOWS", False):
+            self.assertEqual(sm.build_payload(1)["hostOs"], "linux")
+        with mock.patch.object(ha, "IS_WINDOWS", True):
+            self.assertEqual(sm.build_payload(1)["hostOs"], "windows")
+
     def test_a_refused_resume_stages_its_reason_against_the_cmd_id(self):
         sm = self._manager()
         with mock.patch.object(ha, "MAX_SESSIONS", 0):

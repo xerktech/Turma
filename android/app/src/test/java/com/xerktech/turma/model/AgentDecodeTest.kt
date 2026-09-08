@@ -126,6 +126,28 @@ class AgentDecodeTest {
         assertEquals("subscription", off.sessions[0].modelSource)
     }
 
+    // XERK-693: the host OS badge + the ticket/epic host-OS requirement map.
+    // hostOs is hub-coerced to "windows"/"linux" or dropped, so an absent field
+    // must decode to null (older agent) — typing it makes a wrong value
+    // decode-fatal for the whole fleet, so the present/absent shape is pinned.
+    @Test fun `hostOs and ticketPlatforms decode, absent hostOs is null`() {
+        val body = """
+            { "now": 1, "agents": [
+              { "key": "win", "device": "win", "online": true, "hostOs": "windows" },
+              { "key": "lin", "device": "lin", "online": true, "hostOs": "linux" },
+              { "key": "old", "device": "old", "online": true }
+            ],
+            "ticketPlatforms": {
+              "acme.atlassian.net/ENG-1": { "platform": "windows", "at": 5 }
+            } }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertEquals("windows", resp.agents[0].hostOs)
+        assertEquals("linux", resp.agents[1].hostOs)
+        assertNull(resp.agents[2].hostOs)
+        assertEquals("windows", resp.ticketPlatforms["acme.atlassian.net/ENG-1"]?.platform)
+    }
+
     // XERK-544: the hub-derived auto-start-paused flag. Emitted only when true,
     // so the default `false` must cover an absent field (an older hub, or any
     // host not past the weekly pace line) — typing it makes a wrong value

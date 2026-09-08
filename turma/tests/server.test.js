@@ -7252,6 +7252,119 @@ test("findTicketHost routes a qwen ticket only to a host that offers qwen", asyn
   hub.setTicketRuntime("trqRoute.atlassian.net", "ENG-9", null);   // cleanup
 });
 
+// ---- XERK-693: host-OS requirement on tickets and epics ---------------------
+
+const setPlatform = (site, key, body) =>
+  request("POST", `/api/jira/${site}/${key}/platform`, { body, headers: userHeaders });
+
+// A ticket host reporting its OS + one triaged ticket. `extra` is merged onto the
+// ticket (e.g. { epicKey } for an inheritance test, or { isEpic: true }).
+const osBeat = (device, site, {
+  hostOs = "linux", key = "ENG-5", repo = "Turma", free = 5, extra = {},
+} = {}) => request("POST", "/api/heartbeat", {
+  body: {
+    device, hostOs,
+    repos: [{ name: repo, path: `/git/${repo}` }],
+    capacity: { maxSessions: 6, running: 6 - free, queued: 0, free },
+    jira: {
+      available: true, configured: true, siteKey: site, user: `${device}@x.com`,
+      fetchedAt: "2026-07-14T12:00:00Z",
+      tickets: [{ key, summary: "Fix it", repoGuess: { repo, cloned: true }, ...extra }],
+    },
+  },
+  headers: agentHeaders,
+});
+
+test("XERK-693: normalizeHostOs keeps a known OS, drops junk, on ingest AND restore", () => {
+  const win = { device: "os1", hostOs: "windows" };
+  hub.normalizeRecord(win);
+  assert.equal(win.hostOs, "windows");
+  const lin = { device: "os2", hostOs: "linux" };
+  hub.normalizeRecord(lin);
+  assert.equal(lin.hostOs, "linux");
+  // A wrong-typed or unknown value is DROPPED (absent = "can't tell"), never a
+  // fabricated default — so a client that TYPES hostOs never fails its decode.
+  const bad = { device: "os3", hostOs: 42 };
+  hub.normalizeRecord(bad);
+  assert.ok(!("hostOs" in bad));
+  const unknown = { device: "os4", hostOs: "solaris" };
+  hub.normalizeRecord(unknown, "state");   // restore path runs the same coercion
+  assert.ok(!("hostOs" in unknown));
+  const absent = { device: "os5" };
+  hub.normalizeRecord(absent);
+  assert.ok(!("hostOs" in absent));
+});
+
+test("XERK-693: the /platform route sets/clears a requirement and rides the payload", async () => {
+  await osBeat("plW", "plat.atlassian.net", { hostOs: "windows" });
+  // Set a Windows requirement.
+  const win = await setPlatform("plat.atlassian.net", "ENG-5", { platform: "windows" });
+  assert.equal(win.status, 200);
+  assert.equal(win.body.platform, "windows");
+  assert.equal(hub.ticketPlatforms["plat.atlassian.net/ENG-5"].platform, "windows");
+  // It rides /api/agents.
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(res.body.ticketPlatforms["plat.atlassian.net/ENG-5"].platform, "windows");
+  // "any" (and {auto:true}) release the pin — nothing stored.
+  const rel = await setPlatform("plat.atlassian.net", "ENG-5", { platform: "any" });
+  assert.equal(rel.status, 200);
+  assert.equal(rel.body.platform, null);
+  assert.ok(!("plat.atlassian.net/ENG-5" in hub.ticketPlatforms));
+  // Bad value, an org nobody reports, and the user-login gate.
+  assert.equal((await setPlatform("plat.atlassian.net", "ENG-5", { platform: "bsd" })).status, 400);
+  assert.equal((await setPlatform("nobody.atlassian.net", "ENG-1", { platform: "linux" })).status, 404);
+  const anon = await request("POST", "/api/jira/plat.atlassian.net/ENG-5/platform",
+    { body: { platform: "windows" } });
+  assert.equal(anon.status, 401);
+});
+
+test("XERK-693: effectiveTicketPlatform — own pin wins, else inherits the epic's", async () => {
+  // A child ticket under epic EPIC-1, and the epic itself.
+  await osBeat("effH", "eff.atlassian.net",
+    { hostOs: "linux", key: "ENG-20", extra: { epicKey: "EPIC-1" } });
+  // No pins anywhere → no requirement.
+  assert.equal(hub.effectiveTicketPlatform("eff.atlassian.net", "ENG-20"), null);
+  // A requirement on the EPIC is inherited by the child.
+  hub.setTicketPlatform("eff.atlassian.net", "EPIC-1", "windows");
+  assert.equal(hub.effectiveTicketPlatform("eff.atlassian.net", "ENG-20"), "windows");
+  // The child's OWN pin overrides the epic's.
+  hub.setTicketPlatform("eff.atlassian.net", "ENG-20", "linux");
+  assert.equal(hub.effectiveTicketPlatform("eff.atlassian.net", "ENG-20"), "linux");
+  hub.setTicketPlatform("eff.atlassian.net", "ENG-20", null);   // cleanup
+  hub.setTicketPlatform("eff.atlassian.net", "EPIC-1", null);
+});
+
+test("XERK-693: findTicketHost routes only to a host running the required OS", async () => {
+  // A Windows requirement plus one org host that runs Linux: blocked, not full —
+  // a freed slot would not change the host's OS.
+  await osBeat("osLin", "osRoute.atlassian.net", { hostOs: "linux", key: "ENG-30" });
+  hub.setTicketPlatform("osRoute.atlassian.net", "ENG-30", "windows");
+  const blocked = hub.findTicketHost("osRoute.atlassian.net", "Turma", "ENG-30",
+    { requireFree: true });
+  assert.equal(blocked.host, undefined);
+  assert.ok(!blocked.full);                    // blocked, ages out — not a capacity wait
+  assert.match(blocked.error, /runs windows/);
+
+  // A Windows host in the same org is chosen.
+  await osBeat("osWin", "osRoute.atlassian.net", { hostOs: "windows", key: "ENG-30" });
+  const ok = hub.findTicketHost("osRoute.atlassian.net", "Turma", "ENG-30",
+    { requireFree: true });
+  assert.equal(ok.host, "osWin");
+  hub.setTicketPlatform("osRoute.atlassian.net", "ENG-30", null);   // cleanup
+});
+
+test("XERK-693: a child inherits its epic's OS requirement at dispatch", async () => {
+  // One Linux host; the epic requires Windows, the child has no pin of its own.
+  await osBeat("epLin", "epRoute.atlassian.net",
+    { hostOs: "linux", key: "ENG-40", extra: { epicKey: "EPIC-9" } });
+  hub.setTicketPlatform("epRoute.atlassian.net", "EPIC-9", "windows");
+  const blocked = hub.findTicketHost("epRoute.atlassian.net", "Turma", "ENG-40",
+    { requireFree: true });
+  assert.equal(blocked.host, undefined);       // inherited Windows requirement, no Windows host
+  assert.match(blocked.error, /runs windows/);
+  hub.setTicketPlatform("epRoute.atlassian.net", "EPIC-9", null);   // cleanup
+});
+
 // ---- XERK-544: pause auto-start past the weekly subscription pace line -------
 
 // A ticket host that reports a 7-day subscription window, so its pace can be

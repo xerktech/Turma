@@ -414,6 +414,25 @@ fun prettyRuntime(v: String): String = when (v) {
 }
 
 /**
+ * The ticket/epic's OWN host-OS requirement out of the hub's ticketPlatforms map,
+ * keyed "<siteKey>/<issueKey>" — a port of board.js `platformPinOf` (XERK-693).
+ * Null means no requirement of its own (it may still inherit its epic's).
+ */
+fun platformPinOf(
+    ticketPlatforms: Map<String, com.xerktech.turma.model.TicketPlatformPin>,
+    siteKey: String,
+    issueKey: String,
+): com.xerktech.turma.model.TicketPlatformPin? =
+    ticketPlatforms["$siteKey/$issueKey"]?.takeIf { it.platform == "windows" || it.platform == "linux" }
+
+/** Human form of a host-OS value — a port of board.js `prettyPlatform`. */
+fun prettyPlatform(v: String): String = when (v) {
+    "windows" -> "Windows"
+    "linux" -> "Linux"
+    else -> v
+}
+
+/**
  * Whether the Runtime row can offer a change — a port of the web's
  * `editable: !!(o.runtimePin || o.dshAvailable || o.qwenAvailable)` (board.js
  * `runtimeFieldHtml` call site). Editable when the org offers a non-default

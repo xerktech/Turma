@@ -17,6 +17,7 @@ const {
   agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
   modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
   runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
+  platformPinOf, platformFieldHtml, platformPickerHtml, platformPickerValue, prettyPlatform,
   statusFieldHtml, statusPickerHtml, statusPickerValue,
   triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
   isEpicTicket, epicRunOf, epicRunView, epicRunSig,
@@ -1295,6 +1296,50 @@ test("runtimePickerHtml: dsh offered only when the org offers it or a pin exists
   assert.ok(/<option value="dsh" selected>/.test(pinned));
   assert.equal(runtimePickerValue({ runtime: "dsh" }), "dsh");
   assert.equal(runtimePickerValue(null), "claude");
+});
+
+// ---- XERK-693: the host-OS requirement row ----------------------------------
+
+test("platformPinOf: reads the map; only a known OS is a pin", () => {
+  const tp = { "myorg.atlassian.net/X-1": { platform: "windows", at: 1 } };
+  assert.equal(platformPinOf(tp, "myorg.atlassian.net", "X-1").platform, "windows");
+  assert.equal(platformPinOf(tp, "myorg.atlassian.net", "X-2"), null);
+  assert.equal(platformPinOf(null, "myorg.atlassian.net", "X-1"), null);
+  // A junk value is not a pin.
+  assert.equal(platformPinOf({ "s/X-1": { platform: "bsd" } }, "s", "X-1"), null);
+});
+
+test("prettyPlatform: names Windows/Linux", () => {
+  assert.equal(prettyPlatform("windows"), "Windows");
+  assert.equal(prettyPlatform("linux"), "Linux");
+});
+
+test("platformFieldHtml: any vs pinned vs inherited-from-epic, always editable", () => {
+  const any = platformFieldHtml(null, { editable: true });
+  assert.ok(any.includes("Any host"));
+  assert.ok(any.includes("data-platform-edit"));
+  const pinned = platformFieldHtml({ platform: "windows" }, { editable: true });
+  assert.ok(pinned.includes("Windows only"));
+  assert.ok(pinned.includes("set by you"));
+  // A subtask with no pin of its own shows what it inherits from the epic.
+  const inh = platformFieldHtml(null, { editable: true, inherited: "linux", inheritedFrom: "EPIC-1" });
+  assert.ok(inh.includes("Linux only"));
+  assert.ok(inh.includes("inherited from EPIC-1"));
+  const err = platformFieldHtml(null, { editable: true, error: "no host runs windows" });
+  assert.ok(err.includes("Couldn't save"));
+  assert.ok(err.includes("no host runs windows"));
+});
+
+test("platformPickerHtml: all three options, current preselected; value derives", () => {
+  const any = platformPickerHtml(null);
+  assert.ok(/<option value="any" selected>/.test(any));
+  assert.ok(any.includes('value="windows"'));
+  assert.ok(any.includes('value="linux"'));
+  assert.ok(any.includes("data-platform-cancel"));   // a pick IS the save
+  const win = platformPickerHtml({ platform: "windows" });
+  assert.ok(/<option value="windows" selected>/.test(win));
+  assert.equal(platformPickerValue({ platform: "linux" }), "linux");
+  assert.equal(platformPickerValue(null), "any");
 });
 
 // ---- XERK-515: the qwen runtime is a second board runtime pin ---------------
