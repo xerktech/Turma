@@ -2412,7 +2412,32 @@ class TestDshWeb(unittest.TestCase):
         t = getattr(sm, "_dsh_web_thread", None)
         self.assertFalse(t is not None and t.is_alive())
 
+    @staticmethod
+    def _loopback_refuses_closed_ports():
+        """True on a stack where connecting to a loopback port NOTHING listens on
+        is refused — the normal POSIX contract this test's 'nothing listening ->
+        False' half depends on. WSL2 mirrored networking accepts such a connect
+        (the relay answers), so a real Linux host / CI returns True here and a WSL
+        dev box returns False, which skips the test rather than false-failing it."""
+        # Replicate the test's exact sequence — bind, LISTEN, then close — since a
+        # port that was listening and is torn down is what the test re-probes, and
+        # WSL2's relay keeps accepting a connect to it after close where a
+        # never-listened port might already refuse.
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        probe.listen(1)
+        closed_port = probe.getsockname()[1]
+        probe.close()   # now nothing listens on closed_port
+        try:
+            with socket.create_connection(("127.0.0.1", closed_port), timeout=1):
+                return False   # the stack accepted a connect to a closed port (WSL2)
+        except OSError:
+            return True        # refused, as a normal loopback stack does
+
     def test_port_open_reads_a_real_listener(self):
+        if not self._loopback_refuses_closed_ports():
+            self.skipTest("loopback accepts connects to closed ports (e.g. WSL2 "
+                          "mirrored networking) — the closed-port half can't hold")
         sm = ha.SessionManager()
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.bind(("127.0.0.1", 0))
@@ -22566,20 +22591,35 @@ class TestSlowRefreshWorker(ManagerMixin, unittest.TestCase):
     the beat (XERK-397): the beat STAGES which are due, the worker runs them."""
 
     def test_build_payload_stages_the_due_refreshes_not_runs_them_inline(self):
-        # On beat 0 github (%15) and pr (%3) are due; jira needs a configured
-        # board, which a clean test host has not got, so it is not staged.
+        # On beat 0 github (%15) and pr (%3) are due; jira also stages only when a
+        # board is configured. Force board_configured() False so the assertion is
+        # deterministic regardless of the DEV HOST'S ambient JIRA_* env — the creds
+        # are read once at import (jira_configured), so a shell that exports them
+        # would otherwise stage "jira" too and the exact-call assert would fail
+        # (green on CI's clean runner, red on a board-configured dev box).
         sm = self.make_manager()
         sm.refresh_github = mock.Mock()
         sm.refresh_jira = mock.Mock()
         sm.refresh_pr_status = mock.Mock()
         sm._stage_slow_refresh = mock.Mock()
-        sm.build_payload(0)
+        with mock.patch.object(ha, "board_configured", return_value=False):
+            sm.build_payload(0)
         # None of the network refreshes ran on the beat...
         sm.refresh_github.assert_not_called()
         sm.refresh_jira.assert_not_called()
         sm.refresh_pr_status.assert_not_called()
         # ...they were staged for the worker instead.
         sm._stage_slow_refresh.assert_called_once_with("github", "pr")
+
+    def test_build_payload_stages_jira_when_a_board_is_configured(self):
+        # The other half of the branch above: a configured board DOES stage "jira"
+        # alongside github/pr. Pinned explicitly (board_configured() True) so it
+        # holds independent of the host's env, either way.
+        sm = self.make_manager()
+        sm._stage_slow_refresh = mock.Mock()
+        with mock.patch.object(ha, "board_configured", return_value=True):
+            sm.build_payload(0)
+        sm._stage_slow_refresh.assert_called_once_with("github", "jira", "pr")
 
     def test_the_light_beat_stages_nothing(self):
         sm = self.make_manager()
