@@ -298,6 +298,21 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Pin which host OS a ticket (or epic) must run on (XERK-693), or release it
+     * (`platform = null`, sent as "any"). Hub-owned and durable — the POST is
+     * authoritative, and the fleet payload's ticketPlatforms reflects it on the
+     * next poll/SSE event. Set on an epic it constrains every subtask.
+     */
+    fun setTicketPlatform(siteKey: String, issueKey: String, platform: String?) {
+        viewModelScope.launch {
+            val body = buildJsonObject { put("platform", JsonPrimitive(platform ?: "any")) }
+            val ok = runCatching { container.client.api.setTicketPlatform(siteKey, issueKey, body) }.isSuccess
+            _messages.tryEmit(if (ok) "✓ host OS updated" else "✗ hub unreachable")
+            container.fleet.nudge()
+        }
+    }
+
+    /**
      * Set or release a ticket's triage verdict (XERK-486): "approve", "hold" or
      * "reject"; `action = null` releases back to auto (the triage model + the
      * org's policy decide). Hub-owned and durable like the pins above — the POST

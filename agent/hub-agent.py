@@ -26087,6 +26087,14 @@ class SessionManager:
             "agentVersion": self.agent_version,
             "codingAgent": self.coding_agent,
             "claudeVersion": self.claude_version,
+            # Which OS this host runs, so the dashboard can badge it and a
+            # ticket/epic can be pinned to a Windows- or Linux-only host
+            # (XERK-693). The requirement is a hub-observed FACT, not a spawn
+            # param: the host's OS never changes between beats, so the hub's
+            # findTicketHost filter is authoritative and there is no agent-side
+            # re-validation (unlike the runtime pin). Everything that is not
+            # Windows (macOS, other Unix) folds into "linux" by design.
+            "hostOs": "windows" if IS_WINDOWS else "linux",
             # Health of the shared subscription login: present/needsLogin/
             # expiringSoon + the refresh-token expiry the hub alerts on when the
             # login lapses (XERK-98). Read fresh each beat — it's a tiny JSON

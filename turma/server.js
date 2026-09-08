@@ -190,6 +190,16 @@ const TICKET_MODELS_MAX = 500;
 // ("dsh") choice is stored; clearing (or "claude") releases back to the default.
 const TICKET_RUNTIMES_FILE = process.env.TICKET_RUNTIMES_FILE || "/data/ticket-runtimes.json";
 const TICKET_RUNTIMES_MAX = 500;
+// XERK-693: the per-ticket / per-epic host-OS requirement store. Same shape and
+// lifecycle as the runtime pin above — a hub-owned durable /data map keyed
+// "<siteKey>/<issueKey>", riding the payload + its own SSE frame. One map serves
+// BOTH tickets and epics (an epic is just an issueKey); a ticket with no pin of
+// its own inherits its epic's (effectiveTicketPlatform).
+const TICKET_PLATFORMS_FILE = process.env.TICKET_PLATFORMS_FILE || "/data/ticket-platforms.json";
+const TICKET_PLATFORMS_MAX = 500;
+// The two OS values a host reports (hostOs) and a requirement may name. Anything
+// that is not Windows folds into "linux" agent-side (XERK-693).
+const HOST_OS_VALUES = new Set(["windows", "linux"]);
 // Per-org auto opt-in (XERK-41): which Jira orgs let the board drive their whole
 // session lifecycle — auto-START a session for every To Do ticket that has a repo
 // (XERK-41), and auto-STOP a session when its ticket moves to Done (XERK-45; see
@@ -1831,6 +1841,87 @@ function setTicketRuntime(siteKey, issueKey, runtime) {
   invalidateAgentsCache();
   sseBroadcast("ticketRuntimes", ticketRuntimes);
 }
+
+// ---- ticket/epic -> host-OS requirement pins (XERK-693) --------------------
+// The operator's answer to which OS a ticket's (or epic's) session must run on —
+// "windows" or "linux". Keyed "<siteKey>/<issueKey>" like the runtime pin; each
+// entry {platform, at}. Hub-owned and durable exactly like ticketRuntimes: the
+// requirement becomes a findTicketHost routing FILTER (the OS is a hub-observed
+// fact off each host's heartbeat, so there is no spawn param and no agent-side
+// re-validation), and it must survive a hub restart to keep constraining routing.
+// Only a set requirement is stored — clearing it (or {any}) releases the pin, so
+// an unconstrained ticket routes exactly as it always did.
+let ticketPlatforms = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(TICKET_PLATFORMS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ticketPlatforms = parsed;
+} catch {
+  /* first boot or no volume mounted */
+}
+let platformsSaveTimer = null;
+function scheduleTicketPlatformsSave() {
+  if (platformsSaveTimer) return;
+  platformsSaveTimer = setTimeout(() => {
+    platformsSaveTimer = null;
+    fs.mkdir(path.dirname(TICKET_PLATFORMS_FILE), { recursive: true }, () => {
+      fs.writeFile(TICKET_PLATFORMS_FILE, JSON.stringify(ticketPlatforms), (err) => {
+        if (err) console.error(`ticket-platforms save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  platformsSaveTimer.unref();
+}
+// A ticket's (or epic's) OWN requirement, or null. Ignores anything but a known
+// OS value so a hand-edited file can't put a junk pin onto the wire.
+function ticketPlatformPin(siteKey, issueKey) {
+  const p = ticketPlatforms[`${siteKey}/${issueKey}`];
+  return p && typeof p.platform === "string" && HOST_OS_VALUES.has(p.platform) ? p : null;
+}
+// Set or clear a requirement. `platform` null/"any" clears it (nothing to store —
+// an unconstrained ticket rides the same routing it always did). The caller has
+// validated the value against HOST_OS_VALUES; this owns the map's bookkeeping and
+// eviction (oldest-first, like ticketRuntimes).
+function setTicketPlatform(siteKey, issueKey, platform) {
+  const k = `${siteKey}/${issueKey}`;
+  if (!platform || platform === "any" || !HOST_OS_VALUES.has(platform)) delete ticketPlatforms[k];
+  else {
+    ticketPlatforms[k] = { platform, at: Date.now() };
+    const keys = Object.keys(ticketPlatforms);
+    if (keys.length > TICKET_PLATFORMS_MAX) {
+      keys.sort((a, b) => (ticketPlatforms[a].at || 0) - (ticketPlatforms[b].at || 0));
+      for (const old of keys.slice(0, keys.length - TICKET_PLATFORMS_MAX)) {
+        delete ticketPlatforms[old];
+      }
+    }
+  }
+  scheduleTicketPlatformsSave();
+  invalidateAgentsCache();
+  sseBroadcast("ticketPlatforms", ticketPlatforms);
+}
+// The epic a ticket belongs to (XERK-634 `epicKey`), off the board's own resolved
+// row — the same copy the card renders. null for a ticket with no epic. `rows` is
+// optional so a caller already holding the map (the sweep/drain) does not rebuild
+// it per call, matching ticketRepo.
+function ticketEpicKey(siteKey, issueKey, rows) {
+  const r = (rows || fleetTicketRows()).get(ticketQueueKey(siteKey, issueKey));
+  return (r && r.row && typeof r.row.epicKey === "string" && r.row.epicKey) || null;
+}
+// The EFFECTIVE requirement for a ticket (XERK-693): its OWN pin wins, else its
+// epic's pin, else none. This is where "set on an epic applies to all subtasks,
+// a subtask overrides the epic" is resolved, so it is the single seam every
+// routing site (findTicketHost, and through it the Start POST, the queue drain
+// and the epic-run driver) consults.
+function effectiveTicketPlatform(siteKey, issueKey, rows) {
+  const own = ticketPlatformPin(siteKey, issueKey);
+  if (own) return own.platform;
+  const epicKey = ticketEpicKey(siteKey, issueKey, rows);
+  if (epicKey) {
+    const ep = ticketPlatformPin(siteKey, epicKey);
+    if (ep) return ep.platform;
+  }
+  return null;
+}
+
 // Whether any host reporting `siteKey` offers the dsh runtime — the org-level
 // capability the runtime pin's dsh option is gated on, both here (rejecting a
 // dsh pin no host could honour) and on the board (hiding the option). Unioned
@@ -3134,7 +3225,7 @@ function buildAgentsCache() {
   // board-scoped, and hub-owned, so this is their one read channel (plus their
   // own SSE events for open boards).
   const body = JSON.stringify({
-    now, agents: list, ticketAgents, ticketModels, ticketRuntimes, autoStartOrgs, autoMergeOrgs, priorityWriteBackOrgs, dedupeLinkOrgs, orgColors,
+    now, agents: list, ticketAgents, ticketModels, ticketRuntimes, ticketPlatforms, autoStartOrgs, autoMergeOrgs, priorityWriteBackOrgs, dedupeLinkOrgs, orgColors,
     // Per-org triage policy (XERK-486 [F]) and the per-ticket triage verdicts
     // (approve/hold/reject): hub-owned like the pins above, and the board's one
     // read channel for both — the policy panel and the card chips read them
@@ -4620,6 +4711,18 @@ function normalizeDefaultRuntime(a) {
   a.defaultRuntime = r;
 }
 
+// XERK-693: which OS a host runs, coerced at ingest/restore like the capability
+// blocks above. A client TYPES it (AgentInfo.hostOs: String?) and `/api/agents`
+// decodes atomically on Android, so one host's `hostOs: 42` would fail the whole
+// fleet decode — coerce to a known value or DROP it (absent = "this host can't
+// tell", the older-agent value every client already handles). Never invent a
+// default: a host that does not report its OS must not read as Linux.
+function normalizeHostOs(a) {
+  if (!a || typeof a !== "object") return;
+  if (!("hostOs" in a)) return;
+  if (typeof a.hostOs !== "string" || !HOST_OS_VALUES.has(a.hostOs)) delete a.hostOs;
+}
+
 // The setToken capability flag (XERK-578) and the hub's own tokenBound note,
 // both coerced at ingest/restore exactly like normalizeQwen/normalizeDsh and for
 // the same reason: a client TYPES them (AgentInfo.tokenRoll/tokenBound: Boolean?)
@@ -5543,10 +5646,21 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
     wantRuntime === "dsh" ? dshAvailable(a)
     : wantRuntime === "qwen" ? qwenAvailable(a)
     : true;
+  // XERK-693: which host OS this ticket must run on — its OWN pin, else its
+  // epic's. Like the runtime pin it restricts the pool (a host of the wrong OS
+  // can no more run it than one that triaged a different repo), so it filters
+  // beside the triage/runtime checks and yields its own blocked refusal below.
+  // A host that does not REPORT its OS (an older agent, absent `hostOs`) never
+  // matches a specific requirement — routing an OS-pinned ticket to a host that
+  // cannot prove its OS is exactly what this guards against.
+  const platformReq = issueKey
+    ? effectiveTicketPlatform(siteKey, issueKey, opts && opts.rows) : null;
+  const platformOfferedBy = (a) => !platformReq || a.hostOs === platformReq;
   let anyOrg = false, anyOnline = false;
   // Vacuously satisfied when there is no ticket to have triaged / no runtime need.
   let anyTriaged = !issueKey;
   let anyRuntimeCapable = !wantRuntime;
+  let anyPlatformCapable = !platformReq;
   // XERK-544/548/555: did some host that could otherwise run this ticket survive
   // the subscription pause? Tracked on BOTH paths now — auto pauses on either
   // trigger, a manual start on the 5-hour cap — so it starts false and the loop
@@ -5565,6 +5679,12 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
     // (blocked, a freed slot would not help) from the triage and full refusals.
     if (wantRuntime && !runtimeOfferedBy(a)) continue;
     anyRuntimeCapable = true;
+    // A host of the wrong OS is out of the running entirely — checked ahead of
+    // capacity too, so `anyPlatformCapable` counts hosts that COULD run it,
+    // separating "no host runs <os>" (blocked, a freed slot would not help) from
+    // the triage and full refusals. (XERK-693)
+    if (platformReq && !platformOfferedBy(a)) continue;
+    anyPlatformCapable = true;
     // Ahead of the capacity filter so `anyTriaged` counts hosts that could run
     // this ticket if they had room, which is what separates the two refusals
     // below: "nothing can run it" (blocked — a freed slot would not help) from
@@ -5615,6 +5735,13 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
       return { status: 503, error:
         `this ticket is pinned to agent "${pin.host}", which does not offer the ${wantRuntime} runtime` };
     }
+    // The pinned host is the wrong OS for the requirement — reported, not routed
+    // around, exactly like the runtime refusal above. Blocked, never full: a slot
+    // freeing on that host does not change its OS. (XERK-693)
+    if (platformReq && !platformOfferedBy(a)) {
+      return { status: 503, error:
+        `this ticket is pinned to agent "${pin.host}", which does not run ${platformReq}` };
+    }
     // The pin says WHICH host, never that the host can run it — reported rather
     // than routed around, exactly like every other pin refusal.
     //
@@ -5654,6 +5781,14 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
   // Not `full`: a slot freeing does not give a host the pinned runtime, so this
   // holds as `blocked` and ages out rather than waiting for capacity that would
   // not help — the same shape as the untriaged refusal below.
+  if (!anyPlatformCapable) {
+    // Not `full`: a slot freeing does not change a host's OS, so this holds as
+    // `blocked` and ages out with a visible give-up note rather than waiting for
+    // capacity that would not help — the honest outcome when a ticket requires an
+    // OS no online host of the org runs. (XERK-693)
+    return { status: 503, error:
+      `no online host reporting that Jira org runs ${platformReq}` };
+  }
   if (!anyRuntimeCapable) {
     return { status: 503, error:
       `no online host reporting that Jira org offers the ${wantRuntime} runtime` };
@@ -5739,7 +5874,7 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "dsh", "qwen", "triage", "defaultRuntime", "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
+  "dsh", "qwen", "triage", "defaultRuntime", "gitSources", "github", "hostOs", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
   "sessions", "startedAt", "subscription", "tokenRoll", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
@@ -6134,6 +6269,7 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeQwen(a);
   normalizeTriage(a);
   normalizeDefaultRuntime(a);
+  normalizeHostOs(a);
   normalizeTokenRoll(a);
   normalizeModels(a);
   normalizeSpawnRefusals(a);
@@ -9743,7 +9879,7 @@ function drainTicketQueue() {
       continue;
     }
     const { host, error, full, paused } = findTicketHost(
-      e.siteKey, repo, e.issueKey, { requireFree: true, auto: e.source === "auto" });
+      e.siteKey, repo, e.issueKey, { requireFree: true, auto: e.source === "auto", rows });
     if (!host) {
       // XERK-555: a subscription pause is a SELF-CLEARING hold like capacity — a
       // freed slot won't help, but the window resetting will — so it is its own
@@ -9928,7 +10064,7 @@ function reclaimStrandedTicketSpawns() {
       const repo = ticketRepo(siteKey, c.issueKey, rows);
       if (!repo) continue;
       const { host: free } =
-        findTicketHost(siteKey, repo, c.issueKey, { requireFree: true, auto: source === "auto" });
+        findTicketHost(siteKey, repo, c.issueKey, { requireFree: true, auto: source === "auto", rows });
       if (!free) continue;
       // An AUTO rescue is itself an attempt that produced nothing, so it waits
       // out the backoff the dispatch spent, exactly like the sweep's own retry.
@@ -14775,6 +14911,39 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, runtime: auto ? "claude" : raw });
     }
 
+    // POST /api/jira/<siteKey>/<issueKey>/platform — pin which host OS this
+    // ticket (or epic) must run on (XERK-693). Body: {platform:"windows"|"linux"}
+    // to set, {platform:null}/{platform:"any"}/{auto:true} to release. Hub-owned
+    // durable state exactly like the /runtime pin — authoritative on return (a
+    // 200). The requirement becomes a findTicketHost filter; a ticket with no pin
+    // inherits its epic's. Applies to a work ticket AND an epic (same route, same
+    // key space) — setting it on an epic is what propagates to its subtasks.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "platform") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}");
+      if (body.platform != null && typeof body.platform !== "string") {
+        return json(res, 400, { error: "body needs {platform} or {auto:true}" });
+      }
+      const raw = typeof body.platform === "string" ? body.platform.trim().toLowerCase() : "";
+      // "any" (or an empty value / {auto:true}) is the release — routing stops
+      // being OS-constrained rather than storing an "any" pin.
+      const auto = body.auto === true || raw === "any" || raw === "";
+      if (!auto && !HOST_OS_VALUES.has(raw)) {
+        return json(res, 400, { error: "platform must be windows, linux or any" });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      setTicketPlatform(siteKey, issueKey, auto ? null : raw);
+      return json(res, 200, { ok: true, platform: auto ? null : raw });
+    }
+
     // POST /api/jira/<siteKey>/<issueKey>/triage — the operator's per-ticket
     // triage verdict (XERK-486 [F]). Body: {action:"approve"|"hold"|"reject"}
     // to set it, {action:null} (or {clear:true}) to release back to the
@@ -15796,6 +15965,12 @@ if (process.env.TURMA_TEST) {
     ticketRuntimes,
     ticketRuntimePin,
     setTicketRuntime,
+    ticketPlatforms,
+    ticketPlatformPin,
+    setTicketPlatform,
+    ticketEpicKey,
+    effectiveTicketPlatform,
+    normalizeHostOs,
     orgOffersDsh,
     orgOffersQwen,
     findTicketHost,

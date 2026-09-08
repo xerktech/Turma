@@ -289,6 +289,16 @@ interface HubApi {
         @Body body: kotlinx.serialization.json.JsonObject,
     ): OkResponse
 
+    // Set or clear a ticket/epic's host-OS requirement (XERK-693). Body:
+    // {platform:"windows"|"linux"} to pin, {platform:"any"} (or {auto:true}) to
+    // release. Hub-owned and durable like the runtime pin — an authoritative 200.
+    @POST("api/jira/{siteKey}/{issueKey}/platform")
+    suspend fun setTicketPlatform(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): OkResponse
+
     // Set or clear a ticket's triage verdict (XERK-486): approve / hold /
     // reject, or no verdict. Hub-owned and durable like the other pins, so an
     // authoritative 200. Body: {action:"<verdict>"} to set, {clear:true} to

@@ -546,6 +546,13 @@ function paintDetail() {
   const agentPin = B.agentPinOf(cache && cache.ticketAgents, s.siteKey, s.key);
   const modelPin = B.modelPinOf(cache && cache.ticketModels, s.siteKey, s.key);
   const runtimePin = B.runtimePinOf(cache && cache.ticketRuntimes, s.siteKey, s.key);
+  // The host-OS requirement (XERK-693), off the payload's ticketPlatforms like
+  // the other hub-owned pins. A subtask with no pin of its own inherits its
+  // epic's; setting it on an epic constrains all its subtasks.
+  const platformPin = B.platformPinOf(cache && cache.ticketPlatforms, s.siteKey, s.key);
+  const epicKey = (s.ticket && typeof s.ticket.epicKey === "string") ? s.ticket.epicKey : "";
+  const epicPlatform = (!platformPin && epicKey)
+    ? B.platformPinOf(cache && cache.ticketPlatforms, s.siteKey, epicKey) : null;
   // The operator's triage verdict (XERK-486 [F]), off the payload's
   // ticketTriageActions like the other hub-owned pins.
   const triageAction = B.triageActionOf(cache && cache.ticketTriageActions, s.siteKey, s.key);
@@ -554,6 +561,8 @@ function paintDetail() {
   s.agentPinShown = agentPin ? agentPin.host : "";
   s.modelPinShown = modelPin ? modelPin.model : "";
   s.runtimePinShown = runtimePin ? runtimePin.runtime : "";
+  s.platformPinShown = platformPin ? platformPin.platform : "";
+  s.platformInheritedShown = epicPlatform ? epicPlatform.platform : "";
   s.triageActionShown = triageAction || "";
   // The epic-run panel (XERK-638), only for an epic. Its run comes off the
   // payload's epicRuns, resolved to live child progress against this site's
@@ -599,6 +608,14 @@ function paintDetail() {
     runtimeError: s.runtimeError,
     dshAvailable: !!(site && site.dshAvailable),
     qwenAvailable: !!(site && site.qwenAvailable),
+    // The host-OS requirement (XERK-693) is hub-owned like the pins above — the
+    // POST is authoritative on return, no online host required. Inheritance from
+    // the epic is display-only; choosing an explicit OS overrides it.
+    platformPin,
+    platformEditing: s.platformEditing,
+    platformError: s.platformError,
+    platformInherited: epicPlatform ? epicPlatform.platform : null,
+    platformInheritedFrom: epicPlatform ? epicKey : null,
     // The triage verdict (XERK-486 [F]) is hub-owned like the pins above — the
     // POST is authoritative the moment it returns, no online host required.
     triageAction,
@@ -631,6 +648,10 @@ function paintDetail() {
   }
   if (s.runtimeEditing) {
     const sel = $panel.querySelector("[data-runtime-select]");
+    if (sel) sel.focus();
+  }
+  if (s.platformEditing) {
+    const sel = $panel.querySelector("[data-platform-select]");
     if (sel) sel.focus();
   }
   if (s.triageEditing) {
@@ -686,6 +707,12 @@ function refreshOpenTicket() {
   const pin = B.agentPinOf(cache && cache.ticketAgents, s.siteKey, s.key);
   const mpin = B.modelPinOf(cache && cache.ticketModels, s.siteKey, s.key);
   const rpin = B.runtimePinOf(cache && cache.ticketRuntimes, s.siteKey, s.key);
+  // Host-OS requirement (XERK-693): its own pin, plus the epic's requirement it
+  // inherits — both feed what the row draws, so both are in the repaint check.
+  const ppin = B.platformPinOf(cache && cache.ticketPlatforms, s.siteKey, s.key);
+  const pEpicKey = (fresh && typeof fresh.epicKey === "string") ? fresh.epicKey : "";
+  const pInherit = (!ppin && pEpicKey)
+    ? B.platformPinOf(cache && cache.ticketPlatforms, s.siteKey, pEpicKey) : null;
   const tpin = B.triageActionOf(cache && cache.ticketTriageActions, s.siteKey, s.key) || "";
   // The epic-run signature (XERK-638) isn't a ticket field either — it's derived
   // from cache.epicRuns + the children's live state — so the open panel repaints
@@ -703,12 +730,14 @@ function refreshOpenTicket() {
     (pin ? pin.host : "") !== (s.agentPinShown || "") ||
     (mpin ? mpin.model : "") !== (s.modelPinShown || "") ||
     (rpin ? rpin.runtime : "") !== (s.runtimePinShown || "") ||
+    (ppin ? ppin.platform : "") !== (s.platformPinShown || "") ||
+    (pInherit ? pInherit.platform : "") !== (s.platformInheritedShown || "") ||
     tpin !== (s.triageActionShown || "") ||
     epicSig !== (s.epicRunShown || "");
   s.ticket = fresh;
   // No picker may be swapped out from under an operator mid-edit.
   if (changed && !s.editing && !s.agentEditing && !s.modelEditing &&
-      !s.runtimeEditing && !s.triageEditing && !s.statusEditing) paintDetail();
+      !s.runtimeEditing && !s.platformEditing && !s.triageEditing && !s.statusEditing) paintDetail();
 }
 
 // The operator's own answer to which HOST the ticket's sessions spawn on
@@ -816,6 +845,41 @@ async function saveRuntime(value) {
     else tr[k] = { runtime: value, at: Date.now() };
   } else if (openTicketState === s) {
     s.runtimeError = err;
+  }
+  if (openTicketState === s) paintDetail();
+}
+
+// The operator's host-OS requirement for this ticket or epic (XERK-693). Same
+// posture as saveRuntime: hub-owned, the POST is authoritative, the SSE broadcast
+// keeps other boards in step. "any" releases the pin (so a subtask falls back to
+// inheriting its epic's requirement, if any).
+async function savePlatform(value) {
+  const s = openTicketState;
+  if (!s) return;
+  s.platformEditing = false;
+  s.platformError = "";
+  let ok = false, err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/platform`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ platform: value }) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    ok = r.ok;
+    if (!ok) {
+      let d = {};
+      try { d = await r.json(); } catch { /* non-JSON error body */ }
+      err = d.error || `HTTP ${r.status}`;
+    }
+  } catch { err = "the hub is unreachable"; }
+  if (ok) {
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    const tp = cache.ticketPlatforms || (cache.ticketPlatforms = {});
+    const k = `${s.siteKey}/${s.key}`;
+    if (value === "any") delete tp[k];
+    else tp[k] = { platform: value, at: Date.now() };
+  } else if (openTicketState === s) {
+    s.platformError = err;
   }
   if (openTicketState === s) paintDetail();
 }
@@ -1412,6 +1476,15 @@ $panel.addEventListener("click", (e) => {
     openTicketState.runtimeEditing = false;
     return paintDetail();
   }
+  if (e.target.closest("[data-platform-edit]")) {
+    openTicketState.platformEditing = true;
+    openTicketState.platformError = "";   // a new attempt clears the old complaint
+    return paintDetail();
+  }
+  if (e.target.closest("[data-platform-cancel]")) {
+    openTicketState.platformEditing = false;
+    return paintDetail();
+  }
   if (e.target.closest("[data-triage-edit]")) {
     openTicketState.triageEditing = true;
     openTicketState.triageError = "";   // a new attempt clears the old complaint
@@ -1477,6 +1550,18 @@ $panel.addEventListener("change", (e) => {
       return paintDetail();
     }
     return void saveRuntime(rsel.value);
+  }
+  // The host-OS requirement follows the same contract (XERK-693): a pick IS the
+  // save, and re-picking the current value closes the picker without a POST.
+  const psel = e.target.closest("[data-platform-select]");
+  if (psel) {
+    const pin = B.platformPinOf(cache && cache.ticketPlatforms,
+      openTicketState.siteKey, openTicketState.key);
+    if (psel.value === B.platformPickerValue(pin)) {
+      openTicketState.platformEditing = false;
+      return paintDetail();
+    }
+    return void savePlatform(psel.value);
   }
   // The triage verdict follows the same contract (XERK-486): a pick IS the
   // save, a re-pick of the current verdict saves nothing but closes the picker.
@@ -1600,7 +1685,8 @@ function stampPatch(key) { patchedAt.set(key, ++sseClock); }
 // keep-live below never fires for it (a test drives each one mid-fetch).
 const LIVE_MAPS = [
   ["ticketAgents", "@ticketAgents"], ["ticketModels", "@ticketModels"],
-  ["ticketRuntimes", "@ticketRuntimes"], ["ticketQueue", "@ticketQueue"],
+  ["ticketRuntimes", "@ticketRuntimes"], ["ticketPlatforms", "@ticketPlatforms"],
+  ["ticketQueue", "@ticketQueue"],
   ["orgColors", "@orgColors"], ["ticketTriageActions", "@ticketTriageActions"],
   ["triagePolicies", "@triagePolicies"], ["epicRuns", "@epicRuns"],
 ];
@@ -1710,6 +1796,16 @@ function connectSSE() {
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.ticketRuntimes = tr;
     stampPatch("@ticketRuntimes");   // in-flight snapshot can't clobber this (XERK-546)
+    scheduleRender();
+  });
+  // A ticket/epic host-OS requirement changed (XERK-693) — set or released, by
+  // this board or any other. Whole-value like the runtime pin above.
+  es.addEventListener("ticketPlatforms", (e) => {
+    let tp;
+    try { tp = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.ticketPlatforms = tp;
+    stampPatch("@ticketPlatforms");   // in-flight snapshot can't clobber this (XERK-546)
     scheduleRender();
   });
   // The hub's ticket queue changed (XERK-296) — a ticket queued, dispatched or

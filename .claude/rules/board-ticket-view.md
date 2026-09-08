@@ -85,3 +85,11 @@ specific fixture that caught it was added.
   XERK-265). `startSweepVerdict` checks it before the `sawCmd`/timeout heuristics — a silent
   "clear" there is indistinguishable from a spawn that WORKED. Absent = "can't tell" (old timing
   rules apply).
+- **A host-OS requirement is a `findTicketHost` filter beside triage/runtime** (XERK-693,
+  `effectiveTicketPlatform` = the ticket's own `ticketPlatforms` pin, else its epic's). It compares
+  the host's hub-observed `hostOs`, so — UNLIKE the runtime pin — there is no agent accept condition
+  to keep in step (a host cannot change its OS between the beat the hub read and the dispatch).
+  Filtered ahead of capacity so "no online host runs `<os>`" reads **blocked** (ages out), and a
+  pinned host of the wrong OS is reported not routed around. A host with no `hostOs` (older agent)
+  never satisfies a specific requirement. The `rows` threaded into `findTicketHost` (drain, reclaim)
+  is what lets the epic-inheritance lookup reuse the resolved rows instead of rebuilding them.

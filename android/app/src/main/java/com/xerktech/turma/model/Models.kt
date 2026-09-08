@@ -38,6 +38,11 @@ data class AgentsResponse(
     // the spawnTicket command as `agentType`. Only a non-default ("dsh") pin is
     // stored. Hub-owned and durable like ticketModels; absent on older hubs.
     val ticketRuntimes: Map<String, TicketRuntimePin> = emptyMap(),
+    // Ticket/epic -> host-OS requirement (XERK-693), keyed "<siteKey>/<issueKey>":
+    // which OS ("windows"|"linux") a ticket's session must run on. Set on an epic
+    // it applies to every subtask; a subtask's own pin overrides it. Hub-owned and
+    // durable like ticketRuntimes; absent on older hubs.
+    val ticketPlatforms: Map<String, TicketPlatformPin> = emptyMap(),
     // Manual org-color pins (XERK-145), keyed by siteKey, value the palette slot
     // 1..8 (presence = pinned). Hub-owned and durable; absent on older hubs.
     val orgColors: Map<String, Int> = emptyMap(),
@@ -107,6 +112,10 @@ data class TicketModelPin(val model: String = "", val at: Long = 0)
 /** One ticket->runtime pin (the web board's Runtime row; hub ticket-runtimes store). */
 @Serializable
 data class TicketRuntimePin(val runtime: String = "", val at: Long = 0)
+
+/** One ticket/epic->host-OS requirement (XERK-693; hub ticket-platforms store). */
+@Serializable
+data class TicketPlatformPin(val platform: String = "", val at: Long = 0)
 
 /**
  * One ticket->triage-verdict pin (the web board's Triage row; hub
@@ -199,6 +208,12 @@ data class AgentInfo(
     val claudeVersion: String = "",
     val agentVersion: String = "",
     val codingAgent: CodingAgent? = null,
+    // Which OS this host runs — "windows" or "linux" (XERK-693), hub-coerced to
+    // one of those or dropped. Shown as a host badge, and the join key for a
+    // ticket/epic's host-OS requirement. Null on an older agent that doesn't
+    // report it (never a wrong guess). Typed here per the heartbeat contract —
+    // the hub's normalizeHostOs coercion and this field are the same change.
+    val hostOs: String? = null,
     // Shared Claude login health (XERK-98); null on an older agent.
     val claudeAuth: ClaudeAuth? = null,
     val lastSeen: Long = 0,
