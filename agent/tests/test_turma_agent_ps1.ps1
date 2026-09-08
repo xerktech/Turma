@@ -241,15 +241,23 @@ try {
   $env:TURMA_AGENT_ENV = $goodCfg
   Start-Launcher @() (Join-Path $Work 'run2.log') | Out-Null
   # The second launch REAPS the prior supervisor before backgrounding its own, so the count
-  # transiently passes through 0 (old gone, new not yet up) — a fixed `Wait-For{>=1}; sleep;
-  # count` raced that gap and read 0 on a loaded CI runner. Wait until it SETTLES at exactly
-  # one (through the 0), then settle briefly and confirm it is STILL one — which still catches
-  # the real bug this guards (a duplicate supervisor persists at 2, never settling to 1).
-  $settled = Wait-For { (Count-Supervisors) -eq 1 }
-  Start-Sleep -Milliseconds 500
-  $n = Count-Supervisors
-  if ($settled -and $n -eq 1) { Ok "exactly one supervisor after a restart" }
-  else { Fail "expected 1 supervisor, found $n (a duplicate tunnel fights for the channel)" }
+  # transiently passes through 0 (old gone, new not yet up) AND through a momentary 1 (the OLD
+  # supervisor, pre-reap). A single `Wait-For{==1}; sleep; recount` races both: it can latch the
+  # pre-reap 1 and then recount during the reap gap as 0 (observed failing 2/2 on a loaded CI
+  # runner). Instead wait until the count HOLDS at exactly 1 across several consecutive samples --
+  # so a momentary 1 or a transient 0 cannot satisfy it, while the real bug (a duplicate persists
+  # at 2, or the reaped supervisor is respawned so it never holds at 1) still fails it.
+  $stable = $false
+  for ($i = 0; $i -lt 100 -and -not $stable; $i++) {
+    if ((Count-Supervisors) -eq 1) {
+      $hold = $true
+      for ($j = 0; $j -lt 4; $j++) { Start-Sleep -Milliseconds 150; if ((Count-Supervisors) -ne 1) { $hold = $false; break } }
+      $stable = $hold
+    }
+    else { Start-Sleep -Milliseconds 150 }
+  }
+  if ($stable) { Ok "exactly one supervisor after a restart" }
+  else { Fail "expected the supervisor count to hold at 1 after a restart, found $(Count-Supervisors) (a duplicate tunnel fights for the channel, or the supervisor never settled)" }
   Reset-Launchers
 
   # --- Case 5: a non-assignment config line idles, does NOT crash-loop -----------------

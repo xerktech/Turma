@@ -419,8 +419,11 @@ function Invoke-UpdateChecks {
   }
 
   # The agent self-update poller (the WinSW-has-no-timer stand-in for the systemd .timer),
-  # started detached only if one is not already running for this install.
-  if ((Get-UpdatePoller).Count -eq 0) {
+  # started detached only if one is not already running for this install. Wrap the call in @()
+  # so an empty result is a 0-count array, not the $null that a parenthesised call to a function
+  # emitting an empty array collapses to (which throws .Count under StrictMode -- XERK-702). Before
+  # XERK-700 the launcher HUNG in Get-UpdatePoller and never reached this; the reap fix exposed it.
+  if (@(Get-UpdatePoller).Count -eq 0) {
     Log "[turma-agent] starting the auto-update poller (detached)"
     try {
       Start-Process -FilePath (Get-Process -Id $PID).Path `
