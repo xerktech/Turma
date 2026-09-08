@@ -108,6 +108,12 @@ try {
   # --- Case 3: the WinSW descriptor is rendered (%BASE% + env substituted) ---------------
   Note "case: the service descriptor is rendered with real paths"
   $xml = Get-Content -LiteralPath (Join-Path $Prefix 'bin/turma-agent.xml') -Raw
+  # The rendered descriptor MUST be well-formed XML, or WinSW refuses to load it and the
+  # service never registers (XERK-678: an XML comment with '--' inside broke every 1.3.33
+  # install with "An XML comment cannot contain '--'"). Parse it — %USERPROFILE% is left
+  # as literal text for WinSW to expand and is valid inside an element value.
+  try { $null = [xml]$xml; Ok "the rendered descriptor is well-formed XML" }
+  catch { Fail "the rendered descriptor is NOT valid XML: $($_.Exception.Message)" }
   if ($xml.Contains($Prefix) -and -not $xml.Contains('%BASE%')) { Ok "%BASE% substituted to the real prefix" }
   else { Fail "%BASE% not substituted in the descriptor" }
   if ($xml.Contains("value=`"$Cfg`"")) { Ok "TURMA_AGENT_ENV points at the real config path" }

@@ -240,13 +240,15 @@ try {
   Set-BaseEnv
   $env:TURMA_AGENT_ENV = $goodCfg
   Start-Launcher @() (Join-Path $Work 'run2.log') | Out-Null
-  # WAIT for the supervisor to appear (it is backgrounded a beat after the launcher boots —
-  # on a loaded CI runner that can exceed a fixed 1s), THEN settle briefly and assert there
-  # is exactly one (a duplicate would also have appeared by now).
-  $null = Wait-For { (Count-Supervisors) -ge 1 }
+  # The second launch REAPS the prior supervisor before backgrounding its own, so the count
+  # transiently passes through 0 (old gone, new not yet up) — a fixed `Wait-For{>=1}; sleep;
+  # count` raced that gap and read 0 on a loaded CI runner. Wait until it SETTLES at exactly
+  # one (through the 0), then settle briefly and confirm it is STILL one — which still catches
+  # the real bug this guards (a duplicate supervisor persists at 2, never settling to 1).
+  $settled = Wait-For { (Count-Supervisors) -eq 1 }
   Start-Sleep -Milliseconds 500
   $n = Count-Supervisors
-  if ($n -eq 1) { Ok "exactly one supervisor after a restart" }
+  if ($settled -and $n -eq 1) { Ok "exactly one supervisor after a restart" }
   else { Fail "expected 1 supervisor, found $n (a duplicate tunnel fights for the channel)" }
   Reset-Launchers
 
