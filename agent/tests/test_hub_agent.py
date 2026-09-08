@@ -6438,6 +6438,66 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
             probe.join(5)
         self.assertFalse(probe.is_alive())
 
+    def test_the_probe_no_ops_on_windows(self):
+        # The probe shells `tmux`, which is WinError 2 on Windows — a
+        # self-contained subscription TTY probe the ConPTY session terminal
+        # layer (XERK-668) does not cover (XERK-678). On Windows it must skip
+        # ENTIRELY: no settings build, no thread, no tmux launch — degrading to
+        # no `limits` block ("can't tell"), like the cc-socks sweep and the
+        # container-log tail, rather than erroring and burning the backoff.
+        sm = self.make_manager()
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+                mock.patch.object(sm, "_ensure_limits_settings") as ensure:
+            sm._start_limits_probe()  # must not raise
+        ensure.assert_not_called()
+        self.assertIsNone(getattr(sm, "_limits_probe", None))
+        self.assertEqual(
+            [c for c in self.run_ok_calls if c[:2] == ["tmux", "new-session"]], [])
+
+
+class TestWindowsManagerBoot(ManagerMixin, unittest.TestCase):
+    """run_forever installs a POSIX-only SIGUSR1 handler (the tunnel's heartbeat
+    poke) that MUST be gated on IS_WINDOWS, or the manager crashes at boot on
+    Windows Python (`AttributeError: no SIGUSR1`) — the first real-Windows run
+    (XERK-678). SIGTERM/SIGINT exist on Windows and install on both. Pins the
+    guard directly: inverting it must break a test, not sail through green."""
+
+    def _signals_installed(self, is_windows):
+        import signal as _signal
+
+        class _Stop(Exception):
+            pass
+
+        sm = self.make_manager()
+        seen = []
+
+        def fake_signal(sig, _handler):
+            seen.append(sig)
+            if sig == _signal.SIGINT:   # last of the three; stop before the beat loop
+                raise _Stop()
+
+        with mock.patch.object(ha, "IS_WINDOWS", is_windows), \
+                mock.patch.object(ha.signal, "signal", side_effect=fake_signal):
+            try:
+                sm.run_forever()
+            except _Stop:
+                pass
+        return seen
+
+    def test_sigusr1_installs_on_posix(self):
+        import signal as _signal
+        seen = self._signals_installed(False)
+        self.assertIn(_signal.SIGUSR1, seen)     # the poke handler is wired
+        self.assertIn(_signal.SIGTERM, seen)
+        self.assertIn(_signal.SIGINT, seen)
+
+    def test_sigusr1_is_skipped_on_windows(self):
+        import signal as _signal
+        seen = self._signals_installed(True)
+        self.assertNotIn(_signal.SIGUSR1, seen)  # POSIX-only; installing it AttributeErrors
+        self.assertIn(_signal.SIGTERM, seen)     # these exist on Windows Python
+        self.assertIn(_signal.SIGINT, seen)
+
 
 class TestSessionPayloadNeverRaises(ManagerMixin, unittest.TestCase):
     """_session_payload builds one dict per registry record ON THE BEAT LOOP, the

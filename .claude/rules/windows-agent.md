@@ -75,6 +75,28 @@ dispatch on `IS_WINDOWS = os.name == "nt"` rather than living in a Windows copy.
   the owner-only ACL (`restrict_file_to_owner` above). The Windows-launcher half (the
   `TURMA_AGENT_SELF_ENROLL` loop, `TURMA_AGENT_ENV` export) is `windows-launcher.md`.
 
+## Manager-boot POSIX seams — guarded so `run_forever` starts (XERK-678)
+
+Found by the first real-Windows run: the manager crashed at startup on POSIX-only symbols the
+XERK-670 pass missed. Each is a NO-OP-on-Windows guard, behaviour-identical on POSIX; **never write
+the bare POSIX form** (it raises at call time on Windows Python, exactly like `os.O_NOFOLLOW` above).
+
+- **`os.O_NONBLOCK` is guarded like `O_NOFOLLOW`** — `_read_untrusted_json`'s `os.open` uses
+  `getattr(os, "O_NONBLOCK", 0)` (and adds `getattr(os, "O_BINARY", 0)`, a no-op on POSIX, so the
+  JSON read is binary on Windows). It sat un-guarded beside an already-guarded `O_NOFOLLOW` and was
+  the FIRST startup crash (`AttributeError: module 'os' has no attribute 'O_NONBLOCK'`).
+- **`signal.SIGUSR1` install is `IS_WINDOWS`-gated in `run_forever`** — Windows Python has no
+  SIGUSR1, so registering the handler raised. The tunnel's heartbeat poke is a no-op on Windows
+  (tunnel-agent.js portability), so there is no signal to install; the manager beats on its normal
+  interval. SIGTERM/SIGINT exist on Windows and stay unguarded.
+- **The subscription `_start_limits_probe` no-ops on Windows** — it shells `tmux` (`WinError 2`), a
+  self-contained TTY probe the ConPTY session terminal layer (XERK-668) does not cover. Degrades to
+  no `limits` block ("can't tell"), like the cc-socks sweep and container-log tail. `os.getuid` and
+  the `/proc` reads stay unreached on Windows behind their existing `/proc/self` guard.
+- Tests: `TestReadUntrustedJson` (the FIFO refusal proves the guarded `os.open` still works),
+  `TestWindowsManagerBoot` (SIGUSR1 installed on POSIX, skipped under mocked `IS_WINDOWS` — inverting
+  the guard must fail a test), `TestLimitsSnapshot.test_the_probe_no_ops_on_windows` (probe skip).
+
 ## Liveness & degradation (already hold — do not regress)
 
 - **`_pid_alive` uses `os.kill(pid, 0)`, which works on Windows** — the generic liveness primitive.

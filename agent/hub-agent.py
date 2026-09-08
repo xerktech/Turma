@@ -9450,7 +9450,8 @@ def _read_untrusted_json(path, max_bytes):
     should fail; they do not agree.
     """
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
     except OSError:
         return None
     try:
@@ -24427,6 +24428,14 @@ class SessionManager:
         waiting the heartbeat loop must not do. Nothing outside the thread is
         mutated: the thread drives tmux and the hook writes the file, while the
         beat only ever READS that file."""
+        # No tmux on Windows: the probe needs a real interactive TTY running
+        # claude, which the ConPTY terminal layer (XERK-668) provides for
+        # SESSIONS but not for this self-contained subscription probe. Degrade
+        # like the cc-socks sweep and container-log tail — no `limits` block,
+        # read as "can't tell" (never 0% used) — rather than erroring `tmux`
+        # every beat and burning the backoff on a launch that cannot succeed.
+        if IS_WINDOWS:
+            return
         thread = getattr(self, "_limits_probe", None)
         if thread is not None and thread.is_alive():
             return
@@ -26653,8 +26662,11 @@ class SessionManager:
         # tunnel-agent.js on a control-channel poke). Default disposition of
         # SIGUSR1 is to terminate, so this must be installed before the tunnel
         # can poke; run_forever is the main thread, where signal handlers must
-        # be set.
-        signal.signal(signal.SIGUSR1, lambda *_: _poke.set())
+        # be set. POSIX-only: Windows Python has no SIGUSR1, and the tunnel's
+        # poke is a no-op there (tunnel-agent.js portability), so there is no
+        # signal to install — the manager simply beats on its normal interval.
+        if not IS_WINDOWS:
+            signal.signal(signal.SIGUSR1, lambda *_: _poke.set())
         # SIGTERM/SIGINT = the supervisor is restarting us (an update swapping
         # files, or a container recreate). Announce it to the hub as an EXPECTED
         # restart before we go silent (XERK-29), then exit for the supervisor to
