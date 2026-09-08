@@ -141,8 +141,21 @@ pidfile). Commands mirror the bash ctl: `start|stop|restart|status|logs`, plus t
   launcher `Start-Process`es `python hub-agent.py` as a child and `WaitForExit`s it), so killing only
   the launcher pid leaves the python manager running and the fresh launcher starts a SECOND — two
   managers double-heartbeating. `Stop-ControlPlane` reaps the manager by command line for this reason.
-- **The supervisor is reaped BEFORE the tunnel** (`Stop-ControlPlane` order), the same ordering the
-  launcher uses on every start — else the just-killed tunnel is respawned by its own supervisor.
+- **The supervisor is reaped BEFORE the tunnel** (`Stop-ControlPlaneProcesses` order), the same
+  ordering the launcher uses on every start — else the just-killed tunnel is respawned by its supervisor.
+- **The SERVICE-path stop/uninstall MUST run the command-line control-plane reap too, not just
+  `Stop-Service`** (XERK-698). The tunnel + its supervisor break away from WinSW's job object (ADR D2,
+  exactly like the pty-hosts), so `Stop-Service` reaps only the in-job launcher + manager and LEAVES
+  them orphaned — and on `install.ps1 -Uninstall` their still-open `tunnel-agent.js` /
+  `turma-agent.ps1` hold an exclusive file lock that makes the prefix `Remove-Item` SILENTLY fail and
+  strand the prefix. `Invoke-Stop` (service branch) and `Invoke-Uninstall` both call
+  `Stop-ControlPlaneProcesses` (the shared prefix-scoped reap the pidfile path uses), so the pty-hosts
+  are spared but the control plane is fully swept. Do NOT reduce the service stop back to bare `Stop-Service`.
+- **`turma-agentctl logs` reads a DIFFERENT file per mode** (XERK-698): under the WinSW service the
+  launcher's output is captured by the roll-by-size appender to `<logpath>\<service>.out.log` /
+  `.err.log` (`~/.turma\turma-agent.out.log`), NOT the `~/.turma\agent.log` the pidfile fallback
+  writes. `Invoke-Logs` tails the service out/err log under the service and `agent.log` on the pidfile
+  path — reading `agent.log` under the service printed "no log yet" over a running, logging service.
 - **The pidfile lives in a Windows-CORRECT per-user location — `%USERPROFILE%\.turma`, NOT `%TEMP%`.**
   This is the Windows twin of the bash ctl guarding against the never-created `/run/user/<uid>`: a
   Session-0 service identity and the interactive user can resolve `%TEMP%` DIFFERENTLY (and it gets
@@ -154,8 +167,10 @@ pidfile). Commands mirror the bash ctl: `start|stop|restart|status|logs`, plus t
   state (`Get-Service`), which no identity divergence touches.
 - **`Get-Service` is undefined on Linux pwsh (and throws for a not-installed service)** — caught, so
   `Test-ServiceMode` is false and every command takes the fallback path. This is what lets the POSIX
-  test drive the fallback, the same way the bash suite runs with no systemd; the WinSW service path is
-  host-verified only.
+  test drive the fallback, the same way the bash suite runs with no systemd. The real WinSW registration
+  is host-verified only, but the service-branch LOGIC (the stop reap, the logs target — XERK-698) is
+  POSIX-drivable via the test-only `TURMA_FORCE_SERVICE_MODE` hook, which forces `Test-ServiceMode`
+  true; the Windows-only `Stop-Service` call is guarded off under it. Unset in every real install.
 - **The manager NEVER calls `turma-agentctl.ps1` on Windows.** `_perform_restart` treats `IS_WINDOWS`
   as supervised and exits cleanly for WinSW to restart the launcher (XERK-675, `windows-agent.md`);
   only a bash nohup install self-relaunches through the ctl script. So the ctl is operator- and
@@ -175,8 +190,10 @@ pidfile). Commands mirror the bash ctl: `start|stop|restart|status|logs`, plus t
 - Tests: `agent/tests/test_turma_agentctl_ps1.ps1` (PowerShell-on-POSIX, the `test_turma_agentctl.sh`
   port) — the `~/.turma` fallback + the runtime-dir trap, the status/stop pidfile round-trip, the
   session-preserving stop/restart (control plane reaped, pty-host left alive, no doubled manager, the
-  supervisor actually reaped so a respawning-supervisor fixture's tunnel stays dead), and the
-  stale/foreign-pidfile guard (an innocent reused pid survives stop). Static analysis: the same
+  supervisor actually reaped so a respawning-supervisor fixture's tunnel stays dead), the
+  stale/foreign-pidfile guard (an innocent reused pid survives stop), and — under
+  `TURMA_FORCE_SERVICE_MODE` — the service-path stop reaping the broken-away tunnel + supervisor and
+  `logs` tailing `<service>.out.log` rather than `agent.log` (XERK-698). Static analysis: the same
   PSScriptAnalyzer gate as the launcher. Both in `code-scan.yml`.
 
 ## `install.ps1` — the installer (XERK-672)

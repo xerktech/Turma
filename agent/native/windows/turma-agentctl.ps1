@@ -158,7 +158,14 @@ function Read-Pid {
 function Get-AgentService {
   try { return Get-Service -Name $ServiceName -ErrorAction Stop } catch { return $null }
 }
-function Test-ServiceMode { return $null -ne (Get-AgentService) }
+function Test-ServiceMode {
+  # TURMA_FORCE_SERVICE_MODE is a TEST-ONLY hook: Get-Service is undefined on Linux pwsh, so
+  # the service path is otherwise unreachable off a real Windows host, and the POSIX suite
+  # must be able to drive the service-path stop/logs reap+log-target (XERK-698). Unset in
+  # every real install; the Windows-only service cmdlets it forces past are guarded on it.
+  if ($env:TURMA_FORCE_SERVICE_MODE) { return $true }
+  return $null -ne (Get-AgentService)
+}
 
 # --- reap by command line (the launcher's Stop-ByCommandLine, prefix-scoped) --------------
 # Kills every process whose command line contains ALL the needles (never ourselves). Reused
@@ -175,17 +182,34 @@ function Stop-ByCommandLine([string[]]$Needles) {
   } | ForEach-Object { try { $_.Kill() } catch { } }
 }
 
-# Reap the whole control plane, in the launcher's order, leaving pty-hosts (and thus the
-# sessions) alive. SUPERVISOR FIRST so it cannot respawn the tunnel we then kill; then the
-# tunnel; then the manager and the launcher pid itself. This is what BOTH `stop` and the
-# pidfile `restart` use -- a Windows restart MUST reap the manager too (unlike the bash
-# restart, where the launcher IS the manager via exec, killing the launcher pid alone would
-# leave the python manager running and the fresh launcher would start a SECOND one:
-# two managers double-heartbeating, the very bug the pidfile discipline exists to prevent).
-function Stop-ControlPlane {
+# Reap the control plane BY COMMAND LINE, in the launcher's order, leaving pty-hosts (and thus
+# the sessions) alive. SUPERVISOR FIRST so it cannot respawn the tunnel we then kill; then the
+# tunnel; then the manager; then any remaining launcher process. A Windows teardown MUST reap
+# the manager too (unlike the bash restart, where the launcher IS the manager via exec, so
+# killing the launcher pid alone would leave the python manager running and a fresh launcher
+# would start a SECOND -- two managers double-heartbeating, the very bug the pidfile discipline
+# exists to prevent).
+#
+# Used on BOTH stop paths (XERK-698): the pidfile path (via Stop-ControlPlane, which also does
+# the guarded pidfile-pid kill) AND the service path. On the service path the tunnel + its
+# supervisor break away from WinSW's job object (ADR D2, exactly like the pty-hosts), so
+# Stop-Service reaps only the in-job launcher + manager and LEAVES the tunnel + supervisor
+# orphaned -- and on uninstall their still-open tunnel-agent.js / turma-agent.ps1 hold an
+# exclusive file lock that makes the prefix Remove-Item silently fail and strand the prefix.
+# The same prefix-scoped command-line reap sweeps them on either path.
+function Stop-ControlPlaneProcesses {
   Stop-ByCommandLine @($Launcher, '-TunnelSupervisor')   # supervisor FIRST
   Stop-ByCommandLine @($Tunnel)                          # then the tunnel
   Stop-ByCommandLine @($Manager)                         # then the manager
+  Stop-ByCommandLine @($Launcher)                        # then any remaining launcher process
+}
+
+# The pidfile-path full teardown: the command-line reap above, PLUS the guarded pidfile-pid
+# kill of the launcher recorded at start (whose command line may be UNREADABLE, in which case
+# the reap above cannot match it and only this pid-keyed kill reaps it). This is what BOTH the
+# pidfile `stop` and the pidfile `restart` use.
+function Stop-ControlPlane {
+  Stop-ControlPlaneProcesses
   # Guard the destructive pidfile kill with the SAME command-line check status/start use
   # (Test-PidAlive). On Windows a pid is reused fast, and a stale pidfile left by a CRASHED
   # launcher (a clean stop/restart removes it) can point at an innocent process -- worst case
@@ -235,8 +259,14 @@ function Invoke-Stop {
   # Full teardown of the CONTROL PLANE only; the sessions (pty-hosts) are left running and a
   # later start re-adopts them -- the bash ctl's "kill keeps the worktree/session" philosophy.
   if (Test-ServiceMode) {
-    # WinSW stops the launcher; the detached pty-hosts break away and survive (ADR D2).
-    Stop-Service -Name $ServiceName
+    # WinSW stops the launcher + the manager it started (both in the service job object); the
+    # detached pty-hosts break away and survive (ADR D2). But the tunnel + its supervisor ALSO
+    # broke away from the job (like the pty-hosts) and are NOT control plane WinSW can reach --
+    # so run the SAME prefix-scoped command-line reap the pidfile path uses, on the service
+    # path too, or they orphan (and on uninstall lock the prefix) (XERK-698). The env guard is
+    # the test-only service-mode hook: no real service exists on the POSIX runner.
+    if (-not $env:TURMA_FORCE_SERVICE_MODE) { Stop-Service -Name $ServiceName }
+    Stop-ControlPlaneProcesses
     Log "turma-agent service '$ServiceName' stopped (sessions left running)"
   }
   else {
@@ -280,16 +310,28 @@ function Invoke-Status {
 function Invoke-Logs([string]$LogArg) {
   $n = 200
   if ($LogArg -and ($LogArg -match '^\d+$')) { $n = [int]$LogArg }
-  # Follow the launcher's log (both the service and the fallback write here; WinSW's
-  # <log> is pointed at the same file by turma-agent.xml). No file yet -> say so rather
-  # than error, then wait for it to appear.
-  # -Wait THROWS on a not-yet-existent file rather than waiting for it, so return after the
-  # notice instead of erroring. Only reachable before the first start (start creates the log).
-  if (-not (Test-Path -LiteralPath $Log)) {
-    Log "no log yet at $Log (has the agent started?)"
+  # The two supervisors capture the launcher's output to DIFFERENT files, so `logs` must tail
+  # the right one for the mode in play (XERK-698):
+  #   * Under the WinSW service, WinSW's SizeBasedRollingLogAppender writes to
+  #     <logpath>\<service>.out.log / .err.log (logpath is ~/.turma, basename is the service
+  #     id) -- NOT the agent.log the pidfile fallback writes. Reading agent.log there printed
+  #     "no log yet" while the service was running and logging.
+  #   * On the pidfile fallback, Start-Fallback redirects to ~/.turma\agent.log.
+  # -Wait THROWS on a not-yet-existent file rather than waiting for it, so return after a
+  # notice instead of erroring when nothing has been written yet.
+  $target = $Log
+  if (Test-ServiceMode) {
+    $svcOut = Join-Path $TurmaDir "$ServiceName.out.log"
+    $svcErr = Join-Path $TurmaDir "$ServiceName.err.log"
+    $target = if (Test-Path -LiteralPath $svcOut) { $svcOut }
+              elseif (Test-Path -LiteralPath $svcErr) { $svcErr }
+              else { $svcOut }   # name the out log in the "not yet" notice
+  }
+  if (-not (Test-Path -LiteralPath $target)) {
+    Log "no log yet at $target (has the agent started?)"
     return
   }
-  Get-Content -LiteralPath $Log -Tail $n -Wait
+  Get-Content -LiteralPath $target -Tail $n -Wait
 }
 
 # --- install / uninstall: thin WinSW wrappers (Windows host only) ------------------------
@@ -317,6 +359,12 @@ function Invoke-Uninstall {
   }
   & $WinswExe uninstall
   $rc = $LASTEXITCODE
+  # WinSW uninstall stops + deregisters the service, but the tunnel + its supervisor broke away
+  # from the job and survive it -- reap the whole control plane here, or their held-open
+  # tunnel-agent.js / turma-agent.ps1 keep an exclusive lock that makes the caller's
+  # (install.ps1 -Uninstall) prefix Remove-Item SILENTLY fail and leave the prefix behind
+  # (XERK-698). Done regardless of WinSW's exit so a partial uninstall does not strand orphans.
+  Stop-ControlPlaneProcesses
   if ($rc -ne 0) { Log "uninstall: WinSW exited $rc"; exit $rc }
   Log "turma-agent service '$ServiceName' uninstalled (running sessions were left alone)"
 }
