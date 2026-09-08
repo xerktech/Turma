@@ -29560,6 +29560,364 @@ class TestWindowsPortability(unittest.TestCase):
             self.assertEqual(ha._default_projects_root(), "/root/.claude/projects")
 
 
+def _ws_server_frame(text):
+    """Build one UNMASKED server text frame (what the pty-host sends), for feeding
+    _ws_read_json without a real socket."""
+    payload = text.encode("utf-8")
+    n = len(payload)
+    if n < 126:
+        header = struct.pack("!BB", 0x81, n)
+    elif n < 65536:
+        header = struct.pack("!BBH", 0x81, 126, n)
+    else:
+        header = struct.pack("!BBQ", 0x81, 127, n)
+    return header + payload
+
+
+class _FrameSock:
+    """A minimal socket stand-in: hands out preloaded bytes over recv()."""
+
+    def __init__(self, data):
+        self._data = bytes(data)
+
+    def recv(self, n):
+        chunk, self._data = self._data[:n], self._data[n:]
+        return chunk
+
+
+class TestWindowsTerminalBackend(unittest.TestCase):
+    """XERK-697 — the manager side of the ConPTY pty-host seam (ADR D5): the
+    pure-Python control client + the tmux/ttyd call-site dispatch, all verified
+    on Linux CI by MOCKING IS_WINDOWS. The pty-host itself (node-pty) is proven
+    host-side (drive.mjs, 24/24 on real ConPTY) and by the ws-only control drive;
+    these pin the Python half — framing, the shell->argv/env translation, and
+    that every terminal call site routes to the pty-host on Windows."""
+
+    # --- the RFC 6455 control client: framing (the load-bearing new code) ------
+
+    def test_ws_encode_text_is_a_masked_client_frame(self):
+        frame = ha._ws_encode_text("hi")
+        self.assertEqual(frame[0], 0x81)          # FIN + text opcode
+        self.assertEqual(frame[1] & 0x80, 0x80)   # client frames MUST be masked
+        self.assertEqual(frame[1] & 0x7F, 2)      # 2-byte payload, 7-bit length
+        mask = frame[2:6]
+        unmasked = bytes(b ^ mask[i % 4] for i, b in enumerate(frame[6:]))
+        self.assertEqual(unmasked, b"hi")
+
+    def test_ws_encode_text_uses_the_extended_length_fields(self):
+        # 126 -> 2-byte length header; >=65536 -> 8-byte.
+        med = ha._ws_encode_text("x" * 200)
+        self.assertEqual(med[1] & 0x7F, 126)
+        big = ha._ws_encode_text("y" * 70000)
+        self.assertEqual(big[1] & 0x7F, 127)
+
+    def test_ws_read_json_parses_a_server_frame(self):
+        sock = _FrameSock(_ws_server_frame(json.dumps({"ok": True, "data": "yo"})))
+        self.assertEqual(ha._ws_read_json(sock, b"", 5.0), {"ok": True, "data": "yo"})
+
+    def test_ws_read_json_returns_none_on_a_close_frame(self):
+        sock = _FrameSock(struct.pack("!BB", 0x88, 0))   # opcode 0x8 = close
+        self.assertIsNone(ha._ws_read_json(sock, b"", 5.0))
+
+    def test_ws_read_json_skips_a_ping_then_reads_the_reply(self):
+        ping = struct.pack("!BB", 0x89, 0)               # 0x9 = ping, no payload
+        data = ping + _ws_server_frame(json.dumps({"ok": True}))
+        sock = _FrameSock(data)
+        self.assertEqual(ha._ws_read_json(sock, b"", 5.0), {"ok": True})
+
+    # --- state file + control dispatch -----------------------------------------
+
+    def test_pty_read_state_is_defensive(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(ha, "PTY_HOST_DIR", d):
+                self.assertIsNone(ha._pty_read_state("agent-x"))      # absent
+                with open(ha._pty_state_path("agent-x"), "w") as f:
+                    f.write("{not json")
+                self.assertIsNone(ha._pty_read_state("agent-x"))      # unreadable
+                with open(ha._pty_state_path("agent-x"), "w") as f:
+                    json.dump({"ctrlPort": 40000, "pid": 7}, f)
+                self.assertEqual(ha._pty_read_state("agent-x")["ctrlPort"], 40000)
+
+    def test_pty_control_dials_the_state_port_with_the_agent_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(ha, "PTY_HOST_DIR", d), \
+                 mock.patch.object(ha, "TURMA_TOKEN", "sekret"):
+                with open(ha._pty_state_path("agent-x"), "w") as f:
+                    json.dump({"ctrlPort": 40123, "pid": 7}, f)
+                with mock.patch.object(ha, "_ws_control_rpc",
+                                       return_value={"ok": True}) as rpc:
+                    self.assertTrue(ha._pty_control("agent-x", "alive")["ok"])
+                port, token, msg = rpc.call_args.args[:3]
+                self.assertEqual(port, 40123)
+                self.assertEqual(token, "sekret")
+                self.assertEqual(msg["op"], "alive")
+
+    def test_pty_control_is_none_without_a_live_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(ha, "PTY_HOST_DIR", d):
+                self.assertIsNone(ha._pty_control("agent-gone", "capture"))
+
+    # --- the tmux/ttyd module-level call sites dispatch on IS_WINDOWS ----------
+
+    def test_capture_pane_dispatches_to_the_pty_host_on_windows(self):
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pty_capture", return_value="PANE") as cap:
+            self.assertEqual(ha._capture_pane("agent-x"), "PANE")
+        cap.assert_called_once_with("agent-x")
+
+    def test_type_into_pane_dispatches_to_the_pty_host_on_windows(self):
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pty_inject", return_value=True) as inj:
+            self.assertTrue(ha._type_into_pane("agent-x", "hello"))
+        inj.assert_called_once_with("agent-x", "hello")
+
+    def test_pty_inject_sends_a_bracketed_paste_then_enter(self):
+        calls = []
+
+        def fake_control(name, op, **kw):
+            calls.append(kw.get("data"))
+            return {"ok": True}
+
+        with mock.patch.object(ha, "_pty_control", side_effect=fake_control):
+            self.assertTrue(ha._pty_inject("agent-x", "line1\nline2"))
+        # First call: the whole message wrapped in bracketed-paste markers (so
+        # newlines land as ONE message); then a bare CR to submit.
+        self.assertTrue(calls[0].startswith("\x1b[200~"))
+        self.assertTrue(calls[0].endswith("\x1b[201~"))
+        self.assertIn("line1\nline2", calls[0])
+        self.assertEqual(calls[1], "\r")
+
+    def test_pty_inject_strips_control_bytes_from_the_paste(self):
+        seen = []
+
+        def fake_control(name, op, **kw):
+            seen.append(kw.get("data"))
+            return {"ok": True}
+
+        with mock.patch.object(ha, "_pty_control", side_effect=fake_control):
+            ha._pty_inject("agent-x", "a\x1bb\x07c")
+        # An ESC/BEL inside the body would close the paste early — stripped, like
+        # INPUT_CTRL_RE on the tmux path (the paste is the FIRST control call).
+        self.assertIn("\x1b[200~abc\x1b[201~", seen[0])
+
+    def test_pane_send_keys_translates_key_names_on_windows(self):
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pty_control", return_value={"ok": True}) as c:
+            ha._pane_send_keys("agent-x", "Escape")
+            self.assertEqual(c.call_args.kwargs["data"], "\x1b")
+            ha._pane_send_keys("agent-x", "BTab")
+            self.assertEqual(c.call_args.kwargs["data"], "\x1b[Z")
+            ha._pane_send_keys("agent-x", "/model", literal=True)
+            self.assertEqual(c.call_args.kwargs["data"], "/model")
+
+    def test_pane_send_keys_runs_tmux_off_windows(self):
+        with mock.patch.object(ha, "IS_WINDOWS", False), \
+             mock.patch.object(ha, "run") as run:
+            ha._pane_send_keys("agent-x", "Escape")
+        self.assertEqual(run.call_args.args[0],
+                         ["tmux", "send-keys", "-t", "agent-x", "Escape"])
+
+    # --- host-specific helpers -------------------------------------------------
+
+    def test_windows_claude_launcher_spawns_an_exe_directly(self):
+        with mock.patch.object(ha.shutil, "which",
+                               return_value=r"C:\Users\u\.local\bin\claude.exe"):
+            self.assertEqual(ha._windows_claude_launcher(),
+                             [r"C:\Users\u\.local\bin\claude.exe"])
+
+    def test_windows_claude_launcher_wraps_a_cmd_shim(self):
+        with mock.patch.object(ha.shutil, "which",
+                               return_value=r"C:\Users\u\AppData\Roaming\npm\claude.cmd"):
+            self.assertEqual(ha._windows_claude_launcher(),
+                             ["cmd.exe", "/c", "claude"])
+
+    def test_windows_claude_launcher_raises_when_absent(self):
+        with mock.patch.object(ha.shutil, "which", return_value=None):
+            with self.assertRaises(RuntimeError):
+                ha._windows_claude_launcher()
+
+    def test_read_env_file_parses_key_values(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "m.env")
+            with open(p, "w") as f:
+                f.write("# a comment\nexport ANTHROPIC_MODEL=deepseek\n"
+                        'ANTHROPIC_BASE_URL="http://gw/v1"\nBLANK\n')
+            got = ha._read_env_file(p)
+        self.assertEqual(got["ANTHROPIC_MODEL"], "deepseek")
+        self.assertEqual(got["ANTHROPIC_BASE_URL"], "http://gw/v1")
+        self.assertNotIn("BLANK", got)
+
+
+class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
+    """The manager-method half of the XERK-697 seam, driven through a real
+    SessionManager with IS_WINDOWS mocked."""
+
+    def setUp(self):
+        super().setUp()
+        self.pty_dir = os.path.join(self.tmp, "pty-hosts")
+        p = mock.patch.object(ha, "PTY_HOST_DIR", self.pty_dir)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _write_state(self, tmux_name, **st):
+        os.makedirs(self.pty_dir, exist_ok=True)
+        with open(ha._pty_state_path(tmux_name), "w") as f:
+            json.dump(st, f)
+
+    def test_kill_tmux_tears_down_the_pty_host_on_windows(self):
+        sm = self.make_manager()
+        self._write_state("agent-w1", pid=999999, ctrlPort=40000)
+        sess = {"id": "w1", "tmuxName": "agent-w1"}
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pty_control", return_value={"ok": True}) as ctl, \
+             mock.patch.object(ha.os, "kill"):
+            sm._kill_tmux(sess)
+        ctl.assert_called_once()
+        self.assertEqual(ctl.call_args.args[1], "kill")
+        # No tmux kill-session was shelled, and the state file is gone.
+        self.assertFalse(any(c[:2] == ["tmux", "kill-session"]
+                             for c in self.run_calls))
+        self.assertFalse(os.path.exists(ha._pty_state_path("agent-w1")))
+
+    def test_kill_ttyd_is_a_noop_on_windows(self):
+        sm = self.make_manager()
+        self.run_calls.clear()   # drop __init__'s hostname/version probes
+        with mock.patch.object(ha, "IS_WINDOWS", True):
+            sm._kill_ttyd("w1")   # must not raise or shell anything
+        self.assertEqual(self.run_calls, [])
+
+    def test_launch_ttyd_is_a_noop_on_windows(self):
+        sm = self.make_manager()
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7700}
+        self.run_calls.clear()   # drop __init__'s hostname/version probes
+        with mock.patch.object(ha, "IS_WINDOWS", True):
+            sm._launch_ttyd(sess)   # the pty-host already serves the terminal
+        self.assertEqual(self.run_calls, [])
+        self.assertNotIn("w1", sm.ttyd)
+
+    def test_tmux_alive_reads_the_pty_host_pid_on_windows(self):
+        sm = self.make_manager()
+        self._write_state("agent-w1", pid=os.getpid(), ctrlPort=40000)
+        with mock.patch.object(ha, "IS_WINDOWS", True):
+            self.assertTrue(sm._tmux_alive("agent-w1"))   # this process is alive
+        with mock.patch.object(ha, "IS_WINDOWS", True):
+            self.assertFalse(sm._tmux_alive("agent-none"))  # no state -> dead
+
+    def test_spawn_pty_host_builds_the_node_command_and_env(self):
+        sm = self.make_manager()
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "worktreePath": self.tmp}
+        # The pty-host "publishes" its state as soon as it is spawned.
+        def fake_popen(*a, **k):
+            self._write_state("agent-w1", pid=1234, ctrlPort=55000, termPort=7742)
+            self.popen_args = (a, k)
+            return mock.Mock()
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "TURMA_TOKEN", "tok"), \
+             mock.patch.object(ha.shutil, "which", return_value=r"C:\claude.exe"), \
+             mock.patch.object(ha, "_pty_teardown"), \
+             mock.patch.object(ha.subprocess, "Popen", side_effect=fake_popen):
+            sm._spawn_pty_host(sess, ["--session-id", "abc", "--remote-control",
+                                      "myrc"], {"TURMA_SESSION_ID": "w1"})
+        cmd = self.popen_args[0][0]
+        self.assertEqual(cmd[0], ha.PTY_NODE_EXE)
+        self.assertEqual(cmd[1], ha.PTY_HOST_MJS)
+        self.assertIn("--session", cmd)
+        self.assertIn("w1", cmd)
+        self.assertEqual(cmd[cmd.index("--term-port") + 1], "7742")
+        self.assertEqual(cmd[cmd.index("--auth-token") + 1], "tok")
+        self.assertEqual(cmd[cmd.index("--cols") + 1], "220")
+        # The claude argv rides after the launcher, past the `--` separator.
+        dd = cmd.index("--")
+        self.assertEqual(cmd[dd + 1:], [r"C:\claude.exe", "--session-id", "abc",
+                                        "--remote-control", "myrc"])
+        env = self.popen_args[1]["env"]
+        self.assertEqual(env["TURMA_SESSION_ID"], "w1")
+        self.assertEqual(sess["ttydPid"], 1234)
+
+    def test_spawn_pty_host_raises_when_no_state_is_published(self):
+        sm = self.make_manager()
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "worktreePath": self.tmp}
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "PTY_SPAWN_TIMEOUT_SEC", 0.2), \
+             mock.patch.object(ha.shutil, "which", return_value=r"C:\claude.exe"), \
+             mock.patch.object(ha, "_pty_teardown"), \
+             mock.patch.object(ha.subprocess, "Popen", return_value=mock.Mock()):
+            with self.assertRaises(RuntimeError):
+                sm._spawn_pty_host(sess, ["--session-id", "abc"], {})
+
+    def test_launch_tmux_translates_the_shell_command_to_argv_and_env(self):
+        # The heart of the seam: _launch_tmux's Windows branch turns the POSIX
+        # shell command (env prefix + claude flags + positional prompt) into the
+        # pty-host's argv + env dict, one-for-one with the Linux `claude_cmd`.
+        sm = self.make_manager()
+        wt = os.path.join(self.tmp, "wt")
+        os.makedirs(wt, exist_ok=True)
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "worktreePath": wt, "rcName": "TrueNAS-Repo-w1", "repo": "Repo"}
+        captured = {}
+
+        def fake_spawn(s, argv, env):
+            captured["argv"] = argv
+            captured["env"] = env
+
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(sm, "_spawn_pty_host", side_effect=fake_spawn), \
+             mock.patch.object(sm, "_ensure_guard_settings",
+                               return_value=os.path.join(self.tmp, "guard.json")), \
+             mock.patch.object(sm, "_session_directive", return_value="DIRECTIVE"), \
+             mock.patch.object(sm, "_remember_ticket"), \
+             mock.patch.object(sm, "_drop_bridge_pointer"):
+            sm._launch_tmux(sess, prompt="do the thing")
+        argv, env = captured["argv"], captured["env"]
+        # A fresh conversation pins --session-id; the rc name drives both
+        # --remote-control and --name; the guard --settings and the directive
+        # ride every launch; the prompt is the positional after `--`.
+        self.assertEqual(argv[0], "--session-id")
+        self.assertIn("--remote-control", argv)
+        self.assertEqual(argv[argv.index("--remote-control") + 1], "TrueNAS-Repo-w1")
+        self.assertIn("--name", argv)
+        self.assertIn("--settings", argv)
+        self.assertEqual(argv[argv.index("--append-system-prompt") + 1], "DIRECTIVE")
+        self.assertEqual(argv[-2:], ["--", "do the thing"])
+        # The env-assignment prefix the shell string carried becomes env entries.
+        self.assertEqual(env["TURMA_SESSION_ID"], "w1")
+        self.assertEqual(env["TURMA_QUESTIONS_DIR"], ha.QUESTIONS_DIR)
+
+    def test_launch_tmux_merges_the_local_model_env_file_on_windows(self):
+        # The `set -a; . <file>` failover source has no shell equivalent: the file
+        # is READ and its keys merged into the env dict, never argv'd (the gateway
+        # credential stays off the command line).
+        sm = self.make_manager()
+        wt = os.path.join(self.tmp, "wt2")
+        os.makedirs(wt, exist_ok=True)
+        envf = os.path.join(self.tmp, "local-model.env")
+        with open(envf, "w") as f:
+            f.write("ANTHROPIC_BASE_URL=http://gw/v1\nANTHROPIC_API_KEY=secretkey\n")
+        sess = {"id": "w2", "tmuxName": "agent-w2", "ttydPort": 7743,
+                "worktreePath": wt, "rcName": "rc2", "repo": "Repo",
+                "modelSource": "local", "localModelName": "deepseek"}
+        captured = {}
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(sm, "_spawn_pty_host",
+                               side_effect=lambda s, a, e: captured.update(argv=a, env=e)), \
+             mock.patch.object(sm, "_ensure_guard_settings", return_value=None), \
+             mock.patch.object(sm, "_session_directive", return_value="D"), \
+             mock.patch.object(sm, "_remember_ticket"), \
+             mock.patch.object(sm, "_drop_bridge_pointer"), \
+             mock.patch.object(ha, "local_model_member", return_value=True), \
+             mock.patch.object(ha, "local_model_context", return_value=200000), \
+             mock.patch.object(ha, "LOCAL_MODEL_BASE_URL", "http://gw/v1"), \
+             mock.patch.object(ha, "LOCAL_MODEL_API_KEY", "k"), \
+             mock.patch.object(ha, "LOCAL_MODEL_NAME", ""), \
+             mock.patch.object(ha, "write_local_model_env", return_value=envf):
+            sm._launch_tmux(sess)
+        self.assertEqual(captured["env"]["ANTHROPIC_API_KEY"], "secretkey")
+        # The credential never appears on the command line.
+        self.assertNotIn("secretkey", " ".join(captured["argv"]))
+
+
 class TestTtydTokenRelaunch(unittest.TestCase):
     """XERK-578 follow-up: ttyd bakes its basic-auth token in at launch and
     outlives a manager-only restart (KillMode=process), so after a token ROLL the

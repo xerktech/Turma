@@ -9185,7 +9185,17 @@ def _pane_status(tmux_name, state):
 
 def _capture_pane(tmux_name):
     """The session pane's current text, or None when it can't be captured
-    (tmux gone, timeout)."""
+    (tmux gone, timeout).
+
+    On Windows there is no tmux: the session's terminal is the per-session
+    ConPTY pty-host (XERK-668), and `capture` reads its scrollback RING over the
+    control channel (XERK-697). The ring is RAW pty output with ANSI still in
+    it, not a rendered grid — good enough for `_busy_from_capture`'s plain-text
+    marker scan (the "esc to interrupt" footer survives as a contiguous
+    substring), an accepted approximation the ADR flags for a headless-emulator
+    follow-up."""
+    if IS_WINDOWS:
+        return _pty_capture(tmux_name)
     if not tmux_name:
         return None
     try:
@@ -9342,7 +9352,14 @@ def _type_into_pane(tmux_name, text):
     text in SENDKEYS_MAX_CHARS **chunks** (newlines flattened, since nothing
     brackets them there) rather than clipping it: a message the operator believes
     they sent whole must never arrive with its end quietly missing. Returns True
-    when the text was pasted."""
+    when the text was pasted.
+
+    On Windows the pty-host stands in for tmux (XERK-697): `_pty_inject` delivers
+    the text as a bracketed paste over the control channel, the direct analog of
+    the `paste-buffer -p` path here (newlines survive as ONE message), then
+    submits with Enter."""
+    if IS_WINDOWS:
+        return _pty_inject(tmux_name, text)
     if not tmux_name:
         return False
     buf = f"turma-input-{tmux_name}"      # per-pane, so two sessions can't race
@@ -9369,6 +9386,341 @@ def _type_into_pane(tmux_name, text):
     run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
     return pasted
 
+
+# --- Windows terminal backend: the ConPTY pty-host (XERK-697, ADR D5) ----------
+# On Linux a session's terminal is `tmux` (detached session, pane capture, input
+# injection, has-session) served to the browser by `ttyd`. Neither exists on a
+# native Windows host, so XERK-668 built a per-session pty-host (agent/win/) that
+# owns the session's ConPTY and serves the EXACT ttyd HTTP/ws surface (so the hub
+# proxies /term/<id>/* to it unchanged) PLUS a JSON control websocket that stands
+# in for the tmux CLI: `inject`/`capture`/`alive`/`resize`/`kill`. This block is
+# the manager side of that seam — the piece the pty-host README calls D5, "wiring
+# hub-agent.py's tmux calls to the control channel". Everything keys off the
+# pty-host's own atomically-written STATE FILE ({pid, termPort, ctrlPort}), so a
+# fresh manager re-adopts a surviving pty-host from that alone (the analog of
+# resume_on_boot's ttydPid/ttydPort probe), with no in-memory registry to lose.
+PTY_HOST_MJS = os.path.join(_AGENT_DIR, "win", "pty-host.mjs")
+PTY_HOST_DIR = os.path.join(REGISTRY_DIR, "pty-hosts")   # state files + spawn logs
+# The control channel is a tiny request/reply on loopback; a per-op connect
+# matches the per-op `tmux` subprocess model the Linux path uses. Bounded so a
+# wedged pty-host can never stall a caller on the beat past OFFLINE_AFTER_MS.
+PTY_CONTROL_TIMEOUT_SEC = _env_float("PTY_CONTROL_TIMEOUT_SEC", 5.0, minimum=0.5)
+# How long to wait for a freshly-spawned pty-host to publish its state file with
+# bound ports — the analog of a `tmux new-session` either succeeding or failing.
+PTY_SPAWN_TIMEOUT_SEC = _env_float("PTY_SPAWN_TIMEOUT_SEC", 15.0, minimum=1.0)
+# The node runtime the pty-host runs under; the Windows launcher puts it on PATH.
+PTY_NODE_EXE = os.environ.get("TURMA_NODE_EXE", "node")
+
+
+def _pty_state_path(tmux_name):
+    """The pty-host state file for a session, keyed by its stable tmuxName (which
+    embeds the session id) so every module-level terminal helper can find it from
+    the same handle the Linux path passes around."""
+    return os.path.join(PTY_HOST_DIR, f"{tmux_name}.state.json")
+
+
+def _pty_read_state(tmux_name):
+    """Parse a session's pty-host state file, or None if absent/unreadable. Fully
+    defensive (this runs on the beat's critical path via _pty_alive/_capture): a
+    missing or half-written file reads as "no terminal", never raises."""
+    if not tmux_name:
+        return None
+    try:
+        with open(_pty_state_path(tmux_name), "r", encoding="utf-8") as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"  # RFC 6455 handshake constant
+
+
+def _ws_encode_text(text):
+    """One masked client text frame (RFC 6455 requires client→server masking)."""
+    payload = text.encode("utf-8")
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    n = len(payload)
+    b0 = 0x80 | 0x1  # FIN + opcode text
+    if n < 126:
+        header = struct.pack("!BB", b0, 0x80 | n)
+    elif n < 65536:
+        header = struct.pack("!BBH", b0, 0x80 | 126, n)
+    else:
+        header = struct.pack("!BBQ", b0, 0x80 | 127, n)
+    return header + mask + masked
+
+
+def _ws_control_rpc(port, token, msg, timeout=PTY_CONTROL_TIMEOUT_SEC,
+                    host="127.0.0.1"):
+    """A one-shot RFC 6455 client to the pty-host CONTROL websocket: open, send
+    one JSON text frame, read one JSON reply frame, close. Loopback only, so the
+    handshake is minimal (no TLS). Pure stdlib (socket/struct/base64/hashlib —
+    already imported), so it is unit-testable and needs no `ws` dependency on the
+    Python side. Returns the parsed reply dict, or None on ANY failure — the
+    caller treats None like a `tmux` command that returned nonzero."""
+    key = base64.b64encode(os.urandom(16)).decode()
+    path = f"/?token={urllib.parse.quote(str(token), safe='')}" if token else "/"
+    req = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    )
+    s = None
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.settimeout(timeout)
+        s.sendall(req.encode("latin-1"))
+        buf = bytearray()
+        while b"\r\n\r\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                return None
+            buf.extend(chunk)
+            if len(buf) > 65536:
+                return None
+        head, _, rest = bytes(buf).partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n", 1)[0]
+        if b" 101 " not in status_line:
+            return None
+        accept = base64.b64encode(
+            hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+        if accept.encode().lower() not in head.lower():
+            return None
+        s.sendall(_ws_encode_text(json.dumps(msg)))
+        return _ws_read_json(s, rest, timeout)
+    except (OSError, ValueError):
+        return None
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
+def _ws_read_json(sock, initial, timeout):
+    """Read frames off `sock` (with any bytes already buffered in `initial`) until
+    one complete text/binary message arrives, and return its parsed JSON. Server
+    frames are unmasked. Control frames (ping/pong) are skipped; a close frame or
+    an unparseable/oversize payload returns None. Bounded so a hostile peer can't
+    grow the buffer without limit."""
+    buf = bytearray(initial)
+    deadline = time.time() + timeout
+
+    def _need(n):
+        while len(buf) < n:
+            if time.time() > deadline:
+                raise TimeoutError
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError
+            buf.extend(chunk)
+            if len(buf) > 4 * 1024 * 1024:
+                raise ValueError("control reply too large")
+
+    while True:
+        _need(2)
+        b0, b1 = buf[0], buf[1]
+        fin = b0 & 0x80
+        opcode = b0 & 0x0F
+        masked = b1 & 0x80
+        length = b1 & 0x7F
+        idx = 2
+        if length == 126:
+            _need(4)
+            length = struct.unpack("!H", bytes(buf[2:4]))[0]
+            idx = 4
+        elif length == 127:
+            _need(10)
+            length = struct.unpack("!Q", bytes(buf[2:10]))[0]
+            idx = 10
+        if length > 4 * 1024 * 1024:
+            return None
+        maskkey = b""
+        if masked:
+            _need(idx + 4)
+            maskkey = bytes(buf[idx:idx + 4])
+            idx += 4
+        _need(idx + length)
+        payload = bytes(buf[idx:idx + length])
+        if masked:
+            payload = bytes(p ^ maskkey[i % 4] for i, p in enumerate(payload))
+        del buf[:idx + length]
+        if opcode == 0x8:            # close
+            return None
+        if opcode in (0x1, 0x2):     # text / binary
+            if not fin:              # our replies are tiny; a fragment is a bug
+                continue
+            try:
+                return json.loads(payload.decode("utf-8"))
+            except ValueError:
+                return None
+        # ping / pong / continuation: ignore and keep reading
+
+
+def _pty_control(tmux_name, op, timeout=PTY_CONTROL_TIMEOUT_SEC, **extra):
+    """Drive one control op on a session's pty-host, the tmux-CLI replacement.
+    Reads the ctrlPort from the state file and authenticates with the same token
+    the pty-host was minted with (`--auth-token`, = the value ttyd's `-c` takes),
+    so no per-session secret has to be tracked here. Returns the reply dict (with
+    `ok`), or None when there is no live terminal / the call failed."""
+    st = _pty_read_state(tmux_name)
+    if not st or not st.get("ctrlPort"):
+        return None
+    msg = {"op": op}
+    msg.update(extra)
+    return _ws_control_rpc(st["ctrlPort"], TURMA_TOKEN or "changeme", msg, timeout)
+
+
+def _pty_capture(tmux_name):
+    """capture-pane analog: the pty-host's scrollback ring, or None."""
+    r = _pty_control(tmux_name, "capture")
+    if r and r.get("ok"):
+        return r.get("data")
+    return None
+
+
+def _pty_inject(tmux_name, text):
+    """send-keys/paste analog. Delivers `text` as a BRACKETED PASTE (ESC[200~ …
+    ESC[201~) so a multi-line message lands as one input just as `paste-buffer
+    -p` keeps it whole on Linux, then submits with Enter. Control bytes are
+    stripped first (an ESC inside the body would close the paste early and have
+    the rest read as keystrokes — the same hazard INPUT_CTRL_RE guards on the
+    tmux path), and \\r is normalized to \\n like the paste path. Returns True
+    when the paste was accepted."""
+    if not tmux_name:
+        return False
+    clean = INPUT_CTRL_RE.sub("", text.replace("\r", "\n"))
+    bracketed = "\x1b[200~" + clean + "\x1b[201~"
+    r = _pty_control(tmux_name, "inject", data=bracketed)
+    if not (r and r.get("ok")):
+        # A terminal that never enabled bracketed paste (or an older pty-host):
+        # fall back to a plain typed send + submit rather than drop the message.
+        r = _pty_control(tmux_name, "inject", data=clean.replace("\n", " "),
+                         submit=True)
+        return bool(r and r.get("ok"))
+    _pty_control(tmux_name, "inject", data="\r")   # submit
+    return True
+
+
+# The terminal byte sequence to write into the pty for each tmux key TOKEN the
+# pane-driving commands send (interrupt=Escape, set_mode=BTab, set_model's
+# C-u/Up/Down/Enter/Escape, answer_pane_prompt's digit+Enter). An unmapped token
+# is written verbatim, so a bare digit key ("5") is already its own char.
+_TMUX_KEY_BYTES = {
+    "Enter": "\r", "Escape": "\x1b", "Tab": "\t", "BTab": "\x1b[Z",
+    "C-u": "\x15", "Up": "\x1b[A", "Down": "\x1b[B",
+    "Left": "\x1b[D", "Right": "\x1b[C",
+}
+
+
+def _pane_send_keys(tmux_name, *tokens, literal=False):
+    """Send keystrokes to a session pane: `tmux send-keys` on Linux, an `inject`
+    of the equivalent bytes over the pty-host control channel on Windows
+    (XERK-697), so interrupt / set_mode / set_model / answer_pane_prompt drive a
+    ConPTY session exactly as they drive a tmux pane. `literal=True` sends the
+    tokens as verbatim TEXT (tmux `-l -- …`); otherwise each token is a key NAME
+    translated through _TMUX_KEY_BYTES."""
+    if IS_WINDOWS:
+        if literal:
+            data = "".join(str(t) for t in tokens)
+        else:
+            data = "".join(_TMUX_KEY_BYTES.get(t, str(t)) for t in tokens)
+        _pty_control(tmux_name, "inject", data=data)
+        return
+    cmd = ["tmux", "send-keys", "-t", tmux_name]
+    if literal:
+        cmd += ["-l", "--"]
+    cmd += [str(t) for t in tokens]
+    run(cmd)
+
+
+def _pty_alive(tmux_name):
+    """has-session analog: whether the session's pty-host (and therefore its pty)
+    is still up. The pty-host exits ~immediately after its pty child exits, so
+    its pid being alive tracks a live session exactly as a live tmux does — and a
+    cheap pid check keeps this off the network on the beat's liveness scan."""
+    st = _pty_read_state(tmux_name)
+    if not st:
+        return False
+    pid = st.get("pid")
+    try:
+        return bool(pid) and _pid_alive(int(pid))
+    except (TypeError, ValueError):
+        return False
+
+
+def _pty_teardown(tmux_name):
+    """kill-session analog: tell the pty-host to kill its pty and exit, back it up
+    with a signal to its pid, and drop the state file so a dead session is never
+    re-adopted on the next boot. Best-effort and idempotent — a session with no
+    pty-host is a no-op."""
+    if not tmux_name:
+        return
+    st = _pty_read_state(tmux_name)
+    if st:
+        _pty_control(tmux_name, "kill")   # clean pty teardown, then it exits
+        pid = st.get("pid")
+        if pid:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except (OSError, TypeError, ValueError):
+                pass
+    try:
+        os.remove(_pty_state_path(tmux_name))
+    except OSError:
+        pass
+
+
+def _read_env_file(path):
+    """Parse a 0600 `KEY=VALUE` env file (write_local_model_env's output) into a
+    dict, so a Windows launch can MERGE those vars into the pty-host's process env
+    — the analog of the Linux `set -a; . <file>; set +a` the shell has no
+    equivalent for. The gateway credential still never reaches a command line
+    (/proc-equivalent exposure); only the file path did on Linux, and here only
+    the env dict does. Best-effort: an unreadable file yields {}."""
+    out = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key:
+                    out[key] = val
+    except OSError:
+        pass
+    return out
+
+
+def _windows_claude_launcher():
+    """Resolve how to invoke `claude` on this Windows host, as the argv PREFIX the
+    pty-host runs before the claude flags.
+
+    Two shapes ship (XERK-666/672): the native installer's
+    `%USERPROFILE%\\.local\\bin\\claude.exe` and npm's `%APPDATA%\\npm\\claude.cmd`,
+    with the launcher putting both dirs on PATH. A `.exe` node-pty spawns directly
+    (argv); a `.cmd`/`.bat` is NOT CreateProcess-spawnable, so it must run via
+    `cmd.exe /c claude …` (relying on PATH the launcher set — more robust than
+    quoting a `%APPDATA%` path with spaces through cmd). Resolution honours
+    PATHEXT via shutil.which. Raises if claude is not on PATH — a clean launch
+    failure, like a `tmux` that isn't installed."""
+    found = shutil.which("claude")
+    if not found:
+        raise RuntimeError("claude not found on PATH")
+    if found.lower().endswith((".cmd", ".bat")):
+        return ["cmd.exe", "/c", "claude"]
+    return [found]
 
 # --- the session inbox (XERK-340) --------------------------------------------
 #
@@ -16766,6 +17118,7 @@ class SessionManager:
                 # handle it ever had on its conversation. Keep it.
                 claude_sid = self._latest_transcript_id(sess["worktreePath"])
         if claude_sid:
+            id_flag = "--resume"       # captured for the Windows argv path below
             parts.append(f"--resume {claude_sid}")
         else:
             # Fresh conversation (spawn, restart-clear-context, or a resume with
@@ -16773,6 +17126,7 @@ class SessionManager:
             # this session is identifiable from its first byte rather than from
             # whenever it happens to out-mtime its neighbours.
             claude_sid = str(uuid.uuid4())
+            id_flag = "--session-id"
             parts.append(f"--session-id {claude_sid}")
         sess["claudeSessionId"] = claude_sid
         # This session now knows which conversation it is, which is the one moment
@@ -16915,7 +17269,120 @@ class SessionManager:
             # every tool subprocess it spawns.
             claude_cmd = (f"set -a; . {shlex.quote(local_env_file)}; set +a; "
                           + claude_cmd)
+        if IS_WINDOWS:
+            # No POSIX shell on a native Windows host: the pty-host runs claude
+            # via node-pty (argv + an env dict), so the three shell constructs the
+            # Linux `claude_cmd` prepends have to be translated (XERK-697) —
+            #   * the `VAR=x` env-assignment prefix -> entries in the env dict;
+            #   * `set -a; . <local-model.env>; set +a` (failover only) -> read
+            #     that 0600 file and MERGE its KEY=VALUE lines into the env dict,
+            #     keeping the gateway credential off the command line exactly as
+            #     the source did (only the env dict carries it, never argv);
+            #   * the claude flags -> portable argv (no shell quoting), with the
+            #     initial prompt a positional after `--`.
+            # These mirror `parts`/`env_prefix`/`prompt` above one-for-one.
+            claude_argv = [
+                id_flag, claude_sid,
+                "--remote-control", sess["rcName"],
+                "--name", sess["rcName"],
+            ]
+            if model and not on_local:
+                claude_argv += ["--model", model]
+            if perm != "default":
+                claude_argv += ["--permission-mode", perm]
+            if settings:
+                claude_argv += ["--settings", settings]
+            claude_argv += ["--append-system-prompt", policy]
+            if prompt:
+                claude_argv += ["--", prompt]
+            extra_env = {
+                "TURMA_SESSION_ID": sess["id"],
+                "TURMA_QUESTIONS_DIR": QUESTIONS_DIR,
+            }
+            if gitlab_configured() and not os.environ.get("GITLAB_HOST"):
+                extra_env["GITLAB_HOST"] = gitlab_base()
+            if local_env_file:
+                extra_env.update(_read_env_file(local_env_file))
+            self._spawn_pty_host(sess, claude_argv, extra_env)
+            return
         self._spawn_in_tmux(sess, claude_cmd)
+
+    def _spawn_pty_host(self, sess, claude_argv, extra_env):
+        """Windows launch (XERK-697): (re)start this session's ConPTY pty-host
+        DETACHED, running claude under node-pty and serving the terminal on the
+        session's stable ttyd port. Replaces BOTH `_spawn_in_tmux` and
+        `_launch_ttyd` in one process — on Windows they are the same pty-host.
+
+        Detached so it outlives a manager restart (the KillMode=process analog),
+        to be re-adopted from its state file by the next boot. Raises RuntimeError
+        if claude isn't on PATH or the pty-host never publishes its bound ports —
+        the clean launch failure the caller's error handling expects, in place of
+        the `WinError 2` the unconditional `tmux`/`ttyd` calls used to throw."""
+        tmux_name = sess["tmuxName"]
+        _pty_teardown(tmux_name)                 # clean slate (tmux kill-session)
+        os.makedirs(PTY_HOST_DIR, exist_ok=True)
+        state = _pty_state_path(tmux_name)
+        launcher = _windows_claude_launcher()    # [claude.exe] or [cmd.exe /c claude]
+        cmd = [
+            PTY_NODE_EXE, PTY_HOST_MJS,
+            "--session", sess["id"],
+            "--base-path", f"/term/{sess['id']}",
+            "--term-port", str(sess["ttydPort"]),   # the hub proxies /term to this
+            "--ctrl-port", "0",                      # ephemeral; published in state
+            "--state", state,
+            # The pty-host refuses to run unauthenticated; this is the same
+            # credential ttyd's `-c term:<token>` takes and the hub proxies as
+            # Basic base64(term:<token>), so the browser terminal authenticates
+            # identically. Its DEFAULT_PREFS already match _launch_ttyd's `-t`
+            # flags (font/size/webgl/…), so no --pref is needed for fleet parity.
+            "--auth-token", (TURMA_TOKEN or "changeme"),
+            "--cwd", sess["worktreePath"],
+            "--cols", "220", "--rows", "50",         # the tmux `-x 220 -y 50` geometry
+            "--",
+        ] + launcher + claude_argv
+        env = dict(os.environ)
+        env.update({k: str(v) for k, v in extra_env.items()})
+        # DETACHED so a manager restart (KillMode=process) leaves it running for
+        # the next boot to re-adopt; start_new_session is the POSIX equivalent,
+        # which also lets the forkpty backend exercise this path in a drive test.
+        popen_kw = {}
+        if IS_WINDOWS:
+            popen_kw["creationflags"] = (
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        else:
+            popen_kw["start_new_session"] = True
+        try:
+            logf = open(os.path.join(PTY_HOST_DIR, f"{tmux_name}.log"), "ab")
+        except OSError:
+            logf = subprocess.DEVNULL
+        try:
+            subprocess.Popen(
+                cmd, cwd=sess["worktreePath"], env=env,
+                stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                close_fds=True, **popen_kw)
+        except Exception as e:
+            raise RuntimeError(f"pty-host launch failed: {e}")
+        finally:
+            if logf not in (subprocess.DEVNULL, None):
+                try:
+                    logf.close()
+                except OSError:
+                    pass
+        # A started process is not proof it bound its ports — wait for the state
+        # file the pty-host writes once BOTH servers are listening, the analog of
+        # confirming a `tmux new-session` actually came up.
+        deadline = time.time() + PTY_SPAWN_TIMEOUT_SEC
+        while time.time() < deadline:
+            st = _pty_read_state(tmux_name)
+            if st and st.get("ctrlPort") and st.get("termPort"):
+                sess["ttydPid"] = st.get("pid")   # reaped like a ttyd pid on kill
+                return
+            time.sleep(0.1)
+        _pty_teardown(tmux_name)
+        raise RuntimeError(
+            "pty-host did not publish its terminal within "
+            f"{PTY_SPAWN_TIMEOUT_SEC:g}s (terminal failed to start)")
 
     def _launch_ttyd(self, sess):
         """Ensure a ttyd is serving this session's tmux on its stable port.
@@ -16932,7 +17399,16 @@ class SessionManager:
         "Terminal ▸" view it fed is dropped in favour of one host-wide read-only
         dsh viewer. Guarding here (the ONE ttyd choke point) covers every launch
         path — spawn/provision, resume, restart, resume-on-boot — with one rule,
-        so no dsh session ever allocates or adopts a ttyd."""
+        so no dsh session ever allocates or adopts a ttyd.
+
+        On Windows there is no separate ttyd: the pty-host serves the terminal
+        surface itself, on this same stable port, and was (re)started by
+        `_spawn_pty_host` at launch — so this choke point is a no-op there. The
+        resume-on-boot ADOPT path reaches a surviving pty-host with no work here:
+        every terminal helper resolves it from its persisted state file, so
+        "re-ensure the bridge" needs nothing (XERK-697)."""
+        if IS_WINDOWS:
+            return
         if sess.get("agentType") == "dsh":
             return
         proc = self.ttyd.get(sess["id"])
@@ -17015,9 +17491,20 @@ class SessionManager:
             raise RuntimeError(f"ttyd launch failed: {e}")
 
     def _kill_tmux(self, sess):
+        # On Windows the pty-host is BOTH the terminal and the pty (no separate
+        # ttyd), so tearing it down here ends claude AND the terminal in one step
+        # (XERK-697). _kill_ttyd then no-ops. Every kill/delete/restart path runs
+        # _kill_tmux before _kill_ttyd, so nothing leaks.
+        if IS_WINDOWS:
+            _pty_teardown(sess.get("tmuxName"))
+            return
         run(["tmux", "kill-session", "-t", sess["tmuxName"]])
 
     def _kill_ttyd(self, sid):
+        # Windows: the pty-host that served the terminal was torn down by
+        # _kill_tmux (the two are one process there), so there is nothing to reap.
+        if IS_WINDOWS:
+            return
         proc = self.ttyd.pop(sid, None)
         if proc is not None:
             try:
@@ -19387,7 +19874,7 @@ class SessionManager:
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
-        run(["tmux", "send-keys", "-t", sess["tmuxName"], "Escape"])
+        _pane_send_keys(sess["tmuxName"], "Escape")
         log(f"interrupted session {sid}")
 
     def answer_pane_prompt(self, sid, number):
@@ -19417,12 +19904,12 @@ class SessionManager:
         if not any(o["number"] == number for o in prompt["options"]):
             log(f"pane-prompt answer {number} for {sid} dropped: not an option")
             return
-        run(["tmux", "send-keys", "-t", sess["tmuxName"], str(number)])
+        _pane_send_keys(sess["tmuxName"], str(number))
         # Qwen's approval picker requires the digit AND Enter to submit (G0
         # crit. 3: "the approval keystroke (1 + Enter)"); Claude Code's dialog
         # submits on the digit alone, so Enter is qwen-only.
         if sess.get("agentType") == "qwen":
-            run(["tmux", "send-keys", "-t", sess["tmuxName"], "Enter"])
+            _pane_send_keys(sess["tmuxName"], "Enter")
         log(f"answered pane prompt for session {sid}: option {number}")
 
     def set_summary(self, sid, summary):
@@ -19515,9 +20002,9 @@ class SessionManager:
             log(f"set model of {sid} -> {arg}: turn in flight; deferred until idle")
             return
         sess.pop("pendingModel", None)
-        run(["tmux", "send-keys", "-t", tmux_name, "C-u"])
-        run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", "/model"])
-        run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+        _pane_send_keys(tmux_name, "C-u")
+        _pane_send_keys(tmux_name, "/model", literal=True)
+        _pane_send_keys(tmux_name, "Enter")
         rows, cur = [], None
         for _ in range(MODEL_PICKER_TRIES):
             time.sleep(MODEL_PICKER_WAIT_SEC)
@@ -19528,7 +20015,7 @@ class SessionManager:
             # No picker appeared (or no cursor to navigate from): back out.
             # The pane was idle a moment ago, so Escape lands on the prompt (or
             # closes a half-painted picker) and destroys nothing.
-            run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
+            _pane_send_keys(tmux_name, "Escape")
             log(f"set model of {sid} -> {arg}: /model picker did not appear")
             self.save()
             return
@@ -19543,7 +20030,7 @@ class SessionManager:
         while True:
             target = _picker_index_for(rows, resolved)
             if target is None:
-                run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
+                _pane_send_keys(tmux_name, "Escape")
                 log(f"set model of {sid} -> {arg}: picker offers no such row "
                     f"({', '.join(rows)})")
                 self.save()
@@ -19551,21 +20038,20 @@ class SessionManager:
             if cur == target:
                 break
             if steps >= MODEL_PICKER_MAX_STEPS:
-                run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
+                _pane_send_keys(tmux_name, "Escape")
                 log(f"set model of {sid} -> {arg}: cursor never reached the row "
                     f"(at {cur} after {steps} presses)")
                 self.save()
                 return
-            run(["tmux", "send-keys", "-t", tmux_name,
-                 "Down" if target > cur else "Up"])
+            _pane_send_keys(tmux_name, "Down" if target > cur else "Up")
             steps += 1
             rows, cur = self._await_picker_step(tmux_name, rows, cur)
             if not rows or cur is None:
-                run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
+                _pane_send_keys(tmux_name, "Escape")
                 log(f"set model of {sid} -> {arg}: picker vanished mid-navigation")
                 self.save()
                 return
-        run(["tmux", "send-keys", "-t", tmux_name, "-l", "s"])
+        _pane_send_keys(tmux_name, "s", literal=True)
         # The record updates only on the TUI's own confirmation — "Set model
         # to X for this session only" (or "Kept model as X" when the row was
         # already current). Unconfirmed, the record keeps the old value and the
@@ -19665,7 +20151,7 @@ class SessionManager:
             return
         start, presses = cur, 0
         while cur != target and presses < MODE_CYCLE_MAX_PRESSES:
-            run(["tmux", "send-keys", "-t", tmux_name, "BTab"])
+            _pane_send_keys(tmux_name, "BTab")
             presses += 1
             nxt = self._await_mode_step(tmux_name, cur)
             if nxt is None:
@@ -19715,7 +20201,7 @@ class SessionManager:
         presses = (cycle.index(target) - cycle.index(current)) % len(cycle)
         tmux_name = sess["tmuxName"]
         for _ in range(presses):
-            run(["tmux", "send-keys", "-t", tmux_name, "BTab"])
+            _pane_send_keys(tmux_name, "BTab")
         sess["permissionMode"] = target
         self.save()
         log(f"set mode of {sid} -> {target} ({presses} Shift+Tab, blind)")
@@ -19786,7 +20272,10 @@ class SessionManager:
     def _tmux_alive(self, tmux_name):
         """Whether the session's claude tmux is still up. The claude process is
         that tmux session's only command, so a missing session means claude
-        exited (a killed/crashed/finished turn)."""
+        exited (a killed/crashed/finished turn). On Windows the pty-host stands
+        in for tmux: its live pid is the has-session signal (XERK-697)."""
+        if IS_WINDOWS:
+            return _pty_alive(tmux_name)
         if not tmux_name:
             return False
         rc, _ = run_ok(["tmux", "has-session", "-t", tmux_name], timeout=5)
