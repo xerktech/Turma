@@ -466,6 +466,61 @@ esac
   else { Fail "did not attempt --enroll for a truthy opt-in" }
   if ($tok -eq 'master-shared') { Ok "stayed on the current token and still started (soft skip)" }
   else { Fail "exit 2 did not stay on the current token (got '$tok') — a soft skip must not roll or block" }
+
+  # --- Case 15: the auto-update poller starts; the empty-poller check does not crash -----
+  # (XERK-700) Invoke-UpdateChecks decides whether to start the detached -Loop poller with
+  # `if (@(Get-UpdatePoller).Count -eq 0)`. On the normal FIRST start no poller is running, so
+  # Get-UpdatePoller returns an empty array — and a PARENTHESISED call to a function that emits
+  # `@()` collapses to $null, so the pre-fix `(Get-UpdatePoller).Count` threw PropertyNotFound
+  # under StrictMode and the poller was silently never started (auto-update dead on the host).
+  # Wrapping the call in @() makes the empty case a real 0-count. The fixture deliberately omits
+  # the updater (so every earlier case's Invoke-UpdateChecks short-circuits on Test-Path $Updater,
+  # which is why this went uncaught), so lay a stub updater here and assert the -Loop poller is
+  # actually started and not duplicated on a second launch. (Get-ProcessCommandLine's Windows CIM
+  # enumeration — the other half of XERK-700 — is host-verified; here the Linux Get-Process
+  # fallback drives the same @()/count logic.)
+  Note "case: the auto-update poller is started and the empty-poller check does not crash — XERK-700"
+  $UpdaterPath = Join-Path $Bin 'turma-agent-update.ps1'
+  Set-Content -Path $UpdaterPath -Value @'
+param([switch]$ClaudeOnly, [switch]$Loop, [switch]$Boot, [switch]$LockedRun, [switch]$LockedClaude)
+if ($Loop) { Start-Sleep -Seconds 300 }   # a -Loop poller stays alive so it is detectable
+exit 0                                     # -ClaudeOnly (and any other mode) returns at once
+'@
+  function Count-UpdatePollers {
+    @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $cl = $null; try { $cl = $_.CommandLine } catch { }
+        $cl -and $cl.Contains($UpdaterPath) -and $cl.Contains('-Loop')
+      }).Count
+  }
+  function Stop-UpdatePollers {
+    Get-Process -ErrorAction SilentlyContinue | Where-Object {
+      $cl = $null; try { $cl = $_.CommandLine } catch { }
+      $cl -and $cl.Contains($UpdaterPath)
+    } | ForEach-Object { try { $_.Kill() } catch { } }
+  }
+  Stop-UpdatePollers   # deterministic clean slate (a leftover from a prior local run)
+  Reset-Launchers
+  Remove-Item $ManagerLog -ErrorAction SilentlyContinue
+  Set-BaseEnv
+  $env:TURMA_AGENT_ENV = $goodCfg
+  New-ShStub (Join-Path $NpmBin 'claude') "exit 0"   # a reachable claude so the run path proceeds
+  Start-Launcher @() (Join-Path $Work 'run-upd.log') | Out-Null
+  if (Wait-For { (Test-Path $ManagerLog) -and ((Get-Item $ManagerLog).Length -gt 0) }) { Ok "manager started — Invoke-UpdateChecks did not crash the launcher on the empty-poller check" }
+  else { Fail "manager never started — the empty-poller check threw and aborted the run: $(Get-Content (Join-Path $Work 'run-upd.log') -Raw -ErrorAction SilentlyContinue)" }
+  if (Wait-For { (Count-UpdatePollers) -ge 1 }) { Ok "auto-update poller started (an empty poller set is a 0-count, not a throw)" }
+  else { Fail "auto-update poller never started — (Get-UpdatePoller).Count threw on the empty set (XERK-700 regression): $(Get-Content (Join-Path $Work 'run-upd.log') -Raw -ErrorAction SilentlyContinue)" }
+  # A second launch must REUSE the running poller, not stack a duplicate (the non-empty path).
+  Reset-Launchers
+  Set-BaseEnv
+  $env:TURMA_AGENT_ENV = $goodCfg
+  Start-Launcher @() (Join-Path $Work 'run-upd2.log') | Out-Null
+  Start-Sleep -Seconds 1
+  $np = Count-UpdatePollers
+  if ($np -eq 1) { Ok "a second launch reused the existing poller (no duplicate)" }
+  else { Fail "expected exactly 1 auto-update poller after a re-launch, found $np" }
+  Stop-UpdatePollers
+  Reset-Launchers
+  Remove-Item $UpdaterPath -ErrorAction SilentlyContinue
 }
 finally {
   Cleanup

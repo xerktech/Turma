@@ -168,18 +168,36 @@ function Test-ServiceMode {
 }
 
 # --- reap by command line (the launcher's Stop-ByCommandLine, prefix-scoped) --------------
+# Enumerate every process as (Id, CommandLine) WITHOUT blocking. On Windows,
+# Get-Process().CommandLine opens each process and reads its PEB, and that read HANGS
+# INDEFINITELY on a protected/system process (observed on a real host: uninstall/stop/restart
+# wedged forever right here, 0 CPU, no child). The try/catch below catches exceptions, not a
+# hang. Win32_Process returns CommandLine from a single WMI query with no per-process handle,
+# so it cannot block that way. On Linux pwsh (the POSIX test harness) Win32_Process is
+# unavailable, so fall back to Get-Process -- safe there, and it keeps the suite driving this
+# same reap logic. (XERK-700)
+function Get-ProcessCommandLine {
+  if ($IsWindows) {
+    return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
+        [pscustomobject]@{ Id = [int]$_.ProcessId; CommandLine = $_.CommandLine }
+      })
+  }
+  return @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+      $cl = $null; try { $cl = $_.CommandLine } catch { }
+      [pscustomobject]@{ Id = $_.Id; CommandLine = $cl }
+    })
+}
 # Kills every process whose command line contains ALL the needles (never ourselves). Reused
 # for the tunnel supervisor, the tunnel and the manager on the pidfile stop path. A pty-host
 # is never a needle here, so it is never reaped -- the session-preserving property.
 function Stop-ByCommandLine([string[]]$Needles) {
-  Get-Process -ErrorAction SilentlyContinue | Where-Object {
+  Get-ProcessCommandLine | Where-Object {
     if ($_.Id -eq $PID) { return $false }
-    $cl = $null
-    try { $cl = $_.CommandLine } catch { return $false }
+    $cl = $_.CommandLine
     if (-not $cl) { return $false }
     foreach ($n in $Needles) { if (-not $cl.Contains($n)) { return $false } }
     return $true
-  } | ForEach-Object { try { $_.Kill() } catch { } }
+  } | ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch { } }
 }
 
 # Reap the control plane BY COMMAND LINE, in the launcher's order, leaving pty-hosts (and thus

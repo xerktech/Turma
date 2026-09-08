@@ -348,12 +348,30 @@ function Get-IntEnv([string]$Value, [int]$Default) {
   if ($Value -and ($Value -match '^\d+$')) { $n = [int]$Value; if ($n -gt 0) { return $n } }
   return $Default
 }
+# Enumerate every process as (Id, CommandLine) WITHOUT blocking. On Windows,
+# Get-Process().CommandLine opens each process and reads its PEB, and that read HANGS
+# INDEFINITELY on a protected/system process (observed on a real host: launcher STARTUP wedged
+# here in Get-UpdatePoller, 0 CPU, manager never started). The try/catch catches exceptions,
+# not a hang. Win32_Process returns CommandLine from a single WMI query with no per-process
+# handle, so it cannot block that way. On Linux pwsh (the POSIX test harness) Win32_Process is
+# unavailable, so fall back to Get-Process -- safe there, and it keeps the suite driving this
+# same code. (XERK-700)
+function Get-ProcessCommandLine {
+  if ($IsWindows) {
+    return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
+        [pscustomobject]@{ Id = [int]$_.ProcessId; CommandLine = $_.CommandLine }
+      })
+  }
+  return @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+      $cl = $null; try { $cl = $_.CommandLine } catch { }
+      [pscustomobject]@{ Id = $_.Id; CommandLine = $cl }
+    })
+}
 # A running -Loop poller for THIS install (its command line names our updater + -Loop).
 function Get-UpdatePoller {
-  @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
-      $cl = $null; try { $cl = $_.CommandLine } catch { return $false }
-      if (-not $cl) { return $false }
-      return ($cl.Contains($Updater) -and $cl.Contains('-Loop'))
+  @(Get-ProcessCommandLine | Where-Object {
+      $cl = $_.CommandLine
+      $cl -and $cl.Contains($Updater) -and $cl.Contains('-Loop')
     })
 }
 function Invoke-UpdateChecks {
@@ -385,8 +403,10 @@ function Invoke-UpdateChecks {
   }
 
   # The agent self-update poller (the WinSW-has-no-timer stand-in for the systemd .timer),
-  # started detached only if one is not already running for this install.
-  if ((Get-UpdatePoller).Count -eq 0) {
+  # started detached only if one is not already running for this install. Wrap the call in @()
+  # so an empty result is a 0-count array, not the $null that a parenthesised call to a function
+  # emitting an empty array collapses to (which throws .Count under StrictMode -- XERK-700).
+  if (@(Get-UpdatePoller).Count -eq 0) {
     Log "[turma-agent] starting the auto-update poller (detached)"
     try {
       Start-Process -FilePath (Get-Process -Id $PID).Path `
@@ -432,17 +452,16 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
 # prior tunnel can outlive a manager restart). The SUPERVISOR goes first and the tunnel
 # second: the reverse order lets the old supervisor respawn the tunnel we just killed.
 # Matching is on the command line and prefix-scoped (like the bash pkill keys), so a
-# second install only ever reaps its own. Get-Process exposes CommandLine on both Windows
-# and Linux in PowerShell 7, so this is the same code the tests drive.
+# second install only ever reaps its own. Enumeration is via Get-ProcessCommandLine (CIM on
+# Windows, Get-Process on Linux) so it cannot hang on a protected process's PEB read (XERK-700).
 function Stop-ByCommandLine([string[]]$Needles) {
-  Get-Process -ErrorAction SilentlyContinue | Where-Object {
+  Get-ProcessCommandLine | Where-Object {
     if ($_.Id -eq $PID) { return $false }
-    $cl = $null
-    try { $cl = $_.CommandLine } catch { return $false }
+    $cl = $_.CommandLine
     if (-not $cl) { return $false }
     foreach ($n in $Needles) { if (-not $cl.Contains($n)) { return $false } }
     return $true
-  } | ForEach-Object { try { $_.Kill() } catch { } }
+  } | ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch { } }
 }
 Stop-ByCommandLine @($SelfPath, '-TunnelSupervisor')   # supervisor FIRST
 Stop-ByCommandLine @($Tunnel)                          # then the tunnel
