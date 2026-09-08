@@ -84,7 +84,8 @@ try {
     'qwen/ask_mcp.py', 'qwen/peer_mcp.py', 'qwen/peer_inbox.py', 'qwen/guard/shim.py',
     'win/pty-host.mjs', 'win/tty-protocol.mjs', 'win/package.json',
     'win/vendor/ttyd-1.7.7/index.html',
-    'bin/turma-agent.ps1', 'bin/turma-agentctl.ps1', 'bin/turma-agent.xml',
+    'bin/turma-agent.ps1', 'bin/turma-agentctl.ps1', 'bin/turma-agent-update.ps1',
+    'bin/turma-agent.xml',
     'VERSION'
   )
   $missing = @($mustExist | Where-Object { -not (Test-Path -LiteralPath (Join-Path $Prefix $_)) })

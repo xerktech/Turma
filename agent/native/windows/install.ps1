@@ -146,7 +146,7 @@ $VerifyFiles = @(
   'qwen_session.py', 'qwen_transcript.py',
   'qwen\ask_mcp.py', 'qwen\peer_mcp.py', 'qwen\peer_inbox.py', 'qwen\guard\shim.py',
   'win\pty-host.mjs', 'win\tty-protocol.mjs',
-  'bin\turma-agent.ps1', 'bin\turma-agentctl.ps1'
+  'bin\turma-agent.ps1', 'bin\turma-agentctl.ps1', 'bin\turma-agent-update.ps1'
 )
 
 function Get-NodeMajor {
@@ -442,9 +442,12 @@ function Install-Files {
   if (Test-Path -LiteralPath $winSrcDir) { Copy-Tree $winSrcDir (Join-Path $Prefix 'win') @('node_modules') }
   else { Warn "source dir missing: $winSrcDir (the Windows terminal layer)" }
 
-  # The Windows shell scripts into bin\ (the launcher + controller; the xml is rendered by
-  # Install-Service). These sit at $WinSrc in both the repo and a sensible tarball layout.
-  foreach ($s in @('turma-agent.ps1', 'turma-agentctl.ps1')) {
+  # The Windows shell scripts into bin\ (the launcher + controller + self-updater; the xml is
+  # rendered by Install-Service). These sit at $WinSrc in both the repo and a sensible tarball
+  # layout. The updater MUST be laid down: the launcher resolves it from bin\ and its update
+  # poller early-returns when it is absent, so omitting it silently disables all auto-update
+  # (agent self-update AND Claude Code) on the host -- XERK-682.
+  foreach ($s in @('turma-agent.ps1', 'turma-agentctl.ps1', 'turma-agent-update.ps1')) {
     $src = Join-Path $WinSrc $s
     if (Test-Path -LiteralPath $src) { Copy-Item -Force -LiteralPath $src -Destination (Join-Path $Bin $s) }
     else { Warn "source missing: $src" }
