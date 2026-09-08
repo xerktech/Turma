@@ -24,6 +24,12 @@
   interactive user both work. (Left unset here so the descriptor is account-agnostic.)
 -->
 <service>
+  <!--
+    <id> is the registered Windows service NAME and the basename WinSW derives its rolling log
+    from. The installer's Render-ServiceXml TEMPLATES it from $ServiceName (TURMA_SERVICE_NAME,
+    default turma-agent) so it agrees with turma-agentctl's Get-Service/Stop-Service -Name and
+    the .exe/.xml/log basenames (XERK-699). The default below is byte-identical when unset.
+  -->
   <id>turma-agent</id>
   <name>Turma per-host agent</name>
   <description>Turma per-host agent: multiplexes worktree-backed Claude Code sessions and heartbeats the hub.</description>

@@ -252,7 +252,17 @@ bullets for the contract this mirrors.
 - **The WinSW descriptor is RENDERED, not consumed raw**: `%BASE%` → the real prefix (WinSW's own
   `%BASE%` would be `bin\` and mis-resolve `%BASE%\bin\turma-agent.ps1`), and the placeholder
   `TURMA_AGENT_ENV` value → the real `%APPDATA%` config path. `%USERPROFILE%` in `<logpath>` is left
-  for WinSW to expand. Then `turma-agentctl install` + (account reconfigure) + `restart` wires +
+  for WinSW to expand.
+- **`Render-ServiceXml` TEMPLATES the WinSW `<id>` from `$ServiceName` (`TURMA_SERVICE_NAME`,
+  default `turma-agent`) — XERK-699.** The `<id>` IS the registered Windows service name and the
+  basename WinSW derives its rolling log from, and `turma-agentctl.ps1` uses `$ServiceName` for
+  `Get-Service`/`Stop-Service -Name`, the `.exe`/`.xml` basenames, and the `<service>.out.log` it
+  tails. A hardcoded `<id>` desyncs all of those under an override: WinSW registers as `turma-agent`
+  while the ctl targets the override, so `Test-ServiceMode` misses the real service (every command
+  silently falls through to the pidfile path) and `logs` reads the wrong basename. The source
+  `turma-agent.xml` keeps its real default `<id>turma-agent</id>`, so an unset override renders
+  byte-identically. Tests: the `TURMA_SERVICE_NAME templates the WinSW <id>` case in
+  `test_install_ps1.ps1`. Then `turma-agentctl install` + (account reconfigure) + `restart` wires +
   session-preservingly restarts it — the twin of `install.sh`'s `systemctl try-restart`.
 - **WinSW is a PINNED download** (`Get-WinSW`, into `bin\<service>.exe` where `turma-agentctl install`
   expects it), the bundled-binary analog of `install.sh`'s static ttyd/glab; a release build may
