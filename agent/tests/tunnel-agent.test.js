@@ -634,6 +634,26 @@ test("pokeHeartbeat swallows a failing signal (best-effort)", () => {
   }
 });
 
+test("pokeHeartbeat is a no-op on Windows (no POSIX signals to poke with)", () => {
+  // On Windows Node, process.kill(pid,"SIGUSR1") does not poke — it EINVALs or
+  // terminates the manager, which crash-looped a real host (XERK-678). The manager
+  // installs no SIGUSR1 handler there anyway, so the poke must simply not fire.
+  const realPlat = Object.getOwnPropertyDescriptor(process, "platform");
+  const realKill = process.kill;
+  const calls = [];
+  process.kill = (pid, sig) => calls.push([pid, sig]);
+  Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+  try {
+    process.env.TURMA_MANAGER_PID = "4242";
+    pokeHeartbeat();
+    assert.deepEqual(calls, []); // never signals on Windows
+  } finally {
+    process.kill = realKill;
+    Object.defineProperty(process, "platform", realPlat);
+    delete process.env.TURMA_MANAGER_PID;
+  }
+});
+
 // --- live TUI pane parsing (real-time assistant streaming) ------------------
 // parsePaneLiveTurn extracts the in-progress assistant turn from a `tmux
 // capture-pane` snapshot. Fixtures mirror real Claude Code v2.1.x TUI output.
