@@ -300,8 +300,17 @@ Read `agent-native.md`'s `bootstrap.sh` bullet for the contract it mirrors.
   (`$IsWindows` under StrictMode Latest), and PowerShell is the INTERPRETER the installer runs under —
   an installer cannot provision its own interpreter (the one chicken-and-egg with no Linux analog).
   `Resolve-Pwsh`: this process if already 7+, else `pwsh` on PATH, else the known Program Files
-  install dirs, else `winget install Microsoft.PowerShell` then re-probe; a clear message if winget
-  is absent. Everything else (git/node/python/gh/claude/service) stays `install.ps1`'s job.
+  install dirs, else `winget install Microsoft.PowerShell` then re-probe.
+  - **winget is NOT assumed present (XERK-678).** It ships as part of App Installer, which a Server
+    image or a stripped/older Windows install can lack — a winget-only path DEAD-ENDED there on a
+    manual step, breaking the "clean-machine one-liner" DoD. `Install-PwshViaMsi` is the winget-less
+    fallback: resolve the latest PowerShell MSI for this host's `$env:PROCESSOR_ARCHITECTURE` (x64/
+    arm64; unknown → x64) from the PowerShell repo's `releases/latest`, download it, and `msiexec
+    /i /quiet /norestart`. The msiexec call is behind `Invoke-MsiInstall` so the POSIX suite drives
+    the resolve+arch+download logic without a real installer (msiexec/winget themselves stay host
+    proof). A non-0/3010 exit (a non-elevated shell → 1603) is a reported FAILURE, then the clear
+    manual-install Die — never a silent success. Everything else (git/node/python/gh/claude/service)
+    stays `install.ps1`'s job.
 - **Hands off `install.ps1` as a real FILE under pwsh 7** (`-NoProfile -ExecutionPolicy Bypass -File`)
   so its `$PSCommandPath` source-probe resolves the unpacked tree beside it — the analog of
   `bootstrap.sh` running `install.sh` THROUGH bash. Not copied into the prefix, so a later

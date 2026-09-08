@@ -41,7 +41,10 @@ irm https://raw.githubusercontent.com/xerktech/turma/main/agent/native/windows/b
 it, unpacks it, and hands off to the `install.ps1` inside it. The one prerequisite
 the front door owns is **PowerShell 7** itself (the installer runs under 7, and an
 installer cannot provision its own interpreter): if 7 is missing it installs it
-via `winget`, then re-runs the installer under it. Everything else — git, Node,
+via `winget`, or — on a box without winget (Server images, stripped installs) — by
+downloading the PowerShell 7 MSI for this host's architecture directly and installing
+it silently (run the paste in an **elevated** PowerShell so the silent MSI can complete),
+then re-runs the installer under it. Everything else — git, Node,
 Python, `gh`, `claude`, WinSW, the pty layer's `node-pty` — is `install.ps1`'s job.
 
 A piped `iex` cannot forward options. To pass any, use the call form (the Windows
