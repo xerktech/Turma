@@ -29747,6 +29747,17 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         self.assertEqual(got["ANTHROPIC_BASE_URL"], "http://gw/v1")
         self.assertNotIn("BLANK", got)
 
+    def test_read_env_file_is_the_inverse_of_shlex_quote(self):
+        # write_local_model_env writes `KEY=shlex.quote(value)` and the Linux path
+        # sources it with `. <file>`, so a value with a space or a single quote
+        # must round-trip through _read_env_file (a naive strip('"') would not).
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "m.env")
+            for value in ("http://gw/v1", "a b c", "with'sq", 'with"dq', "12000"):
+                with open(p, "w") as f:
+                    f.write(f"K={shlex.quote(value)}\n")
+                self.assertEqual(ha._read_env_file(p)["K"], value)
+
 
 class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
     """The manager-method half of the XERK-697 seam, driven through a real
@@ -29835,17 +29846,23 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         self.assertEqual(env["TURMA_SESSION_ID"], "w1")
         self.assertEqual(sess["ttydPid"], 1234)
 
-    def test_spawn_pty_host_raises_when_no_state_is_published(self):
+    def test_spawn_pty_host_raises_and_reaps_the_orphan_on_timeout(self):
+        # If the pty-host started but never published bound ports, the detached
+        # Popen has no tmux backstop — the captured handle must be terminated so
+        # it doesn't leak (and keep holding ttydPort).
         sm = self.make_manager()
         sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
                 "worktreePath": self.tmp}
+        proc = mock.Mock()
         with mock.patch.object(ha, "IS_WINDOWS", True), \
              mock.patch.object(ha, "PTY_SPAWN_TIMEOUT_SEC", 0.2), \
              mock.patch.object(ha.shutil, "which", return_value=r"C:\claude.exe"), \
-             mock.patch.object(ha, "_pty_teardown"), \
-             mock.patch.object(ha.subprocess, "Popen", return_value=mock.Mock()):
+             mock.patch.object(ha, "_pty_teardown") as teardown, \
+             mock.patch.object(ha.subprocess, "Popen", return_value=proc):
             with self.assertRaises(RuntimeError):
                 sm._spawn_pty_host(sess, ["--session-id", "abc"], {})
+        proc.terminate.assert_called_once()
+        teardown.assert_called()   # also cleans up any partial state file
 
     def test_launch_tmux_translates_the_shell_command_to_argv_and_env(self):
         # The heart of the seam: _launch_tmux's Windows branch turns the POSIX

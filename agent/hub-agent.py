@@ -9597,12 +9597,8 @@ def _pty_inject(tmux_name, text):
     bracketed = "\x1b[200~" + clean + "\x1b[201~"
     r = _pty_control(tmux_name, "inject", data=bracketed)
     if not (r and r.get("ok")):
-        # A terminal that never enabled bracketed paste (or an older pty-host):
-        # fall back to a plain typed send + submit rather than drop the message.
-        r = _pty_control(tmux_name, "inject", data=clean.replace("\n", " "),
-                         submit=True)
-        return bool(r and r.get("ok"))
-    _pty_control(tmux_name, "inject", data="\r")   # submit
+        return False   # no live terminal / control call failed
+    _pty_control(tmux_name, "inject", data="\r")   # submit with Enter
     return True
 
 
@@ -9695,9 +9691,16 @@ def _read_env_file(path):
                     continue
                 key, _, val = line.partition("=")
                 key = key.strip()
-                val = val.strip().strip('"').strip("'")
+                # Un-quote with SHELL semantics — write_local_model_env writes
+                # `KEY=shlex.quote(value)` and the Linux path sources it with
+                # `. <file>`, so shlex.split is the exact inverse (a value with a
+                # quote/space round-trips; a naive strip('"').strip("'") does not).
+                try:
+                    parts = shlex.split(val)
+                except ValueError:
+                    parts = [val]
                 if key:
-                    out[key] = val
+                    out[key] = parts[0] if parts else ""
     except OSError:
         pass
     return out
@@ -17357,7 +17360,7 @@ class SessionManager:
         except OSError:
             logf = subprocess.DEVNULL
         try:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd, cwd=sess["worktreePath"], env=env,
                 stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
                 close_fds=True, **popen_kw)
@@ -17379,6 +17382,15 @@ class SessionManager:
                 sess["ttydPid"] = st.get("pid")   # reaped like a ttyd pid on kill
                 return
             time.sleep(0.1)
+        # It started but never published bound ports. _pty_teardown reaps it ONLY
+        # if a state file with a pid exists; a process that wrote nothing (or a
+        # partial state) would otherwise be ORPHANED — holding ttydPort so the
+        # next launch can't rebind — since a bare detached Popen has no tmux
+        # backstop. Terminate the handle we captured directly, then clean up.
+        try:
+            proc.terminate()
+        except Exception:
+            pass
         _pty_teardown(tmux_name)
         raise RuntimeError(
             "pty-host did not publish its terminal within "
