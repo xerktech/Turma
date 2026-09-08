@@ -46,6 +46,10 @@ downloading the PowerShell 7 MSI for this host's architecture directly and insta
 it silently (run the paste in an **elevated** PowerShell so the silent MSI can complete),
 then re-runs the installer under it. Everything else — git, Node,
 Python, `gh`, `claude`, WinSW, the pty layer's `node-pty` — is `install.ps1`'s job.
+`install.ps1` prefers `winget` for git/Node/Python/`gh` but does **not require it**: on a
+box without winget it installs each directly from its vendor (the Node/Python/`gh` MSI or
+the Git for Windows silent installer), **machine-wide** so the service inherits them on the
+system PATH.
 
 A piped `iex` cannot forward options. To pass any, use the call form (the Windows
 analog of `bash -s -- …`):
@@ -92,6 +96,25 @@ ACL — it holds a token; a re-install never overwrites an operator-edited value
 - **`claude /login`** on this host — **required**. Remote Control needs a
   subscription OAuth login; the agent idles until Claude Code has credentials.
 - **`gh auth login`** — for private git and `gh pr create`.
+
+## Service account (runs as YOU, not LocalSystem)
+
+The WinSW service **must run as the user logged into Claude**, because the agent reads that
+user's `~/.claude` login, `gh` auth and per-user tools — none of which `LocalSystem`'s
+profile (`C:\Windows\System32\config\systemprofile`) can see. A `LocalSystem` service would
+just idle "no Claude credentials" on a fully logged-in host.
+
+So `install.ps1` configures the service to run as an account, granting it the **Log on as a
+service** right and storing the credential via the SCM (LSA-encrypted, never a plaintext
+file):
+
+- **Interactive install** (the one-liner): it prompts for the account (default: the current
+  user) and its password.
+- **Unattended install**: set `TURMA_SERVICE_ACCOUNT` (e.g. `CORP\alice` or `.\alice`) and
+  `TURMA_SERVICE_PASSWORD` in the environment, or pass `-ServiceAccount` (the password still
+  comes from the env / a prompt — never a plaintext CLI flag).
+- If no account/password is given non-interactively, the service is left as `LocalSystem`
+  with a loud warning; re-run `install.ps1 -ServiceAccount '<you>'` to fix it.
 
 ## Service
 

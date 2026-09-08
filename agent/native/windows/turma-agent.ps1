@@ -1,5 +1,5 @@
 #!/usr/bin/env pwsh
-# turma-agent.ps1 — native (no-WSL) Windows launcher for the Turma per-host agent
+# turma-agent.ps1 -- native (no-WSL) Windows launcher for the Turma per-host agent
 # (XERK-669, epic XERK-666; the decisions it implements are in docs/windows-agent-adr.md,
 # the operative rules in .claude/rules/windows-launcher.md).
 #
@@ -15,19 +15,19 @@
 #   3. supervise the reverse tunnel with the node check INSIDE the retry loop (a
 #      fire-and-forget check makes a missing node silent AND permanent);
 #   4. export the manager PID (for the tunnel's heartbeat poke) and TURMA_AGENT_ENV (the
-#      resolved env-file path, so the manager can rewrite this host's token — XERK-578);
+#      resolved env-file path, so the manager can rewrite this host's token -- XERK-578);
 #   5. idle (never crash-loop) when the Claude subscription login is absent;
 #   6. start + wait on the shared manager (hub-agent.py) as the long-lived process.
 #
 # The self-updater (turma-agent-update.ps1, XERK-674) and its "every start is an update
-# check" ARE wired now — see Invoke-UpdateChecks below (Claude Code awaited before the
+# check" ARE wired now -- see Invoke-UpdateChecks below (Claude Code awaited before the
 # manager; the agent self-update poller started detached, the Windows stand-in for the
 # systemd .timer WinSW has no analogue for).
 #
 # Deliberately NOT here, each owned by a later epic child (kept out to keep this focused
 # and testable, and marked below where they wire in):
-#   * the Windows SERVICE wrapper (WinSW) that supervises THIS script — ADR D2;
-#   * the per-session pty-host that replaces tmux+ttyd — ADR D1.
+#   * the Windows SERVICE wrapper (WinSW) that supervises THIS script -- ADR D2;
+#   * the per-session pty-host that replaces tmux+ttyd -- ADR D1.
 
 [CmdletBinding()]
 param(
@@ -40,13 +40,13 @@ param(
 
 # PowerShell has no `set -u`; StrictMode is the closest analog (an undefined variable is
 # an error, not a silent empty). We read env vars through helpers, never bare, so this
-# only guards genuine typos. ErrorActionPreference stays at the default 'Continue' — the
+# only guards genuine typos. ErrorActionPreference stays at the default 'Continue' -- the
 # bash launcher's `set -e` maps badly here (we WANT to idle on a bad config, not die),
 # so the two idle cases are explicit and everything else uses ordinary error semantics.
 Set-StrictMode -Version Latest
 
 # Log straight to the process's stdout handle so a real console, a WinSW log, and a test
-# redirect ALL capture it identically — Write-Host / Write-Output land on streams a plain
+# redirect ALL capture it identically -- Write-Host / Write-Output land on streams a plain
 # `>` redirect (and WinSW) do not reliably pick up.
 function Log([string]$Message) { [Console]::Out.WriteLine($Message) }
 
@@ -57,7 +57,7 @@ function Coalesce {
   return ''
 }
 
-# Never returns — the Windows equivalent of `exec sleep infinity`. Idling is
+# Never returns -- the Windows equivalent of `exec sleep infinity`. Idling is
 # self-healing (fix the file / log in, restart the service) and, unlike an exit, it does
 # not read as a crash the service manager should restart-loop.
 function Enter-Idle {
@@ -119,7 +119,7 @@ function Get-ConfigErrors([string]$Path) {
 
 # Apply a validated config: set $env:KEY for each assignment, honouring an `export `
 # prefix and stripping ONE layer of matching surrounding quotes from the value (the
-# common `export TURMA_TOKEN="t"` / `MAX_SESSIONS=6` forms). No shell expansion — these
+# common `export TURMA_TOKEN="t"` / `MAX_SESSIONS=6` forms). No shell expansion -- these
 # files hold plain literals, and the values are read back as-is by the manager.
 function Import-Config([string]$Path) {
   foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
@@ -140,16 +140,16 @@ if (Test-Path -LiteralPath $Cfg) {
   if ($cfgBad.Count -eq 0) { Import-Config $Cfg }
 }
 
-# A bad config is reported ONCE (names + line numbers, no values — this file is ACL'd
+# A bad config is reported ONCE (names + line numbers, no values -- this file is ACL'd
 # owner-only and holds TURMA_TOKEN / JIRA_TOKEN, while this banner goes to the service log,
 # a different audience) and then idled on. Never exit here: a launcher that exits reads,
-# to the service manager, exactly like one worth restarting in a few seconds — which is
+# to the service manager, exactly like one worth restarting in a few seconds -- which is
 # the invisible crash loop this whole discipline exists to prevent. Nothing is loaded in
 # this state: a half-applied config would report to the wrong hub, or none.
 if ($cfgBad.Count -gt 0) {
   Log "=================================================================="
   Log " Invalid line(s) in $Cfg"
-  Log " (values hidden — this file holds tokens; only names are shown)"
+  Log " (values hidden -- this file holds tokens; only names are shown)"
   Log ""
   foreach ($b in $cfgBad) { Log ("   line {0}: {1} ..." -f $b.Line, $b.Name) }
   Log ""
@@ -172,14 +172,19 @@ $env:CLAUDE_PROJECTS_ROOT = Coalesce $env:CLAUDE_PROJECTS_ROOT (Join-Path $env:U
 $env:REPOS_ROOT           = Coalesce $env:REPOS_ROOT (Join-Path $env:USERPROFILE 'git')
 $env:DEVICE_NAME          = Coalesce $env:DEVICE_NAME $env:COMPUTERNAME ([System.Net.Dns]::GetHostName())
 
-# Put the per-user tool dir on PATH ourselves. A Windows service running without an
-# interactive login does NOT inherit the user's shell PATH, so `claude` — installed by
-# npm to %APPDATA%\npm (npm's global bin on Windows, where claude.cmd lands) — is
-# otherwise unreachable and every session dies on exec. The install prefix's bin dir goes
-# on too (bundled tools like WinSW). This is the launcher's job, host-agnostically, the
-# exact twin of the bash launcher blessing ~/.local/bin (XERK-94).
-$NpmBin = Join-Path $AppData 'npm'
-$env:PATH = @($SelfDir, $NpmBin, $env:PATH) -join [System.IO.Path]::PathSeparator
+# Put the per-user tool dirs on PATH ourselves. A Windows service running without an
+# interactive login does NOT inherit the user's shell PATH, so `claude` is otherwise
+# unreachable and every session dies on exec. Claude Code lands in ONE of two per-user
+# places depending on how it was installed, and we cannot predict which, so cover BOTH:
+#   * %APPDATA%\npm       -- npm's global bin (`claude.cmd`), what install.ps1 lays down;
+#   * %USERPROFILE%\.local\bin -- the native `claude` installer's dir (`claude.exe`), the
+#     Windows twin of the ~/.local/bin the bash launcher blesses (XERK-94, XERK-678:
+#     a real host had it here, not under npm).
+# The install prefix's bin dir goes on too (bundled tools like WinSW). System-PATH tools
+# (git/node/python, installed machine-wide by install.ps1) ride the inherited $env:PATH.
+$NpmBin   = Join-Path $AppData 'npm'
+$LocalBin = Join-Path $env:USERPROFILE '.local\bin'
+$env:PATH = @($SelfDir, $NpmBin, $LocalBin, $env:PATH) -join [System.IO.Path]::PathSeparator
 
 $TunnelRetrySec = [int](Coalesce $env:TUNNEL_RETRY_SEC '10')
 $Creds = Join-Path $env:USERPROFILE '.claude\.credentials.json'
@@ -187,14 +192,14 @@ $Creds = Join-Path $env:USERPROFILE '.claude\.credentials.json'
 # --- XERK-578 optional zero-touch token onboarding (self-enroll) ----------------------
 # When opted in (TURMA_AGENT_SELF_ENROLL truthy), roll this host onto its OWN derived agent
 # token (XERK-268/284) on start, so a fleet self-rolls off the shared master with no
-# per-host ritual — the Windows twin of the bash launcher's self-enroll block. IDEMPOTENT
+# per-host ritual -- the Windows twin of the bash launcher's self-enroll block. IDEMPOTENT
 # (a host already on its derived token is a hub-side no-op) and BEST-EFFORT (never blocks
 # start): a hub too old to offer the endpoint (exit 2), or ANY failure, leaves the current
 # token in place. hub-agent.py --enroll fetches + verifies + writes the new token to $Cfg
 # ATOMICALLY with an owner-only NTFS ACL (restrict_file_to_owner's icacls, the chmod-600
 # analog), refusing to persist a token whose name half is not this host's DEVICE_NAME. On
-# success we re-read ONLY TURMA_TOKEN from the file — re-importing the WHOLE file would
-# reset every blank Windows-relative default we just applied — so the tunnel and manager
+# success we re-read ONLY TURMA_TOKEN from the file -- re-importing the WHOLE file would
+# reset every blank Windows-relative default we just applied -- so the tunnel and manager
 # below start authenticated on the new token. Called from the MAIN run path only (below),
 # never the -TunnelSupervisor re-entry or -Preflight: the manager + supervisor we start
 # inherit the re-read token, and the supervisor's own Import-Config re-reads the rolled
@@ -214,14 +219,14 @@ function Invoke-SelfEnroll {
     Log "[turma-agent] self-enroll: could not run the manager's --enroll ($_); staying on the current token"
     return
   }
-  # 2 = hub too old (soft skip); any other non-zero = a failure. Either way stay put — the
+  # 2 = hub too old (soft skip); any other non-zero = a failure. Either way stay put -- the
   # manager still authenticates on the existing TURMA_TOKEN. --enroll never prints a token.
   if ($rc -ne 0) { return }
   # Re-read ONLY TURMA_TOKEN from the (now atomically-rewritten) config. Last assignment
   # wins, matching how the file is sourced/imported; one layer of surrounding quotes is
   # stripped, as Import-Config does. Wrapped best-effort like the --enroll call above: on
   # Windows a just-renamed file can be momentarily locked (AV/indexer/backup handle) or
-  # vanish in a TOCTOU window, and ReadAllLines throws — degrade with one log line and stay
+  # vanish in a TOCTOU window, and ReadAllLines throws -- degrade with one log line and stay
   # on the current token, not a stack trace to the service log (bash's grep degrades
   # silently; parity). The enroll already persisted the new token, so the next start reads
   # it via Import-Config regardless.
@@ -250,7 +255,7 @@ function Invoke-SelfEnroll {
 # loaded and the PATH above, and so its command line carries a precise, greppable key the
 # run path reaps on. The node check lives INSIDE the loop, never in front of it: on a
 # native install node is a setup-time prerequisite, not a baked layer, so it can be
-# genuinely absent — and a fire-and-forget check would make that both silent (the manager
+# genuinely absent -- and a fire-and-forget check would make that both silent (the manager
 # keeps heartbeating, so the host reads ONLINE) and permanent (nothing retries). Checking
 # each pass heals the terminals within one retry the moment node is installed, no restart.
 if ($TunnelSupervisor) {
@@ -260,7 +265,7 @@ if ($TunnelSupervisor) {
       Log "[turma-agent] tunnel exited (rc=$LASTEXITCODE); web terminals are offline until it is back"
     }
     else {
-      Log "[turma-agent] node not on PATH — the reverse tunnel cannot start, so every"
+      Log "[turma-agent] node not on PATH -- the reverse tunnel cannot start, so every"
       Log "[turma-agent] session on this host reads 'terminal offline'. Install Node >= 24"
       Log "[turma-agent] (the installer does this); it is picked up here with no restart."
     }
@@ -275,7 +280,7 @@ function Report-Creds {
     Log "[turma-agent] claude: subscription credentials present"
   }
   else {
-    Log "[turma-agent] claude: NO credentials at $Creds — run 'claude /login' on this host"
+    Log "[turma-agent] claude: NO credentials at $Creds -- run 'claude /login' on this host"
   }
   if (Get-Command gh -ErrorAction SilentlyContinue) {
     & gh auth status *> $null
@@ -284,12 +289,12 @@ function Report-Creds {
       Log "[turma-agent] gh: authenticated as $who"
     }
     else {
-      Log "[turma-agent] gh: NOT authenticated — private git ops and 'gh pr create' will fail (run: gh auth login)"
+      Log "[turma-agent] gh: NOT authenticated -- private git ops and 'gh pr create' will fail (run: gh auth login)"
     }
   }
   # Cloud CLIs are optional and usually absent natively; the command guard makes this a
   # silent no-op. Keyed on a login-marker FILE, never the store dir (each CLI creates its
-  # own store just by running) — same rule as the bash launcher / entrypoint.sh.
+  # own store just by running) -- same rule as the bash launcher / entrypoint.sh.
   $pairs = @(
     @{ Cli = 'aws';       Marker = (Join-Path $env:USERPROFILE '.aws\credentials') }
     @{ Cli = 'az';        Marker = (Join-Path $env:USERPROFILE '.azure\msal_token_cache.json') }
@@ -301,7 +306,7 @@ function Report-Creds {
       Log "[turma-agent] $($p.Cli): host creds present"
     }
     else {
-      Log "[turma-agent] $($p.Cli): installed; no creds on this device — ignoring"
+      Log "[turma-agent] $($p.Cli): installed; no creds on this device -- ignoring"
     }
   }
 }
@@ -325,7 +330,7 @@ Invoke-SelfEnroll
 Report-Creds
 
 # --- update checks on every start (XERK-254 / XERK-674) --------------------------------
-# A restart — an operator's, WinSW's after a crash, the hub's token-roll, a host reboot — is
+# A restart -- an operator's, WinSW's after a crash, the hub's token-roll, a host reboot -- is
 # the moment to be running current code, so every start checks both halves of what this host
 # runs. They are fired DIFFERENTLY, and the difference is the whole safety argument:
 #   * Claude Code, AWAITED, right here, before the manager exists. Replacing the npm package
@@ -357,7 +362,7 @@ function Invoke-UpdateChecks {
   New-Item -ItemType Directory -Force -Path (Join-Path $env:USERPROFILE '.turma') -ErrorAction SilentlyContinue | Out-Null
 
   # Claude Code, AWAITED + bounded. The deadline is a FIXED generous number floored well clear
-  # of the npm install budget (2.5x, as the bash launcher does) so it cannot fire mid-install —
+  # of the npm install budget (2.5x, as the bash launcher does) so it cannot fire mid-install --
   # `Kill` would only interrupt a version read or a registry query, orphaning nothing, but an
   # install killed halfway leaves NO claude where letting it be is merely stale.
   $installBudget = Get-IntEnv $env:TURMA_NPM_INSTALL_TIMEOUT 300
@@ -415,7 +420,7 @@ if (-not (Test-Path -LiteralPath $Creds)) {
 # %APPDATA%\npm is on PATH above, so installing claude there heals the next launch with no
 # restart.
 if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
-  Log "[turma-agent] WARNING: claude not on PATH — every session launch will fail"
+  Log "[turma-agent] WARNING: claude not on PATH -- every session launch will fail"
   Log "[turma-agent] until it is installed. Install it with npm:"
   Log "[turma-agent]   npm install -g @anthropic-ai/claude-code"
   Log "[turma-agent] It is picked up here (%APPDATA%\npm is on PATH) with no restart needed."
@@ -446,13 +451,13 @@ $PwshExe = (Get-Process -Id $PID).Path
 
 # Start the manager and learn its pid, then export it BEFORE backgrounding the supervisor
 # so the tunnel (the supervisor's child) inherits the right TURMA_MANAGER_PID for its
-# heartbeat poke. This reorders the bash sequence slightly — bash names $$ up front
-# because `exec` preserves it, which has no Windows analog — but the invariant the poke
+# heartbeat poke. This reorders the bash sequence slightly -- bash names $$ up front
+# because `exec` preserves it, which has no Windows analog -- but the invariant the poke
 # depends on (the tunnel targets the live manager) holds. -NoNewWindow keeps the manager's
 # output on the launcher's stdout so the service log captures it.
 #
 # If the manager cannot start at all (python genuinely absent from PATH), IDLE rather than
-# exit — an exit here reads to the service manager as a crash-loop worth restarting every
+# exit -- an exit here reads to the service manager as a crash-loop worth restarting every
 # few seconds, the exact failure this launcher exists to avoid, and reading $mgr.Id on an
 # unset $mgr would abort under StrictMode. Idling BEFORE the supervisor is started also
 # means no orphaned tunnel pointing at a hub with no manager. Self-heals when python

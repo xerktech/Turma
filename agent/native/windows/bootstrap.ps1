@@ -1,50 +1,50 @@
 #!/usr/bin/env pwsh
-# bootstrap.ps1 — one-command install of the latest native Turma agent on Windows
+# bootstrap.ps1 -- one-command install of the latest native Turma agent on Windows
 # (XERK-673, epic XERK-666; the PowerShell port of agent/native/bootstrap.sh, rules
 # in .claude/rules/windows-launcher.md, decisions in docs/windows-agent-adr.md).
 #
 # The Windows front door for a host that just wants the agent, not the source. One
-# pasted line does the ENTIRE job — resolve the newest windows-native asset, download
+# pasted line does the ENTIRE job -- resolve the newest windows-native asset, download
 # it, sha256-verify it, unpack it to a temp dir, and hand off to the install.ps1
-# inside it — so the operator does nothing but paste it (and, once, `claude /login`):
+# inside it -- so the operator does nothing but paste it (and, once, `claude /login`):
 #
 #   irm https://raw.githubusercontent.com/xerktech/turma/main/agent/native/windows/bootstrap.ps1 | iex
 #
-# Passthrough options (the Windows analog of `bash -s -- --verify …`) need the call form,
+# Passthrough options (the Windows analog of `bash -s -- --verify ...`) need the call form,
 # since a piped `iex` cannot forward args:
 #
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/xerktech/turma/main/agent/native/windows/bootstrap.ps1))) -Verify
 #   & ([scriptblock]::Create((irm .../bootstrap.ps1))) -Prefix 'D:\turma' -NoInstallDeps
 #
 # Once installed, the Windows self-updater (XERK-674) keeps the host current; this
-# script is only the way IN. It deliberately duplicates none of install.ps1 —
+# script is only the way IN. It deliberately duplicates none of install.ps1 --
 # prerequisites, config, the ACL and the service are all still that script's job.
 #
 # ---------------------------------------------------------------------------------
 # TWO Windows-specific wrinkles the Linux bootstrap does not have:
 #
 # 1. It MUST run under Windows PowerShell 5.1. A clean box has 5.1 (`powershell.exe`),
-#    NOT PowerShell 7 — nothing has provisioned 7 yet — so `irm | iex` lands in 5.1.
+#    NOT PowerShell 7 -- nothing has provisioned 7 yet -- so `irm | iex` lands in 5.1.
 #    Hence this file uses ONLY 5.1-safe surface: no $IsWindows, no ternary/`??`, no
 #    `Set-StrictMode -Version Latest` reads of Core-only automatics. JSON parsing is
-#    ConvertFrom-Json (built into 5.1 — the Windows analog of "parser-light": no
+#    ConvertFrom-Json (built into 5.1 -- the Windows analog of "parser-light": no
 #    external tool, unlike bootstrap.sh which must grep because python isn't there yet).
 #
 # 2. install.ps1 REQUIRES PowerShell 7 ($IsWindows under StrictMode Latest). PowerShell
 #    is the INTERPRETER the installer runs under, and an installer cannot provision the
-#    interpreter it is already running in — the one genuine chicken-and-egg with no
+#    interpreter it is already running in -- the one genuine chicken-and-egg with no
 #    Linux analog (bash is always present). So the single prerequisite this front door
-#    legitimately ensures is pwsh 7 itself — via winget when present, else a direct MSI
-#    download (XERK-678, so a winget-less box is not a manual dead-end) — then it hands
+#    legitimately ensures is pwsh 7 itself -- via winget when present, else a direct MSI
+#    download (XERK-678, so a winget-less box is not a manual dead-end) -- then it hands
 #    the unpacked install.ps1 to that pwsh. Everything else stays install.ps1's job.
 # ---------------------------------------------------------------------------------
 
 # NO param()/[CmdletBinding()] on purpose. This is a passthrough front door: every
-# argument — named switches and their values alike (-Verify, -Uninstall, -Prefix
-# 'D:\turma', -NoInstallDeps) — must land in the automatic $args verbatim to forward to
+# argument -- named switches and their values alike (-Verify, -Uninstall, -Prefix
+# 'D:\turma', -NoInstallDeps) -- must land in the automatic $args verbatim to forward to
 # install.ps1, the analog of bootstrap.sh's `install.sh "$@"`. An advanced function with
 # a declared param would instead REJECT an unknown -Foo as a binding error, which is
-# exactly what an arbitrary install.ps1 flag is to this script — so capture with $args.
+# exactly what an arbitrary install.ps1 flag is to this script -- so capture with $args.
 
 $ErrorActionPreference = 'Stop'   # a resolve/download/verify failure must abort, never
                                   # limp on to a half-baked handoff.
@@ -54,14 +54,14 @@ $Api  = "https://api.github.com/repos/$Repo/releases?per_page=100"
 
 # The windows-native release asset (XERK-676 will produce it; XERK-674's updater reads
 # the same name). Parity with bootstrap.sh's turma-agent-native-v<ver>.tar.gz, but a
-# .zip so the unpack is Expand-Archive — built into 5.1, no tar dependency.
+# .zip so the unpack is Expand-Archive -- built into 5.1, no tar dependency.
 $AssetRe = '^turma-agent-windows-v([0-9]+(?:\.[0-9]+)*)\.zip$'
 
 # The temp working dir, registered here the moment it exists so Die can sweep it. The
 # happy path is cleaned in Invoke-Bootstrap's finally; but a refusal (bad/missing
 # checksum, download or unpack failure, malformed asset) exits THROUGH Die, which is
 # before that finally, so without this the downloaded (possibly tampered) zip would be
-# left in %TEMP% forever — the parity gap vs bootstrap.sh's `trap 'rm -rf' EXIT`.
+# left in %TEMP% forever -- the parity gap vs bootstrap.sh's `trap 'rm -rf' EXIT`.
 $script:WorkDir = $null
 function Remove-WorkDir {
   if ($script:WorkDir) {
@@ -89,7 +89,7 @@ function Get-ReleaseFile([string]$Url, [string]$OutFile) {
 }
 
 # --- resolve the newest windows-native asset ---------------------------------------
-# Picked by the version in the ASSET's own filename, not by release tag — the trap
+# Picked by the version in the ASSET's own filename, not by release tag -- the trap
 # bootstrap.sh documents: a release umbrella carries an unchanged component forward
 # under its ORIGINAL older name (turma-agent-windows-v0.3.0.zip can sit on the v0.4.0
 # release), so the highest tag does not always name the highest windows build, but the
@@ -126,7 +126,7 @@ function Resolve-Asset {
 
 # --- download, verify, unpack ------------------------------------------------------
 # Returns the temp dir holding the unpacked, checksum-verified tree (install.ps1 at
-# its root beside hub-agent.py — the flat layout the release asset ships and that
+# its root beside hub-agent.py -- the flat layout the release asset ships and that
 # install.ps1's own source-probe expects).
 function Get-VerifiedTree($Asset) {
   $work = Join-Path ([System.IO.Path]::GetTempPath()) ("turma-bootstrap-" + [guid]::NewGuid().ToString('N'))
@@ -137,14 +137,14 @@ function Get-VerifiedTree($Asset) {
   $sha = "$zip.sha256"
   try { Get-ReleaseFile $Asset.Url $zip } catch { Die "download failed: $($Asset.Url)" }
   try { Get-ReleaseFile "$($Asset.Url).sha256" $sha }
-  catch { Die "no checksum published for $($Asset.Name) — refusing to install unverified bits" }
+  catch { Die "no checksum published for $($Asset.Name) -- refusing to install unverified bits" }
 
   # The sidecar is the sha256sum(1) format: "<hex>  <filename>". Take the first token.
   $want = ((Get-Content -LiteralPath $sha -Raw) -split '\s+' | Where-Object { $_ })[0]
-  if (-not $want) { Die "empty checksum sidecar for $($Asset.Name) — refusing to install" }
+  if (-not $want) { Die "empty checksum sidecar for $($Asset.Name) -- refusing to install" }
   $have = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
   if ($have.ToLowerInvariant() -ne $want.ToLowerInvariant()) {
-    Die "checksum mismatch on $($Asset.Name) — refusing to install"
+    Die "checksum mismatch on $($Asset.Name) -- refusing to install"
   }
   Info "checksum OK"
 
@@ -163,7 +163,7 @@ function Get-VerifiedTree($Asset) {
     }
   }
   if (-not (Test-Path -LiteralPath (Join-Path $root 'install.ps1'))) {
-    Die "$($Asset.Name) has no install.ps1 — malformed release asset"
+    Die "$($Asset.Name) has no install.ps1 -- malformed release asset"
   }
   return @{ Work = $work; Root = $root }
 }
@@ -171,20 +171,20 @@ function Get-VerifiedTree($Asset) {
 # --- resolve a PowerShell 7 to run install.ps1 under -------------------------------
 # install.ps1 is pwsh-7-only ($IsWindows under StrictMode Latest); this front door runs
 # under whatever the operator pasted into, usually 5.1. So find pwsh 7, installing it via
-# winget when genuinely absent — it is the interpreter the installer needs, and an
+# winget when genuinely absent -- it is the interpreter the installer needs, and an
 # installer cannot provision its own interpreter (see the header). Returns a pwsh path.
-# Known 64-/32-bit Program Files install dirs — filtered for a null root (a 32-bit host
+# Known 64-/32-bit Program Files install dirs -- filtered for a null root (a 32-bit host
 # has no ProgramFiles(x86)) so a probe never throws before the winget/fallback path.
 function Get-PwshCandidatePaths {
   $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }
   return $roots | ForEach-Object { Join-Path $_ 'PowerShell\7\pwsh.exe' }
 }
 # The winget-less PS7 fallback (XERK-678). winget ships as part of App Installer, which a
-# Windows Server image or a stripped/older Windows install may simply not have — there the
+# Windows Server image or a stripped/older Windows install may simply not have -- there the
 # winget-only path DEAD-ENDED on a manual "install PowerShell 7 yourself" step, breaking the
 # "clean-machine install via the one-liner" DoD on exactly the hosts an agent runs on. This
 # resolves the latest PowerShell MSI for THIS host's arch from GitHub (the same anonymous,
-# ConvertFrom-Json style as our own asset resolution) and installs it silently with msiexec —
+# ConvertFrom-Json style as our own asset resolution) and installs it silently with msiexec --
 # no App Installer, no winget. The msiexec call is behind Invoke-MsiInstall so the suite can
 # drive the resolve+download+arch logic without a real installer or a real Windows.
 $PwshApi = 'https://api.github.com/repos/PowerShell/PowerShell/releases/latest'
@@ -202,7 +202,7 @@ function Install-PwshViaMsi {
     default     { 'x64' }   # unknown/absent (e.g. the POSIX test runner) -> the common case
   }
   $assetRe = "^PowerShell-[0-9][0-9.]*-win-$arch\.msi$"
-  Info "installing PowerShell 7 via direct MSI (winget unavailable) — arch $arch"
+  Info "installing PowerShell 7 via direct MSI (winget unavailable) -- arch $arch"
   $rel = $null
   try { $rel = Get-ReleaseJson $PwshApi } catch { Info "cannot reach the PowerShell release API"; return $false }
   $asset = $null
@@ -214,7 +214,7 @@ function Install-PwshViaMsi {
     $code = Invoke-MsiInstall $msi
     Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
     if ($code -eq 0 -or $code -eq 3010) { return $true }
-    Info "msiexec exited $code (a silent MSI install needs an elevated shell — re-run the paste as Administrator)"
+    Info "msiexec exited $code (a silent MSI install needs an elevated shell -- re-run the paste as Administrator)"
     return $false
   } catch { Info "msiexec failed: $_"; return $false }
 }
@@ -228,11 +228,11 @@ function Resolve-Pwsh {
   # Common winget/MSI install locations that may not be on THIS shell's PATH yet.
   foreach ($p in (Get-PwshCandidatePaths)) { if (Test-Path -LiteralPath $p) { return $p } }
 
-  # Not present — provision it. This is the ONE prerequisite the front door owns. Prefer
+  # Not present -- provision it. This is the ONE prerequisite the front door owns. Prefer
   # winget when it is there; fall back to a direct MSI when it is not (XERK-678) so a
   # winget-less box still gets a true one-paste install instead of a manual dead-end.
   if (Get-Command 'winget' -ErrorAction SilentlyContinue) {
-    Info "installing PowerShell 7 (winget: Microsoft.PowerShell) — the installer requires it"
+    Info "installing PowerShell 7 (winget: Microsoft.PowerShell) -- the installer requires it"
     try {
       & winget install --id Microsoft.PowerShell --exact --silent --accept-package-agreements --accept-source-agreements | Out-Null
     } catch { }
@@ -241,7 +241,7 @@ function Resolve-Pwsh {
     foreach ($p in (Get-PwshCandidatePaths)) { if (Test-Path -LiteralPath $p) { return $p } }
   }
 
-  # winget absent, or it ran but pwsh still is not resolvable — direct MSI, then re-probe.
+  # winget absent, or it ran but pwsh still is not resolvable -- direct MSI, then re-probe.
   if (Install-PwshViaMsi) {
     $cmd = Get-Command 'pwsh' -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -249,12 +249,12 @@ function Resolve-Pwsh {
   }
 
   Die ("PowerShell 7 is required to run the installer and it could not be installed automatically " +
-       "(winget unavailable and the MSI fallback did not succeed — a silent MSI install needs an " +
+       "(winget unavailable and the MSI fallback did not succeed -- a silent MSI install needs an " +
        "elevated shell). Install it from https://aka.ms/powershell, then re-run.")
 }
 
 # ===================================================================================
-# main — resolve, verify, unpack, hand off. Returns the installer's exit code. Kept a
+# main -- resolve, verify, unpack, hand off. Returns the installer's exit code. Kept a
 # function so the behavioural suite can drive it after substituting the HTTP + pwsh
 # helpers above (there is no PATH-stubbable `curl` here, unlike test_bootstrap.sh); the
 # guard at the bottom auto-runs it for real invocation (`iex`, scriptblock, or -File).
@@ -267,7 +267,7 @@ function Invoke-Bootstrap([string[]]$ForwardArgs = @()) {
     $installPs1 = Join-Path $tree.Root 'install.ps1'
 
     # Run install.ps1 as a real FILE (so its $PSCommandPath source-probe resolves the
-    # unpacked tree beside it) under pwsh 7 with policy bypassed and no profile — the
+    # unpacked tree beside it) under pwsh 7 with policy bypassed and no profile -- the
     # analog of bootstrap.sh running install.sh THROUGH bash. Not copied into the prefix,
     # so a later -Verify/-Uninstall re-runs through this same download+unpack path.
     $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installPs1)
@@ -277,7 +277,7 @@ function Invoke-Bootstrap([string[]]$ForwardArgs = @()) {
   }
   finally {
     # Best-effort cleanup of the whole temp tree, whatever install.ps1 did. Same dir Die
-    # would have swept — Remove-WorkDir is idempotent, so the two paths never conflict.
+    # would have swept -- Remove-WorkDir is idempotent, so the two paths never conflict.
     Remove-WorkDir
   }
 }
