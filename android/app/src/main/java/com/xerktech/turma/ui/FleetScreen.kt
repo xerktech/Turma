@@ -295,15 +295,6 @@ private fun HostSection(
                         Icon(Icons.Filled.Refresh, "Restart agent", Modifier.size(18.dp))
                     }
                 }
-                // The host's operating system (XERK-693): a neutral badge so an
-                // operator can tell a Windows host from a Linux one, and know where
-                // a Windows- or Linux-only ticket will land. Mirrors index.html's
-                // osBadge; absent (older agent) shows nothing, never a wrong guess.
-                when (agent.hostOs) {
-                    "windows" -> Pill("⊞ Windows", color = null)
-                    "linux" -> Pill("🐧 Linux", color = null)
-                    else -> {}
-                }
                 // Claude subscription-login health (XERK-98): a red "login" pill
                 // when the shared login has lapsed (sessions can't authenticate)
                 // and an amber "expiring" one when it's about to. Shown only when

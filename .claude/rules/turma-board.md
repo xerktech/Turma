@@ -378,8 +378,11 @@ button and the auto-start sweep.
   slot can't change a host's OS), a pinned host of the wrong OS is reported not routed around. A host
   that does NOT report `hostOs` (older agent) never matches a specific requirement.
 - **`hostOs` is a per-agent wire field**, `normalizeHostOs`-coerced to `windows`/`linux` or dropped
-  (typed on Android `AgentInfo.hostOs`, so coercion + typing are one change), and shown as a host
-  badge (`osBadge` in `index.html`, a Pill in `FleetScreen.kt`) — NOT a board surface on glasses.
+  (typed on Android `AgentInfo.hostOs`, so coercion + typing are one change). It is shown on the WEB
+  dashboard as an entry on the host `.host-meta` INFO line (`osMeta` in `index.html`, beside
+  Memory/Uptime/Repos root/Sessions), NOT a header chip — header chips are reserved for actionable
+  state (XERK-696). **Deliberately NOT surfaced in the Android UI** (the field is decoded but unused
+  there) and not a glasses/board surface.
 - **Web ⇄ Android parity**: the Host OS row shipped on Android too (`PlatformSection`/`PlatformPicker`,
   `platformPinOf`/`prettyPlatform`). Vendored `board.cjs` stays byte-identical to `board.js`.
 - Tests: `server.test.js` (`normalizeHostOs`, `/platform` route, `effectiveTicketPlatform`,
