@@ -146,6 +146,12 @@ static and the only thing that changes is a child's board Done-ness.
   returns the `{siteKey,key,row,repo}` shape `autoMergeSession` does, and both `autoMergeSweep` +
   `autoCloseSweep` act on `autoMergeSession(s) || epicRunChildSession(s)`. The two are DISJOINT by
   construction (autoMergeSession nulls on any epic child via the content gate), so the OR is safe.
+  - **`autoCloseSweep` now BRANCHES on which matched (XERK-705), and the epic child is the ONLY path
+    that still closes+kills.** The ORG stream stopped closing tickets itself — a merged PR only
+    MESSAGES that session to self-mark Done (the session may have more work). The epic run is the
+    opposite case: it OWNS the child's whole lifecycle and its wave DAG advances on the child's Done
+    edge, so a child must NOT be left to choose whether to self-close — `epicRunChildSession` keeps
+    the direct Done write + kill (`autoClosed`/`autoStopped`) unchanged. Mechanics: `turma-board.md`.
 - **Arming the run is the hands-off opt-in — it OVERRIDES the org auto-merge toggle AND the bug-only
   floor.** An epic's children are tasks/stories, not just bugs, and the operator armed the run
   deliberately (operator-confirmed for XERK-637). So `epicRunChildSession` requires neither

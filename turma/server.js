@@ -10809,7 +10809,31 @@ const AUTO_MERGE_STATE_MAX = 500;
 const autoMergeState = new Map();
 // "<siteKey>\x00<key>" tickets already moved to Done by autoCloseSweep, so the
 // Done write fires at most once per hub lifetime (like autoStopped for the kill).
+// Used ONLY by the epic-run child path now — see autoCloseNotified below for the
+// ORG auto-merge stream, which no longer closes the ticket itself (XERK-705).
 const autoClosed = new Set();
+// XERK-705: for the ORG auto-merge stream, a merged PR does NOT close the ticket
+// or kill the session any more — the session may still have work to do (the PR was
+// just one step). Instead the hub MESSAGES the running session to mark the ticket
+// Done itself once it judges the work complete; the human/self Done then auto-STOPS
+// it (XERK-45), which frees the slot. This map remembers, per session, which merged
+// PR urls it has already been told about, so a FOLLOW-UP PR merging re-fires the
+// message but a repeat sweep over the same set does not. Keyed
+// "<host>\x00<sessionId>" -> {at, urls:Set<string>}; bounded oldest-first. In-memory
+// only (like autoClosed/autoStopped): a hub restart at worst re-sends one message.
+// The EPIC-run child path keeps the direct Done+kill (autoClosed) — an armed run
+// OWNS its children's whole lifecycle and its wave DAG advances on the Done edge
+// (XERK-637), so it must not depend on a child session choosing to self-close.
+const autoCloseNotified = new Map();
+const AUTO_CLOSE_NOTIFY_MAX = 500;
+// The message typed into the session (the operator `input` path, so it survives a
+// compaction via the agent's pendingInputs outbox — agent-input.md). Kept close to
+// the ticket's own wording; it is a directive to act, not third-party text, so it
+// rides `input`/send_input rather than the peer inbox.
+const AUTO_CLOSE_MERGED_MESSAGE =
+  "That PR has been merged. If all the work for this ticket is done, mark the "
+  + "ticket as Done (move it to the Done column) so this session can wrap up — "
+  + "otherwise, keep going and it will re-check when your next PR lands.";
 // "<siteKey>\x00<epicKey>" epics already written to Done by epicRunCompleteSweep,
 // so the epic-Done write fires at most once per hub lifetime (like autoClosed for
 // a child). The DURABLE guard is the run's own persisted state:"done" — this Set
@@ -10991,32 +11015,66 @@ function autoMergeSweep() {
 }
 
 // PHASE 2: once every PR a session opened has LANDED (and at least one actually
-// MERGED, so a purely-CLOSED PR never closes its ticket), move the ticket to
-// Done AND kill the session. The Done write routes to a board-cred host of the
-// org (like the /status route); the kill goes to the session's host and frees
-// the slot NOW rather than waiting out the ~10-min Jira poll that would surface
-// Done to autoStopSweep — the promptness the whole feature is about.
+// MERGED, so a purely-CLOSED PR never closes its ticket), react — but HOW depends
+// on which stream the session belongs to:
+//
+//   ORG auto-merge stream (autoMergeSession): the hub does NOT close the ticket or
+//     kill the session (XERK-705). The session may still have work to do — the
+//     merged PR was one step, not necessarily the whole ticket — so the hub only
+//     MESSAGES the running session to mark the ticket Done itself once it judges
+//     the work complete. The self/human Done then auto-STOPS it (autoStopSweep,
+//     XERK-45) and frees the slot. The message re-fires when a FOLLOW-UP PR merges.
+//
+//   EPIC-run child (epicRunChildSession): UNCHANGED — the armed run owns the
+//     child's whole lifecycle and its wave DAG advances on the Done edge (XERK-637),
+//     so a child must not depend on choosing to self-close. Move the ticket to Done
+//     AND kill the session, the Done write routed to a board-cred host of the org
+//     (like the /status route), the kill to the session's host — freeing the slot
+//     NOW rather than waiting out the ~10-min Jira poll.
 function autoCloseSweep() {
   // As with autoMergeSweep: an org opt-in OR an armed epic run (XERK-637).
   if (!orgsWithAutoMerge().size && !anyArmedEpicRun()) return;
   const rows = fleetTicketRows();
   const byKey = autoMergeRowIndex(rows);
+  const isMerged = (p) => String((p && p.state) || "").toUpperCase() === "MERGED";
   for (const [host, a] of Object.entries(agents)) {
     for (const s of a.sessions || []) {
-      const elig = autoMergeSession(s, byKey, rows)
-        || epicRunChildSession(s, byKey, rows);
+      // autoMergeSession and epicRunChildSession are DISJOINT by construction (the
+      // content gate nulls autoMergeSession on any epic child), so at most one
+      // matches — but keep them apart here since the two react differently.
+      const orgElig = autoMergeSession(s, byKey, rows);
+      const epicElig = orgElig ? null : epicRunChildSession(s, byKey, rows);
+      const elig = orgElig || epicElig;
       if (!elig) continue;
       const prs = s.prs || [];
       if (!prs.length || !prs.every(prLanded)) continue;
-      if (!prs.some((p) => String((p && p.state) || "").toUpperCase() === "MERGED")) continue;
-      const tkey = elig.siteKey + "\x00" + elig.key;
-      // The Done write must be QUEUED before the kill — killing a session whose
-      // ticket we can't move to Done orphans it (In Progress, merged PR, no
-      // session, forever, since the killed session then leaves the sweep). So if
-      // no board-cred host can take the write (none reports the org, or every one
+      if (!prs.some(isMerged)) continue;
+
+      if (orgElig) {
+        // XERK-705: message the session; never close/kill it here. Fire only when a
+        // merged PR we have NOT already announced for this session is present, so a
+        // follow-up PR merging nudges again while a repeat sweep over the same set
+        // stays quiet.
+        const nk = host + "\x00" + s.id;
+        const mergedUrls = prs.filter(isMerged).map((p) => p.url).filter(Boolean);
+        const rec = autoCloseNotified.get(nk);
+        const seen = rec ? rec.urls : null;
+        const fresh = seen ? mergedUrls.some((u) => !seen.has(u)) : mergedUrls.length > 0;
+        if (fresh) {
+          queueCommand(host, { type: "input", sessionId: s.id, text: AUTO_CLOSE_MERGED_MESSAGE });
+          autoCloseNotified.set(nk, { at: Date.now(), urls: new Set(mergedUrls) });
+        }
+        continue;
+      }
+
+      // EPIC-run child: the Done write must be QUEUED before the kill — killing a
+      // session whose ticket we can't move to Done orphans it (In Progress, merged
+      // PR, no session, forever, since the killed session then leaves the sweep). So
+      // if no board-cred host can take the write (none reports the org, or every one
       // is too old for setTicketStatus), stand down this beat and retry — never
-      // kill. Once `autoClosed` holds the ticket the write is on its way (this
-      // beat or a prior one), so the kill is safe.
+      // kill. Once `autoClosed` holds the ticket the write is on its way (this beat
+      // or a prior one), so the kill is safe.
+      const tkey = elig.siteKey + "\x00" + elig.key;
       if (!autoClosed.has(tkey)) {
         const wh = pickBoardWriteHost(elig.siteKey, "setTicketStatus");
         if (!wh || agentGapError(agents[wh], "setTicketStatus", "close a ticket")) continue;
@@ -11030,6 +11088,14 @@ function autoCloseSweep() {
         queueCommand(host, { type: "kill", sessionId: s.id });
         autoStopped.add(dk);
       }
+    }
+  }
+  // Bound the per-session notify map oldest-first (XERK-705) — entries accrue one
+  // per messaged session and are only ever dropped here, so cap the total.
+  if (autoCloseNotified.size > AUTO_CLOSE_NOTIFY_MAX) {
+    const over = autoCloseNotified.size - AUTO_CLOSE_NOTIFY_MAX;
+    for (const [k] of [...autoCloseNotified].sort((x, y) => x[1].at - y[1].at).slice(0, over)) {
+      autoCloseNotified.delete(k);
     }
   }
 }
@@ -15913,6 +15979,7 @@ if (process.env.TURMA_TEST) {
     setAutoMergeOrg,
     autoMergeState,
     autoClosed,
+    autoCloseNotified,
     ingestMergeResults,
     // The capability-gap resolver and its wait TTL. Exported so a test can hold
     // the mergePr-specific rule directly: an ACK whose async worker-thread result
