@@ -29818,19 +29818,24 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
                 "worktreePath": self.tmp}
-        # The pty-host "publishes" its state as soon as it is spawned.
-        def fake_popen(*a, **k):
+        captured = {}
+        # On Windows the pty-host is launched through a one-shot Scheduled Task
+        # (not a direct Popen), so it becomes a child of the task engine — outside
+        # WinSW's job — and survives a service restart to be re-adopted (XERK-701).
+        # Capture what the task is handed and "publish" the state file the way the
+        # launched pty-host would once its servers bind.
+        def fake_task(tmux_name, cmd, cwd, env, log_path):
+            captured.update(cmd=cmd, cwd=cwd, env=env)
             self._write_state("agent-w1", pid=1234, ctrlPort=55000, termPort=7742)
-            self.popen_args = (a, k)
-            return mock.Mock()
         with mock.patch.object(ha, "IS_WINDOWS", True), \
              mock.patch.object(ha, "TURMA_TOKEN", "tok"), \
              mock.patch.object(ha.shutil, "which", return_value=r"C:\claude.exe"), \
              mock.patch.object(ha, "_pty_teardown"), \
-             mock.patch.object(ha.subprocess, "Popen", side_effect=fake_popen):
+             mock.patch.object(ha, "_pty_task_cleanup"), \
+             mock.patch.object(ha, "_launch_pty_via_task", side_effect=fake_task):
             sm._spawn_pty_host(sess, ["--session-id", "abc", "--remote-control",
                                       "myrc"], {"TURMA_SESSION_ID": "w1"})
-        cmd = self.popen_args[0][0]
+        cmd = captured["cmd"]
         self.assertEqual(cmd[0], ha.PTY_NODE_EXE)
         self.assertEqual(cmd[1], ha.PTY_HOST_MJS)
         self.assertIn("--session", cmd)
@@ -29842,21 +29847,40 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         dd = cmd.index("--")
         self.assertEqual(cmd[dd + 1:], [r"C:\claude.exe", "--session-id", "abc",
                                         "--remote-control", "myrc"])
-        env = self.popen_args[1]["env"]
-        self.assertEqual(env["TURMA_SESSION_ID"], "w1")
+        self.assertEqual(captured["env"]["TURMA_SESSION_ID"], "w1")
         self.assertEqual(sess["ttydPid"], 1234)
 
-    def test_spawn_pty_host_raises_and_reaps_the_orphan_on_timeout(self):
-        # If the pty-host started but never published bound ports, the detached
-        # Popen has no tmux backstop — the captured handle must be terminated so
-        # it doesn't leak (and keep holding ttydPort).
+    def test_spawn_pty_host_windows_raises_and_reaps_via_state_on_timeout(self):
+        # On Windows the task-launched pty-host is NOT our child, so there is no
+        # Popen handle to terminate: if it never publishes bound ports the launch
+        # must still fail cleanly, delete the one-shot task, and reap by the
+        # state-file pid via _pty_teardown (XERK-701).
+        sm = self.make_manager()
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "worktreePath": self.tmp}
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "PTY_SPAWN_TIMEOUT_SEC", 0.2), \
+             mock.patch.object(ha.shutil, "which", return_value=r"C:\claude.exe"), \
+             mock.patch.object(ha, "_pty_teardown") as teardown, \
+             mock.patch.object(ha, "_pty_task_cleanup") as cleanup, \
+             mock.patch.object(ha, "_launch_pty_via_task") as launch:
+            with self.assertRaises(RuntimeError):
+                sm._spawn_pty_host(sess, ["--session-id", "abc"], {})
+        launch.assert_called_once()    # launched via the task, no Popen handle
+        cleanup.assert_called_once()   # the one-shot task definition is deleted
+        teardown.assert_called()       # reaps by state pid + cleans partial state
+
+    def test_spawn_pty_host_posix_terminates_the_orphan_on_timeout(self):
+        # On POSIX the pty-host IS our detached child (start_new_session), so on a
+        # publish timeout the captured handle must be terminated so it doesn't leak
+        # (and keep holding ttydPort), then _pty_teardown cleans partial state.
         sm = self.make_manager()
         sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
                 "worktreePath": self.tmp}
         proc = mock.Mock()
-        with mock.patch.object(ha, "IS_WINDOWS", True), \
+        with mock.patch.object(ha, "IS_WINDOWS", False), \
              mock.patch.object(ha, "PTY_SPAWN_TIMEOUT_SEC", 0.2), \
-             mock.patch.object(ha.shutil, "which", return_value=r"C:\claude.exe"), \
+             mock.patch.object(ha.shutil, "which", return_value="/usr/bin/claude"), \
              mock.patch.object(ha, "_pty_teardown") as teardown, \
              mock.patch.object(ha.subprocess, "Popen", return_value=proc):
             with self.assertRaises(RuntimeError):
@@ -30009,6 +30033,37 @@ class TestTtydTokenRelaunch(unittest.TestCase):
         self.assertEqual(fp, ha._token_fp("some.secret-token"))       # stable
         self.assertNotEqual(fp, ha._token_fp("some.secret-token2"))   # sensitive
         self.assertEqual(ha._token_fp(None), ha._token_fp(""))        # never raises
+
+
+class PidAliveWindowsProbe(unittest.TestCase):
+    """XERK-701: `os.kill(pid, 0)` is a benign liveness probe on POSIX, but on
+    Windows it is unreliable and version-dependent -- on older CPython it maps to
+    TerminateProcess (signal 0 KILLS the target); on Python 3.14 signal 0 no
+    longer terminates but the call still opens the process for access it can be
+    denied on a detached pty-host, misreporting it dead. Either way `_pid_alive`
+    at `resume_on_boot` read a surviving pty-host as dead, so a service restart
+    resumed from scratch instead of adopting. The Windows branch must therefore
+    probe WITHOUT os.kill. CI runs on Linux (the Windows branch is never executed
+    there), so this is a source-level regression guard."""
+
+    def test_windows_pid_alive_does_not_use_os_kill(self):
+        with open(ha.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        anchor = "import ctypes as _ctypes"
+        self.assertIn(anchor, src, "Windows _pid_alive branch is missing")
+        win_start = src.index(anchor)
+        # The POSIX fallback `def _pid_alive` sits after the branch's `else:`.
+        posix_def = src.index("def _pid_alive(pid):",
+                              src.index("else:", win_start))
+        win_block = src[win_start:posix_def]
+        self.assertIn("def _pid_alive(pid):", win_block)
+        # Non-destructive: waits on the process object, never signals it. (The
+        # docstring quotes os.kill to explain the bug, so guard the CALL form,
+        # not the mere mention.)
+        self.assertIn("WaitForSingleObject", win_block)
+        self.assertNotIn("os.kill(int(pid), 0)", win_block)
+        # The POSIX branch keeps the signal-0 probe.
+        self.assertIn("os.kill(int(pid), 0)", src[posix_def:])
 
 
 if __name__ == "__main__":

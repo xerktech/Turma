@@ -1033,13 +1033,69 @@ def _port_open(port, host="127.0.0.1", timeout=0.3):
         return False
 
 
-def _pid_alive(pid):
-    """Whether a pid is a live process (signal 0 probes without delivering)."""
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
+if IS_WINDOWS:
+    import ctypes as _ctypes
+
+    _kernel32 = _ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.OpenProcess.restype = _ctypes.c_void_p
+    _kernel32.OpenProcess.argtypes = [_ctypes.c_uint32, _ctypes.c_int, _ctypes.c_uint32]
+    _kernel32.WaitForSingleObject.restype = _ctypes.c_uint32
+    _kernel32.WaitForSingleObject.argtypes = [_ctypes.c_void_p, _ctypes.c_uint32]
+    _kernel32.CloseHandle.argtypes = [_ctypes.c_void_p]
+    # SYNCHRONIZE is the ONLY right WaitForSingleObject needs; asking for
+    # PROCESS_QUERY_LIMITED_INFORMATION instead makes the wait fail (a live
+    # process then reads as dead). Keep the mask minimal.
+    _SYNCHRONIZE = 0x00100000
+    _WAIT_TIMEOUT = 0x00000102
+    _ERROR_ACCESS_DENIED = 5
+
+    def _pid_alive(pid):
+        """Whether a pid is a live process, delivering NOTHING to it.
+
+        On POSIX `os.kill(pid, 0)` is the classic signal-less liveness probe. On
+        Windows it is neither safe nor reliable as one, and HOW it fails is
+        CPython-version-dependent:
+          * on older CPython, `os.kill` maps to `TerminateProcess(handle, sig)`
+            for every signal but CTRL_C_EVENT/CTRL_BREAK_EVENT, so signal 0
+            *terminates* the target (exit code 0);
+          * on Python 3.14 (this host, gh-58685) signal 0 no longer terminates,
+            but the call still opens the process for access it can be DENIED on a
+            detached, task-engine-parented pty-host -- so it raises and misreports
+            the live process as dead.
+        Either failure breaks `resume_on_boot`: its adopt-vs-resume check
+        (`_tmux_alive -> _pty_alive -> _pid_alive`) read the pty-host that had
+        correctly survived the service stop as dead (and, on the terminating
+        CPythons, killed it), so the manager resumed it from scratch instead of
+        adopting the live process (XERK-701; host-verified -- before this fix a
+        restart RESUMED, after it ADOPTS with pids identical). Open a minimal
+        SYNCHRONIZE handle and read whether the process object is signaled
+        instead (WAIT_TIMEOUT == still running); a live process we merely lack
+        rights on reports ACCESS_DENIED, treated as alive. Nothing is delivered to
+        the process on any CPython version. The POSIX branch keeps the
+        `os.kill(pid, 0)` probe unchanged."""
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid <= 0:
+            return False
+        h = _kernel32.OpenProcess(_SYNCHRONIZE, False, pid)
+        if not h:
+            # No handle: a live process we merely lack rights on reports
+            # ACCESS_DENIED (it EXISTS); a truly-gone pid reports otherwise.
+            return _ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+        try:
+            return _kernel32.WaitForSingleObject(h, 0) == _WAIT_TIMEOUT
+        finally:
+            _kernel32.CloseHandle(h)
+else:
+    def _pid_alive(pid):
+        """Whether a pid is a live process (signal 0 probes without delivering)."""
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except (OSError, TypeError, ValueError):
+            return False
 
 
 # --- leaked Claude Code inbox sockets (XERK-341) -------------------------------
@@ -9411,6 +9467,81 @@ PTY_SPAWN_TIMEOUT_SEC = _env_float("PTY_SPAWN_TIMEOUT_SEC", 15.0, minimum=1.0)
 # The node runtime the pty-host runs under; the Windows launcher puts it on PATH.
 PTY_NODE_EXE = os.environ.get("TURMA_NODE_EXE", "node")
 
+# Windows: run as `python <this> <spec.json>` from a one-shot Scheduled Task, so the pty-host is a
+# child of the TASK ENGINE, not of the manager -- outside the WinSW service's job AND process tree,
+# the only way it survives a service restart/self-update for the next boot to re-adopt (XERK-701;
+# host-verified that launching it under the manager, even job-broken-away + orphaned, was still
+# killed by WinSW 2.12's teardown). Reads the pty-host argv/env/cwd/log from the JSON spec so the
+# multi-line claude argv needs no schtasks /tr quoting, then Popens it detached and exits; any spawn
+# error is written to the pty-host log, never swallowed.
+_PTY_TASK_SPAWNER = r"""
+import sys, os, json, subprocess
+spec = sys.argv[1]
+d = json.load(open(spec, encoding='utf-8'))
+try:
+    os.remove(spec)
+except OSError:
+    pass
+try:
+    lf = open(d['log'], 'ab') if d.get('log') else subprocess.DEVNULL
+except OSError:
+    lf = subprocess.DEVNULL
+try:
+    subprocess.Popen(d['argv'], cwd=d['cwd'], env=d['env'], stdin=subprocess.DEVNULL,
+                     stdout=lf, stderr=lf, close_fds=True,
+                     creationflags=getattr(subprocess, 'DETACHED_PROCESS', 0)
+                                   | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0))
+except Exception as e:
+    try:
+        lf.write(('pty-host spawn failed: %r\n' % (e,)).encode())
+    except Exception:
+        pass
+"""
+
+
+def _pty_task_name(tmux_name):
+    return f"turma-pty-{tmux_name}"
+
+
+def _pty_task_cleanup(tmux_name):
+    """Remove a session's one-shot pty-host task + its .cmd wrapper. The task launches an
+    INSTANCE that keeps running after the definition is deleted, so this is safe once the run has
+    been triggered; also called on teardown/timeout. Best-effort."""
+    run(["schtasks", "/delete", "/tn", _pty_task_name(tmux_name), "/f"])
+    try:
+        os.remove(os.path.join(PTY_HOST_DIR, f"{tmux_name}.spawn.cmd"))
+    except OSError:
+        pass
+
+
+def _launch_pty_via_task(tmux_name, argv, cwd, env, log_path):
+    """Windows: start the pty-host through a one-shot Scheduled Task (see _PTY_TASK_SPAWNER) so it
+    lands OUTSIDE the WinSW service's job and process tree and survives a restart. Raises
+    RuntimeError if the task can't be created or run; the caller cleans the task up after the
+    pty-host publishes its state (or on timeout)."""
+    spec = os.path.join(PTY_HOST_DIR, f"{tmux_name}.spawn.json")
+    spawner = os.path.join(PTY_HOST_DIR, "pty-spawn.py")
+    cmdfile = os.path.join(PTY_HOST_DIR, f"{tmux_name}.spawn.cmd")
+    task = _pty_task_name(tmux_name)
+    with open(spec, "w", encoding="utf-8") as f:
+        json.dump({"argv": argv, "cwd": cwd, "env": env, "log": log_path}, f)
+    restrict_file_to_owner(spec)   # the spec's env dict carries TURMA_TOKEN et al.
+    with open(spawner, "w", encoding="utf-8") as f:
+        f.write(_PTY_TASK_SPAWNER)
+    # A .cmd wrapper keeps schtasks /tr a single quoted path; it does the real quoting of the
+    # python/spawner/spec paths itself. CRLF so cmd.exe parses it.
+    with open(cmdfile, "w", encoding="utf-8", newline="") as f:
+        f.write(f'@echo off\r\n"{sys.executable}" "{spawner}" "{spec}"\r\n')
+    run(["schtasks", "/delete", "/tn", task, "/f"])   # clear a stale one first
+    rc, err = run_ok(["schtasks", "/create", "/tn", task, "/tr", cmdfile,
+                      "/sc", "ONCE", "/st", "00:00", "/f"])
+    if rc != 0:
+        raise RuntimeError(f"pty-host task create failed (rc={rc}): {err}")
+    rc, err = run_ok(["schtasks", "/run", "/tn", task])
+    if rc != 0:
+        _pty_task_cleanup(tmux_name)
+        raise RuntimeError(f"pty-host task run failed (rc={rc}): {err}")
+
 
 def _pty_state_path(tmux_name):
     """The pty-host state file for a session, keyed by its stable tmuxName (which
@@ -17345,52 +17476,59 @@ class SessionManager:
         ] + launcher + claude_argv
         env = dict(os.environ)
         env.update({k: str(v) for k, v in extra_env.items()})
-        # DETACHED so a manager restart (KillMode=process) leaves it running for
-        # the next boot to re-adopt; start_new_session is the POSIX equivalent,
-        # which also lets the forkpty backend exercise this path in a drive test.
-        popen_kw = {}
+        log_path = os.path.join(PTY_HOST_DIR, f"{tmux_name}.log")
+        # The pty-host must SURVIVE a WinSW service restart/self-update UNTOUCHED, for the next boot
+        # to re-adopt it from its state file (KillMode=process, ADR D1/D2). On Windows a process
+        # launched UNDER the manager -- even detached, job-broken-away and orphaned -- is still
+        # killed by WinSW 2.12's teardown (host-verified, XERK-701), so start it through a one-shot
+        # Scheduled Task: the pty-host becomes a child of the TASK ENGINE, outside WinSW's job AND
+        # process tree entirely. POSIX keeps the direct start_new_session spawn -- setsid already
+        # survives a KillMode=process systemd restart, and it lets the forkpty backend exercise this.
+        proc = None
         if IS_WINDOWS:
-            popen_kw["creationflags"] = (
-                getattr(subprocess, "DETACHED_PROCESS", 0)
-                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+            _launch_pty_via_task(tmux_name, cmd, sess["worktreePath"], env, log_path)
         else:
-            popen_kw["start_new_session"] = True
+            try:
+                logf = open(log_path, "ab")
+            except OSError:
+                logf = subprocess.DEVNULL
+            try:
+                proc = subprocess.Popen(
+                    cmd, cwd=sess["worktreePath"], env=env,
+                    stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                    close_fds=True, start_new_session=True)
+            except Exception as e:
+                raise RuntimeError(f"pty-host launch failed: {e}")
+            finally:
+                if logf not in (subprocess.DEVNULL, None):
+                    try:
+                        logf.close()
+                    except OSError:
+                        pass
+        # A started process is not proof it bound its ports — wait for the state file the pty-host
+        # writes once BOTH servers are listening, the analog of confirming a `tmux new-session`
+        # actually came up. Either way clean up the one-shot task afterwards (the launched instance
+        # keeps running; deleting the task definition does not touch it).
         try:
-            logf = open(os.path.join(PTY_HOST_DIR, f"{tmux_name}.log"), "ab")
-        except OSError:
-            logf = subprocess.DEVNULL
-        try:
-            proc = subprocess.Popen(
-                cmd, cwd=sess["worktreePath"], env=env,
-                stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
-                close_fds=True, **popen_kw)
-        except Exception as e:
-            raise RuntimeError(f"pty-host launch failed: {e}")
+            deadline = time.time() + PTY_SPAWN_TIMEOUT_SEC
+            while time.time() < deadline:
+                st = _pty_read_state(tmux_name)
+                if st and st.get("ctrlPort") and st.get("termPort"):
+                    sess["ttydPid"] = st.get("pid")   # reaped like a ttyd pid on kill
+                    return
+                time.sleep(0.1)
         finally:
-            if logf not in (subprocess.DEVNULL, None):
-                try:
-                    logf.close()
-                except OSError:
-                    pass
-        # A started process is not proof it bound its ports — wait for the state
-        # file the pty-host writes once BOTH servers are listening, the analog of
-        # confirming a `tmux new-session` actually came up.
-        deadline = time.time() + PTY_SPAWN_TIMEOUT_SEC
-        while time.time() < deadline:
-            st = _pty_read_state(tmux_name)
-            if st and st.get("ctrlPort") and st.get("termPort"):
-                sess["ttydPid"] = st.get("pid")   # reaped like a ttyd pid on kill
-                return
-            time.sleep(0.1)
-        # It started but never published bound ports. _pty_teardown reaps it ONLY
-        # if a state file with a pid exists; a process that wrote nothing (or a
-        # partial state) would otherwise be ORPHANED — holding ttydPort so the
-        # next launch can't rebind — since a bare detached Popen has no tmux
-        # backstop. Terminate the handle we captured directly, then clean up.
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+            if IS_WINDOWS:
+                _pty_task_cleanup(tmux_name)
+        # It never published bound ports. Reap: POSIX terminates the handle it holds (covers a
+        # process that wrote nothing); Windows has no handle (the task-launched pty-host is not our
+        # child), so _pty_teardown reaps by the state-file pid if one was published. A pty-host that
+        # wrote nothing crashed on its own (the spawner logged the error to the .log).
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
         _pty_teardown(tmux_name)
         raise RuntimeError(
             "pty-host did not publish its terminal within "
