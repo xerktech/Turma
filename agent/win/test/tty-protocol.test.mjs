@@ -248,3 +248,15 @@ test('TerminalGrid handles erase, scroll region and resize without throwing', ()
   g.write('\x1b[2J\x1b[Hafter');                  // the app's post-SIGWINCH repaint
   assert.equal(g.capture(), 'after');
 });
+
+test('a never-terminating escape does not grow pending without bound (untrusted output)', () => {
+  const g = new T.TerminalGrid(20, 5);
+  // An OSC with no ST, then a CSI with endless params — both incomplete forever.
+  for (let i = 0; i < 20; i++) g.write('\x1b]' + 'A'.repeat(50000));
+  assert.ok(g._pending.length <= 65536 + 50000, 'pending is bounded');
+  for (let i = 0; i < 20; i++) g.write('\x1b[' + '1;'.repeat(50000));
+  assert.ok(g._pending.length <= 65536 + 100000, 'pending stays bounded');
+  // Still usable afterwards.
+  g.write('\x1b[2J\x1b[Hok');
+  assert.equal(g.capture(), 'ok');
+});

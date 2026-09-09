@@ -221,6 +221,11 @@ export class ScrollbackRing {
 // emits for nearly every token — resyncs the column, so a width miscount inside
 // one segment is bounded and corrected at the next move (why a width-1 cell model
 // suffices for the marker/mode/prompt scans).
+//
+// pty output is UNTRUSTED: a malformed escape that never terminates (unbounded
+// CSI params, an OSC with no ST) must not grow the split-escape carry without
+// bound — past this cap the stuck prefix is dropped as garbage.
+const PENDING_MAX = 65536;
 export class TerminalGrid {
   constructor(cols = 80, rows = 24) {
     this.cols = Math.max(1, cols | 0);
@@ -264,6 +269,11 @@ export class TerminalGrid {
     const s = this._pending + (typeof data === 'string' ? data : this._decoder.decode(data, { stream: true }));
     const consumed = this._process(s);
     this._pending = s.slice(consumed);
+    // pty output is UNTRUSTED (a session can echo crafted bytes). A malformed
+    // escape that never terminates (unbounded CSI params, an OSC with no ST)
+    // would otherwise grow _pending without bound. A real control sequence is
+    // short, so past the cap the stuck prefix is garbage — drop it.
+    if (this._pending.length > PENDING_MAX) this._pending = '';
   }
 
   // Process as much of `s` as forms COMPLETE tokens; return the index consumed.
