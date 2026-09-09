@@ -6329,8 +6329,7 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
             self.run_ok_calls.append(cmd)
             return 1, "tmux: command not found"
 
-        with mock.patch.object(ha, "run_ok", failing_launch), \
-             mock.patch.object(ha, "LIMITS_PROBE_TRUST_SEC", 0):
+        with mock.patch.object(ha, "run_ok", failing_launch):
             sm._run_limits_probe(os.path.join(self.tmp, "limits-settings.json"))
         self.assertEqual(sm._limits_probe_backoff, ha.LIMITS_PROBE_RETRY_SEC)
 
@@ -6340,7 +6339,7 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # happens to be due.
         sm = self.make_manager()
         with mock.patch.object(ha, "LIMITS_PROBE_TIMEOUT_SEC", 0), \
-             mock.patch.object(ha, "LIMITS_PROBE_TRUST_SEC", 0):
+             mock.patch.object(ha, "_answer_trust_dialog", return_value=True):
             sm._run_limits_probe(os.path.join(self.tmp, "limits-settings.json"))
         kills = [i for i, c in enumerate(self.run_calls)
                  if c == ["tmux", "kill-session", "-t", ha.LIMITS_TMUX]]
@@ -6384,9 +6383,17 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
 
     def test_the_probe_runs_a_throwaway_claude_in_its_own_tmux(self):
         sm = self.make_manager()
+        trust = []
         with mock.patch.object(ha, "LIMITS_PROBE_TIMEOUT_SEC", 0), \
-             mock.patch.object(ha, "LIMITS_PROBE_TRUST_SEC", 0):
+             mock.patch.object(ha, "_answer_trust_dialog",
+                               side_effect=lambda n: trust.append(n) or True):
             sm._run_limits_probe(os.path.join(self.tmp, "limits-settings.json"))
+        # It NAVIGATED the trust-folder modal on its own tmux (XERK-709), the SAME
+        # OS-general helper the ConPTY path uses — never a blind send-keys Enter,
+        # which current Claude Code would read as "No, exit" and use to EXIT.
+        self.assertEqual(trust, [ha.LIMITS_TMUX])
+        self.assertNotIn(["tmux", "send-keys", "-t", ha.LIMITS_TMUX, "Enter"],
+                         self.run_calls)
         launch = [c for c in self.run_ok_calls if c[:2] == ["tmux", "new-session"]]
         self.assertEqual(len(launch), 1)
         cmd = launch[0][-1]

@@ -149,11 +149,12 @@ the bare POSIX form** (it raises at call time on Windows Python, exactly like `o
     written — the whole "no rate limits before the timeout" symptom on a fresh host). `_answer_trust_dialog`
     reads the rendered pane, finds the cursor (`❯`) line and the accept-option line, and STEPS the
     cursor to accept before Enter (default-position-agnostic); it no-ops when there is no modal (an
-    already-trusted dir just runs the positional prompt). The Windows probe POLLS for it over a startup
-    window (it lags claude's cold start). The Linux tmux path's single Enter is unchanged — it only
-    works because current Linux hosts trusted `~/.turma` long ago when the default was "Yes"; a fresh
-    Linux host would hit the same modal (XERK-709 — wire the same `_answer_trust_dialog` into the tmux
-    path once a fresh-Linux repro is available to verify against).
+    already-trusted dir just runs the positional prompt). **BOTH probe paths POLL for it** over a
+    startup window (it lags claude's cold start) — the ConPTY path and, since XERK-709, the Linux tmux
+    path (`_run_limits_probe`), which previously blind-Enter'd and only worked because current Linux
+    hosts trusted `~/.turma` long ago when the default was "Yes"; a FRESH Linux host hit the same
+    "No, exit" modal. `_answer_trust_dialog` is OS-general (`_capture_pane`/`_pane_send_keys` dispatch
+    per-OS), so the two paths share it verbatim. Verified against real Claude Code 2.1.263 on Linux.
   - **`_pty_spawn_and_wait` is the ONE ConPTY-spawn choke point** — session launch (`_spawn_pty_host`)
     and this probe both go through it (detached spawn via the one-shot Scheduled Task, wait for bound
     ports, reap on timeout), so neither grows a second copy. Do NOT re-inline the spawn dance.

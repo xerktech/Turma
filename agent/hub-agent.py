@@ -13903,13 +13903,12 @@ LIMITS_PROBE_TIMEOUT_SEC = _env_int("TURMA_LIMITS_PROBE_TIMEOUT_SEC", 120)
 # every beat forever, chasing a number it will never have.
 LIMITS_PROBE_RETRY_SEC = _env_int("TURMA_LIMITS_PROBE_RETRY_SEC", 900)
 LIMITS_PROBE_MAX_BACKOFF_SEC = _env_int("TURMA_LIMITS_PROBE_MAX_BACKOFF_SEC", 21600)
-LIMITS_PROBE_TRUST_SEC = 4  # let the TUI paint before answering its trust dialog
-# The Windows probe drives claude in a ConPTY (no tmux), so it answers the
-# trust-folder modal by POLLING the pane and navigating to the accept option
-# rather than blind-Enter'ing after a fixed wait (XERK-704 — the modal's default
-# is 'No, exit', so a bare Enter EXITS the probe). Poll for up to WAIT_SEC (the
-# modal lags claude's cold start) every POLL_SEC; on an already-trusted dir the
-# modal never shows and the positional prompt just runs, so the loop ends early.
+# Both probe paths (tmux and ConPTY) answer the trust-folder modal by POLLING the
+# pane and navigating to the accept option rather than blind-Enter'ing after a
+# fixed wait (XERK-704/XERK-709 — the modal's default is 'No, exit', so a bare
+# Enter EXITS the probe). Poll for up to WAIT_SEC (the modal lags claude's cold
+# start) every POLL_SEC; on an already-trusted dir the modal never shows and the
+# positional prompt just runs, so the loop ends early.
 LIMITS_PROBE_TRUST_WAIT_SEC = _env_int("TURMA_LIMITS_PROBE_TRUST_WAIT_SEC", 25)
 LIMITS_PROBE_TRUST_POLL_SEC = _env_float("TURMA_LIMITS_PROBE_TRUST_POLL_SEC", 1.5)
 
@@ -25272,13 +25271,25 @@ class SessionManager:
             return
         ok = False
         try:
-            # One Enter, once: a directory claude has never been trusted in
-            # opens a "do you trust this folder" dialog whose default is Yes, and
-            # nothing else happens until it's answered — the turn never runs, so
-            # the snapshot never lands. On an already-trusted dir this presses
-            # Enter on an empty composer, which does nothing.
-            time.sleep(LIMITS_PROBE_TRUST_SEC)
-            run(["tmux", "send-keys", "-t", LIMITS_TMUX, "Enter"])
+            # Answer the trust-folder modal if/when it paints — NAVIGATED, never a
+            # blind Enter (XERK-709): a directory claude has never been trusted in
+            # opens a "do you trust this folder" dialog whose default is now
+            # 'No, exit' on current Claude Code, so a bare Enter EXITS the probe and
+            # the turn never runs — no snapshot lands. Current Linux hosts trusted
+            # ~/.turma long ago (when the default was accept) so this no-ops there,
+            # but a FRESH Linux host hits the same modal Windows did. Same poll +
+            # OS-general _answer_trust_dialog the ConPTY path uses: on a fresh host
+            # the modal lags claude's cold start; an already-trusted dir shows none
+            # and the positional prompt just runs, so the loop ends once a snapshot
+            # lands.
+            trust_deadline = time.time() + LIMITS_PROBE_TRUST_WAIT_SEC
+            while time.time() < trust_deadline:
+                if _answer_trust_dialog(LIMITS_TMUX):
+                    break
+                snap = read_limits_snapshot()
+                if snap and snap.get("capturedAt", 0) >= started:
+                    break        # already trusted; the turn ran without a modal
+                time.sleep(LIMITS_PROBE_TRUST_POLL_SEC)
             ok = self._await_limits_snapshot(started)
         finally:
             self._kill_limits_probe()
