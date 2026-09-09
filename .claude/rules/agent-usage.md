@@ -109,6 +109,9 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
   runs an interactive claude in its own tmux (`LIMITS_TMUX`) on a daemon thread (print mode never
   invokes a statusLine, so it can't be a `claude -p` one-shot) and kills it once the snapshot lands.
   cwd `REGISTRY_DIR` → tombstoned as internal overhead.
+  - **On native Windows there is no tmux, so it runs in a ConPTY pty-host instead** (XERK-704,
+    `_run_limits_probe_windows`, the XERK-668/697 terminal layer) — same cost/shape and the same
+    snapshot poll, only the launch/keypress/kill mechanism differs. `.claude/rules/windows-agent.md`.
 - The probe is **a real turn billed against the windows it measures** (~36k tokens, mostly cache) —
   sized down (cheapest model, minimal system prompt, `--strict-mcp-config`) and spent sparingly: only
   with no snapshot at all, or once one ages past `LIMITS_PROBE_SEC` **and a session is actually

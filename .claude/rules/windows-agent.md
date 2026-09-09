@@ -130,13 +130,24 @@ the bare POSIX form** (it raises at call time on Windows Python, exactly like `o
   SIGUSR1, so registering the handler raised. The tunnel's heartbeat poke is a no-op on Windows
   (tunnel-agent.js portability), so there is no signal to install; the manager beats on its normal
   interval. SIGTERM/SIGINT exist on Windows and stay unguarded.
-- **The subscription `_start_limits_probe` no-ops on Windows** — it shells `tmux` (`WinError 2`), a
-  self-contained TTY probe the ConPTY session terminal layer (XERK-668) does not cover. Degrades to
-  no `limits` block ("can't tell"), like the cc-socks sweep and container-log tail. `os.getuid` and
-  the `/proc` reads stay unreached on Windows behind their existing `/proc/self` guard.
+- **The subscription-limits probe RUNS on Windows via the ConPTY pty-host** (XERK-704, superseding the
+  XERK-678 no-op). It needs a real interactive claude on a TTY (print mode never invokes a statusLine),
+  which tmux gave POSIX; on Windows `_run_limits_probe_windows` runs the SAME throwaway probe claude in
+  a pty-host (the XERK-668/697 terminal layer) with an EPHEMERAL terminal port nobody proxies
+  (`--term-port 0`), drives its trust-dialog Enter over the control channel (`_pane_send_keys`), polls
+  the same snapshot (`_await_limits_snapshot`), and tears it down (`_kill_limits_probe` →
+  `_pty_teardown`). Without it a native Windows host reported no `limits` block and its Claude
+  subscription showed no usage card — the OPPOSITE degradation from the cc-socks sweep, since a whole
+  subscription's card vanishes. `os.getuid` and the `/proc` reads stay unreached on Windows behind
+  their existing `/proc/self` guard.
+  - **`_pty_spawn_and_wait` is the ONE ConPTY-spawn choke point** — session launch (`_spawn_pty_host`)
+    and this probe both go through it (detached spawn via the one-shot Scheduled Task, wait for bound
+    ports, reap on timeout), so neither grows a second copy. Do NOT re-inline the spawn dance.
 - Tests: `TestReadUntrustedJson` (the FIFO refusal proves the guarded `os.open` still works),
   `TestWindowsManagerBoot` (SIGUSR1 installed on POSIX, skipped under mocked `IS_WINDOWS` — inverting
-  the guard must fail a test), `TestLimitsSnapshot.test_the_probe_no_ops_on_windows` (probe skip).
+  the guard must fail a test), and the Windows probe cases in `TestLimitsSnapshot`
+  (`test_the_probe_runs_in_a_pty_host_on_windows`, `test_a_windows_probe_that_cannot_launch_backs_off`,
+  `test_kill_limits_probe_tears_down_the_pty_host_on_windows`).
 
 ## Liveness & degradation (already hold — do not regress)
 
