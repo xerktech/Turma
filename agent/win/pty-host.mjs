@@ -99,6 +99,11 @@ const term = pty.spawn(CMD, CMD_ARGS, {
 });
 
 const ring = new T.ScrollbackRing(RING_MAX);
+// The rendered-screen grid the control `capture` reads (XERK-703). The ring above
+// is raw bytes over time and loses Claude Code's paint-once interrupt-hint footer
+// once a turn streams past its window (false-idle); the grid is fed EVERY byte and
+// keeps the footer as a persistent screen element, the `capture-pane -p` analog.
+const grid = new T.TerminalGrid(COLS, ROWS);
 const termClients = new Set();
 let ptyAlive = true;
 let exitCode = null;
@@ -106,6 +111,7 @@ let exitCode = null;
 term.onData((d) => {
   const buf = Buffer.from(d, 'utf8');
   ring.append(buf);
+  grid.write(buf);
   const frame = T.outputFrame(buf);
   for (const ws of termClients) if (ws.readyState === ws.OPEN) ws.send(frame);
 });
@@ -122,9 +128,11 @@ term.onExit(({ exitCode: code }) => {
 // ---- pty adapter for the pure control handler --------------------------------
 const adapter = {
   write: (s) => term.write(s),
-  resize: (c, r) => { try { term.resize(c, r); } catch { /* pty may have exited */ } },
+  resize: (c, r) => { try { term.resize(c, r); grid.resize(c, r); } catch { /* pty may have exited */ } },
   kill: () => { try { term.kill(); } catch { /* already dead */ } },
-  capture: () => ring.text(),
+  // The RENDERED visible screen (tmux capture-pane -p analog), not the raw ring —
+  // so `_busy_from_capture`'s marker scan sees the persistent footer (XERK-703).
+  capture: () => grid.capture(),
   get pid() { return process.pid; },
   get ptyPid() { return term.pid; },
   get alive() { return ptyAlive; },

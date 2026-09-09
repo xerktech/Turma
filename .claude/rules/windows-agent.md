@@ -40,10 +40,12 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
   prompt a positional after `--`. Keep `--settings` (wires the guard + AskUserQuestion bridge).
 - **`_windows_claude_launcher` resolves `.exe` (argv-spawn) vs `.cmd` (`cmd.exe /c claude`)** via
   `shutil.which` (PATHEXT). The npm shim is not CreateProcess-spawnable, hence the `cmd.exe` wrap.
-- **`capture` returns the RAW scrollback ring**, so `_busy_from_capture`'s `esc to interrupt` scan is
-  an accepted approximation on Windows (the markers survive as substrings); details + the pane-drive
-  keystroke map (`_pane_send_keys`: Escape/BTab/Up/Down/… → terminal bytes for interrupt/set_mode/
-  set_model/answer_pane_prompt) in `windows-terminal.md`.
+- **`capture` returns the RENDERED screen grid** (`TerminalGrid`, XERK-703), so `_busy_from_capture`'s
+  `esc to interrupt` scan reads the persistent footer exactly as on Linux — NOT the raw ring, whose
+  byte-time-tail loses Claude's paint-once footer mid-turn and read a working session IDLE (the
+  false-idle that fired the "you have uncommitted work" nudge). Details + the pane-drive keystroke map
+  (`_pane_send_keys`: Escape/BTab/Up/Down/… → terminal bytes for interrupt/set_mode/set_model/
+  answer_pane_prompt) in `windows-terminal.md`.
 - **Deps + lay-down are `install.ps1`'s** (node-pty + ws into `<base>\win\node_modules`, beside
   `pty-host.mjs` at `<base>\win\`). Detached spawn = `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP`
   (KillMode=process analog); `start_new_session` on POSIX lets the forkpty backend exercise the path.

@@ -45,12 +45,15 @@ capture/persistence), not just the ws bridge.
 
 ## Pure protocol vs. I/O shell — the split is a CI constraint, not style
 
-- **`agent/win/tty-protocol.mjs` owns every wire/auth/framing DECISION and imports
-  NO I/O** (no node-pty, no ws, no http, no fs writes). `code-scan.yml` runs its
-  tests with `node --test` and **installs zero npm deps** (node-pty is a native
-  addon CI cannot build), so anything CI must check lives here. This mirrors how
-  `server.js` hand-rolls its WS framing and the dsh guard splits pure `*.test.mjs`
-  from host-proof drives.
+- **`agent/win/tty-protocol.mjs` owns every wire/auth/framing DECISION plus the
+  `TerminalGrid` screen emulator (XERK-703), and imports NO I/O** (no node-pty, no
+  ws, no http, no fs writes). `code-scan.yml` runs its tests with `node --test` and
+  **installs zero npm deps** (node-pty is a native addon CI cannot build), so
+  anything CI must check lives here — which is WHY `TerminalGrid` is hand-rolled
+  dep-free rather than pulling `@xterm/headless` into the I/O shell (that would put
+  the terminal LOGIC where CI cannot reach it, and add a runtime dep the self-updater
+  does not rebuild). This mirrors how `server.js` hand-rolls its WS framing and the
+  dsh guard splits pure `*.test.mjs` from host-proof drives.
 - **`agent/win/pty-host.mjs` is only the node-pty + ws + http around it** — never
   imported by CI, only run. Keep new protocol logic in the pure module with a test,
   not in the shell.
@@ -81,12 +84,22 @@ capture/persistence), not just the ws bridge.
   wired — **the manager-side seam is `.claude/rules/windows-agent.md` ("The
   terminal seam IS wired")**. Do not add a second Windows branch into the tmux
   paths outside those `IS_WINDOWS` dispatches.
-- **`capture` returns the raw scrollback RING, not a rendered grid.** `_busy_from_
-  capture` reads the *rendered* pane today; on Windows it scans that raw ring, and
-  the plain-text markers it looks for (`esc to interrupt`) survive as contiguous
-  substrings, so busy detection works as an ACCEPTED APPROXIMATION. Byte-for-byte
-  parity would need a headless emulator (`@xterm/headless`) in the pty-host to
-  render the ring — the ADR open question, still NOT built.
+- **`capture` returns the RENDERED screen grid (`TerminalGrid`), not the raw ring
+  (XERK-703).** The raw scrollback ring is bytes over TIME, and Claude Code paints
+  its `esc to interrupt` footer ONCE per turn then updates the spinner in place, so
+  a turn that streams past the ring's byte window pushes the sole marker out of the
+  tail and `_busy_from_capture` reads a working session IDLE (the false-idle that
+  fired the "you have uncommitted work" nudge). `TerminalGrid` is a minimal VT
+  emulator in the pure module, fed EVERY pty byte, returning the visible screen as
+  plain text — the `tmux capture-pane -p` analog, where the footer is a persistent
+  element regardless of when it was painted. The ring is KEPT, but only for the ws
+  REPLAY on re-attach (raw bytes are what xterm.js wants); `capture` no longer reads
+  it. This is the headless-emulator the ADR flagged, hand-rolled dep-free (so it
+  stays in the CI-tested pure module) and validated BYTE-FOR-BYTE against
+  `@xterm/headless` on real captured Claude output (`test/fixtures/`), a
+  development-only oracle, not a CI dep. The emulator covers exactly the escape
+  subset Claude emits; per-word absolute `\x1b[NG` repositioning resyncs the column
+  so a width miscount in one segment self-corrects at the next move.
 - Control is loopback + a `?token=<token>` shared secret (defence in depth); the
   manager holds the token and reads `ctrlPort` from the state file.
 - **The pty-host REFUSES to start without `--auth-token`** — unlike ttyd's optional
@@ -109,7 +122,10 @@ to undo here. Detail: `agent/win/README.md`.
 
 - CI: `agent/win/test/tty-protocol.test.mjs` (stdlib only) — pins the command
   bytes against the capture, the auth/`/token`/prefs/redirect/ring/state/control
-  logic, and the vendored-client hub-integration anchors.
+  logic, the vendored-client hub-integration anchors, and `TerminalGrid` against
+  real captured Claude output (`test/fixtures/`, XERK-703): a mid-turn render reads
+  BUSY where the raw ring tail reads idle, chunk-boundary stability, and dialog
+  rendering.
 - Host proof: `agent/win/drive.mjs` (`npm run drive`) — spawn (via a spawner that
   exits, proving the child outlives it) → HTTP surface (302/index/token/auth) →
   attach/detach/reattach with scrollback → control → adopt-from-state → teardown.
