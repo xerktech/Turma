@@ -199,7 +199,12 @@ function feed(bytes, cols, rows, chunk) {
 
 test('a working turn reads BUSY off the rendered grid where the raw ring reads idle', () => {
   // Mid-turn: the model is still streaming. The interrupt hint was painted at the
-  // very start and has long since scrolled out of a bounded raw byte window.
+  // very start and scrolls out of a bounded raw byte window once enough streams
+  // past it. The production ring is 256 KiB (pty-host.mjs RING_MAX), so the real
+  // trigger is a turn streaming >256 KiB past the paint-once marker; this uses a
+  // reduced 20 KiB window on the compact real-capture fixture to demonstrate the
+  // SAME mechanism (marker outside the window -> the ring scan reads idle, the
+  // full-stream grid still reads busy) without shipping a 300 KiB fixture.
   const mid = WORKING.subarray(0, 30000);
   const ringTail = mid.subarray(mid.length - 20000).toString('utf8');   // what capture returned before
   assert.ok(!ringTail.includes('esc to interrupt'),
