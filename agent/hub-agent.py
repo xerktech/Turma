@@ -9244,12 +9244,13 @@ def _capture_pane(tmux_name):
     (tmux gone, timeout).
 
     On Windows there is no tmux: the session's terminal is the per-session
-    ConPTY pty-host (XERK-668), and `capture` reads its scrollback RING over the
-    control channel (XERK-697). The ring is RAW pty output with ANSI still in
-    it, not a rendered grid — good enough for `_busy_from_capture`'s plain-text
-    marker scan (the "esc to interrupt" footer survives as a contiguous
-    substring), an accepted approximation the ADR flags for a headless-emulator
-    follow-up."""
+    ConPTY pty-host (XERK-668), and `capture` reads its RENDERED SCREEN GRID over
+    the control channel (XERK-703) — the pty-host's `TerminalGrid` emulator
+    returns the visible screen as plain text, the tmux `capture-pane -p` analog.
+    (It used to return the raw scrollback ring, but Claude Code paints the "esc to
+    interrupt" footer once per turn and updates the spinner in place, so a turn
+    that streamed past the ring's byte window lost the marker and read the working
+    session IDLE.) So this reads the same rendered-pane shape on both OSes."""
     if IS_WINDOWS:
         return _pty_capture(tmux_name)
     if not tmux_name:

@@ -179,3 +179,89 @@ test('vendored ttyd client keeps every hub-integration anchor', () => {
   assert.ok(html.includes('window.location.pathname'), 'base-path-agnostic (served under /term/<id>/)');
   assert.ok(html.includes('AuthToken'), 'the ws init credential field');
 });
+
+// ---- TerminalGrid: the rendered-screen capture (XERK-703) --------------------
+// The bug: Claude Code paints its "esc to interrupt" footer ONCE per turn and
+// updates the spinner in place, so the RAW scrollback ring loses the marker once
+// a turn streams past its byte window and `_busy_from_capture` reads a working
+// session IDLE (firing the "you have uncommitted work" nudge). TerminalGrid
+// renders the ring into the visible grid (the tmux capture-pane -p analog) where
+// the footer is a persistent element. Driven against REAL captured Claude output
+// (fixtures/, provenance there); the grid is fed EVERY byte, not the ring tail.
+const WORKING = readFileSync(join(HERE, 'fixtures', 'claude-working-turn.raw'));
+const DIALOG = readFileSync(join(HERE, 'fixtures', 'claude-trust-dialog.raw'));
+
+function feed(bytes, cols, rows, chunk) {
+  const g = new T.TerminalGrid(cols, rows);
+  for (let i = 0; i < bytes.length; i += chunk) g.write(bytes.subarray(i, i + chunk));
+  return g;
+}
+
+test('a working turn reads BUSY off the rendered grid where the raw ring reads idle', () => {
+  // Mid-turn: the model is still streaming. The interrupt hint was painted at the
+  // very start and scrolls out of a bounded raw byte window once enough streams
+  // past it. The production ring is 256 KiB (pty-host.mjs RING_MAX), so the real
+  // trigger is a turn streaming >256 KiB past the paint-once marker; this uses a
+  // reduced 20 KiB window on the compact real-capture fixture to demonstrate the
+  // SAME mechanism (marker outside the window -> the ring scan reads idle, the
+  // full-stream grid still reads busy) without shipping a 300 KiB fixture.
+  const mid = WORKING.subarray(0, 30000);
+  const ringTail = mid.subarray(mid.length - 20000).toString('utf8');   // what capture returned before
+  assert.ok(!ringTail.includes('esc to interrupt'),
+    'the raw ring tail has lost the paint-once footer — the false-idle bug');
+  const grid = feed(mid, 100, 40, mid.length).capture();
+  assert.ok(grid.includes('esc to interrupt'),
+    'the rendered grid keeps the footer as a persistent screen element');
+  // And the mode-footer glyph parse (parse_pane_mode) now has real text to read.
+  assert.ok(grid.includes('plan mode on'));
+});
+
+test('turn completion reads IDLE off the rendered grid (no false busy)', () => {
+  const grid = feed(WORKING, 100, 40, WORKING.length).capture();
+  assert.ok(!grid.includes('esc to interrupt'), 'the finished turn dropped the hint');
+  assert.ok(grid.includes('❯'), 'the idle prompt is back');   // the ❯ prompt
+});
+
+test('the rendered grid is stable across arbitrary pty chunk boundaries', () => {
+  // The pty delivers arbitrary chunks; an escape sequence split across two writes
+  // must not corrupt the grid. Every chunk size must produce the identical screen.
+  const whole = feed(WORKING, 100, 40, WORKING.length).capture();
+  for (const chunk of [1, 7, 13, 100, 4096]) {
+    assert.equal(feed(WORKING, 100, 40, chunk).capture(), whole, `chunk size ${chunk}`);
+  }
+});
+
+test('per-word cursor-positioned dialog text renders as readable lines', () => {
+  // Claude lays dialog words out with \x1b[NG column moves, not spaces — the raw
+  // stream has no contiguous phrases, so only the rendered grid can be parsed.
+  const grid = feed(DIALOG, 100, 40, DIALOG.length).capture();
+  assert.ok(grid.includes('Yes, I trust this folder'));
+  assert.ok(grid.includes('No, exit'));
+});
+
+test('TerminalGrid handles erase, scroll region and resize without throwing', () => {
+  const g = new T.TerminalGrid(20, 5);
+  g.write('\x1b[2J\x1b[H');                       // clear + home
+  g.write('line one\r\nline two');
+  assert.ok(g.capture().includes('line one'));
+  g.write('\x1b[1;3r');                           // a scroll region
+  g.write('\x1b[10;10H' + 'x'.repeat(50));        // out-of-range cursor + autowrap (no throw)
+  // Resize PRESERVES the overlapping region (no transient blank -> no false idle
+  // in the gap before the app's repaint).
+  g.resize(40, 10);
+  assert.ok(g.capture().includes('line one'), 'content survives a resize');
+  g.write('\x1b[2J\x1b[Hafter');                  // the app's post-SIGWINCH repaint
+  assert.equal(g.capture(), 'after');
+});
+
+test('a never-terminating escape does not grow pending without bound (untrusted output)', () => {
+  const g = new T.TerminalGrid(20, 5);
+  // An OSC with no ST, then a CSI with endless params — both incomplete forever.
+  for (let i = 0; i < 20; i++) g.write('\x1b]' + 'A'.repeat(50000));
+  assert.ok(g._pending.length <= 65536 + 50000, 'pending is bounded');
+  for (let i = 0; i < 20; i++) g.write('\x1b[' + '1;'.repeat(50000));
+  assert.ok(g._pending.length <= 65536 + 100000, 'pending stays bounded');
+  // Still usable afterwards.
+  g.write('\x1b[2J\x1b[Hok');
+  assert.equal(g.capture(), 'ok');
+});
