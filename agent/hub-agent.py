@@ -9802,6 +9802,76 @@ def _pty_teardown(tmux_name):
         pass
 
 
+def _pty_spawn_and_wait(tmux_name, cmd, cwd, env, log_path):
+    """Start a pty-host running `cmd` DETACHED and wait until it publishes its
+    state file with BOTH ports bound, returning the published pid — the analog of
+    a `tmux new-session` either coming up or failing.
+
+    Detached so it outlives a manager restart to be re-adopted from its state
+    file. Windows goes through a one-shot Scheduled Task (the pty-host becomes a
+    child of the task engine, outside WinSW's job — the only way it survives a
+    service restart/self-update, XERK-701); POSIX is a direct `start_new_session`
+    Popen (setsid survives a KillMode=process systemd restart, and lets the
+    forkpty backend exercise this path). Raises RuntimeError if claude/node is
+    missing or the pty-host never binds — reaping the orphan (POSIX: the handle;
+    Windows: by the state-file pid) and cleaning partial state either way.
+
+    The ONE ConPTY-spawn choke point: session launch (`_spawn_pty_host`) and the
+    subscription-limits probe on Windows (`_run_limits_probe`) both go through it,
+    so neither grows a second copy of the detached-spawn / wait / reap dance."""
+    _pty_teardown(tmux_name)                  # clean slate (tmux kill-session)
+    os.makedirs(PTY_HOST_DIR, exist_ok=True)
+    proc = None
+    if IS_WINDOWS:
+        _launch_pty_via_task(tmux_name, cmd, cwd, env, log_path)
+    else:
+        try:
+            logf = open(log_path, "ab")
+        except OSError:
+            logf = subprocess.DEVNULL
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=cwd, env=env,
+                stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                close_fds=True, start_new_session=True)
+        except Exception as e:
+            raise RuntimeError(f"pty-host launch failed: {e}")
+        finally:
+            if logf not in (subprocess.DEVNULL, None):
+                try:
+                    logf.close()
+                except OSError:
+                    pass
+    # A started process is not proof it bound its ports — wait for the state file
+    # the pty-host writes once BOTH servers are listening. Either way clean up the
+    # one-shot task afterwards (the launched instance keeps running; deleting the
+    # task definition does not touch it).
+    try:
+        deadline = time.time() + PTY_SPAWN_TIMEOUT_SEC
+        while time.time() < deadline:
+            st = _pty_read_state(tmux_name)
+            if st and st.get("ctrlPort") and st.get("termPort"):
+                return st.get("pid")
+            time.sleep(0.1)
+    finally:
+        if IS_WINDOWS:
+            _pty_task_cleanup(tmux_name)
+    # It never published bound ports. Reap: POSIX terminates the handle it holds
+    # (covers a process that wrote nothing); Windows has no handle (the
+    # task-launched pty-host is not our child), so _pty_teardown reaps by the
+    # state-file pid if one was published. A pty-host that wrote nothing crashed
+    # on its own (the spawner logged the error to the .log).
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    _pty_teardown(tmux_name)
+    raise RuntimeError(
+        "pty-host did not publish its terminal within "
+        f"{PTY_SPAWN_TIMEOUT_SEC:g}s (terminal failed to start)")
+
+
 def _read_env_file(path):
     """Parse a 0600 `KEY=VALUE` env file (write_local_model_env's output) into a
     dict, so a Windows launch can MERGE those vars into the pty-host's process env
@@ -17453,7 +17523,6 @@ class SessionManager:
         the clean launch failure the caller's error handling expects, in place of
         the `WinError 2` the unconditional `tmux`/`ttyd` calls used to throw."""
         tmux_name = sess["tmuxName"]
-        _pty_teardown(tmux_name)                 # clean slate (tmux kill-session)
         os.makedirs(PTY_HOST_DIR, exist_ok=True)
         state = _pty_state_path(tmux_name)
         launcher = _windows_claude_launcher()    # [claude.exe] or [cmd.exe /c claude]
@@ -17477,62 +17546,15 @@ class SessionManager:
         env = dict(os.environ)
         env.update({k: str(v) for k, v in extra_env.items()})
         log_path = os.path.join(PTY_HOST_DIR, f"{tmux_name}.log")
-        # The pty-host must SURVIVE a WinSW service restart/self-update UNTOUCHED, for the next boot
-        # to re-adopt it from its state file (KillMode=process, ADR D1/D2). On Windows a process
-        # launched UNDER the manager -- even detached, job-broken-away and orphaned -- is still
-        # killed by WinSW 2.12's teardown (host-verified, XERK-701), so start it through a one-shot
-        # Scheduled Task: the pty-host becomes a child of the TASK ENGINE, outside WinSW's job AND
-        # process tree entirely. POSIX keeps the direct start_new_session spawn -- setsid already
-        # survives a KillMode=process systemd restart, and it lets the forkpty backend exercise this.
-        proc = None
-        if IS_WINDOWS:
-            _launch_pty_via_task(tmux_name, cmd, sess["worktreePath"], env, log_path)
-        else:
-            try:
-                logf = open(log_path, "ab")
-            except OSError:
-                logf = subprocess.DEVNULL
-            try:
-                proc = subprocess.Popen(
-                    cmd, cwd=sess["worktreePath"], env=env,
-                    stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
-                    close_fds=True, start_new_session=True)
-            except Exception as e:
-                raise RuntimeError(f"pty-host launch failed: {e}")
-            finally:
-                if logf not in (subprocess.DEVNULL, None):
-                    try:
-                        logf.close()
-                    except OSError:
-                        pass
-        # A started process is not proof it bound its ports — wait for the state file the pty-host
-        # writes once BOTH servers are listening, the analog of confirming a `tmux new-session`
-        # actually came up. Either way clean up the one-shot task afterwards (the launched instance
-        # keeps running; deleting the task definition does not touch it).
-        try:
-            deadline = time.time() + PTY_SPAWN_TIMEOUT_SEC
-            while time.time() < deadline:
-                st = _pty_read_state(tmux_name)
-                if st and st.get("ctrlPort") and st.get("termPort"):
-                    sess["ttydPid"] = st.get("pid")   # reaped like a ttyd pid on kill
-                    return
-                time.sleep(0.1)
-        finally:
-            if IS_WINDOWS:
-                _pty_task_cleanup(tmux_name)
-        # It never published bound ports. Reap: POSIX terminates the handle it holds (covers a
-        # process that wrote nothing); Windows has no handle (the task-launched pty-host is not our
-        # child), so _pty_teardown reaps by the state-file pid if one was published. A pty-host that
-        # wrote nothing crashed on its own (the spawner logged the error to the .log).
-        if proc is not None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-        _pty_teardown(tmux_name)
-        raise RuntimeError(
-            "pty-host did not publish its terminal within "
-            f"{PTY_SPAWN_TIMEOUT_SEC:g}s (terminal failed to start)")
+        # The detached-spawn / wait-for-bound-ports / reap-on-timeout dance is the
+        # shared ConPTY choke point (`_pty_spawn_and_wait`) — the pty-host must
+        # SURVIVE a WinSW service restart/self-update to be re-adopted from its
+        # state file (KillMode=process, ADR D1/D2), which is why Windows launches
+        # it through a one-shot Scheduled Task (outside WinSW's job) and POSIX
+        # keeps the direct start_new_session spawn. The published pid is reaped
+        # like a ttyd pid on kill.
+        sess["ttydPid"] = _pty_spawn_and_wait(
+            tmux_name, cmd, sess["worktreePath"], env, log_path)
 
     def _launch_ttyd(self, sess):
         """Ensure a ttyd is serving this session's tmux on its stable port.
@@ -25073,19 +25095,12 @@ class SessionManager:
 
         Unlike the summary/models helpers this can't be a `claude -p` reaped on
         the beat: print mode never invokes a statusLine (verified), so the probe
-        has to be a real interactive claude on a TTY — hence tmux — and it needs
-        a keypress and a poll for the snapshot to land, which is a few seconds of
-        waiting the heartbeat loop must not do. Nothing outside the thread is
-        mutated: the thread drives tmux and the hook writes the file, while the
-        beat only ever READS that file."""
-        # No tmux on Windows: the probe needs a real interactive TTY running
-        # claude, which the ConPTY terminal layer (XERK-668) provides for
-        # SESSIONS but not for this self-contained subscription probe. Degrade
-        # like the cc-socks sweep and container-log tail — no `limits` block,
-        # read as "can't tell" (never 0% used) — rather than erroring `tmux`
-        # every beat and burning the backoff on a launch that cannot succeed.
-        if IS_WINDOWS:
-            return
+        has to be a real interactive claude on a TTY — a tmux session on POSIX, a
+        ConPTY pty-host on Windows (XERK-704, the XERK-668/697 terminal layer) —
+        and it needs a keypress and a poll for the snapshot to land, which is a
+        few seconds of waiting the heartbeat loop must not do. Nothing outside the
+        thread is mutated: the thread drives the terminal and the hook writes the
+        file, while the beat only ever READS that file."""
         thread = getattr(self, "_limits_probe", None)
         if thread is not None and thread.is_alive():
             return
@@ -25134,8 +25149,17 @@ class SessionManager:
         the one above, not a Haiku one. cwd is REGISTRY_DIR, which
         is what keeps its transcript off the usage page (`_is_internal_tool_slug`
         tombstones the registry dir's slug), and plan mode plus a prompt with
-        nothing to do keeps it from touching a repo."""
+        nothing to do keeps it from touching a repo.
+
+        On a native Windows host there is no tmux, so the throwaway claude runs in
+        a ConPTY pty-host (the XERK-668/697 terminal layer) instead, driven over
+        its control channel — `_run_limits_probe_windows`. Same cost/shape, same
+        snapshot poll (`_await_limits_snapshot`); only the launch/keypress/kill
+        mechanism differs (XERK-704)."""
         started = int(time.time())
+        if IS_WINDOWS:
+            self._run_limits_probe_windows(settings, started)
+            return
         # It measures the SUBSCRIPTION's windows, so it must run against the
         # mounted ~/.claude login — never the local-model failover's endpoint
         # (XERK-246), which has no such windows and would make every probe time
@@ -25177,35 +25201,112 @@ class SessionManager:
             # Enter on an empty composer, which does nothing.
             time.sleep(LIMITS_PROBE_TRUST_SEC)
             run(["tmux", "send-keys", "-t", LIMITS_TMUX, "Enter"])
-            deadline = time.time() + LIMITS_PROBE_TIMEOUT_SEC
-            while time.time() < deadline:
-                time.sleep(1)
-                snap = read_limits_snapshot()
-                if snap and snap.get("capturedAt", 0) >= started:
-                    ok = True
-                    log("limits probe: 5h "
-                        f"{(snap.get('fiveHour') or {}).get('usedPct')}%, 7d "
-                        f"{(snap.get('sevenDay') or {}).get('usedPct')}%")
-                    return
-            # A login with no subscription windows (API key, Bedrock/Vertex) never
-            # populates rate_limits, so this is a normal outcome on such a host,
-            # not an error — it just means the Usage page keeps its empty state,
-            # and the backoff keeps that host from paying for a turn per beat.
-            log("limits probe: no rate limits reported before the timeout")
+            ok = self._await_limits_snapshot(started)
+        finally:
+            self._kill_limits_probe()
+            self._limits_probe_outcome(ok)
+
+    def _await_limits_snapshot(self, started):
+        """Poll for the snapshot hooks/statusline.py writes once the probe's turn
+        lands, up to LIMITS_PROBE_TIMEOUT_SEC. Returns True on a snapshot NEWER
+        than `started` (logging the captured windows); False on timeout — a login
+        with no subscription windows (API key, Bedrock/Vertex) never populates
+        `rate_limits`, a normal outcome that just keeps the Usage page's empty
+        state and lets the backoff space retries. Shared by the tmux and ConPTY
+        (Windows) probe paths."""
+        deadline = time.time() + LIMITS_PROBE_TIMEOUT_SEC
+        while time.time() < deadline:
+            time.sleep(1)
+            snap = read_limits_snapshot()
+            if snap and snap.get("capturedAt", 0) >= started:
+                log("limits probe: 5h "
+                    f"{(snap.get('fiveHour') or {}).get('usedPct')}%, 7d "
+                    f"{(snap.get('sevenDay') or {}).get('usedPct')}%")
+                return True
+        log("limits probe: no rate limits reported before the timeout")
+        return False
+
+    def _run_limits_probe_windows(self, settings, started):
+        """The subscription-limits probe on a native Windows host (XERK-704).
+
+        There is no tmux, so the throwaway probe claude runs inside a ConPTY
+        pty-host — the SAME XERK-668/697 terminal layer sessions use — driven over
+        its control channel instead of the tmux CLI. Everything else matches the
+        tmux path: cheapest model, plan mode, no MCP servers, cwd REGISTRY_DIR
+        (tombstoned off the usage page), killed after one turn, and the same
+        snapshot poll. The pty-host binds an EPHEMERAL terminal port nobody
+        proxies (`--term-port 0`); only its control channel is used.
+
+        The failover endpoint is deliberately NOT sourced here either — this
+        measures the subscription's windows, which a local model has none of."""
+        tmux_name = LIMITS_TMUX
+        # claude flags as portable argv (no shell), mirroring the tmux `parts`.
+        claude_argv = [
+            "--settings", settings,
+            "--model", LIMITS_PROBE_MODEL,
+            "--permission-mode", "plan",
+            # The operator's MCP servers would be loaded (and their tool
+            # definitions billed) for a turn that uses none of them.
+            "--strict-mcp-config",
+            "--system-prompt", LIMITS_PROBE_SYSTEM_PROMPT,
+            "--", LIMITS_PROBE_PROMPT,
+        ]
+        launcher = _windows_claude_launcher()   # [claude.exe] or [cmd.exe /c claude]
+        cmd = [
+            PTY_NODE_EXE, PTY_HOST_MJS,
+            "--session", tmux_name,
+            # No hub proxies the probe's terminal — an ephemeral port is enough,
+            # and avoids contending for a session's stable ttyd port.
+            "--term-port", "0",
+            "--ctrl-port", "0",
+            "--state", _pty_state_path(tmux_name),
+            "--auth-token", (TURMA_TOKEN or "changeme"),
+            "--cwd", REGISTRY_DIR,
+            "--cols", "80", "--rows", "24",   # the tmux `-x 80 -y 24` geometry
+            "--",
+        ] + launcher + claude_argv
+        env = dict(os.environ)
+        # hooks/statusline.py writes the snapshot where read_limits_snapshot reads;
+        # the pty-host has no shell to carry the `VAR=x` assignment the tmux path
+        # prepends, so pin it in the process env instead (override included).
+        env["TURMA_LIMITS_PATH"] = LIMITS_PATH
+        log_path = os.path.join(PTY_HOST_DIR, f"{tmux_name}.log")
+        ok = False
+        try:
+            _pty_spawn_and_wait(tmux_name, cmd, REGISTRY_DIR, env, log_path)
+            # One Enter, once, over the control channel: a never-trusted dir opens
+            # a "do you trust this folder" dialog whose default is Yes and which
+            # blocks the turn until answered; on an already-trusted dir this Enters
+            # an empty composer, a no-op. The tmux path sends the same key.
+            time.sleep(LIMITS_PROBE_TRUST_SEC)
+            _pane_send_keys(tmux_name, "Enter")
+            ok = self._await_limits_snapshot(started)
+        except RuntimeError as e:
+            # The pty-host never came up (node/claude missing, ports never bound).
+            # A normal degradation like a failed tmux launch, not a crash: log and
+            # let the backoff space retries.
+            log(f"limits probe: pty-host did not start ({e})")
         finally:
             self._kill_limits_probe()
             self._limits_probe_outcome(ok)
 
     def _kill_limits_probe(self):
-        """Tear down the probe's tmux (and the claude inside it). Idempotent.
+        """Tear down the probe's terminal (and the claude inside it). Idempotent.
 
         Called from the probe's own `finally`, from the shutdown handler and at
         boot, because the `finally` is NOT enough on its own: the probe runs on a
         daemon thread, whose `finally` never runs when the interpreter exits, and
-        tmux outlives the manager by design. A restart mid-probe (the native
-        updater does exactly that) would otherwise leave an interactive claude
-        sitting in a detached tmux until some later probe's clean-slate kill —
-        up to LIMITS_MAX_AGE_SEC away on an idle host."""
+        the terminal outlives the manager by design. A restart mid-probe (the
+        native updater does exactly that) would otherwise leave an interactive
+        claude sitting in a detached tmux / pty-host until some later probe's
+        clean-slate kill — up to LIMITS_MAX_AGE_SEC away on an idle host.
+
+        On Windows the pty-host IS both the terminal and the pty (XERK-704), so
+        `_pty_teardown` ends claude and the terminal in one step and drops the
+        state file so a dead probe is never re-adopted on the next boot."""
+        if IS_WINDOWS:
+            _pty_teardown(LIMITS_TMUX)
+            return
         run(["tmux", "kill-session", "-t", LIMITS_TMUX])
 
     def models_available(self):

@@ -6463,21 +6463,83 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
             probe.join(5)
         self.assertFalse(probe.is_alive())
 
-    def test_the_probe_no_ops_on_windows(self):
-        # The probe shells `tmux`, which is WinError 2 on Windows — a
-        # self-contained subscription TTY probe the ConPTY session terminal
-        # layer (XERK-668) does not cover (XERK-678). On Windows it must skip
-        # ENTIRELY: no settings build, no thread, no tmux launch — degrading to
-        # no `limits` block ("can't tell"), like the cc-socks sweep and the
-        # container-log tail, rather than erroring and burning the backoff.
+    def test_the_probe_runs_in_a_pty_host_on_windows(self):
+        # XERK-704: there is no tmux on a native Windows host, so the probe runs
+        # the throwaway claude in a ConPTY pty-host (the XERK-668/697 terminal
+        # layer) and drives it over the control channel — it must NOT skip, or the
+        # host reports no `limits` block and its Claude subscription shows no usage
+        # card on the Usage page (the reported bug). Same cost/shape as the tmux
+        # path; only the launch/keypress/kill mechanism differs.
+        sm = self.make_manager()
+        captured = {}
+
+        def fake_spawn(tmux_name, cmd, cwd, env, log_path):
+            captured.update(tmux_name=tmux_name, cmd=cmd, cwd=cwd, env=env)
+            return 4321   # the published pty-host pid
+
+        keys = []
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+                mock.patch.object(ha, "LIMITS_PROBE_TIMEOUT_SEC", 0), \
+                mock.patch.object(ha, "LIMITS_PROBE_TRUST_SEC", 0), \
+                mock.patch.object(ha.shutil, "which", return_value=r"C:\claude.exe"), \
+                mock.patch.object(ha, "_pty_spawn_and_wait", side_effect=fake_spawn), \
+                mock.patch.object(ha, "_pane_send_keys",
+                                  side_effect=lambda n, *k, **kw: keys.append((n, k))), \
+                mock.patch.object(ha, "_pty_teardown") as teardown, \
+                mock.patch.object(ha, "read_limits_snapshot", return_value=None):
+            sm._run_limits_probe(os.path.join(self.tmp, "limits-settings.json"))
+        # It ran a pty-host, not a tmux session.
+        self.assertEqual(captured["tmux_name"], ha.LIMITS_TMUX)
+        self.assertEqual([c for c in self.run_ok_calls
+                          if c[:2] == ["tmux", "new-session"]], [])
+        cmd = captured["cmd"]
+        self.assertEqual(cmd[0], ha.PTY_NODE_EXE)
+        self.assertEqual(cmd[1], ha.PTY_HOST_MJS)
+        # An ephemeral terminal port (nobody proxies the probe's terminal).
+        self.assertEqual(cmd[cmd.index("--term-port") + 1], "0")
+        self.assertEqual(cmd[cmd.index("--cwd") + 1], ha.REGISTRY_DIR)
+        # The claude argv rides after the launcher, past the `--` separator.
+        dd = cmd.index("--")
+        argv = cmd[dd + 1:]
+        self.assertEqual(argv[0], r"C:\claude.exe")
+        # As small as a turn can be, and never a registered session.
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "haiku")
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "plan")
+        self.assertNotIn("--remote-control", argv)
+        self.assertEqual(argv[-2:], ["--", ha.LIMITS_PROBE_PROMPT])
+        # The hook's snapshot path is pinned in the env (no shell to carry a
+        # `VAR=x` prefix), and the failover endpoint is never sourced.
+        self.assertEqual(captured["env"]["TURMA_LIMITS_PATH"], ha.LIMITS_PATH)
+        self.assertNotIn("ANTHROPIC_BASE_URL", captured["env"])
+        # It answered the trust dialog with one Enter over the control channel,
+        # and always tears the pty-host down afterwards.
+        self.assertEqual(keys, [(ha.LIMITS_TMUX, ("Enter",))])
+        teardown.assert_called_with(ha.LIMITS_TMUX)
+
+    def test_a_windows_probe_that_cannot_launch_backs_off(self):
+        # A pty-host that never binds (node/claude missing) raises RuntimeError,
+        # which must be a normal degradation — logged, backoff spaced — not a
+        # crash on the probe thread. Mirrors the tmux launch-failure case.
         sm = self.make_manager()
         with mock.patch.object(ha, "IS_WINDOWS", True), \
-                mock.patch.object(sm, "_ensure_limits_settings") as ensure:
-            sm._start_limits_probe()  # must not raise
-        ensure.assert_not_called()
-        self.assertIsNone(getattr(sm, "_limits_probe", None))
-        self.assertEqual(
-            [c for c in self.run_ok_calls if c[:2] == ["tmux", "new-session"]], [])
+                mock.patch.object(ha, "LIMITS_PROBE_TRUST_SEC", 0), \
+                mock.patch.object(ha.shutil, "which", return_value=r"C:\claude.exe"), \
+                mock.patch.object(ha, "_pty_spawn_and_wait",
+                                  side_effect=RuntimeError("pty-host did not start")), \
+                mock.patch.object(ha, "_pty_teardown"):
+            sm._run_limits_probe(os.path.join(self.tmp, "limits-settings.json"))
+        self.assertEqual(sm._limits_probe_backoff, ha.LIMITS_PROBE_RETRY_SEC)
+
+    def test_kill_limits_probe_tears_down_the_pty_host_on_windows(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+                mock.patch.object(ha, "_pty_teardown") as teardown:
+            sm._kill_limits_probe()
+        teardown.assert_called_once_with(ha.LIMITS_TMUX)
+        # No tmux kill-session shelled on Windows.
+        self.assertNotIn(["tmux", "kill-session", "-t", ha.LIMITS_TMUX],
+                         self.run_calls)
 
 
 class TestWindowsManagerBoot(ManagerMixin, unittest.TestCase):
