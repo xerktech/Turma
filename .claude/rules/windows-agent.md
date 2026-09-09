@@ -136,20 +136,33 @@ the bare POSIX form** (it raises at call time on Windows Python, exactly like `o
   XERK-678 no-op). It needs a real interactive claude on a TTY (print mode never invokes a statusLine),
   which tmux gave POSIX; on Windows `_run_limits_probe_windows` runs the SAME throwaway probe claude in
   a pty-host (the XERK-668/697 terminal layer) with an EPHEMERAL terminal port nobody proxies
-  (`--term-port 0`), drives its trust-dialog Enter over the control channel (`_pane_send_keys`), polls
-  the same snapshot (`_await_limits_snapshot`), and tears it down (`_kill_limits_probe` →
-  `_pty_teardown`). Without it a native Windows host reported no `limits` block and its Claude
-  subscription showed no usage card — the OPPOSITE degradation from the cc-socks sweep, since a whole
-  subscription's card vanishes. `os.getuid` and the `/proc` reads stay unreached on Windows behind
-  their existing `/proc/self` guard.
+  (`--term-port 0`), answers the trust-folder modal (below), polls the same snapshot
+  (`_await_limits_snapshot`), and tears it down (`_kill_limits_probe` → `_pty_teardown`). Without it a
+  native Windows host reported no `limits` block and its Claude subscription showed no usage card — the
+  OPPOSITE degradation from the cc-socks sweep, since a whole subscription's card vanishes. `os.getuid`
+  and the `/proc` reads stay unreached on Windows behind their existing `/proc/self` guard.
+  - **The probe must NAVIGATE the trust-folder modal, never blind-Enter it** (XERK-704 follow-up). An
+    INTERACTIVE claude in REGISTRY_DIR opens "do you trust the files in this folder?" on a host that
+    hasn't trusted that dir (print-mode helpers never do), and on Claude Code 2.1.266 its DEFAULT is
+    "No, exit" with "Yes, I trust this folder" one option below — so a single Enter SELECTS EXIT and the
+    turn never runs (`rate_limits` never populate, the statusLine never fires, `limits.json` never
+    written — the whole "no rate limits before the timeout" symptom on a fresh host). `_answer_trust_dialog`
+    reads the rendered pane, finds the cursor (`❯`) line and the accept-option line, and STEPS the
+    cursor to accept before Enter (default-position-agnostic); it no-ops when there is no modal (an
+    already-trusted dir just runs the positional prompt). The Windows probe POLLS for it over a startup
+    window (it lags claude's cold start). The Linux tmux path's single Enter is unchanged — it only
+    works because current Linux hosts trusted `~/.turma` long ago when the default was "Yes"; a fresh
+    Linux host would hit the same modal (XERK-709 — wire the same `_answer_trust_dialog` into the tmux
+    path once a fresh-Linux repro is available to verify against).
   - **`_pty_spawn_and_wait` is the ONE ConPTY-spawn choke point** — session launch (`_spawn_pty_host`)
     and this probe both go through it (detached spawn via the one-shot Scheduled Task, wait for bound
     ports, reap on timeout), so neither grows a second copy. Do NOT re-inline the spawn dance.
 - Tests: `TestReadUntrustedJson` (the FIFO refusal proves the guarded `os.open` still works),
   `TestWindowsManagerBoot` (SIGUSR1 installed on POSIX, skipped under mocked `IS_WINDOWS` — inverting
-  the guard must fail a test), and the Windows probe cases in `TestLimitsSnapshot`
+  the guard must fail a test), the Windows probe cases in `TestLimitsSnapshot`
   (`test_the_probe_runs_in_a_pty_host_on_windows`, `test_a_windows_probe_that_cannot_launch_backs_off`,
-  `test_kill_limits_probe_tears_down_the_pty_host_on_windows`).
+  `test_kill_limits_probe_tears_down_the_pty_host_on_windows`), and `TestAnswerTrustDialog` (navigate to
+  accept over the verbatim 2.1.266 modal, cursor-already-on-accept, ANSI ring, no-modal/empty no-ops).
 
 ## Liveness & degradation (already hold — do not regress)
 

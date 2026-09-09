@@ -9766,6 +9766,75 @@ def _pane_send_keys(tmux_name, *tokens, literal=False):
     run(cmd)
 
 
+# Claude Code's "do you trust the files in this folder?" modal, and its accept
+# option. The subscription-limits probe launches an INTERACTIVE claude in
+# REGISTRY_DIR, which on a host that has never trusted that dir opens this modal
+# (print-mode helpers never do). On current Claude Code (2.1.266) its DEFAULT
+# selection is 'No, exit', so a blind Enter EXITS the probe and no turn runs —
+# the whole reason a fresh (native Windows) host reported no `limits` block
+# (XERK-704). We navigate to the accept option instead.
+_TRUST_DIALOG_RE = re.compile(
+    r"trust (?:this|the) (?:folder|workspace)|do you trust the files", re.I)
+_TRUST_ACCEPT_RE = re.compile(r"trust this (?:folder|workspace)", re.I)
+# The arrow cursor is ❯ / › — NOT a bare '>', which appears in paths/prose and
+# would mis-place the cursor (a QA finding). If a build ever renders the cursor
+# some other way it just isn't found, and the fallback below (one Down) still
+# accepts the observed 'No, exit'-default layout.
+_TRUST_CURSOR_RE = re.compile(r"[❯›]")
+# Defensive ANSI strip. Both captures are rendered plain text (Linux tmux
+# `capture-pane -p`, Windows the pty-host's TerminalGrid, XERK-703), so this is
+# normally a no-op — but a stray escape must never break the line parsing below.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+
+
+def _answer_trust_dialog(tmux_name):
+    """If the pane shows Claude Code's trust-folder modal, select the trust
+    option and confirm; return True if it acted, False when there is no modal.
+
+    Navigates rather than blind-Entering: the modal's default is 'No, exit' with
+    'Yes, I trust this folder' one option below, so a bare Enter exits the probe
+    (XERK-704). Reads the rendered pane (Linux tmux `-p`, Windows TerminalGrid),
+    locates the cursor line and the accept-option line, and steps the cursor
+    between them — working regardless of which option the default sits on. No-ops
+    on an already-trusted dir (no modal shows; the positional prompt just runs).
+    Host-verified against Claude Code 2.1.266."""
+    cap = _capture_pane(tmux_name)
+    if not cap:
+        return False
+    text = _ANSI_RE.sub("", cap)
+    if not _TRUST_DIALOG_RE.search(text):
+        return False
+    lines = text.splitlines()
+    cursor_idx = accept_idx = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # The cursor sits on a menu OPTION line (short), never in the prose above
+        # it — bounding the length keeps a glyph in body text from being read as
+        # the cursor (the "takes the last match" hazard).
+        if _TRUST_CURSOR_RE.search(line) and len(stripped) < 60:
+            cursor_idx = i
+        # The accept OPTION line, not the question line (which ends in '?' and is
+        # long) — 'Yes, I trust this folder'.
+        if (_TRUST_ACCEPT_RE.search(stripped) and "?" not in stripped
+                and len(stripped) < 60):
+            accept_idx = i
+    if accept_idx is None:
+        return False
+    # Step from the cursor to the accept option, then Enter. If the cursor can't
+    # be located in the ring, fall back to one Down — the accept option sits just
+    # below the 'No, exit' default (the observed layout).
+    if cursor_idx is None:
+        steps, key = 1, "Down"
+    else:
+        delta = accept_idx - cursor_idx
+        key = "Down" if delta >= 0 else "Up"
+        steps = abs(delta)
+    for _ in range(steps):
+        _pane_send_keys(tmux_name, key)
+    _pane_send_keys(tmux_name, "Enter")
+    return True
+
+
 def _pty_alive(tmux_name):
     """has-session analog: whether the session's pty-host (and therefore its pty)
     is still up. The pty-host exits ~immediately after its pty child exits, so
@@ -13835,6 +13904,14 @@ LIMITS_PROBE_TIMEOUT_SEC = _env_int("TURMA_LIMITS_PROBE_TIMEOUT_SEC", 120)
 LIMITS_PROBE_RETRY_SEC = _env_int("TURMA_LIMITS_PROBE_RETRY_SEC", 900)
 LIMITS_PROBE_MAX_BACKOFF_SEC = _env_int("TURMA_LIMITS_PROBE_MAX_BACKOFF_SEC", 21600)
 LIMITS_PROBE_TRUST_SEC = 4  # let the TUI paint before answering its trust dialog
+# The Windows probe drives claude in a ConPTY (no tmux), so it answers the
+# trust-folder modal by POLLING the pane and navigating to the accept option
+# rather than blind-Enter'ing after a fixed wait (XERK-704 — the modal's default
+# is 'No, exit', so a bare Enter EXITS the probe). Poll for up to WAIT_SEC (the
+# modal lags claude's cold start) every POLL_SEC; on an already-trusted dir the
+# modal never shows and the positional prompt just runs, so the loop ends early.
+LIMITS_PROBE_TRUST_WAIT_SEC = _env_int("TURMA_LIMITS_PROBE_TRUST_WAIT_SEC", 25)
+LIMITS_PROBE_TRUST_POLL_SEC = _env_float("TURMA_LIMITS_PROBE_TRUST_POLL_SEC", 1.5)
 
 MODEL_PROBE_PROMPT = "/model"
 MODELS_REFRESH_EVERY = _env_int("TURMA_MODELS_REFRESH_EVERY", 1080)   # beats (~6h at the 20s interval)
@@ -25275,12 +25352,20 @@ class SessionManager:
         ok = False
         try:
             _pty_spawn_and_wait(tmux_name, cmd, REGISTRY_DIR, env, log_path)
-            # One Enter, once, over the control channel: a never-trusted dir opens
-            # a "do you trust this folder" dialog whose default is Yes and which
-            # blocks the turn until answered; on an already-trusted dir this Enters
-            # an empty composer, a no-op. The tmux path sends the same key.
-            time.sleep(LIMITS_PROBE_TRUST_SEC)
-            _pane_send_keys(tmux_name, "Enter")
+            # Answer the trust-folder modal if/when it paints. It must be
+            # NAVIGATED, not blind-Enter'd: current Claude Code defaults its
+            # selection to 'No, exit', so a bare Enter exits the probe and no turn
+            # runs (XERK-704). Poll for it — on a fresh host it lags claude's cold
+            # start; on an already-trusted dir none shows and the positional
+            # prompt just runs, so the loop ends the moment a snapshot lands.
+            trust_deadline = time.time() + LIMITS_PROBE_TRUST_WAIT_SEC
+            while time.time() < trust_deadline:
+                if _answer_trust_dialog(tmux_name):
+                    break
+                snap = read_limits_snapshot()
+                if snap and snap.get("capturedAt", 0) >= started:
+                    break        # already trusted; the turn ran without a modal
+                time.sleep(LIMITS_PROBE_TRUST_POLL_SEC)
             ok = self._await_limits_snapshot(started)
         except RuntimeError as e:
             # The pty-host never came up (node/claude missing, ports never bound).

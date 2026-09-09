@@ -6477,14 +6477,15 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
             captured.update(tmux_name=tmux_name, cmd=cmd, cwd=cwd, env=env)
             return 4321   # the published pty-host pid
 
-        keys = []
+        trust = []
         with mock.patch.object(ha, "IS_WINDOWS", True), \
                 mock.patch.object(ha, "LIMITS_PROBE_TIMEOUT_SEC", 0), \
-                mock.patch.object(ha, "LIMITS_PROBE_TRUST_SEC", 0), \
+                mock.patch.object(ha, "LIMITS_PROBE_TRUST_WAIT_SEC", 5), \
+                mock.patch.object(ha, "LIMITS_PROBE_TRUST_POLL_SEC", 0), \
                 mock.patch.object(ha.shutil, "which", return_value=r"C:\claude.exe"), \
                 mock.patch.object(ha, "_pty_spawn_and_wait", side_effect=fake_spawn), \
-                mock.patch.object(ha, "_pane_send_keys",
-                                  side_effect=lambda n, *k, **kw: keys.append((n, k))), \
+                mock.patch.object(ha, "_answer_trust_dialog",
+                                  side_effect=lambda n: trust.append(n) or True), \
                 mock.patch.object(ha, "_pty_teardown") as teardown, \
                 mock.patch.object(ha, "read_limits_snapshot", return_value=None):
             sm._run_limits_probe(os.path.join(self.tmp, "limits-settings.json"))
@@ -6512,9 +6513,9 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # `VAR=x` prefix), and the failover endpoint is never sourced.
         self.assertEqual(captured["env"]["TURMA_LIMITS_PATH"], ha.LIMITS_PATH)
         self.assertNotIn("ANTHROPIC_BASE_URL", captured["env"])
-        # It answered the trust dialog with one Enter over the control channel,
-        # and always tears the pty-host down afterwards.
-        self.assertEqual(keys, [(ha.LIMITS_TMUX, ("Enter",))])
+        # It drove the trust-folder modal over the control channel (navigating to
+        # accept, not blind-Enter), and always tears the pty-host down afterwards.
+        self.assertEqual(trust, [ha.LIMITS_TMUX])
         teardown.assert_called_with(ha.LIMITS_TMUX)
 
     def test_a_windows_probe_that_cannot_launch_backs_off(self):
@@ -6523,7 +6524,7 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # crash on the probe thread. Mirrors the tmux launch-failure case.
         sm = self.make_manager()
         with mock.patch.object(ha, "IS_WINDOWS", True), \
-                mock.patch.object(ha, "LIMITS_PROBE_TRUST_SEC", 0), \
+                mock.patch.object(ha, "LIMITS_PROBE_TRUST_WAIT_SEC", 0), \
                 mock.patch.object(ha.shutil, "which", return_value=r"C:\claude.exe"), \
                 mock.patch.object(ha, "_pty_spawn_and_wait",
                                   side_effect=RuntimeError("pty-host did not start")), \
@@ -6540,6 +6541,81 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # No tmux kill-session shelled on Windows.
         self.assertNotIn(["tmux", "kill-session", "-t", ha.LIMITS_TMUX],
                          self.run_calls)
+
+
+class TestAnswerTrustDialog(unittest.TestCase):
+    """The probe's interactive claude opens a 'trust this folder?' modal in
+    REGISTRY_DIR on a fresh host. Its default is 'No, exit', so a blind Enter
+    exits the probe (XERK-704) — `_answer_trust_dialog` must NAVIGATE to the
+    accept option. Captured verbatim from real Claude Code 2.1.266."""
+
+    # The real modal (ANSI stripped): the cursor ❯ defaults to 'No, exit', and
+    # 'Yes, I trust this folder' sits one option below.
+    DIALOG = (
+        "Accessing workspace:\n\n"
+        "  C:\\Users\\me\\AppData\\Local\\Temp\\x\n\n"
+        "  Quick safety check: Is this a project you created or one you trust?\n\n"
+        "  Claude Code'll be able to read, edit, and execute files here.\n\n"
+        "  Security guide\n\n"
+        " \u276f No, exit\n"
+        "   Yes, I trust this folder\n\n"
+        " Enter to confirm \u00b7 Esc to cancel\n"
+    )
+
+    def _keys(self, capture):
+        sent = []
+        with mock.patch.object(ha, "_capture_pane", return_value=capture), \
+                mock.patch.object(ha, "_pane_send_keys",
+                                  side_effect=lambda n, *k, **kw: sent.append(k)):
+            acted = ha._answer_trust_dialog("agent-x")
+        return acted, sent
+
+    def test_navigates_down_to_the_accept_option_then_enters(self):
+        acted, sent = self._keys(self.DIALOG)
+        self.assertTrue(acted)
+        # One Down (No -> Yes) then Enter — NOT a bare Enter (which selects exit).
+        self.assertEqual(sent, [("Down",), ("Enter",)])
+
+    def test_enters_directly_when_the_cursor_is_already_on_accept(self):
+        # Robust to the default flipping: if ❯ already sits on the trust option,
+        # no navigation, just confirm.
+        cap = self.DIALOG.replace(" \u276f No, exit\n   Yes, I trust this folder",
+                                  "   No, exit\n \u276f Yes, I trust this folder")
+        acted, sent = self._keys(cap)
+        self.assertTrue(acted)
+        self.assertEqual(sent, [("Enter",)])
+
+    def test_survives_ansi_escapes_in_a_raw_pty_ring(self):
+        # The Windows capture is a raw pty ring with ANSI still in it; the
+        # navigator must strip it and still parse the modal.
+        noisy = "\x1b[2J\x1b[H" + self.DIALOG.replace(
+            "\u276f No", "\x1b[7m\u276f\x1b[0m No").replace(
+            "Yes, I trust", "\x1b[1mYes, I trust\x1b[0m")
+        acted, sent = self._keys(noisy)
+        self.assertTrue(acted)
+        self.assertEqual(sent, [("Down",), ("Enter",)])
+
+    def test_a_stray_gt_after_the_accept_line_does_not_misplace_the_cursor(self):
+        # QA finding: a bare '>' (a path, quoted text, a shell prompt) rendered
+        # AFTER the accept option must NOT be read as the cursor — only ❯/› on a
+        # short option line count. Here the real cursor is ❯ on 'No, exit'.
+        cap = self.DIALOG + "  cd C:\\x > out.txt\n"
+        acted, sent = self._keys(cap)
+        self.assertTrue(acted)
+        self.assertEqual(sent, [("Down",), ("Enter",)])   # one Down (No -> Yes)
+
+    def test_no_op_when_there_is_no_modal(self):
+        # An already-trusted dir shows no modal — the composer/turn is up. Send
+        # NOTHING (a stray Enter/Down here would disturb a running turn).
+        acted, sent = self._keys("❯ turma limits probe: reply ok\n\nok\n")
+        self.assertFalse(acted)
+        self.assertEqual(sent, [])
+
+    def test_no_op_on_an_empty_or_unreadable_capture(self):
+        for cap in (None, ""):
+            acted, sent = self._keys(cap)
+            self.assertFalse(acted)
+            self.assertEqual(sent, [])
 
 
 class TestWindowsManagerBoot(ManagerMixin, unittest.TestCase):
