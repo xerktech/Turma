@@ -140,7 +140,20 @@ the bare POSIX form** (it raises at call time on Windows Python, exactly like `o
 
 ## Liveness & degradation (already hold — do not regress)
 
-- **`_pid_alive` uses `os.kill(pid, 0)`, which works on Windows** — the generic liveness primitive.
+- **`_pid_alive` must NOT use `os.kill(pid, 0)` on Windows — it is an unreliable, version-dependent
+  liveness probe there** (XERK-701). On POSIX `os.kill(pid, 0)` is a signal-less probe. On Windows
+  how it fails depends on the CPython version: on older CPython `os.kill` maps to
+  `TerminateProcess(handle, sig)` for every signal but `CTRL_C_EVENT`/`CTRL_BREAK_EVENT`, so signal 0
+  *terminates* the target (exit code 0); on Python 3.14 (the MAXAI-WIN host, gh-58685) signal 0 no
+  longer terminates but the call still opens the process for access it can be DENIED on a detached,
+  task-engine-parented pty-host, so it raises and misreports the live process as dead. Either way
+  `resume_on_boot`'s adopt-vs-resume check read the surviving pty-host as dead (and on the
+  terminating CPythons killed it), so a restart resumed from scratch instead of adopting
+  (host-verified: before the fix a restart RESUMED, after it ADOPTS, pids identical). The Windows
+  branch opens a minimal `SYNCHRONIZE` handle and reads whether the process object is signaled
+  (`WaitForSingleObject(h, 0)`: `WAIT_TIMEOUT` == alive; `ACCESS_DENIED` on open == alive), delivering
+  nothing on any version. The POSIX branch keeps the `os.kill(pid, 0)` probe. **Never collapse the two
+  back into one `os.kill`-based definition** — guarded by `test_windows_pid_alive_does_not_use_os_kill`.
   The `/proc`-specific cc-socks sweep is a POSIX/dsh feature that already self-guards
   (`getattr(os, "getuid", None)`, `os.path.isdir("/proc/self")`) and degrades to no-op on Windows.
 - **`startedAt` falls back to the manager's start time** (`run(["docker", ...]) or now_iso()`) and the
