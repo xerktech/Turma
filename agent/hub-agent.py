@@ -9766,6 +9766,116 @@ def _pane_send_keys(tmux_name, *tokens, literal=False):
     run(cmd)
 
 
+# ---- Claude Code startup trust modal ---------------------------------------
+# The first time claude runs in a directory it shows a "do you trust the files in
+# this folder?" modal and BLOCKS the turn until it is answered. Its two options
+# are NOT numbered (unlike the permission dialog / model picker), and the DEFAULT
+# highlighted (❯) option is version-dependent: recent Claude Code sits the cursor
+# on "No, exit" with "Yes, I trust this folder" one line below (observed on
+# 2.1.263/2.1.266, XERK-709), so a blind Enter selects "No, exit" and EXITS
+# claude. Older builds defaulted to accept, which is why a blind Enter ever
+# worked. So the answer must NAVIGATE to the accept option, never trust the
+# default position.
+#
+# The accept option is matched by its stable text; the cursor by its glyph
+# ("❯" in Claude Code, "›" in qwen, as everywhere else). Neither the wording of
+# "No, exit" nor the cursor's starting row is assumed.
+TRUST_ACCEPT_RE = re.compile(r"trust this folder", re.IGNORECASE)
+TRUST_CURSOR_GLYPHS = "❯›"
+# Poll for the modal to paint (an already-trusted dir never shows one — a no-op),
+# and the per-press readback pacing, mirroring the model picker's step loop. The
+# appearance budget (TRIES * WAIT ≈ 4s) matches the fixed settle the blind Enter
+# used, so an already-trusted host waits no longer than before.
+TRUST_MODAL_TRIES = 10
+TRUST_MODAL_WAIT_SEC = 0.4
+TRUST_STEP_TRIES = 8
+TRUST_STEP_WAIT_SEC = 0.12
+TRUST_MODAL_MAX_STEPS = 6
+
+
+def _trust_modal_lines(cap):
+    """Locate Claude Code's trust modal in a pane capture: (accept_index,
+    cursor_index) as line indices into `cap`, or (None, None) when no modal is on
+    screen (an already-trusted directory shows the composer, not the modal).
+    `cursor_index` is None when the accept line is visible but the selection glyph
+    has not painted yet — the caller polls again.
+
+    The modal is recognised by the accept option's stable text; the cursor sits on
+    the accept line or the sibling option directly above/below it."""
+    if not cap:
+        return None, None
+    lines = cap.splitlines()
+    accept_idx = None
+    for i, ln in enumerate(lines):
+        if TRUST_ACCEPT_RE.search(ln):
+            accept_idx = i
+            break
+    if accept_idx is None:
+        return None, None
+    cursor_idx = None
+    for j in (accept_idx - 1, accept_idx, accept_idx + 1):
+        if 0 <= j < len(lines):
+            s = lines[j].lstrip()
+            if s and s[0] in TRUST_CURSOR_GLYPHS:
+                cursor_idx = j
+                break
+    return accept_idx, cursor_idx
+
+
+def _answer_trust_dialog(tmux_name):
+    """Answer the startup trust modal by NAVIGATING to the accept option, never a
+    blind Enter (XERK-709). Returns True once it confirmed trust, False when no
+    modal appeared.
+
+    On a directory claude has never been trusted in, the modal blocks the turn
+    until answered and its default selection is "No, exit" on current Claude Code,
+    so a blind Enter EXITS claude and the probe's turn never runs — no limits
+    snapshot is ever written. This polls for the modal, finds the accept option by
+    its text and the cursor by its glyph, steps the cursor onto accept one verified
+    press at a time, then confirms.
+
+    A no-op on an already-trusted directory (every existing host trusted ~/.turma
+    long ago, when the default WAS accept): the composer is on screen, not the
+    modal, so this presses nothing — safe to call unconditionally. OS-general:
+    _capture_pane / _pane_send_keys dispatch tmux (Linux) vs. the ConPTY control
+    channel (Windows), so both subscription-limits probe paths share it."""
+    accept_idx = cursor_idx = None
+    for _ in range(TRUST_MODAL_TRIES):
+        time.sleep(TRUST_MODAL_WAIT_SEC)
+        accept_idx, cursor_idx = _trust_modal_lines(_capture_pane(tmux_name))
+        if accept_idx is not None and cursor_idx is not None:
+            break
+    if accept_idx is None or cursor_idx is None:
+        return False  # no modal (already trusted), or it never fully painted
+    steps = 0
+    while cursor_idx != accept_idx:
+        if steps >= TRUST_MODAL_MAX_STEPS:
+            log("limits probe: trust modal cursor never reached the accept option")
+            return False
+        _pane_send_keys(tmux_name, "Down" if accept_idx > cursor_idx else "Up")
+        steps += 1
+        # Re-read until the ❯ moves off its old row; a dropped key just leaves the
+        # gap to press again, a doubled one flips direction next loop.
+        moved = cursor_idx
+        for _ in range(TRUST_STEP_TRIES):
+            time.sleep(TRUST_STEP_WAIT_SEC)
+            a, c = _trust_modal_lines(_capture_pane(tmux_name))
+            if a is None:
+                return False  # modal vanished mid-navigation
+            accept_idx = a
+            if c is not None and c != cursor_idx:
+                moved = c
+                break
+        if moved == cursor_idx:
+            # No movement read after a full step budget — the press count is
+            # unreliable, so stop rather than risk confirming on the wrong option.
+            log("limits probe: trust modal cursor did not move after a press")
+            return False
+        cursor_idx = moved
+    _pane_send_keys(tmux_name, "Enter")
+    return True
+
+
 def _pty_alive(tmux_name):
     """has-session analog: whether the session's pty-host (and therefore its pty)
     is still up. The pty-host exits ~immediately after its pty child exits, so
@@ -13834,7 +13944,6 @@ LIMITS_PROBE_TIMEOUT_SEC = _env_int("TURMA_LIMITS_PROBE_TIMEOUT_SEC", 120)
 # every beat forever, chasing a number it will never have.
 LIMITS_PROBE_RETRY_SEC = _env_int("TURMA_LIMITS_PROBE_RETRY_SEC", 900)
 LIMITS_PROBE_MAX_BACKOFF_SEC = _env_int("TURMA_LIMITS_PROBE_MAX_BACKOFF_SEC", 21600)
-LIMITS_PROBE_TRUST_SEC = 4  # let the TUI paint before answering its trust dialog
 
 MODEL_PROBE_PROMPT = "/model"
 MODELS_REFRESH_EVERY = _env_int("TURMA_MODELS_REFRESH_EVERY", 1080)   # beats (~6h at the 20s interval)
@@ -25195,13 +25304,14 @@ class SessionManager:
             return
         ok = False
         try:
-            # One Enter, once: a directory claude has never been trusted in
-            # opens a "do you trust this folder" dialog whose default is Yes, and
-            # nothing else happens until it's answered — the turn never runs, so
-            # the snapshot never lands. On an already-trusted dir this presses
-            # Enter on an empty composer, which does nothing.
-            time.sleep(LIMITS_PROBE_TRUST_SEC)
-            run(["tmux", "send-keys", "-t", LIMITS_TMUX, "Enter"])
+            # NAVIGATE the trust modal, never blind-Enter it: a directory claude
+            # has never been trusted in opens a "do you trust this folder" dialog
+            # and blocks the turn until answered, and its default is now "No, exit"
+            # (XERK-709), so an Enter on the default would EXIT claude and the
+            # snapshot would never land. A no-op on an already-trusted dir (no
+            # modal), which is every existing Linux host. The prompt itself rides
+            # the launch line's `-- <prompt>` positional, so nothing else is typed.
+            _answer_trust_dialog(LIMITS_TMUX)
             ok = self._await_limits_snapshot(started)
         finally:
             self._kill_limits_probe()
@@ -25275,12 +25385,12 @@ class SessionManager:
         ok = False
         try:
             _pty_spawn_and_wait(tmux_name, cmd, REGISTRY_DIR, env, log_path)
-            # One Enter, once, over the control channel: a never-trusted dir opens
-            # a "do you trust this folder" dialog whose default is Yes and which
-            # blocks the turn until answered; on an already-trusted dir this Enters
-            # an empty composer, a no-op. The tmux path sends the same key.
-            time.sleep(LIMITS_PROBE_TRUST_SEC)
-            _pane_send_keys(tmux_name, "Enter")
+            # NAVIGATE the trust modal over the control channel, never blind-Enter
+            # it (XERK-709): a never-trusted dir's modal now defaults to "No, exit",
+            # so an Enter on the default would EXIT claude and no snapshot would
+            # land. A no-op on an already-trusted dir. The same helper drives the
+            # tmux path — _answer_trust_dialog is OS-general.
+            _answer_trust_dialog(tmux_name)
             ok = self._await_limits_snapshot(started)
         except RuntimeError as e:
             # The pty-host never came up (node/claude missing, ports never bound).

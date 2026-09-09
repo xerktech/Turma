@@ -136,7 +136,8 @@ the bare POSIX form** (it raises at call time on Windows Python, exactly like `o
   XERK-678 no-op). It needs a real interactive claude on a TTY (print mode never invokes a statusLine),
   which tmux gave POSIX; on Windows `_run_limits_probe_windows` runs the SAME throwaway probe claude in
   a pty-host (the XERK-668/697 terminal layer) with an EPHEMERAL terminal port nobody proxies
-  (`--term-port 0`), drives its trust-dialog Enter over the control channel (`_pane_send_keys`), polls
+  (`--term-port 0`), NAVIGATES its trust dialog over the control channel (`_answer_trust_dialog`, the
+  OS-general helper the tmux path also uses — never a blind Enter, XERK-709), polls
   the same snapshot (`_await_limits_snapshot`), and tears it down (`_kill_limits_probe` →
   `_pty_teardown`). Without it a native Windows host reported no `limits` block and its Claude
   subscription showed no usage card — the OPPOSITE degradation from the cc-socks sweep, since a whole

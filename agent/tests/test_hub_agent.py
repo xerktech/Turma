@@ -6329,8 +6329,7 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
             self.run_ok_calls.append(cmd)
             return 1, "tmux: command not found"
 
-        with mock.patch.object(ha, "run_ok", failing_launch), \
-             mock.patch.object(ha, "LIMITS_PROBE_TRUST_SEC", 0):
+        with mock.patch.object(ha, "run_ok", failing_launch):
             sm._run_limits_probe(os.path.join(self.tmp, "limits-settings.json"))
         self.assertEqual(sm._limits_probe_backoff, ha.LIMITS_PROBE_RETRY_SEC)
 
@@ -6340,7 +6339,7 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # happens to be due.
         sm = self.make_manager()
         with mock.patch.object(ha, "LIMITS_PROBE_TIMEOUT_SEC", 0), \
-             mock.patch.object(ha, "LIMITS_PROBE_TRUST_SEC", 0):
+             mock.patch.object(ha, "_answer_trust_dialog", return_value=False):
             sm._run_limits_probe(os.path.join(self.tmp, "limits-settings.json"))
         kills = [i for i, c in enumerate(self.run_calls)
                  if c == ["tmux", "kill-session", "-t", ha.LIMITS_TMUX]]
@@ -6385,7 +6384,7 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
     def test_the_probe_runs_a_throwaway_claude_in_its_own_tmux(self):
         sm = self.make_manager()
         with mock.patch.object(ha, "LIMITS_PROBE_TIMEOUT_SEC", 0), \
-             mock.patch.object(ha, "LIMITS_PROBE_TRUST_SEC", 0):
+             mock.patch.object(ha, "_answer_trust_dialog", return_value=False):
             sm._run_limits_probe(os.path.join(self.tmp, "limits-settings.json"))
         launch = [c for c in self.run_ok_calls if c[:2] == ["tmux", "new-session"]]
         self.assertEqual(len(launch), 1)
@@ -6477,14 +6476,12 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
             captured.update(tmux_name=tmux_name, cmd=cmd, cwd=cwd, env=env)
             return 4321   # the published pty-host pid
 
-        keys = []
         with mock.patch.object(ha, "IS_WINDOWS", True), \
                 mock.patch.object(ha, "LIMITS_PROBE_TIMEOUT_SEC", 0), \
-                mock.patch.object(ha, "LIMITS_PROBE_TRUST_SEC", 0), \
                 mock.patch.object(ha.shutil, "which", return_value=r"C:\claude.exe"), \
                 mock.patch.object(ha, "_pty_spawn_and_wait", side_effect=fake_spawn), \
-                mock.patch.object(ha, "_pane_send_keys",
-                                  side_effect=lambda n, *k, **kw: keys.append((n, k))), \
+                mock.patch.object(ha, "_answer_trust_dialog",
+                                  return_value=False) as answer_trust, \
                 mock.patch.object(ha, "_pty_teardown") as teardown, \
                 mock.patch.object(ha, "read_limits_snapshot", return_value=None):
             sm._run_limits_probe(os.path.join(self.tmp, "limits-settings.json"))
@@ -6512,9 +6509,10 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # `VAR=x` prefix), and the failover endpoint is never sourced.
         self.assertEqual(captured["env"]["TURMA_LIMITS_PATH"], ha.LIMITS_PATH)
         self.assertNotIn("ANTHROPIC_BASE_URL", captured["env"])
-        # It answered the trust dialog with one Enter over the control channel,
+        # It NAVIGATED the trust dialog over the control channel (the SAME
+        # OS-general helper the tmux path uses, XERK-709) rather than blind-Enter,
         # and always tears the pty-host down afterwards.
-        self.assertEqual(keys, [(ha.LIMITS_TMUX, ("Enter",))])
+        answer_trust.assert_called_once_with(ha.LIMITS_TMUX)
         teardown.assert_called_with(ha.LIMITS_TMUX)
 
     def test_a_windows_probe_that_cannot_launch_backs_off(self):
@@ -6523,7 +6521,6 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # crash on the probe thread. Mirrors the tmux launch-failure case.
         sm = self.make_manager()
         with mock.patch.object(ha, "IS_WINDOWS", True), \
-                mock.patch.object(ha, "LIMITS_PROBE_TRUST_SEC", 0), \
                 mock.patch.object(ha.shutil, "which", return_value=r"C:\claude.exe"), \
                 mock.patch.object(ha, "_pty_spawn_and_wait",
                                   side_effect=RuntimeError("pty-host did not start")), \
@@ -6540,6 +6537,125 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # No tmux kill-session shelled on Windows.
         self.assertNotIn(["tmux", "kill-session", "-t", ha.LIMITS_TMUX],
                          self.run_calls)
+
+
+class TestAnswerTrustDialog(unittest.TestCase):
+    """The subscription-limits probe must NAVIGATE Claude Code's startup trust
+    modal to the accept option, never blind-Enter it (XERK-709). On current Claude
+    Code the modal's default (❯) is "No, exit", so an Enter on the default EXITS
+    claude and the probe's turn never runs — no snapshot is ever written. Verified
+    against the real 2.1.263/2.1.266 modal layout."""
+
+    # The modal exactly as Claude Code 2.1.x renders it (fresh, never-trusted dir).
+    MODAL_NO_EXIT_DEFAULT = (
+        " Quick safety check: Is this a project you created or one you trust?\n"
+        "\n"
+        " Claude Code'll be able to read, edit, and execute files here.\n"
+        "\n"
+        " Security guide\n"
+        "\n"
+        " ❯ No, exit\n"
+        "   Yes, I trust this folder\n"
+        "\n"
+        " Enter to confirm · Esc to cancel\n"
+    )
+    # The same modal after one Down press: cursor moved onto the accept option.
+    MODAL_TRUST_SELECTED = (
+        " Quick safety check: Is this a project you created or one you trust?\n"
+        "\n"
+        " Security guide\n"
+        "\n"
+        "   No, exit\n"
+        " ❯ Yes, I trust this folder\n"
+        "\n"
+        " Enter to confirm · Esc to cancel\n"
+    )
+    # An already-trusted dir: the composer is up, no modal. The composer prompt
+    # ALSO carries a ❯ glyph, which must not be mistaken for the modal cursor.
+    COMPOSER = (
+        " ╰ Claude Code v2.1.263\n"
+        "\n"
+        " ❯ Try \"write a test for <filepath>\"\n"
+        "\n"
+        "  ⏸ plan mode on (shift+tab to cycle)\n"
+    )
+
+    def test_trust_modal_lines_finds_accept_and_cursor(self):
+        acc, cur = ha._trust_modal_lines(self.MODAL_NO_EXIT_DEFAULT)
+        lines = self.MODAL_NO_EXIT_DEFAULT.splitlines()
+        self.assertIn("trust this folder", lines[acc])
+        self.assertTrue(lines[cur].lstrip().startswith("❯"))
+        # Default sits on "No, exit", one line ABOVE the accept option.
+        self.assertEqual(acc, cur + 1)
+
+    def test_trust_modal_lines_no_modal_is_none(self):
+        # The composer's ❯ prompt must NOT read as a modal — no accept line.
+        self.assertEqual(ha._trust_modal_lines(self.COMPOSER), (None, None))
+        self.assertEqual(ha._trust_modal_lines(""), (None, None))
+        self.assertEqual(ha._trust_modal_lines(None), (None, None))
+
+    def _drive(self, frames):
+        """Run _answer_trust_dialog against a scripted sequence of pane captures,
+        recording the keys it sends. `frames` is a callable returning the current
+        capture; a Down/Up press advances it via the key handler."""
+        state = {"cur_on_accept": False}
+        keys = []
+
+        def capture(_name):
+            return frames(state)
+
+        def send(_name, *toks, **kw):
+            keys.append(toks[0] if toks else None)
+            if toks and toks[0] in ("Down", "Up"):
+                state["cur_on_accept"] = not state["cur_on_accept"]
+        with mock.patch.object(ha, "_capture_pane", side_effect=capture), \
+                mock.patch.object(ha, "_pane_send_keys", side_effect=send), \
+                mock.patch.object(ha, "TRUST_MODAL_WAIT_SEC", 0), \
+                mock.patch.object(ha, "TRUST_STEP_WAIT_SEC", 0):
+            ok = ha._answer_trust_dialog("turma-limits")
+        return ok, keys
+
+    def test_navigates_down_when_default_is_no_exit(self):
+        # The bug scenario: cursor defaults to "No, exit"; the answer must step
+        # DOWN onto accept, then Enter — never Enter on the default.
+        def frames(state):
+            return (self.MODAL_TRUST_SELECTED if state["cur_on_accept"]
+                    else self.MODAL_NO_EXIT_DEFAULT)
+        ok, keys = self._drive(frames)
+        self.assertTrue(ok)
+        self.assertEqual(keys, ["Down", "Enter"])
+
+    def test_just_confirms_when_cursor_already_on_accept(self):
+        # A build whose default already IS accept: no arrow, straight to Enter.
+        ok, keys = self._drive(lambda state: self.MODAL_TRUST_SELECTED)
+        self.assertTrue(ok)
+        self.assertEqual(keys, ["Enter"])
+
+    def test_no_modal_presses_nothing(self):
+        # An already-trusted dir (every existing host): no modal, no key at all.
+        ok, keys = self._drive(lambda state: self.COMPOSER)
+        self.assertFalse(ok)
+        self.assertEqual(keys, [])
+
+    def test_steps_up_when_accept_is_above_cursor(self):
+        # Order-agnostic: if a future build lists accept ABOVE "No, exit", the
+        # cursor must step UP, not down.
+        # Start: cursor on "No, exit" (line 1), accept on line 0 -> must press Up.
+        start = (
+            "   Yes, I trust this folder\n"
+            " ❯ No, exit\n"
+        )
+        # After one Up, the cursor lands on accept (line 0).
+        selected = (
+            " ❯ Yes, I trust this folder\n"
+            "   No, exit\n"
+        )
+
+        def frames(state):
+            return selected if state["cur_on_accept"] else start
+        ok, keys = self._drive(frames)
+        self.assertTrue(ok)
+        self.assertEqual(keys, ["Up", "Enter"])
 
 
 class TestWindowsManagerBoot(ManagerMixin, unittest.TestCase):

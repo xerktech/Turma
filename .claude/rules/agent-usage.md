@@ -122,7 +122,13 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
   with no subscription windows (API key, Bedrock, Vertex) can NEVER produce one, and the
   no-snapshot branch ignores the "only while running" gate, so without backoff such a host spends a
   real turn every beat forever.
-- Answers the trust-folder dialog with one `Enter` (blocks the turn otherwise).
+- **NAVIGATES the trust-folder dialog to the accept option, never a blind `Enter`** (XERK-709):
+  the modal blocks the turn, and its default (❯) is now "No, exit" on current Claude Code, so an
+  Enter on the default EXITS claude and no snapshot ever lands (bites a FRESH host; existing hosts
+  trusted `~/.turma` long ago when the default was accept). `_answer_trust_dialog` polls for the
+  modal, matches the accept option by its text and the cursor by its glyph, steps onto accept, then
+  confirms — a no-op when there is no modal. It is OS-general (`_capture_pane`/`_pane_send_keys`), so
+  the tmux (Linux) and ConPTY (Windows) probe paths share it. **Never revert to `send-keys Enter`.**
 - **Its prompt is a distinctive signature, not a bare "ok"** (`INTERNAL_TOOL_PROMPT_SIGS`) — a
   symlinked `~/.turma` resolves to a different slug before the direct `REGISTRY_DIR` match can fire,
   so the signature is the only thing keeping this overhead off the usage page (XERK-27), and a bare
