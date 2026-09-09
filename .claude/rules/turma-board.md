@@ -237,19 +237,37 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
       `inflightRepos`/`dispatchedRepos`, XERK-563): a squash-merge moves the base, so a second
       concurrent merge to the same repo hits `Base branch was modified` and burns an attempt.
       Serializing lands several ready PRs to one repo one-per-sweep instead of racing them.
-  - **`autoCloseSweep`** — once EVERY PR a session opened has **landed** and at least one actually
-    **MERGED** (a purely-CLOSED PR never closes its ticket), move the ticket to **Done** (the
-    XERK-138 status-writeback, routed to a `pickBoardWriteHost` of the org) AND **kill** the session
-    (reusing `autoStopped`). The kill is DIRECT, not via `autoStopSweep` observing Done — that would
-    wait out the ~10-min Jira poll, and freeing the slot promptly is the whole point. Guards:
-    `autoClosed` (`<siteKey>\x00<key>`, the Done write once) + `autoStopped` (the kill once).
+  - **`autoCloseSweep` — MESSAGE the session to self-close; never write Done or kill (XERK-705).**
+    Once EVERY PR a session opened has **landed** and at least one actually **MERGED** (a purely-CLOSED
+    PR never triggers it), the hub does NOT close the ticket and does NOT kill the session — a merged
+    PR is one step, not proof the whole ticket is done (the session may have a follow-up PR, tests, a
+    migration). It queues an **`input`** command (`AUTO_CLOSE_MERGED_MESSAGE`, the operator path so it
+    rides the agent's `pendingInputs` outbox through a compaction) telling the running session to
+    mark **its own ticket Done** once the work is truly complete. That Done edge then drives everything
+    the hub used to force: `autoStopSweep` (XERK-45, opt-in-independent) kills the session and frees
+    the slot, and for an epic-run child the driver advances the wave / completes the epic (below). So
+    the sweep needs NO board-cred host to act, and no ticket ever closes behind live work.
+    - **BOTH eligibility streams behave identically** — the ORG auto-merge stream (`autoMergeSession`)
+      AND epic-run children (`epicRunChildSession`). **Each ticket self-closes**; the epic run no
+      longer force-closes its children (the earlier XERK-637 direct Done+kill is gone). Arming a run
+      still gets its child auto-MERGED and messaged; the child, like any session, decides when its
+      work is done. **TRADE-OFF:** a session (org or epic child) that neither continues nor self-marks
+      Done holds its slot, and for an epic stalls the wave — the deliberate cost of not closing behind
+      live work.
+    - **Re-fires per NEW merged PR, not per sweep**: `autoCloseNotified`
+      (`<host>\x00<sessionId>` → `{at, urls:Set}`, bounded `AUTO_CLOSE_NOTIFY_MAX` oldest-first)
+      remembers which merged urls a session was told about. A repeat sweep over the same merged set
+      sends nothing; a FOLLOW-UP PR merging (a new url, all landed again) sends the message again —
+      "until the ticket is marked Done and the session auto-closes." In-memory like `autoStopped`: a
+      restart at worst re-sends one message. The `epicRunCompleteSweep` epic-Done write is unchanged
+      (an epic has no session to message).
 - **GitHub only for now** — the agent's `merge_pr` refuses a GitLab MR / ADO PR (staged `ok:false`)
   so the hub gives up rather than retrying. Merge method is `--squash --delete-branch`,
   env-overridable (`TURMA_AUTOMERGE_METHOD`/`_DELETE_BRANCH`).
 - **Web ⇄ Android parity gap**: the org-menu auto-merge switch shipped on WEB only; Android ignores
   the `autoMergeOrgs` payload key (safe — unknown key) and has no switch yet. Tracked in
   `android/PARITY.md`; the hub route works from web regardless.
-- Tests: the `XERK-550:`/`automerge route:` cases in `server.test.js`, `TestMergePr` in
+- Tests: the `XERK-550:`/`XERK-705:`/`automerge route:` cases in `server.test.js`, `TestMergePr` in
   `test_hub_agent.py`, the auto-merge switch case in `org.test.js`.
 
 ### Ticket ↔ session chips

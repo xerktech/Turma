@@ -161,7 +161,7 @@ test.afterEach(() => {
   // run (the control-WS liveness cases).
   for (const k of Object.keys(autoMergeOrgs)) delete autoMergeOrgs[k];
   autoMergeState.clear();
-  autoClosed.clear();
+  autoCloseNotified.clear();   // XERK-705: per-session merged-PR notify memory
   // XERK-637: an ARMED epic run is now a second reason autoMergeSweep/
   // autoCloseSweep/epicRunCompleteSweep act, so a leaked armed run keeps the live
   // 15s sweep churning `agents` the same way a leaked opt-in did. Drop them too.
@@ -196,7 +196,7 @@ const {
   epicRunChildSession, anyArmedEpicRun, epicRunCompleteSweep, epicDoneWritten,
   autoMergeSweep, autoCloseSweep, prAutoMergeReady, epicNoCiSeen, PR_NO_CI_GRACE_MS,
   autoStartContentGate, orgsWithAutoMerge,
-  autoMergeOrgs, setAutoMergeOrg, autoMergeState, autoClosed, ingestMergeResults,
+  autoMergeOrgs, setAutoMergeOrg, autoMergeState, autoCloseNotified, ingestMergeResults,
   resolveResultWaits, RESULT_WAIT_MAX_MS,
   priorityWriteBackOrgs, setPriorityWriteBackOrg, orgsWithPriorityWriteBack,
   priorityWriteBackSweep, priorityWriteBackSkips,
@@ -11349,7 +11349,7 @@ test("auto-stop: resuming a NON-Done ticket does not exempt a LATER Done (XERK-5
 const PR1 = "https://github.com/x/y/pull/1";
 const resetMerge = () => {
   autoMergeState.clear();
-  autoClosed.clear();
+  autoCloseNotified.clear();
   autoStopped.clear();
   for (const k of Object.keys(autoMergeOrgs)) delete autoMergeOrgs[k];
   // XERK-563: the per-repo merge guard (inflightRepos) scans the WHOLE fleet, so
@@ -11687,16 +11687,18 @@ test("XERK-635: an armed run survives a hub restart (read back from its own file
 });
 
 // ---- auto-close chaining + epic completion (XERK-637, epic XERK-633) --------
-// D advances and completes an armed run: its children auto-merge + auto-close
-// through the SAME XERK-550 sweeps (arming the run is the hands-off opt-in, so it
-// overrides the org auto-merge toggle AND the bug-only floor), and once every
-// child is Done the epic itself is written to Done exactly once and the run goes
+// D advances and completes an armed run: its children auto-MERGE through the
+// XERK-550 sweep (arming the run is the hands-off opt-in, so it overrides the org
+// auto-merge toggle AND the bug-only floor), and once a child's PR lands the hub
+// MESSAGES the child to self-close (XERK-705) rather than forcing its Done+kill.
+// Once every child is Done — self-closed or human-moved — the EPIC itself is written
+// to Done exactly once (still a hub write; the epic has no session) and the run goes
 // terminal. Starting the newly-unblocked wave is C's job (XERK-636), not D's.
 const resetEpicD = () => {
   for (const k of Object.keys(epicRuns)) delete epicRuns[k];
   autoMergeState.clear();
   epicNoCiSeen.clear();
-  autoClosed.clear();
+  autoCloseNotified.clear();
   autoStopped.clear();
   epicDoneWritten.clear();
   for (const k of Object.keys(autoMergeOrgs)) delete autoMergeOrgs[k];
@@ -11726,6 +11728,10 @@ const dChildSession = (id, key, site, prState, url) => ({
   session: { transcriptAgeSec: 30, paneBusy: false } });
 const dCmds = (device) => (agents[device].commands || [])
   .map((c) => [c.type, c.sessionId || c.issueKey, c.category]);
+// XERK-705: the `input` messages queued to sessions (both the org auto-merge stream
+// and epic-run children self-close via these now — no hub Done write / kill).
+const inputTo = (device, sessionId) => (agents[device].commands || [])
+  .filter((c) => c.type === "input" && c.sessionId === sessionId).map((c) => c.text);
 
 test("XERK-637: an armed run's child auto-merges even with NO org opt-in and a non-bug type", async () => {
   resetEpicD();
@@ -11742,7 +11748,10 @@ test("XERK-637: an armed run's child auto-merges even with NO org opt-in and a n
   assert.equal(c.sessionId, "s-c1");
 });
 
-test("XERK-637: an armed run's child auto-closes on a merged PR — Done write + kill, no opt-in", async () => {
+test("XERK-705/637: an armed run's child is MESSAGED to self-close on a merged PR — no Done write, no kill", async () => {
+  // The child self-closes like any session now (XERK-705): the hub messages it, and
+  // its own Done edge (once it moves the ticket) advances the wave via C. No forced
+  // Done write, no forced kill.
   resetEpicD();
   const url = "https://github.com/ep/c1/pull/1";
   await asBeat("edC", "d637-2.atlassian.net", { autoStart: false,
@@ -11751,10 +11760,13 @@ test("XERK-637: an armed run's child auto-closes on a merged PR — Done write +
   armEpicRun("d637-2.atlassian.net", "E-1");
   autoCloseSweep();
   const got = dCmds("edC");
-  assert.ok(got.some(([t, k, cat]) => t === "setTicketStatus" && k === "C-1" && cat === "done"),
-    `expected a Done write for C-1, got ${JSON.stringify(got)}`);
-  assert.ok(got.some(([t, sid]) => t === "kill" && sid === "s-c1"),
-    `expected a kill, got ${JSON.stringify(got)}`);
+  assert.equal(got.filter(([t]) => t === "setTicketStatus").length, 0,
+    `must NOT write Done, got ${JSON.stringify(got)}`);
+  assert.equal(got.filter(([t]) => t === "kill").length, 0,
+    `must NOT kill, got ${JSON.stringify(got)}`);
+  const msgs = inputTo("edC", "s-c1");
+  assert.equal(msgs.length, 1, `expected one message to the child, got ${JSON.stringify(got)}`);
+  assert.match(msgs[0], /mark the ticket as Done/i);
 });
 
 test("XERK-637: an epic child with NO armed run stays excluded, even in an auto-merge org", async () => {
@@ -11773,9 +11785,10 @@ test("XERK-637: an epic child with NO armed run stays excluded, even in an auto-
   assert.equal(kinds.filter((t) => t === "mergePr").length, 0);
   assert.equal(kinds.filter((t) => t === "setTicketStatus").length, 0);
   assert.equal(kinds.filter((t) => t === "kill").length, 0);
+  assert.equal(kinds.filter((t) => t === "input").length, 0);   // not messaged either
 });
 
-test("XERK-637: chain-advance — auto-closing a wave-1 child unblocks dependents, epic NOT done yet", async () => {
+test("XERK-705/637: chain-advance — a wave-1 child self-closing unblocks dependents, epic NOT done yet", async () => {
   resetEpicD();
   const url = "https://github.com/ep/ch/pull/1";
   await asBeat("edCh", "d637-4.atlassian.net", { autoStart: false,
@@ -11786,12 +11799,14 @@ test("XERK-637: chain-advance — auto-closing a wave-1 child unblocks dependent
     sessions: [dChildSession("s-c1", "C-1", "d637-4.atlassian.net", "MERGED", url)] });
   armEpicRun("d637-4.atlassian.net", "E-1");
   assert.deepEqual(epicRuns["d637-4.atlassian.net/E-1"].waves, [["C-1"], ["C-2", "C-3"]]);
-  // C-1 lands -> auto-close produces its Done edge; the epic stays In Progress.
+  // C-1's PR lands -> the hub MESSAGES the child to self-close; nothing is forced,
+  // and the epic stays In Progress.
   autoCloseSweep();
   epicRunCompleteSweep();
   const got = dCmds("edCh");
-  assert.ok(got.some(([t, k, cat]) => t === "setTicketStatus" && k === "C-1" && cat === "done"),
-    `expected C-1 Done, got ${JSON.stringify(got)}`);
+  assert.equal(inputTo("edCh", "s-c1").length, 1, `expected C-1 to be messaged, got ${JSON.stringify(got)}`);
+  assert.equal(got.filter(([t, k]) => t === "setTicketStatus" && k === "C-1").length, 0,
+    "the hub must NOT force C-1 Done — the child self-closes");
   assert.ok(!got.some(([t, k]) => t === "setTicketStatus" && k === "E-1"),
     "the epic must NOT be closed while C-2/C-3 are still open");
   assert.equal(epicRuns["d637-4.atlassian.net/E-1"].state, "running");
@@ -11827,6 +11842,7 @@ test("XERK-637: a child ADDED to the epic after arming (not in run.children) is 
   assert.equal(kinds.filter((t) => t === "mergePr").length, 0);
   assert.equal(kinds.filter((t) => t === "setTicketStatus").length, 0);
   assert.equal(kinds.filter((t) => t === "kill").length, 0);
+  assert.equal(kinds.filter((t) => t === "input").length, 0);   // not messaged either
 });
 
 test("XERK-637: the epic is written to Done exactly once when every child is Done, run terminal", async () => {
@@ -11848,19 +11864,19 @@ test("XERK-637: the epic is written to Done exactly once when every child is Don
   assert.equal(epicRuns["d637-5.atlassian.net/E-1"].state, "done");
 });
 
-test("XERK-637: mixed auto/human completion — one child auto-closed, one human-moved, epic completes", async () => {
+test("XERK-705/637: mixed completion — one child self-closes after its PR, one human-moved, epic completes", async () => {
   resetEpicD();
   const url = "https://github.com/ep/mx/pull/1";
-  // C-1 is being auto-closed (running session, merged PR); C-2 a human already
+  // C-1's PR merged (running session, messaged to self-close); C-2 a human already
   // moved to Done out of band.
   await asBeat("edMx", "d637-6.atlassian.net", { autoStart: false,
     tickets: [dEpic("inprogress"),
       dChild("C-1", [], "inprogress"), dChild("C-2", [], "done")],
     sessions: [dChildSession("s-c1", "C-1", "d637-6.atlassian.net", "MERGED", url)] });
   armEpicRun("d637-6.atlassian.net", "E-1");
-  autoCloseSweep();                                // C-1 -> Done write + kill
-  assert.ok(dCmds("edMx").some(([t, k, cat]) => t === "setTicketStatus" && k === "C-1" && cat === "done"));
-  // The agent applies C-1's Done and re-reports (session gone).
+  autoCloseSweep();                                // C-1 -> messaged to self-close
+  assert.equal(inputTo("edMx", "s-c1").length, 1, "C-1 is messaged to self-close");
+  // C-1 self-marks Done and its session ends; the agent re-reports.
   await asBeat("edMx", "d637-6.atlassian.net", { autoStart: false,
     tickets: [dEpic("inprogress"),
       dChild("C-1", [], "done"), dChild("C-2", [], "done")], sessions: [] });
@@ -12343,7 +12359,7 @@ test("XERK-641: pausing a run halts new child dispatch; resuming restarts it", a
   resetEpicRuns();
 });
 
-test("XERK-641: a paused run's running child is NOT auto-merged/closed — left alone until resume", async () => {
+test("XERK-641: a paused run's running child is NOT auto-merged/messaged — left alone until resume", async () => {
   resetEpicD();
   const url = "https://github.com/ep/p1/pull/1";
   await asBeat("edPm", "e641b.atlassian.net", { autoStart: false,
@@ -12352,23 +12368,25 @@ test("XERK-641: a paused run's running child is NOT auto-merged/closed — left 
   armEpicRun("e641b.atlassian.net", "E-1");
   setEpicRunPaused("e641b.atlassian.net", "E-1", true);
   // A paused run is not "actively driving", so the XERK-550 sweeps early-return and
-  // its running child (a MERGED PR that WOULD auto-close) is untouched.
+  // its running child (a MERGED PR that WOULD be messaged to self-close) is untouched.
   assert.equal(anyArmedEpicRun(), false);
   autoMergeSweep();
   autoCloseSweep();
   const whileHeld = dCmds("edPm");
   assert.equal(whileHeld.filter(([t]) => t === "mergePr").length, 0);
+  assert.equal(whileHeld.filter(([t]) => t === "input").length, 0);
   assert.equal(whileHeld.filter(([t]) => t === "setTicketStatus").length, 0);
   assert.equal(whileHeld.filter(([t]) => t === "kill").length, 0);
-  // Resume -> the same MERGED-PR child now auto-closes: Done write + session kill.
+  // Resume -> the same MERGED-PR child is now MESSAGED to self-close (XERK-705); the
+  // hub still never forces its Done or kill.
   setEpicRunPaused("e641b.atlassian.net", "E-1", false);
   assert.equal(anyArmedEpicRun(), true);
   autoCloseSweep();
   const afterResume = dCmds("edPm");
-  assert.ok(afterResume.some(([t, k, cat]) => t === "setTicketStatus" && k === "C-1" && cat === "done"),
-    `expected a Done write for C-1 after resume, got ${JSON.stringify(afterResume)}`);
-  assert.ok(afterResume.some(([t, sid]) => t === "kill" && sid === "s-c1"),
-    `expected a kill after resume, got ${JSON.stringify(afterResume)}`);
+  assert.equal(inputTo("edPm", "s-c1").length, 1,
+    `expected C-1 to be messaged after resume, got ${JSON.stringify(afterResume)}`);
+  assert.equal(afterResume.filter(([t]) => t === "setTicketStatus").length, 0);
+  assert.equal(afterResume.filter(([t]) => t === "kill").length, 0);
 });
 
 test("XERK-641: pause preserves the DAG/state; a missing run is null; a re-arm keeps the hold", async () => {
@@ -12456,7 +12474,8 @@ test("XERK-641: a paused run's child stays untouched even while ANOTHER active r
   // Proof the sweeps actually ran: EP-A's OPEN-PR child auto-merges.
   assert.ok(cmds.some(([t, sid]) => t === "mergePr" && sid === "s-a1"),
     `expected EP-A's child to auto-merge (sweeps ran), got ${JSON.stringify(cmds)}`);
-  // EP-B is paused: its MERGED-PR child B-1 is NOT closed or killed, though live.
+  // EP-B is paused: its MERGED-PR child B-1 is NOT messaged, closed or killed, though live.
+  assert.equal(inputTo("edMulti", "s-b1").length, 0);
   assert.equal(cmds.filter(([t, k]) => t === "setTicketStatus" && k === "B-1").length, 0);
   assert.equal(cmds.filter(([t, sid]) => t === "kill" && sid === "s-b1").length, 0);
 });
@@ -12775,28 +12794,61 @@ test("a sync-result command acked without a result still stamps unsupported at o
   assert.equal(next.resultWaits.s1, undefined);
 });
 
-test("XERK-550: auto-close moves an all-merged ticket to Done AND kills the session", async () => {
+// XERK-705: the ORG auto-merge stream no longer closes the ticket or kills the
+// session on a merged PR — the session may still have work. It MESSAGES the session
+// to mark the ticket Done itself, re-firing when a FOLLOW-UP PR merges. (The
+// EPIC-run child path keeps the Done+kill, pinned by the XERK-637 cases above.)
+const inputTexts = (device) => (agents[device].commands || [])
+  .filter((c) => c.type === "input").map((c) => c.text);
+
+test("XERK-705: a merged PR MESSAGES the org-stream session — no Done write, no kill", async () => {
   resetMerge();
   await mergeBeat("amC", "amc.atlassian.net", { state: "MERGED" });
   autoCloseSweep();
   const got = cmds("amC");
-  assert.ok(got.some(([t, , cat]) => t === "setTicketStatus" && cat === "done"),
-    `expected a Done write, got ${JSON.stringify(got)}`);
-  assert.ok(got.some(([t, sid]) => t === "kill" && sid === "sm1"),
-    `expected a kill, got ${JSON.stringify(got)}`);
+  assert.equal(got.filter(([t]) => t === "setTicketStatus").length, 0,
+    `must NOT write Done, got ${JSON.stringify(got)}`);
+  assert.equal(got.filter(([t]) => t === "kill").length, 0,
+    `must NOT kill, got ${JSON.stringify(got)}`);
+  const msgs = inputTexts("amC");
+  assert.equal(msgs.length, 1, `expected one input message, got ${JSON.stringify(got)}`);
+  assert.match(msgs[0], /merged/i);
+  assert.match(msgs[0], /mark the ticket as Done/i);
+  assert.equal((agents.amC.commands || []).find((c) => c.type === "input").sessionId, "sm1");
 });
 
-test("XERK-550: auto-close is idempotent across repeated sweeps", async () => {
+test("XERK-705: the message is sent once — a repeat sweep over the same merged set stays quiet", async () => {
   resetMerge();
   await mergeBeat("amC2", "amc2.atlassian.net", { state: "MERGED" });
   autoCloseSweep();
   autoCloseSweep();
-  const got = cmds("amC2");
-  assert.equal(got.filter(([t]) => t === "setTicketStatus").length, 1);
-  assert.equal(got.filter(([t]) => t === "kill").length, 1);
+  assert.equal(inputTexts("amC2").length, 1, "no re-nag while the merged set is unchanged");
 });
 
-test("XERK-550: auto-close waits until EVERY PR has landed", async () => {
+test("XERK-705: a FOLLOW-UP PR merging re-fires the message", async () => {
+  resetMerge();
+  const url2 = "https://github.com/x/y/pull/705";
+  // First: one merged PR -> one message.
+  await mergeBeat("amC2b", "amc2b.atlassian.net", { state: "MERGED" });
+  autoCloseSweep();
+  assert.equal(inputTexts("amC2b").length, 1);
+  // The session opens a second PR (still OPEN) -> not-all-landed -> no new message.
+  await mergeBeat("amC2b", "amc2b.atlassian.net", { prs: [
+    { url: PR1, state: "MERGED", ready: "ready", mergeable: "MERGEABLE" },
+    { url: url2, state: "OPEN", ready: "ready", mergeable: "MERGEABLE" },
+  ] });
+  autoCloseSweep();
+  assert.equal(inputTexts("amC2b").length, 1, "a still-open follow-up PR must not nag");
+  // The follow-up merges -> all landed, a NEW merged url -> the message fires again.
+  await mergeBeat("amC2b", "amc2b.atlassian.net", { prs: [
+    { url: PR1, state: "MERGED", ready: "ready", mergeable: "MERGEABLE" },
+    { url: url2, state: "MERGED", ready: "ready", mergeable: "MERGEABLE" },
+  ] });
+  autoCloseSweep();
+  assert.equal(inputTexts("amC2b").length, 2, "a newly-merged follow-up PR re-fires");
+});
+
+test("XERK-705: auto-close waits until EVERY PR has landed", async () => {
   resetMerge();
   await mergeBeat("amC3", "amc3.atlassian.net", { prs: [
     { url: PR1, state: "MERGED", ready: "ready", mergeable: "MERGEABLE" },
@@ -12806,7 +12858,7 @@ test("XERK-550: auto-close waits until EVERY PR has landed", async () => {
   assert.equal((agents.amC3.commands || []).length, 0);
 });
 
-test("XERK-550: auto-close does nothing without an actually-merged PR (all CLOSED)", async () => {
+test("XERK-705: auto-close does nothing without an actually-merged PR (all CLOSED)", async () => {
   resetMerge();
   await mergeBeat("amC4", "amc4.atlassian.net", { state: "CLOSED" });
   autoCloseSweep();
@@ -12839,20 +12891,19 @@ test("XERK-550: a DRAFT PR is never auto-merged (would gaveUp forever)", async (
   assert.equal(autoMergeState.has(draftUrl), false);  // not even attempted
 });
 
-test("XERK-550: auto-close does NOT kill when the Done write cannot be dispatched", async () => {
-  // No board-cred host can take the setTicketStatus (here: the only host is too
-  // old for it). Killing anyway would orphan the ticket In Progress with a merged
-  // PR and no session, forever. So stand down and retry — never kill.
+test("XERK-705: the org-stream message needs NO board-cred host — it goes to the session", async () => {
+  // The old flow stood down when no host could take the setTicketStatus Done write
+  // (agentGapError). The new flow writes no ticket status at all, so a merge-ready
+  // session is messaged regardless of board-write capability — the session, not the
+  // hub, owns the Done transition now.
   resetMerge();
   await mergeBeat("amO", "amo.atlassian.net", { state: "MERGED" });
-  agents.amO.unsupported = { setTicketStatus: Date.now() };  // agentGapError -> truthy
+  agents.amO.unsupported = { setTicketStatus: Date.now() };  // no board-cred write possible
   autoCloseSweep();
-  assert.equal((agents.amO.commands || []).length, 0, "must neither write Done nor kill");
-  // Once the host can write again, it closes + kills.
-  delete agents.amO.unsupported;
-  autoCloseSweep();
-  const types = (agents.amO.commands || []).map((c) => c.type).sort();
-  assert.deepEqual(types, ["kill", "setTicketStatus"]);
+  const got = cmds("amO");
+  assert.equal(got.filter(([t]) => t === "setTicketStatus").length, 0);
+  assert.equal(got.filter(([t]) => t === "kill").length, 0);
+  assert.equal(inputTexts("amO").length, 1, "the session is still messaged");
 });
 
 test("http: /api/agents does not serialize the jiraIssues cache (served only by /api/jira)", async () => {

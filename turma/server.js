@@ -10807,12 +10807,29 @@ const AUTO_MERGE_RETRY_MS = 2 * 60 * 1000;
 const AUTO_MERGE_MAX_ATTEMPTS = 6;
 const AUTO_MERGE_STATE_MAX = 500;
 const autoMergeState = new Map();
-// "<siteKey>\x00<key>" tickets already moved to Done by autoCloseSweep, so the
-// Done write fires at most once per hub lifetime (like autoStopped for the kill).
-const autoClosed = new Set();
+// XERK-705: a merged PR does NOT close the ticket or kill the session any more, for
+// EITHER stream (the org auto-merge stream AND epic-run children). The session may
+// still have work to do (the PR was just one step), so the hub MESSAGES the running
+// session to mark its OWN ticket Done once it judges the work complete; that Done edge
+// then auto-STOPS it (XERK-45) and, for an epic child, advances the wave / completes
+// the epic (XERK-636/637). This map remembers, per session, which merged PR urls it
+// has already been told about, so a FOLLOW-UP PR merging re-fires the message but a
+// repeat sweep over the same set does not. Keyed "<host>\x00<sessionId>" ->
+// {at, urls:Set<string>}; bounded oldest-first. In-memory only (like autoStopped): a
+// hub restart at worst re-sends one message.
+const autoCloseNotified = new Map();
+const AUTO_CLOSE_NOTIFY_MAX = 500;
+// The message typed into the session (the operator `input` path, so it survives a
+// compaction via the agent's pendingInputs outbox — agent-input.md). Kept close to
+// the ticket's own wording; it is a directive to act, not third-party text, so it
+// rides `input`/send_input rather than the peer inbox.
+const AUTO_CLOSE_MERGED_MESSAGE =
+  "That PR has been merged. If all the work for this ticket is done, mark the "
+  + "ticket as Done (move it to the Done column) so this session can wrap up — "
+  + "otherwise, keep going and it will re-check when your next PR lands.";
 // "<siteKey>\x00<epicKey>" epics already written to Done by epicRunCompleteSweep,
-// so the epic-Done write fires at most once per hub lifetime (like autoClosed for
-// a child). The DURABLE guard is the run's own persisted state:"done" — this Set
+// so the epic-Done write fires at most once per hub lifetime. The DURABLE guard is
+// the run's own persisted state:"done" — this Set
 // only stops a re-fire within one hub lifetime; after a restart a run already
 // marked done is skipped by state, and the setTicketStatus write is re-validated
 // against a fresh read agent-side, so a rare double-write is a harmless no-op.
@@ -10991,53 +11008,76 @@ function autoMergeSweep() {
 }
 
 // PHASE 2: once every PR a session opened has LANDED (and at least one actually
-// MERGED, so a purely-CLOSED PR never closes its ticket), move the ticket to
-// Done AND kill the session. The Done write routes to a board-cred host of the
-// org (like the /status route); the kill goes to the session's host and frees
-// the slot NOW rather than waiting out the ~10-min Jira poll that would surface
-// Done to autoStopSweep — the promptness the whole feature is about.
+// MERGED, so a purely-CLOSED PR never closes its ticket), the hub MESSAGES the
+// running session to mark ITS OWN ticket Done — it never writes Done or kills the
+// session itself (XERK-705). A merged PR is one step, not proof the whole ticket is
+// finished (the session may have a follow-up PR, tests, a migration), so each ticket
+// is TASKED TO SELF-CLOSE: the session validates its work and moves the ticket to
+// Done. That Done edge then does everything the hub used to force:
+//   - autoStopSweep (XERK-45, opt-in-independent) kills the session and frees the slot;
+//   - for an epic-run child, the driver (epicRunDriveSweep, XERK-636) re-evaluates
+//     readiness off the child's Done and starts the next wave, and once every child is
+//     Done epicRunCompleteSweep (XERK-637) writes the EPIC to Done.
+//
+// This applies to BOTH eligibility streams identically — the ORG auto-merge stream
+// (autoMergeSession) AND epic-run children (epicRunChildSession). An epic run no
+// longer force-closes its children (the earlier XERK-637 direct Done+kill is gone):
+// arming a run is still the opt-in that gets the child auto-MERGED and messaged, but
+// the child, like any session, decides for itself when its work is done. TRADE-OFF: a
+// child (or org-stream session) that neither continues nor self-marks Done holds its
+// slot and, for an epic, stalls the wave — the deliberate cost of not closing a ticket
+// behind live work.
+//
+// The message re-fires per NEW merged PR (autoCloseNotified per session), never on a
+// repeat sweep over the same merged set.
 function autoCloseSweep() {
   // As with autoMergeSweep: an org opt-in OR an armed epic run (XERK-637).
   if (!orgsWithAutoMerge().size && !anyArmedEpicRun()) return;
   const rows = fleetTicketRows();
   const byKey = autoMergeRowIndex(rows);
+  const isMerged = (p) => String((p && p.state) || "").toUpperCase() === "MERGED";
   for (const [host, a] of Object.entries(agents)) {
     for (const s of a.sessions || []) {
+      // Either stream makes a session eligible; both react the same way now, so the
+      // OR (disjoint by construction — the content gate nulls autoMergeSession on any
+      // epic child) is all we need.
       const elig = autoMergeSession(s, byKey, rows)
         || epicRunChildSession(s, byKey, rows);
       if (!elig) continue;
       const prs = s.prs || [];
       if (!prs.length || !prs.every(prLanded)) continue;
-      if (!prs.some((p) => String((p && p.state) || "").toUpperCase() === "MERGED")) continue;
-      const tkey = elig.siteKey + "\x00" + elig.key;
-      // The Done write must be QUEUED before the kill — killing a session whose
-      // ticket we can't move to Done orphans it (In Progress, merged PR, no
-      // session, forever, since the killed session then leaves the sweep). So if
-      // no board-cred host can take the write (none reports the org, or every one
-      // is too old for setTicketStatus), stand down this beat and retry — never
-      // kill. Once `autoClosed` holds the ticket the write is on its way (this
-      // beat or a prior one), so the kill is safe.
-      if (!autoClosed.has(tkey)) {
-        const wh = pickBoardWriteHost(elig.siteKey, "setTicketStatus");
-        if (!wh || agentGapError(agents[wh], "setTicketStatus", "close a ticket")) continue;
-        const cmdId = queueCommand(wh, { type: "setTicketStatus", issueKey: elig.key, category: "done" });
-        awaitResult(agents[wh], cmdId, "setTicketStatus");
-        rememberCmdHost(cmdId, wh, "setTicketStatus");
-        autoClosed.add(tkey);
+      if (!prs.some(isMerged)) continue;
+
+      // Message the session; never close/kill it here. Fire only when a merged PR we
+      // have NOT already announced for this session is present, so a follow-up PR
+      // merging nudges again while a repeat sweep over the same set stays quiet.
+      const nk = host + "\x00" + s.id;
+      const mergedUrls = prs.filter(isMerged).map((p) => p.url).filter(Boolean);
+      const rec = autoCloseNotified.get(nk);
+      const seen = rec ? rec.urls : null;
+      const fresh = seen ? mergedUrls.some((u) => !seen.has(u)) : mergedUrls.length > 0;
+      if (fresh) {
+        queueCommand(host, { type: "input", sessionId: s.id, text: AUTO_CLOSE_MERGED_MESSAGE });
+        autoCloseNotified.set(nk, { at: Date.now(), urls: new Set(mergedUrls) });
       }
-      const dk = host + "\x00" + s.id;
-      if (!autoStopped.has(dk)) {
-        queueCommand(host, { type: "kill", sessionId: s.id });
-        autoStopped.add(dk);
-      }
+    }
+  }
+  // Bound the per-session notify map oldest-first (XERK-705) — entries accrue one
+  // per messaged session and are only ever dropped here, so cap the total.
+  if (autoCloseNotified.size > AUTO_CLOSE_NOTIFY_MAX) {
+    const over = autoCloseNotified.size - AUTO_CLOSE_NOTIFY_MAX;
+    for (const [k] of [...autoCloseNotified].sort((x, y) => x[1].at - y[1].at).slice(0, over)) {
+      autoCloseNotified.delete(k);
     }
   }
 }
 
 // PHASE 3 (XERK-637): complete an epic run. Once EVERY child in an armed run has
-// reached Done — whether auto-closed above (a landed PR) or moved by a human out
-// of band — move the EPIC ITSELF to Done (the XERK-138 status write-back, routed
-// to a board-cred host of the org like autoCloseSweep) and mark the run terminal.
+// reached Done — whether the child self-closed after its PR landed (XERK-705, the
+// message autoCloseSweep sends) or a human moved it out of band — move the EPIC
+// ITSELF to Done (the XERK-138 status write-back, routed to a board-cred host of the
+// org) and mark the run terminal. The epic is an organizer with no session of its
+// own, so the hub still writes its Done directly (there is nothing to message).
 //
 // The epic is an ORGANIZER: this is the ONLY step that ever transitions it, and
 // it never gets a work session (XERK-635's never-auto-start gate keeps it out of
@@ -11047,7 +11087,8 @@ function autoCloseSweep() {
 // The DAG is NOT recomputed here (that is C's readiness job, XERK-636) — the run
 // record's static waves/children are B's; D only reads them and reacts to the
 // live board's Done edges. Chaining (starting the newly-unblocked wave) is C's:
-// the Done edge this and autoCloseSweep produce is what C re-evaluates against.
+// the child's self-close Done edge (XERK-705) or a human move is what C re-evaluates
+// against.
 function epicRunCompleteSweep() {
   if (!Object.keys(epicRuns).length) return;
   const rows = fleetTicketRows();
@@ -15912,7 +15953,7 @@ if (process.env.TURMA_TEST) {
     autoMergeOrgs,
     setAutoMergeOrg,
     autoMergeState,
-    autoClosed,
+    autoCloseNotified,
     ingestMergeResults,
     // The capability-gap resolver and its wait TTL. Exported so a test can hold
     // the mergePr-specific rule directly: an ACK whose async worker-thread result
