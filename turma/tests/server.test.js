@@ -11743,6 +11743,16 @@ test("XERK-725: epic-builder route validates input, idea length, org and repo", 
   r = await request("POST", "/api/jira/eb1.atlassian.net/epic-builder",
     { body: { title: "T", idea: "go", targetHost: "ghost" }, headers: userHeaders });
   assert.equal(r.status, 404);
+  // A bad-TYPED repo/targetHost is a 400, never silently coerced to "absent" and
+  // accepted with the operator's intended pin dropped (QA F1).
+  for (const bad of [5, ["x"], { a: 1 }]) {
+    r = await request("POST", "/api/jira/eb1.atlassian.net/epic-builder",
+      { body: { title: "T", idea: "go", repo: bad }, headers: userHeaders });
+    assert.equal(r.status, 400, `repo:${JSON.stringify(bad)} must 400`);
+    r = await request("POST", "/api/jira/eb1.atlassian.net/epic-builder",
+      { body: { title: "T", idea: "go", targetHost: bad }, headers: userHeaders });
+    assert.equal(r.status, 400, `targetHost:${JSON.stringify(bad)} must 400`);
+  }
   // No refusal created a run.
   assert.equal(Object.keys(epicBuilders).length, 0);
 });
@@ -11858,6 +11868,11 @@ test("XERK-725: normalizeEpicBuilderStatus coerces the per-agent report to shape
   assert.equal("epicKey" in a.epicBuilderStatus[0], false);
   assert.equal("error" in a.epicBuilderStatus[0], false);
   assert.equal("id" in a.epicBuilderStatus[1], false);
+  // Every string field is re-capped, `state` included (QA F2) — an oversize one
+  // would otherwise ride /api/agents + every SSE frame at full length.
+  const b = { epicBuilderStatus: [{ id: "y", state: "S".repeat(5000) }] };
+  normalizeEpicBuilderStatus(b);
+  assert.equal(b.epicBuilderStatus[0].state.length, 64);
 });
 
 test("XERK-725: arming a builder pushes an epicBuilders SSE frame", async () => {

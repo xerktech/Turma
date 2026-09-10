@@ -6620,6 +6620,12 @@ function normalizeEpicBuilderStatus(a) {
       if (k in s && typeof s[k] !== "string") delete s[k];
     }
     if (typeof s.id === "string" && s.id.length > 64) s.id = s.id.slice(0, 64);
+    // `state` is re-capped like every other string here — a host reporting a
+    // multi-MB `state` would otherwise ride /api/agents + every SSE frame at full
+    // length beside the capped siblings (bounded per record by AGENT_RECORD_MAX,
+    // but a wire hazard the moment a client types the field — the heartbeat
+    // contract). The VALUE (which state it is) is still advanceEpicBuilder's check.
+    if (typeof s.state === "string" && s.state.length > 64) s.state = s.state.slice(0, 64);
     if (typeof s.epicKey === "string" && s.epicKey.length > 64) s.epicKey = s.epicKey.slice(0, 64);
     if (typeof s.error === "string" && s.error.length > 500) s.error = s.error.slice(0, 500);
   }
@@ -15363,14 +15369,19 @@ const server = http.createServer(async (req, res) => {
       if (title.length > EPIC_BUILDER_TITLE_MAX) {
         return json(res, 400, { error: `title must be at most ${EPIC_BUILDER_TITLE_MAX} characters` });
       }
-      const repo = typeof body.repo === "string" && body.repo ? body.repo : null;
-      const targetHost = typeof body.targetHost === "string" && body.targetHost ? body.targetHost : null;
-      if (repo !== null && (typeof body.repo !== "string" || body.repo.length > 200)) {
+      // Validate the RAW body field, not the coerced value: a bad-TYPED repo
+      // (number/array/object) must 400, not be silently coerced to "absent" and
+      // return 200 with the operator's intended pin dropped. `!= null` lets an
+      // omitted / explicit-null / "" field mean "the builder picks one"; anything
+      // else present must be a string within bound.
+      if (body.repo != null && (typeof body.repo !== "string" || body.repo.length > 200)) {
         return json(res, 400, { error: "repo must be a repo name" });
       }
-      if (targetHost !== null && (typeof body.targetHost !== "string" || body.targetHost.length > 200)) {
+      if (body.targetHost != null && (typeof body.targetHost !== "string" || body.targetHost.length > 200)) {
         return json(res, 400, { error: "targetHost must be a host name" });
       }
+      const repo = typeof body.repo === "string" && body.repo ? body.repo : null;
+      const targetHost = typeof body.targetHost === "string" && body.targetHost ? body.targetHost : null;
       // The idea is bounded because it rides both the durable record (served on
       // the payload + SSE) and the dispatch command — an oversize one is a 413,
       // the size refusal, not a malformed request.
