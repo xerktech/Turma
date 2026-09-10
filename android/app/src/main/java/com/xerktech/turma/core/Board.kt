@@ -5,6 +5,7 @@ import com.xerktech.turma.model.CreateMetaEnvelope
 import com.xerktech.turma.model.CreateProject
 import com.xerktech.turma.model.CreateResultEnvelope
 import com.xerktech.turma.model.CreateType
+import com.xerktech.turma.model.EpicBuilder
 import com.xerktech.turma.model.EpicRun
 import com.xerktech.turma.model.JiraIssueDetail
 import com.xerktech.turma.model.JiraIssueEnvelope
@@ -252,6 +253,82 @@ fun epicRunSig(view: EpicRunView?): String {
     return "${view.state}|${if (view.paused) "p" else ""}|${view.done}/${view.total}" +
         "|${view.count(EpicChildStatus.RUNNING)},${view.count(EpicChildStatus.READY)}," +
         "${view.count(EpicChildStatus.BLOCKED)}"
+}
+
+// The epic-builder states, in order (board.js EPIC_BUILDER_STATES / hub
+// EPIC_BUILDER_STATES). An unknown value coerces to "queued".
+val EPIC_BUILDER_STATES = listOf("queued", "researching", "creating", "done", "failed")
+
+/**
+ * One row of the epic-builder progress strip (board.js epicBuilderRows entry).
+ * A pure projection of one `epicBuilders` record, with its state coerced to a
+ * known value and its optional fields defaulted to "".
+ */
+data class EpicBuilderRow(
+    val id: String,
+    val siteKey: String,
+    val title: String,
+    val idea: String,
+    val state: String,
+    val host: String,
+    val repo: String,
+    val epicKey: String,
+    val error: String,
+    val startedAt: Long,
+    val updatedAt: Long,
+) {
+    val terminal: Boolean get() = state == "done" || state == "failed"
+}
+
+/**
+ * Normalize the hub's `epicBuilders` map to a sorted list of rows for the orgs
+ * in [siteKeys] (empty = every org, matching TurmaOrg.getKeys()). A record with
+ * no siteKey or title is DROPPED (unusable) and the state is coerced to a known
+ * value; newest-first by updatedAt then startedAt, id breaking the tie so the
+ * order is deterministic (for tests + a stable repaint). A pure port of
+ * board.js `epicBuilderRows`.
+ */
+fun epicBuilderRows(
+    epicBuilders: Map<String, EpicBuilder>?,
+    siteKeys: Set<String>,
+): List<EpicBuilderRow> {
+    val rows = ArrayList<EpicBuilderRow>()
+    for ((id, r) in epicBuilders ?: emptyMap()) {
+        val siteKey = r.siteKey
+        val title = r.title
+        if (siteKey.isBlank() || title.isBlank()) continue
+        if (siteKeys.isNotEmpty() && siteKey !in siteKeys) continue
+        rows.add(
+            EpicBuilderRow(
+                id = r.id.ifBlank { id },
+                siteKey = siteKey,
+                title = title,
+                idea = r.idea,
+                state = if (r.state in EPIC_BUILDER_STATES) r.state else "queued",
+                host = r.host,
+                repo = r.repo,
+                epicKey = r.epicKey,
+                error = r.error,
+                startedAt = r.startedAt,
+                updatedAt = r.updatedAt,
+            ),
+        )
+    }
+    rows.sortWith(
+        compareByDescending<EpicBuilderRow> { it.updatedAt }
+            .thenByDescending { it.startedAt }
+            .thenBy { it.id },
+    )
+    return rows
+}
+
+/** The progress strip's state label (board.js epicBuilderStateLabel). */
+fun epicBuilderStateLabel(state: String): String = when (state) {
+    "researching" -> "Researching"
+    "creating" -> "Creating epic"
+    "done" -> "Done"
+    "failed" -> "Failed"
+    else -> "Queued"
 }
 
 /**

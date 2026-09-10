@@ -8,6 +8,7 @@ import com.xerktech.turma.model.CreateResultEnvelope
 import com.xerktech.turma.model.CreateTicketRequest
 import com.xerktech.turma.model.CreateTicketResponse
 import com.xerktech.turma.model.DshTrajectory
+import com.xerktech.turma.model.EpicBuilderResponse
 import com.xerktech.turma.model.HistoryResponse
 import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.SearchResponse
@@ -322,6 +323,26 @@ interface HubApi {
         @Path("siteKey") siteKey: String,
         @Path("epicKey") epicKey: String,
         @Body body: kotlinx.serialization.json.JsonObject,
+    ): retrofit2.Response<OkResponse>
+
+    // Arm an epic-builder run (XERK-725/731): expand an idea into an
+    // Auto-Epic-ready epic. Body: {title, idea, repo?, targetHost?}. 200
+    // {ok, run} with the minted builder record, or 4xx/5xx {error}. The fleet
+    // payload's `epicBuilders` (+ SSE) reflects its progress.
+    @POST("api/jira/{siteKey}/epic-builder")
+    suspend fun armEpicBuilder(
+        @Path("siteKey") siteKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): retrofit2.Response<EpicBuilderResponse>
+
+    // Cancel / dismiss an epic-builder run (XERK-725/731). 200 {ok}, or 404 once
+    // it has already left the store — which satisfies the operator's intent, so
+    // the caller treats 404 like success. The dispatched builder session, if any,
+    // is not hub-reachable and is left to end on its own (hub clearEpicBuilder).
+    @DELETE("api/jira/{siteKey}/epic-builder/{id}")
+    suspend fun cancelEpicBuilder(
+        @Path("siteKey") siteKey: String,
+        @Path("id") id: String,
     ): retrofit2.Response<OkResponse>
 
     // Patch an org's triage policy (XERK-486): the knobs the hub's auto-start

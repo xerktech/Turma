@@ -1280,4 +1280,72 @@ class BoardTest {
         assertEquals("Max auto-starts must be a whole number between 1 and 50 (or empty for the default)", rateMaxError("abc"))
         assertEquals("Max auto-starts must be a whole number between 1 and 50 (or empty for the default)", rateMaxError("-1"))
     }
+
+    // --- epic-builder progress strip (XERK-731) -----------------------------
+
+    private fun mkBuilder(
+        id: String,
+        siteKey: String = "org",
+        title: String = "An idea",
+        state: String = "queued",
+        epicKey: String = "",
+        host: String = "",
+        error: String = "",
+        startedAt: Long = 0,
+        updatedAt: Long = 0,
+    ) = com.xerktech.turma.model.EpicBuilder(
+        id = id, siteKey = siteKey, title = title, state = state, epicKey = epicKey,
+        host = host, error = error, startedAt = startedAt, updatedAt = updatedAt)
+
+    @Test fun `epicBuilderRows keeps the id, coerces an unknown state, drops the unusable`() {
+        val map = mapOf(
+            "a" to mkBuilder("a", state = "researching"),
+            "b" to mkBuilder("b", state = "bogus"),               // unknown -> queued
+            "c" to mkBuilder("c", title = ""),                    // no title -> dropped
+            "d" to mkBuilder("d", siteKey = ""),                  // no siteKey -> dropped
+            "e" to mkBuilder(id = "", title = "keyed by map id"), // blank id -> falls back to map key
+        )
+        val rows = epicBuilderRows(map, emptySet())
+        assertEquals(setOf("a", "b", "e"), rows.map { it.id }.toSet())
+        assertEquals("researching", rows.first { it.id == "a" }.state)
+        assertEquals("queued", rows.first { it.id == "b" }.state)   // coerced
+        assertEquals("keyed by map id", rows.first { it.id == "e" }.title)
+    }
+
+    @Test fun `epicBuilderRows scopes to the org filter, empty means every org`() {
+        val map = mapOf(
+            "a" to mkBuilder("a", siteKey = "org1"),
+            "b" to mkBuilder("b", siteKey = "org2"),
+        )
+        assertEquals(setOf("a", "b"), epicBuilderRows(map, emptySet()).map { it.id }.toSet())
+        assertEquals(listOf("a"), epicBuilderRows(map, setOf("org1")).map { it.id })
+        assertEquals(listOf("b"), epicBuilderRows(map, setOf("org2")).map { it.id })
+        assertTrue(epicBuilderRows(map, setOf("org9")).isEmpty())
+        assertTrue(epicBuilderRows(null, emptySet()).isEmpty())
+    }
+
+    @Test fun `epicBuilderRows sorts newest-first by updatedAt then startedAt then id`() {
+        val map = mapOf(
+            "a" to mkBuilder("a", updatedAt = 100, startedAt = 10),
+            "b" to mkBuilder("b", updatedAt = 300, startedAt = 30),
+            "c" to mkBuilder("c", updatedAt = 300, startedAt = 20),  // same updatedAt as b, older startedAt
+            "d" to mkBuilder("d", updatedAt = 300, startedAt = 20),  // ties c -> id breaks it
+        )
+        assertEquals(listOf("b", "c", "d", "a"), epicBuilderRows(map, emptySet()).map { it.id })
+    }
+
+    @Test fun `epicBuilderStateLabel words each state`() {
+        assertEquals("Queued", epicBuilderStateLabel("queued"))
+        assertEquals("Researching", epicBuilderStateLabel("researching"))
+        assertEquals("Creating epic", epicBuilderStateLabel("creating"))
+        assertEquals("Done", epicBuilderStateLabel("done"))
+        assertEquals("Failed", epicBuilderStateLabel("failed"))
+        assertEquals("Queued", epicBuilderStateLabel("anything-else"))
+    }
+
+    @Test fun `an epic-builder row is terminal only when done or failed`() {
+        assertTrue(epicBuilderRows(mapOf("a" to mkBuilder("a", state = "done")), emptySet()).first().terminal)
+        assertTrue(epicBuilderRows(mapOf("a" to mkBuilder("a", state = "failed")), emptySet()).first().terminal)
+        assertFalse(epicBuilderRows(mapOf("a" to mkBuilder("a", state = "creating")), emptySet()).first().terminal)
+    }
 }
