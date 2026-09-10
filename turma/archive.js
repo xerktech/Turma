@@ -1780,6 +1780,27 @@ const DSH_TRAJ_READ_MAX = 8 * 1024 * 1024;    // bytes of the log we scan (tail)
 const DSH_TRAJ_TURNS_MAX = 1000;              // turns kept (newest)
 const DSH_TRAJ_CALLS_MAX = 4000;              // tool calls kept (across turns)
 const DSH_TRAJ_SNIPPET = 400;                 // per tool-call arg snippet
+// The bounded-FULL copy behind the UI's expand-to-full toggle (XERK-720). The
+// snippet above stays the collapsed display; when a field is longer, the fold
+// also carries up to this many chars so the operator can expand it in place
+// instead of only ever seeing the first 400. Per-field bounded AND — because
+// every field is a slice of the tail-capped read — bounded in aggregate by the
+// read cap, so this never ships more than the reducer already held in memory.
+const DSH_TRAJ_FULL_MAX = 1024 * 1024;        // per text/args/result full copy
+
+// Attach a snippeted display value to obj[key], plus — only when the value was
+// actually cut — a bounded-full copy obj[key+"Full"] (and obj[key+"Clipped"]
+// when even that bound truncated) for the UI's expand-to-full toggle (XERK-720).
+// Additive to the trajectory contract: a fold that omits the extras leaves the
+// field simply un-expandable (the superset rule). A short value sets only the
+// display key, so the common case is unchanged.
+function attachTrajSnip(obj, key, s, snipMax, fullMax) {
+  s = String(s == null ? "" : s);
+  if (s.length <= snipMax) { obj[key] = s; return; }
+  obj[key] = s.slice(0, snipMax) + "…";
+  obj[key + "Full"] = s.length > fullMax ? s.slice(0, fullMax) : s;
+  if (s.length > fullMax) obj[key + "Clipped"] = true;
+}
 
 function dshTrajNum(x) {
   return (typeof x === "number" && isFinite(x) && x >= 0) ? Math.floor(x) : 0;
@@ -1880,12 +1901,13 @@ function dshTrajectory(transcriptId) {
     if (type === "tool/call" && typeof tn === "number") {
       totals.toolCalls++;
       if (calls < DSH_TRAJ_CALLS_MAX) {
-        getTurn(tn).calls.push({
+        const call = {
           name: String(d.name || "?"),
           callId: d.callId != null ? String(d.callId) : null,
           at: time, ok: null, error: false,
-          args: snip(dshArgStr(d.arguments)),
-        });
+        };
+        attachTrajSnip(call, "args", dshArgStr(d.arguments), DSH_TRAJ_SNIPPET, DSH_TRAJ_FULL_MAX);
+        getTurn(tn).calls.push(call);
         calls++;
       } else callsDropped++;
       continue;
@@ -1956,6 +1978,7 @@ const TRAJ_READ_MAX = DSH_TRAJ_READ_MAX;      // bytes of the log we scan (tail)
 const TRAJ_TURNS_MAX = DSH_TRAJ_TURNS_MAX;    // turns kept (newest)
 const TRAJ_CALLS_MAX = DSH_TRAJ_CALLS_MAX;    // tool calls kept (across turns)
 const TRAJ_SNIPPET = DSH_TRAJ_SNIPPET;        // per text/args/result snippet (=400)
+const TRAJ_FULL_MAX = DSH_TRAJ_FULL_MAX;      // per text/args/result full copy (expand)
 // The native Qwen store dir inside the raw layer (mirrors hub-agent.py's
 // QWEN_STORE_DIRNAME) — the fallback when no projected <sid>.jsonl is present.
 const TRAJ_QWEN_STORE_DIRNAME = "qwen";
@@ -2073,8 +2096,10 @@ function claudeTrajectoryFromText(transcriptId, text, truncated) {
     tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
 
   const openTurn = (time, userText) => {
+    let user = null;
+    if (userText != null) { user = {}; attachTrajSnip(user, "text", userText, TRAJ_SNIPPET, TRAJ_FULL_MAX); }
     cur = { turn: totals.turns + 1, startedAt: time, endedAt: time, durationMs: null,
-      user: userText == null ? null : { text: snip(userText) },
+      user,
       output: [], model: null,
       calls: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       reason: null };
@@ -2083,14 +2108,21 @@ function claudeTrajectoryFromText(transcriptId, text, truncated) {
   };
   const ensureTurn = (time) => cur || openTurn(time, null);
   const touchEnd = (time) => { if (cur && time != null) cur.endedAt = time; };
+  // Push a model-output block (text/thinking) with the snippet + expand-full copy.
+  const pushOut = (kind, text) => {
+    const b = { kind };
+    attachTrajSnip(b, "text", text, TRAJ_SNIPPET, TRAJ_FULL_MAX);
+    cur.output.push(b);
+  };
 
   const openCall = (id, name, input, time) => {
     totals.toolCalls++;
     if (calls >= TRAJ_CALLS_MAX) { callsDropped++; return; }
     const call = { name: String(name || "?"),
       callId: id != null ? String(id) : null,
-      at: time, ok: null, error: false, args: snip(asStr(input)),
+      at: time, ok: null, error: false,
       result: null, durationMs: null };
+    attachTrajSnip(call, "args", asStr(input), TRAJ_SNIPPET, TRAJ_FULL_MAX);
     ensureTurn(time).calls.push(call);
     if (call.callId != null) callsById.set(call.callId, call);
     calls++;
@@ -2104,7 +2136,7 @@ function claudeTrajectoryFromText(transcriptId, text, truncated) {
     const call = callsById.get(String(id));
     if (!call || call.ok !== null) return;
     call.ok = !isError; call.error = !!isError;
-    call.result = snip(resultText);
+    attachTrajSnip(call, "result", resultText, TRAJ_SNIPPET, TRAJ_FULL_MAX);
     call.durationMs = (call.at != null && time != null) ? Math.max(0, time - call.at) : null;
     if (isError) totals.errors++;
   };
@@ -2143,9 +2175,9 @@ function claudeTrajectoryFromText(transcriptId, text, truncated) {
           if (p.functionCall && typeof p.functionCall === "object") {
             openCall(p.functionCall.id, p.functionCall.name, p.functionCall.args, time);
           } else if (p.thought) {
-            cur.output.push({ kind: "thinking", text: snip(p.text || "") });
+            pushOut("thinking", p.text || "");
           } else if (typeof p.text === "string") {
-            cur.output.push({ kind: "text", text: snip(p.text) });
+            pushOut("text", p.text);
           }
         }
         const um = (e.usageMetadata && typeof e.usageMetadata === "object") ? e.usageMetadata : null;
@@ -2191,10 +2223,10 @@ function claudeTrajectoryFromText(transcriptId, text, truncated) {
       const c = Array.isArray(m.content) ? m.content : [];
       for (const b of c) {
         if (!b || typeof b !== "object") continue;
-        if (b.type === "text") cur.output.push({ kind: "text", text: snip(b.text || "") });
+        if (b.type === "text") pushOut("text", b.text || "");
         // On this fleet extended-thinking is stored ENCRYPTED: `thinking` is empty
         // and only `signature` is present — emit the block, NEVER surface `signature`.
-        else if (b.type === "thinking") cur.output.push({ kind: "thinking", text: snip(b.thinking || "") });
+        else if (b.type === "thinking") pushOut("thinking", b.thinking || "");
         else if (b.type === "tool_use") openCall(b.id, b.name, b.input, time);
       }
       // Claude splits one assistant message across lines that repeat the SAME
@@ -2270,22 +2302,30 @@ function renderedTrajectory(transcriptId, runtime) {
   const totals = { turns: 0, toolCalls: 0, errors: 0, tokens: null };
 
   const openTurn = (time, userText) => {
+    let user = null;
+    if (userText != null) { user = {}; attachTrajSnip(user, "text", userText, TRAJ_SNIPPET, TRAJ_FULL_MAX); }
     cur = { turn: totals.turns + 1, startedAt: time, endedAt: time, durationMs: null,
-      user: userText == null ? null : { text: snip(userText) },
+      user,
       output: [], model: null, calls: [], tokens: null, reason: null };
     turns.push(cur); totals.turns++;
     return cur;
   };
   const ensureTurn = (time) => cur || openTurn(time, null);
   const touchEnd = (time) => { if (cur && time != null) cur.endedAt = time; };
+  const pushOut = (kind, text) => {
+    const b = { kind };
+    attachTrajSnip(b, "text", text, TRAJ_SNIPPET, TRAJ_FULL_MAX);
+    cur.output.push(b);
+  };
 
   const openCall = (id, name, args, time) => {
     totals.toolCalls++;
     if (calls >= TRAJ_CALLS_MAX) { callsDropped++; return; }
     const call = { name: String(name || "?"),
       callId: id != null ? String(id) : null,
-      at: time, ok: null, error: false, args: snip(args),
+      at: time, ok: null, error: false,
       result: null, durationMs: null };
+    attachTrajSnip(call, "args", args, TRAJ_SNIPPET, TRAJ_FULL_MAX);
     ensureTurn(time).calls.push(call);
     if (call.callId != null) callsById.set(call.callId, call);
     calls++;
@@ -2295,7 +2335,7 @@ function renderedTrajectory(transcriptId, runtime) {
     const call = callsById.get(String(id));
     if (!call || call.ok !== null) return;
     call.ok = !isError; call.error = !!isError;
-    call.result = snip(resultText);
+    attachTrajSnip(call, "result", resultText, TRAJ_SNIPPET, TRAJ_FULL_MAX);
     call.durationMs = (call.at != null && time != null) ? Math.max(0, time - call.at) : null;
     if (isError) totals.errors++;
   };
@@ -2328,14 +2368,14 @@ function renderedTrajectory(transcriptId, runtime) {
       for (const b of blocks) {
         if (!b || typeof b !== "object") continue;
         if (b.t === "text" || b.t === "compact_summary" || b.t === "away_summary") {
-          if (b.text) cur.output.push({ kind: "text", text: snip(b.text) });
+          if (b.text) pushOut("text", b.text);
         } else if (b.t === "thinking") {
-          cur.output.push({ kind: "thinking", text: snip(b.text || "") });
+          pushOut("thinking", b.text || "");
         } else if (b.t === "command") {
           const line = b.args ? `${b.name || ""} ${b.args}` : String(b.name || "");
-          cur.output.push({ kind: "text", text: snip(line) });
+          pushOut("text", line);
         } else if (b.t === "command_output") {
-          if (b.text) cur.output.push({ kind: "text", text: snip(b.text) });
+          if (b.text) pushOut("text", b.text);
         } else if (b.t === "interrupt") {
           cur.reason = "interrupt";
         } else if (b.t === "tool_use") {

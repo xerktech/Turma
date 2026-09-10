@@ -97,6 +97,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   dsh chat, and is NOT being generalized to Claude/Qwen nor to the ended-session view here.
   Recorded web-only like the archive Restore picker (XERK-453); a later ticket can port the shared
   view to the phone if a need appears. Shape/renderer invariants: `.claude/rules/trajectory.md`.
+  The XERK-720 additions — an absolute wall-clock timestamp on the head/turn/call and an
+  expand-to-full toggle for any ellipsis-snippeted field — are part of this same web-only pane, so
+  no Android/glasses change; a future port carries them with it.
 
 ## Done (this pass — first installment)
 

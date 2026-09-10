@@ -193,7 +193,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
       + " openSubagentView, transcriptBack,"
       + " chatToTerminal, terminalToChat, chatToTrajectory, trajectoryToChat, renderTrajectory,"
-      + " transcriptToTrajectory, trajectoryBack,"
+      + " transcriptToTrajectory, trajectoryBack, trajScrollClick,"
       + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
       + " applyAgent, mergeSnapshot, sseClock: () => sseClock,"
       + " setCache: (c) => { cache = c; }, getCache: () => cache, setDraft: (t) => { renameDraft = t; },"
@@ -2958,6 +2958,55 @@ test("XERK-717: renderTrajectory escapes every interpolated field (stored XSS)",
   const h = scroll.innerHTML;
   assert.ok(!h.includes("<script>"), "no raw <script> survives");
   assert.ok(h.includes("&lt;script&gt;"), "the payload is escaped");
+});
+
+test("XERK-720: renderTrajectory renders absolute timestamps on head/turn/call", () => {
+  const page = loadPage();
+  const scroll = makeEl("trajScroll");
+  page.renderTrajectory(scroll, claudeTraj());
+  const h = scroll.innerHTML;
+  const clocks = (h.match(/traj-time/g) || []).length;
+  assert.ok(clocks >= 3, `head + turn + call each carry a clock (saw ${clocks})`);
+  // A null timestamp renders as absent, never as 0/epoch.
+  const scroll2 = makeEl("trajScroll2");
+  page.renderTrajectory(scroll2, claudeTraj({ startedAt: null,
+    turns: [trajTurn({ startedAt: null, calls: [{ name: "Bash", ok: true, error: false, args: "x", at: null }] })] }));
+  assert.ok(!scroll2.innerHTML.includes("traj-time"), "no clock when every timestamp is null");
+});
+
+test("XERK-720: a snipped field gets an expand toggle + hidden full copy; both escaped", () => {
+  const page = loadPage();
+  const scroll = makeEl("trajScroll");
+  const x = "<img src=x onerror=alert(1)>";
+  page.renderTrajectory(scroll, claudeTraj({
+    turns: [trajTurn({
+      user: { text: "arg…", textFull: "argument full body " + x, textClipped: true },
+      output: [{ kind: "text", text: "out…", textFull: "output full " + x }],
+      calls: [{ name: "Bash", callId: "c1", ok: true, error: false, at: 1500, durationMs: 1,
+        args: "ls…", argsFull: "ls -la /a/very/long/path " + x,
+        result: "res…", resultFull: "the full result " + x }],
+    })],
+  }));
+  const h = scroll.innerHTML;
+  assert.ok(h.includes("traj-exp-toggle"), "an expand toggle is offered");
+  assert.ok(h.includes("traj-snip") && h.includes("traj-full"), "snippet + full both present");
+  assert.ok(h.includes("argument full body") && h.includes("the full result"), "full copies are in the DOM (hidden via CSS)");
+  assert.ok(h.includes("traj-clip"), "a clipped full copy is marked");
+  // The full copy is attacker content too — it must be escaped, not injected.
+  assert.ok(!h.includes("<img src=x onerror"), "no raw <img> survives from a full copy");
+  assert.ok(h.includes("&lt;img src=x onerror=alert(1)&gt;"), "the full-copy payload is escaped");
+});
+
+test("XERK-720: a short (un-snipped) field offers no expand toggle", () => {
+  const page = loadPage();
+  const scroll = makeEl("trajScroll");
+  page.renderTrajectory(scroll, claudeTraj());  // fixture has no *Full fields
+  assert.ok(!scroll.innerHTML.includes("traj-exp-toggle"), "no toggle when nothing was snipped");
+  // The delegated click handler flips `.exp` on the clicked field's wrapper.
+  const wrap = { classList: { toggled: false, toggle() { this.toggled = true; } } };
+  const btn = { closest: (sel) => sel === ".traj-exp-toggle" ? btn : null, parentElement: wrap };
+  page.trajScrollClick({ target: btn });
+  assert.ok(wrap.classList.toggled, "clicking the toggle flips .exp on the wrapper");
 });
 
 test("XERK-717: the Trajectory toggle shows beside Terminal for claude, replaces it for dsh, hidden with no transcript", () => {
