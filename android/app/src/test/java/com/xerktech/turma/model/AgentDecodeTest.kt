@@ -374,6 +374,39 @@ class AgentDecodeTest {
         assertTrue(bare.ticketRuntimes.isEmpty())
     }
 
+    // XERK-731: the top-level epicBuilders map — an operator's idea expanded into
+    // an Auto-Epic-ready epic. Newly TYPED on AgentsResponse, so (per the XERK-338
+    // decode-fatality rule) it must decode the well-formed shape, default cleanly
+    // when a pre-XERK-731 hub omits it, and NOT throw on a partial/older entry —
+    // which would hide the WHOLE fleet from the atomic poll.
+    @Test fun `the epicBuilders map decodes, defaults when absent, and tolerates a partial entry`() {
+        val body = """
+            { "now": 1, "agents": [],
+              "epicBuilders": {
+                "b1": { "id": "b1", "siteKey": "org.atlassian.net", "title": "Ship X",
+                        "idea": "make it", "state": "done", "host": "h1", "repo": "turma",
+                        "epicKey": "X-9", "startedAt": 10, "updatedAt": 20 },
+                "b2": { "id": "b2", "siteKey": "org.atlassian.net", "title": "Y" } } }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val b1 = resp.epicBuilders["b1"]!!
+        assertEquals("done", b1.state)
+        assertEquals("X-9", b1.epicKey)
+        assertEquals(20L, b1.updatedAt)
+        // A partial entry (older/mid-flight) defaults its absent fields, not a throw.
+        val b2 = resp.epicBuilders["b2"]!!
+        assertEquals("queued", b2.state)     // the field default
+        assertEquals("", b2.epicKey)
+        assertEquals(0L, b2.updatedAt)
+        // A hub predating the field sends none; it defaults to an empty map, and
+        // every other host in the payload still decodes.
+        val bare = TurmaJson.decodeFromString<AgentsResponse>(
+            """{ "now": 1, "agents": [ { "key": "h", "device": "h", "online": true } ] }""",
+        )
+        assertTrue(bare.epicBuilders.isEmpty())
+        assertEquals(listOf("h"), bare.agents.map { it.key })
+    }
+
     @Test fun `the autoStartOrgs and autoMergeOrgs maps decode independently (XERK-550)`() {
         // The two per-org opt-ins are separate top-level maps; auto-merge must
         // not be inferred from auto-start.

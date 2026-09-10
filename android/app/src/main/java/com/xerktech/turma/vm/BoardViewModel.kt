@@ -82,9 +82,16 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     private val _queueDrops = MutableStateFlow<Set<String>>(emptySet())
     val queueDrops: StateFlow<Set<String>> = _queueDrops
 
+    // Epic-builder runs optimistically dismissed (XERK-731) — keyed by builder
+    // id. A ✕ drops the row from the strip at once; the beat that no longer lists
+    // the id retires the overlay (sweepEpicBuilders), and a refused DELETE (not a
+    // 404, which means "already gone") restores it and toasts the hub's words.
+    private val _ebDismissed = MutableStateFlow<Set<String>>(emptySet())
+    val ebDismissed: StateFlow<Set<String>> = _ebDismissed
+
     init {
         // Sweep on every fleet beat (web board.html sweepStarts on each render).
-        viewModelScope.launch { container.fleet.state.collect { sweepStarts(it); sweepMoves(it); sweepQueue(it) } }
+        viewModelScope.launch { container.fleet.state.collect { sweepStarts(it); sweepMoves(it); sweepQueue(it); sweepEpicBuilders(it) } }
     }
 
     fun start() = container.fleet.start()
@@ -181,6 +188,17 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         if (adds != _queueAdds.value) _queueAdds.value = adds
         val drops = _queueDrops.value.filterTo(mutableSetOf()) { it in inHub }
         if (drops != _queueDrops.value) _queueDrops.value = drops
+    }
+
+    /**
+     * Retire the epic-builder dismissals the hub has caught up with (XERK-731) —
+     * run on the same beat as [sweepQueue]. A dismissal goes once the hub no
+     * longer lists that builder id, so the overlay can never outlive the truth.
+     */
+    private fun sweepEpicBuilders(fleet: com.xerktech.turma.net.FleetState) {
+        val inHub = fleet.epicBuilders.keys
+        val kept = _ebDismissed.value.filterTo(mutableSetOf()) { it in inHub }
+        if (kept != _ebDismissed.value) _ebDismissed.value = kept
     }
 
     /** Resolve in-flight starts against the fleet — web board.html sweepStarts. */
@@ -347,6 +365,65 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun startEpicRun(siteKey: String, epicKey: String) {
         viewModelScope.launch { setEpicRun(siteKey, epicKey, clear = false)?.let { _messages.tryEmit("✗ $it") } }
+    }
+
+    /**
+     * Arm an epic-builder run from an idea (XERK-725/731) — the composer's Build
+     * button. POSTs {title, idea, repo?, targetHost?}; the hub mints a durable
+     * builder run and streams its progress back on the fleet payload's
+     * `epicBuilders`, so the client nudges rather than reading the returned
+     * record. Returns null on success (the sheet closes), or the hub's own words
+     * on a refusal (XERK-264) so the composer can show it inline.
+     */
+    suspend fun armEpicBuilder(
+        siteKey: String,
+        title: String,
+        idea: String,
+        repo: String?,
+        targetHost: String?,
+    ): String? {
+        val body = buildJsonObject {
+            put("title", JsonPrimitive(title))
+            put("idea", JsonPrimitive(idea))
+            if (!repo.isNullOrBlank()) put("repo", JsonPrimitive(repo))
+            if (!targetHost.isNullOrBlank()) put("targetHost", JsonPrimitive(targetHost))
+        }
+        return try {
+            val r = container.client.api.armEpicBuilder(siteKey, body)
+            val b = r.body()
+            if (!r.isSuccessful || b?.ok != true) {
+                b?.error?.takeIf { it.isNotBlank() } ?: r.hubError() ?: "HTTP ${r.code()}"
+            } else {
+                _messages.tryEmit("✓ epic builder started")
+                container.fleet.nudge()
+                null
+            }
+        } catch (_: Exception) {
+            "the hub is unreachable"
+        }
+    }
+
+    /**
+     * Cancel / dismiss an epic-builder run (XERK-725/731) — the strip's ✕. The
+     * removal paints immediately and rolls back onto the strip if the hub refuses;
+     * a 404 means it already left the store, which satisfies the operator's intent
+     * rather than failing it (same idiom as [cancelQueued]).
+     */
+    fun dismissEpicBuilder(siteKey: String, id: String) {
+        _ebDismissed.value = _ebDismissed.value + id
+        viewModelScope.launch {
+            val err = try {
+                val r = container.client.api.cancelEpicBuilder(siteKey, id)
+                if (r.isSuccessful || r.code() == 404) null else hubErrorMessage(r)
+            } catch (_: Exception) {
+                "the hub is unreachable"
+            }
+            if (err != null) {
+                _ebDismissed.value = _ebDismissed.value - id
+                _messages.tryEmit("✗ $err")
+            }
+            container.fleet.nudge()
+        }
     }
 
     /**

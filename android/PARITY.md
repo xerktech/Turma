@@ -575,6 +575,41 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   editor); glasses `phone/render.test.ts` (untriaged + held in-lane); Veiller
   `ui/phone/render.test.ts` (same pair). All suites green.
 
+## Done (XERK-731 — Epic Builder composer + progress strip)
+
+- **Android has FULL Epic Builder parity** with the web board (XERK-725/726/728): the idea→epic
+  composer AND the live progress strip, a client-only additive build (no column-rule/lane mirror is
+  touched, so no re-vendor/re-port).
+  - **`epicBuilders` is TYPED on the fleet payload** — `AgentsResponse.epicBuilders: Map<String,
+    EpicBuilder>` (`model/Models.kt`), decoded via `FleetRepository`/`HubApi` and mirrored on
+    `FleetState` + the `"epicBuilders"` SSE event. Per the XERK-338 decode-fatality rule, `EpicBuilder`
+    has every field defaulted (state defaults `"queued"`), so a partial/older/malformed entry defaults
+    rather than throwing the whole atomic `/api/agents` decode; the hub (`sanitizeEpicBuilderRecord`)
+    only ever emits clean entries. Pinned by `AgentDecodeTest` (well-formed + partial + absent + the
+    rest of the fleet still decodes).
+  - **Progress strip** — `core/Board.kt` `epicBuilderRows`/`epicBuilderStateLabel` mirror `board.js`
+    (pure, drop no-siteKey/no-title, coerce the state, org-scope by the header filter, newest-first
+    sort), tested in `core/BoardTest.kt`; `ui/BoardScreen.kt`'s `EpicBuilderStrip` renders above the
+    board: a state chip, title, org + dispatched host, and a tail — a done run links the produced epic
+    to the board's OWN detail (not out to Jira) and offers a one-click **Arm Auto Epic run** (reusing
+    `vm.startEpicRun`, the XERK-638 epic-run arm), a failed run shows the hub's error, an in-flight run
+    spins; each carries a ✕ that cancels/dismisses via `DELETE /api/jira/<site>/epic-builder/<id>`
+    (404 = already gone), optimistically dropped and reconciled on the beat (`ebDismissed`/
+    `sweepEpicBuilders`, the `cancelQueued`/`sweepQueue` idiom).
+  - **Composer sheet** — `EpicBuilderSheet` (header "✨ New epic" button, gated on a reporting org)
+    mirrors `epicBuilderComposerHtml`: title + free-form idea + optional repo/host picked off the
+    org's own `mergeSites` `repoOptions`/`hostOptions` pools (uncloned repos and offline hosts
+    flagged), POSTing `{title, idea, repo?, targetHost?}` to `POST /api/jira/<siteKey>/epic-builder`.
+    A hub refusal lands inline in the hub's own words (`hubErrorMessage`, XERK-264); the swipe-down /
+    Cancel discard guard (XERK-218) matches `CreateTicketSheet`.
+- **Platform-form notes (parity by intent, not omission):** the strip is a `Column` of cards above the
+  board's own scroll surface (the web's `#epicBuilders` region); the composer is a modal sheet with
+  dropdown pickers vs the web's inline modal — same wire calls, same semantics, different gesture
+  chrome. Web-first precedent for a low-frequency operator authoring action, like the org auto-merge
+  switch (XERK-550).
+- Tests: `core/BoardTest.kt` (`epicBuilderRows`/label/terminal cases), `model/AgentDecodeTest.kt`
+  (the `epicBuilders` decode + tolerance case).
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
@@ -790,18 +825,8 @@ those are marked `[MODEL]`.
 - P3 Org control: no cross-tab sync (the web follows a `storage` event when a second tab re-scopes;
   a phone has one instance) and no "Currently set" carry-back for a stored-but-unreported org — the
   pick is kept and resumes, it just isn't listed while nothing reports it, same as the web.
-- **P1 Epic Builder composer + progress (XERK-726) is WEB-ONLY for now.** The board's "✨ New epic"
-  composer (title + free-form idea + optional repo/host, POSTing to `POST
-  /api/jira/<siteKey>/epic-builder`) and the progress strip that tracks a builder run through
-  queued → researching → creating → done/failed — linking the produced epic and offering a one-click
-  "Arm Auto Epic run" — have no Android counterpart yet. **Decode-safe**: `epicBuilders` is a NEW
-  top-level `/api/agents` key that Android does not type, so `ignoreUnknownKeys` skips it (no
-  decode-fatality — the full-array atomicity risk needs a TYPED field). To reach parity: type
-  `epicBuilders: Map<String, EpicBuilder>?` on the fleet payload, add an `EpicBuilder` shape
-  (`id/siteKey/title/idea/state/host/epicKey/error`), render a progress list + Arm button in
-  `BoardScreen.kt`, and a composer sheet (like `CreateTicketSheet`) POSTing the same route — reusing
-  the epic-run arm call already wired for XERK-638. It is a low-frequency operator authoring action,
-  so this follows the same web-first precedent as the org auto-merge switch (XERK-550).
+- ~~P1 Epic Builder composer + progress (XERK-726).~~ **Done (XERK-731, see Done below):** the "✨ New
+  epic" composer + the progress strip with the "Arm Auto Epic run" action shipped on Android.
 
 ### Usage (`usage.html` → `UsageScreen`)
 - ~~P0 30-day stacked daily chart.~~ ~~P0 Legend with per-series + per-group toggles, persisted,

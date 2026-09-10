@@ -79,6 +79,9 @@ data class FleetState(
     // the board's epic card control + detail panel read it. Refreshed by the poll
     // and the "epicRuns" SSE event.
     val epicRuns: Map<String, com.xerktech.turma.model.EpicRun> = emptyMap(),
+    // Epic-builder runs (XERK-725/731), keyed by builder id; the board's progress
+    // strip reads it. Refreshed by the poll and the "epicBuilders" SSE event.
+    val epicBuilders: Map<String, com.xerktech.turma.model.EpicBuilder> = emptyMap(),
 )
 
 class FleetRepository(
@@ -138,6 +141,7 @@ class FleetRepository(
             ticketTriageActions = resp.ticketTriageActions
             triagePolicies = resp.triagePolicies
             epicRuns = resp.epicRuns
+            epicBuilders = resp.epicBuilders
             emit(resp.now, error = null)
         } catch (e: Exception) {
             emit(_state.value.now, error = e.message ?: "hub unreachable")
@@ -183,6 +187,9 @@ class FleetRepository(
     @Volatile
     private var epicRuns: Map<String, com.xerktech.turma.model.EpicRun> = emptyMap()
 
+    @Volatile
+    private var epicBuilders: Map<String, com.xerktech.turma.model.EpicBuilder> = emptyMap()
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
@@ -200,6 +207,7 @@ class FleetRepository(
             ticketTriageActions = ticketTriageActions,
             triagePolicies = triagePolicies,
             epicRuns = epicRuns,
+            epicBuilders = epicBuilders,
         )
     }
 
@@ -271,6 +279,11 @@ class FleetRepository(
                     "epicRuns" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.EpicRun>>(data)
                     }.getOrNull()?.let { epicRuns = it; emit(_state.value.now, null) }
+                    // An epic builder was armed/advanced/cancelled (XERK-731); the
+                    // event carries the whole (small) map, like the other pins.
+                    "epicBuilders" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.EpicBuilder>>(data)
+                    }.getOrNull()?.let { epicBuilders = it; emit(_state.value.now, null) }
                 }
             }
 

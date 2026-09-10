@@ -76,6 +76,16 @@ data class AgentsResponse(
     // a work ticket, offer the Start-epic control, and show wave/child progress.
     // NEW top-level key, defaulted empty so an older hub reads as "no runs armed".
     val epicRuns: Map<String, EpicRun> = emptyMap(),
+    // Epic-builder runs (XERK-725/731), keyed by builder id: an operator's idea
+    // expanded into an Auto-Epic-ready epic by a builder session, streamed back
+    // as queued -> researching -> creating -> done/failed. NEW top-level key,
+    // defaulted empty so an older hub reads as "no builders running". Because
+    // this is now a TYPED top-level field, [EpicBuilder]'s every-field-defaulted
+    // shape is what keeps a partial/older/malformed entry from throwing the whole
+    // atomic /api/agents decode (the XERK-338 decode-fatality rule) — the hub
+    // (sanitizeEpicBuilderRecord) only ever emits clean object entries, so there
+    // is no per-value coercion beyond the defaults + TurmaJson.coerceInputValues.
+    val epicBuilders: Map<String, EpicBuilder> = emptyMap(),
 )
 
 /**
@@ -99,6 +109,44 @@ data class EpicRun(
     val paused: Boolean = false,
     val startedAt: Long = 0,
     val updatedAt: Long = 0,
+)
+
+/**
+ * One epic-builder run (XERK-725/731; the web board's `epicBuilders` entry,
+ * hub sanitizeEpicBuilderRecord). An operator's idea is expanded into an
+ * Auto-Epic-ready epic by a dispatched builder session; [state] streams
+ * "queued" -> "researching" -> "creating" -> "done"/"failed". [host] is the
+ * dispatched host (blank until dispatch), [epicKey] the produced epic (on
+ * "done"), [error] the hub-reported reason (on "failed"). Every field is
+ * defaulted so a partial/older record decodes rather than failing the whole
+ * atomic payload (the heartbeat contract; the closest precedent is [EpicRun]).
+ */
+@Serializable
+data class EpicBuilder(
+    val id: String = "",
+    val siteKey: String = "",
+    val title: String = "",
+    val idea: String = "",
+    val state: String = "queued",
+    val host: String = "",
+    val repo: String = "",
+    val epicKey: String = "",
+    val error: String = "",
+    val startedAt: Long = 0,
+    val updatedAt: Long = 0,
+)
+
+/**
+ * The POST /api/jira/<siteKey>/epic-builder reply (XERK-731): 200 {ok, run}
+ * with the freshly-minted builder record, or 4xx/5xx {error}. `run` lands in
+ * the strip optimistically; the fleet payload's `epicBuilders` (+ SSE) confirms
+ * it. Every field defaulted, so a bare/older body never throws.
+ */
+@Serializable
+data class EpicBuilderResponse(
+    val ok: Boolean = false,
+    val run: EpicBuilder? = null,
+    val error: String? = null,
 )
 
 /** One ticket->agent pin (the web board's Agent row; hub ticket-agents store). */

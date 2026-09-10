@@ -75,6 +75,8 @@ import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.input.KeyboardType
@@ -105,8 +107,11 @@ import com.xerktech.turma.core.createDirty
 import com.xerktech.turma.core.createLabelWord
 import com.xerktech.turma.core.displayColumnOf
 import com.xerktech.turma.core.edgeScrollStep
+import com.xerktech.turma.core.EpicBuilderRow
 import com.xerktech.turma.core.EpicChild
 import com.xerktech.turma.core.EpicChildStatus
+import com.xerktech.turma.core.epicBuilderRows
+import com.xerktech.turma.core.epicBuilderStateLabel
 import com.xerktech.turma.core.EpicRunView
 import com.xerktech.turma.core.epicRunOf
 import com.xerktech.turma.core.TICKET_ORDER
@@ -192,6 +197,16 @@ fun BoardScreen(
     // The per-org triage policy sheet (XERK-486), opened from the header — the
     // board bar's "Triage policy" button on the web.
     var policyOpen by remember { mutableStateOf(false) }
+    // The "✨ New epic" composer (XERK-731), opened from the header — the board
+    // bar's "New epic" button on the web.
+    var epicComposerOpen by remember { mutableStateOf(false) }
+    // The epic-builder progress strip (XERK-731): the hub's `epicBuilders` map,
+    // scoped to the header's org filter (empty = every org, like the web's
+    // TurmaOrg.getKeys()), through this client's optimistic dismissals.
+    val ebDismissed by vm.ebDismissed.collectAsStateWithLifecycle()
+    val epicBuilders = remember(fleet.epicBuilders, orgFilter, ebDismissed) {
+        epicBuilderRows(fleet.epicBuilders, orgFilter).filterNot { it.id in ebDismissed }
+    }
 
     val context = LocalContext.current
     LaunchedEffect(Unit) {
@@ -211,6 +226,9 @@ fun BoardScreen(
             // so it's on every screen — see NewTicketAction. Refresh and the
             // triage policy are board-specific now.
             if (sites.isNotEmpty()) {
+                IconButton(onClick = { epicComposerOpen = true }) {
+                    Text("✨", fontSize = 18.sp, modifier = Modifier.semantics { contentDescription = "New epic" })
+                }
                 IconButton(onClick = { policyOpen = true }) {
                     Icon(Icons.Filled.Tune, "Triage policy")
                 }
@@ -219,6 +237,25 @@ fun BoardScreen(
                 if (refreshing) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                 else Icon(Icons.Filled.Refresh, "Refresh")
             }
+        }
+        if (epicBuilders.isNotEmpty()) {
+            EpicBuilderStrip(
+                rows = epicBuilders,
+                onArm = { row -> vm.startEpicRun(row.siteKey, row.epicKey) },
+                onDismiss = { row -> vm.dismissEpicBuilder(row.siteKey, row.id) },
+                onOpenEpic = { row ->
+                    val site = sites.find { it.siteKey == row.siteKey }
+                    val ticket = site?.tickets?.find { it.key == row.epicKey }
+                    if (site != null && ticket != null) detail = site to ticket
+                    else Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(
+                            context,
+                            "${row.epicKey} isn't on the board yet — it'll appear on the next poll.",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                },
+            )
         }
         if (sites.isEmpty() || shown.all { it.tickets.isEmpty() }) {
             Text(
@@ -397,6 +434,19 @@ fun BoardScreen(
             initialSiteKey = shown.first().siteKey,
             vm = vm,
             onDismiss = { policyOpen = false },
+        )
+    }
+
+    // The "New epic from idea" composer (XERK-731). Its orgs are those in scope
+    // under the header filter (web ebSites); the default org matches the filter,
+    // like NewTicketAction.
+    if (epicComposerOpen && shown.isNotEmpty()) {
+        val initial = shown.firstOrNull { it.siteKey in orgFilter }?.siteKey ?: shown.first().siteKey
+        EpicBuilderSheet(
+            sites = shown,
+            initialSiteKey = initial,
+            vm = vm,
+            onDismiss = { epicComposerOpen = false },
         )
     }
 }
@@ -950,6 +1000,102 @@ private fun EpicWaveGroup(title: String, children: List<EpicChild>, cyclic: Bool
                 Text(c.key, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(c.summary, style = MaterialTheme.typography.bodyMedium, maxLines = 1, modifier = Modifier.weight(1f))
                 Text(epicChildLabel(c.status), style = MaterialTheme.typography.labelSmall, color = epicChildColor(c.status))
+            }
+        }
+    }
+}
+
+/** The epic-builder progress row's state-chip color (board.js `.eb-state-*`). */
+@Composable
+private fun epicBuilderStateColor(state: String): Color = when (state) {
+    "done" -> TurmaColors.good
+    "failed" -> TurmaColors.critical
+    "researching", "creating" -> MaterialTheme.colorScheme.primary
+    else -> MaterialTheme.colorScheme.onSurfaceVariant
+}
+
+/**
+ * The epic-builder progress strip (XERK-731; board.js epicBuilderProgressHtml).
+ * One card per builder run for the scoped orgs: a live state chip, the title,
+ * the org + dispatched host, and a tail — a done run links the produced epic to
+ * the board's own detail and offers arming its Auto Epic run; a failed run shows
+ * the hub's reported error; an in-flight run spins. Each carries a ✕ to cancel
+ * (in-flight) or dismiss (terminal).
+ */
+@Composable
+private fun EpicBuilderStrip(
+    rows: List<EpicBuilderRow>,
+    onArm: (EpicBuilderRow) -> Unit,
+    onDismiss: (EpicBuilderRow) -> Unit,
+    onOpenEpic: (EpicBuilderRow) -> Unit,
+) {
+    Column(
+        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        SectionLabel("Epic builders")
+        for (row in rows) {
+            TurmaCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Pill(epicBuilderStateLabel(row.state), color = epicBuilderStateColor(row.state))
+                        Text(
+                            row.title,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 2,
+                            modifier = Modifier.weight(1f),
+                        )
+                        IconButton(onClick = { onDismiss(row) }, modifier = Modifier.size(28.dp)) {
+                            Text(
+                                "✕",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.semantics {
+                                    contentDescription = if (row.terminal) "Dismiss epic builder" else "Cancel epic builder"
+                                },
+                            )
+                        }
+                    }
+                    val meta = buildString {
+                        append(orgName(row.siteKey))
+                        if (row.host.isNotBlank()) append(" · ").append(row.host)
+                    }
+                    Text(
+                        meta,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    when {
+                        row.state == "done" && row.epicKey.isNotBlank() ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                TextButton(onClick = { onOpenEpic(row) }) { Text("${row.epicKey} ↗") }
+                                Button(onClick = { onArm(row) }) { Text("▶ Arm Auto Epic run") }
+                            }
+                        row.state == "failed" ->
+                            Text(
+                                row.error.ifBlank { "the builder reported a failure" },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        !row.terminal ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                                Text(
+                                    "working…",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                    }
+                }
             }
         }
     }
@@ -1579,6 +1725,138 @@ private fun TicketDetailSheet(
                 }
             }
             Spacer(Modifier.height(8.dp))
+        }
+    }
+}
+
+/**
+ * The "New epic from idea" composer (XERK-731) — a port of board.html's
+ * epic-builder modal (epicBuilderComposerHtml). A title, a free-form idea, and
+ * an optional repo/host picked off the org's own mergeSites pools (the same
+ * pools the ticket Start/agent pickers draw from, uncloned repos and offline
+ * hosts flagged); the Build button POSTs {title, idea, repo?, targetHost?} to
+ * `POST /api/jira/<siteKey>/epic-builder`. A hub refusal lands inline in the
+ * hub's own words (XERK-264); the run then shows in the progress strip above.
+ *
+ * Dismissal is guarded (XERK-218) like [CreateTicketSheet]: a swipe-down / back
+ * press / scrim tap / Cancel over typed text raises a discard dialog.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun EpicBuilderSheet(
+    sites: List<BoardSite>,
+    initialSiteKey: String,
+    vm: BoardViewModel,
+    onDismiss: () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var siteKey by remember { mutableStateOf(initialSiteKey) }
+    val site = sites.firstOrNull { it.siteKey == siteKey } ?: sites.first()
+
+    var title by remember { mutableStateOf("") }
+    var idea by remember { mutableStateOf("") }
+    var repo by remember { mutableStateOf("") }
+    var host by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf("") }
+    var confirmDiscard by remember { mutableStateOf(false) }
+
+    fun dirty() = title.isNotBlank() || idea.isNotBlank()
+    val sheet = rememberModalBottomSheetState(
+        skipPartiallyExpanded = true,
+        confirmValueChange = { target ->
+            if (target == SheetValue.Hidden && dirty()) { confirmDiscard = true; false } else true
+        },
+    )
+    val requestDismiss = { if (dirty()) { confirmDiscard = true } else onDismiss() }
+
+    if (confirmDiscard) {
+        AlertDialog(
+            onDismissRequest = { confirmDiscard = false },
+            title = { Text("Discard this idea?") },
+            text = { Text("The builder hasn't been armed yet — closing now loses what you've typed.") },
+            confirmButton = {
+                TextButton(onClick = { confirmDiscard = false; onDismiss() }) {
+                    Text("Discard", color = TurmaColors.critical)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmDiscard = false }) { Text("Keep editing") } },
+        )
+    }
+
+    // The repo/host pools are the org's own, so a pick from one org's pool never
+    // survives onto another org.
+    LaunchedEffect(siteKey) { repo = ""; host = ""; error = "" }
+
+    ModalBottomSheet(onDismissRequest = requestDismiss, sheetState = sheet) {
+        Column(
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp, 0.dp, 20.dp, 32.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("New epic from idea", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Describe an idea and a builder session researches the repo, expands it into a set of " +
+                    "dependency-ordered tickets and files an Auto-Epic-ready epic. Watch it build in the " +
+                    "strip above, then arm its Auto Epic run when it lands.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            if (sites.size > 1) {
+                CreatePicker(
+                    "Org",
+                    sites.map { it.siteKey to (orgName(it.siteKey, it.orgName) + if (!it.online) " (offline)" else "") },
+                    siteKey,
+                ) { siteKey = it }
+            }
+
+            OutlinedTextField(
+                title, { title = it },
+                label = { Text("Title") }, singleLine = true,
+                keyboardOptions = SentenceCapsKeyboard,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                idea, { idea = it },
+                label = { Text("Idea") }, minLines = 4, maxLines = 10,
+                keyboardOptions = SentenceCapsKeyboard,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            CreatePicker(
+                "Repo (optional)",
+                listOf("" to "Let the builder pick a repo") +
+                    site.repoOptions.map { it.name to (it.name + if (!it.cloned) " (not cloned)" else "") },
+                repo,
+            ) { repo = it }
+            CreatePicker(
+                "Host (optional)",
+                listOf("" to "Any capable host") +
+                    site.hostOptions.map { it.key to (it.name + if (!it.online) " (offline)" else "") },
+                host,
+            ) { host = it }
+
+            if (error.isNotBlank()) ErrorRow(error)
+
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = requestDismiss, enabled = !busy) { Text("Cancel") }
+                Spacer(Modifier.weight(1f))
+                val canSubmit = title.isNotBlank() && idea.isNotBlank() && !busy
+                PrimaryButton(
+                    if (busy) "Building…" else "Build epic",
+                    enabled = canSubmit,
+                    onClick = {
+                        busy = true; error = ""
+                        scope.launch {
+                            val err = vm.armEpicBuilder(
+                                siteKey, title.trim(), idea.trim(),
+                                repo.ifBlank { null }, host.ifBlank { null },
+                            )
+                            busy = false
+                            if (err == null) onDismiss() else error = err
+                        }
+                    },
+                )
+            }
         }
     }
 }
