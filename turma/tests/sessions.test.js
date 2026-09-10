@@ -193,7 +193,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
       + " openSubagentView, transcriptBack,"
       + " chatToTerminal, terminalToChat, chatToTrajectory, trajectoryToChat, renderTrajectory,"
-      + " transcriptToTrajectory, trajectoryBack, trajScrollClick,"
+      + " transcriptToTrajectory, trajectoryBack, trajScrollClick, trajScrollKey, trajToggleTurn,"
       + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
       + " applyAgent, mergeSnapshot, sseClock: () => sseClock,"
       + " setCache: (c) => { cache = c; }, getCache: () => cache, setDraft: (t) => { renameDraft = t; },"
@@ -3019,6 +3019,53 @@ test("XERK-720: a short (un-snipped) field offers no expand toggle", () => {
   const btn = { closest: (sel) => sel === ".traj-exp-toggle" ? btn : null, parentElement: wrap };
   page.trajScrollClick({ target: btn });
   assert.ok(wrap.classList.toggled, "clicking the toggle flips .exp on the wrapper");
+});
+
+test("XERK-734: each turn header is a collapse toggle wrapping the turn body", () => {
+  const page = loadPage();
+  const scroll = makeEl("trajScroll");
+  page.renderTrajectory(scroll, claudeTraj());
+  const h = scroll.innerHTML;
+  assert.ok(h.includes('class="traj-t-head" role="button"'), "the header is a button-role toggle");
+  assert.ok(h.includes('aria-expanded="true"'), "starts expanded");
+  assert.ok(h.includes("traj-t-caret"), "a caret indicator is rendered");
+  assert.ok(h.includes('class="traj-t-body"'), "the turn body is wrapped so it can be hidden");
+  // The body content lives inside the wrapper, after the header.
+  assert.ok(h.indexOf('traj-t-body') > h.indexOf('traj-t-head'), "body follows the header");
+});
+
+test("XERK-734: clicking / key-toggling a turn header folds and unfolds that turn", () => {
+  const page = loadPage();
+  // Stub a .traj-turn holding its header, mirroring the real DOM the delegated
+  // handler walks (the shim doesn't parse innerHTML — see the exp-toggle test).
+  const turn = makeEl("turn");
+  const head = makeEl("head");
+  head.parentElement = turn;
+  const aria = {};
+  head.setAttribute = (k, v) => { aria[k] = v; };
+  head.closest = (sel) => (sel === ".traj-t-head" ? head : null);
+
+  page.trajScrollClick({ target: head });
+  assert.ok(turn.classList.contains("traj-collapsed"), "first click collapses the turn");
+  assert.equal(aria["aria-expanded"], "false", "aria-expanded flips to false when folded");
+
+  page.trajScrollClick({ target: head });
+  assert.ok(!turn.classList.contains("traj-collapsed"), "second click expands it again");
+  assert.equal(aria["aria-expanded"], "true", "aria-expanded flips back to true");
+
+  // Enter on a focused header toggles it too.
+  let prevented = false;
+  page.trajScrollKey({ key: "Enter", target: head, preventDefault() { prevented = true; } });
+  assert.ok(turn.classList.contains("traj-collapsed"), "Enter collapses the turn");
+  assert.ok(prevented, "the key event is consumed");
+});
+
+test("XERK-734: trajScrollClick still expands a snippeted field, not the whole turn", () => {
+  const page = loadPage();
+  const wrap = { classList: { _c: null, toggle(c) { this._c = c; } } };
+  const btn = { closest: (sel) => (sel === ".traj-exp-toggle" ? btn : null), parentElement: wrap };
+  page.trajScrollClick({ target: btn });
+  assert.equal(wrap.classList._c, "exp", "the field wrapper still gets .exp, not the turn folded");
 });
 
 test("XERK-717: the Trajectory toggle shows beside Terminal for claude, replaces it for dsh, hidden with no transcript", () => {

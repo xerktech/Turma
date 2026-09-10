@@ -391,7 +391,15 @@
   .traj-trunc { font-size: 12px; color: var(--muted); font-style: italic; }
   .traj-turns { display: flex; flex-direction: column; gap: 10px; }
   .traj-turn { border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); padding: 9px 11px; }
-  .traj-t-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 6px; }
+  /* The turn header is a collapse toggle for the whole turn (XERK-734): clickable,
+     with a caret that rotates, and it drops its bottom margin when the turn folds. */
+  .traj-t-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 6px; cursor: pointer; user-select: none; }
+  .traj-t-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-sm); }
+  .traj-t-caret { color: var(--muted); font-size: 10px; line-height: 1; transition: transform 0.12s; }
+  .traj-t-caret::before { content: "▾"; }
+  .traj-collapsed > .traj-t-head { margin-bottom: 0; }
+  .traj-collapsed > .traj-t-head .traj-t-caret { transform: rotate(-90deg); }
+  .traj-collapsed > .traj-t-body { display: none; }
   .traj-t-n { font-weight: 600; font-size: 13px; color: var(--ink); }
   .traj-call { display: grid; grid-template-columns: auto auto 1fr; gap: 6px 8px; align-items: baseline; padding: 3px 0; font-size: 12.5px; }
   .traj-call-err .traj-c-name { color: var(--danger, #c0392b); }
@@ -3097,8 +3105,26 @@ function trajFieldInner(snippet, full, clipped) {
 }
 function trajScrollClick(e) {
   const btn = e.target.closest(".traj-exp-toggle");
-  if (!btn || !btn.parentElement) return;
-  btn.parentElement.classList.toggle("exp");
+  if (btn && btn.parentElement) { btn.parentElement.classList.toggle("exp"); return; }
+  // A click anywhere on a turn header collapses/expands that whole turn (XERK-734).
+  const head = e.target.closest(".traj-t-head");
+  if (head && head.parentElement) { trajToggleTurn(head); }
+}
+// Collapse/expand one turn: flip `.traj-collapsed` on the .traj-turn and keep the
+// header's aria-expanded in step. The body is hidden via CSS (display:none), so the
+// clock/tag summary in the header stays readable while the turn is folded.
+function trajToggleTurn(head) {
+  const turn = head.parentElement;
+  const collapsed = turn.classList.toggle("traj-collapsed");
+  head.setAttribute("aria-expanded", collapsed ? "false" : "true");
+}
+// Space/Enter on a focused turn header toggles it, like a real button.
+function trajScrollKey(e) {
+  if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
+  const head = e.target.closest && e.target.closest(".traj-t-head");
+  if (!head || !head.parentElement) return;
+  e.preventDefault();
+  trajToggleTurn(head);
 }
 // Render the XERK-712 superset contract (docs/trajectory-contract.md): per turn,
 // newest-first, the USER message, the MODEL OUTPUT blocks (text + thinking,
@@ -3160,13 +3186,16 @@ function renderTrajectory(scroll, d) {
     // Only fall back to "no tool calls" when the turn is otherwise empty (a dsh
     // turn); a claude/qwen turn with user/output but no call is not "empty".
     const body = userHtml + outHtml + (rows || (userHtml || outHtml ? "" : '<div class="traj-c-none">no tool calls</div>'));
+    // The whole turn header is a collapse toggle for that turn's body (XERK-734):
+    // clicking it flips `.traj-collapsed` on the turn (handled in trajScrollClick).
     return `<div class="traj-turn">
-      <div class="traj-t-head"><span class="traj-t-n">Turn ${esc(String(tn.turn))}</span>${trajClock(tn.startedAt, false)}${steps}<span class="traj-tag">${calls.length} calls</span>${model}${tk}${dur}${rk}</div>
-      ${body}
+      <div class="traj-t-head" role="button" tabindex="0" aria-expanded="true"><span class="traj-t-caret" aria-hidden="true"></span><span class="traj-t-n">Turn ${esc(String(tn.turn))}</span>${trajClock(tn.startedAt, false)}${steps}<span class="traj-tag">${calls.length} calls</span>${model}${tk}${dur}${rk}</div>
+      <div class="traj-t-body">${body}</div>
     </div>`;
   }).join("");
   scroll.innerHTML = head + `<div class="traj-turns">${turns || '<div class="traj-empty">No turns recorded yet.</div>'}</div>`;
-  scroll.onclick = trajScrollClick;  // delegated expand/collapse for snippeted fields
+  scroll.onclick = trajScrollClick;  // delegated: turn-header collapse + snippeted-field expand
+  scroll.onkeydown = trajScrollKey;  // keyboard toggle for a focused turn header (XERK-734)
 }
 // Push one mobile history entry the back button consumes, and reveal the stage.
 function enterStage() {
