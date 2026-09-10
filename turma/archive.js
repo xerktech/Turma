@@ -2217,10 +2217,151 @@ function claudeTrajectory(transcriptId) {
   };
 }
 
+// A DEGRADED Trajectory built from the RENDERED layer, for a session whose RAW
+// layer has not synced yet (XERK-715). A running claude/qwen session ships its
+// rendered `<sid>.jsonl` hub-side while running but DEFERS its raw native log to
+// session end (agent-archive.md, `defer_raw`), so dshTrajectory()/claudeTrajectory()
+// — which both fold the RAW layer — return null for it. This folds what the
+// rendered entries CAN say into the SAME contract shape: role-grouped turns with
+// per-entry timestamps, the display blocks' text/thinking/tool-calls. What the
+// rendered layer does NOT carry is flagged honestly rather than faked: token
+// counts and per-turn model live only in the raw/usage layers, so `partial` is
+// true and every `tokens` field is null (the live figures arrive with the
+// live-enrichment ticket; this route must work WITHOUT it). Returns null when the
+// rendered transcript is itself absent/placeholder, so the route can 404 "not
+// archived". `runtime` is a best-effort hint from the caller (the rendered layer
+// cannot tell claude from qwen — both render identically); defaults to claude.
+function renderedTrajectory(transcriptId, runtime) {
+  let t;
+  try { t = getTranscript(transcriptId); } catch { return null; }
+  if (!t || !Array.isArray(t.entries)) return null;
+
+  const snip = (s) => {
+    s = String(s == null ? "" : s);
+    return s.length > TRAJ_SNIPPET ? s.slice(0, TRAJ_SNIPPET) + "…" : s;
+  };
+  const entryTime = (e) => {
+    if (!e || typeof e.ts !== "string") return null;
+    const ms = Date.parse(e.ts);
+    return isFinite(ms) ? ms : null;
+  };
+
+  const turns = [];
+  let cur = null;
+  const callsById = new Map();
+  let firstTime = null, lastTime = null;
+  let calls = 0, callsDropped = 0;
+  // `tokens` is null on totals AND every turn — the rendered layer cannot answer
+  // it, and a fabricated 0 is indistinguishable from a real zero-spend turn.
+  const totals = { turns: 0, toolCalls: 0, errors: 0, tokens: null };
+
+  const openTurn = (time, userText) => {
+    cur = { turn: totals.turns + 1, startedAt: time, endedAt: time, durationMs: null,
+      user: userText == null ? null : { text: snip(userText) },
+      output: [], model: null, calls: [], tokens: null, reason: null };
+    turns.push(cur); totals.turns++;
+    return cur;
+  };
+  const ensureTurn = (time) => cur || openTurn(time, null);
+  const touchEnd = (time) => { if (cur && time != null) cur.endedAt = time; };
+
+  const openCall = (id, name, args, time) => {
+    totals.toolCalls++;
+    if (calls >= TRAJ_CALLS_MAX) { callsDropped++; return; }
+    const call = { name: String(name || "?"),
+      callId: id != null ? String(id) : null,
+      at: time, ok: null, error: false, args: snip(args),
+      result: null, durationMs: null };
+    ensureTurn(time).calls.push(call);
+    if (call.callId != null) callsById.set(call.callId, call);
+    calls++;
+  };
+  const closeCall = (id, resultText, isError, time) => {
+    if (id == null) return;
+    const call = callsById.get(String(id));
+    if (!call || call.ok !== null) return;
+    call.ok = !isError; call.error = !!isError;
+    call.result = snip(resultText);
+    call.durationMs = (call.at != null && time != null) ? Math.max(0, time - call.at) : null;
+    if (isError) totals.errors++;
+  };
+
+  for (const e of t.entries) {
+    const time = entryTime(e);
+    if (time != null) {
+      if (firstTime == null || time < firstTime) firstTime = time;
+      if (lastTime == null || time > lastTime) lastTime = time;
+    }
+    const blocks = Array.isArray(e.blocks) ? e.blocks : [];
+    // A rendered block carries its kind on `t` (the tunnel/hub mirror shape),
+    // never `type`: text / thinking / tool_use{name,input,id} / tool_result
+    // {text,forId,isError} / command / command_output / interrupt / away_summary
+    // / compact_summary, plus non-conversational markers (pr_link, compact_boundary,
+    // task_notification) we skip.
+    const userText = blocks.filter((b) => b && b.t === "text")
+      .map((b) => b.text || "").join("");
+
+    if (e.role === "user") {
+      // A user entry that carries real text opens a turn; one that is only tool
+      // output (no text block) just correlates results into the open turn.
+      if (userText.trim()) openTurn(time, userText);
+      for (const b of blocks) {
+        if (b && b.t === "tool_result") closeCall(b.forId, b.text, b.isError === true, time);
+      }
+    } else {
+      // assistant (and anything else that rendered) attaches to the open turn.
+      ensureTurn(time);
+      for (const b of blocks) {
+        if (!b || typeof b !== "object") continue;
+        if (b.t === "text" || b.t === "compact_summary" || b.t === "away_summary") {
+          if (b.text) cur.output.push({ kind: "text", text: snip(b.text) });
+        } else if (b.t === "thinking") {
+          cur.output.push({ kind: "thinking", text: snip(b.text || "") });
+        } else if (b.t === "command") {
+          const line = b.args ? `${b.name || ""} ${b.args}` : String(b.name || "");
+          cur.output.push({ kind: "text", text: snip(line) });
+        } else if (b.t === "command_output") {
+          if (b.text) cur.output.push({ kind: "text", text: snip(b.text) });
+        } else if (b.t === "interrupt") {
+          cur.reason = "interrupt";
+        } else if (b.t === "tool_use") {
+          openCall(b.id, b.name, b.input, time);
+        } else if (b.t === "tool_result") {
+          closeCall(b.forId, b.text, b.isError === true, time);
+        }
+      }
+    }
+    touchEnd(time);
+  }
+
+  for (const tn of turns) {
+    tn.durationMs = (tn.startedAt != null && tn.endedAt != null)
+      ? Math.max(0, tn.endedAt - tn.startedAt) : null;
+  }
+  let kept = turns;
+  let turnsDropped = 0;
+  if (kept.length > TRAJ_TURNS_MAX) {
+    turnsDropped = kept.length - TRAJ_TURNS_MAX;
+    kept = kept.slice(-TRAJ_TURNS_MAX);  // keep the newest, as the full folds do
+  }
+  return {
+    transcriptId,
+    runtime: runtime === "qwen" ? "qwen" : "claude",
+    partial: true,
+    title: t.summary != null ? snip(String(t.summary)) : null,
+    model: null,
+    startedAt: firstTime, endedAt: lastTime,
+    durationMs: (firstTime != null && lastTime != null) ? lastTime - firstTime : null,
+    totals, turns: kept,
+    truncated: turnsDropped > 0 || callsDropped > 0,
+    turnsDropped, callsDropped,
+  };
+}
+
 module.exports = {
   ARCHIVE_DIR, ARCHIVE_DB, ARCHIVE_TRANSCRIPT_MAX, ARCHIVE_TOTAL_MAX,
   dshTrajectory, dshEventsFile,
-  claudeTrajectory, claudeTrajFile,
+  claudeTrajectory, claudeTrajFile, renderedTrajectory,
   ARCHIVE_RAW_TRANSCRIPT_MAX, ARCHIVE_RAW_CURSOR_MAX, ARCHIVE_RAW_CURSOR_LOOKUP_MAX,
   ARCHIVE_MANIFEST_CURSOR_MAX,
   RAW_DIR_SUFFIX,
