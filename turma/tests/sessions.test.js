@@ -271,6 +271,38 @@ test("background agents: the count is pluralized, and an empty list changes noth
   assert.ok(els.idle.innerHTML.includes("Quiet Task"));
 });
 
+// XERK-735. The card's second line reads repo · related ticket · pc name ·
+// session id, one line, and the ticket key links to that ticket's detail on the
+// board rather than out to Jira.
+test("cardMeta: order is repo · ticket · pc · id and the ticket is a board link", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    { ...idle("11111", "Ticketed"), ticket: { key: "XERK-9", siteKey: "acme.atlassian.net", summary: "Fix the thing" } },
+  ]);
+  render({ now, agents: [h] });
+  const meta = els.idle.innerHTML.match(/<div class="meta"[^>]*>[\s\S]*?<\/div>/)[0];
+  // Assert the VISIBLE order against the BODY only — stripping the opening tag so
+  // the title="…" attribute (which already lists the fields in order) can't make a
+  // wrong render pass (the MUT-A escape QA caught).
+  const body = meta.replace(/^<div class="meta"[^>]*>/, "");
+  assert.match(body, /^repoX · <a class="s-ticket"[\s\S]*>XERK-9<\/a> · hostA · <span class="id">11111<\/span>/);
+  // The ticket is a same-app board deep-link (not a Jira URL), carrying its site.
+  assert.match(meta, /<a class="s-ticket" href="\/board\?ticket=XERK-9&site=acme\.atlassian\.net"/);
+  assert.ok(!/atlassian\.net\/browse/.test(meta), "links to the board, not out to Jira");
+  // Whole line in a title for hover-reveal, in the same order.
+  assert.match(meta, /<div class="meta" title="repoX · XERK-9 · hostA · 11111">/);
+});
+
+// A session with no ticket drops that segment cleanly (no empty separators).
+test("cardMeta: no ticket → repo · pc · id with no dangling separator", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([idle("22222", "Untitled")]);
+  render({ now, agents: [h] });
+  const meta = els.idle.innerHTML.match(/<div class="meta"[^>]*>[\s\S]*?<\/div>/)[0];
+  assert.match(meta, /<div class="meta" title="repoX · hostA · 22222">/);
+  assert.ok(!meta.includes("s-ticket"), "no ticket link when there is no ticket");
+});
+
 // XERK-538. A running QA / QA-delta subagent is the operator's own change being
 // adversarially exercised — a distinct thing to watch. The card stays Active (it
 // is still working) but says "QA Review" rather than a bare agent count.

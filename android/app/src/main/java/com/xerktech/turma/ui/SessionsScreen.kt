@@ -797,9 +797,10 @@ private fun QueuedSessionCard(r: FlatSession, now: Long, tint: Color?, onCancel:
             StateDot(com.xerktech.turma.core.LiveState.WAITING)
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(sessionName(r.session), fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                val ticket = r.session.ticket?.key?.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty()
+                // repo · ticket · pc name · session id (web cardMeta, XERK-735).
+                val ticket = r.session.ticket?.key?.takeIf { it.isNotBlank() }?.let { "$it · " }.orEmpty()
                 Text(
-                    "${r.session.id} · ${r.session.repo.ifBlank { "?" }} · ${r.device}$ticket",
+                    "${r.session.repo.ifBlank { "?" }} · $ticket${r.device} · ${r.session.id}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
@@ -844,8 +845,10 @@ private fun EndedSessionRow(e: EndedSession, now: Long, tint: Color?, selected: 
                 // A resumable row is keyed on a 36-char transcript UUID; shorten it
                 // to the same visual weight as a session id (web endedRowId).
                 val rowId = if (e.kind == EndedKind.RESUMABLE) e.transcriptId.take(8) else e.id
+                // repo · pc name · session id (web cardMeta, XERK-735). An ended row
+                // carries no ticket.
                 Text(
-                    "$rowId · ${e.repo.ifBlank { "—" }} · ${e.device}",
+                    "${e.repo.ifBlank { "—" }} · ${e.device} · $rowId",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
