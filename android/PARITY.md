@@ -99,7 +99,8 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   view to the phone if a need appears. Shape/renderer invariants: `.claude/rules/trajectory.md`.
   The XERK-720 additions — an absolute wall-clock timestamp on the head/turn/call and an
   expand-to-full toggle for any ellipsis-snippeted field — are part of this same web-only pane, so
-  no Android/glasses change; a future port carries them with it.
+  no Android/glasses change; a future port carries them with it. So is XERK-734: each turn header is
+  a collapse toggle that folds/unfolds that whole turn's body.
 
 ## Done (this pass — first installment)
 
