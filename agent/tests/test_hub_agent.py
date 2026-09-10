@@ -1623,6 +1623,24 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [self.MR1])
 
+    def test_http_self_hosted_mr_is_attributed(self):
+        """XERK-741: a self-hosted GitLab served over plain http on a LAN prints
+        an http:// MR URL from `glab mr create` / a push option. A scheme-only
+        mismatch used to drop the chip in SILENCE (the MR was never attributed),
+        so its card showed no chip 'sometimes' — exactly on the http hosts."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        http_mr = "http://gitlab.internal/grp/app/-/merge_requests/7"
+        write_jsonl(path, [
+            self.pr_create_call("h1", cmd="glab mr create --fill"),
+            self.tool_result("h1", f"{http_mr}\n"),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [http_mr])
+
     AZDO1 = "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12"
 
     def test_az_repos_pr_create_result_is_this_sessions_pr(self):

@@ -46,6 +46,12 @@ DevOps, and what gets typed back because of it.
     via `_MR_CONFLICT_STATUSES`/`_MR_UNVERIFIED_STATUSES`, every other KNOWN status → MERGEABLE.
   - `_mr_url_parts` matches GITLAB_URL by **host(:port), case-insensitively, ignoring scheme** — a
     byte-prefix compare misattributed MRs over a spelling mismatch.
+  - **`MR_URL_RE` takes http as well as https** (XERK-741) — a self-hosted GitLab is routinely plain
+    http on a LAN, and the https-only ATTRIBUTION regex dropped its chip in silence (the MR was never
+    added to `prUrls`), which is why chips appeared "sometimes". The `/-/merge_requests/<n>` infix is
+    the discriminator, so the scheme widening can't misattribute a GitHub/ADO URL. This matches the
+    http support `_mr_url_parts`/`AZDO_PR_URL_RE` already carried. Client chip renderers key on that
+    same path infix, not the scheme, so no client change.
   - Every launch exports **`GITLAB_HOST`**: glab reads that var, never GITLAB_URL, so self-hosted
     `glab mr create` can't auth without it.
   - Chips label an MR/ADO PR **`!n`, not `#n`** (ADO's `#n` is a WORK ITEM) — every renderer mirrors
