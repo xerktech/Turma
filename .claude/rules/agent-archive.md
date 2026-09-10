@@ -257,6 +257,12 @@ paths:
       running conversation). Tests: `test_manifest_keeps_a_running_worktree_session_rendered_only`,
       `test_manifest_excludes_a_running_ROOT_session`,
       `test_manifest_keeps_a_running_dsh_session_so_its_trajectory_populates`.
+    - **This is WHY the Trajectory endpoint reads different layers by session state** (epic
+      XERK-712, `.claude/rules/trajectory.md`): an ENDED claude/qwen session's `GET
+      /api/archive/<id>/trajectory` folds the RAW `<id>.jsonl` (full — per-turn model + tokens); a
+      RUNNING one has deferred that raw sidecar, so the route folds the RENDERED layer instead,
+      degraded (`partial:true`, tokens/model null). dsh ships raw LIVE (no `defer_raw`), so its
+      trajectory is full whether running or ended.
   - **Only APPEND-ONLY bytes belong under `<tid>/dsh/`** — the per-file cursor ships bytes past an
     offset, right for an event-sourced log, wrong for a page-mutating SQLite (an in-place rewrite
     would leave archived early bytes stale). dsh's SQLite is a derived index it rebuilds from the

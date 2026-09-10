@@ -86,6 +86,14 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   dropped to fit the reply carries "… preview dropped to fit" on its name chip on both, so it reads
   differently from a file that never rendered. Both clients still poll `/history` while the live
   socket is down, and still page older entries through it.
+- **Session Trajectory view is WEB-ONLY (epic XERK-712).** The generalized Trajectory pane — a
+  read-only turns / tool-calls / tokens render for Claude and Qwen sessions (not just dsh), toggled
+  beside "Terminal ▸" (XERK-717) and served by `GET /api/archive/<transcriptId>/trajectory`
+  (XERK-715) — ships on the WEB only; no Android, no glasses. Android carries only the earlier
+  dsh-specific Trajectory screen (`ui/TrajectoryScreen.kt`, XERK-498) over `GET
+  /api/dsh/<id>/trajectory`, and is NOT being generalized to Claude/Qwen here. Recorded web-only
+  like the archive Restore picker (XERK-453); a later ticket can port the shared view to the phone
+  if a need appears. Shape/renderer invariants: `.claude/rules/trajectory.md`.
 
 ## Done (this pass — first installment)
 

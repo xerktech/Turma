@@ -248,6 +248,13 @@ distinct file. [K] is that store plus the resume the driver never wired.
   `archive.dshTrajectory` parses the log the raw archive already holds, served by `GET
   /api/dsh/<tid>/trajectory`. Tests: `dshTrajectory` in `archive.test.js`, the trajectory case in
   `server.test.js`.
+- **The viewer is now GENERALIZED across runtimes (epic XERK-712); dsh keeps its headless
+  specifics.** The shared `GET /api/archive/<tid>/trajectory` (XERK-715) emits ONE shape — a
+  SUPERSET of `dshTrajectory`'s output — rendered by ONE renderer for claude/qwen/dsh; the dsh-only
+  `GET /api/dsh/<tid>/trajectory` stays. dsh's difference is load-bearing: it ships its raw log LIVE
+  (no `defer_raw`, [E]/XERK-469), so its trajectory resolves running OR ended and is NEVER the
+  degraded rendered fallback the deferred-raw runtimes (claude/qwen) take while running. Shape /
+  dispatch / contract: `.claude/rules/trajectory.md`.
 - **XERK-501 adds ONE host-wide `dsh web` per host** over the shared store. The per-session proxy
   blocker does not apply: it has no sub-path, is reached DIRECTLY on the host, and only READS the
   store. Mechanics: `dsh-input.md`.
