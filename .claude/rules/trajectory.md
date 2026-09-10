@@ -1,9 +1,11 @@
 ---
 paths:
   - "turma/archive.js"
+  - "turma/server.js"
   - "turma/tests/fixtures/trajectory/**"
   - "turma/tests/trajectory-fixtures.test.js"
   - "docs/trajectory-contract.md"
+  - "agent/hub-agent.py"
   - "agent/qwen_transcript.py"
 ---
 
@@ -25,6 +27,33 @@ paths:
   `partial:false`), else `claudeTrajectory` (raw `<id>.jsonl`, FULL once ENDED),
   else the **degraded `renderedTrajectory()` fallback**. Unknown id -> 404 with a
   `refused` hint like the sibling archive read.
+- **A RUNNING claude/qwen session gets a LIVE FULL-fidelity trajectory via an
+  on-demand raw tail (XERK-716), off the beat.** Its raw `<sid>.jsonl` is
+  deferred hub-side (`defer_raw`), so instead the endpoint asks the AGENT for a
+  BOUNDED raw tail and reduces it with the SAME js reducer — so there is no second
+  (python) reducer to keep in parity.
+  - Agent: the `{type:"trajectoryTail", sessionId}` command → `_stage_trajectory_tail`
+    reads the pinned `<sid>.jsonl` (via `_session_transcript_path`), tails up to
+    `TRAJECTORY_TAIL_MAX_BYTES` (4 MiB) from the END dropping a leading partial
+    line, and stages `{sessionId, text, truncated}` on the SAME on-demand,
+    dropped-on-oversize lifecycle as `history` (rides `_fit_staged_history` /
+    `_drop_on_demand_results`, cleared on delivery). Capability flag
+    `trajectory:{available}` on the heartbeat (`_trajectory_payload`, always true
+    for a current agent).
+  - Hub: `ingestTrajectoryTails` caches the tail per sessionId (`trajectoryTails`,
+    an AGENT_CACHE_KEY — excluded from the record ceiling, held under the
+    container-sized cache byte budget, stripped from the served payload). The
+    endpoint, for a RUNNING claude/qwen session on an ONLINE host reporting
+    `trajectory.available` (`liveSessionForTranscript`): reduces a fresh cached
+    tail via `claudeTrajectoryFromText` → `{partial:false, live:true}`; else
+    queues a `trajectoryTail` fetch (deduped by `requestTrajectoryTail`, 15s memo)
+    and serves the degraded rendered layer NOW with `pending:true`, so a later
+    poll returns the full one. `normalizeTrajectory` coerces the flag (whitelist,
+    strict boolean, absent = false = "can't serve live full", degraded view).
+  - **Fall back to DEGRADED whenever the live path can't answer** — host offline
+    (a stale `running` record is NOT trusted — the same reason the route dispatches
+    off archived data), no `trajectory` capability, or the tail not cached yet. The
+    endpoint always returns a trajectory; `partial`/`live`/`pending` say which.
 - **`renderedTrajectory()` (archive.js) is the RUNNING fallback** — a running
   claude/qwen session ships its RENDERED layer hub-side but DEFERS its raw
   `<id>.jsonl` to session end (`agent-archive.md`, `defer_raw`), so both raw folds
