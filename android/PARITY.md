@@ -621,6 +621,20 @@ those are marked `[MODEL]`.
 - **P2 dsh Trajectory view, and no terminal for dsh (XERK-498).** Android half DONE (see Done below).
   Still open: **glasses** (`hub-client.ts`) likewise still exposes the terminal for a dsh session —
   the same suppression, plus ideally the same Trajectory render.
+- **P2 Trajectory generalized to claude/qwen (XERK-717, epic XERK-712).** Web now shows the
+  Trajectory toggle for a claude/qwen session too — BESIDE "Terminal ▸" (not replacing it, since
+  those runtimes keep their ttyd terminal), shown once the session has a `transcriptId`. It fetches
+  the unified `GET /api/archive/<transcriptId>/trajectory` (runtime-dispatched, XERK-715) instead of
+  the dsh-only `/api/dsh/...`, and `renderTrajectory` renders the XERK-712 SUPERSET
+  (`docs/trajectory-contract.md`): per turn — the user message, model output blocks (text +
+  thinking), tool-call rows WITH result snippets, per-turn + total tokens, model, duration; a
+  `partial:true` (running) payload shows a "tokens after the session ends" note. dsh renders through
+  the same code as its subset (missing fields absent). **Android is still on the dsh-only path**:
+  `TrajectoryScreen`/`TrajectoryViewModel`/`HubApi.dshTrajectory` call `/api/dsh/<id>/trajectory` and
+  only a dsh session exposes the action. To reach parity: switch the call to the unified archive
+  endpoint, widen `DshTrajectory` (`TrajTurn`/`TrajCall`) to the superset fields (`user`, `output[]`,
+  per-turn `model`, per-call `result`, `partial`, `runtime`), render user/output/result + the partial
+  note, and offer the action for a claude/qwen session (beside Terminal, gated on a transcript id).
 - **P3 host-wide "dsh web ↗" link in the dsh chat header (XERK-501).** The web shows a link to the
   host's single host-wide `dsh web` viewer for a dsh session whose host reports a reachable
   `dsh.web.url` (`AgentInfo.dsh.web = {running, port, url}`, hub-whitelisted; absent/`url:null` on a
