@@ -21,11 +21,16 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
       <span id="refreshLabel">Refresh</span>
     </button>
+    <button id="newEpic" class="board-refresh"
+      title="Expand an idea into an Auto-Epic-ready epic — a builder session researches the repo and files a dependency-ordered epic (XERK-726)">
+      ✨ New epic
+    </button>
     <button id="triagePolicy" class="board-refresh"
       title="Decides which To Do tickets each org's auto-start sweep qualifies: minimum priority, excluded types, repo allow/deny, auto-start rate (XERK-486)">
       Triage policy
     </button>
   </div>
+  <div id="epicBuilders"></div>
   <div id="board"></div>
   <div class="td-backdrop" id="detailBackdrop" hidden>
     <div class="td-panel" id="detailPanel" role="dialog" aria-modal="true" aria-label="Ticket detail"></div>
@@ -42,6 +47,11 @@
   <div class="td-backdrop" id="triageRulesBackdrop" hidden>
     <div class="td-panel td-narrow" id="triageRulesPanel" role="dialog" aria-modal="true" aria-label="Triage policy"></div>
   </div>
+  <!-- XERK-726: the "New epic from idea" composer. Same backdrop/narrow-panel
+       pattern as the triage-policy modal above. -->
+  <div class="td-backdrop" id="epicBuilderBackdrop" hidden>
+    <div class="td-panel td-narrow" id="epicBuilderPanel" role="dialog" aria-modal="true" aria-label="New epic from idea"></div>
+  </div>
   <div class="footer">Each host agent polls its org's tracker — Jira Cloud (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code>) or a self-hosted/cloud Azure DevOps board (<code>AZDO_URL</code> / <code>AZDO_TOKEN</code>) in the agent's env — for tickets assigned to that user, active work plus the last two weeks of Done, and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns follow the tracker's universal status categories, with an In Review column carved out for review/testing statuses; each card's pill shows the org's own status name. The header's org filter scopes this board — and every other page — to one org; each org is labelled from its site unless the agent sets <code>BOARD_ORG_NAME</code>. The board reads the tracker; the one write it makes is creating a ticket via the New ticket button.</div>
 </div>
 
@@ -57,6 +67,7 @@
 <script>
 const B = window.TurmaBoard;
 const $board = document.getElementById("board");
+const $epicBuilders = document.getElementById("epicBuilders");
 
 // The org scope is no longer this page's to own — it lives in the header and
 // applies to every page (XERK-62). The board just reads it each render and
@@ -110,6 +121,13 @@ function render(data) {
   // switches) and the create button's visibility track the fleet.
   TurmaOrg.update(data);
   TurmaNewTicket.update(data);
+  // The epic-builder progress strip (XERK-726) — driven by the hub's
+  // `epicBuilders` map (+ its SSE event), scoped to the header's org filter. It
+  // lives above the board and collapses to nothing when no builder is running,
+  // so it renders BEFORE the empty-board early return (a fresh org may have a
+  // queued builder before any ticket).
+  $epicBuilders.innerHTML = B.epicBuilderProgressHtml(
+    B.epicBuilderRows(data.epicBuilders, TurmaOrg.getKeys()));
   if (!sites.length) {
     $board.innerHTML = `<div class="empty">No tickets reported yet. Connect an org by setting <code>JIRA_SITE</code>/<code>JIRA_EMAIL</code>/<code>JIRA_TOKEN</code> (Jira) or <code>AZDO_URL</code>/<code>AZDO_TOKEN</code> (Azure DevOps) in an agent's environment.</div>`;
     return;
@@ -1003,6 +1021,149 @@ function resumeEpicRun(epicKey, siteKey) {
   return postEpicRun(epicKey, siteKey, { resume: true }, "resume");
 }
 
+// --- Epic builder: idea -> epic composer + progress (XERK-726) --------------
+// The composer POSTs an idea to `POST /api/jira/<siteKey>/epic-builder`; the hub
+// mints a durable builder run (XERK-725), dispatches a builder session to a
+// capable host and streams its progress back on the `epicBuilders` payload key
+// (+ SSE). The progress strip (rendered in render()) reads that map; its "Arm
+// Auto Epic run" reuses startEpicRun, and its ✕ cancels via DELETE. Same modal
+// pattern as the triage-policy panel — the panel DOM stays stable while open (so
+// typing keeps focus) and its field values are read at submit; only an org
+// change or a busy/error transition repaints it.
+const $ebBackdrop = document.getElementById("epicBuilderBackdrop");
+const $ebPanel = document.getElementById("epicBuilderPanel");
+const $ebBtn = document.getElementById("newEpic");
+// The open draft, or null when closed: {siteKey, title, idea, repo, host, busy, error}.
+let ebState = null;
+
+// The orgs the composer can target: those in scope under the header's org filter
+// (empty filter = every org the fleet reports), same rule as policySites().
+function ebSites() {
+  const keys = TurmaOrg.getKeys();
+  return keys.length ? lastSites.filter(s => keys.includes(s.siteKey)) : lastSites;
+}
+// Snapshot the live field values into ebState before any repaint, so an org
+// change (which rebuilds the repo/host options) doesn't drop what was typed.
+function ebReadForm() {
+  if (!ebState) return;
+  const val = (sel) => { const el = $ebPanel.querySelector(sel); return el ? el.value : undefined; };
+  const t = val("[data-eb-title]"); if (t !== undefined) ebState.title = t;
+  const i = val("[data-eb-idea]"); if (i !== undefined) ebState.idea = i;
+  const r = val("[data-eb-repo]"); if (r !== undefined) ebState.repo = r;
+  const h = val("[data-eb-host]"); if (h !== undefined) ebState.host = h;
+}
+function paintEpicBuilder() {
+  const sites = ebSites();
+  if (!sites.length || !ebState) return;
+  if (!ebState.siteKey || !sites.some(s => s.siteKey === ebState.siteKey)) {
+    ebState.siteKey = sites[0].siteKey;
+  }
+  $ebPanel.innerHTML = B.epicBuilderComposerHtml(sites, ebState);
+}
+function openEpicBuilder() {
+  if (!ebSites().length) return;
+  ebState = { siteKey: null, title: "", idea: "", repo: "", host: "", busy: false, error: "" };
+  paintEpicBuilder();
+  $ebBackdrop.hidden = false;
+  syncOverlayLock();
+  const el = $ebPanel.querySelector("[data-eb-title]");
+  if (el) el.focus();
+}
+function closeEpicBuilder() {
+  ebState = null;
+  $ebBackdrop.hidden = true;
+  syncOverlayLock();
+}
+
+async function submitEpicBuilder() {
+  if (!ebState || ebState.busy) return;
+  ebReadForm();
+  const title = (ebState.title || "").trim();
+  const idea = (ebState.idea || "").trim();
+  // Match the hub's own 400s so a plainly-empty form never round-trips.
+  if (!title) { ebState.error = "a title is required"; return paintEpicBuilder(); }
+  if (!idea) { ebState.error = "an idea is required"; return paintEpicBuilder(); }
+  const siteKey = ebState.siteKey;
+  const body = { title, idea };
+  if (ebState.repo) body.repo = ebState.repo;
+  if (ebState.host) body.targetHost = ebState.host;
+  ebState.busy = true; ebState.error = "";
+  paintEpicBuilder();
+  let r, d = {}, status = 0;
+  try {
+    r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/epic-builder`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body) });
+    status = r.status;
+    if (r.status === 401) return void (location.href = "/login");
+    try { d = await r.json(); } catch { /* non-JSON error body */ }
+  } catch {
+    if (ebState) { ebState.busy = false; ebState.error = "the hub is unreachable"; }
+    return paintEpicBuilder();
+  }
+  if (!ebState) return;                     // closed mid-flight
+  ebState.busy = false;
+  if (!r.ok) {
+    ebState.error = d.error || `HTTP ${status}`;
+    paintEpicBuilder();
+    // refusalText reads `.error` off the RESPONSE BODY (XERK-264), so pass `d`.
+    TurmaNav.toast(TurmaNav.refusalText(`Build the epic for ${B.orgName(siteKey)}`, status, d));
+    return;
+  }
+  // 200: land the new run so the progress strip shows it at once; the SSE
+  // `epicBuilders` event confirms it for every other open board.
+  if (!cache) cache = { now: Date.now(), agents: [] };
+  const eb = cache.epicBuilders || (cache.epicBuilders = {});
+  if (d.run && d.run.id) eb[d.run.id] = d.run;
+  closeEpicBuilder();
+  if (cache) render(cache);
+}
+
+// Cancel / dismiss a builder run (XERK-725 DELETE). Optimistically drops it from
+// the strip; a failed DELETE (not a 404, which means "already gone") restores it
+// and toasts the hub's words. The dispatched session, if any, is not hub-reachable
+// and is left to end on its own — same as the hub-side clearEpicBuilder.
+async function dismissEpicBuilder(id, siteKey) {
+  const prev = cache && cache.epicBuilders ? cache.epicBuilders[id] : null;
+  if (cache && cache.epicBuilders) { delete cache.epicBuilders[id]; render(cache); }
+  let ok = false, status = 0, d = {};
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(siteKey)}/epic-builder/${encodeURIComponent(id)}`,
+      { method: "DELETE" });
+    status = r.status;
+    if (r.status === 401) return void (location.href = "/login");
+    ok = r.ok || r.status === 404;          // 404 = already gone, treat as done
+    try { d = await r.json(); } catch { /* non-JSON error body */ }
+  } catch { /* restored below */ }
+  if (!ok) {
+    if (prev && cache) (cache.epicBuilders || (cache.epicBuilders = {}))[id] = prev;
+    if (cache) render(cache);
+    TurmaNav.toast(TurmaNav.refusalText("Cancel the epic builder", status, d));
+  }
+}
+
+$ebBtn.addEventListener("click", openEpicBuilder);
+$ebPanel.addEventListener("click", (e) => {
+  if (e.target.closest("[data-eb-close]") || e.target.closest("[data-eb-cancel]")) {
+    return closeEpicBuilder();
+  }
+  if (e.target.closest("[data-eb-submit]")) submitEpicBuilder();
+});
+$ebPanel.addEventListener("change", (e) => {
+  const org = e.target.closest("[data-eb-org]");
+  if (org && ebState) { ebReadForm(); ebState.siteKey = org.value; ebState.error = ""; paintEpicBuilder(); }
+});
+$ebBackdrop.addEventListener("click", (e) => { if (e.target === $ebBackdrop) closeEpicBuilder(); });
+// The progress strip lives outside #board and the detail panel, so it carries
+// its own click handler: "Arm Auto Epic run" reuses the epic-run POST, ✕ cancels.
+$epicBuilders.addEventListener("click", (e) => {
+  const arm = e.target.closest("[data-eb-arm]");
+  if (arm) { startEpicRun(arm.dataset.ebArm, arm.dataset.ebSite); return; }
+  const dis = e.target.closest("[data-eb-dismiss]");
+  if (dis) { dismissEpicBuilder(dis.dataset.ebDismiss, dis.dataset.ebSite); return; }
+});
+
 // The operator's own repo answer. Painted optimistically: the pin only becomes
 // real on the agent's next beat (the command rides the heartbeat reply), and the
 // board would otherwise sit showing the model's old guess for a full interval
@@ -1279,7 +1440,8 @@ function closePolicyPanel() {
 
 // Either overlay locks the page scroll; release it only when both are closed.
 function syncOverlayLock() {
-  document.body.classList.toggle("td-open", !!(openTicketState || !$policyBackdrop.hidden));
+  document.body.classList.toggle("td-open",
+    !!(openTicketState || !$policyBackdrop.hidden || !$ebBackdrop.hidden));
 }
 
 // Read the current form fields into the patch shape the hub expects; empty
@@ -1596,6 +1758,7 @@ $panel.addEventListener("change", (e) => {
 $backdrop.addEventListener("click", (e) => { if (e.target === $backdrop) closeDetail(); });
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
+  if (!openTicketState && !$ebBackdrop.hidden) return closeEpicBuilder();
   if (!openTicketState && !$policyBackdrop.hidden) return closePolicyPanel();
   if (openTicketState) closeDetail();
 });
@@ -1689,6 +1852,7 @@ const LIVE_MAPS = [
   ["ticketQueue", "@ticketQueue"],
   ["orgColors", "@orgColors"], ["ticketTriageActions", "@ticketTriageActions"],
   ["triagePolicies", "@triagePolicies"], ["epicRuns", "@epicRuns"],
+  ["epicBuilders", "@epicBuilders"],
 ];
 function mergeSnapshot(body, since) {
   if (!body || !Array.isArray(body.agents)) { cache = body; return; }
@@ -1864,6 +2028,18 @@ function connectSSE() {
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.epicRuns = er;
     stampPatch("@epicRuns");   // in-flight snapshot can't clobber this (XERK-546)
+    scheduleRender();
+  });
+  // A builder run was armed/advanced/cancelled (XERK-726) — same tiny-whole-map
+  // pattern. The hub dispatches the builder and re-broadcasts as it moves through
+  // queued -> researching -> creating -> done/failed, so this keeps the progress
+  // strip live across boards.
+  es.addEventListener("epicBuilders", (e) => {
+    let eb;
+    try { eb = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.epicBuilders = eb;
+    stampPatch("@epicBuilders");   // in-flight snapshot can't clobber this (XERK-546)
     scheduleRender();
   });
   // An org's auto-start opt-in changed (XERK-41) — same tiny-whole-map pattern
