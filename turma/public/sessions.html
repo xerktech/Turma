@@ -961,6 +961,16 @@
           <span class="spacer"></span>
           <span class="tr-prs" id="trPrs" hidden></span>
           <span class="verbosity" id="trVerbosity"></span>
+          <!-- Trajectory toggle for the read-only stage (XERK-718). The ended/
+               killed-session and archived/search-transcript views are served
+               entirely from the durable archive, so their Trajectory works for an
+               OFFLINE host too: GET /api/archive/<id>/trajectory reads the RAW
+               layer and returns the FULL trajectory (tokens/model/timings) once
+               the session has ended (raw is synced after session end). Shown only
+               when the staged transcript has an archived id — set in
+               openEndedSession/openTranscript, hidden by resetEndedBar for the
+               subagent view (its id is virtual and has no archived <id>.jsonl). -->
+          <button class="seg-toggle" id="trTraj" hidden onclick="transcriptToTrajectory()" title="Open the read-only Trajectory (turns, output, tool calls, tokens)">Trajectory ▸</button>
           <button class="resume-btn" id="trResume" hidden onclick="resumeCurrentEnded()">Resume</button>
           <!-- An ARCHIVED session (XERK-441): its host may not exist any more, so
                the hub packs its archived files and hands them to another agent.
@@ -1056,7 +1066,7 @@
       <div class="traj-pane" id="trajPane" hidden>
         <div class="term-bar">
           <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
-          <button class="seg-toggle" id="trajChatBtn" onclick="trajectoryToChat()" title="Back to the native chat view">◂ Chat</button>
+          <button class="seg-toggle" id="trajChatBtn" onclick="trajectoryBack()" title="Back to the view this Trajectory was opened from">◂ Chat</button>
           <span class="t-title"><span class="name" id="trajTitle"></span> · <span class="path" id="trajPath"></span></span>
           <span class="spacer"></span>
           <button class="seg-toggle" id="trajRefresh" onclick="loadTrajectory(currentTrajId, true)" title="Reload the trajectory">↻ Refresh</button>
@@ -2556,6 +2566,17 @@ const $stageEmpty = document.getElementById("stageEmpty");
 // The dsh session whose Trajectory is currently staged (XERK-498), so ↻ Refresh
 // and a re-open know which one to re-fetch.
 let currentTrajId = null;
+// The Trajectory pane is reached two ways (XERK-717 live chat, XERK-718 read-only
+// stage), so its ◂ Back routes by where it was opened FROM: "chat" returns to the
+// live chat pane, "transcript" returns to the read-only stage (an ended/killed
+// session or an archived/search transcript), restoring the viewMode it had.
+let trajReturn = null;    // "chat" | "transcript"
+let trajPrevMode = null;  // viewMode to restore on Back to the read-only stage
+// The archived transcriptId the read-only stage's Trajectory toggle opens. Set by
+// openEndedSession/openTranscript (both archive-served, both real ids), cleared by
+// resetEndedBar — so the subagent view, whose id is virtual (no archived
+// <id>.jsonl), never offers the toggle.
+let transcriptTrajId = null;
 let currentId = null;
 // The host the staged session belongs to, remembered across beats — see
 // render()'s vanish check, which needs it to tell a host that has dropped the
@@ -2950,6 +2971,7 @@ function chatToTrajectory() {
   // Any runtime with a transcript (the toggle is hidden otherwise); loadTrajectory
   // handles a missing/unsynced transcript with an in-pane note.
   if (!rec) return;
+  trajReturn = "chat";
   viewMode = "trajectory";
   $chatPane.hidden = true;
   if ($trajPane) $trajPane.hidden = false;
@@ -2957,7 +2979,37 @@ function chatToTrajectory() {
   const pth = document.getElementById("trajPath");
   if (nm) nm.textContent = sessTitle(rec);
   if (pth) pth.textContent = sessMeta(rec);
+  const back = document.getElementById("trajChatBtn");
+  if (back) back.textContent = "◂ Chat";
   loadTrajectory(rec.transcriptId, false);
+}
+// The Trajectory over the read-only stage (XERK-718): an ended/killed session or
+// an archived/search transcript, both served from the durable archive — so this
+// works for an OFFLINE host, and for an ended session the endpoint returns the
+// FULL trajectory (tokens/model/timings) from the raw layer. Back returns to the
+// transcript, not a live chat (there is none). The transcript pane stays
+// populated underneath (only hidden), so returning needs no re-fetch.
+function transcriptToTrajectory() {
+  if (!transcriptTrajId) return;
+  trajReturn = "transcript";
+  trajPrevMode = viewMode;   // "ended" | "transcript" — restored on Back
+  viewMode = "trajectory";
+  $transcriptPane.hidden = true;
+  if ($trajPane) $trajPane.hidden = false;
+  // The read-only stage's title/path are already set for the staged transcript
+  // (openEndedSession/openTranscript/renderTranscript) — carry them across.
+  const nm = document.getElementById("trajTitle");
+  const pth = document.getElementById("trajPath");
+  if (nm) nm.textContent = document.getElementById("trTitle").textContent;
+  if (pth) pth.textContent = document.getElementById("trPath").textContent;
+  const back = document.getElementById("trajChatBtn");
+  if (back) back.textContent = "◂ Conversation";
+  loadTrajectory(transcriptTrajId, false);
+}
+// The Trajectory pane's ◂ Back — routes to whichever view it was opened from.
+function trajectoryBack() {
+  if (trajReturn === "transcript") { trajectoryToTranscript(); return; }
+  trajectoryToChat();
 }
 function trajectoryToChat() {
   if (!currentId) return;
@@ -2965,6 +3017,11 @@ function trajectoryToChat() {
   if ($trajPane) $trajPane.hidden = true;
   $chatPane.hidden = false;
   if (window.TurmaChat) TurmaChat.repaint();
+}
+function trajectoryToTranscript() {
+  viewMode = trajPrevMode || "transcript";
+  if ($trajPane) $trajPane.hidden = true;
+  $transcriptPane.hidden = false;
 }
 // Fetch and render the trajectory. `force` re-fetches even if we just showed it.
 async function loadTrajectory(transcriptId, force) {
@@ -3142,6 +3199,9 @@ function clearStage() {
   if (window.TurmaChat) { TurmaChat.close(); TurmaChat.closeStatic(); } // stop the chat live tail + clear the archived view
   viewMode = null;
   currentTrajId = null;
+  trajReturn = null;
+  trajPrevMode = null;
+  transcriptTrajId = null;
   $chatPane.hidden = true;
   $termPane.hidden = true;
   $transcriptPane.hidden = true;
@@ -3431,6 +3491,14 @@ async function openEndedSession(id) {
   $res.hidden = false;
   $res.disabled = !e.a.online;
   $res.title = e.a.online ? "Bring this session back" : "Host offline";
+  // The Trajectory toggle (XERK-718): archive-served, so it works even for an
+  // offline host. Offered once the session has an archived transcript id; a
+  // just-killed session that hasn't synced yet still gets the button, and
+  // loadTrajectory's 404 note covers "not synced yet".
+  const tid0 = e.s.transcriptId;
+  transcriptTrajId = tid0 || null;
+  const $traj = document.getElementById("trTraj");
+  if ($traj) $traj.hidden = !tid0;
   document.getElementById("trScroll").innerHTML = `<div class="tr-empty">Loading conversation…</div>`;
   // Leave any live chat + clear a prior archived view's verbosity control.
   if (window.TurmaChat) { TurmaChat.close(); TurmaChat.closeStatic(); }
@@ -3486,6 +3554,12 @@ function resetEndedBar() {
   const $res = document.getElementById("trResume");
   if ($prs) { $prs.hidden = true; $prs.innerHTML = ""; }
   if ($res) { $res.hidden = true; }
+  // The Trajectory toggle (XERK-718) is per-staged-transcript; each view that
+  // reuses this pane re-shows it if it has a real archived id (the subagent
+  // view's is virtual, so it stays hidden here).
+  transcriptTrajId = null;
+  const $traj = document.getElementById("trTraj");
+  if ($traj) $traj.hidden = true;
   hideRestore();
 }
 
@@ -3611,6 +3685,12 @@ async function restoreTo(ev, host) {
 async function openTranscript(id, title, hi) {
   resetEndedBar();
   currentTranscriptId = id;
+  // An archived/search transcript is archive-served with a real id, so it offers
+  // the same read-only Trajectory the ended-session view does (XERK-718).
+  // resetEndedBar() just hid the toggle and cleared the id — re-enable both here.
+  transcriptTrajId = id || null;
+  const $traj = document.getElementById("trTraj");
+  if ($traj) $traj.hidden = !id;
   trHighlight = hi || null;
   subagentReturn = null; // an archive open -> Back goes to the list
   subagentListReturn = null;
