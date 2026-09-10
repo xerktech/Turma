@@ -276,8 +276,12 @@
   details.spawn-wrap[open] > summary .chev { transform: rotate(180deg); }
   .spawn-body { padding: 10px 2px 4px; display: flex; flex-direction: column; gap: 10px; }
   .host-block .hname { font-weight: 600; font-size: 12.5px; margin-bottom: 7px; overflow-wrap: anywhere; }
-  .repo-btns { display: flex; flex-direction: column; gap: 8px; }
-  .repo-item { display: flex; flex-direction: column; align-items: stretch; }
+  /* Repos flow to fill the sidebar width, several per row (XERK-739), instead of
+     one card per line. Each closed repo is sized to its button; an OPEN composer
+     takes the whole row so its panel isn't crammed into a narrow column. */
+  .repo-btns { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }
+  .repo-item { display: flex; flex-direction: column; }
+  .repo-item.open { flex: 1 1 100%; }
   .repo-item > button { align-self: flex-start; font-size: 12px; padding: 5px 11px; }
 
   /* "New session" composer — opened by clicking a repo's button. Leaving Task
@@ -2415,7 +2419,7 @@ function hostBlock(a) {
       ${spawning ? '<span class="spin"></span> Starting…' : (open ? "− " : "+ ") + esc(r.name)}
     </button>`;
     const panel = open ? composer(a, r, rk, spawning) : "";
-    return `<div class="repo-item">${btn}${panel}</div>`;
+    return `<div class="repo-item${open ? " open" : ""}">${btn}${panel}</div>`;
   }).join("");
   return `<div class="host-block">
     <div class="hname">${esc(a.key)}</div>
