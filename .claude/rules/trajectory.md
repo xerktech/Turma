@@ -16,6 +16,16 @@ paths:
   contract is a **superset of dsh's `dshTrajectory()` output** — dsh may keep
   emitting its subset; missing fields render as absent, never as errors. Do not
   fork a second shape per runtime.
+- **The Claude+Qwen reducer is `claudeTrajectory()`** in `turma/archive.js`
+  (XERK-714), parallel to `dshTrajectory()`. ONE fold serves both: a top-level
+  raw `<sid>.jsonl` is the Claude raw transcript AND the Qwen projected one, and
+  the fold branches per LINE on `message.content` (Claude blocks) vs
+  `message.parts` (Qwen), never on runtime. `runtime` is set from which shape
+  appeared. It bounds every axis (`TRAJ_READ_MAX`/`TURNS_MAX`/`CALLS_MAX`/
+  `SNIPPET`, mirrors of the dsh constants) and returns structured JSON only.
+- **Dedupe usage on `message.id`** — Claude splits one assistant message across
+  lines that REPEAT the same id and the same `message.usage`, so summing per line
+  triples the tokens. Qwen lines carry no repeated id, so they never dedupe.
 - `TRAJ_SNIPPET = 400` bounds every `text` / `args` / `result` (mirror
   `DSH_TRAJ_SNIPPET`).
 - **Fixtures are real, trimmed + scrubbed transcripts** under
