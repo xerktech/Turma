@@ -3338,6 +3338,84 @@ test("http: GET /api/dsh/<id>/trajectory parses the native log (XERK-498)", asyn
   assert.equal((await request("GET", "/api/dsh/nope/trajectory", { headers: userHeaders })).status, 404);
 });
 
+test("http: GET /api/archive/<id>/trajectory dispatches by runtime, degrades while running (XERK-715)", async () => {
+  const meta = { remoteKey: "github.com/xerk/turma", repo: "turma", slug: "-w-ab" };
+  const ingest = (id, entries, size) => request("POST", `/api/agents/nas/archive/${id}`,
+    { body: { startOffset: 0, endOffset: size, size, meta, entries }, headers: agentHeaders });
+
+  // --- ENDED claude -> FULL trajectory (tokens + model + timings) ---
+  // The rendered row must exist first (ingestRaw skips a transcript with no
+  // filePath), then the raw <id>.jsonl is the Claude transcript claudeTrajectory folds.
+  await ingest("trajc", [{ uuid: "e1", role: "user", ts: "2026-07-11T00:00:00Z", text: "hello" }], 60);
+  const claudeRaw = [
+    '{"type":"user","timestamp":"2026-07-11T00:00:00Z","message":{"role":"user","content":"hello"}}',
+    '{"type":"assistant","timestamp":"2026-07-11T00:00:05Z","message":{"role":"assistant","model":"claude-x",' +
+      '"content":[{"type":"text","text":"hi there"}],' +
+      '"usage":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}',
+  ].join("\n") + "\n";
+  assert.equal((await rawPush("nas", "trajc", "trajc.jsonl", 0, gz(claudeRaw), agentHeaders)).status, 200);
+
+  assert.equal((await request("GET", "/api/archive/trajc/trajectory")).status, 401, "user-authed");
+  const full = await request("GET", "/api/archive/trajc/trajectory", { headers: userHeaders });
+  assert.equal(full.status, 200);
+  assert.equal(full.body.partial, false, "an ended session with a raw layer is FULL, not partial");
+  assert.equal(full.body.runtime, "claude");
+  assert.equal(full.body.model, "claude-x");
+  assert.equal(full.body.totals.turns, 1);
+  assert.equal(full.body.totals.tokens.input, 10);
+  assert.equal(full.body.totals.tokens.output, 3);
+  assert.equal(full.body.turns[0].user.text, "hello");
+
+  // --- RUNNING claude/qwen -> DEGRADED trajectory from the rendered layer ---
+  // No raw push: the raw layer is deferred while running, so claudeTrajectory()
+  // returns null and the route folds the rendered entries instead.
+  const renderedEntries = [
+    { uuid: "r1", role: "user", ts: "2026-07-11T01:00:00Z", text: "do the thing",
+      blocks: [{ t: "text", text: "do the thing" }] },
+    { uuid: "r2", role: "assistant", ts: "2026-07-11T01:00:02Z", text: "on it",
+      blocks: [{ t: "thinking", text: "planning" }, { t: "text", text: "on it" },
+               { t: "tool_use", name: "Bash", input: "ls", id: "u1" }] },
+    { uuid: "r3", role: "user", ts: "2026-07-11T01:00:04Z", text: "",
+      blocks: [{ t: "tool_result", text: "a.txt b.txt", forId: "u1" }] },
+  ];
+  await ingest("trajr", renderedEntries, 400);
+  const deg = await request("GET", "/api/archive/trajr/trajectory", { headers: userHeaders });
+  assert.equal(deg.status, 200);
+  assert.equal(deg.body.partial, true, "a rendered-only (running) session is DEGRADED");
+  assert.equal(deg.body.totals.tokens, null, "tokens are unknowable from the rendered layer -> null");
+  assert.equal(deg.body.runtime, "claude");                 // no live session -> default hint
+  assert.equal(deg.body.totals.turns, 1);
+  assert.equal(deg.body.totals.toolCalls, 1);
+  assert.equal(deg.body.turns[0].user.text, "do the thing");
+  assert.equal(deg.body.turns[0].tokens, null);
+  assert.equal(deg.body.turns[0].model, null);
+  assert.ok(deg.body.turns[0].output.some((o) => o.kind === "thinking"));
+  assert.ok(deg.body.turns[0].output.some((o) => o.kind === "text" && o.text === "on it"));
+  assert.equal(deg.body.turns[0].calls[0].name, "Bash");
+  assert.equal(deg.body.turns[0].calls[0].ok, true);        // correlated by tool_use id <-> forId
+  assert.equal(deg.body.turns[0].calls[0].result, "a.txt b.txt");
+
+  // --- unknown / not-yet-synced id -> 404 ---
+  assert.equal(
+    (await request("GET", "/api/archive/never-archived/trajectory", { headers: userHeaders })).status, 404);
+
+  // --- a dsh session STILL routes to dshTrajectory (no regression) ---
+  await ingest("trajd", [{ uuid: "d1", role: "user", ts: "2026-07-11T02:00:00Z", text: "x" }], 40);
+  const dshEvents = [
+    '{"type":"session/title","seq":1,"time":1000,"data":{"title":"dsh via archive route"}}',
+    '{"type":"turn/start","seq":2,"time":1000,"data":{"turn":1}}',
+    '{"type":"tool/call","seq":3,"time":1100,"data":{"turn":1,"callId":"c1","name":"bash","arguments":{"command":"ls"}}}',
+    '{"type":"turn/end","seq":4,"time":1200,"data":{"turn":1,"reason":{"kind":"completed"}}}',
+  ].join("\n") + "\n";
+  assert.equal((await rawPush("nas", "trajd", "trajd/dsh/events.jsonl", 0, gz(dshEvents), agentHeaders)).status, 200);
+  const dsh = await request("GET", "/api/archive/trajd/trajectory", { headers: userHeaders });
+  assert.equal(dsh.status, 200);
+  assert.equal(dsh.body.runtime, "dsh");
+  assert.equal(dsh.body.partial, false);
+  assert.equal(dsh.body.title, "dsh via archive route");
+  assert.equal(dsh.body.turns[0].calls[0].name, "bash");
+});
+
 test("http: a full chunk of INCOMPRESSIBLE bytes still fits the wire cap", async () => {
   // gzip EXPANDS incompressible input, so a wire cap equal to the chunk size made
   // any session file holding a full chunk of already-compressed bytes impossible

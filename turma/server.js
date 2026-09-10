@@ -4992,6 +4992,23 @@ function normalizeTokenRoll(a) {
 // The archive keys entries on `uuid`; the live/history path and the client merge
 // (foldHistory) key on `id`, so map uuid -> id here. Bounded to the newest
 // HISTORY_ARCHIVE_MSGS; the archive holds the whole transcript.
+// Best-effort runtime hint for a DEGRADED (running, rendered-only) trajectory —
+// the rendered layer cannot tell claude from qwen, so consult the live fleet for
+// the session's pinned `agentType`. Only claude/qwen reach the degraded path (a
+// dsh session resolves off its live raw log before this), so a "dsh" answer here
+// would be a stale record and is ignored; anything else defaults to claude.
+function liveRuntimeForTranscript(transcriptId) {
+  if (!transcriptId) return "claude";
+  for (const a of Object.values(agents)) {
+    for (const s of a.sessions || []) {
+      if (s.transcriptId === transcriptId) {
+        return s.agentType === "qwen" ? "qwen" : "claude";
+      }
+    }
+  }
+  return "claude";
+}
+
 function archiveHistory(transcriptId) {
   if (!transcriptId) return null;
   let t;
@@ -13881,6 +13898,41 @@ const server = http.createServer(async (req, res) => {
       const traj = archive.dshTrajectory(transcriptId);
       if (!traj) return json(res, 404, { error: "no dsh trajectory for this session" });
       return json(res, 200, traj);
+    }
+
+    // GET /api/archive/<transcriptId>/trajectory — the runtime-dispatched
+    // Trajectory (XERK-715, epic XERK-712), the claude/qwen sibling of the dsh
+    // route above and user-authed like `GET /api/archive/<id>`. One normalized
+    // shape (docs/trajectory-contract.md), three runtimes, chosen from the
+    // archived session's OWN data rather than a live lookup so it answers for an
+    // offline/removed host too:
+    //   - a dsh session ships its raw native log LIVE (XERK-469, no `defer_raw`),
+    //     so `dshTrajectory` — which folds `<tid>/dsh/*.jsonl` — resolves whether
+    //     the session is RUNNING or ENDED. Stamp `runtime:"dsh"`/`partial:false`.
+    //   - a claude/qwen session ships its raw `<tid>.jsonl` only at session END
+    //     (`defer_raw`), so `claudeTrajectory` (raw fold, `runtime` from the
+    //     line shape) gives the FULL trajectory once ENDED (tokens+model+timings).
+    //   - a RUNNING claude/qwen session has no raw yet, but its RENDERED layer is
+    //     synced hub-side, so serve a DEGRADED trajectory from it — `partial:true`,
+    //     tokens null — flagged so the UI shows what it can. The live token/model
+    //     enrichment is a separate ticket; this must work without it.
+    // Nothing raw is returned (JSON only, bounded in archive.js). A genuinely
+    // unknown / not-yet-synced id 404s, carrying a `refused` hint like the sibling
+    // `GET /api/archive/<id>` when a push was refused rather than merely late.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "archive" &&
+        parts[3] === "trajectory" && parts.length === 4) {
+      const transcriptId = decodeURIComponent(parts[2]);
+      const dsh = archive.dshTrajectory(transcriptId);
+      if (dsh) return json(res, 200, { runtime: "dsh", partial: false, ...dsh });
+      const full = archive.claudeTrajectory(transcriptId);
+      if (full) return json(res, 200, { partial: false, ...full });
+      const degraded = archive.renderedTrajectory(
+        transcriptId, liveRuntimeForTranscript(transcriptId));
+      if (degraded) return json(res, 200, degraded);
+      const r = archiveRefusalFor(transcriptId);
+      return json(res, 404, r
+        ? { error: "no trajectory for this session", refused: { host: r.host, at: r.at, error: r.error } }
+        : { error: "no trajectory for this session" });
     }
 
     // POST /api/agents/<host>/clone — queue a clone into the host's repos

@@ -16,6 +16,25 @@ paths:
   contract is a **superset of dsh's `dshTrajectory()` output** — dsh may keep
   emitting its subset; missing fields render as absent, never as errors. Do not
   fork a second shape per runtime.
+- **The HTTP surface is `GET /api/archive/<transcriptId>/trajectory`** (XERK-715,
+  `turma/server.js`), user-authed like `GET /api/archive/<id>`, the claude/qwen
+  sibling of the dsh-only `GET /api/dsh/<id>/trajectory`. It **dispatches by
+  runtime off the archived data, not a live lookup** (so it answers for an
+  offline/removed host): `dshTrajectory` first (dsh ships raw LIVE, XERK-469 — no
+  `defer_raw` — so it resolves running OR ended; stamped `runtime:"dsh"`/
+  `partial:false`), else `claudeTrajectory` (raw `<id>.jsonl`, FULL once ENDED),
+  else the **degraded `renderedTrajectory()` fallback**. Unknown id -> 404 with a
+  `refused` hint like the sibling archive read.
+- **`renderedTrajectory()` (archive.js) is the RUNNING fallback** — a running
+  claude/qwen session ships its RENDERED layer hub-side but DEFERS its raw
+  `<id>.jsonl` to session end (`agent-archive.md`, `defer_raw`), so both raw folds
+  return null for it. It folds `getTranscript`/`parseEntries` (role + per-entry
+  `ts` + the `t`-keyed display blocks) into the SAME contract shape, flagged
+  `partial:true` with **every `tokens` null and per-turn `model` null** — those
+  live only in the raw/usage layers and are NOT faked (live enrichment is a later
+  ticket; this route works without it). `runtime` is a best-effort hint
+  (`liveRuntimeForTranscript` in server.js — the rendered layer can't tell claude
+  from qwen), defaulting to `"claude"`.
 - **The Claude+Qwen reducer is `claudeTrajectory()`** in `turma/archive.js`
   (XERK-714), parallel to `dshTrajectory()`. ONE fold serves both: a top-level
   raw `<sid>.jsonl` is the Claude raw transcript AND the Qwen projected one, and
