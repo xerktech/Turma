@@ -3134,8 +3134,8 @@ function renderTrajectory(scroll, d) {
       ${partial ? '<div class="traj-partial">Live session — showing what has synced so far. Token counts and per-turn model appear once the session ends.</div>' : ""}
       ${d.truncated ? '<div class="traj-trunc">Showing the most recent activity — this session’s log is large and was truncated.</div>' : ""}
     </div>`;
-  // Newest turn first — a live viewer watches the latest.
-  const turns = d.turns.slice().reverse().map((tn) => {
+  // Chronological — Turn 1 at the top, reading top-to-bottom like the conversation.
+  const turns = d.turns.map((tn) => {
     const userHtml = (tn.user && tn.user.text)
       ? `<div class="traj-user"><span class="traj-role">User</span>${trajFieldInner(tn.user.text, tn.user.textFull, tn.user.textClipped)}</div>` : "";
     // Model output blocks: plain text vs a visually-distinct thinking trace.
