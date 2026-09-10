@@ -57,13 +57,19 @@ fun categoryOf(t: JiraTicket): String {
  * Column card order, a port of board.js `ticketSort`: epics float to the top of
  * every column (an organizer reads best as the column's header, not buried by
  * `updated` among its own children), then newest `updated` first within each
- * group. `sortedWith` is stable, so same-group ties keep prior order.
+ * group. Stable, so same-group ties keep prior order.
+ *
+ * Exposed as a [Comparator] so the ONE ordering definition can also sort the
+ * `(site, ticket)` pairs the board UI carries (`BoardScreen` via
+ * `compareBy(TICKET_ORDER) { it.second }`) — an inline copy there drifted from
+ * this once and silently left epics unsorted on the phone.
  */
+val TICKET_ORDER: Comparator<JiraTicket> =
+    compareBy<JiraTicket> { if (isEpicTicket(it)) 0 else 1 }
+        .thenByDescending { it.updated }
+
 fun ticketSort(tickets: List<JiraTicket>): List<JiraTicket> =
-    tickets.sortedWith(
-        compareBy<JiraTicket> { if (isEpicTicket(it)) 0 else 1 }
-            .thenByDescending { it.updated }
-    )
+    tickets.sortedWith(TICKET_ORDER)
 
 // --- drag-and-drop status change (XERK-141) ----------------------------------
 // Dragging a card into another column changes the ticket's status: the drop
