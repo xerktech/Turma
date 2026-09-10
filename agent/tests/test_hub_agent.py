@@ -28882,6 +28882,292 @@ class TestBuildTicketPrompt(unittest.TestCase):
         self.assertIn("NOT on this machine", p)
 
 
+class TestEpicPlanValidation(unittest.TestCase):
+    """XERK-724: the pure plan helpers — a Python mirror of epic-plan.js. No
+    manager, no network."""
+
+    def _diamond(self):
+        return {
+            "epic": {"summary": "Build the widget", "description": "whole thing"},
+            "children": [
+                {"localId": "a", "summary": "scaffold", "issueType": "Task", "blockedBy": []},
+                {"localId": "b", "summary": "left", "issueType": "Story", "blockedBy": ["a"]},
+                {"localId": "c", "summary": "right", "issueType": "Task", "blockedBy": ["a"]},
+                {"localId": "d", "summary": "qa+enable", "issueType": "Task",
+                 "blockedBy": ["a", "b", "c"]},
+            ],
+        }
+
+    def test_a_well_formed_plan_validates(self):
+        self.assertEqual(ha.validate_epic_plan(self._diamond()), [])
+
+    def test_link_edges_are_deduped_self_dropped_and_ordered(self):
+        self.assertEqual(ha.epic_plan_link_edges(self._diamond()),
+                         [("a", "b"), ("a", "c"), ("a", "d"), ("b", "d"), ("c", "d")])
+
+    def test_missing_epic_summary(self):
+        p = self._diamond(); p["epic"] = {"description": "x"}
+        self.assertTrue(any("summary" in e for e in ha.validate_epic_plan(p)))
+
+    def test_duplicate_localid(self):
+        p = self._diamond(); p["children"][1]["localId"] = "a"
+        self.assertTrue(any("duplicate" in e for e in ha.validate_epic_plan(p)))
+
+    def test_bad_issue_type(self):
+        p = self._diamond(); p["children"][0]["issueType"] = "Epic"
+        self.assertTrue(any("issueType" in e for e in ha.validate_epic_plan(p)))
+
+    def test_dangling_and_self_blockedby(self):
+        p = self._diamond(); p["children"][1]["blockedBy"] = ["nope", "b"]
+        errs = ha.validate_epic_plan(p)
+        self.assertTrue(any("unknown localId" in e for e in errs))
+        self.assertTrue(any("cannot block itself" in e for e in errs))
+
+    def test_cycle_is_reported(self):
+        p = self._diamond()
+        p["children"][0]["blockedBy"] = ["d"]  # a<-d, d<-a,b,c -> cycle
+        self.assertTrue(any("cycle" in e for e in ha.validate_epic_plan(p)))
+
+    def test_final_child_must_be_blocked_by_all(self):
+        p = self._diamond(); p["children"][3]["blockedBy"] = ["a", "b"]  # missing c
+        errs = ha.validate_epic_plan(p)
+        self.assertTrue(any("blocked by every other child" in e for e in errs))
+
+    def test_blockedby_as_a_string_is_rejected_like_the_JS_mirror(self):
+        # `epic-plan.js` treats a non-array blockedBy as [] (Array.isArray). A
+        # naive Python `... or []` would iterate a STRING's characters and accept
+        # a plan JS rejects; _eb_blocked_by keeps the two in step. Here the final
+        # child's blockedBy is a bare string, so it is NOT blocked-by-all.
+        p = self._diamond()
+        p["children"][3]["blockedBy"] = "a"   # a string, not ["a", "b", "c"]
+        errs = ha.validate_epic_plan(p)
+        self.assertTrue(any("blocked by every other child" in e for e in errs))
+
+    def test_prompt_carries_idea_and_the_plan_filename(self):
+        pr = ha.build_epic_builder_prompt("Widgets", "make widgets")
+        self.assertIn("Widgets", pr)
+        self.assertIn("make widgets", pr)
+        self.assertIn(ha.EPIC_BUILDER_PLAN_FILENAME, pr)
+
+
+class TestMaterializeEpicPlan(unittest.TestCase):
+    """XERK-724: materialize_epic_plan drives create_jira_issue + the Blocks-link
+    POST to produce an Auto-Epic-ready result, and reports partial failure."""
+
+    def _diamond(self):
+        return {
+            "epic": {"summary": "Epic", "description": "d"},
+            "children": [
+                {"localId": "a", "summary": "A", "issueType": "Task", "blockedBy": []},
+                {"localId": "b", "summary": "B", "issueType": "Story", "blockedBy": ["a"]},
+                {"localId": "d", "summary": "QA", "issueType": "Task", "blockedBy": ["a", "b"]},
+            ],
+        }
+
+    def _types(self, project):
+        return [{"id": "10001", "name": "Epic"}, {"id": "10002", "name": "Task"},
+                {"id": "10003", "name": "Story"}]
+
+    def test_creates_epic_children_parented_and_links(self):
+        creates, links = [], []
+        counter = [100]
+
+        def fake_create(project, issue_type, summary, description, labels, parent=None):
+            counter[0] += 1
+            key = f"XERK-{counter[0]}"
+            creates.append({"key": key, "type": issue_type, "parent": parent, "summary": summary})
+            return {"key": key, "url": "u", "assigned": True}
+
+        def fake_post(path, body):
+            links.append((body["inwardIssue"]["key"], body["outwardIssue"]["key"]))
+            return {}
+
+        with mock.patch.object(ha, "jira_issue_types", self._types), \
+             mock.patch.object(ha, "jira_post", fake_post), \
+             mock.patch.object(ha, "create_jira_issue", fake_create):
+            created = ha.materialize_epic_plan(self._diamond(), "XERK")
+
+        epic = creates[0]
+        self.assertEqual(epic["type"], "10001")          # Epic type
+        self.assertIsNone(epic["parent"])
+        # every child parented to the epic
+        for c in creates[1:]:
+            self.assertEqual(c["parent"], epic["key"])
+        self.assertEqual(len(created["children"]), 3)
+        # links reproduce the DAG, blocker->blocked, using the real keys
+        kb = created["children"]
+        self.assertEqual(sorted(links), sorted([
+            (kb["a"], kb["b"]), (kb["a"], kb["d"]), (kb["b"], kb["d"])]))
+
+    def test_partial_failure_carries_the_created_epic(self):
+        counter = [0]
+
+        def fake_create(project, issue_type, summary, description, labels, parent=None):
+            counter[0] += 1
+            if counter[0] == 3:      # epic ok, first child ok, second child fails
+                raise RuntimeError("boom")
+            return {"key": f"XERK-{counter[0]}", "url": "u", "assigned": True}
+
+        with mock.patch.object(ha, "jira_issue_types", self._types), \
+             mock.patch.object(ha, "jira_post", lambda p, b: {}), \
+             mock.patch.object(ha, "create_jira_issue", fake_create):
+            with self.assertRaises(ha.EpicBuilderError) as cm:
+                ha.materialize_epic_plan(self._diamond(), "XERK")
+        self.assertEqual(cm.exception.created["epicKey"], "XERK-1")
+        self.assertEqual(len(cm.exception.created["children"]), 1)  # only 'a' landed
+        self.assertEqual(cm.exception.created["links"], [])         # never reached links
+
+    def test_missing_epic_type_fails_before_any_write(self):
+        with mock.patch.object(ha, "jira_issue_types", lambda p: [{"id": "1", "name": "Task"}]), \
+             mock.patch.object(ha, "create_jira_issue",
+                               lambda *a, **k: self.fail("must not create")):
+            with self.assertRaises(ha.EpicBuilderError):
+                ha.materialize_epic_plan(self._diamond(), "XERK")
+
+
+class TestEpicBuilderRun(ManagerMixin, unittest.TestCase):
+    """XERK-724: the spawn/advance lifecycle and the epicBuilderStatus report."""
+
+    def _jira(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net", JIRA_EMAIL="e",
+                                   JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN="")
+
+    def _plan(self):
+        return {
+            "epic": {"summary": "Epic"},
+            "children": [
+                {"localId": "a", "summary": "A", "issueType": "Task", "blockedBy": []},
+                {"localId": "b", "summary": "B", "issueType": "Task", "blockedBy": ["a"]},
+            ],
+        }
+
+    def _spawn_returns(self, sm, sid, worktree):
+        # Fake spawn: register a session and return its id, like the real spawn.
+        def fake_spawn(repo_name, **kw):
+            sm.registry.append({"id": sid, "worktreePath": worktree,
+                                "repo": repo_name, "status": "running"})
+            return sid
+        return mock.patch.object(sm, "spawn", fake_spawn)
+
+    def test_azure_host_refuses_with_a_failed_record(self):
+        sm = self.make_manager()
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p",
+                                 JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN=""):
+            sm.spawn_epic_builder({"builderId": "b1", "siteKey": "s", "title": "T",
+                                   "idea": "i"})
+        self.assertEqual(sm.epic_builders["b1"]["state"], "failed")
+        self.assertIn("Azure", sm.epic_builders["b1"]["error"])
+
+    def test_unknown_repo_refuses(self):
+        sm = self.make_manager()
+        with self._jira(), mock.patch.object(ha, "scan_repos", lambda: []):
+            sm.spawn_epic_builder({"builderId": "b1", "siteKey": "s", "title": "T",
+                                   "idea": "i", "repo": "ghost"})
+        self.assertEqual(sm.epic_builders["b1"]["state"], "failed")
+        self.assertIn("ghost", sm.epic_builders["b1"]["error"])
+
+    def test_spawn_records_a_researching_builder(self):
+        sm = self.make_manager()
+        wt = os.path.join(self.tmp, "wt")
+        os.makedirs(wt, exist_ok=True)
+        with self._jira(), mock.patch.object(ha, "scan_repos", lambda: [{"name": "Turma", "path": "/x"}]), \
+             self._spawn_returns(sm, "sid1", wt):
+            sm.spawn_epic_builder({"builderId": "b1", "siteKey": "s.atlassian.net",
+                                   "title": "T", "idea": "i", "repo": "Turma"})
+        b = sm.epic_builders["b1"]
+        self.assertEqual(b["state"], "researching")
+        self.assertEqual(b["sessionId"], "sid1")
+        self.assertEqual(b["worktreePath"], wt)
+        self.assertEqual(sm.epic_builder_status(),
+                         [{"id": "b1", "state": "researching"}])
+
+    def test_advance_materializes_a_valid_plan(self):
+        sm = self.make_manager()
+        wt = os.path.join(self.tmp, "wt2")
+        os.makedirs(wt, exist_ok=True)
+        with open(os.path.join(wt, ha.EPIC_BUILDER_PLAN_FILENAME), "w") as f:
+            f.write(json.dumps(self._plan()))
+        sm.registry.append({"id": "sid1", "worktreePath": wt, "status": "running"})
+        sm.epic_builders["b1"] = {
+            "id": "b1", "siteKey": "s.atlassian.net", "state": "researching",
+            "sessionId": "sid1", "worktreePath": wt,
+            "planFile": ha.EPIC_BUILDER_PLAN_FILENAME, "epicKey": None, "error": None,
+            "materializing": False, "plan": None, "project": None,
+            "startedAt": time.time(), "updatedAt": time.time(),
+        }
+        sm.jira = {"tickets": [{"key": "XERK-1"}, {"key": "XERK-2"}]}
+        # Run materialization inline instead of on a worker thread.
+        done = {}
+
+        def fake_start(bid):
+            b = sm.epic_builders[bid]
+            sm._materialize_epic_builder(bid, b["plan"], b["project"])
+            done["ran"] = True
+
+        with mock.patch.object(sm, "_start_epic_builder_materialize", fake_start), \
+             mock.patch.object(sm, "_kill_epic_builder_session", lambda *a: None), \
+             mock.patch.object(ha, "materialize_epic_plan",
+                               lambda plan, project: {"epicKey": "XERK-500"}):
+            sm._advance_epic_builders()
+        self.assertTrue(done.get("ran"))
+        self.assertEqual(sm.epic_builders["b1"]["state"], "done")
+        self.assertEqual(sm.epic_builders["b1"]["epicKey"], "XERK-500")
+        self.assertEqual(sm.epic_builders["b1"]["project"], "XERK")
+        self.assertEqual(sm.epic_builder_status(),
+                         [{"id": "b1", "state": "done", "epicKey": "XERK-500"}])
+
+    def test_advance_fails_an_invalid_plan(self):
+        sm = self.make_manager()
+        wt = os.path.join(self.tmp, "wt3")
+        os.makedirs(wt, exist_ok=True)
+        bad = {"epic": {}, "children": []}
+        with open(os.path.join(wt, ha.EPIC_BUILDER_PLAN_FILENAME), "w") as f:
+            f.write(json.dumps(bad))
+        sm.registry.append({"id": "sid1", "worktreePath": wt, "status": "running"})
+        sm.epic_builders["b1"] = {
+            "id": "b1", "siteKey": "s", "state": "researching", "sessionId": "sid1",
+            "worktreePath": wt, "planFile": ha.EPIC_BUILDER_PLAN_FILENAME,
+            "epicKey": None, "error": None, "materializing": False, "plan": None,
+            "project": None, "startedAt": time.time(), "updatedAt": time.time(),
+        }
+        with mock.patch.object(sm, "_kill_epic_builder_session", lambda *a: None):
+            sm._advance_epic_builders()
+        self.assertEqual(sm.epic_builders["b1"]["state"], "failed")
+        self.assertIn("invalid plan", sm.epic_builders["b1"]["error"])
+
+    def test_advance_fails_when_session_ended_without_a_plan(self):
+        sm = self.make_manager()
+        wt = os.path.join(self.tmp, "wt4")
+        os.makedirs(wt, exist_ok=True)  # no plan file, no session in registry
+        sm.epic_builders["b1"] = {
+            "id": "b1", "siteKey": "s", "state": "researching", "sessionId": "gone",
+            "worktreePath": wt, "planFile": ha.EPIC_BUILDER_PLAN_FILENAME,
+            "epicKey": None, "error": None, "materializing": False, "plan": None,
+            "project": None, "startedAt": time.time(), "updatedAt": time.time(),
+        }
+        sm._advance_epic_builders()
+        self.assertEqual(sm.epic_builders["b1"]["state"], "failed")
+        self.assertIn("without writing a valid plan", sm.epic_builders["b1"]["error"])
+
+    def test_a_partial_failure_reports_the_epic_key_and_error(self):
+        sm = self.make_manager()
+        err = ha.EpicBuilderError("linking a->b: boom",
+                                  {"epicKey": "XERK-9", "children": {"a": "X"}, "links": []})
+        with mock.patch.object(ha, "materialize_epic_plan",
+                               side_effect=err), \
+             mock.patch.object(sm, "_kill_epic_builder_session", lambda *a: None):
+            sm.epic_builders["b1"] = {
+                "id": "b1", "state": "creating", "epicKey": None, "error": None,
+                "materializing": True, "sessionId": None,
+                "startedAt": time.time(), "updatedAt": time.time(),
+            }
+            sm._materialize_epic_builder("b1", self._plan(), "XERK")
+        st = sm.epic_builder_status()[0]
+        self.assertEqual(st["state"], "failed")
+        self.assertEqual(st["epicKey"], "XERK-9")   # the partial epic is reported
+        self.assertIn("boom", st["error"])
+
+
 class TestSpawnTicket(ManagerMixin, unittest.TestCase):
     """The board's start button, agent-side: resolve the repo from THIS host's
     triage ledger, fetch the ticket, reserve a branch, spawn."""
