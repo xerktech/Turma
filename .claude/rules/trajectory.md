@@ -88,3 +88,17 @@ paths:
   never surface `signature`. Qwen keeps thinking plaintext (`parts[].thought`).
 - **Qwen mapping reuses `agent/qwen_transcript.py::_project`** — do not re-derive
   the parts→blocks / `usageMetadata`→usage projection independently.
+- **Expand-to-full + timestamps (XERK-720).** Every snippeted field
+  (`text`/`args`/`result`) additionally carries a bounded-full copy
+  (`<field>Full`, `<field>Clipped`) — set ONLY when the value was cut — via the
+  shared `attachTrajSnip(obj, key, s, snipMax, fullMax)` helper, in all three
+  folds (`claudeTrajectoryFromText`, `renderedTrajectory`, `dshTrajectory`).
+  `TRAJ_FULL_MAX`/`DSH_TRAJ_FULL_MAX` = 1 MiB per field; the aggregate is already
+  bounded by the read cap (each field is a slice of the tail-capped read). It is
+  ADDITIVE (superset rule): a fold omitting the extras just isn't expandable, and
+  the base display field stays the 400-char snippet. The renderer
+  (`renderTrajectory`/`trajFieldInner` in `sessions.html`) `esc()`s BOTH the
+  snippet AND the full copy — the full copy is the same attacker-controlled
+  archived content (stored-XSS). Timestamps (`startedAt`/`at`, already in the
+  shape) are rendered as local wall-clock on the head/turn/call by `trajClock`.
+  Web-only, like the pane. Tests: the `XERK-720` cases in `archive.test.js`.

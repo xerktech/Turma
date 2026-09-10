@@ -29,8 +29,8 @@ Produced by the server (`turma/archive.js`), consumed by the UI. All of
   turns: [ {
     turn,                      // 1-based ordinal
     startedAt, endedAt, durationMs,
-    user:   { text } | null,   // user message text for this turn, snippeted
-    output: [ { kind: "text" | "thinking", text } ],  // model output blocks, in order
+    user:   { text, textFull?, textClipped? } | null,  // user text, snippeted (+ full on expand)
+    output: [ { kind: "text" | "thinking", text, textFull?, textClipped? } ],  // model output, in order
     model,                     // model id for this turn; null if unknown
     calls:  [ {
       name,                    // tool name
@@ -38,8 +38,8 @@ Produced by the server (`turma/archive.js`), consumed by the UI. All of
       at,                      // epoch ms of the call; null if unknown
       ok,                      // true | false | null (null = no result seen yet)
       error,                   // bool: result was an error
-      args,                    // snippeted stringified input
-      result,                  // snippeted stringified result (present when known)
+      args, argsFull?, argsClipped?,       // snippeted input (+ full on expand)
+      result, resultFull?, resultClipped?, // snippeted result (+ full on expand); present when known
       durationMs               // result time - call time; null if underivable
     } ],
     tokens: { input, output, cacheRead, cacheWrite },
@@ -50,10 +50,25 @@ Produced by the server (`turma/archive.js`), consumed by the UI. All of
 }
 ```
 
-### Snippeting
+### Snippeting and expand-to-full (XERK-720)
 
 - Define `TRAJ_SNIPPET = 400` (mirror dsh's `DSH_TRAJ_SNIPPET`). Every `text`,
   `args`, and `result` is cut to `TRAJ_SNIPPET` chars with a trailing `…`.
+- **A cut field ALSO carries a bounded-full copy for the UI's expand toggle**,
+  so the operator can read the whole thing in place instead of only the first
+  400 chars. It is **additive and present only when the value was actually cut**:
+  alongside `text` → `textFull` (+ `textClipped`), `args` → `argsFull`
+  (+ `argsClipped`), `result` → `resultFull` (+ `resultClipped`). The `*Full`
+  copy is bounded to `TRAJ_FULL_MAX` (1 MiB) per field; when even that truncated,
+  `*Clipped: true`. A short field sets only the base key (no `*Full`), and a fold
+  MAY omit the extras entirely (superset rule — the UI just won't offer expand).
+  Because every field is a slice of the tail-capped read, the `*Full` copies are
+  also bounded in aggregate by the read cap, so this ships nothing the reducer did
+  not already hold. Both the snippet and the full copy are attacker-controlled
+  archived content: the UI MUST escape BOTH (stored-XSS).
+- **Timestamps are rendered, not just durations.** The head shows `startedAt`
+  (with date), each turn its `startedAt`, and each tool call its `at` — all
+  already in the shape below (epoch ms); the UI formats them to local wall-clock.
 - Caps (mirror the dsh constants; the parser MAY reuse them):
   `TRAJ_TURNS_MAX` (turns kept, newest), `TRAJ_CALLS_MAX` (tool calls kept
   across turns). Tripping either — or a size-based read cap — sets `truncated`

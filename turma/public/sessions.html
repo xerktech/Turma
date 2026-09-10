@@ -408,6 +408,18 @@
   .traj-out-empty { opacity: 0.7; }
   .traj-c-result { grid-column: 1 / -1; color: var(--muted); font-family: var(--mono, monospace); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; opacity: 0.8; border-left: 2px solid var(--border); padding-left: 7px; margin-top: 2px; }
   .traj-partial { font-size: 12px; color: var(--muted); font-style: italic; }
+  /* Absolute transaction timestamps + expand-to-full for snippeted fields (XERK-720). */
+  .traj-time { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .traj-c-meta { display: inline-flex; gap: 8px; align-items: baseline; }
+  .traj-full { display: none; }
+  .exp > .traj-snip { display: none; }
+  .exp > .traj-full { display: inline; }
+  .traj-clip { color: var(--muted); font-style: italic; }
+  .traj-exp-toggle { display: inline; margin-left: 6px; padding: 0; border: 0; background: none;
+    color: var(--accent); cursor: pointer; font: inherit; font-size: 11px; vertical-align: baseline; }
+  .traj-exp-toggle::after { content: "▸ full"; }
+  .exp > .traj-exp-toggle::after { content: "▾ less"; }
+  .traj-exp-toggle:hover { text-decoration: underline; }
   .tr-scroll { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
   .tr-msg { max-width: 760px; padding: 9px 13px; border-radius: var(--radius-md); font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
   .tr-msg.user { align-self: flex-end; background: var(--accent-soft); color: var(--ink); }
@@ -3064,6 +3076,37 @@ function trajTokTag(tok) {
   const extra = tok.cacheRead ? ` ⇄${trajNum(tok.cacheRead)}` : "";
   return `<span class="traj-tag">↑${trajNum(tok.input)} ↓${trajNum(tok.output)}${extra}</span>`;
 }
+// An absolute clock time for a transaction (XERK-720) — the head/turn/call carry
+// epoch-ms `startedAt`/`at`; show the wall-clock so the operator can line a turn
+// up against logs, not just relative durations. Local time; `withDate` prefixes
+// the month/day for the session head (turns/calls are same-session, time alone).
+// "" when the runtime didn't carry a timestamp (rendered as absent, never 0).
+function trajClock(ms, withDate) {
+  if (typeof ms !== "number" || !isFinite(ms)) return "";
+  const dt = new Date(ms);
+  const time = dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const label = withDate
+    ? dt.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + time
+    : time;
+  return `<span class="traj-time" title="${esc(dt.toLocaleString())}">${esc(label)}</span>`;
+}
+// Render one snippeted field. When the reducer carried an expand-to-full copy
+// (`<field>Full`, set only when the value was cut with an ellipsis — XERK-720),
+// emit the snippet, the hidden full text, and a toggle; a delegated click on the
+// scroll (trajScrollClick) flips `.exp` on the wrapper so CSS swaps which shows.
+// EVERY branch is esc()'d — the full copy is arbitrary archived/attacker content
+// exactly like the snippet, so it must never reach the DOM as markup (stored XSS).
+function trajFieldInner(snippet, full, clipped) {
+  if (full == null) return esc(snippet == null ? "" : snippet);
+  return `<span class="traj-snip">${esc(snippet)}</span>`
+    + `<span class="traj-full">${esc(full)}${clipped ? '<span class="traj-clip"> … truncated at the full-view limit</span>' : ""}</span>`
+    + `<button type="button" class="traj-exp-toggle" title="Show / hide full detail"></button>`;
+}
+function trajScrollClick(e) {
+  const btn = e.target.closest(".traj-exp-toggle");
+  if (!btn || !btn.parentElement) return;
+  btn.parentElement.classList.toggle("exp");
+}
 // Render the XERK-712 superset contract (docs/trajectory-contract.md): per turn,
 // newest-first, the USER message, the MODEL OUTPUT blocks (text + thinking,
 // visually distinct), the tool-call rows (✓/✗, name, args, result, duration),
@@ -3086,6 +3129,7 @@ function renderTrajectory(scroll, d) {
         ${t.errors ? `<span class="traj-tag traj-err">${trajNum(t.errors)} errors</span>` : ""}
         ${tok ? `<span class="traj-tag">↑${trajNum(tok.input)} ↓${trajNum(tok.output)} tok</span>` : ""}
         ${d.durationMs != null ? `<span class="traj-tag">${esc(trajMs(d.durationMs))}</span>` : ""}
+        ${trajClock(d.startedAt, true)}
       </div>
       ${partial ? '<div class="traj-partial">Live session — showing what has synced so far. Token counts and per-turn model appear once the session ends.</div>' : ""}
       ${d.truncated ? '<div class="traj-trunc">Showing the most recent activity — this session’s log is large and was truncated.</div>' : ""}
@@ -3093,25 +3137,26 @@ function renderTrajectory(scroll, d) {
   // Newest turn first — a live viewer watches the latest.
   const turns = d.turns.slice().reverse().map((tn) => {
     const userHtml = (tn.user && tn.user.text)
-      ? `<div class="traj-user"><span class="traj-role">User</span>${esc(tn.user.text)}</div>` : "";
+      ? `<div class="traj-user"><span class="traj-role">User</span>${trajFieldInner(tn.user.text, tn.user.textFull, tn.user.textClipped)}</div>` : "";
     // Model output blocks: plain text vs a visually-distinct thinking trace.
     // Claude's extended-thinking is stored encrypted (empty text) on this fleet
     // — still show the block, marked, and never surface a signature (none here).
     const outHtml = (Array.isArray(tn.output) ? tn.output : []).map((o) => {
       if (!o || typeof o.text !== "string") return "";
       const think = o.kind === "thinking";
-      if (think) return `<div class="traj-out traj-out-think">💭 ${o.text ? esc(o.text) : '<span class="traj-out-empty">(thinking)</span>'}</div>`;
-      return o.text ? `<div class="traj-out">${esc(o.text)}</div>` : "";
+      if (think) return `<div class="traj-out traj-out-think">💭 ${o.text ? trajFieldInner(o.text, o.textFull, o.textClipped) : '<span class="traj-out-empty">(thinking)</span>'}</div>`;
+      return o.text ? `<div class="traj-out">${trajFieldInner(o.text, o.textFull, o.textClipped)}</div>` : "";
     }).join("");
     const calls = Array.isArray(tn.calls) ? tn.calls : [];
     const rows = calls.map((c) => {
       const mark = c.ok === false ? "✗" : (c.ok === true ? "✓" : "•");
       const cls = c.ok === false ? "traj-call traj-call-err" : "traj-call";
+      const at = trajClock(c.at, false);
       const dur = c.durationMs != null ? `<span class="traj-c-dur">${esc(trajMs(c.durationMs))}</span>` : "";
-      const args = c.args ? `<div class="traj-c-args">${esc(c.args)}</div>` : "";
+      const args = c.args ? `<div class="traj-c-args">${trajFieldInner(c.args, c.argsFull, c.argsClipped)}</div>` : "";
       const result = (c.result != null && c.result !== "")
-        ? `<div class="traj-c-result">${esc(c.result)}</div>` : "";
-      return `<div class="${cls}"><span class="traj-c-mark">${mark}</span><span class="traj-c-name">${esc(c.name || "?")}</span>${dur}${args}${result}</div>`;
+        ? `<div class="traj-c-result">${trajFieldInner(c.result, c.resultFull, c.resultClipped)}</div>` : "";
+      return `<div class="${cls}"><span class="traj-c-mark">${mark}</span><span class="traj-c-name">${esc(c.name || "?")}</span><span class="traj-c-meta">${at}${dur}</span>${args}${result}</div>`;
     }).join("");
     const model = tn.model ? `<span class="traj-tag">${esc(tn.model)}</span>` : "";
     const tk = trajTokTag(tn.tokens);
@@ -3123,11 +3168,12 @@ function renderTrajectory(scroll, d) {
     // turn); a claude/qwen turn with user/output but no call is not "empty".
     const body = userHtml + outHtml + (rows || (userHtml || outHtml ? "" : '<div class="traj-c-none">no tool calls</div>'));
     return `<div class="traj-turn">
-      <div class="traj-t-head"><span class="traj-t-n">Turn ${esc(String(tn.turn))}</span>${steps}<span class="traj-tag">${calls.length} calls</span>${model}${tk}${dur}${rk}</div>
+      <div class="traj-t-head"><span class="traj-t-n">Turn ${esc(String(tn.turn))}</span>${trajClock(tn.startedAt, false)}${steps}<span class="traj-tag">${calls.length} calls</span>${model}${tk}${dur}${rk}</div>
       ${body}
     </div>`;
   }).join("");
   scroll.innerHTML = head + `<div class="traj-turns">${turns || '<div class="traj-empty">No turns recorded yet.</div>'}</div>`;
+  scroll.onclick = trajScrollClick;  // delegated expand/collapse for snippeted fields
 }
 // Push one mobile history entry the back button consumes, and reveal the stage.
 function enterStage() {

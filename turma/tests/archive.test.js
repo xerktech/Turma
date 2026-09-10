@@ -1001,6 +1001,21 @@ test("dshTrajectory parses the D3 native log into turns/steps/tool-calls/tokens 
   assert.equal(t.truncated, false);
 });
 
+test("dshTrajectory: a long tool arg carries the FULL copy for expand (XERK-720)", () => {
+  seedRaw("dshtrajfull");
+  const long = "z".repeat(2000);
+  const events = [
+    { type: "turn/start", seq: 1, time: 1000, data: { turn: 1 } },
+    { type: "tool/call", seq: 2, time: 1100, data: { turn: 1, step: 1, callId: "c1", name: "bash", arguments: { command: long } } },
+    { type: "turn/end", seq: 3, time: 1200, data: { turn: 1, reason: { kind: "completed" } } },
+  ].map((e) => JSON.stringify(e)).join("\n") + "\n";
+  archive.ingestRaw("nas", "dshtrajfull", "dshtrajfull/dsh/events.jsonl", 0, Buffer.from(events, "utf8"));
+  const call = archive.dshTrajectory("dshtrajfull").turns[0].calls[0];
+  assert.ok(call.args.length <= 401 && call.args.endsWith("…"), "display arg is the snippet");
+  assert.ok(call.argsFull.includes(long) && call.argsFull.length > 401, "full arg carried for expand");
+  assert.ok(call.argsClipped === undefined);
+});
+
 test("dshTrajectory returns null when a session has no dsh native log (XERK-498)", () => {
   seedRaw("nodsh");
   archive.ingestRaw("nas", "nodsh", "nodsh.jsonl", 0, Buffer.from("x"));
@@ -1336,9 +1351,58 @@ test("claudeTrajectory: every text/args/result is snippeted, no un-snippeted con
   const call = r.turns[0].calls[0];
   assert.ok(call.args.length <= cap && call.args.endsWith("…"));
   assert.ok(call.result.length <= cap && call.result.endsWith("…"));
-  // The full 5000-char blobs must not survive anywhere in the structured output.
-  assert.ok(!JSON.stringify(r).includes(long));
+  // The signature must NEVER survive anywhere in the structured output.
   assert.ok(!JSON.stringify(r).includes("SECRETSIG"));
+});
+
+test("claudeTrajectory: a snipped field carries the FULL copy for expand (XERK-720)", () => {
+  const long = "x".repeat(5000);  // > TRAJ_SNIPPET, < TRAJ_FULL_MAX (1 MiB)
+  const lines = [
+    JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:00.000Z",
+      message: { role: "user", content: long } }),
+    JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:01.000Z",
+      message: { role: "assistant", model: "m", content: [
+        { type: "text", text: long },
+        { type: "tool_use", id: "c1", name: "Bash", input: { cmd: long } }] } }),
+    JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:02.000Z",
+      message: { role: "user", content: [
+        { type: "tool_result", tool_use_id: "c1", content: long, is_error: false }] } }),
+  ];
+  seedTraj("traj-full", lines.join("\n") + "\n");
+  const r = archive.claudeTrajectory("traj-full");
+  const tn = r.turns[0], call = tn.calls[0];
+  // The display field stays the 400-char snippet; the *Full sibling is the whole
+  // value, unclipped (it fits under TRAJ_FULL_MAX), so the UI can expand it.
+  assert.equal(tn.user.textFull, long);
+  assert.ok(tn.user.textClipped === undefined);
+  assert.equal(tn.output.find((o) => o.kind === "text").textFull, long);
+  assert.equal(call.argsFull.length, 5000 + '{"cmd":""}'.length, "args full is the whole stringified input");
+  assert.equal(call.resultFull, long);
+  assert.ok(call.argsClipped === undefined && call.resultClipped === undefined);
+});
+
+test("claudeTrajectory: a short field gets NO *Full copy; a >1MiB field is clipped (XERK-720)", () => {
+  const short = "hello";                       // <= TRAJ_SNIPPET: no expand
+  const huge = "y".repeat(1024 * 1024 + 10);   // > TRAJ_FULL_MAX (1 MiB): clipped
+  const lines = [
+    JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:00.000Z",
+      message: { role: "user", content: short } }),
+    JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:01.000Z",
+      message: { role: "assistant", model: "m", content: [
+        { type: "tool_use", id: "c1", name: "Bash", input: huge }] } }),
+    JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:02.000Z",
+      message: { role: "user", content: [
+        { type: "tool_result", tool_use_id: "c1", content: huge, is_error: false }] } }),
+  ];
+  seedTraj("traj-clip", lines.join("\n") + "\n");
+  const r = archive.claudeTrajectory("traj-clip");
+  const tn = r.turns[0], call = tn.calls[0];
+  assert.equal(tn.user.text, short);
+  assert.ok(tn.user.textFull === undefined, "short field carries no expand copy");
+  assert.equal(call.argsFull.length, 1024 * 1024, "full copy bounded to TRAJ_FULL_MAX");
+  assert.equal(call.argsClipped, true);
+  assert.equal(call.resultFull.length, 1024 * 1024);
+  assert.equal(call.resultClipped, true);
 });
 
 test("claudeTrajectory: deeply-nested tool content returns JSON, never throws (XERK-714 QA D1)", () => {
