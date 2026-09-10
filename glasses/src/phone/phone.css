@@ -157,14 +157,13 @@
 .ph-card:hover { border-color: var(--accent); }
 .ph-card.cur { border-color: var(--accent); border-width: 2px; }
 .ph-ticket { font-family: var(--font-mono); color: var(--accent); }
+/* PR chips are right-aligned and drop to their own line(s) below the state text
+   when they don't all fit (XERK-736). The phone card has no ⋯/Resume corner
+   reservation (unlike sessions.html), so its chips already reach the card edge
+   with only the normal padding — no negative-margin reclaim is needed here. */
 .ph-state-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; margin-top: 4px; }
-.ph-state-row .ph-state { margin-top: 0; flex: 0 1 auto; min-width: 0; }
-/* PR chips flow into the empty space beside the state text, wrapping left-to-right
-   only once a row is full (XERK-736) — mirrors sessions.html's .state-row. The
-   old atomic right-pinned list dropped to its own line(s) the moment the chips
-   didn't ALL fit, wasting the state line's right half and growing the card.
-   display: contents dissolves the wrapper so each chip is a direct flex item. */
-.ph-pr-list { display: contents; }
+.ph-state-row .ph-state { margin-top: 0; flex: 1 1 auto; min-width: 0; }
+.ph-pr-list { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; justify-content: flex-end; min-width: 0; }
 /* Queued: dashed, static, with an inline Cancel. */
 .ph-queued { border-style: dashed; cursor: default; }
 .ph-queued .ph-dot.st-waiting { box-shadow: none; }
