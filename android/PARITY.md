@@ -118,6 +118,13 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `pc · repo · branch` (XERK-125) FlowRow rather than adopting the web's `repo · ticket · pc · id`, so
   the web reorder does not apply to it and Android's active card shows no ticket/session-id.
 
+- **New-session repo list flows to fill the width (XERK-739).** The web `#spawn` sidebar picker laid
+  each host's repos ONE CARD PER LINE; they now wrap (`.repo-btns` flex-wrap), several per row, an
+  open composer taking the whole row. Web-only: Android's equivalent is the modal
+  `NewSessionPickerDialog` (host → repo), a full-width dialog list, not a wrappable sidebar column, so
+  the flow layout does not map. A later ticket can lay its repo rows out multi-column if a need
+  appears.
+
 ## Done (this pass — first installment)
 
 - **Repo on the Sessions-tab session card (XERK-125).** The live card's meta row read
