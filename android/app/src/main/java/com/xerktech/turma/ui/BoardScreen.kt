@@ -226,14 +226,14 @@ fun BoardScreen(
             // so it's on every screen — see NewTicketAction. Refresh and the
             // triage policy are board-specific now.
             if (sites.isNotEmpty()) {
-                IconButton(onClick = { epicComposerOpen = true }) {
+                HeaderIconButton(onClick = { epicComposerOpen = true }) {
                     Text("✨", fontSize = 18.sp, modifier = Modifier.semantics { contentDescription = "New epic" })
                 }
-                IconButton(onClick = { policyOpen = true }) {
+                HeaderIconButton(onClick = { policyOpen = true }) {
                     Icon(Icons.Filled.Tune, "Triage policy")
                 }
             }
-            IconButton(onClick = { vm.refresh() }, enabled = !refreshing) {
+            HeaderIconButton(onClick = { vm.refresh() }, enabled = !refreshing) {
                 if (refreshing) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                 else Icon(Icons.Filled.Refresh, "Refresh")
             }

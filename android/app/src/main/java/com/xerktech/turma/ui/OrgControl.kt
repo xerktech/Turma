@@ -5,6 +5,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -97,7 +98,14 @@ fun OrgFilterAction(vm: OrgViewModel = viewModel()) {
     var colorFor by remember { mutableStateOf<String?>(null) }
 
     Box {
-        TextButton(onClick = { open = true }) {
+        // Trim the default TextButton padding (XERK-742): in the shared header this
+        // control sits shoulder-to-shoulder with the New ticket pill and the page
+        // action icons, and the default 16dp/8dp inset left a wide gap on each side
+        // that crowded the cluster. The header releases the 48dp minimum height too.
+        TextButton(
+            onClick = { open = true },
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+        ) {
             // One dot per selected org (XERK-222), each in its org's color.
             Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                 for (s in picked) OrgDot(orgColor(colorMap, s.siteKey))

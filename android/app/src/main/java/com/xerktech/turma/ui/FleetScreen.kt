@@ -27,12 +27,14 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalMinimumInteractiveComponentSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
@@ -44,6 +46,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -106,7 +109,7 @@ fun FleetScreen(
     Box(modifier) {
         Column(Modifier.fillMaxSize()) {
             ScreenHeader("Dashboard") {
-                IconButton(onClick = { vm.refresh() }) { Icon(Icons.Filled.Refresh, "Refresh") }
+                HeaderIconButton(onClick = { vm.refresh() }) { Icon(Icons.Filled.Refresh, "Refresh") }
             }
             UpdateBanner()
             LazyColumn(
@@ -713,19 +716,53 @@ fun ScreenHeader(title: String, actions: @Composable () -> Unit = {}) {
     ) {
         Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.weight(1f))
-        // Both are shared-chrome controls, on every top-level screen: the one
-        // write action (New ticket, XERK-150) beside the org scope (XERK-62).
-        NewTicketAction()
-        OrgFilterAction()
-        actions()
-        Box {
-            IconButton(onClick = { menuOpen = true }) { Icon(Icons.Filled.MoreVert, "More") }
-            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                DropdownMenuItem(
-                    text = { Text("Sign out") },
-                    onClick = { menuOpen = false; signOut() },
-                )
+        // The trailing cluster — New ticket pill, org scope, page actions, ⋮ — is
+        // packed tight (XERK-742). Material's default 48dp minimum touch target on
+        // every IconButton and the org TextButton left wide gaps between them that
+        // pushed the whole cluster left and crowded "New ticket" into the title on
+        // a phone header. Releasing the minimum-interactive size lets each control
+        // shrink to its own compact footprint ([HeaderIconButton] is 36dp, the org
+        // button trims its padding), so the buttons sit close and the pill keeps
+        // room. A small `spacedBy` keeps them from actually touching.
+        CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides Dp.Unspecified) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                // Both are shared-chrome controls, on every top-level screen: the
+                // one write action (New ticket, XERK-150) beside the org scope
+                // (XERK-62).
+                NewTicketAction()
+                OrgFilterAction()
+                actions()
+                Box {
+                    HeaderIconButton(onClick = { menuOpen = true }) { Icon(Icons.Filled.MoreVert, "More") }
+                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Sign out") },
+                            onClick = { menuOpen = false; signOut() },
+                        )
+                    }
+                }
             }
         }
     }
+}
+
+/**
+ * Compact icon button for the shared [ScreenHeader]'s trailing action cluster
+ * (XERK-742). The Material default reserves a 48dp touch target, so several in a
+ * row leave wide gaps that crowd the title and the "New ticket" pill on a phone
+ * header. This is a 36dp box around the default glyph; the header wraps the whole
+ * cluster with the minimum-interactive size released so the 36dp survives instead
+ * of being re-inflated to 48dp. Use it for every header action, not raw
+ * [IconButton], so all four pages stay consistent.
+ */
+@Composable
+fun HeaderIconButton(
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    content: @Composable () -> Unit,
+) {
+    IconButton(onClick = onClick, enabled = enabled, modifier = Modifier.size(36.dp), content = content)
 }
