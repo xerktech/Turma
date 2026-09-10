@@ -35,6 +35,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.xerktech.turma.core.ModelSource
 import com.xerktech.turma.core.Runtime
@@ -273,7 +274,16 @@ fun NewSessionPickerDialog(
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     targets.forEach { h ->
-                        SectionLabel(h.device, Modifier.padding(top = 8.dp, bottom = 2.dp))
+                        // The agent/host name headers each group of repos. Render it LARGER than
+                        // the repo rows below it (which take the dialog's default bodyMedium, 14sp)
+                        // so where one agent's list ends and the next begins is easy to see — the
+                        // muted labelSmall SectionLabel read SMALLER than its own rows (XERK-737).
+                        Text(
+                            h.device,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(top = 12.dp, bottom = 4.dp),
+                        )
                         h.repos.forEach { repo ->
                             Text(
                                 if (repo.root) "⌂ Repos root" else repo.name,
