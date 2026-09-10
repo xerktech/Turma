@@ -74,7 +74,6 @@ import com.xerktech.turma.core.scopedAgents
 import com.xerktech.turma.core.siteKeyOf
 import com.xerktech.turma.core.sessionBranch
 import com.xerktech.turma.core.sessionName
-import com.xerktech.turma.core.sessionRepoLabel
 import com.xerktech.turma.core.snippetSpans
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.ClosedSessionInfo
@@ -1020,45 +1019,19 @@ private fun SessionListCard(
                     optimistic?.ifBlank { null } ?: liveName,
                     fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
-                // host · repo · branch — the card's identity row (XERK-125), the same
-                // three facts in the same order as the session header this card opens
-                // (core/Sessions.kt sessionHeaderMeta). The repo is the addition: it
-                // is what tells several sessions on one host apart.
-                // A FlowRow so a long repo or branch wraps rather than ellipsising the
-                // parts after it away on a narrow phone.
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
-                    Text(
-                        r.device,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        "· ${sessionRepoLabel(r.session)}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    // A repos-root session has no worktree, so it has no branch to
-                    // name — the row would otherwise read "… · repos root · detached"
-                    // and assert a HEAD it was never given (the Dashboard card does
-                    // the same).
-                    if (!r.session.root) {
-                        Text(
-                            "· ${sessionBranch(r.session)}",
-                            style = MaterialTheme.typography.bodySmall,
-                            fontFamily = FontFamily.Monospace,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
+                // repo · related ticket · pc name · session id, one line (web
+                // cardMeta, XERK-735) — the same order and one-line-ellipsis
+                // treatment as the queued/ended rows and the web card. (The web
+                // makes the ticket key a board deep-link; that stays web-only here,
+                // see android/PARITY.md.)
+                val ticket = r.session.ticket?.key?.takeIf { it.isNotBlank() }?.let { "$it · " }.orEmpty()
+                Text(
+                    "${r.session.repo.ifBlank { "?" }} · $ticket${r.device} · ${r.session.id}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
                 // The PRs share a marks row at the BOTTOM of the card (web
                 // sessions.html state-row), rendered when there is at least one.
                 if (r.session.prs.isNotEmpty()) {

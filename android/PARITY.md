@@ -112,11 +112,14 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `sessions.html`) was reordered to `repo · related ticket · pc name · session id` and clamped to one
   line with an ellipsis + hover-reveal `title`, and its ticket key became a LINK to that ticket's
   detail on the board (`/board?ticket=&site=`, same in-app hop as the chat footer chip). Android's
-  QUEUED and ENDED rows were reordered to match (`SessionsScreen.kt`, already `maxLines=1`). Two web-only
-  parts: (1) the ticket key is NOT a tappable board deep-link on Android's session cards yet — a later
-  ticket can thread a nav callback through; (2) the ACTIVE card meta stays Android's own
-  `pc · repo · branch` (XERK-125) FlowRow rather than adopting the web's `repo · ticket · pc · id`, so
-  the web reorder does not apply to it and Android's active card shows no ticket/session-id.
+  ACTIVE, QUEUED and ENDED rows all match the new order, each one line with ellipsis
+  (`SessionsScreen.kt`); the active row dropped its old `pc · repo · branch` FlowRow (XERK-125) for
+  the same `repo · ticket · pc · id`. One web-only part remains: the ticket key is NOT a tappable
+  board deep-link on Android's session cards — the board is a top-level tab with no ticket-detail
+  route, so that needs new cross-screen nav plumbing; a later ticket can add it.
+  - The in-session stage-bar header (web `.term-bar .t-title`) now stacks the identity/meta line
+    BELOW the title instead of letting it wrap off the first line (`app.css`). Android's chat header
+    (`sessionHeaderMeta`) is already a separate line under the title, so no change was needed there.
 
 - **New-session repo list flows to fill the width (XERK-739).** The web `#spawn` sidebar picker laid
   each host's repos ONE CARD PER LINE; they now wrap (`.repo-btns` flex-wrap), several per row, an

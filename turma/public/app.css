@@ -986,8 +986,15 @@ body.td-open { overflow: hidden; }
   display: flex; align-items: center; gap: 12px; padding: 8px 12px;
   background: var(--surface); border-bottom: 1px solid var(--hairline);
 }
-.term-bar .t-title { font-weight: 600; font-size: 14px; }
-.term-bar .t-title .path { font-family: var(--font-mono); color: var(--muted); font-weight: 400; font-size: 12px; }
+/* The stage bar's title block stacks the name over the identity/meta line
+   (XERK-735): inside a session the meta sits on its OWN line below the title
+   rather than wrapping off the end of the first. min-width:0 lets it shrink and
+   ellipsis inside the flex row instead of shoving the toolbar buttons off. */
+.term-bar .t-title { display: flex; flex-direction: column; min-width: 0;
+  font-weight: 600; font-size: 14px; line-height: 1.3; }
+.term-bar .t-title .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.term-bar .t-title .path { font-family: var(--font-mono); color: var(--muted);
+  font-weight: 400; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .term-bar .spacer { flex: 1; }
 .term-bar a { color: var(--accent); text-decoration: none; font-size: 13px; }
 .term-bar a:hover { text-decoration: underline; }
