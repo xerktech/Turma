@@ -1949,7 +1949,8 @@ test("an ended session's card carries Resume and its PR chips", () => {
   const e = els.ended.innerHTML;
   assert.match(e, /class="s-resume"/, "Resume button present");
   assert.match(e, /resumeEnded\(event,'33333'\)/);
-  assert.ok(e.includes("#7 Merged"), "the PR state it reached still shows");
+  assert.ok(e.includes("#7"), "the PR it reached still shows");
+  assert.ok(!e.includes("Merged"), "no state word on the chip (XERK-740)");
   // The card's click now rides a stretched .s-hit button, so its PR chips are real
   // <a> links out to the PR (XERK-553), matching the Android app and the stage bar.
   assert.match(e, /<a href="https:\/\/github\.com\/o\/r\/pull\/7"[^>]*class="pr-badge/,
@@ -2056,7 +2057,7 @@ test("a killed session reported through both channels collapses to one row", () 
 
   const e = els.ended.innerHTML;
   assert.match(e, /Ended sessions <span class="count">1<\/span>/, "one session, one row");
-  assert.ok(e.includes("#7 Merged"), "the surviving row is the one carrying the PR chips");
+  assert.ok(e.includes("#7"), "the surviving row is the one carrying the PR chips");
   assert.match(e, /resumeEnded\(event,'33333'\)/, "and it resumes by its own session id");
 });
 
@@ -2226,7 +2227,7 @@ test("opening an ended session shows PRs + Resume and never a terminal or compos
   // On the stage the chips ARE links — nothing wraps them, so a PR can be clicked
   // through to GitHub, which is often the reason to open an ended session at all.
   assert.match(els.trPrs.innerHTML, /<a href="https:\/\/github.com\/o\/r\/pull\/7"/);
-  assert.match(els.trPrs.innerHTML, /#7 Open/);
+  assert.match(els.trPrs.innerHTML, /#7/);
 });
 
 // XERK-356. A refused archive push never arrives, so the reassuring "it syncs

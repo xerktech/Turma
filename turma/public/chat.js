@@ -1711,13 +1711,13 @@
     const num = pr.number ? sigil + pr.number : (m ? sigil + (m[1] || m[2] || m[3]) : "PR");
     const state = String(pr.state || "").toUpperCase();
     const cls = { OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" }[state] || "";
-    const label = state ? state[0] + state.slice(1).toLowerCase() : "";
+    // No state word ("Open"/"Merged"/…): the colour already encodes the state (XERK-740).
     const ready = prReady(pr);
     const mark = ready === "ready" ? "✓" : ready === "blocked" ? "✗" : ready === "pending" ? "●" : "";
     const chk = mark ? ' <span class="pr-ready ' + ready + '" title="' + esc(prReadyTitle(pr)) + '">' + mark + "</span>" : "";
     return '<a class="pr-badge ' + cls + '" href="' + safeUrl(url) +
       '" target="_blank" rel="noopener" title="' + esc(pr.title || url) + '">' +
-      '<span class="pr-dot"></span>' + esc(num) + (label ? " " + esc(label) : "") + chk + "</a>";
+      '<span class="pr-dot"></span>' + esc(num) + chk + "</a>";
   }
   // PR status chips for the footer, next to 🛡 mode / 🧠 model. Lists every PR
   // the session opened (newest first — the freshest link leads), each linked
