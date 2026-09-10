@@ -22,6 +22,7 @@ const {
   triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
   isEpicTicket, epicRunOf, epicRunView, epicRunSig,
   epicCardControlHtml, epicRunPanelHtml,
+  epicBuilderRows, epicBuilderStateLabel, epicBuilderProgressHtml, epicBuilderComposerHtml,
   boardColumnOf, moveSweepVerdict,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
   queuedTicketOf, queuedTip,
@@ -2635,6 +2636,7 @@ const BOARD_LIVE_MAPS = [
   ["ticketTriageActions", "triageActions"],   // event name differs from the cache key
   ["triagePolicies", "triagePolicies"],
   ["epicRuns", "epicRuns"],
+  ["epicBuilders", "epicBuilders"],
 ];
 
 for (const [key, event] of BOARD_LIVE_MAPS) {
@@ -2973,4 +2975,130 @@ test("board.html: refused-command toasts pass the RESPONSE BODY to refusalText, 
   // try that block-scopes `r` (a ReferenceError that ate the refusal handling).
   assert.doesNotMatch(BOARD_SCRIPT, /Triage \$\{body\.clear[^}]*\} for[^;]*?,\s*r\.status,/,
     "saveTriage must use the hoisted `status`, not the block-scoped `r`");
+});
+
+// --- epic builder: composer + progress (XERK-726) ---------------------------
+
+function builder(over = {}) {
+  return {
+    id: "b1", siteKey: "myorg.atlassian.net", title: "Speed up onboarding",
+    idea: "Cut the new-host setup to one command.", state: "researching",
+    startedAt: 100, updatedAt: 200, host: "k8x", ...over,
+  };
+}
+
+test("epicBuilderRows: drops malformed, coerces state, scopes to orgs, newest-first", () => {
+  const map = {
+    b1: builder({ id: "b1", updatedAt: 100 }),
+    b2: builder({ id: "b2", updatedAt: 300, state: "done", epicKey: "E-9" }),
+    b3: builder({ id: "b3", siteKey: "other.atlassian.net", updatedAt: 400 }),
+    bad1: { title: "no site" },                       // no siteKey -> dropped
+    bad2: { siteKey: "myorg.atlassian.net" },         // no title -> dropped
+    bad3: null,                                        // not an object -> dropped
+    b4: builder({ id: "b4", updatedAt: 200, state: "bogus" }),  // unknown state -> queued
+  };
+  // No scope: every org, newest updatedAt first.
+  const all = epicBuilderRows(map, []);
+  assert.deepEqual(all.map((r) => r.id), ["b3", "b2", "b4", "b1"]);
+  assert.equal(all.find((r) => r.id === "b4").state, "queued", "an unknown state coerces to queued");
+  // Scoped to one org: the other-org builder drops out.
+  const scoped = epicBuilderRows(map, ["myorg.atlassian.net"]);
+  assert.deepEqual(scoped.map((r) => r.id), ["b2", "b4", "b1"]);
+  // A Set scope works the same.
+  assert.deepEqual(epicBuilderRows(map, new Set(["other.atlassian.net"])).map((r) => r.id), ["b3"]);
+  assert.deepEqual(epicBuilderRows(null, []), []);
+});
+
+test("epicBuilderRows: falls back to the map key when the record has no id", () => {
+  const rows = epicBuilderRows({ keyed: builder({ id: undefined }) }, []);
+  assert.equal(rows[0].id, "keyed");
+});
+
+test("epicBuilderStateLabel: labels each state, unknown -> Queued", () => {
+  assert.equal(epicBuilderStateLabel("researching"), "Researching");
+  assert.equal(epicBuilderStateLabel("creating"), "Creating epic");
+  assert.equal(epicBuilderStateLabel("done"), "Done");
+  assert.equal(epicBuilderStateLabel("failed"), "Failed");
+  assert.equal(epicBuilderStateLabel("queued"), "Queued");
+  assert.equal(epicBuilderStateLabel("???"), "Queued");
+});
+
+test("epicBuilderProgressHtml: empty rows collapse to nothing", () => {
+  assert.equal(epicBuilderProgressHtml([]), "");
+  assert.equal(epicBuilderProgressHtml(null), "");
+});
+
+test("epicBuilderProgressHtml: an in-flight run shows a state chip, host and a Cancel ✕", () => {
+  const html = epicBuilderProgressHtml(epicBuilderRows({ b1: builder() }, []));
+  assert.match(html, /eb-state-researching/);
+  assert.match(html, /Researching/);
+  assert.match(html, /Speed up onboarding/);
+  assert.match(html, /k8x/);                          // dispatched host
+  assert.match(html, /data-eb-dismiss="b1"/);
+  assert.match(html, /data-eb-site="myorg\.atlassian\.net"/);
+  assert.match(html, /eb-spin/);                      // a working spinner
+  assert.doesNotMatch(html, /data-eb-arm/, "no Arm button until the epic lands");
+});
+
+test("epicBuilderProgressHtml: a done run links the epic and offers Arm Auto Epic run", () => {
+  const html = epicBuilderProgressHtml(
+    epicBuilderRows({ b1: builder({ state: "done", epicKey: "E-42" }) }, []));
+  assert.match(html, /eb-state-done/);
+  // The epic link deep-links to the board's OWN detail (XERK-16 pattern), not out to Jira.
+  assert.match(html, /href="\/board\?ticket=E-42&amp;site=myorg\.atlassian\.net"/);
+  assert.match(html, /data-eb-arm="E-42"/);
+  assert.match(html, /Arm Auto Epic run/);
+});
+
+test("epicBuilderProgressHtml: a failed run shows the hub's error and no Arm", () => {
+  const html = epicBuilderProgressHtml(
+    epicBuilderRows({ b1: builder({ state: "failed", error: "repo has no tickets" }) }, []));
+  assert.match(html, /eb-state-failed/);
+  assert.match(html, /repo has no tickets/);
+  assert.doesNotMatch(html, /data-eb-arm/);
+});
+
+test("epicBuilderProgressHtml: escapes the title, idea tooltip and error", () => {
+  const html = epicBuilderProgressHtml(epicBuilderRows(
+    { b1: builder({ state: "failed", title: "<b>x</b>", idea: "a\"b", error: "<i>e</i>" }) }, []));
+  assert.doesNotMatch(html, /<b>x<\/b>/);
+  assert.match(html, /&lt;b&gt;x&lt;\/b&gt;/);
+  assert.doesNotMatch(html, /<i>e<\/i>/);
+});
+
+test("epicBuilderComposerHtml: single org shows a disabled field; title/idea/repo/host present", () => {
+  const site = { siteKey: "myorg.atlassian.net", orgName: "", online: true,
+    repoOptions: [{ name: "acme/web", cloned: true }, { name: "acme/api", cloned: false }],
+    hostOptions: [{ key: "k8x", name: "k8x", online: true }, { key: "old", name: "old", online: false }] };
+  const html = epicBuilderComposerHtml([site], { siteKey: "myorg.atlassian.net" });
+  assert.match(html, /New epic from idea/);
+  assert.match(html, /value="myorg"[^>]*disabled/);   // single org -> disabled text field, no select
+  assert.doesNotMatch(html, /data-eb-org/);
+  assert.match(html, /data-eb-title/);
+  assert.match(html, /data-eb-idea/);
+  assert.match(html, /acme\/web/);
+  assert.match(html, /acme\/api \(not cloned\)/);      // an uncloned repo is offered but flagged
+  assert.match(html, /old \(offline\)/);               // an offline host is offered but flagged
+  assert.match(html, /Build epic/);
+});
+
+test("epicBuilderComposerHtml: multiple orgs get a select; a draft preselects its org", () => {
+  const sites = [
+    { siteKey: "a.atlassian.net", orgName: "", repoOptions: [], hostOptions: [] },
+    { siteKey: "b.atlassian.net", orgName: "", repoOptions: [], hostOptions: [] },
+  ];
+  const html = epicBuilderComposerHtml(sites, { siteKey: "b.atlassian.net" });
+  assert.match(html, /data-eb-org/);
+  assert.match(html, /value="b\.atlassian\.net" selected/);
+});
+
+test("epicBuilderComposerHtml: reflects busy + error, and escapes the draft", () => {
+  const site = { siteKey: "s", orgName: "", repoOptions: [], hostOptions: [] };
+  const busy = epicBuilderComposerHtml([site], { siteKey: "s", busy: true });
+  assert.match(busy, /Building…/);
+  assert.match(busy, /data-eb-submit="1" disabled/);
+  const err = epicBuilderComposerHtml([site], { siteKey: "s", error: "no host reports that Jira org", title: "<x>" });
+  assert.match(err, /no host reports that Jira org/);
+  assert.match(err, /value="&lt;x&gt;"/);
+  assert.equal(epicBuilderComposerHtml([], {}), "", "no sites -> no composer");
 });

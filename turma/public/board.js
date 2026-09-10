@@ -336,6 +336,144 @@
       </section>`;
   }
 
+  // --- epic builder: idea -> epic composer + progress (XERK-726) -------------
+  // The operator hands the hub an IDEA (a title + free-text) and a builder
+  // SESSION expands it into an Auto-Epic-ready Jira epic (epic XERK-721; the hub
+  // half — the route, the durable `epicBuilders` store and its SSE event — is
+  // XERK-725). This is the board's operator surface: a "New epic from idea"
+  // composer POSTing to `POST /api/jira/<siteKey>/epic-builder`, and a progress
+  // strip driven by the hub's `epicBuilders` map showing queued -> researching
+  // -> creating -> done/failed, linking the produced epic on completion and
+  // offering a one-click "Arm Auto Epic run" for it. Everything malformed on the
+  // wire reads as absent — degrade, never block — like epicRunOf.
+  const EPIC_BUILDER_STATES = ["queued", "researching", "creating", "done", "failed"];
+
+  // Normalize the hub's `epicBuilders` map to a sorted array of rows for the
+  // orgs in `siteKeys` (a Set/array, empty or absent = every org). A record with
+  // no siteKey or title is DROPPED (unusable), the state coerced to a known
+  // value; newest-first by updatedAt then startedAt, id breaking the tie so the
+  // order is deterministic (for tests + a stable repaint).
+  function epicBuilderRows(epicBuilders, siteKeys) {
+    const scope = siteKeys instanceof Set ? siteKeys
+      : Array.isArray(siteKeys) ? new Set(siteKeys) : null;
+    const rows = [];
+    for (const [id, r] of Object.entries(epicBuilders || {})) {
+      if (!r || typeof r !== "object") continue;
+      const siteKey = typeof r.siteKey === "string" ? r.siteKey : "";
+      const title = typeof r.title === "string" ? r.title : "";
+      if (!siteKey || !title) continue;
+      if (scope && scope.size && !scope.has(siteKey)) continue;
+      rows.push({
+        id: typeof r.id === "string" && r.id ? r.id : id,
+        siteKey, title,
+        state: EPIC_BUILDER_STATES.includes(r.state) ? r.state : "queued",
+        idea: typeof r.idea === "string" ? r.idea : "",
+        host: typeof r.host === "string" ? r.host : "",
+        repo: typeof r.repo === "string" ? r.repo : "",
+        epicKey: typeof r.epicKey === "string" ? r.epicKey : "",
+        error: typeof r.error === "string" ? r.error : "",
+        startedAt: Number.isFinite(r.startedAt) ? r.startedAt : 0,
+        updatedAt: Number.isFinite(r.updatedAt) ? r.updatedAt : 0,
+      });
+    }
+    rows.sort((a, b) => (b.updatedAt - a.updatedAt) || (b.startedAt - a.startedAt)
+      || String(a.id).localeCompare(String(b.id)));
+    return rows;
+  }
+
+  function epicBuilderStateLabel(state) {
+    switch (state) {
+      case "researching": return "Researching";
+      case "creating": return "Creating epic";
+      case "done": return "Done";
+      case "failed": return "Failed";
+      default: return "Queued";
+    }
+  }
+
+  // The progress strip: one row per builder run for the scoped orgs, driven by
+  // the hub's `epicBuilders` map (+ its SSE event). In-flight runs show a live
+  // state chip, the dispatched host and a ✕ to CANCEL; a done run links the
+  // produced epic (to the board's own detail, deep-linked) and offers arming its
+  // Auto-Epic run in one click; a failed run shows the hub's reported error and a
+  // ✕ to dismiss. No runs -> "" so the strip collapses entirely.
+  function epicBuilderProgressHtml(rows) {
+    if (!rows || !rows.length) return "";
+    const item = (r) => {
+      const terminal = r.state === "done" || r.state === "failed";
+      const chip = `<span class="eb-state eb-state-${esc(r.state)}">${esc(epicBuilderStateLabel(r.state))}</span>`;
+      const host = r.host
+        ? `<span class="eb-host" title="dispatched to ${esc(r.host)}">${esc(r.host)}</span>` : "";
+      let tail = "";
+      if (r.state === "done" && r.epicKey) {
+        const epicUrl = `/board?ticket=${encodeURIComponent(r.epicKey)}&site=${encodeURIComponent(r.siteKey)}`;
+        tail = `<a class="eb-epic" href="${esc(epicUrl)}" title="Open the produced epic">${esc(r.epicKey)} ↗</a>
+          <button type="button" class="eb-arm" data-eb-arm="${esc(r.epicKey)}" data-eb-site="${esc(r.siteKey)}"
+            title="Arm the Auto Epic run for ${esc(r.epicKey)} — its children work in dependency order, ready ones in parallel, hands-off">▶ Arm Auto Epic run</button>`;
+      } else if (r.state === "failed") {
+        tail = `<span class="eb-err">${esc(r.error || "the builder reported a failure")}</span>`;
+      } else if (!terminal) {
+        tail = `<span class="eb-spin" role="img" aria-label="working"></span>`;
+      }
+      const dismiss = `<button type="button" class="eb-dismiss" data-eb-dismiss="${esc(r.id)}" data-eb-site="${esc(r.siteKey)}"
+        title="${terminal ? "Dismiss" : "Cancel this builder"}" aria-label="${terminal ? "Dismiss" : "Cancel"} epic builder">✕</button>`;
+      return `<div class="eb-row eb-${esc(r.state)}" data-eb-id="${esc(r.id)}">
+          ${chip}
+          <span class="eb-title" title="${esc(r.idea || r.title)}">${esc(r.title)}</span>
+          <span class="eb-org">${esc(orgName(r.siteKey))}</span>
+          ${host}${tail}${dismiss}
+        </div>`;
+    };
+    return `<div class="eb-progress" role="region" aria-label="Epic builders">
+        <div class="eb-progress-h">Epic builders</div>
+        ${rows.map(item).join("")}
+      </div>`;
+  }
+
+  // The "New epic from idea" composer body. `sites` are the in-scope mergeSites()
+  // entries; `o` carries the draft (siteKey/title/idea/repo/host) plus busy/error.
+  // Title + free-form idea, an optional repo and host picked off the site's own
+  // options (mergeSites' repoOptions/hostOptions) — the same pools the manual
+  // Start pickers draw from. Empty sites -> "" (the button is hidden then anyway).
+  function epicBuilderComposerHtml(sites, o) {
+    o = o || {};
+    if (!sites || !sites.length) return "";
+    const site = sites.find((s) => s.siteKey === o.siteKey) || sites[0];
+    const single = sites.length === 1;
+    const orgRow = single
+      ? `<div class="tp-field"><span>Org</span><input type="text" value="${esc(orgName(site.siteKey, site.orgName))}" disabled></div>`
+      : `<label class="tp-field"><span>Org</span><select data-eb-org="1">`
+        + sites.map((s) => `<option value="${esc(s.siteKey)}"${s.siteKey === site.siteKey ? " selected" : ""}>${esc(orgName(s.siteKey, s.orgName))}</option>`).join("")
+        + `</select></label>`;
+    const repoOpts = `<option value="">Let the builder pick a repo</option>`
+      + (site.repoOptions || []).map((r) => `<option value="${esc(r.name)}"${o.repo === r.name ? " selected" : ""}>${esc(r.name)}${r.cloned ? "" : " (not cloned)"}</option>`).join("");
+    const hostOpts = `<option value="">Any capable host</option>`
+      + (site.hostOptions || []).map((h) => `<option value="${esc(h.key)}"${o.host === h.key ? " selected" : ""}>${esc(h.name)}${h.online ? "" : " (offline)"}</option>`).join("");
+    return `<div class="td-head">
+        <span class="tp-title">New epic from idea</span>
+        <button type="button" class="td-close" data-eb-close="1" aria-label="Close">✕</button>
+      </div>
+      ${orgRow}
+      <p class="tp-note">Describe an idea and a builder session researches the repo, expands it into a
+        set of dependency-ordered tickets and files an Auto-Epic-ready epic. Watch it build below, then
+        arm its Auto Epic run when it lands.</p>
+      <label class="tp-field"><span>Title</span>
+        <input type="text" data-eb-title="1" maxlength="500" placeholder="Short name for the epic"
+          value="${esc(o.title || "")}"></label>
+      <label class="tp-field"><span>Idea</span>
+        <textarea data-eb-idea="1" rows="6" maxlength="8000"
+          placeholder="What should this epic accomplish? Free-form — the builder does the breakdown.">${esc(o.idea || "")}</textarea></label>
+      <label class="tp-field"><span>Repo (optional)</span>
+        <select data-eb-repo="1">${repoOpts}</select></label>
+      <label class="tp-field"><span>Host (optional)</span>
+        <select data-eb-host="1">${hostOpts}</select></label>
+      ${o.error ? `<div class="tp-err">${esc(o.error)}</div>` : ""}
+      <div class="cf-actions">
+        <button type="button" class="cf-btn" data-eb-cancel="1">Cancel</button>
+        <button type="button" class="cf-btn cf-primary" data-eb-submit="1"${o.busy ? " disabled" : ""}>${o.busy ? "Building…" : "Build epic"}</button>
+      </div>`;
+  }
+
   // The operator's verdict on the card (XERK-486 [F]). It outranks everything
   // the model said, so it gets a chip of its own: approve reads green (it
   // forces auto-start), hold amber (it parks the card in the Triage lane),
@@ -2059,6 +2197,7 @@
     triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
     isEpicTicket, epicRunOf, epicRunView, epicRunSig,
     epicCardControlHtml, epicProgressBarHtml, epicRunPanelHtml,
+    epicBuilderRows, epicBuilderStateLabel, epicBuilderProgressHtml, epicBuilderComposerHtml,
     boardColumnOf, moveSweepVerdict,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
     queuedTicketOf, queuedLabel, queuedTip,

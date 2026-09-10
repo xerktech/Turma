@@ -11835,6 +11835,41 @@ test("XERK-725: epic-builder route validates input, idea length, org and repo", 
   assert.equal(Object.keys(epicBuilders).length, 0);
 });
 
+test("XERK-726: the route accepts a LISTED-but-uncloned repo (clone-on-demand), not just on-disk ones", async () => {
+  // The board composer offers uncloned repos (flagged "(not cloned)") off the
+  // org's jira.repoOptions, exactly as the manual Start/repo pickers do, and
+  // dispatch clones on demand. orgReportsRepo must therefore accept a repo LISTED
+  // in repoOptions even when no host has it on disk — checking only the on-disk
+  // `repos[]` 404'd every uncloned pick the UI presents (QA seam defect).
+  resetEpicBuilders();
+  // The host has "Turma" cloned (repos[]) and lists an uncloned "acme/api"
+  // (repoOptions only) — the shape the composer draws from.
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "ebListed",
+      repos: [{ name: "Turma", path: "/git/Turma" }],
+      jira: { available: true, configured: true, siteKey: "eb726.atlassian.net",
+        user: "ebListed@x.com", fetchedAt: "2026-07-14T12:00:00Z", tickets: [],
+        repoOptions: [{ name: "Turma", cloned: true }, { name: "acme/api", cloned: false }] },
+    },
+    headers: agentHeaders,
+  });
+  // A cloned repo -> 200.
+  let r = await request("POST", "/api/jira/eb726.atlassian.net/epic-builder",
+    { body: { title: "T", idea: "go", repo: "Turma" }, headers: userHeaders });
+  assert.equal(r.status, 200, "a cloned repo is accepted");
+  assert.equal(r.body.run.repo, "Turma");
+  // A listed-but-uncloned repo -> 200 (clone-on-demand), NOT a 404.
+  r = await request("POST", "/api/jira/eb726.atlassian.net/epic-builder",
+    { body: { title: "T", idea: "go", repo: "acme/api" }, headers: userHeaders });
+  assert.equal(r.status, 200, "a listed-but-uncloned repo is accepted, not 404'd");
+  assert.equal(r.body.run.repo, "acme/api");
+  // A repo in NEITHER set is still not cloneable -> 404.
+  r = await request("POST", "/api/jira/eb726.atlassian.net/epic-builder",
+    { body: { title: "T", idea: "go", repo: "nope/nope" }, headers: userHeaders });
+  assert.equal(r.status, 404, "a repo no host reports (cloned or listed) is still 404");
+});
+
 test("XERK-725: arming a builder dispatches to a findTicketHost pick and rides the payload", async () => {
   resetEpicBuilders();
   await builderBeat("ebDisp", "eb2.atlassian.net");

@@ -2489,12 +2489,21 @@ function publishEpicBuilders() {
   invalidateAgentsCache();
   sseBroadcast("epicBuilders", epicBuilders);
 }
-// Which hosts of an org report a repo by name (cloned or merely listed among its
-// repos[]). Used by the route to refuse a builder pinned to a repo no host of the
-// org could clone — the "repo isn't cloneable" refusal.
+// Which hosts of an org report a repo by name — CLONED (on-disk `repos[]`) OR
+// merely LISTED among the org's triaged `jira.repoOptions` (a gh-clonable repo no
+// host has cloned yet). Used by the route to refuse a builder pinned to a repo no
+// host of the org could clone — the "repo isn't cloneable" refusal.
+//
+// The listed set matters because the board composer (XERK-726) offers uncloned
+// repos (flagged "(not cloned)"), exactly as the manual Start/repo-pin pickers do,
+// and dispatch clones on demand (`findTicketHost` → `needsClone`). Checking only
+// on-disk `repos[]` would 404 every uncloned pick the composer presents — a
+// UI↔route seam that always fails (QA). So this accepts either, matching this
+// comment's stated "cloned or merely listed" intent and the pickers' own pool.
 function orgReportsRepo(siteKey, repo) {
   return Object.values(agents).some((a) => a && a.jira && a.jira.siteKey === siteKey
-    && Array.isArray(a.repos) && a.repos.some((r) => r && r.name === repo));
+    && ((Array.isArray(a.repos) && a.repos.some((r) => r && r.name === repo))
+      || (Array.isArray(a.jira.repoOptions) && a.jira.repoOptions.some((r) => r && r.name === repo))));
 }
 // Create a builder run for an idea. Returns the record. Validation (org/repo/
 // length) is the route's; this just mints and stores. State starts "queued";

@@ -762,6 +762,18 @@ those are marked `[MODEL]`.
 - P3 Org control: no cross-tab sync (the web follows a `storage` event when a second tab re-scopes;
   a phone has one instance) and no "Currently set" carry-back for a stored-but-unreported org — the
   pick is kept and resumes, it just isn't listed while nothing reports it, same as the web.
+- **P1 Epic Builder composer + progress (XERK-726) is WEB-ONLY for now.** The board's "✨ New epic"
+  composer (title + free-form idea + optional repo/host, POSTing to `POST
+  /api/jira/<siteKey>/epic-builder`) and the progress strip that tracks a builder run through
+  queued → researching → creating → done/failed — linking the produced epic and offering a one-click
+  "Arm Auto Epic run" — have no Android counterpart yet. **Decode-safe**: `epicBuilders` is a NEW
+  top-level `/api/agents` key that Android does not type, so `ignoreUnknownKeys` skips it (no
+  decode-fatality — the full-array atomicity risk needs a TYPED field). To reach parity: type
+  `epicBuilders: Map<String, EpicBuilder>?` on the fleet payload, add an `EpicBuilder` shape
+  (`id/siteKey/title/idea/state/host/epicKey/error`), render a progress list + Arm button in
+  `BoardScreen.kt`, and a composer sheet (like `CreateTicketSheet`) POSTing the same route — reusing
+  the epic-run arm call already wired for XERK-638. It is a low-frequency operator authoring action,
+  so this follows the same web-first precedent as the org auto-merge switch (XERK-550).
 
 ### Usage (`usage.html` → `UsageScreen`)
 - ~~P0 30-day stacked daily chart.~~ ~~P0 Legend with per-series + per-group toggles, persisted,

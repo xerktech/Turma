@@ -2,6 +2,9 @@
 paths:
   - turma/server.js
   - turma/tests/server.test.js
+  - turma/public/board.js
+  - turma/public/board.html
+  - turma/tests/board.test.js
 ---
 
 # Epic Builder — hub route + dispatch + run tracking (XERK-725, epic XERK-721)
@@ -40,8 +43,14 @@ builder session + its agent-side tracker writes are XERK-723 (C); the operator U
 - Validation ORDER (each a distinct fact): **400** on a missing/empty title or idea, or an
   over-long title / bad repo|targetHost type → **413** on an idea over `EPIC_BUILDER_IDEA_MAX` (a
   SIZE refusal, since the idea rides both the served record and the dispatch command) → **404** when
-  no host reports the org, a named `repo` is not cloneable (no host of the org reports it,
-  `orgReportsRepo`), or a named `targetHost` does not report the org.
+  no host reports the org, a named `repo` is not cloneable, or a named `targetHost` does not report
+  the org.
+- **`orgReportsRepo` accepts a repo CLONED (on-disk `repos[]`) OR merely LISTED (`jira.repoOptions`)**
+  — a gh-clonable repo no host has cloned yet. The composer (E, XERK-726) offers uncloned repos
+  (flagged "(not cloned)") like the manual Start/repo pickers, and dispatch clones on demand
+  (`findTicketHost` → `needsClone`); checking only the on-disk set 404'd every uncloned pick the UI
+  presents (QA seam). A repo in NEITHER set is still not cloneable → 404. Tests: `XERK-726:` in
+  `server.test.js`.
 - On success `armEpicBuilder` mints the run (`queued`), then the route calls `epicBuilderDriveSweep()`
   INLINE so a free fleet dispatches at once. Returns `{ok, run}`.
 - **`DELETE /api/jira/<siteKey>/epic-builder/<id>`** cancels: drops the hub record (the dispatched
@@ -87,6 +96,37 @@ builder session + its agent-side tracker writes are XERK-723 (C); the operator U
   host may only advance a builder **dispatched to it** (`run.host === hostKey`) — the ownership rule
   `ingestSpawnFailures` follows for cmdIds — so one host cannot advance another's builder. `error`
   is kept only while `failed`.
+
+## The operator UI (E, XERK-726) — composer + progress strip (`board.js`/`board.html`)
+
+The board is the operator surface. **Purely ADDITIVE** — no column-rule/lane mirror is touched, so it
+triggers no re-vendor/re-port.
+
+- **The composer** is a board-bar "✨ New epic" button opening a narrow modal (`epicBuilderComposerHtml`,
+  the triage-policy modal's backdrop/`td-narrow` pattern): title + free-form idea + an OPTIONAL repo
+  and host, picked off the org's own `mergeSites` `repoOptions`/`hostOptions` (the same pools the Start
+  pickers use). It POSTs `{title, idea, repo?, targetHost?}` to `POST /api/jira/<siteKey>/epic-builder`.
+  The panel DOM stays STABLE while open (typing keeps focus) — field values are read at submit
+  (`ebReadForm`), and only an org change or a busy/error transition repaints it. A refusal surfaces the
+  hub's own words (`TurmaNav.refusalText` off the RESPONSE BODY, XERK-264), not a bare status.
+- **The progress strip** (`epicBuilderProgressHtml`, rendered ABOVE the board, before the empty-board
+  early return so a fresh org's queued builder still shows) reads `epicBuilderRows(data.epicBuilders,
+  orgFilter)` — the hub's `epicBuilders` map, org-scoped by the header filter, malformed rows DROPPED
+  (degrade like `epicRunOf`). One row per run: a live state chip (queued→researching→creating→
+  done/failed) + host + a ✕ that CANCELS in-flight (DELETE) or dismisses a terminal one; a `done` run
+  LINKS the produced epic to the board's OWN detail (`/board?ticket=<epicKey>&site=<siteKey>`, the
+  XERK-16 pattern, never out to Jira) and offers **"▶ Arm Auto Epic run"** — which reuses
+  `startEpicRun(epicKey, siteKey)`, the XERK-638 epic-run POST, NOT a new route. A `failed` run shows
+  the hub's `error`.
+- **`epicBuilders` is a LIVE_MAPS/SSE key** (`@epicBuilders`) — its own `epicBuilders` SSE event
+  whole-value-patches the cache like `epicRuns`, so the strip stays live across boards, and an
+  in-flight `/api/agents` snapshot can't clobber a fresher patch (XERK-546).
+- **Web ⇄ Android parity: WEB-ONLY**, tracked in `android/PARITY.md` (P1). `epicBuilders` is a NEW
+  untyped top-level key Android's `ignoreUnknownKeys` skips (decode-SAFE — the full-array atomicity
+  risk needs a TYPED field). Same web-first precedent as the org auto-merge switch (XERK-550).
+- Tests: the `XERK-726:` cases — `epicBuilderRows`/`epicBuilderStateLabel`/`epicBuilderProgressHtml`/
+  `epicBuilderComposerHtml` in `board.test.js`, plus the `epicBuilders` entry in `BOARD_LIVE_MAPS`
+  (the SSE keep-live).
 
 ## Tests
 
