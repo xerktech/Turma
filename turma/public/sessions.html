@@ -130,14 +130,20 @@
     font-size: 12px; color: var(--ink-2); margin-top: 3px;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   }
-  /* PR badges sit on the state line, pinned to the right, to save card height.
-     When there are more PRs than fit, the list wraps onto its own line(s)
-     rather than spilling past the card edge over neighbouring text. */
+  /* PR badges share the state line and flow into the empty space beside the
+     state text, wrapping left-to-right only once a row is full (XERK-736).
+     Earlier the whole .pr-list was one atomic flex item pinned right, so it
+     dropped to its OWN line(s) the moment its chips didn't ALL fit beside the
+     state text — wasting the state line's right half and growing the card
+     vertically. `.pr-list { display: contents }` dissolves that wrapper so each
+     chip is a direct flex item of .state-row, packing beside the state text and
+     filling the width; `.state` no longer grows (flex: 0 1 auto), or it would
+     eat the free space and shove every chip onto the next line again. */
   .s-card .state-row {
-    display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-top: 4px;
+    display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; margin-top: 4px;
   }
-  .s-card .state-row .state { margin-top: 0; min-width: 0; flex: 1 1 auto; }
-  .s-card .state-row .pr-list { flex: 0 1 auto; min-width: 0; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+  .s-card .state-row .state { margin-top: 0; min-width: 0; flex: 0 1 auto; }
+  .s-card .state-row .pr-list { display: contents; }
   .s-card .state-row .pr-badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 
   /* Per-card overflow menu (⋯ → Rename / Kill). The trigger and its popover are
