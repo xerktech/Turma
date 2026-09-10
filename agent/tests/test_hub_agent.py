@@ -28822,13 +28822,15 @@ class TestEpicPlanValidation(unittest.TestCase):
         errs = ha.validate_epic_plan(p)
         self.assertTrue(any("blocked by every other child" in e for e in errs))
 
-    def test_parse_plan_plain_fenced_and_garbage(self):
+    def test_blockedby_as_a_string_is_rejected_like_the_JS_mirror(self):
+        # `epic-plan.js` treats a non-array blockedBy as [] (Array.isArray). A
+        # naive Python `... or []` would iterate a STRING's characters and accept
+        # a plan JS rejects; _eb_blocked_by keeps the two in step. Here the final
+        # child's blockedBy is a bare string, so it is NOT blocked-by-all.
         p = self._diamond()
-        self.assertEqual(ha.parse_epic_plan(json.dumps(p)), p)
-        self.assertEqual(ha.parse_epic_plan("```json\n" + json.dumps(p) + "\n```"), p)
-        self.assertIsNone(ha.parse_epic_plan("not json"))
-        self.assertIsNone(ha.parse_epic_plan("[1,2,3]"))  # not an object
-        self.assertIsNone(ha.parse_epic_plan(123))
+        p["children"][3]["blockedBy"] = "a"   # a string, not ["a", "b", "c"]
+        errs = ha.validate_epic_plan(p)
+        self.assertTrue(any("blocked by every other child" in e for e in errs))
 
     def test_prompt_carries_idea_and_the_plan_filename(self):
         pr = ha.build_epic_builder_prompt("Widgets", "make widgets")

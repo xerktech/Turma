@@ -13112,6 +13112,15 @@ def _eb_nonempty_str(v):
     return isinstance(v, str) and v.strip() != ""
 
 
+def _eb_blocked_by(c):
+    """A child's `blockedBy` as a list. A NON-list (e.g. a bare string) is [],
+    NOT iterated — `epic-plan.js` uses `Array.isArray(...) ? ... : []`, and the
+    Python `... or []` idiom would iterate a string's CHARACTERS, diverging from
+    the JS mirror (a plan JS rejects would validate here). Keep the two in step."""
+    bs = c.get("blockedBy") if isinstance(c, dict) else None
+    return bs if isinstance(bs, list) else []
+
+
 EPIC_BUILDER_DIRECTIVE = (
     "You are the Epic Builder. Turn the operator's idea into a single, well-formed\n"
     "Jira Epic whose children are already shaped for Turma's Auto Epic feature, so\n"
@@ -13171,27 +13180,6 @@ def build_epic_builder_prompt(title, idea):
     return "\n".join(lines)
 
 
-def parse_epic_plan(text):
-    """Parse the plan JSON the builder wrote. Returns the object or None (a
-    partial/mid-write file simply doesn't parse yet). Strips a ```json fence if
-    the model wrapped it in one."""
-    if not isinstance(text, str):
-        return None
-    t = text.strip()
-    if t.startswith("```"):
-        # ```json\n … \n```
-        nl = t.find("\n")
-        if nl != -1:
-            t = t[nl + 1:]
-        if t.rstrip().endswith("```"):
-            t = t.rstrip()[:-3]
-    try:
-        v = json.loads(t)
-    except Exception:
-        return None
-    return v if isinstance(v, dict) else None
-
-
 def _epic_plan_child_ids(plan):
     ids = []
     for c in (plan.get("children") or []):
@@ -13211,7 +13199,7 @@ def _epic_plan_cycle(children, idset):
             continue
         k = c["localId"]
         order.append(k)
-        blockers[k] = [b for b in (c.get("blockedBy") or [])
+        blockers[k] = [b for b in _eb_blocked_by(c)
                        if isinstance(b, str) and b in idset and b != k]
     placed, remaining = set(), list(order)
     while remaining:
@@ -13265,7 +13253,7 @@ def validate_epic_plan(plan):
         it = c.get("issueType")
         if not _eb_nonempty_str(it) or it.strip().lower() not in EPIC_BUILDER_CHILD_TYPES:
             errors.append(f'child "{lid}" issueType must be Task or Story (got {it!r})')
-        for b in (c.get("blockedBy") or []):
+        for b in _eb_blocked_by(c):
             if b == lid:
                 errors.append(f'child "{lid}" cannot block itself')
             elif b not in idset:
@@ -13281,7 +13269,7 @@ def validate_epic_plan(plan):
         final = children[-1] if isinstance(children[-1], dict) else None
         fid = final.get("localId") if (final and _eb_nonempty_str(final.get("localId"))) else None
         if fid:
-            fb = set(b for b in (final.get("blockedBy") or []) if b != fid)
+            fb = set(b for b in _eb_blocked_by(final) if b != fid)
             missing = [c["localId"] for c in valid_children
                        if c["localId"] != fid and c["localId"] not in fb]
             if missing:
@@ -13301,7 +13289,7 @@ def epic_plan_link_edges(plan):
         if not (isinstance(c, dict) and _eb_nonempty_str(c.get("localId"))):
             continue
         blocked = c["localId"]
-        for blocker in (c.get("blockedBy") or []):
+        for blocker in _eb_blocked_by(c):
             if not isinstance(blocker, str) or blocker == blocked or blocker not in idset:
                 continue
             key = (blocker, blocked)
@@ -19097,15 +19085,22 @@ class SessionManager:
         return max(counts, key=lambda p: counts[p]) if counts else None
 
     def _advance_epic_builders(self):
-        """Beat-loop sweep: move each researching builder forward. Never raises
-        onto the beat (XERK-395/402). `creating`/`done`/`failed` are the worker's
-        or terminal — only `researching` is advanced here."""
+        """Beat-loop sweep. Never raises onto the beat (XERK-395/402). Advances
+        each `researching` builder, and REAPS the session of a terminal
+        (`done`/`failed`) builder ON THE BEAT — `kill()` rebinds `self.registry`,
+        so it must never run from the materialization worker thread (which only
+        sets the terminal state). One reap per builder (`sessionKilled`)."""
         try:
             with self._epic_builders_lock:
-                builders = [dict(b) for b in self.epic_builders.values()
-                            if b.get("state") == "researching"]
+                builders = [dict(b) for b in self.epic_builders.values()]
             for b in builders:
-                self._advance_researching_builder(b)
+                st = b.get("state")
+                if st == "researching":
+                    self._advance_researching_builder(b)
+                elif (st in ("done", "failed") and b.get("sessionId")
+                      and not b.get("sessionKilled")):
+                    self._kill_epic_builder_session(b["id"], b)
+                    self._set_epic_builder(b["id"], sessionKilled=True)
         except Exception as e:
             log(f"epic builder advance failed: {e}")
 
@@ -19115,18 +19110,19 @@ class SessionManager:
             self._set_epic_builder(
                 bid, state="failed",
                 error="the builder timed out before writing a valid plan")
-            self._kill_epic_builder_session(bid, b)
             return
         worktree = b.get("worktreePath")
         plan_path = (os.path.join(worktree, b.get("planFile"))
                      if worktree and b.get("planFile") else None)
-        plan = None
-        if plan_path and os.path.isfile(plan_path):
-            try:
-                with open(plan_path, "r", encoding="utf-8", errors="replace") as f:
-                    plan = parse_epic_plan(f.read(EPIC_BUILDER_PLAN_MAX_BYTES))
-            except Exception:
-                plan = None  # mid-write / unreadable — try again next beat
+        # The plan file is written by the SESSION (same uid, its own worktree), so
+        # it is untrusted from the beat's point of view: read it through
+        # `_read_untrusted_json` (O_NONBLOCK|O_NOFOLLOW + regular-file + bounded),
+        # exactly like the session-inbox/limits reads. A plain `open()` here would
+        # let a session swap the file for a FIFO between beats and WEDGE the
+        # heartbeat with no exception to catch. None = not a complete valid JSON
+        # object yet (mid-write / absent / oversized / not an object) — keep waiting.
+        plan = (_read_untrusted_json(plan_path, EPIC_BUILDER_PLAN_MAX_BYTES)
+                if plan_path else None)
         if plan is None:
             # No plan yet. If the session is gone, it ended without one -> fail.
             if not any(s.get("id") == b.get("sessionId") for s in self.registry):
@@ -19139,16 +19135,15 @@ class SessionManager:
             self._set_epic_builder(
                 bid, state="failed",
                 error="the builder produced an invalid plan: " + "; ".join(errors[:6]))
-            self._kill_epic_builder_session(bid, b)
             return
         project = self._epic_builder_project(plan, b.get("siteKey"))
         if not project:
             self._set_epic_builder(
                 bid, state="failed",
                 error="could not determine a Jira project to create the epic in")
-            self._kill_epic_builder_session(bid, b)
             return
-        # Valid plan -> materialize OFF the beat.
+        # Valid plan -> materialize OFF the beat. The session is reaped on a later
+        # beat once the run is terminal (never here / never from the worker).
         self._set_epic_builder(bid, state="creating", plan=plan, project=project)
         self._start_epic_builder_materialize(bid)
 
@@ -19188,10 +19183,9 @@ class SessionManager:
             self._set_epic_builder(
                 bid, state="failed", materializing=False, error=str(e)[:500])
             log(f"epic builder {bid} materialization error: {e}")
-        finally:
-            with self._epic_builders_lock:
-                b = dict(self.epic_builders.get(bid) or {})
-            self._kill_epic_builder_session(bid, b)
+        # The builder's session is reaped ON THE BEAT (_advance_epic_builders),
+        # NOT here: kill() rebinds self.registry and running it from this worker
+        # thread would race the beat's registry access.
 
     def _kill_epic_builder_session(self, bid, b):
         """Free the builder's session slot once the build is over — best-effort;
