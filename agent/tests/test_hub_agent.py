@@ -4207,6 +4207,7 @@ class ManagerMixin:
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
             ("PRIORITY_WRITE_LEDGER_PATH", os.path.join(self.tmp, "jira-priority-writes.json")),
             ("DUPLICATE_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-duplicate-links.json")),
+            ("BLOCKS_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-blocks-links.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
@@ -19523,6 +19524,7 @@ class TestPruneRepo(unittest.TestCase):
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
             ("PRIORITY_WRITE_LEDGER_PATH", os.path.join(self.tmp, "jira-priority-writes.json")),
             ("DUPLICATE_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-duplicate-links.json")),
+            ("BLOCKS_LINK_LEDGER_PATH", os.path.join(self.tmp, "jira-blocks-links.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
@@ -26002,6 +26004,392 @@ class TestCreateDuplicateLink(ManagerMixin, unittest.TestCase):
         self.assertIn("s.atlassian.net/OLD-0", sm.duplicate_links,
                       "re-confirmed pair must survive the cap")
         self.assertNotIn("s.atlassian.net/OLD-1", sm.duplicate_links,
+                         "the next-oldest unconfirmed entry is evicted")
+
+
+class TestCreateEpicChild(ManagerMixin, unittest.TestCase):
+    """XERK-723: createEpicChild creates an issue whose parent is the epic and
+    stages {cmdId, key, url, epicKey} by cmdId. Jira-only; Azure boards refuse.
+    Self-assigns per the existing create path."""
+
+    def _jira(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net",
+                                   JIRA_EMAIL="e", JIRA_TOKEN="t",
+                                   AZDO_URL="", AZDO_TOKEN="")
+
+    def _azure(self):
+        return mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                   AZDO_TOKEN="p", JIRA_SITE="", JIRA_EMAIL="",
+                                   JIRA_TOKEN="")
+
+    def _cmd(self, **kw):
+        base = {"cmdId": "c1", "epicKey": "ENG-1", "project": "ENG",
+                "issueType": "10001", "summary": "child work",
+                "description": "do the thing", "labels": ["repo-agent"]}
+        base.update(kw)
+        return base
+
+    def test_parent_set_on_create(self):
+        """The real create_jira_issue POST carries fields.parent = the epic
+        (team-managed nesting) alongside the self-assignment."""
+        sm = self.make_manager()
+        seen = {}
+
+        def fake_post(path, body):
+            seen["path"] = path
+            seen["body"] = body
+            return {"key": "ENG-9"}
+        with self._jira(), \
+             mock.patch.object(ha, "_jira_account_id", return_value="acct-7"), \
+             mock.patch.object(ha, "jira_post", fake_post):
+            sm._stage_create_epic_child(self._cmd())
+        self.assertEqual(seen["path"], "/rest/api/3/issue")
+        fields = seen["body"]["fields"]
+        self.assertEqual(fields["parent"], {"key": "ENG-1"})
+        self.assertEqual(fields["project"], {"key": "ENG"})
+        self.assertEqual(fields["issuetype"], {"id": "10001"})
+        self.assertEqual(fields["assignee"], {"id": "acct-7"})
+        r = sm.epic_child_results[0]
+        self.assertEqual((r["cmdId"], r["key"], r["epicKey"], r["error"],
+                          r["warning"]),
+                         ("c1", "ENG-9",
+                          "ENG-1", None, None))
+        self.assertEqual(r["url"], "https://s.atlassian.net/browse/ENG-9")
+
+    def test_unassigned_child_warns(self):
+        """No account id -> the child is created but unassigned, a success the
+        operator is warned about (the board filters on the tracker user)."""
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "_jira_account_id", return_value=None), \
+             mock.patch.object(ha, "jira_post", return_value={"key": "ENG-9"}):
+            sm._stage_create_epic_child(self._cmd())
+        r = sm.epic_child_results[0]
+        self.assertEqual((r["key"], r["error"]), ("ENG-9", None))
+        self.assertIn("couldn't be assigned", r["warning"])
+
+    def test_azure_rejected(self):
+        sm = self.make_manager()
+        with self._azure(), mock.patch.object(ha, "jira_post") as p:
+            sm._stage_create_epic_child(self._cmd(epicKey="42"))
+        p.assert_not_called()
+        self.assertEqual(sm.epic_child_results[0]["error"],
+                         "epic children are not supported for Azure DevOps yet")
+
+    def test_unconfigured_rejected(self):
+        sm = self.make_manager()
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="",
+                                 JIRA_TOKEN="", AZDO_URL="", AZDO_TOKEN=""), \
+             mock.patch.object(ha, "jira_post") as p:
+            sm._stage_create_epic_child(self._cmd())
+        p.assert_not_called()
+        self.assertIn("no board credentials",
+                      sm.epic_child_results[0]["error"])
+
+    def test_validation_errors(self):
+        sm = self.make_manager()
+        with self._jira(), mock.patch.object(ha, "jira_post") as p:
+            sm._stage_create_epic_child(self._cmd(epicKey="../evil"))
+            self.assertEqual(sm.epic_child_results[-1]["error"],
+                             "not a valid epic key")
+            sm._stage_create_epic_child(self._cmd(summary="  "))
+            self.assertEqual(sm.epic_child_results[-1]["error"],
+                             "a title is required")
+            sm._stage_create_epic_child(self._cmd(project=""))
+            self.assertEqual(sm.epic_child_results[-1]["error"],
+                             "a project is required")
+            sm._stage_create_epic_child(self._cmd(issueType=""))
+            self.assertEqual(sm.epic_child_results[-1]["error"],
+                             "an issue type is required")
+        p.assert_not_called()
+
+    def test_creation_failure_bounded(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "_jira_account_id", return_value="a"), \
+             mock.patch.object(ha, "jira_post",
+                               side_effect=RuntimeError("HTTP Error 400: "
+                                                        + "x" * 400)):
+            sm._stage_create_epic_child(self._cmd())
+        r = sm.epic_child_results[0]
+        self.assertIsNone(r["key"])
+        self.assertTrue(r["error"].startswith("HTTP Error 400"))
+        self.assertLessEqual(len(r["error"]), 300)
+
+    def test_non_string_fields_stage_a_bounded_failure(self):
+        """A non-string field (a builder bug, or a hand-crafted command) must
+        stage a bounded fail result, NOT raise into handle_commands' swallow
+        (which would leave the submitter with no result for its cmdId). The
+        str()-wrap turns a list epicKey into text that fails valid_issue_key."""
+        sm = self.make_manager()
+        with self._jira(), mock.patch.object(ha, "jira_post") as p:
+            sm._stage_create_epic_child(self._cmd(epicKey=["ENG-1"]))
+        p.assert_not_called()
+        self.assertEqual(len(sm.epic_child_results), 1)
+        r = sm.epic_child_results[0]
+        self.assertIsNone(r["key"])
+        self.assertEqual(r["error"], "not a valid epic key")
+
+    def test_command_dispatch_and_payload_rides(self):
+        sm = self.make_manager()
+        sm.registry = []
+        with self._jira(), \
+             mock.patch.object(ha, "_jira_account_id", return_value="a"), \
+             mock.patch.object(ha, "jira_post", return_value={"key": "ENG-9"}):
+            sm.handle_commands([{"cmdId": "c9", "type": "createEpicChild",
+                                 "epicKey": "ENG-1", "project": "ENG",
+                                 "issueType": "10001", "summary": "child"}])
+        self.assertIn("c9", sm.acked)
+        self.assertEqual(sm.epic_child_results[0]["cmdId"], "c9")
+        payload = sm.build_payload(1)
+        self.assertEqual(payload["epicChildResults"][0]["cmdId"], "c9")
+
+
+class TestCreateBlocksLink(ManagerMixin, unittest.TestCase):
+    """XERK-723: createBlocksLink creates a Jira "Blocks" link, blocker blocks
+    blocked. Idempotent via a live issuelinks read (shaped by _shape_issue_links)
+    + local ledger for sticky reversal. Jira-only; Azure boards refuse. Results
+    stage into blocks_link_results keyed by cmdId."""
+
+    def _jira(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net",
+                                   JIRA_EMAIL="e", JIRA_TOKEN="t",
+                                   AZDO_URL="", AZDO_TOKEN="")
+
+    def _azure(self):
+        return mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                   AZDO_TOKEN="p", JIRA_SITE="", JIRA_EMAIL="",
+                                   JIRA_TOKEN="")
+
+    def _issue(self, links):
+        return {"fields": {"issuelinks": links}}
+
+    def test_links_in_correct_direction(self):
+        """The POST sends inwardIssue = blocker, outwardIssue = blocked (the
+        direction VERIFIED against the real XERK-634 -> XERK-635 link), reading
+        the blocker's issuelinks first as the source of truth."""
+        sm = self.make_manager()
+        seen = {}
+
+        def fake_get(path, params):
+            seen["get_path"] = path
+            seen["get_params"] = params
+            return self._issue([])  # blocker has no links yet
+
+        def fake_post(path, body):
+            seen["post_path"] = path
+            seen["post_body"] = body
+            return {}
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", fake_get), \
+             mock.patch.object(ha, "jira_post", fake_post):
+            sm.create_blocks_link("c1", "ENG-1", "ENG-2")
+        self.assertEqual(seen["get_path"], "/rest/api/3/issue/ENG-1")
+        self.assertEqual(seen["get_params"], {"fields": "issuelinks"})
+        self.assertEqual(seen["post_path"], "/rest/api/3/issueLink")
+        self.assertEqual(seen["post_body"], {
+            "inwardIssue": {"key": "ENG-1"},   # the blocker
+            "outwardIssue": {"key": "ENG-2"},  # the blocked issue
+            "type": {"name": "Blocks"},
+        })
+        r = sm.blocks_link_results[0]
+        self.assertEqual((r["cmdId"], r["blockerKey"], r["blockedKey"],
+                          r["siteKey"], r["ok"], r["action"], r["error"]),
+                         ("c1", "ENG-1", "ENG-2", "s.atlassian.net",
+                          True, "linked", None))
+        self.assertEqual(
+            sm.blocks_links["s.atlassian.net/ENG-1->ENG-2"], "ENG-2")
+
+    def test_direction_round_trips_through_shape_issue(self):
+        """The link this POST creates, re-read via _shape_issue_links, puts the
+        blocker in the blocked issue's blockedBy and the blocked issue in the
+        blocker's blocks — the shape the epic orchestration consumes. Uses the
+        EXACT per-issue shapes the real Jira API returns for such a link (see
+        XERK-634/XERK-635)."""
+        # As seen when GETting the BLOCKER (ENG-1): the other end is the
+        # outwardIssue.
+        blocker_links = [{"type": {"name": "Blocks"},
+                          "outwardIssue": {"key": "ENG-2"}}]
+        # As seen when GETting the BLOCKED issue (ENG-2): the other end is the
+        # inwardIssue.
+        blocked_links = [{"type": {"name": "Blocks"},
+                          "inwardIssue": {"key": "ENG-1"}}]
+        b_blocks, b_blocked_by = ha._shape_issue_links(blocker_links)
+        self.assertEqual((b_blocks, b_blocked_by), (["ENG-2"], []))
+        c_blocks, c_blocked_by = ha._shape_issue_links(blocked_links)
+        self.assertEqual((c_blocks, c_blocked_by), ([], ["ENG-1"]))
+
+    def test_noop_when_live_blocks_link_exists(self):
+        """The blocker already blocks the blocked issue in Jira -> no POST."""
+        sm = self.make_manager()
+        calls = []
+
+        def fake_post(path, body):
+            calls.append((path, body))
+            return {}
+        live = self._issue([
+            {"type": {"name": "Blocks"}, "outwardIssue": {"key": "ENG-7"}},
+            {"type": {"name": "Blocks"}, "outwardIssue": {"key": "ENG-2"}},
+        ])
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=live), \
+             mock.patch.object(ha, "jira_post", fake_post):
+            sm.create_blocks_link("c1", "ENG-1", "ENG-2")
+        self.assertEqual(calls, [])
+        r = sm.blocks_link_results[0]
+        self.assertEqual((r["ok"], r["action"]), (True, "no-op"))
+        self.assertEqual(
+            sm.blocks_links["s.atlassian.net/ENG-1->ENG-2"], "ENG-2")
+
+    def test_noop_when_blocker_already_blocks_many(self):
+        """The idempotency read is UNCAPPED (not _shape_issue_links, capped at
+        JIRA_LINKS_MAX=30): a blocker already blocking >30 issues whose target
+        sits beyond the first 30 is still a no-op, never a duplicate POST."""
+        sm = self.make_manager()
+        many = [{"type": {"name": "Blocks"},
+                 "outwardIssue": {"key": "ENG-%d" % i}} for i in range(40)]
+        # The target ENG-39 is the 40th link — past _shape_issue_links' cap.
+        live = self._issue(many)
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=live), \
+             mock.patch.object(ha, "jira_post") as post:
+            sm.create_blocks_link("c1", "ENG-1", "ENG-39")
+        post.assert_not_called()
+        self.assertEqual(sm.blocks_link_results[0]["action"], "no-op")
+
+    def test_sticky_skip_on_human_reversal(self):
+        """Ledger says we linked this pair, but the live read shows no link — a
+        human removed it. Must NOT relink."""
+        sm = self.make_manager()
+        sm.blocks_links["s.atlassian.net/ENG-1->ENG-2"] = "ENG-2"
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=self._issue([])), \
+             mock.patch.object(ha, "jira_post") as post:
+            sm.create_blocks_link("c1", "ENG-1", "ENG-2")
+        post.assert_not_called()
+        r = sm.blocks_link_results[0]
+        self.assertEqual((r["ok"], r["action"]), (True, "skipped"))
+
+    def test_a_different_blocked_is_not_a_reversal(self):
+        """The ledger key is the ORDERED PAIR — a blocker that already blocks X
+        is still linked to a NEW target Y, not skipped as a reversal."""
+        sm = self.make_manager()
+        sm.blocks_links["s.atlassian.net/ENG-1->ENG-2"] = "ENG-2"
+        posted = []
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=self._issue([])), \
+             mock.patch.object(ha, "jira_post",
+                               side_effect=lambda p, b: posted.append(b) or {}):
+            sm.create_blocks_link("c2", "ENG-1", "ENG-3")
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(sm.blocks_link_results[0]["action"], "linked")
+
+    def test_validation_errors(self):
+        sm = self.make_manager()
+        with self._jira(), mock.patch.object(ha, "jira_get") as g, \
+             mock.patch.object(ha, "jira_post") as p:
+            sm.create_blocks_link("c1", "../evil", "ENG-2")
+            self.assertEqual(sm.blocks_link_results[-1]["error"],
+                             "not a valid blocker issue key")
+            sm.create_blocks_link("c2", "ENG-1", "../evil")
+            self.assertEqual(sm.blocks_link_results[-1]["error"],
+                             "not a valid blocked issue key")
+            sm.create_blocks_link("c3", "ENG-1", "ENG-1")
+            self.assertEqual(sm.blocks_link_results[-1]["error"],
+                             "an issue cannot block itself")
+        g.assert_not_called()
+        p.assert_not_called()
+
+    def test_unconfigured_stages_error(self):
+        sm = self.make_manager()
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="",
+                                 JIRA_TOKEN="", AZDO_URL="", AZDO_TOKEN=""), \
+             mock.patch.object(ha, "jira_get") as g:
+            sm.create_blocks_link("c1", "ENG-1", "ENG-2")
+        g.assert_not_called()
+        self.assertIn("no board credentials",
+                      sm.blocks_link_results[0]["error"])
+
+    def test_azure_rejected(self):
+        sm = self.make_manager()
+        with self._azure(), mock.patch.object(ha, "jira_get") as g:
+            sm.create_blocks_link("c1", "42", "43")
+        g.assert_not_called()
+        self.assertEqual(sm.blocks_link_results[0]["error"],
+                         "issue linking is not supported for Azure DevOps yet")
+
+    def test_refusal_error_bounded_to_200_chars(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=self._issue([])), \
+             mock.patch.object(ha, "jira_post",
+                               side_effect=RuntimeError(
+                                   "HTTP Error 403: Forbidden — " + "x" * 300)):
+            sm.create_blocks_link("c1", "ENG-1", "ENG-2")
+        r = sm.blocks_link_results[0]
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["error"].startswith("HTTP Error 403: Forbidden"))
+        self.assertLessEqual(len(r["error"]), 200)
+
+    def test_link_check_failure_stages_error(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get",
+                               side_effect=RuntimeError("HTTP Error 404")), \
+             mock.patch.object(ha, "jira_post") as p:
+            sm.create_blocks_link("c1", "ENG-1", "ENG-2")
+        p.assert_not_called()
+        r = sm.blocks_link_results[0]
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["error"], "HTTP Error 404")
+
+    def test_keys_truncated_to_50_chars(self):
+        sm = self.make_manager()
+        long_key = "A" * 55 + "-1"
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=self._issue([])), \
+             mock.patch.object(ha, "jira_post", return_value={}):
+            sm.create_blocks_link("c1", long_key, "ENG-2")
+        self.assertEqual(len(sm.blocks_link_results[0]["blockerKey"]), 50)
+        self.assertEqual(sm.blocks_link_results[0]["blockerKey"],
+                         long_key[:50])
+
+    def test_command_dispatch_and_payload_rides(self):
+        sm = self.make_manager()
+        sm.registry = []
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=self._issue([])), \
+             mock.patch.object(ha, "jira_post", return_value={}):
+            sm.handle_commands([{"cmdId": "c9", "type": "createBlocksLink",
+                                 "blockerKey": "ENG-1", "blockedKey": "ENG-2"}])
+        self.assertIn("c9", sm.acked)
+        self.assertEqual(sm.blocks_link_results[0]["cmdId"], "c9")
+        payload = sm.build_payload(1)
+        self.assertEqual(payload["blocksLinkResults"][0]["cmdId"], "c9")
+
+    def test_ledger_update_moves_key_to_tail(self):
+        """Re-insertion moves the key to the tail (mirrors the duplicate ledger
+        contract): at the cap, _save_blocks_links evicts from the head, so a
+        re-confirmed pair must not be the one dropped."""
+        sm = self.make_manager()
+        for i in range(ha.BLOCKS_LINK_LEDGER_MAX):
+            sm.blocks_links["s.atlassian.net/OLD-%d->X" % i] = "X"
+        live = self._issue([{"type": {"name": "Blocks"},
+                             "outwardIssue": {"key": "ENG-2"}}])
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=live):
+            sm.create_blocks_link("c1", "OLD-0", "ENG-2")
+        self.assertEqual(sm.blocks_link_results[0]["action"], "no-op")
+        self.assertEqual(list(sm.blocks_links)[-1],
+                         "s.atlassian.net/OLD-0->ENG-2",
+                         "update must move the key to the tail")
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=self._issue([])), \
+             mock.patch.object(ha, "jira_post", return_value={}):
+            sm.create_blocks_link("c2", "NEW-1", "ENG-2")
+        self.assertIn("s.atlassian.net/OLD-0->ENG-2", sm.blocks_links,
+                      "re-confirmed pair must survive the cap")
+        self.assertNotIn("s.atlassian.net/OLD-1->X", sm.blocks_links,
                          "the next-oldest unconfirmed entry is evicted")
 
 

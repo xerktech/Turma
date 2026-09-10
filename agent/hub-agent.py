@@ -11942,17 +11942,23 @@ def jira_issue_types(project):
     return out
 
 
-def create_jira_issue(project, issue_type, summary, description, labels):
+def create_jira_issue(project, issue_type, summary, description, labels,
+                      parent=None):
     """Create one Jira issue and return {key, url}. `issue_type` is an issue-type
     id (from jira_issue_types); labels are the array Jira stores verbatim. The
     issue is assigned to the configured user (best-effort) so it lands on their
-    board immediately."""
+    board immediately. `parent`, when given, is an issue key set as the new
+    issue's parent — for createEpicChild (XERK-723) that is the Epic, which is
+    how a team-managed project nests a child under its epic (the unified
+    `parent` field also nests under an epic in company-managed projects)."""
     site_key = normalize_jira_site(JIRA_SITE)
     fields = {
         "project": {"key": project},
         "summary": summary,
         "issuetype": {"id": str(issue_type)},
     }
+    if parent:
+        fields["parent"] = {"key": parent}
     if description:
         fields["description"] = _text_to_adf(description)
     if labels:
@@ -13374,6 +13380,17 @@ DUPLICATE_LINK_LEDGER_MAX = 500
 # link types, else createIssueLink 400s and the tracker's own refusal is
 # staged on the result.
 JIRA_DUPLICATE_LINK_TYPE = "Duplicate"
+# Durable record of blocker->blocked pairs THIS host has linked with a Jira
+# "Blocks" link (XERK-723): {siteKey/blocker->blocked: blockedKey}. Same role as
+# the duplicate ledger — tells "linked, since reversed by a human" (sticky
+# no-op) apart from "never linked" (link it). A blocker can block MANY issues,
+# so the key encodes the ordered pair, not just the source issue.
+BLOCKS_LINK_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-blocks-links.json")
+BLOCKS_LINK_LEDGER_MAX = 500
+# The Jira issue-link type name a dependency link uses (XERK-634's collector
+# reads the same canonical name). Must exist in the org's link types, else
+# createIssueLink 400s and the tracker's own refusal is staged on the result.
+JIRA_BLOCKS_LINK_TYPE = "Blocks"
 # Fixed enums the model must pick from; anything else is a failed attempt.
 TRIAGE_TYPES = ("bug", "feature", "task", "chore", "improvement",
                 "documentation", "other")
@@ -13483,6 +13500,40 @@ def _candidates_fingerprint(cands):
 
 def _triage_key(site_key, issue_key):
     return f"{site_key or ''}/{issue_key}"
+
+
+def _blocks_link_key(site_key, blocker, blocked):
+    """The blocks-ledger key for one ordered dependency pair (XERK-723). Unlike
+    the duplicate ledger (one twin per issue) a blocker can block many issues,
+    so the key encodes both ends."""
+    return f"{site_key or ''}/{blocker}->{blocked}"
+
+
+def _issue_already_blocks(issue, blocked_key):
+    """True when the fetched issue ALREADY has a "Blocks" link naming
+    `blocked_key` on its OUTWARD (= what it blocks) side (XERK-723 idempotency).
+
+    Scans the raw `issuelinks` UNCAPPED — deliberately NOT via _shape_issue_links,
+    whose JIRA_LINKS_MAX (30) cap could hide the pair on a blocker that already
+    blocks many issues and provoke a duplicate POST. The match is otherwise
+    identical to the shaper (canonical link-type name; the viewed issue's
+    outwardIssue is what it blocks). Total: a malformed field reads as
+    "not linked", never raises."""
+    fields = issue.get("fields") if isinstance(issue, dict) else None
+    links = fields.get("issuelinks") if isinstance(fields, dict) else None
+    if not isinstance(links, list):
+        return False
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        ltype = link.get("type")
+        if not isinstance(ltype, dict) or \
+                (ltype.get("name") or "") != JIRA_BLOCKS_LINK_TYPE:
+            continue
+        out = link.get("outwardIssue")
+        if isinstance(out, dict) and out.get("key") == blocked_key:
+            return True
+    return False
 
 
 # The normalized priority band a triage assessment carries (XERK-481); the
@@ -14458,6 +14509,18 @@ class SessionManager:
         # linked" (link it). Same staging lifecycle as ticket_priority_results.
         self.duplicate_links = self._load_duplicate_links()
         self.ticket_link_results = []
+        # Durable record of blocker->blocked pairs THIS host has linked with a
+        # Jira "Blocks" link (XERK-723): {siteKey/blocker->blocked: blockedKey}.
+        # Same sticky-reversal role as duplicate_links; the epic builder
+        # (XERK-721) wires the child DAG through createBlocksLink.
+        self.blocks_links = self._load_blocks_links()
+        self.blocks_link_results = []
+        # Staged {type:"createEpicChild"} outcomes (XERK-723) — each
+        # {cmdId, key, url, epicKey, error, warning}, riding the next beat so the
+        # builder that submitted it gets the new child's key back. Same
+        # staged-in-the-same-handle_commands-call lifecycle as
+        # create_ticket_results.
+        self.epic_child_results = []
         # Staged {type:"mergePr"} outcomes (XERK-550: PR auto-merge) — each
         # {cmdId, url, ok, error}. Its writer is an OFF-BEAT worker thread
         # (_merge_pr_async runs `gh pr merge`, a blocking network call that must
@@ -14906,6 +14969,39 @@ class SessionManager:
         self.duplicate_links[lkey] = twin
         self._save_duplicate_links()
 
+    def _load_blocks_links(self):
+        try:
+            with open(BLOCKS_LINK_LEDGER_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_blocks_links(self):
+        """Persist the host's own blocks links (XERK-723). Updated keys are
+        re-inserted (moved to the tail), so at the cap the oldest entries are
+        the ones dropped — losing a record can only make the linker re-attempt
+        (where the live read no-ops), never relink over a human's reversal."""
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            while len(self.blocks_links) > BLOCKS_LINK_LEDGER_MAX:
+                self.blocks_links.pop(next(iter(self.blocks_links)))
+            tmp = BLOCKS_LINK_LEDGER_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.blocks_links, f, indent=2)
+            os.replace(tmp, BLOCKS_LINK_LEDGER_PATH)
+        except OSError as e:
+            log(f"blocks link ledger save failed: {e}")
+
+    def _record_blocks_link(self, lkey, blocked):
+        """Remember that this host confirmed the pair linked, and persist the
+        ledger. Re-inserting moves the key to the tail (as _record_duplicate_link)
+        so the evict-oldest save never drops a re-confirmed pair before a newer
+        unconfirmed one."""
+        self.blocks_links.pop(lkey, None)
+        self.blocks_links[lkey] = blocked
+        self._save_blocks_links()
+
     def _ticket_triage_due(self, tickets, now, site_key):
         """The tickets wanting an assessment right now: stale (never assessed,
         or assessed from different ticket text), attempts left, and past the
@@ -15273,6 +15369,108 @@ class SessionManager:
             return
         self._record_duplicate_link(lkey, twin)
         log(f"linked {k} as duplicate of {twin} (site {result['siteKey']})")
+        stage(ok=True, action="linked")
+
+    def create_blocks_link(self, cmd_id, blocker_key, blocked_key):
+        """Create a Jira "Blocks" issue link: `blocker_key` blocks `blocked_key`
+        (XERK-723, `createBlocksLink`). The epic builder (XERK-721) uses it to
+        wire the dependency DAG between the children createEpicChild made.
+
+        Direction is VERIFIED against the real XERK-634 -> XERK-635 link: the
+        POST sends inwardIssue = the blocker, outwardIssue = the blocked issue,
+        so a re-read via _shape_issue then lists the blocker in the blocked
+        issue's `blockedBy` and the blocked issue in the blocker's `blocks` (the
+        shape XERK-634's collector and the epic orchestration consume).
+
+        Idempotent, layered exactly like create_duplicate_link:
+          1. a live read of the blocker's issuelinks (scanned UNCAPPED by
+             _issue_already_blocks) is the source of truth — a Blocks link to
+             `blocked_key` already present is `ok, action:"no-op"`, no POST;
+          2. the durable ledger makes a HUMAN REMOVAL sticky — a pair this host
+             linked that Jira no longer shows linked is `ok, action:"skipped"`,
+             never re-linked;
+          3. success -> ledger entry + `ok, action:"linked"`.
+        Every failure path (bad key, unconfigured, HTTP error) stages `ok:false`
+        with a bounded error, so the hub's suppression map can retry (errors) or
+        drop (oks). Staged on blocks_link_results, same held-across-a-failed-POST
+        lifecycle as ticket_link_results. Never raises onto the beat. Jira-only:
+        the issueLink API is Jira's and the hub only sweeps Jira orgs, so an
+        Azure host stages a refusal, no HTTP.
+        """
+        blocker = str(blocker_key or "").strip()
+        blocked = str(blocked_key or "").strip()
+        result = {
+            "cmdId": cmd_id,
+            # The staged keys are the truncation the hub keys the result on.
+            "blockerKey": blocker[:50],
+            "blockedKey": blocked[:50],
+            "siteKey": None,
+            "ok": False,
+            "error": None,
+            "action": None,  # "linked" | "no-op" | "skipped"
+        }
+
+        def stage(ok=False, action=None, err=None):
+            result["ok"] = ok
+            if action is not None:
+                result["action"] = action
+            if err is not None:
+                result["error"] = err
+            self.blocks_link_results.append(dict(result))
+
+        if not valid_issue_key(blocker):
+            stage(err="not a valid blocker issue key")
+            return
+        if not valid_issue_key(blocked):
+            stage(err="not a valid blocked issue key")
+            return
+        if blocker == blocked:
+            stage(err="an issue cannot block itself")
+            return
+        if not board_configured():
+            stage(err="no board credentials on this host")
+            return
+        if azure_configured():
+            stage(err="issue linking is not supported for Azure DevOps yet")
+            return
+        result["siteKey"] = board_site_key()
+        lkey = _blocks_link_key(result["siteKey"], blocker, blocked)
+
+        # Live links first: if the blocker already blocks the blocked issue in
+        # Jira (by this host or anyone), that is the terminal state — record it
+        # and stop, no relink. The read is the same issue GET the board's
+        # _shape_issue uses (fields=issuelinks), so "already linked" agrees with
+        # what the epic orchestration sees; _issue_already_blocks scans it
+        # UNCAPPED so a blocker with many links can't hide the pair.
+        try:
+            issue = jira_get(
+                f"/rest/api/3/issue/{urllib.parse.quote(blocker)}",
+                {"fields": "issuelinks"})
+        except Exception as e:
+            log(f"blocks link check {blocker}: {e}")
+            stage(err=str(e)[:200])
+            return
+        if _issue_already_blocks(issue, blocked):
+            self._record_blocks_link(lkey, blocked)
+            stage(ok=True, action="no-op")
+            return
+        if self.blocks_links.get(lkey) == blocked:
+            # This host linked the pair and it is gone from Jira: a human
+            # removed it. Do not relink — the reversal is sticky.
+            stage(ok=True, action="skipped")
+            return
+        try:
+            jira_post("/rest/api/3/issueLink", {
+                "inwardIssue": {"key": blocker},
+                "outwardIssue": {"key": blocked},
+                "type": {"name": JIRA_BLOCKS_LINK_TYPE},
+            })
+        except Exception as e:
+            log(f"issueLink {blocker} blocks {blocked}: {e}")
+            stage(err=str(e)[:200])
+            return
+        self._record_blocks_link(lkey, blocked)
+        log(f"linked {blocker} blocks {blocked} (site {result['siteKey']})")
         stage(ok=True, action="linked")
 
     # --- usage attribution ledger -----------------------------------------
@@ -21978,6 +22176,70 @@ class SessionManager:
             log(f"ticket creation failed in {project}: {e}")
             fail(str(e)[:300])
 
+    def _stage_create_epic_child(self, cmd):
+        """Handle a {type:"createEpicChild"} command (XERK-723): create a child
+        issue whose PARENT is the epic, staging the new key by cmdId so the
+        builder that submitted it (XERK-721) gets it back. Team-managed projects
+        set the Epic directly as `parent`; the create otherwise follows
+        _stage_create_ticket's path, self-assigning to the tracker user so the
+        child lands on the board. Result staged in the SAME handle_commands call
+        (an agent predating it still ACKs). Jira-only (ADO out of scope), like
+        createBlocksLink: an Azure host stages a refusal, no HTTP. Validated
+        defensively — this is the only thing between a request and a write."""
+        cid = cmd.get("cmdId")
+        # str()-wrapped like the link handlers (not the bare `.strip()` that
+        # _stage_create_ticket uses): a non-string field would otherwise raise
+        # at .strip(), which handle_commands swallows and acks — staging NO
+        # result, so the builder gets nothing back. Coercing lets a bad value
+        # fall through to a bounded fail() instead (a list epicKey stringifies,
+        # then fails valid_issue_key).
+        epic_key = str(cmd.get("epicKey") or "").strip()
+        summary = str(cmd.get("summary") or "").strip()[:CREATE_TITLE_MAX_CHARS]
+        project = str(cmd.get("project") or "").strip()
+        issue_type = str(cmd.get("issueType") or "").strip()
+        description = str(cmd.get("description") or "")[:CREATE_DESC_MAX_CHARS]
+        labels = [str(l).strip() for l in (cmd.get("labels") or [])
+                  if str(l).strip()][:CREATE_LABELS_MAX]
+
+        def fail(msg):
+            self.epic_child_results.append(
+                {"cmdId": cid, "key": None, "url": None,
+                 "epicKey": epic_key[:50], "error": msg, "warning": None})
+
+        # A child that lands UNASSIGNED is a success the operator must still be
+        # told about — the board filters on the tracker user, so it is created
+        # and then invisible there (same reasoning as _stage_create_ticket).
+        def unassigned_warning(created):
+            why = str(created.get("assignError") or "").strip()
+            return ("created, but it couldn't be assigned to you, so it won't "
+                    "show on your board" + (f" — {why}" if why else ""))
+
+        if not board_configured():
+            return fail("no board credentials on this host")
+        if azure_configured():
+            return fail("epic children are not supported for Azure DevOps yet")
+        if not valid_issue_key(epic_key):
+            return fail("not a valid epic key")
+        if not summary:
+            return fail("a title is required")
+        if not project:
+            return fail("a project is required")
+        if not issue_type:
+            return fail("an issue type is required")
+        try:
+            created = create_jira_issue(project, issue_type, summary,
+                                        description, labels, parent=epic_key)
+            self.epic_child_results.append(
+                {"cmdId": cid, "key": created.get("key"),
+                 "url": created.get("url"), "epicKey": epic_key[:50],
+                 "error": None,
+                 "warning": None if created.get("assigned")
+                            else unassigned_warning(created)})
+            log(f"created epic child {created.get('key')} under {epic_key}")
+        except Exception as e:
+            log(f"epic child creation failed under {epic_key}: {e}")
+            fail(str(e)[:300])
+
     # --- durable archive sync ---------------------------------------------
     # Ship every INACTIVE session's transcript to the hub so history is durable
     # (survives this host being wiped/offline) and searchable there. The agent
@@ -25951,6 +26213,11 @@ class SessionManager:
                 elif ctype == "createDuplicateLink":
                     self.create_duplicate_link(
                         cid, cmd.get("issueKey"), cmd.get("twinKey"))
+                elif ctype == "createEpicChild":
+                    self._stage_create_epic_child(cmd)
+                elif ctype == "createBlocksLink":
+                    self.create_blocks_link(
+                        cid, cmd.get("blockerKey"), cmd.get("blockedKey"))
                 elif ctype == "mergePr":
                     self._merge_pr_async(
                         cid, cmd.get("sessionId"), cmd.get("url"))
@@ -27090,6 +27357,10 @@ class SessionManager:
             payload["ticketPriorityResults"] = list(self.ticket_priority_results)
         if self.ticket_link_results:
             payload["ticketLinkResults"] = list(self.ticket_link_results)
+        if self.epic_child_results:
+            payload["epicChildResults"] = list(self.epic_child_results)
+        if self.blocks_link_results:
+            payload["blocksLinkResults"] = list(self.blocks_link_results)
         # Snapshotted under the lock the merge worker appends under (XERK-550,
         # same shape as spawn_failures below): _clear_delivered_staged removes
         # exactly these delivered entries by identity, so a result the worker
@@ -27164,6 +27435,8 @@ class SessionManager:
             self.create_ticket_results,
             self.ticket_priority_results,
             self.ticket_link_results,
+            self.epic_child_results,
+            self.blocks_link_results,
         ]
         self._clear_pending_prs()
         for coll in collections:
