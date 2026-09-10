@@ -178,7 +178,7 @@ hub.registerDevice("capture-device", "android", ["dismiss"]);
 const {
   server, agents, queueCommand, findSession, orgPeers, boundOrgOf, orgDrifted,
   orgDriftWarned, warnOrgDrift, siteKeyOf, normalizeJira, normalizeClones,
-  normalizeTriage,
+  normalizeTriage, normalizeTrajectory,
   CLONE_PROGRESS_MAX,
   wsAccept, wsEncode, wsParser, WS_FRAME_MAX, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
@@ -3414,6 +3414,104 @@ test("http: GET /api/archive/<id>/trajectory dispatches by runtime, degrades whi
   assert.equal(dsh.body.partial, false);
   assert.equal(dsh.body.title, "dsh via archive route");
   assert.equal(dsh.body.turns[0].calls[0].name, "bash");
+});
+
+test("http: GET /api/archive/<id>/trajectory serves a RUNNING claude session live full-fidelity (XERK-716)", async () => {
+  const meta = { remoteKey: "github.com/xerk/turma", repo: "turma", slug: "-w-cd" };
+  const ingest = (id, entries, size) => request("POST", `/api/agents/live1/archive/${id}`,
+    { body: { startOffset: 0, endOffset: size, size, meta, entries }, headers: agentHeaders });
+
+  // A RUNNING claude session: rendered layer synced hub-side (degraded is
+  // available), but NO raw push (the raw layer defers while running), so
+  // claudeTrajectory() returns null and the route falls to the live path.
+  await ingest("trajlive", [
+    { uuid: "r1", role: "user", ts: "2026-07-11T03:00:00Z", text: "do it",
+      blocks: [{ t: "text", text: "do it" }] }], 60);
+
+  const claudeRaw = [
+    '{"type":"user","timestamp":"2026-07-11T03:00:00Z","message":{"role":"user","content":"do it"}}',
+    '{"type":"assistant","timestamp":"2026-07-11T03:00:05Z","message":{"role":"assistant","model":"claude-live",' +
+      '"content":[{"type":"text","text":"done"}],' +
+      '"usage":{"input_tokens":42,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}',
+  ].join("\n") + "\n";
+
+  // --- first request: no tail cached yet -> DEGRADED + pending, and a
+  //     trajectoryTail command queued to the host ---
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: "live1", trajectory: { available: true },
+    sessions: [{ id: "sLive", status: "running", transcriptId: "trajlive",
+      agentType: "claude", worktreePath: "/w", session: {} }],
+  } });
+  const first = await request("GET", "/api/archive/trajlive/trajectory", { headers: userHeaders });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.partial, true, "no tail cached yet -> degraded rendered layer");
+  assert.equal(first.body.pending, true, "flags that a live tail was requested");
+  assert.ok((agents.live1.commands || []).some((c) => c.type === "trajectoryTail"
+    && c.sessionId === "sLive"), "queued a trajectoryTail fetch to the host");
+  const queuedAfterFirst = (agents.live1.commands || [])
+    .filter((c) => c.type === "trajectoryTail" && c.sessionId === "sLive").length;
+
+  // --- a second poll WITHIN the dedup window must NOT re-queue (liveTrajFetches) ---
+  const second = await request("GET", "/api/archive/trajlive/trajectory", { headers: userHeaders });
+  assert.equal(second.body.partial, true, "still degraded — tail not delivered yet");
+  assert.ok(!second.body.pending, "a re-poll within the dedup window did not request again");
+  assert.equal((agents.live1.commands || [])
+    .filter((c) => c.type === "trajectoryTail" && c.sessionId === "sLive").length,
+    queuedAfterFirst, "no second trajectoryTail command was queued");
+
+  // --- the agent delivers the raw tail on a later beat -> FULL, live ---
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: "live1", trajectory: { available: true },
+    sessions: [{ id: "sLive", status: "running", transcriptId: "trajlive",
+      agentType: "claude", worktreePath: "/w", session: {} }],
+    trajectoryTailResults: [{ sessionId: "sLive", text: claudeRaw, truncated: false }],
+  } });
+  const full = await request("GET", "/api/archive/trajlive/trajectory", { headers: userHeaders });
+  assert.equal(full.status, 200);
+  assert.equal(full.body.partial, false, "the cached raw tail reduces to a FULL trajectory");
+  assert.equal(full.body.live, true);
+  assert.equal(full.body.runtime, "claude");
+  assert.equal(full.body.model, "claude-live", "real model from the raw tail");
+  assert.equal(full.body.totals.tokens.input, 42, "real tokens from the raw tail");
+  assert.equal(full.body.totals.tokens.output, 7);
+  assert.equal(full.body.turns[0].user.text, "do it");
+});
+
+test("http: a live full trajectory falls back to DEGRADED when the host is OFFLINE (XERK-716)", async () => {
+  const meta = { remoteKey: "github.com/xerk/turma", repo: "turma", slug: "-w-ef" };
+  await request("POST", "/api/agents/off1/archive/trajoff", { headers: agentHeaders,
+    body: { startOffset: 0, endOffset: 60, size: 60, meta, entries: [
+      { uuid: "o1", role: "user", ts: "2026-07-11T04:00:00Z", text: "hello",
+        blocks: [{ t: "text", text: "hello" }] }] } });
+  // Register the running session + a cached tail, then age the host OFFLINE.
+  const claudeRaw =
+    '{"type":"assistant","timestamp":"2026-07-11T04:00:05Z","message":{"role":"assistant",' +
+    '"model":"claude-x","content":[{"type":"text","text":"hi"}],' +
+    '"usage":{"input_tokens":5,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n';
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: "off1", trajectory: { available: true },
+    sessions: [{ id: "sOff", status: "running", transcriptId: "trajoff",
+      agentType: "claude", worktreePath: "/w", session: {} }],
+    trajectoryTailResults: [{ sessionId: "sOff", text: claudeRaw, truncated: false }],
+  } });
+  agents.off1.lastSeen = 1; // long past OFFLINE_AFTER_MS
+
+  const r = await request("GET", "/api/archive/trajoff/trajectory", { headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.partial, true, "an offline host's stale running record is NOT trusted for a live fetch");
+  assert.ok(!r.body.live, "not the live full path");
+  assert.equal(r.body.totals.tokens, null, "degraded rendered layer");
+});
+
+test("normalizeTrajectory coerces the capability flag strictly boolean (XERK-716)", () => {
+  const norm = (trajectory) => { const p = { device: "h", trajectory }; normalizeTrajectory(p); return p.trajectory; };
+  assert.deepEqual(norm({ available: true }), { available: true });
+  assert.deepEqual(norm({ available: "yes" }), { available: false }, "a truthy non-true reads as false");
+  assert.deepEqual(norm({ available: false }), { available: false });
+  const absent = { device: "h" }; normalizeTrajectory(absent);  // key never sent
+  assert.equal("trajectory" in absent, false, "absent stays absent (pre-XERK-716 agent)");
+  assert.equal(norm("bogus"), null, "a non-object block coerces to null, never a rebuilt {available:true}");
+  assert.equal(norm([1]), null, "an array is not a capability block");
 });
 
 test("http: a full chunk of INCOMPRESSIBLE bytes still fits the wire cap", async () => {

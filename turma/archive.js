@@ -2030,8 +2030,22 @@ function claudeTrajectory(transcriptId) {
   if (!full) return null;
   const read = trajReadTail(full, TRAJ_READ_MAX);
   if (!read) return null;
-  const { text } = read;
-  let truncated = read.truncated;
+  return claudeTrajectoryFromText(transcriptId, read.text, read.truncated);
+}
+
+// The line-fold CORE of claudeTrajectory(), over raw <sid>.jsonl text already in
+// hand rather than a file on disk. XERK-716 feeds it the BOUNDED raw tail an
+// agent returns on demand for a RUNNING claude/qwen session — whose raw layer is
+// deferred to session end (agent-archive.md, `defer_raw`), so claudeTrajFile()
+// finds nothing hub-side yet — so a live session gets the SAME full-fidelity
+// trajectory (real tokens/model/timings) an ended one does, reduced by the SAME
+// js fold with no second (python) reducer to keep in parity. `text` is already
+// caller-bounded (the agent caps its tail at TRAJECTORY_TAIL_MAX_BYTES);
+// `truncated` says the source file was larger than what `text` carries. Returns
+// the same shape claudeTrajectory() does; the route stamps `partial:false`.
+function claudeTrajectoryFromText(transcriptId, text, truncated) {
+  text = String(text == null ? "" : text);
+  truncated = !!truncated;
 
   const snip = (s) => {
     s = String(s == null ? "" : s);
@@ -2361,7 +2375,7 @@ function renderedTrajectory(transcriptId, runtime) {
 module.exports = {
   ARCHIVE_DIR, ARCHIVE_DB, ARCHIVE_TRANSCRIPT_MAX, ARCHIVE_TOTAL_MAX,
   dshTrajectory, dshEventsFile,
-  claudeTrajectory, claudeTrajFile, renderedTrajectory,
+  claudeTrajectory, claudeTrajectoryFromText, claudeTrajFile, renderedTrajectory,
   ARCHIVE_RAW_TRANSCRIPT_MAX, ARCHIVE_RAW_CURSOR_MAX, ARCHIVE_RAW_CURSOR_LOOKUP_MAX,
   ARCHIVE_MANIFEST_CURSOR_MAX,
   RAW_DIR_SUFFIX,
