@@ -206,3 +206,19 @@ test("XERK-722: layerWaves matches buildEpicWaves directly on rows", () => {
   const rows = edgesToRows(SHARED_EDGES);
   assert.deepEqual(EP.layerWaves(rows), buildEpicWaves(rows));
 });
+
+// Self-blocks and external refs are exactly what the `&& b !== k` / `inSet`
+// filters in layerWaves exist to drop. Pin them against buildEpicWaves too, so
+// dropping the self-block handling in only one of the two mirrors is caught (a
+// self-blocking node must lay out normally, NOT stall as a cycle).
+test("XERK-722: waves equals buildEpicWaves for self-blocks and external refs", () => {
+  const edges = [
+    { id: "S1", blockedBy: ["S1"] },              // self-block: dropped, S1 is ready
+    { id: "S2", blockedBy: ["S1", "OUTSIDE-9"] }, // external ref: dropped, S2 waits on S1
+  ];
+  const a = EP.waves(edgesToPlan(edges));
+  const b = buildEpicWaves(edgesToRows(edges));
+  assert.deepEqual(a, b);
+  assert.deepEqual(a.waves, [["S1"], ["S2"]]);
+  assert.deepEqual(a.cycle, []);
+});
