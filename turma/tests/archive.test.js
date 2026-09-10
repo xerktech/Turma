@@ -1168,3 +1168,175 @@ test("rawCursorsForIds reads back the hub's own stored raw files", () => {
   assert.equal(cur["inv-b"]["inv-b/tool-results/x.txt"], 5);
   assert.ok(!("inv-a" in (cur || {})), "no raw bytes -> no entry");
 });
+
+// ---- claudeTrajectory: the Claude+Qwen Trajectory reducer (XERK-714) ----
+// One parser folds both the Claude raw <sid>.jsonl and the Qwen projected
+// <sid>.jsonl into the Trajectory JSON contract (docs/trajectory-contract.md).
+// Driven against the committed real fixtures, not a mock.
+
+const TRAJ_FIXTURES = path.join(__dirname, "fixtures", "trajectory");
+
+// Seed a row (the raw dir hangs off it) and lay the raw <tid>.jsonl the parser
+// resolves via listRawFiles/rawFileFor. `body` is the raw bytes to store.
+function seedTraj(tid, body) {
+  archive.ingestChunk("nas", tid, { ...RAW_META }, 0, 10, [ent("s1", "user", "seed")]);
+  const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
+  archive.ingestRaw("nas", tid, `${tid}.jsonl`, 0, buf);
+}
+function seedTrajFixture(tid, name) {
+  seedTraj(tid, fs.readFileSync(path.join(TRAJ_FIXTURES, name)));
+  return archive.claudeTrajectory(tid);
+}
+
+test("claudeTrajectory: null when the transcript / raw file is absent", () => {
+  assert.equal(archive.claudeTrajectory("no-such-transcript"), null);
+});
+
+test("claudeTrajectory: folds the real Claude fixture into the contract", () => {
+  const t = seedTrajFixture("traj-claude", "claude.jsonl");
+  assert.equal(t.runtime, "claude");
+  assert.equal(t.transcriptId, "traj-claude");
+  assert.equal(t.model, "claude-opus-4-8");
+  // Two real user turns (both `<task-notification>` strings open a turn);
+  // tool_result-only user lines never open one.
+  assert.equal(t.totals.turns, 2);
+  assert.equal(t.turns.length, 2);
+  assert.equal(t.totals.toolCalls, 4);
+  assert.equal(t.totals.errors, 1);          // the one is_error tool_result
+  // Claude repeats message.usage across the split lines of one message; the
+  // parser dedupes on message.id, so tokens are counted once, not per line.
+  assert.deepEqual(t.totals.tokens,
+    { input: 48, output: 15131, cacheRead: 9648263, cacheWrite: 26613 });
+  assert.equal(t.totals.tokens.input, t.turns[0].tokens.input + t.turns[1].tokens.input);
+  assert.equal(t.totals.tokens.output, t.turns[0].tokens.output + t.turns[1].tokens.output);
+
+  const t1 = t.turns[0];
+  assert.equal(t1.turn, 1);
+  assert.ok(t1.user && t1.user.text.startsWith("<task-notification>"));
+  assert.ok(t1.output.some((o) => o.kind === "thinking"));
+  assert.ok(t1.output.some((o) => o.kind === "text"));
+  assert.equal(t1.reason, "end_turn");
+  assert.equal(t1.calls.length, 4);
+  assert.equal(t1.startedAt, Date.parse("2026-08-25T21:08:31.412Z"));
+  assert.ok(t1.durationMs > 0 && t1.durationMs === t1.endedAt - t1.startedAt);
+
+  // The error Edit correlates by tool_use_id: !ok, error, a duration from the
+  // two timestamps, and a stringified result present.
+  const errCall = t1.calls.find((c) => c.callId === "toolu_014fHV5pvJXMyPrxTxFCW8k2");
+  assert.equal(errCall.ok, false);
+  assert.equal(errCall.error, true);
+  assert.equal(errCall.name, "Edit");
+  assert.equal(typeof errCall.durationMs, "number");
+  assert.ok(errCall.result.includes("tool_use_error"));
+  // A successful call is ok:true / error:false with a result.
+  const okCall = t1.calls.find((c) => c.callId === "toolu_01GB7VeiABq9ttM4DTHGbjQF");
+  assert.equal(okCall.ok, true);
+  assert.equal(okCall.error, false);
+  assert.ok(okCall.result.length > 0);
+
+  assert.equal(t.truncated, false);
+  assert.equal(t.turnsDropped, 0);
+  assert.equal(t.callsDropped, 0);
+});
+
+test("claudeTrajectory: encrypted Claude thinking is emitted empty, signature never leaks", () => {
+  const t = seedTrajFixture("traj-claude-sig", "claude.jsonl");
+  const thinking = t.turns.flatMap((tn) => tn.output).filter((o) => o.kind === "thinking");
+  assert.ok(thinking.length >= 1, "has thinking blocks");
+  assert.ok(thinking.every((o) => o.text === ""), "encrypted -> empty text");
+  // The `signature` field is the encrypted blob — it must never appear anywhere.
+  assert.ok(!JSON.stringify(t).includes("signature"));
+  assert.ok(!JSON.stringify(t).includes("REDACTED"));  // the scrubbed signature value
+});
+
+test("claudeTrajectory: folds the real Qwen projected fixture, same shape, no branch", () => {
+  const t = seedTrajFixture("traj-qwen", "qwen.jsonl");
+  assert.equal(t.runtime, "qwen");
+  assert.equal(t.model, "qwen3.8-27b-dflash");
+  assert.equal(t.totals.turns, 3);           // three real user turns
+  assert.equal(t.totals.toolCalls, 6);
+  assert.equal(t.totals.errors, 4);          // four error tool results
+  // Gemini-shaped usage maps via promptTokenCount/candidatesTokenCount/
+  // cachedContentTokenCount; no distinct cacheWrite.
+  assert.equal(t.totals.tokens.input, 855483);
+  assert.equal(t.totals.tokens.output, 5138);
+  assert.equal(t.totals.tokens.cacheWrite, 0);
+
+  // Qwen keeps thinking PLAINTEXT (unlike Claude), so a thinking block carries text.
+  const thinking = t.turns.flatMap((tn) => tn.output).filter((o) => o.kind === "thinking");
+  assert.ok(thinking.some((o) => o.text.trim().length > 0), "qwen thinking is plaintext");
+
+  // functionCall <-> functionResponse pairs correlate by id; the last call in
+  // the run has no result -> ok stays null (not-yet-seen).
+  const closed = t.turns.flatMap((tn) => tn.calls).find((c) => c.error === true);
+  assert.ok(closed && closed.ok === false && closed.durationMs >= 0);
+  const open = t.turns.flatMap((tn) => tn.calls).find((c) => c.ok === null);
+  assert.ok(open && open.result === null && open.durationMs === null,
+    "a call with no result stays ok:null");
+
+  assert.equal(t.truncated, false);
+});
+
+test("claudeTrajectory: bounds turns, sets truncated + turnsDropped over the cap", () => {
+  // One user line per turn, one past TRAJ_TURNS_MAX (1000).
+  const n = 1001;
+  const lines = [];
+  for (let i = 0; i < n; i++) {
+    lines.push(JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:00.000Z",
+      message: { role: "user", content: `turn ${i}` } }));
+  }
+  seedTraj("traj-turncap", lines.join("\n") + "\n");
+  const r = archive.claudeTrajectory("traj-turncap");
+  assert.equal(r.totals.turns, n);           // all counted
+  assert.equal(r.turns.length, 1000);        // only the newest kept
+  assert.equal(r.turnsDropped, 1);
+  assert.equal(r.truncated, true);
+});
+
+test("claudeTrajectory: bounds tool calls, sets truncated + callsDropped over the cap", () => {
+  // One user turn, then TRAJ_CALLS_MAX + 1 tool_use lines.
+  const n = 4001;
+  const lines = [JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:00.000Z",
+    message: { role: "user", content: "go" } })];
+  for (let i = 0; i < n; i++) {
+    lines.push(JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:01.000Z",
+      message: { role: "assistant", model: "m", content: [
+        { type: "tool_use", id: `c${i}`, name: "Bash", input: { i } }] } }));
+  }
+  seedTraj("traj-callcap", lines.join("\n") + "\n");
+  const r = archive.claudeTrajectory("traj-callcap");
+  assert.equal(r.totals.toolCalls, n);       // all counted in totals
+  assert.equal(r.callsDropped, 1);           // one shed from the kept calls[]
+  assert.equal(r.truncated, true);
+  const kept = r.turns.reduce((a, tn) => a + tn.calls.length, 0);
+  assert.equal(kept, 4000);
+});
+
+test("claudeTrajectory: every text/args/result is snippeted, no un-snippeted content leaks", () => {
+  const long = "x".repeat(5000);
+  const lines = [
+    JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:00.000Z",
+      message: { role: "user", content: long } }),
+    JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:01.000Z",
+      message: { role: "assistant", model: "m", content: [
+        { type: "text", text: long },
+        { type: "thinking", thinking: long, signature: "SECRETSIG" },
+        { type: "tool_use", id: "c1", name: "Bash", input: { cmd: long } }] } }),
+    JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:02.000Z",
+      message: { role: "user", content: [
+        { type: "tool_result", tool_use_id: "c1", content: long, is_error: false }] } }),
+  ];
+  seedTraj("traj-snip", lines.join("\n") + "\n");
+  const r = archive.claudeTrajectory("traj-snip");
+  const cap = 401;  // TRAJ_SNIPPET (400) + the trailing "…"
+  assert.ok(r.turns[0].user.text.length <= cap && r.turns[0].user.text.endsWith("…"));
+  for (const o of r.turns[0].output) {
+    assert.ok(o.text.length <= cap, `output ${o.kind} not snippeted`);
+  }
+  const call = r.turns[0].calls[0];
+  assert.ok(call.args.length <= cap && call.args.endsWith("…"));
+  assert.ok(call.result.length <= cap && call.result.endsWith("…"));
+  // The full 5000-char blobs must not survive anywhere in the structured output.
+  assert.ok(!JSON.stringify(r).includes(long));
+  assert.ok(!JSON.stringify(r).includes("SECRETSIG"));
+});

@@ -1936,9 +1936,267 @@ function dshTrajectory(transcriptId) {
   };
 }
 
+// The Trajectory reducer for Claude AND Qwen (XERK-714, epic XERK-712). One
+// parser serves both runtimes because Qwen's on-disk transcript is PROJECTED to
+// a Claude-shaped envelope (agent/qwen_transcript.py::_project) — the two shapes
+// differ only in the message body, which this fold handles per-line with no
+// runtime branch. The contract (field names FINAL) is docs/trajectory-contract.md:
+// a superset of dshTrajectory() above that also carries the conversation. BOUNDED
+// on every axis for the same reason dsh is (attacker-influenced content on an HTTP
+// route): the read is tail-capped, every text/args/result is snippeted, and only
+// structured JSON is ever returned — never raw bytes.
+const TRAJ_READ_MAX = DSH_TRAJ_READ_MAX;      // bytes of the log we scan (tail)
+const TRAJ_TURNS_MAX = DSH_TRAJ_TURNS_MAX;    // turns kept (newest)
+const TRAJ_CALLS_MAX = DSH_TRAJ_CALLS_MAX;    // tool calls kept (across turns)
+const TRAJ_SNIPPET = DSH_TRAJ_SNIPPET;        // per text/args/result snippet (=400)
+// The native Qwen store dir inside the raw layer (mirrors hub-agent.py's
+// QWEN_STORE_DIRNAME) — the fallback when no projected <sid>.jsonl is present.
+const TRAJ_QWEN_STORE_DIRNAME = "qwen";
+
+function trajNum(x) {
+  return (typeof x === "number" && isFinite(x) && x >= 0) ? Math.floor(x) : 0;
+}
+
+// ISO-8601 timestamp string -> epoch ms, or null. Both the Claude raw and Qwen
+// projected shapes carry a per-line ISO `timestamp` (unlike dsh's numeric `time`).
+function trajTime(e) {
+  if (!e || typeof e.timestamp !== "string") return null;
+  const ms = Date.parse(e.timestamp);
+  return isFinite(ms) ? ms : null;
+}
+
+// Locate the per-session raw transcript to fold. A top-level `<sid>.jsonl` serves
+// BOTH the Claude raw transcript and the Qwen projected one (the projection the
+// ticket says to prefer); the dsh events file lives under `/dsh/` and is excluded
+// by the no-separator match. Falls back to the native Qwen `<tid>/qwen/chat.jsonl`
+// when only the un-projected store is present.
+function claudeTrajFile(transcriptId) {
+  const files = listRawFiles(transcriptId);
+  if (!files || !files.length) return null;
+  const topLevel = files.filter((f) => /^[^/]+\.jsonl$/.test(f.path));
+  if (topLevel.length) {
+    // Prefer the file named for this transcript when the store holds several.
+    const exact = topLevel.find((f) => f.path === `${transcriptId}.jsonl`);
+    return (exact || topLevel[0]).path;
+  }
+  const qwenRe = new RegExp(`(^|/)${TRAJ_QWEN_STORE_DIRNAME}/[^/]+\\.jsonl$`);
+  const hit = files.find((f) => qwenRe.test(f.path));
+  return hit ? hit.path : null;
+}
+
+// Read the TAIL of the raw file up to `cap` bytes; a leading partial line is
+// dropped (as in dshTrajectory) and `truncated` records that we did not see the
+// whole file. Returns null only when the file cannot be read at all.
+function trajReadTail(full, cap) {
+  let text = "", truncated = false;
+  try {
+    const fd = fs.openSync(full, "r");
+    try {
+      const size = fs.fstatSync(fd).size;
+      const take = Math.min(size, cap);
+      const start = size - take;
+      truncated = start > 0;
+      const buf = Buffer.allocUnsafe(take);
+      let off = 0;
+      while (off < take) {
+        const n = fs.readSync(fd, buf, off, take - off, start + off);
+        if (n <= 0) break;
+        off += n;
+      }
+      text = buf.toString("utf8", 0, off);
+    } finally { fs.closeSync(fd); }
+  } catch { return null; }
+  if (truncated) { const nl = text.indexOf("\n"); text = nl >= 0 ? text.slice(nl + 1) : ""; }
+  return { text, truncated };
+}
+
+function claudeTrajectory(transcriptId) {
+  const rel = claudeTrajFile(transcriptId);
+  if (!rel) return null;
+  const full = rawFileFor(transcriptId, rel);
+  if (!full) return null;
+  const read = trajReadTail(full, TRAJ_READ_MAX);
+  if (!read) return null;
+  const { text } = read;
+  let truncated = read.truncated;
+
+  const snip = (s) => {
+    s = String(s == null ? "" : s);
+    return s.length > TRAJ_SNIPPET ? s.slice(0, TRAJ_SNIPPET) + "…" : s;
+  };
+  const asStr = (v) => (typeof v === "string" ? v : JSON.stringify(v == null ? "" : v));
+
+  const turns = [];            // in first-seen order; 1-based `turn` set at open
+  let cur = null;              // the turn open entries attach to
+  const callsById = new Map(); // callId -> call obj, for call<->result correlation
+  const seenUsage = new Set(); // usage keys already counted (dedupe below)
+  let title = null, model = null, firstTime = null, lastTime = null;
+  let sawQwen = false;
+  let calls = 0, callsDropped = 0;
+  const totals = { turns: 0, toolCalls: 0, errors: 0,
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+
+  const openTurn = (time, userText) => {
+    cur = { turn: totals.turns + 1, startedAt: time, endedAt: time, durationMs: null,
+      user: userText == null ? null : { text: snip(userText) },
+      output: [], model: null,
+      calls: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      reason: null };
+    turns.push(cur); totals.turns++;
+    return cur;
+  };
+  const ensureTurn = (time) => cur || openTurn(time, null);
+  const touchEnd = (time) => { if (cur && time != null) cur.endedAt = time; };
+
+  const openCall = (id, name, input, time) => {
+    totals.toolCalls++;
+    if (calls >= TRAJ_CALLS_MAX) { callsDropped++; return; }
+    const call = { name: String(name || "?"),
+      callId: id != null ? String(id) : null,
+      at: time, ok: null, error: false, args: snip(asStr(input)),
+      result: null, durationMs: null };
+    ensureTurn(time).calls.push(call);
+    if (call.callId != null) callsById.set(call.callId, call);
+    calls++;
+  };
+  // Close a call by id with its result. `isError` is authoritative (a Qwen
+  // toolCallResult.status or a Claude tool_result.is_error); errors are counted
+  // whether or not the opening call is still in-window.
+  const closeCall = (id, resultText, isError, time) => {
+    if (isError) totals.errors++;
+    if (id == null) return;
+    const call = callsById.get(String(id));
+    if (!call || call.ok !== null) return;
+    call.ok = !isError; call.error = !!isError;
+    call.result = snip(resultText);
+    call.durationMs = (call.at != null && time != null) ? Math.max(0, time - call.at) : null;
+  };
+
+  const addUsage = (key, u) => {
+    if (key != null) { if (seenUsage.has(key)) return; seenUsage.add(key); }
+    const t = ensureTurn(null);
+    for (const [k, v] of Object.entries(u)) { t.tokens[k] += v; totals.tokens[k] += v; }
+  };
+
+  for (const line of text.split("\n")) {
+    const s = line.trim();
+    if (!s) continue;
+    let e; try { e = JSON.parse(s); } catch { continue; }
+    if (!e || typeof e !== "object") continue;
+    const type = e.type;
+    const m = (e.message && typeof e.message === "object") ? e.message : {};
+    const time = trajTime(e);
+    if (time != null) {
+      if (firstTime == null || time < firstTime) firstTime = time;
+      if (lastTime == null || time > lastTime) lastTime = time;
+    }
+
+    // ---- Qwen projected: message.parts + separate tool_result lines ----
+    if (Array.isArray(m.parts)) {
+      sawQwen = true;
+      if (type === "user") {
+        const txt = m.parts.filter((p) => p && typeof p.text === "string" && !p.thought)
+          .map((p) => p.text).join("");
+        openTurn(time, txt);
+      } else if (type === "assistant") {
+        ensureTurn(time);
+        if (e.model) { cur.model = snip(String(e.model)); model = cur.model; }
+        for (const p of m.parts) {
+          if (!p || typeof p !== "object") continue;
+          if (p.functionCall && typeof p.functionCall === "object") {
+            openCall(p.functionCall.id, p.functionCall.name, p.functionCall.args, time);
+          } else if (p.thought) {
+            cur.output.push({ kind: "thinking", text: snip(p.text || "") });
+          } else if (typeof p.text === "string") {
+            cur.output.push({ kind: "text", text: snip(p.text) });
+          }
+        }
+        const um = (e.usageMetadata && typeof e.usageMetadata === "object") ? e.usageMetadata : null;
+        if (um) addUsage(m.id || e.uuid || null, {
+          input: trajNum(um.promptTokenCount), output: trajNum(um.candidatesTokenCount),
+          cacheRead: trajNum(um.cachedContentTokenCount), cacheWrite: 0 });
+      } else if (type === "tool_result") {
+        const tcr = (e.toolCallResult && typeof e.toolCallResult === "object") ? e.toolCallResult : {};
+        const isErr = tcr.status === "error";
+        for (const p of m.parts) {
+          const fr = p && p.functionResponse;
+          if (!fr || typeof fr !== "object") continue;
+          const resText = tcr.resultDisplay != null ? tcr.resultDisplay : asStr(fr.response);
+          closeCall(fr.id != null ? fr.id : tcr.callId, resText, isErr, time);
+        }
+      }
+      touchEnd(time);
+      continue;
+    }
+
+    // ---- Claude raw: message.content string | block[] ----
+    if (type === "user") {
+      const c = m.content;
+      if (typeof c === "string") {
+        if (c.trim()) openTurn(time, c);
+      } else if (Array.isArray(c)) {
+        const isToolResultOnly = c.length > 0 && c.every((b) => b && b.type === "tool_result");
+        if (!isToolResultOnly) {
+          const txt = c.filter((b) => b && b.type === "text").map((b) => b.text || "").join("");
+          openTurn(time, txt);
+        }
+        for (const b of c) {
+          if (b && b.type === "tool_result") {
+            closeCall(b.tool_use_id, asStr(b.content), b.is_error === true, time);
+          }
+        }
+      }
+    } else if (type === "assistant") {
+      ensureTurn(time);
+      if (m.model) { cur.model = snip(String(m.model)); model = cur.model; }
+      if (m.stop_reason) cur.reason = String(m.stop_reason);
+      const c = Array.isArray(m.content) ? m.content : [];
+      for (const b of c) {
+        if (!b || typeof b !== "object") continue;
+        if (b.type === "text") cur.output.push({ kind: "text", text: snip(b.text || "") });
+        // On this fleet extended-thinking is stored ENCRYPTED: `thinking` is empty
+        // and only `signature` is present — emit the block, NEVER surface `signature`.
+        else if (b.type === "thinking") cur.output.push({ kind: "thinking", text: snip(b.thinking || "") });
+        else if (b.type === "tool_use") openCall(b.id, b.name, b.input, time);
+      }
+      // Claude splits one assistant message across lines that repeat the SAME
+      // message.id AND its usage — dedupe on the id or tokens multiply-count.
+      const u = (m.usage && typeof m.usage === "object") ? m.usage : null;
+      if (u) addUsage(m.id || e.uuid || null, {
+        input: trajNum(u.input_tokens), output: trajNum(u.output_tokens),
+        cacheRead: trajNum(u.cache_read_input_tokens),
+        cacheWrite: trajNum(u.cache_creation_input_tokens) });
+      touchEnd(time);
+    }
+    // Everything else (system, control-plane noise) is ignored per the contract.
+  }
+
+  for (const t of turns) {
+    t.durationMs = (t.startedAt != null && t.endedAt != null)
+      ? Math.max(0, t.endedAt - t.startedAt) : null;
+  }
+  let kept = turns;
+  let turnsDropped = 0;
+  if (kept.length > TRAJ_TURNS_MAX) {
+    turnsDropped = kept.length - TRAJ_TURNS_MAX;
+    kept = kept.slice(-TRAJ_TURNS_MAX);  // keep the newest, as dsh does
+  }
+  return {
+    transcriptId,
+    runtime: sawQwen ? "qwen" : "claude",
+    title, model,
+    startedAt: firstTime, endedAt: lastTime,
+    durationMs: (firstTime != null && lastTime != null) ? lastTime - firstTime : null,
+    totals, turns: kept,
+    truncated: truncated || turnsDropped > 0 || callsDropped > 0,
+    turnsDropped, callsDropped,
+  };
+}
+
 module.exports = {
   ARCHIVE_DIR, ARCHIVE_DB, ARCHIVE_TRANSCRIPT_MAX, ARCHIVE_TOTAL_MAX,
   dshTrajectory, dshEventsFile,
+  claudeTrajectory, claudeTrajFile,
   ARCHIVE_RAW_TRANSCRIPT_MAX, ARCHIVE_RAW_CURSOR_MAX, ARCHIVE_RAW_CURSOR_LOOKUP_MAX,
   ARCHIVE_MANIFEST_CURSOR_MAX,
   RAW_DIR_SUFFIX,
