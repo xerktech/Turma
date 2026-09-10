@@ -193,6 +193,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
       + " openSubagentView, transcriptBack,"
       + " chatToTerminal, terminalToChat, chatToTrajectory, trajectoryToChat, renderTrajectory,"
+      + " transcriptToTrajectory, trajectoryBack,"
       + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
       + " applyAgent, mergeSnapshot, sseClock: () => sseClock,"
       + " setCache: (c) => { cache = c; }, getCache: () => cache, setDraft: (t) => { renameDraft = t; },"
@@ -2991,4 +2992,55 @@ test("XERK-717: chatToTrajectory reveals the pane and loads from the unified /ap
   assert.equal(page.els.chatPane.hidden, true, "the chat pane is hidden");
   assert.ok(page.gets.some((u) => u.includes("/api/archive/tid1/trajectory")),
     "loadTrajectory fetches the runtime-dispatched archive endpoint, not /api/dsh");
+});
+
+// --- Trajectory on the read-only stage (XERK-718) ----------------------------
+// The ended/killed-session and archived-transcript views are archive-served, so
+// their Trajectory works for an offline host too. The toggle rides the SAME
+// endpoint the live pane does; the difference is only where its ◂ Back returns.
+
+test("XERK-718: an ended session offers Trajectory, opens it from the archive, and Back returns to the transcript", async () => {
+  const { beat, openEndedSession, transcriptToTrajectory, trajectoryBack, els, gets } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z", { transcriptId: "t-abc" })];
+  beat({ now, agents: [h] });
+  openEndedSession("33333");
+  assert.equal(els.trTraj.hidden, false, "the Trajectory toggle is offered on the ended-session bar");
+
+  transcriptToTrajectory();
+  assert.equal(els.trajPane.hidden, false, "the trajectory pane is revealed");
+  assert.equal(els.transcriptPane.hidden, true, "the read-only transcript is hidden behind it");
+  assert.ok(gets.some((u) => u.includes("/api/archive/t-abc/trajectory")),
+    "it fetches the same runtime-dispatched archive endpoint (works for an offline host)");
+  // Back returns to the read-only transcript, NOT a live chat (there is none).
+  assert.equal(els.trajChatBtn.textContent, "◂ Conversation", "Back reads 'Conversation', not 'Chat'");
+  trajectoryBack();
+  assert.equal(els.trajPane.hidden, true, "the trajectory pane is hidden again");
+  assert.equal(els.transcriptPane.hidden, false, "we are back on the read-only transcript");
+  assert.equal(els.chatPane.hidden, true, "no live chat pane is shown for an ended session");
+});
+
+test("XERK-718: an ended session with no transcript id offers no Trajectory toggle", () => {
+  const { beat, openEndedSession, els } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z")]; // no transcriptId
+  beat({ now, agents: [h] });
+  openEndedSession("33333");
+  assert.equal(els.trTraj.hidden, true, "no archived transcript, so no Trajectory toggle");
+});
+
+test("XERK-718: an archived transcript offers Trajectory; the subagent view does not", () => {
+  const { beat, selectSession, openTranscript, openSubagentView, els } = loadPage();
+  const { now, host: h } = host([{ ...running("live1", "Live", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tl" }]);
+  beat({ now, agents: [h] });
+
+  // A search/archive transcript is archive-served with a real id — same toggle.
+  openTranscript("t-other", "Some Archived Session", null);
+  assert.equal(els.trTraj.hidden, false, "the archive/search transcript view offers it");
+
+  // A background-agent transcript's id is virtual (no archived <id>.jsonl), so
+  // the toggle must NOT appear — resetEndedBar hides it and nothing re-shows it.
+  selectSession("live1");            // openSubagentView reads currentId + its host key
+  openSubagentView("general-purpose", "Research");
+  assert.equal(els.trTraj.hidden, true, "the subagent view offers no Trajectory (virtual id)");
 });

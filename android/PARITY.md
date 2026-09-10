@@ -89,11 +89,14 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Session Trajectory view is WEB-ONLY (epic XERK-712).** The generalized Trajectory pane — a
   read-only turns / tool-calls / tokens render for Claude and Qwen sessions (not just dsh), toggled
   beside "Terminal ▸" (XERK-717) and served by `GET /api/archive/<transcriptId>/trajectory`
-  (XERK-715) — ships on the WEB only; no Android, no glasses. Android carries only the earlier
-  dsh-specific Trajectory screen (`ui/TrajectoryScreen.kt`, XERK-498) over `GET
-  /api/dsh/<id>/trajectory`, and is NOT being generalized to Claude/Qwen here. Recorded web-only
-  like the archive Restore picker (XERK-453); a later ticket can port the shared view to the phone
-  if a need appears. Shape/renderer invariants: `.claude/rules/trajectory.md`.
+  (XERK-715) — ships on the WEB only; no Android, no glasses. This includes the read-only stage's
+  Trajectory toggle (XERK-718): the web ended/killed-session and archived-transcript views now
+  offer the same archive-served Trajectory (full tokens/model/timings for an ended session, works
+  for an offline host), also web-only. Android carries only the earlier dsh-specific Trajectory
+  screen (`ui/TrajectoryScreen.kt`, XERK-498) over `GET /api/dsh/<id>/trajectory`, opened from a
+  dsh chat, and is NOT being generalized to Claude/Qwen nor to the ended-session view here.
+  Recorded web-only like the archive Restore picker (XERK-453); a later ticket can port the shared
+  view to the phone if a need appears. Shape/renderer invariants: `.claude/rules/trajectory.md`.
 
 ## Done (this pass — first installment)
 
