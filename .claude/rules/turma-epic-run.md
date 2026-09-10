@@ -46,6 +46,10 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   A→{B,C}→D yields `[[A],[B,C],[D]]`.
 - **A cycle is ANNOTATED, never a silent deadlock**: children that can never be placed land in
   `cycle`, and `armEpicRun` sets `state:"blocked"`. The acyclic remainder still lays out in `waves`.
+- **`buildEpicWaves` has TWO mirrors the Epic Builder relies on** (`.claude/rules/epic-builder.md`):
+  `layerWaves` in `turma/epic-plan.js` is a byte-for-byte copy, and `_epic_plan_cycle` in
+  `hub-agent.py` its Python twin — so a builder's plan previews as the exact waves this run executes.
+  Change the layering here and both move too; `turma/tests/epic-plan.test.js` pins the parity.
 - `epicChildRows(siteKey, epicKey, rows)` resolves the children from `fleetTicketRows()` — the
   board's own resolved view (XERK-634 `epicKey`), never a raw walk of `agents`.
 

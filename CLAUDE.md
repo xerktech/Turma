@@ -38,6 +38,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `turma-ticket-queue.md` | `turma/server.js`, `board.*` | hub ticket queue: admission, drain, expiries, caps |
 | `turma-epic-run.md` | `turma/server.js` | epic auto-orchestration: durable run store, dependency DAG, manual-start route, never-auto-start gate (XERK-635); auto-close chaining + epic-completion write (XERK-637); pause/resume operator hold (XERK-641) |
 | `turma-epic-builder.md` | `turma/server.js` | Epic Builder (XERK-725): idea→epic `epic-builder` route + DELETE, `epicBuilders` durable store, `epicBuilderDriveSweep` dispatch via findTicketHost (not ticketQueue), `epicBuilderStatus` heartbeat ingest |
+| `epic-builder.md` | `agent/hub-agent.py`, `turma/epic-plan.js` | Epic Builder agent+plan half (XERK-722/723/724): EpicPlan model + `waves`==`buildEpicWaves` parity (3 mirrors), verified Blocks direction (inwardIssue=blocker), emit isEpic/epicKey/blocks so Auto Epic needs no change, final-child-blocked-by-all, `createBlocksLink` idempotency, the builder session + no-silent-half-epic materializer + on-beat reap |
 | `board-ticket-view.md` | `server.js`, `hub-agent.py`, `board.js` + vendored copies, `Board.kt` | routing a ticket to a capable host; hub resolving a ticket as the board does |
 | `turma-sessions.md` | `turma/public/sessions.html`, `chat.js` | Sessions page, chat engine, live tail, composer, terminal |
 | `android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
