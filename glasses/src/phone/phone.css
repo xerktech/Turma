@@ -157,9 +157,14 @@
 .ph-card:hover { border-color: var(--accent); }
 .ph-card.cur { border-color: var(--accent); border-width: 2px; }
 .ph-ticket { font-family: var(--font-mono); color: var(--accent); }
-.ph-state-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-top: 4px; }
-.ph-state-row .ph-state { margin-top: 0; flex: 1 1 auto; min-width: 0; }
-.ph-pr-list { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; justify-content: flex-end; min-width: 0; }
+.ph-state-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; margin-top: 4px; }
+.ph-state-row .ph-state { margin-top: 0; flex: 0 1 auto; min-width: 0; }
+/* PR chips flow into the empty space beside the state text, wrapping left-to-right
+   only once a row is full (XERK-736) — mirrors sessions.html's .state-row. The
+   old atomic right-pinned list dropped to its own line(s) the moment the chips
+   didn't ALL fit, wasting the state line's right half and growing the card.
+   display: contents dissolves the wrapper so each chip is a direct flex item. */
+.ph-pr-list { display: contents; }
 /* Queued: dashed, static, with an inline Cancel. */
 .ph-queued { border-style: dashed; cursor: default; }
 .ph-queued .ph-dot.st-waiting { box-shadow: none; }
