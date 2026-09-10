@@ -452,12 +452,13 @@ test("ready for review: a card says why it is there instead of a bare 'idle'", (
   assert.ok(r.includes(`<span class="dot review">`), "and takes the accent dot, not the muted idle one");
 });
 
-test("ready for review: the header count and the Active empty state point at it", () => {
+test("ready for review: the Active empty state points at it", () => {
   const { render, els } = loadPage();
   const { now, host: h } = host([finished("11111", "Research Task"), waiting("22222", "Waiting Task")]);
   render({ now, agents: [h] });
 
-  assert.equal(els.hdrMeta.textContent, "2 running · 1 waiting on you · 2 ready for review");
+  // The header no longer carries a running/ready-for-review count (XERK-733);
+  // the empty Active section still points the operator up to Ready for review.
   assert.match(els.active.innerHTML, /No active sessions\. See Ready for review above\./);
 });
 

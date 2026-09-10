@@ -1108,9 +1108,6 @@ const $ended = document.getElementById("ended");
 const $spawn = document.getElementById("spawn");
 const $queued = document.getElementById("queued");
 const $sidebar = document.querySelector(".sidebar");
-// The header slot nav.js mounts for this page's running/waiting counts.
-// See public/nav.js.
-const $counts = document.getElementById("hdrMeta");
 
 // Keyboard-aware app-shell height (see the body{} rule). `100dvh` +
 // `interactive-widget=resizes-content` is right on phones, but some Android
@@ -2061,7 +2058,6 @@ function render(data) {
   refreshOrgColors(data.agents || []);
 
   const { running, queued, ended } = collect(agents, now);
-  const waiting = running.filter(x => x.live.kind === "waiting").length;
 
   // Running sessions split three ways, in the order the operator reads them:
   //
@@ -2078,10 +2074,6 @@ function render(data) {
   for (const x of running) (readyForReview(x.s, x.live) ? review : rest).push(x);
   const active = rest.filter(x => x.live.kind !== "idle");
   const idle = rest.filter(x => x.live.kind === "idle");
-
-  $counts.textContent = running.length + " running"
-    + (waiting ? " · " + waiting + " waiting on you" : "")
-    + (review.length ? " · " + review.length + " ready for review" : "");
 
   const hosts = agents.filter(a => a.online && (a.repos || []).length);
   // Preserve focus/caret (in an open composer or a card's rename box), the

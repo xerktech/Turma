@@ -853,7 +853,6 @@ those are marked `[MODEL]`.
 - P2 Per-day tooltip; the web's texture channel for series 9+ (Android reuses hues past 8).
 
 ### Nav / Login
-- P3 Optional header descriptor/meta slot (e.g. Sessions running/waiting counts).
 - **Native Authentik SSO is IMPLEMENTED on Android (XERK-591).** `LoginScreen.kt` shows a "Sign in
   with SSO" button beside the Hub-URL + break-glass credential fields. It opens the hub's existing
   `/auth/oidc/login` in a **Chrome Custom Tab** (system browser, so passkeys/WebAuthn work — a plain
