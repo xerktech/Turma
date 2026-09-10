@@ -102,6 +102,16 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   no Android/glasses change; a future port carries them with it. So is XERK-734: each turn header is
   a collapse toggle that folds/unfolds that whole turn's body.
 
+- **Sessions card subtitle refresh (XERK-735).** The web card's second line (`cardMeta` in
+  `sessions.html`) was reordered to `repo · related ticket · pc name · session id` and clamped to one
+  line with an ellipsis + hover-reveal `title`, and its ticket key became a LINK to that ticket's
+  detail on the board (`/board?ticket=&site=`, same in-app hop as the chat footer chip). Android's
+  QUEUED and ENDED rows were reordered to match (`SessionsScreen.kt`, already `maxLines=1`). Two web-only
+  parts: (1) the ticket key is NOT a tappable board deep-link on Android's session cards yet — a later
+  ticket can thread a nav callback through; (2) the ACTIVE card meta stays Android's own
+  `pc · repo · branch` (XERK-125) FlowRow rather than adopting the web's `repo · ticket · pc · id`, so
+  the web reorder does not apply to it and Android's active card shows no ticket/session-id.
+
 ## Done (this pass — first installment)
 
 - **Repo on the Sessions-tab session card (XERK-125).** The live card's meta row read

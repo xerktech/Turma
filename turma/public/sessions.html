@@ -110,11 +110,16 @@
   .s-card .body { flex: 1; min-width: 0; }
   .s-card .title { font-weight: 600; font-size: 12px; line-height: 1.3;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .s-card .meta { color: var(--muted); font-size: 11.5px; margin-top: 2px; overflow-wrap: anywhere; }
+  /* One line, clamped with an ellipsis + hover-reveal title (XERK-735), matching
+     the card header above — the meta line is dense, so it must not wrap. */
+  .s-card .meta { color: var(--muted); font-size: 11.5px; margin-top: 2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .s-card .meta .id { font-family: var(--font-mono); }
   /* The Jira ticket this session works — the key alone, since the card's meta
      line is already dense and the chat footer carries the linked chip. */
-  .s-card .meta .s-ticket { font-family: var(--font-mono); color: var(--accent); }
+  .s-card .meta .s-ticket { font-family: var(--font-mono); color: var(--accent);
+    text-decoration: none; }
+  a.s-ticket:hover { text-decoration: underline; }
   .s-card .state { font-size: 12px; margin-top: 4px; color: var(--ink-2); }
   .s-card .state.working { color: var(--good); }
   .s-card .state.waiting { color: var(--warning); font-weight: 600; }
@@ -2048,6 +2053,39 @@ function sessMeta(s) {
   return [s.repo, branch].filter(Boolean).join(" · ");
 }
 
+// The session card's second line (XERK-735): repo · related ticket · pc name ·
+// session id, in that order — clamped to one line by `.meta`'s ellipsis, with the
+// whole line in a `title` for hover-reveal, matching the card header. `idText`
+// lets the ended-row pass its transcript-derived id in place of s.id.
+//
+// The ticket key is a LINK to that ticket's detail on Turma's own board
+// (/board?ticket=&site=), the same in-app hop chat.js's ticketFooterChip makes
+// (XERK-16) — not out to Jira. The card body re-enables pointer events on its
+// links (.s-card > .body a), so clicking it navigates while a click elsewhere
+// still selects the session. The href is built entirely from encodeURIComponent,
+// so it carries no attribute-breaking characters.
+function cardMeta(a, s, idText) {
+  const id = idText != null ? idText : s.id;
+  const repo = s.repo || "?";
+  const dev = a.device || a.key;
+  const t = s.ticket || null;
+  const key = (t && t.key) || "";
+  let ticketHtml = null;
+  if (key) {
+    const href = "/board?ticket=" + encodeURIComponent(key) +
+      (t.siteKey ? "&site=" + encodeURIComponent(t.siteKey) : "");
+    ticketHtml = `<a class="s-ticket" href="${href}" title="${esc(t.summary || key)}">${esc(key)}</a>`;
+  }
+  const html = [
+    esc(repo),
+    ticketHtml,
+    esc(dev),
+    `<span class="id">${esc(id)}</span>`,
+  ].filter(Boolean).join(" · ");
+  const text = [repo, key, dev, id].filter(Boolean).join(" · ");
+  return `<div class="meta" title="${esc(text)}">${html}</div>`;
+}
+
 function render(data) {
   const { now } = data;
   // Against the WHOLE fleet: a command fired before the operator narrowed to
@@ -2204,15 +2242,14 @@ function queuedStageText(s) {
 // a single inline arm/confirm keeps it simple).
 function queuedCard({ a, s }) {
   const armed = killArmedId === s.id;
-  const ticket = s.ticket?.key ? ` · <span class="s-ticket">${esc(s.ticket.key)}</span>` : "";
-  const meta = `<span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}${ticket}`;
+  const meta = cardMeta(a, s);
   const since = s.queuedAt ? " · " + esc(ago(Date.now() - Date.parse(s.queuedAt))) : "";
   return `<div class="s-card-wrap"${orgTintStyle(a)}>
     <div class="s-card queued">
       <span class="dot queued"></span>
       <span class="body">
         <div class="title" title="${esc(sessTitle(s))}">${esc(sessTitle(s))}</div>
-        <div class="meta">${meta}</div>
+        ${meta}
         <div class="state-row">
           <div class="state">${esc(queuedReasonText(s.queuedReason))}${since}</div>
         </div>
@@ -2227,11 +2264,7 @@ function activeCard({ a, s, live }) {
   if (renameId === s.id) return renameCard(a, s);
   const attachable = a.terminalOnline;
   const cur = s.id === currentId;
-  // The ticket this session works, when it was started from the board. A plain
-  // span, not a link out to Jira: the meta line is already dense, and the chat
-  // footer's chip is where the ticket links out.
-  const ticket = s.ticket?.key ? ` · <span class="s-ticket">${esc(s.ticket.key)}</span>` : "";
-  const meta = `<span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}${ticket}`;
+  const meta = cardMeta(a, s);
   // A move in progress: show where it's going until the stage follows it over.
   const mig = migrationFor(a.key, s.id);
   const moving = mig
@@ -2245,7 +2278,7 @@ function activeCard({ a, s, live }) {
       <span class="dot ${live.kind}"></span>
       <span class="body">
         <div class="title" title="${esc(sessTitle(s))}">${esc(sessTitle(s))}</div>
-        <div class="meta">${meta}</div>
+        ${meta}
         <div class="state-row">
           <div class="state ${live.kind}">${esc(live.label)}${!attachable ? " · terminal offline" : ""}</div>
           ${s.modelSource === "local" ? `<span class="local-mark" title="${
@@ -2345,7 +2378,7 @@ function endedRow(e) {
       <span class="dot"></span>
       <span class="body">
         <div class="title" title="${esc(sessTitle(s))}">${esc(sessTitle(s))}</div>
-        <div class="meta"><span class="id">${esc(endedRowId(e))}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}</div>
+        ${cardMeta(a, s, endedRowId(e))}
         <div class="state-row">
           <div class="state">${esc(state)}</div>
           ${s.modelSource === "local" ? `<span class="local-mark" title="${
