@@ -1102,6 +1102,11 @@ const AGENT_CACHE_KEYS = [
   "history", "subagentHistory", "jiraIssues", "statusResults",
   "priorityResults", "linkResults", "mergeResults",
   "createMeta", "createTypes", "createResults", "resultWaits",
+  // The Epic Builder's per-cmdId materialization outcomes (XERK-724): the
+  // hub-side consumption of XERK-723's createEpicChild / createBlocksLink
+  // primitives. Read by the materialization run (XERK-725), stripped from the
+  // fleet payload like the other write-outcome caches.
+  "epicChildResults", "blocksLinkResults",
 ];
 
 // The serialized size of what this record contributes to /api/agents.
@@ -3129,6 +3134,7 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
   const { history, subagentHistory, jiraIssues, statusResults,
           priorityResults, linkResults, mergeResults,
           createMeta, createTypes, createResults, resultWaits, tokenBound,
+          epicChildResults, blocksLinkResults,
           orgBound, autoPaused: _forgedAutoPaused, ...a } = agent;
   // The paused-subscription set (XERK-544/548). buildAgentsCache computes it once
   // and passes it; the per-agent SSE broadcast has none and derives its own.
@@ -5157,6 +5163,59 @@ function ingestCreateResults(agent, results) {
   }
 }
 
+// Merge the Epic Builder's createEpicChild outcomes (heartbeat `epicChildResults`,
+// XERK-723/724) into a per-cmdId cache, keyed and evicted like `createResults`:
+// the materialization run (XERK-725) reads `agent.epicChildResults[cmdId]` to
+// learn the real key of a child it queued. `epicKey` is echoed so a caller can
+// confirm the parent it asked for. Stripped from the fleet payload.
+function ingestEpicChildResults(agent, results) {
+  const now = Date.now();
+  for (const r of (Array.isArray(results) ? results : [])) {
+    if (!r || !r.cmdId) continue;
+    agent.epicChildResults[r.cmdId] = {
+      key: r.key || null, url: r.url || null, epicKey: r.epicKey || null,
+      error: r.error || null, warning: r.warning || null, fetchedAt: now,
+    };
+  }
+  for (const [k, e] of Object.entries(agent.epicChildResults)) {
+    if (now - e.fetchedAt > CREATE_RESULT_MAX_AGE_MS) delete agent.epicChildResults[k];
+  }
+  const over = Object.keys(agent.epicChildResults).length - CREATE_RESULT_MAX;
+  if (over > 0) {
+    Object.entries(agent.epicChildResults)
+      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
+      .slice(0, over)
+      .forEach(([k]) => delete agent.epicChildResults[k]);
+  }
+}
+
+// Merge the Epic Builder's createBlocksLink outcomes (heartbeat
+// `blocksLinkResults`, XERK-723/724) into a per-cmdId cache. The result carries
+// `ok` + `action` ("linked"|"no-op"|"skipped"), like `linkResults` (XERK-484);
+// the materialization run reads it to confirm a dependency edge was written.
+// Stripped from the fleet payload.
+function ingestBlocksLinkResults(agent, results) {
+  const now = Date.now();
+  for (const r of (Array.isArray(results) ? results : [])) {
+    if (!r || !r.cmdId) continue;
+    agent.blocksLinkResults[r.cmdId] = {
+      blockerKey: r.blockerKey || null, blockedKey: r.blockedKey || null,
+      siteKey: r.siteKey || null, ok: !!r.ok, error: r.error || null,
+      action: r.action || null, fetchedAt: now,
+    };
+  }
+  for (const [k, e] of Object.entries(agent.blocksLinkResults)) {
+    if (now - e.fetchedAt > CREATE_RESULT_MAX_AGE_MS) delete agent.blocksLinkResults[k];
+  }
+  const over = Object.keys(agent.blocksLinkResults).length - CREATE_RESULT_MAX;
+  if (over > 0) {
+    Object.entries(agent.blocksLinkResults)
+      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
+      .slice(0, over)
+      .forEach(([k]) => delete agent.blocksLinkResults[k]);
+  }
+}
+
 // --- Proven capability gaps (XERK-151) ---------------------------------------
 // Record that `cmdId` is a command whose whole answer is a staged result, so the
 // beat that acks it can decide whether the agent actually implements it. `extra`
@@ -5184,6 +5243,8 @@ function resultLanded(agent, cmdId, wait) {
   if (wait.kind === "setTicketPriority") return !!(agent.priorityResults || {})[cmdId];
   if (wait.kind === "createDuplicateLink") return !!(agent.linkResults || {})[cmdId];
   if (wait.kind === "mergePr") return !!(agent.mergeResults || {})[cmdId];
+  if (wait.kind === "createEpicChild") return !!(agent.epicChildResults || {})[cmdId];
+  if (wait.kind === "createBlocksLink") return !!(agent.blocksLinkResults || {})[cmdId];
   return true;
 }
 
@@ -5880,6 +5941,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "ticketPriorityResults", "ticketLinkResults",
+  "epicChildResults", "blocksLinkResults",
   "spawnFailures",
 ]);
 
@@ -12661,6 +12723,14 @@ const server = http.createServer(async (req, res) => {
       // a conflict that appeared): those need a human, not another attempt.
       const mergePrResults = payload.mergePrResults;
       delete payload.mergePrResults;
+      // Epic Builder materialization outcomes (XERK-724): the results of the
+      // createEpicChild / createBlocksLink primitives (XERK-723) the hub queued
+      // to build an epic. Cached by cmdId below like the other write outcomes and
+      // read by the materialization run (XERK-725) to advance the epic build.
+      const epicChildResults = payload.epicChildResults;
+      delete payload.epicChildResults;
+      const blocksLinkResults = payload.blocksLinkResults;
+      delete payload.blocksLinkResults;
       // Session-creating commands this agent REFUSED since the last beat
       // (XERK-265) — cached by cmdId below and applied to any migration they
       // name, so a refusal fails the move now rather than at its timeout.
@@ -12761,6 +12831,11 @@ const server = http.createServer(async (req, res) => {
         // Per-cmdId PR auto-merge outcome cache (XERK-550); survives across
         // beats like `linkResults` and is stripped from the fleet payload.
         mergeResults: prev.mergeResults || {},
+        // Per-cmdId Epic Builder materialization outcome caches (XERK-724): the
+        // createEpicChild / createBlocksLink results (XERK-723). Survive across
+        // beats like `mergeResults` and are stripped from the fleet payload.
+        epicChildResults: prev.epicChildResults || {},
+        blocksLinkResults: prev.blocksLinkResults || {},
         // Per-cmdId refusals of a session-creating command (XERK-265). Survives
         // across beats like the caches above, but is SERVED with the record
         // rather than stripped — the client following that spawn is who needs it.
@@ -12903,6 +12978,8 @@ const server = http.createServer(async (req, res) => {
       ingestMergeResults(next, mergePrResults);
       ingestCreateMeta(next, createMetaResults);
       ingestCreateResults(next, createTicketResults);
+      ingestEpicChildResults(next, epicChildResults);
+      ingestBlocksLinkResults(next, blocksLinkResults);
       // Scoped to the commands this host was actually given: `prev.commands` is
       // the queue BEFORE this beat's acks were filtered out, and the agent
       // stages a refusal in the same handle_commands call that acks it, so the
@@ -12932,7 +13009,8 @@ const server = http.createServer(async (req, res) => {
       // across the fleet.
       if ([historyResults, subagentHistoryResults, jiraIssueResults,
            ticketStatusResults, ticketPriorityResults, ticketLinkResults,
-           mergePrResults, createMetaResults, createTicketResults].some(
+           mergePrResults, createMetaResults, createTicketResults,
+           epicChildResults, blocksLinkResults].some(
              (a) => Array.isArray(a) && a.length)) {
         enforceCacheHostBudget(next);
         enforceCacheTotalBudget();
@@ -15987,6 +16065,8 @@ if (process.env.TURMA_TEST) {
     dedupeLinkSweep,
     dedupeLinkSkips,
     ingestTicketLinkResults,
+    ingestEpicChildResults,
+    ingestBlocksLinkResults,
     orgColors,
     setOrgColor,
     // Per-repo importance tiers (XERK-487): the store and the read seams [E]'s
