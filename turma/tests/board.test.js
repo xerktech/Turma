@@ -277,6 +277,20 @@ test("ticketSort: newest updated first", () => {
   assert.deepEqual(list.sort(ticketSort).map((t) => t.key), ["B", "A"]);
 });
 
+test("ticketSort: epics float to the top of the column, then newest updated", () => {
+  // Two epics and two work tickets, deliberately interleaved and with the epics
+  // NOT the newest by `updated` — the epics still lead, each group internally
+  // newest-first.
+  const list = [
+    ticket("W-old", { updated: "2026-07-01T00:00:00Z" }),
+    epicTicket("E-old", { updated: "2026-06-01T00:00:00Z" }),
+    ticket("W-new", { updated: "2026-07-10T00:00:00Z" }),
+    epicTicket("E-new", { updated: "2026-06-15T00:00:00Z" }),
+  ];
+  assert.deepEqual(list.sort(ticketSort).map((t) => t.key),
+    ["E-new", "E-old", "W-new", "W-old"]);
+});
+
 test("orgColorMap: every org gets a UNIQUE color, no overlap (XERK-48)", () => {
   // A collision-free set: each org's djb2-preferred slot differs, so each keeps
   // it. All four colors distinct.
