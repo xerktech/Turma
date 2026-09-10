@@ -116,9 +116,16 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
     `defer_raw`), so the route folds the RENDERED layer instead — flagged `partial:true` with every
     `tokens`/`model` null (NOT faked; live enrichment is XERK-716). dsh ships raw LIVE (no
     `defer_raw`), so it is FULL whether running or ended.
-  - **The web pane that consumes this beside "Terminal ▸" for a live claude/qwen session is XERK-717
-    (in progress); today only the dsh pane above is wired in `sessions.html`.** Shape / reducer /
-    contract invariants: `.claude/rules/trajectory.md` + `docs/trajectory-contract.md`.
+  - **The web `#trajPane` consumes this in TWO places, both `sessions.html`.** (1) Beside "Terminal ▸"
+    for a LIVE claude/qwen session (XERK-717, `chatToTrajectory` — Back returns to the chat pane).
+    (2) On the READ-ONLY stage for an ENDED/killed session and an archived/search transcript
+    (XERK-718, `transcriptToTrajectory` — Back returns to `#transcriptPane`). Both hit the SAME
+    archive endpoint, so the ended path works for an OFFLINE host and gets the FULL trajectory (raw
+    is synced after session end). `trajReturn` routes the pane's one ◂ Back button ("chat" vs
+    "transcript"); `#trTraj` is gated on a real archived `transcriptId` (`resetEndedBar` hides it, so
+    the subagent view's VIRTUAL id never offers it). Web-only (Android has only the dsh screen,
+    `android/PARITY.md`). Shape / reducer / contract invariants: `.claude/rules/trajectory.md` +
+    `docs/trajectory-contract.md`.
 - **A dsh session's chat header also shows a "dsh web ↗" link** (XERK-501) to the host's single
   host-wide `dsh web` (direct-access viewer over the shared store, `dsh-input.md`) — shown only when
   the host reports a reachable `dsh.web.url` (a loopback-only host reports `null`, link stays hidden).

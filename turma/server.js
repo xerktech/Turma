@@ -1104,7 +1104,7 @@ const STATE_FILE_MAX = positiveEnv(
 // every constant that path reads has to exist by then or the `const` is in its
 // temporal dead zone and the restore's own `catch {}` swallows the throw.
 const AGENT_CACHE_KEYS = [
-  "history", "subagentHistory", "jiraIssues", "statusResults",
+  "history", "trajectoryTails", "subagentHistory", "jiraIssues", "statusResults",
   "priorityResults", "linkResults", "mergeResults",
   "createMeta", "createTypes", "createResults", "resultWaits",
 ];
@@ -3367,7 +3367,7 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
   // (XERK-544) is HUB-DERIVED — a heartbeat cannot assert it (a forged one would
   // let a host fake its own pause), so it is stripped here and recomputed
   // authoritatively below.
-  const { history, subagentHistory, jiraIssues, statusResults,
+  const { history, trajectoryTails, subagentHistory, jiraIssues, statusResults,
           priorityResults, linkResults, mergeResults,
           createMeta, createTypes, createResults, resultWaits, tokenBound,
           orgBound, autoPaused: _forgedAutoPaused, ...a } = agent;
@@ -4937,6 +4937,26 @@ function normalizeTriage(payload) {
   payload.triage = { available: t.available === true };
 }
 
+// The trajectory (XERK-716) capability block, coerced at ingest exactly like
+// normalizeQwen/normalizeTriage and for the same reason: it is agent-supplied
+// and could be TYPED by a client, and `/api/agents` decodes atomically on
+// Android, so one host's `trajectory.available: "yes"` must never fail the whole
+// fleet decode. Strictly boolean; unusable becomes NULL (never a rebuilt
+// {available: true}); ABSENT means absent — an agent predating XERK-716 carries
+// no block, which clients read as "this host can't serve a live full
+// trajectory" (the degraded rendered view), never as "full, unknown". It gates
+// only the LIVE full-fidelity affordance; the endpoint answers a degraded
+// rendered trajectory regardless of it.
+function normalizeTrajectory(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const t = payload.trajectory;
+  if (!t || typeof t !== "object" || Array.isArray(t)) {
+    if ("trajectory" in payload) payload.trajectory = null;
+    return;
+  }
+  payload.trajectory = { available: t.available === true };
+}
+
 // This host's EFFECTIVE default runtime for an unpinned spawn (XERK-521), coerced
 // at ingest exactly like normalizeQwen/normalizeDsh and for the same reason: it
 // is agent-supplied, a client may TYPE it, and `/api/agents` decodes atomically
@@ -5018,6 +5038,58 @@ function liveRuntimeForTranscript(transcriptId) {
   return "claude";
 }
 
+// The LIVE, RUNNING claude/qwen session whose transcript this is, on an ONLINE
+// host — the input to XERK-716's full-fidelity live trajectory. Returns null for
+// a dsh session (its raw log is live-synced, so dshTrajectory already answered),
+// an ENDED session (claudeTrajectory answered off the synced raw layer), or a
+// session only an OFFLINE host still reports as running (a stale record — the
+// degraded rendered fallback is the honest answer there, the same reason the
+// endpoint dispatches off archived data rather than a live lookup). `runtime` is
+// the session's pinned agentType, so the reduced trajectory and the degraded
+// fallback agree on which runtime they describe.
+function liveSessionForTranscript(transcriptId) {
+  if (!transcriptId) return null;
+  const now = Date.now();
+  for (const [key, a] of Object.entries(agents)) {
+    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    for (const s of a.sessions || []) {
+      if (s.transcriptId !== transcriptId || s.status !== "running") continue;
+      if (s.agentType === "dsh") return null; // resolved off its live raw log
+      return { key, agent: a, session: s,
+        runtime: s.agentType === "qwen" ? "qwen" : "claude" };
+    }
+  }
+  return null;
+}
+
+// A running session's live raw tail is requested on demand (a `trajectoryTail`
+// command) but delivered a round-trip later, so a burst of polls must not queue
+// one command per poll — each re-serializes the host record and SSE-broadcasts
+// it (XERK-261). This memo (host \0 sessionId -> last-queued epoch) suppresses a
+// re-request within TRAJECTORY_FETCH_DEDUP_MS; it is pure hub-internal dedup, so
+// it lives OFF the record (never served) and is bounded oldest-first.
+const liveTrajFetches = new Map();
+const TRAJECTORY_FETCH_DEDUP_MS = 15 * 1000;
+const TRAJECTORY_FETCH_MEMO_MAX = 512;
+
+// Queue a `trajectoryTail` fetch to the session's host unless one was queued for
+// it within TRAJECTORY_FETCH_DEDUP_MS. Returns true if a command was queued.
+function requestTrajectoryTail(live) {
+  const memoKey = live.key + "\0" + live.session.id;
+  const now = Date.now();
+  const last = liveTrajFetches.get(memoKey);
+  if (last && now - last < TRAJECTORY_FETCH_DEDUP_MS) return false;
+  queueCommand(live.key, { type: "trajectoryTail", sessionId: live.session.id });
+  liveTrajFetches.set(memoKey, now);
+  if (liveTrajFetches.size > TRAJECTORY_FETCH_MEMO_MAX) {
+    const oldest = [...liveTrajFetches.entries()].sort((a, b) => a[1] - b[1]);
+    for (const [k] of oldest.slice(0, liveTrajFetches.size - TRAJECTORY_FETCH_MEMO_MAX)) {
+      liveTrajFetches.delete(k);
+    }
+  }
+  return true;
+}
+
 function archiveHistory(transcriptId) {
   if (!transcriptId) return null;
   let t;
@@ -5051,6 +5123,36 @@ function ingestHistory(agent, historyResults) {
       .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
       .slice(0, over)
       .forEach(([sessionId]) => delete agent.history[sessionId]);
+  }
+}
+
+// The on-demand raw <sid>.jsonl tails delivered by a `trajectoryTail` command
+// (XERK-716), cached per session exactly like ingestHistory (same TTL + count
+// bound, oldest-fetchedAt evicted) so the trajectory endpoint can reduce a
+// RUNNING claude/qwen session's live raw tail into a FULL trajectory. Keyed by
+// sessionId, the same handle the endpoint queued the command for. The RAW text
+// is heavy (raw is 3-14x the rendered layer), so — like `history` — this is an
+// AGENT_CACHE_KEY excluded from the record ceiling and separately held under the
+// container-sized byte budget (AGENT_CACHE_HOST_MAX/TOTAL_MAX), never a beat
+// refusal. An empty result (no transcript yet) is still cached: it settles the
+// fetch so the endpoint stops re-queueing, and reduces to an empty trajectory.
+function ingestTrajectoryTails(agent, results) {
+  const now = Date.now();
+  for (const r of (Array.isArray(results) ? results : [])) {
+    if (!r || !r.sessionId) continue;
+    agent.trajectoryTails[r.sessionId] = {
+      text: typeof r.text === "string" ? r.text : "",
+      truncated: r.truncated === true, fetchedAt: now };
+  }
+  for (const [sessionId, t] of Object.entries(agent.trajectoryTails)) {
+    if (now - t.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.trajectoryTails[sessionId];
+  }
+  const over = Object.keys(agent.trajectoryTails).length - HISTORY_MAX_SESSIONS;
+  if (over > 0) {
+    Object.entries(agent.trajectoryTails)
+      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
+      .slice(0, over)
+      .forEach(([sessionId]) => delete agent.trajectoryTails[sessionId]);
   }
 }
 
@@ -6138,10 +6240,10 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "dsh", "qwen", "triage", "defaultRuntime", "gitSources", "github", "hostOs", "inputMaxChars", "jira", "limits", "localModel",
+  "dsh", "qwen", "triage", "trajectory", "defaultRuntime", "gitSources", "github", "hostOs", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
   "sessions", "startedAt", "subscription", "tokenRoll", "uploadMaxBytes", "usage",
-  "historyResults", "subagentHistoryResults", "jiraIssueResults",
+  "historyResults", "trajectoryTailResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "ticketPriorityResults", "ticketLinkResults",
   "spawnFailures", "epicBuilderStatus",
@@ -6532,6 +6634,7 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeDsh(a);
   normalizeQwen(a);
   normalizeTriage(a);
+  normalizeTrajectory(a);
   normalizeDefaultRuntime(a);
   normalizeHostOs(a);
   normalizeTokenRoll(a);
@@ -12931,6 +13034,12 @@ const server = http.createServer(async (req, res) => {
       // stored on the record verbatim.
       const historyResults = payload.historyResults;
       delete payload.historyResults;
+      // On-demand raw <sid>.jsonl tails the agent fetched since the last beat
+      // (see the {type:"trajectoryTail"} command, XERK-716); cached below like
+      // historyResults so the archive trajectory route can reduce a running
+      // session's live raw tail into a full trajectory.
+      const trajectoryTailResults = payload.trajectoryTailResults;
+      delete payload.trajectoryTailResults;
       // On-demand background-agent transcripts the agent fetched since the last
       // beat (see the {type:"subagentHistory"} command); cached like history.
       const subagentHistoryResults = payload.subagentHistoryResults;
@@ -13049,6 +13158,10 @@ const server = http.createServer(async (req, res) => {
         // Per-session history cache (see the /history route); survives across
         // beats like the rest of agent state.
         history: prev.history || {},
+        // Per-session raw <sid>.jsonl tail cache (XERK-716, `trajectoryTail`
+        // command) that the archive trajectory route reduces into a live full
+        // trajectory; survives across beats like `history`.
+        trajectoryTails: prev.trajectoryTails || {},
         // Per-(session,type,label) background-agent transcript cache (see the
         // /subagents/history route); like `history`, survives across beats.
         subagentHistory: prev.subagentHistory || {},
@@ -13201,6 +13314,7 @@ const server = http.createServer(async (req, res) => {
       // rolled back to `prev` must not have been folded into the ledger first.
       usageLedger.ingest(key, next);
       ingestHistory(next, historyResults);
+      ingestTrajectoryTails(next, trajectoryTailResults);
       ingestSubagentHistory(next, subagentHistoryResults);
       ingestJiraIssues(next, jiraIssueResults);
       ingestStatusResults(next, ticketStatusResults);
@@ -13241,7 +13355,7 @@ const server = http.createServer(async (req, res) => {
       // would misfire the gap detection. The per-host pass bites first for a
       // single flooder; the aggregate pass is the container-sized invariant
       // across the fleet.
-      if ([historyResults, subagentHistoryResults, jiraIssueResults,
+      if ([historyResults, trajectoryTailResults, subagentHistoryResults, jiraIssueResults,
            ticketStatusResults, ticketPriorityResults, ticketLinkResults,
            mergePrResults, createMetaResults, createTicketResults].some(
              (a) => Array.isArray(a) && a.length)) {
@@ -13921,10 +14035,16 @@ const server = http.createServer(async (req, res) => {
     //   - a claude/qwen session ships its raw `<tid>.jsonl` only at session END
     //     (`defer_raw`), so `claudeTrajectory` (raw fold, `runtime` from the
     //     line shape) gives the FULL trajectory once ENDED (tokens+model+timings).
-    //   - a RUNNING claude/qwen session has no raw yet, but its RENDERED layer is
-    //     synced hub-side, so serve a DEGRADED trajectory from it — `partial:true`,
-    //     tokens null — flagged so the UI shows what it can. The live token/model
-    //     enrichment is a separate ticket; this must work without it.
+    //   - a RUNNING claude/qwen session has no raw archived yet, but XERK-716
+    //     fetches its live raw `<tid>.jsonl` TAIL on demand from the agent (a
+    //     `trajectoryTail` command, off the beat) and reduces it with the SAME
+    //     `claudeTrajectoryFromText` reducer — so a running session gets a FULL
+    //     trajectory (real tokens/model/timings) too, `partial:false`+`live:true`.
+    //     The round-trip is a beat away, so the FIRST request (or an offline/
+    //     older host) falls back to the DEGRADED rendered layer synced hub-side —
+    //     `partial:true`, tokens null, `pending:true` while a tail is on its way —
+    //     and a later poll returns the full one once the tail is cached. Gated on
+    //     the host's `trajectory` capability (absent = degraded, never assume full).
     // Nothing raw is returned (JSON only, bounded in archive.js). A genuinely
     // unknown / not-yet-synced id 404s, carrying a `refused` hint like the sibling
     // `GET /api/archive/<id>` when a push was refused rather than merely late.
@@ -13935,6 +14055,22 @@ const server = http.createServer(async (req, res) => {
       if (dsh) return json(res, 200, { runtime: "dsh", partial: false, ...dsh });
       const full = archive.claudeTrajectory(transcriptId);
       if (full) return json(res, 200, { partial: false, ...full });
+      // Live full-fidelity for a RUNNING claude/qwen session (XERK-716): reduce
+      // the agent's on-demand raw tail if it is cached, else request it and serve
+      // the degraded rendered layer now (the client re-polls for the full one).
+      const live = liveSessionForTranscript(transcriptId);
+      if (live && live.agent.trajectory && live.agent.trajectory.available === true) {
+        const tail = live.agent.trajectoryTails
+          ? live.agent.trajectoryTails[live.session.id] : null;
+        if (tail && Date.now() - tail.fetchedAt < HISTORY_MAX_AGE_MS) {
+          const reduced = archive.claudeTrajectoryFromText(
+            transcriptId, tail.text, tail.truncated);
+          if (reduced) return json(res, 200, { partial: false, live: true, ...reduced });
+        }
+        const pending = requestTrajectoryTail(live);
+        const degraded = archive.renderedTrajectory(transcriptId, live.runtime);
+        if (degraded) return json(res, 200, pending ? { ...degraded, pending: true } : degraded);
+      }
       const degraded = archive.renderedTrajectory(
         transcriptId, liveRuntimeForTranscript(transcriptId));
       if (degraded) return json(res, 200, degraded);
@@ -16184,6 +16320,9 @@ if (process.env.TURMA_TEST) {
     __getDshEnabled() { return DSH_ENABLED; },
     normalizeQwen,
     normalizeTriage,
+    normalizeTrajectory,
+    ingestTrajectoryTails,
+    liveSessionForTranscript,
     normalizeDefaultRuntime,
     qwenAvailable,
     // The fleet-wide qwen kill switch (XERK-504) mirrors the dsh one above: the

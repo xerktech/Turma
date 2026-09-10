@@ -15428,6 +15428,117 @@ class TestSweepOrphanQuestions(ManagerMixin, unittest.TestCase):
         self.assertFalse(sm._tmux_alive(None))
 
 
+class TestTrajectoryTailCommand(ManagerMixin, unittest.TestCase):
+    """XERK-716: the {type:"trajectoryTail"} command stages a bounded, byte-for-
+    byte raw <sid>.jsonl tail for the hub to reduce into a live full trajectory."""
+    WORKDIR = "/w/.turma/worktrees/repo"
+
+    def _running_session(self, sm, sid="abcde", workdir=None):
+        workdir = workdir or self.WORKDIR
+        sess = {"id": sid, "status": "running", "worktreePath": workdir,
+                "tmuxName": f"agent-{sid}"}
+        sm.registry = [sess]
+        return sess
+
+    def _proj_dir(self, workdir=None):
+        workdir = workdir or self.WORKDIR
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(workdir))
+        os.makedirs(proj, exist_ok=True)
+        return proj
+
+    def test_capability_flag_is_available(self):
+        sm = self.make_manager()
+        self.assertEqual(sm._trajectory_payload(), {"available": True})
+
+    def test_unknown_session_stages_empty_result(self):
+        sm = self.make_manager()
+        sm.registry = []
+        sm._stage_trajectory_tail("nope")
+        self.assertEqual(sm.trajectory_tail_results, [
+            {"sessionId": "nope", "text": "", "truncated": False},
+        ])
+
+    def test_reads_the_raw_tail_verbatim_untruncated(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        raw = ('{"type":"user","message":{"content":"hi"}}\n'
+               '{"type":"assistant","message":{"content":[{"type":"text",'
+               '"text":"yo"}],"model":"claude-x"}}\n')
+        with open(os.path.join(proj, "t.jsonl"), "w") as f:
+            f.write(raw)
+        sm._stage_trajectory_tail(sess["id"])
+        result = sm.trajectory_tail_results[0]
+        self.assertEqual(result["sessionId"], sess["id"])
+        self.assertEqual(result["text"], raw)  # byte-for-byte, no parse
+        self.assertFalse(result["truncated"])
+
+    def test_caps_oversize_drops_leading_partial_line_and_flags_truncated(self):
+        # A transcript larger than the cap reads back only its TAIL, with the
+        # leading partial line dropped so what remains parses line-by-line.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        line = '{"type":"user","message":{"content":"%s"}}\n' % ("x" * 200)
+        # Enough lines to exceed a small cap several times over.
+        with open(os.path.join(proj, "t.jsonl"), "w") as f:
+            for _ in range(200):
+                f.write(line)
+        with mock.patch.object(ha, "TRAJECTORY_TAIL_MAX_BYTES", 1000):
+            sm._stage_trajectory_tail(sess["id"])
+        result = sm.trajectory_tail_results[0]
+        self.assertTrue(result["truncated"])
+        # Never larger than the cap.
+        self.assertLessEqual(len(result["text"].encode("utf-8")),
+                             ha.TRAJECTORY_TAIL_MAX_BYTES)
+        # The leading partial line was dropped: every retained line is whole JSON.
+        for ln in result["text"].splitlines():
+            if ln:
+                json.loads(ln)  # raises if a partial line leaked in
+
+    def test_a_partial_last_line_survives_without_being_dropped(self):
+        # Only the LEADING partial line is dropped (the file grew past the cap
+        # window); a whole small file is returned untouched, truncated False.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        raw = '{"type":"user","message":{"content":"solo"}}\n'
+        with open(os.path.join(proj, "t.jsonl"), "w") as f:
+            f.write(raw)
+        with mock.patch.object(ha, "TRAJECTORY_TAIL_MAX_BYTES", 10_000):
+            sm._stage_trajectory_tail(sess["id"])
+        self.assertEqual(sm.trajectory_tail_results[0]["text"], raw)
+        self.assertFalse(sm.trajectory_tail_results[0]["truncated"])
+
+    def test_command_dispatch_stages_a_tail(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        with open(os.path.join(proj, "t.jsonl"), "w") as f:
+            f.write('{"type":"user","message":{"content":"hi"}}\n')
+        sm.handle_commands([
+            {"cmdId": "c1", "type": "trajectoryTail", "sessionId": sess["id"]}])
+        self.assertEqual(len(sm.trajectory_tail_results), 1)
+        self.assertEqual(sm.trajectory_tail_results[0]["sessionId"], sess["id"])
+
+    def test_payload_carries_staged_tails_only_when_present(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        with open(os.path.join(proj, "t.jsonl"), "w") as f:
+            f.write('{"type":"user","message":{"content":"hi"}}\n')
+        sess["summary"] = "named"  # already named → no claude -p summary spawn
+        sm._stage_trajectory_tail(sess["id"])
+        payload = sm.build_payload(1)
+        self.assertIn("trajectory", payload)
+        self.assertEqual(payload["trajectory"], {"available": True})
+        self.assertIn("trajectoryTailResults", payload)
+        self.assertEqual(payload["trajectoryTailResults"][0]["sessionId"], sess["id"])
+        # It is an on-demand delivery: dropped on the oversize/shed path.
+        sm._drop_on_demand_results()
+        self.assertEqual(sm.trajectory_tail_results, [])
+
+
 class TestHistoryCommand(ManagerMixin, unittest.TestCase):
     WORKDIR = "/w/.turma/worktrees/repo"
 

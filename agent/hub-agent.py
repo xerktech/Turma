@@ -803,6 +803,20 @@ HISTORY_MAX_BYTES = _env_int("SESSION_HISTORY_MAX_BYTES", 6 << 20)
 # has no result for with its "not ready" 202 and the client asks again, whereas
 # an oversize body is refused whole, forever.
 HISTORY_STAGED_MAX_BYTES = _env_int("SESSION_HISTORY_STAGED_MAX_BYTES", 12 << 20)
+# The most raw <sid>.jsonl TAIL bytes a `trajectoryTail` delivery may carry
+# (XERK-716). The hub reduces this live raw tail with the SAME js reducer it
+# folds an ENDED session's raw layer with (archive.js claudeTrajectoryFromText),
+# so a RUNNING claude/qwen session gets a FULL-fidelity trajectory without
+# un-deferring the raw archive layer (which is 3-14x the rendered bytes and would
+# bloat every heartbeat — XERK-395). Capped WELL under HISTORY_MAX_BYTES because
+# raw bytes dwarf the rendered layer: this rides the same on-demand staged budget
+# (HISTORY_STAGED_MAX_BYTES) and is dropped-on-oversize like a `history` reply, so
+# an unbounded tail would simply never land and the client would see the degraded
+# rendered trajectory forever. The reducer's own scan window is larger (8 MiB), so
+# this cap — not the reducer — is what bounds the wire; a larger source file just
+# reads back `truncated` with the newest turns kept, exactly as an oversize tail
+# read does on the ended path.
+TRAJECTORY_TAIL_MAX_BYTES = _env_int("TURMA_TRAJECTORY_TAIL_MAX_BYTES", 4 << 20)
 # The biggest body this agent will POST at all. The hub answers an oversize body
 # with 413 only NEAR its ceiling: measured, roughly to 1.1x, a coin flip at 1.5x
 # and never at 2x — past that Node destroys the socket under a request still
@@ -14602,6 +14616,12 @@ class SessionManager:
         # Consecutive failed beats — see _note_beat_failure.
         self._beat_failures = 0
         self.history_results = []
+        # Staged `trajectoryTail` results (XERK-716): a bounded raw <sid>.jsonl
+        # tail for a RUNNING session, fetched on demand so the hub can reduce it
+        # into a FULL-fidelity live Trajectory. Same on-demand, dropped-on-oversize
+        # lifecycle as history_results (it is a FETCH the client repeats, not an
+        # EVENT), so it rides `_fit_staged_history` / `_drop_on_demand_results`.
+        self.trajectory_tail_results = []
         # Staged `subagentHistory` results (one background agent's transcript,
         # fetched when an operator clicks a live agent-list row) — same
         # staged-until-delivered lifecycle as history_results.
@@ -16780,6 +16800,18 @@ class SessionManager:
         coerced hub-side (normalizeTriage), so clients gate on it and read absent
         as 'that host can't triage', never as 'triaged, unknown result'."""
         return {"available": board_configured()}
+
+    def _trajectory_payload(self):
+        """The heartbeat `trajectory` block: the capability flag alone
+        ({available}), mirroring the qwen/dsh/triage/localModel discipline
+        (XERK-716). It says whether this build can answer a `trajectoryTail`
+        command — the on-demand raw <sid>.jsonl tail the hub reduces into a
+        FULL-fidelity LIVE Trajectory for a running claude/qwen session. Any
+        current agent can, so it is unconditionally True; an agent predating
+        this reports nothing, which the hub coerces to false (normalizeTrajectory)
+        and clients read as 'this host can't serve a live full trajectory' — the
+        UI then shows the DEGRADED rendered view, never assuming full."""
+        return {"available": True}
 
     def _ensure_qwen_ready(self):
         """Probe whether this host can LAUNCH qwen — the qwen binary runs and a
@@ -22129,10 +22161,12 @@ class SessionManager:
         202, so a dropped delivery costs a re-ask. Everything else staged
         (ticket status, spawn refusals, create results) is an EVENT that exists
         nowhere else, is small, and stays held."""
-        for attr in ("history_results", "subagent_history_results", "jira_issue_results"):
+        for attr in ("history_results", "trajectory_tail_results",
+                     "subagent_history_results", "jira_issue_results"):
             getattr(self, attr).clear()
         if payload is not None:
-            for key in ("historyResults", "subagentHistoryResults", "jiraIssueResults"):
+            for key in ("historyResults", "trajectoryTailResults",
+                        "subagentHistoryResults", "jiraIssueResults"):
                 payload.pop(key, None)
 
     def _fit_staged_history(self):
@@ -22150,7 +22184,8 @@ class SessionManager:
         """
         remaining = HISTORY_STAGED_MAX_BYTES
         admitted = False   # ONE exemption for the whole beat, not one per list
-        for attr in ("history_results", "subagent_history_results"):
+        for attr in ("history_results", "trajectory_tail_results",
+                     "subagent_history_results"):
             staged = getattr(self, attr)
             if not staged:
                 continue
@@ -22194,6 +22229,46 @@ class SessionManager:
             # chat's /history fallback shows them like the live tail does.
             "queued": queued,
         })
+
+    def _stage_trajectory_tail(self, sid):
+        """Handle a {type:"trajectoryTail"} command (XERK-716): stage a BOUNDED,
+        byte-for-byte TAIL of the session's raw `<sid>.jsonl` for the next
+        heartbeat (trajectoryTailResults). The hub reduces it with the SAME js
+        reducer it folds an ended session's raw layer with (claudeTrajectoryFromText),
+        so a RUNNING claude/qwen session gets a FULL-fidelity live Trajectory
+        without the raw archive layer un-deferring (XERK-395 beat budget).
+
+        Resolved via `_session_transcript_path` — the SAME pinned `<sid>.jsonl`
+        the chat/history/PR scans read (for qwen, that is its PROJECTION, which
+        the reducer's per-line branch already handles). Capped at
+        TRAJECTORY_TAIL_MAX_BYTES from the END: a larger file drops its leading
+        partial line and flags `truncated`, so the hub's fold keeps the NEWEST
+        turns — exactly what the ended path's own tail read does. An unknown or
+        killed sessionId, or a session with no transcript yet, stages an empty
+        result rather than raising — a poison sessionId must not take down the
+        heartbeat loop (the same discipline as _stage_history)."""
+        sess = self._find(sid)
+        path = _session_transcript_path(sess) if sess else None
+        text, truncated = "", False
+        if path:
+            try:
+                size = os.path.getsize(path)
+                take = min(size, TRAJECTORY_TAIL_MAX_BYTES)
+                with open(path, "rb") as f:
+                    if size > take:
+                        f.seek(size - take)
+                    raw = f.read(take)
+                truncated = size > take
+                if truncated:
+                    # Drop the leading partial line, as the reducer's tail read
+                    # (archive.js trajReadTail) does — a half line never parses.
+                    nl = raw.find(b"\n")
+                    raw = raw[nl + 1:] if nl >= 0 else b""
+                text = raw.decode("utf-8", "replace")
+            except OSError:
+                text, truncated = "", False
+        self.trajectory_tail_results.append(
+            {"sessionId": sid, "text": text, "truncated": truncated})
 
     def _stage_subagent_history(self, sid, agent_type, label, agent_id=None):
         """Handle a {type:"subagentHistory"} command: resolve the clicked pane
@@ -26780,6 +26855,8 @@ class SessionManager:
                         cmd.get("sessionId"), cmd.get("optionNumber"))
                 elif ctype == "history":
                     self._stage_history(cmd.get("sessionId"))
+                elif ctype == "trajectoryTail":
+                    self._stage_trajectory_tail(cmd.get("sessionId"))
                 elif ctype == "subagentHistory":
                     self._stage_subagent_history(
                         cmd.get("sessionId"), cmd.get("agentType"),
@@ -27926,6 +28003,14 @@ class SessionManager:
             # as 'this host can't triage', never 'triaged, unknown'. The triage
             # ASSESSMENT itself rides per-ticket as jira.tickets[].triage.
             "triage": self._triage_payload(),
+            # Whether this host can serve a live full-fidelity Trajectory
+            # (XERK-716) — i.e. answer a `trajectoryTail` command with the raw
+            # <sid>.jsonl tail the hub reduces. Doubles as the capability flag
+            # like the qwen/dsh/triage blocks above: absent (a pre-XERK-716 agent)
+            # is coerced to false hub-side (normalizeTrajectory), which clients
+            # read as 'this host can't serve a live full trajectory' and fall back
+            # to the DEGRADED rendered view, never assuming full.
+            "trajectory": self._trajectory_payload(),
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),
@@ -27936,6 +28021,8 @@ class SessionManager:
         self._fit_staged_history()
         if self.history_results:
             payload["historyResults"] = list(self.history_results)
+        if self.trajectory_tail_results:
+            payload["trajectoryTailResults"] = list(self.trajectory_tail_results)
         if self.subagent_history_results:
             payload["subagentHistoryResults"] = list(self.subagent_history_results)
         if self.jira_issue_results:
@@ -28027,6 +28114,7 @@ class SessionManager:
         # so a bad attribute name aborts the whole clear, never half of it.
         collections = [
             self.history_results,
+            self.trajectory_tail_results,
             self.subagent_history_results,
             self.jira_issue_results,
             self.ticket_status_results,
@@ -28187,8 +28275,8 @@ class SessionManager:
         self._beat_failures = getattr(self, "_beat_failures", 0) + 1
         if self._beat_failures < HEARTBEAT_FAILURES_BEFORE_SHED:
             return
-        if not (self.history_results or self.subagent_history_results
-                or self.jira_issue_results):
+        if not (self.history_results or self.trajectory_tail_results
+                or self.subagent_history_results or self.jira_issue_results):
             return
         log(f"{self._beat_failures} beats in a row failed while carrying on-demand "
             "deliveries; shedding them rather than re-sending the same body forever")
