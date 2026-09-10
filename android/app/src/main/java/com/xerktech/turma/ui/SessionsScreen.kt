@@ -545,7 +545,7 @@ fun SessionsListPane(
     Box(modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
         ScreenHeader("Sessions") {
-            IconButton(onClick = { pickerOpen = true }) { Icon(Icons.Filled.Add, "New session") }
+            HeaderIconButton(onClick = { pickerOpen = true }) { Icon(Icons.Filled.Add, "New session") }
         }
         // ONE search affordance (XERK-243): the header carried a Search action
         // onto a separate archive screen while this box only filtered the live
