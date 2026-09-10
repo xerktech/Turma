@@ -2960,6 +2960,17 @@ test("XERK-717: renderTrajectory escapes every interpolated field (stored XSS)",
   assert.ok(h.includes("&lt;script&gt;"), "the payload is escaped");
 });
 
+test("XERK-720: renderTrajectory renders turns chronologically, Turn 1 at the top", () => {
+  const page = loadPage();
+  const scroll = makeEl("trajScroll");
+  page.renderTrajectory(scroll, claudeTraj({
+    totals: { turns: 2, toolCalls: 0, errors: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+    turns: [trajTurn({ turn: 1, calls: [] }), trajTurn({ turn: 2, calls: [] })],
+  }));
+  const h = scroll.innerHTML;
+  assert.ok(h.indexOf("Turn 1") < h.indexOf("Turn 2"), "Turn 1 renders before Turn 2 (top-to-bottom)");
+});
+
 test("XERK-720: renderTrajectory renders absolute timestamps on head/turn/call", () => {
   const page = loadPage();
   const scroll = makeEl("trajScroll");
