@@ -387,6 +387,17 @@ function materializeTick(plan, opts, state, outcomes) {
   // ---- 1. FOLD every outcome present, clearing the in-flight mark ----------
   // Done regardless of phase (an outcome for a step folds it whatever phase the
   // stored label claims). The epic first, then children, then links.
+  //
+  // DELIBERATELY not gated on `issued`: a real outcome is trusted over the
+  // in-flight bookkeeping, because the outcome came from a ticket that WAS
+  // created (the result cache only holds results of commands D queued). If D
+  // persisted the run record a beat behind the emit — dispatch, restart, then
+  // the result lands — the `issued` mark can be missing while the ticket exists;
+  // folding the outcome anyway records the real key and avoids re-issuing (a
+  // duplicate). Gating on `issued` would trade that duplicate-safety for
+  // strictness against a FABRICATED outcome (an outcome for a step never
+  // issued), which is a D-owned forged-input class and cannot arise under the
+  // cmdId→step contract. Duplicate-avoidance wins — do not "tighten" this.
   if (!s.epicKey) {
     const out = o[EPIC_STEP];
     if (out) {
