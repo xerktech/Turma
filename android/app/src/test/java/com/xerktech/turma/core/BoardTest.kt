@@ -71,6 +71,19 @@ class BoardTest {
         assertEquals(listOf("B", "C", "A"), ticketSort(listOf(a, b, c)).map { it.key })
     }
 
+    @Test fun `ticketSort floats epics to the top of the column`() {
+        // Epics lead their column even when they aren't the newest by `updated`;
+        // each group (epics, then work tickets) stays newest-first.
+        val wOld = ticket("W-old", updated = "2026-07-01T00:00:00Z")
+        val eOld = JiraTicket(key = "E-old", statusCategory = "todo",
+            updated = "2026-06-01T00:00:00Z", isEpic = true)
+        val wNew = ticket("W-new", updated = "2026-07-10T00:00:00Z")
+        val eNew = JiraTicket(key = "E-new", statusCategory = "todo",
+            updated = "2026-06-15T00:00:00Z", isEpic = true)
+        assertEquals(listOf("E-new", "E-old", "W-new", "W-old"),
+            ticketSort(listOf(wOld, eOld, wNew, eNew)).map { it.key })
+    }
+
     @Test fun `two users on one site union their tickets, deduped by key`() {
         val a1 = agent("h1", true, JiraBlock(siteKey = "org", site = "org.atlassian.net", user = "u1", fetchedAt = "2026-07-16T01:00:00Z", tickets = listOf(ticket("X-1"), ticket("X-2"))))
         val a2 = agent("h2", false, JiraBlock(siteKey = "org", user = "u2", fetchedAt = "2026-07-16T02:00:00Z", tickets = listOf(ticket("X-2"), ticket("X-3"))))

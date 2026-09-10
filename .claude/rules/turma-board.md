@@ -454,6 +454,10 @@ The operator-facing half of the epic auto-orchestration (the hub half is
 route. **Purely ADDITIVE** — the column rule (`categoryOf`/`CATEGORIES`/`REVIEW_STATUS_RE`) is
 UNTOUCHED, so it triggers no column-mirror re-port. The ONE lane-rule change is below.
 
+- **Epics sort to the TOP of every column** (`ticketSort`): an organizer reads best as the column's
+  header, not buried by `updated` among its own children. `ticketSort` puts epics first, then newest
+  `updated` within each group (both sorts stable). NOT a column-rule mirror (`categoryOf` untouched),
+  but it IS ported in `Board.kt` `ticketSort` + vendored `board.cjs` — move all three together.
 - **An epic (`isEpicTicket` = `isEpic === true`) is an organizer, never a work session.** The card
   carries an **EPIC badge** and, IN PLACE of the per-ticket Start (never `ticketStartHtml` for an
   epic), the **epic-run control**: `▶ Start epic` (`data-epic-start`) when unarmed, else a

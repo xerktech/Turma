@@ -65,6 +65,13 @@
   }
 
   function ticketSort(a, b) {
+    // Epics float to the top of every column — an epic is an organizer that
+    // spans the work tickets below it, so it reads best as the column's header
+    // rather than buried by `updated` among its own children. Within each of
+    // the two groups, newest `updated` first.
+    const ea = isEpicTicket(a) ? 0 : 1;
+    const eb = isEpicTicket(b) ? 0 : 1;
+    if (ea !== eb) return ea - eb;
     return String(b.updated || "").localeCompare(String(a.updated || ""));
   }
 

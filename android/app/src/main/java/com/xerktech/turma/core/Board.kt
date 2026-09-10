@@ -53,9 +53,17 @@ fun categoryOf(t: JiraTicket): String {
     return if (base == "inprogress" && isReviewStatus(t)) "review" else base
 }
 
-/** Column card order: newest `updated` first, a port of board.js `ticketSort`. */
+/**
+ * Column card order, a port of board.js `ticketSort`: epics float to the top of
+ * every column (an organizer reads best as the column's header, not buried by
+ * `updated` among its own children), then newest `updated` first within each
+ * group. `sortedWith` is stable, so same-group ties keep prior order.
+ */
 fun ticketSort(tickets: List<JiraTicket>): List<JiraTicket> =
-    tickets.sortedByDescending { it.updated }
+    tickets.sortedWith(
+        compareBy<JiraTicket> { if (isEpicTicket(it)) 0 else 1 }
+            .thenByDescending { it.updated }
+    )
 
 // --- drag-and-drop status change (XERK-141) ----------------------------------
 // Dragging a card into another column changes the ticket's status: the drop
