@@ -1024,13 +1024,14 @@
                   title="Close this view. The session is unaffected — reopen it from the list.">Close</button>
           <span class="spacer"></span>
           <span class="verbosity" id="chatVerbosity"></span>
-          <button class="seg-toggle" id="chatTermBtn" onclick="chatToTerminal()" title="Open the raw ttyd terminal for debugging">Terminal ▸</button>
           <!-- Trajectory toggle (XERK-717): a read-only, runtime-dispatched view
                (turns, model output, tool calls + results, tokens). A dsh session
                is headless (no ttyd, XERK-498) so this takes the Terminal toggle's
                place; a claude/qwen session shows it BESIDE Terminal. Hidden until
-               the session has a transcript (see selectSession). -->
+               the session has a transcript (see selectSession). Ordered BEFORE
+               "Terminal ▸" (XERK-738). -->
           <button class="seg-toggle" id="chatTrajBtn" hidden onclick="chatToTrajectory()" title="Open the read-only Trajectory (turns, output, tool calls, tokens)">Trajectory ▸</button>
+          <button class="seg-toggle" id="chatTermBtn" onclick="chatToTerminal()" title="Open the raw ttyd terminal for debugging">Terminal ▸</button>
           <!-- The host-wide `dsh web` viewer (XERK-501; opens dsh's OWN read-only UI over
                the shared store, so this chat can be confirmed in both places).
                Shown only for a dsh session whose host advertises a reachable
