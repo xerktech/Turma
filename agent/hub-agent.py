@@ -13075,6 +13075,312 @@ def create_board_issue(project, issue_type, summary, description, labels):
     return create_jira_issue(project, issue_type, summary, description, labels)
 
 
+# --- Epic Builder (XERK-724, epic XERK-721) ------------------------------------
+# The agent half of the Epic Builder. The hub (XERK-725, D) hands us a
+# {type:"spawnEpicBuilder", builderId, siteKey, title, idea, repo?} command; we
+# spawn a REAL builder SESSION in a worktree so it can read the code, expand the
+# idea into an Auto-Epic-ready plan, and WRITE that plan to a file in its
+# worktree. We then MATERIALIZE the plan into a live Jira epic via XERK-723's
+# write primitives — create the epic, each child parented to it, then the Blocks
+# links in dependency order — and report progress back on the per-agent
+# `epicBuilderStatus` heartbeat field (`[{id, state, epicKey?, error?}]`), which
+# the hub reads to advance its durable run record. Jira-only (the link/parent
+# APIs are Jira's, like createEpicChild/createBlocksLink).
+#
+# The session PRODUCES the plan (research needs a coding session); the AGENT
+# materializes it (a session cannot create a parented issue + Blocks links). The
+# two meet through the plan FILE the session writes into its own worktree — an
+# in-cwd write, so `acceptEdits` auto-approves it with no blocking prompt.
+
+# The filename the builder session writes its final plan JSON to, in its worktree
+# (its cwd). One builder per worktree, so a fixed name never collides.
+EPIC_BUILDER_PLAN_FILENAME = "TURMA_EPIC_PLAN.json"
+# Bounds. The idea is already hub-capped (EPIC_BUILDER_IDEA_MAX there, a 413);
+# re-cap defensively. The plan file read is bounded so a runaway write can't OOM
+# the beat's read; a builder that never writes a valid plan fails after the
+# timeout rather than holding a slot forever.
+EPIC_BUILDER_IDEA_MAX = _env_int("EPIC_BUILDER_IDEA_MAX", 8000)
+EPIC_BUILDER_PLAN_MAX_BYTES = _env_int("EPIC_BUILDER_PLAN_MAX_BYTES", 256 * 1024)
+EPIC_BUILDER_TIMEOUT_SEC = _env_int("EPIC_BUILDER_TIMEOUT_SEC", 45 * 60)
+EPIC_BUILDERS_MAX = _env_int("EPIC_BUILDERS_MAX", 64)
+# The child issue types a plan may use (case-insensitive) — a work ticket, never
+# another Epic and never a Subtask. Mirrors epic-plan.js EPIC_PLAN_CHILD_TYPES.
+EPIC_BUILDER_CHILD_TYPES = ("task", "story")
+
+
+def _eb_nonempty_str(v):
+    return isinstance(v, str) and v.strip() != ""
+
+
+EPIC_BUILDER_DIRECTIVE = (
+    "You are the Epic Builder. Turn the operator's idea into a single, well-formed\n"
+    "Jira Epic whose children are already shaped for Turma's Auto Epic feature, so\n"
+    "the epic rolls out in dependency order with no manual link fixup.\n"
+    "\n"
+    "Do this in order:\n"
+    "\n"
+    "1. RESEARCH. You are in a real worktree of the target repo — read the code and\n"
+    "   the idea before planning, exactly as an engineer would. Understand what the\n"
+    "   idea actually requires, which components it touches, and the natural seams\n"
+    "   to split the work along.\n"
+    "\n"
+    "2. EXPAND into a plan of work tickets (Tasks/Stories, never Epics or Subtasks):\n"
+    "   - Order them into WAVES by dependency, running in PARALLEL where the work is\n"
+    "     genuinely independent, and SERIALIZED only where one child truly needs\n"
+    "     another's output. Each child names the children it is blocked by.\n"
+    "   - The LAST child is a QA-and-enable step blocked by EVERY other child, so\n"
+    "     the epic converges to one wrap-up sink.\n"
+    "   - Keep each child a real, self-contained piece of work with a clear summary\n"
+    "     and enough description to start on.\n"
+    "\n"
+    "3. WRITE the plan as JSON to the file \"" + EPIC_BUILDER_PLAN_FILENAME + "\" in your\n"
+    "   current working directory (nothing else — just that file), in exactly this\n"
+    "   shape (localId is a builder-local handle you choose; real Jira keys are\n"
+    "   assigned when the plan is materialized):\n"
+    "\n"
+    "   { \"epic\": { \"summary\": \"…\", \"description\": \"…\" },\n"
+    "     \"children\": [\n"
+    "       { \"localId\": \"w1a\", \"summary\": \"…\", \"description\": \"…\",\n"
+    "         \"issueType\": \"Task\", \"blockedBy\": [] },\n"
+    "       … ,\n"
+    "       { \"localId\": \"qa\", \"summary\": \"QA end-to-end and enable\",\n"
+    "         \"description\": \"…\", \"issueType\": \"Task\",\n"
+    "         \"blockedBy\": [\"w1a\", …every other localId…] } ] }\n"
+    "\n"
+    "The plan must satisfy: exactly one epic with a non-empty summary; every child a\n"
+    "unique non-empty localId; every issueType is Task or Story; every blockedBy\n"
+    "names another child in the plan (no dangling or self references); the\n"
+    "dependency graph is acyclic; the final child is blocked by every other child.\n"
+    "Do NOT create any Jira ticket yourself — writing the file is your whole job;\n"
+    "the plan is materialized from it once the file is valid."
+)
+
+
+def build_epic_builder_prompt(title, idea):
+    """The initial prompt for a builder session: the operator's title + idea
+    followed by the directive that tells it to research, expand, and WRITE the
+    plan file."""
+    title = (title or "").strip()
+    idea = (idea or "").strip()[:EPIC_BUILDER_IDEA_MAX]
+    lines = ["# New epic to build"]
+    if title:
+        lines += ["", "Title: " + title]
+    if idea:
+        lines += ["", "Idea / details:", "", idea]
+    lines += ["", "---", "", EPIC_BUILDER_DIRECTIVE]
+    return "\n".join(lines)
+
+
+def parse_epic_plan(text):
+    """Parse the plan JSON the builder wrote. Returns the object or None (a
+    partial/mid-write file simply doesn't parse yet). Strips a ```json fence if
+    the model wrapped it in one."""
+    if not isinstance(text, str):
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        # ```json\n … \n```
+        nl = t.find("\n")
+        if nl != -1:
+            t = t[nl + 1:]
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]
+    try:
+        v = json.loads(t)
+    except Exception:
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def _epic_plan_child_ids(plan):
+    ids = []
+    for c in (plan.get("children") or []):
+        if isinstance(c, dict) and _eb_nonempty_str(c.get("localId")):
+            ids.append(c["localId"])
+    return ids
+
+
+def _epic_plan_cycle(children, idset):
+    """The localIds a dependency loop stalls (empty = acyclic). Kahn layering over
+    in-plan edges only, self-edges dropped — the SAME shape epic-plan.js
+    layerWaves / server.js buildEpicWaves use, so a plan that validates here arms
+    identically."""
+    order, blockers = [], {}
+    for c in children:
+        if not (isinstance(c, dict) and _eb_nonempty_str(c.get("localId"))):
+            continue
+        k = c["localId"]
+        order.append(k)
+        blockers[k] = [b for b in (c.get("blockedBy") or [])
+                       if isinstance(b, str) and b in idset and b != k]
+    placed, remaining = set(), list(order)
+    while remaining:
+        wave = [k for k in remaining if all(b in placed for b in blockers[k])]
+        if not wave:
+            break
+        for k in wave:
+            placed.add(k)
+        remaining = [k for k in remaining if k not in placed]
+    return remaining
+
+
+def validate_epic_plan(plan):
+    """Everything the Auto-Epic run needs, as a list of human-readable error
+    strings (empty = valid). A Python mirror of epic-plan.js validateEpicPlan:
+    one epic with a summary; unique non-empty localIds; issueType Task/Story;
+    blockedBy names only in-plan localIds (no dangling/self); acyclic DAG; the
+    final child (last) blocked by every other child."""
+    errors = []
+    if not isinstance(plan, dict):
+        return ["plan must be an object"]
+    epic = plan.get("epic")
+    if not isinstance(epic, dict) or not _eb_nonempty_str(epic.get("summary")):
+        errors.append("plan.epic must be an object with a non-empty summary")
+    children = plan.get("children")
+    if not isinstance(children, list) or not children:
+        errors.append("plan.children must be a non-empty array")
+        children = children if isinstance(children, list) else []
+
+    seen, dup = set(), set()
+    for c in children:
+        if not isinstance(c, dict):
+            errors.append("each child must be an object")
+            continue
+        lid = c.get("localId")
+        if not _eb_nonempty_str(lid):
+            errors.append("each child needs a non-empty localId")
+            continue
+        if lid in seen and lid not in dup:
+            dup.add(lid)
+            errors.append(f'duplicate localId "{lid}"')
+        seen.add(lid)
+    idset = set(seen)
+
+    for c in children:
+        if not (isinstance(c, dict) and _eb_nonempty_str(c.get("localId"))):
+            continue
+        lid = c["localId"]
+        if not _eb_nonempty_str(c.get("summary")):
+            errors.append(f'child "{lid}" needs a non-empty summary')
+        it = c.get("issueType")
+        if not _eb_nonempty_str(it) or it.strip().lower() not in EPIC_BUILDER_CHILD_TYPES:
+            errors.append(f'child "{lid}" issueType must be Task or Story (got {it!r})')
+        for b in (c.get("blockedBy") or []):
+            if b == lid:
+                errors.append(f'child "{lid}" cannot block itself')
+            elif b not in idset:
+                errors.append(f'child "{lid}" is blocked by unknown localId {b!r}')
+
+    if _epic_plan_cycle(children, idset):
+        errors.append("dependency cycle among children: "
+                      + ", ".join(_epic_plan_cycle(children, idset)))
+
+    valid_children = [c for c in children
+                      if isinstance(c, dict) and _eb_nonempty_str(c.get("localId"))]
+    if len(valid_children) > 1:
+        final = children[-1] if isinstance(children[-1], dict) else None
+        fid = final.get("localId") if (final and _eb_nonempty_str(final.get("localId"))) else None
+        if fid:
+            fb = set(b for b in (final.get("blockedBy") or []) if b != fid)
+            missing = [c["localId"] for c in valid_children
+                       if c["localId"] != fid and c["localId"] not in fb]
+            if missing:
+                errors.append(f'final child "{fid}" must be blocked by every other '
+                              f'child; missing: {", ".join(missing)}')
+    return errors
+
+
+def epic_plan_link_edges(plan):
+    """The plan's blockedBy edges as (blocker_localId, blocked_localId) pairs, in
+    a deterministic order (child order, then each child's blockedBy order),
+    de-duplicated, self-edges and out-of-plan refs dropped — the edges the Blocks
+    links reproduce (blocker blocks blocked)."""
+    idset = set(_epic_plan_child_ids(plan))
+    edges, seen = [], set()
+    for c in (plan.get("children") or []):
+        if not (isinstance(c, dict) and _eb_nonempty_str(c.get("localId"))):
+            continue
+        blocked = c["localId"]
+        for blocker in (c.get("blockedBy") or []):
+            if not isinstance(blocker, str) or blocker == blocked or blocker not in idset:
+                continue
+            key = (blocker, blocked)
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append(key)
+    return edges
+
+
+class EpicBuilderError(Exception):
+    """A materialization failure that carries exactly what WAS created, so the
+    operator sees a partial epic rather than a silent half-write."""
+
+    def __init__(self, message, created=None):
+        super().__init__(message)
+        self.created = created or {}
+
+
+def materialize_epic_plan(plan, project):
+    """Create the epic + children + Blocks links for a VALIDATED plan in `project`.
+    Returns {epicKey, children:{localId:key}, links:[(blocker,blocked)]}. Raises
+    EpicBuilderError (carrying what was created so far) on any failure — no silent
+    half-epic. Jira-only. Runs OFF the beat (each call is Jira HTTP)."""
+    types = jira_issue_types(project)
+    by_name = {(t.get("name") or "").strip().lower(): t["id"]
+               for t in types if t.get("id")}
+
+    def type_id(name):
+        tid = by_name.get((name or "").strip().lower())
+        if not tid:
+            raise EpicBuilderError(f'project {project} has no "{name}" issue type')
+        return tid
+
+    epic_type = type_id("Epic")
+    created = {"epicKey": None, "children": {}, "links": []}
+
+    epic = plan["epic"]
+    r = create_jira_issue(
+        project, epic_type,
+        (epic.get("summary") or "").strip()[:CREATE_TITLE_MAX_CHARS],
+        (epic.get("description") or "")[:CREATE_DESC_MAX_CHARS], [])
+    created["epicKey"] = r["key"]
+
+    for c in plan["children"]:
+        lid = c["localId"]
+        try:
+            cr = create_jira_issue(
+                project, type_id(c.get("issueType")),
+                (c.get("summary") or "").strip()[:CREATE_TITLE_MAX_CHARS],
+                (c.get("description") or "")[:CREATE_DESC_MAX_CHARS], [],
+                parent=created["epicKey"])
+        except EpicBuilderError:
+            raise
+        except Exception as e:
+            raise EpicBuilderError(f"creating child {lid}: {e}", created)
+        created["children"][lid] = cr["key"]
+
+    for blocker, blocked in epic_plan_link_edges(plan):
+        bk = created["children"].get(blocker)
+        dk = created["children"].get(blocked)
+        if not bk or not dk:
+            continue
+        try:
+            # inwardIssue = the blocker, outwardIssue = the blocked issue — the
+            # direction createBlocksLink verified (XERK-723), so a re-read lists
+            # the blocker in the blocked child's blockedBy.
+            jira_post("/rest/api/3/issueLink", {
+                "inwardIssue": {"key": bk},
+                "outwardIssue": {"key": dk},
+                "type": {"name": JIRA_BLOCKS_LINK_TYPE},
+            })
+        except Exception as e:
+            raise EpicBuilderError(f"linking {blocker}->{blocked}: {e}", created)
+        created["links"].append((blocker, blocked))
+
+    return created
+
+
 # --- Jira ticket sessions ------------------------------------------------------
 # Spawn a session to WORK a ticket: the board's per-card start button. Like the
 # triage above, this runs agent-side because this host is the only place the
@@ -14550,6 +14856,15 @@ class SessionManager:
         # staged-in-the-same-handle_commands-call lifecycle as
         # create_ticket_results.
         self.epic_child_results = []
+        # Epic Builder runs this host is driving (XERK-724), keyed by the hub's
+        # builderId: {id, siteKey, title, idea, repo, state, sessionId,
+        # worktreePath, planFile, plan, project, epicKey, error, materializing,
+        # startedAt, updatedAt}. In-memory (a rare, short-lived run); the hub's
+        # own epicBuilders record is the durable side. Read on the beat to build
+        # epicBuilderStatus, written by the beat (spawn/advance) AND the
+        # materialization worker, so every access is lock-guarded.
+        self.epic_builders = {}
+        self._epic_builders_lock = threading.Lock()
         # Staged {type:"mergePr"} outcomes (XERK-550: PR auto-merge) — each
         # {cmdId, url, ok, error}. Its writer is an OFF-BEAT worker thread
         # (_merge_pr_async runs `gh pr merge`, a blocking network call that must
@@ -18317,8 +18632,14 @@ class SessionManager:
                 f"{self._running_count()}/{MAX_SESSIONS} running, "
                 f"{self._queued_count()} queued"
                 + (f" ticket {ticket['key']}" if ticket else ""))
-            return
+            return sid
         self._provision_session(sess)
+        # The minted session id (queued or provisioned). Returned so a caller that
+        # needs to track the session it just created — the Epic Builder (XERK-724),
+        # which watches the builder session's worktree for the plan — has a handle;
+        # every other caller ignores it, exactly as before (a failed spawn's early
+        # returns above answer None, so a tracking caller can tell it failed).
+        return sid
 
     def _provision_session(self, sess):
         """Bring a session's record to life: add its worktree, launch claude +
@@ -18661,6 +18982,243 @@ class SessionManager:
                    await_clone=await_clone,
                    await_clone_owner=(entry.get("nameWithOwner") if await_clone
                                       else None))
+
+    # --- Epic Builder (XERK-724) ------------------------------------------
+    # spawn_epic_builder runs on the beat (handle_commands) like spawn_ticket;
+    # _advance_epic_builders runs each beat to move a builder from researching ->
+    # creating once its session writes a valid plan; the actual Jira writes run on
+    # a WORKER THREAD (materialize_epic_plan is N+M HTTP calls, so it must not
+    # block the beat past OFFLINE_AFTER_MS, XERK-395). epic_builder_status rides
+    # the heartbeat so the hub advances its durable run record.
+
+    def _set_epic_builder(self, bid, **fields):
+        """Update a builder record under the lock, stamping updatedAt. Bounds the
+        map (oldest updatedAt evicted, never touching an active builder)."""
+        with self._epic_builders_lock:
+            b = self.epic_builders.get(bid)
+            if b is None:
+                return
+            b.update(fields)
+            b["updatedAt"] = time.time()
+            over = len(self.epic_builders) - EPIC_BUILDERS_MAX
+            if over > 0:
+                done = sorted(
+                    (x for x in self.epic_builders.values()
+                     if x.get("state") in ("done", "failed")),
+                    key=lambda x: x.get("updatedAt", 0))
+                for x in done[:over]:
+                    self.epic_builders.pop(x["id"], None)
+
+    def spawn_epic_builder(self, cmd):
+        """Handle a {type:"spawnEpicBuilder"} command (XERK-724): spawn a real
+        builder session that researches the repo and writes an EpicPlan file,
+        tracked so `_advance_epic_builders` can materialize it. Jira-only; every
+        refusal is REPORTED via a failed builder record so the hub's run doesn't
+        sit in `queued` forever (the epicBuilderStatus analogue of _refuse_start).
+        """
+        bid = str(cmd.get("builderId") or "").strip()
+        if not bid:
+            log("spawnEpicBuilder with no builderId — ignored")
+            return
+        site_key = str(cmd.get("siteKey") or "").strip()
+        title = str(cmd.get("title") or "").strip()
+        idea = str(cmd.get("idea") or "")
+        repo_req = str(cmd.get("repo") or "").strip() or None
+
+        def fail(msg):
+            with self._epic_builders_lock:
+                self.epic_builders[bid] = {
+                    "id": bid, "siteKey": site_key, "title": title, "idea": idea,
+                    "repo": repo_req, "state": "failed", "error": msg[:500],
+                    "sessionId": None, "worktreePath": None, "epicKey": None,
+                    "materializing": False, "plan": None, "project": None,
+                    "startedAt": time.time(), "updatedAt": time.time(),
+                }
+            log(f"epic builder {bid} refused: {msg}")
+
+        # Jira-only: the epic parenting + Blocks-link APIs are Jira's, exactly
+        # like createEpicChild/createBlocksLink (an Azure host can't materialize).
+        if not board_configured():
+            return fail("this host has no board credentials")
+        if azure_configured():
+            return fail("the Epic Builder is not supported for Azure DevOps yet")
+
+        # A named repo must be present on this host (the hub validated it was
+        # cloneable, but this host is where the session runs). With no repo, the
+        # builder researches from the repos-root (it can read every repo there).
+        if repo_req:
+            if not any(r["name"] == repo_req for r in scan_repos()):
+                return fail(f"repo {repo_req!r} is not on this host")
+            repo_name = repo_req
+        else:
+            repo_name = ROOT_REPO_NAME
+
+        prompt = build_epic_builder_prompt(title, idea)
+        label = (f"Epic Builder: {title}" if title else "Epic Builder")[:120]
+        # acceptEdits so the session's WRITE of the plan file (in its own cwd) is
+        # auto-approved — research is Read/Grep/Glob (never prompts), so the
+        # builder runs unattended without hanging on a permission dialog.
+        try:
+            sid = self.spawn(repo_name, prompt=prompt, label=label,
+                             permission_mode="acceptEdits")
+        except Exception as e:
+            return fail(f"could not spawn the builder session: {e}")
+        if not sid:
+            return fail("could not spawn the builder session")
+        sess = next((s for s in self.registry if s.get("id") == sid), None)
+        worktree = sess.get("worktreePath") if sess else None
+        with self._epic_builders_lock:
+            self.epic_builders[bid] = {
+                "id": bid, "siteKey": site_key, "title": title, "idea": idea,
+                "repo": repo_name, "state": "researching", "sessionId": sid,
+                "worktreePath": worktree, "planFile": EPIC_BUILDER_PLAN_FILENAME,
+                "epicKey": None, "error": None, "materializing": False,
+                "plan": None, "project": None,
+                "startedAt": time.time(), "updatedAt": time.time(),
+            }
+        log(f"epic builder {bid} spawned session {sid} in {repo_name}")
+
+    def _epic_builder_project(self, plan, site_key):
+        """The Jira project the epic is created in. Prefer an explicit
+        `epic.project` the builder chose; else the MODAL project key across this
+        host's board tickets (`XERK-724` -> `XERK`). Jira-only, so a key always
+        has a `<project>-<n>` shape."""
+        epic = plan.get("epic") if isinstance(plan, dict) else None
+        chosen = epic.get("project") if isinstance(epic, dict) else None
+        if _eb_nonempty_str(chosen):
+            return chosen.strip()
+        counts = {}
+        for t in (self.jira.get("tickets") or []):
+            k = str(t.get("key") or "")
+            if "-" in k:
+                p = k.split("-", 1)[0]
+                if p:
+                    counts[p] = counts.get(p, 0) + 1
+        return max(counts, key=lambda p: counts[p]) if counts else None
+
+    def _advance_epic_builders(self):
+        """Beat-loop sweep: move each researching builder forward. Never raises
+        onto the beat (XERK-395/402). `creating`/`done`/`failed` are the worker's
+        or terminal — only `researching` is advanced here."""
+        try:
+            with self._epic_builders_lock:
+                builders = [dict(b) for b in self.epic_builders.values()
+                            if b.get("state") == "researching"]
+            for b in builders:
+                self._advance_researching_builder(b)
+        except Exception as e:
+            log(f"epic builder advance failed: {e}")
+
+    def _advance_researching_builder(self, b):
+        bid = b["id"]
+        if time.time() - b.get("startedAt", 0) > EPIC_BUILDER_TIMEOUT_SEC:
+            self._set_epic_builder(
+                bid, state="failed",
+                error="the builder timed out before writing a valid plan")
+            self._kill_epic_builder_session(bid, b)
+            return
+        worktree = b.get("worktreePath")
+        plan_path = (os.path.join(worktree, b.get("planFile"))
+                     if worktree and b.get("planFile") else None)
+        plan = None
+        if plan_path and os.path.isfile(plan_path):
+            try:
+                with open(plan_path, "r", encoding="utf-8", errors="replace") as f:
+                    plan = parse_epic_plan(f.read(EPIC_BUILDER_PLAN_MAX_BYTES))
+            except Exception:
+                plan = None  # mid-write / unreadable — try again next beat
+        if plan is None:
+            # No plan yet. If the session is gone, it ended without one -> fail.
+            if not any(s.get("id") == b.get("sessionId") for s in self.registry):
+                self._set_epic_builder(
+                    bid, state="failed",
+                    error="the builder session ended without writing a valid plan")
+            return
+        errors = validate_epic_plan(plan)
+        if errors:
+            self._set_epic_builder(
+                bid, state="failed",
+                error="the builder produced an invalid plan: " + "; ".join(errors[:6]))
+            self._kill_epic_builder_session(bid, b)
+            return
+        project = self._epic_builder_project(plan, b.get("siteKey"))
+        if not project:
+            self._set_epic_builder(
+                bid, state="failed",
+                error="could not determine a Jira project to create the epic in")
+            self._kill_epic_builder_session(bid, b)
+            return
+        # Valid plan -> materialize OFF the beat.
+        self._set_epic_builder(bid, state="creating", plan=plan, project=project)
+        self._start_epic_builder_materialize(bid)
+
+    def _start_epic_builder_materialize(self, bid):
+        """Kick off the materialization worker exactly once for a builder."""
+        with self._epic_builders_lock:
+            b = self.epic_builders.get(bid)
+            if not b or b.get("materializing"):
+                return
+            b["materializing"] = True
+            plan, project = b.get("plan"), b.get("project")
+        try:
+            threading.Thread(
+                target=self._materialize_epic_builder,
+                args=(bid, plan, project), daemon=True).start()
+        except Exception as e:
+            # pids_limit etc. — fail cleanly (safe on the beat, like the merge
+            # worker's synchronous fallback).
+            self._set_epic_builder(
+                bid, state="failed", materializing=False,
+                error=f"could not start materialization: {e}")
+
+    def _materialize_epic_builder(self, bid, plan, project):
+        try:
+            created = materialize_epic_plan(plan, project)
+            self._set_epic_builder(
+                bid, state="done", epicKey=created["epicKey"], materializing=False)
+            log(f"epic builder {bid} created epic {created['epicKey']}")
+        except EpicBuilderError as e:
+            # Carry whatever WAS created (the epic key, if the epic itself landed)
+            # so the operator sees a partial epic, never a silent half-write.
+            self._set_epic_builder(
+                bid, state="failed", materializing=False,
+                epicKey=(e.created or {}).get("epicKey"), error=str(e)[:500])
+            log(f"epic builder {bid} materialization failed: {e}")
+        except Exception as e:
+            self._set_epic_builder(
+                bid, state="failed", materializing=False, error=str(e)[:500])
+            log(f"epic builder {bid} materialization error: {e}")
+        finally:
+            with self._epic_builders_lock:
+                b = dict(self.epic_builders.get(bid) or {})
+            self._kill_epic_builder_session(bid, b)
+
+    def _kill_epic_builder_session(self, bid, b):
+        """Free the builder's session slot once the build is over — best-effort;
+        a failure to kill never fails the build."""
+        sid = (b or {}).get("sessionId")
+        if not sid:
+            return
+        try:
+            if any(s.get("id") == sid for s in self.registry):
+                self.kill(sid)
+        except Exception as e:
+            log(f"epic builder {bid} session kill failed: {e}")
+
+    def epic_builder_status(self):
+        """The per-agent heartbeat field the hub reads to advance its run record
+        (XERK-725): [{id, state, epicKey?, error?}]. `epicKey` rides whenever we
+        have it (done, or a partial-failure epic); `error` only while failed."""
+        out = []
+        with self._epic_builders_lock:
+            for b in self.epic_builders.values():
+                s = {"id": b.get("id"), "state": b.get("state")}
+                if b.get("epicKey"):
+                    s["epicKey"] = b["epicKey"]
+                if b.get("state") == "failed" and b.get("error"):
+                    s["error"] = str(b["error"])[:500]
+                out.append(s)
+        return out
 
     def _remember_closed(self, sess):
         """Record a killed session in the closed history so the hub can offer
@@ -26253,6 +26811,8 @@ class SessionManager:
                 elif ctype == "createBlocksLink":
                     self.create_blocks_link(
                         cid, cmd.get("blockerKey"), cmd.get("blockedKey"))
+                elif ctype == "spawnEpicBuilder":
+                    self.spawn_epic_builder(cmd)
                 elif ctype == "mergePr":
                     self._merge_pr_async(
                         cid, cmd.get("sessionId"), cmd.get("url"))
@@ -27214,6 +27774,10 @@ class SessionManager:
         # reap any finished naming subprocess.
         self._seed_summaries()
         self._poll_summaries()
+        # Move each Epic Builder run forward (XERK-724): read the plan its session
+        # wrote and, once valid, materialize the epic on a worker thread. Guarded
+        # so it never raises onto the beat; the Jira writes are off-beat.
+        self._advance_epic_builders()
         # Confirm recently-sent messages landed, and re-send any a compaction
         # dropped (XERK-47). Cheap on a settled fleet — it short-circuits on any
         # session with an empty outbox.
@@ -27396,6 +27960,12 @@ class SessionManager:
             payload["epicChildResults"] = list(self.epic_child_results)
         if self.blocks_link_results:
             payload["blocksLinkResults"] = list(self.blocks_link_results)
+        # Epic Builder progress (XERK-724): the hub reads this to advance its
+        # durable run record. Omitted when this host is driving no builders (an
+        # absent field reads as "nothing to report", advancing nothing hub-side).
+        eb_status = self.epic_builder_status()
+        if eb_status:
+            payload["epicBuilderStatus"] = eb_status
         # Snapshotted under the lock the merge worker appends under (XERK-550,
         # same shape as spawn_failures below): _clear_delivered_staged removes
         # exactly these delivered entries by identity, so a result the worker
