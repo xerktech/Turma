@@ -1340,3 +1340,81 @@ test("claudeTrajectory: every text/args/result is snippeted, no un-snippeted con
   assert.ok(!JSON.stringify(r).includes(long));
   assert.ok(!JSON.stringify(r).includes("SECRETSIG"));
 });
+
+test("claudeTrajectory: deeply-nested tool content returns JSON, never throws (XERK-714 QA D1)", () => {
+  // A real Read/Bash/MCP result can hold a deeply-nested object that JSON.parse
+  // accepts but JSON.stringify blows the stack on (depth >= ~6000 here). The
+  // fold must snip it to a bounded fallback, not crash. Built as raw text so the
+  // test itself isn't the thing that stringifies (and throws) the deep value.
+  const deepJson = '{"n":'.repeat(6000) + "0" + "}".repeat(6000);
+  const lines = [
+    '{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"go"}}',
+    '{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"m","content":[{"type":"tool_use","id":"c1","name":"Read","input":' + deepJson + "}]}}",
+    '{"type":"user","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":' + deepJson + ',"is_error":false}]}}',
+  ];
+  seedTraj("traj-deep", lines.join("\n") + "\n");
+  let r;
+  assert.doesNotThrow(() => { r = archive.claudeTrajectory("traj-deep"); });
+  assert.ok(r && r.runtime === "claude");
+  const call = r.turns[0].calls[0];
+  assert.ok(call && call.args.length <= 401, "deep input still snipped/bounded");
+  assert.ok(call.result != null && call.result.length <= 401);
+});
+
+test("claudeTrajectory: a duplicate/orphan error tool_result counts errors once (XERK-714 QA D2)", () => {
+  const lines = [
+    JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:00.000Z",
+      message: { role: "user", content: "go" } }),
+    JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:01.000Z",
+      message: { role: "assistant", model: "m", content: [
+        { type: "tool_use", id: "c1", name: "Bash", input: {} }] } }),
+    // two error results for the SAME call, plus an orphan error result
+    JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:02.000Z",
+      message: { role: "user", content: [
+        { type: "tool_result", tool_use_id: "c1", content: "boom", is_error: true }] } }),
+    JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:03.000Z",
+      message: { role: "user", content: [
+        { type: "tool_result", tool_use_id: "c1", content: "boom again", is_error: true },
+        { type: "tool_result", tool_use_id: "nope", content: "orphan", is_error: true }] } }),
+  ];
+  seedTraj("traj-duperr", lines.join("\n") + "\n");
+  const r = archive.claudeTrajectory("traj-duperr");
+  assert.equal(r.totals.errors, 1, "one errored call -> errors:1, not 3");
+  assert.equal(r.turns[0].calls[0].error, true);
+});
+
+test("claudeTrajectory: a finite-but-absurd token count is clamped, totals stay finite (XERK-714 QA D3)", () => {
+  const lines = [
+    JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:00.000Z",
+      message: { role: "user", content: "go" } }),
+    JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:01.000Z", uuid: "a1",
+      message: { role: "assistant", model: "m", id: "a1",
+        content: [{ type: "text", text: "hi" }],
+        usage: { input_tokens: 1e308, output_tokens: 1e308,
+          cache_read_input_tokens: 1e308, cache_creation_input_tokens: 1e308 } } }),
+    JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:02.000Z", uuid: "a2",
+      message: { role: "assistant", model: "m", id: "a2",
+        content: [{ type: "text", text: "yo" }],
+        usage: { input_tokens: 1e308, output_tokens: 5, cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0 } } }),
+  ];
+  seedTraj("traj-bigtok", lines.join("\n") + "\n");
+  const r = archive.claudeTrajectory("traj-bigtok");
+  for (const k of ["input", "output", "cacheRead", "cacheWrite"]) {
+    assert.ok(isFinite(r.totals.tokens[k]), `${k} finite, not Infinity`);
+  }
+  assert.equal(r.totals.tokens.output, 1e15 + 5);  // clamped 1e308 + a real 5
+});
+
+test("claudeTrajectory: an empty-array user content line opens no turn (XERK-714 QA D4)", () => {
+  const lines = [
+    JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:00.000Z",
+      message: { role: "user", content: "real turn" } }),
+    JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:01.000Z",
+      message: { role: "user", content: [] } }),
+  ];
+  seedTraj("traj-empty", lines.join("\n") + "\n");
+  const r = archive.claudeTrajectory("traj-empty");
+  assert.equal(r.totals.turns, 1, "the [] line opens no turn");
+  assert.equal(r.turns[0].user.text, "real turn");
+});

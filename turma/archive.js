@@ -1825,6 +1825,14 @@ function dshTrajectory(transcriptId) {
     s = String(s == null ? "" : s);
     return s.length > DSH_TRAJ_SNIPPET ? s.slice(0, DSH_TRAJ_SNIPPET) + "…" : s;
   };
+  // Guarded so a deeply-nested/cyclic tool argument (byte-for-byte arbitrary
+  // session content) cannot blow the stack and crash the fold (XERK-714 QA).
+  const dshArgStr = (v) => {
+    if (typeof v === "string") return v;
+    if (v == null) return "";
+    try { const s = JSON.stringify(v); return typeof s === "string" ? s : String(v); }
+    catch { return "[unserializable]"; }
+  };
   const turnsMap = new Map();  // turn number -> object
   const order = [];            // turn numbers, first-seen order
   const stepsSeen = new Set(); // "<turn>/<step>"
@@ -1876,8 +1884,7 @@ function dshTrajectory(transcriptId) {
           name: String(d.name || "?"),
           callId: d.callId != null ? String(d.callId) : null,
           at: time, ok: null, error: false,
-          args: snip(typeof d.arguments === "string"
-            ? d.arguments : JSON.stringify(d.arguments == null ? "" : d.arguments)),
+          args: snip(dshArgStr(d.arguments)),
         });
         calls++;
       } else callsDropped++;
@@ -1953,8 +1960,14 @@ const TRAJ_SNIPPET = DSH_TRAJ_SNIPPET;        // per text/args/result snippet (=
 // QWEN_STORE_DIRNAME) — the fallback when no projected <sid>.jsonl is present.
 const TRAJ_QWEN_STORE_DIRNAME = "qwen";
 
+// Token counts are agent-supplied: reject NaN/Infinity/negative, and CLAMP a
+// finite-but-absurd value (a crafted 1e308) so summing many turns can never
+// overflow the totals to a bogus Infinity — 1e15 is orders of magnitude above
+// any real session and stays finite when multiplied by the turn cap.
+const TRAJ_TOKEN_MAX = 1e15;
 function trajNum(x) {
-  return (typeof x === "number" && isFinite(x) && x >= 0) ? Math.floor(x) : 0;
+  if (typeof x !== "number" || !isFinite(x) || x < 0) return 0;
+  return Math.min(Math.floor(x), TRAJ_TOKEN_MAX);
 }
 
 // ISO-8601 timestamp string -> epoch ms, or null. Both the Claude raw and Qwen
@@ -2024,7 +2037,16 @@ function claudeTrajectory(transcriptId) {
     s = String(s == null ? "" : s);
     return s.length > TRAJ_SNIPPET ? s.slice(0, TRAJ_SNIPPET) + "…" : s;
   };
-  const asStr = (v) => (typeof v === "string" ? v : JSON.stringify(v == null ? "" : v));
+  // Stringify a tool-call input/result for snipping. The value is byte-for-byte
+  // arbitrary archived content, so JSON.stringify can BLOW THE STACK on a deeply
+  // nested object (a real Read/Bash/MCP result can hold one) or throw on a cycle
+  // — guard it and fall back to a bounded string rather than crashing the fold.
+  const asStr = (v) => {
+    if (typeof v === "string") return v;
+    if (v == null) return "";
+    try { const s = JSON.stringify(v); return typeof s === "string" ? s : String(v); }
+    catch { return "[unserializable]"; }
+  };
 
   const turns = [];            // in first-seen order; 1-based `turn` set at open
   let cur = null;              // the turn open entries attach to
@@ -2060,16 +2082,17 @@ function claudeTrajectory(transcriptId) {
     calls++;
   };
   // Close a call by id with its result. `isError` is authoritative (a Qwen
-  // toolCallResult.status or a Claude tool_result.is_error); errors are counted
-  // whether or not the opening call is still in-window.
+  // toolCallResult.status or a Claude tool_result.is_error). Count the error ONCE,
+  // on the transition — a duplicate or orphan result (no in-window call) must not
+  // inflate totals.errors, which tracks errored CALLS.
   const closeCall = (id, resultText, isError, time) => {
-    if (isError) totals.errors++;
     if (id == null) return;
     const call = callsById.get(String(id));
     if (!call || call.ok !== null) return;
     call.ok = !isError; call.error = !!isError;
     call.result = snip(resultText);
     call.durationMs = (call.at != null && time != null) ? Math.max(0, time - call.at) : null;
+    if (isError) totals.errors++;
   };
 
   const addUsage = (key, u) => {
@@ -2135,10 +2158,11 @@ function claudeTrajectory(transcriptId) {
       if (typeof c === "string") {
         if (c.trim()) openTurn(time, c);
       } else if (Array.isArray(c)) {
-        const isToolResultOnly = c.length > 0 && c.every((b) => b && b.type === "tool_result");
-        if (!isToolResultOnly) {
-          const txt = c.filter((b) => b && b.type === "text").map((b) => b.text || "").join("");
-          openTurn(time, txt);
+        // A real user turn carries text; a line that is only tool_result blocks
+        // (or empty) never opens one — it just correlates results below.
+        const textBlocks = c.filter((b) => b && b.type === "text");
+        if (textBlocks.length) {
+          openTurn(time, textBlocks.map((b) => b.text || "").join(""));
         }
         for (const b of c) {
           if (b && b.type === "tool_result") {
