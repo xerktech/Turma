@@ -109,6 +109,7 @@ import com.xerktech.turma.core.EpicChild
 import com.xerktech.turma.core.EpicChildStatus
 import com.xerktech.turma.core.EpicRunView
 import com.xerktech.turma.core.epicRunOf
+import com.xerktech.turma.core.TICKET_ORDER
 import com.xerktech.turma.core.epicRunView
 import com.xerktech.turma.core.isEpicTicket
 import com.xerktech.turma.core.filterSites
@@ -284,7 +285,9 @@ fun BoardScreen(
                     // The client-only Triage lane (XERK-486) leads the strip;
                     // the four tracker columns follow it unchanged.
                     for ((cat, title) in (listOf("triage" to "Triage") + BOARD_CATEGORIES)) {
-                        // Newest-updated first, matching board.js `ticketSort`; a
+                        // Epics float to the top of every column, then newest-updated
+                        // first within each group — matching board.js `ticketSort`
+                        // (sortedWith is stable, so same-group order is preserved). A
                         // live drag override lands the card in its dropped column,
                         // and (XERK-486) untriaged/held To Do tickets sit in the
                         // Triage lane unless a live drag overrides them.
@@ -298,7 +301,7 @@ fun BoardScreen(
                                     ) == cat
                                 }
                                 .map { site to it } }
-                            .sortedByDescending { it.second.updated }
+                            .sortedWith(compareBy(TICKET_ORDER) { it.second })
                         KanbanColumn(
                             cat, title, cards, colorMap, now,
                             sessionIndex = sessionIndex,
