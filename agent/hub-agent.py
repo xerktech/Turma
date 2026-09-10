@@ -13536,6 +13536,35 @@ def _issue_already_blocks(issue, blocked_key):
     return False
 
 
+def _issue_already_duplicates(issue, twin_key):
+    """True when the fetched issue ALREADY has a "Duplicate" link naming
+    `twin_key` on EITHER side (XERK-729 idempotency).
+
+    Scans the raw `issuelinks` UNCAPPED (like _issue_already_blocks, not via
+    _shape_issue_links whose JIRA_LINKS_MAX cap could hide the pair). Unlike the
+    directional Blocks check, a Duplicate link is treated SYMMETRICALLY: a
+    Duplicate link between the two in either direction means they are already
+    linked, so it matches `twin_key` as the inwardIssue OR the outwardIssue —
+    the point is to never POST a second link. Total: a malformed field reads as
+    "not linked", never raises."""
+    fields = issue.get("fields") if isinstance(issue, dict) else None
+    links = fields.get("issuelinks") if isinstance(fields, dict) else None
+    if not isinstance(links, list):
+        return False
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        ltype = link.get("type")
+        if not isinstance(ltype, dict) or \
+                (ltype.get("name") or "") != JIRA_DUPLICATE_LINK_TYPE:
+            continue
+        for side in ("inwardIssue", "outwardIssue"):
+            end = link.get(side)
+            if isinstance(end, dict) and end.get("key") == twin_key:
+                return True
+    return False
+
+
 # The normalized priority band a triage assessment carries (XERK-481); the
 # tracker's own label rides separately as `priorityName`.
 TRIAGE_PRIORITIES = ("P0", "P1", "P2", "P3")
@@ -15338,30 +15367,36 @@ class SessionManager:
 
         # Live links first: if the pair is already linked as Duplicate in Jira
         # (by this host or anyone), that is the terminal state — record it and
-        # stop, no relink.
+        # stop, no relink. The read is the same issue GET the board's
+        # _shape_issue uses (fields=issuelinks) — NOT a /issue/{key}/links
+        # resource, which is not a Jira Cloud REST v3 endpoint (404). Params
+        # MUST be a dict, never None (urlencode(None) raises), and the response
+        # is {fields:{issuelinks:[...]}}, not a bare list — _issue_already_
+        # duplicates scans it UNCAPPED (XERK-729).
         try:
-            links = jira_get(f"/rest/api/3/issue/{urllib.parse.quote(k)}/links", None)
+            issue = jira_get(
+                f"/rest/api/3/issue/{urllib.parse.quote(k)}",
+                {"fields": "issuelinks"})
         except Exception as e:
             log(f"link check {k}: {e}")
             stage(err=str(e)[:200])
             return
-        for link in (links if isinstance(links, list) else []):
-            lt = (link or {}).get("linkType") or {}
-            inward = (link or {}).get("inwardIssue") or {}
-            if lt.get("name") == JIRA_DUPLICATE_LINK_TYPE and inward.get("key") == twin:
-                self._record_duplicate_link(lkey, twin)
-                stage(ok=True, action="no-op")
-                return
+        if _issue_already_duplicates(issue, twin):
+            self._record_duplicate_link(lkey, twin)
+            stage(ok=True, action="no-op")
+            return
         if self.duplicate_links.get(lkey) == twin:
             # This host linked the pair and it is gone from Jira: a human
             # removed it. Do not relink — the reversal is sticky.
             stage(ok=True, action="skipped")
             return
         try:
+            # Jira Cloud POST /rest/api/3/issueLink requires the key `type`
+            # (not `linkType`, which yields 400 "The link type is required").
             jira_post("/rest/api/3/issueLink", {
                 "inwardIssue": {"key": twin},
                 "outwardIssue": {"key": k},
-                "linkType": {"name": JIRA_DUPLICATE_LINK_TYPE},
+                "type": {"name": JIRA_DUPLICATE_LINK_TYPE},
             })
         except Exception as e:
             log(f"issueLink {k} -> {twin}: {e}")
