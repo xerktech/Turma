@@ -5490,7 +5490,17 @@ PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 # leading path segments cover nested groups and a subpath install alike. A
 # plain `git push`'s "to create a merge request … visit" hint ends in
 # /merge_requests/new, which the \d+ deliberately doesn't match.
-MR_URL_RE = re.compile(r"https://[\w.-]+(?::\d+)?(?:/[\w.-]+)+/-/merge_requests/\d+")
+#
+# http as well as https (XERK-741): a self-hosted GitLab is routinely served
+# over plain http on a LAN, so `glab mr create` / `git push -o
+# merge_request.create` prints an http:// MR URL — and a scheme-only mismatch
+# dropped its chip in SILENCE, never even attributing the MR. This mirrors the
+# http support AZDO_PR_URL_RE already carries for the same on-prem reason, and
+# the scheme-agnostic host match _mr_url_parts was built for (its own comment
+# notes an http:// GITLAB_URL) — dead for http URLs while this gate rejected
+# them upstream. The `/-/merge_requests/<n>` infix is still the discriminator,
+# so widening the scheme can't misattribute a GitHub or ADO URL.
+MR_URL_RE = re.compile(r"https?://[\w.-]+(?::\d+)?(?:/[\w.-]+)+/-/merge_requests/\d+")
 # An Azure DevOps pull request's URL, on Services or a self-hosted collection
 # (XERK-226): the `/_git/<repo>/` repository namespace plus `pullrequest/<n>`.
 # The leading segments cover the org/collection, a subpath install, and the
