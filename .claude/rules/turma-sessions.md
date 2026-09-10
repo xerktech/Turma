@@ -106,6 +106,19 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
   Refresh). The dsh-web-through-tunnel PROXY path is ruled out (`dsh web` has no base-path flag).
   Web-first; Android/glasses in `android/PARITY.md`. Tests: `dshTrajectory` in `archive.test.js`,
   `/api/dsh/<id>/trajectory` in `server.test.js`.
+- **The Trajectory view is GENERALIZING to Claude/Qwen — one shape, one renderer, three runtimes**
+  (epic XERK-712). The shared **`GET /api/archive/<transcriptId>/trajectory`** (XERK-715) dispatches
+  by runtime off the ARCHIVED data (so it answers for an offline/removed host): `dshTrajectory` for
+  dsh, `claudeTrajectory` for a claude/qwen raw `<id>.jsonl`, else a degraded rendered fallback. The
+  shape is a SUPERSET of the dsh-only `/api/dsh/<id>/trajectory` output — do not fork a second shape.
+  - **Running = PARTIAL, ended = FULL.** An ENDED claude/qwen session serves its RAW layer (full,
+    per-turn `model` + `tokens`); a RUNNING one has deferred its raw sidecars (`agent-archive.md`,
+    `defer_raw`), so the route folds the RENDERED layer instead — flagged `partial:true` with every
+    `tokens`/`model` null (NOT faked; live enrichment is XERK-716). dsh ships raw LIVE (no
+    `defer_raw`), so it is FULL whether running or ended.
+  - **The web pane that consumes this beside "Terminal ▸" for a live claude/qwen session is XERK-717
+    (in progress); today only the dsh pane above is wired in `sessions.html`.** Shape / reducer /
+    contract invariants: `.claude/rules/trajectory.md` + `docs/trajectory-contract.md`.
 - **A dsh session's chat header also shows a "dsh web ↗" link** (XERK-501) to the host's single
   host-wide `dsh web` (direct-access viewer over the shared store, `dsh-input.md`) — shown only when
   the host reports a reachable `dsh.web.url` (a loopback-only host reports `null`, link stays hidden).

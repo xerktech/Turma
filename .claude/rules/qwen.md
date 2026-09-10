@@ -346,6 +346,10 @@ WHO writes the native log into the store.
 - **The native log is never double-counted in usage** — `<sid>/qwen/chat.jsonl` is neither a top-level
   `*.jsonl` nor under `subagents/`, so `_project_transcripts` skips it; the projection is the single
   counted copy. **Do not teach the walk to read `<sid>/qwen/`.**
+- **The generalized Trajectory (epic XERK-712) reads a qwen session's PROJECTED `<id>.jsonl` via the
+  shared `claudeTrajectory` reducer** (`.claude/rules/trajectory.md`) — same fold as Claude, branching
+  per line on `message.parts`; ended = full (raw), running = degraded rendered fallback (raw
+  deferred, `partial:true`). No qwen-specific trajectory code.
 - **No beat-loop budget regression** — the mirror runs on the tail's own daemon thread (never the
   beat, never raising), and archive sync stays on the sync worker (XERK-395).
 - Tests: `TestQwenArchiveSync` (manifest + both delta pushes over the real projector/corpus) and the
