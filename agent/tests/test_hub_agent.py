@@ -25798,8 +25798,9 @@ class TestSetTicketPriority(ManagerMixin, unittest.TestCase):
 
 class TestCreateDuplicateLink(ManagerMixin, unittest.TestCase):
     """XERK-484: createDuplicateLink links two Jira issues as duplicates.
-    Idempotent via live GET-links read + local ledger for sticky reversal.
-    Jira-only; Azure boards are refused. Results stage into
+    Idempotent via a live issue GET (fields=issuelinks) + local ledger for
+    sticky reversal (XERK-729 fixed the endpoint, the None params and the POST
+    field). Jira-only; Azure boards are refused. Results stage into
     ticket_link_results keyed by cmdId."""
 
     def _jira(self):
@@ -25818,7 +25819,8 @@ class TestCreateDuplicateLink(ManagerMixin, unittest.TestCase):
 
         def fake_jira_get(path, params):
             seen["get_path"] = path
-            return []  # no existing links
+            seen["get_params"] = params
+            return {"fields": {"issuelinks": []}}  # no existing links
 
         def fake_jira_post(path, body):
             seen["post_path"] = path
@@ -25828,13 +25830,16 @@ class TestCreateDuplicateLink(ManagerMixin, unittest.TestCase):
              mock.patch.object(ha, "jira_get", fake_jira_get), \
              mock.patch.object(ha, "jira_post", fake_jira_post):
             sm.create_duplicate_link("c1", "ENG-9", "ENG-8")
-        self.assertEqual(seen["get_path"],
-                         "/rest/api/3/issue/ENG-9/links")
+        # XERK-729: the live read is the issue GET (fields=issuelinks), NOT the
+        # non-existent /issue/{key}/links resource; params is a dict, never None.
+        self.assertEqual(seen["get_path"], "/rest/api/3/issue/ENG-9")
+        self.assertEqual(seen["get_params"], {"fields": "issuelinks"})
         self.assertEqual(seen["post_path"], "/rest/api/3/issueLink")
+        # The POST carries the key `type`, not `linkType` (400 otherwise).
         self.assertEqual(seen["post_body"], {
             "inwardIssue": {"key": "ENG-8"},
             "outwardIssue": {"key": "ENG-9"},
-            "linkType": {"name": "Duplicate"},
+            "type": {"name": "Duplicate"},
         })
         r = sm.ticket_link_results[0]
         self.assertEqual((r["cmdId"], r["key"], r["twinKey"], r["siteKey"],
@@ -25854,14 +25859,16 @@ class TestCreateDuplicateLink(ManagerMixin, unittest.TestCase):
         def fake_jira_post(path, body):
             calls.append((path, body))
             return {}
-        live_links = [
-            {"linkType": {"name": "Blocks"},
+        # The real issue GET shape: {fields:{issuelinks:[...]}} with the `type`
+        # key (XERK-729). The Duplicate link names the twin on either side.
+        live_issue = {"fields": {"issuelinks": [
+            {"type": {"name": "Blocks"},
              "inwardIssue": {"key": "ENG-7"}},
-            {"linkType": {"name": "Duplicate"},
+            {"type": {"name": "Duplicate"},
              "inwardIssue": {"key": "ENG-8"}},
-        ]
+        ]}}
         with self._jira(), \
-             mock.patch.object(ha, "jira_get", return_value=live_links), \
+             mock.patch.object(ha, "jira_get", return_value=live_issue), \
              mock.patch.object(ha, "jira_post", fake_jira_post):
             sm.create_duplicate_link("c1", "ENG-9", "ENG-8")
         self.assertEqual(calls, [])  # no POST — the live link is terminal
@@ -25870,6 +25877,41 @@ class TestCreateDuplicateLink(ManagerMixin, unittest.TestCase):
         # Ledger should record it so future sweeps see it
         self.assertEqual(
             sm.duplicate_links["s.atlassian.net/ENG-9"], "ENG-8")
+
+    def test_noop_when_twin_on_outward_side(self):
+        """A Duplicate link is symmetric for idempotency: the twin appearing on
+        the link's OUTWARD side (viewed issue is the "is duplicated by" end) is
+        just as terminal — no second POST (XERK-729)."""
+        sm = self.make_manager()
+        live_issue = {"fields": {"issuelinks": [
+            {"type": {"name": "Duplicate"},
+             "outwardIssue": {"key": "ENG-8"}},
+        ]}}
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=live_issue), \
+             mock.patch.object(ha, "jira_post") as post:
+            sm.create_duplicate_link("c1", "ENG-9", "ENG-8")
+        post.assert_not_called()
+        self.assertEqual(sm.ticket_link_results[0]["action"], "no-op")
+
+    def test_duplicate_link_to_a_different_issue_is_not_a_match(self):
+        """A Duplicate link naming a DIFFERENT issue must NOT read as the twin
+        already being linked — the scan compares the exact twin key, so this
+        proceeds to the POST rather than a wrong no-op (XERK-729 regression
+        guard for the either-side match)."""
+        sm = self.make_manager()
+        posts = []
+        live_issue = {"fields": {"issuelinks": [
+            {"type": {"name": "Duplicate"},
+             "inwardIssue": {"key": "ENG-7"}},  # a different twin
+        ]}}
+        with self._jira(), \
+             mock.patch.object(ha, "jira_get", return_value=live_issue), \
+             mock.patch.object(ha, "jira_post",
+                               side_effect=lambda p, b: posts.append(b) or {}):
+            sm.create_duplicate_link("c1", "ENG-9", "ENG-8")
+        self.assertEqual(len(posts), 1)  # not a no-op — it linked
+        self.assertEqual(sm.ticket_link_results[0]["action"], "linked")
 
     def test_sticky_skip_on_human_reversal(self):
         """Ledger says we linked this pair, but live read shows no link —
@@ -25985,8 +26027,9 @@ class TestCreateDuplicateLink(ManagerMixin, unittest.TestCase):
         for i in range(ha.DUPLICATE_LINK_LEDGER_MAX):
             sm.duplicate_links["s.atlassian.net/OLD-%d" % i] = "ENG-8"
         # Re-confirm the oldest pair through the live no-op path.
-        live = [{"linkType": {"name": "Duplicate"},
-                 "inwardIssue": {"key": "ENG-8"}}]
+        live = {"fields": {"issuelinks": [
+            {"type": {"name": "Duplicate"},
+             "inwardIssue": {"key": "ENG-8"}}]}}
         with self._jira(), \
              mock.patch.object(ha, "jira_get", return_value=live):
             sm.create_duplicate_link("c1", "OLD-0", "ENG-8")

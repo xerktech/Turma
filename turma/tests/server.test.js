@@ -167,6 +167,10 @@ test.afterEach(() => {
   // 15s sweep churning `agents` the same way a leaked opt-in did. Drop them too.
   for (const k of Object.keys(epicRuns)) delete epicRuns[k];
   epicDoneWritten.clear();
+  // XERK-725: a leaked QUEUED builder run is a second reason the live 15s sweep
+  // dispatches (epicBuilderDriveSweep), so it would churn `agents` the same way a
+  // leaked armed epic run does. Drop them too.
+  for (const k of Object.keys(epicBuilders)) delete epicBuilders[k];
 });
 // notify() no-ops when no device is registered; register one so the alert tests
 // see the fan-out. Real fan-out/pruning is exercised separately below.
@@ -192,6 +196,9 @@ const {
   autoStopped, autoStopResumeExempt, autoStartOrgs, setAutoStartOrg,
   epicRuns, armEpicRun, clearEpicRun, setEpicRunPaused, buildEpicWaves, epicChildRows,
   isEpicOrEpicChild, sanitizeEpicRunRecord,
+  epicBuilders, armEpicBuilder, clearEpicBuilder, advanceEpicBuilder,
+  ingestEpicBuilderStatus, epicBuilderDriveSweep, sanitizeEpicBuilderRecord,
+  normalizeEpicBuilderStatus, EPIC_BUILDER_STATES, EPIC_BUILDER_IDEA_MAX,
   epicRunDriveSweep, epicChildBlockersDone, epicRunAllChildrenDone, epicChildAttempts,
   epicRunChildSession, anyArmedEpicRun, epicRunCompleteSweep, epicDoneWritten,
   autoMergeSweep, autoCloseSweep, prAutoMergeReady, epicNoCiSeen, PR_NO_CI_GRACE_MS,
@@ -3329,6 +3336,84 @@ test("http: GET /api/dsh/<id>/trajectory parses the native log (XERK-498)", asyn
   assert.equal(r.body.turns[0].calls[0].ok, true);
   // A session with no dsh native log answers 404 — the client shows "no trajectory".
   assert.equal((await request("GET", "/api/dsh/nope/trajectory", { headers: userHeaders })).status, 404);
+});
+
+test("http: GET /api/archive/<id>/trajectory dispatches by runtime, degrades while running (XERK-715)", async () => {
+  const meta = { remoteKey: "github.com/xerk/turma", repo: "turma", slug: "-w-ab" };
+  const ingest = (id, entries, size) => request("POST", `/api/agents/nas/archive/${id}`,
+    { body: { startOffset: 0, endOffset: size, size, meta, entries }, headers: agentHeaders });
+
+  // --- ENDED claude -> FULL trajectory (tokens + model + timings) ---
+  // The rendered row must exist first (ingestRaw skips a transcript with no
+  // filePath), then the raw <id>.jsonl is the Claude transcript claudeTrajectory folds.
+  await ingest("trajc", [{ uuid: "e1", role: "user", ts: "2026-07-11T00:00:00Z", text: "hello" }], 60);
+  const claudeRaw = [
+    '{"type":"user","timestamp":"2026-07-11T00:00:00Z","message":{"role":"user","content":"hello"}}',
+    '{"type":"assistant","timestamp":"2026-07-11T00:00:05Z","message":{"role":"assistant","model":"claude-x",' +
+      '"content":[{"type":"text","text":"hi there"}],' +
+      '"usage":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}',
+  ].join("\n") + "\n";
+  assert.equal((await rawPush("nas", "trajc", "trajc.jsonl", 0, gz(claudeRaw), agentHeaders)).status, 200);
+
+  assert.equal((await request("GET", "/api/archive/trajc/trajectory")).status, 401, "user-authed");
+  const full = await request("GET", "/api/archive/trajc/trajectory", { headers: userHeaders });
+  assert.equal(full.status, 200);
+  assert.equal(full.body.partial, false, "an ended session with a raw layer is FULL, not partial");
+  assert.equal(full.body.runtime, "claude");
+  assert.equal(full.body.model, "claude-x");
+  assert.equal(full.body.totals.turns, 1);
+  assert.equal(full.body.totals.tokens.input, 10);
+  assert.equal(full.body.totals.tokens.output, 3);
+  assert.equal(full.body.turns[0].user.text, "hello");
+
+  // --- RUNNING claude/qwen -> DEGRADED trajectory from the rendered layer ---
+  // No raw push: the raw layer is deferred while running, so claudeTrajectory()
+  // returns null and the route folds the rendered entries instead.
+  const renderedEntries = [
+    { uuid: "r1", role: "user", ts: "2026-07-11T01:00:00Z", text: "do the thing",
+      blocks: [{ t: "text", text: "do the thing" }] },
+    { uuid: "r2", role: "assistant", ts: "2026-07-11T01:00:02Z", text: "on it",
+      blocks: [{ t: "thinking", text: "planning" }, { t: "text", text: "on it" },
+               { t: "tool_use", name: "Bash", input: "ls", id: "u1" }] },
+    { uuid: "r3", role: "user", ts: "2026-07-11T01:00:04Z", text: "",
+      blocks: [{ t: "tool_result", text: "a.txt b.txt", forId: "u1" }] },
+  ];
+  await ingest("trajr", renderedEntries, 400);
+  const deg = await request("GET", "/api/archive/trajr/trajectory", { headers: userHeaders });
+  assert.equal(deg.status, 200);
+  assert.equal(deg.body.partial, true, "a rendered-only (running) session is DEGRADED");
+  assert.equal(deg.body.totals.tokens, null, "tokens are unknowable from the rendered layer -> null");
+  assert.equal(deg.body.runtime, "claude");                 // no live session -> default hint
+  assert.equal(deg.body.totals.turns, 1);
+  assert.equal(deg.body.totals.toolCalls, 1);
+  assert.equal(deg.body.turns[0].user.text, "do the thing");
+  assert.equal(deg.body.turns[0].tokens, null);
+  assert.equal(deg.body.turns[0].model, null);
+  assert.ok(deg.body.turns[0].output.some((o) => o.kind === "thinking"));
+  assert.ok(deg.body.turns[0].output.some((o) => o.kind === "text" && o.text === "on it"));
+  assert.equal(deg.body.turns[0].calls[0].name, "Bash");
+  assert.equal(deg.body.turns[0].calls[0].ok, true);        // correlated by tool_use id <-> forId
+  assert.equal(deg.body.turns[0].calls[0].result, "a.txt b.txt");
+
+  // --- unknown / not-yet-synced id -> 404 ---
+  assert.equal(
+    (await request("GET", "/api/archive/never-archived/trajectory", { headers: userHeaders })).status, 404);
+
+  // --- a dsh session STILL routes to dshTrajectory (no regression) ---
+  await ingest("trajd", [{ uuid: "d1", role: "user", ts: "2026-07-11T02:00:00Z", text: "x" }], 40);
+  const dshEvents = [
+    '{"type":"session/title","seq":1,"time":1000,"data":{"title":"dsh via archive route"}}',
+    '{"type":"turn/start","seq":2,"time":1000,"data":{"turn":1}}',
+    '{"type":"tool/call","seq":3,"time":1100,"data":{"turn":1,"callId":"c1","name":"bash","arguments":{"command":"ls"}}}',
+    '{"type":"turn/end","seq":4,"time":1200,"data":{"turn":1,"reason":{"kind":"completed"}}}',
+  ].join("\n") + "\n";
+  assert.equal((await rawPush("nas", "trajd", "trajd/dsh/events.jsonl", 0, gz(dshEvents), agentHeaders)).status, 200);
+  const dsh = await request("GET", "/api/archive/trajd/trajectory", { headers: userHeaders });
+  assert.equal(dsh.status, 200);
+  assert.equal(dsh.body.runtime, "dsh");
+  assert.equal(dsh.body.partial, false);
+  assert.equal(dsh.body.title, "dsh via archive route");
+  assert.equal(dsh.body.turns[0].calls[0].name, "bash");
 });
 
 test("http: a full chunk of INCOMPRESSIBLE bytes still fits the wire cap", async () => {
@@ -11684,6 +11769,256 @@ test("XERK-635: an armed run survives a hub restart (read back from its own file
   } finally {
     fs.unlinkSync(file);
   }
+});
+
+// ---- Epic Builder: hub route + dispatch + run tracking (XERK-725) -----------
+// The operator hands the hub an IDEA; the hub creates a durable builder run and
+// dispatches a builder session to a capable host through the SAME findTicketHost
+// the Start button uses (capacity/backpressure/host-selection inherited), then
+// advances the run from the host's per-beat status report. The run rides its own
+// /data store + top-level payload key + SSE frame, mirroring epicRuns' lifecycle.
+
+const resetEpicBuilders = () => {
+  for (const k of Object.keys(epicBuilders)) delete epicBuilders[k];
+};
+
+// A host reporting an org with the Turma repo. `capacity` absent = "can't tell" =
+// a free slot (so a dispatch always finds a host); pass {free:0} to make it full.
+const builderBeat = (device, site, { capacity } = {}) => request("POST", "/api/heartbeat", {
+  body: {
+    device,
+    repos: [{ name: "Turma", path: "/git/Turma" }],
+    ...(capacity ? { capacity } : {}),
+    jira: { available: true, configured: true, siteKey: site, user: `${device}@x.com`,
+      fetchedAt: "2026-07-14T12:00:00Z", tickets: [] },
+  },
+  headers: agentHeaders,
+});
+
+test("XERK-725: epic-builder route validates input, idea length, org and repo", async () => {
+  resetEpicBuilders();
+  await builderBeat("ebVal", "eb1.atlassian.net");
+  // Missing / empty title and idea are bad requests (400).
+  let r = await request("POST", "/api/jira/eb1.atlassian.net/epic-builder",
+    { body: { idea: "do a thing" }, headers: userHeaders });
+  assert.equal(r.status, 400);
+  r = await request("POST", "/api/jira/eb1.atlassian.net/epic-builder",
+    { body: { title: "T", idea: "   " }, headers: userHeaders });
+  assert.equal(r.status, 400);
+  // An oversize idea is a SIZE refusal (413), not a malformed one.
+  r = await request("POST", "/api/jira/eb1.atlassian.net/epic-builder",
+    { body: { title: "T", idea: "x".repeat(EPIC_BUILDER_IDEA_MAX + 1) }, headers: userHeaders });
+  assert.equal(r.status, 413);
+  // No host reports the org -> 404.
+  r = await request("POST", "/api/jira/nobody725.atlassian.net/epic-builder",
+    { body: { title: "T", idea: "go" }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  // A named repo no host of the org reports is not cloneable -> 404.
+  r = await request("POST", "/api/jira/eb1.atlassian.net/epic-builder",
+    { body: { title: "T", idea: "go", repo: "NoSuchRepo" }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  // A named targetHost that does not report the org -> 404.
+  r = await request("POST", "/api/jira/eb1.atlassian.net/epic-builder",
+    { body: { title: "T", idea: "go", targetHost: "ghost" }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  // A bad-TYPED repo/targetHost is a 400, never silently coerced to "absent" and
+  // accepted with the operator's intended pin dropped (QA F1).
+  for (const bad of [5, ["x"], { a: 1 }]) {
+    r = await request("POST", "/api/jira/eb1.atlassian.net/epic-builder",
+      { body: { title: "T", idea: "go", repo: bad }, headers: userHeaders });
+    assert.equal(r.status, 400, `repo:${JSON.stringify(bad)} must 400`);
+    r = await request("POST", "/api/jira/eb1.atlassian.net/epic-builder",
+      { body: { title: "T", idea: "go", targetHost: bad }, headers: userHeaders });
+    assert.equal(r.status, 400, `targetHost:${JSON.stringify(bad)} must 400`);
+  }
+  // No refusal created a run.
+  assert.equal(Object.keys(epicBuilders).length, 0);
+});
+
+test("XERK-726: the route accepts a LISTED-but-uncloned repo (clone-on-demand), not just on-disk ones", async () => {
+  // The board composer offers uncloned repos (flagged "(not cloned)") off the
+  // org's jira.repoOptions, exactly as the manual Start/repo pickers do, and
+  // dispatch clones on demand. orgReportsRepo must therefore accept a repo LISTED
+  // in repoOptions even when no host has it on disk — checking only the on-disk
+  // `repos[]` 404'd every uncloned pick the UI presents (QA seam defect).
+  resetEpicBuilders();
+  // The host has "Turma" cloned (repos[]) and lists an uncloned "acme/api"
+  // (repoOptions only) — the shape the composer draws from.
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "ebListed",
+      repos: [{ name: "Turma", path: "/git/Turma" }],
+      jira: { available: true, configured: true, siteKey: "eb726.atlassian.net",
+        user: "ebListed@x.com", fetchedAt: "2026-07-14T12:00:00Z", tickets: [],
+        repoOptions: [{ name: "Turma", cloned: true }, { name: "acme/api", cloned: false }] },
+    },
+    headers: agentHeaders,
+  });
+  // A cloned repo -> 200.
+  let r = await request("POST", "/api/jira/eb726.atlassian.net/epic-builder",
+    { body: { title: "T", idea: "go", repo: "Turma" }, headers: userHeaders });
+  assert.equal(r.status, 200, "a cloned repo is accepted");
+  assert.equal(r.body.run.repo, "Turma");
+  // A listed-but-uncloned repo -> 200 (clone-on-demand), NOT a 404.
+  r = await request("POST", "/api/jira/eb726.atlassian.net/epic-builder",
+    { body: { title: "T", idea: "go", repo: "acme/api" }, headers: userHeaders });
+  assert.equal(r.status, 200, "a listed-but-uncloned repo is accepted, not 404'd");
+  assert.equal(r.body.run.repo, "acme/api");
+  // A repo in NEITHER set is still not cloneable -> 404.
+  r = await request("POST", "/api/jira/eb726.atlassian.net/epic-builder",
+    { body: { title: "T", idea: "go", repo: "nope/nope" }, headers: userHeaders });
+  assert.equal(r.status, 404, "a repo no host reports (cloned or listed) is still 404");
+});
+
+test("XERK-725: arming a builder dispatches to a findTicketHost pick and rides the payload", async () => {
+  resetEpicBuilders();
+  await builderBeat("ebDisp", "eb2.atlassian.net");
+  agents.ebDisp.commands = [];
+  const r = await request("POST", "/api/jira/eb2.atlassian.net/epic-builder",
+    { body: { title: "Ship X", idea: "Expand into an epic" }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  const id = r.body.run.id;
+  assert.ok(id, "a builder id was minted");
+  assert.equal(r.body.run.state, "queued");
+  assert.equal(r.body.run.host, "ebDisp", "dispatched inline to the free host");
+  assert.equal(r.body.run.siteKey, "eb2.atlassian.net");
+  // A spawnEpicBuilder command carrying the idea went to the chosen host.
+  const cmd = (agents.ebDisp.commands || []).find((c) => c.type === "spawnEpicBuilder");
+  assert.ok(cmd, "a spawnEpicBuilder command was queued");
+  assert.equal(cmd.builderId, id);
+  assert.equal(cmd.idea, "Expand into an epic");
+  assert.equal(cmd.siteKey, "eb2.atlassian.net");
+  // It rides /api/agents under its own top-level key, keyed by the minted id.
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.body.epicBuilders[id].state, "queued");
+  assert.equal(list.body.epicBuilders[id].host, "ebDisp");
+});
+
+test("XERK-725: a full fleet holds the builder queued; a freed slot dispatches it", async () => {
+  resetEpicBuilders();
+  await builderBeat("ebFull", "eb3.atlassian.net", { capacity: { free: 0, total: 3, queued: 0 } });
+  agents.ebFull.commands = [];
+  const r = await request("POST", "/api/jira/eb3.atlassian.net/epic-builder",
+    { body: { title: "Later", idea: "wait for a slot" }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  const id = r.body.run.id;
+  // No host free -> HELD queued, no command, no host claim (backpressure inherited).
+  assert.equal(r.body.run.state, "queued");
+  assert.equal("host" in r.body.run, false);
+  assert.equal((agents.ebFull.commands || []).some((c) => c.type === "spawnEpicBuilder"), false);
+  // A slot frees; the driver dispatches on the next sweep.
+  await builderBeat("ebFull", "eb3.atlassian.net", { capacity: { free: 2, total: 3, queued: 0 } });
+  epicBuilderDriveSweep();
+  assert.equal(epicBuilders[id].host, "ebFull");
+  assert.ok((agents.ebFull.commands || []).some(
+    (c) => c.type === "spawnEpicBuilder" && c.builderId === id));
+});
+
+test("XERK-725: a host's epicBuilderStatus report advances the run; another host cannot", async () => {
+  resetEpicBuilders();
+  await builderBeat("ebRep", "eb4.atlassian.net");
+  await builderBeat("ebOther", "eb4.atlassian.net");
+  agents.ebRep.commands = [];
+  const r = await request("POST", "/api/jira/eb4.atlassian.net/epic-builder",
+    { body: { title: "Report", idea: "go", targetHost: "ebRep" }, headers: userHeaders });
+  const id = r.body.run.id;
+  assert.equal(epicBuilders[id].host, "ebRep", "pinned + dispatched to the target host");
+  // The OWNING host advances it through the states and delivers the epicKey.
+  const report = (state, extra = {}) => request("POST", "/api/heartbeat", {
+    body: { device: "ebRep", repos: [{ name: "Turma" }],
+      jira: { available: true, configured: true, siteKey: "eb4.atlassian.net",
+        user: "ebRep@x.com", fetchedAt: "2026-07-14T12:00:00Z", tickets: [] },
+      epicBuilderStatus: [{ id, state, ...extra }] },
+    headers: agentHeaders });
+  await report("researching");
+  assert.equal(epicBuilders[id].state, "researching");
+  await report("creating");
+  assert.equal(epicBuilders[id].state, "creating");
+  await report("done", { epicKey: "EB-42" });
+  assert.equal(epicBuilders[id].state, "done");
+  assert.equal(epicBuilders[id].epicKey, "EB-42");
+  // A DIFFERENT host cannot advance a builder it does not own (the cmdId-style
+  // ownership rule) — an attempt to flip it to failed is ignored.
+  advanceEpicBuilder("ebOther", { id, state: "failed", error: "nope" });
+  assert.equal(epicBuilders[id].state, "done");
+  assert.equal("error" in epicBuilders[id], false);
+});
+
+test("XERK-725: builder runs survive a hub restart; a malformed record is dropped", () => {
+  const file = path.join(os.tmpdir(), `turma-test-epicbuilders-${process.pid}.json`);
+  fs.writeFileSync(file, JSON.stringify({
+    abc123: { id: "abc123", siteKey: "o.atlassian.net", title: "Keep me",
+      idea: "expand", state: "researching", host: "h1", startedAt: 111, updatedAt: 222 },
+    // A malformed record (no id, no title) must be DROPPED, not restored.
+    bad: { siteKey: "o.atlassian.net", state: "queued" },
+  }));
+  try {
+    const mod = freshServerModule((env) => { env.EPIC_BUILDERS_FILE = file; });
+    assert.equal(mod.epicBuilders.abc123.state, "researching");
+    assert.equal(mod.epicBuilders.abc123.title, "Keep me");
+    assert.equal(mod.epicBuilders.abc123.startedAt, 111);
+    assert.equal("bad" in mod.epicBuilders, false);
+  } finally {
+    fs.unlinkSync(file);
+  }
+});
+
+test("XERK-725: normalizeEpicBuilderStatus coerces the per-agent report to shape", () => {
+  // A non-array is dropped (absent = can't tell).
+  let a = { epicBuilderStatus: "nope" };
+  normalizeEpicBuilderStatus(a);
+  assert.equal("epicBuilderStatus" in a, false);
+  // Non-object elements filtered; wrong-typed sub-fields dropped, not stringified.
+  a = { epicBuilderStatus: [
+    "junk",
+    { id: "x", state: "done", epicKey: 5, error: { bad: 1 } },
+    { id: 9, state: "queued" },
+  ] };
+  normalizeEpicBuilderStatus(a);
+  assert.equal(a.epicBuilderStatus.length, 2);
+  assert.equal(a.epicBuilderStatus[0].id, "x");
+  assert.equal("epicKey" in a.epicBuilderStatus[0], false);
+  assert.equal("error" in a.epicBuilderStatus[0], false);
+  assert.equal("id" in a.epicBuilderStatus[1], false);
+  // Every string field is re-capped, `state` included (QA F2) — an oversize one
+  // would otherwise ride /api/agents + every SSE frame at full length.
+  const b = { epicBuilderStatus: [{ id: "y", state: "S".repeat(5000) }] };
+  normalizeEpicBuilderStatus(b);
+  assert.equal(b.epicBuilderStatus[0].state.length, 64);
+});
+
+test("XERK-725: arming a builder pushes an epicBuilders SSE frame", async () => {
+  resetEpicBuilders();
+  await builderBeat("ebSse", "eb6.atlassian.net");
+  const { req, res } = await sseConnect(userHeaders);
+  assert.equal(res.statusCode, 200);
+  const events = collectSse(res);
+  const r = await request("POST", "/api/jira/eb6.atlassian.net/epic-builder",
+    { body: { title: "See me", idea: "expand" }, headers: userHeaders });
+  const id = r.body.run.id;
+  await waitFor(() => events.some(
+    (e) => e.event === "epicBuilders" && JSON.parse(e.data)[id]));
+  req.destroy();
+  res.destroy();
+});
+
+test("XERK-725: DELETE cancels a builder run and drops it from the payload", async () => {
+  resetEpicBuilders();
+  await builderBeat("ebDel", "eb7.atlassian.net");
+  const r = await request("POST", "/api/jira/eb7.atlassian.net/epic-builder",
+    { body: { title: "Cancel", idea: "expand" }, headers: userHeaders });
+  const id = r.body.run.id;
+  assert.equal(id in epicBuilders, true);
+  const d = await request("DELETE", `/api/jira/eb7.atlassian.net/epic-builder/${id}`,
+    { headers: userHeaders });
+  assert.equal(d.status, 200);
+  assert.equal(d.body.cleared, true);
+  assert.equal(id in epicBuilders, false);
+  // A second cancel of the same id is a 404, not a false success.
+  const d2 = await request("DELETE", `/api/jira/eb7.atlassian.net/epic-builder/${id}`,
+    { headers: userHeaders });
+  assert.equal(d2.status, 404);
 });
 
 // ---- auto-close chaining + epic completion (XERK-637, epic XERK-633) --------

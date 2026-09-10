@@ -399,6 +399,15 @@
   .traj-c-name { font-family: var(--mono, monospace); color: var(--ink); }
   .traj-c-dur { color: var(--muted); font-size: 11.5px; }
   .traj-c-args { grid-column: 1 / -1; color: var(--muted); font-family: var(--mono, monospace); font-size: 11.5px; white-space: pre-wrap; overflow-wrap: anywhere; opacity: 0.85; }
+  /* Trajectory superset (XERK-717): user message, model output blocks (text +
+     thinking), a tool call's result snippet, and the degraded-session note. */
+  .traj-user { font-size: 12.5px; color: var(--ink); background: var(--accent-soft); border-radius: var(--radius-sm); padding: 6px 9px; margin: 2px 0 7px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .traj-role { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 2px; }
+  .traj-out { font-size: 12.5px; color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; padding: 3px 0; }
+  .traj-out-think { color: var(--muted); font-style: italic; }
+  .traj-out-empty { opacity: 0.7; }
+  .traj-c-result { grid-column: 1 / -1; color: var(--muted); font-family: var(--mono, monospace); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; opacity: 0.8; border-left: 2px solid var(--border); padding-left: 7px; margin-top: 2px; }
+  .traj-partial { font-size: 12px; color: var(--muted); font-style: italic; }
   .tr-scroll { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
   .tr-msg { max-width: 760px; padding: 9px 13px; border-radius: var(--radius-md); font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
   .tr-msg.user { align-self: flex-end; background: var(--accent-soft); color: var(--ink); }
@@ -974,10 +983,12 @@
           <span class="spacer"></span>
           <span class="verbosity" id="chatVerbosity"></span>
           <button class="seg-toggle" id="chatTermBtn" onclick="chatToTerminal()" title="Open the raw ttyd terminal for debugging">Terminal ▸</button>
-          <!-- dsh sessions are headless (no ttyd, XERK-498): the Terminal toggle
-               above is hidden for them and this Trajectory toggle takes its place,
-               a read-only view over the dsh D3 native event log. -->
-          <button class="seg-toggle" id="chatTrajBtn" hidden onclick="chatToTrajectory()" title="Open the read-only dsh Trajectory (turns, tool calls, tokens)">Trajectory ▸</button>
+          <!-- Trajectory toggle (XERK-717): a read-only, runtime-dispatched view
+               (turns, model output, tool calls + results, tokens). A dsh session
+               is headless (no ttyd, XERK-498) so this takes the Terminal toggle's
+               place; a claude/qwen session shows it BESIDE Terminal. Hidden until
+               the session has a transcript (see selectSession). -->
+          <button class="seg-toggle" id="chatTrajBtn" hidden onclick="chatToTrajectory()" title="Open the read-only Trajectory (turns, output, tool calls, tokens)">Trajectory ▸</button>
           <!-- The host-wide `dsh web` viewer (XERK-501; opens dsh's OWN read-only UI over
                the shared store, so this chat can be confirmed in both places).
                Shown only for a dsh session whose host advertises a reachable
@@ -1037,10 +1048,11 @@
           <button class="primary compose-action" id="termSend" onclick="termComposeAction()">Send</button>
         </div>
       </div>
-      <!-- The dsh Trajectory pane (XERK-498): a Turma-native read-only view over
-           a dsh session's D3 native event log, replacing the removed per-session
-           dsh terminal. Fetched from /api/dsh/<transcriptId>/trajectory, rendered
-           by renderTrajectory(). No compose box, no terminal — observe-only. -->
+      <!-- The Trajectory pane (XERK-498 dsh, generalized XERK-717): a Turma-native
+           read-only view over the archived session. Fetched from
+           /api/archive/<transcriptId>/trajectory (runtime-dispatched — claude/qwen
+           /dsh), rendered by renderTrajectory(). No compose box, no terminal —
+           observe-only. -->
       <div class="traj-pane" id="trajPane" hidden>
         <div class="term-bar">
           <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
@@ -2843,15 +2855,20 @@ function selectSession(id) {
   if ($trajPane) $trajPane.hidden = true;
   $stageEmpty.hidden = true;
   $chatPane.hidden = false;
-  // A dsh session is HEADLESS — no ttyd, no raw terminal (XERK-498), so hide the
-  // "Terminal ▸" toggle and show "Trajectory ▸" in its place (the Turma-native
-  // read-only view over its D3 native log). A claude session keeps the terminal
-  // toggle and never shows trajectory.
+  // The Trajectory toggle (XERK-717): a read-only, runtime-dispatched view over
+  // the archived session (turns, model output, tool calls + results, tokens).
+  //  - A dsh session is HEADLESS — no ttyd, no raw terminal (XERK-498) — so hide
+  //    "Terminal ▸" and Trajectory takes its place.
+  //  - A claude/qwen session keeps its ttyd terminal, so Trajectory sits BESIDE
+  //    "Terminal ▸" rather than replacing it, shown once the session has a
+  //    transcript to fold (a brand-new one has none yet; loadTrajectory's 404
+  //    also covers "not synced yet").
   const isDsh = !!(hit.s && hit.s.agentType === "dsh");
+  const hasTranscript = !!(hit.s && hit.s.transcriptId);
   const chatTermBtn = document.getElementById("chatTermBtn");
   if (chatTermBtn) chatTermBtn.style.display = isDsh ? "none" : "";
   const chatTrajBtn = document.getElementById("chatTrajBtn");
-  if (chatTrajBtn) chatTrajBtn.hidden = !isDsh;
+  if (chatTrajBtn) chatTrajBtn.hidden = !(isDsh || hasTranscript);
   // The host-wide `dsh web` link: a dsh session whose host reports a reachable
   // viewer URL. A loopback-only host reports none (dsh.web.url == null), so the
   // link stays hidden rather than pointing nowhere.
@@ -2923,13 +2940,16 @@ function terminalToChat() {
   carryDraft("termInput", "chatInput"); // after the swap — see chatToTerminal()
   if (window.TurmaChat) TurmaChat.repaint();
 }
-// The dsh Trajectory view (XERK-498): replaces the removed per-session dsh
-// terminal with a Turma-native read-only render of the session's D3 native event
-// log. Keeps the chat's live tail warm underneath so returning is instant.
+// The Trajectory view (XERK-498 dsh, generalized to claude/qwen in XERK-717): a
+// Turma-native read-only render of the archived session. For dsh it replaces the
+// removed per-session terminal; for claude/qwen it sits beside it. Keeps the
+// chat's live tail warm underneath so returning is instant.
 function chatToTrajectory() {
   if (!currentId) return;
   const rec = findSession(currentId);
-  if (!rec || rec.agentType !== "dsh") return;  // dsh-only, guarded like the button
+  // Any runtime with a transcript (the toggle is hidden otherwise); loadTrajectory
+  // handles a missing/unsynced transcript with an in-pane note.
+  if (!rec) return;
   viewMode = "trajectory";
   $chatPane.hidden = true;
   if ($trajPane) $trajPane.hidden = false;
@@ -2957,9 +2977,9 @@ async function loadTrajectory(transcriptId, force) {
   scroll.dataset.loaded = "";
   let data;
   try {
-    const r = await fetch(`/api/dsh/${encodeURIComponent(transcriptId)}/trajectory`, { credentials: "same-origin" });
+    const r = await fetch(`/api/archive/${encodeURIComponent(transcriptId)}/trajectory`, { credentials: "same-origin" });
     if (r.status === 404) {
-      scroll.innerHTML = '<div class="traj-empty">No dsh trajectory yet — a running session syncs its native log to the archive within a few beats. Reopen or ↻ Refresh in a moment.</div>';
+      scroll.innerHTML = '<div class="traj-empty">No trajectory yet — a running session syncs to the archive within a few beats. Reopen or ↻ Refresh in a moment.</div>';
       return;
     }
     if (!r.ok) { scroll.innerHTML = `<div class="traj-empty">Could not load the trajectory (HTTP ${r.status}).</div>`; return; }
@@ -2979,38 +2999,75 @@ function trajMs(ms) {
   return s < 60 ? s.toFixed(s < 10 ? 1 : 0) + "s" : Math.floor(s / 60) + "m" + String(Math.round(s % 60)).padStart(2, "0") + "s";
 }
 function trajNum(n) { return (typeof n === "number" && isFinite(n)) ? n.toLocaleString() : "0"; }
+// A per-turn / total token tag (↑input ↓output, cache-read appended when any),
+// or "" when the runtime didn't carry usage (a DEGRADED running claude/qwen
+// trajectory has null tokens — XERK-715 — the fallback note below says why).
+function trajTokTag(tok) {
+  if (!tok || (!tok.input && !tok.output && !tok.cacheRead)) return "";
+  const extra = tok.cacheRead ? ` ⇄${trajNum(tok.cacheRead)}` : "";
+  return `<span class="traj-tag">↑${trajNum(tok.input)} ↓${trajNum(tok.output)}${extra}</span>`;
+}
+// Render the XERK-712 superset contract (docs/trajectory-contract.md): per turn,
+// newest-first, the USER message, the MODEL OUTPUT blocks (text + thinking,
+// visually distinct), the tool-call rows (✓/✗, name, args, result, duration),
+// plus per-turn + total tokens, model and duration. dsh emits a SUBSET (no user
+// /output, tool-call-centric turns with `steps`) and renders correctly through
+// the same code — a missing field is simply absent. Every interpolated field is
+// esc()'d (a transcript can hold pasted/attacker content — stored XSS).
 function renderTrajectory(scroll, d) {
   if (!d || !Array.isArray(d.turns)) { scroll.innerHTML = '<div class="traj-empty">Empty trajectory.</div>'; return; }
   const t = d.totals || {};
-  const tok = t.tokens || {};
+  const tok = t.tokens || null;               // null on a DEGRADED running session
+  const partial = d.partial === true;
   const head = `
     <div class="traj-head">
-      <div class="traj-h-title">${esc(d.title || "dsh session")}</div>
+      <div class="traj-h-title">${esc(d.title || (d.runtime ? d.runtime + " session" : "session"))}</div>
       <div class="traj-h-meta">
         ${d.model ? `<span class="traj-tag">${esc(d.model)}</span>` : ""}
         <span class="traj-tag">${trajNum(t.turns)} turns</span>
         <span class="traj-tag">${trajNum(t.toolCalls)} tool calls</span>
         ${t.errors ? `<span class="traj-tag traj-err">${trajNum(t.errors)} errors</span>` : ""}
-        <span class="traj-tag">↑${trajNum(tok.input)} ↓${trajNum(tok.output)} tok</span>
+        ${tok ? `<span class="traj-tag">↑${trajNum(tok.input)} ↓${trajNum(tok.output)} tok</span>` : ""}
         ${d.durationMs != null ? `<span class="traj-tag">${esc(trajMs(d.durationMs))}</span>` : ""}
       </div>
+      ${partial ? '<div class="traj-partial">Live session — showing what has synced so far. Token counts and per-turn model appear once the session ends.</div>' : ""}
       ${d.truncated ? '<div class="traj-trunc">Showing the most recent activity — this session’s log is large and was truncated.</div>' : ""}
     </div>`;
   // Newest turn first — a live viewer watches the latest.
   const turns = d.turns.slice().reverse().map((tn) => {
+    const userHtml = (tn.user && tn.user.text)
+      ? `<div class="traj-user"><span class="traj-role">User</span>${esc(tn.user.text)}</div>` : "";
+    // Model output blocks: plain text vs a visually-distinct thinking trace.
+    // Claude's extended-thinking is stored encrypted (empty text) on this fleet
+    // — still show the block, marked, and never surface a signature (none here).
+    const outHtml = (Array.isArray(tn.output) ? tn.output : []).map((o) => {
+      if (!o || typeof o.text !== "string") return "";
+      const think = o.kind === "thinking";
+      if (think) return `<div class="traj-out traj-out-think">💭 ${o.text ? esc(o.text) : '<span class="traj-out-empty">(thinking)</span>'}</div>`;
+      return o.text ? `<div class="traj-out">${esc(o.text)}</div>` : "";
+    }).join("");
     const calls = Array.isArray(tn.calls) ? tn.calls : [];
     const rows = calls.map((c) => {
       const mark = c.ok === false ? "✗" : (c.ok === true ? "✓" : "•");
       const cls = c.ok === false ? "traj-call traj-call-err" : "traj-call";
       const dur = c.durationMs != null ? `<span class="traj-c-dur">${esc(trajMs(c.durationMs))}</span>` : "";
-      return `<div class="${cls}"><span class="traj-c-mark">${mark}</span><span class="traj-c-name">${esc(c.name || "?")}</span>${dur}<div class="traj-c-args">${esc(c.args || "")}</div></div>`;
+      const args = c.args ? `<div class="traj-c-args">${esc(c.args)}</div>` : "";
+      const result = (c.result != null && c.result !== "")
+        ? `<div class="traj-c-result">${esc(c.result)}</div>` : "";
+      return `<div class="${cls}"><span class="traj-c-mark">${mark}</span><span class="traj-c-name">${esc(c.name || "?")}</span>${dur}${args}${result}</div>`;
     }).join("");
-    const rk = tn.reason ? `<span class="traj-tag ${tn.reason === "error" ? "traj-err" : ""}">${esc(tn.reason)}</span>` : "";
+    const model = tn.model ? `<span class="traj-tag">${esc(tn.model)}</span>` : "";
+    const tk = trajTokTag(tn.tokens);
     const dur = (tn.startedAt != null && tn.endedAt != null) ? `<span class="traj-tag">${esc(trajMs(tn.endedAt - tn.startedAt))}</span>` : "";
-    const tk = (tn.tokens && (tn.tokens.input || tn.tokens.output)) ? `<span class="traj-tag">↑${trajNum(tn.tokens.input)} ↓${trajNum(tn.tokens.output)}</span>` : "";
+    const rk = tn.reason ? `<span class="traj-tag ${tn.reason === "error" ? "traj-err" : ""}">${esc(tn.reason)}</span>` : "";
+    // dsh carries `steps`; claude/qwen do not (omit rather than show "0 steps").
+    const steps = (tn.steps != null) ? `<span class="traj-tag">${trajNum(tn.steps)} steps</span>` : "";
+    // Only fall back to "no tool calls" when the turn is otherwise empty (a dsh
+    // turn); a claude/qwen turn with user/output but no call is not "empty".
+    const body = userHtml + outHtml + (rows || (userHtml || outHtml ? "" : '<div class="traj-c-none">no tool calls</div>'));
     return `<div class="traj-turn">
-      <div class="traj-t-head"><span class="traj-t-n">Turn ${esc(String(tn.turn))}</span><span class="traj-tag">${trajNum(tn.steps)} steps</span><span class="traj-tag">${calls.length} calls</span>${tk}${dur}${rk}</div>
-      ${rows || '<div class="traj-c-none">no tool calls</div>'}
+      <div class="traj-t-head"><span class="traj-t-n">Turn ${esc(String(tn.turn))}</span>${steps}<span class="traj-tag">${calls.length} calls</span>${model}${tk}${dur}${rk}</div>
+      ${body}
     </div>`;
   }).join("");
   scroll.innerHTML = head + `<div class="traj-turns">${turns || '<div class="traj-empty">No turns recorded yet.</div>'}</div>`;

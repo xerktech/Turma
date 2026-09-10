@@ -192,7 +192,8 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " showRestore, hideRestore, toggleRestoreMenu, restoreTo, eligibleRestoreTargets,"
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
       + " openSubagentView, transcriptBack,"
-      + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
+      + " chatToTerminal, terminalToChat, chatToTrajectory, trajectoryToChat, renderTrajectory,"
+      + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
       + " applyAgent, mergeSnapshot, sseClock: () => sseClock,"
       + " setCache: (c) => { cache = c; }, getCache: () => cache, setDraft: (t) => { renameDraft = t; },"
       + " setPendingSelectAt: (t) => { pendingSelectAt = t; }, SELECT_FOLLOW_MS };");
@@ -2867,4 +2868,127 @@ test("sessions: mergeSnapshot keeps an orgColors patch that landed mid-fetch (XE
   p.mergeSnapshot({ now: Date.now(), agents: [], migrations: [], orgColors: { o: "red" } }, since);
   assert.deepEqual(p.getCache().orgColors, { o: "blue" },
     "the live orgColors patch survives the older snapshot");
+});
+
+// --- Trajectory pane (XERK-717) ----------------------------------------------
+// The Trajectory toggle + renderer, generalized from the dsh-only view (XERK-498)
+// to the XERK-712 superset contract (docs/trajectory-contract.md): claude/qwen
+// carry the conversation (user + model output + per-turn tokens/model), dsh keeps
+// its tool-call-centric subset. Web-only, read-only, every field esc()'d.
+
+const trajTurn = (over = {}) => ({
+  turn: 1, startedAt: 1000, endedAt: 3000, durationMs: 2000,
+  user: { text: "do the thing" },
+  output: [{ kind: "thinking", text: "let me plan" }, { kind: "text", text: "here is the plan" }],
+  model: "claude-opus-4-8",
+  calls: [{ name: "Bash", callId: "c1", at: 1500, ok: true, error: false,
+    args: "ls -la", result: "file.txt", durationMs: 400 }],
+  tokens: { input: 120, output: 45, cacheRead: 900, cacheWrite: 0 },
+  reason: "end_turn",
+  ...over,
+});
+const claudeTraj = (over = {}) => ({
+  transcriptId: "tid1", runtime: "claude", title: "Fix the bug",
+  model: "claude-opus-4-8", startedAt: 1000, endedAt: 5000, durationMs: 4000,
+  totals: { turns: 1, toolCalls: 1, errors: 0,
+    tokens: { input: 120, output: 45, cacheRead: 900, cacheWrite: 0 } },
+  turns: [trajTurn()], truncated: false, turnsDropped: 0, callsDropped: 0, partial: false,
+  ...over,
+});
+
+test("XERK-717: renderTrajectory shows the claude superset (user, output, thinking, result, per-turn tokens/model)", () => {
+  const page = loadPage();
+  const scroll = makeEl("trajScroll");
+  page.renderTrajectory(scroll, claudeTraj());
+  const h = scroll.innerHTML;
+  assert.ok(h.includes("Fix the bug"), "the title heads the pane");
+  assert.ok(h.includes("do the thing"), "the user message renders");
+  assert.ok(h.includes("here is the plan"), "model text output renders");
+  assert.ok(h.includes("traj-out-think") && h.includes("let me plan"), "thinking is distinct and shown");
+  assert.ok(h.includes("Bash"), "the tool call name renders");
+  assert.ok(h.includes("ls -la"), "the call args render");
+  assert.ok(h.includes("traj-c-result") && h.includes("file.txt"), "the call RESULT renders (superset field)");
+  assert.ok(h.includes("claude-opus-4-8"), "the model tag renders");
+  assert.match(h, /↑120 ↓45/, "per-turn tokens render");
+  assert.ok(h.includes("✓"), "an ok call is checked");
+});
+
+test("XERK-717: renderTrajectory flags a partial (running) trajectory and shows no token tag", () => {
+  const page = loadPage();
+  const scroll = makeEl("trajScroll");
+  page.renderTrajectory(scroll, claudeTraj({
+    partial: true,
+    totals: { turns: 1, toolCalls: 1, errors: 0, tokens: null },
+    turns: [trajTurn({ tokens: null, model: null })],
+  }));
+  const h = scroll.innerHTML;
+  assert.ok(h.includes("traj-partial"), "the degraded note is shown");
+  assert.match(h, /appear once the session ends/, "the note explains the missing tokens");
+  assert.doesNotMatch(h, /↑\d+ ↓\d+ tok/, "no total token tag when tokens are null");
+});
+
+test("XERK-717: renderTrajectory renders the dsh subset unchanged (steps, no user/output)", () => {
+  const page = loadPage();
+  const scroll = makeEl("trajScroll");
+  page.renderTrajectory(scroll, {
+    transcriptId: "d1", runtime: "dsh", title: "dsh run", model: "deepseek",
+    startedAt: 1, endedAt: 2, durationMs: 1,
+    totals: { turns: 1, steps: 4, toolCalls: 0, errors: 0,
+      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+    turns: [{ turn: 1, steps: 4, calls: [], reason: "stop", startedAt: 1, endedAt: 2,
+      tokens: { input: 0, output: 0 } }],
+    truncated: false, turnsDropped: 0, callsDropped: 0, partial: false,
+  });
+  const h = scroll.innerHTML;
+  assert.ok(h.includes("4 steps"), "dsh steps still render");
+  assert.ok(h.includes("no tool calls"), "an empty dsh turn falls back to 'no tool calls'");
+  assert.ok(!h.includes("traj-user"), "a dsh turn carries no user block");
+});
+
+test("XERK-717: renderTrajectory escapes every interpolated field (stored XSS)", () => {
+  const page = loadPage();
+  const scroll = makeEl("trajScroll");
+  const x = "<script>alert(1)</script>";
+  page.renderTrajectory(scroll, claudeTraj({
+    title: x,
+    turns: [trajTurn({ user: { text: x }, output: [{ kind: "text", text: x }],
+      calls: [{ name: x, ok: false, error: true, args: x, result: x, durationMs: 1 }] })],
+  }));
+  const h = scroll.innerHTML;
+  assert.ok(!h.includes("<script>"), "no raw <script> survives");
+  assert.ok(h.includes("&lt;script&gt;"), "the payload is escaped");
+});
+
+test("XERK-717: the Trajectory toggle shows beside Terminal for claude, replaces it for dsh, hidden with no transcript", () => {
+  const claude = loadPage();
+  const c = host([{ ...running("s1", "T", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tid1" }]);
+  claude.beat({ now: c.now, agents: [c.host] });
+  claude.selectSession("s1");
+  assert.equal(claude.els.chatTrajBtn.hidden, false, "Trajectory shows for a claude session with a transcript");
+  assert.notEqual(claude.els.chatTermBtn.style.display, "none", "Terminal stays for a claude session");
+
+  const dsh = loadPage();
+  const d = host([{ ...running("s2", "T", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tid2", agentType: "dsh" }]);
+  dsh.beat({ now: d.now, agents: [d.host] });
+  dsh.selectSession("s2");
+  assert.equal(dsh.els.chatTrajBtn.hidden, false, "Trajectory shows for a dsh session");
+  assert.equal(dsh.els.chatTermBtn.style.display, "none", "Terminal is hidden for a headless dsh session");
+
+  const bare = loadPage();
+  const b = host([running("s3", "T", { paneBusy: false, transcriptAgeSec: 5 })]);
+  bare.beat({ now: b.now, agents: [b.host] });
+  bare.selectSession("s3");
+  assert.equal(bare.els.chatTrajBtn.hidden, true, "Trajectory is hidden for a claude session with no transcript yet");
+});
+
+test("XERK-717: chatToTrajectory reveals the pane and loads from the unified /api/archive/<id>/trajectory endpoint", () => {
+  const page = loadPage();
+  const c = host([{ ...running("s1", "T", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tid1" }]);
+  page.beat({ now: c.now, agents: [c.host] });
+  page.selectSession("s1");
+  page.chatToTrajectory();
+  assert.equal(page.els.trajPane.hidden, false, "the trajectory pane is revealed");
+  assert.equal(page.els.chatPane.hidden, true, "the chat pane is hidden");
+  assert.ok(page.gets.some((u) => u.includes("/api/archive/tid1/trajectory")),
+    "loadTrajectory fetches the runtime-dispatched archive endpoint, not /api/dsh");
 });

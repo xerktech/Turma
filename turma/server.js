@@ -273,6 +273,11 @@ const REPO_TIER_SEED = process.env.REPO_TIER_SEED || "";
 // would replay stale intent as a burst of session starts after every hub reboot,
 // which is the whole reason it lives on the /data volume and not state.json.
 const EPIC_RUNS_FILE = process.env.EPIC_RUNS_FILE || "/data/epic-runs.json";
+// Epic Builder run records (XERK-725, epic XERK-721). Same posture as EPIC_RUNS
+// above: hub-owned durable state on /data, NOT state.json — a builder queued when
+// the hub restarts must survive so its idea is dispatched, not lost. Small (a few
+// per operator burst, bounded EPIC_BUILDERS_MAX).
+const EPIC_BUILDERS_FILE = process.env.EPIC_BUILDERS_FILE || "/data/epic-builders.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -1102,11 +1107,6 @@ const AGENT_CACHE_KEYS = [
   "history", "subagentHistory", "jiraIssues", "statusResults",
   "priorityResults", "linkResults", "mergeResults",
   "createMeta", "createTypes", "createResults", "resultWaits",
-  // The Epic Builder's per-cmdId materialization outcomes (XERK-724): the
-  // hub-side consumption of XERK-723's createEpicChild / createBlocksLink
-  // primitives. Read by the materialization run (XERK-725), stripped from the
-  // fleet payload like the other write-outcome caches.
-  "epicChildResults", "blocksLinkResults",
 ];
 
 // The serialized size of what this record contributes to /api/agents.
@@ -2398,6 +2398,242 @@ function setEpicRunPaused(siteKey, epicKey, paused) {
   return run;
 }
 
+// ---- the Epic Builder run store (XERK-725, epic XERK-721) -------------------
+// The operator hands the hub an IDEA (a title + free-text description) and the
+// hub dispatches a builder SESSION to a capable host, which expands the idea into
+// an Auto-Epic-ready Jira epic (the plan/run contract is XERK-722; the builder
+// session that consumes it is XERK-723/C). This is the hub's durable record of
+// each such builder, mirroring epicRuns' lifecycle: its own /data file, its own
+// SSE frame, its own top-level payload key, a sanitize-on-boot whitelist and a
+// bound. It is NOT a Jira ticket (there is no epic yet — the builder produces
+// one), so it does NOT ride the (siteKey,issueKey) ticketQueue; it is keyed by a
+// minted id and its DISPATCH inherits capacity/backpressure/pause/OS-filtering by
+// going through the SAME findTicketHost the Start button and auto-start use, with
+// its own driver sweep (the epicRuns pattern), never re-implementing routing.
+const EPIC_BUILDER_STATES = new Set(["queued", "researching", "creating", "done", "failed"]);
+// A builder is a heavy, rare operator action; a handful in flight at once is the
+// worst case, so this bound is a backstop, not a working limit. Oldest-updatedAt
+// evicted once over it (never the just-armed one), like EPIC_RUNS_MAX.
+const EPIC_BUILDERS_MAX = positiveEnv("EPIC_BUILDERS_MAX", 200);
+// The idea rides the durable record (so a restart re-dispatches it, not loses it)
+// AND the dispatch command; bounded so one operator paste cannot bloat the
+// payload/SSE it rides or the queued command. Title is short — a card heading.
+const EPIC_BUILDER_IDEA_MAX = positiveEnv("EPIC_BUILDER_IDEA_MAX", 8000);
+const EPIC_BUILDER_TITLE_MAX = 500;
+// A host reports the status of the builders it is running as a per-agent heartbeat
+// field (agent side is XERK-723/C); this bounds that array's length on the wire.
+const EPIC_BUILDER_STATUS_MAX = 50;
+// A builder dispatched to a host that acks-without-a-session (the epic-child
+// acked-no-session case, turma-epic-run.md) reads un-started forever otherwise.
+// If a dispatched run has not advanced past "queued" this long, its host claim is
+// cleared so the driver re-dispatches it. Comfortably longer than a builder's
+// first-report latency (a research session takes minutes to its first edge).
+const EPIC_BUILDER_REDISPATCH_MS = positiveEnv("EPIC_BUILDER_REDISPATCH_MS", 3 * 60 * 1000);
+
+// Coerce ONE persisted builder record to the fixed shape the payload serves.
+// Inline literal bounds (NOT the EPIC_BUILDER_* consts below other consts' TDZ,
+// same rule sanitizeEpicRunRecord follows): this runs at module-init from the
+// load loop. Returns the sanitized record, or null (dropped) for a malformed one
+// — a record with no id / siteKey / title is unusable, so it is discarded rather
+// than restored into memory or onto the wire.
+function sanitizeEpicBuilderRecord(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  if (typeof v.id !== "string" || !v.id) return null;
+  if (typeof v.siteKey !== "string" || !v.siteKey) return null;
+  if (typeof v.title !== "string" || !v.title) return null;
+  const now = Date.now();
+  const rec = {
+    id: v.id.slice(0, 64),
+    siteKey: v.siteKey.slice(0, 200),
+    title: v.title.slice(0, 500),
+    idea: typeof v.idea === "string" ? v.idea.slice(0, 8000) : "",
+    state: EPIC_BUILDER_STATES.has(v.state) ? v.state : "queued",
+    startedAt: Number.isFinite(v.startedAt) ? v.startedAt : now,
+    updatedAt: Number.isFinite(v.updatedAt) ? v.updatedAt : now,
+  };
+  if (typeof v.repo === "string" && v.repo) rec.repo = v.repo.slice(0, 200);
+  if (typeof v.targetHost === "string" && v.targetHost) rec.targetHost = v.targetHost.slice(0, 200);
+  if (typeof v.host === "string" && v.host) rec.host = v.host.slice(0, 200);
+  if (typeof v.epicKey === "string" && v.epicKey) rec.epicKey = v.epicKey.slice(0, 64);
+  if (typeof v.error === "string" && v.error) rec.error = v.error.slice(0, 500);
+  if (Number.isFinite(v.dispatchedAt)) rec.dispatchedAt = v.dispatchedAt;
+  return rec;
+}
+let epicBuilders = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(EPIC_BUILDERS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) {
+      const rec = sanitizeEpicBuilderRecord(v);
+      if (rec) epicBuilders[k] = rec;
+    }
+  }
+} catch {
+  /* first boot or no volume mounted */
+}
+let ebSaveTimer = null;
+function scheduleEpicBuildersSave() {
+  if (ebSaveTimer) return;
+  ebSaveTimer = setTimeout(() => {
+    ebSaveTimer = null;
+    fs.mkdir(path.dirname(EPIC_BUILDERS_FILE), { recursive: true }, () => {
+      fs.writeFile(EPIC_BUILDERS_FILE, JSON.stringify(epicBuilders), (err) => {
+        if (err) console.error(`epic-builders save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  ebSaveTimer.unref();
+}
+function publishEpicBuilders() {
+  scheduleEpicBuildersSave();
+  invalidateAgentsCache();
+  sseBroadcast("epicBuilders", epicBuilders);
+}
+// Which hosts of an org report a repo by name — CLONED (on-disk `repos[]`) OR
+// merely LISTED among the org's triaged `jira.repoOptions` (a gh-clonable repo no
+// host has cloned yet). Used by the route to refuse a builder pinned to a repo no
+// host of the org could clone — the "repo isn't cloneable" refusal.
+//
+// The listed set matters because the board composer (XERK-726) offers uncloned
+// repos (flagged "(not cloned)"), exactly as the manual Start/repo-pin pickers do,
+// and dispatch clones on demand (`findTicketHost` → `needsClone`). Checking only
+// on-disk `repos[]` would 404 every uncloned pick the composer presents — a
+// UI↔route seam that always fails (QA). So this accepts either, matching this
+// comment's stated "cloned or merely listed" intent and the pickers' own pool.
+function orgReportsRepo(siteKey, repo) {
+  return Object.values(agents).some((a) => a && a.jira && a.jira.siteKey === siteKey
+    && ((Array.isArray(a.repos) && a.repos.some((r) => r && r.name === repo))
+      || (Array.isArray(a.jira.repoOptions) && a.jira.repoOptions.some((r) => r && r.name === repo))));
+}
+// Create a builder run for an idea. Returns the record. Validation (org/repo/
+// length) is the route's; this just mints and stores. State starts "queued";
+// the driver dispatches it to a host on the next sweep (or inline right after).
+function armEpicBuilder(siteKey, { title, idea, repo, targetHost }) {
+  const now = Date.now();
+  const rec = {
+    id: crypto.randomBytes(8).toString("hex"),
+    siteKey,
+    title: String(title).slice(0, EPIC_BUILDER_TITLE_MAX),
+    idea: String(idea).slice(0, EPIC_BUILDER_IDEA_MAX),
+    state: "queued",
+    startedAt: now,
+    updatedAt: now,
+  };
+  if (repo) rec.repo = String(repo).slice(0, 200);
+  if (targetHost) rec.targetHost = String(targetHost).slice(0, 200);
+  epicBuilders[rec.id] = rec;
+  // Bound the map, evicting the least-recently-updated once over the cap (never
+  // the just-armed one), like EPIC_RUNS_MAX.
+  const all = Object.keys(epicBuilders);
+  if (all.length > EPIC_BUILDERS_MAX) {
+    all.sort((a, b) => (epicBuilders[a].updatedAt || 0) - (epicBuilders[b].updatedAt || 0));
+    for (const old of all.slice(0, all.length - EPIC_BUILDERS_MAX)) {
+      if (old !== rec.id) delete epicBuilders[old];
+    }
+  }
+  publishEpicBuilders();
+  return rec;
+}
+// Cancel a builder run (operator, or an internal give-up). Returns whether it
+// existed. A dispatched builder's SESSION is not touched here (the hub can't reach
+// a worktree) — this just drops the hub's record.
+function clearEpicBuilder(id) {
+  if (!(id in epicBuilders)) return false;
+  delete epicBuilders[id];
+  publishEpicBuilders();
+  return true;
+}
+// Advance one builder run from a host's reported status. `hostKey` is the host
+// that reported it: it may only advance a builder DISPATCHED to it (`run.host ===
+// hostKey`), so a host cannot advance another host's builder (the ownership rule
+// ingestSpawnFailures follows for cmdIds). `state` is validated; `epicKey`/`error`
+// are optional. Persists + broadcasts only on a real change.
+function advanceEpicBuilder(hostKey, { id, state, epicKey, error }) {
+  const run = id && epicBuilders[id];
+  if (!run || run.host !== hostKey) return;
+  if (!EPIC_BUILDER_STATES.has(state)) return;
+  let changed = false;
+  if (run.state !== state) { run.state = state; changed = true; }
+  if (typeof epicKey === "string" && epicKey && run.epicKey !== epicKey) {
+    run.epicKey = epicKey.slice(0, 64); changed = true;
+  }
+  // Keep an error only while failed; a run that recovered off "failed" drops it.
+  if (state === "failed") {
+    const e = typeof error === "string" ? error.slice(0, 500) : "";
+    if (run.error !== e) { run.error = e || "builder reported a failure"; changed = true; }
+  } else if (run.error) { delete run.error; changed = true; }
+  if (changed) { run.updatedAt = Date.now(); publishEpicBuilders(); }
+}
+// Ingest a host's per-beat builder-status report. The field is the agent's own
+// (coerced by normalizeEpicBuilderStatus), absent on any host not running a
+// builder or predating XERK-723 — "can't tell", so no advance. Advances each
+// reported builder this host owns.
+function ingestEpicBuilderStatus(hostKey, agent) {
+  const list = agent && agent.epicBuilderStatus;
+  if (!Array.isArray(list) || !list.length) return;
+  for (const s of list) if (s && typeof s === "object") advanceEpicBuilder(hostKey, s);
+}
+// The DRIVER (the epicRuns pattern): dispatch every builder still waiting for a
+// host to one chosen through findTicketHost, so capacity/backpressure/subscription
+// pause/OS-filtering are all INHERITED, not re-implemented. Runs on the 15s sweep
+// and once inline right after the route arms one (so a free fleet dispatches at
+// once). A queued builder with no free host HOLDS and is retried next tick — the
+// same self-clearing backpressure the ticket queue gives, without a Jira ticket.
+function epicBuilderDriveSweep() {
+  const ids = Object.keys(epicBuilders);
+  if (!ids.length) return;
+  const now = Date.now();
+  const rows = fleetTicketRows();
+  const usedHosts = new Set();
+  for (const id of ids) {
+    const run = epicBuilders[id];
+    if (!run) continue;
+    // Only a run still awaiting its builder is dispatchable. A run the agent has
+    // advanced past "queued" (researching/creating/done/failed) is the agent's to
+    // finish; the hub dispatches nothing more for it.
+    if (run.state !== "queued") continue;
+    // Already dispatched: leave it while its host works, unless it has gone this
+    // long without the agent advancing it — an acked-no-session dispatch — in
+    // which case clear the host so it re-dispatches (turma-epic-run.md's backoff
+    // shape, minus the growing timer: a builder is rare, so a flat re-dispatch is
+    // enough and never churns).
+    if (run.host) {
+      if (now - (run.dispatchedAt || 0) <= EPIC_BUILDER_REDISPATCH_MS) continue;
+      delete run.host; delete run.dispatchedAt; run.updatedAt = now;
+      publishEpicBuilders();
+    }
+    let host = null;
+    if (run.targetHost) {
+      // A pinned host is used only when it is a live, free host of the org; else
+      // the run HOLDS (a pin says WHICH host, never around it), retried next tick.
+      const a = agents[run.targetHost];
+      if (a && a.jira && a.jira.siteKey === run.siteKey
+          && now - (a.lastSeen || 0) < OFFLINE_AFTER_MS && hostHasFreeSlot(a)) {
+        host = run.targetHost;
+      }
+    } else {
+      // null issueKey vacuously satisfies findTicketHost's triage/runtime/OS
+      // pins, so this reuses the Start button's exact host selection: online host
+      // of the org, cloned-repo preferred, most-available, capacity-gated,
+      // subscription-pause-aware. `repo` may be absent — the builder chooses one.
+      const pick = findTicketHost(run.siteKey, run.repo || null, null,
+        { requireFree: true, rows });
+      if (pick && pick.host) host = pick.host;
+    }
+    if (!host || usedHosts.has(host)) continue;   // hold, or one-per-host-per-pass
+    usedHosts.add(host);
+    queueCommand(host, {
+      type: "spawnEpicBuilder", builderId: id, siteKey: run.siteKey,
+      title: run.title, idea: run.idea, ...(run.repo ? { repo: run.repo } : {}),
+    });
+    run.host = host;
+    run.dispatchedAt = now;
+    run.updatedAt = now;
+    publishEpicBuilders();
+    console.log(`epic builder: dispatched ${logName(id)} to ${logName(host)}`);
+  }
+}
+
 // ---- the epic-run DRIVER (XERK-636, epic XERK-633) --------------------------
 // The sibling of autoStartSweep / drainTicketQueue that actually WORKS an armed
 // run's DAG: for each run that is not finished, it enumerates the children whose
@@ -3134,7 +3370,6 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
   const { history, subagentHistory, jiraIssues, statusResults,
           priorityResults, linkResults, mergeResults,
           createMeta, createTypes, createResults, resultWaits, tokenBound,
-          epicChildResults, blocksLinkResults,
           orgBound, autoPaused: _forgedAutoPaused, ...a } = agent;
   // The paused-subscription set (XERK-544/548). buildAgentsCache computes it once
   // and passes it; the per-agent SSE broadcast has none and derives its own.
@@ -3248,6 +3483,12 @@ function buildAgentsCache() {
     // its own SSE event. A NEW top-level key — an older web/Android client just
     // ignores it, so they degrade cleanly.
     epicRuns,
+    // Epic Builder run records (XERK-725): a minted-id -> record of each idea the
+    // hub is expanding into an epic (queued/researching/creating/done/failed +
+    // the produced epicKey). Hub-owned durable state like epicRuns, its one read
+    // channel for the builder UI (subtask E) plus its own SSE event. A NEW
+    // top-level key, so an older client just ignores it.
+    epicBuilders,
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -4760,6 +5001,23 @@ function normalizeTokenRoll(a) {
 // The archive keys entries on `uuid`; the live/history path and the client merge
 // (foldHistory) key on `id`, so map uuid -> id here. Bounded to the newest
 // HISTORY_ARCHIVE_MSGS; the archive holds the whole transcript.
+// Best-effort runtime hint for a DEGRADED (running, rendered-only) trajectory —
+// the rendered layer cannot tell claude from qwen, so consult the live fleet for
+// the session's pinned `agentType`. Only claude/qwen reach the degraded path (a
+// dsh session resolves off its live raw log before this), so a "dsh" answer here
+// would be a stale record and is ignored; anything else defaults to claude.
+function liveRuntimeForTranscript(transcriptId) {
+  if (!transcriptId) return "claude";
+  for (const a of Object.values(agents)) {
+    for (const s of a.sessions || []) {
+      if (s.transcriptId === transcriptId) {
+        return s.agentType === "qwen" ? "qwen" : "claude";
+      }
+    }
+  }
+  return "claude";
+}
+
 function archiveHistory(transcriptId) {
   if (!transcriptId) return null;
   let t;
@@ -5163,59 +5421,6 @@ function ingestCreateResults(agent, results) {
   }
 }
 
-// Merge the Epic Builder's createEpicChild outcomes (heartbeat `epicChildResults`,
-// XERK-723/724) into a per-cmdId cache, keyed and evicted like `createResults`:
-// the materialization run (XERK-725) reads `agent.epicChildResults[cmdId]` to
-// learn the real key of a child it queued. `epicKey` is echoed so a caller can
-// confirm the parent it asked for. Stripped from the fleet payload.
-function ingestEpicChildResults(agent, results) {
-  const now = Date.now();
-  for (const r of (Array.isArray(results) ? results : [])) {
-    if (!r || !r.cmdId) continue;
-    agent.epicChildResults[r.cmdId] = {
-      key: r.key || null, url: r.url || null, epicKey: r.epicKey || null,
-      error: r.error || null, warning: r.warning || null, fetchedAt: now,
-    };
-  }
-  for (const [k, e] of Object.entries(agent.epicChildResults)) {
-    if (now - e.fetchedAt > CREATE_RESULT_MAX_AGE_MS) delete agent.epicChildResults[k];
-  }
-  const over = Object.keys(agent.epicChildResults).length - CREATE_RESULT_MAX;
-  if (over > 0) {
-    Object.entries(agent.epicChildResults)
-      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
-      .slice(0, over)
-      .forEach(([k]) => delete agent.epicChildResults[k]);
-  }
-}
-
-// Merge the Epic Builder's createBlocksLink outcomes (heartbeat
-// `blocksLinkResults`, XERK-723/724) into a per-cmdId cache. The result carries
-// `ok` + `action` ("linked"|"no-op"|"skipped"), like `linkResults` (XERK-484);
-// the materialization run reads it to confirm a dependency edge was written.
-// Stripped from the fleet payload.
-function ingestBlocksLinkResults(agent, results) {
-  const now = Date.now();
-  for (const r of (Array.isArray(results) ? results : [])) {
-    if (!r || !r.cmdId) continue;
-    agent.blocksLinkResults[r.cmdId] = {
-      blockerKey: r.blockerKey || null, blockedKey: r.blockedKey || null,
-      siteKey: r.siteKey || null, ok: !!r.ok, error: r.error || null,
-      action: r.action || null, fetchedAt: now,
-    };
-  }
-  for (const [k, e] of Object.entries(agent.blocksLinkResults)) {
-    if (now - e.fetchedAt > CREATE_RESULT_MAX_AGE_MS) delete agent.blocksLinkResults[k];
-  }
-  const over = Object.keys(agent.blocksLinkResults).length - CREATE_RESULT_MAX;
-  if (over > 0) {
-    Object.entries(agent.blocksLinkResults)
-      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
-      .slice(0, over)
-      .forEach(([k]) => delete agent.blocksLinkResults[k]);
-  }
-}
-
 // --- Proven capability gaps (XERK-151) ---------------------------------------
 // Record that `cmdId` is a command whose whole answer is a staged result, so the
 // beat that acks it can decide whether the agent actually implements it. `extra`
@@ -5243,8 +5448,6 @@ function resultLanded(agent, cmdId, wait) {
   if (wait.kind === "setTicketPriority") return !!(agent.priorityResults || {})[cmdId];
   if (wait.kind === "createDuplicateLink") return !!(agent.linkResults || {})[cmdId];
   if (wait.kind === "mergePr") return !!(agent.mergeResults || {})[cmdId];
-  if (wait.kind === "createEpicChild") return !!(agent.epicChildResults || {})[cmdId];
-  if (wait.kind === "createBlocksLink") return !!(agent.blocksLinkResults || {})[cmdId];
   return true;
 }
 
@@ -5941,8 +6144,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "ticketPriorityResults", "ticketLinkResults",
-  "epicChildResults", "blocksLinkResults",
-  "spawnFailures",
+  "spawnFailures", "epicBuilderStatus",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -6336,6 +6538,7 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeModels(a);
   normalizeSpawnRefusals(a);
   normalizeRefused(a);
+  normalizeEpicBuilderStatus(a);
   normalizeRetired(a);
   normalizeOrg(a);
   normalizeJira(a);
@@ -6415,6 +6618,43 @@ function normalizeRefused(a) {
     if (k in r && typeof r[k] !== "string") delete r[k];
   }
   if (typeof r.detail === "string" && r.detail.length > 200) r.detail = r.detail.slice(0, 200);
+}
+
+// The per-agent Epic Builder status report (XERK-725) coerced to the shape the
+// hub ingests and the clients may read. A host running a builder session reports
+// `epicBuilderStatus: [{id, state, epicKey?, error?}]` on its heartbeat (the
+// agent side is XERK-723/C); the hub reads it to advance the durable epicBuilders
+// store. It is agent-supplied and — the heartbeat contract — decode-fatal the
+// moment a client types it, so it is coerced here: a non-array is DROPPED (→
+// absent = "can't tell", no builder reported), each element is filtered to a plain
+// object, its typed sub-fields DROPPED when wrong-typed (never stringified) and
+// the strings re-capped. State is NOT validated against a set here (the value
+// check is advanceEpicBuilder's, on ingest) — only the SHAPE, so this stays a
+// pure type coercion. Bounds are INLINE literals for the loadState-TDZ reason
+// normalizeClones/normalizeRefused give: this is reached from the restore loop
+// near the top of the file, where the EPIC_BUILDER_* consts declared far below are
+// in their TDZ. A function declaration, guarding its own input, never throwing.
+function normalizeEpicBuilderStatus(a) {
+  if (!a || typeof a !== "object") return;
+  if (!("epicBuilderStatus" in a)) return;
+  if (!Array.isArray(a.epicBuilderStatus)) { delete a.epicBuilderStatus; return; }
+  a.epicBuilderStatus = a.epicBuilderStatus
+    .filter((s) => s && typeof s === "object" && !Array.isArray(s))
+    .slice(0, 50);
+  for (const s of a.epicBuilderStatus) {
+    for (const k of ["id", "state", "epicKey", "error"]) {
+      if (k in s && typeof s[k] !== "string") delete s[k];
+    }
+    if (typeof s.id === "string" && s.id.length > 64) s.id = s.id.slice(0, 64);
+    // `state` is re-capped like every other string here — a host reporting a
+    // multi-MB `state` would otherwise ride /api/agents + every SSE frame at full
+    // length beside the capped siblings (bounded per record by AGENT_RECORD_MAX,
+    // but a wire hazard the moment a client types the field — the heartbeat
+    // contract). The VALUE (which state it is) is still advanceEpicBuilder's check.
+    if (typeof s.state === "string" && s.state.length > 64) s.state = s.state.slice(0, 64);
+    if (typeof s.epicKey === "string" && s.epicKey.length > 64) s.epicKey = s.epicKey.slice(0, 64);
+    if (typeof s.error === "string" && s.error.length > 500) s.error = s.error.slice(0, 500);
+  }
 }
 
 // ============================================================================
@@ -11221,6 +11461,10 @@ setInterval(() => {
   // in this same tick. Epics + their children are excluded from autoStartSweep
   // above (XERK-635), so the two streams never contend for the same ticket.
   epicRunDriveSweep();
+  // Epic Builder dispatch (XERK-725): hand each queued builder run to a capable
+  // host through findTicketHost. No-op with none queued; one already dispatched is
+  // left to its host. Retries a held (no free host) builder each tick.
+  epicBuilderDriveSweep();
   // Triage -> tracker priority (XERK-483): gated per org; no-op unless opted in.
   priorityWriteBackSweep();
   // Triage -> duplicate links (XERK-484): gated per org and Jira-only; no-op
@@ -12723,14 +12967,6 @@ const server = http.createServer(async (req, res) => {
       // a conflict that appeared): those need a human, not another attempt.
       const mergePrResults = payload.mergePrResults;
       delete payload.mergePrResults;
-      // Epic Builder materialization outcomes (XERK-724): the results of the
-      // createEpicChild / createBlocksLink primitives (XERK-723) the hub queued
-      // to build an epic. Cached by cmdId below like the other write outcomes and
-      // read by the materialization run (XERK-725) to advance the epic build.
-      const epicChildResults = payload.epicChildResults;
-      delete payload.epicChildResults;
-      const blocksLinkResults = payload.blocksLinkResults;
-      delete payload.blocksLinkResults;
       // Session-creating commands this agent REFUSED since the last beat
       // (XERK-265) — cached by cmdId below and applied to any migration they
       // name, so a refusal fails the move now rather than at its timeout.
@@ -12831,11 +13067,6 @@ const server = http.createServer(async (req, res) => {
         // Per-cmdId PR auto-merge outcome cache (XERK-550); survives across
         // beats like `linkResults` and is stripped from the fleet payload.
         mergeResults: prev.mergeResults || {},
-        // Per-cmdId Epic Builder materialization outcome caches (XERK-724): the
-        // createEpicChild / createBlocksLink results (XERK-723). Survive across
-        // beats like `mergeResults` and are stripped from the fleet payload.
-        epicChildResults: prev.epicChildResults || {},
-        blocksLinkResults: prev.blocksLinkResults || {},
         // Per-cmdId refusals of a session-creating command (XERK-265). Survives
         // across beats like the caches above, but is SERVED with the record
         // rather than stripped — the client following that spawn is who needs it.
@@ -12978,8 +13209,6 @@ const server = http.createServer(async (req, res) => {
       ingestMergeResults(next, mergePrResults);
       ingestCreateMeta(next, createMetaResults);
       ingestCreateResults(next, createTicketResults);
-      ingestEpicChildResults(next, epicChildResults);
-      ingestBlocksLinkResults(next, blocksLinkResults);
       // Scoped to the commands this host was actually given: `prev.commands` is
       // the queue BEFORE this beat's acks were filtered out, and the agent
       // stages a refusal in the same handle_commands call that acks it, so the
@@ -12991,6 +13220,11 @@ const server = http.createServer(async (req, res) => {
       // being checked.
       ingestSpawnFailures(key, next,
         new Set((prev.commands || []).map((c) => c && c.cmdId)), spawnFailures);
+      // XERK-725: advance any Epic Builder run this host is reporting on. Reads
+      // the coerced `next.epicBuilderStatus` (normalizeRecord ran above); a host
+      // may only advance a builder DISPATCHED to it, and an absent field advances
+      // nothing (older agent / not running a builder).
+      ingestEpicBuilderStatus(key, next);
       // Ordered after every ingest above: an ack settles against what this same
       // beat delivered, which is the whole basis of the gap detection.
       resolveResultWaits(prev, next, commands);
@@ -13009,8 +13243,7 @@ const server = http.createServer(async (req, res) => {
       // across the fleet.
       if ([historyResults, subagentHistoryResults, jiraIssueResults,
            ticketStatusResults, ticketPriorityResults, ticketLinkResults,
-           mergePrResults, createMetaResults, createTicketResults,
-           epicChildResults, blocksLinkResults].some(
+           mergePrResults, createMetaResults, createTicketResults].some(
              (a) => Array.isArray(a) && a.length)) {
         enforceCacheHostBudget(next);
         enforceCacheTotalBudget();
@@ -13674,6 +13907,41 @@ const server = http.createServer(async (req, res) => {
       const traj = archive.dshTrajectory(transcriptId);
       if (!traj) return json(res, 404, { error: "no dsh trajectory for this session" });
       return json(res, 200, traj);
+    }
+
+    // GET /api/archive/<transcriptId>/trajectory — the runtime-dispatched
+    // Trajectory (XERK-715, epic XERK-712), the claude/qwen sibling of the dsh
+    // route above and user-authed like `GET /api/archive/<id>`. One normalized
+    // shape (docs/trajectory-contract.md), three runtimes, chosen from the
+    // archived session's OWN data rather than a live lookup so it answers for an
+    // offline/removed host too:
+    //   - a dsh session ships its raw native log LIVE (XERK-469, no `defer_raw`),
+    //     so `dshTrajectory` — which folds `<tid>/dsh/*.jsonl` — resolves whether
+    //     the session is RUNNING or ENDED. Stamp `runtime:"dsh"`/`partial:false`.
+    //   - a claude/qwen session ships its raw `<tid>.jsonl` only at session END
+    //     (`defer_raw`), so `claudeTrajectory` (raw fold, `runtime` from the
+    //     line shape) gives the FULL trajectory once ENDED (tokens+model+timings).
+    //   - a RUNNING claude/qwen session has no raw yet, but its RENDERED layer is
+    //     synced hub-side, so serve a DEGRADED trajectory from it — `partial:true`,
+    //     tokens null — flagged so the UI shows what it can. The live token/model
+    //     enrichment is a separate ticket; this must work without it.
+    // Nothing raw is returned (JSON only, bounded in archive.js). A genuinely
+    // unknown / not-yet-synced id 404s, carrying a `refused` hint like the sibling
+    // `GET /api/archive/<id>` when a push was refused rather than merely late.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "archive" &&
+        parts[3] === "trajectory" && parts.length === 4) {
+      const transcriptId = decodeURIComponent(parts[2]);
+      const dsh = archive.dshTrajectory(transcriptId);
+      if (dsh) return json(res, 200, { runtime: "dsh", partial: false, ...dsh });
+      const full = archive.claudeTrajectory(transcriptId);
+      if (full) return json(res, 200, { partial: false, ...full });
+      const degraded = archive.renderedTrajectory(
+        transcriptId, liveRuntimeForTranscript(transcriptId));
+      if (degraded) return json(res, 200, degraded);
+      const r = archiveRefusalFor(transcriptId);
+      return json(res, 404, r
+        ? { error: "no trajectory for this session", refused: { host: r.host, at: r.at, error: r.error } }
+        : { error: "no trajectory for this session" });
     }
 
     // POST /api/agents/<host>/clone — queue a clone into the host's repos
@@ -15140,6 +15408,82 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, run });
     }
 
+    // POST /api/jira/<siteKey>/epic-builder — the operator entry point that
+    // expands an IDEA into an Auto-Epic-ready epic (XERK-725, epic XERK-721).
+    // Body: {title, idea, repo?, targetHost?}. Operator-authed and authoritative
+    // on the 200 like the pin/triage/epic-run routes above. It validates the
+    // input, bounds the idea length (413), refuses when no host reports the org
+    // (404) or a named repo is not cloneable by any host of the org (404), then
+    // creates a durable builder run (state "queued") and dispatches it to a
+    // capable host through the SAME findTicketHost the Start button uses — so
+    // capacity/backpressure/host-selection are inherited, never re-implemented.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "epic-builder") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      // Input shape first (400), so a bad request never reaches the length/org
+      // checks below.
+      const title = typeof body.title === "string" ? body.title.trim() : "";
+      const idea = typeof body.idea === "string" ? body.idea : "";
+      if (!title) return json(res, 400, { error: "a non-empty title is required" });
+      if (!idea.trim()) return json(res, 400, { error: "a non-empty idea is required" });
+      if (title.length > EPIC_BUILDER_TITLE_MAX) {
+        return json(res, 400, { error: `title must be at most ${EPIC_BUILDER_TITLE_MAX} characters` });
+      }
+      // Validate the RAW body field, not the coerced value: a bad-TYPED repo
+      // (number/array/object) must 400, not be silently coerced to "absent" and
+      // return 200 with the operator's intended pin dropped. `!= null` lets an
+      // omitted / explicit-null / "" field mean "the builder picks one"; anything
+      // else present must be a string within bound.
+      if (body.repo != null && (typeof body.repo !== "string" || body.repo.length > 200)) {
+        return json(res, 400, { error: "repo must be a repo name" });
+      }
+      if (body.targetHost != null && (typeof body.targetHost !== "string" || body.targetHost.length > 200)) {
+        return json(res, 400, { error: "targetHost must be a host name" });
+      }
+      const repo = typeof body.repo === "string" && body.repo ? body.repo : null;
+      const targetHost = typeof body.targetHost === "string" && body.targetHost ? body.targetHost : null;
+      // The idea is bounded because it rides both the durable record (served on
+      // the payload + SSE) and the dispatch command — an oversize one is a 413,
+      // the size refusal, not a malformed request.
+      if (idea.length > EPIC_BUILDER_IDEA_MAX) {
+        return json(res, 413, { error: `idea must be at most ${EPIC_BUILDER_IDEA_MAX} characters` });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      // A named repo must be cloneable by the org — some host of it must already
+      // report the repo (cloned or listed). Omitting `repo` lets the builder pick
+      // one, so it skips this. A named targetHost must actually report the org.
+      if (repo !== null && !orgReportsRepo(siteKey, repo)) {
+        return json(res, 404, { error: "no host reporting that Jira org has that repo" });
+      }
+      if (targetHost !== null) {
+        const a = agents[targetHost];
+        if (!a || !a.jira || a.jira.siteKey !== siteKey) {
+          return json(res, 404, { error: "no such host reports that Jira org" });
+        }
+      }
+      const run = armEpicBuilder(siteKey, { title, idea, repo, targetHost });
+      // Dispatch now if a host is free (else it holds "queued", retried on the
+      // 15s sweep). Inline so a quiet fleet starts the builder without a sweep wait.
+      epicBuilderDriveSweep();
+      return json(res, 200, { ok: true, run: epicBuilders[run.id] || run });
+    }
+
+    // DELETE /api/jira/<siteKey>/epic-builder/<id> — cancel a builder run
+    // (XERK-725). Drops the hub's record; the dispatched session (if any) is not
+    // reachable from the hub and is left to end on its own. Operator-authed and
+    // authoritative on the 200.
+    if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[3] === "epic-builder") {
+      const id = decodeURIComponent(parts[4]);
+      const existed = clearEpicBuilder(id);
+      return json(res, existed ? 200 : 404,
+        existed ? { ok: true, cleared: true } : { error: "no builder run by that id" });
+    }
+
     // POST /api/jira/<siteKey>/autostart — flip an org's auto-start opt-in
     // (XERK-41). Body: {enabled:true|false}. Hub-owned durable state, so — like
     // the /agent pin and unlike the /repo override — the save is authoritative
@@ -16006,6 +16350,20 @@ if (process.env.TURMA_TEST) {
     isEpicOrEpicChild,
     sanitizeEpicRunRecord,
     EPIC_RUN_STATES,
+    // Epic Builder (XERK-725, epic XERK-721): the durable run store, its arm/clear
+    // + advance helpers, the heartbeat-status ingest, the dispatch driver, the
+    // record whitelist, the state set and the idea/status bounds the tests drive.
+    epicBuilders,
+    armEpicBuilder,
+    clearEpicBuilder,
+    advanceEpicBuilder,
+    ingestEpicBuilderStatus,
+    epicBuilderDriveSweep,
+    sanitizeEpicBuilderRecord,
+    normalizeEpicBuilderStatus,
+    EPIC_BUILDER_STATES,
+    EPIC_BUILDER_IDEA_MAX,
+    EPIC_BUILDER_REDISPATCH_MS,
     // XERK-636: the wave-dispatch driver + its readiness/state helpers, and the
     // per-child backoff map (XERK-61/109 hot-loop guard).
     epicRunDriveSweep,
@@ -16065,8 +16423,6 @@ if (process.env.TURMA_TEST) {
     dedupeLinkSweep,
     dedupeLinkSkips,
     ingestTicketLinkResults,
-    ingestEpicChildResults,
-    ingestBlocksLinkResults,
     orgColors,
     setOrgColor,
     // Per-repo importance tiers (XERK-487): the store and the read seams [E]'s

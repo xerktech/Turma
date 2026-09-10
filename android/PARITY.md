@@ -86,6 +86,14 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   dropped to fit the reply carries "… preview dropped to fit" on its name chip on both, so it reads
   differently from a file that never rendered. Both clients still poll `/history` while the live
   socket is down, and still page older entries through it.
+- **Session Trajectory view is WEB-ONLY (epic XERK-712).** The generalized Trajectory pane — a
+  read-only turns / tool-calls / tokens render for Claude and Qwen sessions (not just dsh), toggled
+  beside "Terminal ▸" (XERK-717) and served by `GET /api/archive/<transcriptId>/trajectory`
+  (XERK-715) — ships on the WEB only; no Android, no glasses. Android carries only the earlier
+  dsh-specific Trajectory screen (`ui/TrajectoryScreen.kt`, XERK-498) over `GET
+  /api/dsh/<id>/trajectory`, and is NOT being generalized to Claude/Qwen here. Recorded web-only
+  like the archive Restore picker (XERK-453); a later ticket can port the shared view to the phone
+  if a need appears. Shape/renderer invariants: `.claude/rules/trajectory.md`.
 
 ## Done (this pass — first installment)
 
@@ -621,6 +629,20 @@ those are marked `[MODEL]`.
 - **P2 dsh Trajectory view, and no terminal for dsh (XERK-498).** Android half DONE (see Done below).
   Still open: **glasses** (`hub-client.ts`) likewise still exposes the terminal for a dsh session —
   the same suppression, plus ideally the same Trajectory render.
+- **P2 Trajectory generalized to claude/qwen (XERK-717, epic XERK-712).** Web now shows the
+  Trajectory toggle for a claude/qwen session too — BESIDE "Terminal ▸" (not replacing it, since
+  those runtimes keep their ttyd terminal), shown once the session has a `transcriptId`. It fetches
+  the unified `GET /api/archive/<transcriptId>/trajectory` (runtime-dispatched, XERK-715) instead of
+  the dsh-only `/api/dsh/...`, and `renderTrajectory` renders the XERK-712 SUPERSET
+  (`docs/trajectory-contract.md`): per turn — the user message, model output blocks (text +
+  thinking), tool-call rows WITH result snippets, per-turn + total tokens, model, duration; a
+  `partial:true` (running) payload shows a "tokens after the session ends" note. dsh renders through
+  the same code as its subset (missing fields absent). **Android is still on the dsh-only path**:
+  `TrajectoryScreen`/`TrajectoryViewModel`/`HubApi.dshTrajectory` call `/api/dsh/<id>/trajectory` and
+  only a dsh session exposes the action. To reach parity: switch the call to the unified archive
+  endpoint, widen `DshTrajectory` (`TrajTurn`/`TrajCall`) to the superset fields (`user`, `output[]`,
+  per-turn `model`, per-call `result`, `partial`, `runtime`), render user/output/result + the partial
+  note, and offer the action for a claude/qwen session (beside Terminal, gated on a transcript id).
 - **P3 host-wide "dsh web ↗" link in the dsh chat header (XERK-501).** The web shows a link to the
   host's single host-wide `dsh web` viewer for a dsh session whose host reports a reachable
   `dsh.web.url` (`AgentInfo.dsh.web = {running, port, url}`, hub-whitelisted; absent/`url:null` on a
@@ -762,6 +784,18 @@ those are marked `[MODEL]`.
 - P3 Org control: no cross-tab sync (the web follows a `storage` event when a second tab re-scopes;
   a phone has one instance) and no "Currently set" carry-back for a stored-but-unreported org — the
   pick is kept and resumes, it just isn't listed while nothing reports it, same as the web.
+- **P1 Epic Builder composer + progress (XERK-726) is WEB-ONLY for now.** The board's "✨ New epic"
+  composer (title + free-form idea + optional repo/host, POSTing to `POST
+  /api/jira/<siteKey>/epic-builder`) and the progress strip that tracks a builder run through
+  queued → researching → creating → done/failed — linking the produced epic and offering a one-click
+  "Arm Auto Epic run" — have no Android counterpart yet. **Decode-safe**: `epicBuilders` is a NEW
+  top-level `/api/agents` key that Android does not type, so `ignoreUnknownKeys` skips it (no
+  decode-fatality — the full-array atomicity risk needs a TYPED field). To reach parity: type
+  `epicBuilders: Map<String, EpicBuilder>?` on the fleet payload, add an `EpicBuilder` shape
+  (`id/siteKey/title/idea/state/host/epicKey/error`), render a progress list + Arm button in
+  `BoardScreen.kt`, and a composer sheet (like `CreateTicketSheet`) POSTing the same route — reusing
+  the epic-run arm call already wired for XERK-638. It is a low-frequency operator authoring action,
+  so this follows the same web-first precedent as the org auto-merge switch (XERK-550).
 
 ### Usage (`usage.html` → `UsageScreen`)
 - ~~P0 30-day stacked daily chart.~~ ~~P0 Legend with per-series + per-group toggles, persisted,
