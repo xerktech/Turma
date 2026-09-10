@@ -65,31 +65,46 @@ function fakeTracker(opts) {
   return { state, run };
 }
 
-// Drive the engine to completion (or failure) the way D's beat loop would: each
-// "beat" folds the PREVIOUS beat's outcomes, gets the next commands, runs them
-// against the tracker, and stages their outcomes for the next beat. Bounded so a
-// stuck engine can't loop forever. Returns { report, state, beats, tracker }.
-function drive(plan, opts, tracker, seedState) {
+// Drive the engine to completion (or failure) the way D's real beat loop does,
+// WITH LATENCY: a command issued at beat N yields its outcome only at beat
+// N+`delay` (a primitive's result rides a LATER heartbeat — `delay` >= 2 is the
+// normal regime). The caller queues EVERY returned command that beat, then feeds
+// back only the outcomes that have "landed" by the current beat. This is the
+// scenario that catches an engine that re-emits an in-flight command (which
+// would duplicate a ticket). `delay` defaults to 2. Returns
+// { report, state, beats, tracker, waits } — `waits` counts zero-command ticks.
+function drive(plan, opts, tracker, seedState, delay) {
+  const d = delay || 2;
   let mstate = seedState || null;
-  let outcomes = {};
+  const pending = []; // { landAt, step, result }
   let beats = 0;
+  let waits = 0;
   for (;;) {
     beats++;
-    assert.ok(beats < 50, "engine did not settle");
+    assert.ok(beats < 80, "engine did not settle");
+    // Outcomes that have landed by this beat.
+    const outcomes = {};
+    for (let i = pending.length - 1; i >= 0; i--) {
+      if (pending[i].landAt <= beats) {
+        const p = pending.splice(i, 1)[0];
+        outcomes[p.step] = M.outcomeFromResult(p.result.kind, p.result);
+      }
+    }
     const tick = M.materializeTick(plan, opts, mstate, outcomes);
     mstate = tick.state;
-    if (tick.done || tick.failed) return { report: tick.report, state: mstate, beats, tick };
+    if (tick.done || tick.failed) return { report: tick.report, state: mstate, beats, waits, tick };
     if (tick.commands.length === 0) {
-      // No progress and not terminal: only legitimate if we are waiting on an
-      // outcome we already fed — which `drive` never does, so this is a stall.
-      throw new Error("engine stalled with no commands at phase " + mstate.phase);
+      // Legitimate ONLY while something is genuinely in flight; otherwise a stall.
+      assert.ok(pending.length > 0,
+        "engine returned no commands with nothing in flight at phase " + mstate.phase);
+      waits++;
+      continue;
     }
-    // Run this beat's commands; stage outcomes keyed by step for the next tick.
-    outcomes = {};
+    // Queue each returned command against the tracker; its outcome lands later.
     for (const { step, cmd } of tick.commands) {
       const result = tracker.run(step, cmd);
-      const kind = cmd.type;
-      outcomes[step] = M.outcomeFromResult(kind, result);
+      result.kind = cmd.type;
+      pending.push({ landAt: beats + d, step, result });
     }
   }
 }
@@ -139,7 +154,7 @@ test("XERK-724: an invalid plan previews invalid and never writes", () => {
 test("XERK-724: a full run yields isEpic + epicKey-on-every-child + the DAG links", () => {
   const plan = diamondPlan();
   const tracker = fakeTracker();
-  const { report, beats } = drive(plan, { project: "XERK" }, tracker);
+  const { report } = drive(plan, { project: "XERK" }, tracker);
 
   assert.equal(report.done, true);
   assert.equal(report.failed, false);
@@ -161,9 +176,38 @@ test("XERK-724: a full run yields isEpic + epicKey-on-every-child + the DAG link
     [keyOf.b, keyOf.d], [keyOf.c, keyOf.d],
   ].sort();
   assert.deepEqual(gotLinks, wantLinks);
-  // One round-trip for the epic, one per dependency WAVE of children (a/{b,c}/d
-  // = 3 waves), one for the links batch, plus a final fold beat = 6.
-  assert.equal(beats, 6);
+});
+
+test("XERK-724: NO duplicate tickets when results take multiple beats to land", () => {
+  // The regression QA caught (in-flight re-emit): a create's result rides a
+  // LATER heartbeat, so a caller that queues every returned command each beat
+  // must never be handed the same create twice. Drive across realistic delays.
+  for (const delay of [2, 3, 5]) {
+    const plan = diamondPlan();
+    const tracker = fakeTracker();
+    const { report, waits } = drive(plan, { project: "XERK" }, tracker, null, delay);
+    assert.equal(report.done, true, `delay=${delay}`);
+    const creates = Object.values(tracker.state.created);
+    assert.equal(creates.filter((c) => c.type === "epic").length, 1, `epics delay=${delay}`);
+    assert.equal(creates.filter((c) => c.type === "child").length, 4, `children delay=${delay}`);
+    assert.equal(tracker.state.links.length, 5, `links delay=${delay}`);
+    // A higher delay only ADDS wait beats — it never adds writes.
+    assert.ok(waits > 0, `delay=${delay} should have waited on in-flight results`);
+  }
+});
+
+test("XERK-724: an in-flight step is not re-emitted while its outcome is pending", () => {
+  // First tick issues the epic create and marks it in-flight; a second tick with
+  // NO outcome yet must return zero commands (waiting), not the epic again.
+  const plan = diamondPlan();
+  const t1 = M.materializeTick(plan, { project: "XERK" }, null, {});
+  assert.equal(t1.commands.length, 1);
+  assert.equal(t1.commands[0].step, "epic");
+  assert.deepEqual(t1.report.inFlight, ["epic"]);
+  const t2 = M.materializeTick(plan, { project: "XERK" }, t1.state, {}); // no outcome
+  assert.deepEqual(t2.commands, []);
+  assert.deepEqual(t2.report.inFlight, ["epic"]);
+  assert.equal(t2.failed, false);
 });
 
 test("XERK-724: buildEpicWaves over the materialized DAG yields the intended waves", () => {
@@ -216,12 +260,10 @@ test("XERK-724: a resume after partial failure does NOT re-create the landed chi
   const landedBefore = Object.keys(t1.state.created).length; // epic + a + b = 3
   assert.equal(landedBefore, 3);
 
-  // Resume from the persisted state against a fresh (healthy) tracker that
-  // continues the key numbering, but SHARES the already-created records so a
-  // duplicate would be visible. Simplest: reuse the same tracker, cleared of the
-  // failure, and re-seed the engine's phase to children.
-  const resumeState = M.coerceState(first.state);
-  resumeState.phase = "children"; // re-open the run from where it failed
+  // Resume from the persisted state against the SAME tracker (its failOnce is
+  // spent, so child:c now succeeds), re-opening the failed run with reopenState.
+  // A duplicate epic/a/b would show up as extra records in tracker.state.created.
+  const resumeState = M.reopenState(first.state);
   const second = drive(plan, { project: "XERK" }, t1, resumeState);
 
   assert.equal(second.report.done, true);
@@ -256,6 +298,37 @@ test("XERK-724: materialize refuses with no project, before any write", () => {
   assert.ok(tick.report.failures.some((f) => /project/.test(f.error)));
 });
 
+// ---- corrupted / forged resume state cannot lie or mis-write ---------------
+
+test("XERK-724: a forged phase:done over an empty state does NOT report done", () => {
+  // done/failed/phase are derived from CONTENT, so a stored label can't lie.
+  const plan = diamondPlan();
+  const forged = { phase: "done", epicKey: null, keyByLocalId: {}, links: {}, issued: {}, failures: [] };
+  const rep = M.materializationReport(plan, forged);
+  assert.equal(rep.done, false);
+  assert.equal(rep.phase, "epic");
+  assert.ok(rep.pending.length > 0);
+  // And a tick over it re-issues the EPIC (from the start), never a later step.
+  const tick = M.materializeTick(plan, { project: "XERK" }, forged, {});
+  assert.equal(tick.done, false);
+  assert.deepEqual(tick.commands.map((c) => c.step), ["epic"]);
+});
+
+test("XERK-724: a forged phase:links with no child keys never emits a null-keyed link", () => {
+  // The link phase is only ENTERED once every child key exists (derived), so a
+  // corrupted state claiming links can't produce createBlocksLink with undefined
+  // keys — it falls back to creating what's actually missing.
+  const plan = diamondPlan();
+  const forged = { phase: "links", epicKey: "XERK-1", keyByLocalId: {}, links: {}, issued: {}, failures: [] };
+  const tick = M.materializeTick(plan, { project: "XERK" }, forged, {});
+  for (const { cmd } of tick.commands) {
+    assert.notEqual(cmd.type, "createBlocksLink");
+  }
+  // It resumes at the children phase (epic exists, children don't).
+  assert.ok(tick.commands.every((c) => c.cmd.type === "createEpicChild"));
+  assert.ok(tick.commands.length > 0);
+});
+
 // ---- a single-child plan (trivially blocked-by-all) ------------------------
 
 test("XERK-724: a one-child plan materializes epic + child + no links", () => {
@@ -264,12 +337,11 @@ test("XERK-724: a one-child plan materializes epic + child + no links", () => {
     children: [{ localId: "only", summary: "do it", description: "", issueType: "Task", blockedBy: [] }],
   };
   const tracker = fakeTracker();
-  const { report, beats } = drive(plan, { project: "XERK" }, tracker);
+  const { report } = drive(plan, { project: "XERK" }, tracker, null, 3);
   assert.equal(report.done, true);
   assert.equal(report.children.length, 1);
+  assert.equal(Object.values(tracker.state.created).filter((c) => c.type === "child").length, 1);
   assert.equal(tracker.state.links.length, 0);
-  // epic beat, child beat, and a final fold beat (no link phase work).
-  assert.equal(beats, 3);
 });
 
 // ---- outcomeFromResult: the per-primitive success rule ---------------------

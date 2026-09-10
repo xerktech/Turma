@@ -179,6 +179,7 @@ function freshState() {
     epicUrl: null,
     keyByLocalId: {},
     links: {},
+    issued: {},
     failures: [],
   };
 }
@@ -192,8 +193,46 @@ function coerceState(state) {
     epicUrl: s.epicUrl || null,
     keyByLocalId: (s.keyByLocalId && typeof s.keyByLocalId === "object") ? { ...s.keyByLocalId } : {},
     links: (s.links && typeof s.links === "object") ? { ...s.links } : {},
+    // Steps whose command has been RETURNED to the caller but whose outcome has
+    // not yet been folded — the in-flight set. This is what stops a not-yet-
+    // landed create from being re-emitted every beat (createTicket /
+    // createEpicChild are NOT idempotent, so re-issuing one duplicates a
+    // ticket). Cleared per step the beat its outcome folds. A caller that must
+    // retry a command it believes was LOST (queued, no result, no session) can
+    // delete that step's entry to force a re-emit — retry policy is the run's
+    // (XERK-725, D), never the engine's.
+    issued: (s.issued && typeof s.issued === "object") ? { ...s.issued } : {},
     failures: Array.isArray(s.failures) ? s.failures.slice() : [],
   };
+}
+
+// Re-open a run that STOPPED at `failed` so materialization continues from
+// exactly what already exists (the epic + children + links recorded in the
+// state), re-issuing only the steps that never landed. This is how the run
+// tracker (XERK-725, D) retries after a partial failure: clear the terminal
+// marker; the working phase is re-derived from content each tick, so nothing
+// already created is re-issued (a create is never idempotent). A no-op on a
+// non-failed state.
+function reopenState(state) {
+  const s = coerceState(state);
+  if (s.phase === "failed") s.phase = "epic"; // non-terminal; real phase is derived
+  return s;
+}
+
+// The working phase DERIVED from state CONTENT, not a stored label — so a
+// corrupted or forged `phase` on a rehydrated run record can never make the
+// engine (a) report done while the DAG is incomplete, or (b) enter the link
+// phase with children still uncreated and emit null-keyed link commands. The
+// authoritative terminal is `failed` (sticky, checked before this); every other
+// phase is a pure function of what actually exists.
+function derivePhase(plan, s) {
+  if (!s.epicKey) return "epic";
+  if (childOrder(plan).some((id) => !s.keyByLocalId[id])) return "children";
+  const incomplete = linkSteps(plan).some((l) => {
+    const r = s.links[linkStepId(l.blocker, l.blocked)];
+    return !(r && r.ok);
+  });
+  return incomplete ? "links" : "done";
 }
 
 // The report the caller surfaces at every step and, decisively, on partial
@@ -203,7 +242,11 @@ function coerceState(state) {
 //     links:[{blocker, blocked, action}],  // resolved, in creation order
 //     failures:[{step, error}],
 //     pending:[step],                       // steps not yet done
+//     inFlight:[step],                      // commands issued, outcome pending
 //     done, failed }
+// `done`/`failed`/`phase` are derived from CONTENT (not a stored label), so the
+// report is self-consistent even for a corrupted rehydrated state: `done` is
+// true only when the epic, every child and every link actually exist.
 function materializationReport(plan, state) {
   const s = coerceState(state);
   const created = childOrder(plan)
@@ -211,25 +254,27 @@ function materializationReport(plan, state) {
     .map((id) => ({ localId: id, key: s.keyByLocalId[id] }));
   const links = linkSteps(plan)
     .map((l) => ({ l, r: s.links[linkStepId(l.blocker, l.blocked)] }))
-    .filter((x) => x.r)
+    .filter((x) => x.r && x.r.ok)
     .map((x) => ({ blocker: x.l.blocker, blocked: x.l.blocked, action: x.r.action || null }));
   const pending = [];
   if (!s.epicKey) pending.push(EPIC_STEP);
   for (const id of childOrder(plan)) if (!s.keyByLocalId[id]) pending.push(childStepId(id));
   for (const l of linkSteps(plan)) {
     const st = linkStepId(l.blocker, l.blocked);
-    if (!s.links[st]) pending.push(st);
+    if (!(s.links[st] && s.links[st].ok)) pending.push(st);
   }
+  const failed = s.phase === "failed";
   return {
-    phase: s.phase,
+    phase: failed ? "failed" : derivePhase(plan, s),
     epicKey: s.epicKey,
     epicUrl: s.epicUrl,
     children: created,
     links,
     failures: s.failures.slice(),
     pending,
-    done: s.phase === "done",
-    failed: s.phase === "failed",
+    inFlight: Object.keys(s.issued),
+    done: !failed && pending.length === 0,
+    failed,
   };
 }
 
@@ -279,14 +324,20 @@ function linkCommand(state, blocker, blocked) {
 // shape the caller distils from a result cache entry:
 //   - createTicket/createEpicChild result → ok = !result.error, key/url from it;
 //   - createBlocksLink result → ok = result.ok, action from it.
-// An outcome absent for an issued step means "not landed yet" — the engine
-// simply re-returns nothing new and waits (idempotent per beat).
+// An outcome absent for an ISSUED step means "not landed yet" — the step stays
+// in the in-flight set (`state.issued`) and is NOT re-emitted, so a create whose
+// result rides a LATER heartbeat is issued EXACTLY ONCE. This is load-bearing:
+// createTicket / createEpicChild are NOT idempotent, so re-emitting one every
+// beat until its result lands (a beat or more) would create duplicate tickets —
+// precisely the regime this state machine exists to handle. A tick with an
+// outstanding step and no new outcome therefore legitimately returns ZERO
+// commands (the run is waiting), not a stall.
 //
 // Failure policy: a create that comes back `!ok` is recorded in `failures` and
-// STOPS the run at `failed` — a half-created wave must not silently proceed to
-// links that can't resolve. The report then names exactly what exists, so D can
-// surface it and a human (or a resumed run) can continue. A link that comes back
-// `!ok` also fails the run (the DAG would be wrong), but createBlocksLink is
+// STOPS the run at `failed` (sticky) — a half-created wave must not silently
+// proceed to links that can't resolve. The report then names exactly what
+// exists, so D can surface it and a resumed run can continue. A link that comes
+// back `!ok` also fails the run (the DAG would be wrong), but createBlocksLink is
 // idempotent so a resume re-issues it cleanly.
 function materializeTick(plan, opts, state, outcomes) {
   const o = outcomes && typeof outcomes === "object" ? outcomes : {};
@@ -311,100 +362,106 @@ function materializeTick(plan, opts, state, outcomes) {
   }
 
   const s = state ? coerceState(state) : freshState();
-  const commands = [];
-  const recordFailure = (step, error) => {
-    s.failures.push({ step, error: String(error || "unknown error").slice(0, 300) });
-    s.phase = "failed";
-  };
 
-  // Fold in the outcomes of whatever was issued last tick, per phase.
-  // ---- epic -------------------------------------------------------------
-  if (s.phase === "epic") {
-    const out = o[EPIC_STEP];
-    if (out) {
-      if (out.ok && out.key) {
-        s.epicKey = out.key;
-        s.epicUrl = out.url || null;
-        s.phase = "children";
-      } else {
-        recordFailure(EPIC_STEP, out.error || "epic creation failed");
-      }
-    } else if (!s.epicKey) {
-      // Nothing issued yet (or not landed): issue the epic create.
-      commands.push({ step: EPIC_STEP, cmd: epicCommand(plan, options) });
-    }
+  // A failure is TERMINAL and sticky — re-entering a failed run issues nothing
+  // (a resume deliberately re-opens it by clearing `phase`/the failed step).
+  if (s.phase === "failed") {
+    return { state: s, commands: [], report: materializationReport(plan, s),
+             done: false, failed: true };
   }
 
-  // ---- children ---------------------------------------------------------
-  if (s.phase === "children") {
-    // Ingest any child outcomes present.
+  const commands = [];
+  const emit = (step, cmd) => { commands.push({ step, cmd }); s.issued[step] = true; };
+  const recordFailure = (step, error) => {
+    s.failures.push({ step, error: String(error || "unknown error").slice(0, 300) });
+    delete s.issued[step];
+    s.phase = "failed";
+  };
+  // A step that succeeds THIS tick clears any earlier failure for it — so a
+  // resume (which re-opens a failed run) that then succeeds the once-failed step
+  // reports a clean run, not a stale failure in the log.
+  const clearFailure = (step) => {
+    if (s.failures.length) s.failures = s.failures.filter((f) => f.step !== step);
+  };
+
+  // ---- 1. FOLD every outcome present, clearing the in-flight mark ----------
+  // Done regardless of phase (an outcome for a step folds it whatever phase the
+  // stored label claims). The epic first, then children, then links.
+  if (!s.epicKey) {
+    const out = o[EPIC_STEP];
+    if (out) {
+      delete s.issued[EPIC_STEP];
+      if (out.ok && out.key) { s.epicKey = out.key; s.epicUrl = out.url || null; clearFailure(EPIC_STEP); }
+      else recordFailure(EPIC_STEP, out.error || "epic creation failed");
+    }
+  }
+  if (s.phase !== "failed") {
     for (const id of childOrder(plan)) {
       if (s.keyByLocalId[id]) continue;               // already created
       const out = o[childStepId(id)];
       if (!out) continue;                             // not landed yet
-      if (out.ok && out.key) s.keyByLocalId[id] = out.key;
+      delete s.issued[childStepId(id)];
+      if (out.ok && out.key) { s.keyByLocalId[id] = out.key; clearFailure(childStepId(id)); }
       else recordFailure(childStepId(id), out.error || "child creation failed");
     }
-    if (s.phase === "children") {                     // not tripped into failed
-      // Create children WAVE BY WAVE, not all at once: issue the earliest wave
-      // that still has an uncreated child, and issue no LATER wave until it
-      // completes. createEpicChild only needs the epic to exist (not the child's
-      // blockers), so all-at-once would create correctly — but a mid-plan
-      // failure would then leave DOWNSTREAM children created whose failed
-      // blockers can never be linked. Wave-gating bounds a failure's blast
-      // radius to one wave: a wave with a failure stops the run before any later
-      // wave is touched, so the partial-failure report never shows a child whose
-      // predecessors did not land. Siblings WITHIN a wave are independent, so
-      // they are still issued together (one round-trip per wave). Not re-issuing
-      // ones already in keyByLocalId is what makes a retry non-duplicating.
-      const waves = EP.waves(plan).waves;
-      let issued = false;
-      for (const wave of waves) {
-        const missing = wave.filter((id) => !s.keyByLocalId[id]);
-        if (missing.length === 0) continue;           // this wave is complete
-        for (const id of missing) {
-          commands.push({ step: childStepId(id), cmd: childCommand(plan, options, s, id) });
-        }
-        issued = true;
-        break;                                        // hold later waves
-      }
-      if (!issued) s.phase = "links";                 // every child created
-    }
   }
-
-  // ---- links ------------------------------------------------------------
-  if (s.phase === "links") {
-    const steps = linkSteps(plan);
-    for (const l of steps) {
+  if (s.phase !== "failed") {
+    for (const l of linkSteps(plan)) {
       const st = linkStepId(l.blocker, l.blocked);
       if (s.links[st] && s.links[st].ok) continue;    // already linked
       const out = o[st];
       if (!out) continue;
-      if (out.ok) s.links[st] = { ok: true, action: out.action || null };
+      delete s.issued[st];
+      if (out.ok) { s.links[st] = { ok: true, action: out.action || null }; clearFailure(st); }
       else recordFailure(st, out.error || "blocks link failed");
     }
-    if (s.phase === "links") {
-      const missing = steps.filter((l) => {
-        const st = linkStepId(l.blocker, l.blocked);
-        return !(s.links[st] && s.links[st].ok);
-      });
-      if (missing.length === 0) {
-        s.phase = "done";
-      } else {
-        for (const l of missing) {
-          commands.push({ step: linkStepId(l.blocker, l.blocked),
-                          cmd: linkCommand(s, l.blocker, l.blocked) });
-        }
+  }
+  if (s.phase === "failed") {
+    return { state: s, commands: [], report: materializationReport(plan, s),
+             done: false, failed: true };
+  }
+
+  // ---- 2. DERIVE the phase from CONTENT, then EMIT only NOT-in-flight steps -
+  // Deriving (never trusting the stored label) is what keeps a corrupted resume
+  // from emitting a null-keyed link (the link phase is only reached once every
+  // child key exists) or reporting done over an empty build.
+  s.phase = derivePhase(plan, s);
+  if (s.phase === "epic") {
+    if (!s.issued[EPIC_STEP]) emit(EPIC_STEP, epicCommand(plan, options));
+  } else if (s.phase === "children") {
+    // Create children WAVE BY WAVE: issue the earliest wave that still has an
+    // uncreated child, and no LATER wave until it completes. createEpicChild
+    // only needs the epic to exist (not the child's blockers), so all-at-once
+    // would create correctly — but a mid-plan failure would then leave
+    // DOWNSTREAM children created whose failed blockers can never be linked.
+    // Wave-gating bounds a failure's blast radius to one wave. Siblings within a
+    // wave are independent, so they are issued together (one round-trip/wave).
+    const waves = EP.waves(plan).waves;
+    for (const wave of waves) {
+      const uncreated = wave.filter((id) => !s.keyByLocalId[id]);
+      if (uncreated.length === 0) continue;           // this wave is complete
+      for (const id of uncreated) {
+        if (!s.issued[childStepId(id)]) emit(childStepId(id), childCommand(plan, options, s, id));
       }
+      break;                                          // hold later waves
+    }
+  } else if (s.phase === "links") {
+    // Every child exists now, so all links can go together — an in-flight link
+    // is not re-emitted, so a batch that partly landed only re-issues the rest.
+    for (const l of linkSteps(plan)) {
+      const st = linkStepId(l.blocker, l.blocked);
+      if (s.links[st] && s.links[st].ok) continue;    // already linked
+      if (!s.issued[st]) emit(st, linkCommand(s, l.blocker, l.blocked));
     }
   }
+  // s.phase === "done" falls through with no commands.
 
   return {
     state: s,
     commands,
     report: materializationReport(plan, s),
     done: s.phase === "done",
-    failed: s.phase === "failed",
+    failed: false,
   };
 }
 
@@ -552,6 +609,8 @@ module.exports = {
   // the resumable engine
   freshState,
   coerceState,
+  reopenState,
+  derivePhase,
   materializeTick,
   materializationReport,
   outcomeFromResult,
