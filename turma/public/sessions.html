@@ -989,7 +989,7 @@
       <div class="transcript-pane" id="transcriptPane" hidden>
         <div class="term-bar">
           <button class="back-btn" onclick="transcriptBack()">‹<span class="back-label" id="trBackLabel"> Sessions</span></button>
-          <span class="t-title"><span class="name" id="trTitle"></span> · <span class="path" id="trPath"></span></span>
+          <span class="t-title"><span class="name" id="trTitle"></span><span class="path" id="trPath"></span></span>
           <span class="spacer"></span>
           <span class="tr-prs" id="trPrs" hidden></span>
           <span class="verbosity" id="trVerbosity"></span>
@@ -1018,7 +1018,7 @@
       <div class="chat-pane" id="chatPane" hidden>
         <div class="term-bar">
           <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
-          <span class="t-title"><span class="name" id="chatTitle"></span> · <span class="path" id="chatPath"></span></span>
+          <span class="t-title"><span class="name" id="chatTitle"></span><span class="path" id="chatPath"></span></span>
           <span class="tunnel-off" id="chatTunnelOff" hidden></span>
           <button class="tunnel-close" id="chatTunnelClose" hidden onclick="clearStage()"
                   title="Close this view. The session is unaffected — reopen it from the list.">Close</button>
@@ -1067,7 +1067,7 @@
         <div class="term-bar">
           <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <button class="seg-toggle" id="termChatBtn" onclick="terminalToChat()" title="Back to the native chat view">◂ Chat</button>
-          <span class="t-title"><span class="name" id="termTitle"></span> · <span class="path" id="termPath"></span></span>
+          <span class="t-title"><span class="name" id="termTitle"></span><span class="path" id="termPath"></span></span>
           <span class="tunnel-off" id="termTunnelOff" hidden></span>
           <button class="tunnel-close" id="termTunnelClose" hidden onclick="clearStage()"
                   title="Close this view. The session is unaffected — reopen it from the list.">Close</button>
@@ -1099,7 +1099,7 @@
         <div class="term-bar">
           <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <button class="seg-toggle" id="trajChatBtn" onclick="trajectoryBack()" title="Back to the view this Trajectory was opened from">◂ Chat</button>
-          <span class="t-title"><span class="name" id="trajTitle"></span> · <span class="path" id="trajPath"></span></span>
+          <span class="t-title"><span class="name" id="trajTitle"></span><span class="path" id="trajPath"></span></span>
           <span class="spacer"></span>
           <button class="seg-toggle" id="trajRefresh" onclick="loadTrajectory(currentTrajId, true)" title="Reload the trajectory">↻ Refresh</button>
         </div>
