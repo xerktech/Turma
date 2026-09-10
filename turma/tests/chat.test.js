@@ -909,16 +909,18 @@ test("prFooterChip: '' when the session has no PRs", () => {
   assert.equal(prFooterChip({ prs: [] }), "");
 });
 
-test("prFooterChip: lists every PR, newest first, each linked with state + readiness mark", () => {
+test("prFooterChip: lists every PR, newest first, each linked with colour-coded state + readiness mark", () => {
   const html = prFooterChip({ prs: [
     { url: "https://github.com/o/r/pull/1", number: 1, state: "MERGED" },
     { url: "https://github.com/o/r/pull/2", number: 2, state: "OPEN", checks: "passing",
       mergeable: "MERGEABLE", ready: "ready", title: "Add flag" },
   ] });
+  // State is conveyed by colour class alone, no "Open"/"Merged" word (XERK-740).
   assert.match(html, /pr-badge pr-open/);          // newest PR's state
-  assert.match(html, /#2 Open/);                    // number + capitalized state
+  assert.match(html, /#2/);                          // number shown, no state word
+  assert.doesNotMatch(html, /Open|Merged/);        // no state words on the chips
   assert.match(html, /pr-badge pr-merged/);        // older PR still shown
-  assert.match(html, /#1 Merged/);
+  assert.match(html, /#1/);
   assert.match(html, /pr-ready ready/);             // merge-readiness mark
   assert.match(html, /title="CI passing · no conflicts"/);
   assert.match(html, /href="https:\/\/github\.com\/o\/r\/pull\/1"/);
@@ -945,7 +947,7 @@ test("prFooterChip: a GitLab MR chips like a PR, labelled !n", () => {
       state: "OPEN", checks: "passing", mergeable: "MERGEABLE", ready: "ready" },
   ] });
   assert.match(html, /!12/);                        // number from the MR URL
-  assert.match(html, /!13 Open/);                   // number from the status
+  assert.match(html, /!13/);                         // number from the status, no state word (XERK-740)
   assert.doesNotMatch(html, /#1[23]/);
   assert.match(html, /pr-ready ready/);
   assert.match(html, /href="https:\/\/gitlab\.example\.com\/grp\/app\/-\/merge_requests\/12"/);
@@ -962,7 +964,8 @@ test("prFooterChip: an Azure DevOps PR chips like a GitHub PR", () => {
       checks: "passing", mergeable: "MERGEABLE", ready: "ready" },
   ] });
   assert.match(html, /!12/);                        // number from the ADO URL
-  assert.match(html, /!13 Open/);
+  assert.match(html, /!13/);                         // number, no state word (XERK-740)
+  assert.match(html, /pr-badge pr-open/);            // state via colour class
   assert.match(html, /pr-ready ready/);
   assert.match(html, new RegExp('href="' + url.replace(/[/.]/g, "\\$&") + '"'));
 });
