@@ -58,6 +58,54 @@ This file is the operative rules for the two modules that landed it.
   `LedgerStore` slots in later with no call-site change. Full rules: `.claude/rules/turma-usage.md`
   ("HA: the shared-store backend").
 
+## The wave-3 externalization pattern (XERK-757, `server.js`)
+
+XERK-757 moved the 13 low-churn operator/org policy stores (`devices` + the ticket
+pins, org opt-ins, triage policy/actions, org colors, repo tiers) onto the adapter.
+The pattern every wave-3 store-externalization follows — **this file's `paths:` do
+NOT load on `server.js`, so re-read it here before touching that wiring**:
+
+- **Keep the module object as a SYNCHRONOUS read MIRROR.** The sweeps and the hot
+  `serializeAgent` path read these inline and cannot become async. `LiveStore` is
+  async, so it is the durability/propagation backend, never the read path.
+- **`registerExternalStore({name,file,event,coerce,read,install,afterLoad?})`** binds
+  a store to a `policy:<name>` key + its `/data` file (`STORE_PERSISTENT`, fed to the
+  file backend as `persistent` so on-disk bytes are unchanged) and returns `persist()`.
+  A setter mutates the mirror, broadcasts SSE + drops the agents cache LOCALLY (as
+  before), then calls `persist()` — fire-and-forget (`liveStore.set`, `.catch` logs):
+  the 200 already reflects the change, a store blip must not fail it.
+- **`coerce` is the SAME whitelist the file boot-load used**, so a hand-edited file
+  AND a malformed remote value degrade identically. Boot loads via `coerce`, not a
+  second inline validator — do not let the two drift.
+- **`watch` handles a change from ANY replica** (`applyExternalStoreValue`): re-coerce,
+  DEDUP by value (`sameValue` vs the mirror — our own write's echo is a no-op), install,
+  invalidate. It updates THIS replica's server state (payload + sweeps); it does NOT
+  broadcast SSE. The originating setter's own `sseBroadcast` is fanned to every replica's
+  clients by XERK-762's bus, so a second broadcast in the watch would deliver every policy
+  frame to a peer's browsers TWICE (and re-publish it to the bus). Cross-replica SSE is
+  XERK-762's; cross-replica SERVER STATE (the mirror) is this ticket's.
+- **Boot (`wireExternalStores`, off `store.ready()`):** a key PRESENT in the store wins
+  (adopt); a key ABSENT is SEEDED up from the file/seed-primed mirror — migrating
+  existing single-process `/data` state into a fresh shared store with no operator
+  action. `afterLoad` re-applies a BOOT-ONLY default (repoTiers' `REPO_TIER_SEED`) after
+  the adapter load — never on a remote watch (a runtime change is authoritative).
+- **Accepted residual (low-churn):** `watch` carries the value SET, not a re-read, so
+  two replicas writing the SAME key in the same millisecond can briefly disagree with
+  the store; self-heals on the next write. These are one-human-flips-one-switch stores.
+- HA off: `persist()`/`watch` run against the file backend, byte-identical to the
+  removed `scheduleXSave`/`readFileSync`. The store is created at MODULE LOAD (XERK-760),
+  so `persist()` writes to it on both paths; under `TURMA_TEST` only the boot WIRING
+  (`wireExternalStores` — watches + boot-load + seed-up) is skipped, so setters keep
+  their exact mirror+SSE behaviour and their file writes go to the test env's temp paths.
+- `STORE_PERSISTENT` is declared before the module-load store and passed as its
+  `persistent`, but POPULATED later by the `registerExternalStore` calls; the file
+  backend reads `this.persistent[key]` lazily at write time, so a set() after those
+  registrations finds the file. `wireExternalStores(store)` operates on its passed
+  `store` (production hands it the module `liveStore`); `persist()` writes to the module
+  `liveStore` — the same binding in production.
+- Tests: `turma/tests/external-stores.test.js` (coerces, dedup/install, byte-identical
+  persist, the two-mirror shared-backend watch fan-out, boot adopt-vs-seed).
+
 ## Load-bearing invariants
 
 - **stdlib only — the hub ships no `node_modules`.** `SharedLiveStore` speaks RESP2
