@@ -1,8 +1,12 @@
 __pycache__/
 *.pyc
 
-# Local compose secrets — never commit
+# Local compose secrets — never commit. The `.env*` glob also catches the HA
+# stack's `.env.ha`; the committed `*.example` templates are re-included below.
 .env
+.env.*
+!.env.example
+!.env.ha.example
 
 # Packed glasses app — built by `glasses` npm run pack, published to the Even
 # Hub portal (not committed, not a release asset).
