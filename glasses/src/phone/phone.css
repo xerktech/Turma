@@ -157,14 +157,15 @@
 .ph-card:hover { border-color: var(--accent); }
 .ph-card.cur { border-color: var(--accent); border-width: 2px; }
 .ph-ticket { font-family: var(--font-mono); color: var(--accent); }
-/* PR chips CONSOLIDATE onto the state line: they flow left-to-right straight
-   after the state text and wrap to fill the full card width, mirroring
-   sessions.html. `.ph-pr-list` is `display:contents` so its chips become direct
-   children of the state-row's single wrap flow, letting a wrapped chip row
-   reclaim the space under the state text. The phone card has no ⋯/Resume corner
-   reservation, so no negative-margin reclaim is needed here. */
-.ph-state-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; margin-top: 4px; }
-.ph-state-row .ph-state { margin-top: 0; flex: 0 1 auto; min-width: 0; }
+/* PR chips CONSOLIDATE and RIGHT-ALIGN on the state line, mirroring sessions.html:
+   they share the first line with the state text (packed to its right) and wrap to
+   fill the full card width. `.ph-pr-list` is `display:contents` so its chips become
+   direct children of the state-row's single wrap flow; the state keeps `flex:1 1
+   auto` to stay pinned left, and `justify-content:flex-end` right-aligns the chips
+   on every wrapped line. The phone card has no ⋯/Resume corner reservation, so no
+   negative-margin reclaim is needed here. */
+.ph-state-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; margin-top: 4px; justify-content: flex-end; }
+.ph-state-row .ph-state { margin-top: 0; flex: 1 1 auto; min-width: 0; }
 .ph-pr-list { display: contents; }
 /* Queued: dashed, static, with an inline Cancel. */
 .ph-queued { border-style: dashed; cursor: default; }

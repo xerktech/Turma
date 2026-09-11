@@ -56,15 +56,15 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `BoardScreen.kt`) that opens the dropdown on tap — for the Status, Repo, Agent and Model rows. One
   tappable chip reads better on a phone than a value plus a separate button; a pick is still the save,
   same as the web.
-- **Session-card PR chips: consolidated onto the state line, left-filled.** On web the chips now flow
-  left-to-right straight after the state text ("idle") and wrap to fill the full card width, still
-  reclaiming the ⋯/Resume corner padding (`display:contents` on `.pr-list` folds the chips into the
-  state-row's single wrap flow). This SUPERSEDES the earlier XERK-736 right-aligned block. Android was
-  never affected and is now the closer match: `SessionsScreen.kt` already renders the PRs start-packed
-  in a `FlowRow`, and has no ⋯/Resume corner reservation eating its width. No Android change; the fix
-  is web (`sessions.html`) + glasses (`phone.css`) only. Android keeps the PRs in their own FlowRow
-  below the state text rather than sharing the first line — an accepted, pre-existing platform-idiomatic
-  difference, not a new gap.
+- **Session-card PR chips: consolidated onto the state line, right-aligned.** On web the chips share
+  the state line with the state text ("idle"), packed to its right, and wrap to fill the full card
+  width, still reclaiming the ⋯/Resume corner padding. `display:contents` on `.pr-list` folds the
+  chips into the state-row's single wrap flow; the state keeps `flex:1 1 auto` (stays pinned left) and
+  `justify-content:flex-end` right-aligns the chips on every wrapped line. This keeps XERK-736's
+  right-alignment but lifts the old ~3-per-row cap. Android is unaffected: `SessionsScreen.kt` renders
+  the PRs in their own start-packed `FlowRow` below the state text (no shared line, no corner
+  reservation) — an accepted, pre-existing platform-idiomatic difference, not a new gap. No Android
+  change; the fix is web (`sessions.html`) + glasses (`phone.css`) only.
 - **In-app updater** (`ui/UpdateBanner.kt`) — a sideload stopgap until Play (XERK-11), no web analog.
 - **Chat text-size control** (XERK-144) — a phone-only addition, no web analog. The chat settings menu
   (the top-bar ⚙/Tune button that holds verbosity) also picks a chat text size, scaling every bubble/
