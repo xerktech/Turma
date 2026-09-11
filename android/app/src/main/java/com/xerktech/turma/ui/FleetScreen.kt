@@ -714,16 +714,24 @@ fun ScreenHeader(title: String, actions: @Composable () -> Unit = {}) {
         Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 2.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+        Text(
+            title,
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.SemiBold,
+            // Guarantee a gap between the title and the pill even when the trailing
+            // cluster is wide enough to collapse the weight spacer (XERK-742) — the
+            // "New ticket squished into the title" symptom.
+            modifier = Modifier.padding(end = 8.dp),
+        )
         Spacer(Modifier.weight(1f))
         // The trailing cluster — New ticket pill, org scope, page actions, ⋮ — is
         // packed tight (XERK-742). Material's default 48dp minimum touch target on
         // every IconButton and the org TextButton left wide gaps between them that
         // pushed the whole cluster left and crowded "New ticket" into the title on
         // a phone header. Releasing the minimum-interactive size lets each control
-        // shrink to its own compact footprint ([HeaderIconButton] is 36dp, the org
-        // button trims its padding), so the buttons sit close and the pill keeps
-        // room. A small `spacedBy` keeps them from actually touching.
+        // shrink to its own compact footprint ([HeaderIconButton] is 32dp, the org
+        // button and the pill trim their padding), so the buttons sit close and the
+        // pill keeps room. A small `spacedBy` keeps them from actually touching.
         CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides Dp.Unspecified) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -759,10 +767,12 @@ fun ScreenHeader(title: String, actions: @Composable () -> Unit = {}) {
  * Compact icon button for the shared [ScreenHeader]'s trailing action cluster
  * (XERK-742). The Material default reserves a 48dp touch target, so several in a
  * row leave wide gaps that crowd the title and the "New ticket" pill on a phone
- * header. This is a 36dp box around the default glyph; the header wraps the whole
- * cluster with the minimum-interactive size released so the 36dp survives instead
- * of being re-inflated to 48dp. Use it for every header action, not raw
- * [IconButton], so all four pages stay consistent.
+ * header. This is a 32dp box around the default 24dp glyph (4dp inset a side); the
+ * header wraps the whole cluster with the minimum-interactive size released so the
+ * 32dp survives instead of being re-inflated to 48dp. Use it for every header
+ * action, not raw [IconButton], so all four pages stay consistent. Below the 48dp
+ * accessibility minimum on purpose — this is a dense operator tool and the ticket
+ * asked for a tight, neat header; the glyphs stay a comfortable 24dp.
  */
 @Composable
 fun HeaderIconButton(
@@ -770,5 +780,5 @@ fun HeaderIconButton(
     enabled: Boolean = true,
     content: @Composable () -> Unit,
 ) {
-    IconButton(onClick = onClick, enabled = enabled, modifier = Modifier.size(36.dp), content = content)
+    IconButton(onClick = onClick, enabled = enabled, modifier = Modifier.size(32.dp), content = content)
 }
