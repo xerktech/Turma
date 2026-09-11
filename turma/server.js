@@ -2197,7 +2197,14 @@ function setTriagePolicy(siteKey, patch) {
     if (v == null) delete p[k];
     else p[k] = v;
   }
-  if (Object.keys(p).length) triagePolicies[siteKey] = p;
+  // Store the policy in the SAME canonical key order `triagePoliciesCoerce` yields
+  // (XERK-757): the coerce is the only one that rebuilds nested objects field-by-
+  // field in a fixed order, so a mirror left in insertion order would fail the
+  // own-write watch echo's `sameValue` dedup and re-broadcast one redundant
+  // (idempotent) SSE frame. Canonicalising here makes the echo always dedup and
+  // the on-disk order deterministic; the other 12 stores store flat values and
+  // never hit this.
+  if (Object.keys(p).length) triagePolicies[siteKey] = triagePoliciesCoerce({ [siteKey]: p })[siteKey];
   else delete triagePolicies[siteKey];
   persistTriagePolicies();
   invalidateAgentsCache();

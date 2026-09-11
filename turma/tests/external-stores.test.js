@@ -132,6 +132,26 @@ test("XERK-757: a change on one replica reaches another via the shared backend's
   store.close();
 });
 
+test("XERK-757: two triage-policy sets leave the mirror a coerce fixed-point (echo dedups)", () => {
+  // triagePolicies is the one store whose coerce rebuilds nested objects in a
+  // FIXED key order. setTriagePolicy must store that canonical order, or the
+  // own-write watch echo (coerce(setValue)) fails the sameValue dedup and
+  // re-broadcasts a redundant SSE frame (QA LOW). After any sequence of sets the
+  // mirror must equal its own coerce BYTE-FOR-BYTE (the dedup is JSON-string).
+  const desc = X.list().find((d) => d.name === "triagePolicies");
+  const site = "canon.atlassian.net";
+  srv.setTriagePolicy(site, { rateMax: 7 });
+  srv.setTriagePolicy(site, { minPriority: "P1" });          // adds a key out of coerce order
+  const v = desc.read();
+  assert.deepEqual(v[site], { minPriority: "P1", rateMax: 7 });
+  assert.equal(
+    JSON.stringify(desc.coerce(structuredClone(v))),
+    JSON.stringify(v),
+    "the mirror is a coerce fixed-point, so the own-write echo dedups",
+  );
+  srv.setTriagePolicy(site, { rateMax: null, minPriority: null }); // clean up global state
+});
+
 test("XERK-757: boot load adopts the store's value; a fresh store is SEEDED from the mirror", async () => {
   // A store that already HAS the key wins on boot (authoritative). A store MISSING
   // the key is seeded up from the file/seed-primed mirror (single-process -> HA
