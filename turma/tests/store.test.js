@@ -67,6 +67,21 @@ test("XERK-754: compareAndSet matches by value incl. null/absent", async () => {
   assert.equal(await s.get("o"), "flat");
 });
 
+test("XERK-754: compareAndSet expected-null matches absent OR stored-null (the shared-backend parity contract, QA D2)", async () => {
+  const s = new FileLiveStore();
+  // absent key: expected null succeeds
+  assert.equal(await s.compareAndSet("a", null, "v"), true);
+  // key holding JSON null: expected null ALSO succeeds (File conflates the two;
+  // SharedLiveStore's Lua matches v==false OR v=="null" to agree — host-verified).
+  await s.set("b", null);
+  assert.equal(await s.compareAndSet("b", null, "v"), true);
+  assert.equal(await s.get("b"), "v");
+  // expected null must NOT match a stored non-null value
+  await s.set("c", 5);
+  assert.equal(await s.compareAndSet("c", null, "v"), false);
+  assert.equal(await s.get("c"), 5);
+});
+
 test("XERK-754: incrBy counts from 0", async () => {
   const s = new FileLiveStore();
   assert.equal(await s.incrBy("n", 3), 3);
@@ -219,6 +234,17 @@ test("XERK-754: RespParser reassembles a reply split across chunks", () => {
 test("XERK-754: RespParser returns multiple replies from one chunk", () => {
   const p = new RespParser();
   assert.deepEqual(p.feed(Buffer.from("+A\r\n:1\r\n$1\r\nb\r\n")), ["A", 1, "b"]);
+});
+
+test("XERK-754: RespParser surfaces an Error on a malformed length, never throws (QA D3)", () => {
+  // A desync'd bulk/array length must become an Error reply (the connection layer
+  // resets on it) rather than throwing out of feed() on NaN arithmetic.
+  const bad = new RespParser();
+  const r1 = bad.feed(Buffer.from("$abc\r\n"));
+  assert.ok(r1[0] instanceof Error && /bad bulk length/.test(r1[0].message));
+  const bad2 = new RespParser();
+  const r2 = bad2.feed(Buffer.from("*xyz\r\n"));
+  assert.ok(r2[0] instanceof Error && /bad array length/.test(r2[0].message));
 });
 
 // ---------------------------------------------------------------------------

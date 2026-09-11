@@ -398,6 +398,10 @@ class RespParser {
         return { value: Number(header), offset: afterHeader };
       case "$": {
         const len = Number(header);
+        // A malformed length ("$abc") is a protocol desync, not a value — surface
+        // it as an Error reply (like the unknown-type byte) so the connection
+        // layer resets, rather than letting NaN arithmetic run wild (XERK-754 D3).
+        if (!Number.isInteger(len)) return { value: new Error(`bad bulk length ${JSON.stringify(header)}`), offset: afterHeader };
         if (len === -1) return { value: null, offset: afterHeader };
         const end = afterHeader + len;
         if (end + 2 > buf.length) return null; // value + trailing CRLF not all here
@@ -405,6 +409,7 @@ class RespParser {
       }
       case "*": {
         const count = Number(header);
+        if (!Number.isInteger(count)) return { value: new Error(`bad array length ${JSON.stringify(header)}`), offset: afterHeader };
         if (count === -1) return { value: null, offset: afterHeader };
         const arr = [];
         let off = afterHeader;
@@ -538,18 +543,24 @@ class SharedLiveStore {
   // comparing the STORED JSON string to the expected value's JSON — the same
   // canonicalisation FileLiveStore uses, so both backends decide CAS identically.
   async compareAndSet(key, expected, next, { ttlMs } = {}) {
-    const expJson = expected === null ? null : JSON.stringify(expected);
+    // ARGV[1] is the expected value's JSON (null -> "null"); ARGV[4]="1" flags an
+    // expected null. The match must be IDENTICAL to FileLiveStore, which conflates
+    // an ABSENT key and a stored JSON `null` (both read as `cur === null`) — so an
+    // expected null succeeds against EITHER (XERK-754 QA D2). In Lua an absent key
+    // is `false` and a stored null is the string "null"; so:
+    //   expected null    -> match `v==false` (absent) OR `v=="null"` (stored null)
+    //   expected non-null -> match `v==ARGV[1]` only (absent `false` never equals a
+    //                        JSON string, so it correctly fails, as File does).
+    const expJson = JSON.stringify(expected); // null -> "null"
     const nextJson = JSON.stringify(next);
     const px = ttlMs && ttlMs > 0 ? String(Math.floor(ttlMs)) : "";
+    const nullFlag = expected === null ? "1" : "0";
     const script =
       "local v=redis.call('GET',KEYS[1]) " +
-      "if (v==false and ARGV[1]=='\\0nil') or v==ARGV[1] then " +
+      "if v==ARGV[1] or (ARGV[4]=='1' and v==false) then " +
       "if ARGV[3]~='' then redis.call('SET',KEYS[1],ARGV[2],'PX',tonumber(ARGV[3])) " +
       "else redis.call('SET',KEYS[1],ARGV[2]) end return 1 else return 0 end";
-    // A key with no value is `false` in Lua; represent "expected null/absent" with
-    // a sentinel so it round-trips (an absent key and a JSON `null` value differ).
-    const expArg = expJson === null ? "\0nil" : expJson;
-    const r = await this._command("EVAL", script, "1", key, expArg, nextJson, px);
+    const r = await this._command("EVAL", script, "1", key, expJson, nextJson, px, nullFlag);
     const ok = r === 1;
     if (ok) await this._announce("set", key, next);
     return ok;
@@ -671,20 +682,32 @@ class SharedLiveStore {
 
   _onConnected(conn) {
     conn.backoff = RECONNECT_BASE_MS;
-    // AUTH then SELECT before the connection counts as ready. These ride the
-    // pending queue like any command; the promises are fire-and-forget here (an
-    // auth failure surfaces as a rejected command later and a close).
+    // AUTH then SELECT go out FIRST, ahead of any user command. `ready` is set
+    // BEFORE they are queued ON PURPOSE: `_sendOn` refuses a command while a
+    // connection is not ready, so with `ready` set AFTER this loop the boot
+    // commands were silently dropped (the rejection swallowed) and the cmd
+    // connection never authenticated or selected its db — broken against every
+    // password-protected / non-zero-db Valkey (XERK-754 QA D1). Setting it first
+    // lets the boot commands ride the pending queue like any command; because
+    // `_onConnected` runs synchronously to completion before any `ready()`
+    // awaiter resumes, their resolvers are enqueued (and bytes written) ahead of
+    // the first user command, so replies still match FIFO.
+    conn.ready = true;
     const boot = [];
     if (this.password) boot.push(["AUTH", this.password]);
     if (this.db) boot.push(["SELECT", String(this.db)]);
     for (const cmd of boot) {
       if (conn.role === "cmd") {
+        // Fire-and-forget: an AUTH/SELECT failure rejects here (swallowed) and
+        // the server closes the socket, which the reconnect path handles.
         this._sendOn(conn, cmd).catch(() => {});
       } else {
-        conn.socket.write(encodeCommand(cmd)); // sub conn: reply routed/ignored
+        // The sub connection can't run ordinary commands once subscribed, so its
+        // boot commands are written raw; their +OK replies have no pending waiter
+        // and are dropped by _onData (the "boot/PING ack" case).
+        conn.socket.write(encodeCommand(cmd));
       }
     }
-    conn.ready = true;
     if (conn.role === "sub") this._resubscribe(conn);
     // A periodic PING keeps a dead-but-not-closed socket honest (a silently
     // half-open TCP connection past a NAT idle timeout), same discipline as the
