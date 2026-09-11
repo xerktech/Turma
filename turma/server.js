@@ -52,7 +52,7 @@ const usageLedger = require("./usage-ledger.js");
 // here is on the hot path yet; wave-3 children flip each store's save/load onto
 // it. See docs/turma-ha-store-adr.md.
 const { resolveHaConfig } = require("./ha-config.js");
-const { createLiveStore } = require("./store.js");
+const { createLiveStore, sameValue } = require("./store.js");
 
 const PORT = positiveEnv("PORT", 8300);
 
@@ -1640,31 +1640,148 @@ function prune() {
   }
 }
 
+// ===== Externalized operator/org policy stores (XERK-757, epic XERK-751) =====
+// The low-churn, operator-SET stores below (devices + the ~12 board/triage/org
+// policy maps) move off "/data file in one process" onto the LiveStore adapter,
+// so a toggle set on ONE replica is visible on EVERY replica. With HA OFF the
+// adapter IS the file backend and behaviour is byte-identical to the per-store
+// scheduleXSave/readFileSync this replaces (same on-disk JSON, same SSE events).
+//
+// Each store KEEPS its module-level object as a SYNCHRONOUS read mirror — the
+// sweeps and the hot serializeAgent path read it inline and cannot become async.
+// A setter mutates the mirror, then (as today) broadcasts its SSE event + drops
+// the agents cache LOCALLY — immediate for the acting replica — and finally
+// PERSISTS the whole value through the adapter (fire-and-forget: the local view
+// already reflects it; a store blip must not fail the operator's 200). The
+// adapter's `watch` delivers a change made on ANY replica; the watcher re-coerces
+// it into the mirror, drops the cache and RE-BROADCASTS the SSE event LOCALLY, so
+// a remote toggle reaches this replica's browsers too (the cross-replica SSE
+// fan-out itself is XERK-762; this only touches THIS replica's own SSE clients).
+// A watch echo of our OWN write is deduped by value (`sameValue` vs the mirror),
+// so the double-apply is a no-op. Coercion (`coerce`) is the SAME shape/whitelist
+// validation the file boot-load used, so a hand-edited file OR a malformed remote
+// value degrades identically on either path.
+//
+// KNOWN residual (accepted, low-churn): the watch carries the value that was SET,
+// not a re-read, so two replicas writing the SAME key within the same millisecond
+// can leave their mirrors briefly disagreeing with the store; it self-heals on
+// the next write of that key. These are operator-set stores (a human flips one
+// org's switch on one replica) — simultaneous same-key cross-replica writes do
+// not happen in practice, which is why the ticket scopes them as low-risk.
+const STORE_KEY_PREFIX = "policy:";
+let liveStore = null;              // the LiveStore backend, assigned at boot
+const externalizedStores = [];     // {key,name,event,coerce,read,install} descriptors
+const STORE_PERSISTENT = {};       // storeKey -> {file, debounceMs} for the file backend
+
+// Read+parse a durable store file, or undefined when absent/unreadable/corrupt —
+// the "not set" posture every one of these stores already had (losing one just
+// re-accumulates). Coercion turns undefined into the store's empty default.
+function readJsonFile(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return undefined; // first boot / no volume / corrupt — treated as absent
+  }
+}
+
+// The default coerce for a plain string-keyed map store whose entries are
+// validated at READ time (the ticket pins): keep an object, drop anything else.
+const asPlainObject = (raw) =>
+  raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+
+// The coerce for a per-org opt-in flag map (autoStart/autoMerge/…): keep only the
+// truthy keys, normalized to `true` (presence = enabled), matching every one of
+// these stores' identical boot filter.
+const asFlagMap = (raw) => {
+  const o = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) if (v) o[k] = true;
+  }
+  return o;
+};
+
+// Register one externalized store and return its `persist()` — call that from the
+// store's setter AFTER mutating the mirror. `read` returns the current mirror
+// value; `install` replaces the mirror with a coerced value (boot-load / remote
+// watch); `coerce` validates a raw value to the store's shape.
+function registerExternalStore({ name, file, event, coerce, read, install, afterLoad }) {
+  const key = STORE_KEY_PREFIX + name;
+  STORE_PERSISTENT[key] = { file, debounceMs: 5000 };
+  externalizedStores.push({ key, name, event, coerce, read, install, afterLoad });
+  return function persist() {
+    if (!liveStore) return; // not wired (tests / pre-boot): mirror + SSE already updated
+    Promise.resolve(liveStore.set(key, read())).catch((e) =>
+      console.error(`store ${name}: persist failed: ${e && e.message}`));
+  };
+}
+
+// Apply a value observed FROM the backend (boot-load or a remote replica's watch)
+// into the mirror. Deduped by value, so our own write's watch echo is a no-op; a
+// genuine change installs it, drops the agents cache and re-broadcasts SSE locally.
+function applyExternalStoreValue(desc, rawValue) {
+  const next = desc.coerce(rawValue);
+  if (sameValue(next, desc.read())) return false;
+  desc.install(next);
+  invalidateAgentsCache();
+  if (desc.event) sseBroadcast(desc.event, next);
+  return true;
+}
+
+// Wire every externalized store onto the resolved backend at boot (never under
+// TURMA_TEST, where this block does not run and `persist()` no-ops). Registers a
+// watch per store, then loads the current value once the backend is ready. A key
+// ABSENT from the store on first boot (a fresh Valkey, or a fresh /data) is SEEDED
+// from the file/seed-primed mirror — migrating existing single-process state up to
+// the shared store with no operator action.
+function wireExternalStores(store) {
+  liveStore = store;
+  for (const desc of externalizedStores) {
+    store.watch(desc.key, (ev) => {
+      try {
+        applyExternalStoreValue(desc, ev && ev.value);
+      } catch (e) {
+        console.error(`store ${desc.name}: watch apply failed: ${e && e.message}`);
+      }
+    });
+  }
+  // Load off the ready backend (file: immediate; shared: once both sockets are up).
+  // Best-effort — a store that is down at boot leaves the file/seed-primed mirror
+  // in place and re-syncs when a later set or watch lands; never fatal.
+  Promise.resolve(store.ready?.()).then(() => {
+    for (const desc of externalizedStores) {
+      Promise.resolve(store.get(desc.key)).then((raw) => {
+        if (raw == null) {
+          // Nothing stored yet — publish our file/seed-primed mirror up, if it
+          // carries data (migrates existing single-process state into the store).
+          const cur = desc.read();
+          const empty = Array.isArray(cur) ? cur.length === 0 : !Object.keys(cur || {}).length;
+          if (!empty && liveStore) {
+            Promise.resolve(liveStore.set(desc.key, cur)).catch((e) =>
+              console.error(`store ${desc.name}: seed failed: ${e && e.message}`));
+          }
+        } else {
+          // The store is authoritative on boot; adopt it, then re-apply any
+          // BOOT-ONLY seed (repoTiers) the stored value may not carry.
+          applyExternalStoreValue(desc, raw);
+          desc.afterLoad?.();
+        }
+      }).catch((e) => console.error(`store ${desc.name}: load failed: ${e && e.message}`));
+    }
+  }).catch(() => {});
+}
+
 // ---- mobile push device registry -------------------------------------------
 // FCM tokens the Android client has registered (POST /api/devices). notify()
 // fans every alert out to these. Persisted next to
 // STATE_FILE, same best-effort pattern (losing it just means devices re-register
 // on their next app launch). Each entry: {token, platform, addedAt, seenAt}.
 let devices = [];
-try {
-  const parsed = JSON.parse(fs.readFileSync(DEVICES_FILE, "utf8"));
-  if (Array.isArray(parsed)) devices = parsed;
-} catch {
-  /* first boot or no volume mounted */
-}
-let devSaveTimer = null;
-function scheduleDeviceSave() {
-  if (devSaveTimer) return;
-  devSaveTimer = setTimeout(() => {
-    devSaveTimer = null;
-    fs.mkdir(path.dirname(DEVICES_FILE), { recursive: true }, () => {
-      fs.writeFile(DEVICES_FILE, JSON.stringify(devices), (err) => {
-        if (err) console.error(`devices save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  devSaveTimer.unref();
-}
+const devicesCoerce = (raw) => (Array.isArray(raw) ? raw : []);
+devices = devicesCoerce(readJsonFile(DEVICES_FILE));
+const persistDevices = registerExternalStore({
+  name: "devices", file: DEVICES_FILE, event: null,
+  coerce: devicesCoerce, read: () => devices, install: (v) => { devices = v; },
+});
 function registerDevice(token, platform, features) {
   const now = Date.now();
   // What this app build can do (XERK-154). Only a build that declares "dismiss"
@@ -1680,19 +1797,19 @@ function registerDevice(token, platform, features) {
   } else {
     devices.push({ token, platform: platform || "android", features: caps || [], addedAt: now, seenAt: now });
   }
-  scheduleDeviceSave();
+  persistDevices();
 }
 function unregisterDevice(token) {
   const before = devices.length;
   devices = devices.filter((d) => d.token !== token);
-  if (devices.length !== before) scheduleDeviceSave();
+  if (devices.length !== before) persistDevices();
 }
 function pruneDevices(deadTokens) {
   if (!deadTokens || !deadTokens.length) return;
   const dead = new Set(deadTokens);
   const before = devices.length;
   devices = devices.filter((d) => !dead.has(d.token));
-  if (devices.length !== before) scheduleDeviceSave();
+  if (devices.length !== before) persistDevices();
 }
 function listDevices() {
   return devices;
@@ -1706,25 +1823,11 @@ function listDevices() {
 // restart, which is why it has its own file on /data rather than riding the
 // best-effort state.json (whose loss is documented as harmless).
 let ticketAgents = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(TICKET_AGENTS_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ticketAgents = parsed;
-} catch {
-  /* first boot or no volume mounted */
-}
-let taSaveTimer = null;
-function scheduleTicketAgentsSave() {
-  if (taSaveTimer) return;
-  taSaveTimer = setTimeout(() => {
-    taSaveTimer = null;
-    fs.mkdir(path.dirname(TICKET_AGENTS_FILE), { recursive: true }, () => {
-      fs.writeFile(TICKET_AGENTS_FILE, JSON.stringify(ticketAgents), (err) => {
-        if (err) console.error(`ticket-agents save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  taSaveTimer.unref();
-}
+ticketAgents = asPlainObject(readJsonFile(TICKET_AGENTS_FILE));
+const persistTicketAgents = registerExternalStore({
+  name: "ticketAgents", file: TICKET_AGENTS_FILE, event: "ticketAgents",
+  coerce: asPlainObject, read: () => ticketAgents, install: (v) => { ticketAgents = v; },
+});
 function ticketAgentPin(siteKey, issueKey) {
   const p = ticketAgents[`${siteKey}/${issueKey}`];
   return p && typeof p.host === "string" && p.host ? p : null;
@@ -1744,7 +1847,7 @@ function setTicketAgent(siteKey, issueKey, host) {
       }
     }
   }
-  scheduleTicketAgentsSave();
+  persistTicketAgents();
   // The pin rides the /api/agents payload (and its own SSE event), so open
   // boards must see the change without waiting out an ETag match.
   invalidateAgentsCache();
@@ -1758,25 +1861,11 @@ function setTicketAgent(siteKey, issueKey, host) {
 // the same reason the agent pin is: the model is delivered on the spawnTicket
 // command the hub routes, so the hub must remember the choice across a restart.
 let ticketModels = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(TICKET_MODELS_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ticketModels = parsed;
-} catch {
-  /* first boot or no volume mounted */
-}
-let tmSaveTimer = null;
-function scheduleTicketModelsSave() {
-  if (tmSaveTimer) return;
-  tmSaveTimer = setTimeout(() => {
-    tmSaveTimer = null;
-    fs.mkdir(path.dirname(TICKET_MODELS_FILE), { recursive: true }, () => {
-      fs.writeFile(TICKET_MODELS_FILE, JSON.stringify(ticketModels), (err) => {
-        if (err) console.error(`ticket-models save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  tmSaveTimer.unref();
-}
+ticketModels = asPlainObject(readJsonFile(TICKET_MODELS_FILE));
+const persistTicketModels = registerExternalStore({
+  name: "ticketModels", file: TICKET_MODELS_FILE, event: "ticketModels",
+  coerce: asPlainObject, read: () => ticketModels, install: (v) => { ticketModels = v; },
+});
 function ticketModelPin(siteKey, issueKey) {
   const p = ticketModels[`${siteKey}/${issueKey}`];
   return p && typeof p.model === "string" && p.model ? p : null;
@@ -1797,7 +1886,7 @@ function setTicketModel(siteKey, issueKey, model) {
       }
     }
   }
-  scheduleTicketModelsSave();
+  persistTicketModels();
   invalidateAgentsCache();
   sseBroadcast("ticketModels", ticketModels);
 }
@@ -1811,25 +1900,11 @@ function setTicketModel(siteKey, issueKey, model) {
 // choice is stored — "claude" and clearing both release the pin — so a ticket with
 // no runtime choice rides exactly the command it always did.
 let ticketRuntimes = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(TICKET_RUNTIMES_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ticketRuntimes = parsed;
-} catch {
-  /* first boot or no volume mounted */
-}
-let trSaveTimer = null;
-function scheduleTicketRuntimesSave() {
-  if (trSaveTimer) return;
-  trSaveTimer = setTimeout(() => {
-    trSaveTimer = null;
-    fs.mkdir(path.dirname(TICKET_RUNTIMES_FILE), { recursive: true }, () => {
-      fs.writeFile(TICKET_RUNTIMES_FILE, JSON.stringify(ticketRuntimes), (err) => {
-        if (err) console.error(`ticket-runtimes save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  trSaveTimer.unref();
-}
+ticketRuntimes = asPlainObject(readJsonFile(TICKET_RUNTIMES_FILE));
+const persistTicketRuntimes = registerExternalStore({
+  name: "ticketRuntimes", file: TICKET_RUNTIMES_FILE, event: "ticketRuntimes",
+  coerce: asPlainObject, read: () => ticketRuntimes, install: (v) => { ticketRuntimes = v; },
+});
 function ticketRuntimePin(siteKey, issueKey) {
   const p = ticketRuntimes[`${siteKey}/${issueKey}`];
   return p && typeof p.runtime === "string" && p.runtime ? p : null;
@@ -1851,7 +1926,7 @@ function setTicketRuntime(siteKey, issueKey, runtime) {
       }
     }
   }
-  scheduleTicketRuntimesSave();
+  persistTicketRuntimes();
   invalidateAgentsCache();
   sseBroadcast("ticketRuntimes", ticketRuntimes);
 }
@@ -1866,25 +1941,11 @@ function setTicketRuntime(siteKey, issueKey, runtime) {
 // Only a set requirement is stored — clearing it (or {any}) releases the pin, so
 // an unconstrained ticket routes exactly as it always did.
 let ticketPlatforms = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(TICKET_PLATFORMS_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ticketPlatforms = parsed;
-} catch {
-  /* first boot or no volume mounted */
-}
-let platformsSaveTimer = null;
-function scheduleTicketPlatformsSave() {
-  if (platformsSaveTimer) return;
-  platformsSaveTimer = setTimeout(() => {
-    platformsSaveTimer = null;
-    fs.mkdir(path.dirname(TICKET_PLATFORMS_FILE), { recursive: true }, () => {
-      fs.writeFile(TICKET_PLATFORMS_FILE, JSON.stringify(ticketPlatforms), (err) => {
-        if (err) console.error(`ticket-platforms save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  platformsSaveTimer.unref();
-}
+ticketPlatforms = asPlainObject(readJsonFile(TICKET_PLATFORMS_FILE));
+const persistTicketPlatforms = registerExternalStore({
+  name: "ticketPlatforms", file: TICKET_PLATFORMS_FILE, event: "ticketPlatforms",
+  coerce: asPlainObject, read: () => ticketPlatforms, install: (v) => { ticketPlatforms = v; },
+});
 // A ticket's (or epic's) OWN requirement, or null. Ignores anything but a known
 // OS value so a hand-edited file can't put a junk pin onto the wire.
 function ticketPlatformPin(siteKey, issueKey) {
@@ -1908,7 +1969,7 @@ function setTicketPlatform(siteKey, issueKey, platform) {
       }
     }
   }
-  scheduleTicketPlatformsSave();
+  persistTicketPlatforms();
   invalidateAgentsCache();
   sseBroadcast("ticketPlatforms", ticketPlatforms);
 }
@@ -1983,33 +2044,17 @@ function orgModelAliases(siteKey) {
 // bounded by how many Jira sites the operator connects (a handful), not by the
 // churn of tickets. See AUTOSTART_ORGS_FILE for why it's durable and hub-owned.
 let autoStartOrgs = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(AUTOSTART_ORGS_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    for (const [k, v] of Object.entries(parsed)) if (v) autoStartOrgs[k] = true;
-  }
-} catch {
-  /* first boot or no volume mounted */
-}
-let asSaveTimer = null;
-function scheduleAutoStartSave() {
-  if (asSaveTimer) return;
-  asSaveTimer = setTimeout(() => {
-    asSaveTimer = null;
-    fs.mkdir(path.dirname(AUTOSTART_ORGS_FILE), { recursive: true }, () => {
-      fs.writeFile(AUTOSTART_ORGS_FILE, JSON.stringify(autoStartOrgs), (err) => {
-        if (err) console.error(`autostart-orgs save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  asSaveTimer.unref();
-}
+autoStartOrgs = asFlagMap(readJsonFile(AUTOSTART_ORGS_FILE));
+const persistAutoStartOrgs = registerExternalStore({
+  name: "autoStartOrgs", file: AUTOSTART_ORGS_FILE, event: "autoStartOrgs",
+  coerce: asFlagMap, read: () => autoStartOrgs, install: (v) => { autoStartOrgs = v; },
+});
 // Flip an org's hub-side auto-start opt-in. The caller has already validated the
 // siteKey is one the fleet actually reports; this owns the map's bookkeeping.
 function setAutoStartOrg(siteKey, enabled) {
   if (enabled) autoStartOrgs[siteKey] = true;
   else delete autoStartOrgs[siteKey];
-  scheduleAutoStartSave();
+  persistAutoStartOrgs();
   // Switching auto OFF calls off the work it queued and NOTHING else (XERK-296):
   // the org's auto-queued tickets leave the line, its running sessions carry on,
   // and a ticket an operator queued by hand keeps its place. That is only
@@ -2028,27 +2073,11 @@ function setAutoStartOrg(siteKey, enabled) {
 // the default branch with no human review — the operator's deliberate,
 // per-project trust decision, mirroring the auto-start switch it sits beside.
 let autoMergeOrgs = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(AUTOMERGE_ORGS_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    for (const [k, v] of Object.entries(parsed)) if (v) autoMergeOrgs[k] = true;
-  }
-} catch {
-  /* first boot or no volume mounted */
-}
-let amSaveTimer = null;
-function scheduleAutoMergeSave() {
-  if (amSaveTimer) return;
-  amSaveTimer = setTimeout(() => {
-    amSaveTimer = null;
-    fs.mkdir(path.dirname(AUTOMERGE_ORGS_FILE), { recursive: true }, () => {
-      fs.writeFile(AUTOMERGE_ORGS_FILE, JSON.stringify(autoMergeOrgs), (err) => {
-        if (err) console.error(`automerge-orgs save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  amSaveTimer.unref();
-}
+autoMergeOrgs = asFlagMap(readJsonFile(AUTOMERGE_ORGS_FILE));
+const persistAutoMergeOrgs = registerExternalStore({
+  name: "autoMergeOrgs", file: AUTOMERGE_ORGS_FILE, event: "autoMergeOrgs",
+  coerce: asFlagMap, read: () => autoMergeOrgs, install: (v) => { autoMergeOrgs = v; },
+});
 // Flip an org's hub-side auto-merge opt-in. The caller has already validated the
 // siteKey is one the fleet reports; this owns the map's bookkeeping. Switching
 // OFF simply stops the sweep from acting — nothing already merged or closed is
@@ -2056,7 +2085,7 @@ function scheduleAutoMergeSave() {
 function setAutoMergeOrg(siteKey, enabled) {
   if (enabled) autoMergeOrgs[siteKey] = true;
   else delete autoMergeOrgs[siteKey];
-  scheduleAutoMergeSave();
+  persistAutoMergeOrgs();
   invalidateAgentsCache();
   sseBroadcast("autoMergeOrgs", autoMergeOrgs);
 }
@@ -2069,29 +2098,21 @@ function setAutoMergeOrg(siteKey, enabled) {
 // oldest decision. The sweep (decision time) and the drain (dispatch time) both
 // consult ticketTriageAction so a verdict holds across both.
 let ticketTriageActions = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(TRIAGE_ACTIONS_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    for (const [k, v] of Object.entries(parsed)) {
-      if (v && TRIAGE_ACTIONS.has(v.action)) ticketTriageActions[k] = v;
-    }
+// Keep only entries with a valid action — the same whitelist the file boot-load
+// applied, now also guarding a malformed remote value on the watch path.
+const triageActionsCoerce = (raw) => {
+  const o = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) if (v && TRIAGE_ACTIONS.has(v.action)) o[k] = v;
   }
-} catch {
-  /* first boot or no volume mounted */
-}
-let ttSaveTimer = null;
-function scheduleTriageActionsSave() {
-  if (ttSaveTimer) return;
-  ttSaveTimer = setTimeout(() => {
-    ttSaveTimer = null;
-    fs.mkdir(path.dirname(TRIAGE_ACTIONS_FILE), { recursive: true }, () => {
-      fs.writeFile(TRIAGE_ACTIONS_FILE, JSON.stringify(ticketTriageActions), (err) => {
-        if (err) console.error(`triage-actions save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  ttSaveTimer.unref();
-}
+  return o;
+};
+ticketTriageActions = triageActionsCoerce(readJsonFile(TRIAGE_ACTIONS_FILE));
+const persistTriageActions = registerExternalStore({
+  name: "triageActions", file: TRIAGE_ACTIONS_FILE, event: "triageActions",
+  coerce: triageActionsCoerce, read: () => ticketTriageActions,
+  install: (v) => { ticketTriageActions = v; },
+});
 function ticketTriageAction(siteKey, issueKey) {
   const a = ticketTriageActions[`${siteKey}/${issueKey}`];
   return a && TRIAGE_ACTIONS.has(a.action) ? a.action : null;
@@ -2112,7 +2133,7 @@ function setTicketTriageAction(siteKey, issueKey, action) {
       }
     }
   }
-  scheduleTriageActionsSave();
+  persistTriageActions();
   invalidateAgentsCache();
   sseBroadcast("triageActions", ticketTriageActions);
 }
@@ -2123,10 +2144,13 @@ function setTicketTriageAction(siteKey, issueKey, action) {
 // with per-field sanitization at boot so a hand-edited file can't smuggle a
 // non-string into a .includes() or a float into a rate comparison.
 let triagePolicies = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(TRIAGE_POLICIES_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    for (const [k, v] of Object.entries(parsed)) {
+// Per-org, per-field sanitize — the same whitelist the file boot-load applied,
+// now also guarding a malformed remote value on the watch path (a non-string in
+// a .includes(), a float in the rate compare).
+const triagePoliciesCoerce = (raw) => {
+  const out = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) {
       const p = {};
       if (v && typeof v === "object" && !Array.isArray(v)) {
         if (v.minPriority && ["P0", "P1", "P2", "P3"].includes(v.minPriority)) p.minPriority = v.minPriority;
@@ -2135,12 +2159,17 @@ try {
         if (Array.isArray(v.repoDeny)) p.repoDeny = v.repoDeny.filter(x => typeof x === "string");
         if (Number.isInteger(v.rateMax) && v.rateMax >= 1 && v.rateMax <= 50) p.rateMax = v.rateMax;
       }
-      if (Object.keys(p).length) triagePolicies[k] = p;
+      if (Object.keys(p).length) out[k] = p;
     }
   }
-} catch {
-  /* first boot or no volume mounted */
-}
+  return out;
+};
+triagePolicies = triagePoliciesCoerce(readJsonFile(TRIAGE_POLICIES_FILE));
+const persistTriagePolicies = registerExternalStore({
+  name: "triagePolicies", file: TRIAGE_POLICIES_FILE, event: "triagePolicies",
+  coerce: triagePoliciesCoerce, read: () => triagePolicies,
+  install: (v) => { triagePolicies = v; },
+});
 function sanitizeTriagePolicy(patch) {
   // Returns a sanitized partial policy or null if the patch is malformed.
   if (typeof patch !== "object" || patch === null || Array.isArray(patch)) return null;
@@ -2161,19 +2190,6 @@ function sanitizeTriagePolicy(patch) {
   }
   return p;
 }
-let tpSaveTimer = null;
-function scheduleTriagePolicySave() {
-  if (tpSaveTimer) return;
-  tpSaveTimer = setTimeout(() => {
-    tpSaveTimer = null;
-    fs.mkdir(path.dirname(TRIAGE_POLICIES_FILE), { recursive: true }, () => {
-      fs.writeFile(TRIAGE_POLICIES_FILE, JSON.stringify(triagePolicies), (err) => {
-        if (err) console.error(`triage-policies save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  tpSaveTimer.unref();
-}
 // Merge a sanitized patch into an org's policy (null values clear a knob).
 function setTriagePolicy(siteKey, patch) {
   const p = { ...(triagePolicies[siteKey] || {}) };
@@ -2183,7 +2199,7 @@ function setTriagePolicy(siteKey, patch) {
   }
   if (Object.keys(p).length) triagePolicies[siteKey] = p;
   else delete triagePolicies[siteKey];
-  scheduleTriagePolicySave();
+  persistTriagePolicies();
   invalidateAgentsCache();
   sseBroadcast("triagePolicies", triagePolicies);
 }
@@ -2807,33 +2823,17 @@ function epicRunDriveSweep() {
 // deletes the key). Writing priority into someone's tracker is intrusive, so
 // this is OFF by default everywhere. Same shape and lifecycle as autoStartOrgs.
 let priorityWriteBackOrgs = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(PRIORITY_WRITEBACK_ORGS_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    for (const [k, v] of Object.entries(parsed)) if (v) priorityWriteBackOrgs[k] = true;
-  }
-} catch {
-  /* first boot or no volume mounted */
-}
-let pwSaveTimer = null;
-function schedulePriorityWriteBackSave() {
-  if (pwSaveTimer) return;
-  pwSaveTimer = setTimeout(() => {
-    pwSaveTimer = null;
-    fs.mkdir(path.dirname(PRIORITY_WRITEBACK_ORGS_FILE), { recursive: true }, () => {
-      fs.writeFile(PRIORITY_WRITEBACK_ORGS_FILE, JSON.stringify(priorityWriteBackOrgs), (err) => {
-        if (err) console.error(`priority-writeback-orgs save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  pwSaveTimer.unref();
-}
+priorityWriteBackOrgs = asFlagMap(readJsonFile(PRIORITY_WRITEBACK_ORGS_FILE));
+const persistPriorityWriteBackOrgs = registerExternalStore({
+  name: "priorityWriteBackOrgs", file: PRIORITY_WRITEBACK_ORGS_FILE, event: "priorityWriteBackOrgs",
+  coerce: asFlagMap, read: () => priorityWriteBackOrgs, install: (v) => { priorityWriteBackOrgs = v; },
+});
 // Flip an org's priority write-back opt-in. The caller has already validated the
 // siteKey is one the fleet actually reports; this owns the map's bookkeeping.
 function setPriorityWriteBackOrg(siteKey, enabled) {
   if (enabled) priorityWriteBackOrgs[siteKey] = true;
   else delete priorityWriteBackOrgs[siteKey];
-  schedulePriorityWriteBackSave();
+  persistPriorityWriteBackOrgs();
   // Rides the /api/agents payload (and its own SSE event), like the auto-start
   // opt-in, so open boards reflect the toggle without waiting out an ETag match.
   invalidateAgentsCache();
@@ -2846,33 +2846,17 @@ function setPriorityWriteBackOrg(siteKey, enabled) {
 // the key). Writing issue links into someone's tracker is intrusive, so this is
 // OFF by default everywhere. Same shape and lifecycle as priorityWriteBackOrgs.
 let dedupeLinkOrgs = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(DEDUPE_LINK_ORGS_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    for (const [k, v] of Object.entries(parsed)) if (v) dedupeLinkOrgs[k] = true;
-  }
-} catch {
-  /* first boot or no volume mounted */
-}
-let dlSaveTimer = null;
-function scheduleDedupeLinkSave() {
-  if (dlSaveTimer) return;
-  dlSaveTimer = setTimeout(() => {
-    dlSaveTimer = null;
-    fs.mkdir(path.dirname(DEDUPE_LINK_ORGS_FILE), { recursive: true }, () => {
-      fs.writeFile(DEDUPE_LINK_ORGS_FILE, JSON.stringify(dedupeLinkOrgs), (err) => {
-        if (err) console.error(`dedupe-link-orgs save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  dlSaveTimer.unref();
-}
+dedupeLinkOrgs = asFlagMap(readJsonFile(DEDUPE_LINK_ORGS_FILE));
+const persistDedupeLinkOrgs = registerExternalStore({
+  name: "dedupeLinkOrgs", file: DEDUPE_LINK_ORGS_FILE, event: "dedupeLinkOrgs",
+  coerce: asFlagMap, read: () => dedupeLinkOrgs, install: (v) => { dedupeLinkOrgs = v; },
+});
 // Flip an org's duplicate-linking opt-in. The caller has already validated the
 // siteKey is one the fleet actually reports; this owns the map's bookkeeping.
 function setDedupeLinkOrg(siteKey, enabled) {
   if (enabled) dedupeLinkOrgs[siteKey] = true;
   else delete dedupeLinkOrgs[siteKey];
-  scheduleDedupeLinkSave();
+  persistDedupeLinkOrgs();
   // Rides the /api/agents payload (and its own SSE event), like the other
   // per-org opt-ins, so open boards reflect the toggle without an ETag match.
   invalidateAgentsCache();
@@ -2884,35 +2868,28 @@ function setDedupeLinkOrg(siteKey, enabled) {
 // number (1..8). Loaded like the auto-start opt-in: only well-formed entries
 // survive a read, so a hand-edited or corrupt file degrades to auto colors.
 let orgColors = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(ORG_COLORS_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    for (const [k, v] of Object.entries(parsed)) {
-      if (Number.isInteger(v) && v >= 1 && v <= ORG_COLOR_SLOTS) orgColors[k] = v;
+// Keep only in-range integer slots — the file boot-load's filter, now also on the
+// watch path so a hand-edited or malformed remote value degrades to auto colors.
+const orgColorsCoerce = (raw) => {
+  const o = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) {
+      if (Number.isInteger(v) && v >= 1 && v <= ORG_COLOR_SLOTS) o[k] = v;
     }
   }
-} catch {
-  /* first boot or no volume mounted */
-}
-let ocSaveTimer = null;
-function scheduleOrgColorsSave() {
-  if (ocSaveTimer) return;
-  ocSaveTimer = setTimeout(() => {
-    ocSaveTimer = null;
-    fs.mkdir(path.dirname(ORG_COLORS_FILE), { recursive: true }, () => {
-      fs.writeFile(ORG_COLORS_FILE, JSON.stringify(orgColors), (err) => {
-        if (err) console.error(`org-colors save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  ocSaveTimer.unref();
-}
+  return o;
+};
+orgColors = orgColorsCoerce(readJsonFile(ORG_COLORS_FILE));
+const persistOrgColors = registerExternalStore({
+  name: "orgColors", file: ORG_COLORS_FILE, event: "orgColors",
+  coerce: orgColorsCoerce, read: () => orgColors, install: (v) => { orgColors = v; },
+});
 // Pin an org's palette slot, or release it back to auto (slot = null). The
 // caller has validated the siteKey and the slot range; this owns the map.
 function setOrgColor(siteKey, slot) {
   if (slot) orgColors[siteKey] = slot;
   else delete orgColors[siteKey];
-  scheduleOrgColorsSave();
+  persistOrgColors();
   invalidateAgentsCache();
   sseBroadcast("orgColors", orgColors);
 }
@@ -2936,30 +2913,32 @@ const DEFAULT_REPO_TIER = "active";
 const REPO_NAME_MAX = 200;
 const isRepoTier = (t) => typeof t === "string" && Object.hasOwn(REPO_TIER_RANK, t);
 let repoTiers = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(REPO_TIERS_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    for (const [k, v] of Object.entries(parsed)) {
-      // Only NON-default, in-range tiers are kept: the default is implicit, so
-      // storing it would just be dead weight (setRepoTier deletes back to it).
-      if (k && k.length <= REPO_NAME_MAX && isRepoTier(v) && v !== DEFAULT_REPO_TIER) {
-        repoTiers[k] = v;
-      }
+// Keep only NON-default, in-range tiers (the default is implicit, so storing it
+// is dead weight — setRepoTier deletes back to it). Same whitelist the file
+// boot-load used, now also guarding a malformed remote value on the watch path.
+const repoTiersCoerce = (raw) => {
+  const o = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) {
+      if (k && k.length <= REPO_NAME_MAX && isRepoTier(v) && v !== DEFAULT_REPO_TIER) o[k] = v;
     }
   }
-} catch {
-  /* first boot or no volume mounted */
-}
-// One-shot config seed: fills in repos the durable file does not already carry.
-// Wrapped so a malformed REPO_TIER_SEED is a logged boot warning, never a crash.
+  return o;
+};
+// The one-shot config seed, parsed once. A malformed REPO_TIER_SEED is a logged
+// boot warning, never a crash. Applied to repos the store does NOT already carry,
+// exactly as before — but now at BOOT ONLY (module-init AND after the adapter
+// load), NEVER on a remote watch: a runtime change on any replica is authoritative
+// and must not be undone by the seed, and an operator RELEASE still reverts to the
+// seed at the next boot (the seed is a boot-time default, as it always was).
+const repoTierSeed = {};
 if (REPO_TIER_SEED) {
   try {
     const seed = JSON.parse(REPO_TIER_SEED);
     if (seed && typeof seed === "object" && !Array.isArray(seed)) {
       for (const [k, v] of Object.entries(seed)) {
-        if (k && k.length <= REPO_NAME_MAX && isRepoTier(v) &&
-            v !== DEFAULT_REPO_TIER && !Object.hasOwn(repoTiers, k)) {
-          repoTiers[k] = v;
+        if (k && k.length <= REPO_NAME_MAX && isRepoTier(v) && v !== DEFAULT_REPO_TIER) {
+          repoTierSeed[k] = v;
         }
       }
     } else {
@@ -2969,19 +2948,20 @@ if (REPO_TIER_SEED) {
     console.error(`REPO_TIER_SEED could not be parsed — ignored: ${err.message}`);
   }
 }
-let rtSaveTimer = null;
-function scheduleRepoTiersSave() {
-  if (rtSaveTimer) return;
-  rtSaveTimer = setTimeout(() => {
-    rtSaveTimer = null;
-    fs.mkdir(path.dirname(REPO_TIERS_FILE), { recursive: true }, () => {
-      fs.writeFile(REPO_TIERS_FILE, JSON.stringify(repoTiers), (err) => {
-        if (err) console.error(`repo-tiers save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  rtSaveTimer.unref();
+// Fill in repos the mirror does not already carry from the seed. Idempotent; the
+// mirror's own (stored) entries always win, so operator edits beat the seed.
+function applyRepoTierSeed() {
+  for (const [k, v] of Object.entries(repoTierSeed)) {
+    if (!Object.hasOwn(repoTiers, k)) repoTiers[k] = v;
+  }
 }
+repoTiers = repoTiersCoerce(readJsonFile(REPO_TIERS_FILE));
+applyRepoTierSeed();
+const persistRepoTiers = registerExternalStore({
+  name: "repoTiers", file: REPO_TIERS_FILE, event: "repoTiers",
+  coerce: repoTiersCoerce, read: () => repoTiers, install: (v) => { repoTiers = v; },
+  afterLoad: applyRepoTierSeed,
+});
 // The read seams the rest of triage consumes. Keyed by the SAME repo name
 // `repoGuess`/`ticketRepo` yields, so a ticket's triaged repo joins cleanly.
 // An unset or blank repo is the default middle tier — the "can't tell" answer,
@@ -3003,7 +2983,7 @@ function isRepoIgnored(repo) {
 function setRepoTier(repo, tier) {
   if (tier && tier !== DEFAULT_REPO_TIER) repoTiers[repo] = tier;
   else delete repoTiers[repo];
-  scheduleRepoTiersSave();
+  persistRepoTiers();
   invalidateAgentsCache();
   sseBroadcast("repoTiers", repoTiers);
 }
@@ -16285,6 +16265,25 @@ if (process.env.TURMA_TEST) {
     invalidateAgentsCache,
     serializeAgentsForSave,
     flushStateNow, // graceful-shutdown synchronous state flush (XERK-552)
+    // XERK-757 — the externalized-store wiring. The full cross-replica behaviour
+    // over a live Valkey is host-QA (no Valkey in CI), so these expose the
+    // backend-agnostic mechanism: the coerces, the observe-from-backend apply
+    // (dedup + install), the boot wiring, and the descriptor list, so a test can
+    // drive it against a real FileLiveStore (the non-HA path, verbatim).
+    __externalStores: {
+      registerExternalStore,
+      applyExternalStoreValue,
+      wireExternalStores,
+      readJsonFile,
+      asPlainObject,
+      asFlagMap,
+      list: () => externalizedStores,
+      persistentConfig: () => STORE_PERSISTENT,
+      setLiveStore: (s) => { liveStore = s; },
+      getLiveStore: () => liveStore,
+      repoTiers: () => repoTiers,
+      setRepoTier,
+    },
     // The usage-coercion warning is rate-limited to one line a minute across the
     // WHOLE fleet, on module state. Exported so a test can hold BOTH halves of
     // the rule — that a deliberate `null` stays silent AND that a wrong-typed
@@ -16756,16 +16755,20 @@ if (process.env.TURMA_TEST) {
     process.exit(2);
   }
   // Build the LiveStore for the resolved mode. With HA off this is the local
-  // file/in-memory backend and nothing here touches the hot path yet (wave-3
-  // wires the call sites); with HA on it is the Valkey client, whose connection
+  // file/in-memory backend (its `persistent` map reproduces each store's on-disk
+  // JSON byte-for-byte); with HA on it is the Valkey client, whose connection
   // health is logged as it comes and goes — never fatal at runtime, so a store
-  // blip reconnects rather than taking the hub down (availability).
-  const liveStore = createLiveStore(haConfig, {
+  // blip reconnects rather than taking the hub down (availability). The file
+  // backend's `persistent` config is the same /data files the stores used to
+  // write themselves, so nothing on disk moves.
+  const backendStore = createLiveStore(haConfig, {
     onHealth: (h) => console.log(`HA store health: ${h}`),
+    persistent: STORE_PERSISTENT,
   });
-  // Referenced so linters/readers see it is intentionally constructed-not-yet-
-  // wired this wave; wave-3 children read it. (No-op; keeps the binding alive.)
-  void liveStore;
+  // XERK-757: wire the low-churn operator/org policy stores onto the backend so a
+  // toggle set on one replica is visible on every replica — set-through-adapter +
+  // watch-driven local SSE re-broadcast, byte-identical on the file backend.
+  wireExternalStores(backendStore);
 
   // ---- Graceful shutdown (XERK-552) --------------------------------------
   // The hub is single-replica on an RWO volume, so a rolling deploy is a
@@ -16850,6 +16853,10 @@ if (process.env.TURMA_TEST) {
       // now); the archive SQLite handle is closed so its last writes land; the
       // usage ledger's write is async, and its callback is what ends the process.
       flushStateNow();
+      // Drain the externalized stores' pending debounced writes synchronously
+      // (file backend) and close the shared client's sockets (XERK-757) — the
+      // same lossless-drain intent as flushStateNow, for the policy stores.
+      try { backendStore.close?.(); } catch {}
       try { archive.closeDb(); } catch {}
       const finish = () => { clearTimeout(forceExit); console.log("drain complete — exiting"); process.exit(0); };
       const once = () => { if (!done) { done = true; finish(); } };
