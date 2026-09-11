@@ -44,6 +44,15 @@ const push = require("./push.js");
 // /data, keyed by host, and folds it back into what /api/agents serves. Reads
 // its file at require time (like the other /data stores below).
 const usageLedger = require("./usage-ledger.js");
+// HA storage-abstraction seam (XERK-754, epic XERK-751): the config resolver and
+// the LiveStore backends (file/in-memory default, or the Valkey shared client
+// when HA is on). Requiring these is side-effect-free — no socket is dialled and
+// no env is read until `resolveHaConfig`/`createLiveStore` are CALLED at boot
+// below. With HA off (the default) the file backend is constructed but nothing
+// here is on the hot path yet; wave-3 children flip each store's save/load onto
+// it. See docs/turma-ha-store-adr.md.
+const { resolveHaConfig } = require("./ha-config.js");
+const { createLiveStore } = require("./store.js");
 
 const PORT = positiveEnv("PORT", 8300);
 
@@ -16705,6 +16714,34 @@ if (process.env.TURMA_TEST) {
   if (TURMA_AGENT_TOKEN && !TURMA_AGENT_STRICT) {
     console.warn("WARNING: TURMA_AGENT_STRICT not set — the shared TURMA_AGENT_TOKEN is still accepted, so an agent can act as any host. Give each agent `node server.js --agent-token <host>` as its TURMA_TOKEN, then set TURMA_AGENT_STRICT=1");
   }
+
+  // ---- HA storage seam: resolve the mode, select the backend (XERK-754) ----
+  // ONE switch (HA_MODE / TURMA_STORE_URL) decides single-process-on-files (the
+  // default) vs the shared store. Resolved and PRINTED before the listen so a
+  // misconfigured HA hub REFUSES TO BOOT loudly rather than run half-shared,
+  // half-local (the split-brain the epic exists to avoid). The effective mode
+  // prints for the same reason the memory ceilings do: it is the only way to
+  // tell a correctly-configured hub from one whose env moved under it. See
+  // docs/turma-ha-store-adr.md ("The HA config contract").
+  const haConfig = resolveHaConfig(process.env);
+  console.log(haConfig.bootLine);
+  if (haConfig.fatal.length) {
+    // Fail loud, never half-HA: name every misconfiguration and refuse to boot.
+    for (const msg of haConfig.fatal) console.error(`HA config error: ${msg}`);
+    console.error("refusing to boot — fix the HA configuration or unset HA_MODE to run single-process");
+    process.exit(2);
+  }
+  // Build the LiveStore for the resolved mode. With HA off this is the local
+  // file/in-memory backend and nothing here touches the hot path yet (wave-3
+  // wires the call sites); with HA on it is the Valkey client, whose connection
+  // health is logged as it comes and goes — never fatal at runtime, so a store
+  // blip reconnects rather than taking the hub down (availability).
+  const liveStore = createLiveStore(haConfig, {
+    onHealth: (h) => console.log(`HA store health: ${h}`),
+  });
+  // Referenced so linters/readers see it is intentionally constructed-not-yet-
+  // wired this wave; wave-3 children read it. (No-op; keeps the binding alive.)
+  void liveStore;
 
   // ---- Graceful shutdown (XERK-552) --------------------------------------
   // The hub is single-replica on an RWO volume, so a rolling deploy is a
