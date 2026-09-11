@@ -25,6 +25,14 @@ This file is the operative rules for the two modules that landed it.
   the hot path. **Wave-3 children flip each call site** onto the already-proven
   adapter, one store at a time — that is where "moving a store's semantics" lives.
   Do not fold a call-site rewire into this seam.
+- **First wave-3 child LANDED: the usage ledger (XERK-758).** `usage-ledger.js` now persists through
+  a pluggable backend — file default (byte-identical, HA off) or `SharedLedgerBackend`
+  (`usage-ledger-shared.js`, atomic per-host high-water max-merge into this `LiveStore`), swapped by
+  `usageLedger.configure(liveStore, haConfig)` at boot. It reuses the LiveStore's `compareAndSet`/
+  `setIfAbsent`/`scan`/`watch` unchanged — **no new store primitive was added here.** DELIBERATE ADR
+  divergence (ledger on Valkey, not the ADR's Postgres — no stdlib PG client exists yet); the
+  per-host max-merge write is backend-agnostic so a PG `LedgerStore` slots in later with no call-site
+  change. Full rules: `.claude/rules/turma-usage.md` ("HA: the shared-store backend").
 
 ## Load-bearing invariants
 

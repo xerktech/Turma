@@ -16763,9 +16763,14 @@ if (process.env.TURMA_TEST) {
   const liveStore = createLiveStore(haConfig, {
     onHealth: (h) => console.log(`HA store health: ${h}`),
   });
-  // Referenced so linters/readers see it is intentionally constructed-not-yet-
-  // wired this wave; wave-3 children read it. (No-op; keeps the binding alive.)
-  void liveStore;
+  // Wave-3 (XERK-758): move the durable usage ledger onto the shared store when HA
+  // is on. With HA off this is a no-op and the ledger stays on its local JSON file,
+  // byte-identical. Fire-and-forget + logged: a store down at boot must not block
+  // the listen (availability) — `configure` yields an empty model that the store's
+  // `watch` and the next beats refill. Other wave-3 children read `liveStore` too.
+  usageLedger.configure(liveStore, haConfig).catch((e) => {
+    console.error(`usage ledger: shared-store configure failed, staying on the local file: ${(e && e.message) || e}`);
+  });
 
   // ---- Graceful shutdown (XERK-552) --------------------------------------
   // The hub is single-replica on an RWO volume, so a rolling deploy is a

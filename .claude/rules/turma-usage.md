@@ -2,10 +2,12 @@
 paths:
   - "turma/public/usage.html"
   - "turma/usage-ledger.js"
+  - "turma/usage-ledger-shared.js"
   - "turma/server.js"
   - "turma/tests/usage.test.js"
   - "turma/tests/usage-models.test.js"
   - "turma/tests/usage-ledger.test.js"
+  - "turma/tests/usage-ledger-shared.test.js"
 ---
 
 # Usage page (`/usage`) and the durable usage ledger
@@ -166,6 +168,48 @@ paths:
   Android) gets it with no parity change; the dashboard token TILES sum fleet-wide, so the merge
   correcting the split (removing the overlap double-count) is the only movement they see.
 - Tests: the `XERK-448:` cases in `usage-ledger.test.js`.
+
+### HA: the shared-store backend (XERK-758, epic XERK-751)
+
+- **Persistence is a PLUGGABLE BACKEND behind one seam** (`usage-ledger.js`, `backend` +
+  `configure(liveStore, haConfig)`). The in-memory `hosts` model and EVERY reducer/read function
+  (`ingest`'s model mutation, `fold`, `retiredAgents`, `has`) are backend-agnostic and stay
+  SYNCHRONOUS — only PERSISTENCE differs. So with HA off nothing changes: the file backend rewrites
+  `/data/usage-ledger.json` whole, byte-for-byte and same cadence as before, and `configure` is a
+  no-op (the byte-for-byte file tests are untouched and still pass).
+- **With HA on, `configure` swaps in `SharedLedgerBackend`** (`usage-ledger-shared.js`): each host is
+  its OWN store key (`usage:host:<ledgerKey>`), written by an ATOMIC per-host HIGH-WATER **max-merge**
+  under the store's CAS (XERK-754 `LiveStore.compareAndSet` / `setIfAbsent`). The write RAISES the
+  local entry by the store's current value BEFORE the CAS, so what it writes is `>=` both this
+  replica's partial view AND any other replica's recorded marks — **a low writer can never lower a
+  recorded total**, and two racing replicas converge (the CAS loser re-reads the higher marks and
+  re-applies max). This is the LiveStore expression of the ADR's `GREATEST(existing,incoming)`.
+- **DELIBERATE ADR DIVERGENCE — flagged for sign-off.** `docs/turma-ha-store-adr.md` names **Postgres**
+  as the ledger of-record. Only the **Valkey LiveStore** backend exists today (XERK-754; the hub is
+  stdlib-only, so a from-scratch Postgres client is a separate large effort), and the ticket asks for
+  "the store's CAS/atomic ops chosen in the spike" — which is this. The write path is
+  backend-agnostic (per-host max-merge): a future Postgres `LedgerStore` with the same semantics
+  slots in behind `configure()` with **no call-site change**. `DATABASE_URL` is still required when
+  HA is on (`ha-config.js`, unchanged) — reserved for that backend + the archive index.
+- **The READ MODEL stays HOT, so the serve path is unchanged.** `fold`/`retiredAgents`/`has` read the
+  same in-memory `hosts` synchronously; the shared backend keeps it hot via its own writes AND a
+  `watch` subscription that folds in OTHER replicas' writes (the ADR warm-standby design). Under
+  Option 2 (leader-only serving) the leader receives every beat, so its model is complete; a standby
+  stays promotable. `mergeTwoEntries` is the entry-level high-water fold the watch + CAS reuse (the
+  entry analogue of `mergeSeries`), so there is ONE high-water rule, not a second copy.
+- **Bounds mapped to the store**: `LEDGER_MAX` → the per-host `enforceHostShare` byte bound applied
+  before each write (a host is one key, so its share IS its ceiling); the snapshot cadence →
+  `SAVE_DEBOUNCE_MS` debounced dirty-flush. **Whole-store host-COUNT eviction (`LEDGER_HOSTS`) and the
+  innocent-host byte eviction are NOT enforced in HA** — each host is its own durable row (there is no
+  single file to overflow), which is strictly more correct than the file backend's whole-file
+  eviction; a per-key TTL/quota is the store's concern, tracked as future work if a real fleet needs it.
+- **`ingest` persistence is fire-and-forget** (model updated synchronously, durable write scheduled);
+  `configure` at boot is best-effort and NEVER fatal — a store down at boot yields an empty model that
+  `watch` + the next beats refill (availability, matching `SharedLiveStore`'s reconnect posture).
+- Tests: `usage-ledger-shared.test.js` drives the REAL `SharedLedgerBackend` against the in-memory
+  `FileLiveStore` (no live Valkey in CI, same constraint as `store.test.js`): the max-merge
+  no-lower-a-total property, higher-view-raises, boot scan, watch fold, forget propagation, repo-level
+  high-water, and `configure()` end-to-end through the real ledger.
 
 ### Recovering a wiped host's history (`turma/tools/recover-usage-from-archive.js`)
 
