@@ -41,6 +41,9 @@ class ArchiveMirror {
    */
   constructor({ blobStore, archiveDir, reindex, isLeader, log }) {
     this.blobStore = blobStore;
+    // archiveDir is ARCHIVE_DIR (operator env / a fixed default), not user input;
+    // keyFor/pathFor below re-check every derived path against this resolved root.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     this.archiveDir = path.resolve(archiveDir);
     this.reindex = typeof reindex === "function" ? reindex : () => {};
     this.isLeader = typeof isLeader === "function" ? isLeader : () => true;
@@ -55,6 +58,9 @@ class ArchiveMirror {
   // under ARCHIVE_DIR). POSIX '/' separators so a key is portable across a Linux
   // hub and any object store.
   keyFor(absPath) {
+    // The `..`/absolute-rel check IS the traversal guard — a key is returned only
+    // when the path resolves strictly under archiveDir.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     const rel = path.relative(this.archiveDir, path.resolve(absPath));
     if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
     return rel.split(path.sep).join("/");
@@ -65,6 +71,9 @@ class ArchiveMirror {
   // outside ARCHIVE_DIR — the tar-extract discipline).
   pathFor(key) {
     if (typeof key !== "string" || !key || key.includes("\0")) return null;
+    // The startsWith(archiveDir + sep) check below IS the traversal guard — a
+    // listing key that would escape the tree returns null, never a path.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     const abs = path.resolve(this.archiveDir, key);
     if (abs !== this.archiveDir && !abs.startsWith(this.archiveDir + path.sep)) return null;
     return abs;
