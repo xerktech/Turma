@@ -133,11 +133,35 @@ things worth knowing up front:
 It self-updates from the release stream afterwards without stopping running
 sessions. See [`agent/native/README.md`](agent/native/README.md).
 
-> **Testing HA?** There is a separate, optional
-> [`hub-ha.yaml`](examples/compose/hub-ha.yaml) that brings the hub up alongside
-> the shared store (Valkey + Postgres + MinIO) the HA work targets
-> ([the store ADR](docs/turma-ha-store-adr.md)). It is **not** the normal way to
-> run Turma — `hub.yaml` above is — so a plain deploy ignores it entirely.
+## Deployment: single-process vs. HA
+
+The hub runs in one of two supported shapes, and **the single-process one above
+is the default** — it needs no external store and is a legitimate production
+choice for a single operator or a small fleet.
+
+- **Single-process (non-HA), the default.** One hub container on its `/data`
+  volume, exactly what `hub.yaml` runs. **HA is off** — the boot log says
+  `HA: off (single-process)`. Everything Turma does works here; the only thing it
+  lacks is a no-gap dashboard during a redeploy.
+- **Multi-replica HA on Kubernetes.** 2–3 active-passive hub replicas behind a
+  leader lease, backed by a shared store (Valkey + Postgres + object storage), so
+  a rolling update or a pod loss causes **no dashboard outage**. A hub outage only
+  ever costs dashboard visibility and queued commands — never running work, which
+  lives in the native agents — so HA buys *invisible deploys*, not more capability.
+
+**Turning HA on is one switch.** `HA_MODE` unset infers HA on the moment
+`TURMA_STORE_URL` is present; `HA_MODE=1` forces it on and the hub refuses to boot
+if any required store URL is missing (never a silent half-HA); `HA_MODE=0` forces
+it off. HA **requires the external store** — `TURMA_STORE_URL` (Valkey),
+`DATABASE_URL` (Postgres), and `ARCHIVE_S3_*` (object storage) — and every replica
+must share an identical `TURMA_AGENT_TOKEN` and `TURMA_SESSION_SECRET`.
+
+**Full operator guide for both paths — env, leader-lease RBAC, replicas/anti-affinity/RollingUpdate,
+and the `/readyz` vs `/healthz` probes — is [`docs/turma-ha-deploy.md`](docs/turma-ha-deploy.md).**
+The k8s manifests live in `xerktech/ArgoCD` (`ai/turma/` for the hub, `ai/turma-store/` for the
+store), not in this repo. To exercise the HA wiring locally without Kubernetes, the optional
+[`hub-ha.yaml`](examples/compose/hub-ha.yaml) brings the hub up alongside the store — read its header;
+it runs one hub (no failover), and it is **not** the normal way to run Turma.
 
 ## Clients
 

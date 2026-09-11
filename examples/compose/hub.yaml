@@ -6,6 +6,13 @@
 # Run ONE of these per fleet, somewhere every agent host can reach outbound.
 # Agents connect out to it; it never dials an agent, so it needs no route back
 # into the hosts it manages.
+#
+# HA is OFF here, by design — this single process on its /data volume is the
+# fully-supported default and needs no external store (the boot log says
+# "HA: off (single-process)"). Multi-replica HA is a Kubernetes deployment that
+# turns on when the shared-store env is present (HA_MODE / TURMA_STORE_URL /
+# DATABASE_URL / ARCHIVE_S3_*); see docs/turma-ha-deploy.md and, for a local
+# store to test against, hub-ha.yaml beside this file.
 
 services:
   turma:
