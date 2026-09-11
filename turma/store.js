@@ -116,6 +116,21 @@ class FileLiveStore {
     if (had) this._fire(key, "del", null);
   }
 
+  // Atomic get-and-delete: return the current snapshot (or null) AND remove the
+  // key in ONE step, with no `await` between the read and the delete, so a
+  // single-use consume (an OIDC tx/handoff/session, XERK-760) cannot be
+  // double-read by concurrent callers. The shared backend uses RESP `GETDEL` for
+  // the same atomicity — do not decompose this into get()+del() at a call site.
+  async getDel(key) {
+    if (!this.map.has(key)) return null;
+    const val = snapshot(this.map.get(key));
+    this.map.delete(key);
+    this._clearTtl(key);
+    this._persist(key);
+    this._fire(key, "del", null);
+    return val;
+  }
+
   async setIfAbsent(key, value, { ttlMs } = {}) {
     if (this.map.has(key)) return false;
     await this.set(key, value, { ttlMs });
@@ -528,6 +543,17 @@ class SharedLiveStore {
   async del(key) {
     await this._command("DEL", key);
     await this._announce("del", key, null);
+  }
+
+  // Atomic get-and-delete via RESP `GETDEL` (one server-side op — the shared
+  // twin of FileLiveStore.getDel), so a single-use consume that runs on this
+  // replica cannot double-read against a concurrent consume on another. The
+  // watch announce is best-effort after the fact, like del's.
+  async getDel(key) {
+    const raw = await this._command("GETDEL", key);
+    const val = raw == null ? null : JSON.parse(raw);
+    if (val != null) await this._announce("del", key, null);
+    return val;
   }
 
   async setIfAbsent(key, value, { ttlMs } = {}) {

@@ -35,6 +35,30 @@ test("XERK-754: FileLiveStore get/set/del round-trip", async () => {
   assert.equal(await s.get("k"), null);
 });
 
+test("XERK-760: getDel returns the value AND removes it; null when absent", async () => {
+  const s = new FileLiveStore();
+  assert.equal(await s.getDel("k"), null); // absent
+  await s.set("k", { a: 1 });
+  assert.deepEqual(await s.getDel("k"), { a: 1 }); // returns the value
+  assert.equal(await s.get("k"), null); // and it's gone
+  assert.equal(await s.getDel("k"), null); // second consume sees nothing
+});
+
+test("XERK-760: getDel is a SNAPSHOT and is atomic under concurrency (single-use consume)", async () => {
+  const s = new FileLiveStore();
+  await s.set("k", { a: 1 });
+  const v = await s.getDel("k");
+  v.a = 999; // mutating the returned copy must not matter (already deleted, but snapshot anyway)
+  assert.equal(await s.get("k"), null);
+  // Two concurrent consumes of one key: exactly ONE gets the value (no `await`
+  // between the read and the delete inside getDel), the other gets null. The old
+  // get()+del() pair yielded between the two awaits and let both read it.
+  await s.set("once", "the-token");
+  const [a, b] = await Promise.all([s.getDel("once"), s.getDel("once")]);
+  const got = [a, b].filter((x) => x != null);
+  assert.deepEqual(got, ["the-token"], "exactly one concurrent consumer wins");
+});
+
 test("XERK-754: get returns a SNAPSHOT — mutating it can't reshape the store", async () => {
   const s = new FileLiveStore();
   await s.set("k", { a: 1 });
