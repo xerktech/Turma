@@ -56,14 +56,15 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `BoardScreen.kt`) that opens the dropdown on tap — for the Status, Repo, Agent and Model rows. One
   tappable chip reads better on a phone than a value plus a separate button; a pick is still the save,
   same as the web.
-- **Session-card PR chips: right-aligned, reaching the card edge (XERK-736).** On web the chips are
-  right-aligned on the state line and drop to their own line(s) below it when they don't all fit;
-  the fix was to stop them stopping short at the ⋯/Resume corner reservation (they now reclaim that
-  right padding, so the rows reach the card edge and wrap less) plus a slightly tighter card padding.
-  Android was never affected: `SessionsScreen.kt` renders the PRs in their own `FlowRow` below the
-  state row, and has no ⋯/Resume corner reservation eating its width. No Android change; the fix is
-  web (`sessions.html`) + glasses (`phone.css`) only. Android's FlowRow is start-packed rather than
-  end-aligned — an accepted, pre-existing platform-idiomatic difference, not a new gap.
+- **Session-card PR chips: consolidated onto the state line, left-filled.** On web the chips now flow
+  left-to-right straight after the state text ("idle") and wrap to fill the full card width, still
+  reclaiming the ⋯/Resume corner padding (`display:contents` on `.pr-list` folds the chips into the
+  state-row's single wrap flow). This SUPERSEDES the earlier XERK-736 right-aligned block. Android was
+  never affected and is now the closer match: `SessionsScreen.kt` already renders the PRs start-packed
+  in a `FlowRow`, and has no ⋯/Resume corner reservation eating its width. No Android change; the fix
+  is web (`sessions.html`) + glasses (`phone.css`) only. Android keeps the PRs in their own FlowRow
+  below the state text rather than sharing the first line — an accepted, pre-existing platform-idiomatic
+  difference, not a new gap.
 - **In-app updater** (`ui/UpdateBanner.kt`) — a sideload stopgap until Play (XERK-11), no web analog.
 - **Chat text-size control** (XERK-144) — a phone-only addition, no web analog. The chat settings menu
   (the top-bar ⚙/Tune button that holds verbosity) also picks a chat text size, scaling every bubble/
