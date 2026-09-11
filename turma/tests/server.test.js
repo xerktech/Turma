@@ -2282,6 +2282,13 @@ function oversizeHeartbeatBody(device) {
 
 test("http: /healthz is unauthenticated; everything else is gated", async () => {
   assert.equal((await request("GET", "/healthz")).status, 200);
+  // XERK-753: /readyz is a DISTINCT unauthenticated readiness probe. Not draining
+  // here, so it reports Ready 200 {ready:true}; it flips to 503 {ready:false}
+  // only inside the SIGTERM drain (exercised by the boot-and-SIGTERM QA pass, not
+  // this in-process suite whose drain would process.exit).
+  const ready = await request("GET", "/readyz");
+  assert.equal(ready.status, 200);
+  assert.equal(ready.body.ready, true);
   assert.equal((await request("GET", "/api/agents")).status, 401);
   assert.equal(
     (await request("GET", "/api/agents", { headers: { authorization: basic("hubuser", "bad") } })).status,
