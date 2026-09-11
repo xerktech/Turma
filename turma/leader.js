@@ -39,6 +39,19 @@ const crypto = require("crypto");
 
 const SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount";
 
+// A Lease's `acquireTime`/`renewTime` are k8s `MicroTime`, whose parser demands
+// EXACTLY six fractional-second digits (Go layout `2006-01-02T15:04:05.000000Z07:00`).
+// `Date#toISOString()` emits three (milliseconds: `...41.365Z`), which the API
+// rejects with a 400 — and `_create`/`_put` swallow any non-2xx as "not leader"
+// with no log, so a millisecond stamp silently disables election fleet-wide (no
+// lease is ever created, every replica stays a follower, `/readyz` never goes
+// Ready, the Service has zero endpoints). JS Date has no sub-ms resolution, so
+// pad the millis to micros with three zeros. Unit tests inject a fake `request`
+// that never parses the body, which is why this went uncaught until a live API.
+function microTime(ms) {
+  return new Date(ms).toISOString().replace(/\.(\d{3})Z$/, ".$1000Z");
+}
+
 // Timing defaults (client-go's leaderelection shape): renewDeadline < leaseDuration,
 // retryPeriod small. A follower sees the leader gone at most leaseDuration after
 // its last renewal; the leader gives up leadership if it cannot renew within
@@ -200,7 +213,7 @@ class LeaderElector {
   _spec(now, prev) {
     // A lease's timestamps are RFC3339. `acquireTime` is preserved across a renew
     // and stamped fresh on an acquisition; `leaseTransitions` counts handovers.
-    const iso = new Date(now).toISOString();
+    const iso = microTime(now);
     return {
       holderIdentity: this.identity,
       leaseDurationSeconds: this.leaseSeconds,
@@ -316,7 +329,7 @@ class LeaderElector {
       const observed = await this._get();
       if (!observed || !observed.spec || observed.spec.holderIdentity !== this.identity) return;
       const rv = observed.metadata && observed.metadata.resourceVersion;
-      const past = new Date(Date.now() - this.leaseDurationMs - 1000).toISOString();
+      const past = microTime(Date.now() - this.leaseDurationMs - 1000);
       await this._request(
         "PUT",
         `${this._leasePath()}/${encodeURIComponent(this.leaseName)}`,
@@ -492,5 +505,6 @@ module.exports = {
   readServiceAccount,
   makeK8sRequest,
   leaderIdentity,
+  microTime,
   DEFAULTS,
 };
