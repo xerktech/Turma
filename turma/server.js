@@ -3697,14 +3697,80 @@ function safeAgentsCache() {
   return agentsCache;
 }
 
-// Push one Server-Sent Event to every open /api/events stream (best-effort; a
-// dead stream is dropped on its next failed write and by its "close" handler).
-function sseBroadcast(event, dataObj) {
+// ---- Cross-replica SSE fan-out over the shared bus (XERK-762) ---------------
+// SSE is per-process: `sseBroadcast` writes only to THIS process's `sseClients`.
+// With HA off that is the whole story (one process). With N active-active
+// replicas a mutation on replica A must ALSO reach a browser whose /api/events
+// stream is held by replica B, or that dashboard goes stale until it reconnects
+// and re-polls. So in HA mode every broadcast is additionally published to a
+// shared pub/sub channel; each replica subscribes and re-emits to its OWN local
+// clients.
+//
+// The originating replica delivers to its own clients directly (in
+// `sseBroadcast`) AND publishes — so local clients see the event with no bus
+// round-trip and even during a bus blip. Each frame carries this replica's
+// `SSE_REPLICA_ID`; a replica SKIPS a frame stamped with its own id, so an event
+// a replica both ORIGINATED and RECEIVED BACK off the bus is delivered once, not
+// twice. The re-emitted `(event, dataObj)` is byte-identical to what the
+// originator broadcast, so the client merge machinery (mergeSnapshot / sseClock /
+// patchedAt, XERK-444/545) converges a cross-replica patch exactly as it does a
+// local one — this ticket adds NO new event name or payload shape.
+//
+// Non-HA: `sseBus` stays null and `sseBroadcast` is a plain local iteration,
+// unchanged — the FileLiveStore's in-process pub/sub is deliberately NOT wired
+// here (a single process has no other replica to reach).
+const SSE_BUS_CHANNEL = "__turma_sse__";
+// Unique per process, so a replica recognizes (and skips) its own echo. A fresh
+// value each boot is correct: a restarted replica must RE-DELIVER, never skip,
+// frames a previous instance of itself once published.
+const SSE_REPLICA_ID = crypto.randomBytes(8).toString("hex");
+let sseBus = null; // { publish(event, dataObj) } in HA mode; null single-process.
+
+// Write one SSE frame to every open /api/events stream ON THIS PROCESS
+// (best-effort; a dead stream is dropped on its next failed write and by its
+// "close" handler). The LOCAL half — the whole story with HA off, and the
+// per-replica delivery step in HA (both the originator's own clients and, via
+// the bus subscription, another replica's events).
+function sseDeliverLocal(event, dataObj) {
   if (!sseClients.size) return;
   const frame = `event: ${event}\ndata: ${JSON.stringify(dataObj)}\n\n`;
   for (const res of sseClients) {
     try { res.write(frame); } catch { sseClients.delete(res); }
   }
+}
+
+// Broadcast one SSE event: deliver to this replica's clients now, and in HA mode
+// publish it to the shared bus so every OTHER replica re-emits it to its own
+// clients (XERK-762). Signature unchanged, so its ~40 call sites are untouched.
+function sseBroadcast(event, dataObj) {
+  sseDeliverLocal(event, dataObj);
+  if (sseBus) sseBus.publish(event, dataObj);
+}
+
+// Wire cross-replica SSE fan-out onto a LiveStore's pub/sub. Standalone + the
+// store injected so the origin-dedup + re-emit logic is exercisable without a
+// live Valkey socket (unit tests). `deliverLocal` is the same function the
+// originating replica uses, so a re-emitted frame is written identically.
+function makeSseBus(store, replicaId, deliverLocal) {
+  store.subscribe(SSE_BUS_CHANNEL, (msg) => {
+    // Skip our OWN echo — sseBroadcast already delivered it locally. A malformed
+    // or foreign-shaped message is ignored: the only publisher is a peer replica,
+    // but the bus is shared infrastructure, so never trust the shape.
+    if (!msg || typeof msg !== "object" || msg.origin === replicaId) return;
+    if (typeof msg.event !== "string") return;
+    deliverLocal(msg.event, msg.data);
+  });
+  return {
+    publish(event, dataObj) {
+      // Best-effort: a failed publish (a store blip) never fails the mutation it
+      // followed — local clients already got the frame, and the next per-host
+      // beat re-ships that host's FULL serialized record, so a cross-replica
+      // frame missed during a blip self-heals within a beat. Matches the store's
+      // own best-effort watch/announce posture.
+      Promise.resolve(store.publish(SSE_BUS_CHANNEL, { origin: replicaId, event, data: dataObj }))
+        .catch(() => {});
+    },
+  };
 }
 
 // A host's serialized state changed: drop the cached fleet payload and push the
@@ -16839,6 +16905,13 @@ if (process.env.TURMA_TEST) {
     MIGRATION_KEY_PREFIX,
     MIGRATE_RECORD_TTL_MS,
     MIGRATE_SPOOL_ORPHAN_MS,
+    // XERK-762: cross-replica SSE fan-out over the shared bus. Exported so a
+    // test can drive the origin-dedup + re-emit without a live Valkey socket
+    // (`makeSseBus` over an injected store), and hold the local-delivery seam
+    // (`sseClients`/`sseDeliverLocal`) and the HA toggle (`__setSseBus`) that
+    // `sseBroadcast` gates on.
+    sseBroadcast, sseDeliverLocal, makeSseBus, sseClients, SSE_BUS_CHANNEL, SSE_REPLICA_ID,
+    __setSseBus(v) { sseBus = v; },
     siteKeyOf,
     orgPeers,
     boundOrgOf,
@@ -16928,6 +17001,17 @@ if (process.env.TURMA_TEST) {
       console.error(`migration hydrate failed: ${e && e.message}`));
     sweepMigrationSpoolShared().catch((e) =>
       console.error(`migration spool sweep failed: ${e && e.message}`));
+  }
+  // In HA mode, fan SSE broadcasts out across replicas over the store's pub/sub
+  // bus (XERK-762): each replica re-emits another replica's events to its own
+  // /api/events clients, so a dashboard whose stream is held by one replica
+  // still sees a mutation that happened on another. Subscribing before the store
+  // finishes connecting is safe — SharedLiveStore re-issues the subscription on
+  // connect and a publish while down is caught. Non-HA leaves `sseBus` null, so
+  // `sseBroadcast` stays a plain local iteration, unchanged.
+  if (haConfig.ha) {
+    sseBus = makeSseBus(liveStore, SSE_REPLICA_ID, sseDeliverLocal);
+    console.log(`SSE fan-out: shared bus (replica ${SSE_REPLICA_ID})`);
   }
 
   // ---- Graceful shutdown (XERK-552) --------------------------------------
