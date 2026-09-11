@@ -10170,6 +10170,28 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
                if not r.startswith("#")][0]
         self.assertEqual(row.split("\t")[5], "menu ⋮ and é over‑line")
 
+    def test_peers_file_write_survives_a_non_cp1252_char(self):
+        """Complements the test above by proving the explicit encoding="utf-8"
+        is load-bearing INDEPENDENT of the process default -- which matters
+        because the Windows launcher now defaults PYTHONUTF8=1 but lets an
+        operator pin it off (PYTHONUTF8=0), leaving open() back on cp1252.
+        Simulate that by forcing an encoding-less open() to cp1252 and prove
+        the row still lands; a cp1252 write would raise and (now the guard
+        catches every write error) silently drop the row."""
+        sm = self.make_manager()
+        real_open = open
+
+        def cp1252_default_open(*a, **kw):
+            kw.setdefault("encoding", "cp1252")
+            return real_open(*a, **kw)
+
+        with mock.patch("builtins.open", cp1252_default_open):
+            sm._write_peers_file([  # must not raise
+                {"id": "aaaaa", "rcName": "nas-Turma-XERK-1", "repo": "Turma",
+                 "status": "running", "summary": "menu ⋮ glyph"}])
+        body = real_open(ha.PEERS_FILE, encoding="utf-8").read()
+        self.assertIn("menu ⋮ glyph", body)
+
     def test_migrated_ticket_session_keeps_its_ticket_name(self):
         """A session that moves host carries its ticket, so it must keep being
         called after its key — reverting to a hash on arrival would rename the

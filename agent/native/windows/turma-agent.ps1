@@ -171,6 +171,13 @@ if ($cfgBad.Count -gt 0) {
 $env:CLAUDE_PROJECTS_ROOT = Coalesce $env:CLAUDE_PROJECTS_ROOT (Join-Path $env:USERPROFILE '.claude\projects')
 $env:REPOS_ROOT           = Coalesce $env:REPOS_ROOT (Join-Path $env:USERPROFILE 'git')
 $env:DEVICE_NAME          = Coalesce $env:DEVICE_NAME $env:COMPUTERNAME ([System.Net.Dns]::GetHostName())
+# Run the Python manager in UTF-8 mode so open() defaults to UTF-8, not the Windows
+# locale codec (cp1252). Without this, any non-cp1252 char in a session name (the
+# vertical-ellipsis menu glyph has been seen) crashes the heartbeat's peers.tsv write
+# on the beat loop, which takes the whole agent into a crash-restart loop. It also
+# makes every other text write and every UTF-8 transcript read locale-independent.
+# Coalesce so an operator can still pin it off (PYTHONUTF8=0) via the env file.
+$env:PYTHONUTF8           = Coalesce $env:PYTHONUTF8 '1'
 
 # Put the per-user tool dirs on PATH ourselves. A Windows service running without an
 # interactive login does NOT inherit the user's shell PATH, so `claude` is otherwise
