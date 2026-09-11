@@ -53,6 +53,15 @@ const usageLedger = require("./usage-ledger.js");
 // it. See docs/turma-ha-store-adr.md.
 const { resolveHaConfig } = require("./ha-config.js");
 const { createLiveStore, sameValue } = require("./store.js");
+// The archive's object-store backend + mirror (XERK-759, epic XERK-751). The
+// durable archive's BYTES (rendered + raw layers) move to object storage as the
+// of-record so any replica can read them and the RWO volume is no longer the
+// archive's home (docs/turma-ha-store-adr.md). Requiring these is side-effect-
+// free (no socket dialled until wired at boot); with HA off `createBlobStore`
+// returns null, the mirror is never wired, and archive.js's local ARCHIVE_DIR
+// tree stays the of-record, byte-identical.
+const { createBlobStore } = require("./blobstore.js");
+const { ArchiveMirror } = require("./archive-mirror.js");
 
 // XERK-757 externalized-store persistence config, declared here so it can be
 // handed to the module-load store below. It maps each `policy:<name>` store key to
@@ -93,6 +102,14 @@ let liveStore = createLiveStore(haConfig.fatal.length ? { ha: false } : haConfig
   // registerExternalStore calls; read lazily per write). Ignored by SharedLiveStore.
   persistent: STORE_PERSISTENT,
 });
+
+// The archive blob store, created once at module load like `liveStore` (XERK-759).
+// null with HA off, or when a fatal HA config coerced us to the file backend —
+// so it never constructs against a half-validated ARCHIVE_S3_* set before the
+// boot branch can name the error and exit(2). Wired to archive.js + a drain
+// worker in the production boot branch below; nothing here touches the archive's
+// synchronous hot path.
+const archiveBlobStore = createBlobStore(haConfig.fatal.length ? { ha: false } : haConfig);
 
 // ---- HA fleet registry externalization (XERK-756, epic XERK-751) ------------
 // The `agents` fleet registry AND the per-host command queues (which ride each
@@ -3534,6 +3551,41 @@ async function hydrateMigrations() {
     migrations.set(value.id, { ...value, uploading: false, refusal: null });
   }
 }
+// ---- archive object-store mirror wiring (XERK-759) ------------------------
+// The archive's bytes move to object storage as the of-record under HA. The
+// mirror NOTES each file archive.js writes (sync sink), a worker DRAINS them up
+// off the beat, and HYDRATE pulls them back down + rebuilds the index at boot and
+// on promotion (the `leader` child, XERK-763). With HA off `archiveMirror` stays
+// null and archive.js's local tree is the of-record, unchanged. `reindex` opens
+// the DB and rebuilds it from the hydrated files (idempotent — bytesStored comes
+// back off the `.meta` sidecar, rawBytes/archiveBytes off the files).
+let archiveMirror = null;
+// How often the drain worker pushes newly-archived bytes up. Off the beat, so a
+// slow object store never touches the heartbeat budget (XERK-395).
+const ARCHIVE_MIRROR_DRAIN_MS = positiveEnv("ARCHIVE_MIRROR_DRAIN_MS", 15 * 1000);
+function setArchiveMirror(blobStore, ha) {
+  if (!ha || !blobStore) { archiveMirror = null; return; }
+  archiveMirror = new ArchiveMirror({
+    blobStore,
+    archiveDir: archive.ARCHIVE_DIR,
+    reindex: () => { archive.openDb(); archive.rebuildIndex(); },
+    // Single owning writer of the of-record. In Option 2 only the leader ingests
+    // (so only it has dirty files), and this gate makes that explicit; the real
+    // predicate is the not-yet-landed XERK-763 lease. Default true keeps a
+    // single-replica HA hub (or a fleet mid-rollout) mirroring.
+    isLeader: () => true,
+  });
+  archive.setBlobSink((p) => archiveMirror.note(p));
+}
+// The seam a promoted leader calls before it starts serving (XERK-763); also run
+// at boot. Best-effort — a store blip leaves the local copy stale, not the hub
+// down, and the next hydrate/agent re-push catches up.
+async function hydrateArchive() {
+  if (!archiveMirror) return;
+  try { await archiveMirror.hydrate(); }
+  catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
+}
+
 // The multi-replica-safe boot spool sweep (XERK-761). On a shared spool volume a
 // booting replica must NOT delete a bundle that belongs to a migration still in
 // flight under another replica. It keeps any spool file whose migration RECORD
@@ -17587,6 +17639,24 @@ if (process.env.TURMA_TEST) {
     sseBus = makeSseBus(liveStore, SSE_REPLICA_ID, sseDeliverLocal);
     console.log(`SSE fan-out: shared bus (replica ${SSE_REPLICA_ID})`);
   }
+  // XERK-759 (wave-3): move the archive's bytes to object storage as the
+  // of-record. Wire the mirror sink onto archive.js, hydrate the local tree from
+  // the bucket (a freshly-booted replica starts with an empty ephemeral disk;
+  // until hydrate completes, archive reads 404 "still syncing", the archive's own
+  // honest answer), and run the drain worker off the beat. With HA off this is a
+  // no-op and archive.js's local ARCHIVE_DIR tree stays the of-record. See
+  // docs/turma-ha-store-adr.md ("Why the archive splits").
+  setArchiveMirror(archiveBlobStore, HA_ON);
+  if (HA_ON && archiveBlobStore) {
+    console.log(`archive of-record: object storage (bucket ${archiveBlobStore.bucket})`);
+    hydrateArchive().catch((e) =>
+      console.error(`archive hydrate failed: ${e && e.message}`));
+    const archiveDrainTimer = setInterval(() => {
+      archiveMirror.drain().catch((e) =>
+        console.error(`archive mirror drain failed: ${e && e.message}`));
+    }, ARCHIVE_MIRROR_DRAIN_MS);
+    archiveDrainTimer.unref();
+  }
   // XERK-764 (wave-3): the cross-replica tunnel directory + control bus. Watch the
   // host->replica directory FIRST (so no owner change is missed during the async
   // scan), hydrate the mirror, then subscribe the control bus so a poke this replica
@@ -17700,6 +17770,12 @@ if (process.env.TURMA_TEST) {
       // now); the archive SQLite handle is closed so its last writes land; the
       // usage ledger's write is async, and its callback is what ends the process.
       flushStateNow();
+      // Best-effort final push of any un-mirrored archive bytes to the object
+      // store, so a deploy strands the least tail (agents re-push what doesn't
+      // make it on the next replica's promotion — never data loss, XERK-759). Not
+      // awaited: it reads files independently of the DB handle and must not hold
+      // up the exit; the drain worker's leader gate keeps a standby a no-op.
+      if (archiveMirror) archiveMirror.drain().catch(() => {});
       // Drain the externalized stores' pending debounced writes synchronously
       // (file backend) and close the shared client's sockets (XERK-757) — the
       // same lossless-drain intent as flushStateNow, for the policy stores.

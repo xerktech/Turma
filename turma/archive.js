@@ -283,6 +283,24 @@ function rawFilePath(relPath, transcriptId, rel) {
   return full;
 }
 
+// ---- the object-store mirror sink (XERK-759) --------------------------------
+//
+// Under HA the archive's byte layers are mirrored to object storage as the
+// of-record (archive-mirror.js). This module STAYS synchronous and filesystem-
+// native on its hot path; the only coupling is this optional sink, called with
+// the ABSOLUTE path of each durable file the moment it is written. The sink just
+// records the path (sync, cheap) for an off-beat worker to push — nothing here
+// dials the network. UNSET (the default, and every non-HA path) makes this a
+// no-op, so the single-process behaviour is byte-identical.
+let blobSink = null;
+function setBlobSink(fn) {
+  blobSink = typeof fn === "function" ? fn : null;
+}
+function noteWrite(absPath) {
+  // Never let a mirror bookkeeping error break a durable write (XERK-235).
+  if (blobSink) { try { blobSink(absPath); } catch { /* best-effort */ } }
+}
+
 // ---- database ---------------------------------------------------------------
 
 let db = null;
@@ -377,6 +395,7 @@ function writeSidecar(metaPath, obj) {
   const tmp = metaPath + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(obj));
   fs.renameSync(tmp, metaPath);
+  noteWrite(metaPath);
 }
 
 // Bytes the whole store holds, measured by WALKING THE FILES — never summed
@@ -954,6 +973,7 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
     }
     if (lines) {
       fs.appendFileSync(paths.jsonl, lines);
+      noteWrite(paths.jsonl);
       // Charge the store total immediately rather than waiting for the next
       // walk — that gap is what let a burst run 1,200x past the ceiling.
       writtenSinceWalk += Buffer.byteLength(lines);
@@ -1237,6 +1257,7 @@ function ingestRaw(host, transcriptId, rel, start, buf) {
     } else {
       fs.appendFileSync(full, buf);
     }
+    noteWrite(full);
   } catch (e) {
     if (e && e.code === "EEXIST") return { stored: rawCursor(full) || 0 };
     console.error(`archive: raw append failed for ${transcriptId} ${rel}: ${e.message}`);
@@ -2421,7 +2442,7 @@ module.exports = {
   RAW_DIR_SUFFIX,
   slugify, archiveRelPath, resolveNewRelPath, __RELPATH_PROBE_MAX: RELPATH_PROBE_MAX,
   ftsQuery, byteCeiling, shedFilePayloads,
-  openDb, closeDb, rebuildIndex,
+  openDb, closeDb, rebuildIndex, setBlobSink,
   ingestChunk, manifestCursors, inventoryCursors, rawCursorsForIds,
   archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).
