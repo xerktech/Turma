@@ -25,6 +25,25 @@ This file is the operative rules for the two modules that landed it.
   the hot path. **Wave-3 children flip each call site** onto the already-proven
   adapter, one store at a time — that is where "moving a store's semantics" lives.
   Do not fold a call-site rewire into this seam.
+- **The store is now created at MODULE LOAD** (`liveStore`, before the TURMA_TEST/production split)
+  rather than only in the production boot branch — so the test and production paths share one store
+  and a wave-3 call site can reach it. The boot-time PRINT + fail-loud `exit(2)` stay on the
+  production path (a `require` under TURMA_TEST must not print or exit); a FATAL config is coerced to
+  the file backend at creation so `createLiveStore` never parses a broken shared URL before the
+  branch names the error. `void liveStore` is gone.
+
+## Wave-3 children (call sites flipped onto the store)
+
+- **XERK-760 — the OIDC PKCE/session/handoff side-stores** (`oidcTx`/`oidcSessions`/`oidcHandoffs` →
+  `OIDC_*_PREFIX` keys, TTL'd). The first wave-3 child. Mechanics + the cross-replica rationale live
+  in `.claude/rules/turma-oidc.md` ("HA requirements" + the tx/session/handoff invariants). Note the
+  count-cap (`oidcEnforceCap`) is a FILE-BACKEND-ONLY heap guard: on the shared backend a
+  scan-then-evict-oldest across replicas would race and evict another replica's in-flight entry — TTL
+  + Valkey maxmemory bound it there instead.
+- **`getDel(key)` was added to the contract by XERK-760** — atomic get-and-delete (RESP `GETDEL` on
+  the shared backend; a no-await-between read+delete on the file backend), so a single-use consume
+  can't be double-read by concurrent callers. Decomposing it into `get()`+`del()` at a call site
+  reintroduces that race — the file backend yields the event loop between the two awaits.
 
 ## The wave-3 externalization pattern (XERK-757, `server.js`)
 
@@ -61,8 +80,16 @@ NOT load on `server.js`, so re-read it here before touching that wiring**:
   two replicas writing the SAME key in the same millisecond can briefly disagree with
   the store; self-heals on the next write. These are one-human-flips-one-switch stores.
 - HA off: `persist()`/`watch` run against the file backend, byte-identical to the
-  removed `scheduleXSave`/`readFileSync`. Under `TURMA_TEST` the boot wiring never runs
-  and `persist()` no-ops, so setters keep their exact mirror+SSE behaviour.
+  removed `scheduleXSave`/`readFileSync`. The store is created at MODULE LOAD (XERK-760),
+  so `persist()` writes to it on both paths; under `TURMA_TEST` only the boot WIRING
+  (`wireExternalStores` — watches + boot-load + seed-up) is skipped, so setters keep
+  their exact mirror+SSE behaviour and their file writes go to the test env's temp paths.
+- `STORE_PERSISTENT` is declared before the module-load store and passed as its
+  `persistent`, but POPULATED later by the `registerExternalStore` calls; the file
+  backend reads `this.persistent[key]` lazily at write time, so a set() after those
+  registrations finds the file. `wireExternalStores(store)` operates on its passed
+  `store` (production hands it the module `liveStore`); `persist()` writes to the module
+  `liveStore` — the same binding in production.
 - Tests: `turma/tests/external-stores.test.js` (coerces, dedup/install, byte-identical
   persist, the two-mirror shared-backend watch fan-out, boot adopt-vs-seed).
 

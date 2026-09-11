@@ -54,6 +54,43 @@ const usageLedger = require("./usage-ledger.js");
 const { resolveHaConfig } = require("./ha-config.js");
 const { createLiveStore, sameValue } = require("./store.js");
 
+// XERK-757 externalized-store persistence config, declared here so it can be
+// handed to the module-load store below. It maps each `policy:<name>` store key to
+// its /data file for the FILE backend (SharedLiveStore ignores it — Valkey is the
+// durability). It is POPULATED later, by the `registerExternalStore` calls next to
+// each store (~line 1790+); the FileLiveStore reads `this.persistent[key]` lazily
+// at write time, so a set() after those registrations still finds the file, and
+// the empty construction-time read here loads nothing (each store's mirror is
+// primed synchronously by its own module-init `readJsonFile`).
+const STORE_KEY_PREFIX = "policy:";
+const STORE_PERSISTENT = {}; // storeKey -> {file, debounceMs}
+
+// The HA LiveStore is created ONCE at module load so every state-externalization
+// call site (XERK-751 wave-3) shares one backend — the OIDC PKCE/session/handoff
+// side-stores (XERK-760), the migration record/spool mirror (XERK-761), and the
+// SSE fan-out bus (XERK-762) all wire onto THIS binding (the last two in the
+// production boot branch below). Creating it here — before the TURMA_TEST split —
+// is what lets the OIDC helpers reach it on both the test and production paths.
+// HA off (the default) -> the FileLiveStore: module-level maps for hot state,
+// byte-identical to the pre-HA single-process path and RAM-only for the keys this
+// hub does not mark durable (the OIDC side-stores are ephemeral, TTL'd, never
+// persisted). HA on -> the Valkey client, shared across replicas so a login on
+// replica A and its IdP callback on replica B resolve the same `state`. The PRINT and
+// the fail-loud refusal on a bad HA config stay in the production boot branch
+// below (a `require` under TURMA_TEST must neither print nor exit); a FATAL
+// config is coerced to the file backend here so `createLiveStore` never parses a
+// missing/broken shared URL before that branch can name the error and exit(2).
+const haConfig = resolveHaConfig(process.env);
+const liveStore = createLiveStore(haConfig.fatal.length ? { ha: false } : haConfig, {
+  // FileLiveStore never emits health (no connection to lose), so this is silent
+  // on the non-HA path and in tests; on HA it traces the shared store coming and
+  // going. Never fatal at runtime — a blip reconnects rather than downing the hub.
+  onHealth: (h) => console.log(`HA store health: ${h}`),
+  // XERK-757: the file backend's durable-key config (empty now, populated by the
+  // registerExternalStore calls; read lazily per write). Ignored by SharedLiveStore.
+  persistent: STORE_PERSISTENT,
+});
+
 const PORT = positiveEnv("PORT", 8300);
 
 // dsh (DeepSeek Harness runtime, XERK-460) fleet-wide KILL SWITCH. This is an
@@ -783,10 +820,11 @@ const OIDC_STATE_COOKIE = "hub_oidc_state";
 // `userAuthorized` gate with no new authorization decision.
 const OIDC_MOBILE_REDIRECT = (process.env.TURMA_OIDC_MOBILE_REDIRECT || "turma://oidc-callback").trim();
 // Pending mobile handoffs: code -> {token, challenge, at}. Single-use, short TTL
-// (the app exchanges immediately after the deep link fires). Bounded so a flood
-// of mobile logins can't grow it. In-memory like oidcTx — a login interrupted by
-// a restart just retries.
-const oidcHandoffs = new Map();
+// (the app exchanges immediately after the deep link fires). Held in the shared
+// LiveStore (XERK-760) under OIDC_HANDOFF_PREFIX so the callback on one replica
+// and the exchange on another resolve the same code; a login interrupted by a
+// restart just retries. Bounded so a flood of mobile logins can't grow it — see
+// oidcEnforceCap (the count cap is a single-process heap guard, file-backend only).
 const OIDC_HANDOFF_TTL_MS = 2 * 60 * 1000; // deep link -> exchange is seconds
 const OIDC_HANDOFF_MAX = 2000;
 // A mobile challenge is base64url(SHA-256(verifier)); bound its length so a
@@ -1672,10 +1710,9 @@ function prune() {
 // the next write of that key. These are operator-set stores (a human flips one
 // org's switch on one replica) — simultaneous same-key cross-replica writes do
 // not happen in practice, which is why the ticket scopes them as low-risk.
-const STORE_KEY_PREFIX = "policy:";
-let liveStore = null;              // the LiveStore backend, assigned at boot
+// `liveStore`, `STORE_KEY_PREFIX` and `STORE_PERSISTENT` are declared up top (the
+// store is created at module load, XERK-760); this only holds the descriptor list.
 const externalizedStores = [];     // {key,name,coerce,read,install,afterLoad} descriptors
-const STORE_PERSISTENT = {};       // storeKey -> {file, debounceMs} for the file backend
 
 // Read+parse a durable store file, or undefined when absent/unreadable/corrupt —
 // the "not set" posture every one of these stores already had (losing one just
@@ -1713,7 +1750,10 @@ function registerExternalStore({ name, file, coerce, read, install, afterLoad })
   STORE_PERSISTENT[key] = { file, debounceMs: 5000 };
   externalizedStores.push({ key, name, coerce, read, install, afterLoad });
   return function persist() {
-    if (!liveStore) return; // not wired (tests / pre-boot): mirror + SSE already updated
+    // `liveStore` is the module-load backend (file/in-memory off, Valkey on). On
+    // the file backend it writes this store's /data file (via STORE_PERSISTENT);
+    // fire-and-forget — the mirror + SSE already reflect the change, a store blip
+    // must not fail the operator's 200.
     Promise.resolve(liveStore.set(key, read())).catch((e) =>
       console.error(`store ${name}: persist failed: ${e && e.message}`));
   };
@@ -1732,14 +1772,15 @@ function applyExternalStoreValue(desc, rawValue) {
   return true;
 }
 
-// Wire every externalized store onto the resolved backend at boot (never under
-// TURMA_TEST, where this block does not run and `persist()` no-ops). Registers a
-// watch per store, then loads the current value once the backend is ready. A key
-// ABSENT from the store on first boot (a fresh Valkey, or a fresh /data) is SEEDED
-// from the file/seed-primed mirror — migrating existing single-process state up to
-// the shared store with no operator action.
+// Wire every externalized store onto `store` (the module-load backend) at boot —
+// called from the production boot branch, never under TURMA_TEST. Registers a watch
+// per store, then loads the current value once the backend is ready. A key ABSENT
+// from the store on first boot (a fresh Valkey, or a fresh /data) is SEEDED from the
+// file/seed-primed mirror — migrating existing single-process state up to the shared
+// store with no operator action. Operates entirely on the passed `store` (so a test
+// can drive it against an isolated backend); the setters' `persist()` writes to the
+// module-load `liveStore`, and production passes that same binding here.
 function wireExternalStores(store) {
-  liveStore = store;
   for (const desc of externalizedStores) {
     store.watch(desc.key, (ev) => {
       try {
@@ -1760,8 +1801,8 @@ function wireExternalStores(store) {
           // carries data (migrates existing single-process state into the store).
           const cur = desc.read();
           const empty = Array.isArray(cur) ? cur.length === 0 : !Object.keys(cur || {}).length;
-          if (!empty && liveStore) {
-            Promise.resolve(liveStore.set(desc.key, cur)).catch((e) =>
+          if (!empty) {
+            Promise.resolve(store.set(desc.key, cur)).catch((e) =>
               console.error(`store ${desc.name}: seed failed: ${e && e.message}`));
           }
         } else {
@@ -8567,53 +8608,78 @@ function userAuthorized(req) {
 // fetch for the three outbound calls (discovery, JWKS, token exchange) and
 // `crypto` for PKCE, the RS256 signature check, and the state/nonce nonces.
 
-// Pending authorization transactions: state -> {nonce, verifier, next, at}. A
-// login mints one; its callback consumes it (single use). In-memory by design —
-// the hub is single-instance, and a login interrupted by a restart just retries.
-const oidcTx = new Map();
+// Pending authorization transactions: state -> {nonce, verifier, next, mobile,
+// at}. A login mints one; its callback consumes it (single use). Held in the
+// shared LiveStore (XERK-760) under OIDC_TX_PREFIX with a TTL, so a login begun
+// on replica A resolves against its callback on replica B — single-process
+// before, which 400'd the cross-replica callback with a state-CSRF failure. A
+// login interrupted by a restart just retries. With HA off the FileLiveStore
+// holds these in an in-memory map exactly as before, RAM-only (never persisted).
+const OIDC_TX_PREFIX = "oidc:tx:";
 const OIDC_TX_TTL_MS = 10 * 60 * 1000; // an auth round trip is minutes, not hours
-const OIDC_TX_MAX = 2000; // bound the map so a flood of /login hits can't grow it unboundedly
+const OIDC_TX_MAX = 2000; // heap-guard cap vs a /login flood (file backend only — see oidcEnforceCap)
 
 // Established browser sessions, keyed by the random sid in the OIDC_SID cookie:
-// sid -> {idToken, sub, at}. Holds only the last ID token, used as the
-// `id_token_hint` on RP-initiated logout so the IdP ends the right session
-// without a confirmation prompt. Also in-memory; losing it on restart only
-// means a logout falls back to a hintless end-session (still logs out).
-const oidcSessions = new Map();
+// sid -> {idToken, sub, role, groups, at}. Holds only the last ID token, used as
+// the `id_token_hint` on RP-initiated logout so the IdP ends the right session
+// without a confirmation prompt. Also in the shared store (XERK-760) under
+// OIDC_SESSION_PREFIX, so a session established on replica A can be logged out on
+// replica B; losing it only means a hintless end-session (still logs out). Its
+// TTL matches the sid cookie's own Max-Age (OIDC_SESSION_TTL_MS) — the record has
+// no purpose once the cookie it is keyed by has expired.
+const OIDC_SESSION_PREFIX = "oidc:sess:";
 const OIDC_SESSIONS_MAX = 5000;
+
+// Mobile handoffs share the store too, under this prefix (the TTL/cap consts sit
+// with OIDC_MOBILE_REDIRECT above): code -> {token, challenge, at}.
+const OIDC_HANDOFF_PREFIX = "oidc:handoff:";
 
 // Discovery + JWKS caches. The discovery doc and signing keys change rarely, so
 // cache them; an ID token whose `kid` misses the cache forces one JWKS refetch
-// (key rotation) before the token is rejected.
+// (key rotation) before the token is rejected. These stay per-process in-memory
+// (KeyObjects don't serialise; each replica warms its own on first use).
 let oidcDiscoveryCache = null; // {at, doc}
 let oidcJwksCache = null; // {at, keys: Map(kid -> KeyObject)}
 const OIDC_CACHE_TTL_MS = 60 * 60 * 1000;
 
-function oidcSweep(now = Date.now()) {
-  for (const [k, v] of oidcTx) if (now - v.at > OIDC_TX_TTL_MS) oidcTx.delete(k);
-  for (const [k, v] of oidcSessions) if (now - v.at > SESSION_TTL_MS) oidcSessions.delete(k);
-  for (const [k, v] of oidcHandoffs) if (now - v.at > OIDC_HANDOFF_TTL_MS) oidcHandoffs.delete(k);
+// The count cap is a SINGLE-PROCESS heap guard (XERK-592): it stops an
+// unauthenticated /login (or mobile-login) flood from growing the hub's OWN map
+// before the TTLs expire the entries. It runs ONLY on the file backend, for two
+// reasons: on the shared backend the entries live in Valkey (external — bounded
+// by the PX TTLs + the store's own maxmemory policy, not the hub heap); AND a
+// scan-then-evict-oldest across replicas would RACE — replica B could evict a tx
+// replica A just wrote for an in-flight login, reintroducing the very
+// cross-replica failure XERK-760 removes. Trims oldest-`at` first, leaving room
+// for the imminent set; the same O(n) cost the previous per-put oidcSweep paid,
+// and the cap keeps n small so the scan never grows.
+async function oidcEnforceCap(prefix, max) {
+  if (liveStore.kind !== "file") return;
+  const rows = await liveStore.scan(prefix);
+  const over = rows.length - (max - 1);
+  if (over <= 0) return;
+  rows.sort((a, b) => (a.value?.at || 0) - (b.value?.at || 0));
+  for (let i = 0; i < over; i++) await liveStore.del(rows[i].key);
 }
 
-// Store a pending mobile handoff (XERK-591), sweeping expired ones and dropping
-// the oldest at the ceiling — same discipline as oidcPutTx.
-function oidcPutHandoff(code, rec) {
-  oidcSweep();
-  while (oidcHandoffs.size >= OIDC_HANDOFF_MAX) {
-    const oldest = oidcHandoffs.keys().next().value;
-    if (oldest === undefined) break;
-    oidcHandoffs.delete(oldest);
-  }
-  oidcHandoffs.set(code, rec);
+// Store a pending mobile handoff (XERK-591): capped like the tx store, TTL'd so
+// an unredeemed code self-expires whichever replica minted it.
+async function oidcPutHandoff(code, rec) {
+  await oidcEnforceCap(OIDC_HANDOFF_PREFIX, OIDC_HANDOFF_MAX);
+  await liveStore.set(OIDC_HANDOFF_PREFIX + code, rec, { ttlMs: OIDC_HANDOFF_TTL_MS });
 }
 
 // Consume a handoff: return its record if the code is live and the presented
 // verifier hashes to the stored challenge, else null. Single use — the code is
 // deleted whatever the verifier, so a wrong guess burns it (no oracle to retry
-// against). A constant-time compare guards the challenge check.
-function oidcTakeHandoff(code, verifier, now = Date.now()) {
-  const rec = code ? oidcHandoffs.get(code) : null;
-  if (rec) oidcHandoffs.delete(code);
+// against). A constant-time compare guards the challenge check. The store's TTL
+// is a backstop; the explicit `at` check keeps the exact prior expiry semantics.
+async function oidcTakeHandoff(code, verifier, now = Date.now()) {
+  if (!code) return null;
+  // Atomic get-and-delete, so two concurrent exchanges of one code can't both
+  // read it (the "no oracle" property must hold under concurrency, not just
+  // sequentially — even across replicas, where the get+del window is a network
+  // round trip).
+  const rec = await liveStore.getDel(OIDC_HANDOFF_PREFIX + code);
   if (!rec || now - rec.at > OIDC_HANDOFF_TTL_MS) return null;
   const got = pkceChallenge(String(verifier || ""));
   const want = String(rec.challenge || "");
@@ -8634,25 +8700,33 @@ function oidcMobileRedirect(params) {
   return q ? `${OIDC_MOBILE_REDIRECT}${sep}${q}` : OIDC_MOBILE_REDIRECT;
 }
 
-// Store a pending transaction, sweeping expired ones and dropping the oldest if
-// the map is somehow at its ceiling (a Map preserves insertion order).
-function oidcPutTx(state, rec) {
-  oidcSweep();
-  while (oidcTx.size >= OIDC_TX_MAX) {
-    const oldest = oidcTx.keys().next().value;
-    if (oldest === undefined) break;
-    oidcTx.delete(oldest);
-  }
-  oidcTx.set(state, rec);
+// Store a pending transaction: capped (file backend) and TTL'd.
+async function oidcPutTx(state, rec) {
+  await oidcEnforceCap(OIDC_TX_PREFIX, OIDC_TX_MAX);
+  await liveStore.set(OIDC_TX_PREFIX + state, rec, { ttlMs: OIDC_TX_TTL_MS });
 }
 
-function oidcPutSession(sid, rec) {
-  while (oidcSessions.size >= OIDC_SESSIONS_MAX) {
-    const oldest = oidcSessions.keys().next().value;
-    if (oldest === undefined) break;
-    oidcSessions.delete(oldest);
-  }
-  oidcSessions.set(sid, rec);
+// Consume a pending transaction: atomic get-and-delete (single use, whatever the
+// outcome — two concurrent callbacks for one state can't both read it). Returns
+// the raw record (or null); the callback applies its own `at` freshness check, so
+// an expired tx reads as absent identically whether the store TTL already dropped
+// it or the `at` check catches it.
+async function oidcConsumeTx(state) {
+  if (!state) return null;
+  return (await liveStore.getDel(OIDC_TX_PREFIX + state)) || null;
+}
+
+// Record an established browser session for RP-logout (id_token_hint): capped
+// (file backend) and TTL'd to the sid cookie's own lifetime.
+async function oidcPutSession(sid, rec) {
+  await oidcEnforceCap(OIDC_SESSION_PREFIX, OIDC_SESSIONS_MAX);
+  await liveStore.set(OIDC_SESSION_PREFIX + sid, rec, { ttlMs: OIDC_SESSION_TTL_MS });
+}
+
+// Consume a session record on logout: atomic get-and-delete.
+async function oidcConsumeSession(sid) {
+  if (!sid) return null;
+  return (await liveStore.getDel(OIDC_SESSION_PREFIX + sid)) || null;
 }
 
 // PKCE (RFC 7636): the challenge is base64url(SHA-256(verifier)).
@@ -12872,7 +12946,7 @@ const server = http.createServer(async (req, res) => {
       } catch {
         return json(res, 400, { error: "invalid request body" });
       }
-      const rec = oidcTakeHandoff(String(body.code || ""), String(body.verifier || ""));
+      const rec = await oidcTakeHandoff(String(body.code || ""), String(body.verifier || ""));
       if (!rec) return json(res, 400, { error: "invalid or expired handoff code" });
       // The app sends this token as `Cookie: hub_session=<token>` on every
       // request — the SAME value the browser cookie carries, so it rides the
@@ -12897,7 +12971,7 @@ const server = http.createServer(async (req, res) => {
         // app deep link instead of setting a browser cookie + redirecting.
         const mobileRaw = url.searchParams.get("mobile") || "";
         const mobile = mobileRaw && mobileRaw.length <= OIDC_CHALLENGE_MAX ? mobileRaw : "";
-        oidcPutTx(state, { nonce, verifier, next, mobile, at: Date.now() });
+        await oidcPutTx(state, { nonce, verifier, next, mobile, at: Date.now() });
         const auth = new URL(disco.authorization_endpoint);
         auth.searchParams.set("response_type", "code");
         auth.searchParams.set("client_id", OIDC_CLIENT_ID);
@@ -12929,8 +13003,7 @@ const server = http.createServer(async (req, res) => {
       const code = url.searchParams.get("code") || "";
       const idpError = url.searchParams.get("error");
       const stateCookie = cookies(req)[OIDC_STATE_COOKIE] || "";
-      const tx = state ? oidcTx.get(state) : null;
-      if (tx) oidcTx.delete(state); // single use, whatever happens next
+      const tx = await oidcConsumeTx(state); // fetch-and-delete, single use, whatever happens next
       const clearState = authCookie(req, OIDC_STATE_COOKIE, "", 0);
       // A MOBILE flow (XERK-591) reports every outcome over the app deep link,
       // never the hub's HTML /login page — the app is waiting on the deep link,
@@ -12991,7 +13064,7 @@ const server = http.createServer(async (req, res) => {
         if (mobile) {
           const token = issueSessionToken(OIDC_SESSION_TTL_MS);
           const handoff = crypto.randomBytes(32).toString("base64url");
-          oidcPutHandoff(handoff, { token, challenge: mobile, at: Date.now() });
+          await oidcPutHandoff(handoff, { token, challenge: mobile, at: Date.now() });
           res.writeHead(302, {
             Location: oidcMobileRedirect({ code: handoff }),
             "Cache-Control": "no-store",
@@ -13002,7 +13075,7 @@ const server = http.createServer(async (req, res) => {
         const sid = crypto.randomBytes(32).toString("base64url");
         // Record the resolved role + groups for a future admin-only surface; the
         // session cookie itself stays opaque (no identity on the wire).
-        oidcPutSession(sid, {
+        await oidcPutSession(sid, {
           idToken: tokens.id_token,
           sub: claims.sub,
           role: access.role,
@@ -13043,8 +13116,7 @@ const server = http.createServer(async (req, res) => {
     // the issuer advertises no end-session endpoint.
     if (url.pathname === "/auth/oidc/logout") {
       const sid = cookies(req)[OIDC_SID_COOKIE];
-      const rec = sid ? oidcSessions.get(sid) : null;
-      if (sid) oidcSessions.delete(sid);
+      const rec = await oidcConsumeSession(sid); // fetch-and-delete
       const clear = [sessionSetCookie(req, ""), authCookie(req, OIDC_SID_COOKIE, "", 0)];
       const fallback = () => {
         res.writeHead(302, { Location: "/login", "Cache-Control": "no-store", "Set-Cookie": clear });
@@ -16498,8 +16570,6 @@ if (process.env.TURMA_TEST) {
       asFlagMap,
       list: () => externalizedStores,
       persistentConfig: () => STORE_PERSISTENT,
-      setLiveStore: (s) => { liveStore = s; },
-      getLiveStore: () => liveStore,
       repoTiers: () => repoTiers,
       setRepoTier,
     },
@@ -16694,12 +16764,26 @@ if (process.env.TURMA_TEST) {
     oidcSafeNext,
     oidcErrorDetail,
     oidcOrigin,
-    oidcTx,
-    oidcSessions,
-    // Native-app SSO handoff (XERK-591): the map + pure helpers, so the
+    // OIDC side-stores now live in the shared LiveStore (XERK-760). The store +
+    // key prefixes are exported so a test seeds/peeks a tx/session/handoff via
+    // liveStore.get/set/scan, and the async put/consume helpers are exported so a
+    // test drives them directly. `liveStore` is HA-off in tests (FileLiveStore),
+    // so the seed/peek is a synchronous in-memory map under the async surface.
+    liveStore,
+    OIDC_TX_PREFIX,
+    OIDC_SESSION_PREFIX,
+    OIDC_HANDOFF_PREFIX,
+    OIDC_TX_TTL_MS,
+    OIDC_SESSION_TTL_MS,
+    OIDC_HANDOFF_TTL_MS,
+    OIDC_TX_MAX,
+    oidcPutTx,
+    oidcConsumeTx,
+    oidcPutSession,
+    oidcConsumeSession,
+    // Native-app SSO handoff (XERK-591): the store helpers + pure helpers, so the
     // PKCE-bound code exchange is unit-tested offline.
     OIDC_MOBILE_REDIRECT,
-    oidcHandoffs,
     oidcPutHandoff,
     oidcTakeHandoff,
     oidcMobileRedirect,
@@ -16976,15 +17060,18 @@ if (process.env.TURMA_TEST) {
     console.warn("WARNING: TURMA_AGENT_STRICT not set — the shared TURMA_AGENT_TOKEN is still accepted, so an agent can act as any host. Give each agent `node server.js --agent-token <host>` as its TURMA_TOKEN, then set TURMA_AGENT_STRICT=1");
   }
 
-  // ---- HA storage seam: resolve the mode, select the backend (XERK-754) ----
-  // ONE switch (HA_MODE / TURMA_STORE_URL) decides single-process-on-files (the
-  // default) vs the shared store. Resolved and PRINTED before the listen so a
-  // misconfigured HA hub REFUSES TO BOOT loudly rather than run half-shared,
-  // half-local (the split-brain the epic exists to avoid). The effective mode
-  // prints for the same reason the memory ceilings do: it is the only way to
-  // tell a correctly-configured hub from one whose env moved under it. See
+  // ---- HA storage seam: PRINT the mode, refuse a fatal config (XERK-754) ----
+  // The backend was already SELECTED at module load (`liveStore` up top, so the
+  // test and production paths share one store and the OIDC side-stores — XERK-760
+  // — reach it). This is where the resolved mode PRINTS and a misconfigured HA
+  // hub REFUSES TO BOOT loudly rather than run half-shared, half-local (the
+  // split-brain the epic exists to avoid): the print/exit only belong on the
+  // production path, never a `require` under TURMA_TEST. `liveStore` was coerced
+  // to the file backend up top when the config is fatal, so it never dialled a
+  // broken shared URL before we could name the error here. The effective mode
+  // prints for the same reason the memory ceilings do: it is the only way to tell
+  // a correctly-configured hub from one whose env moved under it. See
   // docs/turma-ha-store-adr.md ("The HA config contract").
-  const haConfig = resolveHaConfig(process.env);
   console.log(haConfig.bootLine);
   if (haConfig.fatal.length) {
     // Fail loud, never half-HA: name every misconfiguration and refuse to boot.
@@ -16992,31 +17079,23 @@ if (process.env.TURMA_TEST) {
     console.error("refusing to boot — fix the HA configuration or unset HA_MODE to run single-process");
     process.exit(2);
   }
-  // Build the LiveStore for the resolved mode. With HA off this is the local
-  // file/in-memory backend (its `persistent` map reproduces each store's on-disk
-  // JSON byte-for-byte); with HA on it is the Valkey client, whose connection
-  // health is logged as it comes and goes — never fatal at runtime, so a store
-  // blip reconnects rather than taking the hub down (availability). The file
-  // backend's `persistent` config is the same /data files the stores used to
-  // write themselves, so nothing on disk moves.
-  const backendStore = createLiveStore(haConfig, {
-    onHealth: (h) => console.log(`HA store health: ${h}`),
-    persistent: STORE_PERSISTENT,
-  });
-  // XERK-757: wire the low-churn operator/org policy stores onto the backend so a
-  // toggle set on one replica is visible on every replica — set-through-adapter +
-  // a watch that updates this replica's mirror. Byte-identical on the file backend.
-  // (The cross-replica SSE the browsers see is XERK-762's fan-out of the setter's
-  // own broadcast, below — the watch does NOT re-broadcast, or a peer's clients
-  // would get every policy frame twice.)
-  wireExternalStores(backendStore);
+  // `liveStore` was already SELECTED and constructed at module load (up top, so
+  // the test and production paths share one store and the OIDC side-stores —
+  // XERK-760 — reach it). The wave-3 consumers below wire onto that same binding.
+  // XERK-757: wire the low-churn operator/org policy stores onto it — a toggle set
+  // on one replica is visible on every replica (set-through-adapter + a watch that
+  // updates this replica's mirror). Byte-identical on the file backend. The
+  // cross-replica SSE the browsers see is XERK-762's fan-out of the setter's own
+  // broadcast (below) — the watch does NOT re-broadcast, or a peer's clients would
+  // get every policy frame twice.
+  wireExternalStores(liveStore);
   // XERK-761 (wave-3): wire the migration record/spool sharing onto the store.
   // It is the SHARED backend only when HA is on; with HA off this is the local
   // in-memory store, the flag stays false, and nothing about migrations changes.
   // In HA, hydrate the Map from the store (this covers a restart; the `leader`
   // child calls hydrateMigrations again on promotion) and run the record-aware
   // spool sweep the single-process boot sweep deferred to above.
-  setMigrationStore(backendStore, haConfig.ha);
+  setMigrationStore(liveStore, haConfig.ha);
   if (haConfig.ha) {
     hydrateMigrations().catch((e) =>
       console.error(`migration hydrate failed: ${e && e.message}`));
@@ -17031,7 +17110,7 @@ if (process.env.TURMA_TEST) {
   // connect and a publish while down is caught. Non-HA leaves `sseBus` null, so
   // `sseBroadcast` stays a plain local iteration, unchanged.
   if (haConfig.ha) {
-    sseBus = makeSseBus(backendStore, SSE_REPLICA_ID, sseDeliverLocal);
+    sseBus = makeSseBus(liveStore, SSE_REPLICA_ID, sseDeliverLocal);
     console.log(`SSE fan-out: shared bus (replica ${SSE_REPLICA_ID})`);
   }
 
@@ -17121,7 +17200,7 @@ if (process.env.TURMA_TEST) {
       // Drain the externalized stores' pending debounced writes synchronously
       // (file backend) and close the shared client's sockets (XERK-757) — the
       // same lossless-drain intent as flushStateNow, for the policy stores.
-      try { backendStore.close?.(); } catch {}
+      try { liveStore.close?.(); } catch {}
       try { archive.closeDb(); } catch {}
       const finish = () => { clearTimeout(forceExit); console.log("drain complete — exiting"); process.exit(0); };
       const once = () => { if (!done) { done = true; finish(); } };

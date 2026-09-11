@@ -90,22 +90,21 @@ test("XERK-757: applyExternalStoreValue installs a change, dedups an echo, coerc
 });
 
 test("XERK-757: persist writes byte-identical JSON through the file backend", async () => {
+  // persist() writes through the module-load backend (a FileLiveStore under
+  // TURMA_TEST, sharing STORE_PERSISTENT). Registering a store adds its file to
+  // that config, so a set() then finds it and writes byte-identical JSON.
   const file = tmp("persist-probe");
   try { fs.unlinkSync(file); } catch { /* first run */ }
-  const store = fileStore({ "policy:probe": { file, debounceMs: 5000 } });
-  X.setLiveStore(store);
   let mirror = {};
   const persist = X.registerExternalStore({
     name: "probe", file, coerce: X.asPlainObject,
     read: () => mirror, install: (v) => { mirror = v; },
   });
   mirror = { "site/KEY-1": { host: "h1", at: 123 } };
-  persist();                 // liveStore.set(key, mirror), debounced write
-  assert.deepEqual(await store.get("policy:probe"), mirror);
-  store.flush();             // drain the debounced durable write synchronously
+  persist();                       // liveStore.set("policy:probe", mirror), debounced
+  assert.deepEqual(await srv.liveStore.get("policy:probe"), mirror);
+  srv.liveStore.flush();           // drain the debounced durable write synchronously
   assert.equal(fs.readFileSync(file, "utf8"), JSON.stringify(mirror));
-  store.close();
-  X.setLiveStore(null);
 });
 
 test("XERK-757: a change on one replica reaches another via the shared backend's watch", async () => {
@@ -171,5 +170,4 @@ test("XERK-757: boot load adopts the store's value; a fresh store is SEEDED from
   assert.equal(after["other-repo"], "archive", "the store's value was adopted");
   assert.equal(after["seeded-repo"], "live", "the boot-only seed survived the adapter load");
   store.close();
-  X.setLiveStore(null);
 });

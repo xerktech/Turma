@@ -31,6 +31,19 @@ Read `.claude/rules/turma.md` "Auth and the glasses surface" for the auth model 
   follow-on RBAC task, the core neither reads nor enforces it), `TURMA_OIDC_POST_LOGOUT_REDIRECT_URI`
   (default `<redirect origin>/login`), `TURMA_OIDC_TIMEOUT_MS` (10s).
 
+## HA (multi-replica) requirements
+
+- **Every replica MUST share an identical `TURMA_SESSION_SECRET`** (XERK-760, epic XERK-751). The
+  `hub_session` cookie and the mobile-exchange token are HMAC'd with `SESSION_KEY` — `TURMA_SESSION_SECRET`
+  when set, else a value derived from `TURMA_USER`+`TURMA_PASSWORD`. If the secret differs across
+  replicas, a cookie minted by replica A fails `userAuthorized` on replica B and the user is bounced
+  back to login on every request that lands on the other pod — the same silent failure the OIDC
+  side-store externalization removes for the `state` handshake. Break-glass Basic auth
+  (`TURMA_USER`/`TURMA_PASSWORD`) is likewise identity-by-env, so those two must match across replicas
+  too. The three OIDC side-stores (`oidcTx`/`oidcSessions`/`oidcHandoffs`) are the shared LiveStore's
+  concern (below); the cookie/Basic secrets are the operator's env concern and are NOT in the store.
+- **Non-HA needs none of this** — one process, one env, the `FileLiveStore`'s in-memory maps as before.
+
 ## Load-bearing invariants
 
 - **The configured issuer only LOCATES discovery; `discovery.issuer` is authoritative for `iss`.**
@@ -45,9 +58,21 @@ Read `.claude/rules/turma.md` "Auth and the glasses surface" for the auth model 
   KEYLESS token falls back to the sole key, and only when there is exactly one.
 - **Claim checks** (`oidcValidateClaims`): `iss`/`aud`/`exp`/`iat`(future)/`nonce`, ±120s skew; a
   multi-valued `aud` requires `azp == client_id`, and any `azp` present must equal `client_id`.
-- **State + PKCE verifier live in an in-memory `oidcTx` map, single-use, 10-min TTL** — the hub is
-  single-instance, so a login interrupted by a restart just retries. The callback consumes the tx
-  (deletes it) whatever happens next. Bounded (`OIDC_TX_MAX`) so a `/login` flood can't grow it.
+- **State + PKCE verifier live in the shared LiveStore under `OIDC_TX_PREFIX`, single-use, 10-min
+  TTL** (XERK-760, the HA epic XERK-751). HA on → Valkey, so a login begun on replica A resolves
+  against its IdP callback on replica B (single-process before, which 400'd the cross-replica callback
+  with a state-CSRF failure); HA off → the `FileLiveStore` holds it in the same in-memory map as
+  before, RAM-only, never persisted. `oidcConsumeTx` fetch-and-deletes it (single use) whatever
+  happens next; the callback keeps its own `at` freshness check, so an expired tx reads absent
+  identically whether the store TTL dropped it or the check catches it. **Bounded (`OIDC_TX_MAX`) is a
+  SINGLE-PROCESS heap guard via `oidcEnforceCap`, FILE-BACKEND ONLY** — on the shared backend the PX
+  TTL + Valkey's own maxmemory bound it, and a scan-then-evict-oldest across replicas would RACE
+  (replica B evicting a tx replica A just wrote for an in-flight login), reintroducing the very
+  cross-replica failure this fixes. All three consumes (`oidcConsumeTx`/`oidcConsumeSession`/
+  `oidcTakeHandoff`) go through the store's **atomic `getDel`** (RESP `GETDEL` on Valkey, a
+  no-await-between get+delete on the file backend), so single-use holds under CONCURRENCY too — two
+  callbacks racing on one `state`/code can't both read it (a plain get-then-del yields the event loop
+  between the two awaits and lets both through).
 - **The flow is BOUND to the browser (login-CSRF defence).** Login sets a `hub_oidc_state` cookie to
   the `state`; the callback rejects (400) unless the cookie equals the returned `state`. Without it,
   an attacker who finished their OWN IdP auth could deliver their `code`+`state` to a victim and plant
@@ -57,11 +82,15 @@ Read `.claude/rules/turma.md` "Auth and the glasses surface" for the auth model 
 - **The `next` param is open-redirect-guarded** (`oidcSafeNext`): only local same-origin paths
   (rejects `//`, `https://…`, `/\`); anything else → `/`.
 - **Logout keeps the ID token OFF the session cookie.** A separate small `hub_oidc` sid cookie names
-  an in-memory `oidcSessions` record holding the last ID token, used ONLY as the `id_token_hint` on
-  RP-initiated logout (so a token with a big `groups` claim never has to fit in a cookie). Losing it
-  on restart only means a hintless end-session — logout still clears the local session. Logout clears
-  BOTH cookies and redirects to `end_session_endpoint` (falls back to `/login` if OIDC is off or the
-  issuer advertises none).
+  an `oidcSessions` record (shared LiveStore under `OIDC_SESSION_PREFIX`, XERK-760) holding the last
+  ID token, used ONLY as the `id_token_hint` on RP-initiated logout (so a token with a big `groups`
+  claim never has to fit in a cookie). In HA a session established on replica A logs out on replica B;
+  losing it only means a hintless end-session — logout still clears the local session. **Its TTL is
+  the sid cookie's own `OIDC_SESSION_TTL_MS` Max-Age** (was swept at 30 days) — the record has no
+  purpose past the cookie it is keyed by. Logout `oidcConsumeSession`s the record, clears BOTH cookies
+  and redirects to `end_session_endpoint` (falls back to `/login` if OIDC is off or the issuer
+  advertises none). The discovery/JWKS caches stay per-process (KeyObjects don't serialise; each
+  replica warms its own).
 - **Token exchange authenticates client_secret_basic** (Authentik confidential-provider default) —
   the secret rides the `Authorization: Basic` header, never the body.
 - **The endpoint helpers NAME the IdP's error, but only in the log** (`oidcErrorDetail`): a failed
@@ -90,8 +119,10 @@ by handing the token back over an app deep link, PKCE-protected. The hub stays t
   hub's HTML `/login` page — a browser page would strand the user in the Custom Tab. Length-capped
   (`OIDC_CHALLENGE_MAX`); an over-long one is dropped (treated as non-mobile).
 - **On success the callback mints a single-use handoff `code`** bound to `{token, challenge}`
-  (`oidcPutHandoff`, bounded `OIDC_HANDOFF_MAX`, TTL `OIDC_HANDOFF_TTL_MS`) and redirects to
-  `<redirect>?code=<code>`. It sets NO session/sid cookie (the Custom Tab is throwaway).
+  (`oidcPutHandoff` into the shared LiveStore under `OIDC_HANDOFF_PREFIX`, XERK-760; heap-cap
+  `OIDC_HANDOFF_MAX` file-backend-only like the tx, TTL `OIDC_HANDOFF_TTL_MS`) and redirects to
+  `<redirect>?code=<code>`. The callback on replica A and the exchange on replica B resolve the same
+  code. It sets NO session/sid cookie (the Custom Tab is throwaway).
 - **`POST /api/oidc/mobile/exchange {code, verifier}`** releases the token ONLY if
   `SHA-256(verifier) === challenge` (`oidcTakeHandoff`, `timingSafeEqual`). **The code is single-use
   and burned on ANY exchange attempt** — a wrong verifier deletes it too, so there is no oracle to
@@ -201,3 +232,9 @@ redirect they cannot complete, and the fleet went dead.
   `global.fetch`, logout end-session, public-gate reachability).
 - `__setOidcCaches(discovery, jwks)` seeds the discovery/JWKS caches so a route/verify test runs with
   no live IdP.
+- The `XERK-760:` cases in `oidc.test.js`: `/auth/oidc/login` writes the tx into `hub.liveStore`; a
+  callback resolves a tx written straight to the store (the cross-replica round trip) and consumes it;
+  the logout-hint session round-trips the store; the tx count cap still bounds the file backend. The
+  side-stores are seeded/peeked via `liveStore.get/set/scan` under the exported `OIDC_*_PREFIX`
+  (HA off in tests → an in-memory `FileLiveStore` under the async surface), replacing the old
+  `hub.oidcTx`/`oidcSessions`/`oidcHandoffs` Map access in both `oidc.test.js` and `oidc-groups.test.js`.
