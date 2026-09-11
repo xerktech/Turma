@@ -13393,13 +13393,35 @@ const server = http.createServer(async (req, res) => {
     // readinessProbe here; while draining (a rolling update's preStop/SIGTERM)
     // this answers 503 NotReady so the Service removes the pod from its
     // EndpointSlice before the drain cuts sockets, then browsers/agents reconnect
-    // to a surviving replica instead of racing a socket being torn down. Ready
-    // (200) whenever the process is up and not draining. Unauthenticated and
-    // leaks nothing, same rationale as /healthz.
+    // to a surviving replica instead of racing a socket being torn down.
+    // Unauthenticated and leaks nothing, same rationale as /healthz.
+    //
+    // XERK-765: readiness ALSO follows leadership — this is the "Service gating"
+    // step the design doc pairs with the leader lease (XERK-763 gated the sweeps;
+    // this gates the SERVICE). Under HA the fleet runs Option 2 (active-passive):
+    // exactly ONE replica — the leader — serves ALL traffic, and the standbys
+    // stay warm off the shared store. The shipped code REQUIRES that shape: the
+    // cross-replica terminal/`/live` byte-stream relay is deliberately deferred
+    // (XERK-764), so terminal bytes serve only from the tunnel owner's replica,
+    // and the migration request path reads a leader-only in-memory Map
+    // (`:3588`, `:11905`). A non-leader answering NotReady here removes it from
+    // the Service's EndpointSlice, so browsers/agents only ever hit the leader.
+    // On a rolling update the draining leader flips NotReady + renounces the
+    // lease (backdated renewTime), a standby wins it within a beat or two and
+    // flips Ready, and clients re-dial to it — the ~1-2s reconnect the epic
+    // accepts, not a sustained outage.
+    //
+    // `isLeader()` is a STABLE read, not a flapping one: it is refreshed on every
+    // confirmed lease renewal (retry ~2s) and self-expires only after the full
+    // ~15s lease window, absorbing a single API blip — so a HEALTHY leader stays
+    // Ready and only a genuine partition drops it (which SHOULD pull it from the
+    // Service). With HA OFF there is no elector (`hubLeader` is a StandaloneLeader
+    // / null), `isLeader()` is always true, and a single-replica or docker-compose
+    // hub is always Ready — unchanged.
     if (url.pathname === "/readyz") {
-      return hubDraining
-        ? json(res, 503, { ready: false, draining: true })
-        : json(res, 200, { ready: true });
+      if (hubDraining) return json(res, 503, { ready: false, draining: true });
+      if (!isLeader()) return json(res, 503, { ready: false, leader: false });
+      return json(res, 200, { ready: true });
     }
 
     // Branded static assets (stylesheet, UI fonts, icon/favicon set, manifest):

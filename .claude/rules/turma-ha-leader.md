@@ -28,6 +28,31 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
 (`autoStartSweep`, …) stay UNGATED, directly-callable units — the gate is at the tick, not in them
 (their own tests call them directly, with no leader, and must keep acting).
 
+## Service gating — the leader is the only Ready endpoint (XERK-765)
+
+- **`/readyz` returns 200 ONLY on the leader** (`hubDraining` false AND `isLeader()` true); a
+  non-leader answers **503 `{ready:false, leader:false}`**. This is the "Service gating" the design
+  doc pairs with the lease: XERK-763 gated the SWEEPS, this gates the SERVICE. k8s pulls a NotReady
+  pod from the Service EndpointSlice, so under HA the leader is the ONLY pod client/agent traffic
+  reaches — the standbys stay warm off the shared store and serve nothing.
+- **This is load-bearing, not cosmetic.** The shipped hub only supports Option 2 (leader-serves-all):
+  the cross-replica terminal/`/live` byte-stream relay is deferred (XERK-764) so terminal bytes serve
+  only from the tunnel owner's replica, and the migration request path reads a leader-only in-memory
+  Map (`server.js` `:3588`, `:11905`). A non-leader that served traffic would return dead terminals
+  and stale 404s. **Do NOT remove the `isLeader()` gate from `/readyz` or make non-leaders serve**
+  until the byte-stream relay lands (true active-active).
+- **It does not flap:** `isLeader()` is refreshed on every ~2s lease renewal and self-expires only
+  after the full ~15s window, so a healthy leader stays Ready through a transient API blip; only a
+  genuine partition drops it (which SHOULD pull it from the Service). **HA off / no elector →
+  `isLeader()` always true → always Ready**, so single-replica and docker-compose are unchanged.
+- **Failover has a bounded gap, by design.** On a rolling update the draining leader flips NotReady
+  and renounces the lease (backdated `renewTime`); a standby wins it within a beat or two and flips
+  Ready. Between the two there can be zero Ready endpoints for ~1–2s — the reconnect the epic accepts,
+  NOT a sustained outage (streams close with reconnect hints). The ArgoCD `deployment.yaml`
+  readinessProbe must point at `/readyz` (NOT `/healthz`) for this to take effect; liveness/startup
+  stay on `/healthz` so a warm standby is never SIGKILLed for being un-Ready.
+- Tests: `XERK-765: /readyz follows leadership …` in `server.test.js`.
+
 ## `isLeader()` and the elector
 
 - **`isLeader()` is SYNCHRONOUS** (the sweeps call it inline) and returns `!hubLeader ||

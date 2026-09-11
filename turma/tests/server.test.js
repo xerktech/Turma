@@ -2286,9 +2286,10 @@ function oversizeHeartbeatBody(device) {
 test("http: /healthz is unauthenticated; everything else is gated", async () => {
   assert.equal((await request("GET", "/healthz")).status, 200);
   // XERK-753: /readyz is a DISTINCT unauthenticated readiness probe. Not draining
-  // here, so it reports Ready 200 {ready:true}; it flips to 503 {ready:false}
-  // only inside the SIGTERM drain (exercised by the boot-and-SIGTERM QA pass, not
-  // this in-process suite whose drain would process.exit).
+  // here AND single-process (no elector -> always the leader, XERK-765), so it
+  // reports Ready 200 {ready:true}; it flips to 503 {ready:false} inside the
+  // SIGTERM drain (the boot-and-SIGTERM QA pass) or on a non-leader replica (the
+  // XERK-765 leadership-gating test below).
   const ready = await request("GET", "/readyz");
   assert.equal(ready.status, 200);
   assert.equal(ready.body.ready, true);
@@ -15179,6 +15180,31 @@ test("XERK-763: isLeader() is always true with no elector, and follows an inject
   hub.__setLeader(fakeLeader(true));
   assert.equal(hub.isLeader(), true);
   hub.__setLeader(null); // restore
+});
+
+test("XERK-765: /readyz follows leadership — only the leader is a Service endpoint", async () => {
+  // No elector (single-process / HA off): always the leader, so always Ready.
+  hub.__setLeader(null);
+  let r = await request("GET", "/readyz");
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ready, true);
+
+  // A follower replica reports NotReady so k8s pulls it from the EndpointSlice
+  // and the Service routes traffic only to the leader (the byte-stream relay is
+  // deferred; non-leaders must not serve terminals/migration).
+  hub.__setLeader(fakeLeader(false));
+  r = await request("GET", "/readyz");
+  assert.equal(r.status, 503);
+  assert.equal(r.body.ready, false);
+  assert.equal(r.body.leader, false);
+
+  // The leader is Ready again.
+  hub.__setLeader(fakeLeader(true));
+  r = await request("GET", "/readyz");
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ready, true);
+
+  hub.__setLeader(null); // restore the single-process default
 });
 
 test("XERK-763: migrationAdvanceTick runs the advance only on the leader", () => {
