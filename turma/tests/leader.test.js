@@ -169,6 +169,25 @@ test("the local self-expiry is never LOOSER than a standby's expiry (rounding gu
   }
 });
 
+test("isLeader()'s threshold is exactly the advertised lease, for a fractional-second lease", async () => {
+  // Pin the THRESHOLD VALUE directly (no multi-second sleep): a 1400ms lease
+  // advertises 2s, so isLeader() must hold up to 2000ms since the last renew and
+  // drop past it — never up to the raw 1400ms (the pre-fix bug would have dropped
+  // at 1400, i.e. looser-then-stricter than a standby reading 2s... the bug was
+  // the reverse for round-DOWN; here 1400 rounds UP so the direct threshold check
+  // is the durable guard against any future re-introduction).
+  const api = fakeK8s();
+  const a = elector(api, "pod-a", { leaseDurationMs: 1400 });
+  await a._tick();
+  assert.equal(a.isLeader(), true);
+  assert.equal(a.leaseSeconds, 2);
+  // Simulate elapsed time by backdating the last confirmed renewal.
+  a._lastRenew = Date.now() - 1900; // within the 2000ms advertised window
+  assert.equal(a.isLeader(), true, "holds within the advertised (ceil) lease window");
+  a._lastRenew = Date.now() - 2100; // past it
+  assert.equal(a.isLeader(), false, "drops past the advertised window, matching a standby");
+});
+
 test("a stale-resourceVersion PUT (409) does not claim leadership", async () => {
   const api = fakeK8s();
   const a = elector(api, "pod-a", { leaseDurationMs: 1000, renewDeadlineMs: 800 });

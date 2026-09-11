@@ -45,12 +45,17 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   sibling's job, NOT this ticket. The algorithm is pure over an injected `request(method,path,body)`,
   so acquire/renew/failover/conflict are unit-tested with a fake API (no live cluster) — the same
   no-live-backend discipline as `store.js`'s RESP codec.
-- **`isLeader()` self-expires off a LOCAL clock**: `_leader && now - _lastRenew <= leaseDurationMs`.
-  A wedged election loop (no ticks firing) drops leadership at the lease duration even though `_tick`
-  never cleared it — the split-brain defence. A transient API error keeps leadership only within the
-  renewDeadline, then drops it. Do NOT remove either guard.
-- **k8s Lease durations are integer SECONDS** (`leaseDurationSeconds`), so expiry granularity is 1s;
-  the local-clock self-expiry uses the configured ms. Timing tests that need real expiry use ≥1s.
+- **`isLeader()` self-expires off a LOCAL clock**: `_leader && now - _lastRenew <= leaseSeconds*1000`.
+  A wedged election loop (no ticks firing) drops leadership even though `_tick` never cleared it — the
+  split-brain defence. A transient API error keeps leadership only within the renewDeadline, then
+  drops it. Do NOT remove either guard.
+- **The self-expiry bounds on the ADVERTISED lease (`leaseSeconds*1000`), NOT the raw
+  `leaseDurationMs`** (XERK-763 QA): a k8s Lease advertises integer SECONDS (`leaseDurationSeconds`),
+  which is what a standby reads for expiry, and `leaseSeconds` CEILs — so the local guard's window is
+  never LOOSER than the standby's. A raw-ms bound + a round-DOWN `leaseSeconds` (the original bug)
+  let a wedged leader outlive the standby's acquisition for a fractional-second custom lease. Keep the
+  two in agreement (both `leaseSeconds*1000`, `leaseSeconds` ceiled). Timing tests that need real
+  expiry use ≥1s.
 - **On graceful shutdown the leader RENOUNCES** (`release()` backdates the lease's `renewTime`) so a
   warm standby promotes within a beat or two instead of waiting out the whole lease — the fast-
   failover point of a deploy. Fire-and-forget; the drain never waits on it.
