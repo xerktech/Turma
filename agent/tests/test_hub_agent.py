@@ -10153,6 +10153,32 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             sm._write_peers_file([{"id": "a", "rcName": "n", "repo": "r",
                                    "status": "running"}])  # must not raise
 
+    def test_peers_file_survives_non_ascii_on_a_cp1252_host(self):
+        """A summary/task/branch routinely holds non-ASCII (a "⋮" from the
+        XERK-745 work). On native Windows text mode defaults to cp1252, which
+        cannot encode such a char; the UnicodeEncodeError is a ValueError, NOT
+        the OSError the best-effort catch handled, so it reached build_payload
+        on the beat loop and crash-looped the whole manager. The write must pin
+        utf-8, round-trip the char, and never raise — emulated here by forcing
+        cp1252 for any text write that does not ask for utf-8."""
+        sm = self.make_manager()
+        real_open = open
+
+        def cp1252_open(file, mode="r", *args, **kwargs):
+            if "b" not in mode and kwargs.get("encoding") not in ("utf-8", "utf8"):
+                kwargs["encoding"] = "cp1252"
+            return real_open(file, mode, *args, **kwargs)
+
+        with mock.patch("builtins.open", cp1252_open):
+            sm._write_peers_file([
+                {"id": "aaaaa", "rcName": "nas-Turma-XERK-745", "repo": "Turma",
+                 "status": "running", "summary": "trim the ⋮ overflow menu",
+                 "git": {"liveBranch": "XERK-745"}},
+            ])  # must not raise
+        row = [r for r in real_open(ha.PEERS_FILE, encoding="utf-8").read()
+               .splitlines() if not r.startswith("#")][0]
+        self.assertEqual(row.split("\t")[5], "trim the ⋮ overflow menu")
+
     def test_migrated_ticket_session_keeps_its_ticket_name(self):
         """A session that moves host carries its ticket, so it must keep being
         called after its key — reverting to a hash on arrival would rename the

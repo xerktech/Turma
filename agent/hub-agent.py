@@ -15962,10 +15962,16 @@ class SessionManager:
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = PEERS_FILE + ".tmp"
-            with open(tmp, "w") as f:
+            # utf-8 explicitly: rows carry session names/tasks/branches, which
+            # routinely hold non-ASCII (e.g. a "⋮" in a summary). Text mode uses
+            # the platform default otherwise — cp1252 on native Windows — so any
+            # such char raised UnicodeEncodeError. That is a ValueError, NOT an
+            # OSError, so it slipped past the best-effort catch below and reached
+            # build_payload on the beat loop, crash-looping the whole manager.
+            with open(tmp, "w", encoding="utf-8") as f:
                 f.write("\n".join(rows) + "\n")
             os.replace(tmp, PEERS_FILE)
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             log(f"peers file write failed: {e}")
 
     # --- ticket attribution ledger -----------------------------------------
