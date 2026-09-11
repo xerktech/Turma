@@ -10153,6 +10153,23 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             sm._write_peers_file([{"id": "a", "rcName": "n", "repo": "r",
                                    "status": "running"}])  # must not raise
 
+    def test_peers_file_writes_non_ascii_cells_as_utf8(self):
+        """A cell holds a peer's free-text summary/task, which can carry any
+        char. The file is written UTF-8 explicitly: the platform default
+        (cp1252 on Windows) raised UnicodeEncodeError on e.g. "⋮" and, since
+        the except only caught OSError, crashed the whole manager on the beat
+        loop (the Windows session-restart loop)."""
+        sm = self.make_manager()
+        sm._write_peers_file([  # must not raise
+            {"id": "aaaaa", "rcName": "nas-Turma-XERK-1", "repo": "Turma",
+             "status": "running", "summary": "menu ⋮ and é over‑line"},
+        ])
+        raw = open(ha.PEERS_FILE, "rb").read()
+        self.assertIn("⋮".encode("utf-8"), raw)
+        row = [r for r in open(ha.PEERS_FILE, encoding="utf-8").read().splitlines()
+               if not r.startswith("#")][0]
+        self.assertEqual(row.split("\t")[5], "menu ⋮ and é over‑line")
+
     def test_migrated_ticket_session_keeps_its_ticket_name(self):
         """A session that moves host carries its ticket, so it must keep being
         called after its key — reverting to a hash on arrival would rename the
