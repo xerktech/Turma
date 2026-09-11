@@ -484,7 +484,9 @@ fun NewTicketAction(vm: BoardViewModel = viewModel()) {
             "New ticket",
             style = MaterialTheme.typography.labelLarge,
             maxLines = 1,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            // Trimmed from 12/6 to keep the pill compact in the tight header cluster
+            // (XERK-742) while staying a comfortable tap target.
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
         )
     }
     if (creating) {
