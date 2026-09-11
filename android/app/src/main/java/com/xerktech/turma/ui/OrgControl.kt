@@ -75,7 +75,7 @@ import com.xerktech.turma.vm.OrgViewModel
  * offering a menu whose only entry is "All orgs".
  */
 @Composable
-fun OrgFilterAction(vm: OrgViewModel = viewModel()) {
+fun OrgFilterAction(modifier: Modifier = Modifier, vm: OrgViewModel = viewModel()) {
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val stored by vm.org.collectAsStateWithLifecycle()
     val sites = remember(fleet.agents) { mergeSites(fleet.agents) }
@@ -97,7 +97,13 @@ fun OrgFilterAction(vm: OrgViewModel = viewModel()) {
     // The org whose color-swatch strip is expanded (XERK-145), or null.
     var colorFor by remember { mutableStateOf<String?>(null) }
 
-    Box {
+    // `modifier` lets the shared header make this control the FLEXIBLE element of
+    // the trailing cluster (XERK-745): the header passes `Modifier.weight(1f,
+    // fill = false)` so the fixed page-action icons, the New-ticket pill and the ⋮
+    // overflow are measured first and the org button yields whatever is left —
+    // ellipsizing the name — instead of pushing the ⋮ (Sign out's only home) off a
+    // phone screen when one long-named org is selected.
+    Box(modifier) {
         // Trim the default TextButton padding (XERK-742): in the shared header this
         // control sits shoulder-to-shoulder with the New ticket pill and the page
         // action icons, and the default 16dp/8dp inset left a wide gap on each side
@@ -119,9 +125,15 @@ fun OrgFilterAction(vm: OrgViewModel = viewModel()) {
                 style = MaterialTheme.typography.labelLarge,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                // Capped so a long org name can't push the title or the actions
-                // off a phone header — the full key is one tap away in the menu.
+                // The NAME is the one thing that yields (XERK-745): `weight(fill =
+                // false)` makes it the flexible child of the button's own row, so
+                // when the header squeezes this control (see the `weight` the shared
+                // header passes in) the name ellipsizes while the dots and the ▾
+                // arrow stay put — the arrow must never be the thing that clips.
+                // Still capped at 120dp so it never pushes the actions off when
+                // there IS room; the full key is one tap away in the menu.
                 modifier = Modifier
+                    .weight(1f, fill = false)
                     .padding(start = if (picked.isNotEmpty()) 6.dp else 0.dp)
                     .widthIn(max = 120.dp),
             )
