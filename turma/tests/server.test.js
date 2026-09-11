@@ -19274,3 +19274,136 @@ test("a models block with no usable label cannot clear a real host's label", asy
   hub.normalizeRecord(good);
   assert.equal(good.models.at, "2026-01-01");
 });
+
+// ---------------------------------------------------------------------------
+// XERK-762: cross-replica SSE fan-out over the shared pub/sub bus.
+//
+// SSE was per-process; with active-active replicas a mutation on replica A must
+// reach a browser whose /api/events stream is held by replica B. `makeSseBus`
+// publishes every broadcast to a shared channel and re-emits a PEER'S events to
+// this replica's clients, skipping the frame it originated itself. The Valkey
+// socket can't run in CI, so a faithful in-test shared bus (JSON round-trip,
+// fanning to every subscriber across instances, exactly as SharedLiveStore's
+// PUBLISH/message path does) stands in for it and two `makeSseBus` instances
+// over ONE mock are two replicas.
+// ---------------------------------------------------------------------------
+
+// A stand-in for the shared store's pub/sub: subscribers on ANY instance built
+// over the same hub receive every publish, and the message is JSON round-tripped
+// like SharedLiveStore (stringify on publish, parse on delivery) so the test
+// can't accidentally rely on object identity a real bus would sever.
+function makeSharedBusHub() {
+  const subs = new Map(); // channel -> Set<cb>
+  return {
+    store() {
+      return {
+        subscribe(channel, cb) {
+          let s = subs.get(channel);
+          if (!s) { s = new Set(); subs.set(channel, s); }
+          s.add(cb);
+          return () => s.delete(cb);
+        },
+        async publish(channel, message) {
+          const wire = JSON.stringify(message);
+          for (const cb of [...(subs.get(channel) || [])]) cb(JSON.parse(wire));
+        },
+      };
+    },
+  };
+}
+
+test("XERK-762: a peer replica's broadcast is re-emitted locally; own echo is skipped", async () => {
+  const busHub = makeSharedBusHub();
+  const deliveredA = [];
+  const deliveredB = [];
+  const busA = hub.makeSseBus(busHub.store(), "replicaA", (event, data) => deliveredA.push({ event, data }));
+  const busB = hub.makeSseBus(busHub.store(), "replicaB", (event, data) => deliveredB.push({ event, data }));
+
+  // A originates: its OWN deliverLocal is done by sseBroadcast (not the bus), so
+  // A must NOT re-deliver its echo; B must re-emit it once.
+  busA.publish("agent", { key: "host1", foo: 1 });
+  await Promise.resolve();
+  assert.deepEqual(deliveredA, [], "the originating replica must skip its own echo off the bus");
+  assert.deepEqual(deliveredB, [{ event: "agent", data: { key: "host1", foo: 1 } }],
+    "the peer replica re-emits the event once, payload byte-identical");
+
+  // Symmetric: B originates, A re-emits, B skips.
+  busB.publish("removed", { key: "host2" });
+  await Promise.resolve();
+  assert.deepEqual(deliveredB, [{ event: "agent", data: { key: "host1", foo: 1 } }],
+    "B did not re-deliver its own removed echo");
+  assert.deepEqual(deliveredA, [{ event: "removed", data: { key: "host2" } }],
+    "A re-emitted B's event");
+});
+
+test("XERK-762: a malformed or foreign-shaped bus message is ignored, never delivered", async () => {
+  const busHub = makeSharedBusHub();
+  const delivered = [];
+  hub.makeSseBus(busHub.store(), "me", (event, data) => delivered.push({ event, data }));
+  // Publish raw shapes onto the same channel as a hostile/older peer might.
+  const raw = busHub.store();
+  await raw.publish(hub.SSE_BUS_CHANNEL, null);
+  await raw.publish(hub.SSE_BUS_CHANNEL, { origin: "peer" });                 // no event
+  await raw.publish(hub.SSE_BUS_CHANNEL, { origin: "peer", event: 5, data: {} }); // non-string event
+  await raw.publish(hub.SSE_BUS_CHANNEL, "just a string");
+  assert.deepEqual(delivered, [], "nothing malformed is delivered");
+  // A well-formed peer frame still lands, proving the guard isn't over-broad.
+  await raw.publish(hub.SSE_BUS_CHANNEL, { origin: "peer", event: "ticketQueue", data: [1, 2] });
+  assert.deepEqual(delivered, [{ event: "ticketQueue", data: [1, 2] }]);
+});
+
+test("XERK-762: sseBroadcast delivers locally AND publishes to the bus when HA is on", async () => {
+  // A fake SSE client capturing the frames written to it.
+  const frames = [];
+  const fakeRes = { write(s) { frames.push(s); } };
+  hub.sseClients.add(fakeRes);
+
+  // Non-HA (default): bus stays null, only local delivery, no publish.
+  const published = [];
+  hub.__setSseBus(null);
+  hub.sseBroadcast("agent", { key: "h", n: 1 });
+  assert.equal(frames.length, 1, "local client got the frame with HA off");
+  assert.match(frames[0], /^event: agent\ndata: \{"key":"h","n":1\}\n\n$/);
+  assert.equal(published.length, 0, "no bus publish with HA off");
+
+  // HA on: sseBroadcast both writes locally AND publishes to the bus.
+  hub.__setSseBus({ publish(event, data) { published.push({ event, data }); } });
+  hub.sseBroadcast("removed", { key: "h" });
+  assert.equal(frames.length, 2, "local client still gets every frame with HA on");
+  assert.deepEqual(published, [{ event: "removed", data: { key: "h" } }],
+    "and the event is published to the shared bus for other replicas");
+
+  // Cleanup so no later test sees this client or the injected bus.
+  hub.sseClients.delete(fakeRes);
+  hub.__setSseBus(null);
+});
+
+test("XERK-762: a replica with zero local clients still publishes to the bus", async () => {
+  assert.equal(hub.sseClients.size, 0, "precondition: no local SSE clients");
+  const published = [];
+  hub.__setSseBus({ publish(event, data) { published.push({ event, data }); } });
+  hub.sseBroadcast("epicRuns", [{ id: "e1" }]);
+  assert.deepEqual(published, [{ event: "epicRuns", data: [{ id: "e1" }] }],
+    "with no local clients the frame is still fanned out to other replicas");
+  hub.__setSseBus(null);
+});
+
+test("XERK-762: a store blip (publish rejects) never throws out of sseBroadcast", async () => {
+  const busHub = makeSharedBusHub();
+  // A store whose publish rejects, as SharedLiveStore's _command does while the
+  // connection is down.
+  const failing = { subscribe() { return () => {}; }, async publish() { throw new Error("store not connected"); } };
+  const bus = hub.makeSseBus(failing, "me", () => {});
+  // makeSseBus wraps the publish in a caught promise — must not reject/throw.
+  assert.doesNotThrow(() => bus.publish("agent", { key: "h" }));
+  await Promise.resolve();
+  // And through sseBroadcast (local delivery still happens; publish is swallowed).
+  const frames = [];
+  const fakeRes = { write(s) { frames.push(s); } };
+  hub.sseClients.add(fakeRes);
+  hub.__setSseBus(bus);
+  assert.doesNotThrow(() => hub.sseBroadcast("agent", { key: "h" }));
+  assert.equal(frames.length, 1, "local delivery survives a dead bus");
+  hub.sseClients.delete(fakeRes);
+  hub.__setSseBus(null);
+});
