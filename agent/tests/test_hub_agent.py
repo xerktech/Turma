@@ -10153,6 +10153,30 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             sm._write_peers_file([{"id": "a", "rcName": "n", "repo": "r",
                                    "status": "running"}])  # must not raise
 
+    def test_peers_file_write_survives_a_non_cp1252_char(self):
+        """A session name can carry any char (the vertical-ellipsis menu glyph
+        has been seen on a real host). The write MUST specify UTF-8 and never
+        fall back to the Windows locale codec (cp1252), whose encode raises
+        UnicodeEncodeError on that glyph -- and this runs on the beat loop
+        (build_payload), so that exception crash-loops the whole agent. Simulate
+        the Windows default by forcing an encoding-less open() to cp1252 and
+        prove the row still lands as UTF-8."""
+        sm = self.make_manager()
+        real_open = open
+
+        def cp1252_default_open(*a, **kw):
+            kw.setdefault("encoding", "cp1252")
+            return real_open(*a, **kw)
+
+        with mock.patch("builtins.open", cp1252_default_open):
+            sm._write_peers_file([  # must not raise
+                {"id": "aaaaa", "rcName": "nas-Turma-XERK-1", "repo": "Turma",
+                 "status": "running", "summary": "menu ⋮ glyph"}])
+        body = real_open(ha.PEERS_FILE, encoding="utf-8").read()
+        # Present == the write used UTF-8; a cp1252 write would have raised and
+        # dropped the row (silently, now the guard catches every write error).
+        self.assertIn("menu ⋮ glyph", body)
+
     def test_migrated_ticket_session_keeps_its_ticket_name(self):
         """A session that moves host carries its ticket, so it must keep being
         called after its key — reverting to a hash on arrival would rename the
