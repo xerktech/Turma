@@ -3265,6 +3265,143 @@ function migrationList() {
 function publishMigrations() {
   invalidateAgentsCache();
   sseBroadcast("migrations", migrationList());
+  // Mirror the live set to the shared store so any replica can resolve a
+  // migration by id after a leader failover (XERK-761). Every migration mutation
+  // funnels through here, so mirroring the whole (MIGRATIONS_MAX-bounded) set
+  // refreshes each record's TTL and misses no mutation site; retire is the one
+  // path that also has to REMOVE a record, so it forgets explicitly. No-op —
+  // and thus byte-identical single-process behaviour — when HA is off.
+  if (migrationStoreShared) {
+    for (const m of migrations.values()) mirrorMigration(m);
+  }
+}
+
+// ---- migration record + spool sharing across replicas (XERK-761) -----------
+// Session migration (XERK-101) assumed ONE hub: the in-memory `migrations` Map
+// plus the spool bundles under MIGRATE_SPOOL_DIR. Under the HA epic (XERK-751)
+// the hub runs as multiple replicas, and a single move's source-upload,
+// target-pull and advanceMigrations can land on DIFFERENT replicas across a
+// RollingUpdate leader failover — where the record would not exist (uniform 404)
+// and a booting replica's spool sweep would delete another replica's live bundle.
+//
+// The in-memory Map stays the LEADER's working copy: only the leader serves
+// traffic and runs advanceMigrations (Option 2, docs/turma-ha-design.md), so its
+// SYNCHRONOUS reads across the request path and the beat stay valid and are not
+// rewritten to async. On top of it, in HA each record is MIRRORED to the shared
+// LiveStore keyed `migration/<id>`, from which a newly-promoted leader HYDRATES
+// (the seam the `leader` child calls on promotion; also run at boot). The spool
+// sits on the SHARED volume under its deterministic per-id name, and the boot
+// sweep keys on record-in-store existence + a TTL so a booting replica never
+// deletes a bundle a live migration still owns. With HA off `migrationStoreShared`
+// is false, none of this runs, and the single-process path is unchanged.
+let migrationStore = null; // a LiveStore (store.js), or null (single-process/tests)
+let migrationStoreShared = false; // true ONLY when that store is the SHARED backend
+function setMigrationStore(store, shared) {
+  migrationStore = store || null;
+  migrationStoreShared = !!(store && shared);
+}
+const MIGRATION_KEY_PREFIX = "migration/";
+// The record's TTL in the shared store: comfortably past the whole in-flight
+// window (MIGRATE_TIMEOUT_MS), so an `exporting` move waiting on the source's
+// upload retry never expires under a live leader (which re-mirrors on each
+// mutation), while a CRASHED leader's records still self-clean rather than leak.
+// A settled record is unmirrored on retire well before this.
+const MIGRATE_RECORD_TTL_MS = MIGRATE_TIMEOUT_MS + 2 * 60 * 1000;
+// How stale an ORPHAN spool file must be before the multi-replica boot sweep
+// removes it — long enough that a bundle another replica is mid-writing, whose
+// record has not yet been mirrored, is never mistaken for garbage.
+const MIGRATE_SPOOL_ORPHAN_MS = positiveEnv("MIGRATE_SPOOL_ORPHAN_MS", 10 * 60 * 1000);
+// Resolved once at module load (resolveHaConfig is pure — no log, no exit), so
+// the single-process boot sweep can run synchronously as it always did while the
+// HA path defers to the record-aware sweep. The authoritative resolve + fatal
+// handling stays in the boot branch.
+const MIGRATE_HA_ON = resolveHaConfig(process.env).ha;
+
+// Mirror one record into the shared store. Best-effort: a failed mirror never
+// fails the mutation it followed — the Map is authoritative for this leader and
+// the next mutation re-mirrors. `uploading`/`refusal` are LEADER-LOCAL transient
+// flags reset in the mirrored copy, so a promoted leader neither blocks a fresh
+// upload nor inherits a half-applied refusal.
+function mirrorMigration(m) {
+  if (!migrationStoreShared || !m || !m.id) return;
+  const copy = { ...m, uploading: false, refusal: null };
+  Promise.resolve(
+    migrationStore.set(MIGRATION_KEY_PREFIX + m.id, copy, { ttlMs: MIGRATE_RECORD_TTL_MS })
+  ).catch(() => {});
+}
+// Remove a record from the shared store. Best-effort, no-op when HA is off.
+function forgetMigration(id) {
+  if (!migrationStoreShared || !id) return;
+  Promise.resolve(migrationStore.del(MIGRATION_KEY_PREFIX + id)).catch(() => {});
+}
+// Drop a record from the Map AND the shared store together — the single retire
+// path every eviction/cleanup goes through, so no forgotten record lingers in the
+// store to be re-hydrated after it settled.
+function retireMigration(id) {
+  migrations.delete(id);
+  forgetMigration(id);
+}
+// Rebuild the in-memory Map from the shared store — every record another replica
+// (or this one before a restart) left in flight. The seam a promoted leader calls
+// before it starts serving/advancing (the `leader` child, XERK-751); also run at
+// boot. Transient leader-local flags are reset; a record THIS leader already
+// holds is never overwritten (its copy is the live one). The mirrored `blobPath`
+// is always `migrationSpoolPath(id)` and MIGRATE_SPOOL_DIR is identical across
+// replicas on the shared volume, so a hydrated `importing` record's bundle path
+// resolves the same bytes the old leader wrote.
+async function hydrateMigrations() {
+  if (!migrationStoreShared) return;
+  let rows;
+  try {
+    rows = await migrationStore.scan(MIGRATION_KEY_PREFIX);
+  } catch {
+    return; // store unreachable — the leader child retries; nothing is lost
+  }
+  for (const { value } of rows) {
+    if (!value || typeof value !== "object" || typeof value.id !== "string") continue;
+    if (migrations.has(value.id)) continue;
+    migrations.set(value.id, { ...value, uploading: false, refusal: null });
+  }
+}
+// The multi-replica-safe boot spool sweep (XERK-761). On a shared spool volume a
+// booting replica must NOT delete a bundle that belongs to a migration still in
+// flight under another replica. It keeps any spool file whose migration RECORD
+// still exists in the shared store, and of the rest deletes only those older than
+// MIGRATE_SPOOL_ORPHAN_MS — long enough that a bundle mid-upload, whose record has
+// not yet been mirrored, is never mistaken for an orphan. Deletes ONLY names this
+// hub could have written (MIGRATE_SPOOL_RE), exactly like the single-process
+// sweep — MIGRATE_SPOOL_DIR is deployment config, so a slip pointing it at /data
+// must not delete state.json.
+async function sweepMigrationSpoolShared() {
+  let names;
+  try {
+    names = fs.readdirSync(MIGRATE_SPOOL_DIR);
+  } catch {
+    return; // no spool dir yet — nothing has been relayed on this volume
+  }
+  const now = Date.now();
+  for (const n of names) {
+    if (!MIGRATE_SPOOL_RE.test(n)) continue;
+    const id = n.slice(0, -4); // the 16-hex id (MIGRATE_SPOOL_RE guarantees `.bin`)
+    const full = path.join(MIGRATE_SPOOL_DIR, n);
+    let rec = null;
+    try {
+      rec = await migrationStore.get(MIGRATION_KEY_PREFIX + id);
+    } catch {
+      rec = null;
+    }
+    if (rec) continue; // a live migration still owns this bundle
+    // No record: an orphan — but only if it is old enough that it cannot be a
+    // bundle another replica is mid-writing whose record has not yet mirrored.
+    let old = true;
+    try {
+      old = now - fs.statSync(full).mtimeMs >= MIGRATE_SPOOL_ORPHAN_MS;
+    } catch {
+      old = true; // unstattable — treat as removable
+    }
+    if (!old) continue;
+    try { fs.unlinkSync(full); } catch {}
+  }
 }
 
 // ---- /api/agents payload cache + SSE fanout ---------------------------------
@@ -3896,7 +4033,7 @@ function startMigration(srcHost, s, targetHost) {
         if (!oldest || m.at < oldest.at) oldest = m;
       }
     }
-    if (oldest) { dropMigrationBlob(oldest); migrations.delete(oldest.id); }
+    if (oldest) { dropMigrationBlob(oldest); retireMigration(oldest.id); }
   }
   const id = crypto.randomBytes(8).toString("hex");
   const m = {
@@ -3977,7 +4114,7 @@ function startArchiveRestore(row, files, targetHost) {
         if (!oldest || m.at < oldest.at) oldest = m;
       }
     }
-    if (oldest) { dropMigrationBlob(oldest); migrations.delete(oldest.id); }
+    if (oldest) { dropMigrationBlob(oldest); retireMigration(oldest.id); }
   }
   const id = crypto.randomBytes(8).toString("hex");
   const tgt = agents[targetHost] || null;
@@ -4197,7 +4334,7 @@ function advanceMigrations() {
     if ((m.phase === "done" || m.phase === "failed") &&
         now - m.at > MIGRATE_DONE_KEEP_MS) {
       dropMigrationBlob(m); // settling already dropped it; this is the backstop
-      migrations.delete(m.id);
+      retireMigration(m.id);
       publishMigrations();
     }
   }
@@ -16247,9 +16384,13 @@ server.on("upgrade", async (req, socket, head) => {
   socket.destroy();
 });
 
-// Nothing in the migration spool survives a restart usefully (the records that
-// name those files were in memory), so clear it before anything can relay.
-sweepMigrationSpool();
+// Single-process: nothing in the migration spool survives a restart usefully
+// (the records that named those files were in memory), so clear it before
+// anything can relay. In HA the spool is SHARED across replicas, so a blanket
+// wipe would delete another replica's live bundle — the record-aware
+// sweepMigrationSpoolShared (run once the store is wired, in the boot branch
+// below) replaces it there (XERK-761).
+if (!MIGRATE_HA_ON) sweepMigrationSpool();
 
 // Test hooks: when TURMA_TEST is set (never in the image — the Dockerfile
 // runs `node server.js` with it unset), export the internals for the test
@@ -16686,6 +16827,18 @@ if (process.env.TURMA_TEST) {
     sweepMigrationSpool,
     dropMigrationBlob,
     migrationSpoolPath,
+    // XERK-761: the record/spool sharing seam. `setMigrationStore` injects a
+    // LiveStore (shared flag) so a test can drive the mirror/hydrate/sweep the
+    // way a real HA replica does; the rest are the pieces the leader child and
+    // boot call.
+    setMigrationStore,
+    hydrateMigrations,
+    sweepMigrationSpoolShared,
+    mirrorMigration,
+    forgetMigration,
+    MIGRATION_KEY_PREFIX,
+    MIGRATE_RECORD_TTL_MS,
+    MIGRATE_SPOOL_ORPHAN_MS,
     siteKeyOf,
     orgPeers,
     boundOrgOf,
@@ -16763,9 +16916,19 @@ if (process.env.TURMA_TEST) {
   const liveStore = createLiveStore(haConfig, {
     onHealth: (h) => console.log(`HA store health: ${h}`),
   });
-  // Referenced so linters/readers see it is intentionally constructed-not-yet-
-  // wired this wave; wave-3 children read it. (No-op; keeps the binding alive.)
-  void liveStore;
+  // XERK-761 (wave-3): wire the migration record/spool sharing onto the store.
+  // It is the SHARED backend only when HA is on; with HA off this is the local
+  // in-memory store, the flag stays false, and nothing about migrations changes.
+  // In HA, hydrate the Map from the store (this covers a restart; the `leader`
+  // child calls hydrateMigrations again on promotion) and run the record-aware
+  // spool sweep the single-process boot sweep deferred to above.
+  setMigrationStore(liveStore, haConfig.ha);
+  if (haConfig.ha) {
+    hydrateMigrations().catch((e) =>
+      console.error(`migration hydrate failed: ${e && e.message}`));
+    sweepMigrationSpoolShared().catch((e) =>
+      console.error(`migration spool sweep failed: ${e && e.message}`));
+  }
 
   // ---- Graceful shutdown (XERK-552) --------------------------------------
   // The hub is single-replica on an RWO volume, so a rolling deploy is a
