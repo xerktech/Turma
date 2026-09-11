@@ -32,6 +32,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `turma-ha-archive.md` | `turma/blobstore.js`, `turma/archive-mirror.js` | HA archive of-record (XERK-759): object-store bytes + per-replica single-writer disposable index, the mirror/hydrate seam |
 | `turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `turma-ha-registry.md` | `turma/server.js` | HA: the fleet registry + per-host command queues in the shared store (per-host write-through, hydration, watch); non-HA byte-identical (XERK-756) |
+| `turma-ha-leader.md` | `turma/leader.js`, `turma/server.js` | HA: k8s-Lease leader election + `isLeader()` gating the singleton sweeps/migration-advance; the shared single-flight guards (write-through + hydrate-on-promotion); non-HA always-leader/byte-identical (XERK-763) |
 | `turma-ha-tunnel.md` | `turma/server.js` | HA: cross-replica tunnel directory + control bus (XERK-764) — `terminalOnline` truth + command poke across replicas; the duplex byte-stream relay is deferred; non-HA byte-identical |
 | `turma-oidc.md` | `turma/server.js` | OIDC relying-party core: code+PKCE, discovery, JWKS RS256, session cookie, RP-logout |
 | `turma-break-glass.md` | `turma/server.js`, `turma/public/login.html` | IdP-independent break-glass local login; invariants a mandatory-OIDC change must keep |
