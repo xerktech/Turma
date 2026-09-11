@@ -133,6 +133,12 @@ things worth knowing up front:
 It self-updates from the release stream afterwards without stopping running
 sessions. See [`agent/native/README.md`](agent/native/README.md).
 
+> **Testing HA?** There is a separate, optional
+> [`hub-ha.yaml`](examples/compose/hub-ha.yaml) that brings the hub up alongside
+> the shared store (Valkey + Postgres + MinIO) the HA work targets
+> ([the store ADR](docs/turma-ha-store-adr.md)). It is **not** the normal way to
+> run Turma — `hub.yaml` above is — so a plain deploy ignores it entirely.
+
 ## Clients
 
 Both clients talk to the hub over HTTP Basic and are configured with a hub URL

@@ -1,0 +1,171 @@
+# Turma hub + the HA shared store, for LOCAL HA testing ONLY (XERK-755).
+#
+#   cp .env.ha.example .env.ha && $EDITOR .env.ha
+#   docker compose --env-file .env.ha -f hub-ha.yaml up -d
+#
+# ---------------------------------------------------------------------------
+# THIS IS NOT THE DEFAULT WAY TO RUN TURMA. A normal Docker user runs the
+# single-service, non-HA `hub.yaml` and never touches this file. This one exists
+# so the HA-externalization work (epic XERK-751) has a real Valkey + Postgres +
+# MinIO to integration-test against without a Kubernetes cluster — the same
+# three backends the XERK-752 ADR (docs/turma-ha-store-adr.md) selected and that
+# xerktech/ArgoCD `ai/turma-store/` provisions in production.
+# ---------------------------------------------------------------------------
+#
+# WHAT EACH BACKEND HOLDS (see the ADR for the full contract):
+#   valkey    the live plane — fleet registry, command/ticket queues, migration
+#             record, hot policy/OIDC side-stores, the pub/sub bus. Persistent
+#             (AOF everysec), unlike LiteLLM's throwaway cache.
+#   postgres  the durable of-record — the usage-ledger high-water and the
+#             archive SEARCH INDEX (SQLite today).
+#   minio     the archive BYTES of-record — rendered + raw session layers, in
+#             the `turma-archive` bucket that `minio-init` creates.
+#
+# HA_MODE and the pre-HA image, read this before expecting HA behaviour:
+#   - `HA_MODE` defaults to 1 here (this is the HA stack). Per the ADR the hub
+#     then REQUIRES every store URL or refuses to boot — never a silent
+#     single-process fallback.
+#   - The published `:latest` image is only HA-capable once the externalization
+#     children (XERK-754 et al.) ship. Against a PRE-HA image every var below is
+#     simply ignored and the hub runs its normal file/in-memory backend on the
+#     `turma-data` volume — the store containers come up but sit idle. That is
+#     expected until the HA build lands; point `TURMA_IMAGE` at an HA build to
+#     exercise the store for real.
+#   - LEADER LEASE: in Kubernetes HA the singleton sweeps gate on a k8s `Lease`
+#     (coordination.k8s.io), which does not exist in compose. This stack runs
+#     ONE hub, so there is no leader contention to resolve; an HA build must
+#     treat a lone process as the leader here. Do not add a second `turma`
+#     replica to this file expecting active-active — that needs the lease story
+#     the ADR keeps in Kubernetes.
+
+services:
+  # --- The live plane -------------------------------------------------------
+  valkey:
+    image: valkey/valkey:8.1-alpine
+    container_name: turma-valkey
+    restart: unless-stopped
+    # AOF everysec — the ADR's durability floor for the live plane. Mirrors the
+    # k8s StatefulSet (ai/turma-store/valkey.yaml). No auth: this store is only
+    # reachable on the compose network, the same posture as in-cluster.
+    command: ["valkey-server", "--appendonly", "yes", "--appendfsync", "everysec", "--dir", "/data"]
+    volumes:
+      - turma-valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # --- The durable of-record (ledger + archive index) -----------------------
+  postgres:
+    image: postgres:18-alpine
+    container_name: turma-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: turma
+      POSTGRES_USER: turma
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.ha}"
+    volumes:
+      - turma-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U turma -d turma"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # --- The archive bytes of-record ------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    container_name: turma-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env.ha}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env.ha}"
+    volumes:
+      - turma-minio-data:/data
+    # No healthcheck: the minio server image ships no curl/wget/mc to probe with.
+    # minio-init below retries the connection itself instead — the same
+    # `until mc alias set …` loop the k8s bucket-job uses.
+
+  # One-shot: create the archive bucket, then exit 0. MinIO does not auto-create
+  # buckets. Idempotent (`mb --ignore-existing`), so a re-`up` is harmless. It
+  # retries until MinIO answers, so it needs no MinIO healthcheck to gate on.
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    container_name: turma-minio-init
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        until mc alias set store http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do
+          echo "waiting for minio..."; sleep 3
+        done
+        mc mb --ignore-existing store/turma-archive
+        mc ls store
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env.ha}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env.ha}"
+    restart: "no"
+
+  # --- The hub, wired to the store above ------------------------------------
+  turma:
+    image: "${TURMA_IMAGE:-ghcr.io/xerktech/turma:latest}"
+    container_name: turma
+    restart: unless-stopped
+    depends_on:
+      valkey:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "8300:8300"
+    environment:
+      # ---- Hub auth (identical to hub.yaml) --------------------------------
+      TURMA_USER: "${TURMA_USER:?set TURMA_USER in .env.ha}"
+      TURMA_PASSWORD: "${TURMA_PASSWORD:?set TURMA_PASSWORD in .env.ha}"
+      TURMA_AGENT_TOKEN: "${TURMA_AGENT_TOKEN:?set TURMA_AGENT_TOKEN in .env.ha}"
+
+      # ---- HA config contract (XERK-752 ADR) -------------------------------
+      # 1 = force HA on; the hub refuses to boot if any store URL below is
+      # missing (never a silent single-process fallback). Set HA_MODE=0 in
+      # .env.ha to run the known-good single-process hub against these same
+      # containers, e.g. to A/B a bug against the file backend.
+      HA_MODE: "${HA_MODE:-1}"
+      # Live plane -> Valkey.
+      TURMA_STORE_URL: "redis://valkey:6379/0"
+      # Ledger + archive index -> Postgres.
+      DATABASE_URL: "postgres://turma:${POSTGRES_PASSWORD}@postgres:5432/turma"
+      # Archive bytes -> MinIO bucket turma-archive.
+      ARCHIVE_S3_ENDPOINT: "http://minio:9000"
+      ARCHIVE_S3_BUCKET: "turma-archive"
+      ARCHIVE_S3_REGION: "us-east-1"
+      ARCHIVE_S3_ACCESS_KEY: "${MINIO_ROOT_USER}"
+      ARCHIVE_S3_SECRET_KEY: "${MINIO_ROOT_PASSWORD}"
+
+      # Silences node:sqlite's ExperimentalWarning (the single-process index).
+      NODE_NO_WARNINGS: "1"
+
+    volumes:
+      # Still present so a HA_MODE=0 run (or a pre-HA image) has its file backend.
+      # Under HA the durable state lives in the store above, not here.
+      - turma-data:/data
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8300/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  turma-data:
+  turma-valkey-data:
+  turma-postgres-data:
+  turma-minio-data:
