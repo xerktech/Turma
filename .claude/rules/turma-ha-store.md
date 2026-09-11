@@ -47,8 +47,11 @@ NOT load on `server.js`, so re-read it here before touching that wiring**:
   second inline validator — do not let the two drift.
 - **`watch` handles a change from ANY replica** (`applyExternalStoreValue`): re-coerce,
   DEDUP by value (`sameValue` vs the mirror — our own write's echo is a no-op), install,
-  invalidate, re-broadcast SSE LOCALLY. The cross-replica SSE fan-out itself is XERK-762;
-  this only re-broadcasts to THIS replica's own SSE clients.
+  invalidate. It updates THIS replica's server state (payload + sweeps); it does NOT
+  broadcast SSE. The originating setter's own `sseBroadcast` is fanned to every replica's
+  clients by XERK-762's bus, so a second broadcast in the watch would deliver every policy
+  frame to a peer's browsers TWICE (and re-publish it to the bus). Cross-replica SSE is
+  XERK-762's; cross-replica SERVER STATE (the mirror) is this ticket's.
 - **Boot (`wireExternalStores`, off `store.ready()`):** a key PRESENT in the store wins
   (adopt); a key ABSENT is SEEDED up from the file/seed-primed mirror — migrating
   existing single-process `/data` state into a fresh shared store with no operator
@@ -105,6 +108,23 @@ NOT load on `server.js`, so re-read it here before touching that wiring**:
 - **The effective mode PRINTS at boot** (`HA: on (...)` / `HA: off (single-process)`),
   same idiom as the memory-ceiling prints — the only way to tell a correctly-wired
   hub from one whose env moved under it.
+
+## Wave-3 consumers already on the seam
+
+- **SSE fan-out across replicas (XERK-762)** — the first live-plane consumer of `publish`/`subscribe`.
+  In `turma/server.js`, `sseBroadcast` = `sseDeliverLocal` (this process's `sseClients`, as always)
+  **plus** `sseBus.publish` when HA is on. `makeSseBus(store, replicaId, deliverLocal)` subscribes to
+  `SSE_BUS_CHANNEL` and re-emits a PEER's frames to local clients; it SKIPS a frame stamped with its
+  own `SSE_REPLICA_ID` (a fresh per-boot random), so an event a replica both originated and received
+  back is delivered once. `sseBus` is null single-process (`FileLiveStore` pub/sub is NOT wired for
+  SSE — one process has no peer), so the non-HA path is unchanged.
+  - **Payloads/event names are byte-identical** — the bus only carries `{origin, event, data}` and
+    unwraps to the same `(event, dataObj)`, so the client merge machinery (`mergeSnapshot`/`sseClock`/
+    `patchedAt`, XERK-444/545, all CLIENT-side) converges a cross-replica patch as it does a local
+    one. There is NO server-side clock; do not add one.
+  - **Publish is best-effort** (caught): a store blip never fails the mutation, and each host's next
+    beat re-ships its FULL serialized record, so a frame missed during a blip self-heals within a
+    beat. Tests: the `XERK-762:` cases in `server.test.js`.
 
 ## Tests
 

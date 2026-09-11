@@ -49,6 +49,43 @@ contract migration preserves is in `.claude/rules/session-transcript.md`.
 - Tests: `TestMigrateSession`, `server.test.js`, the Move cases in `sessions.test.js`,
   `eligibleMoveTargets` in android `SessionsTest`.
 
+## Sharing the record + spool across HA replicas (XERK-761, epic XERK-751)
+
+Migration assumed ONE hub. Under HA the hub is N replicas and a single move's source-upload,
+target-pull and `advanceMigrations` can land on DIFFERENT replicas across a RollingUpdate leader
+failover. Read `.claude/rules/turma-ha-store.md` for the `LiveStore` seam this plugs into.
+
+- **The in-memory `migrations` Map stays the LEADER's working copy.** Only the leader serves traffic
+  and runs `advanceMigrations` (Option 2, `docs/turma-ha-design.md`), so its SYNCHRONOUS reads across
+  the request path and the beat are left as-is — NOT rewritten to async. The store is the
+  cross-replica-durable MIRROR + hydration source on top of the Map, not a replacement for it.
+- **In HA every record is mirrored to the shared `LiveStore` keyed `migration/<id>`** with a TTL past
+  the whole in-flight window (`MIGRATE_RECORD_TTL_MS` = `MIGRATE_TIMEOUT_MS` + 2m), refreshed on every
+  mutation via `publishMigrations` (the one funnel every mutation hits — so no site is missed) and
+  DELETED by `retireMigration` on every eviction/retire. `uploading`/`refusal` are LEADER-LOCAL and
+  reset in the mirrored copy, so a promoted leader neither blocks a fresh upload nor inherits a
+  half-applied refusal.
+- **`hydrateMigrations()` rebuilds the Map from the store** — the seam the (not-yet-landed) `leader`
+  child calls ON PROMOTION, also run at boot. Never overwrites a record this leader already holds.
+- **The spool sits on the SHARED volume** under its deterministic per-id name (`migrationSpoolPath`),
+  so upload and pull resolve the same bytes on any replica. Deployment: `MIGRATE_SPOOL_DIR` must be an
+  RWX mount in HA (the ArgoCD concern).
+- **The boot sweep is record-aware under HA** (`sweepMigrationSpoolShared`): it KEEPS any bundle whose
+  record still exists in the store, and of the rest deletes only orphans older than
+  `MIGRATE_SPOOL_ORPHAN_MS` (10m) — so a bundle another replica is mid-writing, whose record has not
+  yet mirrored, is never mistaken for garbage. The single-process `sweepMigrationSpool` (delete-all)
+  runs at module load ONLY when HA is off (`MIGRATE_HA_ON`, resolved once); the HA path defers to the
+  shared sweep run once the store is wired.
+- **`advanceMigrations` composes with the leader gate unchanged** — the gate is the leader child's;
+  this ticket only makes the record/spool resolvable so a newly-promoted leader can advance a move the
+  old leader started. **The 503-holds-in-`exporting` + `_migration_upload` retry and the
+  refused-start-is-reported contracts are untouched** — they operate on the leader's Map record, and
+  mirroring/hydration are additive.
+- **HA OFF is byte-identical**: `migrationStoreShared` is false, so mirror/hydrate/shared-sweep are
+  all no-ops and the single-process path is exactly as before.
+- Tests: the `XERK-761:` cases in `server.test.js` (mirror-then-forget, hydrate on promotion, the
+  record-aware sweep keeping live/fresh bundles and deleting only a stale orphan).
+
 ## A refused session start is REPORTED, never just logged (XERK-265)
 
 - **A command is ACKed whether the agent ran it or declined it**, so a refusal the agent only `log()`s

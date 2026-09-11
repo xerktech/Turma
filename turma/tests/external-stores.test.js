@@ -75,7 +75,7 @@ test("XERK-757: asFlagMap keeps only truthy keys as true; asPlainObject keeps ob
 test("XERK-757: applyExternalStoreValue installs a change, dedups an echo, coerces junk", () => {
   let mirror = {};
   const desc = {
-    key: "policy:t", event: null, coerce: X.asFlagMap,
+    key: "policy:t", coerce: X.asFlagMap,
     read: () => mirror, install: (v) => { mirror = v; },
   };
   // A genuine change installs and returns true.
@@ -96,7 +96,7 @@ test("XERK-757: persist writes byte-identical JSON through the file backend", as
   X.setLiveStore(store);
   let mirror = {};
   const persist = X.registerExternalStore({
-    name: "probe", file, event: null, coerce: X.asPlainObject,
+    name: "probe", file, coerce: X.asPlainObject,
     read: () => mirror, install: (v) => { mirror = v; },
   });
   mirror = { "site/KEY-1": { host: "h1", at: 123 } };
@@ -110,16 +110,16 @@ test("XERK-757: persist writes byte-identical JSON through the file backend", as
 
 test("XERK-757: a change on one replica reaches another via the shared backend's watch", async () => {
   // ONE FileLiveStore = one shared backend; two mirrors watching the same key =
-  // two replicas. A set from A must land in B's mirror (and re-broadcast there),
-  // while A's own echo is deduped.
+  // two replicas. A set from A must land in B's mirror (SSE fan-out to B's clients
+  // is XERK-762's job, not the watch's), while A's own echo is deduped.
   const file = tmp("shared-probe");
   try { fs.unlinkSync(file); } catch { /* first run */ }
   const store = fileStore({ "policy:shared": { file, debounceMs: 5000 } });
 
   let mirrorA = {};
   let mirrorB = {};
-  const descA = { key: "policy:shared", event: null, coerce: X.asFlagMap, read: () => mirrorA, install: (v) => { mirrorA = v; } };
-  const descB = { key: "policy:shared", event: null, coerce: X.asFlagMap, read: () => mirrorB, install: (v) => { mirrorB = v; } };
+  const descA = { key: "policy:shared", coerce: X.asFlagMap, read: () => mirrorA, install: (v) => { mirrorA = v; } };
+  const descB = { key: "policy:shared", coerce: X.asFlagMap, read: () => mirrorB, install: (v) => { mirrorB = v; } };
   store.watch(descA.key, (ev) => X.applyExternalStoreValue(descA, ev && ev.value));
   store.watch(descB.key, (ev) => X.applyExternalStoreValue(descB, ev && ev.value));
 
