@@ -44,6 +44,19 @@ This file is the operative rules for the two modules that landed it.
   the shared backend; a no-await-between read+delete on the file backend), so a single-use consume
   can't be double-read by concurrent callers. Decomposing it into `get()`+`del()` at a call site
   reintroduces that race — the file backend yields the event loop between the two awaits.
+- **XERK-758 — the durable USAGE LEDGER** (`usage-ledger.js` → a pluggable persistence backend, file
+  default byte-identical / `SharedLedgerBackend` in `usage-ledger-shared.js`). UNLIKE the OIDC child it
+  did NOT flip a `LiveStore` call site inline: the in-memory model + every read (`fold`/`retiredAgents`/
+  `has`) stay synchronous, and only PERSISTENCE swaps — each host is its own key
+  `usage:host:<key>`, written by an atomic per-host high-water **max-merge** under `compareAndSet`/
+  `setIfAbsent` (a low/partial writer can never lower a recorded total). Wired by
+  `usageLedger.configure(liveStore, haConfig, invalidateAgentsCache)` at boot; reuses `scan`/`watch`
+  unchanged — **no new store primitive.** The boot/reconnect scan runs on the store's health→ready
+  edge (never inline in `init`, which would reject on a not-yet-connected socket) and invalidates the
+  hub's `/api/agents` cache on any non-beat model change. DELIBERATE ADR divergence (ledger on Valkey,
+  not the ADR's Postgres — no stdlib PG client yet); the max-merge write is backend-agnostic so a PG
+  `LedgerStore` slots in later with no call-site change. Full rules: `.claude/rules/turma-usage.md`
+  ("HA: the shared-store backend").
 
 ## Load-bearing invariants
 

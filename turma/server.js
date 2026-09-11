@@ -17350,6 +17350,17 @@ if (process.env.TURMA_TEST) {
     sseBus = makeSseBus(liveStore, SSE_REPLICA_ID, sseDeliverLocal);
     console.log(`SSE fan-out: shared bus (replica ${SSE_REPLICA_ID})`);
   }
+  // Wave-3 (XERK-758): move the durable usage ledger onto the shared store when HA
+  // is on. With HA off this is a no-op and the ledger stays on its local JSON file,
+  // byte-identical. Fire-and-forget + logged: a store down at boot must not block
+  // the listen (availability) — `configure` loads the model when the store's socket
+  // becomes ready and re-loads on reconnect. `invalidateAgentsCache` is passed so a
+  // boot/reconnect scan load or a peer replica's watch-folded write refreshes the
+  // served /api/agents (retiredUsage) promptly — a model change with no local beat
+  // behind it would otherwise serve stale until the next mutation (XERK-758 QA D1).
+  usageLedger.configure(liveStore, haConfig, invalidateAgentsCache).catch((e) => {
+    console.error(`usage ledger: shared-store configure failed, staying on the local file: ${(e && e.message) || e}`);
+  });
 
   // ---- Graceful shutdown (XERK-552) --------------------------------------
   // The hub is single-replica on an RWO volume, so a rolling deploy is a
