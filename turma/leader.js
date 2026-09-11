@@ -111,7 +111,13 @@ class LeaderElector {
   }
 
   get leaseSeconds() {
-    return Math.max(1, Math.round(this.leaseDurationMs / 1000));
+    // CEIL, never round: a k8s Lease advertises integer SECONDS, and this is the
+    // value a standby honors for expiry. Rounding DOWN would advertise a lease
+    // SHORTER than configured AND — with `isLeader()` self-expiring off the same
+    // value below — is what keeps the local split-brain guard from ever being
+    // LOOSER than the standby's expiry (XERK-763 QA). Ceil floors the effective
+    // lease at the configured duration.
+    return Math.max(1, Math.ceil(this.leaseDurationMs / 1000));
   }
 
   _leasePath() {
@@ -121,9 +127,13 @@ class LeaderElector {
   isLeader() {
     // Fail-safe: hold leadership only while our last confirmed renewal is still
     // within the lease window. A wedged loop (no ticks firing) therefore drops
-    // leadership after leaseDurationMs even though `_leader` was never cleared,
-    // so it can never race a newly-promoted standby.
-    return this._leader && Date.now() - this._lastRenew <= this.leaseDurationMs;
+    // leadership even though `_tick` never cleared `_leader`, so it can never
+    // race a newly-promoted standby. Bounded by the ADVERTISED lease duration
+    // (`leaseSeconds*1000`) — the exact value a standby reads to decide the lease
+    // has expired — so this local guard is never LOOSER than the standby's
+    // expiry (which a raw-ms bound would be whenever the ms rounds down to a
+    // shorter second count; XERK-763 QA).
+    return this._leader && Date.now() - this._lastRenew <= this.leaseSeconds * 1000;
   }
 
   onChange(cb) {

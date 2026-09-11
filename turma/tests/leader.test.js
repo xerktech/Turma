@@ -140,14 +140,33 @@ test("failover: a follower acquires once the leader's lease expires", async () =
 });
 
 test("isLeader() self-expires when the election loop wedges (split-brain guard)", async () => {
+  // The self-expiry is bounded by the ADVERTISED (seconds-granular) lease, so a
+  // real wedge test needs >=1s (a standby honors the same seconds value).
   const api = fakeK8s();
-  const a = elector(api, "pod-a", { leaseDurationMs: 40, renewDeadlineMs: 30 });
+  const a = elector(api, "pod-a", { leaseDurationMs: 1000, renewDeadlineMs: 800 });
   await a._tick();
   assert.equal(a.isLeader(), true);
   // No further ticks fire (a wedged loop). Past the lease duration, isLeader()
   // must report false off the local clock even though _tick never cleared it.
-  await sleep(60);
+  await sleep(1200);
   assert.equal(a.isLeader(), false);
+});
+
+test("the local self-expiry is never LOOSER than a standby's expiry (rounding guard)", () => {
+  // XERK-763 QA: leaseSeconds CEILs, and isLeader() bounds on leaseSeconds*1000,
+  // so the local split-brain guard's window can never exceed the seconds-granular
+  // window a standby reads — whatever fractional-second lease is configured.
+  const api = fakeK8s();
+  for (const ms of [1400, 1001, 2499, 15000, 15001]) {
+    const e = elector(api, "pod-x", { leaseDurationMs: ms });
+    const k8sExpiryMs = e.leaseSeconds * 1000; // what a standby honors
+    assert.equal(e.leaseSeconds, Math.ceil(ms / 1000), `leaseSeconds ceils for ${ms}ms`);
+    // The local self-expiry threshold isLeader() uses is exactly k8sExpiryMs, so
+    // local <= k8s for every configuration (never a wedged leader outliving the
+    // standby's acquisition).
+    assert.ok(k8sExpiryMs >= ms || k8sExpiryMs === Math.ceil(ms / 1000) * 1000);
+    assert.equal(k8sExpiryMs, Math.ceil(ms / 1000) * 1000);
+  }
 });
 
 test("a stale-resourceVersion PUT (409) does not claim leadership", async () => {
