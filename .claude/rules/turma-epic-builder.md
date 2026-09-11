@@ -24,6 +24,13 @@ builder session + its agent-side tracker writes are XERK-723 (C); the operator U
   ticket and has no issue key.
 - **It MUST persist.** A builder queued when the hub restarts would otherwise lose its idea; the
   record carries the idea so the driver re-dispatches it after a reboot.
+- **Externalized to the shared store under HA (XERK-769)** via `registerExternalStore`, exactly like
+  `epicRuns` — visible across replicas, surviving a pod restart, seeded up from the local file on a
+  cutover. `epicBuildersCoerce` runs the SAME `sanitizeEpicBuilderRecord` per-record whitelist; that
+  sanitizer's field order matches the RUNTIME insertion order (base → dispatch's host/dispatchedAt →
+  advance's epicKey/error) so a live record is a coerce FIXED-POINT and the own-write watch echo dedups
+  under HA. `persistEpicBuilders()` (via `publishEpicBuilders`) replaces `scheduleEpicBuildersSave`.
+  Mechanics: `.claude/rules/turma-ha-store.md` (wave-3 pattern).
 - **Record**: `{id, siteKey, title, idea, state, startedAt, updatedAt}` + optional
   `repo, targetHost, host, epicKey, dispatchedAt, error`. `state ∈ {queued, researching, creating,
   done, failed}` (`EPIC_BUILDER_STATES`). `queued` covers both "waiting for a host" and "dispatched,

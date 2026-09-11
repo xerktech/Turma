@@ -18367,7 +18367,9 @@ test("the state.json restore coerces too, not just the ingest path", () => {
   // Anchored on the section header rather than a statement, so rewording the
   // parse doesn't silently slice nothing and pass this whole block vacuously.
   const loStart = src.indexOf("---- persistence");
-  const loEnd = src.indexOf("first boot or no volume");
+  // End on the state-restore loader's OWN catch comment (XERK-769 externalized the
+  // epic-run/-builder loaders, whose comment this once borrowed as the boundary).
+  const loEnd = src.indexOf("first boot / no volume mounted");
   assert.ok(loStart > -1 && loEnd > loStart, "the loader block must be locatable");
   const loader = src.slice(loStart, loEnd);
   // Pins the `"restore"` source too (XERK-429): the restore re-coerces PERSISTED
@@ -18590,7 +18592,9 @@ test("XERK-297: dropNonObjectRecords removes non-object records, in every positi
   // walk that would crash on a non-object.
   const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const loStart = src.indexOf("---- persistence");
-  const loEnd = src.indexOf("first boot or no volume");
+  // End on the state-restore loader's OWN catch comment (XERK-769 externalized the
+  // epic-run/-builder loaders, whose comment this once borrowed as the boundary).
+  const loEnd = src.indexOf("first boot / no volume mounted");
   const loader = src.slice(loStart, loEnd);
   assert.ok(/dropNonObjectRecords\(agents\)/.test(loader),
     "the restore must drop non-object records before serializing them");

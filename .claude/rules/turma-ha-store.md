@@ -62,6 +62,10 @@ This file is the operative rules for the two modules that landed it.
 
 XERK-757 moved the 13 low-churn operator/org policy stores (`devices` + the ticket
 pins, org opt-ins, triage policy/actions, org colors, repo tiers) onto the adapter.
+**XERK-769 added `epicRuns` + `epicBuilders`** the same way (their bespoke
+`scheduleXSave`/`readFileSync` loaders replaced by `registerExternalStore` + a
+per-record coerce over `sanitizeEpicRunRecord`/`sanitizeEpicBuilderRecord`) — the
+pre-HA gap where epic state lived per-pod on an emptyDir and vanished on restart.
 The pattern every wave-3 store-externalization follows — **this file's `paths:` do
 NOT load on `server.js`, so re-read it here before touching that wiring**:
 
