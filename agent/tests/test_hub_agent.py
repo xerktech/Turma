@@ -10153,14 +10153,31 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             sm._write_peers_file([{"id": "a", "rcName": "n", "repo": "r",
                                    "status": "running"}])  # must not raise
 
+    def test_peers_file_writes_non_ascii_cells_as_utf8(self):
+        """A cell holds a peer's free-text summary/task, which can carry any
+        char. The file is written UTF-8 explicitly: the platform default
+        (cp1252 on Windows) raised UnicodeEncodeError on e.g. "⋮" and, since
+        the except only caught OSError, crashed the whole manager on the beat
+        loop (the Windows session-restart loop)."""
+        sm = self.make_manager()
+        sm._write_peers_file([  # must not raise
+            {"id": "aaaaa", "rcName": "nas-Turma-XERK-1", "repo": "Turma",
+             "status": "running", "summary": "menu ⋮ and é over‑line"},
+        ])
+        raw = open(ha.PEERS_FILE, "rb").read()
+        self.assertIn("⋮".encode("utf-8"), raw)
+        row = [r for r in open(ha.PEERS_FILE, encoding="utf-8").read().splitlines()
+               if not r.startswith("#")][0]
+        self.assertEqual(row.split("\t")[5], "menu ⋮ and é over‑line")
+
     def test_peers_file_write_survives_a_non_cp1252_char(self):
-        """A session name can carry any char (the vertical-ellipsis menu glyph
-        has been seen on a real host). The write MUST specify UTF-8 and never
-        fall back to the Windows locale codec (cp1252), whose encode raises
-        UnicodeEncodeError on that glyph -- and this runs on the beat loop
-        (build_payload), so that exception crash-loops the whole agent. Simulate
-        the Windows default by forcing an encoding-less open() to cp1252 and
-        prove the row still lands as UTF-8."""
+        """Complements the test above by proving the explicit encoding="utf-8"
+        is load-bearing INDEPENDENT of the process default -- which matters
+        because the Windows launcher now defaults PYTHONUTF8=1 but lets an
+        operator pin it off (PYTHONUTF8=0), leaving open() back on cp1252.
+        Simulate that by forcing an encoding-less open() to cp1252 and prove
+        the row still lands; a cp1252 write would raise and (now the guard
+        catches every write error) silently drop the row."""
         sm = self.make_manager()
         real_open = open
 
@@ -10173,8 +10190,6 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
                 {"id": "aaaaa", "rcName": "nas-Turma-XERK-1", "repo": "Turma",
                  "status": "running", "summary": "menu ⋮ glyph"}])
         body = real_open(ha.PEERS_FILE, encoding="utf-8").read()
-        # Present == the write used UTF-8; a cp1252 write would have raised and
-        # dropped the row (silently, now the guard catches every write error).
         self.assertIn("menu ⋮ glyph", body)
 
     def test_migrated_ticket_session_keeps_its_ticket_name(self):

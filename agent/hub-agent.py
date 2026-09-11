@@ -15962,18 +15962,15 @@ class SessionManager:
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = PEERS_FILE + ".tmp"
-            # encoding="utf-8" is load-bearing, not tidiness: a session name can
-            # carry any char (the ⋮ menu glyph has been seen), and open()'s
-            # default is the LOCALE codec — cp1252 on Windows — which raises
-            # UnicodeEncodeError on the first non-latin char. This runs on the
-            # beat loop (build_payload), so that exception crash-loops the whole
-            # host. The broad except keeps the docstring's "must never cost the
-            # heartbeat" promise for ANY write failure, per agent.md's
-            # beat-loop-never-raises rule.
-            with open(tmp, "w", encoding="utf-8") as f:
+            # UTF-8 explicitly, newline="" for byte-identical output on every OS:
+            # a cell can hold any char (a peer's summary/task), and the platform
+            # default (cp1252 on Windows) raised UnicodeEncodeError on e.g. "⋮".
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
                 f.write("\n".join(rows) + "\n")
             os.replace(tmp, PEERS_FILE)
         except Exception as e:
+            # Best-effort: this runs on the beat loop (agent.md — no call here may
+            # raise), and OSError alone let a UnicodeEncodeError crash the manager.
             log(f"peers file write failed: {e}")
 
     # --- ticket attribution ledger -----------------------------------------
