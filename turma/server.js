@@ -55,11 +55,12 @@ const { resolveHaConfig } = require("./ha-config.js");
 const { createLiveStore } = require("./store.js");
 
 // The HA LiveStore is created ONCE at module load so every state-externalization
-// call site (XERK-751 wave-3) shares one backend — the OIDC PKCE/session/handoff
-// side-stores (XERK-760), the migration record/spool mirror (XERK-761), and the
-// SSE fan-out bus (XERK-762) all wire onto THIS binding (the last two in the
-// production boot branch below). Creating it here — before the TURMA_TEST split —
-// is what lets the OIDC helpers reach it on both the test and production paths.
+// call site (XERK-751 wave-3) shares one backend — the fleet registry + per-host
+// command queues (XERK-756, below), the OIDC PKCE/session/handoff side-stores
+// (XERK-760), the migration record/spool mirror (XERK-761), and the SSE fan-out
+// bus (XERK-762) all wire onto THIS binding (the last two in the production boot
+// branch below). Creating it here — before the TURMA_TEST split — is what lets the
+// OIDC helpers reach it on both the test and production paths.
 // HA off (the default) -> the FileLiveStore: module-level maps for hot state,
 // byte-identical to the pre-HA single-process path and RAM-only for the keys this
 // hub does not mark durable (the OIDC side-stores are ephemeral, TTL'd, never
@@ -70,12 +71,37 @@ const { createLiveStore } = require("./store.js");
 // config is coerced to the file backend here so `createLiveStore` never parses a
 // missing/broken shared URL before that branch can name the error and exit(2).
 const haConfig = resolveHaConfig(process.env);
-const liveStore = createLiveStore(haConfig.fatal.length ? { ha: false } : haConfig, {
+// `let`, not `const` (XERK-756): the registry-externalization tests inject a
+// FileLiveStore standing in as the shared store via __setLiveStore.
+let liveStore = createLiveStore(haConfig.fatal.length ? { ha: false } : haConfig, {
   // FileLiveStore never emits health (no connection to lose), so this is silent
   // on the non-HA path and in tests; on HA it traces the shared store coming and
   // going. Never fatal at runtime — a blip reconnects rather than downing the hub.
   onHealth: (h) => console.log(`HA store health: ${h}`),
 });
+
+// ---- HA fleet registry externalization (XERK-756, epic XERK-751) ------------
+// The `agents` fleet registry AND the per-host command queues (which ride each
+// host record's `commands`) move OFF the RWO `state.json` volume into the shared
+// LiveStore so ANY replica can ingest ANY agent's beat and serve the WHOLE fleet
+// from /api/agents — today each replica would hold only the hosts that beat to it.
+// `agents` stays the SYNCHRONOUS in-memory read model in both modes (the ~13k-line
+// request path is untouched); HA adds, on top of it: a per-HOST write-through
+// (`markAgentDirty`/`markAgentRemoved` -> `flushAgentsToStore`), REPLACING the
+// last-writer-wins full-map state.json serialize so concurrent replicas write
+// disjoint keys and never clobber; boot HYDRATION (`hydrateAgentsFromStore`, a
+// `scan("agent:")`) + a WATCH that keeps this replica's `agents` hot with records
+// other replicas wrote. `HA_ON` gates every seam; a test flips it (and injects a
+// store) via __setLiveStore. HA off -> byte-identical to today (state.json). A
+// FATAL config coerces HA_ON off to match the file backend built above (the boot
+// branch still names the error and exits).
+let HA_ON = !haConfig.fatal.length && haConfig.ha;
+// One store key per host record; the whole fleet is the `agent:` prefix.
+const AGENT_STORE_PREFIX = "agent:";
+// How long a run of registry mutations coalesces before the per-host write-back.
+// A beat's ~8s cadence and the 75s offline window make ~1s propagation to a warm
+// standby ample; it is not on the request path (writes are fire-and-forget).
+const HA_STORE_DEBOUNCE_MS = positiveEnv("HA_STORE_DEBOUNCE_MS", 1000);
 
 const PORT = positiveEnv("PORT", 8300);
 
@@ -1409,6 +1435,7 @@ function makeRegistryRoom(addBytes, addSlots) {
     deviceCollisionWarned.delete(key);
     invalidateAgentsCache();
     sseBroadcast("removed", { key });
+    markAgentRemoved(key); // XERK-756: drop it from the shared store too (HA)
   }
   // An eviction has to reach state.json, or a restart brings the record back.
   if (evictable.length !== before) scheduleSave();
@@ -1440,6 +1467,15 @@ function trimRestoredAgents() {
     dropped.push(key);
     delete agents[key];
     recordBytes.delete(key);
+    // XERK-756: DELIBERATELY not markAgentRemoved. This trim is a LOCAL capacity
+    // decision — this replica cannot hold the whole durable fleet under its OWN
+    // AGENTS_MAX/byte budget (a per-process bound, kept local like the caches) —
+    // NOT a genuine removal. Deleting the over-budget (oldest-lastSeen) keys from
+    // the SHARED store would drop offline hosts' records cluster-wide, the exact
+    // durable state externalizing the registry exists to preserve. It drops them
+    // only from THIS replica's map; the store keeps them for a replica with room
+    // and for when the host returns. (Genuine removals — the DELETE route, the
+    // 7-day prune, registry-full eviction — do del the store key.)
   });
   if (dropped.length) {
     console.warn(
@@ -1471,7 +1507,12 @@ const liveClients = {};
 
 // ---- persistence (best-effort: survives hub restarts so the UI isn't blank
 // for the first heartbeat interval; losing it is harmless) -------------------
-try {
+// XERK-756: in HA the registry lives in the shared store, so the boot branch
+// hydrates `agents` from it (hydrateAgentsFromStore) and this state.json restore
+// is SKIPPED — state.json is the RWO-volume copy this epic leaves behind. The
+// `if (!HA_ON)` guards the whole try/catch as its single-statement body; the
+// single-process default runs it exactly as before (byte-identical).
+if (!HA_ON) try {
   // The trim below cannot protect a restore it never reaches: `readFileSync` +
   // `JSON.parse` materialize the WHOLE file first, so a 264 MiB state.json left
   // by a flood kills a 256 MiB hub at init — before a single log line, on every
@@ -1600,8 +1641,95 @@ function serializeAgentsForSave() {
   }
 }
 
+// ---- HA per-host registry write-through (XERK-756) --------------------------
+// The set of host keys whose local record CHANGED since the last flush, and the
+// set REMOVED. A record learned from another replica via the watch is NEVER
+// added here (it is applied by applyRemoteAgent, which does not mark dirty), so
+// this replica only ever WRITES the records it OWNS — that is what makes the
+// per-host writes disjoint and non-clobbering across replicas.
+const storeDirty = new Set();
+const storeRemoved = new Set();
+let storeFlushTimer = null;
+// The JSON we last WROTE for each host, so the watch can drop our OWN echo (the
+// store's change channel delivers every mutation back to us too). Without this a
+// self-echo would re-apply the cache-STRIPPED copy over the live full record and
+// wipe this replica's on-demand caches for the host.
+const lastStoreWritten = new Map();
+
+// A store write must never throw on the hot path or in a timer (XERK-235); log
+// and move on. The record re-writes on the host's next beat, and a warm standby
+// re-reads on promotion, so a dropped write self-heals.
+function storeWriteFailed(e) {
+  console.error(`HA registry store write failed: ${(e && e.message) || e}`);
+}
+
+// The bytes we persist for one host: the record MINUS the on-demand caches, the
+// exact subset serializeAgentsForSave writes to state.json (AGENT_CACHE_KEYS are
+// TTL'd, worthless across a restart, and the one part not bounded by
+// AGENT_RECORD_MAX — XERK-292). `commands` IS kept, so the per-host command queue
+// rides the record into the store with no separate list to keep in sync.
+function agentStoreRecord(key) {
+  const a = agents[key];
+  if (!a) return null;
+  try {
+    return JSON.parse(
+      JSON.stringify(a, (k, v) =>
+        AGENT_CACHE_KEYS.includes(k) && v && typeof v === "object" ? undefined : v)
+    );
+  } catch {
+    return null; // unserializable — cannot be persisted anyway
+  }
+}
+
+function markAgentDirty(key) {
+  if (!HA_ON || !liveStore) return;
+  storeRemoved.delete(key);
+  storeDirty.add(key);
+  scheduleStoreFlush();
+}
+
+function markAgentRemoved(key) {
+  if (!HA_ON || !liveStore) return;
+  storeDirty.delete(key);
+  storeRemoved.add(key);
+  scheduleStoreFlush();
+}
+
+function scheduleStoreFlush() {
+  if (storeFlushTimer) return;
+  storeFlushTimer = setTimeout(() => {
+    storeFlushTimer = null;
+    flushAgentsToStore();
+  }, HA_STORE_DEBOUNCE_MS);
+  storeFlushTimer.unref?.();
+}
+
+// Push the pending per-host changes to the shared store: one `set` per changed
+// record, one `del` per removed key. Best-effort and fire-and-forget — the
+// promises are caught, never awaited on any request path.
+function flushAgentsToStore() {
+  if (!HA_ON || !liveStore) { storeDirty.clear(); storeRemoved.clear(); return; }
+  for (const key of storeRemoved) {
+    liveStore.del(AGENT_STORE_PREFIX + key).catch(storeWriteFailed);
+    lastStoreWritten.delete(key);
+  }
+  storeRemoved.clear();
+  for (const key of storeDirty) {
+    const rec = agentStoreRecord(key);
+    if (rec === null) continue; // gone or unserializable — skip; next beat retries
+    lastStoreWritten.set(key, JSON.stringify(rec)); // remember it to drop the echo
+    liveStore.set(AGENT_STORE_PREFIX + key, rec).catch(storeWriteFailed);
+  }
+  storeDirty.clear();
+}
+
 let saveTimer = null;
 function scheduleSave() {
+  // XERK-756: in HA the registry is persisted per-host to the shared store via
+  // markAgentDirty (publishAgent) + markAgentRemoved, never to state.json on the
+  // RWO volume. Every scheduleSave caller still runs; this is the one place the
+  // state.json write is turned off, so nothing else in the request path changes.
+  if (HA_ON) return;
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
@@ -1644,6 +1772,13 @@ function scheduleSave() {
 // atomic like the async path's, so a half-written file can never be left for the
 // next boot's restore. Cancels the pending debounce so it can't fire post-exit.
 function flushStateNow() {
+  // XERK-756: HA persists to the shared store, not state.json — flush any pending
+  // per-host writes so a graceful shutdown does not drop the last debounce window.
+  if (HA_ON) {
+    if (storeFlushTimer) { clearTimeout(storeFlushTimer); storeFlushTimer = null; }
+    flushAgentsToStore();
+    return;
+  }
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   const blob = serializeAgentsForSave();
   if (blob === null) return; // unserializable — same give-up as the debounced path
@@ -1660,7 +1795,10 @@ function flushStateNow() {
 function prune() {
   const now = Date.now();
   for (const [key, a] of Object.entries(agents)) {
-    if (now - (a.lastSeen || 0) > PRUNE_AFTER_MS) delete agents[key];
+    if (now - (a.lastSeen || 0) > PRUNE_AFTER_MS) {
+      delete agents[key];
+      markAgentRemoved(key); // XERK-756: a pruned host leaves the shared store too (HA)
+    }
   }
 }
 
@@ -3803,7 +3941,117 @@ function makeSseBus(store, replicaId, deliverLocal) {
 function publishAgent(key) {
   invalidateAgentsCache();
   const a = agents[key];
-  if (a) sseBroadcast("agent", serializeAgent(key, a, Date.now()));
+  if (a) {
+    sseBroadcast("agent", serializeAgent(key, a, Date.now()));
+    // XERK-756: a record this replica authored (a beat, a queued command, a
+    // refusal stamp, an offline mark) — mark it for the per-host write-through so
+    // the whole fleet (and a warm standby) sees it. No-op with HA off. Only here,
+    // never on the watch-apply path (applyRemoteAgent), so a record learned from
+    // another replica is not echoed back and re-written under its owner.
+    markAgentDirty(key);
+  }
+}
+
+// ---- HA registry watch: apply a record another replica wrote (XERK-756) -----
+// The store's change channel delivers `{type, key, value}` for every mutation on
+// any replica; installRegistryWatch filters to the `agent:` prefix and calls
+// these. They mirror the record into THIS replica's `agents` MAP (for /api/agents
+// and this replica's future beats/drains) — WITHOUT marking it dirty, so it is
+// never written back (its owner already persisted it). This is what keeps every
+// replica's fleet view whole even though a host only beats to one replica.
+//
+// They deliberately do NOT sseBroadcast: the client PUSH is the XERK-762 SSE bus's
+// job — the owning replica's publishAgent already published the "agent" frame to
+// the shared bus, which every replica re-emits to its own clients. Broadcasting
+// here too would double-deliver each frame and amplify bus publishes O(replicas);
+// the registry watch is the MAP/state channel, the SSE bus is the client channel.
+// A record whose live frame the bus dropped in a blip self-heals on the host's
+// next beat (XERK-762's own resilience model), and /api/agents is already correct
+// off the map here in the meantime.
+function applyRemoteAgent(key, value) {
+  if (!value || typeof value !== "object") return;
+  // Caches are per-process (kept LOCAL, XERK-756) — a store record never carries
+  // them, so preserve whatever this replica already holds for the host rather
+  // than let a remote update (or a self-echo) blank them.
+  const existing = agents[key];
+  if (existing) {
+    for (const ck of AGENT_CACHE_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(existing, ck)) value[ck] = existing[ck];
+    }
+  }
+  agents[key] = value;
+  try { recordBytes.set(key, agentRecordSize(value)); } catch { /* best effort */ }
+  invalidateAgentsCache();
+}
+
+function applyRemoteRemoval(key) {
+  if (!Object.prototype.hasOwnProperty.call(agents, key)) return;
+  delete agents[key];
+  recordBytes.delete(key);
+  recordSizeWarned.delete(key);
+  shareWarned.delete(key);
+  invalidateAgentsCache();
+}
+
+// Subscribe to the shared store's change channel so records other replicas write
+// (or delete) land in this replica's `agents` map. Idempotent set/del; a
+// self-echo of our own write just re-sets the identical value (harmless).
+function installRegistryWatch() {
+  if (!HA_ON || !liveStore || typeof liveStore.watch !== "function") return;
+  liveStore.watch(AGENT_STORE_PREFIX, (ev) => {
+    if (!ev || typeof ev.key !== "string") return;
+    const key = ev.key.slice(AGENT_STORE_PREFIX.length);
+    if (!key) return;
+    if (ev.type === "del") { lastStoreWritten.delete(key); applyRemoteRemoval(key); return; }
+    // Drop our OWN echo: if the event value is byte-identical to what we just
+    // wrote for this key, it is the store reflecting our own set back — applying
+    // it would re-install the cache-stripped copy and churn an SSE frame.
+    try {
+      if (lastStoreWritten.get(key) === JSON.stringify(ev.value)) return;
+    } catch { /* fall through and apply */ }
+    applyRemoteAgent(key, ev.value);
+  });
+}
+
+// Boot-time hydration: read the whole fleet from the shared store into `agents`,
+// then run the SAME restore coercions the state.json path runs (normalize on
+// load, stamp restored commands delivered, hold to the registry budget). A key a
+// watch event already populated during the async scan is left alone (the watched
+// value is fresher). Best-effort — never fatal, so a store that is down at boot
+// serves an empty fleet and fills in from beats + the watch, exactly as a missing
+// state.json does today.
+async function hydrateAgentsFromStore() {
+  if (!HA_ON || !liveStore || typeof liveStore.scan !== "function") return;
+  let rows;
+  try {
+    if (liveStore.ready) await liveStore.ready();
+    rows = await liveStore.scan(AGENT_STORE_PREFIX);
+  } catch (e) {
+    console.error(`HA registry hydrate failed: ${(e && e.message) || e}`);
+    return;
+  }
+  let loaded = 0;
+  for (const { key, value } of rows) {
+    const hk = key.slice(AGENT_STORE_PREFIX.length);
+    if (!hk) continue;
+    if (Object.prototype.hasOwnProperty.call(agents, hk)) continue; // watch won
+    if (!value || typeof value !== "object") continue;
+    agents[hk] = value;
+    loaded += 1;
+  }
+  // The same coercion/trim discipline the state.json restore uses (XERK-259/272/
+  // 303): drop unusable/non-object records, re-normalize on load, stamp restored
+  // commands delivered, then hold the restored set to the registry budget.
+  for (const k of dropUnusableHostKeys(agents)) {
+    console.warn(`dropping restored agent under unusable device name ${hostKeyLabel(k)}`);
+  }
+  for (const k of dropNonObjectRecords(agents)) {
+    console.warn(`dropping restored agent with a non-object record under ${hostKeyLabel(k)}`);
+  }
+  for (const a of Object.values(agents)) normalizeRecord(a, "restore");
+  sanitizeRestoredCommands(agents);
+  trimRestoredAgents();
+  console.log(`hydrated ${loaded} agent record(s) from the HA store`);
 }
 
 // Append a command to a host's queue with a fresh, stable cmdId. The heartbeat
@@ -15081,6 +15329,7 @@ const server = http.createServer(async (req, res) => {
       const purged = url.searchParams.get("usage") === "purge"
         ? usageLedger.forget(key) : false;
       scheduleSave();
+      markAgentRemoved(key); // XERK-756: remove the host record from the shared store (HA)
       invalidateAgentsCache();
       sseBroadcast("removed", { key });
       return json(res, 200, { ok: true, usagePurged: purged });
@@ -16547,6 +16796,17 @@ if (process.env.TURMA_TEST) {
     invalidateAgentsCache,
     serializeAgentsForSave,
     flushStateNow, // graceful-shutdown synchronous state flush (XERK-552)
+    // XERK-756: the HA fleet-registry externalization. Exported so tests can
+    // inject a FileLiveStore as the shared store (a real Valkey can't run in CI),
+    // drive the per-host write-through and hydration, and pin the non-HA path off.
+    __setLiveStore(store, on) { liveStore = store; HA_ON = !!on; },
+    __getHaOn() { return HA_ON; },
+    AGENT_STORE_PREFIX,
+    publishAgent,
+    markAgentDirty, markAgentRemoved,
+    flushAgentsToStore, hydrateAgentsFromStore,
+    installRegistryWatch, applyRemoteAgent, applyRemoteRemoval,
+    agentStoreRecord, queueCommand,
     // The usage-coercion warning is rate-limited to one line a minute across the
     // WHOLE fleet, on module state. Exported so a test can hold BOTH halves of
     // the rule — that a deliberate `null` stays silent AND that a wrong-typed
@@ -17056,14 +17316,24 @@ if (process.env.TURMA_TEST) {
   // `liveStore` was already SELECTED and constructed at module load (up top, so
   // the test and production paths share one store and the OIDC side-stores —
   // XERK-760 — reach it). The wave-3 consumers below wire onto that same binding.
+  // XERK-756: externalize the fleet registry + per-host command queues. Install
+  // the watch FIRST (so no cross-replica change is missed while the async scan
+  // runs), then hydrate this replica's `agents` from the store. Best-effort: a
+  // store down at boot serves an empty fleet and fills in from beats + the watch,
+  // exactly as a missing state.json does — never fatal.
+  if (HA_ON) {
+    installRegistryWatch();
+    hydrateAgentsFromStore().catch((e) =>
+      console.error(`HA registry hydrate failed: ${(e && e.message) || e}`));
+  }
   // XERK-761 (wave-3): wire the migration record/spool sharing onto the store.
   // It is the SHARED backend only when HA is on; with HA off this is the local
   // in-memory store, the flag stays false, and nothing about migrations changes.
   // In HA, hydrate the Map from the store (this covers a restart; the `leader`
   // child calls hydrateMigrations again on promotion) and run the record-aware
   // spool sweep the single-process boot sweep deferred to above.
-  setMigrationStore(liveStore, haConfig.ha);
-  if (haConfig.ha) {
+  setMigrationStore(liveStore, HA_ON);
+  if (HA_ON) {
     hydrateMigrations().catch((e) =>
       console.error(`migration hydrate failed: ${e && e.message}`));
     sweepMigrationSpoolShared().catch((e) =>
@@ -17076,7 +17346,7 @@ if (process.env.TURMA_TEST) {
   // finishes connecting is safe — SharedLiveStore re-issues the subscription on
   // connect and a publish while down is caught. Non-HA leaves `sseBus` null, so
   // `sseBroadcast` stays a plain local iteration, unchanged.
-  if (haConfig.ha) {
+  if (HA_ON) {
     sseBus = makeSseBus(liveStore, SSE_REPLICA_ID, sseDeliverLocal);
     console.log(`SSE fan-out: shared bus (replica ${SSE_REPLICA_ID})`);
   }
