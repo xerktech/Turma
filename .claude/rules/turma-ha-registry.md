@@ -45,6 +45,12 @@ for the store contract this plugs into.
   from another replica must not be echoed back and re-written under its owner. This split (own = dirty,
   remote = apply-only) is what keeps per-host writes disjoint; do not route the watch through
   `publishAgent`.
+- **The watch handlers update the MAP only — they do NOT `sseBroadcast`.** The client PUSH is the
+  XERK-762 SSE shared bus's job (the owning replica's `publishAgent` published the `agent` frame to the
+  bus, which every replica re-emits to its own clients). Broadcasting in the watch handler too would
+  double-deliver each frame and amplify bus publishes O(replicas). The registry watch is the MAP/state
+  channel; the SSE bus is the client channel. Both are gated on `HA_ON` and wired together at boot, so
+  the bus is always present when the watch is. Do not re-add `sseBroadcast` to the watch handlers.
 - **The store record is the record MINUS `AGENT_CACHE_KEYS`** (`agentStoreRecord`, the same subset
   `serializeAgentsForSave` strips). The caches stay PER-PROCESS (the ticket's rule); `commands` is
   KEPT, so **the per-host command queue rides the record — there is no separate list key to sync.**
