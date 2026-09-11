@@ -184,6 +184,82 @@ test("XERK-758: repo-level spend max-merges independently of the host total", as
   await b.backend.close();
 });
 
+// A store that mimics SharedLiveStore's boot lifecycle: NOT ready until its socket
+// connects, and a `scan`/`get` issued while not-ready REJECTS ("store not
+// connected"), exactly as SharedLiveStore._sendOn does. This is what FileLiveStore
+// cannot reproduce (it is always "ready", synchronous) — the XERK-758 QA D1 gap.
+class LazyStore {
+  constructor() {
+    this._health = "connecting";
+    this.data = new Map();
+    this._healthCbs = new Set();
+    this._watchers = [];
+  }
+  get health() { return this._health; }
+  onHealth(cb) { this._healthCbs.add(cb); return () => this._healthCbs.delete(cb); }
+  becomeReady() { this._health = "ready"; for (const cb of [...this._healthCbs]) cb("ready"); }
+  _assertReady() { if (this._health !== "ready") throw new Error("store not connected (closed)"); }
+  async scan(prefix) {
+    this._assertReady();
+    const out = [];
+    for (const [k, v] of this.data) if (k.startsWith(prefix)) out.push({ key: k, value: structuredClone(v) });
+    return out;
+  }
+  async get(k) { this._assertReady(); return this.data.has(k) ? structuredClone(this.data.get(k)) : null; }
+  async set(k, v) { this._assertReady(); this.data.set(k, structuredClone(v)); this._fire("set", k, v); }
+  async setIfAbsent(k, v) { this._assertReady(); if (this.data.has(k)) return false; await this.set(k, v); return true; }
+  async compareAndSet(k, exp, next) {
+    this._assertReady();
+    const cur = this.data.has(k) ? this.data.get(k) : null;
+    if (JSON.stringify(cur) !== JSON.stringify(exp)) return false;
+    await this.set(k, next);
+    return true;
+  }
+  async del(k) { this._assertReady(); if (this.data.delete(k)) this._fire("del", k, null); }
+  watch(prefix, cb) {
+    const e = { prefix, cb };
+    this._watchers.push(e);
+    return () => { const i = this._watchers.indexOf(e); if (i >= 0) this._watchers.splice(i, 1); };
+  }
+  _fire(type, key, value) {
+    for (const w of this._watchers) if (key.startsWith(w.prefix)) w.cb({ type, key, value: type === "del" ? null : structuredClone(value) });
+  }
+}
+
+test("XERK-758 QA D1: boot scan runs on the READY edge, not synchronously in init", async () => {
+  const store = new LazyStore();
+  // A durable row a prior boot left in the store (e.g. a now-retired host).
+  store.data.set(KEY_PREFIX + "retired", structuredClone(entryWithDay(DAY, 777)));
+
+  const b = replica(store);
+  await b.backend.init(); // store is NOT ready yet — must NOT throw, must NOT scan
+  assert.equal(b.model.has("retired"), false, "init must not scan a not-ready store (it would reject)");
+
+  store.becomeReady(); // the socket connects -> health->ready edge fires the scan
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(
+    dayTokens(b.model.get("retired"), DAY), 777,
+    "the retired host's durable row loads once the store is ready — without this it vanishes from retiredUsage"
+  );
+  await b.backend.close();
+});
+
+test("XERK-758 QA D1: a reconnect (a second ready edge) re-scans and catches up", async () => {
+  const store = new LazyStore();
+  const b = replica(store);
+  await b.backend.init();
+  store.becomeReady();
+  await new Promise((r) => setTimeout(r, 5)); // first scan: empty
+
+  // A peer writes a row while this replica is "disconnected" (health flaps down/up).
+  store.data.set(KEY_PREFIX + "late", structuredClone(entryWithDay(DAY, 321)));
+  store._health = "reconnecting";
+  store.becomeReady(); // reconnect edge -> re-scan catches up the row written meanwhile
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(dayTokens(b.model.get("late"), DAY), 321, "a reconnect re-scan catches up rows written while disconnected");
+  await b.backend.close();
+});
+
 test("XERK-758: configure() moves the real ledger onto the shared store end-to-end", async () => {
   const store = new FileLiveStore();
   ledger._internals.reset();

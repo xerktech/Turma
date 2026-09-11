@@ -920,11 +920,14 @@ function flush(done) {
 
 /**
  * Select the persistence backend from the resolved HA config (server.js calls
- * this once at boot, awaited before the hub serves). With HA OFF this is a no-op —
- * the file backend loaded at require time stays, byte-identical. With HA ON it
- * discards the file-loaded model, swaps in the shared backend and rebuilds the
- * model from the store (so the first served beat is already whole). Never fatal —
- * a store down at boot yields an empty model that `watch` + beats refill.
+ * this once at boot, FIRE-AND-FORGET — it does not gate the listen). With HA OFF
+ * this is a no-op — the file backend loaded at require time stays, byte-identical.
+ * With HA ON it discards the file-loaded model and swaps in the shared backend.
+ * The shared backend does NOT block boot on the store connecting: it loads the
+ * history when the store's socket becomes READY (and re-loads on reconnect), so a
+ * store down at boot is never fatal — the serve path degrades to serving each live
+ * host's own raw report until the model loads, and retired-host rows appear as soon
+ * as the store is reachable (XERK-758 QA D1).
  */
 async function configure(liveStore, haConfig) {
   if (!haConfig || !haConfig.ha || !liveStore) return; // single-process default

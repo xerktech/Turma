@@ -69,6 +69,8 @@ class SharedLedgerBackend {
     this._timer = null;
     this._closed = false;
     this._unwatch = null;
+    this._offHealth = null;
+    this._scanning = false;
     // A per-key promise chain so two flushes never race the same host's CAS (a
     // second CAS reading the value the first is mid-writing would livelock the
     // retry). Serialises writes per host WITHIN this replica; cross-replica races
@@ -84,33 +86,70 @@ class SharedLedgerBackend {
     return storeKey.slice(KEY_PREFIX.length);
   }
 
-  // Boot: load every host row from the store into the in-memory model, then watch
-  // for peer writes. Awaited before the hub serves, so the first `/api/agents` is
-  // already whole (not an empty beat while the scan runs).
+  // Start watching for peer writes and load the existing history from the store.
+  //
+  // NEVER BLOCKS BOOT. A shared store is not connected within this synchronous
+  // call — its socket connects (+AUTH/+SELECT) asynchronously — so a scan issued
+  // here would REJECT ("store not connected") on every real boot (XERK-758 QA D1).
+  // Instead the scan runs when the store TRANSITIONS TO READY, which also covers a
+  // reconnect after an outage: without a re-scan, a RETIRED host's durable row —
+  // it never beats, so it never self-heals via `_persistHost` — would sit unread
+  // and vanish from `retiredUsage`, defeating XERK-338 (spend outlives the host).
+  // The immediate branch handles the FileLiveStore (always "ready", synchronous
+  // scan) and a shared store already connected on a reconnect path.
   async init() {
-    let rows = [];
-    try {
-      rows = await this.store.scan(KEY_PREFIX);
-    } catch (e) {
-      // A store down at boot must not crash the hub (availability) — start with an
-      // empty model and let `watch` + the next beats refill it as the store returns.
-      console.error(`usage ledger: shared-store scan failed at boot: ${(e && e.message) || e}`);
-      rows = [];
-    }
-    let kept = 0;
-    for (const { key, value } of rows) {
-      const entry = this.ops.coerce(value); // JSON -> coerced entry, or null
-      if (!entry) continue;
-      this.ops.setEntry(this.keyOf(key), entry);
-      kept += 1;
-    }
-    if (kept) console.log(`loaded usage history for ${kept} host(s) from the shared store`);
-    // Fold in peer writes. Best-effort (the store's watch is a cache-warming hint,
-    // not a correctness guarantee — this replica's own reads/writes are the floor).
+    // Watch FIRST so no peer write is missed between the scan and now.
     try {
       this._unwatch = this.store.watch(KEY_PREFIX, (ev) => this._onPeerEvent(ev));
     } catch (e) {
       console.error(`usage ledger: shared-store watch failed: ${(e && e.message) || e}`);
+    }
+    // Re-scan on every health->ready edge (boot connect AND reconnect). Idempotent:
+    // a scan max-merges rows INTO the live model and can only raise a figure.
+    if (typeof this.store.onHealth === "function") {
+      this._offHealth = this.store.onHealth((h) => {
+        if (h === "ready" && !this._closed) this._scan();
+      });
+    }
+    // Immediate scan when the store is already usable now.
+    if (this._storeReady()) await this._scan();
+  }
+
+  // The FileLiveStore has no `health` (undefined) and is always usable; a shared
+  // store exposes "ready" only once both connections have authenticated.
+  _storeReady() {
+    return this.store.health === undefined || this.store.health === "ready";
+  }
+
+  // Load every host row into the model by HIGH-WATER max-merge (never a replace),
+  // so a scan racing a concurrent write, or a re-scan after reconnect, can only
+  // raise a figure. Guarded against overlap; a scan failure is logged, not fatal.
+  async _scan() {
+    if (this._scanning) return;
+    this._scanning = true;
+    try {
+      let rows;
+      try {
+        rows = await this.store.scan(KEY_PREFIX);
+      } catch (e) {
+        // A store not yet up must not crash the hub (availability) — the next
+        // health->ready edge re-runs this.
+        console.error(`usage ledger: shared-store scan failed: ${(e && e.message) || e}`);
+        return;
+      }
+      let kept = 0;
+      for (const { key, value } of rows) {
+        const peer = this.ops.coerce(value); // JSON -> coerced entry, or null
+        if (!peer) continue;
+        const k = this.keyOf(key);
+        const local = this.ops.getEntry(k);
+        if (local) this.ops.mergeEntry(local, peer); // raise, never lower
+        else this.ops.setEntry(k, peer);
+        kept += 1;
+      }
+      if (kept) console.log(`loaded usage history for ${kept} host(s) from the shared store`);
+    } finally {
+      this._scanning = false;
     }
   }
 
@@ -192,13 +231,6 @@ class SharedLedgerBackend {
   async _persistHost(key) {
     const entry = this.ops.getEntry(key);
     if (!entry) return; // forgotten between the mark and the flush
-    // Bound this host's bytes exactly as the file backend does before a save — the
-    // store's whole-value ceiling is per-KEY here, so each host must fit its share.
-    try {
-      this.ops.enforceHostShare(key, entry);
-    } catch {
-      /* enforceHostShare never throws in practice; guard the timer-adjacent path */
-    }
     const skey = this.storeKey(key);
     for (let attempt = 0; attempt < CAS_RETRIES; attempt++) {
       let cur;
@@ -216,6 +248,14 @@ class SharedLedgerBackend {
       if (cur != null) {
         const stored = this.ops.coerce(cur);
         if (stored) this.ops.mergeEntry(entry, stored);
+      }
+      // Bound this host's bytes AFTER the merge (XERK-758 QA), so the value actually
+      // WRITTEN fits its per-key share. Enforcing BEFORE the merge let the re-added
+      // store days push the written row back over the share the trim just enforced.
+      try {
+        this.ops.enforceHostShare(key, entry);
+      } catch {
+        /* enforceHostShare never throws in practice; guard the timer-adjacent path */
       }
       let ok;
       try {
@@ -256,6 +296,14 @@ class SharedLedgerBackend {
         /* best effort */
       }
       this._unwatch = null;
+    }
+    if (this._offHealth) {
+      try {
+        this._offHealth();
+      } catch {
+        /* best effort */
+      }
+      this._offHealth = null;
     }
   }
 }

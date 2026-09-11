@@ -204,8 +204,15 @@ paths:
   single file to overflow), which is strictly more correct than the file backend's whole-file
   eviction; a per-key TTL/quota is the store's concern, tracked as future work if a real fleet needs it.
 - **`ingest` persistence is fire-and-forget** (model updated synchronously, durable write scheduled);
-  `configure` at boot is best-effort and NEVER fatal — a store down at boot yields an empty model that
-  `watch` + the next beats refill (availability, matching `SharedLiveStore`'s reconnect posture).
+  `configure` at boot is fire-and-forget too and NEVER fatal (it does not gate the listen).
+- **The boot scan runs on the store's health→READY edge, NOT synchronously in `init`** (XERK-758 QA
+  D1): a `SharedLiveStore` socket is not connected within `init`'s call stack, so a scan issued there
+  REJECTS ("store not connected") on every real boot — silently starting empty. A live host self-heals
+  on its next beat (`_persistHost` max-merges the store row into its live entry), but a RETIRED host
+  never beats, so without the ready-edge (re-)scan its durable row sits unread and vanishes from
+  `retiredUsage` — the XERK-338 failure. Scanning on every ready edge also catches up rows written by
+  other replicas while this one was disconnected; it is idempotent (max-merge, never lowers). The
+  `FileLiveStore` (tests) has no `health` and scans immediately, so the in-memory path is unchanged.
 - Tests: `usage-ledger-shared.test.js` drives the REAL `SharedLedgerBackend` against the in-memory
   `FileLiveStore` (no live Valkey in CI, same constraint as `store.test.js`): the max-merge
   no-lower-a-total property, higher-view-raises, boot scan, watch fold, forget propagation, repo-level
