@@ -155,8 +155,14 @@ test("XERK-764: sweepTunnelDirectory reclaims stale mirror entries, keeps fresh 
   // its ping-set within the TTL) is kept.
   hub.hostTunnelOwners.dead = { replica: "gone", at: now - TTL - 1 };
   hub.hostTunnelOwners.live = { replica: "here", at: now };
-  hub.sweepTunnelDirectory();
+  // Pin the EXACT boundary: an entry at exactly `now - TTL` reads offline
+  // (hostTunnelOwnerLive is a strict `< TTL`), so the sweep MUST reclaim it — this
+  // is what makes the `<=` cutoff, not `<`, the correct match to the freshness gate.
+  hub.hostTunnelOwners.edge = { replica: "boundary", at: now - TTL };
+  assert.equal(hub.hostTunnelOwnerLive("edge"), false, "at==cutoff reads offline");
+  hub.sweepTunnelDirectory(now); // inject `now` so the boundary is exact, not racy
   assert.equal("dead" in hub.hostTunnelOwners, false, "stale entry reclaimed");
+  assert.equal("edge" in hub.hostTunnelOwners, false, "at==cutoff entry reclaimed (matches the gate)");
   assert.equal(hub.hostTunnelOwners.live.replica, "here", "fresh entry kept");
 });
 

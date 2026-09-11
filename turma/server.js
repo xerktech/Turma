@@ -4200,8 +4200,14 @@ async function hydrateTunnelDirectory() {
 // ping-set arriving on the watch, so only genuinely-dead entries are removed. Runs
 // on a timer under HA; never throws (a plain map walk). (On the file backend the
 // TTL already fires a `del` watch that clears the entry, so this is a no-op there.)
-function sweepTunnelDirectory() {
-  const cutoff = Date.now() - HOST_REPLICA_TTL_MS;
+// `now` is injectable so a test can pin the EXACT freshness boundary (two
+// independent Date.now() reads would make an at==cutoff assertion flaky); the
+// timer and every production caller pass nothing and get Date.now(). The cutoff is
+// `< HOST_REPLICA_TTL_MS`'s complement, so the swept set is EXACTLY the set
+// `hostTunnelOwnerLive` reads as offline — the sweep never changes a read, only
+// frees memory.
+function sweepTunnelDirectory(now = Date.now()) {
+  const cutoff = now - HOST_REPLICA_TTL_MS;
   for (const host of Object.keys(hostTunnelOwners)) {
     const o = hostTunnelOwners[host];
     if (!o || o.at <= cutoff) delete hostTunnelOwners[host];
