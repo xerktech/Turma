@@ -15962,10 +15962,15 @@ class SessionManager:
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = PEERS_FILE + ".tmp"
-            with open(tmp, "w") as f:
+            # UTF-8 explicitly, newline="" for byte-identical output on every OS:
+            # a cell can hold any char (a peer's summary/task), and the platform
+            # default (cp1252 on Windows) raised UnicodeEncodeError on e.g. "⋮".
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
                 f.write("\n".join(rows) + "\n")
             os.replace(tmp, PEERS_FILE)
-        except OSError as e:
+        except Exception as e:
+            # Best-effort: this runs on the beat loop (agent.md — no call here may
+            # raise), and OSError alone let a UnicodeEncodeError crash the manager.
             log(f"peers file write failed: {e}")
 
     # --- ticket attribution ledger -----------------------------------------
