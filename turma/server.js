@@ -12360,6 +12360,17 @@ const DROP_LOG_EVERY_MS = 60 * 1000;
 let dropsSinceLog = 0;
 let dropLoggedAt = 0;
 
+// Readiness (XERK-753). Flipped true the instant a SIGTERM/SIGINT drain begins,
+// so `/readyz` reports NotReady while the graceful-shutdown handler still holds
+// the listener open — giving the k8s Service time to pull this pod from its
+// EndpointSlice BEFORE any socket is cut (the sockets are cut only after a short
+// propagation delay in `gracefulShutdown`). Module-scoped so the request handler
+// closure below sees it, since the handler is defined before the shutdown code.
+// `/healthz` stays a pure process-up LIVENESS check and never reads this — a
+// draining pod is still alive, and flipping liveness would make kubelet SIGKILL
+// it mid-drain.
+let hubDraining = false;
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const parts = url.pathname.split("/").filter(Boolean); // e.g. api/agents/<id>/sessions
@@ -12407,6 +12418,19 @@ const server = http.createServer(async (req, res) => {
     // healthcheck 401s and autoheal restart-loops the container.
     if (url.pathname === "/healthz") {
       return json(res, 200, { ok: true });
+    }
+
+    // Readiness probe, DISTINCT from /healthz liveness (XERK-753). k8s points a
+    // readinessProbe here; while draining (a rolling update's preStop/SIGTERM)
+    // this answers 503 NotReady so the Service removes the pod from its
+    // EndpointSlice before the drain cuts sockets, then browsers/agents reconnect
+    // to a surviving replica instead of racing a socket being torn down. Ready
+    // (200) whenever the process is up and not draining. Unauthenticated and
+    // leaks nothing, same rationale as /healthz.
+    if (url.pathname === "/readyz") {
+      return hubDraining
+        ? json(res, 503, { ready: false, draining: true })
+        : json(res, 200, { ready: true });
     }
 
     // Branded static assets (stylesheet, UI fonts, icon/favicon set, manifest):
@@ -16719,38 +16743,88 @@ if (process.env.TURMA_TEST) {
   // mount it. It is NOT high availability — a single replica still has a brief
   // reconnect gap — it is the floor that removes the state loss and the hang.
   // Rationale and the multi-replica options above it: docs/turma-ha-design.md.
+  //
+  // XERK-753 hardens it for RollingUpdate: the drain now runs in TWO phases so
+  // a readiness probe (`/readyz`) reports NotReady FIRST and the k8s Service
+  // pulls this pod from its EndpointSlice BEFORE any socket is cut, and the
+  // long-lived streams are closed with a RECONNECT HINT (SSE `retry:`, tunnel WS
+  // close-1001) so clients re-dial promptly to a surviving replica.
   const SHUTDOWN_DRAIN_MS = positiveEnv("SHUTDOWN_DRAIN_MS", 10 * 1000);
-  let draining = false;
+  // How long to keep serving with `/readyz` NotReady before cutting sockets, so
+  // the Service has removed this pod from its EndpointSlice by the time it does.
+  // Explicit `0` disables the wait — single-replica Recreate has no Service race
+  // to lose, so the wait is pure added gap there; it is the prerequisite value
+  // for RollingUpdate (XERK-751). Clamped so the flush phase always keeps a
+  // couple of seconds of the overall budget even if the delay is set high.
+  const rawReadyDelay = process.env.READYZ_DRAIN_DELAY_MS;
+  const READYZ_DRAIN_DELAY_MS =
+    rawReadyDelay !== undefined && rawReadyDelay.trim() === "0"
+      ? 0
+      : Math.min(positiveEnv("READYZ_DRAIN_DELAY_MS", 2 * 1000), Math.max(0, SHUTDOWN_DRAIN_MS - 2000));
+  // WebSocket CLOSE frame payload: status code 1001 "going away" (0x03E9), the
+  // reconnect hint the tunnel agent re-dials on.
+  const WS_GOING_AWAY = Buffer.from([0x03, 0xe9]);
   const gracefulShutdown = (signal) => {
-    if (draining) return; // a second signal must not race the first drain
-    draining = true;
+    if (hubDraining) return; // a second signal must not race the first drain
+    hubDraining = true; // `/readyz` now answers 503 NotReady (liveness unaffected)
     console.log(`${signal} received — draining before exit`);
-    // Stop accepting new connections; in-flight HTTP requests finish on their own.
-    try { server.close(); } catch {}
-    // End the long-lived streams ourselves — server.close() waits on open SSE
-    // responses and never tracks upgraded WebSockets, so neither ends without
-    // this. Browsers' EventSource and each agent's tunnel both reconnect on
-    // their own; ending now beats waiting out an idle timeout.
-    for (const res of sseClients) { try { res.end(); } catch {} }
-    for (const name of Object.keys(controlChannels)) {
-      try { controlChannels[name].socket.destroy(); } catch {}
-    }
-    for (const host of Object.keys(liveClients)) {
-      for (const sid of Object.keys(liveClients[host] || {})) {
-        for (const sock of liveClients[host][sid] || []) { try { sock.destroy(); } catch {} }
-      }
-    }
-    // Flush every durable store. state.json is synchronous (nothing else runs
-    // now); the archive SQLite handle is closed so its last writes land; the
-    // usage ledger's write is async, and its callback is what ends the process.
-    flushStateNow();
-    try { archive.closeDb(); } catch {}
-    const finish = () => { console.log("drain complete — exiting"); process.exit(0); };
+
+    // Force-exit backstop, armed from signal receipt over the WHOLE budget so
+    // the readiness delay + the flush together never overrun
+    // terminationGracePeriodSeconds.
     let done = false;
-    const once = () => { if (!done) { done = true; finish(); } };
-    try { usageLedger.flush(() => once()); } catch { once(); }
-    // Never overrun terminationGracePeriodSeconds — force out if a flush hangs.
-    setTimeout(() => { if (!done) { done = true; console.error("drain timed out — forcing exit"); process.exit(0); } }, SHUTDOWN_DRAIN_MS).unref();
+    const forceExit = setTimeout(() => {
+      if (!done) { done = true; console.error("drain timed out — forcing exit"); process.exit(0); }
+    }, SHUTDOWN_DRAIN_MS);
+    forceExit.unref();
+
+    // Phase 2 — cut the long-lived streams and flush. Deferred by the readiness
+    // delay so the Service drops this pod first; the listener stays OPEN until
+    // here so the readiness probe can still reach `/readyz` for a clean 503.
+    const cutAndFlush = () => {
+      // Stop accepting new connections; in-flight HTTP requests finish on their own.
+      try { server.close(); } catch {}
+      // End the long-lived streams ourselves — server.close() waits on open SSE
+      // responses and never tracks upgraded WebSockets, so neither ends without
+      // this. Each is closed with a RECONNECT HINT so the client re-dials at once.
+      for (const res of sseClients) {
+        // Reassert the reconnect backoff EventSource should use after we end the
+        // stream. It already got a `retry:` at open; restating it costs nothing
+        // and covers a client that never captured it. Kept at the same 3000ms as
+        // the /api/events open hint.
+        try { res.write("retry: 3000\n\n"); } catch {}
+        try { res.end(); } catch {}
+      }
+      for (const name of Object.keys(controlChannels)) {
+        // A WebSocket CLOSE frame (opcode 0x8) with code 1001 "going away" is the
+        // tunnel's reconnect hint: tunnel-agent.js's control socket fires 'close'
+        // and re-dials on its 1s backoff, and the hub re-arms live-tail watches on
+        // the new channel. socket.end(frame) writes the frame THEN half-closes, so
+        // the agent actually receives it — unlike a bare destroy() (a TCP reset
+        // that can drop the still-buffered frame).
+        try { controlChannels[name].socket.end(wsEncode(0x8, WS_GOING_AWAY)); } catch {}
+      }
+      for (const host of Object.keys(liveClients)) {
+        for (const sid of Object.keys(liveClients[host] || {})) {
+          for (const sock of liveClients[host][sid] || []) { try { sock.destroy(); } catch {} }
+        }
+      }
+      // Flush every durable store. state.json is synchronous (nothing else runs
+      // now); the archive SQLite handle is closed so its last writes land; the
+      // usage ledger's write is async, and its callback is what ends the process.
+      flushStateNow();
+      try { archive.closeDb(); } catch {}
+      const finish = () => { clearTimeout(forceExit); console.log("drain complete — exiting"); process.exit(0); };
+      const once = () => { if (!done) { done = true; finish(); } };
+      try { usageLedger.flush(() => once()); } catch { once(); }
+    };
+
+    if (READYZ_DRAIN_DELAY_MS > 0) {
+      console.log(`/readyz NotReady — holding ${READYZ_DRAIN_DELAY_MS}ms for endpoint drain before cutting sockets`);
+      setTimeout(cutAndFlush, READYZ_DRAIN_DELAY_MS).unref();
+    } else {
+      cutAndFlush();
+    }
   };
   process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
   process.on("SIGINT", () => gracefulShutdown("SIGINT"));
