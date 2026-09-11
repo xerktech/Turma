@@ -54,6 +54,29 @@ const usageLedger = require("./usage-ledger.js");
 const { resolveHaConfig } = require("./ha-config.js");
 const { createLiveStore } = require("./store.js");
 
+// The HA LiveStore is created ONCE at module load so every state-externalization
+// call site (XERK-751 wave-3) shares one backend — the OIDC PKCE/session/handoff
+// side-stores (XERK-760), the migration record/spool mirror (XERK-761), and the
+// SSE fan-out bus (XERK-762) all wire onto THIS binding (the last two in the
+// production boot branch below). Creating it here — before the TURMA_TEST split —
+// is what lets the OIDC helpers reach it on both the test and production paths.
+// HA off (the default) -> the FileLiveStore: module-level maps for hot state,
+// byte-identical to the pre-HA single-process path and RAM-only for the keys this
+// hub does not mark durable (the OIDC side-stores are ephemeral, TTL'd, never
+// persisted). HA on -> the Valkey client, shared across replicas so a login on
+// replica A and its IdP callback on replica B resolve the same `state`. The PRINT and
+// the fail-loud refusal on a bad HA config stay in the production boot branch
+// below (a `require` under TURMA_TEST must neither print nor exit); a FATAL
+// config is coerced to the file backend here so `createLiveStore` never parses a
+// missing/broken shared URL before that branch can name the error and exit(2).
+const haConfig = resolveHaConfig(process.env);
+const liveStore = createLiveStore(haConfig.fatal.length ? { ha: false } : haConfig, {
+  // FileLiveStore never emits health (no connection to lose), so this is silent
+  // on the non-HA path and in tests; on HA it traces the shared store coming and
+  // going. Never fatal at runtime — a blip reconnects rather than downing the hub.
+  onHealth: (h) => console.log(`HA store health: ${h}`),
+});
+
 const PORT = positiveEnv("PORT", 8300);
 
 // dsh (DeepSeek Harness runtime, XERK-460) fleet-wide KILL SWITCH. This is an
@@ -783,10 +806,11 @@ const OIDC_STATE_COOKIE = "hub_oidc_state";
 // `userAuthorized` gate with no new authorization decision.
 const OIDC_MOBILE_REDIRECT = (process.env.TURMA_OIDC_MOBILE_REDIRECT || "turma://oidc-callback").trim();
 // Pending mobile handoffs: code -> {token, challenge, at}. Single-use, short TTL
-// (the app exchanges immediately after the deep link fires). Bounded so a flood
-// of mobile logins can't grow it. In-memory like oidcTx — a login interrupted by
-// a restart just retries.
-const oidcHandoffs = new Map();
+// (the app exchanges immediately after the deep link fires). Held in the shared
+// LiveStore (XERK-760) under OIDC_HANDOFF_PREFIX so the callback on one replica
+// and the exchange on another resolve the same code; a login interrupted by a
+// restart just retries. Bounded so a flood of mobile logins can't grow it — see
+// oidcEnforceCap (the count cap is a single-process heap guard, file-backend only).
 const OIDC_HANDOFF_TTL_MS = 2 * 60 * 1000; // deep link -> exchange is seconds
 const OIDC_HANDOFF_MAX = 2000;
 // A mobile challenge is base64url(SHA-256(verifier)); bound its length so a
@@ -3265,6 +3289,143 @@ function migrationList() {
 function publishMigrations() {
   invalidateAgentsCache();
   sseBroadcast("migrations", migrationList());
+  // Mirror the live set to the shared store so any replica can resolve a
+  // migration by id after a leader failover (XERK-761). Every migration mutation
+  // funnels through here, so mirroring the whole (MIGRATIONS_MAX-bounded) set
+  // refreshes each record's TTL and misses no mutation site; retire is the one
+  // path that also has to REMOVE a record, so it forgets explicitly. No-op —
+  // and thus byte-identical single-process behaviour — when HA is off.
+  if (migrationStoreShared) {
+    for (const m of migrations.values()) mirrorMigration(m);
+  }
+}
+
+// ---- migration record + spool sharing across replicas (XERK-761) -----------
+// Session migration (XERK-101) assumed ONE hub: the in-memory `migrations` Map
+// plus the spool bundles under MIGRATE_SPOOL_DIR. Under the HA epic (XERK-751)
+// the hub runs as multiple replicas, and a single move's source-upload,
+// target-pull and advanceMigrations can land on DIFFERENT replicas across a
+// RollingUpdate leader failover — where the record would not exist (uniform 404)
+// and a booting replica's spool sweep would delete another replica's live bundle.
+//
+// The in-memory Map stays the LEADER's working copy: only the leader serves
+// traffic and runs advanceMigrations (Option 2, docs/turma-ha-design.md), so its
+// SYNCHRONOUS reads across the request path and the beat stay valid and are not
+// rewritten to async. On top of it, in HA each record is MIRRORED to the shared
+// LiveStore keyed `migration/<id>`, from which a newly-promoted leader HYDRATES
+// (the seam the `leader` child calls on promotion; also run at boot). The spool
+// sits on the SHARED volume under its deterministic per-id name, and the boot
+// sweep keys on record-in-store existence + a TTL so a booting replica never
+// deletes a bundle a live migration still owns. With HA off `migrationStoreShared`
+// is false, none of this runs, and the single-process path is unchanged.
+let migrationStore = null; // a LiveStore (store.js), or null (single-process/tests)
+let migrationStoreShared = false; // true ONLY when that store is the SHARED backend
+function setMigrationStore(store, shared) {
+  migrationStore = store || null;
+  migrationStoreShared = !!(store && shared);
+}
+const MIGRATION_KEY_PREFIX = "migration/";
+// The record's TTL in the shared store: comfortably past the whole in-flight
+// window (MIGRATE_TIMEOUT_MS), so an `exporting` move waiting on the source's
+// upload retry never expires under a live leader (which re-mirrors on each
+// mutation), while a CRASHED leader's records still self-clean rather than leak.
+// A settled record is unmirrored on retire well before this.
+const MIGRATE_RECORD_TTL_MS = MIGRATE_TIMEOUT_MS + 2 * 60 * 1000;
+// How stale an ORPHAN spool file must be before the multi-replica boot sweep
+// removes it — long enough that a bundle another replica is mid-writing, whose
+// record has not yet been mirrored, is never mistaken for garbage.
+const MIGRATE_SPOOL_ORPHAN_MS = positiveEnv("MIGRATE_SPOOL_ORPHAN_MS", 10 * 60 * 1000);
+// Resolved once at module load (resolveHaConfig is pure — no log, no exit), so
+// the single-process boot sweep can run synchronously as it always did while the
+// HA path defers to the record-aware sweep. The authoritative resolve + fatal
+// handling stays in the boot branch.
+const MIGRATE_HA_ON = resolveHaConfig(process.env).ha;
+
+// Mirror one record into the shared store. Best-effort: a failed mirror never
+// fails the mutation it followed — the Map is authoritative for this leader and
+// the next mutation re-mirrors. `uploading`/`refusal` are LEADER-LOCAL transient
+// flags reset in the mirrored copy, so a promoted leader neither blocks a fresh
+// upload nor inherits a half-applied refusal.
+function mirrorMigration(m) {
+  if (!migrationStoreShared || !m || !m.id) return;
+  const copy = { ...m, uploading: false, refusal: null };
+  Promise.resolve(
+    migrationStore.set(MIGRATION_KEY_PREFIX + m.id, copy, { ttlMs: MIGRATE_RECORD_TTL_MS })
+  ).catch(() => {});
+}
+// Remove a record from the shared store. Best-effort, no-op when HA is off.
+function forgetMigration(id) {
+  if (!migrationStoreShared || !id) return;
+  Promise.resolve(migrationStore.del(MIGRATION_KEY_PREFIX + id)).catch(() => {});
+}
+// Drop a record from the Map AND the shared store together — the single retire
+// path every eviction/cleanup goes through, so no forgotten record lingers in the
+// store to be re-hydrated after it settled.
+function retireMigration(id) {
+  migrations.delete(id);
+  forgetMigration(id);
+}
+// Rebuild the in-memory Map from the shared store — every record another replica
+// (or this one before a restart) left in flight. The seam a promoted leader calls
+// before it starts serving/advancing (the `leader` child, XERK-751); also run at
+// boot. Transient leader-local flags are reset; a record THIS leader already
+// holds is never overwritten (its copy is the live one). The mirrored `blobPath`
+// is always `migrationSpoolPath(id)` and MIGRATE_SPOOL_DIR is identical across
+// replicas on the shared volume, so a hydrated `importing` record's bundle path
+// resolves the same bytes the old leader wrote.
+async function hydrateMigrations() {
+  if (!migrationStoreShared) return;
+  let rows;
+  try {
+    rows = await migrationStore.scan(MIGRATION_KEY_PREFIX);
+  } catch {
+    return; // store unreachable — the leader child retries; nothing is lost
+  }
+  for (const { value } of rows) {
+    if (!value || typeof value !== "object" || typeof value.id !== "string") continue;
+    if (migrations.has(value.id)) continue;
+    migrations.set(value.id, { ...value, uploading: false, refusal: null });
+  }
+}
+// The multi-replica-safe boot spool sweep (XERK-761). On a shared spool volume a
+// booting replica must NOT delete a bundle that belongs to a migration still in
+// flight under another replica. It keeps any spool file whose migration RECORD
+// still exists in the shared store, and of the rest deletes only those older than
+// MIGRATE_SPOOL_ORPHAN_MS — long enough that a bundle mid-upload, whose record has
+// not yet been mirrored, is never mistaken for an orphan. Deletes ONLY names this
+// hub could have written (MIGRATE_SPOOL_RE), exactly like the single-process
+// sweep — MIGRATE_SPOOL_DIR is deployment config, so a slip pointing it at /data
+// must not delete state.json.
+async function sweepMigrationSpoolShared() {
+  let names;
+  try {
+    names = fs.readdirSync(MIGRATE_SPOOL_DIR);
+  } catch {
+    return; // no spool dir yet — nothing has been relayed on this volume
+  }
+  const now = Date.now();
+  for (const n of names) {
+    if (!MIGRATE_SPOOL_RE.test(n)) continue;
+    const id = n.slice(0, -4); // the 16-hex id (MIGRATE_SPOOL_RE guarantees `.bin`)
+    const full = path.join(MIGRATE_SPOOL_DIR, n);
+    let rec = null;
+    try {
+      rec = await migrationStore.get(MIGRATION_KEY_PREFIX + id);
+    } catch {
+      rec = null;
+    }
+    if (rec) continue; // a live migration still owns this bundle
+    // No record: an orphan — but only if it is old enough that it cannot be a
+    // bundle another replica is mid-writing whose record has not yet mirrored.
+    let old = true;
+    try {
+      old = now - fs.statSync(full).mtimeMs >= MIGRATE_SPOOL_ORPHAN_MS;
+    } catch {
+      old = true; // unstattable — treat as removable
+    }
+    if (!old) continue;
+    try { fs.unlinkSync(full); } catch {}
+  }
 }
 
 // ---- /api/agents payload cache + SSE fanout ---------------------------------
@@ -3560,14 +3721,80 @@ function safeAgentsCache() {
   return agentsCache;
 }
 
-// Push one Server-Sent Event to every open /api/events stream (best-effort; a
-// dead stream is dropped on its next failed write and by its "close" handler).
-function sseBroadcast(event, dataObj) {
+// ---- Cross-replica SSE fan-out over the shared bus (XERK-762) ---------------
+// SSE is per-process: `sseBroadcast` writes only to THIS process's `sseClients`.
+// With HA off that is the whole story (one process). With N active-active
+// replicas a mutation on replica A must ALSO reach a browser whose /api/events
+// stream is held by replica B, or that dashboard goes stale until it reconnects
+// and re-polls. So in HA mode every broadcast is additionally published to a
+// shared pub/sub channel; each replica subscribes and re-emits to its OWN local
+// clients.
+//
+// The originating replica delivers to its own clients directly (in
+// `sseBroadcast`) AND publishes — so local clients see the event with no bus
+// round-trip and even during a bus blip. Each frame carries this replica's
+// `SSE_REPLICA_ID`; a replica SKIPS a frame stamped with its own id, so an event
+// a replica both ORIGINATED and RECEIVED BACK off the bus is delivered once, not
+// twice. The re-emitted `(event, dataObj)` is byte-identical to what the
+// originator broadcast, so the client merge machinery (mergeSnapshot / sseClock /
+// patchedAt, XERK-444/545) converges a cross-replica patch exactly as it does a
+// local one — this ticket adds NO new event name or payload shape.
+//
+// Non-HA: `sseBus` stays null and `sseBroadcast` is a plain local iteration,
+// unchanged — the FileLiveStore's in-process pub/sub is deliberately NOT wired
+// here (a single process has no other replica to reach).
+const SSE_BUS_CHANNEL = "__turma_sse__";
+// Unique per process, so a replica recognizes (and skips) its own echo. A fresh
+// value each boot is correct: a restarted replica must RE-DELIVER, never skip,
+// frames a previous instance of itself once published.
+const SSE_REPLICA_ID = crypto.randomBytes(8).toString("hex");
+let sseBus = null; // { publish(event, dataObj) } in HA mode; null single-process.
+
+// Write one SSE frame to every open /api/events stream ON THIS PROCESS
+// (best-effort; a dead stream is dropped on its next failed write and by its
+// "close" handler). The LOCAL half — the whole story with HA off, and the
+// per-replica delivery step in HA (both the originator's own clients and, via
+// the bus subscription, another replica's events).
+function sseDeliverLocal(event, dataObj) {
   if (!sseClients.size) return;
   const frame = `event: ${event}\ndata: ${JSON.stringify(dataObj)}\n\n`;
   for (const res of sseClients) {
     try { res.write(frame); } catch { sseClients.delete(res); }
   }
+}
+
+// Broadcast one SSE event: deliver to this replica's clients now, and in HA mode
+// publish it to the shared bus so every OTHER replica re-emits it to its own
+// clients (XERK-762). Signature unchanged, so its ~40 call sites are untouched.
+function sseBroadcast(event, dataObj) {
+  sseDeliverLocal(event, dataObj);
+  if (sseBus) sseBus.publish(event, dataObj);
+}
+
+// Wire cross-replica SSE fan-out onto a LiveStore's pub/sub. Standalone + the
+// store injected so the origin-dedup + re-emit logic is exercisable without a
+// live Valkey socket (unit tests). `deliverLocal` is the same function the
+// originating replica uses, so a re-emitted frame is written identically.
+function makeSseBus(store, replicaId, deliverLocal) {
+  store.subscribe(SSE_BUS_CHANNEL, (msg) => {
+    // Skip our OWN echo — sseBroadcast already delivered it locally. A malformed
+    // or foreign-shaped message is ignored: the only publisher is a peer replica,
+    // but the bus is shared infrastructure, so never trust the shape.
+    if (!msg || typeof msg !== "object" || msg.origin === replicaId) return;
+    if (typeof msg.event !== "string") return;
+    deliverLocal(msg.event, msg.data);
+  });
+  return {
+    publish(event, dataObj) {
+      // Best-effort: a failed publish (a store blip) never fails the mutation it
+      // followed — local clients already got the frame, and the next per-host
+      // beat re-ships that host's FULL serialized record, so a cross-replica
+      // frame missed during a blip self-heals within a beat. Matches the store's
+      // own best-effort watch/announce posture.
+      Promise.resolve(store.publish(SSE_BUS_CHANNEL, { origin: replicaId, event, data: dataObj }))
+        .catch(() => {});
+    },
+  };
 }
 
 // A host's serialized state changed: drop the cached fleet payload and push the
@@ -3896,7 +4123,7 @@ function startMigration(srcHost, s, targetHost) {
         if (!oldest || m.at < oldest.at) oldest = m;
       }
     }
-    if (oldest) { dropMigrationBlob(oldest); migrations.delete(oldest.id); }
+    if (oldest) { dropMigrationBlob(oldest); retireMigration(oldest.id); }
   }
   const id = crypto.randomBytes(8).toString("hex");
   const m = {
@@ -3977,7 +4204,7 @@ function startArchiveRestore(row, files, targetHost) {
         if (!oldest || m.at < oldest.at) oldest = m;
       }
     }
-    if (oldest) { dropMigrationBlob(oldest); migrations.delete(oldest.id); }
+    if (oldest) { dropMigrationBlob(oldest); retireMigration(oldest.id); }
   }
   const id = crypto.randomBytes(8).toString("hex");
   const tgt = agents[targetHost] || null;
@@ -4197,7 +4424,7 @@ function advanceMigrations() {
     if ((m.phase === "done" || m.phase === "failed") &&
         now - m.at > MIGRATE_DONE_KEEP_MS) {
       dropMigrationBlob(m); // settling already dropped it; this is the backstop
-      migrations.delete(m.id);
+      retireMigration(m.id);
       publishMigrations();
     }
   }
@@ -8372,53 +8599,78 @@ function userAuthorized(req) {
 // fetch for the three outbound calls (discovery, JWKS, token exchange) and
 // `crypto` for PKCE, the RS256 signature check, and the state/nonce nonces.
 
-// Pending authorization transactions: state -> {nonce, verifier, next, at}. A
-// login mints one; its callback consumes it (single use). In-memory by design —
-// the hub is single-instance, and a login interrupted by a restart just retries.
-const oidcTx = new Map();
+// Pending authorization transactions: state -> {nonce, verifier, next, mobile,
+// at}. A login mints one; its callback consumes it (single use). Held in the
+// shared LiveStore (XERK-760) under OIDC_TX_PREFIX with a TTL, so a login begun
+// on replica A resolves against its callback on replica B — single-process
+// before, which 400'd the cross-replica callback with a state-CSRF failure. A
+// login interrupted by a restart just retries. With HA off the FileLiveStore
+// holds these in an in-memory map exactly as before, RAM-only (never persisted).
+const OIDC_TX_PREFIX = "oidc:tx:";
 const OIDC_TX_TTL_MS = 10 * 60 * 1000; // an auth round trip is minutes, not hours
-const OIDC_TX_MAX = 2000; // bound the map so a flood of /login hits can't grow it unboundedly
+const OIDC_TX_MAX = 2000; // heap-guard cap vs a /login flood (file backend only — see oidcEnforceCap)
 
 // Established browser sessions, keyed by the random sid in the OIDC_SID cookie:
-// sid -> {idToken, sub, at}. Holds only the last ID token, used as the
-// `id_token_hint` on RP-initiated logout so the IdP ends the right session
-// without a confirmation prompt. Also in-memory; losing it on restart only
-// means a logout falls back to a hintless end-session (still logs out).
-const oidcSessions = new Map();
+// sid -> {idToken, sub, role, groups, at}. Holds only the last ID token, used as
+// the `id_token_hint` on RP-initiated logout so the IdP ends the right session
+// without a confirmation prompt. Also in the shared store (XERK-760) under
+// OIDC_SESSION_PREFIX, so a session established on replica A can be logged out on
+// replica B; losing it only means a hintless end-session (still logs out). Its
+// TTL matches the sid cookie's own Max-Age (OIDC_SESSION_TTL_MS) — the record has
+// no purpose once the cookie it is keyed by has expired.
+const OIDC_SESSION_PREFIX = "oidc:sess:";
 const OIDC_SESSIONS_MAX = 5000;
+
+// Mobile handoffs share the store too, under this prefix (the TTL/cap consts sit
+// with OIDC_MOBILE_REDIRECT above): code -> {token, challenge, at}.
+const OIDC_HANDOFF_PREFIX = "oidc:handoff:";
 
 // Discovery + JWKS caches. The discovery doc and signing keys change rarely, so
 // cache them; an ID token whose `kid` misses the cache forces one JWKS refetch
-// (key rotation) before the token is rejected.
+// (key rotation) before the token is rejected. These stay per-process in-memory
+// (KeyObjects don't serialise; each replica warms its own on first use).
 let oidcDiscoveryCache = null; // {at, doc}
 let oidcJwksCache = null; // {at, keys: Map(kid -> KeyObject)}
 const OIDC_CACHE_TTL_MS = 60 * 60 * 1000;
 
-function oidcSweep(now = Date.now()) {
-  for (const [k, v] of oidcTx) if (now - v.at > OIDC_TX_TTL_MS) oidcTx.delete(k);
-  for (const [k, v] of oidcSessions) if (now - v.at > SESSION_TTL_MS) oidcSessions.delete(k);
-  for (const [k, v] of oidcHandoffs) if (now - v.at > OIDC_HANDOFF_TTL_MS) oidcHandoffs.delete(k);
+// The count cap is a SINGLE-PROCESS heap guard (XERK-592): it stops an
+// unauthenticated /login (or mobile-login) flood from growing the hub's OWN map
+// before the TTLs expire the entries. It runs ONLY on the file backend, for two
+// reasons: on the shared backend the entries live in Valkey (external — bounded
+// by the PX TTLs + the store's own maxmemory policy, not the hub heap); AND a
+// scan-then-evict-oldest across replicas would RACE — replica B could evict a tx
+// replica A just wrote for an in-flight login, reintroducing the very
+// cross-replica failure XERK-760 removes. Trims oldest-`at` first, leaving room
+// for the imminent set; the same O(n) cost the previous per-put oidcSweep paid,
+// and the cap keeps n small so the scan never grows.
+async function oidcEnforceCap(prefix, max) {
+  if (liveStore.kind !== "file") return;
+  const rows = await liveStore.scan(prefix);
+  const over = rows.length - (max - 1);
+  if (over <= 0) return;
+  rows.sort((a, b) => (a.value?.at || 0) - (b.value?.at || 0));
+  for (let i = 0; i < over; i++) await liveStore.del(rows[i].key);
 }
 
-// Store a pending mobile handoff (XERK-591), sweeping expired ones and dropping
-// the oldest at the ceiling — same discipline as oidcPutTx.
-function oidcPutHandoff(code, rec) {
-  oidcSweep();
-  while (oidcHandoffs.size >= OIDC_HANDOFF_MAX) {
-    const oldest = oidcHandoffs.keys().next().value;
-    if (oldest === undefined) break;
-    oidcHandoffs.delete(oldest);
-  }
-  oidcHandoffs.set(code, rec);
+// Store a pending mobile handoff (XERK-591): capped like the tx store, TTL'd so
+// an unredeemed code self-expires whichever replica minted it.
+async function oidcPutHandoff(code, rec) {
+  await oidcEnforceCap(OIDC_HANDOFF_PREFIX, OIDC_HANDOFF_MAX);
+  await liveStore.set(OIDC_HANDOFF_PREFIX + code, rec, { ttlMs: OIDC_HANDOFF_TTL_MS });
 }
 
 // Consume a handoff: return its record if the code is live and the presented
 // verifier hashes to the stored challenge, else null. Single use — the code is
 // deleted whatever the verifier, so a wrong guess burns it (no oracle to retry
-// against). A constant-time compare guards the challenge check.
-function oidcTakeHandoff(code, verifier, now = Date.now()) {
-  const rec = code ? oidcHandoffs.get(code) : null;
-  if (rec) oidcHandoffs.delete(code);
+// against). A constant-time compare guards the challenge check. The store's TTL
+// is a backstop; the explicit `at` check keeps the exact prior expiry semantics.
+async function oidcTakeHandoff(code, verifier, now = Date.now()) {
+  if (!code) return null;
+  // Atomic get-and-delete, so two concurrent exchanges of one code can't both
+  // read it (the "no oracle" property must hold under concurrency, not just
+  // sequentially — even across replicas, where the get+del window is a network
+  // round trip).
+  const rec = await liveStore.getDel(OIDC_HANDOFF_PREFIX + code);
   if (!rec || now - rec.at > OIDC_HANDOFF_TTL_MS) return null;
   const got = pkceChallenge(String(verifier || ""));
   const want = String(rec.challenge || "");
@@ -8439,25 +8691,33 @@ function oidcMobileRedirect(params) {
   return q ? `${OIDC_MOBILE_REDIRECT}${sep}${q}` : OIDC_MOBILE_REDIRECT;
 }
 
-// Store a pending transaction, sweeping expired ones and dropping the oldest if
-// the map is somehow at its ceiling (a Map preserves insertion order).
-function oidcPutTx(state, rec) {
-  oidcSweep();
-  while (oidcTx.size >= OIDC_TX_MAX) {
-    const oldest = oidcTx.keys().next().value;
-    if (oldest === undefined) break;
-    oidcTx.delete(oldest);
-  }
-  oidcTx.set(state, rec);
+// Store a pending transaction: capped (file backend) and TTL'd.
+async function oidcPutTx(state, rec) {
+  await oidcEnforceCap(OIDC_TX_PREFIX, OIDC_TX_MAX);
+  await liveStore.set(OIDC_TX_PREFIX + state, rec, { ttlMs: OIDC_TX_TTL_MS });
 }
 
-function oidcPutSession(sid, rec) {
-  while (oidcSessions.size >= OIDC_SESSIONS_MAX) {
-    const oldest = oidcSessions.keys().next().value;
-    if (oldest === undefined) break;
-    oidcSessions.delete(oldest);
-  }
-  oidcSessions.set(sid, rec);
+// Consume a pending transaction: atomic get-and-delete (single use, whatever the
+// outcome — two concurrent callbacks for one state can't both read it). Returns
+// the raw record (or null); the callback applies its own `at` freshness check, so
+// an expired tx reads as absent identically whether the store TTL already dropped
+// it or the `at` check catches it.
+async function oidcConsumeTx(state) {
+  if (!state) return null;
+  return (await liveStore.getDel(OIDC_TX_PREFIX + state)) || null;
+}
+
+// Record an established browser session for RP-logout (id_token_hint): capped
+// (file backend) and TTL'd to the sid cookie's own lifetime.
+async function oidcPutSession(sid, rec) {
+  await oidcEnforceCap(OIDC_SESSION_PREFIX, OIDC_SESSIONS_MAX);
+  await liveStore.set(OIDC_SESSION_PREFIX + sid, rec, { ttlMs: OIDC_SESSION_TTL_MS });
+}
+
+// Consume a session record on logout: atomic get-and-delete.
+async function oidcConsumeSession(sid) {
+  if (!sid) return null;
+  return (await liveStore.getDel(OIDC_SESSION_PREFIX + sid)) || null;
 }
 
 // PKCE (RFC 7636): the challenge is base64url(SHA-256(verifier)).
@@ -12677,7 +12937,7 @@ const server = http.createServer(async (req, res) => {
       } catch {
         return json(res, 400, { error: "invalid request body" });
       }
-      const rec = oidcTakeHandoff(String(body.code || ""), String(body.verifier || ""));
+      const rec = await oidcTakeHandoff(String(body.code || ""), String(body.verifier || ""));
       if (!rec) return json(res, 400, { error: "invalid or expired handoff code" });
       // The app sends this token as `Cookie: hub_session=<token>` on every
       // request — the SAME value the browser cookie carries, so it rides the
@@ -12702,7 +12962,7 @@ const server = http.createServer(async (req, res) => {
         // app deep link instead of setting a browser cookie + redirecting.
         const mobileRaw = url.searchParams.get("mobile") || "";
         const mobile = mobileRaw && mobileRaw.length <= OIDC_CHALLENGE_MAX ? mobileRaw : "";
-        oidcPutTx(state, { nonce, verifier, next, mobile, at: Date.now() });
+        await oidcPutTx(state, { nonce, verifier, next, mobile, at: Date.now() });
         const auth = new URL(disco.authorization_endpoint);
         auth.searchParams.set("response_type", "code");
         auth.searchParams.set("client_id", OIDC_CLIENT_ID);
@@ -12734,8 +12994,7 @@ const server = http.createServer(async (req, res) => {
       const code = url.searchParams.get("code") || "";
       const idpError = url.searchParams.get("error");
       const stateCookie = cookies(req)[OIDC_STATE_COOKIE] || "";
-      const tx = state ? oidcTx.get(state) : null;
-      if (tx) oidcTx.delete(state); // single use, whatever happens next
+      const tx = await oidcConsumeTx(state); // fetch-and-delete, single use, whatever happens next
       const clearState = authCookie(req, OIDC_STATE_COOKIE, "", 0);
       // A MOBILE flow (XERK-591) reports every outcome over the app deep link,
       // never the hub's HTML /login page — the app is waiting on the deep link,
@@ -12796,7 +13055,7 @@ const server = http.createServer(async (req, res) => {
         if (mobile) {
           const token = issueSessionToken(OIDC_SESSION_TTL_MS);
           const handoff = crypto.randomBytes(32).toString("base64url");
-          oidcPutHandoff(handoff, { token, challenge: mobile, at: Date.now() });
+          await oidcPutHandoff(handoff, { token, challenge: mobile, at: Date.now() });
           res.writeHead(302, {
             Location: oidcMobileRedirect({ code: handoff }),
             "Cache-Control": "no-store",
@@ -12807,7 +13066,7 @@ const server = http.createServer(async (req, res) => {
         const sid = crypto.randomBytes(32).toString("base64url");
         // Record the resolved role + groups for a future admin-only surface; the
         // session cookie itself stays opaque (no identity on the wire).
-        oidcPutSession(sid, {
+        await oidcPutSession(sid, {
           idToken: tokens.id_token,
           sub: claims.sub,
           role: access.role,
@@ -12848,8 +13107,7 @@ const server = http.createServer(async (req, res) => {
     // the issuer advertises no end-session endpoint.
     if (url.pathname === "/auth/oidc/logout") {
       const sid = cookies(req)[OIDC_SID_COOKIE];
-      const rec = sid ? oidcSessions.get(sid) : null;
-      if (sid) oidcSessions.delete(sid);
+      const rec = await oidcConsumeSession(sid); // fetch-and-delete
       const clear = [sessionSetCookie(req, ""), authCookie(req, OIDC_SID_COOKIE, "", 0)];
       const fallback = () => {
         res.writeHead(302, { Location: "/login", "Cache-Control": "no-store", "Set-Cookie": clear });
@@ -16247,9 +16505,13 @@ server.on("upgrade", async (req, socket, head) => {
   socket.destroy();
 });
 
-// Nothing in the migration spool survives a restart usefully (the records that
-// name those files were in memory), so clear it before anything can relay.
-sweepMigrationSpool();
+// Single-process: nothing in the migration spool survives a restart usefully
+// (the records that named those files were in memory), so clear it before
+// anything can relay. In HA the spool is SHARED across replicas, so a blanket
+// wipe would delete another replica's live bundle — the record-aware
+// sweepMigrationSpoolShared (run once the store is wired, in the boot branch
+// below) replaces it there (XERK-761).
+if (!MIGRATE_HA_ON) sweepMigrationSpool();
 
 // Test hooks: when TURMA_TEST is set (never in the image — the Dockerfile
 // runs `node server.js` with it unset), export the internals for the test
@@ -16476,12 +16738,26 @@ if (process.env.TURMA_TEST) {
     oidcSafeNext,
     oidcErrorDetail,
     oidcOrigin,
-    oidcTx,
-    oidcSessions,
-    // Native-app SSO handoff (XERK-591): the map + pure helpers, so the
+    // OIDC side-stores now live in the shared LiveStore (XERK-760). The store +
+    // key prefixes are exported so a test seeds/peeks a tx/session/handoff via
+    // liveStore.get/set/scan, and the async put/consume helpers are exported so a
+    // test drives them directly. `liveStore` is HA-off in tests (FileLiveStore),
+    // so the seed/peek is a synchronous in-memory map under the async surface.
+    liveStore,
+    OIDC_TX_PREFIX,
+    OIDC_SESSION_PREFIX,
+    OIDC_HANDOFF_PREFIX,
+    OIDC_TX_TTL_MS,
+    OIDC_SESSION_TTL_MS,
+    OIDC_HANDOFF_TTL_MS,
+    OIDC_TX_MAX,
+    oidcPutTx,
+    oidcConsumeTx,
+    oidcPutSession,
+    oidcConsumeSession,
+    // Native-app SSO handoff (XERK-591): the store helpers + pure helpers, so the
     // PKCE-bound code exchange is unit-tested offline.
     OIDC_MOBILE_REDIRECT,
-    oidcHandoffs,
     oidcPutHandoff,
     oidcTakeHandoff,
     oidcMobileRedirect,
@@ -16686,6 +16962,25 @@ if (process.env.TURMA_TEST) {
     sweepMigrationSpool,
     dropMigrationBlob,
     migrationSpoolPath,
+    // XERK-761: the record/spool sharing seam. `setMigrationStore` injects a
+    // LiveStore (shared flag) so a test can drive the mirror/hydrate/sweep the
+    // way a real HA replica does; the rest are the pieces the leader child and
+    // boot call.
+    setMigrationStore,
+    hydrateMigrations,
+    sweepMigrationSpoolShared,
+    mirrorMigration,
+    forgetMigration,
+    MIGRATION_KEY_PREFIX,
+    MIGRATE_RECORD_TTL_MS,
+    MIGRATE_SPOOL_ORPHAN_MS,
+    // XERK-762: cross-replica SSE fan-out over the shared bus. Exported so a
+    // test can drive the origin-dedup + re-emit without a live Valkey socket
+    // (`makeSseBus` over an injected store), and hold the local-delivery seam
+    // (`sseClients`/`sseDeliverLocal`) and the HA toggle (`__setSseBus`) that
+    // `sseBroadcast` gates on.
+    sseBroadcast, sseDeliverLocal, makeSseBus, sseClients, SSE_BUS_CHANNEL, SSE_REPLICA_ID,
+    __setSseBus(v) { sseBus = v; },
     siteKeyOf,
     orgPeers,
     boundOrgOf,
@@ -16739,15 +17034,18 @@ if (process.env.TURMA_TEST) {
     console.warn("WARNING: TURMA_AGENT_STRICT not set — the shared TURMA_AGENT_TOKEN is still accepted, so an agent can act as any host. Give each agent `node server.js --agent-token <host>` as its TURMA_TOKEN, then set TURMA_AGENT_STRICT=1");
   }
 
-  // ---- HA storage seam: resolve the mode, select the backend (XERK-754) ----
-  // ONE switch (HA_MODE / TURMA_STORE_URL) decides single-process-on-files (the
-  // default) vs the shared store. Resolved and PRINTED before the listen so a
-  // misconfigured HA hub REFUSES TO BOOT loudly rather than run half-shared,
-  // half-local (the split-brain the epic exists to avoid). The effective mode
-  // prints for the same reason the memory ceilings do: it is the only way to
-  // tell a correctly-configured hub from one whose env moved under it. See
+  // ---- HA storage seam: PRINT the mode, refuse a fatal config (XERK-754) ----
+  // The backend was already SELECTED at module load (`liveStore` up top, so the
+  // test and production paths share one store and the OIDC side-stores — XERK-760
+  // — reach it). This is where the resolved mode PRINTS and a misconfigured HA
+  // hub REFUSES TO BOOT loudly rather than run half-shared, half-local (the
+  // split-brain the epic exists to avoid): the print/exit only belong on the
+  // production path, never a `require` under TURMA_TEST. `liveStore` was coerced
+  // to the file backend up top when the config is fatal, so it never dialled a
+  // broken shared URL before we could name the error here. The effective mode
+  // prints for the same reason the memory ceilings do: it is the only way to tell
+  // a correctly-configured hub from one whose env moved under it. See
   // docs/turma-ha-store-adr.md ("The HA config contract").
-  const haConfig = resolveHaConfig(process.env);
   console.log(haConfig.bootLine);
   if (haConfig.fatal.length) {
     // Fail loud, never half-HA: name every misconfiguration and refuse to boot.
@@ -16755,23 +17053,41 @@ if (process.env.TURMA_TEST) {
     console.error("refusing to boot — fix the HA configuration or unset HA_MODE to run single-process");
     process.exit(2);
   }
-  // Build the LiveStore for the resolved mode. With HA off this is the local
-  // file/in-memory backend and nothing here touches the hot path yet (wave-3
-  // wires the call sites); with HA on it is the Valkey client, whose connection
-  // health is logged as it comes and goes — never fatal at runtime, so a store
-  // blip reconnects rather than taking the hub down (availability).
-  const liveStore = createLiveStore(haConfig, {
-    onHealth: (h) => console.log(`HA store health: ${h}`),
-  });
+  // `liveStore` was already SELECTED and constructed at module load (up top, so
+  // the test and production paths share one store and the OIDC side-stores —
+  // XERK-760 — reach it). The wave-3 consumers below wire onto that same binding.
+  // XERK-761 (wave-3): wire the migration record/spool sharing onto the store.
+  // It is the SHARED backend only when HA is on; with HA off this is the local
+  // in-memory store, the flag stays false, and nothing about migrations changes.
+  // In HA, hydrate the Map from the store (this covers a restart; the `leader`
+  // child calls hydrateMigrations again on promotion) and run the record-aware
+  // spool sweep the single-process boot sweep deferred to above.
+  setMigrationStore(liveStore, haConfig.ha);
+  if (haConfig.ha) {
+    hydrateMigrations().catch((e) =>
+      console.error(`migration hydrate failed: ${e && e.message}`));
+    sweepMigrationSpoolShared().catch((e) =>
+      console.error(`migration spool sweep failed: ${e && e.message}`));
+  }
+  // In HA mode, fan SSE broadcasts out across replicas over the store's pub/sub
+  // bus (XERK-762): each replica re-emits another replica's events to its own
+  // /api/events clients, so a dashboard whose stream is held by one replica
+  // still sees a mutation that happened on another. Subscribing before the store
+  // finishes connecting is safe — SharedLiveStore re-issues the subscription on
+  // connect and a publish while down is caught. Non-HA leaves `sseBus` null, so
+  // `sseBroadcast` stays a plain local iteration, unchanged.
+  if (haConfig.ha) {
+    sseBus = makeSseBus(liveStore, SSE_REPLICA_ID, sseDeliverLocal);
+    console.log(`SSE fan-out: shared bus (replica ${SSE_REPLICA_ID})`);
+  }
   // Wave-3 (XERK-758): move the durable usage ledger onto the shared store when HA
   // is on. With HA off this is a no-op and the ledger stays on its local JSON file,
   // byte-identical. Fire-and-forget + logged: a store down at boot must not block
-  // the listen (availability) — `configure` yields an empty model that the store's
-  // `watch` and the next beats refill. Other wave-3 children read `liveStore` too.
-  // Pass `invalidateAgentsCache` so a boot/reconnect scan load or a peer replica's
-  // watch-folded write refreshes the served /api/agents (retiredUsage) promptly — a
-  // model change with no local beat behind it would otherwise serve stale until the
-  // next unrelated mutation (XERK-758 QA D1).
+  // the listen (availability) — `configure` loads the model when the store's socket
+  // becomes ready and re-loads on reconnect. `invalidateAgentsCache` is passed so a
+  // boot/reconnect scan load or a peer replica's watch-folded write refreshes the
+  // served /api/agents (retiredUsage) promptly — a model change with no local beat
+  // behind it would otherwise serve stale until the next mutation (XERK-758 QA D1).
   usageLedger.configure(liveStore, haConfig, invalidateAgentsCache).catch((e) => {
     console.error(`usage ledger: shared-store configure failed, staying on the local file: ${(e && e.message) || e}`);
   });

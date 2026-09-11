@@ -25,14 +25,38 @@ This file is the operative rules for the two modules that landed it.
   the hot path. **Wave-3 children flip each call site** onto the already-proven
   adapter, one store at a time — that is where "moving a store's semantics" lives.
   Do not fold a call-site rewire into this seam.
-- **First wave-3 child LANDED: the usage ledger (XERK-758).** `usage-ledger.js` now persists through
-  a pluggable backend — file default (byte-identical, HA off) or `SharedLedgerBackend`
-  (`usage-ledger-shared.js`, atomic per-host high-water max-merge into this `LiveStore`), swapped by
-  `usageLedger.configure(liveStore, haConfig)` at boot. It reuses the LiveStore's `compareAndSet`/
-  `setIfAbsent`/`scan`/`watch` unchanged — **no new store primitive was added here.** DELIBERATE ADR
-  divergence (ledger on Valkey, not the ADR's Postgres — no stdlib PG client exists yet); the
-  per-host max-merge write is backend-agnostic so a PG `LedgerStore` slots in later with no call-site
-  change. Full rules: `.claude/rules/turma-usage.md` ("HA: the shared-store backend").
+- **The store is now created at MODULE LOAD** (`liveStore`, before the TURMA_TEST/production split)
+  rather than only in the production boot branch — so the test and production paths share one store
+  and a wave-3 call site can reach it. The boot-time PRINT + fail-loud `exit(2)` stay on the
+  production path (a `require` under TURMA_TEST must not print or exit); a FATAL config is coerced to
+  the file backend at creation so `createLiveStore` never parses a broken shared URL before the
+  branch names the error. `void liveStore` is gone.
+
+## Wave-3 children (call sites flipped onto the store)
+
+- **XERK-760 — the OIDC PKCE/session/handoff side-stores** (`oidcTx`/`oidcSessions`/`oidcHandoffs` →
+  `OIDC_*_PREFIX` keys, TTL'd). The first wave-3 child. Mechanics + the cross-replica rationale live
+  in `.claude/rules/turma-oidc.md` ("HA requirements" + the tx/session/handoff invariants). Note the
+  count-cap (`oidcEnforceCap`) is a FILE-BACKEND-ONLY heap guard: on the shared backend a
+  scan-then-evict-oldest across replicas would race and evict another replica's in-flight entry — TTL
+  + Valkey maxmemory bound it there instead.
+- **`getDel(key)` was added to the contract by XERK-760** — atomic get-and-delete (RESP `GETDEL` on
+  the shared backend; a no-await-between read+delete on the file backend), so a single-use consume
+  can't be double-read by concurrent callers. Decomposing it into `get()`+`del()` at a call site
+  reintroduces that race — the file backend yields the event loop between the two awaits.
+- **XERK-758 — the durable USAGE LEDGER** (`usage-ledger.js` → a pluggable persistence backend, file
+  default byte-identical / `SharedLedgerBackend` in `usage-ledger-shared.js`). UNLIKE the OIDC child it
+  did NOT flip a `LiveStore` call site inline: the in-memory model + every read (`fold`/`retiredAgents`/
+  `has`) stay synchronous, and only PERSISTENCE swaps — each host is its own key
+  `usage:host:<key>`, written by an atomic per-host high-water **max-merge** under `compareAndSet`/
+  `setIfAbsent` (a low/partial writer can never lower a recorded total). Wired by
+  `usageLedger.configure(liveStore, haConfig, invalidateAgentsCache)` at boot; reuses `scan`/`watch`
+  unchanged — **no new store primitive.** The boot/reconnect scan runs on the store's health→ready
+  edge (never inline in `init`, which would reject on a not-yet-connected socket) and invalidates the
+  hub's `/api/agents` cache on any non-beat model change. DELIBERATE ADR divergence (ledger on Valkey,
+  not the ADR's Postgres — no stdlib PG client yet); the max-merge write is backend-agnostic so a PG
+  `LedgerStore` slots in later with no call-site change. Full rules: `.claude/rules/turma-usage.md`
+  ("HA: the shared-store backend").
 
 ## Load-bearing invariants
 
@@ -76,6 +100,23 @@ This file is the operative rules for the two modules that landed it.
 - **The effective mode PRINTS at boot** (`HA: on (...)` / `HA: off (single-process)`),
   same idiom as the memory-ceiling prints — the only way to tell a correctly-wired
   hub from one whose env moved under it.
+
+## Wave-3 consumers already on the seam
+
+- **SSE fan-out across replicas (XERK-762)** — the first live-plane consumer of `publish`/`subscribe`.
+  In `turma/server.js`, `sseBroadcast` = `sseDeliverLocal` (this process's `sseClients`, as always)
+  **plus** `sseBus.publish` when HA is on. `makeSseBus(store, replicaId, deliverLocal)` subscribes to
+  `SSE_BUS_CHANNEL` and re-emits a PEER's frames to local clients; it SKIPS a frame stamped with its
+  own `SSE_REPLICA_ID` (a fresh per-boot random), so an event a replica both originated and received
+  back is delivered once. `sseBus` is null single-process (`FileLiveStore` pub/sub is NOT wired for
+  SSE — one process has no peer), so the non-HA path is unchanged.
+  - **Payloads/event names are byte-identical** — the bus only carries `{origin, event, data}` and
+    unwraps to the same `(event, dataObj)`, so the client merge machinery (`mergeSnapshot`/`sseClock`/
+    `patchedAt`, XERK-444/545, all CLIENT-side) converges a cross-replica patch as it does a local
+    one. There is NO server-side clock; do not add one.
+  - **Publish is best-effort** (caught): a store blip never fails the mutation, and each host's next
+    beat re-ships its FULL serialized record, so a frame missed during a blip self-heals within a
+    beat. Tests: the `XERK-762:` cases in `server.test.js`.
 
 ## Tests
 

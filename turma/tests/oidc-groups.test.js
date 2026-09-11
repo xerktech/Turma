@@ -54,6 +54,15 @@ process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
 const hub = require("../server.js");
 const { server } = hub;
 
+// The OIDC side-stores moved into the shared LiveStore (XERK-760); in tests HA is
+// off so `hub.liveStore` is an in-memory FileLiveStore. Seed/peek it as the old
+// Map-based tests did.
+const store = hub.liveStore;
+const txSet = (state, rec) => store.set(hub.OIDC_TX_PREFIX + state, rec);
+const txHas = async (state) => (await store.get(hub.OIDC_TX_PREFIX + state)) != null;
+const sessGet = (sid) => store.get(hub.OIDC_SESSION_PREFIX + sid);
+const sessSize = async () => (await store.scan(hub.OIDC_SESSION_PREFIX)).length;
+
 // ---- a locally-minted RSA signing key + JWKS ---------------------------------
 
 const KID = "test-key-1";
@@ -139,7 +148,7 @@ function get(pathName, headers = {}) {
 async function driveCallback(groups) {
   hub.__setOidcCaches(DISCOVERY, jwksKeys);
   const state = `state-${crypto.randomBytes(4).toString("hex")}`;
-  hub.oidcTx.set(state, { nonce: "the-nonce", verifier: "verifier-xyz-1234567890", next: "/board", at: Date.now() });
+  await txSet(state, { nonce: "the-nonce", verifier: "verifier-xyz-1234567890", next: "/board", at: Date.now() });
   const saved = global.fetch;
   global.fetch = async () => ({
     ok: true,
@@ -171,24 +180,24 @@ test("a user in the user group is admitted with a user-role session", async () =
   assert.match(sc, /hub_oidc=/);
   // The session cookie's Max-Age reflects the shorter OIDC TTL, not 30 days.
   assert.match(sc, new RegExp(`hub_session=[^;]+; .*Max-Age=${OIDC_TTL_MS / 1000}(;|\\b)`));
-  const rec = hub.oidcSessions.get(sidFromSetCookie(res));
+  const rec = await sessGet(sidFromSetCookie(res));
   assert.ok(rec);
   assert.equal(rec.role, "user");
   assert.deepEqual(rec.groups, [USER_GROUP]);
-  assert.equal(hub.oidcTx.has(state), false); // tx consumed
+  assert.equal(await txHas(state), false); // tx consumed
 });
 
 test("a user in the admin group is admitted with an admin-role session", async () => {
   const { res } = await driveCallback([ADMIN_GROUP, USER_GROUP]);
   assert.equal(res.status, 302);
   assert.equal(res.headers.location, "/board");
-  const rec = hub.oidcSessions.get(sidFromSetCookie(res));
+  const rec = await sessGet(sidFromSetCookie(res));
   assert.ok(rec);
   assert.equal(rec.role, "admin");
 });
 
 test("a user in NEITHER group is denied a session and bounced to /login?error=forbidden", async () => {
-  const before = hub.oidcSessions.size;
+  const before = await sessSize();
   const { res, state } = await driveCallback(["some-other-group"]);
   assert.equal(res.status, 302);
   assert.equal(res.headers.location, "/login?error=forbidden");
@@ -197,8 +206,8 @@ test("a user in NEITHER group is denied a session and bounced to /login?error=fo
   assert.doesNotMatch(sc, /hub_session=[^;]/);
   assert.doesNotMatch(sc, /hub_oidc=[^;]/);
   assert.match(sc, /hub_oidc_state=; .*Max-Age=0/);
-  assert.equal(hub.oidcSessions.size, before); // no server-side record added
-  assert.equal(hub.oidcTx.has(state), false); // tx still consumed (single use)
+  assert.equal(await sessSize(), before); // no server-side record added
+  assert.equal(await txHas(state), false); // tx still consumed (single use)
 });
 
 test("a token with NO groups claim at all is denied", async () => {

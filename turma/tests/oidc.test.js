@@ -62,6 +62,28 @@ process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
 const hub = require("../server.js");
 const { server } = hub;
 
+// The OIDC side-stores (tx / session / handoff) moved from in-process Maps into
+// the shared LiveStore (XERK-760). In tests HA is off, so `hub.liveStore` is the
+// FileLiveStore — an in-memory map under an async surface. These helpers seed and
+// peek it the way the old Map-based tests did (.set/.get/.has/.clear/.size).
+const store = hub.liveStore;
+const txKey = (state) => hub.OIDC_TX_PREFIX + state;
+const sessKey = (sid) => hub.OIDC_SESSION_PREFIX + sid;
+const handoffKey = (code) => hub.OIDC_HANDOFF_PREFIX + code;
+const txSet = (state, rec) => store.set(txKey(state), rec);
+const txGet = (state) => store.get(txKey(state));
+const txHas = async (state) => (await store.get(txKey(state))) != null;
+const sessSet = (sid, rec) => store.set(sessKey(sid), rec);
+const sessGet = (sid) => store.get(sessKey(sid));
+const sessHas = async (sid) => (await store.get(sessKey(sid))) != null;
+const handoffHas = async (code) => (await store.get(handoffKey(code))) != null;
+async function storeClear(prefix) {
+  for (const { key } of await store.scan(prefix)) await store.del(key);
+}
+const txClear = () => storeClear(hub.OIDC_TX_PREFIX);
+const sessSize = async () => (await store.scan(hub.OIDC_SESSION_PREFIX)).length;
+const handoffClear = () => storeClear(hub.OIDC_HANDOFF_PREFIX);
+
 // ---- a locally-minted RSA signing key + JWKS ---------------------------------
 
 const KID = "test-key-1";
@@ -217,7 +239,7 @@ function get(pathName, headers = {}) {
 
 test("GET /auth/oidc/login redirects to the IdP with PKCE + state, storing the tx", async () => {
   hub.__setOidcCaches(DISCOVERY, jwksKeys);
-  hub.oidcTx.clear();
+  await txClear();
   const res = await get("/auth/oidc/login?next=/board");
   assert.equal(res.status, 302);
   const loc = new URL(res.headers.location);
@@ -231,7 +253,7 @@ test("GET /auth/oidc/login redirects to the IdP with PKCE + state, storing the t
   const state = loc.searchParams.get("state");
   assert.ok(state);
   // The transaction was stored under that exact state, remembering the safe next.
-  const tx = hub.oidcTx.get(state);
+  const tx = (await txGet(state));
   assert.ok(tx);
   assert.equal(tx.next, "/board");
   // The challenge is the S256 of the stored verifier.
@@ -247,7 +269,7 @@ test("GET /auth/oidc/callback exchanges the code and issues the hub session", as
   hub.__setOidcCaches(DISCOVERY, jwksKeys);
   const state = "state-abc";
   const verifier = "verifier-xyz-1234567890";
-  hub.oidcTx.set(state, { nonce: "the-nonce", verifier, next: "/usage", at: Date.now() });
+  await txSet(state, { nonce: "the-nonce", verifier, next: "/usage", at: Date.now() });
 
   const saved = global.fetch;
   let tokenBody = null;
@@ -277,7 +299,7 @@ test("GET /auth/oidc/callback exchanges the code and issues the hub session", as
     assert.match(setCookie, /hub_oidc=/);
     assert.match(setCookie, /HttpOnly/);
     // The tx was consumed (single use).
-    assert.equal(hub.oidcTx.has(state), false);
+    assert.equal(await txHas(state), false);
   } finally {
     global.fetch = saved;
   }
@@ -295,7 +317,7 @@ test("GET /auth/oidc/callback is bound to the browser (login-CSRF)", async () =>
   // delivering their own code+state to a victim).
   hub.__setOidcCaches(DISCOVERY, jwksKeys);
   const state = "state-csrf";
-  hub.oidcTx.set(state, { nonce: "the-nonce", verifier: "v-1234567890", next: "/", at: Date.now() });
+  await txSet(state, { nonce: "the-nonce", verifier: "v-1234567890", next: "/", at: Date.now() });
   let tokenCalled = false;
   const saved = global.fetch;
   global.fetch = async () => { tokenCalled = true; return { ok: true, status: 200, text: async () => "{}" }; };
@@ -304,7 +326,7 @@ test("GET /auth/oidc/callback is bound to the browser (login-CSRF)", async () =>
     let res = await get(`/auth/oidc/callback?state=${state}&code=c`);
     assert.equal(res.status, 400);
     // A DIFFERENT state cookie (attacker's own) — still rejected.
-    hub.oidcTx.set(state, { nonce: "the-nonce", verifier: "v-1234567890", next: "/", at: Date.now() });
+    await txSet(state, { nonce: "the-nonce", verifier: "v-1234567890", next: "/", at: Date.now() });
     res = await get(`/auth/oidc/callback?state=${state}&code=c`, { cookie: "hub_oidc_state=someone-else" });
     assert.equal(res.status, 400);
     // The token endpoint was never even contacted.
@@ -323,7 +345,7 @@ test("GET /auth/oidc/callback bounces an IdP error to the login page", async () 
 test("GET /auth/oidc/logout clears cookies and redirects to the IdP end-session", async () => {
   hub.__setOidcCaches(DISCOVERY, jwksKeys);
   const sid = "sid-1";
-  hub.oidcSessions.set(sid, { idToken: "the-id-token", sub: "user-123", at: Date.now() });
+  await sessSet(sid, { idToken: "the-id-token", sub: "user-123", at: Date.now() });
   const res = await get("/auth/oidc/logout", { cookie: `hub_oidc=${sid}` });
   assert.equal(res.status, 302);
   const loc = new URL(res.headers.location);
@@ -335,7 +357,7 @@ test("GET /auth/oidc/logout clears cookies and redirects to the IdP end-session"
   assert.match(setCookie, /hub_session=; .*Max-Age=0/);
   assert.match(setCookie, /hub_oidc=; .*Max-Age=0/);
   // The server-side session record was dropped.
-  assert.equal(hub.oidcSessions.has(sid), false);
+  assert.equal(await sessHas(sid), false);
 });
 
 test("the OIDC routes are reachable WITHOUT a hub login (public gate)", async () => {
@@ -540,29 +562,29 @@ test("XERK-591: GET /api/oidc/config reports OIDC enabled, WITHOUT a hub login",
 
 test("XERK-591: a mobile login carries the challenge into the tx", async () => {
   hub.__setOidcCaches(DISCOVERY, jwksKeys);
-  hub.oidcTx.clear();
+  await txClear();
   const challenge = hub.pkceChallenge("app-verifier-abc-1234567890");
   const res = await get(`/auth/oidc/login?mobile=${encodeURIComponent(challenge)}`);
   assert.equal(res.status, 302);
   const state = new URL(res.headers.location).searchParams.get("state");
-  assert.equal(hub.oidcTx.get(state).mobile, challenge);
+  assert.equal((await txGet(state)).mobile, challenge);
 });
 
 test("XERK-591: an over-long mobile challenge is dropped (treated as non-mobile)", async () => {
   hub.__setOidcCaches(DISCOVERY, jwksKeys);
-  hub.oidcTx.clear();
+  await txClear();
   const res = await get(`/auth/oidc/login?mobile=${"x".repeat(500)}`);
   const state = new URL(res.headers.location).searchParams.get("state");
-  assert.equal(hub.oidcTx.get(state).mobile, "");
+  assert.equal((await txGet(state)).mobile, "");
 });
 
 test("XERK-591: the mobile flow deep-links a code, exchanges it once, and the token authorises", async () => {
   hub.__setOidcCaches(DISCOVERY, jwksKeys);
-  hub.oidcHandoffs.clear();
+  await handoffClear();
   const state = "mstate-1";
   const verifier = "mobile-verifier-xyz-1234567890";
   const challenge = hub.pkceChallenge(verifier);
-  hub.oidcTx.set(state, { nonce: "the-nonce", verifier: "pkce-v", next: "/", mobile: challenge, at: Date.now() });
+  await txSet(state, { nonce: "the-nonce", verifier: "pkce-v", next: "/", mobile: challenge, at: Date.now() });
 
   const saved = global.fetch;
   global.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ id_token: signJwt(goodClaims()) }) });
@@ -575,7 +597,7 @@ test("XERK-591: the mobile flow deep-links a code, exchanges it once, and the to
     const setCookie = (cb.headers["set-cookie"] || []).join("\n");
     assert.doesNotMatch(setCookie, /hub_session=[^;]/, "no session cookie on the mobile path");
     const code = new URL(cb.headers.location).searchParams.get("code");
-    assert.ok(hub.oidcHandoffs.has(code));
+    assert.ok(await handoffHas(code));
 
     // Redeem the code with the verifier -> the token + its ttl.
     const ex = await req("POST", "/api/oidc/mobile/exchange", { body: { code, verifier } });
@@ -597,14 +619,14 @@ test("XERK-591: the mobile flow deep-links a code, exchanges it once, and the to
 });
 
 test("XERK-591: a hijacked code with the WRONG verifier is refused AND burned", async () => {
-  hub.oidcHandoffs.clear();
-  hub.oidcPutHandoff("code-1", { token: "sekret-token", challenge: hub.pkceChallenge("real-verifier-123456"), at: Date.now() });
+  await handoffClear();
+  await hub.oidcPutHandoff("code-1", { token: "sekret-token", challenge: hub.pkceChallenge("real-verifier-123456"), at: Date.now() });
   // Another app that intercepted the deep link has the code but not the verifier.
   const bad = await req("POST", "/api/oidc/mobile/exchange", { body: { code: "code-1", verifier: "guessed-wrong" } });
   assert.equal(bad.status, 400);
   // The wrong guess burned the code — the real app now can't redeem it either
   // (no oracle to brute-force the verifier against).
-  assert.equal(hub.oidcHandoffs.has("code-1"), false);
+  assert.equal(await handoffHas("code-1"), false);
   const real = await req("POST", "/api/oidc/mobile/exchange", { body: { code: "code-1", verifier: "real-verifier-123456" } });
   assert.equal(real.status, 400);
 });
@@ -612,7 +634,7 @@ test("XERK-591: a hijacked code with the WRONG verifier is refused AND burned", 
 test("XERK-591: a mobile flow reports an IdP error over the deep link, not the /login page", async () => {
   hub.__setOidcCaches(DISCOVERY, jwksKeys);
   const state = "mstate-err";
-  hub.oidcTx.set(state, { nonce: "n", verifier: "v", next: "/", mobile: hub.pkceChallenge("verf-123456"), at: Date.now() });
+  await txSet(state, { nonce: "n", verifier: "v", next: "/", mobile: hub.pkceChallenge("verf-123456"), at: Date.now() });
   const res = await get(`/auth/oidc/callback?state=${state}&error=access_denied`, { cookie: `hub_oidc_state=${state}` });
   assert.equal(res.status, 302);
   assert.ok(res.headers.location.startsWith(hub.OIDC_MOBILE_REDIRECT + "?error=oidc"));
@@ -621,7 +643,7 @@ test("XERK-591: a mobile flow reports an IdP error over the deep link, not the /
 test("XERK-591: a mobile flow deep-links when the token exchange itself fails", async () => {
   hub.__setOidcCaches(DISCOVERY, jwksKeys);
   const state = "mstate-fail";
-  hub.oidcTx.set(state, { nonce: "n", verifier: "v", next: "/", mobile: hub.pkceChallenge("verf-123456"), at: Date.now() });
+  await txSet(state, { nonce: "n", verifier: "v", next: "/", mobile: hub.pkceChallenge("verf-123456"), at: Date.now() });
   const saved = global.fetch;
   // The IdP's token endpoint 500s mid-flow: the callback must NOT strand the app
   // on a JSON page — it deep-links ?error=oidc like every other mobile outcome.
@@ -661,7 +683,7 @@ test("XERK-600: a failed token exchange NAMES the IdP's error in the hub log, no
   // generic 502 (no IdP detail leaks to the browser) and the tx is consumed.
   hub.__setOidcCaches(DISCOVERY, jwksKeys);
   const state = "state-exch-fail";
-  hub.oidcTx.set(state, { nonce: "the-nonce", verifier: "v-1234567890", next: "/", at: Date.now() });
+  await txSet(state, { nonce: "the-nonce", verifier: "v-1234567890", next: "/", at: Date.now() });
 
   const savedFetch = global.fetch;
   global.fetch = async () => ({
@@ -686,5 +708,84 @@ test("XERK-600: a failed token exchange NAMES the IdP's error in the hub log, no
   assert.ok(line, "the callback failure is logged");
   assert.match(line, /invalid_client/, "the IdP's error CODE is named in the log");
   assert.match(line, /Client authentication failed/, "the IdP's DESCRIPTION is named too");
-  assert.equal(hub.oidcTx.has(state), false, "the tx is consumed on failure (single use)");
+  assert.equal(await txHas(state), false, "the tx is consumed on failure (single use)");
+});
+
+// ---- XERK-760: OIDC side-stores externalized to the shared LiveStore ----------
+// The PKCE tx, the logout-hint session, and the mobile handoff moved from
+// in-process Maps into the shared LiveStore, so a login on replica A and its IdP
+// callback on replica B resolve the same `state`/`sid`/`code` (single-process
+// before, which 400'd the cross-replica callback). A single-process test has one
+// store, so these pin (1) the flow goes THROUGH liveStore rather than a local
+// Map — which is what a shared backend carries across replicas — and (2) the
+// heap-guard count cap still bounds the file backend against a /login flood.
+
+test("XERK-760: /auth/oidc/login writes the tx into the shared LiveStore", async () => {
+  hub.__setOidcCaches(DISCOVERY, jwksKeys);
+  await txClear();
+  const res = await get("/auth/oidc/login?next=/board");
+  const state = new URL(res.headers.location).searchParams.get("state");
+  // Present in liveStore under the OIDC_TX_PREFIX — a second replica sharing the
+  // store would see it and resolve the callback.
+  const rec = await store.get(hub.OIDC_TX_PREFIX + state);
+  assert.ok(rec, "tx is in the shared store, not a process-local map");
+  assert.equal(rec.next, "/board");
+});
+
+test("XERK-760: the callback resolves a tx 'another replica' wrote to the store", async () => {
+  hub.__setOidcCaches(DISCOVERY, jwksKeys);
+  const state = "xrep-state";
+  // Simulate replica A's /login by writing straight to the shared store; the
+  // callback (replica B) must consume it.
+  await store.set(hub.OIDC_TX_PREFIX + state, {
+    nonce: "the-nonce",
+    verifier: "v-1234567890",
+    next: "/usage",
+    at: Date.now(),
+  });
+  const saved = global.fetch;
+  global.fetch = async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ id_token: signJwt(goodClaims()) }),
+  });
+  try {
+    const res = await get(`/auth/oidc/callback?state=${state}&code=the-code`, { cookie: `hub_oidc_state=${state}` });
+    assert.equal(res.status, 302);
+    assert.equal(res.headers.location, "/usage");
+    assert.equal(await txHas(state), false, "consumed from the store (single use)");
+  } finally {
+    global.fetch = saved;
+  }
+});
+
+test("XERK-760: the logout-hint session round-trips through the shared store", async () => {
+  hub.__setOidcCaches(DISCOVERY, jwksKeys);
+  const sid = "xrep-sid";
+  // As written by a callback on 'replica A'.
+  await store.set(hub.OIDC_SESSION_PREFIX + sid, { idToken: "the-id-token", sub: "u", at: Date.now() });
+  const res = await get("/auth/oidc/logout", { cookie: `hub_oidc=${sid}` });
+  assert.equal(res.status, 302);
+  assert.equal(new URL(res.headers.location).searchParams.get("id_token_hint"), "the-id-token");
+  assert.equal(await sessHas(sid), false, "the session record is consumed on logout");
+});
+
+test("XERK-760: the tx count cap still bounds the file backend against a /login flood", async () => {
+  await txClear();
+  // Pre-fill to the cap directly, oldest-`at` first (as a flood would have).
+  for (let i = 0; i < hub.OIDC_TX_MAX; i++) {
+    await store.set(hub.OIDC_TX_PREFIX + `flood-${String(i).padStart(6, "0")}`, {
+      nonce: "n",
+      verifier: "v",
+      next: "/",
+      at: 1000 + i,
+    });
+  }
+  // One more login through oidcPutTx must evict the oldest, never grow past the cap.
+  await hub.oidcPutTx("flood-newest", { nonce: "n", verifier: "v", next: "/", at: Date.now() });
+  const count = (await store.scan(hub.OIDC_TX_PREFIX)).length;
+  assert.ok(count <= hub.OIDC_TX_MAX, `tx store capped at ${hub.OIDC_TX_MAX}, saw ${count}`);
+  assert.equal(await txHas("flood-000000"), false, "oldest-`at` evicted first");
+  assert.equal(await txHas("flood-newest"), true, "the new tx is kept");
+  await txClear();
 });
