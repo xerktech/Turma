@@ -832,10 +832,122 @@ function scheduleSnapshot() {
 // shutdown flushes here so a rolling deploy never drops the unsaved deltas the
 // 5s debounce / 5min snapshot were still holding (this is the only copy of a
 // year of spend). Async like writeNow; `done(err|null)` fires on completion.
-function flush(done) {
+function fileFlush(done) {
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
   writeNow(done);
+}
+
+// ---- the persistence backend seam (XERK-758) --------------------------------
+//
+// The in-memory `hosts` model and every reducer/read function above are
+// backend-AGNOSTIC and SYNCHRONOUS. Only PERSISTENCE differs between modes:
+//   - fileBackend (DEFAULT): rewrites `/data/usage-ledger.json` whole, exactly as
+//     before — so with HA off the on-disk bytes and cadence are byte-identical.
+//   - SharedLedgerBackend (HA): atomic per-host high-water max-merge into the
+//     LiveStore (usage-ledger-shared.js), so no replica's partial view can lower a
+//     recorded total. Swapped in by `configure()` at boot when HA is on.
+const fileBackend = {
+  // A fresh/augmenting beat saves promptly; a re-stating one rides the snapshot
+  // timer (rewriting the whole file at the beat rate protects nothing).
+  onChange(_key, prompt) { if (prompt) scheduleSave(); else scheduleSnapshot(); },
+  onForget(_key) { scheduleSave(); },
+  flush(done) { fileFlush(done); },
+  async close() {},
+};
+let backend = fileBackend;
+
+// High-water MERGE of one plain entry (`src`, e.g. the shared store's row) into
+// another (`dst`, the live model entry), IN PLACE — the entry-level analogue of
+// `mergeSeries`, used by the shared backend so it reuses the store's ONE
+// implementation of the high-water rule rather than a second copy. `dst` and `src`
+// are `{device,siteKey,firstSeen,lastSeen,host,repos}` (host/repos already coerced
+// by `entryOf`/`seriesOf`). Every figure is the per-key MAXIMUM ever seen, never a
+// SUM — the two are the SAME durable history reported by different replicas, so a
+// day both saw is `max`, and summing would double-count it.
+function mergeTwoEntries(dst, src) {
+  if (!src) return dst;
+  if (src.host) {
+    if (dst.host) mergeSeries(dst.host, src.host);
+    else dst.host = cloneSeries(src.host);
+  }
+  for (const [rk, r] of Object.entries(src.repos || {})) {
+    if (rk === "__proto__" || !r) continue;
+    if (dst.repos[rk]) {
+      mergeSeries(dst.repos[rk].series, r.series);
+      if (r.repo && !dst.repos[rk].repo) dst.repos[rk].repo = r.repo;
+      if (r.remote && !dst.repos[rk].remote) dst.repos[rk].remote = r.remote;
+    } else {
+      dst.repos[rk] = { repo: r.repo, remote: r.remote, series: cloneSeries(r.series) };
+    }
+  }
+  // Labels/scalars follow the most-recently-seen side (its casing/org is current),
+  // the same rule `mergeEntries` uses for the case-twin fold.
+  if ((src.lastSeen || 0) >= (dst.lastSeen || 0)) {
+    dst.lastSeen = src.lastSeen || 0;
+    if (src.device) dst.device = src.device;
+    if (src.siteKey) dst.siteKey = src.siteKey;
+  } else if (!dst.siteKey && src.siteKey) {
+    dst.siteKey = src.siteKey;
+  }
+  // firstSeen is the EARLIEST either replica saw the host.
+  const firsts = [dst.firstSeen, src.firstSeen].filter((n) => typeof n === "number" && n > 0);
+  if (firsts.length) dst.firstSeen = Math.min(...firsts);
+  return dst;
+}
+
+// The in-memory model + pure reducers the shared backend operates on, passed to it
+// so it mutates the SAME `hosts` object the read path serves (and to avoid a
+// require cycle). Coercion (`entryOf`) turns a stored JSON row back into a proper
+// entry; `mergeEntry` is the high-water fold; `enforceHostShare` bounds one row.
+function sharedOps() {
+  return {
+    getEntry: (key) => hosts[key] || null,
+    setEntry: (key, entry) => { hosts[key] = entry; },
+    deleteEntry: (key) => { delete hosts[key]; shortfallLoggedAt.delete(key); },
+    coerce: (raw) => entryOf(raw),
+    mergeEntry: (dst, src) => mergeTwoEntries(dst, src),
+    enforceHostShare,
+    SAVE_DEBOUNCE_MS,
+  };
+}
+
+// Public flush — the graceful-shutdown drain path calls this; it delegates to
+// whichever backend is active.
+function flush(done) {
+  backend.flush(done);
+}
+
+/**
+ * Select the persistence backend from the resolved HA config (server.js calls
+ * this once at boot, FIRE-AND-FORGET — it does not gate the listen). With HA OFF
+ * this is a no-op — the file backend loaded at require time stays, byte-identical.
+ * With HA ON it discards the file-loaded model and swaps in the shared backend.
+ * The shared backend does NOT block boot on the store connecting: it loads the
+ * history when the store's socket becomes READY (and re-loads on reconnect), so a
+ * store down at boot is never fatal — the serve path degrades to serving each live
+ * host's own raw report until the model loads, and retired-host rows appear as soon
+ * as the store is reachable (XERK-758 QA D1).
+ */
+async function configure(liveStore, haConfig, onExternalChange) {
+  if (!haConfig || !haConfig.ha || !liveStore) return; // single-process default
+  const { SharedLedgerBackend } = require("./usage-ledger-shared.js");
+  // Cancel any pending file-backend timers — the file model is being discarded.
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
+  hosts = Object.create(null);
+  // `onExternalChange` invalidates the hub's /api/agents cache when the model
+  // changes from a source OTHER than a local heartbeat (a boot/reconnect scan
+  // load, a peer replica's watch-folded write): those raise `hosts` with no beat
+  // to clear the cache, so without it a reconnect (or the all-retired/quiet fleet)
+  // keeps serving a stale `retiredUsage` (XERK-758 QA D1). A local ingest already
+  // invalidates via the beat, so it does NOT call this.
+  const b = new SharedLedgerBackend(liveStore, sharedOps(), {
+    onExternalChange: typeof onExternalChange === "function" ? onExternalChange : null,
+  });
+  await b.init();
+  backend = b;
+  console.log("usage ledger: using the shared store (HA) for durable spend history");
 }
 
 // A host name reaches the log from an agent-supplied field, so it gets the same
@@ -938,7 +1050,13 @@ function ingest(key, record, now = Date.now()) {
   // model appears.
   if (grew) enforceHostShare(key, entry);
   entry.augments = augments;
-  if (augments || fresh) scheduleSave(); else scheduleSnapshot();
+  // Persist through the pluggable backend (XERK-758): the file backend rewrites
+  // its JSON (a fresh/augmenting beat promptly, a re-stating one on the slow
+  // snapshot timer); the shared backend folds this host into the store via an
+  // atomic per-host max-merge. The in-memory model above is already updated
+  // synchronously either way, so the serve path (`fold`/`retiredAgents`) is
+  // unaffected by which backend persists.
+  backend.onChange(key, augments || fresh);
 }
 
 // What one series is SERVED as: everything recorded, raised by the newest report.
@@ -1210,7 +1328,7 @@ function forget(key) {
   if (!Object.prototype.hasOwnProperty.call(hosts, key)) return false;
   delete hosts[key];
   shortfallLoggedAt.delete(key);
-  scheduleSave();
+  backend.onForget(key);
   return true;
 }
 
@@ -1222,7 +1340,7 @@ function has(key) {
 load();
 
 module.exports = {
-  ingest, fold, retiredAgents, forget, has, flush,
+  ingest, fold, retiredAgents, forget, has, flush, configure,
   LEDGER_FILE, LEDGER_MAX, LEDGER_DAYS, LEDGER_HOSTS, LEDGER_REPOS, RETIRED_MAX,
   LEDGER_MODELS, LEDGER_NAME_MAX, hostShare,
   SYSTEM_USAGE_REPO, isSystemUsageRepo, foldSystemRepos,
@@ -1234,7 +1352,16 @@ module.exports = {
       shortfallLoggedAt.clear();
       if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
       if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
+      // Restore the default file backend so a test that swapped in the shared one
+      // (via `configure`) does not leak it into the next test.
+      if (backend !== fileBackend) { try { backend.close(); } catch { /* noop */ } }
+      backend = fileBackend;
     },
+    // The shared-backend seam, for usage-ledger-shared.test.js to drive it against
+    // an in-memory FileLiveStore without a live Valkey.
+    sharedOps, mergeTwoEntries,
+    setBackend(b) { backend = b; },
+    getBackend: () => backend,
     // Test seam for the `grew` gate: its entire effect is that enforceHostShare
     // does NOT run on a numbers-only beat, which nothing else can observe.
     // **Read it as a DELTA, never as an absolute** — `reset()` deliberately does
