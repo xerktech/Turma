@@ -53,6 +53,7 @@ const usageLedger = require("./usage-ledger.js");
 // it. See docs/turma-ha-store-adr.md.
 const { resolveHaConfig } = require("./ha-config.js");
 const { createLiveStore, sameValue } = require("./store.js");
+const { createLeader } = require("./leader.js");
 
 // XERK-757 externalized-store persistence config, declared here so it can be
 // handed to the module-load store below. It maps each `policy:<name>` store key to
@@ -116,6 +117,110 @@ const AGENT_STORE_PREFIX = "agent:";
 // A beat's ~8s cadence and the 75s offline window make ~1s propagation to a warm
 // standby ample; it is not on the request path (writes are fire-and-forget).
 const HA_STORE_DEBOUNCE_MS = positiveEnv("HA_STORE_DEBOUNCE_MS", 1000);
+
+// ---- Leader election + shared single-flight guards (XERK-763, epic XERK-751) --
+// Under Option 2 (docs/turma-ha-design.md) the hub runs as N replicas but the
+// SINGLETON background work — the offline-detection sweep, the master
+// orchestration tick (auto-start/stop, epic runs, auto-merge/close, drain) and
+// migration-advance — must run on EXACTLY ONE replica or every fleet-wide action
+// fires N times. `hubLeader` (a k8s-Lease elector under HA, an always-leader
+// StandaloneLeader otherwise) decides which; the sweeps gate on `isLeader()`.
+// Non-HA and HA-without-a-lease are trivially always-leader, so with HA off this
+// is byte-identical to today. Wired at boot (or injected by a test) — see
+// __setLeader / the boot block. Mechanics: turma/leader.js, turma-ha-leader.md.
+let hubLeader = null;
+function isLeader() {
+  // No elector (non-HA production before the boot wire, or a test with none
+  // injected) is trivially the leader — single-process runs every sweep.
+  return !hubLeader || hubLeader.isLeader();
+}
+
+// The in-memory single-flight/dedup guards the sweeps rely on
+// (`autoStarted`/`autoStopped`/`cmdHosts`/`createInFlight`/`ticketDispatchedAt`/
+// `epicDoneWritten`/`autoCloseNotified`/`epicChildAttempts`, and the resume
+// exemption) are WRITE-THROUGH mirrored to the shared store under `guard:<name>:`
+// and HYDRATED on leader promotion, so a leader FAILOVER mid-flight does not
+// re-fire an action the old leader already guarded. Each guard keeps its native
+// Map/Set as the SYNCHRONOUS read/write the sweeps use (unchanged); the store is
+// the durability/handover backend on top, exactly the wave-3 pattern
+// (turma-ha-registry.md). HA off: every call below early-returns, byte-identical
+// to today. Bounded by a per-write TTL (the store self-expires stale guards, so
+// LRU-eviction deletes need not propagate; only MEANINGFUL clears do).
+const GUARD_STORE_PREFIX = "guard:";
+// Generous default TTL: registry records live 7 days, so a guard the store still
+// holds past that is stale by any measure. Per-guard overrides match the native
+// TTLs (cmdHosts/createInFlight/dispatch memo) so a hydrated guard never outlives
+// what the in-memory copy would have.
+const GUARD_DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const guardMirrors = []; // {name, prefix, ttlMs, apply(key,value)}
+function registerGuardMirror(name, spec = {}) {
+  guardMirrors.push({
+    name,
+    prefix: GUARD_STORE_PREFIX + name + ":",
+    ttlMs: spec.ttlMs || GUARD_DEFAULT_TTL_MS,
+    apply: spec.apply,
+  });
+}
+function guardMirrorOf(name) {
+  return guardMirrors.find((g) => g.name === name);
+}
+function guardWriteFailed(e) {
+  // A store blip must never fail the mutation it followed nor throw in a timer
+  // (XERK-235) — the in-memory guard already reflects the change; a promoted
+  // leader re-hydrates, and a live host/sweep re-derives what a dropped write lost.
+  console.error(`guard store write failed: ${(e && e.message) || e}`);
+}
+// Write-through a guard entry. `value` is JSON-shaped (a Set stores `1`); pass a
+// per-call TTL to match the native structure's own expiry.
+function guardStoreSet(name, key, value, ttlMs) {
+  if (!HA_ON || !liveStore) return;
+  const g = guardMirrorOf(name);
+  const prefix = g ? g.prefix : GUARD_STORE_PREFIX + name + ":";
+  const ttl = ttlMs || (g ? g.ttlMs : GUARD_DEFAULT_TTL_MS);
+  Promise.resolve(liveStore.set(prefix + key, value == null ? 1 : value, { ttlMs: ttl })).catch(
+    guardWriteFailed
+  );
+}
+function guardStoreDel(name, key) {
+  if (!HA_ON || !liveStore) return;
+  const g = guardMirrorOf(name);
+  const prefix = g ? g.prefix : GUARD_STORE_PREFIX + name + ":";
+  Promise.resolve(liveStore.del(prefix + key)).catch(guardWriteFailed);
+}
+// Rebuild every registered guard's in-memory Map/Set from the store. Run on
+// leader promotion (and boot-as-leader), so a newly-promoted leader inherits the
+// old leader's in-flight guards rather than re-firing their actions. Merges into
+// the (empty, on a fresh standby) native structure via each guard's `apply`.
+async function hydrateGuards() {
+  if (!HA_ON || !liveStore || typeof liveStore.scan !== "function") return;
+  for (const g of guardMirrors) {
+    if (typeof g.apply !== "function") continue;
+    let rows;
+    try {
+      rows = await liveStore.scan(g.prefix);
+    } catch (e) {
+      console.error(`guard hydrate (${g.name}) failed: ${(e && e.message) || e}`);
+      continue;
+    }
+    for (const { key, value } of rows) {
+      try {
+        g.apply(key.slice(g.prefix.length), value);
+      } catch (e) {
+        console.error(`guard hydrate (${g.name}) apply failed: ${(e && e.message) || e}`);
+      }
+    }
+  }
+}
+// Fired when THIS replica acquires leadership (and once at boot when it is the
+// leader). Re-hydrates the singleton state the old leader owned so the handover
+// re-fires nothing: the migration record Map (its own hydrate) and the guards.
+function onLeaderPromoted() {
+  if (!HA_ON) return;
+  hydrateMigrations().catch((e) =>
+    console.error(`leader promotion: migration hydrate failed: ${(e && e.message) || e}`));
+  hydrateGuards().catch((e) =>
+    console.error(`leader promotion: guard hydrate failed: ${(e && e.message) || e}`));
+}
 
 const PORT = positiveEnv("PORT", 8300);
 
@@ -2868,6 +2973,12 @@ function epicBuilderDriveSweep() {
 // forever. Dropped the moment the child is seen started or settled, so it stays
 // as small as the set of children currently failing to start. Bounded below.
 const epicChildAttempts = new Map();
+// XERK-763: mirror the epic-child dispatch backoff (the driver's twin of
+// `autoStarted`) so a leader failover does not reset it and re-dispatch a child
+// the agent keeps acking-without-a-session every 15s.
+registerGuardMirror("epicChildAttempts", {
+  apply: (k, rec) => { if (rec) epicChildAttempts.set(k, rec); },
+});
 // A backstop cap so a long series of arm/clear cycles cannot grow the map without
 // bound; in practice it only ever holds currently-failing children, cleared on
 // success. Oldest entry (Map insertion order) evicted first — it re-stamps on its
@@ -2976,12 +3087,12 @@ function epicRunDriveSweep() {
       // Only a To Do child is a fresh start; one already Done, in progress or in
       // review is being handled (or finished) and must not gain a second session
       // — and it is settled, so forget any backoff we were holding for it.
-      if (cat && cat !== "todo") { epicChildAttempts.delete(k); continue; }
+      if (cat && cat !== "todo") { epicChildAttempts.delete(k); guardStoreDel("epicChildAttempts", k); continue; }
       if (!epicChildBlockersDone(row, run, rows)) continue;   // a blocker isn't Done yet
       if (!started) started = startedTicketKeys();
       // A session on any channel is the definitive "started" — clear the backoff
       // so a child that later re-enters To Do (a rare human move) starts clean.
-      if (started.has(k)) { epicChildAttempts.delete(k); continue; }
+      if (started.has(k)) { epicChildAttempts.delete(k); guardStoreDel("epicChildAttempts", k); continue; }
       if (liveQueuedTicket(siteKey, childKey)) continue;      // already waiting in line
       if (spawnTicketInFlight(siteKey, childKey)) continue;   // a spawn is riding a queue
       if (committedTicketSpawn(siteKey, childKey)) continue;  // committed to a host
@@ -3002,7 +3113,9 @@ function epicRunDriveSweep() {
       // complete, not for capacity backpressure the queue already handles).
       if (!enqueueTicketStart(siteKey, childKey, "manual")) continue;
       const attempts = Math.min((prior ? prior.attempts : 0) + 1, AUTO_START_BACKOFF_STEPS);
-      epicChildAttempts.set(k, { attempts, nextAt: autoStartRetryAt(now, attempts) });
+      const rec = { attempts, nextAt: autoStartRetryAt(now, attempts) };
+      epicChildAttempts.set(k, rec);
+      guardStoreSet("epicChildAttempts", k, rec);
     }
     advanceEpicRunState(run, rows);
   }
@@ -6216,12 +6329,21 @@ function pickBoardWriteHost(siteKey, kind) {
 const cmdHosts = new Map(); // cmdId -> {host, at}
 const CMD_HOST_TTL_MS = 30 * 60 * 1000;
 const CMD_HOST_MAX = 200;
+// XERK-763: mirror the cmd->host ownership so a promoted leader still reads a
+// board create/status poll's outcome off the right host (else it falls back to
+// the fleet scan, an equivalent but slower answer).
+registerGuardMirror("cmdHosts", {
+  ttlMs: CMD_HOST_TTL_MS,
+  apply: (cmdId, rec) => { if (rec) cmdHosts.set(cmdId, rec); },
+});
 function rememberCmdHost(cmdId, host, kind) {
   const now = Date.now();
   for (const [id, e] of cmdHosts) {
     if (now - e.at > CMD_HOST_TTL_MS) cmdHosts.delete(id);
   }
-  cmdHosts.set(cmdId, { host, kind, at: now });
+  const rec = { host, kind, at: now };
+  cmdHosts.set(cmdId, rec);
+  guardStoreSet("cmdHosts", cmdId, rec, CMD_HOST_TTL_MS);
   while (cmdHosts.size > CMD_HOST_MAX) cmdHosts.delete(cmdHosts.keys().next().value);
 }
 // The recorded owner if it still reports the org, else any host of the org that
@@ -6273,6 +6395,12 @@ const createInFlight = new Map(); // fingerprint -> {cmdId, host, at}
 const CREATE_INFLIGHT_TTL_DEFAULT_MS = RESULT_WAIT_MAX_MS;
 const CREATE_INFLIGHT_TTL_MS = positiveEnv(
   "CREATE_INFLIGHT_TTL_MS", CREATE_INFLIGHT_TTL_DEFAULT_MS);
+// XERK-763: mirror the in-flight create single-flight so a leader failover mid-
+// create does not open a SECOND ticket for a retry that arrives on the new leader.
+registerGuardMirror("createInFlight", {
+  ttlMs: CREATE_INFLIGHT_TTL_MS,
+  apply: (fp, rec) => { if (rec) createInFlight.set(fp, rec); },
+});
 // Hashed, and over the WHOLE body rather than the title alone: two tickets that
 // share a title but differ in description or labels are DIFFERENT tickets, and
 // folding them would not just suppress a retry — it would discard the second
@@ -6310,11 +6438,19 @@ function findCreateInFlight(siteKey, project, issueType, summary, description, l
 // must open a new write rather than rejoin the one just written off.
 function forgetCreateInFlight(cmdId) {
   for (const [fp, e] of createInFlight) {
-    if (e.cmdId === cmdId) createInFlight.delete(fp);
+    if (e.cmdId === cmdId) {
+      createInFlight.delete(fp);
+      // A MEANINGFUL clear (the hub reported this create failed) must propagate,
+      // so a promoted leader does not rejoin a create the operator has been told
+      // to retry (XERK-763).
+      guardStoreDel("createInFlight", fp);
+    }
   }
 }
 function rememberCreateInFlight(fields, cmdId, host) {
-  createInFlight.set(createFp(...fields), { cmdId, host, at: Date.now() });
+  const fp = createFp(...fields);
+  createInFlight.set(fp, { cmdId, host, at: Date.now() });
+  guardStoreSet("createInFlight", fp, { cmdId, host, at: Date.now() }, CREATE_INFLIGHT_TTL_MS);
   while (createInFlight.size > CMD_HOST_MAX) {
     createInFlight.delete(createInFlight.keys().next().value);
   }
@@ -10006,7 +10142,11 @@ function heartbeatAlerts(key, prev, next) {
 // Offline detection is time-driven, not heartbeat-driven, so it needs a sweep.
 // unref'd for the same reason as the save timer: the server socket is what
 // keeps the process alive in production.
-setInterval(() => {
+// Offline-detection sweep, a named unit (XERK-763) so the leader gate is
+// behaviorally testable. Singleton — only the leader runs it, or N replicas fire
+// N duplicate offline FCM alerts (and judge offline against a partial fleet view).
+function offlineDetectionTick() {
+  if (!isLeader()) return;
   const now = Date.now();
   if (now - BOOT_AT < BOOT_GRACE_MS) return;
   for (const [key, a] of Object.entries(agents)) {
@@ -10029,7 +10169,8 @@ setInterval(() => {
     // `online` flag is now stale) and push the transition to dashboards.
     publishAgent(key);
   }
-}, 15 * 1000).unref();
+}
+setInterval(offlineDetectionTick, 15 * 1000).unref();
 
 // ---- auto-start To Do tickets (XERK-32) ------------------------------------
 // Opt-in PER ORG via the hub's own per-org toggle (autoStartOrgs, XERK-41 —
@@ -10091,6 +10232,13 @@ const AUTO_START_BACKOFF_STEPS = 5;
 // moment the ticket is seen to have a session, so this stays as small as the set
 // of tickets currently failing to start.
 const autoStarted = new Map();
+// XERK-763: mirror the auto-start attempt/backoff record so a leader failover
+// does not reset a ticket's growing backoff and re-dispatch a spawn the agent
+// keeps refusing every sweep (the durable `startedTicketKeys` still prevents a
+// true double-start; this preserves the anti-churn backoff across the handover).
+registerGuardMirror("autoStarted", {
+  apply: (k, rec) => { if (rec) autoStarted.set(k, rec); },
+});
 
 // When to try again after `attempts` failed attempts: 1min, 2min, 4min, 8min, then
 // held at AUTO_START_RETRY_MAX_MS (10min) for good.
@@ -10247,6 +10395,13 @@ const ticketQueue = [];
 // Start has superseded (withdraw it, never re-queue — XERK-540). Bounded by the
 // prune in rememberDispatch.
 const ticketDispatchedAt = new Map();
+// XERK-763: mirror the dispatch memo so a promoted leader still tells "you
+// already cancelled this" from "this started a moment ago" (XERK-540's
+// supersede check reads it too).
+registerGuardMirror("dispatch", {
+  ttlMs: TICKET_DISPATCH_MEMO_MS,
+  apply: (tk, rec) => { if (rec) ticketDispatchedAt.set(tk, rec); },
+});
 
 // XERK-485 [E]: per-org rolling-window rate limit on AUTO dispatches.
 // siteKey -> [{at, key}] of the auto dispatches still inside the window.
@@ -10424,7 +10579,9 @@ function rememberDispatch(siteKey, issueKey, cmdId) {
   for (const [k, rec] of ticketDispatchedAt) {
     if (now - rec.at > TICKET_DISPATCH_MEMO_MS) ticketDispatchedAt.delete(k);
   }
-  ticketDispatchedAt.set(ticketQueueKey(siteKey, issueKey), { at: now, cmdId });
+  const tk = ticketQueueKey(siteKey, issueKey);
+  ticketDispatchedAt.set(tk, { at: now, cmdId });
+  guardStoreSet("dispatch", tk, { at: now, cmdId }, TICKET_DISPATCH_MEMO_MS);
 }
 
 function dispatchedRecently(siteKey, issueKey) {
@@ -10876,7 +11033,9 @@ function drainTicketQueue() {
       const prior = autoStarted.get(k);
       const attempts = Math.min((prior ? prior.attempts : 0) + 1,
         AUTO_START_BACKOFF_STEPS);
-      autoStarted.set(k, { attempts, nextAt: autoStartRetryAt(now, attempts) });
+      const rec = { attempts, nextAt: autoStartRetryAt(now, attempts) };
+      autoStarted.set(k, rec);
+      guardStoreSet("autoStarted", k, rec);
       // XERK-485 [E]: this dispatch counts against the org's rate window.
       recordAutoStartRate(e.siteKey, k, now);
       if (attempts > 1) {
@@ -11188,7 +11347,7 @@ function autoStartSweep() {
       // A session exists on some channel — the work is under way (or was, and
       // was deliberately killed). Done with this ticket for good; drop any
       // attempt record so the map only ever holds tickets still failing.
-      if (started.has(k)) { autoStarted.delete(k); continue; }
+      if (started.has(k)) { autoStarted.delete(k); guardStoreDel("autoStarted", k); continue; }
       // XERK-486 [F]: the operator's per-ticket verdict outranks everything the
       // model said. Hold and reject keep the ticket out of the auto stream no
       // matter its triage block; approve forces eligibility past the triage
@@ -11491,6 +11650,12 @@ function dedupeLinkSweep() {
 // re-issued kill of an already-dead session is a harmless no-op the agent
 // ignores, and a still-live session re-derives into the sweep on its own.
 const autoStopped = new Set(); // "<host>\x00<sessionId>" already auto-stopped
+// XERK-763: mirror the auto-stop dedup so a leader failover does not re-issue a
+// kill for a session it already stopped (harmless but noisy) while the killed
+// record is still in its clearing window.
+registerGuardMirror("autoStopped", {
+  apply: (dk) => autoStopped.add(dk),
+});
 // "<host>\x00<sessionId>" of a session the operator deliberately resumed while
 // its ticket was Done (XERK-561) — exempt from autoStopSweep's re-kill. Kept
 // SEPARATE from autoStopped on purpose: autoCloseSweep also reads autoStopped,
@@ -11499,6 +11664,12 @@ const autoStopped = new Set(); // "<host>\x00<sessionId>" already auto-stopped
 // autoStopped it needs no durability — a hub restart clears it, and the worst a
 // lost entry costs is one re-kill the operator resumes past again.
 const autoStopResumeExempt = new Set();
+// XERK-763: mirror the resume exemption so a leader failover does not re-kill a
+// session the operator deliberately resumed while its ticket was Done (XERK-561)
+// — the exemption is seated on the request path, which only the leader serves.
+registerGuardMirror("autoStopResumeExempt", {
+  apply: (dk) => autoStopResumeExempt.add(dk),
+});
 
 function autoStopSweep() {
   // The set of now-Done tickets across EVERY reporting org — no opt-in gate —
@@ -11533,6 +11704,7 @@ function autoStopSweep() {
       if (autoStopped.has(dk) || autoStopResumeExempt.has(dk)) continue;
       queueCommand(host, { type: "kill", sessionId: s.id });
       autoStopped.add(dk);
+      guardStoreSet("autoStopped", dk, 1);
     }
   }
 }
@@ -11565,6 +11737,7 @@ function markResumedTicketAutoStopExempt(host, sessionId) {
     if (row && row.statusCategory === "done"
         && ticketQueueKey(siteKey, row.key) === tk) {
       autoStopResumeExempt.add(host + "\x00" + sessionId);
+      guardStoreSet("autoStopResumeExempt", host + "\x00" + sessionId, 1);
       return;
     }
   }
@@ -11750,6 +11923,16 @@ const autoMergeState = new Map();
 // hub restart at worst re-sends one message.
 const autoCloseNotified = new Map();
 const AUTO_CLOSE_NOTIFY_MAX = 500;
+// XERK-763: mirror which merged-PR urls a session was already messaged about, so
+// a leader failover does not re-send the self-close nudge for a PR set already
+// handled. The `urls` Set is stored as an array and rebuilt on hydrate.
+registerGuardMirror("autoCloseNotified", {
+  apply: (nk, rec) => {
+    if (rec && typeof rec.at === "number") {
+      autoCloseNotified.set(nk, { at: rec.at, urls: new Set(Array.isArray(rec.urls) ? rec.urls : []) });
+    }
+  },
+});
 // The message typed into the session (the operator `input` path, so it survives a
 // compaction via the agent's pendingInputs outbox — agent-input.md). Kept close to
 // the ticket's own wording; it is a directive to act, not third-party text, so it
@@ -11765,6 +11948,12 @@ const AUTO_CLOSE_MERGED_MESSAGE =
 // marked done is skipped by state, and the setTicketStatus write is re-validated
 // against a fresh read agent-side, so a rare double-write is a harmless no-op.
 const epicDoneWritten = new Set();
+// XERK-763: mirror the once-per-run epic-Done guard so a leader failover does not
+// re-issue the epic-Done tracker write (the epic's own board Done is the durable
+// backstop; this keeps the handover from a redundant write attempt).
+registerGuardMirror("epicDoneWritten", {
+  apply: (tkey) => epicDoneWritten.add(tkey),
+});
 // url -> the first sweep-time (ms) an armed epic child's PR was seen in the
 // "no CI checks + MERGEABLE" state (XERK-659). That state is AMBIGUOUS exactly as
 // prAlertDecision documents: a just-opened PR reports an EMPTY check rollup for a
@@ -11989,7 +12178,9 @@ function autoCloseSweep() {
       const fresh = seen ? mergedUrls.some((u) => !seen.has(u)) : mergedUrls.length > 0;
       if (fresh) {
         queueCommand(host, { type: "input", sessionId: s.id, text: AUTO_CLOSE_MERGED_MESSAGE });
-        autoCloseNotified.set(nk, { at: Date.now(), urls: new Set(mergedUrls) });
+        const at = Date.now();
+        autoCloseNotified.set(nk, { at, urls: new Set(mergedUrls) });
+        guardStoreSet("autoCloseNotified", nk, { at, urls: [...mergedUrls] });
       }
     }
   }
@@ -12054,6 +12245,7 @@ function epicRunCompleteSweep() {
       awaitResult(agents[wh], cmdId, "setTicketStatus");
       rememberCmdHost(cmdId, wh, "setTicketStatus");
       epicDoneWritten.add(tkey);
+      guardStoreSet("epicDoneWritten", tkey, 1);
     }
     // The epic is Done or its write is on its way — ensure the run is terminal.
     // Usually a no-op (advanceEpicRunState already set state:"done" this tick),
@@ -12076,7 +12268,13 @@ function epicRunCompleteSweep() {
 // block and route through findTicketHost, so they no-op until a host re-heartbeats
 // anyway — this is belt-and-suspenders, kept out of the sweeps themselves so they
 // stay pure, directly-callable units.)
-setInterval(() => {
+// The master orchestration tick, extracted into a named unit (XERK-763) so the
+// leader gate is behaviorally testable. Only the LEADER runs it — this is the
+// SINGLETON that spawns, kills, merges PRs, closes tickets and writes back to the
+// tracker fleet-wide, so every action must fire on EXACTLY ONE replica. Non-HA /
+// standalone is always leader, so this is byte-identical to today.
+function masterOrchestrationTick() {
+  if (!isLeader()) return;
   if (Date.now() - BOOT_AT < BOOT_GRACE_MS) return;
   // Work dispatched to a host that then died before taking it goes back in the
   // queue (XERK-303), in time for the drain at the end of this same tick to hand
@@ -12112,15 +12310,24 @@ setInterval(() => {
   // it lands. The heartbeat drains too (that's where capacity actually changes);
   // this is the backstop for a fleet that is quiet but full.
   drainTicketQueue();
-}, AUTO_START_EVERY_MS).unref();
+}
+setInterval(masterOrchestrationTick, AUTO_START_EVERY_MS).unref();
 
 // Migration timeouts + settled-record cleanup (the fast handoff runs on the
 // target's heartbeat; this is the fallback that fails a stuck move and retires a
 // done one). Runs regardless of boot grace — a migration is only ever created
 // after boot, by an explicit operator action.
-setInterval(() => {
+// Migration-advance timer, a named unit (XERK-763) for the same testability
+// reason. Leader-only: advance kills the source + finishes the move, a singleton.
+// (The fast handoff on the target's heartbeat reaches whichever replica the
+// target beats to, which under Option 2 is the leader; a newly-promoted leader
+// hydrates the migrations Map so it can advance a move the old leader started —
+// session-migration.md, onLeaderPromoted.)
+function migrationAdvanceTick() {
+  if (!isLeader()) return;
   if (migrations.size) advanceMigrations();
-}, 10 * 1000).unref();
+}
+setInterval(migrationAdvanceTick, 10 * 1000).unref();
 
 // Branded static assets: the shared stylesheet, self-hosted UI fonts (Inter +
 // Space Grotesk), and the icon/favicon set + web manifest. Read once into memory
@@ -16827,6 +17034,17 @@ if (process.env.TURMA_TEST) {
     // drive the per-host write-through and hydration, and pin the non-HA path off.
     __setLiveStore(store, on) { liveStore = store; HA_ON = !!on; },
     __getHaOn() { return HA_ON; },
+    // XERK-763: leader election + the shared single-flight guards. Exported so a
+    // test can inject a leader (drive isLeader() true/false), drive the guard
+    // write-through + hydration against an injected FileLiveStore, and pin the
+    // non-HA path off. `__setLeader(null)` restores always-leader.
+    isLeader,
+    __setLeader(leader) { hubLeader = leader; },
+    // The three gated tick UNITS the intervals call — exported so a test can drive
+    // the leader gate behaviorally (a non-leader replica does nothing).
+    masterOrchestrationTick, offlineDetectionTick, migrationAdvanceTick,
+    GUARD_STORE_PREFIX,
+    guardStoreSet, guardStoreDel, hydrateGuards, onLeaderPromoted,
     AGENT_STORE_PREFIX,
     publishAgent,
     markAgentDirty, markAgentRemoved,
@@ -17395,6 +17613,32 @@ if (process.env.TURMA_TEST) {
     console.error(`usage ledger: shared-store configure failed, staying on the local file: ${(e && e.message) || e}`);
   });
 
+  // ---- Leader election (XERK-763) ---------------------------------------
+  // Elect the ONE replica that runs the singleton sweeps + migration-advance.
+  // Non-HA -> a StandaloneLeader (always leader), so this is byte-identical to
+  // today. HA -> a k8s-Lease elector; on PROMOTION it hydrates the migration Map
+  // and the single-flight guards from the shared store so the handover re-fires
+  // no action the old leader already took. HA with no reachable k8s API degrades
+  // to always-leader with a loud warning (sweeps then run on every replica).
+  hubLeader = createLeader({
+    haOn: HA_ON,
+    env: process.env,
+    log: (m) => console.log(m),
+    onChange: (leader) => {
+      if (leader) {
+        console.log("leader: this replica is now the leader — running the singleton sweeps");
+        onLeaderPromoted();
+      } else {
+        console.log("leader: this replica is now a follower — singleton sweeps stand down");
+      }
+    },
+  });
+  console.log(
+    HA_ON
+      ? `leader election: ${hubLeader.kind === "k8s" ? "k8s Lease" : "standalone (" + hubLeader.mode + ")"}`
+      : "leader election: single-process (always leader)"
+  );
+
   // ---- Graceful shutdown (XERK-552) --------------------------------------
   // The hub is single-replica on an RWO volume, so a rolling deploy is a
   // stop-then-start: k8s sends SIGTERM, waits terminationGracePeriodSeconds,
@@ -17433,6 +17677,13 @@ if (process.env.TURMA_TEST) {
     if (hubDraining) return; // a second signal must not race the first drain
     hubDraining = true; // `/readyz` now answers 503 NotReady (liveness unaffected)
     console.log(`${signal} received — draining before exit`);
+
+    // XERK-763: renounce leadership FIRST so a warm standby promotes within a
+    // beat or two (release() backdates the lease's renewTime) instead of waiting
+    // out the whole lease duration — the fast-failover point of the deploy.
+    // Fire-and-forget: the drain below (and the force-exit backstop) never wait
+    // on it, and it never throws.
+    if (hubLeader) Promise.resolve(hubLeader.release()).catch(() => {});
 
     // Force-exit backstop, armed from signal receipt over the WHOLE budget so
     // the readiness delay + the flush together never overrun

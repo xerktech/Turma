@@ -15147,6 +15147,162 @@ test("XERK-761: the shared boot sweep keeps a live/fresh bundle, deletes only a 
   });
 });
 
+// ---- XERK-763: leader election + shared single-flight guards -----------------
+// Under HA (Option 2) the singleton sweeps + migration-advance run on the LEADER
+// only, and the guards those sweeps rely on are WRITE-THROUGH mirrored to the
+// shared store + HYDRATED on promotion so a leader FAILOVER re-fires nothing.
+// These drive the real FileLiveStore as the injected shared backend and an
+// injected leader; every one restores the non-HA path afterwards.
+
+// A fake leader whose isLeader() the test controls.
+const fakeLeader = (leader) => ({ kind: "test", isLeader: () => leader });
+
+// Run a body with HA on and a FileLiveStore as the shared store, ALWAYS
+// restoring the non-HA default afterwards (the byte-identical path every other
+// test depends on).
+async function withGuardStore(fn) {
+  const store = new FileLiveStore();
+  hub.__setLiveStore(store, true);
+  try {
+    await fn(store);
+  } finally {
+    hub.__setLiveStore(hub.liveStore, false); // restore the original store, HA off
+    store.close();
+  }
+}
+
+test("XERK-763: isLeader() is always true with no elector, and follows an injected one", () => {
+  hub.__setLeader(null);
+  assert.equal(hub.isLeader(), true, "no elector -> single-process is always the leader");
+  hub.__setLeader(fakeLeader(false));
+  assert.equal(hub.isLeader(), false, "a follower replica reports not-leader");
+  hub.__setLeader(fakeLeader(true));
+  assert.equal(hub.isLeader(), true);
+  hub.__setLeader(null); // restore
+});
+
+test("XERK-763: migrationAdvanceTick runs the advance only on the leader", () => {
+  const id = "ff00ff00ff00ff00";
+  const seed = () => migrations.set(id, {
+    id, phase: "done", srcHost: "lx", targetHost: "ly", restore: false,
+    at: 0, startedAt: Date.now(), blobPath: null,
+  });
+
+  // A follower replica advances nothing — the settled record is left in place.
+  seed();
+  hub.__setLeader(fakeLeader(false));
+  hub.migrationAdvanceTick();
+  assert.equal(migrations.has(id), true, "a follower must not advance/retire the move");
+
+  // The leader advances it — the settled record is retired.
+  hub.__setLeader(fakeLeader(true));
+  hub.migrationAdvanceTick();
+  assert.equal(migrations.has(id), false, "the leader retires the settled record");
+  hub.__setLeader(null);
+  migrations.delete(id);
+});
+
+test("XERK-763: HA OFF — a guard mutation writes NOTHING to the store (byte-identical)", async () => {
+  const store = new FileLiveStore();
+  hub.__setLiveStore(store, false); // HA explicitly OFF
+  try {
+    hub.guardStoreSet("autoStopped", "hoff\x00soff", 1);
+    hub.guardStoreDel("autoStopped", "hoff\x00soff");
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(await store.scan(hub.GUARD_STORE_PREFIX), [],
+      "with HA off the guard write-through is inert");
+  } finally {
+    hub.__setLiveStore(hub.liveStore, false);
+    store.close();
+  }
+});
+
+test("XERK-763: a Set guard writes through and hydrates back (autoStopped)", async () => {
+  await withGuardStore(async (store) => {
+    autoStopped.clear();
+    // A real sweep stamps the guard AND writes it through.
+    await doneBeat("leadHost", "lead1.atlassian.net");
+    autoStopSweep();
+    const dk = "leadHost\x00sd1";
+    assert.ok(autoStopped.has(dk), "the sweep still stamps the in-memory guard");
+    assert.deepEqual((agents.leadHost.commands || []).map((c) => c.type), ["kill"]);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(await store.get(hub.GUARD_STORE_PREFIX + "autoStopped:" + dk), 1,
+      "the guard is mirrored to the shared store");
+
+    // A newly-promoted leader (empty Set) rebuilds it from the store, so it does
+    // NOT re-issue the kill it already sent.
+    autoStopped.clear();
+    assert.equal(autoStopped.has(dk), false);
+    await hub.hydrateGuards();
+    assert.ok(autoStopped.has(dk), "hydrate rebuilds the guard on promotion");
+    autoStopped.clear();
+  });
+});
+
+test("XERK-763: a Map guard round-trips its value through the store (autoStarted)", async () => {
+  await withGuardStore(async (store) => {
+    autoStarted.clear();
+    const k = "map1.atlassian.net\x00ENG-1";
+    hub.guardStoreSet("autoStarted", k, { attempts: 3, nextAt: 987654 });
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(await store.get(hub.GUARD_STORE_PREFIX + "autoStarted:" + k),
+      { attempts: 3, nextAt: 987654 });
+    await hub.hydrateGuards();
+    assert.deepEqual(autoStarted.get(k), { attempts: 3, nextAt: 987654 },
+      "the {attempts,nextAt} record is rebuilt intact");
+    autoStarted.clear();
+  });
+});
+
+test("XERK-763: the autoCloseNotified urls Set survives the round-trip", async () => {
+  await withGuardStore(async () => {
+    autoCloseNotified.clear();
+    const nk = "cn\x00scn";
+    hub.guardStoreSet("autoCloseNotified", nk, { at: 111, urls: ["u1", "u2"] });
+    await new Promise((r) => setImmediate(r));
+    await hub.hydrateGuards();
+    const rec = autoCloseNotified.get(nk);
+    assert.ok(rec && rec.urls instanceof Set, "urls is rebuilt as a Set");
+    assert.deepEqual([...rec.urls].sort(), ["u1", "u2"]);
+    assert.equal(rec.at, 111);
+    autoCloseNotified.clear();
+  });
+});
+
+test("XERK-763: a MEANINGFUL clear propagates so a promoted leader does not re-guard", async () => {
+  await withGuardStore(async (store) => {
+    epicChildAttempts.clear();
+    const k = "del1.atlassian.net\x00ENG-2";
+    hub.guardStoreSet("epicChildAttempts", k, { attempts: 1, nextAt: 5 });
+    await new Promise((r) => setImmediate(r));
+    assert.ok(await store.get(hub.GUARD_STORE_PREFIX + "epicChildAttempts:" + k));
+    hub.guardStoreDel("epicChildAttempts", k);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(await store.get(hub.GUARD_STORE_PREFIX + "epicChildAttempts:" + k), null,
+      "the cleared guard is removed from the store");
+    // A fresh hydrate must not resurrect it.
+    epicChildAttempts.clear();
+    await hub.hydrateGuards();
+    assert.equal(epicChildAttempts.has(k), false);
+  });
+});
+
+test("XERK-763: onLeaderPromoted hydrates the guards from the shared store", async () => {
+  await withGuardStore(async (store) => {
+    epicDoneWritten.clear();
+    // Another replica (the old leader) recorded a guard before the handover.
+    await store.set(hub.GUARD_STORE_PREFIX + "epicDoneWritten:site\x00EPIC-1", 1);
+    assert.equal(epicDoneWritten.has("site\x00EPIC-1"), false);
+    hub.onLeaderPromoted();
+    await new Promise((r) => setImmediate(r)); // let the async hydrate scans land
+    await new Promise((r) => setImmediate(r));
+    assert.ok(epicDoneWritten.has("site\x00EPIC-1"),
+      "promotion inherits the old leader's once-per-run epic-Done guard");
+    epicDoneWritten.clear();
+  });
+});
+
 test("migrate: a second move of the same session is single-flighted", async () => {
   await migHost("sfA", "sf.atlassian.net");
   await migHost("sfB", "sf.atlassian.net");
