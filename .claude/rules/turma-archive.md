@@ -12,6 +12,13 @@ paths:
 Split out of `.claude/rules/turma.md`. `CLAUDE.md` has the `/data` volume and what else shares it.
 The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules/agent-archive.md`.
 
+- **Under HA the archive's BYTES move to object storage as the of-record** (XERK-759,
+  `.claude/rules/turma-ha-archive.md`): a sync write sink (`archive.setBlobSink`) notes each durable
+  file, an off-beat worker mirrors it to the bucket, and a booting/promoted replica hydrates a local
+  working copy back and `rebuildIndex()`es. The per-replica SQLite index stays local + disposable
+  (no shared file to corrupt); the leader is the single owning writer. **HA off = byte-identical**:
+  the sink is unset, the local `ARCHIVE_DIR` tree is the of-record, and everything below is unchanged.
+
 - The hub hosts a **durable, searchable archive of ended sessions**: agents push each inactive
   transcript in, landing as organized files on `/data`
   (`/data/archive/<repo>/<YYYY-MM-DD>__<summary>__<host>__<shortId>.jsonl` + `.meta` sidecar),

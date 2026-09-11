@@ -119,6 +119,22 @@ This is the precise answer to the ticket's *"object storage (S3/MinIO) vs Postgr
 archive: **both, by layer** — bytes to object storage, index to Postgres — never SQLite over shared
 RWX, which the ticket rules out outright.
 
+> **Implementation note (XERK-759, the archive child).** The bytes-to-object-storage half landed as
+> specified. For the INDEX the child took the ticket's EXPLICIT alternative — *"designate a SINGLE
+> archive-writer"* — over this ADR's Postgres index, and the two are equivalent on the property that
+> matters: the SQLite index stays **per-replica, local and disposable** (`rebuildIndex` re-derives
+> every row, cursors included, from the object-store bytes a replica hydrates), so there is **no
+> shared SQLite file to corrupt** — a strictly stronger guarantee than "one writer of a shared
+> index" — and the leader is the single owning writer of the of-record (only it ingests, so only it
+> mirrors up). The driver was the **stdlib-only** constraint (the hub ships no `node_modules`, CI is
+> offline): a shared Postgres FTS index means hand-rolling a Postgres wire-protocol + SCRAM +
+> tsvector/tsquery client and porting archive.js's whole query/reclaim path onto it. `DATABASE_URL`
+> stays validated at boot but the ARCHIVE does not consume it (the usage ledger, XERK-758, is its
+> intended consumer); moving the index to Postgres later needs no change to the byte layer. The
+> single-writer option's cost — a promoted standby hydrates + rebuilds before serving archive reads,
+> 404ing "still syncing" until then — is accepted for Option 2, where failover is rare. Mechanics:
+> `.claude/rules/turma-ha-archive.md`.
+
 ---
 
 ## The abstract store contract (what hub code will target)

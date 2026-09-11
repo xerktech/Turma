@@ -54,6 +54,15 @@ const usageLedger = require("./usage-ledger.js");
 const { resolveHaConfig } = require("./ha-config.js");
 const { createLiveStore, sameValue } = require("./store.js");
 const { createLeader } = require("./leader.js");
+// The archive's object-store backend + mirror (XERK-759, epic XERK-751). The
+// durable archive's BYTES (rendered + raw layers) move to object storage as the
+// of-record so any replica can read them and the RWO volume is no longer the
+// archive's home (docs/turma-ha-store-adr.md). Requiring these is side-effect-
+// free (no socket dialled until wired at boot); with HA off `createBlobStore`
+// returns null, the mirror is never wired, and archive.js's local ARCHIVE_DIR
+// tree stays the of-record, byte-identical.
+const { createBlobStore } = require("./blobstore.js");
+const { ArchiveMirror } = require("./archive-mirror.js");
 
 // XERK-757 externalized-store persistence config, declared here so it can be
 // handed to the module-load store below. It maps each `policy:<name>` store key to
@@ -94,6 +103,14 @@ let liveStore = createLiveStore(haConfig.fatal.length ? { ha: false } : haConfig
   // registerExternalStore calls; read lazily per write). Ignored by SharedLiveStore.
   persistent: STORE_PERSISTENT,
 });
+
+// The archive blob store, created once at module load like `liveStore` (XERK-759).
+// null with HA off, or when a fatal HA config coerced us to the file backend —
+// so it never constructs against a half-validated ARCHIVE_S3_* set before the
+// boot branch can name the error and exit(2). Wired to archive.js + a drain
+// worker in the production boot branch below; nothing here touches the archive's
+// synchronous hot path.
+const archiveBlobStore = createBlobStore(haConfig.fatal.length ? { ha: false } : haConfig);
 
 // ---- HA fleet registry externalization (XERK-756, epic XERK-751) ------------
 // The `agents` fleet registry AND the per-host command queues (which ride each
@@ -3647,6 +3664,41 @@ async function hydrateMigrations() {
     migrations.set(value.id, { ...value, uploading: false, refusal: null });
   }
 }
+// ---- archive object-store mirror wiring (XERK-759) ------------------------
+// The archive's bytes move to object storage as the of-record under HA. The
+// mirror NOTES each file archive.js writes (sync sink), a worker DRAINS them up
+// off the beat, and HYDRATE pulls them back down + rebuilds the index at boot and
+// on promotion (the `leader` child, XERK-763). With HA off `archiveMirror` stays
+// null and archive.js's local tree is the of-record, unchanged. `reindex` opens
+// the DB and rebuilds it from the hydrated files (idempotent — bytesStored comes
+// back off the `.meta` sidecar, rawBytes/archiveBytes off the files).
+let archiveMirror = null;
+// How often the drain worker pushes newly-archived bytes up. Off the beat, so a
+// slow object store never touches the heartbeat budget (XERK-395).
+const ARCHIVE_MIRROR_DRAIN_MS = positiveEnv("ARCHIVE_MIRROR_DRAIN_MS", 15 * 1000);
+function setArchiveMirror(blobStore, ha) {
+  if (!ha || !blobStore) { archiveMirror = null; return; }
+  archiveMirror = new ArchiveMirror({
+    blobStore,
+    archiveDir: archive.ARCHIVE_DIR,
+    reindex: () => { archive.openDb(); archive.rebuildIndex(); },
+    // Single owning writer of the of-record. In Option 2 only the leader ingests
+    // (so only it has dirty files), and this gate makes that explicit; the real
+    // predicate is the not-yet-landed XERK-763 lease. Default true keeps a
+    // single-replica HA hub (or a fleet mid-rollout) mirroring.
+    isLeader: () => true,
+  });
+  archive.setBlobSink((p) => archiveMirror.note(p));
+}
+// The seam a promoted leader calls before it starts serving (XERK-763); also run
+// at boot. Best-effort — a store blip leaves the local copy stale, not the hub
+// down, and the next hydrate/agent re-push catches up.
+async function hydrateArchive() {
+  if (!archiveMirror) return;
+  try { await archiveMirror.hydrate(); }
+  catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
+}
+
 // The multi-replica-safe boot spool sweep (XERK-761). On a shared spool volume a
 // booting replica must NOT delete a bundle that belongs to a migration still in
 // flight under another replica. It keeps any spool file whose migration RECORD
@@ -3842,8 +3894,12 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
     // heartbeat rebuild already dropped the stored flag — and only until the
     // grace window lapses, past which a stuck update falls through to `offline`.
     updating: !online && a.updating && now < a.updating.until ? a.updating : null,
-    // Only true when this container's reverse tunnel is live right now.
-    terminalOnline: !!controlChannels[key],
+    // True when this container's reverse tunnel is live right now — held by THIS
+    // replica (`controlChannels`, the authoritative local truth) OR, under active-
+    // active HA, by another replica per the shared tunnel directory (XERK-764). A
+    // stale directory entry (owner crashed, del/TTL not yet seen) reads as offline
+    // via the freshness check, so a dead tunnel never lingers terminal-online.
+    terminalOnline: !!controlChannels[key] || hostTunnelOwnerLive(key),
     // Auto-start paused because this host's Claude subscription has hit a limit —
     // the weekly pace line (XERK-544) or the 5-hour cap (XERK-548). Emitted ONLY
     // when true, so an absent field is "not paused / can't tell" — the value every
@@ -4009,6 +4065,46 @@ const SSE_BUS_CHANNEL = "__turma_sse__";
 // frames a previous instance of itself once published.
 const SSE_REPLICA_ID = crypto.randomBytes(8).toString("hex");
 let sseBus = null; // { publish(event, dataObj) } in HA mode; null single-process.
+
+// ---- Cross-replica tunnel directory + control bus (XERK-764) ----------------
+// Each agent holds exactly ONE reverse-tunnel control channel, to ONE replica
+// (`controlChannels[host]` on that replica; `/agent/control`). Under active-active
+// HA a dashboard read of `terminalOnline`, or a queued command's poke, can land on
+// a DIFFERENT replica than the one holding the host's tunnel — and reading
+// `controlChannels` alone then answers "offline" for a host a sibling holds, and a
+// poke never reaches the agent. So the OWNING replica publishes a host->replica
+// DIRECTORY entry to the shared store (written on control-channel connect,
+// refreshed on the control ping, deleted on drop, TTL'd as a backstop), and every
+// replica keeps a hot in-memory MIRROR of it via a `watch` — the same pattern the
+// registry watch (XERK-756) uses to keep `agents` hot — so the SYNCHRONOUS reads on
+// the request path (`serializeAgent`'s `terminalOnline`) stay synchronous.
+//
+// This child lands the DIRECTORY + the control-plane fixes it enables:
+// `terminalOnline` telling the truth cross-replica, and cross-replica command poke
+// over the control bus. The DUPLEX BYTE-STREAM relay for `/term`, the `/live`
+// deltas and the `openChannel` data channel is a deliberately-deferred follow-up
+// (see `.claude/rules/turma-ha-tunnel.md`): until it lands those bytes still serve
+// only from the tunnel owner's replica, which is exactly the recommended Option-2
+// (leader-only-serving) topology's behaviour, so nothing regresses there.
+//
+// Non-HA (default): `hostTunnelOwners` stays empty and `controlBus` null, so
+// `terminalOnline` is purely `controlChannels` and a poke never leaves the process
+// — byte-identical to before.
+const HOST_REPLICA_PREFIX = "hostReplica:";
+const CONTROL_BUS_CHANNEL = "__turma_control__";
+// A directory entry is trusted only while FRESH: it is refreshed every
+// CONTROL_PING_EVERY_MS, so an entry older than a few missed refreshes is a dead or
+// handed-off tunnel whose `del` we may have missed. The store TTL is the backstop;
+// this freshness check is what makes a stale mirror entry read as "no owner" even
+// when the del/expiry never arrived (e.g. a crashed owner on the file backend).
+const HOST_REPLICA_TTL_MS = Math.max(CONTROL_DEAD_AFTER_MS, CONTROL_PING_EVERY_MS * 3);
+// host -> {replica, at}: the tunnel owners this replica knows from the directory.
+// Populated by watchTunnelDirectory + the boot scan, AND written synchronously for
+// this replica's OWN tunnels by publishHostTunnel/retireHostTunnel so the request
+// path never depends on a self-echo watch arriving first. `controlChannels` stays
+// the authoritative local truth; this mirror answers for OTHER replicas' tunnels.
+const hostTunnelOwners = Object.create(null);
+let controlBus = null; // { publish(msg) } in HA mode; null single-process.
 
 // Write one SSE frame to every open /api/events stream ON THIS PROCESS
 // (best-effort; a dead stream is dropped on its next failed write and by its
@@ -4176,6 +4272,151 @@ async function hydrateAgentsFromStore() {
   console.log(`hydrated ${loaded} agent record(s) from the HA store`);
 }
 
+// ---- Cross-replica tunnel directory (XERK-764) ------------------------------
+// Announce (or refresh) that THIS replica holds `host`'s control channel. The
+// store write carries a TTL so a crashed owner's entry expires even if its `del`
+// never runs. The mirror is also set SYNCHRONOUSLY so `terminalOnline` (and the
+// retire owner-guard) read the truth for our own tunnels without waiting on the
+// self-echo watch. Best-effort, fire-and-forget: a dropped write self-heals on the
+// next ping refresh, and an uncaught throw in a control-channel callback would take
+// the socket down.
+function publishHostTunnel(host) {
+  if (!HA_ON || !liveStore) return;
+  const at = Date.now();
+  hostTunnelOwners[host] = { replica: SSE_REPLICA_ID, at };
+  liveStore
+    .set(HOST_REPLICA_PREFIX + host, { replica: SSE_REPLICA_ID, at }, { ttlMs: HOST_REPLICA_TTL_MS })
+    .catch(storeWriteFailed);
+}
+
+// The control channel for `host` dropped on THIS replica: clear the directory
+// entry so other replicas stop reporting it terminal-online. Only `del` if the
+// mirror still shows US as the owner — if the host already reconnected to another
+// replica, that replica's newer `set` now owns the key and our `del` would wrongly
+// clear it (the true owner's next ping re-establishes it within CONTROL_PING_EVERY_MS
+// either way, but this avoids the flap). Clears our OWN mirror entry now so
+// `terminalOnline` on this replica falls to false immediately on the drop.
+function retireHostTunnel(host) {
+  if (!HA_ON || !liveStore) return;
+  const owner = hostTunnelOwners[host];
+  if (owner && owner.replica !== SSE_REPLICA_ID) return; // handed off — not ours to clear
+  delete hostTunnelOwners[host];
+  liveStore.del(HOST_REPLICA_PREFIX + host).catch(storeWriteFailed);
+}
+
+// Does a live tunnel for `host` exist on ANOTHER replica, per the directory mirror?
+// A stale entry (owner crashed, del/TTL not yet seen) reads as no-owner via the
+// freshness check, so a dead tunnel never lingers as terminal-online. Our OWN
+// tunnel is covered by `controlChannels` at the call site, so this need not exclude
+// self — but a self entry is fresh-checked identically and harmless.
+function hostTunnelOwnerLive(host) {
+  const o = hostTunnelOwners[host];
+  return !!o && Date.now() - o.at < HOST_REPLICA_TTL_MS;
+}
+
+// Watch the shared directory so owner changes on OTHER replicas land in the local
+// mirror (a `del`/expiry clears an entry, a `set` records/updates one). Idempotent;
+// a self-echo of our own write just re-sets the identical value.
+function watchTunnelDirectory() {
+  if (!HA_ON || !liveStore || typeof liveStore.watch !== "function") return;
+  liveStore.watch(HOST_REPLICA_PREFIX, (ev) => {
+    if (!ev || typeof ev.key !== "string") return;
+    const host = ev.key.slice(HOST_REPLICA_PREFIX.length);
+    if (!host) return;
+    if (ev.type === "del") { delete hostTunnelOwners[host]; return; }
+    const v = ev.value;
+    // The bus is shared infrastructure — never trust the shape.
+    if (!v || typeof v !== "object" || typeof v.replica !== "string" || typeof v.at !== "number") return;
+    hostTunnelOwners[host] = { replica: v.replica, at: v.at };
+  });
+}
+
+// Boot-time hydration of the directory mirror (like hydrateAgentsFromStore): read
+// every owner the store already holds, so a freshly-booted replica knows the
+// fleet's tunnels before its first watch event. A key a watch event already
+// populated during the async scan is left alone (fresher). Best-effort, never fatal.
+async function hydrateTunnelDirectory() {
+  if (!HA_ON || !liveStore || typeof liveStore.scan !== "function") return;
+  let rows;
+  try {
+    if (liveStore.ready) await liveStore.ready();
+    rows = await liveStore.scan(HOST_REPLICA_PREFIX);
+  } catch (e) {
+    console.error(`HA tunnel-directory hydrate failed: ${(e && e.message) || e}`);
+    return;
+  }
+  for (const { key, value } of rows) {
+    const host = key.slice(HOST_REPLICA_PREFIX.length);
+    if (!host || Object.prototype.hasOwnProperty.call(hostTunnelOwners, host)) continue; // watch won
+    if (!value || typeof value !== "object") continue;
+    if (typeof value.replica !== "string" || typeof value.at !== "number") continue;
+    hostTunnelOwners[host] = { replica: value.replica, at: value.at };
+  }
+}
+
+// Reclaim mirror entries whose owner stopped refreshing — a crashed owner whose
+// `retireHostTunnel` del never ran. On the SHARED (Valkey) backend a `PX`-TTL
+// EXPIRY fires NO watch event (the store announces only on an explicit set/del,
+// deliberately not via Redis keyspace notifications), so such an entry would
+// otherwise linger in this map for the process lifetime — the unbounded host-name
+// map class XERK-272 caps `agents` against. The freshness gate already keeps every
+// READ correct (a stale entry reads offline and is never poked); this frees the
+// memory. A LIVE owner's entry is refreshed within `HOST_REPLICA_TTL_MS` by its
+// ping-set arriving on the watch, so only genuinely-dead entries are removed. Runs
+// on a timer under HA; never throws (a plain map walk). (On the file backend the
+// TTL already fires a `del` watch that clears the entry, so this is a no-op there.)
+// `now` is injectable so a test can pin the EXACT freshness boundary (two
+// independent Date.now() reads would make an at==cutoff assertion flaky); the
+// timer and every production caller pass nothing and get Date.now(). The cutoff is
+// `< HOST_REPLICA_TTL_MS`'s complement, so the swept set is EXACTLY the set
+// `hostTunnelOwnerLive` reads as offline — the sweep never changes a read, only
+// frees memory.
+function sweepTunnelDirectory(now = Date.now()) {
+  const cutoff = now - HOST_REPLICA_TTL_MS;
+  for (const host of Object.keys(hostTunnelOwners)) {
+    const o = hostTunnelOwners[host];
+    if (!o || o.at <= cutoff) delete hostTunnelOwners[host];
+  }
+}
+
+// ---- Cross-replica control bus (XERK-764) -----------------------------------
+// A small addressed pub/sub for control signals a replica must send to the replica
+// that OWNS a host's tunnel — today just the heartbeat poke, kept extensible for the
+// deferred byte-stream relay. `makeControlBus` is standalone + store-injected so the
+// address routing is unit-testable without a live Valkey socket. A message is
+// addressed by `target` (a replica id); a replica ignores anything not for it.
+function makeControlBus(store, replicaId) {
+  store.subscribe(CONTROL_BUS_CHANNEL, (msg) => {
+    if (!msg || typeof msg !== "object" || msg.target !== replicaId) return;
+    if (msg.type === "poke" && typeof msg.host === "string") {
+      const cc = controlChannels[msg.host];
+      if (cc) { try { cc.sendPoke(); } catch { /* best-effort; the interval beat is the fallback */ } }
+    }
+  });
+  return {
+    publish(msg) {
+      // Best-effort, like the SSE bus: a store blip never fails the mutation that
+      // asked for the poke — the command still rides the host's next scheduled beat.
+      Promise.resolve(store.publish(CONTROL_BUS_CHANNEL, { origin: replicaId, ...msg })).catch(() => {});
+    },
+  };
+}
+
+// Poke `host`'s agent to heartbeat NOW so a just-queued command is delivered this
+// beat instead of up to a whole TURMA_INTERVAL later. If this replica holds the
+// tunnel, poke directly (the single-process path, unchanged). Otherwise, in HA, ask
+// the OWNING replica to poke over the control bus. A missed poke (no known/fresh
+// owner, tunnel down, store blip) just falls back to the scheduled beat.
+function pokeHost(host) {
+  const cc = controlChannels[host];
+  if (cc) { try { cc.sendPoke(); } catch { /* best-effort; the interval beat is the fallback */ } return; }
+  if (!HA_ON || !controlBus) return;
+  const owner = hostTunnelOwners[host];
+  if (!owner || owner.replica === SSE_REPLICA_ID) return; // no known REMOTE owner
+  if (Date.now() - owner.at >= HOST_REPLICA_TTL_MS) return; // stale — treat as gone
+  controlBus.publish({ type: "poke", target: owner.replica, host });
+}
+
 // Append a command to a host's queue with a fresh, stable cmdId. The heartbeat
 // reply re-sends the queue every beat until the agent acks the cmdId (at-least-
 // once delivery; the agent dedupes). Returns the cmdId for the API response.
@@ -4224,17 +4465,12 @@ function queueCommand(key, cmd) {
   publishAgent(key);
   // Poke the agent (if its control tunnel is up) to heartbeat immediately, so
   // the command it just enqueued is delivered in the next beat's reply within
-  // ~a round-trip rather than up to a whole TURMA_INTERVAL later. A missed poke
-  // (tunnel down) just falls back to the normal interval — the command still
-  // rides the next scheduled beat.
-  const cc = controlChannels[key];
-  if (cc) {
-    try {
-      cc.sendPoke();
-    } catch {
-      /* best-effort; the interval beat is the fallback */
-    }
-  }
+  // ~a round-trip rather than up to a whole TURMA_INTERVAL later. Under HA the
+  // tunnel may be held by another replica; pokeHost routes the poke over the
+  // control bus to its owner (XERK-764). A missed poke (tunnel down, no known
+  // owner) just falls back to the normal interval — the command still rides the
+  // next scheduled beat.
+  pokeHost(key);
   return cmdId;
 }
 
@@ -16653,6 +16889,10 @@ server.on("upgrade", async (req, socket, head) => {
     // Terminal tunnel just came up — the host's `terminalOnline` flag flipped,
     // so refresh the cached payload and push it (Attach buttons enable live).
     publishAgent(name);
+    // Announce to the fleet that THIS replica now owns this host's tunnel, so a
+    // sibling replica reports it terminal-online and routes a poke here (XERK-764).
+    // No-op with HA off.
+    publishHostTunnel(name);
     // A fresh (or reconnected) tunnel doesn't know which sessions the hub still
     // has live watchers for — re-arm each so an agent restart / control-channel
     // flap doesn't silently stop the live stream to already-attached glasses.
@@ -16689,6 +16929,9 @@ server.on("upgrade", async (req, socket, head) => {
       }
       send(0x9, Buffer.alloc(0));
       send(0x1, JSON.stringify({ ping: Date.now() }));
+      // Refresh the tunnel-directory entry so its TTL never lapses under a live
+      // tunnel (XERK-764); a crashed owner stops refreshing and its entry expires.
+      publishHostTunnel(name);
     }, CONTROL_PING_EVERY_MS);
     // The agent pushes live deltas back on this same channel: committed
     // transcript entries as `{tail: sessionId, entries}`, and the in-progress
@@ -16737,6 +16980,10 @@ server.on("upgrade", async (req, socket, head) => {
       if (controlChannels[name] && controlChannels[name].socket === socket) {
         delete controlChannels[name];
         dropTermAgents(name); // discard pooled terminal channels (now dead)
+        // Clear the shared tunnel-directory entry (XERK-764) BEFORE publishAgent, so
+        // the pushed record's `terminalOnline` reflects the drop this instant on this
+        // replica. No-op with HA off.
+        retireHostTunnel(name);
         console.log(`tunnel gone: ${name}`);
         // Tunnel down — `terminalOnline` flipped back to false; push it.
         publishAgent(name);
@@ -17485,6 +17732,15 @@ if (process.env.TURMA_TEST) {
     // `sseBroadcast` gates on.
     sseBroadcast, sseDeliverLocal, makeSseBus, sseClients, SSE_BUS_CHANNEL, SSE_REPLICA_ID,
     __setSseBus(v) { sseBus = v; },
+    // XERK-764: the cross-replica tunnel directory + control bus. Exported so tests
+    // can drive the directory publish/retire/mirror, the freshness-gated
+    // `terminalOnline`, the watch/hydrate, and `pokeHost`'s local-vs-bus routing
+    // over an injected FileLiveStore (no live Valkey in CI), and pin the non-HA path
+    // off. `controlChannels` is already exported above.
+    HOST_REPLICA_PREFIX, CONTROL_BUS_CHANNEL, hostTunnelOwners,
+    publishHostTunnel, retireHostTunnel, hostTunnelOwnerLive,
+    watchTunnelDirectory, hydrateTunnelDirectory, sweepTunnelDirectory, makeControlBus, pokeHost,
+    __setControlBus(v) { controlBus = v; },
     siteKeyOf,
     orgPeers,
     boundOrgOf,
@@ -17600,6 +17856,42 @@ if (process.env.TURMA_TEST) {
   if (HA_ON) {
     sseBus = makeSseBus(liveStore, SSE_REPLICA_ID, sseDeliverLocal);
     console.log(`SSE fan-out: shared bus (replica ${SSE_REPLICA_ID})`);
+  }
+  // XERK-759 (wave-3): move the archive's bytes to object storage as the
+  // of-record. Wire the mirror sink onto archive.js, hydrate the local tree from
+  // the bucket (a freshly-booted replica starts with an empty ephemeral disk;
+  // until hydrate completes, archive reads 404 "still syncing", the archive's own
+  // honest answer), and run the drain worker off the beat. With HA off this is a
+  // no-op and archive.js's local ARCHIVE_DIR tree stays the of-record. See
+  // docs/turma-ha-store-adr.md ("Why the archive splits").
+  setArchiveMirror(archiveBlobStore, HA_ON);
+  if (HA_ON && archiveBlobStore) {
+    console.log(`archive of-record: object storage (bucket ${archiveBlobStore.bucket})`);
+    hydrateArchive().catch((e) =>
+      console.error(`archive hydrate failed: ${e && e.message}`));
+    const archiveDrainTimer = setInterval(() => {
+      archiveMirror.drain().catch((e) =>
+        console.error(`archive mirror drain failed: ${e && e.message}`));
+    }, ARCHIVE_MIRROR_DRAIN_MS);
+    archiveDrainTimer.unref();
+  }
+  // XERK-764 (wave-3): the cross-replica tunnel directory + control bus. Watch the
+  // host->replica directory FIRST (so no owner change is missed during the async
+  // scan), hydrate the mirror, then subscribe the control bus so a poke this replica
+  // publishes for a tunnel owned elsewhere reaches its owner. This is what makes
+  // `terminalOnline` true fleet-wide and a queued command's poke cross replicas
+  // under active-active. Non-HA leaves the mirror empty and the bus null, so
+  // `terminalOnline` is purely local and `pokeHost` never leaves this process.
+  if (HA_ON) {
+    watchTunnelDirectory();
+    hydrateTunnelDirectory().catch((e) =>
+      console.error(`HA tunnel-directory hydrate failed: ${(e && e.message) || e}`));
+    controlBus = makeControlBus(liveStore, SSE_REPLICA_ID);
+    console.log(`control bus: shared (replica ${SSE_REPLICA_ID})`);
+    // Reclaim mirror entries a crashed owner never retired: on the Valkey backend a
+    // TTL expiry fires no watch event, so a periodic sweep frees them (XERK-764).
+    const dirSweep = setInterval(sweepTunnelDirectory, HOST_REPLICA_TTL_MS);
+    dirSweep.unref?.();
   }
   // Wave-3 (XERK-758): move the durable usage ledger onto the shared store when HA
   // is on. With HA off this is a no-op and the ledger stays on its local JSON file,
@@ -17729,6 +18021,12 @@ if (process.env.TURMA_TEST) {
       // now); the archive SQLite handle is closed so its last writes land; the
       // usage ledger's write is async, and its callback is what ends the process.
       flushStateNow();
+      // Best-effort final push of any un-mirrored archive bytes to the object
+      // store, so a deploy strands the least tail (agents re-push what doesn't
+      // make it on the next replica's promotion — never data loss, XERK-759). Not
+      // awaited: it reads files independently of the DB handle and must not hold
+      // up the exit; the drain worker's leader gate keeps a standby a no-op.
+      if (archiveMirror) archiveMirror.drain().catch(() => {});
       // Drain the externalized stores' pending debounced writes synchronously
       // (file backend) and close the shared client's sockets (XERK-757) — the
       // same lossless-drain intent as flushStateNow, for the policy stores.
