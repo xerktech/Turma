@@ -104,7 +104,7 @@ fun OrgFilterAction(vm: OrgViewModel = viewModel()) {
         // that crowded the cluster. The header releases the 48dp minimum height too.
         TextButton(
             onClick = { open = true },
-            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
         ) {
             // One dot per selected org (XERK-222), each in its org's color.
             Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -121,11 +121,13 @@ fun OrgFilterAction(vm: OrgViewModel = viewModel()) {
                 overflow = TextOverflow.Ellipsis,
                 // Capped so a long org name can't push the title or the actions
                 // off a phone header — the full key is one tap away in the menu.
+                // Tightened for XERK-742: narrower cap and a smaller dot→label gap.
                 modifier = Modifier
-                    .padding(start = if (picked.isNotEmpty()) 6.dp else 0.dp)
-                    .widthIn(max = 120.dp),
+                    .padding(start = if (picked.isNotEmpty()) 4.dp else 0.dp)
+                    .widthIn(max = 104.dp),
             )
-            Icon(Icons.Filled.ArrowDropDown, "Filter by org")
+            // Smaller than the default 24dp so the button ends compactly.
+            Icon(Icons.Filled.ArrowDropDown, "Filter by org", Modifier.size(18.dp))
         }
         DropdownMenu(expanded = open, onDismissRequest = { open = false; colorFor = null }) {
             DropdownMenuItem(
