@@ -146,6 +146,20 @@ test("XERK-764: hydrate loads the directory at boot, leaving watch-won keys alon
   assert.equal(hub.hostTunnelOwners.b.replica, "r2", "scanned key loaded");
 });
 
+test("XERK-764: sweepTunnelDirectory reclaims stale mirror entries, keeps fresh ones", () => {
+  reset(true);
+  const now = Date.now();
+  // A crashed owner whose retire del never ran (and, on Valkey, whose TTL expiry
+  // fires no watch event) leaves a stale mirror entry that the freshness gate reads
+  // offline but nothing removes. The sweep reclaims it; a live owner (refreshed by
+  // its ping-set within the TTL) is kept.
+  hub.hostTunnelOwners.dead = { replica: "gone", at: now - TTL - 1 };
+  hub.hostTunnelOwners.live = { replica: "here", at: now };
+  hub.sweepTunnelDirectory();
+  assert.equal("dead" in hub.hostTunnelOwners, false, "stale entry reclaimed");
+  assert.equal(hub.hostTunnelOwners.live.replica, "here", "fresh entry kept");
+});
+
 test("XERK-764: pokeHost pokes a LOCAL channel directly and never touches the bus", () => {
   reset(true);
   let localPokes = 0;

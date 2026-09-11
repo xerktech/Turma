@@ -4189,6 +4189,25 @@ async function hydrateTunnelDirectory() {
   }
 }
 
+// Reclaim mirror entries whose owner stopped refreshing — a crashed owner whose
+// `retireHostTunnel` del never ran. On the SHARED (Valkey) backend a `PX`-TTL
+// EXPIRY fires NO watch event (the store announces only on an explicit set/del,
+// deliberately not via Redis keyspace notifications), so such an entry would
+// otherwise linger in this map for the process lifetime — the unbounded host-name
+// map class XERK-272 caps `agents` against. The freshness gate already keeps every
+// READ correct (a stale entry reads offline and is never poked); this frees the
+// memory. A LIVE owner's entry is refreshed within `HOST_REPLICA_TTL_MS` by its
+// ping-set arriving on the watch, so only genuinely-dead entries are removed. Runs
+// on a timer under HA; never throws (a plain map walk). (On the file backend the
+// TTL already fires a `del` watch that clears the entry, so this is a no-op there.)
+function sweepTunnelDirectory() {
+  const cutoff = Date.now() - HOST_REPLICA_TTL_MS;
+  for (const host of Object.keys(hostTunnelOwners)) {
+    const o = hostTunnelOwners[host];
+    if (!o || o.at <= cutoff) delete hostTunnelOwners[host];
+  }
+}
+
 // ---- Cross-replica control bus (XERK-764) -----------------------------------
 // A small addressed pub/sub for control signals a replica must send to the replica
 // that OWNS a host's tunnel — today just the heartbeat poke, kept extensible for the
@@ -17444,7 +17463,7 @@ if (process.env.TURMA_TEST) {
     // off. `controlChannels` is already exported above.
     HOST_REPLICA_PREFIX, CONTROL_BUS_CHANNEL, hostTunnelOwners,
     publishHostTunnel, retireHostTunnel, hostTunnelOwnerLive,
-    watchTunnelDirectory, hydrateTunnelDirectory, makeControlBus, pokeHost,
+    watchTunnelDirectory, hydrateTunnelDirectory, sweepTunnelDirectory, makeControlBus, pokeHost,
     __setControlBus(v) { controlBus = v; },
     siteKeyOf,
     orgPeers,
@@ -17575,6 +17594,10 @@ if (process.env.TURMA_TEST) {
       console.error(`HA tunnel-directory hydrate failed: ${(e && e.message) || e}`));
     controlBus = makeControlBus(liveStore, SSE_REPLICA_ID);
     console.log(`control bus: shared (replica ${SSE_REPLICA_ID})`);
+    // Reclaim mirror entries a crashed owner never retired: on the Valkey backend a
+    // TTL expiry fires no watch event, so a periodic sweep frees them (XERK-764).
+    const dirSweep = setInterval(sweepTunnelDirectory, HOST_REPLICA_TTL_MS);
+    dirSweep.unref?.();
   }
   // Wave-3 (XERK-758): move the durable usage ledger onto the shared store when HA
   // is on. With HA off this is a no-op and the ledger stays on its local JSON file,

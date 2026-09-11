@@ -44,6 +44,15 @@ hub half of, and `.claude/rules/turma-ha-store.md` for the `LiveStore` seam it p
 - **Freshness gates the read** (`hostTunnelOwnerLive`): a mirror entry older than `HOST_REPLICA_TTL_MS`
   reads as no-owner, so a dead/handed-off tunnel never lingers `terminalOnline` even if the del/expiry
   was missed. The store TTL is the backstop; this is the belt.
+- **A periodic `sweepTunnelDirectory` reclaims stale mirror entries.** On the SHARED (Valkey)
+  backend a `PX`-TTL expiry fires NO watch event (the store announces only on an explicit set/del,
+  deliberately not via Redis keyspace notifications), so a CRASHED owner's entry — whose
+  `retireHostTunnel` del never ran — would otherwise linger in `hostTunnelOwners` for the process
+  lifetime (the unbounded host-name map class XERK-272 caps `agents` against). The freshness gate
+  already keeps every READ correct; the sweep frees the memory. A LIVE owner's entry is refreshed
+  within the TTL by its ping-set arriving on the watch, so only genuinely-dead entries are removed.
+  On the FILE backend the TTL already fires a `del` watch, so the sweep is a no-op there (and the
+  tests, which use the file backend, exercise `sweepTunnelDirectory` directly rather than the timer).
 - **`retireHostTunnel`'s owner-guard only `del`s if the mirror still shows US as owner.** A host that
   reconnected to another replica has that replica's newer `set` owning the key; our stale `del` must
   not clear it (the true owner's next ping re-establishes it within `CONTROL_PING_EVERY_MS` either
