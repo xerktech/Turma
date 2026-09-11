@@ -20,7 +20,7 @@ const ledger = require("../usage-ledger.js");
 // It reuses the ledger's REAL reducers (coerce=entryOf, mergeEntry, enforceHostShare
 // via `sharedOps`) but keeps a per-replica `hosts` map, so two replicas can hold
 // different partial views the way real hub replicas do.
-function replica(store) {
+function replica(store, cfg = {}) {
   const model = new Map();
   const base = ledger._internals.sharedOps();
   const ops = {
@@ -29,7 +29,7 @@ function replica(store) {
     setEntry: (k, e) => model.set(k, e),
     deleteEntry: (k) => model.delete(k),
   };
-  const backend = new SharedLedgerBackend(store, ops, { debounceMs: 5 });
+  const backend = new SharedLedgerBackend(store, ops, { debounceMs: 5, ...cfg });
   return { model, ops, backend };
 }
 
@@ -258,6 +258,40 @@ test("XERK-758 QA D1: a reconnect (a second ready edge) re-scans and catches up"
   await new Promise((r) => setTimeout(r, 5));
   assert.equal(dayTokens(b.model.get("late"), DAY), 321, "a reconnect re-scan catches up rows written while disconnected");
   await b.backend.close();
+});
+
+test("XERK-758 QA D1b: a reconnect scan load INVALIDATES the served cache", async () => {
+  // The scan raising the model with no local beat must fire onExternalChange, or
+  // /api/agents keeps serving a stale retiredUsage until an unrelated mutation.
+  const store = new LazyStore();
+  store.data.set(KEY_PREFIX + "r", structuredClone(entryWithDay(DAY, 88)));
+  let invalidations = 0;
+  const b = replica(store, { onExternalChange: () => { invalidations += 1; } });
+  await b.backend.init(); // not ready -> no scan, no invalidation
+  assert.equal(invalidations, 0);
+
+  store.becomeReady();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(dayTokens(b.model.get("r"), DAY), 88);
+  assert.ok(invalidations >= 1, "loading rows on the ready edge must invalidate the served cache");
+  await b.backend.close();
+});
+
+test("XERK-758 QA D1b: a peer's watch-folded write invalidates the served cache", async () => {
+  const store = new FileLiveStore();
+  const writer = replica(store);
+  let invalidations = 0;
+  const reader = replica(store, { onExternalChange: () => { invalidations += 1; } });
+  await reader.backend.init(); // reader starts watching
+
+  writer.model.set("h", entryWithDay(DAY, 600, { lastSeen: 4 }));
+  writer.backend.onChange("h");
+  await new Promise((r) => writer.backend.flush(r));
+
+  assert.equal(dayTokens(reader.model.get("h"), DAY), 600, "peer write folded into the reader's model");
+  assert.ok(invalidations >= 1, "a peer's fold must invalidate the reader's served cache");
+  await writer.backend.close();
+  await reader.backend.close();
 });
 
 test("XERK-758: configure() moves the real ledger onto the shared store end-to-end", async () => {

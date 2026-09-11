@@ -16768,7 +16768,11 @@ if (process.env.TURMA_TEST) {
   // byte-identical. Fire-and-forget + logged: a store down at boot must not block
   // the listen (availability) — `configure` yields an empty model that the store's
   // `watch` and the next beats refill. Other wave-3 children read `liveStore` too.
-  usageLedger.configure(liveStore, haConfig).catch((e) => {
+  // Pass `invalidateAgentsCache` so a boot/reconnect scan load or a peer replica's
+  // watch-folded write refreshes the served /api/agents (retiredUsage) promptly — a
+  // model change with no local beat behind it would otherwise serve stale until the
+  // next unrelated mutation (XERK-758 QA D1).
+  usageLedger.configure(liveStore, haConfig, invalidateAgentsCache).catch((e) => {
     console.error(`usage ledger: shared-store configure failed, staying on the local file: ${(e && e.message) || e}`);
   });
 

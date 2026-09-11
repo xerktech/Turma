@@ -65,6 +65,10 @@ class SharedLedgerBackend {
     this.store = store;
     this.ops = ops;
     this.debounceMs = cfg.debounceMs || ops.SAVE_DEBOUNCE_MS || 5000;
+    // Called when the model changes from an EXTERNAL source (scan load, peer
+    // watch-fold) — NOT a local ingest — so the hub can invalidate its /api/agents
+    // cache (which a local beat already does). See XERK-758 QA D1.
+    this._onExternalChange = typeof cfg.onExternalChange === "function" ? cfg.onExternalChange : null;
     this._dirty = new Set(); // host keys changed since the last flush
     this._timer = null;
     this._closed = false;
@@ -84,6 +88,19 @@ class SharedLedgerBackend {
 
   keyOf(storeKey) {
     return storeKey.slice(KEY_PREFIX.length);
+  }
+
+  // Signal the hub that the served model changed with no local beat behind it, so
+  // it rebuilds /api/agents (retiredUsage especially). Best-effort and cheap (the
+  // hub's callback just marks its cache stale); a throwing callback must not break
+  // a scan/fold.
+  _notifyExternal() {
+    if (!this._onExternalChange) return;
+    try {
+      this._onExternalChange();
+    } catch {
+      /* the cache-invalidate callback must never break model loading */
+    }
   }
 
   // Start watching for peer writes and load the existing history from the store.
@@ -147,7 +164,13 @@ class SharedLedgerBackend {
         else this.ops.setEntry(k, peer);
         kept += 1;
       }
-      if (kept) console.log(`loaded usage history for ${kept} host(s) from the shared store`);
+      if (kept) {
+        console.log(`loaded usage history for ${kept} host(s) from the shared store`);
+        // The scan raised the served model with no beat behind it — invalidate the
+        // hub's /api/agents cache so a reconnect/boot load reaches the dashboard
+        // promptly, not on the next unrelated mutation (XERK-758 QA D1).
+        this._notifyExternal();
+      }
     } finally {
       this._scanning = false;
     }
@@ -162,6 +185,7 @@ class SharedLedgerBackend {
     if (!key) return;
     if (ev.type === "del") {
       this.ops.deleteEntry(key);
+      this._notifyExternal(); // the served model shrank with no local beat
       return;
     }
     const peer = this.ops.coerce(ev.value);
@@ -169,6 +193,10 @@ class SharedLedgerBackend {
     const local = this.ops.getEntry(key);
     if (local) this.ops.mergeEntry(local, peer); // raise local by the peer's marks
     else this.ops.setEntry(key, peer);
+    // A peer replica's write changed the served model with no beat here to clear
+    // the hub's /api/agents cache (XERK-758 QA D1). Under leader-only serving this
+    // is usually a self-echo (harmless); under active-active it is load-bearing.
+    this._notifyExternal();
   }
 
   // The ledger changed host `key` this beat. Mark it dirty and arm the debounce —

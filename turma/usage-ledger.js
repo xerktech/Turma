@@ -929,14 +929,22 @@ function flush(done) {
  * host's own raw report until the model loads, and retired-host rows appear as soon
  * as the store is reachable (XERK-758 QA D1).
  */
-async function configure(liveStore, haConfig) {
+async function configure(liveStore, haConfig, onExternalChange) {
   if (!haConfig || !haConfig.ha || !liveStore) return; // single-process default
   const { SharedLedgerBackend } = require("./usage-ledger-shared.js");
   // Cancel any pending file-backend timers — the file model is being discarded.
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
   hosts = Object.create(null);
-  const b = new SharedLedgerBackend(liveStore, sharedOps());
+  // `onExternalChange` invalidates the hub's /api/agents cache when the model
+  // changes from a source OTHER than a local heartbeat (a boot/reconnect scan
+  // load, a peer replica's watch-folded write): those raise `hosts` with no beat
+  // to clear the cache, so without it a reconnect (or the all-retired/quiet fleet)
+  // keeps serving a stale `retiredUsage` (XERK-758 QA D1). A local ingest already
+  // invalidates via the beat, so it does NOT call this.
+  const b = new SharedLedgerBackend(liveStore, sharedOps(), {
+    onExternalChange: typeof onExternalChange === "function" ? onExternalChange : null,
+  });
   await b.init();
   backend = b;
   console.log("usage ledger: using the shared store (HA) for durable spend history");

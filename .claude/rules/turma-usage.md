@@ -213,6 +213,12 @@ paths:
   `retiredUsage` — the XERK-338 failure. Scanning on every ready edge also catches up rows written by
   other replicas while this one was disconnected; it is idempotent (max-merge, never lowers). The
   `FileLiveStore` (tests) has no `health` and scans immediately, so the in-memory path is unchanged.
+- **A model change with NO local beat behind it INVALIDATES the hub's `/api/agents` cache** (XERK-758
+  QA D1b): a scan load and a peer replica's watch-folded write both raise `hosts` without a heartbeat,
+  and the beat is what normally clears `agentsCache` — so `configure` passes `invalidateAgentsCache`
+  as the backend's `onExternalChange`, fired on a scan that loaded rows and on every watch fold.
+  Without it a reconnect (or an all-retired/quiet fleet) serves a stale `retiredUsage` until the next
+  unrelated mutation. A LOCAL ingest does NOT call it (its beat already invalidates).
 - Tests: `usage-ledger-shared.test.js` drives the REAL `SharedLedgerBackend` against the in-memory
   `FileLiveStore` (no live Valkey in CI, same constraint as `store.test.js`): the max-merge
   no-lower-a-total property, higher-view-raises, boot scan, watch fold, forget propagation, repo-level
