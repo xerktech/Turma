@@ -741,7 +741,13 @@ fun ScreenHeader(title: String, actions: @Composable () -> Unit = {}) {
                 // one write action (New ticket, XERK-150) beside the org scope
                 // (XERK-62).
                 NewTicketAction()
-                OrgFilterAction()
+                // The org control is the one FLEXIBLE member of the cluster
+                // (XERK-745): it yields space to — and ellipsizes its name behind
+                // — the fixed page actions and the ⋮ overflow, so a single
+                // long-named org can never push the ⋮ (Sign out) off a phone
+                // header. `fill = false` keeps it at its natural width (capped at
+                // 120dp inside) when there is room to spare.
+                OrgFilterAction(Modifier.weight(1f, fill = false))
                 actions()
                 Box {
                     HeaderIconButton(onClick = { menuOpen = true }) { Icon(Icons.Filled.MoreVert, "More") }
