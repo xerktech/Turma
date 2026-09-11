@@ -23,6 +23,12 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   …)`), and a top-level key on `/api/agents`. Keyed `"<siteKey>/<epicKey>"` (`epicRunKey`).
 - **It MUST persist.** An in-memory-only run would replay stale intent as a BURST of child starts
   after every hub restart — the same reason the ticket queue is in-memory but this is not.
+- **Externalized to the shared store under HA (XERK-769)** via `registerExternalStore` like the
+  XERK-757 policy stores — so a run armed on one replica is visible on every replica and survives a
+  pod restart (HA pods run on an emptyDir), seeded up from the local file on a cutover. `epicRunsCoerce`
+  is the SAME per-record `sanitizeEpicRunRecord` whitelist boot-load used, applied to a remote value
+  too; `persistEpicRuns()` replaces the old `scheduleEpicRunsSave`. HA off: byte-identical file writes,
+  same 5s debounce. Mechanics: `.claude/rules/turma-ha-store.md` (wave-3 pattern).
 - **Run record**: `{epicKey, siteKey, state, children[], waves[][], cycle?[], startedAt, updatedAt}`.
   `state ∈ {running, blocked, done}` (`EPIC_RUN_STATES`); `waves` is the topological layering;
   `cycle` is present only when a dependency loop stalls children. `startedAt` is preserved across

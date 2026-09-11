@@ -29,7 +29,8 @@ for (const v of [
   "DEVICES_FILE", "TICKET_AGENTS_FILE", "TICKET_MODELS_FILE", "TICKET_RUNTIMES_FILE",
   "TICKET_PLATFORMS_FILE", "AUTOSTART_ORGS_FILE", "AUTOMERGE_ORGS_FILE", "TRIAGE_ACTIONS_FILE",
   "TRIAGE_POLICIES_FILE", "PRIORITY_WRITEBACK_ORGS_FILE", "DEDUPE_LINK_ORGS_FILE",
-  "ORG_COLORS_FILE", "REPO_TIERS_FILE", "USAGE_LEDGER_FILE", "STATE_FILE",
+  "ORG_COLORS_FILE", "REPO_TIERS_FILE", "EPIC_RUNS_FILE", "EPIC_BUILDERS_FILE",
+  "USAGE_LEDGER_FILE", "STATE_FILE",
 ]) {
   process.env[v] = tmp(v.toLowerCase());
 }
@@ -53,6 +54,9 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     "devices", "ticketAgents", "ticketModels", "ticketRuntimes", "ticketPlatforms",
     "autoStartOrgs", "autoMergeOrgs", "triageActions", "triagePolicies",
     "priorityWriteBackOrgs", "dedupeLinkOrgs", "orgColors", "repoTiers",
+    // XERK-769 — the epic-run/-builder stores joined the externalized set so HA
+    // replicas share them and they survive a pod restart.
+    "epicRuns", "epicBuilders",
   ]) {
     assert.ok(names.has(n), `store ${n} is registered`);
   }
@@ -169,5 +173,127 @@ test("XERK-757: boot load adopts the store's value; a fresh store is SEEDED from
   const after = X.repoTiers();
   assert.equal(after["other-repo"], "archive", "the store's value was adopted");
   assert.equal(after["seeded-repo"], "live", "the boot-only seed survived the adapter load");
+  store.close();
+});
+
+// ---- XERK-769: epic-run / epic-builder stores are externalized -------------
+// The epic auto-orchestration run store (epicRuns) and the Epic Builder store
+// (epicBuilders) moved off "a /data file in one process" onto the SAME adapter,
+// so a run armed or a builder queued on one HA replica is visible on every
+// replica and survives a pod restart (the pre-HA gap the ticket closed). Same
+// backend-agnostic mechanism as the 13 XERK-757 stores.
+
+test("XERK-769: epicRuns/epicBuilders map to policy: keys with per-record coerces", () => {
+  const list = X.list();
+  const runs = list.find((d) => d.name === "epicRuns");
+  const builders = list.find((d) => d.name === "epicBuilders");
+  assert.ok(runs && builders, "both epic stores are registered");
+  assert.ok(runs.key === "policy:epicRuns" && builders.key === "policy:epicBuilders");
+
+  // The coerce is the SAME per-record whitelist the file boot-load used: a good
+  // record survives, a malformed one (no epicKey / no id) is dropped — so a
+  // hand-edited file AND a bad remote replica value degrade identically.
+  const runsIn = {
+    "o.atlassian.net/E-1": { epicKey: "E-1", siteKey: "o.atlassian.net", state: "running", children: ["C-1"], waves: [["C-1"]], startedAt: 1, updatedAt: 2 },
+    "o.atlassian.net/bad": { siteKey: "o.atlassian.net", state: "running" }, // no epicKey -> dropped
+  };
+  const runsOut = runs.coerce(runsIn);
+  assert.deepEqual(Object.keys(runsOut), ["o.atlassian.net/E-1"]);
+  assert.equal(runsOut["o.atlassian.net/E-1"].state, "running");
+
+  const buildersIn = {
+    "abc": { id: "abc", siteKey: "o.atlassian.net", title: "Idea", idea: "do a thing", state: "queued", startedAt: 1, updatedAt: 2 },
+    "bad": { siteKey: "o.atlassian.net", title: "no id" }, // no id -> dropped
+  };
+  const buildersOut = builders.coerce(buildersIn);
+  assert.deepEqual(Object.keys(buildersOut), ["abc"]);
+  assert.equal(buildersOut["abc"].title, "Idea");
+
+  // Junk containers coerce to an empty map (the "not set" posture).
+  assert.deepEqual(runs.coerce([1, 2]), {});
+  assert.deepEqual(builders.coerce(7), {});
+});
+
+test("XERK-769: a live epicBuilder record is a coerce FIXED-POINT (own-write echo dedups)", () => {
+  // In-place mutations (dispatch sets host/dispatchedAt, advance sets epicKey/
+  // error) must land in the SAME key order sanitizeEpicBuilderRecord emits, or
+  // the own-write watch echo (coerce(setValue)) fails the sameValue dedup under
+  // HA and re-invalidates the cache every write. Build the record exactly as the
+  // runtime does and assert it equals its own coerce byte-for-byte.
+  const now = Date.now();
+  const live = {
+    id: "d1", siteKey: "o.atlassian.net", title: "T", idea: "i",
+    state: "failed", startedAt: now, updatedAt: now,
+    repo: "turma", targetHost: "host-a",
+    host: "host-a", dispatchedAt: now, epicKey: "E-9", error: "boom",
+  };
+  assert.equal(
+    JSON.stringify(srv.sanitizeEpicBuilderRecord(live)),
+    JSON.stringify(live),
+    "the coerce is a fixed-point of a fully-populated live record",
+  );
+
+  // And drive it through the real setters: arm (queued), fake a dispatch, then
+  // advance — the resulting mirror record must still be a coerce fixed-point.
+  const rec = srv.armEpicBuilder("o.atlassian.net", { title: "Build me", idea: "an epic" });
+  const mirror = X.epicBuilders();
+  mirror[rec.id].host = "host-x";        // stand in for the dispatch's host claim
+  mirror[rec.id].dispatchedAt = Date.now();
+  srv.advanceEpicBuilder("host-x", { id: rec.id, state: "creating", epicKey: "E-77" });
+  const advanced = mirror[rec.id];
+  assert.equal(advanced.state, "creating");
+  assert.equal(advanced.epicKey, "E-77");
+  assert.equal(
+    JSON.stringify(srv.sanitizeEpicBuilderRecord(advanced)),
+    JSON.stringify(advanced),
+    "the advanced live record is still a coerce fixed-point",
+  );
+  srv.clearEpicBuilder(rec.id); // clean up global state
+});
+
+test("XERK-769: an epicRuns change on one replica reaches another via the shared watch", async () => {
+  // Two mirrors watching one FileLiveStore = two replicas sharing a backend. A
+  // set from A lands in B's mirror (SSE fan-out to B's clients is XERK-762's),
+  // while A's own echo dedups. The coerce sanitizes what B installs.
+  const file = tmp("epicruns-shared");
+  try { fs.unlinkSync(file); } catch { /* first run */ }
+  const store = fileStore({ "policy:epicRuns": { file, debounceMs: 5000 } });
+  const runs = X.list().find((d) => d.name === "epicRuns");
+
+  let mirrorA = {};
+  let mirrorB = {};
+  const descA = { key: runs.key, coerce: runs.coerce, read: () => mirrorA, install: (v) => { mirrorA = v; } };
+  const descB = { key: runs.key, coerce: runs.coerce, read: () => mirrorB, install: (v) => { mirrorB = v; } };
+  store.watch(descA.key, (ev) => X.applyExternalStoreValue(descA, ev && ev.value));
+  store.watch(descB.key, (ev) => X.applyExternalStoreValue(descB, ev && ev.value));
+
+  mirrorA = { "acme.atlassian.net/E-1": { epicKey: "E-1", siteKey: "acme.atlassian.net", state: "running", children: [], waves: [], startedAt: 1, updatedAt: 2 } };
+  await store.set(descA.key, mirrorA);
+
+  assert.equal(mirrorB["acme.atlassian.net/E-1"].state, "running", "B saw A's armed run");
+  assert.deepEqual(mirrorA["acme.atlassian.net/E-1"].epicKey, "E-1", "A's own echo left it unchanged");
+  store.close();
+});
+
+test("XERK-769: boot adopts a stored epicBuilders value; a fresh store is SEEDED from the file", async () => {
+  // A store that already HAS the key wins (adopt). Prime the mirror with a
+  // record, wire onto a backend that carries a different one: the store's value
+  // is adopted. Seeding-up (the migration path) is proven by the repoTiers case;
+  // this pins the adopt half for a per-record-coerced store.
+  const seeded = srv.armEpicBuilder("boot.atlassian.net", { title: "local", idea: "primed" });
+  assert.ok(X.epicBuilders()[seeded.id], "the mirror carries the primed builder");
+
+  const persistent = { ...X.persistentConfig() };
+  const store = fileStore(persistent);
+  await store.set("policy:epicBuilders", {
+    "remote1": { id: "remote1", siteKey: "boot.atlassian.net", title: "adopted", idea: "from the store", state: "queued", startedAt: 1, updatedAt: 2 },
+  });
+  X.wireExternalStores(store);
+  await new Promise((r) => setTimeout(r, 50)); // let ready()->get settle
+
+  const after = X.epicBuilders();
+  assert.ok(after["remote1"], "the store's value was adopted on boot");
+  assert.equal(after["remote1"].title, "adopted");
+  assert.equal(after[seeded.id], undefined, "adopting the store replaces the primed mirror");
   store.close();
 });

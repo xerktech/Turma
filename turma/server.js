@@ -2569,31 +2569,32 @@ function sanitizeEpicRunRecord(v) {
   if (v.paused === true) rec.paused = true;   // operator hold survives a restart (XERK-641)
   return rec;
 }
-let epicRuns = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(EPIC_RUNS_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    for (const [k, v] of Object.entries(parsed)) {
+// Coerce a raw store/file value (the whole run map) to the sanitized shape: keep
+// an object, drop any record sanitizeEpicRunRecord rejects. This is the SAME
+// whitelist the file boot-load used AND what a malformed remote replica's value
+// runs through, so a hand-edited file and a bad remote value degrade identically
+// (the XERK-757 pattern). It runs at module-init (below) AND at runtime (a watch),
+// so it references only the epic consts declared ABOVE it, never one in its TDZ.
+const epicRunsCoerce = (raw) => {
+  const out = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) {
       const rec = sanitizeEpicRunRecord(v);
-      if (rec) epicRuns[k] = rec;
+      if (rec) out[k] = rec;
     }
   }
-} catch {
-  /* first boot or no volume mounted */
-}
-let erSaveTimer = null;
-function scheduleEpicRunsSave() {
-  if (erSaveTimer) return;
-  erSaveTimer = setTimeout(() => {
-    erSaveTimer = null;
-    fs.mkdir(path.dirname(EPIC_RUNS_FILE), { recursive: true }, () => {
-      fs.writeFile(EPIC_RUNS_FILE, JSON.stringify(epicRuns), (err) => {
-        if (err) console.error(`epic-runs save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  erSaveTimer.unref();
-}
+  return out;
+};
+let epicRuns = epicRunsCoerce(readJsonFile(EPIC_RUNS_FILE));
+// Externalized to the shared store (XERK-769, epic XERK-751): under HA a run armed
+// on one replica is visible on every replica and survives a pod restart, seeded up
+// from the local file on a cutover/cold-start by wireExternalStores. HA off:
+// persistEpicRuns() writes EPIC_RUNS_FILE byte-identically on the same 5s debounce
+// as the removed scheduleEpicRunsSave. Call it AFTER mutating the mirror.
+const persistEpicRuns = registerExternalStore({
+  name: "epicRuns", file: EPIC_RUNS_FILE,
+  coerce: epicRunsCoerce, read: () => epicRuns, install: (v) => { epicRuns = v; },
+});
 function epicRunKey(siteKey, epicKey) {
   return (siteKey || "") + "/" + epicKey;
 }
@@ -2699,7 +2700,7 @@ function armEpicRun(siteKey, epicKey, rows) {
       if (old !== k) delete epicRuns[old];
     }
   }
-  scheduleEpicRunsSave();
+  persistEpicRuns();
   invalidateAgentsCache();
   sseBroadcast("epicRuns", epicRuns);
   return rec;
@@ -2709,7 +2710,7 @@ function clearEpicRun(siteKey, epicKey) {
   const k = epicRunKey(siteKey, epicKey);
   if (!(k in epicRuns)) return false;
   delete epicRuns[k];
-  scheduleEpicRunsSave();
+  persistEpicRuns();
   invalidateAgentsCache();
   sseBroadcast("epicRuns", epicRuns);
   return true;
@@ -2730,7 +2731,7 @@ function setEpicRunPaused(siteKey, epicKey, paused) {
   if (!!run.paused === want) return run;   // idempotent
   if (want) run.paused = true; else delete run.paused;
   run.updatedAt = Date.now();
-  scheduleEpicRunsSave();
+  persistEpicRuns();
   invalidateAgentsCache();
   sseBroadcast("epicRuns", epicRuns);
   return run;
@@ -2789,41 +2790,46 @@ function sanitizeEpicBuilderRecord(v) {
     startedAt: Number.isFinite(v.startedAt) ? v.startedAt : now,
     updatedAt: Number.isFinite(v.updatedAt) ? v.updatedAt : now,
   };
+  // Field order matches the RUNTIME insertion order (armEpicBuilder base, then
+  // dispatch's host/dispatchedAt, then advance's epicKey/error) so the coerce is a
+  // FIXED-POINT of a live record — its own-write watch echo dedups under HA
+  // instead of re-installing a byte-reordered twin every write (the XERK-757
+  // discipline, pinned for triagePolicies by external-stores.test.js).
   if (typeof v.repo === "string" && v.repo) rec.repo = v.repo.slice(0, 200);
   if (typeof v.targetHost === "string" && v.targetHost) rec.targetHost = v.targetHost.slice(0, 200);
   if (typeof v.host === "string" && v.host) rec.host = v.host.slice(0, 200);
+  if (Number.isFinite(v.dispatchedAt)) rec.dispatchedAt = v.dispatchedAt;
   if (typeof v.epicKey === "string" && v.epicKey) rec.epicKey = v.epicKey.slice(0, 64);
   if (typeof v.error === "string" && v.error) rec.error = v.error.slice(0, 500);
-  if (Number.isFinite(v.dispatchedAt)) rec.dispatchedAt = v.dispatchedAt;
   return rec;
 }
-let epicBuilders = {};
-try {
-  const parsed = JSON.parse(fs.readFileSync(EPIC_BUILDERS_FILE, "utf8"));
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    for (const [k, v] of Object.entries(parsed)) {
+// Coerce a raw store/file value (the whole builder map) to the sanitized shape,
+// dropping any record sanitizeEpicBuilderRecord rejects — the SAME whitelist the
+// file boot-load used AND what a malformed remote replica's value runs through
+// (the XERK-757 pattern). Runs at module-init (below) AND at runtime (a watch), so
+// it references only the epic consts declared ABOVE it, never one in its TDZ.
+const epicBuildersCoerce = (raw) => {
+  const out = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) {
       const rec = sanitizeEpicBuilderRecord(v);
-      if (rec) epicBuilders[k] = rec;
+      if (rec) out[k] = rec;
     }
   }
-} catch {
-  /* first boot or no volume mounted */
-}
-let ebSaveTimer = null;
-function scheduleEpicBuildersSave() {
-  if (ebSaveTimer) return;
-  ebSaveTimer = setTimeout(() => {
-    ebSaveTimer = null;
-    fs.mkdir(path.dirname(EPIC_BUILDERS_FILE), { recursive: true }, () => {
-      fs.writeFile(EPIC_BUILDERS_FILE, JSON.stringify(epicBuilders), (err) => {
-        if (err) console.error(`epic-builders save failed: ${err.message}`);
-      });
-    });
-  }, 5 * 1000);
-  ebSaveTimer.unref();
-}
+  return out;
+};
+let epicBuilders = epicBuildersCoerce(readJsonFile(EPIC_BUILDERS_FILE));
+// Externalized to the shared store (XERK-769, epic XERK-751), same as epicRuns:
+// under HA a builder queued on one replica is visible on every replica and its
+// idea survives a pod restart (so the driver re-dispatches it), seeded up from the
+// local file on a cutover by wireExternalStores. HA off: persistEpicBuilders()
+// writes EPIC_BUILDERS_FILE byte-identically on the 5s debounce.
+const persistEpicBuilders = registerExternalStore({
+  name: "epicBuilders", file: EPIC_BUILDERS_FILE,
+  coerce: epicBuildersCoerce, read: () => epicBuilders, install: (v) => { epicBuilders = v; },
+});
 function publishEpicBuilders() {
-  scheduleEpicBuildersSave();
+  persistEpicBuilders();
   invalidateAgentsCache();
   sseBroadcast("epicBuilders", epicBuilders);
 }
@@ -3049,7 +3055,7 @@ function advanceEpicRunState(run, rows) {
   if (run.state === want) return;
   run.state = want;
   run.updatedAt = Date.now();
-  scheduleEpicRunsSave();
+  persistEpicRuns();
   invalidateAgentsCache();
   sseBroadcast("epicRuns", epicRuns);
 }
@@ -12491,7 +12497,7 @@ function epicRunCompleteSweep() {
     if (run.state !== "done") {
       run.state = "done";
       run.updatedAt = Date.now();
-      scheduleEpicRunsSave();
+      persistEpicRuns();
       invalidateAgentsCache();
       sseBroadcast("epicRuns", epicRuns);
     }
@@ -17297,6 +17303,10 @@ if (process.env.TURMA_TEST) {
       persistentConfig: () => STORE_PERSISTENT,
       repoTiers: () => repoTiers,
       setRepoTier,
+      // XERK-769: epicRuns/epicBuilders joined the externalized set, so a test can
+      // read the mirrors the coerce/watch/seed path installs into.
+      epicRuns: () => epicRuns,
+      epicBuilders: () => epicBuilders,
     },
     // XERK-756: the HA fleet-registry externalization. Exported so tests can
     // inject a FileLiveStore as the shared store (a real Valkey can't run in CI),
