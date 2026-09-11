@@ -231,6 +231,9 @@ const {
   DEFAULT_REPO_TIER, REPO_TIERS,
   migrations, advanceMigrations, MIGRATE_SPOOL_DIR, sweepMigrationSpool,
   dropMigrationBlob, migrationSpoolPath,
+  // XERK-761: migration record/spool sharing across replicas.
+  setMigrationStore, hydrateMigrations, sweepMigrationSpoolShared,
+  MIGRATION_KEY_PREFIX, MIGRATE_SPOOL_ORPHAN_MS,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
   usageLedger, normalizeRetired,
   ARCHIVE_CHUNK_BODY_MAX, ARCHIVE_PARSE_COST, archiveChunkLabel,
@@ -15033,6 +15036,115 @@ test("migrate: full move — export, relay, import, then kill the source", async
   assert.equal(after.blobPath, null);
   assert.equal(await awaitUnlinked(spoolFile), true,
     "the spool file should be unlinked once the migration is done");
+});
+
+// ---- XERK-761: the record + spool become shareable across replicas -----------
+// The in-memory Map stays the LEADER's working copy; in HA each record is
+// mirrored to the shared LiveStore (from which a promoted leader HYDRATES), and
+// the boot spool sweep keys on record existence + a TTL so a booting replica
+// never deletes another replica's live bundle. These drive the real
+// FileLiveStore (store.js) as the injected shared backend.
+const { FileLiveStore } = require("../store.js");
+
+// Run a body with a FileLiveStore wired as the SHARED migration store, ALWAYS
+// unwiring afterwards so the rest of the migrate suite runs single-process (the
+// byte-identical HA-off path every other test depends on).
+async function withSharedMigrationStore(fn) {
+  const store = new FileLiveStore();
+  setMigrationStore(store, true);
+  try {
+    await fn(store);
+  } finally {
+    setMigrationStore(null, false);
+    store.close();
+  }
+}
+
+test("XERK-761: a started migration is MIRRORED to the shared store, then retiring it FORGETS it", async () => {
+  await withSharedMigrationStore(async (store) => {
+    await migHost("hax", "hax.atlassian.net");
+    await migHost("hay", "hax.atlassian.net");
+    const r = await migrate("hax", "s1", { host: "hay" });
+    assert.equal(r.status, 200);
+    const mid = r.body.migrationId;
+    await new Promise((res) => setImmediate(res)); // let the best-effort mirror land
+    const rec = await store.get(MIGRATION_KEY_PREFIX + mid);
+    assert.ok(rec, "the record must be resolvable by id on any replica");
+    assert.equal(rec.id, mid);
+    assert.equal(rec.phase, "exporting");
+    assert.equal(rec.srcHost, "hax");
+    assert.equal(rec.targetHost, "hay");
+    // Leader-local transients are stripped from the mirrored copy so a promoted
+    // leader neither blocks a fresh upload nor inherits a half-applied refusal.
+    assert.equal(rec.uploading, false);
+    assert.equal(rec.refusal, null);
+
+    // Retiring the move removes it from the store, so a booting replica cannot
+    // resurrect a settled migration.
+    const m = migrations.get(mid);
+    m.phase = "done";
+    m.at = 0; // force the MIGRATE_DONE_KEEP_MS retire grace to elapse
+    advanceMigrations();
+    await new Promise((res) => setImmediate(res));
+    assert.equal(await store.get(MIGRATION_KEY_PREFIX + mid), null,
+      "a retired record must be forgotten from the shared store");
+    migrations.delete(mid);
+  });
+});
+
+test("XERK-761: hydrateMigrations rebuilds the Map from the store (a promoted leader)", async () => {
+  await withSharedMigrationStore(async (store) => {
+    // Another replica created an in-flight record while THIS one held none.
+    const id = "00112233445566aa";
+    await store.set(MIGRATION_KEY_PREFIX + id, {
+      id, srcHost: "hbx", targetHost: "hby", phase: "importing",
+      transcriptId: "t-hbx", meta: {}, blobPath: null, blobSize: 0,
+      uploading: true, refusal: "stale", at: Date.now(), startedAt: Date.now(),
+    });
+    assert.equal(migrations.has(id), false);
+    await hydrateMigrations();
+    const m = migrations.get(id);
+    assert.ok(m, "a promoted leader resolves the in-flight record from the store");
+    assert.equal(m.phase, "importing");
+    assert.equal(m.uploading, false, "the leader-local upload flag is reset on hydrate");
+    assert.equal(m.refusal, null, "a half-applied refusal is not inherited");
+    // Hydrate never overwrites a record THIS leader already holds (its copy is
+    // the live one).
+    m.phase = "done";
+    await hydrateMigrations();
+    assert.equal(migrations.get(id).phase, "done");
+    migrations.delete(id);
+  });
+});
+
+test("XERK-761: the shared boot sweep keeps a live/fresh bundle, deletes only a stale orphan", async () => {
+  await withSharedMigrationStore(async (store) => {
+    fs.mkdirSync(MIGRATE_SPOOL_DIR, { recursive: true });
+    const live = "aaaaaaaaaaaaaaaa";
+    const freshOrphan = "bbbbbbbbbbbbbbbb";
+    const staleOrphan = "cccccccccccccccc";
+    const other = "not-a-migration.txt";
+    for (const id of [live, freshOrphan, staleOrphan]) fs.writeFileSync(migrationSpoolPath(id), "x");
+    fs.writeFileSync(path.join(MIGRATE_SPOOL_DIR, other), "keep me");
+    // A live migration still owns `live`'s bundle.
+    await store.set(MIGRATION_KEY_PREFIX + live, { id: live, phase: "importing" });
+    // Age the stale orphan past the sweep TTL.
+    const old = (Date.now() - MIGRATE_SPOOL_ORPHAN_MS - 60000) / 1000;
+    fs.utimesSync(migrationSpoolPath(staleOrphan), old, old);
+
+    await sweepMigrationSpoolShared();
+
+    assert.ok(fs.existsSync(migrationSpoolPath(live)),
+      "a bundle a live record still owns is kept");
+    assert.ok(fs.existsSync(migrationSpoolPath(freshOrphan)),
+      "a just-written orphan (its record not yet mirrored) is kept until the TTL");
+    assert.ok(!fs.existsSync(migrationSpoolPath(staleOrphan)),
+      "a stale orphan with no record is the only one deleted");
+    assert.ok(fs.existsSync(path.join(MIGRATE_SPOOL_DIR, other)),
+      "a non-migration file is never touched");
+    for (const id of [live, freshOrphan]) { try { fs.unlinkSync(migrationSpoolPath(id)); } catch {} }
+    try { fs.unlinkSync(path.join(MIGRATE_SPOOL_DIR, other)); } catch {}
+  });
 });
 
 test("migrate: a second move of the same session is single-flighted", async () => {
