@@ -234,6 +234,53 @@ test("a transient API error keeps leadership within the renew deadline, then dro
   assert.equal(a.isLeader(), false);
 });
 
+// A k8s `MicroTime` (Lease `acquireTime`/`renewTime`) parses ONLY with exactly six
+// fractional-second digits. This is the exact shape the real API server enforces
+// and rejects with a 400 otherwise.
+const MICROTIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
+
+test("microTime() emits k8s MicroTime (6 fractional digits), not millis", () => {
+  const { microTime } = require("../leader.js");
+  const t = microTime(Date.parse("2026-09-11T20:34:41.365Z"));
+  assert.equal(t, "2026-09-11T20:34:41.365000Z");
+  assert.ok(MICROTIME_RE.test(t), `${t} is not a valid MicroTime`);
+  // A millisecond stamp (what Date#toISOString produces) is NOT valid.
+  assert.ok(!MICROTIME_RE.test(new Date().toISOString()));
+});
+
+// Regression for the live-cluster outage: the elector's create/renew POST/PUT
+// bodies stamp `acquireTime`/`renewTime` as MicroTime. The real API 400s a
+// millisecond stamp, `_create`/`_put` swallow any non-2xx as "not leader" with no
+// log, and election silently never happens. This fake API validates the timestamp
+// the way the real one does, so a millisecond regression fails the test here
+// instead of taking the fleet down.
+test("acquire + renew send valid MicroTime stamps (a millis stamp would 400)", async () => {
+  const api = fakeK8s();
+  const strict = async (method, path, body) => {
+    if ((method === "POST" || method === "PUT") && body && body.spec) {
+      for (const f of ["acquireTime", "renewTime"]) {
+        const v = body.spec[f];
+        if (v != null && !MICROTIME_RE.test(v)) {
+          return { status: 400, body: { kind: "Status", code: 400, message: `bad MicroTime ${f}=${v}` } };
+        }
+      }
+    }
+    return api.request(method, path, body);
+  };
+  const a = new LeaderElector(
+    { identity: "pod-a", namespace: "turma", leaseName: "turma-hub-leader",
+      leaseDurationMs: 300, renewDeadlineMs: 200, retryPeriodMs: 1000 },
+    { request: strict, connect: false }
+  );
+  await a._tick(); // 404 → create
+  assert.equal(a.isLeader(), true, "elector must acquire — a millis stamp would have 400'd the create");
+  assert.ok(MICROTIME_RE.test(api.lease.spec.renewTime));
+  assert.ok(MICROTIME_RE.test(api.lease.spec.acquireTime));
+  await a._tick(); // renew
+  assert.equal(a.isLeader(), true);
+  assert.ok(MICROTIME_RE.test(api.lease.spec.renewTime));
+});
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
