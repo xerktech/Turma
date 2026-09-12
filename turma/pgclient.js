@@ -213,6 +213,13 @@ function encodePasswordMessage(password) {
 // bytes, EXCLUDES the type byte), then (length - 4) body bytes. `feed(chunk)`
 // returns the array of complete {type, body} messages decodable so far and holds
 // any partial tail for the next chunk.
+// A backend message's declared length is checked against this the moment its
+// 5-byte header is in hand (BEFORE the body is buffered), so a hostile/desynced
+// server declaring a huge length can never make `feed` accumulate unbounded memory
+// — it throws at the declaration and the connection layer resets. Generous: far
+// above any real ledger/index row, so it never refuses a legitimate message.
+const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+
 class PgProtocolReader {
   constructor() {
     this.buf = Buffer.alloc(0);
@@ -228,6 +235,9 @@ class PgProtocolReader {
       // A length below 4 is a protocol desync (the length covers its own 4 bytes),
       // not a value — surface it so the connection layer resets rather than looping.
       if (len < 4) throw new Error(`bad message length ${len} for type ${JSON.stringify(type)}`);
+      if (len - 4 > MAX_MESSAGE_BYTES) {
+        throw new Error(`backend message length ${len} exceeds the ${MAX_MESSAGE_BYTES}-byte cap`);
+      }
       const total = 1 + len; // type byte + declared length
       if (this.buf.length - offset < total) break; // body not all here yet
       const body = this.buf.subarray(offset + 5, offset + total);
@@ -605,7 +615,20 @@ class PgConnection {
       this._fail(e);
       return;
     }
-    for (const { type, body } of messages) this._onMessage(type, body);
+    for (const { type, body } of messages) {
+      try {
+        this._onMessage(type, body);
+      } catch (e) {
+        // A decoder threw on a malformed/truncated body (a body lying about its
+        // field/column count, a NUL-less notice, a short auth packet) — a protocol
+        // desync we can't recover from. Route it to _fail exactly as the reader's
+        // own corrupt-length case does; NEVER let it escape this socket 'data'
+        // handler to become an uncaughtException that takes the whole hub down
+        // (the XERK-235 class). The in-flight query rejects and the socket resets.
+        this._fail(e);
+        return;
+      }
+    }
   }
 
   _onMessage(type, body) {
@@ -647,8 +670,9 @@ class PgConnection {
         // ErrorResponse. During the handshake it fails the connect; during a query
         // it fails that query (the server still sends ReadyForQuery after, which
         // _finishQuery is a no-op for once the error is set).
-        const err = new Error("postgres: " + parseNoticeFields(body).message);
-        err.pgError = parseNoticeFields(body);
+        const fields = parseNoticeFields(body);
+        const err = new Error("postgres: " + fields.message);
+        err.pgError = fields;
         if (!this.alive) this._fail(err);
         else if (this._q) this._q.error = err;
         return;

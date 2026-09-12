@@ -135,6 +135,13 @@ test("PgProtocolReader throws on a corrupt (sub-4) length", () => {
   assert.throws(() => new PgProtocolReader().feed(bad), /bad message length/);
 });
 
+test("PgProtocolReader rejects an over-cap declared length before buffering it", () => {
+  // type 'D', length 0x7fffffff — a hostile server declaring ~2 GiB. The header
+  // alone (5 bytes) trips the cap; no body bytes are accumulated.
+  const header = Buffer.from([0x44, 0x7f, 0xff, 0xff, 0xff]);
+  assert.throws(() => new PgProtocolReader().feed(header), /exceeds the .* cap/);
+});
+
 test("parseAuthentication decodes each flavour", () => {
   const auth = (code, extra) =>
     parseAuthentication(new ByteWriter().int32(code).bytes(extra || Buffer.alloc(0)).build());
@@ -352,6 +359,13 @@ function startFakePg(opts = {}) {
     const answerQuery = () => {
       const write = [frameMessage("1"), frameMessage("2")]; // ParseComplete, BindComplete
       if (opts.hangOnQuery) return; // never respond — drives the client timeout
+      if (opts.malformOnQuery) {
+        // A RowDescription claiming 1000 fields with an empty body — the decoder
+        // reads past the end. Proves a hostile/desynced server rejects the query
+        // rather than crashing the hub with an uncaught RangeError.
+        send(Buffer.concat([...write, frameMessage("T", new ByteWriter().int16(1000).build())]));
+        return;
+      }
       if (/^\s*INSERT/i.test(lastSql)) {
         write.push(frameMessage("n")); // NoData (Describe portal, no result columns)
         write.push(frameMessage("C", new ByteWriter().cstring("INSERT 0 1").build()));
@@ -567,6 +581,21 @@ test("live: a query that never gets a reply times out and poisons its connection
   const pool = poolFor(fake, { queryTimeoutMs: 250 });
   try {
     await assert.rejects(pool.query("SELECT 1", []), /query timeout/);
+  } finally {
+    pool.close();
+    await fake.close();
+  }
+});
+
+test("live: a malformed backend message rejects the query, never crashes the process", async () => {
+  // If the decode loop let a RangeError escape the socket 'data' handler it would
+  // be an uncaughtException that kills node --test itself — so this test COMPLETING
+  // is part of the assertion (QA finding, XERK-776 defect 1).
+  const fake = await startFakePg({ malformOnQuery: true });
+  const pool = poolFor(fake, { queryTimeoutMs: 2000 });
+  try {
+    await assert.rejects(pool.query("SELECT 1", []));
+    assert.notEqual(pool.health, "ready"); // the poisoned connection was torn down
   } finally {
     pool.close();
     await fake.close();

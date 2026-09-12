@@ -43,6 +43,16 @@ byte-identical + no-work-on-the-beat invariants. This file is the operative rule
   byte. `frameMessage(type, body)` is the typed framer; `encodeStartupMessage`/`encodeSSLRequest` are
   the untyped ones. `PgProtocolReader.feed` needs ≥5 bytes to know a message's length and holds a
   partial tail across chunks (a DataRow can span sockets), exactly like `RespParser`.
+- **A malformed backend message must NEVER escape the socket handler.** The
+  `ByteReader` decoders (`parseRowDescription`/`parseDataRow`/`parseNoticeFields`/
+  `parseAuthentication`) throw a `RangeError` on a body that lies about its field/column
+  count or is truncated. `PgConnection._onData` wraps BOTH `reader.feed` AND the per-message
+  `_onMessage` decode in try/catch and routes any throw to `_fail` (reject the in-flight query,
+  reset the socket) — a hostile/desynced server (or a MITM, since `require` is encrypt-only)
+  otherwise becomes an `uncaughtException` that kills the whole hub (the XERK-235 class). Do NOT
+  move the decode loop back outside the try. `PgProtocolReader` also caps a message's DECLARED
+  length (`MAX_MESSAGE_BYTES`, checked at the header before any body is buffered) so a bogus huge
+  length can't grow the read buffer unbounded.
 - **SCRAM-SHA-256 is the auth path** (the CNPG default). It is `-SHA-256`, NOT `-PLUS`, so there is NO
   channel binding: the GS2 header is `n,,` and the client-final channel-binding attribute is the fixed
   `c=biws` (base64 of `n,,`). The username in SCRAM is EMPTY (`n=,r=<nonce>`) because Postgres takes
