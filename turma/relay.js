@@ -478,8 +478,9 @@ function makeRelay(store, replicaId, deps = {}) {
     // Re-publish this replica's endpoint on every store health→ready EDGE (initial
     // connect AND every reconnect), the XERK-758 ledger pattern — the boot publish
     // above races the socket, and a reconnect would otherwise leave the endpoint
-    // gone until the refresh timer. FileLiveStore has no `onHealth` and is ready
-    // synchronously, so this only arms on the shared backend.
+    // gone until the refresh timer. FileLiveStore's `onHealth` is an inert no-op
+    // (never fires) and it is ready synchronously, so this only fires on the shared
+    // backend; the after-`ready()` publish below covers the file/test path.
     if (endpoint && store && typeof store.onHealth === "function") {
       unhealth = store.onHealth((h) => { if (h === "ready") publishEndpoint(); });
     }
