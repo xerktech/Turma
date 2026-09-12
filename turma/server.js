@@ -27,7 +27,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
-const { Duplex } = require("stream");
+const { Duplex, Readable } = require("stream");
 // Only the archive's raw layer uses this (XERK-338): agents gzip a session's own
 // bytes on the wire, and the hub gunzips them under a hard output bound.
 const zlib = require("zlib");
@@ -794,6 +794,37 @@ function sweepUploads(now = Date.now()) {
   for (const [id, u] of uploads) {
     if (now - u.at > UPLOAD_TTL_MS) uploads.delete(id);
   }
+}
+
+// ---- message-attachment directory across replicas (XERK-787) ----------------
+// The `uploads` Map (XERK-234) holds attachment BYTES in memory on the replica the
+// operator's staging POST landed on. Under active-active HA the agent's blob pull
+// (`GET .../uploads/<id>/blob`) can land on a DIFFERENT replica, whose Map never
+// received the bytes -> a 404 that drops the attachment. So mirror a BYTE-FREE
+// directory entry to the shared store keyed `upload/<id>` — which replica holds it,
+// for whom, how big — and a pull that misses locally reads it and RELAYS the bytes
+// from the owner over the SAME transport the migration bundle uses (relay.js
+// `kind:"upload"`, XERK-785 sibling). The store carries no attachment byte (the
+// byte-plane vs record-plane split). HA off => `uploadStoreShared` false => inert,
+// and the single-process local-hit path is byte-identical.
+let uploadStore = null;
+let uploadStoreShared = false;
+function setUploadStore(store, shared) {
+  uploadStore = store || null;
+  uploadStoreShared = !!(store && shared);
+}
+const UPLOAD_DIR_PREFIX = "upload/";
+// Publish the byte-free directory entry for a freshly-staged upload. Best-effort
+// (a dropped write self-heals: the agent's pull just 404s and the command re-issues
+// on at-least-once delivery). TTL matches the in-memory UPLOAD_TTL_MS, so the
+// directory entry expires with the bytes it points at rather than lingering.
+function publishUploadDir(u) {
+  if (!uploadStoreShared || !u || !u.id) return;
+  Promise.resolve(uploadStore.set(
+    UPLOAD_DIR_PREFIX + u.id,
+    { replica: SSE_REPLICA_ID, host: u.host, size: u.size, at: u.at },
+    { ttlMs: UPLOAD_TTL_MS },
+  )).catch(() => {});
 }
 
 /**
@@ -13785,6 +13816,36 @@ function openMigrationBlobForRelay(id) {
   });
 }
 
+// A backpressure-honouring Readable over an in-memory Buffer, yielding it in slices
+// well under the relay's frame ceiling (`DEFAULT_FRAME_MAX`, 16 MiB) — a single
+// `Readable.from([buf])` would emit the WHOLE buffer as ONE frame, which the peer's
+// deframer refuses (goes dead) once an attachment exceeds the ceiling. 1 MiB slices
+// mirror how a file stream chunks (the migration path streams off disk).
+function bufferReadable(buf, chunkSize = 1 << 20) {
+  let off = 0;
+  return new Readable({
+    read() {
+      if (off >= buf.length) { this.push(null); return; }
+      const end = Math.min(off + chunkSize, buf.length);
+      this.push(buf.subarray(off, end));
+      off = end;
+    },
+  });
+}
+
+// OWNER side of the cross-replica message-attachment relay (XERK-787) — the
+// `openUpload` twin of `openMigrationBlobForRelay`. This replica's `uploads` Map
+// holds the attachment bytes for `id`; return a chunked stream + length for the
+// relay to pipe back to the ORIGIN replica the agent's pull landed on. Null when
+// this replica no longer holds it (expired/swept), so the relay hints "no-bundle"
+// and the origin answers the same 404 the local GET does.
+function openUploadBlobForRelay(id) {
+  sweepUploads();
+  const u = uploads.get(id);
+  if (!u || !u.bytes) return Promise.resolve(null);
+  return Promise.resolve({ stream: bufferReadable(u.bytes), size: u.bytes.length });
+}
+
 // ---- terminal proxy ---------------------------------------------------------
 // Proxy an HTTP asset request (ttyd HTML/JS/token) through the agent's tunnel.
 //
@@ -15450,14 +15511,64 @@ const server = http.createServer(async (req, res) => {
         parts[3] === "uploads" && parts[5] === "blob" && parts.length === 6) {
       sweepUploads();
       const host = decodeURIComponent(parts[2]);
-      const u = uploads.get(decodeURIComponent(parts[4]));
-      if (!u || u.host !== host) return json(res, 404, { error: "no such upload" });
-      res.writeHead(200, {
-        "Content-Type": "application/octet-stream",
-        "Content-Length": u.bytes.length,
-        "Cache-Control": "no-store",
-      });
-      return res.end(u.bytes);
+      const uid = decodeURIComponent(parts[4]);
+      const u = uploads.get(uid);
+      if (u) {
+        // Local hit. A hit for the WRONG host is a scoping refusal (XERK-268), never
+        // a cross-replica miss — 404 without relaying.
+        if (u.host !== host) return json(res, 404, { error: "no such upload" });
+        res.writeHead(200, {
+          "Content-Type": "application/octet-stream",
+          "Content-Length": u.bytes.length,
+          "Cache-Control": "no-store",
+        });
+        return res.end(u.bytes);
+      }
+      // Local MISS under active-active HA (XERK-787): the operator's staging POST
+      // landed on ANOTHER replica, so the bytes live in its `uploads` Map, not ours.
+      // Consult the byte-free directory and relay-fetch from the owning replica over
+      // the same pod-to-pod transport the migration bundle uses. `dir.host === host`
+      // preserves the XERK-268 scoping cross-replica; `connectUpload` returns null
+      // (fall to 404) when the owner is us / unreachable, and rejects on a dial
+      // failure (logged + 404) — the attachment then just doesn't arrive (SAFE, the
+      // send fails visibly / retries), never a crash and never a bundle byte in the
+      // store.
+      if (relay && uploadStoreShared) {
+        let dir = null;
+        try { dir = await uploadStore.get(UPLOAD_DIR_PREFIX + uid); } catch { dir = null; }
+        if (dir && dir.host === host && dir.replica && dir.replica !== SSE_REPLICA_ID) {
+          let d;
+          try {
+            d = await relay.connectUpload(dir.replica, uid);
+          } catch (e) {
+            console.error(`upload ${uid}: blob relay dial failed: ${(e && e.message) || e}`);
+            return json(res, 404, { error: "no such upload" });
+          }
+          if (d) {
+            let started = false;
+            d.on("hint", (obj) => {
+              if (!obj || typeof obj !== "object") return;
+              if (obj.t === "blob" && !started && !res.headersSent) {
+                started = true;
+                const len = Number.isInteger(obj.size) ? obj.size : dir.size;
+                res.writeHead(200, {
+                  "Content-Type": "application/octet-stream",
+                  "Content-Length": len,
+                  "Cache-Control": "no-store",
+                });
+                d.pipe(res);
+              }
+            });
+            d.on("close", () => {
+              if (!started && !res.headersSent) json(res, 404, { error: "no such upload" });
+            });
+            d.on("error", () => {}); // teardown surfaced via close; never re-throw
+            res.on("close", () => { if (!d.destroyed) d.destroy(); });
+            return;
+          }
+        }
+      }
+      return json(res, 404, { error: "no such upload" });
     }
 
     // GET /api/search?q=&repo=&host=&limit= — instant hub-local full-text search
@@ -16152,9 +16263,11 @@ const server = http.createServer(async (req, res) => {
           return json(res, 503, { error: "the hub is holding too many pending uploads — try again shortly" });
         const id = crypto.randomBytes(12).toString("hex");
         const name = safeUploadName(url.searchParams.get("name") || "");
-        uploads.set(id, {
-          id, host: key, sessionId, name, size: bytes.length, bytes, at: Date.now(),
-        });
+        const u = { id, host: key, sessionId, name, size: bytes.length, bytes, at: Date.now() };
+        uploads.set(id, u);
+        // Publish the byte-free directory entry so a pull that lands on another
+        // replica can relay the bytes from here (XERK-787). No-op with HA off.
+        publishUploadDir(u);
         return json(res, 200, { ok: true, uploadId: id, name, size: bytes.length });
       }
       // POST /api/agents/<host>/sessions/<id>/input -> forward free-text input
@@ -18435,6 +18548,7 @@ if (process.env.TURMA_TEST) {
     // `armLiveWatcher`/`disarmLiveWatcher` are the `/live` machinery. Exported so a
     // test can drive the cross-replica paths with an injected relay (`__setRelay`).
     openChannel, openChannelLocal, openLiveForRelay, openLiveRelay, openMigrationBlobForRelay,
+    openUploadBlobForRelay, setUploadStore, UPLOAD_DIR_PREFIX, publishUploadDir,
     liveFanout, liveClients, liveRelayChannels, armLiveWatcher, disarmLiveWatcher,
     rearmOriginLiveRelays, dropOriginLiveRelays, RELAY_AUTH_TOKEN,
     siteKeyOf,
@@ -18536,6 +18650,7 @@ if (process.env.TURMA_TEST) {
   // child calls hydrateMigrations again on promotion) and run the record-aware
   // spool sweep the single-process boot sweep deferred to above.
   setMigrationStore(liveStore, HA_ON);
+  setUploadStore(liveStore, HA_ON); // XERK-787: the byte-free attachment directory
   if (HA_ON) {
     // Watch FIRST (so no cross-replica change is missed during the async scan),
     // then hydrate the Map from the store (XERK-778/761). The standing watch keeps
@@ -18612,6 +18727,7 @@ if (process.env.TURMA_TEST) {
       openLocal: openChannelLocal, // the DATA bridge (owner side), never the relay-aware wrapper
       openLive: openLiveForRelay, // the LIVE delta bridge (owner side)
       openBlob: openMigrationBlobForRelay, // the migration-bundle bridge (owner side, XERK-785)
+      openUpload: openUploadBlobForRelay, // the message-attachment bridge (owner side, XERK-787)
       dial: relayDial,
       endpoint: relayEndpointAddr(),
       authToken: RELAY_AUTH_TOKEN,

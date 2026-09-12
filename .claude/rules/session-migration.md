@@ -186,6 +186,41 @@ was an RWX spool PVC — a Longhorn share-manager pod, a new failure point for a
   forward-learning `blobReplica`). The HTTP-route wiring end-to-end is QA'd on a live active-active
   fleet.
 
+## Relaying MESSAGE ATTACHMENT bytes cross-replica (XERK-787, epic XERK-775)
+
+The XERK-785 sibling for operator attachments (XERK-234): a file attached to a session message is
+staged by `POST /api/agents/<host>/uploads`, which holds the BYTES in memory in the per-replica
+`uploads` Map — NOT on the hot-mirrored migration record, and never spooled. Under active-active the
+agent's later blob pull (`GET .../uploads/<id>/blob`) can land on a replica whose Map never received
+the bytes → it 404'd "no such upload" and the attachment silently dropped (SAFE — no data loss, the
+send just fails/retries; only bites cross-replica). Fixed the same way: relay the bytes.
+
+- **A BYTE-FREE directory names the owner.** On stage, `publishUploadDir` writes `upload/<id> →
+  {replica: SSE_REPLICA_ID, host, size, at}` to the shared store with a TTL matching `UPLOAD_TTL_MS`
+  (so it expires WITH the in-memory bytes). Unlike migrations (whose record is already hot-mirrored),
+  uploads had NO cross-replica channel, so this is a small dedicated directory — but it needs no hot
+  MIRROR/watch: the GET reads it with a single lazy `await uploadStore.get()` only on a LOCAL MISS
+  (the cross-replica path), never on the hot local-hit path.
+- **The pull relay-fetches on a local miss.** The GET serves a local hit as before (a wrong-host
+  local hit stays a scoping 404, never relays); on a miss it reads the directory and, if
+  `dir.host === host` (XERK-268 scoping preserved cross-replica) and `dir.replica` is another replica,
+  calls `relay.connectUpload(dir.replica, id)` — the `kind:"upload"` twin of the migration channel
+  (shared `connectBlobKind` transport, `openUpload` owner bridge reading the `uploads` Map). Same
+  `{t:"blob",size}` ack → 200 + Content-Length → pipe; `no-bundle`/dial-failure/null → 404. **The
+  store carries no attachment byte.**
+- **Attachment bytes are CHUNKED for the relay** (`bufferReadable`, 1 MiB slices): the bytes are an
+  in-memory Buffer, and a single `Readable.from([buf])` would frame the WHOLE attachment as ONE frame,
+  which the peer deframer refuses (goes dead) once it exceeds the relay's 16 MiB ceiling. The migration
+  path never hit this (it streams off disk in 64 KiB chunks).
+- **HA OFF / single-process is byte-identical** — `uploadStoreShared` false, `relay` null, so
+  `publishUploadDir` is inert and the GET's relay branch is never entered; the local-hit `res.end(u.bytes)`
+  is exactly as before.
+- Tests: the `XERK-787:` cases in `tunnel-relay.test.js` (`connectUpload` bridge end-to-end,
+  `no-bundle`/`relay-error`, and that an upload channel uses `openUpload` not the migration `openBlob`)
+  and `server.test.js` (`openUploadBlobForRelay` chunked byte-identical stream under the frame ceiling;
+  `publishUploadDir` byte-free + inert with HA off). The HTTP-route wiring end-to-end is QA'd on a live
+  fleet.
+
 ## A refused session start is REPORTED, never just logged (XERK-265)
 
 - **A command is ACKed whether the agent ran it or declined it**, so a refusal the agent only `log()`s

@@ -118,10 +118,18 @@ rule above. Rationale (recommended shape vs the rejected route-by-host-at-ingres
   with no consumer listener would crash the process — the `channelDuplex` rule).
 - **Liveness:** a ping/idle loop over the pod-to-pod hop (mirrors the control channel) tears down a
   half-open conn rather than reporting it live forever.
-- **Two channel KINDS on the handshake** (XERK-781): `kind:"data"` (default) bridges to `openLocal`
-  (ttyd bytes / the `openChannel` dial-back); `kind:"live"` bridges to `openLive(host,session)` (the
-  `/live` delta stream), keyed by a session id, not a ttyd port. A live channel to an owner with no
-  `openLive` dep hints `relay-error`.
+- **Channel KINDS on the handshake.** Two are HOST-addressed (`connect(host, port, {kind})`), the
+  owner resolved from the tunnel-owner directory: `kind:"data"` (default, XERK-781) bridges to
+  `openLocal` (ttyd bytes / the `openChannel` dial-back); `kind:"live"` (XERK-781) bridges to
+  `openLive(host,session)` (the `/live` delta stream), keyed by a session id, not a ttyd port. Two are
+  REPLICA-addressed BLOB-BY-KEY channels (`connectMigration`/`connectUpload(replica, id)`, the shared
+  `connectBlobKind` internal), dialing a specific replica directly rather than a host's tunnel owner —
+  because the byte owner is "whichever replica the POST landed on", unrelated to any tunnel:
+  `kind:"migration"` (XERK-785) bridges to `openBlob(id)` (the migration spool file), `kind:"upload"`
+  (XERK-787) to `openUpload(id)` (a message attachment's `uploads`-Map bytes). Both stream the bytes
+  back prefixed by a `{t:"blob",size}` CTRL frame; a missing blob hints `no-bundle` (origin 404s), an
+  owner with no bridge dep hints `relay-error`. See `.claude/rules/session-migration.md` for the
+  migration/upload record + directory plumbing on the server side.
 - **The pod-to-pod hop is AUTHENTICATED by a shared secret** (XERK-781, `authToken` dep): server.js
   derives it from `SESSION_KEY` (`HMAC(SESSION_KEY,"turma-relay")`, identical across replicas by the
   XERK-760 same-secret rule), `connect` puts it in the handshake, and `accept` refuses a mismatched
