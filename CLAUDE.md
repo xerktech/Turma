@@ -29,12 +29,12 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `windows-terminal.md` | `agent/win/**` | native Windows terminal layer (XERK-668): the ttyd drop-in pty-host; rationale in `docs/windows-agent-adr.md` |
 | `turma.md` | `turma/**` | chrome, org filter, dashboard, notifications, auth |
 | `turma-archive.md` | `turma/archive.js` | durable archive: layers, size ceilings, how the total is measured |
-| `turma-ha-archive.md` | `turma/blobstore.js`, `turma/archive-mirror.js` | HA archive of-record (XERK-759): object-store bytes + per-replica single-writer disposable index, the mirror/hydrate seam |
-| `turma-ha-postgres.md` | `turma/pgclient.js` | HA Postgres of-record spine (XERK-776): stdlib v3 wire client + SCRAM-SHA-256 + extended query + pool + GREATEST upsert; no consumer wired yet; non-HA returns null |
+| `turma-ha-archive.md` | `turma/blobstore.js`, `turma/archive-mirror.js`, `turma/index-store.js` | HA archive of-record (XERK-759/780): object-store bytes + Postgres index of-record (per-replica hot SQLite cache, hydrated from PG), the mirror/hydrate seam |
+| `turma-ha-postgres.md` | `turma/pgclient.js` | HA Postgres of-record spine (XERK-776): stdlib v3 wire client + SCRAM-SHA-256 + extended query + pool + GREATEST upsert; consumed by the ledger (XERK-779) + archive index (XERK-780) of-records; non-HA returns null |
 | `turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `turma-ha-registry.md` | `turma/server.js` | HA: the fleet registry + per-host command queues in the shared store (per-host write-through, hydration, watch); non-HA byte-identical (XERK-756) |
 | `turma-ha-leader.md` | `turma/leader.js`, `turma/server.js` | HA: k8s-Lease leader election + `isLeader()` gating the singleton sweeps/migration-advance; the shared single-flight guards (write-through + hydrate-on-promotion); non-HA always-leader/byte-identical (XERK-763) |
-| `turma-ha-tunnel.md` | `turma/server.js` | HA: cross-replica tunnel directory + control bus (XERK-764) — `terminalOnline` truth + command poke across replicas; the duplex byte-stream relay is deferred; non-HA byte-identical |
+| `turma-ha-tunnel.md` | `turma/server.js`, `turma/relay.js` | HA: cross-replica tunnel directory + control bus (XERK-764) + the duplex byte-stream relay for /term,/live,openChannel (XERK-777/781) — active-active serving across replicas; non-HA byte-identical |
 | `turma-oidc.md` | `turma/server.js` | OIDC relying-party core: code+PKCE, discovery, JWKS RS256, session cookie, RP-logout |
 | `turma-break-glass.md` | `turma/server.js`, `turma/public/login.html` | IdP-independent break-glass local login; invariants a mandatory-OIDC change must keep |
 | `turma-usage.md` | `turma/public/usage.html`, `usage-ledger.js` | token chart, durable ledger, sub-agent split, limit cards, ingest coercions |

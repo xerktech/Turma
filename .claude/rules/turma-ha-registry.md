@@ -70,17 +70,19 @@ for the store contract this plugs into.
 - **Watch FIRST, then scan** (boot order) so no cross-replica change is missed during the async scan; a
   key a watch event already populated is left alone (the watched value is fresher).
 
-## Known constraints (out of scope, deliberately)
+## Known constraints (residuals under active-active)
 
-- **Cross-replica command delivery + tunnel poke assume ACTIVE-PASSIVE leader-only** (the ADR's Option
-  2): a host beats to the leader, which holds its control channel, so the command it queued is on the
-  same replica's `agents` and the tunnel poke reaches it. A command queued on replica A for a host
-  beating to replica B propagates via the record+watch (~1s debounce), NOT instantly — fine for warm
-  standby, the "coordinate" note in the ticket for full active-active (Option 3).
-- **Leader election is NOT here** — it is a k8s `Lease` (a separate sibling). Until it is wired, the
-  singleton sweeps (offline-alert, auto-start, prune eviction) run on every replica; each still writes
-  only records it owns, and eviction/prune `del`s are the leader's job under the lease. Do not add a
-  store-key lease here (the ADR keeps election in k8s).
+- **The tunnel poke IS cross-replica now** (XERK-764): a poke for a host a sibling replica owns is
+  addressed over the control bus to the owning replica, so it is no longer leader-local. Serving is
+  active-active (XERK-782). Mechanics: `.claude/rules/turma-ha-tunnel.md`.
+- **Cross-replica command QUEUEING keeps a ~1s delivery race** — this is the residual, unchanged. A
+  command queued on replica A for a host beating to replica B propagates via the record+watch (~1s
+  debounce), NOT instantly; the host's next scheduled beat delivers it regardless (the poke is only a
+  latency optimisation). Accepted for active-active — see `.claude/rules/turma-ha-leader.md`.
+- **Leader election IS wired** — it is a k8s `Lease` (XERK-763, `.claude/rules/turma-ha-leader.md`),
+  gating only the singleton sweeps (offline-alert, the master-orchestration bundle, migration-advance)
+  + the eviction/prune `del`s, never serving. Each replica still writes only records it owns. Do not
+  add a store-key lease here (the ADR keeps election in k8s).
 
 ## Tests
 

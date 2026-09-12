@@ -18,6 +18,29 @@ CloudNativePG, and — if not already present — MinIO). The parent design expl
 before building — it adds an operational surface to k8x."* This ADR **is** that confirmation
 artifact: the decision is recorded here to be reviewed on the PR, not re-derived by each sibling.
 
+> **SHIPPED (epic XERK-775) — Postgres is now the durable of-record this ADR designated.** The
+> "structured history → Postgres" decision below is fully realized, superseding every earlier
+> "no PG client yet" / "SQLite-per-pod interim" / "ledger on Valkey interim" note in this document:
+> - **The stdlib Postgres client landed** (XERK-776, `turma/pgclient.js`) — the v3 wire protocol +
+>   SCRAM-SHA-256 + extended query + a bounded pool + the `GREATEST` upsert, all stdlib-only. This
+>   removed the sole reason the ledger and index took interim homes.
+> - **The usage ledger is of-record on Postgres** (XERK-779, `usage-ledger-store.js`), **retiring the
+>   interim Valkey `SharedLedgerBackend`** (XERK-758, which existed only because there was no PG
+>   client). One `GREATEST`-per-leaf upsert; full fidelity (per-repo/model/pre/sub-agent) survives a
+>   cold rehydrate.
+> - **The archive index is of-record on Postgres** (XERK-780, `index-store.js`), **retiring the
+>   interim SQLite-per-pod rebuild-from-files** (XERK-759). The local node:sqlite stays a per-replica
+>   hot cache, mirrored to Postgres and hydrated from it on boot/promotion.
+> - **This closes the XERK-773 divergence** — the boot line no longer claims Postgres for a backend
+>   that wasn't wired: per-backend flags (`LEDGER_BACKEND_WIRED`/`INDEX_BACKEND_WIRED`) each flip in
+>   the change that wires their backend, so `HA: on (…, ledger=postgres, index=postgres, …)` is true.
+> - **The cross-replica byte-stream relay transport landed** (XERK-777/781, §"The cross-replica
+>   byte-stream relay transport" below), which — with the shared SSE bus and session cookie — let
+>   `/readyz` go leader-independent (XERK-782): **active-active is the shipped topology.**
+> Where the sections below read in the design/future tense, treat them as the decision record; the
+> operative mechanics are in `.claude/rules/turma-ha-postgres.md`, `turma-ha-archive.md`,
+> `turma-usage.md`, and the operator guide `docs/turma-ha-deploy.md`.
+
 ---
 
 ## The decision, in one paragraph

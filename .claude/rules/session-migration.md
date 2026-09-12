@@ -55,9 +55,12 @@ Migration assumed ONE hub. Under HA the hub is N replicas and a single move's so
 target-pull and `advanceMigrations` can land on DIFFERENT replicas across a RollingUpdate leader
 failover. Read `.claude/rules/turma-ha-store.md` for the `LiveStore` seam this plugs into.
 
-- **The in-memory `migrations` Map stays the LEADER's working copy.** Only the leader serves traffic
-  and runs `advanceMigrations` (Option 2, `docs/turma-ha-design.md`), so its SYNCHRONOUS reads across
-  the request path and the beat are left as-is — NOT rewritten to async. The store is the
+- **The in-memory `migrations` Map stays the LEADER's working copy.** *(As of XERK-761 this rode the
+  Option-2 assumption that only the leader served traffic; XERK-778 then made the request path
+  resolvable on any replica via a hot cross-replica mirror, and XERK-782 flipped `/readyz` to
+  active-active and closed the mutation flow — see those two sections below. `advanceMigrations` stays
+  leader-only regardless.)* The leader runs `advanceMigrations`, so its SYNCHRONOUS reads across the
+  request path and the beat are left as-is — NOT rewritten to async. The store is the
   cross-replica-durable MIRROR + hydration source on top of the Map, not a replacement for it.
 - **In HA every record is mirrored to the shared `LiveStore` keyed `migration/<id>`** with a TTL past
   the whole in-flight window (`MIGRATE_RECORD_TTL_MS` = `MIGRATE_TIMEOUT_MS` + 2m), refreshed on every
