@@ -15,7 +15,8 @@ Turma's hub supports **two deployment shapes**, and both are fully supported:
 **A hub outage costs dashboard visibility and queued commands, never work.** The fleet's agents run
 natively on each host; sessions are `claude`/tmux processes owned by those agents, not by the hub,
 and agents retry their heartbeats and tunnels across a gap. So the non-HA path is a completely
-legitimate production choice — HA buys *no visible gap during a deploy*, not more capability.
+legitimate production choice — HA buys a *~5–6 s reconnect blip on a deploy instead of a
+full-restart outage* (measured, XERK-767), not more capability.
 
 ---
 
@@ -27,7 +28,7 @@ legitimate production choice — HA buys *no visible gap during a deploy*, not m
 | Terminals, live transcript tail, chat | ✅ | ✅ |
 | Durable archive, usage ledger, board, triage, migration | ✅ | ✅ |
 | OIDC / break-glass login, notifications (FCM) | ✅ | ✅ |
-| **No-outage rolling updates / pod-loss failover** | ❌ (a deploy blips the dashboard) | ✅ |
+| **Low-blip rolling updates / pod-loss failover** | ❌ (a deploy = full-restart outage) | ✅ (~5–6 s reconnect) |
 | **Horizontal scale-out of the dashboard** | ❌ | ❌ — see note below |
 
 **Everything except no-outage deploys works identically on the single-process path.** HA does *not*
@@ -134,8 +135,8 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 1                 # bring a standby up before draining the leader
-      maxUnavailable: 0           # never drop below the running replica count
+      maxSurge: 1                 # surge a fresh pod in during the roll
+      maxUnavailable: 100%        # REQUIRED, not 0 — see the note below
   template:
     spec:
       terminationGracePeriodSeconds: 20   # ≥ SHUTDOWN_DRAIN_MS (default 10s), room for the drain
@@ -150,7 +151,16 @@ spec:
 ```
 
 Because only the leader serves (below), the second replica is a **warm standby**, not extra capacity.
-Two replicas is enough for no-outage deploys; three tolerates one being down *during* a deploy.
+Two replicas is enough for a low-blip deploy; three tolerates one being down *during* a deploy.
+
+**Why `maxUnavailable` must allow 0 available, not `0`.** Readiness is gated on leadership (`/readyz`
+below), so **only the leader is ever Ready** — the Deployment's `availableReplicas` is permanently 1
+of `replicas`. `maxUnavailable: 0` would demand `availableReplicas ≥ replicas` throughout the roll,
+which can *never* hold, so the rollout **deadlocks** (it surges a new pod, but that pod stays a
+NotReady standby and the old leader is never drained). `maxUnavailable: 100%` is what lets the roll
+proceed at all — and it means Kubernetes may drain the old leader *before* the surged pod is Ready.
+A brief serving gap during a deploy is therefore **inherent** to Option 2 + leadership-gated
+readiness, not a tuning miss; see the measured cost in step 4 below.
 
 ### The leader lease + RBAC (net-new)
 
@@ -228,7 +238,7 @@ readinessProbe:                   # gates Service membership on leadership + dra
 The Docker `healthcheck` in `hub.yaml` already targets `/healthz` — correct, since a compose hub is
 always the leader.
 
-### The no-outage rolling update, step by step
+### The rolling update, step by step (a reconnect blip, not a full-restart outage)
 
 On `SIGTERM` (which a rolling update sends to the old pod):
 
@@ -239,8 +249,17 @@ On `SIGTERM` (which a rolling update sends to the old pod):
 3. The hub holds for `READYZ_DRAIN_DELAY_MS` (default `2000`, capped below `SHUTDOWN_DRAIN_MS`) to let
    the endpoint removal propagate, **then** closes SSE/WebSocket sockets with a going-away code and
    flushes the store. Force-exit backstop at `SHUTDOWN_DRAIN_MS` (default `10000`).
-4. A standby wins the lease within a beat or two, flips **Ready**, and the Service routes to it;
-   browsers and agents re-dial. That ~1–2 s reconnect is the accepted cost — no sustained outage.
+4. A new leader wins the lease, flips **Ready**, and the Service routes to it; browsers and agents
+   re-dial. **Measured reconnect cost (XERK-767, prod, `kubectl rollout restart`, `/readyz` polled
+   through the Service every 200 ms): ~5–6 s with no Ready endpoint** — ~4–5 s of `503` from the
+   draining old leader (still the sole endpoint until kube-proxy catches up) then ~1 s of
+   connection-refused, before the new leader answers `200`. It is a *reconnect blip*, not a
+   full-restart outage — but it is **not** the ~1–2 s a warm-standby promotion would cost. In a
+   rolling update the old warm standby is *also* being replaced, so the lease goes to a **fresh pod
+   that must cold-boot, elect, and hydrate the archive index** before it is Ready; that cold-promote
+   is the bulk of the gap. An abrupt leader pod-loss with a surviving warm standby is faster (bounded
+   by the lease window + index hydration), but was not measured under XERK-767 (pod deletion is
+   guard-blocked in that environment). Shrinking the rollout gap is tracked separately.
 
 Set `terminationGracePeriodSeconds` at or above `SHUTDOWN_DRAIN_MS` so Kubernetes doesn't `SIGKILL`
 mid-drain.
@@ -266,9 +285,11 @@ mid-drain.
   blobs=s3)`. `HA: off` on a pod you expected to be HA means the store env didn't reach it.
 - **Leadership:** exactly one pod's `/readyz` returns `200`; the rest return `503 {leader:false}`.
   `kubectl get lease turma-hub-leader -n turma -o yaml` shows the current holder.
-- **No-outage deploy:** bump the image (or `kubectl rollout restart deploy/turma-hub`) and hold an
-  SSE stream or a terminal open against the public URL — it should reconnect within ~1–2 s, not drop
-  for the pod's full boot.
+- **Low-blip deploy:** bump the image (or `kubectl rollout restart deploy/turma-hub`) and hold an
+  SSE stream or a terminal open against the public URL — it should reconnect within ~5–6 s (measured,
+  XERK-767), not drop for the pod's full boot. Poll `/readyz` *through the Service* every 200 ms to
+  measure the gap precisely: the Service routes only to the Ready leader, so any non-`200` there is
+  the real serving-gap window.
 - **RBAC:** if pod logs warn "no Kubernetes service account is reachable — leader election is
   DISABLED", the ServiceAccount/Role/RoleBinding or `automountServiceAccountToken` is missing, and
   every replica is running the sweeps (double alerts, double auto-starts). Fix before going wider.
