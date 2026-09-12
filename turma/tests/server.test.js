@@ -15148,6 +15148,125 @@ test("XERK-761: the shared boot sweep keeps a live/fresh bundle, deletes only a 
   });
 });
 
+// ---- XERK-778: the migration REQUEST path resolves on any replica ------------
+// XERK-761 mirrored each record to the store + hydrated on promotion, but a
+// NON-leader's Map was a stale boot snapshot between promotions, so a status read
+// / attachment fetch that the LB landed on a non-owning replica saw no record.
+// A standing watch (watchMigrations) keeps `migrations` a hot cross-replica
+// mirror on EVERY replica, so the synchronous request-path reads serve on any
+// replica; migration ADVANCE stays leader-only. These drive the real
+// FileLiveStore as the injected shared backend + an injected follower leader.
+
+// Wire a FileLiveStore as the shared migration store AND install the watch, ALWAYS
+// unwiring + restoring the always-leader default afterwards.
+async function withWatchedMigrationStore(fn) {
+  const store = new FileLiveStore();
+  setMigrationStore(store, true);
+  hub.watchMigrations();
+  try {
+    await fn(store);
+  } finally {
+    hub.__setLeader(null);
+    setMigrationStore(null, false);
+    store.close();
+  }
+}
+
+test("XERK-778: a FOLLOWER serves a migration status read + attachment from the shared record", async () => {
+  await withWatchedMigrationStore(async (store) => {
+    await migHost("mgFollow", "mgf.atlassian.net");
+    hub.__setLeader(fakeLeader(false)); // this replica is NOT the leader/owner
+
+    const id = "778aabbccddeeff0";
+    const spool = migrationSpoolPath(id);
+    fs.writeFileSync(spool, "ATTACHMENT-BYTES");
+    // Another replica (the owner/leader) wrote the in-flight record. The watch
+    // fires synchronously on the FileLiveStore, so by the time set() resolves the
+    // hot mirror holds it.
+    await store.set(MIGRATION_KEY_PREFIX + id, {
+      id, srcHost: "mgSrc", targetHost: "mgFollow", phase: "importing",
+      transcriptId: "t-778", meta: {}, blobPath: spool, blobSize: fs.statSync(spool).size,
+      at: Date.now(), startedAt: Date.now(),
+    });
+
+    // The status read (/api/agents' migrationList) now resolves the record on a
+    // replica that never owned it.
+    assert.ok(hub.migrationList().some((x) => x.id === id && x.phase === "importing"),
+      "a follower serves the migration status read off the hot mirror");
+    // The leader-local transients are reset in the mirrored copy (as on hydrate).
+    assert.equal(migrations.get(id).uploading, false);
+    assert.equal(migrations.get(id).refusal, null);
+
+    // The attachment fetch (the target agent pulling the bundle) also resolves on
+    // the follower — the spool sits on the shared volume under its per-id name.
+    const dl = await requestRaw("GET", `/api/agents/mgFollow/migrations/${id}/blob`,
+      { headers: { authorization: "Bearer agenttok" } });
+    assert.equal(dl.status, 200);
+    assert.ok(Buffer.from("ATTACHMENT-BYTES").equals(dl.buf));
+
+    // A del from the owner (retire) propagates via the watch — the follower drops it.
+    await store.del(MIGRATION_KEY_PREFIX + id);
+    assert.equal(migrations.has(id), false, "a retired record leaves the follower's mirror");
+    try { fs.unlinkSync(spool); } catch {}
+  });
+});
+
+test("XERK-778: a FOLLOWER never re-mirrors a record it learned via the watch (no resurrection)", async () => {
+  await withWatchedMigrationStore(async (store) => {
+    const id = "778deadbeef00001";
+    // As if learned via the watch: it is in the Map but the owner has since
+    // RETIRED it, so the store holds nothing for this id.
+    migrations.set(id, {
+      id, srcHost: "rx", targetHost: "ry", phase: "exporting", meta: {},
+      at: Date.now(), startedAt: Date.now(),
+    });
+
+    // A follower publishing (an Option-3 request it serves) must NOT write the
+    // record back — that would resurrect a settled move in the store.
+    hub.__setLeader(fakeLeader(false));
+    hub.publishMigrations();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(await store.get(MIGRATION_KEY_PREFIX + id), null,
+      "a follower is a pure reader — it never mirrors the migration record");
+
+    // The leader IS the sole writer: it mirrors its whole working set.
+    hub.__setLeader(fakeLeader(true));
+    hub.publishMigrations();
+    await new Promise((r) => setImmediate(r));
+    assert.ok(await store.get(MIGRATION_KEY_PREFIX + id),
+      "the leader mirrors its working-set record");
+    migrations.delete(id);
+  });
+});
+
+test("XERK-778: the leader's own mirror echo does not clobber its live leader-local flags", async () => {
+  await withWatchedMigrationStore(async (store) => {
+    hub.__setLeader(fakeLeader(true));
+    const id = "778cafe000000001";
+    const m = {
+      id, srcHost: "ex", targetHost: "ey", phase: "exporting", meta: {},
+      uploading: true, refusal: "boom", at: Date.now(), startedAt: Date.now(),
+    };
+    migrations.set(id, m);
+
+    // Mirroring fires the watch synchronously on the FileLiveStore; the apply
+    // handler early-returns on the leader (its Map is authoritative), so the echo
+    // is never applied back over the live record.
+    hub.mirrorMigration(m);
+
+    // The leader's LIVE working record keeps its in-flight upload + refusal — the
+    // store copy has them stripped (mirror rule).
+    assert.equal(migrations.get(id).uploading, true,
+      "the self-echo must not reset the live upload flag mid-move");
+    assert.equal(migrations.get(id).refusal, "boom",
+      "the self-echo must not reset a live refusal");
+    const rec = await store.get(MIGRATION_KEY_PREFIX + id);
+    assert.equal(rec.uploading, false);
+    assert.equal(rec.refusal, null);
+    migrations.delete(id);
+  });
+});
+
 // ---- XERK-763: leader election + shared single-flight guards -----------------
 // Under HA (Option 2) the singleton sweeps + migration-advance run on the LEADER
 // only, and the guards those sweeps rely on are WRITE-THROUGH mirrored to the

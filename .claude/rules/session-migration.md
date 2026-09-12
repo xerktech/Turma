@@ -86,6 +86,50 @@ failover. Read `.claude/rules/turma-ha-store.md` for the `LiveStore` seam this p
 - Tests: the `XERK-761:` cases in `server.test.js` (mirror-then-forget, hydrate on promotion, the
   record-aware sweep keeping live/fresh bundles and deleting only a stale orphan).
 
+## Serving the request path from the shared record on any replica (XERK-778, epic XERK-775)
+
+XERK-761 mirrored the record + hydrated the Map ON PROMOTION, but between promotions a NON-leader's
+`migrations` Map was a stale boot snapshot — so under active-active (Option 3, XERK-775) a migration
+status read (`migrationList` on `/api/agents`), an attachment/import blob request, or a refusal
+ingest that the LB landed on a non-owning replica saw NO record. This makes the request path
+resolvable on any replica, while migration ADVANCE stays a leader-only sweep (XERK-763, unchanged).
+
+- **A standing WATCH keeps `migrations` a HOT cross-replica mirror on EVERY replica**
+  (`watchMigrations`, the MAP-channel pattern the registry — XERK-756 — and tunnel directory —
+  XERK-764 — use). So the SYNCHRONOUS request-path reads (`migrationList`, the blob `GET`/`POST`,
+  `ingestSpawnFailures`) resolve on any replica with NO async hop and NO change to those call sites —
+  the Map they already read is simply kept fresh. Installed at boot BEFORE `hydrateMigrations` (so no
+  change is missed during the scan) and left standing regardless of leadership.
+- **The LEADER is the SOLE WRITER; only NON-leaders APPLY the watch** — the split that makes this
+  correct without an echo-dedup. `publishMigrations`'s mirror loop is gated on `isLeader()` (a
+  non-leader learns records via the watch and must never re-mirror one, or a stale copy still in its
+  Map when the leader retires a move would RESURRECT the record), and `applyRemoteMigration`/
+  `applyRemoteMigrationRemoval` early-return on `isLeader()` (the leader's Map is its authoritative
+  working set; it never learns a record from the store). So no replica ever both writes AND applies —
+  a self-echo (even one racing the pub/sub round trip and thus not byte-equal to what we wrote) is
+  never applied over the leader's live `uploading`/`refusal`, and no `lastStoreWritten`-style memo is
+  needed. `isLeader()` is trivially true with no elector, so HA-off is byte-identical.
+- **The apply is otherwise like `applyRemoteAgent`**: it updates the Map and drops the agents cache
+  (migrations ride `/api/agents`), but never `sseBroadcast`s — the owning replica's
+  `publishMigrations` already published the `migrations` frame to the XERK-762 bus, which every
+  replica re-emits to its own clients. Leader-local transients are reset in the applied copy, as on
+  hydrate. On promotion `hydrateMigrations` re-syncs the new leader's Map before it starts writing.
+- **Scope boundary:** this only makes the record RESOLVABLE. A follower does NOT advance a move
+  (`migrationAdvanceTick` is leader-gated) and its request-path MUTATIONS are not mirrored to the
+  leader (mutations still flow to the leader under the shipped Option-2 topology, where `/readyz`
+  routes all traffic to it). The `/readyz` leader-gate stays because the terminal/`/live` byte-stream
+  relay is still deferred (XERK-764/777) — that, not migration, is now the remaining Option-2
+  requirement.
+- **Accepted residual (LOW, Valkey-only):** a leader crashing mid-move can leave a store key that
+  TTL-EXPIRES, and Valkey fires no watch event on a PX expiry (like XERK-764's tunnel directory), so
+  the record lingers in a non-promoted follower's Map. It is harmless — a follower serves no traffic
+  under Option 2, the Map is bounded (`MIGRATIONS_MAX`), and it self-heals on promotion (the new
+  leader's `advanceMigrations` times the record out and `del`s it). No sweep is added for it (unlike
+  the tunnel directory, whose entries a live path reads); documented, not fixed.
+- Tests: the `XERK-778:` cases in `server.test.js` (a follower serving a status read + attachment
+  fetch off the hot mirror; a follower never re-mirroring — no resurrection; the leader's own echo
+  not clobbering its live leader-local flags).
+
 ## A refused session start is REPORTED, never just logged (XERK-265)
 
 - **A command is ACKed whether the agent ran it or declined it**, so a refusal the agent only `log()`s
