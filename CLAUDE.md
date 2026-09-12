@@ -30,6 +30,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `turma.md` | `turma/**` | chrome, org filter, dashboard, notifications, auth |
 | `turma-archive.md` | `turma/archive.js` | durable archive: layers, size ceilings, how the total is measured |
 | `turma-ha-archive.md` | `turma/blobstore.js`, `turma/archive-mirror.js` | HA archive of-record (XERK-759): object-store bytes + per-replica single-writer disposable index, the mirror/hydrate seam |
+| `turma-ha-postgres.md` | `turma/pgclient.js` | HA Postgres of-record spine (XERK-776): stdlib v3 wire client + SCRAM-SHA-256 + extended query + pool + GREATEST upsert; no consumer wired yet; non-HA returns null |
 | `turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `turma-ha-registry.md` | `turma/server.js` | HA: the fleet registry + per-host command queues in the shared store (per-host write-through, hydration, watch); non-HA byte-identical (XERK-756) |
 | `turma-ha-leader.md` | `turma/leader.js`, `turma/server.js` | HA: k8s-Lease leader election + `isLeader()` gating the singleton sweeps/migration-advance; the shared single-flight guards (write-through + hydrate-on-promotion); non-HA always-leader/byte-identical (XERK-763) |
