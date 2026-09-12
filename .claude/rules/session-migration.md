@@ -114,13 +114,21 @@ resolvable on any replica, while migration ADVANCE stays a leader-only sweep (XE
   `publishMigrations` already published the `migrations` frame to the XERK-762 bus, which every
   replica re-emits to its own clients. Leader-local transients are reset in the applied copy, as on
   hydrate. On promotion `hydrateMigrations` re-syncs the new leader's Map before it starts writing.
-- **Scope boundary:** this only makes the record RESOLVABLE. A follower does NOT advance a move
-  (`migrationAdvanceTick` is leader-gated) and its request-path MUTATIONS are not mirrored to the
-  leader (mutations still flow to the leader under the shipped Option-2 topology, where `/readyz`
-  routes all traffic to it). The terminal/`/live` byte-stream relay has now LANDED (XERK-777 transport
-  + XERK-781 consumers), so it is no longer the blocker — the `/readyz` leader-gate now stays precisely
-  because request-path MUTATIONS (this migration flow, cross-replica command delivery) are not mirrored
-  to the leader from a follower; closing THAT is the remaining Option-2→Option-3 requirement.
+- **Scope boundary (XERK-778):** this only makes the record RESOLVABLE. A follower does NOT advance a
+  move (`migrationAdvanceTick` is leader-gated). At the time of XERK-778, request-path MUTATIONS were
+  not mirrored to the leader — mutations flowed to it under the Option-2 topology where `/readyz`
+  routed all traffic to the leader — and closing that was named as the remaining Option-2→Option-3
+  requirement.
+- **The mutation flow is now CLOSED (XERK-782), and `/readyz` is active-active.** A migration START /
+  blob-upload / restore-pack landing on a NON-leader write-throughs (a follower mirrors ONLY records
+  it itself mutated — `publishMigrations(id)` / `migrationsDirty` — never its whole Map, or it
+  resurrects a settled move), and the LEADER FORWARD-LEARNS them (`applyRemoteMigration`: adopt-if-
+  absent, forward-merge phase + progress fields, never regress, never touch leader-local
+  `uploading`/`refusal`, `migrationsRetired` anti-resurrection). The inline heartbeat-handler
+  `advanceMigrations()` is now `isLeader()`-gated too (a host beats to any replica once all are Ready).
+  So the sole advancer finishes a move started on any replica. Residual (LOW): a follower-ingested
+  `refusal` still doesn't travel (mirror strips it), so that case TIMES OUT rather than fast-failing —
+  source intact, no loss. Full rationale + the `/readyz` gate lift: `.claude/rules/turma-ha-leader.md`.
 - **Accepted residual (LOW, Valkey-only):** a leader crashing mid-move can leave a store key that
   TTL-EXPIRES, and Valkey fires no watch event on a PX expiry (like XERK-764's tunnel directory), so
   the record lingers in a non-promoted follower's Map. It is harmless — a follower serves no traffic
