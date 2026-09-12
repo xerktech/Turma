@@ -3578,7 +3578,16 @@ function publishMigrations() {
   // refreshes each record's TTL and misses no mutation site; retire is the one
   // path that also has to REMOVE a record, so it forgets explicitly. No-op —
   // and thus byte-identical single-process behaviour — when HA is off.
-  if (migrationStoreShared) {
+  //
+  // Only the LEADER writes the shared migration record (XERK-778). It owns the
+  // working-set Map; a non-leader learns records via watchMigrations (below) and
+  // must never re-mirror one, or a stale copy still in its Map when the leader
+  // retires a move would RESURRECT the record in the store. With HA off
+  // isLeader() is trivially true and migrationStoreShared is false, so this stays
+  // byte-identical. (A follower reaches this only under Option 3 request serving,
+  // deferred; migration ADVANCE — the mutations that finish a move — is
+  // leader-only regardless, migrationAdvanceTick.)
+  if (migrationStoreShared && isLeader()) {
     for (const m of migrations.values()) mirrorMigration(m);
   }
 }
@@ -3669,6 +3678,60 @@ async function hydrateMigrations() {
     if (migrations.has(value.id)) continue;
     migrations.set(value.id, { ...value, uploading: false, refusal: null });
   }
+}
+// ---- HA migration watch: keep every replica's Map a HOT mirror (XERK-778) ----
+// XERK-761 mirrored each record to the store and hydrated the Map on PROMOTION,
+// but between promotions a NON-leader's Map was a stale boot snapshot: a migration
+// status read (migrationList on /api/agents), an attachment/import blob request,
+// or a refusal ingest that the LB landed on a non-owning replica saw no record —
+// the active-active gap the /readyz comment names. A standing watch on the
+// migration prefix keeps `migrations` a hot cross-replica mirror on EVERY replica
+// (the MAP-channel pattern the registry — XERK-756 — and tunnel directory —
+// XERK-764 — use), so the SYNCHRONOUS request-path reads resolve on any replica
+// with no async hop and no change to those call sites. Migration ADVANCE (killing
+// the source, finishing the move) stays leader-only (migrationAdvanceTick,
+// XERK-763); this only makes the record RESOLVABLE, never lets a follower advance.
+//
+// Apply-only, and ONLY ON A NON-LEADER. The leader is the SOLE writer of the
+// shared migration record (publishMigrations mirror is isLeader-gated), so it owns
+// its whole Map and never needs to learn a record from the store — its own writes
+// echo back through this watch, and applying that echo (even a fresher-than-echo
+// one racing the pub/sub round trip) would re-install the flag-stripped copy OVER
+// the leader's live `uploading`/`refusal`. Gating apply on `!isLeader()` means no
+// replica ever both writes AND applies, so a self-echo is never applied and no
+// echo-dedup memo is needed. A follower's Map is thus kept a hot mirror; the
+// leader's Map stays its authoritative working set (re-synced by hydrateMigrations
+// on promotion). Like applyRemoteAgent this drops the agents cache (migrations
+// ride /api/agents) but never re-mirrors and never sseBroadcasts — the owning
+// replica's publishMigrations already published the `migrations` frame to the
+// XERK-762 bus, which every replica re-emits to its own clients. Leader-local
+// transients are reset in the applied copy, as on hydrate.
+function applyRemoteMigration(id, value) {
+  if (isLeader()) return; // the leader's Map is authoritative; never apply an echo
+  if (!value || typeof value !== "object" || typeof value.id !== "string") return;
+  migrations.set(id, { ...value, uploading: false, refusal: null });
+  invalidateAgentsCache();
+}
+function applyRemoteMigrationRemoval(id) {
+  if (isLeader()) return; // the leader retires its own records; ignore del echoes
+  if (!migrations.has(id)) return;
+  migrations.delete(id);
+  invalidateAgentsCache();
+}
+// Subscribe to the shared store's change channel for the migration prefix, so a
+// NON-leader's Map tracks the leader's writes (set/del) and stays a hot mirror for
+// the request-path reads. Installed before the boot hydrate so no cross-replica
+// change is missed during the async scan. No-op with HA off (migrationStoreShared
+// false) and inert on the leader (the apply handlers early-return there).
+function watchMigrations() {
+  if (!migrationStoreShared || !migrationStore || typeof migrationStore.watch !== "function") return;
+  migrationStore.watch(MIGRATION_KEY_PREFIX, (ev) => {
+    if (!ev || typeof ev.key !== "string") return;
+    const id = ev.key.slice(MIGRATION_KEY_PREFIX.length);
+    if (!id) return;
+    if (ev.type === "del") { applyRemoteMigrationRemoval(id); return; }
+    applyRemoteMigration(id, ev.value);
+  });
 }
 // ---- archive object-store mirror wiring (XERK-759) ------------------------
 // The archive's bytes move to object storage as the of-record under HA. The
@@ -13408,10 +13471,13 @@ const server = http.createServer(async (req, res) => {
     // exactly ONE replica — the leader — serves ALL traffic, and the standbys
     // stay warm off the shared store. The shipped code REQUIRES that shape: the
     // cross-replica terminal/`/live` byte-stream relay is deliberately deferred
-    // (XERK-764), so terminal bytes serve only from the tunnel owner's replica,
-    // and the migration request path reads a leader-only in-memory Map
-    // (`:3588`, `:11905`). A non-leader answering NotReady here removes it from
-    // the Service's EndpointSlice, so browsers/agents only ever hit the leader.
+    // (XERK-764), so terminal bytes serve only from the tunnel owner's replica. (The
+    // migration REQUEST path no longer needs the leader — XERK-778 made `migrations`
+    // a hot cross-replica mirror via watchMigrations, so a status read / attachment
+    // fetch resolves on any replica; only migration ADVANCE stays leader-only. The
+    // terminal byte relay is the remaining Option-2 requirement.) A non-leader
+    // answering NotReady here removes it from the Service's EndpointSlice, so
+    // browsers/agents only ever hit the leader.
     // On a rolling update the draining leader flips NotReady + renounces the
     // lease (backdated renewTime), a standby wins it within a beat or two and
     // flips Ready, and clients re-dial to it — the ~1-2s reconnect the epic
@@ -17754,6 +17820,12 @@ if (process.env.TURMA_TEST) {
     sweepMigrationSpoolShared,
     mirrorMigration,
     forgetMigration,
+    // XERK-778: the watch that keeps `migrations` a hot cross-replica mirror, and
+    // migrationList (what /api/agents serves), so a test can drive a non-leader
+    // serving a status read off the shared record.
+    watchMigrations,
+    migrationList,
+    publishMigrations,
     MIGRATION_KEY_PREFIX,
     MIGRATE_RECORD_TTL_MS,
     MIGRATE_SPOOL_ORPHAN_MS,
@@ -17873,6 +17945,12 @@ if (process.env.TURMA_TEST) {
   // spool sweep the single-process boot sweep deferred to above.
   setMigrationStore(liveStore, HA_ON);
   if (HA_ON) {
+    // Watch FIRST (so no cross-replica change is missed during the async scan),
+    // then hydrate the Map from the store (XERK-778/761). The standing watch keeps
+    // `migrations` a hot mirror so a NON-leader can serve a migration status/
+    // attachment/import request off it; hydrate covers a restart, and the `leader`
+    // child calls hydrateMigrations again on promotion.
+    watchMigrations();
     hydrateMigrations().catch((e) =>
       console.error(`migration hydrate failed: ${e && e.message}`));
     sweepMigrationSpoolShared().catch((e) =>
