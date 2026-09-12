@@ -2,12 +2,12 @@
 paths:
   - "turma/public/usage.html"
   - "turma/usage-ledger.js"
-  - "turma/usage-ledger-shared.js"
+  - "turma/usage-ledger-store.js"
   - "turma/server.js"
   - "turma/tests/usage.test.js"
   - "turma/tests/usage-models.test.js"
   - "turma/tests/usage-ledger.test.js"
-  - "turma/tests/usage-ledger-shared.test.js"
+  - "turma/tests/usage-ledger-store.test.js"
 ---
 
 # Usage page (`/usage`) and the durable usage ledger
@@ -169,60 +169,76 @@ paths:
   correcting the split (removing the overlap double-count) is the only movement they see.
 - Tests: the `XERK-448:` cases in `usage-ledger.test.js`.
 
-### HA: the shared-store backend (XERK-758, epic XERK-751)
+### HA: the Postgres of-record backend (XERK-779, epic XERK-775; was Valkey XERK-758)
 
 - **Persistence is a PLUGGABLE BACKEND behind one seam** (`usage-ledger.js`, `backend` +
-  `configure(liveStore, haConfig)`). The in-memory `hosts` model and EVERY reducer/read function
-  (`ingest`'s model mutation, `fold`, `retiredAgents`, `has`) are backend-agnostic and stay
-  SYNCHRONOUS — only PERSISTENCE differs. So with HA off nothing changes: the file backend rewrites
-  `/data/usage-ledger.json` whole, byte-for-byte and same cadence as before, and `configure` is a
-  no-op (the byte-for-byte file tests are untouched and still pass).
-- **With HA on, `configure` swaps in `SharedLedgerBackend`** (`usage-ledger-shared.js`): each host is
-  its OWN store key (`usage:host:<ledgerKey>`), written by an ATOMIC per-host HIGH-WATER **max-merge**
-  under the store's CAS (XERK-754 `LiveStore.compareAndSet` / `setIfAbsent`). The write RAISES the
-  local entry by the store's current value BEFORE the CAS, so what it writes is `>=` both this
-  replica's partial view AND any other replica's recorded marks — **a low writer can never lower a
-  recorded total**, and two racing replicas converge (the CAS loser re-reads the higher marks and
-  re-applies max). This is the LiveStore expression of the ADR's `GREATEST(existing,incoming)`.
-- **DELIBERATE ADR DIVERGENCE — flagged for sign-off.** `docs/turma-ha-store-adr.md` names **Postgres**
-  as the ledger of-record. Only the **Valkey LiveStore** backend exists today (XERK-754; the hub is
-  stdlib-only, so a from-scratch Postgres client is a separate large effort), and the ticket asks for
-  "the store's CAS/atomic ops chosen in the spike" — which is this. The write path is
-  backend-agnostic (per-host max-merge): a future Postgres `LedgerStore` with the same semantics
-  slots in behind `configure()` with **no call-site change**. `DATABASE_URL` is still required when
-  HA is on (`ha-config.js`, unchanged) — reserved for that backend + the archive index.
-- **The READ MODEL stays HOT, so the serve path is unchanged.** `fold`/`retiredAgents`/`has` read the
-  same in-memory `hosts` synchronously; the shared backend keeps it hot via its own writes AND a
-  `watch` subscription that folds in OTHER replicas' writes (the ADR warm-standby design). Under
-  Option 2 (leader-only serving) the leader receives every beat, so its model is complete; a standby
-  stays promotable. `mergeTwoEntries` is the entry-level high-water fold the watch + CAS reuse (the
-  entry analogue of `mergeSeries`), so there is ONE high-water rule, not a second copy.
+  `configure(haConfig, pgClient, onExternalChange)`). The in-memory `hosts` model and EVERY
+  reducer/read function (`ingest`'s model mutation, `fold`, `retiredAgents`, `has`) are
+  backend-agnostic and stay SYNCHRONOUS — only PERSISTENCE differs. So with HA off nothing changes:
+  the file backend rewrites `/data/usage-ledger.json` whole, byte-for-byte and same cadence as before,
+  and `configure` is a no-op (the byte-for-byte file tests are untouched and still pass).
+- **With HA on, `configure` swaps in the Postgres `LedgerStore`** (`usage-ledger-store.js`), the ADR's
+  designated of-record (`docs/turma-ha-store-adr.md`, "Why the ledger's high-water lives in
+  Postgres"). This RETIRES the Valkey `SharedLedgerBackend` (XERK-758), which existed only because
+  there was no stdlib Postgres client — w1-pg (XERK-776, `pgclient.js`) now provides one. The shared
+  `PgPool` is created in `server.js` (`createPgClient`, shared with the archive IndexStore) and passed
+  to `configure`; `DATABASE_URL` is a required, validated HA config, so it is non-null under HA. If it
+  is somehow absent under HA, the ledger stays on the file backend and logs LOUDLY (degraded, never
+  fatal — a per-replica file is wrong, but downing the control plane is worse).
+- **The write is ONE atomic, contention-free GREATEST upsert per numeric leaf** — no read-modify-write
+  window, so a low/partial writer can NEVER lower a recorded total and concurrent replicas converge
+  with NO lock (GREATEST is commutative + idempotent). `INSERT … ON CONFLICT (host,series,day,token_key)
+  DO UPDATE SET tokens = GREATEST(existing, incoming)`. This is the ADR's exact statement and is what
+  makes concurrent-replica ledger writes safe under active-active.
+- **FULL FIDELITY (unlike the Valkey blob-per-host).** Each numeric LEAF of a host's model is its own
+  GREATEST row, so per-repo breakdowns, per-model totals, the sub-agent split, `pre` (spend aged past
+  the day window) and the scalars all survive a cold rehydrate for RETIRED hosts too — not just the
+  headline day buckets. Four tables (`usage_host` / `usage_series` / `usage_day` / `usage_model`);
+  `series` = `''` for the host-level series, else a repo's `remoteKey`. `pre`/sub-agent ride the
+  `usage_day` table under the sentinel days `__pre__`/`__sub__` (neither is a valid ISO date, so a scan
+  routes it to the right bucket). `cutoff`/`last_activity`/`sessions` GREATEST; `first_seen`
+  LEAST-nonzero; `last_seen` GREATEST; labels (device/site_key/repo/remote) non-empty last-writer.
+  Every column is monotonic or commutative → a concurrent writer converges. `CREATE TABLE IF NOT
+  EXISTS` runs on the ready edge (self-provisions the schema).
+- **`pre`/`cutoff` and the below-cutoff drop.** In-memory a day older than the window folds into `pre`
+  and `cutoff` advances; all-time = `pre + sum(days)`. The store writes only days > cutoff (the model
+  already excludes ≤ cutoff), writes `pre` as `__pre__`, and after each host write DELETEs any real-date
+  row ≤ cutoff so the store never holds a day BOTH as a row AND inside `pre` (a double-count). The scan
+  is belt-and-suspenders: it also drops a real-date row ≤ its series' cutoff during reassembly. Both
+  monotonic, so safe under concurrent writers.
 - **Bounds mapped to the store**: `LEDGER_MAX` → the per-host `enforceHostShare` byte bound applied
-  before each write (a host is one key, so its share IS its ceiling); the snapshot cadence →
-  `SAVE_DEBOUNCE_MS` debounced dirty-flush. **Whole-store host-COUNT eviction (`LEDGER_HOSTS`) and the
-  innocent-host byte eviction are NOT enforced in HA** — each host is its own durable row (there is no
-  single file to overflow), which is strictly more correct than the file backend's whole-file
-  eviction; a per-key TTL/quota is the store's concern, tracked as future work if a real fleet needs it.
-- **`ingest` persistence is fire-and-forget** (model updated synchronously, durable write scheduled);
-  `configure` at boot is fire-and-forget too and NEVER fatal (it does not gate the listen).
-- **The boot scan runs on the store's health→READY edge, NOT synchronously in `init`** (XERK-758 QA
-  D1): a `SharedLiveStore` socket is not connected within `init`'s call stack, so a scan issued there
-  REJECTS ("store not connected") on every real boot — silently starting empty. A live host self-heals
-  on its next beat (`_persistHost` max-merges the store row into its live entry), but a RETIRED host
-  never beats, so without the ready-edge (re-)scan its durable row sits unread and vanishes from
-  `retiredUsage` — the XERK-338 failure. Scanning on every ready edge also catches up rows written by
-  other replicas while this one was disconnected; it is idempotent (max-merge, never lowers). The
-  `FileLiveStore` (tests) has no `health` and scans immediately, so the in-memory path is unchanged.
+  BEFORE decomposing to rows (a host is one logical row-set, so its share IS its ceiling). Multi-row
+  upserts are chunked under Postgres's 65535-param statement limit. **Whole-store host-COUNT eviction
+  (`LEDGER_HOSTS`) and the innocent-host byte eviction are NOT enforced in HA** — each host is its own
+  durable row-set (there is no single file to overflow); a per-key TTL/quota is future work.
+- **`ingest` persistence is fire-and-forget** (model updated synchronously, durable write scheduled on
+  the debounce); a re-stating beat's GREATEST upsert simply no-ops against equal stored values, so
+  there is no separate slow snapshot cadence. `configure` at boot is fire-and-forget + NEVER fatal.
+- **The boot/reconnect scan runs on the pool's health→READY edge, NOT synchronously in `init`** (the
+  XERK-758 QA D1 posture, carried over): the pool is not connected within `init`'s call stack, so an
+  inline scan would reject. A fire-and-forget `pool.ready()` kicks the first connection; the ready edge
+  (boot AND reconnect) ensures the schema then scans. A live host self-heals on its next beat, but a
+  RETIRED host never beats, so the ready-edge scan is what keeps `retiredUsage` alive (XERK-338).
+  Idempotent (max-merge, never lowers).
+- **No Postgres pub/sub watch (an accepted divergence from the Valkey backend's continuous `watch`).**
+  pgclient wires no LISTEN/NOTIFY, so cross-replica freshness between promotions is NOT continuous.
+  Under Option 2 (leader-only serving) the leader receives every beat, so its model is complete; a
+  promoted standby kept its Postgres connection (no health→ready edge fires on promotion), so
+  `server.js`'s `onLeaderPromoted` calls **`usageLedger.rehydrate()`** — a full rescan — to close the
+  retired-host gap (live hosts self-heal on their next beat). A full periodic rescan is deliberately
+  NOT added (a full-table scan every interval is costly); promotion + reconnect are the rescan points.
 - **A model change with NO local beat behind it INVALIDATES the hub's `/api/agents` cache** (XERK-758
-  QA D1b): a scan load and a peer replica's watch-folded write both raise `hosts` without a heartbeat,
-  and the beat is what normally clears `agentsCache` — so `configure` passes `invalidateAgentsCache`
-  as the backend's `onExternalChange`, fired on a scan that loaded rows and on every watch fold.
-  Without it a reconnect (or an all-retired/quiet fleet) serves a stale `retiredUsage` until the next
-  unrelated mutation. A LOCAL ingest does NOT call it (its beat already invalidates).
-- Tests: `usage-ledger-shared.test.js` drives the REAL `SharedLedgerBackend` against the in-memory
-  `FileLiveStore` (no live Valkey in CI, same constraint as `store.test.js`): the max-merge
-  no-lower-a-total property, higher-view-raises, boot scan, watch fold, forget propagation, repo-level
-  high-water, and `configure()` end-to-end through the real ledger.
+  QA D1b): a scan/rescan load raises `hosts` without a heartbeat, and the beat is what normally clears
+  `agentsCache` — so `configure` passes `invalidateAgentsCache` as the backend's `onExternalChange`,
+  fired on a scan that loaded rows. A LOCAL ingest does NOT call it (its beat already invalidates).
+- **The cutover DISCARDS the local file model** (`configure` resets `hosts`, then scans Postgres) —
+  matching the XERK-758 Valkey behaviour; pre-HA single-process history is not seeded up (live hosts
+  self-heal). The single-process file backend (`USAGE_LEDGER_FILE`) is otherwise byte-identical.
+- Tests: `usage-ledger-store.test.js` drives the REAL `LedgerStore` against an in-memory fake `PgPool`
+  that faithfully implements the emitted SQL (no live Postgres in CI, same constraint as
+  `pgclient.test.js`): full-fidelity round-trip (repos + models + pre + sub-agent), the GREATEST
+  no-lower-a-total property, concurrent-writer convergence, the below-cutoff drop, forget propagation,
+  and `configure()` + `rehydrate()` end-to-end through the real ledger.
 
 ### Recovering a wiped host's history (`turma/tools/recover-usage-from-archive.js`)
 

@@ -838,15 +838,21 @@ function fileFlush(done) {
   writeNow(done);
 }
 
-// ---- the persistence backend seam (XERK-758) --------------------------------
+// ---- the persistence backend seam (XERK-758, XERK-779) ----------------------
 //
 // The in-memory `hosts` model and every reducer/read function above are
 // backend-AGNOSTIC and SYNCHRONOUS. Only PERSISTENCE differs between modes:
 //   - fileBackend (DEFAULT): rewrites `/data/usage-ledger.json` whole, exactly as
 //     before — so with HA off the on-disk bytes and cadence are byte-identical.
-//   - SharedLedgerBackend (HA): atomic per-host high-water max-merge into the
-//     LiveStore (usage-ledger-shared.js), so no replica's partial view can lower a
-//     recorded total. Swapped in by `configure()` at boot when HA is on.
+//   - LedgerStore (HA): the durable of-record is Postgres (usage-ledger-store.js),
+//     the ADR's designated home. Each numeric leaf of a host's model — every day
+//     bucket, `pre`, the sub-agent split, each per-model total — is a row keyed per
+//     host/series/day/token-key, written by the single atomic contention-free
+//     high-water upsert `INSERT … ON CONFLICT DO UPDATE SET tokens =
+//     GREATEST(existing, incoming)` (docs/turma-ha-store-adr.md). A low/partial
+//     writer can never lower a recorded total and concurrent replicas are correct
+//     with no lock. Swapped in by `configure()` at boot when HA is on; the Valkey
+//     SharedLedgerBackend it replaces (XERK-758) is retired.
 const fileBackend = {
   // A fresh/augmenting beat saves promptly; a re-stating one rides the snapshot
   // timer (rewriting the whole file at the beat rate protects nothing).
@@ -905,10 +911,17 @@ function sharedOps() {
     getEntry: (key) => hosts[key] || null,
     setEntry: (key, entry) => { hosts[key] = entry; },
     deleteEntry: (key) => { delete hosts[key]; shortfallLoggedAt.delete(key); },
+    keys: () => Object.keys(hosts),
     coerce: (raw) => entryOf(raw),
     mergeEntry: (dst, src) => mergeTwoEntries(dst, src),
     enforceHostShare,
     SAVE_DEBOUNCE_MS,
+    // The four token keys, so the Postgres LedgerStore decomposes/reassembles a
+    // bucket to per-token-key rows without a second copy of the wire contract.
+    TOKEN_KEYS,
+    // Whether a day string is a real UTC date (vs a `__pre__`/`__sub__` sentinel),
+    // so the store routes a day row to the right bucket on scan.
+    isoDay,
   };
 }
 
@@ -922,32 +935,57 @@ function flush(done) {
  * Select the persistence backend from the resolved HA config (server.js calls
  * this once at boot, FIRE-AND-FORGET — it does not gate the listen). With HA OFF
  * this is a no-op — the file backend loaded at require time stays, byte-identical.
- * With HA ON it discards the file-loaded model and swaps in the shared backend.
- * The shared backend does NOT block boot on the store connecting: it loads the
- * history when the store's socket becomes READY (and re-loads on reconnect), so a
- * store down at boot is never fatal — the serve path degrades to serving each live
- * host's own raw report until the model loads, and retired-host rows appear as soon
- * as the store is reachable (XERK-758 QA D1).
+ * With HA ON it discards the file-loaded model and swaps in the Postgres LedgerStore
+ * (XERK-779, the ADR's designated of-record), RETIRING the Valkey SharedLedgerBackend
+ * (XERK-758). The LedgerStore does NOT block boot on Postgres connecting: it loads
+ * the history when the pool becomes READY (and re-loads on reconnect), so a database
+ * down at boot is never fatal — the serve path degrades to serving each live host's
+ * own raw report until the model loads, and retired-host rows appear as soon as the
+ * pool is reachable (the XERK-758 QA D1 posture, carried over).
+ *
+ * `pgClient` is the shared `PgPool` (created in server.js from `createPgClient`,
+ * shared with the archive IndexStore) — non-null under HA because `DATABASE_URL` is
+ * a required, validated HA config. If it is somehow absent under HA we stay on the
+ * file backend and log LOUDLY (degraded, never fatal): a per-replica file under HA is
+ * wrong, but crashing the fleet's control plane is worse.
  */
-async function configure(liveStore, haConfig, onExternalChange) {
-  if (!haConfig || !haConfig.ha || !liveStore) return; // single-process default
-  const { SharedLedgerBackend } = require("./usage-ledger-shared.js");
+async function configure(haConfig, pgClient, onExternalChange) {
+  if (!haConfig || !haConfig.ha) return; // single-process default: file backend stays
+  if (!pgClient) {
+    console.error(
+      "usage ledger: HA is on but no Postgres client was provided — staying on the " +
+        "local file (DEGRADED; each replica would write its own file)"
+    );
+    return;
+  }
+  const { LedgerStore } = require("./usage-ledger-store.js");
   // Cancel any pending file-backend timers — the file model is being discarded.
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
   hosts = Object.create(null);
-  // `onExternalChange` invalidates the hub's /api/agents cache when the model
-  // changes from a source OTHER than a local heartbeat (a boot/reconnect scan
-  // load, a peer replica's watch-folded write): those raise `hosts` with no beat
-  // to clear the cache, so without it a reconnect (or the all-retired/quiet fleet)
-  // keeps serving a stale `retiredUsage` (XERK-758 QA D1). A local ingest already
-  // invalidates via the beat, so it does NOT call this.
-  const b = new SharedLedgerBackend(liveStore, sharedOps(), {
+  // `onExternalChange` invalidates the hub's /api/agents cache when the model changes
+  // from a source OTHER than a local heartbeat (a boot/reconnect scan load, a
+  // promotion rescan): those raise `hosts` with no beat to clear the cache, so without
+  // it a reconnect (or the all-retired/quiet fleet) keeps serving a stale
+  // `retiredUsage` (XERK-758 QA D1). A local ingest already invalidates via the beat,
+  // so it does NOT call this.
+  const b = new LedgerStore(pgClient, sharedOps(), {
     onExternalChange: typeof onExternalChange === "function" ? onExternalChange : null,
   });
   await b.init();
   backend = b;
-  console.log("usage ledger: using the shared store (HA) for durable spend history");
+  console.log("usage ledger: using Postgres (LedgerStore) for durable spend history");
+}
+
+// Re-load the in-memory model from the of-record. On the LedgerStore this rescans
+// every host row from Postgres; the file backend has no external source, so it is a
+// no-op. server.js calls it on LEADER PROMOTION (`onLeaderPromoted`) — a promoted
+// standby kept its Postgres connection (no health→ready edge fires), so without a
+// rescan its retired-host view would be as stale as its own boot scan. Live hosts
+// self-heal on their next beat; a rescan closes the retired-host gap. Idempotent
+// (every scan max-merges rows into the live model and can only raise a figure).
+function rehydrate() {
+  return backend.rescan ? backend.rescan() : Promise.resolve();
 }
 
 // A host name reaches the log from an agent-supplied field, so it gets the same
@@ -1340,7 +1378,7 @@ function has(key) {
 load();
 
 module.exports = {
-  ingest, fold, retiredAgents, forget, has, flush, configure,
+  ingest, fold, retiredAgents, forget, has, flush, configure, rehydrate,
   LEDGER_FILE, LEDGER_MAX, LEDGER_DAYS, LEDGER_HOSTS, LEDGER_REPOS, RETIRED_MAX,
   LEDGER_MODELS, LEDGER_NAME_MAX, hostShare,
   SYSTEM_USAGE_REPO, isSystemUsageRepo, foldSystemRepos,
@@ -1357,8 +1395,8 @@ module.exports = {
       if (backend !== fileBackend) { try { backend.close(); } catch { /* noop */ } }
       backend = fileBackend;
     },
-    // The shared-backend seam, for usage-ledger-shared.test.js to drive it against
-    // an in-memory FileLiveStore without a live Valkey.
+    // The backend seam, for usage-ledger-store.test.js to drive the Postgres
+    // LedgerStore against an in-memory fake PgPool without a live database.
     sharedOps, mergeTwoEntries,
     setBackend(b) { backend = b; },
     getBackend: () => backend,

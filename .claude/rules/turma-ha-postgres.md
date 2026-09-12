@@ -12,15 +12,19 @@ wave-2 children of epic XERK-775 (finish Option-3 active-active). **Read `docs/t
 first** (Postgres is designated the durable of-record) and `CLAUDE.md`'s stdlib-only + HA-off-is-
 byte-identical + no-work-on-the-beat invariants. This file is the operative rules for the client.
 
-## What this ticket landed, and what it deliberately did NOT
+## What XERK-776 landed, and what consumes it now
 
-- **Landed:** the Postgres v3 wire client (`PgConnection`), a bounded reusable-connection pool
-  (`PgPool`), the `createPgClient(haConfig)` factory, and the tests.
-- **NOT wired:** no `server.js` call site is flipped onto it. The ledger still lives in Valkey and the
-  archive index is still per-pod local SQLite (`POSTGRES_BACKEND_WIRED = false` in `ha-config.js`;
-  the boot line honestly says so). Moving the ledger of-record → `w2-ledger`; moving the archive index
-  → `w2-index`. **Do not flip `POSTGRES_BACKEND_WIRED` here** — that flag flips in the SAME change
-  that wires a real backend, or the boot line lies to the operator (the XERK-773 prod finding).
+- **Landed by XERK-776:** the Postgres v3 wire client (`PgConnection`), a bounded reusable-connection
+  pool (`PgPool`), the `createPgClient(haConfig)` factory, and the tests. That ticket wired NO
+  consumer — no `server.js` call site was flipped onto it.
+- **The usage-ledger of-record now consumes it (XERK-779, `w2-ledger`).** `server.js` creates ONE
+  shared `PgPool` (`createPgClient`) and passes it to `usageLedger.configure`; the ledger's Postgres
+  `LedgerStore` (`usage-ledger-store.js`) is the durable of-record under HA, retiring the Valkey
+  backend. The archive index (`w2-index`, XERK-780) is still per-pod local SQLite.
+- **Per-backend boot flags** (`POSTGRES_LEDGER_WIRED` true, `POSTGRES_INDEX_WIRED` false in
+  `ha-config.js`) so the boot line honestly reads `ledger=postgres, index=sqlite(...)`. **Flip each
+  flag in the SAME change that wires its backend** — never ahead of it, or the boot line lies to the
+  operator (the XERK-773 prod finding). XERK-780 flips `POSTGRES_INDEX_WIRED` when the IndexStore lands.
 
 ## stdlib-only, like store.js and blobstore.js
 

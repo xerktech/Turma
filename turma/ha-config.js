@@ -49,25 +49,29 @@ const S3_VARS = [
 // one is a misconfig, not a default.
 const S3_REGION_DEFAULT = "us-east-1";
 
-// Whether a Postgres LedgerStore/IndexStore backend is actually WIRED and consuming
-// DATABASE_URL (XERK-773). The ADR (docs/turma-ha-store-adr.md) designates Postgres
-// the durable of-record for the usage ledger + archive index, but no such backend
-// exists yet: the hub is stdlib-only with no Postgres client, so the ledger's
-// high-water lives in the Valkey LiveStore (XERK-758) and the archive index is a
-// local node:sqlite rebuilt from the S3 bytes (XERK-759). DATABASE_URL stays REQUIRED
-// under HA (validated below) so the cluster is provisioned ahead of use — but the boot
-// line must name the backends ACTUALLY in use, never the intended ones, or it lies to
-// the operator (turma-postgres sat idle with zero tables for hours in prod).
-// When a Postgres LedgerStore/IndexStore lands, flip this to true IN THE SAME CHANGE
-// that wires it, and the boot line reads `ledger+index=postgres` again.
-const POSTGRES_BACKEND_WIRED = false;
+// Which Postgres of-record backends are actually WIRED and consuming DATABASE_URL
+// (XERK-773 landed this as ONE flag; XERK-779 granularized it into per-backend
+// flags because the ledger and the index move onto Postgres in SEPARATE changes).
+// The ADR (docs/turma-ha-store-adr.md) designates Postgres the durable of-record for
+// BOTH the usage ledger and the archive index; the boot line must name the backends
+// ACTUALLY in use, never the intended ones, or it lies to the operator (turma-postgres
+// sat idle with zero tables for hours in prod). DATABASE_URL stays REQUIRED under HA
+// (validated below) so the cluster is provisioned ahead of any backend landing.
+//   - POSTGRES_LEDGER_WIRED: the usage-ledger of-record is the Postgres LedgerStore
+//     (XERK-779, usage-ledger-store.js). Was `ledger=valkey` (XERK-758).
+//   - POSTGRES_INDEX_WIRED: the archive search index is the Postgres IndexStore
+//     (XERK-780). Until it lands the index is a per-pod local node:sqlite rebuilt from
+//     the S3 bytes (XERK-759), so this stays false.
+// Flip each flag to true IN THE SAME CHANGE that wires its backend — never ahead of it.
+const POSTGRES_LEDGER_WIRED = true;
+const POSTGRES_INDEX_WIRED = false;
 
-// The of-record segment of the boot line: the intended Postgres backend once wired,
-// else the backends genuinely in use today. Kept beside the flag so the two never drift.
+// The of-record segment of the boot line: names each backend genuinely in use today,
+// per-backend. Kept beside the flags so the line never drifts from what is wired.
 function ledgerIndexBootSegment() {
-  return POSTGRES_BACKEND_WIRED
-    ? "ledger+index=postgres"
-    : "ledger=valkey, index=sqlite(local, rebuilt from s3)";
+  const ledger = POSTGRES_LEDGER_WIRED ? "ledger=postgres" : "ledger=valkey";
+  const index = POSTGRES_INDEX_WIRED ? "index=postgres" : "index=sqlite(local, rebuilt from s3)";
+  return `${ledger}, ${index}`;
 }
 
 // A store URL must be a redis/rediss (Valkey is redis-wire) URL that actually
@@ -181,9 +185,10 @@ function resolveHaConfig(env) {
   }
 
   if (!databaseUrl) {
-    // Required, but provisioned AHEAD OF USE: no Postgres backend consumes it yet
-    // (POSTGRES_BACKEND_WIRED). The requirement stands so the CloudNativePG cluster the
-    // future LedgerStore/IndexStore needs is in place before that backend lands (XERK-773).
+    // Required. The ledger of-record (LedgerStore, XERK-779) now consumes it; the
+    // archive index (IndexStore, XERK-780) is still provisioned AHEAD OF USE
+    // (POSTGRES_INDEX_WIRED false). The requirement stands so the CloudNativePG cluster
+    // both backends need is in place before each lands.
     fatal.push("HA is on but DATABASE_URL (Postgres ledger + archive index of-record) is not set");
   } else {
     const p = parseDatabaseUrl(databaseUrl);
@@ -227,6 +232,7 @@ module.exports = {
   parseDatabaseUrl,
   S3_VARS,
   S3_REGION_DEFAULT,
-  POSTGRES_BACKEND_WIRED,
+  POSTGRES_LEDGER_WIRED,
+  POSTGRES_INDEX_WIRED,
   ledgerIndexBootSegment,
 };

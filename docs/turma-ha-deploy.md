@@ -78,12 +78,12 @@ store, not failover.
   known-good single-process hub against a cluster that still has the wiring.
 
 Precedence: an explicit `HA_MODE` (1/0) wins over URL presence. The effective mode **prints at boot**
-— `HA: on (store=valkey, ledger=valkey, index=sqlite(local, rebuilt from s3), blobs=s3)` or
+— `HA: on (store=valkey, ledger=postgres, index=sqlite(local, rebuilt from s3), blobs=s3)` or
 `HA: off (single-process)` — so you can tell a correctly-wired hub from one whose env moved under it.
-The boot line names the backends **actually in use**: the usage ledger's high-water lives in the
-Valkey live store (XERK-758) and the archive index is a local SQLite file rebuilt from the S3 bytes
-(XERK-759). `DATABASE_URL` is still required (below) but no backend consumes Postgres yet; when a
-Postgres ledger/index of-record lands, the boot line reads `ledger+index=postgres` again.
+The boot line names the backends **actually in use**: the usage ledger's high-water of-record is now
+Postgres (XERK-779), while the archive index is still a local SQLite file rebuilt from the S3 bytes
+(XERK-759) until its IndexStore lands (XERK-780). `DATABASE_URL` is required (below) and the ledger
+consumes it; when the archive index moves too, the boot line reads `index=postgres`.
 
 ### Required env when HA is on (all-or-nothing)
 
@@ -289,10 +289,11 @@ mid-drain.
 
 ## Verifying a deploy
 
-- **Boot line:** `kubectl logs` a hub pod and confirm `HA: on (store=valkey, ledger=valkey,
+- **Boot line:** `kubectl logs` a hub pod and confirm `HA: on (store=valkey, ledger=postgres,
   index=sqlite(local, rebuilt from s3), blobs=s3)`. `HA: off` on a pod you expected to be HA means
-  the store env didn't reach it. (The line names the backends actually wired — Postgres is
-  provisioned ahead of use and receives no writes yet, so an empty `turma` database is expected.)
+  the store env didn't reach it. (The line names the backends actually wired — the usage ledger now
+  writes Postgres, so the `usage_host`/`usage_series`/`usage_day`/`usage_model` tables appear once a
+  host reports spend; the archive index still uses local SQLite until XERK-780 lands.)
 - **Leadership:** exactly one pod's `/readyz` returns `200`; the rest return `503 {leader:false}`.
   `kubectl get lease turma-hub-leader -n turma -o yaml` shows the current holder.
 - **Low-blip deploy:** bump the image (or `kubectl rollout restart deploy/turma-hub`) and hold an

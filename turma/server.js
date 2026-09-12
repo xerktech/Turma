@@ -63,6 +63,12 @@ const { createLeader } = require("./leader.js");
 // tree stays the of-record, byte-identical.
 const { createBlobStore } = require("./blobstore.js");
 const { ArchiveMirror } = require("./archive-mirror.js");
+// The stdlib Postgres client (XERK-776) + its factory. Postgres is the durable
+// of-record for the usage ledger (XERK-779, LedgerStore) and the archive index
+// (XERK-780). `createPgClient` returns null with HA off / no DATABASE_URL / a fatal
+// config, so nothing is wired single-process and that path is byte-identical.
+// Requiring it is side-effect-free (no socket dialled until a query is issued).
+const { createPgClient } = require("./pgclient.js");
 
 // XERK-757 externalized-store persistence config, declared here so it can be
 // handed to the module-load store below. It maps each `policy:<name>` store key to
@@ -111,6 +117,14 @@ let liveStore = createLiveStore(haConfig.fatal.length ? { ha: false } : haConfig
 // worker in the production boot branch below; nothing here touches the archive's
 // synchronous hot path.
 const archiveBlobStore = createBlobStore(haConfig.fatal.length ? { ha: false } : haConfig);
+
+// The shared Postgres pool, created once at module load like `liveStore` /
+// `archiveBlobStore` (XERK-779). null with HA off, no DATABASE_URL, or a fatal HA
+// config (coerced to {ha:false} so it never dials a half-validated URL before the
+// boot branch names the error and exits). One pool serves the usage-ledger
+// LedgerStore and, once it lands, the archive IndexStore (XERK-780). Nothing here
+// touches a synchronous hot path; the ledger's serve path stays in-memory.
+const pgClient = createPgClient(haConfig.fatal.length ? { ha: false } : haConfig);
 
 // ---- HA fleet registry externalization (XERK-756, epic XERK-751) ------------
 // The `agents` fleet registry AND the per-host command queues (which ride each
@@ -237,6 +251,12 @@ function onLeaderPromoted() {
     console.error(`leader promotion: migration hydrate failed: ${(e && e.message) || e}`));
   hydrateGuards().catch((e) =>
     console.error(`leader promotion: guard hydrate failed: ${(e && e.message) || e}`));
+  // Re-load the usage-ledger model from Postgres (XERK-779). A promoted standby kept
+  // its Postgres connection (no health→ready edge fires on promotion), so without this
+  // its retired-host view stays as stale as its own boot scan; live hosts self-heal on
+  // their next beat. No-op on the file backend.
+  usageLedger.rehydrate().catch((e) =>
+    console.error(`leader promotion: usage-ledger rehydrate failed: ${(e && e.message) || e}`));
 }
 
 const PORT = positiveEnv("PORT", 8300);
@@ -18003,16 +18023,16 @@ if (process.env.TURMA_TEST) {
     const dirSweep = setInterval(sweepTunnelDirectory, HOST_REPLICA_TTL_MS);
     dirSweep.unref?.();
   }
-  // Wave-3 (XERK-758): move the durable usage ledger onto the shared store when HA
-  // is on. With HA off this is a no-op and the ledger stays on its local JSON file,
-  // byte-identical. Fire-and-forget + logged: a store down at boot must not block
-  // the listen (availability) — `configure` loads the model when the store's socket
-  // becomes ready and re-loads on reconnect. `invalidateAgentsCache` is passed so a
-  // boot/reconnect scan load or a peer replica's watch-folded write refreshes the
-  // served /api/agents (retiredUsage) promptly — a model change with no local beat
-  // behind it would otherwise serve stale until the next mutation (XERK-758 QA D1).
-  usageLedger.configure(liveStore, haConfig, invalidateAgentsCache).catch((e) => {
-    console.error(`usage ledger: shared-store configure failed, staying on the local file: ${(e && e.message) || e}`);
+  // Wave-2 (XERK-779): move the durable usage ledger of-record onto Postgres when HA
+  // is on (retiring the XERK-758 Valkey backend). With HA off this is a no-op and the
+  // ledger stays on its local JSON file, byte-identical. Fire-and-forget + logged: a
+  // database down at boot must not block the listen (availability) — `configure` loads
+  // the model when the pool becomes ready and re-loads on reconnect. `invalidateAgentsCache`
+  // is passed so a boot/reconnect scan load or a promotion rescan refreshes the served
+  // /api/agents (retiredUsage) promptly — a model change with no local beat behind it
+  // would otherwise serve stale until the next mutation (XERK-758 QA D1).
+  usageLedger.configure(haConfig, pgClient, invalidateAgentsCache).catch((e) => {
+    console.error(`usage ledger: Postgres configure failed, staying on the local file: ${(e && e.message) || e}`);
   });
 
   // ---- Leader election (XERK-763) ---------------------------------------
@@ -18142,7 +18162,14 @@ if (process.env.TURMA_TEST) {
       // same lossless-drain intent as flushStateNow, for the policy stores.
       try { liveStore.close?.(); } catch {}
       try { archive.closeDb(); } catch {}
-      const finish = () => { clearTimeout(forceExit); console.log("drain complete — exiting"); process.exit(0); };
+      const finish = () => {
+        // Close the shared Postgres pool AFTER the ledger's final flush has landed
+        // (XERK-779) — closing it earlier would reject those last GREATEST upserts and
+        // strand the deltas the debounce was still holding. Best-effort Terminate;
+        // null with HA off.
+        try { pgClient?.close?.(); } catch {}
+        clearTimeout(forceExit); console.log("drain complete — exiting"); process.exit(0);
+      };
       const once = () => { if (!done) { done = true; finish(); } };
       try { usageLedger.flush(() => once()); } catch { once(); }
     };

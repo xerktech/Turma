@@ -250,12 +250,13 @@ invariant the ticket demands, and every sibling must preserve it.
   registry-cap knobs already use — *"the effective budget prints at boot"*), so an operator sees the
   effective mode in the log, not a guess: `HA: off (single-process)`, or `HA: on (...)` naming the
   backends genuinely in use. **The boot line must name what is ACTUALLY wired, never the intended
-  design (XERK-773)** — today `HA: on (store=valkey, ledger=valkey, index=sqlite(local, rebuilt from
-  s3), blobs=s3)`, because the ledger's high-water lives in the Valkey live store (XERK-758) and the
-  index is local SQLite rebuilt from the S3 bytes (XERK-759); it must not claim Postgres while
-  nothing writes it. `DATABASE_URL` stays required (provisioned ahead of use); `ha-config.js`'s
-  `POSTGRES_BACKEND_WIRED` gates the claim, and when a Postgres LedgerStore/IndexStore lands the flag
-  flips and the line reads `ledger+index=postgres` again.
+  design (XERK-773)** — today `HA: on (store=valkey, ledger=postgres, index=sqlite(local, rebuilt from
+  s3), blobs=s3)`: the ledger's high-water of-record moved to the Postgres `LedgerStore` (XERK-779),
+  while the archive index is still local SQLite rebuilt from the S3 bytes (XERK-759) until its
+  IndexStore lands (XERK-780). The line must not claim Postgres for a backend nothing writes yet.
+  `DATABASE_URL` stays required; `ha-config.js`'s per-backend flags (`POSTGRES_LEDGER_WIRED`,
+  `POSTGRES_INDEX_WIRED`) gate each half of the claim, each flipped in the SAME change that wires its
+  backend — so the line reads `index=postgres` once XERK-780 lands.
 - Every new URL/knob reads through the existing `positiveEnv`-style guards where numeric; a malformed
   store URL is a boot refusal, never a runtime surprise.
 
