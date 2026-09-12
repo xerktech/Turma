@@ -239,6 +239,26 @@ test("XERK-777: a broken pod-to-pod hop mid-stream EOFs the origin duplex (no hu
   await ended; // resolves => the origin duplex tore down rather than hanging
 });
 
+test("XERK-777: a resolved non-stream from openLocal hints + closes, never an unhandled crash", async () => {
+  const [originConn, ownerConn] = await loopback();
+  // A mis-wired consumer: openLocal RESOLVES (doesn't reject) with a non-duplex, so
+  // the internal bridge() would throw synchronously inside the async onCtrl handler.
+  const owner = ownerRelay({ openLocal: async () => ({ notAStream: true }) });
+  owner.accept(ownerConn);
+
+  const origin = makeRelay(null, "R-A", {
+    owners: { h1: { replica: "R-owner", at: Date.now() } },
+    ttlMs: 60000,
+    localTunnel: () => false,
+    dial: async () => originConn,
+  });
+  const d = await origin.connect("h1", 7681);
+  const closed = new Promise((resolve) => d.on("close", resolve));
+  const hint = await new Promise((resolve) => d.once("hint", resolve));
+  assert.equal(hint.reason, "relay-error", "a bridge throw is turned into a clean hint + close");
+  await closed; // process did not crash; the socket tore down
+});
+
 test("XERK-777: a large payload survives framing + backpressure intact", async () => {
   const [originConn, ownerConn] = await loopback();
   const [ownerAgentEnd, ttyd] = await loopback();

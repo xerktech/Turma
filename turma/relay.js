@@ -354,22 +354,34 @@ function makeRelay(store, replicaId, deps = {}) {
         clearTimeout(hsTimer);
         const host = obj.host;
         const port = obj.port;
-        // Owner handoff: the host reconnected to another replica between the
-        // origin's owner lookup and this dial. We are not it — tell the origin to
-        // reconnect (it re-resolves the new owner) and close.
-        if (!localTunnel(host)) { d.sendCtrl({ t: "hint", reason: "not-owner" }); d.end(); return; }
-        let agent;
+        // This handler is async and invoked un-awaited by frameConn, so ANY throw
+        // past here is an UNHANDLED REJECTION — which instant-exits the hub
+        // (server.js's own unhandledRejection note). A wrapper keeps the module's
+        // "never crash the process" discipline even if `openLocal` RESOLVES a
+        // non-duplex (a mis-wired consumer): `bridge` would then throw synchronously.
         try {
-          agent = await openLocal(host, port);
+          // Owner handoff: the host reconnected to another replica between the
+          // origin's owner lookup and this dial. We are not it — tell the origin to
+          // reconnect (it re-resolves the new owner) and close.
+          if (!localTunnel(host)) { d.sendCtrl({ t: "hint", reason: "not-owner" }); d.end(); return; }
+          let agent;
+          try {
+            agent = await openLocal(host, port);
+          } catch (e) {
+            // Tunnel drop (the control channel went away as we bridged): hint +
+            // close; the origin reconnects and finds the tunnel down or moved.
+            d.sendCtrl({ t: "hint", reason: "tunnel-down", detail: (e && e.message) || String(e) });
+            d.end();
+            return;
+          }
+          attachLiveness(d, { pingMs, deadMs, now });
+          bridge(d, agent);
         } catch (e) {
-          // Tunnel drop (the control channel went away as we bridged): hint +
-          // close; the origin reconnects and finds the tunnel down or moved.
-          d.sendCtrl({ t: "hint", reason: "tunnel-down", detail: (e && e.message) || String(e) });
-          d.end();
-          return;
+          // Anything unexpected (e.g. a resolved non-stream making `bridge` throw):
+          // hint + tear down, never let it become an unhandled rejection.
+          try { d.sendCtrl({ t: "hint", reason: "relay-error", detail: (e && e.message) || String(e) }); } catch { /* gone */ }
+          if (!d.destroyed) d.destroy();
         }
-        attachLiveness(d, { pingMs, deadMs, now });
-        bridge(d, agent);
       },
     });
     // A dial that connected but never sent a handshake (not a real relay origin, or
