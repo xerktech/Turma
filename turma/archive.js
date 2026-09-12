@@ -451,6 +451,32 @@ function resetLocalIndex() {
   return openDb();
 }
 
+// PROACTIVELY verify the FTS5 index is not corrupt (XERK-791). A bulk-hydrate or
+// concurrent-writer corruption of `entries_fts` is otherwise LATENT — the physical
+// damage sits unnoticed until the first later ingest or search hits "database disk
+// image is malformed" / "fts5: corruption found …", after which that replica's
+// archive silently stops until the reactive self-heal fires (the prod symptom). Run
+// right after a hydrate — while the index is still `hydrating` and serving nothing —
+// so the caller can reset-and-rebuild at a CONTROLLED point rather than have a random
+// live request discover it. Returns true when healthy, false on a detected
+// corruption (the caller then `resetLocalIndex()`s). Uses FTS5's own internal
+// consistency verb (`'integrity-check'`, which raises SQLITE_CORRUPT_VTAB on a
+// damaged index) plus a bounded MATCH that exercises the segment b-tree read path
+// the insert-side check does not fully touch. An UNEXPECTED (non-corruption) error is
+// re-thrown — it is not evidence to blow the cache away. Cheap on a healthy index (an
+// O(index) internal scan, run once per hydrate, off no hot path).
+function checkIndexIntegrity() {
+  openDb();
+  try {
+    db.exec("INSERT INTO entries_fts(entries_fts) VALUES('integrity-check')");
+    db.prepare("SELECT rowid FROM entries_fts WHERE entries_fts MATCH ? LIMIT 1").get("a");
+    return true;
+  } catch (e) {
+    if (isSqliteCorruption(e)) return false;
+    throw e;
+  }
+}
+
 // node:sqlite's DatabaseSync has no .transaction() helper (unlike
 // better-sqlite3), so wrap a unit of work in BEGIN/COMMIT by hand. Not nested.
 function tx(fn) {
@@ -1753,6 +1779,19 @@ function parseEntries(raw) {
 function reconcileRow(transcriptId, storedCount, storedBytes, entries, trueBytes) {
   const trueCount = entries.length;
   if (trueCount === storedCount && trueBytes === storedBytes) return trueCount;
+  // XERK-791: do NOT mutate the local index while it is being HYDRATED from the
+  // Postgres of-record. This heal-on-read `tx()` (DELETE + reinsert entries_fts)
+  // is a WRITE on the same node:sqlite handle the async paged hydrate is writing,
+  // and it is reachable from the archive READ routes (GET /api/search, /api/archive,
+  // /api/archive/<id>) — which, unlike the ingest routes and the beat cursor path,
+  // are NOT 503-gated during a hydrate. So it was the one concurrent local-index
+  // writer the XERK-789 serialize guard missed, and interleaving it with the bulk
+  // hydrate is the same `entries_fts` corruption that guard exists to prevent
+  // ("the boot hydrate and live index writes MUST NOT run concurrently",
+  // turma-ha-archive.md). The read still returns the honest file-derived count for
+  // display; the index heal simply re-fires on a later read once the hydrate has
+  // finished. Inert off HA (`hydrating` is only ever set around the HA hydrate).
+  if (hydrating) return trueCount;
   const insert = db.prepare(
     "INSERT INTO entries_fts(text, transcriptId, uuid, role, ts) VALUES(?,?,?,?,?)"
   );
@@ -2666,7 +2705,7 @@ module.exports = {
   openDb, closeDb, rebuildIndex, setBlobSink,
   // Boot/hydrate serialization + corrupt-cache self-heal (XERK-789) — all inert
   // off HA (`hydrating` is only ever set around the HA index hydrate).
-  isHydrating, setHydrating, isSqliteCorruption, resetLocalIndex,
+  isHydrating, setHydrating, isSqliteCorruption, resetLocalIndex, checkIndexIntegrity,
   // The Postgres INDEX of-record seam (XERK-780): the write sink + the hydration
   // bulk loader + the post-hydrate cursor reconcile (all no-ops off HA — the sink
   // stays unset, and the loader/reconcile only run on the HA hydrate path).

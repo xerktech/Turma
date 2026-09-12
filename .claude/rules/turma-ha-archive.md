@@ -171,6 +171,24 @@ of-record**, so both halves of the ADR split now hold:
     failed identically). `hydrateArchiveIndex`'s catch and both ingest catches call it on
     `archive.isSqliteCorruption(e)`, then 503. `resetLocalIndex` is fully SYNCHRONOUS, so no ingest
     races the rebuild. Tests: the `XERK-789:` cases in `archive.test.js` + `server.test.js`.
+- **The serialize guard must cover EVERY local-index WRITER, not just ingest (XERK-791).** The
+  `isHydrating()` gate first shipped on the ingest routes + the beat cursor path, but the corruption
+  persisted in prod because two OTHER writers of the same handle were still reachable during a hydrate:
+  - **Heal-on-read** (`reconcileRow`, XERK-280) — a `tx()` that DELETE+reinserts `entries_fts` for a
+    stale row, reached from the READ routes (`/api/search`, `/api/archive`, `/api/archive/<id>`), which
+    are NOT 503-gated (clients poll them at boot). `reconcileRow` now early-returns the honest
+    file-derived count WITHOUT writing while `hydrating` — the read stays correct and the heal re-fires
+    on a later read once the hydrate finishes.
+  - **Restore** (`restampOrg` via `POST /api/archive/<id>/restore`) — also a local-index write; the
+    route now 503s "still syncing" while `isHydrating()`, like ingest.
+  So NO local-index writer runs concurrently with the hydrate. Do not add a new writer without gating it.
+- **A hydrate that completed WITHOUT throwing can still have left `entries_fts` corrupt** (XERK-791,
+  the leader symptom: hydrated "cleanly", first post-boot ingest hit "malformed"). So `hydrateArchiveIndex`
+  runs a PROACTIVE `archive.checkIndexIntegrity()` (FTS5's `'integrity-check'` verb + a bounded MATCH)
+  right after `hydrateInto`, while `hydrating` is still set (nothing served yet); on a detected
+  corruption it `resetLocalIndex()`s BEFORE serving, turning the reactive error-logging self-heal into a
+  controlled one. On a healthy hydrate it is a cheap no-op and the file rebuild NEVER fires (XERK-780's
+  cheap-hydrate intent preserved). Tests: the `XERK-791:` cases in `archive.test.js` + `restore.test.js`.
 
 ## Wiring (server.js)
 
