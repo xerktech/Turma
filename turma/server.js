@@ -14794,7 +14794,16 @@ const server = http.createServer(async (req, res) => {
       let archiveHave, archiveShed, archiveFull, archiveRawHave, archiveRawSkip;
       const haveManifest = Array.isArray(archiveManifest) && archiveManifest.length;
       const haveInventory = Array.isArray(archiveInventory) && archiveInventory.length;
-      if (haveManifest || haveInventory) {
+      // While the local index is HYDRATING from Postgres, do NOT touch it from the
+      // beat (XERK-789): manifestCursors/inventoryCursors INSERT placeholder rows,
+      // and archiveLimits -> totalForCeiling -> maybeReclaimIndex can rebuild/VACUUM
+      // it — all WRITES on the same node:sqlite handle the async hydrate is writing,
+      // which corrupts entries_fts exactly as a concurrent ingest would. The ingest
+      // ROUTES 503 during this window; the beat's cursor path is the OTHER writer, so
+      // it must be gated too. Skipped => no archiveHave this beat => the agent re-offers
+      // next beat (the same benign "zero cursors" the comments below describe). Inert
+      // off HA (`isHydrating` is only ever set around the HA index hydrate).
+      if ((haveManifest || haveInventory) && !archive.isHydrating()) {
         try {
           // This beat's DECIDED org is stamped on every placeholder row either
           // path creates, so the ingestChunk gate (XERK-344/573) protects a
