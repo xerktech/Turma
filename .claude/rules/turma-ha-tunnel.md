@@ -1,7 +1,9 @@
 ---
 paths:
   - turma/server.js
+  - turma/relay.js
   - turma/tests/tunnel-directory.test.js
+  - turma/tests/tunnel-relay.test.js
 ---
 
 # Cross-replica tunnel/terminal/command plane (XERK-764, epic XERK-751)
@@ -17,14 +19,16 @@ hub half of, and `.claude/rules/turma-ha-store.md` for the `LiveStore` seam it p
 
 - **LANDS: the shared host→owning-replica DIRECTORY + the CONTROL-plane fixes it enables.** Any
   replica can now tell the truth about a host's tunnel and deliver a poke to it, cross-replica.
-- **DEFERS: the duplex BYTE-STREAM relay** for `/term`, the `/live` deltas and the `openChannel`
-  data channel. Relaying bulk interactive terminal traffic through the store's pub/sub would ride the
-  SAME single shared subscriber connection the SSE bus (XERK-762) and the registry watch (XERK-756)
-  depend on — head-of-line blocking on the fleet's liveness channel. So the byte relay is a separate
-  follow-up (bus-relay or route-by-host-at-ingress). Until it lands, those bytes serve only from the
-  tunnel owner's replica — which is exactly the recommended Option-2 (leader-only-serving) topology's
-  behaviour, so nothing regresses. Do NOT push raw terminal/`/live`/ttyd bytes through
-  `store.publish`/`subscribe`.
+- **The duplex BYTE-STREAM relay TRANSPORT is now SHIPPED** (XERK-777, `turma/relay.js`) — the
+  transport PRIMITIVE only. `/term`, the `/live` deltas and the `openChannel` data channel are the
+  CONSUMERS, a follow-up (w2-relay-consumers): until they wire it, those bytes still serve from the
+  tunnel owner's replica (the Option-2 leader-only-serving behaviour), so nothing regresses. See "The
+  byte-stream relay transport" below.
+- **NEVER push raw terminal / `/live` / ttyd bytes through `store.publish`/`subscribe`.** Bulk
+  interactive traffic there would ride the SAME single shared subscriber connection the SSE bus
+  (XERK-762) and the registry watch (XERK-756) depend on — head-of-line blocking the fleet's LIVENESS
+  channel. The relay is a DEDICATED pod-to-pod transport for exactly this reason; the store carries
+  only its byte-free endpoint directory.
 
 ## The directory
 
@@ -76,11 +80,53 @@ hub half of, and `.claude/rules/turma-ha-store.md` for the `LiveStore` seam it p
 - **`makeControlBus(store, replicaId)` is standalone + store-injected** (like `makeSseBus`) so the
   address routing is unit-testable with a `FileLiveStore` (no live Valkey in CI). Messages are routed
   by `target` (a replica id); a replica ignores anything not addressed to it or malformed. The channel
-  is kept extensible (`{type, target, …}`) for the deferred byte relay.
+  is kept extensible (`{type, target, …}`); the byte relay does NOT ride it (below).
+
+## The byte-stream relay transport (XERK-777, `turma/relay.js`)
+
+The duplex relay XERK-764 deferred, for the DATA plane `/term` / `/live` / `openChannel` bytes. It is
+a DEDICATED pod-to-pod transport, NOT the control/SSE bus — see the "never through store pub/sub"
+rule above. Rationale (recommended shape vs the rejected route-by-host-at-ingress) is in
+`docs/turma-ha-store-adr.md` ("The cross-replica byte-stream relay transport").
+
+- **`makeRelay(store, replicaId, deps)` is standalone + store/directory-injected**, exactly like
+  `makeControlBus`/`makeSseBus`, so the routing + duplex bridging + lifecycle are unit-testable with a
+  `FileLiveStore` and an in-process LOOPBACK PAIR — no live Valkey and no cluster. The deps inject the
+  seams that are deployment-coupled or live in server.js: `owners` (the `hostTunnelOwners` mirror),
+  `ttlMs`, `localTunnel` (`!!controlChannels[host]`, the ownership check), `openLocal` (`openChannel`,
+  the local tunnel bridge, OWNER side only), `dial` (the raw pod-to-pod byte channel), and `endpoint`
+  (this replica's dial address).
+- **Shape: an in-hub pod-to-pod reverse-proxy.** The ORIGIN (the replica a client landed on) resolves
+  the host's owner from `hostTunnelOwners` — SAME `local`/`self`/`stale`/`absent` gate as `pokeHost`,
+  a fresh REMOTE owner is the only relay target — resolves that replica's dial address from the
+  endpoint directory, and `dial`s a DIRECT duplex to it. The OWNER `accept`s it, verifies it STILL
+  holds the tunnel (`localTunnel`), bridges to `openChannel`, and pipes both ways.
+- **The endpoint DIRECTORY is the store's only job here, and it is byte-FREE**: `relayEndpoint:<id>`
+  → `{addr, at}`, TTL'd + refreshed + watch-mirrored + boot-scanned, the exact `hostTunnelOwners`
+  pattern. A stream byte NEVER touches the store.
+- **Framing:** a tiny length-prefixed frame (`[type][u32 len][payload]`, NOT WS, NOT the store) —
+  DATA (raw bytes), CTRL (JSON: the `{t:"open",host,port}` handshake, a reconnect hint, ping/pong),
+  CLOSE. The declared length is capped (`frameMax`, the `wsParser`/XERK-357 memory discipline: a
+  deframer over the cap goes DEAD, no unbounded `Buffer.concat`).
+- **Duplex + backpressure-aware:** `_write` honours the conn's `drain`; inbound DATA pauses the conn
+  when `push()` says the consumer is behind — so a slow peer pod can't buffer a whole terminal stream
+  in the hub heap.
+- **Clean close on all three failure modes, a reconnect HINT, never a hung socket:** owner HANDOFF
+  (host reconnected elsewhere → `accept` refuses with `{t:"hint",reason:"not-owner"}`), TUNNEL DROP
+  (`openLocal` rejects → `{reason:"tunnel-down"}`), REPLICA LOSS (`dial`/conn fails → `connect`
+  rejects / the duplex closes). A teardown hint fully closes the origin duplex a tick later (the
+  consumer has seen the hint); a bare CLOSE frame is a half-close (the reverse flow may still stream);
+  a broken conn EOFs + destroys. Every teardown destroys WITHOUT an error arg (a re-thrown `error`
+  with no consumer listener would crash the process — the `channelDuplex` rule).
+- **Liveness:** a ping/idle loop over the pod-to-pod hop (mirrors the control channel) tears down a
+  half-open conn rather than reporting it live forever.
+- **Consumers are a follow-up (w2-relay-consumers).** server.js CONSTRUCTS the relay under HA (binding
+  `owners`/`ttlMs`/`localTunnel`/`openLocal`) but does NOT `start()` it or wire `dial`/a listener/
+  `endpoint` — so `connect`/`accept` are reachable by no client yet and no byte crosses replicas.
 
 ## Non-HA is byte-identical (the load-bearing invariant)
 
-- With HA off, `hostTunnelOwners` stays empty and `controlBus`/`sseBus` null: `publishHostTunnel`/
+- With HA off, `hostTunnelOwners` stays empty and `controlBus`/`sseBus`/`relay` null: `publishHostTunnel`/
   `retireHostTunnel` early-return, `terminalOnline` is purely `controlChannels`, and `pokeHost` never
   leaves the process. Everything gates on `HA_ON` at its entry, exactly like the registry watch.
 
@@ -92,4 +138,11 @@ hub half of, and `.claude/rules/turma-ha-store.md` for the `LiveStore` seam it p
   via `serializeAgent`; the watch mirroring a peer's set/del + ignoring a malformed value; boot
   hydrate leaving watch-won keys alone; `pokeHost` local-vs-bus routing (fresh remote → bus, stale/
   self/absent → nothing); `makeControlBus` delivering only messages addressed to this replica.
+- `turma/tests/tunnel-relay.test.js` (own process; `FileLiveStore` + net loopback pairs, no
+  cluster): the `remoteOwner` routing gate (local/self/absent/stale → no relay, fresh remote → dial);
+  `connect` returning null with no dial when no remote owner; the end-to-end bridge (origin bytes →
+  owner's `openLocal` → back); the three clean-close hints (handoff/tunnel-down/replica-loss) with no
+  hung socket; a broken mid-stream conn EOFing the origin; large-payload framing + backpressure
+  integrity; the framing codec (split chunks, overflow → dead); the handshake timeout; and the
+  endpoint directory (publish/watch-mirror/hydrate/retire + `connect` resolving the peer addr).
 - `turma/tests/server.test.js` (HA off) is the non-HA byte-identity guard and must stay green.

@@ -63,6 +63,14 @@ const { createLeader } = require("./leader.js");
 // tree stays the of-record, byte-identical.
 const { createBlobStore } = require("./blobstore.js");
 const { ArchiveMirror } = require("./archive-mirror.js");
+// The cross-replica byte-stream relay TRANSPORT (XERK-777, epic XERK-751/775): the
+// duplex relay XERK-764 deferred for `/term`, the `/live` deltas and `openChannel`.
+// Requiring it is side-effect-free (it dials no socket until constructed + started);
+// with HA off the `relay` binding below stays null and none of it runs. This child
+// lands the TRANSPORT PRIMITIVE only — the `/term`/`/live`/`openChannel` CONSUMERS
+// (which supply the pod-to-pod `dial`/listener + this replica's `endpoint`) are the
+// follow-up (w2-relay-consumers). See `.claude/rules/turma-ha-tunnel.md`.
+const { makeRelay } = require("./relay.js");
 
 // XERK-757 externalized-store persistence config, declared here so it can be
 // handed to the module-load store below. It maps each `policy:<name>` store key to
@@ -4174,6 +4182,13 @@ const HOST_REPLICA_TTL_MS = Math.max(CONTROL_DEAD_AFTER_MS, CONTROL_PING_EVERY_M
 // the authoritative local truth; this mirror answers for OTHER replicas' tunnels.
 const hostTunnelOwners = Object.create(null);
 let controlBus = null; // { publish(msg) } in HA mode; null single-process.
+// The cross-replica byte-stream relay TRANSPORT (XERK-777): a dedicated pod-to-pod
+// duplex, NOT the store's pub/sub (bulk terminal bytes there would head-of-line-
+// block the SSE/registry liveness channel — `.claude/rules/turma-ha-tunnel.md`).
+// Constructed under HA with the routing deps that already live here; the pod-to-pod
+// `dial`/listener + `endpoint` and the `/term`/`/live`/`openChannel` CONSUMERS are
+// the follow-up (w2-relay-consumers). Null single-process — byte-identical HA-off.
+let relay = null; // { connect, accept, start, stop } in HA mode; null single-process.
 
 // Write one SSE frame to every open /api/events stream ON THIS PROCESS
 // (best-effort; a dead stream is dropped on its next failed write and by its
@@ -17845,6 +17860,11 @@ if (process.env.TURMA_TEST) {
     publishHostTunnel, retireHostTunnel, hostTunnelOwnerLive,
     watchTunnelDirectory, hydrateTunnelDirectory, sweepTunnelDirectory, makeControlBus, pokeHost,
     __setControlBus(v) { controlBus = v; },
+    // XERK-777: the byte-stream relay transport, constructed under HA (null single-
+    // process). Its routing/bridging/lifecycle are unit-tested in tunnel-relay.test.js
+    // against turma/relay.js directly; exposed here as the seam consumers reach.
+    get relay() { return relay; },
+    __setRelay(v) { relay = v; },
     siteKeyOf,
     orgPeers,
     boundOrgOf,
@@ -17998,6 +18018,20 @@ if (process.env.TURMA_TEST) {
       console.error(`HA tunnel-directory hydrate failed: ${(e && e.message) || e}`));
     controlBus = makeControlBus(liveStore, SSE_REPLICA_ID);
     console.log(`control bus: shared (replica ${SSE_REPLICA_ID})`);
+    // XERK-777: the byte-stream relay transport. Construct it with the routing deps
+    // that already live here — the owner directory (XERK-764), the ownership check
+    // (`controlChannels`), and the local tunnel bridge (`openChannel`) — so a
+    // consumer only has to supply the pod-to-pod `dial`/listener + this replica's
+    // `endpoint` and call `start()`. Deliberately NOT started here: the `/term`,
+    // `/live` and `openChannel` consumers own that wiring (w2-relay-consumers), so
+    // until then no byte crosses replicas and terminals serve from the owner only —
+    // exactly the Option-2 behaviour, nothing regresses. Bytes NEVER ride the store.
+    relay = makeRelay(liveStore, SSE_REPLICA_ID, {
+      owners: hostTunnelOwners,
+      ttlMs: HOST_REPLICA_TTL_MS,
+      localTunnel: (host) => !!controlChannels[host],
+      openLocal: openChannel,
+    });
     // Reclaim mirror entries a crashed owner never retired: on the Valkey backend a
     // TTL expiry fires no watch event, so a periodic sweep frees them (XERK-764).
     const dirSweep = setInterval(sweepTunnelDirectory, HOST_REPLICA_TTL_MS);
