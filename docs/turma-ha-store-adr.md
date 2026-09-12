@@ -269,6 +269,48 @@ invariant the ticket demands, and every sibling must preserve it.
 
 ---
 
+## The cross-replica byte-stream relay transport (XERK-777)
+
+XERK-764 landed the tunnel DIRECTORY + the CONTROL plane (cross-replica `terminalOnline` + an
+addressed command poke) and DEFERRED the DATA plane: the duplex byte streams for `/term`, the `/live`
+deltas and `openChannel`. XERK-777 lands that transport primitive (`turma/relay.js`); the consumers
+that wire it into those three routes are a follow-up.
+
+**The decision: an in-hub pod-to-pod reverse-proxy, on a DEDICATED transport.** The replica a client
+landed on (the origin) looks up the host's tunnel owner in the `hostTunnelOwners` mirror (XERK-764)
+and opens a DIRECT duplex byte channel to that owning replica, which bridges it to its local
+`controlChannels[host]` (via `openChannel`) and pipes both ways. Two alternatives were considered and
+rejected:
+
+1. **Relay bytes over the store's pub/sub (the control/SSE bus).** Rejected as a HARD constraint, not
+   a preference: bulk interactive terminal traffic would ride the SAME single shared subscriber
+   connection the SSE bus (XERK-762) and the registry watch (XERK-756) depend on, head-of-line
+   blocking the fleet's LIVENESS channel. So the relay is a dedicated pod-to-pod transport; the store
+   carries only a byte-free endpoint directory (`relayEndpoint:<replicaId>` → `{addr, at}`, TTL'd +
+   watch-mirrored, the `hostTunnelOwners` pattern) so the origin can resolve where to dial a peer.
+2. **Route-by-host at the ingress (sticky/L7 routing so a client always lands on the tunnel owner).**
+   Rejected because a stock L4/L7 load balancer cannot key on Turma's app-level host identity (the
+   `<host>` segment of a `/term/<sessionId>/…` path resolves to a session, whose owning host — and
+   thus owning replica — is hub state, not anything the LB can read), and the ingress manifests live
+   in `xerktech/ArgoCD`, out of this repo. An app-aware relay inside the hub needs no ingress change.
+
+**Why a primitive, injected, unit-tested with no cluster.** `makeRelay(store, replicaId, deps)` is
+standalone and store/directory-injected exactly like `makeControlBus`/`makeSseBus`, and the
+deployment-coupled seams (the pod-to-pod `dial` + listener, this replica's `endpoint`) and the
+server.js-resident seams (`hostTunnelOwners`, `controlChannels`, `openChannel`) are injected — so the
+whole routing + duplex-bridging + lifecycle is exercised with a `FileLiveStore` and an in-process
+loopback pair, the same no-live-backend discipline as store.js's RESP codec and leader.js's election.
+It is duplex + backpressure-aware, caps its frame length (the `wsParser`/XERK-357 memory rule), and
+closes cleanly on the three failure modes — owner handoff, tunnel drop, replica loss — each with a
+reconnect hint and never a hung socket. Non-HA is byte-identical: server.js constructs a relay only
+under HA, null single-process. Mechanics: `.claude/rules/turma-ha-tunnel.md`.
+
+**Reachability of Option 3.** This transport is the byte-plane half named in `docs/turma-ha-design.md`
+§"Option 3" ("relay the byte streams between replicas … proxying a live ttyd WebSocket pod-to-pod").
+Landing it (plus the consumers) removes the last reason `/readyz` gates the Service to the leader only
+(`.claude/rules/turma-ha-leader.md` — the migration-request Map is the other), a step toward true
+active-active.
+
 ## If we must cut to fewer dependencies
 
 Three new stateful operators (Valkey + CloudNativePG + MinIO) is real k8x surface. Two honest
