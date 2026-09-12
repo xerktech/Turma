@@ -28,33 +28,64 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
 (`autoStartSweep`, …) stay UNGATED, directly-callable units — the gate is at the tick, not in them
 (their own tests call them directly, with no leader, and must keep acting).
 
-## Service gating — the leader is the only Ready endpoint (XERK-765)
+## Service gating — active-active: every healthy replica serves (XERK-782, was XERK-765)
 
-- **`/readyz` returns 200 ONLY on the leader** (`hubDraining` false AND `isLeader()` true); a
-  non-leader answers **503 `{ready:false, leader:false}`**. This is the "Service gating" the design
-  doc pairs with the lease: XERK-763 gated the SWEEPS, this gates the SERVICE. k8s pulls a NotReady
-  pod from the Service EndpointSlice, so under HA the leader is the ONLY pod client/agent traffic
-  reaches — the standbys stay warm off the shared store and serve nothing.
-- **This is load-bearing, not cosmetic.** The shipped hub only supports Option 2 (leader-serves-all).
-  The cross-replica terminal/`/live` byte-stream relay HAS now landed (XERK-777 transport + XERK-781
-  consumers), and the migration request-path READ is resolvable on any replica (XERK-778) — so those
-  two original blockers are gone. What still keeps `/readyz` leader-only is that request-path
-  MUTATIONS assume leader-serves-all: a migration mutation (and cross-replica command delivery) on a
-  FOLLOWER is not mirrored to the leader (XERK-778's scope boundary), so a follower serving write
-  traffic would silently drop it. **Do NOT remove the `isLeader()` gate from `/readyz` or make
-  non-leaders serve** until that mutation-flow gap is closed (the true active-active flip, its own
-  ticket) — not merely because the relay landed.
+- **`/readyz` returns 200 on ANY healthy, non-draining replica** — leader-INDEPENDENT since XERK-782.
+  k8s keeps every replica in the Service EndpointSlice, so the LB spreads clients across the whole
+  fleet (true active-active / horizontal scale). `/healthz` is unchanged (pure process-up liveness).
+- **The XERK-765 leader-serves-all gate is LIFTED — do NOT restore it.** It was load-bearing only
+  while cross-replica serving was incomplete. Every prerequisite has landed: the duplex byte-stream
+  relay for `/term`, `/live` and `openChannel` (XERK-777 transport + XERK-781 consumers); the
+  migration REQUEST-path READ as a hot cross-replica mirror (XERK-778); and the shared archive index
+  (XERK-780). **The request-path MUTATION gap the old gate also covered is now CLOSED here** (below),
+  so a follower serving write traffic no longer silently drops it.
+- **Leader election STAYS, but now gates ONLY the singleton background work — never serving.** The
+  three leader-gated ticks (`offlineDetectionTick`, `masterOrchestrationTick`, `migrationAdvanceTick`)
+  are unchanged, AND the **inline migration-ADVANCE in the heartbeat handler is now `isLeader()`-gated
+  too** (XERK-782): under Option 2 only the leader beat, so that inline `advanceMigrations()` was
+  implicitly leader-only; with every replica Ready a host beats to any replica, so an ungated inline
+  advance would race the handoff (double source-kill). Every SERVING path a client hits is
+  leader-independent: registry/SSE bus (XERK-756/762), command-poke (XERK-764), the terminal/`/live`
+  relay (XERK-781), migration reads (XERK-778), archive index (XERK-780).
+- **The migration MUTATION flow reaches the leader (XERK-782).** A migration START / blob-upload /
+  restore-pack can now land on a non-leader. A FOLLOWER write-throughs ONLY the records it itself
+  mutated (`publishMigrations(id)` marks `migrationsDirty`, the follower branch mirrors just those —
+  never its whole Map, or it would resurrect a settled move: the registry own=dirty / remote=apply-only
+  split). The LEADER FORWARD-LEARNS via `applyRemoteMigration`: it ADOPTS a record it lacks (a
+  follower-started move), FORWARD-MERGES phase (exporting→importing→terminal) + progress fields
+  (`importCmdId`/`blobPath`/`blobSize`/`targetSessionId`/`error`) it lacks, NEVER regresses phase and
+  NEVER touches leader-local `uploading`/`refusal` (so the leader's own mirror self-echo is a no-op).
+  A `migrationsRetired` bounded set is the anti-resurrection guard: the leader never re-adopts an id
+  it retired, and DELETES the store zombie if a stale echo arrives.
+  - **Accepted residual (LOW):** a `refusal` ingested on a follower does NOT travel (mirrorMigration
+    still strips it — the leader-local rule XERK-778 pins), so a follower-side agent refusal fast-fails
+    only if the leader ingested it; otherwise the move TIMES OUT (`MIGRATE_TIMEOUT_MS`) with the source
+    intact — no data loss, just slower failure feedback. Cross-replica command QUEUEING keeps its
+    documented ~1s record+watch delivery race (`turma-ha-registry.md`), unchanged. The ticket queue is
+    per-replica in-memory (not shared): each replica self-drains its OWN admissions on its own beats
+    (the beat-handler `drainTicketQueue` stays UNgated — gating it would strand follower-admitted
+    tickets), and the shared double-start guards + agent-side session queue bound the dispatch race.
+  - **`heartbeatAlerts` can double-fire in the ~1s registry-convergence window.** Beats now spread
+    across replicas, and a host's dedup state (`next.alerts`, on the shared registry record) converges
+    via the watch with the ~1s debounce — so replica B can re-detect an edge replica A already fired
+    before B's mirror caught up. Informational only: deduped/retracted on the phone by the stable
+    `notifKey`, the same class as the XERK-756 SSE-convergence residual.
 - **It does not flap:** `isLeader()` is refreshed on every ~2s lease renewal and self-expires only
-  after the full ~15s window, so a healthy leader stays Ready through a transient API blip; only a
-  genuine partition drops it (which SHOULD pull it from the Service). **HA off / no elector →
-  `isLeader()` always true → always Ready**, so single-replica and docker-compose are unchanged.
-- **Failover has a bounded gap, by design.** On a rolling update the draining leader flips NotReady
-  and renounces the lease (backdated `renewTime`); a standby wins it within a beat or two and flips
-  Ready. Between the two there can be zero Ready endpoints for ~1–2s — the reconnect the epic accepts,
-  NOT a sustained outage (streams close with reconnect hints). The ArgoCD `deployment.yaml`
-  readinessProbe must point at `/readyz` (NOT `/healthz`) for this to take effect; liveness/startup
-  stay on `/healthz` so a warm standby is never SIGKILLed for being un-Ready.
-- Tests: `XERK-765: /readyz follows leadership …` in `server.test.js`.
+  after the full ~15s window. **HA off / no elector → `isLeader()` always true**; the flip only removed
+  a 503 branch a single-process hub never took, so HA-off / docker-compose is byte-identical.
+- **The graceful-drain gate remains, per replica** (XERK-765's other half): a SIGTERM flips
+  `hubDraining` so THIS replica reports NotReady and k8s pulls it before its sockets are cut
+  (READYZ_DRAIN_DELAY_MS hold). The ArgoCD readinessProbe must point at `/readyz` (NOT `/healthz`);
+  liveness/startup stay on `/healthz`.
+- **Manifest implication (w4-deploy, XERK-783).** With all replicas Ready, `availableReplicas ==
+  replicas`, so a rolling update can use a REAL `maxUnavailable` (e.g. 0/1) for a genuinely
+  zero-serving-gap deploy — replacing the FORCED `maxUnavailable: 100%` Option 2 needed (its lone
+  Ready pod had to go NotReady before a standby could serve, XERK-772's cold-promote gap). The
+  cross-replica byte relay needs the pod-to-pod `RELAY_PORT` exposed + `POD_IP` injected + a
+  NetworkPolicy (XERK-781); that manifest work is XERK-783's.
+- Tests: `XERK-782: /readyz is leader-INDEPENDENT …`, `XERK-782: the leader FORWARD-LEARNS …`,
+  `XERK-782: … never RE-ADOPTS a retired migration …`, `XERK-782: a FOLLOWER write-throughs …` in
+  `server.test.js`.
 
 ## `isLeader()` and the elector
 

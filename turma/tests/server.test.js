@@ -15267,6 +15267,97 @@ test("XERK-778: the leader's own mirror echo does not clobber its live leader-lo
   });
 });
 
+// ---- XERK-782: active-active migration MUTATIONS reach the leader ------------
+// The /readyz flip lets a migration START/blob-upload land on a non-leader. A
+// follower write-throughs the records it mutated and the LEADER forward-learns
+// them so the sole advancer finishes the move — without resurrecting a settled one.
+
+test("XERK-782: the leader FORWARD-LEARNS a follower-started + blob-advanced migration", async () => {
+  await withWatchedMigrationStore(async (store) => {
+    hub.__setLeader(fakeLeader(true)); // this replica is the leader/advancer
+    const id = "782aaaa000000001";
+    // A FOLLOWER started the move (operator POST landed there) and wrote it
+    // through — it arrives on the leader's watch. The leader holds no such record,
+    // so it ADOPTS it (else the move would never advance).
+    await store.set(MIGRATION_KEY_PREFIX + id, {
+      id, srcHost: "s1", targetHost: "t1", phase: "exporting", meta: {},
+      at: Date.now(), startedAt: Date.now(),
+    });
+    assert.ok(migrations.has(id), "the leader adopts a follower-started migration");
+    assert.equal(migrations.get(id).phase, "exporting");
+
+    // The blob upload landed on a follower too and advanced the record to
+    // importing with the importCmdId the leader needs to detect the target coming
+    // up. The leader forward-merges the phase + progress fields.
+    await store.set(MIGRATION_KEY_PREFIX + id, {
+      id, srcHost: "s1", targetHost: "t1", phase: "importing", meta: {},
+      importCmdId: "imp782", blobPath: migrationSpoolPath(id), blobSize: 5,
+      at: Date.now(), startedAt: Date.now(),
+    });
+    assert.equal(migrations.get(id).phase, "importing", "phase advances forward");
+    assert.equal(migrations.get(id).importCmdId, "imp782", "the leader learns importCmdId");
+
+    // An out-of-order REGRESS echo (back to exporting) is IGNORED.
+    await store.set(MIGRATION_KEY_PREFIX + id, {
+      id, srcHost: "s1", targetHost: "t1", phase: "exporting", meta: {},
+      at: Date.now(), startedAt: Date.now(),
+    });
+    assert.equal(migrations.get(id).phase, "importing", "phase never regresses on the leader");
+
+    migrations.delete(id);
+    await store.del(MIGRATION_KEY_PREFIX + id);
+  });
+});
+
+test("XERK-782: the leader never RE-ADOPTS a retired migration and deletes the store zombie", async () => {
+  await withWatchedMigrationStore(async (store) => {
+    hub.__setLeader(fakeLeader(true));
+    const id = "782dead000000002";
+    // The leader had the record and RETIRED it (advanceMigrations settled the move).
+    migrations.set(id, { id, srcHost: "s", targetHost: "t", phase: "done", meta: {}, at: 0, startedAt: 0 });
+    hub.retireMigration(id);
+    assert.equal(migrations.has(id), false);
+
+    // A stale follower echo of the settled record races in on the watch. The leader
+    // must NOT resurrect it, and it deletes the store zombie so a later promotion's
+    // hydrate can't either.
+    await store.set(MIGRATION_KEY_PREFIX + id, {
+      id, srcHost: "s", targetHost: "t", phase: "importing", meta: {},
+      at: Date.now(), startedAt: Date.now(),
+    });
+    assert.equal(migrations.has(id), false, "a retired move is never re-adopted on the leader");
+    await new Promise((r) => setImmediate(r));
+    assert.equal(await store.get(MIGRATION_KEY_PREFIX + id), null, "the store zombie is deleted");
+  });
+});
+
+test("XERK-782: a FOLLOWER write-throughs a record it MUTATED, never one it only learned", async () => {
+  await withWatchedMigrationStore(async (store) => {
+    hub.__setLeader(fakeLeader(false));
+    // Learned via the watch (not mutated on this replica): must NOT be written back.
+    const learned = "782cccc000000003";
+    migrations.set(learned, {
+      id: learned, srcHost: "a", targetHost: "b", phase: "exporting", meta: {},
+      at: Date.now(), startedAt: Date.now(),
+    });
+    // Mutated locally on this follower (e.g. the blob upload): marked dirty by id.
+    const mine = "782cccc000000004";
+    migrations.set(mine, {
+      id: mine, srcHost: "c", targetHost: "d", phase: "importing", importCmdId: "x",
+      meta: {}, at: Date.now(), startedAt: Date.now(),
+    });
+    hub.publishMigrations(mine);
+    await new Promise((r) => setImmediate(r));
+    assert.ok(await store.get(MIGRATION_KEY_PREFIX + mine),
+      "a follower mirrors the record it mutated");
+    assert.equal(await store.get(MIGRATION_KEY_PREFIX + learned), null,
+      "a follower never mirrors a record it only learned via the watch");
+    migrations.delete(mine);
+    migrations.delete(learned);
+    await store.del(MIGRATION_KEY_PREFIX + mine);
+  });
+});
+
 // ---- XERK-763: leader election + shared single-flight guards -----------------
 // Under HA (Option 2) the singleton sweeps + migration-advance run on the LEADER
 // only, and the guards those sweeps rely on are WRITE-THROUGH mirrored to the
@@ -15301,23 +15392,25 @@ test("XERK-763: isLeader() is always true with no elector, and follows an inject
   hub.__setLeader(null); // restore
 });
 
-test("XERK-765: /readyz follows leadership — only the leader is a Service endpoint", async () => {
-  // No elector (single-process / HA off): always the leader, so always Ready.
+test("XERK-782: /readyz is leader-INDEPENDENT — every healthy replica serves (active-active)", async () => {
+  // No elector (single-process / HA off): always Ready — byte-identical, the flip
+  // only removes a branch a single-process hub never took.
   hub.__setLeader(null);
   let r = await request("GET", "/readyz");
   assert.equal(r.status, 200);
   assert.equal(r.body.ready, true);
 
-  // A follower replica reports NotReady so k8s pulls it from the EndpointSlice
-  // and the Service routes traffic only to the leader (the byte-stream relay is
-  // deferred; non-leaders must not serve terminals/migration).
+  // A FOLLOWER now reports READY too (was 503 under Option 2 / XERK-765) — k8s
+  // keeps every replica in the Service EndpointSlice so the LB spreads clients
+  // across the whole fleet. The cross-replica serving paths (relay/registry/SSE/
+  // migration-read/archive-index) all resolve off the leader; leadership no longer
+  // gates serving, only the singleton background sweeps.
   hub.__setLeader(fakeLeader(false));
   r = await request("GET", "/readyz");
-  assert.equal(r.status, 503);
-  assert.equal(r.body.ready, false);
-  assert.equal(r.body.leader, false);
+  assert.equal(r.status, 200, "a non-leader is Ready under active-active");
+  assert.equal(r.body.ready, true);
 
-  // The leader is Ready again.
+  // The leader is Ready as well.
   hub.__setLeader(fakeLeader(true));
   r = await request("GET", "/readyz");
   assert.equal(r.status, 200);

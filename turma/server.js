@@ -3384,6 +3384,24 @@ function fleetRepoNames() {
 // State is in-memory and short-lived; a hub restart mid-migration aborts it,
 // leaving the source session intact.
 const migrations = new Map(); // migrationId -> record (see startMigration)
+// Active-active mutation sharing (XERK-782). Under Option 3 every healthy replica
+// serves, so a migration MUTATION (startMigration, the blob upload, a restore's
+// pack) can land on a replica that is NOT the leader — the sole advancer. A
+// follower must therefore write-through the records IT mutated so the leader
+// LEARNS them and finishes the move; but it must NOT re-mirror a record it merely
+// learned via the watch (that resurrects a settled move — XERK-778). `migrationsDirty`
+// is the own-mutation set (the registry's markAgentDirty pattern): a follower
+// mirrors only these, never its whole Map. `migrationsRetired` is a bounded
+// anti-resurrection guard on the LEADER's forward-learn — an id the leader retired
+// must never be re-adopted from a stale store echo (and the leader deletes that
+// zombie when it sees one). Both are per-replica, in-memory; HA off leaves them
+// unused (the leader mirrors its whole Map exactly as before).
+const migrationsDirty = new Set(); // ids THIS replica mutated and must write-through
+const migrationsRetired = new Set(); // ids THIS replica retired (leader anti-resurrection)
+const MIGRATIONS_RETIRED_MAX = 512; // bound the retired-id guard, oldest-first
+function markMigrationDirty(id) {
+  if (id) migrationsDirty.add(id);
+}
 const MIGRATE_TIMEOUT_MS = positiveEnv("MIGRATE_TIMEOUT_MS", 5 * 60 * 1000);
 const MIGRATE_DONE_KEEP_MS = 30 * 1000; // keep a done/failed record briefly so UI can observe
 const MIGRATIONS_MAX = 40; // backstop against unbounded growth
@@ -3613,27 +3631,37 @@ function serializeMigration(m) {
 function migrationList() {
   return Array.from(migrations.values()).map(serializeMigration);
 }
-function publishMigrations() {
+function publishMigrations(changedId) {
+  // A record this replica just MUTATED is written through even from a follower
+  // (XERK-782, below); mark it so the follower branch mirrors exactly it.
+  if (changedId) markMigrationDirty(changedId);
   invalidateAgentsCache();
   sseBroadcast("migrations", migrationList());
+  if (!migrationStoreShared) { migrationsDirty.clear(); return; }
   // Mirror the live set to the shared store so any replica can resolve a
-  // migration by id after a leader failover (XERK-761). Every migration mutation
-  // funnels through here, so mirroring the whole (MIGRATIONS_MAX-bounded) set
-  // refreshes each record's TTL and misses no mutation site; retire is the one
-  // path that also has to REMOVE a record, so it forgets explicitly. No-op —
-  // and thus byte-identical single-process behaviour — when HA is off.
+  // migration by id after a leader failover (XERK-761). Retire is the one path
+  // that also has to REMOVE a record, so it forgets explicitly. No-op — and thus
+  // byte-identical single-process behaviour — when HA is off.
   //
-  // Only the LEADER writes the shared migration record (XERK-778). It owns the
-  // working-set Map; a non-leader learns records via watchMigrations (below) and
-  // must never re-mirror one, or a stale copy still in its Map when the leader
-  // retires a move would RESURRECT the record in the store. With HA off
-  // isLeader() is trivially true and migrationStoreShared is false, so this stays
-  // byte-identical. (A follower reaches this only under Option 3 request serving,
-  // deferred; migration ADVANCE — the mutations that finish a move — is
-  // leader-only regardless, migrationAdvanceTick.)
-  if (migrationStoreShared && isLeader()) {
+  // The LEADER mirrors its WHOLE working set: it owns the Map, so re-mirroring
+  // every record refreshes each one's TTL and misses no mutation site. A FOLLOWER
+  // (Option 3 active-active, XERK-782) mirrors ONLY the records it itself mutated
+  // (`migrationsDirty`), never its whole Map — a record it merely LEARNED via the
+  // watch must not be re-mirrored, or a stale copy still in its Map when the
+  // leader retires a move would RESURRECT the record in the store (the XERK-778
+  // resurrection rule, now that followers write too). This is the registry's
+  // own=dirty / remote=apply-only split (XERK-756). The leader LEARNS a follower's
+  // write via applyRemoteMigration's forward-merge, so the sole advancer
+  // (migrationAdvanceTick) finishes a move an operator/agent started on any replica.
+  if (isLeader()) {
     for (const m of migrations.values()) mirrorMigration(m);
+  } else {
+    for (const id of migrationsDirty) {
+      const m = migrations.get(id);
+      if (m) mirrorMigration(m);
+    }
   }
+  migrationsDirty.clear();
 }
 
 // ---- migration record + spool sharing across replicas (XERK-761) -----------
@@ -3699,7 +3727,18 @@ function forgetMigration(id) {
 // store to be re-hydrated after it settled.
 function retireMigration(id) {
   migrations.delete(id);
+  migrationsDirty.delete(id); // it is gone — never write it back
   forgetMigration(id);
+  // Remember it briefly so the leader's forward-learn never RE-ADOPTS a stale
+  // store echo of a move it just retired (XERK-782 anti-resurrection). Bounded
+  // oldest-first; ids are 16-hex random, so a live follower-created migration is
+  // never confused with a retired one.
+  if (id) {
+    migrationsRetired.add(id);
+    while (migrationsRetired.size > MIGRATIONS_RETIRED_MAX) {
+      migrationsRetired.delete(migrationsRetired.values().next().value);
+    }
+  }
 }
 // Rebuild the in-memory Map from the shared store — every record another replica
 // (or this one before a restart) left in flight. The seam a promoted leader calls
@@ -3736,25 +3775,61 @@ async function hydrateMigrations() {
 // the source, finishing the move) stays leader-only (migrationAdvanceTick,
 // XERK-763); this only makes the record RESOLVABLE, never lets a follower advance.
 //
-// Apply-only, and ONLY ON A NON-LEADER. The leader is the SOLE writer of the
-// shared migration record (publishMigrations mirror is isLeader-gated), so it owns
-// its whole Map and never needs to learn a record from the store — its own writes
-// echo back through this watch, and applying that echo (even a fresher-than-echo
-// one racing the pub/sub round trip) would re-install the flag-stripped copy OVER
-// the leader's live `uploading`/`refusal`. Gating apply on `!isLeader()` means no
-// replica ever both writes AND applies, so a self-echo is never applied and no
-// echo-dedup memo is needed. A follower's Map is thus kept a hot mirror; the
-// leader's Map stays its authoritative working set (re-synced by hydrateMigrations
-// on promotion). Like applyRemoteAgent this drops the agents cache (migrations
-// ride /api/agents) but never re-mirrors and never sseBroadcasts — the owning
-// replica's publishMigrations already published the `migrations` frame to the
-// XERK-762 bus, which every replica re-emits to its own clients. Leader-local
-// transients are reset in the applied copy, as on hydrate.
+// A FOLLOWER keeps its whole Map a hot mirror off the watch (XERK-778): the
+// synchronous request-path reads then resolve on any replica. Leader-local
+// transients (`uploading`/`refusal`) are reset in the applied copy, as on hydrate.
+//
+// The LEADER FORWARD-LEARNS (XERK-782). Under Option 3 active-active a migration
+// MUTATION (startMigration / the blob upload / a restore's pack) can land on a
+// FOLLOWER, which writes it through (publishMigrations' dirty mirror); the leader
+// is the sole advancer, so it must LEARN that write to finish the move. It does so
+// FORWARD-ONLY, never regressing its own authoritative state:
+//   - a record it does NOT hold, and did NOT just retire, is ADOPTED (a
+//     follower-started move);
+//   - a store echo of a record the leader RETIRED is refused AND the zombie is
+//     deleted (anti-resurrection — the reason the plain isLeader early-return
+//     existed before followers wrote);
+//   - a held record advances by PHASE (exporting -> importing -> terminal) and
+//     picks up progress fields it lacks (importCmdId / blobPath / blobSize /
+//     targetSessionId, and `error` on a terminal edge). It NEVER regresses phase
+//     and NEVER touches the leader-local `uploading`/`refusal` — so the leader's
+//     own mirror self-echo (same phase, stripped transients) is a no-op, and a
+//     stale follower write can't undo a completed handoff.
+// Like applyRemoteAgent this drops the agents cache (migrations ride /api/agents)
+// but never re-mirrors and never sseBroadcasts — the owning replica's
+// publishMigrations already published the `migrations` frame to the XERK-762 bus.
+const MIGRATION_PHASE_RANK = { exporting: 0, importing: 1, done: 3, failed: 3 };
+function migrationPhaseRank(p) {
+  return Object.prototype.hasOwnProperty.call(MIGRATION_PHASE_RANK, p)
+    ? MIGRATION_PHASE_RANK[p] : 0;
+}
 function applyRemoteMigration(id, value) {
-  if (isLeader()) return; // the leader's Map is authoritative; never apply an echo
   if (!value || typeof value !== "object" || typeof value.id !== "string") return;
-  migrations.set(id, { ...value, uploading: false, refusal: null });
-  invalidateAgentsCache();
+  if (!isLeader()) {
+    migrations.set(id, { ...value, uploading: false, refusal: null });
+    invalidateAgentsCache();
+    return;
+  }
+  // Leader forward-learn.
+  const cur = migrations.get(id);
+  if (!cur) {
+    if (migrationsRetired.has(id)) { forgetMigration(id); return; } // retired zombie
+    migrations.set(id, { ...value, uploading: false, refusal: null });
+    invalidateAgentsCache();
+    return;
+  }
+  if (cur.phase === "done" || cur.phase === "failed") return; // terminal is absorbing
+  if (migrationPhaseRank(value.phase) < migrationPhaseRank(cur.phase)) return; // no regress
+  let changed = false;
+  if (migrationPhaseRank(value.phase) > migrationPhaseRank(cur.phase)) {
+    cur.phase = value.phase;
+    if (typeof value.error === "string" && value.error) cur.error = value.error;
+    changed = true;
+  }
+  for (const f of ["importCmdId", "blobPath", "blobSize", "targetSessionId", "transcriptId"]) {
+    if (value[f] != null && cur[f] == null) { cur[f] = value[f]; changed = true; }
+  }
+  if (changed) { cur.at = Date.now(); invalidateAgentsCache(); }
 }
 function applyRemoteMigrationRemoval(id) {
   if (isLeader()) return; // the leader retires its own records; ignore del echoes
@@ -5071,7 +5146,7 @@ function startMigration(srcHost, s, targetHost) {
   };
   migrations.set(id, m);
   queueCommand(srcHost, { type: "exportSession", sessionId: s.id, migrationId: id });
-  publishMigrations();
+  publishMigrations(id); // write-through even from a follower (XERK-782)
   return m;
 }
 
@@ -5133,7 +5208,7 @@ function startArchiveRestore(row, files, targetHost) {
     error: null, startedAt: Date.now(), at: Date.now(),
   };
   migrations.set(id, m);
-  publishMigrations();
+  publishMigrations(id); // write-through even from a follower (XERK-782)
 
   // A restore resumes this transcript on a host that may be in ANOTHER org (a
   // restore is deliberately not org-scoped — the dead source has no org to
@@ -5179,7 +5254,7 @@ function startArchiveRestore(row, files, targetHost) {
           m.error = "the archived conversation could not be packed intact";
           m.at = Date.now();
           try { fs.unlinkSync(spool); } catch {}
-          publishMigrations();
+          publishMigrations(id);
           return;
         }
         // Everything else rides, but the record SAYS SO. A restore that silently
@@ -5212,7 +5287,7 @@ function startArchiveRestore(row, files, targetHost) {
         // inventing one would name a session that does not exist.
         migratedFrom: { host: row.host || null, sessionId: null, at: Date.now(), fromArchive: true },
       });
-      publishMigrations();
+      publishMigrations(id);
     })
     .catch((e) => {
       if (!migrations.has(id)) return;
@@ -5222,7 +5297,7 @@ function startArchiveRestore(row, files, targetHost) {
         : "packing the archived session failed";
       m.at = Date.now();
       dropMigrationBlob(m);
-      publishMigrations();
+      publishMigrations(id);
       console.error(`restore ${id}: pack failed: ${e && e.message}`);
     });
   return m;
@@ -13877,34 +13952,38 @@ const server = http.createServer(async (req, res) => {
     // to a surviving replica instead of racing a socket being torn down.
     // Unauthenticated and leaks nothing, same rationale as /healthz.
     //
-    // XERK-765: readiness ALSO follows leadership — this is the "Service gating"
-    // step the design doc pairs with the leader lease (XERK-763 gated the sweeps;
-    // this gates the SERVICE). Under HA the fleet runs Option 2 (active-passive):
-    // exactly ONE replica — the leader — serves ALL traffic, and the standbys
-    // stay warm off the shared store. The shipped code REQUIRES that shape: the
-    // cross-replica terminal/`/live` byte-stream relay is deliberately deferred
-    // (XERK-764), so terminal bytes serve only from the tunnel owner's replica. (The
-    // migration REQUEST path no longer needs the leader — XERK-778 made `migrations`
-    // a hot cross-replica mirror via watchMigrations, so a status read / attachment
-    // fetch resolves on any replica; only migration ADVANCE stays leader-only. The
-    // terminal byte relay is the remaining Option-2 requirement.) A non-leader
-    // answering NotReady here removes it from the Service's EndpointSlice, so
-    // browsers/agents only ever hit the leader.
-    // On a rolling update the draining leader flips NotReady + renounces the
-    // lease (backdated renewTime), a standby wins it within a beat or two and
-    // flips Ready, and clients re-dial to it — the ~1-2s reconnect the epic
-    // accepts, not a sustained outage.
+    // XERK-782: ACTIVE-ACTIVE (Option 3). Readiness is now leader-INDEPENDENT —
+    // EVERY healthy, non-draining replica returns 200, so k8s keeps them all in the
+    // Service EndpointSlice and the LB spreads clients across the whole fleet (true
+    // horizontal scale). This LIFTS the XERK-765 leader-serves-all gate, which was
+    // load-bearing only while cross-replica serving was incomplete. Its
+    // prerequisites have all landed: the duplex byte-stream relay for `/term`,
+    // `/live` and `openChannel` (XERK-777 transport + XERK-781 consumers), the
+    // migration REQUEST path as a hot cross-replica mirror (XERK-778), and the
+    // shared archive index (XERK-780). The one request-path MUTATION that the old
+    // gate also covered — a migration STARTED/advanced on a non-owning replica — is
+    // closed here too: a follower write-throughs the records it mutates and the
+    // leader FORWARD-LEARNS them (publishMigrations/applyRemoteMigration, XERK-782),
+    // and the inline migration-ADVANCE in the heartbeat handler is now leader-gated.
     //
-    // `isLeader()` is a STABLE read, not a flapping one: it is refreshed on every
-    // confirmed lease renewal (retry ~2s) and self-expires only after the full
-    // ~15s lease window, absorbing a single API blip — so a HEALTHY leader stays
-    // Ready and only a genuine partition drops it (which SHOULD pull it from the
-    // Service). With HA OFF there is no elector (`hubLeader` is a StandaloneLeader
-    // / null), `isLeader()` is always true, and a single-replica or docker-compose
-    // hub is always Ready — unchanged.
+    // LEADER ELECTION STAYS, but now gates ONLY the singleton background work
+    // (offlineDetectionTick, masterOrchestrationTick, migrationAdvanceTick +
+    // the inline advance) — never serving. Every serving path a client can hit is
+    // leader-independent: the registry/SSE bus (XERK-756/762), command-poke
+    // (XERK-764), the terminal/`/live` relay (XERK-781), migration reads (XERK-778)
+    // and the archive index (XERK-780) all resolve cross-replica.
+    //
+    // Only the graceful-drain gate remains (XERK-765's other half): a SIGTERM flips
+    // `hubDraining` so THIS replica reports NotReady and k8s pulls it before its
+    // sockets are cut. Because all replicas are Ready, availableReplicas == replicas,
+    // so the rolling update can use a real maxUnavailable for a zero-serving-gap
+    // deploy (was forced 100% under Option 2) — see turma-ha-leader.md / w4-deploy.
+    //
+    // With HA OFF there is no elector, and this was byte-identical before the flip
+    // too (isLeader() always true → always Ready); it still is — the flip only
+    // removes a branch a single-process hub never took.
     if (url.pathname === "/readyz") {
       if (hubDraining) return json(res, 503, { ready: false, draining: true });
-      if (!isLeader()) return json(res, 503, { ready: false, leader: false });
       return json(res, 200, { ready: true });
     }
 
@@ -14864,7 +14943,14 @@ const server = http.createServer(async (req, res) => {
       // A migration finishes the instant its target session heartbeats in — do
       // the handoff (kill source, mark done) now rather than waiting out the
       // sweep interval (XERK-101). Cheap: a no-op unless a migration is live.
-      if (migrations.size) advanceMigrations();
+      // LEADER-ONLY (XERK-782): migration-advance is a singleton — it KILLS the
+      // source and finalizes the move. Under Option 2 only the leader beat, so
+      // this inline call was implicitly leader-only; with /readyz now Ready on
+      // every replica (active-active) a host beats to any replica, so an ungated
+      // inline advance would let two replicas race the handoff (double source-kill).
+      // The gate matches migrationAdvanceTick's; a follower learns the record via
+      // watchMigrations and leaves advancing to the leader.
+      if (isLeader() && migrations.size) advanceMigrations();
       // This beat is the fleet's capacity report, so it is exactly when a
       // waiting ticket may have become startable (XERK-296) — a session that
       // ended here frees a slot the queue can claim within one beat instead of
@@ -15148,7 +15234,7 @@ const server = http.createServer(async (req, res) => {
         m.phase = "failed";
         m.error = tooBig ? "transcript bundle too large" : "transcript bundle spool failed";
         m.at = Date.now();
-        publishMigrations();
+        publishMigrations(m.id);
         // The 413 is the enumerated exception discussed above. A SPOOL failure
         // is not a second one: it answers the uniform 404 like every other
         // refusal, because a distinct status would name the source to anyone
@@ -15200,7 +15286,7 @@ const server = http.createServer(async (req, res) => {
         // only logs it.
         m.phase = "failed"; m.error = "source session gone";
         dropMigrationBlob(m); m.at = Date.now();
-        publishMigrations();
+        publishMigrations(m.id);
         return json(res, 404, { error: "unknown migration" });
       }
       m.importCmdId = queueCommand(m.targetHost, {
@@ -15221,7 +15307,7 @@ const server = http.createServer(async (req, res) => {
         ticket: m.meta.ticket,
         migratedFrom: { host: m.srcHost, sessionId: m.srcSessionId, at: Date.now() },
       });
-      publishMigrations();
+      publishMigrations(m.id);
       return json(res, 200, { ok: true });
     }
 
@@ -18236,6 +18322,9 @@ if (process.env.TURMA_TEST) {
     watchMigrations,
     migrationList,
     publishMigrations,
+    // XERK-782: retire (for the anti-resurrection test) + the forward-learn seam.
+    retireMigration,
+    applyRemoteMigration,
     MIGRATION_KEY_PREFIX,
     MIGRATE_RECORD_TTL_MS,
     MIGRATE_SPOOL_ORPHAN_MS,
