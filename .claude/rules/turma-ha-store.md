@@ -147,11 +147,25 @@ NOT load on `server.js`, so re-read it here before touching that wiring**:
   shared URL in (the escape hatch). A non-0/1 `HA_MODE` is fatal (typo, not a guess).
 - **Fail loud, never half-HA:** when HA is on, a missing/malformed required URL is
   FATAL and NAMED at boot (refuse, don't degrade) — `TURMA_STORE_URL` (this ticket's
-  live plane), `DATABASE_URL` and `ARCHIVE_S3_*` (wave-3 backends, validated now so
-  the contract lands once). `ARCHIVE_S3_REGION` is the one S3 var with a default.
+  live plane), `DATABASE_URL` (Postgres — the archive INDEX consumes it now, XERK-780;
+  the usage ledger will, w2-ledger) and `ARCHIVE_S3_*` (object storage). `ARCHIVE_S3_REGION`
+  is the one S3 var with a default.
 - **The effective mode PRINTS at boot** (`HA: on (...)` / `HA: off (single-process)`),
   same idiom as the memory-ceiling prints — the only way to tell a correctly-wired
-  hub from one whose env moved under it.
+  hub from one whose env moved under it. The of-record segment names each backend by
+  its own flag (`INDEX_BACKEND_WIRED`/`LEDGER_BACKEND_WIRED`, `ledgerIndexBootSegment`),
+  so it can never falsely claim Postgres for a backend not yet wired (XERK-773): today
+  `ledger=valkey, index=postgres`.
+
+## The archive index of-record on Postgres (XERK-780)
+
+- **The FIRST Postgres of-record consumer wired** (over `pgclient.js`, XERK-776). Not a
+  LiveStore consumer — the archive's searchable INDEX moves onto Postgres (`index-store.js`),
+  keeping archive.js's local node:sqlite as the per-replica hot read/write CACHE (the sync
+  request + beat-cursor paths read it) and mirroring each write to Postgres idempotently, so a
+  promoted replica hydrates the index FROM Postgres instead of rebuilding from the S3 bytes.
+  Mechanics + the concurrency story: `.claude/rules/turma-ha-archive.md`. HA off = byte-identical
+  (`createIndexStore`/`createPgClient` return null).
 
 ## Wave-3 consumers already on the seam
 

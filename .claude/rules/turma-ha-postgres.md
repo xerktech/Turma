@@ -12,15 +12,16 @@ wave-2 children of epic XERK-775 (finish Option-3 active-active). **Read `docs/t
 first** (Postgres is designated the durable of-record) and `CLAUDE.md`'s stdlib-only + HA-off-is-
 byte-identical + no-work-on-the-beat invariants. This file is the operative rules for the client.
 
-## What this ticket landed, and what it deliberately did NOT
+## What XERK-776 landed, and what consumes it now
 
-- **Landed:** the Postgres v3 wire client (`PgConnection`), a bounded reusable-connection pool
-  (`PgPool`), the `createPgClient(haConfig)` factory, and the tests.
-- **NOT wired:** no `server.js` call site is flipped onto it. The ledger still lives in Valkey and the
-  archive index is still per-pod local SQLite (`POSTGRES_BACKEND_WIRED = false` in `ha-config.js`;
-  the boot line honestly says so). Moving the ledger of-record → `w2-ledger`; moving the archive index
-  → `w2-index`. **Do not flip `POSTGRES_BACKEND_WIRED` here** — that flag flips in the SAME change
-  that wires a real backend, or the boot line lies to the operator (the XERK-773 prod finding).
+- **Landed by XERK-776:** the Postgres v3 wire client (`PgConnection`), a bounded reusable-connection
+  pool (`PgPool`), the `createPgClient(haConfig)` factory, and the tests. That ticket wired NO consumer.
+- **CONSUMERS:** the archive INDEX of-record (`index-store.js`, XERK-780/w2-index) is wired onto this
+  pool — `INDEX_BACKEND_WIRED = true`, the boot line reads `index=postgres`. The usage ledger is NOT
+  yet (`LEDGER_BACKEND_WIRED = false` in `ha-config.js`, still Valkey — `w2-ledger`).
+- **The wired flag is GRANULAR, one per backend** (XERK-773 was a single conflated flag): flip each in
+  the SAME change that wires ITS backend, never ahead of it, or the boot line lies to the operator.
+  Mechanics of the archive-index consumer: `.claude/rules/turma-ha-archive.md`.
 
 ## stdlib-only, like store.js and blobstore.js
 
