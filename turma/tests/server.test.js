@@ -19824,3 +19824,125 @@ test("XERK-762: a store blip (publish rejects) never throws out of sseBroadcast"
   hub.sseClients.delete(fakeRes);
   hub.__setSseBus(null);
 });
+
+// ---- XERK-781: the cross-replica byte-stream relay CONSUMERS -----------------
+// The relay TRANSPORT is proven in tunnel-relay.test.js; these pin the server-side
+// WIRING: `openChannel` proxies a data channel to the tunnel owner, and the `/live`
+// bridge streams deltas both ways. HA is OFF in this module (no store URL), so the
+// relay binding is null by default and a fake one is injected via `__setRelay`.
+
+test("XERK-781: with no relay (single-process) openChannel is exactly the local path", async () => {
+  // relay is null here — openChannel must be byte-identical to openChannelLocal,
+  // which rejects when this process holds no control channel for the host.
+  await assert.rejects(() => hub.openChannel("xerk781-nobody", 7681), /agent tunnel offline/);
+});
+
+test("XERK-781: openChannel proxies a data channel to the tunnel owner via the relay", async () => {
+  const sentinel = { proxied: true };
+  let args = null;
+  hub.__setRelay({ connect: async (name, port) => { args = [name, port]; return sentinel; } });
+  try {
+    const d = await hub.openChannel("xerk781-remote", 7681);
+    assert.equal(d, sentinel, "the relay duplex is returned to the caller (/term, the asset pool)");
+    assert.deepEqual(args, ["xerk781-remote", 7681], "the owner + ttyd port are dialed");
+  } finally {
+    hub.__setRelay(null);
+  }
+});
+
+test("XERK-781: openChannel falls back to the local path when the relay declines (we own it / no owner)", async () => {
+  // relay.connect returns null => serve locally; with no control channel the local
+  // path rejects, exactly as single-process.
+  hub.__setRelay({ connect: async () => null });
+  try {
+    await assert.rejects(() => hub.openChannel("xerk781-nobody2", 7681), /agent tunnel offline/);
+  } finally {
+    hub.__setRelay(null);
+  }
+});
+
+test("XERK-781: openLiveForRelay (owner side) arms the tail, streams deltas, and disarms on close", async () => {
+  const host = "xerk781-livehost";
+  const watched = [];
+  const unwatched = [];
+  hub.controlChannels[host] = {
+    sendWatch: (id) => watched.push(id),
+    sendUnwatch: (id) => unwatched.push(id),
+    socket: {},
+  };
+  hub.agents[host] = { sessions: [{ id: "sX", worktreePath: "/w", transcriptId: "t1" }] };
+  try {
+    const d = await hub.openLiveForRelay(host, "sX");
+    assert.deepEqual(watched, ["sX"], "the first relay watcher arms the agent tail");
+
+    const got = new Promise((resolve) => d.once("data", (c) => resolve(c.toString("utf8"))));
+    hub.liveFanout(host, "sX", { type: "tail", entries: ["hi"] });
+    assert.equal((await got).trim(), JSON.stringify({ type: "tail", entries: ["hi"] }),
+      "a fanned delta streams into the duplex readable as newline-delimited JSON");
+
+    d.destroy();
+    await new Promise((resolve) => d.once("close", resolve));
+    assert.deepEqual(unwatched, ["sX"], "the last watcher leaving disarms the agent tail");
+  } finally {
+    delete hub.controlChannels[host];
+    delete hub.agents[host];
+  }
+});
+
+test("XERK-781: openLiveRelay (origin side) fans an owner's relayed deltas to the local subscribers", async () => {
+  const { Duplex } = require("node:stream");
+  const host = "xerk781-orig";
+  const sid = "sess-1";
+  const ownerSide = new Duplex({ read() {}, write(_c, _e, cb) { cb(); } });
+  let opts = null;
+  hub.__setRelay({ connect: async (_h, _p, o) => { opts = o; return ownerSide; } });
+
+  const frames = [];
+  const browser = { write: (buf) => frames.push(buf), destroy() {} };
+  // No control channel for this host => armLiveWatcher does not arm locally; the
+  // relay channel is what feeds the deltas.
+  hub.armLiveWatcher(host, sid, browser);
+  try {
+    await hub.openLiveRelay(host, sid);
+    assert.equal(opts.kind, "live", "a LIVE channel is opened");
+    assert.equal(opts.session, sid, "keyed by the session id");
+    ownerSide.push(Buffer.from(JSON.stringify({ type: "turn", text: "hi" }) + "\n"));
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(frames.length, 1, "the local browser subscriber got the relayed delta");
+  } finally {
+    hub.disarmLiveWatcher(host, sid, browser); // last subscriber -> destroys the relay channel
+    hub.__setRelay(null);
+  }
+});
+
+test("XERK-781: rearmOriginLiveRelays opens a relay channel for a waiting /live session when the owner appears", async () => {
+  const { Duplex } = require("node:stream");
+  const host = "xerk781-rearm";
+  const sid = "s1";
+  const owner = new Duplex({ read() {}, write(_c, _e, cb) { cb(); } });
+  let connects = 0;
+  hub.__setRelay({ connect: async () => { connects++; return owner; } });
+  const browser = { write() {}, destroy() {} };
+  // No control channel here => armLiveWatcher does not arm locally and no relay
+  // channel is opened yet (the host is offline everywhere at connect time).
+  hub.armLiveWatcher(host, sid, browser);
+  assert.equal(hub.liveRelayChannels[host]?.[sid], undefined, "no relay channel until an owner appears");
+  try {
+    hub.rearmOriginLiveRelays(host); // simulates the owner-appeared directory-watch edge
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(connects, 1, "the owner appearing opens the relay channel");
+    assert.ok(hub.liveRelayChannels[host]?.[sid], "the session is now backed by a relay channel");
+  } finally {
+    hub.disarmLiveWatcher(host, sid, browser);
+    hub.__setRelay(null);
+  }
+});
+
+test("XERK-781: dropOriginLiveRelays tears down relay channels when this replica becomes the owner", () => {
+  const host = "xerk781-drop";
+  let destroyed = false;
+  hub.liveRelayChannels[host] = { s1: { destroy() { destroyed = true; } } };
+  hub.dropOriginLiveRelays(host);
+  assert.equal(destroyed, true, "the redundant relay channel is destroyed");
+  assert.equal(hub.liveRelayChannels[host], undefined, "the host's relay-channel map is cleared");
+});

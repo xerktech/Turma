@@ -19,11 +19,9 @@ hub half of, and `.claude/rules/turma-ha-store.md` for the `LiveStore` seam it p
 
 - **LANDS: the shared host→owning-replica DIRECTORY + the CONTROL-plane fixes it enables.** Any
   replica can now tell the truth about a host's tunnel and deliver a poke to it, cross-replica.
-- **The duplex BYTE-STREAM relay TRANSPORT is now SHIPPED** (XERK-777, `turma/relay.js`) — the
-  transport PRIMITIVE only. `/term`, the `/live` deltas and the `openChannel` data channel are the
-  CONSUMERS, a follow-up (w2-relay-consumers): until they wire it, those bytes still serve from the
-  tunnel owner's replica (the Option-2 leader-only-serving behaviour), so nothing regresses. See "The
-  byte-stream relay transport" below.
+- **The duplex BYTE-STREAM relay TRANSPORT shipped** (XERK-777, `turma/relay.js`) and its CONSUMERS
+  are now WIRED (XERK-781): `/term`, the `/live` deltas and the `openChannel` data channel serve from
+  ANY replica cross-replica. See "The byte-stream relay transport" and "The consumers (XERK-781)".
 - **NEVER push raw terminal / `/live` / ttyd bytes through `store.publish`/`subscribe`.** Bulk
   interactive traffic there would ride the SAME single shared subscriber connection the SSE bus
   (XERK-762) and the registry watch (XERK-756) depend on — head-of-line blocking the fleet's LIVENESS
@@ -120,15 +118,75 @@ rule above. Rationale (recommended shape vs the rejected route-by-host-at-ingres
   with no consumer listener would crash the process — the `channelDuplex` rule).
 - **Liveness:** a ping/idle loop over the pod-to-pod hop (mirrors the control channel) tears down a
   half-open conn rather than reporting it live forever.
-- **Consumers are a follow-up (w2-relay-consumers).** server.js CONSTRUCTS the relay under HA (binding
-  `owners`/`ttlMs`/`localTunnel`/`openLocal`) but does NOT `start()` it or wire `dial`/a listener/
-  `endpoint` — so `connect`/`accept` are reachable by no client yet and no byte crosses replicas.
+- **Two channel KINDS on the handshake** (XERK-781): `kind:"data"` (default) bridges to `openLocal`
+  (ttyd bytes / the `openChannel` dial-back); `kind:"live"` bridges to `openLive(host,session)` (the
+  `/live` delta stream), keyed by a session id, not a ttyd port. A live channel to an owner with no
+  `openLive` dep hints `relay-error`.
+- **The pod-to-pod hop is AUTHENTICATED by a shared secret** (XERK-781, `authToken` dep): server.js
+  derives it from `SESSION_KEY` (`HMAC(SESSION_KEY,"turma-relay")`, identical across replicas by the
+  XERK-760 same-secret rule), `connect` puts it in the handshake, and `accept` refuses a mismatched
+  token with an `unauthorized` hint + close — so a stray in-cluster peer that reaches the listener
+  cannot open a terminal/`/live`. Absent token (tests / an un-secreted hub) → no check.
+
+## The consumers (XERK-781, `turma/server.js`)
+
+server.js CONSTRUCTS the relay under HA and now WIRES the transport + all three consumers.
+
+- **The pod-to-pod transport**: a dedicated `net` TCP listener on `RELAY_PORT` (`TURMA_RELAY_PORT`,
+  default 8390) hands each inbound socket to `relay.accept`; `relayDial(replica, addr)` opens a raw
+  socket to a peer's listener; `endpoint` = `relayEndpointAddr()` = `TURMA_RELAY_ENDPOINT` ?? `POD_IP`
+  (k8s downward API) `:RELAY_PORT` ?? first non-internal IPv4. A null endpoint is logged, not fatal —
+  the replica can still ORIGIN-dial peers, but peers can't dial ITS owned tunnels (the ArgoCD manifest
+  must inject `POD_IP` + expose the port pod-to-pod, and gate it with a NetworkPolicy). `relay.start()`
+  publishes the endpoint + watches/hydrates peer endpoints; the listener + `relay.stop()` tear down on
+  graceful drain.
+  - **The endpoint re-publishes on the store health→ready EDGE, not only the `ttlMs/3` refresh timer**
+    (XERK-781 QA). The boot publish races the not-yet-connected `SharedLiveStore` socket (rejects), so
+    without it a freshly-booted/promoted owner is un-dialable by peers for up to ~30s (a peer resolving
+    a null endpoint 502s `/term`, seeds `/live` from cache). The XERK-758 ledger pattern —
+    `store.onHealth("ready")` + a publish after `await store.ready()`.
+- **`openChannel(name, port)` is the DATA consumer + the owner-side bridge split** (the third ticket
+  bullet — the dial-back "pairs only on the issuing replica" bug). `openChannelLocal` is the original
+  pending-channel dance (agent dials `/agent/data` back to the replica that holds the control channel,
+  where `pendingChannels` lives). The relay-aware `openChannel` wrapper: if another replica owns the
+  tunnel, `relay.connect(name, port)` proxies the bytes to that owner, which runs `openChannelLocal`
+  itself so the dial-back pairs THERE; `connect` returns null when THIS replica should serve locally
+  (it owns the tunnel, or no fresh remote owner) and rejects on dial/replica-loss so `/term` 502s and
+  the asset-pool Agent opens a fresh socket. `openLocal` is bound to `openChannelLocal` (never the
+  wrapper) so the owner side never re-enters the relay. `/term` (WS + `proxyTerm` assets) use the
+  wrapper, so both cross replicas with no change of their own.
+- **`/live` is the LIVE consumer, modelled as a pseudo-subscriber** so the existing arm/unwatch +
+  reconnect-re-arm logic drives it with no special case. `armLiveWatcher`/`disarmLiveWatcher` are the
+  shared add/remove (browser socket OR relay pseudo-sub) — first watcher arms the agent tail (when we
+  own the tunnel), last unwatches. `sendLive` is polymorphic: a browser WS gets a text frame, a relay
+  pseudo-sub (`_relayLive`) gets `push(JSON+"\n")`.
+  - ORIGIN (`openLiveRelay`, on the first local subscriber when we DON'T own the tunnel): `relay.connect
+    (host, 0, {kind:"live", session})` → a duplex whose readable is newline-delimited JSON deltas, split
+    by `makeLiveLineReader` and `liveFanout`ed to the local browser subscribers. One relay channel per
+    (host, session) in `liveRelayChannels`, torn down when the last local subscriber leaves.
+  - OWNER (`openLiveForRelay`): returns a `_relayLive` Duplex, registers it as a pseudo-subscriber via
+    `armLiveWatcher` (so a control-reconnect re-arms it like any watcher), and `liveFanout` pushes the
+    deltas into its readable → the relay pipes them to the origin. Closing it `disarmLiveWatcher`s.
+  - **On owner handoff / tunnel drop / relay loss (a hint or unexpected close), the ORIGIN closes the
+    local browser subscribers** so the client reconnects to `/live` and re-resolves the (possibly new)
+    owner — the ticket's "close the client stream with a reconnect hint, no hung sockets". This is a
+    DIFFERENT event from XERK-252's local-tunnel-flap hold-in-place (same owner heals) — a cross-replica
+    teardown may mean the owner CHANGED, so reconnect-to-re-resolve is correct.
+  - **The origin RE-ARMS when the owner appears** (`rearmOriginLiveRelays`, on the tunnel-directory
+    watch's owner-appeared edge) — the cross-replica twin of the single-process control-reconnect
+    re-arm: a /live socket opened while the host was offline EVERYWHERE, then connecting to ANOTHER
+    replica, would otherwise never get a channel. When THIS replica becomes the owner,
+    `dropOriginLiveRelays` tears down the now-redundant origin channels (the local watch serves).
+- **The agent is UNCHANGED** — the relay is hub-to-hub only; the owner runs the same `sendOpen`/
+  `pendingChannels`/`sendWatch` dance and the agent dials `/agent/data` / tails as always. No
+  `agent-tunnel.md` framing note is needed.
 
 ## Non-HA is byte-identical (the load-bearing invariant)
 
 - With HA off, `hostTunnelOwners` stays empty and `controlBus`/`sseBus`/`relay` null: `publishHostTunnel`/
-  `retireHostTunnel` early-return, `terminalOnline` is purely `controlChannels`, and `pokeHost` never
-  leaves the process. Everything gates on `HA_ON` at its entry, exactly like the registry watch.
+  `retireHostTunnel` early-return, `terminalOnline` is purely `controlChannels`, `pokeHost` never
+  leaves the process, and `openChannel` is exactly `openChannelLocal` (no relay listener bound, no
+  `/live` relay channel). Everything gates on `HA_ON`/`relay` at its entry, like the registry watch.
 
 ## Tests
 
@@ -145,4 +203,10 @@ rule above. Rationale (recommended shape vs the rejected route-by-host-at-ingres
   hung socket; a broken mid-stream conn EOFing the origin; large-payload framing + backpressure
   integrity; the framing codec (split chunks, overflow → dead); the handshake timeout; and the
   endpoint directory (publish/watch-mirror/hydrate/retire + `connect` resolving the peer addr).
+- `turma/tests/tunnel-relay.test.js` (XERK-781): the `kind:"live"` bridge end-to-end (owner deltas →
+  origin), a live channel to an owner with no `openLive` (relay-error hint), and the auth token
+  (mismatch → unauthorized hint + no bridge; match → bytes through).
+- `turma/tests/server.test.js` (XERK-781): `openChannel` byte-identical with no relay; it proxies to a
+  remote owner via an injected relay and falls back to local when the relay declines; `openLiveForRelay`
+  arms/streams/disarms (owner side); `openLiveRelay` fans a relayed delta to a local subscriber (origin).
 - `turma/tests/server.test.js` (HA off) is the non-HA byte-identity guard and must stay green.

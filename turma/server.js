@@ -22,6 +22,7 @@
 // WebSocket; the hub hand-rolls the WebSocket *server* framing with `crypto`).
 
 const http = require("http");
+const net = require("net");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -4185,10 +4186,59 @@ let controlBus = null; // { publish(msg) } in HA mode; null single-process.
 // The cross-replica byte-stream relay TRANSPORT (XERK-777): a dedicated pod-to-pod
 // duplex, NOT the store's pub/sub (bulk terminal bytes there would head-of-line-
 // block the SSE/registry liveness channel — `.claude/rules/turma-ha-tunnel.md`).
-// Constructed under HA with the routing deps that already live here; the pod-to-pod
-// `dial`/listener + `endpoint` and the `/term`/`/live`/`openChannel` CONSUMERS are
-// the follow-up (w2-relay-consumers). Null single-process — byte-identical HA-off.
+// Constructed + STARTED under HA (XERK-781) with the routing deps that live here
+// (owner directory, `controlChannels` ownership check, `openChannelLocal` data
+// bridge, `openLiveForRelay` live bridge) plus a pod-to-pod TCP `dial`/listener and
+// this replica's `endpoint`; the `/term`, `/live` and `openChannel` consumers reach
+// it through `openChannel`/`openLiveRelay`. Null single-process — byte-identical.
 let relay = null; // { connect, accept, start, stop } in HA mode; null single-process.
+let relayServer = null; // the pod-to-pod TCP listener (HA); null single-process.
+
+// The pod-to-pod relay listen port and this replica's dialable address. A peer
+// resolves the address from the endpoint directory the relay publishes, so it must
+// be reachable pod-to-pod: k8s injects the pod IP via the downward API (`POD_IP`),
+// and `TURMA_RELAY_ENDPOINT` is the explicit override. With neither we fall back to
+// the first non-internal IPv4 (dev/compose). A null address means peers cannot dial
+// THIS replica (its owned tunnels won't serve cross-replica) — logged, not fatal;
+// it can still ORIGIN-dial peers whose endpoints it knows.
+const RELAY_PORT = positiveEnv("TURMA_RELAY_PORT", 8390);
+function relayEndpointAddr() {
+  if (process.env.TURMA_RELAY_ENDPOINT) return process.env.TURMA_RELAY_ENDPOINT;
+  const ip = process.env.POD_IP;
+  if (ip) return `${ip}:${RELAY_PORT}`;
+  for (const ifaces of Object.values(os.networkInterfaces())) {
+    for (const i of ifaces || []) {
+      if (i.family === "IPv4" && !i.internal) return `${i.address}:${RELAY_PORT}`;
+    }
+  }
+  return null;
+}
+// Split "host:port" (host may be an IPv6 literal in [..]); returns {host, port}.
+function splitRelayAddr(addr) {
+  const i = String(addr).lastIndexOf(":");
+  if (i < 0) return null;
+  let host = addr.slice(0, i);
+  const port = Number(addr.slice(i + 1));
+  if (!port) return null;
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
+  return { host, port };
+}
+// Dial a peer replica's relay listener; resolve the raw byte socket. Rejects on
+// connect failure so `relay.connect` surfaces a replica-loss cleanly (never hangs).
+function relayDial(_replica, addr) {
+  return new Promise((resolve, reject) => {
+    const a = splitRelayAddr(addr);
+    if (!a) return reject(new Error(`no dialable relay endpoint (${addr})`));
+    const sock = net.connect({ host: a.host, port: a.port });
+    const onErr = (e) => { sock.destroy(); reject(e); };
+    sock.once("error", onErr);
+    sock.once("connect", () => { sock.removeListener("error", onErr); resolve(sock); });
+  });
+}
+// A shared secret every replica holds (derived from the same SESSION_KEY, which
+// XERK-760 requires identical across replicas), so the relay listener can turn
+// away a channel from a stray in-cluster peer. Stable across a replica's life.
+const RELAY_AUTH_TOKEN = crypto.createHmac("sha256", SESSION_KEY).update("turma-relay").digest("base64url");
 
 // Write one SSE frame to every open /api/events stream ON THIS PROCESS
 // (best-effort; a dead stream is dropped on its next failed write and by its
@@ -4411,7 +4461,13 @@ function watchTunnelDirectory() {
     const v = ev.value;
     // The bus is shared infrastructure — never trust the shape.
     if (!v || typeof v !== "object" || typeof v.replica !== "string" || typeof v.at !== "number") return;
+    const appeared = !hostTunnelOwners[host];
     hostTunnelOwners[host] = { replica: v.replica, at: v.at };
+    // A remote owner just came online — re-arm any /live sockets on THIS replica
+    // that were waiting for it (XERK-781). Only on the appear edge (not every
+    // refresh); openLiveRelay is idempotent + bails when it isn't a fresh remote
+    // owner or we already hold a channel, so this is cheap.
+    if (appeared && v.replica !== SSE_REPLICA_ID) rearmOriginLiveRelays(host);
   });
 }
 
@@ -13200,7 +13256,11 @@ function channelDuplex(socket) {
 // local ttyd `port`; resolves with its Duplex once the agent connects (or
 // rejects if the tunnel is offline / slow). One control channel per host fans
 // out to per-session ttyds by port.
-function openChannel(name, port) {
+// The LOCAL dial-back: this replica holds `name`'s control channel, so it asks
+// the agent to dial `/agent/data?ch=<ch>` back to THIS replica, where the pending
+// channel lives (XERK-268 pairs the answer against the host it was opened for).
+// This is the whole story single-process, and the OWNER side of the relay bridge.
+function openChannelLocal(name, port) {
   return new Promise((resolve, reject) => {
     const cc = controlChannels[name];
     if (!cc) return reject(new Error("agent tunnel offline"));
@@ -13222,6 +13282,23 @@ function openChannel(name, port) {
     };
     cc.sendOpen(ch, port);
   });
+}
+
+// Open a data channel to `name`'s ttyd `port`, wherever the tunnel actually is.
+// Single-process (relay null) this is exactly `openChannelLocal`. Under HA, if
+// ANOTHER replica owns the control channel (XERK-764 directory), the dial-back
+// would never pair here (it pairs on the OWNER, where the control channel and the
+// `pendingChannels` entry live) — so we proxy the bytes over the cross-replica
+// relay to that owner, which runs `openChannelLocal` itself and bridges its ttyd
+// duplex back (XERK-781). `relay.connect` returns null when THIS replica should
+// serve locally (it holds the tunnel, or there is no fresh remote owner), and
+// rejects on a dial/replica-loss so the caller (a 502 for /term, a fresh Agent
+// socket for the asset pool) surfaces it rather than hanging.
+function openChannel(name, port) {
+  if (relay) {
+    return relay.connect(name, port).then((remote) => remote || openChannelLocal(name, port));
+  }
+  return openChannelLocal(name, port);
 }
 
 // ---- live transcript relay --------------------------------------------------
@@ -13271,20 +13348,186 @@ function rearmMovedWatches(host, prev, next) {
   }
 }
 
-// Send one JSON text frame to a single live subscriber socket (best-effort).
+// Send one delta to a single live subscriber (best-effort). A subscriber is
+// either a BROWSER WebSocket (a text frame) or, under HA, a cross-replica RELAY
+// pseudo-subscriber whose readable side carries newline-delimited JSON to the
+// origin replica's browser sockets (XERK-781, `openLiveForRelay`). The two share
+// the `liveClients` set + the watch arm/disarm logic; only the write differs.
 function sendLive(socket, obj) {
   try {
-    socket.write(wsEncode(0x1, JSON.stringify(obj)));
+    if (socket._relayLive) socket.push(Buffer.from(JSON.stringify(obj) + "\n"));
+    else socket.write(wsEncode(0x1, JSON.stringify(obj)));
   } catch {
     /* socket already gone; cleanup runs on its close/error */
   }
 }
 
-// Fan a delta out to every socket watching (host, sessionId).
+// Fan a delta out to every subscriber watching (host, sessionId) — browser
+// sockets AND relay pseudo-subscribers alike.
 function liveFanout(host, sessionId, obj) {
   const set = liveClients[host]?.[sessionId];
   if (!set) return;
   for (const socket of set) sendLive(socket, obj);
+}
+
+// Add `socket` (a browser WS or a relay pseudo-subscriber) to the watchers of
+// (host, sessionId); arm the agent's live tail on the FIRST watcher (when this
+// replica holds the control channel). Returns whether it was the first — the
+// caller opens the cross-replica relay channel when it is first AND does not own
+// the tunnel. Shared by the /live upgrade handler and `openLiveForRelay`, so a
+// relay sink and a browser subscriber count toward the same one-watch-per-session.
+function armLiveWatcher(host, sessionId, socket) {
+  const byHost = (liveClients[host] = liveClients[host] || {});
+  const set = (byHost[sessionId] = byHost[sessionId] || new Set());
+  const first = set.size === 0;
+  set.add(socket);
+  if (first) {
+    const target = watchTargetFor(host, sessionId);
+    if (target && controlChannels[host]) controlChannels[host].sendWatch(sessionId, target);
+  }
+  return first;
+}
+
+// Remove `socket` from the watchers of (host, sessionId); on the LAST watcher
+// leaving, tell the agent to stop tailing (owner replica) and tear down the
+// origin's relay channel if one backs this session. Idempotent.
+function disarmLiveWatcher(host, sessionId, socket) {
+  const s = liveClients[host]?.[sessionId];
+  if (!s) return;
+  s.delete(socket);
+  if (s.size > 0) return;
+  delete liveClients[host][sessionId];
+  if (controlChannels[host]) controlChannels[host].sendUnwatch(sessionId);
+  // Origin side: no more local subscribers, so drop the relay channel feeding
+  // them (which makes the owner unwatch in turn). No-op on the owner replica,
+  // which holds no relay channels for its own tunnels.
+  const rc = liveRelayChannels[host]?.[sessionId];
+  if (rc) { try { rc.destroy(); } catch { /* already gone */ } }
+  if (Object.keys(liveClients[host]).length === 0) delete liveClients[host];
+}
+
+// ---- cross-replica /live relay (XERK-781) -----------------------------------
+// Under HA a /live socket can land on a replica that does NOT own the host's
+// tunnel. `liveRelayChannels[host][sessionId]` is the ORIGIN-side relay duplex to
+// the owning replica; its readable carries newline-delimited JSON deltas, which
+// we fan to the local browser subscribers via `liveFanout`.
+const liveRelayChannels = {};
+
+// A line-buffered JSON reader over a relay duplex's raw DATA bytes: the owner
+// pushes one `JSON.stringify(delta) + "\n"` per delta, but the pod-to-pod hop may
+// coalesce them, so we split on the (never-embedded) newline. Bounded so a peer
+// cannot grow the buffer without a delimiter (WS_FRAME_MAX is the same class of
+// ceiling the ingest path applies).
+function makeLiveLineReader(onDelta) {
+  let buf = "";
+  return (chunk) => {
+    buf += chunk.toString("utf8");
+    if (buf.length > WS_FRAME_MAX) { buf = ""; return; } // runaway line — drop
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      let obj; try { obj = JSON.parse(line); } catch { continue; }
+      onDelta(obj);
+    }
+  };
+}
+
+// ORIGIN: open a relay LIVE channel to `host`'s owning replica for `sessionId`,
+// fanning the deltas it streams back to the local browser subscribers. Called for
+// the FIRST local subscriber when this replica does not hold the control channel.
+// On owner handoff / tunnel drop / relay loss (a hint or an unexpected close), the
+// local subscribers are closed so the client reconnects and re-resolves the (now
+// possibly different) owner — the ticket's "close the client stream with a
+// reconnect hint, no hung sockets". Best-effort: a dial failure / no-owner leaves
+// the client on its cached seed (it retries), exactly as an offline owner does.
+async function openLiveRelay(host, sessionId) {
+  if (!relay) return;
+  if (liveRelayChannels[host]?.[sessionId]) return; // already backed
+  let d;
+  try {
+    d = await relay.connect(host, 0, { kind: "live", session: sessionId });
+  } catch {
+    return; // dial / replica loss — client keeps its cache seed and reconnects
+  }
+  if (!d) return; // no fresh remote owner — offline; cache seed only
+  // A concurrent first-subscriber race may have opened one meanwhile.
+  if (liveRelayChannels[host]?.[sessionId]) { try { d.destroy(); } catch {} return; }
+  (liveRelayChannels[host] = liveRelayChannels[host] || {})[sessionId] = d;
+  d.on("data", makeLiveLineReader((obj) => liveFanout(host, sessionId, obj)));
+  const teardown = (reconnect) => {
+    if (liveRelayChannels[host]?.[sessionId] === d) {
+      delete liveRelayChannels[host][sessionId];
+      if (Object.keys(liveRelayChannels[host]).length === 0) delete liveRelayChannels[host];
+    }
+    // The owner is gone/handed off while subscribers remain: close them so the
+    // client reconnects to /live and re-resolves the owner. (When the LAST
+    // subscriber left, disarmLiveWatcher destroyed us and there is nobody to close.)
+    if (reconnect) closeLiveSubscribers(host, sessionId);
+  };
+  // A hint (not-owner / tunnel-down / unauthorized) is a teardown signal; the
+  // duplex fully closes a tick later, but act on the hint now.
+  d.on("hint", () => teardown(true));
+  d.on("close", () => teardown(true));
+}
+
+// Close every browser subscriber for (host, sessionId) so the client reconnects.
+function closeLiveSubscribers(host, sessionId) {
+  const set = liveClients[host]?.[sessionId];
+  if (!set) return;
+  for (const sock of [...set]) { try { sock.destroy(); } catch { /* gone */ } }
+}
+
+// ORIGIN re-arm: a remote owner just APPEARED for `host` (its directory entry
+// arrived on the tunnel-directory watch). Open a relay channel for any of this
+// replica's /live sessions on that host that has waiting subscribers but no
+// backing channel yet — the cross-replica twin of the single-process
+// control-reconnect re-arm (`/agent/control`). Without it a /live socket opened
+// while the host was offline everywhere never gets deltas once the host connects
+// to ANOTHER replica (XERK-781 QA finding). No-op if we own the tunnel (the local
+// watch already serves) or there is no fresh remote owner (openLiveRelay bails).
+function rearmOriginLiveRelays(host) {
+  if (!relay || controlChannels[host]) return;
+  const sessions = liveClients[host];
+  if (!sessions) return;
+  for (const sessionId of Object.keys(sessions)) {
+    if (!sessions[sessionId] || sessions[sessionId].size === 0) continue;
+    if (liveRelayChannels[host]?.[sessionId]) continue; // already backed
+    openLiveRelay(host, sessionId);
+  }
+}
+
+// This replica just BECAME the owner of `host`'s tunnel (its control channel
+// connected here). Any origin relay channels we held for it are now redundant —
+// the local watch (re-armed by the /agent/control handler) serves the deltas — so
+// drop them to avoid a double feed. Best-effort.
+function dropOriginLiveRelays(host) {
+  const byHost = liveRelayChannels[host];
+  if (!byHost) return;
+  for (const sessionId of Object.keys(byHost)) {
+    try { byHost[sessionId].destroy(); } catch { /* gone */ }
+  }
+  delete liveRelayChannels[host];
+}
+
+// OWNER: the relay's bridge for an inbound LIVE channel. Returns a Duplex whose
+// READABLE side carries this session's deltas (the relay pipes them to the origin)
+// and whose writable side is drained (the origin sends nothing but a close). It
+// registers as a pseudo-subscriber in `liveClients` so the EXISTING arm/unwatch +
+// reconnect re-arm logic drives the agent tail with no special case; on close it
+// disarms like any subscriber.
+function openLiveForRelay(host, sessionId) {
+  const d = new Duplex({
+    read() {},
+    write(_chunk, _enc, cb) { cb(); }, // origin sends no payload on a live channel
+    final(cb) { cb(); },
+    destroy(err, cb) { cb(err); },
+  });
+  d._relayLive = true;
+  armLiveWatcher(host, sessionId, d);
+  d.once("close", () => disarmLiveWatcher(host, sessionId, d));
+  return Promise.resolve(d);
 }
 
 // ---- terminal proxy ---------------------------------------------------------
@@ -17009,6 +17252,10 @@ server.on("upgrade", async (req, socket, head) => {
       const target = watchTargetFor(name, sessionId);
       if (target) controlChannels[name].sendWatch(sessionId, target);
     }
+    // We are now the OWNER — the local watch above serves this host's /live
+    // subscribers, so drop any origin relay channels we held for it (redundant,
+    // would double-feed). No-op with HA off (XERK-781).
+    dropOriginLiveRelays(name);
     // Liveness, in both directions — the channel is proven, never assumed.
     //
     // The protocol ping (0x9) beats Cloudflare's idle timeout and is what every
@@ -17143,10 +17390,9 @@ server.on("upgrade", async (req, socket, head) => {
     }
     wsHandshake(socket, req);
 
-    const byHost = (liveClients[host] = liveClients[host] || {});
-    const set = (byHost[sessionId] = byHost[sessionId] || new Set());
-    const first = set.size === 0;
-    set.add(socket);
+    // Register as a watcher (arms the agent tail on the first, when THIS replica
+    // owns the control channel). Shared with the relay pseudo-subscriber path.
+    const first = armLiveWatcher(host, sessionId, socket);
 
     // Immediately seed the client with the most recent tail we already have
     // (from the last heartbeat) so it isn't blank until the first live delta.
@@ -17155,10 +17401,12 @@ server.on("upgrade", async (req, socket, head) => {
       sendLive(socket, { type: "tail", entries: cachedTail });
     }
 
-    // First watcher for this session -> ask the agent to start tailing it.
-    if (first) {
-      const target = watchTargetFor(host, sessionId);
-      if (target && controlChannels[host]) controlChannels[host].sendWatch(sessionId, target);
+    // First watcher, but this replica does NOT hold the tunnel: under HA another
+    // replica owns it, so proxy a live channel to that owner over the relay
+    // (XERK-781). armLiveWatcher already armed the tail if we DO own it; with no
+    // owner anywhere the client rides its cached seed until the tunnel returns.
+    if (first && !controlChannels[host] && relay) {
+      openLiveRelay(host, sessionId);
     }
 
     const ping = setInterval(() => {
@@ -17176,18 +17424,11 @@ server.on("upgrade", async (req, socket, head) => {
     socket.on("data", parse);
 
     // Safe to run more than once: after the first pass the subscriber is gone,
-    // so the guard below returns early (no double unwatch).
+    // so disarmLiveWatcher returns early (no double unwatch). It also tears down
+    // the relay channel backing this session when the last local subscriber goes.
     const cleanup = () => {
       clearInterval(ping);
-      const s = liveClients[host]?.[sessionId];
-      if (!s) return;
-      s.delete(socket);
-      if (s.size > 0) return;
-      delete liveClients[host][sessionId];
-      // Last watcher gone -> tell the agent to stop tailing (frees the ~1s
-      // file-tail loop when nobody's looking).
-      if (controlChannels[host]) controlChannels[host].sendUnwatch(sessionId);
-      if (Object.keys(liveClients[host]).length === 0) delete liveClients[host];
+      disarmLiveWatcher(host, sessionId, socket);
     };
     // A graceful WS close arrives as a 0x8 frame (handled above -> socket.end
     // -> "close"), but a client that half-closes the TCP side (or the SDK
@@ -17865,6 +18106,14 @@ if (process.env.TURMA_TEST) {
     // against turma/relay.js directly; exposed here as the seam consumers reach.
     get relay() { return relay; },
     __setRelay(v) { relay = v; },
+    // XERK-781: the relay CONSUMERS. `openChannel` is relay-aware (proxies a data
+    // channel to the tunnel owner); `openChannelLocal`/`openLiveForRelay` are the
+    // OWNER-side bridges; `liveFanout`/`liveClients`/`liveRelayChannels` +
+    // `armLiveWatcher`/`disarmLiveWatcher` are the `/live` machinery. Exported so a
+    // test can drive the cross-replica paths with an injected relay (`__setRelay`).
+    openChannel, openChannelLocal, openLiveForRelay, openLiveRelay,
+    liveFanout, liveClients, liveRelayChannels, armLiveWatcher, disarmLiveWatcher,
+    rearmOriginLiveRelays, dropOriginLiveRelays, RELAY_AUTH_TOKEN,
     siteKeyOf,
     orgPeers,
     boundOrgOf,
@@ -18018,20 +18267,37 @@ if (process.env.TURMA_TEST) {
       console.error(`HA tunnel-directory hydrate failed: ${(e && e.message) || e}`));
     controlBus = makeControlBus(liveStore, SSE_REPLICA_ID);
     console.log(`control bus: shared (replica ${SSE_REPLICA_ID})`);
-    // XERK-777: the byte-stream relay transport. Construct it with the routing deps
-    // that already live here — the owner directory (XERK-764), the ownership check
-    // (`controlChannels`), and the local tunnel bridge (`openChannel`) — so a
-    // consumer only has to supply the pod-to-pod `dial`/listener + this replica's
-    // `endpoint` and call `start()`. Deliberately NOT started here: the `/term`,
-    // `/live` and `openChannel` consumers own that wiring (w2-relay-consumers), so
-    // until then no byte crosses replicas and terminals serve from the owner only —
-    // exactly the Option-2 behaviour, nothing regresses. Bytes NEVER ride the store.
+    // XERK-777/781: the byte-stream relay transport, now WIRED to its consumers.
+    // The origin (the replica a terminal/`/live` request landed on) dials the owning
+    // replica's listener; the owner bridges to its local `openChannelLocal` (ttyd /
+    // the openChannel dial-back) or `openLiveForRelay` (the `/live` delta stream) and
+    // pipes both ways. Bytes NEVER ride the store — a dedicated pod-to-pod TCP hop —
+    // so bulk terminal traffic can't head-of-line-block the liveness channel.
     relay = makeRelay(liveStore, SSE_REPLICA_ID, {
       owners: hostTunnelOwners,
       ttlMs: HOST_REPLICA_TTL_MS,
       localTunnel: (host) => !!controlChannels[host],
-      openLocal: openChannel,
+      openLocal: openChannelLocal, // the DATA bridge (owner side), never the relay-aware wrapper
+      openLive: openLiveForRelay, // the LIVE delta bridge (owner side)
+      dial: relayDial,
+      endpoint: relayEndpointAddr(),
+      authToken: RELAY_AUTH_TOKEN,
     });
+    // The pod-to-pod listener: each inbound socket is an origin replica's dial —
+    // hand it to accept(), which reads the handshake, verifies auth + ownership,
+    // and bridges. Bound on all interfaces so peer pods reach it.
+    relayServer = net.createServer((sock) => {
+      sock.on("error", () => {}); // frameConn owns teardown; swallow a raw socket error
+      relay.accept(sock);
+    });
+    relayServer.on("error", (e) => console.error(`relay listener error: ${(e && e.message) || e}`));
+    relayServer.listen(RELAY_PORT, "0.0.0.0", () => {
+      const ep = relayEndpointAddr();
+      console.log(`relay listener on :${RELAY_PORT} (endpoint ${ep || "UNRESOLVED — peers cannot dial this replica"})`);
+    });
+    // Publish this replica's endpoint + watch/hydrate peer endpoints so an origin
+    // can resolve an owner's dial address. Best-effort; never fatal.
+    relay.start().catch((e) => console.error(`relay start failed: ${(e && e.message) || e}`));
     // Reclaim mirror entries a crashed owner never retired: on the Valkey backend a
     // TTL expiry fires no watch event, so a periodic sweep frees them (XERK-764).
     const dirSweep = setInterval(sweepTunnelDirectory, HOST_REPLICA_TTL_MS);
@@ -18159,6 +18425,16 @@ if (process.env.TURMA_TEST) {
       for (const host of Object.keys(liveClients)) {
         for (const sid of Object.keys(liveClients[host] || {})) {
           for (const sock of liveClients[host][sid] || []) { try { sock.destroy(); } catch {} }
+        }
+      }
+      // XERK-781: stop accepting pod-to-pod relay dials, retire this replica's
+      // endpoint from the directory, and drop any live-relay channels. A client
+      // whose bytes were proxying through us reconnects and re-resolves the owner.
+      try { relayServer?.close(); } catch {}
+      try { relay?.stop(); } catch {}
+      for (const host of Object.keys(liveRelayChannels)) {
+        for (const sid of Object.keys(liveRelayChannels[host] || {})) {
+          try { liveRelayChannels[host][sid].destroy(); } catch {}
         }
       }
       // Flush every durable store. state.json is synchronous (nothing else runs

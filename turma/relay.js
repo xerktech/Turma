@@ -41,6 +41,17 @@
 "use strict";
 
 const { Duplex } = require("stream");
+const crypto = require("crypto");
+
+// Constant-time compare of two short shared secrets (the pod-to-pod relay auth
+// token). Length-mismatched or non-string inputs are unequal; never throws.
+function tokenEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ba.length !== bb.length) return false;
+  try { return crypto.timingSafeEqual(ba, bb); } catch { return false; }
+}
 
 // The endpoint directory: replica id -> {addr, at} in the shared store, so the
 // ORIGIN can turn "owner is replica B" (from `hostTunnelOwners`) into a dialable
@@ -205,6 +216,13 @@ function frameConn(conn, { max, onCtrl, label }) {
   conn.on("close", () => { endRead(); if (!d.destroyed) d.destroy(); });
   conn.on("error", () => { if (!d.destroyed) d.destroy(); });
 
+  // Socket-ish no-ops so an ORIGIN can drive this duplex as an `http.Agent`
+  // connection — server.js's `proxyTerm` asset pool calls setNoDelay/keepAlive/
+  // timeout/ref/unref on it, exactly as it does the local `channelDuplex`. Harmless
+  // on the owner-bridge use (never called there).
+  d.setNoDelay = d.setKeepAlive = d.setTimeout = () => d;
+  d.ref = d.unref = () => d;
+
   d._relayConn = conn;
   return d;
 }
@@ -259,11 +277,21 @@ function attachLiveness(d, { pingMs, deadMs, now }) {
 //   localTunnel  (host) => truthy iff THIS replica holds host's control channel
 //                (server.js `!!controlChannels[host]`) — the ownership check
 //   openLocal    (host, port) => Promise<Duplex> bridged to the local agent tunnel
-//                (server.js `openChannel`); ONLY used on the accept/owner side
+//                (server.js `openChannelLocal`); the DATA-channel bridge (ttyd / the
+//                `openChannel` dial-back), ONLY used on the accept/owner side
+//   openLive     (host, session) => Promise<Duplex> whose READABLE side carries the
+//                session's newline-delimited `/live` JSON deltas (server.js
+//                `openLiveForRelay`); the LIVE-channel bridge, owner side only. A
+//                `kind:"live"` handshake routes here instead of `openLocal`.
 //   dial         (replica, addr) => Promise<Duplex> raw pod-to-pod byte channel
 //                (prod: connect to the peer's relay listener; tests: a loopback pair)
 //   endpoint     this replica's own dialable address, published to the directory so
 //                a peer's `dial` can resolve it (optional; the listener is boot scope)
+//   authToken    a shared secret every replica holds (server.js derives it from
+//                TURMA_SESSION_SECRET); when set, `connect` puts it in the handshake
+//                and `accept` refuses a channel whose token does not match — so a
+//                stray in-cluster peer cannot open a terminal/`/live` through the
+//                listener. Absent (tests / an un-secreted hub) => no auth check.
 //   frameMax/pingMs/deadMs/handshakeMs/now  tunables (tests wind them down)
 function makeRelay(store, replicaId, deps = {}) {
   const {
@@ -271,8 +299,10 @@ function makeRelay(store, replicaId, deps = {}) {
     ttlMs = DEFAULT_DEAD_MS,
     localTunnel = () => false,
     openLocal,
+    openLive,
     dial,
     endpoint = null,
+    authToken = null,
     frameMax = DEFAULT_FRAME_MAX,
     pingMs = DEFAULT_PING_MS,
     deadMs = DEFAULT_DEAD_MS,
@@ -288,6 +318,7 @@ function makeRelay(store, replicaId, deps = {}) {
   const endpoints = Object.create(null);
   let refreshTimer = null;
   let unwatch = null;
+  let unhealth = null;
 
   function storeFailed(e) {
     // Best-effort like every other store write here (XERK-235): an uncaught throw
@@ -317,7 +348,12 @@ function makeRelay(store, replicaId, deps = {}) {
   // null when there is no fresh REMOTE owner (the caller then uses its own local
   // path — `openChannel` when it holds the tunnel, or reports offline). Rejects on
   // a dial/handshake failure so the caller can surface it, never hangs.
-  async function connect(host, port) {
+  //
+  // `opts.kind` selects the owner-side bridge: "data" (default) → `openLocal`
+  // (ttyd bytes / the `openChannel` dial-back), "live" → `openLive` (the `/live`
+  // delta stream, keyed by `opts.session` instead of a ttyd port).
+  async function connect(host, port, opts = {}) {
+    const kind = opts.kind === "live" ? "live" : "data";
     const target = remoteOwner(host);
     if (!target) return null;
     const addr = endpointAddr(target); // may be null; a DNS-based `dial` ignores it
@@ -329,9 +365,11 @@ function makeRelay(store, replicaId, deps = {}) {
       throw new Error(`relay dial to ${target} failed: ${(e && e.message) || e}`);
     }
     const d = frameConn(conn, { max: frameMax, label: `relay->${host}` });
-    // The handshake NAMES the host (and its ttyd port) so the owner bridges the
-    // right tunnel and can refuse if it no longer holds it.
-    d.sendCtrl({ t: "open", host, port });
+    // The handshake NAMES the host (+ ttyd port for data, session for live) so the
+    // owner bridges the right tunnel and can refuse if it no longer holds it. It
+    // also carries `auth` when a shared token is configured, so the owner can turn
+    // away a channel from an unauthenticated in-cluster peer.
+    d.sendCtrl({ t: "open", host, port, kind, session: opts.session, auth: authToken || undefined });
     attachLiveness(d, { pingMs, deadMs, now });
     return d;
   }
@@ -354,19 +392,31 @@ function makeRelay(store, replicaId, deps = {}) {
         clearTimeout(hsTimer);
         const host = obj.host;
         const port = obj.port;
+        const kind = obj.kind === "live" ? "live" : "data";
         // This handler is async and invoked un-awaited by frameConn, so ANY throw
         // past here is an UNHANDLED REJECTION — which instant-exits the hub
         // (server.js's own unhandledRejection note). A wrapper keeps the module's
         // "never crash the process" discipline even if `openLocal` RESOLVES a
         // non-duplex (a mis-wired consumer): `bridge` would then throw synchronously.
         try {
+          // Refuse a channel from an unauthenticated in-cluster peer (only when a
+          // shared token is configured). Hint + close so a mis-configured ORIGIN
+          // surfaces it rather than hanging; a real peer holds the same secret.
+          if (authToken && !tokenEqual(obj.auth, authToken)) {
+            d.sendCtrl({ t: "hint", reason: "unauthorized" }); d.end(); return;
+          }
           // Owner handoff: the host reconnected to another replica between the
           // origin's owner lookup and this dial. We are not it — tell the origin to
           // reconnect (it re-resolves the new owner) and close.
           if (!localTunnel(host)) { d.sendCtrl({ t: "hint", reason: "not-owner" }); d.end(); return; }
+          // A live channel needs the `openLive` bridge; a mis-wired owner lacking
+          // it hints + closes rather than crashing.
+          if (kind === "live" && !openLive) {
+            d.sendCtrl({ t: "hint", reason: "relay-error", detail: "no live bridge" }); d.end(); return;
+          }
           let agent;
           try {
-            agent = await openLocal(host, port);
+            agent = kind === "live" ? await openLive(host, obj.session) : await openLocal(host, port);
           } catch (e) {
             // Tunnel drop (the control channel went away as we bridged): hint +
             // close; the origin reconnects and finds the tunnel down or moved.
@@ -408,6 +458,11 @@ function makeRelay(store, replicaId, deps = {}) {
   // pattern. Best-effort; a store without watch/scan (or HA off) simply leaves the
   // mirror to fill from live sets, and address-less `dial` still works.
   async function start() {
+    // Sets the LOCAL mirror synchronously (a self-dial edge) and attempts the
+    // store write. On a SharedLiveStore not yet connected this write REJECTS
+    // (caught) — the real publish lands on the ready edge below, not only on the
+    // 30s refresh timer, so a freshly-booted/promoted owner is dialable within a
+    // beat rather than un-dialable for up to ttlMs/3 (XERK-781 QA finding).
     publishEndpoint();
     if (store && typeof store.watch === "function") {
       unwatch = store.watch(RELAY_ENDPOINT_PREFIX, (ev) => {
@@ -420,9 +475,21 @@ function makeRelay(store, replicaId, deps = {}) {
         endpoints[replica] = { addr: v.addr, at: v.at };
       });
     }
+    // Re-publish this replica's endpoint on every store health→ready EDGE (initial
+    // connect AND every reconnect), the XERK-758 ledger pattern — the boot publish
+    // above races the socket, and a reconnect would otherwise leave the endpoint
+    // gone until the refresh timer. FileLiveStore's `onHealth` is an inert no-op
+    // (never fires) and it is ready synchronously, so this only fires on the shared
+    // backend; the after-`ready()` publish below covers the file/test path.
+    if (endpoint && store && typeof store.onHealth === "function") {
+      unhealth = store.onHealth((h) => { if (h === "ready") publishEndpoint(); });
+    }
     if (store && typeof store.scan === "function") {
       try {
         if (store.ready) await store.ready();
+        // Now connected — land the endpoint write the boot call may have lost to a
+        // not-yet-connected socket, before serving any dial.
+        publishEndpoint();
         for (const { key, value } of await store.scan(RELAY_ENDPOINT_PREFIX)) {
           const replica = key.slice(RELAY_ENDPOINT_PREFIX.length);
           if (!replica || Object.prototype.hasOwnProperty.call(endpoints, replica)) continue; // watch won
@@ -440,6 +507,7 @@ function makeRelay(store, replicaId, deps = {}) {
   function stop() {
     if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
     if (unwatch) { try { unwatch(); } catch { /* best effort */ } unwatch = null; }
+    if (unhealth) { try { unhealth(); } catch { /* best effort */ } unhealth = null; }
     if (endpoint && store) {
       delete endpoints[replicaId];
       Promise.resolve(store.del(RELAY_ENDPOINT_PREFIX + replicaId)).catch(storeFailed);
