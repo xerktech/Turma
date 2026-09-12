@@ -4019,6 +4019,22 @@ async function hydrateArchiveIndex() {
   archive.setHydrating(true);
   try {
     await archiveIndexStore.hydrateInto(archive.indexLoader());
+    // XERK-791: PROACTIVELY verify the freshly-hydrated FTS5 index BEFORE this
+    // replica serves reads or accepts ingest. A hydrate that completed WITHOUT
+    // throwing can still have left `entries_fts` physically corrupt (the prod
+    // symptom: the leader hydrated "cleanly" then the FIRST post-boot ingest hit
+    // "database disk image is malformed"). Catching it here — while `hydrating` is
+    // still set, so nothing is being served — turns that reactive, error-logging
+    // discovery into a controlled reset-and-rebuild-from-files at the one point the
+    // index is known-partial anyway. On a healthy hydrate this is a cheap no-op and
+    // the expensive file rebuild NEVER fires (XERK-780's cheap-hydrate intent
+    // preserved); it only pays the rebuild when the index is genuinely damaged.
+    if (!archive.checkIndexIntegrity()) {
+      console.error(
+        "archive index: post-hydrate integrity check found a corrupt entries_fts; " +
+        "resetting and rebuilding the local index from files before serving (XERK-791)");
+      archive.resetLocalIndex();
+    }
     // Re-derive the byte cursors from the local files (the append-only ground truth)
     // so a Postgres of-record that LAGS local files (a persistent-volume restart that
     // lost the mirror queue) can't leave bytesStored behind the `.jsonl` and drive a
@@ -15702,6 +15718,14 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "archive" &&
         parts[3] === "restore" && parts.length === 4) {
       const transcriptId = decodeURIComponent(parts[2]);
+      // XERK-791: a restore WRITES the local index (`restampOrg` re-points the row),
+      // so it must not run concurrently with a hydrate — the same rule the ingest
+      // routes and the beat cursor path follow. 503 "still syncing"; the operator
+      // (or the page's retry) re-issues once the brief boot/promotion hydrate ends.
+      // Inert off HA.
+      if (archive.isHydrating()) {
+        return json(res, 503, { error: "archive index is still syncing on this replica — retry" });
+      }
       const body = JSON.parse((await readBody(req)) || "{}");
       const target = typeof body.host === "string" ? body.host : "";
       const row = archive.sessionRow(transcriptId);

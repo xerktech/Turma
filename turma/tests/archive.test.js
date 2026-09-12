@@ -1508,6 +1508,96 @@ test("XERK-789: setHydrating toggles the ingest gate the routes read", () => {
   assert.equal(archive.isHydrating(), false);
 });
 
+// ---- XERK-791: complete the hydrate serialization + proactive integrity check --
+
+test("XERK-791: heal-on-read does NOT write the index while hydrating (the guard gap)", () => {
+  const M = { ...META, summary: "x791 healgate" };
+  archive.ingestChunk("nas791", "x791a", { ...M }, 0, 100, [
+    ent("a1", "user", "one alpha791"), ent("a2", "assistant", "two gamma791"),
+  ]);
+  // Stale the row the XERK-280 way: delete the .jsonl, then append one short line
+  // at the OLD cursor so the file holds ONE line while the index still claims two.
+  fs.unlinkSync(jsonlFor("x791a", M, "nas791"));
+  archive.ingestChunk("nas791", "x791a", { ...M }, 100, 200, [ent("a3", "user", "survivor791")]);
+
+  // While HYDRATING, a read must return the honest disk view but NEVER mutate the
+  // local index — an interleaved heal-on-read tx() is the concurrent-writer
+  // corruption the guard closes. reconcileRow logs "reconciled …" only PAST its
+  // hydrating guard, so its absence pins that no FTS delete/reinsert + row UPDATE
+  // ran (the exact tripwire XERK-280's healthy-read test uses).
+  archive.setHydrating(true);
+  const origErr = console.error;
+  const logs = [];
+  console.error = (...a) => logs.push(a.join(" "));
+  let t;
+  try {
+    t = archive.getTranscript("x791a");
+    archive.listArchive({ host: "nas791" });
+  } finally { console.error = origErr; archive.setHydrating(false); }
+  assert.equal(t.entries.length, 1, "read is still honest for display (file is truth)");
+  assert.equal(t.entries[0].text, "survivor791");
+  // The proof no WRITE ran: no reconcile log, and the vanished message is STILL in
+  // the FTS index (the DELETE was skipped). The RETURNED msgCount is honestly the
+  // file count (reconcileRow returns trueCount even when it skips the write), so it
+  // is NOT the tripwire here — the persisted FTS state is.
+  assert.equal(logs.filter((l) => l.includes("reconciled x791a")).length, 0,
+    "no index heal ran while hydrating");
+  assert.ok(archive.searchArchive("gamma791").groups
+    .flatMap((g) => g.matches).some((m) => m.transcriptId === "x791a"),
+    "vanished message still in FTS (no DELETE ran) while hydrating");
+
+  // Once the hydrate ends, the next read heals normally — XERK-280 unchanged.
+  assert.equal(archive.getTranscript("x791a").entries.length, 1);
+  assert.equal(archive.listArchive({ host: "nas791" }).sessions
+    .find((s) => s.transcriptId === "x791a").msgCount, 1, "healed once hydrate finished");
+  assert.equal(archive.searchArchive("gamma791").groups
+    .flatMap((g) => g.matches).filter((m) => m.transcriptId === "x791a").length, 0,
+    "vanished message dropped from FTS after the hydrate");
+});
+
+test("XERK-791: checkIndexIntegrity passes a healthy hydrated index", () => {
+  archive.ingestChunk("nas791", "x791b", { ...META, summary: "x791 integ" }, 0, 60, [
+    ent("b1", "user", "integrity needle one"), ent("b2", "assistant", "integrity needle two"),
+  ]);
+  assert.equal(archive.checkIndexIntegrity(), true, "healthy FTS5 index passes the check");
+});
+
+test("XERK-791: checkIndexIntegrity DETECTS a corrupt fts5 page (false, not a throw) and resetLocalIndex recovers", () => {
+  const M = { ...META, summary: "x791 corrupt" };
+  // Seed enough entries that entries_fts spills across multiple data pages.
+  for (let i = 0; i < 60; i++) {
+    archive.ingestChunk("nas791c", "x791c" + i, { ...M, summary: "x791 corrupt " + i },
+      0, 100, [ent("c" + i, "user", "corruptneedle alpha beta gamma delta epsilon " + i)]);
+  }
+  assert.equal(archive.checkIndexIntegrity(), true, "healthy before corruption");
+
+  // closeDb() checkpoints the WAL into the main file, so a data page overwritten
+  // there is authoritative on reopen. Corrupt the LAST entries_fts_data page (a
+  // leaf) — page 1 / schema / meta stay intact so openDb() still succeeds and the
+  // damage surfaces as an FTS5 corruption on the integrity check, not NOTADB.
+  archive.closeDb();
+  const { DatabaseSync } = require("node:sqlite");
+  const raw = new DatabaseSync(process.env.ARCHIVE_DB);
+  const ps = raw.prepare("PRAGMA page_size").get().page_size;
+  const pages = raw.prepare(
+    "SELECT pageno FROM dbstat WHERE name='entries_fts_data' ORDER BY pageno").all();
+  raw.close();
+  assert.ok(pages.length > 0, "seeded index has fts5 data pages to corrupt");
+  const pageno = pages[pages.length - 1].pageno;
+  const fd = fs.openSync(process.env.ARCHIVE_DB, "r+");
+  fs.writeSync(fd, Buffer.alloc(ps, 0xEE), 0, ps, (pageno - 1) * ps);
+  fs.closeSync(fd);
+
+  // The PROACTIVE check catches it as a boolean false (the caller resets), NEVER a
+  // throw that would escape hydrateArchiveIndex's try and leave a corrupt index served.
+  assert.equal(archive.checkIndexIntegrity(), false, "corruption detected proactively");
+  // resetLocalIndex drops the corrupt file and rebuilds from the .jsonl files.
+  archive.resetLocalIndex();
+  assert.equal(archive.checkIndexIntegrity(), true, "healthy again after the reset");
+  assert.ok(archive.searchArchive("corruptneedle").groups.length > 0,
+    "searchable again after rebuild-from-files");
+});
+
 test("XERK-789: resetLocalIndex drops a corrupt index.db and rebuilds from the files", () => {
   // Ingest so an organized .jsonl + a populated index exist.
   archive.ingestChunk("nas", "heal1", { ...META, summary: "Self Heal One" }, 0, 60, [

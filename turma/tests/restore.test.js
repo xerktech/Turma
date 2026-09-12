@@ -203,6 +203,27 @@ test("restore: an archived session is packed and imported onto a live host", asy
   assert.equal(cmd.summaryManual, false);
 });
 
+test("XERK-791: restore refuses (503) while the archive index is hydrating", async () => {
+  // A restore WRITES the local index (restampOrg re-points the row), so it must
+  // not run concurrently with a boot/promotion hydrate — the same serialize rule
+  // the ingest routes and the beat cursor path follow (XERK-789). 503 is the retry
+  // signal; the guard fires before any validation, so it never starts a pack/slot.
+  releaseInFlight();
+  await beat("k8x");
+  archive.setHydrating(true);
+  let r;
+  try {
+    r = await request("POST", `/api/archive/${TID}/restore`,
+      { headers: userHeaders, body: { host: "k8x" } });
+  } finally { archive.setHydrating(false); }
+  assert.equal(r.status, 503, JSON.stringify(r.body));
+  // Once the hydrate clears, the same restore is admitted (no longer 503).
+  const ok = await request("POST", `/api/archive/${TID}/restore`,
+    { headers: userHeaders, body: { host: "k8x" } });
+  assert.notEqual(ok.status, 503, JSON.stringify(ok.body));
+  releaseInFlight();
+});
+
 test("restore: the bundle the target downloads is the archived bytes, byte for byte", async () => {
   // Its own restore rather than the previous test's: scanning `migrations` for
   // one still in `importing` couples the test to how fast the last pack ran,
