@@ -128,11 +128,18 @@ RWX, which the ticket rules out outright.
 > index" — and the leader is the single owning writer of the of-record (only it ingests, so only it
 > mirrors up). The driver was the **stdlib-only** constraint (the hub ships no `node_modules`, CI is
 > offline): a shared Postgres FTS index means hand-rolling a Postgres wire-protocol + SCRAM +
-> tsvector/tsquery client and porting archive.js's whole query/reclaim path onto it. `DATABASE_URL`
-> stays validated at boot but the ARCHIVE does not consume it (the usage ledger, XERK-758, is its
-> intended consumer); moving the index to Postgres later needs no change to the byte layer. The
-> single-writer option's cost — a promoted standby hydrates + rebuilds before serving archive reads,
-> 404ing "still syncing" until then — is accepted for Option 2, where failover is rare. Mechanics:
+> tsvector/tsquery client and porting archive.js's whole query/reclaim path onto it — deferred by
+> XERK-759, kept rebuildable-from-files in the interim.
+>
+> **Update (XERK-780, w2-index): the Postgres index the ADR designated has LANDED.** XERK-776 shipped
+> the stdlib Postgres client (`pgclient.js`); XERK-780 built `index-store.js` on it — the archive
+> index is now the shared Postgres of-record. archive.js keeps its local node:sqlite as the per-replica
+> hot read/write CACHE (the sync request + beat-cursor paths need it, and no Postgres round trip may
+> sit on the beat, XERK-395), mirrored to Postgres with idempotent `ON CONFLICT` upserts and HYDRATED
+> from Postgres on promotion instead of rebuilt from the S3 bytes — so the cold-promote gap (finding
+> A) shrinks and concurrent-replica ingest is safe. The byte layer was unchanged, as this note
+> predicted. Direct per-replica PG SERVING is the one deferred piece (Option 2 still serves from the
+> leader; the query layer is built + parity-tested for when active-active serving lands). Mechanics:
 > `.claude/rules/turma-ha-archive.md`.
 
 ---
@@ -250,12 +257,13 @@ invariant the ticket demands, and every sibling must preserve it.
   registry-cap knobs already use — *"the effective budget prints at boot"*), so an operator sees the
   effective mode in the log, not a guess: `HA: off (single-process)`, or `HA: on (...)` naming the
   backends genuinely in use. **The boot line must name what is ACTUALLY wired, never the intended
-  design (XERK-773)** — today `HA: on (store=valkey, ledger=valkey, index=sqlite(local, rebuilt from
-  s3), blobs=s3)`, because the ledger's high-water lives in the Valkey live store (XERK-758) and the
-  index is local SQLite rebuilt from the S3 bytes (XERK-759); it must not claim Postgres while
-  nothing writes it. `DATABASE_URL` stays required (provisioned ahead of use); `ha-config.js`'s
-  `POSTGRES_BACKEND_WIRED` gates the claim, and when a Postgres LedgerStore/IndexStore lands the flag
-  flips and the line reads `ledger+index=postgres` again.
+  design (XERK-773)** — today `HA: on (store=valkey, ledger=valkey, index=postgres, blobs=s3)`: the
+  archive INDEX is now the shared Postgres of-record (XERK-780), while the ledger's high-water still
+  lives in the Valkey live store (XERK-758). It must not claim Postgres for a backend nothing writes.
+  `DATABASE_URL` stays required (consumed by the index now, by the ledger once `w2-ledger` lands);
+  `ha-config.js`'s per-backend flags (`INDEX_BACKEND_WIRED`/`LEDGER_BACKEND_WIRED`) gate each claim —
+  granularized from the single conflated flag XERK-773 used, so the index can read `postgres` while
+  the ledger still reads `valkey`.
 - Every new URL/knob reads through the existing `positiveEnv`-style guards where numeric; a malformed
   store URL is a boot refusal, never a runtime surprise.
 

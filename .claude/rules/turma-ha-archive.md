@@ -2,11 +2,13 @@
 paths:
   - turma/blobstore.js
   - turma/archive-mirror.js
+  - turma/index-store.js
   - turma/tests/blobstore.test.js
   - turma/tests/archive-mirror.test.js
+  - turma/tests/index-store.test.js
 ---
 
-# The archive's HA of-record: object-store bytes + single-writer index (XERK-759)
+# The archive's HA of-record: object-store bytes + Postgres index (XERK-759, XERK-780)
 
 Wave-3 of the HA epic (XERK-751) for the DURABLE ARCHIVE. Read `.claude/rules/turma-archive.md`
 first (the two byte layers, the size ceilings, `rebuildIndex`, `maybeReclaimIndex`) and
@@ -15,31 +17,35 @@ archive.js and its hot path are unchanged bar one optional write sink.
 
 ## The decision this ticket implements (and where it refines the ADR)
 
-The ADR splits the archive: **bytes → object storage (MinIO/S3)**, index → Postgres. This ticket
-takes the **bytes → object storage** half in full, and for the INDEX takes the ticket's EXPLICIT
-alternative — *"designate a SINGLE archive-writer"* — instead of a shared Postgres index:
+The ADR splits the archive: **bytes → object storage (MinIO/S3)**, **index → Postgres**. XERK-759
+landed the **bytes → object storage** half in full; **XERK-780 (w2-index) landed the Postgres index
+of-record**, so both halves of the ADR split now hold:
 
 - **Bytes (rendered `.jsonl`+`.meta` AND the `.raw/` layer) become object-store objects**, keyed by
   their path relative to `ARCHIVE_DIR` (`repo/<file>.jsonl`, `…/<file>.jsonl.meta`,
   `…/<file>.jsonl.raw/<member>`). The bucket is the of-record; the RWO `turma-data` volume is no
-  longer required for the archive (a standby hydrates a local working copy from the bucket).
-- **The index STAYS the per-replica disposable SQLite** archive.js already rebuilds from the files
-  (`bytesStored` from the `.meta` sidecar, `rawBytes`/`archiveBytes` from the bytes). There is **no
-  shared SQLite file**, so the ticket's corruption hazard (*"two processes on one SQLite file"*)
-  cannot arise — a strictly stronger property than "one writer of a shared index". The **leader is
-  the single owning WRITER of the of-record** (only it ingests, so only it mirrors up), which is the
-  ticket's "single archive-writer" satisfied at the bytes layer.
-- **Why not the ADR's Postgres index:** the hub ships **no `node_modules`** (the XERK-754 stdlib-only
-  stance; `node --test`, no network in CI). A shared Postgres FTS index means hand-rolling a
-  Postgres wire-protocol + SCRAM + tsvector/tsquery client and porting all of archive.js's
-  query/reclaim logic onto it — a large, risky surface. archive.js's index is ALREADY documented as
-  disposable and rebuildable from the files, so once the files are the of-record the local index
-  needs no shared home. `DATABASE_URL` stays validated at boot (ha-config) but the archive does not
-  use it; a future ticket may still move the index to Postgres without changing the byte layer.
-- **Trade-off, accepted (Option 2):** a freshly-promoted standby must hydrate the bytes from the
-  bucket and rebuild its index before it can serve archive reads — until then archive reads 404
-  "still syncing" (archive.js's own honest answer). Failover is rare in Option 2; the ADR flags this
-  as the single-writer option's cost.
+  longer required for the archive (a standby hydrates a local working copy from the bucket). Unchanged.
+- **The INDEX has a shared Postgres OF-RECORD** (`index-store.js` over pgclient, XERK-780). archive.js
+  keeps its local node:sqlite index as the SYNCHRONOUS read/write model in BOTH modes — the request
+  path and the beat-cursor path read it, and they cannot be async (XERK-395: no Postgres on the beat)
+  — but under HA it is a per-replica HOT CACHE, mirrored to Postgres and HYDRATED FROM Postgres on
+  boot/promotion instead of rebuilt by re-parsing the S3-hydrated `.jsonl`s. That per-pod rebuild was
+  the bulk of the cold-promote gap (finding A, XERK-772), and rebuilding per pod races concurrent-
+  replica ingest; the Postgres of-record removes both.
+  - **Why XERK-759 took the SQLite-per-pod interim instead of Postgres, and why that is now
+    superseded:** the hub ships **no `node_modules`** (XERK-754 stdlib-only), so a Postgres FTS index
+    meant first hand-rolling a Postgres wire client (SCRAM + extended query) — a large surface XERK-759
+    deferred, keeping the local SQLite rebuildable from the files as an interim (there was then no
+    shared SQLite file to corrupt, a strictly-stronger property than "one shared writer"). XERK-776
+    landed that stdlib client (`pgclient.js`); XERK-780 is the port the ADR always designated.
+- **The local SQLite is STILL never shared** — the corruption hazard the ADR rules out (two processes
+  on one SQLite file) still cannot arise: each replica has its OWN disposable node:sqlite cache; the
+  SHARED of-record is Postgres, a transactional row store with safe concurrent writers.
+- **Trade-off, accepted (Option 2):** a freshly-promoted standby still hydrates the BYTES from the
+  bucket before it can serve transcript CONTENT (getTranscript reads the local `.jsonl`), and until
+  the index hydrate completes archive reads 404 "still syncing" — but the INDEX hydrate is now a
+  Postgres read (indexed rows over the wire), not a file walk + re-parse, so it is far cheaper.
+  Failover is rare in Option 2; the ADR flags the hydrate window as the cost.
 
 ## `blobstore.js` — the object-store client
 
@@ -77,19 +83,81 @@ alternative — *"designate a SINGLE archive-writer"* — instead of a shared Po
   SMALLER** than the object (missing, or a partial download to finish) — **never same-size-or-larger**,
   so a leader warm-restarting with un-mirrored appends (local ahead of the bucket) is NOT truncated
   back to the of-record; its files are append-only + authoritative and re-mirror on the next drain. A
-  leader that has been writing thus hydrates to a near-no-op. Then `openDb()`+`rebuildIndex()`
-  re-derives the index from the hydrated files. Best-effort per key; a store blip leaves the local
-  copy stale, not the hub down.
+  leader that has been writing thus hydrates to a near-no-op. Best-effort per key; a store blip
+  leaves the local copy stale, not the hub down.
+- **`reindex` is INJECTED and is a NO-OP when the Postgres index is wired** (XERK-780): the byte
+  hydrate no longer rebuilds the index from files (the expensive walk) — server.js's `hydrateArchive`
+  runs the Postgres index hydrate separately, AFTER the bytes. With no PG index store (HA off, or an
+  HA hub without one) `reindex` stays `openDb()`+`rebuildIndex()`, and it is ALSO the FALLBACK when a
+  PG index hydrate fails, so a store blip never leaves a promoted replica index-blind.
 - **Path safety both ways**: `keyFor` rejects a path escaping `ARCHIVE_DIR`; `pathFor` rejects a
   listing key that would write outside it (the tar-extract discipline — never trust a listing).
 
+## `index-store.js` — the archive index Postgres of-record (XERK-780)
+
+- **The DESIGN, and where it draws the line (the ledger/registry house pattern).** archive.js's local
+  node:sqlite index stays the SYNCHRONOUS read/write model in BOTH modes. HA off: byte-identical —
+  no store, no sink. HA on: the local SQLite is a per-replica HOT read cache that the request path
+  (`searchArchive`/`listArchive`/`getTranscript`) and the beat-cursor path (`manifestCursors`/…)
+  read (neither can be async, and no Postgres round trip may sit on the beat, XERK-395). Postgres is
+  the durable MIRROR + hydration source ON TOP: every index write is mirrored here (idempotent upsert,
+  off the beat) and a promoted/booting replica hydrates the local cache FROM here.
+- **DEFERRED (documented scope boundary, like XERK-764's byte relay / XERK-778's request-path
+  scope):** a replica serving archive READS DIRECTLY from Postgres. Today only the LEADER serves
+  (Option 2, `/readyz` leader-gated — `turma-ha-leader.md`), so its local cache answers reads; the
+  query layer (`searchQuery`/`listQuery`/`rowQuery`) is implemented + parity-tested so direct
+  per-replica serving is a WIRING change when active-active serving lands, NOT a store swap.
+- **stdlib ONLY, over `pgclient.js`'s `PgPool`** (XERK-776) — no `pg`/`node_modules`. The pure SQL
+  builders (`buildSessionUpsert`/`buildEntryInsert`/`buildSearch`/`buildList`/`ftsToTsquery`) +
+  camel↔snake mappers are unit-tested; the socket path is host-QA-only.
+- **The sink archive.js calls (`archive.setIndexSink`, no-op off HA) is SYNC + never throws** into
+  the hot path — it enqueues; server.js's `IndexMirror` drains it to Postgres in a background loop
+  (bounded `INDEX_MIRROR_QUEUE_MAX`, drop-oldest on overflow: a lost mirror op self-heals — the local
+  SQLite is authoritative and a promotion re-hydrates only what Postgres holds). A SESSION mutation
+  mirrors the FULL row (re-read from SQLite) so the upsert never clobbers untouched metadata; ENTRIES
+  mirror append-only by ordinal, or wholesale-replace on a reconcile (XERK-280).
+- **CONCURRENCY story (the change from the leader-only Option-2 posture):** every write is idempotent.
+  SESSION upserts `ON CONFLICT(transcript_id)` raise the monotonic byte/count columns with
+  `GREATEST(existing, incoming)` (a low/partial writer can NEVER lower a cursor — the ledger's
+  high-water rule) and overwrite metadata; ENTRY upserts `ON CONFLICT(transcript_id, seq) DO NOTHING`
+  (a replayed range is a no-op). Two replicas racing one transcript converge with no lock. archive.js's
+  own append-only/forward-only/ownership gates (XERK-255/344/573) run in the LOCAL SQLite BEFORE the
+  mirror fires, so the mirrored value is already the resolved one; GREATEST is the belt.
+- **Hydration RETIRES the per-pod rebuild-from-files** (`PgIndexStore.hydrateInto` → `archive.indexLoader`):
+  it pages session + entry rows out of Postgres and BATCH-applies each PAGE into a fresh local SQLite
+  in one synchronous transaction — a tx is NEVER held open across a page `await` (a concurrent request
+  starting its own tx would hit "transaction within a transaction"). Between reset and done the index
+  is partial → reads answer "still syncing", the archive's honest answer.
+- **After the hydrate, `reconcileHydratedCursors` re-derives the BYTE CURSORS from the LOCAL FILES**
+  (bytesStored from the `.meta` sidecar, archiveBytes from the `.jsonl` stat, rawBytes from the raw
+  walk — exactly as `rebuildIndex` does, but WITHOUT reading `.jsonl` content, so the skipped
+  FTS-reinsert stays skipped). Load-bearing: the Postgres of-record can LAG the local files on a
+  persistent-volume restart that lost the in-memory mirror queue (on k8s emptyDir the disk + queue are
+  lost together, so PG never lags there) — a too-low `bytesStored` would make the agent re-push a range
+  the `.jsonl` already holds and `appendFileSync` DUPLICATE it. The files are the append-only ground
+  truth for a replica's cursors; PG supplies the metadata + FTS entries. A no-op on a fresh replica.
+- **RECLAIM (`maybeReclaimIndex`) under HA is a LOCAL-index-size concern only** — it reaps rows for
+  a hand-deleted `.jsonl` from the disposable local SQLite but does NOT delete from the Postgres
+  of-record, the SAME posture as the byte mirror's documented hand-delete gap (deletion is an
+  out-of-band operator action; a bucket/of-record lifecycle rule removes it).
+- **`createIndexStore(haConfig, pool)` returns null with HA off / no pool / a fatal config**, so no
+  sink is wired and the local SQLite is the whole story, byte-identical.
+
 ## Wiring (server.js)
 
-- `archiveBlobStore = createBlobStore(...)` at module load (null off HA), like `liveStore`.
-- Boot HA branch: `setArchiveMirror(archiveBlobStore, haConfig.ha)` wires `archive.setBlobSink`,
-  then `hydrateArchive()` + the drain `setInterval` (`.unref()`, so it never holds the process up).
-- `reindex` is `() => { archive.openDb(); archive.rebuildIndex(); }` — idempotent (INSERT OR
-  REPLACE), and `rebuildIndex` already skips a `.raw/` directory whole.
+- `archiveBlobStore = createBlobStore(...)`, `archiveIndexPool = createPgClient(...)`,
+  `archiveIndexStore = createIndexStore(..., archiveIndexPool)` at module load (all null off HA),
+  like `liveStore`. When a Postgres LedgerStore lands (w2-ledger) it shares `archiveIndexPool`.
+- Boot HA branch: `setArchiveMirror(archiveBlobStore, HA_ON)` + `setIndexMirror(archiveIndexStore,
+  HA_ON)` wire `archive.setBlobSink` + `archive.setIndexSink`, then `hydrateArchive()` + the drain
+  `setInterval` (`.unref()`). A boot line prints `archive index of-record: postgres`.
+- **`hydrateArchive()` runs at boot AND on promotion** (`onLeaderPromoted` now calls it — a promoted
+  standby did not ingest as a follower, so its index only advances via hydrate): it downloads the
+  bytes (byte mirror) then `hydrateArchiveIndex()` (Postgres → local SQLite via `archive.indexLoader`),
+  with the file rebuild as the hard fallback.
+- **The byte mirror's `reindex` is a NO-OP when `archiveIndexStore` is wired** (the PG hydrate does
+  the indexing); else `() => { archive.openDb(); archive.rebuildIndex(); }` — idempotent (INSERT OR
+  REPLACE), `rebuildIndex` skips a `.raw/` directory whole.
 
 ## Deployment
 
@@ -117,3 +185,10 @@ alternative — *"designate a SINGLE archive-writer"* — instead of a shared Po
   `.jsonl`, its `.meta` and the raw file, and those bytes hydrate into a FRESH replica dir whose
   rebuilt index reads the transcript back and RESUMES the cursor (a re-ingest from 0 stores nothing,
   no duplication).
+- `index-store.test.js`: the pure SQL builders (the `GREATEST`-on-exactly-the-monotonic-columns
+  upsert, the entry `ON CONFLICT (transcript_id, seq) DO NOTHING`, the search/list SQL, `ftsToTsquery`,
+  the camel↔snake mappers, `intParam`); the mirror + CONCURRENCY logic against a faithful in-memory
+  of-record (a low/partial writer never lowers a cursor; a replayed entry range is a no-op); the
+  archive.js sink→of-record→hydrate ROUND-TRIP reconstructing the index (browse + full-text search)
+  with the `.jsonl` FILES DELETED — the retirement of the rebuild-from-files; the no-sink byte-identity;
+  and the `PgIndexStore`→pool contract over a spy pool (the socket itself is `pgclient.test.js`'s).

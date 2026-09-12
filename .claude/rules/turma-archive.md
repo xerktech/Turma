@@ -15,9 +15,21 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
 - **Under HA the archive's BYTES move to object storage as the of-record** (XERK-759,
   `.claude/rules/turma-ha-archive.md`): a sync write sink (`archive.setBlobSink`) notes each durable
   file, an off-beat worker mirrors it to the bucket, and a booting/promoted replica hydrates a local
-  working copy back and `rebuildIndex()`es. The per-replica SQLite index stays local + disposable
-  (no shared file to corrupt); the leader is the single owning writer. **HA off = byte-identical**:
-  the sink is unset, the local `ARCHIVE_DIR` tree is the of-record, and everything below is unchanged.
+  working copy back.
+- **Under HA the searchable INDEX has a shared Postgres of-record** (XERK-780, `index-store.js`,
+  `.claude/rules/turma-ha-archive.md`). The local node:sqlite index STAYS the SYNCHRONOUS read/write
+  model this file describes (the request path + the beat-cursor path read it and cannot be async), but
+  it is a per-replica HOT CACHE: a SECOND sync sink (`archive.setIndexSink`) mirrors each index write
+  to Postgres (idempotent `ON CONFLICT` upserts — `GREATEST` on the byte/count columns, entries by
+  ordinal), and a promoted/booting replica HYDRATES the local index FROM Postgres (`archive.indexLoader`)
+  instead of rebuilding it by re-parsing every hydrated `.jsonl` (finding A). There is STILL no shared
+  SQLite file to corrupt — each replica's cache is its own; Postgres is the shared writer.
+- **HA off = byte-identical**: neither sink is set, the local `ARCHIVE_DIR` tree + node:sqlite index
+  are the whole of-record, and everything below is unchanged.
+- **`maybeReclaimIndex`/`rebuildIndex` do NOT mirror to Postgres** — reclaim reaps the disposable
+  LOCAL rows for a hand-deleted `.jsonl` only; the Postgres of-record keeps the row (deletion is an
+  out-of-band operator action, the same posture as the byte mirror's hand-delete gap). A hydrate may
+  re-list such a row; its transcript view still reads honestly empty (XERK-422).
 
 - The hub hosts a **durable, searchable archive of ended sessions**: agents push each inactive
   transcript in, landing as organized files on `/data`

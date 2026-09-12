@@ -63,6 +63,19 @@ const { createLeader } = require("./leader.js");
 // tree stays the of-record, byte-identical.
 const { createBlobStore } = require("./blobstore.js");
 const { ArchiveMirror } = require("./archive-mirror.js");
+// The stdlib Postgres client (XERK-776) + the archive's Postgres INDEX of-record
+// (XERK-780, epic XERK-775). The archive's searchable index moves onto Postgres as
+// the durable, shared of-record so a promoted/new replica HYDRATES its local
+// node:sqlite index FROM Postgres (fast, indexed rows) instead of rebuilding it by
+// re-parsing every S3-hydrated `.jsonl` — the bulk of the cold-promote gap (finding
+// A, XERK-772) — and every ingest is an idempotent ON-CONFLICT upsert so concurrent-
+// replica ingest converges. Requiring these is side-effect-free (no socket dialled
+// until wired at boot); with HA off `createPgClient`/`createIndexStore` return null,
+// no sink is wired, and archive.js's local SQLite index is the whole story, byte-
+// identical. See docs/turma-ha-store-adr.md ("Why the archive splits") and
+// .claude/rules/turma-ha-archive.md.
+const { createPgClient } = require("./pgclient.js");
+const { createIndexStore } = require("./index-store.js");
 
 // XERK-757 externalized-store persistence config, declared here so it can be
 // handed to the module-load store below. It maps each `policy:<name>` store key to
@@ -111,6 +124,16 @@ let liveStore = createLiveStore(haConfig.fatal.length ? { ha: false } : haConfig
 // worker in the production boot branch below; nothing here touches the archive's
 // synchronous hot path.
 const archiveBlobStore = createBlobStore(haConfig.fatal.length ? { ha: false } : haConfig);
+
+// The Postgres pool + the archive INDEX of-record on top of it (XERK-780), created
+// once at module load like `liveStore`/`archiveBlobStore`. null with HA off or a
+// fatal HA config (DATABASE_URL is validated all-or-nothing at boot; the factories
+// guard again). No socket is dialled here — the pool connects lazily on the first
+// query, which happens off the beat (ingest mirror + boot/promotion hydrate). When
+// a Postgres LedgerStore lands (w2-ledger) it shares this same pool.
+const archiveIndexPool = createPgClient(haConfig.fatal.length ? { ha: false } : haConfig);
+const archiveIndexStore = createIndexStore(
+  haConfig.fatal.length ? { ha: false } : haConfig, archiveIndexPool);
 
 // ---- HA fleet registry externalization (XERK-756, epic XERK-751) ------------
 // The `agents` fleet registry AND the per-host command queues (which ride each
@@ -237,6 +260,12 @@ function onLeaderPromoted() {
     console.error(`leader promotion: migration hydrate failed: ${(e && e.message) || e}`));
   hydrateGuards().catch((e) =>
     console.error(`leader promotion: guard hydrate failed: ${(e && e.message) || e}`));
+  // A promoted standby did not ingest while it was a follower (Option 2: only the
+  // leader ingests), so its local archive index only advances via hydrate — re-pull
+  // the bytes and re-hydrate the index FROM POSTGRES (XERK-780) before it serves, so
+  // it catches up every write the old leader made since this replica booted.
+  hydrateArchive().catch((e) =>
+    console.error(`leader promotion: archive hydrate failed: ${(e && e.message) || e}`));
 }
 
 const PORT = positiveEnv("PORT", 8300);
@@ -3750,7 +3779,16 @@ function setArchiveMirror(blobStore, ha) {
   archiveMirror = new ArchiveMirror({
     blobStore,
     archiveDir: archive.ARCHIVE_DIR,
-    reindex: () => { archive.openDb(); archive.rebuildIndex(); },
+    // When a Postgres INDEX of-record is wired (XERK-780), the index is HYDRATED
+    // FROM POSTGRES by `hydrateArchive` below — so the byte-hydrate's own reindex is
+    // a NO-OP, retiring the expensive per-pod file-walk-and-reparse that was the bulk
+    // of the cold-promote gap (finding A). With no PG index store (HA off, or HA-on
+    // without one) it stays the local rebuild-from-files, unchanged. The PG path also
+    // keeps this as a FALLBACK: `hydrateArchive` rebuilds from files if the PG hydrate
+    // fails, so a store blip never leaves a promoted replica index-blind.
+    reindex: archiveIndexStore
+      ? () => {}
+      : () => { archive.openDb(); archive.rebuildIndex(); },
     // Single owning writer of the of-record. In Option 2 only the leader ingests
     // (so only it has dirty files), and this gate makes that explicit; the real
     // predicate is the not-yet-landed XERK-763 lease. Default true keeps a
@@ -3759,13 +3797,123 @@ function setArchiveMirror(blobStore, ha) {
   });
   archive.setBlobSink((p) => archiveMirror.note(p));
 }
-// The seam a promoted leader calls before it starts serving (XERK-763); also run
-// at boot. Best-effort — a store blip leaves the local copy stale, not the hub
-// down, and the next hydrate/agent re-push catches up.
+
+// ---- archive Postgres INDEX mirror (XERK-780) -------------------------------
+// The write half of the shared index of-record. archive.js keeps its local SQLite
+// index the SYNCHRONOUS read/write model (unchanged, byte-identical HA-off); under
+// HA this receives — via a SYNC, cheap sink like the blob mirror's `note` — a copy of
+// each index mutation and applies it to Postgres OFF the beat, idempotently. Under
+// Option 2 only the leader ingests, so only it produces sink events; the ON-CONFLICT
+// upserts converge even if more than one replica ever does (the ticket's concurrency
+// story). NEVER throws (a mirror error must not break a durable local write, XERK-235)
+// and NEVER blocks the caller (ops queue; a background loop drains them).
+let indexMirror = null;
+// Bounds the pending-op queue so a Postgres outage can't grow the hub's heap without
+// limit — the same "cap agent-influenced growth" posture as every other queue here.
+// Past it the OLDEST op is dropped (a lost mirror write self-heals: the local SQLite
+// is authoritative and a promotion re-hydrates only what Postgres holds; a dropped
+// op just means that row waits for the next write of the same transcript, or an
+// operator-triggered re-sync — never local data loss).
+const INDEX_MIRROR_QUEUE_MAX = positiveEnv("INDEX_MIRROR_QUEUE_MAX", 100000);
+class IndexMirror {
+  constructor(store) {
+    this.store = store;
+    this._q = [];
+    this._running = false;
+    this._dropped = 0;
+    this._lastDropWarnAt = 0;
+  }
+  _push(op) {
+    if (this._q.length >= INDEX_MIRROR_QUEUE_MAX) {
+      this._q.shift();
+      this._dropped++;
+      const now = Date.now();
+      if (now - this._lastDropWarnAt > 60 * 60 * 1000) {
+        this._lastDropWarnAt = now;
+        console.error(
+          `archive index mirror: queue over ${INDEX_MIRROR_QUEUE_MAX} (Postgres slow/down); ` +
+          `dropped ${this._dropped} oldest ops. The local index is authoritative and a ` +
+          `promotion re-hydrates from Postgres; a dropped op self-heals on the next write.`);
+      }
+    }
+    this._q.push(op);
+    this._drain();
+  }
+  // A single background drain loop — serialized, so writes to one transcript apply in
+  // order (session before its entries). Fire-and-forget; a failed op is retried a
+  // bounded number of times then dropped (best-effort, like the byte mirror).
+  async _drain() {
+    if (this._running || !this.store) return;
+    this._running = true;
+    try {
+      while (this._q.length) {
+        const op = this._q.shift();
+        try { await this._apply(op); }
+        catch (e) {
+          op._tries = (op._tries || 0) + 1;
+          if (op._tries < 3) this._q.push(op); // transient — re-queue at the tail
+          else console.error(`archive index mirror: op ${op.t} failed (${e && e.message}); dropped`);
+        }
+      }
+    } finally {
+      this._running = false;
+    }
+  }
+  async _apply(op) {
+    if (op.t === "session") return this.store.upsertSession(op.row);
+    if (op.t === "entries") return this.store.appendEntries(op.transcriptId, op.entries, op.startSeq);
+    if (op.t === "replace") return this.store.replaceEntries(op.transcriptId, op.entries);
+    if (op.t === "remove") return this.store.deleteTranscript(op.transcriptId);
+  }
+  // The sink archive.js calls — each method SYNC (enqueue only), never awaited by the
+  // caller and never throwing back into archive.js's hot path.
+  sink() {
+    return {
+      session: (row) => this._push({ t: "session", row }),
+      entries: (transcriptId, entries, startSeq) =>
+        this._push({ t: "entries", transcriptId, entries, startSeq }),
+      replace: (transcriptId, entries) => this._push({ t: "replace", transcriptId, entries }),
+      remove: (transcriptId) => this._push({ t: "remove", transcriptId }),
+    };
+  }
+}
+function setIndexMirror(store, ha) {
+  if (!ha || !store) { indexMirror = null; archive.setIndexSink(null); return; }
+  indexMirror = new IndexMirror(store);
+  archive.setIndexSink(indexMirror.sink());
+}
+// Load the local SQLite index FROM the Postgres of-record — the retirement of the
+// per-pod rebuild-from-files. Streams session + entry rows out of Postgres into a
+// fresh local index via archive.js's bulk loader. Best-effort with a HARD fallback:
+// on any failure, rebuild from the (already-hydrated) files, so a store blip never
+// leaves a promoted replica unable to serve archive reads.
+async function hydrateArchiveIndex() {
+  if (!archiveIndexStore) return;
+  try {
+    await archiveIndexStore.hydrateInto(archive.indexLoader());
+    // Re-derive the byte cursors from the local files (the append-only ground truth)
+    // so a Postgres of-record that LAGS local files (a persistent-volume restart that
+    // lost the mirror queue) can't leave bytesStored behind the `.jsonl` and drive a
+    // duplicate re-push. A no-op on a fresh replica; reads only sidecars/stats.
+    archive.reconcileHydratedCursors();
+  } catch (e) {
+    console.error(
+      `archive index: Postgres hydrate failed (${e && e.message}); ` +
+      `rebuilding the local index from files as a fallback`);
+    try { archive.openDb(); archive.rebuildIndex(); }
+    catch (e2) { console.error(`archive index: file rebuild fallback failed (${e2 && e2.message})`); }
+  }
+}
+// The seam a promoted leader calls before it starts serving (XERK-763); also run at
+// boot. Downloads the bytes (byte mirror), then HYDRATES the index from Postgres
+// (XERK-780) — replacing the file-walk reindex. Best-effort — a store blip leaves the
+// local copy stale, not the hub down, and the next hydrate/agent re-push catches up.
 async function hydrateArchive() {
-  if (!archiveMirror) return;
-  try { await archiveMirror.hydrate(); }
-  catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
+  if (archiveMirror) {
+    try { await archiveMirror.hydrate(); }
+    catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
+  }
+  await hydrateArchiveIndex();
 }
 
 // The multi-replica-safe boot spool sweep (XERK-761). On a shared spool volume a
@@ -17975,6 +18123,15 @@ if (process.env.TURMA_TEST) {
   // no-op and archive.js's local ARCHIVE_DIR tree stays the of-record. See
   // docs/turma-ha-store-adr.md ("Why the archive splits").
   setArchiveMirror(archiveBlobStore, HA_ON);
+  // XERK-780 (wave-2): the archive's searchable INDEX of-record on Postgres. Wire
+  // the mirror sink onto archive.js (each local index write is upserted to Postgres
+  // off the beat, idempotently) so a promoted/new replica hydrates the index FROM
+  // Postgres instead of rebuilding it from the S3 bytes. Must be wired BEFORE
+  // hydrate/ingest; a no-op when no PG index store (HA off, byte-identical).
+  setIndexMirror(archiveIndexStore, HA_ON);
+  if (HA_ON && archiveIndexStore) {
+    console.log("archive index of-record: postgres (XERK-780)");
+  }
   if (HA_ON && archiveBlobStore) {
     console.log(`archive of-record: object storage (bucket ${archiveBlobStore.bucket})`);
     hydrateArchive().catch((e) =>
