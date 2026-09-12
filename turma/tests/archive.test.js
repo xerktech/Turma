@@ -1491,6 +1491,9 @@ test("XERK-789: isSqliteCorruption matches the real prod errors, not benign ones
   assert.ok(archive.isSqliteCorruption(
     new Error('fts5: corruption found reading blob 1236950581254 from table "entries_fts"')));
   assert.ok(archive.isSqliteCorruption("SqliteError: database disk image is malformed"));
+  // SQLITE_NOTADB — a zeroed / header-corrupt index.db surfaces as this, and it
+  // must self-heal too rather than reopen the dead file (XERK-789 QA defect 2).
+  assert.ok(archive.isSqliteCorruption(new Error("file is not a database")));
   // Benign / unrelated errors must NOT trip the self-heal (it deletes the cache).
   assert.ok(!archive.isSqliteCorruption(new Error("UNIQUE constraint failed")));
   assert.ok(!archive.isSqliteCorruption(new Error("disk I/O error")));

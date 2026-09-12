@@ -430,7 +430,12 @@ let hydrating = false;
 function isHydrating() { return hydrating; }
 function setHydrating(v) { hydrating = !!v; }
 function isSqliteCorruption(e) {
-  return !!e && /\b(malformed|corrupt|corruption|fts5)\b/i.test(String((e && e.message) || e));
+  // "database disk image is malformed" (SQLITE_CORRUPT), "fts5: corruption found …"
+  // (SQLITE_CORRUPT_VTAB), AND "file is not a database" (SQLITE_NOTADB) — a
+  // zeroed/header-corrupt index.db surfaces as NOTADB, which must also self-heal
+  // rather than 500-loop or reopen the dead file (XERK-789 QA).
+  return !!e && /\b(malformed|corrupt|corruption|fts5|not a database|notadb)\b/i
+    .test(String((e && e.message) || e));
 }
 // Drop the corrupt local cache FILE (not just the handle) and reopen fresh, so
 // `openDb()` rebuilds it from the on-disk `.jsonl` files (a fresh DB has zero

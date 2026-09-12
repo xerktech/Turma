@@ -4046,7 +4046,25 @@ async function hydrateArchiveIndex() {
 // boot. Downloads the bytes (byte mirror), then HYDRATES the index from Postgres
 // (XERK-780) — replacing the file-walk reindex. Best-effort — a store blip leaves the
 // local copy stale, not the hub down, and the next hydrate/agent re-push catches up.
-async function hydrateArchive() {
+// SINGLE-FLIGHT (XERK-789). `hydrateArchive` is called from BOTH boot and
+// `onLeaderPromoted`, and on a boot-as-leader replica the two OVERLAP. Two
+// concurrent runs would (a) both write the SAME node:sqlite handle via
+// `hydrateArchiveIndex` — a hydrate-vs-hydrate corruption of `entries_fts` — and
+// (b) let the first to finish clear the `hydrating` boolean while the second is
+// still writing, reopening the ingest 503 gate MID-HYDRATE (the exact window the
+// serialize guard exists to close). Coalescing a concurrent caller onto the
+// in-flight run closes both: exactly one hydrate touches the handle, and
+// `hydrating` clears only when that single run's `finally` fires. A caller
+// arriving AFTER a run has completed (the promise cleared) starts a FRESH run, so
+// a promotion that happens after boot still re-hydrates.
+let archiveHydrateInFlight = null;
+function hydrateArchive() {
+  if (archiveHydrateInFlight) return archiveHydrateInFlight;
+  archiveHydrateInFlight = hydrateArchiveOnce()
+    .finally(() => { archiveHydrateInFlight = null; });
+  return archiveHydrateInFlight;
+}
+async function hydrateArchiveOnce() {
   if (archiveMirror) {
     try { await archiveMirror.hydrate(); }
     catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
