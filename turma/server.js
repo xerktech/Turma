@@ -4011,6 +4011,12 @@ function setIndexMirror(store, ha) {
 // leaves a promoted replica unable to serve archive reads.
 async function hydrateArchiveIndex() {
   if (!archiveIndexStore) return;
+  // Gate archive ingest for the whole hydrate: the paged hydrate `await`s each
+  // Postgres page, so without this an ingest `tx()` interleaves with the hydrate's
+  // bulk fts5 writes on the SAME node:sqlite handle and corrupts entries_fts
+  // (XERK-789). Stays set through the fallback rebuild below (which also writes the
+  // cache) and is cleared in the `finally` so a failed hydrate never wedges ingest.
+  archive.setHydrating(true);
   try {
     await archiveIndexStore.hydrateInto(archive.indexLoader());
     // Re-derive the byte cursors from the local files (the append-only ground truth)
@@ -4022,8 +4028,18 @@ async function hydrateArchiveIndex() {
     console.error(
       `archive index: Postgres hydrate failed (${e && e.message}); ` +
       `rebuilding the local index from files as a fallback`);
-    try { archive.openDb(); archive.rebuildIndex(); }
-    catch (e2) { console.error(`archive index: file rebuild fallback failed (${e2 && e2.message})`); }
+    try {
+      // A CORRUPT local cache must be DROPPED and recreated, never reopened — the
+      // old `openDb()+rebuildIndex()` reopened the SAME malformed index.db and
+      // failed identically (XERK-789, the prod symptom). `resetLocalIndex` deletes
+      // index.db (+ -wal/-shm) then rebuilds from the S3-hydrated `.jsonl` files.
+      if (archive.isSqliteCorruption(e)) archive.resetLocalIndex();
+      else { archive.openDb(); archive.rebuildIndex(); }
+    } catch (e2) {
+      console.error(`archive index: file rebuild fallback failed (${e2 && e2.message})`);
+    }
+  } finally {
+    archive.setHydrating(false);
   }
 }
 // The seam a promoted leader calls before it starts serving (XERK-763); also run at
@@ -15135,6 +15151,14 @@ const server = http.createServer(async (req, res) => {
       const key = decodeURIComponent(parts[2]);
       const transcriptId = decodeURIComponent(parts[4]);
       if (!/^[A-Za-z0-9._-]+$/.test(transcriptId)) return json(res, 400, { error: "bad transcriptId" });
+      // While the local index cache is HYDRATING from Postgres (boot/promotion),
+      // refuse writes so an ingest `tx()` cannot interleave with the hydrate's bulk
+      // fts5 writes and corrupt the shared node:sqlite handle (XERK-789). 503 is the
+      // agent's retry signal (same contract as the budget 503 below); the read side
+      // already answers "still syncing" during this window. Inert off HA.
+      if (archive.isHydrating()) {
+        return json(res, 503, { error: "archive index is still syncing on this replica — retry" });
+      }
       // A raw push whose <file> segment was an unencoded `.`/`..` has had that
       // segment normalised away by the URL parser and arrives HERE, on the
       // rendered route, with a gzip body. No privilege is gained (the auth gate
@@ -15192,6 +15216,15 @@ const server = http.createServer(async (req, res) => {
         // included), the record is served to a browser, and the reply is what
         // the agent logs on the host (XERK-356 QA D9).
         console.error(`archive: could not store a chunk from ${key} for ${transcriptId}: ${e.message}`);
+        // A corrupt local cache is DISPOSABLE (XERK-789): drop + rebuild it from the
+        // local `.jsonl` files and tell the agent to RETRY (503), rather than 500-
+        // looping forever on a dead index (the prod symptom). resetLocalIndex is
+        // synchronous, so no ingest races the rebuild. Only fires on real corruption.
+        if (archive.isSqliteCorruption(e)) {
+          try { archive.resetLocalIndex(); }
+          catch (e2) { console.error(`archive: local index reset failed (${e2 && e2.message})`); }
+          return json(res, 503, { error: "archive index was corrupt; rebuilt — retry" });
+        }
         const stored = "the hub could not store this chunk — see the hub log";
         noteArchiveRefusal(transcriptId, key, stored);
         return json(res, 500, { error: stored });
@@ -15222,6 +15255,12 @@ const server = http.createServer(async (req, res) => {
       // at the syscall and report `skip` with no diagnostic at all (QA F6).
       if (!/^[A-Za-z0-9._-]{1,255}$/.test(transcriptId)) {
         return json(res, 400, { error: "bad transcriptId" });
+      }
+      // Refuse writes while the index cache hydrates — same reason as the rendered
+      // route (XERK-789): the raw ingest also touches the shared node:sqlite index
+      // (the sessions rawBytes cursor). 503 = retry. Inert off HA.
+      if (archive.isHydrating()) {
+        return json(res, 503, { error: "archive index is still syncing on this replica — retry" });
       }
       let rel;
       try { rel = decodeURIComponent(parts[6]); } catch { return json(res, 400, { error: "bad file" }); }
@@ -15263,6 +15302,13 @@ const server = http.createServer(async (req, res) => {
       try {
         return json(res, 200, archive.ingestRaw(key, transcriptId, rel, start, buf));
       } catch (e) {
+        // Self-heal a corrupt disposable cache + retry, like the rendered route (XERK-789).
+        if (archive.isSqliteCorruption(e)) {
+          console.error(`archive: could not store a raw chunk from ${key} for ${transcriptId}: ${e.message}`);
+          try { archive.resetLocalIndex(); }
+          catch (e2) { console.error(`archive: local index reset failed (${e2 && e2.message})`); }
+          return json(res, 503, { error: "archive index was corrupt; rebuilt — retry" });
+        }
         return json(res, 500, { error: e.message });
       }
     }
