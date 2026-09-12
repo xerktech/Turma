@@ -2708,6 +2708,31 @@ test("http: archive ingest is agent-authed; search/browse/view are user-authed",
   assert.deepEqual(emptyView.body.entries, []);
 });
 
+test("XERK-789: archive ingest refuses (503, retry) while the index is hydrating", async () => {
+  // The local node:sqlite index cache hydrates from Postgres on boot/promotion while
+  // the server already accepts ingest; an ingest tx() interleaving with the hydrate's
+  // bulk fts5 writes corrupts entries_fts. The routes gate on archive.isHydrating()
+  // and return 503 (the agent's retry signal), not a write that races the hydrate.
+  const archive = require("../archive.js");
+  const meta = { remoteKey: "github.com/xerk/hy", repo: "hy", worktree: "/w", slug: "-w",
+    createdAt: "2026-07-11T00:00:00Z", endedTs: "2026-07-11T01:00:00Z", summary: "Hydrating" };
+  const body = { startOffset: 0, endOffset: 30, size: 30, meta,
+    entries: [{ uuid: "hy1", role: "user", ts: "2026-07-11T00:00:00Z", text: "gate me while syncing" }] };
+  const rawBuf = require("zlib").gzipSync(Buffer.from("raw"));
+  try {
+    archive.setHydrating(true);
+    const rendered = await request("POST", "/api/agents/nas/archive/hytr", { body, headers: agentHeaders });
+    assert.equal(rendered.status, 503, "rendered ingest refuses while hydrating");
+    const raw = await rawPush("nas", "hytr", "x.jsonl", 0, rawBuf, { authorization: "Bearer agenttok" });
+    assert.equal(raw.status, 503, "raw ingest refuses while hydrating");
+  } finally {
+    archive.setHydrating(false);
+  }
+  // Once hydration is done, the same push is accepted.
+  const ok = await request("POST", "/api/agents/nas/archive/hytr", { body, headers: agentHeaders });
+  assert.equal(ok.status, 200, "ingest resumes after hydration clears");
+});
+
 test("http: heartbeat carries archiveHave cursors back for a manifest", async () => {
   // A manifest for a not-yet-synced transcript reports have=0.
   const beat1 = {

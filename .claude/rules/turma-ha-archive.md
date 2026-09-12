@@ -155,6 +155,22 @@ of-record**, so both halves of the ADR split now hold:
   out-of-band operator action; a bucket/of-record lifecycle rule removes it).
 - **`createIndexStore(haConfig, pool)` returns null with HA off / no pool / a fatal config**, so no
   sink is wired and the local SQLite is the whole story, byte-identical.
+- **The boot hydrate and live ingest MUST NOT write the local node:sqlite concurrently** (XERK-789,
+  the prod regression). `hydrateInto` `await`s each Postgres page, and the server accepts archive
+  ingest the whole time, so an `ingestChunk` `tx()` interleaves with the hydrate's bulk fts5 writes /
+  its `reset()` DELETE on the SAME `DatabaseSync` handle and PHYSICALLY corrupts `entries_fts`
+  ("database disk image is malformed" / "fts5: corruption found reading blob …"), after which every
+  later ingest on that replica fails and the archive silently stops. Two guards, both inert off HA:
+  - **Serialize**: `archive.setHydrating(true)` wraps `hydrateArchiveIndex` (through the fallback
+    rebuild, cleared in `finally`); the ingest ROUTES (`/archive/<id>` and `.../raw/...`) return
+    **503 "still syncing"** while `archive.isHydrating()` — the agent's retry signal, the documented
+    read-side "still syncing" extended to writes. Do NOT let ingest write the cache during a hydrate.
+  - **Self-heal**: the cache is DISPOSABLE, so a corruption is recovered with `archive.resetLocalIndex()`
+    — DELETE `index.db` (+ `-wal`/`-shm`) then `openDb()` rebuilds from the local `.jsonl` files —
+    NEVER by reopening the corrupt file (the old `openDb()+rebuildIndex()` fallback did exactly that and
+    failed identically). `hydrateArchiveIndex`'s catch and both ingest catches call it on
+    `archive.isSqliteCorruption(e)`, then 503. `resetLocalIndex` is fully SYNCHRONOUS, so no ingest
+    races the rebuild. Tests: the `XERK-789:` cases in `archive.test.js` + `server.test.js`.
 
 ## Wiring (server.js)
 

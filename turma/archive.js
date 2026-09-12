@@ -407,6 +407,50 @@ function closeDb() {
   if (db) { try { db.close(); } catch { /* already closed */ } db = null; }
 }
 
+// ---- boot/hydrate serialization + corrupt-cache self-heal (XERK-789) --------
+// The local node:sqlite index is a DISPOSABLE per-replica hot cache (HA, XERK-780).
+// Under HA it is HYDRATED from the Postgres of-record on boot/promotion WHILE the
+// server is already accepting archive ingest. Both the async paged hydrate
+// (`indexLoader`) and a live `ingestChunk` write the SAME single `DatabaseSync`
+// handle, and the hydrate `await`s each Postgres page — so an ingest `tx()`
+// interleaves with the hydrate's bulk fts5 writes / its `reset()` DELETE at every
+// await point and physically CORRUPTS `entries_fts` ("database disk image is
+// malformed" / "fts5: corruption found reading blob …"), after which every later
+// ingest on that replica fails. Two guards, both no-ops off HA:
+//   1. `hydrating` — set around the index hydrate (server.js `hydrateArchiveIndex`);
+//      the ingest ROUTES refuse with a 503 "still syncing" (the documented read
+//      behaviour, extended to writes) rather than write the cache concurrently.
+//      Set true only while a hydrate runs, so a non-HA hub (no hydrate) never sees it.
+//   2. `resetLocalIndex()` — the cache being disposable, a corruption is recovered
+//      by DELETING the index.db file (+ its -wal/-shm) and rebuilding from the local
+//      `.jsonl` files (themselves hydrated from the S3 of-record), NOT by reopening
+//      the corrupt file — which is exactly what the old fallback did, so it failed
+//      identically. Callers detect a corruption with `isSqliteCorruption`.
+let hydrating = false;
+function isHydrating() { return hydrating; }
+function setHydrating(v) { hydrating = !!v; }
+function isSqliteCorruption(e) {
+  // "database disk image is malformed" (SQLITE_CORRUPT), "fts5: corruption found …"
+  // (SQLITE_CORRUPT_VTAB), AND "file is not a database" (SQLITE_NOTADB) — a
+  // zeroed/header-corrupt index.db surfaces as NOTADB, which must also self-heal
+  // rather than 500-loop or reopen the dead file (XERK-789 QA).
+  return !!e && /\b(malformed|corrupt|corruption|fts5|not a database|notadb)\b/i
+    .test(String((e && e.message) || e));
+}
+// Drop the corrupt local cache FILE (not just the handle) and reopen fresh, so
+// `openDb()` rebuilds it from the on-disk `.jsonl` files (a fresh DB has zero
+// sessions → `openDb` runs `rebuildIndex`). Fully SYNCHRONOUS (closeDb + unlink +
+// openDb all in one tick), so no other write interleaves during the reset, and a
+// concurrent ingest cannot race the rebuild. Best-effort unlink: an absent
+// -wal/-shm is fine; a genuinely unremovable main file surfaces on the reopen.
+function resetLocalIndex() {
+  closeDb();
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try { fs.unlinkSync(ARCHIVE_DB + suffix); } catch { /* absent/raced is fine */ }
+  }
+  return openDb();
+}
+
 // node:sqlite's DatabaseSync has no .transaction() helper (unlike
 // better-sqlite3), so wrap a unit of work in BEGIN/COMMIT by hand. Not nested.
 function tx(fn) {
@@ -2620,6 +2664,9 @@ module.exports = {
   slugify, archiveRelPath, resolveNewRelPath, __RELPATH_PROBE_MAX: RELPATH_PROBE_MAX,
   ftsQuery, byteCeiling, shedFilePayloads,
   openDb, closeDb, rebuildIndex, setBlobSink,
+  // Boot/hydrate serialization + corrupt-cache self-heal (XERK-789) — all inert
+  // off HA (`hydrating` is only ever set around the HA index hydrate).
+  isHydrating, setHydrating, isSqliteCorruption, resetLocalIndex,
   // The Postgres INDEX of-record seam (XERK-780): the write sink + the hydration
   // bulk loader + the post-hydrate cursor reconcile (all no-ops off HA — the sink
   // stays unset, and the loader/reconcile only run on the HA hydrate path).

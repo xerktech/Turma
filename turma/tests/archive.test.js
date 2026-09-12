@@ -1482,3 +1482,52 @@ test("claudeTrajectory: an empty-array user content line opens no turn (XERK-714
   assert.equal(r.totals.turns, 1, "the [] line opens no turn");
   assert.equal(r.turns[0].user.text, "real turn");
 });
+
+// ---- XERK-789: hydrate/ingest serialization + corrupt-cache self-heal ----------
+
+test("XERK-789: isSqliteCorruption matches the real prod errors, not benign ones", () => {
+  // The exact strings prod logged (both replicas), plus the node:sqlite class.
+  assert.ok(archive.isSqliteCorruption(new Error("database disk image is malformed")));
+  assert.ok(archive.isSqliteCorruption(
+    new Error('fts5: corruption found reading blob 1236950581254 from table "entries_fts"')));
+  assert.ok(archive.isSqliteCorruption("SqliteError: database disk image is malformed"));
+  // SQLITE_NOTADB — a zeroed / header-corrupt index.db surfaces as this, and it
+  // must self-heal too rather than reopen the dead file (XERK-789 QA defect 2).
+  assert.ok(archive.isSqliteCorruption(new Error("file is not a database")));
+  // Benign / unrelated errors must NOT trip the self-heal (it deletes the cache).
+  assert.ok(!archive.isSqliteCorruption(new Error("UNIQUE constraint failed")));
+  assert.ok(!archive.isSqliteCorruption(new Error("disk I/O error")));
+  assert.ok(!archive.isSqliteCorruption(null));
+});
+
+test("XERK-789: setHydrating toggles the ingest gate the routes read", () => {
+  assert.equal(archive.isHydrating(), false, "default off");
+  archive.setHydrating(true);
+  assert.equal(archive.isHydrating(), true);
+  archive.setHydrating(false);
+  assert.equal(archive.isHydrating(), false);
+});
+
+test("XERK-789: resetLocalIndex drops a corrupt index.db and rebuilds from the files", () => {
+  // Ingest so an organized .jsonl + a populated index exist.
+  archive.ingestChunk("nas", "heal1", { ...META, summary: "Self Heal One" }, 0, 60, [
+    ent("h1", "user", "a searchable healing needle alpha"),
+    ent("h2", "assistant", "acknowledged the healing needle"),
+  ]);
+  // It is findable before the corruption.
+  assert.ok(archive.searchArchive("healing").groups.length > 0, "found before corruption");
+
+  // Physically corrupt the on-disk index.db (drop the handle, overwrite the file).
+  archive.closeDb();
+  fs.writeFileSync(process.env.ARCHIVE_DB, Buffer.from("this is not a sqlite database at all"));
+
+  // resetLocalIndex deletes the corrupt file and rebuilds from the .jsonl files —
+  // it must NOT reopen the corrupt file (the bug: the old fallback did, and failed).
+  archive.resetLocalIndex();
+
+  // The rebuilt-from-files index serves the transcript again.
+  const t = archive.getTranscript("heal1");
+  assert.ok(t && Array.isArray(t.entries) && t.entries.length >= 2, "transcript readable after heal");
+  assert.ok(archive.searchArchive("healing").groups.length > 0,
+    "searchable again after heal (rebuilt from files)");
+});
