@@ -318,6 +318,7 @@ function makeRelay(store, replicaId, deps = {}) {
   const endpoints = Object.create(null);
   let refreshTimer = null;
   let unwatch = null;
+  let unhealth = null;
 
   function storeFailed(e) {
     // Best-effort like every other store write here (XERK-235): an uncaught throw
@@ -457,6 +458,11 @@ function makeRelay(store, replicaId, deps = {}) {
   // pattern. Best-effort; a store without watch/scan (or HA off) simply leaves the
   // mirror to fill from live sets, and address-less `dial` still works.
   async function start() {
+    // Sets the LOCAL mirror synchronously (a self-dial edge) and attempts the
+    // store write. On a SharedLiveStore not yet connected this write REJECTS
+    // (caught) — the real publish lands on the ready edge below, not only on the
+    // 30s refresh timer, so a freshly-booted/promoted owner is dialable within a
+    // beat rather than un-dialable for up to ttlMs/3 (XERK-781 QA finding).
     publishEndpoint();
     if (store && typeof store.watch === "function") {
       unwatch = store.watch(RELAY_ENDPOINT_PREFIX, (ev) => {
@@ -469,9 +475,20 @@ function makeRelay(store, replicaId, deps = {}) {
         endpoints[replica] = { addr: v.addr, at: v.at };
       });
     }
+    // Re-publish this replica's endpoint on every store health→ready EDGE (initial
+    // connect AND every reconnect), the XERK-758 ledger pattern — the boot publish
+    // above races the socket, and a reconnect would otherwise leave the endpoint
+    // gone until the refresh timer. FileLiveStore has no `onHealth` and is ready
+    // synchronously, so this only arms on the shared backend.
+    if (endpoint && store && typeof store.onHealth === "function") {
+      unhealth = store.onHealth((h) => { if (h === "ready") publishEndpoint(); });
+    }
     if (store && typeof store.scan === "function") {
       try {
         if (store.ready) await store.ready();
+        // Now connected — land the endpoint write the boot call may have lost to a
+        // not-yet-connected socket, before serving any dial.
+        publishEndpoint();
         for (const { key, value } of await store.scan(RELAY_ENDPOINT_PREFIX)) {
           const replica = key.slice(RELAY_ENDPOINT_PREFIX.length);
           if (!replica || Object.prototype.hasOwnProperty.call(endpoints, replica)) continue; // watch won
@@ -489,6 +506,7 @@ function makeRelay(store, replicaId, deps = {}) {
   function stop() {
     if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
     if (unwatch) { try { unwatch(); } catch { /* best effort */ } unwatch = null; }
+    if (unhealth) { try { unhealth(); } catch { /* best effort */ } unhealth = null; }
     if (endpoint && store) {
       delete endpoints[replicaId];
       Promise.resolve(store.del(RELAY_ENDPOINT_PREFIX + replicaId)).catch(storeFailed);

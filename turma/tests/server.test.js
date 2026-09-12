@@ -19914,3 +19914,35 @@ test("XERK-781: openLiveRelay (origin side) fans an owner's relayed deltas to th
     hub.__setRelay(null);
   }
 });
+
+test("XERK-781: rearmOriginLiveRelays opens a relay channel for a waiting /live session when the owner appears", async () => {
+  const { Duplex } = require("node:stream");
+  const host = "xerk781-rearm";
+  const sid = "s1";
+  const owner = new Duplex({ read() {}, write(_c, _e, cb) { cb(); } });
+  let connects = 0;
+  hub.__setRelay({ connect: async () => { connects++; return owner; } });
+  const browser = { write() {}, destroy() {} };
+  // No control channel here => armLiveWatcher does not arm locally and no relay
+  // channel is opened yet (the host is offline everywhere at connect time).
+  hub.armLiveWatcher(host, sid, browser);
+  assert.equal(hub.liveRelayChannels[host]?.[sid], undefined, "no relay channel until an owner appears");
+  try {
+    hub.rearmOriginLiveRelays(host); // simulates the owner-appeared directory-watch edge
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(connects, 1, "the owner appearing opens the relay channel");
+    assert.ok(hub.liveRelayChannels[host]?.[sid], "the session is now backed by a relay channel");
+  } finally {
+    hub.disarmLiveWatcher(host, sid, browser);
+    hub.__setRelay(null);
+  }
+});
+
+test("XERK-781: dropOriginLiveRelays tears down relay channels when this replica becomes the owner", () => {
+  const host = "xerk781-drop";
+  let destroyed = false;
+  hub.liveRelayChannels[host] = { s1: { destroy() { destroyed = true; } } };
+  hub.dropOriginLiveRelays(host);
+  assert.equal(destroyed, true, "the redundant relay channel is destroyed");
+  assert.equal(hub.liveRelayChannels[host], undefined, "the host's relay-channel map is cleared");
+});

@@ -4461,7 +4461,13 @@ function watchTunnelDirectory() {
     const v = ev.value;
     // The bus is shared infrastructure — never trust the shape.
     if (!v || typeof v !== "object" || typeof v.replica !== "string" || typeof v.at !== "number") return;
+    const appeared = !hostTunnelOwners[host];
     hostTunnelOwners[host] = { replica: v.replica, at: v.at };
+    // A remote owner just came online — re-arm any /live sockets on THIS replica
+    // that were waiting for it (XERK-781). Only on the appear edge (not every
+    // refresh); openLiveRelay is idempotent + bails when it isn't a fresh remote
+    // owner or we already hold a channel, so this is cheap.
+    if (appeared && v.replica !== SSE_REPLICA_ID) rearmOriginLiveRelays(host);
   });
 }
 
@@ -13473,6 +13479,38 @@ function closeLiveSubscribers(host, sessionId) {
   for (const sock of [...set]) { try { sock.destroy(); } catch { /* gone */ } }
 }
 
+// ORIGIN re-arm: a remote owner just APPEARED for `host` (its directory entry
+// arrived on the tunnel-directory watch). Open a relay channel for any of this
+// replica's /live sessions on that host that has waiting subscribers but no
+// backing channel yet — the cross-replica twin of the single-process
+// control-reconnect re-arm (`/agent/control`). Without it a /live socket opened
+// while the host was offline everywhere never gets deltas once the host connects
+// to ANOTHER replica (XERK-781 QA finding). No-op if we own the tunnel (the local
+// watch already serves) or there is no fresh remote owner (openLiveRelay bails).
+function rearmOriginLiveRelays(host) {
+  if (!relay || controlChannels[host]) return;
+  const sessions = liveClients[host];
+  if (!sessions) return;
+  for (const sessionId of Object.keys(sessions)) {
+    if (!sessions[sessionId] || sessions[sessionId].size === 0) continue;
+    if (liveRelayChannels[host]?.[sessionId]) continue; // already backed
+    openLiveRelay(host, sessionId);
+  }
+}
+
+// This replica just BECAME the owner of `host`'s tunnel (its control channel
+// connected here). Any origin relay channels we held for it are now redundant —
+// the local watch (re-armed by the /agent/control handler) serves the deltas — so
+// drop them to avoid a double feed. Best-effort.
+function dropOriginLiveRelays(host) {
+  const byHost = liveRelayChannels[host];
+  if (!byHost) return;
+  for (const sessionId of Object.keys(byHost)) {
+    try { byHost[sessionId].destroy(); } catch { /* gone */ }
+  }
+  delete liveRelayChannels[host];
+}
+
 // OWNER: the relay's bridge for an inbound LIVE channel. Returns a Duplex whose
 // READABLE side carries this session's deltas (the relay pipes them to the origin)
 // and whose writable side is drained (the origin sends nothing but a close). It
@@ -17214,6 +17252,10 @@ server.on("upgrade", async (req, socket, head) => {
       const target = watchTargetFor(name, sessionId);
       if (target) controlChannels[name].sendWatch(sessionId, target);
     }
+    // We are now the OWNER — the local watch above serves this host's /live
+    // subscribers, so drop any origin relay channels we held for it (redundant,
+    // would double-feed). No-op with HA off (XERK-781).
+    dropOriginLiveRelays(name);
     // Liveness, in both directions — the channel is proven, never assumed.
     //
     // The protocol ping (0x9) beats Cloudflare's idle timeout and is what every
@@ -18071,7 +18113,7 @@ if (process.env.TURMA_TEST) {
     // test can drive the cross-replica paths with an injected relay (`__setRelay`).
     openChannel, openChannelLocal, openLiveForRelay, openLiveRelay,
     liveFanout, liveClients, liveRelayChannels, armLiveWatcher, disarmLiveWatcher,
-    RELAY_AUTH_TOKEN,
+    rearmOriginLiveRelays, dropOriginLiveRelays, RELAY_AUTH_TOKEN,
     siteKeyOf,
     orgPeers,
     boundOrgOf,

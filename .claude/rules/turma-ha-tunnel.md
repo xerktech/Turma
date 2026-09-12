@@ -140,6 +140,11 @@ server.js CONSTRUCTS the relay under HA and now WIRES the transport + all three 
   must inject `POD_IP` + expose the port pod-to-pod, and gate it with a NetworkPolicy). `relay.start()`
   publishes the endpoint + watches/hydrates peer endpoints; the listener + `relay.stop()` tear down on
   graceful drain.
+  - **The endpoint re-publishes on the store health→ready EDGE, not only the `ttlMs/3` refresh timer**
+    (XERK-781 QA). The boot publish races the not-yet-connected `SharedLiveStore` socket (rejects), so
+    without it a freshly-booted/promoted owner is un-dialable by peers for up to ~30s (a peer resolving
+    a null endpoint 502s `/term`, seeds `/live` from cache). The XERK-758 ledger pattern —
+    `store.onHealth("ready")` + a publish after `await store.ready()`.
 - **`openChannel(name, port)` is the DATA consumer + the owner-side bridge split** (the third ticket
   bullet — the dial-back "pairs only on the issuing replica" bug). `openChannelLocal` is the original
   pending-channel dance (agent dials `/agent/data` back to the replica that holds the control channel,
@@ -167,6 +172,11 @@ server.js CONSTRUCTS the relay under HA and now WIRES the transport + all three 
     owner — the ticket's "close the client stream with a reconnect hint, no hung sockets". This is a
     DIFFERENT event from XERK-252's local-tunnel-flap hold-in-place (same owner heals) — a cross-replica
     teardown may mean the owner CHANGED, so reconnect-to-re-resolve is correct.
+  - **The origin RE-ARMS when the owner appears** (`rearmOriginLiveRelays`, on the tunnel-directory
+    watch's owner-appeared edge) — the cross-replica twin of the single-process control-reconnect
+    re-arm: a /live socket opened while the host was offline EVERYWHERE, then connecting to ANOTHER
+    replica, would otherwise never get a channel. When THIS replica becomes the owner,
+    `dropOriginLiveRelays` tears down the now-redundant origin channels (the local watch serves).
 - **The agent is UNCHANGED** — the relay is hub-to-hub only; the owner runs the same `sendOpen`/
   `pendingChannels`/`sendWatch` dance and the agent dials `/agent/data` / tails as always. No
   `agent-tunnel.md` framing note is needed.

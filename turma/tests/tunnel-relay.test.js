@@ -474,6 +474,34 @@ test("XERK-781: a MATCHING auth token bridges normally", async () => {
   d.destroy();
 });
 
+test("XERK-781: the endpoint publishes on the store ready EDGE, not only the refresh timer", async () => {
+  // A store that REJECTS a write until it is connected (the SharedLiveStore boot
+  // shape), then becomes ready — the boot publish is lost, the ready-edge publish
+  // must land it (XERK-781 QA finding: don't wait out the ttlMs/3 refresh timer).
+  let ready = false;
+  const sets = [];
+  let resolveReady;
+  const readyP = new Promise((r) => { resolveReady = r; });
+  const fakeStore = {
+    set: async (k, v) => { if (!ready) throw new Error("store not connected"); sets.push(k); },
+    del: async () => {},
+    watch: () => () => {},
+    scan: async () => [],
+    ready: () => readyP,
+    onHealth: (cb) => { fakeStore._health = cb; return () => {}; },
+  };
+  const relay = makeRelay(fakeStore, "R-boot", { endpoint: "10.0.0.7:8390", ttlMs: 90000 });
+  const started = relay.start();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(sets.length, 0, "the pre-ready publish is rejected and recorded nothing");
+  ready = true;
+  resolveReady();
+  if (fakeStore._health) fakeStore._health("ready");
+  await started;
+  assert.ok(sets.includes(RELAY_ENDPOINT_PREFIX + "R-boot"), "the endpoint lands once the store is ready");
+  relay.stop();
+});
+
 test("XERK-777: frameConn honours a clean CLOSE frame as readable EOF", async () => {
   const [a, b] = await loopback();
   const da = frameConn(a, { max: 1 << 20 });
