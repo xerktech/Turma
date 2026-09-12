@@ -1562,6 +1562,42 @@ test("XERK-791: checkIndexIntegrity passes a healthy hydrated index", () => {
   assert.equal(archive.checkIndexIntegrity(), true, "healthy FTS5 index passes the check");
 });
 
+test("XERK-791: checkIndexIntegrity DETECTS a corrupt fts5 page (false, not a throw) and resetLocalIndex recovers", () => {
+  const M = { ...META, summary: "x791 corrupt" };
+  // Seed enough entries that entries_fts spills across multiple data pages.
+  for (let i = 0; i < 60; i++) {
+    archive.ingestChunk("nas791c", "x791c" + i, { ...M, summary: "x791 corrupt " + i },
+      0, 100, [ent("c" + i, "user", "corruptneedle alpha beta gamma delta epsilon " + i)]);
+  }
+  assert.equal(archive.checkIndexIntegrity(), true, "healthy before corruption");
+
+  // closeDb() checkpoints the WAL into the main file, so a data page overwritten
+  // there is authoritative on reopen. Corrupt the LAST entries_fts_data page (a
+  // leaf) — page 1 / schema / meta stay intact so openDb() still succeeds and the
+  // damage surfaces as an FTS5 corruption on the integrity check, not NOTADB.
+  archive.closeDb();
+  const { DatabaseSync } = require("node:sqlite");
+  const raw = new DatabaseSync(process.env.ARCHIVE_DB);
+  const ps = raw.prepare("PRAGMA page_size").get().page_size;
+  const pages = raw.prepare(
+    "SELECT pageno FROM dbstat WHERE name='entries_fts_data' ORDER BY pageno").all();
+  raw.close();
+  assert.ok(pages.length > 0, "seeded index has fts5 data pages to corrupt");
+  const pageno = pages[pages.length - 1].pageno;
+  const fd = fs.openSync(process.env.ARCHIVE_DB, "r+");
+  fs.writeSync(fd, Buffer.alloc(ps, 0xEE), 0, ps, (pageno - 1) * ps);
+  fs.closeSync(fd);
+
+  // The PROACTIVE check catches it as a boolean false (the caller resets), NEVER a
+  // throw that would escape hydrateArchiveIndex's try and leave a corrupt index served.
+  assert.equal(archive.checkIndexIntegrity(), false, "corruption detected proactively");
+  // resetLocalIndex drops the corrupt file and rebuilds from the .jsonl files.
+  archive.resetLocalIndex();
+  assert.equal(archive.checkIndexIntegrity(), true, "healthy again after the reset");
+  assert.ok(archive.searchArchive("corruptneedle").groups.length > 0,
+    "searchable again after rebuild-from-files");
+});
+
 test("XERK-789: resetLocalIndex drops a corrupt index.db and rebuilds from the files", () => {
   // Ingest so an organized .jsonl + a populated index exist.
   archive.ingestChunk("nas", "heal1", { ...META, summary: "Self Heal One" }, 0, 60, [
