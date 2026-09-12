@@ -78,15 +78,19 @@ store, not failover.
   known-good single-process hub against a cluster that still has the wiring.
 
 Precedence: an explicit `HA_MODE` (1/0) wins over URL presence. The effective mode **prints at boot**
-— `HA: on (store=valkey, ledger+index=postgres, blobs=s3)` or `HA: off (single-process)` — so you can
-tell a correctly-wired hub from one whose env moved under it.
+— `HA: on (store=valkey, ledger=valkey, index=sqlite(local, rebuilt from s3), blobs=s3)` or
+`HA: off (single-process)` — so you can tell a correctly-wired hub from one whose env moved under it.
+The boot line names the backends **actually in use**: the usage ledger's high-water lives in the
+Valkey live store (XERK-758) and the archive index is a local SQLite file rebuilt from the S3 bytes
+(XERK-759). `DATABASE_URL` is still required (below) but no backend consumes Postgres yet; when a
+Postgres ledger/index of-record lands, the boot line reads `ledger+index=postgres` again.
 
 ### Required env when HA is on (all-or-nothing)
 
 | Var | Selects | Example |
 |---|---|---|
 | `TURMA_STORE_URL` | Live plane → Valkey (redis-wire). **Also the HA-on signal when `HA_MODE` is unset.** | `rediss://valkey.turma.svc:6379/0` |
-| `DATABASE_URL` | Usage ledger + archive index → Postgres (CloudNativePG) | `postgres://turma:…@pg.turma.svc:5432/turma` |
+| `DATABASE_URL` | Reserved for the future Postgres ledger + index of-record (CloudNativePG). **Required, but provisioned ahead of use** — no backend writes it yet (ledger→Valkey, index→local SQLite). | `postgres://turma:…@pg.turma.svc:5432/turma` |
 | `ARCHIVE_S3_ENDPOINT` | Archive **bytes** → object storage (MinIO/S3) | `https://minio.turma.svc:9000` |
 | `ARCHIVE_S3_BUCKET` | " | `turma-archive` |
 | `ARCHIVE_S3_REGION` | " (the one S3 var with a default: `us-east-1`) | `us-east-1` |
@@ -118,8 +122,11 @@ The manifests live in **`xerktech/ArgoCD`, not in this repo**:
   release rewrites this Application's image tag and Argo CD (`automated`) syncs it; that image bump is
   exactly the deploy this HA work makes invisible.
 - **`ai/turma-store/`** — the shared store the [store ADR](turma-ha-store-adr.md) selected: Valkey
-  (live plane), CloudNativePG (usage ledger + archive index of-record), and MinIO/S3 (archive bytes
-  of-record). This is the "new stateful dependency in the cluster" the design flags as an operator
+  (live plane, **and today the usage-ledger backend too**), MinIO/S3 (archive bytes of-record), and
+  CloudNativePG. **The Postgres cluster is provisioned ahead of use** — the ADR designates it the
+  ledger + index of-record, but no backend consumes it yet (the ledger lives in Valkey, the index is
+  local SQLite rebuilt from S3), so it will sit idle with no application tables until that backend
+  lands. This is the "new stateful dependency in the cluster" the design flags as an operator
   decision. Point the hub's `TURMA_STORE_URL` / `DATABASE_URL` / `ARCHIVE_S3_*` at these services.
 
 This repo owns the hub code and this guide; the sections below are the manifest shapes an operator
@@ -267,9 +274,10 @@ mid-drain.
 ### Storage under HA — no RWO volume blocks failover
 
 - **State** (fleet registry, queues, migration record, policy/pins, OIDC side-stores) lives in
-  **Valkey**; the **usage ledger** and **archive index** in **Postgres**; the **archive bytes** in
-  **object storage**. None of it is on a pod-local volume, so a standby is promotable with no volume
-  detach/attach.
+  **Valkey**; the **usage ledger** in **Valkey** too (XERK-758, ADR divergence — Postgres has no
+  client yet); the **archive index** is a local SQLite file rebuilt from the object-store bytes
+  (XERK-759, next bullet); the **archive bytes** in **object storage**. None of the durable state is
+  on a pod-local volume, so a standby is promotable with no volume detach/attach.
 - The archive **index is a local, disposable SQLite file rebuilt from the object-store bytes**
   (XERK-759), not a shared file — there is no shared SQLite to corrupt. A **just-promoted** standby
   hydrates and rebuilds it before serving archive reads, so archive queries can briefly `404`
@@ -281,8 +289,10 @@ mid-drain.
 
 ## Verifying a deploy
 
-- **Boot line:** `kubectl logs` a hub pod and confirm `HA: on (store=valkey, ledger+index=postgres,
-  blobs=s3)`. `HA: off` on a pod you expected to be HA means the store env didn't reach it.
+- **Boot line:** `kubectl logs` a hub pod and confirm `HA: on (store=valkey, ledger=valkey,
+  index=sqlite(local, rebuilt from s3), blobs=s3)`. `HA: off` on a pod you expected to be HA means
+  the store env didn't reach it. (The line names the backends actually wired — Postgres is
+  provisioned ahead of use and receives no writes yet, so an empty `turma` database is expected.)
 - **Leadership:** exactly one pod's `/readyz` returns `200`; the rest return `503 {leader:false}`.
   `kubectl get lease turma-hub-leader -n turma -o yaml` shows the current holder.
 - **Low-blip deploy:** bump the image (or `kubectl rollout restart deploy/turma-hub`) and hold an

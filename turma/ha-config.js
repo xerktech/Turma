@@ -49,6 +49,27 @@ const S3_VARS = [
 // one is a misconfig, not a default.
 const S3_REGION_DEFAULT = "us-east-1";
 
+// Whether a Postgres LedgerStore/IndexStore backend is actually WIRED and consuming
+// DATABASE_URL (XERK-773). The ADR (docs/turma-ha-store-adr.md) designates Postgres
+// the durable of-record for the usage ledger + archive index, but no such backend
+// exists yet: the hub is stdlib-only with no Postgres client, so the ledger's
+// high-water lives in the Valkey LiveStore (XERK-758) and the archive index is a
+// local node:sqlite rebuilt from the S3 bytes (XERK-759). DATABASE_URL stays REQUIRED
+// under HA (validated below) so the cluster is provisioned ahead of use — but the boot
+// line must name the backends ACTUALLY in use, never the intended ones, or it lies to
+// the operator (turma-postgres sat idle with zero tables for hours in prod).
+// When a Postgres LedgerStore/IndexStore lands, flip this to true IN THE SAME CHANGE
+// that wires it, and the boot line reads `ledger+index=postgres` again.
+const POSTGRES_BACKEND_WIRED = false;
+
+// The of-record segment of the boot line: the intended Postgres backend once wired,
+// else the backends genuinely in use today. Kept beside the flag so the two never drift.
+function ledgerIndexBootSegment() {
+  return POSTGRES_BACKEND_WIRED
+    ? "ledger+index=postgres"
+    : "ledger=valkey, index=sqlite(local, rebuilt from s3)";
+}
+
 // A store URL must be a redis/rediss (Valkey is redis-wire) URL that actually
 // parses and names a host — a malformed one is a boot refusal, never a runtime
 // surprise (the ADR: "a malformed store URL is a boot refusal").
@@ -160,7 +181,10 @@ function resolveHaConfig(env) {
   }
 
   if (!databaseUrl) {
-    fatal.push("HA is on but DATABASE_URL (Postgres ledger + archive index) is not set");
+    // Required, but provisioned AHEAD OF USE: no Postgres backend consumes it yet
+    // (POSTGRES_BACKEND_WIRED). The requirement stands so the CloudNativePG cluster the
+    // future LedgerStore/IndexStore needs is in place before that backend lands (XERK-773).
+    fatal.push("HA is on but DATABASE_URL (Postgres ledger + archive index of-record) is not set");
   } else {
     const p = parseDatabaseUrl(databaseUrl);
     if (!p.ok) fatal.push(`DATABASE_URL is invalid: ${p.reason}`);
@@ -183,7 +207,7 @@ function resolveHaConfig(env) {
 
   const bootLine = fatal.length
     ? "HA: on — but the configuration is INCOMPLETE (see errors above); refusing to boot"
-    : "HA: on (store=valkey, ledger+index=postgres, blobs=s3)";
+    : `HA: on (store=valkey, ${ledgerIndexBootSegment()}, blobs=s3)`;
 
   return {
     ha: true,
@@ -197,4 +221,12 @@ function resolveHaConfig(env) {
   };
 }
 
-module.exports = { resolveHaConfig, parseStoreUrl, parseDatabaseUrl, S3_VARS, S3_REGION_DEFAULT };
+module.exports = {
+  resolveHaConfig,
+  parseStoreUrl,
+  parseDatabaseUrl,
+  S3_VARS,
+  S3_REGION_DEFAULT,
+  POSTGRES_BACKEND_WIRED,
+  ledgerIndexBootSegment,
+};
