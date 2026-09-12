@@ -15358,6 +15358,70 @@ test("XERK-782: a FOLLOWER write-throughs a record it MUTATED, never one it only
   });
 });
 
+// ---- XERK-785: cross-replica migration bundle bytes (relay the blob) ---------
+// The record + its blobPath/blobSize mirror cross-replica already (XERK-778/782),
+// but the spool is a per-pod emptyDir, so the target's pull can land on a replica
+// that never got the bytes. The upload now records WHICH replica spooled them
+// (`blobReplica`); a pull elsewhere relay-fetches from that replica. These pin the
+// record plumbing + the owner-side bridge; the transport is proven in
+// tunnel-relay.test.js, and the HTTP-route wiring end-to-end by QA on a live fleet.
+
+test("XERK-785: openMigrationBlobForRelay serves a spooled bundle to the owner-side relay", async () => {
+  const id = "785bbbb000000001";
+  const spool = migrationSpoolPath(id);
+  fs.writeFileSync(spool, "MIGRATIONBYTES");
+  migrations.set(id, {
+    id, srcHost: "s", targetHost: "t", phase: "importing", meta: {},
+    blobPath: spool, blobSize: 14, blobReplica: "R-owner", at: 0, startedAt: 0,
+  });
+  try {
+    const blob = await hub.openMigrationBlobForRelay(id);
+    assert.ok(blob && blob.stream, "the owner returns the bundle's read stream");
+    assert.equal(blob.size, 14, "with the recorded byte length (the origin's Content-Length)");
+    const got = await new Promise((resolve) => {
+      const chunks = [];
+      blob.stream.on("data", (c) => chunks.push(c));
+      blob.stream.on("end", () => resolve(Buffer.concat(chunks)));
+    });
+    assert.equal(got.toString(), "MIGRATIONBYTES", "every byte streams from the spool file");
+
+    assert.equal(await hub.openMigrationBlobForRelay("785nonexistent00"), null,
+      "an unknown migration id => null (the relay hints no-bundle)");
+
+    dropMigrationBlob(migrations.get(id));
+    assert.equal(migrations.get(id).blobReplica, null,
+      "dropping the bundle clears blobReplica too (no stale owner pointer)");
+    assert.equal(await hub.openMigrationBlobForRelay(id), null,
+      "a dropped/settled bundle is no longer served");
+  } finally {
+    migrations.delete(id);
+    try { fs.unlinkSync(spool); } catch { /* already gone */ }
+  }
+});
+
+test("XERK-785: the leader forward-learns blobReplica so a cross-replica pull can be relayed", async () => {
+  await withWatchedMigrationStore(async (store) => {
+    hub.__setLeader(fakeLeader(true)); // this replica is the leader/advancer
+    const id = "785aaaa000000001";
+    // A follower started the move (operator POST landed there); the leader adopts it.
+    await store.set(MIGRATION_KEY_PREFIX + id, {
+      id, srcHost: "s1", targetHost: "t1", phase: "exporting", meta: {}, at: Date.now(), startedAt: Date.now(),
+    });
+    // The blob upload landed on a DIFFERENT follower, which recorded ITSELF as the
+    // owner of the spooled bytes. The leader forward-merges blobReplica alongside
+    // blobPath/blobSize, so a pull that lands on the leader can relay to that owner.
+    await store.set(MIGRATION_KEY_PREFIX + id, {
+      id, srcHost: "s1", targetHost: "t1", phase: "importing", meta: {},
+      importCmdId: "imp785", blobPath: migrationSpoolPath(id), blobSize: 5, blobReplica: "R-follower",
+      at: Date.now(), startedAt: Date.now(),
+    });
+    assert.equal(migrations.get(id).blobReplica, "R-follower",
+      "the leader learns which replica holds the bundle bytes");
+    migrations.delete(id);
+    await store.del(MIGRATION_KEY_PREFIX + id);
+  });
+});
+
 // ---- XERK-763: leader election + shared single-flight guards -----------------
 // Under HA (Option 2) the singleton sweeps + migration-advance run on the LEADER
 // only, and the guards those sweeps rely on are WRITE-THROUGH mirrored to the

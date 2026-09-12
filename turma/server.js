@@ -3586,6 +3586,7 @@ function dropMigrationBlob(m) {
   if (!p) return;
   m.blobPath = null;
   m.blobSize = 0;
+  m.blobReplica = null; // no replica holds the bytes any more (XERK-785)
   fs.unlink(p, () => {});
 }
 
@@ -3826,7 +3827,7 @@ function applyRemoteMigration(id, value) {
     if (typeof value.error === "string" && value.error) cur.error = value.error;
     changed = true;
   }
-  for (const f of ["importCmdId", "blobPath", "blobSize", "targetSessionId", "transcriptId"]) {
+  for (const f of ["importCmdId", "blobPath", "blobSize", "blobReplica", "targetSessionId", "transcriptId"]) {
     if (value[f] != null && cur[f] == null) { cur[f] = value[f]; changed = true; }
   }
   if (changed) { cur.at = Date.now(); invalidateAgentsCache(); }
@@ -13759,6 +13760,31 @@ function openLiveForRelay(host, sessionId) {
   return Promise.resolve(d);
 }
 
+// OWNER side of the cross-replica migration-blob relay (XERK-785). This replica
+// spooled the bundle for migration `id` (its `blobReplica` names us); return the
+// bundle's read stream + byte length for the relay to pipe back to the ORIGIN
+// replica the target agent's pull landed on. Resolves null when this replica does
+// not (any more) hold it — a settled/dropped move, or a stale pointer — so the
+// relay hints "no-bundle" and the origin answers the same 404 the local GET does.
+function openMigrationBlobForRelay(id) {
+  const m = migrations.get(id);
+  if (!m || !m.blobPath) return Promise.resolve(null);
+  // Snapshot path + size together before the stream opens — the SAME race the local
+  // GET guards: a concurrent dropMigrationBlob zeroes both while the open fd stays
+  // valid, which would otherwise stream the full body under a Content-Length of 0.
+  const blobPath = m.blobPath;
+  const size = m.blobSize;
+  return new Promise((resolve) => {
+    const stream = fs.createReadStream(blobPath);
+    // Resolve only on `open` (the file exists + is readable), so a vanished/
+    // unreadable spool becomes a clean "no-bundle" hint rather than a truncated
+    // stream. An error after `open` (mid-read) is handled by the relay's own
+    // stream-error teardown; this listener has already resolved and no-ops.
+    stream.once("open", () => resolve({ stream, size }));
+    stream.once("error", () => resolve(null));
+  });
+}
+
 // ---- terminal proxy ---------------------------------------------------------
 // Proxy an HTTP asset request (ttyd HTML/JS/token) through the agent's tunnel.
 //
@@ -15268,6 +15294,13 @@ const server = http.createServer(async (req, res) => {
       }
       m.blobPath = spool;
       m.blobSize = size;
+      // Record WHICH replica holds the bytes (XERK-785). Under active-active HA the
+      // spool is a per-pod emptyDir, so the target's pull can land on a replica that
+      // never received this upload; it reads `blobReplica` off the hot-mirrored
+      // record and relay-fetches the bundle from here. Single-process / same-replica
+      // pull ignores it (serves the local file). It rides the record's own mirror
+      // (`mirrorMigration` copies the whole record; the leader forward-learns it).
+      m.blobReplica = SSE_REPLICA_ID;
       m.phase = "importing";
       m.at = Date.now();
       // Hand the target everything it needs to resume the moved session as its
@@ -15332,6 +15365,53 @@ const server = http.createServer(async (req, res) => {
       // `Content-Length: 0`, which the agent's urllib read as an empty bundle.
       const blobPath = m.blobPath;
       const blobSize = m.blobSize;
+      const blobReplica = m.blobReplica;
+      // Cross-replica pull under active-active HA (XERK-785): the bytes were spooled
+      // on ANOTHER replica's per-pod emptyDir (the source's upload landed there),
+      // so this replica's local spool is empty. Relay-fetch the bundle from the
+      // owning replica over the same pod-to-pod transport that carries `/term` and
+      // `/live` (XERK-777/781) — the store stays byte-free. `connectMigration`
+      // returns null (fall through to the local read) when the owner is US; it
+      // rejects on a dial failure — including an unresolved peer endpoint — which we
+      // log + 404 (the move times out safely, source intact, and self-heals).
+      if (relay && migrationStoreShared && blobReplica && blobReplica !== SSE_REPLICA_ID) {
+        let d;
+        try {
+          d = await relay.connectMigration(blobReplica, id);
+        } catch (e) {
+          console.error(`migration ${id}: blob relay dial failed: ${(e && e.message) || e}`);
+          return json(res, 404, { error: "no bundle" });
+        }
+        if (d) {
+          let started = false;
+          d.on("hint", (obj) => {
+            if (!obj || typeof obj !== "object") return;
+            // The owner acknowledges with `{t:"blob",size}` before it streams; write
+            // the 200 (its size is the authoritative one — it is the file about to
+            // arrive) and pipe the bytes through. Any TEARDOWN hint (no-bundle /
+            // relay-error / not-owner) arrives BEFORE that, so `started` is false and
+            // the `close` handler answers 404.
+            if (obj.t === "blob" && !started && !res.headersSent) {
+              started = true;
+              const len = Number.isInteger(obj.size) ? obj.size : blobSize;
+              res.writeHead(200, {
+                "Content-Type": "application/octet-stream",
+                "Content-Length": len,
+                "Cache-Control": "no-store",
+              });
+              d.pipe(res);
+            }
+          });
+          d.on("close", () => {
+            if (!started && !res.headersSent) json(res, 404, { error: "no bundle" });
+          });
+          d.on("error", () => {}); // teardown is surfaced via close; never re-throw
+          res.on("close", () => { if (!d.destroyed) d.destroy(); });
+          return;
+        }
+        // d === null: owner is this replica after all, or its endpoint has not landed
+        // yet — fall through to the local read (404 if this pod lacks the file).
+      }
       // Streamed off the spool file, so handing a 65 MiB bundle down costs the
       // hub a read buffer rather than a second copy of the whole thing.
       const stream = fs.createReadStream(blobPath);
@@ -18354,7 +18434,7 @@ if (process.env.TURMA_TEST) {
     // OWNER-side bridges; `liveFanout`/`liveClients`/`liveRelayChannels` +
     // `armLiveWatcher`/`disarmLiveWatcher` are the `/live` machinery. Exported so a
     // test can drive the cross-replica paths with an injected relay (`__setRelay`).
-    openChannel, openChannelLocal, openLiveForRelay, openLiveRelay,
+    openChannel, openChannelLocal, openLiveForRelay, openLiveRelay, openMigrationBlobForRelay,
     liveFanout, liveClients, liveRelayChannels, armLiveWatcher, disarmLiveWatcher,
     rearmOriginLiveRelays, dropOriginLiveRelays, RELAY_AUTH_TOKEN,
     siteKeyOf,
@@ -18531,6 +18611,7 @@ if (process.env.TURMA_TEST) {
       localTunnel: (host) => !!controlChannels[host],
       openLocal: openChannelLocal, // the DATA bridge (owner side), never the relay-aware wrapper
       openLive: openLiveForRelay, // the LIVE delta bridge (owner side)
+      openBlob: openMigrationBlobForRelay, // the migration-bundle bridge (owner side, XERK-785)
       dial: relayDial,
       endpoint: relayEndpointAddr(),
       authToken: RELAY_AUTH_TOKEN,

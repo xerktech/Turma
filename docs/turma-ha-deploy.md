@@ -343,8 +343,11 @@ mid-drain.
   answers `Ready`, so archive reads are served straight away rather than briefly `404`-ing
   "still syncing".
 - You do **not** need the `turma-data` RWO PVC under HA. Keep one only if you run a replica with
-  `HA_MODE=0` against the same cluster (the escape hatch). The relay spool / `MIGRATE_SPOOL_DIR` must
-  be an **RWX** mount so any replica can resolve an in-flight migration's bundle.
+  `HA_MODE=0` against the same cluster (the escape hatch). The migration spool / `MIGRATE_SPOOL_DIR`
+  stays a **per-pod `emptyDir`** — it does **not** need an RWX mount (XERK-785, superseding the earlier
+  RWX note): an in-flight migration's bundle bytes are RELAYED from the replica that spooled them to
+  the replica the pull lands on, over the same pod-to-pod byte relay `/term`/`/live` use (needs the
+  `RELAY_PORT` reachable pod-to-pod + `POD_IP` injected, which HA already requires).
 
 ---
 

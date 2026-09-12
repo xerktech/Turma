@@ -513,3 +513,84 @@ test("XERK-777: frameConn honours a clean CLOSE frame as readable EOF", async ()
   da.destroy();
   db.destroy();
 });
+
+// ---- XERK-785: the migration-bundle channel (replica-addressed) --------------
+// Under active-active HA the migration spool is a per-pod emptyDir, so the target
+// agent's blob pull can land on a replica that never received the source's upload.
+// `connectMigration` dials the OWNING replica by id (server.js `m.blobReplica`,
+// NOT a host-tunnel owner) and streams the bundle back over the same transport.
+
+test("XERK-785: connectMigration streams the owner's bundle bytes back to the origin", async () => {
+  const { Readable } = require("node:stream");
+  const [originConn, ownerConn] = await loopback();
+  const payload = Buffer.from("BUNDLE-".repeat(5000)); // > one frame's worth of bytes
+  let askedId = null;
+  const owner = makeRelay(null, "R-owner", {
+    localTunnel: () => false, // migration is replica-addressed, never host-owned
+    openBlob: async (id) => { askedId = id; return { stream: Readable.from([payload]), size: payload.length }; },
+  });
+  owner.accept(ownerConn);
+
+  const origin = makeRelay(null, "R-A", { dial: async () => originConn });
+  const d = await origin.connectMigration("R-owner", "mig785aaa00000001");
+  assert.ok(d, "a remote replica yields a relay duplex");
+
+  const bytesP = readAll(d); // attach data/end listeners BEFORE awaiting anything
+  const sizeP = new Promise((resolve) => d.on("hint", (o) => { if (o && o.t === "blob") resolve(o.size); }));
+  assert.equal(await sizeP, payload.length, "the owner acks the exact bundle size before streaming");
+  assert.equal(Buffer.compare(await bytesP, payload), 0, "every byte of the bundle arrives at the origin");
+  assert.equal(askedId, "mig785aaa00000001", "the handshake names the migration id, not a host");
+  d.destroy();
+});
+
+test("XERK-785: a bundle the owner no longer holds hints no-bundle and closes clean", async () => {
+  const [originConn, ownerConn] = await loopback();
+  const owner = makeRelay(null, "R-owner", { localTunnel: () => false, openBlob: async () => null });
+  owner.accept(ownerConn);
+  const origin = makeRelay(null, "R-A", { dial: async () => originConn });
+  const d = await origin.connectMigration("R-owner", "gone785000000000");
+  const closed = new Promise((r) => d.on("close", r));
+  const hint = await new Promise((r) => d.once("hint", r));
+  assert.equal(hint.reason, "no-bundle", "the origin is told the bundle is gone (it 404s)");
+  await closed; // never left hung
+});
+
+test("XERK-785: connectMigration to THIS replica returns null (serve locally), never dials", async () => {
+  let dialed = 0;
+  const relay = makeRelay(null, "R-self", { dial: async () => { dialed++; return (await loopback())[0]; } });
+  assert.equal(await relay.connectMigration("R-self", "x785000000000000"), null);
+  assert.equal(dialed, 0, "the owner is us => no dial, the caller reads its own spool");
+});
+
+test("XERK-785: a mismatched auth token refuses a migration channel (unauthorized)", async () => {
+  const [originConn, ownerConn] = await loopback();
+  let openBlobCalls = 0;
+  const owner = makeRelay(null, "R-owner", {
+    authToken: "right", localTunnel: () => false,
+    openBlob: async () => { openBlobCalls++; return null; },
+  });
+  owner.accept(ownerConn);
+  const origin = makeRelay(null, "R-A", { authToken: "wrong", dial: async () => originConn });
+  const d = await origin.connectMigration("R-owner", "m785000000000000");
+  const closed = new Promise((r) => d.on("close", r));
+  const hint = await new Promise((r) => d.once("hint", r));
+  assert.equal(hint.reason, "unauthorized");
+  assert.equal(openBlobCalls, 0, "an unauthenticated in-cluster peer never reaches the bundle");
+  await closed;
+});
+
+test("XERK-785: a migration channel to an owner with no blob bridge hints relay-error", async () => {
+  const [originConn, ownerConn] = await loopback();
+  const owner = makeRelay(null, "R-owner", { localTunnel: () => false }); // no openBlob dep
+  owner.accept(ownerConn);
+  const origin = makeRelay(null, "R-A", { dial: async () => originConn });
+  const d = await origin.connectMigration("R-owner", "m785000000000001");
+  const hint = await new Promise((r) => d.once("hint", r));
+  assert.equal(hint.reason, "relay-error");
+});
+
+test("XERK-785: a failed dial rejects connectMigration cleanly (replica loss), never hangs", async () => {
+  const origin = makeRelay(null, "R-A", { dial: async () => { throw new Error("ECONNREFUSED"); } });
+  await assert.rejects(() => origin.connectMigration("R-gone", "m785000000000002"),
+    /relay migration dial to R-gone failed/);
+});
