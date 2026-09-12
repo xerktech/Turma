@@ -2754,6 +2754,30 @@ test("http: heartbeat carries archiveHave cursors back for a manifest", async ()
   assert.equal("archiveFull" in r2.body, false);
 });
 
+test("XERK-789: the beat's archive-cursor path is skipped while the index is hydrating", async () => {
+  // manifestCursors/inventoryCursors INSERT placeholder rows and archiveLimits can
+  // rebuild/VACUUM the local index — all WRITES that would race the async hydrate on
+  // the same node:sqlite handle and corrupt it. The beat must NOT touch the index
+  // while hydrating; the agent reads the absent archiveHave as "zero" and re-offers.
+  const archive = require("../archive.js");
+  const beat = { device: "nas",
+    archiveManifest: [{ transcriptId: "tr-hy-beat", slug: "s", repo: "turma",
+      remoteKey: "github.com/xerk/turma", size: 999 }] };
+  try {
+    archive.setHydrating(true);
+    const r = await request("POST", "/api/heartbeat", { body: beat, headers: agentHeaders });
+    assert.equal(r.status, 200, "the beat still succeeds while hydrating");
+    assert.equal(r.body.archiveHave, undefined, "no cursors computed (index untouched) during hydrate");
+    // The placeholder row was NOT created — the index was not written on the beat.
+    assert.equal(archive.getTranscript("tr-hy-beat"), null, "no placeholder row written during hydrate");
+  } finally {
+    archive.setHydrating(false);
+  }
+  // Once hydration clears, the same manifest gets its cursor back (have=0, new id).
+  const after = await request("POST", "/api/heartbeat", { body: beat, headers: agentHeaders });
+  assert.equal(after.body.archiveHave["tr-hy-beat"], 0, "cursor path resumes after hydration");
+});
+
 test("http: XERK-431 the inverted path — an inventory gets back only what the hub is SHORT of", async () => {
   // tr1 is fully stored at 120 bytes (above). An inventory reporting its current
   // size as 120 must NOT be wanted; the same id at 500 IS wanted from 120; a
