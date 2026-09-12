@@ -283,6 +283,13 @@ function attachLiveness(d, { pingMs, deadMs, now }) {
 //                session's newline-delimited `/live` JSON deltas (server.js
 //                `openLiveForRelay`); the LIVE-channel bridge, owner side only. A
 //                `kind:"live"` handshake routes here instead of `openLocal`.
+//   openBlob     (id) => Promise<{stream, size} | null> a migration bundle's byte
+//                stream + length (server.js `openMigrationBlobForRelay`), owner side
+//                only. A `kind:"migration"` handshake — addressed to a REPLICA id via
+//                `connectMigration`, not a host tunnel — routes here (XERK-785): the
+//                owner replica that spooled the bundle streams it back to the origin
+//                replica the target agent's pull landed on. Null => owner no longer
+//                holds it => the origin gets a "no-bundle" hint and 404s.
 //   dial         (replica, addr) => Promise<Duplex> raw pod-to-pod byte channel
 //                (prod: connect to the peer's relay listener; tests: a loopback pair)
 //   endpoint     this replica's own dialable address, published to the directory so
@@ -300,6 +307,7 @@ function makeRelay(store, replicaId, deps = {}) {
     localTunnel = () => false,
     openLocal,
     openLive,
+    openBlob,
     dial,
     endpoint = null,
     authToken = null,
@@ -374,6 +382,31 @@ function makeRelay(store, replicaId, deps = {}) {
     return d;
   }
 
+  // ORIGIN, migration-bundle variant (XERK-785). Addressed to a REPLICA id (the one
+  // that spooled the bundle — server.js `m.blobReplica`), NOT a host-tunnel owner:
+  // the migration blob's owner is "whichever replica the source's POST landed on",
+  // unrelated to any host's tunnel. Returns a duplex whose readable carries a
+  // `{t:"blob",size}` CTRL frame followed by the raw bundle bytes, or null when the
+  // replica is US (the caller then serves its own local spool). Rejects on a dial
+  // failure — including an UNRESOLVED/stale endpoint, which `dial` refuses — so the
+  // caller can log + 404 it; the move then times out with the source intact (the
+  // documented SAFE failure), and it self-heals once the endpoint directory catches
+  // up. Same null-is-local / reject-is-failure contract as `connect`.
+  async function connectMigration(replica, id) {
+    if (!replica || replica === replicaId) return null; // ours — serve locally
+    const addr = endpointAddr(replica); // may be null; `dial` refuses an unresolved addr
+    let conn;
+    try {
+      conn = await dial(replica, addr);
+    } catch (e) {
+      throw new Error(`relay migration dial to ${replica} failed: ${(e && e.message) || e}`);
+    }
+    const d = frameConn(conn, { max: frameMax, label: `relay-migration->${replica}` });
+    d.sendCtrl({ t: "open", kind: "migration", id, auth: authToken || undefined });
+    attachLiveness(d, { pingMs, deadMs, now });
+    return d;
+  }
+
   // OWNER / SERVE. The relay LISTENER (boot/consumer scope) hands each inbound raw
   // duplex here. Read the handshake, verify THIS replica still owns the host, bridge
   // to the local agent tunnel, and pipe both ways. Every refusal/failure closes with
@@ -387,12 +420,15 @@ function makeRelay(store, replicaId, deps = {}) {
       onCtrl: async (obj) => {
         if (obj && obj.t === "ping") { d.sendCtrl({ t: "pong" }); return; }
         if (obj && obj.t === "pong") return;
-        if (handshook || !obj || obj.t !== "open" || typeof obj.host !== "string") return;
+        if (handshook || !obj || obj.t !== "open") return;
+        const kind = obj.kind === "live" ? "live" : obj.kind === "migration" ? "migration" : "data";
+        // A data/live channel names a HOST (its tunnel owner); a migration channel
+        // names a migration ID (it is replica-addressed, not host-owned, XERK-785).
+        if (kind === "migration" ? typeof obj.id !== "string" : typeof obj.host !== "string") return;
         handshook = true;
         clearTimeout(hsTimer);
         const host = obj.host;
         const port = obj.port;
-        const kind = obj.kind === "live" ? "live" : "data";
         // This handler is async and invoked un-awaited by frameConn, so ANY throw
         // past here is an UNHANDLED REJECTION — which instant-exits the hub
         // (server.js's own unhandledRejection note). A wrapper keeps the module's
@@ -404,6 +440,33 @@ function makeRelay(store, replicaId, deps = {}) {
           // surfaces it rather than hanging; a real peer holds the same secret.
           if (authToken && !tokenEqual(obj.auth, authToken)) {
             d.sendCtrl({ t: "hint", reason: "unauthorized" }); d.end(); return;
+          }
+          // Migration bundle (XERK-785): this replica spooled it; stream its bytes
+          // back. Replica-addressed, so there is NO host-ownership check — the
+          // origin dialed US because `m.blobReplica` named us. Signal success + size
+          // with a `{t:"blob"}` CTRL, then pipe the file; a missing bundle (settled/
+          // dropped since the origin read the record) hints "no-bundle" → origin 404.
+          if (kind === "migration") {
+            if (!openBlob) {
+              d.sendCtrl({ t: "hint", reason: "relay-error", detail: "no blob bridge" }); d.end(); return;
+            }
+            let blob;
+            try {
+              blob = await openBlob(obj.id);
+            } catch (e) {
+              d.sendCtrl({ t: "hint", reason: "relay-error", detail: (e && e.message) || String(e) }); d.end(); return;
+            }
+            if (!blob || !blob.stream) { d.sendCtrl({ t: "hint", reason: "no-bundle" }); d.end(); return; }
+            d.sendCtrl({ t: "blob", size: blob.size });
+            attachLiveness(d, { pingMs, deadMs, now });
+            const s = blob.stream;
+            // A read error mid-stream (or the origin hanging up) tears the channel
+            // down without an error arg (the bridge/channelDuplex rule); the origin
+            // then sees a truncated body and its pull fails safe (source intact).
+            s.on("error", () => { if (!d.destroyed) d.destroy(); });
+            d.once("close", () => { try { s.destroy(); } catch { /* gone */ } });
+            s.pipe(d); // readable end → d.end() → CLOSE frame (clean half-close)
+            return;
           }
           // Owner handoff: the host reconnected to another replica between the
           // origin's owner lookup and this dial. We are not it — tell the origin to
@@ -516,6 +579,7 @@ function makeRelay(store, replicaId, deps = {}) {
 
   return {
     connect,
+    connectMigration,
     accept,
     start,
     stop,

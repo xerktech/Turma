@@ -70,9 +70,14 @@ failover. Read `.claude/rules/turma-ha-store.md` for the `LiveStore` seam this p
   half-applied refusal.
 - **`hydrateMigrations()` rebuilds the Map from the store** — the seam the (not-yet-landed) `leader`
   child calls ON PROMOTION, also run at boot. Never overwrites a record this leader already holds.
-- **The spool sits on the SHARED volume** under its deterministic per-id name (`migrationSpoolPath`),
-  so upload and pull resolve the same bytes on any replica. Deployment: `MIGRATE_SPOOL_DIR` must be an
-  RWX mount in HA (the ArgoCD concern).
+- **The spool stays a PER-POD `emptyDir`; the bytes are RELAYED cross-replica, never shared on disk**
+  (XERK-785, superseding the XERK-761 "SHARED volume / `MIGRATE_SPOOL_DIR` must be RWX" note). The
+  upload spools locally on whichever replica the source's POST landed on and records `blobReplica`
+  (that replica's `SSE_REPLICA_ID`) on the record; the RECORD is already hot-mirrored cross-replica
+  (XERK-778), so a pull that lands elsewhere reads `blobReplica` and relay-fetches the bundle from the
+  owning replica over the SAME byte-plane transport `/term`/`/live` use (`relay.js`, XERK-777/781) —
+  the store stays byte-free (the byte-plane vs record-plane split the epic established). So **no RWX
+  mount is needed**, and the prod manifest's `emptyDir` is correct. See the XERK-785 section below.
 - **The boot sweep is record-aware under HA** (`sweepMigrationSpoolShared`): it KEEPS any bundle whose
   record still exists in the store, and of the rest deletes only orphans older than
   `MIGRATE_SPOOL_ORPHAN_MS` (10m) — so a bundle another replica is mid-writing, whose record has not
@@ -141,6 +146,45 @@ resolvable on any replica, while migration ADVANCE stays a leader-only sweep (XE
 - Tests: the `XERK-778:` cases in `server.test.js` (a follower serving a status read + attachment
   fetch off the hot mirror; a follower never re-mirroring — no resurrection; the leader's own echo
   not clobbering its live leader-local flags).
+
+## Relaying the bundle BYTES cross-replica (XERK-785, epic XERK-775)
+
+XERK-778/782 made the migration RECORD resolvable on any replica, but the bundle BYTES were not: the
+spool is a per-pod `emptyDir`, so under active-active a target's blob pull that lands on a replica
+which never received the source's upload read an empty spool and 404'd — the move wedged in
+`importing` until `MIGRATE_TIMEOUT_MS` (SAFE: the source is left intact/resumable, no data loss). The
+fix RELAYS the bytes like every other data-plane byte (the chosen option; the rejected alternative
+was an RWX spool PVC — a Longhorn share-manager pod, a new failure point for a rare feature).
+
+- **The upload records WHICH replica spooled the bytes.** `POST .../migrations/<id>/blob` spools
+  locally on whichever replica the LB routed the source's POST to, then stamps
+  `m.blobReplica = SSE_REPLICA_ID`. It rides the record's OWN cross-replica mirror — `mirrorMigration`
+  copies the whole record, followers apply it whole (XERK-778), and the leader FORWARD-LEARNS it
+  (added to `applyRemoteMigration`'s merge whitelist beside `blobPath`/`blobSize`). `dropMigrationBlob`
+  clears it with the path/size. It is INTERNAL — `serializeMigration` omits it, so it never rides the
+  wire to clients.
+- **The pull relay-fetches from the owner when it lands elsewhere.** `GET .../migrations/<id>/blob`,
+  when `blobReplica` is set and is NOT this replica (and HA is on), calls `relay.connectMigration(
+  blobReplica, id)` — a REPLICA-ADDRESSED channel (`kind:"migration"`, XERK-785), distinct from the
+  host-tunnel-owner-addressed `/term`/`/live` channels: the migration blob's owner is "whichever
+  replica the POST landed on", unrelated to any host's tunnel. The owner replica (`accept`, via the
+  `openBlob` dep = `openMigrationBlobForRelay`) streams the spool file back, prefixed by a
+  `{t:"blob",size}` CTRL frame; the origin writes the 200 + `Content-Length` on that frame and pipes
+  the bytes to the agent. Same pod-to-pod TCP transport, auth token, framing and backpressure as
+  XERK-777/781 — **the store carries no bundle byte** (the byte-plane vs record-plane split).
+- **Failure is SAFE and self-healing.** A `no-bundle` hint (owner dropped it since the record was
+  read), a dial failure (unreachable/unresolved-endpoint replica), or `connectMigration` returning
+  null (owner is us, or — for a record predating `blobReplica` — no owner recorded) all fall to a 404
+  / the local read; the move times out with the source intact, exactly the pre-fix SAFE failure, and
+  a fresh attempt succeeds once the transient clears.
+- **HA OFF / single-process is byte-identical**: `relay` is null and `migrationStoreShared` false, so
+  the GET's relay branch is never entered and the local spool read is exactly as before; `blobReplica`
+  is set but unused.
+- Tests: the `XERK-785:` cases in `tunnel-relay.test.js` (the `connectMigration` bundle bridge
+  end-to-end, `no-bundle`/`relay-error`/`unauthorized` hints, self→null, dial-failure reject) and in
+  `server.test.js` (`openMigrationBlobForRelay` serving/absent + clearing on drop; the leader
+  forward-learning `blobReplica`). The HTTP-route wiring end-to-end is QA'd on a live active-active
+  fleet.
 
 ## A refused session start is REPORTED, never just logged (XERK-265)
 
