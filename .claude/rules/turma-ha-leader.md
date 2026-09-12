@@ -65,6 +65,11 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
     per-replica in-memory (not shared): each replica self-drains its OWN admissions on its own beats
     (the beat-handler `drainTicketQueue` stays UNgated — gating it would strand follower-admitted
     tickets), and the shared double-start guards + agent-side session queue bound the dispatch race.
+  - **`heartbeatAlerts` can double-fire in the ~1s registry-convergence window.** Beats now spread
+    across replicas, and a host's dedup state (`next.alerts`, on the shared registry record) converges
+    via the watch with the ~1s debounce — so replica B can re-detect an edge replica A already fired
+    before B's mirror caught up. Informational only: deduped/retracted on the phone by the stable
+    `notifKey`, the same class as the XERK-756 SSE-convergence residual.
 - **It does not flap:** `isLeader()` is refreshed on every ~2s lease renewal and self-expires only
   after the full ~15s window. **HA off / no elector → `isLeader()` always true**; the flip only removed
   a 503 branch a single-process hub never took, so HA-off / docker-compose is byte-identical.
