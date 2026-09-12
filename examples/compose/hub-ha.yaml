@@ -16,8 +16,10 @@
 #   valkey    the live plane — fleet registry, command/ticket queues, migration
 #             record, hot policy/OIDC side-stores, the pub/sub bus. Persistent
 #             (AOF everysec), unlike LiteLLM's throwaway cache.
-#   postgres  the durable of-record — the usage-ledger high-water and the
-#             archive SEARCH INDEX (SQLite today).
+#   postgres  the durable of-record, ACTIVELY WRITTEN (no longer idle): the
+#             usage-ledger high-water (XERK-779) and the archive SEARCH INDEX
+#             (XERK-780), both on Postgres via the stdlib client (XERK-776). An
+#             HA hub REQUIRES DATABASE_URL and refuses to boot without it.
 #   minio     the archive BYTES of-record — rendered + raw session layers, in
 #             the `turma-archive` bucket that `minio-init` creates.
 #
@@ -25,18 +27,21 @@
 #   - `HA_MODE` defaults to 1 here (this is the HA stack). Per the ADR the hub
 #     then REQUIRES every store URL or refuses to boot — never a silent
 #     single-process fallback.
-#   - The published `:latest` image is only HA-capable once the externalization
-#     children (XERK-754 et al.) ship. Against a PRE-HA image every var below is
-#     simply ignored and the hub runs its normal file/in-memory backend on the
-#     `turma-data` volume — the store containers come up but sit idle. That is
-#     expected until the HA build lands; point `TURMA_IMAGE` at an HA build to
-#     exercise the store for real.
-#   - LEADER LEASE: in Kubernetes HA the singleton sweeps gate on a k8s `Lease`
+#   - A CURRENT `:latest` image is HA-capable and CONSUMES Postgres for real: it
+#     writes the usage ledger (XERK-779) and the archive index (XERK-780) to the
+#     `postgres` service, and Valkey + MinIO as the ADR describes — so with this
+#     stack up, `postgres` is actively written, not idle. Only against an OLD
+#     PRE-HA image is every var below ignored (the hub runs its file/in-memory
+#     backend on `turma-data` and the store containers sit idle); point
+#     `TURMA_IMAGE` at a current build to exercise the store.
+#   - LEADER LEASE + active-active: in Kubernetes HA every replica SERVES (Option
+#     3, active-active) and the singleton sweeps gate on a k8s `Lease`
 #     (coordination.k8s.io), which does not exist in compose. This stack runs
-#     ONE hub, so there is no leader contention to resolve; an HA build must
-#     treat a lone process as the leader here. Do not add a second `turma`
-#     replica to this file expecting active-active — that needs the lease story
-#     the ADR keeps in Kubernetes.
+#     ONE hub, so there is no leader contention and it treats the lone process as
+#     the leader. Do not add a second `turma` replica to this file expecting
+#     active-active — cross-replica serving needs the k8s Lease AND the pod-to-pod
+#     byte relay (RELAY_PORT/POD_IP/NetworkPolicy), which live in the ArgoCD
+#     manifests, not compose. See docs/turma-ha-deploy.md.
 
 services:
   # --- The live plane -------------------------------------------------------

@@ -7,6 +7,16 @@
 > topologies that reach the goal at very different cost, and recommends one. It is written to be
 > decided on before any hub code is written, the way `docs/k8s-agent-design.md` (XERK-369) was.
 
+> **STATUS — SHIPPED (epic XERK-751 → XERK-775).** This design was decided as **Option 2** and built
+> in that shape, then carried the rest of the way to **Option 3 (active-active)** under the follow-on
+> epic XERK-775. As of XERK-782 **every replica serves** (`/readyz` is leader-independent), the load
+> balancer spreads clients, and a rolling update drops no serving window (`maxUnavailable: 0`). Leader
+> election remains, now gating **only** the singleton background sweeps + migration-advance, never
+> serving. The byte-plane question this document left open under Option 3 ("route by target host name
+> vs relay the byte streams between replicas") was answered by **relay** — see the Option 3 section
+> below. Operator guide: `docs/turma-ha-deploy.md`. This document is kept as the decision record;
+> where it reads in the future tense, the work has since landed.
+
 ## The goal, stated precisely
 
 The ticket's own words: *"make turma highly available so that a rolling update doesn't cause an
@@ -163,6 +173,29 @@ Every replica serves; the load balancer spreads clients arbitrarily. On top of t
   cores that carry the `hub-agent.py` ↔ `tunnel-agent.js` parity contract and the terminal proxy. It
   is the right target only if the hub needs to scale beyond one pod's throughput, which nothing in the
   ticket says it does.
+
+> **SHIPPED (XERK-775), and how the byte plane was solved.** Option 3 is the shipped topology. The
+> pub/sub fan-out landed as the shared SSE bus over Valkey (XERK-762); leader election stayed as the
+> k8s `Lease`, now gating only the singleton sweeps + migration-advance (XERK-763). The hard part —
+> the tunnel byte plane — chose **relay the byte streams between replicas**, not route-by-host:
+> - **Why not route-by-host.** A stock L4/L7 load balancer cannot key on Turma's app-level host
+>   identity: the `<host>` segment of a `/term/<sessionId>/…` path resolves to a session whose owning
+>   host — and thus owning replica — is hub state, not anything the LB can read. Co-locating a client
+>   with a tunnel's owning replica would need an app-aware router, and the ingress manifests live in
+>   `xerktech/ArgoCD`, out of this repo. So route-by-host was rejected.
+> - **What relay is.** A shared, byte-free **directory** (`hostReplica:<host>` → owning replica,
+>   TTL'd + watch-mirrored, XERK-764) lets any replica learn which replica holds a host's tunnel; a
+>   dedicated **pod-to-pod byte transport** (`turma/relay.js`, XERK-777) then proxies `/term`, `/live`
+>   and `openChannel` bytes from the replica a client landed on to the replica that owns the tunnel,
+>   which bridges to its local `controlChannels[host]` (consumers wired by XERK-781). The relay is a
+>   dedicated transport **on purpose** — pushing bulk interactive terminal traffic through the store's
+>   pub/sub bus would head-of-line-block the fleet's liveness channel (the SSE bus + registry watch
+>   share one subscriber connection), so the store carries only the endpoint directory, never a stream
+>   byte. The hop is authenticated by a `TURMA_SESSION_SECRET`-derived shared secret.
+> - **Result.** With the relay + shared SSE + shared session cookie, any replica serves any request,
+>   so `/readyz` was flipped leader-independent (XERK-782) and sticky sessions are not required.
+> Mechanics: `.claude/rules/turma-ha-tunnel.md`; the transport ADR: `docs/turma-ha-store-adr.md`
+> §"The cross-replica byte-stream relay transport".
 
 ## Recommendation
 

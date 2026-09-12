@@ -132,8 +132,9 @@ NOT load on `server.js`, so re-read it here before touching that wiring**:
   which managed Valkey often denies. Every mutating op PUBLISHes a small
   `{type,key,value}` event; watchers filter by prefix. Cross-replica by construction
   (warm standbys), at the cost of one extra publish per mutation — accepted for the
-  seam; a wave-3 op may fold it into Lua. `watch`/`publish` are in the contract even
-  though Option 2 is leader-only, for warm standbys + the reachable Option 3 (ADR).
+  seam; a wave-3 op may fold it into Lua. `watch`/`publish` are load-bearing for the
+  shipped active-active topology (Option 3): every replica keeps its caches hot from
+  peers' writes and the SSE bus fans mutations cross-replica (XERK-762/782).
 - **Durable persistence is full-file temp+rename**, on-disk bytes exactly
   `JSON.stringify(value)` — identical to every store's current format, so a wave-3
   child moves a store on with NO on-disk change. A durable write NEVER throws inside

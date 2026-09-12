@@ -221,12 +221,15 @@ paths:
   RETIRED host never beats, so the ready-edge scan is what keeps `retiredUsage` alive (XERK-338).
   Idempotent (max-merge, never lowers).
 - **No Postgres pub/sub watch (an accepted divergence from the Valkey backend's continuous `watch`).**
-  pgclient wires no LISTEN/NOTIFY, so cross-replica freshness between promotions is NOT continuous.
-  Under Option 2 (leader-only serving) the leader receives every beat, so its model is complete; a
-  promoted standby kept its Postgres connection (no health→ready edge fires on promotion), so
-  `server.js`'s `onLeaderPromoted` calls **`usageLedger.rehydrate()`** — a full rescan — to close the
-  retired-host gap (live hosts self-heal on their next beat). A full periodic rescan is deliberately
-  NOT added (a full-table scan every interval is costly); promotion + reconnect are the rescan points.
+  pgclient wires no LISTEN/NOTIFY, so cross-replica freshness is NOT continuous. Under active-active a
+  host beats to only ONE replica, so no single replica's in-memory model is complete on its own — but
+  **live-host served figures are still correct**: `serializeAgent` folds the durable of-record RAISED
+  by the live raw report from the SHARED registry (XERK-756 keeps every host's latest report on every
+  replica), so a live host self-heals on its next beat wherever it lands. The gap is RETIRED hosts,
+  which never beat again: a newly-promoted leader kept its Postgres connection (no health→ready edge
+  fires on promotion), so `server.js`'s `onLeaderPromoted` calls **`usageLedger.rehydrate()`** — a
+  full rescan — to close it. A full periodic rescan is deliberately NOT added (a full-table scan every
+  interval is costly); promotion + reconnect are the rescan points.
 - **A model change with NO local beat behind it INVALIDATES the hub's `/api/agents` cache** (XERK-758
   QA D1b): a scan/rescan load raises `hosts` without a heartbeat, and the beat is what normally clears
   `agentsCache` — so `configure` passes `invalidateAgentsCache` as the backend's `onExternalChange`,

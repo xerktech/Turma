@@ -41,11 +41,12 @@ of-record**, so both halves of the ADR split now hold:
 - **The local SQLite is STILL never shared** — the corruption hazard the ADR rules out (two processes
   on one SQLite file) still cannot arise: each replica has its OWN disposable node:sqlite cache; the
   SHARED of-record is Postgres, a transactional row store with safe concurrent writers.
-- **Trade-off, accepted (Option 2):** a freshly-promoted standby still hydrates the BYTES from the
-  bucket before it can serve transcript CONTENT (getTranscript reads the local `.jsonl`), and until
-  the index hydrate completes archive reads 404 "still syncing" — but the INDEX hydrate is now a
-  Postgres read (indexed rows over the wire), not a file walk + re-parse, so it is far cheaper.
-  Failover is rare in Option 2; the ADR flags the hydrate window as the cost.
+- **Trade-off, accepted (active-active):** a freshly-STARTED or -promoted replica still hydrates the
+  BYTES from the bucket before it can serve transcript CONTENT (getTranscript reads the local
+  `.jsonl`), and until the index hydrate completes archive reads 404 "still syncing" — but the INDEX
+  hydrate is now a Postgres read (indexed rows over the wire), not a file walk + re-parse, so it is
+  far cheaper. The ADR flags the hydrate window as the cost; it is a startup/promotion event, not a
+  per-request one.
 
 ## `blobstore.js` — the object-store client
 
@@ -71,13 +72,20 @@ of-record**, so both halves of the ADR split now hold:
   blob-key in a dirty Set. archive.js calls it after each durable write (`writeSidecar`, the ingest
   `.jsonl` append, the raw write) via `archive.setBlobSink`. NOTHING here runs on the heartbeat/
   ingest path; the network is only touched by the off-beat drain (XERK-395).
-- **`drain()` pushes the dirty files up, LEADER-ONLY** (`isLeader`, default true → the not-yet-landed
-  XERK-763 lease). In Option 2 only the leader ingests, so only it has dirty files; the gate makes
-  "exactly one writer of the of-record" explicit. Best-effort per file: a transient push failure
-  re-queues (agents re-push any un-mirrored tail on promotion — a lagging of-record is never data
-  loss, matching the archive's append-only/re-push discipline); an ENOENT (raced operator delete) is
-  dropped. Serialized so two workers never overlap. Run on an off-beat `setInterval`
-  (`ARCHIVE_MIRROR_DRAIN_MS`, 15s) and once on graceful shutdown (best-effort, not awaited).
+- **`drain()` pushes the dirty files up.** `ArchiveMirror` carries an `isLeader` gate as a SEAM, but
+  server.js deliberately wires it **`() => true`** — under active-active (XERK-782) archive ingest
+  spreads across replicas (a `note()` populates the INGESTING replica's own dirty Set), so EACH
+  replica must mirror ITS OWN ingested bytes. **Do NOT wire this to the real leader** (the stale
+  "not-yet-landed XERK-763 lease" the seam comment names — the lease HAS landed, but gating the byte
+  drain on it would strand every non-leader-ingested transcript's bytes off the of-record: they'd
+  reach the bucket only if that pod later became leader, and be lost on an emptyDir restart before
+  then). Concurrent per-replica drains are safe: keys are per-transcript, puts are idempotent, and
+  hydrate skips a same-size-or-larger local copy (the INDEX mirror is likewise NOT leader-gated, its
+  GREATEST/`DO NOTHING` upserts safe under concurrent writers). Best-effort per file: a transient push
+  failure re-queues (a lagging of-record is never data loss, matching the archive's append-only/re-push
+  discipline); an ENOENT (raced operator delete) is dropped. Serialized so two workers never overlap.
+  Run on an off-beat `setInterval` (`ARCHIVE_MIRROR_DRAIN_MS`, 15s) and once on graceful shutdown
+  (best-effort, not awaited).
 - **`hydrate()` pulls every object down + `reindex()`** — run at boot AND on promotion (the XERK-763
   seam, via `hydrateArchive()` in server.js). Downloads only a key whose local copy is **absent or
   SMALLER** than the object (missing, or a partial download to finish) — **never same-size-or-larger**,
@@ -102,11 +110,16 @@ of-record**, so both halves of the ADR split now hold:
   read (neither can be async, and no Postgres round trip may sit on the beat, XERK-395). Postgres is
   the durable MIRROR + hydration source ON TOP: every index write is mirrored here (idempotent upsert,
   off the beat) and a promoted/booting replica hydrates the local cache FROM here.
-- **DEFERRED (documented scope boundary, like XERK-764's byte relay / XERK-778's request-path
-  scope):** a replica serving archive READS DIRECTLY from Postgres. Today only the LEADER serves
-  (Option 2, `/readyz` leader-gated — `turma-ha-leader.md`), so its local cache answers reads; the
-  query layer (`searchQuery`/`listQuery`/`rowQuery`) is implemented + parity-tested so direct
-  per-replica serving is a WIRING change when active-active serving lands, NOT a store swap.
+- **DEFERRED (documented scope boundary):** a replica serving archive READS DIRECTLY from Postgres.
+  Active-active serving HAS landed (XERK-782), and each replica answers archive reads from its OWN
+  hydrated local SQLite cache — advanced by that replica's own ingests plus the boot/promotion
+  hydrate, with **no continuous cross-replica watch** (unlike the registry XERK-756 / tunnel
+  directory XERK-764). So a session ingested on a DIFFERENT replica is durable (its index rows in
+  Postgres, its bytes in the bucket) but not visible in THIS replica's browse/search until it next
+  hydrates — a bounded freshness residual, NOT data loss. Serving reads directly from the shared
+  Postgres of-record (or adding an index watch) would close it; the query layer
+  (`searchQuery`/`listQuery`/`rowQuery`) is implemented + parity-tested so it is a WIRING change, NOT
+  a store swap.
 - **stdlib ONLY, over `pgclient.js`'s `PgPool`** (XERK-776) — no `pg`/`node_modules`. The pure SQL
   builders (`buildSessionUpsert`/`buildEntryInsert`/`buildSearch`/`buildList`/`ftsToTsquery`) +
   camel↔snake mappers are unit-tested; the socket path is host-QA-only.
