@@ -44,19 +44,22 @@ This file is the operative rules for the two modules that landed it.
   the shared backend; a no-await-between read+delete on the file backend), so a single-use consume
   can't be double-read by concurrent callers. Decomposing it into `get()`+`del()` at a call site
   reintroduces that race — the file backend yields the event loop between the two awaits.
-- **XERK-758 — the durable USAGE LEDGER** (`usage-ledger.js` → a pluggable persistence backend, file
-  default byte-identical / `SharedLedgerBackend` in `usage-ledger-shared.js`). UNLIKE the OIDC child it
-  did NOT flip a `LiveStore` call site inline: the in-memory model + every read (`fold`/`retiredAgents`/
-  `has`) stay synchronous, and only PERSISTENCE swaps — each host is its own key
-  `usage:host:<key>`, written by an atomic per-host high-water **max-merge** under `compareAndSet`/
-  `setIfAbsent` (a low/partial writer can never lower a recorded total). Wired by
-  `usageLedger.configure(liveStore, haConfig, invalidateAgentsCache)` at boot; reuses `scan`/`watch`
-  unchanged — **no new store primitive.** The boot/reconnect scan runs on the store's health→ready
-  edge (never inline in `init`, which would reject on a not-yet-connected socket) and invalidates the
-  hub's `/api/agents` cache on any non-beat model change. DELIBERATE ADR divergence (ledger on Valkey,
-  not the ADR's Postgres — no stdlib PG client yet); the max-merge write is backend-agnostic so a PG
-  `LedgerStore` slots in later with no call-site change. Full rules: `.claude/rules/turma-usage.md`
-  ("HA: the shared-store backend").
+- **XERK-758 / XERK-779 — the durable USAGE LEDGER, of-record on POSTGRES** (`usage-ledger.js` → a
+  pluggable persistence backend, file default byte-identical / the Postgres `LedgerStore` in
+  `usage-ledger-store.js`). UNLIKE the OIDC/policy children it did NOT flip a `LiveStore` call site:
+  the in-memory model + every read (`fold`/`retiredAgents`/`has`) stay synchronous, and only
+  PERSISTENCE swaps. XERK-758 first landed this on the Valkey `LiveStore` (a deliberate divergence,
+  forced only by the then-absent Postgres client); **XERK-779 moved it onto Postgres — the ADR's
+  designated home — RETIRING the Valkey backend**, now that w1-pg (XERK-776, `pgclient.js`) exists.
+  Each numeric leaf is a row keyed per host/series/day/token-key, written by the single atomic
+  contention-free high-water upsert `INSERT … ON CONFLICT DO UPDATE SET tokens = GREATEST(existing,
+  incoming)` — a low/partial writer can never lower a recorded total and concurrent replicas converge
+  with no lock. Wired by `usageLedger.configure(haConfig, pgClient, invalidateAgentsCache)` at boot
+  (the shared `PgPool` from `createPgClient`, shared with the archive IndexStore). The boot/reconnect
+  scan runs on the pool's health→ready edge (never inline in `init`) and invalidates the hub's
+  `/api/agents` cache on any non-beat model change; there is NO Postgres pub/sub watch, so a promoted
+  leader rescans via `usageLedger.rehydrate()` (`onLeaderPromoted`) instead of a continuous watch.
+  Full rules: `.claude/rules/turma-usage.md` ("HA: the Postgres of-record backend").
 
 ## The wave-3 externalization pattern (XERK-757, `server.js`)
 
@@ -147,15 +150,15 @@ NOT load on `server.js`, so re-read it here before touching that wiring**:
   shared URL in (the escape hatch). A non-0/1 `HA_MODE` is fatal (typo, not a guess).
 - **Fail loud, never half-HA:** when HA is on, a missing/malformed required URL is
   FATAL and NAMED at boot (refuse, don't degrade) — `TURMA_STORE_URL` (this ticket's
-  live plane), `DATABASE_URL` (Postgres — the archive INDEX consumes it now, XERK-780;
-  the usage ledger will, w2-ledger) and `ARCHIVE_S3_*` (object storage). `ARCHIVE_S3_REGION`
+  live plane), `DATABASE_URL` (Postgres — consumed by BOTH the archive INDEX (XERK-780)
+  and the usage LEDGER (XERK-779)) and `ARCHIVE_S3_*` (object storage). `ARCHIVE_S3_REGION`
   is the one S3 var with a default.
 - **The effective mode PRINTS at boot** (`HA: on (...)` / `HA: off (single-process)`),
   same idiom as the memory-ceiling prints — the only way to tell a correctly-wired
   hub from one whose env moved under it. The of-record segment names each backend by
   its own flag (`INDEX_BACKEND_WIRED`/`LEDGER_BACKEND_WIRED`, `ledgerIndexBootSegment`),
   so it can never falsely claim Postgres for a backend not yet wired (XERK-773): today
-  `ledger=valkey, index=postgres`.
+  `ledger=postgres, index=postgres` (both of-record backends wired).
 
 ## The archive index of-record on Postgres (XERK-780)
 

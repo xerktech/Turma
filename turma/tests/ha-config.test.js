@@ -121,16 +121,14 @@ test("XERK-754: a non 0/1 HA_MODE is fatal (typo, not a silent guess)", () => {
   assert.ok(r.fatal.some((m) => m.includes("HA_MODE")));
 });
 
-test("XERK-780: the boot line names the archive index as postgres, the ledger still valkey", () => {
+test("XERK-779/780: the boot line names BOTH the ledger and the index as postgres", () => {
   const r = resolveHaConfig(FULL);
   assert.deepEqual(r.fatal, []);
-  // The archive INDEX of-record is now Postgres (XERK-780, INDEX_BACKEND_WIRED); the
-  // usage LEDGER is still Valkey (w2-ledger not landed). The line names each honestly.
-  assert.equal(INDEX_BACKEND_WIRED, true, "the archive index Postgres backend is wired here");
-  assert.equal(LEDGER_BACKEND_WIRED, false, "flip this with the w2-ledger backend");
-  assert.equal(r.bootLine, "HA: on (store=valkey, ledger=valkey, index=postgres, blobs=s3)");
-  // It must never falsely claim the ledger is on Postgres while it is still Valkey.
-  assert.ok(!r.bootLine.includes("ledger=postgres"), "must not falsely claim a Postgres ledger");
+  // Both of-record backends are now Postgres: the archive INDEX (XERK-780) and the
+  // usage LEDGER (XERK-779). The line names each by its own flag.
+  assert.equal(INDEX_BACKEND_WIRED, true, "the archive index Postgres backend is wired");
+  assert.equal(LEDGER_BACKEND_WIRED, true, "the usage-ledger Postgres backend is wired (XERK-779)");
+  assert.equal(r.bootLine, "HA: on (store=valkey, ledger=postgres, index=postgres, blobs=s3)");
 });
 
 test("XERK-780: the of-record boot segment names each backend by its own flag", () => {

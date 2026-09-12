@@ -60,13 +60,14 @@ const S3_REGION_DEFAULT = "us-east-1";
 //     shared Postgres of-record (index-store.js over pgclient) — a promoted/new
 //     replica hydrates its local node:sqlite index FROM Postgres instead of rebuilding
 //     from the S3 bytes, and ingest is an idempotent ON-CONFLICT upsert.
-//   - LEDGER: NOT wired yet (w2-ledger). The usage ledger's high-water still lives in
-//     the Valkey LiveStore (XERK-758, stdlib-only, no Postgres LedgerStore yet). Flip
-//     LEDGER_BACKEND_WIRED when that backend lands.
+//   - LEDGER: WIRED (XERK-779, w2-ledger). The usage ledger's high-water of-record is
+//     now the Postgres LedgerStore (usage-ledger-store.js over pgclient) — each numeric
+//     leaf is a per-host/series/day/token-key GREATEST upsert, retiring the Valkey
+//     backend (XERK-758) it replaced.
 // DATABASE_URL stays REQUIRED under HA (validated below) so the cluster is provisioned
 // ahead of use by both consumers.
 const INDEX_BACKEND_WIRED = true;
-const LEDGER_BACKEND_WIRED = false;
+const LEDGER_BACKEND_WIRED = true;
 
 // The of-record segment of the boot line: each of ledger/index named by the backend
 // it ACTUALLY runs on. Kept beside the flags so the two never drift.

@@ -275,6 +275,12 @@ function onLeaderPromoted() {
   // it catches up every write the old leader made since this replica booted.
   hydrateArchive().catch((e) =>
     console.error(`leader promotion: archive hydrate failed: ${(e && e.message) || e}`));
+  // Same reason for the usage ledger (XERK-779): a promoted standby kept its Postgres
+  // connection (no health→ready edge fires on promotion), so its retired-host view
+  // stays as stale as its own boot scan until this rescan; live hosts self-heal on
+  // their next beat. No-op on the file backend.
+  usageLedger.rehydrate().catch((e) =>
+    console.error(`leader promotion: usage-ledger rehydrate failed: ${(e && e.message) || e}`));
 }
 
 const PORT = positiveEnv("PORT", 8300);
@@ -18460,16 +18466,18 @@ if (process.env.TURMA_TEST) {
     const dirSweep = setInterval(sweepTunnelDirectory, HOST_REPLICA_TTL_MS);
     dirSweep.unref?.();
   }
-  // Wave-3 (XERK-758): move the durable usage ledger onto the shared store when HA
-  // is on. With HA off this is a no-op and the ledger stays on its local JSON file,
-  // byte-identical. Fire-and-forget + logged: a store down at boot must not block
-  // the listen (availability) — `configure` loads the model when the store's socket
-  // becomes ready and re-loads on reconnect. `invalidateAgentsCache` is passed so a
-  // boot/reconnect scan load or a peer replica's watch-folded write refreshes the
-  // served /api/agents (retiredUsage) promptly — a model change with no local beat
-  // behind it would otherwise serve stale until the next mutation (XERK-758 QA D1).
-  usageLedger.configure(liveStore, haConfig, invalidateAgentsCache).catch((e) => {
-    console.error(`usage ledger: shared-store configure failed, staying on the local file: ${(e && e.message) || e}`);
+  // Wave-2 (XERK-779): move the durable usage ledger of-record onto Postgres when HA
+  // is on (retiring the XERK-758 Valkey backend), reusing the SHARED `archiveIndexPool`
+  // the archive IndexStore (XERK-780) already created — one pool, both of-record
+  // consumers. With HA off this is a no-op and the ledger stays on its local JSON file,
+  // byte-identical. Fire-and-forget + logged: a database down at boot must not block
+  // the listen (availability) — `configure` loads the model when the pool becomes ready
+  // and re-loads on reconnect. `invalidateAgentsCache` is passed so a boot/reconnect
+  // scan load or a promotion rescan refreshes the served /api/agents (retiredUsage)
+  // promptly — a model change with no local beat behind it would otherwise serve stale
+  // until the next mutation (XERK-758 QA D1).
+  usageLedger.configure(haConfig, archiveIndexPool, invalidateAgentsCache).catch((e) => {
+    console.error(`usage ledger: Postgres configure failed, staying on the local file: ${(e && e.message) || e}`);
   });
 
   // ---- Leader election (XERK-763) ---------------------------------------

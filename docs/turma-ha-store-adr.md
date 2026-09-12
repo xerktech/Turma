@@ -257,13 +257,12 @@ invariant the ticket demands, and every sibling must preserve it.
   registry-cap knobs already use — *"the effective budget prints at boot"*), so an operator sees the
   effective mode in the log, not a guess: `HA: off (single-process)`, or `HA: on (...)` naming the
   backends genuinely in use. **The boot line must name what is ACTUALLY wired, never the intended
-  design (XERK-773)** — today `HA: on (store=valkey, ledger=valkey, index=postgres, blobs=s3)`: the
-  archive INDEX is now the shared Postgres of-record (XERK-780), while the ledger's high-water still
-  lives in the Valkey live store (XERK-758). It must not claim Postgres for a backend nothing writes.
-  `DATABASE_URL` stays required (consumed by the index now, by the ledger once `w2-ledger` lands);
-  `ha-config.js`'s per-backend flags (`INDEX_BACKEND_WIRED`/`LEDGER_BACKEND_WIRED`) gate each claim —
-  granularized from the single conflated flag XERK-773 used, so the index can read `postgres` while
-  the ledger still reads `valkey`.
+  design (XERK-773)** — today `HA: on (store=valkey, ledger=postgres, index=postgres, blobs=s3)`: BOTH
+  of-record backends are now Postgres — the usage ledger's high-water (`LedgerStore`, XERK-779) and the
+  archive index (`IndexStore`, XERK-780, hydrated from Postgres instead of rebuilt from the S3 bytes).
+  `DATABASE_URL` stays required and is consumed by both. `ha-config.js`'s per-backend flags
+  (`INDEX_BACKEND_WIRED`/`LEDGER_BACKEND_WIRED`) gate each half of the claim — granularized from the
+  single conflated flag XERK-773 used, each flipped in the SAME change that wired its backend.
 - Every new URL/knob reads through the existing `positiveEnv`-style guards where numeric; a malformed
   store URL is a boot refusal, never a runtime surprise.
 
