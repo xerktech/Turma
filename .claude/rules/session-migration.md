@@ -117,9 +117,10 @@ resolvable on any replica, while migration ADVANCE stays a leader-only sweep (XE
 - **Scope boundary:** this only makes the record RESOLVABLE. A follower does NOT advance a move
   (`migrationAdvanceTick` is leader-gated) and its request-path MUTATIONS are not mirrored to the
   leader (mutations still flow to the leader under the shipped Option-2 topology, where `/readyz`
-  routes all traffic to it). The `/readyz` leader-gate stays because the terminal/`/live` byte-stream
-  relay is still deferred (XERK-764/777) — that, not migration, is now the remaining Option-2
-  requirement.
+  routes all traffic to it). The terminal/`/live` byte-stream relay has now LANDED (XERK-777 transport
+  + XERK-781 consumers), so it is no longer the blocker — the `/readyz` leader-gate now stays precisely
+  because request-path MUTATIONS (this migration flow, cross-replica command delivery) are not mirrored
+  to the leader from a follower; closing THAT is the remaining Option-2→Option-3 requirement.
 - **Accepted residual (LOW, Valkey-only):** a leader crashing mid-move can leave a store key that
   TTL-EXPIRES, and Valkey fires no watch event on a PX expiry (like XERK-764's tunnel directory), so
   the record lingers in a non-promoted follower's Map. It is harmless — a follower serves no traffic

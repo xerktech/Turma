@@ -26,6 +26,7 @@
 const { test, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
 const net = require("node:net");
+const { Duplex } = require("node:stream");
 
 const {
   makeRelay,
@@ -366,6 +367,111 @@ test("XERK-777: endpoint directory — publish, watch-mirror a peer, hydrate at 
   relay.stop();
   relay2.stop();
   assert.equal(await store.get(RELAY_ENDPOINT_PREFIX + "R-me"), null, "stop retires the endpoint");
+});
+
+test("XERK-781: a LIVE channel bridges the owner's delta stream to the origin", async () => {
+  const [originConn, ownerConn] = await loopback();
+  let liveHost = null;
+  let liveSession = null;
+  let sink = null;
+  let resolveOpen;
+  const opened = new Promise((r) => { resolveOpen = r; });
+  const owner = ownerRelay({
+    // `openLive` returns a duplex whose READABLE side carries the session's deltas.
+    openLive: async (host, session) => {
+      liveHost = host;
+      liveSession = session;
+      sink = new Duplex({ read() {}, write(_c, _e, cb) { cb(); } });
+      resolveOpen();
+      return sink;
+    },
+  });
+  owner.accept(ownerConn);
+
+  const origin = makeRelay(null, "R-A", {
+    owners: { h1: { replica: "R-owner", at: Date.now() } },
+    ttlMs: 60000,
+    localTunnel: () => false,
+    dial: async () => originConn,
+  });
+  const d = await origin.connect("h1", 0, { kind: "live", session: "sess-9" });
+  assert.ok(d, "a live channel to a fresh remote owner yields a duplex");
+  await opened;
+  assert.equal(liveHost, "h1", "the handshake named the host");
+  assert.equal(liveSession, "sess-9", "the handshake named the session (not a ttyd port)");
+
+  // The owner pushes one newline-delimited JSON delta; it reaches the origin intact.
+  let buf = "";
+  const gotDelta = new Promise((resolve) => {
+    d.on("data", (c) => {
+      buf += c.toString("utf8");
+      const nl = buf.indexOf("\n");
+      if (nl >= 0) resolve(JSON.parse(buf.slice(0, nl)));
+    });
+  });
+  sink.push(Buffer.from(JSON.stringify({ type: "tail", entries: ["x"] }) + "\n"));
+  assert.deepEqual(await gotDelta, { type: "tail", entries: ["x"] });
+  d.destroy();
+});
+
+test("XERK-781: a live channel to an owner with no live bridge hints relay-error", async () => {
+  const [originConn, ownerConn] = await loopback();
+  const owner = ownerRelay({ openLocal: async () => (await loopback())[0] }); // no openLive
+  owner.accept(ownerConn);
+  const origin = makeRelay(null, "R-A", {
+    owners: { h1: { replica: "R-owner", at: Date.now() } },
+    ttlMs: 60000,
+    localTunnel: () => false,
+    dial: async () => originConn,
+  });
+  const d = await origin.connect("h1", 0, { kind: "live", session: "s" });
+  const closed = new Promise((resolve) => d.on("close", resolve));
+  const hint = await new Promise((resolve) => d.once("hint", resolve));
+  assert.equal(hint.reason, "relay-error");
+  await closed;
+});
+
+test("XERK-781: a mismatched auth token is refused (unauthorized hint), never bridged", async () => {
+  const [originConn, ownerConn] = await loopback();
+  let bridged = 0;
+  const owner = ownerRelay({
+    authToken: "correct-secret",
+    openLocal: async () => { bridged++; return (await loopback())[0]; },
+  });
+  owner.accept(ownerConn);
+  const origin = makeRelay(null, "R-A", {
+    owners: { h1: { replica: "R-owner", at: Date.now() } },
+    ttlMs: 60000,
+    localTunnel: () => false,
+    dial: async () => originConn,
+    authToken: "WRONG-secret",
+  });
+  const d = await origin.connect("h1", 7681);
+  const closed = new Promise((resolve) => d.on("close", resolve));
+  const hint = await new Promise((resolve) => d.once("hint", resolve));
+  assert.equal(hint.reason, "unauthorized");
+  assert.equal(bridged, 0, "a bad token never reaches the tunnel bridge");
+  await closed;
+});
+
+test("XERK-781: a MATCHING auth token bridges normally", async () => {
+  const [originConn, ownerConn] = await loopback();
+  const [ownerAgentEnd, ttyd] = await loopback();
+  ttyd.pipe(ttyd);
+  const owner = ownerRelay({ authToken: "shared", openLocal: async () => ownerAgentEnd });
+  owner.accept(ownerConn);
+  const origin = makeRelay(null, "R-A", {
+    owners: { h1: { replica: "R-owner", at: Date.now() } },
+    ttlMs: 60000,
+    localTunnel: () => false,
+    dial: async () => originConn,
+    authToken: "shared",
+  });
+  const d = await origin.connect("h1", 7681);
+  const got = new Promise((resolve) => d.once("data", (c) => resolve(c.toString())));
+  d.write(Buffer.from("hi"));
+  assert.equal(await got, "hi", "a matching token lets the bytes through");
+  d.destroy();
 });
 
 test("XERK-777: frameConn honours a clean CLOSE frame as readable EOF", async () => {

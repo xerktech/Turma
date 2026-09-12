@@ -35,12 +35,15 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   doc pairs with the lease: XERK-763 gated the SWEEPS, this gates the SERVICE. k8s pulls a NotReady
   pod from the Service EndpointSlice, so under HA the leader is the ONLY pod client/agent traffic
   reaches — the standbys stay warm off the shared store and serve nothing.
-- **This is load-bearing, not cosmetic.** The shipped hub only supports Option 2 (leader-serves-all):
-  the cross-replica terminal/`/live` byte-stream relay is deferred (XERK-764) so terminal bytes serve
-  only from the tunnel owner's replica, and the migration request path reads a leader-only in-memory
-  Map (`server.js` `:3588`, `:11905`). A non-leader that served traffic would return dead terminals
-  and stale 404s. **Do NOT remove the `isLeader()` gate from `/readyz` or make non-leaders serve**
-  until the byte-stream relay lands (true active-active).
+- **This is load-bearing, not cosmetic.** The shipped hub only supports Option 2 (leader-serves-all).
+  The cross-replica terminal/`/live` byte-stream relay HAS now landed (XERK-777 transport + XERK-781
+  consumers), and the migration request-path READ is resolvable on any replica (XERK-778) — so those
+  two original blockers are gone. What still keeps `/readyz` leader-only is that request-path
+  MUTATIONS assume leader-serves-all: a migration mutation (and cross-replica command delivery) on a
+  FOLLOWER is not mirrored to the leader (XERK-778's scope boundary), so a follower serving write
+  traffic would silently drop it. **Do NOT remove the `isLeader()` gate from `/readyz` or make
+  non-leaders serve** until that mutation-flow gap is closed (the true active-active flip, its own
+  ticket) — not merely because the relay landed.
 - **It does not flap:** `isLeader()` is refreshed on every ~2s lease renewal and self-expires only
   after the full ~15s window, so a healthy leader stays Ready through a transient API blip; only a
   genuine partition drops it (which SHOULD pull it from the Service). **HA off / no elector →
