@@ -247,9 +247,15 @@ invariant the ticket demands, and every sibling must preserve it.
   (offline-alert, the auto-start bundle, migration-advance) would run N times. Absence is fatal at
   boot, not a silent double-run.
 - **Effective mode + resolved backends print at boot** (the same idiom the memory-ceiling and
-  registry-cap knobs already use — *"the effective budget prints at boot"*), so an operator sees
-  `HA: on (store=valkey, ledger+index=postgres, blobs=s3)` or `HA: off (single-process)` in the log,
-  not a guess.
+  registry-cap knobs already use — *"the effective budget prints at boot"*), so an operator sees the
+  effective mode in the log, not a guess: `HA: off (single-process)`, or `HA: on (...)` naming the
+  backends genuinely in use. **The boot line must name what is ACTUALLY wired, never the intended
+  design (XERK-773)** — today `HA: on (store=valkey, ledger=valkey, index=sqlite(local, rebuilt from
+  s3), blobs=s3)`, because the ledger's high-water lives in the Valkey live store (XERK-758) and the
+  index is local SQLite rebuilt from the S3 bytes (XERK-759); it must not claim Postgres while
+  nothing writes it. `DATABASE_URL` stays required (provisioned ahead of use); `ha-config.js`'s
+  `POSTGRES_BACKEND_WIRED` gates the claim, and when a Postgres LedgerStore/IndexStore lands the flag
+  flips and the line reads `ledger+index=postgres` again.
 - Every new URL/knob reads through the existing `positiveEnv`-style guards where numeric; a malformed
   store URL is a boot refusal, never a runtime surprise.
 

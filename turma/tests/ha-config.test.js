@@ -4,7 +4,11 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { resolveHaConfig } = require("../ha-config.js");
+const {
+  resolveHaConfig,
+  POSTGRES_BACKEND_WIRED,
+  ledgerIndexBootSegment,
+} = require("../ha-config.js");
 
 // A complete HA env, so a test can drop ONE var to prove it is required.
 const FULL = {
@@ -44,7 +48,9 @@ test("XERK-754: HA_MODE unset + full env infers HA on cleanly", () => {
   assert.equal(r.ha, true);
   assert.equal(r.forced, false);
   assert.deepEqual(r.fatal, []);
-  assert.equal(r.bootLine, "HA: on (store=valkey, ledger+index=postgres, blobs=s3)");
+  // The of-record segment names the backends ACTUALLY wired (XERK-773), not the
+  // intended Postgres one, until POSTGRES_BACKEND_WIRED flips.
+  assert.equal(r.bootLine, `HA: on (store=valkey, ${ledgerIndexBootSegment()}, blobs=s3)`);
   assert.equal(r.storeUrl, FULL.TURMA_STORE_URL);
   assert.equal(r.databaseUrl, FULL.DATABASE_URL);
   assert.equal(r.s3.bucket, "turma-archive");
@@ -112,4 +118,31 @@ test("XERK-754: a malformed DATABASE_URL scheme is fatal", () => {
 test("XERK-754: a non 0/1 HA_MODE is fatal (typo, not a silent guess)", () => {
   const r = resolveHaConfig({ HA_MODE: "yes" });
   assert.ok(r.fatal.some((m) => m.includes("HA_MODE")));
+});
+
+test("XERK-773: the boot line names the backends actually wired, not the intended Postgres one", () => {
+  const r = resolveHaConfig(FULL);
+  assert.deepEqual(r.fatal, []);
+  // No Postgres LedgerStore/IndexStore exists yet, so the boot line must NOT claim one.
+  assert.equal(POSTGRES_BACKEND_WIRED, false, "flip this test's expectation with the flag");
+  assert.equal(r.bootLine, "HA: on (store=valkey, ledger=valkey, index=sqlite(local, rebuilt from s3), blobs=s3)");
+  assert.ok(!r.bootLine.includes("ledger+index=postgres"), "must not falsely claim Postgres");
+});
+
+test("XERK-773: the of-record boot segment gates on POSTGRES_BACKEND_WIRED", () => {
+  // The segment and the flag live together so they can never drift: today it names
+  // the real backends; once a Postgres backend is wired, it reads ledger+index=postgres.
+  const seg = ledgerIndexBootSegment();
+  if (POSTGRES_BACKEND_WIRED) {
+    assert.equal(seg, "ledger+index=postgres");
+  } else {
+    assert.equal(seg, "ledger=valkey, index=sqlite(local, rebuilt from s3)");
+  }
+});
+
+test("XERK-773: DATABASE_URL stays required under HA (provisioned ahead of use)", () => {
+  const env = { ...FULL };
+  delete env.DATABASE_URL;
+  const r = resolveHaConfig(env);
+  assert.ok(r.fatal.some((m) => m.includes("DATABASE_URL")), "still fatal when absent");
 });
