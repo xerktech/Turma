@@ -15422,6 +15422,62 @@ test("XERK-785: the leader forward-learns blobReplica so a cross-replica pull ca
   });
 });
 
+// ---- XERK-787: cross-replica message-attachment bytes (relay the upload) -----
+// The XERK-785 sibling for operator attachments: the `uploads` Map holds bytes in
+// memory on the replica the staging POST landed on, so under active-active the
+// agent's blob pull elsewhere 404'd. A byte-free directory entry says which replica
+// holds it; a pull that misses locally relays the bytes from that replica.
+
+test("XERK-787: openUploadBlobForRelay serves a CHUNKED byte-identical stream (under the relay frame ceiling)", async () => {
+  const id = "787bbbb000000001";
+  // > 1 MiB so bufferReadable must emit MULTIPLE sub-frame chunks — a single-frame
+  // Readable.from([buf]) of an attachment over the 16 MiB ceiling would go dead.
+  const payload = Buffer.alloc(2_500_000, 0xab);
+  uploads.set(id, { id, host: "h1", sessionId: "s1", name: "f.bin", size: payload.length, bytes: payload, at: Date.now() });
+  try {
+    const blob = await hub.openUploadBlobForRelay(id);
+    assert.ok(blob && blob.stream, "returns the attachment's read stream");
+    assert.equal(blob.size, payload.length, "with the byte length (the origin's Content-Length)");
+    const chunks = [];
+    await new Promise((resolve) => {
+      blob.stream.on("data", (c) => chunks.push(c));
+      blob.stream.on("end", resolve);
+    });
+    assert.equal(Buffer.compare(Buffer.concat(chunks), payload), 0, "every byte streams intact");
+    assert.ok(chunks.length > 1, "a large buffer is sliced into multiple chunks");
+    assert.ok(chunks.every((c) => c.length <= (1 << 20)), "no chunk exceeds 1 MiB (well under the 16 MiB frame ceiling)");
+
+    assert.equal(await hub.openUploadBlobForRelay("787nonexistent00"), null,
+      "an unknown upload id => null (the relay hints no-bundle)");
+  } finally {
+    uploads.delete(id);
+  }
+});
+
+test("XERK-787: publishUploadDir mirrors a BYTE-FREE directory entry, and is inert with HA off", async () => {
+  const store = new FileLiveStore();
+  const id = "787cccc000000001";
+  const u = { id, host: "h1", sessionId: "s1", name: "f.bin", size: 42, bytes: Buffer.alloc(42), at: 1234 };
+  try {
+    // HA off: no-op — nothing written.
+    hub.setUploadStore(store, false);
+    hub.publishUploadDir(u);
+    assert.equal(await store.get(hub.UPLOAD_DIR_PREFIX + id), null, "HA off => no directory write");
+
+    // HA on: a byte-free entry naming this replica.
+    hub.setUploadStore(store, true);
+    hub.publishUploadDir(u);
+    const dir = await store.get(hub.UPLOAD_DIR_PREFIX + id);
+    assert.ok(dir, "HA on => the directory entry is written");
+    assert.equal(dir.replica, hub.SSE_REPLICA_ID, "it names the replica that holds the bytes");
+    assert.equal(dir.host, "h1", "it carries the host for cross-replica scoping (XERK-268)");
+    assert.equal(dir.size, 42, "and the size for the Content-Length");
+    assert.equal(dir.bytes, undefined, "the directory carries NO attachment bytes (byte-plane vs record-plane)");
+  } finally {
+    hub.setUploadStore(null, false); // restore the non-HA default
+  }
+});
+
 // ---- XERK-763: leader election + shared single-flight guards -----------------
 // Under HA (Option 2) the singleton sweeps + migration-advance run on the LEADER
 // only, and the guards those sweeps rely on are WRITE-THROUGH mirrored to the

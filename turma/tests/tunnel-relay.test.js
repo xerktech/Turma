@@ -594,3 +594,59 @@ test("XERK-785: a failed dial rejects connectMigration cleanly (replica loss), n
   await assert.rejects(() => origin.connectMigration("R-gone", "m785000000000002"),
     /relay migration dial to R-gone failed/);
 });
+
+// ---- XERK-787: the message-attachment channel (kind:"upload") ----------------
+// The `kind:"upload"` twin of the migration bundle channel — same replica-addressed
+// blob-by-key transport (`connectUpload`), a different owner-side dep (`openUpload`,
+// reading the in-memory `uploads` Map instead of the migration spool). Under
+// active-active the operator's staging POST and the agent's blob pull land on
+// different replicas; the origin relay-fetches the bytes from the owning replica.
+
+test("XERK-787: connectUpload streams the owner's attachment bytes back to the origin", async () => {
+  const { Readable } = require("node:stream");
+  const [originConn, ownerConn] = await loopback();
+  const payload = Buffer.from("ATTACH-".repeat(6000));
+  let askedId = null, askedBlob = false;
+  const owner = makeRelay(null, "R-owner", {
+    localTunnel: () => false,
+    // A real openUpload chunks the buffer; a stub Readable.from([buf]) is fine here
+    // (payload is under the 16 MiB frame ceiling).
+    openUpload: async (id) => { askedId = id; return { stream: Readable.from([payload]), size: payload.length }; },
+    openBlob: async () => { askedBlob = true; return null; }, // must NOT be used for an upload
+  });
+  owner.accept(ownerConn);
+
+  const origin = makeRelay(null, "R-A", { dial: async () => originConn });
+  const d = await origin.connectUpload("R-owner", "up785000000000001");
+  assert.ok(d, "a remote replica yields a relay duplex");
+
+  const bytesP = readAll(d);
+  const sizeP = new Promise((resolve) => d.on("hint", (o) => { if (o && o.t === "blob") resolve(o.size); }));
+  assert.equal(await sizeP, payload.length, "the owner acks the attachment size before streaming");
+  assert.equal(Buffer.compare(await bytesP, payload), 0, "every attachment byte arrives at the origin");
+  assert.equal(askedId, "up785000000000001", "the handshake names the upload id");
+  assert.equal(askedBlob, false, "an upload channel uses openUpload, never the migration openBlob");
+  d.destroy();
+});
+
+test("XERK-787: an attachment the owner no longer holds hints no-bundle (origin 404s)", async () => {
+  const [originConn, ownerConn] = await loopback();
+  const owner = makeRelay(null, "R-owner", { localTunnel: () => false, openUpload: async () => null });
+  owner.accept(ownerConn);
+  const origin = makeRelay(null, "R-A", { dial: async () => originConn });
+  const d = await origin.connectUpload("R-owner", "gone787000000000");
+  const closed = new Promise((r) => d.on("close", r));
+  const hint = await new Promise((r) => d.once("hint", r));
+  assert.equal(hint.reason, "no-bundle");
+  await closed;
+});
+
+test("XERK-787: an upload channel to an owner with no openUpload bridge hints relay-error", async () => {
+  const [originConn, ownerConn] = await loopback();
+  const owner = makeRelay(null, "R-owner", { localTunnel: () => false }); // no openUpload dep
+  owner.accept(ownerConn);
+  const origin = makeRelay(null, "R-A", { dial: async () => originConn });
+  const d = await origin.connectUpload("R-owner", "up787000000000002");
+  const hint = await new Promise((r) => d.once("hint", r));
+  assert.equal(hint.reason, "relay-error");
+});

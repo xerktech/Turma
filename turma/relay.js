@@ -290,6 +290,11 @@ function attachLiveness(d, { pingMs, deadMs, now }) {
 //                owner replica that spooled the bundle streams it back to the origin
 //                replica the target agent's pull landed on. Null => owner no longer
 //                holds it => the origin gets a "no-bundle" hint and 404s.
+//   openUpload   (id) => Promise<{stream, size} | null> a message ATTACHMENT's bytes
+//                (server.js `openUploadBlobForRelay`), owner side only. The `kind:
+//                "upload"` twin of `openBlob` (XERK-787) — same replica-addressed
+//                blob-by-key transport (`connectUpload`), a different in-memory store
+//                (the `uploads` Map, not the migration spool).
 //   dial         (replica, addr) => Promise<Duplex> raw pod-to-pod byte channel
 //                (prod: connect to the peer's relay listener; tests: a loopback pair)
 //   endpoint     this replica's own dialable address, published to the directory so
@@ -308,6 +313,7 @@ function makeRelay(store, replicaId, deps = {}) {
     openLocal,
     openLive,
     openBlob,
+    openUpload,
     dial,
     endpoint = null,
     authToken = null,
@@ -382,30 +388,33 @@ function makeRelay(store, replicaId, deps = {}) {
     return d;
   }
 
-  // ORIGIN, migration-bundle variant (XERK-785). Addressed to a REPLICA id (the one
-  // that spooled the bundle — server.js `m.blobReplica`), NOT a host-tunnel owner:
-  // the migration blob's owner is "whichever replica the source's POST landed on",
-  // unrelated to any host's tunnel. Returns a duplex whose readable carries a
-  // `{t:"blob",size}` CTRL frame followed by the raw bundle bytes, or null when the
-  // replica is US (the caller then serves its own local spool). Rejects on a dial
+  // ORIGIN, blob-by-key variant. Addressed to a REPLICA id, NOT a host-tunnel owner:
+  // a migration bundle's owner is "whichever replica the source's POST landed on"
+  // (server.js `m.blobReplica`, XERK-785) and a message upload's owner is "whichever
+  // replica the operator's staging POST landed on" (server.js the upload directory,
+  // XERK-787) — both unrelated to any host's tunnel. Returns a duplex whose readable
+  // carries a `{t:"blob",size}` CTRL frame followed by the raw bytes, or null when
+  // the replica is US (the caller then serves its own local copy). Rejects on a dial
   // failure — including an UNRESOLVED/stale endpoint, which `dial` refuses — so the
-  // caller can log + 404 it; the move then times out with the source intact (the
-  // documented SAFE failure), and it self-heals once the endpoint directory catches
-  // up. Same null-is-local / reject-is-failure contract as `connect`.
-  async function connectMigration(replica, id) {
+  // caller can log + 404 it; the transfer then fails SAFE (the move/attachment is
+  // retried or times out, nothing lost), self-healing once the endpoint directory
+  // catches up. Same null-is-local / reject-is-failure contract as `connect`.
+  async function connectBlobKind(replica, id, kind) {
     if (!replica || replica === replicaId) return null; // ours — serve locally
     const addr = endpointAddr(replica); // may be null; `dial` refuses an unresolved addr
     let conn;
     try {
       conn = await dial(replica, addr);
     } catch (e) {
-      throw new Error(`relay migration dial to ${replica} failed: ${(e && e.message) || e}`);
+      throw new Error(`relay ${kind} dial to ${replica} failed: ${(e && e.message) || e}`);
     }
-    const d = frameConn(conn, { max: frameMax, label: `relay-migration->${replica}` });
-    d.sendCtrl({ t: "open", kind: "migration", id, auth: authToken || undefined });
+    const d = frameConn(conn, { max: frameMax, label: `relay-${kind}->${replica}` });
+    d.sendCtrl({ t: "open", kind, id, auth: authToken || undefined });
     attachLiveness(d, { pingMs, deadMs, now });
     return d;
   }
+  const connectMigration = (replica, id) => connectBlobKind(replica, id, "migration");
+  const connectUpload = (replica, id) => connectBlobKind(replica, id, "upload");
 
   // OWNER / SERVE. The relay LISTENER (boot/consumer scope) hands each inbound raw
   // duplex here. Read the handshake, verify THIS replica still owns the host, bridge
@@ -421,10 +430,13 @@ function makeRelay(store, replicaId, deps = {}) {
         if (obj && obj.t === "ping") { d.sendCtrl({ t: "pong" }); return; }
         if (obj && obj.t === "pong") return;
         if (handshook || !obj || obj.t !== "open") return;
-        const kind = obj.kind === "live" ? "live" : obj.kind === "migration" ? "migration" : "data";
-        // A data/live channel names a HOST (its tunnel owner); a migration channel
-        // names a migration ID (it is replica-addressed, not host-owned, XERK-785).
-        if (kind === "migration" ? typeof obj.id !== "string" : typeof obj.host !== "string") return;
+        const kind = obj.kind === "live" ? "live"
+          : obj.kind === "migration" ? "migration"
+          : obj.kind === "upload" ? "upload" : "data";
+        // A data/live channel names a HOST (its tunnel owner); a migration/upload
+        // channel names an ID (it is replica-addressed, not host-owned, XERK-785/787).
+        const byId = kind === "migration" || kind === "upload";
+        if (byId ? typeof obj.id !== "string" : typeof obj.host !== "string") return;
         handshook = true;
         clearTimeout(hsTimer);
         const host = obj.host;
@@ -441,18 +453,20 @@ function makeRelay(store, replicaId, deps = {}) {
           if (authToken && !tokenEqual(obj.auth, authToken)) {
             d.sendCtrl({ t: "hint", reason: "unauthorized" }); d.end(); return;
           }
-          // Migration bundle (XERK-785): this replica spooled it; stream its bytes
-          // back. Replica-addressed, so there is NO host-ownership check — the
-          // origin dialed US because `m.blobReplica` named us. Signal success + size
-          // with a `{t:"blob"}` CTRL, then pipe the file; a missing bundle (settled/
-          // dropped since the origin read the record) hints "no-bundle" → origin 404.
-          if (kind === "migration") {
-            if (!openBlob) {
+          // Blob-by-key (XERK-785 migration bundle / XERK-787 message attachment):
+          // this replica holds it; stream its bytes back. Replica-addressed, so
+          // there is NO host-ownership check — the origin dialed US because the
+          // record/directory named us. Signal success + size with a `{t:"blob"}`
+          // CTRL, then pipe the bytes; a missing blob (settled/dropped/expired since
+          // the origin resolved the owner) hints "no-bundle" → origin 404.
+          if (byId) {
+            const openIt = kind === "upload" ? openUpload : openBlob;
+            if (!openIt) {
               d.sendCtrl({ t: "hint", reason: "relay-error", detail: "no blob bridge" }); d.end(); return;
             }
             let blob;
             try {
-              blob = await openBlob(obj.id);
+              blob = await openIt(obj.id);
             } catch (e) {
               d.sendCtrl({ t: "hint", reason: "relay-error", detail: (e && e.message) || String(e) }); d.end(); return;
             }
@@ -580,6 +594,7 @@ function makeRelay(store, replicaId, deps = {}) {
   return {
     connect,
     connectMigration,
+    connectUpload,
     accept,
     start,
     stop,
