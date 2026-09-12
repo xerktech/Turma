@@ -128,11 +128,18 @@ RWX, which the ticket rules out outright.
 > index" — and the leader is the single owning writer of the of-record (only it ingests, so only it
 > mirrors up). The driver was the **stdlib-only** constraint (the hub ships no `node_modules`, CI is
 > offline): a shared Postgres FTS index means hand-rolling a Postgres wire-protocol + SCRAM +
-> tsvector/tsquery client and porting archive.js's whole query/reclaim path onto it. `DATABASE_URL`
-> stays validated at boot but the ARCHIVE does not consume it (the usage ledger, XERK-758, is its
-> intended consumer); moving the index to Postgres later needs no change to the byte layer. The
-> single-writer option's cost — a promoted standby hydrates + rebuilds before serving archive reads,
-> 404ing "still syncing" until then — is accepted for Option 2, where failover is rare. Mechanics:
+> tsvector/tsquery client and porting archive.js's whole query/reclaim path onto it — deferred by
+> XERK-759, kept rebuildable-from-files in the interim.
+>
+> **Update (XERK-780, w2-index): the Postgres index the ADR designated has LANDED.** XERK-776 shipped
+> the stdlib Postgres client (`pgclient.js`); XERK-780 built `index-store.js` on it — the archive
+> index is now the shared Postgres of-record. archive.js keeps its local node:sqlite as the per-replica
+> hot read/write CACHE (the sync request + beat-cursor paths need it, and no Postgres round trip may
+> sit on the beat, XERK-395), mirrored to Postgres with idempotent `ON CONFLICT` upserts and HYDRATED
+> from Postgres on promotion instead of rebuilt from the S3 bytes — so the cold-promote gap (finding
+> A) shrinks and concurrent-replica ingest is safe. The byte layer was unchanged, as this note
+> predicted. Direct per-replica PG SERVING is the one deferred piece (Option 2 still serves from the
+> leader; the query layer is built + parity-tested for when active-active serving lands). Mechanics:
 > `.claude/rules/turma-ha-archive.md`.
 
 ---
@@ -250,17 +257,58 @@ invariant the ticket demands, and every sibling must preserve it.
   registry-cap knobs already use — *"the effective budget prints at boot"*), so an operator sees the
   effective mode in the log, not a guess: `HA: off (single-process)`, or `HA: on (...)` naming the
   backends genuinely in use. **The boot line must name what is ACTUALLY wired, never the intended
-  design (XERK-773)** — today `HA: on (store=valkey, ledger=postgres, index=sqlite(local, rebuilt from
-  s3), blobs=s3)`: the ledger's high-water of-record moved to the Postgres `LedgerStore` (XERK-779),
-  while the archive index is still local SQLite rebuilt from the S3 bytes (XERK-759) until its
-  IndexStore lands (XERK-780). The line must not claim Postgres for a backend nothing writes yet.
-  `DATABASE_URL` stays required; `ha-config.js`'s per-backend flags (`POSTGRES_LEDGER_WIRED`,
-  `POSTGRES_INDEX_WIRED`) gate each half of the claim, each flipped in the SAME change that wires its
-  backend — so the line reads `index=postgres` once XERK-780 lands.
+  design (XERK-773)** — today `HA: on (store=valkey, ledger=postgres, index=postgres, blobs=s3)`: BOTH
+  of-record backends are now Postgres — the usage ledger's high-water (`LedgerStore`, XERK-779) and the
+  archive index (`IndexStore`, XERK-780, hydrated from Postgres instead of rebuilt from the S3 bytes).
+  `DATABASE_URL` stays required and is consumed by both. `ha-config.js`'s per-backend flags
+  (`INDEX_BACKEND_WIRED`/`LEDGER_BACKEND_WIRED`) gate each half of the claim — granularized from the
+  single conflated flag XERK-773 used, each flipped in the SAME change that wired its backend.
 - Every new URL/knob reads through the existing `positiveEnv`-style guards where numeric; a malformed
   store URL is a boot refusal, never a runtime surprise.
 
 ---
+
+## The cross-replica byte-stream relay transport (XERK-777)
+
+XERK-764 landed the tunnel DIRECTORY + the CONTROL plane (cross-replica `terminalOnline` + an
+addressed command poke) and DEFERRED the DATA plane: the duplex byte streams for `/term`, the `/live`
+deltas and `openChannel`. XERK-777 lands that transport primitive (`turma/relay.js`); the consumers
+that wire it into those three routes are a follow-up.
+
+**The decision: an in-hub pod-to-pod reverse-proxy, on a DEDICATED transport.** The replica a client
+landed on (the origin) looks up the host's tunnel owner in the `hostTunnelOwners` mirror (XERK-764)
+and opens a DIRECT duplex byte channel to that owning replica, which bridges it to its local
+`controlChannels[host]` (via `openChannel`) and pipes both ways. Two alternatives were considered and
+rejected:
+
+1. **Relay bytes over the store's pub/sub (the control/SSE bus).** Rejected as a HARD constraint, not
+   a preference: bulk interactive terminal traffic would ride the SAME single shared subscriber
+   connection the SSE bus (XERK-762) and the registry watch (XERK-756) depend on, head-of-line
+   blocking the fleet's LIVENESS channel. So the relay is a dedicated pod-to-pod transport; the store
+   carries only a byte-free endpoint directory (`relayEndpoint:<replicaId>` → `{addr, at}`, TTL'd +
+   watch-mirrored, the `hostTunnelOwners` pattern) so the origin can resolve where to dial a peer.
+2. **Route-by-host at the ingress (sticky/L7 routing so a client always lands on the tunnel owner).**
+   Rejected because a stock L4/L7 load balancer cannot key on Turma's app-level host identity (the
+   `<host>` segment of a `/term/<sessionId>/…` path resolves to a session, whose owning host — and
+   thus owning replica — is hub state, not anything the LB can read), and the ingress manifests live
+   in `xerktech/ArgoCD`, out of this repo. An app-aware relay inside the hub needs no ingress change.
+
+**Why a primitive, injected, unit-tested with no cluster.** `makeRelay(store, replicaId, deps)` is
+standalone and store/directory-injected exactly like `makeControlBus`/`makeSseBus`, and the
+deployment-coupled seams (the pod-to-pod `dial` + listener, this replica's `endpoint`) and the
+server.js-resident seams (`hostTunnelOwners`, `controlChannels`, `openChannel`) are injected — so the
+whole routing + duplex-bridging + lifecycle is exercised with a `FileLiveStore` and an in-process
+loopback pair, the same no-live-backend discipline as store.js's RESP codec and leader.js's election.
+It is duplex + backpressure-aware, caps its frame length (the `wsParser`/XERK-357 memory rule), and
+closes cleanly on the three failure modes — owner handoff, tunnel drop, replica loss — each with a
+reconnect hint and never a hung socket. Non-HA is byte-identical: server.js constructs a relay only
+under HA, null single-process. Mechanics: `.claude/rules/turma-ha-tunnel.md`.
+
+**Reachability of Option 3.** This transport is the byte-plane half named in `docs/turma-ha-design.md`
+§"Option 3" ("relay the byte streams between replicas … proxying a live ttyd WebSocket pod-to-pod").
+Landing it (plus the consumers) removes the last reason `/readyz` gates the Service to the leader only
+(`.claude/rules/turma-ha-leader.md` — the migration-request Map is the other), a step toward true
+active-active.
 
 ## If we must cut to fewer dependencies
 

@@ -301,6 +301,56 @@ function noteWrite(absPath) {
   if (blobSink) { try { blobSink(absPath); } catch { /* best-effort */ } }
 }
 
+// ---- the Postgres INDEX mirror sink (XERK-780) ------------------------------
+//
+// Under HA the archive's searchable index has a shared Postgres OF-RECORD (server.js
+// wires this sink to an IndexMirror over pgclient). This module stays synchronous and
+// node:sqlite-native on its hot path; the ONLY coupling is this optional sink, called
+// after each durable index mutation with a SNAPSHOT of what changed. The sink just
+// enqueues (sync, cheap) for an off-beat worker to upsert to Postgres — nothing here
+// dials the network. UNSET (the default, and every non-HA path) makes this a no-op,
+// so the single-process behaviour is byte-identical.
+//
+// A session mutation mirrors the FULL row (mirrorSession re-reads it), so the
+// Postgres upsert never clobbers a metadata column the mutation didn't touch; the
+// monotonic byte/count columns are GREATEST-merged there, never lowered. Entries are
+// mirrored append-only by ordinal (idempotent) or replaced wholesale on a reconcile.
+let indexSink = null;
+function setIndexSink(sink) {
+  indexSink = sink && typeof sink === "object" ? sink : null;
+}
+// Mirror the FULL current SQLite session row for `transcriptId`. Best-effort — a
+// mirror hiccup must never break the durable local write (XERK-235).
+function mirrorSession(transcriptId) {
+  if (!indexSink || typeof indexSink.session !== "function") return;
+  try {
+    const row = db.prepare(`SELECT transcriptId, host, siteKey, remoteKey, repo, worktree,
+        slug, createdAt, endedTs, summary, msgCount, bytesStored, archiveBytes, rawBytes,
+        filePath, updatedAt FROM sessions WHERE transcriptId=?`).get(transcriptId);
+    if (row) indexSink.session(row);
+  } catch { /* best-effort mirror */ }
+}
+// Mirror newly-appended entries at ordinals [startSeq, startSeq+n). `list` is the
+// raw entry objects; only the FTS-indexed {uuid,role,ts,text} projection is mirrored,
+// matching what the SQLite entries_fts holds.
+function mirrorEntries(transcriptId, list, startSeq) {
+  if (!indexSink || typeof indexSink.entries !== "function" || !list || !list.length) return;
+  try {
+    indexSink.entries(transcriptId, list.map((e) => ({
+      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
+    })), startSeq);
+  } catch { /* best-effort mirror */ }
+}
+// Mirror a wholesale replacement of a transcript's entries (the reconcile heal).
+function mirrorReplace(transcriptId, list) {
+  if (!indexSink || typeof indexSink.replace !== "function") return;
+  try {
+    indexSink.replace(transcriptId, (list || []).map((e) => ({
+      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
+    })));
+  } catch { /* best-effort mirror */ }
+}
+
 // ---- database ---------------------------------------------------------------
 
 let db = null;
@@ -1012,6 +1062,14 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
     updatedAt: nowIso,
   });
 
+  // Mirror the durable index write to the Postgres of-record (XERK-780, no-op off
+  // HA): the full session row (so the upsert never clobbers untouched metadata) and
+  // the entries appended this chunk, at ordinals continuing from prevCount (idempotent
+  // by (transcriptId, seq)). After the local write is durable, so a mirror hiccup
+  // never affects what we return.
+  mirrorSession(transcriptId);
+  mirrorEntries(transcriptId, list, prevCount);
+
   // `shed` tells the agent this transcript is over budget so it stops putting
   // the payloads on the wire at all; the hub sheds regardless, since an agent
   // too old to read the flag still pushes them.
@@ -1055,6 +1113,8 @@ function restampOrg(transcriptId, siteKey, host) {
       try { writeSidecar(metaPath, sc); } catch { /* best-effort */ }
     }
   }
+  // Mirror the re-pointed owner (host + org) to the Postgres of-record (XERK-780).
+  mirrorSession(transcriptId);
   return true;
 }
 
@@ -1268,6 +1328,9 @@ function ingestRaw(host, transcriptId, rel, start, buf) {
   writtenSinceWalk += buf.length;
   db.prepare("UPDATE sessions SET rawBytes=?, updatedAt=? WHERE transcriptId=?")
     .run(rawBytes + buf.length, new Date().toISOString(), transcriptId);
+  // Mirror the raised raw-byte cursor to the Postgres of-record (XERK-780). GREATEST
+  // there keeps a concurrent replica from ever lowering it.
+  mirrorSession(transcriptId);
   return { stored: have + buf.length };
 }
 
@@ -1358,6 +1421,7 @@ function manifestCursors(host, manifest, siteKey) {
       endedTs=excluded.endedTs, summary=COALESCE(excluded.summary, sessions.summary),
       updatedAt=excluded.updatedAt`);
   const nowIso = new Date().toISOString();
+  const created = [];
   tx(() => {
     for (const m of list) {
       if (!m || !m.transcriptId) continue;
@@ -1367,9 +1431,14 @@ function manifestCursors(host, manifest, siteKey) {
         upsert.run(m.transcriptId, host, pushOrg, m.remoteKey || null, m.repo || null,
           m.worktree || null, m.slug || null, m.createdAt || null,
           m.endedTs || null, m.summary || null, nowIso);
+        created.push(m.transcriptId);
       }
     }
   });
+  // Mirror each newly-created placeholder row to the Postgres of-record (XERK-780)
+  // so a promoted replica sees the same not-yet-filled rows the ingestChunk org gate
+  // depends on. After the tx (the rows now exist to be read back by mirrorSession).
+  for (const id of created) mirrorSession(id);
   return have;
 }
 
@@ -1420,6 +1489,7 @@ function inventoryCursors(host, inventory, siteKey) {
     VALUES(?,?,?,0,0,?)
     ON CONFLICT(transcriptId) DO NOTHING`);
   const nowIso = new Date().toISOString();
+  const created = [];
   tx(() => {
     for (const m of list) {
       // Inventory entries are the compact `{i, s, r}` the agent ships — id, its
@@ -1437,10 +1507,13 @@ function inventoryCursors(host, inventory, siteKey) {
       const rShort = Number.isFinite(r) && r > 0 && rawBytes < r;
       const sShort = Number.isFinite(s) && s > 0 && bytesStored < s;
       if (!sShort && !rShort) continue;
-      if (!row) insert.run(tid, host, pushOrg, nowIso);
+      if (!row) { insert.run(tid, host, pushOrg, nowIso); created.push(tid); }
       have[tid] = bytesStored;
     }
   });
+  // Mirror each newly-created placeholder row to the Postgres of-record (XERK-780),
+  // as manifestCursors does. After the tx, so the row exists to read back.
+  for (const id of created) mirrorSession(id);
   return have;
 }
 
@@ -1651,6 +1724,11 @@ function reconcileRow(transcriptId, storedCount, storedBytes, entries, trueBytes
     db.prepare("UPDATE sessions SET msgCount=?, archiveBytes=? WHERE transcriptId=?")
       .run(trueCount, trueBytes, transcriptId);
   });
+  // Mirror the heal to the Postgres of-record (XERK-780): the transcript's entries
+  // are REPLACED wholesale (matching the SQLite DELETE+reinsert), and its row's
+  // healed msgCount/archiveBytes re-mirrored.
+  mirrorReplace(transcriptId, entries);
+  mirrorSession(transcriptId);
   console.error(
     `archive: reconciled ${transcriptId} on read — index claimed ${storedCount} ` +
     `msgs/${storedBytes}B, file holds ${trueCount}/${trueBytes}B (a .jsonl was ` +
@@ -1785,6 +1863,105 @@ function rebuildIndex() {
     });
   }
   return files.length;
+}
+
+// ---- bulk load the index FROM the Postgres of-record (XERK-780) --------------
+//
+// The hydration sink server.js hands to PgIndexStore.hydrateInto — the RETIREMENT of
+// the per-pod rebuild-from-files. `reset()` clears the local index ONCE; each page of
+// session/entry rows out of Postgres is applied in ONE synchronous transaction (never
+// held open across the caller's `await`s between pages, so a concurrent request can't
+// hit a nested transaction). `done()` stamps the schema version so openDb does not
+// re-rebuild from files afterward. Between reset() and done() the local index is
+// partial — archive reads answer "still syncing" exactly as they do during a
+// byte-hydrate, the archive's own honest answer.
+function indexLoader() {
+  openDb();
+  let upsertS = null;
+  let insertE = null;
+  return {
+    reset() {
+      upsertS = db.prepare(`INSERT OR REPLACE INTO sessions(
+          transcriptId, host, siteKey, remoteKey, repo, worktree, slug, createdAt, endedTs,
+          summary, msgCount, bytesStored, archiveBytes, rawBytes, filePath, updatedAt)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      insertE = db.prepare(
+        "INSERT INTO entries_fts(text, transcriptId, uuid, role, ts) VALUES(?,?,?,?,?)");
+      tx(() => {
+        db.exec("DELETE FROM entries_fts");
+        db.exec("DELETE FROM sessions");
+      });
+    },
+    sessions(rows) {
+      tx(() => {
+        for (const r of rows) {
+          // `?? null` keeps a recorded "" (a real no-org owner, still gated) distinct
+          // from a legacy NULL — the same rule rebuildIndex uses for the sidecar.
+          upsertS.run(r.transcriptId, r.host ?? null, r.siteKey ?? null, r.remoteKey ?? null,
+            r.repo ?? null, r.worktree ?? null, r.slug ?? null, r.createdAt ?? null,
+            r.endedTs ?? null, r.summary ?? null, r.msgCount || 0, r.bytesStored || 0,
+            r.archiveBytes || 0, r.rawBytes || 0, r.filePath ?? null, r.updatedAt ?? null);
+        }
+      });
+    },
+    entries(rows) {
+      tx(() => {
+        for (const e of rows) {
+          insertE.run(String(e.text || ""), e.transcriptId, e.uuid || null,
+            e.role || null, e.ts || null);
+        }
+      });
+    },
+    done() {
+      db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('schemaVersion',?)")
+        .run(String(SCHEMA_VERSION));
+    },
+  };
+}
+
+// After a Postgres hydrate, re-derive each filed transcript's BYTE CURSORS from the
+// LOCAL FILES — the append-only ground truth for this replica — exactly as
+// rebuildIndex does (bytesStored from the `.meta` sidecar, archiveBytes from the
+// `.jsonl` SIZE, rawBytes from the raw directory). This is the correctness backstop
+// for the one case where the Postgres of-record can lag the local files: a hub whose
+// ARCHIVE_DIR volume PERSISTED across a restart that lost the in-memory index-mirror
+// queue (a persistent-volume compose deploy; on k8s emptyDir the disk and the queue
+// are lost together, so PG never lags the files there). Without it a too-low
+// `bytesStored` makes the agent re-push a range the `.jsonl` already holds, and
+// `appendFileSync` DUPLICATES it — the append-only corruption the file-authoritative
+// cursor exists to prevent.
+//
+// It reads only the SIDECAR (267 bytes) + a `.jsonl` stat + the raw-dir walk per
+// transcript — NEVER the `.jsonl` content — so the expensive part the Postgres
+// hydrate skips (re-parsing every entry into the FTS index) stays skipped; this is
+// O(transcripts) stats, the same class as the store-total walk, not O(entries).
+// A no-op on a fresh replica (PG == the just-downloaded files). NOT re-mirrored: the
+// local cursor is now correct, and the agent's next re-push re-mirrors the tail.
+function reconcileHydratedCursors() {
+  openDb();
+  const rows = db.prepare(
+    "SELECT transcriptId, filePath, bytesStored, archiveBytes, rawBytes " +
+    "FROM sessions WHERE filePath IS NOT NULL").all();
+  const upd = db.prepare(
+    "UPDATE sessions SET bytesStored=?, archiveBytes=?, rawBytes=? WHERE transcriptId=?");
+  let healed = 0;
+  for (const row of rows) {
+    const paths = filePaths(row.filePath);
+    let fileSize;
+    try { fileSize = fs.statSync(paths.jsonl).size; }
+    catch { continue; } // no local file (or unreadable): trust PG, as rebuildIndex skips it
+    const sc = readSidecar(paths.meta);
+    const bytesStored = sc && Number.isFinite(sc.bytesStored) ? sc.bytesStored : (row.bytesStored || 0);
+    const rawBytes = walkAllBytes(paths.jsonl + RAW_DIR_SUFFIX);
+    if (bytesStored === row.bytesStored && fileSize === row.archiveBytes && rawBytes === row.rawBytes) continue;
+    upd.run(bytesStored, fileSize, rawBytes, row.transcriptId);
+    healed += 1;
+  }
+  if (healed) {
+    console.error(`archive: reconciled ${healed} transcript cursor(s) against local files ` +
+      `after a Postgres index hydrate (files ahead of the of-record; XERK-780)`);
+  }
+  return healed;
 }
 
 // ---- the dsh Trajectory (XERK-498) ------------------------------------------
@@ -2443,6 +2620,10 @@ module.exports = {
   slugify, archiveRelPath, resolveNewRelPath, __RELPATH_PROBE_MAX: RELPATH_PROBE_MAX,
   ftsQuery, byteCeiling, shedFilePayloads,
   openDb, closeDb, rebuildIndex, setBlobSink,
+  // The Postgres INDEX of-record seam (XERK-780): the write sink + the hydration
+  // bulk loader + the post-hydrate cursor reconcile (all no-ops off HA — the sink
+  // stays unset, and the loader/reconcile only run on the HA hydrate path).
+  setIndexSink, indexLoader, reconcileHydratedCursors,
   ingestChunk, manifestCursors, inventoryCursors, rawCursorsForIds,
   archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).

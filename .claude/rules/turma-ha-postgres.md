@@ -15,16 +15,19 @@ byte-identical + no-work-on-the-beat invariants. This file is the operative rule
 ## What XERK-776 landed, and what consumes it now
 
 - **Landed by XERK-776:** the Postgres v3 wire client (`PgConnection`), a bounded reusable-connection
-  pool (`PgPool`), the `createPgClient(haConfig)` factory, and the tests. That ticket wired NO
-  consumer — no `server.js` call site was flipped onto it.
-- **The usage-ledger of-record now consumes it (XERK-779, `w2-ledger`).** `server.js` creates ONE
-  shared `PgPool` (`createPgClient`) and passes it to `usageLedger.configure`; the ledger's Postgres
-  `LedgerStore` (`usage-ledger-store.js`) is the durable of-record under HA, retiring the Valkey
-  backend. The archive index (`w2-index`, XERK-780) is still per-pod local SQLite.
-- **Per-backend boot flags** (`POSTGRES_LEDGER_WIRED` true, `POSTGRES_INDEX_WIRED` false in
-  `ha-config.js`) so the boot line honestly reads `ledger=postgres, index=sqlite(...)`. **Flip each
-  flag in the SAME change that wires its backend** — never ahead of it, or the boot line lies to the
-  operator (the XERK-773 prod finding). XERK-780 flips `POSTGRES_INDEX_WIRED` when the IndexStore lands.
+  pool (`PgPool`), the `createPgClient(haConfig)` factory, and the tests. That ticket wired NO consumer.
+- **CONSUMERS: BOTH of-record backends now ride this pool.** `server.js` creates ONE shared `PgPool`
+  (`createPgClient`, the `archiveIndexPool` binding) and hands it to both:
+  - the archive INDEX of-record (`index-store.js`, XERK-780/w2-index) — `INDEX_BACKEND_WIRED = true`;
+  - the usage-LEDGER of-record (`usage-ledger-store.js`, XERK-779/w2-ledger) via
+    `usageLedger.configure(haConfig, archiveIndexPool, invalidateAgentsCache)` — `LEDGER_BACKEND_WIRED
+    = true`, retiring the Valkey `SharedLedgerBackend` (XERK-758). The boot line reads
+    `ledger=postgres, index=postgres`.
+- **The wired flag is GRANULAR, one per backend** (`LEDGER_BACKEND_WIRED`/`INDEX_BACKEND_WIRED`;
+  XERK-773 was a single conflated flag): flip each in the SAME change that wires ITS backend, never
+  ahead of it, or the boot line lies to the operator (the XERK-773 prod finding). Ledger mechanics:
+  `.claude/rules/turma-usage.md` ("HA: the Postgres of-record backend"); archive index:
+  `.claude/rules/turma-ha-archive.md`.
 
 ## stdlib-only, like store.js and blobstore.js
 
