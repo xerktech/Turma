@@ -29,7 +29,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `windows-terminal.md` | `agent/win/**` | native Windows terminal layer (XERK-668): the ttyd drop-in pty-host; rationale in `docs/windows-agent-adr.md` |
 | `turma.md` | `turma/**` | chrome, org filter, dashboard, notifications, auth |
 | `turma-archive.md` | `turma/archive.js` | durable archive: layers, size ceilings, how the total is measured |
-| `turma-ha-archive.md` | `turma/blobstore.js`, `turma/archive-mirror.js`, `turma/index-store.js` | HA archive of-record (XERK-759/780): object-store bytes + Postgres index of-record (per-replica hot SQLite cache, hydrated from PG), the mirror/hydrate seam |
+| `turma-ha-archive.md` | `turma/blobstore.js`, `turma/archive-mirror.js`, `turma/index-store.js` | HA archive of-record (XERK-759/780/793): object-store bytes + Postgres index of-record; under HA the local node:sqlite is RETIRED for an in-memory session map (hydrated from PG) + PG-direct search, the mirror/hydrate seam |
 | `turma-ha-postgres.md` | `turma/pgclient.js` | HA Postgres of-record spine (XERK-776): stdlib v3 wire client + SCRAM-SHA-256 + extended query + pool + GREATEST upsert; consumed by the ledger (XERK-779) + archive index (XERK-780) of-records; non-HA returns null |
 | `turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `turma-ha-registry.md` | `turma/server.js` | HA: the fleet registry + per-host command queues in the shared store (per-host write-through, hydration, watch); non-HA byte-identical (XERK-756) |

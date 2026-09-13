@@ -126,13 +126,13 @@ test("ingestChunk: the cursor never rewinds, so a range can't be ingested twice 
   assert.equal(ok.bytesStored, 20, "a legitimate chunk must still land after a refused one");
 });
 
-test("searchArchive: ranked, <mark>-highlighted snippets, repo/host filters", () => {
+test("searchArchive: ranked, <mark>-highlighted snippets, repo/host filters", async () => {
   archive.ingestChunk("nas2", "t2", {
     remoteKey: "github.com/xerk/other", repo: "other", worktree: "/w2",
     slug: "s2", createdAt: "2026-07-09T00:00:00Z", endedTs: "2026-07-09T00:00:00Z", summary: "Other work",
   }, 0, 40, [ent("o1", "assistant", "compose flag lives elsewhere here")]);
 
-  const res = archive.searchArchive("compose flag");
+  const res = (await archive.searchArchive("compose flag"));
   const allMatches = res.groups.flatMap((g) => g.matches);
   assert.ok(allMatches.length >= 2, "matches across both repos");
   assert.ok(allMatches.some((m) => /<mark>/.test(m.snippet)), "snippet highlights the term");
@@ -141,19 +141,19 @@ test("searchArchive: ranked, <mark>-highlighted snippets, repo/host filters", ()
   // Grouped by remoteKey.
   assert.ok(res.groups.length >= 2);
 
-  const scoped = archive.searchArchive("compose flag", { repo: "turma" });
+  const scoped = (await archive.searchArchive("compose flag", { repo: "turma" }));
   assert.ok(scoped.groups.every((g) => g.repo === "turma"));
 
-  assert.equal(archive.searchArchive("!!!").groups.length, 0, "no usable tokens -> no results");
+  assert.equal((await archive.searchArchive("!!!")).groups.length, 0, "no usable tokens -> no results");
 });
 
-test("listArchive: newest first, filters, offline-host-independent", () => {
-  const all = archive.listArchive({});
+test("listArchive: newest first, filters, offline-host-independent", async () => {
+  const all = (await archive.listArchive({}));
   assert.ok(all.sessions.length >= 2);
   // Newest endedTs first: t1 (07-10) before t2 (07-09).
   const ids = all.sessions.map((s) => s.transcriptId);
   assert.ok(ids.indexOf("t1") < ids.indexOf("t2"));
-  const only = archive.listArchive({ repo: "other" });
+  const only = (await archive.listArchive({ repo: "other" }));
   assert.ok(only.sessions.every((s) => s.repo === "other"));
 });
 
@@ -185,7 +185,7 @@ test("XERK-453: getTranscript serves the row's origin org (siteKey) for the rest
     "an org-less row serves an empty origin org, never null");
 });
 
-test("XERK-422: a transcript that rendered ZERO entries reads back as empty, not a 404", () => {
+test("XERK-422: a transcript that rendered ZERO entries reads back as empty, not a 404", async () => {
   // A transcript whose lines are all non-renderable (mode/permission-mode/
   // system/last-prompt records) projects to no entries: the agent read the bytes
   // and advanced its cursor to size, so ingestChunk gets an empty entry list at a
@@ -197,7 +197,7 @@ test("XERK-422: a transcript that rendered ZERO entries reads back as empty, not
   assert.ok(!fs.existsSync(path.join(process.env.ARCHIVE_DIR, rel)),
     "no organized .jsonl is written when there are no renderable entries");
   // It lists (the row exists) ...
-  assert.ok(archive.listArchive({ host: "nas" }).sessions.some((s) => s.transcriptId === "empty1"),
+  assert.ok((await archive.listArchive({ host: "nas" })).sessions.some((s) => s.transcriptId === "empty1"),
     "the row is listable");
   // ... and now reads back as an honest empty conversation rather than 404ing
   // forever. `null` (an unknown transcript) stays reserved for a row that isn't
@@ -253,13 +253,13 @@ test("ingestChunk persists blocks[] and getTranscript returns them", () => {
   assert.deepEqual(JSON.parse(line1).blocks, blocks);
 });
 
-test("rebuildIndex repopulates search from files after the DB is deleted", () => {
+test("rebuildIndex repopulates search from files after the DB is deleted", async () => {
   archive.closeDb();
   fs.rmSync(process.env.ARCHIVE_DB, { force: true });
   fs.rmSync(process.env.ARCHIVE_DB + "-wal", { force: true });
   fs.rmSync(process.env.ARCHIVE_DB + "-shm", { force: true });
   // openDb() on next call sees an empty DB with files present -> auto-rebuild.
-  const res = archive.searchArchive("compose flag");
+  const res = (await archive.searchArchive("compose flag"));
   const allMatches = res.groups.flatMap((g) => g.matches);
   assert.ok(allMatches.length >= 2, "search works again, rebuilt from files");
   const t = archive.getTranscript("t1");
@@ -622,11 +622,11 @@ test("the store total counts raw bytes of EVERY extension", () => {
   assert.ok(after - before >= 4096, `raw .txt bytes uncounted: ${before} -> ${after}`);
 });
 
-test("a rebuild derives rawBytes from disk and never indexes a raw file as a session", () => {
+test("a rebuild derives rawBytes from disk and never indexes a raw file as a session", async () => {
   seedRaw("raw6");
   archive.ingestRaw("nas", "raw6", "raw6.jsonl", 0, Buffer.from("x".repeat(50)));
   archive.ingestRaw("nas", "raw6", "raw6/subagents/a.jsonl", 0, Buffer.from("y".repeat(25)));
-  const before = archive.listArchive({ limit: 500 }).sessions.length;
+  const before = (await archive.listArchive({ limit: 500 })).sessions.length;
   // The rebuild's file walk must not DESCEND a raw directory at all. Its
   // contents are the session's own .jsonl files, which carry no `.meta` and so
   // would be skipped as rows anyway — but only after the rebuild had read every
@@ -636,7 +636,7 @@ test("a rebuild derives rawBytes from disk and never indexes a raw file as a ses
     "the rebuild walk descended a raw directory");
   assert.ok(walked.length, "the walk found the rendered files");
   archive.rebuildIndex();
-  const after = archive.listArchive({ limit: 500 });
+  const after = (await archive.listArchive({ limit: 500 }));
   assert.equal(after.sessions.length, before, "a raw file was indexed as a session");
   // rawBytes comes off the disk, like archiveBytes — so an operator's `rm -rf`
   // of a raw directory actually gives the budget back.
@@ -1030,14 +1030,14 @@ function jsonlFor(id, meta, host) {
   return path.join(process.env.ARCHIVE_DIR, archive.archiveRelPath(id, { ...meta, host }));
 }
 
-test("XERK-280: getTranscript heals msgCount + FTS after a delete+recreate", () => {
+test("XERK-280: getTranscript heals msgCount + FTS after a delete+recreate", async () => {
   const M = { ...META, summary: "x280 recreate" };
   archive.ingestChunk("nas280", "x280a", { ...M }, 0, 100, [
     ent("a1", "user", "one alpha280"), ent("a2", "assistant", "two beta280"),
   ]);
   archive.ingestChunk("nas280", "x280a", { ...M }, 100, 200, [ent("a3", "user", "three gamma280")]);
   // Index believes 3 messages are stored.
-  assert.equal(archive.listArchive({ host: "nas280" }).sessions
+  assert.equal((await archive.listArchive({ host: "nas280" })).sessions
     .find((s) => s.transcriptId === "x280a").msgCount, 3);
 
   // Operator deletes the .jsonl by hand; the row survives, cursor untouched.
@@ -1051,18 +1051,18 @@ test("XERK-280: getTranscript heals msgCount + FTS after a delete+recreate", () 
   assert.equal(t.entries[0].text, "after deletion x280");
 
   // The read healed the row: msgCount now matches disk, not the lie.
-  assert.equal(archive.listArchive({ host: "nas280" }).sessions
+  assert.equal((await archive.listArchive({ host: "nas280" })).sessions
     .find((s) => s.transcriptId === "x280a").msgCount, 1);
   // And search no longer returns the vanished messages.
-  const hitsGamma = archive.searchArchive("gamma280").groups
+  const hitsGamma = (await archive.searchArchive("gamma280")).groups
     .flatMap((g) => g.matches).filter((m) => m.transcriptId === "x280a");
   assert.equal(hitsGamma.length, 0, "deleted message dropped from FTS");
-  const hitsAfter = archive.searchArchive("after").groups
+  const hitsAfter = (await archive.searchArchive("after")).groups
     .flatMap((g) => g.matches).filter((m) => m.transcriptId === "x280a");
   assert.equal(hitsAfter.length, 1, "surviving message still searchable");
 });
 
-test("XERK-280: listArchive heals a stale row on its own (before any transcript view)", () => {
+test("XERK-280: listArchive heals a stale row on its own (before any transcript view)", async () => {
   const M = { ...META, summary: "x280 listheal" };
   archive.ingestChunk("nas280", "x280b", { ...M }, 0, 100, [
     ent("b1", "user", "one"), ent("b2", "assistant", "two"), ent("b3", "user", "three"),
@@ -1070,18 +1070,18 @@ test("XERK-280: listArchive heals a stale row on its own (before any transcript 
   fs.unlinkSync(jsonlFor("x280b", M, "nas280"));
   archive.ingestChunk("nas280", "x280b", { ...M }, 100, 200, [ent("b4", "user", "survivor")]);
   // listArchive alone (no getTranscript first) reports the true, healed count.
-  const row = archive.listArchive({ host: "nas280" }).sessions.find((s) => s.transcriptId === "x280b");
+  const row = (await archive.listArchive({ host: "nas280" })).sessions.find((s) => s.transcriptId === "x280b");
   assert.equal(row.msgCount, 1);
   // Helper columns never leak onto the wire.
   assert.equal("filePath" in row, false);
   assert.equal("archiveBytes" in row, false);
   // Healed values match a full rebuild-from-disk (the file is the source of truth).
   archive.rebuildIndex();
-  assert.equal(archive.listArchive({ host: "nas280" }).sessions
+  assert.equal((await archive.listArchive({ host: "nas280" })).sessions
     .find((s) => s.transcriptId === "x280b").msgCount, 1);
 });
 
-test("XERK-280: a healthy transcript is never mutated on read", () => {
+test("XERK-280: a healthy transcript is never mutated on read", async () => {
   const M = { ...META, summary: "x280 healthy" };
   archive.ingestChunk("nas280", "x280c", { ...M }, 0, 100, [
     ent("c1", "user", "hello"), ent("c2", "assistant", "world"),
@@ -1098,11 +1098,11 @@ test("XERK-280: a healthy transcript is never mutated on read", () => {
   let t;
   try {
     t = archive.getTranscript("x280c");
-    archive.listArchive({ host: "nas280" });
-    archive.searchArchive("hello");
+    (await archive.listArchive({ host: "nas280" }));
+    (await archive.searchArchive("hello"));
   } finally { console.error = origErr; }
   assert.equal(t.entries.length, 2);
-  assert.equal(archive.listArchive({ host: "nas280" }).sessions
+  assert.equal((await archive.listArchive({ host: "nas280" })).sessions
     .find((s) => s.transcriptId === "x280c").msgCount, 2);
   // No heal ran: no reconcile log, and the file was not rewritten.
   assert.equal(logs.filter((l) => l.includes("reconciled x280c")).length, 0,
@@ -1110,7 +1110,7 @@ test("XERK-280: a healthy transcript is never mutated on read", () => {
   assert.equal(fs.statSync(jsonl).mtimeMs, before);
 });
 
-test("XERK-280: a fully-deleted file (ENOENT) is NOT mutated on read — blip-safe residual", () => {
+test("XERK-280: a fully-deleted file (ENOENT) is NOT mutated on read — blip-safe residual", async () => {
   const M = { ...META, summary: "x280 enoent" };
   archive.ingestChunk("nas280", "x280d", { ...M }, 0, 100, [
     ent("d1", "user", "one"), ent("d2", "assistant", "two"),
@@ -1122,7 +1122,7 @@ test("XERK-280: a fully-deleted file (ENOENT) is NOT mutated on read — blip-sa
   assert.deepEqual(t.entries, []);
   // The row's count is deliberately left as-is (the ambiguous case the ticket
   // isolates); it is not zeroed on an absence.
-  assert.equal(archive.listArchive({ host: "nas280" }).sessions
+  assert.equal((await archive.listArchive({ host: "nas280" })).sessions
     .find((s) => s.transcriptId === "x280d").msgCount, 2);
 });
 
@@ -1510,7 +1510,7 @@ test("XERK-789: setHydrating toggles the ingest gate the routes read", () => {
 
 // ---- XERK-791: complete the hydrate serialization + proactive integrity check --
 
-test("XERK-791: heal-on-read does NOT write the index while hydrating (the guard gap)", () => {
+test("XERK-791: heal-on-read does NOT write the index while hydrating (the guard gap)", async () => {
   const M = { ...META, summary: "x791 healgate" };
   archive.ingestChunk("nas791", "x791a", { ...M }, 0, 100, [
     ent("a1", "user", "one alpha791"), ent("a2", "assistant", "two gamma791"),
@@ -1532,7 +1532,7 @@ test("XERK-791: heal-on-read does NOT write the index while hydrating (the guard
   let t;
   try {
     t = archive.getTranscript("x791a");
-    archive.listArchive({ host: "nas791" });
+    (await archive.listArchive({ host: "nas791" }));
   } finally { console.error = origErr; archive.setHydrating(false); }
   assert.equal(t.entries.length, 1, "read is still honest for display (file is truth)");
   assert.equal(t.entries[0].text, "survivor791");
@@ -1542,15 +1542,15 @@ test("XERK-791: heal-on-read does NOT write the index while hydrating (the guard
   // is NOT the tripwire here — the persisted FTS state is.
   assert.equal(logs.filter((l) => l.includes("reconciled x791a")).length, 0,
     "no index heal ran while hydrating");
-  assert.ok(archive.searchArchive("gamma791").groups
+  assert.ok((await archive.searchArchive("gamma791")).groups
     .flatMap((g) => g.matches).some((m) => m.transcriptId === "x791a"),
     "vanished message still in FTS (no DELETE ran) while hydrating");
 
   // Once the hydrate ends, the next read heals normally — XERK-280 unchanged.
   assert.equal(archive.getTranscript("x791a").entries.length, 1);
-  assert.equal(archive.listArchive({ host: "nas791" }).sessions
+  assert.equal((await archive.listArchive({ host: "nas791" })).sessions
     .find((s) => s.transcriptId === "x791a").msgCount, 1, "healed once hydrate finished");
-  assert.equal(archive.searchArchive("gamma791").groups
+  assert.equal((await archive.searchArchive("gamma791")).groups
     .flatMap((g) => g.matches).filter((m) => m.transcriptId === "x791a").length, 0,
     "vanished message dropped from FTS after the hydrate");
 });
@@ -1562,7 +1562,7 @@ test("XERK-791: checkIndexIntegrity passes a healthy hydrated index", () => {
   assert.equal(archive.checkIndexIntegrity(), true, "healthy FTS5 index passes the check");
 });
 
-test("XERK-791: checkIndexIntegrity DETECTS a corrupt fts5 page (false, not a throw) and resetLocalIndex recovers", () => {
+test("XERK-791: checkIndexIntegrity DETECTS a corrupt fts5 page (false, not a throw) and resetLocalIndex recovers", async () => {
   const M = { ...META, summary: "x791 corrupt" };
   // Seed enough entries that entries_fts spills across multiple data pages.
   for (let i = 0; i < 60; i++) {
@@ -1594,18 +1594,18 @@ test("XERK-791: checkIndexIntegrity DETECTS a corrupt fts5 page (false, not a th
   // resetLocalIndex drops the corrupt file and rebuilds from the .jsonl files.
   archive.resetLocalIndex();
   assert.equal(archive.checkIndexIntegrity(), true, "healthy again after the reset");
-  assert.ok(archive.searchArchive("corruptneedle").groups.length > 0,
+  assert.ok((await archive.searchArchive("corruptneedle")).groups.length > 0,
     "searchable again after rebuild-from-files");
 });
 
-test("XERK-789: resetLocalIndex drops a corrupt index.db and rebuilds from the files", () => {
+test("XERK-789: resetLocalIndex drops a corrupt index.db and rebuilds from the files", async () => {
   // Ingest so an organized .jsonl + a populated index exist.
   archive.ingestChunk("nas", "heal1", { ...META, summary: "Self Heal One" }, 0, 60, [
     ent("h1", "user", "a searchable healing needle alpha"),
     ent("h2", "assistant", "acknowledged the healing needle"),
   ]);
   // It is findable before the corruption.
-  assert.ok(archive.searchArchive("healing").groups.length > 0, "found before corruption");
+  assert.ok((await archive.searchArchive("healing")).groups.length > 0, "found before corruption");
 
   // Physically corrupt the on-disk index.db (drop the handle, overwrite the file).
   archive.closeDb();
@@ -1618,6 +1618,6 @@ test("XERK-789: resetLocalIndex drops a corrupt index.db and rebuilds from the f
   // The rebuilt-from-files index serves the transcript again.
   const t = archive.getTranscript("heal1");
   assert.ok(t && Array.isArray(t.entries) && t.entries.length >= 2, "transcript readable after heal");
-  assert.ok(archive.searchArchive("healing").groups.length > 0,
+  assert.ok((await archive.searchArchive("healing")).groups.length > 0,
     "searchable again after heal (rebuilt from files)");
 });

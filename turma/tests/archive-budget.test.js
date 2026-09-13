@@ -126,12 +126,12 @@ test("an HTML preview sheds like an image one", () => {
   assert.equal(f.shed, true);
 });
 
-test("rebuildIndex re-derives archiveBytes from the files, so a lost DB keeps the budget", () => {
-  const spend = () => {
-    const r = archive.listArchive({ limit: 500 }).sessions.find((s) => s.transcriptId === "big");
+test("rebuildIndex re-derives archiveBytes from the files, so a lost DB keeps the budget", async () => {
+  const spend = async () => {
+    const r = (await archive.listArchive({ limit: 500 })).sessions.find((s) => s.transcriptId === "big");
     return r;
   };
-  assert.ok(spend(), "big should be indexed before the rebuild");
+  assert.ok(await spend(), "big should be indexed before the rebuild");
   archive.closeDb();
   fs.rmSync(process.env.ARCHIVE_DB, { force: true });
   fs.rmSync(process.env.ARCHIVE_DB + "-wal", { force: true });

@@ -324,9 +324,10 @@ function setIndexSink(sink) {
 function mirrorSession(transcriptId) {
   if (!indexSink || typeof indexSink.session !== "function") return;
   try {
-    const row = db.prepare(`SELECT transcriptId, host, siteKey, remoteKey, repo, worktree,
-        slug, createdAt, endedTs, summary, msgCount, bytesStored, archiveBytes, rawBytes,
-        filePath, updatedAt FROM sessions WHERE transcriptId=?`).get(transcriptId);
+    // idxGetSession reads the sqlite table (sqlite mode) or the in-memory map (pg
+    // mode, XERK-793), returning a copy either way — so the enqueued upsert never
+    // aliases the live map row.
+    const row = idxGetSession(transcriptId);
     if (row) indexSink.session(row);
   } catch { /* best-effort mirror */ }
 }
@@ -349,6 +350,92 @@ function mirrorReplace(transcriptId, list) {
       uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
     })));
   } catch { /* best-effort mirror */ }
+}
+
+// ---- index backend mode: retire the local node:sqlite under HA (XERK-793) ---
+//
+// XERK-780 kept a per-replica local node:sqlite index as the SYNCHRONOUS read/write
+// model, hydrated from the shared Postgres of-record. Its FTS5 `entries_fts` was the
+// recurring corruption surface (XERK-789/791): the boot/promotion hydrate raced live
+// ingest on the one DatabaseSync handle and physically corrupted the index. This
+// RETIRES that surface. Under HA the index becomes:
+//   - an in-memory `sessionsMap` — the full session ROW (metadata + cursors + owner
+//     + filePath), the BEAT-SAFE synchronous model the heartbeat cursor path AND
+//     getTranscript/sessionRow read. Hydrated from Postgres on boot/promotion and
+//     mirrored back on every write (the existing `setIndexSink` -> IndexMirror).
+//   - Postgres-DIRECT full-text SEARCH (`searchArchive`/`listArchive` go async), so
+//     there is NO local `entries_fts` at all — nothing local to corrupt.
+// The organized `.jsonl`/`.raw` FILES stay local in BOTH modes (getTranscript reads
+// them for CONTENT; the bytes hydrate from the object store under HA).
+//
+// HA OFF is byte-identical: there is no shared Postgres, so the local node:sqlite
+// stays the whole index exactly as before — and it never corrupts there, because the
+// hydrate that races ingest is itself HA-only. So `pg` mode is set ONLY when server.js
+// has wired a PgIndexStore (`setIndexMode("pg", store)` at boot under HA); everything
+// below branches on `indexMode` and the sqlite path is unchanged.
+let indexMode = "sqlite";     // "sqlite" (HA off) | "pg" (HA on, node:sqlite retired)
+let sessionsMap = null;       // pg mode: the in-memory session-row of-record mirror
+let filePathIndex = null;     // pg mode: relPath -> transcriptId, for relPathOwner O(1)
+let pgIndex = null;           // pg mode: the PgIndexStore (async search/list, direct PG)
+
+// Wired from server.js at boot. "pg" retires the local node:sqlite; anything else
+// (the default, and the test reset) is the byte-identical sqlite path.
+function setIndexMode(mode, store) {
+  if (mode === "pg" && store) {
+    indexMode = "pg"; pgIndex = store;
+    if (!sessionsMap) { sessionsMap = new Map(); filePathIndex = new Map(); }
+  } else {
+    indexMode = "sqlite"; pgIndex = null; sessionsMap = null; filePathIndex = null;
+  }
+}
+function isPgMode() { return indexMode === "pg"; }
+
+// The full session-row column list, in one place so the map row and the sqlite
+// SELECT never drift.
+const SESSION_COLS_SQL =
+  "transcriptId, host, siteKey, remoteKey, repo, worktree, slug, createdAt, endedTs, " +
+  "summary, msgCount, bytesStored, archiveBytes, rawBytes, filePath, updatedAt";
+
+// A complete map row with the SAME defaults the sqlite columns carry (0 for the
+// numeric cursors, null otherwise) — a placeholder/partial insert fills the rest.
+function newSessionRow(f) {
+  return {
+    transcriptId: f.transcriptId,
+    host: f.host ?? null, siteKey: f.siteKey ?? null, remoteKey: f.remoteKey ?? null,
+    repo: f.repo ?? null, worktree: f.worktree ?? null, slug: f.slug ?? null,
+    createdAt: f.createdAt ?? null, endedTs: f.endedTs ?? null, summary: f.summary ?? null,
+    msgCount: f.msgCount ?? 0, bytesStored: f.bytesStored ?? 0,
+    archiveBytes: f.archiveBytes ?? 0, rawBytes: f.rawBytes ?? 0,
+    filePath: f.filePath ?? null, updatedAt: f.updatedAt ?? null,
+  };
+}
+
+// Store a row into the pg-mode map, keeping the filePath -> id index current (filePath
+// is immutable once set, so this only ever ADDS an entry). Callers pass a complete row.
+function mapPutSession(row) {
+  sessionsMap.set(row.transcriptId, row);
+  if (row.filePath != null) filePathIndex.set(row.filePath, row.transcriptId);
+}
+
+// Read one full session row — the in-memory map (pg mode) or the sqlite table. Returns
+// a COPY (the sqlite path returns a fresh object per call), or null.
+function idxGetSession(id) {
+  if (indexMode === "pg") { const r = sessionsMap.get(id); return r ? { ...r } : null; }
+  openDb();
+  return db.prepare(`SELECT ${SESSION_COLS_SQL} FROM sessions WHERE transcriptId=?`).get(id) || null;
+}
+
+// Every FILED row (filePath set) — the reconcile/reclaim input. pg: the map; sqlite: a
+// SELECT of the requested columns.
+function idxFiledRows(cols) {
+  if (indexMode === "pg") {
+    const out = [];
+    for (const r of sessionsMap.values()) if (r.filePath != null) out.push({ ...r });
+    return out;
+  }
+  openDb();
+  return db.prepare(
+    `SELECT ${cols || SESSION_COLS_SQL} FROM sessions WHERE filePath IS NOT NULL`).all();
 }
 
 // ---- database ---------------------------------------------------------------
@@ -378,6 +465,10 @@ function createSchema() {
 // files already exist on disk, rebuild the index from them (self-heal after a
 // lost/corrupt DB or a schema bump).
 function openDb() {
+  // pg mode (XERK-793) retires the local node:sqlite entirely — the in-memory map +
+  // Postgres are the whole index, so never open a DatabaseSync. Every caller openDb()s
+  // at its top; this makes that a no-op and the pg branch does the map work instead.
+  if (indexMode === "pg") return null;
   if (db) return db;
   fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
   db = new DatabaseSync(ARCHIVE_DB);
@@ -444,6 +535,8 @@ function isSqliteCorruption(e) {
 // concurrent ingest cannot race the rebuild. Best-effort unlink: an absent
 // -wal/-shm is fine; a genuinely unremovable main file surfaces on the reopen.
 function resetLocalIndex() {
+  // pg mode has no local index.db to drop (XERK-793) — nothing to self-heal.
+  if (indexMode === "pg") return null;
   closeDb();
   for (const suffix of ["", "-wal", "-shm"]) {
     try { fs.unlinkSync(ARCHIVE_DB + suffix); } catch { /* absent/raced is fine */ }
@@ -466,6 +559,9 @@ function resetLocalIndex() {
 // re-thrown — it is not evidence to blow the cache away. Cheap on a healthy index (an
 // O(index) internal scan, run once per hydrate, off no hot path).
 function checkIndexIntegrity() {
+  // pg mode has no local FTS5 to verify (there is nothing local to corrupt) — always
+  // healthy (XERK-793).
+  if (indexMode === "pg") return true;
   openDb();
   try {
     db.exec("INSERT INTO entries_fts(entries_fts) VALUES('integrity-check')");
@@ -480,6 +576,9 @@ function checkIndexIntegrity() {
 // node:sqlite's DatabaseSync has no .transaction() helper (unlike
 // better-sqlite3), so wrap a unit of work in BEGIN/COMMIT by hand. Not nested.
 function tx(fn) {
+  // pg mode has no local sqlite to transact — a JS-map mutation is atomic on the one
+  // event loop, so just run the unit of work (XERK-793).
+  if (indexMode === "pg") return fn();
   db.exec("BEGIN");
   try {
     const r = fn();
@@ -909,8 +1008,12 @@ function normalizeMeta(meta) {
 // the surviving row's gap: the exact interleave this exists to stop. The disk
 // sidecar is the backstop for an index that was wiped and has not rebuilt yet.
 function relPathOwner(relPath, transcriptId) {
-  const row = db.prepare("SELECT transcriptId FROM sessions WHERE filePath=?").get(relPath);
-  if (row && row.transcriptId && row.transcriptId !== transcriptId) return row.transcriptId;
+  // pg mode: the filePath -> id index (filePath is immutable once set); sqlite: the
+  // authoritative sessions table. The disk sidecar backstop below is the same in both.
+  const ownerId = indexMode === "pg"
+    ? filePathIndex.get(relPath)
+    : (db.prepare("SELECT transcriptId FROM sessions WHERE filePath=?").get(relPath) || {}).transcriptId;
+  if (ownerId && ownerId !== transcriptId) return ownerId;
   const sc = readSidecar(filePaths(relPath).meta);
   if (sc && sc.transcriptId && sc.transcriptId !== transcriptId) return sc.transcriptId;
   return null;
@@ -975,9 +1078,7 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
   // is the narrow "no org" answer decidedOrgOf returns for an org-less or
   // actively-drifted host.
   const pushOrg = String(siteKey == null ? "" : siteKey).slice(0, META_TEXT_MAX);
-  const row = db.prepare(
-    "SELECT bytesStored, archiveBytes, filePath, host, siteKey FROM sessions WHERE transcriptId=?"
-  ).get(transcriptId);
+  const row = idxGetSession(transcriptId);
   const have = row ? row.bytesStored : 0;
   // Ownership (XERK-344). `<host>` is proved by the credential at the route
   // (XERK-268), but proving WHO is calling says nothing about WHOSE archived
@@ -1058,10 +1159,13 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
   const list = Array.isArray(entries) ? entries : [];
   const nowIso = new Date().toISOString();
 
-  const insert = db.prepare(
+  // pg mode keeps NO local entries index — the entry text lives only in Postgres
+  // (written by mirrorEntries below, searched direct from PG), so there is nothing
+  // local to corrupt (XERK-793). sqlite mode inserts into entries_fts as before.
+  const insert = isPgMode() ? null : db.prepare(
     "INSERT INTO entries_fts(text, transcriptId, uuid, role, ts) VALUES(?,?,?,?,?)"
   );
-  const prevCount = row ? (db.prepare("SELECT msgCount FROM sessions WHERE transcriptId=?").get(transcriptId)?.msgCount || 0) : 0;
+  const prevCount = row ? (row.msgCount || 0) : 0;
   const msgCount = prevCount + list.length;
   const bytesStored = Number(endOffset);
   // What this transcript's .jsonl already costs us, and whether that has taken
@@ -1089,7 +1193,7 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
       // would store the very thing the ceiling exists to refuse.
       archiveBytes += Buffer.byteLength(line);
       if (ARCHIVE_TRANSCRIPT_MAX > 0 && archiveBytes >= ARCHIVE_TRANSCRIPT_MAX) shed = true;
-      insert.run(text, transcriptId, e.uuid || null, e.role || null, e.ts || null);
+      if (insert) insert.run(text, transcriptId, e.uuid || null, e.role || null, e.ts || null);
     }
     if (lines) {
       fs.appendFileSync(paths.jsonl, lines);
@@ -1098,7 +1202,24 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
       // walk — that gap is what let a burst run 1,200x past the ceiling.
       writtenSinceWalk += Buffer.byteLength(lines);
     }
-    db.prepare(`INSERT INTO sessions(
+    if (isPgMode()) {
+      // The SAME upsert against the in-memory map (XERK-793): COALESCE createdAt/
+      // summary from the prior row (fall back to the incoming value else null),
+      // PRESERVE rawBytes (this upsert never sets it — the raw layer owns it), and
+      // take everything else from the incoming values. `relPath` now enters the
+      // filePath index (mapPutSession), the placeholder's NULL filePath replaced.
+      const prev = sessionsMap.get(transcriptId);
+      mapPutSession(newSessionRow({
+        transcriptId, host, siteKey: pushOrg, remoteKey: meta.remoteKey || null,
+        repo: meta.repo || null, worktree: meta.worktree || null, slug: meta.slug || null,
+        createdAt: meta.createdAt || (prev && prev.createdAt) || null,
+        endedTs: meta.endedTs || null,
+        summary: meta.summary || (prev && prev.summary) || null,
+        msgCount, bytesStored, archiveBytes, rawBytes: (prev && prev.rawBytes) || 0,
+        filePath: relPath, updatedAt: nowIso,
+      }));
+    } else {
+      db.prepare(`INSERT INTO sessions(
         transcriptId, host, siteKey, remoteKey, repo, worktree, slug, createdAt, endedTs,
         summary, msgCount, bytesStored, archiveBytes, filePath, updatedAt)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -1110,11 +1231,12 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
         msgCount=excluded.msgCount, bytesStored=excluded.bytesStored,
         archiveBytes=excluded.archiveBytes,
         filePath=excluded.filePath, updatedAt=excluded.updatedAt`).run(
-      transcriptId, host, pushOrg, meta.remoteKey || null, meta.repo || null,
-      meta.worktree || null, meta.slug || null, meta.createdAt || null,
-      meta.endedTs || null, meta.summary || null, msgCount, bytesStored,
-      archiveBytes, relPath, nowIso
-    );
+        transcriptId, host, pushOrg, meta.remoteKey || null, meta.repo || null,
+        meta.worktree || null, meta.slug || null, meta.createdAt || null,
+        meta.endedTs || null, meta.summary || null, msgCount, bytesStored,
+        archiveBytes, relPath, nowIso
+      );
+    }
   });
   if (shedBytes) {
     console.error(
@@ -1168,11 +1290,16 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
 function restampOrg(transcriptId, siteKey, host) {
   openDb();
   const org = String(siteKey == null ? "" : siteKey).slice(0, META_TEXT_MAX);
-  const row = db.prepare("SELECT filePath, host FROM sessions WHERE transcriptId=?").get(transcriptId);
+  const row = idxGetSession(transcriptId);
   if (!row) return false;
   const newHost = host == null ? row.host : String(host).slice(0, META_TEXT_MAX);
-  db.prepare("UPDATE sessions SET siteKey=?, host=?, updatedAt=? WHERE transcriptId=?")
-    .run(org, newHost, new Date().toISOString(), transcriptId);
+  const nowIso = new Date().toISOString();
+  if (isPgMode()) {
+    mapPutSession({ ...row, siteKey: org, host: newHost, updatedAt: nowIso });
+  } else {
+    db.prepare("UPDATE sessions SET siteKey=?, host=?, updatedAt=? WHERE transcriptId=?")
+      .run(org, newHost, nowIso, transcriptId);
+  }
   // Keep the sidecar honest so rebuildIndex re-derives the new org+host, not the old.
   if (row.filePath) {
     const metaPath = filePaths(row.filePath).meta;
@@ -1235,8 +1362,9 @@ function rawCursors(manifest) {
   // the oldest history rather than the live sessions.
   let budget = ARCHIVE_RAW_CURSOR_MAX + ARCHIVE_RAW_CURSOR_LOOKUP_MAX;
   let dropped = 0;
-  // Prepared ONCE. It was recompiled per iteration inside the loop below.
-  const lookup = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?");
+  // Prepared ONCE (sqlite). It was recompiled per iteration inside the loop below.
+  // pg mode reads the in-memory map per id instead (XERK-793).
+  const lookup = isPgMode() ? null : db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?");
   for (const m of Array.isArray(manifest) ? manifest : []) {
     if (!m || !m.transcriptId || !Array.isArray(m.rawFiles) || !m.rawFiles.length) continue;
     if (budget <= 0) { dropped += m.rawFiles.length; continue; }
@@ -1248,7 +1376,7 @@ function rawCursors(manifest) {
     // 4.2 ms for the same entries with `rawFiles` omitted (QA F4). Same rule as
     // the inner loop: the budget bounds the WORK, and a lookup is work.
     budget -= 1;
-    const row = lookup.get(m.transcriptId);
+    const row = isPgMode() ? idxGetSession(m.transcriptId) : lookup.get(m.transcriptId);
     if (!row || !row.filePath) continue;
     const have = {};
     for (const f of m.rawFiles) {
@@ -1309,6 +1437,12 @@ function rawLimits(ids) {
   openDb();
   const list = Array.isArray(ids) ? ids : [];
   if (!(ARCHIVE_RAW_TRANSCRIPT_MAX > 0) || !list.length) return [];
+  if (isPgMode()) {
+    return list.filter((id) => {
+      const r = sessionsMap.get(id);
+      return !!(r && r.rawBytes >= ARCHIVE_RAW_TRANSCRIPT_MAX);
+    });
+  }
   const over = new Set(db.prepare(
     "SELECT transcriptId FROM sessions WHERE rawBytes >= ?"
   ).all(ARCHIVE_RAW_TRANSCRIPT_MAX).map((r) => r.transcriptId));
@@ -1336,8 +1470,7 @@ let lastRawOverWarnAt = 0;
  */
 function ingestRaw(host, transcriptId, rel, start, buf) {
   openDb();
-  const row = db.prepare(
-    "SELECT filePath, rawBytes, host FROM sessions WHERE transcriptId=?").get(transcriptId);
+  const row = idxGetSession(transcriptId);
   // No row means no canonical file to hang the raw directory off. The manifest
   // creates the row a beat before any raw push, so this is a stale offer.
   if (!row || !row.filePath) return { stored: 0, skip: true };
@@ -1396,8 +1529,13 @@ function ingestRaw(host, transcriptId, rel, start, buf) {
   // Charge the store total immediately rather than waiting for the next walk —
   // the same rule the rendered layer follows, and for the same reason.
   writtenSinceWalk += buf.length;
-  db.prepare("UPDATE sessions SET rawBytes=?, updatedAt=? WHERE transcriptId=?")
-    .run(rawBytes + buf.length, new Date().toISOString(), transcriptId);
+  const rawNowIso = new Date().toISOString();
+  if (isPgMode()) {
+    mapPutSession({ ...row, rawBytes: rawBytes + buf.length, updatedAt: rawNowIso });
+  } else {
+    db.prepare("UPDATE sessions SET rawBytes=?, updatedAt=? WHERE transcriptId=?")
+      .run(rawBytes + buf.length, rawNowIso, transcriptId);
+  }
   // Mirror the raised raw-byte cursor to the Postgres of-record (XERK-780). GREATEST
   // there keeps a concurrent replica from ever lowering it.
   mirrorSession(transcriptId);
@@ -1407,7 +1545,7 @@ function ingestRaw(host, transcriptId, rel, start, buf) {
 /** The raw files held for one transcript, as [{path, bytes}], newest walk order. */
 function listRawFiles(transcriptId) {
   openDb();
-  const row = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(transcriptId);
+  const row = idxGetSession(transcriptId);
   if (!row || !row.filePath) return null;
   const dir = rawDirFor(row.filePath, transcriptId);
   if (!dir) return null;
@@ -1437,15 +1575,21 @@ function listRawFiles(transcriptId) {
  */
 function sessionRow(transcriptId) {
   openDb();
-  const row = db.prepare(`SELECT transcriptId, host, remoteKey, repo, worktree, summary,
-      createdAt, endedTs, msgCount, filePath FROM sessions WHERE transcriptId=?`).get(transcriptId);
-  return row || null;
+  const row = idxGetSession(transcriptId);
+  if (!row) return null;
+  // The subset restore reads (XERK-441) — same columns the sqlite SELECT projected.
+  return {
+    transcriptId: row.transcriptId, host: row.host, remoteKey: row.remoteKey,
+    repo: row.repo, worktree: row.worktree, summary: row.summary,
+    createdAt: row.createdAt, endedTs: row.endedTs, msgCount: row.msgCount,
+    filePath: row.filePath,
+  };
 }
 
 /** One raw file's absolute path, for streaming it back. null when unknown. */
 function rawFileFor(transcriptId, rel) {
   openDb();
-  const row = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(transcriptId);
+  const row = idxGetSession(transcriptId);
   if (!row || !row.filePath) return null;
   const full = rawFilePath(row.filePath, transcriptId, rel);
   if (!full) return null;
@@ -1480,7 +1624,9 @@ function manifestCursors(host, manifest, siteKey) {
     warnManifestCap(list.length - ARCHIVE_MANIFEST_CURSOR_MAX);
     list = list.slice(0, ARCHIVE_MANIFEST_CURSOR_MAX);
   }
-  const upsert = db.prepare(`INSERT INTO sessions(
+  // Only INSERT is ever reached (the loop guards on `!row`), so the placeholder is a
+  // pure create in both modes; the sqlite ON CONFLICT clause is dead but kept.
+  const upsert = isPgMode() ? null : db.prepare(`INSERT INTO sessions(
       transcriptId, host, siteKey, remoteKey, repo, worktree, slug, createdAt, endedTs,
       summary, updatedAt)
     VALUES(?,?,?,?,?,?,?,?,?,?,?)
@@ -1495,12 +1641,22 @@ function manifestCursors(host, manifest, siteKey) {
   tx(() => {
     for (const m of list) {
       if (!m || !m.transcriptId) continue;
-      const row = db.prepare("SELECT bytesStored FROM sessions WHERE transcriptId=?").get(m.transcriptId);
+      const row = idxGetSession(m.transcriptId);
       have[m.transcriptId] = row ? row.bytesStored : 0;
       if (!row) {
-        upsert.run(m.transcriptId, host, pushOrg, m.remoteKey || null, m.repo || null,
-          m.worktree || null, m.slug || null, m.createdAt || null,
-          m.endedTs || null, m.summary || null, nowIso);
+        if (isPgMode()) {
+          mapPutSession(newSessionRow({
+            transcriptId: m.transcriptId, host, siteKey: pushOrg,
+            remoteKey: m.remoteKey || null, repo: m.repo || null,
+            worktree: m.worktree || null, slug: m.slug || null,
+            createdAt: m.createdAt || null, endedTs: m.endedTs || null,
+            summary: m.summary || null, updatedAt: nowIso,
+          }));
+        } else {
+          upsert.run(m.transcriptId, host, pushOrg, m.remoteKey || null, m.repo || null,
+            m.worktree || null, m.slug || null, m.createdAt || null,
+            m.endedTs || null, m.summary || null, nowIso);
+        }
         created.push(m.transcriptId);
       }
     }
@@ -1552,9 +1708,7 @@ function inventoryCursors(host, inventory, siteKey) {
     warnManifestCap(list.length - ARCHIVE_MANIFEST_CURSOR_MAX);
     list = list.slice(0, ARCHIVE_MANIFEST_CURSOR_MAX);
   }
-  const lookup = db.prepare(
-    "SELECT bytesStored, rawBytes, host FROM sessions WHERE transcriptId=?");
-  const insert = db.prepare(`INSERT INTO sessions(
+  const insert = isPgMode() ? null : db.prepare(`INSERT INTO sessions(
       transcriptId, host, siteKey, bytesStored, rawBytes, updatedAt)
     VALUES(?,?,?,0,0,?)
     ON CONFLICT(transcriptId) DO NOTHING`);
@@ -1568,7 +1722,7 @@ function inventoryCursors(host, inventory, siteKey) {
       if (!tid) continue;
       const s = Number(m.s);
       const r = Number(m.r);
-      const row = lookup.get(tid);
+      const row = idxGetSession(tid);
       // Another host owns this id: never re-point here (manifestCursors' rule),
       // and never want it for the caller — the owner drives its own sync.
       if (row && row.host && row.host !== host) continue;
@@ -1577,7 +1731,16 @@ function inventoryCursors(host, inventory, siteKey) {
       const rShort = Number.isFinite(r) && r > 0 && rawBytes < r;
       const sShort = Number.isFinite(s) && s > 0 && bytesStored < s;
       if (!sShort && !rShort) continue;
-      if (!row) { insert.run(tid, host, pushOrg, nowIso); created.push(tid); }
+      if (!row) {
+        if (isPgMode()) {
+          mapPutSession(newSessionRow({
+            transcriptId: tid, host, siteKey: pushOrg, updatedAt: nowIso,
+          }));
+        } else {
+          insert.run(tid, host, pushOrg, nowIso);
+        }
+        created.push(tid);
+      }
       have[tid] = bytesStored;
     }
   });
@@ -1619,14 +1782,23 @@ function archiveLimits(ids) {
   const shed = [];
   const list = Array.isArray(ids) ? ids : [];
   if (ARCHIVE_TRANSCRIPT_MAX > 0 && list.length) {
-    // One query for the over-budget set, intersected in JS, rather than a point
-    // lookup per manifest entry: this runs on every heartbeat of every host, a
-    // manifest carries up to ARCHIVE_MANIFEST_MAX (200) ids, and in the ordinary
-    // case the over-budget set is empty.
-    const over = new Set(db.prepare(
-      "SELECT transcriptId FROM sessions WHERE archiveBytes >= ?"
-    ).all(ARCHIVE_TRANSCRIPT_MAX).map((r) => r.transcriptId));
-    for (const id of list) if (over.has(id)) shed.push(id);
+    if (isPgMode()) {
+      // The offered set is bounded (ARCHIVE_MANIFEST_MAX), so a point lookup per id
+      // against the map is cheap and needs no whole-map scan.
+      for (const id of list) {
+        const r = sessionsMap.get(id);
+        if (r && r.archiveBytes >= ARCHIVE_TRANSCRIPT_MAX) shed.push(id);
+      }
+    } else {
+      // One query for the over-budget set, intersected in JS, rather than a point
+      // lookup per manifest entry: this runs on every heartbeat of every host, a
+      // manifest carries up to ARCHIVE_MANIFEST_MAX (200) ids, and in the ordinary
+      // case the over-budget set is empty.
+      const over = new Set(db.prepare(
+        "SELECT transcriptId FROM sessions WHERE archiveBytes >= ?"
+      ).all(ARCHIVE_TRANSCRIPT_MAX).map((r) => r.transcriptId));
+      for (const id of list) if (over.has(id)) shed.push(id);
+    }
   }
   return { shed, full: !!(ARCHIVE_TOTAL_MAX && totalForCeiling() >= ARCHIVE_TOTAL_MAX) };
 }
@@ -1649,25 +1821,45 @@ function ftsQuery(q) {
 
 // Full-text search across all archived sessions. Returns matches grouped by
 // remoteKey (so the same repo across hosts unifies), most recent first.
-function searchArchive(query, opts) {
-  openDb();
+//
+// ASYNC in both modes (XERK-793): pg mode serves DIRECT from the Postgres of-record
+// (there is no local entries_fts to search); sqlite mode wraps the local FTS5 query.
+// The caller (`GET /api/search`) awaits either way.
+async function searchArchive(query, opts) {
   const match = ftsQuery(query);
   if (!match) return { query: String(query || ""), groups: [] };
   const limit = Math.min(Math.max(parseInt((opts && opts.limit) || 100, 10) || 100, 1), 500);
-  const where = ["entries_fts MATCH ?"];
-  const args = [match];
-  if (opts && opts.repo) { where.push("s.repo = ?"); args.push(opts.repo); }
-  if (opts && opts.host) { where.push("s.host = ?"); args.push(opts.host); }
-  const sql = `
-    SELECT s.transcriptId, s.host, s.remoteKey, s.repo, s.summary, s.endedTs,
-           f.role AS role, f.ts AS ts, f.uuid AS uuid,
-           snippet(entries_fts, 0, '<mark>', '</mark>', '…', 12) AS snippet,
-           rank AS rnk
-    FROM entries_fts f JOIN sessions s ON s.transcriptId = f.transcriptId
-    WHERE ${where.join(" AND ")}
-    ORDER BY rank
-    LIMIT ?`;
-  const rows = db.prepare(sql).all(...args, limit);
+  let rows;
+  if (isPgMode()) {
+    // Direct from Postgres: searchQuery runs ftsToTsquery over the SAME token list
+    // ftsQuery produced (parity-tested), and projects the same fields (snake_case).
+    const pgRows = await pgIndex.searchQuery(match, {
+      repo: opts && opts.repo ? opts.repo : undefined,
+      host: opts && opts.host ? opts.host : undefined,
+      limit,
+    });
+    rows = (pgRows || []).map((r) => ({
+      transcriptId: r.transcript_id, host: r.host, remoteKey: r.remote_key,
+      repo: r.repo, summary: r.summary, endedTs: r.ended_ts,
+      role: r.role, ts: r.ts, uuid: r.uuid, snippet: r.snippet,
+    }));
+  } else {
+    openDb();
+    const where = ["entries_fts MATCH ?"];
+    const args = [match];
+    if (opts && opts.repo) { where.push("s.repo = ?"); args.push(opts.repo); }
+    if (opts && opts.host) { where.push("s.host = ?"); args.push(opts.host); }
+    const sql = `
+      SELECT s.transcriptId, s.host, s.remoteKey, s.repo, s.summary, s.endedTs,
+             f.role AS role, f.ts AS ts, f.uuid AS uuid,
+             snippet(entries_fts, 0, '<mark>', '</mark>', '…', 12) AS snippet,
+             rank AS rnk
+      FROM entries_fts f JOIN sessions s ON s.transcriptId = f.transcriptId
+      WHERE ${where.join(" AND ")}
+      ORDER BY rank
+      LIMIT ?`;
+    rows = db.prepare(sql).all(...args, limit);
+  }
 
   // Group by remoteKey (fallback repo/transcriptId), preserving rank order.
   const groups = [];
@@ -1687,11 +1879,29 @@ function searchArchive(query, opts) {
 
 // Browse ended sessions (newest first), independent of live fleet state — so
 // offline hosts' history still lists. Optional repo/host filters + paging.
-function listArchive(opts) {
-  openDb();
+//
+// ASYNC in both modes (XERK-793): pg mode browses DIRECT from the Postgres of-record
+// (`listQuery`, ordered/paged there); sqlite mode wraps the local query + heal-on-read.
+async function listArchive(opts) {
   opts = opts || {};
   const limit = Math.min(Math.max(parseInt(opts.limit || 100, 10) || 100, 1), 500);
   const offset = Math.max(parseInt(opts.offset || 0, 10) || 0, 0);
+  if (isPgMode()) {
+    // Direct from Postgres. No heal-on-read: under HA the local `.jsonl` is a hydrated
+    // working COPY and Postgres is the of-record, so a one-replica file discrepancy
+    // must not rewrite the shared index (turma-ha-archive.md; XERK-280 was a
+    // local-sqlite-lies repair with no analogue here).
+    const rows = await pgIndex.listQuery({
+      repo: opts.repo || undefined, host: opts.host || undefined, limit, offset,
+    });
+    const sessions = (rows || []).map((r) => ({
+      transcriptId: r.transcriptId, host: r.host, remoteKey: r.remoteKey, repo: r.repo,
+      worktree: r.worktree, summary: r.summary, createdAt: r.createdAt,
+      endedTs: r.endedTs, msgCount: r.msgCount,
+    }));
+    return { sessions };
+  }
+  openDb();
   const where = [];
   const args = [];
   if (opts.repo) { where.push("repo = ?"); args.push(opts.repo); }
@@ -1779,6 +1989,13 @@ function parseEntries(raw) {
 function reconcileRow(transcriptId, storedCount, storedBytes, entries, trueBytes) {
   const trueCount = entries.length;
   if (trueCount === storedCount && trueBytes === storedBytes) return trueCount;
+  // pg mode (XERK-793): heal-on-read is DISABLED. Under HA the local `.jsonl` is a
+  // hydrated working COPY and Postgres is the of-record — a discrepancy on THIS
+  // replica's local file is a hydration gap, not an authoritative deletion, so
+  // rewriting the shared index off it would fight the of-record and the other
+  // replicas (turma-ha-archive.md: deletion is an out-of-band operator action). The
+  // read still returns the honest file-derived count for display; nothing is written.
+  if (isPgMode()) return trueCount;
   // XERK-791: do NOT mutate the local index while it is being HYDRATED from the
   // Postgres of-record. This heal-on-read `tx()` (DELETE + reinsert entries_fts)
   // is a WRITE on the same node:sqlite handle the async paged hydrate is writing,
@@ -1823,8 +2040,7 @@ function reconcileRow(transcriptId, storedCount, storedBytes, entries, trueBytes
 // organized file (not the index). null when unknown/missing.
 function getTranscript(transcriptId) {
   openDb();
-  const row = db.prepare("SELECT filePath, repo, host, siteKey, worktree, summary, endedTs, createdAt, "
-    + "msgCount, archiveBytes FROM sessions WHERE transcriptId=?").get(transcriptId);
+  const row = idxGetSession(transcriptId);
   // No row at all — the hub has genuinely never heard of this transcript.
   if (!row) return null;
   // A row with no organized file is a manifest PLACEHOLDER (manifestCursors)
@@ -1894,6 +2110,9 @@ function walkJsonl(dir, out, depth) {
 // Repopulate `sessions` + `entries_fts` from the canonical organized files. The
 // files (+ their .meta sidecars) are the source of truth; the DB is disposable.
 function rebuildIndex() {
+  // pg mode has no local node:sqlite to rebuild (XERK-793) — the index is the
+  // in-memory map, hydrated from Postgres by sessionLoader/hydrateSessionsInto.
+  if (isPgMode()) return 0;
   openDb();
   db.exec("DELETE FROM entries_fts");
   db.exec("DELETE FROM sessions");
@@ -2002,6 +2221,34 @@ function indexLoader() {
   };
 }
 
+// The pg-mode hydration applier (XERK-793): the twin of `indexLoader`, but it fills
+// the in-memory `sessionsMap` from Postgres SESSION rows ONLY — entries stay in
+// Postgres (search is served direct from there), so there is no entry paging and no
+// local FTS to build. server.js calls `hydrateSessionsInto(sessionLoader())` under HA
+// while `hydrating` gates ingest, so `reset()` clearing the map never races a write.
+function sessionLoader() {
+  return {
+    reset() { sessionsMap.clear(); filePathIndex.clear(); },
+    sessions(rows) {
+      for (const r of rows) {
+        // `?? null` keeps a recorded "" (a real no-org owner, still gated) distinct
+        // from a legacy NULL — the same rule rebuildIndex/indexLoader use.
+        mapPutSession(newSessionRow({
+          transcriptId: r.transcriptId, host: r.host ?? null, siteKey: r.siteKey ?? null,
+          remoteKey: r.remoteKey ?? null, repo: r.repo ?? null, worktree: r.worktree ?? null,
+          slug: r.slug ?? null, createdAt: r.createdAt ?? null, endedTs: r.endedTs ?? null,
+          summary: r.summary ?? null, msgCount: r.msgCount || 0, bytesStored: r.bytesStored || 0,
+          archiveBytes: r.archiveBytes || 0, rawBytes: r.rawBytes || 0,
+          filePath: r.filePath ?? null, updatedAt: r.updatedAt ?? null,
+        }));
+      }
+    },
+    // No entries table and no schema stamp to write — the map is ephemeral, rebuilt
+    // from Postgres every boot/promotion.
+    done() {},
+  };
+}
+
 // After a Postgres hydrate, re-derive each filed transcript's BYTE CURSORS from the
 // LOCAL FILES — the append-only ground truth for this replica — exactly as
 // rebuildIndex does (bytesStored from the `.meta` sidecar, archiveBytes from the
@@ -2022,10 +2269,9 @@ function indexLoader() {
 // local cursor is now correct, and the agent's next re-push re-mirrors the tail.
 function reconcileHydratedCursors() {
   openDb();
-  const rows = db.prepare(
-    "SELECT transcriptId, filePath, bytesStored, archiveBytes, rawBytes " +
-    "FROM sessions WHERE filePath IS NOT NULL").all();
-  const upd = db.prepare(
+  const rows = idxFiledRows(
+    "transcriptId, filePath, bytesStored, archiveBytes, rawBytes");
+  const upd = isPgMode() ? null : db.prepare(
     "UPDATE sessions SET bytesStored=?, archiveBytes=?, rawBytes=? WHERE transcriptId=?");
   let healed = 0;
   for (const row of rows) {
@@ -2037,7 +2283,14 @@ function reconcileHydratedCursors() {
     const bytesStored = sc && Number.isFinite(sc.bytesStored) ? sc.bytesStored : (row.bytesStored || 0);
     const rawBytes = walkAllBytes(paths.jsonl + RAW_DIR_SUFFIX);
     if (bytesStored === row.bytesStored && fileSize === row.archiveBytes && rawBytes === row.rawBytes) continue;
-    upd.run(bytesStored, fileSize, rawBytes, row.transcriptId);
+    if (isPgMode()) {
+      // Mutate the LIVE map row (idxFiledRows returned a copy); filePath is unchanged
+      // so the filePath index stays consistent.
+      const live = sessionsMap.get(row.transcriptId);
+      if (live) { live.bytesStored = bytesStored; live.archiveBytes = fileSize; live.rawBytes = rawBytes; }
+    } else {
+      upd.run(bytesStored, fileSize, rawBytes, row.transcriptId);
+    }
     healed += 1;
   }
   if (healed) {
@@ -2710,6 +2963,10 @@ module.exports = {
   // bulk loader + the post-hydrate cursor reconcile (all no-ops off HA — the sink
   // stays unset, and the loader/reconcile only run on the HA hydrate path).
   setIndexSink, indexLoader, reconcileHydratedCursors,
+  // The node:sqlite retirement (XERK-793): server.js calls setIndexMode("pg", store)
+  // under HA so the index is the in-memory map + Postgres-direct search; sessionLoader
+  // is the sessions-only hydration applier.
+  setIndexMode, isPgMode, sessionLoader,
   ingestChunk, manifestCursors, inventoryCursors, rawCursorsForIds,
   archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).
