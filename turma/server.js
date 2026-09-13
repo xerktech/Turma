@@ -4000,9 +4000,16 @@ class IndexMirror {
   }
 }
 function setIndexMirror(store, ha) {
-  if (!ha || !store) { indexMirror = null; archive.setIndexSink(null); return; }
+  if (!ha || !store) {
+    indexMirror = null; archive.setIndexSink(null); archive.setIndexMode(null);
+    return;
+  }
   indexMirror = new IndexMirror(store);
   archive.setIndexSink(indexMirror.sink());
+  // XERK-793: retire the per-replica local node:sqlite index. The index becomes the
+  // in-memory session-row map (beat-safe, hydrated from Postgres) + Postgres-direct
+  // full-text search over `store`; there is no local entries_fts to corrupt.
+  archive.setIndexMode("pg", store);
 }
 // Load the local SQLite index FROM the Postgres of-record — the retirement of the
 // per-pod rebuild-from-files. Streams session + entry rows out of Postgres into a
@@ -4018,22 +4025,28 @@ async function hydrateArchiveIndex() {
   // cache) and is cleared in the `finally` so a failed hydrate never wedges ingest.
   archive.setHydrating(true);
   try {
-    await archiveIndexStore.hydrateInto(archive.indexLoader());
-    // XERK-791: PROACTIVELY verify the freshly-hydrated FTS5 index BEFORE this
-    // replica serves reads or accepts ingest. A hydrate that completed WITHOUT
-    // throwing can still have left `entries_fts` physically corrupt (the prod
-    // symptom: the leader hydrated "cleanly" then the FIRST post-boot ingest hit
-    // "database disk image is malformed"). Catching it here — while `hydrating` is
-    // still set, so nothing is being served — turns that reactive, error-logging
-    // discovery into a controlled reset-and-rebuild-from-files at the one point the
-    // index is known-partial anyway. On a healthy hydrate this is a cheap no-op and
-    // the expensive file rebuild NEVER fires (XERK-780's cheap-hydrate intent
-    // preserved); it only pays the rebuild when the index is genuinely damaged.
-    if (!archive.checkIndexIntegrity()) {
-      console.error(
-        "archive index: post-hydrate integrity check found a corrupt entries_fts; " +
-        "resetting and rebuilding the local index from files before serving (XERK-791)");
-      archive.resetLocalIndex();
+    if (archive.isPgMode()) {
+      // XERK-793: the local node:sqlite index is retired. Page SESSION rows out of
+      // Postgres into the in-memory map (entries stay in Postgres — search is served
+      // direct from there). `hydrating` gates ingest for the whole load, so the
+      // reset-then-fill never races a concurrent map write. There is NO local FTS5 to
+      // integrity-check and nothing to reset — the map is ephemeral, rebuilt every boot.
+      await archiveIndexStore.hydrateSessionsInto(archive.sessionLoader());
+    } else {
+      // Legacy sqlite-hot-cache hydrate (HA on but no Postgres index store — a degraded
+      // misconfig; XERK-780/789/791 path).
+      await archiveIndexStore.hydrateInto(archive.indexLoader());
+      // XERK-791: PROACTIVELY verify the freshly-hydrated FTS5 index BEFORE this
+      // replica serves reads or accepts ingest. A hydrate that completed WITHOUT
+      // throwing can still have left `entries_fts` physically corrupt. Catching it
+      // here — while `hydrating` is still set — turns a reactive discovery into a
+      // controlled reset-and-rebuild-from-files.
+      if (!archive.checkIndexIntegrity()) {
+        console.error(
+          "archive index: post-hydrate integrity check found a corrupt entries_fts; " +
+          "resetting and rebuilding the local index from files before serving (XERK-791)");
+        archive.resetLocalIndex();
+      }
     }
     // Re-derive the byte cursors from the local files (the append-only ground truth)
     // so a Postgres of-record that LAGS local files (a persistent-volume restart that
@@ -4041,18 +4054,23 @@ async function hydrateArchiveIndex() {
     // duplicate re-push. A no-op on a fresh replica; reads only sidecars/stats.
     archive.reconcileHydratedCursors();
   } catch (e) {
-    console.error(
-      `archive index: Postgres hydrate failed (${e && e.message}); ` +
-      `rebuilding the local index from files as a fallback`);
-    try {
-      // A CORRUPT local cache must be DROPPED and recreated, never reopened — the
-      // old `openDb()+rebuildIndex()` reopened the SAME malformed index.db and
-      // failed identically (XERK-789, the prod symptom). `resetLocalIndex` deletes
-      // index.db (+ -wal/-shm) then rebuilds from the S3-hydrated `.jsonl` files.
-      if (archive.isSqliteCorruption(e)) archive.resetLocalIndex();
-      else { archive.openDb(); archive.rebuildIndex(); }
-    } catch (e2) {
-      console.error(`archive index: file rebuild fallback failed (${e2 && e2.message})`);
+    if (archive.isPgMode()) {
+      // No local sqlite to rebuild — a failed sessions hydrate leaves the map partial;
+      // the next promotion re-hydrates and live ingest fills it in the meantime.
+      console.error(
+        `archive index: Postgres sessions hydrate failed (${e && e.message}); ` +
+        `the in-memory index is partial and will catch up on ingest / next promotion`);
+    } else {
+      console.error(
+        `archive index: Postgres hydrate failed (${e && e.message}); ` +
+        `rebuilding the local index from files as a fallback`);
+      try {
+        // A CORRUPT local cache must be DROPPED and recreated, never reopened.
+        if (archive.isSqliteCorruption(e)) archive.resetLocalIndex();
+        else { archive.openDb(); archive.rebuildIndex(); }
+      } catch (e2) {
+        console.error(`archive index: file rebuild fallback failed (${e2 && e2.message})`);
+      }
     }
   } finally {
     archive.setHydrating(false);
@@ -15666,7 +15684,7 @@ const server = http.createServer(async (req, res) => {
       const q = (url.searchParams.get("q") || "").trim();
       if (q.length < 2) return json(res, 400, { error: "query too short" });
       try {
-        return json(res, 200, archive.searchArchive(q, {
+        return json(res, 200, await archive.searchArchive(q, {
           repo: url.searchParams.get("repo") || undefined,
           host: url.searchParams.get("host") || undefined,
           limit: url.searchParams.get("limit") || undefined,
@@ -15679,7 +15697,7 @@ const server = http.createServer(async (req, res) => {
     // GET /api/archive?repo=&host=&limit=&offset= — browse ended sessions.
     if (req.method === "GET" && url.pathname === "/api/archive") {
       try {
-        return json(res, 200, archive.listArchive({
+        return json(res, 200, await archive.listArchive({
           repo: url.searchParams.get("repo") || undefined,
           host: url.searchParams.get("host") || undefined,
           limit: url.searchParams.get("limit") || undefined,

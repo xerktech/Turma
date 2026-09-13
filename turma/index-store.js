@@ -448,6 +448,19 @@ class PgIndexStore {
     if (apply.done) apply.done();
   }
 
+  // Page ONLY the session rows into `apply` — the pg-mode archive index (XERK-793)
+  // keeps ENTRIES in Postgres and searches them there (searchQuery), so a booting/
+  // promoted replica hydrates a sessions-only in-memory map and never pulls entry rows
+  // down. The twin of hydrateInto without the (large) entries page.
+  // `apply` = { reset(), sessions(camelRows[]), done()? }.
+  async hydrateSessionsInto(apply) {
+    await this.ensureSchema();
+    apply.reset();
+    await this._pageAll(`${this.prefix}_sessions`, "transcript_id", SESSION_COLS,
+      (page) => apply.sessions(page.map(rowFromPg)));
+    if (apply.done) apply.done();
+  }
+
   // Paginate a table by an ORDER BY key so a large index never buffers one giant
   // result set, handing each PAGE (array of raw pg rows) to `onPage`. LIMIT/OFFSET
   // is O(n^2)-ish but simple and only ever runs at promotion — a first-fill index is

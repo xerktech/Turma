@@ -16,20 +16,24 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
   `.claude/rules/turma-ha-archive.md`): a sync write sink (`archive.setBlobSink`) notes each durable
   file, an off-beat worker mirrors it to the bucket, and a booting/promoted replica hydrates a local
   working copy back.
-- **Under HA the searchable INDEX has a shared Postgres of-record** (XERK-780, `index-store.js`,
-  `.claude/rules/turma-ha-archive.md`). The local node:sqlite index STAYS the SYNCHRONOUS read/write
-  model this file describes (the request path + the beat-cursor path read it and cannot be async), but
-  it is a per-replica HOT CACHE: a SECOND sync sink (`archive.setIndexSink`) mirrors each index write
-  to Postgres (idempotent `ON CONFLICT` upserts — `GREATEST` on the byte/count columns, entries by
-  ordinal), and a promoted/booting replica HYDRATES the local index FROM Postgres (`archive.indexLoader`)
-  instead of rebuilding it by re-parsing every hydrated `.jsonl` (finding A). There is STILL no shared
-  SQLite file to corrupt — each replica's cache is its own; Postgres is the shared writer.
-- **HA off = byte-identical**: neither sink is set, the local `ARCHIVE_DIR` tree + node:sqlite index
-  are the whole of-record, and everything below is unchanged.
-- **`maybeReclaimIndex`/`rebuildIndex` do NOT mirror to Postgres** — reclaim reaps the disposable
-  LOCAL rows for a hand-deleted `.jsonl` only; the Postgres of-record keeps the row (deletion is an
-  out-of-band operator action, the same posture as the byte mirror's hand-delete gap). A hydrate may
-  re-list such a row; its transcript view still reads honestly empty (XERK-422).
+- **Under HA the searchable INDEX has a shared Postgres of-record and the per-replica local
+  node:sqlite index is RETIRED** (XERK-780 + XERK-793, `index-store.js`,
+  `.claude/rules/turma-ha-archive.md`). In `pg` mode (`archive.setIndexMode("pg", store)`) the index
+  is an in-memory `sessionsMap` — the beat-safe synchronous model the cursor path + `getTranscript`/
+  `sessionRow` read, hydrated from Postgres on boot/promotion and mirrored back via `archive.setIndexSink`
+  — plus Postgres-DIRECT full-text search (`searchArchive`/`listArchive` are async). There is no local
+  `entries_fts`, so the FTS5 corruption surface (XERK-789/791) is gone. `getTranscript` still reads the
+  local `.jsonl` for CONTENT (bytes hydrate from the bucket).
+- **HA off = byte-identical**: no sink is set, `setIndexMode` stays `sqlite`, and the local
+  `ARCHIVE_DIR` tree + node:sqlite index are the whole of-record — everything below is unchanged (it
+  never corrupts there, the hydrate that races ingest being HA-only). The retirement is HA-on-and-PG
+  only; an HA hub with no PG degrades to the legacy sqlite hot-cache path.
+- **`maybeReclaimIndex`/`rebuildIndex` are sqlite-mode only and never touch Postgres.** In `pg` mode
+  (XERK-793) reclaim is a no-op (no on-disk `index.db` to bloat) and there is no `rebuildIndex`; a
+  hand-deleted `.jsonl` leaves its row in the Postgres of-record (deletion is an out-of-band operator
+  action, the same posture as the byte mirror's hand-delete gap), whose transcript view still reads
+  honestly empty (XERK-422). In sqlite mode (HA off) reclaim reaps the disposable local rows + VACUUMs
+  as before (XERK-332).
 
 - The hub hosts a **durable, searchable archive of ended sessions**: agents push each inactive
   transcript in, landing as organized files on `/data`

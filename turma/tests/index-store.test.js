@@ -187,6 +187,52 @@ class MemIndexStore {
     for (let i = 0; i < erows.length; i += 500) apply.entries(erows.slice(i, i + 500));
     if (apply.done) apply.done();
   }
+
+  // ---- the pg-mode (XERK-793) query layer: what archive.js calls when the local
+  //      node:sqlite is retired. Faithful enough to drive searchArchive/listArchive
+  //      + the sessions-only hydrate off this in-memory of-record.
+  async searchQuery(ftsExpr, opts) {
+    const terms = String(ftsExpr || "").split(/\s+/)
+      .map((t) => t.replace(/[^a-z0-9]/gi, "").toLowerCase()).filter(Boolean);
+    if (!terms.length) return [];
+    const out = [];
+    for (const [tid, m] of this.entries) {
+      const s = this.sessions.get(tid);
+      if (!s) continue;
+      if (opts && opts.repo && s.repo !== opts.repo) continue;
+      if (opts && opts.host && s.host !== opts.host) continue;
+      for (const [, e] of [...m].sort((a, b) => a[0] - b[0])) {
+        const text = String(e.text || "").toLowerCase();
+        if (terms.every((t) => text.includes(t))) {
+          out.push({
+            transcript_id: tid, host: s.host, remote_key: s.remoteKey || null,
+            repo: s.repo || null, summary: s.summary || null, ended_ts: s.endedTs || null,
+            role: e.role || null, ts: e.ts || null, uuid: e.uuid || null,
+            snippet: `<mark>${e.text}</mark>`,
+          });
+        }
+      }
+    }
+    return opts && opts.limit ? out.slice(0, opts.limit) : out;
+  }
+  async listQuery(opts) {
+    let rows = [...this.sessions.values()];
+    if (opts && opts.repo) rows = rows.filter((r) => r.repo === opts.repo);
+    if (opts && opts.host) rows = rows.filter((r) => r.host === opts.host);
+    rows.sort((a, b) =>
+      String(b.endedTs || b.createdAt || "").localeCompare(String(a.endedTs || a.createdAt || "")) ||
+      String(b.transcriptId).localeCompare(String(a.transcriptId)));
+    const off = (opts && opts.offset) || 0;
+    const lim = (opts && opts.limit) || 100;
+    return rows.slice(off, off + lim);
+  }
+  async rowQuery(id) { return this.sessions.get(id) || null; }
+  async hydrateSessionsInto(apply) {
+    apply.reset();
+    const srows = [...this.sessions.values()];
+    for (let i = 0; i < srows.length; i += 500) apply.sessions(srows.slice(i, i + 500));
+    if (apply.done) apply.done();
+  }
 }
 
 function ent(uuid, role, text, ts) {
@@ -261,7 +307,7 @@ test("hydrate: the index reconstructs from the of-record with the FILES DELETED 
 
     // Capture the truth the LOCAL index holds, then WIPE THE LOCAL INDEX AND THE
     // FILES — everything a file-rebuild would read is gone.
-    const before = archive.listArchive({}).sessions;
+    const before = (await archive.listArchive({})).sessions;
     assert.equal(before.length, 2);
     archive.closeDb();
     fs.rmSync(process.env.ARCHIVE_DB, { force: true });
@@ -272,17 +318,17 @@ test("hydrate: the index reconstructs from the of-record with the FILES DELETED 
     await mem.hydrateInto(archive.indexLoader());
 
     // The browse index reconstructed entirely from the of-record — no files read.
-    const after = archive.listArchive({}).sessions;
+    const after = (await archive.listArchive({})).sessions;
     assert.equal(after.length, 2, "both transcripts reconstructed from the of-record");
     const byId = Object.fromEntries(after.map((s) => [s.transcriptId, s]));
     assert.equal(byId["t-hydrate-1"].msgCount, 2);
     assert.equal(byId["t-hydrate-1"].host, "nas");
     assert.equal(byId["t-hydrate-2"].summary, "Docs");
     // Full-text search reconstructed too (entries_fts came from the of-record).
-    const hit = archive.searchArchive("quantum");
+    const hit = (await archive.searchArchive("quantum"));
     const ids = hit.groups.flatMap((g) => g.matches.map((m) => m.transcriptId));
     assert.ok(ids.includes("t-hydrate-1"), "search finds the hydrated transcript's entry");
-    assert.equal(archive.searchArchive("nonexistentzzz").groups.length, 0);
+    assert.equal((await archive.searchArchive("nonexistentzzz")).groups.length, 0);
   } finally {
     archive.setIndexSink(null);
     archive.closeDb();
@@ -444,4 +490,172 @@ test("PgIndexStore.hydrateInto: pages sessions then entries into the apply, rese
   assert.equal(seen.entries.length, 1);
   assert.equal(seen.entries[0].text, "hello");
   assert.equal(seen.entries[0].transcriptId, "t1");
+});
+
+test("XERK-793 PgIndexStore.hydrateSessionsInto: pages SESSIONS only, never the entries table", async () => {
+  let sPage = [{ transcript_id: "t1", host: "nas", site_key: "", msg_count: "3",
+    bytes_stored: "10", archive_bytes: "20", raw_bytes: "0", file_path: "turma/x.jsonl",
+    remote_key: null, repo: "turma", worktree: null, slug: null, created_at: null,
+    ended_ts: null, summary: "S", updated_at: null }];
+  const queries = [];
+  const pool = {
+    async query(text) {
+      queries.push(text);
+      if (/CREATE /.test(text)) return [];
+      if (/FROM archive_sessions ORDER BY/.test(text)) { const p = sPage; sPage = []; return p; }
+      // A sessions-only hydrate must NEVER page the entries table (entries stay in PG,
+      // searched direct — pg mode keeps no local entry index, XERK-793).
+      if (/FROM archive_entries/.test(text)) throw new Error("must not page entries in a sessions-only hydrate");
+      return [];
+    },
+    async execute() { return { rows: [], rowCount: 1 }; },
+  };
+  const store = new PgIndexStore(pool, { prefix: DEFAULT_PREFIX });
+  const seen = { reset: 0, sessions: [], done: 0 };
+  await store.hydrateSessionsInto({
+    reset() { seen.reset++; },
+    sessions(rows) { seen.sessions.push(...rows); },
+    done() { seen.done++; },
+  });
+  assert.equal(seen.reset, 1, "reset once before any page");
+  assert.equal(seen.done, 1);
+  assert.equal(seen.sessions.length, 1);
+  assert.equal(seen.sessions[0].transcriptId, "t1");
+  assert.equal(seen.sessions[0].msgCount, 3, "bigint coerced to a number");
+  assert.equal(seen.sessions[0].siteKey, "", "'' org preserved (rowFromPg)");
+  assert.ok(queries.some((q) => /FROM archive_sessions ORDER BY/.test(q)), "paged the sessions table");
+  assert.ok(!queries.some((q) => /FROM archive_entries/.test(q)), "never paged the entries table");
+});
+
+// ============================================================================
+// 4. pg mode (XERK-793): the local node:sqlite index is RETIRED. Under HA the index
+//    is the in-memory session-row MAP (hydrated from Postgres, beat-safe) + Postgres-
+//    DIRECT full-text search — there is no local entries_fts to corrupt. Driven end to
+//    end against the MemIndexStore of-record via setIndexMode("pg", store).
+// ============================================================================
+
+function pgSetup() {
+  archive.closeDb();
+  fs.rmSync(process.env.ARCHIVE_DIR, { recursive: true, force: true });
+  const mem = new MemIndexStore();
+  archive.setIndexSink(mem.sink());     // server.js wires this via IndexMirror
+  archive.setIndexMode("pg", mem);      // ...and this: the retirement seam
+  return mem;
+}
+function pgTeardown() {
+  archive.setIndexSink(null);
+  archive.setIndexMode(null);           // back to sqlite for any later test
+  archive.closeDb();
+}
+
+test("XERK-793 pg mode: ingest writes NO local index.db, mirrors PG, reads serve from PG/map", async () => {
+  const mem = pgSetup();
+  try {
+    assert.equal(archive.isPgMode(), true);
+    const b1 = [ent("u0", "user", "the quantum widget failed"), ent("u1", "assistant", "patched it")];
+    const len1 = Buffer.byteLength(JSON.stringify(b1));
+    assert.equal(archive.ingestChunk("nas", "t-pg-1", META, 0, len1, b1, "acme").bytesStored, len1);
+    const b2 = [ent("v0", "user", "unrelated docs typo")];
+    archive.ingestChunk("nas", "t-pg-2", { ...META, summary: "Docs", repo: "other" }, 0,
+      Buffer.byteLength(JSON.stringify(b2)), b2, "acme");
+
+    // The whole point: NO local node:sqlite was ever opened or created.
+    assert.ok(!fs.existsSync(process.env.ARCHIVE_DB), "no index.db created in pg mode");
+    // The rows + entries reached the Postgres of-record (via the sync mirror sink).
+    assert.equal(mem.sessions.get("t-pg-1").msgCount, 2);
+    assert.equal(mem.sessions.get("t-pg-1").siteKey, "acme");
+    assert.equal(mem.entries.get("t-pg-1").size, 2);
+
+    // getTranscript: row from the MAP, CONTENT from the local .jsonl.
+    const t = archive.getTranscript("t-pg-1");
+    assert.equal(t.entries.length, 2);
+    assert.equal(t.entries[0].text, "the quantum widget failed");
+    assert.equal(t.host, "nas");
+    // sessionRow (restore path) also reads the map.
+    assert.equal(archive.sessionRow("t-pg-1").repo, "turma");
+
+    // search: DIRECT from Postgres (there is no local entries_fts).
+    const ids = (await archive.searchArchive("quantum")).groups.flatMap((g) => g.matches.map((m) => m.transcriptId));
+    assert.ok(ids.includes("t-pg-1"));
+    assert.equal((await archive.searchArchive("nonexistentzzz")).groups.length, 0);
+
+    // list: DIRECT from Postgres, filters applied.
+    assert.equal((await archive.listArchive({})).sessions.length, 2);
+    assert.deepEqual((await archive.listArchive({ repo: "other" })).sessions.map((s) => s.transcriptId), ["t-pg-2"]);
+
+    // restampOrg re-points the map row (host + org) and re-mirrors to PG.
+    assert.equal(archive.restampOrg("t-pg-1", "rival", "other-host"), true);
+    assert.equal(archive.sessionRow("t-pg-1").host, "other-host");
+    assert.equal(mem.sessions.get("t-pg-1").siteKey, "rival");
+  } finally { pgTeardown(); }
+});
+
+test("XERK-793 pg mode: the beat cursor path + org gate run off the in-memory map", async () => {
+  const mem = pgSetup();
+  try {
+    // manifestCursors creates a placeholder (0 bytes) in the map AND mirrors it to PG.
+    const have = archive.manifestCursors("nas",
+      [{ transcriptId: "t-mc", remoteKey: "rk", repo: "turma" }], "acme");
+    assert.equal(have["t-mc"], 0);
+    assert.equal(mem.sessions.get("t-mc").siteKey, "acme", "org stamped on the placeholder (XERK-344)");
+
+    // A cross-org host's first chunk is REFUSED by the ownership gate on the map row.
+    const refused = archive.ingestChunk("evil", "t-mc", META, 0, 10, [ent("x", "user", "hijack")], "rival");
+    assert.equal(refused.bytesStored, 0);
+    assert.equal(mem.entries.get("t-mc"), undefined, "nothing written for the cross-org push");
+
+    // The owning host fills it (same-host append, never gated).
+    const body = [ent("u0", "user", "alpha needle")];
+    const len = Buffer.byteLength(JSON.stringify(body));
+    assert.equal(archive.ingestChunk("nas", "t-mc", META, 0, len, body, "acme").bytesStored, len);
+    assert.equal((await archive.searchArchive("needle")).groups.length, 1);
+
+    // inventoryCursors: names back a rendered-short transcript, off the map.
+    assert.equal(archive.inventoryCursors("nas", [{ i: "t-mc", s: len + 999, r: 0 }], "acme")["t-mc"], len);
+    // archiveLimits reads the map cursor (under budget -> not shed).
+    assert.deepEqual(archive.archiveLimits(["t-mc"]).shed, []);
+  } finally { pgTeardown(); }
+});
+
+test("XERK-793 pg mode: a promoted replica hydrates its map from PG (sessions only)", async () => {
+  const mem = pgSetup();
+  try {
+    const b = [ent("u0", "user", "gamma content")];
+    const len = Buffer.byteLength(JSON.stringify(b));
+    archive.ingestChunk("nas", "t-hy", META, 0, len, b, "acme");
+    archive.ingestRaw("nas", "t-hy", "t-hy.jsonl", 0, Buffer.from("rawbytes"));
+
+    // Simulate a FRESH replica: drop the local map (setIndexMode(null) then a fresh
+    // pg mode makes a new empty map), keeping the of-record + the local files.
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    assert.equal(archive.sessionRow("t-hy"), null, "the fresh replica's map is empty pre-hydrate");
+
+    // Hydrate SESSIONS from PG into the map (entries stay in PG — no entry paging).
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    assert.equal(archive.sessionRow("t-hy").msgCount, 1, "the row hydrated into the map");
+    // reconcile cursors from local files: a no-op here (PG == files), must not throw.
+    assert.equal(archive.reconcileHydratedCursors(), 0);
+    // search still serves from PG; getTranscript still reads the local file.
+    assert.equal((await archive.searchArchive("gamma")).groups.length, 1);
+    assert.equal(archive.getTranscript("t-hy").entries.length, 1);
+  } finally { pgTeardown(); }
+});
+
+test("XERK-793 pg mode: heal-on-read and reclaim do NOT mutate the of-record", async () => {
+  const mem = pgSetup();
+  try {
+    const b = [ent("u0", "user", "delta one"), ent("u1", "assistant", "delta two")];
+    const len = Buffer.byteLength(JSON.stringify(b));
+    archive.ingestChunk("nas", "t-heal", META, 0, len, b, "acme");
+    const relPath = mem.sessions.get("t-heal").filePath;
+    // Truncate the local .jsonl under the surviving row (an operator hand-edit / a
+    // hydration gap on THIS replica). The of-record (Postgres) is authoritative.
+    fs.writeFileSync(path.join(process.env.ARCHIVE_DIR, relPath), "");
+    const t = archive.getTranscript("t-heal");
+    assert.equal(t.entries.length, 0, "reads the honest local (truncated) view");
+    assert.equal(mem.entries.get("t-heal").size, 2, "PG entries untouched — heal-on-read is disabled in pg mode");
+    assert.equal(mem.sessions.get("t-heal").msgCount, 2, "PG row msgCount untouched");
+  } finally { pgTeardown(); }
 });

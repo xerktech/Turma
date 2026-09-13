@@ -54,8 +54,8 @@ function wipeFiles() {
   }
 }
 
-function rowCount() {
-  return archive.listArchive({ limit: 1000 }).sessions.length;
+async function rowCount() {
+  return (await archive.listArchive({ limit: 1000 })).sessions.length;
 }
 
 // A clean fresh walk, past the min-interval so a reclaim is never rate-limited.
@@ -73,32 +73,32 @@ function reset() {
   archive.__resetTotalCache();
 }
 
-test("a wipe's orphaned rows are reaped and the file is VACUUMed", () => {
+test("a wipe's orphaned rows are reaped and the file is VACUUMed", async () => {
   reset();
   fill(10);
-  assert.equal(rowCount(), 10);
+  assert.equal(await rowCount(), 10);
   freshWalk();                                   // seed the walk cache
   const before = fs.statSync(process.env.ARCHIVE_DB).size;
 
   wipeFiles();
   freshWalk();                                   // the walk that finds 0 files
 
-  assert.equal(rowCount(), 0, "orphaned rows must be gone");
+  assert.equal(await rowCount(), 0, "orphaned rows must be gone");
   assert.equal(archive.getTranscript("t3"), null, "and unreadable by id");
-  assert.equal(archive.searchArchive("word").groups.length, 0, "and out of FTS");
+  assert.equal((await archive.searchArchive("word")).groups.length, 0, "and out of FTS");
   const after = fs.statSync(process.env.ARCHIVE_DB).size;
   assert.ok(after <= before, `index.db grew after a wipe: ${before} -> ${after}`);
 });
 
-test("a store below the floor is left alone (no churn on noise)", () => {
+test("a store below the floor is left alone (no churn on noise)", async () => {
   reset();
   fill(3);                                        // gap of 3 < floor of 4
   wipeFiles();
   freshWalk();
-  assert.equal(rowCount(), 3, "a sub-floor gap must not trigger a rebuild");
+  assert.equal(await rowCount(), 3, "a sub-floor gap must not trigger a rebuild");
 });
 
-test("a partial delete that leaves the majority does not reclaim", () => {
+test("a partial delete that leaves the majority does not reclaim", async () => {
   reset();
   fill(10);
   // Delete 4 of the 10: gap 4 clears the floor, but files (6) are not FAR fewer
@@ -107,10 +107,10 @@ test("a partial delete that leaves the majority does not reclaim", () => {
   const jsonls = fs.readdirSync(repo).filter((n) => n.endsWith(".jsonl")).slice(0, 4);
   for (const n of jsonls) fs.rmSync(path.join(repo, n));
   freshWalk();
-  assert.equal(rowCount(), 10, "a majority-surviving store must keep its rows");
+  assert.equal(await rowCount(), 10, "a majority-surviving store must keep its rows");
 });
 
-test("the index no longer grows across fill/wipe cycles (the ticket's scenario)", () => {
+test("the index no longer grows across fill/wipe cycles (the ticket's scenario)", async () => {
   reset();
   fill(10);
   freshWalk();
@@ -118,7 +118,7 @@ test("the index no longer grows across fill/wipe cycles (the ticket's scenario)"
   for (let cycle = 0; cycle < 5; cycle++) {
     wipeFiles();
     freshWalk();                                 // reaps + VACUUMs
-    assert.equal(rowCount(), 0);
+    assert.equal(await rowCount(), 0);
     fill(10);
     freshWalk();
   }
@@ -129,7 +129,7 @@ test("the index no longer grows across fill/wipe cycles (the ticket's scenario)"
     `index grew across cycles: one fill ${oneFill}, after 5 cycles ${afterCycles}`);
 });
 
-test("a bulk sync's placeholder rows are never read as a wipe", () => {
+test("a bulk sync's placeholder rows are never read as a wipe", async () => {
   // manifestCursors creates a `sessions` row (filePath NULL) for every inactive
   // transcript a host offers, a beat or more before its rendered chunk lands. So
   // an initial sync legitimately has many rows and few files — which must NOT
@@ -140,17 +140,17 @@ test("a bulk sync's placeholder rows are never read as a wipe", () => {
   const manifest = [];
   for (let i = 0; i < 50; i++) manifest.push({ transcriptId: `p${i}`, repo: "turma" });
   archive.manifestCursors("nas", manifest, "");
-  assert.equal(rowCount(), 50, "placeholder rows exist");
+  assert.equal(await rowCount(), 50, "placeholder rows exist");
   freshWalk();                                   // 50 rows, 0 files on disk
-  assert.equal(rowCount(), 50, "a bulk sync must not be reaped as a wipe");
+  assert.equal(await rowCount(), 50, "a bulk sync must not be reaped as a wipe");
   // And once a couple fill in, still no reap (the filled ones now have files).
   archive.ingestChunk("nas", "p0", { ...META }, 0, 100,
     [{ uuid: "x", role: "user", ts: "2026-07-10T00:00:00Z", text: "hi" }]);
   freshWalk();
-  assert.equal(rowCount(), 50, "a partially-filled sync must not be reaped either");
+  assert.equal(await rowCount(), 50, "a partially-filled sync must not be reaped either");
 });
 
-test("a walk that skipped an unreadable subtree never reclaims", { skip: process.getuid && process.getuid() === 0 ? "runs as root; chmod is a no-op" : false }, () => {
+test("a walk that skipped an unreadable subtree never reclaims", { skip: process.getuid && process.getuid() === 0 ? "runs as root; chmod is a no-op" : false }, async () => {
   reset();
   fill(10);
   // The files are all still on disk, but a permission error hides them from the
@@ -160,7 +160,7 @@ test("a walk that skipped an unreadable subtree never reclaims", { skip: process
   fs.chmodSync(repo, 0o000);
   try {
     freshWalk();
-    assert.equal(rowCount(), 10, "a partial walk must leave every row in place");
+    assert.equal(await rowCount(), 10, "a partial walk must leave every row in place");
   } finally {
     fs.chmodSync(repo, 0o755);
   }
