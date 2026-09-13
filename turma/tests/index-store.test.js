@@ -492,6 +492,41 @@ test("PgIndexStore.hydrateInto: pages sessions then entries into the apply, rese
   assert.equal(seen.entries[0].transcriptId, "t1");
 });
 
+test("XERK-793 PgIndexStore.hydrateSessionsInto: pages SESSIONS only, never the entries table", async () => {
+  let sPage = [{ transcript_id: "t1", host: "nas", site_key: "", msg_count: "3",
+    bytes_stored: "10", archive_bytes: "20", raw_bytes: "0", file_path: "turma/x.jsonl",
+    remote_key: null, repo: "turma", worktree: null, slug: null, created_at: null,
+    ended_ts: null, summary: "S", updated_at: null }];
+  const queries = [];
+  const pool = {
+    async query(text) {
+      queries.push(text);
+      if (/CREATE /.test(text)) return [];
+      if (/FROM archive_sessions ORDER BY/.test(text)) { const p = sPage; sPage = []; return p; }
+      // A sessions-only hydrate must NEVER page the entries table (entries stay in PG,
+      // searched direct — pg mode keeps no local entry index, XERK-793).
+      if (/FROM archive_entries/.test(text)) throw new Error("must not page entries in a sessions-only hydrate");
+      return [];
+    },
+    async execute() { return { rows: [], rowCount: 1 }; },
+  };
+  const store = new PgIndexStore(pool, { prefix: DEFAULT_PREFIX });
+  const seen = { reset: 0, sessions: [], done: 0 };
+  await store.hydrateSessionsInto({
+    reset() { seen.reset++; },
+    sessions(rows) { seen.sessions.push(...rows); },
+    done() { seen.done++; },
+  });
+  assert.equal(seen.reset, 1, "reset once before any page");
+  assert.equal(seen.done, 1);
+  assert.equal(seen.sessions.length, 1);
+  assert.equal(seen.sessions[0].transcriptId, "t1");
+  assert.equal(seen.sessions[0].msgCount, 3, "bigint coerced to a number");
+  assert.equal(seen.sessions[0].siteKey, "", "'' org preserved (rowFromPg)");
+  assert.ok(queries.some((q) => /FROM archive_sessions ORDER BY/.test(q)), "paged the sessions table");
+  assert.ok(!queries.some((q) => /FROM archive_entries/.test(q)), "never paged the entries table");
+});
+
 // ============================================================================
 // 4. pg mode (XERK-793): the local node:sqlite index is RETIRED. Under HA the index
 //    is the in-memory session-row MAP (hydrated from Postgres, beat-safe) + Postgres-
