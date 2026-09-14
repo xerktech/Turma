@@ -98,7 +98,8 @@ _TMUX_CONF = os.path.join(_AGENT_DIR, "tmux.conf")
 # just queued, so the heartbeat loop cuts its interval sleep short and delivers
 # that command in the next beat's reply instead of up to a whole INTERVAL
 # later. A threading.Event lets the loop wait interruptibly (plain time.sleep
-# wouldn't wake on the signal).
+# wouldn't wake on the signal). On Windows there is no SIGUSR1, so a loopback
+# poke listener sets this same Event instead (_start_poke_listener).
 _poke = threading.Event()
 
 def _env_num(name, default, cast, *, minimum=None, maximum=None):
@@ -244,6 +245,13 @@ CLONES_TMP_ROOT = os.path.join(REPOS_ROOT, ".turma", "clones")
 # Persisted session registry (survives container restart).
 REGISTRY_DIR = os.path.expanduser("~/.turma")
 REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
+# Loopback "beat now" poke for Windows (XERK-678 successor). On POSIX the tunnel
+# pokes the manager with SIGUSR1; Windows Python has no SIGUSR1, so the manager
+# publishes an ephemeral loopback port here and wakes on a connection instead —
+# the tunnel reads this path (os.homedir()/.turma, matching REGISTRY_DIR) to find
+# it. Lives beside the other ~/.turma ledgers.
+POKE_PORT_FILE = os.path.join(REGISTRY_DIR, "poke-port")
+POKE_CONN_TIMEOUT_SEC = _env_float("TURMA_POKE_CONN_TIMEOUT_SEC", 2.0)
 # Expected-restart signal (XERK-29). Before the manager goes down for a restart
 # it can't heartbeat through — an image update recreating the whole container,
 # or the native updater swapping files and `systemctl restart`ing us — it POSTs
@@ -938,6 +946,66 @@ LAUNCH_STAGGER = 1.0
 
 def log(msg):
     print(f"[hub-agent] {msg}", flush=True)
+
+
+def _start_poke_listener():
+    """Windows equivalent of the POSIX SIGUSR1 poke. Windows Python has no
+    SIGUSR1, and the tunnel runs in a SEPARATE process, so a "beat now" poke
+    cannot be a signal — it arrives over a loopback socket instead. Bind an
+    ephemeral 127.0.0.1 port, publish it where the tunnel reads it (POKE_PORT_FILE,
+    under ~/.turma), and set _poke on any AUTHENTICATED connection. Without this a
+    hub command (a composer Send, an answer, a model/mode switch, the chat's
+    /history load) sat unqueried on the host until the next scheduled beat — up to
+    a whole TURMA_INTERVAL of latency. Best-effort throughout: a bind/publish
+    failure only costs the poke, never the beat (the manager still beats on
+    INTERVAL), so it must never raise onto run_forever."""
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        port = srv.getsockname()[1]
+    except OSError as e:
+        log(f"poke listener: could not bind ({e}); commands wait a full interval")
+        return
+    # Publish the chosen port atomically so the tunnel (a separate process that
+    # restarts independently) always reads a complete value, and a manager restart
+    # onto a new port is picked up with no tunnel restart.
+    try:
+        tmp = POKE_PORT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(str(port))
+        os.replace(tmp, POKE_PORT_FILE)
+    except OSError as e:
+        log(f"poke listener: could not publish port ({e})")
+
+    def _serve():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return  # socket closed on shutdown
+            try:
+                conn.settimeout(POKE_CONN_TIMEOUT_SEC)
+                data = conn.recv(512)
+                # A shared-secret gate — the loopback analog of SIGUSR1's same-uid
+                # send permission — so a stray local process on this session-shared
+                # host cannot spam the hub with beats. ~/.turma is session-writable,
+                # but only the tunnel holds TURMA_TOKEN. An UNSET token accepts any
+                # poke (a dev host with no token configured).
+                tok = data.decode("latin-1", "replace").strip()
+                if not TURMA_TOKEN or tok == TURMA_TOKEN:
+                    _poke.set()
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    threading.Thread(target=_serve, name="poke-listener", daemon=True).start()
+    log(f"poke listener on 127.0.0.1:{port} (Windows beat-now channel)")
 
 
 def run(cmd, cwd=None, timeout=15):
@@ -28481,15 +28549,20 @@ class SessionManager:
             f"reporting to {TURMA_URL} as {self.device} (container {self.agent_id}); "
             f"reposRoot={REPOS_ROOT} maxSessions={MAX_SESSIONS}"
         )
-        # SIGUSR1 = "the hub queued a command for you — beat now" (sent by
-        # tunnel-agent.js on a control-channel poke). Default disposition of
-        # SIGUSR1 is to terminate, so this must be installed before the tunnel
-        # can poke; run_forever is the main thread, where signal handlers must
-        # be set. POSIX-only: Windows Python has no SIGUSR1, and the tunnel's
-        # poke is a no-op there (tunnel-agent.js portability), so there is no
-        # signal to install — the manager simply beats on its normal interval.
+        # "The hub queued a command for you — beat now", so an operator action
+        # (a composer Send, an answer, a model/mode switch, the chat's /history
+        # load) lands on the NEXT beat instead of waiting up to a whole
+        # TURMA_INTERVAL. POSIX: SIGUSR1 (sent by tunnel-agent.js on a
+        # control-channel poke). Its default disposition is to terminate, so it
+        # must be installed before the tunnel can poke; run_forever is the main
+        # thread, where signal handlers must be set. Windows Python has no
+        # SIGUSR1, so a loopback poke listener sets the SAME _poke Event — without
+        # it every command sat until the next scheduled beat (up to 20s), which
+        # read as the terminal/chat/submit "instability" on native Windows hosts.
         if not IS_WINDOWS:
             signal.signal(signal.SIGUSR1, lambda *_: _poke.set())
+        else:
+            _start_poke_listener()
         # SIGTERM/SIGINT = the supervisor is restarting us (an update swapping
         # files, or a container recreate). Announce it to the hub as an EXPECTED
         # restart before we go silent (XERK-29), then exit for the supervisor to

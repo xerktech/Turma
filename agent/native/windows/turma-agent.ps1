@@ -86,6 +86,13 @@ if (-not $env:USERPROFILE) {
   Log "[turma-agent] USERPROFILE was unset (service context?); using $up"
 }
 $AppData = Coalesce $env:APPDATA (Join-Path $env:USERPROFILE 'AppData\Roaming')
+# The reverse tunnel owns the terminal + live-chat control channel, so its logs
+# (control-channel connect/reconnect/errors) are the ONLY window into "the terminal
+# won't connect / chat lags" reports. It runs in a backgrounded supervisor whose
+# stdout was previously discarded (Start-Process ... | Out-Null in a Session-0
+# service has no console), leaving those symptoms undiagnosable. Capture it here.
+# Recreated (truncated) on each launcher start, so it stays bounded per run.
+$TurmaDir = Join-Path $env:USERPROFILE '.turma'
 
 # --- Locate + export the config path BEFORE loading it --------------------------------
 # The manager (hub-agent.py agent_env_path()) rewrites THIS file when it rolls the host's
@@ -520,8 +527,16 @@ if (-not $mgr) {
 }
 $env:TURMA_MANAGER_PID = $mgr.Id
 
+# Redirect the supervisor's stdout/stderr (which carry the tunnel's own console
+# output) to ~/.turma so the control channel is diagnosable; without this they
+# were lost to a Session-0 process's non-existent console. Two files (Start-Process
+# requires distinct redirect targets); best-effort dir create.
+try { if (-not (Test-Path -LiteralPath $TurmaDir)) { New-Item -ItemType Directory -Path $TurmaDir -Force | Out-Null } } catch { }
+$TunnelOut = Join-Path $TurmaDir 'tunnel.out.log'
+$TunnelErr = Join-Path $TurmaDir 'tunnel.err.log'
 Start-Process -FilePath $PwshExe `
-  -ArgumentList @('-NoProfile', '-File', $SelfPath, '-TunnelSupervisor') | Out-Null
+  -ArgumentList @('-NoProfile', '-File', $SelfPath, '-TunnelSupervisor') `
+  -RedirectStandardOutput $TunnelOut -RedirectStandardError $TunnelErr | Out-Null
 
 Log "[turma-agent] starting session manager (REPOS_ROOT=$($env:REPOS_ROOT) DEVICE_NAME=$($env:DEVICE_NAME))"
 $mgr.WaitForExit()

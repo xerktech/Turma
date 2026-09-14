@@ -10,6 +10,7 @@
 
 const os = require("os");
 const fs = require("fs");
+const net = require("net");
 const path = require("path");
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -634,23 +635,62 @@ test("pokeHeartbeat swallows a failing signal (best-effort)", () => {
   }
 });
 
-test("pokeHeartbeat is a no-op on Windows (no POSIX signals to poke with)", () => {
+test("pokeHeartbeat connects to the manager's loopback poke port on Windows", () => {
   // On Windows Node, process.kill(pid,"SIGUSR1") does not poke — it EINVALs or
   // terminates the manager, which crash-looped a real host (XERK-678). The manager
-  // installs no SIGUSR1 handler there anyway, so the poke must simply not fire.
+  // has no SIGUSR1 handler there; instead it publishes an ephemeral loopback poke
+  // port (~/.turma/poke-port) and we connect to it to cut the beat's interval sleep
+  // short. Never signals on Windows; it must dial 127.0.0.1:<published port>.
   const realPlat = Object.getOwnPropertyDescriptor(process, "platform");
   const realKill = process.kill;
-  const calls = [];
-  process.kill = (pid, sig) => calls.push([pid, sig]);
+  const realConnect = net.connect;
+  const realRead = fs.readFileSync;
+  const kills = [];
+  const events = {};
+  const sent = [];
+  const fakeSock = {
+    setTimeout() {},
+    on(ev, cb) { events[ev] = cb; return this; },
+    end(d) { sent.push(d); },
+    destroy() {},
+  };
+  let connectedTo = null;
+  process.kill = (pid, sig) => kills.push([pid, sig]);
+  net.connect = (port, host) => { connectedTo = [port, host]; return fakeSock; };
+  fs.readFileSync = () => "54321\n";
   Object.defineProperty(process, "platform", { value: "win32", configurable: true });
   try {
-    process.env.TURMA_MANAGER_PID = "4242";
     pokeHeartbeat();
-    assert.deepEqual(calls, []); // never signals on Windows
+    assert.deepEqual(kills, []);                       // never signals on Windows
+    assert.deepEqual(connectedTo, [54321, "127.0.0.1"]); // dials the published port
+    if (events.connect) events.connect();
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0].endsWith("\n"));                // token line, newline-terminated
   } finally {
     process.kill = realKill;
+    net.connect = realConnect;
+    fs.readFileSync = realRead;
     Object.defineProperty(process, "platform", realPlat);
-    delete process.env.TURMA_MANAGER_PID;
+  }
+});
+
+test("pokeHeartbeat is a best-effort no-op on Windows when no poke port is published", () => {
+  // The manager hasn't started / published its port yet — the command still rides
+  // the host's next scheduled beat, so pokeWindows must NOT throw and must NOT dial.
+  const realPlat = Object.getOwnPropertyDescriptor(process, "platform");
+  const realConnect = net.connect;
+  const realRead = fs.readFileSync;
+  let dialed = false;
+  net.connect = () => { dialed = true; return { setTimeout() {}, on() { return this; }, end() {}, destroy() {} }; };
+  fs.readFileSync = () => { throw new Error("ENOENT"); };
+  Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+  try {
+    assert.doesNotThrow(() => pokeHeartbeat());
+    assert.equal(dialed, false);
+  } finally {
+    net.connect = realConnect;
+    fs.readFileSync = realRead;
+    Object.defineProperty(process, "platform", realPlat);
   }
 });
 

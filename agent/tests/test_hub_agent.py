@@ -6648,10 +6648,12 @@ class TestWindowsManagerBoot(ManagerMixin, unittest.TestCase):
     """run_forever installs a POSIX-only SIGUSR1 handler (the tunnel's heartbeat
     poke) that MUST be gated on IS_WINDOWS, or the manager crashes at boot on
     Windows Python (`AttributeError: no SIGUSR1`) — the first real-Windows run
-    (XERK-678). SIGTERM/SIGINT exist on Windows and install on both. Pins the
-    guard directly: inverting it must break a test, not sail through green."""
+    (XERK-678). On Windows the poke arrives over a loopback listener instead
+    (`_start_poke_listener`) so a queued command still cuts the beat's interval
+    short. SIGTERM/SIGINT exist on Windows and install on both. Pins the guard
+    directly: inverting it must break a test, not sail through green."""
 
-    def _signals_installed(self, is_windows):
+    def _boot(self, is_windows):
         import signal as _signal
 
         class _Stop(Exception):
@@ -6659,6 +6661,7 @@ class TestWindowsManagerBoot(ManagerMixin, unittest.TestCase):
 
         sm = self.make_manager()
         seen = []
+        poke_started = []
 
         def fake_signal(sig, _handler):
             seen.append(sig)
@@ -6666,26 +6669,30 @@ class TestWindowsManagerBoot(ManagerMixin, unittest.TestCase):
                 raise _Stop()
 
         with mock.patch.object(ha, "IS_WINDOWS", is_windows), \
+                mock.patch.object(ha, "_start_poke_listener",
+                                  side_effect=lambda: poke_started.append(True)), \
                 mock.patch.object(ha.signal, "signal", side_effect=fake_signal):
             try:
                 sm.run_forever()
             except _Stop:
                 pass
-        return seen
+        return seen, poke_started
 
     def test_sigusr1_installs_on_posix(self):
         import signal as _signal
-        seen = self._signals_installed(False)
+        seen, poke_started = self._boot(False)
         self.assertIn(_signal.SIGUSR1, seen)     # the poke handler is wired
         self.assertIn(_signal.SIGTERM, seen)
         self.assertIn(_signal.SIGINT, seen)
+        self.assertEqual(poke_started, [])       # no loopback listener on POSIX
 
     def test_sigusr1_is_skipped_on_windows(self):
         import signal as _signal
-        seen = self._signals_installed(True)
+        seen, poke_started = self._boot(True)
         self.assertNotIn(_signal.SIGUSR1, seen)  # POSIX-only; installing it AttributeErrors
         self.assertIn(_signal.SIGTERM, seen)     # these exist on Windows Python
         self.assertIn(_signal.SIGINT, seen)
+        self.assertEqual(poke_started, [True])   # the loopback poke channel is wired instead
 
 
 class TestSessionPayloadNeverRaises(ManagerMixin, unittest.TestCase):
@@ -19653,6 +19660,63 @@ class TestPokeHeartbeat(unittest.TestCase):
         start = time.monotonic()
         self.assertTrue(ha._poke.wait(5))
         self.assertLess(time.monotonic() - start, 1.0)
+
+
+class TestPokeListener(unittest.TestCase):
+    """The Windows poke channel (`_start_poke_listener`): Windows Python has no
+    SIGUSR1, so the tunnel wakes the beat over a loopback socket instead. It must
+    publish its port for the tunnel, set _poke on an AUTHENTICATED connection, and
+    ignore an unauthenticated one — the loopback analog of SIGUSR1's same-uid gate.
+    Drives the real listener over a real socket (no mock), on any OS."""
+
+    def _connect_and_send(self, port, payload):
+        import socket as _socket
+        c = _socket.create_connection(("127.0.0.1", port), timeout=2)
+        try:
+            if payload is not None:
+                c.sendall(payload)
+            c.shutdown(_socket.SHUT_WR)
+            c.recv(16)  # wait for the server to close (it read + acted)
+        finally:
+            c.close()
+
+    def test_publishes_port_and_pokes_on_the_right_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            port_file = os.path.join(d, "poke-port")
+            with mock.patch.object(ha, "POKE_PORT_FILE", port_file), \
+                    mock.patch.object(ha, "TURMA_TOKEN", "s3cret"):
+                ha._poke.clear()
+                ha._start_poke_listener()
+                # The port is published atomically for the tunnel to read.
+                for _ in range(50):
+                    if os.path.exists(port_file):
+                        break
+                    time.sleep(0.02)
+                port = int(open(port_file).read().strip())
+                self.assertGreater(port, 0)
+
+                # Wrong token: ignored, the beat is not woken.
+                self._connect_and_send(port, b"nope\n")
+                self.assertFalse(ha._poke.wait(0.2))
+
+                # Right token: the beat is woken effectively immediately.
+                self._connect_and_send(port, b"s3cret\n")
+                self.assertTrue(ha._poke.wait(2))
+
+    def test_empty_token_accepts_any_poke(self):
+        with tempfile.TemporaryDirectory() as d:
+            port_file = os.path.join(d, "poke-port")
+            with mock.patch.object(ha, "POKE_PORT_FILE", port_file), \
+                    mock.patch.object(ha, "TURMA_TOKEN", ""):
+                ha._poke.clear()
+                ha._start_poke_listener()
+                for _ in range(50):
+                    if os.path.exists(port_file):
+                        break
+                    time.sleep(0.02)
+                port = int(open(port_file).read().strip())
+                self._connect_and_send(port, b"anything\n")
+                self.assertTrue(ha._poke.wait(2))
 
 
 class TestPruneRepo(unittest.TestCase):

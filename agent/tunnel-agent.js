@@ -1616,20 +1616,44 @@ function stopAllWatches() {
 // on every poke, so every hub command silently waited out a full beat instead of
 // landing in about a round-trip. Still best-effort: a failed signal costs
 // latency, never correctness, since the scheduled beat delivers the command anyway.
+// The Windows manager publishes its loopback poke port here (hub-agent.py
+// _start_poke_listener); os.homedir()/.turma matches the manager's
+// REGISTRY_DIR = expanduser("~/.turma") on both processes (same run-as user).
+const POKE_PORT_FILE = path.join(os.homedir(), ".turma", "poke-port");
+
 function pokeHeartbeat() {
-  // Windows Node has no POSIX signals: process.kill(pid, "SIGUSR1") does NOT poke —
-  // libuv rejects SIGUSR1 (EINVAL) or, worse, terminates the target. hub-agent.py also
-  // installs no SIGUSR1 handler on Windows (XERK-678), so there is nothing to poke: the
-  // manager beats on its normal TURMA_INTERVAL. Cost is the same latency the `|| 1`
-  // fallback already accepts — a hub command lands a beat later, never lost. Checked at
-  // call time (not a load-time const) so the suite can drive both platforms.
-  if (process.platform === "win32") return;
+  // "The hub queued a command — beat now", so the operator doesn't wait a whole
+  // TURMA_INTERVAL for a submit/answer/model switch/history load to land.
+  // POSIX signals the manager (SIGUSR1). Windows Node has no POSIX signals —
+  // process.kill(pid, "SIGUSR1") either EINVALs or TERMINATES the target — and
+  // the Windows manager installs no SIGUSR1 handler, so it publishes a loopback
+  // poke port instead and we connect to it to wake the beat. Checked at call
+  // time (not a load-time const) so the suite can drive both platforms.
+  if (process.platform === "win32") { pokeWindows(); return; }
   const pid = Number(process.env.TURMA_MANAGER_PID) || 1;
   try {
     process.kill(pid, "SIGUSR1");
   } catch (err) {
     log(`poke failed (pid ${pid}): ${(err && err.message) || err}`);
   }
+}
+
+// Wake the Windows manager's beat over its loopback poke port. Best-effort: if
+// the port file isn't published yet or the connect fails, the command still
+// rides the host's next scheduled beat (the pre-fix behaviour), so nothing here
+// is fatal. Sends TURMA_TOKEN as the shared secret the listener gates on.
+function pokeWindows() {
+  let port;
+  try { port = parseInt(fs.readFileSync(POKE_PORT_FILE, "utf8").trim(), 10); }
+  catch { return; } // manager hasn't published a port yet
+  if (!Number.isInteger(port) || port <= 0) return;
+  let sock;
+  try { sock = net.connect(port, "127.0.0.1"); }
+  catch { return; }
+  sock.setTimeout(2000);
+  sock.on("connect", () => { try { sock.end(TOKEN + "\n"); } catch { /* best-effort */ } });
+  sock.on("timeout", () => sock.destroy());
+  sock.on("error", () => { /* best-effort; the scheduled beat is the fallback */ });
 }
 
 // ws(s):// base derived from TURMA_URL's scheme.

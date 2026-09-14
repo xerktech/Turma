@@ -127,13 +127,20 @@ updater section).
 `hub-agent.py`'s own Windows portability is XERK-670 (`windows-agent.md`); the tunnel is its own
 pass. This launcher exports the correct pid regardless.
 
-- **The tunnel's `pokeHeartbeat` is a NO-OP on Windows (XERK-678, done).** `process.kill(pid,
-  "SIGUSR1")` on Windows Node does not poke — libuv EINVALs SIGUSR1 or terminates the target — and
-  `hub-agent.py` installs no SIGUSR1 handler on Windows anyway (`windows-agent.md`), so there is
-  nothing to poke. `pokeHeartbeat` returns early on `process.platform === "win32"` (checked at call
-  time so the suite drives both); the manager beats on its normal `TURMA_INTERVAL`, the same latency
-  the `|| 1` fallback already accepts. Tests: the `pokeHeartbeat is a no-op on Windows` case in
-  `tunnel-agent.test.js`.
+- **The tunnel's `pokeHeartbeat` dials a LOOPBACK POKE PORT on Windows, it is no longer a no-op.**
+  `process.kill(pid, "SIGUSR1")` on Windows Node does not poke — libuv EINVALs SIGUSR1 or terminates
+  the target — so the Windows manager publishes an ephemeral loopback poke port
+  (`_start_poke_listener`, `windows-agent.md`) and `pokeWindows` reads `~/.turma/poke-port` and
+  connects to it, sending `TURMA_TOKEN` as the shared secret the listener gates on. A no-op made every
+  hub command wait up to a full `TURMA_INTERVAL` (20s) for the next scheduled beat — the terminal/chat/
+  submit "instability" the native Windows fix addresses. Best-effort (checked at call time so the suite
+  drives both): an unpublished port or a failed connect falls back to the scheduled beat. Tests: the
+  `pokeHeartbeat connects to the manager's loopback poke port on Windows` case in `tunnel-agent.test.js`.
+- **The reverse tunnel's own stdout/stderr are CAPTURED to `~/.turma/tunnel.out.log`/`tunnel.err.log`**
+  (`-RedirectStandardOutput`/`-RedirectStandardError` on the `-TunnelSupervisor` Start-Process). A
+  Session-0 service has no console, so the previous `| Out-Null` discarded the tunnel's control-channel
+  connect/reconnect/error lines — the only window into "terminal won't connect / chat lags". The files
+  truncate on each launcher start, so they stay bounded per run.
 - **`hub-agent.py`'s `SIGUSR1` handler + other Unix seams** (tmux CLI, `os.setsid`, `/proc`) are the
   `IS_WINDOWS` dispatch in `windows-agent.md` (XERK-670) and the `TerminalBackend` seam (XERK-668);
   the launcher does not touch the shared runtime.
