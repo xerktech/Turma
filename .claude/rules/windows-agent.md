@@ -33,6 +33,19 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
   `tmux` subprocess it replaces. `inject`/`capture`/`alive`/`resize`/`kill` are the tmux-CLI ops. It
   authenticates with `TURMA_TOKEN or 'changeme'` = the pty-host's `--auth-token` = ttyd's `-c` token,
   so nothing hub-side changes (`.claude/rules/windows-terminal.md`).
+- **A MULTI-LINE composer send must DELAY the Enter after the paste** (`_pty_inject`,
+  `PTY_SUBMIT_SETTLE_SEC`). Claude Code collapses a multi-line bracketed paste into a
+  `[Pasted text +N lines]` chip, and an Enter that races that collapse is ABSORBED — the message
+  lands in the composer but is never submitted ("it gets typed into the terminal chat but not
+  actually sent"; bites attachment sends, whose `attachment_message` is always multi-line). Measured
+  on real Claude Code 2.1.270 over fresh sessions: immediate Enter submitted 0-1/4, a ~0.4s-settled
+  Enter 6/6. The Linux tmux path never hit this because its SEPARATE `send-keys Enter` subprocess
+  spawn already interposed that delay; the Windows control channel is a fast loopback call. So
+  `_pty_inject` settles before the Enter and, if the `[Pasted text` chip is still showing and no turn
+  has started, Enters again (bounded, `PTY_SUBMIT_MAX_RETRIES`). A SINGLE-line paste doesn't collapse
+  and keeps the immediate-Enter fast path. **Do NOT "simplify" to an atomic paste+`\r` in one inject
+  (`submit:true`)** — that removes the settle and submitted 0/4. Tests: the `_pty_inject` cases in
+  `TestWindowsTerminalBackend`.
 - **`_launch_tmux` translates its POSIX shell command into argv + an env dict** on Windows (node-pty
   spawns claude directly, no shell): the `VAR=x` env-assignment prefix → env entries; the failover
   `set -a; . <local-model.env>` → `_read_env_file` merged into the env dict (the gateway credential
