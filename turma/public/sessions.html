@@ -2054,7 +2054,9 @@ function sessTitle(s) {
   if (name) return name;
   if (s.label) return s.label;
   if (s.root) return "⌂ Repos root";
-  const wt = String(s.worktreePath || "").split("/").filter(Boolean).pop();
+  // Split on BOTH separators — a Windows agent's worktreePath uses backslashes,
+  // so a "/"-only split returns the whole path as the "basename" (XERK-666).
+  const wt = String(s.worktreePath || "").split(/[\\/]/).filter(Boolean).pop();
   return wt || s.id;
 }
 

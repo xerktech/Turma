@@ -173,6 +173,9 @@ class SessionsTest {
         assertEquals("Fix login", sessionName(SessionInfo(summary = "Fix login", label = "l", worktreePath = "/a/b")))
         assertEquals("mylabel", sessionName(SessionInfo(label = "mylabel", worktreePath = "/a/wt-9")))
         assertEquals("wt-9", sessionName(SessionInfo(worktreePath = "/a/wt-9")))
+        // A Windows agent reports a backslash worktreePath; the basename must not
+        // be the whole path (XERK-666).
+        assertEquals("9a183", sessionName(SessionInfo(worktreePath = "C:\\Users\\me\\git\\.turma\\worktrees\\Turma\\9a183")))
     }
 
     @Test fun `card repo label names the repo, or says repos root in words`() {

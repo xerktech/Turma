@@ -485,7 +485,8 @@ private fun SessionCard(
                     if (session.root) {
                         Text("· repos root (no worktree)", style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
                     } else {
-                        val wt = session.worktreePath.substringAfterLast('/').ifBlank { "–" }
+                        // Strip BOTH separators — a Windows worktreePath uses backslashes (XERK-666).
+                        val wt = session.worktreePath.substringAfterLast('/').substringAfterLast('\\').ifBlank { "–" }
                         Text("· $wt", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(
                             "· ${sessionBranch(session)}",
