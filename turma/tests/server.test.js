@@ -187,7 +187,7 @@ const {
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, REFUSED_DETAIL_MAX,
   userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
   agentBearerKind, agentHostRefusal, agentPresentedRefusal, resolveEnrollToken, hostAgentToken, tokenHost, ttydAuth,
-  controlChannels, pendingChannels,
+  controlChannels, pendingChannels, termAgents,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
   TERM_OSC52_JS,
@@ -13935,6 +13935,39 @@ test("queueCommand pokes a connected control channel so the agent beats immediat
   assert.equal(agents.pokehost.commands.length, 1);
   assert.equal(agents.pokehost.commands[0].cmdId, cmdId);
   ctrl.socket.destroy();
+});
+
+test("a reconnecting control channel reaps the previous socket's ping + pooled terminal channels", async () => {
+  // The agent's watchdog reconnects WITHOUT waiting for the dead socket to close
+  // (agent-tunnel.md), so a second control socket for the same host arrives while
+  // the first is still half-open here. The first socket's guarded `cleanup` will
+  // never run once we overwrite the entry, so the reconnect setup must reap it:
+  // clear its ping (else the interval leaks) and drop its pooled terminal channels
+  // (else /term reuses a dead channel and hangs until the 60s pool timeout — the
+  // "press Enter over and over until the terminal connects" reconnect symptom).
+  agents.reconhost = { device: "reconhost", lastSeen: Date.now(), commands: [], history: {}, sessions: [] };
+  const a = await wsConnect(`/agent/control?name=reconhost&token=agenttok`);
+  assert.match(a.statusLine, /^HTTP\/1\.1 101/);
+  assert.ok(controlChannels.reconhost && controlChannels.reconhost.ping, "first tunnel registered with a ping");
+  const firstPing = controlChannels.reconhost.ping;
+
+  // A pooled terminal channel bridged over the (about-to-be-replaced) tunnel.
+  let destroyed = false;
+  termAgents.set("reconhost:7681", { destroy() { destroyed = true; } });
+
+  const b = await wsConnect(`/agent/control?name=reconhost&token=agenttok`);
+  assert.match(b.statusLine, /^HTTP\/1\.1 101/);
+
+  // The new socket is the current entry, with its OWN (different) ping...
+  assert.ok(controlChannels.reconhost && controlChannels.reconhost.ping, "reconnect registered with a fresh ping");
+  assert.notEqual(controlChannels.reconhost.ping, firstPing);
+  // ...and the stale pooled terminal channels were discarded on reconnect.
+  assert.equal(destroyed, true, "stale pooled terminal channel destroyed");
+  assert.equal(termAgents.has("reconhost:7681"), false, "stale pool entry removed");
+
+  a.socket.destroy();
+  b.socket.destroy();
+  delete controlChannels.reconhost;
 });
 
 test("queueCommand without a control channel still queues (no poke, no throw)", () => {
