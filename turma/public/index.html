@@ -890,7 +890,9 @@ function workLine(s) {
 // The session's worktree directory name (the randomly-assigned id under the
 // worktrees root) — shown on the card alongside the branch.
 function worktreeName(s) {
-  return String(s.worktreePath || "").split("/").filter(Boolean).pop() || "–";
+  // Split on BOTH separators — a Windows agent's worktreePath uses backslashes,
+  // so a "/"-only split returns the whole path as the "basename" (XERK-666).
+  return String(s.worktreePath || "").split(/[\\/]/).filter(Boolean).pop() || "–";
 }
 // The branch to show: the LIVE branch the running agent named for its work (the
 // app itself creates none). "detached" while it's still on detached HEAD.

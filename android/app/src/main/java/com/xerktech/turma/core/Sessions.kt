@@ -112,7 +112,9 @@ fun readyForReview(session: SessionInfo, state: LiveState): Boolean {
 fun sessionName(session: SessionInfo): String {
     session.summary.takeIf { it.isNotBlank() }?.let { return it }
     session.label.takeIf { it.isNotBlank() }?.let { return it }
-    val wt = session.worktreePath.substringAfterLast('/')
+    // Strip BOTH separators — a Windows agent's worktreePath uses backslashes,
+    // so a '/'-only basename returns the whole path (XERK-666).
+    val wt = session.worktreePath.substringAfterLast('/').substringAfterLast('\\')
     return wt.ifBlank { session.id }
 }
 
