@@ -30582,6 +30582,63 @@ class TestWindowsPortability(unittest.TestCase):
                 ha.restrict_file_to_owner(link)
                 chmod.assert_not_called()
 
+    def test_ensure_upload_dir_uses_the_inheriting_mode_and_no_heal_when_fresh(self):
+        # XERK-234 Windows fix: the attachments dir must be created with
+        # UPLOAD_DIR_MODE (which does NOT block ACL inheritance on Windows) so the
+        # non-elevated session that reads the file can reach it — 0o700 there is
+        # translated by Python 3.13+ into an inheritance-blocking owner-only ACL.
+        # A brand-new dir needs no repair.
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "sid")
+            with mock.patch.object(ha, "IS_WINDOWS", True), \
+                 mock.patch.object(ha.os.path, "isdir", return_value=False), \
+                 mock.patch.object(ha.os, "makedirs") as md, \
+                 mock.patch.object(ha.subprocess, "run") as run:
+                ha.ensure_upload_dir(target)
+            self.assertEqual(md.call_args.kwargs.get("mode"), ha.UPLOAD_DIR_MODE)
+            run.assert_not_called()          # fresh dir -> no icacls repair
+
+    def test_ensure_upload_dir_heals_a_preexisting_dir_on_windows(self):
+        # A live session survives an agent update (resume_on_boot adopts it), so a
+        # dir an OLDER agent created 0o700 would stay unreadable; ensure_upload_dir
+        # repairs it in place via icacls /reset.
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "sid")
+            done = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch.object(ha, "IS_WINDOWS", True), \
+                 mock.patch.object(ha.os.path, "isdir", return_value=True), \
+                 mock.patch.object(ha.os, "makedirs"), \
+                 mock.patch.object(ha.subprocess, "run",
+                                   return_value=done) as run:
+                ha.ensure_upload_dir(target)
+            cmd = run.call_args.args[0]
+            self.assertEqual(cmd[0], "icacls")
+            self.assertIn(target, cmd)
+            self.assertIn("/reset", cmd)
+            self.assertIn("/T", cmd)         # fix the files inside too
+
+    def test_ensure_upload_dir_never_heals_on_posix(self):
+        # On POSIX the agent and the session share one uid, so 0o700 is both
+        # private and readable — no icacls path exists, and none must be reached
+        # even for a pre-existing dir.
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "sid")
+            os.makedirs(target)
+            with mock.patch.object(ha, "IS_WINDOWS", False), \
+                 mock.patch.object(ha.subprocess, "run") as run:
+                ha.ensure_upload_dir(target)   # already exists
+            run.assert_not_called()
+
+    def test_restore_dir_inheritance_windows_swallows_failure(self):
+        # Best-effort like restrict_file_to_owner: the dir/bytes already exist, so
+        # a missing or failing icacls must NEVER raise onto an upload.
+        with mock.patch.object(ha.subprocess, "run",
+                               side_effect=FileNotFoundError("no icacls")):
+            ha._restore_dir_inheritance_windows("C:\\x")     # must not raise
+        failed = subprocess.CompletedProcess([], 1, "", "denied")
+        with mock.patch.object(ha.subprocess, "run", return_value=failed):
+            ha._restore_dir_inheritance_windows("C:\\x")     # non-zero rc: no raise
+
     def test_token_env_writer_is_owner_restricted_on_posix(self):
         # rewrite_env_var (the TURMA_TOKEN file, XERK-578) still lands 0600 on
         # POSIX after being routed through the shared helper.

@@ -882,6 +882,21 @@ HEARTBEAT_FAILURES_BEFORE_SHED = 2
 # _settings pre-approves Read on this tree so an attachment never costs a
 # permission prompt.
 UPLOADS_DIR = os.path.join(REGISTRY_DIR, "uploads")
+# Directory mode for a session's uploads tree. On POSIX 0o700 is right: the agent
+# and the session it launches share one uid, so owner-only is both private and
+# readable by the session. On Windows it is BROKEN, and silently: since Python
+# 3.13 os.mkdir TRANSLATES a POSIX mode into an explicit ACL that BLOCKS
+# inheritance, so a 0o700 dir grants only its OWNER (+ SYSTEM/Administrators) and
+# nothing else. The native agent runs ELEVATED (its dirs are owned by
+# BUILTIN\Administrators), while the Claude/pty-host session runs as the
+# interactive user via a scheduled task (XERK-668) — a DIFFERENT, non-elevated
+# identity — so every attachment landed in a dir that identity could not read,
+# and the session reported "I can't view the file". The uploads tree lives inside
+# the user profile (already user-scoped), so on Windows we let the dir INHERIT the
+# profile's ACL — which grants the interactive user — instead of pinning a mode
+# that strips them. (The upload FILES inherit correctly at 0o600, measured — only
+# the directory blocks inheritance, so only the directory mode is changed.)
+UPLOAD_DIR_MODE = 0o777 if IS_WINDOWS else 0o700
 UPLOAD_MAX_BYTES = _env_int("TURMA_UPLOAD_MAX_BYTES", 1 << 25)  # 32 MiB
 UPLOAD_MAX_PER_MESSAGE = _env_int("TURMA_UPLOAD_MAX_PER_MESSAGE", 10)
 UPLOAD_DOWNLOAD_TIMEOUT_SEC = _env_int("TURMA_UPLOAD_TIMEOUT_SEC", 60)
@@ -2626,6 +2641,43 @@ def restrict_file_to_owner(path):
                 f"{(r.stderr or '').strip()[:200]}")
     except Exception as e:  # no icacls, timeout, etc. — never fail a write on it
         log(f"icacls could not restrict {path}: {e}")
+
+
+def _restore_dir_inheritance_windows(path):
+    """Re-enable inherited ACLs on an attachments dir (and everything under it)
+    that an OLDER agent created 0o700 (XERK-234 pre-fix). Python 3.13+ translates
+    a POSIX dir mode into an explicit, inheritance-BLOCKING ACL, so such a dir
+    grants only its owner — the ELEVATED agent (BUILTIN\\Administrators) — and the
+    non-elevated session that must READ the attachment (XERK-668) gets nothing,
+    reporting "I can't view the file". A live session survives an agent update
+    (resume_on_boot adopts it), so its pre-fix dir would otherwise stay unreadable
+    forever. `icacls /reset` restores the DACL each object inherits from the
+    profile-scoped parent (which grants the interactive user). Idempotent on an
+    already-healthy dir. Best-effort: the dir and bytes already exist, so a
+    failure only leaves the pre-fix behaviour, never breaks a working path. The
+    elevated agent owns the dir, so it always has the right to rewrite the ACL."""
+    try:
+        r = subprocess.run(["icacls", path, "/reset", "/T", "/C", "/Q"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                           text=True, timeout=30)
+        if r.returncode != 0:
+            log(f"icacls could not restore inheritance on {path}: "
+                f"{(r.stderr or '').strip()[:200]}")
+    except Exception as e:  # no icacls, timeout, etc. — never fail an upload on it
+        log(f"icacls could not restore inheritance on {path}: {e}")
+
+
+def ensure_upload_dir(path):
+    """makedirs a session's attachments dir so the session that owns it can READ
+    it. UPLOAD_DIR_MODE is the whole point on Windows (see its comment): 0o700
+    there locks out the non-elevated session; the inheriting mode does not. On a
+    pre-existing dir left unreadable by an older agent, repair it in place. Raises
+    like os.makedirs on a create failure (callers report that); the ACL repair is
+    best-effort and never raises."""
+    existed = IS_WINDOWS and os.path.isdir(path)
+    os.makedirs(path, mode=UPLOAD_DIR_MODE, exist_ok=True)
+    if existed:
+        _restore_dir_inheritance_windows(path)
 
 
 def write_local_model_env(path, model=None, context=None):
@@ -20561,7 +20613,7 @@ class SessionManager:
         writes to the disk."""
         paths, failed = [], []
         try:
-            os.makedirs(upload_dir_for(sess["id"]), mode=0o700, exist_ok=True)
+            ensure_upload_dir(upload_dir_for(sess["id"]))
         except Exception as e:
             log(f"uploads: cannot create the directory for session "
                 f"{sess.get('id')}: {e}")
@@ -20616,7 +20668,7 @@ class SessionManager:
         deadline = time.monotonic() + TICKET_ATTACH_DEADLINE_SEC
         dirpath = upload_dir_for(sess["id"])
         try:
-            os.makedirs(dirpath, mode=0o700, exist_ok=True)
+            ensure_upload_dir(dirpath)
         except Exception as e:
             log(f"ticket attachments: cannot create the directory for session "
                 f"{sess.get('id')}: {e}")

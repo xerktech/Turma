@@ -102,6 +102,28 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
   a planted symlink can't redirect the write; `_write_new_file` (uploads) uses the same `getattr`
   form. Never write bare `os.O_NOFOLLOW` — it does not exist on Windows and raises at call time.
 
+### A POSIX DIRECTORY mode (0o700) LOCKS OUT the session on Windows — uploads (XERK-234)
+
+- **`UPLOAD_DIR_MODE = 0o777 if IS_WINDOWS else 0o700`; NEVER pass `mode=0o700` to `os.makedirs` for
+  a dir the SESSION must read.** Since Python 3.13 `os.mkdir` TRANSLATES a POSIX dir mode into an
+  explicit ACL that BLOCKS inheritance, so a 0o700 dir grants ONLY its owner (+ SYSTEM/Admins). The
+  native agent runs ELEVATED (its dirs are owned by `BUILTIN\Administrators`) while the Claude/pty-host
+  session runs as the interactive user via the scheduled-task launch (XERK-668) — a DIFFERENT,
+  non-elevated identity — so every attachment landed in a dir that identity could not read and the
+  session reported "I can't view the file". The inheriting mode keeps the profile's ACL (which grants
+  the interactive user). Verified on-host: `~/.turma/pty-hosts` (elevated-created, DEFAULT mode) IS
+  readable by the session; a 0o700 upload dir is DENIED.
+- **This is DIRECTORY-only. Files (`_write_new_file`, 0o600) inherit correctly** — measured: `os.open`
+  with a mode does not emit the inheritance-blocking SD that `os.mkdir` does. So only the makedirs mode
+  changed.
+- **`ensure_upload_dir(path)` is the one choke point** for both `_store_uploads` and
+  `_store_ticket_attachments`: makedirs at `UPLOAD_DIR_MODE`, then on Windows HEAL a PRE-EXISTING dir
+  an older agent created 0o700 (`_restore_dir_inheritance_windows` → `icacls /reset /T`) — a live
+  session survives an agent update (`resume_on_boot` adopts it), so its pre-fix dir would otherwise
+  stay unreadable forever. Best-effort, never raises; the elevated agent owns the dir so it can rewrite
+  the ACL. No-op on POSIX (`existed` gates on `IS_WINDOWS`). Tests: the `ensure_upload_dir` /
+  `_restore_dir_inheritance_windows` cases in `TestWindowsPortability`.
+
 ## Token-roll restart is a supervisor exit, never turma-agentctl (XERK-675)
 
 - A hub-pushed `setToken` (Roll) or `--enroll` (Enroll) ends in a manager restart. `_perform_restart`
