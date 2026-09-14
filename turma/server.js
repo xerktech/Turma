@@ -17779,8 +17779,6 @@ server.on("upgrade", async (req, socket, head) => {
     const send = (op, payload) => {
       try { socket.write(wsEncode(op, payload)); } catch {}
     };
-    // Replace any stale channel for this name.
-    if (controlChannels[name]) { try { controlChannels[name].socket.destroy(); } catch {} }
     // A reconnecting tunnel for the SAME host REPLACES the previous control
     // socket. The agent's watchdog reconnects WITHOUT waiting for the dead socket
     // to close (agent-tunnel.md's retire()), so the old socket is often still
