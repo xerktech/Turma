@@ -17781,8 +17781,28 @@ server.on("upgrade", async (req, socket, head) => {
     };
     // Replace any stale channel for this name.
     if (controlChannels[name]) { try { controlChannels[name].socket.destroy(); } catch {} }
+    // A reconnecting tunnel for the SAME host REPLACES the previous control
+    // socket. The agent's watchdog reconnects WITHOUT waiting for the dead socket
+    // to close (agent-tunnel.md's retire()), so the old socket is often still
+    // half-open HERE when the new one arrives — and the old socket's `cleanup`
+    // (below) is guarded on being the CURRENT entry, so once we overwrite it it
+    // will NEVER run. Reap the previous entry explicitly: clear its ping (else the
+    // 30s interval leaks for the process's life) and — load-bearing — drop its
+    // pooled terminal channels (`dropTermAgents`), which were bridged over the now
+    // dead tunnel; left in the keep-alive pool, `/term` asset requests reuse a dead
+    // channel and hang until its 60s timeout — the "press Enter over and over
+    // until the terminal connects" symptom after an agent restart / tunnel flap.
+    const prevCc = controlChannels[name];
+    if (prevCc && prevCc.socket !== socket) {
+      if (prevCc.ping) clearInterval(prevCc.ping);
+      dropTermAgents(name);
+      try { prevCc.socket.destroy(); } catch {}
+    }
     controlChannels[name] = {
       socket,
+      // The liveness interval below, stored so a reconnect that replaces this
+      // entry can clear it (a bare closure would leak on the racy-reconnect path).
+      ping: null,
       // Tell the agent which ttyd port to bridge this data channel to (per
       // session); it defaults to 7681 if the port is ever absent.
       sendOpen: (ch, port) => send(0x1, JSON.stringify({ open: ch, port })),
@@ -17847,6 +17867,13 @@ server.on("upgrade", async (req, socket, head) => {
       // tunnel (XERK-764); a crashed owner stops refreshing and its entry expires.
       publishHostTunnel(name);
     }, CONTROL_PING_EVERY_MS);
+    // Publish the interval on the entry so a later reconnect that overwrites this
+    // entry (the racy half-open case above) can clear it. Guarded: only if we are
+    // still the current entry (a synchronous reap can't have replaced us yet, but
+    // this keeps the write honest).
+    if (controlChannels[name] && controlChannels[name].socket === socket) {
+      controlChannels[name].ping = ping;
+    }
     // The agent pushes live deltas back on this same channel: committed
     // transcript entries as `{tail: sessionId, entries}`, and the in-progress
     // assistant turn scraped from the TUI as `{turn: sessionId, text, status}`
@@ -18371,6 +18398,7 @@ if (process.env.TURMA_TEST) {
     // than a failing test (XERK-268).
     controlChannels,
     pendingChannels,
+    termAgents,
     agentWsAuthorized,
     hostAgentToken,
     ttydAuth,
