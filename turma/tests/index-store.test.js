@@ -257,7 +257,9 @@ test("mirror: ingestChunk mirrors the full row + the appended entries at ordinal
     assert.equal(row.siteKey, "acme", "the hub-decided org is mirrored");
     assert.equal(row.bytesStored, len);
     assert.equal(row.msgCount, 2);
-    assert.match(row.filePath, /turma\//);
+    // Separator-agnostic: filePath is a path.relative() result, so it uses the OS
+    // separator (backslash on Windows) — match either so the suite is cross-platform.
+    assert.match(row.filePath, /turma[\\/]/);
     const em = mem.entries.get("tid-a");
     assert.equal(em.size, 2, "both entries mirrored");
     assert.equal(em.get(0).text, "find the alpha bug");
