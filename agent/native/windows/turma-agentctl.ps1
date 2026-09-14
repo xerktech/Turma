@@ -314,8 +314,22 @@ function Invoke-Restart {
   # pty-hosts), wait for the launcher pid to release, then start a fresh one that re-adopts
   # the still-running sessions on boot.
   if (Test-ServiceMode) {
-    Restart-Service -Name $ServiceName
-    Log "turma-agent service '$ServiceName' restarted (sessions preserved)"
+    # Restart-Service raises a NON-TERMINATING error (e.g. Access Denied when not
+    # elevated), which a bare call swallows -- so the success line printed over a
+    # restart that never happened, and an operator deploying an update believed it
+    # landed when it did not. Force it terminating and report the truth. The
+    # broken-away old tunnel + supervisor are reaped by the FRESH launcher at
+    # startup (turma-agent.ps1's Stop-ByCommandLine before it respawns), so a
+    # service restart still converges to a single tunnel with no reap here.
+    try {
+      Restart-Service -Name $ServiceName -ErrorAction Stop
+      Log "turma-agent service '$ServiceName' restarted (sessions preserved)"
+    }
+    catch {
+      Log "turma-agent service '$ServiceName' restart FAILED: $($_.Exception.Message)"
+      Log "(Restart-Service needs an elevated shell -- run turma-agentctl as Administrator.)"
+      exit 1
+    }
     return
   }
   $pidNum = Read-Pid
