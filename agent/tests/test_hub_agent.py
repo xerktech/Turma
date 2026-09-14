@@ -30604,6 +30604,7 @@ class TestWindowsPortability(unittest.TestCase):
         # repairs it in place via icacls /reset.
         with tempfile.TemporaryDirectory() as d:
             target = os.path.join(d, "sid")
+            ha._UPLOAD_DIRS_HEALED.discard(target)
             done = subprocess.CompletedProcess([], 0, "", "")
             with mock.patch.object(ha, "IS_WINDOWS", True), \
                  mock.patch.object(ha.os.path, "isdir", return_value=True), \
@@ -30616,6 +30617,24 @@ class TestWindowsPortability(unittest.TestCase):
             self.assertIn(target, cmd)
             self.assertIn("/reset", cmd)
             self.assertIn("/T", cmd)         # fix the files inside too
+
+    def test_ensure_upload_dir_heals_at_most_once_per_process(self):
+        # The heal is redundant after the first time (a single /reset fixes an old
+        # 0o700 dir), so a session's 2nd+ upload must NOT re-run a recursive icacls
+        # over its growing attachment tree on the inline upload path.
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "sid")
+            ha._UPLOAD_DIRS_HEALED.discard(target)
+            done = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch.object(ha, "IS_WINDOWS", True), \
+                 mock.patch.object(ha.os.path, "isdir", return_value=True), \
+                 mock.patch.object(ha.os, "makedirs"), \
+                 mock.patch.object(ha.subprocess, "run",
+                                   return_value=done) as run:
+                ha.ensure_upload_dir(target)
+                ha.ensure_upload_dir(target)
+                ha.ensure_upload_dir(target)
+            self.assertEqual(run.call_count, 1)
 
     def test_ensure_upload_dir_never_heals_on_posix(self):
         # On POSIX the agent and the session share one uid, so 0o700 is both

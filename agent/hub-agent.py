@@ -2667,15 +2667,29 @@ def _restore_dir_inheritance_windows(path):
         log(f"icacls could not restore inheritance on {path}: {e}")
 
 
+_UPLOAD_DIRS_HEALED = set()
+
+
 def ensure_upload_dir(path):
     """makedirs a session's attachments dir so the session that owns it can READ
     it. UPLOAD_DIR_MODE is the whole point on Windows (see its comment): 0o700
     there locks out the non-elevated session; the inheriting mode does not. On a
     pre-existing dir left unreadable by an older agent, repair it in place. Raises
     like os.makedirs on a create failure (callers report that); the ACL repair is
-    best-effort and never raises."""
-    existed = IS_WINDOWS and os.path.isdir(path)
+    best-effort and never raises.
+
+    The repair fires AT MOST ONCE per dir per process: a dir THIS agent created is
+    already correct (the `not existed` path adds it), and healing only ever
+    matters for a dir an OLDER agent left 0o700, which a single `/reset` fixes. So
+    every upload after the first to a given session no longer re-runs a recursive
+    icacls over its whole (growing) attachment tree — the churn a repeated heal
+    would add to the operator's inline upload path. A restart clears the set and
+    costs one more heal per still-broken dir, which is fine."""
+    existed = (IS_WINDOWS and path not in _UPLOAD_DIRS_HEALED
+               and os.path.isdir(path))
     os.makedirs(path, mode=UPLOAD_DIR_MODE, exist_ok=True)
+    if IS_WINDOWS:
+        _UPLOAD_DIRS_HEALED.add(path)
     if existed:
         _restore_dir_inheritance_windows(path)
 
