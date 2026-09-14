@@ -129,9 +129,18 @@ the bare POSIX form** (it raises at call time on Windows Python, exactly like `o
   JSON read is binary on Windows). It sat un-guarded beside an already-guarded `O_NOFOLLOW` and was
   the FIRST startup crash (`AttributeError: module 'os' has no attribute 'O_NONBLOCK'`).
 - **`signal.SIGUSR1` install is `IS_WINDOWS`-gated in `run_forever`** — Windows Python has no
-  SIGUSR1, so registering the handler raised. The tunnel's heartbeat poke is a no-op on Windows
-  (tunnel-agent.js portability), so there is no signal to install; the manager beats on its normal
-  interval. SIGTERM/SIGINT exist on Windows and stay unguarded.
+  SIGUSR1, so registering the handler raised. SIGTERM/SIGINT exist on Windows and stay unguarded.
+- **The "beat now" poke is a LOOPBACK LISTENER on Windows, not a no-op** (`_start_poke_listener`,
+  gated as the `else` of the SIGUSR1 install). Leaving it a no-op meant EVERY hub command (a composer
+  Send, an answer, a model/mode switch, the chat's `/history` load) waited up to a full
+  `TURMA_INTERVAL` (20s) for the next scheduled beat — the terminal/chat/submit "instability" on
+  native Windows hosts. The manager binds an ephemeral `127.0.0.1` port, publishes it atomically to
+  `POKE_PORT_FILE` (`~/.turma/poke-port`, matching `REGISTRY_DIR`), and sets the same `_poke` Event
+  the SIGUSR1 handler does on any connection whose payload equals `TURMA_TOKEN` (a shared-secret gate
+  — the loopback analog of SIGUSR1's same-uid send permission; an UNSET token accepts any poke). The
+  tunnel dials it in `pokeWindows` (`tunnel-agent.js`). Best-effort throughout: a bind/publish/connect
+  failure only costs the poke, never the beat. Tests: `TestPokeListener` (real socket, token gate),
+  the Windows arm of `TestWindowsManagerBoot` (listener started instead of SIGUSR1).
 - **The subscription-limits probe RUNS on Windows via the ConPTY pty-host** (XERK-704, superseding the
   XERK-678 no-op). It needs a real interactive claude on a TTY (print mode never invokes a statusLine),
   which tmux gave POSIX; on Windows `_run_limits_probe_windows` runs the SAME throwaway probe claude in

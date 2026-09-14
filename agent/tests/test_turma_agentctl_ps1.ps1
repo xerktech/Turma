@@ -303,6 +303,25 @@ try {
   if ((Count-Faux @($PtyHost)) -ge 1) { Ok "the pty-host survived the service-path stop (the session is preserved)" }
   else { Fail "service-path stop killed the pty-host — a running session would be destroyed" }
 
+  # --- Case 7b: a FAILED service restart is REPORTED, never logged as success ------------
+  # Restart-Service raises a NON-TERMINATING error when it can't act (Access Denied on a
+  # non-elevated shell on a real host; command-not-found here on the POSIX runner). A bare
+  # call swallowed it and still printed "restarted (sessions preserved)", so an operator
+  # deploying an update believed it landed when it did not. It must report FAILED + exit 1.
+  Note "case: a failed service-path restart reports FAILED and exits nonzero (no false success)"
+  Reset-Fixture
+  Set-BaseEnv
+  $env:TURMA_FORCE_SERVICE_MODE = '1'
+  $rp = Invoke-Ctl 'restart' (Join-Path $Work 'restart7b.log')
+  Remove-Item env:TURMA_FORCE_SERVICE_MODE -ErrorAction SilentlyContinue
+  $out7b = (Get-Content (Join-Path $Work 'restart7b.log') -Raw -ErrorAction SilentlyContinue)
+  if ($out7b -and $out7b.Contains('restart FAILED') -and -not $out7b.Contains('restarted (sessions preserved)')) {
+    Ok "a restart that could not run reported FAILED, not success"
+  }
+  else { Fail "a failed restart did not report FAILED (false-success bug): $out7b" }
+  if ($rp.ExitCode -ne 0) { Ok "a failed restart exits nonzero" }
+  else { Fail "a failed restart exited 0 (an operator/automation would read it as deployed)" }
+
   # --- Case 8: `logs` under the SERVICE tails <service>.out.log, not agent.log (XERK-698) -
   # Under WinSW the launcher's output is captured to ~/.turma\turma-agent.out.log (the roll-by-
   # size appender), NOT the agent.log the pidfile fallback writes — so `logs` reading agent.log
