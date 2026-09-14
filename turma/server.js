@@ -4032,6 +4032,16 @@ async function hydrateArchiveIndex() {
       // reset-then-fill never races a concurrent map write. There is NO local FTS5 to
       // integrity-check and nothing to reset — the map is ephemeral, rebuilt every boot.
       await archiveIndexStore.hydrateSessionsInto(archive.sessionLoader());
+      // The rebuild-of-record-FROM-FILES backstop the sqlite path had and XERK-793
+      // removed (XERK-797): if Postgres was wiped/rebuilt independently of the S3
+      // byte-of-record (or a fresh PG stood up beside an existing bucket), the hydrate
+      // above paged an EMPTY/lagging index into the map while the `.jsonl` files are
+      // present locally. Rebuild any file-present-but-row-absent transcript into the map
+      // AND back into Postgres via the mirror sink, so the agent's next manifest reads
+      // the real cursor instead of a 0-byte placeholder and cannot re-push-and-duplicate
+      // the already-populated `.jsonl`. A NO-OP on the normal path (every file has a
+      // filed row) and on a legitimately-empty archive (no files -> nothing rebuilt).
+      archive.backfillPgIndexFromFiles();
     } else {
       // Legacy sqlite-hot-cache hydrate (HA on but no Postgres index store — a degraded
       // misconfig; XERK-780/789/791 path).

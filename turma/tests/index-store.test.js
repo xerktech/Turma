@@ -643,6 +643,83 @@ test("XERK-793 pg mode: a promoted replica hydrates its map from PG (sessions on
   } finally { pgTeardown(); }
 });
 
+test("XERK-797 pg mode: a wiped/empty PG is rebuilt-of-record from the local files (no re-push duplication)", async () => {
+  const mem = pgSetup();
+  try {
+    const b1 = [ent("u0", "user", "epsilon needle one"), ent("u1", "assistant", "epsilon two")];
+    const len1 = Buffer.byteLength(JSON.stringify(b1));
+    archive.ingestChunk("nas", "t-wipe-1", META, 0, len1, b1, "acme");
+    archive.ingestRaw("nas", "t-wipe-1", "t-wipe-1.jsonl", 0, Buffer.from("rawbytes-1"));
+    const b2 = [ent("v0", "user", "zeta docs typo")];
+    const len2 = Buffer.byteLength(JSON.stringify(b2));
+    archive.ingestChunk("nas", "t-wipe-2", { ...META, summary: "Docs", repo: "other" }, 0, len2, b2, "acme");
+    const relPath1 = mem.sessions.get("t-wipe-1").filePath;
+
+    // Simulate the failure: Postgres WIPED/REBUILT INDEPENDENTLY of the S3 byte-of-record.
+    // The index of-record is emptied; the `.jsonl`/`.raw` files (the hydrated working copy
+    // of the still-populated bucket) stay on disk.
+    mem.sessions.clear();
+    mem.entries.clear();
+
+    // A fresh replica boots: empty map, hydrates from the (now empty) PG -> still empty.
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    assert.equal(archive.sessionRow("t-wipe-1"), null, "map empty after hydrating a wiped PG");
+    // The GAP: reconcileHydratedCursors iterates only rows already IN the map, so it heals
+    // nothing — and a manifest for a file present locally would return have=0, driving the
+    // agent to re-push from offset 0 onto the already-populated .jsonl (the duplication).
+    assert.equal(archive.reconcileHydratedCursors(), 0);
+
+    // The backstop: rebuild both transcripts into the map AND back into Postgres.
+    assert.equal(archive.backfillPgIndexFromFiles(), 2);
+    const r1 = archive.sessionRow("t-wipe-1");
+    assert.ok(r1, "the row was rebuilt into the map from its file");
+    assert.equal(r1.msgCount, 2);
+    assert.equal(r1.host, "nas");
+    assert.equal(r1.filePath, relPath1);
+    // Postgres was backfilled via the mirror sink (session + entries) — assert the full
+    // row columns off the mirrored of-record (sessionRow projects only a subset).
+    const pg1 = mem.sessions.get("t-wipe-1");
+    assert.equal(pg1.bytesStored, len1, "the append-only cursor is restored + mirrored to PG");
+    assert.equal(pg1.siteKey, "acme", "the owner org is preserved (no re-attribution)");
+    assert.equal(pg1.rawBytes, Buffer.byteLength("rawbytes-1"), "raw-layer bytes re-derived from the raw dir");
+    assert.equal(pg1.msgCount, 2, "the session row reached PG");
+    assert.equal(mem.entries.get("t-wipe-1").size, 2, "the entries reached PG");
+    // Reads work again off the rebuilt of-record.
+    assert.equal((await archive.searchArchive("epsilon")).groups.length, 1);
+    assert.equal(archive.getTranscript("t-wipe-1").entries.length, 2);
+    assert.deepEqual((await archive.listArchive({ repo: "other" })).sessions.map((s) => s.transcriptId), ["t-wipe-2"]);
+
+    // The anti-duplication guarantee: a manifest now hands back the REAL cursor, and the
+    // agent's re-push from offset 0 is refused (startOffset !== have) — nothing appended.
+    assert.equal(archive.manifestCursors("nas", [{ transcriptId: "t-wipe-1" }], "acme")["t-wipe-1"], len1);
+    const before = fs.statSync(path.join(process.env.ARCHIVE_DIR, relPath1)).size;
+    assert.equal(archive.ingestChunk("nas", "t-wipe-1", META, 0, len1, b1, "acme").bytesStored, len1,
+      "a re-push from 0 is a no-op (the restored cursor guards it)");
+    assert.equal(fs.statSync(path.join(process.env.ARCHIVE_DIR, relPath1)).size, before, "the .jsonl was NOT duplicated");
+    assert.equal(archive.sessionRow("t-wipe-1").msgCount, 2, "msgCount not doubled");
+  } finally { pgTeardown(); }
+});
+
+test("XERK-797 pg mode: backfill is a no-op on a healthy boot and on a legitimately-empty archive", async () => {
+  const mem = pgSetup();
+  try {
+    // Legitimately-empty archive (fresh deployment, empty PG AND no files): rebuilds nothing.
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    assert.equal(archive.backfillPgIndexFromFiles(), 0, "an empty ARCHIVE_DIR invents no session");
+
+    // Healthy boot (PG populated, every file has a filed row): a no-op that touches nothing.
+    const b = [ent("u0", "user", "eta content")];
+    const len = Buffer.byteLength(JSON.stringify(b));
+    archive.ingestChunk("nas", "t-ok", META, 0, len, b, "acme");
+    const entriesSnapshot = mem.entries.get("t-ok").size;
+    assert.equal(archive.backfillPgIndexFromFiles(), 0, "a filed row is left alone (no expensive re-parse)");
+    assert.equal(mem.entries.get("t-ok").size, entriesSnapshot, "PG entries untouched by the no-op backfill");
+  } finally { pgTeardown(); }
+});
+
 test("XERK-793 pg mode: heal-on-read and reclaim do NOT mutate the of-record", async () => {
   const mem = pgSetup();
   try {
