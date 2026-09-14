@@ -2300,6 +2300,87 @@ function reconcileHydratedCursors() {
   return healed;
 }
 
+// The pg-mode REBUILD-OF-RECORD-FROM-FILES backstop (XERK-797) — the one thing the
+// node:sqlite retirement (XERK-793) removed. Walk the LOCAL `.jsonl` files and, for any
+// transcript whose file is present but whose map row is ABSENT (or is a not-yet-filled
+// placeholder), rebuild the FULL row from the file into the in-memory map AND backfill
+// the Postgres of-record via the existing mirror sink (session + entries).
+//
+// The failure it closes: a replica boots in `pg` mode with the archive `.jsonl`/`.raw`
+// files hydrated from the S3 byte-of-record but the Postgres index EMPTY or lagging (PG
+// wiped/rebuilt independently of the bucket, or a fresh PG stood up beside an existing
+// bucket). `hydrateSessionsInto` then pages an empty/short PG into the map,
+// `reconcileHydratedCursors` heals nothing (it iterates only rows already IN the map),
+// and the agent's next manifest re-creates a 0-byte placeholder (`have = 0`) and
+// re-pushes from offset 0 onto the ALREADY-POPULATED `.jsonl` — `ingestChunk` sees
+// `startOffset (0) === have (0)` and `appendFileSync` DUPLICATES it (the append-only
+// cursor is the sole duplicate guard, and it was reset to 0). Rebuilding the row here
+// restores that cursor BEFORE any re-push, and mirroring it to Postgres self-heals the
+// wiped of-record from the S3-hydrated files.
+//
+// SAFE against a legitimately-empty archive: it acts ONLY where a local `.jsonl` EXISTS,
+// so an empty ARCHIVE_DIR (a genuinely fresh deployment) rebuilds nothing — it never
+// invents a session. It is a NO-OP on the normal path (PG populated -> every file
+// already has a FILED row -> nothing rebuilt), so the expensive entry re-parse XERK-793
+// retired runs ONLY for genuinely-missing rows, never on a healthy boot. The scan is
+// O(files) sidecar reads (the same class as reconcileHydratedCursors, off the beat under
+// the `hydrating` gate); the full read+parse is only paid for the rebuilt subset.
+//
+// A row another host is recorded as owning is rebuilt from ITS OWN sidecar (the byte
+// of-record's attribution), so this cannot re-attribute — it reconstructs exactly what a
+// full rebuildIndex would derive. Idempotent: `mirrorSession`'s GREATEST upsert never
+// lowers a cursor and `mirrorReplace` re-seats entries at [0..n), so a re-run or a
+// concurrent replica's own backfill converge with no lock.
+function backfillPgIndexFromFiles() {
+  if (!isPgMode()) return 0;
+  const files = [];
+  walkJsonl(ARCHIVE_DIR, files, 0);
+  let rebuilt = 0;
+  for (const jsonl of files) {
+    const meta = readSidecar(jsonl + ".meta") || {};
+    const transcriptId = meta.transcriptId;
+    if (!transcriptId) continue; // can't attribute without the sidecar
+    const existing = sessionsMap.get(transcriptId);
+    if (existing && existing.filePath != null) continue; // already a filed row — known
+    const relPath = path.relative(ARCHIVE_DIR, jsonl);
+    let raw = "";
+    try { raw = fs.readFileSync(jsonl, "utf8"); } catch { continue; }
+    // From the file/stat, never the sidecar — same rule rebuildIndex uses (a stale or
+    // pre-field sidecar must not drive the byte budgets).
+    const archiveBytes = Buffer.byteLength(raw);
+    const rawBytes = walkAllBytes(jsonl + RAW_DIR_SUFFIX);
+    const entries = [];
+    for (const line of raw.split("\n")) {
+      const s = line.trim();
+      if (!s) continue;
+      let e;
+      try { e = JSON.parse(s); } catch { continue; }
+      if (!e || typeof e !== "object") continue;
+      entries.push({ uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || "") });
+    }
+    // `?? null` KEEPS a recorded "" (a real no-org owner, still gated) distinct from a
+    // missing field, exactly as rebuildIndex/indexLoader/sessionLoader do. bytesStored
+    // (the agent cursor) comes from the sidecar; archiveBytes/rawBytes from the files.
+    mapPutSession(newSessionRow({
+      transcriptId, host: meta.host ?? null, siteKey: meta.siteKey ?? null,
+      remoteKey: meta.remoteKey || null, repo: meta.repo || null,
+      worktree: meta.worktree || null, slug: meta.slug || null,
+      createdAt: meta.createdAt || null, endedTs: meta.endedTs || null,
+      summary: meta.summary || null, msgCount: entries.length,
+      bytesStored: Number.isFinite(meta.bytesStored) ? meta.bytesStored : 0,
+      archiveBytes, rawBytes, filePath: relPath, updatedAt: meta.updatedAt || null,
+    }));
+    mirrorSession(transcriptId);
+    mirrorReplace(transcriptId, entries);
+    rebuilt += 1;
+  }
+  if (rebuilt) {
+    console.error(`archive: rebuilt ${rebuilt} transcript(s) into the pg index from local files ` +
+      `(Postgres index empty/lagging while the S3-hydrated files are present; XERK-797)`);
+  }
+  return rebuilt;
+}
+
 // ---- the dsh Trajectory (XERK-498) ------------------------------------------
 // A read-only Trajectory over a dsh session's D3 NATIVE event log — the
 // canonical record the raw layer already keeps at `<id>/dsh/*.jsonl` (XERK-469),
@@ -2966,7 +3047,7 @@ module.exports = {
   // The node:sqlite retirement (XERK-793): server.js calls setIndexMode("pg", store)
   // under HA so the index is the in-memory map + Postgres-direct search; sessionLoader
   // is the sessions-only hydration applier.
-  setIndexMode, isPgMode, sessionLoader,
+  setIndexMode, isPgMode, sessionLoader, backfillPgIndexFromFiles,
   ingestChunk, manifestCursors, inventoryCursors, rawCursorsForIds,
   archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).

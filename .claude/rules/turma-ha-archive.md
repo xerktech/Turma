@@ -43,7 +43,9 @@ of-record**, so both halves of the ADR split now hold:
   itself HA-only. So the retirement is HA-on-and-PG-wired only; an HA hub with no PG (a misconfig)
   degrades to the legacy sqlite hot-cache path (XERK-780).
 - **The corruption class is eliminated under HA, not merely serialized:** `pg` mode opens no
-  `DatabaseSync` at all, so there is no FTS5 to corrupt and no per-pod file rebuild. The XERK-789/791
+  `DatabaseSync` at all, so there is no FTS5 to corrupt and no ROUTINE per-pod file rebuild (the one
+  file rebuild that remains is the XERK-797 wiped-PG backstop below, which runs only when PG is
+  empty/lagging while the files are present). The XERK-789/791
   `setHydrating`→503-ingest gate STILL wraps the (map) hydrate — a reset-then-fill must not race a
   concurrent map write — but `checkIndexIntegrity`/`resetLocalIndex`/`isSqliteCorruption` and the
   file-rebuild fallback are now sqlite-mode-only (the degraded HA-no-PG path); they are inert in `pg`
@@ -162,6 +164,23 @@ of-record**, so both halves of the ADR split now hold:
   too-low `bytesStored` would make the agent re-push a range the `.jsonl` already holds and
   `appendFileSync` DUPLICATE it. The files are the append-only ground truth for a replica's cursors;
   PG supplies the metadata. A no-op on a fresh replica.
+- **`backfillPgIndexFromFiles` is the REBUILD-OF-RECORD-FROM-FILES backstop `pg` mode otherwise
+  lacked (XERK-797)** — the companion to `reconcileHydratedCursors`, run right after the sessions
+  hydrate. reconcileHydratedCursors only heals rows ALREADY in the map (cursor-lag); this closes the
+  ROW-ABSENT case: PG wiped/rebuilt INDEPENDENTLY of the S3 byte-of-record (or a fresh PG beside an
+  existing bucket) hydrates an EMPTY/lagging map while the `.jsonl` files are present locally, and the
+  agent's next manifest then reads `have = 0` and re-pushes from offset 0 onto the already-populated
+  `.jsonl` — `ingestChunk`'s `startOffset === have` guard is the sole duplicate protection and it was
+  reset to 0. It walks the local files and, for any transcript whose file is present but whose map row
+  is ABSENT or a not-yet-filled placeholder, rebuilds the full row into the map AND back into Postgres
+  via the mirror sink (session + entries), so a replica SELF-HEALS a wiped PG from the S3-hydrated
+  files. SAFE against a legitimately-empty archive (acts only where a `.jsonl` EXISTS — no files, no
+  rebuild) and a NO-OP on the normal path (every file already a filed row), so the expensive entry
+  re-parse XERK-793 retired runs ONLY for genuinely-missing rows, off the beat under the `hydrating`
+  gate. Idempotent (GREATEST upsert + entry `replace` at [0..n)) so a re-run / concurrent replica
+  converges. Rebuilds from each file's OWN sidecar, so it never re-attributes. This makes the
+  operator runbook line ("never wipe the archive PG without also wiping S3") a nicety, not a
+  requirement.
 - **RECLAIM (`maybeReclaimIndex`) is a no-op in `pg` mode** — there is no on-disk `index.db` to bloat
   (it never opens sqlite: `openDb()` early-returns, so the `!db` guard already skips it), and it must
   not delete from the Postgres of-record (deletion is an out-of-band operator action; a bucket/
@@ -267,6 +286,10 @@ of-record**, so both halves of the ADR split now hold:
   `hydrateSessionsInto`): ingest writes NO local `index.db`, mirrors PG, and search/list serve DIRECT
   from PG while getTranscript/sessionRow read the map + local `.jsonl`; the beat cursor path +
   ownership gate run off the map; a fresh replica hydrates its map (sessions-only) from PG; heal-on-read
-  + reclaim do NOT mutate the of-record. The whole HA-off suite (`archive.test.js` et al.) is the
+  + reclaim do NOT mutate the of-record.
+- `index-store.test.js` `XERK-797 pg mode:` cases: a WIPED PG (of-record cleared, files kept) is
+  rebuilt-of-record by `backfillPgIndexFromFiles` — the map + PG repopulate (session + entries), the
+  restored cursor makes an agent's re-push from 0 a no-op so the `.jsonl` is NOT duplicated, and it is
+  a no-op on a healthy boot AND a legitimately-empty archive. The whole HA-off suite (`archive.test.js` et al.) is the
   byte-identity guard for sqlite mode. **Real prod-scale Postgres + a real HA boot are host-QA only**
   (fake-pool unit coverage, the `PgIndexStore` posture).
