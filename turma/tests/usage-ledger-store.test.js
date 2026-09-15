@@ -283,6 +283,118 @@ test("XERK-779: a day at/below the cutoff is dropped (never double-counted with 
   await a.backend.close(); await b.backend.close();
 });
 
+test("XERK-813: the pre-HA file model is SEEDED up into Postgres on the ready edge", async () => {
+  const pool = new FakePgPool();
+  // A retired host (never beats again) with rich fidelity, exactly what only the
+  // file ledger held pre-cutover.
+  const retired = base().coerce({
+    device: "MaxAI", siteKey: "acme.atlassian.net", firstSeen: 100, lastSeen: 999,
+    host: {
+      pre: bucket(5379447205, 0, 0, 0), cutoff: "2026-08-15",
+      days: { "2026-09-01": bucket(1000, 10) },
+      models: { "claude-opus-5": bucket(1000, 10) },
+      subagent: bucket(4, 0, 0, 1), sessions: 3, lastActivity: "2026-09-01T00:00:00Z",
+    },
+    repos: { "git@x/repo-a": { repo: "repo-a", remote: "git@x/repo-a", series: { days: { "2026-09-01": bucket(500) } } } },
+  });
+  // Construct the store WITH the seed (what configure passes), drive the ready edge.
+  const a = replica(pool, { seed: { MaxAI: retired } });
+  await ready(a);
+  assert.equal(a.backend._seed, null, "the seed is cleared once it lands (one-shot)");
+  assert.equal(a.backend._seeded, true);
+
+  // A FRESH replica with NO seed scans the SAME Postgres — proof the seed reached the
+  // of-record, not just this process's memory.
+  const b = replica(pool);
+  await ready(b);
+  const got = b.model.get("MaxAI");
+  assert.ok(got, "the retired host's history reached Postgres via the seed");
+  assert.equal(bTok(sTot(got.host)), bTok(sTot(retired.host)), "all-time (pre + days) survives");
+  assert.deepEqual(got.host.subagent, retired.host.subagent, "sub-agent split survives");
+  assert.equal(got.host.sessions, 3);
+  assert.equal(got.device, "MaxAI");
+  assert.equal(got.siteKey, "acme.atlassian.net");
+  assert.equal(bTok(sTot(got.repos["git@x/repo-a"].series)), 500, "per-repo breakdown survives");
+  await a.backend.close(); await b.backend.close();
+});
+
+test("XERK-813: the seed is IDEMPOTENT and never lowers a total (re-seed on next boot)", async () => {
+  const pool = new FakePgPool();
+  // First boot: seed a host.
+  const a = replica(pool, { seed: { h: base().coerce({ device: "h", lastSeen: 1, host: { days: { "2026-09-11": bucket(1000) } } }) } });
+  await ready(a);
+  // A live beat raises the same day HIGHER after the cutover.
+  a.model.set("h", base().coerce({ device: "h", lastSeen: 2, host: { days: { "2026-09-11": bucket(3000) } } }));
+  a.backend.onChange("h"); await flush(a);
+  // A LATER boot re-seeds from the still-frozen file (the LOWER pre-HA value).
+  const c = replica(pool, { seed: { h: base().coerce({ device: "h", lastSeen: 1, host: { days: { "2026-09-11": bucket(1000) } } }) } });
+  await ready(c);
+  const seen = replica(pool); await ready(seen);
+  assert.equal(bTok(sTot(seen.model.get("h").host)), 3000, "a re-seed GREATEST-no-ops, never lowering the live high-water");
+  await a.backend.close(); await c.backend.close(); await seen.backend.close();
+});
+
+test("XERK-813: a swallowed seed write leaves the one-shot UNSET so the next ready edge retries (QA D1)", async () => {
+  // A pool that throws on usage_day INSERTs while `failDays` is set — the transient
+  // mid-seed blip the fix must survive without silently dropping a retired host.
+  class FlakyPool extends FakePgPool {
+    constructor() { super(); this.failDays = true; }
+    query(text, params) {
+      const sql = String(text).replace(/\s+/g, " ").trim();
+      if (this.failDays && /^INSERT INTO "usage_day"/i.test(sql)) {
+        return Promise.reject(new Error("transient day-insert failure"));
+      }
+      return super.query(text, params);
+    }
+  }
+  const pool = new FlakyPool();
+  const retired = base().coerce({ device: "MaxAI", lastSeen: 9, host: { days: { "2026-09-01": bucket(1000) } } });
+  const a = replica(pool, { seed: { MaxAI: retired } });
+  await ready(a); // first ready edge: the day upsert throws, _writeEntry returns false
+  assert.equal(a.backend._seeded, false, "a partial seed does NOT consume the one-shot");
+  assert.ok(a.backend._seed, "the seed is retained for the retry");
+
+  // The transient clears; the next ready edge (a reconnect) retries and lands.
+  pool.failDays = false;
+  await a.backend._onReady();
+  assert.equal(a.backend._seeded, true, "the retry lands and consumes the one-shot");
+  assert.equal(a.backend._seed, null);
+
+  const b = replica(pool); await ready(b);
+  assert.ok(b.model.get("MaxAI"), "the retired host reached Postgres on the retry (not lost for the process)");
+  assert.equal(bTok(sTot(b.model.get("MaxAI").host)), 1000);
+  await a.backend.close(); await b.backend.close();
+});
+
+test("XERK-813: configure() seeds the pre-HA file model so retired + aged-out history survives the cutover", async () => {
+  ledger._internals.reset();
+  const pool = new FakePgPool();
+  // Simulate what the file backend loaded at require time: a RETIRED host (never
+  // beats again) and a LIVE host whose day bucket has since aged off disk — the two
+  // classes the ticket proves do NOT self-heal after the cutover.
+  const H = ledger._internals.hosts();
+  H["MaxAI"] = base().coerce({
+    device: "MaxAI", siteKey: "acme.atlassian.net", firstSeen: 1, lastSeen: 9,
+    host: { pre: bucket(5379447205), days: { "2026-08-01": bucket(1000) }, sessions: 3 },
+  });
+  H["box-live"] = base().coerce({ device: "box-live", lastSeen: 5, host: { days: { "2026-07-01": bucket(2000) } } });
+
+  await ledger.configure({ ha: true }, pool, () => {});
+  assert.equal(typeof ledger._internals.getBackend().rescan, "function", "the LedgerStore is now the backend");
+  // configure kicks the ready-edge work (seed + scan) fire-and-forget; drive it.
+  await ledger.rehydrate();
+
+  // A FRESH replica scanning the SAME Postgres sees both — the file history reached
+  // the durable of-record, not just this process's memory (the cutover bug).
+  const b = replica(pool); await ready(b);
+  assert.ok(b.model.get("MaxAI"), "the retired host reached Postgres");
+  assert.equal(bTok(sTot(b.model.get("MaxAI").host)), 5379447205 + 1000);
+  assert.ok(b.model.get("box-live"), "the aged-out live-host history reached Postgres");
+  assert.equal(bTok(sTot(b.model.get("box-live").host)), 2000);
+  await b.backend.close();
+  ledger._internals.reset();
+});
+
 test("XERK-779: configure + ingest + rehydrate end-to-end through the real ledger", async () => {
   ledger._internals.reset();
   const pool = new FakePgPool();

@@ -234,9 +234,33 @@ paths:
   QA D1b): a scan/rescan load raises `hosts` without a heartbeat, and the beat is what normally clears
   `agentsCache` — so `configure` passes `invalidateAgentsCache` as the backend's `onExternalChange`,
   fired on a scan that loaded rows. A LOCAL ingest does NOT call it (its beat already invalidates).
-- **The cutover DISCARDS the local file model** (`configure` resets `hosts`, then scans Postgres) —
-  matching the XERK-758 Valkey behaviour; pre-HA single-process history is not seeded up (live hosts
-  self-heal). The single-process file backend (`USAGE_LEDGER_FILE`) is otherwise byte-identical.
+- **The cutover SEEDS the local file model up into Postgres, then serves from Postgres** (XERK-813).
+  `configure` captures the file-loaded `hosts` model, resets `hosts`, and passes the captured model to
+  the `LedgerStore` as a one-shot `seed`; on its first ready edge the store writes it up (schema →
+  seed → scan) with the SAME atomic GREATEST upserts a beat uses, then the scan reads it back into the
+  served model. **This reverses the original XERK-758/779 "discard the file model" behaviour**, which
+  dropped ALL pre-HA single-process history that nothing re-derives at runtime — RETIRED hosts (which
+  never beat again, `retiredUsage`) and live hosts' aged-out day buckets (whose transcripts Claude
+  Code deletes after `cleanupPeriodDays`) — losing ≈10B tokens off the Usage page + token tiles at the
+  v2.0.0 cutover. Do NOT restore the discard; "live hosts self-heal" covers only day buckets still on
+  disk.
+  - **The seed is IDEMPOTENT and self-recovering.** GREATEST never lowers a live high-water, so a
+    re-seed on every boot from the still-frozen `/data/usage-ledger.json` no-ops against equal/higher
+    stored values — which is also why it fixes any future cutover / DR restore with no manual step
+    (the frozen file need only still be on the PVC). One-shot per PROCESS (`_seed`/`_seeded` on the
+    store), so a reconnect's ready edge does not re-write it; safe under concurrent replicas (GREATEST
+    is commutative). Empty on a first-ever boot.
+  - **The one-shot is consumed only when EVERY host landed** (XERK-813 QA D1): `_writeEntry` returns
+    success (a swallowed write — the XERK-235 never-throw rule — returns false), and a partial seed
+    leaves `_seed` SET so the next ready edge (reconnect) retries, GREATEST no-oping the hosts that
+    already landed. Otherwise a transient DB blip mid-seed would silently drop a RETIRED host's history
+    for the life of the process (it never beats to self-heal). The log counts SUCCESSES, never attempts.
+  - `_seedFileModel` shares `_writeEntry` with the live per-host flush (`_persistHost`), so the seed
+    is decomposed + bounded (`enforceHostShare`) exactly like a beat. The single-process file backend
+    (`USAGE_LEDGER_FILE`) is otherwise byte-identical.
+  - Tests: the `XERK-813:` cases in `usage-ledger-store.test.js` (store-level seed round-trip, seed
+    idempotence/no-lower, and `configure()` end-to-end seeding a retired + aged-out host so a fresh
+    replica scans them).
 - Tests: `usage-ledger-store.test.js` drives the REAL `LedgerStore` against an in-memory fake `PgPool`
   that faithfully implements the emitted SQL (no live Postgres in CI, same constraint as
   `pgclient.test.js`): full-fidelity round-trip (repos + models + pre + sub-agent), the GREATEST

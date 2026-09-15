@@ -126,6 +126,12 @@ class LedgerStore {
     this._readyWork = null;
     // A per-host promise chain so two flushes never race one host's write set.
     this._writing = new Map();
+    // A one-shot seed of the pre-HA single-process file model (XERK-813). Set by
+    // `configure()` to the model the file backend loaded before it is discarded,
+    // written UP into Postgres on the first ready edge so retired-host + aged-out
+    // history survives the cutover. Cleared after it lands; a reconnect never re-seeds.
+    this._seed = cfg.seed && typeof cfg.seed === "object" ? cfg.seed : null;
+    this._seeded = false;
   }
 
   // Signal the hub that the served model changed with no local beat behind it (a
@@ -166,6 +172,12 @@ class LedgerStore {
     this._readyWork = (async () => {
       try {
         await this._ensureSchema();
+        // Seed the pre-HA file history UP before the scan reads it back into the
+        // served model (XERK-813). Ordered after the schema (the tables must exist)
+        // and before the scan (so the scan max-merges the seeded rows into `hosts`).
+        // Both the seed and the scan are GREATEST/max-merges, so their order versus
+        // a concurrent replica's writes never matters.
+        await this._seedFileModel();
         await this._scan();
       } catch (e) {
         console.error(`usage ledger: Postgres ready-work failed: ${(e && e.message) || e}`);
@@ -216,6 +228,51 @@ class LedgerStore {
     // One statement at a time — the extended protocol carries a single command.
     for (const stmt of ddl) await this.pool.query(stmt);
     this._schemaReady = true;
+  }
+
+  // Seed the pre-HA single-process file model into Postgres, once (XERK-813).
+  //
+  // The HA cutover discards the file backend's in-memory model (`configure` resets
+  // `hosts`), but nothing else re-derives its accumulated history: a live host
+  // self-heals only the day buckets whose transcripts are still on disk (Claude
+  // Code deletes its own after ~30 days), and a RETIRED host never beats again — so
+  // both its whole history AND every live host's aged-out day bucket vanished from
+  // the Usage page + token tiles at v2.0.0 (≈10B tokens). The frozen
+  // `/data/usage-ledger.json` still holds them, so seeding it up recovers them, and
+  // does so on any future cutover / DR restore too.
+  //
+  // Written with the SAME atomic GREATEST upserts a beat uses, so it is IDEMPOTENT
+  // (a re-seed on the next boot no-ops against equal-or-higher stored values) and
+  // safe under concurrent replicas (GREATEST is commutative). One-shot per process:
+  // cleared once it lands, so a reconnect's ready edge does not re-write the file.
+  async _seedFileModel() {
+    if (this._seeded || !this._seed) return;
+    const entries = Object.entries(this._seed).filter(
+      ([k, e]) => k && k !== "__proto__" && e && typeof e === "object"
+    );
+    if (!entries.length) { this._seeded = true; this._seed = null; return; }
+    // Serialise each host's write through the same per-host chain live writes use,
+    // so a beat that arrives mid-seed for the same host can't interleave its rows.
+    let landed = 0;
+    for (const [key, entry] of entries) {
+      if (await this._serialize(key, () => this._writeEntry(key, entry))) landed += 1;
+    }
+    if (landed < entries.length) {
+      // A transient write failure (the schema DDL already proved the connection up,
+      // so this is a mid-flight blip) must NOT consume the one-shot: leave `_seed`
+      // set so the next ready edge (reconnect) retries. GREATEST makes re-writing the
+      // hosts that DID land a no-op, so the retry is safe and only fills the gap —
+      // without it a RETIRED host (which never beats again) would lose its history for
+      // the life of the process. The count is of SUCCESSES, never attempts.
+      console.warn(
+        `usage ledger: seeded ${landed}/${entries.length} pre-HA host(s) into Postgres; ` +
+          `${entries.length - landed} failed and will retry on the next ready edge`
+      );
+      return;
+    }
+    this._seeded = true;
+    this._seed = null;
+    console.log(`usage ledger: seeded pre-HA file history for ${landed} host(s) into Postgres`);
   }
 
   // Public rescan (leader promotion). Same as the ready-edge scan; idempotent.
@@ -381,6 +438,16 @@ class LedgerStore {
   async _persistHost(key) {
     const entry = this.ops.getEntry(key);
     if (!entry) return; // forgotten between the mark and the flush
+    return this._writeEntry(key, entry);
+  }
+
+  // Decompose one entry and GREATEST-upsert it — shared by the live per-host flush
+  // (`_persistHost`, entry read from the model) and the one-shot file-model seed
+  // (`_seedFileModel`, entry supplied directly, since it is NOT in the served model).
+  // Returns TRUE when every statement landed, FALSE when a write was swallowed — the
+  // seed reads this to decide whether to consume its one-shot or retry; the live flush
+  // ignores it (it re-marks the host dirty on its next beat regardless).
+  async _writeEntry(key, entry) {
     // Bound this host's bytes BEFORE decomposing (the per-host `enforceHostShare` is
     // the store's expression of LEDGER_MAX — a host is one logical row-set, so its
     // share IS its ceiling). It mutates the live entry, exactly as the file/Valkey
@@ -424,10 +491,12 @@ class LedgerStore {
           [key, series, cutoff]
         );
       }
+      return true;
     } catch (e) {
       // Retried on the next dirty flush; a durable write must never throw out of the
       // debounce timer (an uncaught throw there exits the hub — the XERK-235 rule).
       console.error(`usage ledger: Postgres write failed for a host: ${(e && e.message) || e}`);
+      return false;
     }
   }
 

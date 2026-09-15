@@ -935,8 +935,11 @@ function flush(done) {
  * Select the persistence backend from the resolved HA config (server.js calls
  * this once at boot, FIRE-AND-FORGET — it does not gate the listen). With HA OFF
  * this is a no-op — the file backend loaded at require time stays, byte-identical.
- * With HA ON it discards the file-loaded model and swaps in the Postgres LedgerStore
- * (XERK-779, the ADR's designated of-record), RETIRING the Valkey SharedLedgerBackend
+ * With HA ON it SEEDS the file-loaded model up into Postgres then swaps in the
+ * LedgerStore as the served model (XERK-813 / XERK-779, the ADR's designated
+ * of-record) — the seed keeps the pre-HA single-process history (retired hosts +
+ * aged-out day buckets) that nothing re-derives at runtime. It RETIRES the Valkey
+ * SharedLedgerBackend
  * (XERK-758). The LedgerStore does NOT block boot on Postgres connecting: it loads
  * the history when the pool becomes READY (and re-loads on reconnect), so a database
  * down at boot is never fatal — the serve path degrades to serving each live host's
@@ -962,6 +965,14 @@ async function configure(haConfig, pgClient, onExternalChange) {
   // Cancel any pending file-backend timers — the file model is being discarded.
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
+  // Capture the file-loaded model BEFORE discarding it, to SEED it up into the
+  // Postgres of-record (XERK-813). The cutover otherwise drops all pre-HA history
+  // that nothing re-derives at runtime — retired hosts (which never beat again) and
+  // live hosts' aged-out day buckets (whose transcripts Claude Code has since
+  // deleted). `hosts` is rebound to a fresh model below; `fileModel` keeps the old
+  // one alive for the store to write up on its first ready edge (a GREATEST upsert,
+  // so idempotent and safe under concurrent replicas). Empty on a first-ever boot.
+  const fileModel = hosts;
   hosts = Object.create(null);
   // `onExternalChange` invalidates the hub's /api/agents cache when the model changes
   // from a source OTHER than a local heartbeat (a boot/reconnect scan load, a
@@ -971,6 +982,7 @@ async function configure(haConfig, pgClient, onExternalChange) {
   // so it does NOT call this.
   const b = new LedgerStore(pgClient, sharedOps(), {
     onExternalChange: typeof onExternalChange === "function" ? onExternalChange : null,
+    seed: fileModel,
   });
   await b.init();
   backend = b;
