@@ -116,36 +116,41 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         if (_refreshing.value) return
         _refreshing.value = true
         viewModelScope.launch {
-            val before = container.fleet.state.value.agents
-            // The hub fans refreshJira to every CONFIGURED host (not just
-            // available ones — a failing host is exactly what a retry is for).
-            val hosts = before.filter { it.jira?.configured == true }.map { it.key }.toSet()
-            val ok = try { container.client.api.jiraRefresh(); true } catch (_: Exception) { false }
-            if (!ok) { _messages.tryEmit("Refresh failed"); _refreshing.value = false; return@launch }
-            // No Jira-configured host: nothing will ever land, so stop now
-            // rather than spin for the full timeout.
-            if (hosts.isEmpty()) { _refreshing.value = false; return@launch }
-            container.fleet.nudge()
-            val mark = newestFetchedAt(before)
-            var saw = false
-            val landed = withTimeoutOrNull(REFRESH_TIMEOUT_MS) {
-                container.fleet.state.first { st ->
-                    val list = st.agents
-                    when {
-                        // Still executing on some host — keep waiting.
-                        jiraRefreshPending(list, hosts) -> { saw = true; false }
-                        // The ack beat us to the first emission and we never
-                        // caught it in flight: wait for the watermark to move.
-                        !saw && newestFetchedAt(list) <= mark -> false
-                        else -> true
+            // finally so every early return (and any unexpected throw) still
+            // clears the spinner — the button is always self-healing.
+            try {
+                val before = container.fleet.state.value.agents
+                // The hub fans refreshJira to every CONFIGURED host (not just
+                // available ones — a failing host is exactly what a retry is for).
+                val hosts = before.filter { it.jira?.configured == true }.map { it.key }.toSet()
+                val ok = try { container.client.api.jiraRefresh(); true } catch (_: Exception) { false }
+                if (!ok) { _messages.tryEmit("Refresh failed"); return@launch }
+                // No Jira-configured host: nothing will ever land, so stop now
+                // rather than spin for the full timeout.
+                if (hosts.isEmpty()) return@launch
+                container.fleet.nudge()
+                val mark = newestFetchedAt(before)
+                var saw = false
+                val landed = withTimeoutOrNull(REFRESH_TIMEOUT_MS) {
+                    container.fleet.state.first { st ->
+                        val list = st.agents
+                        when {
+                            // Still executing on some host — keep waiting.
+                            jiraRefreshPending(list, hosts) -> { saw = true; false }
+                            // The ack beat us to the first emission and we never
+                            // caught it in flight: wait for the watermark to move.
+                            !saw && newestFetchedAt(list) <= mark -> false
+                            else -> true
+                        }
                     }
                 }
+                when {
+                    landed == null -> _messages.tryEmit("Refresh timed out")
+                    jiraRefreshFailed(landed.agents, hosts) -> _messages.tryEmit("Refresh failed")
+                }
+            } finally {
+                _refreshing.value = false
             }
-            when {
-                landed == null -> _messages.tryEmit("Refresh timed out")
-                jiraRefreshFailed(landed.agents, hosts) -> _messages.tryEmit("Refresh failed")
-            }
-            _refreshing.value = false
         }
     }
 

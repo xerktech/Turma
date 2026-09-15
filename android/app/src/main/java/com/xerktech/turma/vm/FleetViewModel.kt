@@ -83,11 +83,17 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
         if (_refreshing.value) return
         _refreshing.value = true
         viewModelScope.launch {
-            val started = System.currentTimeMillis()
-            container.fleet.refresh()
-            val elapsed = System.currentTimeMillis() - started
-            if (elapsed < REFRESH_MIN_VISIBLE_MS) delay(REFRESH_MIN_VISIBLE_MS - elapsed)
-            _refreshing.value = false
+            // finally so a future throw from the awaited poll can never wedge the
+            // spinner (the repository swallows its own errors today, but this keeps
+            // the button self-healing regardless).
+            try {
+                val started = System.currentTimeMillis()
+                container.fleet.refresh()
+                val elapsed = System.currentTimeMillis() - started
+                if (elapsed < REFRESH_MIN_VISIBLE_MS) delay(REFRESH_MIN_VISIBLE_MS - elapsed)
+            } finally {
+                _refreshing.value = false
+            }
         }
     }
 
