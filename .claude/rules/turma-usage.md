@@ -244,12 +244,24 @@ paths:
   Code deletes after `cleanupPeriodDays`) — losing ≈10B tokens off the Usage page + token tiles at the
   v2.0.0 cutover. Do NOT restore the discard; "live hosts self-heal" covers only day buckets still on
   disk.
-  - **The seed is IDEMPOTENT and self-recovering.** GREATEST never lowers a live high-water, so a
-    re-seed on every boot from the still-frozen `/data/usage-ledger.json` no-ops against equal/higher
-    stored values — which is also why it fixes any future cutover / DR restore with no manual step
-    (the frozen file need only still be on the PVC). One-shot per PROCESS (`_seed`/`_seeded` on the
-    store), so a reconnect's ready edge does not re-write it; safe under concurrent replicas (GREATEST
-    is commutative). Empty on a first-ever boot.
+  - **The seed is IDEMPOTENT.** GREATEST never lowers a live high-water, so a re-seed on every boot
+    from a still-present `/data/usage-ledger.json` no-ops against equal/higher stored values. One-shot
+    per PROCESS (`_seed`/`_seeded` on the store), so a reconnect's ready edge does not re-write it;
+    safe under concurrent replicas (GREATEST is commutative). Empty on a first-ever boot.
+  - **It only fires when a `/data` usage-ledger FILE is present at boot — so it is INERT under the HA
+    prod topology.** The k8x hub (`ArgoCD/ai/turma/deployment.yaml`) runs `/data` as a per-pod
+    `emptyDir` (the pre-HA `turma-data` PVC was deleted at the 2026-09-11 cutover), so `load()` finds
+    no file and the seed writes nothing there. It protects a FILE-topology cutover / DR restore (a hub
+    that still mounts the file), NOT this fleet — do not describe it as auto-recovering prod on deploy.
+  - **The actual v2.0.0 prod loss was the VALKEY→Postgres seed gap, not file→Postgres.** The
+    2026-09-11 cutover backfilled the full ledger into Valkey (`usage:host:*`, retired `MAXAI-WIN`
+    included); XERK-779 then made Postgres the of-record WITHOUT seeding from Valkey, stranding the
+    pre-cutover history (~9B tokens) while the live hub read an incomplete Postgres. Recovered
+    2026-09-15 by GREATEST-merging the 8 Valkey blobs into Postgres in-cluster (the `usage:host:` scan
+    → `ops.coerce`/`mergeEntry` → `onChange`/`flush` path), then a rolling restart so both replicas
+    rescanned (Postgres 7→8 hosts, 31.5B→40.6B day-tokens; `MAXAI-WIN` restored). The Valkey keys are
+    now redundant but retained as a safety copy; Postgres (CNPG + barman-cloud backups) is the durable
+    of-record from here.
   - **The one-shot is consumed only when EVERY host landed** (XERK-813 QA D1): `_writeEntry` returns
     success (a swallowed write — the XERK-235 never-throw rule — returns false), and a partial seed
     leaves `_seed` SET so the next ready edge (reconnect) retries, GREATEST no-oping the hosts that
