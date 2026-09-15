@@ -30848,7 +30848,11 @@ class TestWindowsTerminalBackend(unittest.TestCase):
             calls.append(kw.get("data"))
             return {"ok": True}
 
-        with mock.patch.object(ha, "_pty_control", side_effect=fake_control):
+        # A multi-line paste settles before Enter and then re-checks the pane; a
+        # cleared composer (no paste chip) means no further Enter.
+        with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
+             mock.patch.object(ha.time, "sleep"), \
+             mock.patch.object(ha, "_capture_pane", return_value="submitted"):
             self.assertTrue(ha._pty_inject("agent-x", "line1\nline2"))
         # First call: the whole message wrapped in bracketed-paste markers (so
         # newlines land as ONE message); then a bare CR to submit.
@@ -30856,6 +30860,85 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         self.assertTrue(calls[0].endswith("\x1b[201~"))
         self.assertIn("line1\nline2", calls[0])
         self.assertEqual(calls[1], "\r")
+        self.assertEqual(calls, [calls[0], "\r"])   # no extra Enter once submitted
+
+    def test_pty_inject_multiline_settles_before_the_enter(self):
+        # Claude Code collapses a multi-line paste into a chip; an Enter that
+        # races that collapse is absorbed, so the Enter must be delayed.
+        order = []
+
+        def fake_control(name, op, **kw):
+            order.append(("inject", kw.get("data")))
+            return {"ok": True}
+
+        with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
+             mock.patch.object(ha.time, "sleep",
+                               side_effect=lambda s: order.append(("sleep", s))), \
+             mock.patch.object(ha, "_capture_pane", return_value=""):
+            ha._pty_inject("agent-x", "a\nb")
+        # paste, THEN a settle sleep, THEN the Enter — never Enter before the sleep.
+        self.assertEqual(order[0][0], "inject")
+        self.assertEqual(order[1], ("sleep", ha.PTY_SUBMIT_SETTLE_SEC))
+        self.assertEqual(order[2], ("inject", "\r"))
+
+    def test_pty_inject_single_line_submits_immediately(self):
+        # A single-line paste never collapses, so it keeps the fast path: no
+        # settle sleep, no pane re-read, an immediate Enter.
+        calls = []
+
+        def fake_control(name, op, **kw):
+            calls.append(kw.get("data"))
+            return {"ok": True}
+
+        with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
+             mock.patch.object(ha.time, "sleep") as slept, \
+             mock.patch.object(ha, "_capture_pane") as cap:
+            self.assertTrue(ha._pty_inject("agent-x", "just one line"))
+        self.assertEqual(calls, [calls[0], "\r"])
+        slept.assert_not_called()
+        cap.assert_not_called()
+
+    def test_pty_inject_retries_enter_while_the_paste_chip_shows(self):
+        # Safety net: a collapse slower than one settle leaves the "[Pasted text]"
+        # chip on screen; Enter again until it clears (or the cap runs out).
+        enters = []
+
+        def fake_control(name, op, **kw):
+            d = kw.get("data")
+            if d == "\r":
+                enters.append(d)
+            return {"ok": True}
+
+        # Chip still visible for the first two re-checks, then gone.
+        caps = iter(["> [Pasted text #1 +3 lines]",
+                     "> [Pasted text #1 +3 lines]",
+                     "cleared"])
+        with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
+             mock.patch.object(ha.time, "sleep"), \
+             mock.patch.object(ha, "_busy_from_capture", return_value=False), \
+             mock.patch.object(ha, "_capture_pane",
+                               side_effect=lambda n: next(caps)):
+            ha._pty_inject("agent-x", "a\nb")
+        # the initial Enter + one per chip-still-showing re-check (2), then it
+        # cleared — three Enters total, well under PTY_SUBMIT_MAX_RETRIES+1.
+        self.assertEqual(len(enters), 3)
+
+    def test_pty_inject_stops_retrying_once_a_turn_is_running(self):
+        # If the pane goes busy (the turn started), stop — even if a chip lingers.
+        enters = []
+
+        def fake_control(name, op, **kw):
+            if kw.get("data") == "\r":
+                enters.append("\r")
+            return {"ok": True}
+
+        with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
+             mock.patch.object(ha.time, "sleep"), \
+             mock.patch.object(ha, "_busy_from_capture", return_value=True), \
+             mock.patch.object(ha, "_capture_pane",
+                               return_value="[Pasted text #1 +3 lines] esc to interrupt"):
+            ha._pty_inject("agent-x", "a\nb")
+        self.assertEqual(len(enters), 1)   # the initial Enter only; busy -> no retry
 
     def test_pty_inject_strips_control_bytes_from_the_paste(self):
         seen = []

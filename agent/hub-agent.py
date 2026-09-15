@@ -9625,6 +9625,24 @@ PTY_CONTROL_TIMEOUT_SEC = _env_float("PTY_CONTROL_TIMEOUT_SEC", 5.0, minimum=0.5
 PTY_SPAWN_TIMEOUT_SEC = _env_float("PTY_SPAWN_TIMEOUT_SEC", 15.0, minimum=1.0)
 # The node runtime the pty-host runs under; the Windows launcher puts it on PATH.
 PTY_NODE_EXE = os.environ.get("TURMA_NODE_EXE", "node")
+# Claude Code collapses a MULTI-LINE bracketed paste into a "[Pasted text +N
+# lines]" chip, and an Enter that arrives before that collapse settles is
+# ABSORBED — the message lands in the composer but is never submitted (the "it
+# gets typed into the terminal chat but not actually sent" report on Windows).
+# Measured on real Claude Code 2.1.270 over fresh sessions: an immediate Enter
+# after the paste submitted 0-1/4 of the time, a ~0.4s-settled Enter 6/6. The
+# Linux tmux path never hit this because its SEPARATE `send-keys Enter` subprocess
+# spawn already interposes that much delay; the Windows control channel is a fast
+# loopback call, so the Enter raced the collapse. So on the pty path we settle
+# before the Enter and, if the paste chip is still showing, Enter again (a
+# collapse slower than one settle). A single-line paste never collapses and stays
+# on the fast path.
+PTY_SUBMIT_SETTLE_SEC = _env_float("PTY_SUBMIT_SETTLE_SEC", 0.4, minimum=0.0)
+PTY_SUBMIT_MAX_RETRIES = _env_int("PTY_SUBMIT_MAX_RETRIES", 3, minimum=0)
+# The composer chip a not-yet-submitted multi-line paste shows. Version-coupled to
+# Claude Code's TUI like the busy markers and the trust-dialog regex; it only
+# gates the retry SAFETY NET — the settle above is the marker-independent fix.
+PTY_PASTE_CHIP_MARK = "[Pasted text"
 
 # Windows: run as `python <this> <spec.json>` from a one-shot Scheduled Task, so the pty-host is a
 # child of the TASK ENGINE, not of the manager -- outside the WinSW service's job AND process tree,
@@ -9880,7 +9898,16 @@ def _pty_inject(tmux_name, text):
     stripped first (an ESC inside the body would close the paste early and have
     the rest read as keystrokes — the same hazard INPUT_CTRL_RE guards on the
     tmux path), and \\r is normalized to \\n like the paste path. Returns True
-    when the paste was accepted."""
+    when the paste was accepted.
+
+    A MULTI-LINE paste needs the Enter DELAYED: Claude Code collapses it into a
+    "[Pasted text +N lines]" chip, and an Enter that races that collapse is
+    absorbed, leaving the message unsubmitted in the composer (PTY_SUBMIT_SETTLE_SEC
+    — the Windows submit bug the tmux path never had, since its separate
+    `send-keys Enter` subprocess already interposed the delay). After the Enter we
+    re-check and Enter again while the chip is still showing, bounded, for a
+    collapse slower than one settle. A single-line paste doesn't collapse, so it
+    keeps the immediate-Enter fast path."""
     if not tmux_name:
         return False
     clean = INPUT_CTRL_RE.sub("", text.replace("\r", "\n"))
@@ -9888,7 +9915,19 @@ def _pty_inject(tmux_name, text):
     r = _pty_control(tmux_name, "inject", data=bracketed)
     if not (r and r.get("ok")):
         return False   # no live terminal / control call failed
+    multiline = "\n" in clean
+    if multiline:
+        time.sleep(PTY_SUBMIT_SETTLE_SEC)          # let the paste chip settle
     _pty_control(tmux_name, "inject", data="\r")   # submit with Enter
+    # Safety net: while a not-yet-submitted paste chip is still on screen and no
+    # turn has started, Enter again. Never fires for a single-line paste (no
+    # chip). Bounded by PTY_SUBMIT_MAX_RETRIES.
+    for _ in range(PTY_SUBMIT_MAX_RETRIES if multiline else 0):
+        cap = _capture_pane(tmux_name) or ""
+        if PTY_PASTE_CHIP_MARK not in cap or _busy_from_capture(cap):
+            break
+        time.sleep(PTY_SUBMIT_SETTLE_SEC)
+        _pty_control(tmux_name, "inject", data="\r")
     return True
 
 
