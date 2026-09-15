@@ -1230,7 +1230,13 @@ const PTY_HOST_DIR = path.join(os.homedir(), ".turma", "pty-hosts");
 const PTY_CONTROL_TOKEN = TOKEN || "changeme";
 const PTY_CAPTURE_TIMEOUT_MS = 2000; // matches the tmux capture timeout below
 
+// Path-traversal-safe: sessionId is validated to a plain word (the same charset
+// dshEventsPath uses for transcriptId), so the join only ever names a child of
+// PTY_HOST_DIR — the id arrives hub-supplied over the control channel. null for
+// an unusable id, which ptyCaptureWindows reads as "no live terminal".
 function ptyStatePath(sessionId) {
+  if (!sessionId || !/^[A-Za-z0-9-]+$/.test(sessionId)) return null;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
   return path.join(PTY_HOST_DIR, `agent-${sessionId}.state.json`);
 }
 
@@ -1241,8 +1247,10 @@ function ptyStatePath(sessionId) {
 // call, like the Python side's one-shot _ws_control_rpc; the timer bounds a
 // hung pty-host so it can't wedge the control-WS event loop.
 function ptyCaptureWindows(sessionId, cb) {
+  const statePath = ptyStatePath(sessionId);
+  if (!statePath) { cb(null); return; }
   let st;
-  try { st = JSON.parse(fs.readFileSync(ptyStatePath(sessionId), "utf8")); }
+  try { st = JSON.parse(fs.readFileSync(statePath, "utf8")); }
   catch { cb(null); return; }
   const port = st && st.ctrlPort;
   if (!Number.isInteger(port) || port <= 0) { cb(null); return; }

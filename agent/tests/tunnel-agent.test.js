@@ -2318,6 +2318,12 @@ test("ptyCaptureWindows: a not-ok reply yields null (like a nonzero tmux)", asyn
 
 test("ptyCaptureWindows: a missing state file, or one with no usable ctrlPort, yields null", async () => {
   assert.equal(await captureOnce("cap-absent-" + process.pid), null);
+  // A traversal-shaped id is rejected before it reaches path.join (ptyStatePath
+  // validates it to a plain word), so it can never escape PTY_HOST_DIR.
+  const { ptyStatePath } = require("../tunnel-agent.js");
+  assert.equal(ptyStatePath("../../etc/evil"), null);
+  assert.equal(ptyStatePath(".."), null);
+  assert.equal(await captureOnce("../../etc/evil"), null);
   const sid = "cap-noport-" + process.pid;
   const sp = writePtyState(sid, { ctrlPort: 0 });
   try {
