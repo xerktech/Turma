@@ -248,8 +248,13 @@ paths:
     re-seed on every boot from the still-frozen `/data/usage-ledger.json` no-ops against equal/higher
     stored values — which is also why it fixes any future cutover / DR restore with no manual step
     (the frozen file need only still be on the PVC). One-shot per PROCESS (`_seed`/`_seeded` on the
-    store, cleared once it lands), so a reconnect's ready edge does not re-write it; safe under
-    concurrent replicas (GREATEST is commutative). Empty on a first-ever boot.
+    store), so a reconnect's ready edge does not re-write it; safe under concurrent replicas (GREATEST
+    is commutative). Empty on a first-ever boot.
+  - **The one-shot is consumed only when EVERY host landed** (XERK-813 QA D1): `_writeEntry` returns
+    success (a swallowed write — the XERK-235 never-throw rule — returns false), and a partial seed
+    leaves `_seed` SET so the next ready edge (reconnect) retries, GREATEST no-oping the hosts that
+    already landed. Otherwise a transient DB blip mid-seed would silently drop a RETIRED host's history
+    for the life of the process (it never beats to self-heal). The log counts SUCCESSES, never attempts.
   - `_seedFileModel` shares `_writeEntry` with the live per-host flush (`_persistHost`), so the seed
     is decomposed + bounded (`enforceHostShare`) exactly like a beat. The single-process file backend
     (`USAGE_LEDGER_FILE`) is otherwise byte-identical.

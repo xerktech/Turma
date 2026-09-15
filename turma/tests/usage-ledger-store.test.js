@@ -334,6 +334,38 @@ test("XERK-813: the seed is IDEMPOTENT and never lowers a total (re-seed on next
   await a.backend.close(); await c.backend.close(); await seen.backend.close();
 });
 
+test("XERK-813: a swallowed seed write leaves the one-shot UNSET so the next ready edge retries (QA D1)", async () => {
+  // A pool that throws on usage_day INSERTs while `failDays` is set — the transient
+  // mid-seed blip the fix must survive without silently dropping a retired host.
+  class FlakyPool extends FakePgPool {
+    constructor() { super(); this.failDays = true; }
+    query(text, params) {
+      const sql = String(text).replace(/\s+/g, " ").trim();
+      if (this.failDays && /^INSERT INTO "usage_day"/i.test(sql)) {
+        return Promise.reject(new Error("transient day-insert failure"));
+      }
+      return super.query(text, params);
+    }
+  }
+  const pool = new FlakyPool();
+  const retired = base().coerce({ device: "MaxAI", lastSeen: 9, host: { days: { "2026-09-01": bucket(1000) } } });
+  const a = replica(pool, { seed: { MaxAI: retired } });
+  await ready(a); // first ready edge: the day upsert throws, _writeEntry returns false
+  assert.equal(a.backend._seeded, false, "a partial seed does NOT consume the one-shot");
+  assert.ok(a.backend._seed, "the seed is retained for the retry");
+
+  // The transient clears; the next ready edge (a reconnect) retries and lands.
+  pool.failDays = false;
+  await a.backend._onReady();
+  assert.equal(a.backend._seeded, true, "the retry lands and consumes the one-shot");
+  assert.equal(a.backend._seed, null);
+
+  const b = replica(pool); await ready(b);
+  assert.ok(b.model.get("MaxAI"), "the retired host reached Postgres on the retry (not lost for the process)");
+  assert.equal(bTok(sTot(b.model.get("MaxAI").host)), 1000);
+  await a.backend.close(); await b.backend.close();
+});
+
 test("XERK-813: configure() seeds the pre-HA file model so retired + aged-out history survives the cutover", async () => {
   ledger._internals.reset();
   const pool = new FakePgPool();

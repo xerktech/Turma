@@ -253,14 +253,26 @@ class LedgerStore {
     if (!entries.length) { this._seeded = true; this._seed = null; return; }
     // Serialise each host's write through the same per-host chain live writes use,
     // so a beat that arrives mid-seed for the same host can't interleave its rows.
+    let landed = 0;
     for (const [key, entry] of entries) {
-      await this._serialize(key, () => this._writeEntry(key, entry));
+      if (await this._serialize(key, () => this._writeEntry(key, entry))) landed += 1;
+    }
+    if (landed < entries.length) {
+      // A transient write failure (the schema DDL already proved the connection up,
+      // so this is a mid-flight blip) must NOT consume the one-shot: leave `_seed`
+      // set so the next ready edge (reconnect) retries. GREATEST makes re-writing the
+      // hosts that DID land a no-op, so the retry is safe and only fills the gap —
+      // without it a RETIRED host (which never beats again) would lose its history for
+      // the life of the process. The count is of SUCCESSES, never attempts.
+      console.warn(
+        `usage ledger: seeded ${landed}/${entries.length} pre-HA host(s) into Postgres; ` +
+          `${entries.length - landed} failed and will retry on the next ready edge`
+      );
+      return;
     }
     this._seeded = true;
     this._seed = null;
-    console.log(
-      `usage ledger: seeded pre-HA file history for ${entries.length} host(s) into Postgres`
-    );
+    console.log(`usage ledger: seeded pre-HA file history for ${landed} host(s) into Postgres`);
   }
 
   // Public rescan (leader promotion). Same as the ready-edge scan; idempotent.
@@ -432,6 +444,9 @@ class LedgerStore {
   // Decompose one entry and GREATEST-upsert it — shared by the live per-host flush
   // (`_persistHost`, entry read from the model) and the one-shot file-model seed
   // (`_seedFileModel`, entry supplied directly, since it is NOT in the served model).
+  // Returns TRUE when every statement landed, FALSE when a write was swallowed — the
+  // seed reads this to decide whether to consume its one-shot or retry; the live flush
+  // ignores it (it re-marks the host dirty on its next beat regardless).
   async _writeEntry(key, entry) {
     // Bound this host's bytes BEFORE decomposing (the per-host `enforceHostShare` is
     // the store's expression of LEDGER_MAX — a host is one logical row-set, so its
@@ -476,10 +491,12 @@ class LedgerStore {
           [key, series, cutoff]
         );
       }
+      return true;
     } catch (e) {
       // Retried on the next dirty flush; a durable write must never throw out of the
       // debounce timer (an uncaught throw there exits the hub — the XERK-235 rule).
       console.error(`usage ledger: Postgres write failed for a host: ${(e && e.message) || e}`);
+      return false;
     }
   }
 
