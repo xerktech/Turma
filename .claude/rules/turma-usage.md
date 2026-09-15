@@ -256,12 +256,14 @@ paths:
   - **The actual v2.0.0 prod loss was the VALKEY→Postgres seed gap, not file→Postgres.** The
     2026-09-11 cutover backfilled the full ledger into Valkey (`usage:host:*`, retired `MAXAI-WIN`
     included); XERK-779 then made Postgres the of-record WITHOUT seeding from Valkey, stranding the
-    pre-cutover history (~9B tokens) while the live hub read an incomplete Postgres. Recovered
-    2026-09-15 by GREATEST-merging the 8 Valkey blobs into Postgres in-cluster (the `usage:host:` scan
-    → `ops.coerce`/`mergeEntry` → `onChange`/`flush` path), then a rolling restart so both replicas
-    rescanned (Postgres 7→8 hosts, 31.5B→40.6B day-tokens; `MAXAI-WIN` restored). The Valkey keys are
-    now redundant but retained as a safety copy; Postgres (CNPG + barman-cloud backups) is the durable
-    of-record from here.
+    pre-cutover history (~6.4B host-level tokens, incl. the retired `MAXAI-WIN`) while the live hub
+    read an incomplete Postgres. Recovered 2026-09-15 by GREATEST-merging the 8 Valkey blobs into
+    Postgres in-cluster (the `usage:host:` scan → `ops.coerce`/`mergeEntry` → `onChange`/`flush`
+    path), then a rolling restart so both replicas rescanned (Postgres 7→8 hosts; fleet host-level
+    day-tokens ~14.3B→20.8B, `MAXAI-WIN` restored). **Sum only the host-level series (`series=''`) for
+    a fleet total — adding the per-repo series is ~1.8× DOUBLE-COUNTING the same spend** (the repo
+    rows are a breakdown of the host total, not additional spend). The Valkey keys are now redundant
+    but retained as a safety copy; Postgres (CNPG + barman-cloud backups) is the durable of-record.
   - **The one-shot is consumed only when EVERY host landed** (XERK-813 QA D1): `_writeEntry` returns
     success (a swallowed write — the XERK-235 never-throw rule — returns false), and a partial seed
     leaves `_seed` SET so the next ready edge (reconnect) retries, GREATEST no-oping the hosts that
