@@ -2235,3 +2235,112 @@ test("deviceDiscriminator mirrors hub-agent.py: lowercase, keep [0-9a-z-], trunc
   assert.equal(deviceDiscriminator("  "), "");
   assert.equal(deviceDiscriminator(null), "");
 });
+
+// ---- ptyCaptureWindows: the Windows pty-host live-pane capture --------------
+// On Windows there is no tmux; captureLiveTurn reads the session's RENDERED pane
+// over the pty-host control WebSocket instead (mirrors hub-agent.py's
+// _pty_capture -> _ws_control_rpc). Without it the live tail's working-status
+// verb AND its pane-footer subagent rows never surface on a Windows host. These
+// drive ptyCaptureWindows directly — it only reads a state file and connects a
+// port, so it is platform-agnostic and Linux CI exercises the Windows path.
+
+// A minimal RFC 6455 control server: completes the handshake (via http's own
+// upgrade), then on the client's first frame replies with ONE unmasked text
+// frame carrying `reply` — the shape the real pty-host `capture` op returns.
+function fakePtyControl(reply) {
+  const srv = http.createServer();
+  const sockets = [];
+  srv.on("upgrade", (req, socket) => {
+    sockets.push(socket);
+    const key = req.headers["sec-websocket-key"];
+    const accept = crypto.createHash("sha1")
+      .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" +
+        `Connection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      // The client's capture frame arrived (its bytes don't affect the reply).
+      const payload = Buffer.from(JSON.stringify(reply), "utf8");
+      socket.write(Buffer.concat([Buffer.from([0x81, payload.length]), payload]));
+    });
+  });
+  srv.unref(); // never hold the event loop open past a test that forgot to close
+  // close() destroys lingering upgraded sockets too (srv.close alone leaves them
+  // open, keeping node:test from exiting).
+  const close = () => { sockets.forEach((s) => { try { s.destroy(); } catch {} }); srv.close(); };
+  return new Promise((resolve) => {
+    srv.listen(0, "127.0.0.1", () => resolve({ srv, port: srv.address().port, close }));
+  });
+}
+
+function writePtyState(sessionId, obj) {
+  const { ptyStatePath } = require("../tunnel-agent.js");
+  const p = ptyStatePath(sessionId);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(obj));
+  return p;
+}
+
+const captureOnce = (sessionId) =>
+  new Promise((resolve) => require("../tunnel-agent.js").ptyCaptureWindows(sessionId, resolve));
+
+test("ptyCaptureWindows: returns the pty-host's rendered pane on a successful capture", async () => {
+  const sid = "cap-ok-" + process.pid;
+  const pane = "● hi\n✳ Cascading… (3s · esc to interrupt)\n";
+  const { port, close } = await fakePtyControl({ ok: true, data: pane });
+  const sp = writePtyState(sid, { ctrlPort: port });
+  try {
+    const out = await captureOnce(sid);
+    assert.equal(out, pane);
+    // The captured pane feeds parsePaneLiveTurn unchanged: verb + busy read.
+    const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+    const parsed = parsePaneLiveTurn(out);
+    assert.equal(parsed.generating, true);
+    assert.equal(parsed.status.verb, "Cascading");
+  } finally {
+    close();
+    fs.rmSync(sp, { force: true });
+  }
+});
+
+test("ptyCaptureWindows: a not-ok reply yields null (like a nonzero tmux)", async () => {
+  const sid = "cap-notok-" + process.pid;
+  const { port, close } = await fakePtyControl({ ok: false });
+  const sp = writePtyState(sid, { ctrlPort: port });
+  try {
+    assert.equal(await captureOnce(sid), null);
+  } finally {
+    close();
+    fs.rmSync(sp, { force: true });
+  }
+});
+
+test("ptyCaptureWindows: a missing state file, or one with no usable ctrlPort, yields null", async () => {
+  assert.equal(await captureOnce("cap-absent-" + process.pid), null);
+  const sid = "cap-noport-" + process.pid;
+  const sp = writePtyState(sid, { ctrlPort: 0 });
+  try {
+    assert.equal(await captureOnce(sid), null);
+  } finally {
+    fs.rmSync(sp, { force: true });
+  }
+});
+
+test("ptyCaptureWindows: an unreachable ctrlPort yields null and never hangs", async () => {
+  const sid = "cap-dead-" + process.pid;
+  // A port bound then immediately freed: nothing listens, connect is refused.
+  const deadPort = await new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.listen(0, "127.0.0.1", () => {
+      const p = probe.address().port;
+      probe.close(() => resolve(p));
+    });
+  });
+  const sp = writePtyState(sid, { ctrlPort: deadPort });
+  try {
+    assert.equal(await captureOnce(sid), null);
+  } finally {
+    fs.rmSync(sp, { force: true });
+  }
+});

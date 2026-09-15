@@ -36,6 +36,16 @@ Python side in `.claude/rules/agent.md`.
 
 - `parsePaneLiveTurn` → `{generating,text,status,agents}`: in-progress assistant text plus
   `status = {verb, token counters, elapsed, hint}` and live agent rows (`parseAgentList`).
+- **`captureLiveTurn` must dispatch on OS — on Windows there is NO tmux.** Linux shells `tmux
+  capture-pane`; Windows reads the pty-host's rendered pane over its control WebSocket
+  (`ptyCaptureWindows`, mirroring `hub-agent.py`'s `_capture_pane`/`_pty_capture` — state file at
+  `~/.turma/pty-hosts/agent-<id>.state.json` → `ctrlPort`, one `{op:"capture"}` per call, auth
+  `TURMA_TOKEN or 'changeme'`). Shelling `tmux` unconditionally ENOENTs on Windows, so `status` reads
+  null every poll and the working-status VERB **and** the pane-footer subagent rows never show on the
+  session page (the card is fine — it rides the heartbeat's own `_capture_pane`, which was already
+  OS-aware). The transcript-derived background-agent list rides the frame separately, so it is
+  unaffected; these are the pane-scraped display halves. Any capture added here needs the same
+  `IS_WINDOWS` dispatch. Tests: the `ptyCaptureWindows` cases in `tunnel-agent.test.js`.
 - **`agents` rides the FRAME, not `status`** (XERK-245) — they clear at different moments: `status`
   is "a turn is running" (drives the Stop button, must clear the instant a turn ends), while a
   background agent keeps going past that.

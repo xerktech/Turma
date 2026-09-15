@@ -1213,16 +1213,78 @@ function liveTurnDecision(prevGen, prevPending, generating) {
   return { emit: true, gen: false, pending: false };
 }
 
-// Capture the session's tmux pane (agent-<id>) and extract the in-progress
-// assistant turn. Async (execFile, not execFileSync) so a slow/hung capture
-// can't block the control-WS event loop.
+// ---- Windows live-pane capture ----------------------------------------------
+// On Windows there is no tmux: a session's terminal is the per-session ConPTY
+// pty-host (XERK-668/697), which serves a control WebSocket whose `capture` op
+// returns the RENDERED screen grid (XERK-703) — the same shape `tmux
+// capture-pane -p` yields on Linux, so parsePaneLiveTurn reads it unchanged.
+// This mirrors hub-agent.py's _capture_pane -> _pty_capture. Without it the live
+// tail's working-status verb AND its pane-footer subagent rows never appear on a
+// Windows host: captureLiveTurn's tmux shell-out ENOENTs, so every turn reads as
+// not-generating with a null status. (The transcript-derived background-agent
+// list rides the frame separately and is unaffected; these are the pane-scraped
+// display halves.)
+const PTY_HOST_DIR = path.join(os.homedir(), ".turma", "pty-hosts");
+// The token the pty-host was minted with (`--auth-token` = TURMA_TOKEN or
+// 'changeme' = ttyd's `-c` token), exactly as hub-agent.py's _pty_control uses.
+const PTY_CONTROL_TOKEN = TOKEN || "changeme";
+const PTY_CAPTURE_TIMEOUT_MS = 2000; // matches the tmux capture timeout below
+
+function ptyStatePath(sessionId) {
+  return path.join(PTY_HOST_DIR, `agent-${sessionId}.state.json`);
+}
+
+// Capture a Windows session's rendered pane over its pty-host control socket.
+// Calls cb(paneText) on success and cb(null) on ANY failure (no live terminal,
+// unreadable/half-written state file, bad port, handshake/timeout/close error) —
+// treated exactly like a tmux capture that returned nonzero. One connect per
+// call, like the Python side's one-shot _ws_control_rpc; the timer bounds a
+// hung pty-host so it can't wedge the control-WS event loop.
+function ptyCaptureWindows(sessionId, cb) {
+  let st;
+  try { st = JSON.parse(fs.readFileSync(ptyStatePath(sessionId), "utf8")); }
+  catch { cb(null); return; }
+  const port = st && st.ctrlPort;
+  if (!Number.isInteger(port) || port <= 0) { cb(null); return; }
+  let ws = null;
+  let done = false;
+  const finish = (data) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    try { if (ws) ws.close(); } catch { /* best-effort */ }
+    cb(data);
+  };
+  const timer = setTimeout(() => finish(null), PTY_CAPTURE_TIMEOUT_MS);
+  try {
+    ws = new WebSocket(`ws://127.0.0.1:${port}/?token=${encodeURIComponent(PTY_CONTROL_TOKEN)}`);
+  } catch { finish(null); return; }
+  ws.onopen = () => { try { ws.send(JSON.stringify({ op: "capture" })); } catch { finish(null); } };
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { finish(null); return; }
+    finish(msg && msg.ok ? (typeof msg.data === "string" ? msg.data : "") : null);
+  };
+  ws.onerror = () => finish(null);
+  ws.onclose = () => finish(null);
+}
+
+// Capture the session's pane and extract the in-progress assistant turn. Async
+// so a slow/hung capture can't block the control-WS event loop: on Linux via
+// `tmux capture-pane` (execFile, not execFileSync), on Windows via the pty-host
+// control socket (ptyCaptureWindows). Platform checked at call time so the suite
+// can drive both paths.
 function captureLiveTurn(sessionId, cb) {
+  const idle = { generating: false, text: "", status: null, agents: [] };
+  if (process.platform === "win32") {
+    ptyCaptureWindows(sessionId, (pane) => cb(pane == null ? idle : parsePaneLiveTurn(pane)));
+    return;
+  }
   execFile(
     "tmux",
     ["capture-pane", "-p", "-t", `agent-${sessionId}`],
     { timeout: 2000, maxBuffer: 1 << 20 },
-    (err, stdout) => cb(err ? { generating: false, text: "", status: null, agents: [] }
-                            : parsePaneLiveTurn(stdout))
+    (err, stdout) => cb(err ? idle : parsePaneLiveTurn(stdout))
   );
 }
 
@@ -1916,5 +1978,6 @@ if (require.main === module) {
   module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS,
     toolUseDetail, todoItems, fmtDshElapsed, dshStatus,
+    ptyCaptureWindows, ptyStatePath,
     usableHostname, deviceName, deviceDiscriminator };
 }
