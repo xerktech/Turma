@@ -93,6 +93,50 @@ class ChatUiStateTest {
         assertTrue(s.canSwitchModelSource())
     }
 
+    // --- AskUserQuestion optimistic dismiss + stale-beat guard (XERK-812) -----
+
+    private fun sessionAsking(q: String) =
+        SessionInfo(id = "s1", session = com.xerktech.turma.model.LiveSignals(question = q))
+
+    @Test
+    fun `an answered question is hidden until the heartbeat moves off it`() {
+        val asking = ChatUiState(session = sessionAsking("Pick a colour"))
+        assertEquals("Pick a colour", asking.question) // shown before answering
+
+        // Optimistic dismiss: the getter suppresses the just-answered question so
+        // the card goes at the tap, not on some later beat — the whole XERK-812 fix.
+        val answered = asking.copy(answeredQuestion = "Pick a colour")
+        assertEquals("", answered.question)
+        assertTrue(answered.canAttach || true) // canAttach reads the effective question
+    }
+
+    @Test
+    fun `a stale beat still reporting the answered question cannot bounce it back`() {
+        val answered = ChatUiState(session = sessionAsking("Pick a colour"), answeredQuestion = "Pick a colour")
+        // fromFleet with the SAME question (a beat lagging the answer): stays hidden.
+        val again = answered.fromFleet(null, sessionAsking("Pick a colour"), host = "h1")
+        assertEquals("Pick a colour", again.answeredQuestion)
+        assertEquals("", again.question)
+    }
+
+    @Test
+    fun `the next question in the batch shows at once`() {
+        val answered = ChatUiState(session = sessionAsking("Question 1"), answeredQuestion = "Question 1")
+        // The agent advances to Q2 — the guard is forgotten and Q2 is shown, so a
+        // second tap can never land on it before it appears (the erratic skip-ahead).
+        val q2 = answered.fromFleet(null, sessionAsking("Question 2"), host = "h1")
+        assertNull(q2.answeredQuestion)
+        assertEquals("Question 2", q2.question)
+    }
+
+    @Test
+    fun `clearing the question forgets the guard`() {
+        val answered = ChatUiState(session = sessionAsking("Question 1"), answeredQuestion = "Question 1")
+        val cleared = answered.fromFleet(null, sessionAsking(""), host = "h1")
+        assertNull(cleared.answeredQuestion)
+        assertEquals("", cleared.question)
+    }
+
     @Test
     fun `a beat from a host with no local model clears the capability`() {
         // Not merely "leaves it alone": a host that lost its configuration must

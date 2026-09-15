@@ -86,9 +86,19 @@ data class ChatUiState(
     // subscription/local chips. Null = not a dsh host (the common case).
     val dsh: com.xerktech.turma.model.DshInfo? = null,
     val modelSourcePending: ModelSource.Pending? = null,
+    // The AskUserQuestion we just answered, held to hide its card the instant the
+    // operator picks — the round-trip to the hub plus the agent's next heartbeat
+    // can take a moment, and leaving the card up reads as if the tap didn't
+    // register, so they tap again and the extra answers land on the NEXT question
+    // (XERK-812). Cleared by [fromFleet] the moment the heartbeat moves off this
+    // question (a new one or none), so a stale beat still reporting it can't bounce
+    // it back. Mirrors the web's `answeredQuestion` guard (chat.js updateQuestion),
+    // which Android lacked.
+    val answeredQuestion: String? = null,
 ) {
     val prefs: VerbosityPrefs get() = VerbosityPrefs.forPreset(verbosity)
-    val question: String get() = session?.session?.question ?: ""
+    private val rawQuestion: String get() = session?.session?.question ?: ""
+    val question: String get() = if (rawQuestion.isNotBlank() && rawQuestion == answeredQuestion) "" else rawQuestion
     val questionOptions: List<String> get() = session?.session?.questionOptions ?: emptyList()
     val questionOptionsRich: List<com.xerktech.turma.model.QuestionOption> get() = session?.session?.questionOptionsRich ?: emptyList()
     val questionHeader: String get() = session?.session?.questionHeader ?: ""
@@ -127,6 +137,11 @@ data class ChatUiState(
         uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
         localModel = agent?.localModel,
         dsh = agent?.dsh,
+        // Keep the just-answered suppression ONLY while the heartbeat still reports
+        // that same question (a stale beat lagging the answer); the moment it moves
+        // to the next question or clears, forget it so the new one shows at once
+        // (XERK-812) — the web's `answeredQuestion = null` on a differing beat.
+        answeredQuestion = answeredQuestion?.takeIf { it == (session?.session?.question ?: "") },
     )
 }
 
@@ -468,6 +483,9 @@ class ChatViewModel(
         if (text.isEmpty() && uploadIds.isEmpty()) return
         draft.value = ""
         if (staged.isNotEmpty()) _state.update { it.copy(attachments = emptyList()) }
+        // A custom answer dismisses the question card too (XERK-812), the same way
+        // an option tap does — re-surfaced below if the send fails.
+        val pendingQ = if (answering) dismissQuestion() else ""
         viewModelScope.launch {
             val sent = runCatching {
                 if (answering) {
@@ -495,6 +513,7 @@ class ChatViewModel(
                 if (staged.isNotEmpty() && _state.value.attachments.isEmpty()) {
                     _state.update { it.copy(attachments = staged) }
                 }
+                resurfaceQuestion(pendingQ)
                 val why = sent.exceptionOrNull()?.let { hubErrorMessage(it) }
                 _messages.tryEmit("✗ " + (why ?: "hub unreachable"))
             }
@@ -539,11 +558,15 @@ class ChatViewModel(
     }
 
     fun answerOption(index: Int) {
+        val pending = dismissQuestion()
         viewModelScope.launch {
             // Only the failure is worth a message here: the answer landing is
-            // its own visible feedback (the question box goes).
+            // its own visible feedback (the question box goes at once, above).
             val r = runCatching { client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = index)) }
-            if (r.isFailure) _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
+            if (r.isFailure) {
+                resurfaceQuestion(pending) // the send failed — let the card show again
+                _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
+            }
             container.fleet.nudge()
         }
     }
@@ -551,11 +574,36 @@ class ChatViewModel(
     /** Multi-select answer: submit the picked option indices together. */
     fun answerMulti(picks: List<Int>) {
         if (picks.isEmpty()) return
+        val pending = dismissQuestion()
         viewModelScope.launch {
             val r = runCatching { client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = -1, optionIndices = picks)) }
-            if (r.isFailure) _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
+            if (r.isFailure) {
+                resurfaceQuestion(pending)
+                _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
+            }
             container.fleet.nudge()
         }
+    }
+
+    /**
+     * Hide the pending AskUserQuestion card the instant it is answered (XERK-812),
+     * returning the question text so a failed send can [resurfaceQuestion] it. A
+     * blank return means nothing was pending, so nothing needs restoring. Mirrors
+     * the web's optimistic `box.hidden = true` + `answeredQuestion` in chat.js.
+     */
+    private fun dismissQuestion(): String {
+        val pending = _state.value.question
+        if (pending.isNotBlank()) _state.update { it.copy(answeredQuestion = pending) }
+        return pending
+    }
+
+    /** Undo [dismissQuestion] when the answer never reached the hub. */
+    private fun resurfaceQuestion(pending: String) {
+        if (pending.isBlank()) return
+        // Only if the heartbeat hasn't already moved on to a different question:
+        // clearing the guard then would re-show whatever is now pending, not the
+        // one we tried to answer. The getter treats a mismatch as "show it".
+        _state.update { if (it.answeredQuestion == pending) it.copy(answeredQuestion = null) else it }
     }
 
     /**
