@@ -1,15 +1,9 @@
 package com.xerktech.turma.ui
 
-import androidx.compose.ui.test.junit4.createComposeRule
-import androidx.compose.ui.test.onAllNodesWithText
-import androidx.compose.ui.test.onNodeWithText
-import androidx.compose.ui.test.performClick
-import androidx.test.core.app.ApplicationProvider
-import com.xerktech.turma.TurmaApplication
-import org.junit.After
+import androidx.navigation.navOptions
 import org.junit.Assert.assertEquals
-import org.junit.Before
-import org.junit.Rule
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -24,55 +18,30 @@ import org.robolectric.annotation.Config
  * under one id — tapping Sessions saved the popped stack keyed "dashboard", and
  * tapping Dashboard restored that saved Sessions entry, landing on Sessions.
  *
- * Both the Dashboard and Sessions screens render a ScreenHeader title matching the
- * bottom-nav label, so the screen we are on shows its own label TWICE (header + nav)
- * and every other tab's label once (nav only).
+ * The actual round trip cannot be driven here: Robolectric's NavController does not
+ * honor saveState/restoreState back-stack persistence, so a rendered-screen test
+ * passes on the buggy code too (a false guard). Instead assert on the exact
+ * [tabNavOptions] `goTab` uses — chiefly that restoreState is OFF, the flag whose
+ * removal is the fix. This fails on the pre-fix options (restoreState = true) and
+ * passes on the fix, so it is a real, mutation-sensitive guard.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class BottomNavTabTest {
 
-    @get:Rule
-    val compose = createComposeRule()
+    @Test fun tabSwitchDoesNotRestoreSavedBackStack() {
+        val opts = navOptions(tabNavOptions())
 
-    private val container get() =
-        ApplicationProvider.getApplicationContext<TurmaApplication>().container
+        // The fix: no restore of a saved back stack (and nothing saves one), so a
+        // tab tap can never land on a sibling tab held under the shared "dashboard"
+        // key. This is the assertion that fails on the pre-fix restoreState = true.
+        assertFalse("a tab switch must NOT restore a saved back stack", opts.shouldRestoreState())
 
-    @Before fun signIn() {
-        // Configured, so TurmaApp starts on the Dashboard.
-        container.config.save("http://localhost:1/", "op", "pw")
-    }
-
-    @After fun tearDown() {
-        container.fleet.stop()
-        container.config.clear()
-    }
-
-    private fun labelCount(label: String) =
-        compose.onAllNodesWithText(label).fetchSemanticsNodes().size
-
-    @Test fun dashboardTabAlwaysReturnsToTheDashboard() {
-        compose.setContent {
-            TurmaApp(
-                container = container,
-                wide = false,
-                pendingDeepLink = null,
-                onDeepLinkConsumed = {},
-            )
-        }
-        compose.waitForIdle()
-        // Start on the Dashboard: its label shows in the header AND the nav.
-        assertEquals("should start on the Dashboard", 2, labelCount("Dashboard"))
-
-        // Go to Sessions.
-        compose.onNodeWithText("Sessions").performClick()
-        compose.waitForIdle()
-        assertEquals("Sessions tap should open the Sessions page", 2, labelCount("Sessions"))
-
-        // Back to the Dashboard — must land on the Dashboard, not restore Sessions.
-        compose.onNodeWithText("Dashboard").performClick()
-        compose.waitForIdle()
-        assertEquals("Dashboard tap must return to the Dashboard", 2, labelCount("Dashboard"))
-        assertEquals("Dashboard tap must NOT leave us on Sessions", 1, labelCount("Sessions"))
+        // The rest of the intended tab behavior: reuse the single tab entry, and pop
+        // back to the Dashboard root (not inclusive) so detail routes are cleared and
+        // Back from any tab lands on the Dashboard.
+        assertTrue("a tab switch is single-top", opts.shouldLaunchSingleTop())
+        assertEquals("pops back to the Dashboard root", TopDest.DASHBOARD.route, opts.popUpToRoute)
+        assertFalse("keeps the Dashboard root itself", opts.isPopUpToInclusive())
     }
 }

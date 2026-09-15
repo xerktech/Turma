@@ -11,6 +11,7 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavGraph.Companion.findStartDestination
+import androidx.navigation.NavOptionsBuilder
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -56,6 +57,27 @@ data class TextSizeControl(
     val set: (TextSize) -> Unit = {},
 )
 val LocalTextSize = staticCompositionLocalOf { TextSizeControl() }
+
+/**
+ * NavOptions for a bottom-nav tab switch: pop back to the Dashboard root and land
+ * on the tapped tab's own screen, matching the web bottom nav (each page loads
+ * fresh). saveState/restoreState are DELIBERATELY NOT used (XERK-814).
+ *
+ * The nav graph is FLAT: every tab is a leaf destination and DASHBOARD is at once
+ * the start destination, the popUpTo anchor AND a tab you navigate to. AndroidX
+ * keys a saved back stack by the popUpTo destination id, so tapping Sessions saved
+ * the popped stack keyed "dashboard", and then tapping Dashboard navigated to
+ * "dashboard" with restoreState=true, matched that same key, and restored the
+ * Sessions entry on top — the Dashboard button landing on the Sessions page, stuck
+ * until an app restart cleared the saved states. (Google's NowInAndroid multi-back-
+ * stack pattern is safe only because each tab is a NESTED GRAPH, so the popUpTo id
+ * differs from the navigated route; here the ids are identical.) These tabs are
+ * single-screen, so there is no per-tab stack worth preserving.
+ */
+internal fun tabNavOptions(): NavOptionsBuilder.() -> Unit = {
+    popUpTo(TopDest.DASHBOARD.route) { inclusive = false }
+    launchSingleTop = true
+}
 
 @Composable
 fun TurmaApp(
@@ -148,11 +170,12 @@ fun TurmaApp(
     // multi-back-stack pattern is safe only because each tab is a NESTED GRAPH, so
     // the popUpTo id differs from the navigated route; here the ids are identical.)
     // These tabs are single-screen, so there is no per-tab stack worth preserving.
+    // Options factored out so the invariant is unit-testable (BottomNavTabTest):
+    // the round trip that reproduces the bug can't be driven in Robolectric (its
+    // NavController doesn't honor saveState/restoreState back-stack persistence), so
+    // the guard asserts on the NavOptions instead — chiefly that restoreState is off.
     val goTab: (TopDest) -> Unit = { dest ->
-        nav.navigate(dest.route) {
-            popUpTo(TopDest.DASHBOARD.route) { inclusive = false }
-            launchSingleTop = true
-        }
+        nav.navigate(dest.route, tabNavOptions())
     }
 
     CompositionLocalProvider(
