@@ -17,6 +17,7 @@ import com.xerktech.turma.net.ResumeRequest
 import com.xerktech.turma.net.SpawnRequest
 import com.xerktech.turma.net.SummaryRequest
 import com.xerktech.turma.net.hubErrorMessage
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -37,6 +38,16 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val messages: SharedFlow<String> = _messages
+
+    /**
+     * The header Refresh button's in-flight state. Unlike a mutation, a refresh
+     * has no card to paint optimistically, so without this the button gave NO
+     * feedback at all — a tap looked like nothing happened. [refresh] awaits the
+     * real /api/agents poll and holds this true (with a short floor so a fast
+     * poll is still perceptible) so the icon shows a spinner while it runs.
+     */
+    private val _refreshing = MutableStateFlow(false)
+    val refreshing: StateFlow<Boolean> = _refreshing
 
     /**
      * Optimistic per-session pending, keyed "<host>::<id>" — the dashboard's
@@ -60,7 +71,31 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
 
     fun start() = container.fleet.start()
     fun stop() = container.fleet.stop()
-    fun refresh() = container.fleet.nudge()
+
+    /**
+     * Force an immediate /api/agents poll and show the button spinning until it
+     * returns. `nudge()` alone fired the poll but gave no signal; awaiting the
+     * repository's own `refresh()` lets the icon reflect "refreshing… done". A
+     * poll that lands in a few ms would blink imperceptibly, so hold the spinner
+     * for at least [REFRESH_MIN_VISIBLE_MS] — long enough to read as an action.
+     */
+    fun refresh() {
+        if (_refreshing.value) return
+        _refreshing.value = true
+        viewModelScope.launch {
+            // finally so a future throw from the awaited poll can never wedge the
+            // spinner (the repository swallows its own errors today, but this keeps
+            // the button self-healing regardless).
+            try {
+                val started = System.currentTimeMillis()
+                container.fleet.refresh()
+                val elapsed = System.currentTimeMillis() - started
+                if (elapsed < REFRESH_MIN_VISIBLE_MS) delay(REFRESH_MIN_VISIBLE_MS - elapsed)
+            } finally {
+                _refreshing.value = false
+            }
+        }
+    }
 
     /**
      * Fire one command and report what actually happened.
@@ -178,6 +213,10 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
     data class SessPending(val kind: String, val at: Long, val restartCount: Int = 0)
 
     companion object {
+        // Floor on how long the Refresh spinner stays up, so a poll that returns
+        // in a few ms still reads as a deliberate refresh rather than a blink.
+        private const val REFRESH_MIN_VISIBLE_MS = 600L
+
         fun pendKey(host: String, id: String) = "$host::$id"
 
         /**

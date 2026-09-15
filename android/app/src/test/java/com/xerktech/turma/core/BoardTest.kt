@@ -1,6 +1,7 @@
 package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.CommandInfo
 import com.xerktech.turma.model.CreateMetaEnvelope
 import com.xerktech.turma.model.CreateProject
 import com.xerktech.turma.model.CreateResultEnvelope
@@ -25,6 +26,50 @@ class BoardTest {
 
     private fun agent(key: String, online: Boolean, jira: JiraBlock?) =
         AgentInfo(key = key, online = online, jira = jira)
+
+    // --- Manual-refresh land-detection (parity with board.js) ----------------
+
+    private fun jiraBlock(fetchedAt: String = "", error: String? = null, configured: Boolean = true) =
+        JiraBlock(configured = configured, fetchedAt = fetchedAt, error = error)
+
+    private fun agentWith(key: String, jira: JiraBlock?, commands: List<CommandInfo> = emptyList()) =
+        AgentInfo(key = key, jira = jira, commands = commands)
+
+    @Test fun `newestFetchedAt picks the max lexicographic timestamp`() {
+        val a = agentWith("h1", jiraBlock(fetchedAt = "2026-09-15T10:00:00Z"))
+        val b = agentWith("h2", jiraBlock(fetchedAt = "2026-09-15T11:00:00Z"))
+        val noBlock = agentWith("h3", jira = null)
+        assertEquals("2026-09-15T11:00:00Z", newestFetchedAt(listOf(a, b, noBlock)))
+        assertEquals("", newestFetchedAt(listOf(noBlock)))
+        assertEquals("", newestFetchedAt(emptyList()))
+    }
+
+    @Test fun `jiraRefreshPending true only while a targeted host holds refreshJira`() {
+        val busy = agentWith("h1", jiraBlock(), listOf(CommandInfo(type = "refreshJira")))
+        val idle = agentWith("h2", jiraBlock())
+        assertTrue(jiraRefreshPending(listOf(busy, idle), setOf("h1", "h2")))
+        // Cleared once the command has been acked and dropped from the record.
+        assertFalse(jiraRefreshPending(listOf(idle), setOf("h1", "h2")))
+        // A command on an UNtargeted host doesn't count.
+        assertFalse(jiraRefreshPending(listOf(busy), setOf("h2")))
+        // A different command type doesn't count.
+        val spawning = agentWith("h1", jiraBlock(), listOf(CommandInfo(type = "spawn")))
+        assertFalse(jiraRefreshPending(listOf(spawning), setOf("h1")))
+    }
+
+    @Test fun `jiraRefreshFailed only when every targeted host errored`() {
+        val errored = agentWith("h1", jiraBlock(error = "boom"))
+        val ok = agentWith("h2", jiraBlock(error = null))
+        // One good host means the refresh as a whole is not a failure.
+        assertFalse(jiraRefreshFailed(listOf(errored, ok), setOf("h1", "h2")))
+        // Every targeted host errored.
+        assertTrue(jiraRefreshFailed(listOf(errored), setOf("h1")))
+        // No targeted host present -> not a failure.
+        assertFalse(jiraRefreshFailed(listOf(ok), setOf("zzz")))
+        // An empty-string error reads as no error.
+        val blank = agentWith("h3", jiraBlock(error = ""))
+        assertFalse(jiraRefreshFailed(listOf(blank), setOf("h3")))
+    }
 
     @Test fun `unknown status category lands in todo`() {
         assertEquals("todo", categoryOf(ticket("A", "")))
