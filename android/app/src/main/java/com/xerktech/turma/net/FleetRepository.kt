@@ -125,8 +125,23 @@ class FleetRepository(
         try {
             val resp = client.api.listAgents()
             synchronized(byKey) {
+                // Membership is the snapshot's (a host absent here is gone), but a
+                // record we already hold FRESHER by `lastSeen` is kept, never
+                // regressed to the snapshot's older copy (XERK-812). A poll and
+                // the immediate nudge() after an answer race, and a response
+                // captured before the agent advanced to the next question can land
+                // after we answered it — a blind overwrite then bounces the stale
+                // question back onto the card. This is Android's analogue of the
+                // web's mergeSnapshot freshness guard (XERK-444); `lastSeen` is
+                // stamped fresh on every heartbeat, so a newer state always sorts
+                // above an older one.
+                val merged = HashMap<String, AgentInfo>(resp.agents.size)
+                for (a in resp.agents) {
+                    val cur = byKey[a.key]
+                    merged[a.key] = if (cur != null && cur.lastSeen > a.lastSeen) cur else a
+                }
                 byKey.clear()
-                for (a in resp.agents) byKey[a.key] = a
+                byKey.putAll(merged)
             }
             ticketAgents = resp.ticketAgents
             autoStartOrgs = resp.autoStartOrgs
@@ -142,7 +157,10 @@ class FleetRepository(
             triagePolicies = resp.triagePolicies
             epicRuns = resp.epicRuns
             epicBuilders = resp.epicBuilders
-            emit(resp.now, error = null)
+            // Don't let a late/stale poll drag the clock backward under the
+            // records we just kept fresh (XERK-812) — same upward coercion upsert
+            // uses for an SSE event.
+            emit(_state.value.now.coerceAtLeast(resp.now), error = null)
         } catch (e: Exception) {
             emit(_state.value.now, error = e.message ?: "hub unreachable")
         }
@@ -213,7 +231,14 @@ class FleetRepository(
 
     private fun upsert(agent: AgentInfo) {
         if (agent.key.isEmpty()) return
-        synchronized(byKey) { byKey[agent.key] = agent }
+        // Same freshness guard as refresh() (XERK-812): drop an SSE event older
+        // than the record we already hold, so a late/out-of-order event can't
+        // regress a session's question (or any other field) to a stale value.
+        synchronized(byKey) {
+            val cur = byKey[agent.key]
+            if (cur != null && cur.lastSeen > agent.lastSeen) return
+            byKey[agent.key] = agent
+        }
         emit(_state.value.now.coerceAtLeast(agent.lastSeen), null)
     }
 

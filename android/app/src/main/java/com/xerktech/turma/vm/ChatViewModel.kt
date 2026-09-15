@@ -255,7 +255,7 @@ class ChatViewModel(
     // restarts cleanly rather than stacking a second collector on each job.
     fun onLeave() {
         liveJob?.cancel(); historyJob?.cancel(); fleetJob?.cancel()
-        pollJob?.cancel(); refreshJob?.cancel()
+        pollJob?.cancel(); refreshJob?.cancel(); nextQuestionJob?.cancel()
         cancelDictation()
     }
 
@@ -499,6 +499,7 @@ class ChatViewModel(
             }
             if (sent.isSuccess) {
                 _messages.tryEmit("✓ sent")
+                pollForNextQuestion(pendingQ) // no-op unless this was an answer
             } else {
                 // Put the message back rather than swallowing it — the web
                 // composer restores its box the same way — and say WHY when the
@@ -566,6 +567,8 @@ class ChatViewModel(
             if (r.isFailure) {
                 resurfaceQuestion(pending) // the send failed — let the card show again
                 _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
+            } else {
+                pollForNextQuestion(pending)
             }
             container.fleet.nudge()
         }
@@ -580,6 +583,8 @@ class ChatViewModel(
             if (r.isFailure) {
                 resurfaceQuestion(pending)
                 _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
+            } else {
+                pollForNextQuestion(pending)
             }
             container.fleet.nudge()
         }
@@ -604,6 +609,34 @@ class ChatViewModel(
         // clearing the guard then would re-show whatever is now pending, not the
         // one we tried to answer. The getter treats a mismatch as "show it".
         _state.update { if (it.answeredQuestion == pending) it.copy(answeredQuestion = null) else it }
+    }
+
+    private var nextQuestionJob: Job? = null
+
+    /**
+     * After a question is answered, surface the NEXT one (or the cleared state)
+     * faster than the 6s fleet-poll floor (XERK-812). `nudge()` fires one poll
+     * immediately, but the agent hasn't advanced yet at that instant, so without
+     * this the next question waits for either an SSE event — flaky once a phone
+     * backgrounds its socket — or the next scheduled poll, which reads as "the
+     * question took a long time to appear".
+     *
+     * A short bounded burst, stopping as soon as the heartbeat moves off the
+     * answered question. Safe to poll aggressively only because [FleetRepository]
+     * is now freshness-guarded (a late poll can't regress the state), so this
+     * cannot reintroduce the bounce-back it sits beside. Self-cancelling: a new
+     * answer or leaving the screen cancels it.
+     */
+    private fun pollForNextQuestion(answered: String) {
+        if (answered.isBlank()) return
+        nextQuestionJob?.cancel()
+        nextQuestionJob = viewModelScope.launch {
+            repeat(6) {
+                delay(600)
+                if ((_state.value.session?.session?.question ?: "") != answered) return@launch
+                container.fleet.nudge()
+            }
+        }
     }
 
     /**
