@@ -134,12 +134,24 @@ fun TurmaApp(
         onDeepLinkConsumed()
     }
 
-    // Switch top-level tabs, keeping a single back-stack entry per tab.
+    // Switch top-level tabs: pop back to the Dashboard root and land on the tapped
+    // tab's own screen — matching the web bottom nav, which loads each page fresh.
+    //
+    // saveState/restoreState are DELIBERATELY NOT used (XERK-814). The nav graph is
+    // FLAT: every tab is a leaf destination and DASHBOARD is at once the start
+    // destination, the popUpTo anchor AND a tab you navigate to. AndroidX keys a
+    // saved back stack by the popUpTo destination id, so tapping Sessions saved the
+    // popped stack keyed "dashboard", and then tapping Dashboard navigated to
+    // "dashboard" with restoreState=true, matched that same key, and restored the
+    // Sessions entry on top — the Dashboard button landing on the Sessions page,
+    // stuck until an app restart cleared the saved states. (Google's NowInAndroid
+    // multi-back-stack pattern is safe only because each tab is a NESTED GRAPH, so
+    // the popUpTo id differs from the navigated route; here the ids are identical.)
+    // These tabs are single-screen, so there is no per-tab stack worth preserving.
     val goTab: (TopDest) -> Unit = { dest ->
         nav.navigate(dest.route) {
-            popUpTo(TopDest.DASHBOARD.route) { saveState = true }
+            popUpTo(TopDest.DASHBOARD.route) { inclusive = false }
             launchSingleTop = true
-            restoreState = true
         }
     }
 
