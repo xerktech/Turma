@@ -14,7 +14,10 @@ import com.xerktech.turma.core.categoryOf
 import com.xerktech.turma.core.classifyCreateMeta
 import com.xerktech.turma.core.classifyCreateResult
 import com.xerktech.turma.core.classifyIssueResponse
+import com.xerktech.turma.core.jiraRefreshFailed
+import com.xerktech.turma.core.jiraRefreshPending
 import com.xerktech.turma.core.moveSweepVerdict
+import com.xerktech.turma.core.newestFetchedAt
 import com.xerktech.turma.core.startSweepVerdict
 import com.xerktech.turma.core.ticketSessionIndex
 import com.xerktech.turma.core.ticketSessionsOf
@@ -28,7 +31,9 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
@@ -96,12 +101,50 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
 
     fun start() = container.fleet.start()
 
+    /**
+     * Re-poll Jira on every configured host and hold the button's spinner until
+     * the re-poll ACTUALLY lands — the web board's behaviour (board.html manual
+     * refresh), not the old fire-and-forget that cleared the instant the POST
+     * was acked (so the icon flashed and "completed" before any data moved). We
+     * fan `POST /api/jira/refresh` out, then watch the fleet records: done when
+     * we saw the `refreshJira` command clear, or the freshness watermark
+     * advanced, with a timeout backstop for a host that simply never beats.
+     * Success stops the spinner silently (fresh data is the signal); a failure
+     * or timeout toasts so the button never clears with nothing to show.
+     */
     fun refresh() {
         if (_refreshing.value) return
         _refreshing.value = true
         viewModelScope.launch {
-            try { container.client.api.jiraRefresh() } catch (_: Exception) {}
+            val before = container.fleet.state.value.agents
+            // The hub fans refreshJira to every CONFIGURED host (not just
+            // available ones — a failing host is exactly what a retry is for).
+            val hosts = before.filter { it.jira?.configured == true }.map { it.key }.toSet()
+            val ok = try { container.client.api.jiraRefresh(); true } catch (_: Exception) { false }
+            if (!ok) { _messages.tryEmit("Refresh failed"); _refreshing.value = false; return@launch }
+            // No Jira-configured host: nothing will ever land, so stop now
+            // rather than spin for the full timeout.
+            if (hosts.isEmpty()) { _refreshing.value = false; return@launch }
             container.fleet.nudge()
+            val mark = newestFetchedAt(before)
+            var saw = false
+            val landed = withTimeoutOrNull(REFRESH_TIMEOUT_MS) {
+                container.fleet.state.first { st ->
+                    val list = st.agents
+                    when {
+                        // Still executing on some host — keep waiting.
+                        jiraRefreshPending(list, hosts) -> { saw = true; false }
+                        // The ack beat us to the first emission and we never
+                        // caught it in flight: wait for the watermark to move.
+                        !saw && newestFetchedAt(list) <= mark -> false
+                        else -> true
+                    }
+                }
+            }
+            when {
+                landed == null -> _messages.tryEmit("Refresh timed out")
+                jiraRefreshFailed(landed.agents, hosts) -> _messages.tryEmit("Refresh failed")
+            }
             _refreshing.value = false
         }
     }
@@ -244,6 +287,10 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         // failed one this long before reverting (board.html MOVE_SETTLE_MS / _TTL).
         const val MOVE_SETTLE_MS = 120_000L
         const val MOVE_ERROR_TTL_MS = 6_000L
+        // How long the manual refresh spins waiting for the re-poll to land
+        // before giving up (board.html REFRESH_TIMEOUT_MS): a queued command +
+        // the host's own beat + Jira's latency, so this is generous.
+        const val REFRESH_TIMEOUT_MS = 45_000L
     }
 
     /**

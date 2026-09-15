@@ -363,6 +363,54 @@ fun moveSweepVerdict(move: MoveState, realCat: String, now: Long, settleMs: Long
 }
 
 /**
+ * The board's manual-refresh land-detection, ported 1:1 from board.js so the
+ * phone's Refresh button holds "busy" until the re-poll ACTUALLY landed rather
+ * than clearing the instant the POST is acked. The round trip is a queued
+ * `refreshJira` command -> the agent's next beat -> Jira -> a beat back, so we
+ * watch the fleet records for the outcome, exactly as the web board does.
+ *
+ * [newestFetchedAt]: the freshest `jira.fetchedAt` across every agent ("" when
+ * none report one) — the freshness watermark; the refresh watches it advance to
+ * know a re-poll landed. Same lexicographic-compare-on-fixed-format-UTC
+ * assumption as mergeSites.
+ */
+fun newestFetchedAt(agents: List<AgentInfo>): String {
+    var newest = ""
+    for (a in agents) {
+        val f = a.jira?.fetchedAt ?: ""
+        if (f.isNotEmpty() && f > newest) newest = f
+    }
+    return newest
+}
+
+/**
+ * Is a manual refresh still in flight across [hosts]? True while any of them
+ * still holds an unacked `refreshJira` command. The hub drops the command from
+ * the record the moment the agent acks it, so this flips false once the fleet
+ * has EXECUTED the re-poll — including a poll that FAILED, which the watermark
+ * can't see (the fail-open keeps the old tickets and only sets `error`, leaving
+ * fetchedAt untouched) and would otherwise wait out the full timeout.
+ */
+fun jiraRefreshPending(agents: List<AgentInfo>, hosts: Set<String>): Boolean {
+    for (a in agents) {
+        if (a.key !in hosts) continue
+        if (a.commands.any { it.type == "refreshJira" }) return true
+    }
+    return false
+}
+
+/**
+ * Did a finished refresh fail OUTRIGHT — did EVERY targeted host come back with
+ * an error? Deliberately not "any host errored": one permanently broken host
+ * would then label every refresh a failure even when the rest of the fleet
+ * updated fine (each org's own error still shows on its column).
+ */
+fun jiraRefreshFailed(agents: List<AgentInfo>, hosts: Set<String>): Boolean {
+    val targeted = agents.filter { it.key in hosts }
+    return targeted.isNotEmpty() && targeted.all { !it.jira?.error.isNullOrEmpty() }
+}
+
+/**
  * How far to auto-scroll the column strip this frame while a dragged card
  * hovers near its left/right edge — board.html `edgeScroll` (XERK-179): a phone
  * can't show every column, and once the long-press drag owns the gesture a

@@ -28,6 +28,10 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Hub-URL field on Login.** The web is same-origin; a phone app must point at any hub, so Login has
   an extra Hub-URL field.
 - **Voice dictation** into the spawn/compose fields — a phone-only addition.
+- **Manual Refresh button on the Dashboard.** The web dashboard has no explicit refresh control (it
+  auto-polls + SSE); the phone keeps a header Refresh button for a deliberate re-poll. It now shows a
+  spinner while the awaited `/api/agents` poll runs (a short visible floor so a fast poll still reads
+  as an action), matching the board button's in-flight treatment (`FleetViewModel.refresh`).
 - **Wide board column area on large screens (XERK-606).** The web board widens ONLY its Kanban
   column area past the shared reading width (`--wrap-board`, header/toolbar/footer stay centred at
   `--wrap`) so more of the fixed-300px columns show without horizontal scroll on a desktop monitor.
@@ -849,7 +853,12 @@ those are marked `[MODEL]`.
   twin) and the detail panel's "Duplicate of" row — not ported to Android yet; `TicketTriage`
   already decodes `dedupeOf`, so only the chip + row need drawing (the Jira Duplicate link itself is
   hub/agent-side, not a client surface).
-- P2 Mobile scroll-snapping columns with peek; deep-link (`?ticket=&site=`); refresh outcome/landing.
+- P2 Mobile scroll-snapping columns with peek; deep-link (`?ticket=&site=`).
+- ~~P2 Board refresh outcome/landing.~~ **Done:** the board Refresh button now holds its spinner until
+  the re-poll ACTUALLY lands (the web `jiraRefreshPending`/`newestFetchedAt` land-detection ported to
+  `core/Board.kt`, `BoardViewModel.refresh`), with a 45s timeout, and toasts "Refresh failed"/"Refresh
+  timed out" on a bad outcome (web shows the outcome inline in the button label — a toast is the
+  phone-idiomatic equivalent). Success stops the spinner silently, fresh data being the signal.
 - P3 Card org-chip placement; empty-column + truncation notes. (The org chips themselves are gone —
   XERK-62 — and their "offline · synced N ago" note now rides the header control's org rows.)
 - P3 Org control: no cross-tab sync (the web follows a `storage` event when a second tab re-scopes;

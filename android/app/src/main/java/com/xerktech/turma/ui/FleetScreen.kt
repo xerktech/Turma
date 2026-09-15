@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -75,6 +76,7 @@ fun FleetScreen(
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val org by vm.orgFilter.collectAsStateWithLifecycle()
     val pending by vm.pending.collectAsStateWithLifecycle()
+    val refreshing by vm.refreshing.collectAsStateWithLifecycle()
     // Everything below is the fleet as scoped by the header's org control
     // (XERK-62). A host polls exactly one org, so scoping the agent list scopes
     // the tiles, the host cards, their repos and their sessions in one move.
@@ -109,7 +111,10 @@ fun FleetScreen(
     Box(modifier) {
         Column(Modifier.fillMaxSize()) {
             ScreenHeader("Dashboard") {
-                HeaderIconButton(onClick = { vm.refresh() }) { Icon(Icons.Filled.Refresh, "Refresh") }
+                HeaderIconButton(onClick = { vm.refresh() }, enabled = !refreshing) {
+                    if (refreshing) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    else Icon(Icons.Filled.Refresh, "Refresh")
+                }
             }
             UpdateBanner()
             LazyColumn(
