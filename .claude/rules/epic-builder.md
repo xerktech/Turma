@@ -120,10 +120,10 @@ already understand, so nothing downstream changes:
 
 - `spawn_epic_builder` spawns a **real Remote-Control session** (`spawn()`), NOT a `claude -p`: the
   builder must RESEARCH a real worktree (Read/Grep/Glob over the repo across many turns), which
-  print-mode cannot do, and its plan-file write needs the session lifecycle (acceptEdits, timeout,
+  print-mode cannot do, and its plan-file write needs the session lifecycle (auto mode, timeout,
   reap). It is **ticket-less** — the hub keys it by a minted `builderId`, not a Jira key, because
   there is no epic yet (it PRODUCES one).
-- **`permission_mode="acceptEdits"`** so the session's WRITE of `TURMA_EPIC_PLAN.json` in its own cwd
+- **`permission_mode="auto"`** so the session's WRITE of `TURMA_EPIC_PLAN.json` in its own cwd
   auto-approves and it runs UNATTENDED — research never prompts, and the directive forbids it from
   creating any Jira ticket itself (writing the file is its whole job). No repo → researches from the
   repos-root (it can read every repo there).

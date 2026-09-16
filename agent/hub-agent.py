@@ -13287,7 +13287,7 @@ def create_board_issue(project, issue_type, summary, description, labels):
 # The session PRODUCES the plan (research needs a coding session); the AGENT
 # materializes it (a session cannot create a parented issue + Blocks links). The
 # two meet through the plan FILE the session writes into its own worktree — an
-# in-cwd write, so `acceptEdits` auto-approves it with no blocking prompt.
+# in-cwd write, so `auto` mode auto-approves it with no blocking prompt.
 
 # The filename the builder session writes its final plan JSON to, in its worktree
 # (its cwd). One builder per worktree, so a fixed name never collides.
@@ -19352,12 +19352,12 @@ class SessionManager:
 
         prompt = build_epic_builder_prompt(title, idea)
         label = (f"Epic Builder: {title}" if title else "Epic Builder")[:120]
-        # acceptEdits so the session's WRITE of the plan file (in its own cwd) is
+        # auto mode so the session's WRITE of the plan file (in its own cwd) is
         # auto-approved — research is Read/Grep/Glob (never prompts), so the
         # builder runs unattended without hanging on a permission dialog.
         try:
             sid = self.spawn(repo_name, prompt=prompt, label=label,
-                             permission_mode="acceptEdits")
+                             permission_mode="auto")
         except Exception as e:
             return fail(f"could not spawn the builder session: {e}")
         if not sid:
