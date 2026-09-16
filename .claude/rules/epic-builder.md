@@ -127,6 +127,14 @@ already understand, so nothing downstream changes:
   auto-approves and it runs UNATTENDED — research never prompts, and the directive forbids it from
   creating any Jira ticket itself (writing the file is its whole job). No repo → researches from the
   repos-root (it can read every repo there).
+- **The directive tells the builder to research against LATEST MAIN, not the checkout it is handed.**
+  A named-repo builder's worktree is already `git fetch`ed + detached at `origin/<default>` by `spawn`
+  (`default_base_ref`), but a NO-REPO (repos-root) builder reads whatever branch/commit the host last
+  left each repo on — arbitrarily stale, never fetched. So `EPIC_BUILDER_DIRECTIVE` step 1 (RESEARCH)
+  instructs it to `git fetch origin` and read the default branch (`git rev-parse --abbrev-ref
+  origin/HEAD`) in each repo — via `git checkout <origin/default>` or reading straight from the ref
+  (`git show`/`git grep <ref>`) — so the plan reflects current code. These are ordinary dev commands
+  (fetch/checkout/show/grep), untouched by the guard; auto mode runs them unattended.
 - Every refusal in `spawn_epic_builder` is **REPORTED** via a `failed` builder record (the
   `epicBuilderStatus` analogue of `_refuse_start`, XERK-265), so the hub's run never sits `queued`
   forever.

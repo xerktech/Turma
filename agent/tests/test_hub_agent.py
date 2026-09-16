@@ -29317,6 +29317,9 @@ class TestEpicPlanValidation(unittest.TestCase):
         self.assertIn("Widgets", pr)
         self.assertIn("make widgets", pr)
         self.assertIn(ha.EPIC_BUILDER_PLAN_FILENAME, pr)
+        # Researches against the latest code, not a stale checkout (XERK-817 follow-up).
+        self.assertIn("git fetch origin", pr)
+        self.assertIn("origin/HEAD", pr)
 
 
 class TestMaterializeEpicPlan(unittest.TestCase):
