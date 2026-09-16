@@ -6041,6 +6041,126 @@ class TestTicketLedger(ManagerMixin, unittest.TestCase):
         self.assertEqual(set(sm.ticket_ledger), {"t1", "t2"})  # oldest t0 fell off
 
 
+class TestIssueKeyFromBranch(unittest.TestCase):
+    """Pulling a board issue key back out of a session's live branch (XERK-817),
+    matched against the keys the host actually collected."""
+
+    def test_jira_exact_and_decorated_branches(self):
+        known = {"XERK-817", "PROJ-3"}
+        self.assertEqual(ha.issue_key_from_branch("XERK-817", known), "XERK-817")
+        # A collision `-N` suffix and a trailing `-slug` both keep the leading key.
+        self.assertEqual(ha.issue_key_from_branch("XERK-817-2", known), "XERK-817")
+        self.assertEqual(
+            ha.issue_key_from_branch("XERK-817-fix-retry", known), "XERK-817")
+        self.assertEqual(
+            ha.issue_key_from_branch("feature/PROJ-3", known), "PROJ-3")
+
+    def test_only_a_known_key_is_returned(self):
+        # A grammar-valid but foreign/uncollected key is not adopted — the branch
+        # could be an unrelated tool's, and there is no card to link to.
+        self.assertIsNone(ha.issue_key_from_branch("ABC-5", {"XERK-817"}))
+        self.assertIsNone(ha.issue_key_from_branch("main", {"XERK-817"}))
+        self.assertIsNone(ha.issue_key_from_branch("XERK-817", set()))
+        self.assertIsNone(ha.issue_key_from_branch("", {"XERK-817"}))
+
+    def test_leftmost_known_key_wins(self):
+        # A branch could parse to two known-shaped tokens; the leading one wins.
+        self.assertEqual(
+            ha.issue_key_from_branch("XERK-817-and-PROJ-3", {"XERK-817", "PROJ-3"}),
+            "XERK-817")
+
+    def test_azure_is_never_adopted(self):
+        # Azure work-item ids are bare integers, indistinguishable from a version/
+        # date/number in a branch (`release-2024-oauth` -> `2024`), so adoption is
+        # Jira-only — an Azure board keeps the explicit ticket-spawn link alone.
+        p = mock.patch.object(ha, "board_source", lambda: "azure")
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertIsNone(ha.issue_key_from_branch("MyProject-1234", {"1234"}))
+        self.assertIsNone(ha.issue_key_from_branch("release-2024-oauth", {"2024"}))
+
+
+class TestAdoptTicket(ManagerMixin, unittest.TestCase):
+    """XERK-817: a manually-started session whose agent filed its own ticket and
+    branched for it is linked to that ticket, as if spawned from it."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(ha, "board_configured", lambda: True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _mgr(self, tickets=(("XERK-817", "Link session to ticket"),)):
+        sm = self.make_manager()
+        sm.jira = {
+            "siteKey": "x.atlassian.net",
+            "tickets": [{"key": k, "summary": s,
+                         "url": f"https://x.atlassian.net/browse/{k}"}
+                        for k, s in tickets],
+        }
+        return sm
+
+    def _sess(self, **over):
+        s = {"id": "s1", "repo": "Turma", "claudeSessionId": "t1"}
+        s.update(over)
+        return s
+
+    def test_adopts_when_the_branch_names_a_collected_ticket(self):
+        sm = self._mgr()
+        sess = self._sess()
+        self.assertTrue(sm._maybe_adopt_ticket(sess, "XERK-817"))
+        t = sess["ticket"]
+        self.assertEqual(t["key"], "XERK-817")
+        self.assertEqual(t["siteKey"], "x.atlassian.net")
+        self.assertEqual(t["url"], "https://x.atlassian.net/browse/XERK-817")
+        self.assertEqual(t["summary"], "Link session to ticket")
+        self.assertEqual(t["branch"], "XERK-817")
+        self.assertTrue(sess["ticketAdopted"])
+        # And it landed in the durable transcriptId -> ticket ledger.
+        self.assertEqual(sm.ticket_ledger["t1"]["key"], "XERK-817")
+
+    def test_adopts_from_a_decorated_branch(self):
+        sm = self._mgr()
+        sess = self._sess()
+        self.assertTrue(sm._maybe_adopt_ticket(sess, "XERK-817-fix-retry"))
+        self.assertEqual(sess["ticket"]["key"], "XERK-817")
+        # The record keeps the ACTUAL branch, not just the key.
+        self.assertEqual(sess["ticket"]["branch"], "XERK-817-fix-retry")
+
+    def test_does_not_adopt_an_uncollected_key(self):
+        sm = self._mgr()
+        sess = self._sess()
+        self.assertFalse(sm._maybe_adopt_ticket(sess, "ABC-9"))
+        self.assertNotIn("ticket", sess)
+
+    def test_never_clobbers_an_existing_ticket(self):
+        sm = self._mgr()
+        sess = self._sess(ticket={"key": "PROJ-1", "siteKey": "x.atlassian.net"})
+        self.assertFalse(sm._maybe_adopt_ticket(sess, "XERK-817"))
+        self.assertEqual(sess["ticket"]["key"], "PROJ-1")
+
+    def test_skips_a_root_session_and_a_detached_worktree(self):
+        sm = self._mgr()
+        self.assertFalse(sm._maybe_adopt_ticket(self._sess(root=True), "XERK-817"))
+        self.assertFalse(sm._maybe_adopt_ticket(self._sess(), None))
+
+    def test_no_board_no_adoption(self):
+        sm = self._mgr()
+        p = mock.patch.object(ha, "board_configured", lambda: False)
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertFalse(sm._maybe_adopt_ticket(self._sess(), "XERK-817"))
+
+    def test_url_falls_back_when_the_collected_ticket_has_none(self):
+        sm = self._mgr(tickets=[])
+        sm.jira["tickets"] = [{"key": "XERK-817"}]  # no url/summary
+        sess = self._sess()
+        self.assertTrue(sm._maybe_adopt_ticket(sess, "XERK-817"))
+        self.assertEqual(sess["ticket"]["url"],
+                         "https://x.atlassian.net/browse/XERK-817")
+        self.assertEqual(sess["ticket"]["summary"], "")
+
+
 class TestUsageLedger(ManagerMixin, unittest.TestCase):
     """The attribution ledger: written at spawn, backfilled, pruned, and — the
     whole point — surviving a kill so usage stays reported."""
