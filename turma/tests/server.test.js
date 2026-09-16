@@ -183,6 +183,7 @@ const {
   wsAccept, wsEncode, wsParser, WS_FRAME_MAX, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
+  termRetryReset, terminalFail,
   serializeAgentsForSave,
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, REFUSED_DETAIL_MAX,
   userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
@@ -17076,6 +17077,79 @@ test("term: terminal HTML serves JBMNerd with font-display:swap (not block)", as
   assert.equal(head.status, 200, "HEAD must be answered, not 404'd");
   assert.equal(head.headers.etag, font.headers.etag);
   assert.equal(head.raw, "", "HEAD must carry no body");
+});
+
+
+test("term: a reset on a REUSED pooled ttyd channel is replayed once (termRetryReset)", () => {
+  // Terminal Connection Resilience: a pooled tunnel channel that ttyd (or the
+  // Windows pty-host) closed on its own keep-alive idle timeout still looks
+  // reusable to Node's Agent, so the first asset request on it fails with
+  // ECONNRESET ("socket hang up") BEFORE ttyd sees it. proxyTerm replays such an
+  // idempotent request once on a fresh channel; the end-to-end reuse/reset heal is
+  // host-QA'd (no ttyd in CI, and the harness's 400ms control-reap races a GC
+  // pause), so this pins the decision the wiring turns on. The mechanism is proven
+  // through the real tunnel path in QA — see the PR's verification.
+  const reset = { code: "ECONNRESET", message: "socket hang up" };
+  const hangup = { code: undefined, message: "socket hang up" }; // some Node paths omit code
+
+  // The case that heals: a reused socket reset before any response, on a GET/HEAD.
+  assert.equal(termRetryReset(0, true, false, "GET", reset), true);
+  assert.equal(termRetryReset(0, true, false, "HEAD", reset), true);
+  assert.equal(termRetryReset(0, true, false, "GET", hangup), true,
+    "a bare 'socket hang up' with no code still retries");
+
+  // The cases that must NOT retry (each is a real failure or an unsafe replay):
+  assert.equal(termRetryReset(1, true, false, "GET", reset), false, "only the first attempt retries");
+  assert.equal(termRetryReset(0, false, false, "GET", reset), false,
+    "a FRESH-socket reset is a real dial failure, not the keep-alive race");
+  assert.equal(termRetryReset(0, true, true, "GET", reset), false,
+    "once bytes have gone to the client the response can't be replayed");
+  assert.equal(termRetryReset(0, true, false, "POST", reset), false,
+    "a POST body has already been consumed — never blind-replay a mutation");
+  assert.equal(termRetryReset(0, true, false, "GET", { code: "ETIMEDOUT", message: "timeout" }), false,
+    "only a connection reset is the idle-closed-keep-alive signal");
+});
+
+test("term: terminalFail settles the proxy response exactly once (no double-end crash)", () => {
+  // Terminal Connection Resilience: proxyTerm has several error edges — an upstream
+  // stream error AND the ClientRequest error can both fire on one mid-body reset —
+  // and a second res.end() throws ERR_STREAM_WRITE_AFTER_END out of an error
+  // handler, which exits the hub under `restart: unless-stopped`. terminalFail is
+  // the one idempotent settle they all route through. A fake response records what
+  // it was asked to do so the three branches are pinned deterministically.
+  const fakeRes = () => ({
+    headersSent: false, writableEnded: false, head: null, ended: undefined, endCount: 0,
+    writeHead(code, h) { this.headersSent = true; this.head = [code, h]; },
+    end(body) { this.endCount += 1; this.writableEnded = true; this.ended = body; },
+  });
+
+  // Before headers: a 502 with the reason, ended once.
+  const a = fakeRes();
+  terminalFail(a, "terminal error: boom");
+  assert.deepEqual(a.head, [502, { "Content-Type": "text/plain" }]);
+  assert.equal(a.ended, "terminal error: boom");
+  assert.equal(a.endCount, 1);
+
+  // A second call is a NO-OP — this is the double-end crash guard.
+  terminalFail(a, "again");
+  assert.equal(a.endCount, 1, "a settled response must never be re-ended");
+  assert.equal(a.ended, "terminal error: boom", "the second reason must not overwrite the first");
+
+  // Mid-stream (headers already sent for a piped asset): truncate, no 502, no body,
+  // and never a writeHead-after-headers throw.
+  const b = fakeRes();
+  b.headersSent = true;
+  terminalFail(b, "terminal error: mid");
+  assert.equal(b.head, null, "must not writeHead once headers are already sent");
+  assert.equal(b.endCount, 1);
+  assert.equal(b.ended, undefined, "a mid-stream failure truncates, it does not append the reason");
+
+  // Already ended (e.g. the success path completed): a stray late error is inert.
+  const c = fakeRes();
+  c.writableEnded = true;
+  terminalFail(c, "late");
+  assert.equal(c.endCount, 0);
+  assert.equal(c.head, null);
 });
 
 
