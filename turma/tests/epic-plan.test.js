@@ -20,10 +20,10 @@ function goodPlan() {
   return {
     epic: { summary: "Build the widget", description: "the whole widget" },
     children: [
-      { localId: "a", summary: "scaffold", description: "", issueType: "Task", blockedBy: [] },
-      { localId: "b", summary: "left", description: "", issueType: "Story", blockedBy: ["a"] },
-      { localId: "c", summary: "right", description: "", issueType: "Task", blockedBy: ["a"] },
-      { localId: "d", summary: "integrate", description: "", issueType: "Task", blockedBy: ["a", "b", "c"] },
+      { localId: "a", summary: "scaffold", description: "", issueType: "Task", repo: "widget", blockedBy: [] },
+      { localId: "b", summary: "left", description: "", issueType: "Story", repo: "widget", blockedBy: ["a"] },
+      { localId: "c", summary: "right", description: "", issueType: "Task", repo: "widget", blockedBy: ["a"] },
+      { localId: "d", summary: "integrate", description: "", issueType: "Task", repo: "widget", blockedBy: ["a", "b", "c"] },
     ],
   };
 }
@@ -42,7 +42,7 @@ test("XERK-722: a well-formed plan validates, with its waves + final child", () 
 test("XERK-722: a single-child plan is trivially final-blocked-by-all", () => {
   const res = EP.validateEpicPlan({
     epic: { summary: "solo" },
-    children: [{ localId: "only", summary: "do it", issueType: "Task", blockedBy: [] }],
+    children: [{ localId: "only", summary: "do it", issueType: "Task", repo: "solo-repo", blockedBy: [] }],
   });
   assert.equal(res.valid, true, JSON.stringify(res.errors));
   assert.deepEqual(res.waves, [["only"]]);
@@ -124,6 +124,22 @@ test("XERK-722: issueType is constrained to Task/Story, never Epic/Subtask", () 
     p.children[1].issueType = ok;
     assert.equal(EP.validateEpicPlan(p).valid, true, `expected ${ok} to validate`);
   }
+});
+
+test("every child needs a non-empty repo (its single Jira label)", () => {
+  for (const bad of ["", "   ", undefined, null, 3, {}]) {
+    const p = goodPlan();
+    p.children[1].repo = bad;
+    const res = EP.validateEpicPlan(p);
+    assert.ok(
+      res.errors.some((e) => e.code === "REPO_MISSING"),
+      `expected REPO_MISSING for ${JSON.stringify(bad)}`,
+    );
+  }
+  // A dropped repo key entirely is also rejected.
+  const p = goodPlan();
+  delete p.children[0].repo;
+  assert.ok(EP.validateEpicPlan(p).errors.some((e) => e.code === "REPO_MISSING"));
 });
 
 test("XERK-722: non-object / empty-children plans are rejected, not thrown", () => {

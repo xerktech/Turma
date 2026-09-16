@@ -13303,6 +13303,7 @@ EPIC_BUILDERS_MAX = _env_int("EPIC_BUILDERS_MAX", 64)
 # The child issue types a plan may use (case-insensitive) — a work ticket, never
 # another Epic and never a Subtask. Mirrors epic-plan.js EPIC_PLAN_CHILD_TYPES.
 EPIC_BUILDER_CHILD_TYPES = ("task", "story")
+EPIC_CHILD_LABEL_MAX = 255      # Jira's own label length ceiling
 
 
 def _eb_nonempty_str(v):
@@ -13344,6 +13345,11 @@ EPIC_BUILDER_DIRECTIVE = (
     "     the epic converges to one wrap-up sink.\n"
     "   - Keep each child a real, self-contained piece of work with a clear summary\n"
     "     and enough description to start on.\n"
+    "   - CRITICAL: every child names the REPOSITORY its work belongs in, in a\n"
+    "     \"repo\" field. Use the exact repo name as it appears in the checkout (the\n"
+    "     directory name), e.g. the repo you researched in step 1. It becomes the\n"
+    "     child ticket's single label, so whoever picks the ticket up knows where\n"
+    "     to do the work. A child with no repo is rejected.\n"
     "\n"
     "3. WRITE the plan as JSON to the file \"" + EPIC_BUILDER_PLAN_FILENAME + "\" in your\n"
     "   current working directory (nothing else — just that file), in exactly this\n"
@@ -13353,16 +13359,17 @@ EPIC_BUILDER_DIRECTIVE = (
     "   { \"epic\": { \"summary\": \"…\", \"description\": \"…\" },\n"
     "     \"children\": [\n"
     "       { \"localId\": \"w1a\", \"summary\": \"…\", \"description\": \"…\",\n"
-    "         \"issueType\": \"Task\", \"blockedBy\": [] },\n"
+    "         \"issueType\": \"Task\", \"repo\": \"the-repo-name\", \"blockedBy\": [] },\n"
     "       … ,\n"
     "       { \"localId\": \"qa\", \"summary\": \"QA end-to-end and enable\",\n"
-    "         \"description\": \"…\", \"issueType\": \"Task\",\n"
+    "         \"description\": \"…\", \"issueType\": \"Task\", \"repo\": \"the-repo-name\",\n"
     "         \"blockedBy\": [\"w1a\", …every other localId…] } ] }\n"
     "\n"
     "The plan must satisfy: exactly one epic with a non-empty summary; every child a\n"
-    "unique non-empty localId; every issueType is Task or Story; every blockedBy\n"
-    "names another child in the plan (no dangling or self references); the\n"
-    "dependency graph is acyclic; the final child is blocked by every other child.\n"
+    "unique non-empty localId; every issueType is Task or Story; every child names a\n"
+    "non-empty repo (the repository its work belongs in); every blockedBy names\n"
+    "another child in the plan (no dangling or self references); the dependency graph\n"
+    "is acyclic; the final child is blocked by every other child.\n"
     "Do NOT create any Jira ticket yourself — writing the file is your whole job;\n"
     "the plan is materialized from it once the file is valid."
 )
@@ -13419,8 +13426,9 @@ def validate_epic_plan(plan):
     """Everything the Auto-Epic run needs, as a list of human-readable error
     strings (empty = valid). A Python mirror of epic-plan.js validateEpicPlan:
     one epic with a summary; unique non-empty localIds; issueType Task/Story;
-    blockedBy names only in-plan localIds (no dangling/self); acyclic DAG; the
-    final child (last) blocked by every other child."""
+    every child names a non-empty repo (its single Jira label); blockedBy names
+    only in-plan localIds (no dangling/self); acyclic DAG; the final child
+    (last) blocked by every other child."""
     errors = []
     if not isinstance(plan, dict):
         return ["plan must be an object"]
@@ -13453,6 +13461,8 @@ def validate_epic_plan(plan):
         lid = c["localId"]
         if not _eb_nonempty_str(c.get("summary")):
             errors.append(f'child "{lid}" needs a non-empty summary')
+        if not _eb_nonempty_str(c.get("repo")):
+            errors.append(f'child "{lid}" needs a non-empty repo (its work\'s repository)')
         it = c.get("issueType")
         if not _eb_nonempty_str(it) or it.strip().lower() not in EPIC_BUILDER_CHILD_TYPES:
             errors.append(f'child "{lid}" issueType must be Task or Story (got {it!r})')
@@ -13503,6 +13513,16 @@ def epic_plan_link_edges(plan):
     return edges
 
 
+def _epic_child_label(repo):
+    """The single Jira label for a plan child: its `repo`, made label-safe. Jira
+    rejects a label containing whitespace, so internal whitespace collapses to
+    '-' (repo names don't normally have any); capped like an operator label.
+    Returns [] for an empty/blank repo so a create is never handed a broken
+    label (validation already requires a non-empty repo, so this is a floor)."""
+    label = "-".join(str(repo or "").split())[:EPIC_CHILD_LABEL_MAX]
+    return [label] if label else []
+
+
 class EpicBuilderError(Exception):
     """A materialization failure that carries exactly what WAS created, so the
     operator sees a partial epic rather than a silent half-write."""
@@ -13543,7 +13563,8 @@ def materialize_epic_plan(plan, project):
             cr = create_jira_issue(
                 project, type_id(c.get("issueType")),
                 (c.get("summary") or "").strip()[:CREATE_TITLE_MAX_CHARS],
-                (c.get("description") or "")[:CREATE_DESC_MAX_CHARS], [],
+                (c.get("description") or "")[:CREATE_DESC_MAX_CHARS],
+                _epic_child_label(c.get("repo")),
                 parent=created["epicKey"])
         except EpicBuilderError:
             raise

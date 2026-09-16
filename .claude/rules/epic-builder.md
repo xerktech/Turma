@@ -24,7 +24,7 @@ is `.claude/rules/turma-epic-run.md`.
 
 ## The EpicPlan (`turma/epic-plan.js`, A) — one shape three stages agree on
 
-`{ epic:{summary,description}, children:[{localId, summary, description, issueType, blockedBy:[localId]}] }`
+`{ epic:{summary,description}, children:[{localId, summary, description, issueType, repo, blockedBy:[localId]}] }`
 
 - **Pure, stdlib-only** — no network, no tracker write, no server state — so the builder session and
   the hub validate/preview a plan the SAME way before any ticket exists.
@@ -33,9 +33,24 @@ is `.claude/rules/turma-epic-run.md`.
 - **`validateEpicPlan` returns every problem, never throws** (`assertValidEpicPlan` is the throwing
   form). What the Auto-Epic run needs, each its own error code: exactly one epic with a non-empty
   summary; unique non-empty localIds; every `issueType` is **Task or Story** (case-insensitive), never
-  Epic or Subtask (an Epic-typed child is caught HERE, not by a "second epic" field); `blockedBy`
-  names only in-plan localIds (no dangling, no self); an **acyclic** DAG (a cycle is REPORTED in
-  `cycle`, never silently dropped); and the **final-child-blocked-by-all** rule below.
+  Epic or Subtask (an Epic-typed child is caught HERE, not by a "second epic" field); every child a
+  non-empty `repo` (`REPO_MISSING`, below); `blockedBy` names only in-plan localIds (no dangling, no
+  self); an **acyclic** DAG (a cycle is REPORTED in `cycle`, never silently dropped); and the
+  **final-child-blocked-by-all** rule below.
+
+### repo is REQUIRED — it becomes the child's single Jira LABEL
+
+- **Every child names the `repo` its work belongs in, and it is required** (`REPO_MISSING` in both the
+  JS validator and the Python `validate_epic_plan` mirror). `materialize_epic_plan` passes exactly
+  ONE label per child — that repo, via `_epic_child_label` — matching the operator-create contract
+  (one label = the repo the work needs doing in). A plan with any child missing a repo is rejected, so
+  the builder session retries rather than filing repo-less tickets.
+- **The EPIC itself is left unlabeled** — it is an organizing container that may span repos; only the
+  work children carry a repo label.
+- **`_epic_child_label` makes the repo label-safe**: internal whitespace → `-` (Jira rejects a
+  whitespace label; repo names don't normally have any), capped at `EPIC_CHILD_LABEL_MAX` (255, Jira's
+  own ceiling), and a blank repo yields NO label rather than a broken one (validation already floors
+  it non-empty). The directive tells the builder to use the exact checkout directory name.
 
 ### plan-waves == buildEpicWaves parity — THREE mirrors that must agree
 
