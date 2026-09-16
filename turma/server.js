@@ -13989,9 +13989,25 @@ async function proxyTerm(req, res, name, port) {
   // it uncompressed (small file; avoids having to gunzip before injecting).
   delete headers["accept-encoding"];
 
+  // End the response at most once, whatever fails. Before headers, that is a 502
+  // with a reason; mid-stream (headers already sent for a piped asset) it just
+  // truncates. Idempotent so the several error edges below — an upstream stream
+  // error AND the ClientRequest error can both fire on one mid-body reset — can't
+  // double-`res.end()` (ERR_STREAM_WRITE_AFTER_END was an unhandled throw = a hub
+  // exit under `restart: unless-stopped`).
+  const fail = (msg) => {
+    if (res.writableEnded) return;
+    if (res.headersSent) { res.end(); return; }
+    res.writeHead(502, { "Content-Type": "text/plain" });
+    res.end(msg);
+  };
+
   // The upstream (ttyd) response handler — shared by the initial attempt and the
   // reused-socket retry below.
   const onUpstream = (upRes) => {
+    // A mid-stream upstream error on EITHER branch must not become an unhandled
+    // 'error' (the non-HTML `upRes.pipe(res)` had no handler = a hub exit).
+    upRes.on("error", () => fail("terminal error"));
     // Only the top-level HTML document is buffered + rewritten; every other
     // asset (JS, token, favicon) streams straight through as before.
     const ctype = upRes.headers["content-type"] || "";
@@ -13999,6 +14015,7 @@ async function proxyTerm(req, res, name, port) {
       const chunks = [];
       upRes.on("data", (c) => chunks.push(c));
       upRes.on("end", () => {
+        if (res.writableEnded) return; // a prior error already settled the response
         let html = Buffer.concat(chunks).toString("utf8");
         // Insert the @font-face + touch-scroll shim + clipboard bridge before
         // </head> (fall back to prepending).
@@ -14019,10 +14036,6 @@ async function proxyTerm(req, res, name, port) {
         res.writeHead(upRes.statusCode, h);
         res.end(body);
       });
-      upRes.on("error", () => {
-        if (!res.headersSent) res.writeHead(502, { "Content-Type": "text/plain" });
-        res.end("terminal error");
-      });
       return;
     }
     res.writeHead(upRes.statusCode, upRes.headers);
@@ -14036,8 +14049,7 @@ async function proxyTerm(req, res, name, port) {
     );
     up.on("error", (e) => {
       if (termRetryReset(attempt, up.reusedSocket, res.headersSent, req.method, e)) return send(1);
-      if (!res.headersSent) res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end(`terminal error: ${e.message}`);
+      fail(`terminal error: ${e.message}`);
     });
     // Only the first attempt forwards the client body; the retry is gated to
     // GET/HEAD (no body), and the client stream was already consumed by that pipe,
