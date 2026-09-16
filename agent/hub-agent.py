@@ -13607,6 +13607,41 @@ def ticket_branch_base(key, detail):
     return f"wi-{key}"
 
 
+# A Jira key is embedded verbatim in the branch (PROJECT-123, optionally with a
+# collision `-N` or a trailing `-slug`), so a key-shaped token is a strong signal.
+_JIRA_KEY_IN_BRANCH_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*-[0-9]+")
+
+
+def issue_key_from_branch(branch, known_keys):
+    """Find a board issue key embedded in a session's live branch name, matched
+    against the set of keys this host actually collected (`known_keys`). Returns
+    the key, or None (XERK-817).
+
+    A session started WITHOUT a ticket carries no `ticket` record, so when its
+    agent files a ticket mid-run and cuts a branch named for it (the reserved
+    `PROJECT-123` shape ticket_branch_base hands out), nothing links the two.
+    Rather than reverse the naming rule, pull every plausible key-shaped token out
+    of the branch and keep the FIRST that is a real ticket on this host's board —
+    which both validates the token (over a bare grammar match, which a foreign or
+    coincidental `X-9` branch would pass) and confirms the card exists to link to.
+    Order is left-to-right, so the leading key wins over a trailing `-slug` that
+    also parses (e.g. `XERK-817-fix-99` -> `XERK-817`).
+
+    JIRA-ONLY on purpose. An Azure work-item id is a BARE INTEGER, so any version/
+    date/number in a branch (`release-2024-oauth`, `hotfix-2025-09-15`) that equals
+    a collected id would false-link a session to an unrelated card — the collected-
+    key filter is too weak a guard for small common integers, and an inventing
+    agent follows no reserved Azure branch convention to anchor on. So Azure boards
+    keep the explicit ticket-spawn link only; a reliable Azure adoption needs a
+    branch grammar that does not yet exist."""
+    if not branch or not known_keys or board_source() == "azure":
+        return None
+    for cand in _JIRA_KEY_IN_BRANCH_RE.findall(branch):
+        if cand in known_keys:
+            return cand
+    return None
+
+
 def branch_names(repo_path):
     """Every branch name a new branch here could collide with: local heads, plus
     remote-tracking branches reduced to the name they'd have locally (a pushed
@@ -16233,6 +16268,56 @@ class SessionManager:
             changed |= self._remember_ticket(sess, save=False)
         if changed:
             self._save_ticket_ledger()
+
+    def _maybe_adopt_ticket(self, sess, live_branch):
+        """Link a manually-started session to a ticket its agent created and
+        branched for mid-run, so the board picks it up as if it were spawned from
+        that ticket (XERK-817).
+
+        The ticket <-> session link is the `ticket` block on the record, which the
+        board reverse-indexes by (siteKey, key). A bare spawn carries none, so a
+        session whose agent files its own ticket and cuts a `PROJECT-123` branch
+        never appears on that ticket's card. When the session's LIVE branch names
+        a ticket THIS host actually collected, stamp the same block spawn_ticket
+        would have — the board then links it with no hub change. Jira-only, since
+        an Azure bare-integer id can't be told from a number in a branch (see
+        issue_key_from_branch).
+
+        Cheap and on the beat by design: no tracker HTTP, the url/summary come from
+        the already-collected board ticket (issue_key_from_branch only accepts a
+        key present in `self.jira`, which both validates it and guarantees the card
+        exists). Idempotent — the `ticket` guard below stops it re-firing. Returns
+        whether it adopted, so the caller saves the record once."""
+        if sess.get("root"):
+            return False                      # a root session's branch is the host's
+        if (sess.get("ticket") or {}).get("key"):
+            return False                      # already linked (spawned or adopted)
+        if not live_branch or not board_configured():
+            return False
+        jira = self.jira or {}
+        tickets = jira.get("tickets") or []
+        known = {t.get("key") for t in tickets
+                 if isinstance(t, dict) and t.get("key")}
+        key = issue_key_from_branch(live_branch, known)
+        if not key:
+            return False
+        site_key = jira.get("siteKey") or board_site_key()
+        match = next((t for t in tickets
+                      if isinstance(t, dict) and t.get("key") == key), {})
+        # Same shape spawn_ticket builds, so every reader (board index, ledger,
+        # the card's back-link, Android's typed TicketRef) treats it identically.
+        sess["ticket"] = {
+            "key": key,
+            "siteKey": site_key,
+            "url": match.get("url") or f"https://{site_key}/browse/{key}",
+            "summary": (match.get("summary") or "")[:200],
+            "branch": live_branch,
+        }
+        # Internal provenance only (not served) — distinguishes a branch-adopted
+        # link from a ticket spawn without changing the wire `ticket` shape.
+        sess["ticketAdopted"] = True
+        self._remember_ticket(sess)           # durable transcriptId -> ticket ledger
+        return True
 
     def _load_pr_ledger(self):
         try:
@@ -27709,6 +27794,18 @@ class SessionManager:
         except Exception as e:
             log(f"session git failed for {sid}: {e}")
             gi, work = None, None
+        # XERK-817: a running session whose agent filed its own ticket and cut a
+        # branch named for it gets linked to that ticket, as if spawned from it.
+        # Guarded so a beat-loop raise here can never take the host down (XERK-402).
+        if running:
+            try:
+                lb = gi.get("branch") if gi else None
+                if lb == "HEAD":
+                    lb = None
+                if self._maybe_adopt_ticket(sess, lb):
+                    self.save()
+            except Exception as e:
+                log(f"ticket adopt failed for {sid}: {e}")
         return {
             "id": sid,
             # Read with .get(), NEVER a bare sess["..."] — this dict is built on

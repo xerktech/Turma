@@ -248,6 +248,21 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
   archived session is still the answer. Tests: `TestTicketLedger`.
 - A ticket-backed session is **named from its ticket** instead of paying a `claude -p`. A failed
   fetch raises to `handle_commands`, which logs and acks.
+- **A bare session that files its OWN ticket mid-run is adopted onto it** (XERK-817,
+  `_maybe_adopt_ticket` off `_session_payload`): a manually-started session carries no `ticket`, so
+  when its agent creates a ticket and cuts a branch named for it, nothing links the two. When the
+  session's LIVE branch names a ticket THIS host actually collected, stamp the SAME `ticket` block a
+  spawn would — the board reverse-index then links it with no hub change. **Cheap and on the beat: no
+  tracker HTTP** — `issue_key_from_branch` pulls key-shaped tokens out of the branch and keeps the
+  first present in `self.jira` (which both validates it over a coincidental/foreign `X-9` and yields
+  the url/summary), leftmost wins over a trailing `-slug`. Guarded (root session / already-linked /
+  detached / no board all skip; a raise can't take the host down, XERK-402); idempotent via the
+  `ticket` check; provenance is the internal, unserved `ticketAdopted`.
+  - **JIRA-ONLY** (`issue_key_from_branch` returns None for an Azure board): an Azure work-item id is
+    a BARE INTEGER, so a version/date/number in a branch (`release-2024-oauth`) that equals a
+    collected id would false-link to an unrelated card, and an inventing agent follows no reserved
+    Azure branch convention to anchor on. Azure keeps the explicit ticket-spawn link only.
+  - Tests: `TestAdoptTicket`, `TestIssueKeyFromBranch`.
 - **A ticket can run on the dsh OR qwen RUNTIME** (XERK-473 dsh, XERK-515 qwen): the hub's per-ticket
   runtime pin rides the command as `agentType`, which `spawn_ticket` forwards to `spawn()`
   (validated by `resolve_agent_type`, refused where that runtime is not configured) — the launch
