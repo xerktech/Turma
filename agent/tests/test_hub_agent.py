@@ -29259,11 +29259,14 @@ class TestEpicPlanValidation(unittest.TestCase):
         return {
             "epic": {"summary": "Build the widget", "description": "whole thing"},
             "children": [
-                {"localId": "a", "summary": "scaffold", "issueType": "Task", "blockedBy": []},
-                {"localId": "b", "summary": "left", "issueType": "Story", "blockedBy": ["a"]},
-                {"localId": "c", "summary": "right", "issueType": "Task", "blockedBy": ["a"]},
+                {"localId": "a", "summary": "scaffold", "issueType": "Task",
+                 "repo": "widget", "blockedBy": []},
+                {"localId": "b", "summary": "left", "issueType": "Story",
+                 "repo": "widget", "blockedBy": ["a"]},
+                {"localId": "c", "summary": "right", "issueType": "Task",
+                 "repo": "widget", "blockedBy": ["a"]},
                 {"localId": "d", "summary": "qa+enable", "issueType": "Task",
-                 "blockedBy": ["a", "b", "c"]},
+                 "repo": "widget", "blockedBy": ["a", "b", "c"]},
             ],
         }
 
@@ -29285,6 +29288,16 @@ class TestEpicPlanValidation(unittest.TestCase):
     def test_bad_issue_type(self):
         p = self._diamond(); p["children"][0]["issueType"] = "Epic"
         self.assertTrue(any("issueType" in e for e in ha.validate_epic_plan(p)))
+
+    def test_missing_repo_is_rejected(self):
+        # Every child needs a non-empty repo — its single Jira label. Mirrors the
+        # JS REPO_MISSING check. Blank, absent, and non-string all fail.
+        for bad in ("", "   ", None, 3):
+            p = self._diamond(); p["children"][1]["repo"] = bad
+            self.assertTrue(any("repo" in e for e in ha.validate_epic_plan(p)),
+                            f"expected a repo error for {bad!r}")
+        p = self._diamond(); del p["children"][0]["repo"]
+        self.assertTrue(any("repo" in e for e in ha.validate_epic_plan(p)))
 
     def test_dangling_and_self_blockedby(self):
         p = self._diamond(); p["children"][1]["blockedBy"] = ["nope", "b"]
@@ -29320,6 +29333,17 @@ class TestEpicPlanValidation(unittest.TestCase):
         # Researches against the latest code, not a stale checkout (XERK-817 follow-up).
         self.assertIn("git fetch origin", pr)
         self.assertIn("origin/HEAD", pr)
+        # Directs the builder to name each child's repo (its label).
+        self.assertIn('"repo"', pr)
+
+    def test_child_label_is_sanitized_repo(self):
+        self.assertEqual(ha._epic_child_label("Turma"), ["Turma"])
+        self.assertEqual(ha._epic_child_label(" repo-agent "), ["repo-agent"])
+        # Jira rejects a whitespace label; internal whitespace collapses to '-'.
+        self.assertEqual(ha._epic_child_label("my repo"), ["my-repo"])
+        # A blank/absent repo yields no label rather than a broken one.
+        self.assertEqual(ha._epic_child_label(""), [])
+        self.assertEqual(ha._epic_child_label(None), [])
 
 
 class TestMaterializeEpicPlan(unittest.TestCase):
@@ -29330,9 +29354,12 @@ class TestMaterializeEpicPlan(unittest.TestCase):
         return {
             "epic": {"summary": "Epic", "description": "d"},
             "children": [
-                {"localId": "a", "summary": "A", "issueType": "Task", "blockedBy": []},
-                {"localId": "b", "summary": "B", "issueType": "Story", "blockedBy": ["a"]},
-                {"localId": "d", "summary": "QA", "issueType": "Task", "blockedBy": ["a", "b"]},
+                {"localId": "a", "summary": "A", "issueType": "Task",
+                 "repo": "repo-agent", "blockedBy": []},
+                {"localId": "b", "summary": "B", "issueType": "Story",
+                 "repo": "Turma", "blockedBy": ["a"]},
+                {"localId": "d", "summary": "QA", "issueType": "Task",
+                 "repo": "Turma", "blockedBy": ["a", "b"]},
             ],
         }
 
@@ -29347,7 +29374,8 @@ class TestMaterializeEpicPlan(unittest.TestCase):
         def fake_create(project, issue_type, summary, description, labels, parent=None):
             counter[0] += 1
             key = f"XERK-{counter[0]}"
-            creates.append({"key": key, "type": issue_type, "parent": parent, "summary": summary})
+            creates.append({"key": key, "type": issue_type, "parent": parent,
+                            "summary": summary, "labels": labels})
             return {"key": key, "url": "u", "assigned": True}
 
         def fake_post(path, body):
@@ -29362,9 +29390,13 @@ class TestMaterializeEpicPlan(unittest.TestCase):
         epic = creates[0]
         self.assertEqual(epic["type"], "10001")          # Epic type
         self.assertIsNone(epic["parent"])
-        # every child parented to the epic
+        self.assertEqual(epic["labels"], [])             # the epic itself is unlabeled
+        # every child parented to the epic AND labeled with its own repo
         for c in creates[1:]:
             self.assertEqual(c["parent"], epic["key"])
+        self.assertEqual(creates[1]["labels"], ["repo-agent"])   # child a
+        self.assertEqual(creates[2]["labels"], ["Turma"])        # child b
+        self.assertEqual(creates[3]["labels"], ["Turma"])        # child d (QA)
         self.assertEqual(len(created["children"]), 3)
         # links reproduce the DAG, blocker->blocked, using the real keys
         kb = created["children"]
@@ -29408,8 +29440,10 @@ class TestEpicBuilderRun(ManagerMixin, unittest.TestCase):
         return {
             "epic": {"summary": "Epic"},
             "children": [
-                {"localId": "a", "summary": "A", "issueType": "Task", "blockedBy": []},
-                {"localId": "b", "summary": "B", "issueType": "Task", "blockedBy": ["a"]},
+                {"localId": "a", "summary": "A", "issueType": "Task",
+                 "repo": "Turma", "blockedBy": []},
+                {"localId": "b", "summary": "B", "issueType": "Task",
+                 "repo": "Turma", "blockedBy": ["a"]},
             ],
         }
 

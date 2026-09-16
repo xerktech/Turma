@@ -11,7 +11,7 @@
 //   EpicPlan = {
 //     epic: { summary, description },
 //     children: [
-//       { localId, summary, description, issueType, blockedBy: [localId, ...] },
+//       { localId, summary, description, issueType, repo, blockedBy: [localId, ...] },
 //       ...
 //     ],
 //   }
@@ -19,6 +19,12 @@
 // `localId` is a builder-LOCAL handle (e.g. "w1a"); real Jira keys are assigned
 // only at materialization, so the whole plan is expressible before a single
 // ticket exists. `blockedBy` names other children by their localId.
+//
+// `repo` is REQUIRED and names the repository the child's work belongs in — it
+// becomes the child ticket's single Jira LABEL at materialization, so a session
+// picking the ticket up knows where to do the work (the same one-label-per-ticket
+// contract the operator's own creates follow). The builder decides it during
+// RESEARCH; a plan with any child missing a repo is rejected (REPO_MISSING).
 //
 // The plan must map cleanly onto what the Auto-Epic run (XERK-633) consumes:
 //   - exactly one epic (a non-empty summary),
@@ -29,7 +35,9 @@
 //   - the DESIGNATED FINAL child (the last element of `children`) is blocked by
 //     every other child, so the epic has a single wrap-up sink,
 //   - every child's issueType is a project child type (Task/Story), never
-//     Epic or Subtask.
+//     Epic or Subtask,
+//   - every child names a non-empty `repo` (its single Jira label — where the
+//     work belongs).
 
 // The child issue types a plan may use. An epic organizes work tickets; a child
 // is a Task or a Story, never another Epic and never a Subtask (Subtasks are a
@@ -177,6 +185,12 @@ function validateEpicPlan(plan) {
       const id = c.localId;
       if (!isNonEmptyString(c.summary)) {
         add("SUMMARY_MISSING", `child "${id}" needs a non-empty summary`);
+      }
+      // repo: the child's single Jira label — the repository its work belongs
+      // in. Required, so no child ships to Jira without saying where the work
+      // goes (the one-label-per-ticket contract).
+      if (!isNonEmptyString(c.repo)) {
+        add("REPO_MISSING", `child "${id}" needs a non-empty repo (its work's repository)`);
       }
       // issueType constrained to the project's child types (Task/Story); never
       // Epic or Subtask.
