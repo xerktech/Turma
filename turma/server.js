@@ -13960,6 +13960,26 @@ function dropTermAgents(name) {
     }
   }
 }
+// Whether a failed terminal-asset request may be replayed once on a fresh channel.
+//
+// A pooled tunnel channel that ttyd (or the Windows pty-host) closed on ITS OWN
+// keep-alive idle timeout can still look reusable to Node's Agent, so the first
+// asset request sent on it fails with ECONNRESET ("socket hang up") BEFORE ttyd
+// ever sees it. `reusedSocket` is Node's signal for exactly that race: the request
+// went out on a pooled socket and never reached the origin, so a GET/HEAD
+// (idempotent, and carrying no body to re-stream) is safe to replay on a fresh
+// channel — which the Agent dials because the dead socket has been evicted from
+// the pool. Without the replay the browser gets a 502 and the operator refreshes
+// until a warm channel happens to answer — the flaky "retry over and over to
+// connect the terminal" symptom, independent of the agent's OS. Only the FIRST
+// attempt (`attempt === 0`) is retried, and only before any bytes have gone to the
+// client (`!headersSent`); a non-reused socket's reset, a POST, or a mid-response
+// error is a real failure the caller surfaces.
+function termRetryReset(attempt, reusedSocket, headersSent, method, err) {
+  return attempt === 0 && !!reusedSocket && !headersSent &&
+    (method === "GET" || method === "HEAD") &&
+    (err.code === "ECONNRESET" || err.message === "socket hang up");
+}
 async function proxyTerm(req, res, name, port) {
   const headers = { ...req.headers, host: "ttyd", authorization: ttydAuth(name) };
   // Keep-alive over the pooled channel — drop any client-sent Connection header
@@ -13968,51 +13988,64 @@ async function proxyTerm(req, res, name, port) {
   // We rewrite ttyd's HTML document to inject the terminal web font, so ask for
   // it uncompressed (small file; avoids having to gunzip before injecting).
   delete headers["accept-encoding"];
-  const up = http.request(
-    { agent: termAgentFor(name, port), host: name, port, method: req.method, path: req.url, headers },
-    (upRes) => {
-      // Only the top-level HTML document is buffered + rewritten; every other
-      // asset (JS, token, favicon) streams straight through as before.
-      const ctype = upRes.headers["content-type"] || "";
-      if (req.method === "GET" && ctype.includes("text/html")) {
-        const chunks = [];
-        upRes.on("data", (c) => chunks.push(c));
-        upRes.on("end", () => {
-          let html = Buffer.concat(chunks).toString("utf8");
-          // Insert the @font-face + touch-scroll shim + clipboard bridge before
-          // </head> (fall back to prepending).
-          const inject = TERM_FONT_STYLE + TERM_TOUCH_SCROLL + TERM_OSC52_CLIPBOARD +
-            TERM_SCROLL_BOTTOM;
-          html = html.includes("</head>")
-            ? html.replace("</head>", inject + "</head>")
-            : inject + html;
-          const body = Buffer.from(html, "utf8");
-          const h = { ...upRes.headers };
-          // Content changed; drop framing headers and any CSP that would block
-          // an inline <style>/font (the hub is the single-user trust boundary).
-          delete h["content-length"];
-          delete h["transfer-encoding"];
-          delete h["content-security-policy"];
-          delete h["content-encoding"];
-          h["content-length"] = Buffer.byteLength(body);
-          res.writeHead(upRes.statusCode, h);
-          res.end(body);
-        });
-        upRes.on("error", () => {
-          if (!res.headersSent) res.writeHead(502, { "Content-Type": "text/plain" });
-          res.end("terminal error");
-        });
-        return;
-      }
-      res.writeHead(upRes.statusCode, upRes.headers);
-      upRes.pipe(res);
+
+  // The upstream (ttyd) response handler — shared by the initial attempt and the
+  // reused-socket retry below.
+  const onUpstream = (upRes) => {
+    // Only the top-level HTML document is buffered + rewritten; every other
+    // asset (JS, token, favicon) streams straight through as before.
+    const ctype = upRes.headers["content-type"] || "";
+    if (req.method === "GET" && ctype.includes("text/html")) {
+      const chunks = [];
+      upRes.on("data", (c) => chunks.push(c));
+      upRes.on("end", () => {
+        let html = Buffer.concat(chunks).toString("utf8");
+        // Insert the @font-face + touch-scroll shim + clipboard bridge before
+        // </head> (fall back to prepending).
+        const inject = TERM_FONT_STYLE + TERM_TOUCH_SCROLL + TERM_OSC52_CLIPBOARD +
+          TERM_SCROLL_BOTTOM;
+        html = html.includes("</head>")
+          ? html.replace("</head>", inject + "</head>")
+          : inject + html;
+        const body = Buffer.from(html, "utf8");
+        const h = { ...upRes.headers };
+        // Content changed; drop framing headers and any CSP that would block
+        // an inline <style>/font (the hub is the single-user trust boundary).
+        delete h["content-length"];
+        delete h["transfer-encoding"];
+        delete h["content-security-policy"];
+        delete h["content-encoding"];
+        h["content-length"] = Buffer.byteLength(body);
+        res.writeHead(upRes.statusCode, h);
+        res.end(body);
+      });
+      upRes.on("error", () => {
+        if (!res.headersSent) res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end("terminal error");
+      });
+      return;
     }
-  );
-  up.on("error", (e) => {
-    if (!res.headersSent) res.writeHead(502, { "Content-Type": "text/plain" });
-    res.end(`terminal error: ${e.message}`);
-  });
-  req.pipe(up);
+    res.writeHead(upRes.statusCode, upRes.headers);
+    upRes.pipe(res);
+  };
+
+  const send = (attempt) => {
+    const up = http.request(
+      { agent: termAgentFor(name, port), host: name, port, method: req.method, path: req.url, headers },
+      onUpstream
+    );
+    up.on("error", (e) => {
+      if (termRetryReset(attempt, up.reusedSocket, res.headersSent, req.method, e)) return send(1);
+      if (!res.headersSent) res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end(`terminal error: ${e.message}`);
+    });
+    // Only the first attempt forwards the client body; the retry is gated to
+    // GET/HEAD (no body), and the client stream was already consumed by that pipe,
+    // so ending the fresh request is enough.
+    if (attempt === 0) req.pipe(up);
+    else up.end();
+  };
+  send(0);
 }
 
 // ---- connection cap (XERK-273) ----------------------------------------------
@@ -18190,6 +18223,10 @@ if (process.env.TURMA_TEST) {
     STATIC_ASSETS, ASSET_URLS, IMMUTABLE_CACHE, REVALIDATE_CACHE, HTML_CACHE, SUPERSEDED_CACHE,
     supersededAsset,
     invalidateAgentsCache,
+    // The terminal-proxy retry decision (Terminal Connection Resilience): a reused
+    // pooled ttyd channel that reset before answering is replayed once, so an
+    // idle-closed keep-alive socket no longer surfaces as "socket hang up".
+    termRetryReset,
     serializeAgentsForSave,
     flushStateNow, // graceful-shutdown synchronous state flush (XERK-552)
     // XERK-757 — the externalized-store wiring. The full cross-replica behaviour
