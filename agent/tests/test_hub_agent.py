@@ -29415,6 +29415,7 @@ class TestEpicBuilderRun(ManagerMixin, unittest.TestCase):
         def fake_spawn(repo_name, **kw):
             sm.registry.append({"id": sid, "worktreePath": worktree,
                                 "repo": repo_name, "status": "running"})
+            self._last_spawn_kw = kw
             return sid
         return mock.patch.object(sm, "spawn", fake_spawn)
 
@@ -29449,6 +29450,8 @@ class TestEpicBuilderRun(ManagerMixin, unittest.TestCase):
         self.assertEqual(b["worktreePath"], wt)
         self.assertEqual(sm.epic_builder_status(),
                          [{"id": "b1", "state": "researching"}])
+        # Runs unattended in auto mode (auto-approves the in-cwd plan-file write).
+        self.assertEqual(self._last_spawn_kw.get("permission_mode"), "auto")
 
     def test_advance_materializes_a_valid_plan(self):
         sm = self.make_manager()
