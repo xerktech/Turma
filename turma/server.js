@@ -13980,6 +13980,19 @@ function termRetryReset(attempt, reusedSocket, headersSent, method, err) {
     (method === "GET" || method === "HEAD") &&
     (err.code === "ECONNRESET" || err.message === "socket hang up");
 }
+
+// Settle a terminal-proxy response exactly once, whatever failed. Before headers
+// that is a 502 with a reason; mid-stream (headers already sent for a piped asset)
+// it just truncates. Idempotent so the several error edges in proxyTerm — an
+// upstream stream error AND the ClientRequest error can both fire on one mid-body
+// reset — can't double-`res.end()`, which threw ERR_STREAM_WRITE_AFTER_END out of
+// an error handler = a hub exit under `restart: unless-stopped`.
+function terminalFail(res, msg) {
+  if (res.writableEnded) return;
+  if (res.headersSent) { res.end(); return; }
+  res.writeHead(502, { "Content-Type": "text/plain" });
+  res.end(msg);
+}
 async function proxyTerm(req, res, name, port) {
   const headers = { ...req.headers, host: "ttyd", authorization: ttydAuth(name) };
   // Keep-alive over the pooled channel — drop any client-sent Connection header
@@ -13989,18 +14002,7 @@ async function proxyTerm(req, res, name, port) {
   // it uncompressed (small file; avoids having to gunzip before injecting).
   delete headers["accept-encoding"];
 
-  // End the response at most once, whatever fails. Before headers, that is a 502
-  // with a reason; mid-stream (headers already sent for a piped asset) it just
-  // truncates. Idempotent so the several error edges below — an upstream stream
-  // error AND the ClientRequest error can both fire on one mid-body reset — can't
-  // double-`res.end()` (ERR_STREAM_WRITE_AFTER_END was an unhandled throw = a hub
-  // exit under `restart: unless-stopped`).
-  const fail = (msg) => {
-    if (res.writableEnded) return;
-    if (res.headersSent) { res.end(); return; }
-    res.writeHead(502, { "Content-Type": "text/plain" });
-    res.end(msg);
-  };
+  const fail = (msg) => terminalFail(res, msg);
 
   // The upstream (ttyd) response handler — shared by the initial attempt and the
   // reused-socket retry below.
@@ -18238,7 +18240,9 @@ if (process.env.TURMA_TEST) {
     // The terminal-proxy retry decision (Terminal Connection Resilience): a reused
     // pooled ttyd channel that reset before answering is replayed once, so an
     // idle-closed keep-alive socket no longer surfaces as "socket hang up".
-    termRetryReset,
+    // `terminalFail` is the idempotent settle that keeps a mid-stream proxy error
+    // from double-ending the response (an ERR_STREAM_WRITE_AFTER_END hub crash).
+    termRetryReset, terminalFail,
     serializeAgentsForSave,
     flushStateNow, // graceful-shutdown synchronous state flush (XERK-552)
     // XERK-757 — the externalized-store wiring. The full cross-replica behaviour

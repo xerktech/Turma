@@ -183,7 +183,7 @@ const {
   wsAccept, wsEncode, wsParser, WS_FRAME_MAX, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
-  termRetryReset,
+  termRetryReset, terminalFail,
   serializeAgentsForSave,
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, REFUSED_DETAIL_MAX,
   userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
@@ -17108,6 +17108,48 @@ test("term: a reset on a REUSED pooled ttyd channel is replayed once (termRetryR
     "a POST body has already been consumed — never blind-replay a mutation");
   assert.equal(termRetryReset(0, true, false, "GET", { code: "ETIMEDOUT", message: "timeout" }), false,
     "only a connection reset is the idle-closed-keep-alive signal");
+});
+
+test("term: terminalFail settles the proxy response exactly once (no double-end crash)", () => {
+  // Terminal Connection Resilience: proxyTerm has several error edges — an upstream
+  // stream error AND the ClientRequest error can both fire on one mid-body reset —
+  // and a second res.end() throws ERR_STREAM_WRITE_AFTER_END out of an error
+  // handler, which exits the hub under `restart: unless-stopped`. terminalFail is
+  // the one idempotent settle they all route through. A fake response records what
+  // it was asked to do so the three branches are pinned deterministically.
+  const fakeRes = () => ({
+    headersSent: false, writableEnded: false, head: null, ended: undefined, endCount: 0,
+    writeHead(code, h) { this.headersSent = true; this.head = [code, h]; },
+    end(body) { this.endCount += 1; this.writableEnded = true; this.ended = body; },
+  });
+
+  // Before headers: a 502 with the reason, ended once.
+  const a = fakeRes();
+  terminalFail(a, "terminal error: boom");
+  assert.deepEqual(a.head, [502, { "Content-Type": "text/plain" }]);
+  assert.equal(a.ended, "terminal error: boom");
+  assert.equal(a.endCount, 1);
+
+  // A second call is a NO-OP — this is the double-end crash guard.
+  terminalFail(a, "again");
+  assert.equal(a.endCount, 1, "a settled response must never be re-ended");
+  assert.equal(a.ended, "terminal error: boom", "the second reason must not overwrite the first");
+
+  // Mid-stream (headers already sent for a piped asset): truncate, no 502, no body,
+  // and never a writeHead-after-headers throw.
+  const b = fakeRes();
+  b.headersSent = true;
+  terminalFail(b, "terminal error: mid");
+  assert.equal(b.head, null, "must not writeHead once headers are already sent");
+  assert.equal(b.endCount, 1);
+  assert.equal(b.ended, undefined, "a mid-stream failure truncates, it does not append the reason");
+
+  // Already ended (e.g. the success path completed): a stray late error is inert.
+  const c = fakeRes();
+  c.writableEnded = true;
+  terminalFail(c, "late");
+  assert.equal(c.endCount, 0);
+  assert.equal(c.head, null);
 });
 
 
