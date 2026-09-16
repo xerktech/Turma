@@ -9731,8 +9731,8 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
             f"TURMA_QUESTIONS_DIR={shlex.quote(ha.QUESTIONS_DIR)} "
             f"claude --session-id {sess['claudeSessionId']} "
-            f"--remote-control '{sess['rcName']}' "
-            f"--name {sess['rcName']} "
+            f"--remote-control {shlex.quote(sess['rcName'])} "
+            f"--name {shlex.quote(sess['rcName'])} "
             f"--permission-mode auto --settings {shlex.quote(settings)} "
             f"--append-system-prompt "
             f"{shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + peers)}",
@@ -18780,6 +18780,134 @@ class TestSetSummary(ManagerMixin, unittest.TestCase):
 
         self.assertEqual(resumed_agent_type(False), "claude")  # kill switch / no dsh
         self.assertEqual(resumed_agent_type(True), "dsh")      # dsh offered -> preserved
+
+
+class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
+    """XERK-815: a running Claude session's Remote-Control + peer name is brought
+    up to its display summary on the first idle beat via `/rename`, with rcName
+    kept in step so peers.tsv keeps resolving the live name."""
+
+    def make_manager(self, busy=False, dialog=False, cap="idle pane"):
+        sm = super().make_manager()
+        sm.save = mock.Mock()
+        self.keys = []
+
+        def fake_send(tmux, *tokens, literal=False):
+            self.keys.append((tmux, tuple(tokens), literal))
+
+        for name, value in [
+                ("_capture_pane", lambda t: cap),
+                ("_busy_from_capture", lambda c: busy),
+                ("parse_pane_prompt", lambda c: {"prompt": "?"} if dialog else None),
+                ("_pane_send_keys", fake_send)]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        return sm
+
+    def _sess(self, **kw):
+        s = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+             "rcName": "h-r-s1", "summary": "Fix the retry loop"}
+        s.update(kw)
+        return s
+
+    def test_renames_to_the_summary_and_syncs_rcname(self):
+        sm = self.make_manager()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        # /rename typed as literal keystrokes, then Enter to execute it.
+        self.assertEqual(
+            self.keys,
+            [("agent-s1", ("/rename Fix the retry loop",), True),
+             ("agent-s1", ("Enter",), False)])
+        # rcName follows the live name (peers.tsv publishes it); the marker records
+        # the summary it came from.
+        self.assertEqual(sess["rcName"], "Fix the retry loop")
+        self.assertEqual(sess["rcRenamedFor"], "Fix the retry loop")
+        sm.save.assert_called_once()
+
+    def test_second_beat_is_a_no_op(self):
+        sm = self.make_manager()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self.keys.clear()
+        sm._reconcile_rc_names()          # summary == rcRenamedFor now
+        self.assertEqual(self.keys, [])
+
+    def test_a_changed_summary_renames_again(self):
+        # Covers both a fresh auto-summary and a manual rename: either just moves
+        # sess['summary'], and the reconciler chases it.
+        sm = self.make_manager()
+        sess = self._sess(rcName="Old Name", rcRenamedFor="Old Name",
+                          summary="New Name")
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self.assertEqual(sess["rcName"], "New Name")
+        self.assertIn(("agent-s1", ("/rename New Name",), True), self.keys)
+
+    def test_reidempotent_when_the_name_already_matches(self):
+        # After a restart drops rcRenamedFor, the reconciler retypes the SAME name
+        # (harmless) and must NOT suffix -2 against the session's OWN current name.
+        sm = self.make_manager()
+        sess = self._sess(rcName="Fix the retry loop")   # no rcRenamedFor
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self.assertEqual(sess["rcName"], "Fix the retry loop")
+        self.assertIn(("agent-s1", ("/rename Fix the retry loop",), True), self.keys)
+
+    def test_busy_pane_defers(self):
+        sm = self.make_manager(busy=True)
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+        self.assertNotIn("rcRenamedFor", sess)     # untouched -> retried when idle
+
+    def test_dialog_on_pane_defers(self):
+        sm = self.make_manager(dialog=True)
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+        self.assertNotIn("rcRenamedFor", sess)
+
+    def test_dead_pane_does_not_mark(self):
+        sm = self.make_manager(cap="")
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+        self.assertNotIn("rcRenamedFor", sess)     # so a resumed pane renames later
+        self.assertEqual(sess["rcName"], "h-r-s1")
+
+    def test_dsh_and_qwen_are_skipped(self):
+        # /rename is a Claude Code command; dsh has no pane, qwen's TUI has none.
+        sm = self.make_manager()
+        sm.registry = [self._sess(id="d", tmuxName="agent-d", agentType="dsh"),
+                       self._sess(id="q", tmuxName="agent-q", agentType="qwen")]
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+
+    def test_unnamed_and_stopped_sessions_are_skipped(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess(id="u", summary=None),
+                       self._sess(id="p", status="stopped")]
+        sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
+
+    def test_collision_with_another_live_name_is_deduped(self):
+        sm = self.make_manager()
+        other = self._sess(id="s2", tmuxName="agent-s2",
+                           rcName="Fix the retry loop", summary="Something else",
+                           rcRenamedFor="Something else")   # a no-op itself
+        sess = self._sess()          # its summary == other's live rcName
+        sm.registry = [other, sess]
+        sm._reconcile_rc_names()
+        self.assertEqual(sess["rcName"], "Fix the retry loop-2")
+        self.assertIn(("agent-s1", ("/rename Fix the retry loop-2",), True),
+                      self.keys)
 
 
 class TestSessionSummaries(ManagerMixin, unittest.TestCase):

@@ -16493,7 +16493,7 @@ class SessionManager:
             p += 1
         return p
 
-    def _unique_rc_name(self, base):
+    def _unique_rc_name(self, base, exclude_id=None):
         """`base`, or the first `-N` variant no LIVE session on this host holds.
 
         Two sessions answering to one name are BOTH unaddressable, not merely
@@ -16509,9 +16509,13 @@ class SessionManager:
         dedupe is what keeps the name an ADDRESS instead of a label.
 
         Only LIVE sessions reserve a name: a stopped one holds no inbox socket,
-        so reusing its name is exactly the recycling we want."""
+        so reusing its name is exactly the recycling we want. `exclude_id` drops
+        one session from the reservation set — used when RE-naming a live session
+        to its summary (XERK-815), so its OWN current name never forces a `-N` on
+        itself."""
         taken = {s.get("rcName") for s in self.registry
-                 if s.get("status") in ("running", "queued")}
+                 if s.get("status") in ("running", "queued")
+                 and s.get("id") != exclude_id}
         if base not in taken:
             return base
         n = 2
@@ -18172,7 +18176,7 @@ class SessionManager:
         # cleared session's new transcript too — both worked the ticket, and the
         # board should chip both. No-op unless this session has a ticket.
         self._remember_ticket(sess)
-        parts.append(f"--remote-control '{sess['rcName']}'")
+        parts.append(f"--remote-control {shlex.quote(sess['rcName'])}")
         # The session's PEER name (XERK-339) — what `ListAgents` shows a sibling
         # session and what `SendMessage` addresses. Deliberately the SAME string
         # as the RC name: a session is then addressed identically whether a peer
@@ -21360,6 +21364,79 @@ class SessionManager:
             except Exception as e:
                 log(f"deferred model switch for {sess['id']} failed: {e}")
                 self.save()
+
+    def _reconcile_rc_names(self):
+        """Keep a running Claude session's Remote-Control + peer name in step
+        with its display name (XERK-815).
+
+        A session launches under rcName `<host>-<repo>-<key|id>`, passed to BOTH
+        `--remote-control` (its claude.ai/code + mobile display name) and
+        `--name` (the peer address SendMessage/ListAgents resolve, published to
+        peers.tsv — XERK-339/348). After the first prompt the card gets a
+        generated summary, and a manual rename can replace it, but neither
+        touches the LIVE name — so the mobile app and the roster keep showing the
+        launch slug long after the card reads something better.
+
+        Claude Code's `/rename <name>` fixes that: it rewrites the session's own
+        registry `name` (verified on 2.1.273 — the field SendMessage keys on) and
+        syncs it to Remote Control (>= 2.1.221). Because it moves the PEER address
+        too, rcName is updated to the SAME value on success, so
+        `_write_peers_file` re-publishes the name the live registry now answers to
+        and the roster stays in step — a stale peers.tsv would leave the session
+        unreachable by its listed name. The name is deduped against the other live
+        sessions exactly as at spawn (excluding this one), so two sessions
+        summarised alike stay individually addressable.
+
+        `rcRenamedFor` records the summary the current name was derived from, so a
+        `/rename` is typed only when the summary actually CHANGES, never every
+        beat. Claude only: dsh is headless (no pane, no slash commands) and qwen
+        is a different TUI with no `/rename`. Runs on the beat, so it must never
+        raise (the caller guards it) and only ever drives an IDLE pane with no
+        dialog up — a `/rename` typed mid-turn or into a prompt would land as
+        input instead of running."""
+        for sess in list(self.registry):
+            if sess.get("status") != "running":
+                continue
+            # /rename is a Claude Code command: dsh has no pane, qwen's TUI has no
+            # such command. Everything else is a Claude session.
+            if sess.get("agentType") in ("dsh", "qwen"):
+                continue
+            summary = (sess.get("summary") or "").strip()
+            # Nothing to sync to (unnamed yet, or a blank manual rename), or the
+            # live name already reflects this summary.
+            if not summary or summary == sess.get("rcRenamedFor"):
+                continue
+            tmux = sess.get("tmuxName")
+            if not tmux:
+                continue
+            cap = _capture_pane(tmux)
+            # Empty/unreadable capture: pane not up yet or gone. Skip WITHOUT
+            # marking, so a session gets its rename once its pane is back (resume,
+            # a slow first paint) rather than being recorded as done.
+            if not cap:
+                continue
+            # Mid-turn: defer to the first idle beat, like a deferred model switch
+            # (None from a markers-disabled host falls through, same as there).
+            if _busy_from_capture(cap):
+                continue
+            # A blocking dialog (permission prompt / question) owns the input
+            # line; keystrokes would answer it, not run the command.
+            if parse_pane_prompt(cap):
+                continue
+            name = self._unique_rc_name(summary, exclude_id=sess.get("id"))
+            # Keystrokes + Enter, the form proven to EXECUTE the command (a
+            # bracketed paste can read as literal composer text). `_pane_send_keys`
+            # is the one choke point that drives tmux on Linux and the pty-host on
+            # Windows.
+            _pane_send_keys(tmux, f"/rename {name}", literal=True)
+            _pane_send_keys(tmux, "Enter")
+            # rcName is what peers.tsv publishes and what a resume/restart relaunches
+            # --name/--remote-control with, so it must track the value we just typed
+            # or the roster and the next launch would disagree with the live name.
+            sess["rcName"] = name
+            sess["rcRenamedFor"] = summary
+            self.save()
+            log(f"renamed session {sess['id']} RC/peer name -> {name!r}")
 
     def set_mode(self, sid, mode):
         """Switch a running session's permission mode live as a CLOSED LOOP:
@@ -28059,6 +28136,12 @@ class SessionManager:
                 self._apply_pending_switches()
             except Exception as e:
                 log(f"pending switch drain failed: {e}")
+            # Bring each Claude session's Remote-Control + peer name up to its
+            # display summary (XERK-815), on the first idle beat after it changes.
+            try:
+                self._reconcile_rc_names()
+            except Exception as e:
+                log(f"rc-name reconcile failed: {e}")
 
         payload = {
             # `device` (the physical host name) is the hub's identity key; agentId

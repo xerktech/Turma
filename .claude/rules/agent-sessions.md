@@ -174,6 +174,17 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   **`_unique_rc_name` suffixes `-N` on collision** — two sessions sharing a name are BOTH
   unaddressable, and Claude Code does NOT rename the later one (measured). Only running/queued
   sessions reserve a name.
+- **rcName is NOT immutable after spawn for a running CLAUDE session** (XERK-815). `_reconcile_rc_names`
+  (each non-light beat, guarded) types Claude Code's `/rename <summary>` into an IDLE pane when the
+  card's `summary` changes (auto or manual), so the Remote-Control display name (claude.ai/code +
+  mobile) follows the card instead of staying the launch slug. `/rename` ALSO rewrites the session's
+  registry `name` — the peer address `SendMessage`/`ListAgents` resolve (verified on 2.1.273) — so
+  rcName is updated to the SAME value, keeping `peers.tsv` in step (a stale roster would leave the
+  session unreachable by its listed name). The new name is deduped via `_unique_rc_name(…,
+  exclude_id=sess)`, `rcRenamedFor` gates re-typing to real summary changes, and it is Claude-only
+  (dsh is headless; qwen's TUI has no `/rename`). Consequence: `--remote-control`/`--name` now carry
+  arbitrary summary text, so both `shlex.quote` at launch (an apostrophe in a name once broke the
+  single-quoted `--remote-control`). Tests: `TestReconcileRcNames`.
 - The messaging POLICY lives in `PEERS_SYSTEM_PROMPT`, weighted toward restraint: a message costs the
   receiver a turn and sits in their context every turn after, so it ranks ASK-before-rediscovery above
   WARN-about-lost-work and forbids status traffic. It also states the two rules the tool can't
