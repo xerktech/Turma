@@ -18967,15 +18967,42 @@ class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["rcName"], "New Name")
         self.assertIn(("agent-s1", ("/rename New Name",), True), self.keys)
 
-    def test_reidempotent_when_the_name_already_matches(self):
-        # After a restart drops rcRenamedFor, the reconciler retypes the SAME name
-        # (harmless) and must NOT suffix -2 against the session's OWN current name.
+    def test_no_op_when_the_live_name_already_matches(self):
+        # A rebuild path (resume/restart/migration) can drop rcRenamedFor while the
+        # session already answers to the target name. The reconciler must type
+        # NOTHING then — a `/rename` driven into a freshly-resumed pane lands in the
+        # composer beside the operator's first message and eats it (XERK-815). It
+        # records the marker so later beats stay quiet too, and never suffixes -2
+        # against the session's OWN current name.
         sm = self.make_manager()
         sess = self._sess(rcName="Fix the retry loop")   # no rcRenamedFor
         sm.registry = [sess]
         sm._reconcile_rc_names()
+        self.assertEqual(self.keys, [])
         self.assertEqual(sess["rcName"], "Fix the retry loop")
-        self.assertIn(("agent-s1", ("/rename Fix the retry loop",), True), self.keys)
+        self.assertEqual(sess["rcRenamedFor"], "Fix the retry loop")
+        sm.save.assert_called_once()
+
+    def test_remember_closed_snapshots_rcrenamedfor(self):
+        # _remember_closed is what a resume rebuilds from; without rcRenamedFor in
+        # the snapshot a resumed session re-issues a redundant `/rename` (XERK-815).
+        sm = self.make_manager()
+        live = self._sess(repo="r", rcName="Fix the retry loop",
+                          rcRenamedFor="Fix the retry loop")
+        sm._remember_closed(live)
+        self.assertEqual(sm.closed[-1].get("rcRenamedFor"), "Fix the retry loop")
+
+    def test_carried_rcrenamedfor_means_no_rename_fires(self):
+        # A resume rebuild carries summary + rcRenamedFor, so the first idle beat
+        # is a clean no-op rather than a `/rename` colliding with the operator's
+        # first prompt.
+        sm = self.make_manager()
+        rebuilt = self._sess(rcName="Fix the retry loop",
+                             rcRenamedFor="Fix the retry loop")
+        sm.registry = [rebuilt]
+        sm._reconcile_rc_names()
+        # summary == rcRenamedFor from the very first beat: no capture, no keys.
+        self.assertEqual(self.keys, [])
 
     def test_busy_pane_defers(self):
         sm = self.make_manager(busy=True)

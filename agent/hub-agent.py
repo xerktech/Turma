@@ -19559,6 +19559,11 @@ class SessionManager:
             "id", "repo", "repoPath", "worktreePath", "branch", "baseRef",
             "rcName", "tmuxName", "createdAt", "label", "summary",
             "summaryManual", "model", "permissionMode", "root", "ticket",
+            # The summary the live name was last renamed to (XERK-815). Carried so
+            # a resume does NOT re-issue a redundant `/rename` for a name the
+            # relaunched session already answers to — that keystroke would collide
+            # with the operator's first message in the composer.
+            "rcRenamedFor",
             # Which model this session was running against (XERK-246). Without
             # it a resume silently returns a failed-over session to the
             # exhausted subscription — and restores its --model alias, which the
@@ -19697,6 +19702,12 @@ class SessionManager:
             # transcript here" is not the same question as "this session's".
             "claudeSessionId": rec.get("claudeSessionId"),
             "rcName": rec.get("rcName"),
+            # The summary the live name was last renamed to (XERK-815). Carried
+            # alongside rcName/summary so the first idle beat after a resume does
+            # not re-type a redundant `/rename` (which would collide with the
+            # operator's first message in the composer) for a name the relaunched
+            # session already answers to.
+            "rcRenamedFor": rec.get("rcRenamedFor"),
             "tmuxName": rec.get("tmuxName") or f"agent-{sid}",
             "ttydPort": self._alloc_port(),  # old port may be taken by now
             "model": rec.get("model"),
@@ -21536,6 +21547,19 @@ class SessionManager:
             if parse_pane_prompt(cap):
                 continue
             name = self._unique_rc_name(summary, exclude_id=sess.get("id"))
+            # The live name already matches the target, so there is nothing to
+            # rename — a resume/restart relaunches --remote-control/--name with the
+            # stored rcName, so the running session already answers to it. Record
+            # the marker (so later beats skip too) but type NOTHING: a `/rename`
+            # driven into a freshly-resumed IDLE pane lands in the composer beside
+            # the operator's first message and turns the whole thing into one long
+            # `/rename` instead of sending it (XERK-815 resume collision). Only a
+            # genuinely-different target is worth driving the pane for.
+            if name == sess.get("rcName"):
+                if sess.get("rcRenamedFor") != summary:
+                    sess["rcRenamedFor"] = summary
+                    self.save()
+                continue
             # Keystrokes + Enter, the form proven to EXECUTE the command (a
             # bracketed paste can read as literal composer text). `_pane_send_keys`
             # is the one choke point that drives tmux on Linux and the pty-host on
