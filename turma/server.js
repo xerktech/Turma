@@ -13234,6 +13234,33 @@ const TERM_FONT_STYLE =
   "<style>@font-face{font-family:'JBMNerd';" +
   "src:url('/term-font.woff2') format('woff2');font-display:swap;}</style>";
 
+// Self-reloading interstitial served for the BASE terminal DOCUMENT (the iframe's
+// top-level /term/<id>/ GET) when ttyd can't be reached — a transient condition
+// (a control-channel flap on a hub restart, a data-channel dial-back that raced
+// the tunnel's return). Without it that failure answered the top-level document
+// with a plain-text 502, which the browser renders AS the iframe document —
+// WIPING the terminal the operator was reading and never recovering, since
+// nothing re-requests it (the sessions page only re-navigates the frame on a
+// tunnel-RETURN edge, which is exactly when the race happens). This document keeps
+// the frame alive and reloads itself every couple of seconds until ttyd answers,
+// so the view heals in place. It is a transient UI state, not a client error, so
+// it is served 200 + `no-store`: a 200 renders + runs its reload script in every
+// context (iframe, new tab, Android WebView) with no intermediary (nginx/Cloudflare)
+// swapping a 5xx body for its own error page.
+const TERM_RECONNECT_HTML =
+  "<!doctype html><html><head><meta charset='utf-8'>" +
+  "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
+  "<title>Reconnecting…</title><style>" +
+  "html,body{margin:0;height:100%;background:#000;color:#8a8f98;" +
+  "font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif}" +
+  ".wrap{height:100%;display:flex;flex-direction:column;align-items:center;" +
+  "justify-content:center;gap:14px}" +
+  ".spin{width:22px;height:22px;border:2px solid #2a2d31;border-top-color:#8a8f98;" +
+  "border-radius:50%;animation:s .8s linear infinite}@keyframes s{to{transform:rotate(360deg)}}" +
+  ".msg{opacity:.85}</style></head><body><div class='wrap'><div class='spin'></div>" +
+  "<div class='msg'>Reconnecting to the terminal…</div></div>" +
+  "<script>setTimeout(function(){location.reload()},2000)</script></body></html>";
+
 // Touch-scroll shim injected into ttyd's page for phones. Sessions run inside
 // tmux with `mouse on`, which routes the *wheel* by screen model (agent/tmux.conf):
 // forwarded to the app on the alternate screen (Claude scrolls its own history),
@@ -13993,6 +14020,26 @@ function terminalFail(res, msg) {
   res.writeHead(502, { "Content-Type": "text/plain" });
   res.end(msg);
 }
+
+// Settle the BASE terminal-document response with the self-reloading interstitial
+// (TERM_RECONNECT_HTML) instead of the plain-text 502 dead end. Used ONLY before
+// headers, and ONLY for the top-level /term/<id>/ GET, when the tunnel/channel
+// could not be opened — the transient flap/race case. A 502 here wipes the
+// terminal the operator was reading (the browser paints the error body as the
+// frame document) and never recovers; this keeps the frame alive and reloads it
+// until ttyd answers. Idempotent like terminalFail, so a stray later error on the
+// same response can't double-end it (an ERR_STREAM_WRITE_AFTER_END hub crash).
+function terminalReconnectPage(res) {
+  if (res.writableEnded) return;
+  if (res.headersSent) { res.end(); return; }
+  res.writeHead(200, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Retry-After": "2",
+    "Content-Length": Buffer.byteLength(TERM_RECONNECT_HTML),
+  });
+  res.end(TERM_RECONNECT_HTML);
+}
 async function proxyTerm(req, res, name, port) {
   const headers = { ...req.headers, host: "ttyd", authorization: ttydAuth(name) };
   // Keep-alive over the pooled channel — drop any client-sent Connection header
@@ -14002,7 +14049,20 @@ async function proxyTerm(req, res, name, port) {
   // it uncompressed (small file; avoids having to gunzip before injecting).
   delete headers["accept-encoding"];
 
-  const fail = (msg) => terminalFail(res, msg);
+  // The BASE terminal DOCUMENT (the iframe's top-level /term/<id>/ GET), as
+  // opposed to an asset request or the WS upgrade. Its path is exactly
+  // `/term/<id>/` — nothing after the trailing slash (the route inserts the slash
+  // before proxying). A failure to reach ttyd HERE is what wipes the operator's
+  // view, so it heals via the self-reloading interstitial rather than the plain
+  // 502; an asset failure keeps the plain settle (the reloaded document re-fetches
+  // every asset). Only a PRE-HEADERS failure can be swapped — a mid-stream error
+  // (headers already sent) still just truncates through terminalFail.
+  const isBaseDoc = req.method === "GET" &&
+    /^\/term\/[^/]+\/$/.test((req.url || "").split("?")[0]);
+  const fail = (msg) => {
+    if (isBaseDoc && !res.headersSent && !res.writableEnded) return terminalReconnectPage(res);
+    return terminalFail(res, msg);
+  };
 
   // The upstream (ttyd) response handler — shared by the initial attempt and the
   // reused-socket retry below.
@@ -18242,7 +18302,11 @@ if (process.env.TURMA_TEST) {
     // idle-closed keep-alive socket no longer surfaces as "socket hang up".
     // `terminalFail` is the idempotent settle that keeps a mid-stream proxy error
     // from double-ending the response (an ERR_STREAM_WRITE_AFTER_END hub crash).
-    termRetryReset, terminalFail,
+    // The base-terminal-document reconnect interstitial (Terminal Connection
+    // Resilience): a transient channel-open failure for the top-level /term/<id>/
+    // GET heals via a self-reloading page instead of a dead-end 502 that wipes the
+    // terminal the operator was reading.
+    termRetryReset, terminalFail, terminalReconnectPage,
     serializeAgentsForSave,
     flushStateNow, // graceful-shutdown synchronous state flush (XERK-552)
     // XERK-757 — the externalized-store wiring. The full cross-replica behaviour

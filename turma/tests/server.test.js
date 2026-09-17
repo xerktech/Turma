@@ -183,7 +183,7 @@ const {
   wsAccept, wsEncode, wsParser, WS_FRAME_MAX, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
-  termRetryReset, terminalFail,
+  termRetryReset, terminalFail, terminalReconnectPage,
   serializeAgentsForSave,
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, REFUSED_DETAIL_MAX,
   userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
@@ -17150,6 +17150,85 @@ test("term: terminalFail settles the proxy response exactly once (no double-end 
   terminalFail(c, "late");
   assert.equal(c.endCount, 0);
   assert.equal(c.head, null);
+});
+
+
+test("term: terminalReconnectPage serves a self-reloading interstitial, once", () => {
+  // Terminal Connection Resilience: a transient channel-open failure for the BASE
+  // terminal document (the iframe's top-level /term/<id>/ GET) must NOT answer with
+  // a plain-text 502 — the browser paints that body as the frame document, wiping
+  // the terminal the operator was reading and never recovering. terminalReconnectPage
+  // is the self-reloading heal-in-place document; it is idempotent (same double-end
+  // crash guard as terminalFail) and served 200 so the body + reload script render
+  // in every context with no intermediary swapping a 5xx body.
+  const fakeRes = () => ({
+    headersSent: false, writableEnded: false, head: null, ended: undefined, endCount: 0,
+    writeHead(code, h) { this.headersSent = true; this.head = [code, h]; },
+    end(body) { this.endCount += 1; this.writableEnded = true; this.ended = body; },
+  });
+
+  // Before headers: a 200 text/html reconnect document, no-store, ended once.
+  const a = fakeRes();
+  terminalReconnectPage(a);
+  assert.equal(a.head[0], 200, "the interstitial is a 200 so it renders + runs everywhere");
+  assert.match(a.head[1]["Content-Type"], /text\/html/);
+  assert.equal(a.head[1]["Cache-Control"], "no-store", "a reload must fetch the real terminal, never a cached interstitial");
+  assert.equal(a.endCount, 1);
+  assert.match(a.ended, /location\.reload/, "the document must reload itself until ttyd answers");
+  assert.match(a.ended, /Reconnecting to the terminal/);
+
+  // A second call is a NO-OP — the double-end crash guard.
+  terminalReconnectPage(a);
+  assert.equal(a.endCount, 1, "a settled response must never be re-ended");
+
+  // Headers already sent (a mid-stream edge routed here by mistake): end once, no
+  // writeHead-after-headers throw.
+  const b = fakeRes();
+  b.headersSent = true;
+  terminalReconnectPage(b);
+  assert.equal(b.head, null, "must not writeHead once headers are already sent");
+  assert.equal(b.endCount, 1);
+
+  // Already ended: inert.
+  const c = fakeRes();
+  c.writableEnded = true;
+  terminalReconnectPage(c);
+  assert.equal(c.endCount, 0);
+  assert.equal(c.head, null);
+});
+
+
+test("term: a base-document channel failure heals with the reconnect page; an asset stays a 502", async () => {
+  // Terminal Connection Resilience (end to end): with the session's host reporting
+  // but NO tunnel connected, openChannel rejects at once ("agent tunnel offline").
+  // The BASE document (/term/<id>/) must answer with the self-reloading interstitial
+  // — NOT the plain-text 502 that wipes the operator's view — while an ASSET request
+  // under it keeps the plain 502 (the reloaded document re-fetches assets).
+  const host = "termHealHost";
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: host,
+      sessions: [{ id: "th1", repo: "Turma", status: "running", ttydPort: 7911,
+        worktreePath: "/git/.turma/worktrees/Turma/th1", transcriptId: "t-th1" }],
+    },
+    headers: agentHeaders,
+  });
+
+  // No /agent/control connection for this host, so the tunnel is offline and the
+  // channel open fails immediately — the transient condition, deterministically.
+  const doc = await request("GET", "/term/th1/", { headers: userHeaders });
+  assert.equal(doc.status, 200, "the base document heals with a 200 interstitial, not a dead-end 502");
+  assert.match(doc.headers["content-type"], /text\/html/);
+  assert.equal(doc.headers["cache-control"], "no-store");
+  assert.match(doc.raw, /location\.reload/, "the interstitial reloads itself until ttyd answers");
+  assert.ok(!doc.raw.startsWith("terminal error"), "the raw error string must never be the document body");
+
+  // An asset under the same path is not the top-level document: it keeps the plain
+  // 502 so the reloading document (which re-requests every asset) drives recovery.
+  const asset = await request("GET", "/term/th1/app.js", { headers: userHeaders });
+  assert.equal(asset.status, 502);
+  assert.match(asset.headers["content-type"], /text\/plain/);
+  assert.match(asset.raw, /terminal error/);
 });
 
 
