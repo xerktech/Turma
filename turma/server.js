@@ -14035,7 +14035,6 @@ function terminalReconnectPage(res) {
   res.writeHead(200, {
     "Content-Type": "text/html; charset=utf-8",
     "Cache-Control": "no-store",
-    "Retry-After": "2",
     "Content-Length": Buffer.byteLength(TERM_RECONNECT_HTML),
   });
   res.end(TERM_RECONNECT_HTML);
