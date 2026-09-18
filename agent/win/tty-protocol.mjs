@@ -91,6 +91,37 @@ export function decodeClientFrame(data) {
 export const KEEPALIVE_TIMEOUT_MS = 75_000;
 export const HEADERS_TIMEOUT_MS = 80_000;
 
+// Apply them. This lives HERE, not inline in the shell, because the shell is
+// never imported by CI (node-pty is a native addon it cannot build) — so an
+// assignment written there is covered by nothing, and deleting it (i.e.
+// reinstating the exact bug this fixes) passes every gate. Takes anything with
+// the two writable fields, so a test drives it with a plain object.
+export function applyKeepAlive(servers) {
+  for (const s of servers) {
+    s.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
+    s.headersTimeout = HEADERS_TIMEOUT_MS;
+  }
+}
+
+// ---- fatal 'error' wiring, for the same reason ------------------------------
+// A bind failure is an 'error' on an EventEmitter; with no listener that is an
+// uncaught throw, and with the pty spawned first it took the process down with
+// the child already running under it. `ws` RE-EMITS its attached http server's
+// 'error' on the WebSocketServer, so BOTH must be covered or the re-emit throws
+// anyway. Pure + exported so CI can prove the wiring exists and fires once.
+export function installFatalErrorHandlers(emitters, onFatal) {
+  let fired = false;
+  const once = (which, err) => {
+    if (fired) return;
+    fired = true;
+    onFatal(which, err);
+  };
+  for (const { name, emitter } of emitters) {
+    emitter.on('error', (err) => once(name, err));
+  }
+  return () => fired;
+}
+
 // ---- the auth token in force RIGHT NOW (XERK-578 roll, no relaunch) ----------
 // A pty-host's basic-auth/control token used to be baked in at launch, exactly
 // as ttyd bakes `-c term:<token>`. On Linux that is survivable: after a hub token
@@ -108,12 +139,29 @@ export const HEADERS_TIMEOUT_MS = 80_000;
 // fallback for a missing/unreadable/empty file, so the "refuses to start
 // unauthenticated" invariant is unchanged and an older manager (no file) keeps
 // working exactly as before.
-export function pickAuthToken(fileText, baked) {
+//
+// **BOTH are in force, not just the file.** Making the file OUTRANK the baked
+// token would hand any stale or failed-to-update file the power to lock the
+// MANAGER — which authenticates with its env `TURMA_TOKEN` — out of a pty-host it
+// just spawned, recreating the very zombie this exists to prevent, and it would
+// make "a publish failure leaves the baked token in force" untrue. Accepting
+// either means a failed republish degrades exactly to the pre-change behaviour,
+// which is the whole safety argument.
+//
+// The cost is deliberate and small: a pre-roll credential keeps working against
+// an ALREADY-RUNNING pty-host until it is relaunched. That channel is loopback
+// only and the token is defence in depth behind that (the hub's own credential
+// is what actually rolled), so a stale acceptor on one local port for the life of
+// one session is a far better trade than an unreachable session or a manager
+// locked out of its own pty.
+export function authTokensInForce(fileText, baked) {
+  const out = [];
   if (typeof fileText === 'string') {
     const t = fileText.trim();
-    if (t) return t;
+    if (t) out.push(t);
   }
-  return baked;
+  if (baked && !out.includes(baked)) out.push(baked);
+  return out;
 }
 
 // ---- basic auth (ttyd `-c term:<token>`) -------------------------------------
@@ -422,8 +470,24 @@ export function serializeState(st) {
     ptyAlive: st.ptyAlive !== false,
     exitCode: st.exitCode ?? null,
     startedAt: st.startedAt,
+    // Whether this pty-host re-reads its token from a manager-owned file. The
+    // MANAGER reads it back to tell a healable pty-host from one that predates
+    // the live token and can only be torn down.
+    //
+    // **This function is a WHITELIST**: a field added to the pty-host's
+    // writeState() object but not here is silently dropped, and the manager then
+    // reads the absence as fact. That exact omission shipped once and turned the
+    // post-roll self-heal into "tear down every session". `stateKeysMatchWriter`
+    // pins the two sides together — do not add a key in one place only.
+    authTokenFile: st.authTokenFile ?? null,
   }, null, 2);
 }
+
+// The keys `serializeState` publishes, so a test can hold the writer to them.
+export const STATE_KEYS = [
+  'session', 'pid', 'ptyPid', 'base', 'termPort', 'ctrlPort', 'shell',
+  'ptyAlive', 'exitCode', 'startedAt', 'authTokenFile',
+];
 export function parseState(str) {
   const j = JSON.parse(str);
   if (!j || typeof j !== 'object') throw new Error('state is not an object');

@@ -12,7 +12,8 @@
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import { WebSocket } from 'ws';
-import { readFileSync, existsSync, unlinkSync, appendFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, unlinkSync, appendFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import process from 'node:process';
@@ -129,6 +130,12 @@ async function main() {
   if (!st) return finish();
   check('pty-host pid is alive after its spawner exited', pidAlive(st.pid));
   check('ports bind loopback only (state has no external addr)', st.termPort > 0 && st.ctrlPort > 0);
+  // serializeState is a WHITELIST: a field the pty-host writes but it does not
+  // publish is silently dropped, and the manager reads the ABSENCE as fact. That
+  // exact omission turned the post-roll self-heal into "tear down every session",
+  // so assert on the file the real pty-host just WROTE, not on what it meant to.
+  check('published state carries authTokenFile (the manager reads it back)',
+    st.authTokenFile === TOKENFILE, `authTokenFile=${JSON.stringify(st.authTokenFile)}`);
 
   // --- 1b. BIND FAILURE — no orphaned pty when a port is taken ----------------
   // The pty child used to be spawned at module top, BEFORE either server bound,
@@ -268,8 +275,17 @@ async function main() {
   out('\n[9] TOKEN ROLL — the live token file is obeyed without a relaunch');
   const rolledCred = 'Basic ' + Buffer.from(`term:${ROLLED_TOKEN}`).toString('base64');
   writeFileSync(TOKENFILE, ROLLED_TOKEN + '\n');   // trailing newline on purpose
-  const rOld = await fetch(`${b}${BASE}/token`, { headers: { Authorization: CRED }, redirect: 'manual' });
-  check('the pre-roll credential is refused', rOld.status === 401, `status=${rOld.status}`);
+  // BOTH tokens stay in force. Letting the file OUTRANK the baked token would let
+  // any stale or failed-to-update file lock the MANAGER — which authenticates
+  // with its env TURMA_TOKEN — out of a pty-host it just spawned, which is the
+  // same zombie by another door.
+  const rOld = await fetch(`${b}${BASE}/token`, { headers: { Authorization: CRED } });
+  check('the baked credential still works (the manager is never locked out)', rOld.status === 200);
+  const rJunk = await fetch(`${b}${BASE}/token`, {
+    headers: { Authorization: 'Basic ' + Buffer.from('term:not-a-token').toString('base64') },
+    redirect: 'manual',
+  });
+  check('an unrelated credential is still refused', rJunk.status === 401, `status=${rJunk.status}`);
   const rNew = await fetch(`${b}${BASE}/token`, { headers: { Authorization: rolledCred } });
   const rolledJson = rNew.ok ? await rNew.json() : {};
   check('the rolled credential is accepted', rNew.status === 200 &&
@@ -279,12 +295,36 @@ async function main() {
   const capRolled = await ctrlRolled.rpc('capture');
   check('the manager drives control on the rolled token', typeof capRolled.data === 'string');
   check('the scrollback is intact across the roll', capRolled.data.includes('DRIVE_MARK_ADOPT'));
-  // An unreadable file must fall back to the BAKED token, never to an empty one
-  // (an empty token means "no auth required" and would open the control channel).
-  unlinkSync(TOKENFILE);
-  const rFallback = await fetch(`${b}${BASE}/token`, { headers: { Authorization: CRED } });
-  check('a deleted token file falls back to the baked token, not to open access',
-    rFallback.status === 200);
+  // Hostile token files. Each must fall back to the BAKED token — never to an
+  // EMPTY one (an empty token means "no auth required" and would open the control
+  // channel that accepts inject/kill) — and none may wedge the single event loop.
+  // A planted FIFO is the sharp one: a blocking read on it would hang the
+  // terminal AND the manager's control channel forever, with the pid still alive.
+  const hostile = [
+    ['deleted', () => {}],   // the loop already removed it
+    ['a directory', () => mkdirSync(TOKENFILE)],
+    ['empty', () => writeFileSync(TOKENFILE, '')],
+    ['whitespace only', () => writeFileSync(TOKENFILE, '   \n\t ')],
+    ['far over the size cap', () => writeFileSync(TOKENFILE, 'x'.repeat(512 * 1024))],
+  ];
+  if (process.platform !== 'win32') {
+    hostile.push(['a FIFO', () => execFileSync('mkfifo', [TOKENFILE])]);
+  }
+  for (const [label, plant] of hostile) {
+    try { if (existsSync(TOKENFILE)) { try { unlinkSync(TOKENFILE); } catch { rmSync(TOKENFILE, { recursive: true, force: true }); } } } catch {}
+    plant();
+    const t0 = Date.now();
+    let baked = null; let rolled = null;
+    try {
+      baked = await fetch(`${b}${BASE}/token`, { headers: { Authorization: CRED }, signal: AbortSignal.timeout(3000) });
+      rolled = await fetch(`${b}${BASE}/token`, { headers: { Authorization: rolledCred }, redirect: 'manual', signal: AbortSignal.timeout(3000) });
+    } catch (e) { check(`token file ${label}: server still answers`, false, String(e)); continue; }
+    check(`token file ${label}: falls back to the baked token, promptly`,
+      baked.status === 200 && Date.now() - t0 < 2000, `status=${baked.status} in ${Date.now() - t0}ms`);
+    check(`token file ${label}: does NOT open access to anything else`, rolled.status === 401,
+      `status=${rolled.status}`);
+  }
+  try { unlinkSync(TOKENFILE); } catch { rmSync(TOKENFILE, { recursive: true, force: true }); }
   ctrlRolled.close();
 
   // --- 10. TEARDOWN -----------------------------------------------------------

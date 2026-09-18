@@ -125,14 +125,21 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
 
 ## Heartbeat
 
-- **A POKED beat is `light`, and a light beat does NOT advance `beat`.** A poke means "the hub has a
-  command for you, beat now", and a command arrives only on a beat's REPLY — so the operator waits
-  through `build_payload` + the RTT on every Send, Stop, model switch and `/history` fetch. The heavy
-  payload is dominated by uncached git subprocesses (2/scanned repo, 3/running session, 3 for the
-  repos-root entry); at Windows process-creation cost that is SECONDS spent re-deriving facts nobody
-  asked for, before the POST leaves. `beat` indexes the slow-cadence work a light beat skips, so a
-  light beat must not consume that index or a burst of pokes starves a cadence slot.
-  Tests: `TestPokedBeatIsLight`.
+- **A POKED beat is `light` ONLY while a FULL beat ran within the last `INTERVAL`.** A poke means "the
+  hub has a command for you, beat now", and a command arrives only on a beat's REPLY — so the operator
+  waits through `build_payload` + the RTT on every Send, Stop, model switch and `/history` fetch. The
+  heavy payload is dominated by uncached git subprocesses (2/scanned repo, 3/running session, 3 for
+  the repos-root entry); at Windows process-creation cost that is SECONDS spent re-deriving facts
+  nobody asked for, before the POST leaves.
+  - **The deadline is not optional.** `pokeHost` fires on EVERY queued command, and a browser sitting
+    on a session produces a steady stream (chat's 202-retry chain and its 6s poll fallback each queue
+    a `history`), so an unconditional `light=poked` meant NO full beat ever ran: `_drain_queue` (a
+    queued session never starts), the pending mode/model switches, jira + ticket triage, PR-comment
+    delivery, the models/limits probes and every usage/slow refresh all stopped for as long as the
+    pokes lasted.
+  - **A light beat also does not advance `beat`**, which indexes the cadence work it skipped. That
+    stops a slot being SKIPPED; only the deadline stops the cadence being STARVED — do not conflate
+    the two guards. Tests: `TestPokedBeatIsLight`.
 - **`light` means "reuse the caches" for the CHEAP git reads too**, not just the slow ones:
   `repo_cheap`/`session_cheap` hold the previous beat's branch + dirty counts. Never make a light beat
   re-derive something a scheduled beat will re-derive moments later. Tests: `TestLightBeatCost`.

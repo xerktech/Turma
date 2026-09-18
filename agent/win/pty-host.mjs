@@ -25,7 +25,7 @@
 import { WebSocketServer } from 'ws';
 import * as pty from 'node-pty';
 import { createServer } from 'node:http';
-import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, lstatSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import process from 'node:process';
@@ -53,7 +53,7 @@ const CTRL_PORT = parseInt(arg('ctrl-port', '0'), 10);   // 0 = ephemeral; publi
 const STATE = arg('state', join(HERE, `pty-host-${SESSION}.state.json`));
 const BAKED_TOKEN = arg('auth-token', '');               // the `term:<TOKEN>` basic-auth password
 // The manager-owned file holding the token CURRENTLY in force. Re-read per auth
-// check so a hub token roll needs no relaunch (see pickAuthToken's comment) —
+// check so a hub token roll needs no relaunch (see authTokensInForce's comment) —
 // which on Windows would mean killing the operator's live claude, the pty-host
 // being both the terminal and the pty. Empty/absent = the baked token, unchanged.
 const TOKEN_FILE = arg('auth-token-file', '');
@@ -90,17 +90,44 @@ if (BAKED_TOKEN === '' || BAKED_TOKEN == null) {
   process.exit(2);
 }
 
-// The token in force for THIS check. Read fresh (a ~80-byte loopback file; the
-// request rate here is a handful per terminal open plus one control op a beat),
-// so a manager that rewrites the file after a roll is obeyed immediately with no
-// relaunch and no lost session. Any read failure falls back to the baked token,
-// so a deleted/locked file degrades to the pre-XERK-578 behaviour rather than
-// locking the manager out of its own session.
-function authToken() {
-  if (!TOKEN_FILE) return BAKED_TOKEN;
-  let text = null;
-  try { text = readFileSync(TOKEN_FILE, 'utf8'); } catch { /* fall back */ }
-  return T.pickAuthToken(text, BAKED_TOKEN);
+// The tokens in force for THIS check: the manager's live file AND the baked one
+// (see authTokensInForce for why BOTH). A manager that rewrites the file after a
+// roll is obeyed immediately, with no relaunch and no lost session.
+//
+// The read is HARDENED because it runs on the pty-host's ONLY thread, on every
+// auth check, against a path another same-uid process can replace:
+//   * a non-REGULAR file is refused outright — opening a planted FIFO here blocks
+//     the event loop FOREVER, wedging the terminal AND the manager's control
+//     channel while the pid stays alive (the zombie, by another door);
+//   * a file over TOKEN_FILE_MAX is refused rather than read — a 10 MB one costs
+//     ~22ms of blocking read PER REQUEST;
+//   * the answer is cached on (mtime, size, inode, dev), so the steady state is
+//     one stat, not a read.
+// Every refusal falls back to the baked token, never to an empty one (an empty
+// token means "no auth required" to basicAuthOk and would open the control
+// channel that accepts inject/kill).
+const TOKEN_FILE_MAX = 4096;
+let tokenCache = { key: null, tokens: null };
+function authTokens() {
+  if (!TOKEN_FILE) return [BAKED_TOKEN];
+  try {
+    const st = lstatSync(TOKEN_FILE);
+    if (!st.isFile() || st.size > TOKEN_FILE_MAX) throw new Error('unusable token file');
+    const key = `${st.mtimeMs}:${st.size}:${st.ino}:${st.dev}`;
+    if (tokenCache.key === key) return tokenCache.tokens;
+    const tokens = T.authTokensInForce(readFileSync(TOKEN_FILE, 'utf8'), BAKED_TOKEN);
+    tokenCache = { key, tokens };
+    return tokens;
+  } catch { /* unreadable/unusable: the baked token alone */ }
+  tokenCache = { key: null, tokens: null };
+  return T.authTokensInForce(null, BAKED_TOKEN);
+}
+// The token a request authenticated WITH, or null. `/token` must echo THAT one:
+// the browser sends it straight back as the ws init AuthToken, so answering with
+// a different in-force token would fail the pty-host's own second check.
+function matchedToken(header) {
+  for (const t of authTokens()) if (T.basicAuthOk(header, t)) return t;
+  return null;
 }
 
 // ---- the pty (ConPTY on Windows) ---------------------------------------------
@@ -175,7 +202,8 @@ function unauthorized(res) {
 }
 const termHttp = createServer((req, res) => {
   const path = req.url.split('?')[0];
-  if (!T.basicAuthOk(req.headers.authorization, authToken())) return unauthorized(res);
+  const tok = matchedToken(req.headers.authorization);
+  if (tok === null) return unauthorized(res);
   const route = T.routeHttp(path, BASE);
   if (route.kind === 'redirect') {
     // Preserve the query byte-for-byte (ttyd does; server.js relies on it).
@@ -189,7 +217,7 @@ const termHttp = createServer((req, res) => {
     return res.end(req.method === 'HEAD' ? undefined : INDEX_HTML);
   }
   if (route.kind === 'token') {
-    const body = Buffer.from(T.tokenResponseBody(authToken()), 'utf8');
+    const body = Buffer.from(T.tokenResponseBody(tok), 'utf8');
     res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': body.length });
     return res.end(req.method === 'HEAD' ? undefined : body);
   }
@@ -202,7 +230,7 @@ const termWss = new WebSocketServer({
   path: BASE + T.WS_PATH_SUFFIX,
   // xterm.js negotiates the `tty` subprotocol; preserve it exactly.
   handleProtocols: (protocols) => (protocols.has(T.WS_SUBPROTOCOL) ? T.WS_SUBPROTOCOL : false),
-  verifyClient: (info) => T.basicAuthOk(info.req.headers.authorization, authToken()),
+  verifyClient: (info) => matchedToken(info.req.headers.authorization) !== null,
 });
 
 termWss.on('connection', (ws) => {
@@ -218,7 +246,7 @@ termWss.on('connection', (ws) => {
     switch (f.kind) {
       case 'init': {
         // ttyd's second auth check; the ws upgrade already carried basic auth.
-        if (!T.initAuthOk(f.authToken, authToken())) { ws.close(1008, 'bad token'); return; }
+        if (!authTokens().some((t) => T.initAuthOk(f.authToken, t))) { ws.close(1008, 'bad token'); return; }
         if (f.columns && f.rows) adapter.resize(f.columns, f.rows);
         if (inited) return;
         inited = true;
@@ -258,7 +286,7 @@ termWss.on('connection', (ws) => {
 const ctrlHttp = createServer((_req, res) => { res.writeHead(426); res.end('control channel is websocket-only'); });
 const ctrlWss = new WebSocketServer({
   server: ctrlHttp,
-  verifyClient: (info) => T.controlTokenOk(info.req.url, authToken()),
+  verifyClient: (info) => authTokens().some((t) => T.controlTokenOk(info.req.url, t)),
 });
 ctrlWss.on('connection', (ws) => {
   ws.on('message', (raw) => {
@@ -281,7 +309,12 @@ function writeState() {
     // refreshed and a roll leaves it unreachable — which is the one case the
     // manager has to heal destructively.
     authTokenFile: TOKEN_FILE || null,
-    shell: CMD, ptyAlive, exitCode, startedAt: START,
+    // Spelled out rather than shorthand: `serializeState` is a WHITELIST, and the
+    // CI test reads THIS literal's key names to hold the two sides together (a
+    // key added here but not there is silently dropped, and the manager reads the
+    // absence as fact — that omission shipped once and turned the post-roll
+    // self-heal into "tear down every session").
+    shell: CMD, ptyAlive: ptyAlive, exitCode: exitCode, startedAt: START,
   };
   // Atomic: write a sibling temp then rename, so a reader never sees a partial.
   const tmp = STATE + '.tmp';
@@ -300,10 +333,7 @@ process.stdout.on('error', () => {});
 // hub parks a free tunnel channel for, which guarantees the hub eventually sends
 // an asset request down a socket we already FIN'd — the browser's ECONNRESET /
 // "socket hang up" on terminal open. See KEEPALIVE_TIMEOUT_MS for the invariant.
-for (const srv of [termHttp, ctrlHttp]) {
-  srv.keepAliveTimeout = T.KEEPALIVE_TIMEOUT_MS;
-  srv.headersTimeout = T.HEADERS_TIMEOUT_MS;
-}
+T.applyKeepAlive([termHttp, ctrlHttp]);
 
 // A bind failure ('error' on a server with no listener) is an UNCAUGHT throw that
 // takes the process down — and with the old spawn-at-top order it did so with
@@ -311,27 +341,22 @@ for (const srv of [termHttp, ctrlHttp]) {
 // structured reason (the manager's only window into a launch that never
 // published), tear any pty down, and exit non-zero so the .log says why rather
 // than the manager just timing out.
-let fatal = false;
-function serverError(which, port) {
-  return (err) => {
-    if (fatal) return;
-    fatal = true;
-    try {
-      process.stderr.write(`pty-host: ${which} server failed to bind 127.0.0.1:${port}` +
-        ` (${err && err.code ? err.code : err}) — not starting the pty\n`);
-    } catch { /* stderr gone */ }
-    try { term?.kill(); } catch { /* not spawned / already dead */ }
-    process.exit(3);
-  };
-}
-termHttp.on('error', serverError('terminal', TERM_PORT));
-ctrlHttp.on('error', serverError('control', CTRL_PORT));
-// `ws` RE-EMITS its attached http server's 'error' on the WebSocketServer, so
-// handling it on the http server alone is not enough — the re-emit is itself an
-// unhandled 'error' on an EventEmitter and throws. Both, or the clean exit above
-// never runs.
-termWss.on('error', serverError('terminal ws', TERM_PORT));
-ctrlWss.on('error', serverError('control ws', CTRL_PORT));
+T.installFatalErrorHandlers([
+  { name: `terminal server (127.0.0.1:${TERM_PORT})`, emitter: termHttp },
+  { name: `control server (127.0.0.1:${CTRL_PORT})`, emitter: ctrlHttp },
+  // `ws` RE-EMITS its attached http server's 'error' on the WebSocketServer, so
+  // covering the http servers alone is not enough — the re-emit is itself an
+  // unhandled 'error' and throws before the clean exit below can run.
+  { name: `terminal ws (127.0.0.1:${TERM_PORT})`, emitter: termWss },
+  { name: `control ws (127.0.0.1:${CTRL_PORT})`, emitter: ctrlWss },
+], (which, err) => {
+  try {
+    process.stderr.write(`pty-host: ${which} failed to bind ` +
+      `(${err && err.code ? err.code : err}) — not starting the pty\n`);
+  } catch { /* stderr gone */ }
+  try { term?.kill(); } catch { /* not spawned / already dead */ }
+  process.exit(3);
+});
 
 let up = 0;
 const onListen = () => {

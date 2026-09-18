@@ -20104,10 +20104,14 @@ class TestPokedBeatIsLight(ManagerMixin, unittest.TestCase):
     class _Stop(Exception):
         pass
 
-    def _beats(self, wait_answers):
+    def _beats(self, wait_answers, tick=0.0):
+        """Drive the REAL run_forever loop. `tick` advances the fake clock by that
+        many seconds per iteration, which is what decides whether a poked beat is
+        still allowed to be light."""
         sm = self.make_manager()
         calls = []
         answers = list(wait_answers)
+        clock = [1000.0]
 
         def fake_wait(_timeout):
             if not answers:
@@ -20116,12 +20120,14 @@ class TestPokedBeatIsLight(ManagerMixin, unittest.TestCase):
 
         def fake_beat(beat, light=False):
             calls.append((beat, light))
+            clock[0] += tick
             return None
 
         with mock.patch.object(ha, "IS_WINDOWS", False), \
              mock.patch.object(ha.signal, "signal"), \
              mock.patch.object(sm, "_start_dsh_web"), \
              mock.patch.object(sm, "_beat_once", side_effect=fake_beat), \
+             mock.patch.object(ha.time, "time", side_effect=lambda: clock[0]), \
              mock.patch.object(ha._poke, "wait", side_effect=fake_wait), \
              mock.patch.object(ha._poke, "clear"):
             try:
@@ -20137,14 +20143,39 @@ class TestPokedBeatIsLight(ManagerMixin, unittest.TestCase):
 
     def test_a_light_beat_does_not_consume_its_cadence_index(self):
         """It did none of the work `beat` indexes (refresh/triage/log-tail/usage
-        slots), so advancing the counter would let a burst of pokes step over a
-        slow-cadence slot entirely and starve it."""
+        slots), so advancing the counter would let a poke step over a slow-cadence
+        slot and skip it."""
         calls = self._beats([True, True, True, False])
         # Beat 0 is heavy and advances the index; the three poked beats that
         # follow all sit on index 1 without consuming it, and the next scheduled
         # beat is the one that does index 1's cadence work.
         self.assertEqual(calls, [(0, False), (1, True), (1, True), (1, True),
                                  (1, False)])
+
+    def test_a_sustained_poke_stream_cannot_STARVE_the_full_cadence(self):
+        """The guard above stops a cadence slot being SKIPPED. It does not, on its
+        own, stop the cadence work never running at all — and a poke stream is not
+        hypothetical: `pokeHost` fires on EVERY queued command, and a browser
+        sitting on a session produces one per beat cycle (chat's 202-retry chain
+        and its 6s poll fallback each queue a `history`). With an unconditional
+        `light=poked`, NO full beat ever ran while that lasted, so `_drain_queue`
+        (a queued session never starts), the pending mode/model switches, triage,
+        PR-comment delivery, the models/limits probes and every usage/slow refresh
+        all stopped. The INTERVAL deadline keeps the full cadence at exactly the
+        rate it had before."""
+        # Every wait is a poke, and each beat costs more than a whole INTERVAL.
+        calls = self._beats([True] * 6, tick=ha.INTERVAL + 1)
+        self.assertTrue(all(not light for _beat, light in calls),
+                        f"a poke may not suppress the full cadence: {calls}")
+        # ...and the cadence index keeps advancing, so the slow-cadence work runs.
+        self.assertEqual([b for b, _l in calls], list(range(len(calls))))
+
+    def test_pokes_between_full_beats_still_get_the_light_fast_path(self):
+        # The win is kept: pokes arriving inside the deadline are light, and the
+        # first one past it pays for a full beat again.
+        calls = self._beats([True] * 4, tick=ha.INTERVAL * 0.45)
+        self.assertEqual([light for _b, light in calls],
+                         [False, True, True, False, True])
 
 
 class TestPokeHeartbeat(unittest.TestCase):
@@ -31406,6 +31437,72 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         with mock.patch.object(ha, "PTY_HOST_DIR", "/proc/nonexistent/pty-hosts"):
             self.assertIs(ha._write_pty_token_file(), False)
 
+    @unittest.skipIf(not hasattr(os, "O_NOFOLLOW"), "POSIX symlink semantics")
+    def test_a_planted_symlink_cannot_divert_the_token_write(self):
+        """The tmp path is FIXED and ~/.turma is session-writable, so a symlink
+        planted there would otherwise have this write the HOST CREDENTIAL to an
+        attacker-chosen path — and restrict_file_to_owner deliberately SKIPS a
+        symlink, so it would land at the umask's mode. O_NOFOLLOW|O_EXCL refuses
+        it instead, and the mode is set at creation rather than chmod'd after, so
+        the secret is never briefly group-readable."""
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(ha, "PTY_HOST_DIR", d), \
+                 mock.patch.object(ha, "TURMA_TOKEN", "live-token"):
+                target = os.path.join(d, "stolen")
+                os.symlink(target, ha._pty_token_file() + ".tmp")
+                # The unlink destroys the LINK (never the target) and O_EXCL then
+                # creates a fresh regular file, so the publish succeeds and the
+                # planted path is never written.
+                self.assertIs(ha._write_pty_token_file(), True)
+                self.assertFalse(os.path.exists(target), "the token was diverted")
+                st = os.lstat(ha._pty_token_file())
+                self.assertTrue(ha.stat.S_ISREG(st.st_mode))
+                self.assertEqual(st.st_mode & 0o777, 0o600,
+                                 "owner-only at CREATION, not chmod'd afterwards")
+
+    @unittest.skipIf(not hasattr(os, "O_NOFOLLOW"), "POSIX symlink semantics")
+    def test_a_symlink_racing_the_unlink_is_refused_outright(self):
+        """O_NOFOLLOW is the backstop for the window between the unlink and the
+        open: a symlink that lands in it must make the open FAIL, not write the
+        host credential to whatever it points at."""
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(ha, "PTY_HOST_DIR", d), \
+                 mock.patch.object(ha, "TURMA_TOKEN", "live-token"):
+                os.makedirs(d, exist_ok=True)
+                target = os.path.join(d, "stolen")
+                real_remove = ha.os.remove
+
+                def plant(path):
+                    real_remove(path)
+                    os.symlink(target, path)   # wins the race
+
+                with mock.patch.object(ha.os, "remove", side_effect=plant):
+                    with open(ha._pty_token_file() + ".tmp", "w") as f:
+                        f.write("x")
+                    self.assertIs(ha._write_pty_token_file(), False)
+                self.assertFalse(os.path.exists(target), "the token was diverted")
+
+    def test_a_stale_tmp_file_does_not_wedge_the_publish(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(ha, "PTY_HOST_DIR", d), \
+                 mock.patch.object(ha, "TURMA_TOKEN", "live-token"):
+                os.makedirs(d, exist_ok=True)
+                with open(ha._pty_token_file() + ".tmp", "w") as f:
+                    f.write("leftover")
+                self.assertIs(ha._write_pty_token_file(), True)
+                with open(ha._pty_token_file()) as f:
+                    self.assertEqual(f.read(), "live-token")
+
+    def test_pty_still_running_reaps_a_posix_zombie_first(self):
+        """`os.kill(pid, 0)` succeeds for an exited-but-unreaped CHILD, and the
+        POSIX spawn path drops the Popen handle — so without the reap a teardown
+        that worked perfectly polls the corpse for the whole wait and then reports
+        the reap as FAILED, keeping a state file for a process that is long gone."""
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        pid = proc.pid
+        proc.wait()                     # exited, but not yet reaped by os.waitpid
+        self.assertIs(ha._pty_still_running(pid), False)
+
     def test_pty_capture_uses_the_short_beat_timeout(self):
         """capture is the one control op on the BEAT loop, once (twice on the
         busy->idle edge) per session per beat. At the 5s teardown budget, times
@@ -31792,6 +31889,43 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
              mock.patch.object(ha, "_pty_teardown") as teardown:
             sm._launch_ttyd(sess)
         teardown.assert_called_once_with("agent-w1")
+
+    def test_spawn_publishes_the_live_token_file(self):
+        """The pty-host reads this file per auth check, so a launch that does not
+        publish it leaves the file whatever a PREVIOUS token wrote — and the whole
+        roll story depends on the manager being its only, current, writer."""
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "worktreePath": self.tmp}
+
+        def fake_task(tmux_name, cmd, cwd, env, log_path):
+            self._write_state("agent-w1", pid=1234, ctrlPort=55000, termPort=7742)
+
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "TURMA_TOKEN", "tok-at-spawn"), \
+             mock.patch.object(ha, "_pty_teardown", return_value=True), \
+             mock.patch.object(ha, "_pty_task_cleanup"), \
+             mock.patch.object(ha, "_launch_pty_via_task", side_effect=fake_task):
+            ha._pty_spawn_and_wait("agent-w1", ["node"], self.tmp, {}, None)
+        with open(ha._pty_token_file()) as f:
+            self.assertEqual(f.read(), "tok-at-spawn")
+
+    def test_a_failed_republish_is_not_stamped_as_a_completed_roll(self):
+        """The fingerprint is the guard that short-circuits the whole heal, so
+        recording it after a write that failed would mark the roll done and never
+        retry it — while the pty-host went on accepting only its baked token."""
+        sm = self.make_manager()
+        self._write_state("agent-w1", pid=os.getpid(), ctrlPort=40000,
+                          termPort=7742, authTokenFile=ha._pty_token_file())
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "ttydTokenFp": ha._token_fp("the-old-token")}
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "TURMA_TOKEN", "the-new-token"), \
+             mock.patch.object(ha, "_write_pty_token_file", return_value=False), \
+             mock.patch.object(ha, "_pty_teardown") as teardown:
+            sm._launch_ttyd(sess)
+        teardown.assert_not_called()          # still not worth killing the session
+        self.assertEqual(sess["ttydTokenFp"], ha._token_fp("the-old-token"),
+                         "a failed publish must stay retryable")
 
     def test_no_live_pty_host_means_nothing_to_heal(self):
         sm = self.make_manager()

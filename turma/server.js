@@ -14045,8 +14045,19 @@ function dropTermAgents(name) {
 // attempt (`attempt === 0`) is retried, and only before any bytes have gone to the
 // client (`!headersSent`); a non-reused socket's reset, a POST, or a mid-response
 // error is a real failure the caller surfaces.
+//
+// **The budget is the POOL SIZE, not one.** Each reset evicts exactly ONE dead
+// socket, and `maxFreeSockets` is 4 — so a single replay still surfaced a 502
+// whenever two pooled channels had gone stale together, which is the common case
+// (they were parked at the same time and the origin ages them together). Retrying
+// up to the pool size guarantees the Agent eventually has to dial a fresh channel.
+// This is the ONLY mitigation the LINUX fleet has: a real ttyd 1.7.4 was measured
+// closing an idle keep-alive connection after 5.0s and `_launch_ttyd` passes no
+// flag to change that, so no idle window the hub could choose sits below it
+// without churning a tunnel dial-back every few seconds.
+const TERM_RETRY_MAX = 4;   // = maxFreeSockets in termAgentFor
 function termRetryReset(attempt, reusedSocket, headersSent, method, err) {
-  return attempt === 0 && !!reusedSocket && !headersSent &&
+  return attempt < TERM_RETRY_MAX && !!reusedSocket && !headersSent &&
     (method === "GET" || method === "HEAD") &&
     (err.code === "ECONNRESET" || err.message === "socket hang up");
 }
@@ -14171,7 +14182,7 @@ async function proxyTerm(req, res, name, port) {
     );
     currentUp = up;
     up.on("error", (e) => {
-      if (termRetryReset(attempt, up.reusedSocket, res.headersSent, req.method, e)) return send(1);
+      if (termRetryReset(attempt, up.reusedSocket, res.headersSent, req.method, e)) return send(attempt + 1);
       fail(`terminal error: ${e.message}`);
     });
     // Only the first attempt forwards the client body; the retry is gated to

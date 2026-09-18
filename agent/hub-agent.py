@@ -9827,16 +9827,37 @@ def _write_pty_token_file(token=None):
     the file always equals this process's TURMA_TOKEN. That is why _pty_control
     can keep authenticating with the env value. Atomic temp+rename so a pty-host
     mid-read never sees a partial token, and owner-only like every other
-    credential file. Best-effort: a failure logs and leaves the baked-in token in
-    force (the pre-change behaviour), it never raises on the beat."""
+    credential file.
+
+    Best-effort — it never raises on the beat — and a failure genuinely leaves the
+    BAKED token in force, because the pty-host accepts either that or the file
+    (`authTokensInForce`). Callers must still honour the False: stamping a failed
+    republish as a completed roll would record a fingerprint that stops it ever
+    being retried."""
     value = TURMA_TOKEN if token is None else token
     path = _pty_token_file()
+    tmp = path + ".tmp"
     try:
         os.makedirs(PTY_HOST_DIR, exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(value or "changeme")
-        restrict_file_to_owner(tmp)
+        # O_EXCL|O_NOFOLLOW + mode at CREATION, not a chmod afterwards. The tmp
+        # path is fixed and ~/.turma is session-writable, so a planted SYMLINK
+        # there would otherwise have this write the HOST CREDENTIAL to an
+        # attacker-chosen path — and `restrict_file_to_owner` deliberately skips a
+        # symlink, so it would land world-readable. O_EXCL also means a stale tmp
+        # is cleared rather than reused, and creating at 0600 closes the window in
+        # which the secret existed at the umask's mode.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+        fd = os.open(tmp, flags, 0o600)
+        try:
+            os.write(fd, (value or "changeme").encode("utf-8"))
+        finally:
+            os.close(fd)
+        restrict_file_to_owner(tmp)   # the Windows ACL half (no-op-ish on POSIX)
         os.replace(tmp, path)
         return True
     except OSError as e:
@@ -10169,6 +10190,23 @@ def _pty_alive(tmux_name):
         return False
 
 
+def _pty_still_running(pid):
+    """`_pid_alive` with a POSIX zombie reaped first.
+
+    `os.kill(pid, 0)` succeeds for an exited-but-unreaped CHILD, and the POSIX arm
+    of `_pty_spawn_and_wait` Popens the pty-host and drops the handle — so without
+    this, a teardown that worked perfectly polls the corpse for the whole
+    PTY_TEARDOWN_WAIT_SEC and then reports the reap as FAILED, keeping a state file
+    for a process that is long gone. Reaping is a no-op for anything that is not
+    our child (the Windows production path, where the task engine is the parent),
+    which is why it can be unconditional."""
+    try:
+        os.waitpid(int(pid), os.WNOHANG)
+    except (OSError, AttributeError, TypeError, ValueError):
+        pass          # not our child / no waitpid (Windows) — nothing to reap
+    return _pid_alive(pid)
+
+
 def _pty_teardown(tmux_name):
     """kill-session analog: tell the pty-host to kill its pty and exit, back it up
     with a signal to its pid, and drop the state file so a dead session is never
@@ -10205,9 +10243,9 @@ def _pty_teardown(tmux_name):
             # pty down first. Either way the exit is what licenses dropping the
             # state file below.
             deadline = time.time() + PTY_TEARDOWN_WAIT_SEC
-            while _pid_alive(pid) and time.time() < deadline:
+            while _pty_still_running(pid) and time.time() < deadline:
                 time.sleep(0.05)
-            if _pid_alive(pid):
+            if _pty_still_running(pid):
                 log(f"pty-host {tmux_name}: still alive (pid {pid}) after kill + "
                     "SIGTERM; KEEPING its state file so the reap can be retried "
                     "(dropping it would orphan the process and its terminal port)")
@@ -18766,10 +18804,17 @@ class SessionManager:
             return                       # nothing serving; the next launch bakes
                                          # in the current token anyway
         if st.get("authTokenFile"):
-            _write_pty_token_file()      # it re-reads this per auth check
-            sess["ttydTokenFp"] = fp
-            log(f"pty-host for {sess['id']}: agent token changed (post-roll); "
-                "republished the token file — no relaunch, session preserved")
+            # Stamp the fingerprint ONLY on a successful publish: it is the guard
+            # that short-circuits this whole function, so recording it after a
+            # failed write would mark the roll done and never retry it.
+            if _write_pty_token_file():  # it re-reads this per auth check
+                sess["ttydTokenFp"] = fp
+                log(f"pty-host for {sess['id']}: agent token changed (post-roll); "
+                    "republished the token file — no relaunch, session preserved")
+            else:
+                log(f"pty-host for {sess['id']}: could not republish the token "
+                    "file; the pty-host still accepts the token it was launched "
+                    "with, and this will be retried on the next launch path")
             return
         log(f"pty-host for {sess['id']}: agent token changed under a surviving "
             "pty-host that predates the live-token file, so its baked-in token "
@@ -29307,6 +29352,9 @@ class SessionManager:
         # Whether the wait below was cut short by a poke — "the hub has a command
         # for you, beat NOW".
         poked = False
+        # When the last FULL payload went out. A poked beat may only be light while
+        # a full one ran within INTERVAL (see below).
+        last_full = 0.0
         while True:
             # Clear before the beat so a poke that lands *during* it (a command
             # queued while we're mid-cycle) still shortens the next wait rather
@@ -29322,14 +29370,29 @@ class SessionManager:
             # every Send, Stop, model switch and /history fetch. `light` is
             # already the established "reflect the result fast, reuse the caches"
             # payload — the post-command follow-up beat has used it for ages —
-            # so a poked beat uses it too, and the scheduled beat that follows
-            # (the wait below times out normally) carries the full facts.
-            reply = self._beat_once(beat, light=poked)
+            # so a poked beat uses it too.
+            #
+            # **But only while a FULL beat ran within the last INTERVAL.** A poke
+            # fires on EVERY queued command (`pokeHost` in server.js), and a
+            # browser sitting on a session produces a steady stream of them —
+            # chat's 202-retry chain and its 6s poll fallback each queue a
+            # `history` command. With an unconditional `light=poked` that stream
+            # meant NO full beat ever ran, so every `if not light:` block in
+            # build_payload stopped: `_drain_queue` (a queued session never
+            # starts), the pending mode/model switches, jira + ticket triage, PR
+            # comment delivery, the models/limits probes, the usage refreshes and
+            # every staged slow refresh. The deadline keeps the FULL cadence
+            # exactly as often as it ran before and spends the pokes on the gaps
+            # between — which is all the latency win ever needed.
+            now = time.time()
+            light = poked and (now - last_full) < INTERVAL
+            reply = self._beat_once(beat, light=light)
             # A light beat did NOT do the cadence work `beat` indexes
             # (refresh/triage/log-tail/usage slots), so it must not consume that
-            # index — otherwise a burst of pokes could step over a slow-cadence
-            # slot entirely and starve it.
-            if not poked:
+            # index either — otherwise a poke could step over a slow-cadence slot
+            # and skip it.
+            if not light:
+                last_full = now
                 beat += 1
             # If a prior beat armed a restart but couldn't confirm its ack
             # reached the hub, this successful beat just carried the ack

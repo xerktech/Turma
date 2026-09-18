@@ -35,7 +35,12 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
   - A pty-host whose state carries no `authTokenFile` predates this and can NEVER match again — the
     terminal 401s, the ws upgrade is refused, AND `capture`/`inject`/`kill` all fail while its pid
     stays alive and the session reports `running` forever. That zombie is strictly worse than a
-    stopped session, so it is torn down and Restart rebuilds it.
+    stopped session, so it is torn down and Restart rebuilds it. **That branch is destructive, so
+    what it keys on had better be real**: the field is dropped unless `serializeState` publishes it
+    too (see `windows-terminal.md`), and a manager-side test that hand-writes it into a fake state
+    file proves nothing.
+  - **Honour `_write_pty_token_file`'s return.** `ttydTokenFp` is the guard that short-circuits the
+    whole heal, so stamping it after a write that FAILED marks the roll done and never retries it.
 - **`_pty_teardown` removes the state file ONLY once the pid is confirmed gone** (it returns False
   otherwise). The state file is the only handle to a pty-host — there is deliberately no in-memory
   registry — so dropping it after a kill that did not take loses the process permanently: `_pty_alive`

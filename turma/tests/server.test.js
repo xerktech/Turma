@@ -17216,8 +17216,15 @@ test("term: a reset on a REUSED pooled ttyd channel is replayed once (termRetryR
   assert.equal(termRetryReset(0, true, false, "GET", hangup), true,
     "a bare 'socket hang up' with no code still retries");
 
+  // The budget is the free-socket POOL SIZE, not one: each reset evicts exactly
+  // ONE dead socket, and the pool parks four that the origin ages out together,
+  // so a single replay still 502'd on the common "two stale channels" case.
+  assert.equal(termRetryReset(1, true, false, "GET", reset), true);
+  assert.equal(termRetryReset(3, true, false, "GET", reset), true);
+
   // The cases that must NOT retry (each is a real failure or an unsafe replay):
-  assert.equal(termRetryReset(1, true, false, "GET", reset), false, "only the first attempt retries");
+  assert.equal(termRetryReset(4, true, false, "GET", reset), false,
+    "bounded: past the pool size a fresh dial has certainly been made, so it is a real failure");
   assert.equal(termRetryReset(0, false, false, "GET", reset), false,
     "a FRESH-socket reset is a real dial failure, not the keep-alive race");
   assert.equal(termRetryReset(0, true, true, "GET", reset), false,
@@ -17235,12 +17242,12 @@ test("term: the pooled-channel idle window stays BELOW the origin's keep-alive",
   // hold that connection. If the origin closes first, the Agent still believes
   // the socket is reusable and sends the request down a channel already FIN'd —
   // ECONNRESET / "socket hang up" before the request ever reaches the terminal.
-  // termRetryReset replays exactly ONE such request, and the pool holds four, so
-  // two consecutive stale sockets still surfaced as a 502 (the "refresh the
-  // terminal a few times" symptom). The hub was at 60s against a pty-host running
-  // Node's 5_000ms default, so EVERY terminal open whose assets were more than
-  // ~5s apart raced it. Read the pty-host's number out of the agent source rather
-  // than restating it here — it is a cross-component contract.
+  // The hub was at 60s against a pty-host running Node's 5_000ms default, so
+  // EVERY terminal open whose assets were more than ~5s apart raced it. Read the
+  // pty-host's number out of the agent source rather than restating it here — it
+  // is a cross-component contract. (On LINUX the origin is ttyd, measured closing
+  // an idle keep-alive after 5.0s with no flag to change it, so there the bounded
+  // replay above is the mitigation, not this window.)
   const proto = path.join(__dirname, "..", "..", "agent", "win", "tty-protocol.mjs");
   if (!fs.existsSync(proto)) return;   // agent not checked out beside the hub
   const m = /KEEPALIVE_TIMEOUT_MS\s*=\s*([0-9_]+)/.exec(fs.readFileSync(proto, "utf8"));
