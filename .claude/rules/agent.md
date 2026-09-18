@@ -211,6 +211,12 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     screen NOW. Both `liveState`s check the prompt ahead of the busy read. Tests:
     `TestParsePanePrompt`, `TestAnswerPanePrompt`, `pane-prompt` in `server.test.js`,
     `panePromptHtml` in `chat.test.js`.
+  - **It is NOT the only blocking dialog.** Claude Code's trust-folder modal has no numbered options,
+    no interrupt hint and no mode footer, so `parse_pane_prompt`, `_busy_from_capture` and
+    `parse_pane_mode` ALL read it as an idle composer — and its default is "No, exit", so one Enter
+    ended the session (XERK-868). **`_pane_blocking_dialog` is the predicate a typing guard uses**
+    (`parse_pane_prompt` OR `_trust_dialog_up`); `parse_pane_prompt`'s four conditions are unchanged
+    and the modal deliberately never becomes a `panePrompt`. Full rule: `agent-sessions.md`.
 
 ## PR status, comment delivery and conflict nudges
 

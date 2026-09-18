@@ -4310,6 +4310,12 @@ class ManagerMixin:
             # assertions (CI caught exactly that in TestSetModelMode). The tests
             # that exercise the probe re-enable it deliberately.
             ("LIMITS_PROBE_SEC", 0),
+            # No pane by default: the manager reads captures on paths the suite
+            # exercises without a tmux (send_input's trust-modal check, the beat
+            # sweeps), and the REAL _capture_pane would shell out to the dev
+            # box's tmux — nondeterministic, and it could match a session the
+            # host actually has. Tests that care patch it themselves on top.
+            ("_capture_pane", lambda tmux_name: None),
         ]:
             p = mock.patch.object(ha, name, value)
             p.start()
@@ -6811,6 +6817,124 @@ class TestAnswerTrustDialog(unittest.TestCase):
             acted, sent = self._keys(cap)
             self.assertFalse(acted)
             self.assertEqual(sent, [])
+
+    def test_navigates_the_real_linux_pane_capture(self):
+        # The SAME modal as it really renders in a Turma session's tmux pane
+        # (LINUX_TRUST_MODAL below, `tmux capture-pane -p` verbatim off Claude
+        # Code 2.1.276) — not the hand-typed Windows transcript above. Pinning
+        # both is the point: the Linux frame is the one the operator hit.
+        acted, sent = self._keys(LINUX_TRUST_MODAL)
+        self.assertTrue(acted)
+        self.assertEqual(sent, [("Down",), ("Enter",)])
+
+
+# Claude Code 2.1.276's trust-folder modal exactly as `tmux capture-pane -p`
+# renders it in a Turma session pane (the 220x50 geometry every launcher uses),
+# captured on a real Linux host against a never-before-opened directory. NOT
+# hand-cleaned: the leading blank line, the full-width rule and the trailing
+# blanks are what tmux actually returns, and the parsers under test are exactly
+# the ones a cleaned copy has hidden a bug from before (the qwen scrollbar trap,
+# `.claude/rules/qwen.md`).
+#
+# What makes it the XERK-868 bug: there are NO numbered options (the two choices
+# are bare lines an arrow moves between), no "esc to interrupt", and no mode
+# footer. So parse_pane_prompt, _busy_from_capture and parse_pane_mode all say
+# "idle composer, safe to type into" — and the first Enter anything sends
+# confirms the ❯ default, 'No, exit'.
+LINUX_TRUST_MODAL = (
+    "\n"
+    + "─" * 220 + "\n"
+    " Accessing workspace:\n"
+    "\n"
+    " /repos/.turma/worktrees/Ryujinx/abc123\n"
+    "\n"
+    " Quick safety check: Is this a project you created or one you trust? (Like "
+    "your own code, a well-known open source project, or work from your team). "
+    "If not, take a moment to review what's in this folder first.\n"
+    "\n"
+    " Claude Code'll be able to read, edit, and execute files here.\n"
+    "\n"
+    " Security guide\n"
+    "\n"
+    " ❯ No, exit\n"
+    "   Yes, I trust this folder\n"
+    "\n"
+    " Enter to confirm · Esc to cancel\n"
+    + "\n" * 33
+)
+
+# The same pane a second later, once the modal has been accepted: the composer
+# and its mode footer are back. This is what "not a dialog" looks like.
+LINUX_COMPOSER_PANE = (
+    "\n" * 6
+    + "                                                   ● high · /effort\n"
+    + "─" * 220 + "\n"
+    "❯ Try \"refactor <filepath>\"\n"
+    + "─" * 220 + "\n"
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n"
+)
+
+
+class TestTrustDialogIsABlockingDialog(unittest.TestCase):
+    """XERK-868. The operator's bug: a manual session in a repo Claude Code had
+    never been run in came up on the trust modal, and the terminal then showed
+    tmux's own `can't find session: agent-e6d49` — ttyd still serving, the tmux
+    GONE. The mechanism is that NOTHING on this agent could see that modal, so
+    `_reconcile_rc_names` typed `/rename <summary>` + Enter into it on the first
+    beat after the summary landed, and the Enter confirmed its 'No, exit'
+    default. Proven on a real host: those exact two `_pane_send_keys` calls
+    against a live Claude Code 2.1.276 trust modal ended the tmux session."""
+
+    def test_every_other_pane_read_calls_the_modal_an_idle_composer(self):
+        # This is the hole, pinned: the three reads a "safe to type here?" guard
+        # had available all say the pane is free.
+        self.assertIsNone(ha.parse_pane_prompt(LINUX_TRUST_MODAL))
+        self.assertFalse(ha._busy_from_capture(LINUX_TRUST_MODAL))
+        self.assertIsNone(ha.parse_pane_mode(LINUX_TRUST_MODAL))
+
+    def test_the_modal_is_recognised_as_a_blocking_dialog(self):
+        self.assertTrue(ha._trust_dialog_up(LINUX_TRUST_MODAL))
+        self.assertTrue(ha._pane_blocking_dialog(LINUX_TRUST_MODAL))
+
+    def test_a_live_composer_is_not_a_blocking_dialog(self):
+        self.assertFalse(ha._trust_dialog_up(LINUX_COMPOSER_PANE))
+        self.assertFalse(ha._pane_blocking_dialog(LINUX_COMPOSER_PANE))
+
+    def test_the_numbered_dialog_contract_is_untouched(self):
+        # _pane_blocking_dialog must still be TRUE for the numbered dialog
+        # parse_pane_prompt owns, and parse_pane_prompt itself must be unchanged
+        # — the trust modal deliberately does NOT become a `panePrompt`, because
+        # the chat page renders those options as clickable DIGITS and this modal
+        # has none.
+        numbered = ("Bash command\n"
+                    "  rm -rf /tmp/x\n"
+                    "─────\n"
+                    "Do you want to proceed?\n"
+                    " ❯ 1. Yes\n"
+                    "   2. No\n")
+        self.assertIsNotNone(ha.parse_pane_prompt(numbered))
+        self.assertTrue(ha._pane_blocking_dialog(numbered))
+
+    def test_prose_merely_mentioning_trust_is_not_a_modal(self):
+        # The live-session false positive that matters: a session TALKING about
+        # the modal, with its composer up, must never be Down/Entered.
+        prose = (
+            "> explain the trust this folder prompt\n"
+            "\n"
+            "  Claude Code asks 'do you trust the files in this folder?' the "
+            "first time you open a directory, and you answer yes, I trust this "
+            "folder to continue.\n"
+            "─────\n"
+            "❯ \n"
+            "─────\n"
+            "  ⏵⏵ auto mode on (shift+tab to cycle)\n")
+        self.assertFalse(ha._trust_dialog_up(prose))
+        self.assertFalse(ha._pane_blocking_dialog(prose))
+
+    def test_no_dialog_on_an_empty_or_unreadable_capture(self):
+        for cap in (None, "", "just some output\n"):
+            self.assertFalse(ha._trust_dialog_up(cap))
+            self.assertFalse(ha._pane_blocking_dialog(cap))
 
 
 class TestWindowsManagerBoot(ManagerMixin, unittest.TestCase):
@@ -10541,6 +10665,38 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         # The message still goes through regardless.
         self.assertEqual(self.run_stdin_calls[0][1], "Add a docker compose flag")
 
+    def test_the_trust_modal_is_cleared_before_the_message_is_typed(self):
+        # XERK-868: a session still on the trust modal has no composer. Typed
+        # text would be swallowed and its Enter would confirm 'No, exit',
+        # ending the session — so the modal is answered first.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sess["worktreePath"] = os.path.join(ha.REPOS_ROOT, "r", "wt")
+        keys, caps = [], [LINUX_TRUST_MODAL, LINUX_COMPOSER_PANE]
+        with mock.patch.object(ha, "_capture_pane",
+                               side_effect=lambda t: caps.pop(0) if caps else None), \
+                mock.patch.object(ha, "_pane_send_keys",
+                                  side_effect=lambda n, *k, **kw: keys.append(k)):
+            sm.send_input(sess["id"], "hello")
+        self.assertEqual(keys, [("Down",), ("Enter",)])       # modal accepted
+        self.assertEqual(self.run_stdin_calls[0][1], "hello")  # then delivered
+
+    def test_a_message_is_held_when_the_modal_cannot_be_answered(self):
+        # Out of REPOS_ROOT (or TURMA_AUTO_TRUST off): a human answers it. The
+        # message is HELD, never typed into the modal.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sess["worktreePath"] = "/somewhere/else"
+        keys = []
+        with mock.patch.object(ha, "_capture_pane",
+                               return_value=LINUX_TRUST_MODAL), \
+                mock.patch.object(ha, "_pane_send_keys",
+                                  side_effect=lambda n, *k, **kw: keys.append(k)):
+            sm.send_input(sess["id"], "hello")
+        self.assertEqual(keys, [])
+        self.assertEqual(self.run_stdin_calls, [])
+        self.assertEqual(self.run_calls, [])
+
     def test_later_prompts_do_not_resummarize(self):
         sm = self.make_manager()
         sess = self._running_session(sm)  # summaryStarted=True already
@@ -11805,10 +11961,22 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
 
     SID = "11111111-1111-4111-8111-111111111111"
 
+    # The pane states the resend gate reads, as CAPTURES — it takes one capture
+    # and reads both busy and "a dialog owns the keyboard" off it (XERK-868),
+    # rather than calling _pane_busy (which took a capture of its own).
+    BUSY_PANE = "  ⏵⏵ auto mode on · esc to interrupt\n"
+    IDLE_PANE = "❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+
     def make_manager(self):
         sm = super().make_manager()
         self.run_calls.clear()
         return sm
+
+    def _pane(self, busy):
+        """Patch the pane capture to read busy (True) / idle (False) /
+        uncapturable (None)."""
+        cap = {True: self.BUSY_PANE, False: self.IDLE_PANE, None: None}[busy]
+        return mock.patch.object(ha, "_capture_pane", return_value=cap)
 
     def _session(self, sm, pending, worktree=None):
         wt = worktree or os.path.join(self.tmp, "wt")
@@ -11832,7 +12000,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
                                        "attempts": 1}])
         self._write_transcript(wt, [
             {"type": "user", "message": {"role": "user", "content": "do it"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         self.assertNotIn("pendingInputs", sess)
         self.assertEqual(self.run_calls, [])  # no resend
@@ -11843,7 +12011,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
                                        "attempts": 1}])
         self._write_transcript(wt, [
             {"type": "queue-operation", "operation": "enqueue", "content": "later"}])
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         self.assertEqual(len(sess["pendingInputs"]), 1)
         self.assertEqual(self.run_calls, [])
@@ -11856,7 +12024,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self._write_transcript(wt, [
             {"type": "system", "subtype": "compact_boundary",
              "compactMetadata": {"trigger": "auto"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         # Re-typed the same way a first send goes in: pasted, then Enter.
         self.assertEqual(self.run_stdin_calls, [
@@ -11876,7 +12044,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self._write_transcript(wt, [
             {"type": "system", "subtype": "compact_boundary",
              "compactMetadata": {"trigger": "auto"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=True):
+        with self._pane(True):
             sm._poll_pending_inputs()
         self.assertEqual(self.run_calls, [])            # deferred
         self.assertEqual(len(sess["pendingInputs"]), 1)  # still tracked
@@ -11890,7 +12058,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self._write_transcript(wt, [
             {"type": "system", "subtype": "compact_boundary",
              "compactMetadata": {"trigger": "auto"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         self.assertEqual(self.run_calls, [])
         self.assertEqual(len(sess["pendingInputs"]), 1)
@@ -11903,7 +12071,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self._write_transcript(wt, [
             {"type": "system", "subtype": "compact_boundary",
              "compactMetadata": {"trigger": "auto"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         self.assertEqual(self.run_calls, [])       # budget spent, no resend
         self.assertNotIn("pendingInputs", sess)     # given up, reaped
@@ -11917,7 +12085,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self._write_transcript(wt, [
             {"type": "system", "subtype": "compact_boundary",
              "compactMetadata": {"trigger": "auto"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         # Exactly one message re-typed this beat (paste + Enter); the other waits.
         self.assertEqual([data for _cmd, data in self.run_stdin_calls], ["one"])
@@ -11929,7 +12097,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
             sm, [{"text": "stale", "at": time.time() - ha.PENDING_INPUT_TTL_SEC - 1,
                   "attempts": 1, "compactBase": 0}])
         self._write_transcript(wt, [])  # never landed, no compaction
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         self.assertEqual(self.run_calls, [])
         self.assertNotIn("pendingInputs", sess)
@@ -11943,14 +12111,14 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self.assertNotIn("pendingInputs", sess)
 
     def test_unknown_pane_state_does_not_resend(self):
-        # _pane_busy None (uncapturable) is not "idle" — never resend on it.
+        # An uncapturable pane is not "idle" — never resend on it.
         sm = self.make_manager()
         sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
                                        "attempts": 1, "compactBase": 0}])
         self._write_transcript(wt, [
             {"type": "system", "subtype": "compact_boundary",
              "compactMetadata": {"trigger": "auto"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=None):
+        with self._pane(None):
             sm._poll_pending_inputs()
         self.assertEqual(self.run_calls, [])
         self.assertEqual(len(sess["pendingInputs"]), 1)
@@ -13971,7 +14139,12 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
             return ""
 
         def fake_capture(tmux_name):
-            return self.pane.capture() if hasattr(self.pane, "capture") else self.pane
+            cap = self.pane.capture() if hasattr(self.pane, "capture") else self.pane
+            # `busy` has to show up in the CAPTURE, not only in the _pane_busy
+            # mock: _apply_pending_switches now takes one capture and reads busy
+            # (and "a dialog owns the keyboard") off it (XERK-868), so a mock on
+            # _pane_busy alone would no longer gate it.
+            return f"{cap}\n  esc to interrupt" if busy and cap else cap
 
         for name, value in [("run", fake_run),
                             ("_pane_busy", lambda t: busy),
@@ -14052,6 +14225,27 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         sess["pendingModel"] = "sonnet"
         sm._apply_pending_switches()
         self.assertEqual(sess["pendingModel"], "sonnet")  # still waiting
+        self.assertEqual(self.run_calls, [])
+
+    def test_apply_pending_switches_waits_out_the_trust_modal(self):
+        # XERK-868: set_model drives the pane with /model + arrows + Enter, and
+        # the trust modal shows no interrupt hint and no mode footer — so the
+        # busy gate alone let this through and its Enter confirmed 'No, exit'.
+        sm = self.make_manager(pane=LINUX_TRUST_MODAL)
+        sess = self._session(sm, model=None)
+        sess["pendingModel"] = "sonnet"
+        sm._apply_pending_switches()
+        self.assertEqual(sess["pendingModel"], "sonnet")  # deferred, not dropped
+        self.assertEqual(self.run_calls, [])
+
+    def test_apply_pending_switches_waits_out_an_uncapturable_pane(self):
+        # "Can't tell" is never "safe to type into".
+        sm = self.make_manager(pane=None)
+        sess = self._session(sm, model=None)
+        sess["pendingModel"] = "sonnet"
+        with mock.patch.object(ha, "_capture_pane", return_value=None):
+            sm._apply_pending_switches()
+        self.assertEqual(sess["pendingModel"], "sonnet")
         self.assertEqual(self.run_calls, [])
 
     def test_set_model_no_picker_escapes_and_keeps_model(self):
@@ -19104,6 +19298,283 @@ class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["rcName"], "Fix the retry loop-2")
         self.assertIn(("agent-s1", ("/rename Fix the retry loop-2",), True),
                       self.keys)
+
+
+class TestReconcileRcNamesTrustModal(ManagerMixin, unittest.TestCase):
+    """XERK-868, the operator's bug, reproduced end to end with the REAL parsers
+    (no parse_pane_prompt mock — the mock is what hid this).
+
+    A session spawned into a repo Claude Code has never run in sits on the
+    trust-folder modal. Its summary lands a few seconds later (spawn starts the
+    naming `claude -p` from the initial prompt), so on the very next beat
+    `_reconcile_rc_names` finds summary != rcRenamedFor, a pane that reads idle
+    with no dialog — and types `/rename <summary>` + Enter. The Enter confirms
+    the modal's 'No, exit' default: claude exits, its tmux dies with it, the
+    orphaned ttyd keeps serving `can't find session: agent-<id>` and the card
+    still says running."""
+
+    def _run(self, capture):
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        keys = []
+        sess = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+                "rcName": "truenas-ryujinx-s1", "summary": "Port the shader cache"}
+        sm.registry = [sess]
+        with mock.patch.object(ha, "_capture_pane", lambda t: capture), \
+                mock.patch.object(
+                    ha, "_pane_send_keys",
+                    side_effect=lambda n, *k, **kw: keys.append(k)):
+            sm._reconcile_rc_names()
+        return sess, keys
+
+    def test_nothing_is_typed_into_the_trust_modal(self):
+        sess, keys = self._run(LINUX_TRUST_MODAL)
+        # The fix: NO keystrokes at all. An Enter here ends the session.
+        self.assertEqual(keys, [])
+        # And the session is not marked renamed, so it gets its /rename once the
+        # modal is gone rather than being recorded as done.
+        self.assertNotIn("rcRenamedFor", sess)
+        self.assertEqual(sess["rcName"], "truenas-ryujinx-s1")
+
+    def test_the_same_session_renames_once_the_modal_is_gone(self):
+        sess, keys = self._run(LINUX_COMPOSER_PANE)
+        self.assertEqual(keys, [("/rename Port the shader cache",), ("Enter",)])
+        self.assertEqual(sess["rcName"], "Port the shader cache")
+
+
+class TestAnswerTrustDialogSweep(ManagerMixin, unittest.TestCase):
+    """XERK-868's answering half: the beat clears the trust modal for a
+    freshly-launched session, bounded and scoped."""
+
+    def make_manager(self, capture=None, scope_ok=True):
+        sm = super().make_manager()
+        sm.save = mock.Mock()
+        self.keys = []
+        self.captures = []
+
+        def fake_capture(tmux):
+            self.captures.append(tmux)
+            return capture
+
+        for name, value in [
+                ("_capture_pane", fake_capture),
+                ("_pane_send_keys",
+                 lambda n, *k, **kw: self.keys.append((n, k)))]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(ha.SessionManager, "_trust_scope_ok",
+                              lambda self, sess: scope_ok)
+        p.start()
+        self.addCleanup(p.stop)
+        return sm
+
+    def _sess(self, **kw):
+        s = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+             "worktreePath": "/repos/.turma/worktrees/Ryujinx/abc123",
+             "trustCheckUntil": time.time() + 60}
+        s.update(kw)
+        return s
+
+    def test_accepts_the_modal_and_disarms(self):
+        sm = self.make_manager(capture=LINUX_TRUST_MODAL)
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._answer_trust_dialogs()
+        # Down to 'Yes, I trust this folder', then Enter — never a bare Enter.
+        self.assertEqual(self.keys, [("agent-s1", ("Down",)),
+                                     ("agent-s1", ("Enter",))])
+        self.assertNotIn("trustCheckUntil", sess)
+
+    def test_an_out_of_scope_workspace_is_left_for_a_human(self):
+        sm = self.make_manager(capture=LINUX_TRUST_MODAL, scope_ok=False)
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._answer_trust_dialogs()
+        self.assertEqual(self.keys, [])
+        # Still armed: the guard half keeps anything else off the pane meanwhile.
+        self.assertIn("trustCheckUntil", sess)
+
+    def test_a_live_composer_disarms_without_touching_the_pane(self):
+        sm = self.make_manager(capture=LINUX_COMPOSER_PANE)
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._answer_trust_dialogs()
+        self.assertEqual(self.keys, [])
+        self.assertNotIn("trustCheckUntil", sess)   # claude is past the modal
+
+    def test_an_unreadable_pane_stays_armed_and_sends_nothing(self):
+        sm = self.make_manager(capture=None)
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._answer_trust_dialogs()
+        self.assertEqual(self.keys, [])
+        self.assertIn("trustCheckUntil", sess)      # not painted yet: try again
+
+    def test_an_unarmed_or_stopped_session_costs_no_capture(self):
+        # The steady state: one dict lookup per session, no subprocess at all.
+        sm = self.make_manager(capture=LINUX_TRUST_MODAL)
+        sm.registry = [self._sess(id="a", trustCheckUntil=None),
+                       self._sess(id="b", status="stopped")]
+        sm._answer_trust_dialogs()
+        self.assertEqual(self.captures, [])
+        self.assertEqual(self.keys, [])
+
+    def test_an_expired_window_disarms_and_never_answers(self):
+        # Outside the launch window nothing is auto-answered — that bound is what
+        # makes a false positive on conversation text impossible in practice.
+        sm = self.make_manager(capture=LINUX_TRUST_MODAL)
+        sess = self._sess(trustCheckUntil=time.time() - 1)
+        sm.registry = [sess]
+        sm._answer_trust_dialogs()
+        self.assertEqual(self.captures, [])
+        self.assertEqual(self.keys, [])
+        self.assertNotIn("trustCheckUntil", sess)
+
+    def test_captures_are_capped_per_beat(self):
+        # CLAUDE.md's beat-loop budget: _capture_pane is 5s-bounded, so the
+        # sweep's worst case must not scale with MAX_SESSIONS.
+        sm = self.make_manager(capture=None)
+        sm.registry = [self._sess(id=f"s{i}", tmuxName=f"agent-s{i}")
+                       for i in range(8)]
+        sm._answer_trust_dialogs()
+        self.assertEqual(len(self.captures), ha.TRUST_CHECKS_PER_BEAT)
+
+    def test_trust_scope_is_limited_to_the_repos_root(self):
+        sm = super().make_manager()
+        with mock.patch.object(ha, "AUTO_TRUST_WORKSPACE", True):
+            inside = {"worktreePath": os.path.join(ha.REPOS_ROOT, "x", "y")}
+            self.assertTrue(sm._trust_scope_ok(inside))
+            self.assertFalse(sm._trust_scope_ok({"worktreePath": "/etc"}))
+            self.assertFalse(sm._trust_scope_ok({"worktreePath": None}))
+        with mock.patch.object(ha, "AUTO_TRUST_WORKSPACE", False):
+            self.assertFalse(sm._trust_scope_ok(inside))   # the kill switch
+
+    def test_a_claude_launch_arms_the_watch_and_other_runtimes_do_not(self):
+        sm = super().make_manager()
+        claude = {"id": "c"}
+        sm._trust_watch(claude)
+        self.assertGreater(claude["trustCheckUntil"], time.time())
+        for rt in ("dsh", "qwen"):
+            other = {"id": rt, "agentType": rt}
+            sm._trust_watch(other)
+            self.assertNotIn("trustCheckUntil", other)
+
+
+class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
+    """XERK-868: a `running` session whose tmux is gone must stop reading running
+    forever. Nothing checked this before, so the operator's dead session kept its
+    card, its slot and an orphaned ttyd serving tmux's raw error."""
+
+    def make_manager(self, listing=(0, "agent-alive")):
+        sm = super().make_manager()
+        sm.save = mock.Mock()
+        self.killed_ttyd = []
+        self.run_out_calls = []
+
+        def fake_run_out(cmd, cwd=None, timeout=None):
+            self.run_out_calls.append(cmd)
+            return listing
+
+        p = mock.patch.object(ha, "run_out", fake_run_out)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(ha.SessionManager, "_kill_ttyd",
+                              lambda self, sid: self and self.killed_ttyd.append(sid))
+        p.start()
+        self.addCleanup(p.stop)
+        sm.killed_ttyd = self.killed_ttyd
+        return sm
+
+    def _sess(self, **kw):
+        s = {"id": "s1", "status": "running", "tmuxName": "agent-dead",
+             "worktreePath": "/repos/.turma/worktrees/Ryujinx/abc"}
+        s.update(kw)
+        return s
+
+    def test_one_subprocess_for_the_whole_fleet(self):
+        # NOT `has-session` per session — that would put MAX_SESSIONS timeouts on
+        # the beat (CLAUDE.md's beat-loop budget).
+        sm = self.make_manager()
+        sm.registry = [self._sess(id=f"s{i}", tmuxName=f"agent-s{i}")
+                       for i in range(6)]
+        sm._sweep_dead_sessions()
+        self.assertEqual(len(self.run_out_calls), 1)
+        self.assertEqual(self.run_out_calls[0][:2], ["tmux", "list-sessions"])
+
+    def test_a_dead_tmux_ends_the_session_after_the_strike_count(self):
+        sm = self.make_manager()
+        sess = self._sess()
+        sm.registry = [sess]
+        for _ in range(ha.DEAD_TMUX_STRIKES - 1):
+            sm._sweep_dead_sessions()
+            self.assertEqual(sess["status"], "running")   # still owed a beat
+        sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("tmux session is gone", sess["errorMsg"])
+        self.assertTrue(sess["stoppedAt"])
+        # The orphaned ttyd is reaped, so the terminal stops serving tmux's raw
+        # `can't find session: agent-<id>` as if it were a working terminal.
+        self.assertEqual(sm.killed_ttyd, ["s1"])
+
+    def test_a_live_tmux_is_untouched_and_clears_its_strikes(self):
+        sm = self.make_manager()
+        sess = self._sess(tmuxName="agent-alive", deadTmuxStrikes=1)
+        sm.registry = [sess]
+        sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "running")
+        self.assertNotIn("deadTmuxStrikes", sess)
+        self.assertEqual(sm.killed_ttyd, [])
+
+    def test_a_flap_resets_the_strikes(self):
+        # A session missing once (raced a relaunch) and present next beat must
+        # start over, never accumulate toward a reap.
+        sm = self.make_manager()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._sweep_dead_sessions()                       # strike 1
+        with mock.patch.object(ha, "run_out",
+                               lambda *a, **k: (0, "agent-dead")):
+            sm._sweep_dead_sessions()                   # back: cleared
+        for _ in range(ha.DEAD_TMUX_STRIKES - 1):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "running")
+
+    def test_an_untrustworthy_listing_is_never_read_as_all_dead(self):
+        # rc != 0 (no tmux server, a wedged tmux, a failed launch) is "can't
+        # tell". Erring toward leaving sessions alone is the whole contract.
+        for listing in ((1, ""), (None, "boom"), (1, "no server running")):
+            sm = self.make_manager(listing=listing)
+            sess = self._sess()
+            sm.registry = [sess]
+            for _ in range(ha.DEAD_TMUX_STRIKES + 2):
+                sm._sweep_dead_sessions()
+            self.assertEqual(sess["status"], "running")
+            self.assertEqual(sm.killed_ttyd, [])
+
+    def test_a_queued_session_is_never_reaped(self):
+        # A queued record has no tmux BY DESIGN — _drain_queue provisions it later.
+        sm = self.make_manager()
+        sess = self._sess(status="queued", tmuxName="agent-nope")
+        sm.registry = [sess]
+        for _ in range(ha.DEAD_TMUX_STRIKES + 2):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "queued")
+        self.assertEqual(sm.killed_ttyd, [])
+
+    def test_windows_is_left_to_the_pty_host_liveness_read(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess()]
+        with mock.patch.object(ha, "IS_WINDOWS", True):
+            self.assertIsNone(sm._live_tmux_names())
+            for _ in range(ha.DEAD_TMUX_STRIKES + 2):
+                sm._sweep_dead_sessions()
+        self.assertEqual(sm.registry[0]["status"], "running")
+
+    def test_the_sweep_never_raises_onto_the_beat(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "broken"}]          # a legacy/partial record
+        sm._sweep_dead_sessions()                 # no KeyError onto run_forever
 
 
 class TestSessionSummaries(ManagerMixin, unittest.TestCase):

@@ -10007,9 +10007,82 @@ _TRUST_CURSOR_RE = re.compile(r"[❯›]")
 # `capture-pane -p`, Windows the pty-host's TerminalGrid, XERK-703), so this is
 # normally a no-op — but a stray escape must never break the line parsing below.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+# How long after a launch the beat keeps looking for that session's trust modal
+# (XERK-868). The modal only ever appears at claude's cold start, so the window
+# is what keeps the sweep off a settled fleet AND what makes a false positive on
+# conversation text impossible in practice: outside it nothing auto-answers.
+TRUST_ANSWER_WINDOW_SEC = _env_int("TURMA_TRUST_ANSWER_WINDOW_SEC", 120, minimum=0)
+# Captures the trust sweep may take per beat. `_capture_pane` is bounded at 5s,
+# so this is the sweep's whole worst case (10s) regardless of MAX_SESSIONS —
+# CLAUDE.md's beat-loop budget. A burst spawn is simply covered over more beats;
+# nothing is lost, because the `_pane_blocking_dialog` guard protects an
+# unanswered session whether or not the sweep has reached it.
+TRUST_CHECKS_PER_BEAT = _env_int("TURMA_TRUST_CHECKS_PER_BEAT", 2, minimum=1)
+# Auto-accepting the trust modal is a SECURITY-RELEVANT default (see
+# `_trust_scope_ok`); this is the kill switch for a fleet that wants every
+# workspace confirmed by a human at the terminal instead.
+AUTO_TRUST_WORKSPACE = os.environ.get(
+    "TURMA_AUTO_TRUST", "1").strip().lower() not in ("0", "false", "no", "off")
+# Consecutive beats a running session's tmux must be missing before
+# `_sweep_dead_sessions` ends it. >1 on purpose: the listing and the scan are not
+# atomic, so a session launched or relaunched in between is owed another beat.
+DEAD_TMUX_STRIKES = _env_int("TURMA_DEAD_TMUX_STRIKES", 2, minimum=1)
 
 
-def _answer_trust_dialog(tmux_name):
+def _trust_dialog_up(cap):
+    """Whether this capture is Claude Code's trust-folder modal.
+
+    It is the TUI's OTHER keyboard-owning dialog, and the one NOTHING else on
+    this agent could see (XERK-868):
+      * it carries NO numbered options — the two choices are bare lines an arrow
+        key moves between — so `parse_pane_prompt`, whose whole contract is a
+        1..N run, returns None for it;
+      * it shows no "esc to interrupt", so `_busy_from_capture` reads it IDLE;
+      * it REPLACES the composer, so there is no mode footer for
+        `parse_pane_mode` to find either.
+    Every "is this pane safe to type into?" guard therefore called a session
+    sitting at the modal an idle composer, and the first Enter anything sent
+    confirmed its DEFAULT — 'No, exit' — which exits claude and takes its tmux
+    with it. Verified against real Claude Code 2.1.276 on Linux.
+
+    Deliberately stricter than the `_TRUST_DIALOG_RE` sniff `_answer_trust_dialog`
+    opens with: this one runs against LIVE operator sessions whose panes carry
+    arbitrary conversation text, so it also requires the accept OPTION line and
+    the absence of a composer footer. A session merely discussing trusting a
+    folder is not a modal."""
+    if not cap:
+        return False
+    text = _ANSI_RE.sub("", cap)
+    if not _TRUST_DIALOG_RE.search(text):
+        return False
+    if PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text):
+        return False           # the composer footer is live: no modal is up
+    for line in text.splitlines():
+        stripped = line.strip()
+        # The accept OPTION line ('Yes, I trust this folder'), not the question
+        # line (long, ends in '?') and not a sentence quoting it.
+        if (_TRUST_ACCEPT_RE.search(stripped) and "?" not in stripped
+                and len(stripped) < 60):
+            return True
+    return False
+
+
+def _pane_blocking_dialog(cap):
+    """Whether ANY dialog owns this pane's keyboard, so nothing may type into it.
+
+    ONE predicate for the two shapes, rather than each caller re-deriving it:
+      * the numbered choice dialog `parse_pane_prompt` reads (tool permission,
+        plan approval) — answered by typing a digit;
+      * the trust-folder modal `_trust_dialog_up` reads — arrow-driven, invisible
+        to every other pane read, and fatal to the session if Entered (XERK-868).
+    Keeping the second OUT of `parse_pane_prompt` is deliberate: `panePrompt` is
+    a wire contract whose options the chat page renders as clickable digits, and
+    the trust modal has no digit to click — surfacing it there would offer the
+    operator a button that does nothing."""
+    return bool(parse_pane_prompt(cap)) or _trust_dialog_up(cap)
+
+
+def _answer_trust_dialog(tmux_name, cap=None):
     """If the pane shows Claude Code's trust-folder modal, select the trust
     option and confirm; return True if it acted, False when there is no modal.
 
@@ -10019,8 +10092,12 @@ def _answer_trust_dialog(tmux_name):
     locates the cursor line and the accept-option line, and steps the cursor
     between them — working regardless of which option the default sits on. No-ops
     on an already-trusted dir (no modal shows; the positional prompt just runs).
-    Host-verified against Claude Code 2.1.266."""
-    cap = _capture_pane(tmux_name)
+    Host-verified against Claude Code 2.1.266 and 2.1.276.
+
+    `cap` is an already-taken capture of that pane; passing it saves a second
+    `capture-pane` for a caller (the beat's trust sweep) that has just read one."""
+    if cap is None:
+        cap = _capture_pane(tmux_name)
     if not cap:
         return False
     text = _ANSI_RE.sub("", cap)
@@ -18481,8 +18558,10 @@ class SessionManager:
                 extra_env["GITLAB_HOST"] = gitlab_base()
             if local_env_file:
                 extra_env.update(_read_env_file(local_env_file))
+            self._trust_watch(sess)
             self._spawn_pty_host(sess, claude_argv, extra_env)
             return
+        self._trust_watch(sess)
         self._spawn_in_tmux(sess, claude_cmd)
 
     def _spawn_pty_host(self, sess, claude_argv, extra_env):
@@ -21113,6 +21192,14 @@ class SessionManager:
         if (typed.strip() and not sess.get("summary")
                 and _summary_attempts(sess) == 0 and sid not in self.summaries):
             self._start_summary(sess, typed)
+        # A session still sitting at Claude Code's trust modal has no composer:
+        # this text would be swallowed and its Enter would confirm the modal's
+        # 'No, exit' default, ending the session (XERK-868). Clear it first,
+        # bounded — this runs on the beat, and only in that rare state.
+        if not self._clear_trust_dialog(sess, wait=2.0):
+            log(f"input for session {sid} held: Claude Code is still asking "
+                f"whether to trust this workspace — answer that first")
+            return
         _type_into_pane(sess["tmuxName"], text)
         # Record it on the session's outbox so _poll_pending_inputs can confirm it
         # landed and re-send it if a compaction drops it (XERK-47). `attempts:1`
@@ -21209,8 +21296,12 @@ class SessionManager:
             # Only judge a message "lost" once the pane is settled: True=busy,
             # False=idle, None=unknown (uncapturable) — treat anything but a
             # confirmed idle as "wait", so a transient capture failure or an
-            # in-progress turn never triggers a resend.
-            idle = _pane_busy(tmux_name) is False
+            # in-progress turn never triggers a resend. ONE capture feeds both
+            # reads (it replaces `_pane_busy`, which took its own): a pane showing
+            # a blocking DIALOG is not idle either — a resend's Enter would answer
+            # it, and in the trust modal's case exit claude (XERK-868).
+            cap = _capture_pane(tmux_name)
+            idle = _busy_from_capture(cap) is False and not _pane_blocking_dialog(cap)
             keep, changed, resent = [], False, False
             for item in pend:
                 text = (item.get("text") or "")
@@ -21495,6 +21586,201 @@ class SessionManager:
                 return True
         return False
 
+    # --- the trust-folder modal (XERK-868) ---------------------------------
+
+    def _trust_watch(self, sess):
+        """Arm the trust sweep for a session about to (re)launch claude.
+
+        Set on EVERY claude launch (spawn, start, restart, resume, resume-any,
+        migration in): whether the modal appears depends on the WORKSPACE, not on
+        how the session got here, and a resumed session in an untrusted worktree
+        is refused exactly as a fresh one is."""
+        if sess.get("agentType") in ("dsh", "qwen"):
+            return          # neither runtime has Claude Code's trust modal
+        sess["trustCheckUntil"] = time.time() + TRUST_ANSWER_WINDOW_SEC
+
+    def _trust_scope_ok(self, sess):
+        """Whether this agent may accept the trust modal on the operator's behalf
+        for this session.
+
+        **Auto-accepting is a security-relevant decision, so it is scoped**: only
+        a workspace UNDER `REPOS_ROOT` — a repo this agent scans, or a worktree it
+        cut itself — is auto-trusted. What that grants is what Claude Code's
+        dialog gates: reading, editing and executing the files in that folder,
+        which includes any `.claude/` settings and hooks the repo carries. The
+        operator spawned this session against that repo deliberately and Turma
+        already launches it with `--permission-mode auto`/`bypassPermissions` and
+        its own guard `--settings`, so the modal is not the boundary doing the
+        work here; the alternative is a session that cannot start at all, which
+        before XERK-868 did not merely stall but died. Never widen this to an
+        arbitrary path, and `TURMA_AUTO_TRUST=0` turns it off entirely."""
+        if not AUTO_TRUST_WORKSPACE:
+            return False
+        path = sess.get("worktreePath")
+        if not path:
+            return False
+        try:
+            root = os.path.realpath(REPOS_ROOT)
+            here = os.path.realpath(path)
+        except Exception:
+            return False
+        return here == root or here.startswith(root + os.sep)
+
+    def _answer_trust_dialogs(self):
+        """Clear Claude Code's trust-folder modal for freshly-launched sessions.
+
+        Runs on the beat, but only for sessions inside their launch window
+        (`_trust_watch`) and at most `TRUST_CHECKS_PER_BEAT` captures per beat, so
+        a settled fleet pays one dict lookup per session and the worst case is
+        bounded independently of MAX_SESSIONS (CLAUDE.md's beat-loop budget).
+
+        The window is also the false-positive guard: outside it nothing here ever
+        sends a key, so a long-running session whose conversation happens to
+        mention trusting a folder can never be Down/Entered by this sweep.
+
+        This is the ANSWERING half of XERK-868; `_pane_blocking_dialog` is the
+        guarding half, and the guard stands alone — a session whose workspace is
+        out of scope (or a fleet with `TURMA_AUTO_TRUST=0`) keeps its modal up
+        waiting for a human, and nothing types into it meanwhile."""
+        now = time.time()
+        checked = 0
+        for sess in list(self.registry):
+            until = sess.get("trustCheckUntil")
+            if not until:
+                continue
+            if sess.get("status") != "running" or now > until:
+                sess.pop("trustCheckUntil", None)
+                self.save()
+                continue
+            if checked >= TRUST_CHECKS_PER_BEAT:
+                continue                       # next beat; the window is long
+            tmux = sess.get("tmuxName")
+            if not tmux:
+                continue
+            checked += 1
+            cap = _capture_pane(tmux)
+            if not cap:
+                continue                       # not painted yet, or gone — wait
+            if not _trust_dialog_up(cap):
+                # Claude is past the modal (or never had one) the moment the
+                # composer footer is up. Disarm early so the sweep costs nothing
+                # for the rest of the window.
+                if PANE_MODE_RE.search(cap) or _busy_from_capture(cap):
+                    sess.pop("trustCheckUntil", None)
+                    self.save()
+                continue
+            if not self._trust_scope_ok(sess):
+                # Left up deliberately: a human answers it at the terminal. Say so
+                # once (the window expiry stops the log repeating forever).
+                log(f"session {sess['id']}: Claude Code is asking whether to trust "
+                    f"{sess.get('worktreePath')!r} and this agent will not answer "
+                    f"it (outside REPOS_ROOT, or TURMA_AUTO_TRUST is off) — answer "
+                    f"it in the session's terminal")
+                continue
+            if _answer_trust_dialog(tmux, cap=cap):
+                log(f"session {sess['id']}: accepted Claude Code's trust prompt "
+                    f"for {sess.get('worktreePath')!r} (a workspace this agent "
+                    f"manages). Its DEFAULT is 'No, exit', which would have ended "
+                    f"the session")
+                sess.pop("trustCheckUntil", None)
+                self.save()
+
+    def _clear_trust_dialog(self, sess, wait=0.0):
+        """Answer a trust modal blocking THIS moment's typing, and wait (briefly,
+        bounded) for the pane to come back.
+
+        `send_input` calls this before typing: the operator's first message would
+        otherwise be eaten by the modal and its Enter would confirm 'No, exit'.
+        Returns True when the pane is clear to type into."""
+        tmux = sess.get("tmuxName")
+        cap = _capture_pane(tmux)
+        if not _trust_dialog_up(cap):
+            return True
+        if not self._trust_scope_ok(sess):
+            return False
+        if not _answer_trust_dialog(tmux, cap=cap):
+            return False
+        log(f"session {sess['id']}: accepted Claude Code's trust prompt before "
+            f"delivering a message")
+        sess.pop("trustCheckUntil", None)
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            time.sleep(0.25)
+            if not _trust_dialog_up(_capture_pane(tmux)):
+                return True
+        return wait <= 0
+
+    # --- a session whose runtime died (XERK-868) ---------------------------
+
+    def _live_tmux_names(self):
+        """Every tmux session name this host's server currently holds, or None
+        when the answer cannot be trusted.
+
+        ONE subprocess for the WHOLE fleet — deliberately not `has-session` per
+        session, which would put MAX_SESSIONS timeouts on the beat. rc != 0 (no
+        server, a wedged tmux, a launch failure) is "can't tell", never "all
+        dead": `_sweep_dead_sessions` must err toward leaving sessions alone, and
+        the whole-server-died case is `resume_on_boot`'s, not the beat's."""
+        if IS_WINDOWS:
+            return None      # no tmux; the pty-host liveness read is _pty_alive
+        rc, out = run_out(["tmux", "list-sessions", "-F", "#{session_name}"],
+                          timeout=5)
+        if rc != 0:
+            return None
+        return {line.strip() for line in out.splitlines() if line.strip()}
+
+    def _sweep_dead_sessions(self):
+        """Stop a `running` session whose tmux is gone from reading running
+        forever (XERK-868).
+
+        The runtime is its tmux session's only command, so a missing session means
+        claude/qwen/dsh exited — it quit at a startup prompt, crashed, or was
+        killed outside our own teardown. Nothing on the beat noticed: the card
+        kept saying running, the orphaned ttyd kept serving tmux's own
+        `can't find session: agent-<id>` as if it were the terminal, and the slot
+        stayed spent.
+
+        Conservative by construction, because the cost of a false positive is
+        ending a live session:
+          * a QUEUED record has no tmux by design and is skipped (status gate);
+          * an untrustworthy listing (`_live_tmux_names() is None`) is skipped
+            whole — "can't tell" is never "dead";
+          * a name must be missing on `DEAD_TMUX_STRIKES` CONSECUTIVE beats, so a
+            session launched between the listing and this scan, or one racing a
+            relaunch, gets another beat before anything happens.
+        The reap keeps the worktree and the transcript, exactly as `kill` does, so
+        Start resumes the conversation."""
+        live = self._live_tmux_names()
+        if live is None:
+            return
+        for sess in list(self.registry):
+            if sess.get("status") != "running":
+                sess.pop("deadTmuxStrikes", None)
+                continue
+            tmux = sess.get("tmuxName")
+            if not tmux:
+                continue
+            if tmux in live:
+                sess.pop("deadTmuxStrikes", None)
+                continue
+            strikes = int(sess.get("deadTmuxStrikes") or 0) + 1
+            sess["deadTmuxStrikes"] = strikes
+            self.save()
+            if strikes < DEAD_TMUX_STRIKES:
+                continue
+            sess.pop("deadTmuxStrikes", None)
+            # Reap the orphaned ttyd FIRST: while it lives the terminal serves
+            # tmux's raw "can't find session" text, which reads like a working
+            # terminal saying something cryptic rather than a session that ended.
+            self._kill_ttyd(sess["id"])
+            sess["stoppedAt"] = now_iso()
+            self._set_error(
+                sess,
+                "the coding agent exited — its tmux session is gone. It may have "
+                "quit at a startup prompt or crashed. The worktree and the "
+                "conversation are kept: Start resumes it.")
+            self.save()
+
     def _apply_pending_switches(self):
         """Apply model switches that arrived while their session's pane was
         mid-turn (set_model defers them as sess['pendingModel']). Runs each
@@ -21504,7 +21790,15 @@ class SessionManager:
             pend = sess.get("pendingModel")
             if not pend or sess.get("status") != "running":
                 continue
-            if _pane_busy(sess["tmuxName"]):
+            # ONE capture feeding both reads (it replaces `_pane_busy`, which
+            # took its own). Busy: defer, as before. A blocking DIALOG: also
+            # defer — `set_model` drives the pane with `/model` + arrows + Enter,
+            # and an Enter into the trust modal confirms 'No, exit' and kills the
+            # session (XERK-868). An uncapturable pane is "can't tell": wait.
+            cap = _capture_pane(sess["tmuxName"])
+            if cap is None or _busy_from_capture(cap):
+                continue
+            if _pane_blocking_dialog(cap):
                 continue
             sess.pop("pendingModel", None)
             try:
@@ -21567,9 +21861,15 @@ class SessionManager:
             # (None from a markers-disabled host falls through, same as there).
             if _busy_from_capture(cap):
                 continue
-            # A blocking dialog (permission prompt / question) owns the input
-            # line; keystrokes would answer it, not run the command.
-            if parse_pane_prompt(cap):
+            # A blocking dialog owns the input line; keystrokes would answer it,
+            # not run the command. BOTH shapes (`_pane_blocking_dialog`): the
+            # numbered permission/plan dialog, and the trust-folder modal — which
+            # has no numbers, no interrupt hint and no mode footer, so before
+            # XERK-868 every guard above read it as an idle composer and this
+            # method's Enter confirmed its 'No, exit' default. That exited claude
+            # and took its tmux with it, leaving an orphaned ttyd serving tmux's
+            # own `can't find session: agent-<id>` while the card read running.
+            if _pane_blocking_dialog(cap):
                 continue
             name = self._unique_rc_name(summary, exclude_id=sess.get("id"))
             # The live name already matches the target, so there is nothing to
@@ -28266,6 +28566,23 @@ class SessionManager:
         # finished on-demand clone. One per beat; see the method.
         if not light:
             self._drain_queue()
+        # End any session whose tmux is gone before the payload is built, so a
+        # session that died reports its real status on THIS beat rather than one
+        # more beat of `running` (XERK-868). One `tmux list-sessions` for the whole
+        # fleet; wrapped, because nothing on the beat may raise.
+        try:
+            self._sweep_dead_sessions()
+        except Exception as e:
+            log(f"dead-session sweep failed: {e}")
+        # Clear Claude Code's trust-folder modal for sessions still inside their
+        # launch window (XERK-868). Bounded to TRUST_CHECKS_PER_BEAT captures;
+        # wrapped for the same reason. Deliberately NOT gated on `light`: the
+        # light follow-up beat is the one right after a spawn command executed,
+        # which is the earliest the modal can be caught.
+        try:
+            self._answer_trust_dialogs()
+        except Exception as e:
+            log(f"trust-dialog sweep failed: {e}")
         # Drop AskUserQuestion rendezvous files left behind by a turn that died
         # outside our kill/restart cleanup, so a long-answered/abandoned question
         # can't keep showing as pending on the card.
