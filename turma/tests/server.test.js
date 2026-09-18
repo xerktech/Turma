@@ -13693,6 +13693,17 @@ test("http: GET /api/ws-token is user-auth gated; returns {token, expiresInSec}"
 // resolves once the status line + headers are in; `leftover` is any bytes
 // already read past the header terminator (the server may coalesce the 101
 // response with the first WS frames it emits).
+// Every socket wsConnect opens, so none can outlive the run.
+//
+// Callers destroy theirs on the SUCCESS path; on a failure path they do not,
+// and an open socket keeps the event loop alive. `node --test` has no default
+// timeout, so the file never exits and CI reports a JOB TIMEOUT rather than a
+// failing test -- which reads as flaky infrastructure and hides the regression
+// that caused it. It is not hypothetical: breaking the `/live` upgrade makes
+// several tests fail their 101 assertion at once, and the leak from the OTHERS
+// hangs the file even when the test under repair cleans up after itself.
+// 22 tests in this file have that shape, so this is fixed once here rather
+// than 22 times at the call sites.
 function wsConnect(pathAndQuery, timeoutMs = 3000) {
   return new Promise((resolve, reject) => {
     const port = server.address().port;
@@ -21061,22 +21072,26 @@ test("live WS: a hostile agent tail frame reaches the viewer COERCED", async (t)
     sessions: [{ id: "cw1", status: "running", repo: "r", worktreePath: "/w",
       transcriptId: "conv-cw1", session: { tail: [] } }],
   };
-  const ctrl = await wsConnect(`/agent/control?name=${host}&token=agenttok`);
-  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
-  const token = await issueToken();
-  const live = await wsConnect(`/live/${host}/cw1?auth=${token}`);
-  assert.match(live.statusLine, /^HTTP\/1\.1 101/);
-  // Teardown must run on the FAILURE path too. Destroying the sockets only
-  // after the assertions means any failure -- a plain assertion failure, not
-  // just a throw -- leaks two open sockets, the file never exits, and
-  // `node --test` (which has no default timeout) reports a CI JOB TIMEOUT
-  // rather than a failing test. A regression on this wire path would then look
-  // like flaky infrastructure. Measured: 28 minutes before it was killed.
+  // Teardown is registered BEFORE the first socket opens, and destroys whatever
+  // is non-null. Registering it after both connect leaves a window -- the two
+  // 101 assertions -- in which a failure has no teardown at all, and a failure
+  // there is exactly what this test exists to catch (a route or handshake
+  // regression). The file then never exits, and because `node --test` has no
+  // default timeout, CI reports a JOB TIMEOUT rather than a failing test, which
+  // reads as flaky infrastructure. Moving the registration earlier does not
+  // shrink that window, it removes it.
+  let ctrl = null;
+  let live = null;
   t.after(() => {
-    try { live.socket.destroy(); } catch {}
-    try { ctrl.socket.destroy(); } catch {}
+    try { if (live) live.socket.destroy(); } catch {}
+    try { if (ctrl) ctrl.socket.destroy(); } catch {}
     delete agents[host];
   });
+  ctrl = await wsConnect(`/agent/control?name=${host}&token=agenttok`);
+  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+  const token = await issueToken();
+  live = await wsConnect(`/live/${host}/cw1?auth=${token}`);
+  assert.match(live.statusLine, /^HTTP\/1\.1 101/);
   const frames = collectLiveFrames(live.socket);
 
   ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({
@@ -21179,5 +21194,13 @@ test("subagent history: a malformed block is coerced at ingest too", async () =>
   assert.deepStrictEqual(rec.entries[0].blocks.length, 1, "a null block is dropped");
   const edit = rec.entries[0].blocks[0].edit;
   assert.ok(!("old" in edit) && !("new" in edit), "non-string edit leaves are dropped");
+  assert.strictEqual(rec.truncated, false, "truncated is a Boolean here too");
+
+  hub.ingestSubagentHistory(agents[host], [{ sessionId: "s2", type: "qa", label: "x",
+    agentId: "", entries: [], truncated: "yes" }]);
+  const bad = agents[host].subagentHistory[
+    Object.keys(agents[host].subagentHistory).find((k) => k.includes("s2"))];
+  assert.strictEqual(bad.truncated, true,
+    "a non-bool truncated is decode-fatal on Android for BOTH history routes");
   delete agents[host];
 });

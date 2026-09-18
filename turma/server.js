@@ -6561,7 +6561,13 @@ function ingestSubagentHistory(agent, results) {
   for (const r of (Array.isArray(results) ? results : [])) {
     if (!r || !r.sessionId) continue;
     agent.subagentHistory[subagentKey(r.sessionId, r.type, r.label, r.agentId)] =
-      { entries: coerceTailFrame(r).entries, truncated: r.truncated,
+      // BOTH truncated flags are coerced. HubClient.mapHistory decodes this
+      // route and /history into the SAME typed HistoryResponse, so a non-bool
+      // here is decode-fatal exactly as it is there -- and the throw is
+      // SWALLOWED (SubagentViewModel's runCatching -> the null branch), so the
+      // pane reads "unreachable" and blames the network. Fixing only the
+      // sibling was the whole bug: they are one token apart on one line.
+      { entries: coerceTailFrame(r).entries, truncated: !!r.truncated,
         agents: sanitizeWorkflowAgents(r.agents),
         agentsTruncated: !!r.agentsTruncated, fetchedAt: now };
   }
