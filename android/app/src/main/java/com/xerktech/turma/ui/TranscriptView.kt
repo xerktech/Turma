@@ -204,7 +204,10 @@ private fun ProseBlocks(
                 modifier = Modifier.padding(top = 4.dp),
                 fontSize = fontSize * headingScale(block.level),
                 lineHeight = lineHeight * headingScale(block.level),
-                color = color,
+                // h5/h6 are muted and the trace's italic carries through, both as
+                // on the web (.md-h under --ink-2, .thought-body still italic).
+                color = if (block.level >= 5) color.copy(alpha = 0.78f) else color,
+                fontStyle = if (italic) FontStyle.Italic else FontStyle.Normal,
                 fontWeight = FontWeight.SemiBold,
             )
             is ProseBlock.Rule -> Box(
@@ -231,7 +234,9 @@ private fun ProseBlocks(
                     Row(Modifier.padding(start = (row.depth * 14).dp)) {
                         Text(
                             row.marker,
-                            modifier = Modifier.widthIn(min = 16.dp),
+                            // Wide enough for a two-digit ordered marker ("10."),
+                            // or rows past nine lose their alignment.
+                            modifier = Modifier.widthIn(min = 24.dp),
                             fontSize = fontSize,
                             lineHeight = lineHeight,
                             color = color.copy(alpha = 0.72f),

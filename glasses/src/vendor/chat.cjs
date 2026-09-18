@@ -217,7 +217,27 @@
   // most of that, but nothing Claude writes needs `_` emphasis, so the whole
   // class of false positives is removed rather than guarded. Don't "fix" this
   // by adding `_` back.
-  function markRun(s, i) { const c = s[i]; let n = 0; while (s[i + n] === c) n++; return n; }
+  //
+  // COST. This runs on every bubble of every repaint, and a repaint fires on
+  // each ~1s tail frame, so it must be linear in the text. Three things keep it
+  // there, and each of them was measured costing SECONDS of blocked main thread
+  // before it went in (a 100k-character line is inside the wire's own
+  // BLOCK_TEXT_CHARS cap, and the composer will accept one):
+  //  - MARK_RUN_MAX caps how far a delimiter run is counted;
+  //  - `noClose` remembers that a kind of closer is absent for the rest of the
+  //    line, so N unclosed openers cost one scan rather than N;
+  //  - EMPH_MAX_DEPTH bounds the recursion.
+  // Delimiter runs are counted only as far as the longest run that can change a
+  // decision (`***`). Capping can't change an outcome: once m has reached 3,
+  // `m === len` and `m >= len` already resolve the same way for every len used.
+  const MARK_RUN_MAX = 3;
+  const EMPH_MAX_DEPTH = 8;
+  function markRun(s, i) {
+    const c = s[i];
+    let n = 0;
+    while (n < MARK_RUN_MAX && s[i + n] === c) n++;
+    return n;
+  }
   function isSpaceAt(ch) { return ch === undefined || /\s/.test(ch); }
   // The index of the next right-flanking closing run of `c` at or after `from`,
   // or -1. A closer is not preceded by whitespace, and the scan stops at a line
@@ -234,13 +254,32 @@
     }
     return -1;
   }
-  function renderEmph(text) {
+  // findEmphClose, with the per-line "there is no such closer" memo. A failure
+  // at `from` means the region [from, end of line) holds no closer of this kind;
+  // any LATER opener on the same line searches a subset of it, so it fails too.
+  function closeWithMemo(s, from, c, len, exact, memo) {
+    const key = c + String(len) + (exact ? "E" : "A");
+    const failedAt = memo.get(key);
+    if (failedAt !== undefined && from >= failedAt) return -1;
+    const hit = findEmphClose(s, from, c, len, exact);
+    if (hit < 0) memo.set(key, from);
+    return hit;
+  }
+  function renderEmph(text, depth) {
     const s = String(text == null ? "" : text);
     if (s.indexOf("*") < 0 && s.indexOf("~~") < 0) return linkify(s); // nothing to lift out
+    const d = depth || 0;
+    if (d >= EMPH_MAX_DEPTH) return linkify(s);
+    const noClose = new Map();
     let out = "", last = 0, i = 0;
     while (i < s.length) {
       const c = s[i];
-      if (c !== "*" && c !== "~") { i++; continue; }
+      if (c !== "*" && c !== "~") {
+        // The ONLY way `i` crosses a line break (every other advance stays
+        // inside one), so it is the only place the memo needs clearing.
+        if (c === "\n") noClose.clear();
+        i++; continue;
+      }
       const n = markRun(s, i);
       let len, open, close;
       if (c === "~") {
@@ -257,10 +296,14 @@
       // A run of the SAME length is preferred over a longer one, so `*a **b** c*`
       // closes on the final single `*` rather than on the inner `**`; a longer
       // run is accepted only when no exact one is left (an unbalanced `*a**`).
-      let endIdx = findEmphClose(s, i + len, c, len, true);
-      if (endIdx < 0) endIdx = findEmphClose(s, i + len, c, len, false);
-      if (endIdx < 0) { i += n; continue; }             // unclosed: literal
-      out += linkify(s.slice(last, i)) + open + renderEmph(s.slice(i + len, endIdx)) + close;
+      const from = i + len;
+      let endIdx = closeWithMemo(s, from, c, len, true, noClose);
+      if (endIdx < 0) endIdx = closeWithMemo(s, from, c, len, false, noClose);
+      // Unclosed, or an EMPTY span (`****`, `~~~~`) — both literal, as in GFM.
+      // Rejecting the empty one also stops a long delimiter run from emitting a
+      // wall of empty elements.
+      if (endIdx <= from) { i += n; continue; }
+      out += linkify(s.slice(last, i)) + open + renderEmph(s.slice(from, endIdx), d + 1) + close;
       i = endIdx + len;
       last = i;
     }
@@ -336,7 +379,6 @@
   //    does), or a surviving "\n" prints as a blank line on top of the
   //    element's own margin.
   const HEADING_RE = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*$/;
-  const RULE_RE = /^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/;
   const QUOTE_RE = /^ {0,3}> ?(.*)$/;
   const UL_RE = /^([ \t]*)[-*+][ \t]+(.*)$/;
   const OL_RE = /^([ \t]*)(\d{1,9})[.)][ \t]+(.*)$/;
@@ -350,12 +392,35 @@
     for (const ch of s) n += ch === "\t" ? 4 : 1;
     return n;
   }
+  // A horizontal rule: at most 3 leading spaces, then 3+ of ONE marker with
+  // spaces/tabs allowed between them and nothing else on the line.
+  //
+  // Written as a scan, not as `/^ {0,3}(?:(?:-[ \t]*){3,}|…)$/`. That regex is
+  // linear in V8 but recurses once per iteration in java.util.regex, and the
+  // Android port of this rule has to be the SAME rule — there, one long line of
+  // dashes overflowed the native stack inside a Composable, where the thrown
+  // StackOverflowError is an Error and the catch(Exception) around it cannot see
+  // it. A scan is the same rule on both sides, with no quantified group at all.
+  function isRuleLine(line) {
+    const s = String(line);
+    let i = 0;
+    while (i < 3 && s[i] === " ") i++;
+    const marker = s[i];
+    if (marker !== "*" && marker !== "-" && marker !== "_") return false;
+    let count = 0;
+    for (; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === marker) count++;
+      else if (ch !== " " && ch !== "\t") return false;
+    }
+    return count >= 3;
+  }
   function listItemAt(line) {
     const o = OL_RE.exec(line);
     if (o) return { indent: indentWidth(o[1]), ordered: true, num: parseInt(o[2], 10), text: o[3] };
     // An HR (`***`, `---`) wins over a bullet: it matched first in the caller,
     // but re-check here so a nested call can't turn one into a one-item list.
-    if (RULE_RE.test(line)) return null;
+    if (isRuleLine(line)) return null;
     const u = UL_RE.exec(line);
     if (u) return { indent: indentWidth(u[1]), ordered: false, num: 1, text: u[2] };
     return null;
@@ -421,7 +486,7 @@
         out += "<h" + n + ' class="md-h">' + renderInline(body) + "</h" + n + ">";
         i++; eatBlanks(); continue;
       }
-      if (RULE_RE.test(line)) {
+      if (isRuleLine(line)) {
         flush(true);
         out += '<hr class="md-hr">';
         i++; eatBlanks(); continue;
@@ -441,10 +506,24 @@
         const items = [li];
         i++;
         for (;;) {
+          // GFM lazy continuation: a MORE-indented, non-construct line belongs
+          // to the item above it. Without this a wrapped bullet ended the list,
+          // rendered its own second line as a bare paragraph flush to the
+          // container's left edge, and started a fresh list underneath — on 3%
+          // of the list-bearing prose in the real corpus.
+          const cur = i < lines.length ? lines[i] : null;
+          if (cur !== null && cur.trim() !== "" && !listItemAt(cur) &&
+              !HEADING_RE.test(cur) && !isRuleLine(cur) && !QUOTE_RE.test(cur) &&
+              indentWidth(/^[ \t]*/.exec(cur)[0]) > items[items.length - 1].indent) {
+            // Joined with the newline it had: <li> is white-space:normal inside
+            // these pre-wrap containers, so it collapses to the wrap it was.
+            items[items.length - 1].text += "\n" + cur.trim();
+            i++; continue;
+          }
           // A single blank line between items keeps ONE list (a GFM "loose"
           // list), rather than splitting it into two adjacent <ul>s.
           let k = i;
-          while (k < lines.length && k < i + 1 && lines[k].trim() === "") k++;
+          if (k < lines.length && lines[k].trim() === "") k++;
           const nxt = k < lines.length ? listItemAt(lines[k]) : null;
           if (!nxt) break;
           items.push(nxt); i = k + 1;
@@ -997,18 +1076,35 @@
   // only when the run is NOT preceded by a space or tab — `_entry_text` joins
   // with no separator, so a real run abuts its text or a line break, while
   // prose puts a space before its bracket.
-  const TOOL_MARKER_RUN = /(?:\[[A-Za-z][A-Za-z0-9_-]*\])+$/;
+  //
+  // Peeled backwards one `[Name]` at a time rather than with
+  // `/(?:\[[A-Za-z][A-Za-z0-9_-]*\])+$/`. That regex is unanchored on the left,
+  // so on text that does NOT end in a marker it retries from every `[` in the
+  // message — quadratic, and seconds of blocked main thread on a big degraded
+  // entry. Walking back from the end touches each character once.
+  const TOOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
+  function trailingMarkerStart(t) {
+    let start = t.length;
+    for (;;) {
+      if (start < 2 || t[start - 1] !== "]") break;
+      const open = t.lastIndexOf("[", start - 2);
+      if (open < 0) break;
+      if (!TOOL_NAME_RE.test(t.slice(open + 1, start - 1))) break;
+      start = open;
+    }
+    return start < t.length ? start : -1;
+  }
   function degradedBlocks(text, role) {
     const t = String(text == null ? "" : text);
     if (!t) return [];
     if (role !== "assistant") return [{ t: "text", text: t }];
-    const m = TOOL_MARKER_RUN.exec(t);
-    if (!m) return [{ t: "text", text: t }];
-    const before = t.slice(0, m.index);
+    const start = trailingMarkerStart(t);
+    if (start < 0) return [{ t: "text", text: t }];
+    const before = t.slice(0, start);
     if (/[ \t]$/.test(before)) return [{ t: "text", text: t }];
     const out = [];
     if (before.trim()) out.push({ t: "text", text: before });
-    for (const name of m[0].slice(1, -1).split("][")) {
+    for (const name of t.slice(start + 1, -1).split("][")) {
       out.push({ t: "tool_use", name: name, input: "", degraded: true });
     }
     return out;
@@ -1198,6 +1294,17 @@
     return truncated ? '<span class="clipped">… clipped to fit</span>' : "";
   }
 
+  // The first line of some markdown, as a plain one-line card summary: heading
+  // hashes, a leading bullet and emphasis markers are syntax, and on a single
+  // collapsed line they read as noise rather than as formatting.
+  function chipLine(text) {
+    return String(text == null ? "" : text).split("\n")[0]
+      .replace(/^ {0,3}#{1,6}[ \t]+/, "")
+      .replace(/^ {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+/, "")
+      .replace(/\*{1,3}|~~/g, "")
+      .trim();
+  }
+
   function renderMsg(it) {
     const cls = it.role === "user" ? "user" : "assistant";
     return '<div class="tr-msg ' + cls + '" data-uuid="' + esc(it.id) + '"><span class="role">' + cls + "</span>" +
@@ -1317,7 +1424,12 @@
     // A plan card's salient line is the plan itself; a SendUserFile card's is its
     // caption or a file count — not the raw input JSON either would fall back to.
     const argSrc = it.plan || (it.files ? "" : it.input);
-    let argOne = argSrc ? esc(argSrc.split("\n")[0]) : "";
+    // A plan's first line is MARKDOWN, and the card collapses it to one line —
+    // so the syntax has to come off, or the header reads "ExitPlanMode ## The
+    // plan" beside a body that renders the same heading properly. Only the plan
+    // gets this: a raw tool input is not markdown, and stripping `*` there would
+    // eat the glob out of an `ls *.js` chip.
+    let argOne = argSrc ? esc(it.plan ? chipLine(argSrc) : argSrc.split("\n")[0]) : "";
     if (it.files && !argOne) {
       argOne = esc(it.caption ? it.caption.split("\n")[0]
         : it.files.length + (it.files.length === 1 ? " file" : " files"));

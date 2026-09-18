@@ -285,9 +285,22 @@ test("buildItems/render: an ExitPlanMode plan renders as prose, open by default"
   assert.match(html, /tool-plan/);
   assert.match(html, /The plan/);
   assert.match(html, /<details class="action-card[^"]*" [^>]*open>/); // approvable: open
-  // The summary leads with the plan's first line, not the raw input JSON.
-  assert.match(html, /tool-arg">## The plan</);
+  // The summary leads with the plan's first line, not the raw input JSON — and
+  // with its MARKDOWN off, since the card collapses it to one line while the
+  // body below renders the same heading properly.
+  assert.match(html, /tool-arg">The plan</);
+  assert.match(html, /<h2 class="md-h">The plan<\/h2>/);
   assert.doesNotMatch(html, /allowedPrompts/);
+});
+
+test("render: a tool card's raw input chip keeps its markdown-looking characters", () => {
+  // Only a PLAN is markdown. Stripping `*` off a raw argument would eat the
+  // glob out of an `ls *.js` chip.
+  const entries = [{ id: "b1", role: "assistant", blocks: [{
+    t: "tool_use", id: "t2", name: "Bash", input: "ls *.js",
+  }] }];
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
+  assert.match(html, /tool-arg">ls \*\.js</);
 });
 
 test("buildItems/render: a todo_write snapshot renders as a checklist with a count summary", () => {
@@ -1299,6 +1312,47 @@ test("renderInline: an emphasis span never crosses a line break", () => {
   assert.equal(renderInline("*open\nclose*"), "*open\nclose*");
 });
 
+test("renderInline: LEFT flanking — a delimiter followed by a space never opens", () => {
+  // The right-flanking guard alone lets these through, so pin the left one
+  // separately: deleting it changed 127 blocks of the real corpus and no test.
+  assert.equal(renderInline("** bold**"), "** bold**");
+  assert.equal(renderInline("~~ s~~"), "~~ s~~");
+  assert.equal(renderInline("see ** note**"), "see ** note**");
+  assert.equal(renderInline("* italic*"), "* italic*");
+  // The closer-side guard still holds too.
+  assert.equal(renderInline("**bold **"), "**bold **");
+});
+
+test("renderInline: an EMPTY emphasis span is literal, and a long run stays literal", () => {
+  assert.equal(renderInline("**** and ~~~~"), "**** and ~~~~");
+  // A long delimiter run must not become a wall of empty elements (it also used
+  // to cost seconds of blocked main thread — see the cost note in renderEmph).
+  const many = renderInline("x " + "*".repeat(500));
+  assert.doesNotMatch(many, /<strong|<em/);
+});
+
+test("renderProse: emphasis and markers stay linear on pathological input", () => {
+  // Every one of these took SECONDS before MARK_RUN_MAX + the noClose memo.
+  // The budget is generous (CI machines vary); the failure mode was ~10^3x this.
+  const cases = [
+    "x " + "~".repeat(100000),
+    "x " + "*".repeat(100000),
+    "*a".repeat(50000),
+    "**".repeat(100000),
+    "-".repeat(100000),
+  ];
+  for (const src of cases) {
+    const t0 = Date.now();
+    renderProse(src);
+    const ms = Date.now() - t0;
+    assert.ok(ms < 2000, "renderProse took " + ms + "ms on a " + src.length + "-char input");
+  }
+  // The same for the degraded-entry marker peel (it was unanchored on the left).
+  const t0 = Date.now();
+  buildItems([{ id: "a", role: "assistant", text: "x" + "[Bash]".repeat(40000) + "tail" }]);
+  assert.ok(Date.now() - t0 < 2000, "degraded marker scan is not linear");
+});
+
 test("renderInline: GFM flanking kills arithmetic, spaced stars and globs", () => {
   for (const t of ["a * b", "2 * 3 = 6", "run *.js and *.ts", "** spaced **", "a ~ b"]) {
     assert.equal(renderInline(t), t, "should stay literal: " + t);
@@ -1361,6 +1415,22 @@ test("renderProse: bullets and ordered lists become real lists, and nest", () =>
   // List content goes through renderInline, not esc.
   assert.match(renderProse("- **bold** and `code`"),
     /<li><strong class="md-strong">bold<\/strong> and <code class="md-code-inline">code<\/code><\/li>/);
+});
+
+test("renderProse: a wrapped bullet's continuation line stays in its item", () => {
+  // GFM lazy continuation. Without it the list ended at the wrap, the second
+  // line rendered as a bare paragraph flush left, and a fresh list started
+  // under it — 3% of the list-bearing prose in the real corpus.
+  assert.equal(renderProse("- item one\n  continued here\n- item two"),
+    '<ul class="md-list"><li>item one\ncontinued here</li><li>item two</li></ul>');
+  // A NESTED item is an item, not a continuation.
+  assert.equal(renderProse("- a\n  - b"),
+    '<ul class="md-list"><li>a<ul class="md-list"><li>b</li></ul></li></ul>');
+  // A flush-left line after the list is a paragraph, not a continuation.
+  assert.equal(renderProse("- a\nnext paragraph"),
+    '<ul class="md-list"><li>a</li></ul>next paragraph');
+  // A more-indented CONSTRUCT is still that construct, not continuation text.
+  assert.match(renderProse("- a\n  ## head"), /<h2 class="md-h">head<\/h2>/);
 });
 
 test("renderProse: a dash that isn't a bullet stays prose", () => {

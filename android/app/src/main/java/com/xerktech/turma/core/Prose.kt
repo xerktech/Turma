@@ -107,12 +107,34 @@ private fun linkify(text: String): List<Span> {
 // crosses a line break. `_`/`__` are deliberately NOT delimiters — this corpus
 // is snake_case, __init__ and file_path from end to end. Keep in step with
 // chat.js renderEmph().
-private fun isSpaceAt(s: String, i: Int): Boolean = i < 0 || i >= s.length || s[i].isWhitespace()
+// JavaScript's `\s`, not Java's. `Character.isWhitespace` excludes U+00A0 and
+// U+FEFF (both of which JS calls whitespace) and includes U+001C..U+001F (which
+// JS does not) — so using the platform's idea of whitespace made `**<BOM>a**`
+// bold on Android and literal on the web. Same set, same answer, both ports.
+internal fun isJsSpace(ch: Char): Boolean {
+    // Written as code points: the set has control and format characters in it,
+    // and a literal one in a source file is invisible and easy to break.
+    val c = ch.code
+    return c == 0x09 || c == 0x0A || c == 0x0B || c == 0x0C || c == 0x0D || c == 0x20 ||
+        c == 0xA0 || c == 0x1680 || (c in 0x2000..0x200A) ||
+        c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000 || c == 0xFEFF
+}
+
+/** JS `s.trim() === ""`, for the same reason as [isJsSpace]. */
+internal fun isJsBlank(s: String): Boolean = s.all { isJsSpace(it) }
+
+private fun isSpaceAt(s: String, i: Int): Boolean = i < 0 || i >= s.length || isJsSpace(s[i])
+
+// Delimiter runs are counted only as far as the longest run that can change a
+// decision (`***`); see chat.js's cost note. Counting a 100k-character run in
+// full, once per position, is quadratic — measured in seconds on the JVM too.
+private const val MARK_RUN_MAX = 3
+private const val EMPH_MAX_DEPTH = 8
 
 private fun markRun(s: String, i: Int): Int {
     val c = s[i]
     var n = 0
-    while (i + n < s.length && s[i + n] == c) n++
+    while (n < MARK_RUN_MAX && i + n < s.length && s[i + n] == c) n++
     return n
 }
 
@@ -129,14 +151,38 @@ private fun findEmphClose(s: String, from: Int, c: Char, len: Int, exact: Boolea
     return -1
 }
 
-private fun parseEmph(text: String): List<Span> {
+/**
+ * [findEmphClose] with the per-line "there is no such closer" memo: a failure at
+ * `from` means the rest of that line holds no closer of this kind, so any later
+ * opener on the same line fails too. Without it, N unclosed openers cost N scans.
+ */
+private fun closeWithMemo(
+    s: String, from: Int, c: Char, len: Int, exact: Boolean, memo: HashMap<String, Int>,
+): Int {
+    val key = "$c$len${if (exact) "E" else "A"}"
+    val failedAt = memo[key]
+    if (failedAt != null && from >= failedAt) return -1
+    val hit = findEmphClose(s, from, c, len, exact)
+    if (hit < 0) memo[key] = from
+    return hit
+}
+
+private fun parseEmph(text: String, depth: Int = 0): List<Span> {
     if (!text.contains('*') && !text.contains("~~")) return linkify(text)
+    if (depth >= EMPH_MAX_DEPTH) return linkify(text)
+    val noClose = HashMap<String, Int>()
     val out = ArrayList<Span>()
     var last = 0
     var i = 0
     while (i < text.length) {
         val c = text[i]
-        if (c != '*' && c != '~') { i++; continue }
+        if (c != '*' && c != '~') {
+            // The only way `i` crosses a line break, so the only place the memo
+            // needs clearing.
+            if (c == '\n') noClose.clear()
+            i++
+            continue
+        }
         val n = markRun(text, i)
         val len: Int
         var bold = false
@@ -151,11 +197,13 @@ private fun parseEmph(text: String): List<Span> {
         if (isSpaceAt(text, i + len)) { i += n; continue }  // not left-flanking
         // A run of the SAME length is preferred, so `*a **b** c*` closes on the
         // final single `*`; a longer run is accepted only when no exact one is left.
-        var endIdx = findEmphClose(text, i + len, c, len, true)
-        if (endIdx < 0) endIdx = findEmphClose(text, i + len, c, len, false)
-        if (endIdx < 0) { i += n; continue }               // unclosed: literal
+        val from = i + len
+        var endIdx = closeWithMemo(text, from, c, len, true, noClose)
+        if (endIdx < 0) endIdx = closeWithMemo(text, from, c, len, false, noClose)
+        // Unclosed, or an EMPTY span (`****`, `~~~~`) — both literal, as in GFM.
+        if (endIdx <= from) { i += n; continue }
         out.addAll(linkify(text.substring(last, i)))
-        out.add(Span.Styled(parseEmph(text.substring(i + len, endIdx)), bold, italic, strike))
+        out.add(Span.Styled(parseEmph(text.substring(from, endIdx), depth + 1), bold, italic, strike))
         i = endIdx + len
         last = i
     }
@@ -270,7 +318,6 @@ private fun parseTables(text: String): List<ProseBlock> {
 // emphasis). Keep in step with chat.js renderBlocks().
 private val HEADING_RE = Regex("""^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*$""")
 private val HEADING_CLOSE_RE = Regex("""[ \t]+#+[ \t]*$""")
-private val RULE_RE = Regex("""^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$""")
 private val QUOTE_RE = Regex("""^ {0,3}> ?(.*)$""")
 private val UL_RE = Regex("""^([ \t]*)[-*+][ \t]+(.*)$""")
 private val OL_RE = Regex("""^([ \t]*)(\d{1,9})[.)][ \t]+(.*)$""")
@@ -279,7 +326,10 @@ private val OL_RE = Regex("""^([ \t]*)(\d{1,9})[.)][ \t]+(.*)$""")
 private val BLOCK_HINT = Regex("""^[ \t]{0,8}(?:#|>|[-*+_]|\d{1,9}[.)])""", RegexOption.MULTILINE)
 private const val MAX_QUOTE_DEPTH = 4
 
-private data class RawListItem(val indent: Int, val ordered: Boolean, val num: Int, val text: String)
+// `text` is var so a lazy-continuation line can be appended to the item above it.
+private data class RawListItem(val indent: Int, val ordered: Boolean, val num: Int, var text: String)
+
+private val LEADING_WS_RE = Regex("""^[ \t]*""")
 
 private fun indentWidth(s: String): Int {
     var n = 0
@@ -287,11 +337,43 @@ private fun indentWidth(s: String): Int {
     return n
 }
 
+/**
+ * A horizontal rule: at most 3 leading spaces, then 3+ of ONE marker with
+ * spaces/tabs allowed between them and nothing else on the line.
+ *
+ * A scan, not `Regex("""^ {0,3}(?:(?:-[ \t]*){3,}|…)$""")`. That regex is
+ * linear in V8, but `java.util.regex` recurses once per iteration of a
+ * quantified GROUP, so one long line of dashes threw an uncatchable
+ * `StackOverflowError` out of `parseProse` — which runs inside a Composable,
+ * where the only handler is a `catch (e: Exception)` that an `Error` walks
+ * straight past. A 100k-character text block is inside the wire's own
+ * BLOCK_TEXT_CHARS cap, so this was reachable from ordinary agent output.
+ * chat.js's `isRuleLine` is the same scan; keep the two together.
+ */
+internal fun isRuleLine(line: String): Boolean {
+    var i = 0
+    while (i < 3 && i < line.length && line[i] == ' ') i++
+    if (i >= line.length) return false
+    val marker = line[i]
+    if (marker != '*' && marker != '-' && marker != '_') return false
+    var count = 0
+    while (i < line.length) {
+        val ch = line[i]
+        when {
+            ch == marker -> count++
+            ch == ' ' || ch == '\t' -> {}
+            else -> return false
+        }
+        i++
+    }
+    return count >= 3
+}
+
 private fun listItemAt(line: String): RawListItem? {
     OL_RE.find(line)?.let {
         return RawListItem(indentWidth(it.groupValues[1]), true, it.groupValues[2].toInt(), it.groupValues[3])
     }
-    if (RULE_RE.matches(line)) return null  // an HR wins over a one-item `***` list
+    if (isRuleLine(line)) return null  // an HR wins over a one-item `***` list
     UL_RE.find(line)?.let {
         return RawListItem(indentWidth(it.groupValues[1]), false, 1, it.groupValues[2])
     }
@@ -339,11 +421,11 @@ private fun parseBlocks(text: String, depth: Int): List<ProseBlock> {
     // the blank line markdown used to separate it. The FINAL flush keeps the
     // buffer verbatim, so construct-free text parses exactly as it did before.
     fun flush(dropBlanks: Boolean) {
-        if (dropBlanks) while (buf.isNotEmpty() && buf.last().isBlank()) buf.removeAt(buf.size - 1)
+        if (dropBlanks) while (buf.isNotEmpty() && isJsBlank(buf.last())) buf.removeAt(buf.size - 1)
         if (buf.isNotEmpty()) paragraphOf(buf.joinToString("\n"))?.let { out.add(it) }
         buf.clear()
     }
-    fun eatBlanks() { while (i < lines.size && lines[i].isBlank()) i++ }
+    fun eatBlanks() { while (i < lines.size && isJsBlank(lines[i])) i++ }
     while (i < lines.size) {
         val line = lines[i]
         val h = HEADING_RE.find(line)
@@ -356,7 +438,7 @@ private fun parseBlocks(text: String, depth: Int): List<ProseBlock> {
             eatBlanks()
             continue
         }
-        if (RULE_RE.matches(line)) {
+        if (isRuleLine(line)) {
             flush(true)
             out.add(ProseBlock.Rule)
             i++
@@ -384,10 +466,23 @@ private fun parseBlocks(text: String, depth: Int): List<ProseBlock> {
             items.add(li)
             i++
             while (true) {
+                // GFM lazy continuation: a MORE-indented, non-construct line
+                // belongs to the item above it, not to a new paragraph. Without
+                // this a wrapped bullet ended the list and dropped its own second
+                // line between two lists — 3% of the real corpus's list prose.
+                val cur = if (i < lines.size) lines[i] else null
+                if (cur != null && !isJsBlank(cur) && listItemAt(cur) == null &&
+                    HEADING_RE.find(cur) == null && !isRuleLine(cur) && !QUOTE_RE.matches(cur) &&
+                    indentWidth(LEADING_WS_RE.find(cur)!!.value) > items.last().indent
+                ) {
+                    items.last().text += "\n" + cur.trim()
+                    i++
+                    continue
+                }
                 // A single blank line between items keeps ONE list (a GFM "loose"
                 // list) rather than splitting it in two.
                 var k = i
-                if (k < lines.size && lines[k].isBlank()) k++
+                if (k < lines.size && isJsBlank(lines[k])) k++
                 val nxt = if (k < lines.size) listItemAt(lines[k]) else null
                 if (nxt == null) break
                 items.add(nxt)
@@ -406,7 +501,7 @@ private fun parseBlocks(text: String, depth: Int): List<ProseBlock> {
 
 /** A paragraph from [text], or null when it holds nothing but whitespace. */
 private fun paragraphOf(text: String): ProseBlock.Paragraph? {
-    if (text.isBlank()) return null
+    if (isJsBlank(text)) return null
     return ProseBlock.Paragraph(parseInline(text))
 }
 

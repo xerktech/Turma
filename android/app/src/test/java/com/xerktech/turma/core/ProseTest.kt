@@ -226,6 +226,63 @@ class ProseTest {
         assertTrue(styled(paras("*open\nclose*").single().spans).isEmpty())
     }
 
+    @Test fun `left flanking — a delimiter followed by a space never opens`() {
+        // Pinned separately from the closer-side guard: only the closer guard is
+        // exercised by the arithmetic cases below, so deleting this one was silent.
+        for (t in listOf("** bold**", "~~ s~~", "see ** note**", "* italic*", "**bold **")) {
+            val spans = paras(t).single().spans
+            assertTrue("should stay literal: $t", styled(spans).isEmpty())
+            assertEquals(t, plain(spans))
+        }
+    }
+
+    @Test fun `an empty emphasis span is literal`() {
+        val spans = paras("**** and ~~~~").single().spans
+        assertTrue(styled(spans).isEmpty())
+        assertEquals("**** and ~~~~", plain(spans))
+    }
+
+    @Test fun `ordered list numbering increments like the browser's ol`() {
+        // `1. 1. 1.` is what markdown is usually written as; the web renders it
+        // through <ol>, which counts. Flattening here has to count too.
+        assertEquals(listOf("1.", "2.", "3."), lists("1. a\n1. b\n1. c").single().items.map { it.marker })
+        assertEquals(listOf("5.", "6."), lists("5. a\n9. b").single().items.map { it.marker })
+    }
+
+    @Test fun `whitespace follows JavaScript's definition, not Java's`() {
+        // U+FEFF is whitespace to JS and not to Java; U+001C is the reverse. The
+        // two ports must agree, or the same message renders differently.
+        assertTrue(styled(paras("**﻿a**").single().spans).isEmpty())
+        assertTrue(styled(paras("*a*").single().spans).isNotEmpty())
+    }
+
+    @Test fun `a long delimiter run or rule line stays linear and does not overflow the stack`() {
+        // A quantified GROUP in java.util.regex recurses once per iteration, so
+        // the old RULE_RE threw an uncatchable StackOverflowError out of a
+        // Composable on one long line of dashes. A 100k-char block is inside the
+        // wire's own cap, so this was reachable from ordinary agent output.
+        for (src in listOf("-".repeat(100_000), "*".repeat(100_000), "_".repeat(100_000))) {
+            assertEquals(listOf(ProseBlock.Rule), parseProse(src))
+        }
+        for (src in listOf("x " + "~".repeat(100_000), "x " + "*".repeat(100_000), "*a".repeat(20_000))) {
+            val t0 = System.nanoTime()
+            parseProse(src)
+            val ms = (System.nanoTime() - t0) / 1_000_000
+            assertTrue("parseProse took ${ms}ms on ${src.length} chars", ms < 3000)
+        }
+    }
+
+    @Test fun `a wrapped bullet's continuation line stays in its item`() {
+        val items = lists("- item one\n  continued here\n- item two").single().items
+        assertEquals(2, items.size)
+        assertEquals("item one\ncontinued here", plain(items[0].spans))
+        assertEquals("item two", plain(items[1].spans))
+        // A flush-left line after the list is a paragraph, not a continuation.
+        val blocks = parseProse("- a\nnext paragraph")
+        assertEquals(1, (blocks[0] as ProseBlock.ListBlock).items.size)
+        assertEquals("next paragraph", plain((blocks[1] as ProseBlock.Paragraph).spans))
+    }
+
     @Test fun `flanking rules keep arithmetic, spaced stars and globs literal`() {
         for (t in listOf("a * b", "2 * 3 = 6", "run *.js and *.ts", "** spaced **")) {
             val spans = paras(t).single().spans

@@ -101,6 +101,30 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
     `file_path` throughout, and nothing Claude writes needs them. Don't add them back.
   - Tables run BEFORE the block pass, so a `|---|---|` delimiter row is never read as a rule while a
     bare `---` (no pipe) correctly is.
+  - **Every pass must be LINEAR in the text.** `repaint()` re-renders the whole buffer on each ~1s
+    tail frame, and a 100k-char block is inside the wire's own `BLOCK_TEXT_CHARS` cap, so a
+    quadratic pass is a seconds-long main-thread freeze an agent can trigger. Three guards, each
+    added after one was measured: `MARK_RUN_MAX` (a delimiter run is counted only as far as `***`),
+    the per-line `noClose` memo in `renderEmph` (N unclosed openers cost ONE scan, not N), and
+    `EMPH_MAX_DEPTH`. `trailingMarkerStart` peels markers backwards for the same reason — the
+    obvious `/(?:\[\w+\])+$/` is unanchored on the left and retries from every `[`.
+  - **A rule line is a SCAN (`isRuleLine`), never `/(?:-[ \t]*){3,}/`.** That regex is linear in V8
+    but `java.util.regex` recurses once per iteration of a quantified GROUP, so the Android port of
+    it threw an **uncatchable `StackOverflowError`** out of `parseProse` inside a Composable (an
+    `Error`, so the `catch (e: Exception)` there never saw it) on one long line of dashes. Any
+    JS→Kotlin regex port carrying a quantified group needs that check.
+  - **Android uses `isJsSpace`/`isJsBlank`, not `Character.isWhitespace`/`isBlank()`** — Java's set
+    omits U+00A0 and U+FEFF and adds U+001C..U+001F, so the platform's answer made the same message
+    render differently on the two clients.
+  - A **wrapped bullet's continuation line belongs to its item** (GFM lazy continuation: more
+    indented, not itself a construct). Without it a wrap ended the list, printed its own second
+    line as a bare paragraph flush left, and started a new list underneath — 3% of the real
+    corpus's list-bearing prose.
+  - **Android flattens nested lists to depth-tagged rows** (`ProseBlock.ListBlock`) where the web
+    nests real `<ul>`/`<ol>`s; Compose has no list primitive. Markers, depths and ordered numbering
+    agree (verified against 3,000 real transcript blocks), but a marker switch at one depth opens a
+    second list on the web and stays one flat block on Android. That grouping difference is
+    deliberate and cosmetic — don't "fix" it by making the web stop distinguishing `<ul>` from `<ol>`.
   - **The live bubble uses `renderInline`, never `renderProse`** — `parsePaneLiveTurn` reflows the
     pane's hard-wrapped lines into ONE line, so a block pass has no line structure to read.
   - Every prose surface is styled as the same complete set — `.tr-msg`, `.thought-body`,
