@@ -7938,13 +7938,17 @@ def transcript_tail(path):
     (`verbose` expands what the agent already hollowed out). Dropping the OLDEST
     rows instead costs nothing: they are exactly what `/history` serves on demand,
     at the same caps."""
-    kept = []
-    for entry in _tail_entries(path):
-        text = _entry_text(entry)
-        if text is None:
-            continue
-        kept.append((entry, text))
-    kept = kept[-TAIL_MSGS:]
+    # Walk NEWEST-first and keep an entry that has ANYTHING renderable — text or
+    # blocks. The old filter dropped every entry whose `_entry_text` was None,
+    # and `_entry_text` drops tool_result blocks, so a TOOL-OUTPUT-ONLY turn was
+    # skipped outright. That is the other half of the hollow-card defect: the
+    # tool_use rode (it sits on the assistant turn, which has text), its RESULT
+    # did not, so the chat drew a card whose body had never been sent. Expanding
+    # it showed nothing and `verbose` looked broken — the same symptom as the
+    # emptied payloads, by a different route. `_history_row` has always widened
+    # inclusion this way ("a turn that carries only tool_result blocks still has
+    # renderable blocks and is kept"); the preview now matches it, which is the
+    # point: one shape on every feed.
     rows = []
     spent = 0
     # Newest-first, and the budget decides HOW MANY rows ride — never how good a
@@ -7963,13 +7967,19 @@ def transcript_tail(path):
     # Dropping the OLDEST rows instead costs nothing real: they are exactly what
     # `/history` serves, at looser caps, on demand. What must never be lossy is
     # what is on screen right now.
-    for i, (entry, text) in enumerate(reversed(kept)):
+    for entry in reversed(_tail_entries(path)):
+        if len(rows) >= TAIL_MSGS:
+            break
         # The NEWEST row always rides, whatever it costs. It is the message the
         # operator is reading; excluding it to respect a budget would blank the
         # very thing the preview exists to paint.
-        if i and spent >= TAIL_BLOCKS_BUDGET:
+        if rows and spent >= TAIL_BLOCKS_BUDGET:
             break
+        text = _entry_text(entry)
         blocks = _entry_blocks(entry, BLOCK_CAPS, preview=True) or []
+        if text is None and not blocks:
+            continue
+        text = text or ""
         spent += _blocks_weight(blocks)
         row = {
             "id": entry.get("uuid"),
