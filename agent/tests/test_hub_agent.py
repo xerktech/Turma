@@ -2832,19 +2832,26 @@ class TestStablePaneBusy(unittest.TestCase):
     """_stable_pane_busy suppresses the busy->idle flicker a single mid-repaint
     capture would otherwise cause: a busy read is instant, an idle read is
     re-confirmed on the busy->idle edge, and None passes through untouched.
-    time.sleep is patched out so the confirm delay costs the tests nothing."""
+    time.sleep is patched out so the confirm delay costs the tests nothing.
+
+    Driven through `_capture_pane`, which is what actually costs something (a
+    tmux subprocess on Linux, a control-channel RPC on Windows) and what
+    `_pane_status` now hands in rather than taking its own."""
+
+    BUSY = "\u23f5 Thinking... (esc to interrupt)"
+    IDLE = "> ready"
 
     def setUp(self):
         self._sleep = mock.patch.object(ha.time, "sleep").start()
         self.addCleanup(mock.patch.stopall)
 
     def test_busy_is_instant_and_marks_state(self):
-        # A busy read is trusted on the first capture — status lights up promptly
-        # — and there is no confirmation re-capture.
+        # A busy read is trusted on the first capture -- status lights up promptly
+        # -- and there is no confirmation re-capture.
         st = {}
-        with mock.patch.object(ha, "_pane_busy", return_value=True) as pb:
+        with mock.patch.object(ha, "_capture_pane", return_value=self.BUSY) as cp:
             self.assertIs(ha._stable_pane_busy("agent-x", st), True)
-        pb.assert_called_once_with("agent-x")
+        cp.assert_called_once_with("agent-x")
         self.assertIs(st["paneBusyStable"], True)
         self._sleep.assert_not_called()
 
@@ -2852,9 +2859,9 @@ class TestStablePaneBusy(unittest.TestCase):
         # Never was busy this session -> nothing to flicker off, so a single idle
         # read is believed with no second capture.
         st = {}  # no paneBusyStable
-        with mock.patch.object(ha, "_pane_busy", return_value=False) as pb:
+        with mock.patch.object(ha, "_capture_pane", return_value=self.IDLE) as cp:
             self.assertIs(ha._stable_pane_busy("agent-x", st), False)
-        pb.assert_called_once_with("agent-x")
+        cp.assert_called_once_with("agent-x")
         self.assertIs(st["paneBusyStable"], False)
         self._sleep.assert_not_called()
 
@@ -2862,9 +2869,10 @@ class TestStablePaneBusy(unittest.TestCase):
         # busy->idle edge: the first capture missed the marker (redraw gap) but
         # the confirming re-capture sees it -> stays working, no flip.
         st = {"paneBusyStable": True}
-        with mock.patch.object(ha, "_pane_busy", side_effect=[False, True]) as pb:
+        with mock.patch.object(ha, "_capture_pane",
+                               side_effect=[self.IDLE, self.BUSY]) as cp:
             self.assertIs(ha._stable_pane_busy("agent-x", st), True)
-        self.assertEqual(pb.call_count, 2)  # confirmed with a second capture
+        self.assertEqual(cp.call_count, 2)  # confirmed with a second capture
         self.assertIs(st["paneBusyStable"], True)
         self._sleep.assert_called_once()
 
@@ -2872,18 +2880,19 @@ class TestStablePaneBusy(unittest.TestCase):
         # busy->idle edge with the marker really gone: both captures agree,
         # so it flips to idle (only one confirm delay was spent).
         st = {"paneBusyStable": True}
-        with mock.patch.object(ha, "_pane_busy", side_effect=[False, False]) as pb:
+        with mock.patch.object(ha, "_capture_pane",
+                               side_effect=[self.IDLE, self.IDLE]) as cp:
             self.assertIs(ha._stable_pane_busy("agent-x", st), False)
-        self.assertEqual(pb.call_count, 2)
+        self.assertEqual(cp.call_count, 2)
         self.assertIs(st["paneBusyStable"], False)
 
     def test_unknown_passes_through_without_touching_state(self):
         # A capture failure is not evidence the turn ended: return None (so the
         # transcript fallback decides) and leave the remembered state alone.
         st = {"paneBusyStable": True}
-        with mock.patch.object(ha, "_pane_busy", return_value=None) as pb:
+        with mock.patch.object(ha, "_capture_pane", return_value=None) as cp:
             self.assertIsNone(ha._stable_pane_busy("agent-x", st))
-        pb.assert_called_once_with("agent-x")
+        cp.assert_called_once_with("agent-x")
         self.assertIs(st["paneBusyStable"], True)  # untouched
         self._sleep.assert_not_called()
 
@@ -2893,20 +2902,48 @@ class TestStablePaneBusy(unittest.TestCase):
         orig = ha.PANE_IDLE_CONFIRM_SEC
         ha.PANE_IDLE_CONFIRM_SEC = 0.0
         try:
-            with mock.patch.object(ha, "_pane_busy", side_effect=[False, True]) as pb:
+            with mock.patch.object(ha, "_capture_pane",
+                                   side_effect=[self.IDLE, self.BUSY]) as cp:
                 self.assertIs(ha._stable_pane_busy("agent-x", st), False)
-            pb.assert_called_once_with("agent-x")  # no confirmation capture
+            cp.assert_called_once_with("agent-x")  # no confirmation capture
         finally:
             ha.PANE_IDLE_CONFIRM_SEC = orig
+
+    def test_pane_status_takes_one_capture_for_busy_mode_and_prompt(self):
+        """The beat-budget fix: busy, modeActual and panePrompt all come off ONE
+        capture. It used to take two (three on the idle edge) -- on Windows each
+        is a control-channel RPC, so against MAX_SESSIONS that put the beat's
+        worst case at or past the hub's OFFLINE_AFTER_MS."""
+        cap = self.BUSY + "\n\u23f8 manual mode on"
+        with mock.patch.object(ha, "_capture_pane", return_value=cap) as cp:
+            busy, mode, prompt = ha._pane_status("agent-x", {})
+        cp.assert_called_once_with("agent-x")
+        self.assertIs(busy, True)
+        self.assertEqual(mode, "default")
+        self.assertIsNone(prompt)
+
+    def test_pane_status_edge_recapture_feeds_mode_and_prompt(self):
+        """On the busy->idle edge the second capture is the FRESHER screen, so
+        mode/prompt are derived from it rather than from the stale first one."""
+        stale = self.BUSY + "\n\u23f8 manual mode on"
+        fresh = self.IDLE + "\n\u23f5\u23f5 plan mode on"
+        with mock.patch.object(ha, "_capture_pane",
+                               side_effect=[self.IDLE, fresh]) as cp:
+            busy, mode, _prompt = ha._pane_status("agent-x", {"paneBusyStable": True})
+        self.assertEqual(cp.call_count, 2)
+        self.assertIs(busy, False)
+        self.assertEqual(mode, "plan")   # off the re-capture, not the first read
+        self.assertNotIn(stale, "")      # (stale kept only to name the contrast)
 
     def test_flicker_suppressed_across_beats_in_session_report(self):
         # End-to-end through session_report: one shared state dict, a busy beat
         # then a single idle-frame beat -> paneBusy stays True across the blip.
         st = {}
-        with mock.patch.object(ha, "_pane_busy", return_value=True):
+        with mock.patch.object(ha, "_capture_pane", return_value=self.BUSY):
             r1 = ha.session_report("/absent/worktree", st, "agent-x")
         self.assertIs(r1["paneBusy"], True)
-        with mock.patch.object(ha, "_pane_busy", side_effect=[False, True]):
+        with mock.patch.object(ha, "_capture_pane",
+                               side_effect=[self.IDLE, self.BUSY]):
             r2 = ha.session_report("/absent/worktree", st, "agent-x")
         self.assertIs(r2["paneBusy"], True)
 
@@ -4431,6 +4468,12 @@ class ManagerMixin:
             # assertions (CI caught exactly that in TestSetModelMode). The tests
             # that exercise the probe re-enable it deliberately.
             ("LIMITS_PROBE_SEC", 0),
+            # No pane by default: the manager reads captures on paths the suite
+            # exercises without a tmux (send_input's trust-modal check, the beat
+            # sweeps), and the REAL _capture_pane would shell out to the dev
+            # box's tmux — nondeterministic, and it could match a session the
+            # host actually has. Tests that care patch it themselves on top.
+            ("_capture_pane", lambda tmux_name: None),
         ]:
             p = mock.patch.object(ha, name, value)
             p.start()
@@ -6920,6 +6963,30 @@ class TestAnswerTrustDialog(unittest.TestCase):
         self.assertTrue(acted)
         self.assertEqual(sent, [("Down",), ("Enter",)])   # one Down (No -> Yes)
 
+    def test_every_keystroke_is_bounded_for_the_beat(self):
+        # QA finding: this now runs on the BEAT, and `steps` keystrokes at
+        # run()'s 15s default is a worst case that can pass the hub's
+        # OFFLINE_AFTER_MS. Every send must carry a short timeout.
+        sent = []
+        with mock.patch.object(ha, "_capture_pane", return_value=self.DIALOG), \
+                mock.patch.object(
+                    ha, "_pane_send_keys",
+                    side_effect=lambda n, *k, **kw: sent.append(kw.get("timeout"))):
+            self.assertTrue(ha._answer_trust_dialog("agent-x"))
+        self.assertEqual(sent, [ha._TRUST_KEY_TIMEOUT_SEC] * 2)
+        self.assertLessEqual(ha._TRUST_KEY_TIMEOUT_SEC, 5)
+
+    def test_an_implausible_cursor_distance_sends_nothing(self):
+        # The modal's options are adjacent, so the distance is 0 or 1. A larger
+        # one means the cursor or the accept line was mis-located — refuse rather
+        # than press an unbounded number of arrows (and rather than guess).
+        cap = self.DIALOG.replace(
+            " \u276f No, exit\n   Yes, I trust this folder",
+            " \u276f No, exit\n   a\n   b\n   c\n   d\n   Yes, I trust this folder")
+        acted, sent = self._keys(cap)
+        self.assertFalse(acted)
+        self.assertEqual(sent, [])
+
     def test_no_op_when_there_is_no_modal(self):
         # An already-trusted dir shows no modal — the composer/turn is up. Send
         # NOTHING (a stray Enter/Down here would disturb a running turn).
@@ -6932,6 +6999,156 @@ class TestAnswerTrustDialog(unittest.TestCase):
             acted, sent = self._keys(cap)
             self.assertFalse(acted)
             self.assertEqual(sent, [])
+
+    def test_navigates_the_real_linux_pane_capture(self):
+        # The SAME modal as it really renders in a Turma session's tmux pane
+        # (LINUX_TRUST_MODAL below, `tmux capture-pane -p` verbatim off Claude
+        # Code 2.1.276) — not the hand-typed Windows transcript above. Pinning
+        # both is the point: the Linux frame is the one the operator hit.
+        acted, sent = self._keys(LINUX_TRUST_MODAL)
+        self.assertTrue(acted)
+        self.assertEqual(sent, [("Down",), ("Enter",)])
+
+
+# Claude Code 2.1.276's trust-folder modal exactly as `tmux capture-pane -p`
+# renders it in a Turma session pane (the 220x50 geometry every launcher uses),
+# captured on a real Linux host against a never-before-opened directory. NOT
+# hand-cleaned: the leading blank line, the full-width rule and the trailing
+# blanks are what tmux actually returns, and the parsers under test are exactly
+# the ones a cleaned copy has hidden a bug from before (the qwen scrollbar trap,
+# `.claude/rules/qwen.md`).
+#
+# What makes it the XERK-868 bug: there are NO numbered options (the two choices
+# are bare lines an arrow moves between), no "esc to interrupt", and no mode
+# footer. So parse_pane_prompt, _busy_from_capture and parse_pane_mode all say
+# "idle composer, safe to type into" — and the first Enter anything sends
+# confirms the ❯ default, 'No, exit'.
+LINUX_TRUST_MODAL = (
+    "\n"
+    + "─" * 220 + "\n"
+    " Accessing workspace:\n"
+    "\n"
+    " /repos/.turma/worktrees/Ryujinx/abc123\n"
+    "\n"
+    " Quick safety check: Is this a project you created or one you trust? (Like "
+    "your own code, a well-known open source project, or work from your team). "
+    "If not, take a moment to review what's in this folder first.\n"
+    "\n"
+    " Claude Code'll be able to read, edit, and execute files here.\n"
+    "\n"
+    " Security guide\n"
+    "\n"
+    " ❯ No, exit\n"
+    "   Yes, I trust this folder\n"
+    "\n"
+    " Enter to confirm · Esc to cancel\n"
+    + "\n" * 33
+)
+
+# The same pane a second later, once the modal has been accepted: the composer
+# and its mode footer are back. This is what "not a dialog" looks like.
+LINUX_COMPOSER_PANE = (
+    "\n" * 6
+    + "                                                   ● high · /effort\n"
+    + "─" * 220 + "\n"
+    "❯ Try \"refactor <filepath>\"\n"
+    + "─" * 220 + "\n"
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n"
+)
+
+
+class TestTrustDialogIsABlockingDialog(unittest.TestCase):
+    """XERK-868. The operator's bug: a manual session in a repo Claude Code had
+    never been run in came up on the trust modal, and the terminal then showed
+    tmux's own `can't find session: agent-e6d49` — ttyd still serving, the tmux
+    GONE. The mechanism is that NOTHING on this agent could see that modal, so
+    `_reconcile_rc_names` typed `/rename <summary>` + Enter into it on the first
+    beat after the summary landed, and the Enter confirmed its 'No, exit'
+    default. Proven on a real host: those exact two `_pane_send_keys` calls
+    against a live Claude Code 2.1.276 trust modal ended the tmux session."""
+
+    def test_every_other_pane_read_calls_the_modal_an_idle_composer(self):
+        # This is the hole, pinned: the three reads a "safe to type here?" guard
+        # had available all say the pane is free.
+        self.assertIsNone(ha.parse_pane_prompt(LINUX_TRUST_MODAL))
+        self.assertFalse(ha._busy_from_capture(LINUX_TRUST_MODAL))
+        self.assertIsNone(ha.parse_pane_mode(LINUX_TRUST_MODAL))
+
+    def test_the_modal_is_recognised_as_a_blocking_dialog(self):
+        self.assertTrue(ha._trust_dialog_up(LINUX_TRUST_MODAL))
+        self.assertTrue(ha._pane_blocking_dialog(LINUX_TRUST_MODAL))
+
+    def test_a_live_composer_is_not_a_blocking_dialog(self):
+        self.assertFalse(ha._trust_dialog_up(LINUX_COMPOSER_PANE))
+        self.assertFalse(ha._pane_blocking_dialog(LINUX_COMPOSER_PANE))
+
+    def test_the_numbered_dialog_contract_is_untouched(self):
+        # _pane_blocking_dialog must still be TRUE for the numbered dialog
+        # parse_pane_prompt owns, and parse_pane_prompt itself must be unchanged
+        # — the trust modal deliberately does NOT become a `panePrompt`, because
+        # the chat page renders those options as clickable DIGITS and this modal
+        # has none.
+        numbered = ("Bash command\n"
+                    "  rm -rf /tmp/x\n"
+                    "─────\n"
+                    "Do you want to proceed?\n"
+                    " ❯ 1. Yes\n"
+                    "   2. No\n")
+        self.assertIsNotNone(ha.parse_pane_prompt(numbered))
+        self.assertTrue(ha._pane_blocking_dialog(numbered))
+
+    def test_a_live_permission_dialog_is_never_the_trust_modal(self):
+        # QA finding (HIGH), and the one real regression this change introduced:
+        # a tool-permission dialog shows NO mode footer either (that is exactly
+        # what makes parse_pane_prompt work), so with the footer as the only
+        # guard, any Write/Bash dialog whose diff, command or description carried
+        # a short `trust this folder` line satisfied every other condition — and
+        # the beat then drove arrows + Enter into it, APPROVING a tool call in a
+        # session the operator had put in manual permission mode. Reproduced live
+        # by QA against claude 2.1.276 at t+16s of an ordinary spawn. The two
+        # dialogs are mutually exclusive by construction; pin that.
+        # NB the trigger text is not exotic: this repo's own hub-agent.py and
+        # .claude/rules/agent-sessions.md now contain it, so a Turma session
+        # editing THIS code shows it in a diff.
+        dialog = ("Write\n"
+                  "  notes.md\n"
+                  "    1. No, exit\n"
+                  "    2. Yes, I trust this folder\n"
+                  "\u2500\u2500\u2500\u2500\u2500\n"
+                  "Do you want to create notes.md?\n"
+                  " \u276f 1. Yes\n"
+                  "   2. Yes, and don't ask again this session\n"
+                  "   3. No, and tell Claude what to do differently\n")
+        self.assertIsNotNone(ha.parse_pane_prompt(dialog))   # it IS a panePrompt
+        self.assertFalse(ha._trust_dialog_up(dialog))        # so NOT the modal
+        self.assertTrue(ha._pane_blocking_dialog(dialog))    # still blocking
+
+    def test_the_real_modal_survives_the_numbered_dialog_exclusion(self):
+        # The exclusion must not cost the modal itself: it carries no numbered
+        # run, so parse_pane_prompt stays None for it.
+        self.assertIsNone(ha.parse_pane_prompt(LINUX_TRUST_MODAL))
+        self.assertTrue(ha._trust_dialog_up(LINUX_TRUST_MODAL))
+
+    def test_prose_merely_mentioning_trust_is_not_a_modal(self):
+        # The live-session false positive that matters: a session TALKING about
+        # the modal, with its composer up, must never be Down/Entered.
+        prose = (
+            "> explain the trust this folder prompt\n"
+            "\n"
+            "  Claude Code asks 'do you trust the files in this folder?' the "
+            "first time you open a directory, and you answer yes, I trust this "
+            "folder to continue.\n"
+            "─────\n"
+            "❯ \n"
+            "─────\n"
+            "  ⏵⏵ auto mode on (shift+tab to cycle)\n")
+        self.assertFalse(ha._trust_dialog_up(prose))
+        self.assertFalse(ha._pane_blocking_dialog(prose))
+
+    def test_no_dialog_on_an_empty_or_unreadable_capture(self):
+        for cap in (None, "", "just some output\n"):
+            self.assertFalse(ha._trust_dialog_up(cap))
+            self.assertFalse(ha._pane_blocking_dialog(cap))
 
 
 class TestWindowsManagerBoot(ManagerMixin, unittest.TestCase):
@@ -10662,6 +10879,58 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         # The message still goes through regardless.
         self.assertEqual(self.run_stdin_calls[0][1], "Add a docker compose flag")
 
+    def test_the_trust_modal_is_cleared_before_the_message_is_typed(self):
+        # XERK-868: a session still on the trust modal has no composer. Typed
+        # text would be swallowed and its Enter would confirm 'No, exit',
+        # ending the session — so the modal is answered first.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sess["worktreePath"] = os.path.join(ha.REPOS_ROOT, "r", "wt")
+        sess["trustCheckUntil"] = time.time() + 60      # inside the launch window
+        keys, caps = [], [LINUX_TRUST_MODAL, LINUX_COMPOSER_PANE]
+        with mock.patch.object(ha, "_capture_pane",
+                               side_effect=lambda t: caps.pop(0) if caps else None), \
+                mock.patch.object(ha, "_pane_send_keys",
+                                  side_effect=lambda n, *k, **kw: keys.append(k)):
+            sm.send_input(sess["id"], "hello")
+        self.assertEqual(keys, [("Down",), ("Enter",)])       # modal accepted
+        self.assertEqual(self.run_stdin_calls[0][1], "hello")  # then delivered
+
+    def test_a_message_never_answers_a_modal_outside_the_launch_window(self):
+        # QA finding (HIGH): this path used to answer at ANY age, making it a
+        # second, UNWINDOWED auto-answering path — the hole the sweep's window
+        # exists to close, reachable through any operator message. Outside the
+        # window the message is HELD; a human answers at the terminal.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sess["worktreePath"] = os.path.join(ha.REPOS_ROOT, "r", "wt")
+        sess["trustCheckUntil"] = time.time() - 1       # window expired
+        keys = []
+        with mock.patch.object(ha, "_capture_pane",
+                               return_value=LINUX_TRUST_MODAL), \
+                mock.patch.object(ha, "_pane_send_keys",
+                                  side_effect=lambda n, *k, **kw: keys.append(k)):
+            sm.send_input(sess["id"], "hello")
+        self.assertEqual(keys, [])
+        self.assertEqual(self.run_stdin_calls, [])
+
+    def test_a_message_is_held_when_the_modal_cannot_be_answered(self):
+        # Out of REPOS_ROOT (or TURMA_AUTO_TRUST off): a human answers it. The
+        # message is HELD, never typed into the modal.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sess["worktreePath"] = "/somewhere/else"
+        sess["trustCheckUntil"] = time.time() + 60      # window is not the gate here
+        keys = []
+        with mock.patch.object(ha, "_capture_pane",
+                               return_value=LINUX_TRUST_MODAL), \
+                mock.patch.object(ha, "_pane_send_keys",
+                                  side_effect=lambda n, *k, **kw: keys.append(k)):
+            sm.send_input(sess["id"], "hello")
+        self.assertEqual(keys, [])
+        self.assertEqual(self.run_stdin_calls, [])
+        self.assertEqual(self.run_calls, [])
+
     def test_later_prompts_do_not_resummarize(self):
         sm = self.make_manager()
         sess = self._running_session(sm)  # summaryStarted=True already
@@ -11926,10 +12195,22 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
 
     SID = "11111111-1111-4111-8111-111111111111"
 
+    # The pane states the resend gate reads, as CAPTURES — it takes one capture
+    # and reads both busy and "a dialog owns the keyboard" off it (XERK-868),
+    # rather than calling _pane_busy (which took a capture of its own).
+    BUSY_PANE = "  ⏵⏵ auto mode on · esc to interrupt\n"
+    IDLE_PANE = "❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+
     def make_manager(self):
         sm = super().make_manager()
         self.run_calls.clear()
         return sm
+
+    def _pane(self, busy):
+        """Patch the pane capture to read busy (True) / idle (False) /
+        uncapturable (None)."""
+        cap = {True: self.BUSY_PANE, False: self.IDLE_PANE, None: None}[busy]
+        return mock.patch.object(ha, "_capture_pane", return_value=cap)
 
     def _session(self, sm, pending, worktree=None):
         wt = worktree or os.path.join(self.tmp, "wt")
@@ -11953,7 +12234,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
                                        "attempts": 1}])
         self._write_transcript(wt, [
             {"type": "user", "message": {"role": "user", "content": "do it"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         self.assertNotIn("pendingInputs", sess)
         self.assertEqual(self.run_calls, [])  # no resend
@@ -11964,7 +12245,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
                                        "attempts": 1}])
         self._write_transcript(wt, [
             {"type": "queue-operation", "operation": "enqueue", "content": "later"}])
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         self.assertEqual(len(sess["pendingInputs"]), 1)
         self.assertEqual(self.run_calls, [])
@@ -11977,7 +12258,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self._write_transcript(wt, [
             {"type": "system", "subtype": "compact_boundary",
              "compactMetadata": {"trigger": "auto"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         # Re-typed the same way a first send goes in: pasted, then Enter.
         self.assertEqual(self.run_stdin_calls, [
@@ -11997,7 +12278,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self._write_transcript(wt, [
             {"type": "system", "subtype": "compact_boundary",
              "compactMetadata": {"trigger": "auto"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=True):
+        with self._pane(True):
             sm._poll_pending_inputs()
         self.assertEqual(self.run_calls, [])            # deferred
         self.assertEqual(len(sess["pendingInputs"]), 1)  # still tracked
@@ -12011,7 +12292,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self._write_transcript(wt, [
             {"type": "system", "subtype": "compact_boundary",
              "compactMetadata": {"trigger": "auto"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         self.assertEqual(self.run_calls, [])
         self.assertEqual(len(sess["pendingInputs"]), 1)
@@ -12024,7 +12305,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self._write_transcript(wt, [
             {"type": "system", "subtype": "compact_boundary",
              "compactMetadata": {"trigger": "auto"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         self.assertEqual(self.run_calls, [])       # budget spent, no resend
         self.assertNotIn("pendingInputs", sess)     # given up, reaped
@@ -12038,7 +12319,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self._write_transcript(wt, [
             {"type": "system", "subtype": "compact_boundary",
              "compactMetadata": {"trigger": "auto"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         # Exactly one message re-typed this beat (paste + Enter); the other waits.
         self.assertEqual([data for _cmd, data in self.run_stdin_calls], ["one"])
@@ -12050,7 +12331,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
             sm, [{"text": "stale", "at": time.time() - ha.PENDING_INPUT_TTL_SEC - 1,
                   "attempts": 1, "compactBase": 0}])
         self._write_transcript(wt, [])  # never landed, no compaction
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+        with self._pane(False):
             sm._poll_pending_inputs()
         self.assertEqual(self.run_calls, [])
         self.assertNotIn("pendingInputs", sess)
@@ -12064,14 +12345,14 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self.assertNotIn("pendingInputs", sess)
 
     def test_unknown_pane_state_does_not_resend(self):
-        # _pane_busy None (uncapturable) is not "idle" — never resend on it.
+        # An uncapturable pane is not "idle" — never resend on it.
         sm = self.make_manager()
         sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
                                        "attempts": 1, "compactBase": 0}])
         self._write_transcript(wt, [
             {"type": "system", "subtype": "compact_boundary",
              "compactMetadata": {"trigger": "auto"}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=None):
+        with self._pane(None):
             sm._poll_pending_inputs()
         self.assertEqual(self.run_calls, [])
         self.assertEqual(len(sess["pendingInputs"]), 1)
@@ -14092,7 +14373,12 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
             return ""
 
         def fake_capture(tmux_name):
-            return self.pane.capture() if hasattr(self.pane, "capture") else self.pane
+            cap = self.pane.capture() if hasattr(self.pane, "capture") else self.pane
+            # `busy` has to show up in the CAPTURE, not only in the _pane_busy
+            # mock: _apply_pending_switches now takes one capture and reads busy
+            # (and "a dialog owns the keyboard") off it (XERK-868), so a mock on
+            # _pane_busy alone would no longer gate it.
+            return f"{cap}\n  esc to interrupt" if busy and cap else cap
 
         for name, value in [("run", fake_run),
                             ("_pane_busy", lambda t: busy),
@@ -14173,6 +14459,27 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         sess["pendingModel"] = "sonnet"
         sm._apply_pending_switches()
         self.assertEqual(sess["pendingModel"], "sonnet")  # still waiting
+        self.assertEqual(self.run_calls, [])
+
+    def test_apply_pending_switches_waits_out_the_trust_modal(self):
+        # XERK-868: set_model drives the pane with /model + arrows + Enter, and
+        # the trust modal shows no interrupt hint and no mode footer — so the
+        # busy gate alone let this through and its Enter confirmed 'No, exit'.
+        sm = self.make_manager(pane=LINUX_TRUST_MODAL)
+        sess = self._session(sm, model=None)
+        sess["pendingModel"] = "sonnet"
+        sm._apply_pending_switches()
+        self.assertEqual(sess["pendingModel"], "sonnet")  # deferred, not dropped
+        self.assertEqual(self.run_calls, [])
+
+    def test_apply_pending_switches_waits_out_an_uncapturable_pane(self):
+        # "Can't tell" is never "safe to type into".
+        sm = self.make_manager(pane=None)
+        sess = self._session(sm, model=None)
+        sess["pendingModel"] = "sonnet"
+        with mock.patch.object(ha, "_capture_pane", return_value=None):
+            sm._apply_pending_switches()
+        self.assertEqual(sess["pendingModel"], "sonnet")
         self.assertEqual(self.run_calls, [])
 
     def test_set_model_no_picker_escapes_and_keeps_model(self):
@@ -19227,6 +19534,356 @@ class TestReconcileRcNames(ManagerMixin, unittest.TestCase):
                       self.keys)
 
 
+class TestReconcileRcNamesTrustModal(ManagerMixin, unittest.TestCase):
+    """XERK-868, the operator's bug, reproduced end to end with the REAL parsers
+    (no parse_pane_prompt mock — the mock is what hid this).
+
+    A session spawned into a repo Claude Code has never run in sits on the
+    trust-folder modal. Its summary lands a few seconds later (spawn starts the
+    naming `claude -p` from the initial prompt), so on the very next beat
+    `_reconcile_rc_names` finds summary != rcRenamedFor, a pane that reads idle
+    with no dialog — and types `/rename <summary>` + Enter. The Enter confirms
+    the modal's 'No, exit' default: claude exits, its tmux dies with it, the
+    orphaned ttyd keeps serving `can't find session: agent-<id>` and the card
+    still says running."""
+
+    def _run(self, capture):
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        keys = []
+        sess = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+                "rcName": "truenas-ryujinx-s1", "summary": "Port the shader cache"}
+        sm.registry = [sess]
+        with mock.patch.object(ha, "_capture_pane", lambda t: capture), \
+                mock.patch.object(
+                    ha, "_pane_send_keys",
+                    side_effect=lambda n, *k, **kw: keys.append(k)):
+            sm._reconcile_rc_names()
+        return sess, keys
+
+    def test_nothing_is_typed_into_the_trust_modal(self):
+        sess, keys = self._run(LINUX_TRUST_MODAL)
+        # The fix: NO keystrokes at all. An Enter here ends the session.
+        self.assertEqual(keys, [])
+        # And the session is not marked renamed, so it gets its /rename once the
+        # modal is gone rather than being recorded as done.
+        self.assertNotIn("rcRenamedFor", sess)
+        self.assertEqual(sess["rcName"], "truenas-ryujinx-s1")
+
+    def test_the_same_session_renames_once_the_modal_is_gone(self):
+        sess, keys = self._run(LINUX_COMPOSER_PANE)
+        self.assertEqual(keys, [("/rename Port the shader cache",), ("Enter",)])
+        self.assertEqual(sess["rcName"], "Port the shader cache")
+
+
+class TestAnswerTrustDialogSweep(ManagerMixin, unittest.TestCase):
+    """XERK-868's answering half: the beat clears the trust modal for a
+    freshly-launched session, bounded and scoped."""
+
+    def make_manager(self, capture=None, scope_ok=True):
+        sm = super().make_manager()
+        sm.save = mock.Mock()
+        self.keys = []
+        self.captures = []
+
+        def fake_capture(tmux):
+            self.captures.append(tmux)
+            return capture
+
+        for name, value in [
+                ("_capture_pane", fake_capture),
+                ("_pane_send_keys",
+                 lambda n, *k, **kw: self.keys.append((n, k)))]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(ha.SessionManager, "_trust_scope_ok",
+                              lambda self, sess: scope_ok)
+        p.start()
+        self.addCleanup(p.stop)
+        return sm
+
+    def _sess(self, **kw):
+        s = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+             "worktreePath": "/repos/.turma/worktrees/Ryujinx/abc123",
+             "trustCheckUntil": time.time() + 60}
+        s.update(kw)
+        return s
+
+    def test_accepts_the_modal_and_disarms(self):
+        sm = self.make_manager(capture=LINUX_TRUST_MODAL)
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._answer_trust_dialogs()
+        # Down to 'Yes, I trust this folder', then Enter — never a bare Enter.
+        self.assertEqual(self.keys, [("agent-s1", ("Down",)),
+                                     ("agent-s1", ("Enter",))])
+        self.assertNotIn("trustCheckUntil", sess)
+
+    def test_an_out_of_scope_workspace_is_left_for_a_human(self):
+        sm = self.make_manager(capture=LINUX_TRUST_MODAL, scope_ok=False)
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._answer_trust_dialogs()
+        self.assertEqual(self.keys, [])
+        # Still armed: the guard half keeps anything else off the pane meanwhile.
+        self.assertIn("trustCheckUntil", sess)
+
+    def test_a_live_composer_disarms_without_touching_the_pane(self):
+        sm = self.make_manager(capture=LINUX_COMPOSER_PANE)
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._answer_trust_dialogs()
+        self.assertEqual(self.keys, [])
+        self.assertNotIn("trustCheckUntil", sess)   # claude is past the modal
+
+    def test_an_unreadable_pane_stays_armed_and_sends_nothing(self):
+        sm = self.make_manager(capture=None)
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._answer_trust_dialogs()
+        self.assertEqual(self.keys, [])
+        self.assertIn("trustCheckUntil", sess)      # not painted yet: try again
+
+    def test_an_unarmed_or_stopped_session_costs_no_capture(self):
+        # The steady state: one dict lookup per session, no subprocess at all.
+        sm = self.make_manager(capture=LINUX_TRUST_MODAL)
+        sm.registry = [self._sess(id="a", trustCheckUntil=None),
+                       self._sess(id="b", status="stopped")]
+        sm._answer_trust_dialogs()
+        self.assertEqual(self.captures, [])
+        self.assertEqual(self.keys, [])
+
+    def test_an_expired_window_disarms_and_never_answers(self):
+        # Outside the launch window nothing is auto-answered — that bound is what
+        # makes a false positive on conversation text impossible in practice.
+        sm = self.make_manager(capture=LINUX_TRUST_MODAL)
+        sess = self._sess(trustCheckUntil=time.time() - 1)
+        sm.registry = [sess]
+        sm._answer_trust_dialogs()
+        self.assertEqual(self.captures, [])
+        self.assertEqual(self.keys, [])
+        self.assertNotIn("trustCheckUntil", sess)
+
+    def test_at_most_one_modal_is_answered_per_beat(self):
+        # The captures and the KEYSTROKES are the two costs this puts on the
+        # beat, and both must stay bounded independently of how many sessions
+        # launched at once (CLAUDE.md's beat-loop budget).
+        sm = self.make_manager(capture=LINUX_TRUST_MODAL)
+        sm.registry = [self._sess(id=f"s{i}", tmuxName=f"agent-s{i}")
+                       for i in range(4)]
+        sm._answer_trust_dialogs()
+        self.assertEqual(self.keys, [("agent-s0", ("Down",)),
+                                     ("agent-s0", ("Enter",))])
+
+    def test_captures_are_capped_per_beat(self):
+        # CLAUDE.md's beat-loop budget: _capture_pane is 5s-bounded, so the
+        # sweep's worst case must not scale with MAX_SESSIONS.
+        sm = self.make_manager(capture=None)
+        sm.registry = [self._sess(id=f"s{i}", tmuxName=f"agent-s{i}")
+                       for i in range(8)]
+        sm._answer_trust_dialogs()
+        self.assertEqual(len(self.captures), ha.TRUST_CHECKS_PER_BEAT)
+
+    def test_the_sweep_never_raises_onto_the_beat(self):
+        # The beat is the manager's MAIN process: a KeyError here takes every
+        # session on the host down. Legacy / hand-edited / partial
+        # ~/.turma/sessions.json records are the shape that does it (XERK-402).
+        sm = self.make_manager(capture=LINUX_TRUST_MODAL)
+        sm.registry = [{"trustCheckUntil": time.time() + 60},          # no id
+                       {"id": "x", "trustCheckUntil": time.time() + 60},  # no status
+                       {"status": "running", "trustCheckUntil": time.time() + 60}]
+        sm._answer_trust_dialogs()
+
+    def test_trust_scope_is_limited_to_the_repos_root(self):
+        sm = super().make_manager()
+        with mock.patch.object(ha, "AUTO_TRUST_WORKSPACE", True):
+            inside = {"worktreePath": os.path.join(ha.REPOS_ROOT, "x", "y")}
+            self.assertTrue(sm._trust_scope_ok(inside))
+            self.assertFalse(sm._trust_scope_ok({"worktreePath": "/etc"}))
+            self.assertFalse(sm._trust_scope_ok({"worktreePath": None}))
+        with mock.patch.object(ha, "AUTO_TRUST_WORKSPACE", False):
+            self.assertFalse(sm._trust_scope_ok(inside))   # the kill switch
+
+    def test_a_claude_launch_arms_the_watch_and_other_runtimes_do_not(self):
+        sm = super().make_manager()
+        claude = {"id": "c"}
+        sm._trust_watch(claude)
+        self.assertGreater(claude["trustCheckUntil"], time.time())
+        for rt in ("dsh", "qwen"):
+            other = {"id": rt, "agentType": rt}
+            sm._trust_watch(other)
+            self.assertNotIn("trustCheckUntil", other)
+
+
+class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
+    """XERK-868: a `running` session whose tmux is gone must stop reading running
+    forever. Nothing checked this before, so the operator's dead session kept its
+    card, its slot and an orphaned ttyd serving tmux's raw error."""
+
+    # `tmux list-sessions` outcomes, as (returncode, stdout, stderr). The sweep
+    # reads STDERR to tell "the server is gone, so there are no sessions" from
+    # "tmux could not answer" — the two arrive as the same nonzero rc.
+    LISTING_OK = (0, "agent-alive\n", "")
+    # The tmux server exits with its LAST session, so this is what a host running
+    # exactly one session sees the moment that session dies — the reported
+    # incident's own shape.
+    NO_SERVER = (1, "", "no server running on /tmp/tmux-1000/default\n")
+    NO_SOCKET = (1, "", "error connecting to /tmp/tmux-1000/default "
+                        "(No such file or directory)\n")
+    WEDGED = (1, "", "lost server\n")
+
+    def make_manager(self, listing=None):
+        sm = super().make_manager()
+        sm.save = mock.Mock()
+        self.killed_ttyd = []
+        self.listing_calls = []
+        listing = self.LISTING_OK if listing is None else listing
+
+        def fake_subprocess_run(cmd, **kw):
+            self.listing_calls.append(cmd)
+            rc, out, err = listing
+            return subprocess.CompletedProcess(cmd, rc, out, err)
+
+        p = mock.patch.object(ha.subprocess, "run", fake_subprocess_run)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(ha.SessionManager, "_kill_ttyd",
+                              lambda self, sid: self and self.killed_ttyd.append(sid))
+        p.start()
+        self.addCleanup(p.stop)
+        sm.killed_ttyd = self.killed_ttyd
+        return sm
+
+    def _sess(self, **kw):
+        s = {"id": "s1", "status": "running", "tmuxName": "agent-dead",
+             "worktreePath": "/repos/.turma/worktrees/Ryujinx/abc"}
+        s.update(kw)
+        return s
+
+    def test_one_subprocess_for_the_whole_fleet(self):
+        # NOT `has-session` per session — that would put MAX_SESSIONS timeouts on
+        # the beat (CLAUDE.md's beat-loop budget).
+        sm = self.make_manager()
+        sm.registry = [self._sess(id=f"s{i}", tmuxName=f"agent-s{i}")
+                       for i in range(6)]
+        sm._sweep_dead_sessions()
+        self.assertEqual(len(self.listing_calls), 1)
+        self.assertEqual(self.listing_calls[0][:2], ["tmux", "list-sessions"])
+
+    def test_a_dead_tmux_ends_the_session_after_the_strike_count(self):
+        sm = self.make_manager()
+        sess = self._sess()
+        sm.registry = [sess]
+        for _ in range(ha.DEAD_TMUX_STRIKES - 1):
+            sm._sweep_dead_sessions()
+            self.assertEqual(sess["status"], "running")   # still owed a beat
+        sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("tmux session is gone", sess["errorMsg"])
+        self.assertTrue(sess["stoppedAt"])
+        # The orphaned ttyd is reaped, so the terminal stops serving tmux's raw
+        # `can't find session: agent-<id>` as if it were a working terminal.
+        self.assertEqual(sm.killed_ttyd, ["s1"])
+
+    def test_a_live_tmux_is_untouched_and_clears_its_strikes(self):
+        sm = self.make_manager()
+        sess = self._sess(tmuxName="agent-alive", deadTmuxStrikes=1)
+        sm.registry = [sess]
+        sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "running")
+        self.assertNotIn("deadTmuxStrikes", sess)
+        self.assertEqual(sm.killed_ttyd, [])
+
+    def test_a_flap_resets_the_strikes(self):
+        # A session missing once (raced a relaunch) and present next beat must
+        # start over, never accumulate toward a reap.
+        sm = self.make_manager()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm._sweep_dead_sessions()                       # strike 1
+        with mock.patch.object(
+                ha.SessionManager, "_live_tmux_names",
+                lambda self: {"agent-dead"}):
+            sm._sweep_dead_sessions()                   # back: cleared
+        for _ in range(ha.DEAD_TMUX_STRIKES - 1):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "running")
+
+    def test_an_untrustworthy_listing_is_never_read_as_all_dead(self):
+        # A nonzero rc that is NOT one of the two "no server" messages is "can't
+        # tell". Erring toward leaving sessions alone is the whole contract.
+        for listing in (self.WEDGED, (1, "", ""), (2, "", "permission denied")):
+            sm = self.make_manager(listing=listing)
+            sess = self._sess()
+            sm.registry = [sess]
+            self.assertIsNone(sm._live_tmux_names())
+            for _ in range(ha.DEAD_TMUX_STRIKES + 2):
+                sm._sweep_dead_sessions()
+            self.assertEqual(sess["status"], "running")
+            self.assertEqual(sm.killed_ttyd, [])
+
+    def test_a_launch_failure_is_never_read_as_all_dead(self):
+        # tmux not on PATH at all: subprocess.run raises, which is "can't tell".
+        sm = self.make_manager()
+        with mock.patch.object(ha.subprocess, "run", side_effect=OSError("no tmux")):
+            self.assertIsNone(sm._live_tmux_names())
+            sess = self._sess()
+            sm.registry = [sess]
+            for _ in range(ha.DEAD_TMUX_STRIKES + 2):
+                sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "running")
+
+    def test_no_tmux_server_means_EMPTY_not_unknown(self):
+        # QA finding (HIGH): the tmux server exits with its LAST session, so on a
+        # host running exactly ONE session — the reported incident's own shape —
+        # `list-sessions` exits 1 the moment that session dies. Reading that as
+        # "can't tell" left exactly the session this sweep exists for reading
+        # `running` forever, and resume_on_boot does NOT cover it (it runs only at
+        # manager start). Both wordings tmux uses must mean empty.
+        for listing in (self.NO_SERVER, self.NO_SOCKET):
+            sm = self.make_manager(listing=listing)
+            self.assertEqual(sm._live_tmux_names(), set())
+            sess = self._sess()
+            sm.registry = [sess]
+            for _ in range(ha.DEAD_TMUX_STRIKES):
+                sm._sweep_dead_sessions()
+            self.assertEqual(sess["status"], "error")
+            self.assertEqual(sm.killed_ttyd, ["s1"])
+
+    def test_a_queued_session_is_never_reaped(self):
+        # A queued record has no tmux BY DESIGN — _drain_queue provisions it later.
+        sm = self.make_manager()
+        sess = self._sess(status="queued", tmuxName="agent-nope")
+        sm.registry = [sess]
+        for _ in range(ha.DEAD_TMUX_STRIKES + 2):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "queued")
+        self.assertEqual(sm.killed_ttyd, [])
+
+    def test_windows_is_left_to_the_pty_host_liveness_read(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess()]
+        with mock.patch.object(ha, "IS_WINDOWS", True):
+            self.assertIsNone(sm._live_tmux_names())
+            for _ in range(ha.DEAD_TMUX_STRIKES + 2):
+                sm._sweep_dead_sessions()
+        self.assertEqual(sm.registry[0]["status"], "running")
+
+    def test_the_sweep_never_raises_onto_the_beat(self):
+        # run_forever is the manager's MAIN process: a KeyError here takes every
+        # session on the host down. Legacy / hand-edited / partial
+        # ~/.turma/sessions.json records are the shape that does it (XERK-402),
+        # including one that is `running` and reaches the REAP path with fields
+        # missing.
+        sm = self.make_manager()
+        sm.registry = [{"id": "broken"},                    # no status
+                       {"status": "running"},               # no id, no tmuxName
+                       {"status": "running", "tmuxName": "agent-gone"}]  # no id
+        for _ in range(ha.DEAD_TMUX_STRIKES + 1):
+            sm._sweep_dead_sessions()             # no KeyError onto run_forever
+
+
 class TestSessionSummaries(ManagerMixin, unittest.TestCase):
     def test_missing_prompt_skipped(self):
         sm = self.make_manager()
@@ -20036,10 +20693,12 @@ class TestRepoActivitySort(ManagerMixin, unittest.TestCase):
         }
         for name, value in [
             ("scan_repos", lambda: [{"name": n, "path": "/x/" + n} for n, _ in commits]),
-            # repo_entry now takes cached slow facts as its second arg (ignored here).
-            ("repo_entry", lambda r, slow: dict(by_name[r["name"]])),
+            # repo_entry takes cached slow facts as its second arg and the cheap
+            # branch/dirty reads as its third (both ignored here).
+            ("repo_entry", lambda r, slow, cheap=None: dict(by_name[r["name"]])),
+            ("repo_cheap_facts", lambda path: {}),
             ("repo_slow_facts", lambda path: {}),
-            ("root_repo_entry", lambda: {"name": "(root)", "isRoot": True}),
+            ("root_repo_entry", lambda remote=None, cheap=None: {"name": "(root)", "isRoot": True}),
         ]:
             p = mock.patch.object(ha, name, value)
             p.start()
@@ -20085,6 +20744,227 @@ class TestRepoActivitySort(ManagerMixin, unittest.TestCase):
 @unittest.skipUnless(
     hasattr(signal, "SIGUSR1"), "SIGUSR1 is POSIX-only; the agent runs on Linux"
 )
+class TestLightBeatCost(ManagerMixin, unittest.TestCase):
+    """A `light` beat exists to get a command RESULT back fast — and, since
+    commands arrive only on a beat's REPLY, a POKED beat is what every operator
+    action (Send, Stop, model switch, /history) waits through. The heavy payload
+    is dominated by uncached VCS subprocesses: two per scanned repo, three per
+    running session, three for the repos-root pseudo-repo. On Windows a process
+    creation is ~60-150ms, so that was seconds of re-derived facts nobody asked
+    for, on the critical path. `light` now reuses the cheap reads too."""
+
+    def test_light_repo_entries_reuse_the_cheap_branch_and_dirty_reads(self):
+        sm = self.make_manager()
+        calls = []
+
+        def fake_cheap(path):
+            calls.append(path)
+            return {"branch": "main", "dirtyFiles": 0}
+
+        with mock.patch.object(ha, "scan_repos",
+                               return_value=[{"name": "A", "path": "/x/A"}]), \
+             mock.patch.object(ha, "repo_cheap_facts", side_effect=fake_cheap), \
+             mock.patch.object(ha, "repo_slow_facts", return_value={}), \
+             mock.patch.object(ha, "root_repo_entry",
+                               side_effect=lambda remote=None, cheap=None: {"name": "(root)"}), \
+             mock.patch.object(sm, "_root_repo_remote", return_value=""):
+            first = sm._sorted_repo_entries(refresh=False)
+            self.assertEqual(calls, ["/x/A"])
+            light = sm._sorted_repo_entries(refresh=False, light=True)
+            self.assertEqual(calls, ["/x/A"], "a light beat must not re-spawn")
+            self.assertEqual([e["name"] for e in light],
+                             [e["name"] for e in first])
+            sm._sorted_repo_entries(refresh=False)   # a heavy beat reads fresh
+            self.assertEqual(calls, ["/x/A", "/x/A"])
+
+    def test_a_vanished_repo_drops_out_of_the_cheap_cache(self):
+        sm = self.make_manager()
+        sm.repo_cheap = {"/x/gone": {"branch": "main", "dirtyFiles": 0}}
+        with mock.patch.object(ha, "scan_repos", return_value=[]), \
+             mock.patch.object(ha, "root_repo_entry",
+                               side_effect=lambda remote=None, cheap=None: {"name": "(root)"}), \
+             mock.patch.object(sm, "_root_repo_remote", return_value=""):
+            sm._sorted_repo_entries(refresh=False)
+        # The root pseudo-repo shares the map but is not a scanned path, so it
+        # must survive the prune (otherwise a light beat re-spawns for it anyway).
+        self.assertEqual(list(sm.repo_cheap), [ha.REPOS_ROOT])
+
+    def test_light_session_facts_reuse_the_cheap_worktree_reads(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "worktreePath": "/w/s1", "repoPath": "/x/A"}
+        calls = []
+
+        def fake_cheap(path):
+            calls.append(path)
+            return {"branch": "feat", "dirtyFiles": 2}
+
+        with mock.patch.object(ha, "git_info_cheap", side_effect=fake_cheap), \
+             mock.patch.object(ha, "git_info_slow", return_value={}), \
+             mock.patch.object(ha, "branch_sync", return_value={}), \
+             mock.patch.object(ha, "run", return_value="main"):
+            gi, _work = sm._session_git(sess, refresh=False)
+            self.assertEqual(gi["branch"], "feat")
+            gi2, _ = sm._session_git(sess, refresh=False, light=True)
+        self.assertEqual(calls, ["/w/s1"])
+        self.assertEqual(gi2["branch"], "feat")
+        # The caller mutates the returned dict (it folds the slow facts in), so a
+        # cache hit must hand back a COPY or the cache grows stale fields.
+        self.assertIsNot(gi, gi2)
+
+    def test_root_repo_entry_no_longer_pays_for_the_slow_facts(self):
+        """git_info() ran the whole git_info_slow — the remote URL, the last
+        commit line and a toplevel lookup — every beat and threw all but the
+        remote away, unlike every other slow read on this path."""
+        with mock.patch.object(ha, "git_info_cheap",
+                               return_value={"branch": "main", "dirtyFiles": 0}), \
+             mock.patch.object(ha, "git_info_slow") as slow, \
+             mock.patch.object(ha, "git_info") as full:
+            entry = ha.root_repo_entry("ssh://example.com/x/y")
+        slow.assert_not_called()
+        full.assert_not_called()
+        self.assertEqual(entry["remote"], "ssh://example.com/x/y")
+        self.assertEqual(entry["branch"], "main")
+
+    def test_root_remote_is_cached_across_beats_and_refreshed_on_cadence(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "run", return_value="origin-url") as runner:
+            self.assertEqual(sm._root_repo_remote(refresh=False), "origin-url")
+            sm._root_repo_remote(refresh=False)     # cached
+            self.assertEqual(runner.call_count, 1)
+            sm._root_repo_remote(refresh=True)      # slow cadence -> re-read
+            self.assertEqual(runner.call_count, 2)
+
+
+class TestPokedBeatIsLight(ManagerMixin, unittest.TestCase):
+    """A poke means "the hub has a command for you, beat NOW" — and the command
+    only arrives on that beat's REPLY, so the operator waits through
+    build_payload + the RTT. Building the FULL payload there spends the host's
+    whole subprocess bill before the POST leaves. The poked beat is light; the
+    scheduled beat that follows carries the full facts."""
+
+    class _Stop(Exception):
+        pass
+
+    def _beats(self, wait_answers, tick=0.0):
+        """Drive the REAL run_forever loop. `tick` advances the fake clock by that
+        many seconds per iteration, which is what decides whether a poked beat is
+        still allowed to be light."""
+        sm = self.make_manager()
+        calls = []
+        answers = list(wait_answers)
+        clock = [1000.0]
+
+        def fake_wait(_timeout):
+            if not answers:
+                raise self._Stop()
+            return answers.pop(0)
+
+        def fake_beat(beat, light=False):
+            calls.append((beat, light))
+            clock[0] += tick
+            return None
+
+        with mock.patch.object(ha, "IS_WINDOWS", False), \
+             mock.patch.object(ha.signal, "signal"), \
+             mock.patch.object(sm, "_start_dsh_web"), \
+             mock.patch.object(sm, "_beat_once", side_effect=fake_beat), \
+             mock.patch.object(ha.time, "time", side_effect=lambda: clock[0]), \
+             mock.patch.object(ha.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(ha._poke, "wait", side_effect=fake_wait), \
+             mock.patch.object(ha._poke, "clear"):
+            try:
+                sm.run_forever()
+            except self._Stop:
+                pass
+        return calls
+
+    def test_a_poked_beat_is_light_and_the_next_scheduled_one_is_not(self):
+        # wait answers: timed out, POKED, timed out.
+        calls = self._beats([False, True, False])
+        self.assertEqual(calls, [(0, False), (1, False), (2, True), (2, False)])
+
+    def test_a_light_beat_does_not_consume_its_cadence_index(self):
+        """It did none of the work `beat` indexes (refresh/triage/log-tail/usage
+        slots), so advancing the counter would let a poke step over a slow-cadence
+        slot and skip it."""
+        calls = self._beats([True, True, True, False])
+        # Beat 0 is heavy and advances the index; the three poked beats that
+        # follow all sit on index 1 without consuming it, and the next scheduled
+        # beat is the one that does index 1's cadence work.
+        self.assertEqual(calls, [(0, False), (1, True), (1, True), (1, True),
+                                 (1, False)])
+
+    def test_a_sustained_poke_stream_cannot_STARVE_the_full_cadence(self):
+        """The guard above stops a cadence slot being SKIPPED. It does not, on its
+        own, stop the cadence work never running at all — and a poke stream is not
+        hypothetical: `pokeHost` fires on EVERY queued command, and a browser
+        sitting on a session produces one per beat cycle (chat's 202-retry chain
+        and its 6s poll fallback each queue a `history`). With an unconditional
+        `light=poked`, NO full beat ever ran while that lasted, so `_drain_queue`
+        (a queued session never starts), the pending mode/model switches, triage,
+        PR-comment delivery, the models/limits probes and every usage/slow refresh
+        all stopped. The INTERVAL deadline keeps the full cadence at exactly the
+        rate it had before."""
+        # Every wait is a poke, and each beat costs more than a whole INTERVAL.
+        calls = self._beats([True] * 6, tick=ha.INTERVAL + 1)
+        self.assertTrue(all(not light for _beat, light in calls),
+                        f"a poke may not suppress the full cadence: {calls}")
+        # ...and the cadence index keeps advancing, so the slow-cadence work runs.
+        self.assertEqual([b for b, _l in calls], list(range(len(calls))))
+
+    def test_pokes_between_full_beats_still_get_the_light_fast_path(self):
+        # The win is kept: pokes arriving inside the deadline are light, and the
+        # first one past it pays for a full beat again.
+        calls = self._beats([True] * 4, tick=ha.INTERVAL * 0.45)
+        self.assertEqual([light for _b, light in calls],
+                         [False, True, True, False, True])
+
+    def test_the_deadline_is_on_the_MONOTONIC_clock_not_the_wall_clock(self):
+        """A backward clock step must not re-create the starvation above.
+
+        The deadline is `now - last_full < INTERVAL`. On `time.time()` an NTP or
+        DST step BACKWARDS makes that difference negative for the whole length of
+        the step, so under a poke stream every beat goes light again and no full
+        payload runs until the wall clock catches back up — the exact freeze this
+        guard exists to prevent, re-armed by something no operator would connect
+        to it. `time.monotonic()` cannot step."""
+        sm = self.make_manager()
+        calls = []
+        wall = [1000.0]
+        mono = [5000.0]
+        answers = [True] * 6
+
+        def fake_wait(_timeout):
+            if not answers:
+                raise self._Stop()
+            return answers.pop(0)
+
+        def fake_beat(beat, light=False):
+            calls.append((beat, light))
+            # Each beat takes a full INTERVAL of real time...
+            mono[0] += ha.INTERVAL + 1
+            # ...while the WALL clock is dragged an hour backwards mid-run.
+            wall[0] = 1000.0 - 3600 if len(calls) >= 2 else wall[0] + ha.INTERVAL + 1
+            return None
+
+        with mock.patch.object(ha, "IS_WINDOWS", False), \
+             mock.patch.object(ha.signal, "signal"), \
+             mock.patch.object(sm, "_start_dsh_web"), \
+             mock.patch.object(sm, "_beat_once", side_effect=fake_beat), \
+             mock.patch.object(ha.time, "time", side_effect=lambda: wall[0]), \
+             mock.patch.object(ha.time, "monotonic", side_effect=lambda: mono[0]), \
+             mock.patch.object(ha._poke, "wait", side_effect=fake_wait), \
+             mock.patch.object(ha._poke, "clear"):
+            try:
+                sm.run_forever()
+            except self._Stop:
+                pass
+
+        self.assertTrue(all(not light for _b, light in calls),
+                        f"a backward clock step froze the full cadence: {calls}")
+        self.assertEqual([b for b, _l in calls], list(range(len(calls))))
+
+
 class TestPokeHeartbeat(unittest.TestCase):
     """SIGUSR1 (sent by tunnel-agent.js on a control-channel poke) must cut the
     heartbeat loop's interval wait short so a just-queued command is picked up
@@ -23452,6 +24332,30 @@ class TestBeatLoopBudget(unittest.TestCase):
         worst = (ha.ARCHIVE_CHUNK_TIMEOUT_SEC
                  + ha.ARCHIVE_RAW_FAILURES_MAX * ha.ARCHIVE_RAW_TIMEOUT_SEC)
         self.assertGreaterEqual(worst * 1000, self._offline_after_ms())
+
+    def test_pane_capture_worst_case_fits_under_the_offline_threshold(self):
+        """The Windows pane scrape runs INLINE on the beat, so unlike the archive
+        or the gh sweep it cannot be answered with "move it off" — every other
+        signal (working/idle, the permission-mode footer, the blocking dialog)
+        comes from it and belongs to the beat. What bounds it instead is the
+        number of captures and their timeout.
+
+        On Windows a capture is a control-channel RPC (TCP connect + RFC 6455
+        handshake) at PTY_CONTROL_BEAT_TIMEOUT_SEC each. _pane_status takes ONE
+        per session, plus one more only on the busy->idle edge, so the worst case
+        is MAX_SESSIONS x (2 captures + the confirm delay). Add what the beat
+        already spends — its interval plus the two POSTs a command-executing
+        cycle makes — and it must still leave headroom under the hub's patience.
+
+        It did NOT before: three 5s captures per session x 6 sessions is 90s on
+        its own, past OFFLINE_AFTER_MS with the rest of the beat still to pay."""
+        panes = ha.MAX_SESSIONS * (2 * ha.PTY_CONTROL_BEAT_TIMEOUT_SEC
+                                   + ha.PANE_IDLE_CONFIRM_SEC)
+        beat = ha.INTERVAL + 2 * ha.HEARTBEAT_TIMEOUT_SEC
+        self.assertLess((beat + panes) * 1000, self._offline_after_ms())
+        # And the shape this replaced would not have fit on its own.
+        old = ha.MAX_SESSIONS * 3 * ha.PTY_CONTROL_TIMEOUT_SEC
+        self.assertGreater(old * 1000, self._offline_after_ms())
 
     def test_pr_status_worst_case_exceeds_the_offline_threshold(self):
         """WHY refresh_pr_status is off the beat (XERK-397): PR_STATUS_MAX
@@ -31293,6 +32197,158 @@ class TestWindowsTerminalBackend(unittest.TestCase):
                     json.dump({"ctrlPort": 40000, "pid": 7}, f)
                 self.assertEqual(ha._pty_read_state("agent-x")["ctrlPort"], 40000)
 
+    def test_the_token_file_is_published_atomically_and_owner_only(self):
+        """The live-token file is what makes a hub token roll survivable here: the
+        pty-host re-reads it per auth check, so rewriting it IS the roll — no
+        relaunch, and on this platform a relaunch means killing the operator's
+        claude (the pty-host is both the terminal and the pty). It carries the
+        credential, so it is owner-restricted; it is temp+renamed so a pty-host
+        mid-read never sees a partial token."""
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(ha, "PTY_HOST_DIR", d), \
+                 mock.patch.object(ha, "TURMA_TOKEN", "live-token"), \
+                 mock.patch.object(ha, "restrict_file_to_owner") as restrict:
+                self.assertIs(ha._write_pty_token_file(), True)
+                with open(ha._pty_token_file()) as f:
+                    self.assertEqual(f.read(), "live-token")
+                restrict.assert_called_once()
+                # The temp sibling is restricted BEFORE the rename, so the real
+                # path is never briefly world-readable.
+                self.assertTrue(restrict.call_args.args[0].endswith(".tmp"))
+                self.assertFalse(os.path.exists(ha._pty_token_file() + ".tmp"))
+
+    def test_publishing_the_token_file_never_raises_on_the_beat(self):
+        # A failure here must leave the baked-in token in force (the pre-change
+        # behaviour), not take the manager down: this runs at boot and before
+        # every launch.
+        with mock.patch.object(ha, "PTY_HOST_DIR", "/proc/nonexistent/pty-hosts"):
+            self.assertIs(ha._write_pty_token_file(), False)
+
+    @unittest.skipIf(not hasattr(os, "O_NOFOLLOW"), "POSIX symlink semantics")
+    def test_a_planted_symlink_cannot_divert_the_token_write(self):
+        """The tmp path is FIXED and ~/.turma is session-writable, so a symlink
+        planted there would otherwise have this write the HOST CREDENTIAL to an
+        attacker-chosen path — and restrict_file_to_owner deliberately SKIPS a
+        symlink, so it would land at the umask's mode. O_NOFOLLOW|O_EXCL refuses
+        it instead, and the mode is set at creation rather than chmod'd after, so
+        the secret is never briefly group-readable."""
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(ha, "PTY_HOST_DIR", d), \
+                 mock.patch.object(ha, "TURMA_TOKEN", "live-token"):
+                target = os.path.join(d, "stolen")
+                os.symlink(target, ha._pty_token_file() + ".tmp")
+                # The unlink destroys the LINK (never the target) and O_EXCL then
+                # creates a fresh regular file, so the publish succeeds and the
+                # planted path is never written.
+                self.assertIs(ha._write_pty_token_file(), True)
+                self.assertFalse(os.path.exists(target), "the token was diverted")
+                st = os.lstat(ha._pty_token_file())
+                self.assertTrue(ha.stat.S_ISREG(st.st_mode))
+                self.assertEqual(st.st_mode & 0o777, 0o600,
+                                 "owner-only at CREATION, not chmod'd afterwards")
+
+    @unittest.skipIf(not hasattr(os, "O_NOFOLLOW"), "POSIX symlink semantics")
+    def test_a_symlink_racing_the_unlink_is_refused_outright(self):
+        """O_NOFOLLOW is the backstop for the window between the unlink and the
+        open: a symlink that lands in it must make the open FAIL, not write the
+        host credential to whatever it points at."""
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(ha, "PTY_HOST_DIR", d), \
+                 mock.patch.object(ha, "TURMA_TOKEN", "live-token"):
+                os.makedirs(d, exist_ok=True)
+                target = os.path.join(d, "stolen")
+                real_remove = ha.os.remove
+
+                def plant(path):
+                    real_remove(path)
+                    os.symlink(target, path)   # wins the race
+
+                with mock.patch.object(ha.os, "remove", side_effect=plant):
+                    with open(ha._pty_token_file() + ".tmp", "w") as f:
+                        f.write("x")
+                    self.assertIs(ha._write_pty_token_file(), False)
+                self.assertFalse(os.path.exists(target), "the token was diverted")
+
+    def test_a_stale_tmp_file_does_not_wedge_the_publish(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(ha, "PTY_HOST_DIR", d), \
+                 mock.patch.object(ha, "TURMA_TOKEN", "live-token"):
+                os.makedirs(d, exist_ok=True)
+                with open(ha._pty_token_file() + ".tmp", "w") as f:
+                    f.write("leftover")
+                self.assertIs(ha._write_pty_token_file(), True)
+                with open(ha._pty_token_file()) as f:
+                    self.assertEqual(f.read(), "live-token")
+
+    @unittest.skipUnless(hasattr(os, "WNOHANG"), "POSIX zombies only")
+    def test_pty_still_running_reaps_a_posix_zombie_first(self):
+        """`os.kill(pid, 0)` succeeds for an exited-but-unreaped CHILD, and the
+        POSIX spawn path drops the Popen handle — so without the reap a teardown
+        that worked perfectly polls the corpse for the whole wait and then reports
+        the reap as FAILED, keeping a state file for a process that is long gone.
+
+        **Never call `proc.wait()` to set this up**: `wait()` IS a `waitpid`, so it
+        reaps the zombie itself and the assertion then passes with the reap removed
+        — which is how the first version of this test certified nothing."""
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        pid = proc.pid
+        self.addCleanup(lambda: proc.poll() is None and proc.wait())
+        # Wait for it to EXIT without reaping it: it is a zombie from here on.
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if os.path.exists(f"/proc/{pid}/stat"):
+                with open(f"/proc/{pid}/stat") as f:
+                    if ") Z" in f.read():
+                        break
+            time.sleep(0.02)
+        # A zombie answers os.kill(pid, 0), so the un-reaped read says "alive"...
+        self.assertIs(ha._pid_alive(pid), True, "setup: expected an unreaped zombie")
+        # ...and _pty_still_running must see through that — but ONLY for a pid we
+        # spawned ourselves.
+        self.assertIs(ha._pty_still_running(pid), True,
+                      "a pid this manager never spawned must NOT be waitpid'd")
+        with ha._PTY_OWN_PIDS_LOCK:
+            ha._PTY_OWN_PIDS.add(pid)
+        self.addCleanup(lambda: ha._PTY_OWN_PIDS.discard(pid))
+        self.assertIs(ha._pty_still_running(pid), False)
+
+    @unittest.skipUnless(hasattr(os, "WNOHANG"), "POSIX zombies only")
+    def test_pty_still_running_never_steals_another_childs_exit_status(self):
+        """`os.waitpid` CONSUMES an exit status. A state-file pid can name a
+        RECYCLED pid now belonging to another manager child (a clone, a probe, a
+        ttyd Popen), and reaping that one hands its real owner's `.wait()` a 0 in
+        place of the true exit code — a failed clone silently reported as success.
+        Only pids we Popen'd as pty-hosts are ours to reap."""
+        proc = subprocess.Popen([sys.executable, "-c", "raise SystemExit(7)"])
+        with ha._PTY_OWN_PIDS_LOCK:
+            self.assertNotIn(proc.pid, ha._PTY_OWN_PIDS)
+        deadline = time.time() + 10
+        while time.time() < deadline and ha._pid_alive(proc.pid):
+            time.sleep(0.02)
+        ha._pty_still_running(proc.pid)          # must not touch someone else's child
+        self.assertEqual(proc.wait(), 7, "the owner's exit status was stolen")
+
+    def test_the_posix_spawn_registers_its_pid_as_ours_to_reap(self):
+        """The registration and the reap are one mechanism: the POSIX arm drops the
+        Popen handle deliberately (the pty-host is detached and must outlive us), so
+        `_pty_still_running` is the only thing that will ever collect its status."""
+        src = inspect.getsource(ha._pty_spawn_and_wait)
+        self.assertIn("_PTY_OWN_PIDS.add(proc.pid)", src,
+                      "a POSIX pty-host launch must register its pid, or the reap "
+                      "in _pty_still_running can never fire and teardown re-breaks")
+
+    def test_pty_capture_uses_the_short_beat_timeout(self):
+        """capture is the one control op on the BEAT loop, once (twice on the
+        busy->idle edge) per session per beat. At the 5s teardown budget, times
+        MAX_SESSIONS, it could reach the hub's OFFLINE_AFTER_MS on a host whose
+        pty-hosts are merely slow — flapping a healthy host offline."""
+        self.assertLess(ha.PTY_CONTROL_BEAT_TIMEOUT_SEC, ha.PTY_CONTROL_TIMEOUT_SEC)
+        with mock.patch.object(ha, "_pty_control",
+                               return_value={"ok": True, "data": "screen"}) as ctl:
+            self.assertEqual(ha._pty_capture("agent-x"), "screen")
+        self.assertEqual(ctl.call_args.kwargs["timeout"],
+                         ha.PTY_CONTROL_BEAT_TIMEOUT_SEC)
+
     def test_pty_control_dials_the_state_port_with_the_agent_token(self):
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(ha, "PTY_HOST_DIR", d), \
@@ -31519,6 +32575,7 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         sess = {"id": "w1", "tmuxName": "agent-w1"}
         with mock.patch.object(ha, "IS_WINDOWS", True), \
              mock.patch.object(ha, "_pty_control", return_value={"ok": True}) as ctl, \
+             mock.patch.object(ha, "_pid_alive", return_value=False), \
              mock.patch.object(ha.os, "kill"):
             sm._kill_tmux(sess)
         ctl.assert_called_once()
@@ -31528,6 +32585,90 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
                              for c in self.run_calls))
         self.assertFalse(os.path.exists(ha._pty_state_path("agent-w1")))
 
+    def test_teardown_keeps_the_state_file_when_the_pty_host_survives(self):
+        """The state file is the ONLY handle to a pty-host — there is deliberately
+        no in-memory registry — so dropping it after a kill that did NOT take loses
+        the process permanently: _pty_alive reads False, _pty_control finds no
+        port, and _kill_ttyd no-ops on Windows. The orphan then keeps claude.exe
+        alive in the worktree and keeps the session's terminal port bound, and
+        the very next launch respawns onto that same port."""
+        self._write_state("agent-w1", pid=4242, ctrlPort=40000, termPort=7742)
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pty_control", return_value=None), \
+             mock.patch.object(ha, "PTY_TEARDOWN_WAIT_SEC", 0.0), \
+             mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha.os, "kill", side_effect=OSError("denied")):
+            self.assertIs(ha._pty_teardown("agent-w1"), False)
+        self.assertTrue(os.path.exists(ha._pty_state_path("agent-w1")),
+                        "a failed reap must leave the handle for the next attempt")
+
+    def test_teardown_drops_the_state_file_once_the_pid_is_confirmed_gone(self):
+        self._write_state("agent-w1", pid=4242, ctrlPort=40000, termPort=7742)
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pty_control", return_value={"ok": True}), \
+             mock.patch.object(ha, "_pid_alive", return_value=False), \
+             mock.patch.object(ha.os, "kill"):
+            self.assertIs(ha._pty_teardown("agent-w1"), True)
+        self.assertFalse(os.path.exists(ha._pty_state_path("agent-w1")))
+
+    def test_spawn_waits_for_the_old_terminal_port_before_rebinding(self):
+        """The Linux ttyd relaunch waits up to 2s for the old listener to release
+        the port; the Windows respawn did not, and rebound the SAME fixed
+        --term-port immediately. Losing that race used to crash the pty-host with
+        claude.exe already on the ConPTY."""
+        self._write_state("agent-w1", pid=1, ctrlPort=40000, termPort=7742)
+        probes = []
+
+        def fake_port_open(port, *a, **k):
+            probes.append(port)
+            return len(probes) < 3      # busy twice, then released
+
+        def fake_task(tmux_name, cmd, cwd, env, log_path):
+            self._write_state("agent-w1", pid=1234, ctrlPort=55000, termPort=7742)
+
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pty_teardown", return_value=True), \
+             mock.patch.object(ha, "_port_open", side_effect=fake_port_open), \
+             mock.patch.object(ha, "_pty_task_cleanup"), \
+             mock.patch.object(ha, "_launch_pty_via_task", side_effect=fake_task):
+            pid = ha._pty_spawn_and_wait("agent-w1", ["node"], self.tmp, {}, None)
+        self.assertEqual(pid, 1234)
+        self.assertEqual(probes[:3], [7742, 7742, 7742])
+
+    def test_spawn_refuses_while_the_old_pty_host_still_holds_the_port(self):
+        """A reap that failed AND a port still held means the relaunch cannot
+        succeed anyway — starting it would put a second claude on the worktree.
+        The PORT is the authority, not the pid: a state-file pid can be a
+        Windows-recycled one belonging to something else entirely, and refusing on
+        that alone would strand the session forever."""
+        self._write_state("agent-w1", pid=1, ctrlPort=40000, termPort=7742)
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "PTY_PORT_RELEASE_WAIT_SEC", 0.0), \
+             mock.patch.object(ha, "_pty_teardown", return_value=False), \
+             mock.patch.object(ha, "_port_open", return_value=True), \
+             mock.patch.object(ha, "_launch_pty_via_task") as launch:
+            with self.assertRaises(RuntimeError):
+                ha._pty_spawn_and_wait("agent-w1", ["node"], self.tmp, {}, None)
+        launch.assert_not_called()
+        # ...but a freed port lets it through even after a failed reap.
+        def drop_state(_tmux):
+            try:
+                os.remove(ha._pty_state_path("agent-w1"))
+            except OSError:
+                pass
+            return False
+
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "PTY_PORT_RELEASE_WAIT_SEC", 0.0), \
+             mock.patch.object(ha, "PTY_SPAWN_TIMEOUT_SEC", 0.2), \
+             mock.patch.object(ha, "_pty_teardown", side_effect=drop_state), \
+             mock.patch.object(ha, "_port_open", return_value=False), \
+             mock.patch.object(ha, "_pty_task_cleanup"), \
+             mock.patch.object(ha, "_launch_pty_via_task") as launch:
+            with self.assertRaises(RuntimeError):   # never publishes -> timeout
+                ha._pty_spawn_and_wait("agent-w1", ["node"], self.tmp, {}, None)
+        launch.assert_called_once()
+
     def test_kill_ttyd_is_a_noop_on_windows(self):
         sm = self.make_manager()
         self.run_calls.clear()   # drop __init__'s hostname/version probes
@@ -31535,14 +32676,100 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
             sm._kill_ttyd("w1")   # must not raise or shell anything
         self.assertEqual(self.run_calls, [])
 
-    def test_launch_ttyd_is_a_noop_on_windows(self):
+    def test_launch_ttyd_shells_nothing_on_windows(self):
+        # There is no separate ttyd to (re)launch: the pty-host serves the
+        # terminal itself. With the token unchanged this is a pure no-op.
         sm = self.make_manager()
-        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7700}
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7700,
+                "ttydTokenFp": ha._token_fp(ha.TURMA_TOKEN)}
         self.run_calls.clear()   # drop __init__'s hostname/version probes
         with mock.patch.object(ha, "IS_WINDOWS", True):
-            sm._launch_ttyd(sess)   # the pty-host already serves the terminal
+            sm._launch_ttyd(sess)
         self.assertEqual(self.run_calls, [])
         self.assertNotIn("w1", sm.ttyd)
+
+    def test_a_token_roll_republishes_the_file_and_keeps_the_session(self):
+        """XERK-578 on the Windows path. The Linux branch kills and relaunches a
+        stale ttyd, which costs nothing because tmux (and the claude in it) lives
+        on. Here the pty-host IS the pty, so the same relaunch would kill the
+        operator's session — instead the live pty-host re-reads its token from the
+        manager-owned file, so republishing that file IS the whole roll."""
+        sm = self.make_manager()
+        self._write_state("agent-w1", pid=os.getpid(), ctrlPort=40000,
+                          termPort=7742, authTokenFile=ha._pty_token_file())
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "ttydTokenFp": ha._token_fp("the-old-token")}
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "TURMA_TOKEN", "the-new-token"), \
+             mock.patch.object(ha, "_pty_teardown") as teardown:
+            sm._launch_ttyd(sess)
+        teardown.assert_not_called()          # the session is NOT torn down
+        with open(ha._pty_token_file()) as f:
+            self.assertEqual(f.read(), "the-new-token")
+        self.assertEqual(sess["ttydTokenFp"], ha._token_fp("the-new-token"))
+
+    def test_a_pty_host_that_predates_the_token_file_is_reaped_after_a_roll(self):
+        """Its baked-in token can never change, so it is permanently unreachable:
+        the terminal 401s, the ws upgrade is refused, AND capture/inject/kill all
+        fail while its pid stays alive and the session reports `running` forever.
+        That zombie is strictly worse than a stopped session."""
+        sm = self.make_manager()
+        self._write_state("agent-w1", pid=os.getpid(), ctrlPort=40000,
+                          termPort=7742)          # no authTokenFile
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "ttydTokenFp": ha._token_fp("the-old-token")}
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "TURMA_TOKEN", "the-new-token"), \
+             mock.patch.object(ha, "_pty_teardown") as teardown:
+            sm._launch_ttyd(sess)
+        teardown.assert_called_once_with("agent-w1")
+
+    def test_spawn_publishes_the_live_token_file(self):
+        """The pty-host reads this file per auth check, so a launch that does not
+        publish it leaves the file whatever a PREVIOUS token wrote — and the whole
+        roll story depends on the manager being its only, current, writer."""
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "worktreePath": self.tmp}
+
+        def fake_task(tmux_name, cmd, cwd, env, log_path):
+            self._write_state("agent-w1", pid=1234, ctrlPort=55000, termPort=7742)
+
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "TURMA_TOKEN", "tok-at-spawn"), \
+             mock.patch.object(ha, "_pty_teardown", return_value=True), \
+             mock.patch.object(ha, "_pty_task_cleanup"), \
+             mock.patch.object(ha, "_launch_pty_via_task", side_effect=fake_task):
+            ha._pty_spawn_and_wait("agent-w1", ["node"], self.tmp, {}, None)
+        with open(ha._pty_token_file()) as f:
+            self.assertEqual(f.read(), "tok-at-spawn")
+
+    def test_a_failed_republish_is_not_stamped_as_a_completed_roll(self):
+        """The fingerprint is the guard that short-circuits the whole heal, so
+        recording it after a write that failed would mark the roll done and never
+        retry it — while the pty-host went on accepting only its baked token."""
+        sm = self.make_manager()
+        self._write_state("agent-w1", pid=os.getpid(), ctrlPort=40000,
+                          termPort=7742, authTokenFile=ha._pty_token_file())
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "ttydTokenFp": ha._token_fp("the-old-token")}
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "TURMA_TOKEN", "the-new-token"), \
+             mock.patch.object(ha, "_write_pty_token_file", return_value=False), \
+             mock.patch.object(ha, "_pty_teardown") as teardown:
+            sm._launch_ttyd(sess)
+        teardown.assert_not_called()          # still not worth killing the session
+        self.assertEqual(sess["ttydTokenFp"], ha._token_fp("the-old-token"),
+                         "a failed publish must stay retryable")
+
+    def test_no_live_pty_host_means_nothing_to_heal(self):
+        sm = self.make_manager()
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "ttydTokenFp": ha._token_fp("the-old-token")}
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "TURMA_TOKEN", "the-new-token"), \
+             mock.patch.object(ha, "_pty_teardown") as teardown:
+            sm._launch_ttyd(sess)   # no state file at all
+        teardown.assert_not_called()
 
     def test_tmux_alive_reads_the_pty_host_pid_on_windows(self):
         sm = self.make_manager()
@@ -31580,6 +32807,10 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         self.assertIn("w1", cmd)
         self.assertEqual(cmd[cmd.index("--term-port") + 1], "7742")
         self.assertEqual(cmd[cmd.index("--auth-token") + 1], "tok")
+        # ...and the LIVE token file the pty-host re-reads per auth check, so a
+        # hub token roll needs no relaunch (which here would kill the operator's
+        # claude, the pty-host being both the terminal and the pty).
+        self.assertEqual(cmd[cmd.index("--auth-token-file") + 1], ha._pty_token_file())
         self.assertEqual(cmd[cmd.index("--cols") + 1], "220")
         # The claude argv rides after the launcher, past the `--` separator.
         dd = cmd.index("--")
@@ -31587,6 +32818,9 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
                                         "--remote-control", "myrc"])
         self.assertEqual(captured["env"]["TURMA_SESSION_ID"], "w1")
         self.assertEqual(sess["ttydPid"], 1234)
+        # The Windows path recorded NO token fingerprint at all, so nothing could
+        # tell that a roll had moved the token under a surviving pty-host.
+        self.assertEqual(sess["ttydTokenFp"], ha._token_fp("tok"))
 
     def test_spawn_pty_host_windows_raises_and_reaps_via_state_on_timeout(self):
         # On Windows the task-launched pty-host is NOT our child, so there is no

@@ -208,6 +208,122 @@
     return out;
   }
 
+  // ---- inline emphasis ------------------------------------------------------
+  // **bold**, *italic*, ***both*** and ~~strike~~, applied to the NON-code
+  // slices renderInline() hands down. Runs on RAW text and recurses on the RAW
+  // inner text, bottoming out in linkify() — so esc() still happens exactly
+  // once, at the innermost layer, and nothing here ever regexes over generated
+  // HTML (which is full of href="…_a_b_" and &quot;).
+  //
+  // GFM flanking rules, minus the parts this corpus doesn't need:
+  //  - an opener is not followed by whitespace and a closer is not preceded by
+  //    one, so `a * b`, `2 * 3` and an unclosed `*.js` glob stay literal;
+  //  - a span never crosses a line break — the same rule (and the same reason)
+  //    as a code span: one stray `*` would otherwise italicise the rest of the
+  //    message;
+  //  - an unclosed delimiter is literal text.
+  //
+  // `_`/`__` are deliberately NOT delimiters. Transcript prose is snake_case,
+  // __init__ and file_path from end to end; GFM's intraword guard would cover
+  // most of that, but nothing Claude writes needs `_` emphasis, so the whole
+  // class of false positives is removed rather than guarded. Don't "fix" this
+  // by adding `_` back.
+  //
+  // COST. This runs on every bubble of every repaint, and a repaint fires on
+  // each ~1s tail frame, so it must be linear in the text — a 100k-character
+  // line is inside the wire's own BLOCK_TEXT_CHARS cap, and the composer will
+  // accept one. Two things make it linear, and the naive version was measured
+  // blocking the main thread for SECONDS without them: the `noClose` memo in
+  // findEmphClose (N unclosed openers cost ONE scan, not N) and EMPH_MAX_DEPTH.
+  //
+  // Capping how far a run is counted was tried and REVERTED: it bought nothing
+  // the memo doesn't already give, and it changed output — a saturated count
+  // made `m === len` true for a longer run and made the scan resume INSIDE one,
+  // which fabricated emphasis on input that had none (`~~~~~~# x~~~~`).
+  const EMPH_MAX_DEPTH = 8;
+  function markRun(s, i) { const c = s[i]; let n = 0; while (s[i + n] === c) n++; return n; }
+  function isSpaceAt(ch) { return ch === undefined || /\s/.test(ch); }
+  // The index of the next right-flanking closing run of `c` at or after `from`,
+  // or -1. A closer is not preceded by whitespace, and the scan stops at a line
+  // break (a span never crosses one). `exact` demands a run of precisely `len`.
+  //
+  // `memo` is the per-line "there is no closer of this kind left" cache, and it
+  // is keyed on where the ENTRY-INDEPENDENT part of the scan begins — not on
+  // `from`. That distinction is the whole soundness argument: `from` can land
+  // INSIDE a run (an opener of `***` inside a run of five), and the partial run
+  // it then measures is a candidate no other scan of this line would see. So
+  // that one candidate is tested first, before the memo is consulted; from the
+  // end of it onward every run is entered at its true start, which depends only
+  // on the index — so a later scan starting at or after a failed one visits a
+  // subset of the same candidates and fails too.
+  function findEmphClose(s, from, c, len, exact, memo) {
+    let j = from;
+    if (s[j] === c) {                       // entered mid-run: the one entry-dependent candidate
+      const m = markRun(s, j);
+      if ((exact ? m === len : m >= len) && !isSpaceAt(s[j - 1])) return j;
+      j += m;
+    }
+    const key = c + String(len) + (exact ? "E" : "A");
+    const failedAt = memo.get(key);
+    if (failedAt !== undefined && j >= failedAt) return -1;
+    const start = j;
+    while (j < s.length) {
+      const ch = s[j];
+      if (ch === "\n") break;
+      if (ch !== c) { j++; continue; }
+      const m = markRun(s, j);
+      if ((exact ? m === len : m >= len) && !isSpaceAt(s[j - 1])) return j;
+      j += m;
+    }
+    memo.set(key, start);
+    return -1;
+  }
+  function renderEmph(text, depth) {
+    const s = String(text == null ? "" : text);
+    if (s.indexOf("*") < 0 && s.indexOf("~~") < 0) return linkify(s); // nothing to lift out
+    const d = depth || 0;
+    if (d >= EMPH_MAX_DEPTH) return linkify(s);
+    const noClose = new Map();
+    let out = "", last = 0, i = 0;
+    while (i < s.length) {
+      const c = s[i];
+      if (c !== "*" && c !== "~") {
+        // The ONLY way `i` crosses a line break (every other advance stays
+        // inside one), so it is the only place the memo needs clearing.
+        if (c === "\n") noClose.clear();
+        i++; continue;
+      }
+      const n = markRun(s, i);
+      let len, open, close;
+      if (c === "~") {
+        if (n < 2) { i += n; continue; }       // a single ~ is just a tilde
+        len = 2; open = '<del class="md-strike">'; close = "</del>";
+      } else if (n >= 3) {
+        len = 3; open = '<strong class="md-strong"><em class="md-em">'; close = "</em></strong>";
+      } else if (n === 2) {
+        len = 2; open = '<strong class="md-strong">'; close = "</strong>";
+      } else {
+        len = 1; open = '<em class="md-em">'; close = "</em>";
+      }
+      if (isSpaceAt(s[i + len])) { i += n; continue; }  // not left-flanking
+      // A run of the SAME length is preferred over a longer one, so `*a **b** c*`
+      // closes on the final single `*` rather than on the inner `**`; a longer
+      // run is accepted only when no exact one is left (an unbalanced `*a**`).
+      const from = i + len;
+      let endIdx = findEmphClose(s, from, c, len, true, noClose);
+      if (endIdx < 0) endIdx = findEmphClose(s, from, c, len, false, noClose);
+      // Unclosed, or an EMPTY span (`****`, `~~~~`) — both literal, as in GFM.
+      // Rejecting the empty one also stops a long delimiter run from emitting a
+      // wall of empty elements.
+      if (endIdx <= from) { i += n; continue; }
+      out += linkify(s.slice(last, i)) + open + renderEmph(s.slice(from, endIdx), d + 1) + close;
+      i = endIdx + len;
+      last = i;
+    }
+    out += linkify(s.slice(last));
+    return out;
+  }
+
   // ---- inline code spans ----------------------------------------------------
   // `code` inside a run of prose. A backtick string opens a span that closes on
   // the next backtick string of EXACTLY the same length (so ``a `b` c`` holds a
@@ -218,8 +334,9 @@
   // them) into a code span. GFM allows the wrap; transcript prose is full of
   // lone backticks, so the trade isn't worth it.
   //
-  // The span body is esc()'d and NOT linkified — a URL in `code` is being shown,
-  // not offered — while the prose around it still goes through linkify().
+  // The span body is esc()'d, NOT linkified and NOT emphasised — `**a**` in code
+  // is being shown, not styled — while the prose around it goes through
+  // renderEmph() → linkify().
   function codeSpan(body) {
     // GFM strips one leading + trailing space, so `` ` `` can hold a backtick.
     let b = body;
@@ -227,13 +344,31 @@
     return '<code class="md-code-inline">' + esc(b) + "</code>";
   }
   function runLen(s, i) { let n = 0; while (s[i + n] === "`") n++; return n; }
+  // Line endings, normalised at EVERY entry point into the markdown passes — both
+  // renderProse and renderInline — so each pass splits on "\n" and sees a line
+  // with nothing trailing it, and the two agree about where a line ends.
+  //
+  // Without it a CRLF message rendered with NO markdown at all: every block rule
+  // ends `[ \t]*$`, and the "\r" that split("\n") leaves on each line defeated
+  // all of them, so a heading, a bullet and a rule all stayed raw text.
+  // Reachable from any tool result echoing a Windows file, a pasted CRLF
+  // message, or the native Windows agent.
+  //
+  // renderInline needs it for a DIFFERENT reason: a lone "\r" is a line break
+  // (CSS pre-wrap treats it as a segment break), and without normalising, an
+  // emphasis or code span would form ACROSS one — the exact thing the `\n` bail
+  // in findEmphClose exists to prevent. Android has ONE entry point and
+  // normalises there, so this is also what keeps the web's two in step with it.
+  function normalizeEol(s) {
+    return s.indexOf("\r") < 0 ? s : s.replace(/\r\n?/g, "\n");
+  }
   function renderInline(text) {
-    const s = String(text == null ? "" : text);
-    if (s.indexOf("`") < 0) return linkify(s); // no backtick → nothing to lift out
+    const s = normalizeEol(String(text == null ? "" : text));
+    if (s.indexOf("`") < 0) return renderEmph(s); // no backtick → nothing to lift out
     let out = "", i = 0;
     while (i < s.length) {
       const open = s.indexOf("`", i);
-      if (open < 0) { out += linkify(s.slice(i)); break; }
+      if (open < 0) { out += renderEmph(s.slice(i)); break; }
       const n = runLen(s, open);
       // Scan for a closing run of the same length, bailing at a line break.
       let j = open + n, close = -1;
@@ -244,10 +379,192 @@
         if (m === n) { close = c; break; }
         j = c + m;
       }
-      if (close < 0) { out += linkify(s.slice(i, open + n)); i = open + n; continue; } // unclosed: literal
-      out += linkify(s.slice(i, open)) + codeSpan(s.slice(open + n, close));
+      if (close < 0) { out += renderEmph(s.slice(i, open + n)); i = open + n; continue; } // unclosed: literal
+      out += renderEmph(s.slice(i, open)) + codeSpan(s.slice(open + n, close));
       i = close + n;
     }
+    return out;
+  }
+
+  // ---- line-oriented block markdown -----------------------------------------
+  // ATX headings, horizontal rules, blockquotes and bullet/ordered lists — the
+  // constructs every assistant message is written in, and which used to render
+  // as literal `## What I did` / `- point` text in the bubble.
+  //
+  // Sits between renderTables() and renderInline(): a table is matched FIRST,
+  // so a `|---|---|` delimiter row is never seen here as a rule, while a bare
+  // `---` (no pipe) never looks like a table and correctly lands on the rule.
+  //
+  // Safety: this slices RAW text and hands each construct's content to
+  // renderInline() — headings and list items therefore get inline `code`,
+  // links and emphasis — and concatenates only with literal tag strings
+  // written here. It NEVER regexes over generated HTML.
+  //
+  // Two shape rules that matter under the container's `white-space: pre-wrap`:
+  //  - a plain paragraph emits NOTHING of its own (no <p>) — the pre-wrap
+  //    container already renders its line breaks, and a <p> would double every
+  //    blank line. With no construct present the output is byte-identical to
+  //    renderInline(), which several callers and tests rely on;
+  //  - a construct CONSUMES the newlines around it (the buffer join never
+  //    re-emits a separator at a segment boundary, exactly as the fence pass
+  //    does), or a surviving "\n" prints as a blank line on top of the
+  //    element's own margin.
+  const HEADING_RE = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*$/;
+  const QUOTE_RE = /^ {0,3}> ?(.*)$/;
+  const UL_RE = /^([ \t]*)[-*+][ \t]+(.*)$/;
+  const OL_RE = /^([ \t]*)(\d{1,9})[.)][ \t]+(.*)$/;
+  // Cheap pre-filter: a text with no line that could open a construct skips the
+  // whole pass. Deliberately loose — being wrong here only costs the fast path,
+  // never correctness, since a non-matching line falls through to the buffer.
+  const BLOCK_HINT = /^[ \t]{0,8}(?:#|>|[-*+_]|\d{1,9}[.)])/m;
+  const MAX_QUOTE_DEPTH = 4;   // guards `>>>>…` from recursing without bound
+  function indentWidth(s) {
+    let n = 0;
+    for (const ch of s) n += ch === "\t" ? 4 : 1;
+    return n;
+  }
+  // A horizontal rule: at most 3 leading spaces, then 3+ of ONE marker with
+  // spaces/tabs allowed between them and nothing else on the line.
+  //
+  // Written as a scan, not as `/^ {0,3}(?:(?:-[ \t]*){3,}|…)$/`. That regex is
+  // linear in V8 but recurses once per iteration in java.util.regex, and the
+  // Android port of this rule has to be the SAME rule — there, one long line of
+  // dashes overflowed the native stack inside a Composable, where the thrown
+  // StackOverflowError is an Error and the catch(Exception) around it cannot see
+  // it. A scan is the same rule on both sides, with no quantified group at all.
+  function isRuleLine(line) {
+    const s = String(line);
+    let i = 0;
+    while (i < 3 && s[i] === " ") i++;
+    const marker = s[i];
+    if (marker !== "*" && marker !== "-" && marker !== "_") return false;
+    let count = 0;
+    for (; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === marker) count++;
+      else if (ch !== " " && ch !== "\t") return false;
+    }
+    return count >= 3;
+  }
+  function listItemAt(line) {
+    const o = OL_RE.exec(line);
+    if (o) return { indent: indentWidth(o[1]), ordered: true, num: parseInt(o[2], 10), text: o[3] };
+    // An HR (`***`, `---`) wins over a bullet: it matched first in the caller,
+    // but re-check here so a nested call can't turn one into a one-item list.
+    if (isRuleLine(line)) return null;
+    const u = UL_RE.exec(line);
+    if (u) return { indent: indentWidth(u[1]), ordered: false, num: 1, text: u[2] };
+    return null;
+  }
+  // Render a run of list items as nested <ul>/<ol>s, keyed on indent width. A
+  // deeper item opens a sub-list INSIDE the open <li> (valid HTML); a shallower
+  // one closes back down; a marker-type switch at the same depth starts a new
+  // list. Every level open at the end has exactly one open <li> to close.
+  function renderList(items) {
+    let out = "";
+    const stack = [];
+    const openList = (it) => {
+      out += it.ordered
+        ? '<ol class="md-list"' + (it.num !== 1 ? ' start="' + String(it.num) + '"' : "") + ">"
+        : '<ul class="md-list">';
+      stack.push({ indent: it.indent, ordered: it.ordered });
+    };
+    for (const it of items) {
+      while (stack.length && it.indent < stack[stack.length - 1].indent) {
+        out += "</li></" + (stack.pop().ordered ? "ol" : "ul") + ">";
+      }
+      const top = stack[stack.length - 1];
+      if (!top || it.indent > top.indent) {
+        openList(it);
+      } else {
+        out += "</li>";
+        if (top.ordered !== it.ordered) {
+          out += "</" + (top.ordered ? "ol" : "ul") + ">";
+          stack.pop();
+          openList(it);
+        }
+      }
+      out += "<li>" + renderInline(it.text);
+    }
+    while (stack.length) out += "</li></" + (stack.pop().ordered ? "ol" : "ul") + ">";
+    return out;
+  }
+  function renderBlocks(text, depth) {
+    const s = String(text == null ? "" : text);
+    if (!BLOCK_HINT.test(s)) return renderInline(s); // no construct → plain prose
+    const d = depth || 0;
+    const lines = s.split("\n");
+    let out = "", i = 0, buf = [];
+    // A construct's own margin replaces the blank line markdown used to space
+    // it, so drop the blanks on either side rather than printing them too.
+    // `dropBlanks` is set only when a construct follows — the FINAL flush keeps
+    // the buffer verbatim, so a text with no construct in it at all comes back
+    // byte-identical to renderInline(), which callers and tests rely on.
+    const flush = (dropBlanks) => {
+      if (dropBlanks) { while (buf.length && buf[buf.length - 1].trim() === "") buf.pop(); }
+      if (buf.length) out += renderInline(buf.join("\n"));
+      buf = [];
+    };
+    const eatBlanks = () => { while (i < lines.length && lines[i].trim() === "") i++; };
+    while (i < lines.length) {
+      const line = lines[i];
+      const h = HEADING_RE.exec(line);
+      if (h) {
+        flush(true);
+        const n = h[1].length;
+        // GFM lets a heading be closed by a run of #s; they aren't content.
+        const body = h[2].replace(/[ \t]+#+[ \t]*$/, "");
+        out += "<h" + n + ' class="md-h">' + renderInline(body) + "</h" + n + ">";
+        i++; eatBlanks(); continue;
+      }
+      if (isRuleLine(line)) {
+        flush(true);
+        out += '<hr class="md-hr">';
+        i++; eatBlanks(); continue;
+      }
+      if (QUOTE_RE.test(line)) {
+        flush(true);
+        const body = [];
+        while (i < lines.length && QUOTE_RE.test(lines[i])) { body.push(QUOTE_RE.exec(lines[i])[1]); i++; }
+        const inner = body.join("\n");
+        out += '<blockquote class="md-quote">' +
+          (d < MAX_QUOTE_DEPTH ? renderBlocks(inner, d + 1) : renderInline(inner)) + "</blockquote>";
+        eatBlanks(); continue;
+      }
+      const li = listItemAt(line);
+      if (li) {
+        flush(true);
+        const items = [li];
+        i++;
+        for (;;) {
+          // GFM lazy continuation: a MORE-indented, non-construct line belongs
+          // to the item above it. Without this a wrapped bullet ended the list,
+          // rendered its own second line as a bare paragraph flush to the
+          // container's left edge, and started a fresh list underneath — on 3%
+          // of the list-bearing prose in the real corpus.
+          const cur = i < lines.length ? lines[i] : null;
+          if (cur !== null && cur.trim() !== "" && !listItemAt(cur) &&
+              !HEADING_RE.test(cur) && !isRuleLine(cur) && !QUOTE_RE.test(cur) &&
+              indentWidth(/^[ \t]*/.exec(cur)[0]) > items[items.length - 1].indent) {
+            // Joined with the newline it had: <li> is white-space:normal inside
+            // these pre-wrap containers, so it collapses to the wrap it was.
+            items[items.length - 1].text += "\n" + cur.trim();
+            i++; continue;
+          }
+          // A single blank line between items keeps ONE list (a GFM "loose"
+          // list), rather than splitting it into two adjacent <ul>s.
+          let k = i;
+          if (k < lines.length && lines[k].trim() === "") k++;
+          const nxt = k < lines.length ? listItemAt(lines[k]) : null;
+          if (!nxt) break;
+          items.push(nxt); i = k + 1;
+        }
+        out += renderList(items);
+        eatBlanks(); continue;
+      }
+      buf.push(line); i++;
+    }
+    flush(false);
     return out;
   }
 
@@ -256,10 +573,14 @@
   // header row (a line with `|`) immediately followed by a delimiter row (cells
   // of dashes with optional leading/trailing colons for alignment), then body
   // rows until the first line that isn't a pipe row. Recognised tables become
-  // real <table> elements; everything else falls straight through renderInline()
-  // so non-table prose is byte-identical to before. Cells and prose alike are
-  // renderInline()'d, so injection safety is inherited from esc()/linkify() and
-  // `code` works in a cell too.
+  // real <table> elements; everything else falls through renderBlocks() (which
+  // in turn falls through to renderInline() for plain prose), so non-table,
+  // construct-free prose is byte-identical to before. Cells are renderInline()'d
+  // — a cell is not a block context — so injection safety is inherited from
+  // esc()/linkify() and `code`/**bold** work in a cell too.
+  //
+  // Running FIRST is what keeps a `|---|---|` delimiter row out of the rule
+  // pass below; a bare `---` has no pipe, so it never looks like a table.
   //
   // renderProse() runs the fenced-code pass over this one (see below), so a
   // pipe row inside a code block is never mistaken for a table.
@@ -300,10 +621,10 @@
   }
   function renderTables(text) {
     const s = String(text == null ? "" : text);
-    if (s.indexOf("|") < 0) return renderInline(s); // no pipe → no table possible
+    if (s.indexOf("|") < 0) return renderBlocks(s); // no pipe → no table possible
     const lines = s.split("\n");
     let out = "", i = 0, buf = [];
-    const flush = () => { if (buf.length) { out += renderInline(buf.join("\n")); buf = []; } };
+    const flush = () => { if (buf.length) { out += renderBlocks(buf.join("\n")); buf = []; } };
     while (i < lines.length) {
       const isTableHead = i + 1 < lines.length && hasPipe(lines[i]) && isDelimiterRow(lines[i + 1]) &&
         splitRow(lines[i]).length === splitRow(lines[i + 1]).length;
@@ -430,7 +751,7 @@
   // contains an <svg> among other content.
   const SVG_FENCE = /^\s*<svg[\s>][\s\S]*<\/svg\s*>\s*$/i;
   function renderProse(text) {
-    const s = String(text == null ? "" : text);
+    const s = normalizeEol(String(text == null ? "" : text));
     if (s.indexOf("```") < 0) return renderSvgAndText(s); // no fence → still scan for raw SVG
     const lines = s.split("\n");
     let out = "", i = 0, buf = [];
@@ -851,6 +1172,64 @@
     return out;
   }
 
+  // ---- degraded (block-less) entries ----------------------------------------
+  // An older agent, or the text-only heartbeat cache seed, carries no blocks[] —
+  // only a flat `text` that hub-agent.py's `_entry_text` built by appending a
+  // bare `[Bash]` / `[Read]` marker per tool_use, in content order and with no
+  // separator. Rendering that verbatim was worse than the rich path in two
+  // ways: the operator read a literal "[Bash]" as something the model SAID, and
+  // because it was a TEXT block, Concise — which hides `kind:"action"` cards —
+  // could not reach it. Split the trailing marker run back into name-only
+  // tool_use blocks so the existing action card draws them and the verbosity
+  // filter works for free.
+  //
+  // Matching is deliberately narrow, because a REAL text block may legitimately
+  // contain brackets ("see [1]", "the plan [WIP]"): this runs only on the
+  // SYNTHESIZED path (never on a real {t:"text"} block), only for an assistant
+  // turn, only on a run of markers at the very END of the text (tool_use blocks
+  // always follow the text ones, so that is the only shape `_entry_text` can
+  // produce), only for a plausible tool name (`Bash`, `mcp__server__tool`), and
+  // only when the run is NOT preceded by a space or tab — `_entry_text` joins
+  // with no separator, so a real run abuts its text or a line break, while
+  // prose puts a space before its bracket.
+  //
+  // Peeled backwards one `[Name]` at a time rather than with
+  // `/(?:\[[A-Za-z][A-Za-z0-9_-]*\])+$/`. That regex is unanchored on the left,
+  // so on text that does NOT end in a marker it retries from every `[` in the
+  // message — quadratic, and seconds of blocked main thread on a big degraded
+  // entry. Walking back from the end touches each character once.
+  const TOOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
+  function trailingMarkerStart(t) {
+    let start = t.length;
+    for (;;) {
+      if (start < 2 || t[start - 1] !== "]") break;
+      const open = t.lastIndexOf("[", start - 2);
+      if (open < 0) break;
+      if (!TOOL_NAME_RE.test(t.slice(open + 1, start - 1))) break;
+      start = open;
+    }
+    return start < t.length ? start : -1;
+  }
+  function degradedBlocks(text, role, truncated) {
+    const t = String(text == null ? "" : text);
+    if (!t) return [];
+    // The clip happened at the ROW, so it belongs to the PROSE this splits out —
+    // never to a name-only tool_use marker, which was never truncated content.
+    const txt = (v) => (truncated ? { t: "text", text: v, truncated: true }
+                                  : { t: "text", text: v });
+    if (role !== "assistant") return [txt(t)];
+    const start = trailingMarkerStart(t);
+    if (start < 0) return [txt(t)];
+    const before = t.slice(0, start);
+    if (/[ \t]$/.test(before)) return [txt(t)];
+    const out = [];
+    if (before.trim()) out.push(txt(before));
+    for (const name of t.slice(start + 1, -1).split("][")) {
+      out.push({ t: "tool_use", name: name, input: "", degraded: true });
+    }
+    return out;
+  }
+
   // ---- build display items from rich entries --------------------------------
   // Items: {kind:"msg",role,text,truncated,id} | {kind:"thinking",text,truncated,id}
   //        | {kind:"action", id, name, input, inputTrunc, result:{text,isError,truncated}|null, entryId}
@@ -883,15 +1262,25 @@
       // same buildItems drives both — data-uuid (scroll-to-hit) and the card
       // persistence keys stay real for archived transcripts too.
       const eid = e.id != null ? e.id : e.uuid;
-      // Older agents / a text-only cache seed carry no blocks: synthesize one.
-      // Carry the ROW's truncation flag onto it — a flat preview is clipped at
-      // the row, not per block, and without this the bubble renders a message
-      // cut mid-word with no "… clipped to fit" mark, so the operator reads the
-      // cut as the message.
+      // Older agents / the text-only cache seed carry no blocks: synthesize
+      // them. Two things have to happen here, and they are independent:
+      //
+      // (a) `_entry_text` (hub-agent.py) flattens an assistant turn by appending
+      //     a bare `[Bash]` / `[Read]` marker per tool_use, in content order and
+      //     with no separator — so a degraded row ends in a RUN of markers.
+      //     `degradedBlocks` splits those back out into name-only tool_use
+      //     blocks rather than leaving them as prose, or the fallback renders
+      //     MORE intrusively than the rich path: a text block cannot be hidden
+      //     by Concise, which only filters action cards.
+      //
+      // (b) The row's truncation flag must ride onto the synthesized TEXT, since
+      //     a flat preview is clipped at the ROW (the heartbeat seed cuts at
+      //     `TAIL_MSG_CHARS`), not per block. Without it the bubble shows a
+      //     message cut mid-word with no "… clipped to fit" mark and the
+      //     operator reads the cut as the message itself.
       const blocks = (e.blocks && e.blocks.length)
         ? e.blocks
-        : (e.text ? [e.truncated ? { t: "text", text: e.text, truncated: true }
-                                 : { t: "text", text: e.text }] : []);
+        : degradedBlocks(e.text, role, e.truncated);
       let msg = null;
       const flush = () => { if (msg) { items.push(msg); msg = null; } };
       for (const b of blocks) {
@@ -917,6 +1306,9 @@
           // an Edit's actual diff, a Write's file body, an ExitPlanMode plan,
           // any tool's human description.
           if (b.desc) act.desc = b.desc;
+          // Reconstructed from a block-less entry's flat text (degradedBlocks):
+          // the NAME is all there is, so the card says so instead of "running…".
+          if (b.degraded) act.degraded = true;
           if (b.edit) act.edit = { old: b.edit.old || "", new: b.edit.new || "", replaceAll: !!b.edit.replaceAll };
           if (b.content) act.content = b.content;
           if (b.plan) act.plan = b.plan;
@@ -1028,6 +1420,17 @@
   // one back — that is the ticket.
   function clipMark(truncated) {
     return truncated ? '<span class="clipped">… clipped to fit</span>' : "";
+  }
+
+  // The first line of some markdown, as a plain one-line card summary: heading
+  // hashes, a leading bullet and emphasis markers are syntax, and on a single
+  // collapsed line they read as noise rather than as formatting.
+  function chipLine(text) {
+    return String(text == null ? "" : text).split("\n")[0]
+      .replace(/^ {0,3}#{1,6}[ \t]+/, "")
+      .replace(/^ {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+/, "")
+      .replace(/\*{1,3}|~~/g, "")
+      .trim();
   }
 
   function renderMsg(it) {
@@ -1148,13 +1551,23 @@
     const statusCls = it.result ? (it.result.isError ? "err" : "ok") : "";
     // A plan card's salient line is the plan itself; a SendUserFile card's is its
     // caption or a file count — not the raw input JSON either would fall back to.
-    const argSrc = it.plan || (it.files ? "" : it.input);
-    let argOne = argSrc ? esc(argSrc.split("\n")[0]) : "";
+    // String()-guarded, here and at every other `<field>.split("\n")` on a card
+    // (desc, caption, args): a block whose field arrived as an object rather
+    // than a string threw a TypeError out of itemsToHtml and took the WHOLE
+    // transcript render down with it. The live agent clips these to strings, so
+    // this is defence against a malformed/forged block, not a shape we see.
+    const argSrc = it.plan || (it.files ? "" : (it.input ? String(it.input) : ""));
+    // A plan's first line is MARKDOWN, and the card collapses it to one line —
+    // so the syntax has to come off, or the header reads "ExitPlanMode ## The
+    // plan" beside a body that renders the same heading properly. Only the plan
+    // gets this: a raw tool input is not markdown, and stripping `*` there would
+    // eat the glob out of an `ls *.js` chip.
+    let argOne = argSrc ? esc(it.plan ? chipLine(argSrc) : argSrc.split("\n")[0]) : "";
     if (it.files && !argOne) {
-      argOne = esc(it.caption ? it.caption.split("\n")[0]
+      argOne = esc(it.caption ? String(it.caption).split("\n")[0]
         : it.files.length + (it.files.length === 1 ? " file" : " files"));
     }
-    const descOne = it.desc ? '<span class="tool-desc">' + esc(it.desc.split("\n")[0]) + "</span>" : "";
+    const descOne = it.desc ? '<span class="tool-desc">' + esc(String(it.desc).split("\n")[0]) + "</span>" : "";
     let body = "";
     // A SendUserFile delivery renders its files (the point of the card); its raw
     // input JSON would just be the same paths, so it's suppressed when files show.
@@ -1187,7 +1600,11 @@
         '</div><pre class="tool-result">' + esc(it.result.text || "(no output)") + "</pre>" +
         clipMark(it.result.truncated) + "</div>";
     }
-    if (!body) body = '<div class="tool-block"><div class="tool-label">running…</div></div>';
+    if (!body) {
+      body = it.degraded
+        ? '<div class="tool-block"><div class="tool-label">no detail recorded for this call</div></div>'
+        : '<div class="tool-block"><div class="tool-label">running…</div></div>';
+    }
     const taskCls = it.task ? " task" : "";
     const icon = it.task ? '<span class="tool-glyph">◆</span>' : '<span class="tool-dot"></span>';
     // A plan (approval) and a SendUserFile delivery (its files ARE the point) are
@@ -1207,7 +1624,7 @@
   function renderCommandCard(it) {
     const key = "cmd:" + it.id;
     const head = '<span class="cmd-glyph">›</span><span class="cmd-name">' + esc(it.name) + "</span>" +
-      (it.args ? '<span class="cmd-args">' + esc(it.args.split("\n")[0]) + "</span>" : "");
+      (it.args ? '<span class="cmd-args">' + esc(String(it.args).split("\n")[0]) + "</span>" : "");
     if (!it.result) {
       return '<div class="cmd-card" data-uuid="' + esc(it.id) + '">' + head +
         clipMark(it.argsTrunc) + "</div>";
@@ -1340,8 +1757,13 @@
     // re-captures handled there, see XERK-19), so what lands here is the block
     // the pane is actually generating.
     if (liveTurn) {
+      // renderInline, NOT renderProse: parsePaneLiveTurn (tunnel-agent.js)
+      // deliberately reflows the pane's hard-wrapped lines into ONE flowed line,
+      // so this text has no line structure for a block pass to read — a `##`
+      // would land mid-line. Inline code, links and emphasis are meaningful and
+      // this is the surface the operator watches while the agent works.
       html += '<div class="tr-msg assistant streaming" id="chatLiveBubble"><span class="role">assistant</span>' +
-        esc(liveTurn) + "</div>";
+        renderInline(liveTurn) + "</div>";
     }
     // Still-queued prompts (typed mid-turn) trail the live turn, where they'll
     // actually run — the TUI shows the same list under its input box. Each is a

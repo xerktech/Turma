@@ -26,6 +26,84 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   launches.
 - Agents connect outbound-only to `TURMA_URL` (Cloudflare tunnel) — works from any network.
 
+### The trust-folder modal, and why it KILLED sessions (XERK-868)
+
+- A repo Claude Code has never run in opens its **trust-folder modal** before anything else, and its
+  DEFAULT is **"No, exit"** — so the FIRST Enter anything sends ends claude and takes its tmux with it.
+  Nothing on this agent could see that modal, which is the whole bug: it carries no numbered options
+  (so `parse_pane_prompt` is None), no "esc to interrupt" (so `_busy_from_capture` is False) and no
+  mode footer (so `parse_pane_mode` is None) — every "safe to type into?" read called it an idle
+  composer. `_reconcile_rc_names` then typed `/rename <summary>` + Enter on the first beat after the
+  summary landed, seconds after spawn. Symptom: the terminal serving tmux's own
+  `can't find session: agent-<id>` while the card still read running.
+- **`_pane_blocking_dialog` is now the ONE predicate every such guard uses** (`_reconcile_rc_names`,
+  `_apply_pending_switches`, `_poll_pending_inputs`' resend, `send_input`) — `parse_pane_prompt` OR
+  `_trust_dialog_up`. Add a new pane-typing path → use it, never a bare `parse_pane_prompt`.
+- **A NUMBERED dialog is never the trust modal, and `_trust_dialog_up` MUST keep checking that.**
+  A tool-permission dialog shows no mode footer either — that is what makes `parse_pane_prompt`
+  work — so with the footer as the only guard, any Write/Bash dialog whose diff, command or
+  description carried a short `trust this folder` line read as the modal, and the beat drove arrows
+  + Enter into it, APPROVING a tool call in a session launched in MANUAL permission mode. QA
+  reproduced it 16s into an ordinary spawn. The trigger text is not exotic: `hub-agent.py` and this
+  file now contain it, so a session editing XERK-868 shows it in a diff.
+  Tests: `test_a_live_permission_dialog_is_never_the_trust_modal`.
+- **The trust modal is deliberately NOT a `panePrompt`.** That wire contract's four conditions
+  (`agent.md`) are unchanged, and the chat page renders its options as clickable DIGITS — this modal
+  is arrow-driven and has none, so surfacing it there would offer a button that does nothing.
+- **Turma AUTO-ACCEPTS it, scoped.** `_trust_watch` arms a launch window on every Claude launch and
+  the beat's `_answer_trust_dialogs` answers it via `_answer_trust_dialog` (navigate to the accept
+  option; NEVER a bare Enter). **Only for a workspace under `REPOS_ROOT`** (`_trust_scope_ok`) — a
+  repo this agent scans or a worktree it cut. That is security-relevant: it grants what the dialog
+  gates, reading/editing/executing that folder including any `.claude/` settings and hooks it
+  carries. The operator spawned against that repo deliberately and Turma already launches with
+  `--permission-mode auto`/`bypassPermissions` plus its guard `--settings`, so the modal is not the
+  boundary doing the work; the alternative is a session that cannot start. `TURMA_AUTO_TRUST=0` turns
+  it off. **Never widen the scope to an arbitrary path.**
+  - **What it really costs, measured:** a repo carrying a `SessionStart` hook in `.claude/settings.json`
+    runs that command as the agent user the moment the modal is accepted — QA proved it. The trust
+    dialog is the ONLY gate on hooks (`bypassPermissions` governs tool approvals, not hooks).
+  - **"Under `REPOS_ROOT`" is NOT the same as "a repo a human put there"**: `clone` writes into
+    `REPOS_ROOT`, so a repo the agent cloned on request is auto-trusted on its first session and
+    runs its hooks before any human sees it. `GH_CLONE_OWNERS` allowlisting and the operator asking
+    for the clone are what bound this; narrowing the path would NOT (a cloned repo's worktree is
+    under `WORKTREES_ROOT` like any other). Know this before relying on auto-trust in a fleet that
+    clones from owners it does not control.
+- **The answering half and the guarding half are independent, on purpose.** Out-of-scope (or
+  auto-trust off) leaves the modal up for a human, and the guard keeps everything else off the pane
+  meanwhile.
+- **BOTH auto-answering paths are bounded by the launch window** (`TRUST_ANSWER_WINDOW_SEC`) — the
+  beat's `_answer_trust_dialogs` AND `_clear_trust_dialog`, which `send_input` calls. The second
+  used to answer at any age, which made it a second UNWINDOWED path reachable through any operator
+  message, defeating the bound the first one has. Outside the window `send_input` HOLDS the message
+  instead; it never types into a dialog and never answers one.
+- Beat budget: at most `TRUST_CHECKS_PER_BEAT` captures AND at most ONE answer per beat, each
+  keystroke bounded by `_TRUST_KEY_TIMEOUT_SEC` (not `run()`'s 15s) and the step count by
+  `_TRUST_MAX_STEPS` — all independent of `MAX_SESSIONS`. An implausible cursor distance sends
+  NOTHING rather than pressing arrows it cannot justify.
+- Tests: `TestTrustDialogIsABlockingDialog`, `TestReconcileRcNamesTrustModal`,
+  `TestAnswerTrustDialogSweep`, `TestAnswerTrustDialog` (both the Windows and the real Linux frame).
+
+### A dead tmux must not read `running` forever (XERK-868)
+
+- The runtime is its tmux session's only command, so a missing tmux means claude/qwen/dsh EXITED.
+  Nothing on the beat checked this: the card kept saying running, the slot stayed spent, and the
+  orphaned ttyd kept serving tmux's raw error as if it were the terminal.
+- `_sweep_dead_sessions` runs on the beat, BEFORE the payload, and ends such a session with an
+  operator-visible `errorMsg`; it reaps the orphaned ttyd first, and keeps the worktree and the
+  transcript (like `kill`), so **Start resumes the conversation**.
+- **One `tmux list-sessions` for the WHOLE fleet** (`_live_tmux_names`) — never `has-session` per
+  session, which would put `MAX_SESSIONS` timeouts on the beat.
+- **"No server" is EMPTY, not unknown.** The tmux server exits with its LAST session, so a host
+  running exactly one session — the reported incident's own shape — gets rc 1 the moment that
+  session dies. Reading that as "can't tell" left exactly the session this sweep exists for reading
+  `running` forever, and `resume_on_boot` does NOT cover it (it runs only at manager START). Only
+  tmux's two explicit wordings (`no server running`, `error connecting to`) mean empty.
+- Otherwise conservative by construction, because a false positive ENDS a live session: every OTHER
+  nonzero rc, and a failure to launch tmux at all, is **"can't tell"**; a `queued` record has no
+  tmux by design; and a name must be missing `DEAD_TMUX_STRIKES` CONSECUTIVE beats, since the
+  listing and the scan are not atomic. Windows is left to `_pty_alive`.
+- Tests: `TestSweepDeadSessions`.
+
 ## Repos-root sessions
 
 - Run `claude` directly in `REPOS_ROOT` — no worktree, no branch, base-branch option doesn't apply.

@@ -19,9 +19,45 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
 
 - **One pty-host process per session replaces BOTH tmux AND ttyd.** So `_spawn_in_tmux`+`_launch_ttyd`
   COLLAPSE into `_spawn_pty_host` on Windows (the pty-host owns the pty and serves the terminal on the
-  same stable `ttydPort` the hub proxies `/term/<id>` to). `_launch_ttyd` and `_kill_ttyd` NO-OP on
-  Windows; `_kill_tmux` tears the pty-host down (kill+state-file removal). Every kill/delete/restart
-  path runs `_kill_tmux` before `_kill_ttyd`, so nothing leaks.
+  same stable `ttydPort` the hub proxies `/term/<id>` to). `_kill_ttyd` NO-OPs on Windows; `_kill_tmux`
+  tears the pty-host down. Every kill/delete/restart path runs `_kill_tmux` before `_kill_ttyd`, so
+  nothing leaks.
+- **`_launch_ttyd` is NOT a bare no-op on Windows** — there is no bridge to re-ensure, but it still
+  owes the XERK-578 post-roll check its Linux branch performs (`_ensure_pty_auth_current`, below).
+- **A token ROLL must not cost the session** (XERK-578). The Linux branch kills and relaunches a stale
+  ttyd, which is free because tmux (and the claude in it) lives on; here the pty-host IS the pty. So
+  the manager publishes the live token to ONE host-wide file (`_write_pty_token_file`, at boot and
+  before every spawn) that every pty-host re-reads per auth check — republishing it IS the roll, with
+  no relaunch and nothing lost. **The manager is the only writer**, which is why `_pty_control` can
+  keep authenticating with the env `TURMA_TOKEN`: the file always equals it.
+  - `_spawn_pty_host` records `sess["ttydTokenFp"]` like the Linux launch does; without it nothing
+    could tell a roll had moved the token under a surviving pty-host.
+  - A pty-host whose state carries no `authTokenFile` predates this and can NEVER match again — the
+    terminal 401s, the ws upgrade is refused, AND `capture`/`inject`/`kill` all fail while its pid
+    stays alive and the session reports `running` forever. That zombie is strictly worse than a
+    stopped session, so it is torn down and Restart rebuilds it. **That branch is destructive, so
+    what it keys on had better be real**: the field is dropped unless `serializeState` publishes it
+    too (see `windows-terminal.md`), and a manager-side test that hand-writes it into a fake state
+    file proves nothing.
+  - **Honour `_write_pty_token_file`'s return.** `ttydTokenFp` is the guard that short-circuits the
+    whole heal, so stamping it after a write that FAILED marks the roll done and never retries it.
+- **`_pty_still_running` may `waitpid` ONLY a pid in `_PTY_OWN_PIDS`.** The reap exists because the
+  POSIX arm deliberately drops the Popen handle (the pty-host is detached), so a real teardown would
+  otherwise poll a zombie for the whole `PTY_TEARDOWN_WAIT_SEC` and report the reap as FAILED. But
+  `waitpid` CONSUMES an exit status, and a state-file pid can name a RECYCLED pid now belonging to
+  another manager child — reaping that hands its owner's `.wait()` a 0 in place of the real code, so
+  a failed clone reads as success. Registering the pid at spawn and reaping it here are one change.
+  **Never set this test up with `proc.wait()`** — that IS a `waitpid`, so it reaps the zombie itself
+  and the assertion passes with the fix removed.
+- **`_pty_teardown` removes the state file ONLY once the pid is confirmed gone** (it returns False
+  otherwise). The state file is the only handle to a pty-host — there is deliberately no in-memory
+  registry — so dropping it after a kill that did not take loses the process permanently: `_pty_alive`
+  reads False, `_pty_control` finds no port, `_kill_ttyd` no-ops, and the orphan keeps claude.exe alive
+  in the worktree and its `ttydPort` bound.
+- **`_pty_spawn_and_wait` waits for the old terminal port to be RELEASED before rebinding it**, as the
+  Linux ttyd relaunch does; and it refuses to launch only while that port is demonstrably still held.
+  **The port is the authority, not the pid** — Windows recycles pids aggressively, so refusing on a
+  state-file pid alone would strand a session forever.
 - **The pty-host STATE FILE is the single source of truth — there is NO in-memory registry.** Every
   terminal helper (`_capture_pane`/`_type_into_pane`/`_tmux_alive`/`_pane_send_keys`) resolves the
   session from `<REGISTRY_DIR>/pty-hosts/<tmuxName>.state.json` (`{pid, ctrlPort, termPort}`) keyed by
@@ -33,6 +69,13 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
   `tmux` subprocess it replaces. `inject`/`capture`/`alive`/`resize`/`kill` are the tmux-CLI ops. It
   authenticates with `TURMA_TOKEN or 'changeme'` = the pty-host's `--auth-token` = ttyd's `-c` token,
   so nothing hub-side changes (`.claude/rules/windows-terminal.md`).
+- **A control op ON THE BEAT takes `PTY_CONTROL_BEAT_TIMEOUT_SEC` (1.5s), not the 5s teardown budget**,
+  and `_pane_status` takes ONE capture for busy + mode + prompt (a second only on the busy->idle edge).
+  Unlike Linux's `tmux capture-pane` subprocess, each capture here is a TCP connect + RFC 6455
+  handshake, and the old shape was three at 5s per session: times `MAX_SESSIONS` that is 90s against
+  the hub's 75s `OFFLINE_AFTER_MS`, flapping a healthy host offline — the CLAUDE.md beat-loop contract.
+  A missed capture just reads "can't tell", which the transcript-freshness fallback already handles.
+  Tests: `TestBeatLoopBudget.test_pane_capture_worst_case_fits_under_the_offline_threshold`.
 - **A MULTI-LINE composer send must DELAY the Enter after the paste** (`_pty_inject`,
   `PTY_SUBMIT_SETTLE_SEC`). Claude Code collapses a multi-line bracketed paste into a
   `[Pasted text +N lines]` chip, and an Enter that races that collapse is ABSORBED — the message

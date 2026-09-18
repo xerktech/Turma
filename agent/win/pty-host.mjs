@@ -25,7 +25,7 @@
 import { WebSocketServer } from 'ws';
 import * as pty from 'node-pty';
 import { createServer } from 'node:http';
-import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, lstatSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import process from 'node:process';
@@ -51,7 +51,12 @@ const BASE = arg('base-path', `/term/${SESSION}`);
 const TERM_PORT = parseInt(arg('term-port', '0'), 10);   // 0 = ephemeral; manager allocates off TTYD_PORT_BASE
 const CTRL_PORT = parseInt(arg('ctrl-port', '0'), 10);   // 0 = ephemeral; published in state
 const STATE = arg('state', join(HERE, `pty-host-${SESSION}.state.json`));
-const TOKEN = arg('auth-token', '');                     // the `term:<TOKEN>` basic-auth password
+const BAKED_TOKEN = arg('auth-token', '');               // the `term:<TOKEN>` basic-auth password
+// The manager-owned file holding the token CURRENTLY in force. Re-read per auth
+// check so a hub token roll needs no relaunch (see authTokensInForce's comment) —
+// which on Windows would mean killing the operator's live claude, the pty-host
+// being both the terminal and the pty. Empty/absent = the baked token, unchanged.
+const TOKEN_FILE = arg('auth-token-file', '');
 const COLS = parseInt(arg('cols', '80'), 10);
 const ROWS = parseInt(arg('rows', '24'), 10);
 const RING_MAX = parseInt(arg('scrollback', String(256 * 1024)), 10);
@@ -80,24 +85,60 @@ const START = new Date().toISOString();
 // invention, unlike ttyd's optional `-c`). The manager ALWAYS mints one
 // (`_launch_ttyd` passes `-c term:{TURMA_TOKEN or 'changeme'}`), so an empty token
 // is a misconfiguration, not a mode — refuse to start rather than run open.
-if (TOKEN === '' || TOKEN == null) {
+if (BAKED_TOKEN === '' || BAKED_TOKEN == null) {
   process.stderr.write('pty-host: --auth-token is required (refusing to run the terminal + control channel unauthenticated)\n');
   process.exit(2);
 }
 
-// ---- the pty (ConPTY on Windows) ---------------------------------------------
-// COLORTERM advertises truecolor to the app (the direct analog of tmux.conf's
-// RGB terminal-override — with no tmux in the middle, 24-bit sequences pass
-// straight through to xterm.js, which is truecolor). OSC 52 copy-out likewise
-// passes through as raw output for the hub's injected handler to catch.
-const term = pty.spawn(CMD, CMD_ARGS, {
-  name: 'xterm-256color',
-  cols: COLS,
-  rows: ROWS,
-  cwd: CWD,
-  env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
-});
+// The tokens in force for THIS check: the manager's live file AND the baked one
+// (see authTokensInForce for why BOTH). A manager that rewrites the file after a
+// roll is obeyed immediately, with no relaunch and no lost session.
+//
+// The read is HARDENED because it runs on the pty-host's ONLY thread, on every
+// auth check, against a path another same-uid process can replace:
+//   * a non-REGULAR file is refused outright — opening a planted FIFO here blocks
+//     the event loop FOREVER, wedging the terminal AND the manager's control
+//     channel while the pid stays alive (the zombie, by another door);
+//   * a file over TOKEN_FILE_MAX is refused rather than read — a 10 MB one costs
+//     ~22ms of blocking read PER REQUEST;
+//   * the answer is cached on (mtime, size, inode, dev), so the steady state is
+//     one stat, not a read.
+// Every refusal falls back to the baked token, never to an empty one (an empty
+// token means "no auth required" to basicAuthOk and would open the control
+// channel that accepts inject/kill).
+const TOKEN_FILE_MAX = 4096;
+let tokenCache = { key: null, tokens: null };
+function authTokens() {
+  if (!TOKEN_FILE) return [BAKED_TOKEN];
+  try {
+    const st = lstatSync(TOKEN_FILE);
+    if (!st.isFile() || st.size > TOKEN_FILE_MAX) throw new Error('unusable token file');
+    const key = T.tokenCacheKey(st);
+    if (tokenCache.key === key) return tokenCache.tokens;
+    const tokens = T.authTokensInForce(readFileSync(TOKEN_FILE, 'utf8'), BAKED_TOKEN);
+    tokenCache = { key, tokens };
+    return tokens;
+  } catch { /* unreadable/unusable: the baked token alone */ }
+  tokenCache = { key: null, tokens: null };
+  return T.authTokensInForce(null, BAKED_TOKEN);
+}
+// The token a request authenticated WITH, or null. `/token` must echo THAT one:
+// the browser sends it straight back as the ws init AuthToken, so answering with
+// a different in-force token would fail the pty-host's own second check.
+function matchedToken(header) {
+  for (const t of authTokens()) if (T.basicAuthOk(header, t)) return t;
+  return null;
+}
 
+// ---- the pty (ConPTY on Windows) ---------------------------------------------
+// SPAWNED ONLY ONCE BOTH SERVERS ARE LISTENING (see startPty below). Spawning it
+// at module top meant a bind failure — EADDRINUSE from a port a failed teardown
+// left held, or any squatter that won the TOCTOU against the manager's
+// `_port_open` probe — killed the process with claude.exe already running under
+// the ConPTY, leaking a child nothing could reach and making the manager wait out
+// the full PTY_SPAWN_TIMEOUT_SEC on its beat. Bind first, spawn second: a bind
+// failure then costs nothing but a clean non-zero exit with a reason in the log.
+let term = null;
 const ring = new T.ScrollbackRing(RING_MAX);
 // The rendered-screen grid the control `capture` reads (XERK-703). The ring above
 // is raw bytes over time and loses Claude Code's paint-once interrupt-hint footer
@@ -105,36 +146,51 @@ const ring = new T.ScrollbackRing(RING_MAX);
 // keeps the footer as a persistent screen element, the `capture-pane -p` analog.
 const grid = new T.TerminalGrid(COLS, ROWS);
 const termClients = new Set();
-let ptyAlive = true;
+let ptyAlive = false;
 let exitCode = null;
 
-term.onData((d) => {
-  const buf = Buffer.from(d, 'utf8');
-  ring.append(buf);
-  grid.write(buf);
-  const frame = T.outputFrame(buf);
-  for (const ws of termClients) if (ws.readyState === ws.OPEN) ws.send(frame);
-});
+// COLORTERM advertises truecolor to the app (the direct analog of tmux.conf's
+// RGB terminal-override — with no tmux in the middle, 24-bit sequences pass
+// straight through to xterm.js, which is truecolor). OSC 52 copy-out likewise
+// passes through as raw output for the hub's injected handler to catch.
+function startPty() {
+  term = pty.spawn(CMD, CMD_ARGS, {
+    name: 'xterm-256color',
+    cols: COLS,
+    rows: ROWS,
+    cwd: CWD,
+    env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
+  });
+  ptyAlive = true;
 
-term.onExit(({ exitCode: code }) => {
-  ptyAlive = false;
-  exitCode = code ?? 0;
-  writeState();
-  // Give clients a beat to flush the final bytes, then exit — a real host
-  // lingers briefly so a re-attach right at exit still sees the last screen.
-  setTimeout(() => process.exit(0), 100);
-});
+  term.onData((d) => {
+    const buf = Buffer.from(d, 'utf8');
+    ring.append(buf);
+    grid.write(buf);
+    const frame = T.outputFrame(buf);
+    for (const ws of termClients) if (ws.readyState === ws.OPEN) ws.send(frame);
+  });
+
+  term.onExit(({ exitCode: code }) => {
+    ptyAlive = false;
+    exitCode = code ?? 0;
+    writeState();
+    // Give clients a beat to flush the final bytes, then exit — a real host
+    // lingers briefly so a re-attach right at exit still sees the last screen.
+    setTimeout(() => process.exit(0), 100);
+  });
+}
 
 // ---- pty adapter for the pure control handler --------------------------------
 const adapter = {
-  write: (s) => term.write(s),
-  resize: (c, r) => { try { term.resize(c, r); grid.resize(c, r); } catch { /* pty may have exited */ } },
-  kill: () => { try { term.kill(); } catch { /* already dead */ } },
+  write: (s) => { if (term) term.write(s); },
+  resize: (c, r) => { try { term?.resize(c, r); grid.resize(c, r); } catch { /* pty may have exited */ } },
+  kill: () => { try { term?.kill(); } catch { /* already dead */ } },
   // The RENDERED visible screen (tmux capture-pane -p analog), not the raw ring —
   // so `_busy_from_capture`'s marker scan sees the persistent footer (XERK-703).
   capture: () => grid.capture(),
   get pid() { return process.pid; },
-  get ptyPid() { return term.pid; },
+  get ptyPid() { return term ? term.pid : null; },
   get alive() { return ptyAlive; },
   get exitCode() { return exitCode; },
 };
@@ -146,7 +202,8 @@ function unauthorized(res) {
 }
 const termHttp = createServer((req, res) => {
   const path = req.url.split('?')[0];
-  if (!T.basicAuthOk(req.headers.authorization, TOKEN)) return unauthorized(res);
+  const tok = matchedToken(req.headers.authorization);
+  if (tok === null) return unauthorized(res);
   const route = T.routeHttp(path, BASE);
   if (route.kind === 'redirect') {
     // Preserve the query byte-for-byte (ttyd does; server.js relies on it).
@@ -160,7 +217,7 @@ const termHttp = createServer((req, res) => {
     return res.end(req.method === 'HEAD' ? undefined : INDEX_HTML);
   }
   if (route.kind === 'token') {
-    const body = Buffer.from(T.tokenResponseBody(TOKEN), 'utf8');
+    const body = Buffer.from(T.tokenResponseBody(tok), 'utf8');
     res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': body.length });
     return res.end(req.method === 'HEAD' ? undefined : body);
   }
@@ -173,7 +230,7 @@ const termWss = new WebSocketServer({
   path: BASE + T.WS_PATH_SUFFIX,
   // xterm.js negotiates the `tty` subprotocol; preserve it exactly.
   handleProtocols: (protocols) => (protocols.has(T.WS_SUBPROTOCOL) ? T.WS_SUBPROTOCOL : false),
-  verifyClient: (info) => T.basicAuthOk(info.req.headers.authorization, TOKEN),
+  verifyClient: (info) => matchedToken(info.req.headers.authorization) !== null,
 });
 
 termWss.on('connection', (ws) => {
@@ -189,7 +246,7 @@ termWss.on('connection', (ws) => {
     switch (f.kind) {
       case 'init': {
         // ttyd's second auth check; the ws upgrade already carried basic auth.
-        if (!T.initAuthOk(f.authToken, TOKEN)) { ws.close(1008, 'bad token'); return; }
+        if (!authTokens().some((t) => T.initAuthOk(f.authToken, t))) { ws.close(1008, 'bad token'); return; }
         if (f.columns && f.rows) adapter.resize(f.columns, f.rows);
         if (inited) return;
         inited = true;
@@ -203,16 +260,16 @@ termWss.on('connection', (ws) => {
         break;
       }
       case 'input':
-        if (inited) term.write(f.data.toString('utf8'));
+        if (inited) adapter.write(f.data.toString('utf8'));
         break;
       case 'resize':
         if (f.columns && f.rows) adapter.resize(f.columns, f.rows);
         break;
       case 'pause':
-        try { term.pause(); } catch { /* older node-pty */ }
+        try { term?.pause(); } catch { /* older node-pty */ }
         break;
       case 'resume':
-        try { term.resume(); } catch { /* older node-pty */ }
+        try { term?.resume(); } catch { /* older node-pty */ }
         break;
       default:
         break; // empty/malformed/unknown ignored, as ttyd does
@@ -229,7 +286,7 @@ termWss.on('connection', (ws) => {
 const ctrlHttp = createServer((_req, res) => { res.writeHead(426); res.end('control channel is websocket-only'); });
 const ctrlWss = new WebSocketServer({
   server: ctrlHttp,
-  verifyClient: (info) => T.controlTokenOk(info.req.url, TOKEN),
+  verifyClient: (info) => authTokens().some((t) => T.controlTokenOk(info.req.url, t)),
 });
 ctrlWss.on('connection', (ws) => {
   ws.on('message', (raw) => {
@@ -243,10 +300,21 @@ ctrlWss.on('connection', (ws) => {
 // ---- state file: the registry a fresh manager re-adopts from -----------------
 function writeState() {
   const st = {
-    session: SESSION, pid: process.pid, ptyPid: term.pid, base: BASE,
+    session: SESSION, pid: process.pid, ptyPid: term ? term.pid : null, base: BASE,
     termPort: termHttp.address()?.port ?? (TERM_PORT || null),
     ctrlPort: ctrlHttp.address()?.port ?? (CTRL_PORT || null),
-    shell: CMD, ptyAlive, exitCode, startedAt: START,
+    // Whether this pty-host re-reads its auth token from a manager-owned file
+    // (XERK-578). The manager READS this back: a surviving pty-host WITHOUT it
+    // predates the live-token change, so its baked-in token can never be
+    // refreshed and a roll leaves it unreachable — which is the one case the
+    // manager has to heal destructively.
+    authTokenFile: TOKEN_FILE || null,
+    // Spelled out rather than shorthand: `serializeState` is a WHITELIST, and the
+    // CI test reads THIS literal's key names to hold the two sides together (a
+    // key added here but not there is silently dropped, and the manager reads the
+    // absence as fact — that omission shipped once and turned the post-roll
+    // self-heal into "tear down every session").
+    shell: CMD, ptyAlive: ptyAlive, exitCode: exitCode, startedAt: START,
   };
   // Atomic: write a sibling temp then rename, so a reader never sees a partial.
   const tmp = STATE + '.tmp';
@@ -260,18 +328,54 @@ function writeState() {
 // EPIPE/EBADF on the diagnostic PTYHOST_READY line (or any later write) must be
 // swallowed, not thrown — the pty child outliving its spawner is the whole point.
 process.stdout.on('error', () => {});
+
+// The ORIGIN keep-alive window. Node's 5s default is SHORTER than the window the
+// hub parks a free tunnel channel for, which guarantees the hub eventually sends
+// an asset request down a socket we already FIN'd — the browser's ECONNRESET /
+// "socket hang up" on terminal open. See KEEPALIVE_TIMEOUT_MS for the invariant.
+T.applyKeepAlive([termHttp, ctrlHttp]);
+
+// A bind failure ('error' on a server with no listener) is an UNCAUGHT throw that
+// takes the process down — and with the old spawn-at-top order it did so with
+// claude.exe already running under the ConPTY. Handle it explicitly: log a
+// structured reason (the manager's only window into a launch that never
+// published), tear any pty down, and exit non-zero so the .log says why rather
+// than the manager just timing out.
+T.installFatalErrorHandlers([
+  { name: `terminal server (127.0.0.1:${TERM_PORT})`, emitter: termHttp },
+  { name: `control server (127.0.0.1:${CTRL_PORT})`, emitter: ctrlHttp },
+  // `ws` RE-EMITS its attached http server's 'error' on the WebSocketServer, so
+  // covering the http servers alone is not enough — the re-emit is itself an
+  // unhandled 'error' and throws before the clean exit below can run.
+  { name: `terminal ws (127.0.0.1:${TERM_PORT})`, emitter: termWss },
+  { name: `control ws (127.0.0.1:${CTRL_PORT})`, emitter: ctrlWss },
+], (which, err) => {
+  try {
+    process.stderr.write(`pty-host: ${which} failed to bind ` +
+      `(${err && err.code ? err.code : err}) — not starting the pty\n`);
+  } catch { /* stderr gone */ }
+  try { term?.kill(); } catch { /* not spawned / already dead */ }
+  process.exit(3);
+});
+
 let up = 0;
 const onListen = () => {
-  if (++up === 2) {
-    const st = writeState();
-    try { process.stdout.write(`PTYHOST_READY ${JSON.stringify(st)}\n`); } catch { /* stdout gone */ }
+  if (++up !== 2) return;
+  // BOTH ports are bound: only now is it safe to put a child on the ConPTY.
+  try {
+    startPty();
+  } catch (e) {
+    try { process.stderr.write(`pty-host: pty spawn failed (${e})\n`); } catch { /* stderr gone */ }
+    process.exit(4);
   }
+  const st = writeState();
+  try { process.stdout.write(`PTYHOST_READY ${JSON.stringify(st)}\n`); } catch { /* stdout gone */ }
 };
 termHttp.listen(TERM_PORT, '127.0.0.1', onListen);
 ctrlHttp.listen(CTRL_PORT, '127.0.0.1', onListen);
 
 // KillMode=process semantics: a clean SIGTERM/SIGINT tears the pty down; any
 // other manager death (crash/restart) leaves us running to be re-adopted.
-function shutdown() { try { term.kill(); } catch { /* already dead */ } process.exit(0); }
+function shutdown() { try { term?.kill(); } catch { /* already dead */ } process.exit(0); }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);

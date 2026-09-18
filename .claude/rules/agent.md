@@ -125,6 +125,34 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
 
 ## Heartbeat
 
+- **A POKED beat is `light` ONLY while a FULL beat ran within the last `INTERVAL`.** A poke means "the
+  hub has a command for you, beat now", and a command arrives only on a beat's REPLY — so the operator
+  waits through `build_payload` + the RTT on every Send, Stop, model switch and `/history` fetch. The
+  heavy payload is dominated by uncached git subprocesses (2/scanned repo, 3/running session, 3 for
+  the repos-root entry); at Windows process-creation cost that is SECONDS spent re-deriving facts
+  nobody asked for, before the POST leaves.
+  - **The deadline is not optional.** `pokeHost` fires on EVERY queued command, and a browser sitting
+    on a session produces a steady stream (chat's 202-retry chain and its 6s poll fallback each queue
+    a `history`), so an unconditional `light=poked` meant NO full beat ever ran: `_drain_queue` (a
+    queued session never starts), the pending mode/model switches, jira + ticket triage, PR-comment
+    delivery, the models/limits probes and every usage/slow refresh all stopped for as long as the
+    pokes lasted.
+  - **The deadline is on `time.monotonic()`, never `time.time()`.** A backward NTP/DST step makes
+    `now - last_full` negative for the length of the step, which re-arms the exact starvation above
+    for that whole window — via something no operator would ever connect to a frozen beat.
+  - **A light beat also does not advance `beat`**, which indexes the cadence work it skipped. That
+    stops a slot being SKIPPED; only the deadline stops the cadence being STARVED — do not conflate
+    the two guards. Tests: `TestPokedBeatIsLight`.
+- **`light` means "reuse the caches" for the CHEAP git reads too**, not just the slow ones:
+  `repo_cheap`/`session_cheap` hold the previous beat's branch + dirty counts. Never make a light beat
+  re-derive something a scheduled beat will re-derive moments later. Tests: `TestLightBeatCost`.
+- **`root_repo_entry` takes its `remote` from the slow-cadence cache.** It used to call `git_info()`,
+  running the whole `git_info_slow` — remote, `log -1`, `rev-parse --show-toplevel` — every beat and
+  throwing all but the remote away. Do not re-introduce a full `git_info()` on this path.
+- **`_beat_once` is the ONE place a beat is built and posted**, so its wall clock is measured for
+  every beat (`BEAT_SLOW_LOG_SEC`). Build and post are logged separately: a slow build is local
+  subprocess/disk cost we own, a slow post is the network. There was no instrumentation at all before,
+  which made every claim about heartbeat latency unfalsifiable — keep new beat work behind it.
 - Repo list most-recently-active first; repos-root pseudo-repo **pinned first, never ranked**.
 - `agentVersion` falls back `TURMA_AGENT_VERSION` → `native/install.sh`'s stamped `VERSION` →
   repo-root `VERSION` → `null`. Tests: `TestAgentVersion`.
@@ -211,6 +239,12 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     screen NOW. Both `liveState`s check the prompt ahead of the busy read. Tests:
     `TestParsePanePrompt`, `TestAnswerPanePrompt`, `pane-prompt` in `server.test.js`,
     `panePromptHtml` in `chat.test.js`.
+  - **It is NOT the only blocking dialog.** Claude Code's trust-folder modal has no numbered options,
+    no interrupt hint and no mode footer, so `parse_pane_prompt`, `_busy_from_capture` and
+    `parse_pane_mode` ALL read it as an idle composer — and its default is "No, exit", so one Enter
+    ended the session (XERK-868). **`_pane_blocking_dialog` is the predicate a typing guard uses**
+    (`parse_pane_prompt` OR `_trust_dialog_up`); `parse_pane_prompt`'s four conditions are unchanged
+    and the modal deliberately never becomes a `panePrompt`. Full rule: `agent-sessions.md`.
 
 ## PR status, comment delivery and conflict nudges
 

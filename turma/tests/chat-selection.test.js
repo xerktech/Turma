@@ -267,3 +267,33 @@ test("queued prompts alone defeat the empty-state placeholder", () => {
   assert.match(scroll.innerHTML, /waiting prompt/);
   chat.__setQueued([]);
 });
+
+// ---- the live bubble renders, it isn't just escaped ------------------------
+test("the live turn renders inline markdown, not raw escaped text", () => {
+  // It used to be esc(liveTurn): no code spans, no links, on the one surface
+  // the operator watches while the agent is actually working.
+  chat.__setLiveTurn("Reading `file_path` from https://example.com/x — **found** it");
+  chat.repaint();
+  const html = scroll.innerHTML;
+  assert.match(html, /<code class="md-code-inline">file_path<\/code>/);
+  assert.match(html, /<a href="https:\/\/example\.com\/x"/);
+  assert.match(html, /<strong class="md-strong">found<\/strong>/);
+});
+
+test("the live turn is renderInline, NOT renderProse (the pane reflows it to one line)", () => {
+  // parsePaneLiveTurn joins the pane's wrapped lines into ONE flowed line, so a
+  // `##` there lands mid-sentence and must stay literal — a block pass has no
+  // line structure to read.
+  chat.__setLiveTurn("planning ## next steps - one - two");
+  chat.repaint();
+  assert.doesNotMatch(scroll.innerHTML, /<h2|<ul|<li/);
+  assert.match(scroll.innerHTML, /## next steps/);
+});
+
+test("the live turn is still escaped — markup in it can never reach the DOM", () => {
+  chat.__setLiveTurn('<img src=x onerror="alert(1)"> and <script>alert(2)</script>');
+  chat.repaint();
+  const html = scroll.innerHTML;
+  assert.doesNotMatch(html, /<img|<script/);
+  assert.match(html, /&lt;img src=x onerror=/);
+});

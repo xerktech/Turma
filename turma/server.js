@@ -13265,19 +13265,65 @@ const TERM_FONT_STYLE =
 // it is served 200 + `no-store`: a 200 renders + runs its reload script in every
 // context (iframe, new tab, Android WebView) with no intermediary (nginx/Cloudflare)
 // swapping a 5xx body for its own error page.
-const TERM_RECONNECT_HTML =
-  "<!doctype html><html><head><meta charset='utf-8'>" +
-  "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
-  "<title>Reconnecting…</title><style>" +
-  "html,body{margin:0;height:100%;background:#000;color:#8a8f98;" +
-  "font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif}" +
-  ".wrap{height:100%;display:flex;flex-direction:column;align-items:center;" +
-  "justify-content:center;gap:14px}" +
-  ".spin{width:22px;height:22px;border:2px solid #2a2d31;border-top-color:#8a8f98;" +
-  "border-radius:50%;animation:s .8s linear infinite}@keyframes s{to{transform:rotate(360deg)}}" +
-  ".msg{opacity:.85}</style></head><body><div class='wrap'><div class='spin'></div>" +
-  "<div class='msg'>Reconnecting to the terminal…</div></div>" +
-  "<script>setTimeout(function(){location.reload()},2000)</script></body></html>";
+// It BACKS OFF and eventually GIVES UP rather than reloading forever: a host that
+// is genuinely gone (removed, powered off, tunnel retired) would otherwise have every
+// open terminal tab re-dial it every 2s for the life of the tab, and — worse — the
+// operator would be shown the same "Reconnecting…" spinner whether the tunnel is
+// flapping (heals in seconds) or the host is never coming back. So the delay doubles
+// 2s→30s, the page stands down after TERM_RECONNECT_MAX_TRIES with an explicit Retry,
+// and it says which of the two cases the hub actually believes it is in.
+const TERM_RECONNECT_BASE_MS = 2000;
+const TERM_RECONNECT_MAX_MS = 30000;
+const TERM_RECONNECT_MAX_TRIES = 6; // ~2+4+8+16+30+30s ≈ 90s before standing down
+// The attempt counter lives in sessionStorage (per tab, survives the reload, never
+// shared between viewers) and SELF-RESETS when the last attempt is older than the
+// longest backoff plus slack — so a fresh outage after a healthy period starts at 2s
+// again instead of inheriting a stale count and standing down immediately.
+const TERM_RECONNECT_STALE_MS = TERM_RECONNECT_MAX_MS + 15000;
+
+// `tunnelOnline` is what the hub itself believes about this host's terminal tunnel
+// at the moment the document is served, so the two cases read differently.
+function termReconnectHtml(tunnelOnline) {
+  const detail = tunnelOnline
+    ? "The terminal did not answer in time. Retrying…"
+    : "This host's terminal tunnel is offline. The session keeps running; "
+      + "this view reconnects on its own when the tunnel is back.";
+  return "<!doctype html><html><head><meta charset='utf-8'>" +
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
+    "<title>Reconnecting…</title><style>" +
+    "html,body{margin:0;height:100%;background:#000;color:#8a8f98;" +
+    "font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif}" +
+    ".wrap{height:100%;display:flex;flex-direction:column;align-items:center;" +
+    "justify-content:center;gap:14px;padding:0 24px;text-align:center}" +
+    ".spin{width:22px;height:22px;border:2px solid #2a2d31;border-top-color:#8a8f98;" +
+    "border-radius:50%;animation:s .8s linear infinite}@keyframes s{to{transform:rotate(360deg)}}" +
+    ".msg{opacity:.85}.detail{font-size:12px;opacity:.55;max-width:44ch}" +
+    "button{font:inherit;color:#cdd1d6;background:#1b1e22;border:1px solid #2a2d31;" +
+    "border-radius:6px;padding:6px 14px;cursor:pointer}button:hover{background:#23272c}" +
+    "</style></head><body><div class='wrap' id='w'><div class='spin' id='s'></div>" +
+    "<div class='msg' id='m'>Reconnecting to the terminal…</div>" +
+    // `detail` is one of the two STATIC literals above — never caller- or
+    // agent-supplied — so there is nothing here to escape.
+    "<div class='detail'>" + detail + "</div></div><script>(function(){" +
+    "var BASE=" + TERM_RECONNECT_BASE_MS + ",MAX=" + TERM_RECONNECT_MAX_MS +
+    ",TRIES=" + TERM_RECONNECT_MAX_TRIES + ",STALE=" + TERM_RECONNECT_STALE_MS + ";" +
+    "var k='turma.term.retry.'+location.pathname,n=0;" +
+    // Every storage access is wrapped: sessionStorage throws in a private window or
+    // with site data blocked, and the page must still render and still retry there.
+    "try{var r=JSON.parse(sessionStorage.getItem(k)||'null');" +
+    "if(r&&typeof r.n==='number'&&Date.now()-r.at<STALE)n=r.n;}catch(e){}" +
+    "function save(v){try{sessionStorage.setItem(k,JSON.stringify({n:v,at:Date.now()}));}catch(e){}}" +
+    "function clear(){try{sessionStorage.removeItem(k);}catch(e){}}" +
+    "function retry(){save(n+1);location.reload();}" +
+    "if(n>=TRIES){clear();" +
+    "document.getElementById('s').style.display='none';" +
+    "document.getElementById('m').textContent='Terminal unavailable.';" +
+    "var b=document.createElement('button');b.textContent='Retry';" +
+    "b.onclick=function(){clear();location.reload();};" +
+    "document.getElementById('w').appendChild(b);return;}" +
+    "setTimeout(retry,Math.min(MAX,BASE*Math.pow(2,n)));" +
+    "})();</script></body></html>";
+}
 
 // Touch-scroll shim injected into ttyd's page for phones. Sessions run inside
 // tmux with `mouse on`, which routes the *wheel* by screen model (agent/tmux.conf):
@@ -14083,15 +14129,73 @@ function openUploadBlobForRelay(id) {
 // Agent transparently opens a new one if a pooled channel died. The separate WS
 // upgrade path (browser terminal socket) still opens its own dedicated channel.
 const termAgents = new Map(); // "host:port" -> keep-alive http.Agent over the tunnel
+// How long a FREE (idle, pooled) tunnel channel may sit before Node evicts it.
+//
+// This is one half of a two-sided contract with the ORIGIN's keep-alive window
+// (agent/win/tty-protocol.mjs `KEEPALIVE_TIMEOUT_MS`, applied to both pty-host
+// servers). The origin must ALWAYS outlast this number: if it closes first, the
+// Agent still believes a pooled socket is reusable and sends the next asset or
+// `/token` request down a channel the origin already FIN'd, which surfaces to the
+// browser as ECONNRESET / "socket hang up" before the request ever reached the
+// terminal. `termRetryReset` replays such a request; with 4 free sockets pooled,
+// two consecutive stale ones still became a 502, which is the "refresh the
+// terminal two or three times" symptom. It was 60s against a pty-host running
+// Node's 5s default — every terminal open raced it. 30s here against 75s there
+// leaves a 45s margin, and the only cost of evicting early is one extra channel
+// dial (openChannel), which the Agent already does on a miss.
+//
+// **This window only exists because `armChannelIdleTimeout` below makes it real.**
+// A plain `timeout:` on the Agent does NOTHING here: Node applies it by calling
+// `socket.setTimeout`, and `channelDuplex` stubs setTimeout to a no-op because a
+// tunnel channel is not a real socket. Pass this number without that helper and
+// the whole two-sided contract is a comment describing an eviction that never
+// happens — which is how it sat, inert, before this was measured.
+const TERM_AGENT_IDLE_MS = 30000;
+// Give ONE tunnel channel a real inactivity timer, in the shape http.Agent
+// drives: `setTimeout(ms)` arms it, `setTimeout(0)` (what the Agent calls when it
+// takes a socket back out of the free pool) disarms it, and 'timeout' fires after
+// `ms` with no bytes either way — whereupon the Agent destroys it IF it is still
+// free. Inbound is tracked by wrapping `push` rather than by listening for
+// 'data', which would flip the duplex into flowing mode and steal bytes from the
+// HTTP parser. Scoped to the channels this Agent pools on purpose: /live and the
+// ws relay keep the shared no-op stub and are unaffected.
+function armChannelIdleTimeout(channel) {
+  let ms = 0;
+  let timer = null;
+  const disarm = () => { if (timer) clearTimeout(timer); timer = null; };
+  const rearm = () => {
+    disarm();
+    if (ms > 0) {
+      timer = setTimeout(() => { timer = null; channel.emit("timeout"); }, ms);
+      if (timer.unref) timer.unref();   // never hold the event loop open
+    }
+  };
+  channel.setTimeout = (val, cb) => {
+    ms = Number(val) || 0;
+    if (cb) channel.once("timeout", cb);
+    rearm();
+    return channel;
+  };
+  const push = channel.push.bind(channel);
+  channel.push = (...args) => { rearm(); return push(...args); };
+  const write = channel.write.bind(channel);
+  channel.write = (...args) => { rearm(); return write(...args); };
+  channel.once("close", disarm);
+  return channel;
+}
 function termAgentFor(name, port) {
   const key = name + ":" + port;
   let agent = termAgents.get(key);
   if (agent) return agent;
-  agent = new http.Agent({ keepAlive: true, maxSockets: 6, maxFreeSockets: 4, timeout: 60000 });
+  agent = new http.Agent({
+    keepAlive: true, maxSockets: 6, maxFreeSockets: 4,
+    timeout: TERM_AGENT_IDLE_MS,
+  });
   // Each "socket" the Agent needs is a fresh tunnel data channel to this ttyd;
   // once ttyd keeps it alive the Agent reuses it for the next asset request.
   agent.createConnection = (_opts, cb) => {
-    openChannel(name, port).then((channel) => cb(null, channel), (err) => cb(err));
+    openChannel(name, port).then(
+      (channel) => cb(null, armChannelIdleTimeout(channel)), (err) => cb(err));
   };
   termAgents.set(key, agent);
   return agent;
@@ -14121,8 +14225,19 @@ function dropTermAgents(name) {
 // attempt (`attempt === 0`) is retried, and only before any bytes have gone to the
 // client (`!headersSent`); a non-reused socket's reset, a POST, or a mid-response
 // error is a real failure the caller surfaces.
+//
+// **The budget is the POOL SIZE, not one.** Each reset evicts exactly ONE dead
+// socket, and `maxFreeSockets` is 4 — so a single replay still surfaced a 502
+// whenever two pooled channels had gone stale together, which is the common case
+// (they were parked at the same time and the origin ages them together). Retrying
+// up to the pool size guarantees the Agent eventually has to dial a fresh channel.
+// This is the ONLY mitigation the LINUX fleet has: a real ttyd 1.7.4 was measured
+// closing an idle keep-alive connection after 5.0s and `_launch_ttyd` passes no
+// flag to change that, so no idle window the hub could choose sits below it
+// without churning a tunnel dial-back every few seconds.
+const TERM_RETRY_MAX = 4;   // = maxFreeSockets in termAgentFor
 function termRetryReset(attempt, reusedSocket, headersSent, method, err) {
-  return attempt === 0 && !!reusedSocket && !headersSent &&
+  return attempt < TERM_RETRY_MAX && !!reusedSocket && !headersSent &&
     (method === "GET" || method === "HEAD") &&
     (err.code === "ECONNRESET" || err.message === "socket hang up");
 }
@@ -14153,15 +14268,16 @@ function terminalFail(res, msg) {
 // frame document) and never recovers; this keeps the frame alive and reloads it
 // until ttyd answers. Idempotent like terminalFail, so a stray later error on the
 // same response can't double-end it (an ERR_STREAM_WRITE_AFTER_END hub crash).
-function terminalReconnectPage(res) {
+function terminalReconnectPage(res, tunnelOnline) {
   if (res.writableEnded) return;
   if (res.headersSent) { res.end(); return; }
+  const body = termReconnectHtml(!!tunnelOnline);
   res.writeHead(200, {
     "Content-Type": "text/html; charset=utf-8",
     "Cache-Control": "no-store",
-    "Content-Length": Buffer.byteLength(TERM_RECONNECT_HTML),
+    "Content-Length": Buffer.byteLength(body),
   });
-  res.end(TERM_RECONNECT_HTML);
+  res.end(body);
 }
 // A hard deadline on a whole terminal-proxy request, so ANY silent-death path
 // settles the browser instead of spinning a tab forever (XERK-865, fix half 2).
@@ -14196,7 +14312,12 @@ async function proxyTerm(req, res, name, port) {
   const clearDeadline = () => { if (deadline) { clearTimeout(deadline); deadline = null; } };
   const fail = (msg) => {
     clearDeadline();
-    if (isBaseDoc && !res.headersSent && !res.writableEnded) return terminalReconnectPage(res);
+    if (isBaseDoc && !res.headersSent && !res.writableEnded) {
+      // Read the tunnel's state at SERVE time (the same expression `terminalOnline`
+      // is derived from), so the page can tell a flap apart from a host that is gone.
+      const online = !!controlChannels[name] || hostTunnelOwnerLive(name);
+      return terminalReconnectPage(res, online);
+    }
     return terminalFail(res, msg);
   };
 
@@ -14247,7 +14368,7 @@ async function proxyTerm(req, res, name, port) {
     );
     currentUp = up;
     up.on("error", (e) => {
-      if (termRetryReset(attempt, up.reusedSocket, res.headersSent, req.method, e)) return send(1);
+      if (termRetryReset(attempt, up.reusedSocket, res.headersSent, req.method, e)) return send(attempt + 1);
       fail(`terminal error: ${e.message}`);
     });
     // Only the first attempt forwards the client body; the retry is gated to
@@ -18494,6 +18615,13 @@ if (process.env.TURMA_TEST) {
     // GET heals via a self-reloading page instead of a dead-end 502 that wipes the
     // terminal the operator was reading.
     termRetryReset, terminalFail, terminalReconnectPage,
+    // The hub half of the keep-alive contract with the pty-host / ttyd origin:
+    // this idle window must stay BELOW the origin's keepAliveTimeout, or the
+    // Agent reuses a socket the origin already closed. Exported so a test can
+    // pin it against agent/win/tty-protocol.mjs's KEEPALIVE_TIMEOUT_MS — and
+    // alongside `armChannelIdleTimeout`, which is what makes the number do
+    // anything at all on a tunnel channel (channelDuplex no-ops setTimeout).
+    TERM_AGENT_IDLE_MS, armChannelIdleTimeout,
     serializeAgentsForSave,
     flushStateNow, // graceful-shutdown synchronous state flush (XERK-552)
     // XERK-757 — the externalized-store wiring. The full cross-replica behaviour

@@ -15,13 +15,22 @@ class ProseTest {
     private fun tables(text: String) = parseProse(text).filterIsInstance<ProseBlock.Table>()
     private fun codes(text: String) = parseProse(text).filterIsInstance<ProseBlock.Code>()
 
+    private fun headings(text: String) = parseProse(text).filterIsInstance<ProseBlock.Heading>()
+    private fun lists(text: String) = parseProse(text).filterIsInstance<ProseBlock.ListBlock>()
+
     /** Flatten a paragraph/cell's spans to the plain text a reader sees. */
-    private fun plain(spans: List<Span>) = spans.joinToString("") {
+    private fun plain(spans: List<Span>): String = spans.joinToString("") {
         when (it) {
             is Span.Text -> it.text
             is Span.Code -> it.text
             is Span.Link -> it.label
+            is Span.Styled -> plain(it.spans)
         }
+    }
+
+    /** Every [Span.Styled] anywhere in the tree, flattened depth-first. */
+    private fun styled(spans: List<Span>): List<Span.Styled> = spans.flatMap {
+        if (it is Span.Styled) listOf(it) + styled(it.spans) else emptyList()
     }
 
     // ---- linkify -------------------------------------------------------------
@@ -183,6 +192,263 @@ class ProseTest {
         assertTrue(codes(md).isEmpty())
         val spans = paras(md).single().spans
         assertTrue(spans.any { it is Span.Code && it.text == "npm ci" })
+    }
+
+    // ---- emphasis (chat.js renderEmph) --------------------------------------
+    @Test fun `bold italic both and strike parse`() {
+        val b = styled(parseInlineOnly("a **b** c")).single()
+        assertTrue(b.bold && !b.italic && !b.strike)
+        assertEquals("b", plain(b.spans))
+        val i = styled(parseInlineOnly("a *b* c")).single()
+        assertTrue(!i.bold && i.italic)
+        val s = styled(parseInlineOnly("a ~~b~~ c")).single()
+        assertTrue(s.strike)
+        val both = styled(parseInlineOnly("***b***")).first()
+        assertTrue(both.bold && both.italic)
+    }
+
+    @Test fun `emphasis nests, and its content is re-parsed raw`() {
+        val outer = styled(parseInlineOnly("*a **b** c*")).first()
+        assertTrue(outer.italic)
+        assertEquals("a b c", plain(outer.spans))
+        assertTrue(styled(outer.spans).single().bold)
+    }
+
+    @Test fun `emphasis never applies inside a code span`() {
+        val spans = parseInlineOnly("`**not bold**` but **this is**")
+        assertTrue(spans.any { it is Span.Code && it.text == "**not bold**" })
+        assertEquals(1, styled(spans).size)
+        assertEquals("this is", plain(styled(spans).single().spans))
+    }
+
+    @Test fun `an emphasis span never crosses a line break`() {
+        assertEquals("*open\nclose*", plain(paras("*open\nclose*").single().spans))
+        assertTrue(styled(paras("*open\nclose*").single().spans).isEmpty())
+    }
+
+    @Test fun `left flanking — a delimiter followed by a space never opens`() {
+        // Pinned separately from the closer-side guard: only the closer guard is
+        // exercised by the arithmetic cases below, so deleting this one was silent.
+        // NB: a bare "* italic*" is a BULLET at the start of a line, not a
+        // paragraph — the web's twin of this test calls renderInline, which has
+        // no block pass at all. Use a form that can't open a list.
+        for (t in listOf("** bold**", "~~ s~~", "see ** note**", "see * italic*", "**bold **")) {
+            val spans = paras(t).single().spans
+            assertTrue("should stay literal: $t", styled(spans).isEmpty())
+            assertEquals(t, plain(spans))
+        }
+        // ...and that bullet reading is the correct one, so pin it here too.
+        assertEquals("italic*", plain(lists("* italic*").single().items.single().spans))
+    }
+
+    @Test fun `CRLF text still renders its markdown`() {
+        // Java's `$` matches before a final line terminator and JavaScript's does
+        // not, so the two ports disagreed on CRLF until line endings were
+        // normalised at the outermost pass. On the web a CRLF message rendered
+        // with NO markdown at all — reachable from any tool result echoing a
+        // Windows file, or from the native Windows agent.
+        val crlf = "Summary\r\n\r\n## What changed\r\n\r\n- one thing\r\n- another\r\n"
+        val blocks = parseProse(crlf)
+        assertEquals("What changed", plain(blocks.filterIsInstance<ProseBlock.Heading>().single().spans))
+        assertEquals(
+            listOf("one thing", "another"),
+            blocks.filterIsInstance<ProseBlock.ListBlock>().single().items.map { plain(it.spans) },
+        )
+        // A lone CR is a line break too, not an invisible character in the text.
+        assertEquals("H", plain(headings("## H\r").single().spans))
+    }
+
+    @Test fun `an empty emphasis span is literal`() {
+        val spans = paras("**** and ~~~~").single().spans
+        assertTrue(styled(spans).isEmpty())
+        assertEquals("**** and ~~~~", plain(spans))
+    }
+
+    @Test fun `ordered list numbering increments like the browser's ol`() {
+        // `1. 1. 1.` is what markdown is usually written as; the web renders it
+        // through <ol>, which counts. Flattening here has to count too.
+        assertEquals(listOf("1.", "2.", "3."), lists("1. a\n1. b\n1. c").single().items.map { it.marker })
+        assertEquals(listOf("5.", "6."), lists("5. a\n9. b").single().items.map { it.marker })
+    }
+
+    @Test fun `whitespace follows JavaScript's definition, not Java's`() {
+        // U+FEFF is whitespace to JS and not to Java; U+001C is the reverse. The
+        // two ports must agree, or the same message renders differently.
+        assertTrue(styled(paras("**\uFEFFa**").single().spans).isEmpty())
+        assertTrue(styled(paras("*\u001Ca*").single().spans).isNotEmpty())
+    }
+
+    @Test fun `a long delimiter run or rule line stays linear and does not overflow the stack`() {
+        // A quantified GROUP in java.util.regex recurses once per iteration, so
+        // the old RULE_RE threw an uncatchable StackOverflowError out of a
+        // Composable on one long line of dashes. A 100k-char block is inside the
+        // wire's own cap, so this was reachable from ordinary agent output.
+        for (src in listOf("-".repeat(100_000), "*".repeat(100_000), "_".repeat(100_000))) {
+            assertEquals(listOf(ProseBlock.Rule), parseProse(src))
+        }
+        // The SPACED shapes are the ones that exercise the noClose memo: the
+        // trailing space makes every candidate closer fail the right-flanking
+        // rule, so each opener runs a full failing scan unless the memo stops it.
+        // The unspaced ones all FIND their closer and so cannot catch its
+        // removal — keep both.
+        for (src in listOf(
+            "*a ".repeat(33_333), "~~a ".repeat(25_000), "**a ".repeat(25_000),
+            "x " + "~".repeat(100_000), "x " + "*".repeat(100_000), "*a".repeat(20_000),
+        )) {
+            val t0 = System.nanoTime()
+            parseProse(src)
+            val ms = (System.nanoTime() - t0) / 1_000_000
+            assertTrue("parseProse took ${ms}ms on ${src.length} chars", ms < 3000)
+        }
+    }
+
+    @Test fun `the emphasis scanner measures whole runs, never a capped count`() {
+        // The twin of chat.test.js's "measures whole runs". Capping how far a
+        // delimiter run is counted was tried as a speed fix and reverted: a
+        // saturated count made `m == len` true for a LONGER run and resumed the
+        // scan INSIDE one, fabricating emphasis on input that had none.
+        assertTrue(styled(paras("~~~~~~# x~~~~").single().spans).isEmpty())
+        assertEquals("~~~~~~# x~~~~", plain(paras("~~~~~~# x~~~~").single().spans))
+        assertTrue(styled(paras("****1. y ~~*aa").single().spans).isEmpty())
+        assertEquals("****1. y ~~*aa", plain(paras("****1. y ~~*aa").single().spans))
+        val bold = styled(paras("**a b*****c**").single().spans).first()
+        assertTrue(bold.bold)
+        assertEquals("a b*****c", plain(bold.spans))
+        val em = styled(paras("see *a******* q").single().spans).first()
+        assertTrue(em.italic)
+        assertEquals("a", plain(em.spans))
+    }
+
+    @Test fun `a non-CR Java line terminator does not end a line`() {
+        // Java's `$` also matches BEFORE a final line terminator and JavaScript's
+        // does not, so the anchored line patterns use matchEntire, not find. CR
+        // alone cannot pin that (normalizeEol already handles it); U+2028/U+2029
+        // survive normalisation, are Java line terminators, and are ALSO excluded
+        // from JavaScript's `.` — so the web reads these as prose too, and this
+        // pins the two ports to the same answer.
+        //
+        // U+0085 NEL is deliberately NOT here: it is a Java line terminator that
+        // JavaScript's `.` happily matches, so the ports genuinely disagree on it
+        // and asserting either answer would codify that. See turma-sessions.md.
+        for (t in listOf("## H\u2028", "## H\u2029")) {
+            assertTrue("should not be a heading: " + t.map { it.code }, headings(t).isEmpty())
+        }
+        for (t in listOf("- a\u2028", "1. a\u2029")) {
+            assertTrue("should not be a list: " + t.map { it.code }, lists(t).isEmpty())
+        }
+    }
+
+    @Test fun `a wrapped bullet's continuation line stays in its item`() {
+        val items = lists("- item one\n  continued here\n- item two").single().items
+        assertEquals(2, items.size)
+        assertEquals("item one\ncontinued here", plain(items[0].spans))
+        assertEquals("item two", plain(items[1].spans))
+        // A flush-left line after the list is a paragraph, not a continuation.
+        val blocks = parseProse("- a\nnext paragraph")
+        assertEquals(1, (blocks[0] as ProseBlock.ListBlock).items.size)
+        assertEquals("next paragraph", plain((blocks[1] as ProseBlock.Paragraph).spans))
+    }
+
+    @Test fun `flanking rules keep arithmetic, spaced stars and globs literal`() {
+        for (t in listOf("a * b", "2 * 3 = 6", "run *.js and *.ts", "** spaced **")) {
+            val spans = paras(t).single().spans
+            assertTrue("should stay literal: $t", styled(spans).isEmpty())
+            assertEquals(t, plain(spans))
+        }
+    }
+
+    @Test fun `underscores are not emphasis so snake_case stays put`() {
+        for (t in listOf("snake_case", "__init__", "the file_path arg", "a __b__ c")) {
+            val spans = paras(t).single().spans
+            assertTrue("underscore text must be untouched: $t", styled(spans).isEmpty())
+            assertEquals(t, plain(spans))
+        }
+    }
+
+    @Test fun `a bolded bare url still links, with the markers outside it`() {
+        val outer = styled(parseInlineOnly("PR: **https://github.com/o/r/pull/131**")).single()
+        assertTrue(outer.bold)
+        assertEquals("https://github.com/o/r/pull/131",
+            outer.spans.filterIsInstance<Span.Link>().single().url)
+    }
+
+    // ---- block constructs (chat.js renderBlocks) ----------------------------
+    @Test fun `atx headings parse, with inline code and links inside`() {
+        assertEquals(2, headings("## What I did").single().level)
+        assertEquals("What I did", plain(headings("## What I did").single().spans))
+        assertEquals(6, headings("###### deep").single().level)
+        assertTrue(headings("## Fix `XERK-859`").single().spans.any { it is Span.Code && it.text == "XERK-859" })
+        assertEquals("https://example.com/p/1",
+            headings("## See [the PR](https://example.com/p/1)").single().spans
+                .filterIsInstance<Span.Link>().single().url)
+        // A closing run of #s is syntax, not content.
+        assertEquals("Title", plain(headings("### Title ###").single().spans))
+        // No space after the hashes, and seven hashes, are both not headings.
+        assertTrue(headings("#hashtag stays").isEmpty())
+        assertTrue(headings("####### nope").isEmpty())
+    }
+
+    @Test fun `a heading drops the blank lines around it`() {
+        val blocks = parseProse("intro\n\n## Head\n\nbody")
+        assertEquals(3, blocks.size)
+        assertEquals("intro", plain((blocks[0] as ProseBlock.Paragraph).spans))
+        assertEquals("Head", plain((blocks[1] as ProseBlock.Heading).spans))
+        assertEquals("body", plain((blocks[2] as ProseBlock.Paragraph).spans))
+    }
+
+    @Test fun `bullets and ordered lists parse, and nest`() {
+        assertEquals(listOf("•", "•"), lists("- one\n- two").single().items.map { it.marker })
+        assertEquals(listOf("one", "two"), lists("- one\n- two").single().items.map { plain(it.spans) })
+        assertEquals(listOf("•", "•"), lists("* one\n+ two").single().items.map { it.marker })
+        assertEquals(listOf("1.", "2."), lists("1. one\n2. two").single().items.map { it.marker })
+        assertEquals(listOf("3.", "4."), lists("3. three\n4. four").single().items.map { it.marker })
+        val nested = lists("- a\n  - b\n- c").single().items
+        assertEquals(listOf(0, 1, 0), nested.map { it.depth })
+        assertEquals("◦", nested[1].marker)
+        // A marker switch at the same depth restarts the numbering.
+        assertEquals(listOf("•", "1."), lists("- a\n1. b").single().items.map { it.marker })
+        // Item content goes through the inline pass, not verbatim.
+        val rich = lists("- **bold** and `code`").single().items.single()
+        assertTrue(styled(rich.spans).single().bold)
+        assertTrue(rich.spans.any { it is Span.Code && it.text == "code" })
+    }
+
+    @Test fun `a dash that is not a bullet stays prose`() {
+        for (t in listOf("-no space", "a - b")) {
+            assertTrue(lists(t).isEmpty())
+            assertEquals(t, plain(paras(t).single().spans))
+        }
+    }
+
+    @Test fun `blockquotes and horizontal rules parse`() {
+        val q = parseProse("> quoted").filterIsInstance<ProseBlock.Quote>().single()
+        assertEquals("quoted", plain((q.blocks.single() as ProseBlock.Paragraph).spans))
+        // A quote is block-parsed in turn, so a list inside one is a list.
+        val ql = parseProse("> - a\n> - b").filterIsInstance<ProseBlock.Quote>().single()
+        assertEquals(2, (ql.blocks.single() as ProseBlock.ListBlock).items.size)
+        for (r in listOf("---", "***", "___", "- - -")) {
+            assertEquals("should be a rule: $r", listOf(ProseBlock.Rule), parseProse(r))
+        }
+    }
+
+    @Test fun `a table delimiter row is a table and a bare dash run is a rule`() {
+        val tbl = parseProse("| a | b |\n|---|---|\n| 1 | 2 |")
+        assertEquals(1, tbl.filterIsInstance<ProseBlock.Table>().size)
+        assertTrue(tbl.none { it is ProseBlock.Rule })
+        assertTrue(parseProse("cost is 3 | 4").none { it is ProseBlock.Rule || it is ProseBlock.Table })
+        assertEquals(
+            listOf("above", "RULE", "below"),
+            parseProse("above\n\n---\n\nbelow").map {
+                if (it is ProseBlock.Paragraph) plain(it.spans) else "RULE"
+            },
+        )
+    }
+
+    @Test fun `construct-free prose still parses to one plain paragraph`() {
+        for (t in listOf("plain prose with no markers at all", "1999 was a year")) {
+            assertEquals(t, plain(paras(t).single().spans))
+            assertEquals(1, parseProse(t).size)
+        }
     }
 
     // Expose parseInline for the linkify/inline-code cases (it's file-private).

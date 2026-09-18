@@ -7,9 +7,10 @@ package com.xerktech.turma.core
  * The web builds an HTML string; a Compose UI can't consume HTML, so this
  * produces a typed tree (`List<ProseBlock>`, each paragraph a `List<Span>`) that
  * `ui/TranscriptView.kt` renders natively. The parsing rules mirror chat.js
- * line-for-line — fenced code lifted out first, then GFM tables, then inline
- * code spans and links — and are locked to chat.js's own test vectors in
- * `ProseTest.kt`. Keep the two in sync: a change to `renderProse` belongs here.
+ * line-for-line — fenced code lifted out first, then GFM tables, then the
+ * line-oriented block constructs (headings, rules, quotes, lists), then inline
+ * code spans, emphasis and links — and are locked to chat.js's own test vectors
+ * in `ProseTest.kt`. Keep the two in sync: a change to `renderProse` belongs here.
  *
  * Like the web, this is safe on a partial (mid-turn) buffer: an unterminated
  * fence renders as code so a half-captured block doesn't flash as prose.
@@ -25,7 +26,21 @@ sealed interface Span {
     data class Code(val text: String) : Span
     /** A link: [label] shown, [url] opened. A bare URL has label == url. */
     data class Link(val label: String, val url: String) : Span
+    /**
+     * An emphasised run (`**bold**`, `*italic*`, `***both***`, `~~strike~~`).
+     * Nests: the inner [spans] are the re-parsed raw text, so bold-inside-italic
+     * and a link inside emphasis both work, exactly as on the web.
+     */
+    data class Styled(
+        val spans: List<Span>,
+        val bold: Boolean = false,
+        val italic: Boolean = false,
+        val strike: Boolean = false,
+    ) : Span
 }
+
+/** One row of a [ProseBlock.ListBlock]: its nesting [depth] and rendered [marker]. */
+data class ProseListItem(val depth: Int, val marker: String, val spans: List<Span>)
 
 sealed interface ProseBlock {
     /** A run of prose lines (joined by "\n"), parsed into inline [spans]. */
@@ -38,6 +53,19 @@ sealed interface ProseBlock {
         val aligns: List<CellAlign>,
         val rows: List<List<List<Span>>>,
     ) : ProseBlock
+    /** An ATX heading, [level] 1..6. */
+    data class Heading(val level: Int, val spans: List<Span>) : ProseBlock
+    /** A horizontal rule (`---`, `***`, `___`). */
+    data object Rule : ProseBlock
+    /** A `>` blockquote; its content is itself block-parsed. */
+    data class Quote(val blocks: List<ProseBlock>) : ProseBlock
+    /**
+     * A bullet / ordered list, FLATTENED to depth-tagged rows. The web nests
+     * real <ul>/<ol> elements; Compose has no list primitive, so the marker and
+     * the indent are resolved here and `TranscriptView` just indents each row —
+     * the same reading, one representation simpler.
+     */
+    data class ListBlock(val items: List<ProseListItem>) : ProseBlock
 }
 
 // ---- links (chat.js linkify) ----------------------------------------------
@@ -72,6 +100,118 @@ private fun linkify(text: String): List<Span> {
     return out
 }
 
+// ---- inline emphasis (chat.js renderEmph) ---------------------------------
+// **bold**, *italic*, ***both***, ~~strike~~ on the non-code slices parseInline
+// hands down, recursing on the RAW inner text. GFM flanking: an opener is not
+// followed by whitespace, a closer not preceded by one, and a span never
+// crosses a line break. `_`/`__` are deliberately NOT delimiters — this corpus
+// is snake_case, __init__ and file_path from end to end. Keep in step with
+// chat.js renderEmph().
+// JavaScript's `\s`, not Java's. `Character.isWhitespace` excludes U+00A0 and
+// U+FEFF (both of which JS calls whitespace) and includes U+001C..U+001F (which
+// JS does not) — so using the platform's idea of whitespace made `**<BOM>a**`
+// bold on Android and literal on the web. Same set, same answer, both ports.
+internal fun isJsSpace(ch: Char): Boolean {
+    // Written as code points: the set has control and format characters in it,
+    // and a literal one in a source file is invisible and easy to break.
+    val c = ch.code
+    return c == 0x09 || c == 0x0A || c == 0x0B || c == 0x0C || c == 0x0D || c == 0x20 ||
+        c == 0xA0 || c == 0x1680 || (c in 0x2000..0x200A) ||
+        c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000 || c == 0xFEFF
+}
+
+/** JS `s.trim() === ""`, for the same reason as [isJsSpace]. */
+internal fun isJsBlank(s: String): Boolean = s.all { isJsSpace(it) }
+
+private fun isSpaceAt(s: String, i: Int): Boolean = i < 0 || i >= s.length || isJsSpace(s[i])
+
+// Linearity rests on the per-line `noClose` memo below and on EMPH_MAX_DEPTH.
+// Capping how far a run is counted was tried and REVERTED in both ports: it
+// bought nothing the memo doesn't already give and it changed output.
+private const val EMPH_MAX_DEPTH = 8
+
+private fun markRun(s: String, i: Int): Int {
+    val c = s[i]
+    var n = 0
+    while (i + n < s.length && s[i + n] == c) n++
+    return n
+}
+
+/**
+ * The index of the next right-flanking closing run of [c] at or after [from], or
+ * -1. [memo] is the per-line "no closer of this kind left" cache, keyed on where
+ * the ENTRY-INDEPENDENT part of the scan starts — see chat.js findEmphClose for
+ * why that distinction is the soundness argument.
+ */
+private fun findEmphClose(
+    s: String, from: Int, c: Char, len: Int, exact: Boolean, memo: HashMap<String, Int>,
+): Int {
+    var j = from
+    if (j < s.length && s[j] == c) {   // entered mid-run: the one entry-dependent candidate
+        val m = markRun(s, j)
+        if ((if (exact) m == len else m >= len) && !isSpaceAt(s, j - 1)) return j
+        j += m
+    }
+    val key = "$c$len${if (exact) "E" else "A"}"
+    val failedAt = memo[key]
+    if (failedAt != null && j >= failedAt) return -1
+    val start = j
+    while (j < s.length) {
+        val ch = s[j]
+        if (ch == '\n') break
+        if (ch != c) { j++; continue }
+        val m = markRun(s, j)
+        if ((if (exact) m == len else m >= len) && !isSpaceAt(s, j - 1)) return j
+        j += m
+    }
+    memo[key] = start
+    return -1
+}
+
+private fun parseEmph(text: String, depth: Int = 0): List<Span> {
+    if (!text.contains('*') && !text.contains("~~")) return linkify(text)
+    if (depth >= EMPH_MAX_DEPTH) return linkify(text)
+    val noClose = HashMap<String, Int>()
+    val out = ArrayList<Span>()
+    var last = 0
+    var i = 0
+    while (i < text.length) {
+        val c = text[i]
+        if (c != '*' && c != '~') {
+            // The only way `i` crosses a line break, so the only place the memo
+            // needs clearing.
+            if (c == '\n') noClose.clear()
+            i++
+            continue
+        }
+        val n = markRun(text, i)
+        val len: Int
+        var bold = false
+        var italic = false
+        var strike = false
+        when {
+            c == '~' -> { if (n < 2) { i += n; continue }; len = 2; strike = true }
+            n >= 3 -> { len = 3; bold = true; italic = true }
+            n == 2 -> { len = 2; bold = true }
+            else -> { len = 1; italic = true }
+        }
+        if (isSpaceAt(text, i + len)) { i += n; continue }  // not left-flanking
+        // A run of the SAME length is preferred, so `*a **b** c*` closes on the
+        // final single `*`; a longer run is accepted only when no exact one is left.
+        val from = i + len
+        var endIdx = findEmphClose(text, from, c, len, true, noClose)
+        if (endIdx < 0) endIdx = findEmphClose(text, from, c, len, false, noClose)
+        // Unclosed, or an EMPTY span (`****`, `~~~~`) — both literal, as in GFM.
+        if (endIdx <= from) { i += n; continue }
+        out.addAll(linkify(text.substring(last, i)))
+        out.add(Span.Styled(parseEmph(text.substring(from, endIdx), depth + 1), bold, italic, strike))
+        i = endIdx + len
+        last = i
+    }
+    out.addAll(linkify(text.substring(last)))
+    return out
+}
+
 // ---- inline code spans (chat.js renderInline) -----------------------------
 // A backtick run opens a span that closes on the next run of EXACTLY the same
 // length; a span never crosses a line break, and an unclosed run is literal.
@@ -86,12 +226,12 @@ private fun codeSpanBody(body: String): String {
 }
 
 private fun parseInline(text: String): List<Span> {
-    if (!text.contains('`')) return linkify(text)
+    if (!text.contains('`')) return parseEmph(text)
     val out = ArrayList<Span>()
     var i = 0
     while (i < text.length) {
         val open = text.indexOf('`', i)
-        if (open < 0) { out.addAll(linkify(text.substring(i))); break }
+        if (open < 0) { out.addAll(parseEmph(text.substring(i))); break }
         val n = runLen(text, open)
         var j = open + n
         var close = -1
@@ -102,8 +242,8 @@ private fun parseInline(text: String): List<Span> {
             if (m == n) { close = c; break }
             j = c + m
         }
-        if (close < 0) { out.addAll(linkify(text.substring(i, open + n))); i = open + n; continue } // unclosed: literal
-        out.addAll(linkify(text.substring(i, open)))
+        if (close < 0) { out.addAll(parseEmph(text.substring(i, open + n))); i = open + n; continue } // unclosed: literal
+        out.addAll(parseEmph(text.substring(i, open)))
         out.add(Span.Code(codeSpanBody(text.substring(open + n, close))))
         i = close + n
     }
@@ -142,10 +282,10 @@ private fun cellAlign(c: String): CellAlign {
 /** A run of non-code text → Paragraph blocks, lifting out any GFM tables. */
 private fun parseTables(text: String): List<ProseBlock> {
     val out = ArrayList<ProseBlock>()
-    if (!hasPipe(text)) { paragraphOf(text)?.let { out.add(it) }; return out } // no pipe → no table possible
+    if (!hasPipe(text)) { out.addAll(parseBlocks(text, 0)); return out } // no pipe → no table possible
     val lines = text.split("\n")
     val buf = ArrayList<String>()
-    fun flush() { if (buf.isNotEmpty()) { paragraphOf(buf.joinToString("\n"))?.let { out.add(it) }; buf.clear() } }
+    fun flush() { if (buf.isNotEmpty()) { out.addAll(parseBlocks(buf.joinToString("\n"), 0)); buf.clear() } }
     var i = 0
     while (i < lines.size) {
         val isTableHead = i + 1 < lines.size && hasPipe(lines[i]) && isDelimiterRow(lines[i + 1]) &&
@@ -171,9 +311,198 @@ private fun parseTables(text: String): List<ProseBlock> {
     return out
 }
 
+// ---- line-oriented block markdown (chat.js renderBlocks) ------------------
+// ATX headings, horizontal rules, blockquotes and bullet/ordered lists. Runs
+// BELOW the table pass (so a `|---|---|` delimiter row is never read as a rule,
+// while a bare `---` has no pipe and correctly lands on one) and ABOVE the
+// inline pass (so each construct's content still gets code spans, links and
+// emphasis). Keep in step with chat.js renderBlocks().
+private val HEADING_RE = Regex("""^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*$""")
+private val HEADING_CLOSE_RE = Regex("""[ \t]+#+[ \t]*$""")
+private val QUOTE_RE = Regex("""^ {0,3}> ?(.*)$""")
+private val UL_RE = Regex("""^([ \t]*)[-*+][ \t]+(.*)$""")
+private val OL_RE = Regex("""^([ \t]*)(\d{1,9})[.)][ \t]+(.*)$""")
+// Cheap pre-filter. Deliberately loose: being wrong only costs the fast path,
+// never correctness, since a non-matching line still falls through to the buffer.
+private val BLOCK_HINT = Regex("""^[ \t]{0,8}(?:#|>|[-*+_]|\d{1,9}[.)])""", RegexOption.MULTILINE)
+private const val MAX_QUOTE_DEPTH = 4
+
+// `text` is var so a lazy-continuation line can be appended to the item above it.
+private data class RawListItem(val indent: Int, val ordered: Boolean, val num: Int, var text: String)
+
+private val LEADING_WS_RE = Regex("""^[ \t]*""")
+
+private fun indentWidth(s: String): Int {
+    var n = 0
+    for (ch in s) n += if (ch == '\t') 4 else 1
+    return n
+}
+
+/**
+ * A horizontal rule: at most 3 leading spaces, then 3+ of ONE marker with
+ * spaces/tabs allowed between them and nothing else on the line.
+ *
+ * A scan, not `Regex("""^ {0,3}(?:(?:-[ \t]*){3,}|…)$""")`. That regex is
+ * linear in V8, but `java.util.regex` recurses once per iteration of a
+ * quantified GROUP, so one long line of dashes threw an uncatchable
+ * `StackOverflowError` out of `parseProse` — which runs inside a Composable,
+ * where the only handler is a `catch (e: Exception)` that an `Error` walks
+ * straight past. A 100k-character text block is inside the wire's own
+ * BLOCK_TEXT_CHARS cap, so this was reachable from ordinary agent output.
+ * chat.js's `isRuleLine` is the same scan; keep the two together.
+ */
+internal fun isRuleLine(line: String): Boolean {
+    var i = 0
+    while (i < 3 && i < line.length && line[i] == ' ') i++
+    if (i >= line.length) return false
+    val marker = line[i]
+    if (marker != '*' && marker != '-' && marker != '_') return false
+    var count = 0
+    while (i < line.length) {
+        val ch = line[i]
+        when {
+            ch == marker -> count++
+            ch == ' ' || ch == '\t' -> {}
+            else -> return false
+        }
+        i++
+    }
+    return count >= 3
+}
+
+private fun listItemAt(line: String): RawListItem? {
+    OL_RE.matchEntire(line)?.let {
+        return RawListItem(indentWidth(it.groupValues[1]), true, it.groupValues[2].toInt(), it.groupValues[3])
+    }
+    if (isRuleLine(line)) return null  // an HR wins over a one-item `***` list
+    UL_RE.matchEntire(line)?.let {
+        return RawListItem(indentWidth(it.groupValues[1]), false, 1, it.groupValues[2])
+    }
+    return null
+}
+
+/**
+ * Flatten a run of list items to depth-tagged rows, resolving nesting off the
+ * indent width exactly as the web's <ul>/<ol> stack does, and the ordered
+ * numbering the browser would have derived from `start`.
+ */
+private fun listBlockOf(items: List<RawListItem>): ProseBlock.ListBlock {
+    val indents = ArrayList<Int>()
+    val counters = ArrayList<Int>()   // >0 = ordered counter, 0 = bullets
+    val rows = ArrayList<ProseListItem>()
+    for (it in items) {
+        while (indents.isNotEmpty() && it.indent < indents.last()) {
+            indents.removeAt(indents.size - 1)
+            counters.removeAt(counters.size - 1)
+        }
+        if (indents.isEmpty() || it.indent > indents.last()) {
+            indents.add(it.indent)
+            counters.add(if (it.ordered) it.num else 0)
+        } else {
+            counters[counters.size - 1] = when {
+                !it.ordered -> 0
+                counters.last() > 0 -> counters.last() + 1
+                else -> it.num
+            }
+        }
+        val depth = indents.size - 1
+        val marker = if (it.ordered) "${counters.last()}." else if (depth > 0) "◦" else "•"
+        rows.add(ProseListItem(depth, marker, parseInline(it.text)))
+    }
+    return ProseBlock.ListBlock(rows)
+}
+
+private fun parseBlocks(text: String, depth: Int): List<ProseBlock> {
+    val out = ArrayList<ProseBlock>()
+    if (BLOCK_HINT.find(text) == null) { paragraphOf(text)?.let { out.add(it) }; return out }
+    val lines = text.split("\n")
+    val buf = ArrayList<String>()
+    var i = 0
+    // `dropBlanks` is set only when a construct follows: its own spacing replaces
+    // the blank line markdown used to separate it. The FINAL flush keeps the
+    // buffer verbatim, so construct-free text parses exactly as it did before.
+    fun flush(dropBlanks: Boolean) {
+        if (dropBlanks) while (buf.isNotEmpty() && isJsBlank(buf.last())) buf.removeAt(buf.size - 1)
+        if (buf.isNotEmpty()) paragraphOf(buf.joinToString("\n"))?.let { out.add(it) }
+        buf.clear()
+    }
+    fun eatBlanks() { while (i < lines.size && isJsBlank(lines[i])) i++ }
+    while (i < lines.size) {
+        val line = lines[i]
+        val h = HEADING_RE.matchEntire(line)
+        if (h != null) {
+            flush(true)
+            // A closing run of #s is syntax, not content.
+            val body = HEADING_CLOSE_RE.replace(h.groupValues[2], "")
+            out.add(ProseBlock.Heading(h.groupValues[1].length, parseInline(body)))
+            i++
+            eatBlanks()
+            continue
+        }
+        if (isRuleLine(line)) {
+            flush(true)
+            out.add(ProseBlock.Rule)
+            i++
+            eatBlanks()
+            continue
+        }
+        if (QUOTE_RE.matches(line)) {
+            flush(true)
+            val body = ArrayList<String>()
+            while (i < lines.size && QUOTE_RE.matches(lines[i])) {
+                body.add(QUOTE_RE.matchEntire(lines[i])!!.groupValues[1])
+                i++
+            }
+            val inner = body.joinToString("\n")
+            val nested = if (depth < MAX_QUOTE_DEPTH) parseBlocks(inner, depth + 1)
+                else listOfNotNull(paragraphOf(inner))
+            out.add(ProseBlock.Quote(nested))
+            eatBlanks()
+            continue
+        }
+        val li = listItemAt(line)
+        if (li != null) {
+            flush(true)
+            val items = ArrayList<RawListItem>()
+            items.add(li)
+            i++
+            while (true) {
+                // GFM lazy continuation: a MORE-indented, non-construct line
+                // belongs to the item above it, not to a new paragraph. Without
+                // this a wrapped bullet ended the list and dropped its own second
+                // line between two lists — 3% of the real corpus's list prose.
+                val cur = if (i < lines.size) lines[i] else null
+                if (cur != null && !isJsBlank(cur) && listItemAt(cur) == null &&
+                    HEADING_RE.matchEntire(cur) == null && !isRuleLine(cur) && !QUOTE_RE.matches(cur) &&
+                    indentWidth(LEADING_WS_RE.find(cur)!!.value) > items.last().indent
+                ) {
+                    items.last().text += "\n" + cur.trim()
+                    i++
+                    continue
+                }
+                // A single blank line between items keeps ONE list (a GFM "loose"
+                // list) rather than splitting it in two.
+                var k = i
+                if (k < lines.size && isJsBlank(lines[k])) k++
+                val nxt = if (k < lines.size) listItemAt(lines[k]) else null
+                if (nxt == null) break
+                items.add(nxt)
+                i = k + 1
+            }
+            out.add(listBlockOf(items))
+            eatBlanks()
+            continue
+        }
+        buf.add(line)
+        i++
+    }
+    flush(false)
+    return out
+}
+
 /** A paragraph from [text], or null when it holds nothing but whitespace. */
 private fun paragraphOf(text: String): ProseBlock.Paragraph? {
-    if (text.isBlank()) return null
+    if (isJsBlank(text)) return null
     return ProseBlock.Paragraph(parseInline(text))
 }
 
@@ -185,12 +514,23 @@ private val FENCE_OPEN = Regex("""^\s*(`{3,})[ \t]*([^\s`]*)[ \t]*$""")
 private val FENCE_CLOSE = Regex("""^\s*(`{3,})[ \t]*$""")
 
 private fun fenceCloses(line: String, openLen: Int): Boolean {
-    val m = FENCE_CLOSE.find(line) ?: return false
+    val m = FENCE_CLOSE.matchEntire(line) ?: return false
     return m.groupValues[1].length >= openLen
 }
 
-/** Parse [text] into an ordered list of prose blocks. */
-fun parseProse(text: String): List<ProseBlock> {
+private val EOL_RE = Regex("""\r\n?""")
+
+/**
+ * Line endings, normalised ONCE at the outermost pass so every pass below splits
+ * on "\n" and sees a line with nothing trailing it. Mirrors chat.js
+ * `normalizeEol`, where a CRLF message rendered with NO markdown at all.
+ */
+private fun normalizeEol(s: String): String =
+    if (!s.contains('\r')) s else EOL_RE.replace(s, "\n")
+
+/** Parse [raw] into an ordered list of prose blocks. */
+fun parseProse(raw: String): List<ProseBlock> {
+    val text = normalizeEol(raw)
     if (!text.contains("```")) return parseTables(text)
     val lines = text.split("\n")
     val out = ArrayList<ProseBlock>()
@@ -198,7 +538,7 @@ fun parseProse(text: String): List<ProseBlock> {
     fun flush() { if (buf.isNotEmpty()) { out.addAll(parseTables(buf.joinToString("\n"))); buf.clear() } }
     var i = 0
     while (i < lines.size) {
-        val open = FENCE_OPEN.find(lines[i])
+        val open = FENCE_OPEN.matchEntire(lines[i])
         if (open != null) {
             flush()
             i++
