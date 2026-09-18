@@ -3046,18 +3046,23 @@ class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
             {"t": "tool_use", "name": "Bash", "input": "{}"},
         ])
 
-    def test_oversize_message_truncated_and_flagged(self):
+    def test_a_message_past_the_old_preview_cap_is_no_longer_clipped(self):
+        """The preview used to clip EVERY row's prose to TAIL_MSG_CHARS (500) and
+        flag it, so the chat drew a "… clipped to fit" mark under a 500-char slice
+        of a real answer. Marking the cut was honest, but the cut itself was the
+        defect: on a client painting from the heartbeat, that slice IS the message.
+        The seed now carries the row whole and bounds the payload by including
+        FEWER rows (see transcript_tail)."""
         path = os.path.join(self.proj, "big.jsonl")
         long_text = "x" * (ha.TAIL_MSG_CHARS + 50)
         write_jsonl(path, [{"uuid": "u1", "type": "user", "message": {"content": long_text}}])
         tail = ha.transcript_tail(path)
-        self.assertEqual(len(tail[0]["text"]), ha.TAIL_MSG_CHARS)
-        self.assertEqual(tail[0]["text"], long_text[:ha.TAIL_MSG_CHARS])
-        # The flag is the whole point: without it the chat renders a message cut
-        # mid-word with no "… clipped to fit" mark, and the operator reads the
-        # cut as the message.
-        self.assertTrue(tail[0]["truncated"])
-        self.assertTrue(tail[0]["blocks"][0]["truncated"])
+        self.assertEqual(tail[0]["text"], long_text, "the row rides whole")
+        self.assertNotIn("truncated", tail[0])
+        self.assertNotIn("truncated", tail[0]["blocks"][0])
+        # The absolute ceiling is still BLOCK_CAPS, the same one every other feed
+        # applies — so this row is no longer the lossy one, not unbounded.
+        self.assertGreater(ha.BLOCK_CAPS["text"], ha.TAIL_MSG_CHARS)
 
     def test_untruncated_row_carries_no_flag(self):
         path = os.path.join(self.proj, "small.jsonl")
@@ -3089,11 +3094,16 @@ class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
             ha.BLOCK_CAPS)
         self.assertEqual(rich[0]["caption"], "look")
 
-    def test_block_budget_degrades_oldest_rows_but_never_to_bare_text(self):
-        """The budget is spent NEWEST-first: what the operator is looking at
-        keeps its fidelity, older rows keep their prose and lose tool payloads —
-        and never lose blocks entirely, which is what puts "[Bash]" back into a
-        prose bubble."""
+    def test_block_budget_drops_oldest_rows_whole_never_guts_a_kept_one(self):
+        """The budget is spent NEWEST-first and decides HOW MANY rows ride, never
+        how good one is.
+
+        It used to degrade instead: an older row kept its prose and had its tool
+        `result` payloads emptied. That rendered as a tool card with nothing
+        inside — worse than no card, since nothing tells the reader the content
+        still exists, and `verbose` then expands what the agent already hollowed
+        out. Dropping the oldest rows costs nothing: `/history` serves them on
+        demand at the same caps."""
         path = os.path.join(self.proj, "budget.jsonl")
         entries = []
         for i in range(10):
@@ -3109,47 +3119,63 @@ class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
         with mock.patch.object(ha, "TAIL_BLOCKS_BUDGET", 2000):
             tail = ha.transcript_tail(path)
         self.assertTrue(all(e.get("blocks") for e in tail), "every row keeps blocks")
-        # Newest row: full preview fidelity (its tool_result text rides).
-        self.assertTrue(any(b.get("text") for b in tail[-1]["blocks"] if b["t"] == "tool_result"))
-        # Oldest row: prose survives, the tool_result payload is emptied + flagged.
-        oldest = tail[0]["blocks"]
-        self.assertTrue(any(b["t"] == "text" and b["text"] for b in oldest))
-        self.assertTrue(all(b["text"] == "" and b["truncated"]
-                            for b in oldest if b["t"] == "tool_result"))
-        # A tool call still reads as a tool call at every fidelity.
-        self.assertTrue(any(b["t"] == "tool_use" and b["name"] == "Bash"
-                            for b in tail[0 if tail[0]["role"] == "assistant" else 1]["blocks"]))
+        self.assertLess(len(tail), 20, "the budget bit by dropping rows")
+        # EVERY row that rode kept its real tool output — no emptied payloads.
+        for row in tail:
+            for b in row["blocks"]:
+                if b["t"] == "tool_result":
+                    self.assertTrue(b["text"], "a kept row must keep its tool output")
+                    self.assertNotIn("truncated", b)
+        # And the rows kept are the NEWEST ones (what is on screen).
+        self.assertEqual(tail[-1]["id"], "r9")
 
-    def test_degraded_tier_keeps_names_and_summaries(self):
-        """`caps["input"]` is not only a tool's argument summary — _entry_blocks
-        clips a task_notification's `summary` and a slash command's `name` with
-        it too. A zero there renders an over-budget row as a NAMELESS command
-        chip and a summary-less agent card: the same lie the blocks exist to
-        end."""
+    def test_a_kept_row_carries_its_names_and_summaries_in_full(self):
+        """There is no longer a degraded TIER to blank these.
+
+        The old design clipped an over-budget row's `caps["input"]`, which
+        _entry_blocks also applies to a task_notification's `summary` and a slash
+        command's `name`/`args` — so an over-budget row rendered as a NAMELESS
+        command chip and a summary-less agent card, the same lie the blocks exist
+        to end. Rows are now included whole or not at all, so what has to hold is
+        that a KEPT row carries these intact."""
         path = os.path.join(self.proj, "degraded.jsonl")
+        tn = ("<task-notification><summary>ship the migration</summary>"
+              "<status>completed</status></task-notification>")
         entries = []
-        # Enough full-fidelity rows ahead of them to exhaust the budget.
+        # Plenty of older rows to exhaust the budget BEHIND the two under test,
+        # so the budget is genuinely engaged rather than trivially satisfied.
         for i in range(20):
             entries.append({"uuid": f"f{i}", "type": "assistant",
                             "message": {"content": "p" * 500}})
-        tn = ("<task-notification><summary>ship the migration</summary>"
-              "<status>completed</status></task-notification>")
-        entries.insert(0, {"uuid": "tn", "type": "user", "message": {"content": tn}})
-        entries.insert(1, {"uuid": "cmd", "type": "user", "message": {
+        entries.append({"uuid": "tn", "type": "user", "message": {"content": tn}})
+        entries.append({"uuid": "cmd", "type": "user", "message": {
             "content": "<command-name>/review</command-name><command-args>--fast</command-args>"}})
         write_jsonl(path, entries)
         with mock.patch.object(ha, "TAIL_BLOCKS_BUDGET", 1000):
-            rows = {e["id"]: e for e in ha.transcript_tail(path)}
+            tail = ha.transcript_tail(path)
+        rows = {e["id"]: e for e in tail}
+        self.assertIn("tn", rows)
+        self.assertIn("cmd", rows)
         tn_block = rows["tn"]["blocks"][0]
         self.assertEqual(tn_block["t"], "task_notification")
         self.assertEqual(tn_block["summary"], "ship the migration")
         cmd_block = rows["cmd"]["blocks"][0]
         self.assertEqual(cmd_block["t"], "command")
         self.assertEqual(cmd_block["name"], "/review")
+        # The budget DID bite — it just bit by dropping the oldest rows whole.
+        self.assertNotIn("f0", rows)
+        self.assertLess(len(tail), 22)
 
-    def test_block_payload_stays_bounded(self):
-        """One pathological tool-heavy turn must not blow the per-beat payload:
-        the budget bounds the WHOLE session's preview blocks, not each row."""
+    def test_block_payload_stays_bounded_by_dropping_rows_not_gutting_them(self):
+        """One pathological tool-heavy turn must not blow the per-beat payload —
+        but the budget bounds HOW MANY rows ride, never how good a row is.
+
+        The old design degraded instead: an over-budget row kept its prose and had
+        its tool `result` payloads emptied. That rendered as a tool card with
+        nothing inside it, which is worse than no card — nothing tells the reader
+        the content still exists, and `verbose` then expands a card the agent
+        already hollowed out. Dropping the OLDEST rows costs nothing: `/history`
+        serves them on demand at the same caps."""
         path = os.path.join(self.proj, "heavy.jsonl")
         entries = []
         for i in range(ha.TAIL_MSGS):
@@ -3159,10 +3185,50 @@ class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
         write_jsonl(path, entries)
         tail = ha.transcript_tail(path)
         spent = sum(ha._blocks_weight(e.get("blocks") or []) for e in tail)
-        # Budget plus at most one over-budget row's worth of the tighter caps.
-        self.assertLess(spent, ha.TAIL_BLOCKS_BUDGET +
-                        ha.BLOCK_MAX_PER_ENTRY * ha.TAIL_PREVIEW_CAPS_MIN["text"] +
-                        ha.TAIL_MSGS * ha.TAIL_PREVIEW_CAPS_MIN["text"] * 2)
+        # Still bounded: the budget, plus the newest row which always rides whole.
+        one_row_worst = ha.BLOCK_MAX_PER_ENTRY * max(ha.BLOCK_CAPS.values())
+        self.assertLess(spent, ha.TAIL_BLOCKS_BUDGET + one_row_worst)
+        # It stayed bounded by INCLUDING FEWER rows, not by gutting them.
+        self.assertLess(len(tail), ha.TAIL_MSGS,
+                        "an over-budget session drops older rows")
+        # And every row that DID ride kept real tool output.
+        for row in tail:
+            for b in row.get("blocks") or []:
+                if b.get("t") == "tool_result":
+                    self.assertTrue(b.get("text"),
+                                    "a row that rides must keep its tool output")
+
+    def test_a_long_turn_is_never_clipped_in_the_preview(self):
+        """The operator's report: assistant turns arriving cut mid-word under a
+        '… clipped to fit' mark. The preview clipped EVERY row's prose to
+        TAIL_MSG_CHARS (500), so any real answer was mutilated on the one path the
+        chat paints from first — and on a client living on the heartbeat, that is
+        simply what the message looked like."""
+        path = os.path.join(self.proj, "long.jsonl")
+        prose = ("word " * 4000).strip()             # ~20k chars, far past the old 500
+        write_jsonl(path, [{"uuid": "L1", "type": "assistant",
+                            "message": {"content": [{"type": "text", "text": prose}]}}])
+        row = ha.transcript_tail(path)[0]
+        self.assertNotIn("truncated", row, "a normal long turn must not be marked clipped")
+        self.assertEqual(row["text"], prose, "the flat text rides whole")
+        text_block = [b for b in row["blocks"] if b["t"] == "text"][0]
+        self.assertEqual(text_block["text"], prose, "the rendered block rides whole")
+        self.assertNotIn("truncated", text_block)
+
+    def test_the_newest_row_always_rides_whole_even_over_budget(self):
+        """The budget must never blank the message being read. The newest row is
+        the one on screen; excluding it to respect a ceiling would empty the very
+        thing the preview exists to paint."""
+        path = os.path.join(self.proj, "over.jsonl")
+        big = "y" * 50000
+        entries = [{"uuid": f"o{i}", "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": big}]}} for i in range(4)]
+        write_jsonl(path, entries)
+        with mock.patch.object(ha, "TAIL_BLOCKS_BUDGET", 10):   # absurdly small
+            tail = ha.transcript_tail(path)
+        self.assertEqual(len(tail), 1, "only the newest row fits")
+        self.assertEqual(tail[0]["id"], "o3", "and it is the NEWEST one")
+        self.assertEqual(tail[0]["text"], big, "carried whole, budget notwithstanding")
 
     def test_window_limited_to_tail_msgs(self):
         path = os.path.join(self.proj, "many.jsonl")

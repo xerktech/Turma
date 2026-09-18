@@ -387,3 +387,44 @@ re-implementation of `hub-agent.py`'s parsers; parity contract in `CLAUDE.md`.
 
 `agent-native.md` (scoped to `agent/native/**`). Nothing under `native/` edits the shared runtime
 files; the one enabling change is `resume_on_boot`'s adopt path.
+
+## The heartbeat preview never mutilates a row (operator-reported, supersedes the degrade tier)
+
+- **`transcript_tail` bounds the preview by HOW MANY rows ride, never by how good
+  a row is.** Blocks are built at `BLOCK_CAPS` — the same fidelity `/history` and
+  the live tail ship — and `TAIL_BLOCKS_BUDGET` is spent newest-first as an
+  INCLUSION bound. **The newest row always rides, whatever it costs**: it is the
+  message being read, and excluding it to respect a ceiling blanks the very thing
+  the preview exists to paint.
+- **This REPLACES the earlier degrade design, which produced two operator-visible
+  defects.** Do not reintroduce either:
+  - every row clipped its prose to `TAIL_MSG_CHARS` (500), so a real answer
+    arrived cut mid-word under the chat's "… clipped to fit" mark. Marking the cut
+    was honest; the cut was the defect. On a client that paints from the heartbeat
+    (Android polls `/api/agents`; the web seeds from it before `/history` lands),
+    that slice IS the message.
+  - past the budget a row fell back to emptied tool `result` payloads, so tool
+    calls rendered as title-only rows with nothing inside. **A card that looks
+    expandable and has been hollowed out is worse than no card** — nothing tells
+    the reader the content still exists — and it makes the verbosity control read
+    as broken: `normal` shows a collapsed card, `verbose` expands it, and both
+    show the same nothing, because the AGENT removed the payload before either
+    setting could act on it.
+- **Dropping the OLDEST rows instead costs nothing real.** They are exactly what
+  `/history` serves on demand, at the same caps. What must never be lossy is what
+  is on screen right now.
+- `preview=True` still skips `_tool_use_detail` alone — that reads FILES FROM
+  DISK (a SendUserFile delivery embeds base64 per file), which is affordable once
+  for one watched session and never for every session on every beat. Tool
+  `input` and `result` both ride, so a card is collapsible AND expandable from the
+  preview; only the Edit/Write/plan detail waits for the live tail or `/history`.
+- Measured after the change: a pathological session (30 long turns each with a
+  large tool result) yields ~95 KiB of seed, 0.56 MiB across `MAX_SESSIONS`,
+  against a 32 MiB `HEARTBEAT_MAX` — bounded by carrying 10 whole rows instead of
+  60 mutilated ones.
+- Tests: `test_a_message_past_the_old_preview_cap_is_no_longer_clipped`,
+  `test_a_long_turn_is_never_clipped_in_the_preview`,
+  `test_the_newest_row_always_rides_whole_even_over_budget`,
+  `test_block_budget_drops_oldest_rows_whole_never_guts_a_kept_one`,
+  `test_block_payload_stays_bounded_by_dropping_rows_not_gutting_them`,
+  `test_a_kept_row_carries_its_names_and_summaries_in_full`.
