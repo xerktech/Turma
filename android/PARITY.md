@@ -78,6 +78,16 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   browser (which has OS/browser zoom); the web can revisit this later.
 - **Chat verbosity defaults to Concise** (XERK-40), where the web defaults to Normal — a phone screen
   fits far less, so tool cards/outputs are opt-in there. A per-session pick still persists as on web.
+- **A block-less entry's trailing tool markers render as hideable tool rows on Android; the web shows
+  them literally** (XERK-861). For an entry with no rich blocks (an older agent / the text-only
+  heartbeat seed), the agent flattener leaves a trailing run of `[ToolName]` markers on the text.
+  `core/ChatItems.kt`'s `degradedBlocks` splits that run into NAME-ONLY tool_use rows the verbosity
+  filter hides under Concise / shows under Normal; bracketed prose is left intact. The web `chat.js`
+  synthesizes such an entry as ONE text block and renders the markers **verbatim in every verbosity**
+  (no `degradedBlocks` exists there on `main`). Both preserve prose — the old Android strip deleted it
+  (the XERK-861 bug); this is a documented **improvement** over that, not web parity. Parity is
+  restored when the in-flight chat markdown-fidelity work lands the same split in `chat.js`; until
+  then Android leads. Tracked here per XERK-30.
 - **One "+" per repo, opening the composer** (XERK-69). The web dashboard has two spawn controls per
   repo — a "+ New session" quick bare-spawn and a ▾ caret to the option composer. Android collapses
   these to a single "+" that opens the `SpawnDialog` (prompt/label/base/model/mode); the separate

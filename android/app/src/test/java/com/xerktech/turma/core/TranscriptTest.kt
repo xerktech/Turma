@@ -32,11 +32,6 @@ class TranscriptTest {
         assertTrue(merged[0].blocks.isNotEmpty())
     }
 
-    @Test fun `conciseText strips tool markers from assistant only`() {
-        assertEquals("done", conciseText("assistant", "done [Bash] [Read]"))
-        assertEquals("keep [Bash]", conciseText("user", "keep [Bash]"))
-    }
-
     @Test fun `mergeTail lets a lighter rich copy replace a text-only one`() {
         // chat.js's `incHasBlocks && !curHasBlocks` arm: the rich live copy must
         // win the stored flat preview even when the weight compare alone loses.

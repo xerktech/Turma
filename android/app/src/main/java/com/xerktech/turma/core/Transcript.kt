@@ -13,16 +13,13 @@ import kotlin.math.max
  * Per-session transcript buffer logic — a port of the web chat.js mergeTail
  * (itself descended from glasses/src/transcript.ts). Entries only ever GROW
  * (a shorter incoming copy is a bounded heartbeat preview that must not
- * clobber the full text), are deduped by key, and the concise tool-marker
- * strip matches the web "Concise" verbosity.
+ * clobber the full text) and are deduped by key.
+ *
+ * The block-less entry's trailing [ToolName] markers are handled by
+ * [degradedBlocks] in ChatItems.kt (XERK-861), not by an unconditional strip
+ * here — the old strip deleted ANY [Word] from assistant text, including
+ * ordinary prose like "see the [notes] section".
  */
-
-private val TOOL_MARKER = Regex("\\[[A-Za-z][A-Za-z0-9_]*]")
-
-/** Strip the agent flattener's bracketed [ToolName] markers from assistant text. */
-fun conciseText(role: String, text: String): String =
-    if (role == "assistant") text.replace(TOOL_MARKER, "").replace(Regex("[ \\t]{2,}"), " ").trim()
-    else text
 
 /**
  * Displayable weight of an entry: flat text plus any block payload (rich >

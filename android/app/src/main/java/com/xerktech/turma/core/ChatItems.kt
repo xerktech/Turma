@@ -1,5 +1,6 @@
 package com.xerktech.turma.core
 
+import com.xerktech.turma.model.Block
 import com.xerktech.turma.model.SendFile
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TaskNotificationBlock
@@ -107,11 +108,14 @@ fun buildItems(
         }
     }
     for (entry in entries) {
-        if (entry.blocks.isEmpty()) {
-            val text = conciseText(entry.role, entry.text)
-            if (text.isNotBlank()) out.add(ChatItem.Bubble(entry.key, entry.role, text))
-            continue
-        }
+        // Older agents / the text-only heartbeat seed carry no blocks: synthesize
+        // them, splitting a trailing run of tool markers off into name-only
+        // tool_use rows the verbosity filter can hide — never deleting them, and
+        // never touching bracketed prose (XERK-861). The web chat.js synthesizes
+        // a block-less entry as one text block and shows the markers verbatim;
+        // Android leads it here (see android/PARITY.md, XERK-861).
+        val blocks = if (entry.blocks.isNotEmpty()) entry.blocks else degradedBlocks(entry.role, entry.text)
+        if (blocks.isEmpty()) continue
         // Consecutive text blocks are ONE bubble, flushed by any other block —
         // the web accumulates `msg.text += b.text` and flushes the same way, so
         // a turn split across blocks must not render as several bubbles.
@@ -124,7 +128,7 @@ fun buildItems(
             pendingClipped = false
             if (!text.isNullOrBlank()) out.add(ChatItem.Bubble(entry.key, entry.role, text, clipped))
         }
-        for (block in entry.blocks) {
+        for (block in blocks) {
             when (block) {
                 is TextBlock -> {
                     (pending ?: StringBuilder().also { pending = it }).append(block.text)
@@ -182,6 +186,65 @@ fun buildItems(
         }
         flushText()
     }
+    return out
+}
+
+private fun isMarkerAlpha(c: Char): Boolean = c in 'a'..'z' || c in 'A'..'Z'
+private fun isMarkerNameChar(c: Char): Boolean = isMarkerAlpha(c) || c in '0'..'9' || c == '_' || c == '-'
+
+/**
+ * Synthesize display blocks for a BLOCK-LESS entry (an older agent or the
+ * text-only heartbeat seed) — the fix for XERK-861 (the old `conciseText`
+ * deleted ANY `[Word]` from assistant text, prose included, silently and
+ * un-recoverably).
+ *
+ * The agent flattener (hub-agent.py `_entry_text`) appends one `[ToolName]`
+ * marker per tool_use with NO separator; within one entry the tool_use blocks
+ * sit at the end (the turn yields at the first tool call), so a genuine run is
+ * always TRAILING and its markers abut each other. That run is split off into
+ * NAME-ONLY tool_use rows so buildItems' verbosity filter hides them under
+ * Concise and shows them under Normal/Verbose — rather than the text vanishing.
+ * (The web chat.js does not do this split yet; Android leads it — see
+ * android/PARITY.md.) The split is deliberately narrow, and the narrowness is
+ * the point:
+ *  - only role == "assistant" (a user turn's text is never a flattened turn);
+ *  - only a RUN of markers at the very END of the text;
+ *  - only a plausible tool name (first char a letter, rest `[A-Za-z0-9_-]`; `-`
+ *    for hyphenated subagent types like qa-delta, `_` for MCP `server__tool`);
+ *  - only when the run is NOT preceded by a space or tab — the join has no
+ *    separator, so a real marker abuts its text or a line break, while prose
+ *    ("the plan [WIP]") puts a space before its bracket.
+ * That set keeps "the plan [WIP]", "see [1]" and "see the [notes] section"
+ * intact as ordinary text.
+ *
+ * The trailing run is found by a LINEAR reverse scan, not a regex: an
+ * unanchored `(?:\[…\])+$` backtracks O(n²) on bracket-heavy text that does not
+ * end in a marker (e.g. "[x]"×N + "."), a ReDoS this same fix's glasses twin
+ * hit (XERK-862/#835). buildItems runs on every tail/history render with no
+ * hard clamp on entry text, so the scan peels whole markers off the end and
+ * stops at the first char that isn't part of one, touching each char once.
+ */
+fun degradedBlocks(role: String, text: String): List<Block> {
+    if (text.isEmpty()) return emptyList()
+    val plain = if (text.isBlank()) emptyList() else listOf(TextBlock(text))
+    if (role != "assistant") return plain
+    val names = ArrayList<String>() // collected right-to-left as the run is peeled
+    var start = text.length // start of the trailing marker run, walked leftward
+    while (start > 0 && text[start - 1] == ']') {
+        // A marker is '[' + a name (first char a letter, rest name-chars) + ']'.
+        var j = start - 2
+        while (j >= 0 && isMarkerNameChar(text[j])) j--
+        if (j < 0 || text[j] != '[' || !isMarkerAlpha(text[j + 1])) break // not a marker
+        names.add(text.substring(j + 1, start - 1)) // the name between the brackets
+        start = j // this marker spans [j, start-1); keep peeling the one before it
+    }
+    if (start == text.length) return plain // no trailing marker run
+    // Prose puts a space (or tab) before its bracket; a flattened marker does not.
+    if (start > 0 && (text[start - 1] == ' ' || text[start - 1] == '\t')) return plain
+    val lead = text.substring(0, start).trimEnd()
+    val out = ArrayList<Block>()
+    if (lead.isNotEmpty()) out.add(TextBlock(lead))
+    for (i in names.indices.reversed()) out.add(ToolUseBlock(name = names[i])) // back to content order
     return out
 }
 
