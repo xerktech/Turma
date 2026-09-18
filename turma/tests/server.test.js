@@ -14685,20 +14685,63 @@ test("control WS: a channel that pongs is kept past the dead-after window", asyn
   try {
     let closed = false;
     socket.on("close", () => { closed = true; });
+    // A late write to a socket the hub has already closed surfaces as an
+    // ECONNRESET 'error' event, which node:test counts as a test failure with a
+    // message that says nothing about what went wrong. The real verdict is the
+    // assertion below — `closed` — so swallow the write error and let that speak.
+    // This cannot mask a regression: if the hub drops the channel, `closed` is
+    // true and the assertion fires regardless.
+    socket.on("error", () => {});
     // Mirror what a real agent's WebSocket does for free: auto-pong every ping.
     // Client->server frames must be masked, so encode the empty pong by hand.
+    // `flushed` counts pongs the kernel has actually accepted, which is what the
+    // loop below waits on — see the comment there.
+    let flushed = 0;
     const parse = wsParser((op) => {
       if (op !== 0x9) return;
-      socket.write(Buffer.concat([Buffer.from([0x80 | 0xa, 0x80]), Buffer.from([1, 2, 3, 4])]));
+      if (socket.destroyed || socket.writableEnded) return;
+      socket.write(
+        Buffer.concat([Buffer.from([0x80 | 0xa, 0x80]), Buffer.from([1, 2, 3, 4])]),
+        () => { flushed++; },
+      );
     });
     if (leftover && leftover.length) parse(leftover);
     socket.on("data", parse);
-    // Advance well PAST CONTROL_DEAD_AFTER_MS in ping-sized steps, letting each
-    // ping's pong round-trip (real I/O) before the next tick — so `lastSeen`
-    // stays fresh and the channel must survive every step.
+
+    // Wait on REAL I/O progress, not a fixed number of event-loop turns.
+    //
+    // `pumpIO()` alone was the flake (~1 run in 3, measured): it yields a FIXED 4
+    // setImmediate turns, which is not enough to guarantee a ping has reached the
+    // client, been answered, and had the pong read back by the hub. Every lagging
+    // round-trip leaves `lastSeen` one tick staler, and since each tick advances
+    // the MOCKED clock by a full ping interval regardless, enough consecutive lags
+    // push `idle` past CONTROL_DEAD_AFTER_MS and the hub correctly drops a channel
+    // the test had not actually kept alive. The bug was in the driving, not the hub.
+    //
+    // `waitFor` cannot be reused here: it is built on setInterval + Date.now(),
+    // both of which THIS test mocks, so it would never advance. setTimeout,
+    // setImmediate and process.hrtime are left real, so the wait is built on those.
+    const untilReal = async (predicate, ms = 5000) => {
+      const start = process.hrtime.bigint();
+      while (!predicate()) {
+        if (Number(process.hrtime.bigint() - start) / 1e6 > ms) return false;
+        await new Promise((r) => setImmediate(r));
+      }
+      return true;
+    };
+
+    // Advance well PAST CONTROL_DEAD_AFTER_MS in ping-sized steps. Each step waits
+    // for THIS ping's pong to be flushed before ticking again, so `lastSeen` is
+    // genuinely fresh and the channel must survive every step.
     const steps = Math.ceil((CONTROL_DEAD_AFTER_MS * 3) / CONTROL_PING_EVERY_MS);
     for (let i = 0; i < steps; i++) {
+      const before = flushed;
       t.mock.timers.tick(CONTROL_PING_EVERY_MS);
+      // The pong for this ping must leave the client...
+      const answered = await untilReal(() => flushed > before);
+      assert.ok(answered || closed,
+        `step ${i}: the test client never answered the hub's ping (driving bug, not a hub bug)`);
+      // ...and the hub must get a turn to read it before the clock moves again.
       await pumpIO();
       assert.ok(!closed, "hub dropped a live channel that was answering its pings");
     }
