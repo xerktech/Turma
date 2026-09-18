@@ -285,9 +285,22 @@ test("buildItems/render: an ExitPlanMode plan renders as prose, open by default"
   assert.match(html, /tool-plan/);
   assert.match(html, /The plan/);
   assert.match(html, /<details class="action-card[^"]*" [^>]*open>/); // approvable: open
-  // The summary leads with the plan's first line, not the raw input JSON.
-  assert.match(html, /tool-arg">## The plan</);
+  // The summary leads with the plan's first line, not the raw input JSON — and
+  // with its MARKDOWN off, since the card collapses it to one line while the
+  // body below renders the same heading properly.
+  assert.match(html, /tool-arg">The plan</);
+  assert.match(html, /<h2 class="md-h">The plan<\/h2>/);
   assert.doesNotMatch(html, /allowedPrompts/);
+});
+
+test("render: a tool card's raw input chip keeps its markdown-looking characters", () => {
+  // Only a PLAN is markdown. Stripping `*` off a raw argument would eat the
+  // glob out of an `ls *.js` chip.
+  const entries = [{ id: "b1", role: "assistant", blocks: [{
+    t: "tool_use", id: "t2", name: "Bash", input: "ls *.js",
+  }] }];
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
+  assert.match(html, /tool-arg">ls \*\.js</);
 });
 
 test("buildItems/render: a todo_write snapshot renders as a checklist with a count summary", () => {
@@ -519,6 +532,55 @@ test("buildItems: a compact_summary is its own item, never a bubble", () => {
   assert.equal(items.length, 1);
   assert.equal(items[0].kind, "compact");
   assert.equal(items[0].text, "Summary: we did things");
+});
+
+// ---- block-less (degraded) entries ---------------------------------------
+test("buildItems: a block-less entry's trailing [Tool] markers become action cards", () => {
+  const items = buildItems([{
+    id: "a1", role: "assistant", text: "Checking the config.[Read][Bash]",
+  }]);
+  assert.deepEqual(items.map((i) => i.kind), ["msg", "action", "action"]);
+  assert.equal(items[0].text, "Checking the config.");
+  assert.deepEqual(items.slice(1).map((i) => i.name), ["Read", "Bash"]);
+  assert.ok(items[1].degraded, "a reconstructed card is marked degraded");
+  // An mcp tool name survives the name charset.
+  const mcp = buildItems([{ id: "a2", role: "assistant", text: "ok[mcp__server__tool]" }]);
+  assert.equal(mcp[1].name, "mcp__server__tool");
+});
+
+test("buildItems: Concise can now hide a block-less entry's tool markers", () => {
+  const entries = [{ id: "a1", role: "assistant", text: "Done.[Bash]" }];
+  const concise = withVerbosity("concise", () => itemsToHtml(buildItems(entries)));
+  assert.doesNotMatch(concise, /\[Bash\]/, "the literal marker must not survive as prose");
+  assert.doesNotMatch(concise, /action-card/, "Concise hides the reconstructed card");
+  assert.match(concise, /Done\./);
+  const normal = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
+  assert.match(normal, /action-card/);
+  assert.match(normal, /<span class="tool-name">Bash<\/span>/);
+  assert.match(normal, /no detail recorded/, "a name-only card says so, not 'running…'");
+});
+
+test("buildItems: bracketed PROSE is never mistaken for a tool marker", () => {
+  for (const text of [
+    "see [1] for details",          // digit-led body
+    "the plan [WIP]",               // space before the bracket
+    "[Bash] ran first, then more",  // not at the end
+    "a [link](https://x/y)",        // markdown link
+  ]) {
+    const items = buildItems([{ id: "x", role: "assistant", text }]);
+    assert.deepEqual(items.map((i) => i.kind), ["msg"], "mis-split as a tool marker: " + text);
+    assert.equal(items[0].text, text);
+  }
+  // A USER turn is never split, whatever it ends with.
+  const u = buildItems([{ id: "u1", role: "user", text: "run it[Bash]" }]);
+  assert.deepEqual(u.map((i) => i.kind), ["msg"]);
+  // A real blocks[] entry is untouched — this only runs on the synthesized path.
+  const rich = buildItems([{
+    id: "a3", role: "assistant", text: "ignored",
+    blocks: [{ t: "text", text: "we tagged it [Bash]" }],
+  }]);
+  assert.deepEqual(rich.map((i) => i.kind), ["msg"]);
+  assert.equal(rich[0].text, "we tagged it [Bash]");
 });
 
 test("render: a command is a chip on the operator's side, not a bubble, in every verbosity", () => {
@@ -1215,6 +1277,299 @@ test("renderProse: a lone pipe row with no delimiter stays plain (not a table)",
 test("renderProse: table-free text is byte-identical to linkify", () => {
   const t = "opened [PR #42](https://github.com/o/r/pull/42) — <b>done</b> & dusted";
   assert.equal(renderProse(t), linkify(t));
+});
+
+// ---- renderEmph / renderBlocks (markdown emphasis + block constructs) ----
+test("renderInline: **bold**, *italic*, ***both*** and ~~strike~~ render", () => {
+  assert.equal(renderInline("a **b** c"), 'a <strong class="md-strong">b</strong> c');
+  assert.equal(renderInline("a *b* c"), 'a <em class="md-em">b</em> c');
+  assert.equal(renderInline("a ~~b~~ c"), 'a <del class="md-strike">b</del> c');
+  assert.equal(renderInline("***b***"), '<strong class="md-strong"><em class="md-em">b</em></strong>');
+  // Nesting: the inner text is re-scanned RAW, so bold-inside-italic works.
+  assert.equal(renderInline("*a **b** c*"),
+    '<em class="md-em">a <strong class="md-strong">b</strong> c</em>');
+});
+
+test("renderInline: emphasis never applies inside a code span", () => {
+  const html = renderInline("`**not bold**` but **this is**");
+  assert.equal(html,
+    '<code class="md-code-inline">**not bold**</code> but <strong class="md-strong">this is</strong>');
+  assert.doesNotMatch(html.slice(0, html.indexOf("</code>")), /<strong/);
+});
+
+test("renderProse: emphasis never applies inside a fenced block", () => {
+  const html = renderProse("```\n**literal** and *stars*\n```");
+  assert.match(html, /<code>\*\*literal\*\* and \*stars\*<\/code>/);
+  assert.doesNotMatch(html, /<strong/);
+});
+
+test("renderInline: an emphasis span never crosses a line break", () => {
+  // One stray `*` must not italicise the rest of the message.
+  const html = renderInline("stray * asterisk\nand *another* one");
+  assert.match(html, /^stray \* asterisk\n/);
+  assert.match(html, /<em class="md-em">another<\/em>/);
+  // An opener with its would-be closer on the NEXT line stays literal.
+  assert.equal(renderInline("*open\nclose*"), "*open\nclose*");
+});
+
+test("renderInline: LEFT flanking — a delimiter followed by a space never opens", () => {
+  // The right-flanking guard alone lets these through, so pin the left one
+  // separately: deleting it changed 127 blocks of the real corpus and no test.
+  assert.equal(renderInline("** bold**"), "** bold**");
+  assert.equal(renderInline("~~ s~~"), "~~ s~~");
+  assert.equal(renderInline("see ** note**"), "see ** note**");
+  assert.equal(renderInline("* italic*"), "* italic*");
+  // The closer-side guard still holds too.
+  assert.equal(renderInline("**bold **"), "**bold **");
+});
+
+test("renderInline: an EMPTY emphasis span is literal, and a long run stays literal", () => {
+  assert.equal(renderInline("**** and ~~~~"), "**** and ~~~~");
+  // A long delimiter run must not become a wall of empty elements (it also used
+  // to cost seconds of blocked main thread — see the cost note in renderEmph).
+  const many = renderInline("x " + "*".repeat(500));
+  assert.doesNotMatch(many, /<strong|<em/);
+});
+
+test("renderProse: CRLF text still renders its markdown", () => {
+  // Every block rule ends `[ \t]*$`, and the "\r" that split("\n") leaves on
+  // each line defeated all of them — a CRLF message rendered with NO markdown
+  // at all. Reachable from any tool result echoing a Windows file, a pasted
+  // CRLF message, or the native Windows agent.
+  const crlf = "Summary\r\n\r\n## What changed\r\n\r\n- one thing\r\n- another\r\n";
+  assert.equal(renderProse(crlf),
+    'Summary<h2 class="md-h">What changed</h2>' +
+    '<ul class="md-list"><li>one thing</li><li>another</li></ul>');
+  // A lone CR is a line break too (CSS pre-wrap treats it as a segment break),
+  // so it becomes one rather than surviving as an invisible character.
+  assert.equal(renderProse("## H\r"), '<h2 class="md-h">H</h2>');
+  assert.equal(renderProse("a\rb"), "a\nb");
+});
+
+test("renderProse: a line separator is not a line ending (the ports must agree)", () => {
+  // Java's `$` matches before a final line terminator and JavaScript's does not,
+  // which is why the Kotlin port uses matchEntire rather than find. U+2028/U+2029
+  // are the probe: both runtimes exclude them from `.`, so BOTH sides must read
+  // these as prose. ProseTest.kt asserts the same two.
+  assert.doesNotMatch(renderProse("## H\u2028"), /<h2/);
+  assert.doesNotMatch(renderProse("## H\u2029"), /<h2/);
+  assert.doesNotMatch(renderProse("- a\u2028"), /<ul/);
+  assert.doesNotMatch(renderProse("1. a\u2029"), /<ol/);
+});
+
+test("renderInline: the emphasis scanner measures whole runs, never a capped count", () => {
+  // Capping how far a delimiter run is counted was tried as a speed fix and
+  // reverted: a saturated count made `m === len` true for a LONGER run and made
+  // the scan resume INSIDE one, which fabricated emphasis on input that had
+  // none. These are the vectors that caught it — they must stay literal / whole.
+  assert.equal(renderInline("~~~~~~# x~~~~"), "~~~~~~# x~~~~");
+  assert.equal(renderInline("****1. y ~~*aa"), "****1. y ~~*aa");
+  assert.equal(renderInline("**a b*****c**"), '<strong class="md-strong">a b*****c</strong>');
+  assert.equal(renderInline("*a******* q"), '<em class="md-em">a</em>****** q');
+  assert.equal(renderInline("~~a~~~~~~~~~#"), '<del class="md-strike">a</del>~~~~~~~#');
+});
+
+test("render: a tool block whose input isn't a string can't take the transcript down", () => {
+  // argSrc.split("\n") threw a TypeError out of itemsToHtml, so ONE malformed
+  // block blanked the whole conversation.
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([{
+    id: "x", role: "assistant",
+    blocks: [{ t: "tool_use", id: "t", name: "Bash", input: { cmd: "ls" } }],
+  }])));
+  assert.match(html, /<span class="tool-name">Bash<\/span>/);
+});
+
+test("renderProse: emphasis and markers stay linear on pathological input", () => {
+  // Every one of these took SECONDS before the noClose memo. The budget is
+  // generous (CI machines vary); the failure mode was ~10^3x this.
+  //
+  // The first three are the ones that actually EXERCISE the memo: the trailing
+  // space makes every candidate closer fail the right-flanking rule, so each of
+  // the ~33k openers runs a full failing scan unless the memo stops it (measured
+  // 16.5s without it, 5ms with). The shapes below them all FIND their closer, so
+  // the memo never engages and they cannot catch its removal — don't drop the
+  // spaced ones thinking they are duplicates.
+  const cases = [
+    "*a ".repeat(33333),
+    "~~a ".repeat(25000),
+    "**a ".repeat(25000),
+    "x " + "~".repeat(100000),
+    "x " + "*".repeat(100000),
+    "*a".repeat(50000),
+    "**".repeat(100000),
+    "-".repeat(100000),
+  ];
+  for (const src of cases) {
+    const t0 = Date.now();
+    renderProse(src);
+    const ms = Date.now() - t0;
+    assert.ok(ms < 2000, "renderProse took " + ms + "ms on a " + src.length + "-char input");
+  }
+  // The same for the degraded-entry marker peel (it was unanchored on the left).
+  const t0 = Date.now();
+  buildItems([{ id: "a", role: "assistant", text: "x" + "[Bash]".repeat(40000) + "tail" }]);
+  assert.ok(Date.now() - t0 < 2000, "degraded marker scan is not linear");
+});
+
+test("renderInline: GFM flanking kills arithmetic, spaced stars and globs", () => {
+  for (const t of ["a * b", "2 * 3 = 6", "run *.js and *.ts", "** spaced **", "a ~ b"]) {
+    assert.equal(renderInline(t), t, "should stay literal: " + t);
+  }
+});
+
+test("renderInline: underscores are NOT emphasis (snake_case stays put)", () => {
+  for (const t of ["snake_case", "__init__", "the file_path arg", "_leading and trailing_", "a __b__ c"]) {
+    assert.equal(renderInline(t), t, "underscore text must be untouched: " + t);
+  }
+});
+
+test("renderInline: emphasis output is still escaped exactly once", () => {
+  assert.equal(renderInline("**<b>x</b>**"), '<strong class="md-strong">&lt;b&gt;x&lt;/b&gt;</strong>');
+  assert.equal(renderInline("*<img src=x onerror=alert(1)>*"),
+    '<em class="md-em">&lt;img src=x onerror=alert(1)&gt;</em>');
+});
+
+test("renderInline: a bolded bare URL links, with the markers out of the href", () => {
+  const html = renderInline("PR: **https://github.com/o/r/pull/131**");
+  assert.match(html, /<strong class="md-strong"><a href="https:\/\/github\.com\/o\/r\/pull\/131"/);
+  assert.doesNotMatch(html, /href="[^"]*\*/);
+});
+
+test("renderProse: ATX headings render, with inline code and links inside", () => {
+  assert.equal(renderProse("## What I did"), '<h2 class="md-h">What I did</h2>');
+  assert.equal(renderProse("###### deep"), '<h6 class="md-h">deep</h6>');
+  assert.match(renderProse("## Fix `XERK-859`"), /<h2 class="md-h">Fix <code class="md-code-inline">XERK-859<\/code><\/h2>/);
+  assert.match(renderProse("## See [the PR](https://example.com/p/1)"),
+    /<h2 class="md-h">See <a href="https:\/\/example\.com\/p\/1"/);
+  // A closing run of #s is syntax, not content.
+  assert.equal(renderProse("### Title ###"), '<h3 class="md-h">Title</h3>');
+  // No space after the hashes → not a heading (a #tag stays text).
+  assert.equal(renderProse("#hashtag stays"), "#hashtag stays");
+  // Seven hashes is not a heading level.
+  assert.equal(renderProse("####### nope"), "####### nope");
+});
+
+test("renderProse: a heading consumes the newlines around it (no stray blank line)", () => {
+  // Under the container's white-space: pre-wrap a surviving "\n" would print as
+  // a blank line on top of the heading's own margin.
+  const html = renderProse("intro\n\n## Head\n\nbody");
+  assert.equal(html, 'intro<h2 class="md-h">Head</h2>body');
+});
+
+test("renderProse: bullets and ordered lists become real lists, and nest", () => {
+  assert.equal(renderProse("- one\n- two"),
+    '<ul class="md-list"><li>one</li><li>two</li></ul>');
+  assert.equal(renderProse("* one\n+ two"),
+    '<ul class="md-list"><li>one</li><li>two</li></ul>');
+  assert.equal(renderProse("1. one\n2. two"),
+    '<ol class="md-list"><li>one</li><li>two</li></ol>');
+  assert.equal(renderProse("3. three\n4. four"),
+    '<ol class="md-list" start="3"><li>three</li><li>four</li></ol>');
+  assert.equal(renderProse("- a\n  - b\n- c"),
+    '<ul class="md-list"><li>a<ul class="md-list"><li>b</li></ul></li><li>c</li></ul>');
+  // A marker switch at the same depth closes one list and opens the other.
+  assert.equal(renderProse("- a\n1. b"),
+    '<ul class="md-list"><li>a</li></ul><ol class="md-list"><li>b</li></ol>');
+  // List content goes through renderInline, not esc.
+  assert.match(renderProse("- **bold** and `code`"),
+    /<li><strong class="md-strong">bold<\/strong> and <code class="md-code-inline">code<\/code><\/li>/);
+});
+
+test("renderProse: a wrapped bullet's continuation line stays in its item", () => {
+  // GFM lazy continuation. Without it the list ended at the wrap, the second
+  // line rendered as a bare paragraph flush left, and a fresh list started
+  // under it — 3% of the list-bearing prose in the real corpus.
+  assert.equal(renderProse("- item one\n  continued here\n- item two"),
+    '<ul class="md-list"><li>item one\ncontinued here</li><li>item two</li></ul>');
+  // A NESTED item is an item, not a continuation.
+  assert.equal(renderProse("- a\n  - b"),
+    '<ul class="md-list"><li>a<ul class="md-list"><li>b</li></ul></li></ul>');
+  // A flush-left line after the list is a paragraph, not a continuation.
+  assert.equal(renderProse("- a\nnext paragraph"),
+    '<ul class="md-list"><li>a</li></ul>next paragraph');
+  // A more-indented CONSTRUCT is still that construct, not continuation text.
+  assert.match(renderProse("- a\n  ## head"), /<h2 class="md-h">head<\/h2>/);
+});
+
+test("renderProse: a dash that isn't a bullet stays prose", () => {
+  assert.equal(renderProse("-no space"), "-no space");
+  assert.equal(renderProse("a - b"), "a - b");
+});
+
+test("renderProse: blockquotes and horizontal rules render", () => {
+  assert.equal(renderProse("> quoted"), '<blockquote class="md-quote">quoted</blockquote>');
+  // A quote is itself block-parsed, so a list inside one is a list.
+  assert.equal(renderProse("> - a\n> - b"),
+    '<blockquote class="md-quote"><ul class="md-list"><li>a</li><li>b</li></ul></blockquote>');
+  for (const r of ["---", "***", "___", "- - -"]) {
+    assert.equal(renderProse(r), '<hr class="md-hr">', "should be a rule: " + r);
+  }
+});
+
+test("renderProse: a table delimiter row is a TABLE, a bare --- is a RULE", () => {
+  // Tables run first, so |---|---| is never seen by the rule pass...
+  const tbl = renderProse("| a | b |\n|---|---|\n| 1 | 2 |");
+  assert.match(tbl, /<table class="md-table">/);
+  assert.doesNotMatch(tbl, /<hr/);
+  // ...and a pipe row with no delimiter under it is still plain prose.
+  assert.doesNotMatch(renderProse("cost is 3 | 4"), /<hr|<table/);
+  // ...while a bare --- has no pipe, so it correctly falls through to the rule.
+  assert.equal(renderProse("above\n\n---\n\nbelow"), 'above<hr class="md-hr">below');
+});
+
+test("renderProse: block markdown is escaped, never injected", () => {
+  assert.match(renderProse("## <script>alert(1)</script>"), /<h2 class="md-h">&lt;script&gt;/);
+  assert.doesNotMatch(renderProse("## <script>alert(1)</script>"), /<script>/);
+  assert.match(renderProse('- <img src=x onerror="alert(1)">'), /<li>&lt;img src=x onerror=/);
+  assert.doesNotMatch(renderProse('- <img src=x onerror="alert(1)">'), /<img src=x/);
+  assert.doesNotMatch(renderProse("> <b>q</b>"), /<b>/);
+  // A quoted attribute break-out attempt through a heading's content.
+  assert.doesNotMatch(renderProse('## " onmouseover="alert(1)'), /onmouseover="alert/);
+});
+
+test("renderProse: construct-free text stays byte-identical to renderInline", () => {
+  // The block pass must emit NOTHING of its own for a plain paragraph — no <p>,
+  // which would double every blank line under the container's pre-wrap.
+  for (const t of [
+    "plain prose with no markers at all",
+    "3 apples and 4 pears\n\nsecond paragraph\n",
+    "1999 was a year\n\n-40 degrees",
+  ]) {
+    assert.equal(renderProse(t), renderInline(t), "block pass changed plain prose: " + t);
+  }
+});
+
+test("renderProse: hostile markdown never emits a tag the renderer didn't write", () => {
+  // The safety invariant the whole pipeline rests on: esc() runs ONLY at the
+  // innermost layer (linkify/codeSpan), every pass above slices RAW text, and
+  // the only markup concatenated in is a literal string the renderer wrote. So
+  // every '<' in the output must open one of the renderer's own tags.
+  const ALLOWED = /^<\/?(a|img|code|pre|div|button|svg|rect|path|table|thead|tbody|tr|th|td|h[1-6]|hr|ul|ol|li|blockquote|strong|em|del)[\s>/]/;
+  const hostile = [
+    "## <script>alert(1)</script>",
+    '## " onmouseover="alert(1)',
+    "- <iframe src=javascript:alert(1)></iframe>",
+    "> <svg onload=alert(1)>",
+    "**<a href='javascript:alert(1)'>x</a>**",
+    "| <b>a</b> | *<i>b</i>* |\n|---|---|\n| `<u>c</u>` | ~~<s>d</s>~~ |",
+    "*[x](javascript:alert(1))*",
+    "1. <img src=x onerror=alert(1)>",
+    "#### **`<script>`** and [a](https://x/a_b) and ***y***",
+    "--- <script>x</script>",
+    "***\n<script>y</script>\n***",
+    "> - **<script>z</script>**",
+    "*a **b* c** d",                       // deliberately unbalanced emphasis
+    "- a\n    - b\n  - c\n- d\n1. e\n- f",  // ragged nesting
+  ];
+  for (const src of hostile) {
+    const html = renderProse(src);
+    for (let i = html.indexOf("<"); i >= 0; i = html.indexOf("<", i + 1)) {
+      assert.ok(ALLOWED.test(html.slice(i, i + 32)),
+        "raw markup leaked from " + JSON.stringify(src) + ": …" + html.slice(i, i + 40));
+    }
+    assert.doesNotMatch(html, /href="javascript:/i);
+    assert.doesNotMatch(html, /\son[a-z]+="/i, "an event handler attribute leaked: " + html);
+  }
 });
 
 // ---- renderProse (fenced code blocks in prose bubbles) -------------------
