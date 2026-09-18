@@ -13613,8 +13613,33 @@ function channelDuplex(socket) {
     },
   });
   socket.on("data", parse);
-  socket.on("close", () => { d.push(null); d.destroy(); });
-  socket.on("error", () => d.destroy());
+  // A dead data channel must reach whatever rides the duplex as an ERROR, not a
+  // silent close. proxyTerm's http.ClientRequest settles its RESPONSE off the
+  // socket's 'error'; a bare `d.destroy()` (no error) left a terminal asset
+  // request whose channel died MID-response (headers already piped to the client)
+  // hanging the browser — no 502, no timeout — since `upRes` never surfaced a
+  // prompt error (XERK-865). Destroying WITH an error fails the request fast so
+  // proxyTerm's terminalFail path runs. Safe for both openChannel consumers: the
+  // WS-terminal proxy bails on 'error' or 'close' alike, and the http.Agent just
+  // evicts an idle pooled socket that errors between requests.
+  const die = (err) => {
+    if (d.destroyed) return;
+    d.destroy(err instanceof Error ? err : new Error("tunnel data channel closed"));
+  };
+  // Destroying a stream WITH an error throws "Unhandled error" if nothing is
+  // listening — a hub crash under `restart: unless-stopped` (the terminalFail
+  // paranoia). Consumers attach their own 'error' handler synchronously on
+  // receipt; this no-op backstop guarantees one always exists.
+  d.on("error", () => {});
+  socket.on("close", () => die());
+  socket.on("error", (err) => die(err));
+  // A peer half-close (raw TCP FIN, no WS close frame) fires 'end' but — on an
+  // upgraded/half-open-allowed socket — NOT 'close', so without this a channel the
+  // origin FIN'd mid-response would never tear the duplex down and the request
+  // would hang out the whole deadline (XERK-865). A graceful WS close (op 0x8)
+  // already pushed EOF and ended our side, and `die` is guarded on `d.destroyed`,
+  // so this only bites the abnormal FIN.
+  socket.on("end", () => die());
   return d;
 }
 
@@ -14015,8 +14040,13 @@ function termRetryReset(attempt, reusedSocket, headersSent, method, err) {
 // reset — can't double-`res.end()`, which threw ERR_STREAM_WRITE_AFTER_END out of
 // an error handler = a hub exit under `restart: unless-stopped`.
 function terminalFail(res, msg) {
-  if (res.writableEnded) return;
-  if (res.headersSent) { res.end(); return; }
+  if (res.writableEnded || res.destroyed) return;
+  // Mid-stream (headers already sent for a piped asset): DESTROY the response, do
+  // not end() it. A ttyd asset carries a Content-Length, so res.end() after fewer
+  // bytes than declared leaves the client waiting out the missing length — a ~6s
+  // stall, or forever — spinning the browser tab on a dead channel (XERK-865).
+  // Destroying closes the socket at once; the reloaded terminal document re-fetches.
+  if (res.headersSent) { res.destroy(); return; }
   res.writeHead(502, { "Content-Type": "text/plain" });
   res.end(msg);
 }
@@ -14039,6 +14069,12 @@ function terminalReconnectPage(res) {
   });
   res.end(TERM_RECONNECT_HTML);
 }
+// A hard deadline on a whole terminal-proxy request, so ANY silent-death path
+// settles the browser instead of spinning a tab forever (XERK-865, fix half 2).
+// The error-destroy in channelDuplex settles the common death modes in ms; this
+// is the backstop for anything it (or a future path) misses. Generous — terminal
+// assets are tiny and fast, so it can only ever fire on a genuine hang.
+const TERM_PROXY_TIMEOUT_MS = positiveEnv("TERM_PROXY_TIMEOUT_MS", 30 * 1000);
 async function proxyTerm(req, res, name, port) {
   const headers = { ...req.headers, host: "ttyd", authorization: ttydAuth(name) };
   // Keep-alive over the pooled channel — drop any client-sent Connection header
@@ -14058,7 +14094,14 @@ async function proxyTerm(req, res, name, port) {
   // (headers already sent) still just truncates through terminalFail.
   const isBaseDoc = req.method === "GET" &&
     /^\/term\/[^/]+\/$/.test((req.url || "").split("?")[0]);
+  // The in-flight upstream request, so the deadline below can tear it down; and
+  // the deadline itself, cleared on every settle so a completed request never
+  // trips it. `unref` so it never holds the process open (the suite would hang).
+  let currentUp = null;
+  let deadline = null;
+  const clearDeadline = () => { if (deadline) { clearTimeout(deadline); deadline = null; } };
   const fail = (msg) => {
+    clearDeadline();
     if (isBaseDoc && !res.headersSent && !res.writableEnded) return terminalReconnectPage(res);
     return terminalFail(res, msg);
   };
@@ -14108,6 +14151,7 @@ async function proxyTerm(req, res, name, port) {
       { agent: termAgentFor(name, port), host: name, port, method: req.method, path: req.url, headers },
       onUpstream
     );
+    currentUp = up;
     up.on("error", (e) => {
       if (termRetryReset(attempt, up.reusedSocket, res.headersSent, req.method, e)) return send(1);
       fail(`terminal error: ${e.message}`);
@@ -14118,6 +14162,16 @@ async function proxyTerm(req, res, name, port) {
     if (attempt === 0) req.pipe(up);
     else up.end();
   };
+  // A settled (or client-abandoned) response can never hang, so clear the
+  // deadline once it closes. On timeout, tear down the in-flight upstream (its
+  // 'error' is idempotently absorbed by fail/terminalFail) and settle the client.
+  res.on("close", clearDeadline);
+  deadline = setTimeout(() => {
+    deadline = null;
+    try { currentUp && currentUp.destroy(new Error("terminal proxy timeout")); } catch {}
+    fail("terminal proxy timeout");
+  }, TERM_PROXY_TIMEOUT_MS);
+  if (deadline.unref) deadline.unref();
   send(0);
 }
 

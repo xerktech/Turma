@@ -17080,6 +17080,124 @@ test("term: terminal HTML serves JBMNerd with font-display:swap (not block)", as
 });
 
 
+test("term: channelDuplex surfaces every channel death as a duplex error (XERK-865)", async () => {
+  // XERK-865: whatever rides the data-channel duplex (proxyTerm's ClientRequest)
+  // must see a channel death as an ERROR, not a silent close, or a mid-response
+  // request never settles. Pin ALL THREE teardown paths directly — 'error', a peer
+  // FIN reported as 'close', AND a peer FIN reported as 'end' (an upgraded/half-open
+  // socket fires 'end' but not 'close'; the real hang the full drive test cannot
+  // reach because its fake data socket is not half-open).
+  const { EventEmitter } = require("node:events");
+  const fakeSocket = () => {
+    const s = new EventEmitter();
+    s.write = () => true;
+    s.end = () => {};
+    s.destroy = () => {};
+    return s;
+  };
+  const tick = () => new Promise((r) => setImmediate(r));
+  for (const event of ["error", "close", "end"]) {
+    const socket = fakeSocket();
+    const d = channelDuplex(socket);
+    let errored = null;
+    d.on("error", (e) => { errored = e; }); // a consumer listener (proxyTerm's http client)
+    assert.equal(d.destroyed, false, `duplex must be live before the ${event} signal`);
+    socket.emit(event, event === "error" ? Object.assign(new Error("boom"), { code: "ECONNRESET" }) : undefined);
+    assert.equal(d.destroyed, true, `a socket '${event}' must destroy the duplex`);
+    await tick(); // stream 'error' is emitted on the next tick, not synchronously
+    assert.ok(errored instanceof Error, `a socket '${event}' must surface an ERROR on the duplex, not a silent close`);
+    if (event === "error") assert.equal(errored.code, "ECONNRESET", "the real socket error must propagate");
+  }
+  // The no-op 'error' backstop: destroying with an error must NEVER crash the hub
+  // ("Unhandled error" thrown on the next tick = a restart loop) when NO consumer
+  // has attached its own error listener. Reaching the next line after the tick
+  // proves the built-in backstop absorbed it (the test runner fails on an
+  // uncaughtException otherwise).
+  const bare = channelDuplex(fakeSocket());
+  bare.destroy(new Error("no listener"));
+  await tick();
+  assert.equal(bare.destroyed, true, "destroy-with-error settled without crashing the hub");
+});
+
+
+test("term: a mid-stream channel death settles the asset request, never hangs (XERK-865)", async () => {
+  // XERK-865: a /term ASSET whose tunnel data channel dies AFTER ttyd's headers
+  // reached the client used to hang the browser — proxyTerm piped a declared
+  // Content-Length, so terminalFail's res.end() left the client waiting out the
+  // missing bytes (~6s on a reset, FOREVER on a graceful FIN). The fix: channelDuplex
+  // surfaces the channel death as an ERROR (incl. a peer FIN's 'end'), and terminalFail
+  // DESTROYS the mid-stream response instead of end()ing it. Drive the REAL proxyTerm
+  // path with a fake ttyd that answers a partial body then FINs the channel, and assert
+  // the request settles PROMPTLY rather than hanging.
+  const host = "midDeathHost";
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: host,
+      sessions: [{ id: "md1", repo: "Turma", status: "running", ttydPort: 7911,
+        worktreePath: "/git/.turma/worktrees/Turma/md1", transcriptId: "t-md1" }],
+    },
+    headers: agentHeaders,
+  });
+  const ctrl = await wsConnect(`/agent/control?name=${host}&token=${hostAgentToken(host)}`);
+  const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
+
+  // Fire an ASSET request (not the base doc — this must take the plain terminalFail
+  // path, not the self-reloading interstitial). Observe EVERY settle a browser acts
+  // on — a clean end, a truncation ('aborted'), a request error, or the connection
+  // closing — since the fix truncates by DESTROYING the response, which the plain
+  // `request` helper (res 'end' / req 'error' only) would not observe.
+  const started = Date.now();
+  const assetP = new Promise((resolve) => {
+    const done = (kind) => resolve({ kind, ms: Date.now() - started });
+    const r = http.request(baseUrl + "/term/md1/main.js", { method: "GET", headers: userHeaders },
+      (res) => {
+        res.on("data", () => {});
+        res.on("end", () => done("end"));
+        res.on("aborted", () => done("aborted"));
+        res.on("close", () => done("close"));
+        res.on("error", () => done("res-error"));
+      });
+    r.on("error", () => done("req-error"));
+    r.on("close", () => done("req-close"));
+    r.end();
+  });
+
+  await waitFor(() => ctrlFrames.some((f) => {
+    try { return JSON.parse(f.payload).open; } catch { return false; }
+  }));
+  const ch = ctrlFrames
+    .map((f) => { try { return JSON.parse(f.payload).open; } catch { return null; } })
+    .find(Boolean);
+  assert.ok(ch, "hub should request a data channel for the terminal asset");
+
+  const data = await wsConnect(`/agent/data?ch=${ch}&token=${hostAgentToken(host)}`, 1500);
+  const dataFrames = collectFrames(data.socket, data.leftover);
+  await waitFor(() => dataFrames.some((f) => f.payload.length), 3000);
+
+  // Answer with a 200 whose declared length (100) far exceeds the body sent (7),
+  // then FIN the channel mid-body — the graceful-close case that hung forever.
+  const resp =
+    "HTTP/1.1 200 OK\r\n" +
+    "Content-Type: application/javascript\r\n" +
+    "Content-Length: 100\r\n" +
+    "\r\nPARTIAL";
+  data.socket.write(wsClientFrame(0x2, Buffer.from(resp, "utf8")));
+  setTimeout(() => { try { data.socket.end(); } catch {} }, 30);
+
+  // The request MUST settle well under the proxy deadline (30s) and the old
+  // ~6s/∞ hang — a couple of seconds is generous for the ms-scale real settle.
+  const outcome = await Promise.race([
+    assetP,
+    new Promise((resolve) => setTimeout(() => resolve({ kind: "HUNG" }), 4000)),
+  ]);
+  assert.notEqual(outcome.kind, "HUNG",
+    "a mid-stream channel death must settle the asset request, not hang the browser");
+  assert.ok(Date.now() - started < 4000, "the settle must be prompt, not a multi-second stall");
+  ctrl.socket.destroy();
+  try { data.socket.destroy(); } catch {}
+});
+
+
 test("term: a reset on a REUSED pooled ttyd channel is replayed once (termRetryReset)", () => {
   // Terminal Connection Resilience: a pooled tunnel channel that ttyd (or the
   // Windows pty-host) closed on its own keep-alive idle timeout still looks
@@ -17118,9 +17236,11 @@ test("term: terminalFail settles the proxy response exactly once (no double-end 
   // the one idempotent settle they all route through. A fake response records what
   // it was asked to do so the three branches are pinned deterministically.
   const fakeRes = () => ({
-    headersSent: false, writableEnded: false, head: null, ended: undefined, endCount: 0,
+    headersSent: false, writableEnded: false, destroyed: false,
+    head: null, ended: undefined, endCount: 0, destroyCount: 0,
     writeHead(code, h) { this.headersSent = true; this.head = [code, h]; },
     end(body) { this.endCount += 1; this.writableEnded = true; this.ended = body; },
+    destroy() { this.destroyCount += 1; this.destroyed = true; },
   });
 
   // Before headers: a 502 with the reason, ended once.
@@ -17135,20 +17255,26 @@ test("term: terminalFail settles the proxy response exactly once (no double-end 
   assert.equal(a.endCount, 1, "a settled response must never be re-ended");
   assert.equal(a.ended, "terminal error: boom", "the second reason must not overwrite the first");
 
-  // Mid-stream (headers already sent for a piped asset): truncate, no 502, no body,
-  // and never a writeHead-after-headers throw.
+  // Mid-stream (headers already sent for a piped asset): DESTROY the response, no
+  // 502, no res.end (XERK-865 — an end() under a declared Content-Length hangs the
+  // client), and never a writeHead-after-headers throw.
   const b = fakeRes();
   b.headersSent = true;
   terminalFail(b, "terminal error: mid");
   assert.equal(b.head, null, "must not writeHead once headers are already sent");
-  assert.equal(b.endCount, 1);
-  assert.equal(b.ended, undefined, "a mid-stream failure truncates, it does not append the reason");
+  assert.equal(b.destroyCount, 1, "a mid-stream failure destroys the response");
+  assert.equal(b.endCount, 0, "a mid-stream failure must not res.end() under a declared length");
+
+  // A second mid-stream call is a NO-OP — the destroy crash guard.
+  terminalFail(b, "again");
+  assert.equal(b.destroyCount, 1, "a destroyed response must never be re-destroyed");
 
   // Already ended (e.g. the success path completed): a stray late error is inert.
   const c = fakeRes();
   c.writableEnded = true;
   terminalFail(c, "late");
   assert.equal(c.endCount, 0);
+  assert.equal(c.destroyCount, 0);
   assert.equal(c.head, null);
 });
 
