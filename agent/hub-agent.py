@@ -774,30 +774,15 @@ BLOCK_CAPS = {
 # are far tighter than BLOCK_CAPS (which the SINGLE-session live tail and
 # `history` read at, XERK-347 — never narrow THOSE) and the whole per-session
 # block payload is bounded by TAIL_BLOCKS_BUDGET below.
-TAIL_PREVIEW_CAPS = {
-    "text": TAIL_MSG_CHARS,
-    "input": _env_int("SESSION_TAIL_INPUT_CHARS", 80),   # "Bash(git status)", no more
-    "result": TAIL_MSG_CHARS,
-}
-# What an over-budget (older) preview row degrades to: prose still rides — it is
-# what the operator reads — tool inputs and outputs do not. Never degrade a row
-# to NO blocks: that is what puts "[Bash]" back in a prose bubble.
-# `input` stays NON-ZERO here on purpose: it is not only a tool_use's argument
-# summary. `_entry_blocks` also clips a task_notification's `summary` and a
-# slash-command's `name`/`args` with it, so a zero would render an over-budget
-# row as a nameless command chip and a summary-less agent card — the same class
-# of lie the blocks exist to end. These are short; the budget is spent on text
-# and tool output.
-TAIL_PREVIEW_CAPS_MIN = {
-    "text": _env_int("SESSION_TAIL_MIN_TEXT_CHARS", 200),
-    "input": _env_int("SESSION_TAIL_MIN_INPUT_CHARS", 80),
-    "result": 0,
-}
-# Per-session ceiling on the preview's block payload, spent NEWEST-first (what
-# the operator is looking at gets the fidelity). Past it a row falls back to
-# TAIL_PREVIEW_CAPS_MIN. Bounds the heartbeat: without it one tool-heavy turn
-# could carry BLOCK_MAX_PER_ENTRY x TAIL_MSG_CHARS on its own.
-TAIL_BLOCKS_BUDGET = _env_int("SESSION_TAIL_BLOCKS_BUDGET", 6000)
+# NOTE: TAIL_PREVIEW_CAPS / TAIL_PREVIEW_CAPS_MIN are GONE. They clipped a
+# preview row's prose to TAIL_MSG_CHARS and, past the budget, emptied its tool
+# `result` payloads. Both were visible defects rather than economies: the chat
+# showed assistant turns cut mid-word under "… clipped to fit", and tool calls as
+# title-only rows with nothing inside. The budget now bounds how many rows ride,
+# not how good one is (see transcript_tail), so a preview row is built at
+# BLOCK_CAPS like every other feed. Do not reintroduce a per-row preview cap:
+# an operator reading the newest turn must never be shown a mutilated copy of it.
+TAIL_BLOCKS_BUDGET = _env_int("SESSION_TAIL_BLOCKS_BUDGET", 96000)
 # SendUserFile inline preview (XERK-221): the agent reads the image/SVG/HTML files
 # a session delivers via SendUserFile and embeds them ON the tool_use block (a
 # base64 data: URI for images, the raw markup for HTML) so the chat renders them
@@ -7714,7 +7699,7 @@ def _entry_blocks(entry, caps, preview=False):
     (BLOCK_CAPS on every path — the live tail and on-demand history read at the
     same fidelity); a block cut to its cap gets truncated:true.
 
-    `preview=True` is the HEARTBEAT path (transcript_tail, TAIL_PREVIEW_CAPS):
+    `preview=True` is the HEARTBEAT path (transcript_tail, same BLOCK_CAPS):
     same blocks, but _tool_use_detail is skipped entirely. That detail READS
     FILES FROM DISK (a SendUserFile delivery embeds up to SEND_FILE_MAX_BYTES of
     base64 per file, XERK-221) — affordable once for one watched session, never
@@ -7936,19 +7921,23 @@ def transcript_tail(path):
     Missing/empty transcript -> []. id is the transcript entry's own uuid so
     clients can merge/dedup on it.
 
-    Two consumers, one row. `text` is the flat, lossy string the glasses have
-    always read and is UNCHANGED — except that a row cut to TAIL_MSG_CHARS now
-    says so (`truncated`), instead of arriving silently sliced mid-word with
-    nothing for the chat's "… clipped to fit" mark to key on.
+    Two consumers, one row. `text` is the flat string the glasses read; `blocks`
+    is what stops the row LYING to the chat, which seeds its buffer from here:
+    `_entry_text` flattens a tool call to the literal "[Bash]", and a text-only
+    row makes the chat synthesize one text block around it, so the operator sees
+    a prose bubble whose whole content is "[Bash]".
 
-    `blocks` is what stops the row LYING to the chat, which seeds its buffer
-    from here: _entry_text flattens a tool call to the literal "[Bash]", and a
-    text-only row makes the chat synthesize one text block around it, so the
-    operator sees a prose bubble whose whole content is "[Bash]". The blocks are
-    the same shape every other feed ships (so no client needs a new code path)
-    at TAIL_PREVIEW_CAPS, spent newest-first against TAIL_BLOCKS_BUDGET; past
-    the budget an older row degrades to TAIL_PREVIEW_CAPS_MIN — prose kept, tool
-    payloads emptied — never to no blocks at all."""
+    **A row that rides, rides WHOLE.** Blocks are built at BLOCK_CAPS — the same
+    fidelity `/history` and the live tail ship — and TAIL_BLOCKS_BUDGET bounds HOW
+    MANY rows are included, never how good one is; the newest always rides. The
+    earlier design degraded instead (an over-budget row fell back to emptied tool
+    payloads, and every row clipped its prose), which is what put "… clipped to
+    fit" under a 500-char slice of a long turn and rendered tool calls as bare
+    title rows with their content removed — a card that looks expandable and has
+    been emptied is worse than no card, and it makes verbosity read as broken
+    (`verbose` expands what the agent already hollowed out). Dropping the OLDEST
+    rows instead costs nothing: they are exactly what `/history` serves on demand,
+    at the same caps."""
     kept = []
     for entry in _tail_entries(path):
         text = _entry_text(entry)
@@ -7958,19 +7947,41 @@ def transcript_tail(path):
     kept = kept[-TAIL_MSGS:]
     rows = []
     spent = 0
-    # Newest-first: the fidelity budget goes to what is on screen. The rows are
-    # reversed back to transcript order before returning.
-    for entry, text in reversed(kept):
-        caps = TAIL_PREVIEW_CAPS if spent < TAIL_BLOCKS_BUDGET else TAIL_PREVIEW_CAPS_MIN
-        blocks = _entry_blocks(entry, caps, preview=True) or []
+    # Newest-first, and the budget decides HOW MANY rows ride — never how good a
+    # row is. A row that is included is included WHOLE.
+    #
+    # This used to degrade instead: an over-budget row fell back to
+    # TAIL_PREVIEW_CAPS_MIN, which emptied tool `result` payloads, and EVERY row
+    # clipped its prose at TAIL_MSG_CHARS. Both are visible defects, not
+    # economies. The operator saw assistant turns cut mid-word under a "… clipped
+    # to fit" mark, and tool calls rendered as bare title rows with nothing inside
+    # them — a card that LOOKS expandable and has had its content removed is worse
+    # than no card, because nothing tells the reader the content still exists.
+    # Verbosity then reads as broken: `verbose` expands a card the agent already
+    # emptied, so it shows the same nothing `normal` did.
+    #
+    # Dropping the OLDEST rows instead costs nothing real: they are exactly what
+    # `/history` serves, at looser caps, on demand. What must never be lossy is
+    # what is on screen right now.
+    for i, (entry, text) in enumerate(reversed(kept)):
+        # The NEWEST row always rides, whatever it costs. It is the message the
+        # operator is reading; excluding it to respect a budget would blank the
+        # very thing the preview exists to paint.
+        if i and spent >= TAIL_BLOCKS_BUDGET:
+            break
+        blocks = _entry_blocks(entry, BLOCK_CAPS, preview=True) or []
         spent += _blocks_weight(blocks)
-        clipped, trunc = _clip(text, TAIL_MSG_CHARS)
         row = {
             "id": entry.get("uuid"),
             "role": _entry_role(entry),
-            "text": clipped,
+            # NOT clipped. The flat `text` is the glasses' feed and the chat's
+            # fallback when an entry carries no blocks; a cap here is what put
+            # "… clipped to fit" under a 500-char slice of a long turn.
+            # BLOCK_TEXT_CHARS is the same ceiling every other feed applies, so
+            # this row is no longer the lossy one.
+            "text": text[:BLOCK_TEXT_CHARS],
         }
-        if trunc:
+        if len(text) > BLOCK_TEXT_CHARS:
             row["truncated"] = True
         if blocks:
             row["blocks"] = blocks
