@@ -463,16 +463,23 @@
   /* Markdown tables (chat.js renderProse()). display:block + overflow-x lets a
      wide table scroll inside the bubble instead of stretching the layout; the
      surrounding bubble is pre-wrap, so reset table cells to normal wrapping. */
-  .tr-msg .md-table, .thought-body .md-table {
+  .tr-msg .md-table, .thought-body .md-table, .compact-body .md-table, .away-body .md-table,
+  .tool-plan .md-table {
     display: block; overflow-x: auto; max-width: 100%; margin: 6px 0;
     border-collapse: collapse; font-size: 12.5px; white-space: normal; }
-  .tr-msg .md-table th, .tr-msg .md-table td,
-  .thought-body .md-table th, .thought-body .md-table td {
+  .tr-msg .md-table th, .thought-body .md-table th, .compact-body .md-table th,
+  .away-body .md-table th, .tool-plan .md-table th,
+  .tr-msg .md-table td, .thought-body .md-table td, .compact-body .md-table td,
+  .away-body .md-table td, .tool-plan .md-table td {
     border: 1px solid var(--border); padding: 4px 9px; text-align: left; vertical-align: top; }
-  .tr-msg .md-table th, .thought-body .md-table th {
+  .tr-msg .md-table th, .thought-body .md-table th, .compact-body .md-table th,
+  .away-body .md-table th, .tool-plan .md-table th {
     background: var(--page); font-weight: 600; }
   .tr-msg .md-table tbody tr:nth-child(even) td,
-  .thought-body .md-table tbody tr:nth-child(even) td { background: var(--page); }
+  .thought-body .md-table tbody tr:nth-child(even) td,
+  .compact-body .md-table tbody tr:nth-child(even) td,
+  .away-body .md-table tbody tr:nth-child(even) td,
+  .tool-plan .md-table tbody tr:nth-child(even) td { background: var(--page); }
   /* Fenced code blocks (chat.js renderProse()). The surrounding bubble is
      pre-wrap (and the thinking trace italic), so the block re-asserts pre +
      upright mono and scrolls itself horizontally rather than wrapping code or
@@ -496,17 +503,20 @@
      itself (width:0 / contain:inline-size) — that drops the block out of the
      bubble's width entirely, so it scrolls on a wide screen where it'd fit. */
   .tr-msg:has(.md-code), .thought:has(.md-code) { width: min(760px, 100%); }
-  .tr-msg .md-code, .thought-body .md-code, .compact-body .md-code {
+  .tr-msg .md-code, .thought-body .md-code, .compact-body .md-code, .away-body .md-code,
+  .tool-plan .md-code {
     margin: 6px 0; padding: 8px 10px; background: var(--page);
     border: 1px solid var(--border); border-radius: var(--radius-sm);
     max-width: 100%; overflow-x: auto; white-space: pre; overflow-wrap: normal;
     font-style: normal; font-size: 11.5px; line-height: 1.45; color: var(--ink); }
-  .tr-msg .md-code code, .thought-body .md-code code, .compact-body .md-code code {
+  .tr-msg .md-code code, .thought-body .md-code code, .compact-body .md-code code,
+  .away-body .md-code code, .tool-plan .md-code code {
     font-family: var(--font-mono); }
   /* Language tag, when the fence carried one (```hcl). Outside the <code>, so it
      stays out of a copied selection. */
   .tr-msg .md-code[data-lang]::before, .thought-body .md-code[data-lang]::before,
-  .compact-body .md-code[data-lang]::before {
+  .compact-body .md-code[data-lang]::before, .away-body .md-code[data-lang]::before,
+  .tool-plan .md-code[data-lang]::before {
     content: attr(data-lang); display: block; margin-bottom: 5px;
     font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase;
     letter-spacing: 0.05em; color: var(--muted); }
@@ -534,6 +544,7 @@
      thinking trace is italic. `anywhere` because an inline span is the one code
      surface that can't scroll — a long `path/to/thing` has to break somewhere. */
   .tr-msg .md-code-inline, .thought-body .md-code-inline, .compact-body .md-code-inline,
+  .away-body .md-code-inline, .tool-plan .md-code-inline,
   .md-table .md-code-inline {
     font-family: var(--font-mono); font-size: 0.88em; font-style: normal;
     background: var(--page); border: 1px solid var(--border); border-radius: 4px;
@@ -542,10 +553,14 @@
      so they sit on their own line; capped so a large asset doesn't blow out the
      bubble (which stays shrink-to-fit — an image scales down within it). A light
      backdrop keeps a transparent or dark-stroked SVG legible on either theme. */
-  .tr-msg .md-img, .thought-body .md-img, .compact-body .md-img, .tool-file .md-img {
+  .tr-msg .md-img, .thought-body .md-img, .compact-body .md-img, .away-body .md-img,
+  .tool-plan .md-img,
+  .tool-file .md-img {
     display: block; max-width: 100%; max-height: 420px; height: auto; margin: 6px 0;
     border: 1px solid var(--border); border-radius: var(--radius-sm); }
-  .tr-msg .md-svg, .thought-body .md-svg, .compact-body .md-svg, .tool-file .md-svg {
+  .tr-msg .md-svg, .thought-body .md-svg, .compact-body .md-svg, .away-body .md-svg,
+  .tool-plan .md-svg,
+  .tool-file .md-svg {
     width: auto; background: #fff; padding: 6px; }
   /* SendUserFile inline previews inside a tool card (chat.js renderToolFiles,
      XERK-221): a stacked list of image/SVG/HTML previews + name chips. The HTML
@@ -558,9 +573,47 @@
   .tool-file .md-embed { width: 100%; height: 440px; border: 1px solid var(--border);
     border-radius: var(--radius-sm); background: #fff; }
   .tool-caption { font-size: 12px; color: var(--ink); margin-top: 4px; }
-  /* Auto-linkified URLs in chat bubbles + thinking traces (chat.js linkify()). */
-  .tr-msg a, .thought-body a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
-  .tr-msg a:hover, .thought-body a:hover { text-decoration: none; }
+  /* Auto-linkified URLs, in EVERY prose surface (chat.js linkify()). Left off a
+     surface, a link falls back to the UA's default blue/purple, which is
+     unreadable on the dark theme — so this list, and the markdown lists above,
+     stay the same complete set. */
+  .tr-msg a, .thought-body a, .compact-body a, .away-body a, .tool-plan a {
+    color: var(--accent); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
+  .tr-msg a:hover, .thought-body a:hover, .compact-body a:hover, .away-body a:hover,
+  .tool-plan a:hover { text-decoration: none; }
+
+  /* Block markdown (chat.js renderBlocks()): ATX headings, bullet/ordered
+     lists, blockquotes and horizontal rules. Every container here is
+     `white-space: pre-wrap`, so a list item resets to normal wrapping (the same
+     reset .md-table does above); the margins are deliberately tight, since
+     default heading spacing looks enormous inside a chat bubble. */
+  .tr-msg .md-h, .thought-body .md-h, .compact-body .md-h, .away-body .md-h, .tool-plan .md-h {
+    margin: 8px 0 3px; font-weight: 650; line-height: 1.3; color: var(--ink); }
+  /* Per-level sizing keys on the class alone: .md-h is emitted ONLY by chat.js's
+     prose renderer, so there is no other heading for it to reach. */
+  h1.md-h { font-size: 1.22em; }
+  h2.md-h { font-size: 1.14em; }
+  h3.md-h { font-size: 1.07em; }
+  h4.md-h, h5.md-h, h6.md-h { font-size: 1em; }
+  h5.md-h, h6.md-h { color: var(--ink-2); }
+  .tr-msg .md-hr, .thought-body .md-hr, .compact-body .md-hr, .away-body .md-hr,
+  .tool-plan .md-hr {
+    margin: 8px 0; border: 0; border-top: 1px solid var(--border); }
+  .tr-msg .md-list, .thought-body .md-list, .compact-body .md-list, .away-body .md-list,
+  .tool-plan .md-list { margin: 4px 0; padding-left: 20px; }
+  .tr-msg .md-list li, .thought-body .md-list li, .compact-body .md-list li,
+  .away-body .md-list li, .tool-plan .md-list li {
+    white-space: normal; margin: 1px 0; }
+  .tr-msg .md-list .md-list, .thought-body .md-list .md-list, .compact-body .md-list .md-list,
+  .away-body .md-list .md-list, .tool-plan .md-list .md-list { margin: 1px 0; }
+  .tr-msg .md-quote, .thought-body .md-quote, .compact-body .md-quote, .away-body .md-quote,
+  .tool-plan .md-quote {
+    margin: 6px 0; padding: 1px 0 1px 10px; border-left: 2px solid var(--border); color: var(--ink-2); }
+  /* Emphasis (chat.js renderEmph()). The thinking trace is already italic, so
+     *italic* inside it flips back upright to stay visible. */
+  .md-strong { font-weight: 650; }
+  .md-strike { opacity: 0.72; }
+  .thought-body .md-em { font-style: normal; font-weight: 500; }
   .tr-msg.hit { box-shadow: 0 0 0 2px var(--accent); }
   .tr-msg.flash { animation: hitFlash 1.6s ease-out 1; }
   @keyframes hitFlash {
@@ -748,8 +801,11 @@
     padding: 5px 0; border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border); }
   .compact-card > summary::-webkit-details-marker { display: none; }
   .compact-card > summary:hover { color: var(--accent); }
+  /* pre-wrap like every other prose surface (.tr-msg, .thought-body, .tool-plan):
+     the summary is a long structured markdown document, and without it every
+     line break collapsed into one wall of text. */
   .compact-card .compact-body { margin-top: 6px; padding: 9px 12px; border-left: 2px solid var(--border);
-    color: var(--ink-2); overflow-wrap: anywhere; }
+    color: var(--ink-2); overflow-wrap: anywhere; white-space: pre-wrap; }
 
   /* The model's "while you were away" recap — same collapsed, assistant-side
      shape as the compaction summary (it's the model's writing about the
@@ -759,8 +815,9 @@
     padding: 5px 0; border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border); }
   .away-card > summary::-webkit-details-marker { display: none; }
   .away-card > summary:hover { color: var(--accent); }
+  /* pre-wrap for the same reason as .compact-body above. */
   .away-card .away-body { margin-top: 6px; padding: 9px 12px; border-left: 2px solid var(--border);
-    color: var(--ink-2); overflow-wrap: anywhere; }
+    color: var(--ink-2); overflow-wrap: anywhere; white-space: pre-wrap; }
 
   /* "[Request interrupted by user]" — a statement about the turn, not the
      operator talking: a centred, muted marker rather than a user bubble. */

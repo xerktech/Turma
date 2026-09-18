@@ -15,13 +15,22 @@ class ProseTest {
     private fun tables(text: String) = parseProse(text).filterIsInstance<ProseBlock.Table>()
     private fun codes(text: String) = parseProse(text).filterIsInstance<ProseBlock.Code>()
 
+    private fun headings(text: String) = parseProse(text).filterIsInstance<ProseBlock.Heading>()
+    private fun lists(text: String) = parseProse(text).filterIsInstance<ProseBlock.ListBlock>()
+
     /** Flatten a paragraph/cell's spans to the plain text a reader sees. */
-    private fun plain(spans: List<Span>) = spans.joinToString("") {
+    private fun plain(spans: List<Span>): String = spans.joinToString("") {
         when (it) {
             is Span.Text -> it.text
             is Span.Code -> it.text
             is Span.Link -> it.label
+            is Span.Styled -> plain(it.spans)
         }
+    }
+
+    /** Every [Span.Styled] anywhere in the tree, flattened depth-first. */
+    private fun styled(spans: List<Span>): List<Span.Styled> = spans.flatMap {
+        if (it is Span.Styled) listOf(it) + styled(it.spans) else emptyList()
     }
 
     // ---- linkify -------------------------------------------------------------
@@ -183,6 +192,140 @@ class ProseTest {
         assertTrue(codes(md).isEmpty())
         val spans = paras(md).single().spans
         assertTrue(spans.any { it is Span.Code && it.text == "npm ci" })
+    }
+
+    // ---- emphasis (chat.js renderEmph) --------------------------------------
+    @Test fun `bold italic both and strike parse`() {
+        val b = styled(parseInlineOnly("a **b** c")).single()
+        assertTrue(b.bold && !b.italic && !b.strike)
+        assertEquals("b", plain(b.spans))
+        val i = styled(parseInlineOnly("a *b* c")).single()
+        assertTrue(!i.bold && i.italic)
+        val s = styled(parseInlineOnly("a ~~b~~ c")).single()
+        assertTrue(s.strike)
+        val both = styled(parseInlineOnly("***b***")).first()
+        assertTrue(both.bold && both.italic)
+    }
+
+    @Test fun `emphasis nests, and its content is re-parsed raw`() {
+        val outer = styled(parseInlineOnly("*a **b** c*")).first()
+        assertTrue(outer.italic)
+        assertEquals("a b c", plain(outer.spans))
+        assertTrue(styled(outer.spans).single().bold)
+    }
+
+    @Test fun `emphasis never applies inside a code span`() {
+        val spans = parseInlineOnly("`**not bold**` but **this is**")
+        assertTrue(spans.any { it is Span.Code && it.text == "**not bold**" })
+        assertEquals(1, styled(spans).size)
+        assertEquals("this is", plain(styled(spans).single().spans))
+    }
+
+    @Test fun `an emphasis span never crosses a line break`() {
+        assertEquals("*open\nclose*", plain(paras("*open\nclose*").single().spans))
+        assertTrue(styled(paras("*open\nclose*").single().spans).isEmpty())
+    }
+
+    @Test fun `flanking rules keep arithmetic, spaced stars and globs literal`() {
+        for (t in listOf("a * b", "2 * 3 = 6", "run *.js and *.ts", "** spaced **")) {
+            val spans = paras(t).single().spans
+            assertTrue("should stay literal: $t", styled(spans).isEmpty())
+            assertEquals(t, plain(spans))
+        }
+    }
+
+    @Test fun `underscores are not emphasis so snake_case stays put`() {
+        for (t in listOf("snake_case", "__init__", "the file_path arg", "a __b__ c")) {
+            val spans = paras(t).single().spans
+            assertTrue("underscore text must be untouched: $t", styled(spans).isEmpty())
+            assertEquals(t, plain(spans))
+        }
+    }
+
+    @Test fun `a bolded bare url still links, with the markers outside it`() {
+        val outer = styled(parseInlineOnly("PR: **https://github.com/o/r/pull/131**")).single()
+        assertTrue(outer.bold)
+        assertEquals("https://github.com/o/r/pull/131",
+            outer.spans.filterIsInstance<Span.Link>().single().url)
+    }
+
+    // ---- block constructs (chat.js renderBlocks) ----------------------------
+    @Test fun `atx headings parse, with inline code and links inside`() {
+        assertEquals(2, headings("## What I did").single().level)
+        assertEquals("What I did", plain(headings("## What I did").single().spans))
+        assertEquals(6, headings("###### deep").single().level)
+        assertTrue(headings("## Fix `XERK-859`").single().spans.any { it is Span.Code && it.text == "XERK-859" })
+        assertEquals("https://example.com/p/1",
+            headings("## See [the PR](https://example.com/p/1)").single().spans
+                .filterIsInstance<Span.Link>().single().url)
+        // A closing run of #s is syntax, not content.
+        assertEquals("Title", plain(headings("### Title ###").single().spans))
+        // No space after the hashes, and seven hashes, are both not headings.
+        assertTrue(headings("#hashtag stays").isEmpty())
+        assertTrue(headings("####### nope").isEmpty())
+    }
+
+    @Test fun `a heading drops the blank lines around it`() {
+        val blocks = parseProse("intro\n\n## Head\n\nbody")
+        assertEquals(3, blocks.size)
+        assertEquals("intro", plain((blocks[0] as ProseBlock.Paragraph).spans))
+        assertEquals("Head", plain((blocks[1] as ProseBlock.Heading).spans))
+        assertEquals("body", plain((blocks[2] as ProseBlock.Paragraph).spans))
+    }
+
+    @Test fun `bullets and ordered lists parse, and nest`() {
+        assertEquals(listOf("•", "•"), lists("- one\n- two").single().items.map { it.marker })
+        assertEquals(listOf("one", "two"), lists("- one\n- two").single().items.map { plain(it.spans) })
+        assertEquals(listOf("•", "•"), lists("* one\n+ two").single().items.map { it.marker })
+        assertEquals(listOf("1.", "2."), lists("1. one\n2. two").single().items.map { it.marker })
+        assertEquals(listOf("3.", "4."), lists("3. three\n4. four").single().items.map { it.marker })
+        val nested = lists("- a\n  - b\n- c").single().items
+        assertEquals(listOf(0, 1, 0), nested.map { it.depth })
+        assertEquals("◦", nested[1].marker)
+        // A marker switch at the same depth restarts the numbering.
+        assertEquals(listOf("•", "1."), lists("- a\n1. b").single().items.map { it.marker })
+        // Item content goes through the inline pass, not verbatim.
+        val rich = lists("- **bold** and `code`").single().items.single()
+        assertTrue(styled(rich.spans).single().bold)
+        assertTrue(rich.spans.any { it is Span.Code && it.text == "code" })
+    }
+
+    @Test fun `a dash that is not a bullet stays prose`() {
+        for (t in listOf("-no space", "a - b")) {
+            assertTrue(lists(t).isEmpty())
+            assertEquals(t, plain(paras(t).single().spans))
+        }
+    }
+
+    @Test fun `blockquotes and horizontal rules parse`() {
+        val q = parseProse("> quoted").filterIsInstance<ProseBlock.Quote>().single()
+        assertEquals("quoted", plain((q.blocks.single() as ProseBlock.Paragraph).spans))
+        // A quote is block-parsed in turn, so a list inside one is a list.
+        val ql = parseProse("> - a\n> - b").filterIsInstance<ProseBlock.Quote>().single()
+        assertEquals(2, (ql.blocks.single() as ProseBlock.ListBlock).items.size)
+        for (r in listOf("---", "***", "___", "- - -")) {
+            assertEquals("should be a rule: $r", listOf(ProseBlock.Rule), parseProse(r))
+        }
+    }
+
+    @Test fun `a table delimiter row is a table and a bare dash run is a rule`() {
+        val tbl = parseProse("| a | b |\n|---|---|\n| 1 | 2 |")
+        assertEquals(1, tbl.filterIsInstance<ProseBlock.Table>().size)
+        assertTrue(tbl.none { it is ProseBlock.Rule })
+        assertTrue(parseProse("cost is 3 | 4").none { it is ProseBlock.Rule || it is ProseBlock.Table })
+        assertEquals(
+            listOf("above", "RULE", "below"),
+            parseProse("above\n\n---\n\nbelow").map {
+                if (it is ProseBlock.Paragraph) plain(it.spans) else "RULE"
+            },
+        )
+    }
+
+    @Test fun `construct-free prose still parses to one plain paragraph`() {
+        for (t in listOf("plain prose with no markers at all", "1999 was a year")) {
+            assertEquals(t, plain(paras(t).single().spans))
+            assertEquals(1, parseProse(t).size)
+        }
     }
 
     // Expose parseInline for the linkify/inline-code cases (it's file-private).

@@ -82,10 +82,39 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
     mid-turn, so every frame is classified by `applyTurn` before reaching the bubble: an
     empty/tool-use frame CLEARS it, the same prose block keeps the LONGER text (a shorter re-capture is
     a mid-frame redraw), a different one replaces wholesale. Tests: `chat-selection.test.js`.
-- Bubble prose via `renderProse`: fenced ` ``` ` → `<pre class="md-code">` (language chip); inline
-  ` `code` ` → `<code class="md-code-inline">`; GFM tables → real `<table>`s; else linkified.
-  - Passes nest outward-in (fence, table, inline, link) so code is never linkified; an inline span
-    never crosses a line break; an unterminated fence renders as code.
+- Bubble prose via `renderProse`: fenced ` ``` ` → `<pre class="md-code">` (language chip); GFM
+  tables → real `<table>`s; ATX headings / `-`,`*`,`+` + `1.` lists / `>` quotes / `---` rules →
+  real elements (`renderBlocks`); `**bold**`/`*italic*`/`~~strike~~` (`renderEmph`); inline
+  ` `code` ` → `<code class="md-code-inline">`; else linkified.
+  - Passes nest outward-in — fence, raw SVG, table, **block**, inline code, **emphasis**, link — so
+    code is never linkified or emphasised; an inline code span and an emphasis span each never cross
+    a line break; an unterminated fence renders as code.
+  - **`esc()` is called ONLY at the innermost layer** (`linkify`, `codeSpan`). Every pass above
+    slices RAW text, hands slices down, and concatenates only literal tag strings it wrote itself.
+    **Never regex over generated HTML** — it holds `href="…/a_b_c"` and `&quot;`, so a naive rule
+    matches inside an attribute. A new pass obeys this or it is an injection hole.
+  - **A plain paragraph emits NOTHING of its own** — no `<p>`. The containers are
+    `white-space: pre-wrap`, so paragraphs already break correctly and a `<p>` would double every
+    blank line; construct-free text stays byte-identical to `renderInline`. For the same reason a
+    construct CONSUMES the newlines around it, or a stray `\n` prints on top of its margin.
+  - `_`/`__` are deliberately NOT emphasis delimiters: this corpus is `snake_case`, `__init__` and
+    `file_path` throughout, and nothing Claude writes needs them. Don't add them back.
+  - Tables run BEFORE the block pass, so a `|---|---|` delimiter row is never read as a rule while a
+    bare `---` (no pipe) correctly is.
+  - **The live bubble uses `renderInline`, never `renderProse`** — `parsePaneLiveTurn` reflows the
+    pane's hard-wrapped lines into ONE line, so a block pass has no line structure to read.
+  - Every prose surface is styled as the same complete set — `.tr-msg`, `.thought-body`,
+    `.compact-body`, `.away-body`, `.tool-plan` — for `a`, `.md-code`, `.md-code-inline`, `.md-img`,
+    `.md-table` and the block classes. Left off one, a link falls back to the UA's blue/purple,
+    unreadable on dark. `.compact-body`/`.away-body` must keep `white-space: pre-wrap` like their
+    siblings, or a whole structured recap collapses into one wall of text.
+- **A block-less entry's trailing `[Bash]` markers are split back into name-only tool_use blocks**
+  (`degradedBlocks`). `_entry_text` appends one bare marker per tool_use, in content order with no
+  separator, so a degraded row ends in a RUN of them. Left as prose they read as something the model
+  SAID and — being a text block — `Concise` could not hide them, making the degraded render more
+  intrusive than the rich one. Matching is narrow on purpose (synthesized path only, assistant only,
+  a plausible tool name, a run at the very END, never preceded by a space) so prose like
+  "the plan [WIP]" or "see [1]" is untouched. Tests: the block-less cases in `chat.test.js`.
   - **Images/SVGs render inline (XERK-221)**: `![alt](url)` → `<img>`; a raw `<svg>`/all-SVG fence →
     a sandboxed `data:image/svg+xml` `<img>` — **never DOM-injected**, so an embedded `<script>` can't
     run. SendUserFile deliveries render the same way (images inline, HTML in a sandboxed iframe).

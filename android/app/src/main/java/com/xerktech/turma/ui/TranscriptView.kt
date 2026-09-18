@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -195,11 +196,72 @@ private fun ProseBlocks(
             )
             is ProseBlock.Code -> ProseCode(block, fontSize, color)
             is ProseBlock.Table -> ProseTable(block, fontSize, color)
+            // ATX heading. Scaled off the bubble's own size (a fixed sp would be
+            // enormous in a thinking trace and tiny in a plan card) and kept
+            // tight, like the web's ~8px/3px margins.
+            is ProseBlock.Heading -> Text(
+                spansToAnnotated(block.spans, codeBg = color.copy(alpha = 0.10f), linkColor = MaterialTheme.colorScheme.primary, codeSize = fontSize * 0.88f),
+                modifier = Modifier.padding(top = 4.dp),
+                fontSize = fontSize * headingScale(block.level),
+                lineHeight = lineHeight * headingScale(block.level),
+                color = color,
+                fontWeight = FontWeight.SemiBold,
+            )
+            is ProseBlock.Rule -> Box(
+                Modifier.fillMaxWidth().padding(vertical = 3.dp).height(1.dp).background(color.copy(alpha = 0.25f))
+            )
+            // A blockquote: the web's 2px left rule, with the quoted content
+            // block-parsed in turn (so a list inside a quote is still a list).
+            is ProseBlock.Quote -> Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
+                Box(Modifier.fillMaxHeight().width(2.dp).background(color.copy(alpha = 0.30f)))
+                ProseBlocks(
+                    blocks = block.blocks,
+                    modifier = Modifier.padding(start = 8.dp),
+                    fontSize = fontSize,
+                    lineHeight = lineHeight,
+                    color = color.copy(alpha = 0.85f),
+                    italic = italic,
+                )
+            }
+            // A bullet / ordered list. core.parseProse already resolved the
+            // marker and the nesting depth (Compose has no list primitive), so
+            // each row is just an indent, a marker column and its content.
+            is ProseBlock.ListBlock -> Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                for (row in block.items) {
+                    Row(Modifier.padding(start = (row.depth * 14).dp)) {
+                        Text(
+                            row.marker,
+                            modifier = Modifier.widthIn(min = 16.dp),
+                            fontSize = fontSize,
+                            lineHeight = lineHeight,
+                            color = color.copy(alpha = 0.72f),
+                        )
+                        Text(
+                            spansToAnnotated(row.spans, codeBg = color.copy(alpha = 0.10f), linkColor = MaterialTheme.colorScheme.primary, codeSize = fontSize * 0.88f),
+                            fontSize = fontSize,
+                            lineHeight = lineHeight,
+                            color = color,
+                            fontStyle = if (italic) FontStyle.Italic else FontStyle.Normal,
+                        )
+                    }
+                }
+            }
         }
     }
 }
 
-/** Inline spans → an AnnotatedString: code chips (mono, tinted) and tappable links. */
+/** Heading level → a multiplier on the surrounding text size (web: 1.22em … 1em). */
+private fun headingScale(level: Int): Float = when (level) {
+    1 -> 1.22f
+    2 -> 1.14f
+    3 -> 1.07f
+    else -> 1.0f
+}
+
+/**
+ * Inline spans → an AnnotatedString: code chips (mono, tinted), tappable links,
+ * and emphasis (which nests, so it recurses on its own inner spans).
+ */
 private fun spansToAnnotated(spans: List<Span>, codeBg: Color, linkColor: Color, codeSize: TextUnit): AnnotatedString =
     buildAnnotatedString {
         for (span in spans) when (span) {
@@ -211,6 +273,13 @@ private fun spansToAnnotated(spans: List<Span>, codeBg: Color, linkColor: Color,
             is Span.Link -> withLink(
                 LinkAnnotation.Url(span.url, TextLinkStyles(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline)))
             ) { append(span.label) }
+            is Span.Styled -> withStyle(
+                SpanStyle(
+                    fontWeight = if (span.bold) FontWeight.SemiBold else null,
+                    fontStyle = if (span.italic) FontStyle.Italic else null,
+                    textDecoration = if (span.strike) TextDecoration.LineThrough else null,
+                )
+            ) { append(spansToAnnotated(span.spans, codeBg, linkColor, codeSize)) }
         }
     }
 
