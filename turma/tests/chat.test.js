@@ -9,7 +9,9 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, foldHistory, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending, isQwenSession, qwenRuntimeChipHtml, qwenModelChipHtml } = require("../public/chat.js");
+const { mergeTail, foldHistory, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending, isQwenSession, qwenRuntimeChipHtml, qwenModelChipHtml, reseedFromFleet } = require("../public/chat.js");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -279,49 +281,105 @@ test("buildItems: non-completed task_notification flags its result as an error",
   assert.equal(items[0].result.text, "status: failed");
 });
 
-test("onPoll re-seeds: a held-open view upgrades a stale preview entry", () => {
-  // The web read `session.tail` ONCE, in open(), and the fleet payload is polled
-  // once at load while SSE is healthy — so a view left open kept whatever the
-  // preview said at open, forever. Anything that later improved the preview (a
-  // fixed agent, a host returning, blocks that had not been built yet) never
-  // reached the buffer, and only closing and reopening the session cured it.
-  // Android re-merges the seed on every poll, which is why the two clients
-  // disagreed about the SAME conversation: the phone healed in a beat, the
-  // browser never did.
-  const flat = [{ id: "a1", role: "assistant", text: "checking[Bash]", blocks: [] }];
-  const rich = [{ id: "a1", role: "assistant", text: "checking[Bash]", blocks: [
-    { t: "text", text: "checking" },
-    { t: "tool_use", id: "t1", name: "Bash", input: "git log" }] }];
+test("reseedFromFleet: reads the NESTED session.tail, never a top-level s.tail", () => {
+  // The whole point of the re-seed, and the one thing that shipped wrong: the
+  // wire nests the preview under `session` (_session_payload emits
+  // "session": signals; session_report puts `tail` inside signals). open() and
+  // Android both read the nested path. A top-level read is undefined on every
+  // real record, so the feature silently does nothing -- and the suite could
+  // not tell, because nothing called it.
+  const flat = [{ id: "a1", role: "assistant", text: "checking" }];
+  const rich = [{ id: "a1", role: "assistant", text: "checking",
+    blocks: [{ t: "tool_use", name: "Bash", input: "git log" }] }];
 
-  // What open() would have left in the buffer, pre-fix. The flat text still
-  // produces a card — degradedBlocks reconstructs one from the trailing "[Bash]"
-  // marker — but a NAME-ONLY one, with no command and no output. That empty
-  // title row IS the "lines" the operator reported: it looks expandable and has
-  // nothing inside, so `verbose` reveals exactly what `normal` did.
-  let buffer = mergeTail([], flat);
-  let act = buildItems(buffer).find((i) => i.kind === "action");
-  assert.ok(act, "the marker still reconstructs a card");
-  assert.ok(act.degraded, "...but a degraded, name-only one");
-  assert.equal(act.input, "", "no command to show");
-  assert.equal(act.result, null, "and no output to expand");
+  const buf = mergeTail([], flat);
 
-  // A later beat carries the improved preview: re-merging must upgrade it.
-  buffer = mergeTail(buffer, rich);
-  act = buildItems(buffer).find((i) => i.kind === "action");
+  // The WRONG shape must be inert -- this is what pins the field path.
+  const wrong = reseedFromFleet(buf, { tail: rich });
+  assert.equal(wrong.changed, false, "a top-level s.tail is not the wire shape");
+  assert.equal(wrong.buffer, buf, "and must not touch the buffer");
+
+  // The REAL shape upgrades.
+  const right = reseedFromFleet(buf, { session: { tail: rich } });
+  assert.equal(right.changed, true, "the nested session.tail is what re-seeds");
+  const act = buildItems(right.buffer).find((i) => i.kind === "action");
+  assert.ok(act && !act.degraded, "a real tool card, not the degraded marker one");
+  assert.equal(act.input, "git log");
+});
+
+test("reseedFromFleet: an unchanged preview repaints nothing", () => {
+  // mergeTail always returns a FRESH array and its `weight(inc) >= weight(cur)`
+  // tie-break swaps in the incoming object even when identical, so a reference
+  // compare would report a change every beat and repaint an idle transcript
+  // once a second -- throwing scroll position and any live text selection.
+  const seed = [{ id: "a1", role: "assistant", text: "hi",
+    blocks: [{ t: "tool_use", name: "Bash", input: "ls" }] }];
+  const first = reseedFromFleet([], { session: { tail: seed } });
+  assert.equal(first.changed, true, "the first merge is a change");
+  for (let i = 0; i < 3; i++) {
+    const again = reseedFromFleet(first.buffer, { session: { tail: seed } });
+    assert.equal(again.changed, false, "a steady session must not repaint");
+  }
+});
+
+test("reseedFromFleet: a block-less preview's degraded card upgrades to the real one", () => {
+  // A block-less entry is not card-LESS: degradedBlocks reconstructs a
+  // name-only card from the trailing "[Bash]" marker _entry_text appends. That
+  // empty title row looks expandable and holds nothing, so Verbose reveals
+  // exactly what Normal did -- the "lines" an operator reported. The re-seed
+  // replacing it with the real command+output is the user-visible fix.
+  const flat = [{ id: "a1", role: "assistant", text: "checking[Bash]" }];
+  const buf = mergeTail([], flat);
+  let act = buildItems(buf).find((i) => i.kind === "action");
+  assert.ok(act && act.degraded, "the marker reconstructs a DEGRADED card");
+  assert.equal(act.input, "", "with no command");
+  assert.equal(act.result, null, "and no output");
+
+  const rich = [{ id: "a1", role: "assistant", text: "checking", blocks: [
+    { t: "tool_use", id: "t1", name: "Bash", input: "git log" },
+    { t: "tool_result", forId: "t1", text: "abc123 first commit" },
+  ] }];
+  const out = reseedFromFleet(buf, { session: { tail: rich } });
+  act = buildItems(out.buffer).find((i) => i.kind === "action");
   assert.ok(!act.degraded, "re-seeding replaces it with the real card");
-  assert.equal(act.input, "git log", "which carries the actual command");
+  assert.equal(act.input, "git log");
+  assert.match(act.result.text, /abc123/, "and its real output");
+});
 
-  // Re-merging is GROW-ONLY, so it can never undo the live tail or /history.
-  buffer = mergeTail(buffer, flat);
-  assert.ok(buildItems(buffer).some((i) => i.kind === "action"),
-    "a later flat preview must not downgrade a rich entry");
+test("weight: a TodoWrite preview never ties (and so never clobbers) its rich copy", () => {
+  // `todos` is a _tool_use_detail field, which is exactly what the heartbeat's
+  // preview=True skips -- and it was the ONLY such field missing from weight().
+  // So a preview block tied its own live copy EXACTLY and the `>=` tie-break
+  // swapped a rendered checklist out for a raw-JSON card. Weight-neutral, so
+  // the repaint gate skipped it and the screen only caught up at the next
+  // unrelated repaint, which is what made it so hard to see.
+  const todos = [
+    { content: "stand up the hub", status: "completed" },
+    { content: "drive the chat view", status: "in_progress", activeForm: "driving the chat view" },
+  ];
+  const live = { id: "a1", role: "assistant", text: "",
+    blocks: [{ t: "tool_use", id: "t1", name: "TodoWrite", input: "", todos }] };
+  const preview = { id: "a1", role: "assistant", text: "",
+    blocks: [{ t: "tool_use", id: "t1", name: "TodoWrite", input: "" }] };
 
-  // And an unchanged preview must not look like a change — otherwise every beat
-  // repaints the whole transcript on a session that is doing nothing.
-  const sig = (b) => b.length + ":" + b.reduce((n, e) => n + weight(e), 0);
-  const steady = mergeTail(buffer, flat);
-  assert.equal(sig(steady), sig(buffer),
-    "an unchanged preview re-merges to an identical buffer (no repaint)");
+  assert.ok(weight(live) > weight(preview),
+    "the checklist must outweigh the preview that omits it");
+  const kept = reseedFromFleet([live], { session: { tail: [preview] } });
+  assert.deepEqual(kept.buffer[0].blocks[0].todos, todos,
+    "a re-seed must not strip the checklist");
+  assert.equal(kept.changed, false, "and must not repaint over it");
+});
+
+test("onPoll actually calls reseedFromFleet", () => {
+  // onPoll paints, so it cannot be invoked under node -- which is precisely how
+  // a re-seed reading the wrong field passed a green suite. Deleting the call
+  // would otherwise be invisible to every test above, so the call site is
+  // asserted from source (the technique agent/win pins applyKeepAlive with).
+  const src = fs.readFileSync(path.join(__dirname, "..", "public", "chat.js"), "utf8");
+  const body = src.slice(src.indexOf("function onPoll(s, a) {"));
+  const end = body.indexOf("\n  }\n");
+  assert.match(body.slice(0, end), /reseedFromFleet\(buffer, s\)/,
+    "onPoll must re-seed, or a held-open view freezes at whatever open() saw");
 });
 
 test("XERK-860: hidden thinking announces itself but does NOT carry the trace", () => {

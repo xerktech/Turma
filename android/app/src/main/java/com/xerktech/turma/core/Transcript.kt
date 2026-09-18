@@ -39,7 +39,14 @@ private fun blockText(b: Block): String = when (b) {
     is TextBlock -> b.text
     is ThinkingBlock -> b.text
     is ToolResultBlock -> b.text
-    is ToolUseBlock -> b.name + (b.input?.toString() ?: "")
+    // files/caption count for the same reason chat.js `weight` counts them: a
+    // heartbeat PREVIEW block omits every _tool_use_detail field, so without
+    // them a preview copy TIES the rich one carrying inline SendUserFile
+    // previews and the `>=` tie-break swaps them off the card. Android
+    // re-merges the seed on EVERY poll, so this tie is reachable here on every
+    // beat -- it does not need a held-open view the way the web one does.
+    is ToolUseBlock -> b.name + (b.input?.toString() ?: "") + b.caption +
+        b.files.joinToString("") { it.src + it.html + it.name }
     is TaskNotificationBlock -> b.summary + b.status + b.result
     else -> ""
 }

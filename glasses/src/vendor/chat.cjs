@@ -1122,9 +1122,59 @@
         // Embedded SendUserFile previews (XERK-221): count them so an image-bearing
         // copy outweighs a degraded reload (file since deleted → a name-only chip).
         (Array.isArray(b.files) ? b.files.reduce((s, f) =>
-          s + (f ? (f.src || "").length + (f.html || "").length + (f.name || "").length : 0), 0) : 0);
+          s + (f ? (f.src || "").length + (f.html || "").length + (f.name || "").length : 0), 0) : 0) +
+        // TodoWrite/todo_write checklists, for the SAME reason as `files`. This
+        // one is load-bearing now that the heartbeat preview is re-merged on
+        // every poll: `todos` is a _tool_use_detail field, which is precisely
+        // what preview=True skips, and it was the ONLY such field missing here
+        // -- so a preview block tied its own live copy EXACTLY (319 == 319) and
+        // the `>=` tie-break swapped the checklist out for a raw-JSON card.
+        // Weight-neutral, so the repaint gate skipped it and the screen only
+        // caught up at the next unrelated repaint.
+        (Array.isArray(b.todos) ? b.todos.reduce((s, t) =>
+          s + (t ? (t.content || "").length + (t.activeForm || "").length : 0), 0) : 0);
     }
     return w;
+  }
+  // Re-merge the heartbeat's cached preview into the live buffer.
+  //
+  // open() merged `session.tail` once and nothing ever read it again, while the
+  // fleet payload is polled ONCE at load whenever SSE is healthy -- so a view
+  // held open kept whatever the preview said at open, for as long as it stayed
+  // open. Anything that later IMPROVED the preview never reached the buffer and
+  // the only cure was closing and reopening the session. Android re-merges the
+  // seed on every poll (ChatViewModel), which is why the two clients disagreed
+  // about the same conversation: the phone healed within a beat, the browser
+  // not at all.
+  //
+  // Safe to repeat: mergeTail is GROW-ONLY and keyed by entry id, so a re-merge
+  // can only add an entry or replace one with a richer copy of itself. It can
+  // never downgrade what the live tail or /history delivered -- the rule that
+  // lets the seed and the live feed share one buffer in the first place.
+  //
+  // Returns the new buffer and whether anything actually ADDED or ENRICHED. A
+  // reference compare will not do: mergeTail always returns a fresh array, and
+  // its `weight(inc) >= weight(cur)` tie-break swaps in the incoming object
+  // even when the two are identical -- so every beat would look like a change
+  // and repaint the transcript on a session doing nothing. Count + total weight
+  // is the cheap content signature over a bounded list.
+  function reseedSig(b) {
+    let n = 0;
+    for (const e of b) n += weight(e);
+    return b.length + ":" + n;
+  }
+  function reseedFromFleet(buf, s) {
+    // The tail is NESTED under `session` on the wire, which is why open() reads
+    // s.session.tail and Android reads session?.session?.tail. A top-level
+    // s.tail is undefined on every real record -- and would be an UNCOERCED
+    // agent-controlled field besides (normalizeSessions sanitizes session.tail
+    // and knows nothing about a sibling), so a forged non-iterable `blocks`
+    // would throw out of weight() and blank the whole Sessions page.
+    const seed = s && s.session && s.session.tail;
+    if (!Array.isArray(seed) || !seed.length) return { buffer: buf, changed: false };
+    const before = reseedSig(buf);
+    const next = mergeTail(buf, seed);
+    return { buffer: next, changed: reseedSig(next) !== before };
   }
   function mergeTail(existing, incoming) {
     const byId = new Map();
@@ -3622,38 +3672,14 @@
     if (!s) return;
     sess = s;
     if (a) agent = a;
-    // RE-SEED from the heartbeat preview, not only at open().
-    //
-    // `open()` merged `session.tail` once and nothing ever read it again, while
-    // the fleet payload is polled ONCE at load whenever SSE is healthy — so a
-    // view held open kept whatever the preview said at open, for as long as it
-    // stayed open. Anything that later IMPROVED the preview (a fixed agent, a
-    // host coming back, an entry whose blocks were not built yet) never reached
-    // the buffer, and the only cure was closing and reopening the session.
-    // Android re-merges the seed on every poll, which is why the two clients
-    // disagreed about the same conversation: the phone healed within a beat and
-    // the browser did not heal at all.
-    //
-    // Safe to repeat: mergeTail is GROW-ONLY and keyed by entry id, so a re-merge
-    // can only add entries or replace one with a richer copy of itself. It can
-    // never downgrade what the live tail or /history already delivered — the
-    // rule that lets the seed and the live feed share one buffer in the first
-    // place — and an unchanged preview re-merges to an identical buffer, so a
-    // steady session pays a keyed walk of a bounded list and repaints nothing
-    // (the per-item HTML memo sees the same units).
-    const seed = s.tail;
-    if (Array.isArray(seed) && seed.length) {
-      // Repaint only when the merge actually ADDED or ENRICHED something. A
-      // reference compare will not do: mergeTail always returns a fresh array,
-      // and its `weight(inc) >= weight(cur)` tie-break swaps in the incoming
-      // object even when the two are identical — so every beat would look like a
-      // change and repaint the transcript on a session that is doing nothing.
-      // Count + total weight is the cheap content signature (a bounded list).
-      const sig = (b) => b.length + ":" + b.reduce((n, e) => n + weight(e), 0);
-      const before = sig(buffer);
-      buffer = mergeTail(buffer, seed);
-      if (sig(buffer) !== before) repaint();
-    }
+    // RE-SEED from the heartbeat preview, not only at open() (see
+    // reseedFromFleet). Kept to two lines here so the whole decision is pure
+    // and directly testable -- onPoll itself cannot be called under node (it
+    // paints), which is exactly how a re-seed reading the WRONG field shipped
+    // green once.
+    const re = reseedFromFleet(buffer, s);
+    buffer = re.buffer;
+    if (re.changed) repaint();
     setHeader(s, agent);
     updateQuestion(s);
     renderComposeOpts(true);
@@ -3751,6 +3777,7 @@
       __setQuestionActive: (v) => { questionActive = v; },
       __setPanePromptActive: (v) => { panePromptActive = v; },
       __setVerbosity: (v) => { verbosity = v; },
+      reseedFromFleet,
       __setBuffer: (b) => { buffer = b; },
       __setQueued: (q) => { queuedPrompts = q; },
       __setLiveTurn: (t) => { liveTurn = t; },
