@@ -22,7 +22,7 @@ process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
 process.env.TURMA_TOKEN = "x";
 
-const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn, toolUseDetail, todoItems, fmtDshElapsed, dshStatus } = require("../tunnel-agent.js");
+const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn, toolUseDetail, todoItems, fmtDshElapsed, dshStatus, edgeTrim } = require("../tunnel-agent.js");
 
 const ESC = String.fromCharCode(27); // ANSI escape, kept out of the source as a literal
 
@@ -53,6 +53,32 @@ test("entryText: string content, ANSI-stripped list content, tool_use, drops", (
 
 test("entryBlocks: string content -> one text block", () => {
   assert.deepEqual(entryBlocks({ type: "user", message: { content: "hi" } }, BLOCK_CAPS), [{ t: "text", text: "hi" }]);
+});
+
+test("entryBlocks: unicode-whitespace edges match the py mirror (XERK-864)", () => {
+  // trim() and str.strip() disagree on 6 codepoints — trim() strips U+FEFF
+  // (BOM), strip() strips U+0085 (NEL) and U+001C-U+001F (separators). Both
+  // feeds now edge-trim exactly the ASCII set, so these edge chars are KEPT
+  // identically on both sides; only ASCII whitespace is trimmed. The
+  // test_hub_agent.py twin asserts the byte-identical expected blocks.
+  const cases = [
+    ["  ﻿hello  ", "﻿hello"], // BOM + NEL kept, ASCII spaces stripped
+    ["\tworld", "world"],               // unit separator kept, tab stripped
+    ["foo", "foo"],                       // file separator kept
+  ];
+  for (const [content, want] of cases) {
+    assert.deepEqual(entryBlocks({ type: "user", message: { content } }, BLOCK_CAPS),
+      [{ t: "text", text: want }]);
+  }
+  // A tool_result carrying a leading BOM (the 1-in-80k corpus mismatch: a C#
+  // file read whose BOM Python kept and JS stripped).
+  assert.deepEqual(
+    entryBlocks({ type: "user", message: { content: [
+      { type: "tool_result", tool_use_id: "t1", content: "﻿using System;" }] } }, BLOCK_CAPS),
+    [{ t: "tool_result", text: "﻿using System;", forId: "t1" }]);
+  // edgeTrim itself agrees with the documented divergence set.
+  assert.equal(edgeTrim("﻿x"), "﻿x");
+  assert.equal(edgeTrim("  x  "), "x");
 });
 
 test("entryBlocks: preserves thinking, tool_use input, tool_result output that entryText drops", () => {
