@@ -537,6 +537,32 @@ test("buildItems/render: an Edit diff escapes its lines (stored-XSS)", () => {
   assert.match(html, /&lt;script&gt;alert\(2\)/);
 });
 
+test("buildItems/render: a non-string edit.old/new never throws out of the render (XERK-870)", () => {
+  // The renderer must be TOTAL: a malformed/forged Edit block whose old or new
+  // arrived as a truthy non-string used to reach renderEditDiff via the caller's
+  // `it.edit.old || ""` (which admits a number, {}, [], a populated array) and
+  // `.split` threw a TypeError out of itemsToHtml — killing the WHOLE transcript
+  // render, permanently, since the block sits in the grow-only buffer and every
+  // later frame re-throws on it. The guard is a TYPE check, not a truthiness one.
+  // A guard is correct when the full cross-product of hostile shapes reports zero
+  // throws WITHOUT the hub's coercion (#854) in front of it.
+  const hostile = [5, true, {}, [], { a: 1 }, [null], "ok"];
+  for (const oldV of hostile) for (const newV of hostile) {
+    const entries = [{ id: "bad", role: "assistant", text: "edit", blocks: [{
+      t: "tool_use", id: "t9", name: "Edit", input: "x", edit: { old: oldV, new: newV },
+    }] }];
+    assert.doesNotThrow(() => withVerbosity("normal", () => itemsToHtml(buildItems(entries))),
+      `edit{old:${JSON.stringify(oldV)}, new:${JSON.stringify(newV)}} must not throw`);
+  }
+  // The real diff still renders when both sides are genuine strings.
+  const good = [{ id: "g", role: "assistant", blocks: [{
+    t: "tool_use", id: "tg", name: "Edit", input: "/a.py", edit: { old: "x = 1", new: "x = 2" },
+  }] }];
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems(good)));
+  assert.match(html, /class="dl del">-x = 1</);
+  assert.match(html, /class="dl add">\+x = 2</);
+});
+
 test("buildItems/render: a Write's content and a Bash description show on the card", () => {
   const html = withVerbosity("normal", () => itemsToHtml(buildItems([
     { id: "w1", role: "assistant", blocks: [{ t: "tool_use", id: "t1", name: "Write",

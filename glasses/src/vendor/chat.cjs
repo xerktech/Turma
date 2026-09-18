@@ -1743,9 +1743,18 @@
 
   const DIFF_GLYPH = { ctx: " ", del: "-", add: "+" };
   function renderEditDiff(oldText, newText) {
-    if (!oldText && !newText) return "";
-    const a = oldText ? oldText.split("\n") : [];
-    const b = newText ? newText.split("\n") : [];
+    // Guard on TYPE, not truthiness: the caller's `it.edit.old || ""` admits any
+    // truthy non-string (a number, {}, [], a populated array), and `.split` then
+    // throws a TypeError out of itemsToHtml — killing the WHOLE transcript render,
+    // permanently, since the block sits in the grow-only buffer and every later
+    // frame re-throws on it (XERK-870). The hub coerces edit.old/new to strings
+    // (#854); this is the renderer's own belt behind that. Non-strings collapse
+    // to "" here, so the downstream diff logic below is unchanged for real edits.
+    const oldS = typeof oldText === "string" ? oldText : "";
+    const newS = typeof newText === "string" ? newText : "";
+    if (!oldS && !newS) return "";
+    const a = oldS ? oldS.split("\n") : [];
+    const b = newS ? newS.split("\n") : [];
     // Common head/tail are context by definition and cost nothing to identify.
     let head = 0;
     while (head < a.length && head < b.length && a[head] === b[head]) head++;
