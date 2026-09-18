@@ -14031,6 +14031,103 @@ test("live WS: the hub acks whether it actually armed an agent watch, with a rea
   }
 });
 
+// An agent-authed control frame naming `__proto__` as its session id used to
+// resolve off Object.prototype in `liveFanout` and throw "set is not iterable"
+// straight out of the control-channel listener — which EXITS the hub process,
+// taking every host's terminal, live tail and heartbeat poke with it. The
+// `typeof id === "string"` guard (XERK-278) does not cover it: these ARE
+// strings. Same class as the `controlChannels`/`pendingChannels` trap.
+test("live WS: a control frame naming a prototype key cannot kill the hub", async () => {
+  agents.protohost = {
+    device: "protohost", lastSeen: Date.now(), commands: [], history: {},
+    sessions: [{ id: "s1", worktreePath: "/wt/s1", session: { tail: [] } }],
+  };
+  const token = await issueToken();
+  const ctrl = await wsConnect(`/agent/control?name=protohost&token=agenttok`);
+  const live = await wsConnect(`/live/protohost/s1?auth=${token}`);
+  const frames = collectFrames(live.socket, live.leftover);
+  try {
+    for (const key of ["__proto__", "constructor", "toString", "valueOf"]) {
+      ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+        { tail: key, entries: [] }))));
+      ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+        { turn: key, text: "x" }))));
+      ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+        { watchFailed: key, reason: "x" }))));
+    }
+    // The hub is still serving, and the real session's socket still works.
+    await new Promise((r) => setTimeout(r, 120));
+    ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+      { tail: "s1", entries: [{ id: "e1", role: "user", text: "alive" }] }))));
+    await waitFor(() => frames.filter((f) => f.op === 0x1).some((f) => {
+      try { return JSON.parse(f.payload.toString("utf8")).entries?.[0]?.id === "e1"; }
+      catch { return false; }
+    }));
+    // ...and nothing was re-parented onto Object.prototype.
+    assert.equal({}.host, undefined);
+    assert.equal(({}).s1, undefined);
+  } finally {
+    live.socket.destroy();
+    ctrl.socket.destroy();
+    delete agents.protohost;
+  }
+});
+
+// A host at MAX_WATCHERS refuses deterministically. Re-asking on every beat for
+// the life of the session buys nothing — a control reconnect (the agent forgot
+// its watchers, so its cap really is different) and a transcript MOVE are the
+// two things that can change the answer, and both still re-arm.
+test("live WS: a watch the agent REFUSED is not re-asked on every beat", async () => {
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: "nackhost", sessions: [
+      { id: "s1", status: "running", worktreePath: "/wt/s1", transcriptId: "t1" }] },
+  });
+  const token = await issueToken();
+  const ctrl = await wsConnect(`/agent/control?name=nackhost&token=agenttok`);
+  const agentFrames = collectFrames(ctrl.socket, ctrl.leftover);
+  const live = await wsConnect(`/live/nackhost/s1?auth=${token}`);
+  try {
+    await waitFor(() => agentFrames.some((f) => f.op === 0x1 &&
+      JSON.parse(f.payload.toString("utf8")).watch === "s1"));
+    ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+      { watchFailed: "s1", reason: "at MAX_WATCHERS (16)" }))));
+    await new Promise((r) => setTimeout(r, 80));
+    const afterNack = agentFrames.length;
+
+    // Three more beats describing the same session, unchanged.
+    for (let i = 0; i < 3; i++) {
+      await request("POST", "/api/heartbeat", {
+        headers: agentHeaders,
+        body: { device: "nackhost", sessions: [
+          { id: "s1", status: "running", worktreePath: "/wt/s1", transcriptId: "t1" }] },
+      });
+    }
+    await new Promise((r) => setTimeout(r, 80));
+    const reasked = agentFrames.slice(afterNack).filter((f) => f.op === 0x1 && (() => {
+      try { return JSON.parse(f.payload.toString("utf8")).watch === "s1"; } catch { return false; }
+    })()).length;
+    assert.equal(reasked, 0, "a refused watch is left alone");
+
+    // ...but a transcript MOVE is new information, so it is asked again.
+    await request("POST", "/api/heartbeat", {
+      headers: agentHeaders,
+      body: { device: "nackhost", sessions: [
+        { id: "s1", status: "running", worktreePath: "/wt/s1", transcriptId: "t2" }] },
+    });
+    await waitFor(() => agentFrames.slice(afterNack).some((f) => f.op === 0x1 && (() => {
+      try {
+        const m = JSON.parse(f.payload.toString("utf8"));
+        return m.watch === "s1" && m.transcriptId === "t2";
+      } catch { return false; }
+    })()));
+  } finally {
+    live.socket.destroy();
+    ctrl.socket.destroy();
+    delete agents.nackhost;
+  }
+});
+
 // armLiveWatcher can only arm a session the LAST heartbeat described, and the
 // move-detector below it explicitly skipped any session absent from the previous
 // beat — so a chat opened on a just-spawned session armed nothing and nothing

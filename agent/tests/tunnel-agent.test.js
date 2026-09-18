@@ -2524,3 +2524,52 @@ test("live tail: a refused watch is NACKed to the hub, not just logged here", ()
     mod.__setControlSink(null);
   }
 });
+
+// A delta that never left the host must not be recorded as delivered. This is
+// the difference a delta makes: the snapshot this replaced re-sent the whole
+// window on every change, so a swallowed send self-healed. Here the entry is
+// gone for good — and when a later copy of it IS sent, every id-keyed grow-only
+// consumer appends it at the END, so the transcript reads out of order too.
+test("live tail: a frame that fails to send is re-sent, not silently dropped", async () => {
+  const mod = require("../tunnel-agent.js");
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "lost-wt-"));
+  const tid = "44444444-5555-6666-7777-888888888888";
+  const dir = writeTranscript(work, `${tid}.jsonl`, [
+    { uuid: "x1", type: "user", message: { content: "one" } },
+  ]);
+  const frames = [];
+  // The sink stands in for the socket. Returning false is a send that did NOT
+  // go out (a closed socket, a throwing ws.send) — which sendControl used to
+  // swallow, so the watcher recorded those ids as delivered.
+  let deliver = true;
+  const sink = (o) => {
+    if (o.tail !== "sess-lost") return true;
+    if (!deliver) return false;
+    frames.push(o);
+    return true;
+  };
+  mod.__setControlSink(sink);
+  try {
+    mod.startWatch("sess-lost", work, tid);
+    await waitForCond(() => frames.length >= 1);
+
+    deliver = false;
+    fs.appendFileSync(path.join(dir, `${tid}.jsonl`),
+      JSON.stringify({ uuid: "x2", type: "user", message: { content: "two" } }) + "\n");
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.equal(frames.length, 1, "nothing was delivered while the send failed");
+
+    deliver = true;
+    fs.appendFileSync(path.join(dir, `${tid}.jsonl`),
+      JSON.stringify({ uuid: "x3", type: "user", message: { content: "three" } }) + "\n");
+    await waitForCond(() => frames.length >= 2);
+
+    // Everything the failed frame carried rides the next one, in order.
+    const seen = [];
+    for (const f of frames) for (const e of f.entries) if (!seen.includes(e.id)) seen.push(e.id);
+    assert.deepEqual(seen, ["x1", "x2", "x3"]);
+  } finally {
+    mod.stopWatch("sess-lost");
+    mod.__setControlSink(null);
+  }
+});

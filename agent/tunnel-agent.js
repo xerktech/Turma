@@ -828,11 +828,18 @@ const watchers = new Map(); // sessionId -> { worktreePath, lastTail, sent, time
 // this send) were each individually severable with a green CI until that path
 // was covered end to end.
 let controlSink = null;
+// Returns whether the frame actually went out. The tail is a DELTA now, so a
+// swallowed failure is a LOST entry: the caller only records ids as delivered
+// when this says true (see pollWatcher). A closed/absent socket and a throwing
+// `send` are both "no".
 function sendControl(obj) {
-  if (controlSink) { controlSink(obj); return; }
-  if (controlWs && controlWs.readyState === WebSocket.OPEN) {
-    try { controlWs.send(JSON.stringify(obj)); } catch {}
-  }
+  // A sink that returns exactly `false` stands in for a send that did not go
+  // out, which is how a test drives the delta's re-send path without a socket.
+  // Anything else (including undefined) is a delivery.
+  if (controlSink) return controlSink(obj) !== false;
+  if (!controlWs || controlWs.readyState !== WebSocket.OPEN) return false;
+  try { controlWs.send(JSON.stringify(obj)); } catch { return false; }
+  return true;
 }
 
 // Claude Code writes each assistant message to the transcript JSONL only when
@@ -1607,20 +1614,23 @@ function pollWatcher(sessionId) {
       }
       const queuedJson = JSON.stringify(tail.queued);
       const queuedChanged = queuedJson !== w.lastQueued;
-      // Commit only once every entry serialized: a throw half way through must
-      // not leave ids recorded as sent that never went out (they would never be
-      // re-sent, and that entry would be missing from the chat for good).
-      // Pruned to the window, so a long-lived watch cannot grow this unbounded.
-      // `lastTail` is committed here for the same reason: marking the result
-      // differenced BEFORE it serialized would make a transient RangeError lose
-      // that delta for good (the cache hands back the same object next poll, so
-      // the identity check would skip it forever).
-      w.sent = sent;
-      w.lastTail = tail;
+      // Commit ONLY once the frame has actually gone out. Two ways to get this
+      // wrong, both of which silently DROP an entry from the chat for good
+      // (nothing re-sends it — that is what makes a delta different from the
+      // snapshot this replaced, which self-healed on the next change):
+      //  - committing before the serialize, so a RangeError (XERK-347/355) also
+      //    marks `lastTail` differenced — and the cache hands back the SAME
+      //    object next poll, so the identity check skips it forever;
+      //  - committing before the SEND, so a closed socket or a throwing
+      //    `ws.send` (which sendControl used to swallow) marks entries as
+      //    delivered that never left the host.
+      // `sent` is rebuilt from the window each poll, so it cannot grow unbounded.
+      let delivered = true;
       if (entries.length || queuedChanged) {
-        w.lastQueued = queuedJson;
-        sendControl({ tail: sessionId, entries, queued: tail.queued });
+        delivered = sendControl({ tail: sessionId, entries, queued: tail.queued });
+        if (delivered) w.lastQueued = queuedJson;
       }
+      if (delivered) { w.sent = sent; w.lastTail = tail; }
     } catch (e) {
       log(`live tail: could not serialize ${sessionId}'s tail (${e && e.message}); skipping this frame`);
     }
@@ -1666,8 +1676,10 @@ function pollWatcher(sessionId) {
     // and without this the list would freeze on whatever its first frame said.
     const frameKey = key + (agents.length ? JSON.stringify(agents) : "");
     if (frameKey !== w.lastTurn) {
-      w.lastTurn = frameKey;
-      sendControl({ turn: sessionId, text, status, agents });
+      // Dedup key committed only on a delivered frame, same rule as the tail
+      // delta above: a swallowed send would otherwise hold this turn's text back
+      // until it changed again.
+      if (sendControl({ turn: sessionId, text, status, agents })) w.lastTurn = frameKey;
     }
   });
 }

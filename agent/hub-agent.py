@@ -775,9 +775,15 @@ TAIL_PREVIEW_CAPS = {
 # What an over-budget (older) preview row degrades to: prose still rides — it is
 # what the operator reads — tool inputs and outputs do not. Never degrade a row
 # to NO blocks: that is what puts "[Bash]" back in a prose bubble.
+# `input` stays NON-ZERO here on purpose: it is not only a tool_use's argument
+# summary. `_entry_blocks` also clips a task_notification's `summary` and a
+# slash-command's `name`/`args` with it, so a zero would render an over-budget
+# row as a nameless command chip and a summary-less agent card — the same class
+# of lie the blocks exist to end. These are short; the budget is spent on text
+# and tool output.
 TAIL_PREVIEW_CAPS_MIN = {
     "text": _env_int("SESSION_TAIL_MIN_TEXT_CHARS", 200),
-    "input": 0,
+    "input": _env_int("SESSION_TAIL_MIN_INPUT_CHARS", 80),
     "result": 0,
 }
 # Per-session ceiling on the preview's block payload, spent NEWEST-first (what

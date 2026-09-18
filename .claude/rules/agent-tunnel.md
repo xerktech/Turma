@@ -24,9 +24,17 @@ Python side in `.claude/rules/agent.md`.
   exactly as a snapshot did.
 - **An unchanged transcript costs NOTHING**: `transcriptTail`'s cache returns the SAME result
   object, and the identity compare retires the whole section.
-- **`lastTail`/`sent` are committed only AFTER the frame serialized.** Marking a result differenced
-  first would make a transient `RangeError` (XERK-347/355) lose that delta for good — the cache
-  hands back the same object next poll, so the identity check would skip it forever.
+- **`lastTail`/`sent` are committed only after the frame both SERIALIZED and went OUT.** A delta that
+  is lost is lost for good — nothing re-sends it, unlike the snapshot this replaced, which self-healed
+  on the next change. Two ways to break that, both of which silently drop an entry:
+  - committing before the serialize, so a transient `RangeError` (XERK-347/355) also marks `lastTail`
+    differenced — and the cache hands back the same object next poll, so the identity check skips it
+    forever;
+  - committing before the send. **`sendControl` RETURNS whether the frame went out** for this reason
+    (a closed socket and a throwing `ws.send` are both "no"); it used to swallow both. `lastTurn` is
+    committed on the same rule. A test sink returning exactly `false` drives that path.
+  - A lost frame is not only a missing entry: when a later copy of that id IS sent, every id-keyed
+    grow-only consumer appends it at the END, so the transcript reads out of order too.
 - **A RE-ARM resets the delta state and polls immediately** (`startWatch`'s existing-watcher path).
   A re-arm means somebody is looking who has seen nothing on this channel — a control-channel flap
   re-sends every watch, and a SECOND viewer re-sends that one — and the deltas they missed went down

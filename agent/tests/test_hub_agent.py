@@ -3083,6 +3083,33 @@ class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
         self.assertTrue(any(b["t"] == "tool_use" and b["name"] == "Bash"
                             for b in tail[0 if tail[0]["role"] == "assistant" else 1]["blocks"]))
 
+    def test_degraded_tier_keeps_names_and_summaries(self):
+        """`caps["input"]` is not only a tool's argument summary — _entry_blocks
+        clips a task_notification's `summary` and a slash command's `name` with
+        it too. A zero there renders an over-budget row as a NAMELESS command
+        chip and a summary-less agent card: the same lie the blocks exist to
+        end."""
+        path = os.path.join(self.proj, "degraded.jsonl")
+        entries = []
+        # Enough full-fidelity rows ahead of them to exhaust the budget.
+        for i in range(20):
+            entries.append({"uuid": f"f{i}", "type": "assistant",
+                            "message": {"content": "p" * 500}})
+        tn = ("<task-notification><summary>ship the migration</summary>"
+              "<status>completed</status></task-notification>")
+        entries.insert(0, {"uuid": "tn", "type": "user", "message": {"content": tn}})
+        entries.insert(1, {"uuid": "cmd", "type": "user", "message": {
+            "content": "<command-name>/review</command-name><command-args>--fast</command-args>"}})
+        write_jsonl(path, entries)
+        with mock.patch.object(ha, "TAIL_BLOCKS_BUDGET", 1000):
+            rows = {e["id"]: e for e in ha.transcript_tail(path)}
+        tn_block = rows["tn"]["blocks"][0]
+        self.assertEqual(tn_block["t"], "task_notification")
+        self.assertEqual(tn_block["summary"], "ship the migration")
+        cmd_block = rows["cmd"]["blocks"][0]
+        self.assertEqual(cmd_block["t"], "command")
+        self.assertEqual(cmd_block["name"], "/review")
+
     def test_block_payload_stays_bounded(self):
         """One pathological tool-heavy turn must not blow the per-beat payload:
         the budget bounds the WHOLE session's preview blocks, not each row."""

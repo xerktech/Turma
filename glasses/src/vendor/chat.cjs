@@ -583,7 +583,15 @@
       }
       // A delta that actually arrived is itself proof an agent is tailing — and
       // it is the only proof a hub predating the ack above can give us.
-      if (frame && (frame.type === "tail" || frame.type === "turn")) liveArmed = true;
+      //
+      // EXCEPT the hub's own opening seed (`seed:true`), which it replays from
+      // the last HEARTBEAT the moment the socket upgrades. That frame proves
+      // nothing about the agent: the hub sends it even on the socket it just
+      // told us it could not arm, and letting it through cleared the
+      // `armed:false` a line earlier — re-suppressing the repair path in exactly
+      // the accepted-but-unarmed case this whole read exists for.
+      if (frame && (frame.type === "turn" ||
+                    (frame.type === "tail" && frame.seed !== true))) liveArmed = true;
       if (frame && frame.type === "tail" && Array.isArray(frame.entries)) {
         if (frame.entries.length) buffer = mergeTail(buffer, frame.entries);
         // Every tail frame carries the CURRENT still-queued prompt list (an
@@ -695,20 +703,36 @@
   function liveDelivering() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     if (!liveArmed) return false;
-    if (heartbeatBusy() && Date.now() - lastFrameAt > LIVE_STALE_MS) return false;
+    if (feedMustBeTicking() && Date.now() - lastFrameAt > LIVE_STALE_MS) return false;
     return true;
   }
 
-  // The busy read for the staleness test comes from the HEARTBEAT, never from
-  // `liveStatus`: liveStatus is fed by the very socket under suspicion, so a
-  // feed that died mid-turn would clear it and then read "not busy, so silence
-  // is fine" — the failure hiding itself. `paneBusy` absent means "that agent
-  // can't tell", which is not busy. Live background agents count as working for
-  // the same reason they do everywhere else (XERK-245).
-  function heartbeatBusy() {
+  // Is a frame source OBLIGED to be emitting right now? This is deliberately
+  // NOT the "is the session working" read every other surface uses (XERK-245's
+  // `paneBusy` OR live agents) — it is the narrower "silence here would be a
+  // FAULT" read, and the two are not the same set.
+  //
+  //  - `paneBusy` qualifies: while the pane generates, the agent pushes a `turn`
+  //    frame whose `status.elapsed` ticks every second, so frames keep flowing
+  //    even if the text holds still.
+  //  - **Live background agents do NOT qualify**, however busy the session is.
+  //    The main turn has ENDED (that is the whole point of XERK-245), so the
+  //    pane emits `text:""`/`status:null` and `liveAgentsReport` carries only
+  //    `{type,label}` with nothing that ticks — the agent's frame key never
+  //    changes and it correctly sends nothing for minutes. Counting that as
+  //    "must be emitting" declared every healthy delegating session dead, polled
+  //    /history around it and tore the socket down every cooldown — and each
+  //    re-arm costs a FULL window at BLOCK_CAPS, so it multiplied exactly the
+  //    bytes the delta exists to save. Never put `agents` back in here.
+  //
+  // It comes from the HEARTBEAT, never from `liveStatus`: liveStatus is fed by
+  // the very socket under suspicion, so a feed that died mid-turn would clear it
+  // and then read "not busy, so silence is fine" — the failure hiding itself.
+  // `paneBusy` absent means "that agent can't tell", which is not busy.
+  function feedMustBeTicking() {
     const live = sess && sess.session;
     if (!live) return false;
-    return live.paneBusy === true || (Array.isArray(live.agents) && live.agents.length > 0);
+    return live.paneBusy === true;
   }
 
   function pollFallbackTick(myGen) {

@@ -1722,7 +1722,17 @@ const pendingChannels = Object.create(null);
 // the /live upgrade handler). The hub asks the host's tunnel-agent to tail a
 // session only while at least one socket here is watching it, and fans the
 // agent's `{tail, entries}` deltas back out to that set.
-const liveClients = {};
+//
+// NULL-PROTOTYPE for exactly the reason above, and it is the SAME class of bug:
+// both levels are keyed by attacker-influenced strings — the outer by a `?name=`
+// host, the inner by a session id the AGENT names on the control channel. On a
+// plain object `liveClients[host]?.[sessionId]` resolved `__proto__` /
+// `constructor` / `toString` off Object.prototype, so `for (const s of set)`
+// threw `set is not iterable` straight out of the control-channel listener and
+// exited the hub — every host's terminal, live tail and heartbeat poke with it.
+// `typeof id === "string"` (XERK-278) does NOT cover it: those ARE strings.
+// Every nested map below is created the same way.
+const liveClients = Object.create(null);
 
 // ---- persistence (best-effort: survives hub restarts so the UI isn't blank
 // for the first heartbeat interval; losing it is harmless) -------------------
@@ -13727,9 +13737,20 @@ function watchTargetFor(host, sessionId) {
 // forgets every watch with it — so "armed" only ever means "asked for over the
 // channel we hold NOW". Declared here, not beside its users, for the same
 // reason the ceilings above are: the state.json restore runs at module init.
-const liveWatchArmed = {};
+const liveWatchArmed = Object.create(null);
+// Three states, not two: `true` = asked for and not refused; `"refused"` = the
+// agent NACKed it (see below); absent = never asked on this channel.
 function markWatchArmed(host, sessionId) {
-  (liveWatchArmed[host] = liveWatchArmed[host] || {})[sessionId] = true;
+  (liveWatchArmed[host] = liveWatchArmed[host] || Object.create(null))[sessionId] = true;
+}
+// A watch the AGENT refused. Recorded rather than forgotten so the never-armed
+// re-arm does not ask again on every single beat for the life of the session: a
+// host sitting at MAX_WATCHERS refuses deterministically, and re-asking 20 times
+// a minute buys nothing. A control reconnect clears the whole host (the agent
+// forgot its watchers too, so its cap is genuinely different), and a transcript
+// MOVE still re-arms — those are the two things that can change the answer.
+function markWatchRefused(host, sessionId) {
+  (liveWatchArmed[host] = liveWatchArmed[host] || Object.create(null))[sessionId] = "refused";
 }
 function clearWatchArmed(host, sessionId) {
   if (!liveWatchArmed[host]) return;
@@ -13752,7 +13773,7 @@ function rearmMovedWatches(host, prev, next) {
   const watched = liveClients[host];
   if (!cc || !watched) return;
   const before = new Map((prev?.sessions || []).map((s) => [s.id, s.transcriptId || null]));
-  const armed = liveWatchArmed[host] || {};
+  const armed = liveWatchArmed[host] || Object.create(null);
   for (const sess of next?.sessions || []) {
     if (!watched[sess.id] || !sess.worktreePath) continue;
     const now = sess.transcriptId || null;
@@ -13763,7 +13784,7 @@ function rearmMovedWatches(host, prev, next) {
     // host whose first beat is still in flight — armed NOTHING, and the `!before
     // .has()` guard below then skipped it on the very beat that made it armable.
     // Nothing else retried, so that chat had no live feed for its whole life.
-    const never = !armed[sess.id];
+    const never = armed[sess.id] === undefined;
     // Otherwise only on a real move. An agent predating the pin reports null
     // every beat, which is not a move — and re-arming every beat would be a
     // no-op anyway.
@@ -13792,7 +13813,12 @@ function sendLive(socket, obj) {
 // sockets AND relay pseudo-subscribers alike.
 function liveFanout(host, sessionId, obj) {
   const set = liveClients[host]?.[sessionId];
-  if (!set) return;
+  // `instanceof Set`, not truthiness: belt to the null-prototype braces above.
+  // This runs on the control-channel listener, where a throw exits the hub, and
+  // the session id is a string the AGENT chose — so the one place the cost of
+  // being wrong is the whole fleet is the one place to check the type rather
+  // than assume it.
+  if (!(set instanceof Set)) return;
   for (const socket of set) sendLive(socket, obj);
 }
 
@@ -13803,7 +13829,7 @@ function liveFanout(host, sessionId, obj) {
 // the tunnel. Shared by the /live upgrade handler and `openLiveForRelay`, so a
 // relay sink and a browser subscriber count toward the same one-watch-per-session.
 function armLiveWatcher(host, sessionId, socket) {
-  const byHost = (liveClients[host] = liveClients[host] || {});
+  const byHost = (liveClients[host] = liveClients[host] || Object.create(null));
   const set = (byHost[sessionId] = byHost[sessionId] || new Set());
   const first = set.size === 0;
   set.add(socket);
@@ -13861,7 +13887,7 @@ function disarmLiveWatcher(host, sessionId, socket) {
 // tunnel. `liveRelayChannels[host][sessionId]` is the ORIGIN-side relay duplex to
 // the owning replica; its readable carries newline-delimited JSON deltas, which
 // we fan to the local browser subscribers via `liveFanout`.
-const liveRelayChannels = {};
+const liveRelayChannels = Object.create(null);
 
 // A line-buffered JSON reader over a relay duplex's raw DATA bytes: the owner
 // pushes one `JSON.stringify(delta) + "\n"` per delta, but the pod-to-pod hop may
@@ -13904,7 +13930,7 @@ async function openLiveRelay(host, sessionId) {
   if (!d) return; // no fresh remote owner — offline; cache seed only
   // A concurrent first-subscriber race may have opened one meanwhile.
   if (liveRelayChannels[host]?.[sessionId]) { try { d.destroy(); } catch {} return; }
-  (liveRelayChannels[host] = liveRelayChannels[host] || {})[sessionId] = d;
+  (liveRelayChannels[host] = liveRelayChannels[host] || Object.create(null))[sessionId] = d;
   d.on("data", makeLiveLineReader((obj) => liveFanout(host, sessionId, obj)));
   const teardown = (reconnect) => {
     if (liveRelayChannels[host]?.[sessionId] === d) {
@@ -18148,7 +18174,7 @@ server.on("upgrade", async (req, socket, head) => {
         // reporting the session live-watched and the browser holding an
         // open-but-silent socket — the one state the chat's /history repair was
         // gated OUT of. Now the viewer hears it and falls back to polling.
-        clearWatchArmed(name, msg.watchFailed);
+        markWatchRefused(name, msg.watchFailed);
         liveFanout(name, msg.watchFailed, { type: "watch", armed: false,
           reason: `this host could not tail the session (${safeString(msg.reason).slice(0, 200) ||
             "no reason given"})` });
@@ -18234,9 +18260,13 @@ server.on("upgrade", async (req, socket, head) => {
 
     // Immediately seed the client with the most recent tail we already have
     // (from the last heartbeat) so it isn't blank until the first live delta.
+    // `seed:true` marks it as OUR cache, not an agent delta: the client must not
+    // read it as proof that a watch was armed behind this socket (it is sent
+    // even on a socket we just acked `armed:false`), or the ack above would be
+    // cleared a millisecond after it was sent.
     const cachedTail = (agents[host].sessions || []).find((s) => s.id === sessionId)?.session?.tail;
     if (Array.isArray(cachedTail) && cachedTail.length) {
-      sendLive(socket, { type: "tail", entries: cachedTail });
+      sendLive(socket, { type: "tail", entries: cachedTail, seed: true });
     }
 
     // First watcher, but this replica does NOT hold the tunnel: under HA another

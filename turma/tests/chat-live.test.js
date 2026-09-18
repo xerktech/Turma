@@ -233,9 +233,15 @@ test("a WORKING session that has gone silent falls back and forces a reconnect",
   assert.equal(sockets[0].readyState, FakeSocket.CLOSED);
 });
 
-// A session that delegated its turn reads paneBusy:false while the agents it
-// launched keep going (XERK-245) — the same read every other surface uses.
-test("live background agents count as working for the staleness test", async () => {
+// The staleness read is "must a frame source be TICKING", not "is the session
+// working" — and live background agents are the case where those two differ.
+// A delegating session has ENDED its own turn (XERK-245): the pane emits
+// text:""/status:null and the agent list carries nothing that ticks, so the
+// agent's frame key never changes and it correctly sends nothing for minutes.
+// Counting that as a fault declared every healthy delegating session dead and
+// tore its socket down on a cooldown — and each re-arm re-sends a FULL window at
+// the loose caps, multiplying exactly the bytes the delta exists to save.
+test("live background agents do NOT make silence a fault (the feed has nothing to send)", async () => {
   await chat.reconnectNow();
   await settle();
   sockets[0].open();
@@ -243,7 +249,50 @@ test("live background agents count as working for the staleness test", async () 
   chat.__setLastFrameAt(Date.now() - 10 * chat.LIVE_STALE_MS);
 
   chat.__setSess({ id: "sess-1", session: { paneBusy: false, agents: [{ type: "agent" }] } });
+  assert.equal(chat.liveDelivering(), true, "a delegating session is left alone");
+
+  fetched = [];
+  chat.__setForcedReconnectAt(0);
+  chat.pollFallbackTick(chat.__gen());
+  await settle();
+  assert.deepEqual(fetched, [], "no /history poll");
+  assert.equal(sockets[0].readyState, FakeSocket.OPEN, "and the socket is not torn down");
+
+  // paneBusy IS a ticking source (status.elapsed advances every second), so the
+  // same silence there is still a fault.
+  chat.__setSess({ id: "sess-1", session: { paneBusy: true, agents: [{ type: "agent" }] } });
   assert.equal(chat.liveDelivering(), false);
+});
+
+// The hub replays its last HEARTBEAT tail the moment the socket upgrades, even
+// on a socket it just said it could NOT arm. That frame is the hub's own cache
+// and proves nothing about the agent — letting it through cleared the
+// armed:false a millisecond after it was sent, re-suppressing the repair path in
+// exactly the case it exists for.
+test("the hub's own cached seed frame does not vouch for the agent feed", async () => {
+  await chat.reconnectNow();
+  await settle();
+  sockets[0].open();
+  chat.__setSess({ id: "sess-1", session: { paneBusy: false } });
+
+  deliver(sockets[0], { type: "watch", armed: false, reason: "this host's tunnel is offline" });
+  deliver(sockets[0], { type: "tail", entries: [{ id: "c1", role: "user", text: "cached" }], seed: true });
+  assert.equal(chat.liveDelivering(), false, "still unarmed after the seed");
+
+  fetched = [];
+  chat.pollFallbackTick(chat.__gen());
+  await settle();
+  assert.deepEqual(fetched, ["/api/agents/hostA/sessions/sess-1/history"]);
+
+  // A REAL delta (no `seed`) still proves it, which is what an older hub sends.
+  // Fresh socket: the tick above replaced the torn-down one.
+  await chat.reconnectNow();
+  await settle();
+  const fresh = sockets[sockets.length - 1];
+  fresh.open();
+  assert.equal(chat.liveDelivering(), false, "a new socket starts unproven");
+  deliver(fresh, { type: "tail", entries: [{ id: "c2", role: "user", text: "live" }] });
+  assert.equal(chat.liveDelivering(), true);
 });
 
 // A hub predating the ack sends no {type:"watch"} at all; a delta arriving is
