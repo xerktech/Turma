@@ -439,3 +439,78 @@ test('a never-terminating escape does not grow pending without bound (untrusted 
   g.write('\x1b[2J\x1b[Hok');
   assert.equal(g.capture(), 'ok');
 });
+
+// ---- C6: the scrollback ring is O(1) amortised, not a per-chunk full copy ----
+test('C6: ScrollbackRing keeps an exact byte-bounded tail across many small chunks', () => {
+  // It used to be `this.buf = Buffer.concat([this.buf, b])` per chunk, copying
+  // the WHOLE 256 KiB ring on every pty write — on the pty-host's only thread,
+  // which also fans bytes to the browser and answers the manager's control RPCs.
+  // The chunk-list rewrite must be byte-for-byte identical to that behaviour.
+  const ref = (chunks, max) => {
+    let b = Buffer.alloc(0);
+    for (const c of chunks) { b = Buffer.concat([b, c]); if (b.length > max) b = b.subarray(b.length - max); }
+    return b;
+  };
+  const cases = [
+    { max: 8, chunks: ['a', 'b', 'c'] },
+    { max: 4, chunks: ['abcdefgh'] },                 // one chunk larger than the ring
+    { max: 5, chunks: ['ab', 'cd', 'ef', 'gh'] },     // eviction mid-chunk
+    { max: 16, chunks: [] },                          // empty
+    { max: 3, chunks: ['', 'xy', '', 'z'] },          // empty appends are no-ops
+  ];
+  for (const { max, chunks } of cases) {
+    const bufs = chunks.map((c) => Buffer.from(c, 'utf8'));
+    const ring = new T.ScrollbackRing(max);
+    for (const b of bufs) ring.append(b);
+    const want = ref(bufs, max);
+    assert.deepEqual(ring.bytes(), want, `ring bytes for max=${max} [${chunks}]`);
+    assert.equal(ring.length, want.length, `ring length for max=${max}`);
+    assert.equal(ring.text(), want.toString('utf8'));
+  }
+});
+
+test('C6: the ring never exceeds its ceiling and stays cheap under a stream', () => {
+  const max = 1024;
+  const ring = new T.ScrollbackRing(max);
+  const chunk = Buffer.alloc(64, 0x61);
+  for (let i = 0; i < 5000; i++) {
+    ring.append(chunk);
+    assert.ok(ring.length <= max, 'the ring must never exceed its ceiling mid-stream');
+  }
+  assert.equal(ring.length, max);
+  // Retained chunks must stay bounded too — an unbounded list would be the same
+  // leak in a different shape.
+  assert.ok(ring.chunks.length <= Math.ceil(max / 64) + 1,
+    `retained chunk count stays bounded (got ${ring.chunks.length})`);
+});
+
+// ---- C14: the rendered grid must not corrupt or scramble on hostile bytes ----
+test('C14: an inverted DECSTBM region is IGNORED, not applied', () => {
+  // `\x1b[10;5r` yields top=9, bot=4. Applied, _scrollUp's splice pair removes
+  // and reinserts at the wrong ends and scrambles the screen. These are
+  // untrusted pty bytes — a plain `echo` reaches this.
+  const g = new T.TerminalGrid(20, 10);
+  g.write('\x1b[10;5r');
+  assert.ok(g.top < g.bot, `an unusable region must be refused (top=${g.top} bot=${g.bot})`);
+  // A legitimate region still applies.
+  g.write('\x1b[3;8r');
+  assert.equal(g.top, 2);
+  assert.equal(g.bot, 7);
+  // And the grid still renders rather than throwing.
+  g.write('hello');
+  assert.match(g.capture(), /hello/);
+});
+
+test('C14: EL/ED at the pending-wrap column do not grow the row past `cols`', () => {
+  // After the last cell is filled, `cc === cols` while the wrap is pending, so an
+  // unclamped `c <= this.cc` wrote grid[cr][cols]. capture() trimmed it
+  // cosmetically, but resize()/_scrollUp then carried the wrong row shape.
+  for (const seq of ['\x1b[1K', '\x1b[1J']) {
+    const g = new T.TerminalGrid(4, 3);
+    g.write('abcd');            // fills the row; cc is now at the wrap column
+    g.write(seq);
+    for (const row of g.grid) {
+      assert.equal(row.length, 4, `row stays exactly cols wide after ${JSON.stringify(seq)}`);
+    }
+  }
+});

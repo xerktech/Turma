@@ -32349,6 +32349,31 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         self.assertEqual(ctl.call_args.kwargs["timeout"],
                          ha.PTY_CONTROL_BEAT_TIMEOUT_SEC)
 
+    def test_a_blank_capture_reads_as_cant_tell_not_as_idle(self):
+        """A BLANK grid must be None ("can't tell"), never "" (an affirmative
+        not-busy).
+
+        `_busy_from_capture("")` returns False, and False SKIPS the
+        transcript-freshness fallback an uncapturable Linux pane gets — so a
+        session whose turn is still running reads IDLE and can fire the
+        ready-for-review alert. This is XERK-703's false-idle class arriving by
+        a different door. The grid is legitimately blank right after spawn and
+        between an `ED 2` and the app's repaint, so it is reachable in ordinary
+        use, not only on failure."""
+        for blank in ("", "   ", "\n", " \n\t "):
+            with mock.patch.object(ha, "_pty_control",
+                                   return_value={"ok": True, "data": blank}):
+                self.assertIsNone(ha._pty_capture("agent-x"),
+                                  f"blank capture {blank!r} must read as None")
+        # A capture with real content still comes through untouched, including
+        # leading/trailing whitespace inside a non-empty screen.
+        with mock.patch.object(ha, "_pty_control",
+                               return_value={"ok": True, "data": "  esc to interrupt  "}):
+            self.assertEqual(ha._pty_capture("agent-x"), "  esc to interrupt  ")
+        # And the "can't tell" value really does reach the busy read as None
+        # rather than being coerced to a decision.
+        self.assertIsNone(ha._busy_from_capture(None))
+
     def test_pty_control_dials_the_state_port_with_the_agent_token(self):
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(ha, "PTY_HOST_DIR", d), \
