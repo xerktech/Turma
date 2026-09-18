@@ -270,9 +270,28 @@ h5.md-h, h6.md-h { color: var(--ink-2); }
 /* The tool's human description arg (Bash/Agent/…), beside the raw argument. */
 .action-card .tool-desc { color: var(--muted); font-size: 11px; font-style: italic; flex: none;
   max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* An Edit call's reviewable change: the replaced text (−, red) over its
-   replacement (+, green) — the diff the terminal shows for an edit. */
+/* An Edit call's reviewable change, as the interleaved per-line −/+ diff with
+   context that the terminal shows (chat.js renderEditDiff). It used to be two
+   stacked <pre>s — the whole old text over the whole new text — so finding the
+   two changed lines in a 40-line edit meant eyeballing two 40-line blobs.
+
+   One row per line, mono and pre-wrap so a long line wraps instead of forcing
+   the card sideways; the leading -/+/space glyph is part of the text, so a
+   copied selection carries it exactly as a patch would. */
 .action-card .tool-diff { display: flex; flex-direction: column; gap: 4px; }
+.action-card .tool-diff.lines { gap: 0; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); overflow: hidden; background: var(--page);
+  max-height: 420px; overflow-y: auto; }
+.action-card .tool-diff.lines .dl { font-family: var(--font-mono); font-size: 11.5px;
+  line-height: 1.5; padding: 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.action-card .tool-diff.lines .dl.ctx { color: var(--ink-2); }
+.action-card .tool-diff.lines .dl.del { color: var(--critical);
+  background: color-mix(in srgb, var(--critical) 9%, var(--page)); }
+.action-card .tool-diff.lines .dl.add { color: var(--good);
+  background: color-mix(in srgb, var(--good) 10%, var(--page)); }
+.action-card .tool-diff.lines .dl.gap { color: var(--muted); font-style: italic;
+  background: var(--surface); border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border); }
 .action-card .tool-diff pre.diff-old { background: color-mix(in srgb, var(--critical) 7%, var(--page));
   border-color: color-mix(in srgb, var(--critical) 35%, var(--border)); }
 .action-card .tool-diff pre.diff-new { background: color-mix(in srgb, var(--good) 8%, var(--page));
@@ -371,6 +390,17 @@ h5.md-h, h6.md-h { color: var(--ink-2); }
 .thought > summary { list-style: none; cursor: pointer; user-select: none; color: var(--muted); }
 .thought > summary::-webkit-details-marker { display: none; }
 .thought > summary:hover { color: var(--accent); }
+/* Thinking the current verbosity hides (chat.js renderFoldedThoughts,
+   XERK-860). It used to render as nothing at all, which reads as MISSING
+   content — the terminal always shows the trace. The default still hides it;
+   this only makes its absence visible and one click from being read, so it is
+   deliberately quieter than an ordinary collapsed trace: smaller, dimmer, and
+   dashed to read as a placeholder rather than as content. */
+.thought.folded > summary, .thought.folded > .thf-label { font-size: 11px; opacity: 0.65;
+  border-bottom: 1px dashed var(--border); display: inline-block; padding-bottom: 1px; }
+.thought.folded > summary:hover, .thought.folded > .thf-label:hover { opacity: 1; }
+.thought.folded[open] > summary { opacity: 1; }
+.thought.folded .thought-body + .thought-body { margin-top: 6px; }
 .thought .thought-body { margin-top: 4px; padding: 8px 11px; border-left: 2px solid var(--border);
   color: var(--ink-2); font-style: italic; white-space: pre-wrap; overflow-wrap: anywhere; }
 

@@ -812,10 +812,26 @@
   // Until when the compose button is showing a transient failure message.
   let actionFailUntil = 0;
 
-  // The HTML currently in the scroll, and whether a changed paint was held back
-  // because the reader was selecting text. See repaint()/selectionInScroll().
-  let lastHtml = null;
+  // The HTML currently in the scroll, split at the seam that matters: the BODY
+  // (every settled item) and the LIVE region (the in-progress turn + the still-
+  // queued prompts). They are tracked apart because the live region changes ~1s
+  // while the body does not, and rewriting the body to repaint the live turn is
+  // what destroyed and re-created every data: image and sandboxed iframe in the
+  // transcript once a second. See repaint().
+  let lastBodyHtml = null;
+  let lastLiveHtml = null;
+  // A changed paint held back because the reader was selecting text inside the
+  // region it would have rewritten. See repaint()/selectionIn().
   let repaintDeferred = false;
+  // The pending requestAnimationFrame handle, so the `tail` and `turn` frames —
+  // which arrive within milliseconds of each other every second — coalesce into
+  // ONE repaint instead of each doing a full rebuild.
+  let repaintRaf = 0;
+  let repaintForced = false;
+  // Rendered HTML per display item, so an unchanged item is not re-rendered
+  // (markdown, escaping and all) on every frame. Rebuilt each pass from the
+  // entries actually used, which is what bounds it to the buffer.
+  let itemHtmlCache = new Map();
 
   // User's explicit expand/collapse of <details> cards, keyed by a stable
   // data-dkey, so a repaint (a tail delta lands ~1s while working) doesn't snap
@@ -823,6 +839,13 @@
   // session open and whenever verbosity changes (so the preset sets a clean
   // baseline).
   const detailsOpen = new Map();
+  // Bumped on every mutation of detailsOpen. The rendered HTML of a card carries
+  // its ` open` attribute, so a reader toggling one changes the HTML without
+  // changing the ITEM — and a memo keyed on the item alone would serve the stale
+  // copy back. One integer in the key is exact and costs nothing.
+  let detailsEpoch = 0;
+  function noteDetails(key, open) { detailsOpen.set(key, open); detailsEpoch++; }
+  function clearDetails() { detailsOpen.clear(); detailsEpoch++; }
 
   const $ = (id) => document.getElementById(id);
 
@@ -880,7 +903,7 @@
         // Every tail frame carries the CURRENT still-queued prompt list (an
         // agent predating the field sends none — keep whatever we had).
         if (Array.isArray(frame.queued)) queuedPrompts = frame.queued;
-        repaint();
+        scheduleRepaint();
       } else if (frame && frame.type === "turn" && typeof frame.text === "string") {
         applyTurn(frame.text);
         // The working indicator (spinner verb + live token up/down counters) is
@@ -892,7 +915,7 @@
         liveAgents = Array.isArray(frame.agents)
           ? frame.agents
           : (frame.status && Array.isArray(frame.status.agents) ? frame.status.agents : []);
-        repaint();
+        scheduleRepaint();
       }
     };
     sock.onclose = () => {
@@ -1331,12 +1354,42 @@
       renderProse(it.text) + clipMark(it.truncated) + "</div>";
   }
 
+  function thoughtBody(it) {
+    return '<div class="thought-body" data-uuid="' + esc(it.id) + '">' +
+      renderProse(it.text) + clipMark(it.truncated) + "</div>";
+  }
+
   function renderThought(it) {
-    if (!verbosity.show.thinking) return ""; // hidden by verbosity
     const key = "th:" + it.id;
     return '<details class="thought" data-dkey="' + esc(key) + '" data-uuid="' + esc(it.id) + '"' + openAttr(key, true) +
-      "><summary>💭 Thought</summary>" +
-      '<div class="thought-body">' + renderProse(it.text) + clipMark(it.truncated) + "</div></details>";
+      "><summary>💭 Thought</summary>" + thoughtBody(it) + "</details>";
+  }
+
+  // Thinking that the current verbosity hides (XERK-860). It used to render as
+  // NOTHING AT ALL, which reads as missing content next to the terminal, which
+  // always shows the trace — the operator had no way to tell a quiet turn from
+  // an elided one. The default stays `thinking: false`; what changes is only
+  // that its absence is now VISIBLE and one click from being read.
+  //
+  // A run of consecutive traces folds into ONE marker with a count, because the
+  // hiding verbosities are the ones chosen for quiet, and a turn can carry
+  // several traces — a marker apiece would be exactly the noise they asked to
+  // be rid of. Collapsed <details> means the reveal costs no new machinery: the
+  // same data-dkey persistence that keeps a card the reader opened from snapping
+  // shut on the next repaint carries this too.
+  function renderFoldedThoughts(run) {
+    const key = "thf:" + run[0].id;
+    const label = run.length === 1 ? "1 thought hidden" : run.length + " thoughts hidden";
+    // SUMMARY ONLY — the trace itself is deliberately NOT emitted. The job here
+    // is to make the ELISION visible, not to smuggle the content past the
+    // verbosity setting the operator chose: `concise`/`normal` mean "do not send
+    // me the thinking", and glasses renders this same vendored engine onto a tiny
+    // heads-up display where a collapsed body would still be carried (pinned by
+    // `glasses/src/vendor/vendor.test.ts`). Keeping it out also spares every
+    // repaint the hidden text. To READ a trace, raise the verbosity — which is
+    // exactly what that control is for.
+    return '<div class="thought folded" data-uuid="' + esc(run[0].id) + '">' +
+      '<span class="thf-label">💭 ' + esc(label) + "</span></div>";
   }
 
   // ` open` when this card should be expanded: the user's explicit toggle wins,
@@ -1438,6 +1491,102 @@
       '<div class="tool-body">' + body + "</div></details>";
   }
 
+  // ---- Edit diffs -----------------------------------------------------------
+  // An Edit's reviewable change, as an interleaved per-line -/+ diff with
+  // context — what the terminal shows. It used to be two stacked <pre>s, the
+  // whole old text over the whole new text, so a 40-line edit changing 2 lines
+  // meant eyeballing two 40-line blobs to find them. The agent already ships
+  // {old, new} verbatim (hub-agent _tool_use_detail), so this needs no wire
+  // change; it is purely a rendering one.
+  //
+  // Common leading and trailing lines are stripped FIRST and the LCS runs only
+  // on what is left. That is what keeps this cheap on the shape that actually
+  // occurs — a small change inside a large hunk collapses to a tiny matrix —
+  // and it is why the O(n*m) fallback below is almost never reached.
+  const DIFF_CELL_MAX = 250000;  // n*m ceiling for the LCS table
+  const DIFF_CONTEXT = 3;        // unchanged lines kept either side of a change
+
+  // Longest common subsequence of two line arrays, as a list of ops. Classic
+  // O(n*m) table; the caller bounds n*m before calling.
+  function lcsOps(a, b) {
+    const n = a.length, m = b.length;
+    const w = m + 1;
+    const table = new Int32Array((n + 1) * w);
+    for (let i = n - 1; i >= 0; i--) {
+      for (let j = m - 1; j >= 0; j--) {
+        table[i * w + j] = a[i] === b[j]
+          ? table[(i + 1) * w + j + 1] + 1
+          : Math.max(table[(i + 1) * w + j], table[i * w + j + 1]);
+      }
+    }
+    const ops = [];
+    let i = 0, j = 0;
+    while (i < n && j < m) {
+      if (a[i] === b[j]) { ops.push(["ctx", a[i]]); i++; j++; }
+      else if (table[(i + 1) * w + j] >= table[i * w + j + 1]) { ops.push(["del", a[i]]); i++; }
+      else { ops.push(["add", b[j]]); j++; }
+    }
+    while (i < n) { ops.push(["del", a[i]]); i++; }
+    while (j < m) { ops.push(["add", b[j]]); j++; }
+    return ops;
+  }
+
+  // Drop the runs of context that are too far from any change, leaving
+  // DIFF_CONTEXT lines either side and a count of what was elided. A diff whose
+  // unchanged middle is 200 lines is no more readable than the two blobs were.
+  function collapseContext(ops) {
+    const keep = new Array(ops.length).fill(false);
+    for (let i = 0; i < ops.length; i++) {
+      if (ops[i][0] === "ctx") continue;
+      for (let k = Math.max(0, i - DIFF_CONTEXT); k <= Math.min(ops.length - 1, i + DIFF_CONTEXT); k++) keep[k] = true;
+    }
+    const out = [];
+    let skipped = 0;
+    for (let i = 0; i < ops.length; i++) {
+      if (keep[i]) {
+        if (skipped) { out.push(["gap", skipped]); skipped = 0; }
+        out.push(ops[i]);
+      } else skipped++;
+    }
+    if (skipped) out.push(["gap", skipped]);
+    return out;
+  }
+
+  const DIFF_GLYPH = { ctx: " ", del: "-", add: "+" };
+  function renderEditDiff(oldText, newText) {
+    if (!oldText && !newText) return "";
+    const a = oldText ? oldText.split("\n") : [];
+    const b = newText ? newText.split("\n") : [];
+    // Common head/tail are context by definition and cost nothing to identify.
+    let head = 0;
+    while (head < a.length && head < b.length && a[head] === b[head]) head++;
+    let tail = 0;
+    while (tail < a.length - head && tail < b.length - head &&
+           a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail++;
+    const midA = a.slice(head, a.length - tail);
+    const midB = b.slice(head, b.length - tail);
+    let mid;
+    if (midA.length * midB.length > DIFF_CELL_MAX) {
+      // Too big to align line-by-line. Still better than two blobs: the head and
+      // tail context above and below is real, and the middle is honestly marked
+      // as a wholesale replacement rather than a fabricated alignment.
+      mid = midA.map((l) => ["del", l]).concat(midB.map((l) => ["add", l]));
+    } else {
+      mid = lcsOps(midA, midB);
+    }
+    const ops = a.slice(0, head).map((l) => ["ctx", l])
+      .concat(mid, a.slice(a.length - tail).map((l) => ["ctx", l]));
+    let html = '<div class="tool-diff lines">';
+    for (const [kind, val] of collapseContext(ops)) {
+      if (kind === "gap") {
+        html += '<div class="dl gap">' + esc("\u22EF " + val + (val === 1 ? " unchanged line" : " unchanged lines")) + "</div>";
+      } else {
+        html += '<div class="dl ' + kind + '">' + esc(DIFF_GLYPH[kind] + val) + "</div>";
+      }
+    }
+    return html + "</div>";
+  }
+
   function renderActionCard(it, key) {
     if (Array.isArray(it.todos) && it.todos.length) return renderTodoCard(it, key);
     const statusCls = it.result ? (it.result.isError ? "err" : "ok") : "";
@@ -1473,10 +1622,8 @@
     // rendered markdown — what the operator otherwise opens the terminal for.
     if (it.edit) {
       body += '<div class="tool-block"><div class="tool-label">edit' +
-        (it.edit.replaceAll ? " (replace all)" : "") + '</div><div class="tool-diff">' +
-        (it.edit.old ? '<pre class="diff-old">' + esc(it.edit.old) + "</pre>" : "") +
-        (it.edit.new ? '<pre class="diff-new">' + esc(it.edit.new) + "</pre>" : "") +
-        "</div></div>";
+        (it.edit.replaceAll ? " (replace all)" : "") + "</div>" +
+        renderEditDiff(it.edit.old || "", it.edit.new || "") + "</div>";
     }
     if (it.content) {
       body += '<div class="tool-block"><div class="tool-label">content</div><pre>' +
@@ -1576,19 +1723,57 @@
       '<div class="away-body">' + renderProse(it.text) + clipMark(it.truncated) + "</div></details>";
   }
 
-  function itemsToHtml(items) {
+  // Everything that decides what a rendered unit LOOKS like, beyond the unit
+  // itself: the verbosity flags each renderer reads, and the card open/closed
+  // state that lands in the HTML as ` open`.
+  function renderStateKey() {
+    const sh = verbosity.show || {};
+    return verbosity.preset + ":" + (sh.thinking ? 1 : 0) + (sh.tools ? 1 : 0) + (sh.outputs ? 1 : 0) +
+      ":" + detailsEpoch;
+  }
+
+  // Memoise one rendered unit. The key is the render state plus the unit itself,
+  // SERIALISED — exact, not a length or a hash. A cheap signature (id + weight)
+  // is tempting and is how a cache like this goes stale: two different contents
+  // that happen to agree on the cheap key then render as each other. Serialising
+  // is O(size); rendering is O(size) through several regex passes plus escaping,
+  // so the exact key still wins, and it cannot be wrong.
+  function memoUnit(cache, next, tag, payload, make) {
+    if (!cache || !next) return make();
+    const ck = renderStateKey() + "|" + tag + "|" + JSON.stringify(payload);
+    let html = cache.get(ck);
+    if (html === undefined) html = make();
+    next.set(ck, html);
+    return html;
+  }
+
+  // `cache`/`next` are the previous and the being-built per-unit HTML memo; the
+  // live repaint passes them, the one-shot static/archive renders don't and just
+  // render everything. Rebuilding `next` from scratch each pass is what evicts
+  // units that scrolled out of the buffer.
+  function itemsToHtml(items, cache, next) {
     const out = [];
     let i = 0, g = 0;
+    const push = (tag, payload, make) => out.push(memoUnit(cache, next, tag, payload, make));
     while (i < items.length) {
       const it = items[i];
-      if (it.kind === "msg") { out.push(renderMsg(it)); i++; continue; }
-      if (it.kind === "thinking") { out.push(renderThought(it)); i++; continue; }
-      if (it.kind === "command") { out.push(renderCommandCard(it)); i++; continue; }
-      if (it.kind === "compact") { out.push(renderCompactCard(it)); i++; continue; }
-      if (it.kind === "interrupt") { out.push(renderInterrupt(it)); i++; continue; }
-      if (it.kind === "compact_boundary") { out.push(renderCompactBoundary(it)); i++; continue; }
-      if (it.kind === "pr") { out.push(renderPrMarker(it)); i++; continue; }
-      if (it.kind === "away") { out.push(renderAwayCard(it)); i++; continue; }
+      if (it.kind === "msg") { push("msg", it, () => renderMsg(it)); i++; continue; }
+      if (it.kind === "thinking") {
+        if (verbosity.show.thinking) { push("th", it, () => renderThought(it)); i++; continue; }
+        // Hidden by verbosity: fold this whole run into one counted marker.
+        let j = i;
+        while (j < items.length && items[j].kind === "thinking") j++;
+        const run = items.slice(i, j);
+        push("thf", run, () => renderFoldedThoughts(run));
+        i = j;
+        continue;
+      }
+      if (it.kind === "command") { push("cmd", it, () => renderCommandCard(it)); i++; continue; }
+      if (it.kind === "compact") { push("cmp", it, () => renderCompactCard(it)); i++; continue; }
+      if (it.kind === "interrupt") { push("int", it, () => renderInterrupt(it)); i++; continue; }
+      if (it.kind === "compact_boundary") { push("cb", it, () => renderCompactBoundary(it)); i++; continue; }
+      if (it.kind === "pr") { push("pr", it, () => renderPrMarker(it)); i++; continue; }
+      if (it.kind === "away") { push("away", it, () => renderAwayCard(it)); i++; continue; }
       // action run
       let j = i;
       while (j < items.length && items[j].kind === "action") j++;
@@ -1598,9 +1783,14 @@
       // DELIVERY (a card carrying rendered files) is user-facing content, not a
       // tool detail, so it renders in every verbosity (XERK-221). Otherwise show
       // each action as its own card.
-      out.push(run.map((a, idx) =>
-        (verbosity.show.tools || (a.files && a.files.length))
-          ? renderActionCard(a, actionKey(a, gk, idx)) : "").join(""));
+      run.forEach((a, idx) => {
+        const akey = actionKey(a, gk, idx);
+        // The group key is part of the memo key: it decides the data-dkey of a
+        // card with no id of its own, so two runs holding equal items are not
+        // the same rendered unit.
+        push("act", [akey, a], () =>
+          (verbosity.show.tools || (a.files && a.files.length)) ? renderActionCard(a, akey) : "");
+      });
       i = j;
     }
     return out.join("");
@@ -1615,22 +1805,97 @@
   // anchored to — so a live session (a `turn` frame lands ~1s while the agent
   // works) would wipe the selection out from under a reader trying to copy.
   // Deferring the paint while a selection is live is what makes copy reliable.
-  function selectionInScroll() {
-    const scroll = $("chatScroll");
-    if (!scroll || typeof window === "undefined" || !window.getSelection) return false;
+  function selectionIn(el) {
+    if (!el || typeof window === "undefined" || !window.getSelection) return false;
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
     for (let i = 0; i < sel.rangeCount; i++) {
       const r = sel.getRangeAt(i);
-      if (!r.collapsed && scroll.contains(r.commonAncestorContainer)) return true;
+      if (!r.collapsed && el.contains(r.commonAncestorContainer)) return true;
     }
     return false;
+  }
+  function selectionInScroll() { return selectionIn($("chatScroll")); }
+
+  // Everything below the settled transcript: the in-progress turn and the
+  // prompts still queued behind it. Split out of the body because it changes
+  // every second while the body does not.
+  function liveRegionHtml() {
+    let html = "";
+    // The in-progress assistant turn (text-only) as the trailing bubble, shown
+    // in full the moment it arrives (XERK-251 - it used to type in). liveTurn is
+    // already classified by applyTurn (block swaps / tool bullets / shorter
+    // re-captures handled there, see XERK-19), so what lands here is the block
+    // the pane is actually generating.
+    if (liveTurn) {
+      // renderInline, NOT renderProse: parsePaneLiveTurn (tunnel-agent.js)
+      // deliberately reflows the pane's hard-wrapped lines into ONE flowed line,
+      // so this text has no line structure for a block pass to read - a `##`
+      // would land mid-line. Inline code, links and emphasis are meaningful and
+      // this is the surface the operator watches while the agent works.
+      html += '<div class="tr-msg assistant streaming" id="chatLiveBubble"><span class="role">assistant</span>' +
+        renderInline(liveTurn) + "</div>";
+    }
+    // Still-queued prompts (typed mid-turn) trail the live turn, where they'll
+    // actually run - the TUI shows the same list under its input box. Each is a
+    // dimmed user bubble labelled "queued"; the list is replaced wholesale by
+    // every tail frame, so a consumed prompt swaps for its real user turn.
+    for (const q of queuedPrompts) {
+      html += '<div class="tr-msg user queued"><span class="role">queued</span>' + esc(q) + "</div>";
+    }
+    return html;
+  }
+
+  function resetPaintMemo() {
+    lastBodyHtml = null;
+    lastLiveHtml = null;
+    repaintDeferred = false;
+    itemHtmlCache = new Map();
+    if (repaintRaf) { cancelRepaintFrame(repaintRaf); repaintRaf = 0; }
+    repaintForced = false;
+    setPausedPill(false);
+  }
+
+  function cancelRepaintFrame(h) {
+    if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(h);
+    else clearTimeout(h);
+  }
+
+  // Coalesce the frames that arrive together. A working session delivers a
+  // `tail` and a `turn` within milliseconds of each other every second, and each
+  // used to drive its OWN full rebuild - two complete re-renders of the whole
+  // buffer per second. Schedule one paint per animation frame instead; a forced
+  // paint (a session switch) still runs synchronously, because the caller has
+  // just re-pointed the whole view and must not show the outgoing one.
+  function scheduleRepaint(force) {
+    if (force) {
+      if (repaintRaf) { cancelRepaintFrame(repaintRaf); repaintRaf = 0; }
+      repaintForced = false;
+      repaint(true);
+      return;
+    }
+    if (repaintRaf) return;
+    const run = () => { repaintRaf = 0; repaint(repaintForced); repaintForced = false; };
+    repaintRaf = (typeof requestAnimationFrame === "function")
+      ? requestAnimationFrame(run)
+      : setTimeout(run, 16);
+  }
+
+  // The "paint paused" pill. A held paint used to be completely silent: a stray
+  // double-click or a selection left parked deferred every update indefinitely,
+  // and the chat simply stopped moving with nothing to say why. Now the body
+  // paint is only held when the selection is in the BODY (the live turn and the
+  // status bar keep moving regardless), and when it IS held the reader is told,
+  // with a click that clears the selection and flushes.
+  function setPausedPill(on) {
+    const el = $("chatPaused");
+    if (el) el.hidden = !on;
   }
 
   // `force` bypasses the mid-selection deferral below. It is set ONLY by the
   // seed paint in open() (XERK-604): the selection-defer exists so a live `turn`
   // frame can't nuke a reader's copy selection, but a session SWITCH is a
-  // deliberate teardown of the whole view — a stale selection anchored in the
+  // deliberate teardown of the whole view - a stale selection anchored in the
   // OUTGOING transcript must not hold back the incoming session's first paint.
   // Without this, the header (setHeader) updated while the chat stayed frozen on
   // the previous session, and every further switch re-deferred against the same
@@ -1640,50 +1905,74 @@
     if (!scroll) return;
     const pin = stickBottom;
     const prevTop = scroll.scrollTop;
+
     const items = buildItems(buffer);
-    let html = itemsToHtml(items);
-    if (!html && !liveTurn && !queuedPrompts.length) html = '<div class="chat-empty">No messages yet. Say something below to get the agent going.</div>';
-    // The in-progress assistant turn (text-only) as the trailing bubble, shown
-    // in full the moment it arrives (XERK-251 — it used to type in). liveTurn is
-    // already classified by applyTurn (block swaps / tool bullets / shorter
-    // re-captures handled there, see XERK-19), so what lands here is the block
-    // the pane is actually generating.
-    if (liveTurn) {
-      // renderInline, NOT renderProse: parsePaneLiveTurn (tunnel-agent.js)
-      // deliberately reflows the pane's hard-wrapped lines into ONE flowed line,
-      // so this text has no line structure for a block pass to read — a `##`
-      // would land mid-line. Inline code, links and emphasis are meaningful and
-      // this is the surface the operator watches while the agent works.
-      html += '<div class="tr-msg assistant streaming" id="chatLiveBubble"><span class="role">assistant</span>' +
-        renderInline(liveTurn) + "</div>";
+    const nextCache = new Map();
+    let bodyHtml = itemsToHtml(items, itemHtmlCache, nextCache);
+    itemHtmlCache = nextCache;
+    const liveHtml = liveRegionHtml();
+    if (!bodyHtml && !liveHtml) {
+      bodyHtml = '<div class="chat-empty">No messages yet. Say something below to get the agent going.</div>';
     }
-    // Still-queued prompts (typed mid-turn) trail the live turn, where they'll
-    // actually run — the TUI shows the same list under its input box. Each is a
-    // dimmed user bubble labelled "queued"; the list is replaced wholesale by
-    // every tail frame, so a consumed prompt swaps for its real user turn.
-    for (const q of queuedPrompts) {
-      html += '<div class="tr-msg user queued"><span class="role">queued</span>' + esc(q) + "</div>";
-    }
+
+    const bodyChanged = bodyHtml !== lastBodyHtml;
+    const liveChanged = liveHtml !== lastLiveHtml;
     // Most repaints are no-ops: the /history poll and the ~1s `turn` frame fire
     // whether or not anything changed, and re-writing identical HTML still
     // destroys the selection (and the reader's place). Compare first and touch
     // the DOM only on a real change.
-    if (html === lastHtml) {
+    if (!bodyChanged && !liveChanged) {
       updateJump();
       updateLiveStatus();
       return;
     }
-    // Something DID change, but the reader is mid-selection — hold the paint and
-    // flush it once the selection clears (selectionchange, below). A forced paint
-    // (a session switch) never holds: see repaint()'s header.
-    if (!force && selectionInScroll()) {
+
+    const liveRegion = $("chatLiveRegion");
+    // Patch ONLY the live region when only the live region changed, and only
+    // when the DOM is the one we last wrote (`liveRegion` present and the body
+    // untouched). This is the whole point of the split: a `turn` frame no longer
+    // rewrites the settled transcript, so its data: images and sandboxed
+    // <iframe srcdoc> previews are no longer destroyed and re-created - with
+    // every image re-decoded and every preview re-instantiated - once a second.
+    if (!bodyChanged && liveRegion) {
+      if (!force && selectionIn(liveRegion)) {
+        // A selection inside the live turn itself: hold, exactly as before. The
+        // body is untouched either way, so nothing else is frozen by it.
+        repaintDeferred = true;
+        updateLiveStatus();
+        return;
+      }
+      liveRegion.innerHTML = liveHtml;
+      lastLiveHtml = liveHtml;
+      if (pin) scroll.scrollTop = scroll.scrollHeight;
+      updateJump();
+      updateLiveStatus();
+      return;
+    }
+
+    // Something in the BODY changed. Hold it only if the reader is selecting
+    // inside the body - a selection parked in the live region must not freeze
+    // the transcript, and vice versa. A forced paint (a session switch) never
+    // holds: see repaint()'s header.
+    // Before the first full paint there is no #chatBody yet; fall back to the
+    // whole scroll so a missing wrapper can never silently drop the selection
+    // protection altogether.
+    const holdEl = $("chatBody") || scroll;
+    if (!force && selectionIn(holdEl)) {
       repaintDeferred = true;
+      setPausedPill(true);
       updateLiveStatus();
       return;
     }
     repaintDeferred = false;
-    scroll.innerHTML = html;
-    lastHtml = html;
+    setPausedPill(false);
+    // `display: contents` on both wrappers keeps them out of layout entirely, so
+    // the bubbles stay direct flex children of the scroll and every align-self
+    // (user right, agent left) still resolves against it.
+    scroll.innerHTML = '<div id="chatBody" style="display:contents">' + bodyHtml + "</div>" +
+      '<div id="chatLiveRegion" style="display:contents">' + liveHtml + "</div>";
+    lastBodyHtml = bodyHtml;
+    lastLiveHtml = liveHtml;
     // Stay pinned to the bottom while following along; otherwise hold the
     // reader's place (innerHTML replacement resets scrollTop to 0, and new
     // entries only append below, so the prior offset still points at the same
@@ -1691,6 +1980,18 @@
     scroll.scrollTop = pin ? scroll.scrollHeight : prevTop;
     updateJump();
     updateLiveStatus();
+  }
+
+  // Clear whatever selection is holding the paint and flush it. Bound to the
+  // paused pill, so the reader always has a way out that does not require them
+  // to guess that a stray selection is the cause.
+  function resumePaint() {
+    try {
+      const sel = typeof window !== "undefined" && window.getSelection ? window.getSelection() : null;
+      if (sel && sel.removeAllRanges) sel.removeAllRanges();
+    } catch (_) {}
+    setPausedPill(false);
+    repaint();
   }
 
   // The floating "jump to latest" pill hovering just above the compose box: shown
@@ -1987,7 +2288,7 @@
     host.querySelectorAll(".seg button").forEach((b) => b.addEventListener("click", () => {
       const name = b.getAttribute("data-preset");
       verbosity = { preset: name, show: { ...PRESETS[name] } };
-      detailsOpen.clear(); // a new preset resets card open/closed to its defaults
+      clearDetails(); // a new preset resets card open/closed to its defaults
       onPick();
     }));
   }
@@ -3047,14 +3348,18 @@
     // card's user-chosen open/closed state (survives the next repaint).
     scroll.addEventListener("toggle", (e) => {
       const d = e.target;
-      if (d && d.tagName === "DETAILS" && d.dataset && d.dataset.dkey) detailsOpen.set(d.dataset.dkey, d.open);
+      if (d && d.tagName === "DETAILS" && d.dataset && d.dataset.dkey) noteDetails(d.dataset.dkey, d.open);
     }, true);
     // Flush a paint that was held back while the reader had text selected, as
     // soon as that selection collapses (a click anywhere) or moves out of the
     // transcript. selectionchange is on the document, not the scroll, because a
     // selection can be cleared from outside it.
     document.addEventListener("selectionchange", () => {
-      if (repaintDeferred && !selectionInScroll()) repaint();
+      // A held paint flushes the moment the selection that held it clears. The
+      // check is against the whole scroll, not the held region: either region's
+      // hold is released by the selection going away.
+      if (repaintDeferred && !selectionInScroll()) { repaintDeferred = false; repaint(); }
+      else if (!repaintDeferred) setPausedPill(false);
     });
   }
 
@@ -3111,7 +3416,7 @@
     stVerbHost = opts.verbHost || null;
     stTranscriptId = opts.transcriptId || null;
     stEntries = Array.isArray(opts.entries) ? opts.entries : [];
-    detailsOpen.clear();
+    clearDetails();
     loadStaticVerbosity(stTranscriptId);
     renderStaticVerbosity();
     repaintStatic();
@@ -3132,7 +3437,7 @@
     // verbosity re-render doesn't snap the reader's opened cards shut.
     stScroll.addEventListener("toggle", (e) => {
       const d = e.target;
-      if (d && d.tagName === "DETAILS" && d.dataset && d.dataset.dkey) detailsOpen.set(d.dataset.dkey, d.open);
+      if (d && d.tagName === "DETAILS" && d.dataset && d.dataset.dkey) noteDetails(d.dataset.dkey, d.open);
     }, true);
   }
 
@@ -3163,9 +3468,9 @@
     backoffIdx = 0;
     stopPendingAt = 0; actionFailUntil = 0; // the compose button starts at Send
     modelSwitchPending = null; modeSwitchPending = null;
-    lastHtml = null; repaintDeferred = false; // this session's paint memo starts empty
+    resetPaintMemo(); // this session's paint memo starts empty
     stickBottom = true; // land at the tail on open, past the seed→history race
-    detailsOpen.clear();
+    clearDetails();
     loadVerbosity(id);
     setHeader(s, a);
     renderVerbosityControl();
@@ -3194,7 +3499,7 @@
     questionActive = false; answeredQuestion = null;
     panePromptActive = false; answeredPanePrompt = null;
     stopPendingAt = 0; actionFailUntil = 0; modelSwitchPending = null; modeSwitchPending = null;
-    lastHtml = null; repaintDeferred = false;
+    resetPaintMemo();
     clearAttachments();
     updateLiveStatus(); // hide the pinned bar when the view closes
   }
@@ -3240,6 +3545,9 @@
     window.chatComposeAction = function () { send(); };
     window.chatComposeStop = function () { stop(); };
     window.chatJumpBottom = jumpToBottom;
+    // Clears whatever selection is holding a paint and flushes it (the paused
+    // pill), so a reader who parked a selection always has a way out.
+    window.chatResumePaint = resumePaint;
     // File attachments (XERK-234): the composer's 📎, the picker's change, and
     // a paste that carries files.
     window.chatComposeAttach = openFilePicker;
@@ -3254,6 +3562,7 @@
       mergeTail, foldHistory, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, hasBackgroundAgents, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll,
+      scheduleRepaint, resumePaint, renderEditDiff, renderFoldedThoughts,
       isBusy, updateComposeAction, updateLiveStatus, isToolBullet, sendFailure, isTooLong, TOO_LONG,
       loadHistory, reconnectNow, startWs,
       __setSessionRef: (hk, id) => { hostKey = hk; sessionId = id; },
@@ -3297,7 +3606,7 @@
       __setBuffer: (b) => { buffer = b; },
       __setQueued: (q) => { queuedPrompts = q; },
       __setLiveTurn: (t) => { liveTurn = t; },
-      __resetPaint: () => { lastHtml = null; repaintDeferred = false; },
+      __resetPaint: () => { resetPaintMemo(); },
       __liveTurn: () => liveTurn,
     };
   }
