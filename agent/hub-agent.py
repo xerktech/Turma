@@ -3396,6 +3396,19 @@ PEER_CELL_MAX_CHARS = 120
 DSH_PEER_TRAFFIC_MAX = 200
 DSH_PEER_DELIVER_BATCH = 20
 
+# Operator `input` delivery runs OFF THE BEAT (XERK-867), the dsh/qwen peer-worker
+# pattern. handle_commands runs on the heartbeat loop, and on a Windows host a
+# multi-line paste's settle+retry loop in _pty_inject is a chain of ~5s-class
+# control-channel RPCs whose worst case eats most of the XERK-395 beat budget;
+# with no per-cycle cap on handle_commands, N queued inputs scale linearly past
+# OFFLINE_AFTER_MS and flap a healthy host offline. So the command only ENQUEUES
+# here and _input_worker_loop delivers. QUEUE_MAX caps the backlog (drops OLDEST
+# with a log — an operator message is precious, but an unbounded queue behind a
+# wedged worker is worse, and this depth is only reached if the worker is stuck);
+# DELIVER_BATCH caps one drain pass's footprint (the loop empties the queue).
+INPUT_QUEUE_MAX = _env_int("INPUT_QUEUE_MAX", 500, minimum=1)
+INPUT_DELIVER_BATCH = _env_int("INPUT_DELIVER_BATCH", 20, minimum=1)
+
 
 # qwen cross-session peer messaging (XERK-518 [Qwen L]). Unlike dsh there is no
 # push-based reader thread — a qwen session's send_message MCP tool and its
@@ -9832,6 +9845,15 @@ PTY_NODE_EXE = os.environ.get("TURMA_NODE_EXE", "node")
 # on the fast path.
 PTY_SUBMIT_SETTLE_SEC = _env_float("PTY_SUBMIT_SETTLE_SEC", 0.4, minimum=0.0)
 PTY_SUBMIT_MAX_RETRIES = _env_int("PTY_SUBMIT_MAX_RETRIES", 3, minimum=0)
+# A WALL-CLOCK cap on the whole submit-retry loop (XERK-867), so its cost is bounded
+# by TIME rather than by RETRIES x an unbounded-ish control-timeout: on a degraded
+# host each retry's capture + Enter can each take a full PTY control timeout, so the
+# iteration-count bound alone let one multi-line paste run ~15-30s. Delivery now runs
+# off the beat (the input worker), so this no longer threatens OFFLINE_AFTER_MS; the
+# deadline keeps one wedged paste from tying up the worker on pointless retries. A
+# single in-flight RPC can still overshoot it by one control timeout — the known
+# limit of a deadline (CLAUDE.md), acceptable off the beat.
+PTY_SUBMIT_DEADLINE_SEC = _env_float("PTY_SUBMIT_DEADLINE_SEC", 3.0, minimum=0.0)
 # The composer chip a not-yet-submitted multi-line paste shows. Version-coupled to
 # Claude Code's TUI like the busy markers and the trust-dialog regex; it only
 # gates the retry SAFETY NET — the settle above is the marker-independent fix.
@@ -10202,8 +10224,14 @@ def _pty_inject(tmux_name, text):
     _pty_control(tmux_name, "inject", data="\r")   # submit with Enter
     # Safety net: while a not-yet-submitted paste chip is still on screen and no
     # turn has started, Enter again. Never fires for a single-line paste (no
-    # chip). Bounded by PTY_SUBMIT_MAX_RETRIES.
+    # chip). Bounded by PTY_SUBMIT_MAX_RETRIES *and* a wall-clock deadline
+    # (PTY_SUBMIT_DEADLINE_SEC, XERK-867) — the iteration count alone multiplied a
+    # ~5s-class control timeout, so on a degraded host the loop could run far
+    # longer than the retry count suggests.
+    deadline = time.monotonic() + PTY_SUBMIT_DEADLINE_SEC
     for _ in range(PTY_SUBMIT_MAX_RETRIES if multiline else 0):
+        if time.monotonic() >= deadline:
+            break
         cap = _capture_pane(tmux_name) or ""
         if PTY_PASTE_CHIP_MARK not in cap or _busy_from_capture(cap):
             break
@@ -15370,6 +15398,20 @@ class SessionManager:
         self._dsh_peer_lock = threading.Lock()
         self._dsh_peer_wake = threading.Event()
         self._dsh_peer_worker = None
+        # Operator `input` delivery is staged here and run OFF THE BEAT (XERK-867):
+        # the worker does the network/pane work (uploads fetch, trust-clear, the
+        # Windows multi-line settle+retry paste) and stages the outbox record onto
+        # `input_landed` for the BEAT to apply, so the append to pendingInputs, the
+        # naming and save() stay the beat's (the prune/dsh-peer worker discipline).
+        # The worker's only in-memory registry touch is _clear_trust_dialog popping
+        # `trustCheckUntil` — a benign key removal that never save()s (save()'s C
+        # json.dump holds the GIL over these JSON-native records, so a concurrent
+        # pop cannot tear it); do NOT grow the worker to write records or save().
+        self.input_queue = []                    # [(sid, text, uploads)] to deliver
+        self.input_landed = []                   # [(sid, typed, text)] to record on the beat
+        self._input_lock = threading.Lock()
+        self._input_wake = threading.Event()
+        self._input_worker = None
         self.usage_cache = {}                    # id -> usage_report result
         self.slug_usage = {}                     # project slug -> {acc, offsets}
                                                  # persistent incremental usage fold,
@@ -21658,12 +21700,23 @@ class SessionManager:
         if swept:
             log(f"cc-socks: swept {swept} dead inbox socket(s), left {held} live")
 
-    def send_input(self, sid, text, uploads=None):
+    def send_input(self, sid, text, uploads=None, defer_record=False):
         """Type free-text into a running session's Claude TUI and submit it.
         This is the OPERATOR's path (the chat composer's Send, the glasses
         actions menu) plus notify_session's fallback for a session with no
         inbox; AskUserQuestion answers no longer ride it — they go through
         answer_question below. See _type_into_pane for how the text lands.
+
+        `defer_record` is set by the off-beat input worker (XERK-867): it does
+        the same delivery, but instead of recording the outbox entry + naming the
+        session + save()ing INLINE, it stages the record onto `input_landed` for
+        the BEAT to apply (`_apply_landed_inputs`) — so the worker RECORDS nothing
+        (no pendingInputs write, no naming/self.summaries touch, no save()), the
+        same "only the beat writes+saves the registry" discipline prune/archive/
+        dsh-peer keep. (Its one in-memory registry touch is _clear_trust_dialog
+        clearing `trustCheckUntil`, a benign key pop that never save()s.) Direct
+        callers (notify_session's fallback, tests) leave it False and are already
+        on the beat, so they record inline as before.
 
         Machine-generated messages go to notify_session instead (XERK-340): the
         pane is what a person types into, and what this manager composes has a
@@ -21718,25 +21771,39 @@ class SessionManager:
                 f"INPUT_MAX_CHARS ({INPUT_MAX_CHARS}); sending nothing rather "
                 f"than a truncated message")
             return
-        # Name a still-unnamed session (bare/quick spawn or repos-root, where the
-        # spawn-time summary was a no-op for lack of an initial prompt) from its
-        # first typed prompt — this message is our next chance. Deliberately the
-        # FIRST attempt only: this is a fast path that saves waiting a beat for
-        # _seed_summaries, and later attempts belong there, where the transcript
-        # still names the session from its first prompt rather than from whatever
-        # turn happens to be typed when a retry comes due.
-        if (typed.strip() and not sess.get("summary")
-                and _summary_attempts(sess) == 0 and sid not in self.summaries):
-            self._start_summary(sess, typed)
         # A session still sitting at Claude Code's trust modal has no composer:
         # this text would be swallowed and its Enter would confirm the modal's
         # 'No, exit' default, ending the session (XERK-868). Clear it first,
-        # bounded — this runs on the beat, and only in that rare state.
+        # bounded — and only in that rare state.
         if not self._clear_trust_dialog(sess, wait=2.0):
             log(f"input for session {sid} held: Claude Code is still asking "
                 f"whether to trust this workspace — answer that first")
             return
         _type_into_pane(sess["tmuxName"], text)
+        if defer_record:
+            # Off the beat: hand the outbox record + naming to the beat, which is
+            # the only thread that may mutate the registry / self.summaries / save.
+            with self._input_lock:
+                self.input_landed.append((sid, typed, text))
+            return
+        self._record_delivered_input(sess, typed, text)
+
+    def _record_delivered_input(self, sess, typed, text):
+        """Record a pane-delivered operator message on its session's outbox and
+        name a still-unnamed session from it. **Runs on the BEAT** — either inline
+        for a beat-side caller, or from `_apply_landed_inputs` draining what the
+        off-beat input worker staged (XERK-867) — so the registry mutation, the
+        self.summaries touch and save() stay single-threaded.
+
+        Naming (bare/quick spawn or repos-root, where the spawn-time summary was a
+        no-op for lack of an initial prompt) fires on the FIRST typed prompt only:
+        a fast path that saves waiting a beat for _seed_summaries, where later
+        attempts belong (the transcript still names from the first prompt rather
+        than whatever turn is typed when a retry comes due)."""
+        sid = sess["id"]
+        if (typed.strip() and not sess.get("summary")
+                and _summary_attempts(sess) == 0 and sid not in self.summaries):
+            self._start_summary(sess, typed)
         # Record it on the session's outbox so _poll_pending_inputs can confirm it
         # landed and re-send it if a compaction drops it (XERK-47). `attempts:1`
         # counts this first type; a resend needs a fresh compaction to fire again.
@@ -21744,6 +21811,88 @@ class SessionManager:
         pend.append({"text": text, "at": time.time(), "attempts": 1})
         del pend[:-PENDING_INPUT_MAX]
         self.save()
+
+    def _stage_input(self, sid, text, uploads=None):
+        """Queue an operator `input` command for OFF-BEAT delivery (XERK-867).
+        handle_commands runs on the beat loop and a Windows multi-line paste's
+        settle+retry loop is a chain of ~5s-class control-channel RPCs whose worst
+        case would eat the XERK-395 beat budget, so the command only enqueues here;
+        `_input_worker_loop` delivers and `_apply_landed_inputs` records."""
+        if not sid:
+            return
+        with self._input_lock:
+            self.input_queue.append((sid, text, uploads))
+            over = len(self.input_queue) - INPUT_QUEUE_MAX
+            if over > 0:
+                # Only reachable behind a wedged worker; drop the OLDEST (matching
+                # the dsh-peer queue), loudly — a lost operator message is bad, an
+                # unbounded queue is worse.
+                del self.input_queue[:over]
+                log(f"input queue past {INPUT_QUEUE_MAX}; dropped {over} oldest "
+                    f"undelivered message(s)")
+        self._input_wake.set()
+
+    def _start_input_worker(self):
+        """Start the input-delivery worker once (from run_forever). Idempotent and
+        restart-safe: a relaunched loop that finds a live worker is a no-op."""
+        with self._input_lock:
+            w = self._input_worker
+            if w is not None and w.is_alive():
+                return
+            self._input_worker = threading.Thread(
+                target=self._input_worker_loop, name="input-deliver", daemon=True)
+            self._input_worker.start()
+
+    def _input_worker_loop(self):
+        """Deliver staged operator inputs off the beat (XERK-867). Waits on the
+        wake event, then drains the queue to empty in INPUT_DELIVER_BATCH passes.
+        Never raises — a dead worker would silently stop operator input."""
+        while True:
+            self._input_wake.wait()
+            self._input_wake.clear()
+            try:
+                while True:
+                    with self._input_lock:
+                        if not self.input_queue:
+                            break
+                    self._deliver_staged_inputs()
+            except Exception as e:
+                log(f"input worker error: {type(e).__name__}: {e}")
+
+    def _deliver_staged_inputs(self):
+        """Deliver one batch of staged operator inputs. Runs on the input WORKER
+        thread (or directly in tests). Pops under the lock, then delivers OUTSIDE
+        it (a per-item try/except keeps one wedged session from starving the rest,
+        and no exception escapes). Delivery stages the outbox record onto
+        `input_landed` (`defer_record`) for the beat to apply."""
+        with self._input_lock:
+            if not self.input_queue:
+                return
+            batch = self.input_queue[:INPUT_DELIVER_BATCH]
+            del self.input_queue[:INPUT_DELIVER_BATCH]
+        for sid, text, uploads in batch:
+            try:
+                self.send_input(sid, text, uploads=uploads, defer_record=True)
+            except Exception as e:
+                log(f"input delivery failed for session {sid}: "
+                    f"{type(e).__name__}: {e}")
+
+    def _apply_landed_inputs(self):
+        """Apply the outbox records the input worker staged (XERK-867). Runs on the
+        BEAT so pendingInputs / self.summaries / save() stay single-threaded, the
+        way prune's worker stages `_prune_swept` and the beat applies it."""
+        with self._input_lock:
+            if not self.input_landed:
+                return
+            landed = self.input_landed
+            self.input_landed = []
+        for sid, typed, text in landed:
+            sess = self._find(sid)
+            if sess is None or sess.get("status") != "running":
+                # Killed/ended between delivery and this beat: the pane record
+                # would be meaningless (the message did land in the live pane).
+                continue
+            self._record_delivered_input(sess, typed, text)
 
     def notify_session(self, sid, text):
         """Deliver a MACHINE-generated message to a running session (XERK-340):
@@ -28142,8 +28291,13 @@ class SessionManager:
                 elif ctype == "delete":
                     self.delete(cmd.get("sessionId"))
                 elif ctype == "input":
-                    self.send_input(cmd.get("sessionId"), cmd.get("text") or "",
-                                    uploads=cmd.get("uploads"))
+                    # OFF the beat (XERK-867): only ENQUEUE here — delivery is a
+                    # chain of ~5s-class pane RPCs (the Windows multi-line paste's
+                    # settle+retry loop worst) that would blow the XERK-395 budget
+                    # inline. _input_worker_loop delivers; _apply_landed_inputs
+                    # records the outbox on the beat.
+                    self._stage_input(cmd.get("sessionId"), cmd.get("text") or "",
+                                      uploads=cmd.get("uploads"))
                 elif ctype == "interrupt":
                     self.interrupt(cmd.get("sessionId"))
                 elif ctype == "setSummary":
@@ -29230,6 +29384,9 @@ class SessionManager:
         # wrote and, once valid, materialize the epic on a worker thread. Guarded
         # so it never raises onto the beat; the Jira writes are off-beat.
         self._advance_epic_builders()
+        # Apply the outbox records the off-beat input worker staged (XERK-867):
+        # the worker did the pane delivery, the beat owns the registry mutation.
+        self._apply_landed_inputs()
         # Confirm recently-sent messages landed, and re-send any a compaction
         # dropped (XERK-47). Cheap on a settled fleet — it short-circuits on any
         # session with an empty outbox.
@@ -29943,6 +30100,12 @@ class SessionManager:
         # by an already-running worker; the queue is in-memory, so it parks on an
         # empty queue at boot until a session stages something.
         self._start_dsh_peer_worker()
+        # The operator-input delivery worker (XERK-867): delivers staged `input`
+        # commands off the beat (see _input_worker_loop) so a Windows multi-line
+        # paste's ~5s-class control-channel RPCs can't blow the XERK-395 beat
+        # budget and flap a healthy host offline. Started once here; the queue is
+        # in-memory and parks empty until a command stages something.
+        self._start_input_worker()
         # The qwen peer-message poll/delivery worker (XERK-518 [Qwen L]): unlike
         # dsh's push model, this worker POLLS each live qwen session's rendezvous
         # dir on a timer (_qwen_peer_worker_loop) — started unconditionally, like

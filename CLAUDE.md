@@ -227,8 +227,14 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     which is the beat's to own — so the network half moved off, the registry half stayed on. The
     synchronous `_poll_pr_comments` (fetch-then-deliver) is kept only as the behavioural-test entry
     point. One beat stale, accepted.
+  - **The operator `input` command is a STAGE/DELIVER/RECORD split too** (XERK-867): `handle_commands`
+    only `_stage_input`s it; `_input_worker_loop` delivers (uploads fetch, trust-clear, the Windows
+    multi-line settle+retry paste — all ~5s-class pane RPCs); the BEAT records the `pendingInputs`
+    outbox via `_apply_landed_inputs` (the "only the beat writes+saves the registry" line the
+    PR-comment split draws too — the worker's one touch is a benign `trustCheckUntil` pop). Delivery
+    was inline and its Windows worst case ate the budget. Mechanics: `.claude/rules/agent-input.md`.
   - Tests: `TestBeatLoopBudget`, `TestSlowRefreshWorker`, `TestPrCommentFetchWorker`,
-    `TestArchiveSyncWorker`.
+    `TestArchiveSyncWorker`, `TestOffBeatInputDelivery`.
 - **`readyForReview` has FOUR mirrors that must agree**: `turma/public/sessions.html`,
   `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`. Changing the rule means
   changing all four.
