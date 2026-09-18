@@ -21001,9 +21001,114 @@ test("coerceTailFrame: a malformed entry or block cannot reach a viewer", () => 
   assert.deepStrictEqual(d.entries[0].blocks[0].files.map((f) => f.name), ["f"]);
   assert.ok(!("shed" in d.entries[0].blocks[0].files[0]), "a non-bool shed is dropped");
 
+  // edit.old/edit.new must be STRINGS: chat.js renderEditDiff splits them,
+  // guarded only by truthiness, so a truthy non-string throws inside the
+  // transcript repaint and kills the pane permanently. This survives every
+  // other rule here, so it is what closes the class rather than narrowing it.
+  for (const v of [5, true, {}, [], { a: 1 }, [null]]) {
+    const f = coerceTailFrame({ entries: [{ id: "e", blocks: [
+      { t: "tool_use", name: "Edit", edit: { old: v, new: v } }] }] });
+    const edit = f.entries[0].blocks[0].edit;
+    assert.ok(!("old" in edit) && !("new" in edit),
+      `a non-string edit leaf (${JSON.stringify(v)}) must never reach the renderer`);
+  }
+  // A real edit is untouched, and a non-object `edit` is dropped whole.
+  const keep = coerceTailFrame({ entries: [{ id: "e", blocks: [
+    { t: "tool_use", name: "Edit", edit: { old: "a\nb", new: "a\nc", replaceAll: true } }] }] });
+  assert.deepStrictEqual(keep.entries[0].blocks[0].edit,
+    { old: "a\nb", new: "a\nc", replaceAll: true }, "a legitimate edit is untouched");
+  assert.ok(!("edit" in coerceTailFrame({ entries: [{ id: "e", blocks: [
+    { t: "tool_use", name: "Edit", edit: 5 }] }] }).entries[0].blocks[0]),
+    "a non-object edit is dropped whole");
+
   // queued is a List<String> on the clients.
   const e = coerceTailFrame({ entries: [], queued: ["ok", 7, null, {}, ["x"]] });
   assert.deepStrictEqual(e.queued, ["ok", 7], "non-string/number queued entries are dropped");
   assert.deepStrictEqual(coerceTailFrame({ entries: [] }).queued, [], "absent queued -> []");
   assert.deepStrictEqual(coerceTailFrame({ entries: 5 }).entries, [], "a non-array entries -> []");
+});
+
+// Decode server->client text frames (unmasked) off a viewer socket.
+function collectLiveFrames(sock) {
+  const out = [];
+  let buf = Buffer.alloc(0);
+  sock.on("data", (c) => {
+    buf = Buffer.concat([buf, c]);
+    for (;;) {
+      if (buf.length < 2) return;
+      const op = buf[0] & 0x0f;
+      let len = buf[1] & 0x7f, off = 2;
+      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
+      else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
+      if (buf.length < off + len) return;
+      const payload = buf.subarray(off, off + len);
+      buf = buf.subarray(off + len);
+      if (op === 0x1) { try { out.push(JSON.parse(payload.toString("utf8"))); } catch {} }
+    }
+  });
+  return out;
+}
+
+// The WIRING, not the helper. Reverting the call site while leaving
+// coerceTailFrame defined and exported left the whole suite green and the chat
+// pane dead again -- a test that drives the exported pure function certifies a
+// coercer nobody calls. So this drives a real /agent/control frame and asserts
+// what a real /live SUBSCRIBER receives.
+test("live WS: a hostile agent tail frame reaches the viewer COERCED", async () => {
+  const host = "coerce-wire";
+  agents[host] = {
+    device: host, online: true, lastSeen: Date.now(),
+    sessions: [{ id: "cw1", status: "running", repo: "r", worktreePath: "/w",
+      transcriptId: "conv-cw1", session: { tail: [] } }],
+  };
+  const ctrl = await wsConnect(`/agent/control?name=${host}&token=agenttok`);
+  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+  const token = await issueToken();
+  const live = await wsConnect(`/live/${host}/cw1?auth=${token}`);
+  assert.match(live.statusLine, /^HTTP\/1\.1 101/);
+  const frames = collectLiveFrames(live.socket);
+
+  ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({
+    tail: "cw1",
+    entries: [null, "nope", { id: "h1", role: "assistant", text: "x", blocks: [null] },
+              { id: "h2", role: "assistant", text: "y", blocks: 5 }],
+    queued: ["ok", {}, ["x"]],
+  }))));
+  await waitFor(() => frames.some((f) => f.type === "tail" && f.entries.some((e) => e.id === "h1")), 2000);
+
+  const tail = frames.filter((f) => f.type === "tail").pop();
+  assert.deepStrictEqual(tail.entries.map((e) => e.id), ["h1", "h2"], "non-object entries dropped");
+  assert.deepStrictEqual(tail.entries[0].blocks, [], "a null block never reaches the viewer");
+  assert.deepStrictEqual(tail.entries[1].blocks, [], "a non-array blocks is rewritten, not forwarded");
+  assert.deepStrictEqual(tail.queued, ["ok"], "queued is a List<String> on the clients");
+
+  // The turn branch's status: chat.js SPLITS st.hint, so a non-string throws
+  // there and freezes the working bar with Stop still showing.
+  ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({
+    turn: "cw1", text: "t", status: { verb: "Bashing", hint: 5, elapsed: "3s" },
+  }))));
+  await waitFor(() => frames.some((f) => f.type === "turn"), 2000);
+  const turn = frames.filter((f) => f.type === "turn").pop();
+  assert.ok(!("hint" in turn.status), "a non-string hint never reaches the viewer");
+  assert.equal(turn.status.verb, "Bashing", "and the rest of the status survives");
+
+  live.socket.destroy();
+  ctrl.socket.destroy();
+  delete agents[host];
+});
+
+// /history is the SAME kill with no control socket at all -- one heartbeat.
+test("history: a malformed block is coerced at ingest, not served raw", async () => {
+  const host = "coerce-hist";
+  agents[host] = { device: host, online: true, lastSeen: Date.now(), history: {}, sessions: [] };
+  hub.ingestHistory(agents[host], [{
+    sessionId: "h1",
+    entries: [null, { id: "e1", role: "assistant", text: "x", blocks: [null] }],
+    queued: ["ok", 7, {}],
+  }]);
+  const h = agents[host].history.h1;
+  assert.deepStrictEqual(h.entries.map((e) => e.id), ["e1"]);
+  assert.deepStrictEqual(h.entries[0].blocks, [], "a null block must not reach GET .../history");
+  assert.deepStrictEqual(h.queued, ["ok", 7]);
+  delete agents[host];
 });
