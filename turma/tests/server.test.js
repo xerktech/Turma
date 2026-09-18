@@ -183,7 +183,8 @@ const {
   wsAccept, wsEncode, wsParser, WS_FRAME_MAX, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
-  termRetryReset, terminalFail, terminalReconnectPage,
+  termRetryReset, terminalFail, terminalReconnectPage, TERM_AGENT_IDLE_MS,
+  armChannelIdleTimeout,
   serializeAgentsForSave,
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, REFUSED_DETAIL_MAX,
   userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
@@ -17216,8 +17217,15 @@ test("term: a reset on a REUSED pooled ttyd channel is replayed once (termRetryR
   assert.equal(termRetryReset(0, true, false, "GET", hangup), true,
     "a bare 'socket hang up' with no code still retries");
 
+  // The budget is the free-socket POOL SIZE, not one: each reset evicts exactly
+  // ONE dead socket, and the pool parks four that the origin ages out together,
+  // so a single replay still 502'd on the common "two stale channels" case.
+  assert.equal(termRetryReset(1, true, false, "GET", reset), true);
+  assert.equal(termRetryReset(3, true, false, "GET", reset), true);
+
   // The cases that must NOT retry (each is a real failure or an unsafe replay):
-  assert.equal(termRetryReset(1, true, false, "GET", reset), false, "only the first attempt retries");
+  assert.equal(termRetryReset(4, true, false, "GET", reset), false,
+    "bounded: past the pool size a fresh dial has certainly been made, so it is a real failure");
   assert.equal(termRetryReset(0, false, false, "GET", reset), false,
     "a FRESH-socket reset is a real dial failure, not the keep-alive race");
   assert.equal(termRetryReset(0, true, true, "GET", reset), false,
@@ -17226,6 +17234,107 @@ test("term: a reset on a REUSED pooled ttyd channel is replayed once (termRetryR
     "a POST body has already been consumed — never blind-replay a mutation");
   assert.equal(termRetryReset(0, true, false, "GET", { code: "ETIMEDOUT", message: "timeout" }), false,
     "only a connection reset is the idle-closed-keep-alive signal");
+});
+
+test("term: the pooled-channel idle window stays BELOW the origin's keep-alive", () => {
+  // The two-sided keep-alive contract. The hub parks free tunnel channels in a
+  // keep-alive http.Agent and reuses one for the next terminal asset/token
+  // request; the ORIGIN (ttyd, or the Windows pty-host) decides how long it will
+  // hold that connection. If the origin closes first, the Agent still believes
+  // the socket is reusable and sends the request down a channel already FIN'd —
+  // ECONNRESET / "socket hang up" before the request ever reaches the terminal.
+  // The hub was at 60s against a pty-host running Node's 5_000ms default, so
+  // EVERY terminal open whose assets were more than ~5s apart raced it. Read the
+  // pty-host's number out of the agent source rather than restating it here — it
+  // is a cross-component contract. (On LINUX the origin is ttyd, measured closing
+  // an idle keep-alive after 5.0s with no flag to change it, so there the bounded
+  // replay above is the mitigation, not this window.)
+  const proto = path.join(__dirname, "..", "..", "agent", "win", "tty-protocol.mjs");
+  if (!fs.existsSync(proto)) return;   // agent not checked out beside the hub
+  const m = /KEEPALIVE_TIMEOUT_MS\s*=\s*([0-9_]+)/.exec(fs.readFileSync(proto, "utf8"));
+  assert.ok(m, "KEEPALIVE_TIMEOUT_MS moved or changed shape in tty-protocol.mjs");
+  const originMs = Number(m[1].replace(/_/g, ""));
+  assert.ok(TERM_AGENT_IDLE_MS < originMs,
+    `the hub's free-socket idle window (${TERM_AGENT_IDLE_MS}ms) must be shorter ` +
+    `than the origin's keep-alive (${originMs}ms), or it reuses closed sockets`);
+  // And with real margin, not by a millisecond: a request can be dispatched onto
+  // a socket the instant before the origin's timer fires.
+  assert.ok(originMs - TERM_AGENT_IDLE_MS >= 10000,
+    "leave at least 10s of margin between the two windows");
+});
+
+test("term: the idle window is REAL on a tunnel channel, not just a number", () => {
+  // The window above is worth nothing on its own. A tunnel channel is a Duplex,
+  // not a socket, and `channelDuplex` stubs `setTimeout` to a no-op — while Node's
+  // http.Agent applies its `timeout:` option ONLY by calling `socket.setTimeout`.
+  // So the option was inert and the two-sided contract described an eviction that
+  // never happened. `armChannelIdleTimeout` is what makes it fire; this test is
+  // what stops it being deleted as dead weight.
+  const { Duplex } = require("stream");
+  const mk = () => {
+    const d = new Duplex({ write(c, e, cb) { cb(); }, read() {} });
+    d.setTimeout = () => d;              // the channelDuplex no-op stub
+    return armChannelIdleTimeout(d);
+  };
+
+  // 1. It fires after the idle window with no traffic.
+  const fired = [];
+  const a = mk();
+  a.on("timeout", () => fired.push("a"));
+  a.setTimeout(20);
+  // 2. Traffic in EITHER direction rearms it — inbound bytes go through `push`
+  //    (never a 'data' listener, which would flip the duplex into flowing mode
+  //    and steal bytes from the HTTP parser), outbound through `write`.
+  const b = mk();
+  b.on("timeout", () => fired.push("b"));
+  b.setTimeout(20);
+  const busy = setInterval(() => { b.push(Buffer.from("x")); b.write("y"); }, 5);
+  // 3. setTimeout(0) — what the Agent calls when it takes a socket back OUT of
+  //    the free pool — disarms it, so an in-flight request is never killed.
+  const c = mk();
+  c.on("timeout", () => fired.push("c"));
+  c.setTimeout(20);
+  c.setTimeout(0);
+
+  // ...and it is actually WIRED UP. Testing the helper alone leaves the bug
+  // intact: drop it from createConnection and every assertion below still passes
+  // while TERM_AGENT_IDLE_MS goes back to evicting nothing, which is exactly the
+  // state this was found in.
+  const wiring = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  assert.ok(/openChannel\(name, port\)[\s\S]{0,120}?armChannelIdleTimeout\(channel\)/.test(wiring),
+    "termAgentFor's createConnection must arm the idle timer on every channel it " +
+    "pools, or the Agent's timeout option is inert on a tunnel duplex");
+
+  return new Promise((resolve) => setTimeout(() => {
+    clearInterval(busy);
+    assert.ok(fired.includes("a"), "an idle pooled channel must time out");
+    assert.ok(!fired.includes("b"), "a channel carrying bytes must NOT time out");
+    assert.ok(!fired.includes("c"), "setTimeout(0) must disarm (socket back in use)");
+    // The reader still works: wrapping `push` must not have eaten the bytes.
+    assert.equal(b.read().length > 0, true, "pushed bytes must still be readable");
+    resolve();
+  }, 60));
+});
+
+test("term: a replayed terminal request ADVANCES its attempt counter", () => {
+  // `termRetryReset`'s truth table is pinned above, but the call site passes the
+  // NEXT attempt number — `send(attempt + 1)`. Pass `send(1)` (or `send(attempt)`)
+  // and the budget never advances, so a permanently-resetting origin is replayed
+  // FOREVER: a pooled-socket hiccup becomes an infinite request loop against the
+  // agent, with the browser hanging instead of getting its 502. Drive the loop
+  // the call site actually runs.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  assert.ok(/termRetryReset\(attempt,[^)]*\)\)\s*return send\(attempt \+ 1\)/.test(src),
+    "proxyTerm must replay with send(attempt + 1) — a constant never exhausts the budget");
+  // And the budget terminates: replaying while termRetryReset says so must stop.
+  const reset = { code: "ECONNRESET", message: "socket hang up" };
+  let attempt = 0, sends = 0;
+  while (sends < 100) {
+    sends++;
+    if (!termRetryReset(attempt, true, false, "GET", reset)) break;
+    attempt += 1;
+  }
+  assert.equal(sends, 5, "1 original + at most TERM_RETRY_MAX(4) replays, then a 502");
 });
 
 test("term: terminalFail settles the proxy response exactly once (no double-end crash)", () => {

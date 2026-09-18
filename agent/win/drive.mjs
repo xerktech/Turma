@@ -10,8 +10,10 @@
 // Exit 0 iff every check passes.
 
 import { spawn } from 'node:child_process';
+import net from 'node:net';
 import { WebSocket } from 'ws';
-import { readFileSync, existsSync, unlinkSync, appendFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, unlinkSync, appendFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import process from 'node:process';
@@ -27,6 +29,12 @@ const EVIDENCE = join(HERE, 'drive-evidence.txt');
 function out(line) { process.stdout.write(line + '\n'); try { appendFileSync(EVIDENCE, line + '\n'); } catch {} }
 const SESSION = 'driveA';
 const TOKEN = 'drive-secret-token';
+// The manager-owned file the pty-host re-reads its auth token from per check, so
+// a hub token ROLL needs no relaunch (which here would kill the operator's
+// claude, the pty-host being both the terminal and the pty). Section [9] drives
+// the roll end to end.
+const TOKENFILE = join(HERE, 'pty-host.drive.token');
+const ROLLED_TOKEN = 'drive-rolled-token';
 // The pty child. node-pty binds forkpty on POSIX and ConPTY on Windows; the child
 // must be a shell that actually exists on the host (there is no `/bin/bash` on a
 // native Windows box), or ConPTY/CreateProcess fails at spawn and the whole drive
@@ -74,8 +82,8 @@ function termClient(port) {
 }
 
 // The JSON control client (the manager's tmux-CLI replacement).
-function ctrlClient(port) {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/?token=${encodeURIComponent(TOKEN)}`);
+function ctrlClient(port, token = TOKEN) {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}`);
   let seq = 0;
   const pending = new Map();
   const ready = new Promise((resolve, reject) => { ws.on('open', resolve); ws.on('error', reject); });
@@ -97,6 +105,7 @@ async function main() {
   try { writeFileSync(EVIDENCE, ''); } catch {}
   out(`node ${process.version} · ${process.platform}/${process.arch} · node-pty backend = ${process.platform === 'win32' ? 'ConPTY' : 'forkpty'}`);
   for (const f of [STATE, HOSTLOG]) if (existsSync(f)) unlinkSync(f);
+  writeFileSync(TOKENFILE, TOKEN);   // what the manager publishes at boot
 
   // --- 1. SPAWN via a THROWAWAY spawner that EXITS, proving the child outlives
   //        its spawner (the KillMode=process / manager-restart property) --------
@@ -110,6 +119,7 @@ async function main() {
     `const c=spawn(process.execPath,` +
     `${JSON.stringify([join(HERE, 'pty-host.mjs'),
       '--session', SESSION, '--base-path', BASE, '--state', STATE, '--auth-token', TOKEN,
+      '--auth-token-file', TOKENFILE,
       '--', CHILD_CMD])},` +
     `{detached:true,stdio:['ignore',fd,fd]});c.unref();process.exit(0);`;
   const spawner = spawn(process.execPath, ['-e', spawnerSrc], { stdio: 'ignore' });
@@ -120,6 +130,39 @@ async function main() {
   if (!st) return finish();
   check('pty-host pid is alive after its spawner exited', pidAlive(st.pid));
   check('ports bind loopback only (state has no external addr)', st.termPort > 0 && st.ctrlPort > 0);
+  // serializeState is a WHITELIST: a field the pty-host writes but it does not
+  // publish is silently dropped, and the manager reads the ABSENCE as fact. That
+  // exact omission turned the post-roll self-heal into "tear down every session",
+  // so assert on the file the real pty-host just WROTE, not on what it meant to.
+  check('published state carries authTokenFile (the manager reads it back)',
+    st.authTokenFile === TOKENFILE, `authTokenFile=${JSON.stringify(st.authTokenFile)}`);
+
+  // --- 1b. BIND FAILURE — no orphaned pty when a port is taken ----------------
+  // The pty child used to be spawned at module top, BEFORE either server bound,
+  // and neither server had an 'error' listener — so EADDRINUSE (a squatter, or a
+  // teardown that left the old port held) was an uncaught throw that killed the
+  // process with the child ALREADY RUNNING under the pty, leaking a process
+  // nothing could reach. Bind first, spawn second, and say why in the log.
+  out('\n[1b] BIND FAILURE — a taken port exits cleanly with a reason, no orphan');
+  const squatter = net.createServer(() => {});
+  await new Promise((r) => squatter.listen(0, '127.0.0.1', r));
+  const taken = squatter.address().port;
+  const failLog = join(HERE, 'pty-host.drive.bindfail.log');
+  if (existsSync(failLog)) unlinkSync(failLog);
+  const failState = join(HERE, 'pty-host.drive.bindfail.state.json');
+  if (existsSync(failState)) unlinkSync(failState);
+  const doomed = spawn(process.execPath, [
+    join(HERE, 'pty-host.mjs'), '--session', 'driveBind', '--base-path', '/term/driveBind',
+    '--state', failState, '--auth-token', TOKEN, '--term-port', String(taken),
+    '--', CHILD_CMD,
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let failErr = '';
+  doomed.stderr.on('data', (d) => { failErr += d.toString(); });
+  const failCode = await new Promise((r) => doomed.on('exit', r));
+  check('a taken terminal port exits NON-ZERO instead of throwing', failCode !== 0, `exit=${failCode}`);
+  check('the log says which server and why', /failed to bind/.test(failErr) && /EADDRINUSE/.test(failErr), failErr.trim().split('\n')[0]);
+  check('no state file was published for the failed launch', !existsSync(failState));
+  squatter.close();
 
   // --- 2. HTTP SURFACE — the ttyd client contract the hub proxies -------------
   out('\n[2] HTTP — ttyd client surface (302 / index / token / auth)');
@@ -189,8 +232,103 @@ async function main() {
   d.input('echo DRIVE_MARK_ADOPT\r');
   check('re-adopted terminal has live I/O', await waitFor(() => d.out, 'DRIVE_MARK_ADOPT'));
 
-  // --- 8. TEARDOWN ------------------------------------------------------------
-  out('\n[8] TEARDOWN — explicit kill stops the pty and the host exits');
+  // --- 8. KEEP-ALIVE ----------------------------------------------------------
+  // The hub pools tunnel channels in a keep-alive http.Agent and reuses a FREE
+  // one for the next asset/token request. Node's DEFAULT server keepAliveTimeout
+  // is 5_000ms, far below the hub's idle window, so the hub eventually sent a
+  // request down a socket already FIN'd — the browser's ECONNRESET / "socket
+  // hang up" on terminal open, which is why the class is new on Windows (ttyd's
+  // libwebsockets held connections far longer). Prove the origin outlasts it by
+  // reusing ONE socket across an idle gap longer than that default.
+  out('\n[8] KEEP-ALIVE — one socket survives an idle gap past Node\'s 5s default');
+  const req = (sock) => new Promise((res, rej) => {
+    let buf = '';
+    const onData = (d) => {
+      buf += d.toString('latin1');
+      const i = buf.indexOf('\r\n\r\n');
+      if (i < 0) return;
+      const m = /Content-Length:\s*(\d+)/i.exec(buf.slice(0, i));
+      const need = i + 4 + (m ? Number(m[1]) : 0);
+      if (buf.length < need) return;
+      sock.off('data', onData);
+      res(buf.slice(0, need));
+    };
+    sock.on('data', onData);
+    sock.once('error', rej);
+    sock.write(`GET ${BASE}/token HTTP/1.1\r\nHost: x\r\nAuthorization: ${CRED}\r\nConnection: keep-alive\r\n\r\n`);
+  });
+  const ka = net.connect(st.termPort, '127.0.0.1');
+  await new Promise((r, j) => { ka.once('connect', r); ka.once('error', j); });
+  const first = await req(ka);
+  check('first request on a fresh socket answers 200', first.startsWith('HTTP/1.1 200'));
+  await sleep(7000);   // > Node's 5_000ms default keepAliveTimeout
+  check('socket still open after a 7s idle gap (origin keep-alive raised)', !ka.destroyed && ka.writable);
+  let second = '';
+  try { second = await req(ka); } catch (e) { second = 'ERROR ' + (e && e.code); }
+  check('the SAME socket answers a second request after the gap', second.startsWith('HTTP/1.1 200'), second.split('\r\n')[0]);
+  ka.destroy();
+
+  // --- 9. TOKEN ROLL ----------------------------------------------------------
+  // The XERK-578 roll, which on this platform must NOT cost the session. The
+  // manager rewrites the token file; the live pty-host picks it up on its very
+  // next auth check, with the pty (and its child) untouched.
+  out('\n[9] TOKEN ROLL — the live token file is obeyed without a relaunch');
+  const rolledCred = 'Basic ' + Buffer.from(`term:${ROLLED_TOKEN}`).toString('base64');
+  writeFileSync(TOKENFILE, ROLLED_TOKEN + '\n');   // trailing newline on purpose
+  // BOTH tokens stay in force. Letting the file OUTRANK the baked token would let
+  // any stale or failed-to-update file lock the MANAGER — which authenticates
+  // with its env TURMA_TOKEN — out of a pty-host it just spawned, which is the
+  // same zombie by another door.
+  const rOld = await fetch(`${b}${BASE}/token`, { headers: { Authorization: CRED } });
+  check('the baked credential still works (the manager is never locked out)', rOld.status === 200);
+  const rJunk = await fetch(`${b}${BASE}/token`, {
+    headers: { Authorization: 'Basic ' + Buffer.from('term:not-a-token').toString('base64') },
+    redirect: 'manual',
+  });
+  check('an unrelated credential is still refused', rJunk.status === 401, `status=${rJunk.status}`);
+  const rNew = await fetch(`${b}${BASE}/token`, { headers: { Authorization: rolledCred } });
+  const rolledJson = rNew.ok ? await rNew.json() : {};
+  check('the rolled credential is accepted', rNew.status === 200 &&
+    rolledJson.token === Buffer.from(`term:${ROLLED_TOKEN}`).toString('base64'));
+  check('the pty SURVIVED the roll (no relaunch)', pidAlive(persisted.pid));
+  const ctrlRolled = ctrlClient(persisted.ctrlPort, ROLLED_TOKEN); await ctrlRolled.ready;
+  const capRolled = await ctrlRolled.rpc('capture');
+  check('the manager drives control on the rolled token', typeof capRolled.data === 'string');
+  check('the scrollback is intact across the roll', capRolled.data.includes('DRIVE_MARK_ADOPT'));
+  // Hostile token files. Each must fall back to the BAKED token — never to an
+  // EMPTY one (an empty token means "no auth required" and would open the control
+  // channel that accepts inject/kill) — and none may wedge the single event loop.
+  // A planted FIFO is the sharp one: a blocking read on it would hang the
+  // terminal AND the manager's control channel forever, with the pid still alive.
+  const hostile = [
+    ['deleted', () => {}],   // the loop already removed it
+    ['a directory', () => mkdirSync(TOKENFILE)],
+    ['empty', () => writeFileSync(TOKENFILE, '')],
+    ['whitespace only', () => writeFileSync(TOKENFILE, '   \n\t ')],
+    ['far over the size cap', () => writeFileSync(TOKENFILE, 'x'.repeat(512 * 1024))],
+  ];
+  if (process.platform !== 'win32') {
+    hostile.push(['a FIFO', () => execFileSync('mkfifo', [TOKENFILE])]);
+  }
+  for (const [label, plant] of hostile) {
+    try { if (existsSync(TOKENFILE)) { try { unlinkSync(TOKENFILE); } catch { rmSync(TOKENFILE, { recursive: true, force: true }); } } } catch {}
+    plant();
+    const t0 = Date.now();
+    let baked = null; let rolled = null;
+    try {
+      baked = await fetch(`${b}${BASE}/token`, { headers: { Authorization: CRED }, signal: AbortSignal.timeout(3000) });
+      rolled = await fetch(`${b}${BASE}/token`, { headers: { Authorization: rolledCred }, redirect: 'manual', signal: AbortSignal.timeout(3000) });
+    } catch (e) { check(`token file ${label}: server still answers`, false, String(e)); continue; }
+    check(`token file ${label}: falls back to the baked token, promptly`,
+      baked.status === 200 && Date.now() - t0 < 2000, `status=${baked.status} in ${Date.now() - t0}ms`);
+    check(`token file ${label}: does NOT open access to anything else`, rolled.status === 401,
+      `status=${rolled.status}`);
+  }
+  try { unlinkSync(TOKENFILE); } catch { rmSync(TOKENFILE, { recursive: true, force: true }); }
+  ctrlRolled.close();
+
+  // --- 10. TEARDOWN -----------------------------------------------------------
+  out('\n[10] TEARDOWN — explicit kill stops the pty and the host exits');
   await ctrl2.rpc('kill');
   await d.close(); ctrl2.close();
   let gone = false;

@@ -7,6 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import * as T from '../tty-protocol.mjs';
@@ -64,6 +65,179 @@ test('basic auth matches ttyd -c term:<token> and rejects everything else', () =
   assert.equal(T.basicAuthOk('Basic !!!notbase64', tok), false);
   // An unset token accepts anything (ttyd with no -c).
   assert.equal(T.basicAuthOk(undefined, ''), true);
+});
+
+test('BOTH the live file token and the baked one are in force', () => {
+  // A hub token ROLL used to be fatal here in a way it never is on Linux. There
+  // the manager kills the stale ttyd and relaunches it while tmux (and the claude
+  // in it) lives on; here the pty-host IS the pty, so a relaunch kills the
+  // operator's session — and leaving it running left an unrecoverable zombie: the
+  // terminal 401s into a browser password prompt, the ws upgrade is refused, AND
+  // the manager's own control channel stops authenticating, so capture/inject/kill
+  // silently fail while the pid stays alive and the session reports `running`
+  // forever. So the token comes from a manager-owned file re-read per auth check.
+  assert.deepEqual(T.authTokensInForce('rolled', 'baked'), ['rolled', 'baked']);
+  assert.deepEqual(T.authTokensInForce('  rolled\n', 'baked'), ['rolled', 'baked'],
+    'the file is written with a trailing newline by some editors');
+  // The BAKED token must stay valid. Letting the file OUTRANK it would hand any
+  // stale or failed-to-update file the power to lock the MANAGER — which
+  // authenticates with its env TURMA_TOKEN — out of a pty-host it just spawned,
+  // recreating the zombie by another door, and would make "a failed publish leaves
+  // the baked token in force" untrue.
+  assert.ok(T.authTokensInForce('rolled', 'baked').includes('baked'));
+  // Every "cannot read it" shape degrades to the baked token alone, never to an
+  // EMPTY one — an empty token means "no auth required" to basicAuthOk, which
+  // would silently open the control channel that accepts inject/kill.
+  for (const bad of [null, undefined, '', '   ', '\n', 42, {}]) {
+    assert.deepEqual(T.authTokensInForce(bad, 'baked'), ['baked'],
+      `fallback for ${JSON.stringify(bad)}`);
+  }
+  assert.deepEqual(T.authTokensInForce('same', 'same'), ['same'], 'deduped');
+  const hdr = (t) => 'Basic ' + Buffer.from(`term:${t}`).toString('base64');
+  const ok = (text, baked, sent) =>
+    T.authTokensInForce(text, baked).some((t) => T.basicAuthOk(hdr(sent), t));
+  assert.equal(ok('rolled', 'baked', 'rolled'), true);
+  assert.equal(ok('rolled', 'baked', 'baked'), true, 'the manager is never locked out');
+  assert.equal(ok('rolled', 'baked', 'other'), false);
+  assert.equal(ok(null, 'baked', ''), false, 'an unreadable file never opens auth');
+});
+
+test('serializeState publishes EVERY key the pty-host writes', () => {
+  // serializeState is a WHITELIST, and pty-host.mjs is never imported by CI (it
+  // needs node-pty), so a field added to writeState() but not here is silently
+  // dropped and the manager reads its ABSENCE as fact. That exact omission shipped
+  // once: `authTokenFile` never reached the state file, so the manager's post-roll
+  // self-heal always took its destructive branch and a token roll tore down every
+  // live session — while a python test that hand-wrote the field into a fake state
+  // file stayed green. Read the writer's object literal out of the source and hold
+  // the two sides together.
+  const src = readFileSync(join(HERE, '..', 'pty-host.mjs'), 'utf8');
+  const body = /function writeState\(\) \{\s*const st = \{([\s\S]*?)\n  \};/.exec(src);
+  assert.ok(body, 'writeState() moved or changed shape');
+  // Strip comments first, then take every `name:` that opens a line or follows a
+  // comma. The writer spells every key out (no shorthand) so this sees them all.
+  const literal = body[1].replace(/\/\/[^\n]*/g, '');
+  // Split the literal into TOP-LEVEL entries and require every one of them to be
+  // an explicit `name:`. Matching `name:` alone would let the three natural ways
+  // of adding the next field slip straight through — `newKey,` (shorthand, which
+  // is what the writer used before this guard existed), a `...spread`, and an
+  // `st.newKey = …` assignment after the literal — each re-opening the exact hole
+  // that shipped as the destructive token-roll branch.
+  const entries = [];
+  let depth = 0, cur = '';
+  for (const ch of literal) {
+    if ('{(['.includes(ch)) depth++;
+    else if ('})]'.includes(ch)) depth--;
+    if (ch === ',' && depth === 0) { entries.push(cur); cur = ''; } else cur += ch;
+  }
+  entries.push(cur);
+  const written = new Set();
+  for (const raw of entries) {
+    const e = raw.trim();
+    if (!e) continue;
+    const m = /^([A-Za-z_$][\w$]*)\s*:/.exec(e);
+    assert.ok(m, `writeState() entry ${JSON.stringify(e)} is not an explicit ` +
+      '"name:" — shorthand and spreads are invisible to this guard, so spell it out');
+    written.add(m[1]);
+  }
+  // Nothing may be bolted onto `st` after the literal either.
+  const after = /function writeState\(\) \{[\s\S]*?\n  \};([\s\S]*?)\n\}/.exec(src);
+  assert.ok(after, 'writeState() moved or changed shape');
+  assert.ok(!/\bst\s*(\.\w+|\[)\s*=[^=]/.test(after[1].replace(/\/\/[^\n]*/g, '')),
+    'writeState() assigns a field to `st` AFTER the literal, where the guard ' +
+    'cannot see it — put it in the literal');
+  assert.ok(written.has('authTokenFile'), 'sanity: the writer still has the field');
+  // Every field populated: JSON.stringify omits an `undefined` value entirely, so
+  // a sparse input would under-report what serializeState publishes.
+  const full = Object.fromEntries(T.STATE_KEYS.map((k) => [k, `v-${k}`]));
+  const published = new Set(Object.keys(JSON.parse(T.serializeState(full))));
+  assert.deepEqual([...T.STATE_KEYS].sort(), [...published].sort(),
+    'STATE_KEYS must describe what serializeState actually emits');
+  for (const k of written) {
+    assert.ok(published.has(k),
+      `pty-host writeState() sets "${k}" but serializeState drops it — the manager ` +
+      'will read its absence as fact');
+  }
+  // ...and it round-trips a real value, not just the key.
+  const st = JSON.parse(T.serializeState({ session: 's', pid: 1, base: '/term/s', startedAt: 'now', authTokenFile: '/x/auth-token' }));
+  assert.equal(st.authTokenFile, '/x/auth-token');
+  assert.equal(JSON.parse(T.serializeState({})).authTokenFile, null);
+});
+
+test('the token-file cache key moves when the file is ROLLED', () => {
+  // The read is cached on this key, so a key that misses a roll leaves the OLD
+  // token in force and locks the manager out until the pty-host is relaunched.
+  // The production roll is `os.replace` of a DERIVED token — a fixed-length
+  // secret — so the replacement is typically the SAME SIZE as what it replaces:
+  // a size-only (or size-dominated) key never notices it. Drive exactly that.
+  const base = { mtimeMs: 1700000000000, size: 64, ino: 4242, dev: 66310 };
+  const key = T.tokenCacheKey(base);
+  assert.equal(T.tokenCacheKey({ ...base }), key, 'same stat must hit the cache');
+  // os.replace: new inode, IDENTICAL size, and (worst case, coarse clock) the
+  // same mtime. Only `ino` saves this one.
+  assert.notEqual(T.tokenCacheKey({ ...base, ino: 4243 }), key, 'an os.replace roll must MISS');
+  // In-place same-size rewrite: only mtime moves.
+  assert.notEqual(T.tokenCacheKey({ ...base, mtimeMs: base.mtimeMs + 1 }), key,
+    'an in-place rewrite must MISS');
+  // The remaining two still count.
+  assert.notEqual(T.tokenCacheKey({ ...base, size: 65 }), key);
+  assert.notEqual(T.tokenCacheKey({ ...base, dev: 66311 }), key);
+  // Every field is actually present, so no single one can be dropped unnoticed.
+  for (const f of ['mtimeMs', 'size', 'ino', 'dev']) {
+    assert.ok(key.includes(String(base[f])), `the key must incorporate ${f}`);
+  }
+  // A missing/NaN field degrades to a sentinel rather than "undefined" colliding
+  // across two different broken stats.
+  assert.equal(T.tokenCacheKey({}), '?:?:?:?');
+  assert.notEqual(T.tokenCacheKey({ ...base, ino: undefined }), key);
+});
+
+test('applyKeepAlive really assigns both windows to every server', () => {
+  // The assignment lives in the pure module precisely so this can exist: written
+  // inline in pty-host.mjs it is covered by NOTHING, and deleting it (reinstating
+  // the exact bug it fixes) passes every CI gate.
+  const a = {}, b = {};
+  T.applyKeepAlive([a, b]);
+  for (const s of [a, b]) {
+    assert.equal(s.keepAliveTimeout, T.KEEPALIVE_TIMEOUT_MS);
+    assert.equal(s.headersTimeout, T.HEADERS_TIMEOUT_MS);
+  }
+});
+
+test('installFatalErrorHandlers covers every emitter and fires exactly once', () => {
+  // `ws` re-emits its http server's 'error' on the WebSocketServer, so a bind
+  // failure reaches BOTH — and an unhandled 'error' on either one throws, which
+  // with the pty spawned first took the process down with the child already
+  // running under it. Cover all of them, and settle only once.
+  const http = new EventEmitter(), wss = new EventEmitter();
+  const fired = [];
+  T.installFatalErrorHandlers(
+    [{ name: 'terminal', emitter: http }, { name: 'terminal ws', emitter: wss }],
+    (which, err) => fired.push(`${which}:${err.code}`),
+  );
+  const err = Object.assign(new Error('listen EADDRINUSE'), { code: 'EADDRINUSE' });
+  http.emit('error', err);   // the real ws wiring re-emits, so both fire
+  wss.emit('error', err);
+  assert.deepEqual(fired, ['terminal:EADDRINUSE'], 'one fatal, not two exits');
+  // Every emitter is listened to, so none of them can throw as unhandled.
+  assert.equal(http.listenerCount('error'), 1);
+  assert.equal(wss.listenerCount('error'), 1);
+});
+
+test('pty-host hands installFatalErrorHandlers all four emitters', () => {
+  // The LIST lives in the shell, which CI never imports — so dropping one entry
+  // (say the terminal WebSocketServer, the one that actually receives the
+  // re-emitted bind error) restores the uncaught-throw crash and passes every
+  // other gate. Read the call site and hold it to the four.
+  const src = readFileSync(join(HERE, '..', 'pty-host.mjs'), 'utf8');
+  const call = /T\.installFatalErrorHandlers\(\[([\s\S]*?)\n\],/.exec(src);
+  assert.ok(call, 'the installFatalErrorHandlers call moved or changed shape');
+  const emitters = [...call[1].matchAll(/emitter:\s*([A-Za-z_$][\w$]*)/g)].map((m) => m[1]);
+  assert.deepEqual(emitters.sort(), ['ctrlHttp', 'ctrlWss', 'termHttp', 'termWss'],
+    'both http servers AND both WebSocketServers, or an unhandled bind error throws');
+  // And nothing quietly went back to a bare inline assignment of the windows.
+  assert.ok(/T\.applyKeepAlive\(\[termHttp, ctrlHttp\]\)/.test(src),
+    'both servers must get the keep-alive windows, via the covered helper');
 });
 
 test('/token echoes base64(term:<token>) — the value the ws init must carry', () => {

@@ -109,6 +109,81 @@ capture/persistence), not just the ws bridge.
 - **The `-m` client cap counts RAW connections, not just inited ones** (`termWss.clients`),
   or a socket that never sends its init frame bypasses it.
 
+## The ORIGIN keep-alive must outlast the hub's pooled-channel idle window
+
+- The hub keeps a per-`host:port` keep-alive `http.Agent` over the tunnel (`termAgentFor`) and reuses
+  a FREE channel for the next asset/`/token` request. **If this side closes first, the hub sends that
+  request down a socket already FIN'd** and the browser gets `ECONNRESET` / "socket hang up" before it
+  ever reached us — the terminal that needs two or three refreshes. `termRetryReset` replays exactly
+  ONE such request and the pool holds four, so two consecutive stale sockets still 502'd.
+- So `KEEPALIVE_TIMEOUT_MS` (75s, applied to BOTH servers via `applyKeepAlive`) must stay comfortably
+  above `TERM_AGENT_IDLE_MS` in `turma/server.js` (30s), and `HEADERS_TIMEOUT_MS` above it in turn — a
+  `headersTimeout` at or below `keepAliveTimeout` closes an idle kept-alive socket anyway.
+  **Node's default `server.keepAliveTimeout` is 5_000ms**, so leaving it unset GUARANTEES the race on
+  any terminal whose assets are more than ~5s apart. Both halves are pinned, each from the other side
+  (`tty-protocol.test.mjs` and `server.test.js`); raising one means raising the other.
+  - **The hub half only evicts anything because `armChannelIdleTimeout` makes it real.** A tunnel
+    channel is a Duplex whose `setTimeout` is a no-op stub, and `http.Agent`'s `timeout:` is applied
+    ONLY by calling `socket.setTimeout` — so `TERM_AGENT_IDLE_MS` sat inert, and the two-sided
+    contract described an eviction that never happened, until that was measured. Never assume the hub
+    ages a stale channel out for you: on Linux it never did, which is why the bounded replay is the
+    real mitigation there.
+- **Do not write that ttyd held connections longer — it does not.** A real `ttyd 1.7.4
+  (libwebsockets 4.3.3)` was measured closing an idle keep-alive connection after **5.0s**, and
+  `_launch_ttyd` passes no flag to change it, so the stale-pooled-socket race is FLEET-WIDE, not a
+  Windows novelty. The two-sided window above fixes it only where the origin is the pty-host; on
+  Linux the mitigation is `termRetryReset`'s bounded replay (budgeted to the free-socket pool size,
+  because one reset evicts one socket and the pool parks four the origin ages out together). No idle
+  window the hub could pick sits under 5s without re-dialling a tunnel channel every few seconds.
+- **The assignments live in the PURE module on purpose** (`applyKeepAlive`,
+  `installFatalErrorHandlers`). CI runs only `agent/win/test/*.test.mjs`; `pty-host.mjs` is never
+  imported, so anything written inline there is covered by nothing and deleting it — reinstating the
+  exact bug — passes every gate. The one thing that cannot move, the emitter LIST, is pinned by a
+  test that reads the call site out of the source.
+
+## The auth token is LIVE — a roll must never cost a session
+
+- **`--auth-token-file` names a manager-owned file the pty-host re-reads PER AUTH CHECK**
+  (`authTokensInForce`), so republishing that file IS a token roll — no relaunch, nothing lost.
+- **BOTH the file token and the baked `--auth-token` are in force; the file must NOT outrank it.**
+  Letting it win hands any stale or failed-to-update file the power to lock the MANAGER — which
+  authenticates with its env `TURMA_TOKEN` — out of a pty-host it just spawned, which is the same
+  zombie by another door, and makes "a failed publish leaves the baked token in force" untrue. The
+  cost is deliberate: a pre-roll credential keeps working against an already-running pty-host until
+  it is relaunched, on a loopback port, behind a credential that is defence in depth.
+- **The read is hardened, because it is on the only thread, per request, on a session-writable path**:
+  a non-REGULAR file is refused (a planted FIFO would block the event loop forever, wedging the
+  terminal AND the control channel with the pid still alive), a file over `TOKEN_FILE_MAX` is refused
+  rather than read, and the answer is cached on (mtime, size, inode, dev).
+- **A baked-in-only token is fatal HERE in a way it is not on Linux.** There a hub token roll kills and
+  relaunches the stale ttyd while tmux (and the claude in it) lives on. Here the pty-host IS the pty,
+  so the same relaunch kills the operator's running session — and leaving it alone left an
+  unrecoverable zombie: the terminal 401s into a browser password prompt, the ws upgrade is refused,
+  AND the manager's own control channel stops authenticating, so `capture`/`inject`/`kill` silently
+  fail while the pid stays alive and the session reports `running` forever.
+- **A read failure falls back to the BAKED token, never to an empty one** — an empty token means "no
+  auth required" to `basicAuthOk`/`controlTokenOk`, which would open the control channel that accepts
+  `inject`/`kill`. The state file carries `authTokenFile` so the manager can tell a pty-host that
+  predates this apart from one that can be healed.
+- **`serializeState` is a WHITELIST, and `pty-host.mjs` is never imported by CI.** A field added to
+  `writeState()` but not to it is silently dropped, and the manager reads the ABSENCE as fact — that
+  omission shipped once with `authTokenFile` and turned the post-roll self-heal into "tear down every
+  session", while a python test that hand-wrote the field into a FAKE state file stayed green. The
+  writer spells every key out and a CI test reads its object literal; never assert the state file's
+  shape against one a test wrote itself.
+
+## Bind BOTH servers before spawning the pty, and handle their `'error'`
+
+- `pty.spawn` runs only from the `listen` callback once BOTH servers are up. It used to run at module
+  top, so an `EADDRINUSE` — a port a failed teardown left held, or any squatter winning the TOCTOU
+  against the manager's `_port_open` probe — was an uncaught `'error'` that killed the process with
+  `claude.exe` ALREADY RUNNING under the ConPTY, leaking a child nothing could reach while the manager
+  waited out the whole `PTY_SPAWN_TIMEOUT_SEC` on its beat.
+- **`ws` RE-EMITS its attached http server's `'error'` on the WebSocketServer**, so a handler on the
+  http server alone is not enough — the re-emit is itself an unhandled `'error'` and throws. Handle it
+  on all four (`termHttp`, `ctrlHttp`, `termWss`, `ctrlWss`), log which server and why, and exit
+  non-zero: the `.log` is the manager's only window into a launch that never published.
+
 ## Truecolor & OSC 52 — preserved, and simpler than the tmux stack
 
 With no multiplexer in the middle, both pass straight through: the child env sets
@@ -127,8 +202,11 @@ to undo here. Detail: `agent/win/README.md`.
   BUSY where the raw ring tail reads idle, chunk-boundary stability, and dialog
   rendering.
 - Host proof: `agent/win/drive.mjs` (`npm run drive`) — spawn (via a spawner that
-  exits, proving the child outlives it) → HTTP surface (302/index/token/auth) →
-  attach/detach/reattach with scrollback → control → adopt-from-state → teardown.
+  exits, proving the child outlives it) → bind failure on a taken port (clean
+  non-zero exit, a reason in the log, no orphaned pty) → HTTP surface
+  (302/index/token/auth) → attach/detach/reattach with scrollback → control →
+  adopt-from-state → keep-alive across an idle gap past Node's 5s default → a
+  live token roll with the pty and its scrollback intact → teardown.
   **OS-aware child** (`CHILD_CMD` = a POSIX shell on forkpty, `%COMSPEC%` on
   ConPTY), so it runs on BOTH backends — do not re-hardcode `/bin/bash` (XERK-678).
   Host-verified **24/24 on real Windows ConPTY** (XERK-678, node-pty 1.1.0 bundled
