@@ -6949,7 +6949,12 @@ def _entry_text(entry):
 
 
 def _clip(text, cap):
-    """(clipped, was_truncated). None/empty -> ("", False)."""
+    """(clipped, was_truncated). None/empty -> ("", False).
+
+    Clips by CODE POINT (python string indexing already is). This is a parity
+    contract with tunnel-agent.js `clip` (XERK-863) — do NOT switch to bytes or
+    UTF-16 units, or the two feeds ship a different number of characters for the
+    same block at the cap on astral-plane text (emoji, some CJK extensions)."""
     text = text or ""
     if len(text) > cap:
         return text[:cap], True
