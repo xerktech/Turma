@@ -105,3 +105,42 @@ Python side in `.claude/rules/agent.md`.
   `subagentHistoryResults`.
 - Tests: `TestResolveSubagent`, `TestStageSubagentHistory`; `parseAgentList`, `liveTurnDecision`,
   `stripActivityTail` in `tunnel-agent.test.js`.
+
+## Live-tail cadence: one capture at a time, and an fs watch over the poll (A10/A12)
+
+- **At most ONE pane capture per watcher is in flight** (`w.capturing`).
+  `captureLiveTurn` is ASYNC — on Windows a fresh control WebSocket to the
+  pty-host per call, bounded at `PTY_CAPTURE_TIMEOUT_MS` (2s) — while
+  `pollWatcher` fires from a bare `setInterval` at `LIVE_TAIL_MS` (1s), so a
+  capture slower than the interval OVERLAPPED the next one. Two concurrent
+  sockets per session is the mild case; against a wedged pty-host they pile up
+  every tick and never converge, on the same event loop that bridges terminal
+  bytes. The flag is cleared as the callback's FIRST statement, so a throw
+  downstream cannot wedge it, and `ptyCaptureWindows`/`execFile` both guarantee
+  exactly one bounded callback — which is what makes the guard safe to hold.
+  Skipping a tick costs one frame of latency; the next tick recovers it.
+- **An `fs.watch` fires the poll immediately; the INTERVAL REMAINS as the floor.**
+  `LIVE_TAIL_MS` is a pure poll, so a committed turn waited 0-1000 ms (mean 500)
+  before it was even looked at — the dominant term in the whole
+  agent->hub->browser path, ahead of every network hop. **Never replace the
+  interval with the watch.** `fs.watch` is the least portable API in node: it
+  misses events on network mounts and in some containers, reports renames as
+  changes, can fire twice for one write, and silently stops when a file is
+  replaced by rename. It is a LATENCY OPTIMISATION over a poll that still runs —
+  the same posture the heartbeat poke has to the scheduled beat.
+  - Coalesced through a short debounce so a burst of appends (Claude Code writes
+    a turn in several `write`s) costs ONE poll, and a double-fire is harmless.
+  - The handle is **`unref`'d** — a latency optimisation has no business holding
+    the event loop open, and an unref'd handle cannot turn a missed teardown into
+    a hung process.
+  - An `error` on the watcher DROPS the watch and leaves the interval alone.
+    There is no `uncaughtException` handler in this file, and killing the tunnel
+    takes every session's terminal, live tail and heartbeat poke with it.
+  - Re-armed on a re-arm, because a restart-clear-context MOVES the transcript.
+- Tests: the `A10:`/`A12:` cases in `tunnel-agent.test.js`. A10 counts CAPTURES
+  via the `__setPaneCapture` seam, not frames — the `lastTurn` dedup collapses
+  identical frames, so a frame-count test passes with the guard removed and
+  proves nothing (it was written that way first and caught nothing). A12 asserts
+  `__fsWatchCount()`, a count of OPEN handles: counting `watchers` entries cannot
+  see a leak, because `stopWatch` deletes the entry while the orphaned handle
+  still holds the file.
