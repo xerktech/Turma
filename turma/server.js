@@ -6450,8 +6450,14 @@ function ingestHistory(agent, historyResults) {
   const now = Date.now();
   for (const r of (Array.isArray(historyResults) ? historyResults : [])) {
     if (!r || !r.sessionId) continue;
-    agent.history[r.sessionId] = { entries: r.entries, truncated: r.truncated,
-      queued: Array.isArray(r.queued) ? r.queued : [], fetchedAt: now };
+    // Coerced exactly like a /live tail frame: `entries` is served to the chat
+    // verbatim by GET .../history, so a malformed block here kills the pane the
+    // same way -- and reachable from ONE heartbeat, with no control socket.
+    const { entries, queued } = coerceTailFrame(r);
+    // `truncated` is a TYPED Boolean on Android, so a non-bool is decode-fatal
+    // for the whole /history response -- the wire contract's rule. Its sibling
+    // `agentsTruncated` in ingestSubagentHistory was already `!!`-coerced.
+    agent.history[r.sessionId] = { entries, truncated: !!r.truncated, queued, fetchedAt: now };
   }
   for (const [sessionId, h] of Object.entries(agent.history)) {
     if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.history[sessionId];
@@ -6555,7 +6561,13 @@ function ingestSubagentHistory(agent, results) {
   for (const r of (Array.isArray(results) ? results : [])) {
     if (!r || !r.sessionId) continue;
     agent.subagentHistory[subagentKey(r.sessionId, r.type, r.label, r.agentId)] =
-      { entries: r.entries, truncated: r.truncated,
+      // BOTH truncated flags are coerced. HubClient.mapHistory decodes this
+      // route and /history into the SAME typed HistoryResponse, so a non-bool
+      // here is decode-fatal exactly as it is there -- and the throw is
+      // SWALLOWED (SubagentViewModel's runCatching -> the null branch), so the
+      // pane reads "unreachable" and blames the network. Fixing only the
+      // sibling was the whole bug: they are one token apart on one line.
+      { entries: coerceTailFrame(r).entries, truncated: !!r.truncated,
         agents: sanitizeWorkflowAgents(r.agents),
         agentsTruncated: !!r.agentsTruncated, fetchedAt: now };
   }
@@ -8213,6 +8225,25 @@ function coerceBlockElem(b) {
   for (const k of ["truncated", "isError"]) {
     if (k in b && typeof b[k] !== "boolean") delete b[k];
   }
+  // `edit.old`/`edit.new` must be STRINGS. chat.js renderEditDiff does
+  // `oldText.split("\n")` guarded only by truthiness, so any truthy non-string
+  // throws -- and it throws inside the transcript repaint, so it kills the chat
+  // pane PERMANENTLY: the block is in the client's grow-only buffer, and every
+  // later frame re-renders it and throws again. A QA fuzz of 30,420 block
+  // shapes through the real buildItems+itemsToHtml found this the ONLY survivor
+  // of the rest of this coercion, so it is what closes the class rather than
+  // narrowing it. Both real producers already str()-coerce both fields
+  // (hub-agent.py _tool_use_detail, tunnel-agent.js), so nothing legitimate is
+  // dropped; this bounds a foreign or compromised agent. Coerced at the hub
+  // rather than guarded in the renderer so all three clients are covered at
+  // once -- the renderer should still be made total on its own.
+  if (objectish(b.edit)) {
+    for (const k of ["old", "new"]) {
+      if (k in b.edit && typeof b.edit[k] !== "string") delete b.edit[k];
+    }
+  } else if ("edit" in b) {
+    delete b.edit;
+  }
   const files = coerceObjectList(b, "files");
   if (files) for (const f of files) {
     if ("shed" in f && typeof f.shed !== "boolean") delete f.shed;
@@ -8239,10 +8270,70 @@ function coerceLiveSignals(live) {
   coerceStringList(live, "newPrUrls");
   coerceObjectList(live, "questionOptionsRich"); // QuestionOption leaves are all Strings
   const tail = coerceObjectList(live, "tail");
-  if (tail) for (const e of tail) {
+  if (tail) coerceTailBlocks(tail);
+}
+
+// Coerce the BLOCKS of an already-object-filtered list of tail entries, in
+// place. Extracted from coerceLiveSignals so the /live fanout path can apply
+// the SAME rule -- see coerceTailFrame. Pure lift: the heartbeat path behaves
+// exactly as it did.
+function coerceTailBlocks(entries) {
+  for (const e of entries) {
     const blocks = coerceObjectList(e, "blocks");
     if (blocks) blocks.forEach(coerceBlockElem);
   }
+  return entries;
+}
+
+// Coerce ONE agent-authed /live tail frame's payload.
+//
+// The heartbeat's `session.tail` goes through coerceLiveSignals, but the live
+// fanout forwarded `msg.entries` RAW -- only checking that it was an array. So
+// a single malformed block in an agent frame (`entries:[{id:"a2",
+// blocks:[null]}]`) reached every watching browser, threw out of buildItems,
+// and PERMANENTLY killed the chat pane: the bad entry is in the client's
+// grow-only buffer, so every later frame throws again and no reload short of a
+// new session clears it. Same wire shape, same clients, same risk -- so the
+// same coercion. The two callers now share coerceTailBlocks/coerceBlockElem
+// rather than keeping a second, weaker rule on the hotter path.
+//
+// `queued` is a List<String> on the clients (still-queued prompts typed
+// mid-turn), so it takes coerceStringList's rule: a number decodes leniently
+// into a String, anything else is dropped.
+// Coerce a /live `turn` frame's `status` (the pinned working bar).
+//
+// It was forwarded raw beside an already-sanitized `agents`. chat.js does
+// `st.hint.split("\n")`, guarded only by truthiness, so a truthy non-string
+// `hint` throws once per repaint: the status bar FREEZES on stale content and
+// -- because composeBusy() reads a truthy liveStatus -- Stop stays up on a
+// session that is not working. Milder than the tail kill (the transcript keeps
+// painting, since the call sits at the end of repaint, and a later well-formed
+// status self-heals it), but it is the same "agent frame reaches a DOM sink
+// uncoerced" class, on the same listener.
+//
+// `hint` must be a STRING -- the client SPLITS it, so a number throws there
+// exactly as an object does, and "a number decodes leniently into a String" is
+// only true of leaves that are merely esc()'d. verb/up/down/elapsed are just
+// escaped, so a number is harmless there and is kept (dropping it would blank a
+// counter a real agent could legitimately send as a number). `agents` is left
+// to sanitizeLiveAgents at the call site.
+function coerceLiveStatus(status) {
+  if (!objectish(status)) return null;
+  if ("hint" in status && typeof status.hint !== "string") delete status.hint;
+  for (const k of ["verb", "up", "down", "elapsed"]) {
+    if (k in status && typeof status[k] !== "string" && typeof status[k] !== "number") {
+      delete status[k];
+    }
+  }
+  return status;
+}
+
+function coerceTailFrame(msg) {
+  const entries = coerceTailBlocks(
+    (Array.isArray(msg.entries) ? msg.entries : []).filter(objectish));
+  const queued = (Array.isArray(msg.queued) ? msg.queued : [])
+    .filter((x) => typeof x === "string" || typeof x === "number");
+  return { entries, queued };
 }
 
 // `codingAgent` (CodingAgent? on Android, TIER 2). Only the top-level shape is
@@ -18294,15 +18385,15 @@ server.on("upgrade", async (req, socket, head) => {
       if (msg && typeof msg.tail === "string" && msg.tail && Array.isArray(msg.entries)) {
         // `queued` = still-queued prompts typed mid-turn (foldQueueOp in
         // tunnel-agent.js); absent from agents predating it.
-        liveFanout(name, msg.tail, { type: "tail", entries: msg.entries,
-          queued: Array.isArray(msg.queued) ? msg.queued : [] });
+        const { entries, queued } = coerceTailFrame(msg);
+        liveFanout(name, msg.tail, { type: "tail", entries, queued });
       } else if (msg && typeof msg.turn === "string" && msg.turn && typeof msg.text === "string") {
         // `agents` = the session's live agent list, which outlives the turn
         // (a background agent keeps running after the main one stops), so it
         // rides beside `status` rather than inside it; absent from agents
         // predating it, and the chat then falls back to `status.agents`.
-        liveFanout(name, msg.turn, { type: "turn", text: msg.text, status: msg.status || null,
-          agents: sanitizeLiveAgents(msg.agents) });
+        liveFanout(name, msg.turn, { type: "turn", text: msg.text,
+          status: coerceLiveStatus(msg.status), agents: sanitizeLiveAgents(msg.agents) });
       } else if (msg && typeof msg.watchFailed === "string" && msg.watchFailed) {
         // The agent REFUSED a watch (no worktree on its side, or at
         // MAX_WATCHERS). It used to just log that on the host, leaving the hub
@@ -18587,6 +18678,13 @@ if (process.env.TURMA_TEST) {
   module.exports = {
     server,
     agents,
+    // The /live fanout's coercion of an agent-authed tail frame. Held
+    // directly because the defect it closes is invisible hub-side: the
+    // frame is forwarded, and it is the BROWSER that dies on it.
+    coerceTailFrame,
+    ingestHistory,
+    ingestSubagentHistory,
+    coerceLiveStatus,
     // The create single-flight's backstop, exported so a test can hold the
     // PRODUCTION default rather than the wound-down one the suite runs with —
     // its value relative to the client's give-up is the whole point (XERK-241).
