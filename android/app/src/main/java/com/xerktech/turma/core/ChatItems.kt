@@ -189,15 +189,8 @@ fun buildItems(
     return out
 }
 
-// The agent flattener (hub-agent.py `_entry_text`) appends one `[ToolName]`
-// marker per tool_use in content order with NO separator; within one entry the
-// tool_use blocks sit at the end (the turn yields at the first tool call), so a
-// genuine run is always TRAILING and its markers abut each other. `-` is in the
-// name class for hyphenated subagent types; MCP names (`mcp__server__tool`)
-// carry underscores. Conditions per XERK-861 (the intended web behavior — the
-// web chat.js does NOT yet do this split; see android/PARITY.md).
-private val TRAILING_MARKER_RUN = Regex("(?:\\[[A-Za-z][A-Za-z0-9_-]*])+$")
-private val ONE_MARKER = Regex("\\[[A-Za-z][A-Za-z0-9_-]*]")
+private fun isMarkerAlpha(c: Char): Boolean = c in 'a'..'z' || c in 'A'..'Z'
+private fun isMarkerNameChar(c: Char): Boolean = isMarkerAlpha(c) || c in '0'..'9' || c == '_' || c == '-'
 
 /**
  * Synthesize display blocks for a BLOCK-LESS entry (an older agent or the
@@ -205,32 +198,53 @@ private val ONE_MARKER = Regex("\\[[A-Za-z][A-Za-z0-9_-]*]")
  * deleted ANY `[Word]` from assistant text, prose included, silently and
  * un-recoverably).
  *
- * A trailing run of tool markers is split off into NAME-ONLY tool_use rows so
- * buildItems' verbosity filter hides them under Concise and shows them under
- * Normal/Verbose — rather than the text vanishing. (The web chat.js does not do
- * this split yet; Android leads it — see android/PARITY.md.) The split is
- * deliberately narrow, and the narrowness is the point:
+ * The agent flattener (hub-agent.py `_entry_text`) appends one `[ToolName]`
+ * marker per tool_use with NO separator; within one entry the tool_use blocks
+ * sit at the end (the turn yields at the first tool call), so a genuine run is
+ * always TRAILING and its markers abut each other. That run is split off into
+ * NAME-ONLY tool_use rows so buildItems' verbosity filter hides them under
+ * Concise and shows them under Normal/Verbose — rather than the text vanishing.
+ * (The web chat.js does not do this split yet; Android leads it — see
+ * android/PARITY.md.) The split is deliberately narrow, and the narrowness is
+ * the point:
  *  - only role == "assistant" (a user turn's text is never a flattened turn);
  *  - only a RUN of markers at the very END of the text;
- *  - only a plausible tool name, `[A-Za-z][A-Za-z0-9_-]*`;
+ *  - only a plausible tool name (first char a letter, rest `[A-Za-z0-9_-]`; `-`
+ *    for hyphenated subagent types like qa-delta, `_` for MCP `server__tool`);
  *  - only when the run is NOT preceded by a space or tab — the join has no
  *    separator, so a real marker abuts its text or a line break, while prose
  *    ("the plan [WIP]") puts a space before its bracket.
  * That set keeps "the plan [WIP]", "see [1]" and "see the [notes] section"
  * intact as ordinary text.
+ *
+ * The trailing run is found by a LINEAR reverse scan, not a regex: an
+ * unanchored `(?:\[…\])+$` backtracks O(n²) on bracket-heavy text that does not
+ * end in a marker (e.g. "[x]"×N + "."), a ReDoS this same fix's glasses twin
+ * hit (XERK-862/#835). buildItems runs on every tail/history render with no
+ * hard clamp on entry text, so the scan peels whole markers off the end and
+ * stops at the first char that isn't part of one, touching each char once.
  */
 fun degradedBlocks(role: String, text: String): List<Block> {
     if (text.isEmpty()) return emptyList()
     val plain = if (text.isBlank()) emptyList() else listOf(TextBlock(text))
     if (role != "assistant") return plain
-    val run = TRAILING_MARKER_RUN.find(text) ?: return plain
-    val runStart = run.range.first
+    val names = ArrayList<String>() // collected right-to-left as the run is peeled
+    var start = text.length // start of the trailing marker run, walked leftward
+    while (start > 0 && text[start - 1] == ']') {
+        // A marker is '[' + a name (first char a letter, rest name-chars) + ']'.
+        var j = start - 2
+        while (j >= 0 && isMarkerNameChar(text[j])) j--
+        if (j < 0 || text[j] != '[' || !isMarkerAlpha(text[j + 1])) break // not a marker
+        names.add(text.substring(j + 1, start - 1)) // the name between the brackets
+        start = j // this marker spans [j, start-1); keep peeling the one before it
+    }
+    if (start == text.length) return plain // no trailing marker run
     // Prose puts a space (or tab) before its bracket; a flattened marker does not.
-    if (runStart > 0 && (text[runStart - 1] == ' ' || text[runStart - 1] == '\t')) return plain
-    val lead = text.substring(0, runStart).trimEnd()
+    if (start > 0 && (text[start - 1] == ' ' || text[start - 1] == '\t')) return plain
+    val lead = text.substring(0, start).trimEnd()
     val out = ArrayList<Block>()
     if (lead.isNotEmpty()) out.add(TextBlock(lead))
-    for (m in ONE_MARKER.findAll(run.value)) out.add(ToolUseBlock(name = m.value.substring(1, m.value.length - 1)))
+    for (i in names.indices.reversed()) out.add(ToolUseBlock(name = names[i])) // back to content order
     return out
 }
 

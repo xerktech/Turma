@@ -265,4 +265,26 @@ class ChatItemsTest {
         assertTrue(normal.none { it is ChatItem.Bubble })
         assertEquals("Bash", normal.filterIsInstance<ChatItem.Tool>().single().name)
     }
+
+    @Test fun `a mid-sentence bracket survives while a trailing marker is split off`() {
+        val e = TailEntry(id = "mid", role = "assistant", text = "wrote the [notes] file[Write]")
+        val normal = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
+        assertEquals("wrote the [notes] file", normal.filterIsInstance<ChatItem.Bubble>().single().text)
+        assertEquals("Write", normal.filterIsInstance<ChatItem.Tool>().single().name)
+    }
+
+    @Test fun `degradedBlocks is LINEAR on bracket-heavy text that does not end in a marker`() {
+        // A regex `(?:\[…\])+$` backtracks O(n^2) here (the ReDoS the glasses
+        // twin hit, XERK-862/#835). "[x]"*N + "." has no trailing marker, so the
+        // whole thing must stay ONE bubble verbatim — and finish fast. A
+        // quadratic scan would blow the timeout on this input length.
+        val text = "[x]".repeat(200_000) + "."
+        val e = TailEntry(id = "redos", role = "assistant", text = text)
+        val started = System.nanoTime()
+        val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+        assertEquals(text, items.filterIsInstance<ChatItem.Bubble>().single().text)
+        assertTrue("no tool rows for a non-marker-terminated run", items.none { it is ChatItem.Tool })
+        assertTrue("linear scan should be well under a second (was ${elapsedMs}ms)", elapsedMs < 2_000)
+    }
 }
