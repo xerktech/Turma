@@ -21,15 +21,33 @@ export function emptyBuffer(): TranscriptBuffer {
 // — e.g. "done[Bash]", or a pure tool-call turn "[Read][Edit]". The
 // Sessions-page web chat now renders its "Concise" verbosity by omitting tool
 // actions entirely (only user/assistant message text shows). The glasses view
-// is inherently that same text-only surface, so we match Concise by stripping
-// those markers here, at ingest — the buffer and render then both see the same
-// clean, tool-free text. Only assistant turns
-// carry the markers (tool_use blocks never appear in user turns, and
-// tool_result blocks are already dropped upstream), so user text — which may
-// legitimately contain brackets — is left untouched. Tool names are CapitalCase
-// (Bash, WebFetch, AskUserQuestion) or MCP `server__tool` identifiers, always
-// concatenated with no separator, matching the format `_entry_text` emits.
-const TOOL_MARKER = /\[[A-Za-z][A-Za-z0-9_]*\]/g;
+// is inherently that same text-only surface — it has no tool cards and no
+// verbosity control — so we match Concise by stripping those markers here, at
+// ingest, the buffer and render both seeing the same clean, tool-free text.
+//
+// XERK-862: strip ONLY a TRAILING run of markers, not any bracketed word. The
+// old global strip deleted ANY `[Word]` from an assistant turn, so prose like
+// "see the [notes] section" or "the plan [WIP]" lost its bracketed word
+// outright. Within one transcript entry a turn's tool_use blocks sit at the end
+// (the turn yields at the first tool call), so `_entry_text` puts a real marker
+// run at the very END, abutting the text with no separator — while prose puts a
+// space before its bracket. So we mirror the web/Android `degradedBlocks`
+// (XERK-861) conditions: a trailing run of concatenated markers, each a
+// plausible tool name (`-` covers hyphenated subagent types like qa-delta;
+// MCP `server__tool` names carry underscores), and only when the run is NOT
+// preceded by a space or tab. Only assistant turns are treated (user text keeps
+// its brackets; `conciseEntry` already guards the role).
+const TRAILING_MARKER_RUN = /(?:\[[A-Za-z][A-Za-z0-9_-]*\])+$/;
+
+// Drop the trailing tool-marker run (if any) an assistant turn ends with,
+// leaving bracketed prose and any non-trailing bracket untouched.
+function stripTrailingMarkers(text: string): string {
+  const m = TRAILING_MARKER_RUN.exec(text);
+  if (!m) return text;
+  const start = m.index;
+  if (start > 0 && (text[start - 1] === " " || text[start - 1] === "\t")) return text;
+  return text.slice(0, start).replace(/\s+$/, "");
+}
 
 // Markdown syntax renders as literal noise on the tiny monochrome display: the
 // glasses can't show weight, so bold `**…**` and inline `` `code` `` fences add
@@ -67,7 +85,7 @@ function collapseBlankLines(text: string): string {
 }
 
 export function conciseText(text: string): string {
-  const stripped = stripMarkdown(text.replace(TOOL_MARKER, ""));
+  const stripped = stripMarkdown(stripTrailingMarkers(text));
   return collapseBlankLines(stripped).replace(/[ \t]+$/gm, "").trim();
 }
 

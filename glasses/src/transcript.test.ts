@@ -93,24 +93,35 @@ describe("prependHistory", () => {
 });
 
 describe("concise ingest (matches the web chat's Concise verbosity)", () => {
-  it("strips inline [ToolName] markers from an assistant turn's text", () => {
+  it("strips a TRAILING [ToolName] run from an assistant turn's text", () => {
+    // `_entry_text` appends the turn's markers, abutting the text with no
+    // separator, at the very END (tool_use blocks sit at the end of an entry).
     expect(conciseText("done[Bash]")).toBe("done");
-    expect(conciseText("reading[Read]then[Edit]done")).toBe("readingthendone");
-    expect(conciseText("[mcp__unifi__list]checking")).toBe("checking");
+    expect(conciseText("reading then editing[Read][Edit]")).toBe("reading then editing");
+    expect(conciseText("checking[mcp__unifi__list]")).toBe("checking");
+    expect(conciseText("delegating[qa-delta]")).toBe("delegating"); // hyphenated subagent type
   });
 
   it("reduces a pure tool-call turn to empty text", () => {
     expect(conciseText("[Read][Edit]")).toBe("");
   });
 
-  it("leaves ordinary text (including non-tool brackets) untouched", () => {
+  // XERK-862: the old global strip deleted ANY [Word], prose included. A
+  // bracketed word that is NOT a trailing abutting marker run is left alone.
+  it("keeps bracketed prose (never mistaken for a tool marker)", () => {
+    expect(conciseText("see the [notes] section")).toBe("see the [notes] section");
+    expect(conciseText("the plan [WIP]")).toBe("the plan [WIP]"); // space before the bracket
     expect(conciseText("the value at index [0] is 3")).toBe("the value at index [0] is 3");
     expect(conciseText("plain reply")).toBe("plain reply");
   });
 
-  it("strips tool markers from assistant entries on the way into the buffer", () => {
-    const buf = mergeTail(emptyBuffer(), [entry("1", "compiling[Bash]done")]);
-    expect(buf.entries[0]?.text).toBe("compilingdone");
+  it("keeps a mid-sentence bracket while still stripping a trailing marker", () => {
+    expect(conciseText("wrote the [notes] file[Write]")).toBe("wrote the [notes] file");
+  });
+
+  it("strips the trailing marker run from assistant entries on the way into the buffer", () => {
+    const buf = mergeTail(emptyBuffer(), [entry("1", "compiling done[Bash]")]);
+    expect(buf.entries[0]?.text).toBe("compiling done");
   });
 
   it("never rewrites user text (tool markers can't appear there, brackets are the user's)", () => {
@@ -118,9 +129,9 @@ describe("concise ingest (matches the web chat's Concise verbosity)", () => {
     expect(buf.entries[0]?.text).toBe("check [Read] the docs");
   });
 
-  it("strips markers on history entries too", () => {
-    const buf = prependHistory(emptyBuffer(), [entry("1", "ran[Grep]nothing")], false);
-    expect(buf.entries[0]?.text).toBe("rannothing");
+  it("strips the trailing marker run on history entries too", () => {
+    const buf = prependHistory(emptyBuffer(), [entry("1", "ran nothing[Grep]")], false);
+    expect(buf.entries[0]?.text).toBe("ran nothing");
   });
 
   it("keeps the shorter-preview clobber guard working on stripped lengths", () => {
