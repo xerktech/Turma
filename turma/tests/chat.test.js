@@ -173,6 +173,34 @@ test("buildItems: text-only entry with no blocks (older agent / seed) still bubb
   assert.deepEqual(items, [{ kind: "msg", role: "assistant", id: "a1", text: "legacy text", truncated: false }]);
 });
 
+// The heartbeat preview clips a long message to SESSION_TAIL_MSG_CHARS and now
+// SAYS so on the row (it is clipped per row, not per block). Without the flag
+// the bubble renders a message cut mid-word with no mark, and the operator
+// reads the cut as the message.
+test("buildItems: a truncated text-only row keeps its clip mark", () => {
+  const items = buildItems([{ id: "a1", role: "assistant", text: "cut off her", truncated: true }]);
+  assert.equal(items[0].truncated, true);
+  const html = withVerbosity("normal", () => itemsToHtml(items));
+  assert.match(html, /clipped to fit/);
+});
+
+// The seed the chat opens on used to be text-only, and _entry_text flattens a
+// tool call to the literal "[Bash]" — so the operator saw a prose bubble whose
+// whole content was "[Bash]". The preview carries real blocks now, at tighter
+// caps, and the SAME buildItems turns them into the same action card the live
+// tail produces.
+test("buildItems: a preview row's tool call renders as an action card, never as prose", () => {
+  const items = buildItems([{
+    id: "a1", role: "assistant", text: "running it[Bash]",
+    blocks: [{ t: "text", text: "running it" }, { t: "tool_use", name: "Bash", input: "ls" }],
+  }]);
+  assert.deepEqual(items.map((i) => i.kind), ["msg", "action"]);
+  assert.equal(items[0].text, "running it");
+  assert.equal(items[1].name, "Bash");
+  const html = withVerbosity("normal", () => itemsToHtml(items));
+  assert.ok(!html.includes("[Bash]"), "the flattened marker never reaches the page");
+});
+
 test("mergeTail: a text-only seed can't clobber an equal-text command-block copy", () => {
   // A command block keeps its content in name/args, which the old weight()
   // ignored — so the rich copy TIED its own flattened text and the `>=`
@@ -613,6 +641,39 @@ test("buildItems: a block-less entry's trailing [Tool] markers become action car
   // An mcp tool name survives the name charset.
   const mcp = buildItems([{ id: "a2", role: "assistant", text: "ok[mcp__server__tool]" }]);
   assert.equal(mcp[1].name, "mcp__server__tool");
+});
+
+test("buildItems: a degraded row that is ALSO truncated keeps its clip mark", () => {
+  // The two block-less fixes meet here and are independent, so the seam needs its
+  // own case. The heartbeat seed clips at the ROW (TAIL_MSG_CHARS = 500) and the
+  // same row's flattened text ends in a run of [Tool] markers. Splitting the
+  // markers out must NOT drop the row's truncation flag: without it the bubble
+  // shows prose cut mid-word with no "… clipped to fit" mark, and the operator
+  // reads the cut as the message — the exact symptom the seed fix exists for.
+  const items = buildItems([{
+    id: "a1", role: "assistant", truncated: true,
+    text: "These are all 2160p remuxes - the Max[Bash]",
+  }]);
+  assert.deepEqual(items.map((i) => i.kind), ["msg", "action"]);
+  assert.equal(items[0].truncated, true, "the prose keeps the row's clip flag");
+  assert.equal(items[0].text, "These are all 2160p remuxes - the Max");
+  assert.equal(items[1].name, "Bash");
+  // The marker is a name-only reconstruction, never truncated CONTENT.
+  assert.ok(!items[1].truncated, "a name-only marker is not truncated content");
+
+  // An untruncated degraded row must not sprout a clip mark.
+  const whole = buildItems([{ id: "a2", role: "assistant", text: "Done.[Bash]" }]);
+  assert.ok(!whole[0].truncated, "an untruncated row stays unmarked");
+
+  // A row with no marker run still carries the flag through the plain path.
+  const plain = buildItems([{ id: "a3", role: "assistant", truncated: true, text: "cut here" }]);
+  assert.equal(plain[0].truncated, true);
+
+  // A clip landing MID-marker cannot form a run, so it falls through as prose —
+  // and must still be marked, not silently rendered as a complete message.
+  const midMarker = buildItems([{ id: "a4", role: "assistant", truncated: true, text: "text[Ba" }]);
+  assert.equal(midMarker[0].kind, "msg");
+  assert.equal(midMarker[0].truncated, true);
 });
 
 test("buildItems: Concise can now hide a block-less entry's tool markers", () => {

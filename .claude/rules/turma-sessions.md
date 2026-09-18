@@ -25,7 +25,69 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
   at load state this way).
 - Opens a running session in a **native chat view by default** (`chat.js`), not the raw ttyd
   terminal, over `/live/<host>/<id>` (ws-token auth, seeded from the cached tail, `/history` scrollback
-  + poll fallback when the socket is down).
+  + a poll fallback).
+  - **The fallback is gated on DATA LIVENESS, never on `ws.readyState`** (`liveDelivering`). The hub
+    HOLDS a `/live` socket across a control-channel flap and pings it every 30s, so an
+    open-but-silent socket — one the hub accepted and never armed an agent watch behind — is
+    indistinguishable from a healthy feed on a quiet session, and gating the poll on the socket
+    being DOWN is what made a broken chat unrepairable for as long as it was left open. Three
+    questions, in order of what they prove: is the socket up; did the hub ACK an arm (or has a
+    non-`seed` delta ever arrived, which proves the same of an older hub); and — **only while a frame
+    source is OBLIGED to be ticking** — has anything landed within `LIVE_STALE_MS`.
+    - **That obligation read is NARROWER than "the session is working"** (`feedMustBeTicking`, NOT
+      XERK-245's `paneBusy` OR `agents`). `paneBusy` qualifies: `status.elapsed` advances every
+      second, so frames flow even when the text holds still. **Live background agents do NOT** —
+      the main turn has ENDED, so the pane sends `text:""`/`status:null` and the agent rows carry
+      nothing that ticks, and the agent correctly says nothing for minutes. Counting that as a fault
+      declared every healthy DELEGATING session dead, polled `/history` around it and tore its socket
+      down each cooldown — and every re-arm re-sends a full window at `BLOCK_CAPS`, multiplying
+      exactly the bytes the delta exists to save. **Never put `agents` back into that read.**
+    - It comes from the HEARTBEAT, never `liveStatus` — the suspect socket feeds `liveStatus`, so a
+      feed that died mid-turn would clear it and read its own silence as fine.
+    - **The hub's opening seed is marked `seed:true` and proves NOTHING.** It is replayed from the
+      last heartbeat on upgrade, including on a socket the hub just acked `armed:false`; treating it
+      as a delta cleared that ack a millisecond after it was sent.
+  - **A silent-but-open socket is REPLACED, not merely routed around** — nothing else would ever
+    close it (`onclose` never fires), cooled down by `LIVE_RECONNECT_COOLDOWN_MS`.
+  - **The hub ACKS every `/live` subscription with `{type:"watch", armed, reason?}`** and re-sends
+    it whenever the answer changes: armed on a control reconnect, unarmed when the tunnel drops,
+    unarmed when the agent NACKs the watch (`{watchFailed}`, `agent-tunnel.md`). `reason` is the
+    hub's own words, but **no client RENDERS it yet** — it rides the wire for diagnosis and the chat
+    silently switches to polling. Do not describe it as something the operator sees until one does,
+    and note it is agent-derived text: whoever wires it to a DOM sink must escape it there.
+  - **A watch the AGENT refused is recorded `"refused"`, not forgotten** (`markWatchRefused`), so the
+    never-armed re-arm does not re-ask every beat forever — a host at `MAX_WATCHERS` refuses
+    deterministically. A control reconnect (the agent forgot its watchers too) and a transcript MOVE
+    are the only two things that can change the answer, and both still re-arm.
+    - **Only for a session in `liveClients[host]`.** It is the one write here that ADDS a key rather
+      than deleting one, and the id rides an agent-authed frame — recording it unconditionally let
+      one agent grow the hub's heap ~265 bytes per frame for the life of the control channel
+      (+52.7 MiB over 200k frames, against a 512 MiB container). Suppression only means anything for
+      a watched session anyway.
+    - **The cost, stated:** a viewer that stays connected through a refusal is NOT re-armed when the
+      host's watcher slot later frees — only a move or a reconnect re-asks. It degrades correctly
+      (that client is on `/history` polling) and a reload always recovers, because `armLiveWatcher`
+      arms on every new subscriber. Accepted over re-asking a deterministic refusal 20x a minute.
+  - **Every subscriber arms, not just the first** (`armLiveWatcher`), and **a session the hub could
+    not arm yet is armed on the beat that first describes it** (`rearmMovedWatches`' never-armed
+    branch, tracked in `liveWatchArmed`). `watchTargetFor` needs a `worktreePath`, so a chat opened
+    on a just-spawned session used to arm nothing and the move-detector then skipped it for being
+    absent from the previous beat — no live feed for that chat's whole life.
+  - **`/history` serves a fresh cache AND refreshes behind the answer** past
+    `HISTORY_REFRESH_AFTER_MS`. The fresh-cache branch used to return with nothing queued (the
+    archive fast path and the queue-and-202 path both sit below it), so a client polling every 6s
+    re-read the same five-minute-old body forever.
+  - **Every `/live` map is NULL-PROTOTYPE, and `liveFanout` checks `instanceof Set`.** Both levels
+    are keyed by attacker-influenced strings — the outer by a `?name=` host, the INNER by a session id
+    the AGENT names on the control channel — so on a plain object `liveClients[host]?.[sessionId]`
+    resolved `__proto__`/`constructor`/`toString` off `Object.prototype` and `for (const s of set)`
+    threw `set is not iterable` out of the control-channel listener, EXITING the hub: every host's
+    terminal, live tail and heartbeat poke, fleet-wide, from one agent-authed frame. The XERK-278
+    `typeof id === "string"` guard does not cover it — those ARE strings. Same trap as
+    `controlChannels`/`pendingChannels`; `liveWatchArmed` and `liveRelayChannels` are built the same
+    way. Test: `a control frame naming a prototype key cannot kill the hub`.
+  - Tests: the `live WS:` arm/ack cases in `server.test.js`, the liveness cases in
+    `chat-live.test.js`.
   - **`/history` for a RUNNING session is served INSTANTLY from the hub's durable archive** on a cache
     miss (`archiveHistory` in `server.js`), not by round-tripping to the agent — the agent keeps a
     worktree-backed running session's rendered transcript syncing to the archive

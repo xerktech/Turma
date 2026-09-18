@@ -764,6 +764,40 @@ BLOCK_CAPS = {
     "input": BLOCK_TOOL_INPUT_CHARS,
     "result": BLOCK_TOOL_RESULT_CHARS,
 }
+# The HEARTBEAT preview's own caps (transcript_tail). The chat seeds its buffer
+# from that tail, so a text-only row is a lie the operator reads: _entry_text
+# flattens a tool call to the literal "[Bash]", which the chat then paints as
+# PROSE, and the TAIL_MSG_CHARS clip arrives with no flag, so the renderer's
+# "… clipped to fit" mark never shows. Blocks fix both at once — the chat, the
+# glasses and android all already merge on `blocks` and keep whichever copy of
+# an entry is richer — but this rides EVERY session on EVERY beat, so the caps
+# are far tighter than BLOCK_CAPS (which the SINGLE-session live tail and
+# `history` read at, XERK-347 — never narrow THOSE) and the whole per-session
+# block payload is bounded by TAIL_BLOCKS_BUDGET below.
+TAIL_PREVIEW_CAPS = {
+    "text": TAIL_MSG_CHARS,
+    "input": _env_int("SESSION_TAIL_INPUT_CHARS", 80),   # "Bash(git status)", no more
+    "result": TAIL_MSG_CHARS,
+}
+# What an over-budget (older) preview row degrades to: prose still rides — it is
+# what the operator reads — tool inputs and outputs do not. Never degrade a row
+# to NO blocks: that is what puts "[Bash]" back in a prose bubble.
+# `input` stays NON-ZERO here on purpose: it is not only a tool_use's argument
+# summary. `_entry_blocks` also clips a task_notification's `summary` and a
+# slash-command's `name`/`args` with it, so a zero would render an over-budget
+# row as a nameless command chip and a summary-less agent card — the same class
+# of lie the blocks exist to end. These are short; the budget is spent on text
+# and tool output.
+TAIL_PREVIEW_CAPS_MIN = {
+    "text": _env_int("SESSION_TAIL_MIN_TEXT_CHARS", 200),
+    "input": _env_int("SESSION_TAIL_MIN_INPUT_CHARS", 80),
+    "result": 0,
+}
+# Per-session ceiling on the preview's block payload, spent NEWEST-first (what
+# the operator is looking at gets the fidelity). Past it a row falls back to
+# TAIL_PREVIEW_CAPS_MIN. Bounds the heartbeat: without it one tool-heavy turn
+# could carry BLOCK_MAX_PER_ENTRY x TAIL_MSG_CHARS on its own.
+TAIL_BLOCKS_BUDGET = _env_int("SESSION_TAIL_BLOCKS_BUDGET", 6000)
 # SendUserFile inline preview (XERK-221): the agent reads the image/SVG/HTML files
 # a session delivers via SendUserFile and embeds them ON the tool_use block (a
 # base64 data: URI for images, the raw markup for HTML) so the chat renders them
@@ -7671,14 +7705,22 @@ def _live_agent_resolve_id(state, agent_type, label):
     return found
 
 
-def _entry_blocks(entry, caps):
+def _entry_blocks(entry, caps, preview=False):
     """Rich, order-preserving block list for one transcript entry, or None to
     drop it (wrong type / no message dict). Additive companion to _entry_text:
     it PRESERVES the thinking text, tool_use inputs and tool_result outputs that
     _entry_text() flattens away, so the native chat UI can show/hide each
     component by verbosity. `caps` is a {text, input, result} char-limit dict
     (BLOCK_CAPS on every path — the live tail and on-demand history read at the
-    same fidelity); a block cut to its cap gets truncated:true. Blocks:
+    same fidelity); a block cut to its cap gets truncated:true.
+
+    `preview=True` is the HEARTBEAT path (transcript_tail, TAIL_PREVIEW_CAPS):
+    same blocks, but _tool_use_detail is skipped entirely. That detail READS
+    FILES FROM DISK (a SendUserFile delivery embeds up to SEND_FILE_MAX_BYTES of
+    base64 per file, XERK-221) — affordable once for one watched session, never
+    for every session on every beat. Nothing else differs, so the preview is a
+    strictly poorer copy of the same shape and the clients' grow-only merge
+    always prefers the live/history copy. Blocks:
       {t:"text",           text}
       {t:"thinking",       text, truncated?}
       {t:"tool_use",       id, name, input, truncated?}
@@ -7847,9 +7889,15 @@ def _entry_blocks(entry, caps):
                 block = {"t": "tool_use", "name": str(raw["name"]), "input": clipped}
                 if raw.get("id"):
                     block["id"] = raw["id"]
-                if trunc:
+                # A ZERO input cap means "this feed ships no argument summary at
+                # all" — which the empty `input` already says — so it is not a
+                # clip to mark. Only the preview's degraded tier sets it, and
+                # marking every tool card "… clipped to fit" would be noise on
+                # every card the chat seeds. A real cut still flags.
+                if trunc and caps["input"]:
                     block["truncated"] = True
-                if _tool_use_detail(block, str(raw["name"]), raw.get("input"), caps):
+                if not preview and _tool_use_detail(
+                        block, str(raw["name"]), raw.get("input"), caps):
                     block["truncated"] = True
                 blocks.append(block)
             elif btype == "tool_result":
@@ -7870,22 +7918,65 @@ def _entry_blocks(entry, caps):
     return blocks
 
 
+def _blocks_weight(blocks):
+    """Rough wire cost of a preview block list: every string payload it carries.
+    Used only to spend TAIL_BLOCKS_BUDGET, so an approximation is enough."""
+    total = 0
+    for block in blocks:
+        for value in block.values():
+            if isinstance(value, str):
+                total += len(value)
+    return total
+
+
 def transcript_tail(path):
-    """Last TAIL_MSGS surviving messages of a transcript for the glasses
-    client's tail feed, oldest first: [{"id": entry uuid, "role": "user"/
-    "assistant", "text": text}, ...]. Missing/empty transcript -> []. id is
-    the transcript entry's own uuid so clients can merge/dedup on it."""
-    tail = []
+    """Last TAIL_MSGS surviving messages of a transcript, oldest first, as the
+    heartbeat's per-session preview: [{"id": entry uuid, "role": "user"/
+    "assistant", "text": text, "truncated"?: True, "blocks"?: [...]}, ...].
+    Missing/empty transcript -> []. id is the transcript entry's own uuid so
+    clients can merge/dedup on it.
+
+    Two consumers, one row. `text` is the flat, lossy string the glasses have
+    always read and is UNCHANGED — except that a row cut to TAIL_MSG_CHARS now
+    says so (`truncated`), instead of arriving silently sliced mid-word with
+    nothing for the chat's "… clipped to fit" mark to key on.
+
+    `blocks` is what stops the row LYING to the chat, which seeds its buffer
+    from here: _entry_text flattens a tool call to the literal "[Bash]", and a
+    text-only row makes the chat synthesize one text block around it, so the
+    operator sees a prose bubble whose whole content is "[Bash]". The blocks are
+    the same shape every other feed ships (so no client needs a new code path)
+    at TAIL_PREVIEW_CAPS, spent newest-first against TAIL_BLOCKS_BUDGET; past
+    the budget an older row degrades to TAIL_PREVIEW_CAPS_MIN — prose kept, tool
+    payloads emptied — never to no blocks at all."""
+    kept = []
     for entry in _tail_entries(path):
         text = _entry_text(entry)
         if text is None:
             continue
-        tail.append({
+        kept.append((entry, text))
+    kept = kept[-TAIL_MSGS:]
+    rows = []
+    spent = 0
+    # Newest-first: the fidelity budget goes to what is on screen. The rows are
+    # reversed back to transcript order before returning.
+    for entry, text in reversed(kept):
+        caps = TAIL_PREVIEW_CAPS if spent < TAIL_BLOCKS_BUDGET else TAIL_PREVIEW_CAPS_MIN
+        blocks = _entry_blocks(entry, caps, preview=True) or []
+        spent += _blocks_weight(blocks)
+        clipped, trunc = _clip(text, TAIL_MSG_CHARS)
+        row = {
             "id": entry.get("uuid"),
             "role": _entry_role(entry),
-            "text": text[:TAIL_MSG_CHARS],
-        })
-    return tail[-TAIL_MSGS:]
+            "text": clipped,
+        }
+        if trunc:
+            row["truncated"] = True
+        if blocks:
+            row["blocks"] = blocks
+        rows.append(row)
+    rows.reverse()
+    return rows
 
 
 def _newest_transcript_path(workdir):

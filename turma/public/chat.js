@@ -17,7 +17,18 @@
   const BACKOFF_MS = [1000, 2000, 4000, 8000, 15000];
   const TOKEN_SKEW_MS = 30000;      // refetch a ws-token this long before expiry
   const LIVE_TURN_ID = "__live";
-  const POLL_MS = 6000;             // /history fallback cadence when the WS is down
+  const POLL_MS = 6000;             // /history fallback cadence when the live feed isn't delivering
+  // How long a WORKING session may deliver nothing over an open, armed socket
+  // before we stop believing it. The agent polls the transcript every
+  // LIVE_TAIL_MS (1s) and pushes a `turn` frame on every change, so a session
+  // that reads busy and has said nothing for several of those is not quiet —
+  // the feed is broken. Repair is driven by DATA, never by socket state: the
+  // hub holds a /live socket open across a flap and pings it every 30s, so an
+  // OPEN-BUT-SILENT socket is indistinguishable from a healthy one and used to
+  // suppress the /history fallback permanently.
+  const LIVE_STALE_MS = 5000;
+  // Don't tear a socket down more than this often while chasing a silent feed.
+  const LIVE_RECONNECT_COOLDOWN_MS = 15000;
   const HISTORY_RETRY_MS = 1200;    // poll cadence while /history returns 202
   // The retry window must outlast a HEARTBEAT, not just a fetch (XERK-347). A
   // 202 means "the agent hasn't delivered it yet", and a delivery can be shed —
@@ -789,6 +800,13 @@
   // session always gets its socket.
   let wsStarting = null;
   let pollTimer = null;
+  // Data liveness, which is what the repair path keys on — NOT `ws.readyState`.
+  // `liveArmed` is the hub's own answer to "is an agent actually tailing this
+  // session for you": it acks every /live subscription with {type:"watch",
+  // armed}, and says armed:false when it has no tunnel to the host, no worktree
+  // for the session yet, or the agent refused the watch. `lastFrameAt` is when
+  // this socket last carried anything at all.
+  let liveArmed = false, lastFrameAt = 0, lastForcedReconnect = 0;
   // Whether the reader is following the tail. True on open (so we land at the
   // bottom even after the async /history load grows the transcript below the
   // seed paint) and while they're parked at the bottom; flipped false the moment
@@ -893,11 +911,31 @@
     catch { scheduleReconnect(myGen); return; }
     ws = sock;
     let opened = false;
-    sock.onopen = () => { opened = true; backoffIdx = 0; };
+    sock.onopen = () => { opened = true; backoffIdx = 0; lastFrameAt = Date.now(); };
     sock.onmessage = (ev) => {
       if (myGen !== gen) return;
       let frame;
       try { frame = JSON.parse(ev.data); } catch { return; }
+      // ANY frame proves the feed is alive, whatever it carried.
+      lastFrameAt = Date.now();
+      if (frame && frame.type === "watch") {
+        // The hub's arm/refusal ack. armed:false is the state that used to be
+        // invisible from here — an accepted socket the hub never wired to an
+        // agent — and it is exactly when /history has to take over.
+        liveArmed = frame.armed === true;
+        return;
+      }
+      // A delta that actually arrived is itself proof an agent is tailing — and
+      // it is the only proof a hub predating the ack above can give us.
+      //
+      // EXCEPT the hub's own opening seed (`seed:true`), which it replays from
+      // the last HEARTBEAT the moment the socket upgrades. That frame proves
+      // nothing about the agent: the hub sends it even on the socket it just
+      // told us it could not arm, and letting it through cleared the
+      // `armed:false` a line earlier — re-suppressing the repair path in exactly
+      // the accepted-but-unarmed case this whole read exists for.
+      if (frame && (frame.type === "turn" ||
+                    (frame.type === "tail" && frame.seed !== true))) liveArmed = true;
       if (frame && frame.type === "tail" && Array.isArray(frame.entries)) {
         if (frame.entries.length) buffer = mergeTail(buffer, frame.entries);
         // Every tail frame carries the CURRENT still-queued prompt list (an
@@ -920,6 +958,7 @@
     };
     sock.onclose = () => {
       if (ws === sock) ws = null;
+      liveArmed = false;
       if (myGen !== gen) return;
       // A socket that failed before opening may have been rejected on a stale
       // token — drop the cache so the reconnect mints a fresh one.
@@ -993,13 +1032,70 @@
     repaint();
   }
 
+  // Is the live feed actually DELIVERING? Not "is the socket open" — the hub
+  // holds a /live socket across a control-channel flap and pings it every 30s,
+  // so `readyState === OPEN` stayed true on a socket nothing would ever be
+  // written to, and that was the whole gate on the /history repair path: a chat
+  // that lost its feed sat frozen for as long as it was left open.
+  //
+  // Three questions, in order of how much they prove:
+  //  - is the socket up at all;
+  //  - did the hub say it armed an agent watch behind it (or has a delta ever
+  //    arrived, which proves the same thing about an older hub);
+  //  - and, while the session reads BUSY, has anything arrived recently. A
+  //    quiet session legitimately sends nothing; a working one cannot.
+  function liveDelivering() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    if (!liveArmed) return false;
+    if (feedMustBeTicking() && Date.now() - lastFrameAt > LIVE_STALE_MS) return false;
+    return true;
+  }
+
+  // Is a frame source OBLIGED to be emitting right now? This is deliberately
+  // NOT the "is the session working" read every other surface uses (XERK-245's
+  // `paneBusy` OR live agents) — it is the narrower "silence here would be a
+  // FAULT" read, and the two are not the same set.
+  //
+  //  - `paneBusy` qualifies: while the pane generates, the agent pushes a `turn`
+  //    frame whose `status.elapsed` ticks every second, so frames keep flowing
+  //    even if the text holds still.
+  //  - **Live background agents do NOT qualify**, however busy the session is.
+  //    The main turn has ENDED (that is the whole point of XERK-245), so the
+  //    pane emits `text:""`/`status:null` and `liveAgentsReport` carries only
+  //    `{type,label}` with nothing that ticks — the agent's frame key never
+  //    changes and it correctly sends nothing for minutes. Counting that as
+  //    "must be emitting" declared every healthy delegating session dead, polled
+  //    /history around it and tore the socket down every cooldown — and each
+  //    re-arm costs a FULL window at BLOCK_CAPS, so it multiplied exactly the
+  //    bytes the delta exists to save. Never put `agents` back in here.
+  //
+  // It comes from the HEARTBEAT, never from `liveStatus`: liveStatus is fed by
+  // the very socket under suspicion, so a feed that died mid-turn would clear it
+  // and then read "not busy, so silence is fine" — the failure hiding itself.
+  // `paneBusy` absent means "that agent can't tell", which is not busy.
+  function feedMustBeTicking() {
+    const live = sess && sess.session;
+    if (!live) return false;
+    return live.paneBusy === true;
+  }
+
+  function pollFallbackTick(myGen) {
+    if (myGen !== gen) return stopPollFallback();
+    if (liveDelivering()) return;
+    loadHistory(myGen);
+    // ...and don't just route around the dead socket: replace it. An open
+    // socket carrying nothing never fires onclose, so nothing else would.
+    // Cooled down so a genuinely unreachable feed doesn't thrash.
+    if (ws && ws.readyState === WebSocket.OPEN &&
+        Date.now() - lastForcedReconnect > LIVE_RECONNECT_COOLDOWN_MS) {
+      lastForcedReconnect = Date.now();
+      try { ws.close(); } catch {}   // -> onclose -> scheduleReconnect
+    }
+  }
+
   function startPollFallback(myGen) {
     stopPollFallback();
-    pollTimer = setInterval(() => {
-      if (myGen !== gen) return stopPollFallback();
-      // Only poll when the live socket isn't delivering.
-      if (!ws || ws.readyState !== WebSocket.OPEN) loadHistory(myGen);
-    }, POLL_MS);
+    pollTimer = setInterval(() => pollFallbackTick(myGen), POLL_MS);
   }
   function stopPollFallback() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 
@@ -1137,16 +1233,20 @@
     }
     return start < t.length ? start : -1;
   }
-  function degradedBlocks(text, role) {
+  function degradedBlocks(text, role, truncated) {
     const t = String(text == null ? "" : text);
     if (!t) return [];
-    if (role !== "assistant") return [{ t: "text", text: t }];
+    // The clip happened at the ROW, so it belongs to the PROSE this splits out —
+    // never to a name-only tool_use marker, which was never truncated content.
+    const txt = (v) => (truncated ? { t: "text", text: v, truncated: true }
+                                  : { t: "text", text: v });
+    if (role !== "assistant") return [txt(t)];
     const start = trailingMarkerStart(t);
-    if (start < 0) return [{ t: "text", text: t }];
+    if (start < 0) return [txt(t)];
     const before = t.slice(0, start);
-    if (/[ \t]$/.test(before)) return [{ t: "text", text: t }];
+    if (/[ \t]$/.test(before)) return [txt(t)];
     const out = [];
-    if (before.trim()) out.push({ t: "text", text: before });
+    if (before.trim()) out.push(txt(before));
     for (const name of t.slice(start + 1, -1).split("][")) {
       out.push({ t: "tool_use", name: name, input: "", degraded: true });
     }
@@ -1186,16 +1286,24 @@
       // persistence keys stay real for archived transcripts too.
       const eid = e.id != null ? e.id : e.uuid;
       // Older agents / the text-only cache seed carry no blocks: synthesize
-      // them. `_entry_text` (hub-agent.py) flattens an assistant turn by
-      // appending a bare `[Bash]` / `[Read]` marker per tool_use, in content
-      // order and with no separator — so a degraded row ends in a RUN of
-      // markers. Split those back out into name-only tool_use blocks
-      // (degradedBlocks) rather than leaving them as prose, or the fallback
-      // renders MORE intrusively than the rich path: a text block can't be
-      // hidden by Concise, which only filters action cards.
+      // them. Two things have to happen here, and they are independent:
+      //
+      // (a) `_entry_text` (hub-agent.py) flattens an assistant turn by appending
+      //     a bare `[Bash]` / `[Read]` marker per tool_use, in content order and
+      //     with no separator — so a degraded row ends in a RUN of markers.
+      //     `degradedBlocks` splits those back out into name-only tool_use
+      //     blocks rather than leaving them as prose, or the fallback renders
+      //     MORE intrusively than the rich path: a text block cannot be hidden
+      //     by Concise, which only filters action cards.
+      //
+      // (b) The row's truncation flag must ride onto the synthesized TEXT, since
+      //     a flat preview is clipped at the ROW (the heartbeat seed cuts at
+      //     `TAIL_MSG_CHARS`), not per block. Without it the bubble shows a
+      //     message cut mid-word with no "… clipped to fit" mark and the
+      //     operator reads the cut as the message itself.
       const blocks = (e.blocks && e.blocks.length)
         ? e.blocks
-        : degradedBlocks(e.text, role);
+        : degradedBlocks(e.text, role, e.truncated);
       let msg = null;
       const flush = () => { if (msg) { items.push(msg); msg = null; } };
       for (const b of blocks) {
@@ -3466,6 +3574,7 @@
     historyChain = false;   // a chain from the PREVIOUS session must not block this one
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; liveAgents = [];
     backoffIdx = 0;
+    liveArmed = false; lastFrameAt = Date.now(); lastForcedReconnect = 0;
     stopPendingAt = 0; actionFailUntil = 0; // the compose button starts at Send
     modelSwitchPending = null; modeSwitchPending = null;
     resetPaintMemo(); // this session's paint memo starts empty
@@ -3493,6 +3602,7 @@
     if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
     stopPollFallback();
     if (ws) { try { ws.onclose = null; ws.close(); } catch {} ws = null; }
+    liveArmed = false;
     hostKey = null; sessionId = null; sess = null; agent = null;
     modelSourcePending = null;
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; liveAgents = [];
@@ -3565,6 +3675,12 @@
       scheduleRepaint, resumePaint, renderEditDiff, renderFoldedThoughts,
       isBusy, updateComposeAction, updateLiveStatus, isToolBullet, sendFailure, isTooLong, TOO_LONG,
       loadHistory, reconnectNow, startWs,
+      liveDelivering, pollFallbackTick, LIVE_STALE_MS,
+      // The live feed's data-liveness state, which is what the repair path keys
+      // on rather than ws.readyState. See liveDelivering.
+      __setLiveArmed: (v) => { liveArmed = v; },
+      __setLastFrameAt: (t) => { lastFrameAt = t; },
+      __setForcedReconnectAt: (t) => { lastForcedReconnect = t; },
       __setSessionRef: (hk, id) => { hostKey = hk; sessionId = id; },
       __gen: () => gen,
       // What open()/close() do between two sessions: everything in flight for

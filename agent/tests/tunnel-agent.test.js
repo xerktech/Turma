@@ -2155,8 +2155,11 @@ test("pollWatcher survives a tail JSON.stringify cannot produce", async () => {
   const realStringify = JSON.stringify;
   let boom = true;
   JSON.stringify = function (value, ...rest) {
-    // Only the tail frame — the module serializes other things too.
-    if (boom && value && Array.isArray(value.entries)) throw new RangeError("Invalid string length");
+    // Only the tail frame, or one of the ENTRIES the delta weighs on its way to
+    // building one — the module serializes other things too.
+    if (boom && value && (Array.isArray(value.entries) || typeof value.role === "string")) {
+      throw new RangeError("Invalid string length");
+    }
     return realStringify.call(this, value, ...rest);
   };
   try {
@@ -2390,5 +2393,183 @@ test("ptyCaptureWindows: an unreachable ctrlPort yields null and never hangs", a
     assert.equal(await captureOnce(sid), null);
   } finally {
     fs.rmSync(sp, { force: true });
+  }
+});
+
+// --- the live tail is a DELTA, and a re-arm re-sends a snapshot -------------
+// The frame used to be the whole TAIL_MSGS window, re-serialized and re-sent on
+// every transcript change: tens to hundreds of KB a second per watched session,
+// >95% of it bytes the browser already had, and the change test was a string
+// compare over those same huge strings — on the event loop this process also
+// bridges terminal bytes over. Every consumer (chat.js mergeTail, android
+// mergeTail, the glasses buffer) is id-keyed and grow-only, so a delta merges
+// exactly as a snapshot did.
+function waitForCond(pred, timeoutMs = 5000) {
+  const started = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      if (pred()) return resolve();
+      if (Date.now() - started > timeoutMs) return reject(new Error("timed out waiting"));
+      setTimeout(tick, 20);
+    };
+    tick();
+  });
+}
+
+test("live tail: a tail frame carries only what CHANGED, not the whole window", async () => {
+  const mod = require("../tunnel-agent.js");
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "delta-wt-"));
+  const tid = "11111111-2222-3333-4444-555555555555";
+  const dir = writeTranscript(work, `${tid}.jsonl`, [
+    { uuid: "e1", type: "user", message: { content: "first" } },
+    { uuid: "e2", type: "assistant", message: { content: "second" } },
+  ]);
+  const frames = [];
+  mod.__setControlSink((o) => { if (o.tail === "sess-delta") frames.push(o); });
+  try {
+    mod.startWatch("sess-delta", work, tid);
+    await waitForCond(() => frames.length >= 1);
+    assert.deepEqual(frames[0].entries.map((e) => e.id), ["e1", "e2"],
+      "the first frame after an arm is a full snapshot");
+
+    fs.appendFileSync(path.join(dir, `${tid}.jsonl`),
+      JSON.stringify({ uuid: "e3", type: "assistant", message: { content: "third" } }) + "\n");
+    await waitForCond(() => frames.length >= 2);
+    assert.deepEqual(frames[1].entries.map((e) => e.id), ["e3"],
+      "the next frame carries the new entry ALONE — the browser already has e1/e2");
+
+    // An unchanged transcript sends nothing at all, however long it is watched.
+    const seen = frames.length;
+    await new Promise((r) => setTimeout(r, 2500));
+    assert.equal(frames.length, seen, "a quiet session costs no frames");
+  } finally {
+    mod.stopWatch("sess-delta");
+    mod.__setControlSink(null);
+  }
+});
+
+test("live tail: an entry that GREW is re-sent; one that merely re-appeared is not", async () => {
+  const mod = require("../tunnel-agent.js");
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "grow-wt-"));
+  const tid = "33333333-4444-5555-6666-777777777777";
+  const dir = writeTranscript(work, `${tid}.jsonl`, [
+    { uuid: "g1", type: "user", message: { content: "short" } },
+  ]);
+  const frames = [];
+  mod.__setControlSink((o) => { if (o.tail === "sess-grow") frames.push(o); });
+  try {
+    mod.startWatch("sess-grow", work, tid);
+    await waitForCond(() => frames.length >= 1);
+
+    // Same file, same entry, rewritten identically: nothing is due.
+    fs.writeFileSync(path.join(dir, `${tid}.jsonl`),
+      JSON.stringify({ uuid: "g1", type: "user", message: { content: "short" } }) + "\n");
+    const seen = frames.length;
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.equal(frames.length, seen, "an unchanged entry is not re-sent");
+
+    // Now the same id carries MORE. Weight, not presence, is the test.
+    fs.writeFileSync(path.join(dir, `${tid}.jsonl`),
+      JSON.stringify({ uuid: "g1", type: "user", message: { content: "short but now much longer" } }) + "\n");
+    await waitForCond(() => frames.length > seen);
+    assert.deepEqual(frames[frames.length - 1].entries.map((e) => e.id), ["g1"]);
+  } finally {
+    mod.stopWatch("sess-grow");
+    mod.__setControlSink(null);
+  }
+});
+
+test("live tail: a RE-ARM re-sends the whole window, even on an idle session", async () => {
+  const mod = require("../tunnel-agent.js");
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "rearm-wt-"));
+  const tid = "22222222-3333-4444-5555-666666666666";
+  writeTranscript(work, `${tid}.jsonl`, [
+    { uuid: "r1", type: "user", message: { content: "hello" } },
+  ]);
+  const frames = [];
+  mod.__setControlSink((o) => { if (o.tail === "sess-rearm") frames.push(o); });
+  try {
+    mod.startWatch("sess-rearm", work, tid);
+    await waitForCond(() => frames.length >= 1);
+    const seen = frames.length;
+
+    // The hub re-sends a watch on a control-channel flap and whenever a SECOND
+    // viewer joins. Both have seen nothing on this channel, and the deltas they
+    // missed went down a socket they were not on — so the watch must produce a
+    // snapshot. Leaving the delta state alone is what left a re-armed watch on
+    // an IDLE session silent forever: no delta is ever due.
+    mod.startWatch("sess-rearm", work, tid);
+    await waitForCond(() => frames.length > seen);
+    assert.deepEqual(frames[frames.length - 1].entries.map((e) => e.id), ["r1"]);
+  } finally {
+    mod.stopWatch("sess-rearm");
+    mod.__setControlSink(null);
+  }
+});
+
+test("live tail: a refused watch is NACKed to the hub, not just logged here", () => {
+  const mod = require("../tunnel-agent.js");
+  const nacks = [];
+  mod.__setControlSink((o) => { if (o.watchFailed) nacks.push(o); });
+  try {
+    // No worktree path: the agent can locate nothing, and the hub used to keep
+    // reporting the session live-watched while the browser held an open,
+    // permanently silent socket — the one state its /history repair was gated
+    // out of.
+    mod.startWatch("sess-nack", "", null);
+    assert.equal(nacks.length, 1);
+    assert.equal(nacks[0].watchFailed, "sess-nack");
+    assert.match(nacks[0].reason, /worktree/);
+  } finally {
+    mod.__setControlSink(null);
+  }
+});
+
+// A delta that never left the host must not be recorded as delivered. This is
+// the difference a delta makes: the snapshot this replaced re-sent the whole
+// window on every change, so a swallowed send self-healed. Here the entry is
+// gone for good — and when a later copy of it IS sent, every id-keyed grow-only
+// consumer appends it at the END, so the transcript reads out of order too.
+test("live tail: a frame that fails to send is re-sent, not silently dropped", async () => {
+  const mod = require("../tunnel-agent.js");
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "lost-wt-"));
+  const tid = "44444444-5555-6666-7777-888888888888";
+  const dir = writeTranscript(work, `${tid}.jsonl`, [
+    { uuid: "x1", type: "user", message: { content: "one" } },
+  ]);
+  const frames = [];
+  // The sink stands in for the socket. Returning false is a send that did NOT
+  // go out (a closed socket, a throwing ws.send) — which sendControl used to
+  // swallow, so the watcher recorded those ids as delivered.
+  let deliver = true;
+  const sink = (o) => {
+    if (o.tail !== "sess-lost") return true;
+    if (!deliver) return false;
+    frames.push(o);
+    return true;
+  };
+  mod.__setControlSink(sink);
+  try {
+    mod.startWatch("sess-lost", work, tid);
+    await waitForCond(() => frames.length >= 1);
+
+    deliver = false;
+    fs.appendFileSync(path.join(dir, `${tid}.jsonl`),
+      JSON.stringify({ uuid: "x2", type: "user", message: { content: "two" } }) + "\n");
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.equal(frames.length, 1, "nothing was delivered while the send failed");
+
+    deliver = true;
+    fs.appendFileSync(path.join(dir, `${tid}.jsonl`),
+      JSON.stringify({ uuid: "x3", type: "user", message: { content: "three" } }) + "\n");
+    await waitForCond(() => frames.length >= 2);
+
+    // Everything the failed frame carried rides the next one, in order.
+    const seen = [];
+    for (const f of frames) for (const e of f.entries) if (!seen.includes(e.id)) seen.push(e.id);
+    assert.deepEqual(seen, ["x1", "x2", "x3"]);
+  } finally {
+    mod.stopWatch("sess-lost");
+    mod.__setControlSink(null);
   }
 });

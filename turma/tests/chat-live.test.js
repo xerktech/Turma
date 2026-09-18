@@ -55,6 +55,11 @@ test.beforeEach(() => {
       ? { ok: true, json: async () => ({ token: "tok-1", expiresInSec: 300 }) }
       : { ok: true, status: 200, json: async () => ({ entries: [] }) };
   chat.__setSessionRef("hostA", "sess-1");
+  // Live-feed liveness is module state too (see liveDelivering): a previous
+  // test's armed feed must not vouch for this one's socket.
+  chat.__setLiveArmed(false);
+  chat.__setLastFrameAt(Date.now());
+  chat.__setForcedReconnectAt(0);
 });
 
 // The hub holds a browser's /live socket across a control-channel flap and
@@ -159,4 +164,158 @@ test("loadHistory doesn't fetch for a view that has closed", async () => {
   await chat.loadHistory(gen - 1);
   await settle();
   assert.deepEqual(fetched, []);
+});
+
+// ---- repair is driven by DATA LIVENESS, not socket state --------------------
+// The hub accepts and HOLDS a /live socket even when no agent watch was ever
+// armed behind it, and pings it every 30s so it never closes. The /history poll
+// only ran `if (!ws || ws.readyState !== OPEN)`, so an open-but-silent socket
+// permanently suppressed the only path that could repair the chat — and from
+// the browser it looked exactly like a healthy feed on a quiet session.
+
+// Feed a frame in the way the real socket does.
+function deliver(sock, frame) { sock.onmessage({ data: JSON.stringify(frame) }); }
+
+test("an OPEN socket the hub never armed does NOT suppress the /history poll", async () => {
+  await chat.reconnectNow();
+  await settle();
+  sockets[0].open();
+  chat.__setSess({ id: "sess-1", session: { paneBusy: false } });
+
+  // The hub's own answer: it accepted the socket but wired nothing behind it.
+  deliver(sockets[0], { type: "watch", armed: false, reason: "this host's tunnel is offline" });
+  assert.equal(chat.liveDelivering(), false, "an unarmed socket is not a live feed");
+
+  fetched = [];
+  chat.pollFallbackTick(chat.__gen());
+  await settle();
+  assert.deepEqual(fetched, ["/api/agents/hostA/sessions/sess-1/history"],
+    "the poll runs despite readyState === OPEN");
+  assert.equal(sockets[0].readyState, FakeSocket.CLOSED,
+    "...and the dead socket is replaced, not merely routed around");
+});
+
+test("an armed socket that delivers stops the poll", async () => {
+  await chat.reconnectNow();
+  await settle();
+  sockets[0].open();
+  chat.__setSess({ id: "sess-1", session: { paneBusy: true } });
+  deliver(sockets[0], { type: "watch", armed: true });
+  assert.equal(chat.liveDelivering(), true);
+
+  fetched = [];
+  chat.pollFallbackTick(chat.__gen());
+  await settle();
+  assert.deepEqual(fetched, [], "a healthy feed is left alone");
+});
+
+test("a WORKING session that has gone silent falls back and forces a reconnect", async () => {
+  await chat.reconnectNow();
+  await settle();
+  sockets[0].open();
+  deliver(sockets[0], { type: "watch", armed: true });
+
+  // Quiet session, no frames: legitimate. The agent only pushes on a CHANGE.
+  chat.__setSess({ id: "sess-1", session: { paneBusy: false, agents: [] } });
+  chat.__setLastFrameAt(Date.now() - 10 * chat.LIVE_STALE_MS);
+  assert.equal(chat.liveDelivering(), true, "silence on an idle session proves nothing");
+
+  // Same silence while the heartbeat says the session is WORKING is a broken
+  // feed: the agent polls the transcript every second and pushes every change.
+  chat.__setSess({ id: "sess-1", session: { paneBusy: true } });
+  assert.equal(chat.liveDelivering(), false);
+
+  fetched = [];
+  chat.__setForcedReconnectAt(0);
+  chat.pollFallbackTick(chat.__gen());
+  await settle();
+  assert.deepEqual(fetched, ["/api/agents/hostA/sessions/sess-1/history"]);
+  assert.equal(sockets[0].readyState, FakeSocket.CLOSED);
+});
+
+// The staleness read is "must a frame source be TICKING", not "is the session
+// working" — and live background agents are the case where those two differ.
+// A delegating session has ENDED its own turn (XERK-245): the pane emits
+// text:""/status:null and the agent list carries nothing that ticks, so the
+// agent's frame key never changes and it correctly sends nothing for minutes.
+// Counting that as a fault declared every healthy delegating session dead and
+// tore its socket down on a cooldown — and each re-arm re-sends a FULL window at
+// the loose caps, multiplying exactly the bytes the delta exists to save.
+test("live background agents do NOT make silence a fault (the feed has nothing to send)", async () => {
+  await chat.reconnectNow();
+  await settle();
+  sockets[0].open();
+  deliver(sockets[0], { type: "watch", armed: true });
+  chat.__setLastFrameAt(Date.now() - 10 * chat.LIVE_STALE_MS);
+
+  chat.__setSess({ id: "sess-1", session: { paneBusy: false, agents: [{ type: "agent" }] } });
+  assert.equal(chat.liveDelivering(), true, "a delegating session is left alone");
+
+  fetched = [];
+  chat.__setForcedReconnectAt(0);
+  chat.pollFallbackTick(chat.__gen());
+  await settle();
+  assert.deepEqual(fetched, [], "no /history poll");
+  assert.equal(sockets[0].readyState, FakeSocket.OPEN, "and the socket is not torn down");
+
+  // paneBusy IS a ticking source (status.elapsed advances every second), so the
+  // same silence there is still a fault.
+  chat.__setSess({ id: "sess-1", session: { paneBusy: true, agents: [{ type: "agent" }] } });
+  assert.equal(chat.liveDelivering(), false);
+});
+
+// The hub replays its last HEARTBEAT tail the moment the socket upgrades, even
+// on a socket it just said it could NOT arm. That frame is the hub's own cache
+// and proves nothing about the agent — letting it through cleared the
+// armed:false a millisecond after it was sent, re-suppressing the repair path in
+// exactly the case it exists for.
+test("the hub's own cached seed frame does not vouch for the agent feed", async () => {
+  await chat.reconnectNow();
+  await settle();
+  sockets[0].open();
+  chat.__setSess({ id: "sess-1", session: { paneBusy: false } });
+
+  deliver(sockets[0], { type: "watch", armed: false, reason: "this host's tunnel is offline" });
+  deliver(sockets[0], { type: "tail", entries: [{ id: "c1", role: "user", text: "cached" }], seed: true });
+  assert.equal(chat.liveDelivering(), false, "still unarmed after the seed");
+
+  fetched = [];
+  chat.pollFallbackTick(chat.__gen());
+  await settle();
+  assert.deepEqual(fetched, ["/api/agents/hostA/sessions/sess-1/history"]);
+
+  // A REAL delta (no `seed`) still proves it, which is what an older hub sends.
+  // Fresh socket: the tick above replaced the torn-down one.
+  await chat.reconnectNow();
+  await settle();
+  const fresh = sockets[sockets.length - 1];
+  fresh.open();
+  assert.equal(chat.liveDelivering(), false, "a new socket starts unproven");
+  deliver(fresh, { type: "tail", entries: [{ id: "c2", role: "user", text: "live" }] });
+  assert.equal(chat.liveDelivering(), true);
+});
+
+// A hub predating the ack sends no {type:"watch"} at all; a delta arriving is
+// the same proof by other means, so an older hub is not condemned to poll.
+test("a delta that arrives proves the feed is armed, ack or no ack", async () => {
+  await chat.reconnectNow();
+  await settle();
+  sockets[0].open();
+  chat.__setSess({ id: "sess-1", session: { paneBusy: true } });
+  assert.equal(chat.liveDelivering(), false, "nothing has proven the feed yet");
+  deliver(sockets[0], { type: "tail", entries: [] });
+  assert.equal(chat.liveDelivering(), true);
+});
+
+test("the forced reconnect is cooled down so an unreachable feed can't thrash", async () => {
+  await chat.reconnectNow();
+  await settle();
+  sockets[0].open();
+  chat.__setSess({ id: "sess-1", session: { paneBusy: true } });
+  deliver(sockets[0], { type: "watch", armed: false });
+  chat.__setForcedReconnectAt(Date.now());   // one just happened
+  chat.pollFallbackTick(chat.__gen());
+  await settle();
+  assert.equal(sockets[0].readyState, FakeSocket.OPEN,
+    "the socket is left up; the /history poll still runs every tick");
 });

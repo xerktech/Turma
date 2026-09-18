@@ -1876,8 +1876,10 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         ])
         rep = ha.session_report(self.WORKDIR, {})
         self.assertEqual(rep["tail"], [
-            {"id": "u1", "role": "user", "text": "hi"},
-            {"id": "u2", "role": "assistant", "text": "hello back"},
+            {"id": "u1", "role": "user", "text": "hi",
+             "blocks": [{"t": "text", "text": "hi"}]},
+            {"id": "u2", "role": "assistant", "text": "hello back",
+             "blocks": [{"t": "text", "text": "hello back"}]},
         ])
 
     def test_question_options_from_ask_user_question(self):
@@ -3031,17 +3033,136 @@ class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
         ])
         tail = ha.transcript_tail(path)
         self.assertEqual([e["id"] for e in tail], ["u1", "u2"])
-        self.assertEqual(tail[0], {"id": "u1", "role": "user", "text": "hello there"})
+        self.assertEqual(tail[0], {"id": "u1", "role": "user", "text": "hello there",
+                                   "blocks": [{"t": "text", "text": "hello there"}]})
         self.assertEqual(tail[1]["role"], "assistant")
+        # `text` stays the flat, lossy string the glasses have always read...
         self.assertEqual(tail[1]["text"], "red alert[Bash]")
+        # ...and `blocks` is what stops that string lying to the chat: the
+        # "[Bash]" in it is a TOOL CALL, not prose the model wrote.
+        self.assertEqual(tail[1]["blocks"], [
+            {"t": "thinking", "text": "hmm, let me see"},
+            {"t": "text", "text": "red alert"},
+            {"t": "tool_use", "name": "Bash", "input": "{}"},
+        ])
 
-    def test_oversize_message_truncated(self):
+    def test_oversize_message_truncated_and_flagged(self):
         path = os.path.join(self.proj, "big.jsonl")
         long_text = "x" * (ha.TAIL_MSG_CHARS + 50)
         write_jsonl(path, [{"uuid": "u1", "type": "user", "message": {"content": long_text}}])
         tail = ha.transcript_tail(path)
         self.assertEqual(len(tail[0]["text"]), ha.TAIL_MSG_CHARS)
         self.assertEqual(tail[0]["text"], long_text[:ha.TAIL_MSG_CHARS])
+        # The flag is the whole point: without it the chat renders a message cut
+        # mid-word with no "… clipped to fit" mark, and the operator reads the
+        # cut as the message.
+        self.assertTrue(tail[0]["truncated"])
+        self.assertTrue(tail[0]["blocks"][0]["truncated"])
+
+    def test_untruncated_row_carries_no_flag(self):
+        path = os.path.join(self.proj, "small.jsonl")
+        write_jsonl(path, [{"uuid": "u1", "type": "user", "message": {"content": "short"}}])
+        self.assertNotIn("truncated", ha.transcript_tail(path)[0])
+
+    def test_preview_never_reads_send_user_file_payloads(self):
+        """_tool_use_detail reads files off disk (base64 image previews,
+        XERK-221). Affordable once for one watched session; never for every
+        session on every beat — so the preview path must not call it."""
+        path = os.path.join(self.proj, "suf.jsonl")
+        target = os.path.join(self.proj, "pic.png")
+        with open(target, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"z" * 4096)
+        write_jsonl(path, [{"uuid": "u1", "type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "SendUserFile",
+             "input": {"files": [target], "caption": "look"}},
+        ]}}])
+        block = ha.transcript_tail(path)[0]["blocks"][0]
+        self.assertEqual(block["t"], "tool_use")
+        self.assertEqual(block["name"], "SendUserFile")
+        self.assertNotIn("files", block)
+        self.assertNotIn("caption", block)
+        # The single-session read still carries the whole thing.
+        rich = ha._entry_blocks(
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "SendUserFile",
+                 "input": {"files": [target], "caption": "look"}}]}},
+            ha.BLOCK_CAPS)
+        self.assertEqual(rich[0]["caption"], "look")
+
+    def test_block_budget_degrades_oldest_rows_but_never_to_bare_text(self):
+        """The budget is spent NEWEST-first: what the operator is looking at
+        keeps its fidelity, older rows keep their prose and lose tool payloads —
+        and never lose blocks entirely, which is what puts "[Bash]" back into a
+        prose bubble."""
+        path = os.path.join(self.proj, "budget.jsonl")
+        entries = []
+        for i in range(10):
+            entries.append({"uuid": f"a{i}", "type": "assistant", "message": {"content": [
+                {"type": "text", "text": f"prose {i} " + "p" * 400},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            ]}})
+            entries.append({"uuid": f"r{i}", "type": "user", "message": {"content": [
+                {"type": "tool_result", "content": "o" * 400},
+                {"type": "text", "text": f"reply {i}"},
+            ]}})
+        write_jsonl(path, entries)
+        with mock.patch.object(ha, "TAIL_BLOCKS_BUDGET", 2000):
+            tail = ha.transcript_tail(path)
+        self.assertTrue(all(e.get("blocks") for e in tail), "every row keeps blocks")
+        # Newest row: full preview fidelity (its tool_result text rides).
+        self.assertTrue(any(b.get("text") for b in tail[-1]["blocks"] if b["t"] == "tool_result"))
+        # Oldest row: prose survives, the tool_result payload is emptied + flagged.
+        oldest = tail[0]["blocks"]
+        self.assertTrue(any(b["t"] == "text" and b["text"] for b in oldest))
+        self.assertTrue(all(b["text"] == "" and b["truncated"]
+                            for b in oldest if b["t"] == "tool_result"))
+        # A tool call still reads as a tool call at every fidelity.
+        self.assertTrue(any(b["t"] == "tool_use" and b["name"] == "Bash"
+                            for b in tail[0 if tail[0]["role"] == "assistant" else 1]["blocks"]))
+
+    def test_degraded_tier_keeps_names_and_summaries(self):
+        """`caps["input"]` is not only a tool's argument summary — _entry_blocks
+        clips a task_notification's `summary` and a slash command's `name` with
+        it too. A zero there renders an over-budget row as a NAMELESS command
+        chip and a summary-less agent card: the same lie the blocks exist to
+        end."""
+        path = os.path.join(self.proj, "degraded.jsonl")
+        entries = []
+        # Enough full-fidelity rows ahead of them to exhaust the budget.
+        for i in range(20):
+            entries.append({"uuid": f"f{i}", "type": "assistant",
+                            "message": {"content": "p" * 500}})
+        tn = ("<task-notification><summary>ship the migration</summary>"
+              "<status>completed</status></task-notification>")
+        entries.insert(0, {"uuid": "tn", "type": "user", "message": {"content": tn}})
+        entries.insert(1, {"uuid": "cmd", "type": "user", "message": {
+            "content": "<command-name>/review</command-name><command-args>--fast</command-args>"}})
+        write_jsonl(path, entries)
+        with mock.patch.object(ha, "TAIL_BLOCKS_BUDGET", 1000):
+            rows = {e["id"]: e for e in ha.transcript_tail(path)}
+        tn_block = rows["tn"]["blocks"][0]
+        self.assertEqual(tn_block["t"], "task_notification")
+        self.assertEqual(tn_block["summary"], "ship the migration")
+        cmd_block = rows["cmd"]["blocks"][0]
+        self.assertEqual(cmd_block["t"], "command")
+        self.assertEqual(cmd_block["name"], "/review")
+
+    def test_block_payload_stays_bounded(self):
+        """One pathological tool-heavy turn must not blow the per-beat payload:
+        the budget bounds the WHOLE session's preview blocks, not each row."""
+        path = os.path.join(self.proj, "heavy.jsonl")
+        entries = []
+        for i in range(ha.TAIL_MSGS):
+            content = [{"type": "tool_result", "content": "x" * 5000} for _ in range(20)]
+            content.append({"type": "text", "text": "and some prose"})
+            entries.append({"uuid": f"h{i}", "type": "user", "message": {"content": content}})
+        write_jsonl(path, entries)
+        tail = ha.transcript_tail(path)
+        spent = sum(ha._blocks_weight(e.get("blocks") or []) for e in tail)
+        # Budget plus at most one over-budget row's worth of the tighter caps.
+        self.assertLess(spent, ha.TAIL_BLOCKS_BUDGET +
+                        ha.BLOCK_MAX_PER_ENTRY * ha.TAIL_PREVIEW_CAPS_MIN["text"] +
+                        ha.TAIL_MSGS * ha.TAIL_PREVIEW_CAPS_MIN["text"] * 2)
 
     def test_window_limited_to_tail_msgs(self):
         path = os.path.join(self.proj, "many.jsonl")

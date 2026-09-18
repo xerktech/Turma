@@ -5350,6 +5350,47 @@ test("http: stale cached history (>5 minutes) is re-queued instead of served", a
   assert.equal(res.body.pending, true);
 });
 
+// /history is the chat's ONLY repair path once the live feed stops delivering,
+// and the fresh-cache branch used to return without queueing anything: the
+// archive fast path and the queue-and-202 path both sit underneath it. A client
+// polling every 6s therefore got the identical five-minute-old body every time
+// and the chat could never heal, no matter how long it was left open.
+test("http: a fresh-but-aging cached history is SERVED and refreshed behind the answer", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hhr" }, headers: agentHeaders });
+  await request("POST", "/api/heartbeat", {
+    body: { device: "hhr", historyResults: [
+      { sessionId: "s1", entries: [{ id: "1", role: "user", text: "hi" }], truncated: false }] },
+    headers: agentHeaders,
+  });
+  // Inside HISTORY_FRESH_MS (5 min) but past HISTORY_REFRESH_AFTER_MS (10s).
+  agents.hhr.history.s1.fetchedAt = Date.now() - 30 * 1000;
+
+  const res = await request("GET", "/api/agents/hhr/sessions/s1/history", { headers: userHeaders });
+  assert.equal(res.status, 200, "the operator still gets an answer at once");
+  assert.deepEqual(res.body.entries, [{ id: "1", role: "user", text: "hi" }]);
+  const queued = (agents.hhr.commands || []).filter(
+    (c) => c.type === "history" && c.sessionId === "s1");
+  assert.equal(queued.length, 1, "...and a refresh is on its way");
+
+  // Single-flight: a second poll while that one is outstanding queues nothing.
+  await request("GET", "/api/agents/hhr/sessions/s1/history", { headers: userHeaders });
+  assert.equal((agents.hhr.commands || []).filter(
+    (c) => c.type === "history" && c.sessionId === "s1").length, 1);
+});
+
+test("http: a JUST-fetched cached history queues no refresh", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hhr2" }, headers: agentHeaders });
+  await request("POST", "/api/heartbeat", {
+    body: { device: "hhr2", historyResults: [{ sessionId: "s1", entries: [], truncated: false }] },
+    headers: agentHeaders,
+  });
+  const before = (agents.hhr2.commands || []).length;
+  const res = await request("GET", "/api/agents/hhr2/sessions/s1/history", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal((agents.hhr2.commands || []).length, before,
+    "a cache seconds old is not worth an agent round trip");
+});
+
 test("http: a running session's scrollback is served INSTANTLY from the archive (200, not 202) + refresh queued", async () => {
   // The agent keeps a running worktree-backed session syncing to the archive, so
   // /history serves it hub-locally on a cache miss instead of waiting out an agent
@@ -13922,6 +13963,221 @@ test("live WS: unknown session on a known host -> 404; a real session still upgr
   ok.socket.destroy();
 });
 
+// A socket the hub accepts but never wires to an agent watch is, from the
+// browser, indistinguishable from a healthy one on a quiet session — and the
+// chat's /history repair only ran while the socket was DOWN, so that state
+// suppressed the one path that could have fixed it. The hub therefore says
+// which it gave you, in its own words (the XERK-264 refusal shape).
+test("live WS: the hub acks whether it actually armed an agent watch, with a reason when it did not", async () => {
+  agents.ackhost = {
+    device: "ackhost", lastSeen: Date.now(), commands: [], history: {},
+    sessions: [{ id: "s1", worktreePath: "/wt/s1", session: { tail: [] } },
+               { id: "noworktree", session: { tail: [] } }],
+  };
+  const token = await issueToken();
+
+  // No control channel for this host yet.
+  const offline = await wsConnect(`/live/ackhost/s1?auth=${token}`);
+  const offFrames = collectFrames(offline.socket, offline.leftover);
+  assert.deepEqual(await nextTextJson(offFrames, 0),
+    { type: "watch", armed: false, reason: "this host's tunnel is offline" });
+  offline.socket.destroy();
+  await waitFor(() => !hub.liveClients.ackhost?.s1);
+
+  const ctrl = await wsConnect(`/agent/control?name=ackhost&token=agenttok`);
+  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+  const agentFrames = collectFrames(ctrl.socket, ctrl.leftover);
+  try {
+    // Known session with a worktree: armed, and the agent is told to tail it.
+    const live = await wsConnect(`/live/ackhost/s1?auth=${token}`);
+    const frames = collectFrames(live.socket, live.leftover);
+    assert.deepEqual(await nextTextJson(frames, 0), { type: "watch", armed: true });
+    await waitFor(() => agentFrames.some((f) => f.op === 0x1 &&
+      JSON.parse(f.payload.toString("utf8")).watch === "s1"));
+
+    // A SECOND viewer of the same session must be armed too: the tail frame is a
+    // delta now, and the agent resets its delta state on a re-arm, so this is
+    // what gets the new browser a full snapshot instead of silence until the
+    // session next speaks.
+    const seen = agentFrames.length;
+    const second = await wsConnect(`/live/ackhost/s1?auth=${token}`);
+    const secondFrames = collectFrames(second.socket, second.leftover);
+    assert.deepEqual(await nextTextJson(secondFrames, 0), { type: "watch", armed: true });
+    await waitFor(() => agentFrames.slice(seen).some((f) => f.op === 0x1 &&
+      JSON.parse(f.payload.toString("utf8")).watch === "s1"));
+
+    // The agent REFUSING a watch (no worktree its side, at MAX_WATCHERS) used to
+    // be a log line on the host and nothing else.
+    ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+      { watchFailed: "s1", reason: "at MAX_WATCHERS (16)" }))));
+    const nack = await nextTextJson(frames, 1);
+    assert.equal(nack.type, "watch");
+    assert.equal(nack.armed, false);
+    assert.match(nack.reason, /MAX_WATCHERS/);
+
+    live.socket.destroy();
+    second.socket.destroy();
+
+    // A session the host has not described yet cannot be armed at all — and the
+    // viewer is told so rather than left on a socket nothing will write to.
+    const unknown = await wsConnect(`/live/ackhost/noworktree?auth=${token}`);
+    const unkFrames = collectFrames(unknown.socket, unknown.leftover);
+    const ack = await nextTextJson(unkFrames, 0);
+    assert.equal(ack.armed, false);
+    assert.match(ack.reason, /worktree/);
+    unknown.socket.destroy();
+  } finally {
+    ctrl.socket.destroy();
+    delete agents.ackhost;
+  }
+});
+
+// An agent-authed control frame naming `__proto__` as its session id used to
+// resolve off Object.prototype in `liveFanout` and throw "set is not iterable"
+// straight out of the control-channel listener — which EXITS the hub process,
+// taking every host's terminal, live tail and heartbeat poke with it. The
+// `typeof id === "string"` guard (XERK-278) does not cover it: these ARE
+// strings. Same class as the `controlChannels`/`pendingChannels` trap.
+test("live WS: a control frame naming a prototype key cannot kill the hub", async () => {
+  agents.protohost = {
+    device: "protohost", lastSeen: Date.now(), commands: [], history: {},
+    sessions: [{ id: "s1", worktreePath: "/wt/s1", session: { tail: [] } }],
+  };
+  const token = await issueToken();
+  const ctrl = await wsConnect(`/agent/control?name=protohost&token=agenttok`);
+  const live = await wsConnect(`/live/protohost/s1?auth=${token}`);
+  const frames = collectFrames(live.socket, live.leftover);
+  try {
+    for (const key of ["__proto__", "constructor", "toString", "valueOf"]) {
+      ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+        { tail: key, entries: [] }))));
+      ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+        { turn: key, text: "x" }))));
+      ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+        { watchFailed: key, reason: "x" }))));
+    }
+    // The hub is still serving, and the real session's socket still works.
+    await new Promise((r) => setTimeout(r, 120));
+    ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+      { tail: "s1", entries: [{ id: "e1", role: "user", text: "alive" }] }))));
+    await waitFor(() => frames.filter((f) => f.op === 0x1).some((f) => {
+      try { return JSON.parse(f.payload.toString("utf8")).entries?.[0]?.id === "e1"; }
+      catch { return false; }
+    }));
+    // ...and nothing was re-parented onto Object.prototype.
+    assert.equal({}.host, undefined);
+    assert.equal(({}).s1, undefined);
+  } finally {
+    live.socket.destroy();
+    ctrl.socket.destroy();
+    delete agents.protohost;
+  }
+});
+
+// A host at MAX_WATCHERS refuses deterministically. Re-asking on every beat for
+// the life of the session buys nothing — a control reconnect (the agent forgot
+// its watchers, so its cap really is different) and a transcript MOVE are the
+// two things that can change the answer, and both still re-arm.
+test("live WS: a watch the agent REFUSED is not re-asked on every beat", async () => {
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: "nackhost", sessions: [
+      { id: "s1", status: "running", worktreePath: "/wt/s1", transcriptId: "t1" }] },
+  });
+  const token = await issueToken();
+  const ctrl = await wsConnect(`/agent/control?name=nackhost&token=agenttok`);
+  const agentFrames = collectFrames(ctrl.socket, ctrl.leftover);
+  const live = await wsConnect(`/live/nackhost/s1?auth=${token}`);
+  try {
+    await waitFor(() => agentFrames.some((f) => f.op === 0x1 &&
+      JSON.parse(f.payload.toString("utf8")).watch === "s1"));
+    ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+      { watchFailed: "s1", reason: "at MAX_WATCHERS (16)" }))));
+    await new Promise((r) => setTimeout(r, 80));
+    const afterNack = agentFrames.length;
+
+    // Three more beats describing the same session, unchanged.
+    for (let i = 0; i < 3; i++) {
+      await request("POST", "/api/heartbeat", {
+        headers: agentHeaders,
+        body: { device: "nackhost", sessions: [
+          { id: "s1", status: "running", worktreePath: "/wt/s1", transcriptId: "t1" }] },
+      });
+    }
+    await new Promise((r) => setTimeout(r, 80));
+    const reasked = agentFrames.slice(afterNack).filter((f) => f.op === 0x1 && (() => {
+      try { return JSON.parse(f.payload.toString("utf8")).watch === "s1"; } catch { return false; }
+    })()).length;
+    assert.equal(reasked, 0, "a refused watch is left alone");
+
+    // ...and a refusal naming a session NOBODY watches records nothing. This
+    // write is the only one here that ADDS a key rather than deleting one, and
+    // the id comes off an agent-authed frame, so recording it unconditionally
+    // let one agent grow the hub's heap for the life of the control channel.
+    const armedKeys = () => Object.keys(hub.liveWatchArmed?.nackhost || {});
+    const before = armedKeys().length;
+    for (const ghost of ["ghost-1", "ghost-2", "ghost-3"]) {
+      ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+        { watchFailed: ghost, reason: "at MAX_WATCHERS (16)" }))));
+    }
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(armedKeys().length, before, "an unwatched session records nothing");
+
+    // ...but a transcript MOVE is new information, so it is asked again.
+    await request("POST", "/api/heartbeat", {
+      headers: agentHeaders,
+      body: { device: "nackhost", sessions: [
+        { id: "s1", status: "running", worktreePath: "/wt/s1", transcriptId: "t2" }] },
+    });
+    await waitFor(() => agentFrames.slice(afterNack).some((f) => f.op === 0x1 && (() => {
+      try {
+        const m = JSON.parse(f.payload.toString("utf8"));
+        return m.watch === "s1" && m.transcriptId === "t2";
+      } catch { return false; }
+    })()));
+  } finally {
+    live.socket.destroy();
+    ctrl.socket.destroy();
+    delete agents.nackhost;
+  }
+});
+
+// armLiveWatcher can only arm a session the LAST heartbeat described, and the
+// move-detector below it explicitly skipped any session absent from the previous
+// beat — so a chat opened on a just-spawned session armed nothing and nothing
+// ever retried. It had no live feed for its whole life.
+test("live WS: a session the hub could not arm yet is armed on the beat that first describes it", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "latehost", sessions: [{ id: "later", status: "running" }] },
+    headers: agentHeaders,
+  });
+  const token = await issueToken();
+  const ctrl = await wsConnect(`/agent/control?name=latehost&token=agenttok`);
+  const agentFrames = collectFrames(ctrl.socket, ctrl.leftover);
+  const live = await wsConnect(`/live/latehost/later?auth=${token}`);
+  const frames = collectFrames(live.socket, live.leftover);
+  try {
+    // No worktreePath on that beat -> nothing armed, and the viewer hears it.
+    assert.equal((await nextTextJson(frames, 0)).armed, false);
+    assert.ok(!agentFrames.some((f) => f.op === 0x1 &&
+      JSON.parse(f.payload.toString("utf8")).watch), "nothing to arm yet");
+
+    // The next beat describes it. THAT is when the watch has to go out.
+    await request("POST", "/api/heartbeat", {
+      body: { device: "latehost", sessions: [
+        { id: "later", status: "running", worktreePath: "/wt/later", transcriptId: "t1" }] },
+      headers: agentHeaders,
+    });
+    await waitFor(() => agentFrames.some((f) => f.op === 0x1 &&
+      JSON.parse(f.payload.toString("utf8")).watch === "later"));
+    assert.equal((await nextTextJson(frames, 1)).armed, true, "...and the viewer is told");
+  } finally {
+    live.socket.destroy();
+    ctrl.socket.destroy();
+    delete agents.latehost;
+  }
+});
+
 test("queueCommand pokes a connected control channel so the agent beats immediately", async () => {
   agents.pokehost = { device: "pokehost", lastSeen: Date.now(), commands: [], history: {}, sessions: [] };
   const ctrl = await wsConnect(`/agent/control?name=pokehost&token=agenttok`);
@@ -14008,9 +14264,19 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
   assert.match(live.statusLine, /^HTTP\/1\.1 101/);
   const liveFrames = collectFrames(live.socket, live.leftover);
 
-  // 1. Immediately seeded with the cached tail.
-  const seed = await nextTextJson(liveFrames, 0);
+  // 0. The hub's arm ack — whether an agent watch was actually wired behind the
+  //    socket it just accepted. See the dedicated cases above.
+  assert.deepEqual(await nextTextJson(liveFrames, 0), { type: "watch", armed: true });
+
+  // 1. Immediately seeded with the cached tail — marked `seed:true`, which is
+  //    the HUB's half of a two-sided contract: chat.js refuses to read a seed
+  //    frame as proof that a watch was armed (it is replayed even on a socket
+  //    just acked armed:false). The client-side half is asserted in
+  //    chat-live.test.js against a hand-written frame, so without this the two
+  //    can drift apart silently and the ack clears itself again.
+  const seed = await nextTextJson(liveFrames, 1);
   assert.equal(seed.type, "tail");
+  assert.equal(seed.seed, true, "the hub marks its own cached replay as a seed");
   assert.deepEqual(seed.entries, [{ id: "c1", role: "assistant", text: "cached" }]);
 
   // 2. The agent was told to start tailing, with everything it needs to find
@@ -14034,7 +14300,7 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
     ],
   }] };
   ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(delta))));
-  const relayed = await nextTextJson(liveFrames, 1);
+  const relayed = await nextTextJson(liveFrames, 2);
   assert.equal(relayed.type, "tail");
   assert.deepEqual(relayed.entries, delta.entries);
   // An agent predating the queued field: the hub normalises to [].
@@ -14044,18 +14310,18 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
   //     ride beside the entries and reach the live client.
   ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
     { tail: "ls1", entries: delta.entries, queued: ["also do X"] }))));
-  const queuedFrame = await nextTextJson(liveFrames, 2);
+  const queuedFrame = await nextTextJson(liveFrames, 3);
   assert.equal(queuedFrame.type, "tail");
   assert.deepEqual(queuedFrame.queued, ["also do X"]);
 
   // 3b. A live `turn` delta (in-progress assistant text from the TUI) is fanned
   //     out too, including the empty-string clear on completion.
   ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({ turn: "ls1", text: "streaming…" }))));
-  const turn = await nextTextJson(liveFrames, 3);
+  const turn = await nextTextJson(liveFrames, 4);
   assert.equal(turn.type, "turn");
   assert.equal(turn.text, "streaming…");
   ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({ turn: "ls1", text: "" }))));
-  const cleared = await nextTextJson(liveFrames, 4);
+  const cleared = await nextTextJson(liveFrames, 5);
   assert.equal(cleared.type, "turn");
   assert.equal(cleared.text, "");
 
@@ -20581,6 +20847,11 @@ test("XERK-781: openLiveForRelay (owner side) arms the tail, streams deltas, and
   try {
     const d = await hub.openLiveForRelay(host, "sX");
     assert.deepEqual(watched, ["sX"], "the first relay watcher arms the agent tail");
+    // Every subscriber — browser or relay pseudo-subscriber — is told whether a
+    // watch was actually armed behind it, so a silent feed is distinguishable
+    // from a quiet session.
+    const ack = await new Promise((resolve) => d.once("data", (c) => resolve(c.toString("utf8"))));
+    assert.deepEqual(JSON.parse(ack), { type: "watch", armed: true });
 
     const got = new Promise((resolve) => d.once("data", (c) => resolve(c.toString("utf8"))));
     hub.liveFanout(host, "sX", { type: "tail", entries: ["hi"] });
@@ -20609,6 +20880,10 @@ test("XERK-781: openLiveRelay (origin side) fans an owner's relayed deltas to th
   // No control channel for this host => armLiveWatcher does not arm locally; the
   // relay channel is what feeds the deltas.
   hub.armLiveWatcher(host, sid, browser);
+  // The arm ack (armed:false here — this replica holds no control channel) is
+  // the first thing on the socket; the relay channel is what delivers after it.
+  assert.equal(frames.length, 1, "the subscriber is told it was NOT armed locally");
+  frames.length = 0;
   try {
     await hub.openLiveRelay(host, sid);
     assert.equal(opts.kind, "live", "a LIVE channel is opened");
