@@ -3076,6 +3076,23 @@ class TestEntryBlocks(unittest.TestCase):
         self.assertEqual(len(rb["text"]), ha.BLOCK_CAPS["result"])
         self.assertTrue(rb["truncated"])
 
+    def test_over_cap_result_clips_by_code_point(self):
+        # XERK-863: _clip indexes by CODE POINT; the mirror tunnel-agent.js `clip`
+        # must agree at the cap on astral-plane text rather than counting an emoji
+        # as two UTF-16 units. Same fixture as the JS parity test: an emoji at
+        # code-point index cap-1 is kept WHOLE, and the block holds exactly `cap`
+        # code points. (In Python a surrogate pair can't be split — str is code
+        # points — so this pins the reference the JS side had to be fixed to match.)
+        cap = ha.BLOCK_CAPS["result"]
+        out = "x" * (cap - 1) + "\U0001F600" + "y" * 200
+        rb = ha._entry_blocks(
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": out}]}},
+            ha.BLOCK_CAPS,
+        )[0]
+        self.assertTrue(rb["truncated"])
+        self.assertEqual(len(rb["text"]), cap)
+        self.assertTrue(rb["text"].endswith("\U0001F600"))
+
     def test_wrong_type_and_no_message_return_none_empty_content_empty_list(self):
         self.assertIsNone(ha._entry_blocks({"type": "summary", "message": {"content": "x"}}, ha.BLOCK_CAPS))
         self.assertIsNone(ha._entry_blocks({"type": "user"}, ha.BLOCK_CAPS))

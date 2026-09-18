@@ -398,9 +398,20 @@ function entryId(entry) {
 }
 
 // (clipped, wasTruncated). Mirror of hub-agent.py _clip.
+// Clip by CODE POINT, not UTF-16 code unit, so the two feeds agree on astral
+// text (emoji, some CJK extensions) at the cap: Python indexes strings by code
+// point (`text[:cap]`), and a bare `.slice(0, cap)` here would count one astral
+// character as two AND could split a surrogate pair right at the boundary
+// (XERK-863). `text.length` (UTF-16 units) is always >= the code-point count, so
+// a string that fits in units cannot exceed the cap in code points — the common
+// (ASCII / short) case keeps the cheap fast path and only a genuinely-long
+// string pays for the code-point count.
 function clip(text, cap) {
   text = text || "";
-  if (text.length > cap) return [text.slice(0, cap), true];
+  if (text.length > cap) {
+    const cps = Array.from(text);
+    if (cps.length > cap) return [cps.slice(0, cap).join(""), true];
+  }
   return [text, false];
 }
 

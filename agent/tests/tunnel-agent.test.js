@@ -131,6 +131,22 @@ test("entryBlocks: over-cap text/result get truncated:true and are clipped", () 
   assert.equal(rb.truncated, true);
 });
 
+// XERK-863: clip by CODE POINT, not UTF-16 unit, so this feed and Python's
+// _entry_blocks ship the same characters at the cap on astral-plane text. An
+// emoji straddling the boundary must be kept WHOLE (never split into a lone
+// surrogate) and the block must hold exactly `cap` code points, matching the
+// mirror assertion in test_hub_agent.py::test_over_cap_result_clips_by_code_point.
+test("entryBlocks: over-cap result clips by code point, never splitting a surrogate pair", () => {
+  const cap = BLOCK_CAPS.result;
+  // The emoji sits at code-point index cap-1, so a code-point clip keeps it whole.
+  const out = "x".repeat(cap - 1) + "\u{1F600}" + "y".repeat(200);
+  const [rb] = entryBlocks({ type: "user", message: { content: [{ type: "tool_result", content: out }] } }, BLOCK_CAPS);
+  assert.equal(rb.truncated, true);
+  assert.equal(Array.from(rb.text).length, cap, "clipped to exactly cap CODE POINTS");
+  assert.ok(rb.text.endsWith("\u{1F600}"), "the straddling emoji is kept whole");
+  assert.ok(!/[\uD800-\uDBFF]$/.test(rb.text), "never ends in a lone high surrogate");
+});
+
 test("entryBlocks: wrong type / no message -> null; empty content -> []", () => {
   assert.equal(entryBlocks({ type: "system", message: { content: "x" } }, BLOCK_CAPS), null);
   assert.equal(entryBlocks({ type: "user" }, BLOCK_CAPS), null);
