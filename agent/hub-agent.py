@@ -21672,13 +21672,14 @@ class SessionManager:
             if not self._trust_scope_ok(sess):
                 # Left up deliberately: a human answers it at the terminal. Say so
                 # once (the window expiry stops the log repeating forever).
-                log(f"session {sess['id']}: Claude Code is asking whether to trust "
+                log(f"session {sess.get('id')}: Claude Code is asking whether to "
+                    f"trust "
                     f"{sess.get('worktreePath')!r} and this agent will not answer "
                     f"it (outside REPOS_ROOT, or TURMA_AUTO_TRUST is off) — answer "
                     f"it in the session's terminal")
                 continue
             if _answer_trust_dialog(tmux, cap=cap):
-                log(f"session {sess['id']}: accepted Claude Code's trust prompt "
+                log(f"session {sess.get('id')}: accepted Claude Code's trust prompt "
                     f"for {sess.get('worktreePath')!r} (a workspace this agent "
                     f"manages). Its DEFAULT is 'No, exit', which would have ended "
                     f"the session")
@@ -21700,7 +21701,7 @@ class SessionManager:
             return False
         if not _answer_trust_dialog(tmux, cap=cap):
             return False
-        log(f"session {sess['id']}: accepted Claude Code's trust prompt before "
+        log(f"session {sess.get('id')}: accepted Claude Code's trust prompt before "
             f"delivering a message")
         sess.pop("trustCheckUntil", None)
         deadline = time.time() + wait
@@ -21757,8 +21758,13 @@ class SessionManager:
             if sess.get("status") != "running":
                 sess.pop("deadTmuxStrikes", None)
                 continue
-            tmux = sess.get("tmuxName")
-            if not tmux:
+            # Every field is read with .get() and a missing one skips the record
+            # (XERK-402): this is the BEAT, and a legacy / hand-edited / partial
+            # ~/.turma/sessions.json must not take the host's sessions down. A
+            # record with no id is unmanageable anyway — nothing could reap its
+            # ttyd or name it in an error.
+            sid, tmux = sess.get("id"), sess.get("tmuxName")
+            if not sid or not tmux:
                 continue
             if tmux in live:
                 sess.pop("deadTmuxStrikes", None)
@@ -21772,7 +21778,7 @@ class SessionManager:
             # Reap the orphaned ttyd FIRST: while it lives the terminal serves
             # tmux's raw "can't find session" text, which reads like a working
             # terminal saying something cryptic rather than a session that ended.
-            self._kill_ttyd(sess["id"])
+            self._kill_ttyd(sid)
             sess["stoppedAt"] = now_iso()
             self._set_error(
                 sess,

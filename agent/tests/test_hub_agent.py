@@ -19440,6 +19440,16 @@ class TestAnswerTrustDialogSweep(ManagerMixin, unittest.TestCase):
         sm._answer_trust_dialogs()
         self.assertEqual(len(self.captures), ha.TRUST_CHECKS_PER_BEAT)
 
+    def test_the_sweep_never_raises_onto_the_beat(self):
+        # The beat is the manager's MAIN process: a KeyError here takes every
+        # session on the host down. Legacy / hand-edited / partial
+        # ~/.turma/sessions.json records are the shape that does it (XERK-402).
+        sm = self.make_manager(capture=LINUX_TRUST_MODAL)
+        sm.registry = [{"trustCheckUntil": time.time() + 60},          # no id
+                       {"id": "x", "trustCheckUntil": time.time() + 60},  # no status
+                       {"status": "running", "trustCheckUntil": time.time() + 60}]
+        sm._answer_trust_dialogs()
+
     def test_trust_scope_is_limited_to_the_repos_root(self):
         sm = super().make_manager()
         with mock.patch.object(ha, "AUTO_TRUST_WORKSPACE", True):
@@ -19572,9 +19582,17 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.registry[0]["status"], "running")
 
     def test_the_sweep_never_raises_onto_the_beat(self):
+        # run_forever is the manager's MAIN process: a KeyError here takes every
+        # session on the host down. Legacy / hand-edited / partial
+        # ~/.turma/sessions.json records are the shape that does it (XERK-402),
+        # including one that is `running` and reaches the REAP path with fields
+        # missing.
         sm = self.make_manager()
-        sm.registry = [{"id": "broken"}]          # a legacy/partial record
-        sm._sweep_dead_sessions()                 # no KeyError onto run_forever
+        sm.registry = [{"id": "broken"},                    # no status
+                       {"status": "running"},               # no id, no tmuxName
+                       {"status": "running", "tmuxName": "agent-gone"}]  # no id
+        for _ in range(ha.DEAD_TMUX_STRIKES + 1):
+            sm._sweep_dead_sessions()             # no KeyError onto run_forever
 
 
 class TestSessionSummaries(ManagerMixin, unittest.TestCase):
