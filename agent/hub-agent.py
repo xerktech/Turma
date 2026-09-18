@@ -9967,13 +9967,17 @@ _TMUX_KEY_BYTES = {
 }
 
 
-def _pane_send_keys(tmux_name, *tokens, literal=False):
+def _pane_send_keys(tmux_name, *tokens, literal=False, timeout=None):
     """Send keystrokes to a session pane: `tmux send-keys` on Linux, an `inject`
     of the equivalent bytes over the pty-host control channel on Windows
     (XERK-697), so interrupt / set_mode / set_model / answer_pane_prompt drive a
     ConPTY session exactly as they drive a tmux pane. `literal=True` sends the
     tokens as verbatim TEXT (tmux `-l -- …`); otherwise each token is a key NAME
-    translated through _TMUX_KEY_BYTES."""
+    translated through _TMUX_KEY_BYTES.
+
+    `timeout` bounds the tmux send (default `run()`'s 15s). A caller on the BEAT
+    passes a short one: `run()`'s default times N keystrokes is a worst case that
+    can pass the hub's OFFLINE_AFTER_MS on a wedged tmux."""
     if IS_WINDOWS:
         if literal:
             data = "".join(str(t) for t in tokens)
@@ -9985,7 +9989,7 @@ def _pane_send_keys(tmux_name, *tokens, literal=False):
     if literal:
         cmd += ["-l", "--"]
     cmd += [str(t) for t in tokens]
-    run(cmd)
+    run(cmd, timeout=timeout) if timeout else run(cmd)
 
 
 # Claude Code's "do you trust the files in this folder?" modal, and its accept
@@ -10027,6 +10031,14 @@ AUTO_TRUST_WORKSPACE = os.environ.get(
 # `_sweep_dead_sessions` ends it. >1 on purpose: the listing and the scan are not
 # atomic, so a session launched or relaunched in between is owed another beat.
 DEAD_TMUX_STRIKES = _env_int("TURMA_DEAD_TMUX_STRIKES", 2, minimum=1)
+# The modal's two options are adjacent, so the cursor is at most one step from
+# the accept line. Anything further means it was mis-located; `_answer_trust_dialog`
+# refuses rather than pressing an unbounded number of arrows on the beat. 2 leaves
+# room for a build that adds one option without needing a code change.
+_TRUST_MAX_STEPS = 2
+# And each of those sends is bounded well under `run()`'s 15s default, so the
+# whole answer costs at most (_TRUST_MAX_STEPS + 1) * this on a wedged tmux.
+_TRUST_KEY_TIMEOUT_SEC = _env_int("TURMA_TRUST_KEY_TIMEOUT_SEC", 3, minimum=1)
 
 
 def _trust_dialog_up(cap):
@@ -10047,9 +10059,9 @@ def _trust_dialog_up(cap):
 
     Deliberately stricter than the `_TRUST_DIALOG_RE` sniff `_answer_trust_dialog`
     opens with: this one runs against LIVE operator sessions whose panes carry
-    arbitrary conversation text, so it also requires the accept OPTION line and
-    the absence of a composer footer. A session merely discussing trusting a
-    folder is not a modal."""
+    arbitrary conversation text, so it also requires the accept OPTION line, the
+    absence of a composer footer, and the absence of a NUMBERED dialog. A session
+    merely discussing trusting a folder is not a modal."""
     if not cap:
         return False
     text = _ANSI_RE.sub("", cap)
@@ -10057,6 +10069,19 @@ def _trust_dialog_up(cap):
         return False
     if PANE_MODE_RE.search(text) or QWEN_PANE_FOOTER_RE.search(text):
         return False           # the composer footer is live: no modal is up
+    # A NUMBERED dialog is never the trust modal — the two are mutually exclusive
+    # by construction (the modal's options carry no `N.`), and a pane can only
+    # show one dialog at a time. This check is load-bearing, not belt-and-braces:
+    # a tool-permission dialog shows no mode footer either (that is exactly what
+    # makes `parse_pane_prompt` work), so WITHOUT it any Write/Bash dialog whose
+    # diff, command or description happened to contain a short line matching
+    # `trust this folder` — this repo's own sources and rules files now do —
+    # satisfied every other condition, and the beat then drove arrow keys and an
+    # Enter into it, APPROVING a tool call in a session the operator had put in
+    # manual permission mode. Reproduced live by QA; never remove this.
+    # Ordered after the cheap regex sniff so a settled pane never pays for it.
+    if parse_pane_prompt(cap):
+        return False
     for line in text.splitlines():
         stripped = line.strip()
         # The accept OPTION line ('Yes, I trust this folder'), not the question
@@ -10128,9 +10153,19 @@ def _answer_trust_dialog(tmux_name, cap=None):
         delta = accept_idx - cursor_idx
         key = "Down" if delta >= 0 else "Up"
         steps = abs(delta)
+    # The real modal is two adjacent options, so the distance is 1 (or 0 when the
+    # cursor already sits on accept). A LARGER distance means the cursor or the
+    # accept line was mis-located, and pressing that many arrows is both wrong and
+    # the only unbounded cost this function has — it now runs on the BEAT, where
+    # `steps` keystrokes at `run()`'s 15s default is a worst case that can pass
+    # the hub's OFFLINE_AFTER_MS. Refuse instead of guessing, and bound every send.
+    if steps > _TRUST_MAX_STEPS:
+        log(f"trust prompt: cursor is {steps} options from the accept line, "
+            f"which is not the modal's shape — sending nothing")
+        return False
     for _ in range(steps):
-        _pane_send_keys(tmux_name, key)
-    _pane_send_keys(tmux_name, "Enter")
+        _pane_send_keys(tmux_name, key, timeout=_TRUST_KEY_TIMEOUT_SEC)
+    _pane_send_keys(tmux_name, "Enter", timeout=_TRUST_KEY_TIMEOUT_SEC)
     return True
 
 
@@ -21643,7 +21678,7 @@ class SessionManager:
         out of scope (or a fleet with `TURMA_AUTO_TRUST=0`) keeps its modal up
         waiting for a human, and nothing types into it meanwhile."""
         now = time.time()
-        checked = 0
+        checked = answered = 0
         for sess in list(self.registry):
             until = sess.get("trustCheckUntil")
             if not until:
@@ -21652,7 +21687,11 @@ class SessionManager:
                 sess.pop("trustCheckUntil", None)
                 self.save()
                 continue
-            if checked >= TRUST_CHECKS_PER_BEAT:
+            # At most TRUST_CHECKS_PER_BEAT captures AND at most ONE answer per
+            # beat: the captures and the keystrokes are the two costs this puts on
+            # the beat, and both have to stay bounded independently of how many
+            # sessions launched at once (CLAUDE.md's beat-loop budget).
+            if checked >= TRUST_CHECKS_PER_BEAT or answered:
                 continue                       # next beat; the window is long
             tmux = sess.get("tmuxName")
             if not tmux:
@@ -21679,6 +21718,7 @@ class SessionManager:
                     f"it in the session's terminal")
                 continue
             if _answer_trust_dialog(tmux, cap=cap):
+                answered += 1
                 log(f"session {sess.get('id')}: accepted Claude Code's trust prompt "
                     f"for {sess.get('worktreePath')!r} (a workspace this agent "
                     f"manages). Its DEFAULT is 'No, exit', which would have ended "
@@ -21692,11 +21732,21 @@ class SessionManager:
 
         `send_input` calls this before typing: the operator's first message would
         otherwise be eaten by the modal and its Enter would confirm 'No, exit'.
-        Returns True when the pane is clear to type into."""
+        Returns True when the pane is clear to type into.
+
+        Bounded by the SAME launch window as the beat's sweep (`trustCheckUntil`).
+        It used to answer at any age, which made it a second, UNWINDOWED
+        auto-answering path — the hole the sweep's window was supposed to close,
+        reachable through any operator message. Outside the window this refuses to
+        type rather than answering: a modal still up then is one nothing here may
+        resolve, and the operator answers it in the session's terminal."""
         tmux = sess.get("tmuxName")
         cap = _capture_pane(tmux)
         if not _trust_dialog_up(cap):
             return True
+        until = sess.get("trustCheckUntil")
+        if not until or time.time() > until:
+            return False
         if not self._trust_scope_ok(sess):
             return False
         if not _answer_trust_dialog(tmux, cap=cap):
@@ -21718,17 +21768,33 @@ class SessionManager:
         when the answer cannot be trusted.
 
         ONE subprocess for the WHOLE fleet — deliberately not `has-session` per
-        session, which would put MAX_SESSIONS timeouts on the beat. rc != 0 (no
-        server, a wedged tmux, a launch failure) is "can't tell", never "all
-        dead": `_sweep_dead_sessions` must err toward leaving sessions alone, and
-        the whole-server-died case is `resume_on_boot`'s, not the beat's."""
+        session, which would put MAX_SESSIONS timeouts on the beat.
+
+        **"No server" is EMPTY, not unknown.** The tmux server exits with its LAST
+        session, so on a host running one session — which is the reported
+        incident's own shape, an operator spawning a single manual session that
+        then dies — `list-sessions` exits 1 with `no server running on …` /
+        `error connecting to …`. Reading that as "can't tell" left exactly the
+        session this sweep exists for reading `running` forever, and
+        `resume_on_boot` does not cover it: that runs only at manager START, so
+        nothing would have healed it until the agent restarted.
+        Every OTHER nonzero rc (a wedged tmux, a permissions error, a failure to
+        launch at all) stays "can't tell" — `_sweep_dead_sessions` must err toward
+        leaving sessions alone, so only these two explicit messages mean empty."""
         if IS_WINDOWS:
             return None      # no tmux; the pty-host liveness read is _pty_alive
-        rc, out = run_out(["tmux", "list-sessions", "-F", "#{session_name}"],
-                          timeout=5)
-        if rc != 0:
+        try:
+            out = subprocess.run(
+                ["tmux", "list-sessions", "-F", "#{session_name}"],
+                capture_output=True, text=True, timeout=5)
+        except Exception:
             return None
-        return {line.strip() for line in out.splitlines() if line.strip()}
+        if out.returncode == 0:
+            return {line.strip() for line in out.stdout.splitlines() if line.strip()}
+        err = (out.stderr or "").lower()
+        if "no server running" in err or "error connecting to" in err:
+            return set()     # the server is gone: there are NO tmux sessions
+        return None
 
     def _sweep_dead_sessions(self):
         """Stop a `running` session whose tmux is gone from reading running

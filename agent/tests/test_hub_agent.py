@@ -6805,6 +6805,30 @@ class TestAnswerTrustDialog(unittest.TestCase):
         self.assertTrue(acted)
         self.assertEqual(sent, [("Down",), ("Enter",)])   # one Down (No -> Yes)
 
+    def test_every_keystroke_is_bounded_for_the_beat(self):
+        # QA finding: this now runs on the BEAT, and `steps` keystrokes at
+        # run()'s 15s default is a worst case that can pass the hub's
+        # OFFLINE_AFTER_MS. Every send must carry a short timeout.
+        sent = []
+        with mock.patch.object(ha, "_capture_pane", return_value=self.DIALOG), \
+                mock.patch.object(
+                    ha, "_pane_send_keys",
+                    side_effect=lambda n, *k, **kw: sent.append(kw.get("timeout"))):
+            self.assertTrue(ha._answer_trust_dialog("agent-x"))
+        self.assertEqual(sent, [ha._TRUST_KEY_TIMEOUT_SEC] * 2)
+        self.assertLessEqual(ha._TRUST_KEY_TIMEOUT_SEC, 5)
+
+    def test_an_implausible_cursor_distance_sends_nothing(self):
+        # The modal's options are adjacent, so the distance is 0 or 1. A larger
+        # one means the cursor or the accept line was mis-located — refuse rather
+        # than press an unbounded number of arrows (and rather than guess).
+        cap = self.DIALOG.replace(
+            " \u276f No, exit\n   Yes, I trust this folder",
+            " \u276f No, exit\n   a\n   b\n   c\n   d\n   Yes, I trust this folder")
+        acted, sent = self._keys(cap)
+        self.assertFalse(acted)
+        self.assertEqual(sent, [])
+
     def test_no_op_when_there_is_no_modal(self):
         # An already-trusted dir shows no modal — the composer/turn is up. Send
         # NOTHING (a stray Enter/Down here would disturb a running turn).
@@ -6914,6 +6938,38 @@ class TestTrustDialogIsABlockingDialog(unittest.TestCase):
                     "   2. No\n")
         self.assertIsNotNone(ha.parse_pane_prompt(numbered))
         self.assertTrue(ha._pane_blocking_dialog(numbered))
+
+    def test_a_live_permission_dialog_is_never_the_trust_modal(self):
+        # QA finding (HIGH), and the one real regression this change introduced:
+        # a tool-permission dialog shows NO mode footer either (that is exactly
+        # what makes parse_pane_prompt work), so with the footer as the only
+        # guard, any Write/Bash dialog whose diff, command or description carried
+        # a short `trust this folder` line satisfied every other condition — and
+        # the beat then drove arrows + Enter into it, APPROVING a tool call in a
+        # session the operator had put in manual permission mode. Reproduced live
+        # by QA against claude 2.1.276 at t+16s of an ordinary spawn. The two
+        # dialogs are mutually exclusive by construction; pin that.
+        # NB the trigger text is not exotic: this repo's own hub-agent.py and
+        # .claude/rules/agent-sessions.md now contain it, so a Turma session
+        # editing THIS code shows it in a diff.
+        dialog = ("Write\n"
+                  "  notes.md\n"
+                  "    1. No, exit\n"
+                  "    2. Yes, I trust this folder\n"
+                  "\u2500\u2500\u2500\u2500\u2500\n"
+                  "Do you want to create notes.md?\n"
+                  " \u276f 1. Yes\n"
+                  "   2. Yes, and don't ask again this session\n"
+                  "   3. No, and tell Claude what to do differently\n")
+        self.assertIsNotNone(ha.parse_pane_prompt(dialog))   # it IS a panePrompt
+        self.assertFalse(ha._trust_dialog_up(dialog))        # so NOT the modal
+        self.assertTrue(ha._pane_blocking_dialog(dialog))    # still blocking
+
+    def test_the_real_modal_survives_the_numbered_dialog_exclusion(self):
+        # The exclusion must not cost the modal itself: it carries no numbered
+        # run, so parse_pane_prompt stays None for it.
+        self.assertIsNone(ha.parse_pane_prompt(LINUX_TRUST_MODAL))
+        self.assertTrue(ha._trust_dialog_up(LINUX_TRUST_MODAL))
 
     def test_prose_merely_mentioning_trust_is_not_a_modal(self):
         # The live-session false positive that matters: a session TALKING about
@@ -10672,6 +10728,7 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sess = self._running_session(sm)
         sess["worktreePath"] = os.path.join(ha.REPOS_ROOT, "r", "wt")
+        sess["trustCheckUntil"] = time.time() + 60      # inside the launch window
         keys, caps = [], [LINUX_TRUST_MODAL, LINUX_COMPOSER_PANE]
         with mock.patch.object(ha, "_capture_pane",
                                side_effect=lambda t: caps.pop(0) if caps else None), \
@@ -10681,12 +10738,31 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         self.assertEqual(keys, [("Down",), ("Enter",)])       # modal accepted
         self.assertEqual(self.run_stdin_calls[0][1], "hello")  # then delivered
 
+    def test_a_message_never_answers_a_modal_outside_the_launch_window(self):
+        # QA finding (HIGH): this path used to answer at ANY age, making it a
+        # second, UNWINDOWED auto-answering path — the hole the sweep's window
+        # exists to close, reachable through any operator message. Outside the
+        # window the message is HELD; a human answers at the terminal.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sess["worktreePath"] = os.path.join(ha.REPOS_ROOT, "r", "wt")
+        sess["trustCheckUntil"] = time.time() - 1       # window expired
+        keys = []
+        with mock.patch.object(ha, "_capture_pane",
+                               return_value=LINUX_TRUST_MODAL), \
+                mock.patch.object(ha, "_pane_send_keys",
+                                  side_effect=lambda n, *k, **kw: keys.append(k)):
+            sm.send_input(sess["id"], "hello")
+        self.assertEqual(keys, [])
+        self.assertEqual(self.run_stdin_calls, [])
+
     def test_a_message_is_held_when_the_modal_cannot_be_answered(self):
         # Out of REPOS_ROOT (or TURMA_AUTO_TRUST off): a human answers it. The
         # message is HELD, never typed into the modal.
         sm = self.make_manager()
         sess = self._running_session(sm)
         sess["worktreePath"] = "/somewhere/else"
+        sess["trustCheckUntil"] = time.time() + 60      # window is not the gate here
         keys = []
         with mock.patch.object(ha, "_capture_pane",
                                return_value=LINUX_TRUST_MODAL), \
@@ -19431,6 +19507,17 @@ class TestAnswerTrustDialogSweep(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.keys, [])
         self.assertNotIn("trustCheckUntil", sess)
 
+    def test_at_most_one_modal_is_answered_per_beat(self):
+        # The captures and the KEYSTROKES are the two costs this puts on the
+        # beat, and both must stay bounded independently of how many sessions
+        # launched at once (CLAUDE.md's beat-loop budget).
+        sm = self.make_manager(capture=LINUX_TRUST_MODAL)
+        sm.registry = [self._sess(id=f"s{i}", tmuxName=f"agent-s{i}")
+                       for i in range(4)]
+        sm._answer_trust_dialogs()
+        self.assertEqual(self.keys, [("agent-s0", ("Down",)),
+                                     ("agent-s0", ("Enter",))])
+
     def test_captures_are_capped_per_beat(self):
         # CLAUDE.md's beat-loop budget: _capture_pane is 5s-bounded, so the
         # sweep's worst case must not scale with MAX_SESSIONS.
@@ -19476,17 +19563,31 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
     forever. Nothing checked this before, so the operator's dead session kept its
     card, its slot and an orphaned ttyd serving tmux's raw error."""
 
-    def make_manager(self, listing=(0, "agent-alive")):
+    # `tmux list-sessions` outcomes, as (returncode, stdout, stderr). The sweep
+    # reads STDERR to tell "the server is gone, so there are no sessions" from
+    # "tmux could not answer" — the two arrive as the same nonzero rc.
+    LISTING_OK = (0, "agent-alive\n", "")
+    # The tmux server exits with its LAST session, so this is what a host running
+    # exactly one session sees the moment that session dies — the reported
+    # incident's own shape.
+    NO_SERVER = (1, "", "no server running on /tmp/tmux-1000/default\n")
+    NO_SOCKET = (1, "", "error connecting to /tmp/tmux-1000/default "
+                        "(No such file or directory)\n")
+    WEDGED = (1, "", "lost server\n")
+
+    def make_manager(self, listing=None):
         sm = super().make_manager()
         sm.save = mock.Mock()
         self.killed_ttyd = []
-        self.run_out_calls = []
+        self.listing_calls = []
+        listing = self.LISTING_OK if listing is None else listing
 
-        def fake_run_out(cmd, cwd=None, timeout=None):
-            self.run_out_calls.append(cmd)
-            return listing
+        def fake_subprocess_run(cmd, **kw):
+            self.listing_calls.append(cmd)
+            rc, out, err = listing
+            return subprocess.CompletedProcess(cmd, rc, out, err)
 
-        p = mock.patch.object(ha, "run_out", fake_run_out)
+        p = mock.patch.object(ha.subprocess, "run", fake_subprocess_run)
         p.start()
         self.addCleanup(p.stop)
         p = mock.patch.object(ha.SessionManager, "_kill_ttyd",
@@ -19509,8 +19610,8 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         sm.registry = [self._sess(id=f"s{i}", tmuxName=f"agent-s{i}")
                        for i in range(6)]
         sm._sweep_dead_sessions()
-        self.assertEqual(len(self.run_out_calls), 1)
-        self.assertEqual(self.run_out_calls[0][:2], ["tmux", "list-sessions"])
+        self.assertEqual(len(self.listing_calls), 1)
+        self.assertEqual(self.listing_calls[0][:2], ["tmux", "list-sessions"])
 
     def test_a_dead_tmux_ends_the_session_after_the_strike_count(self):
         sm = self.make_manager()
@@ -19543,24 +19644,54 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         sess = self._sess()
         sm.registry = [sess]
         sm._sweep_dead_sessions()                       # strike 1
-        with mock.patch.object(ha, "run_out",
-                               lambda *a, **k: (0, "agent-dead")):
+        with mock.patch.object(
+                ha.SessionManager, "_live_tmux_names",
+                lambda self: {"agent-dead"}):
             sm._sweep_dead_sessions()                   # back: cleared
         for _ in range(ha.DEAD_TMUX_STRIKES - 1):
             sm._sweep_dead_sessions()
         self.assertEqual(sess["status"], "running")
 
     def test_an_untrustworthy_listing_is_never_read_as_all_dead(self):
-        # rc != 0 (no tmux server, a wedged tmux, a failed launch) is "can't
+        # A nonzero rc that is NOT one of the two "no server" messages is "can't
         # tell". Erring toward leaving sessions alone is the whole contract.
-        for listing in ((1, ""), (None, "boom"), (1, "no server running")):
+        for listing in (self.WEDGED, (1, "", ""), (2, "", "permission denied")):
             sm = self.make_manager(listing=listing)
             sess = self._sess()
             sm.registry = [sess]
+            self.assertIsNone(sm._live_tmux_names())
             for _ in range(ha.DEAD_TMUX_STRIKES + 2):
                 sm._sweep_dead_sessions()
             self.assertEqual(sess["status"], "running")
             self.assertEqual(sm.killed_ttyd, [])
+
+    def test_a_launch_failure_is_never_read_as_all_dead(self):
+        # tmux not on PATH at all: subprocess.run raises, which is "can't tell".
+        sm = self.make_manager()
+        with mock.patch.object(ha.subprocess, "run", side_effect=OSError("no tmux")):
+            self.assertIsNone(sm._live_tmux_names())
+            sess = self._sess()
+            sm.registry = [sess]
+            for _ in range(ha.DEAD_TMUX_STRIKES + 2):
+                sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "running")
+
+    def test_no_tmux_server_means_EMPTY_not_unknown(self):
+        # QA finding (HIGH): the tmux server exits with its LAST session, so on a
+        # host running exactly ONE session — the reported incident's own shape —
+        # `list-sessions` exits 1 the moment that session dies. Reading that as
+        # "can't tell" left exactly the session this sweep exists for reading
+        # `running` forever, and resume_on_boot does NOT cover it (it runs only at
+        # manager start). Both wordings tmux uses must mean empty.
+        for listing in (self.NO_SERVER, self.NO_SOCKET):
+            sm = self.make_manager(listing=listing)
+            self.assertEqual(sm._live_tmux_names(), set())
+            sess = self._sess()
+            sm.registry = [sess]
+            for _ in range(ha.DEAD_TMUX_STRIKES):
+                sm._sweep_dead_sessions()
+            self.assertEqual(sess["status"], "error")
+            self.assertEqual(sm.killed_ttyd, ["s1"])
 
     def test_a_queued_session_is_never_reaped(self):
         # A queued record has no tmux BY DESIGN — _drain_queue provisions it later.

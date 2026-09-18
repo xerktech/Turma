@@ -39,6 +39,14 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
 - **`_pane_blocking_dialog` is now the ONE predicate every such guard uses** (`_reconcile_rc_names`,
   `_apply_pending_switches`, `_poll_pending_inputs`' resend, `send_input`) — `parse_pane_prompt` OR
   `_trust_dialog_up`. Add a new pane-typing path → use it, never a bare `parse_pane_prompt`.
+- **A NUMBERED dialog is never the trust modal, and `_trust_dialog_up` MUST keep checking that.**
+  A tool-permission dialog shows no mode footer either — that is what makes `parse_pane_prompt`
+  work — so with the footer as the only guard, any Write/Bash dialog whose diff, command or
+  description carried a short `trust this folder` line read as the modal, and the beat drove arrows
+  + Enter into it, APPROVING a tool call in a session launched in MANUAL permission mode. QA
+  reproduced it 16s into an ordinary spawn. The trigger text is not exotic: `hub-agent.py` and this
+  file now contain it, so a session editing XERK-868 shows it in a diff.
+  Tests: `test_a_live_permission_dialog_is_never_the_trust_modal`.
 - **The trust modal is deliberately NOT a `panePrompt`.** That wire contract's four conditions
   (`agent.md`) are unchanged, and the chat page renders its options as clickable DIGITS — this modal
   is arrow-driven and has none, so surfacing it there would offer a button that does nothing.
@@ -51,11 +59,27 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   `--permission-mode auto`/`bypassPermissions` plus its guard `--settings`, so the modal is not the
   boundary doing the work; the alternative is a session that cannot start. `TURMA_AUTO_TRUST=0` turns
   it off. **Never widen the scope to an arbitrary path.**
+  - **What it really costs, measured:** a repo carrying a `SessionStart` hook in `.claude/settings.json`
+    runs that command as the agent user the moment the modal is accepted — QA proved it. The trust
+    dialog is the ONLY gate on hooks (`bypassPermissions` governs tool approvals, not hooks).
+  - **"Under `REPOS_ROOT`" is NOT the same as "a repo a human put there"**: `clone` writes into
+    `REPOS_ROOT`, so a repo the agent cloned on request is auto-trusted on its first session and
+    runs its hooks before any human sees it. `GH_CLONE_OWNERS` allowlisting and the operator asking
+    for the clone are what bound this; narrowing the path would NOT (a cloned repo's worktree is
+    under `WORKTREES_ROOT` like any other). Know this before relying on auto-trust in a fleet that
+    clones from owners it does not control.
 - **The answering half and the guarding half are independent, on purpose.** Out-of-scope (or
   auto-trust off) leaves the modal up for a human, and the guard keeps everything else off the pane
-  meanwhile. The launch WINDOW (`TRUST_ANSWER_WINDOW_SEC`) is also the false-positive bound: outside
-  it nothing auto-answers, so a session merely discussing trusting a folder can never be Entered.
-- Beat budget: bounded at `TRUST_CHECKS_PER_BEAT` captures, independent of `MAX_SESSIONS`.
+  meanwhile.
+- **BOTH auto-answering paths are bounded by the launch window** (`TRUST_ANSWER_WINDOW_SEC`) — the
+  beat's `_answer_trust_dialogs` AND `_clear_trust_dialog`, which `send_input` calls. The second
+  used to answer at any age, which made it a second UNWINDOWED path reachable through any operator
+  message, defeating the bound the first one has. Outside the window `send_input` HOLDS the message
+  instead; it never types into a dialog and never answers one.
+- Beat budget: at most `TRUST_CHECKS_PER_BEAT` captures AND at most ONE answer per beat, each
+  keystroke bounded by `_TRUST_KEY_TIMEOUT_SEC` (not `run()`'s 15s) and the step count by
+  `_TRUST_MAX_STEPS` — all independent of `MAX_SESSIONS`. An implausible cursor distance sends
+  NOTHING rather than pressing arrows it cannot justify.
 - Tests: `TestTrustDialogIsABlockingDialog`, `TestReconcileRcNamesTrustModal`,
   `TestAnswerTrustDialogSweep`, `TestAnswerTrustDialog` (both the Windows and the real Linux frame).
 
@@ -69,10 +93,15 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   transcript (like `kill`), so **Start resumes the conversation**.
 - **One `tmux list-sessions` for the WHOLE fleet** (`_live_tmux_names`) — never `has-session` per
   session, which would put `MAX_SESSIONS` timeouts on the beat.
-- Conservative by construction, because a false positive ENDS a live session: `rc != 0` is
-  **"can't tell", never "all dead"** (the whole-server-died case is `resume_on_boot`'s); a `queued`
-  record has no tmux by design; and a name must be missing `DEAD_TMUX_STRIKES` CONSECUTIVE beats,
-  since the listing and the scan are not atomic. Windows is left to `_pty_alive`.
+- **"No server" is EMPTY, not unknown.** The tmux server exits with its LAST session, so a host
+  running exactly one session — the reported incident's own shape — gets rc 1 the moment that
+  session dies. Reading that as "can't tell" left exactly the session this sweep exists for reading
+  `running` forever, and `resume_on_boot` does NOT cover it (it runs only at manager START). Only
+  tmux's two explicit wordings (`no server running`, `error connecting to`) mean empty.
+- Otherwise conservative by construction, because a false positive ENDS a live session: every OTHER
+  nonzero rc, and a failure to launch tmux at all, is **"can't tell"**; a `queued` record has no
+  tmux by design; and a name must be missing `DEAD_TMUX_STRIKES` CONSECUTIVE beats, since the
+  listing and the scan are not atomic. Windows is left to `_pty_alive`.
 - Tests: `TestSweepDeadSessions`.
 
 ## Repos-root sessions
