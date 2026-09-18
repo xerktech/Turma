@@ -319,3 +319,81 @@ test("the forced reconnect is cooled down so an unreachable feed can't thrash", 
   assert.equal(sockets[0].readyState, FakeSocket.OPEN,
     "the socket is left up; the /history poll still runs every tick");
 });
+
+// --- the re-seed, driven through onPoll itself -------------------------------
+// These live HERE, not in chat.test.js, because onPoll PAINTS and so needs this
+// file's DOM shims. That split is why the re-seed shipped broken twice: the
+// pure helper was tested in chat.test.js and the CALL SITE was not tested at
+// all, so first a wrong field name and then a discarded return value both
+// passed a fully green suite. Asserting reseedFromFleet's return value proves
+// the decision; only asserting onPoll's EFFECT on the buffer proves the
+// feature.
+
+test("onPoll: re-seeding UPGRADES the buffer, not just computes an upgrade", () => {
+  // Pins the ASSIGNMENT, not the call. `buffer = re.buffer` is one deletable
+  // line, and with it gone reseedFromFleet still runs, still returns the right
+  // answer, still passes every test that checks its return -- while the view
+  // stays frozen exactly as the original bug did.
+  chat.__setBuffer([{ id: "a1", role: "assistant", text: "checking" }]);
+  chat.onPoll({
+    id: "s1",
+    session: { tail: [{ id: "a1", role: "assistant", text: "checking", blocks: [
+      { t: "tool_use", id: "t1", name: "Bash", input: "git log" },
+      { t: "tool_result", forId: "t1", text: "abc123 first commit" },
+    ] }] },
+  });
+  const buf = chat.__buffer();
+  assert.equal(buf.length, 1);
+  assert.ok(buf[0].blocks && buf[0].blocks.length === 2,
+    "onPoll must WRITE the merged buffer back, not discard it");
+  assert.equal(buf[0].blocks[0].input, "git log");
+});
+
+test("onPoll: the wire shape is nested; a top-level tail is inert", () => {
+  // The D1 defect, pinned at the call site as well as in the helper.
+  const flat = [{ id: "a1", role: "assistant", text: "checking" }];
+  const rich = [{ id: "a1", role: "assistant", text: "checking",
+    blocks: [{ t: "tool_use", id: "t1", name: "Bash", input: "git log" }] }];
+
+  chat.__setBuffer(flat.slice());
+  chat.onPoll({ id: "s1", tail: rich });          // WRONG shape
+  assert.ok(!(chat.__buffer()[0].blocks || []).length,
+    "a top-level s.tail is not the wire shape and must do nothing");
+
+  chat.__setBuffer(flat.slice());
+  chat.onPoll({ id: "s1", session: { tail: rich } });   // real shape
+  assert.ok((chat.__buffer()[0].blocks || []).length,
+    "the nested session.tail is what re-seeds");
+});
+
+test("onPoll: a hostile tail cannot throw out of the poll", () => {
+  // session.tail is agent-supplied. normalizeSessions coerces it, but render()
+  // is the Sessions page's ONLY painter -- a throw here blanks the whole page
+  // and, once a bad entry is in the buffer, keeps blanking it every poll. Belt
+  // and braces behind the hub's coercion.
+  for (const tail of [5, "xx", [null], [{ id: "x", blocks: 5 }],
+                      [{ id: "x", blocks: [null] }], [{ id: "x", text: 7 }],
+                      [{ id: "x", blocks: [{ t: "tool_use", files: 5, todos: 7 }] }]]) {
+    chat.__setBuffer([]);
+    assert.doesNotThrow(() => chat.onPoll({ id: "s1", session: { tail } }),
+      `a tail of ${JSON.stringify(tail)} must not throw out of onPoll`);
+  }
+});
+
+test("onPoll: a re-seed that only ADDS a zero-weight entry still repaints", () => {
+  // reseedSig carries the entry COUNT as well as the weight sum. Dropping the
+  // count looks harmless because the merge is grow-only (so the sum is
+  // otherwise monotone), but an added entry that weighs nothing -- an empty
+  // assistant turn -- then reads as "no change" and never reaches the screen.
+  chat.__setBuffer([{ id: "a1", role: "assistant", text: "hi" }]);
+  chat.onPoll({ id: "s1", session: { tail: [
+    { id: "a1", role: "assistant", text: "hi" },
+    { id: "a2", role: "assistant", text: "" },
+  ] } });
+  assert.equal(chat.__buffer().length, 2, "the new entry must land in the buffer");
+  assert.equal(
+    chat.reseedFromFleet([{ id: "a1", role: "assistant", text: "hi" }],
+      { session: { tail: [{ id: "a1", role: "assistant", text: "hi" },
+                          { id: "a2", role: "assistant", text: "" }] } }).changed,
+    true, "adding an entry is a change even when it weighs nothing");
+});

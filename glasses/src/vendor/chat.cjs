@@ -1111,20 +1111,101 @@
   // and leaving those out made the rich copy TIE its own flat text — and the
   // `>=` tie-break then let a text-only seed clobber the blocks right back off
   // the entry (a `!` chip regressing to a raw user bubble).
+  // Length of ONE agent-supplied leaf, for weight().
+  //
+  // `(b.text || "").length` is undefined for a NUMBER-typed leaf, so the sum
+  // goes NaN -- and NaN !== NaN, which makes reseedSig unequal to ITSELF. One
+  // number-typed `text` anywhere in the buffer then makes every re-seed report
+  // "no change" while still merging the richer copy in: the buffer improves and
+  // the screen never repaints. That is exactly the stale view this re-seed
+  // exists to remove, made permanent, so it matters more here than the throw.
+  // The hub does not coerce these (coerceBlockElem fixes only the booleans and
+  // files[].shed); Android decodes a number leniently into a String, so
+  // counting a finite number as its printed length keeps the two mirrors in
+  // agreement. Anything else weighs 0.
+  function leafLen(v) {
+    if (typeof v === "string") return v.length;
+    if (typeof v === "number" && Number.isFinite(v)) return String(v).length;
+    return 0;
+  }
   function weight(e) {
-    let w = (e.text || "").length;
-    for (const b of (e.blocks || [])) {
-      w += (b.text || "").length + (b.input || "").length + (b.name || "").length +
-        (b.args || "").length + (b.summary || "").length + (b.result || "").length +
-        (b.desc || "").length + (b.content || "").length + (b.plan || "").length +
-        (b.url || "").length + (b.caption || "").length +
-        (b.edit ? (b.edit.old || "").length + (b.edit.new || "").length : 0) +
+    // TOTAL by construction. weight() is on the render path, and the Sessions
+    // page has exactly one painter (render(cache)) -- so a throw here does not
+    // lose one entry, it blanks the whole page, and keeps blanking it every
+    // poll once the offending entry is in the buffer. `e.blocks || []` does not
+    // cover it: a non-array (`blocks: 5`) is truthy and not iterable, and a
+    // null MEMBER throws on the first property read. The hub coerces
+    // session.tail so this should be unreachable from a heartbeat -- but the
+    // /live fanout path does NOT coerce, so it is reachable from an agent frame.
+    // buildItems downstream is still NOT total; see the ticket.
+    if (!e) return 0;
+    let w = leafLen(e.text);
+    for (const b of (Array.isArray(e.blocks) ? e.blocks : [])) {
+      if (!b || typeof b !== "object") continue;
+      // EVERY block payload field counts, not just text/input: a command block
+      // carries its content in name/args (a task_notification in summary/
+      // result), and leaving those out made the rich copy TIE its own flat text
+      // -- and the `>=` tie-break then let a text-only seed clobber the blocks
+      // right back off the entry (a `!` chip regressing to a raw user bubble).
+      w += leafLen(b.text) + leafLen(b.input) + leafLen(b.name) +
+        leafLen(b.args) + leafLen(b.summary) + leafLen(b.result) +
+        leafLen(b.desc) + leafLen(b.content) + leafLen(b.plan) +
+        leafLen(b.url) + leafLen(b.caption) +
+        (b.edit ? leafLen(b.edit.old) + leafLen(b.edit.new) : 0) +
         // Embedded SendUserFile previews (XERK-221): count them so an image-bearing
-        // copy outweighs a degraded reload (file since deleted → a name-only chip).
-        (Array.isArray(b.files) ? b.files.reduce((s, f) =>
-          s + (f ? (f.src || "").length + (f.html || "").length + (f.name || "").length : 0), 0) : 0);
+        // copy outweighs a degraded reload (file since deleted -> a name-only chip).
+        (Array.isArray(b.files) ? b.files.reduce((n, f) =>
+          n + (f ? leafLen(f.src) + leafLen(f.html) + leafLen(f.name) : 0), 0) : 0) +
+        // TodoWrite/todo_write checklists, for the SAME reason as `files`. This
+        // one is load-bearing now that the heartbeat preview is re-merged on
+        // every poll: `todos` is a _tool_use_detail field, which is precisely
+        // what preview=True skips, and it was the ONLY such field missing here
+        // -- so a preview block tied its own live copy EXACTLY (319 == 319) and
+        // the `>=` tie-break swapped the checklist out for a raw-JSON card.
+        (Array.isArray(b.todos) ? b.todos.reduce((n, t) =>
+          n + (t ? leafLen(t.content) + leafLen(t.activeForm) : 0), 0) : 0);
     }
     return w;
+  }
+  // Re-merge the heartbeat's cached preview into the live buffer.
+  //
+  // open() merged `session.tail` once and nothing ever read it again, while the
+  // fleet payload is polled ONCE at load whenever SSE is healthy -- so a view
+  // held open kept whatever the preview said at open, for as long as it stayed
+  // open. Anything that later IMPROVED the preview never reached the buffer and
+  // the only cure was closing and reopening the session. Android re-merges the
+  // seed on every poll (ChatViewModel), which is why the two clients disagreed
+  // about the same conversation: the phone healed within a beat, the browser
+  // not at all.
+  //
+  // Safe to repeat: mergeTail is GROW-ONLY and keyed by entry id, so a re-merge
+  // can only add an entry or replace one with a richer copy of itself. It can
+  // never downgrade what the live tail or /history delivered -- the rule that
+  // lets the seed and the live feed share one buffer in the first place.
+  //
+  // Returns the new buffer and whether anything actually ADDED or ENRICHED. A
+  // reference compare will not do: mergeTail always returns a fresh array, and
+  // its `weight(inc) >= weight(cur)` tie-break swaps in the incoming object
+  // even when the two are identical -- so every beat would look like a change
+  // and repaint the transcript on a session doing nothing. Count + total weight
+  // is the cheap content signature over a bounded list.
+  function reseedSig(b) {
+    let n = 0;
+    for (const e of b) n += weight(e);
+    return b.length + ":" + n;
+  }
+  function reseedFromFleet(buf, s) {
+    // The tail is NESTED under `session` on the wire, which is why open() reads
+    // s.session.tail and Android reads session?.session?.tail. A top-level
+    // s.tail is undefined on every real record -- and would be an UNCOERCED
+    // agent-controlled field besides (normalizeSessions sanitizes session.tail
+    // and knows nothing about a sibling), so a forged non-iterable `blocks`
+    // would throw out of weight() and blank the whole Sessions page.
+    const seed = s && s.session && s.session.tail;
+    if (!Array.isArray(seed) || !seed.length) return { buffer: buf, changed: false };
+    const before = reseedSig(buf);
+    const next = mergeTail(buf, seed);
+    return { buffer: next, changed: reseedSig(next) !== before };
   }
   function mergeTail(existing, incoming) {
     const byId = new Map();
@@ -3622,6 +3703,16 @@
     if (!s) return;
     sess = s;
     if (a) agent = a;
+    // RE-SEED from the heartbeat preview, not only at open() (see
+    // reseedFromFleet). Kept to two lines here so the whole decision is pure
+    // and directly testable. onPoll PAINTS, so it needs chat-live.test.js's DOM
+    // shims to run -- chat.test.js has none, and testing the helper there while
+    // the call site ran under nothing is how a re-seed reading the WRONG field,
+    // and later one whose result was DISCARDED, each shipped green. The tests
+    // that matter assert this buffer, not the text of the call.
+    const re = reseedFromFleet(buffer, s);
+    buffer = re.buffer;
+    if (re.changed) repaint();
     setHeader(s, agent);
     updateQuestion(s);
     renderComposeOpts(true);
@@ -3719,6 +3810,10 @@
       __setQuestionActive: (v) => { questionActive = v; },
       __setPanePromptActive: (v) => { panePromptActive = v; },
       __setVerbosity: (v) => { verbosity = v; },
+      reseedFromFleet,
+      onPoll,            // driven under the chat-live DOM shims: asserting the
+      __buffer: () => buffer,  // EFFECT is the only thing that catches a
+                               // correct re-seed whose result is discarded.
       __setBuffer: (b) => { buffer = b; },
       __setQueued: (q) => { queuedPrompts = q; },
       __setLiveTurn: (t) => { liveTurn = t; },

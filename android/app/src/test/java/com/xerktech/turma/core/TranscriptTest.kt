@@ -2,7 +2,9 @@ package com.xerktech.turma.core
 
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TaskNotificationBlock
+import com.xerktech.turma.model.SendFile
 import com.xerktech.turma.model.TextBlock
+import com.xerktech.turma.model.ToolUseBlock
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -92,5 +94,30 @@ class TranscriptTest {
     @Test fun `mergeTail ignores empty deltas`() {
         val base = mergeTail(emptyList(), listOf(e("1", "user", "hi")))
         assertEquals(base, mergeTail(base, emptyList()))
+    }
+
+    /**
+     * Parity with chat.js `weight`, which counts a tool_use block's files and
+     * caption. A heartbeat PREVIEW block omits every _tool_use_detail field, so
+     * without them a preview TIES the rich copy carrying inline SendUserFile
+     * previews and the `>=` tie-break swaps them off the card. This bites
+     * harder here than on the web: ChatViewModel re-merges the fleet seed on
+     * EVERY poll, so the tie is reachable on every beat rather than only in a
+     * view held open.
+     */
+    @Test fun `a preview tool_use never clobbers one carrying file previews`() {
+        val rich = TailEntry(id = "1", role = "assistant", text = "", blocks = listOf(
+            ToolUseBlock(id = "t1", name = "SendUserFile", caption = "the chart",
+                files = listOf(SendFile(name = "chart.png", kind = "image", src = "data:image/png;base64,AAAA"))),
+        ))
+        val preview = TailEntry(id = "1", role = "assistant", text = "", blocks = listOf(
+            ToolUseBlock(id = "t1", name = "SendUserFile"),
+        ))
+        assertTrue("the file preview must outweigh the copy that omits it",
+            entryWeight(rich) > entryWeight(preview))
+        val merged = mergeTail(listOf(rich), listOf(preview))
+        val block = merged[0].blocks[0] as ToolUseBlock
+        assertEquals(1, block.files.size)
+        assertEquals("the chart", block.caption)
     }
 }
