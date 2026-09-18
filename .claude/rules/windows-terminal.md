@@ -213,3 +213,52 @@ to undo here. Detail: `agent/win/README.md`.
   win32-x64 prebuild). Still un-exercised by the plain drive: ConPTY inside a
   Session-0 WinSW service + job-object breakaway (need the real service; ADR open
   questions).
+
+## Teardown, grid correctness and pane geometry (C6/C9/C14/C15)
+
+- **A deliberate teardown closes every terminal socket with 1000 before exiting.**
+  The vendored ttyd client branches on the close code: anything but 1000 shows
+  "Reconnecting..." and re-dials forever. `process.exit` closes sockets abruptly
+  as **1006** and does not flush pending writes, so the browser reconnect-stormed
+  (each iteration re-fetching `/term/<id>/token` through the hub and dialling a
+  dead port) and the final screen could be truncated. `closeTermClients(1000, …)`
+  runs in BOTH `onExit` and `shutdown()`, then the process exits on its own
+  `PTY_EXIT_DRAIN_MS` timer — never waiting on a peer, so a wedged client cannot
+  keep the host alive. **Never go back to a bare `process.exit` on a teardown path.**
+- **`ScrollbackRing` is a bounded CHUNK LIST with a running byte total, not one
+  growing Buffer.** `Buffer.concat([this.buf, b])` per pty chunk copied the whole
+  256 KiB ring on every write — on the pty-host's ONLY thread, which also fans
+  bytes to every attached browser and answers the manager's beat-path control
+  RPCs. Appends are O(1) amortised; only `bytes()` pays a concat, memoised until
+  the next append. The observable tail is byte-for-byte what the old code
+  produced (pinned by a reference-implementation test).
+- **A BLANK capture is `None` ("can't tell"), never `""`.** `_pty_capture` maps a
+  whitespace-only grid to None because `_busy_from_capture("")` returns False — an
+  AFFIRMATIVE not-busy that skips the transcript-freshness fallback an
+  uncapturable Linux pane gets, so a working session reads idle and can fire
+  ready-for-review mid-turn. This is XERK-703's false-idle class by another door,
+  and it is reachable in ordinary use (right after spawn; between an `ED 2` and
+  the app's repaint), not only on failure.
+- **`TerminalGrid` refuses an unusable scroll region and clamps EL/ED.** An
+  inverted `DECSTBM` (`\x1b[10;5r` → top 9, bot 4) made `_scrollUp`'s splice pair
+  remove and reinsert at the wrong ends and scramble the screen; it is now
+  IGNORED (the current region stands). `EL`/`ED` with `m===1` looped `c <= cc`,
+  and `cc` sits at `cols` while a wrap is PENDING, which wrote `grid[cr][cols]`
+  and grew the row past `cols` — `capture()` trimmed that cosmetically while
+  `resize`/`_scrollUp` carried the wrong row shape forward. Both are untrusted
+  pty bytes reachable by `echo`.
+- **The pty returns to its LAUNCH geometry when the last viewer detaches.** A
+  browser sizes the real pty to its own viewport, and nothing put it back, so the
+  first narrow client framed the pty for the rest of the session's life. Every
+  manager read is calibrated against `--cols 220 --rows 50` (the tmux `-x 220 -y
+  50` analog): the busy truncated-hint/spinner fallbacks, `parse_pane_prompt`,
+  `parse_model_picker`, `_answer_trust_dialog`'s short-line heuristics, and the
+  chat's pane scrape. Restoring on DETACH rather than refusing the resize keeps an
+  attached viewer's terminal fitting its window (refusing would letterbox and
+  diverge from ttyd) while the unobserved state — most of a session's life, and
+  the only state the manager parses — is always parser-shaped.
+- Tests: the `C6:`/`C14:` cases in `agent/win/test/tty-protocol.test.mjs` (ring
+  reference-equivalence + ceiling, inverted DECSTBM, EL/ED row width) and
+  `test_a_blank_capture_reads_as_cant_tell_not_as_idle` in `test_hub_agent.py`.
+  **C9 and C15 live in `pty-host.mjs`, the I/O shell, which needs node-pty and is
+  excluded from CI — both are HOST-VERIFIED ONLY**, like the rest of that file.

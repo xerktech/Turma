@@ -146,6 +146,16 @@ const ring = new T.ScrollbackRing(RING_MAX);
 // keeps the footer as a persistent screen element, the `capture-pane -p` analog.
 const grid = new T.TerminalGrid(COLS, ROWS);
 const termClients = new Set();
+// How long to let close frames + buffered pty output drain before exiting. Short
+// enough that teardown stays prompt, long enough that the final screen lands.
+const PTY_EXIT_DRAIN_MS = Number(process.env.TURMA_PTY_EXIT_DRAIN_MS || 150);
+// Close every attached terminal socket with an explicit code. NEVER let a socket
+// die as 1006 on a deliberate teardown — see the onExit comment for why.
+function closeTermClients(code, reason) {
+  for (const ws of termClients) {
+    try { if (ws.readyState === ws.OPEN) ws.close(code, reason); } catch { /* already gone */ }
+  }
+}
 let ptyAlive = false;
 let exitCode = null;
 
@@ -175,9 +185,26 @@ function startPty() {
     ptyAlive = false;
     exitCode = code ?? 0;
     writeState();
-    // Give clients a beat to flush the final bytes, then exit — a real host
-    // lingers briefly so a re-attach right at exit still sees the last screen.
-    setTimeout(() => process.exit(0), 100);
+    // CLOSE EVERY TERMINAL SOCKET WITH 1000 BEFORE EXITING (C9). The vendored
+    // ttyd client (agent/win/vendor/ttyd-1.7.7) branches on the close code:
+    //
+    //     if (1e3 !== e.code && s) { showOverlay("Reconnecting..."); refreshToken().then(connect); }
+    //     else { ...onKey Enter... showOverlay("Press ⏎ to Reconnect"); }
+    //
+    // so a bare `process.exit` — which closes the sockets abruptly as 1006, and
+    // does NOT flush pending writes — put the browser into an INFINITE reconnect
+    // loop, each iteration re-fetching /term/<id>/token through the hub, opening
+    // a tunnel data channel and dialling a dead port. ttyd on Linux closes 1000
+    // when its child exits and the client settles on "Press Enter to Reconnect",
+    // so this is a drop-in-fidelity divergence in both directions: the storm, and
+    // a truncated final screen. Closing 1000 first makes the Windows pty-host
+    // behave as the thing it replaces.
+    closeTermClients(1000, "process exited");
+    // Let the close frames and any buffered output actually drain. We exit on
+    // our own timer rather than waiting for every socket, so a wedged peer
+    // cannot keep the host alive; `unref` is not used because we WANT this timer
+    // to hold the loop open for its duration.
+    setTimeout(() => process.exit(0), PTY_EXIT_DRAIN_MS);
   });
 }
 
@@ -275,8 +302,30 @@ termWss.on('connection', (ws) => {
         break; // empty/malformed/unknown ignored, as ttyd does
     }
   });
-  ws.on('close', () => termClients.delete(ws));   // DETACH: pty keeps running
-  ws.on('error', () => termClients.delete(ws));
+  // DETACH: the pty keeps running. Restore the LAUNCH geometry once the last
+  // viewer leaves (C15).
+  //
+  // A browser sizes the REAL pty to its own viewport on init/resize, and nothing
+  // ever put it back — so the first narrow client (a phone, a split pane) framed
+  // the pty at e.g. 80x24 for the REST OF THE SESSION'S LIFE, long after it had
+  // gone. Everything the manager reads off that pane is calibrated against the
+  // launch geometry (`--cols 220 --rows 50`, the tmux `-x 220 -y 50` analog):
+  // `_busy_from_capture`'s truncated-hint and spinner fallbacks, the
+  // `parse_pane_prompt` dialog shape, `parse_model_picker`, `_answer_trust_dialog`'s
+  // short-line heuristics, and the chat's own pane scrape. A permanently narrow
+  // grid silently degrades all of them.
+  //
+  // Restoring on DETACH rather than refusing the resize outright is deliberate:
+  // an attached viewer still gets a terminal that fits its window (refusing would
+  // letterbox them and diverge from ttyd), while an unobserved session — which is
+  // most of a session's life, and the only state the manager parses in — is
+  // always back at the geometry the parsers expect.
+  const detach = () => {
+    termClients.delete(ws);
+    if (termClients.size === 0) adapter.resize(COLS, ROWS);
+  };
+  ws.on('close', detach);
+  ws.on('error', detach);
 });
 
 // ---- CONTROL server: the tmux-CLI replacement the manager drives -------------
@@ -376,6 +425,15 @@ ctrlHttp.listen(CTRL_PORT, '127.0.0.1', onListen);
 
 // KillMode=process semantics: a clean SIGTERM/SIGINT tears the pty down; any
 // other manager death (crash/restart) leaves us running to be re-adopted.
-function shutdown() { try { term?.kill(); } catch { /* already dead */ } process.exit(0); }
+function shutdown() {
+  try { term?.kill(); } catch { /* already dead */ }
+  // Same contract as onExit: a 1000 close, never an abrupt 1006 that the client
+  // reads as "retry forever". Reached on SIGTERM/SIGINT — note that on Windows
+  // `os.kill(pid, SIGTERM)` maps to TerminateProcess and this handler does NOT
+  // run (the manager's `kill` control RPC is what gets us here), so this path
+  // matters for the graceful cases and must not be the only teardown.
+  closeTermClients(1000, "shutting down");
+  setTimeout(() => process.exit(0), PTY_EXIT_DRAIN_MS);
+}
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);

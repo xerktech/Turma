@@ -302,16 +302,42 @@ export function routeHttp(reqPath, base) {
 export class ScrollbackRing {
   constructor(maxBytes) {
     this.max = maxBytes > 0 ? maxBytes : 256 * 1024;
-    this.buf = Buffer.alloc(0);
+    // A BOUNDED CHUNK LIST with a running byte total, not one growing Buffer.
+    // `Buffer.concat([this.buf, b])` copied the ENTIRE ring on every pty chunk:
+    // Claude Code streaming emits many small chunks per second, so at ~200/s
+    // against a 256 KiB ring that is ~50 MB/s of memcpy plus the GC churn — on
+    // the pty-host's ONLY thread, which also fans bytes to every attached browser
+    // AND answers the manager's control RPCs on the beat. Appending is now O(1)
+    // amortised and only the (rare) `bytes()` read pays a concat.
+    this.chunks = [];
+    this.len = 0;
+    this._flat = null;   // memoised flatten, invalidated on append
   }
   append(chunk) {
     const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
-    this.buf = Buffer.concat([this.buf, b]);
-    if (this.buf.length > this.max) this.buf = this.buf.subarray(this.buf.length - this.max);
+    if (!b.length) return;
+    this._flat = null;
+    this.chunks.push(b);
+    this.len += b.length;
+    if (this.len <= this.max) return;
+    // Drop whole chunks off the front while the REST still covers the ceiling,
+    // then slice the new head once. A single oversized chunk tail-slices itself.
+    while (this.chunks.length > 1 && this.len - this.chunks[0].length >= this.max) {
+      this.len -= this.chunks.shift().length;
+    }
+    if (this.len > this.max) {
+      const head = this.chunks[0];
+      const cut = this.len - this.max;
+      this.chunks[0] = head.subarray(cut);
+      this.len -= cut;
+    }
   }
-  bytes() { return this.buf; }
-  text() { return this.buf.toString('utf8'); }
-  get length() { return this.buf.length; }
+  bytes() {
+    if (!this._flat) this._flat = this.chunks.length === 1 ? this.chunks[0] : Buffer.concat(this.chunks, this.len);
+    return this._flat;
+  }
+  text() { return this.bytes().toString('utf8'); }
+  get length() { return this.len; }
 }
 
 // ---- rendered screen grid (the `capture-pane -p` analog) ---------------------
@@ -456,8 +482,14 @@ export class TerminalGrid {
       case 'F': this.cr = this._clampR(this.cr - num(0, 1)); this.cc = 0; break;
       case 'K': {                                          // EL — erase in line
         const m = num(0, 0);
+        // `cc` sits at `cols` while a wrap is PENDING (the last cell is filled
+        // but the cursor has not moved down yet), so an unclamped `c <= this.cc`
+        // writes grid[cr][cols] and GROWS the row array to cols+1. capture()
+        // trims it cosmetically, but resize()/_scrollUp() then carry the wrong
+        // row shape forward. Clamp to the last real column.
+        const last = Math.min(this.cc, this.cols - 1);
         if (m === 0) for (let c = this.cc; c < this.cols; c++) this.grid[this.cr][c] = ' ';
-        else if (m === 1) for (let c = 0; c <= this.cc; c++) this.grid[this.cr][c] = ' ';
+        else if (m === 1) for (let c = 0; c <= last; c++) this.grid[this.cr][c] = ' ';
         else for (let c = 0; c < this.cols; c++) this.grid[this.cr][c] = ' ';
         break;
       }
@@ -465,11 +497,22 @@ export class TerminalGrid {
         const m = num(0, 0);
         const blank = (r) => { for (let c = 0; c < this.cols; c++) this.grid[r][c] = ' '; };
         if (m === 0) { for (let c = this.cc; c < this.cols; c++) this.grid[this.cr][c] = ' '; for (let r = this.cr + 1; r < this.rows; r++) blank(r); }
-        else if (m === 1) { for (let c = 0; c <= this.cc; c++) this.grid[this.cr][c] = ' '; for (let r = 0; r < this.cr; r++) blank(r); }
+        else if (m === 1) { const last = Math.min(this.cc, this.cols - 1); for (let c = 0; c <= last; c++) this.grid[this.cr][c] = ' '; for (let r = 0; r < this.cr; r++) blank(r); }
         else for (let r = 0; r < this.rows; r++) blank(r);
         break;
       }
-      case 'r': this.top = this._clampR(num(0, 1) - 1); this.bot = this._clampR(num(1, this.rows) - 1); this.cr = this.top; this.cc = 0; break; // DECSTBM
+      case 'r': {                                          // DECSTBM
+        // An INVERTED or degenerate region (`\x1b[10;5r`) would leave top > bot,
+        // after which _scrollUp's splice pair removes and reinserts at the wrong
+        // ends and scrambles the screen. These are untrusted pty bytes — a plain
+        // `echo` reaches this — so an unusable region is IGNORED (the terminal
+        // keeps its current one) rather than applied.
+        const top = this._clampR(num(0, 1) - 1);
+        const bot = this._clampR(num(1, this.rows) - 1);
+        if (top >= bot) break;
+        this.top = top; this.bot = bot; this.cr = this.top; this.cc = 0;
+        break;
+      }
       default: break;                                      // SGR (m), modes (h/l), DA (c), … move no text
     }
   }

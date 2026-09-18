@@ -10121,7 +10121,19 @@ def _pty_capture(tmux_name):
     PTY_CONTROL_BEAT_TIMEOUT_SEC."""
     r = _pty_control(tmux_name, "capture", timeout=PTY_CONTROL_BEAT_TIMEOUT_SEC)
     if r and r.get("ok"):
-        return r.get("data")
+        data = r.get("data")
+        # A BLANK grid is "can't tell", never "not working" (XERK-703's class,
+        # arriving by a different door). `_busy_from_capture("")` returns False —
+        # an AFFIRMATIVE not-busy — which skips the transcript-freshness fallback
+        # an uncapturable Linux pane gets, so a session reads IDLE and can fire
+        # the ready-for-review alert while its turn is still running. The grid is
+        # legitimately blank right after spawn and in the window between an
+        # `ED 2` and the app's repaint, so this is reachable in normal use, not
+        # only on failure. Whitespace-only counts as blank: a cleared grid is
+        # spaces, and capture() only trims trailing runs.
+        if data is None or not str(data).strip():
+            return None
+        return data
     return None
 
 
