@@ -1,5 +1,6 @@
 package com.xerktech.turma.core
 
+import com.xerktech.turma.model.Block
 import com.xerktech.turma.model.SendFile
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TaskNotificationBlock
@@ -107,11 +108,14 @@ fun buildItems(
         }
     }
     for (entry in entries) {
-        if (entry.blocks.isEmpty()) {
-            val text = conciseText(entry.role, entry.text)
-            if (text.isNotBlank()) out.add(ChatItem.Bubble(entry.key, entry.role, text))
-            continue
-        }
+        // Older agents / the text-only heartbeat seed carry no blocks: synthesize
+        // them, splitting a trailing run of tool markers off into name-only
+        // tool_use rows the verbosity filter can hide — never deleting them, and
+        // never touching bracketed prose (XERK-861). The web chat.js synthesizes
+        // a block-less entry as one text block and shows the markers verbatim;
+        // Android leads it here (see android/PARITY.md, XERK-861).
+        val blocks = if (entry.blocks.isNotEmpty()) entry.blocks else degradedBlocks(entry.role, entry.text)
+        if (blocks.isEmpty()) continue
         // Consecutive text blocks are ONE bubble, flushed by any other block —
         // the web accumulates `msg.text += b.text` and flushes the same way, so
         // a turn split across blocks must not render as several bubbles.
@@ -124,7 +128,7 @@ fun buildItems(
             pendingClipped = false
             if (!text.isNullOrBlank()) out.add(ChatItem.Bubble(entry.key, entry.role, text, clipped))
         }
-        for (block in entry.blocks) {
+        for (block in blocks) {
             when (block) {
                 is TextBlock -> {
                     (pending ?: StringBuilder().also { pending = it }).append(block.text)
@@ -182,6 +186,51 @@ fun buildItems(
         }
         flushText()
     }
+    return out
+}
+
+// The agent flattener (hub-agent.py `_entry_text`) appends one `[ToolName]`
+// marker per tool_use in content order with NO separator; within one entry the
+// tool_use blocks sit at the end (the turn yields at the first tool call), so a
+// genuine run is always TRAILING and its markers abut each other. `-` is in the
+// name class for hyphenated subagent types; MCP names (`mcp__server__tool`)
+// carry underscores. Conditions per XERK-861 (the intended web behavior — the
+// web chat.js does NOT yet do this split; see android/PARITY.md).
+private val TRAILING_MARKER_RUN = Regex("(?:\\[[A-Za-z][A-Za-z0-9_-]*])+$")
+private val ONE_MARKER = Regex("\\[[A-Za-z][A-Za-z0-9_-]*]")
+
+/**
+ * Synthesize display blocks for a BLOCK-LESS entry (an older agent or the
+ * text-only heartbeat seed) — the fix for XERK-861 (the old `conciseText`
+ * deleted ANY `[Word]` from assistant text, prose included, silently and
+ * un-recoverably).
+ *
+ * A trailing run of tool markers is split off into NAME-ONLY tool_use rows so
+ * buildItems' verbosity filter hides them under Concise and shows them under
+ * Normal/Verbose — rather than the text vanishing. (The web chat.js does not do
+ * this split yet; Android leads it — see android/PARITY.md.) The split is
+ * deliberately narrow, and the narrowness is the point:
+ *  - only role == "assistant" (a user turn's text is never a flattened turn);
+ *  - only a RUN of markers at the very END of the text;
+ *  - only a plausible tool name, `[A-Za-z][A-Za-z0-9_-]*`;
+ *  - only when the run is NOT preceded by a space or tab — the join has no
+ *    separator, so a real marker abuts its text or a line break, while prose
+ *    ("the plan [WIP]") puts a space before its bracket.
+ * That set keeps "the plan [WIP]", "see [1]" and "see the [notes] section"
+ * intact as ordinary text.
+ */
+fun degradedBlocks(role: String, text: String): List<Block> {
+    if (text.isEmpty()) return emptyList()
+    val plain = if (text.isBlank()) emptyList() else listOf(TextBlock(text))
+    if (role != "assistant") return plain
+    val run = TRAILING_MARKER_RUN.find(text) ?: return plain
+    val runStart = run.range.first
+    // Prose puts a space (or tab) before its bracket; a flattened marker does not.
+    if (runStart > 0 && (text[runStart - 1] == ' ' || text[runStart - 1] == '\t')) return plain
+    val lead = text.substring(0, runStart).trimEnd()
+    val out = ArrayList<Block>()
+    if (lead.isNotEmpty()) out.add(TextBlock(lead))
+    for (m in ONE_MARKER.findAll(run.value)) out.add(ToolUseBlock(name = m.value.substring(1, m.value.length - 1)))
     return out
 }
 

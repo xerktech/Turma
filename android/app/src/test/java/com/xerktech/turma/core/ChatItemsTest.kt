@@ -207,4 +207,62 @@ class ChatItemsTest {
         val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
         assertEquals("leftover", items.filterIsInstance<ChatItem.Tool>().single().result)
     }
+
+    // ---- XERK-861: block-less entry marker handling (degradedBlocks) --------
+    //
+    // The old conciseText deleted ANY [Word] from a block-less assistant entry —
+    // prose included — silently and with no way to get it back. degradedBlocks
+    // instead splits only a TRAILING run of tool markers into name-only tool_use
+    // rows the verbosity filter can hide, and never touches bracketed prose.
+
+    @Test fun `bracketed PROSE is never mistaken for a tool marker`() {
+        // A space before the bracket ("[notes]" mid-sentence, "the plan [WIP]"),
+        // a non-name marker ("[1]"), or a bracket not at the very end — all stay
+        // verbatim in the bubble, in every verbosity.
+        for (v in Verbosity.values()) {
+            val prefs = VerbosityPrefs.forPreset(v)
+            fun bubble(text: String): String {
+                val e = TailEntry(id = "p", role = "assistant", text = text)
+                return buildItems(listOf(e), prefs).filterIsInstance<ChatItem.Bubble>().single().text
+            }
+            assertEquals("see the [notes] section", bubble("see the [notes] section"))
+            assertEquals("the plan [WIP]", bubble("the plan [WIP]"))
+            assertEquals("see [1]", bubble("see [1]"))
+            // A user turn's brackets are never a flattened marker run — even a
+            // no-space trailing "[Bash]" that WOULD split on an assistant turn,
+            // which is what pins the role guard independently of the space guard.
+            val u = TailEntry(id = "u", role = "user", text = "keep [Bash]")
+            assertEquals("keep [Bash]", buildItems(listOf(u), prefs).filterIsInstance<ChatItem.Bubble>().single().text)
+            val u2 = TailEntry(id = "u2", role = "user", text = "done[Bash]")
+            val u2Items = buildItems(listOf(u2), prefs)
+            assertEquals("done[Bash]", u2Items.filterIsInstance<ChatItem.Bubble>().single().text)
+            assertTrue("a user turn never yields tool rows", u2Items.none { it is ChatItem.Tool })
+        }
+    }
+
+    @Test fun `Concise can now hide a block-less entry's tool markers`() {
+        // A real flattened turn: the agent joins markers onto the text with NO
+        // separator ("done[Bash][Read]"). The prose survives as a bubble; the
+        // trailing run becomes name-only tool rows Concise hides and Normal shows.
+        val e = TailEntry(id = "m", role = "assistant", text = "done[Bash][Read]")
+
+        val concise = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.CONCISE))
+        assertEquals("done", concise.filterIsInstance<ChatItem.Bubble>().single().text)
+        assertTrue("markers hidden under Concise", concise.none { it is ChatItem.Tool })
+
+        val normal = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
+        assertEquals("done", normal.filterIsInstance<ChatItem.Bubble>().single().text)
+        assertEquals(
+            listOf("Bash", "Read"),
+            normal.filterIsInstance<ChatItem.Tool>().map { it.name },
+        )
+    }
+
+    @Test fun `a block-less turn that is ONLY markers yields no bubble, hidden by Concise`() {
+        val e = TailEntry(id = "only", role = "assistant", text = "[Bash]")
+        assertTrue(buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.CONCISE)).isEmpty())
+        val normal = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
+        assertTrue(normal.none { it is ChatItem.Bubble })
+        assertEquals("Bash", normal.filterIsInstance<ChatItem.Tool>().single().name)
+    }
 }
