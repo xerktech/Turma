@@ -1112,8 +1112,18 @@
   // `>=` tie-break then let a text-only seed clobber the blocks right back off
   // the entry (a `!` chip regressing to a raw user bubble).
   function weight(e) {
+    // TOTAL by construction. weight() is on the render path, and the Sessions
+    // page has exactly one painter (render(cache)) -- so a throw here does not
+    // lose one entry, it blanks the whole page, and keeps blanking it every
+    // poll once the offending entry is in the buffer. `e.blocks || []` does not
+    // cover it: a non-array (`blocks: 5`) is truthy and not iterable, and a
+    // null MEMBER throws on the first property read. The hub coerces
+    // session.tail so this should be unreachable, but the cost of being sure is
+    // two guards and the cost of being wrong is a dead page.
+    if (!e) return 0;
     let w = (e.text || "").length;
-    for (const b of (e.blocks || [])) {
+    for (const b of (Array.isArray(e.blocks) ? e.blocks : [])) {
+      if (!b || typeof b !== "object") continue;
       w += (b.text || "").length + (b.input || "").length + (b.name || "").length +
         (b.args || "").length + (b.summary || "").length + (b.result || "").length +
         (b.desc || "").length + (b.content || "").length + (b.plan || "").length +
@@ -3778,6 +3788,9 @@
       __setPanePromptActive: (v) => { panePromptActive = v; },
       __setVerbosity: (v) => { verbosity = v; },
       reseedFromFleet,
+      onPoll,            // driven under the chat-live DOM shims: asserting the
+      __buffer: () => buffer,  // EFFECT is the only thing that catches a
+                               // correct re-seed whose result is discarded.
       __setBuffer: (b) => { buffer = b; },
       __setQueued: (q) => { queuedPrompts = q; },
       __setLiveTurn: (t) => { liveTurn = t; },

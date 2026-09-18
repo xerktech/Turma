@@ -370,6 +370,25 @@ test("weight: a TodoWrite preview never ties (and so never clobbers) its rich co
   assert.equal(kept.changed, false, "and must not repaint over it");
 });
 
+test("weight: a tool_use carrying SendUserFile previews outweighs one without", () => {
+  // The `files` arm of weight() had no test on the web side at all, though the
+  // Android twin pins exactly this. Same shape as the todos tie: `files` is a
+  // _tool_use_detail field, so the heartbeat preview omits it and a re-seed
+  // would strip inline previews off the card on an exact tie.
+  // The two copies differ ONLY in `files` -- caption is identical on both. An
+  // earlier draft put the caption only on the rich one, so its 9 characters
+  // carried the comparison and zeroing the whole files arm still passed.
+  const rich = { id: "a1", role: "assistant", text: "", blocks: [{ t: "tool_use", id: "t1",
+    name: "SendUserFile", caption: "the chart",
+    files: [{ name: "chart.png", kind: "image", src: "data:image/png;base64,AAAA" }] }] };
+  const preview = { id: "a1", role: "assistant", text: "", blocks: [{ t: "tool_use", id: "t1",
+    name: "SendUserFile", caption: "the chart" }] };
+  assert.ok(weight(rich) > weight(preview), "file previews must count toward weight");
+  const kept = reseedFromFleet([rich], { session: { tail: [preview] } });
+  assert.equal(kept.buffer[0].blocks[0].files.length, 1, "a re-seed must not strip them");
+  assert.equal(kept.buffer[0].blocks[0].caption, "the chart");
+});
+
 test("onPoll actually calls reseedFromFleet", () => {
   // onPoll paints, so it cannot be invoked under node -- which is precisely how
   // a re-seed reading the wrong field passed a green suite. Deleting the call
