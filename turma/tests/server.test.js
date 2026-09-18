@@ -17295,30 +17295,54 @@ test("term: terminalReconnectPage serves a self-reloading interstitial, once", (
 
   // Before headers: a 200 text/html reconnect document, no-store, ended once.
   const a = fakeRes();
-  terminalReconnectPage(a);
+  terminalReconnectPage(a, true);
   assert.equal(a.head[0], 200, "the interstitial is a 200 so it renders + runs everywhere");
   assert.match(a.head[1]["Content-Type"], /text\/html/);
   assert.equal(a.head[1]["Cache-Control"], "no-store", "a reload must fetch the real terminal, never a cached interstitial");
   assert.equal(a.endCount, 1);
   assert.match(a.ended, /location\.reload/, "the document must reload itself until ttyd answers");
   assert.match(a.ended, /Reconnecting to the terminal/);
+  assert.equal(a.head[1]["Content-Length"], Buffer.byteLength(a.ended),
+    "Content-Length must match the body actually sent");
+
+  // It must BACK OFF and eventually STAND DOWN, not reload forever: a host that is
+  // gone would otherwise have every open tab re-dial it for the tab's lifetime.
+  assert.match(a.ended, /Math\.min\(MAX,BASE\*Math\.pow\(2,n\)\)/, "the delay must back off exponentially");
+  assert.match(a.ended, /Terminal unavailable\./, "it must have a give-up state");
+  assert.match(a.ended, /Retry/, "the give-up state must offer a manual retry");
+  assert.match(a.ended, /sessionStorage/, "the attempt count must survive the reload");
+  // Every storage access is wrapped — sessionStorage THROWS in a private window or
+  // with site data blocked, and an unguarded read there would kill the script before
+  // it ever scheduled a retry, turning the healing page back into a dead end.
+  const storageCalls = (a.ended.match(/sessionStorage\.\w+\(/g) || []).length;
+  const guarded = (a.ended.match(/try\{[^}]*sessionStorage\.\w+\(/g) || []).length;
+  assert.ok(storageCalls > 0 && guarded === storageCalls,
+    `every sessionStorage access must sit in a try/catch (${guarded}/${storageCalls} guarded)`);
+
+  // The two cases must READ differently — a flapping tunnel vs a host that is gone.
+  const off = fakeRes();
+  terminalReconnectPage(off, false);
+  assert.match(off.ended, /terminal tunnel is offline/,
+    "an offline tunnel must say so, not show the same bare spinner as a timeout");
+  assert.ok(!/terminal tunnel is offline/.test(a.ended),
+    "a live tunnel must NOT claim the tunnel is offline");
 
   // A second call is a NO-OP — the double-end crash guard.
-  terminalReconnectPage(a);
+  terminalReconnectPage(a, true);
   assert.equal(a.endCount, 1, "a settled response must never be re-ended");
 
   // Headers already sent (a mid-stream edge routed here by mistake): end once, no
   // writeHead-after-headers throw.
   const b = fakeRes();
   b.headersSent = true;
-  terminalReconnectPage(b);
+  terminalReconnectPage(b, true);
   assert.equal(b.head, null, "must not writeHead once headers are already sent");
   assert.equal(b.endCount, 1);
 
   // Already ended: inert.
   const c = fakeRes();
   c.writableEnded = true;
-  terminalReconnectPage(c);
+  terminalReconnectPage(c, true);
   assert.equal(c.endCount, 0);
   assert.equal(c.head, null);
 });
