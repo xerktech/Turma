@@ -20971,3 +20971,39 @@ test("XERK-781: dropOriginLiveRelays tears down relay channels when this replica
   assert.equal(destroyed, true, "the redundant relay channel is destroyed");
   assert.equal(hub.liveRelayChannels[host], undefined, "the host's relay-channel map is cleared");
 });
+
+// --- the /live fanout coerces an agent tail frame ----------------------------
+// The heartbeat's session.tail goes through coerceLiveSignals; the live fanout
+// forwarded msg.entries RAW, checking only that it was an array. One malformed
+// block in an agent-authed frame then reached every watching browser, threw out
+// of buildItems, and PERMANENTLY killed the chat pane -- the bad entry sits in
+// the client's grow-only buffer, so every later frame throws again.
+test("coerceTailFrame: a malformed entry or block cannot reach a viewer", () => {
+  const { coerceTailFrame } = hub;
+
+  // A null block member -- the shape QA reproduced killing the pane.
+  const a = coerceTailFrame({ entries: [{ id: "a2", blocks: [null] }] });
+  assert.deepStrictEqual(a.entries[0].blocks, [], "a null block is dropped");
+
+  // A non-array `blocks` is rewritten to [], never left truthy-and-not-iterable.
+  const b = coerceTailFrame({ entries: [{ id: "a2", blocks: 5 }] });
+  assert.deepStrictEqual(b.entries[0].blocks, []);
+
+  // Non-object entries are dropped entirely.
+  const c = coerceTailFrame({ entries: [null, "nope", 5, { id: "ok" }] });
+  assert.deepStrictEqual(c.entries.map((e) => e.id), ["ok"]);
+
+  // Block leaves take the same rule the heartbeat path applies.
+  const d = coerceTailFrame({ entries: [{ id: "a", blocks: [
+    { t: "tool_use", truncated: "yes", files: [null, { name: "f", shed: "no" }] },
+  ] }] });
+  assert.ok(!("truncated" in d.entries[0].blocks[0]), "a non-bool truncated is dropped");
+  assert.deepStrictEqual(d.entries[0].blocks[0].files.map((f) => f.name), ["f"]);
+  assert.ok(!("shed" in d.entries[0].blocks[0].files[0]), "a non-bool shed is dropped");
+
+  // queued is a List<String> on the clients.
+  const e = coerceTailFrame({ entries: [], queued: ["ok", 7, null, {}, ["x"]] });
+  assert.deepStrictEqual(e.queued, ["ok", 7], "non-string/number queued entries are dropped");
+  assert.deepStrictEqual(coerceTailFrame({ entries: [] }).queued, [], "absent queued -> []");
+  assert.deepStrictEqual(coerceTailFrame({ entries: 5 }).entries, [], "a non-array entries -> []");
+});

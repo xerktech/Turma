@@ -8239,10 +8239,42 @@ function coerceLiveSignals(live) {
   coerceStringList(live, "newPrUrls");
   coerceObjectList(live, "questionOptionsRich"); // QuestionOption leaves are all Strings
   const tail = coerceObjectList(live, "tail");
-  if (tail) for (const e of tail) {
+  if (tail) coerceTailBlocks(tail);
+}
+
+// Coerce the BLOCKS of an already-object-filtered list of tail entries, in
+// place. Extracted from coerceLiveSignals so the /live fanout path can apply
+// the SAME rule -- see coerceTailFrame. Pure lift: the heartbeat path behaves
+// exactly as it did.
+function coerceTailBlocks(entries) {
+  for (const e of entries) {
     const blocks = coerceObjectList(e, "blocks");
     if (blocks) blocks.forEach(coerceBlockElem);
   }
+  return entries;
+}
+
+// Coerce ONE agent-authed /live tail frame's payload.
+//
+// The heartbeat's `session.tail` goes through coerceLiveSignals, but the live
+// fanout forwarded `msg.entries` RAW -- only checking that it was an array. So
+// a single malformed block in an agent frame (`entries:[{id:"a2",
+// blocks:[null]}]`) reached every watching browser, threw out of buildItems,
+// and PERMANENTLY killed the chat pane: the bad entry is in the client's
+// grow-only buffer, so every later frame throws again and no reload short of a
+// new session clears it. Same wire shape, same clients, same risk -- so the
+// same coercion. The two callers now share coerceTailBlocks/coerceBlockElem
+// rather than keeping a second, weaker rule on the hotter path.
+//
+// `queued` is a List<String> on the clients (still-queued prompts typed
+// mid-turn), so it takes coerceStringList's rule: a number decodes leniently
+// into a String, anything else is dropped.
+function coerceTailFrame(msg) {
+  const entries = coerceTailBlocks(
+    (Array.isArray(msg.entries) ? msg.entries : []).filter(objectish));
+  const queued = (Array.isArray(msg.queued) ? msg.queued : [])
+    .filter((x) => typeof x === "string" || typeof x === "number");
+  return { entries, queued };
 }
 
 // `codingAgent` (CodingAgent? on Android, TIER 2). Only the top-level shape is
@@ -18294,8 +18326,8 @@ server.on("upgrade", async (req, socket, head) => {
       if (msg && typeof msg.tail === "string" && msg.tail && Array.isArray(msg.entries)) {
         // `queued` = still-queued prompts typed mid-turn (foldQueueOp in
         // tunnel-agent.js); absent from agents predating it.
-        liveFanout(name, msg.tail, { type: "tail", entries: msg.entries,
-          queued: Array.isArray(msg.queued) ? msg.queued : [] });
+        const { entries, queued } = coerceTailFrame(msg);
+        liveFanout(name, msg.tail, { type: "tail", entries, queued });
       } else if (msg && typeof msg.turn === "string" && msg.turn && typeof msg.text === "string") {
         // `agents` = the session's live agent list, which outlives the turn
         // (a background agent keeps running after the main one stops), so it
@@ -18587,6 +18619,10 @@ if (process.env.TURMA_TEST) {
   module.exports = {
     server,
     agents,
+    // The /live fanout's coercion of an agent-authed tail frame. Held
+    // directly because the defect it closes is invisible hub-side: the
+    // frame is forwarded, and it is the BROWSER that dies on it.
+    coerceTailFrame,
     // The create single-flight's backstop, exported so a test can hold the
     // PRODUCTION default rather than the wound-down one the suite runs with —
     // its value relative to the client's give-up is the whole point (XERK-241).
