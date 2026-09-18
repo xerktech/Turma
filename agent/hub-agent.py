@@ -6647,11 +6647,31 @@ def _tail_entries(path):
 TASK_NOTIFICATION_RE = re.compile(r"^\s*<task-notification>(.*)</task-notification>\s*$", re.DOTALL)
 
 
+# Canonical edge-whitespace trim for the transcript block path (XERK-864).
+# str.strip() and JS String.prototype.trim() DISAGREE on 6 codepoints — JS
+# strips U+FEFF (BOM/ZWNBSP) which Python keeps, and Python strips U+0085 (NEL)
+# and U+001C–U+001F (the file/group/record/unit separators) which JS keeps. On
+# the _entry_blocks / entryBlocks path that split the SAME block into a different
+# leading/trailing character on the live tail (JS) vs history/archive (Python),
+# breaking the one-fidelity contract (XERK-347). So both feeds trim exactly this
+# ASCII set instead; the 6 divergent codepoints are kept as content on both
+# sides. Mirror of tunnel-agent.js EDGE_WS_RE / edgeTrim — proven byte-identical
+# across every Unicode codepoint. (Same set _byte_ceiling strips, for the same
+# reason.)
+_EDGE_WS = " \t\n\r\f\v"
+
+
+def _edge_trim(s):
+    """str.strip() restricted to the canonical block-path whitespace set, so it
+    agrees with the JS mirror's edgeTrim() on every codepoint (XERK-864)."""
+    return str(s if s is not None else "").strip(_EDGE_WS)
+
+
 def _tn_tag(name, body):
     """Inner text of the first <name>…</name> in `body`, ANSI-stripped and
     trimmed, or "" when absent."""
     m = re.search(r"<%s>(.*?)</%s>" % (name, name), body, re.DOTALL)
-    return ANSI_RE.sub("", m.group(1)).strip() if m else ""
+    return _edge_trim(ANSI_RE.sub("", m.group(1))) if m else ""
 
 
 def _parse_task_notification(text):
@@ -6732,17 +6752,17 @@ def _parse_local_command(text):
         return {"kind": "caveat"}
     m = COMMAND_NAME_RE.search(text)
     if m:
-        name = ANSI_RE.sub("", m.group(1)).strip()
+        name = _edge_trim(ANSI_RE.sub("", m.group(1)))
         args = COMMAND_ARGS_RE.search(text)
         if name:
             return {
                 "kind": "command",
                 "name": name,
-                "args": ANSI_RE.sub("", args.group(1)).strip() if args else "",
+                "args": _edge_trim(ANSI_RE.sub("", args.group(1))) if args else "",
             }
     m = BASH_INPUT_RE.search(text)
     if m:
-        cmd = ANSI_RE.sub("", m.group(1)).strip()
+        cmd = _edge_trim(ANSI_RE.sub("", m.group(1)))
         if cmd:
             return {"kind": "command", "name": "!", "args": cmd}
     first = None
@@ -6752,7 +6772,7 @@ def _parse_local_command(text):
         if m:
             out = {
                 "kind": "output",
-                "text": ANSI_RE.sub("", m.group(1)).strip(),
+                "text": _edge_trim(ANSI_RE.sub("", m.group(1))),
                 "isError": is_error,
             }
             # stderr wins over stdout ONLY when it carries text — a bash turn
@@ -6827,7 +6847,7 @@ def _away_summary_text(entry):
     tunnel-agent.js awaySummaryText."""
     if entry.get("type") != "system" or entry.get("subtype") != "away_summary":
         return None
-    text = AWAY_HINT_RE.sub("", ANSI_RE.sub("", str(entry.get("content") or ""))).strip()
+    text = _edge_trim(AWAY_HINT_RE.sub("", ANSI_RE.sub("", str(entry.get("content") or ""))))
     return text or None
 
 
@@ -6944,7 +6964,7 @@ def _entry_text(entry):
         text = "".join(parts)
     else:
         return None
-    text = ANSI_RE.sub("", text).strip()
+    text = _edge_trim(ANSI_RE.sub("", text))
     return text or None
 
 
@@ -6971,14 +6991,14 @@ def _tool_input_summary(inp):
     if isinstance(inp, dict):
         questions = inp.get("questions")
         if isinstance(questions, list):
-            texts = [q["question"].strip() for q in questions
+            texts = [_edge_trim(q["question"]) for q in questions
                      if isinstance(q, dict) and isinstance(q.get("question"), str)
-                     and q["question"].strip()]
+                     and _edge_trim(q["question"])]
             if texts:
                 return " · ".join(texts)
         for key in _TOOL_INPUT_KEYS:
             val = inp.get(key)
-            if isinstance(val, str) and val.strip():
+            if isinstance(val, str) and _edge_trim(val):
                 return val
         try:
             return json.dumps(inp, ensure_ascii=False, separators=(",", ":"))
@@ -7101,16 +7121,16 @@ def _todo_items(raw, caps):
         if not isinstance(it, dict):
             continue
         content = it.get("content")
-        if not isinstance(content, str) or not content.strip():
+        if not isinstance(content, str) or not _edge_trim(content):
             continue
         status = it.get("status")
         if status not in _TODO_STATUSES:
             status = "pending"
-        item = {"content": _clip(ANSI_RE.sub("", content).strip(), caps["input"])[0],
+        item = {"content": _clip(_edge_trim(ANSI_RE.sub("", content)), caps["input"])[0],
                 "status": status}
         active = it.get("activeForm")
-        if isinstance(active, str) and active.strip():
-            item["activeForm"] = _clip(ANSI_RE.sub("", active).strip(), caps["input"])[0]
+        if isinstance(active, str) and _edge_trim(active):
+            item["activeForm"] = _clip(_edge_trim(ANSI_RE.sub("", active)), caps["input"])[0]
         out.append(item)
     return out or None
 
@@ -7146,14 +7166,14 @@ def _tool_use_detail(block, name, inp, caps):
             truncated = old_t or new_t
     elif name == "Write":
         content = inp.get("content")
-        if isinstance(content, str) and content.strip():
+        if isinstance(content, str) and _edge_trim(content):
             clipped, trunc = _clip(ANSI_RE.sub("", content), caps["result"])
             block["content"] = clipped
             truncated = trunc
     elif name == "ExitPlanMode":
         plan = inp.get("plan")
-        if isinstance(plan, str) and plan.strip():
-            clipped, trunc = _clip(ANSI_RE.sub("", plan).strip(), caps["text"])
+        if isinstance(plan, str) and _edge_trim(plan):
+            clipped, trunc = _clip(_edge_trim(ANSI_RE.sub("", plan)), caps["text"])
             block["plan"] = clipped
             truncated = trunc
     elif name == "SendUserFile":
@@ -7161,15 +7181,15 @@ def _tool_use_detail(block, name, inp, caps):
         if files:
             block["files"] = files
             cap = inp.get("caption")
-            if isinstance(cap, str) and cap.strip():
-                block["caption"] = _clip(ANSI_RE.sub("", cap).strip(), caps["input"])[0]
+            if isinstance(cap, str) and _edge_trim(cap):
+                block["caption"] = _clip(_edge_trim(ANSI_RE.sub("", cap)), caps["input"])[0]
     elif name in ("TodoWrite", "todo_write"):
         todos = _todo_items(inp.get("todos"), caps)
         if todos:
             block["todos"] = todos
     desc = inp.get("description")
-    if isinstance(desc, str) and desc.strip():
-        block["desc"] = _clip(ANSI_RE.sub("", desc).strip(), caps["input"])[0]
+    if isinstance(desc, str) and _edge_trim(desc):
+        block["desc"] = _clip(_edge_trim(ANSI_RE.sub("", desc)), caps["input"])[0]
     return truncated
 
 
@@ -7725,7 +7745,7 @@ def _entry_blocks(entry, caps):
     # operator prose.
     tool_src = _entry_tool_source(entry)
     if tool_src:
-        text = ANSI_RE.sub("", _entry_first_text(entry)).strip()
+        text = _edge_trim(ANSI_RE.sub("", _entry_first_text(entry)))
         clipped, trunc = _clip(text, caps["result"])
         block = {"t": "tool_result", "text": clipped, "forId": tool_src}
         if trunc:
@@ -7735,7 +7755,7 @@ def _entry_blocks(entry, caps):
     blocks = []
 
     def add_text(kind, text, cap):
-        text = ANSI_RE.sub("", text or "").strip()
+        text = _edge_trim(ANSI_RE.sub("", text or ""))
         if not text:
             return
         clipped, trunc = _clip(text, cap)
@@ -7789,7 +7809,7 @@ def _entry_blocks(entry, caps):
             add_local_command(lc)
             return
         if INTERRUPT_RE.match(raw):
-            blocks.append({"t": "interrupt", "text": ANSI_RE.sub("", raw).strip()})
+            blocks.append({"t": "interrupt", "text": _edge_trim(ANSI_RE.sub("", raw))})
             return
         # A compact summary is prose the model wrote about the conversation so
         # far, injected as a user turn. It gets its own block so the chat can
@@ -7810,7 +7830,7 @@ def _entry_blocks(entry, caps):
             elif btype == "thinking":
                 add_text("thinking", str(raw.get("thinking") or raw.get("text") or ""), caps["text"])
             elif btype == "tool_use" and raw.get("name"):
-                summary = ANSI_RE.sub("", _tool_input_summary(raw.get("input"))).strip()
+                summary = _edge_trim(ANSI_RE.sub("", _tool_input_summary(raw.get("input"))))
                 clipped, trunc = _clip(summary, caps["input"])
                 block = {"t": "tool_use", "name": str(raw["name"]), "input": clipped}
                 if raw.get("id"):
@@ -7821,7 +7841,7 @@ def _entry_blocks(entry, caps):
                     block["truncated"] = True
                 blocks.append(block)
             elif btype == "tool_result":
-                text = ANSI_RE.sub("", _tool_result_text(raw.get("content"))).strip()
+                text = _edge_trim(ANSI_RE.sub("", _tool_result_text(raw.get("content"))))
                 clipped, trunc = _clip(text, caps["result"])
                 block = {"t": "tool_result", "text": clipped}
                 if raw.get("tool_use_id"):
@@ -8050,14 +8070,14 @@ def _fold_queue_op(entry, queue):
     op = entry.get("operation")
     content = entry.get("content")
     if op == "enqueue":
-        if isinstance(content, str) and content.strip():
-            queue.append(content.strip()[:QUEUED_PROMPT_CHARS])
+        if isinstance(content, str) and _edge_trim(content):
+            queue.append(_edge_trim(content)[:QUEUED_PROMPT_CHARS])
     elif op == "dequeue":
         if queue:
             queue.pop(0)
     elif op == "remove":
         if isinstance(content, str):
-            c = content.strip()[:QUEUED_PROMPT_CHARS]
+            c = _edge_trim(content)[:QUEUED_PROMPT_CHARS]
             if c in queue:
                 queue.remove(c)
 

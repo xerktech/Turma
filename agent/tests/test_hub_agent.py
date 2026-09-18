@@ -3029,6 +3029,38 @@ class TestEntryBlocks(unittest.TestCase):
             [{"t": "text", "text": "hi"}],
         )
 
+    def test_unicode_whitespace_edges_match_the_js_mirror(self):
+        # XERK-864: str.strip() and JS trim() disagree on 6 codepoints — JS
+        # strips U+FEFF (BOM), Python strips U+0085 (NEL) and U+001C-U+001F
+        # (the separators). Both feeds now edge-trim exactly the ASCII set, so a
+        # block with those chars at its edges keeps them IDENTICALLY on both
+        # sides; only ordinary ASCII whitespace is trimmed. (The hand-written
+        # tunnel-agent.test.js twin asserts the byte-identical expected block.)
+        cases = [
+            # leading BOM + trailing NEL, wrapped in ASCII spaces that DO strip
+            ("  ﻿hello  ", "﻿hello"),
+            # trailing unit separator kept; leading tab stripped
+            ("\tworld", "world"),
+            # leading file separator kept
+            ("foo", "foo"),
+        ]
+        for content, want in cases:
+            self.assertEqual(
+                ha._entry_blocks({"type": "user", "message": {"content": content}}, ha.BLOCK_CAPS),
+                [{"t": "text", "text": want}],
+            )
+        # A tool_result carrying a leading BOM (the exact 1-in-80k corpus
+        # mismatch: a C# file read whose BOM Python kept and JS stripped).
+        self.assertEqual(
+            ha._entry_blocks({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "﻿using System;"}]}},
+                ha.BLOCK_CAPS),
+            [{"t": "tool_result", "text": "﻿using System;", "forId": "t1"}],
+        )
+        # _edge_trim itself agrees with the documented divergence set.
+        self.assertEqual(ha._edge_trim("﻿x"), "﻿x")
+        self.assertEqual(ha._edge_trim("  x  "), "x")
+
     def test_preserves_thinking_tool_input_and_pairing(self):
         entry = {"type": "assistant", "message": {"content": [
             {"type": "thinking", "thinking": "pon\x1b[0mder"},

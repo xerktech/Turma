@@ -205,10 +205,25 @@ const TN_TAG_RE = {
   result: /<result>([\s\S]*?)<\/result>/,
   "task-id": /<task-id>([\s\S]*?)<\/task-id>/,
 };
+// Canonical edge-whitespace trim for the transcript block path (XERK-864).
+// String.prototype.trim() and Python str.strip() DISAGREE on 6 codepoints — JS
+// trims U+FEFF (BOM/ZWNBSP) which Python keeps, and Python strips U+0085 (NEL)
+// and U+001C–U+001F (the file/group/record/unit separators) which JS keeps. On
+// the entryBlocks / _entry_blocks path that split the SAME block into a
+// different leading/trailing character on the live tail (JS) vs history/archive
+// (Python), breaking the one-fidelity contract (XERK-347). So both feeds trim
+// exactly this ASCII set instead; the 6 divergent codepoints are kept as content
+// on both sides. Mirror of hub-agent.py _EDGE_WS / _edge_trim — proven
+// byte-identical across every Unicode codepoint.
+const EDGE_WS_RE = /^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g;
+function edgeTrim(s) {
+  return String(s == null ? "" : s).replace(EDGE_WS_RE, "");
+}
+
 function tnTag(name, body) {
   const re = TN_TAG_RE[name];
   const m = re ? re.exec(body) : null;
-  return m ? m[1].replace(ANSI_RE, "").trim() : "";
+  return m ? edgeTrim(m[1].replace(ANSI_RE, "")) : "";
 }
 function parseTaskNotification(text) {
   if (!text) return null;
@@ -251,15 +266,15 @@ function parseLocalCommand(text) {
   if (LOCAL_COMMAND_CAVEAT_RE.test(text)) return { kind: "caveat" };
   const nameM = COMMAND_NAME_RE.exec(text);
   if (nameM) {
-    const name = nameM[1].replace(ANSI_RE, "").trim();
+    const name = edgeTrim(nameM[1].replace(ANSI_RE, ""));
     if (name) {
       const argsM = COMMAND_ARGS_RE.exec(text);
-      return { kind: "command", name, args: argsM ? argsM[1].replace(ANSI_RE, "").trim() : "" };
+      return { kind: "command", name, args: argsM ? edgeTrim(argsM[1].replace(ANSI_RE, "")) : "" };
     }
   }
   const bashM = BASH_INPUT_RE.exec(text);
   if (bashM) {
-    const cmd = bashM[1].replace(ANSI_RE, "").trim();
+    const cmd = edgeTrim(bashM[1].replace(ANSI_RE, ""));
     if (cmd) return { kind: "command", name: "!", args: cmd };
   }
   // stderr wins over stdout when a turn carries both — but ONLY when it
@@ -270,7 +285,7 @@ function parseLocalCommand(text) {
     [COMMAND_STDOUT_RE, false], [BASH_STDOUT_RE, false]]) {
     const m = re.exec(text);
     if (m) {
-      const out = { kind: "output", text: m[1].replace(ANSI_RE, "").trim(), isError };
+      const out = { kind: "output", text: edgeTrim(m[1].replace(ANSI_RE, "")), isError };
       if (out.text) return out;
       if (!first) first = out;
     }
@@ -323,7 +338,7 @@ const INTERRUPT_RE = /^\s*\[Request interrupted by user[^\]\n]*\]\s*$/;
 const AWAY_HINT_RE = /\s*\(disable recaps in \/config\)\s*$/;
 function awaySummaryText(entry) {
   if (entry.type !== "system" || entry.subtype !== "away_summary") return null;
-  const text = String(entry.content || "").replace(ANSI_RE, "").replace(AWAY_HINT_RE, "").trim();
+  const text = edgeTrim(String(entry.content || "").replace(ANSI_RE, "").replace(AWAY_HINT_RE, ""));
   return text || null;
 }
 
@@ -379,7 +394,7 @@ function entryText(entry) {
   } else {
     return null;
   }
-  text = text.replace(ANSI_RE, "").trim();
+  text = edgeTrim(text.replace(ANSI_RE, ""));
   return text || null;
 }
 
@@ -415,13 +430,13 @@ function toolInputSummary(inp) {
   if (inp && typeof inp === "object" && !Array.isArray(inp)) {
     if (Array.isArray(inp.questions)) {
       const texts = inp.questions
-        .map((q) => (q && typeof q === "object" && typeof q.question === "string") ? q.question.trim() : "")
+        .map((q) => (q && typeof q === "object" && typeof q.question === "string") ? edgeTrim(q.question) : "")
         .filter(Boolean);
       if (texts.length) return texts.join(" · ");
     }
     for (const key of TOOL_INPUT_KEYS) {
       const val = inp[key];
-      if (typeof val === "string" && val.trim()) return val;
+      if (typeof val === "string" && edgeTrim(val)) return val;
     }
     try { return JSON.stringify(inp); } catch { return String(inp); }
   }
@@ -480,12 +495,12 @@ function todoItems(raw, caps) {
   for (const it of raw.slice(0, TODO_ITEMS_MAX)) {
     if (!it || typeof it !== "object" || Array.isArray(it)) continue;
     const content = it.content;
-    if (typeof content !== "string" || !content.trim()) continue;
+    if (typeof content !== "string" || !edgeTrim(content)) continue;
     let status = it.status;
     if (!TODO_STATUSES.includes(status)) status = "pending";
-    const item = { content: clip(content.replace(ANSI_RE, "").trim(), caps.input)[0], status };
-    if (typeof it.activeForm === "string" && it.activeForm.trim()) {
-      item.activeForm = clip(it.activeForm.replace(ANSI_RE, "").trim(), caps.input)[0];
+    const item = { content: clip(edgeTrim(content.replace(ANSI_RE, "")), caps.input)[0], status };
+    if (typeof it.activeForm === "string" && edgeTrim(it.activeForm)) {
+      item.activeForm = clip(edgeTrim(it.activeForm.replace(ANSI_RE, "")), caps.input)[0];
     }
     out.push(item);
   }
@@ -508,14 +523,14 @@ function toolUseDetail(block, name, inp, caps) {
       truncated = oldT || newT;
     }
   } else if (name === "Write") {
-    if (typeof inp.content === "string" && inp.content.trim()) {
+    if (typeof inp.content === "string" && edgeTrim(inp.content)) {
       const [clipped, trunc] = clip(inp.content.replace(ANSI_RE, ""), caps.result);
       block.content = clipped;
       truncated = trunc;
     }
   } else if (name === "ExitPlanMode") {
-    if (typeof inp.plan === "string" && inp.plan.trim()) {
-      const [clipped, trunc] = clip(inp.plan.replace(ANSI_RE, "").trim(), caps.text);
+    if (typeof inp.plan === "string" && edgeTrim(inp.plan)) {
+      const [clipped, trunc] = clip(edgeTrim(inp.plan.replace(ANSI_RE, "")), caps.text);
       block.plan = clipped;
       truncated = trunc;
     }
@@ -523,16 +538,16 @@ function toolUseDetail(block, name, inp, caps) {
     const files = sendUserFileDetail(inp);
     if (files) {
       block.files = files;
-      if (typeof inp.caption === "string" && inp.caption.trim()) {
-        block.caption = clip(inp.caption.replace(ANSI_RE, "").trim(), caps.input)[0];
+      if (typeof inp.caption === "string" && edgeTrim(inp.caption)) {
+        block.caption = clip(edgeTrim(inp.caption.replace(ANSI_RE, "")), caps.input)[0];
       }
     }
   } else if (name === "TodoWrite" || name === "todo_write") {
     const todos = todoItems(inp.todos, caps);
     if (todos) block.todos = todos;
   }
-  if (typeof inp.description === "string" && inp.description.trim()) {
-    block.desc = clip(inp.description.replace(ANSI_RE, "").trim(), caps.input)[0];
+  if (typeof inp.description === "string" && edgeTrim(inp.description)) {
+    block.desc = clip(edgeTrim(inp.description.replace(ANSI_RE, "")), caps.input)[0];
   }
   return truncated;
 }
@@ -604,7 +619,7 @@ function entryBlocks(entry, caps) {
   // the content walk — the body arrives as an ordinary text block.
   const toolSrc = entryToolSource(entry);
   if (toolSrc) {
-    const text = entryFirstText(entry).replace(ANSI_RE, "").trim();
+    const text = edgeTrim(entryFirstText(entry).replace(ANSI_RE, ""));
     const [clipped, trunc] = clip(text, caps.result);
     const block = { t: "tool_result", text: clipped, forId: toolSrc };
     if (trunc) block.truncated = true;
@@ -613,7 +628,7 @@ function entryBlocks(entry, caps) {
 
   const blocks = [];
   const addText = (kind, text, cap) => {
-    text = String(text || "").replace(ANSI_RE, "").trim();
+    text = edgeTrim(String(text || "").replace(ANSI_RE, ""));
     if (!text) return;
     const [clipped, trunc] = clip(text, cap);
     const block = { t: kind, text: clipped };
@@ -658,7 +673,7 @@ function entryBlocks(entry, caps) {
     if (lc) return addLocalCommand(lc);
     // An interrupt marker is a statement about the turn, not operator prose.
     if (INTERRUPT_RE.test(raw)) {
-      blocks.push({ t: "interrupt", text: String(raw).replace(ANSI_RE, "").trim() });
+      blocks.push({ t: "interrupt", text: edgeTrim(String(raw).replace(ANSI_RE, "")) });
       return;
     }
     addText(entry.isCompactSummary ? "compact_summary" : "text", raw, caps.text);
@@ -673,7 +688,7 @@ function entryBlocks(entry, caps) {
       } else if (raw.type === "thinking") {
         addText("thinking", raw.thinking || raw.text || "", caps.text);
       } else if (raw.type === "tool_use" && raw.name) {
-        const summary = toolInputSummary(raw.input).replace(ANSI_RE, "").trim();
+        const summary = edgeTrim(toolInputSummary(raw.input).replace(ANSI_RE, ""));
         const [clipped, trunc] = clip(summary, caps.input);
         const block = { t: "tool_use", name: String(raw.name), input: clipped };
         if (raw.id) block.id = raw.id;
@@ -681,7 +696,7 @@ function entryBlocks(entry, caps) {
         if (toolUseDetail(block, String(raw.name), raw.input, caps)) block.truncated = true;
         blocks.push(block);
       } else if (raw.type === "tool_result") {
-        const text = toolResultText(raw.content).replace(ANSI_RE, "").trim();
+        const text = edgeTrim(toolResultText(raw.content).replace(ANSI_RE, ""));
         const [clipped, trunc] = clip(text, caps.result);
         const block = { t: "tool_result", text: clipped };
         if (raw.tool_use_id) block.forId = raw.tool_use_id;
@@ -713,12 +728,12 @@ function foldQueueOp(entry, queue) {
   const op = entry.operation;
   const content = entry.content;
   if (op === "enqueue") {
-    if (typeof content === "string" && content.trim()) queue.push(content.trim().slice(0, QUEUED_PROMPT_CHARS));
+    if (typeof content === "string" && edgeTrim(content)) queue.push(edgeTrim(content).slice(0, QUEUED_PROMPT_CHARS));
   } else if (op === "dequeue") {
     if (queue.length) queue.shift();
   } else if (op === "remove") {
     if (typeof content === "string") {
-      const c = content.trim().slice(0, QUEUED_PROMPT_CHARS);
+      const c = edgeTrim(content).slice(0, QUEUED_PROMPT_CHARS);
       const i = queue.indexOf(c);
       if (i >= 0) queue.splice(i, 1);
     }
@@ -1985,7 +2000,7 @@ if (require.main === module) {
 } else {
   module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS,
-    toolUseDetail, todoItems, fmtDshElapsed, dshStatus,
+    toolUseDetail, todoItems, fmtDshElapsed, dshStatus, edgeTrim,
     ptyCaptureWindows, ptyStatePath,
     usableHostname, deviceName, deviceDiscriminator };
 }
