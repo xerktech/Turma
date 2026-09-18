@@ -117,8 +117,35 @@ test('serializeState publishes EVERY key the pty-host writes', () => {
   // Strip comments first, then take every `name:` that opens a line or follows a
   // comma. The writer spells every key out (no shorthand) so this sees them all.
   const literal = body[1].replace(/\/\/[^\n]*/g, '');
+  // Split the literal into TOP-LEVEL entries and require every one of them to be
+  // an explicit `name:`. Matching `name:` alone would let the three natural ways
+  // of adding the next field slip straight through — `newKey,` (shorthand, which
+  // is what the writer used before this guard existed), a `...spread`, and an
+  // `st.newKey = …` assignment after the literal — each re-opening the exact hole
+  // that shipped as the destructive token-roll branch.
+  const entries = [];
+  let depth = 0, cur = '';
+  for (const ch of literal) {
+    if ('{(['.includes(ch)) depth++;
+    else if ('})]'.includes(ch)) depth--;
+    if (ch === ',' && depth === 0) { entries.push(cur); cur = ''; } else cur += ch;
+  }
+  entries.push(cur);
   const written = new Set();
-  for (const m of literal.matchAll(/(?:^|,)\s*([A-Za-z_$][\w$]*)\s*:/gm)) written.add(m[1]);
+  for (const raw of entries) {
+    const e = raw.trim();
+    if (!e) continue;
+    const m = /^([A-Za-z_$][\w$]*)\s*:/.exec(e);
+    assert.ok(m, `writeState() entry ${JSON.stringify(e)} is not an explicit ` +
+      '"name:" — shorthand and spreads are invisible to this guard, so spell it out');
+    written.add(m[1]);
+  }
+  // Nothing may be bolted onto `st` after the literal either.
+  const after = /function writeState\(\) \{[\s\S]*?\n  \};([\s\S]*?)\n\}/.exec(src);
+  assert.ok(after, 'writeState() moved or changed shape');
+  assert.ok(!/\bst\s*(\.\w+|\[)\s*=[^=]/.test(after[1].replace(/\/\/[^\n]*/g, '')),
+    'writeState() assigns a field to `st` AFTER the literal, where the guard ' +
+    'cannot see it — put it in the literal');
   assert.ok(written.has('authTokenFile'), 'sanity: the writer still has the field');
   // Every field populated: JSON.stringify omits an `undefined` value entirely, so
   // a sparse input would under-report what serializeState publishes.
@@ -135,6 +162,34 @@ test('serializeState publishes EVERY key the pty-host writes', () => {
   const st = JSON.parse(T.serializeState({ session: 's', pid: 1, base: '/term/s', startedAt: 'now', authTokenFile: '/x/auth-token' }));
   assert.equal(st.authTokenFile, '/x/auth-token');
   assert.equal(JSON.parse(T.serializeState({})).authTokenFile, null);
+});
+
+test('the token-file cache key moves when the file is ROLLED', () => {
+  // The read is cached on this key, so a key that misses a roll leaves the OLD
+  // token in force and locks the manager out until the pty-host is relaunched.
+  // The production roll is `os.replace` of a DERIVED token — a fixed-length
+  // secret — so the replacement is typically the SAME SIZE as what it replaces:
+  // a size-only (or size-dominated) key never notices it. Drive exactly that.
+  const base = { mtimeMs: 1700000000000, size: 64, ino: 4242, dev: 66310 };
+  const key = T.tokenCacheKey(base);
+  assert.equal(T.tokenCacheKey({ ...base }), key, 'same stat must hit the cache');
+  // os.replace: new inode, IDENTICAL size, and (worst case, coarse clock) the
+  // same mtime. Only `ino` saves this one.
+  assert.notEqual(T.tokenCacheKey({ ...base, ino: 4243 }), key, 'an os.replace roll must MISS');
+  // In-place same-size rewrite: only mtime moves.
+  assert.notEqual(T.tokenCacheKey({ ...base, mtimeMs: base.mtimeMs + 1 }), key,
+    'an in-place rewrite must MISS');
+  // The remaining two still count.
+  assert.notEqual(T.tokenCacheKey({ ...base, size: 65 }), key);
+  assert.notEqual(T.tokenCacheKey({ ...base, dev: 66311 }), key);
+  // Every field is actually present, so no single one can be dropped unnoticed.
+  for (const f of ['mtimeMs', 'size', 'ino', 'dev']) {
+    assert.ok(key.includes(String(base[f])), `the key must incorporate ${f}`);
+  }
+  // A missing/NaN field degrades to a sentinel rather than "undefined" colliding
+  // across two different broken stats.
+  assert.equal(T.tokenCacheKey({}), '?:?:?:?');
+  assert.notEqual(T.tokenCacheKey({ ...base, ino: undefined }), key);
 });
 
 test('applyKeepAlive really assigns both windows to every server', () => {

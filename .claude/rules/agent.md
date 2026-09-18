@@ -137,6 +137,9 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     queued session never starts), the pending mode/model switches, jira + ticket triage, PR-comment
     delivery, the models/limits probes and every usage/slow refresh all stopped for as long as the
     pokes lasted.
+  - **The deadline is on `time.monotonic()`, never `time.time()`.** A backward NTP/DST step makes
+    `now - last_full` negative for the length of the step, which re-arms the exact starvation above
+    for that whole window — via something no operator would ever connect to a frozen beat.
   - **A light beat also does not advance `beat`**, which indexes the cadence work it skipped. That
     stops a slot being SKIPPED; only the deadline stops the cadence being STARVED — do not conflate
     the two guards. Tests: `TestPokedBeatIsLight`.

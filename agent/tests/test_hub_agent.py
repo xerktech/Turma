@@ -20128,6 +20128,7 @@ class TestPokedBeatIsLight(ManagerMixin, unittest.TestCase):
              mock.patch.object(sm, "_start_dsh_web"), \
              mock.patch.object(sm, "_beat_once", side_effect=fake_beat), \
              mock.patch.object(ha.time, "time", side_effect=lambda: clock[0]), \
+             mock.patch.object(ha.time, "monotonic", side_effect=lambda: clock[0]), \
              mock.patch.object(ha._poke, "wait", side_effect=fake_wait), \
              mock.patch.object(ha._poke, "clear"):
             try:
@@ -20176,6 +20177,51 @@ class TestPokedBeatIsLight(ManagerMixin, unittest.TestCase):
         calls = self._beats([True] * 4, tick=ha.INTERVAL * 0.45)
         self.assertEqual([light for _b, light in calls],
                          [False, True, True, False, True])
+
+    def test_the_deadline_is_on_the_MONOTONIC_clock_not_the_wall_clock(self):
+        """A backward clock step must not re-create the starvation above.
+
+        The deadline is `now - last_full < INTERVAL`. On `time.time()` an NTP or
+        DST step BACKWARDS makes that difference negative for the whole length of
+        the step, so under a poke stream every beat goes light again and no full
+        payload runs until the wall clock catches back up — the exact freeze this
+        guard exists to prevent, re-armed by something no operator would connect
+        to it. `time.monotonic()` cannot step."""
+        sm = self.make_manager()
+        calls = []
+        wall = [1000.0]
+        mono = [5000.0]
+        answers = [True] * 6
+
+        def fake_wait(_timeout):
+            if not answers:
+                raise self._Stop()
+            return answers.pop(0)
+
+        def fake_beat(beat, light=False):
+            calls.append((beat, light))
+            # Each beat takes a full INTERVAL of real time...
+            mono[0] += ha.INTERVAL + 1
+            # ...while the WALL clock is dragged an hour backwards mid-run.
+            wall[0] = 1000.0 - 3600 if len(calls) >= 2 else wall[0] + ha.INTERVAL + 1
+            return None
+
+        with mock.patch.object(ha, "IS_WINDOWS", False), \
+             mock.patch.object(ha.signal, "signal"), \
+             mock.patch.object(sm, "_start_dsh_web"), \
+             mock.patch.object(sm, "_beat_once", side_effect=fake_beat), \
+             mock.patch.object(ha.time, "time", side_effect=lambda: wall[0]), \
+             mock.patch.object(ha.time, "monotonic", side_effect=lambda: mono[0]), \
+             mock.patch.object(ha._poke, "wait", side_effect=fake_wait), \
+             mock.patch.object(ha._poke, "clear"):
+            try:
+                sm.run_forever()
+            except self._Stop:
+                pass
+
+        self.assertTrue(all(not light for _b, light in calls),
+                        f"a backward clock step froze the full cadence: {calls}")
+        self.assertEqual([b for b, _l in calls], list(range(len(calls))))
 
 
 class TestPokeHeartbeat(unittest.TestCase):
@@ -31493,15 +31539,62 @@ class TestWindowsTerminalBackend(unittest.TestCase):
                 with open(ha._pty_token_file()) as f:
                     self.assertEqual(f.read(), "live-token")
 
+    @unittest.skipUnless(hasattr(os, "WNOHANG"), "POSIX zombies only")
     def test_pty_still_running_reaps_a_posix_zombie_first(self):
         """`os.kill(pid, 0)` succeeds for an exited-but-unreaped CHILD, and the
         POSIX spawn path drops the Popen handle — so without the reap a teardown
         that worked perfectly polls the corpse for the whole wait and then reports
-        the reap as FAILED, keeping a state file for a process that is long gone."""
+        the reap as FAILED, keeping a state file for a process that is long gone.
+
+        **Never call `proc.wait()` to set this up**: `wait()` IS a `waitpid`, so it
+        reaps the zombie itself and the assertion then passes with the reap removed
+        — which is how the first version of this test certified nothing."""
         proc = subprocess.Popen([sys.executable, "-c", "pass"])
         pid = proc.pid
-        proc.wait()                     # exited, but not yet reaped by os.waitpid
+        self.addCleanup(lambda: proc.poll() is None and proc.wait())
+        # Wait for it to EXIT without reaping it: it is a zombie from here on.
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if os.path.exists(f"/proc/{pid}/stat"):
+                with open(f"/proc/{pid}/stat") as f:
+                    if ") Z" in f.read():
+                        break
+            time.sleep(0.02)
+        # A zombie answers os.kill(pid, 0), so the un-reaped read says "alive"...
+        self.assertIs(ha._pid_alive(pid), True, "setup: expected an unreaped zombie")
+        # ...and _pty_still_running must see through that — but ONLY for a pid we
+        # spawned ourselves.
+        self.assertIs(ha._pty_still_running(pid), True,
+                      "a pid this manager never spawned must NOT be waitpid'd")
+        with ha._PTY_OWN_PIDS_LOCK:
+            ha._PTY_OWN_PIDS.add(pid)
+        self.addCleanup(lambda: ha._PTY_OWN_PIDS.discard(pid))
         self.assertIs(ha._pty_still_running(pid), False)
+
+    @unittest.skipUnless(hasattr(os, "WNOHANG"), "POSIX zombies only")
+    def test_pty_still_running_never_steals_another_childs_exit_status(self):
+        """`os.waitpid` CONSUMES an exit status. A state-file pid can name a
+        RECYCLED pid now belonging to another manager child (a clone, a probe, a
+        ttyd Popen), and reaping that one hands its real owner's `.wait()` a 0 in
+        place of the true exit code — a failed clone silently reported as success.
+        Only pids we Popen'd as pty-hosts are ours to reap."""
+        proc = subprocess.Popen([sys.executable, "-c", "raise SystemExit(7)"])
+        with ha._PTY_OWN_PIDS_LOCK:
+            self.assertNotIn(proc.pid, ha._PTY_OWN_PIDS)
+        deadline = time.time() + 10
+        while time.time() < deadline and ha._pid_alive(proc.pid):
+            time.sleep(0.02)
+        ha._pty_still_running(proc.pid)          # must not touch someone else's child
+        self.assertEqual(proc.wait(), 7, "the owner's exit status was stolen")
+
+    def test_the_posix_spawn_registers_its_pid_as_ours_to_reap(self):
+        """The registration and the reap are one mechanism: the POSIX arm drops the
+        Popen handle deliberately (the pty-host is detached and must outlive us), so
+        `_pty_still_running` is the only thing that will ever collect its status."""
+        src = inspect.getsource(ha._pty_spawn_and_wait)
+        self.assertIn("_PTY_OWN_PIDS.add(proc.pid)", src,
+                      "a POSIX pty-host launch must register its pid, or the reap "
+                      "in _pty_still_running can never fire and teardown re-breaks")
 
     def test_pty_capture_uses_the_short_beat_timeout(self):
         """capture is the one control op on the BEAT loop, once (twice on the

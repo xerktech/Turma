@@ -10190,20 +10190,43 @@ def _pty_alive(tmux_name):
         return False
 
 
+# The pids THIS process Popen'd as pty-hosts (POSIX only). `_pty_still_running`
+# reaps only these: `os.waitpid` consumes an exit status, so calling it on an
+# arbitrary pid from a state file — which can name a RECYCLED pid now belonging to
+# another manager child (a clone, a probe, a ttyd Popen) — would steal that
+# child's status and hand its owner's `.wait()` a 0 in place of the real code.
+# Bounded: one entry per POSIX pty-host launch, discarded once reaped.
+_PTY_OWN_PIDS = set()
+_PTY_OWN_PIDS_LOCK = threading.Lock()
+
+
 def _pty_still_running(pid):
-    """`_pid_alive` with a POSIX zombie reaped first.
+    """`_pid_alive` with a POSIX zombie of OUR OWN reaped first.
 
     `os.kill(pid, 0)` succeeds for an exited-but-unreaped CHILD, and the POSIX arm
-    of `_pty_spawn_and_wait` Popens the pty-host and drops the handle — so without
-    this, a teardown that worked perfectly polls the corpse for the whole
+    of `_pty_spawn_and_wait` Popens the pty-host detached and drops the handle — so
+    without this, a teardown that worked perfectly polls the corpse for the whole
     PTY_TEARDOWN_WAIT_SEC and then reports the reap as FAILED, keeping a state file
-    for a process that is long gone. Reaping is a no-op for anything that is not
-    our child (the Windows production path, where the task engine is the parent),
-    which is why it can be unconditional."""
+    for a process that is long gone.
+
+    Windows (the production path) has no `os.WNOHANG` at all and the task engine
+    owns the pty-host anyway, so this degrades to a plain liveness check there."""
     try:
-        os.waitpid(int(pid), os.WNOHANG)
-    except (OSError, AttributeError, TypeError, ValueError):
-        pass          # not our child / no waitpid (Windows) — nothing to reap
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    with _PTY_OWN_PIDS_LOCK:
+        ours = pid in _PTY_OWN_PIDS
+    if ours:
+        try:
+            reaped, _ = os.waitpid(pid, os.WNOHANG)
+            if reaped:
+                with _PTY_OWN_PIDS_LOCK:
+                    _PTY_OWN_PIDS.discard(pid)
+        except (OSError, AttributeError, ValueError):
+            # already reaped, or no waitpid (Windows) — nothing left to collect
+            with _PTY_OWN_PIDS_LOCK:
+                _PTY_OWN_PIDS.discard(pid)
     return _pid_alive(pid)
 
 
@@ -10316,6 +10339,11 @@ def _pty_spawn_and_wait(tmux_name, cmd, cwd, env, log_path):
                 cmd, cwd=cwd, env=env,
                 stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
                 close_fds=True, start_new_session=True)
+            # Ours to reap: the handle is dropped below (the pty-host is detached
+            # and outlives us), so `_pty_still_running` is the only thing that
+            # will ever collect its exit status. See _PTY_OWN_PIDS.
+            with _PTY_OWN_PIDS_LOCK:
+                _PTY_OWN_PIDS.add(proc.pid)
         except Exception as e:
             raise RuntimeError(f"pty-host launch failed: {e}")
         finally:
@@ -29352,8 +29380,11 @@ class SessionManager:
         # Whether the wait below was cut short by a poke — "the hub has a command
         # for you, beat NOW".
         poked = False
-        # When the last FULL payload went out. A poked beat may only be light while
-        # a full one ran within INTERVAL (see below).
+        # When the last FULL payload went out, on the MONOTONIC clock. Never
+        # time.time(): a backward NTP/DST step makes `now - last_full` negative for
+        # the length of the step, which re-creates the very freeze the deadline
+        # exists to prevent (under a poke stream, no full beat for the whole step).
+        # 0.0 is unreachable for monotonic, so the first beat is always full.
         last_full = 0.0
         while True:
             # Clear before the beat so a poke that lands *during* it (a command
@@ -29381,10 +29412,13 @@ class SessionManager:
             # build_payload stopped: `_drain_queue` (a queued session never
             # starts), the pending mode/model switches, jira + ticket triage, PR
             # comment delivery, the models/limits probes, the usage refreshes and
-            # every staged slow refresh. The deadline keeps the FULL cadence
-            # exactly as often as it ran before and spends the pokes on the gaps
-            # between — which is all the latency win ever needed.
-            now = time.time()
+            # every staged slow refresh. The deadline holds the full payload to
+            # its SCHEDULED cadence (one per INTERVAL) and spends the pokes on
+            # the gaps between — which is all the latency win ever needed. Note
+            # this IS a change from the unpoked behaviour: before pokes existed
+            # every beat was full, so full-beat-only work now waits up to
+            # INTERVAL rather than until the next poke.
+            now = time.monotonic()
             light = poked and (now - last_full) < INTERVAL
             reply = self._beat_once(beat, light=light)
             # A light beat did NOT do the cadence work `beat` indexes

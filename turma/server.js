@@ -13997,13 +13997,52 @@ const termAgents = new Map(); // "host:port" -> keep-alive http.Agent over the t
 // Agent still believes a pooled socket is reusable and sends the next asset or
 // `/token` request down a channel the origin already FIN'd, which surfaces to the
 // browser as ECONNRESET / "socket hang up" before the request ever reached the
-// terminal. `termRetryReset` replays exactly one such request; with 4 free
-// sockets pooled, two consecutive stale ones still became a 502, which is the
-// "refresh the terminal two or three times" symptom. It was 60s against a
-// pty-host running Node's 5s default — every terminal open raced it. 30s here
-// against 75s there leaves a 45s margin, and the only cost of evicting early is
-// one extra channel dial (openChannel), which the Agent already does on a miss.
+// terminal. `termRetryReset` replays such a request; with 4 free sockets pooled,
+// two consecutive stale ones still became a 502, which is the "refresh the
+// terminal two or three times" symptom. It was 60s against a pty-host running
+// Node's 5s default — every terminal open raced it. 30s here against 75s there
+// leaves a 45s margin, and the only cost of evicting early is one extra channel
+// dial (openChannel), which the Agent already does on a miss.
+//
+// **This window only exists because `armChannelIdleTimeout` below makes it real.**
+// A plain `timeout:` on the Agent does NOTHING here: Node applies it by calling
+// `socket.setTimeout`, and `channelDuplex` stubs setTimeout to a no-op because a
+// tunnel channel is not a real socket. Pass this number without that helper and
+// the whole two-sided contract is a comment describing an eviction that never
+// happens — which is how it sat, inert, before this was measured.
 const TERM_AGENT_IDLE_MS = 30000;
+// Give ONE tunnel channel a real inactivity timer, in the shape http.Agent
+// drives: `setTimeout(ms)` arms it, `setTimeout(0)` (what the Agent calls when it
+// takes a socket back out of the free pool) disarms it, and 'timeout' fires after
+// `ms` with no bytes either way — whereupon the Agent destroys it IF it is still
+// free. Inbound is tracked by wrapping `push` rather than by listening for
+// 'data', which would flip the duplex into flowing mode and steal bytes from the
+// HTTP parser. Scoped to the channels this Agent pools on purpose: /live and the
+// ws relay keep the shared no-op stub and are unaffected.
+function armChannelIdleTimeout(channel) {
+  let ms = 0;
+  let timer = null;
+  const disarm = () => { if (timer) clearTimeout(timer); timer = null; };
+  const rearm = () => {
+    disarm();
+    if (ms > 0) {
+      timer = setTimeout(() => { timer = null; channel.emit("timeout"); }, ms);
+      if (timer.unref) timer.unref();   // never hold the event loop open
+    }
+  };
+  channel.setTimeout = (val, cb) => {
+    ms = Number(val) || 0;
+    if (cb) channel.once("timeout", cb);
+    rearm();
+    return channel;
+  };
+  const push = channel.push.bind(channel);
+  channel.push = (...args) => { rearm(); return push(...args); };
+  const write = channel.write.bind(channel);
+  channel.write = (...args) => { rearm(); return write(...args); };
+  channel.once("close", disarm);
+  return channel;
+}
 function termAgentFor(name, port) {
   const key = name + ":" + port;
   let agent = termAgents.get(key);
@@ -14015,7 +14054,8 @@ function termAgentFor(name, port) {
   // Each "socket" the Agent needs is a fresh tunnel data channel to this ttyd;
   // once ttyd keeps it alive the Agent reuses it for the next asset request.
   agent.createConnection = (_opts, cb) => {
-    openChannel(name, port).then((channel) => cb(null, channel), (err) => cb(err));
+    openChannel(name, port).then(
+      (channel) => cb(null, armChannelIdleTimeout(channel)), (err) => cb(err));
   };
   termAgents.set(key, agent);
   return agent;
@@ -18392,8 +18432,10 @@ if (process.env.TURMA_TEST) {
     // The hub half of the keep-alive contract with the pty-host / ttyd origin:
     // this idle window must stay BELOW the origin's keepAliveTimeout, or the
     // Agent reuses a socket the origin already closed. Exported so a test can
-    // pin it against agent/win/tty-protocol.mjs's KEEPALIVE_TIMEOUT_MS.
-    TERM_AGENT_IDLE_MS,
+    // pin it against agent/win/tty-protocol.mjs's KEEPALIVE_TIMEOUT_MS — and
+    // alongside `armChannelIdleTimeout`, which is what makes the number do
+    // anything at all on a tunnel channel (channelDuplex no-ops setTimeout).
+    TERM_AGENT_IDLE_MS, armChannelIdleTimeout,
     serializeAgentsForSave,
     flushStateNow, // graceful-shutdown synchronous state flush (XERK-552)
     // XERK-757 — the externalized-store wiring. The full cross-replica behaviour

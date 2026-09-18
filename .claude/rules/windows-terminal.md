@@ -122,6 +122,12 @@ capture/persistence), not just the ws bridge.
   **Node's default `server.keepAliveTimeout` is 5_000ms**, so leaving it unset GUARANTEES the race on
   any terminal whose assets are more than ~5s apart. Both halves are pinned, each from the other side
   (`tty-protocol.test.mjs` and `server.test.js`); raising one means raising the other.
+  - **The hub half only evicts anything because `armChannelIdleTimeout` makes it real.** A tunnel
+    channel is a Duplex whose `setTimeout` is a no-op stub, and `http.Agent`'s `timeout:` is applied
+    ONLY by calling `socket.setTimeout` — so `TERM_AGENT_IDLE_MS` sat inert, and the two-sided
+    contract described an eviction that never happened, until that was measured. Never assume the hub
+    ages a stale channel out for you: on Linux it never did, which is why the bounded replay is the
+    real mitigation there.
 - **Do not write that ttyd held connections longer — it does not.** A real `ttyd 1.7.4
   (libwebsockets 4.3.3)` was measured closing an idle keep-alive connection after **5.0s**, and
   `_launch_ttyd` passes no flag to change it, so the stale-pooled-socket race is FLEET-WIDE, not a

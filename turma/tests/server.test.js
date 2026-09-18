@@ -184,6 +184,7 @@ const {
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
   termRetryReset, terminalFail, terminalReconnectPage, TERM_AGENT_IDLE_MS,
+  armChannelIdleTimeout,
   serializeAgentsForSave,
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, REFUSED_DETAIL_MAX,
   userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
@@ -17260,6 +17261,71 @@ test("term: the pooled-channel idle window stays BELOW the origin's keep-alive",
   // a socket the instant before the origin's timer fires.
   assert.ok(originMs - TERM_AGENT_IDLE_MS >= 10000,
     "leave at least 10s of margin between the two windows");
+});
+
+test("term: the idle window is REAL on a tunnel channel, not just a number", () => {
+  // The window above is worth nothing on its own. A tunnel channel is a Duplex,
+  // not a socket, and `channelDuplex` stubs `setTimeout` to a no-op — while Node's
+  // http.Agent applies its `timeout:` option ONLY by calling `socket.setTimeout`.
+  // So the option was inert and the two-sided contract described an eviction that
+  // never happened. `armChannelIdleTimeout` is what makes it fire; this test is
+  // what stops it being deleted as dead weight.
+  const { Duplex } = require("stream");
+  const mk = () => {
+    const d = new Duplex({ write(c, e, cb) { cb(); }, read() {} });
+    d.setTimeout = () => d;              // the channelDuplex no-op stub
+    return armChannelIdleTimeout(d);
+  };
+
+  // 1. It fires after the idle window with no traffic.
+  const fired = [];
+  const a = mk();
+  a.on("timeout", () => fired.push("a"));
+  a.setTimeout(20);
+  // 2. Traffic in EITHER direction rearms it — inbound bytes go through `push`
+  //    (never a 'data' listener, which would flip the duplex into flowing mode
+  //    and steal bytes from the HTTP parser), outbound through `write`.
+  const b = mk();
+  b.on("timeout", () => fired.push("b"));
+  b.setTimeout(20);
+  const busy = setInterval(() => { b.push(Buffer.from("x")); b.write("y"); }, 5);
+  // 3. setTimeout(0) — what the Agent calls when it takes a socket back OUT of
+  //    the free pool — disarms it, so an in-flight request is never killed.
+  const c = mk();
+  c.on("timeout", () => fired.push("c"));
+  c.setTimeout(20);
+  c.setTimeout(0);
+
+  return new Promise((resolve) => setTimeout(() => {
+    clearInterval(busy);
+    assert.ok(fired.includes("a"), "an idle pooled channel must time out");
+    assert.ok(!fired.includes("b"), "a channel carrying bytes must NOT time out");
+    assert.ok(!fired.includes("c"), "setTimeout(0) must disarm (socket back in use)");
+    // The reader still works: wrapping `push` must not have eaten the bytes.
+    assert.equal(b.read().length > 0, true, "pushed bytes must still be readable");
+    resolve();
+  }, 60));
+});
+
+test("term: a replayed terminal request ADVANCES its attempt counter", () => {
+  // `termRetryReset`'s truth table is pinned above, but the call site passes the
+  // NEXT attempt number — `send(attempt + 1)`. Pass `send(1)` (or `send(attempt)`)
+  // and the budget never advances, so a permanently-resetting origin is replayed
+  // FOREVER: a pooled-socket hiccup becomes an infinite request loop against the
+  // agent, with the browser hanging instead of getting its 502. Drive the loop
+  // the call site actually runs.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  assert.ok(/termRetryReset\(attempt,[^)]*\)\)\s*return send\(attempt \+ 1\)/.test(src),
+    "proxyTerm must replay with send(attempt + 1) — a constant never exhausts the budget");
+  // And the budget terminates: replaying while termRetryReset says so must stop.
+  const reset = { code: "ECONNRESET", message: "socket hang up" };
+  let attempt = 0, sends = 0;
+  while (sends < 100) {
+    sends++;
+    if (!termRetryReset(attempt, true, false, "GET", reset)) break;
+    attempt += 1;
+  }
+  assert.equal(sends, 5, "1 original + at most TERM_RETRY_MAX(4) replays, then a 502");
 });
 
 test("term: terminalFail settles the proxy response exactly once (no double-end crash)", () => {

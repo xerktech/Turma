@@ -113,7 +113,7 @@ function authTokens() {
   try {
     const st = lstatSync(TOKEN_FILE);
     if (!st.isFile() || st.size > TOKEN_FILE_MAX) throw new Error('unusable token file');
-    const key = `${st.mtimeMs}:${st.size}:${st.ino}:${st.dev}`;
+    const key = T.tokenCacheKey(st);
     if (tokenCache.key === key) return tokenCache.tokens;
     const tokens = T.authTokensInForce(readFileSync(TOKEN_FILE, 'utf8'), BAKED_TOKEN);
     tokenCache = { key, tokens };

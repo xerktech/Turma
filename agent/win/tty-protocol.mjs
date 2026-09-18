@@ -164,6 +164,24 @@ export function authTokensInForce(fileText, baked) {
   return out;
 }
 
+// The cache key the pty-host keys its token-file read on, so the steady state is
+// one `lstat` per auth check rather than a blocking read.
+//
+// **All four fields are load-bearing, and `size` is the WEAKEST of them.** A roll
+// republishes a DERIVED token, which is a fixed length, so the new file is almost
+// always the same size as the old — `size` alone would never notice a roll. The
+// manager publishes via `os.replace`, so `ino` is the field that always moves;
+// `mtimeMs` covers an in-place rewrite. Windows is the reason both are kept: if
+// node ever reports `ino`/`dev` as 0 there, the key degrades to mtime+size, and
+// NTFS's ~15.6ms timestamp granularity could miss a same-size rewrite inside one
+// tick — which would leave the manager locked out until the next roll. Lives here
+// (not inline in pty-host.mjs) because CI never imports pty-host.mjs, so a key
+// written there is pinned by nothing.
+export function tokenCacheKey(st) {
+  const f = (v) => (Number.isFinite(v) ? String(v) : '?');
+  return `${f(st?.mtimeMs)}:${f(st?.size)}:${f(st?.ino)}:${f(st?.dev)}`;
+}
+
 // ---- basic auth (ttyd `-c term:<token>`) -------------------------------------
 // The hub proxies EVERY /term request with `Authorization: Basic base64(term:T)`
 // (server.js `ttydAuth`), so the pty-host validates exactly that, same as ttyd.

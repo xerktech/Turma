@@ -41,6 +41,14 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
     file proves nothing.
   - **Honour `_write_pty_token_file`'s return.** `ttydTokenFp` is the guard that short-circuits the
     whole heal, so stamping it after a write that FAILED marks the roll done and never retries it.
+- **`_pty_still_running` may `waitpid` ONLY a pid in `_PTY_OWN_PIDS`.** The reap exists because the
+  POSIX arm deliberately drops the Popen handle (the pty-host is detached), so a real teardown would
+  otherwise poll a zombie for the whole `PTY_TEARDOWN_WAIT_SEC` and report the reap as FAILED. But
+  `waitpid` CONSUMES an exit status, and a state-file pid can name a RECYCLED pid now belonging to
+  another manager child — reaping that hands its owner's `.wait()` a 0 in place of the real code, so
+  a failed clone reads as success. Registering the pid at spawn and reaping it here are one change.
+  **Never set this test up with `proc.wait()`** — that IS a `waitpid`, so it reaps the zombie itself
+  and the assertion passes with the fix removed.
 - **`_pty_teardown` removes the state file ONLY once the pid is confirmed gone** (it returns False
   otherwise). The state file is the only handle to a pty-host — there is deliberately no in-memory
   registry — so dropping it after a kill that did not take loses the process permanently: `_pty_alive`
