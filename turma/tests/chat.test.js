@@ -389,6 +389,61 @@ test("weight: a tool_use carrying SendUserFile previews outweighs one without", 
   assert.equal(kept.buffer[0].blocks[0].caption, "the chart");
 });
 
+test("weight: EVERY block payload arm is counted", () => {
+  // QA measured this: of weight()'s 15 arms only 4 were pinned, so 11 added for
+  // a real past regression (a text-only seed clobbering blocks off an entry)
+  // could be deleted with the suite still green. One arm at a time, a block
+  // carrying ONLY that field must outweigh the same block without it -- which
+  // is the property the tie-break actually depends on.
+  const base = { t: "tool_use", id: "t1", name: "" };
+  const arms = {
+    text: "x".repeat(7), input: "x".repeat(7), name: "x".repeat(7),
+    args: "x".repeat(7), summary: "x".repeat(7), result: "x".repeat(7),
+    desc: "x".repeat(7), content: "x".repeat(7), plan: "x".repeat(7),
+    url: "x".repeat(7), caption: "x".repeat(7),
+  };
+  for (const [field, val] of Object.entries(arms)) {
+    const bare = { id: "a1", role: "assistant", text: "", blocks: [{ ...base }] };
+    const rich = { id: "a1", role: "assistant", text: "", blocks: [{ ...base, [field]: val }] };
+    assert.ok(weight(rich) > weight(bare), `weight() must count b.${field}`);
+  }
+  // Nested arms, same rule.
+  const bare = { id: "a1", role: "assistant", text: "", blocks: [{ ...base }] };
+  for (const [label, block] of [
+    ["edit", { ...base, edit: { old: "aaaa", new: "bbbb" } }],
+    ["files", { ...base, files: [{ name: "c.png", kind: "image", src: "data:x" }] }],
+    ["todos", { ...base, todos: [{ content: "do it", activeForm: "doing it" }] }],
+  ]) {
+    assert.ok(weight({ id: "a1", role: "assistant", text: "", blocks: [block] }) > weight(bare),
+      `weight() must count b.${label}`);
+  }
+  // And the entry's own text.
+  assert.ok(weight({ id: "a1", role: "assistant", text: "hello" }) >
+            weight({ id: "a1", role: "assistant", text: "" }), "weight() must count e.text");
+});
+
+test("weight: a NUMBER-typed leaf weighs its digits, never NaN", () => {
+  // NaN !== NaN, so a single number-typed leaf made reseedSig unequal to
+  // ITSELF: the re-seed merged the richer copy in and then reported "no
+  // change", so the buffer improved and the screen never repainted -- the exact
+  // stale view this branch removes, made permanent. The hub does not coerce
+  // these; Android decodes a number leniently into a String, so counting its
+  // printed length keeps the mirrors in agreement.
+  assert.equal(weight({ text: 7 }), 1, "a number-typed text weighs its digits");
+  assert.equal(weight({ text: "", blocks: [{ t: "tool_use", name: 12345 }] }), 5);
+  assert.equal(weight({ text: "", blocks: [{ t: "tool_use", name: {} }] }), 0, "an object leaf weighs 0");
+  assert.equal(weight({ text: "", blocks: [{ t: "tool_use", name: NaN }] }), 0, "NaN weighs 0");
+
+  const poisoned = { id: "a0", role: "assistant", text: 7 };
+  const flat = { id: "a1", role: "assistant", text: "checking" };
+  const rich = { id: "a1", role: "assistant", text: "checking",
+    blocks: [{ t: "tool_use", id: "t1", name: "Bash", input: "git log" }] };
+  const out = reseedFromFleet([poisoned, flat], { session: { tail: [rich] } });
+  assert.ok((out.buffer[1].blocks || []).length, "the richer copy still merges");
+  assert.equal(out.changed, true,
+    "and the re-seed must REPORT it, or the buffer improves behind a frozen screen");
+});
+
 test("onPoll actually calls reseedFromFleet", () => {
   // onPoll paints, so it cannot be invoked under node -- which is precisely how
   // a re-seed reading the wrong field passed a green suite. Deleting the call

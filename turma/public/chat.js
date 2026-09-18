@@ -1111,6 +1111,23 @@
   // and leaving those out made the rich copy TIE its own flat text — and the
   // `>=` tie-break then let a text-only seed clobber the blocks right back off
   // the entry (a `!` chip regressing to a raw user bubble).
+  // Length of ONE agent-supplied leaf, for weight().
+  //
+  // `(b.text || "").length` is undefined for a NUMBER-typed leaf, so the sum
+  // goes NaN -- and NaN !== NaN, which makes reseedSig unequal to ITSELF. One
+  // number-typed `text` anywhere in the buffer then makes every re-seed report
+  // "no change" while still merging the richer copy in: the buffer improves and
+  // the screen never repaints. That is exactly the stale view this re-seed
+  // exists to remove, made permanent, so it matters more here than the throw.
+  // The hub does not coerce these (coerceBlockElem fixes only the booleans and
+  // files[].shed); Android decodes a number leniently into a String, so
+  // counting a finite number as its printed length keeps the two mirrors in
+  // agreement. Anything else weighs 0.
+  function leafLen(v) {
+    if (typeof v === "string") return v.length;
+    if (typeof v === "number" && Number.isFinite(v)) return String(v).length;
+    return 0;
+  }
   function weight(e) {
     // TOTAL by construction. weight() is on the render path, and the Sessions
     // page has exactly one painter (render(cache)) -- so a throw here does not
@@ -1118,31 +1135,35 @@
     // poll once the offending entry is in the buffer. `e.blocks || []` does not
     // cover it: a non-array (`blocks: 5`) is truthy and not iterable, and a
     // null MEMBER throws on the first property read. The hub coerces
-    // session.tail so this should be unreachable, but the cost of being sure is
-    // two guards and the cost of being wrong is a dead page.
+    // session.tail so this should be unreachable from a heartbeat -- but the
+    // /live fanout path does NOT coerce, so it is reachable from an agent frame.
+    // buildItems downstream is still NOT total; see the ticket.
     if (!e) return 0;
-    let w = (e.text || "").length;
+    let w = leafLen(e.text);
     for (const b of (Array.isArray(e.blocks) ? e.blocks : [])) {
       if (!b || typeof b !== "object") continue;
-      w += (b.text || "").length + (b.input || "").length + (b.name || "").length +
-        (b.args || "").length + (b.summary || "").length + (b.result || "").length +
-        (b.desc || "").length + (b.content || "").length + (b.plan || "").length +
-        (b.url || "").length + (b.caption || "").length +
-        (b.edit ? (b.edit.old || "").length + (b.edit.new || "").length : 0) +
+      // EVERY block payload field counts, not just text/input: a command block
+      // carries its content in name/args (a task_notification in summary/
+      // result), and leaving those out made the rich copy TIE its own flat text
+      // -- and the `>=` tie-break then let a text-only seed clobber the blocks
+      // right back off the entry (a `!` chip regressing to a raw user bubble).
+      w += leafLen(b.text) + leafLen(b.input) + leafLen(b.name) +
+        leafLen(b.args) + leafLen(b.summary) + leafLen(b.result) +
+        leafLen(b.desc) + leafLen(b.content) + leafLen(b.plan) +
+        leafLen(b.url) + leafLen(b.caption) +
+        (b.edit ? leafLen(b.edit.old) + leafLen(b.edit.new) : 0) +
         // Embedded SendUserFile previews (XERK-221): count them so an image-bearing
-        // copy outweighs a degraded reload (file since deleted → a name-only chip).
-        (Array.isArray(b.files) ? b.files.reduce((s, f) =>
-          s + (f ? (f.src || "").length + (f.html || "").length + (f.name || "").length : 0), 0) : 0) +
+        // copy outweighs a degraded reload (file since deleted -> a name-only chip).
+        (Array.isArray(b.files) ? b.files.reduce((n, f) =>
+          n + (f ? leafLen(f.src) + leafLen(f.html) + leafLen(f.name) : 0), 0) : 0) +
         // TodoWrite/todo_write checklists, for the SAME reason as `files`. This
         // one is load-bearing now that the heartbeat preview is re-merged on
         // every poll: `todos` is a _tool_use_detail field, which is precisely
         // what preview=True skips, and it was the ONLY such field missing here
         // -- so a preview block tied its own live copy EXACTLY (319 == 319) and
         // the `>=` tie-break swapped the checklist out for a raw-JSON card.
-        // Weight-neutral, so the repaint gate skipped it and the screen only
-        // caught up at the next unrelated repaint.
-        (Array.isArray(b.todos) ? b.todos.reduce((s, t) =>
-          s + (t ? (t.content || "").length + (t.activeForm || "").length : 0), 0) : 0);
+        (Array.isArray(b.todos) ? b.todos.reduce((n, t) =>
+          n + (t ? leafLen(t.content) + leafLen(t.activeForm) : 0), 0) : 0);
     }
     return w;
   }
@@ -3684,9 +3705,11 @@
     if (a) agent = a;
     // RE-SEED from the heartbeat preview, not only at open() (see
     // reseedFromFleet). Kept to two lines here so the whole decision is pure
-    // and directly testable -- onPoll itself cannot be called under node (it
-    // paints), which is exactly how a re-seed reading the WRONG field shipped
-    // green once.
+    // and directly testable. onPoll PAINTS, so it needs chat-live.test.js's DOM
+    // shims to run -- chat.test.js has none, and testing the helper there while
+    // the call site ran under nothing is how a re-seed reading the WRONG field,
+    // and later one whose result was DISCARDED, each shipped green. The tests
+    // that matter assert this buffer, not the text of the call.
     const re = reseedFromFleet(buffer, s);
     buffer = re.buffer;
     if (re.changed) repaint();
