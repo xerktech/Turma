@@ -183,7 +183,7 @@ const {
   wsAccept, wsEncode, wsParser, WS_FRAME_MAX, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
-  termRetryReset, terminalFail, terminalReconnectPage,
+  termRetryReset, terminalFail, terminalReconnectPage, TERM_AGENT_IDLE_MS,
   serializeAgentsForSave,
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, REFUSED_DETAIL_MAX,
   userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
@@ -17226,6 +17226,33 @@ test("term: a reset on a REUSED pooled ttyd channel is replayed once (termRetryR
     "a POST body has already been consumed — never blind-replay a mutation");
   assert.equal(termRetryReset(0, true, false, "GET", { code: "ETIMEDOUT", message: "timeout" }), false,
     "only a connection reset is the idle-closed-keep-alive signal");
+});
+
+test("term: the pooled-channel idle window stays BELOW the origin's keep-alive", () => {
+  // The two-sided keep-alive contract. The hub parks free tunnel channels in a
+  // keep-alive http.Agent and reuses one for the next terminal asset/token
+  // request; the ORIGIN (ttyd, or the Windows pty-host) decides how long it will
+  // hold that connection. If the origin closes first, the Agent still believes
+  // the socket is reusable and sends the request down a channel already FIN'd —
+  // ECONNRESET / "socket hang up" before the request ever reaches the terminal.
+  // termRetryReset replays exactly ONE such request, and the pool holds four, so
+  // two consecutive stale sockets still surfaced as a 502 (the "refresh the
+  // terminal a few times" symptom). The hub was at 60s against a pty-host running
+  // Node's 5_000ms default, so EVERY terminal open whose assets were more than
+  // ~5s apart raced it. Read the pty-host's number out of the agent source rather
+  // than restating it here — it is a cross-component contract.
+  const proto = path.join(__dirname, "..", "..", "agent", "win", "tty-protocol.mjs");
+  if (!fs.existsSync(proto)) return;   // agent not checked out beside the hub
+  const m = /KEEPALIVE_TIMEOUT_MS\s*=\s*([0-9_]+)/.exec(fs.readFileSync(proto, "utf8"));
+  assert.ok(m, "KEEPALIVE_TIMEOUT_MS moved or changed shape in tty-protocol.mjs");
+  const originMs = Number(m[1].replace(/_/g, ""));
+  assert.ok(TERM_AGENT_IDLE_MS < originMs,
+    `the hub's free-socket idle window (${TERM_AGENT_IDLE_MS}ms) must be shorter ` +
+    `than the origin's keep-alive (${originMs}ms), or it reuses closed sockets`);
+  // And with real margin, not by a millisecond: a request can be dispatched onto
+  // a socket the instant before the origin's timer fires.
+  assert.ok(originMs - TERM_AGENT_IDLE_MS >= 10000,
+    "leave at least 10s of margin between the two windows");
 });
 
 test("term: terminalFail settles the proxy response exactly once (no double-end crash)", () => {

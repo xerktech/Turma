@@ -13989,11 +13989,29 @@ function openUploadBlobForRelay(id) {
 // Agent transparently opens a new one if a pooled channel died. The separate WS
 // upgrade path (browser terminal socket) still opens its own dedicated channel.
 const termAgents = new Map(); // "host:port" -> keep-alive http.Agent over the tunnel
+// How long a FREE (idle, pooled) tunnel channel may sit before Node evicts it.
+//
+// This is one half of a two-sided contract with the ORIGIN's keep-alive window
+// (agent/win/tty-protocol.mjs `KEEPALIVE_TIMEOUT_MS`, applied to both pty-host
+// servers). The origin must ALWAYS outlast this number: if it closes first, the
+// Agent still believes a pooled socket is reusable and sends the next asset or
+// `/token` request down a channel the origin already FIN'd, which surfaces to the
+// browser as ECONNRESET / "socket hang up" before the request ever reached the
+// terminal. `termRetryReset` replays exactly one such request; with 4 free
+// sockets pooled, two consecutive stale ones still became a 502, which is the
+// "refresh the terminal two or three times" symptom. It was 60s against a
+// pty-host running Node's 5s default — every terminal open raced it. 30s here
+// against 75s there leaves a 45s margin, and the only cost of evicting early is
+// one extra channel dial (openChannel), which the Agent already does on a miss.
+const TERM_AGENT_IDLE_MS = 30000;
 function termAgentFor(name, port) {
   const key = name + ":" + port;
   let agent = termAgents.get(key);
   if (agent) return agent;
-  agent = new http.Agent({ keepAlive: true, maxSockets: 6, maxFreeSockets: 4, timeout: 60000 });
+  agent = new http.Agent({
+    keepAlive: true, maxSockets: 6, maxFreeSockets: 4,
+    timeout: TERM_AGENT_IDLE_MS,
+  });
   // Each "socket" the Agent needs is a fresh tunnel data channel to this ttyd;
   // once ttyd keeps it alive the Agent reuses it for the next asset request.
   agent.createConnection = (_opts, cb) => {
@@ -18360,6 +18378,11 @@ if (process.env.TURMA_TEST) {
     // GET heals via a self-reloading page instead of a dead-end 502 that wipes the
     // terminal the operator was reading.
     termRetryReset, terminalFail, terminalReconnectPage,
+    // The hub half of the keep-alive contract with the pty-host / ttyd origin:
+    // this idle window must stay BELOW the origin's keepAliveTimeout, or the
+    // Agent reuses a socket the origin already closed. Exported so a test can
+    // pin it against agent/win/tty-protocol.mjs's KEEPALIVE_TIMEOUT_MS.
+    TERM_AGENT_IDLE_MS,
     serializeAgentsForSave,
     flushStateNow, // graceful-shutdown synchronous state flush (XERK-552)
     // XERK-757 — the externalized-store wiring. The full cross-replica behaviour

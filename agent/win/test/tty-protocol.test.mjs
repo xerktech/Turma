@@ -66,6 +66,43 @@ test('basic auth matches ttyd -c term:<token> and rejects everything else', () =
   assert.equal(T.basicAuthOk(undefined, ''), true);
 });
 
+test('the live auth token beats the baked one, and a bad read falls back', () => {
+  // A hub token ROLL used to be fatal here in a way it never is on Linux. There
+  // the manager kills the stale ttyd and relaunches it while tmux (and the claude
+  // in it) lives on; here the pty-host IS the pty, so a relaunch kills the
+  // operator's session — and leaving it running left an unrecoverable zombie: the
+  // terminal 401s into a browser password prompt, the ws upgrade is refused, AND
+  // the manager's own control channel stops authenticating, so capture/inject/kill
+  // silently fail while the pid stays alive and the session reports `running`
+  // forever. So the token comes from a manager-owned file re-read per auth check,
+  // and the baked value is only the fallback.
+  assert.equal(T.pickAuthToken('rolled', 'baked'), 'rolled');
+  assert.equal(T.pickAuthToken('  rolled\n', 'baked'), 'rolled',
+    'the file is written with a trailing newline by some editors');
+  // Every "cannot read it" shape must degrade to the baked token rather than to
+  // an EMPTY one — an empty token means "no auth required" to basicAuthOk, which
+  // would silently open the control channel that accepts inject/kill.
+  for (const bad of [null, undefined, '', '   ', '\n', 42, {}]) {
+    assert.equal(T.pickAuthToken(bad, 'baked'), 'baked', `fallback for ${JSON.stringify(bad)}`);
+  }
+  assert.equal(T.basicAuthOk('Basic ' + Buffer.from('term:baked').toString('base64'),
+    T.pickAuthToken('', 'baked')), true);
+});
+
+test('the origin keep-alive outlasts the hub\'s pooled-channel idle window', () => {
+  // Two-sided contract with turma/server.js's TERM_AGENT_IDLE_MS: the hub reuses
+  // a parked tunnel channel for the next asset/token request, so if THIS side
+  // closes first the hub sends that request down a socket already FIN'd and the
+  // browser gets ECONNRESET / "socket hang up" before the request ever arrives.
+  // Node's 5_000ms server default is far below the hub's window, which is what
+  // made the class new on Windows (ttyd/libwebsockets held connections far
+  // longer). The hub half is pinned from the other side in server.test.js.
+  assert.ok(T.KEEPALIVE_TIMEOUT_MS >= 60_000,
+    'must outlast the hub\'s free-socket idle window with real margin');
+  assert.ok(T.HEADERS_TIMEOUT_MS > T.KEEPALIVE_TIMEOUT_MS,
+    'a headersTimeout at or below keepAliveTimeout closes idle kept-alive sockets early');
+});
+
 test('/token echoes base64(term:<token>) — the value the ws init must carry', () => {
   const tok = 'abc';
   assert.equal(T.tokenValue(tok), Buffer.from('term:abc').toString('base64'));

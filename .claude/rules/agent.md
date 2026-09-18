@@ -125,6 +125,24 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
 
 ## Heartbeat
 
+- **A POKED beat is `light`, and a light beat does NOT advance `beat`.** A poke means "the hub has a
+  command for you, beat now", and a command arrives only on a beat's REPLY — so the operator waits
+  through `build_payload` + the RTT on every Send, Stop, model switch and `/history` fetch. The heavy
+  payload is dominated by uncached git subprocesses (2/scanned repo, 3/running session, 3 for the
+  repos-root entry); at Windows process-creation cost that is SECONDS spent re-deriving facts nobody
+  asked for, before the POST leaves. `beat` indexes the slow-cadence work a light beat skips, so a
+  light beat must not consume that index or a burst of pokes starves a cadence slot.
+  Tests: `TestPokedBeatIsLight`.
+- **`light` means "reuse the caches" for the CHEAP git reads too**, not just the slow ones:
+  `repo_cheap`/`session_cheap` hold the previous beat's branch + dirty counts. Never make a light beat
+  re-derive something a scheduled beat will re-derive moments later. Tests: `TestLightBeatCost`.
+- **`root_repo_entry` takes its `remote` from the slow-cadence cache.** It used to call `git_info()`,
+  running the whole `git_info_slow` — remote, `log -1`, `rev-parse --show-toplevel` — every beat and
+  throwing all but the remote away. Do not re-introduce a full `git_info()` on this path.
+- **`_beat_once` is the ONE place a beat is built and posted**, so its wall clock is measured for
+  every beat (`BEAT_SLOW_LOG_SEC`). Build and post are logged separately: a slow build is local
+  subprocess/disk cost we own, a slow post is the network. There was no instrumentation at all before,
+  which made every claim about heartbeat latency unfalsifiable — keep new beat work behind it.
 - Repo list most-recently-active first; repos-root pseudo-repo **pinned first, never ranked**.
 - `agentVersion` falls back `TURMA_AGENT_VERSION` → `native/install.sh`'s stamped `VERSION` →
   repo-root `VERSION` → `null`. Tests: `TestAgentVersion`.

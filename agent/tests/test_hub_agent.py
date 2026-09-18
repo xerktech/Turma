@@ -2830,19 +2830,26 @@ class TestStablePaneBusy(unittest.TestCase):
     """_stable_pane_busy suppresses the busy->idle flicker a single mid-repaint
     capture would otherwise cause: a busy read is instant, an idle read is
     re-confirmed on the busy->idle edge, and None passes through untouched.
-    time.sleep is patched out so the confirm delay costs the tests nothing."""
+    time.sleep is patched out so the confirm delay costs the tests nothing.
+
+    Driven through `_capture_pane`, which is what actually costs something (a
+    tmux subprocess on Linux, a control-channel RPC on Windows) and what
+    `_pane_status` now hands in rather than taking its own."""
+
+    BUSY = "\u23f5 Thinking... (esc to interrupt)"
+    IDLE = "> ready"
 
     def setUp(self):
         self._sleep = mock.patch.object(ha.time, "sleep").start()
         self.addCleanup(mock.patch.stopall)
 
     def test_busy_is_instant_and_marks_state(self):
-        # A busy read is trusted on the first capture — status lights up promptly
-        # — and there is no confirmation re-capture.
+        # A busy read is trusted on the first capture -- status lights up promptly
+        # -- and there is no confirmation re-capture.
         st = {}
-        with mock.patch.object(ha, "_pane_busy", return_value=True) as pb:
+        with mock.patch.object(ha, "_capture_pane", return_value=self.BUSY) as cp:
             self.assertIs(ha._stable_pane_busy("agent-x", st), True)
-        pb.assert_called_once_with("agent-x")
+        cp.assert_called_once_with("agent-x")
         self.assertIs(st["paneBusyStable"], True)
         self._sleep.assert_not_called()
 
@@ -2850,9 +2857,9 @@ class TestStablePaneBusy(unittest.TestCase):
         # Never was busy this session -> nothing to flicker off, so a single idle
         # read is believed with no second capture.
         st = {}  # no paneBusyStable
-        with mock.patch.object(ha, "_pane_busy", return_value=False) as pb:
+        with mock.patch.object(ha, "_capture_pane", return_value=self.IDLE) as cp:
             self.assertIs(ha._stable_pane_busy("agent-x", st), False)
-        pb.assert_called_once_with("agent-x")
+        cp.assert_called_once_with("agent-x")
         self.assertIs(st["paneBusyStable"], False)
         self._sleep.assert_not_called()
 
@@ -2860,9 +2867,10 @@ class TestStablePaneBusy(unittest.TestCase):
         # busy->idle edge: the first capture missed the marker (redraw gap) but
         # the confirming re-capture sees it -> stays working, no flip.
         st = {"paneBusyStable": True}
-        with mock.patch.object(ha, "_pane_busy", side_effect=[False, True]) as pb:
+        with mock.patch.object(ha, "_capture_pane",
+                               side_effect=[self.IDLE, self.BUSY]) as cp:
             self.assertIs(ha._stable_pane_busy("agent-x", st), True)
-        self.assertEqual(pb.call_count, 2)  # confirmed with a second capture
+        self.assertEqual(cp.call_count, 2)  # confirmed with a second capture
         self.assertIs(st["paneBusyStable"], True)
         self._sleep.assert_called_once()
 
@@ -2870,18 +2878,19 @@ class TestStablePaneBusy(unittest.TestCase):
         # busy->idle edge with the marker really gone: both captures agree,
         # so it flips to idle (only one confirm delay was spent).
         st = {"paneBusyStable": True}
-        with mock.patch.object(ha, "_pane_busy", side_effect=[False, False]) as pb:
+        with mock.patch.object(ha, "_capture_pane",
+                               side_effect=[self.IDLE, self.IDLE]) as cp:
             self.assertIs(ha._stable_pane_busy("agent-x", st), False)
-        self.assertEqual(pb.call_count, 2)
+        self.assertEqual(cp.call_count, 2)
         self.assertIs(st["paneBusyStable"], False)
 
     def test_unknown_passes_through_without_touching_state(self):
         # A capture failure is not evidence the turn ended: return None (so the
         # transcript fallback decides) and leave the remembered state alone.
         st = {"paneBusyStable": True}
-        with mock.patch.object(ha, "_pane_busy", return_value=None) as pb:
+        with mock.patch.object(ha, "_capture_pane", return_value=None) as cp:
             self.assertIsNone(ha._stable_pane_busy("agent-x", st))
-        pb.assert_called_once_with("agent-x")
+        cp.assert_called_once_with("agent-x")
         self.assertIs(st["paneBusyStable"], True)  # untouched
         self._sleep.assert_not_called()
 
@@ -2891,20 +2900,48 @@ class TestStablePaneBusy(unittest.TestCase):
         orig = ha.PANE_IDLE_CONFIRM_SEC
         ha.PANE_IDLE_CONFIRM_SEC = 0.0
         try:
-            with mock.patch.object(ha, "_pane_busy", side_effect=[False, True]) as pb:
+            with mock.patch.object(ha, "_capture_pane",
+                                   side_effect=[self.IDLE, self.BUSY]) as cp:
                 self.assertIs(ha._stable_pane_busy("agent-x", st), False)
-            pb.assert_called_once_with("agent-x")  # no confirmation capture
+            cp.assert_called_once_with("agent-x")  # no confirmation capture
         finally:
             ha.PANE_IDLE_CONFIRM_SEC = orig
+
+    def test_pane_status_takes_one_capture_for_busy_mode_and_prompt(self):
+        """The beat-budget fix: busy, modeActual and panePrompt all come off ONE
+        capture. It used to take two (three on the idle edge) -- on Windows each
+        is a control-channel RPC, so against MAX_SESSIONS that put the beat's
+        worst case at or past the hub's OFFLINE_AFTER_MS."""
+        cap = self.BUSY + "\n\u23f8 manual mode on"
+        with mock.patch.object(ha, "_capture_pane", return_value=cap) as cp:
+            busy, mode, prompt = ha._pane_status("agent-x", {})
+        cp.assert_called_once_with("agent-x")
+        self.assertIs(busy, True)
+        self.assertEqual(mode, "default")
+        self.assertIsNone(prompt)
+
+    def test_pane_status_edge_recapture_feeds_mode_and_prompt(self):
+        """On the busy->idle edge the second capture is the FRESHER screen, so
+        mode/prompt are derived from it rather than from the stale first one."""
+        stale = self.BUSY + "\n\u23f8 manual mode on"
+        fresh = self.IDLE + "\n\u23f5\u23f5 plan mode on"
+        with mock.patch.object(ha, "_capture_pane",
+                               side_effect=[self.IDLE, fresh]) as cp:
+            busy, mode, _prompt = ha._pane_status("agent-x", {"paneBusyStable": True})
+        self.assertEqual(cp.call_count, 2)
+        self.assertIs(busy, False)
+        self.assertEqual(mode, "plan")   # off the re-capture, not the first read
+        self.assertNotIn(stale, "")      # (stale kept only to name the contrast)
 
     def test_flicker_suppressed_across_beats_in_session_report(self):
         # End-to-end through session_report: one shared state dict, a busy beat
         # then a single idle-frame beat -> paneBusy stays True across the blip.
         st = {}
-        with mock.patch.object(ha, "_pane_busy", return_value=True):
+        with mock.patch.object(ha, "_capture_pane", return_value=self.BUSY):
             r1 = ha.session_report("/absent/worktree", st, "agent-x")
         self.assertIs(r1["paneBusy"], True)
-        with mock.patch.object(ha, "_pane_busy", side_effect=[False, True]):
+        with mock.patch.object(ha, "_capture_pane",
+                               side_effect=[self.IDLE, self.BUSY]):
             r2 = ha.session_report("/absent/worktree", st, "agent-x")
         self.assertIs(r2["paneBusy"], True)
 
@@ -19915,10 +19952,12 @@ class TestRepoActivitySort(ManagerMixin, unittest.TestCase):
         }
         for name, value in [
             ("scan_repos", lambda: [{"name": n, "path": "/x/" + n} for n, _ in commits]),
-            # repo_entry now takes cached slow facts as its second arg (ignored here).
-            ("repo_entry", lambda r, slow: dict(by_name[r["name"]])),
+            # repo_entry takes cached slow facts as its second arg and the cheap
+            # branch/dirty reads as its third (both ignored here).
+            ("repo_entry", lambda r, slow, cheap=None: dict(by_name[r["name"]])),
+            ("repo_cheap_facts", lambda path: {}),
             ("repo_slow_facts", lambda path: {}),
-            ("root_repo_entry", lambda: {"name": "(root)", "isRoot": True}),
+            ("root_repo_entry", lambda remote=None, cheap=None: {"name": "(root)", "isRoot": True}),
         ]:
             p = mock.patch.object(ha, name, value)
             p.start()
@@ -19964,6 +20003,150 @@ class TestRepoActivitySort(ManagerMixin, unittest.TestCase):
 @unittest.skipUnless(
     hasattr(signal, "SIGUSR1"), "SIGUSR1 is POSIX-only; the agent runs on Linux"
 )
+class TestLightBeatCost(ManagerMixin, unittest.TestCase):
+    """A `light` beat exists to get a command RESULT back fast — and, since
+    commands arrive only on a beat's REPLY, a POKED beat is what every operator
+    action (Send, Stop, model switch, /history) waits through. The heavy payload
+    is dominated by uncached VCS subprocesses: two per scanned repo, three per
+    running session, three for the repos-root pseudo-repo. On Windows a process
+    creation is ~60-150ms, so that was seconds of re-derived facts nobody asked
+    for, on the critical path. `light` now reuses the cheap reads too."""
+
+    def test_light_repo_entries_reuse_the_cheap_branch_and_dirty_reads(self):
+        sm = self.make_manager()
+        calls = []
+
+        def fake_cheap(path):
+            calls.append(path)
+            return {"branch": "main", "dirtyFiles": 0}
+
+        with mock.patch.object(ha, "scan_repos",
+                               return_value=[{"name": "A", "path": "/x/A"}]), \
+             mock.patch.object(ha, "repo_cheap_facts", side_effect=fake_cheap), \
+             mock.patch.object(ha, "repo_slow_facts", return_value={}), \
+             mock.patch.object(ha, "root_repo_entry",
+                               side_effect=lambda remote=None, cheap=None: {"name": "(root)"}), \
+             mock.patch.object(sm, "_root_repo_remote", return_value=""):
+            first = sm._sorted_repo_entries(refresh=False)
+            self.assertEqual(calls, ["/x/A"])
+            light = sm._sorted_repo_entries(refresh=False, light=True)
+            self.assertEqual(calls, ["/x/A"], "a light beat must not re-spawn")
+            self.assertEqual([e["name"] for e in light],
+                             [e["name"] for e in first])
+            sm._sorted_repo_entries(refresh=False)   # a heavy beat reads fresh
+            self.assertEqual(calls, ["/x/A", "/x/A"])
+
+    def test_a_vanished_repo_drops_out_of_the_cheap_cache(self):
+        sm = self.make_manager()
+        sm.repo_cheap = {"/x/gone": {"branch": "main", "dirtyFiles": 0}}
+        with mock.patch.object(ha, "scan_repos", return_value=[]), \
+             mock.patch.object(ha, "root_repo_entry",
+                               side_effect=lambda remote=None, cheap=None: {"name": "(root)"}), \
+             mock.patch.object(sm, "_root_repo_remote", return_value=""):
+            sm._sorted_repo_entries(refresh=False)
+        # The root pseudo-repo shares the map but is not a scanned path, so it
+        # must survive the prune (otherwise a light beat re-spawns for it anyway).
+        self.assertEqual(list(sm.repo_cheap), [ha.REPOS_ROOT])
+
+    def test_light_session_facts_reuse_the_cheap_worktree_reads(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "worktreePath": "/w/s1", "repoPath": "/x/A"}
+        calls = []
+
+        def fake_cheap(path):
+            calls.append(path)
+            return {"branch": "feat", "dirtyFiles": 2}
+
+        with mock.patch.object(ha, "git_info_cheap", side_effect=fake_cheap), \
+             mock.patch.object(ha, "git_info_slow", return_value={}), \
+             mock.patch.object(ha, "branch_sync", return_value={}), \
+             mock.patch.object(ha, "run", return_value="main"):
+            gi, _work = sm._session_git(sess, refresh=False)
+            self.assertEqual(gi["branch"], "feat")
+            gi2, _ = sm._session_git(sess, refresh=False, light=True)
+        self.assertEqual(calls, ["/w/s1"])
+        self.assertEqual(gi2["branch"], "feat")
+        # The caller mutates the returned dict (it folds the slow facts in), so a
+        # cache hit must hand back a COPY or the cache grows stale fields.
+        self.assertIsNot(gi, gi2)
+
+    def test_root_repo_entry_no_longer_pays_for_the_slow_facts(self):
+        """git_info() ran the whole git_info_slow — the remote URL, the last
+        commit line and a toplevel lookup — every beat and threw all but the
+        remote away, unlike every other slow read on this path."""
+        with mock.patch.object(ha, "git_info_cheap",
+                               return_value={"branch": "main", "dirtyFiles": 0}), \
+             mock.patch.object(ha, "git_info_slow") as slow, \
+             mock.patch.object(ha, "git_info") as full:
+            entry = ha.root_repo_entry("ssh://example.com/x/y")
+        slow.assert_not_called()
+        full.assert_not_called()
+        self.assertEqual(entry["remote"], "ssh://example.com/x/y")
+        self.assertEqual(entry["branch"], "main")
+
+    def test_root_remote_is_cached_across_beats_and_refreshed_on_cadence(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "run", return_value="origin-url") as runner:
+            self.assertEqual(sm._root_repo_remote(refresh=False), "origin-url")
+            sm._root_repo_remote(refresh=False)     # cached
+            self.assertEqual(runner.call_count, 1)
+            sm._root_repo_remote(refresh=True)      # slow cadence -> re-read
+            self.assertEqual(runner.call_count, 2)
+
+
+class TestPokedBeatIsLight(ManagerMixin, unittest.TestCase):
+    """A poke means "the hub has a command for you, beat NOW" — and the command
+    only arrives on that beat's REPLY, so the operator waits through
+    build_payload + the RTT. Building the FULL payload there spends the host's
+    whole subprocess bill before the POST leaves. The poked beat is light; the
+    scheduled beat that follows carries the full facts."""
+
+    class _Stop(Exception):
+        pass
+
+    def _beats(self, wait_answers):
+        sm = self.make_manager()
+        calls = []
+        answers = list(wait_answers)
+
+        def fake_wait(_timeout):
+            if not answers:
+                raise self._Stop()
+            return answers.pop(0)
+
+        def fake_beat(beat, light=False):
+            calls.append((beat, light))
+            return None
+
+        with mock.patch.object(ha, "IS_WINDOWS", False), \
+             mock.patch.object(ha.signal, "signal"), \
+             mock.patch.object(sm, "_start_dsh_web"), \
+             mock.patch.object(sm, "_beat_once", side_effect=fake_beat), \
+             mock.patch.object(ha._poke, "wait", side_effect=fake_wait), \
+             mock.patch.object(ha._poke, "clear"):
+            try:
+                sm.run_forever()
+            except self._Stop:
+                pass
+        return calls
+
+    def test_a_poked_beat_is_light_and_the_next_scheduled_one_is_not(self):
+        # wait answers: timed out, POKED, timed out.
+        calls = self._beats([False, True, False])
+        self.assertEqual(calls, [(0, False), (1, False), (2, True), (2, False)])
+
+    def test_a_light_beat_does_not_consume_its_cadence_index(self):
+        """It did none of the work `beat` indexes (refresh/triage/log-tail/usage
+        slots), so advancing the counter would let a burst of pokes step over a
+        slow-cadence slot entirely and starve it."""
+        calls = self._beats([True, True, True, False])
+        # Beat 0 is heavy and advances the index; the three poked beats that
+        # follow all sit on index 1 without consuming it, and the next scheduled
+        # beat is the one that does index 1's cadence work.
+        self.assertEqual(calls, [(0, False), (1, True), (1, True), (1, True),
+                                 (1, False)])
+
+
 class TestPokeHeartbeat(unittest.TestCase):
     """SIGUSR1 (sent by tunnel-agent.js on a control-channel poke) must cut the
     heartbeat loop's interval wait short so a just-queued command is picked up
@@ -23331,6 +23514,30 @@ class TestBeatLoopBudget(unittest.TestCase):
         worst = (ha.ARCHIVE_CHUNK_TIMEOUT_SEC
                  + ha.ARCHIVE_RAW_FAILURES_MAX * ha.ARCHIVE_RAW_TIMEOUT_SEC)
         self.assertGreaterEqual(worst * 1000, self._offline_after_ms())
+
+    def test_pane_capture_worst_case_fits_under_the_offline_threshold(self):
+        """The Windows pane scrape runs INLINE on the beat, so unlike the archive
+        or the gh sweep it cannot be answered with "move it off" — every other
+        signal (working/idle, the permission-mode footer, the blocking dialog)
+        comes from it and belongs to the beat. What bounds it instead is the
+        number of captures and their timeout.
+
+        On Windows a capture is a control-channel RPC (TCP connect + RFC 6455
+        handshake) at PTY_CONTROL_BEAT_TIMEOUT_SEC each. _pane_status takes ONE
+        per session, plus one more only on the busy->idle edge, so the worst case
+        is MAX_SESSIONS x (2 captures + the confirm delay). Add what the beat
+        already spends — its interval plus the two POSTs a command-executing
+        cycle makes — and it must still leave headroom under the hub's patience.
+
+        It did NOT before: three 5s captures per session x 6 sessions is 90s on
+        its own, past OFFLINE_AFTER_MS with the rest of the beat still to pay."""
+        panes = ha.MAX_SESSIONS * (2 * ha.PTY_CONTROL_BEAT_TIMEOUT_SEC
+                                   + ha.PANE_IDLE_CONFIRM_SEC)
+        beat = ha.INTERVAL + 2 * ha.HEARTBEAT_TIMEOUT_SEC
+        self.assertLess((beat + panes) * 1000, self._offline_after_ms())
+        # And the shape this replaced would not have fit on its own.
+        old = ha.MAX_SESSIONS * 3 * ha.PTY_CONTROL_TIMEOUT_SEC
+        self.assertGreater(old * 1000, self._offline_after_ms())
 
     def test_pr_status_worst_case_exceeds_the_offline_threshold(self):
         """WHY refresh_pr_status is off the beat (XERK-397): PR_STATUS_MAX
@@ -31172,6 +31379,45 @@ class TestWindowsTerminalBackend(unittest.TestCase):
                     json.dump({"ctrlPort": 40000, "pid": 7}, f)
                 self.assertEqual(ha._pty_read_state("agent-x")["ctrlPort"], 40000)
 
+    def test_the_token_file_is_published_atomically_and_owner_only(self):
+        """The live-token file is what makes a hub token roll survivable here: the
+        pty-host re-reads it per auth check, so rewriting it IS the roll — no
+        relaunch, and on this platform a relaunch means killing the operator's
+        claude (the pty-host is both the terminal and the pty). It carries the
+        credential, so it is owner-restricted; it is temp+renamed so a pty-host
+        mid-read never sees a partial token."""
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(ha, "PTY_HOST_DIR", d), \
+                 mock.patch.object(ha, "TURMA_TOKEN", "live-token"), \
+                 mock.patch.object(ha, "restrict_file_to_owner") as restrict:
+                self.assertIs(ha._write_pty_token_file(), True)
+                with open(ha._pty_token_file()) as f:
+                    self.assertEqual(f.read(), "live-token")
+                restrict.assert_called_once()
+                # The temp sibling is restricted BEFORE the rename, so the real
+                # path is never briefly world-readable.
+                self.assertTrue(restrict.call_args.args[0].endswith(".tmp"))
+                self.assertFalse(os.path.exists(ha._pty_token_file() + ".tmp"))
+
+    def test_publishing_the_token_file_never_raises_on_the_beat(self):
+        # A failure here must leave the baked-in token in force (the pre-change
+        # behaviour), not take the manager down: this runs at boot and before
+        # every launch.
+        with mock.patch.object(ha, "PTY_HOST_DIR", "/proc/nonexistent/pty-hosts"):
+            self.assertIs(ha._write_pty_token_file(), False)
+
+    def test_pty_capture_uses_the_short_beat_timeout(self):
+        """capture is the one control op on the BEAT loop, once (twice on the
+        busy->idle edge) per session per beat. At the 5s teardown budget, times
+        MAX_SESSIONS, it could reach the hub's OFFLINE_AFTER_MS on a host whose
+        pty-hosts are merely slow — flapping a healthy host offline."""
+        self.assertLess(ha.PTY_CONTROL_BEAT_TIMEOUT_SEC, ha.PTY_CONTROL_TIMEOUT_SEC)
+        with mock.patch.object(ha, "_pty_control",
+                               return_value={"ok": True, "data": "screen"}) as ctl:
+            self.assertEqual(ha._pty_capture("agent-x"), "screen")
+        self.assertEqual(ctl.call_args.kwargs["timeout"],
+                         ha.PTY_CONTROL_BEAT_TIMEOUT_SEC)
+
     def test_pty_control_dials_the_state_port_with_the_agent_token(self):
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(ha, "PTY_HOST_DIR", d), \
@@ -31398,6 +31644,7 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         sess = {"id": "w1", "tmuxName": "agent-w1"}
         with mock.patch.object(ha, "IS_WINDOWS", True), \
              mock.patch.object(ha, "_pty_control", return_value={"ok": True}) as ctl, \
+             mock.patch.object(ha, "_pid_alive", return_value=False), \
              mock.patch.object(ha.os, "kill"):
             sm._kill_tmux(sess)
         ctl.assert_called_once()
@@ -31407,6 +31654,90 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
                              for c in self.run_calls))
         self.assertFalse(os.path.exists(ha._pty_state_path("agent-w1")))
 
+    def test_teardown_keeps_the_state_file_when_the_pty_host_survives(self):
+        """The state file is the ONLY handle to a pty-host — there is deliberately
+        no in-memory registry — so dropping it after a kill that did NOT take loses
+        the process permanently: _pty_alive reads False, _pty_control finds no
+        port, and _kill_ttyd no-ops on Windows. The orphan then keeps claude.exe
+        alive in the worktree and keeps the session's terminal port bound, and
+        the very next launch respawns onto that same port."""
+        self._write_state("agent-w1", pid=4242, ctrlPort=40000, termPort=7742)
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pty_control", return_value=None), \
+             mock.patch.object(ha, "PTY_TEARDOWN_WAIT_SEC", 0.0), \
+             mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha.os, "kill", side_effect=OSError("denied")):
+            self.assertIs(ha._pty_teardown("agent-w1"), False)
+        self.assertTrue(os.path.exists(ha._pty_state_path("agent-w1")),
+                        "a failed reap must leave the handle for the next attempt")
+
+    def test_teardown_drops_the_state_file_once_the_pid_is_confirmed_gone(self):
+        self._write_state("agent-w1", pid=4242, ctrlPort=40000, termPort=7742)
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pty_control", return_value={"ok": True}), \
+             mock.patch.object(ha, "_pid_alive", return_value=False), \
+             mock.patch.object(ha.os, "kill"):
+            self.assertIs(ha._pty_teardown("agent-w1"), True)
+        self.assertFalse(os.path.exists(ha._pty_state_path("agent-w1")))
+
+    def test_spawn_waits_for_the_old_terminal_port_before_rebinding(self):
+        """The Linux ttyd relaunch waits up to 2s for the old listener to release
+        the port; the Windows respawn did not, and rebound the SAME fixed
+        --term-port immediately. Losing that race used to crash the pty-host with
+        claude.exe already on the ConPTY."""
+        self._write_state("agent-w1", pid=1, ctrlPort=40000, termPort=7742)
+        probes = []
+
+        def fake_port_open(port, *a, **k):
+            probes.append(port)
+            return len(probes) < 3      # busy twice, then released
+
+        def fake_task(tmux_name, cmd, cwd, env, log_path):
+            self._write_state("agent-w1", pid=1234, ctrlPort=55000, termPort=7742)
+
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pty_teardown", return_value=True), \
+             mock.patch.object(ha, "_port_open", side_effect=fake_port_open), \
+             mock.patch.object(ha, "_pty_task_cleanup"), \
+             mock.patch.object(ha, "_launch_pty_via_task", side_effect=fake_task):
+            pid = ha._pty_spawn_and_wait("agent-w1", ["node"], self.tmp, {}, None)
+        self.assertEqual(pid, 1234)
+        self.assertEqual(probes[:3], [7742, 7742, 7742])
+
+    def test_spawn_refuses_while_the_old_pty_host_still_holds_the_port(self):
+        """A reap that failed AND a port still held means the relaunch cannot
+        succeed anyway — starting it would put a second claude on the worktree.
+        The PORT is the authority, not the pid: a state-file pid can be a
+        Windows-recycled one belonging to something else entirely, and refusing on
+        that alone would strand the session forever."""
+        self._write_state("agent-w1", pid=1, ctrlPort=40000, termPort=7742)
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "PTY_PORT_RELEASE_WAIT_SEC", 0.0), \
+             mock.patch.object(ha, "_pty_teardown", return_value=False), \
+             mock.patch.object(ha, "_port_open", return_value=True), \
+             mock.patch.object(ha, "_launch_pty_via_task") as launch:
+            with self.assertRaises(RuntimeError):
+                ha._pty_spawn_and_wait("agent-w1", ["node"], self.tmp, {}, None)
+        launch.assert_not_called()
+        # ...but a freed port lets it through even after a failed reap.
+        def drop_state(_tmux):
+            try:
+                os.remove(ha._pty_state_path("agent-w1"))
+            except OSError:
+                pass
+            return False
+
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "PTY_PORT_RELEASE_WAIT_SEC", 0.0), \
+             mock.patch.object(ha, "PTY_SPAWN_TIMEOUT_SEC", 0.2), \
+             mock.patch.object(ha, "_pty_teardown", side_effect=drop_state), \
+             mock.patch.object(ha, "_port_open", return_value=False), \
+             mock.patch.object(ha, "_pty_task_cleanup"), \
+             mock.patch.object(ha, "_launch_pty_via_task") as launch:
+            with self.assertRaises(RuntimeError):   # never publishes -> timeout
+                ha._pty_spawn_and_wait("agent-w1", ["node"], self.tmp, {}, None)
+        launch.assert_called_once()
+
     def test_kill_ttyd_is_a_noop_on_windows(self):
         sm = self.make_manager()
         self.run_calls.clear()   # drop __init__'s hostname/version probes
@@ -31414,14 +31745,63 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
             sm._kill_ttyd("w1")   # must not raise or shell anything
         self.assertEqual(self.run_calls, [])
 
-    def test_launch_ttyd_is_a_noop_on_windows(self):
+    def test_launch_ttyd_shells_nothing_on_windows(self):
+        # There is no separate ttyd to (re)launch: the pty-host serves the
+        # terminal itself. With the token unchanged this is a pure no-op.
         sm = self.make_manager()
-        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7700}
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7700,
+                "ttydTokenFp": ha._token_fp(ha.TURMA_TOKEN)}
         self.run_calls.clear()   # drop __init__'s hostname/version probes
         with mock.patch.object(ha, "IS_WINDOWS", True):
-            sm._launch_ttyd(sess)   # the pty-host already serves the terminal
+            sm._launch_ttyd(sess)
         self.assertEqual(self.run_calls, [])
         self.assertNotIn("w1", sm.ttyd)
+
+    def test_a_token_roll_republishes_the_file_and_keeps_the_session(self):
+        """XERK-578 on the Windows path. The Linux branch kills and relaunches a
+        stale ttyd, which costs nothing because tmux (and the claude in it) lives
+        on. Here the pty-host IS the pty, so the same relaunch would kill the
+        operator's session — instead the live pty-host re-reads its token from the
+        manager-owned file, so republishing that file IS the whole roll."""
+        sm = self.make_manager()
+        self._write_state("agent-w1", pid=os.getpid(), ctrlPort=40000,
+                          termPort=7742, authTokenFile=ha._pty_token_file())
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "ttydTokenFp": ha._token_fp("the-old-token")}
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "TURMA_TOKEN", "the-new-token"), \
+             mock.patch.object(ha, "_pty_teardown") as teardown:
+            sm._launch_ttyd(sess)
+        teardown.assert_not_called()          # the session is NOT torn down
+        with open(ha._pty_token_file()) as f:
+            self.assertEqual(f.read(), "the-new-token")
+        self.assertEqual(sess["ttydTokenFp"], ha._token_fp("the-new-token"))
+
+    def test_a_pty_host_that_predates_the_token_file_is_reaped_after_a_roll(self):
+        """Its baked-in token can never change, so it is permanently unreachable:
+        the terminal 401s, the ws upgrade is refused, AND capture/inject/kill all
+        fail while its pid stays alive and the session reports `running` forever.
+        That zombie is strictly worse than a stopped session."""
+        sm = self.make_manager()
+        self._write_state("agent-w1", pid=os.getpid(), ctrlPort=40000,
+                          termPort=7742)          # no authTokenFile
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "ttydTokenFp": ha._token_fp("the-old-token")}
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "TURMA_TOKEN", "the-new-token"), \
+             mock.patch.object(ha, "_pty_teardown") as teardown:
+            sm._launch_ttyd(sess)
+        teardown.assert_called_once_with("agent-w1")
+
+    def test_no_live_pty_host_means_nothing_to_heal(self):
+        sm = self.make_manager()
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "ttydTokenFp": ha._token_fp("the-old-token")}
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "TURMA_TOKEN", "the-new-token"), \
+             mock.patch.object(ha, "_pty_teardown") as teardown:
+            sm._launch_ttyd(sess)   # no state file at all
+        teardown.assert_not_called()
 
     def test_tmux_alive_reads_the_pty_host_pid_on_windows(self):
         sm = self.make_manager()
@@ -31459,6 +31839,10 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         self.assertIn("w1", cmd)
         self.assertEqual(cmd[cmd.index("--term-port") + 1], "7742")
         self.assertEqual(cmd[cmd.index("--auth-token") + 1], "tok")
+        # ...and the LIVE token file the pty-host re-reads per auth check, so a
+        # hub token roll needs no relaunch (which here would kill the operator's
+        # claude, the pty-host being both the terminal and the pty).
+        self.assertEqual(cmd[cmd.index("--auth-token-file") + 1], ha._pty_token_file())
         self.assertEqual(cmd[cmd.index("--cols") + 1], "220")
         # The claude argv rides after the launcher, past the `--` separator.
         dd = cmd.index("--")
@@ -31466,6 +31850,9 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
                                         "--remote-control", "myrc"])
         self.assertEqual(captured["env"]["TURMA_SESSION_ID"], "w1")
         self.assertEqual(sess["ttydPid"], 1234)
+        # The Windows path recorded NO token fingerprint at all, so nothing could
+        # tell that a roll had moved the token under a surviving pty-host.
+        self.assertEqual(sess["ttydTokenFp"], ha._token_fp("tok"))
 
     def test_spawn_pty_host_windows_raises_and_reaps_via_state_on_timeout(self):
         # On Windows the task-launched pty-host is NOT our child, so there is no

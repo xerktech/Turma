@@ -71,6 +71,51 @@ export function decodeClientFrame(data) {
   return { kind: 'unknown', byte: cmd };
 }
 
+// ---- HTTP keep-alive: the ORIGIN must outlast the hub's idle-reuse window ----
+// The hub pools tunnel channels to this pty-host in a keep-alive `http.Agent`
+// (`termAgentFor`, server.js) and reuses a FREE one for the next asset/`/token`
+// request. If the origin's keep-alive window is SHORTER than the hub's, the hub
+// hands a request to a socket the pty-host has already FIN'd and the browser
+// gets ECONNRESET / "socket hang up" before the request ever reaches us — the
+// terminal open that needs two or three refreshes. Node's default
+// `server.keepAliveTimeout` is 5_000ms; the hub parks free channels for tens of
+// seconds, so the default GUARANTEES that race on any terminal whose assets are
+// more than ~5s apart. ttyd (libwebsockets) held connections far longer, which is
+// why the class is new on Windows.
+//
+// **Invariant: KEEPALIVE_TIMEOUT_MS must stay comfortably ABOVE the hub Agent's
+// `timeout` (its free-socket idle window, TERM_AGENT_IDLE_MS in server.js).**
+// Both sides are pinned by tests; raise the hub's and this must rise with it.
+// `headersTimeout` must in turn exceed `keepAliveTimeout`, or Node arms a
+// headers deadline on an idle kept-alive socket and closes it early anyway.
+export const KEEPALIVE_TIMEOUT_MS = 75_000;
+export const HEADERS_TIMEOUT_MS = 80_000;
+
+// ---- the auth token in force RIGHT NOW (XERK-578 roll, no relaunch) ----------
+// A pty-host's basic-auth/control token used to be baked in at launch, exactly
+// as ttyd bakes `-c term:<token>`. On Linux that is survivable: after a hub token
+// ROLL the manager kills the stale ttyd and relaunches it, and the tmux session
+// (with claude in it) is untouched. On Windows the pty-host IS the pty, so the
+// same relaunch would kill the operator's live claude — and NOT relaunching left
+// an unrecoverable zombie: the terminal 401s into a browser password prompt, the
+// ws upgrade is refused, AND the manager's own control channel stops
+// authenticating, so capture/inject/kill all fail while the pid stays alive and
+// the session reports `running` forever.
+//
+// So the token is read from a FILE the manager owns and rewrites (it is the only
+// writer) and this process re-reads per auth check: a roll then needs no
+// relaunch at all and no session is lost. The baked `--auth-token` remains the
+// fallback for a missing/unreadable/empty file, so the "refuses to start
+// unauthenticated" invariant is unchanged and an older manager (no file) keeps
+// working exactly as before.
+export function pickAuthToken(fileText, baked) {
+  if (typeof fileText === 'string') {
+    const t = fileText.trim();
+    if (t) return t;
+  }
+  return baked;
+}
+
 // ---- basic auth (ttyd `-c term:<token>`) -------------------------------------
 // The hub proxies EVERY /term request with `Authorization: Basic base64(term:T)`
 // (server.js `ttydAuth`), so the pty-host validates exactly that, same as ttyd.

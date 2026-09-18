@@ -4,3 +4,5 @@ node_modules/
 *.log
 drive-evidence.txt
 probe-result.txt
+# the drive's throwaway live-token file (section [9], the XERK-578 roll)
+*.token

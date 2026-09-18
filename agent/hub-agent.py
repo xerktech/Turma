@@ -164,6 +164,13 @@ TURMA_URL = os.environ.get("TURMA_URL", "http://turma:8300")
 # the hub's TURMA_AGENT_TOKEN.
 TURMA_TOKEN = os.environ.get("TURMA_TOKEN", "")
 INTERVAL = _env_int("TURMA_INTERVAL", 20, minimum=1)
+# Log a beat's wall clock when building + posting it took at least this long.
+# There was NO beat-duration instrumentation at all, which made every claim about
+# heartbeat latency — the thing every operator action waits on, since commands
+# arrive only on a beat's REPLY — unfalsifiable. Two numbers are logged, build vs
+# post, because they have completely different causes (local subprocess/disk cost
+# vs the network) and only the first is ours to fix. 0 logs every beat.
+BEAT_SLOW_LOG_SEC = _env_float("TURMA_BEAT_SLOW_LOG_SEC", 5.0, minimum=0.0)
 # How long ONE heartbeat POST may block the beat loop. This and INTERVAL are
 # the whole of what a healthy beat cycle costs, and their sum has to stay well
 # under the hub's OFFLINE_AFTER_MS (turma/server.js) or the host reads as dead
@@ -9196,28 +9203,49 @@ def _busy_from_capture(cap):
 PANE_IDLE_CONFIRM_SEC = _env_float("TURMA_PANE_IDLE_CONFIRM_SEC", 0.2)
 
 
-def _stable_pane_busy(tmux_name, state):
-    """paneBusy with the busy->idle flicker suppressed, using per-session `state`
-    (persisted across beats) to remember the last stable reading. See
-    PANE_IDLE_CONFIRM_SEC for the mechanism and why it's asymmetric.
+def _stable_pane_busy_from(tmux_name, state, cap):
+    """(paneBusy, capture) with the busy->idle flicker suppressed, derived from a
+    capture the CALLER already took. See PANE_IDLE_CONFIRM_SEC for the mechanism
+    and why it's asymmetric.
+
+    Taking the capture as an argument is what keeps `_pane_status` to ONE capture
+    per beat. On Windows a capture is a control-channel RPC (one TCP connect + an
+    RFC 6455 handshake each), and the old shape took three per session per beat —
+    busy, the idle-edge re-check, then a separate one for mode/prompt — which
+    against MAX_SESSIONS put the beat's worst case past OFFLINE_AFTER_MS. On Linux
+    it saves a `tmux capture-pane` subprocess per session per beat.
+
+    The returned capture is the FRESHEST one taken: on the idle edge that is the
+    post-delay re-capture, so the mode/prompt reads the caller derives come from
+    the same screen the busy decision did.
 
     None (unknown — no pane, capture failed) is passed straight through and
     leaves the remembered state untouched, so the transcript-mtime fallback still
     decides and a transient capture failure can't be mistaken for "went idle"."""
-    raw = _pane_busy(tmux_name)
+    raw = _busy_from_capture(cap)
     if raw is None:
-        return None
+        return None, cap
     if raw:
         state["paneBusyStable"] = True
-        return True
+        return True, cap
     # raw is False. Only distrust it on the busy->idle edge.
     if state.get("paneBusyStable") and PANE_IDLE_CONFIRM_SEC > 0:
         time.sleep(PANE_IDLE_CONFIRM_SEC)
-        if _pane_busy(tmux_name):  # the marker was one frame away -> still working
+        cap2 = _capture_pane(tmux_name)
+        if cap2 is not None:
+            cap = cap2
+        if _busy_from_capture(cap2):  # the marker was one frame away -> working
             state["paneBusyStable"] = True
-            return True
+            return True, cap
     state["paneBusyStable"] = False
-    return False
+    return False, cap
+
+
+def _stable_pane_busy(tmux_name, state):
+    """`_stable_pane_busy_from` taking its own capture — the standalone read for
+    callers that want only paneBusy."""
+    busy, _cap = _stable_pane_busy_from(tmux_name, state, _capture_pane(tmux_name))
+    return busy
 
 # The TUI names the ACTIVE permission mode on its footer at all times — even
 # mid-generation — as "⏸ manual mode on" / "⏵⏵ accept edits on" / "⏸ plan mode
@@ -9409,16 +9437,22 @@ def parse_pane_prompt(cap):
 
 
 def _pane_status(tmux_name, state):
-    """(paneBusy, modeActual, panePrompt) for one beat: the busy half goes
-    through _stable_pane_busy's busy->idle flicker suppression (hence `state`),
-    the mode and blocking-dialog halves read one shared capture.
+    """(paneBusy, modeActual, panePrompt) for one beat, off ONE capture: the busy
+    half goes through the busy->idle flicker suppression (hence `state`), and the
+    mode and blocking-dialog halves read the same screen.
+
+    ONE capture is the point. This runs per session per beat, and on Windows a
+    capture is a control-channel RPC rather than a subprocess — the old shape took
+    a separate one for busy and another for mode/prompt (three on the idle edge),
+    which against MAX_SESSIONS put the beat's worst case at or past the hub's
+    OFFLINE_AFTER_MS. Only the busy->idle edge still costs a second capture, and
+    mode/prompt then read THAT fresher one.
 
     Live background agents are deliberately NOT read here — see
     _scan_agent_entry for why the pane cannot answer that question."""
     if not tmux_name:
         return None, None, None
-    busy = _stable_pane_busy(tmux_name, state)
-    cap = _capture_pane(tmux_name)
+    busy, cap = _stable_pane_busy_from(tmux_name, state, _capture_pane(tmux_name))
     return busy, parse_pane_mode(cap), parse_pane_prompt(cap)
 
 
@@ -9645,6 +9679,22 @@ PTY_HOST_DIR = os.path.join(REGISTRY_DIR, "pty-hosts")   # state files + spawn l
 # matches the per-op `tmux` subprocess model the Linux path uses. Bounded so a
 # wedged pty-host can never stall a caller on the beat past OFFLINE_AFTER_MS.
 PTY_CONTROL_TIMEOUT_SEC = _env_float("PTY_CONTROL_TIMEOUT_SEC", 5.0, minimum=0.5)
+# The timeout for control ops that run ON THE BEAT LOOP (`capture`). The 5s above
+# is a teardown/command budget; on the beat it is a budget violation: _pane_status
+# can take two captures per session and MAX_SESSIONS is 6, so 5s each put the
+# worst case at or past the hub's 75s OFFLINE_AFTER_MS on a host whose pty-hosts
+# are merely slow — flapping a healthy host offline (the CLAUDE.md beat-loop
+# contract). A capture is a loopback connect + RFC6455 handshake + a screen grid;
+# 1.5s is already ~100x its normal cost, and a capture that misses just reads
+# "can't tell", which the transcript-freshness fallback already handles.
+PTY_CONTROL_BEAT_TIMEOUT_SEC = _env_float(
+    "PTY_CONTROL_BEAT_TIMEOUT_SEC", 1.5, minimum=0.2)
+# How long _pty_teardown waits for a pty-host to actually DIE before it is allowed
+# to drop the state file (the only handle to it), and how long a respawn waits for
+# the old terminal port to be released before rebinding it — the Windows analog of
+# the Linux ttyd relaunch's port-release wait.
+PTY_TEARDOWN_WAIT_SEC = _env_float("PTY_TEARDOWN_WAIT_SEC", 3.0, minimum=0.0)
+PTY_PORT_RELEASE_WAIT_SEC = _env_float("PTY_PORT_RELEASE_WAIT_SEC", 2.0, minimum=0.0)
 # How long to wait for a freshly-spawned pty-host to publish its state file with
 # bound ports — the analog of a `tmux new-session` either succeeding or failing.
 PTY_SPAWN_TIMEOUT_SEC = _env_float("PTY_SPAWN_TIMEOUT_SEC", 15.0, minimum=1.0)
@@ -9750,6 +9800,49 @@ def _pty_state_path(tmux_name):
     embeds the session id) so every module-level terminal helper can find it from
     the same handle the Linux path passes around."""
     return os.path.join(PTY_HOST_DIR, f"{tmux_name}.state.json")
+
+
+def _pty_token_file():
+    """The one host-wide file holding the auth token every pty-host validates
+    against RIGHT NOW (XERK-578). One file, not one per session: TURMA_TOKEN is a
+    per-HOST credential, and every pty-host on the host takes the same one."""
+    return os.path.join(PTY_HOST_DIR, "auth-token")
+
+
+def _write_pty_token_file(token=None):
+    """Publish the current agent token for every live pty-host to re-read.
+
+    This is what makes a hub token ROLL survivable on Windows. On Linux a roll
+    kills and relaunches the stale ttyd while tmux (and the claude in it) lives
+    on; on Windows the pty-host IS the pty, so the same relaunch would kill the
+    operator's running session — and NOT relaunching left an unrecoverable
+    zombie: the terminal 401s into a browser password prompt, the ws upgrade is
+    refused, AND the manager's own control channel stops authenticating, so
+    capture/inject/kill silently fail while the pid stays alive and the session
+    reports `running` forever. The pty-host re-reads this file per auth check, so
+    rewriting it here is the whole roll — no relaunch, nothing lost.
+
+    The manager is the ONLY writer, and it writes at boot (so a restart onto a
+    rolled token republishes before anything is driven) and before each spawn, so
+    the file always equals this process's TURMA_TOKEN. That is why _pty_control
+    can keep authenticating with the env value. Atomic temp+rename so a pty-host
+    mid-read never sees a partial token, and owner-only like every other
+    credential file. Best-effort: a failure logs and leaves the baked-in token in
+    force (the pre-change behaviour), it never raises on the beat."""
+    value = TURMA_TOKEN if token is None else token
+    path = _pty_token_file()
+    try:
+        os.makedirs(PTY_HOST_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(value or "changeme")
+        restrict_file_to_owner(tmp)
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        log(f"pty-host: could not publish the auth token file ({e}); a token "
+            "roll will need a session restart to take effect")
+        return False
 
 
 def _pty_read_state(tmux_name):
@@ -9909,8 +10002,12 @@ def _pty_control(tmux_name, op, timeout=PTY_CONTROL_TIMEOUT_SEC, **extra):
 
 
 def _pty_capture(tmux_name):
-    """capture-pane analog: the pty-host's scrollback ring, or None."""
-    r = _pty_control(tmux_name, "capture")
+    """capture-pane analog: the pty-host's rendered screen grid, or None.
+
+    Runs on the BEAT LOOP (every session, once or twice per beat), so it takes
+    the short beat timeout rather than the 5s teardown budget — see
+    PTY_CONTROL_BEAT_TIMEOUT_SEC."""
+    r = _pty_control(tmux_name, "capture", timeout=PTY_CONTROL_BEAT_TIMEOUT_SEC)
     if r and r.get("ok"):
         return r.get("data")
     return None
@@ -10076,22 +10173,50 @@ def _pty_teardown(tmux_name):
     """kill-session analog: tell the pty-host to kill its pty and exit, back it up
     with a signal to its pid, and drop the state file so a dead session is never
     re-adopted on the next boot. Best-effort and idempotent — a session with no
-    pty-host is a no-op."""
+    pty-host is a no-op. Returns True when nothing is left running.
+
+    **The state file is removed only once the pid is CONFIRMED gone.** It is the
+    ONLY handle to the pty-host — there is deliberately no in-memory registry —
+    so dropping it after a kill that did not take (a wedged pty-host, or one whose
+    control channel no longer authenticates) loses the process permanently:
+    _pty_alive reads False, _pty_control finds no port, and _kill_ttyd no-ops on
+    Windows, leaving an orphan that keeps claude.exe alive in the worktree and
+    keeps the session's termPort bound. Keeping the file instead means the next
+    attempt (teardown, kill, or the next launch's clean-slate call) can still
+    retry the reap."""
     if not tmux_name:
-        return
+        return True
     st = _pty_read_state(tmux_name)
+    pid = None
     if st:
         _pty_control(tmux_name, "kill")   # clean pty teardown, then it exits
         pid = st.get("pid")
+        try:
+            pid = int(pid) if pid else None
+        except (TypeError, ValueError):
+            pid = None
         if pid:
             try:
-                os.kill(int(pid), signal.SIGTERM)
+                os.kill(pid, signal.SIGTERM)
             except (OSError, TypeError, ValueError):
                 pass
+            # Wait for it to actually go. On Windows os.kill IS TerminateProcess
+            # so this is usually immediate; on POSIX the SIGTERM handler tears the
+            # pty down first. Either way the exit is what licenses dropping the
+            # state file below.
+            deadline = time.time() + PTY_TEARDOWN_WAIT_SEC
+            while _pid_alive(pid) and time.time() < deadline:
+                time.sleep(0.05)
+            if _pid_alive(pid):
+                log(f"pty-host {tmux_name}: still alive (pid {pid}) after kill + "
+                    "SIGTERM; KEEPING its state file so the reap can be retried "
+                    "(dropping it would orphan the process and its terminal port)")
+                return False
     try:
         os.remove(_pty_state_path(tmux_name))
     except OSError:
         pass
+    return True
 
 
 def _pty_spawn_and_wait(tmux_name, cmd, cwd, env, log_path):
@@ -10111,8 +10236,35 @@ def _pty_spawn_and_wait(tmux_name, cmd, cwd, env, log_path):
     The ONE ConPTY-spawn choke point: session launch (`_spawn_pty_host`) and the
     subscription-limits probe on Windows (`_run_limits_probe`) both go through it,
     so neither grows a second copy of the detached-spawn / wait / reap dance."""
-    _pty_teardown(tmux_name)                  # clean slate (tmux kill-session)
+    # The port a previous pty-host was serving this session's terminal on, read
+    # BEFORE the teardown drops its state — the thing we must see released before
+    # rebinding it below.
+    prev = _pty_read_state(tmux_name) or {}
+    prev_port = prev.get("termPort")
+    reaped = _pty_teardown(tmux_name)         # clean slate (tmux kill-session)
     os.makedirs(PTY_HOST_DIR, exist_ok=True)
+    # Publish the current auth token before the pty-host starts, so it reads the
+    # live value on its very first request (XERK-578 roll self-heal).
+    _write_pty_token_file()
+    # Wait for the old pty-host to RELEASE THE TERMINAL PORT before the new one
+    # rebinds it, exactly as the Linux ttyd relaunch waits (a SIGTERM'd process
+    # exits promptly, but not synchronously). Without this the respawn raced the
+    # old listener and lost — which, before the pty-host learned to bind before
+    # spawning, crashed it with claude.exe already on the ConPTY.
+    if prev_port:
+        deadline = time.time() + PTY_PORT_RELEASE_WAIT_SEC
+        while _port_open(prev_port) and time.time() < deadline:
+            time.sleep(0.1)
+        # The port is the authority, not the pid: a state-file pid can be a
+        # Windows-recycled one belonging to something else entirely, and refusing
+        # to launch on that would strand the session forever. Refuse ONLY while
+        # the old terminal port is demonstrably still held — there the relaunch
+        # cannot succeed anyway, and starting it would put a second claude on the
+        # worktree.
+        if not reaped and _port_open(prev_port):
+            raise RuntimeError(
+                f"the previous pty-host still holds terminal port {prev_port} "
+                "after a kill; not relaunching a second pty onto this worktree")
     proc = None
     if IS_WINDOWS:
         _launch_pty_via_task(tmux_name, cmd, cwd, env, log_path)
@@ -10850,36 +11002,61 @@ def repo_slow_facts(path):
     }
 
 
-def repo_entry(repo, slow):
-    """Heartbeat repos[] entry: the CHEAP, fast-changing reads done every beat
-    (current checked-out branch + `git status --porcelain` dirty count) merged
-    with the cached `slow` facts (repo_slow_facts, refreshed on the slow cadence).
-    """
-    path = repo["path"]
+def repo_cheap_facts(path):
+    """The CHEAP, fast-changing repo reads done every beat: the current checked-out
+    branch and the `git status --porcelain` dirty count. Two git spawns — which is
+    why a `light` beat reuses the previous answer instead (see repo_entry)."""
     dirty = run(["git", "status", "--porcelain"], cwd=path)
+    return {
+        "branch": run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path),
+        "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
+    }
+
+
+def repo_entry(repo, slow, cheap=None):
+    """Heartbeat repos[] entry: the CHEAP, fast-changing reads (current checked-out
+    branch + `git status --porcelain` dirty count) merged with the cached `slow`
+    facts (repo_slow_facts, refreshed on the slow cadence).
+
+    `cheap` lets the caller supply the previous beat's cheap reads instead of
+    re-spawning git — what a `light` beat does. Those two spawns per repo per beat
+    are a big share of a Windows host's pre-POST latency, and `light` already
+    means "reflect the command result fast, reuse the caches"."""
+    path = repo["path"]
+    if cheap is None:
+        cheap = repo_cheap_facts(path)
     return {
         "name": repo["name"],
         "path": path,
-        "branch": run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path),
-        "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
+        **cheap,
         **slow,
     }
 
 
-def root_repo_entry():
+def root_repo_entry(remote=None, cheap=None):
     """Heartbeat repos[] entry for the REPOS_ROOT pseudo-repo, so the hub can
     offer a "New session" affordance that runs directly at the root. Unlike
     repo_entry() it runs no per-branch ref walk (the root isn't a fork source,
     so there's no base-branch list); git facts are best-effort and empty unless
     REPOS_ROOT itself happens to be a git checkout. isRoot flags it for the UI,
-    which hides the base-branch/custom-branch/resume/clone bits that don't apply."""
-    info = git_info(REPOS_ROOT) or {}
+    which hides the base-branch/custom-branch/resume/clone bits that don't apply.
+
+    `remote` is the ONE slow-changing fact this entry uses, so the caller passes
+    it from the slow-cadence cache. It used to call git_info(), which ran the
+    whole git_info_slow() — `git remote get-url`, `git log -1`, and a
+    `rev-parse --show-toplevel` — EVERY beat and threw all but the remote away,
+    unlike every other slow read on this path. None means "read it now" (the
+    first beat, and the standalone callers). `cheap` is the same reuse
+    `repo_entry` takes, for a `light` beat."""
+    info = (cheap if cheap is not None else git_info_cheap(REPOS_ROOT)) or {}
+    if remote is None:
+        remote = run(["git", "remote", "get-url", "origin"], cwd=REPOS_ROOT)
     return {
         "name": ROOT_REPO_NAME,
         "path": REPOS_ROOT,
         "isRoot": True,
         "branch": info.get("branch", ""),
-        "remote": info.get("remote", ""),
+        "remote": remote or "",
         "dirtyFiles": info.get("dirtyFiles", 0),
         "branches": [],
         "defaultBranch": "",
@@ -14871,8 +15048,24 @@ class SessionManager:
         # session id -> {liveBranch, slow git_info, branch_sync work}.
         self.repo_facts = {}
         self.session_facts = {}
+        # The CHEAP per-repo/per-session git reads (current branch + dirty count),
+        # remembered so a `light` beat can reuse them instead of re-spawning git.
+        # On Windows a process creation is ~60-150ms, so a host with a handful of
+        # repos and sessions spent SECONDS of git spawns before every POST — on
+        # the critical path of every Send, Stop and /history fetch, since commands
+        # only arrive on a beat's REPLY. `light` already means "reuse the caches".
+        self.repo_cheap = {}                     # repo path -> cheap entry fields
+        self.session_cheap = {}                  # session id -> git_info_cheap
+        self.root_repo_cache = None              # repos-root origin remote (slow)
         # Throttled `docker logs` tail (LOG_TAIL_EVERY beats); reused in between.
         self.log_tail_cache = None
+        # On Windows every live pty-host re-reads the auth token from this file
+        # per request, so publishing it at BOOT is what makes a token roll take
+        # effect: set_token rewrites the env file and restarts, and this line —
+        # running under the NEW TURMA_TOKEN — hands the surviving pty-hosts the
+        # new credential without killing a single session (XERK-578).
+        if IS_WINDOWS:
+            _write_pty_token_file()
         # Staged `history` command results awaiting the next heartbeat payload
         # (historyResults) — held across a failed POST, cleared only once
         # delivery succeeds, same lifecycle as pending_prs above.
@@ -18513,6 +18706,16 @@ class SessionManager:
             # identically. Its DEFAULT_PREFS already match _launch_ttyd's `-t`
             # flags (font/size/webgl/…), so no --pref is needed for fleet parity.
             "--auth-token", (TURMA_TOKEN or "changeme"),
+            # …and the file holding whatever token is in force RIGHT NOW, which
+            # the pty-host re-reads per auth check. A baked-in token alone made a
+            # hub token ROLL fatal here in a way it never is on Linux: the
+            # pty-host is BOTH the terminal and the pty, so it cannot be
+            # relaunched without killing the operator's claude, and left running
+            # it 401s the terminal AND stops accepting the manager's own control
+            # ops (capture/inject/kill) while its pid stays alive — a session that
+            # reports `running` forever with no input, no busy read and no
+            # terminal. See _write_pty_token_file.
+            "--auth-token-file", _pty_token_file(),
             "--cwd", sess["worktreePath"],
             "--cols", "220", "--rows", "50",         # the tmux `-x 220 -y 50` geometry
             "--",
@@ -18529,6 +18732,50 @@ class SessionManager:
         # like a ttyd pid on kill.
         sess["ttydPid"] = _pty_spawn_and_wait(
             tmux_name, cmd, sess["worktreePath"], env, log_path)
+        # The token this pty-host started under (XERK-578), the same field the
+        # Linux ttyd launch records. Without it the Windows path had NO record at
+        # all, so nothing could tell that a roll had moved the token under a
+        # surviving pty-host — `_ensure_pty_auth_current` is what reads it back.
+        sess["ttydTokenFp"] = _token_fp(TURMA_TOKEN)
+
+    def _ensure_pty_auth_current(self, sess):
+        """Windows half of the XERK-578 post-roll self-heal, the counterpart of the
+        Linux branch's kill-and-relaunch-a-stale-ttyd below.
+
+        A pty-host started before the token rolled is still validating the OLD
+        token. On Linux that costs a ttyd relaunch and nothing else; here the
+        pty-host is the pty, so relaunching it would kill the operator's live
+        claude. The fix is that a current pty-host re-reads its token from the
+        file this manager owns, so republishing the file IS the roll — no
+        relaunch, no lost session.
+
+        The one case that cannot be healed that way is a pty-host that predates
+        the token file (its state carries no `authTokenFile`): its baked-in token
+        can never change, so it is permanently unreachable — the terminal 401s,
+        the ws upgrade is refused, and capture/inject/kill all fail while its pid
+        stays alive and the session reports `running` forever. That zombie is
+        strictly worse than a stopped session, so it is torn down: the session
+        then reads not-running and the operator's existing Restart/Resume path
+        rebuilds it on the current token."""
+        fp = _token_fp(TURMA_TOKEN)
+        if sess.get("ttydTokenFp") == fp:
+            return                       # nothing rolled under this pty-host
+        tmux_name = sess.get("tmuxName")
+        st = _pty_read_state(tmux_name)
+        if not st or not _pty_alive(tmux_name):
+            return                       # nothing serving; the next launch bakes
+                                         # in the current token anyway
+        if st.get("authTokenFile"):
+            _write_pty_token_file()      # it re-reads this per auth check
+            sess["ttydTokenFp"] = fp
+            log(f"pty-host for {sess['id']}: agent token changed (post-roll); "
+                "republished the token file — no relaunch, session preserved")
+            return
+        log(f"pty-host for {sess['id']}: agent token changed under a surviving "
+            "pty-host that predates the live-token file, so its baked-in token "
+            "can never match again (terminal 401s AND control ops fail while it "
+            "reports running); tearing it down so Restart can rebuild it")
+        _pty_teardown(tmux_name)
 
     def _launch_ttyd(self, sess):
         """Ensure a ttyd is serving this session's tmux on its stable port.
@@ -18549,11 +18796,14 @@ class SessionManager:
 
         On Windows there is no separate ttyd: the pty-host serves the terminal
         surface itself, on this same stable port, and was (re)started by
-        `_spawn_pty_host` at launch — so this choke point is a no-op there. The
-        resume-on-boot ADOPT path reaches a surviving pty-host with no work here:
-        every terminal helper resolves it from its persisted state file, so
-        "re-ensure the bridge" needs nothing (XERK-697)."""
+        `_spawn_pty_host` at launch — so there is no bridge to re-ensure here.
+        The resume-on-boot ADOPT path reaches a surviving pty-host with no work:
+        every terminal helper resolves it from its persisted state file
+        (XERK-697). What this choke point DOES still owe the Windows path is the
+        XERK-578 post-roll check the Linux branch below performs — see
+        `_ensure_pty_auth_current`."""
         if IS_WINDOWS:
+            self._ensure_pty_auth_current(sess)
             return
         if sess.get("agentType") == "dsh":
             return
@@ -18749,6 +18999,7 @@ class SessionManager:
         # toward the persistent per-repo/host usage. It's keyed by slug (not
         # session id) and bounded by _prune_ledger when the transcript is gone.
         self.session_facts.pop(sid, None)
+        self.session_cheap.pop(sid, None)
         self.pending_prs.pop(sid, None)
         self.session_pr_urls.pop(sid, None)
         # A killed/deleted session's tmux (and its blocked ask.py hook) is gone;
@@ -26700,6 +26951,8 @@ class SessionManager:
             "--ctrl-port", "0",
             "--state", _pty_state_path(tmux_name),
             "--auth-token", (TURMA_TOKEN or "changeme"),
+            # The live token file, so a roll mid-probe doesn't lock us out of it.
+            "--auth-token-file", _pty_token_file(),
             "--cwd", REGISTRY_DIR,
             "--cols", "80", "--rows", "24",   # the tmux `-x 80 -y 24` geometry
             "--",
@@ -27721,16 +27974,24 @@ class SessionManager:
         except Exception as e:
             log(f"cc-socks sweep failed: {e}")
 
-    def _session_git(self, sess, refresh):
+    def _session_git(self, sess, refresh, light=False):
         """(git-info dict | None, branch-sync work dict) for a session's payload.
         The CHEAP current-branch + dirty reads run every beat; the SLOW facts —
         repo name / remote URL / last-commit line, and the branch<->base/origin
         sync counts — are cached and only recomputed on the slow cadence
         (`refresh`), when the session is first seen, or when its live branch
         changed (so a session that just named its work branch updates promptly
-        without re-walking refs every beat)."""
+        without re-walking refs every beat).
+
+        On a `light` beat the cheap reads are cached too (three git spawns per
+        RUNNING session), for the same reason the repo entries cache theirs — a
+        light beat's job is to get the command result back fast."""
         sid = sess["id"]
-        gi = git_info_cheap(sess["worktreePath"])  # None if the worktree is gone
+        gi = self.session_cheap.get(sid) if light else None
+        if gi is None:
+            gi = git_info_cheap(sess["worktreePath"])  # None if the worktree is gone
+            self.session_cheap[sid] = gi
+        gi = dict(gi) if gi is not None else None      # never hand out the cache
         # The app owns no branch, so the branch to report is the LIVE one the
         # running agent named for its work ("HEAD" = still detached, not yet
         # branched -> no branch to sync).
@@ -27772,7 +28033,7 @@ class SessionManager:
         now_ts = (signals or {}).get("lastActivityTs")
         return bool(now_ts and str(now_ts) > str(landed))
 
-    def _session_payload(self, sess, refresh=True):
+    def _session_payload(self, sess, refresh=True, light=False):
         # .get(), not sess["id"] — this runs per record on the beat loop, so a
         # partial/legacy/hand-edited registry record with no "id" must degrade,
         # never raise KeyError and take the host down (XERK-402). None threads
@@ -27866,7 +28127,7 @@ class SessionManager:
         # ~/.turma/sessions.json) must degrade to "no git info", never raise and
         # take the host down (XERK-402). Both fields are nullable on every client.
         try:
-            gi, work = self._session_git(sess, refresh)
+            gi, work = self._session_git(sess, refresh, light)
         except Exception as e:
             log(f"session git failed for {sid}: {e}")
             gi, work = None, None
@@ -28104,27 +28365,57 @@ class SessionManager:
             self.repo_facts[path] = facts
         return facts
 
-    def _sorted_repo_entries(self, refresh=True):
+    def _root_repo_remote(self, refresh):
+        """The repos-root pseudo-repo's origin remote, cached like every other
+        slow git fact (it was the only one on this path re-read every beat)."""
+        if refresh or self.root_repo_cache is None:
+            self.root_repo_cache = run(
+                ["git", "remote", "get-url", "origin"], cwd=REPOS_ROOT)
+        return self.root_repo_cache
+
+    def _sorted_repo_entries(self, refresh=True, light=False):
         """Scanned repos ordered most-recently-active first (see #-activity-sort):
         each repo's lastActivity is the later of its newest commit ("modified")
         and its newest session activity ("used"). The root pseudo-repo is pinned
         first and never ranked. Ties (e.g. never-touched repos) keep the scan's
         alphabetical order, since Python's sort is stable. The cheap current-
-        branch/dirty reads run every beat; the slow facts are cached (`refresh`)."""
+        branch/dirty reads run every beat; the slow facts are cached (`refresh`).
+
+        On a `light` beat even the cheap reads come from cache: they are two git
+        spawns per repo (three for the root), and a light beat exists to reflect a
+        command result FAST — on Windows those spawns are ~60-150ms each, so a
+        host with a handful of repos spent seconds of them before the POST that
+        carries the operator's next command back."""
         activity = self._repo_activity()
         repos = scan_repos()
-        entries = [repo_entry(r, self._repo_slow_facts(r["path"], refresh))
-                   for r in repos]
+        entries = []
+        for r in repos:
+            path = r["path"]
+            cheap = self.repo_cheap.get(path) if light else None
+            if cheap is None:
+                cheap = repo_cheap_facts(path)
+                self.repo_cheap[path] = cheap
+            entries.append(repo_entry(r, self._repo_slow_facts(path, refresh),
+                                      cheap))
         # Drop cache entries for repos that are gone (renamed/removed).
         live_paths = {r["path"] for r in repos}
         self.repo_facts = {p: f for p, f in self.repo_facts.items()
                            if p in live_paths}
+        self.repo_cheap = {p: f for p, f in self.repo_cheap.items()
+                           if p in live_paths or p == REPOS_ROOT}
         for e in entries:
             e["lastActivity"] = max(
                 e.get("lastCommit") or "", activity.get(e["name"], "")
             )
         entries.sort(key=lambda e: e.get("lastActivity") or "", reverse=True)
-        out = [root_repo_entry()] + entries
+        # The root pseudo-repo's own cheap reads are cached on a light beat too
+        # (it is another three spawns), keyed in the same map — REPOS_ROOT is not
+        # a scanned repo path, so the prune above never touches it.
+        root_cheap = self.repo_cheap.get(REPOS_ROOT) if light else None
+        if root_cheap is None:
+            root_cheap = git_info_cheap(REPOS_ROOT) or {}
+            self.repo_cheap[REPOS_ROOT] = root_cheap
+        out = [root_repo_entry(self._root_repo_remote(refresh), root_cheap)] + entries
         # Attach each repo's resumable-session list (cached; refreshed on the slow
         # cadence in _refresh_repo_usage) for the "Resume any session" picker and
         # the hub's Ended-sessions list.
@@ -28414,8 +28705,9 @@ class SessionManager:
             # enough to send every beat, and it has to be: capacity is the fact
             # that goes stale fastest.
             "capacity": self._capacity_payload(),
-            "repos": self._sorted_repo_entries(refresh),
-            "sessions": [self._session_payload(s, refresh) for s in self.registry],
+            "repos": self._sorted_repo_entries(refresh, light),
+            "sessions": [self._session_payload(s, refresh, light)
+                         for s in self.registry],
             "closedSessions": self._closed_payload(),
             # Persistent usage, independent of active sessions: per-repo (keyed by
             # normalized origin so the hub can unify a repo across hosts) plus this
@@ -28835,6 +29127,33 @@ class SessionManager:
             self._restart_pending = False
             self._perform_restart()
 
+    def _beat_once(self, beat, light=False):
+        """Build one heartbeat payload, POST it, and return the reply — timing
+        both halves.
+
+        The ONE place a beat is built and sent, so the wall clock is measured for
+        every beat there is. Nothing else about it is new; the timing is, because
+        there was none, and command-pickup latency (the thing every operator
+        action waits on, commands riding only a beat's REPLY) is exactly
+        build + post. Build and post are reported separately: a slow build is
+        local subprocess/disk cost we own, a slow post is the network.
+
+        Timing must never be able to take the host down, so the log is wrapped
+        and the reply is returned untouched on any path."""
+        t0 = time.time()
+        payload = self.build_payload(beat, light=light)
+        t1 = time.time()
+        reply = self.post(payload)
+        t2 = time.time()
+        try:
+            build, send = t1 - t0, t2 - t1
+            if build + send >= BEAT_SLOW_LOG_SEC:
+                log(f"beat {beat}{' (light)' if light else ''}: "
+                    f"built in {build:.1f}s, posted in {send:.1f}s")
+        except Exception:
+            pass
+        return reply
+
     def _perform_restart(self):
         """Bring the manager back the way a SIGTERM restart (XERK-29) does, but
         triggered from the dashboard rather than the supervisor. Announce the
@@ -28985,13 +29304,33 @@ class SessionManager:
         # off; it adopts an instance that survived an in-place update.
         self._start_dsh_web()
         beat = 0
+        # Whether the wait below was cut short by a poke — "the hub has a command
+        # for you, beat NOW".
+        poked = False
         while True:
             # Clear before the beat so a poke that lands *during* it (a command
             # queued while we're mid-cycle) still shortens the next wait rather
             # than being swallowed.
             _poke.clear()
-            reply = self.post(self.build_payload(beat))
-            beat += 1
+            # A POKED beat is LIGHT. The poke exists to cut command-pickup
+            # latency, and commands arrive only on a beat's REPLY — so what the
+            # operator actually waits through is build_payload + the RTT. The
+            # heavy payload is dominated by uncached git subprocesses (two per
+            # scanned repo, three per running session, three for the root
+            # pseudo-repo); at Windows process-creation cost that is seconds
+            # spent re-deriving facts NOBODY asked for, on the critical path of
+            # every Send, Stop, model switch and /history fetch. `light` is
+            # already the established "reflect the result fast, reuse the caches"
+            # payload — the post-command follow-up beat has used it for ages —
+            # so a poked beat uses it too, and the scheduled beat that follows
+            # (the wait below times out normally) carries the full facts.
+            reply = self._beat_once(beat, light=poked)
+            # A light beat did NOT do the cadence work `beat` indexes
+            # (refresh/triage/log-tail/usage slots), so it must not consume that
+            # index — otherwise a burst of pokes could step over a slow-cadence
+            # slot entirely and starve it.
+            if not poked:
+                beat += 1
             # If a prior beat armed a restart but couldn't confirm its ack
             # reached the hub, this successful beat just carried the ack
             # (ackedCommands rides every payload), so it's now safe to restart.
@@ -29017,8 +29356,7 @@ class SessionManager:
                     # reply is processed once more; cmdId de-dup stops repeats.
                     # `light` keeps this follow-up cheap — its only job is to
                     # reflect the command results, reusing the caches.
-                    reply2 = self.post(self.build_payload(beat, light=True))
-                    beat += 1
+                    reply2 = self._beat_once(beat, light=True)
                     if reply2 is not None:
                         self._ingest_peers(reply2.get("peers"))
                         self.handle_commands(reply2.get("commands"))
@@ -29027,8 +29365,9 @@ class SessionManager:
                     # wait a whole interval for the top-of-loop check.
                     self._restart_if_delivered(reply2 is not None)
             # Interruptible sleep: returns immediately if a poke arrived, else
-            # after the normal interval.
-            _poke.wait(INTERVAL)
+            # after the normal interval. Its answer is what makes the NEXT beat
+            # light — Event.wait() returns True only when the flag was set.
+            poked = _poke.wait(INTERVAL)
 
 
 def main():
