@@ -48,9 +48,15 @@ composed.**
     try/except so one wedged session can't starve the rest.
   - **`defer_record=True` does the delivery but stages the outbox RECORD onto `input_landed` for the
     BEAT** to apply (`_apply_landed_inputs` → `_record_delivered_input`: naming + `pendingInputs`
-    append + `save()`). This keeps "only the beat mutates the registry / `self.summaries` / saves"
-    intact — the same line the PR-comment fetch/deliver split draws (`CLAUDE.md`). Direct callers
-    (`notify_session`'s pane fallback, tests) leave `defer_record` False and record inline, on the beat.
+    append + `save()`). So the worker WRITES nothing to the registry and never `save()`s — the same
+    "only the beat writes+saves the registry" line the PR-comment fetch/deliver split draws
+    (`CLAUDE.md`). Its ONE in-memory registry touch is `_clear_trust_dialog` clearing
+    `trustCheckUntil` (a benign key pop, never saved; `save()`'s C `json.dump` holds the GIL over the
+    JSON-native records, so a concurrent pop cannot tear it) — do NOT grow the worker to write
+    records or `save()`, and do NOT add a beat-side full-`sess`-dict iteration that a pop could race.
+    Direct callers (`notify_session`'s pane fallback, tests) leave `defer_record` False and record
+    inline, on the beat. **Off-beat pane typing is the established qwen-peer pattern** (`_type_into_pane`
+    on `_qwen_peer_worker_loop`), so no new pane-serialization lock is added.
   - The compaction outbox (`pendingInputs`) still covers delivery — it is written a beat after the
     pane got the message, a tiny window narrower callers already tolerated.
   - The Windows `_pty_inject` retry loop is ALSO wall-clock bounded (`PTY_SUBMIT_DEADLINE_SEC`,

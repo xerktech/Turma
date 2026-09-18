@@ -15400,9 +15400,13 @@ class SessionManager:
         self._dsh_peer_worker = None
         # Operator `input` delivery is staged here and run OFF THE BEAT (XERK-867):
         # the worker does the network/pane work (uploads fetch, trust-clear, the
-        # Windows multi-line settle+retry paste) and, since only the beat may
-        # mutate the registry and save() (the prune/dsh-peer worker discipline),
-        # stages the outbox record onto `input_landed` for the beat to apply.
+        # Windows multi-line settle+retry paste) and stages the outbox record onto
+        # `input_landed` for the BEAT to apply, so the append to pendingInputs, the
+        # naming and save() stay the beat's (the prune/dsh-peer worker discipline).
+        # The worker's only in-memory registry touch is _clear_trust_dialog popping
+        # `trustCheckUntil` — a benign key removal that never save()s (save()'s C
+        # json.dump holds the GIL over these JSON-native records, so a concurrent
+        # pop cannot tear it); do NOT grow the worker to write records or save().
         self.input_queue = []                    # [(sid, text, uploads)] to deliver
         self.input_landed = []                   # [(sid, typed, text)] to record on the beat
         self._input_lock = threading.Lock()
@@ -21706,11 +21710,13 @@ class SessionManager:
         `defer_record` is set by the off-beat input worker (XERK-867): it does
         the same delivery, but instead of recording the outbox entry + naming the
         session + save()ing INLINE, it stages the record onto `input_landed` for
-        the BEAT to apply (`_apply_landed_inputs`), so the worker never mutates
-        the registry, touches self.summaries, or races save() — the same "only
-        the beat mutates the registry" discipline prune/archive/dsh-peer keep.
-        Direct callers (notify_session's fallback, tests) leave it False and are
-        already on the beat, so they record inline as before.
+        the BEAT to apply (`_apply_landed_inputs`) — so the worker RECORDS nothing
+        (no pendingInputs write, no naming/self.summaries touch, no save()), the
+        same "only the beat writes+saves the registry" discipline prune/archive/
+        dsh-peer keep. (Its one in-memory registry touch is _clear_trust_dialog
+        clearing `trustCheckUntil`, a benign key pop that never save()s.) Direct
+        callers (notify_session's fallback, tests) leave it False and are already
+        on the beat, so they record inline as before.
 
         Machine-generated messages go to notify_session instead (XERK-340): the
         pane is what a person types into, and what this manager composes has a
