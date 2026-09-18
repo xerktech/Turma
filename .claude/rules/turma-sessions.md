@@ -25,7 +25,34 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
   at load state this way).
 - Opens a running session in a **native chat view by default** (`chat.js`), not the raw ttyd
   terminal, over `/live/<host>/<id>` (ws-token auth, seeded from the cached tail, `/history` scrollback
-  + poll fallback when the socket is down).
+  + a poll fallback).
+  - **The fallback is gated on DATA LIVENESS, never on `ws.readyState`** (`liveDelivering`). The hub
+    HOLDS a `/live` socket across a control-channel flap and pings it every 30s, so an
+    open-but-silent socket — one the hub accepted and never armed an agent watch behind — is
+    indistinguishable from a healthy feed on a quiet session, and gating the poll on the socket
+    being DOWN is what made a broken chat unrepairable for as long as it was left open. Three
+    questions, in order of what they prove: is the socket up; did the hub ACK an arm (or has a delta
+    ever arrived, which proves the same of an older hub); and — **only while the HEARTBEAT reads
+    the session busy** (`paneBusy` or live `agents`, XERK-245, never `liveStatus`, which the
+    suspect socket itself feeds) — has anything landed within `LIVE_STALE_MS`. A quiet session
+    legitimately sends nothing; a working one cannot.
+  - **A silent-but-open socket is REPLACED, not merely routed around** — nothing else would ever
+    close it (`onclose` never fires), cooled down by `LIVE_RECONNECT_COOLDOWN_MS`.
+  - **The hub ACKS every `/live` subscription with `{type:"watch", armed, reason?}`** and re-sends
+    it whenever the answer changes: armed on a control reconnect, unarmed when the tunnel drops,
+    unarmed when the agent NACKs the watch (`{watchFailed}`, `agent-tunnel.md`). `reason` is the
+    hub's own words (XERK-264 shape).
+  - **Every subscriber arms, not just the first** (`armLiveWatcher`), and **a session the hub could
+    not arm yet is armed on the beat that first describes it** (`rearmMovedWatches`' never-armed
+    branch, tracked in `liveWatchArmed`). `watchTargetFor` needs a `worktreePath`, so a chat opened
+    on a just-spawned session used to arm nothing and the move-detector then skipped it for being
+    absent from the previous beat — no live feed for that chat's whole life.
+  - **`/history` serves a fresh cache AND refreshes behind the answer** past
+    `HISTORY_REFRESH_AFTER_MS`. The fresh-cache branch used to return with nothing queued (the
+    archive fast path and the queue-and-202 path both sit below it), so a client polling every 6s
+    re-read the same five-minute-old body forever.
+  - Tests: the `live WS:` arm/ack cases in `server.test.js`, the liveness cases in
+    `chat-live.test.js`.
   - **`/history` for a RUNNING session is served INSTANTLY from the hub's durable archive** on a cache
     miss (`archiveHistory` in `server.js`), not by round-tripping to the agent — the agent keeps a
     worktree-backed running session's rendered transcript syncing to the archive

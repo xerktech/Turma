@@ -13,6 +13,32 @@ Python side in `.claude/rules/agent.md`.
   per-host control channel, which also carries the **live transcript tail** (`{watch}`/`{unwatch}`,
   ~1s, `{tail,entries}` deltas). Tailing runs only while a client watches.
 
+### The tail frame is a DELTA, and a watch either snapshots or NACKs
+
+- **`{tail,entries}` carries only entries whose id is NEW or whose weight GREW** since the last
+  frame on this channel (`w.sent`, id → weight last sent). It used to be the whole `TAIL_MSGS`
+  window re-serialized on every transcript change — tens to hundreds of KB/s per watched session,
+  >95% bytes the browser already had, with the change test a string compare over those same huge
+  strings, on the event loop that also bridges terminal bytes. Every consumer is id-keyed and
+  grow-only (`mergeTail` in `chat.js` / `Transcript.kt`, the glasses buffer), so a delta merges
+  exactly as a snapshot did.
+- **An unchanged transcript costs NOTHING**: `transcriptTail`'s cache returns the SAME result
+  object, and the identity compare retires the whole section.
+- **`lastTail`/`sent` are committed only AFTER the frame serialized.** Marking a result differenced
+  first would make a transient `RangeError` (XERK-347/355) lose that delta for good — the cache
+  hands back the same object next poll, so the identity check would skip it forever.
+- **A RE-ARM resets the delta state and polls immediately** (`startWatch`'s existing-watcher path).
+  A re-arm means somebody is looking who has seen nothing on this channel — a control-channel flap
+  re-sends every watch, and a SECOND viewer re-sends that one — and the deltas they missed went down
+  a socket they were not on. Leaving `sent` alone is what left a re-armed watch on an IDLE session
+  silent forever: no delta is ever due while the transcript holds still.
+- **A watch the agent will not run is NACKed** (`nackWatch` → `{watchFailed, reason}`): no worktree
+  path, or at `MAX_WATCHERS`. It used to be a log line on the host alone, so the hub kept reporting
+  the session live-watched while the browser held an open, permanently silent socket — the one
+  state the chat's `/history` repair was gated OUT of. The hub turns it into `{type:"watch",
+  armed:false, reason}` for the viewer (`turma-sessions.md`).
+- Tests: the `live tail:` cases in `tunnel-agent.test.js`.
+
 ### Control-channel liveness
 
 - **Both ends prove the channel rather than assume it** — heartbeat is a fresh HTTP POST, the tunnel

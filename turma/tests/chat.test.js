@@ -173,6 +173,34 @@ test("buildItems: text-only entry with no blocks (older agent / seed) still bubb
   assert.deepEqual(items, [{ kind: "msg", role: "assistant", id: "a1", text: "legacy text", truncated: false }]);
 });
 
+// The heartbeat preview clips a long message to SESSION_TAIL_MSG_CHARS and now
+// SAYS so on the row (it is clipped per row, not per block). Without the flag
+// the bubble renders a message cut mid-word with no mark, and the operator
+// reads the cut as the message.
+test("buildItems: a truncated text-only row keeps its clip mark", () => {
+  const items = buildItems([{ id: "a1", role: "assistant", text: "cut off her", truncated: true }]);
+  assert.equal(items[0].truncated, true);
+  const html = withVerbosity("normal", () => itemsToHtml(items));
+  assert.match(html, /clipped to fit/);
+});
+
+// The seed the chat opens on used to be text-only, and _entry_text flattens a
+// tool call to the literal "[Bash]" — so the operator saw a prose bubble whose
+// whole content was "[Bash]". The preview carries real blocks now, at tighter
+// caps, and the SAME buildItems turns them into the same action card the live
+// tail produces.
+test("buildItems: a preview row's tool call renders as an action card, never as prose", () => {
+  const items = buildItems([{
+    id: "a1", role: "assistant", text: "running it[Bash]",
+    blocks: [{ t: "text", text: "running it" }, { t: "tool_use", name: "Bash", input: "ls" }],
+  }]);
+  assert.deepEqual(items.map((i) => i.kind), ["msg", "action"]);
+  assert.equal(items[0].text, "running it");
+  assert.equal(items[1].name, "Bash");
+  const html = withVerbosity("normal", () => itemsToHtml(items));
+  assert.ok(!html.includes("[Bash]"), "the flattened marker never reaches the page");
+});
+
 test("mergeTail: a text-only seed can't clobber an equal-text command-block copy", () => {
   // A command block keeps its content in name/args, which the old weight()
   // ignored — so the rich copy TIED its own flattened text and the `>=`

@@ -532,6 +532,14 @@ const CONTROL_PING_EVERY_MS = positiveEnv("CONTROL_PING_EVERY_MS", 30 * 1000);
 const CONTROL_DEAD_AFTER_MS = positiveEnv("CONTROL_DEAD_AFTER_MS", 90 * 1000); // 3 missed beats
 const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
+// ...but a cache entry over THIS age is served AND refreshed behind the answer.
+// /history is the chat's only repair path when the live tail stops delivering,
+// and the fresh-cache branch used to return without queueing anything: a client
+// polling every 6s got the identical five-minute-old body every time, so a chat
+// that had lost the live feed could never heal, no matter how long it sat there.
+// Serving stale-then-refreshing costs at most one agent round trip per session
+// per this interval (single-flighted against an already-queued `history`).
+const HISTORY_REFRESH_AFTER_MS = positiveEnv("HISTORY_REFRESH_AFTER_MS", 10 * 1000);
 const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
 const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted first
 // Newest N entries served when scrollback comes from the hub's durable archive
@@ -13714,6 +13722,21 @@ function watchTargetFor(host, sessionId) {
   return { worktreePath: sess.worktreePath, transcriptId: sess.transcriptId || null };
 }
 
+// Which (host, session) watches this replica has actually asked the agent for.
+// Cleared wholesale when the host's control channel drops, because the agent
+// forgets every watch with it — so "armed" only ever means "asked for over the
+// channel we hold NOW". Declared here, not beside its users, for the same
+// reason the ceilings above are: the state.json restore runs at module init.
+const liveWatchArmed = {};
+function markWatchArmed(host, sessionId) {
+  (liveWatchArmed[host] = liveWatchArmed[host] || {})[sessionId] = true;
+}
+function clearWatchArmed(host, sessionId) {
+  if (!liveWatchArmed[host]) return;
+  if (sessionId === undefined) delete liveWatchArmed[host];
+  else delete liveWatchArmed[host][sessionId];
+}
+
 // A watched session's conversation MOVED — "Restart (clear context)" relaunches
 // claude on a fresh transcript — so re-arm the agent's tail onto the new one.
 //
@@ -13729,13 +13752,25 @@ function rearmMovedWatches(host, prev, next) {
   const watched = liveClients[host];
   if (!cc || !watched) return;
   const before = new Map((prev?.sessions || []).map((s) => [s.id, s.transcriptId || null]));
+  const armed = liveWatchArmed[host] || {};
   for (const sess of next?.sessions || []) {
     if (!watched[sess.id] || !sess.worktreePath) continue;
     const now = sess.transcriptId || null;
-    // Only on a real move. An agent predating the pin reports null every beat,
-    // which is not a move — and re-arming on every beat would be a no-op anyway.
-    if (!before.has(sess.id) || before.get(sess.id) === now) continue;
+    // Never armed at all is the OTHER reason to send one, and it has nothing to
+    // do with a move: armLiveWatcher can only arm a session the last heartbeat
+    // described (watchTargetFor needs its worktreePath), so a chat opened on a
+    // session the hub has just learned about — a fresh spawn, a migration in, a
+    // host whose first beat is still in flight — armed NOTHING, and the `!before
+    // .has()` guard below then skipped it on the very beat that made it armable.
+    // Nothing else retried, so that chat had no live feed for its whole life.
+    const never = !armed[sess.id];
+    // Otherwise only on a real move. An agent predating the pin reports null
+    // every beat, which is not a move — and re-arming every beat would be a
+    // no-op anyway.
+    if (!never && (!before.has(sess.id) || before.get(sess.id) === now)) continue;
+    markWatchArmed(host, sess.id);
     cc.sendWatch(sess.id, { worktreePath: sess.worktreePath, transcriptId: now });
+    if (never) liveFanout(host, sess.id, { type: "watch", armed: true });
   }
 }
 
@@ -13772,10 +13807,33 @@ function armLiveWatcher(host, sessionId, socket) {
   const set = (byHost[sessionId] = byHost[sessionId] || new Set());
   const first = set.size === 0;
   set.add(socket);
-  if (first) {
-    const target = watchTargetFor(host, sessionId);
-    if (target && controlChannels[host]) controlChannels[host].sendWatch(sessionId, target);
+  // Arm on EVERY subscriber, not only the first. The frame is a delta and the
+  // agent's watch is idempotent (a re-arm resets its delta state and emits a
+  // full snapshot), so a second browser joining an already-watched session gets
+  // a snapshot instead of nothing — which is what it used to get on an idle
+  // session, forever, since no delta is due while the transcript holds still.
+  const target = watchTargetFor(host, sessionId);
+  const local = !!(target && controlChannels[host]);
+  if (local) {
+    markWatchArmed(host, sessionId);
+    controlChannels[host].sendWatch(sessionId, target);
   }
+  // Under HA the owner replica may be somewhere else, and an existing relay
+  // channel IS a live feed for this session (XERK-781) — so don't tell a second
+  // subscriber on the ORIGIN replica that nothing is armed. The FIRST one is
+  // told false and corrected a moment later: openLiveRelay makes the owner's own
+  // armLiveWatcher ack through the relay, which fans to every local subscriber.
+  const armed = local || !!liveRelayChannels[host]?.[sessionId];
+  // Tell the subscriber WHICH it got. A socket the hub accepts but never arms
+  // is indistinguishable, from the browser, from a healthy one on a quiet
+  // session — and the chat's /history repair only ran while the socket was
+  // DOWN, so an accepted-but-unarmed socket suppressed the one path that could
+  // have fixed it. `reason` is the operator's words (XERK-264 shape).
+  sendLive(socket, armed ? { type: "watch", armed: true } : {
+    type: "watch", armed: false,
+    reason: !controlChannels[host] ? "this host's tunnel is offline"
+      : "the host has not reported this session's worktree yet",
+  });
   return first;
 }
 
@@ -13788,6 +13846,7 @@ function disarmLiveWatcher(host, sessionId, socket) {
   s.delete(socket);
   if (s.size > 0) return;
   delete liveClients[host][sessionId];
+  clearWatchArmed(host, sessionId);
   if (controlChannels[host]) controlChannels[host].sendUnwatch(sessionId);
   // Origin side: no more local subscribers, so drop the relay channel feeding
   // them (which makes the owner unwatch in turn). No-op on the owner replica,
@@ -16762,7 +16821,17 @@ const server = http.createServer(async (req, res) => {
       // (single-flight) instead of piling up duplicates.
       if (req.method === "GET" && parts.length === 6 && parts[5] === "history") {
         const cached = (agents[key].history || {})[sessionId];
+        const pending = (agents[key].commands || [])
+          .find((c) => c.type === "history" && c.sessionId === sessionId);
         if (cached && Date.now() - cached.fetchedAt < HISTORY_FRESH_MS) {
+          // Serve it, then heal it. Without the queue below this branch is a
+          // dead end: the archive fast path and the queue-and-202 path both sit
+          // underneath it, so a poll that lands inside the freshness window
+          // starts NO refresh and the caller re-reads the same stale body for
+          // the next five minutes.
+          if (!pending && Date.now() - cached.fetchedAt >= HISTORY_REFRESH_AFTER_MS) {
+            queueCommand(key, { type: "history", sessionId });
+          }
           return json(res, 200, {
             entries: cached.entries,
             truncated: cached.truncated,
@@ -16770,8 +16839,6 @@ const server = http.createServer(async (req, res) => {
             fetchedAt: cached.fetchedAt,
           });
         }
-        const pending = (agents[key].commands || [])
-          .find((c) => c.type === "history" && c.sessionId === sessionId);
         // A RUNNING session's transcript is materialized in the hub's durable
         // archive (the agent keeps a worktree-backed running session syncing), so
         // serve scrollback from there INSTANTLY on a cache miss instead of making
@@ -17984,9 +18051,19 @@ server.on("upgrade", async (req, socket, head) => {
     // A fresh (or reconnected) tunnel doesn't know which sessions the hub still
     // has live watchers for — re-arm each so an agent restart / control-channel
     // flap doesn't silently stop the live stream to already-attached glasses.
+    clearWatchArmed(name); // the agent forgot every watch when the channel died
     for (const sessionId of Object.keys(liveClients[name] || {})) {
       const target = watchTargetFor(name, sessionId);
-      if (target) controlChannels[name].sendWatch(sessionId, target);
+      if (target) {
+        markWatchArmed(name, sessionId);
+        controlChannels[name].sendWatch(sessionId, target);
+        liveFanout(name, sessionId, { type: "watch", armed: true });
+      } else {
+        // No target yet — rearmMovedWatches picks this up on the beat that
+        // first describes the session. Say so meanwhile, so the viewer polls.
+        liveFanout(name, sessionId, { type: "watch", armed: false,
+          reason: "the host has not reported this session's worktree yet" });
+      }
     }
     // We are now the OWNER — the local watch above serves this host's /live
     // subscribers, so drop any origin relay channels we held for it (redundant,
@@ -18065,6 +18142,16 @@ server.on("upgrade", async (req, socket, head) => {
         // predating it, and the chat then falls back to `status.agents`.
         liveFanout(name, msg.turn, { type: "turn", text: msg.text, status: msg.status || null,
           agents: sanitizeLiveAgents(msg.agents) });
+      } else if (msg && typeof msg.watchFailed === "string" && msg.watchFailed) {
+        // The agent REFUSED a watch (no worktree on its side, or at
+        // MAX_WATCHERS). It used to just log that on the host, leaving the hub
+        // reporting the session live-watched and the browser holding an
+        // open-but-silent socket — the one state the chat's /history repair was
+        // gated OUT of. Now the viewer hears it and falls back to polling.
+        clearWatchArmed(name, msg.watchFailed);
+        liveFanout(name, msg.watchFailed, { type: "watch", armed: false,
+          reason: `this host could not tail the session (${safeString(msg.reason).slice(0, 200) ||
+            "no reason given"})` });
       }
     }, {
       onOverflow: (len) => {
@@ -18083,6 +18170,14 @@ server.on("upgrade", async (req, socket, head) => {
         // the pushed record's `terminalOnline` reflects the drop this instant on this
         // replica. No-op with HA off.
         retireHostTunnel(name);
+        // Every watch died with the channel, and nothing on the agent will
+        // speak again until a new one arms it. Say so to whoever is watching
+        // rather than leaving them on a socket the hub keeps open and pings.
+        clearWatchArmed(name);
+        for (const sessionId of Object.keys(liveClients[name] || {})) {
+          liveFanout(name, sessionId, { type: "watch", armed: false,
+            reason: "this host's tunnel is offline" });
+        }
         console.log(`tunnel gone: ${name}`);
         // Tunnel down — `terminalOnline` flipped back to false; push it.
         publishAgent(name);

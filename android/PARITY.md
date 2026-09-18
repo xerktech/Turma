@@ -685,6 +685,17 @@ those are marked `[MODEL]`.
 - P1 Composer base-branch dropdown + per-repo option persistence.
 
 ### Sessions + Chat (`sessions.html` + `chat.js` → `SessionsScreen`/`ChatScreen`)
+- **P1 Live-feed repair driven by DATA liveness (WEB ONLY for now).** The web chat no longer gates
+  its `/history` fallback on `ws.readyState`: it reads the hub's new `{type:"watch", armed, reason}`
+  ack, tracks when a frame last arrived, and — while the heartbeat reads the session busy — falls
+  back to polling AND forces a reconnect once the feed has been silent for `LIVE_STALE_MS`
+  (`liveDelivering` in `chat.js`; `.claude/rules/turma-sessions.md`). `LiveTail.kt` ignores the
+  `watch` frame (its `when (frame.type)` skips unknown types, so there is no decode risk) and
+  `ChatViewModel` still polls only around `LiveEvent.Connected(false)` — so an accepted-but-unarmed
+  or silently-wedged socket leaves an Android chat frozen exactly as the web one used to be. Mirror:
+  add `LiveEvent.Watch(armed, reason)`, and make the history poll's condition the same three-part
+  read. The tail-frame SEED fix (the heartbeat preview carrying `blocks`) needed no Android change —
+  `TailEntry.blocks` and `mergeTail`'s grow-only tie-break already consume it.
 - **P1 Restore an archived session onto another agent (XERK-441).** The web archive viewer's bar has
   a "Restore…" button with a host picker: `POST /api/archive/<transcriptId>/restore {host}` packs the
   session's archived raw files hub-side and drives the same `importSession` a move does, so a session

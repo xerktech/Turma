@@ -820,7 +820,7 @@ function transcriptTail(worktreePath, cache, transcriptId, agentState) {
 // The live control WebSocket the tail deltas ride back on, and the set of
 // sessions currently being tailed. Both owned by connectControl below.
 let controlWs = null;
-const watchers = new Map(); // sessionId -> { worktreePath, lastJson, timer }
+const watchers = new Map(); // sessionId -> { worktreePath, lastTail, sent, timer }
 
 // Tests substitute a sink here so the whole watch -> tail -> frame path can be
 // driven without a socket. The four cut points between scanAgentEntry and the
@@ -1574,7 +1574,11 @@ function pollWatcher(sessionId) {
   let tail = null;
   try { tail = transcriptTail(w.worktreePath, w.tailCache, w.transcriptId, w.agentState); }
   catch { tail = null; }
-  if (tail && (tail.entries.length || tail.queued.length)) {
+  // The cache hands back the SAME result OBJECT while the transcript is
+  // unchanged, so an identity compare retires the whole section on an idle
+  // session — no re-serialize, no re-compare, nothing on the event loop this
+  // process also bridges terminal bytes over.
+  if (tail && tail !== w.lastTail) {
     // The serialize is INSIDE the try, not beside it (XERK-347). A turn holding
     // BLOCK_MAX_PER_ENTRY SendUserFile deliveries builds a frame past V8's
     // ~512 MB string ceiling — previews are read from disk, so no transcript
@@ -1584,10 +1588,38 @@ function pollWatcher(sessionId) {
     // long as that session was watched. Skipping one frame is a stale tail; dying is
     // every session's terminal, live tail and heartbeat poke on this host.
     try {
-      const json = JSON.stringify(tail);
-      if (json !== w.lastJson) {
-        w.lastJson = json;
-        sendControl({ tail: sessionId, entries: tail.entries, queued: tail.queued });
+      // A DELTA, not a snapshot. This used to re-send the whole TAIL_MSGS
+      // window on every transcript change — tens to hundreds of KB a second per
+      // watched session, >95% of it bytes the browser already had, and the
+      // change test was a string compare over those same huge strings. Every
+      // consumer of the frame (chat.js mergeTail, android mergeTail, the
+      // glasses buffer) is id-keyed and GROW-ONLY, so a delta merges exactly
+      // like a snapshot did. `sent` is id -> the weight last sent, so an entry
+      // that GREW (a tool_result landing on a turn already shipped) re-sends
+      // and one that merely re-appeared in the window does not.
+      const entries = [];
+      const sent = new Map();
+      for (const e of tail.entries) {
+        const weight = JSON.stringify(e).length;
+        sent.set(e.id, weight);
+        if (w.sent.get(e.id) === weight) continue;
+        entries.push(e);
+      }
+      const queuedJson = JSON.stringify(tail.queued);
+      const queuedChanged = queuedJson !== w.lastQueued;
+      // Commit only once every entry serialized: a throw half way through must
+      // not leave ids recorded as sent that never went out (they would never be
+      // re-sent, and that entry would be missing from the chat for good).
+      // Pruned to the window, so a long-lived watch cannot grow this unbounded.
+      // `lastTail` is committed here for the same reason: marking the result
+      // differenced BEFORE it serialized would make a transient RangeError lose
+      // that delta for good (the cache hands back the same object next poll, so
+      // the identity check would skip it forever).
+      w.sent = sent;
+      w.lastTail = tail;
+      if (entries.length || queuedChanged) {
+        w.lastQueued = queuedJson;
+        sendControl({ tail: sessionId, entries, queued: tail.queued });
       }
     } catch (e) {
       log(`live tail: could not serialize ${sessionId}'s tail (${e && e.message}); skipping this frame`);
@@ -1640,8 +1672,20 @@ function pollWatcher(sessionId) {
   });
 }
 
+// Tell the hub a watch it asked for is NOT running, so it can say so to the
+// viewer instead of leaving a chat pinned on a feed that will never speak.
+// Every refusal below used to be a silent log on this host (XERK-395's sibling
+// failure mode): the hub kept reporting the session live-watched, the browser
+// kept an open-but-silent socket, and the /history repair path is gated on that
+// socket being DOWN — so the chat froze permanently with nothing to correct it.
+function nackWatch(sessionId, reason) {
+  log(`live tail: refusing watch for ${sessionId}: ${reason}`);
+  sendControl({ watchFailed: sessionId, reason });
+}
+
 function startWatch(sessionId, worktreePath, transcriptId) {
-  if (!sessionId || !worktreePath) return;
+  if (!sessionId) return;
+  if (!worktreePath) return nackWatch(sessionId, "no worktree path");
   const existing = watchers.get(sessionId);
   if (existing) {
     // A re-armed watch (control-channel flap) carries the hub's current view of
@@ -1653,14 +1697,28 @@ function startWatch(sessionId, worktreePath, transcriptId) {
     // launch truncates it), so re-detect the runtime; the offset reset in
     // pollDshTurn handles a rewritten file.
     existing.dshEvents = dshEventsPath(worktreePath, transcriptId || null);
+    // A re-arm means somebody is looking who has seen NOTHING on this channel:
+    // a control-channel flap re-sends every watch, and a SECOND viewer joining
+    // an already-watched session re-sends that one. The frame is a delta, and
+    // the deltas both of them missed were sent down a socket they were not on —
+    // so forget what was sent and emit a full snapshot NOW. Leaving `sent`
+    // alone is what left a re-armed watch on an IDLE session silent forever
+    // (the tail is unchanged, so no delta is ever due).
+    existing.sent = new Map();
+    existing.lastTail = null;
+    existing.lastQueued = null;
+    existing.lastTurn = "";
+    pollWatcher(sessionId);
     return; // already tailing
   }
   if (watchers.size >= MAX_WATCHERS) {
-    log(`live tail: at MAX_WATCHERS (${MAX_WATCHERS}); ignoring watch for ${sessionId}`);
-    return;
+    return nackWatch(sessionId, `at MAX_WATCHERS (${MAX_WATCHERS})`);
   }
   const w = { worktreePath, transcriptId: transcriptId || null,
-    lastJson: null, lastTurn: "", timer: null,
+    // Delta state: the tail result object last differenced, id -> weight last
+    // sent, and the last `queued` list serialized. See pollWatcher.
+    lastTail: null, sent: new Map(), lastQueued: null,
+    lastTurn: "", timer: null,
     liveGen: false, livePending: false, // busy->idle blip hold; see liveTurnDecision
     heldText: "", // uncommitted prose held across paint gaps; see resolveLiveText
     // dsh live stream state (null dshEvents = a claude session): the native
