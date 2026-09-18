@@ -35,6 +35,28 @@ composed.**
 - **`send_input` is the OPERATOR's path** — what the manager itself composes goes to
   `notify_session` (below). This is what took the per-beat transcript read off every session a PR
   poller wrote to.
+- **The `input` COMMAND is delivered OFF THE BEAT** (XERK-867), the dsh/qwen peer-worker pattern.
+  `handle_commands` runs on the heartbeat loop, and delivery is a chain of ~5s-class pane RPCs — the
+  Windows multi-line paste's settle+retry loop (`_pty_inject`) worst — whose cost ate most of the
+  XERK-395 budget, with no per-cycle cap on how many `input`s a beat runs, so N queued inputs crossed
+  `OFFLINE_AFTER_MS` and flapped a healthy host offline. So:
+  - `handle_commands` only `_stage_input`s onto `input_queue` (bounded `INPUT_QUEUE_MAX`, drops OLDEST
+    loudly — an operator message is precious, but an unbounded queue behind a wedged worker is worse)
+    and ACKs — the command is off the hub's queue, delivered later (the accepted ack-vs-delivery gap).
+  - `_input_worker_loop` (started once in `run_forever`, mirrors `_start_dsh_peer_worker`) drains via
+    `_deliver_staged_inputs`, calling `send_input(..., defer_record=True)` per item — a per-item
+    try/except so one wedged session can't starve the rest.
+  - **`defer_record=True` does the delivery but stages the outbox RECORD onto `input_landed` for the
+    BEAT** to apply (`_apply_landed_inputs` → `_record_delivered_input`: naming + `pendingInputs`
+    append + `save()`). This keeps "only the beat mutates the registry / `self.summaries` / saves"
+    intact — the same line the PR-comment fetch/deliver split draws (`CLAUDE.md`). Direct callers
+    (`notify_session`'s pane fallback, tests) leave `defer_record` False and record inline, on the beat.
+  - The compaction outbox (`pendingInputs`) still covers delivery — it is written a beat after the
+    pane got the message, a tiny window narrower callers already tolerated.
+  - The Windows `_pty_inject` retry loop is ALSO wall-clock bounded (`PTY_SUBMIT_DEADLINE_SEC`,
+    `.claude/rules/windows-agent.md`), so one wedged paste can't tie up the worker either.
+  - Tests: `TestOffBeatInputDelivery`, `TestPtyInjectDeadline`, and `TestHandleCommandsInputHistory`
+    (the `input` command now STAGES, does not call `send_input` inline).
 - **File attachments ride this command** (XERK-234): `send_input` fetches each hub-staged upload
   into `~/.turma/uploads/<sessionId>/` — **never a worktree**, where it would read as uncommitted
   work `prune`/`delete` key on — then prefixes the message with their PATHS. Name sanitized on BOTH

@@ -16510,7 +16510,11 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
 
 
 class TestHandleCommandsInputHistory(ManagerMixin, unittest.TestCase):
-    def test_dispatches_input_and_history_and_acks_both(self):
+    def test_stages_input_off_the_beat_dispatches_history_and_acks_both(self):
+        # XERK-867: an `input` command is only ENQUEUED on the beat — a worker
+        # delivers it — so handle_commands does NOT call send_input inline. It is
+        # still acked in the same call (the command is off the hub's queue) and
+        # `history` still dispatches directly.
         sm = self.make_manager()
         sm.save = mock.Mock()
         sm.send_input = mock.Mock()
@@ -16520,13 +16524,15 @@ class TestHandleCommandsInputHistory(ManagerMixin, unittest.TestCase):
             {"cmdId": "h1", "type": "history", "sessionId": "s1"},
         ]
         self.assertTrue(sm.handle_commands(cmds))
-        sm.send_input.assert_called_once_with("s1", "hi", uploads=None)
+        sm.send_input.assert_not_called()
+        self.assertEqual(sm.input_queue, [("s1", "hi", None)])
         sm._stage_history.assert_called_once_with("s1")
         self.assertEqual(sm.acked, {"i1", "h1"})
 
-    def test_an_input_command_carries_its_attachments_through(self):
+    def test_an_input_command_carries_its_attachments_through_to_delivery(self):
         # The hub names the staged files on the command (XERK-234); the agent is
-        # what fetches and writes them.
+        # what fetches and writes them. They ride the staged queue entry and reach
+        # send_input when the worker drains it (XERK-867).
         sm = self.make_manager()
         sm.save = mock.Mock()
         sm.send_input = mock.Mock()
@@ -16535,7 +16541,13 @@ class TestHandleCommandsInputHistory(ManagerMixin, unittest.TestCase):
             {"cmdId": "i2", "type": "input", "sessionId": "s1", "text": "look",
              "uploads": ups},
         ]))
-        sm.send_input.assert_called_once_with("s1", "look", uploads=ups)
+        sm.send_input.assert_not_called()
+        self.assertEqual(sm.input_queue, [("s1", "look", ups)])
+        # Draining the queue (the worker's job) delivers with defer_record set and
+        # the attachments intact.
+        sm._deliver_staged_inputs()
+        sm.send_input.assert_called_once_with("s1", "look", uploads=ups,
+                                              defer_record=True)
 
     def test_dispatches_interrupt(self):
         sm = self.make_manager()
@@ -16565,6 +16577,142 @@ class TestHandleCommandsInputHistory(ManagerMixin, unittest.TestCase):
         self.assertTrue(sm.handle_commands(cmds))
         sm.answer_question.assert_called_once_with("s1", -1, None, [0, 2])
         self.assertEqual(sm.acked, {"a2"})
+
+
+class TestOffBeatInputDelivery(ManagerMixin, unittest.TestCase):
+    """XERK-867: operator `input` is delivered by a worker, off the beat; the beat
+    only records the outbox. Keeps the Windows multi-line paste's ~5s-class RPC
+    chain from eating the XERK-395 budget and flapping a healthy host offline."""
+
+    def _running(self, sm, sid="s1"):
+        sess = {"id": sid, "status": "running", "tmuxName": f"agent-{sid}",
+                "summary": "named", "summaryStarted": True}
+        sm.registry = [sess]
+        return sess
+
+    def test_stage_input_enqueues_and_wakes_the_worker(self):
+        sm = self.make_manager()
+        sm._input_wake.clear()
+        sm._stage_input("s1", "hi", uploads=[{"id": "u1"}])
+        self.assertEqual(sm.input_queue, [("s1", "hi", [{"id": "u1"}])])
+        self.assertTrue(sm._input_wake.is_set())
+
+    def test_stage_input_ignores_a_missing_session_id(self):
+        sm = self.make_manager()
+        sm._stage_input(None, "hi")
+        sm._stage_input("", "hi")
+        self.assertEqual(sm.input_queue, [])
+
+    def test_stage_input_drops_the_oldest_past_the_cap(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "INPUT_QUEUE_MAX", 3):
+            for i in range(5):
+                sm._stage_input("s1", f"m{i}")
+        # Oldest two dropped; the newest three survive, in order.
+        self.assertEqual([t[1] for t in sm.input_queue], ["m2", "m3", "m4"])
+
+    def test_worker_delivers_each_with_defer_record_in_order(self):
+        sm = self.make_manager()
+        seen = []
+        sm.send_input = mock.Mock(side_effect=lambda *a, **k: seen.append(a[1]))
+        sm._stage_input("s1", "first")
+        sm._stage_input("s1", "second")
+        sm._deliver_staged_inputs()
+        self.assertEqual(seen, ["first", "second"])
+        for c in sm.send_input.call_args_list:
+            self.assertTrue(c.kwargs.get("defer_record"))
+        self.assertEqual(sm.input_queue, [])
+
+    def test_one_wedged_delivery_does_not_starve_the_rest(self):
+        sm = self.make_manager()
+        seen = []
+
+        def deliver(sid, text, uploads=None, defer_record=False):
+            if text == "boom":
+                raise RuntimeError("wedged")
+            seen.append(text)
+        sm.send_input = mock.Mock(side_effect=deliver)
+        for t in ("boom", "ok"):
+            sm._stage_input("s1", t)
+        sm._deliver_staged_inputs()          # must not raise
+        self.assertEqual(seen, ["ok"])
+
+    def test_defer_record_stages_the_outbox_instead_of_recording_it(self):
+        # send_input(defer_record=True) delivers to the pane but leaves the outbox
+        # write + naming + save() to the beat, so the worker never mutates the
+        # registry or calls save().
+        sm = self.make_manager()
+        sess = self._running(sm)
+        sm.save = mock.Mock()
+        sm.send_input("s1", "hello", defer_record=True)
+        self.assertEqual(self.run_stdin_calls[-1][1], "hello")  # it WAS typed
+        self.assertEqual(sm.input_landed, [("s1", "hello", "hello")])
+        self.assertNotIn("pendingInputs", sess)                 # NOT recorded here
+        sm.save.assert_not_called()
+
+    def test_apply_landed_inputs_records_the_outbox_on_the_beat(self):
+        sm = self.make_manager()
+        sess = self._running(sm)
+        sm.save = mock.Mock()
+        sm.input_landed = [("s1", "hello", "hello")]
+        sm._apply_landed_inputs()
+        self.assertEqual(sess["pendingInputs"][-1]["text"], "hello")
+        self.assertEqual(sess["pendingInputs"][-1]["attempts"], 1)
+        sm.save.assert_called()
+        self.assertEqual(sm.input_landed, [])
+
+    def test_apply_landed_inputs_skips_a_session_that_ended(self):
+        sm = self.make_manager()
+        sess = self._running(sm)
+        sess["status"] = "stopped"
+        sm.save = mock.Mock()
+        sm.input_landed = [("s1", "hello", "hello")]
+        sm._apply_landed_inputs()
+        self.assertNotIn("pendingInputs", sess)
+        sm.save.assert_not_called()
+
+    def test_apply_landed_inputs_names_an_unnamed_session_on_the_beat(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+                "summary": None}
+        sm.registry = [sess]
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm.input_landed = [("s1", "Add a flag", "Add a flag")]
+            sm._apply_landed_inputs()
+        start.assert_called_once_with(sess, "Add a flag")
+
+
+class TestPtyInjectDeadline(unittest.TestCase):
+    """XERK-867: the Windows multi-line submit-retry loop is bounded by a
+    wall-clock deadline, not only by an iteration count times a ~5s control
+    timeout."""
+
+    def _drive(self, deadline):
+        captures = []
+
+        def cap(_name):
+            captures.append(1)
+            return "[Pasted text +2 lines]"        # chip persists, never busy
+
+        with mock.patch.object(ha, "PTY_SUBMIT_DEADLINE_SEC", deadline), \
+                mock.patch.object(ha, "_pty_control",
+                                  return_value={"ok": True}) as ctl, \
+                mock.patch.object(ha, "_capture_pane", side_effect=cap), \
+                mock.patch.object(ha, "_busy_from_capture", return_value=False), \
+                mock.patch.object(ha.time, "sleep", lambda *_a: None):
+            ha._pty_inject("agent-s1", "line one\nline two")
+        return len(captures), ctl
+
+    def test_a_zero_deadline_halts_the_retry_loop_immediately(self):
+        # The loop check fires before the first capture, so a wedged host pays no
+        # retry captures at all.
+        n, _ = self._drive(0.0)
+        self.assertEqual(n, 0)
+
+    def test_a_generous_deadline_runs_the_bounded_retries(self):
+        # With time to spare it still stops at PTY_SUBMIT_MAX_RETRIES captures.
+        n, _ = self._drive(9999.0)
+        self.assertEqual(n, ha.PTY_SUBMIT_MAX_RETRIES)
 
 
 class TestInputMaxCharsPayload(ManagerMixin, unittest.TestCase):

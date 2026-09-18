@@ -89,6 +89,15 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
   and keeps the immediate-Enter fast path. **Do NOT "simplify" to an atomic paste+`\r` in one inject
   (`submit:true`)** — that removes the settle and submitted 0/4. Tests: the `_pty_inject` cases in
   `TestWindowsTerminalBackend`.
+- **The multi-line retry loop is bounded by a WALL CLOCK, not just the iteration count** (XERK-867,
+  `PTY_SUBMIT_DEADLINE_SEC`): each iteration's `_capture_pane` + Enter is a ~5s-class control RPC, so
+  `PTY_SUBMIT_MAX_RETRIES` alone let one degraded multi-line paste run ~15-30s. That was load-bearing
+  when delivery ran inline on the beat (it blew the XERK-395 budget and flapped a healthy host
+  offline); `input` delivery now runs off the beat on `_input_worker_loop`
+  (`.claude/rules/agent-input.md`), so the deadline is defense-in-depth — it keeps one wedged paste
+  from tying up the WORKER on pointless retries. A single in-flight RPC can still overshoot it by one
+  control timeout (a deadline's known limit, `CLAUDE.md`), fine off the beat. Tests:
+  `TestPtyInjectDeadline`.
 - **`_launch_tmux` translates its POSIX shell command into argv + an env dict** on Windows (node-pty
   spawns claude directly, no shell): the `VAR=x` env-assignment prefix → env entries; the failover
   `set -a; . <local-model.env>` → `_read_env_file` merged into the env dict (the gateway credential
