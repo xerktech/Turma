@@ -279,6 +279,51 @@ test("buildItems: non-completed task_notification flags its result as an error",
   assert.equal(items[0].result.text, "status: failed");
 });
 
+test("onPoll re-seeds: a held-open view upgrades a stale preview entry", () => {
+  // The web read `session.tail` ONCE, in open(), and the fleet payload is polled
+  // once at load while SSE is healthy — so a view left open kept whatever the
+  // preview said at open, forever. Anything that later improved the preview (a
+  // fixed agent, a host returning, blocks that had not been built yet) never
+  // reached the buffer, and only closing and reopening the session cured it.
+  // Android re-merges the seed on every poll, which is why the two clients
+  // disagreed about the SAME conversation: the phone healed in a beat, the
+  // browser never did.
+  const flat = [{ id: "a1", role: "assistant", text: "checking[Bash]", blocks: [] }];
+  const rich = [{ id: "a1", role: "assistant", text: "checking[Bash]", blocks: [
+    { t: "text", text: "checking" },
+    { t: "tool_use", id: "t1", name: "Bash", input: "git log" }] }];
+
+  // What open() would have left in the buffer, pre-fix. The flat text still
+  // produces a card — degradedBlocks reconstructs one from the trailing "[Bash]"
+  // marker — but a NAME-ONLY one, with no command and no output. That empty
+  // title row IS the "lines" the operator reported: it looks expandable and has
+  // nothing inside, so `verbose` reveals exactly what `normal` did.
+  let buffer = mergeTail([], flat);
+  let act = buildItems(buffer).find((i) => i.kind === "action");
+  assert.ok(act, "the marker still reconstructs a card");
+  assert.ok(act.degraded, "...but a degraded, name-only one");
+  assert.equal(act.input, "", "no command to show");
+  assert.equal(act.result, null, "and no output to expand");
+
+  // A later beat carries the improved preview: re-merging must upgrade it.
+  buffer = mergeTail(buffer, rich);
+  act = buildItems(buffer).find((i) => i.kind === "action");
+  assert.ok(!act.degraded, "re-seeding replaces it with the real card");
+  assert.equal(act.input, "git log", "which carries the actual command");
+
+  // Re-merging is GROW-ONLY, so it can never undo the live tail or /history.
+  buffer = mergeTail(buffer, flat);
+  assert.ok(buildItems(buffer).some((i) => i.kind === "action"),
+    "a later flat preview must not downgrade a rich entry");
+
+  // And an unchanged preview must not look like a change — otherwise every beat
+  // repaints the whole transcript on a session that is doing nothing.
+  const sig = (b) => b.length + ":" + b.reduce((n, e) => n + weight(e), 0);
+  const steady = mergeTail(buffer, flat);
+  assert.equal(sig(steady), sig(buffer),
+    "an unchanged preview re-merges to an identical buffer (no repaint)");
+});
+
 test("XERK-860: hidden thinking announces itself but does NOT carry the trace", () => {
   // The default verbosity hides thinking while the terminal always shows it, so a
   // quiet turn and an elided one used to look identical (renderThought returned

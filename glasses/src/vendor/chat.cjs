@@ -3622,6 +3622,38 @@
     if (!s) return;
     sess = s;
     if (a) agent = a;
+    // RE-SEED from the heartbeat preview, not only at open().
+    //
+    // `open()` merged `session.tail` once and nothing ever read it again, while
+    // the fleet payload is polled ONCE at load whenever SSE is healthy — so a
+    // view held open kept whatever the preview said at open, for as long as it
+    // stayed open. Anything that later IMPROVED the preview (a fixed agent, a
+    // host coming back, an entry whose blocks were not built yet) never reached
+    // the buffer, and the only cure was closing and reopening the session.
+    // Android re-merges the seed on every poll, which is why the two clients
+    // disagreed about the same conversation: the phone healed within a beat and
+    // the browser did not heal at all.
+    //
+    // Safe to repeat: mergeTail is GROW-ONLY and keyed by entry id, so a re-merge
+    // can only add entries or replace one with a richer copy of itself. It can
+    // never downgrade what the live tail or /history already delivered — the
+    // rule that lets the seed and the live feed share one buffer in the first
+    // place — and an unchanged preview re-merges to an identical buffer, so a
+    // steady session pays a keyed walk of a bounded list and repaints nothing
+    // (the per-item HTML memo sees the same units).
+    const seed = s.tail;
+    if (Array.isArray(seed) && seed.length) {
+      // Repaint only when the merge actually ADDED or ENRICHED something. A
+      // reference compare will not do: mergeTail always returns a fresh array,
+      // and its `weight(inc) >= weight(cur)` tie-break swaps in the incoming
+      // object even when the two are identical — so every beat would look like a
+      // change and repaint the transcript on a session that is doing nothing.
+      // Count + total weight is the cheap content signature (a bounded list).
+      const sig = (b) => b.length + ":" + b.reduce((n, e) => n + weight(e), 0);
+      const before = sig(buffer);
+      buffer = mergeTail(buffer, seed);
+      if (sig(buffer) !== before) repaint();
+    }
     setHeader(s, agent);
     updateQuestion(s);
     renderComposeOpts(true);
