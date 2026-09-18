@@ -39,7 +39,34 @@ export function emptyBuffer(): TranscriptBuffer {
 // Only assistant turns carry the markers (tool_use blocks never appear in user
 // turns, and tool_result blocks are already dropped upstream), so user text is
 // left untouched by conciseEntry.
-const TOOL_MARKER = /(?<![ \t])(?:\[[A-Za-z][A-Za-z0-9_-]*\])+$/;
+//
+// Done with a hand-written reverse scan rather than a regex on purpose: an
+// unanchored `(?:\[…\])+$` backtracks O(n²) on bracket-heavy text that does NOT
+// end in a marker (e.g. "[x]"×N + ".") — a ReDoS on this per-poll ingest path,
+// which has no length clamp (assistant entries run up to INPUT_MAX_CHARS). This
+// scan is linear: it peels whole markers off the end and stops at the first
+// char that isn't part of one, touching no character more than once.
+function isNameChar(c: string): boolean {
+  return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c === "_" || c === "-";
+}
+function isAlpha(c: string): boolean {
+  return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z");
+}
+function stripTrailingToolMarkers(text: string): string {
+  let start = text.length; // start of the trailing marker run, walked leftward
+  while (start > 0 && text[start - 1] === "]") {
+    // A marker is `[` + a name (first char a letter, rest name-chars) + `]`.
+    let j = start - 2;
+    while (j >= 0 && isNameChar(text[j]!)) j--;
+    if (j < 0 || text[j] !== "[" || !isAlpha(text[j + 1]!)) break; // not a marker
+    start = j; // this marker spans [j, start-1]; keep peeling the one before it
+  }
+  if (start === text.length) return text; // no trailing marker run
+  // A real marker abuts its text or a line break; ordinary prose ("the plan
+  // [WIP]") puts a space/tab before its bracket, so a run so preceded is kept.
+  if (start > 0 && (text[start - 1] === " " || text[start - 1] === "\t")) return text;
+  return text.slice(0, start);
+}
 
 // Markdown syntax renders as literal noise on the tiny monochrome display: the
 // glasses can't show weight, so bold `**…**` and inline `` `code` `` fences add
@@ -77,7 +104,7 @@ function collapseBlankLines(text: string): string {
 }
 
 export function conciseText(text: string): string {
-  const stripped = stripMarkdown(text.replace(TOOL_MARKER, ""));
+  const stripped = stripMarkdown(stripTrailingToolMarkers(text));
   return collapseBlankLines(stripped).replace(/[ \t]+$/gm, "").trim();
 }
 

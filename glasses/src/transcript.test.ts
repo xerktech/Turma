@@ -116,6 +116,23 @@ describe("concise ingest (matches the web chat's Concise verbosity)", () => {
     expect(conciseText("plain reply")).toBe("plain reply");
   });
 
+  it("strips a trailing marker abutting a line break, keeps one after a space", () => {
+    expect(conciseText("did a thing\n[Bash]")).toBe("did a thing");
+    expect(conciseText("the plan\t[WIP]")).toBe("the plan\t[WIP]");
+  });
+
+  it("runs in linear time on bracket-heavy text (no ReDoS on the ingest path)", () => {
+    // The trailing-run scan must not backtrack: a large entry (up to the
+    // INPUT_MAX_CHARS ceiling) that is mostly [word] tokens but does NOT end in
+    // a marker used to stall the per-poll merge loop for seconds (XERK-862).
+    const heavy = "[Bash]".repeat(16000) + "."; // ~96k chars, no trailing marker
+    const withDangle = "[Bash]".repeat(16000) + "x]"; // ends in ] but not a marker
+    const t0 = performance.now();
+    expect(conciseText(heavy)).toBe(heavy); // nothing to strip -> returned verbatim
+    expect(conciseText(withDangle)).toBe(withDangle);
+    expect(performance.now() - t0).toBeLessThan(100);
+  });
+
   it("strips tool markers from assistant entries on the way into the buffer", () => {
     const buf = mergeTail(emptyBuffer(), [entry("1", "compiling done[Bash]")]);
     expect(buf.entries[0]?.text).toBe("compiling done");
