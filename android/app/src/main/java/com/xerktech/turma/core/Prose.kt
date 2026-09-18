@@ -125,46 +125,47 @@ internal fun isJsBlank(s: String): Boolean = s.all { isJsSpace(it) }
 
 private fun isSpaceAt(s: String, i: Int): Boolean = i < 0 || i >= s.length || isJsSpace(s[i])
 
-// Delimiter runs are counted only as far as the longest run that can change a
-// decision (`***`); see chat.js's cost note. Counting a 100k-character run in
-// full, once per position, is quadratic — measured in seconds on the JVM too.
-private const val MARK_RUN_MAX = 3
+// Linearity rests on the per-line `noClose` memo below and on EMPH_MAX_DEPTH.
+// Capping how far a run is counted was tried and REVERTED in both ports: it
+// bought nothing the memo doesn't already give and it changed output.
 private const val EMPH_MAX_DEPTH = 8
 
 private fun markRun(s: String, i: Int): Int {
     val c = s[i]
     var n = 0
-    while (n < MARK_RUN_MAX && i + n < s.length && s[i + n] == c) n++
+    while (i + n < s.length && s[i + n] == c) n++
     return n
 }
 
-private fun findEmphClose(s: String, from: Int, c: Char, len: Int, exact: Boolean): Int {
+/**
+ * The index of the next right-flanking closing run of [c] at or after [from], or
+ * -1. [memo] is the per-line "no closer of this kind left" cache, keyed on where
+ * the ENTRY-INDEPENDENT part of the scan starts — see chat.js findEmphClose for
+ * why that distinction is the soundness argument.
+ */
+private fun findEmphClose(
+    s: String, from: Int, c: Char, len: Int, exact: Boolean, memo: HashMap<String, Int>,
+): Int {
     var j = from
+    if (j < s.length && s[j] == c) {   // entered mid-run: the one entry-dependent candidate
+        val m = markRun(s, j)
+        if ((if (exact) m == len else m >= len) && !isSpaceAt(s, j - 1)) return j
+        j += m
+    }
+    val key = "$c$len${if (exact) "E" else "A"}"
+    val failedAt = memo[key]
+    if (failedAt != null && j >= failedAt) return -1
+    val start = j
     while (j < s.length) {
         val ch = s[j]
-        if (ch == '\n') return -1
+        if (ch == '\n') break
         if (ch != c) { j++; continue }
         val m = markRun(s, j)
         if ((if (exact) m == len else m >= len) && !isSpaceAt(s, j - 1)) return j
         j += m
     }
+    memo[key] = start
     return -1
-}
-
-/**
- * [findEmphClose] with the per-line "there is no such closer" memo: a failure at
- * `from` means the rest of that line holds no closer of this kind, so any later
- * opener on the same line fails too. Without it, N unclosed openers cost N scans.
- */
-private fun closeWithMemo(
-    s: String, from: Int, c: Char, len: Int, exact: Boolean, memo: HashMap<String, Int>,
-): Int {
-    val key = "$c$len${if (exact) "E" else "A"}"
-    val failedAt = memo[key]
-    if (failedAt != null && from >= failedAt) return -1
-    val hit = findEmphClose(s, from, c, len, exact)
-    if (hit < 0) memo[key] = from
-    return hit
 }
 
 private fun parseEmph(text: String, depth: Int = 0): List<Span> {
@@ -198,8 +199,8 @@ private fun parseEmph(text: String, depth: Int = 0): List<Span> {
         // A run of the SAME length is preferred, so `*a **b** c*` closes on the
         // final single `*`; a longer run is accepted only when no exact one is left.
         val from = i + len
-        var endIdx = closeWithMemo(text, from, c, len, true, noClose)
-        if (endIdx < 0) endIdx = closeWithMemo(text, from, c, len, false, noClose)
+        var endIdx = findEmphClose(text, from, c, len, true, noClose)
+        if (endIdx < 0) endIdx = findEmphClose(text, from, c, len, false, noClose)
         // Unclosed, or an EMPTY span (`****`, `~~~~`) — both literal, as in GFM.
         if (endIdx <= from) { i += n; continue }
         out.addAll(linkify(text.substring(last, i)))
@@ -370,11 +371,11 @@ internal fun isRuleLine(line: String): Boolean {
 }
 
 private fun listItemAt(line: String): RawListItem? {
-    OL_RE.find(line)?.let {
+    OL_RE.matchEntire(line)?.let {
         return RawListItem(indentWidth(it.groupValues[1]), true, it.groupValues[2].toInt(), it.groupValues[3])
     }
     if (isRuleLine(line)) return null  // an HR wins over a one-item `***` list
-    UL_RE.find(line)?.let {
+    UL_RE.matchEntire(line)?.let {
         return RawListItem(indentWidth(it.groupValues[1]), false, 1, it.groupValues[2])
     }
     return null
@@ -428,7 +429,7 @@ private fun parseBlocks(text: String, depth: Int): List<ProseBlock> {
     fun eatBlanks() { while (i < lines.size && isJsBlank(lines[i])) i++ }
     while (i < lines.size) {
         val line = lines[i]
-        val h = HEADING_RE.find(line)
+        val h = HEADING_RE.matchEntire(line)
         if (h != null) {
             flush(true)
             // A closing run of #s is syntax, not content.
@@ -449,7 +450,7 @@ private fun parseBlocks(text: String, depth: Int): List<ProseBlock> {
             flush(true)
             val body = ArrayList<String>()
             while (i < lines.size && QUOTE_RE.matches(lines[i])) {
-                body.add(QUOTE_RE.find(lines[i])!!.groupValues[1])
+                body.add(QUOTE_RE.matchEntire(lines[i])!!.groupValues[1])
                 i++
             }
             val inner = body.joinToString("\n")
@@ -472,7 +473,7 @@ private fun parseBlocks(text: String, depth: Int): List<ProseBlock> {
                 // line between two lists — 3% of the real corpus's list prose.
                 val cur = if (i < lines.size) lines[i] else null
                 if (cur != null && !isJsBlank(cur) && listItemAt(cur) == null &&
-                    HEADING_RE.find(cur) == null && !isRuleLine(cur) && !QUOTE_RE.matches(cur) &&
+                    HEADING_RE.matchEntire(cur) == null && !isRuleLine(cur) && !QUOTE_RE.matches(cur) &&
                     indentWidth(LEADING_WS_RE.find(cur)!!.value) > items.last().indent
                 ) {
                     items.last().text += "\n" + cur.trim()
@@ -513,12 +514,23 @@ private val FENCE_OPEN = Regex("""^\s*(`{3,})[ \t]*([^\s`]*)[ \t]*$""")
 private val FENCE_CLOSE = Regex("""^\s*(`{3,})[ \t]*$""")
 
 private fun fenceCloses(line: String, openLen: Int): Boolean {
-    val m = FENCE_CLOSE.find(line) ?: return false
+    val m = FENCE_CLOSE.matchEntire(line) ?: return false
     return m.groupValues[1].length >= openLen
 }
 
-/** Parse [text] into an ordered list of prose blocks. */
-fun parseProse(text: String): List<ProseBlock> {
+private val EOL_RE = Regex("""\r\n?""")
+
+/**
+ * Line endings, normalised ONCE at the outermost pass so every pass below splits
+ * on "\n" and sees a line with nothing trailing it. Mirrors chat.js
+ * `normalizeEol`, where a CRLF message rendered with NO markdown at all.
+ */
+private fun normalizeEol(s: String): String =
+    if (!s.contains('\r')) s else EOL_RE.replace(s, "\n")
+
+/** Parse [raw] into an ordered list of prose blocks. */
+fun parseProse(raw: String): List<ProseBlock> {
+    val text = normalizeEol(raw)
     if (!text.contains("```")) return parseTables(text)
     val lines = text.split("\n")
     val out = ArrayList<ProseBlock>()
@@ -526,7 +538,7 @@ fun parseProse(text: String): List<ProseBlock> {
     fun flush() { if (buf.isNotEmpty()) { out.addAll(parseTables(buf.joinToString("\n"))); buf.clear() } }
     var i = 0
     while (i < lines.size) {
-        val open = FENCE_OPEN.find(lines[i])
+        val open = FENCE_OPEN.matchEntire(lines[i])
         if (open != null) {
             flush()
             i++

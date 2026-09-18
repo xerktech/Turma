@@ -219,51 +219,53 @@
   // by adding `_` back.
   //
   // COST. This runs on every bubble of every repaint, and a repaint fires on
-  // each ~1s tail frame, so it must be linear in the text. Three things keep it
-  // there, and each of them was measured costing SECONDS of blocked main thread
-  // before it went in (a 100k-character line is inside the wire's own
-  // BLOCK_TEXT_CHARS cap, and the composer will accept one):
-  //  - MARK_RUN_MAX caps how far a delimiter run is counted;
-  //  - `noClose` remembers that a kind of closer is absent for the rest of the
-  //    line, so N unclosed openers cost one scan rather than N;
-  //  - EMPH_MAX_DEPTH bounds the recursion.
-  // Delimiter runs are counted only as far as the longest run that can change a
-  // decision (`***`). Capping can't change an outcome: once m has reached 3,
-  // `m === len` and `m >= len` already resolve the same way for every len used.
-  const MARK_RUN_MAX = 3;
+  // each ~1s tail frame, so it must be linear in the text — a 100k-character
+  // line is inside the wire's own BLOCK_TEXT_CHARS cap, and the composer will
+  // accept one. Two things make it linear, and the naive version was measured
+  // blocking the main thread for SECONDS without them: the `noClose` memo in
+  // findEmphClose (N unclosed openers cost ONE scan, not N) and EMPH_MAX_DEPTH.
+  //
+  // Capping how far a run is counted was tried and REVERTED: it bought nothing
+  // the memo doesn't already give, and it changed output — a saturated count
+  // made `m === len` true for a longer run and made the scan resume INSIDE one,
+  // which fabricated emphasis on input that had none (`~~~~~~# x~~~~`).
   const EMPH_MAX_DEPTH = 8;
-  function markRun(s, i) {
-    const c = s[i];
-    let n = 0;
-    while (n < MARK_RUN_MAX && s[i + n] === c) n++;
-    return n;
-  }
+  function markRun(s, i) { const c = s[i]; let n = 0; while (s[i + n] === c) n++; return n; }
   function isSpaceAt(ch) { return ch === undefined || /\s/.test(ch); }
   // The index of the next right-flanking closing run of `c` at or after `from`,
   // or -1. A closer is not preceded by whitespace, and the scan stops at a line
   // break (a span never crosses one). `exact` demands a run of precisely `len`.
-  function findEmphClose(s, from, c, len, exact) {
+  //
+  // `memo` is the per-line "there is no closer of this kind left" cache, and it
+  // is keyed on where the ENTRY-INDEPENDENT part of the scan begins — not on
+  // `from`. That distinction is the whole soundness argument: `from` can land
+  // INSIDE a run (an opener of `***` inside a run of five), and the partial run
+  // it then measures is a candidate no other scan of this line would see. So
+  // that one candidate is tested first, before the memo is consulted; from the
+  // end of it onward every run is entered at its true start, which depends only
+  // on the index — so a later scan starting at or after a failed one visits a
+  // subset of the same candidates and fails too.
+  function findEmphClose(s, from, c, len, exact, memo) {
     let j = from;
+    if (s[j] === c) {                       // entered mid-run: the one entry-dependent candidate
+      const m = markRun(s, j);
+      if ((exact ? m === len : m >= len) && !isSpaceAt(s[j - 1])) return j;
+      j += m;
+    }
+    const key = c + String(len) + (exact ? "E" : "A");
+    const failedAt = memo.get(key);
+    if (failedAt !== undefined && j >= failedAt) return -1;
+    const start = j;
     while (j < s.length) {
       const ch = s[j];
-      if (ch === "\n") return -1;
+      if (ch === "\n") break;
       if (ch !== c) { j++; continue; }
       const m = markRun(s, j);
       if ((exact ? m === len : m >= len) && !isSpaceAt(s[j - 1])) return j;
       j += m;
     }
+    memo.set(key, start);
     return -1;
-  }
-  // findEmphClose, with the per-line "there is no such closer" memo. A failure
-  // at `from` means the region [from, end of line) holds no closer of this kind;
-  // any LATER opener on the same line searches a subset of it, so it fails too.
-  function closeWithMemo(s, from, c, len, exact, memo) {
-    const key = c + String(len) + (exact ? "E" : "A");
-    const failedAt = memo.get(key);
-    if (failedAt !== undefined && from >= failedAt) return -1;
-    const hit = findEmphClose(s, from, c, len, exact);
-    if (hit < 0) memo.set(key, from);
-    return hit;
   }
   function renderEmph(text, depth) {
     const s = String(text == null ? "" : text);
@@ -297,8 +299,8 @@
       // closes on the final single `*` rather than on the inner `**`; a longer
       // run is accepted only when no exact one is left (an unbalanced `*a**`).
       const from = i + len;
-      let endIdx = closeWithMemo(s, from, c, len, true, noClose);
-      if (endIdx < 0) endIdx = closeWithMemo(s, from, c, len, false, noClose);
+      let endIdx = findEmphClose(s, from, c, len, true, noClose);
+      if (endIdx < 0) endIdx = findEmphClose(s, from, c, len, false, noClose);
       // Unclosed, or an EMPTY span (`****`, `~~~~`) — both literal, as in GFM.
       // Rejecting the empty one also stops a long delimiter run from emitting a
       // wall of empty elements.
@@ -719,8 +721,19 @@
   // bare ``` fence around SVG alike, without disturbing a fence that merely
   // contains an <svg> among other content.
   const SVG_FENCE = /^\s*<svg[\s>][\s\S]*<\/svg\s*>\s*$/i;
+  // Line endings are normalised ONCE, here at the outermost pass, so every pass
+  // below splits on "\n" and sees a line with nothing trailing it. Without this
+  // a CRLF message rendered with NO markdown at all: every block rule ends
+  // `[ \t]*$`, and the "\r" left on each line by split("\n") defeated all of
+  // them — so a heading, a bullet and a rule all stayed raw text. Reachable from
+  // any tool result echoing a Windows file, a pasted CRLF message, or the native
+  // Windows agent. A lone "\r" is a line break too (CSS pre-wrap treats it as a
+  // segment break), so it becomes one rather than surviving as an invisible char.
+  function normalizeEol(s) {
+    return s.indexOf("\r") < 0 ? s : s.replace(/\r\n?/g, "\n");
+  }
   function renderProse(text) {
-    const s = String(text == null ? "" : text);
+    const s = normalizeEol(String(text == null ? "" : text));
     if (s.indexOf("```") < 0) return renderSvgAndText(s); // no fence → still scan for raw SVG
     const lines = s.split("\n");
     let out = "", i = 0, buf = [];
@@ -1423,7 +1436,11 @@
     const statusCls = it.result ? (it.result.isError ? "err" : "ok") : "";
     // A plan card's salient line is the plan itself; a SendUserFile card's is its
     // caption or a file count — not the raw input JSON either would fall back to.
-    const argSrc = it.plan || (it.files ? "" : it.input);
+    // String()-guarded: a block whose `input` arrived as an object rather than a
+    // string threw a TypeError out of itemsToHtml and took the WHOLE transcript
+    // render down with it. The live agent clips input to a string, so this is
+    // defence against a malformed/forged block, not a shape we see.
+    const argSrc = it.plan || (it.files ? "" : (it.input ? String(it.input) : ""));
     // A plan's first line is MARKDOWN, and the card collapses it to one line —
     // so the syntax has to come off, or the header reads "ExitPlanMode ## The
     // plan" beside a body that renders the same heading properly. Only the plan

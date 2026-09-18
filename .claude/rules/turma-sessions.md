@@ -103,11 +103,18 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
     bare `---` (no pipe) correctly is.
   - **Every pass must be LINEAR in the text.** `repaint()` re-renders the whole buffer on each ~1s
     tail frame, and a 100k-char block is inside the wire's own `BLOCK_TEXT_CHARS` cap, so a
-    quadratic pass is a seconds-long main-thread freeze an agent can trigger. Three guards, each
-    added after one was measured: `MARK_RUN_MAX` (a delimiter run is counted only as far as `***`),
-    the per-line `noClose` memo in `renderEmph` (N unclosed openers cost ONE scan, not N), and
+    quadratic pass is a seconds-long main-thread freeze an agent can trigger. What keeps it linear:
+    the per-line `noClose` memo in `findEmphClose` (N unclosed openers cost ONE scan, not N) and
     `EMPH_MAX_DEPTH`. `trailingMarkerStart` peels markers backwards for the same reason — the
     obvious `/(?:\[\w+\])+$/` is unanchored on the left and retries from every `[`.
+    - **The memo is keyed on where the ENTRY-INDEPENDENT scan starts, not on `from`.** `from` can
+      land INSIDE a delimiter run, and the partial run it measures there is a candidate no other
+      scan of that line sees — so that one is tested first, before the memo is consulted. Keying on
+      `from` looks right and is not: it silently drops closers. Tests: the emphasis differential
+      cases in `chat.test.js`.
+    - **Capping the run count was tried and REVERTED.** It bought nothing the memo doesn't already
+      give, and it changed output — a saturated count made `m === len` true for a longer run and
+      resumed the scan INSIDE one, fabricating emphasis on input that had none. Don't re-add it.
   - **A rule line is a SCAN (`isRuleLine`), never `/(?:-[ \t]*){3,}/`.** That regex is linear in V8
     but `java.util.regex` recurses once per iteration of a quantified GROUP, so the Android port of
     it threw an **uncatchable `StackOverflowError`** out of `parseProse` inside a Composable (an
@@ -115,7 +122,14 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
     JS→Kotlin regex port carrying a quantified group needs that check.
   - **Android uses `isJsSpace`/`isJsBlank`, not `Character.isWhitespace`/`isBlank()`** — Java's set
     omits U+00A0 and U+FEFF and adds U+001C..U+001F, so the platform's answer made the same message
-    render differently on the two clients.
+    render differently on the two clients. For the same family of reason Kotlin uses `matchEntire`,
+    not `find`, on the fully-anchored line patterns: **Java's `$` also matches BEFORE a final line
+    terminator and JavaScript's does not.**
+  - **Line endings are normalised ONCE, at `renderProse`/`parseProse`.** Every block rule ends
+    `[ \t]*$`, so the `\r` that `split("\n")` leaves behind defeated all of them and a CRLF message
+    rendered with NO markdown at all — reachable from any tool result echoing a Windows file, or
+    from the native Windows agent. A lone `\r` becomes `\n` (CSS pre-wrap treats it as a segment
+    break anyway).
   - A **wrapped bullet's continuation line belongs to its item** (GFM lazy continuation: more
     indented, not itself a construct). Without it a wrap ended the list, printed its own second
     line as a bare paragraph flush left, and started a new list underneath — 3% of the real

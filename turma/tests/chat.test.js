@@ -1331,6 +1331,43 @@ test("renderInline: an EMPTY emphasis span is literal, and a long run stays lite
   assert.doesNotMatch(many, /<strong|<em/);
 });
 
+test("renderProse: CRLF text still renders its markdown", () => {
+  // Every block rule ends `[ \t]*$`, and the "\r" that split("\n") leaves on
+  // each line defeated all of them — a CRLF message rendered with NO markdown
+  // at all. Reachable from any tool result echoing a Windows file, a pasted
+  // CRLF message, or the native Windows agent.
+  const crlf = "Summary\r\n\r\n## What changed\r\n\r\n- one thing\r\n- another\r\n";
+  assert.equal(renderProse(crlf),
+    'Summary<h2 class="md-h">What changed</h2>' +
+    '<ul class="md-list"><li>one thing</li><li>another</li></ul>');
+  // A lone CR is a line break too (CSS pre-wrap treats it as a segment break),
+  // so it becomes one rather than surviving as an invisible character.
+  assert.equal(renderProse("## H\r"), '<h2 class="md-h">H</h2>');
+  assert.equal(renderProse("a\rb"), "a\nb");
+});
+
+test("renderInline: the emphasis scanner measures whole runs, never a capped count", () => {
+  // Capping how far a delimiter run is counted was tried as a speed fix and
+  // reverted: a saturated count made `m === len` true for a LONGER run and made
+  // the scan resume INSIDE one, which fabricated emphasis on input that had
+  // none. These are the vectors that caught it — they must stay literal / whole.
+  assert.equal(renderInline("~~~~~~# x~~~~"), "~~~~~~# x~~~~");
+  assert.equal(renderInline("****1. y ~~*aa"), "****1. y ~~*aa");
+  assert.equal(renderInline("**a b*****c**"), '<strong class="md-strong">a b*****c</strong>');
+  assert.equal(renderInline("*a******* q"), '<em class="md-em">a</em>****** q');
+  assert.equal(renderInline("~~a~~~~~~~~~#"), '<del class="md-strike">a</del>~~~~~~~#');
+});
+
+test("render: a tool block whose input isn't a string can't take the transcript down", () => {
+  // argSrc.split("\n") threw a TypeError out of itemsToHtml, so ONE malformed
+  // block blanked the whole conversation.
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([{
+    id: "x", role: "assistant",
+    blocks: [{ t: "tool_use", id: "t", name: "Bash", input: { cmd: "ls" } }],
+  }])));
+  assert.match(html, /<span class="tool-name">Bash<\/span>/);
+});
+
 test("renderProse: emphasis and markers stay linear on pathological input", () => {
   // Every one of these took SECONDS before MARK_RUN_MAX + the noClose memo.
   // The budget is generous (CI machines vary); the failure mode was ~10^3x this.

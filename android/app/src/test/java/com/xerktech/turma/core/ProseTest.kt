@@ -229,11 +229,33 @@ class ProseTest {
     @Test fun `left flanking — a delimiter followed by a space never opens`() {
         // Pinned separately from the closer-side guard: only the closer guard is
         // exercised by the arithmetic cases below, so deleting this one was silent.
-        for (t in listOf("** bold**", "~~ s~~", "see ** note**", "* italic*", "**bold **")) {
+        // NB: a bare "* italic*" is a BULLET at the start of a line, not a
+        // paragraph — the web's twin of this test calls renderInline, which has
+        // no block pass at all. Use a form that can't open a list.
+        for (t in listOf("** bold**", "~~ s~~", "see ** note**", "see * italic*", "**bold **")) {
             val spans = paras(t).single().spans
             assertTrue("should stay literal: $t", styled(spans).isEmpty())
             assertEquals(t, plain(spans))
         }
+        // ...and that bullet reading is the correct one, so pin it here too.
+        assertEquals("italic*", plain(lists("* italic*").single().items.single().spans))
+    }
+
+    @Test fun `CRLF text still renders its markdown`() {
+        // Java's `$` matches before a final line terminator and JavaScript's does
+        // not, so the two ports disagreed on CRLF until line endings were
+        // normalised at the outermost pass. On the web a CRLF message rendered
+        // with NO markdown at all — reachable from any tool result echoing a
+        // Windows file, or from the native Windows agent.
+        val crlf = "Summary\r\n\r\n## What changed\r\n\r\n- one thing\r\n- another\r\n"
+        val blocks = parseProse(crlf)
+        assertEquals("What changed", plain(blocks.filterIsInstance<ProseBlock.Heading>().single().spans))
+        assertEquals(
+            listOf("one thing", "another"),
+            blocks.filterIsInstance<ProseBlock.ListBlock>().single().items.map { plain(it.spans) },
+        )
+        // A lone CR is a line break too, not an invisible character in the text.
+        assertEquals("H", plain(headings("## H\r").single().spans))
     }
 
     @Test fun `an empty emphasis span is literal`() {
