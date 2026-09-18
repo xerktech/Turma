@@ -13749,7 +13749,16 @@ function markWatchArmed(host, sessionId) {
 // a minute buys nothing. A control reconnect clears the whole host (the agent
 // forgot its watchers too, so its cap is genuinely different), and a transcript
 // MOVE still re-arms — those are the two things that can change the answer.
+//
+// **Only for a session somebody is actually watching.** The session id comes
+// off an agent-authed control frame and need not name anything real, and unlike
+// every other write here this one ADDS a key rather than deleting one — so
+// recording it unconditionally let one agent grow the hub's heap by ~265 bytes
+// per frame for the life of the control channel (measured: +52.7 MiB over
+// 200k frames, against a 512 MiB container). Suppressing a re-ask is only
+// meaningful for a watched session anyway: an unwatched one is never re-armed.
 function markWatchRefused(host, sessionId) {
+  if (!liveClients[host]?.[sessionId]) return;
   (liveWatchArmed[host] = liveWatchArmed[host] || Object.create(null))[sessionId] = "refused";
 }
 function clearWatchArmed(host, sessionId) {
@@ -18995,7 +19004,8 @@ if (process.env.TURMA_TEST) {
     // test can drive the cross-replica paths with an injected relay (`__setRelay`).
     openChannel, openChannelLocal, openLiveForRelay, openLiveRelay, openMigrationBlobForRelay,
     openUploadBlobForRelay, setUploadStore, UPLOAD_DIR_PREFIX, publishUploadDir,
-    liveFanout, liveClients, liveRelayChannels, armLiveWatcher, disarmLiveWatcher,
+    liveFanout, liveClients, liveRelayChannels, liveWatchArmed,
+    armLiveWatcher, disarmLiveWatcher,
     rearmOriginLiveRelays, dropOriginLiveRelays, RELAY_AUTH_TOKEN,
     siteKeyOf,
     orgPeers,

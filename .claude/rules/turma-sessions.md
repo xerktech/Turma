@@ -59,6 +59,15 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
     never-armed re-arm does not re-ask every beat forever — a host at `MAX_WATCHERS` refuses
     deterministically. A control reconnect (the agent forgot its watchers too) and a transcript MOVE
     are the only two things that can change the answer, and both still re-arm.
+    - **Only for a session in `liveClients[host]`.** It is the one write here that ADDS a key rather
+      than deleting one, and the id rides an agent-authed frame — recording it unconditionally let
+      one agent grow the hub's heap ~265 bytes per frame for the life of the control channel
+      (+52.7 MiB over 200k frames, against a 512 MiB container). Suppression only means anything for
+      a watched session anyway.
+    - **The cost, stated:** a viewer that stays connected through a refusal is NOT re-armed when the
+      host's watcher slot later frees — only a move or a reconnect re-asks. It degrades correctly
+      (that client is on `/history` polling) and a reload always recovers, because `armLiveWatcher`
+      arms on every new subscriber. Accepted over re-asking a deterministic refusal 20x a minute.
   - **Every subscriber arms, not just the first** (`armLiveWatcher`), and **a session the hub could
     not arm yet is armed on the beat that first describes it** (`rearmMovedWatches`' never-armed
     branch, tracked in `liveWatchArmed`). `watchTargetFor` needs a `worktreePath`, so a chat opened

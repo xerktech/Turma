@@ -14109,6 +14109,19 @@ test("live WS: a watch the agent REFUSED is not re-asked on every beat", async (
     })()).length;
     assert.equal(reasked, 0, "a refused watch is left alone");
 
+    // ...and a refusal naming a session NOBODY watches records nothing. This
+    // write is the only one here that ADDS a key rather than deleting one, and
+    // the id comes off an agent-authed frame, so recording it unconditionally
+    // let one agent grow the hub's heap for the life of the control channel.
+    const armedKeys = () => Object.keys(hub.liveWatchArmed?.nackhost || {});
+    const before = armedKeys().length;
+    for (const ghost of ["ghost-1", "ghost-2", "ghost-3"]) {
+      ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+        { watchFailed: ghost, reason: "at MAX_WATCHERS (16)" }))));
+    }
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(armedKeys().length, before, "an unwatched session records nothing");
+
     // ...but a transcript MOVE is new information, so it is asked again.
     await request("POST", "/api/heartbeat", {
       headers: agentHeaders,
@@ -14254,9 +14267,15 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
   //    socket it just accepted. See the dedicated cases above.
   assert.deepEqual(await nextTextJson(liveFrames, 0), { type: "watch", armed: true });
 
-  // 1. Immediately seeded with the cached tail.
+  // 1. Immediately seeded with the cached tail — marked `seed:true`, which is
+  //    the HUB's half of a two-sided contract: chat.js refuses to read a seed
+  //    frame as proof that a watch was armed (it is replayed even on a socket
+  //    just acked armed:false). The client-side half is asserted in
+  //    chat-live.test.js against a hand-written frame, so without this the two
+  //    can drift apart silently and the ack clears itself again.
   const seed = await nextTextJson(liveFrames, 1);
   assert.equal(seed.type, "tail");
+  assert.equal(seed.seed, true, "the hub marks its own cached replay as a seed");
   assert.deepEqual(seed.entries, [{ id: "c1", role: "assistant", text: "cached" }]);
 
   // 2. The agent was told to start tailing, with everything it needs to find
