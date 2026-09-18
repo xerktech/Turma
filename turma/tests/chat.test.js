@@ -251,6 +251,35 @@ test("buildItems: non-completed task_notification flags its result as an error",
   assert.equal(items[0].result.text, "status: failed");
 });
 
+test("XERK-860: hidden thinking announces itself but does NOT carry the trace", () => {
+  // The default verbosity hides thinking while the terminal always shows it, so a
+  // quiet turn and an elided one used to look identical (renderThought returned
+  // ""). The affordance makes the elision VISIBLE. It is deliberately SUMMARY
+  // ONLY: `concise`/`normal` mean "do not send me the thinking", and glasses
+  // renders this same vendored engine onto a tiny display.
+  const entries = [{ id: "a1", role: "assistant", blocks: [
+    { t: "thinking", text: "SECRET-TRACE" },
+    { t: "text", text: "done" },
+  ] }];
+  const hidden = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
+  assert.match(hidden, /1 thought hidden/, "the elision must be visible");
+  assert.ok(!hidden.includes("SECRET-TRACE"),
+    "the hidden trace must not be emitted at a verbosity that hides thinking");
+  assert.match(hidden, /done/, "the rest of the turn still renders");
+
+  // Two consecutive thoughts fold into ONE marker that counts them.
+  const two = withVerbosity("normal", () => itemsToHtml(buildItems([{
+    id: "a2", role: "assistant",
+    blocks: [{ t: "thinking", text: "x" }, { t: "thinking", text: "y" }, { t: "text", text: "ok" }],
+  }])));
+  assert.match(two, /2 thoughts hidden/);
+
+  // Raising verbosity is what reveals it — that is what the control is for.
+  const shown = withVerbosity("verbose", () => itemsToHtml(buildItems(entries)));
+  assert.match(shown, /SECRET-TRACE/, "verbose must still render the trace");
+  assert.ok(!/thought hidden/.test(shown), "nothing is 'hidden' once it is shown");
+});
+
 test("buildItems/render: an Edit tool_use carries its diff onto the card", () => {
   const entries = [{ id: "e1", role: "assistant", blocks: [{
     t: "tool_use", id: "t1", name: "Edit", input: "/repo/a.py",
@@ -260,9 +289,47 @@ test("buildItems/render: an Edit tool_use carries its diff onto the card", () =>
   assert.deepEqual(items[0].edit, { old: "x = 1", new: "x = 2", replaceAll: true });
   const html = withVerbosity("normal", () => itemsToHtml(items));
   assert.match(html, /tool-diff/);
-  assert.match(html, /class="diff-old">x = 1</);
-  assert.match(html, /class="diff-new">x = 2</);
+  // B4: an Edit renders an INTERLEAVED per-line diff, not two stacked whole-file
+  // blobs. The old markup (`<pre class="diff-old">` over `<pre class="diff-new">`)
+  // made the reader eyeball two 40-line bodies to find the two lines that moved.
+  assert.match(html, /class="dl del">-x = 1</);
+  assert.match(html, /class="dl add">\+x = 2</);
+  assert.ok(!/diff-old|diff-new/.test(html),
+    "the stacked whole-blob markup must be gone, not merely supplemented");
   assert.match(html, /edit \(replace all\)/);
+});
+
+test("buildItems/render: an Edit diff keeps UNCHANGED lines as context and marks only what moved", () => {
+  // The point of the line diff: a large edit that changes one line must show that
+  // one line, with its neighbours as context — not re-print the whole body twice.
+  const entries = [{ id: "e2", role: "assistant", blocks: [{
+    t: "tool_use", id: "t2", name: "Edit", input: "/repo/b.py",
+    edit: { old: "a\nb\nc\nd", new: "a\nB\nc\nd" },
+  }] }];
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
+  assert.match(html, /class="dl del">-b</, "the replaced line is marked removed");
+  assert.match(html, /class="dl add">\+B</, "the replacement is marked added");
+  // a, c and d are untouched, so they appear ONCE each as context — never as a
+  // -/+ pair, which is what the stacked-blob render effectively did to every line.
+  for (const ctx of ["a", "c", "d"]) {
+    assert.ok(!new RegExp('class="dl del">-' + ctx + '<').test(html),
+      `unchanged line ${ctx} must not be marked removed`);
+    assert.ok(!new RegExp('class="dl add">\\+' + ctx + '<').test(html),
+      `unchanged line ${ctx} must not be marked added`);
+  }
+});
+
+test("buildItems/render: an Edit diff escapes its lines (stored-XSS)", () => {
+  // The diff is attacker-influenced archived content on both sides.
+  const entries = [{ id: "e3", role: "assistant", blocks: [{
+    t: "tool_use", id: "t3", name: "Edit", input: "/repo/c.py",
+    edit: { old: "<img src=x onerror=alert(1)>", new: "<script>alert(2)</script>" },
+  }] }];
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
+  assert.ok(!/<img src=x/.test(html), "a removed line must not inject raw markup");
+  assert.ok(!/<script>alert\(2\)/.test(html), "an added line must not inject raw markup");
+  assert.match(html, /&lt;img src=x/);
+  assert.match(html, /&lt;script&gt;alert\(2\)/);
 });
 
 test("buildItems/render: a Write's content and a Bash description show on the card", () => {

@@ -947,3 +947,25 @@ those are marked `[MODEL]`.
     re-authenticate. A break-glass password login keeps the 30-day session.
   - Tests: `core/OidcTest` (PKCE golden vector, deep-link parse), `net/OidcControllerTest` (probe /
     exchange / cookie auth / forbidden / 401-drop over MockWebServer).
+
+- **Chat render performance + two render refinements are WEB-ONLY (XERK-860 / Track B PR 2).** The
+  web chat rebuilt its entire transcript's HTML twice a second (`repaint()` on both the `tail` and
+  the `turn` frame), which destroyed and re-created every `data:` image and sandboxed `<iframe>` in
+  view once per second. PR 2 coalesces the two frames into ONE `requestAnimationFrame` repaint,
+  splits the painted HTML at the BODY / LIVE-region seam so the in-progress turn no longer rewrites
+  settled items, and memoizes per-item HTML keyed by `(item, detailsEpoch)`. **None of this ports**:
+  Android renders through Compose, which recomposes only what changed, so it never had the defect
+  the web fix exists to remove. There is nothing to mirror.
+  - **The selection-freeze fix is web-only for the same reason** — it is a DOM-selection concern
+    (`selectionIn`), which Compose does not have.
+  - **`XERK-860`, the "n thoughts hidden" affordance, IS a user-facing behaviour change and is
+    currently web-only.** Thinking is hidden at the default verbosity while the terminal always shows
+    it, so an elided turn read as a quiet one. The web now renders a `💭 n thought(s) hidden` marker.
+    It is deliberately SUMMARY ONLY — the trace itself is not emitted at a verbosity that hides it
+    (glasses renders the same vendored engine onto a tiny display, pinned by `vendor.test.ts`), so
+    raising the verbosity is what reveals it. **Android's `TranscriptView` still renders nothing for
+    hidden thinking and should grow the same marker.**
+  - **The Edit line diff (B4) is web-only so far.** An `Edit` card used to stack the whole old body
+    over the whole new body; the web now renders an interleaved per-line diff with unchanged lines as
+    context, off the `{old,new}` already on the wire (no wire change). **Android still stacks the two
+    blobs.**
