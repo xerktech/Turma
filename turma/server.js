@@ -13247,19 +13247,65 @@ const TERM_FONT_STYLE =
 // it is served 200 + `no-store`: a 200 renders + runs its reload script in every
 // context (iframe, new tab, Android WebView) with no intermediary (nginx/Cloudflare)
 // swapping a 5xx body for its own error page.
-const TERM_RECONNECT_HTML =
-  "<!doctype html><html><head><meta charset='utf-8'>" +
-  "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
-  "<title>Reconnecting…</title><style>" +
-  "html,body{margin:0;height:100%;background:#000;color:#8a8f98;" +
-  "font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif}" +
-  ".wrap{height:100%;display:flex;flex-direction:column;align-items:center;" +
-  "justify-content:center;gap:14px}" +
-  ".spin{width:22px;height:22px;border:2px solid #2a2d31;border-top-color:#8a8f98;" +
-  "border-radius:50%;animation:s .8s linear infinite}@keyframes s{to{transform:rotate(360deg)}}" +
-  ".msg{opacity:.85}</style></head><body><div class='wrap'><div class='spin'></div>" +
-  "<div class='msg'>Reconnecting to the terminal…</div></div>" +
-  "<script>setTimeout(function(){location.reload()},2000)</script></body></html>";
+// It BACKS OFF and eventually GIVES UP rather than reloading forever: a host that
+// is genuinely gone (removed, powered off, tunnel retired) would otherwise have every
+// open terminal tab re-dial it every 2s for the life of the tab, and — worse — the
+// operator would be shown the same "Reconnecting…" spinner whether the tunnel is
+// flapping (heals in seconds) or the host is never coming back. So the delay doubles
+// 2s→30s, the page stands down after TERM_RECONNECT_MAX_TRIES with an explicit Retry,
+// and it says which of the two cases the hub actually believes it is in.
+const TERM_RECONNECT_BASE_MS = 2000;
+const TERM_RECONNECT_MAX_MS = 30000;
+const TERM_RECONNECT_MAX_TRIES = 6; // ~2+4+8+16+30+30s ≈ 90s before standing down
+// The attempt counter lives in sessionStorage (per tab, survives the reload, never
+// shared between viewers) and SELF-RESETS when the last attempt is older than the
+// longest backoff plus slack — so a fresh outage after a healthy period starts at 2s
+// again instead of inheriting a stale count and standing down immediately.
+const TERM_RECONNECT_STALE_MS = TERM_RECONNECT_MAX_MS + 15000;
+
+// `tunnelOnline` is what the hub itself believes about this host's terminal tunnel
+// at the moment the document is served, so the two cases read differently.
+function termReconnectHtml(tunnelOnline) {
+  const detail = tunnelOnline
+    ? "The terminal did not answer in time. Retrying…"
+    : "This host's terminal tunnel is offline. The session keeps running; "
+      + "this view reconnects on its own when the tunnel is back.";
+  return "<!doctype html><html><head><meta charset='utf-8'>" +
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
+    "<title>Reconnecting…</title><style>" +
+    "html,body{margin:0;height:100%;background:#000;color:#8a8f98;" +
+    "font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif}" +
+    ".wrap{height:100%;display:flex;flex-direction:column;align-items:center;" +
+    "justify-content:center;gap:14px;padding:0 24px;text-align:center}" +
+    ".spin{width:22px;height:22px;border:2px solid #2a2d31;border-top-color:#8a8f98;" +
+    "border-radius:50%;animation:s .8s linear infinite}@keyframes s{to{transform:rotate(360deg)}}" +
+    ".msg{opacity:.85}.detail{font-size:12px;opacity:.55;max-width:44ch}" +
+    "button{font:inherit;color:#cdd1d6;background:#1b1e22;border:1px solid #2a2d31;" +
+    "border-radius:6px;padding:6px 14px;cursor:pointer}button:hover{background:#23272c}" +
+    "</style></head><body><div class='wrap' id='w'><div class='spin' id='s'></div>" +
+    "<div class='msg' id='m'>Reconnecting to the terminal…</div>" +
+    // `detail` is one of the two STATIC literals above — never caller- or
+    // agent-supplied — so there is nothing here to escape.
+    "<div class='detail'>" + detail + "</div></div><script>(function(){" +
+    "var BASE=" + TERM_RECONNECT_BASE_MS + ",MAX=" + TERM_RECONNECT_MAX_MS +
+    ",TRIES=" + TERM_RECONNECT_MAX_TRIES + ",STALE=" + TERM_RECONNECT_STALE_MS + ";" +
+    "var k='turma.term.retry.'+location.pathname,n=0;" +
+    // Every storage access is wrapped: sessionStorage throws in a private window or
+    // with site data blocked, and the page must still render and still retry there.
+    "try{var r=JSON.parse(sessionStorage.getItem(k)||'null');" +
+    "if(r&&typeof r.n==='number'&&Date.now()-r.at<STALE)n=r.n;}catch(e){}" +
+    "function save(v){try{sessionStorage.setItem(k,JSON.stringify({n:v,at:Date.now()}));}catch(e){}}" +
+    "function clear(){try{sessionStorage.removeItem(k);}catch(e){}}" +
+    "function retry(){save(n+1);location.reload();}" +
+    "if(n>=TRIES){clear();" +
+    "document.getElementById('s').style.display='none';" +
+    "document.getElementById('m').textContent='Terminal unavailable.';" +
+    "var b=document.createElement('button');b.textContent='Retry';" +
+    "b.onclick=function(){clear();location.reload();};" +
+    "document.getElementById('w').appendChild(b);return;}" +
+    "setTimeout(retry,Math.min(MAX,BASE*Math.pow(2,n)));" +
+    "})();</script></body></html>";
+}
 
 // Touch-scroll shim injected into ttyd's page for phones. Sessions run inside
 // tmux with `mouse on`, which routes the *wheel* by screen model (agent/tmux.conf):
@@ -14029,15 +14075,16 @@ function terminalFail(res, msg) {
 // frame document) and never recovers; this keeps the frame alive and reloads it
 // until ttyd answers. Idempotent like terminalFail, so a stray later error on the
 // same response can't double-end it (an ERR_STREAM_WRITE_AFTER_END hub crash).
-function terminalReconnectPage(res) {
+function terminalReconnectPage(res, tunnelOnline) {
   if (res.writableEnded) return;
   if (res.headersSent) { res.end(); return; }
+  const body = termReconnectHtml(!!tunnelOnline);
   res.writeHead(200, {
     "Content-Type": "text/html; charset=utf-8",
     "Cache-Control": "no-store",
-    "Content-Length": Buffer.byteLength(TERM_RECONNECT_HTML),
+    "Content-Length": Buffer.byteLength(body),
   });
-  res.end(TERM_RECONNECT_HTML);
+  res.end(body);
 }
 async function proxyTerm(req, res, name, port) {
   const headers = { ...req.headers, host: "ttyd", authorization: ttydAuth(name) };
@@ -14059,7 +14106,12 @@ async function proxyTerm(req, res, name, port) {
   const isBaseDoc = req.method === "GET" &&
     /^\/term\/[^/]+\/$/.test((req.url || "").split("?")[0]);
   const fail = (msg) => {
-    if (isBaseDoc && !res.headersSent && !res.writableEnded) return terminalReconnectPage(res);
+    if (isBaseDoc && !res.headersSent && !res.writableEnded) {
+      // Read the tunnel's state at SERVE time (the same expression `terminalOnline`
+      // is derived from), so the page can tell a flap apart from a host that is gone.
+      const online = !!controlChannels[name] || hostTunnelOwnerLive(name);
+      return terminalReconnectPage(res, online);
+    }
     return terminalFail(res, msg);
   };
 
