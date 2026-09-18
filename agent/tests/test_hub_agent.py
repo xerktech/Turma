@@ -3026,13 +3026,21 @@ class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
                 {"type": "text", "text": ansi_text},
                 {"type": "tool_use", "name": "Bash", "input": {}},
             ]}},
+            # tool_result-only: `_entry_text` returns None for it, but it is the
+            # BODY of u2's Bash card. It used to be dropped, which is what made a
+            # preview tool card render as an empty title row — the card rode and
+            # its output did not. It rides now; `_history_row` always kept it.
             {"uuid": "u3", "type": "user", "message": {"content": [
                 {"type": "tool_result", "content": "some tool output"},
-            ]}},  # tool_result-only -> dropped
+            ]}},
             {"uuid": "u4", "type": "summary", "message": {"content": "not a turn"}},  # wrong type -> dropped
         ])
         tail = ha.transcript_tail(path)
-        self.assertEqual([e["id"] for e in tail], ["u1", "u2"])
+        self.assertEqual([e["id"] for e in tail], ["u1", "u2", "u3"])
+        # u3 carries the OUTPUT, which is the whole reason to keep it...
+        self.assertEqual(tail[2]["blocks"][0]["t"], "tool_result")
+        self.assertEqual(tail[2]["blocks"][0]["text"], "some tool output")
+        # ...while an entry with neither text nor blocks (u4) is still dropped.
         self.assertEqual(tail[0], {"id": "u1", "role": "user", "text": "hello there",
                                    "blocks": [{"t": "text", "text": "hello there"}]})
         self.assertEqual(tail[1]["role"], "assistant")
@@ -3197,6 +3205,51 @@ class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
                 if b.get("t") == "tool_result":
                     self.assertTrue(b.get("text"),
                                     "a row that rides must keep its tool output")
+
+    def test_a_tool_output_only_turn_rides_the_preview(self):
+        """A tool_use card is useless without its RESULT, and the result lives on
+        its own turn.
+
+        `_entry_text` drops tool_result blocks, so a turn carrying ONLY tool
+        output flattens to None — and the preview used to skip every None-text
+        entry outright. The tool_use rode (it sits on the assistant turn, which
+        has text) but its output did not, so the chat drew a card whose body had
+        never been sent: expanding it showed nothing and `verbose` looked broken.
+        Same symptom as emptied payloads, different route. `_history_row` has
+        always kept such turns; the preview must match, or the two feeds disagree
+        about what a tool call looks like."""
+        path = os.path.join(self.proj, "toolout.jsonl")
+        write_jsonl(path, [
+            {"uuid": "a1", "type": "assistant", "message": {"content": [
+                {"type": "text", "text": "checking"},
+                {"type": "tool_use", "id": "t1", "name": "Bash",
+                 "input": {"command": "ls -la"}}]}},
+            # The RESULT turn: no prose at all, so _entry_text returns None.
+            {"uuid": "r1", "type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": "total 48\ndrwxr-xr-x  6 u g 4096 .."}]}},
+        ])
+        rows = ha.transcript_tail(path)
+        ids = [r["id"] for r in rows]
+        self.assertIn("r1", ids, "the tool-output turn must ride the preview")
+        result = [b for r in rows for b in r.get("blocks", [])
+                  if b.get("t") == "tool_result"]
+        self.assertEqual(len(result), 1)
+        self.assertIn("total 48", result[0]["text"], "the card's body must be sent")
+        # The card and its body pair up, which is what makes the card expandable.
+        use = [b for r in rows for b in r.get("blocks", []) if b.get("t") == "tool_use"]
+        self.assertEqual(use[0]["id"], result[0]["forId"])
+
+    def test_an_entry_with_neither_text_nor_blocks_is_still_dropped(self):
+        """Widening inclusion must not start emitting empty rows — the preview
+        would grow with entries that render as nothing."""
+        path = os.path.join(self.proj, "empty.jsonl")
+        write_jsonl(path, [
+            {"uuid": "x1", "type": "system", "subtype": "some_internal_thing"},
+            {"uuid": "u1", "type": "user", "message": {"content": "real message"}},
+        ])
+        rows = ha.transcript_tail(path)
+        self.assertEqual([r["id"] for r in rows], ["u1"])
 
     def test_a_long_turn_is_never_clipped_in_the_preview(self):
         """The operator's report: assistant turns arriving cut mid-word under a
