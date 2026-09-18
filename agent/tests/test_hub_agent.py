@@ -32594,6 +32594,81 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         with open(ha._pty_state_path(tmux_name), "w") as f:
             json.dump(st, f)
 
+    def test_strict_liveness_refuses_a_recycled_pid(self):
+        """C7: a live pid is NOT proof the pty-host is there.
+
+        The state file is removed only by `_pty_teardown`, so a hard stop (reboot,
+        SIGKILL, OOM, a WinSW force-kill) leaves it naming a DEAD pid — and Windows
+        recycles pids from a small space, so that pid can already belong to an
+        unrelated process. The non-strict check then reads a session that is not
+        there as ALIVE, and `resume_on_boot` ADOPTS it: no relaunch, `running`
+        forever, dead terminal, no claude, and nothing re-checks."""
+        self._write_state("agent-recycled", pid=4242, ctrlPort=40001)
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_port_open", return_value=False) as port:
+            # The cheap beat-path read still says alive (a live pid is all it has).
+            self.assertTrue(ha._pty_alive("agent-recycled"))
+            # The boot/adopt read proves the pty-host and refuses.
+            self.assertFalse(ha._pty_alive("agent-recycled", strict=True))
+        self.assertTrue(port.called, "strict must probe the published control port")
+
+        # A genuinely live pty-host passes BOTH.
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_port_open", return_value=True):
+            self.assertTrue(ha._pty_alive("agent-recycled", strict=True))
+
+        # Strict must FAIL SHUT on a state file with no usable port: a false
+        # negative merely resumes the session, while a false positive strands it
+        # dead-but-`running` with no operator recovery.
+        self._write_state("agent-noport", pid=4242)
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pid_alive", return_value=True):
+            self.assertFalse(ha._pty_alive("agent-noport", strict=True))
+
+    def test_strict_is_windows_only_and_tmux_ignores_it(self):
+        """The tmux path is name-keyed and already exact, so it must not change
+        behaviour (or cost) when the adopt path asks for strict."""
+        sm = self.make_manager()
+        with mock.patch.object(ha, "IS_WINDOWS", False), \
+             mock.patch.object(ha, "run_ok", return_value=(0, "")) as ro:
+            self.assertTrue(sm._tmux_alive("agent-x", strict=True))
+        self.assertIn("has-session", ro.call_args[0][0])
+
+    def test_teardown_lets_the_pty_host_exit_cleanly_before_signalling(self):
+        """C8: on Windows `os.kill(pid, SIGTERM)` is TerminateProcess, so firing it
+        straight after the `kill` RPC PRE-EMPTS the clean teardown that RPC just
+        asked for — sockets die as 1006 (the client then reconnect-storms),
+        buffered output is lost, and the ConPTY child is left to handle closure.
+        The signal must be a FALLBACK, not the first move."""
+        self._write_state("agent-clean", pid=4242, ctrlPort=40002)
+        # The RPC lands: the host exits on its own during the grace window.
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pty_control", return_value={"ok": True}), \
+             mock.patch.object(ha, "_pty_still_running", return_value=False), \
+             mock.patch.object(ha, "os") as osmod:
+            osmod.path = os.path
+            osmod.remove = mock.Mock()
+            ha._pty_teardown("agent-clean")
+            self.assertFalse(osmod.kill.called,
+                             "a pty-host that exited on its own must never be signalled")
+
+        # It does NOT exit: the signal still backs the RPC up, so a wedged host is
+        # never left running.
+        self._write_state("agent-wedged", pid=4243, ctrlPort=40003)
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "PTY_CLEAN_EXIT_GRACE_SEC", 0.0), \
+             mock.patch.object(ha, "PTY_TEARDOWN_WAIT_SEC", 0.0), \
+             mock.patch.object(ha, "_pty_control", return_value={"ok": True}), \
+             mock.patch.object(ha, "_pty_still_running", return_value=True), \
+             mock.patch.object(ha, "os") as osmod:
+            osmod.path = os.path
+            osmod.remove = mock.Mock()
+            self.assertFalse(ha._pty_teardown("agent-wedged"),
+                             "a host still alive after the fallback reports not-torn-down")
+            self.assertTrue(osmod.kill.called, "the signal must still back the RPC up")
+
     def test_kill_tmux_tears_down_the_pty_host_on_windows(self):
         sm = self.make_manager()
         self._write_state("agent-w1", pid=999999, ctrlPort=40000)
