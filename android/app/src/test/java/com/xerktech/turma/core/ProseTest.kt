@@ -274,8 +274,8 @@ class ProseTest {
     @Test fun `whitespace follows JavaScript's definition, not Java's`() {
         // U+FEFF is whitespace to JS and not to Java; U+001C is the reverse. The
         // two ports must agree, or the same message renders differently.
-        assertTrue(styled(paras("**﻿a**").single().spans).isEmpty())
-        assertTrue(styled(paras("*a*").single().spans).isNotEmpty())
+        assertTrue(styled(paras("**\uFEFFa**").single().spans).isEmpty())
+        assertTrue(styled(paras("*\u001Ca*").single().spans).isNotEmpty())
     }
 
     @Test fun `a long delimiter run or rule line stays linear and does not overflow the stack`() {
