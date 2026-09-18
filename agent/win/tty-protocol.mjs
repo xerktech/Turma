@@ -80,12 +80,22 @@ export function decodeClientFrame(data) {
 // terminal open that needs two or three refreshes. Node's default
 // `server.keepAliveTimeout` is 5_000ms; the hub parks free channels for tens of
 // seconds, so the default GUARANTEES that race on any terminal whose assets are
-// more than ~5s apart. ttyd (libwebsockets) held connections far longer, which is
-// why the class is new on Windows.
+// more than ~5s apart.
+//
+// **This is NOT a Windows novelty — do not write that ttyd held connections
+// longer.** A real `ttyd 1.7.4 (libwebsockets 4.3.3)` was measured closing an
+// idle keep-alive connection after 5.0s, and `_launch_ttyd` passes no flag to
+// change it, so the same race is fleet-wide. Setting the window below only fixes
+// it where the origin is this pty-host; on Linux the mitigation is the hub's
+// bounded replay (`termRetryReset`), and no idle window the hub could pick sits
+// under 5s without re-dialling a tunnel channel every few seconds.
 //
 // **Invariant: KEEPALIVE_TIMEOUT_MS must stay comfortably ABOVE the hub Agent's
 // `timeout` (its free-socket idle window, TERM_AGENT_IDLE_MS in server.js).**
 // Both sides are pinned by tests; raise the hub's and this must rise with it.
+// Note the hub's number only evicts anything because `armChannelIdleTimeout`
+// gives its tunnel channels a real timer — a plain `timeout:` on the Agent is
+// inert there, since a channel is a Duplex whose `setTimeout` is a no-op stub.
 // `headersTimeout` must in turn exceed `keepAliveTimeout`, or Node arms a
 // headers deadline on an idle kept-alive socket and closes it early anyway.
 export const KEEPALIVE_TIMEOUT_MS = 75_000;

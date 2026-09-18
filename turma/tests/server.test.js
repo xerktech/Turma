@@ -17296,6 +17296,15 @@ test("term: the idle window is REAL on a tunnel channel, not just a number", () 
   c.setTimeout(20);
   c.setTimeout(0);
 
+  // ...and it is actually WIRED UP. Testing the helper alone leaves the bug
+  // intact: drop it from createConnection and every assertion below still passes
+  // while TERM_AGENT_IDLE_MS goes back to evicting nothing, which is exactly the
+  // state this was found in.
+  const wiring = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  assert.ok(/openChannel\(name, port\)[\s\S]{0,120}?armChannelIdleTimeout\(channel\)/.test(wiring),
+    "termAgentFor's createConnection must arm the idle timer on every channel it " +
+    "pools, or the Agent's timeout option is inert on a tunnel duplex");
+
   return new Promise((resolve) => setTimeout(() => {
     clearInterval(busy);
     assert.ok(fired.includes("a"), "an idle pooled channel must time out");
