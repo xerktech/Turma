@@ -1789,6 +1789,97 @@ test("watch -> transcript -> frame: the turn frame carries the live agents", asy
   }
 });
 
+// --- A10/A12: the live tail must not overlap itself, and must not wait a poll --
+test("A10: a second poll during an in-flight capture does not start a second one", async () => {
+  // captureLiveTurn is ASYNC (on Windows a fresh control WebSocket to the
+  // pty-host per call, bounded at 2000ms) while pollWatcher runs from a bare
+  // setInterval at LIVE_TAIL_MS=1000 — so a capture slower than the interval
+  // OVERLAPPED the next one. Two sockets per session is the mild case; against a
+  // wedged pty-host they pile up every tick, on the same event loop that bridges
+  // terminal bytes.
+  //
+  // This has to count CAPTURES, not frames: the `lastTurn` dedup collapses
+  // identical frames, so a frame count passes with the guard removed and proves
+  // nothing. The injected capture never settles on its own, which is exactly the
+  // slow/wedged case.
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "inflight-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const proj = path.join(PROJECTS_ROOT, mod.projectSlug(work));
+  fs.mkdirSync(proj, { recursive: true });
+  const tid = "aaaaaaaa-1111-2222-3333-444444444444";
+  const tpath = path.join(proj, `${tid}.jsonl`);
+  fs.appendFileSync(tpath, JSON.stringify({ type: "user", message: { content: "go" } }) + "\n");
+
+  let started = 0;
+  let inFlight = 0;
+  let peak = 0;
+  const pending = [];
+  mod.__setPaneCapture((sid, cb) => {
+    started++; inFlight++; peak = Math.max(peak, inFlight);
+    pending.push(() => { inFlight--; cb({ generating: false, text: "", status: null, agents: [] }); });
+  });
+  mod.__setControlSink(() => {});
+  try {
+    mod.startWatch("sess-inflight", work, tid);   // startWatch polls once
+    for (let i = 0; i < 25; i++) mod.pollWatcher("sess-inflight");
+    assert.equal(peak, 1, `only ONE capture may be in flight at a time (peak ${peak})`);
+    assert.equal(started, 1, `a poll burst must start exactly one capture (started ${started})`);
+
+    // The guard must RELEASE once the capture settles — a stuck flag would freeze
+    // the live turn permanently, which is the failure class this change removes.
+    pending.shift()();
+    mod.pollWatcher("sess-inflight");
+    assert.equal(started, 2, "a poll after the capture settled starts the next one");
+    assert.equal(peak, 1, "still never more than one at a time");
+  } finally {
+    while (pending.length) pending.shift()();
+    mod.stopWatch("sess-inflight");
+    mod.__setPaneCapture(null);
+    mod.__setControlSink(null);
+  }
+});
+
+test("A12: stopping a watch tears down its fs watch (no leak, no late poll)", async () => {
+  // The fs watch is a LATENCY optimisation over a poll that still runs, so the
+  // only thing that must hold is that it is cleaned up: a leaked watcher keeps a
+  // file handle for the process's life and can fire pollWatcher for a session
+  // that no longer exists.
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fswatch-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const proj = path.join(PROJECTS_ROOT, mod.projectSlug(work));
+  fs.mkdirSync(proj, { recursive: true });
+  const tid = "bbbbbbbb-1111-2222-3333-444444444444";
+  const tpath = path.join(proj, `${tid}.jsonl`);
+  fs.appendFileSync(tpath, JSON.stringify({ type: "user", message: { content: "go" } }) + "\n");
+
+  const frames = [];
+  mod.__setControlSink((o) => frames.push(o));
+  try {
+    mod.startWatch("sess-fswatch", work, tid);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(mod.__fsWatchCount(), 1, "the watch arms an fs watch on the transcript");
+    mod.stopWatch("sess-fswatch");
+    // The DIRECT assertion. A leaked FSWatcher is otherwise invisible until it
+    // surfaces as a file-handle leak on a long-lived host (and, before the
+    // handles were unref'd, as a process that would not exit).
+    assert.equal(mod.__fsWatchCount(), 0, "stopWatch must close the fs watch");
+    frames.length = 0;
+    // Touch the transcript AFTER the watch is stopped. Nothing may be emitted:
+    // pollWatcher returns early for an unknown session, and the fs watch itself
+    // should already be closed.
+    fs.appendFileSync(tpath, JSON.stringify({ type: "user", message: { content: "late" } }) + "\n");
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(frames.filter((f) => f.tail === "sess-fswatch" || f.turn === "sess-fswatch").length, 0,
+      "a stopped watch must emit nothing when its transcript changes");
+  } finally {
+    mod.__setControlSink(null);
+  }
+});
+
 // --- dsh live streaming (XERK: fold the native event log's assistant/chunk ----
 // dsh sessions have no Claude TUI pane, so the live `turn` frame is folded from
 // the driver's native event log (`assistant/chunk` deltas) instead of a pane

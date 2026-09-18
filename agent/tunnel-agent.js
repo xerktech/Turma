@@ -1329,6 +1329,12 @@ function captureLiveTurn(sessionId, cb) {
   );
 }
 
+// Indirection so a test can make a capture SLOW and count how many are in flight
+// at once — the only way to observe the in-flight guard, since frame-level dedup
+// (`lastTurn`) hides overlapping captures from the wire. Production assigns
+// captureLiveTurn itself, so the live path is unchanged.
+let paneCapture = captureLiveTurn;
+
 // Is this scraped live text a block the transcript has ALREADY committed?
 // While a tool call runs, the TUI keeps the finished prose on screen and
 // re-paints the block area every second, alternating between rendering the
@@ -1647,7 +1653,18 @@ function pollWatcher(sessionId) {
     pollDshTurn(w, sessionId);
     return;
   }
-  captureLiveTurn(sessionId, (live) => {
+  // A10: ONE capture in flight per watcher. `captureLiveTurn` is asynchronous
+  // (on Windows it opens a fresh control WebSocket to the pty-host per call,
+  // bounded at PTY_CAPTURE_TIMEOUT_MS = 2000), and this runs from a bare
+  // setInterval at LIVE_TAIL_MS = 1000 — so a capture slower than the interval
+  // OVERLAPS the next one. Two concurrent sockets per session is the mild case;
+  // against a wedged pty-host they pile up every tick and never converge, on the
+  // same event loop that bridges terminal bytes. Skipping a tick costs at most
+  // one frame of latency, which the next tick recovers.
+  if (w.capturing) return;
+  w.capturing = true;
+  paneCapture(sessionId, (live) => {
+    w.capturing = false;
     if (!watchers.has(sessionId)) return; // stopped mid-capture
     const d = liveTurnDecision(w.liveGen === true, w.livePending === true, live.generating);
     w.liveGen = d.gen;
@@ -1720,6 +1737,9 @@ function startWatch(sessionId, worktreePath, transcriptId) {
     existing.lastTail = null;
     existing.lastQueued = null;
     existing.lastTurn = "";
+    // The transcript may have MOVED (restart-clear-context re-points it), so
+    // re-arm the fs watch at the new file before polling.
+    armTranscriptWatch(sessionId, existing);
     pollWatcher(sessionId);
     return; // already tailing
   }
@@ -1754,6 +1774,7 @@ function startWatch(sessionId, worktreePath, transcriptId) {
   }
   watchers.set(sessionId, w);
   w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
+  armTranscriptWatch(sessionId, w);
   pollWatcher(sessionId); // emit an immediate snapshot, don't wait a full interval
   log(`live tail: watching ${sessionId}`);
 }
@@ -1762,13 +1783,74 @@ function stopWatch(sessionId) {
   const w = watchers.get(sessionId);
   if (!w) return;
   clearInterval(w.timer);
+  disarmTranscriptWatch(w);
   watchers.delete(sessionId);
   log(`live tail: stopped ${sessionId}`);
 }
 
 function stopAllWatches() {
-  for (const w of watchers.values()) clearInterval(w.timer);
+  for (const w of watchers.values()) { clearInterval(w.timer); disarmTranscriptWatch(w); }
   watchers.clear();
+}
+
+// A12: fire pollWatcher the moment the transcript changes, instead of waiting out
+// the poll.
+//
+// `LIVE_TAIL_MS` is a pure poll, so a committed turn waits 0-1000 ms (mean 500)
+// before it is even LOOKED at — the dominant term in the whole
+// agent->hub->browser path, ahead of every network hop. An fs watch collapses
+// that to the filesystem's own notification.
+//
+// **The interval is KEPT as the floor, never replaced.** fs.watch is the least
+// portable API in node: it misses events on network mounts and some containers,
+// reports renames as changes, can fire twice for one write, and silently stops
+// after an editor replaces a file by rename. Treating it as the only trigger
+// would freeze a chat on exactly the hosts that are hardest to debug. It is a
+// LATENCY OPTIMISATION over a poll that still runs — the same posture as the
+// heartbeat poke over the scheduled beat.
+//
+// Coalesced through a short timer so a burst of writes (Claude Code appends a
+// turn in several `write`s) costs ONE poll, not one per event, and so a watch
+// that double-fires is harmless.
+const TRANSCRIPT_WATCH_DEBOUNCE_MS = Number(process.env.TURMA_TAIL_WATCH_DEBOUNCE_MS) || 40;
+// Live FSWatcher handles, counted at create/close. This is the ONLY way to see
+// a leak: `watchers` loses its entry on stopWatch, so an orphaned handle is
+// absent from the map while still holding the file open.
+let openFsWatches = 0;
+function armTranscriptWatch(sessionId, w) {
+  let file = null;
+  try { file = sessionTranscript(w.worktreePath, w.transcriptId); } catch { file = null; }
+  if (!file) return;                       // no transcript yet; the poll covers it
+  if (w.watchPath === file && w.fsWatch) return;  // already watching this file
+  disarmTranscriptWatch(w);
+  try {
+    w.fsWatch = fs.watch(file, () => {
+      if (w.watchDebounce) return;
+      w.watchDebounce = setTimeout(() => {
+        w.watchDebounce = null;
+        if (watchers.has(sessionId)) pollWatcher(sessionId);
+      }, TRANSCRIPT_WATCH_DEBOUNCE_MS);
+      if (w.watchDebounce.unref) w.watchDebounce.unref();
+    });
+    // An 'error' on the watcher (the file was replaced, the mount went away) must
+    // not reach the process: there is no uncaughtException handler in this file,
+    // and killing the tunnel takes every session's terminal with it. Drop the
+    // watch and let the interval carry on alone.
+    w.fsWatch.on("error", () => disarmTranscriptWatch(w));
+    // Never let the watch be the reason this process stays alive. It is a
+    // latency optimisation over an interval that already runs, so it has no
+    // business holding the event loop open — and an unref'd handle cannot turn
+    // a missed teardown into a hung process.
+    if (w.fsWatch.unref) w.fsWatch.unref();
+    openFsWatches++;
+    w.watchPath = file;
+  } catch { w.fsWatch = null; w.watchPath = null; }  // unsupported fs: poll only
+}
+function disarmTranscriptWatch(w) {
+  if (w.watchDebounce) { clearTimeout(w.watchDebounce); w.watchDebounce = null; }
+  if (w.fsWatch) { try { w.fsWatch.close(); } catch { /* already closed */ } openFsWatches--; }
+  w.fsWatch = null;
+  w.watchPath = null;
 }
 
 // Nudge the session-manager process (hub-agent.py) to heartbeat immediately so
@@ -2080,7 +2162,14 @@ if (require.main === module) {
   connectControl();
 } else {
   module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn,
-    startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS,
+    startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; },
+    __setPaneCapture: (f) => { paneCapture = f || captureLiveTurn; },
+    // OPEN FSWatcher handles. Exported so a test can pin the teardown DIRECTLY:
+    // a leaked watcher is otherwise invisible until it shows up as a file-handle
+    // leak on a long-lived host. Counting `watchers` entries would NOT work —
+    // stopWatch deletes the entry, so an orphan is absent from the map while
+    // still holding the file.
+    __fsWatchCount: () => openFsWatches, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS,
     toolUseDetail, todoItems, fmtDshElapsed, dshStatus, edgeTrim,
     ptyCaptureWindows, ptyStatePath,
     usableHostname, deviceName, deviceDiscriminator };
