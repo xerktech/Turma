@@ -13689,6 +13689,38 @@ test("http: GET /api/ws-token is user-auth gated; returns {token, expiresInSec}"
 
 // ---- audio WebSocket (raw net socket, per the RFC 6455 helpers above) --------------
 
+// XERK-871: destroy every server-side UPGRADED socket after each test, so a WS
+// test that fails after its upgrade can't leave a socket open and hang the file.
+//
+// The class of bug: a test that opens a WebSocket only calls `.destroy()` on its
+// success path, so a failing assertion leaks the socket. Once UPGRADED, a socket
+// is detached from `server`'s connection tracking — `server.close()` does not
+// wait on it and `server.closeAllConnections()` does not reach it — so nothing
+// tears it down, and its live handle keeps the process from exiting. `node
+// --test` has no default timeout, so instead of the file finishing with the
+// failing test it runs until CI kills the job, which reads as flaky infra and
+// hides the regression. A handful of leaks completes; the aggregate hangs.
+//
+// Destroying the CLIENT half is not enough (a hub-held server half can linger),
+// so we track the SERVER-side UPGRADED sockets — the ones whose live handles
+// hold the process open — and destroy them in `afterEach`, which runs after each
+// test settles (pass OR fail). Only the `upgrade` event is hooked, never every
+// `connection`: a plain HTTP request's socket is reused by the test client's
+// keep-alive agent, so destroying those races the NEXT request into a "socket
+// hang up". This removes the class centrally, covering every WS helper with no
+// per-call-site change. It deliberately does NOT use the file-scoped
+// `test.after`: that runs in registration order AFTER the line-2247
+// `test.after(() => server.close())` and so never gets the chance (the ticket's
+// finding #3). Registered at module load, before `test.before` calls listen().
+const upgradedSockets = new Set();
+server.on("upgrade", (_req, s) => {
+  upgradedSockets.add(s);
+  s.on("close", () => upgradedSockets.delete(s));
+});
+test.afterEach(() => {
+  for (const s of upgradedSockets) { try { s.destroy(); } catch {} }
+});
+
 // Performs a raw HTTP Upgrade handshake against the live test server and
 // resolves once the status line + headers are in; `leftover` is any bytes
 // already read past the header terminator (the server may coalesce the 101
