@@ -1346,6 +1346,17 @@ test("renderProse: CRLF text still renders its markdown", () => {
   assert.equal(renderProse("a\rb"), "a\nb");
 });
 
+test("renderProse: a line separator is not a line ending (the ports must agree)", () => {
+  // Java's `$` matches before a final line terminator and JavaScript's does not,
+  // which is why the Kotlin port uses matchEntire rather than find. U+2028/U+2029
+  // are the probe: both runtimes exclude them from `.`, so BOTH sides must read
+  // these as prose. ProseTest.kt asserts the same two.
+  assert.doesNotMatch(renderProse("## H\u2028"), /<h2/);
+  assert.doesNotMatch(renderProse("## H\u2029"), /<h2/);
+  assert.doesNotMatch(renderProse("- a\u2028"), /<ul/);
+  assert.doesNotMatch(renderProse("1. a\u2029"), /<ol/);
+});
+
 test("renderInline: the emphasis scanner measures whole runs, never a capped count", () => {
   // Capping how far a delimiter run is counted was tried as a speed fix and
   // reverted: a saturated count made `m === len` true for a LONGER run and made
@@ -1369,9 +1380,19 @@ test("render: a tool block whose input isn't a string can't take the transcript 
 });
 
 test("renderProse: emphasis and markers stay linear on pathological input", () => {
-  // Every one of these took SECONDS before MARK_RUN_MAX + the noClose memo.
-  // The budget is generous (CI machines vary); the failure mode was ~10^3x this.
+  // Every one of these took SECONDS before the noClose memo. The budget is
+  // generous (CI machines vary); the failure mode was ~10^3x this.
+  //
+  // The first three are the ones that actually EXERCISE the memo: the trailing
+  // space makes every candidate closer fail the right-flanking rule, so each of
+  // the ~33k openers runs a full failing scan unless the memo stops it (measured
+  // 16.5s without it, 5ms with). The shapes below them all FIND their closer, so
+  // the memo never engages and they cannot catch its removal — don't drop the
+  // spaced ones thinking they are duplicates.
   const cases = [
+    "*a ".repeat(33333),
+    "~~a ".repeat(25000),
+    "**a ".repeat(25000),
     "x " + "~".repeat(100000),
     "x " + "*".repeat(100000),
     "*a".repeat(50000),

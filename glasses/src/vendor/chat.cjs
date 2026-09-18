@@ -333,8 +333,26 @@
     return '<code class="md-code-inline">' + esc(b) + "</code>";
   }
   function runLen(s, i) { let n = 0; while (s[i + n] === "`") n++; return n; }
+  // Line endings, normalised at EVERY entry point into the markdown passes — both
+  // renderProse and renderInline — so each pass splits on "\n" and sees a line
+  // with nothing trailing it, and the two agree about where a line ends.
+  //
+  // Without it a CRLF message rendered with NO markdown at all: every block rule
+  // ends `[ \t]*$`, and the "\r" that split("\n") leaves on each line defeated
+  // all of them, so a heading, a bullet and a rule all stayed raw text.
+  // Reachable from any tool result echoing a Windows file, a pasted CRLF
+  // message, or the native Windows agent.
+  //
+  // renderInline needs it for a DIFFERENT reason: a lone "\r" is a line break
+  // (CSS pre-wrap treats it as a segment break), and without normalising, an
+  // emphasis or code span would form ACROSS one — the exact thing the `\n` bail
+  // in findEmphClose exists to prevent. Android has ONE entry point and
+  // normalises there, so this is also what keeps the web's two in step with it.
+  function normalizeEol(s) {
+    return s.indexOf("\r") < 0 ? s : s.replace(/\r\n?/g, "\n");
+  }
   function renderInline(text) {
-    const s = String(text == null ? "" : text);
+    const s = normalizeEol(String(text == null ? "" : text));
     if (s.indexOf("`") < 0) return renderEmph(s); // no backtick → nothing to lift out
     let out = "", i = 0;
     while (i < s.length) {
@@ -721,17 +739,6 @@
   // bare ``` fence around SVG alike, without disturbing a fence that merely
   // contains an <svg> among other content.
   const SVG_FENCE = /^\s*<svg[\s>][\s\S]*<\/svg\s*>\s*$/i;
-  // Line endings are normalised ONCE, here at the outermost pass, so every pass
-  // below splits on "\n" and sees a line with nothing trailing it. Without this
-  // a CRLF message rendered with NO markdown at all: every block rule ends
-  // `[ \t]*$`, and the "\r" left on each line by split("\n") defeated all of
-  // them — so a heading, a bullet and a rule all stayed raw text. Reachable from
-  // any tool result echoing a Windows file, a pasted CRLF message, or the native
-  // Windows agent. A lone "\r" is a line break too (CSS pre-wrap treats it as a
-  // segment break), so it becomes one rather than surviving as an invisible char.
-  function normalizeEol(s) {
-    return s.indexOf("\r") < 0 ? s : s.replace(/\r\n?/g, "\n");
-  }
   function renderProse(text) {
     const s = normalizeEol(String(text == null ? "" : text));
     if (s.indexOf("```") < 0) return renderSvgAndText(s); // no fence → still scan for raw SVG
@@ -1436,10 +1443,11 @@
     const statusCls = it.result ? (it.result.isError ? "err" : "ok") : "";
     // A plan card's salient line is the plan itself; a SendUserFile card's is its
     // caption or a file count — not the raw input JSON either would fall back to.
-    // String()-guarded: a block whose `input` arrived as an object rather than a
-    // string threw a TypeError out of itemsToHtml and took the WHOLE transcript
-    // render down with it. The live agent clips input to a string, so this is
-    // defence against a malformed/forged block, not a shape we see.
+    // String()-guarded, here and at every other `<field>.split("\n")` on a card
+    // (desc, caption, args): a block whose field arrived as an object rather
+    // than a string threw a TypeError out of itemsToHtml and took the WHOLE
+    // transcript render down with it. The live agent clips these to strings, so
+    // this is defence against a malformed/forged block, not a shape we see.
     const argSrc = it.plan || (it.files ? "" : (it.input ? String(it.input) : ""));
     // A plan's first line is MARKDOWN, and the card collapses it to one line —
     // so the syntax has to come off, or the header reads "ExitPlanMode ## The
@@ -1448,10 +1456,10 @@
     // eat the glob out of an `ls *.js` chip.
     let argOne = argSrc ? esc(it.plan ? chipLine(argSrc) : argSrc.split("\n")[0]) : "";
     if (it.files && !argOne) {
-      argOne = esc(it.caption ? it.caption.split("\n")[0]
+      argOne = esc(it.caption ? String(it.caption).split("\n")[0]
         : it.files.length + (it.files.length === 1 ? " file" : " files"));
     }
-    const descOne = it.desc ? '<span class="tool-desc">' + esc(it.desc.split("\n")[0]) + "</span>" : "";
+    const descOne = it.desc ? '<span class="tool-desc">' + esc(String(it.desc).split("\n")[0]) + "</span>" : "";
     let body = "";
     // A SendUserFile delivery renders its files (the point of the card); its raw
     // input JSON would just be the same paths, so it's suppressed when files show.
@@ -1508,7 +1516,7 @@
   function renderCommandCard(it) {
     const key = "cmd:" + it.id;
     const head = '<span class="cmd-glyph">›</span><span class="cmd-name">' + esc(it.name) + "</span>" +
-      (it.args ? '<span class="cmd-args">' + esc(it.args.split("\n")[0]) + "</span>" : "");
+      (it.args ? '<span class="cmd-args">' + esc(String(it.args).split("\n")[0]) + "</span>" : "");
     if (!it.result) {
       return '<div class="cmd-card" data-uuid="' + esc(it.id) + '">' + head +
         clipMark(it.argsTrunc) + "</div>";

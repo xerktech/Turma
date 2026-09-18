@@ -286,11 +286,55 @@ class ProseTest {
         for (src in listOf("-".repeat(100_000), "*".repeat(100_000), "_".repeat(100_000))) {
             assertEquals(listOf(ProseBlock.Rule), parseProse(src))
         }
-        for (src in listOf("x " + "~".repeat(100_000), "x " + "*".repeat(100_000), "*a".repeat(20_000))) {
+        // The SPACED shapes are the ones that exercise the noClose memo: the
+        // trailing space makes every candidate closer fail the right-flanking
+        // rule, so each opener runs a full failing scan unless the memo stops it.
+        // The unspaced ones all FIND their closer and so cannot catch its
+        // removal — keep both.
+        for (src in listOf(
+            "*a ".repeat(33_333), "~~a ".repeat(25_000), "**a ".repeat(25_000),
+            "x " + "~".repeat(100_000), "x " + "*".repeat(100_000), "*a".repeat(20_000),
+        )) {
             val t0 = System.nanoTime()
             parseProse(src)
             val ms = (System.nanoTime() - t0) / 1_000_000
             assertTrue("parseProse took ${ms}ms on ${src.length} chars", ms < 3000)
+        }
+    }
+
+    @Test fun `the emphasis scanner measures whole runs, never a capped count`() {
+        // The twin of chat.test.js's "measures whole runs". Capping how far a
+        // delimiter run is counted was tried as a speed fix and reverted: a
+        // saturated count made `m == len` true for a LONGER run and resumed the
+        // scan INSIDE one, fabricating emphasis on input that had none.
+        assertTrue(styled(paras("~~~~~~# x~~~~").single().spans).isEmpty())
+        assertEquals("~~~~~~# x~~~~", plain(paras("~~~~~~# x~~~~").single().spans))
+        assertTrue(styled(paras("****1. y ~~*aa").single().spans).isEmpty())
+        assertEquals("****1. y ~~*aa", plain(paras("****1. y ~~*aa").single().spans))
+        val bold = styled(paras("**a b*****c**").single().spans).first()
+        assertTrue(bold.bold)
+        assertEquals("a b*****c", plain(bold.spans))
+        val em = styled(paras("see *a******* q").single().spans).first()
+        assertTrue(em.italic)
+        assertEquals("a", plain(em.spans))
+    }
+
+    @Test fun `a non-CR Java line terminator does not end a line`() {
+        // Java's `$` also matches BEFORE a final line terminator and JavaScript's
+        // does not, so the anchored line patterns use matchEntire, not find. CR
+        // alone cannot pin that (normalizeEol already handles it); U+2028/U+2029
+        // survive normalisation, are Java line terminators, and are ALSO excluded
+        // from JavaScript's `.` — so the web reads these as prose too, and this
+        // pins the two ports to the same answer.
+        //
+        // U+0085 NEL is deliberately NOT here: it is a Java line terminator that
+        // JavaScript's `.` happily matches, so the ports genuinely disagree on it
+        // and asserting either answer would codify that. See turma-sessions.md.
+        for (t in listOf("## H\u2028", "## H\u2029")) {
+            assertTrue("should not be a heading: " + t.map { it.code }, headings(t).isEmpty())
+        }
+        for (t in listOf("- a\u2028", "1. a\u2029")) {
+            assertTrue("should not be a list: " + t.map { it.code }, lists(t).isEmpty())
         }
     }
 

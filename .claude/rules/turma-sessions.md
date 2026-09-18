@@ -109,9 +109,18 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
     obvious `/(?:\[\w+\])+$/` is unanchored on the left and retries from every `[`.
     - **The memo is keyed on where the ENTRY-INDEPENDENT scan starts, not on `from`.** `from` can
       land INSIDE a delimiter run, and the partial run it measures there is a candidate no other
-      scan of that line sees — so that one is tested first, before the memo is consulted. Keying on
-      `from` looks right and is not: it silently drops closers. Tests: the emphasis differential
-      cases in `chat.test.js`.
+      scan of that line sees — so that one is tested first, before the memo is consulted, and the
+      memo covers only the part of the scan that depends on the index alone. That is what makes
+      "a failure here means a failure for every later opener" true rather than merely plausible.
+      Measured output-neutral (memo on vs off) over 550k renders + the whole real corpus. Keying on
+      `from` has not been shown to change output — the entry-dependent candidate can only ever
+      return `from`, which the caller's empty-span check rejects — so treat this as belt and
+      braces, not as a bug fix, and do not "simplify" it away on the strength of that.
+    - **The memo is the ONLY thing keeping emphasis linear**, so it needs a shape whose closer
+      scans FAIL to catch its removal: `"*a ".repeat(33333)` is 5ms with it and 16.5s without,
+      while every shape that FINDS its closer costs nothing either way. Both ports' perf tests
+      carry the spaced shapes for exactly that reason. Tests: `renderProse: emphasis and markers
+      stay linear on pathological input` (`chat.test.js`), its `ProseTest.kt` twin.
     - **Capping the run count was tried and REVERTED.** It bought nothing the memo doesn't already
       give, and it changed output — a saturated count made `m === len` true for a longer run and
       resumed the scan INSIDE one, fabricating emphasis on input that had none. Don't re-add it.
@@ -124,12 +133,22 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
     omits U+00A0 and U+FEFF and adds U+001C..U+001F, so the platform's answer made the same message
     render differently on the two clients. For the same family of reason Kotlin uses `matchEntire`,
     not `find`, on the fully-anchored line patterns: **Java's `$` also matches BEFORE a final line
-    terminator and JavaScript's does not.**
-  - **Line endings are normalised ONCE, at `renderProse`/`parseProse`.** Every block rule ends
+    terminator and JavaScript's does not.** Pinned by the U+2028/U+2029 cases in `chat.test.js` +
+    `ProseTest.kt` — CR alone cannot pin it, because the normalisation below already handles CR.
+    - **Two exotic-whitespace classes still differ and are knowingly left.** U+0085 NEL is a Java
+      line terminator that JavaScript's `.` matches, so `## H<NEL>` is a heading on the web and
+      prose on Android; and `FENCE_OPEN`'s `\s` is each runtime's own (NBSP, BOM and friends open
+      a fence on one side and not the other, in both directions). Neither appears anywhere in the
+      real corpus. Don't assert either answer in a test — that codifies the disagreement.
+  - **Line endings are normalised at EVERY entry point** — `renderProse` AND `renderInline` on the
+    web, `parseProse` on Android (its only one). Every block rule ends
     `[ \t]*$`, so the `\r` that `split("\n")` leaves behind defeated all of them and a CRLF message
     rendered with NO markdown at all — reachable from any tool result echoing a Windows file, or
     from the native Windows agent. A lone `\r` becomes `\n` (CSS pre-wrap treats it as a segment
-    break anyway).
+    break anyway). `renderInline` needs it for its own reason: the live bubble goes through that
+    entry point, and un-normalised, an emphasis or code span would form ACROSS a lone `\r` — the
+    thing `findEmphClose`'s newline bail exists to prevent. Leaving one entry point unnormalised
+    also puts the web's two out of step with each other and with Android's one.
   - A **wrapped bullet's continuation line belongs to its item** (GFM lazy continuation: more
     indented, not itself a construct). Without it a wrap ended the list, printed its own second
     line as a bare paragraph flush left, and started a new list underneath — 3% of the real
