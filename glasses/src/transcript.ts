@@ -17,19 +17,29 @@ export function emptyBuffer(): TranscriptBuffer {
 }
 
 // The agent's cheap tail flattener (`hub-agent.py:_entry_text`) appends a
-// bracketed `[ToolName]` marker for every tool_use block in an assistant turn
-// — e.g. "done[Bash]", or a pure tool-call turn "[Read][Edit]". The
-// Sessions-page web chat now renders its "Concise" verbosity by omitting tool
+// bracketed `[ToolName]` marker for every tool_use block in an assistant turn,
+// concatenated with no separator and always at the very END of the text —
+// e.g. "done[Bash][Read]", or a pure tool-call turn "[Read][Edit]". The
+// Sessions-page web chat renders its "Concise" verbosity by omitting tool
 // actions entirely (only user/assistant message text shows). The glasses view
 // is inherently that same text-only surface, so we match Concise by stripping
 // those markers here, at ingest — the buffer and render then both see the same
-// clean, tool-free text. Only assistant turns
-// carry the markers (tool_use blocks never appear in user turns, and
-// tool_result blocks are already dropped upstream), so user text — which may
-// legitimately contain brackets — is left untouched. Tool names are CapitalCase
-// (Bash, WebFetch, AskUserQuestion) or MCP `server__tool` identifiers, always
-// concatenated with no separator, matching the format `_entry_text` emits.
-const TOOL_MARKER = /\[[A-Za-z][A-Za-z0-9_]*\]/g;
+// clean, tool-free text.
+//
+// We strip ONLY that TRAILING run, and only when it ABUTS its text — that is
+// what tells a real marker apart from ordinary bracketed prose (XERK-862). A
+// real marker is never preceded by a space or tab (prose "the plan [WIP]" or
+// "see the [notes] section" puts a space before its bracket; a flattened marker
+// abuts its text or a line break), and, being appended at the end, always sits
+// at the tail. So "the plan [WIP]", "see [1]" and a mid-sentence "[notes]" all
+// survive, while a real trailing "done[Bash][Read]" is still hidden. Names
+// allow a hyphen for hyphenated subagent types (qa-delta) on top of the
+// CapitalCase tools (Bash, WebFetch) and MCP `server__tool` identifiers.
+//
+// Only assistant turns carry the markers (tool_use blocks never appear in user
+// turns, and tool_result blocks are already dropped upstream), so user text is
+// left untouched by conciseEntry.
+const TOOL_MARKER = /(?<![ \t])(?:\[[A-Za-z][A-Za-z0-9_-]*\])+$/;
 
 // Markdown syntax renders as literal noise on the tiny monochrome display: the
 // glasses can't show weight, so bold `**…**` and inline `` `code` `` fences add

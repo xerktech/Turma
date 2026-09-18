@@ -93,24 +93,32 @@ describe("prependHistory", () => {
 });
 
 describe("concise ingest (matches the web chat's Concise verbosity)", () => {
-  it("strips inline [ToolName] markers from an assistant turn's text", () => {
+  it("strips the trailing [ToolName] run from an assistant turn's text", () => {
     expect(conciseText("done[Bash]")).toBe("done");
-    expect(conciseText("reading[Read]then[Edit]done")).toBe("readingthendone");
-    expect(conciseText("[mcp__unifi__list]checking")).toBe("checking");
+    expect(conciseText("done[Bash][Read][Edit]")).toBe("done");
+    expect(conciseText("checking[mcp__unifi__list]")).toBe("checking");
   });
 
   it("reduces a pure tool-call turn to empty text", () => {
     expect(conciseText("[Read][Edit]")).toBe("");
   });
 
-  it("leaves ordinary text (including non-tool brackets) untouched", () => {
+  it("strips a trailing run of a hyphenated subagent name (qa-delta)", () => {
+    expect(conciseText("handing off[Agent][qa-delta]")).toBe("handing off");
+  });
+
+  it("keeps bracketed prose — only a genuine trailing abutting run is a marker", () => {
+    // The bug (XERK-862): these are ordinary prose, not tool markers, and must survive.
+    expect(conciseText("see the [notes] section")).toBe("see the [notes] section");
+    expect(conciseText("the plan [WIP]")).toBe("the plan [WIP]");
+    expect(conciseText("see [1]")).toBe("see [1]");
     expect(conciseText("the value at index [0] is 3")).toBe("the value at index [0] is 3");
     expect(conciseText("plain reply")).toBe("plain reply");
   });
 
   it("strips tool markers from assistant entries on the way into the buffer", () => {
-    const buf = mergeTail(emptyBuffer(), [entry("1", "compiling[Bash]done")]);
-    expect(buf.entries[0]?.text).toBe("compilingdone");
+    const buf = mergeTail(emptyBuffer(), [entry("1", "compiling done[Bash]")]);
+    expect(buf.entries[0]?.text).toBe("compiling done");
   });
 
   it("never rewrites user text (tool markers can't appear there, brackets are the user's)", () => {
@@ -119,8 +127,8 @@ describe("concise ingest (matches the web chat's Concise verbosity)", () => {
   });
 
   it("strips markers on history entries too", () => {
-    const buf = prependHistory(emptyBuffer(), [entry("1", "ran[Grep]nothing")], false);
-    expect(buf.entries[0]?.text).toBe("rannothing");
+    const buf = prependHistory(emptyBuffer(), [entry("1", "ran, found nothing[Grep]")], false);
+    expect(buf.entries[0]?.text).toBe("ran, found nothing");
   });
 
   it("keeps the shorter-preview clobber guard working on stripped lengths", () => {
