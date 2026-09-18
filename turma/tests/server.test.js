@@ -21054,7 +21054,7 @@ function collectLiveFrames(sock) {
 // pane dead again -- a test that drives the exported pure function certifies a
 // coercer nobody calls. So this drives a real /agent/control frame and asserts
 // what a real /live SUBSCRIBER receives.
-test("live WS: a hostile agent tail frame reaches the viewer COERCED", async () => {
+test("live WS: a hostile agent tail frame reaches the viewer COERCED", async (t) => {
   const host = "coerce-wire";
   agents[host] = {
     device: host, online: true, lastSeen: Date.now(),
@@ -21066,6 +21066,17 @@ test("live WS: a hostile agent tail frame reaches the viewer COERCED", async () 
   const token = await issueToken();
   const live = await wsConnect(`/live/${host}/cw1?auth=${token}`);
   assert.match(live.statusLine, /^HTTP\/1\.1 101/);
+  // Teardown must run on the FAILURE path too. Destroying the sockets only
+  // after the assertions means any failure -- a plain assertion failure, not
+  // just a throw -- leaks two open sockets, the file never exits, and
+  // `node --test` (which has no default timeout) reports a CI JOB TIMEOUT
+  // rather than a failing test. A regression on this wire path would then look
+  // like flaky infrastructure. Measured: 28 minutes before it was killed.
+  t.after(() => {
+    try { live.socket.destroy(); } catch {}
+    try { ctrl.socket.destroy(); } catch {}
+    delete agents[host];
+  });
   const frames = collectLiveFrames(live.socket);
 
   ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({
@@ -21074,10 +21085,15 @@ test("live WS: a hostile agent tail frame reaches the viewer COERCED", async () 
               { id: "h2", role: "assistant", text: "y", blocks: 5 }],
     queued: ["ok", {}, ["x"]],
   }))));
-  await waitFor(() => frames.some((f) => f.type === "tail" && f.entries.some((e) => e.id === "h1")), 2000);
+  // TOTAL on purpose: under a mutation that reverts the call site the viewer
+  // receives the RAW entries, `null` among them, so `e.id` throws inside
+  // waitFor's interval -- which is never cleared, so the test fails AND hangs.
+  await waitFor(() => frames.some((f) =>
+    f.type === "tail" && Array.isArray(f.entries)
+      && f.entries.some((e) => e && e.id === "h1")), 2000);
 
   const tail = frames.filter((f) => f.type === "tail").pop();
-  assert.deepStrictEqual(tail.entries.map((e) => e.id), ["h1", "h2"], "non-object entries dropped");
+  assert.deepStrictEqual(tail.entries.map((e) => e && e.id), ["h1", "h2"], "non-object entries dropped");
   assert.deepStrictEqual(tail.entries[0].blocks, [], "a null block never reaches the viewer");
   assert.deepStrictEqual(tail.entries[1].blocks, [], "a non-array blocks is rewritten, not forwarded");
   assert.deepStrictEqual(tail.queued, ["ok"], "queued is a List<String> on the clients");
@@ -21092,9 +21108,37 @@ test("live WS: a hostile agent tail frame reaches the viewer COERCED", async () 
   assert.ok(!("hint" in turn.status), "a non-string hint never reaches the viewer");
   assert.equal(turn.status.verb, "Bashing", "and the rest of the status survives");
 
-  live.socket.destroy();
-  ctrl.socket.destroy();
-  delete agents[host];
+  // A non-object status becomes null rather than riding through, and the
+  // esc()-only leaves survive as themselves (dropping them would blank a
+  // counter a real agent legitimately sends as a number).
+  ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({
+    turn: "cw1", text: "t2", status: "not-an-object",
+  }))));
+  await waitFor(() => frames.filter((f) => f.type === "turn").length >= 2, 2000);
+  assert.equal(frames.filter((f) => f.type === "turn").pop().status, null,
+    "a non-object status is nulled, not forwarded");
+
+  ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({
+    turn: "cw1", text: "t3", status: { verb: "Working", up: 1200, down: "300", elapsed: "3s" },
+  }))));
+  await waitFor(() => frames.filter((f) => f.type === "turn").length >= 3, 2000);
+  const ok = frames.filter((f) => f.type === "turn").pop().status;
+  assert.deepStrictEqual([ok.verb, ok.up, ok.down, ok.elapsed], ["Working", 1200, "300", "3s"],
+    "esc()-only leaves survive, numbers included");
+
+  // ...and a non-primitive in one of them is DROPPED. Asserting only that good
+  // values survive cannot see this arm being deleted -- removing it makes the
+  // coercion MORE permissive, so every legitimate value still passes.
+  ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({
+    turn: "cw1", text: "t4",
+    status: { verb: {}, up: [], down: true, elapsed: { a: 1 }, hint: "kept" },
+  }))));
+  await waitFor(() => frames.filter((f) => f.type === "turn").length >= 4, 2000);
+  const bad = frames.filter((f) => f.type === "turn").pop().status;
+  for (const k of ["verb", "up", "down", "elapsed"]) {
+    assert.ok(!(k in bad), `a non-primitive status.${k} must not reach the viewer`);
+  }
+  assert.equal(bad.hint, "kept", "and a good hint beside it survives");
 });
 
 // /history is the SAME kill with no control socket at all -- one heartbeat.
@@ -21110,5 +21154,30 @@ test("history: a malformed block is coerced at ingest, not served raw", async ()
   assert.deepStrictEqual(h.entries.map((e) => e.id), ["e1"]);
   assert.deepStrictEqual(h.entries[0].blocks, [], "a null block must not reach GET .../history");
   assert.deepStrictEqual(h.queued, ["ok", 7]);
+  // `truncated` is a typed Boolean on Android (Models.kt), so a non-bool here
+  // is decode-fatal for the whole /history response -- the wire contract's own
+  // rule. `agentsTruncated` beside it was already `!!`-coerced.
+  hub.ingestHistory(agents[host], [{ sessionId: "h2", entries: [], truncated: "yes" }]);
+  assert.strictEqual(agents[host].history.h2.truncated, true, "truncated is coerced to a Boolean");
+  delete agents[host];
+});
+
+// The SAME kill on the background-agent transcript pane. It had no test at all:
+// reverting this coercion left the entire hub suite green while the subagent
+// view died with `Cannot read properties of null (reading 't')`.
+test("subagent history: a malformed block is coerced at ingest too", async () => {
+  const host = "coerce-sub";
+  agents[host] = { device: host, online: true, lastSeen: Date.now(),
+    subagentHistory: {}, sessions: [] };
+  hub.ingestSubagentHistory(agents[host], [{
+    sessionId: "s1", type: "qa", label: "checking", agentId: "",
+    entries: [null, { id: "e1", role: "assistant", text: "agent said", blocks: [
+      null, { t: "tool_use", name: "Edit", edit: { old: 5, new: 5 } }] }],
+  }]);
+  const rec = Object.values(agents[host].subagentHistory)[0];
+  assert.deepStrictEqual(rec.entries.map((e) => e && e.id), ["e1"], "non-object entries dropped");
+  assert.deepStrictEqual(rec.entries[0].blocks.length, 1, "a null block is dropped");
+  const edit = rec.entries[0].blocks[0].edit;
+  assert.ok(!("old" in edit) && !("new" in edit), "non-string edit leaves are dropped");
   delete agents[host];
 });

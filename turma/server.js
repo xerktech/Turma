@@ -6454,7 +6454,10 @@ function ingestHistory(agent, historyResults) {
     // verbatim by GET .../history, so a malformed block here kills the pane the
     // same way -- and reachable from ONE heartbeat, with no control socket.
     const { entries, queued } = coerceTailFrame(r);
-    agent.history[r.sessionId] = { entries, truncated: r.truncated, queued, fetchedAt: now };
+    // `truncated` is a TYPED Boolean on Android, so a non-bool is decode-fatal
+    // for the whole /history response -- the wire contract's rule. Its sibling
+    // `agentsTruncated` in ingestSubagentHistory was already `!!`-coerced.
+    agent.history[r.sessionId] = { entries, truncated: !!r.truncated, queued, fetchedAt: now };
   }
   for (const [sessionId, h] of Object.entries(agent.history)) {
     if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.history[sessionId];
@@ -18674,6 +18677,7 @@ if (process.env.TURMA_TEST) {
     // frame is forwarded, and it is the BROWSER that dies on it.
     coerceTailFrame,
     ingestHistory,
+    ingestSubagentHistory,
     coerceLiveStatus,
     // The create single-flight's backstop, exported so a test can hold the
     // PRODUCTION default rather than the wound-down one the suite runs with —
