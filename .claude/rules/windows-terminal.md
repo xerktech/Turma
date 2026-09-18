@@ -262,3 +262,45 @@ to undo here. Detail: `agent/win/README.md`.
   `test_a_blank_capture_reads_as_cant_tell_not_as_idle` in `test_hub_agent.py`.
   **C9 and C15 live in `pty-host.mjs`, the I/O shell, which needs node-pty and is
   excluded from CI — both are HOST-VERIFIED ONLY**, like the rest of that file.
+
+## Liveness proof and teardown order (C7/C8/C13)
+
+- **The BOOT/adopt decision proves the pty-host, not a pid** (`_pty_alive(..., strict=True)`,
+  reached via `_tmux_alive(..., strict=True)` from `resume_on_boot`). The state
+  file is removed ONLY by `_pty_teardown`, so a hard stop — reboot, SIGKILL, OOM,
+  a WinSW force-kill — leaves it naming a DEAD pid, and Windows recycles pids from
+  a small space. A pid check alone then reads an unrelated process as this session
+  and ADOPTS a session that is not there: no relaunch, `running` forever, dead
+  terminal, no claude, and nothing re-checks. Strict additionally probes the
+  published `ctrlPort`. It **fails shut** (an absent/garbage port reads closed) —
+  a false negative merely resumes the session, while a false positive strands it
+  dead-but-`running` with no operator recovery. The Linux path is name-keyed
+  (`tmux has-session`) and cannot hit this, so it ignores the flag.
+  - **Strict is NOT for the beat.** It costs a loopback connect, and the beat's
+    liveness scan runs per session per beat under `OFFLINE_AFTER_MS`. A recycled
+    pid mid-run is also far less reachable — this manager spawned that pty-host.
+- **The teardown SIGNAL is a fallback, never the first move** (C8,
+  `PTY_CLEAN_EXIT_GRACE_SEC`). `os.kill(pid, SIGTERM)` on Windows is NOT a signal:
+  it maps to `TerminateProcess` for every signal but `CTRL_*_EVENT`, so the
+  pty-host's own handler never runs there. Firing it immediately after the `kill`
+  RPC PRE-EMPTED the clean teardown that RPC had just asked for — sockets died as
+  1006 (so the client reconnect-stormed), buffered output was lost, and the ConPTY
+  child was left to handle closure. `_pty_teardown` now waits out a short grace
+  for the host to exit on its own and only signals if it did not. The state file
+  is still kept when the reap fails (C3), so a wedged host is retried, not orphaned.
+- **`dropTermAgents` matches on the `host:` PREFIX only** (C13). Keys are always
+  `` `${name}:${port}` ``, so the old `key === name` arm could never match and read
+  as a second matching rule that was not one. The `:` is what stops host `a`
+  dropping host `ab`'s pools.
+- **`_pty_task_cleanup` removes the `.spawn.json` as well as the `.cmd`** (C13).
+  That file carries `TURMA_TOKEN` and the whole launch env, and only the SPAWNER
+  removed it — so a `schtasks /run` that succeeded while the task engine never
+  launched the spawner (or a manager that died in between) left a
+  credential-bearing file on disk indefinitely. It is `restrict_file_to_owner`'d
+  at write, so this is defence in depth, but a secret with no reader should not
+  outlive the thing that needed it.
+- Tests: `test_strict_liveness_refuses_a_recycled_pid`,
+  `test_strict_is_windows_only_and_tmux_ignores_it`,
+  `test_teardown_lets_the_pty_host_exit_cleanly_before_signalling`. Both were
+  mutation-checked: restoring the pid-only read fails the first, and restoring the
+  unconditional `os.kill` fails the third.

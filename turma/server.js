@@ -14203,8 +14203,13 @@ function termAgentFor(name, port) {
 // Tear down a host's pooled terminal channels when its tunnel drops, so a later
 // asset request opens a fresh channel instead of reusing a dead one.
 function dropTermAgents(name) {
+  // Keys are ALWAYS `${name}:${port}` (see termAgentFor), so the old
+  // `key === name` arm could never match — it read as a second matching rule
+  // that was not one. The prefix test is the whole rule; the `:` is what stops
+  // host `a` dropping host `ab`'s pools.
+  const prefix = name + ":";
   for (const [key, agent] of termAgents) {
-    if (key === name || key.startsWith(name + ":")) {
+    if (key.startsWith(prefix)) {
       try { agent.destroy(); } catch {}
       termAgents.delete(key);
     }

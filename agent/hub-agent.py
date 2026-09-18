@@ -9785,6 +9785,12 @@ PTY_CONTROL_BEAT_TIMEOUT_SEC = _env_float(
 # the old terminal port to be released before rebinding it — the Windows analog of
 # the Linux ttyd relaunch's port-release wait.
 PTY_TEARDOWN_WAIT_SEC = _env_float("PTY_TEARDOWN_WAIT_SEC", 3.0, minimum=0.0)
+# How long to let the pty-host exit on its OWN after the `kill` RPC, before
+# falling back to a signal. On Windows that fallback is TerminateProcess, which
+# pre-empts the clean socket close + drain the RPC triggers — so this grace is
+# what makes the clean path reachable at all there. Short: teardown is on the
+# path of kill/restart/model-switch, and the signal still backs it up.
+PTY_CLEAN_EXIT_GRACE_SEC = _env_float("TURMA_PTY_CLEAN_EXIT_GRACE_SEC", 0.6, minimum=0.0)
 PTY_PORT_RELEASE_WAIT_SEC = _env_float("PTY_PORT_RELEASE_WAIT_SEC", 2.0, minimum=0.0)
 # How long to wait for a freshly-spawned pty-host to publish its state file with
 # bound ports — the analog of a `tmux new-session` either succeeding or failing.
@@ -9851,10 +9857,18 @@ def _pty_task_cleanup(tmux_name):
     INSTANCE that keeps running after the definition is deleted, so this is safe once the run has
     been triggered; also called on teardown/timeout. Best-effort."""
     run(["schtasks", "/delete", "/tn", _pty_task_name(tmux_name), "/f"])
-    try:
-        os.remove(os.path.join(PTY_HOST_DIR, f"{tmux_name}.spawn.cmd"))
-    except OSError:
-        pass
+    # BOTH files, not just the .cmd wrapper. The .spawn.json carries TURMA_TOKEN
+    # and the whole launch env, and only the SPAWNER removed it — so if
+    # `schtasks /run` succeeded but the task engine never launched the spawner
+    # (or this manager died in between), a credential-bearing file lingered on
+    # disk indefinitely. It is `restrict_file_to_owner`'d at write, so this is
+    # defence in depth rather than the only control, but a secret with no reader
+    # should not outlive the thing that needed it.
+    for suffix in ("spawn.cmd", "spawn.json"):
+        try:
+            os.remove(os.path.join(PTY_HOST_DIR, f"{tmux_name}.{suffix}"))
+        except OSError:
+            pass
 
 
 def _launch_pty_via_task(tmux_name, argv, cwd, env, log_path):
@@ -10390,19 +10404,43 @@ def _answer_trust_dialog(tmux_name, cap=None):
     return True
 
 
-def _pty_alive(tmux_name):
+def _pty_alive(tmux_name, strict=False):
     """has-session analog: whether the session's pty-host (and therefore its pty)
     is still up. The pty-host exits ~immediately after its pty child exits, so
     its pid being alive tracks a live session exactly as a live tmux does — and a
-    cheap pid check keeps this off the network on the beat's liveness scan."""
+    cheap pid check keeps this off the network on the beat's liveness scan.
+
+    `strict=True` additionally proves the PTY-HOST, not merely *a* process with
+    that pid, by probing its control port (XERK C7). The state file is removed
+    only by `_pty_teardown`, so a hard stop — host reboot, SIGKILL, OOM, a WinSW
+    force-kill — leaves it on disk naming a DEAD pid. Windows recycles pids
+    aggressively and from a small space, so that pid can already belong to an
+    unrelated process, and the pid check then reads a session that is not there
+    as ALIVE. The cost of believing it is high and silent: `resume_on_boot` takes
+    the ADOPT branch, never relaunches, and the session reports `running` forever
+    with a dead terminal and no claude. The Linux path cannot hit this at all —
+    `tmux has-session` is keyed by NAME.
+
+    Strict is for the BOOT/adopt decision, not the beat: it adds a loopback
+    connect, and the beat's liveness scan runs per session per beat under the
+    `OFFLINE_AFTER_MS` budget. A recycled pid mid-run is also far less reachable,
+    since this manager spawned that pty-host itself."""
     st = _pty_read_state(tmux_name)
     if not st:
         return False
     pid = st.get("pid")
     try:
-        return bool(pid) and _pid_alive(int(pid))
+        if not (bool(pid) and _pid_alive(int(pid))):
+            return False
     except (TypeError, ValueError):
         return False
+    if not strict:
+        return True
+    # A live pid AND something answering on the port it published. `_port_open`
+    # reads any error as closed, so an absent/garbage ctrlPort fails shut — which
+    # is the safe direction here: a false NEGATIVE relaunches the session, while a
+    # false positive strands it dead-but-`running` with no operator recovery.
+    return _port_open(st.get("ctrlPort"))
 
 
 # The pids THIS process Popen'd as pty-hosts (POSIX only). `_pty_still_running`
@@ -10472,10 +10510,25 @@ def _pty_teardown(tmux_name):
         except (TypeError, ValueError):
             pid = None
         if pid:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (OSError, TypeError, ValueError):
-                pass
+            # GIVE THE CLEAN PATH A CHANCE FIRST (C8). The `kill` RPC above asks
+            # the pty-host to kill its pty and exit, and since XERK C9 it also
+            # closes every terminal socket with 1000 and drains briefly before
+            # exiting. On Windows `os.kill(pid, SIGTERM)` is NOT a signal — it
+            # maps to TerminateProcess for every signal but CTRL_*_EVENT (see
+            # _pid_alive's comment), so the pty-host's own SIGTERM handler NEVER
+            # runs there and firing it immediately after the RPC pre-empts the
+            # clean teardown it just asked for: sockets die as 1006 (the client
+            # then reconnect-storms), buffered output is lost, and the ConPTY
+            # child is left to be reaped by handle closure at best. So wait out a
+            # short grace for the RPC to land, and only signal if it did not.
+            grace = time.time() + PTY_CLEAN_EXIT_GRACE_SEC
+            while _pty_still_running(pid) and time.time() < grace:
+                time.sleep(0.05)
+            if _pty_still_running(pid):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (OSError, TypeError, ValueError):
+                    pass
             # Wait for it to actually go. On Windows os.kill IS TerminateProcess
             # so this is usually immediate; on POSIX the SIGTERM handler tears the
             # pty down first. Either way the exit is what licenses dropping the
@@ -22560,13 +22613,17 @@ class SessionManager:
         self._set_dsh_status(sid, snap)
         return snap
 
-    def _tmux_alive(self, tmux_name):
+    def _tmux_alive(self, tmux_name, strict=False):
         """Whether the session's claude tmux is still up. The claude process is
         that tmux session's only command, so a missing session means claude
         exited (a killed/crashed/finished turn). On Windows the pty-host stands
-        in for tmux: its live pid is the has-session signal (XERK-697)."""
+        in for tmux: its live pid is the has-session signal (XERK-697).
+
+        `strict` is honoured on Windows only, where a pid alone can be a RECYCLED
+        pid naming an unrelated process; pass it on the boot/adopt decision. The
+        tmux path is name-keyed and already exact, so it ignores the flag."""
         if IS_WINDOWS:
-            return _pty_alive(tmux_name)
+            return _pty_alive(tmux_name, strict=strict)
         if not tmux_name:
             return False
         rc, _ = run_ok(["tmux", "has-session", "-t", tmux_name], timeout=5)
@@ -27931,7 +27988,16 @@ class SessionManager:
                 log(f"resume: worktree gone for {sess['id']}, marking stopped")
                 continue
             try:
-                if self._tmux_alive(sess.get("tmuxName")):
+                # STRICT on the adopt decision (C7). On Windows a state file left
+                # by a hard stop (reboot, SIGKILL, OOM, a WinSW force-kill) names a
+                # DEAD pid, and Windows recycles pids from a small space — so a pid
+                # check alone can read an unrelated process as this session and
+                # adopt a session that is not there: no relaunch, `running`
+                # forever, dead terminal, no claude, and nothing re-checks. Strict
+                # also proves the control port. A false negative merely resumes
+                # (correct, one extra launch); a false positive is unrecoverable
+                # without an operator. No-op on Linux, where the tmux name is exact.
+                if self._tmux_alive(sess.get("tmuxName"), strict=True):
                     # Adopt: claude keeps running; just re-ensure the ttyd (adopts
                     # a surviving one by port, else relaunches). No launch stagger
                     # — nothing contends on the shared login, we started no claude.
