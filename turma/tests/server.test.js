@@ -15945,6 +15945,23 @@ test("XERK-874: input resolves an upload staged on ANOTHER replica via the direc
       uploads: [{ id, name: "shot.png", size: 3 }],
     }], "the command carries the name+size read from the directory");
 
+    // The directory `name` came from ANOTHER replica's store write, so it is
+    // re-sanitized here exactly as the local-hit path sanitizes at staging — a
+    // hostile name can never reach the command as a path/traversal (pins the
+    // safeUploadName call, MUT-D).
+    const hostileId = "874aaaa000000009";
+    await store.set(hub.UPLOAD_DIR_PREFIX + hostileId,
+      { replica: "OTHER-REPLICA", host: "upXR", sessionId: "s1", name: "../../etc/passwd", size: 4, at: Date.now() });
+    const hostile = await request("POST", "/api/agents/upXR/sessions/s1/input", {
+      body: { text: "x", uploadIds: [hostileId] }, headers: userHeaders,
+    });
+    assert.equal(hostile.status, 200);
+    const beat2 = await request("POST", "/api/heartbeat", { body: { device: "upXR" }, headers: agentHeaders });
+    // Commands are at-least-once, so the earlier one may still be queued — match by cmdId.
+    const hostileCmd = beat2.body.commands.find((c) => c.cmdId === hostile.body.cmdId);
+    assert.equal(hostileCmd.uploads[0].name, "passwd",
+      "a hostile cross-replica name is basename-sanitized, never a path");
+
     // Scoping still holds cross-replica: a directory entry for a DIFFERENT session
     // or host is refused exactly as a local wrong-session/wrong-host hit is.
     const wrongSession = "874aaaa000000002";
@@ -15968,20 +15985,27 @@ test("XERK-874: input resolves an upload staged on ANOTHER replica via the direc
 });
 
 // With HA OFF the directory is never consulted, so a local miss is a plain 404 as
-// before (byte-identical single-process path).
+// before (byte-identical single-process path). The gate is the `uploadStoreShared`
+// BOOLEAN, not a null-store check: even with a live store PRESENT but shared=false
+// (the real non-HA shape, where `liveStore` is non-null), the fallback must not fire
+// — a store holding a matching entry is still ignored (pins the gate, MUT-C).
 test("XERK-874: with HA off a local miss is a plain 404 (no directory fallback)", async () => {
   const store = new FileLiveStore();
   await upHost("upXROff");
   const id = "874bbbb000000001";
-  // Even if a directory entry exists, HA off means uploadStoreShared is false and it
-  // is never read.
   await store.set(hub.UPLOAD_DIR_PREFIX + id,
     { replica: "OTHER-REPLICA", host: "upXROff", sessionId: "s1", name: "x.png", size: 1, at: Date.now() });
-  const res = await request("POST", "/api/agents/upXROff/sessions/s1/input", {
-    body: { text: "hi", uploadIds: [id] }, headers: userHeaders,
-  });
-  assert.equal(res.status, 404);
-  assert.match(res.body.error, /expired/);
+  try {
+    // A live store, but NOT shared (shared=false) — the real single-process shape.
+    hub.setUploadStore(store, false);
+    const res = await request("POST", "/api/agents/upXROff/sessions/s1/input", {
+      body: { text: "hi", uploadIds: [id] }, headers: userHeaders,
+    });
+    assert.equal(res.status, 404, "shared=false => the directory is never consulted, even when present");
+    assert.match(res.body.error, /expired/);
+  } finally {
+    hub.setUploadStore(null, false); // restore the non-HA default
+  }
 });
 
 // ---- XERK-763: leader election + shared single-flight guards -----------------
