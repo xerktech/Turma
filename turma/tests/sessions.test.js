@@ -3185,3 +3185,46 @@ test("XERK-718: an archived transcript offers Trajectory; the subagent view does
   openSubagentView("general-purpose", "Research");
   assert.equal(els.trTraj.hidden, true, "the subagent view offers no Trajectory (virtual id)");
 });
+
+// chat-card-shrink: the scroller's rows must be pinned against flex-shrink.
+//
+// `.chat-scroll` is a flex COLUMN, so its items default to flex-shrink:1. A
+// flex item whose overflow is not `visible` has an automatic minimum size of 0
+// rather than min-content — so `.action-card` / `.cmd-card` (both
+// `overflow: hidden`, for the border-radius) get crushed to their ~2px borders
+// once the conversation is taller than the viewport, i.e. in every real
+// session. Tool calls then render as bare LINES with their content clipped, at
+// every verbosity preset, while `.tr-msg` beside them looks fine because its
+// overflow is visible and it keeps a min-content floor.
+//
+// The guard existed but was DEAD: chat.js wraps the rows in
+// `<div id="chatBody" style="display:contents">`, so the wrapper is the direct
+// child, generates no box, and is not a flex item — `flex-shrink` on it does
+// nothing, and flex-shrink is not inherited by the children that ARE the items.
+// So the rule must reach the GRANDchildren too.
+test("chat-card-shrink: the flex-shrink guard reaches the real flex items", () => {
+  const css = [...html.matchAll(/<style>([\s\S]*?)<\/style>/g)].map((m) => m[1]).join("\n");
+  const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .map(([, sel, body]) => ({ sel: sel.trim(), body: body.trim() }))
+    .filter((r) => /flex-shrink:\s*0|flex:\s*none/.test(r.body));
+  const sels = rules.map((r) => r.sel.replace(/\s+/g, " ")).join(" | ");
+
+  // Both scrollers, and both depths — the wrapper AND the rows inside it.
+  for (const scroller of [".chat-scroll", ".tr-scroll"]) {
+    assert.ok(new RegExp(`\\${scroller} > \\*(?![ ]*>)`).test(sels),
+      `${scroller} > * must be pinned`);
+    assert.ok(new RegExp(`\\${scroller} > \\* > \\*`).test(sels),
+      `${scroller} > * > * must be pinned — chat.js's display:contents wrapper ` +
+      `is the direct child, so the rows are GRANDchildren and a depth-1 rule is dead`);
+  }
+});
+
+// The wrapper this depends on. If chat.js stops using display:contents, the
+// depth-2 selector above is no longer required — but the depth-1 one becomes
+// load-bearing instead, so the pair must be revisited together rather than one
+// of them being quietly dropped.
+test("chat-card-shrink: chat.js still wraps rows in a display:contents div", () => {
+  const chat = fs.readFileSync(path.join(__dirname, "..", "public", "chat.js"), "utf8");
+  assert.match(chat, /id="chatBody" style="display:contents"/,
+    "the rows are wrapped in a display:contents div; the CSS guard is written for it");
+});
