@@ -872,7 +872,7 @@
     const now = Date.now();
     if (cachedToken && tokenExp - now > TOKEN_SKEW_MS) return cachedToken;
     const r = await fetch("/api/ws-token");
-    if (!r.ok) throw new Error("ws-token " + r.status);
+    if (!r.ok) { authExpired(r.status); throw new Error("ws-token " + r.status); }
     const j = await r.json();
     cachedToken = j.token;
     tokenExp = now + (Number(j.expiresInSec) || 300) * 1000;
@@ -1019,7 +1019,7 @@
       return;
     }
     historyChain = false;
-    if (!r.ok) return;
+    if (!r.ok) { authExpired(r.status); return; }
     let j;
     try { j = await r.json(); } catch { return; }
     if (myGen !== gen || !j || !Array.isArray(j.entries)) return;
@@ -3337,7 +3337,7 @@
         body: file,
       });
       const reply = await r.json().catch(() => null);
-      if (!r.ok) throw new Error((reply && reply.error) || ("upload failed (" + r.status + ")"));
+      if (!r.ok) { authExpired(r.status); throw new Error((reply && reply.error) || ("upload failed (" + r.status + ")")); }
       if (forSession !== sessionId || !attachments.includes(rec)) return;
       rec.uploadId = reply.uploadId;
       rec.name = reply.name || rec.name;   // the name it will land under
@@ -3469,7 +3469,34 @@
   //
   // Guarded on TurmaNav: the vendored copy of this engine (glasses)
   // renders transcripts with none of the site chrome loaded.
+  // A 401 from ANY hub call means the operator's browser session (OIDC or the
+  // local break-glass login) has expired. Every other page redirects to /login
+  // on a 401 (grep `status === 401` across turma/public) rather than surfacing
+  // it as a failure — a message that came back "unauthorized" otherwise left the
+  // operator to discover for themselves that a page refresh fixes it. So a 401
+  // here bounces to /login exactly as the rest of the site does, turning an
+  // expired session into a re-login instead of a dead-end error toast.
+  //
+  // Guarded on TurmaNav + a real `location`, like hubRefused below: the vendored
+  // glasses copy of this engine has neither, authenticates with its own header
+  // flow (no /login page), and never calls the fetch paths this guards anyway.
+  // The one-shot latch stops two racing 401s (a send + the /live socket) each
+  // kicking off a navigation.
+  let authRedirecting = false;
+  function authExpired(status) {
+    if (status !== 401) return false;
+    if (typeof window === "undefined" || !window.TurmaNav || !window.location) return false;
+    if (!authRedirecting) {
+      authRedirecting = true;
+      window.location.href = "/login";
+    }
+    return true;
+  }
   async function hubRefused(what, res) {
+    // Don't toast "unauthorized" over a command that failed only because the
+    // session lapsed — bounce to the login instead (covers send/answer/stop and
+    // every model/mode switch, which all funnel their refusals through here).
+    if (authExpired(res.status)) return null;
     const body = await res.json().catch(() => null);
     const nav = typeof window !== "undefined" && window.TurmaNav;
     if (nav && nav.toast && nav.refusalText) nav.toast(nav.refusalText(what, res.status, body));
