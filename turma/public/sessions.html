@@ -3124,12 +3124,22 @@ function chatToTerminal() {
   // A dsh session has no ttyd (XERK-498); the toggle is hidden, but guard the
   // handler too so a stale keybinding/deeplink can't navigate to a dead /term.
   if (hit && hit.s && hit.s.agentType === "dsh") return;
-  // setFrame() clears the terminal's box (it's opening a session's terminal), so
-  // the draft has to be carried across after it, not before.
-  setFrame(currentId, hit ? hit.s : null, hit ? hit.a : null);
+  // Reveal the terminal pane BEFORE navigating the iframe. ttyd's xterm.js fits
+  // to the iframe's box the moment its JS runs on load, and a load into a still
+  // `[hidden]` (display:none) pane measures 0x0, so it attaches a 0-row terminal
+  // and paints a BLACK SCREEN that only a later resize repairs. It was
+  // intermittent because it's a race: a fast/warm ttyd load fit before the two
+  // lines below revealed the pane, a cold load fit after. Showing the pane first
+  // gives the iframe its real flex dimensions (.stage is always laid out here —
+  // desktop shows it beside the list, and on mobile we arrived from chat with the
+  // stage already up), so ttyd always fits to a real size and the terminal is
+  // there immediately.
   viewMode = "terminal";
   $chatPane.hidden = true;
   $termPane.hidden = false;
+  // setFrame() clears the terminal's box (it's opening a session's terminal), so
+  // the draft has to be carried across after it, not before.
+  setFrame(currentId, hit ? hit.s : null, hit ? hit.a : null);
   // LAST, once the pane is actually shown: focus() on a still-`hidden` textarea
   // is a silent no-op, which lands the draft in a box the operator then has to
   // tap before they can keep typing.
