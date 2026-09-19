@@ -826,11 +826,17 @@ const UPLOAD_DIR_PREFIX = "upload/";
 // (a dropped write self-heals: the agent's pull just 404s and the command re-issues
 // on at-least-once delivery). TTL matches the in-memory UPLOAD_TTL_MS, so the
 // directory entry expires with the bytes it points at rather than lingering.
+//
+// `sessionId`+`name` ride the entry alongside the blob GET's `replica`/`host`/`size`
+// (XERK-874): the operator's INPUT POST can land on a different replica than this
+// staging POST under active-active HA, and its consume (`.../input`) needs the
+// name+session to build the command without the bytes — it resolves the id off this
+// directory on a local miss, exactly as the agent's blob pull does.
 function publishUploadDir(u) {
   if (!uploadStoreShared || !u || !u.id) return;
   Promise.resolve(uploadStore.set(
     UPLOAD_DIR_PREFIX + u.id,
-    { replica: SSE_REPLICA_ID, host: u.host, size: u.size, at: u.at },
+    { replica: SSE_REPLICA_ID, host: u.host, sessionId: u.sessionId, name: u.name, size: u.size, at: u.at },
     { ttlMs: UPLOAD_TTL_MS },
   )).catch(() => {});
 }
@@ -16883,12 +16889,37 @@ const server = http.createServer(async (req, res) => {
         const attached = [];
         for (const id of wanted) {
           const u = uploads.get(id);
-          // A stale id is the TTL having passed (or another hub having served
-          // the upload). Refusing beats sending the text with the files silently
-          // missing — the operator re-attaches and sends again.
-          if (!u || u.host !== key || u.sessionId !== sessionId)
-            return json(res, 404, { error: "an attachment expired before it was sent — re-attach it" });
-          attached.push({ id: u.id, name: u.name, size: u.size });
+          if (u) {
+            // A stale id is the TTL having passed (or another hub having served
+            // the upload). A hit for the WRONG host/session is a scoping refusal,
+            // never a cross-replica miss — 404 without consulting the directory.
+            if (u.host !== key || u.sessionId !== sessionId)
+              return json(res, 404, { error: "an attachment expired before it was sent — re-attach it" });
+            attached.push({ id: u.id, name: u.name, size: u.size });
+            continue;
+          }
+          // Local MISS under active-active HA (XERK-874, the input-consume sibling of
+          // XERK-787's blob-pull relay): the operator's staging POST landed on ANOTHER
+          // replica, so the bytes live in its `uploads` Map. We do NOT need them here —
+          // the agent pulls them from the owner via the blob GET's relay — only the
+          // name+size to build the command, and the same host+session scoping. Read the
+          // byte-free directory that staging published. HA off => uploadStoreShared
+          // false => this branch is never entered and the miss is a plain 404 as before.
+          let dir = null;
+          if (uploadStoreShared) {
+            try { dir = await uploadStore.get(UPLOAD_DIR_PREFIX + id); } catch { dir = null; }
+          }
+          if (dir && dir.host === key && dir.sessionId === sessionId) {
+            attached.push({
+              id,
+              name: safeUploadName(dir.name),
+              size: Number.isFinite(dir.size) ? dir.size : 0,
+            });
+            continue;
+          }
+          // Refusing beats sending the text with the files silently missing — the
+          // operator re-attaches and sends again.
+          return json(res, 404, { error: "an attachment expired before it was sent — re-attach it" });
         }
         if (!text.trim() && !attached.length) return json(res, 400, { error: "text required" });
         // Capped at what THIS host will deliver whole (see inputCapFor): an

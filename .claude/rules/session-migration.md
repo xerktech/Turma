@@ -196,8 +196,10 @@ the bytes → it 404'd "no such upload" and the attachment silently dropped (SAF
 send just fails/retries; only bites cross-replica). Fixed the same way: relay the bytes.
 
 - **A BYTE-FREE directory names the owner.** On stage, `publishUploadDir` writes `upload/<id> →
-  {replica: SSE_REPLICA_ID, host, size, at}` to the shared store with a TTL matching `UPLOAD_TTL_MS`
-  (so it expires WITH the in-memory bytes). Unlike migrations (whose record is already hot-mirrored),
+  {replica: SSE_REPLICA_ID, host, sessionId, name, size, at}` to the shared store with a TTL matching
+  `UPLOAD_TTL_MS` (so it expires WITH the in-memory bytes). `sessionId`+`name` are for the input-consume
+  sibling below — the blob GET reads only `replica`/`host`/`size`. Unlike migrations (whose record is
+  already hot-mirrored),
   uploads had NO cross-replica channel, so this is a small dedicated directory — but it needs no hot
   MIRROR/watch: the GET reads it with a single lazy `await uploadStore.get()` only on a LOCAL MISS
   (the cross-replica path), never on the hot local-hit path.
@@ -215,6 +217,16 @@ send just fails/retries; only bites cross-replica). Fixed the same way: relay th
 - **HA OFF / single-process is byte-identical** — `uploadStoreShared` false, `relay` null, so
   `publishUploadDir` is inert and the GET's relay branch is never entered; the local-hit `res.end(u.bytes)`
   is exactly as before.
+- **The OPERATOR's input-consume is the sibling gap XERK-787 left open (XERK-874).** XERK-787 relayed
+  the AGENT's blob PULL cross-replica but `POST .../sessions/<id>/input`'s uploadId validation still did
+  a bare LOCAL `uploads.get(id)`, so under active-active a staging POST and its input POST landing on
+  different replicas 404'd "an attachment expired before it was sent" on a file just attached (the
+  Android/web symptom — OkHttp readily splits the small input POST onto a fresh connection after the
+  large upload POST). The input route now falls to the SAME directory on a LOCAL MISS
+  (`uploadStoreShared` only): it needs only `name`+`size` to build the command (hence those fields on
+  the entry), validates `dir.host`/`dir.sessionId` for the same scoping the local hit enforces, and the
+  agent still fetches the bytes via the relayed blob GET. It does NOT relay bytes itself. HA off is
+  byte-identical (fallback never entered → plain 404). Tests: the `XERK-874:` cases in `server.test.js`.
 - Tests: the `XERK-787:` cases in `tunnel-relay.test.js` (`connectUpload` bridge end-to-end,
   `no-bundle`/`relay-error`, and that an upload channel uses `openUpload` not the migration `openBlob`)
   and `server.test.js` (`openUploadBlobForRelay` chunked byte-identical stream under the frame ceiling;

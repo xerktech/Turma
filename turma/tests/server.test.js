@@ -15908,7 +15908,101 @@ test("XERK-787: publishUploadDir mirrors a BYTE-FREE directory entry, and is ine
     assert.equal(dir.replica, hub.SSE_REPLICA_ID, "it names the replica that holds the bytes");
     assert.equal(dir.host, "h1", "it carries the host for cross-replica scoping (XERK-268)");
     assert.equal(dir.size, 42, "and the size for the Content-Length");
+    // XERK-874: sessionId+name ride the entry too, so the operator's input-consume
+    // can resolve the id off the directory (name+session) without the bytes.
+    assert.equal(dir.sessionId, "s1", "it carries the sessionId for the input-consume scoping");
+    assert.equal(dir.name, "f.bin", "and the sanitized name to put in the command");
     assert.equal(dir.bytes, undefined, "the directory carries NO attachment bytes (byte-plane vs record-plane)");
+  } finally {
+    hub.setUploadStore(null, false); // restore the non-HA default
+  }
+});
+
+// ---- XERK-874: the operator's input-consume resolves an upload cross-replica ---
+// XERK-787 relayed the agent's blob PULL cross-replica; this is its sibling for the
+// operator's INPUT POST. Under active-active HA the staging POST and the input POST
+// can land on different replicas, so the input route's uploadId lookup must fall to
+// the byte-free directory on a LOCAL MISS — it needs only name+size to build the
+// command (the agent still pulls the bytes via the relayed blob GET).
+test("XERK-874: input resolves an upload staged on ANOTHER replica via the directory", async () => {
+  const store = new FileLiveStore();
+  await upHost("upXR");
+  try {
+    hub.setUploadStore(store, true);
+    // Simulate the OTHER replica's staging: a byte-free directory entry, no local
+    // `uploads` Map bytes on this replica, a replica id that is not ours.
+    const id = "874aaaa000000001";
+    await store.set(hub.UPLOAD_DIR_PREFIX + id,
+      { replica: "OTHER-REPLICA", host: "upXR", sessionId: "s1", name: "shot.png", size: 3, at: Date.now() });
+
+    const res = await request("POST", "/api/agents/upXR/sessions/s1/input", {
+      body: { text: "what is this?", uploadIds: [id] }, headers: userHeaders,
+    });
+    assert.equal(res.status, 200, "the send is accepted off the cross-replica directory, not 404'd");
+    const beat = await request("POST", "/api/heartbeat", { body: { device: "upXR" }, headers: agentHeaders });
+    assert.deepEqual(beat.body.commands, [{
+      type: "input", sessionId: "s1", text: "what is this?", cmdId: res.body.cmdId,
+      uploads: [{ id, name: "shot.png", size: 3 }],
+    }], "the command carries the name+size read from the directory");
+
+    // The directory `name` came from ANOTHER replica's store write, so it is
+    // re-sanitized here exactly as the local-hit path sanitizes at staging — a
+    // hostile name can never reach the command as a path/traversal (pins the
+    // safeUploadName call, MUT-D).
+    const hostileId = "874aaaa000000009";
+    await store.set(hub.UPLOAD_DIR_PREFIX + hostileId,
+      { replica: "OTHER-REPLICA", host: "upXR", sessionId: "s1", name: "../../etc/passwd", size: 4, at: Date.now() });
+    const hostile = await request("POST", "/api/agents/upXR/sessions/s1/input", {
+      body: { text: "x", uploadIds: [hostileId] }, headers: userHeaders,
+    });
+    assert.equal(hostile.status, 200);
+    const beat2 = await request("POST", "/api/heartbeat", { body: { device: "upXR" }, headers: agentHeaders });
+    // Commands are at-least-once, so the earlier one may still be queued — match by cmdId.
+    const hostileCmd = beat2.body.commands.find((c) => c.cmdId === hostile.body.cmdId);
+    assert.equal(hostileCmd.uploads[0].name, "passwd",
+      "a hostile cross-replica name is basename-sanitized, never a path");
+
+    // Scoping still holds cross-replica: a directory entry for a DIFFERENT session
+    // or host is refused exactly as a local wrong-session/wrong-host hit is.
+    const wrongSession = "874aaaa000000002";
+    await store.set(hub.UPLOAD_DIR_PREFIX + wrongSession,
+      { replica: "OTHER-REPLICA", host: "upXR", sessionId: "s2", name: "x.png", size: 1, at: Date.now() });
+    const rejSession = await request("POST", "/api/agents/upXR/sessions/s1/input", {
+      body: { text: "hi", uploadIds: [wrongSession] }, headers: userHeaders,
+    });
+    assert.equal(rejSession.status, 404, "a directory entry for another session is refused");
+
+    const wrongHost = "874aaaa000000003";
+    await store.set(hub.UPLOAD_DIR_PREFIX + wrongHost,
+      { replica: "OTHER-REPLICA", host: "someone-else", sessionId: "s1", name: "x.png", size: 1, at: Date.now() });
+    const rejHost = await request("POST", "/api/agents/upXR/sessions/s1/input", {
+      body: { text: "hi", uploadIds: [wrongHost] }, headers: userHeaders,
+    });
+    assert.equal(rejHost.status, 404, "a directory entry for another host is refused");
+  } finally {
+    hub.setUploadStore(null, false); // restore the non-HA default
+  }
+});
+
+// With HA OFF the directory is never consulted, so a local miss is a plain 404 as
+// before (byte-identical single-process path). The gate is the `uploadStoreShared`
+// BOOLEAN, not a null-store check: even with a live store PRESENT but shared=false
+// (the real non-HA shape, where `liveStore` is non-null), the fallback must not fire
+// — a store holding a matching entry is still ignored (pins the gate, MUT-C).
+test("XERK-874: with HA off a local miss is a plain 404 (no directory fallback)", async () => {
+  const store = new FileLiveStore();
+  await upHost("upXROff");
+  const id = "874bbbb000000001";
+  await store.set(hub.UPLOAD_DIR_PREFIX + id,
+    { replica: "OTHER-REPLICA", host: "upXROff", sessionId: "s1", name: "x.png", size: 1, at: Date.now() });
+  try {
+    // A live store, but NOT shared (shared=false) — the real single-process shape.
+    hub.setUploadStore(store, false);
+    const res = await request("POST", "/api/agents/upXROff/sessions/s1/input", {
+      body: { text: "hi", uploadIds: [id] }, headers: userHeaders,
+    });
+    assert.equal(res.status, 404, "shared=false => the directory is never consulted, even when present");
+    assert.match(res.body.error, /expired/);
   } finally {
     hub.setUploadStore(null, false); // restore the non-HA default
   }
