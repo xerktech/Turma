@@ -657,8 +657,28 @@
   .jump-bottom[hidden] { display: none; }
   /* Keep each message/tool card at its natural size: in a flex column, children
      default to flex-shrink:1, so a growing transcript would squash the existing
-     cards to fit instead of scrolling. Pin them so the container scrolls. */
-  .chat-scroll > *, .tr-scroll > * { flex-shrink: 0; }
+     cards to fit instead of scrolling. Pin them so the container scrolls.
+     
+     The `> * > *` half is load-bearing, not belt-and-braces. chat.js wraps the
+     rows in `<div id="chatBody" style="display:contents">` so their align-self
+     still resolves against the scroller -- which also means the WRAPPER is the
+     direct child and generates no box, so it is not a flex item and
+     `flex-shrink` on it does nothing. The real flex items are its children, and
+     flex-shrink is not inherited, so `> *` alone was a dead rule.
+     
+     What it cost: a flex item whose overflow is not `visible` has an automatic
+     minimum size of 0 instead of min-content, so .action-card / .cmd-card
+     (both `overflow: hidden`, for the border-radius) were crushed to their
+     2px borders in any conversation taller than the viewport -- i.e. every real
+     session. Tool calls rendered as bare LINES with their content clipped away,
+     at every verbosity preset, while .tr-msg (overflow: visible, so a
+     min-content floor) sat right beside them looking fine.
+     
+     Targeting the grandchildren is safe: flex-shrink is ignored on anything
+     that is not a flex item, so this is inert wherever the wrapper is a normal
+     block. Tests: the `chat-card-shrink` case in sessions.test.js. */
+  .chat-scroll > *, .tr-scroll > *,
+  .chat-scroll > * > *, .tr-scroll > * > * { flex-shrink: 0; }
   /* Text bubbles reuse the transcript bubble system: user right, agent left.
      In the live chat, agent output is borderless/background-free and tighter
      so it reads as flat prose; user input keeps its bubble. The archived
