@@ -11079,6 +11079,7 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
     def test_message_is_pasted_then_submitted(self):
         # The text rides tmux's paste buffer over STDIN — never an argv element,
         # which tmux refuses past ~16 KiB (XERK-227) — and Enter submits it.
+        # A SINGLE LINE is pasted WITHOUT `-p`: see the bracketing test below.
         sm = self.make_manager()
         sess = self._running_session(sm)
         sm.send_input(sess["id"], "hello")
@@ -11086,12 +11087,39 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
             (["tmux", "load-buffer", "-b", "turma-input-agent-abcde", "-"], "hello"),
         ])
         self.assertEqual(self.run_ok_calls, [
-            ["tmux", "paste-buffer", "-d", "-p", "-b", "turma-input-agent-abcde",
+            ["tmux", "paste-buffer", "-d", "-b", "turma-input-agent-abcde",
              "-t", "agent-abcde"],
         ])
         self.assertEqual(self.run_calls, [
             ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
         ])
+
+    def test_only_multi_line_input_is_bracketed(self):
+        # `-p` adds the bracketed-paste markers, which is how an application
+        # RECOGNISES a paste — and Claude Code tags one in the transcript as
+        # `<pasted_content id=...>…</pasted_content id=...>`. Bracketing every
+        # message wrapped ordinary one-line chat turns in those tags: they
+        # rendered literally in the chat view, and reached the model framed as
+        # pasted DATA rather than as something the operator typed.
+        #
+        # Multi-line still brackets — that is what keeps it ONE message instead
+        # of submitting a turn per line — so both directions are pinned here.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+
+        sm.send_input(sess["id"], "just one line")
+        self.assertNotIn("-p", self.run_ok_calls[0],
+                         "a single line must not be bracketed as a paste")
+
+        self.run_ok_calls.clear()
+        sm.send_input(sess["id"], "first\nsecond")
+        self.assertIn("-p", self.run_ok_calls[0],
+                      "multi-line must stay bracketed or it submits per line")
+
+        # The buffer (XERK-227's argv limit) is used either way — only the
+        # markers are conditional.
+        self.assertTrue(all(c[0][:2] == ["tmux", "load-buffer"]
+                            for c in self.run_stdin_calls))
 
     def test_a_long_message_is_pasted_whole(self):
         # The point of the paste path: a message far past what a send-keys
@@ -32783,8 +32811,18 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         with mock.patch.object(ha, "_pty_control", side_effect=fake_control):
             ha._pty_inject("agent-x", "a\x1bb\x07c")
         # An ESC/BEL inside the body would close the paste early — stripped, like
-        # INPUT_CTRL_RE on the tmux path (the paste is the FIRST control call).
-        self.assertIn("\x1b[200~abc\x1b[201~", seen[0])
+        # INPUT_CTRL_RE on the tmux path (the inject is the FIRST control call).
+        # A single line is injected UNBRACKETED, the twin of the tmux `-p` rule:
+        # bracketing is what makes Claude Code tag the turn <pasted_content>.
+        self.assertEqual("abc", seen[0])
+
+        seen.clear()
+        with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
+             mock.patch.object(ha, "PTY_SUBMIT_SETTLE_SEC", 0), \
+             mock.patch.object(ha, "PTY_SUBMIT_MAX_RETRIES", 0):
+            ha._pty_inject("agent-x", "one\ntwo")
+        # Multi-line keeps the markers, or it submits a turn per line.
+        self.assertEqual("\x1b[200~one\ntwo\x1b[201~", seen[0])
 
     def test_pane_send_keys_translates_key_names_on_windows(self):
         with mock.patch.object(ha, "IS_WINDOWS", True), \
