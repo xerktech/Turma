@@ -9753,10 +9753,20 @@ def _type_into_pane(tmux_name, text):
     they sent whole must never arrive with its end quietly missing. Returns True
     when the text was pasted.
 
+    `-p` (the bracketed-paste markers) is applied ONLY to multi-line text.
+    Bracketing is how an application RECOGNISES a paste, and Claude Code tags one
+    in the transcript as `<pasted_content id=...>...</pasted_content id=...>`, so
+    bracketing every message wrapped ordinary one-line chat turns in those tags
+    -- rendered literally in the chat, and reaching the model framed as pasted
+    DATA rather than as something the operator typed. The BUFFER is still used
+    for every message (that is XERK-227's argv limit, unrelated); only the
+    markers are conditional, and a single line arrives identically without them.
+
     On Windows the pty-host stands in for tmux (XERK-697): `_pty_inject` delivers
     the text as a bracketed paste over the control channel, the direct analog of
     the `paste-buffer -p` path here (newlines survive as ONE message), then
-    submits with Enter."""
+    submits with Enter. It applies the same single-line rule, for the same
+    reason."""
     if IS_WINDOWS:
         return _pty_inject(tmux_name, text)
     if not tmux_name:
@@ -9766,7 +9776,17 @@ def _type_into_pane(tmux_name, text):
     if pasted:
         # -d drops the buffer once it has been pasted, so a message never sits
         # in tmux's paste history waiting to be re-pasted by hand.
-        rc, _err = run_ok(["tmux", "paste-buffer", "-d", "-p", "-b", buf,
+        # `-p` (bracketed paste) ONLY when the text needs it. The markers are
+        # how an application RECOGNISES a paste, and Claude Code tags one in the
+        # transcript as `<pasted_content id=...>…</pasted_content id=...>` — so
+        # bracketing every message wrapped ordinary one-line chat turns in those
+        # tags. They rendered literally in the chat, and reached the model framed
+        # as pasted DATA rather than as something the operator typed. A line with
+        # no newlines needs no bracketing: it arrives as the same characters and
+        # the Enter below submits it either way. Multi-line still brackets, which
+        # is what keeps it ONE message instead of a turn per line.
+        flags = ["-d", "-p"] if "\n" in text else ["-d"]
+        rc, _err = run_ok(["tmux", "paste-buffer", *flags, "-b", buf,
                            "-t", tmux_name], timeout=15)
         pasted = rc == 0
         if not pasted:
@@ -10214,11 +10234,16 @@ def _pty_inject(tmux_name, text):
     if not tmux_name:
         return False
     clean = INPUT_CTRL_RE.sub("", text.replace("\r", "\n"))
-    bracketed = "\x1b[200~" + clean + "\x1b[201~"
-    r = _pty_control(tmux_name, "inject", data=bracketed)
+    multiline = "\n" in clean
+    # Bracket ONLY what needs it. Claude Code tags bracketed-paste input as
+    # `<pasted_content id=...>` in the transcript, so bracketing an ordinary
+    # one-line message wrapped every operator turn in those tags (see
+    # _type_into_pane). A single line needs neither the newline preservation nor
+    # the chip-collapse settle below, so it is injected as typed text.
+    payload = ("\x1b[200~" + clean + "\x1b[201~") if multiline else clean
+    r = _pty_control(tmux_name, "inject", data=payload)
     if not (r and r.get("ok")):
         return False   # no live terminal / control call failed
-    multiline = "\n" in clean
     if multiline:
         time.sleep(PTY_SUBMIT_SETTLE_SEC)          # let the paste chip settle
     _pty_control(tmux_name, "inject", data="\r")   # submit with Enter
