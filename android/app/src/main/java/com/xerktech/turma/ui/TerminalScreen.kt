@@ -213,17 +213,32 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
                                             e.style.setProperty('margin','0','important'); }
                                           function fix(){
                                             var h=window.innerHeight, w=window.innerWidth;
+                                            if(!h||!w) return;
                                             px(document.documentElement,h,w); px(document.body,h,w);
                                             document.body.style.setProperty('overflow','hidden','important');
                                             document.querySelectorAll('body>div, .xterm').forEach(function(e){ px(e,h,w); });
                                             window.dispatchEvent(new Event('resize'));
                                           }
-                                          // Re-apply as ttyd initializes async after page load,
-                                          // and once more after a beat so late layout still fits.
-                                          [80,350,800,1500].forEach(function(t){ setTimeout(fix,t); });
+                                          // ttyd loads its JS, opens a WebSocket, THEN creates the xterm
+                                          // terminal — all async, and after onPageFinished. FIXED one-shot
+                                          // nudges (the old [80..1500]ms) race that: if the terminal is
+                                          // created AFTER the last nudge (slow device/tunnel) it fits to a
+                                          // 0x0 box and stays BLACK, because nothing re-fits it (the
+                                          // visualViewport listener only fires on rotation/keyboard). So
+                                          // KEEP re-fitting until the terminal is actually up and sized,
+                                          // bounded so it can never spin forever.
+                                          function sized(){ var x=document.querySelector('.xterm');
+                                            return !!(x && x.clientHeight>0 && x.clientWidth>0); }
+                                          var n=0, extra=0;
+                                          (function tick(){
+                                            fix(); n++;
+                                            if(sized()) extra++;            // a few more fits once it's up
+                                            if(extra>=3 || n>=80) return;   // then stop, hard cap ~20s
+                                            setTimeout(tick, 250);
+                                          })();
                                           // Re-fit on real viewport changes (rotation / keyboard).
                                           // visualViewport.resize won't loop with fix()'s synthetic
-                                          // window 'resize' dispatch.
+                                          // window 'resize' dispatch (fix() sets stable innerHeight px).
                                           if(window.visualViewport){ window.visualViewport.addEventListener('resize', fix); }
                                         })();""".trimIndent(),
                                         null,
