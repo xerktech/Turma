@@ -15908,10 +15908,80 @@ test("XERK-787: publishUploadDir mirrors a BYTE-FREE directory entry, and is ine
     assert.equal(dir.replica, hub.SSE_REPLICA_ID, "it names the replica that holds the bytes");
     assert.equal(dir.host, "h1", "it carries the host for cross-replica scoping (XERK-268)");
     assert.equal(dir.size, 42, "and the size for the Content-Length");
+    // XERK-874: sessionId+name ride the entry too, so the operator's input-consume
+    // can resolve the id off the directory (name+session) without the bytes.
+    assert.equal(dir.sessionId, "s1", "it carries the sessionId for the input-consume scoping");
+    assert.equal(dir.name, "f.bin", "and the sanitized name to put in the command");
     assert.equal(dir.bytes, undefined, "the directory carries NO attachment bytes (byte-plane vs record-plane)");
   } finally {
     hub.setUploadStore(null, false); // restore the non-HA default
   }
+});
+
+// ---- XERK-874: the operator's input-consume resolves an upload cross-replica ---
+// XERK-787 relayed the agent's blob PULL cross-replica; this is its sibling for the
+// operator's INPUT POST. Under active-active HA the staging POST and the input POST
+// can land on different replicas, so the input route's uploadId lookup must fall to
+// the byte-free directory on a LOCAL MISS — it needs only name+size to build the
+// command (the agent still pulls the bytes via the relayed blob GET).
+test("XERK-874: input resolves an upload staged on ANOTHER replica via the directory", async () => {
+  const store = new FileLiveStore();
+  await upHost("upXR");
+  try {
+    hub.setUploadStore(store, true);
+    // Simulate the OTHER replica's staging: a byte-free directory entry, no local
+    // `uploads` Map bytes on this replica, a replica id that is not ours.
+    const id = "874aaaa000000001";
+    await store.set(hub.UPLOAD_DIR_PREFIX + id,
+      { replica: "OTHER-REPLICA", host: "upXR", sessionId: "s1", name: "shot.png", size: 3, at: Date.now() });
+
+    const res = await request("POST", "/api/agents/upXR/sessions/s1/input", {
+      body: { text: "what is this?", uploadIds: [id] }, headers: userHeaders,
+    });
+    assert.equal(res.status, 200, "the send is accepted off the cross-replica directory, not 404'd");
+    const beat = await request("POST", "/api/heartbeat", { body: { device: "upXR" }, headers: agentHeaders });
+    assert.deepEqual(beat.body.commands, [{
+      type: "input", sessionId: "s1", text: "what is this?", cmdId: res.body.cmdId,
+      uploads: [{ id, name: "shot.png", size: 3 }],
+    }], "the command carries the name+size read from the directory");
+
+    // Scoping still holds cross-replica: a directory entry for a DIFFERENT session
+    // or host is refused exactly as a local wrong-session/wrong-host hit is.
+    const wrongSession = "874aaaa000000002";
+    await store.set(hub.UPLOAD_DIR_PREFIX + wrongSession,
+      { replica: "OTHER-REPLICA", host: "upXR", sessionId: "s2", name: "x.png", size: 1, at: Date.now() });
+    const rejSession = await request("POST", "/api/agents/upXR/sessions/s1/input", {
+      body: { text: "hi", uploadIds: [wrongSession] }, headers: userHeaders,
+    });
+    assert.equal(rejSession.status, 404, "a directory entry for another session is refused");
+
+    const wrongHost = "874aaaa000000003";
+    await store.set(hub.UPLOAD_DIR_PREFIX + wrongHost,
+      { replica: "OTHER-REPLICA", host: "someone-else", sessionId: "s1", name: "x.png", size: 1, at: Date.now() });
+    const rejHost = await request("POST", "/api/agents/upXR/sessions/s1/input", {
+      body: { text: "hi", uploadIds: [wrongHost] }, headers: userHeaders,
+    });
+    assert.equal(rejHost.status, 404, "a directory entry for another host is refused");
+  } finally {
+    hub.setUploadStore(null, false); // restore the non-HA default
+  }
+});
+
+// With HA OFF the directory is never consulted, so a local miss is a plain 404 as
+// before (byte-identical single-process path).
+test("XERK-874: with HA off a local miss is a plain 404 (no directory fallback)", async () => {
+  const store = new FileLiveStore();
+  await upHost("upXROff");
+  const id = "874bbbb000000001";
+  // Even if a directory entry exists, HA off means uploadStoreShared is false and it
+  // is never read.
+  await store.set(hub.UPLOAD_DIR_PREFIX + id,
+    { replica: "OTHER-REPLICA", host: "upXROff", sessionId: "s1", name: "x.png", size: 1, at: Date.now() });
+  const res = await request("POST", "/api/agents/upXROff/sessions/s1/input", {
+    body: { text: "hi", uploadIds: [id] }, headers: userHeaders,
+  });
+  assert.equal(res.status, 404);
+  assert.match(res.body.error, /expired/);
 });
 
 // ---- XERK-763: leader election + shared single-flight guards -----------------
