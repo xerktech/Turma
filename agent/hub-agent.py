@@ -15441,6 +15441,16 @@ class SessionManager:
         self.slug_usage = {}                     # project slug -> {acc, offsets}
                                                  # persistent incremental usage fold,
                                                  # shared by per-session + repo usage
+        # _resumable_report re-derives the "Resume any session" picker from every
+        # transcript on disk each slow beat; the per-file reads (_transcript_cwd
+        # over ALL of them, _first_user_text/_last_activity_ts over the survivors)
+        # are memoized per (mtime, size) here so a SETTLED transcript is read at
+        # most once, never re-read every beat. Same incremental discipline as
+        # slug_usage above — the reads dominate the slow beat on a host with many
+        # transcripts and/or contended disk, and re-reading them cold could stall
+        # the heartbeat past OFFLINE_AFTER_MS and flap the host (XERK-395 class).
+        self._resumable_cwd_cache = {}           # path -> ((mtime, size), cwd)
+        self._resumable_facts_cache = {}         # path -> ((mtime, size), firstUserText, lastActivityTs)
         self.pending_prs = {}                    # id -> undelivered PR urls
         # The PR links each session has opened, PERSISTENT across beats — unlike
         # pending_prs, which _clear_pending_prs empties after every delivered
@@ -24557,6 +24567,41 @@ class SessionManager:
                 return os.path.join(PROJECTS_ROOT, slug)
         return None
 
+    def _cached_transcript_cwd(self, path, mtime, size):
+        """`_transcript_cwd(path)` memoized per (mtime, size). A transcript's
+        origin cwd sits on its early entries and never changes for a given
+        (mtime, size), so a settled file is head-read at most once instead of
+        every slow beat — the dominant cost of `_resumable_report` on a host
+        with many transcripts / contended disk.
+
+        Only a DEFINITIVE non-None result is cached: `_transcript_cwd` collapses
+        a transient OSError into the same None as "no cwd on the head", and
+        caching that would hide a genuinely-resumable session until its mtime
+        changed. A real no-cwd transcript (rare) simply pays its cheap head-read
+        each beat, as before."""
+        key = (mtime, size)
+        hit = self._resumable_cwd_cache.get(path)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        cwd = _transcript_cwd(path)
+        if cwd:
+            self._resumable_cwd_cache[path] = (key, cwd)
+        return cwd
+
+    def _cached_transcript_facts(self, path, mtime, size):
+        """(`_first_user_text`, `_last_activity_ts`) memoized per (mtime, size),
+        for the RESUMABLE survivors only. `_last_activity_ts` rises as a session
+        appends, but an append moves the mtime (and size), so the key changes and
+        the pair is re-read — a settled transcript is read at most once."""
+        key = (mtime, size)
+        hit = self._resumable_facts_cache.get(path)
+        if hit is not None and hit[0] == key:
+            return hit[1], hit[2]
+        fut = _first_user_text(path)
+        lat = _last_activity_ts(path)
+        self._resumable_facts_cache[path] = (key, fut, lat)
+        return fut, lat
+
     def _resumable_report(self):
         """Per-repo list of EVERY prior Claude session resumable on this host —
         the "Resume any session" picker's source, not just the last-5 killed
@@ -24587,10 +24632,12 @@ class SessionManager:
             slug_path.setdefault(slug, wt)
 
         by_repo = {}
+        seen_paths = set()     # every transcript scanned this pass; caches prune to it
+        scanned_ok = True      # False only if PROJECTS_ROOT itself is unreadable
         try:
             slugs = os.listdir(PROJECTS_ROOT)
         except OSError:
-            slugs = []
+            slugs, scanned_ok = [], False
         for slug in slugs:
             if slug in carded:
                 continue
@@ -24605,7 +24652,15 @@ class SessionManager:
                 if not VALID_CLAUDE_SID_RE.fullmatch(tid):
                     continue
                 path = os.path.join(proj, fname)
-                cwd = _transcript_cwd(path)
+                # Stat FIRST: (mtime, size) keys the cwd cache below, and a file
+                # that vanished mid-scan is skipped here rather than after a read.
+                try:
+                    stt = os.stat(path)
+                except OSError:
+                    continue
+                mtime, size = stt.st_mtime, stt.st_size
+                seen_paths.add(path)
+                cwd = self._cached_transcript_cwd(path, mtime, size)
                 if not cwd:
                     lp = slug_path.get(slug)
                     cwd = lp if lp and _project_slug(lp) == slug else None
@@ -24613,10 +24668,6 @@ class SessionManager:
                 if not cls:
                     continue
                 repo, origin, root = cls
-                try:
-                    mtime = os.stat(path).st_mtime
-                except OSError:
-                    continue
                 by_repo.setdefault(repo, []).append({
                     "transcriptId": tid,
                     "cwd": os.path.normpath(cwd),
@@ -24627,6 +24678,7 @@ class SessionManager:
                     # and _sorted_repo_entries()'s per-beat carded filter keys on it.
                     "slug": slug,
                     "mtime": mtime,        # dropped below; sort/cap key
+                    "size": size,          # dropped below; facts-cache key
                 })
         sess_meta = self._session_meta_by_slug()
         for repo, lst in by_repo.items():
@@ -24639,12 +24691,17 @@ class SessionManager:
             del lst[RESUMABLE_PER_REPO:]
             for e in lst:
                 path = os.path.join(PROJECTS_ROOT, e["slug"], e["transcriptId"] + ".jsonl")
+                # Memoized per (mtime, size): the two per-survivor reads are paid
+                # once for a settled transcript, not every slow beat (see
+                # _cached_transcript_facts).
+                first_user, last_activity = self._cached_transcript_facts(
+                    path, e["mtime"], e["size"])
                 sm = sess_meta.get(e["slug"], {})
-                e["summary"] = sm.get("summary") or _first_user_text(path)
+                e["summary"] = sm.get("summary") or first_user
                 # The last new message's own timestamp, not the file mtime — see
                 # _last_activity_ts. Falls back to mtime only when the transcript
                 # carries no timestamped entry.
-                e["endedTs"] = _last_activity_ts(path) or time.strftime(
+                e["endedTs"] = last_activity or time.strftime(
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(e["mtime"]))
                 # Which Jira ticket this conversation was spawned to work, or None
                 # for the ordinary session. This scan is re-derived from the
@@ -24660,6 +24717,18 @@ class SessionManager:
                 # resumable row has no record to have snapshotted them onto).
                 e["prs"] = self._ledger_prs(e["transcriptId"])
                 e.pop("mtime", None)
+                e.pop("size", None)
+        # Prune both memo caches to the transcripts still scanned this pass, so a
+        # deleted/pruned session (or one now backing a card, hence slug-skipped)
+        # can't accumulate stale entries without bound. Bounded by the on-disk
+        # transcript count either way; this keeps it tight. Skipped only when
+        # PROJECTS_ROOT itself was unreadable — an empty `seen_paths` then means
+        # "couldn't look", not "nothing left", so the caches are kept as-is.
+        if scanned_ok:
+            self._resumable_cwd_cache = {
+                p: v for p, v in self._resumable_cwd_cache.items() if p in seen_paths}
+            self._resumable_facts_cache = {
+                p: v for p, v in self._resumable_facts_cache.items() if p in seen_paths}
         return by_repo
 
     def _note_archive_known(self, have):

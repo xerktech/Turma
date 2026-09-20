@@ -72,6 +72,22 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
     `/model` reads like the probe; the sanitizer lifts such a mistaken tombstone.
 - **This ledger is also the archive's input** (`_archive_manifest` enumerates ledger slugs) — decouple
   reconciliation from archival only if the scopes should diverge.
+- **`_resumable_report`'s per-transcript reads are MEMOIZED per `(mtime, size)`, never re-done every
+  beat** (`_resumable_cwd_cache`/`_resumable_facts_cache`). It runs on the slow beat inside
+  `_refresh_repo_usage` and re-derives the "Resume any session" picker from EVERY transcript on disk:
+  `_transcript_cwd` over ALL of them, `_first_user_text`/`_last_activity_ts` over the per-repo
+  survivors. Those reads are the DOMINANT slow-beat cost on a host with many transcripts / contended
+  disk — measured ~15s cold for the cwd pass alone over ~1000 files with the ZFS ARC evicted — and
+  re-reading them cold each slow beat stalled the heartbeat past `OFFLINE_AFTER_MS` and FLAPPED the
+  host offline (the XERK-395 beat-budget class, but a raise not a move: the scan stays on the beat,
+  it just stops re-reading settled files). A settled transcript never changes, so it is read at most
+  once; an append moves both mtime and size so the key misses and it is re-read (freshness kept).
+  Only a DEFINITIVE non-None `_transcript_cwd` is cached (its OSError→None must not stick). Caches
+  prune to the transcripts scanned this pass, UNLESS `PROJECTS_ROOT` was unreadable (empty-because-
+  couldn't-look ≠ empty-because-gone). Same incremental discipline as `slug_usage`/`_fold_slug`.
+  Tests: the `test_a_settled_transcript_is_read_at_most_once_across_beats` /
+  `test_an_appended_transcript_is_re_read` / `test_the_read_caches_prune_to_transcripts_still_on_disk`
+  cases in `TestResumableReport`.
 - Tests: `TestReconcileOrphanTranscripts`, `TestSanitizeJunkRepoEntries`, android
   `UsageViewModelTest`.
 
