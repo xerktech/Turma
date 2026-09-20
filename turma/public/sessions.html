@@ -2967,6 +2967,63 @@ function navFrame(src) {
   try { $frame.contentWindow.location.replace(src); }
   catch { $frame.src = src; }
 }
+// Heal a terminal that LOADED but never came alive — the grey-screen stall
+// (XERK-879): ttyd's page rendered, but its WebSocket data channel never
+// delivered a byte (a slow/dead channel dial, or under HA a /term landing on a
+// replica that had to relay to the tunnel owner), so the pane sits grey until a
+// manual refresh happens to catch a warm channel. The server already heals the
+// BASE-DOCUMENT failure (the black case) with the self-reloading interstitial
+// (`termReconnectHtml`); it cannot see this one, because there the document DID
+// load. So the page watches the two beacons ttyd's proxied page posts
+// (`turma-term-loaded` on parse, `turma-term-live` on the first WS byte —
+// server.js `TERM_LIVE_BEACON`) and, ONLY when it has seen `loaded` but not
+// `-live`, re-navigates the frame to retry. It deliberately does NOTHING while
+// `loaded` is still false: that window is the interstitial's (or a pending base
+// GET), and reloading there would fight its own backoff.
+const TERM_WATCH_CHECK_MS = 6000;   // how often the watchdog re-evaluates
+const TERM_WATCH_RETRY_MAX = 4;     // reloads before standing down (interstitial-like)
+const TERM_WATCH_GIVEUP_MS = 90000; // overall deadline before disarming
+let termWatch = null, termWatchTimer = null;
+function scheduleTermWatch() {
+  clearTimeout(termWatchTimer);
+  termWatchTimer = setTimeout(termWatchdog, TERM_WATCH_CHECK_MS);
+}
+// Arm (or re-arm) for a terminal we just navigated the frame to. A different id
+// resets the retry budget; re-navigating the SAME id (a tunnel-return heal)
+// keeps its budget but clears the stale `loaded` flag for the fresh load.
+function armTermWatch(id) {
+  if (!termWatch || termWatch.id !== id) termWatch = { id, retries: 0, armedAt: Date.now() };
+  termWatch.loaded = false;
+  scheduleTermWatch();
+}
+function disarmTermWatch() { clearTimeout(termWatchTimer); termWatchTimer = null; termWatch = null; }
+function termWatchdog() {
+  if (!termWatch) return;
+  // The stage moved off this terminal, or the tunnel is reported down (the chip
+  // explains it and the tunnel-return edge re-navigates + re-arms) — stand down.
+  if (viewMode !== "terminal" || currentId !== termWatch.id || !stageTunnelOnline) return disarmTermWatch();
+  if (Date.now() - termWatch.armedAt > TERM_WATCH_GIVEUP_MS) return disarmTermWatch();
+  // Only the grey case is ours: the document loaded but no byte ever flowed.
+  // A still-unloaded frame is the interstitial's / a pending GET's to heal, so
+  // reloading there would fight its own backoff — leave it alone.
+  if (termWatch.loaded && termWatch.retries < TERM_WATCH_RETRY_MAX) {
+    termWatch.retries++;
+    termWatch.loaded = false; // reloading — wait for a fresh load beacon
+    navFrame(`/term/${encodeURIComponent(termWatch.id)}/`);
+  }
+  scheduleTermWatch();
+}
+// The two beacons ttyd's proxied page posts (same-origin under /term/<id>/).
+window.addEventListener("message", (e) => {
+  if (e.origin !== location.origin || !termWatch) return;
+  if (e.data === "turma-term-loaded") { termWatch.loaded = true; return; }
+  if (e.data !== "turma-term-live") return;
+  // A byte flowed — the terminal is alive. Force a resize in case ttyd fit to a
+  // 0x0 box (the black 0-row terminal the chatToTerminal() comment describes),
+  // then stand down.
+  try { $frame.contentWindow.dispatchEvent(new Event("resize")); } catch {}
+  disarmTermWatch();
+});
 // NOT a stageTunnelReset() site, unlike the four that re-point the stage: the
 // only caller is chatToTerminal(), a VIEW TOGGLE on the session already staged.
 // Resetting here would hide the chip explaining why the terminal is dead and
@@ -2980,6 +3037,7 @@ function setFrame(id, s, a) {
     (a ? (a.device || a.key) + " · " : "") + (s ? sessMeta(s) : id);
   document.getElementById("termOpen").href = src;
   navFrame(src);
+  armTermWatch(id);
   disarmTermKill();
   const inp = document.getElementById("termInput");
   if (inp) { inp.value = ""; autoGrowTermInput(); }
@@ -3148,6 +3206,7 @@ function chatToTerminal() {
 function terminalToChat() {
   if (!currentId) return;
   navFrame("about:blank"); // drop the terminal's WebSocket while it's hidden
+  disarmTermWatch();
   viewMode = "chat";
   $termPane.hidden = true;
   $chatPane.hidden = false;
@@ -3433,7 +3492,10 @@ function setStageTunnel(online, hostUp) {
   const returned = online && !stageTunnelOnline;
   stageTunnelOnline = online;
   if (!returned || !currentId) return;
-  if (viewMode === "terminal") navFrame(`/term/${encodeURIComponent(currentId)}/`);
+  if (viewMode === "terminal") {
+    navFrame(`/term/${encodeURIComponent(currentId)}/`);
+    armTermWatch(currentId);
+  }
   if (window.TurmaChat && TurmaChat.reconnectNow) TurmaChat.reconnectNow();
 }
 function clearStage() {
@@ -3445,6 +3507,7 @@ function clearStage() {
   subagentListReturn = null;
   resetEndedBar();
   navFrame("about:blank"); // tear down any live session's WebSocket
+  disarmTermWatch();
   if (window.TurmaChat) { TurmaChat.close(); TurmaChat.closeStatic(); } // stop the chat live tail + clear the archived view
   viewMode = null;
   currentTrajId = null;

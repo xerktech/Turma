@@ -246,6 +246,16 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
   glasses/android; `multiSelect` renders checkboxes + a Submit posting `optionIndices`.
 - Raw ttyd terminal is one **"Terminal ▸"** toggle away (`#termPane` iframe); `GET /api/ws-token` also
   authenticates the chat's `/live` socket. Tests: `chat.test.js`.
+- **A grey-but-loaded terminal self-heals via a client watchdog** (XERK-879, `armTermWatch`): ttyd's
+  page loaded but its WS data channel never delivered a byte (a slow/dead channel dial, or under HA a
+  `/term` that had to relay to the tunnel owner), so the pane sits grey until a manual refresh. The
+  page re-navigates the frame, but **ONLY after ttyd's injected `TERM_LIVE_BEACON` posts
+  `turma-term-loaded`** — the `turma-term-live` (first WS byte) beacon disarms it. The `loaded` gate
+  is load-bearing: the server already heals the base-DOCUMENT / black case with its self-reloading
+  interstitial (`termReconnectHtml`, turma.md), so retrying while unloaded would fight that backoff.
+  A `-live` beacon also nudges an iframe `resize` (repairs a 0-row fit). **Android's WebView terminal
+  runs the server beacon but not the sessions-page watchdog** (`android/PARITY.md`). Tests: the
+  `terminal watchdog` cases in `sessions.test.js`, the `live beacon` case in `server.test.js`.
 - **A dsh session is HEADLESS — hides "Terminal ▸", shows "Trajectory ▸"** (XERK-498): a read-only
   view (`#trajPane`) over the dsh D3 native event log (already in the raw archive,
   `<tid>/dsh/*.jsonl`), fetched via `GET /api/dsh/<transcriptId>/trajectory` and rendered
