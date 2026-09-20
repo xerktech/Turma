@@ -106,7 +106,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   const stubs = {
     document,
     localStorage: { _m: {}, getItem(k) { return this._m[k] ?? null; }, setItem(k, v) { this._m[k] = String(v); }, removeItem(k) { delete this._m[k]; } },
-    location: { href: "", search, pathname: "/sessions" },
+    location: { href: "", search, pathname: "/sessions", origin: "https://hub.test" },
     navigator: { userAgent: "node" },
     // Records what the page asks for and never resolves, so the boot refresh()
     // is inert and a command POST can't race a test's assertions.
@@ -192,6 +192,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " showRestore, hideRestore, toggleRestoreMenu, restoreTo, eligibleRestoreTargets,"
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
       + " openSubagentView, transcriptBack,"
+      + " armTermWatch, disarmTermWatch, termWatchdog, getTermWatch: () => termWatch,"
       + " chatToTerminal, terminalToChat, chatToTrajectory, trajectoryToChat, renderTrajectory,"
       + " transcriptToTrajectory, trajectoryBack, trajScrollClick, trajScrollKey, trajToggleTurn,"
       + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
@@ -202,6 +203,9 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
   return { ...api, els, opened, posts, toasts, chat, sse, gets, body: document.body,
+    // Deliver one window-level event (e.g. the terminal beacons' `message`) to
+    // every listener the page registered for it.
+    fireWindow: (type, evt) => (winListeners[type] || []).forEach((fn) => fn(evt)),
     setGet: (fn) => { getReply = fn; },
     // `setOrg` narrows the header's org filter, the way picking an org in the
     // menu does — the sidebar lists only that org's hosts afterwards.
@@ -254,6 +258,59 @@ test("background agents keep a session Active and name what is running", () => {
     "the card says what is running, not a bare 'working'");
   assert.ok(!els.review.innerHTML.includes("Delegating Task"),
     "not ready for review while an agent it launched is still going");
+});
+
+// XERK-879. A terminal that LOADED but never came alive (the grey-screen stall)
+// heals via the sessions page re-navigating the frame — but ONLY once ttyd's
+// page reports `turma-term-loaded`, so the watchdog never fights the server's
+// self-reloading interstitial (which owns the base-document / black case).
+test("terminal watchdog reloads a loaded-but-grey terminal, leaves the black case alone", () => {
+  const p = loadPage();
+  const { now, host: h } = host([running("t1", "Sess", { paneBusy: false, transcriptAgeSec: 5 })]);
+  p.beat({ now, agents: [h] });
+  p.selectSession("t1");
+  p.chatToTerminal();
+  assert.equal(p.getTermWatch() && p.getTermWatch().id, "t1", "armed for the staged terminal");
+  assert.equal(p.getTermWatch().retries, 0);
+
+  const beacon = (data, origin = "https://hub.test") => p.fireWindow("message", { origin, data });
+
+  // Before ttyd's document reports loaded, the watchdog does NOTHING — that
+  // window is the interstitial's, and reloading there fights its own backoff.
+  p.termWatchdog();
+  assert.equal(p.getTermWatch().retries, 0, "no reload while unloaded (interstitial's window)");
+
+  // A cross-origin message is ignored (loaded stays false).
+  beacon("turma-term-loaded", "https://evil.test");
+  assert.equal(p.getTermWatch().loaded, false, "a cross-origin beacon is ignored");
+
+  // The page loaded (grey) but no WS byte ever arrived: the watchdog reloads,
+  // and re-navigating to /term is what heals it.
+  beacon("turma-term-loaded");
+  p.els.termFrame.src = ""; // so the re-navigation below is observable, not the initial one
+  p.termWatchdog();
+  const w = p.getTermWatch();
+  assert.equal(w.retries, 1, "reloads a loaded-but-grey terminal");
+  assert.equal(w.loaded, false, "waits for a fresh load beacon after the reload");
+  assert.equal(p.els.termFrame.src, "/term/t1/", "the reload re-navigates the frame");
+
+  // The terminal comes alive on the retry: the watchdog stands down for good.
+  beacon("turma-term-loaded");
+  beacon("turma-term-live");
+  assert.equal(p.getTermWatch(), null, "a live terminal disarms the watchdog");
+});
+
+// The watchdog stands down when the stage moves off the terminal (self-guard),
+// so a stray timer can't reload a session the operator already left.
+test("terminal watchdog disarms when the stage leaves the terminal", () => {
+  const p = loadPage();
+  const { now, host: h } = host([running("t1", "Sess", { paneBusy: false, transcriptAgeSec: 5 })]);
+  p.beat({ now, agents: [h] });
+  p.selectSession("t1");
+  p.chatToTerminal();
+  p.fireWindow("message", { origin: "https://hub.test", data: "turma-term-loaded" });
+  p.terminalToChat();
+  assert.equal(p.getTermWatch(), null, "leaving the terminal view disarms it");
 });
 
 test("background agents: the count is pluralized, and an empty list changes nothing", () => {

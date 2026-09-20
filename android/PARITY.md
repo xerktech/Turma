@@ -980,3 +980,10 @@ those are marked `[MODEL]`.
     over the whole new body; the web now renders an interleaved per-line diff with unchanged lines as
     context, off the `{old,new}` already on the wire (no wire change). **Android still stacks the two
     blobs.**
+  - **The terminal grey-heal watchdog (XERK-879) is web-only.** The sessions page reloads a ttyd
+    terminal that loaded but whose WS never delivered a byte (the grey stall), driven by the two
+    beacons the server injects into `/term` (`turma-term-loaded` / `turma-term-live`, server.js
+    `TERM_LIVE_BEACON`). The beacons ARE served to Android's `TerminalScreen` WebView (server-side,
+    parity-exempt), but it loads `/term` at top level (no parent iframe) and does not run the
+    sessions-page watchdog, so its terminal has no grey-heal. `TerminalScreen` should watch a
+    WebView load/connect signal and reload on a stall, or add a manual refresh control.

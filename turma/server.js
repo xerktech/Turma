@@ -13586,6 +13586,39 @@ const TERM_SCROLL_BOTTOM_JS =
 const TERM_SCROLL_BOTTOM =
   TERM_SCROLL_BOTTOM_STYLE + "<script>" + TERM_SCROLL_BOTTOM_JS + "</script>";
 
+// Liveness beacons the sessions page uses to heal a terminal that loaded but
+// never came alive — the GREY-screen case (XERK-879): ttyd's HTML document
+// rendered (so xterm painted its empty canvas), but the terminal WebSocket's
+// data channel never delivered a byte, so the pane sits grey until a manual
+// refresh happens to catch a warm channel. The base-DOCUMENT failure is already
+// healed by the self-reloading interstitial (`termReconnectHtml`); this covers
+// the case the interstitial cannot see, because there the document DID load.
+//
+// Injected into <head> ONLY on ttyd's real page (never the interstitial), so:
+//   - `turma-term-loaded` posts the moment this script parses, proving to the
+//     parent that the ttyd DOCUMENT is up (not the interstitial, not a pending
+//     GET) — the parent retries only when it has seen this AND not `-live`.
+//   - `turma-term-live` posts on the FIRST inbound WebSocket message, proving
+//     the data channel actually carried terminal bytes. Keyed on a real byte,
+//     not `onopen`, because an open-but-silent socket is exactly the grey stall.
+// It wraps window.WebSocket (in place before ttyd's body script instantiates
+// its socket) and returns the genuine native instance, so ttyd is unaffected.
+// The parent is same-origin (proxied under /term/<id>/), so postMessage targets
+// `location.origin`. Fails silently — a beacon that throws must never disturb
+// the terminal itself.
+const TERM_LIVE_BEACON_JS =
+  "(function(){try{" +
+  "var P=function(m){try{parent.postMessage(m,location.origin);}catch(e){}};" +
+  "P('turma-term-loaded');" +
+  "var O=window.WebSocket;if(!O||O.__turmaWrapped)return;" +
+  "function W(u,p){var s=arguments.length>1?new O(u,p):new O(u);" +
+  "s.addEventListener('message',function(){P('turma-term-live');},{once:true});" +
+  "return s;}" +
+  "W.prototype=O.prototype;W.CONNECTING=O.CONNECTING;W.OPEN=O.OPEN;" +
+  "W.CLOSING=O.CLOSING;W.CLOSED=O.CLOSED;W.__turmaWrapped=1;window.WebSocket=W;" +
+  "}catch(e){}})();";
+const TERM_LIVE_BEACON = "<script>" + TERM_LIVE_BEACON_JS + "</script>";
+
 // ---- minimal WebSocket server framing (RFC 6455) ----------------------------
 // We only need enough to carry an opaque byte stream (the agent's ttyd TCP
 // wire) plus text control JSON, ping/pong keepalive, and close. Frames FROM the
@@ -14441,7 +14474,7 @@ async function proxyTerm(req, res, name, port) {
         // Insert the @font-face + touch-scroll shim + clipboard bridge before
         // </head> (fall back to prepending).
         const inject = TERM_FONT_STYLE + TERM_TOUCH_SCROLL + TERM_OSC52_CLIPBOARD +
-          TERM_SCROLL_BOTTOM;
+          TERM_SCROLL_BOTTOM + TERM_LIVE_BEACON;
         html = html.includes("</head>")
           ? html.replace("</head>", inject + "</head>")
           : inject + html;
@@ -19024,6 +19057,7 @@ if (process.env.TURMA_TEST) {
     fmtDur,
     TERM_OSC52_JS,
     TERM_SCROLL_BOTTOM_JS,
+    TERM_LIVE_BEACON_JS,
     pcmToWav,
     transcribePcm,
     issueWsToken,

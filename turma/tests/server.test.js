@@ -194,6 +194,7 @@ const {
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
   TERM_OSC52_JS,
   TERM_SCROLL_BOTTOM_JS,
+  TERM_LIVE_BEACON_JS,
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStopResumeExempt, autoStartOrgs, setAutoStartOrg,
   epicRuns, armEpicRun, clearEpicRun, setEpicRunPaused, buildEpicWaves, epicChildRows,
@@ -641,6 +642,46 @@ test("OSC 52 bridge decodes UTF-8 rather than pasting mojibake", () => {
   const t = runOsc52();
   t.fire("c;" + b64("héllo → wörld ✓"));
   assert.deepEqual(t.writes, ["héllo → wörld ✓"]);
+});
+
+// TERM_LIVE_BEACON_JS runs inside ttyd's proxied page (XERK-879). It posts
+// `turma-term-loaded` on parse and `turma-term-live` on the FIRST WebSocket
+// message, so the sessions page can heal a loaded-but-grey terminal. Exercise it
+// the way the browser does: a fake window/parent/location + a stub WebSocket.
+function runLiveBeacon() {
+  const posts = [];
+  let msgHandler = null;
+  class FakeWS {
+    constructor(url, protocols) { this.url = url; this.protocols = protocols; }
+    addEventListener(type, fn, opts) { if (type === "message") { msgHandler = fn; this._once = opts; } }
+    send() {}
+  }
+  FakeWS.CONNECTING = 0; FakeWS.OPEN = 1; FakeWS.CLOSING = 2; FakeWS.CLOSED = 3;
+  const sandbox = {
+    window: { WebSocket: FakeWS },
+    parent: { postMessage: (m, origin) => posts.push({ m, origin }) },
+    location: { origin: "https://hub.example" },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(TERM_LIVE_BEACON_JS, sandbox);
+  return { posts, sandbox, deliverMessage: () => msgHandler && msgHandler() };
+}
+
+test("live beacon posts `loaded` on parse and `live` on the first WS byte", () => {
+  const t = runLiveBeacon();
+  // Posts loaded immediately, to the parent's origin, and not `-live` yet.
+  assert.deepEqual(t.posts, [{ m: "turma-term-loaded", origin: "https://hub.example" }]);
+  // The wrapper replaced window.WebSocket and returns a REAL instance.
+  const ws = new t.sandbox.window.WebSocket("wss://x", "tty");
+  assert.equal(ws.url, "wss://x");
+  assert.equal(ws.protocols, "tty");
+  // The subprotocol is preserved, and the static constants survive the wrap.
+  assert.equal(t.sandbox.window.WebSocket.OPEN, 1);
+  // The first inbound message — not `onopen` — is what proves the channel carried
+  // terminal bytes; a grey stall is exactly an open-but-silent socket.
+  assert.equal(t.posts.length, 1);
+  t.deliverMessage();
+  assert.deepEqual(t.posts[1], { m: "turma-term-live", origin: "https://hub.example" });
 });
 
 test("OSC 52 bridge is write-only: a read request is never answered", () => {
@@ -17501,6 +17542,13 @@ test("term: terminal HTML serves JBMNerd with font-display:swap (not block)", as
     "the control must be injected before </head>");
   assert.ok(text.includes("@font-face") && text.includes("registerOscHandler"),
     "font + clipboard injections must coexist with the scroll control");
+  // XERK-879: the grey-heal liveness beacon must actually be in the SERVED
+  // document (a VM test of TERM_LIVE_BEACON_JS alone can't catch it being
+  // dropped from proxyTerm's inject string). It lands in <head> like the rest.
+  assert.ok(text.includes("turma-term-loaded"),
+    "the liveness beacon must be injected into the served terminal document");
+  assert.ok(text.indexOf("turma-term-loaded") < text.indexOf("</head>"),
+    "the beacon must be injected before </head>");
   data.socket.destroy();
   ctrl.socket.destroy();
 
