@@ -52,6 +52,22 @@ function makeEl(id) {
     getBoundingClientRect() { return { top: 0, bottom: 0, height: 0 }; },
     scrollIntoView() {}, remove() {},
   };
+  // A minimal same-origin contentWindow so navFrame()'s `location.replace(src)`
+  // succeeds (the real path) instead of falling to its `catch` — and so the
+  // terminal iframe's load handler can read `location.pathname` (XERK-879). The
+  // replace mirrors to `el.src` too, keeping the `.src`-based assertions the
+  // terminal-navigation tests already make.
+  el.contentWindow = {
+    location: {
+      pathname: "blank", href: "about:blank",
+      replace(u) {
+        u = String(u);
+        this.href = u;
+        this.pathname = u === "about:blank" ? "blank" : u.split("?")[0];
+        el.src = u;
+      },
+    },
+  };
   // `_onHtml` lets a test model what the real browser does around an innerHTML
   // swap — chiefly clamping an ancestor's scrollTop while the panel is empty.
   Object.defineProperty(el, "innerHTML", {
@@ -1319,9 +1335,19 @@ test("opening the terminal shows a connecting overlay, hidden when the iframe lo
   (els.termFrame._ls.load || []).forEach((fn) => fn());
   assert.equal(els.termLoading.hidden, true, "the overlay clears once the document loads");
 
-  // A fresh navigate re-shows it; toggling back to chat (about:blank) hides it.
+  // A fresh navigate re-shows it.
   chatToTerminal();
   assert.equal(els.termLoading.hidden, false, "re-shown on a re-navigate");
+
+  // A STALE about:blank load (from a rapid chat→terminal re-toggle) must NOT hide
+  // the overlay we just re-armed — only a load whose document IS the terminal does.
+  els.termFrame.contentWindow.location.pathname = "blank";
+  (els.termFrame._ls.load || []).forEach((fn) => fn());
+  assert.equal(els.termLoading.hidden, false, "a stale about:blank load leaves the overlay up");
+  els.termFrame.contentWindow.location.pathname = "/term/11111/";
+  (els.termFrame._ls.load || []).forEach((fn) => fn());
+  assert.equal(els.termLoading.hidden, true, "the terminal document's own load clears it");
+
   terminalToChat();
   assert.equal(els.termLoading.hidden, true, "hidden when the terminal is torn down");
 });

@@ -2790,9 +2790,17 @@ function hideTermLoading() {
   if ($termLoading) $termLoading.hidden = true;
 }
 // ttyd's page (or the hub's reconnect interstitial, which then shows its own
-// status) has finished loading — drop the overlay. Fires for about:blank too,
-// which is a harmless no-op since the overlay is already hidden by then.
-if ($frame) $frame.addEventListener("load", hideTermLoading);
+// status) has finished loading — drop the overlay. Only for a load whose current
+// document IS a terminal: the `about:blank` teardown fires a load too, and if a
+// rapid chat→terminal re-toggle let that STALE about:blank load land after the
+// re-open re-armed the overlay, hiding here would flash the pane black until the
+// real /term/ load. Same-origin, so the pathname is readable; unreadable → leave
+// the overlay be and let the /term/ navigation's own load clear it.
+if ($frame) $frame.addEventListener("load", () => {
+  let p = "";
+  try { p = ($frame.contentWindow.location.pathname) || ""; } catch { p = ""; }
+  if (p.indexOf("/term/") === 0) hideTermLoading();
+});
 const $termPane = document.getElementById("termPane");
 const $chatPane = document.getElementById("chatPane");
 const $transcriptPane = document.getElementById("transcriptPane");
