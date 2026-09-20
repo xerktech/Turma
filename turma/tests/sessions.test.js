@@ -39,7 +39,10 @@ function makeEl(id) {
       toggle(c, f) { const on = f == null ? !this._s.has(c) : f; on ? this._s.add(c) : this._s.delete(c); return on; },
       contains(c) { return this._s.has(c); },
     },
-    addEventListener() {}, removeEventListener() {},
+    // Record listeners so a test can fire an element event (e.g. the terminal
+    // iframe's `load`, which hides the connecting overlay — XERK-879).
+    addEventListener(type, fn) { (this._ls ||= {})[type] = (this._ls[type] || []).concat(fn); },
+    removeEventListener() {},
     appendChild(c) { this.children.push(c); return c; },
     querySelector() { return null; }, querySelectorAll() { return []; },
     // `focused` records the last focus() call, which is how the draft-carry
@@ -1296,6 +1299,48 @@ test("a tunnel flap re-attaches the terminal iframe, whose socket cannot self-he
   assert.equal(els.termFrame.src, "", "nothing to re-attach while the tunnel is down");
   beat({ now, agents: [h] });
   assert.equal(els.termFrame.src, "/term/11111/", "the ttyd frame is re-navigated on return");
+});
+
+// XERK-879: the terminal iframe is a black box while the tunnel dial-back +
+// ttyd/xterm/WS/tmux come up (intermittently many seconds), so opening it shows a
+// "connecting" overlay for immediate feedback, dropped once the document loads.
+test("opening the terminal shows a connecting overlay, hidden when the iframe loads", () => {
+  const { beat, selectSession, chatToTerminal, terminalToChat, els } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+  // (The DOM shim can't reflect the markup `hidden` attribute, so assert on the
+  // transitions the JS drives, not the initial state.)
+  chatToTerminal();
+  assert.equal(els.termFrame.src, "/term/11111/", "the iframe was pointed at the session");
+  assert.equal(els.termLoading.hidden, false, "the overlay shows the moment we navigate");
+
+  // ttyd's page (or the hub's reconnect interstitial) finishing loading drops it.
+  (els.termFrame._ls.load || []).forEach((fn) => fn());
+  assert.equal(els.termLoading.hidden, true, "the overlay clears once the document loads");
+
+  // A fresh navigate re-shows it; toggling back to chat (about:blank) hides it.
+  chatToTerminal();
+  assert.equal(els.termLoading.hidden, false, "re-shown on a re-navigate");
+  terminalToChat();
+  assert.equal(els.termLoading.hidden, true, "hidden when the terminal is torn down");
+});
+
+// A tunnel-return re-navigates the iframe (XERK-252); that reload has the same
+// black-box window, so the overlay must cover it too.
+test("a tunnel-return re-navigate re-shows the connecting overlay", () => {
+  const { beat, selectSession, chatToTerminal, els } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+  chatToTerminal();
+  (els.termFrame._ls.load || []).forEach((fn) => fn()); // first open settled
+  assert.equal(els.termLoading.hidden, true);
+
+  beat({ now, agents: [{ ...h, terminalOnline: false }] }); // tunnel drops
+  beat({ now, agents: [h] });                               // and returns → re-navigate
+  assert.equal(els.termFrame.src, "/term/11111/");
+  assert.equal(els.termLoading.hidden, false, "the re-attach shows the overlay again");
 });
 
 // The stage's tunnel state belongs to ONE staged subject. Left over from the
