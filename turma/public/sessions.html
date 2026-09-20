@@ -341,7 +341,24 @@
      override to actually hide the pane. Without this the "No session attached"
      notice never clears and the terminal stacks below it. */
   .stage-empty[hidden], .term-pane[hidden] { display: none; }
+  /* Wrapper so the loading overlay (XERK-879) covers just the iframe, leaving the
+     term bar (Close/Chat) usable while the terminal connects. */
+  .term-frame-wrap { flex: 1; position: relative; display: flex; min-height: 0; }
   .term-pane iframe { flex: 1; border: 0; width: 100%; background: #000; }
+  /* Immediate feedback for the black-box window between navigating the iframe and
+     the TUI actually painting — the tunnel dial-back (up to ~10s per attempt) plus
+     ttyd/xterm/WebSocket/tmux bring-up. Shown on navigate, hidden on the iframe's
+     load event (ttyd's page, or the hub's own reconnect interstitial, which then
+     shows its own status). Sits over the black iframe so there is no flash. */
+  .term-loading {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px;
+    background: #000; color: var(--muted); font-size: 13px; text-align: center;
+    padding: 0 24px;
+  }
+  .term-loading[hidden] { display: none; }
+  .term-loading .spin { width: 22px; height: 22px; border-width: 2px; }
+  .term-loading .term-loading-msg { opacity: .85; }
   .term-bar .back-btn { display: none; }
   .term-bar .t-title .name { font-weight: 600; }
   /* The staged session's host lost its terminal tunnel (XERK-252). The stage
@@ -1205,7 +1222,18 @@
           <a id="termOpen" target="_blank" rel="noopener">Open in new tab ↗</a>
           <button class="kill-btn" id="termKill" onclick="killCurrentTerminal()">Kill</button>
         </div>
-        <iframe id="termFrame" src="about:blank" title="Live Claude session"></iframe>
+        <!-- The iframe sits in a positioned wrapper so the loading overlay can
+             cover exactly the terminal region (not the bar/compose). The pane is
+             a black box while the tunnel dial-back + ttyd/xterm/WS/tmux come up,
+             which is intermittently many seconds with no feedback (XERK-879); the
+             overlay gives that window an immediate "connecting" state. -->
+        <div class="term-frame-wrap">
+          <iframe id="termFrame" src="about:blank" title="Live Claude session"></iframe>
+          <div class="term-loading" id="termLoading" hidden>
+            <span class="spin"></span>
+            <span class="term-loading-msg">Connecting to the terminal…</span>
+          </div>
+        </div>
         <!-- Local compose bar: typing here is native/zero-lag (no per-keystroke
              round trip through the tunnels), and Enter sends the whole line via
              the session's /input endpoint, same as the dashboard's terminal. -->
@@ -2742,6 +2770,37 @@ function resumeCurrentEnded() {
 // phones the list and terminal are separate full-screen views; entering the
 // terminal pushes one history entry so the back button returns to the list.
 const $frame = document.getElementById("termFrame");
+// The terminal loading overlay (XERK-879): shown the moment the iframe is pointed
+// at a session's /term/ URL, hidden when that document loads. Covers the black
+// no-feedback window while the tunnel dial-back + ttyd/xterm/WS/tmux come up. A
+// safety timeout so a load event we never receive can't pin the spinner forever
+// (proxyTerm's own deadline is 30s, after which the hub serves the reconnect page
+// — whose load DOES fire — so this only backstops a truly wedged navigation).
+const $termLoading = document.getElementById("termLoading");
+const TERM_LOAD_MAX_MS = 35000;
+let termLoadTimer = null;
+function showTermLoading() {
+  if (!$termLoading) return;
+  $termLoading.hidden = false;
+  if (termLoadTimer) clearTimeout(termLoadTimer);
+  termLoadTimer = setTimeout(hideTermLoading, TERM_LOAD_MAX_MS);
+}
+function hideTermLoading() {
+  if (termLoadTimer) { clearTimeout(termLoadTimer); termLoadTimer = null; }
+  if ($termLoading) $termLoading.hidden = true;
+}
+// ttyd's page (or the hub's reconnect interstitial, which then shows its own
+// status) has finished loading — drop the overlay. Only for a load whose current
+// document IS a terminal: the `about:blank` teardown fires a load too, and if a
+// rapid chat→terminal re-toggle let that STALE about:blank load land after the
+// re-open re-armed the overlay, hiding here would flash the pane black until the
+// real /term/ load. Same-origin, so the pathname is readable; unreadable → leave
+// the overlay be and let the /term/ navigation's own load clear it.
+if ($frame) $frame.addEventListener("load", () => {
+  let p = "";
+  try { p = ($frame.contentWindow.location.pathname) || ""; } catch { p = ""; }
+  if (p.indexOf("/term/") === 0) hideTermLoading();
+});
 const $termPane = document.getElementById("termPane");
 const $chatPane = document.getElementById("chatPane");
 const $transcriptPane = document.getElementById("transcriptPane");
@@ -2964,6 +3023,11 @@ const isNarrow = () => window.matchMedia("(max-width: 820px)").matches;
 // button step through old terminal URLs instead of returning to the list.
 // Same-origin, so contentWindow is reachable.
 function navFrame(src) {
+  // Show the loading overlay when pointing at a real terminal, hide it when
+  // tearing the iframe down (about:blank). Centralised here so every navigation
+  // — the initial open (setFrame) AND the tunnel-return re-navigate — is covered.
+  if (src && src.indexOf("/term/") === 0) showTermLoading();
+  else hideTermLoading();
   try { $frame.contentWindow.location.replace(src); }
   catch { $frame.src = src; }
 }
