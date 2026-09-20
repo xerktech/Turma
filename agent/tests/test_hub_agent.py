@@ -8000,6 +8000,71 @@ class TestResumableReport(ManagerMixin, unittest.TestCase):
         # An ordinary session reports no PRs rather than an empty list.
         self.assertIsNone(by_tid["plain1"]["prs"])
 
+    def test_a_settled_transcript_is_read_at_most_once_across_beats(self):
+        """The per-file reads (_transcript_cwd over ALL transcripts,
+        _first_user_text/_last_activity_ts over the survivors) are memoized per
+        (mtime, size), so a settled transcript is NOT re-read every slow beat —
+        the cold re-read of that whole-fleet scan is what stalled the heartbeat
+        and flapped a host offline (XERK-395 class)."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "abcde")
+        self._write_at(wt, tid="s1")
+        self._write_at(os.path.join(ha.REPOS_ROOT, "Turma"), tid="s2")
+        sm = self.make_manager()
+        with mock.patch.object(ha, "_transcript_cwd",
+                               side_effect=ha._transcript_cwd) as cwd_spy, \
+             mock.patch.object(ha, "_first_user_text",
+                               side_effect=ha._first_user_text) as fu_spy, \
+             mock.patch.object(ha, "_last_activity_ts",
+                               side_effect=ha._last_activity_ts) as la_spy:
+            first = sm._resumable_report()
+            reads_after_first = (cwd_spy.call_count, fu_spy.call_count,
+                                 la_spy.call_count)
+            self.assertGreater(reads_after_first[0], 0)  # it did read them once
+            second = sm._resumable_report()
+            # Nothing changed on disk, so the second pass reads NO transcript.
+            self.assertEqual(cwd_spy.call_count, reads_after_first[0])
+            self.assertEqual(fu_spy.call_count, reads_after_first[1])
+            self.assertEqual(la_spy.call_count, reads_after_first[2])
+            # And the answer is identical — the cache changed the cost, not the result.
+            self.assertEqual(first, second)
+
+    def test_an_appended_transcript_is_re_read(self):
+        """An append moves the mtime AND size, so the (mtime, size) key changes
+        and the memo is a miss — a resumed/still-growing session's facts stay
+        fresh."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "abcde")
+        proj = self._write_at(wt, tid="s1", text="first prompt")
+        sm = self.make_manager()
+        sm._resumable_report()                       # populate the cache
+        # Append a later message and bump the mtime past the cached key.
+        path = os.path.join(proj, "s1.jsonl")
+        with open(path, "a") as fh:
+            fh.write(json.dumps(
+                {"type": "user", "cwd": wt,
+                 "message": {"role": "user", "content": "second"},
+                 "timestamp": "2030-01-01T00:00:00Z"}) + "\n")
+        os.utime(path, (time.time() + 5, time.time() + 5))
+        with mock.patch.object(ha, "_last_activity_ts",
+                               side_effect=ha._last_activity_ts) as la_spy:
+            rep = sm._resumable_report()
+        self.assertGreater(la_spy.call_count, 0)     # the changed file was re-read
+        e = {x["transcriptId"]: x for x in rep["Turma"]}["s1"]
+        self.assertEqual(e["endedTs"], "2030-01-01T00:00:00Z")
+
+    def test_the_read_caches_prune_to_transcripts_still_on_disk(self):
+        """A deleted (or now-carded) transcript's memo entry does not accumulate
+        without bound — the caches prune to what was scanned this pass."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "abcde")
+        proj = self._write_at(wt, tid="gone")
+        sm = self.make_manager()
+        sm._resumable_report()
+        path = os.path.join(proj, "gone.jsonl")
+        self.assertIn(path, sm._resumable_cwd_cache)
+        os.remove(path)
+        sm._resumable_report()
+        self.assertNotIn(path, sm._resumable_cwd_cache)
+        self.assertNotIn(path, sm._resumable_facts_cache)
+
     def test_caps_per_repo(self):
         p = mock.patch.object(ha, "RESUMABLE_PER_REPO", 2)
         p.start()
