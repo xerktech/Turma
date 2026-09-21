@@ -20853,6 +20853,32 @@ class TestRootSessionIsolation(ManagerMixin, unittest.TestCase):
         self.assertIn(f"--resume {a['claudeSessionId']}", cmd)
         self.assertNotIn(b["claudeSessionId"], cmd)
 
+    def test_resuming_a_session_with_an_empty_transcript_starts_fresh(self):
+        # XERK-868 follow-up: Claude Code creates <sid>.jsonl at launch, but a
+        # session that never took a first turn leaves it 0 bytes. `claude
+        # --resume <that id>` exits at once with "No conversation found", killing
+        # its tmux — which _sweep_dead_sessions reports as a crash, on an endless
+        # loop because every Start relaunches the same doomed --resume. The pinned
+        # transcript must read as ABSENT for a 0-byte file, so resume opens a
+        # FRESH conversation (a survivable launch) instead.
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        pinned = a["claudeSessionId"]
+        empty = os.path.join(self.proj, f"{pinned}.jsonl")
+        open(empty, "w").close()  # exists on disk, but 0 bytes
+        self.assertTrue(os.path.exists(empty))
+        # Reads keep the path (an empty scan is harmless); only the --resume id
+        # resolver rejects it, so the launch cannot issue a doomed --resume.
+        self.assertEqual(ha._session_transcript_path(a), empty)
+        self.assertIsNone(sm._session_transcript_id(a))
+        sm.kill(a["id"])
+
+        sm.resume(a["id"])
+        cmd = [c[-1] for c in self.run_ok_calls if "new-session" in c][-1]
+        self.assertNotIn(f"--resume {pinned}", cmd,
+                         "an empty transcript must not be resumed into a crash")
+        self.assertIn("--session-id", cmd)  # a fresh, survivable conversation
+
     def test_killing_a_root_session_records_its_own_transcript_id(self):
         # What the Ended-sessions card opens from the archive.
         sm = self._manager()

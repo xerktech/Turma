@@ -8043,7 +8043,12 @@ def _pinned_transcript_path(workdir, claude_sid):
     --resume id otherwise), and Claude Code names the transcript after it, so
     the file is <claude_sid>.jsonl under the cwd's project slug. None when the
     session predates the pin (no id) or claude hasn't written its first entry
-    yet — see _session_transcript_path for why that is NOT a fallback."""
+    yet — see _session_transcript_path for why that is NOT a fallback.
+
+    A 0-byte transcript still resolves to its PATH here: the read surfaces
+    (tail/history/pending-scan) scan it harmlessly (it yields nothing). Whether
+    it is RESUMABLE is a separate question, answered in _session_transcript_id,
+    which is the only caller that must not hand an empty id to `claude --resume`."""
     if not claude_sid or not VALID_CLAUDE_SID_RE.fullmatch(claude_sid):
         return None
     path = os.path.join(PROJECTS_ROOT, _project_slug(workdir),
