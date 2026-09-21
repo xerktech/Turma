@@ -54,8 +54,10 @@ class TranscriptClippedMarkTest {
     /**
      * The tool card and the thinking trace carry their own call sites — a gate
      * on the bubble alone left both free to be deleted with every Android test
-     * green. Both render COLLAPSED by default, so the mark appears once the card
-     * is opened (the web's thought card opens by default; PARITY.md records it).
+     * green. The tool card renders COLLAPSED by default, so its mark appears once
+     * opened; the Verbose thinking trace renders EXPANDED by default (XERK-860,
+     * web parity with renderThought's `openAttr(key, true)`), so its mark shows
+     * straight away.
      */
     @Test fun `a clipped tool card shows the mark once opened`() {
         compose.setContent {
@@ -69,13 +71,15 @@ class TranscriptClippedMarkTest {
         compose.onNodeWithText(mark).assertIsDisplayed()
     }
 
-    @Test fun `a clipped thinking trace shows the mark once opened`() {
+    @Test fun `a clipped thinking trace shows the mark, expanded by default`() {
         compose.setContent {
             ChatItemView(ChatItem.Thinking("a1", "a long thought", clipped = true))
         }
-        compose.onAllNodesWithText(mark).assertCountEquals(0)  // collapsed
-        compose.onNodeWithText("💭 thinking").performClick()
+        // Verbose shows the trace expanded by default now, so the mark is on
+        // screen without a tap; collapsing it (tap the summary) hides the mark.
         compose.onNodeWithText(mark).assertIsDisplayed()
+        compose.onNodeWithText("💭 thinking").performClick()
+        compose.onAllNodesWithText(mark).assertCountEquals(0)
     }
 
     /**
