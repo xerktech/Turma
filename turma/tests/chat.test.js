@@ -456,21 +456,32 @@ test("onPoll actually calls reseedFromFleet", () => {
     "onPoll must re-seed, or a held-open view freezes at whatever open() saw");
 });
 
-test("XERK-860: hidden thinking announces itself but does NOT carry the trace", () => {
+test("XERK-860: Concise drops thinking, Normal folds it EXPANDABLY, Verbose expands it", () => {
   // The default verbosity hides thinking while the terminal always shows it, so a
   // quiet turn and an elided one used to look identical (renderThought returned
-  // ""). The affordance makes the elision VISIBLE. It is deliberately SUMMARY
-  // ONLY: `concise`/`normal` mean "do not send me the thinking", and glasses
-  // renders this same vendored engine onto a tiny display.
+  // ""). The three presets now treat it three ways: Concise drops it entirely
+  // (no trace, no marker); Normal shows a muted, COUNTED, EXPANDABLE marker that
+  // carries the trace collapsed (a click reveals it in place); Verbose shows the
+  // trace expanded by default.
   const entries = [{ id: "a1", role: "assistant", blocks: [
     { t: "thinking", text: "SECRET-TRACE" },
     { t: "text", text: "done" },
   ] }];
-  const hidden = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
-  assert.match(hidden, /1 thought hidden/, "the elision must be visible");
-  assert.ok(!hidden.includes("SECRET-TRACE"),
-    "the hidden trace must not be emitted at a verbosity that hides thinking");
-  assert.match(hidden, /done/, "the rest of the turn still renders");
+
+  // Concise (the minimal reading view): nothing at all — no marker, no trace.
+  const concise = withVerbosity("concise", () => itemsToHtml(buildItems(entries)));
+  assert.ok(!/thought hidden/.test(concise), "Concise shows no marker");
+  assert.ok(!concise.includes("SECRET-TRACE"), "Concise carries no trace");
+  assert.match(concise, /done/, "the rest of the turn still renders");
+
+  // Normal: a counted marker that CARRIES the trace, COLLAPSED (expandable).
+  const normal = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
+  assert.match(normal, /1 thought hidden/, "Normal signposts the elision");
+  assert.match(normal, /class="thought folded"/, "as an expandable <details>");
+  assert.ok(!/<details class="thought folded"[^>]* open>/.test(normal),
+    "collapsed by default — the trace is hidden until the reader opens it");
+  assert.match(normal, /SECRET-TRACE/, "the trace is carried, ready to reveal in place");
+  assert.match(normal, /done/, "the rest of the turn still renders");
 
   // Two consecutive thoughts fold into ONE marker that counts them.
   const two = withVerbosity("normal", () => itemsToHtml(buildItems([{
@@ -479,10 +490,11 @@ test("XERK-860: hidden thinking announces itself but does NOT carry the trace", 
   }])));
   assert.match(two, /2 thoughts hidden/);
 
-  // Raising verbosity is what reveals it — that is what the control is for.
+  // Verbose: the trace, expanded by default — raising verbosity reveals it.
   const shown = withVerbosity("verbose", () => itemsToHtml(buildItems(entries)));
-  assert.match(shown, /SECRET-TRACE/, "verbose must still render the trace");
+  assert.match(shown, /SECRET-TRACE/, "verbose renders the trace");
   assert.ok(!/thought hidden/.test(shown), "nothing is 'hidden' once it is shown");
+  assert.match(shown, /<details class="thought"[^>]* open>/, "expanded by default");
 });
 
 test("buildItems/render: an Edit tool_use carries its diff onto the card", () => {

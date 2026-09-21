@@ -179,24 +179,25 @@ class ChatItemsTest {
         assertTrue(verbose.any { it is ChatItem.Thinking })
     }
 
-    // ---- XERK-860: hidden thinking folds into a counted marker --------------
+    // ---- XERK-860: Concise drops / Normal folds+carries / Verbose shows ------
     //
-    // The web twin is chat.test.js "XERK-860: hidden thinking announces itself
-    // but does NOT carry the trace". Hidden thinking used to render as nothing at
-    // all here, so an elided turn read as a quiet one next to the terminal (which
-    // always shows the trace). The marker is SUMMARY ONLY — the trace itself is
-    // never carried at a verbosity that hides thinking, so it can't leak.
+    // The web twin is chat.test.js "XERK-860: Concise drops thinking, Normal folds
+    // it EXPANDABLY, Verbose expands it". Hidden thinking used to render as nothing
+    // at all here, so an elided turn read as a quiet one next to the terminal
+    // (which always shows the trace). The three presets now treat it three ways:
+    // Concise drops it (no marker, no trace); Normal folds a run into ONE marker
+    // that CARRIES the traces (expandable in the UI); Verbose shows the traces.
 
     private fun folds(items: List<ChatItem>) = items.filterIsInstance<ChatItem.FoldedThoughts>()
 
-    @Test fun `hidden thinking folds into a counted marker without the trace`() {
+    @Test fun `normal folds hidden thinking into a marker that CARRIES the trace`() {
         val e = TailEntry(id = "a1", role = "assistant",
             blocks = listOf(ThinkingBlock("SECRET-TRACE"), TextBlock("done")))
         val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
-        // The elision is visible and counted, and nothing is a shown Thinking —
-        // and the trace is structurally absent (FoldedThoughts carries a count,
-        // no field that could hold "SECRET-TRACE").
-        assertEquals(1, folds(items).single().count)
+        // Counted, and carrying the trace so the UI can reveal it in place.
+        val fold = folds(items).single()
+        assertEquals(1, fold.count)
+        assertEquals("SECRET-TRACE", fold.thoughts.single().text)
         assertTrue(items.none { it is ChatItem.Thinking })
         // The rest of the turn still renders, AFTER the marker (web order).
         assertEquals("done", items.filterIsInstance<ChatItem.Bubble>().single().text)
@@ -204,11 +205,20 @@ class ChatItemsTest {
             items.indexOfFirst { it is ChatItem.Bubble })
     }
 
-    @Test fun `two consecutive hidden thoughts fold into one marker`() {
+    @Test fun `concise drops hidden thinking entirely — no marker, no trace`() {
+        val e = TailEntry(id = "a1", role = "assistant",
+            blocks = listOf(ThinkingBlock("SECRET-TRACE"), TextBlock("done")))
+        val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.CONCISE))
+        assertTrue("Concise shows no marker", folds(items).isEmpty())
+        assertTrue("and no shown trace", items.none { it is ChatItem.Thinking })
+        assertEquals("done", items.filterIsInstance<ChatItem.Bubble>().single().text)
+    }
+
+    @Test fun `two consecutive hidden thoughts fold into one marker, in order`() {
         val e = TailEntry(id = "a2", role = "assistant",
             blocks = listOf(ThinkingBlock("x"), ThinkingBlock("y"), TextBlock("ok")))
         val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
-        assertEquals(2, folds(items).single().count)
+        assertEquals(listOf("x", "y"), folds(items).single().thoughts.map { it.text })
     }
 
     @Test fun `verbose reveals the trace and drops the folded marker`() {
@@ -237,10 +247,11 @@ class ChatItemsTest {
         assertEquals(1, items.filterIsInstance<ChatItem.Tool>().size)
     }
 
-    @Test fun `a HIDDEN tool between two hidden thoughts still breaks the run`() {
-        // Concise hides BOTH the tool card AND thinking. The web keeps the tool as
-        // an item regardless of verbosity, so it still ends the run — two separate
-        // "1 thought hidden" markers, never a merged "2".
+    @Test fun `a HIDDEN tool still breaks a fold run`() {
+        // A custom verbosity where thinking FOLDS but tool CARDS are hidden
+        // (outputs on, calls off). The web keeps a tool_use as an item regardless
+        // of whether its card renders, so it still ends the run — two separate
+        // "1 thought" markers, never a merged "2".
         val items = buildItems(
             listOf(
                 TailEntry(id = "a5", role = "assistant", blocks = listOf(
@@ -250,7 +261,7 @@ class ChatItemsTest {
                 )),
                 TailEntry(id = "r1", role = "user", blocks = listOf(ToolResultBlock(forId = "t1", text = "out"))),
             ),
-            VerbosityPrefs.forPreset(Verbosity.CONCISE),
+            VerbosityPrefs(thinking = false, toolCalls = false, toolOutputs = true),
         )
         assertEquals(listOf(1, 1), folds(items).map { it.count })
         assertTrue("the tool card itself stays hidden", items.none { it is ChatItem.Tool })
@@ -264,7 +275,7 @@ class ChatItemsTest {
             ),
             VerbosityPrefs.forPreset(Verbosity.NORMAL),
         )
-        assertEquals(2, folds(items).single().count)
+        assertEquals(listOf("a", "b"), folds(items).single().thoughts.map { it.text })
         assertEquals("done", items.filterIsInstance<ChatItem.Bubble>().single().text)
     }
 
@@ -273,7 +284,7 @@ class ChatItemsTest {
             blocks = listOf(TextBlock("hi"), ThinkingBlock("bye")))
         val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
         assertEquals("hi", (items.first() as ChatItem.Bubble).text)
-        assertEquals(1, (items.last() as ChatItem.FoldedThoughts).count)
+        assertEquals("bye", (items.last() as ChatItem.FoldedThoughts).thoughts.single().text)
     }
 
     @Test fun `text-only entry with no blocks becomes a bubble`() {

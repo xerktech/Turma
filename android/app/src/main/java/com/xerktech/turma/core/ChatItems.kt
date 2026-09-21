@@ -22,11 +22,33 @@ import kotlinx.serialization.json.JsonPrimitive
 
 enum class Verbosity { CONCISE, NORMAL, VERBOSE }
 
+/**
+ * Which of the three thinking displays a verbosity wants (XERK-860, web parity
+ * with chat.js `thoughtDisplay`):
+ *  - [SHOW]  (Verbose): the full trace, expanded by default.
+ *  - [FOLD]  (Normal):  one muted, counted, EXPANDABLE marker carrying the run's
+ *            traces collapsed — a tap reveals them in place.
+ *  - [OFF]   (Concise): nothing at all — no trace, no marker.
+ */
+enum class ThoughtDisplay { OFF, FOLD, SHOW }
+
 data class VerbosityPrefs(
     val thinking: Boolean,
     val toolCalls: Boolean,
     val toolOutputs: Boolean,
 ) {
+    /**
+     * Concise is the minimal reading view — the ONLY preset with BOTH tools and
+     * outputs off — so it drops even the thinking marker; any richer verbosity
+     * signposts the elision. Keyed on the flags (not the preset name) so a custom
+     * combo still resolves, exactly as the web's `thoughtDisplay(show)` does.
+     */
+    fun thoughtDisplay(): ThoughtDisplay = when {
+        thinking -> ThoughtDisplay.SHOW
+        toolCalls || toolOutputs -> ThoughtDisplay.FOLD
+        else -> ThoughtDisplay.OFF
+    }
+
     companion object {
         fun forPreset(v: Verbosity): VerbosityPrefs = when (v) {
             Verbosity.CONCISE -> VerbosityPrefs(thinking = false, toolCalls = false, toolOutputs = false)
@@ -35,6 +57,9 @@ data class VerbosityPrefs(
         }
     }
 }
+
+/** One thinking trace inside a folded marker (XERK-860). */
+data class FoldedThought(val text: String, val clipped: Boolean = false)
 
 sealed interface ChatItem {
     val entryKey: String
@@ -59,24 +84,25 @@ sealed interface ChatItem {
     ) : ChatItem
 
     /**
-     * A run of consecutive thinking traces the current verbosity HIDES, folded
-     * into ONE muted marker that COUNTS them (XERK-860) — the web's
+     * A run of consecutive thinking traces the NORMAL verbosity hides, folded
+     * into ONE muted, counted, EXPANDABLE marker (XERK-860) — the web's
      * `💭 n thought(s) hidden` (chat.js `renderFoldedThoughts`), which glasses
      * renders through the same vendored engine. Hidden thinking used to render
-     * as NOTHING here, exactly as it did on the web before the fix: next to the
-     * terminal — which always shows the trace — an elided turn read as a quiet
-     * one, with no signal that anything was cut. This makes the elision VISIBLE.
+     * as NOTHING here: next to the terminal — which always shows the trace — an
+     * elided turn read as a quiet one, with no signal that anything was cut.
      *
-     * It is deliberately SUMMARY ONLY — [count] alone, never the trace: the
-     * hiding verbosities (Concise/Normal) mean "do not show me the thinking", so
-     * raising the verbosity to Verbose is what reveals it. The marker is NOT a
-     * control (the web's is a plain, non-clickable label): there is no fuller
-     * copy to fetch, only a preset to change.
+     * The marker CARRIES the run's [thoughts] collapsed; a tap reveals them in
+     * place ([ui.TranscriptFoldedThoughts]), so the reader reaches the trace
+     * without changing the whole preset. Concise emits no marker at all (the
+     * minimal reading view); Verbose shows the traces expanded instead — see
+     * [ThoughtDisplay] and [buildItems].
      */
     data class FoldedThoughts(
         override val entryKey: String,
-        val count: Int,
-    ) : ChatItem
+        val thoughts: List<FoldedThought>,
+    ) : ChatItem {
+        val count: Int get() = thoughts.size
+    }
 
     data class Tool(
         override val entryKey: String,
@@ -127,23 +153,26 @@ fun buildItems(
             }
         }
     }
-    // A run of consecutive hidden thoughts folds into ONE counted marker
-    // (XERK-860). The web builds every thinking item unconditionally and folds
-    // the run at RENDER time (chat.js itemsToHtml collects `while items[j].kind
-    // === "thinking"`); this single-pass port folds inline instead, so the run
-    // must break on exactly what the web's item stream breaks it on — a bubble,
-    // a tool_use, an orphan tool_result or a task note, EACH an item there even
-    // when this verbosity hides its card. So `flushFold` is called before every
-    // such item, whether or not it renders, and the count SPANS entries the way
-    // adjacent items do (state lives outside the entry loop). A PAIRED
-    // tool_result is `continue`d in the web with no item and no flush, so it
-    // does NOT break a run — it is left untouched below.
-    var foldCount = 0
+    // A run of consecutive thinking blocks the NORMAL verbosity hides folds into
+    // ONE marker carrying their traces (XERK-860). The web builds every thinking
+    // item then folds the run at RENDER time (chat.js itemsToHtml collects `while
+    // items[j].kind === "thinking"`); this single-pass port folds inline instead,
+    // so the run must break on exactly what the web's item stream breaks it on —
+    // a bubble, a tool_use, an orphan tool_result or a task note, EACH an item
+    // there even when this verbosity hides its card. So `flushFold` is called
+    // before every such item, whether or not it renders, and the run SPANS
+    // entries the way adjacent items do (state lives outside the entry loop). A
+    // PAIRED tool_result is `continue`d in the web with no item and no flush, so
+    // it does NOT break a run — it is left untouched below. `thoughtDisp` fixes
+    // the mode once: FOLD accumulates here; SHOW emits Thinking cards; OFF
+    // (Concise) drops the thoughts with no marker.
+    val thoughtDisp = prefs.thoughtDisplay()
+    val foldRun = ArrayList<FoldedThought>()
     var foldKey: String? = null
     fun flushFold() {
-        if (foldCount > 0) {
-            out.add(ChatItem.FoldedThoughts(foldKey ?: "", foldCount))
-            foldCount = 0
+        if (foldRun.isNotEmpty()) {
+            out.add(ChatItem.FoldedThoughts(foldKey ?: "", foldRun.toList()))
+            foldRun.clear()
             foldKey = null
         }
     }
@@ -180,21 +209,29 @@ fun buildItems(
                     (pending ?: StringBuilder().also { pending = it }).append(block.text)
                     if (block.truncated) pendingClipped = true
                 }
-                is ThinkingBlock -> if (prefs.thinking) {
-                    if (block.text.isNotBlank()) {
+                is ThinkingBlock -> when (thoughtDisp) {
+                    ThoughtDisplay.SHOW -> if (block.text.isNotBlank()) {
                         flushText()
                         out.add(ChatItem.Thinking(entry.key, block.text, block.truncated))
                     }
-                } else {
-                    // Hidden by this verbosity: fold into a counted marker rather
-                    // than dropping it (XERK-860). Flush the preceding text first
-                    // so its bubble renders BEFORE the marker, then extend the
-                    // run. Every hidden thought is counted — including a blank one
-                    // — because the web pushes a thinking item for each regardless
-                    // of text, so the count must match.
-                    flushText()
-                    if (foldCount == 0) foldKey = entry.key
-                    foldCount++
+                    ThoughtDisplay.FOLD -> {
+                        // Normal: fold into an expandable marker that CARRIES the
+                        // trace. Flush the preceding text first so its bubble
+                        // renders BEFORE the marker, then extend the run. Every
+                        // hidden thought is carried — a blank one too — because the
+                        // web folds a thinking item for each regardless of text.
+                        flushText()
+                        if (foldRun.isEmpty()) foldKey = entry.key
+                        foldRun.add(FoldedThought(block.text, block.truncated))
+                    }
+                    ThoughtDisplay.OFF -> {
+                        // Concise: drop the thought entirely, no marker. Still
+                        // flush the pending text — a thought is a turn boundary in
+                        // the web stream (buildItems always pushes a thinking item,
+                        // flushing the msg), so text either side must not merge
+                        // into one bubble.
+                        flushText()
+                    }
                 }
                 // A SendUserFile delivery (a block carrying rendered files) is
                 // user-facing content, not a tool mechanic, so it shows in EVERY

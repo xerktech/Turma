@@ -77,7 +77,7 @@ fun ChatItemView(item: ChatItem) {
     when (item) {
         is ChatItem.Bubble -> TranscriptBubble(item)
         is ChatItem.Thinking -> TranscriptThinking(item.text, item.clipped)
-        is ChatItem.FoldedThoughts -> TranscriptFoldedThoughts(item.count)
+        is ChatItem.FoldedThoughts -> TranscriptFoldedThoughts(item)
         is ChatItem.Tool -> TranscriptTool(item)
         is ChatItem.TaskNote -> Pill("⚑ ${item.summary} (${item.status})")
     }
@@ -152,7 +152,9 @@ private fun TranscriptBubble(b: ChatItem.Bubble) {
 
 @Composable
 private fun TranscriptThinking(text: String, clipped: Boolean = false) {
-    var open by remember { mutableStateOf(false) }
+    // Verbose shows the trace EXPANDED by default (web parity: renderThought's
+    // openAttr(key, true)) — collapsible by tap. XERK-860.
+    var open by remember { mutableStateOf(true) }
     val blocks = remember(text) { parseProse(text) }
     Column(Modifier.fillMaxWidth().clickable { open = !open }) {
         Text("💭 thinking", fontSize = scaledSp(12f), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -172,24 +174,39 @@ private fun TranscriptThinking(text: String, clipped: Boolean = false) {
 }
 
 /**
- * A run of thinking traces the current verbosity hides, shown as ONE muted,
- * counted marker (XERK-860) — the web's `💭 n thought(s) hidden`
- * (chat.js `renderFoldedThoughts`). Deliberately quieter than a collapsed trace
- * and NOT interactive: the trace itself isn't carried at a verbosity that hides
- * thinking, so raising the verbosity to Verbose is what reveals it — there is no
- * body for a tap to open. It exists only so an elided turn is distinguishable
- * from a quiet one.
+ * A run of thinking traces the NORMAL verbosity hides, shown as ONE muted,
+ * counted, EXPANDABLE marker (XERK-860) — the web's `💭 n thought(s) hidden`
+ * (chat.js `renderFoldedThoughts`, a collapsed `<details>` carrying the traces).
+ * Quieter than a Verbose trace card and COLLAPSED by default; a tap reveals the
+ * run's traces in place, so the reader reaches them without changing the whole
+ * verbosity. Concise renders no marker at all; Verbose shows the traces expanded
+ * (see [ChatItemView] / core.ThoughtDisplay).
  */
 @Composable
-private fun TranscriptFoldedThoughts(count: Int) {
-    val label = if (count == 1) "1 thought hidden" else "$count thoughts hidden"
-    Text(
-        "💭 $label",
-        Modifier.fillMaxWidth(),
-        fontSize = scaledSp(11f),
-        fontStyle = FontStyle.Italic,
-        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
-    )
+private fun TranscriptFoldedThoughts(item: ChatItem.FoldedThoughts) {
+    var open by remember { mutableStateOf(false) }
+    val label = if (item.count == 1) "1 thought hidden" else "${item.count} thoughts hidden"
+    val parsed = remember(item) { item.thoughts.map { parseProse(it.text) } }
+    Column(Modifier.fillMaxWidth().clickable { open = !open }) {
+        Text(
+            "💭 $label",
+            fontSize = scaledSp(11f),
+            fontStyle = FontStyle.Italic,
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (open) 1f else 0.75f),
+        )
+        // Each trace renders through renderProse (italic), like a Verbose thought.
+        if (open) item.thoughts.forEachIndexed { i, t ->
+            ProseBlocks(
+                parsed[i],
+                Modifier.padding(start = 8.dp, top = 4.dp),
+                fontSize = scaledSp(12f),
+                lineHeight = scaledSp(16f),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                italic = true,
+            )
+            if (t.clipped) ClippedMark(Modifier.padding(start = 8.dp))
+        }
+    }
 }
 
 // ---- prose block rendering (web parity: chat.js renderProse) --------------

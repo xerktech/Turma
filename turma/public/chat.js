@@ -1554,31 +1554,34 @@
       "><summary>💭 Thought</summary>" + thoughtBody(it) + "</details>";
   }
 
-  // Thinking that the current verbosity hides (XERK-860). It used to render as
-  // NOTHING AT ALL, which reads as missing content next to the terminal, which
-  // always shows the trace — the operator had no way to tell a quiet turn from
-  // an elided one. The default stays `thinking: false`; what changes is only
-  // that its absence is now VISIBLE and one click from being read.
-  //
-  // A run of consecutive traces folds into ONE marker with a count, because the
-  // hiding verbosities are the ones chosen for quiet, and a turn can carry
-  // several traces — a marker apiece would be exactly the noise they asked to
-  // be rid of. Collapsed <details> means the reveal costs no new machinery: the
-  // same data-dkey persistence that keeps a card the reader opened from snapping
-  // shut on the next repaint carries this too.
+  // Which of the THREE thinking displays this verbosity wants (XERK-860):
+  //   "show" (Verbose): the full trace, expanded by default (renderThought).
+  //   "fold" (Normal):  ONE muted marker per run of consecutive thoughts,
+  //          counting them and EXPANDABLE — a click reveals the trace in place,
+  //          without changing the whole preset.
+  //   "off"  (Concise): nothing at all — no trace, no marker.
+  // Concise is the minimal reading view — the ONLY preset with BOTH tools and
+  // outputs off — so it drops even the marker; any richer verbosity signposts
+  // the elision. Keyed on the `show` flags, so a custom combo still resolves.
+  function thoughtDisplay(show) {
+    if (show.thinking) return "show";
+    return (show.tools || show.outputs) ? "fold" : "off";
+  }
+
+  // A run of consecutive traces the current verbosity hides folds into ONE marker
+  // with a count (XERK-860) — the terminal always shows the trace, so an elided
+  // turn used to read as a quiet one, and a marker apiece would be the noise the
+  // hiding verbosities asked to be rid of. The marker is an EXPANDABLE <details>
+  // that CARRIES the run's traces (closed by default): the reader reveals them in
+  // place, and the same data-dkey persistence renderThought uses keeps an opened
+  // marker open across repaints. (Concise emits nothing at all — see itemsToHtml
+  // — so the "do not show me the thinking" view is still trace-free; Normal is
+  // the one that signposts-and-reveals.)
   function renderFoldedThoughts(run) {
     const key = "thf:" + run[0].id;
     const label = run.length === 1 ? "1 thought hidden" : run.length + " thoughts hidden";
-    // SUMMARY ONLY — the trace itself is deliberately NOT emitted. The job here
-    // is to make the ELISION visible, not to smuggle the content past the
-    // verbosity setting the operator chose: `concise`/`normal` mean "do not send
-    // me the thinking", and glasses renders this same vendored engine onto a tiny
-    // heads-up display where a collapsed body would still be carried (pinned by
-    // `glasses/src/vendor/vendor.test.ts`). Keeping it out also spares every
-    // repaint the hidden text. To READ a trace, raise the verbosity — which is
-    // exactly what that control is for.
-    return '<div class="thought folded" data-uuid="' + esc(run[0].id) + '">' +
-      '<span class="thf-label">💭 ' + esc(label) + "</span></div>";
+    return '<details class="thought folded" data-dkey="' + esc(key) + '" data-uuid="' + esc(run[0].id) + '"' + openAttr(key, false) +
+      "><summary>💭 " + esc(label) + "</summary>" + run.map(thoughtBody).join("") + "</details>";
   }
 
   // ` open` when this card should be expanded: the user's explicit toggle wins,
@@ -1957,8 +1960,10 @@
       const it = items[i];
       if (it.kind === "msg") { push("msg", it, () => renderMsg(it)); i++; continue; }
       if (it.kind === "thinking") {
-        if (verbosity.show.thinking) { push("th", it, () => renderThought(it)); i++; continue; }
-        // Hidden by verbosity: fold this whole run into one counted marker.
+        const disp = thoughtDisplay(verbosity.show);
+        if (disp === "show") { push("th", it, () => renderThought(it)); i++; continue; }
+        if (disp === "off") { i++; continue; } // Concise: no trace, no marker
+        // "fold" (Normal): one EXPANDABLE marker for the whole run of thoughts.
         let j = i;
         while (j < items.length && items[j].kind === "thinking") j++;
         const run = items.slice(i, j);

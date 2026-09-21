@@ -977,18 +977,21 @@ those are marked `[MODEL]`.
   the web fix exists to remove. There is nothing to mirror.
   - **The selection-freeze fix is web-only for the same reason** — it is a DOM-selection concern
     (`selectionIn`), which Compose does not have.
-  - **`XERK-860`, the "n thoughts hidden" affordance, now MATCHES on Android.** Thinking is hidden at
-    the default verbosity while the terminal always shows it, so an elided turn read as a quiet one.
-    A run of hidden thoughts folds into ONE muted `💭 n thought(s) hidden` marker (`core/ChatItems.kt`
-    `ChatItem.FoldedThoughts` + `ui/TranscriptView.kt` `TranscriptFoldedThoughts`), the web's
-    `renderFoldedThoughts` (which glasses renders through the same vendored engine, pinned by
-    `vendor.test.ts`). It is deliberately SUMMARY ONLY — the trace itself is never carried at a
-    verbosity that hides it, so raising the verbosity to Verbose is what reveals it, and the marker is
-    NOT interactive (no body for a tap to open). The web builds every thinking item then folds runs at
-    render; Android's single-pass `buildItems` folds inline but breaks a run on exactly what the web's
-    item stream breaks it on — a bubble, a tool_use, an orphan tool_result or a task note, each an item
-    there even when its card is hidden — so the counts agree in every verbosity. Tests:
-    `ChatItemsTest.kt` (the `XERK-860` cases), the web twin in `chat.test.js`.
+  - **`XERK-860`, hidden thinking, now MATCHES on Android across all three verbosities.** Thinking is
+    hidden at the default verbosity while the terminal always shows it, so an elided turn read as a
+    quiet one. The three presets treat it three ways (`core/ChatItems.kt` `ThoughtDisplay`, web parity
+    with `chat.js` `thoughtDisplay`): **Concise** drops it entirely (no marker, no trace); **Normal**
+    folds a run of consecutive thoughts into ONE muted, counted, EXPANDABLE `💭 n thought(s) hidden`
+    marker that CARRIES the traces (`ChatItem.FoldedThoughts` + `ui/TranscriptView.kt`
+    `TranscriptFoldedThoughts`, collapsed by default, a tap reveals them in place); **Verbose** shows
+    the traces expanded by default (`TranscriptThinking` now defaults open, matching the web's
+    `openAttr(key, true)`). Web source is `renderFoldedThoughts` (a collapsed `<details>` carrying the
+    traces), which glasses renders through the same vendored engine (`vendor.test.ts`). The web builds
+    every thinking item then folds runs at render; Android's single-pass `buildItems` folds inline but
+    breaks a run on exactly what the web's item stream breaks it on — a bubble, a tool_use, an orphan
+    tool_result or a task note, each an item there even when its card is hidden — so the counts agree in
+    every verbosity. Tests: `core/ChatItemsTest.kt` (the `XERK-860` cases) +
+    `ui/TranscriptFoldedThoughtsTest.kt` (the expand-on-tap render), the web twin in `chat.test.js`.
   - **The Edit line diff (B4) is web-only so far.** An `Edit` card used to stack the whole old body
     over the whole new body; the web now renders an interleaved per-line diff with unchanged lines as
     context, off the `{old,new}` already on the wire (no wire change). **Android still stacks the two

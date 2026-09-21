@@ -1,10 +1,13 @@
 package com.xerktech.turma.ui
 
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import com.xerktech.turma.core.ChatItem
-import org.junit.Assert.assertNull
+import com.xerktech.turma.core.FoldedThought
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -13,14 +16,14 @@ import org.robolectric.annotation.Config
 
 /**
  * The "n thoughts hidden" marker (XERK-860) — the web's `renderFoldedThoughts`,
- * ported. Its COUNTING is pinned in `core/ChatItemsTest`; this drives the real
- * composable, so it fails on the WIRING: the marker must actually reach the
- * screen (a fold rule computed in `core/` that nothing renders is the qa.md §5.7
- * shape) with the right singular/plural label.
+ * ported. Its COUNTING and trace-carrying are pinned in `core/ChatItemsTest`;
+ * this drives the real composable, so it fails on the WIRING: the marker must
+ * reach the screen with the right singular/plural label, stay COLLAPSED by
+ * default, and reveal the carried trace in place on a tap.
  *
- * It is SUMMARY ONLY and — like the web's plain `<span class="thf-label">` —
- * NOT a control: the trace is never carried at a verbosity that hides thinking,
- * so raising the verbosity is what reveals it; a tap could only be a dead end.
+ * That is the web contract (a collapsed `<details>` carrying the trace): Normal
+ * signposts the elision and lets the reader open it without changing the whole
+ * verbosity; Concise renders no marker; Verbose shows the trace expanded.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -29,20 +32,24 @@ class TranscriptFoldedThoughtsTest {
     @get:Rule
     val compose = createComposeRule()
 
+    private fun folded(vararg traces: String) =
+        ChatItem.FoldedThoughts("k", traces.map { FoldedThought(it) })
+
     @Test fun `one hidden thought reads singular`() {
-        compose.setContent { ChatItemView(ChatItem.FoldedThoughts("k", 1)) }
+        compose.setContent { ChatItemView(folded("REVEALED-TRACE")) }
         compose.onNodeWithText("💭 1 thought hidden").assertIsDisplayed()
     }
 
     @Test fun `several hidden thoughts read plural with the count`() {
-        compose.setContent { ChatItemView(ChatItem.FoldedThoughts("k", 3)) }
+        compose.setContent { ChatItemView(folded("a", "b", "c")) }
         compose.onNodeWithText("💭 3 thoughts hidden").assertIsDisplayed()
     }
 
-    @Test fun `the marker is not clickable`() {
-        compose.setContent { ChatItemView(ChatItem.FoldedThoughts("k", 2)) }
-        val node = compose.onNodeWithText("💭 2 thoughts hidden").fetchSemanticsNode()
-        assertNull("the folded-thoughts marker took an OnClick — it must stay inert",
-            node.config.find { it.key.name == "OnClick" })
+    @Test fun `the trace is hidden until the marker is tapped, then revealed`() {
+        compose.setContent { ChatItemView(folded("REVEALED-TRACE")) }
+        // Collapsed by default — the trace is carried but not shown.
+        compose.onAllNodesWithText("REVEALED-TRACE", substring = true).assertCountEquals(0)
+        compose.onNodeWithText("💭 1 thought hidden").performClick()
+        compose.onNodeWithText("REVEALED-TRACE", substring = true).assertIsDisplayed()
     }
 }
