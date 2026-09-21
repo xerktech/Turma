@@ -65,11 +65,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `flex:1 1 auto` and grows, so line 1's chips land at the right edge), then WRAP to their own
   full-width rows below. The state-row reclaims BOTH corners — `margin-right` for the ⋯/Resume corner
   padding and `margin-left` for the status-dot gutter — so a wrapped chip row runs edge to edge at a
-  ~10px inset on both sides; `justify-content:flex-start` left-packs those wrapped rows so the chips
-  FILL the reclaimed left gutter instead of stopping short of it. `display:contents` on `.pr-list`
+  ~10px inset on both sides; `justify-content:flex-end` right-aligns the wrapped rows, and the sidebar
+  is trimmed (366px) so four chips span that full reclaimed width — the row runs edge to edge, leftmost
+  chip in the reclaimed gutter, rightmost at the ⋯-padding inset. `display:contents` on `.pr-list`
   folds the chips into the state-row's single wrap flow; the state keeps a matching `margin-left` so
-  its text stays aligned with the title/meta. This lifts the old ~3-per-row cap and the earlier
-  right-aligned-only wrapped rows (XERK-736). Android is unaffected: `SessionsScreen.kt` already
+  its text stays aligned with the title/meta. This lifts the old ~3-per-row cap (XERK-736). Android is unaffected: `SessionsScreen.kt` already
   renders the PRs in their own start-packed `FlowRow` below the state text — an accepted,
   pre-existing platform-idiomatic difference, not a new gap. No Android change; web
   (`sessions.html`) only.
