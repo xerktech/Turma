@@ -1034,7 +1034,10 @@
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
     box-shadow: 0 8px 24px #0006; padding: 4px; display: none; }
   .cc-menu.open { display: block; }
-  .cc-mode .cc-menu { left: 0; }
+  /* Mode/runtime/model all sit in the right-hand cluster now, so every menu
+     anchors to the right edge — a left-anchored one would open off the right
+     of a narrow viewport. */
+  .cc-mode .cc-menu { right: 0; }
   .cc-model .cc-menu { right: 0; }
   .cc-source .cc-menu { right: 0; }
   /* A session running on the self-hosted model is a state worth SEEING at a
