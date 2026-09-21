@@ -13423,6 +13423,56 @@ test("a sync-result command acked without a result still stamps unsupported at o
   assert.equal(next.resultWaits.s1, undefined);
 });
 
+// A boardCreateMeta gap is a CAPABILITY test, not a freshness test. An agent
+// that has ever answered create-meta (its cache exists, even STALE) implements
+// the command, so an ack seen a beat before this request's fresh result landed
+// must NOT brand a CURRENT agent "too old to offer the New-ticket options" (the
+// reported symptom: a whole fleet on the latest version, New-ticket refusing).
+test("boardCreateMeta acked with a STALE-but-existing cache does NOT stamp unsupported", () => {
+  const next = {
+    agentVersion: "2.0.48",
+    unsupported: {},
+    // Populated by a PRIOR successful fetch — proof the agent implements it —
+    // but older than this request's wait (a re-request after CREATE_META_FRESH_MS).
+    createMeta: { projects: [{ key: "ENG" }], labels: [], fetchedAt: Date.now() - 10 * 60 * 1000 },
+    createTypes: {},
+    resultWaits: { c1: { kind: "boardCreateMeta", at: Date.now() } },
+  };
+  resolveResultWaits({ agentVersion: "2.0.48" }, next, []);   // c1 acked, no fresh result this beat
+  assert.equal(next.unsupported.boardCreateMeta, undefined,
+    "a capable agent whose create-meta cache merely went stale is not 'too old'");
+  assert.equal(next.resultWaits.c1, undefined, "the wait settles on proven capability");
+});
+
+test("a per-project boardCreateMeta ack rides the agent's PROVEN capability, not this project's freshness", () => {
+  const next = {
+    agentVersion: "2.0.48",
+    unsupported: {},
+    createMeta: null,
+    // The agent has answered types for SOME project before — capability proven —
+    // so a wait for a DIFFERENT, not-yet-fetched project must not read as a gap.
+    createTypes: { ENG: { types: [{ id: "1" }], fetchedAt: Date.now() - 10 * 60 * 1000 } },
+    resultWaits: { p1: { kind: "boardCreateMeta", project: "NEW", at: Date.now() } },
+  };
+  resolveResultWaits({ agentVersion: "2.0.48" }, next, []);
+  assert.equal(next.unsupported.boardCreateMeta, undefined);
+  assert.equal(next.resultWaits.p1, undefined);
+});
+
+test("a genuinely-old agent that has NEVER populated a create-meta cache still stamps the gap", () => {
+  const next = {
+    agentVersion: "0.5.38",
+    unsupported: {},
+    createMeta: null,   // a too-old agent acks boardCreateMeta as unknown and stages nothing
+    createTypes: {},
+    resultWaits: { c1: { kind: "boardCreateMeta", at: Date.now() } },
+  };
+  resolveResultWaits({ agentVersion: "0.5.38" }, next, []);
+  assert.ok(next.unsupported.boardCreateMeta,
+    "an agent that never populates EITHER create-meta cache is genuinely too old");
+  assert.equal(next.resultWaits.c1, undefined);
+});
+
 // XERK-705: the ORG auto-merge stream no longer closes the ticket or kills the
 // session on a merged PR — the session may still have work. It MESSAGES the session
 // to mark the ticket Done itself, re-firing when a FOLLOW-UP PR merges. (The

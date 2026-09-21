@@ -6897,10 +6897,22 @@ function awaitResult(agent, cmdId, kind, extra) {
 // is only ever asserted from positive evidence.
 function resultLanded(agent, cmdId, wait) {
   if (wait.kind === "boardCreateMeta") {
-    const e = wait.project
-      ? (agent.createTypes || {})[wait.project]
-      : agent.createMeta;
-    return !!e && e.fetchedAt >= wait.at;
+    // The create-meta/type caches are NOT cmdId-keyed (the agent stages them by
+    // SHAPE), so there is no per-request result to match — only the shape of the
+    // cache. For a CAPABILITY gap the right question is "has this agent EVER
+    // answered a boardCreateMeta", not "did THIS request's fresh result arrive
+    // yet". A genuinely-too-old agent acks the command as unknown and stages
+    // NOTHING, so it never populates EITHER cache; an agent that has returned
+    // create-meta of any shape (this beat's ingest runs before us, so a first
+    // request counts) demonstrably implements it. The earlier `fetchedAt >=
+    // wait.at` FRESHNESS test misfired as a capability test: an ack seen a beat
+    // before this request's fresh result landed — while an older cache entry
+    // sat there — falsely branded a CURRENT agent "too old to offer the
+    // New-ticket options" (a fleet on the latest version, its New-ticket panel
+    // refusing). So credit EXISTENCE, not freshness; the create-meta route
+    // re-checks `CREATE_META_FRESH_MS` itself and re-queues a stale read, so
+    // clearing the wait here never serves stale data.
+    return !!agent.createMeta || Object.keys(agent.createTypes || {}).length > 0;
   }
   if (wait.kind === "createTicket") return !!(agent.createResults || {})[cmdId];
   if (wait.kind === "setTicketStatus") return !!(agent.statusResults || {})[cmdId];
