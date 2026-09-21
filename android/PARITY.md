@@ -60,15 +60,19 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `BoardScreen.kt`) that opens the dropdown on tap — for the Status, Repo, Agent and Model rows. One
   tappable chip reads better on a phone than a value plus a separate button; a pick is still the save,
   same as the web.
-- **Session-card PR chips: consolidated onto the state line, right-aligned.** On web the chips share
-  the state line with the state text ("idle"), packed to its right, and wrap to fill the full card
-  width, still reclaiming the ⋯/Resume corner padding. `display:contents` on `.pr-list` folds the
-  chips into the state-row's single wrap flow; the state keeps `flex:1 1 auto` (stays pinned left) and
-  `justify-content:flex-end` right-aligns the chips on every wrapped line. This keeps XERK-736's
-  right-alignment but lifts the old ~3-per-row cap. Android is unaffected: `SessionsScreen.kt` renders
-  the PRs in their own start-packed `FlowRow` below the state text (no shared line, no corner
-  reservation) — an accepted, pre-existing platform-idiomatic difference, not a new gap. No Android
-  change; the fix is web (`sessions.html`) + glasses (`phone.css`) only.
+- **Session-card PR chips: share line 1 with the state text, then wrap to full-width rows.** On web
+  the chips share the state line with the state text ("idle"), packed to its right (the state keeps
+  `flex:1 1 auto` and grows, so line 1's chips land at the right edge), then WRAP to their own
+  full-width rows below. The state-row reclaims BOTH corners — `margin-right` for the ⋯/Resume corner
+  padding and `margin-left` for the status-dot gutter — so a wrapped chip row runs edge to edge at a
+  ~10px inset on both sides; `justify-content:flex-start` left-packs those wrapped rows so the chips
+  FILL the reclaimed left gutter instead of stopping short of it. `display:contents` on `.pr-list`
+  folds the chips into the state-row's single wrap flow; the state keeps a matching `margin-left` so
+  its text stays aligned with the title/meta. This lifts the old ~3-per-row cap and the earlier
+  right-aligned-only wrapped rows (XERK-736). Android is unaffected: `SessionsScreen.kt` already
+  renders the PRs in their own start-packed `FlowRow` below the state text — an accepted,
+  pre-existing platform-idiomatic difference, not a new gap. No Android change; web
+  (`sessions.html`) only.
 - **Chat COMPOSE footer arrangement.** Web (`chat.js` `renderComposeOpts`) now lays the footer as a
   controls row — context meter + ticket chip on the left, mode/runtime/model chips on the right —
   over a full-width PR-chip row beneath it. Android's `ChatScreen.kt` `ChatFooter` keeps its vertical
