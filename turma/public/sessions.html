@@ -98,11 +98,14 @@
   .s-card:has(> .s-hit:not(:disabled)):hover { border-color: var(--accent); }
   .s-card:has(> .s-hit:disabled) { opacity: 0.6; cursor: default; }
   .s-hit:disabled { cursor: default; }
-  /* Selected: a thicker accent border, but KEEP the org tint as the fill (XERK-142)
-     rather than washing it to accent-soft — the org colour still has to read on the
-     open card. box-sizing:border-box (app.css) means the 2px border adds no layout
-     shift. Mirrors the Android selected card's 2dp border over the tint. */
-  .s-card.cur { border-color: var(--accent); border-width: 2px; }
+  /* Selected: an accent ring, but KEEP the org tint as the fill (XERK-142) rather
+     than washing it to accent-soft — the org colour still has to read on the open
+     card. The emphasis is an accent border-COLOUR plus a 1px INSET box-shadow, NOT
+     a wider border: under box-sizing:border-box a 2px border would shrink the card's
+     CONTENT box by 1px a side, and at the snug PR-chip width that reflowed the chips
+     when a card was selected (they must not move on select). A box-shadow changes no
+     layout. Mirrors the Android selected card's 2dp-looking edge over the tint. */
+  .s-card.cur { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
   /* A queued session card carries no .s-hit (no pane to attach to yet), so it is not
      clickable — cursor stays default, not the base card's pointer. A dashed border +
      amber dot read it as "about to start", distinct from a live or a muted ended one.
