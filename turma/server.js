@@ -842,6 +842,59 @@ function publishUploadDir(u) {
 }
 
 /**
+ * Stage one attachment's raw bytes into the relay under a fresh id, replying
+ * {uploadId, name, size}. ONE body for two routes so they can never drift:
+ *  - the session-scoped composer route `.../sessions/<id>/uploads` (sessionId = the id);
+ *  - the host-scoped spawn-composer route `.../uploads` (XERK-234 spawn attach),
+ *    where there is NO session yet, so `sessionId` is "" — the sentinel the spawn
+ *    route validates against and the agent stores into the id it mints.
+ * The blob GET (`.../uploads/<id>/blob`) is already host-scoped, so a "" upload
+ * serves through it unchanged. Body is raw bytes (no multipart), same 413/503
+ * distinction and TTL ceiling the running-session route always used.
+ */
+async function stageUpload(req, res, url, key, sessionId) {
+  const cap = uploadCapFor(agents[key]);
+  if (!cap)
+    return json(res, 409, {
+      error: "this host's agent is too old to take file attachments — update it",
+    });
+  sweepUploads();
+  let bytes;
+  try {
+    bytes = await readRawBody(req, cap);
+  } catch (e) {
+    // "too big" is about the file (pick a smaller one); "busy" is about the hub
+    // (press send again) — the migration relay draws the same line.
+    if (e && e.stalled) return;
+    if (e && e.budgetExceeded) {
+      res.setHeader("Retry-After", "1");
+      res.setHeader("Connection", "close");
+      json(res, 503, { error: e.message, held: e.held, limit: e.limit });
+      return endRefusedConnection(req, res);
+    }
+    json(res, 413, {
+      error: `file too large — the limit is ${cap.toLocaleString("en-US")} bytes`,
+      limit: cap,
+    });
+    if (e.noDrain) endRefusedConnection(req, res);
+    return;
+  }
+  if (!bytes.length) return json(res, 400, { error: "empty file" });
+  // Refuse rather than evict: the blobs already held belong to messages someone
+  // is still composing, and dropping one would fail a send that looked ready.
+  if (uploadsHeldBytes() + bytes.length > UPLOAD_TOTAL_MAX_BYTES)
+    return json(res, 503, { error: "the hub is holding too many pending uploads — try again shortly" });
+  const id = crypto.randomBytes(12).toString("hex");
+  const name = safeUploadName(url.searchParams.get("name") || "");
+  const u = { id, host: key, sessionId, name, size: bytes.length, bytes, at: Date.now() };
+  uploads.set(id, u);
+  // Publish the byte-free directory entry so a pull that lands on another replica
+  // can relay the bytes from here (XERK-787). No-op with HA off.
+  publishUploadDir(u);
+  return json(res, 200, { ok: true, uploadId: id, name, size: bytes.length });
+}
+
+/**
  * The largest file this host can take, or 0 when it can't take one at all.
  * `uploadMaxBytes` is the agent's capability flag as well as its cap (like
  * `inputMaxChars`): an agent predating attachments reports nothing and would
@@ -16746,6 +16799,20 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, cmdId });
     }
 
+    // POST /api/agents/<host>/uploads?name=<filename> -> stage a file the operator
+    // attached in the NEW-SESSION composer, before any session exists (XERK-234
+    // spawn attach). Host-scoped twin of the session-scoped staging route below:
+    // the bytes sit under the "" sessionId sentinel until the spawn route names
+    // them on `uploadIds`, and the agent writes them into the session id it mints
+    // and prepends their paths onto the initial prompt. Same relay/TTL as the
+    // running-session path; nothing reaches a session until a spawn carries the id.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "uploads" && parts.length === 4) {
+      const key = decodeURIComponent(parts[2]);
+      if (!agents[key]) return json(res, 404, { error: "unknown agent" });
+      return stageUpload(req, res, url, key, "");
+    }
+
     // Session command endpoints — each queues a cmdId onto the host's command
     // queue for the agent to pick up on its next heartbeat reply. The host owns
     // the actual worktree/tmux/ttyd lifecycle; the hub only relays intent.
@@ -16786,6 +16853,51 @@ const server = http.createServer(async (req, res) => {
         // else so the served figure applies.
         if (Number.isInteger(body.localContext) && body.localContext > 0) {
           cmd.localContext = body.localContext;
+        }
+        // Files the operator attached in the NEW-SESSION composer (XERK-234 spawn
+        // attach), staged host-scoped above under the "" sessionId sentinel. Same
+        // validation as the running-session `.../input` route: cap the count, and
+        // resolve each id against the relay (host + "" scoped), carrying name+size
+        // on the command. The agent writes them into the session id it mints and
+        // prepends their paths onto the initial prompt. A stale id is a 404 the
+        // operator re-attaches against — never a silently prompt-less spawn.
+        const wantUploads = Array.isArray(body.uploadIds)
+          ? body.uploadIds.filter((s) => typeof s === "string" && s)
+          : [];
+        if (wantUploads.length > UPLOAD_MAX_PER_MESSAGE)
+          return json(res, 400, { error: `at most ${UPLOAD_MAX_PER_MESSAGE} attachments` });
+        if (wantUploads.length) {
+          sweepUploads();
+          const attached = [];
+          for (const id of wantUploads) {
+            const u = uploads.get(id);
+            if (u) {
+              // A hit for the WRONG host, or for a real session's upload (not the
+              // "" spawn sentinel), is a scoping refusal, never a cross-replica miss.
+              if (u.host !== key || u.sessionId !== "")
+                return json(res, 404, { error: "an attachment expired before the session started — re-attach it" });
+              attached.push({ id: u.id, name: u.name, size: u.size });
+              continue;
+            }
+            // Local MISS under active-active HA (XERK-787/874): the staging POST
+            // landed on another replica. Read the byte-free directory it published
+            // — only name+size are needed to build the command; the agent pulls the
+            // bytes via the blob GET's relay — with the same host + "" scoping.
+            let dir = null;
+            if (uploadStoreShared) {
+              try { dir = await uploadStore.get(UPLOAD_DIR_PREFIX + id); } catch { dir = null; }
+            }
+            if (dir && dir.host === key && dir.sessionId === "") {
+              attached.push({
+                id,
+                name: safeUploadName(dir.name),
+                size: Number.isFinite(dir.size) ? dir.size : 0,
+              });
+              continue;
+            }
+            return json(res, 404, { error: "an attachment expired before the session started — re-attach it" });
+          }
+          cmd.uploads = attached;
         }
         const spawnSourceErr = checkSpawnModelSource(cmd, key);
         if (spawnSourceErr) return json(res, spawnSourceErr.status, { error: spawnSourceErr.error });
@@ -16907,47 +17019,7 @@ const server = http.createServer(async (req, res) => {
       // is what the following /input carries; nothing reaches the session until
       // that message is sent, so an attachment the operator removes just expires.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "uploads") {
-        const cap = uploadCapFor(agents[key]);
-        if (!cap)
-          return json(res, 409, {
-            error: "this host's agent is too old to take file attachments — update it",
-          });
-        sweepUploads();
-        let bytes;
-        try {
-          bytes = await readRawBody(req, cap);
-        } catch (e) {
-          // Same distinction the migration relay draws: "too big" is about the
-          // file and tells the operator to pick a smaller one; "busy" is about
-          // the hub and tells them to press send again.
-          if (e && e.stalled) return;
-          if (e && e.budgetExceeded) {
-            res.setHeader("Retry-After", "1");
-            res.setHeader("Connection", "close");
-            json(res, 503, { error: e.message, held: e.held, limit: e.limit });
-            return endRefusedConnection(req, res);
-          }
-          json(res, 413, {
-            error: `file too large — the limit is ${cap.toLocaleString("en-US")} bytes`,
-            limit: cap,
-          });
-          if (e.noDrain) endRefusedConnection(req, res);
-          return;
-        }
-        if (!bytes.length) return json(res, 400, { error: "empty file" });
-        // Refuse rather than evict: the blobs already held belong to messages
-        // someone is still composing, and dropping one of those would fail a
-        // send that looked ready.
-        if (uploadsHeldBytes() + bytes.length > UPLOAD_TOTAL_MAX_BYTES)
-          return json(res, 503, { error: "the hub is holding too many pending uploads — try again shortly" });
-        const id = crypto.randomBytes(12).toString("hex");
-        const name = safeUploadName(url.searchParams.get("name") || "");
-        const u = { id, host: key, sessionId, name, size: bytes.length, bytes, at: Date.now() };
-        uploads.set(id, u);
-        // Publish the byte-free directory entry so a pull that lands on another
-        // replica can relay the bytes from here (XERK-787). No-op with HA off.
-        publishUploadDir(u);
-        return json(res, 200, { ok: true, uploadId: id, name, size: bytes.length });
+        return stageUpload(req, res, url, key, sessionId);
       }
       // POST /api/agents/<host>/sessions/<id>/input -> forward free-text input
       // to a running session (typing a message into the session). Body: {text},

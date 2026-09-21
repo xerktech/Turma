@@ -87,6 +87,19 @@ interface HubApi {
         @Body body: okhttp3.RequestBody,
     ): UploadResponse
 
+    /**
+     * Stage a file the operator attached in the NEW-SESSION composer, before any
+     * session exists (XERK-234 spawn attach). Host-scoped twin of
+     * [uploadAttachment]: the id carries on [SpawnRequest.uploadIds] and the agent
+     * folds the paths into the initial prompt. Same raw-bytes body and reply.
+     */
+    @POST("api/agents/{host}/uploads")
+    suspend fun uploadSpawnAttachment(
+        @Path("host") host: String,
+        @Query("name") name: String,
+        @Body body: okhttp3.RequestBody,
+    ): UploadResponse
+
     @POST("api/agents/{host}/sessions/{id}/model")
     suspend fun setModel(
         @Path("host") host: String,
@@ -508,6 +521,11 @@ data class SpawnRequest(
     // hub validates membership and the agent clamps its context to the served
     // window. The context override itself is web-only for now (PARITY.md).
     val localModel: String? = null,
+    // Ids of files staged by [HubApi.uploadSpawnAttachment] (XERK-234 spawn
+    // attach). Omitted when empty so a bare spawn is the exact body it always was;
+    // the agent writes them into the minted session's uploads dir and prepends
+    // their paths onto the initial prompt.
+    val uploadIds: List<String>? = null,
 )
 
 @Serializable

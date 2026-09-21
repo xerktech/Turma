@@ -430,6 +430,15 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   (`OpenMultipleDocuments`) covers the same ground, and the system share sheet is the phone's idiom for
   the drop case. Sharing INTO the app is not wired up (no `ACTION_SEND` intent filter yet) — a
   reasonable follow-up, tracked below.
+- **Also in the NEW-SESSION composer (XERK-234 spawn attach), both sides.** The spawn dialog stages
+  files HOST-scoped (`POST /api/agents/<host>/uploads` — there is no session id yet) and sends the
+  ready ids as `SpawnRequest.uploadIds`; the agent writes them into the session it mints and prepends
+  their paths onto the initial prompt. Web: 📎 + chip strip + drag/drop/paste in `sessions.html` and
+  `index.html`, gated on `uploadMaxBytes>0`, `startSession` holds while any chip is unready. Android:
+  the same `OpenMultipleDocuments` picker + chip rows in `SpawnDialog`, staged by
+  `FleetViewModel.attachSpawn` (reusing `core/Uploads.kt`), and the **Spawn button is disabled** while
+  any chip is uploading/errored — the phone idiom for web's "hold the start". Web's drag/drop + paste
+  remain desktop-only here too.
 
 ## Done (XERK-246 — local-model failover controls)
 

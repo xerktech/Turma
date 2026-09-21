@@ -77,6 +77,7 @@ fun FleetScreen(
     val org by vm.orgFilter.collectAsStateWithLifecycle()
     val pending by vm.pending.collectAsStateWithLifecycle()
     val refreshing by vm.refreshing.collectAsStateWithLifecycle()
+    val spawnAtts by vm.spawnAtt.collectAsStateWithLifecycle()
     // Everything below is the fleet as scoped by the header's org control
     // (XERK-62). A host polls exactly one org, so scoping the agent list scopes
     // the tiles, the host cards, their repos and their sessions in one move.
@@ -195,6 +196,10 @@ fun FleetScreen(
             localModel = com.xerktech.turma.core.ModelSource.hostLocalModel(fleet.agents, host),
             dsh = com.xerktech.turma.core.Runtime.hostDsh(fleet.agents, host),
             qwen = com.xerktech.turma.core.Runtime.hostQwen(fleet.agents, host),
+            canAttach = (fleet.agents.firstOrNull { it.key == host }?.uploadMaxBytes ?: 0L) > 0L,
+            attachments = spawnAtts["$host::$repo"].orEmpty(),
+            onAttach = { uris -> vm.attachSpawn(host, repo, uris) },
+            onRemoveAttachment = { key -> vm.removeSpawnAttachment(host, repo, key) },
             onDismiss = { spawnFor = null },
             onSpawn = { prompt, label, baseRef, model, mode, source, localModel, agentType ->
                 vm.spawn(host, repo, prompt, label, baseRef, model, mode, source, localModel, agentType); spawnFor = null

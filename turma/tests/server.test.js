@@ -18217,6 +18217,13 @@ const stage = (host, session, name, body, headers = userHeaders) =>
     `/api/agents/${host}/sessions/${session}/uploads?name=${encodeURIComponent(name)}`,
     { body, headers });
 
+// The NEW-SESSION composer stages HOST-scoped (no session id exists yet); the id
+// carries on the spawn body and the agent folds the paths into the initial prompt.
+const stageHost = (host, name, body, headers = userHeaders) =>
+  requestRaw("POST",
+    `/api/agents/${host}/uploads?name=${encodeURIComponent(name)}`,
+    { body, headers });
+
 test("uploads: safeUploadName can never escape the uploads directory", () => {
   // Mirrored by the agent's safe_upload_name and android's sanitizeUploadName.
   assert.equal(safeUploadName("../../etc/passwd"), "passwd");
@@ -18352,6 +18359,90 @@ test("uploads: an ordinary message still queues exactly what it always did", asy
   assert.deepEqual(beat.body.commands, [
     { type: "input", sessionId: "s1", text: "just talking", cmdId: res.body.cmdId },
   ]);
+});
+
+// ---- new-session composer attach (XERK-234 spawn attach) -------------------
+test("uploads: the host-scoped stage route returns a sanitized name + id; the agent collects it", async () => {
+  await upHost("spawnA");
+  const res = await stageHost("spawnA", "../diagram.png", Buffer.from("PNGDATA"));
+  assert.equal(res.status, 200);
+  assert.equal(res.body.name, "diagram.png");
+  assert.equal(res.body.size, 7);
+  assert.ok(res.body.uploadId);
+  // The blob GET is host-scoped, so a "" (spawn) upload collects through it too.
+  const blob = await requestRaw("GET", `/api/agents/spawnA/uploads/${res.body.uploadId}/blob`,
+    { headers: agentHeaders });
+  assert.equal(blob.status, 200);
+  assert.equal(blob.buf.toString(), "PNGDATA");
+});
+
+test("uploads: the host-scoped stage route obeys the same auth, old-agent and cap rules", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "spawnOld" }, headers: agentHeaders });
+  assert.equal((await stageHost("spawnOld", "a.png", Buffer.from("x"))).status, 409); // too old
+  await upHost("spawnCap", { uploadMaxBytes: 16 });
+  assert.equal((await stageHost("spawnCap", "a.png", null)).status, 400);              // empty
+  assert.equal((await stageHost("spawnCap", "a.png", Buffer.alloc(17, 1))).status, 413); // over cap
+  // Staging is the operator's side of the relay — the agent token is not a way in.
+  await upHost("spawnAuth");
+  assert.equal((await stageHost("spawnAuth", "a.png", Buffer.from("x"), {})).status, 401);
+  assert.equal((await stageHost("spawnAuth", "a.png", Buffer.from("x"), agentHeaders)).status, 401);
+});
+
+test("uploads: a spawn carries its attachments' ids/names/sizes onto the spawn command", async () => {
+  await upHost("spawnSend", { repos: [{ name: "Turma", path: "/git/Turma" }] });
+  const a = await stageHost("spawnSend", "shot.png", Buffer.from("one"));
+  const b = await stageHost("spawnSend", "spec.pdf", Buffer.from("twotwo"));
+  const res = await request("POST", "/api/agents/spawnSend/sessions", {
+    body: { repo: "Turma", prompt: "look at these", uploadIds: [a.body.uploadId, b.body.uploadId] },
+    headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "spawnSend" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [{
+    type: "spawn", repo: "Turma", prompt: "look at these", cmdId: res.body.cmdId,
+    uploads: [
+      { id: a.body.uploadId, name: "shot.png", size: 3 },
+      { id: b.body.uploadId, name: "spec.pdf", size: 6 },
+    ],
+  }]);
+});
+
+test("uploads: a bare spawn with no attachments still queues exactly what it always did", async () => {
+  await upHost("spawnBare", { repos: [{ name: "Turma", path: "/git/Turma" }] });
+  const res = await request("POST", "/api/agents/spawnBare/sessions", {
+    body: { repo: "Turma", uploadIds: [] }, headers: userHeaders,
+  });
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "spawnBare" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [{ type: "spawn", repo: "Turma", cmdId: res.body.cmdId }]);
+});
+
+test("uploads: a spawn refuses a stale, foreign, session-scoped or over-many attachment id", async () => {
+  await upHost("spawnStale", { repos: [{ name: "Turma", path: "/git/Turma" }] });
+  await upHost("spawnOther", { repos: [{ name: "Turma", path: "/git/Turma" }] });
+  // A never-staged id.
+  const gone = await request("POST", "/api/agents/spawnStale/sessions", {
+    body: { repo: "Turma", uploadIds: ["deadbeef"] }, headers: userHeaders,
+  });
+  assert.equal(gone.status, 404);
+  // Another host's upload cannot ride this host's spawn.
+  const theirs = await stageHost("spawnOther", "x.png", Buffer.from("x"));
+  const foreign = await request("POST", "/api/agents/spawnStale/sessions", {
+    body: { repo: "Turma", uploadIds: [theirs.body.uploadId] }, headers: userHeaders,
+  });
+  assert.equal(foreign.status, 404);
+  // A SESSION-scoped upload (real sessionId) is not a spawn upload — the "" scope
+  // is enforced, so it can't be smuggled onto a spawn.
+  const sess = await stage("spawnStale", "s1", "y.png", Buffer.from("y"));
+  const wrongScope = await request("POST", "/api/agents/spawnStale/sessions", {
+    body: { repo: "Turma", uploadIds: [sess.body.uploadId] }, headers: userHeaders,
+  });
+  assert.equal(wrongScope.status, 404);
+  // Over the per-message cap.
+  const many = await request("POST", "/api/agents/spawnStale/sessions", {
+    body: { repo: "Turma", uploadIds: Array.from({ length: UPLOAD_MAX_PER_MESSAGE + 1 }, (_, i) => "id" + i) },
+    headers: userHeaders,
+  });
+  assert.equal(many.status, 400);
 });
 
 test("uploads: a stale, foreign or over-many id refuses the send outright", async () => {

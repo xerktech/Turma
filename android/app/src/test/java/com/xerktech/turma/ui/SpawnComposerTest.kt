@@ -4,10 +4,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import com.xerktech.turma.core.Attachment
+import com.xerktech.turma.core.AttachStatus
 import com.xerktech.turma.model.DshInfo
 import com.xerktech.turma.model.LocalModelInfo
 import com.xerktech.turma.model.LocalModelOption
@@ -199,6 +203,64 @@ class SpawnComposerTest {
         assertEquals("", got?.model)              // no qwen model in [Qwen A]
         assertEquals("subscription", got?.source) // never a modelSource
         assertEquals("", got?.mode)               // no permission mode
+    }
+
+    // ---- file attachments (XERK-234 spawn attach) ---------------------------
+
+    private fun showAttach(
+        canAttach: Boolean,
+        attachments: List<Attachment> = emptyList(),
+        onRemove: (String) -> Unit = {},
+    ) = compose.setContent {
+        SpawnDialog(
+            host = "nas01", repo = "Turma", isRoot = false,
+            canAttach = canAttach, attachments = attachments,
+            onRemoveAttachment = onRemove, onDismiss = {},
+            onSpawn = { _, _, _, _, _, _, _, _ -> },
+        )
+    }
+
+    @Test
+    fun `the attach affordance shows only when the host can take a file`() {
+        showAttach(canAttach = false)
+        compose.onNodeWithText("Attach files", substring = true).assertDoesNotExist()
+    }
+
+    @Test
+    fun `an attachable host shows the picker and lists a staged chip`() {
+        showAttach(
+            canAttach = true,
+            attachments = listOf(Attachment(
+                key = "s1", name = "diagram.png", size = 2048,
+                status = AttachStatus.READY, uploadId = "u1")),
+        )
+        compose.onNodeWithText("Attach files", substring = true).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("diagram.png").performScrollTo().assertIsDisplayed()
+        // A ready chip does not hold the Spawn button.
+        compose.onNodeWithText("Spawn").assertIsEnabled()
+    }
+
+    @Test
+    fun `Spawn is held while an attachment is still uploading or errored`() {
+        showAttach(
+            canAttach = true,
+            attachments = listOf(Attachment(
+                key = "s1", name = "big.log", size = 10, status = AttachStatus.UPLOADING)),
+        )
+        compose.onNodeWithText("Spawn").assertIsNotEnabled()
+    }
+
+    @Test
+    fun `removing a chip calls back with its key`() {
+        var removed: String? = null
+        showAttach(
+            canAttach = true,
+            attachments = listOf(Attachment(
+                key = "s9", name = "shot.png", size = 3, status = AttachStatus.READY, uploadId = "u9")),
+            onRemove = { removed = it },
+        )
+        compose.onNodeWithText("✕").performScrollTo().performClick()
+        assertEquals("s9", removed)
     }
 
     // ---- resets when a runtime leaves the picker ----------------------------

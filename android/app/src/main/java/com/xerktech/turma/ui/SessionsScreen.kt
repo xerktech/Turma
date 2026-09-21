@@ -502,6 +502,7 @@ fun SessionsListPane(
     LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val org by vm.orgFilter.collectAsStateWithLifecycle()
+    val spawnAtts by vm.spawnAtt.collectAsStateWithLifecycle()
     // The archive half of the box. The VM debounces and drops anything under
     // HISTORY_MIN_QUERY, so this can fire on every keystroke.
     val arch by archiveVm.state.collectAsStateWithLifecycle()
@@ -753,6 +754,10 @@ fun SessionsListPane(
             localModel = com.xerktech.turma.core.ModelSource.hostLocalModel(fleet.agents, host),
             dsh = com.xerktech.turma.core.Runtime.hostDsh(fleet.agents, host),
             qwen = com.xerktech.turma.core.Runtime.hostQwen(fleet.agents, host),
+            canAttach = (fleet.agents.firstOrNull { it.key == host }?.uploadMaxBytes ?: 0L) > 0L,
+            attachments = spawnAtts["$host::$repo"].orEmpty(),
+            onAttach = { uris -> vm.attachSpawn(host, repo, uris) },
+            onRemoveAttachment = { key -> vm.removeSpawnAttachment(host, repo, key) },
             onDismiss = { spawnFor = null },
             onSpawn = { prompt, label, baseRef, model, mode, source, localModel, agentType ->
                 vm.spawn(host, repo, prompt, label, baseRef, model, mode, source, localModel, agentType); spawnFor = null

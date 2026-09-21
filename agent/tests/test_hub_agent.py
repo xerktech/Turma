@@ -9666,7 +9666,8 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.spawn.assert_called_once_with(
             "Turma", prompt=None, label=None, base_ref=None,
             model=None, permission_mode=None, model_source=None,
-            local_model=None, local_context=None, agent_type=None, cmd_id="c1",
+            local_model=None, local_context=None, agent_type=None,
+            uploads=None, cmd_id="c1",
         )
         sm.kill.assert_called_once_with("ab123")
         sm.save.assert_called_once()
@@ -9712,11 +9713,13 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
             "cmdId": "c9", "type": "spawn", "repo": "Turma",
             "prompt": "fix the bug", "label": "Fix login", "baseRef": "main",
             "model": "opus", "permissionMode": "plan", "agentType": "dsh",
+            "uploads": [{"id": "u1", "name": "shot.png", "size": 3}],
         }])
         sm.spawn.assert_called_once_with(
             "Turma", prompt="fix the bug", label="Fix login", base_ref="main",
             model="opus", permission_mode="plan", model_source=None,
-            local_model=None, local_context=None, agent_type="dsh", cmd_id="c9",
+            local_model=None, local_context=None, agent_type="dsh",
+            uploads=[{"id": "u1", "name": "shot.png", "size": 3}], cmd_id="c9",
         )
 
     def test_prune_command_dispatches_to_prune_repo(self):
@@ -9999,6 +10002,47 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         wt = next(c for c in self.run_ok_calls if "worktree" in c and "add" in c)
         self.assertIn("--detach", wt)
         self.assertNotIn("-b", wt)
+
+    def test_spawn_folds_composer_attachment_paths_into_the_initial_prompt(self):
+        # XERK-234 spawn attach: files the operator staged in the NEW-SESSION
+        # composer are stored into the minted session's uploads dir and their
+        # paths prepended onto the initial prompt — the same fold a ticket session
+        # does, via the identical attachment_message() header.
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm._launch_tmux = mock.Mock()
+        with mock.patch.object(
+                sm, "_store_uploads",
+                return_value=([os.path.join(ha.UPLOADS_DIR, "sid", "shot.png")], [])) as store:
+            sm.spawn("Turma", prompt="look at this",
+                     uploads=[{"id": "u1", "name": "shot.png"}])
+        store.assert_called_once()
+        # The staged upload records rode through to _store_uploads unchanged.
+        self.assertEqual(store.call_args.args[1], [{"id": "u1", "name": "shot.png"}])
+        prompt = sm._launch_tmux.call_args.kwargs.get("prompt")
+        self.assertIn("shot.png", prompt)
+        self.assertIn("look at this", prompt)
+        self.assertIn("operator attached", prompt)
+
+    def test_spawn_names_an_attachment_that_failed_to_transfer(self):
+        # A transfer failure is NAMED in the prompt, never silently dropped.
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm._launch_tmux = mock.Mock()
+        with mock.patch.object(sm, "_store_uploads", return_value=([], ["big.bin"])):
+            sm.spawn("Turma", uploads=[{"id": "u1", "name": "big.bin"}])
+        prompt = sm._launch_tmux.call_args.kwargs.get("prompt")
+        self.assertIn("big.bin", prompt)
+        self.assertIn("failed to transfer", prompt)
+
+    def test_a_spawn_with_no_attachments_never_stores_uploads(self):
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm._launch_tmux = mock.Mock()
+        with mock.patch.object(sm, "_store_uploads") as store:
+            sm.spawn("Turma", prompt="hi")
+        store.assert_not_called()
+        self.assertEqual(sm._launch_tmux.call_args.kwargs.get("prompt"), "hi")
 
     def test_spawn_defaults_agent_type_to_claude(self):
         # The runtime field is always present and reads claude for a plain spawn,
@@ -11430,6 +11474,40 @@ class TestStoreUploads(ManagerMixin, unittest.TestCase):
             paths, _ = sm._store_uploads(
                 sess, [{"id": "u1", "name": "../../../../etc/cron.d/evil"}])
         self.assertEqual(paths, [os.path.join(ha.UPLOADS_DIR, "abcde", "evil")])
+
+    def test_a_batch_past_its_deadline_names_the_rest_failed(self):
+        # The spawn-provision path runs ON the beat, so a batch deadline bounds
+        # the beat cost (XERK-395). Past it, no download is attempted and every
+        # remaining file is NAMED as failed rather than silently dropped.
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(sm, "_download_upload") as dl:
+            paths, failed = sm._store_uploads(
+                sess, [{"id": "u1", "name": "a.png"}, {"id": "u2", "name": "b.pdf"}],
+                deadline=time.monotonic() - 1)
+        dl.assert_not_called()
+        self.assertEqual(paths, [])
+        self.assertEqual(failed, ["a.png", "b.pdf"])
+
+    def test_the_deadline_shrinks_the_per_download_timeout(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(sm, "_download_upload", return_value=b"x") as dl:
+            sm._store_uploads(sess, [{"id": "u1", "name": "a.png"}],
+                              deadline=time.monotonic() + 5)
+        # The generous default is clamped to what the batch has left.
+        to = dl.call_args.kwargs.get("timeout")
+        self.assertIsNotNone(to)
+        self.assertLessEqual(to, 5)
+
+    def test_no_deadline_leaves_the_off_beat_path_unbounded(self):
+        # The running-session path is off the beat (XERK-867), so it passes no
+        # deadline and the download keeps the full default timeout.
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(sm, "_download_upload", return_value=b"x") as dl:
+            sm._store_uploads(sess, [{"id": "u1", "name": "a.png"}])
+        self.assertIsNone(dl.call_args.kwargs.get("timeout"))
 
     def test_no_more_than_the_per_message_cap_is_written(self):
         sm = self.make_manager()

@@ -147,6 +147,22 @@
   .composer .hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .composer .cmp-actions { display: flex; align-items: center; gap: 10px; }
   .composer .cmp-actions .spacer { flex: 1; }
+  /* New-session composer attachments (XERK-234 spawn attach). Mirrors the chip +
+     clip styling the Sessions page shares between its chat and terminal bars. */
+  button.compose-clip { min-width: 0; padding: 7px 9px; font-size: 15px; line-height: 1;
+    background: var(--page); color: var(--ink); border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
+  .composer .compose-attach { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+  .composer .compose-attach:empty { display: none; }
+  .att-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 260px;
+    padding: 3px 4px 3px 9px; border: 1px solid var(--border); border-radius: 999px;
+    background: var(--page); font-size: 11.5px; color: var(--ink); }
+  .att-chip .att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .att-chip .att-size { color: var(--muted); flex: none; }
+  .att-chip.att-uploading { opacity: .65; }
+  .att-chip.att-error { border-color: var(--critical); color: var(--critical); }
+  .att-chip .att-x { flex: none; border: 0; background: none; cursor: pointer; padding: 0 5px;
+    color: var(--muted); font: inherit; font-size: 13px; line-height: 1; }
+  .att-chip .att-x:hover { color: var(--ink); }
   .sess-label { font-size: 12px; }
 
   /* "Clone from GitHub" bar at the top of a host's repo tree: a collapsible
@@ -445,6 +461,118 @@ function draftSet(rk, field, value) {
   d[field] = value;
   composerDraft.set(rk, d);
 }
+
+// ---- new-session composer attachments (XERK-234 spawn attach) ----------------
+// Keyed by rk="host::repo" like composerDraft (several composers open at once).
+// Each record: {key,name,size,status:"uploading"|"ready"|"error",uploadId,error}.
+// Bytes stage host-scoped (POST /api/agents/<host>/uploads); startSession() sends
+// the ready ids as body.uploadIds. Mirrors the Sessions-page composer.
+const spawnAtt = new Map();
+let spawnAttSeq = 0;
+const SPAWN_ATT_MAX = 10;
+function spawnUploadCap(key) {
+  const a = (cache.agents || []).find((x) => x.key === key);
+  const n = Number(a && a.uploadMaxBytes);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+function spawnAttList(rk) { return spawnAtt.get(rk) || []; }
+function spawnAttChips(rk) {
+  return spawnAttList(rk).map((f) => {
+    const cls = f.status === "error" ? " att-error"
+      : f.status === "uploading" ? " att-uploading" : "";
+    const meta = f.status === "error" ? esc(f.error || "failed")
+      : f.status === "uploading" ? "uploading…" : fmtBytes(f.size);
+    return `<span class="att-chip${cls}" title="${esc(f.name)}">` +
+      `<span class="att-name">${esc(f.name)}</span>` +
+      `<span class="att-size">${meta}</span>` +
+      `<button type="button" class="att-x" title="Remove" ` +
+      `onclick="spawnAttRemove('${escJs(rk)}','${escJs(f.key)}')">✕</button></span>`;
+  }).join("");
+}
+function spawnAttRender(rk) {
+  const strip = document.getElementById(cid(rk, "attstrip"));
+  if (strip) strip.innerHTML = spawnAttChips(rk);
+}
+function spawnAttRemove(rk, key) {
+  spawnAtt.set(rk, spawnAttList(rk).filter((f) => f.key !== key));
+  spawnAttRender(rk);
+}
+function spawnAttFiles(rk, files) {
+  const key = rk.split("::")[0];
+  const list = Array.from(files || []).filter(Boolean);
+  if (!list.length) return;
+  const cap = spawnUploadCap(key);
+  if (!cap) { toast("This host is too old for file attachments"); return; }
+  const cur = spawnAttList(rk).slice();
+  for (const file of list) {
+    if (cur.length >= SPAWN_ATT_MAX) { toast(`At most ${SPAWN_ATT_MAX} files`); break; }
+    const rec = {
+      key: "s" + (++spawnAttSeq),
+      name: file.name || "upload",
+      size: file.size || 0,
+      status: file.size > cap ? "error" : "uploading",
+      error: file.size > cap ? `too big — max ${fmtBytes(cap)}` : "",
+      uploadId: "",
+    };
+    cur.push(rec);
+    if (rec.status !== "error") spawnUploadOne(rk, rec, file);
+  }
+  spawnAtt.set(rk, cur);
+  spawnAttRender(rk);
+}
+async function spawnUploadOne(rk, rec, file) {
+  const key = rk.split("::")[0];
+  try {
+    const url = "/api/agents/" + enc(key) + "/uploads?name=" + encodeURIComponent(rec.name);
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: file,
+    });
+    const reply = await r.json().catch(() => null);
+    if (!r.ok) throw new Error((reply && reply.error) || ("upload failed (" + r.status + ")"));
+    if (!spawnAttList(rk).includes(rec)) return;
+    rec.uploadId = reply.uploadId;
+    rec.name = reply.name || rec.name;
+    rec.size = reply.size || rec.size;
+    rec.status = "ready";
+  } catch (e) {
+    if (!spawnAttList(rk).includes(rec)) return;
+    rec.status = "error";
+    rec.error = (e && e.message) || "upload failed";
+  }
+  spawnAttRender(rk);
+}
+function spawnPick(rk) {
+  const inp = document.getElementById(cid(rk, "file"));
+  if (!inp) return;
+  inp.value = "";
+  inp.click();
+}
+function spawnFilesPicked(rk, ev) {
+  spawnAttFiles(rk, ev && ev.target && ev.target.files);
+}
+function spawnPaste(rk, ev) {
+  const files = (ev && ev.clipboardData && ev.clipboardData.files) || null;
+  if (!files || !files.length) return;
+  ev.preventDefault();
+  spawnAttFiles(rk, files);
+}
+function spawnDrop(rk, ev) {
+  ev.preventDefault();
+  const files = (ev.dataTransfer && ev.dataTransfer.files) || null;
+  if (files && files.length) spawnAttFiles(rk, files);
+}
+function spawnReadyUploadIds(rk) {
+  const list = spawnAttList(rk);
+  const ready = [];
+  for (const f of list) {
+    if (f.status !== "ready" || !f.uploadId) return null;
+    ready.push(f.uploadId);
+  }
+  return ready;
+}
+
 function toggleComposer(rkey, repo) {
   if (composerOpen.has(rkey)) composerOpen.delete(rkey);
   else {
@@ -1538,11 +1666,13 @@ function composer(a, repo, rk, spawning) {
   const optsExpanded = optionsOpen.has(rk);
   const opt = (v, label, sel) => `<option value="${esc(v)}"${v === sel ? " selected" : ""}>${esc(label)}</option>`;
   const submit = `startSession('${key}','${rn}')`;
-  return `<div class="composer">
+  const canAttach = Number(a.uploadMaxBytes) > 0;
+  return `<div class="composer" ondragover="if(${canAttach})event.preventDefault()"${canAttach ? ` ondrop="spawnDrop('${escJs(rk)}',event)"` : ""}>
     <div>
       <label>Task</label>
       <textarea id="${cid(rk, "task")}" placeholder="Describe the task, or leave blank to start an empty session."
         oninput="draftSet('${escJs(rk)}','task',this.value)"
+        onpaste="spawnPaste('${escJs(rk)}',event)"
         onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();${submit};}">${esc(d.task || "")}</textarea>
     </div>
     <div>
@@ -1573,9 +1703,12 @@ function composer(a, repo, rk, spawning) {
         </div>
       </div>
     </details>
+    ${canAttach ? `<div class="compose-attach" id="${cid(rk, "attstrip")}">${spawnAttChips(rk)}</div>
+    <input type="file" id="${cid(rk, "file")}" multiple hidden onchange="spawnFilesPicked('${escJs(rk)}',event)">` : ""}
     <div class="cmp-actions">
       <span class="hint">Cmd/Ctrl+Enter to start</span>
       <span class="spacer"></span>
+      ${canAttach ? `<button type="button" class="compose-clip" title="Attach images or documents" onclick="spawnPick('${escJs(rk)}')">📎</button>` : ""}
       <button class="primary btn-sm" ${spawning ? "disabled" : ""} onclick="${submit}">${spawning ? '<span class="spin"></span> Starting…' : "Start"}</button>
     </div>
   </div>`;
@@ -1881,6 +2014,15 @@ function startSession(key, repo) {
   const baseRef = v("base");
   const model = v("model"), perm = v("perm");
   const body = { repo };
+  // Files attached in this composer (XERK-234 spawn attach). Hold the start while
+  // any is still uploading or errored; the composer stays open so nothing is lost.
+  const uploadIds = spawnReadyUploadIds(rk);
+  if (uploadIds === null) {
+    toast(spawnAttList(rk).some(f => f.status === "error")
+      ? "Remove the failed file before starting" : "Files are still uploading");
+    return;
+  }
+  if (uploadIds.length) body.uploadIds = uploadIds;
   if (prompt) body.prompt = prompt;
   if (label) body.label = label;
   // Omitted base = the agent forks the latest default branch (main). Only send
@@ -1891,6 +2033,7 @@ function startSession(key, repo) {
   saveOpts(repo, { baseRef, model, permissionMode: perm, optionsExpanded: optionsOpen.has(rk) });
   composerOpen.delete(rk);
   composerDraft.delete(rk);
+  spawnAtt.delete(rk);
   const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
     // The reply is returned so busy() can drop the "starting…" row on a refusal.

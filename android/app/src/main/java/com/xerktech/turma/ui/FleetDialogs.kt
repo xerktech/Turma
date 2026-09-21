@@ -1,5 +1,8 @@
 package com.xerktech.turma.ui
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -37,8 +40,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.xerktech.turma.core.Attachment
+import com.xerktech.turma.core.AttachStatus
 import com.xerktech.turma.core.ModelSource
 import com.xerktech.turma.core.Runtime
+import com.xerktech.turma.core.Uploads
 import com.xerktech.turma.model.DshInfo
 import com.xerktech.turma.model.QwenInfo
 import com.xerktech.turma.model.LocalModelInfo
@@ -64,6 +70,13 @@ fun SpawnDialog(
     localModel: LocalModelInfo? = null,
     dsh: DshInfo? = null,
     qwen: QwenInfo? = null,
+    // File attachments (XERK-234 spawn attach). `canAttach` follows the host's
+    // uploadMaxBytes (0 hides the 📎, as an agent predating attachments reports
+    // none); the staged chips + staging live in FleetViewModel, keyed per target.
+    canAttach: Boolean = false,
+    attachments: List<Attachment> = emptyList(),
+    onAttach: (List<Uri>) -> Unit = {},
+    onRemoveAttachment: (String) -> Unit = {},
     onDismiss: () -> Unit,
     onSpawn: (prompt: String, label: String, baseRef: String, model: String, mode: String, modelSource: String, localModel: String, agentType: String) -> Unit,
 ) {
@@ -102,6 +115,14 @@ fun SpawnDialog(
     LaunchedEffect(localModel?.available, dsh?.available, qwen?.available) {
         if (runtimeOpts.none { it.first == runtime }) runtime = Runtime.CLAUDE
     }
+    // File picker for spawn attachments (XERK-234) — the running-session chat uses
+    // the same OpenMultipleDocuments contract (web-only drag/drop + paste have no
+    // phone equivalent, per PARITY.md). Nothing uploads until a file is picked.
+    val filePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()) { uris -> if (uris.isNotEmpty()) onAttach(uris) }
+    // Hold Spawn while any chip is still uploading or errored, exactly as the
+    // running-session Send does (Uploads.readyUploadIds is null until all ready).
+    val attachReady = Uploads.readyUploadIds(attachments) != null
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -189,10 +210,44 @@ fun SpawnDialog(
                         DropdownField("Permission mode", modeOpts, mode) { mode = it }
                     }
                 }
+                // Attachments (XERK-234 spawn attach): a 📎 that opens the picker,
+                // then a chip per staged file with its status + a ✕ to remove it.
+                // Hidden entirely when the host can't take a file.
+                if (canAttach) {
+                    TextButton(onClick = { filePicker.launch(arrayOf("*/*")) }) {
+                        Text("📎  Attach files")
+                    }
+                    for (f in attachments) {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Text(
+                                f.name,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier.weight(1f, fill = false),
+                            )
+                            Text(
+                                when (f.status) {
+                                    AttachStatus.ERROR -> f.error.ifBlank { "failed" }
+                                    AttachStatus.UPLOADING -> "uploading…"
+                                    else -> Uploads.formatBytes(f.size)
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (f.status == AttachStatus.ERROR) MaterialTheme.colorScheme.error
+                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(onClick = { onRemoveAttachment(f.key) }) { Text("✕") }
+                        }
+                    }
+                }
             }
         },
         confirmButton = {
-            TextButton(onClick = {
+            TextButton(enabled = attachReady, onClick = {
                 // Map the one Runtime choice onto the wire fields, exactly as web
                 // `startSession` does — no field from another runtime leaks.
                 val outModelSource = Runtime.spawnModelSource(runtime) ?: ModelSource.SUBSCRIPTION

@@ -926,6 +926,11 @@ UPLOAD_DIR_MODE = 0o777 if IS_WINDOWS else 0o700
 UPLOAD_MAX_BYTES = _env_int("TURMA_UPLOAD_MAX_BYTES", 1 << 25)  # 32 MiB
 UPLOAD_MAX_PER_MESSAGE = _env_int("TURMA_UPLOAD_MAX_PER_MESSAGE", 10)
 UPLOAD_DOWNLOAD_TIMEOUT_SEC = _env_int("TURMA_UPLOAD_TIMEOUT_SEC", 60)
+# Whole-batch wall clock for downloading a SPAWN's composer attachments, which
+# happens ON the beat at provision (unlike the running-session path, which is off
+# the beat). Bounds the beat cost well under OFFLINE_AFTER_MS (75s) even if a blob
+# GET trickles — the sibling of TICKET_ATTACH_DEADLINE_SEC for the same reason.
+SPAWN_ATTACH_DEADLINE_SEC = _env_int("TURMA_SPAWN_ATTACH_DEADLINE_SEC", 40)
 # How long an ended session's attachments stay on disk. They are part of a
 # conversation that is still resumable (and still references their paths), so
 # they outlive the session by a good margin; only a session DELETE drops them at
@@ -19459,7 +19464,7 @@ class SessionManager:
               model=None, permission_mode=None, ticket=None, ticket_detail=None,
               cmd_id=None, await_clone=None, await_clone_owner=None,
               model_source=None, local_model=None, local_context=None,
-              agent_type=None):
+              agent_type=None, uploads=None):
         """Create a brand-new worktree-backed session for <repo_name>.
 
         The worktree is added in DETACHED HEAD forked off the latest default
@@ -19655,6 +19660,13 @@ class SessionManager:
         sess["_pendingPrompt"] = prompt
         if ticket_detail is not None:
             sess["_pendingTicketDetail"] = ticket_detail
+        # Files the operator attached in the NEW-SESSION composer (XERK-234 spawn
+        # attach): [{id, name, size}] staged on the hub's relay. Stored into this
+        # session's uploads dir and folded into the initial prompt at provision
+        # (where the session id — the uploads-dir key — exists), the same shape a
+        # ticket session's own attachments take.
+        if uploads:
+            sess["_pendingUploads"] = uploads
         if reason:
             sess["queuedReason"] = reason
             sess["queuedAt"] = now_iso()
@@ -19694,6 +19706,7 @@ class SessionManager:
         base_ref = sess.pop("_pendingBaseRef", None)
         prompt = sess.pop("_pendingPrompt", None)
         ticket_detail = sess.pop("_pendingTicketDetail", None)
+        pending_uploads = sess.pop("_pendingUploads", None)
         try:
             resolved_base = None
             if not is_root:
@@ -19720,6 +19733,17 @@ class SessionManager:
                     ticket_detail,
                     self._store_ticket_attachments(
                         sess, ticket_detail.get("attachments")))
+            elif pending_uploads:
+                # Files the operator attached in the NEW-SESSION composer (XERK-234
+                # spawn attach). Stored HERE, not at spawn, because the uploads dir
+                # is keyed on the session id and their paths must be woven into the
+                # initial prompt — the same fold a ticket session does with its own
+                # attachments, via the identical attachment_message() header. A
+                # transfer failure is NAMED in the message, never silently dropped.
+                paths, failed = self._store_uploads(
+                    sess, pending_uploads,
+                    deadline=time.monotonic() + SPAWN_ATTACH_DEADLINE_SEC)
+                prompt = attachment_message(paths, failed, prompt or "")
             self._launch_tmux(sess, prompt=(prompt or None))
             self._launch_ttyd(sess)
             # Record the worktree -> repo attribution so this session's token
@@ -21481,11 +21505,12 @@ class SessionManager:
 
     # --- on-demand input/history (glasses client) --------------------------
 
-    def _download_upload(self, upload_id):
+    def _download_upload(self, upload_id, timeout=None):
         """GET one staged attachment's bytes from the hub's upload relay
         (agent-authed, like the migration bundle). Returns the bytes, or None on
         any failure — the caller names the file in the message rather than
-        pretending it arrived."""
+        pretending it arrived. `timeout` (per-socket-operation) lets a caller on
+        a wall-clock budget shrink the default (the spawn-provision path)."""
         try:
             headers = {"User-Agent": "hub-agent/1.0"}
             if TURMA_TOKEN:
@@ -21495,19 +21520,28 @@ class SessionManager:
                    f"/uploads/{urllib.parse.quote(str(upload_id), safe='')}/blob")
             req = urllib.request.Request(url, headers=headers, method="GET")
             with urllib.request.urlopen(
-                    req, timeout=UPLOAD_DOWNLOAD_TIMEOUT_SEC) as resp:
+                    req, timeout=(timeout or UPLOAD_DOWNLOAD_TIMEOUT_SEC)) as resp:
                 return resp.read(UPLOAD_MAX_BYTES + 1)
         except Exception as e:
             log(f"upload {upload_id}: download failed: {_urlopen_error_detail(e)}")
             return None
 
-    def _store_uploads(self, sess, uploads):
+    def _store_uploads(self, sess, uploads, deadline=None):
         """Write a message's attachments into this session's uploads directory.
 
         Returns (paths, failed_names): the absolute paths that landed, and the
         names of any that didn't. Bounded by UPLOAD_MAX_PER_MESSAGE and
         UPLOAD_MAX_BYTES — the hub caps both too, but this is the side that
-        writes to the disk."""
+        writes to the disk.
+
+        `deadline` (a `time.monotonic()` instant) bounds the WHOLE batch's
+        downloads. The running-session path runs OFF the beat (`_input_worker_loop`,
+        XERK-867) so it passes None (a slow socket can't hurt the heartbeat there),
+        but the SPAWN-provision path runs ON the beat, so it passes a deadline —
+        exactly what `_store_ticket_attachments` does — or N trickling blob GETs
+        could each burn UPLOAD_DOWNLOAD_TIMEOUT_SEC and flap the host offline past
+        OFFLINE_AFTER_MS (the XERK-395 beat-budget class). A file the budget runs
+        out on is NAMED as failed, never silently dropped."""
         paths, failed = [], []
         try:
             ensure_upload_dir(upload_dir_for(sess["id"]))
@@ -21521,7 +21555,17 @@ class SessionManager:
             if not isinstance(item, dict):
                 continue
             name = safe_upload_name(item.get("name"))
-            blob = self._download_upload(item.get("id"))
+            # Stop spending the beat once the batch budget is gone; the rest are
+            # named as failed so the session is told a file didn't arrive.
+            left = None
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    log(f"uploads: batch deadline reached; skipping {name}")
+                    failed.append(name)
+                    continue
+                left = min(UPLOAD_DOWNLOAD_TIMEOUT_SEC, left)
+            blob = self._download_upload(item.get("id"), timeout=left)
             if blob is None:
                 failed.append(name)
                 continue
@@ -28360,6 +28404,7 @@ class SessionManager:
                         local_model=cmd.get("localModel"),
                         local_context=cmd.get("localContext"),
                         agent_type=cmd.get("agentType"),
+                        uploads=cmd.get("uploads"),
                         cmd_id=cid,
                     )
                 elif ctype == "spawnTicket":

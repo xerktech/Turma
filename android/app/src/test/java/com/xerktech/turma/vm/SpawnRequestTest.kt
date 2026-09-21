@@ -106,4 +106,16 @@ class SpawnRequestTest {
                 model = "haiku", permissionMode = "plan", modelSource = ModelSource.LOCAL)),
         )
     }
+
+    @Test fun `staged attachments ride as uploadIds, empty is omitted`() {
+        // XERK-234 spawn attach: the ready ids the agent folds into the initial
+        // prompt. Last field, so JSON appends it.
+        assertEquals(
+            """{"repo":"Turma","uploadIds":["u1","u2"]}""",
+            json(spawnRequest("Turma", uploadIds = listOf("u1", "u2"))),
+        )
+        // Empty / null -> omitted, so a bare spawn stays byte-identical.
+        assertEquals("""{"repo":"Turma"}""", json(spawnRequest("Turma", uploadIds = emptyList())))
+        assertEquals("""{"repo":"Turma"}""", json(spawnRequest("Turma", uploadIds = null)))
+    }
 }

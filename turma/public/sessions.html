@@ -1353,6 +1353,16 @@ let endedViewId = null;
 const composerOpen = new Set();
 const optionsOpen = new Set();
 const composerDraft = new Map();
+// Files staged for a NEW-SESSION spawn (XERK-234 spawn attach), keyed by
+// rk="host::repo" like composerDraft — several composers can be open at once, so
+// this can't be one global list the way chat.js's running-session attachments are.
+// Each record: {key,name,size,status:"uploading"|"ready"|"error",uploadId,error}.
+// The bytes are staged to the hub host-scoped (POST /api/agents/<host>/uploads);
+// startSession() sends the ready ids as body.uploadIds and the agent folds their
+// paths into the initial prompt. Cleared when the composer starts or closes.
+const spawnAtt = new Map();
+let spawnAttSeq = 0;
+const SPAWN_ATT_MAX = 10;
 
 // Per-card ⋯ menu state. Like the composer's, it lives here rather than in the
 // DOM because every poll / SSE beat re-renders the card list from scratch — an
@@ -1586,6 +1596,124 @@ function draftSet(rk, field, value) {
   d[field] = value;
   composerDraft.set(rk, d);
 }
+
+// ---- new-session composer attachments (XERK-234 spawn attach) ----------------
+function fmtBytes(n) {
+  const b = Number(n) || 0;
+  if (b < 1024) return b + " B";
+  if (b < 1024 * 1024) return Math.round(b / 1024) + " KB";
+  return (b / (1024 * 1024)).toFixed(b < 10 * 1024 * 1024 ? 1 : 0) + " MB";
+}
+// The largest file this host will take, 0 when it can't take one at all (an agent
+// predating attachments reports no uploadMaxBytes). 0 hides the 📎, exactly as
+// chat.js's attachCap does for the running-session composer.
+function spawnUploadCap(key) {
+  const a = (cache.agents || []).find((x) => x.key === key);
+  const n = Number(a && a.uploadMaxBytes);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+function spawnAttList(rk) { return spawnAtt.get(rk) || []; }
+function spawnAttChips(rk) {
+  return spawnAttList(rk).map((f) => {
+    const cls = f.status === "error" ? " att-error"
+      : f.status === "uploading" ? " att-uploading" : "";
+    const meta = f.status === "error" ? esc(f.error || "failed")
+      : f.status === "uploading" ? "uploading…" : fmtBytes(f.size);
+    return `<span class="att-chip${cls}" title="${esc(f.name)}">` +
+      `<span class="att-name">${esc(f.name)}</span>` +
+      `<span class="att-size">${meta}</span>` +
+      `<button type="button" class="att-x" title="Remove" ` +
+      `onclick="spawnAttRemove('${escJs(rk)}','${escJs(f.key)}')">✕</button></span>`;
+  }).join("");
+}
+// Repaint just this composer's chip strip after an async upload state change,
+// without waiting for the next poll/SSE render (which also rebuilds it from state).
+function spawnAttRender(rk) {
+  const strip = document.getElementById(cid(rk, "attstrip"));
+  if (strip) strip.innerHTML = spawnAttChips(rk);
+}
+function spawnAttRemove(rk, key) {
+  spawnAtt.set(rk, spawnAttList(rk).filter((f) => f.key !== key));
+  spawnAttRender(rk);
+}
+// Stage files and start their uploads — the 📎 picker, a paste, or a drop.
+function spawnAttFiles(rk, files) {
+  const key = rk.split("::")[0];
+  const list = Array.from(files || []).filter(Boolean);
+  if (!list.length) return;
+  const cap = spawnUploadCap(key);
+  if (!cap) { toast("This host is too old for file attachments"); return; }
+  const cur = spawnAttList(rk).slice();
+  for (const file of list) {
+    if (cur.length >= SPAWN_ATT_MAX) { toast(`At most ${SPAWN_ATT_MAX} files`); break; }
+    const rec = {
+      key: "s" + (++spawnAttSeq),
+      name: file.name || "upload",
+      size: file.size || 0,
+      status: file.size > cap ? "error" : "uploading",
+      error: file.size > cap ? `too big — max ${fmtBytes(cap)}` : "",
+      uploadId: "",
+    };
+    cur.push(rec);
+    if (rec.status !== "error") spawnUploadOne(rk, rec, file);
+  }
+  spawnAtt.set(rk, cur);
+  spawnAttRender(rk);
+}
+async function spawnUploadOne(rk, rec, file) {
+  const key = rk.split("::")[0];
+  try {
+    const url = "/api/agents/" + enc(key) + "/uploads?name=" + encodeURIComponent(rec.name);
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: file,
+    });
+    const reply = await r.json().catch(() => null);
+    if (!r.ok) throw new Error((reply && reply.error) || ("upload failed (" + r.status + ")"));
+    if (!spawnAttList(rk).includes(rec)) return;  // removed mid-upload
+    rec.uploadId = reply.uploadId;
+    rec.name = reply.name || rec.name;   // the name it will land under
+    rec.size = reply.size || rec.size;
+    rec.status = "ready";
+  } catch (e) {
+    if (!spawnAttList(rk).includes(rec)) return;
+    rec.status = "error";
+    rec.error = (e && e.message) || "upload failed";
+  }
+  spawnAttRender(rk);
+}
+function spawnPick(rk) {
+  const inp = document.getElementById(cid(rk, "file"));
+  if (!inp) return;
+  inp.value = "";
+  inp.click();
+}
+function spawnFilesPicked(rk, ev) {
+  spawnAttFiles(rk, ev && ev.target && ev.target.files);
+}
+function spawnPaste(rk, ev) {
+  const files = (ev && ev.clipboardData && ev.clipboardData.files) || null;
+  if (!files || !files.length) return;
+  ev.preventDefault();
+  spawnAttFiles(rk, files);
+}
+function spawnDrop(rk, ev) {
+  ev.preventDefault();
+  const files = (ev.dataTransfer && ev.dataTransfer.files) || null;
+  if (files && files.length) spawnAttFiles(rk, files);
+}
+// The staged uploadIds for a spawn, or null if any is still uploading/errored
+// (which HOLDS the start, like chat.js's readyUploadIds).
+function spawnReadyUploadIds(rk) {
+  const list = spawnAttList(rk);
+  const ready = [];
+  for (const f of list) {
+    if (f.status !== "ready" || !f.uploadId) return null;
+    ready.push(f.uploadId);
+  }
+  return ready;
+}
 function toggleComposer(rkey, repo) {
   if (composerOpen.has(rkey)) composerOpen.delete(rkey);
   else {
@@ -1751,13 +1879,15 @@ function composer(a, repo, rk, spawning) {
   const optsExpanded = optionsOpen.has(rk);
   const opt = (val, label, sel) => `<option value="${esc(val)}"${val === sel ? " selected" : ""}>${esc(label)}</option>`;
   const submit = `startSession('${key}','${rn}')`;
-  return `<div class="composer">
+  const canAttach = spawnUploadCap(key) > 0;
+  return `<div class="composer" ondragover="if(${canAttach})event.preventDefault()"${canAttach ? ` ondrop="spawnDrop('${escJs(rk)}',event)"` : ""}>
     <div>
       <label>Task</label>
       <textarea id="${cid(rk, "task")}" data-rk="${esc(rk)}"
         ${composerHeight.has(rk) ? `style="height:${esc(composerHeight.get(rk))}"` : ""}
         placeholder="Describe the task, or leave blank to start an empty session."
         oninput="draftSet('${escJs(rk)}','task',this.value)"
+        onpaste="spawnPaste('${escJs(rk)}',event)"
         onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();${submit};}">${esc(d.task || "")}</textarea>
     </div>
     <div>
@@ -1821,9 +1951,12 @@ function composer(a, repo, rk, spawning) {
         </div>` : ""}
       </div>
     </details>
+    ${canAttach ? `<div class="compose-attach" id="${cid(rk, "attstrip")}">${spawnAttChips(rk)}</div>
+    <input type="file" id="${cid(rk, "file")}" multiple hidden onchange="spawnFilesPicked('${escJs(rk)}',event)">` : ""}
     <div class="cmp-actions">
       <span class="hint">Cmd/Ctrl+Enter to start</span>
       <span class="spacer"></span>
+      ${canAttach ? `<button type="button" class="compose-clip" title="Attach images or documents" onclick="spawnPick('${escJs(rk)}')">📎</button>` : ""}
       <button class="primary btn-sm" ${spawning ? "disabled" : ""} onclick="${submit}">${spawning ? '<span class="spin"></span> Starting…' : "Start"}</button>
     </div>
   </div>`;
@@ -2679,6 +2812,16 @@ function startSession(key, repo) {
   const localContext = parseInt(v("lctx"), 10);
   const dshModel = v("dmodel");
   const body = { repo };
+  // Files attached in this composer (XERK-234 spawn attach). Hold the start while
+  // any is still uploading or errored, exactly as the running-session Send does;
+  // the composer stays open so nothing is lost.
+  const uploadIds = spawnReadyUploadIds(rk);
+  if (uploadIds === null) {
+    toast(spawnAttList(rk).some(f => f.status === "error")
+      ? "Remove the failed file before starting" : "Files are still uploading");
+    return;
+  }
+  if (uploadIds.length) body.uploadIds = uploadIds;
   if (prompt) body.prompt = prompt;
   if (label) body.label = label;
   // Omitted base = the agent forks the latest default branch (main). Only send an
@@ -2726,6 +2869,7 @@ function startSession(key, repo) {
   composerDraft.delete(rk);
   composerHeight.delete(rk);
   composerScroll.delete(rk);
+  spawnAtt.delete(rk);
   const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
     // Open the new session on the stage as soon as the agent reports it. The
