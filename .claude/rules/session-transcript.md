@@ -24,15 +24,23 @@ moves between agents and how a refused start is reported.
 - **A pinned session with no transcript on disk resolves to nothing.** Never add a newest-mtime
   fallback — an empty conversation before the first turn is the truth. A session from an agent
   predating the pin carries no id and keeps the newest-mtime rule.
-- **An EMPTY (0-byte) transcript is not RESUMABLE, though it still resolves as a read path**
-  (XERK-868 follow-up). Claude Code creates `<id>.jsonl` at launch; a session that never took a first
-  turn leaves it 0 bytes. `_session_transcript_path` keeps returning its path (tail/history/pending
-  scan an empty file harmlessly), but `_session_transcript_id` — the ONLY caller that feeds `claude
-  --resume` (via `_launch_tmux`) — gates on `getsize > 0` and returns None, so a resume opens a FRESH
-  conversation. Without that gate `claude --resume <empty id>` exits "No conversation found", killing
-  its tmux, and because the record still names the id EVERY Start relaunches the same doomed
-  `--resume` — an endless failure loop `_sweep_dead_sessions` reports as a crash. Keep the emptiness
-  gate on the resume-id resolver, not on the shared path resolver.
+- **A transcript that exists but has no RESUMABLE entry still resolves as a read PATH, but NOT as a
+  --resume id** (XERK-868 / XERK-892). `claude --resume` needs one real entry (a message, or a
+  system/local-command line); a 0-byte, mode-only, summary-only or all-meta transcript exits "No
+  conversation found" and kills its tmux — and because the record still names the id, every Start
+  relaunches the same doomed `--resume`, an endless dead-tmux loop the sweep reports as a crash
+  (verified on Claude Code 2.1.x). `_session_transcript_path` keeps returning the path
+  (tail/history/pending-scan an empty/meta file harmlessly); `_session_transcript_id` — the resume
+  feeder — gates on `_transcript_has_resumable_entry` and returns None, so `_launch_tmux` opens a
+  FRESH conversation. **The gate FAILS SAFE toward resumable** (`_UNRESUMABLE_META_TYPES` is the
+  closed set of types that carry no turn; an unrecognised/unparseable line reads as resumable) —
+  misclassifying a live conversation as unresumable would silently ABANDON it. **The durable backstop
+  is in `_sweep_dead_sessions`**: a resume-launched tmux that dies without ever being seen alive
+  (`resumeRelaunch` set at every `--resume` launch, cleared the moment it is live) is relaunched
+  FRESH once instead of reported — closing the loop for a shape the predicate let through (a future
+  meta type, or a lone `file-history-snapshot`), independent of Claude's private resume rule. Keep
+  the resumability gate on the resume feeders, never on the shared path resolver. Tests:
+  `TestTranscriptResumable`, the resume/sweep cases in `TestRootSessionIsolation`/`TestSweepDeadSessions`.
 - A watch is sent once and held, so `rearmMovedWatches` re-sends it when a watched session's
   `transcriptId` moves. Only "Restart (clear context)" moves it; without the re-arm that session's
   chat freezes on the pre-restart conversation.
