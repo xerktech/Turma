@@ -6897,10 +6897,22 @@ function awaitResult(agent, cmdId, kind, extra) {
 // is only ever asserted from positive evidence.
 function resultLanded(agent, cmdId, wait) {
   if (wait.kind === "boardCreateMeta") {
-    const e = wait.project
-      ? (agent.createTypes || {})[wait.project]
-      : agent.createMeta;
-    return !!e && e.fetchedAt >= wait.at;
+    // The create-meta/type caches are NOT cmdId-keyed (the agent stages them by
+    // SHAPE), so there is no per-request result to match — only the shape of the
+    // cache. For a CAPABILITY gap the right question is "has this agent EVER
+    // answered a boardCreateMeta", not "did THIS request's fresh result arrive
+    // yet". A genuinely-too-old agent acks the command as unknown and stages
+    // NOTHING, so it never populates EITHER cache; an agent that has returned
+    // create-meta of any shape (this beat's ingest runs before us, so a first
+    // request counts) demonstrably implements it. The earlier `fetchedAt >=
+    // wait.at` FRESHNESS test misfired as a capability test: an ack seen a beat
+    // before this request's fresh result landed — while an older cache entry
+    // sat there — falsely branded a CURRENT agent "too old to offer the
+    // New-ticket options" (a fleet on the latest version, its New-ticket panel
+    // refusing). So credit EXISTENCE, not freshness; the create-meta route
+    // re-checks `CREATE_META_FRESH_MS` itself and re-queues a stale read, so
+    // clearing the wait here never serves stale data.
+    return !!agent.createMeta || Object.keys(agent.createTypes || {}).length > 0;
   }
   if (wait.kind === "createTicket") return !!(agent.createResults || {})[cmdId];
   if (wait.kind === "setTicketStatus") return !!(agent.statusResults || {})[cmdId];
@@ -7033,8 +7045,21 @@ function jiraHostPool(siteKey, requireOnline) {
 // rotating: the read paths
 // cache per host (createMeta, createTypes, jiraIssues), so spreading reads would
 // just multiply cache misses. Writes use pickBoardWriteHost below.
-function findJiraHost(siteKey, requireOnline) {
-  return jiraHostPool(siteKey, requireOnline)[0] || null;
+//
+// `kind` (XERK-151) is the READ-path twin of pickBoardWriteHost's capability
+// exclusion: given one, prefer the first host in the ranked pool that has NOT
+// PROVEN it can't run that command, so a New-ticket meta read routes AROUND a
+// too-old sibling to a capable one instead of refusing at the head. It stays
+// STICKY (returns the first ABLE host, never a rotating one), so the per-host
+// cache still holds. When EVERY covering host is gapped, it falls back to the
+// head — the caller then reaches the honest "agent too old" refusal.
+function findJiraHost(siteKey, requireOnline, kind) {
+  const pool = jiraHostPool(siteKey, requireOnline);
+  if (kind) {
+    const able = pool.find((k) => !agentGapError(agents[k], kind, ""));
+    if (able) return able;
+  }
+  return pool[0] || null;
 }
 
 // Which HOST should run a board WRITE (create a ticket, change a status) for an
@@ -17270,7 +17295,10 @@ const server = http.createServer(async (req, res) => {
         parts.length === 4 && parts[3] === "create-meta") {
       const siteKey = decodeURIComponent(parts[2]);
       const project = (url.searchParams.get("project") || "").trim();
-      const key = findJiraHost(siteKey, true);
+      // Route around a host that has PROVEN it can't offer the New-ticket options
+      // (XERK-151) to a capable sibling of the same org, rather than refusing at
+      // the too-old head while another host could answer.
+      const key = findJiraHost(siteKey, true, "boardCreateMeta");
       if (!key) {
         return findJiraHost(siteKey, false)
           ? json(res, 503, { error: "no online host reports that org" })

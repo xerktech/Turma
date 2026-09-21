@@ -6757,6 +6757,58 @@ test("http: a boardCreateMeta that DID stage its result asserts no gap", async (
   assert.deepEqual(res.body.projects, [{ key: "ENG", name: "Eng" }]);
 });
 
+test("http: New-ticket meta routes AROUND a too-old host to a capable sibling", async () => {
+  const site = "gaproute.atlassian.net";
+  // The too-old host beats FIRST, so it is the head of the org's pool and the
+  // create-meta read lands on it (both hosts online + available, so ties keep
+  // insertion order).
+  await jiraBeat("gaproute-old", site, { agentVersion: "2.0.48" });
+  await jiraBeat("gaproute-new", site, { agentVersion: "2.1.0" });
+
+  // Prove the gap on the head: queue, deliver, then ack with no result.
+  const first = await request("GET", `/api/jira/${site}/create-meta`, { headers: userHeaders });
+  assert.equal(first.status, 202);
+  await jiraBeat("gaproute-old", site, { agentVersion: "2.0.48" }); // deliver the command
+  await ackBeat("gaproute-old", site, [first.body.cmdId], { agentVersion: "2.0.48" });
+
+  // The next read must NOT refuse: it routes to the capable sibling and queues a
+  // fetch there, instead of returning the head's "too old" error.
+  const res = await request("GET", `/api/jira/${site}/create-meta`, { headers: userHeaders });
+  assert.equal(res.status, 202, "should route around the gapped head to the capable host");
+  assert.equal(res.body.error, undefined);
+  assert.ok(res.body.cmdId);
+
+  // The queued fetch lands on the capable host, never the gapped one.
+  const newBeat = await jiraBeat("gaproute-new", site, { agentVersion: "2.1.0" });
+  assert.ok((newBeat.body.commands || []).some((c) => c.type === "boardCreateMeta"),
+    "the capable host receives the boardCreateMeta command");
+  const oldBeat = await jiraBeat("gaproute-old", site, { agentVersion: "2.0.48" });
+  assert.deepEqual(oldBeat.body.commands, [], "the gapped host is not queued again");
+});
+
+test("http: New-ticket meta still refuses when EVERY host of the org is too old", async () => {
+  const site = "gapall.atlassian.net";
+  await jiraBeat("gapall-a", site, { agentVersion: "2.0.48" });
+  await jiraBeat("gapall-b", site, { agentVersion: "2.0.48" });
+
+  // Gap both hosts. Each read picks the first ABLE host; once one is gapped the
+  // read falls to the other, so two rounds gap both.
+  for (let round = 0; round < 2; round++) {
+    const q = await request("GET", `/api/jira/${site}/create-meta`, { headers: userHeaders });
+    assert.equal(q.status, 202);
+    // Deliver to whichever host took it, then ack empty (the cmdId's owning host
+    // settles; the other ack is a harmless no-op).
+    await jiraBeat("gapall-a", site, { agentVersion: "2.0.48" });
+    await jiraBeat("gapall-b", site, { agentVersion: "2.0.48" });
+    await ackBeat("gapall-a", site, [q.body.cmdId], { agentVersion: "2.0.48" });
+    await ackBeat("gapall-b", site, [q.body.cmdId], { agentVersion: "2.0.48" });
+  }
+
+  const res = await request("GET", `/api/jira/${site}/create-meta`, { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.match(res.body.error, /too old to offer the New-ticket options/);
+});
+
 test("http: the per-project type fetch proves its gap on its own project", async () => {
   await jiraBeat("gap3", "gap3.atlassian.net", { agentVersion: "0.5.38" });
   const q = await request("GET", "/api/jira/gap3.atlassian.net/create-meta?project=ENG", { headers: userHeaders });
@@ -13369,6 +13421,56 @@ test("a sync-result command acked without a result still stamps unsupported at o
   assert.ok(next.unsupported.setTicketStatus,
     "a sync-result kind's absence on the ack beat is still positive evidence of a gap");
   assert.equal(next.resultWaits.s1, undefined);
+});
+
+// A boardCreateMeta gap is a CAPABILITY test, not a freshness test. An agent
+// that has ever answered create-meta (its cache exists, even STALE) implements
+// the command, so an ack seen a beat before this request's fresh result landed
+// must NOT brand a CURRENT agent "too old to offer the New-ticket options" (the
+// reported symptom: a whole fleet on the latest version, New-ticket refusing).
+test("boardCreateMeta acked with a STALE-but-existing cache does NOT stamp unsupported", () => {
+  const next = {
+    agentVersion: "2.0.48",
+    unsupported: {},
+    // Populated by a PRIOR successful fetch — proof the agent implements it —
+    // but older than this request's wait (a re-request after CREATE_META_FRESH_MS).
+    createMeta: { projects: [{ key: "ENG" }], labels: [], fetchedAt: Date.now() - 10 * 60 * 1000 },
+    createTypes: {},
+    resultWaits: { c1: { kind: "boardCreateMeta", at: Date.now() } },
+  };
+  resolveResultWaits({ agentVersion: "2.0.48" }, next, []);   // c1 acked, no fresh result this beat
+  assert.equal(next.unsupported.boardCreateMeta, undefined,
+    "a capable agent whose create-meta cache merely went stale is not 'too old'");
+  assert.equal(next.resultWaits.c1, undefined, "the wait settles on proven capability");
+});
+
+test("a per-project boardCreateMeta ack rides the agent's PROVEN capability, not this project's freshness", () => {
+  const next = {
+    agentVersion: "2.0.48",
+    unsupported: {},
+    createMeta: null,
+    // The agent has answered types for SOME project before — capability proven —
+    // so a wait for a DIFFERENT, not-yet-fetched project must not read as a gap.
+    createTypes: { ENG: { types: [{ id: "1" }], fetchedAt: Date.now() - 10 * 60 * 1000 } },
+    resultWaits: { p1: { kind: "boardCreateMeta", project: "NEW", at: Date.now() } },
+  };
+  resolveResultWaits({ agentVersion: "2.0.48" }, next, []);
+  assert.equal(next.unsupported.boardCreateMeta, undefined);
+  assert.equal(next.resultWaits.p1, undefined);
+});
+
+test("a genuinely-old agent that has NEVER populated a create-meta cache still stamps the gap", () => {
+  const next = {
+    agentVersion: "0.5.38",
+    unsupported: {},
+    createMeta: null,   // a too-old agent acks boardCreateMeta as unknown and stages nothing
+    createTypes: {},
+    resultWaits: { c1: { kind: "boardCreateMeta", at: Date.now() } },
+  };
+  resolveResultWaits({ agentVersion: "0.5.38" }, next, []);
+  assert.ok(next.unsupported.boardCreateMeta,
+    "an agent that never populates EITHER create-meta cache is genuinely too old");
+  assert.equal(next.resultWaits.c1, undefined);
 });
 
 // XERK-705: the ORG auto-merge stream no longer closes the ticket or kills the
