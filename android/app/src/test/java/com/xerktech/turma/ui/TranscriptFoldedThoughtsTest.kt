@@ -15,7 +15,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 /**
- * The "n thoughts hidden" marker (XERK-860) — the web's `renderFoldedThoughts`,
+ * The "n thoughts" folded marker (XERK-860) — the web's `renderFoldedThoughts`,
  * ported. Its COUNTING and trace-carrying are pinned in `core/ChatItemsTest`;
  * this drives the real composable, so it fails on the WIRING: the marker must
  * reach the screen with the right singular/plural label, stay COLLAPSED by
