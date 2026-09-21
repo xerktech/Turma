@@ -49,6 +49,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `turma-sessions.md` | `turma/public/sessions.html`, `chat.js` | Sessions page, chat engine, live tail, composer, terminal |
 | `android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
 | `glasses.md` | `glasses/**` | G2 client |
+| `ui-review.md` | `turma/public/**`, `glasses/src/**`, `android/app/src/**` | UI changes get a screenshot review from the operator BEFORE a PR is opened |
 | `release.md` | `.github/**`, `VERSION`, `turma/Dockerfile` | releases, PR gates, hub image |
 | `routing-eval.md` | `bench/archive/**` | archive-sourced replay eval: requestId turn unit, curation gates |
 | `dsh.md` | dsh-specific `agent/**` files | dsh runtime invariants (XERK-460); rationale in `docs/dsh-adr.md` |
