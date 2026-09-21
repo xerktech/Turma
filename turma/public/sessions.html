@@ -1000,15 +1000,20 @@
   /* Live agent-mode (left) / model (right) selectors under the text box; the
      ticket chip and PR status chip (when present) ride just left of the model on
      the right — the ticket the work came from, then the PR it went to. */
-  /* The footer wraps rather than overlapping (a session with many PR chips used
-     to stack the PR badges into a tall block that the context/ticket chips drew
-     on top of). The mode chip stays left; the right cluster grows to fill the
-     rest and wraps its own chips onto extra rows, right-aligned, when crowded. */
-  .chat-compose-opts { display: flex; justify-content: space-between; align-items: center;
+  /* Footer stacks: a controls row on top, then the PR chips on their own
+     full-width row(s) below. The controls row holds the context meter + ticket
+     on the left and the mode/runtime/model chips on the right; PR badges (a
+     session can open many) never share a line with them, so nothing overlaps. */
+  .chat-compose-opts { display: flex; flex-direction: column; gap: 8px; }
+  .cc-controls { display: flex; justify-content: space-between; align-items: center;
     gap: 6px 8px; flex-wrap: wrap; }
+  .cc-left { display: flex; align-items: center; gap: 6px 8px; min-width: 0; flex-wrap: wrap; }
   .cc-right { display: flex; align-items: center; justify-content: flex-end; gap: 6px 8px;
-    min-width: 0; flex: 1 1 auto; flex-wrap: wrap; }
-  .cc-right .pr-badge { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+    min-width: 0; flex-wrap: wrap; }
+  /* The PR row wraps its badges and collapses entirely when the session has none. */
+  .cc-prs { display: flex; }
+  .cc-prs:empty { display: none; }
+  .cc-prs .pr-badge { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
   .cc-pr { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
   .cc-ticket { display: flex; align-items: center; min-width: 0; }
   .jira-chip {
@@ -1210,9 +1215,11 @@
             <button class="primary compose-stop" id="chatStop" onclick="chatComposeStop()" hidden>◼ Stop</button>
             <button class="primary compose-action" id="chatSend" onclick="chatComposeAction()">Send</button>
           </div>
-          <!-- Live per-session selectors: agent (permission) mode on the left,
-               model on the right. Buttons that open a dropdown; picking one
-               changes the RUNNING session (chat.js posts to .../mode | .../model). -->
+          <!-- Live per-session selectors, painted by chat.js renderComposeOpts:
+               a controls row (context meter + ticket on the left, mode / runtime /
+               model chips on the right) over a full-width PR-chip row. Buttons
+               open a dropdown; picking one changes the RUNNING session (posts to
+               .../mode | .../model). -->
           <div class="chat-compose-opts" id="chatComposeOpts"></div>
         </div>
       </div>

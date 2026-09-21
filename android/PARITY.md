@@ -69,6 +69,14 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   the PRs in their own start-packed `FlowRow` below the state text (no shared line, no corner
   reservation) — an accepted, pre-existing platform-idiomatic difference, not a new gap. No Android
   change; the fix is web (`sessions.html`) + glasses (`phone.css`) only.
+- **Chat COMPOSE footer arrangement.** Web (`chat.js` `renderComposeOpts`) now lays the footer as a
+  controls row — context meter + ticket chip on the left, mode/runtime/model chips on the right —
+  over a full-width PR-chip row beneath it. Android's `ChatScreen.kt` `ChatFooter` keeps its vertical
+  stack: one chip `FlowRow` (mode/model/run + the PR badges, which already wrap) with the
+  `ContextMeterBar` on its own line below. Both avoid the old overlap; a phone is too narrow for a
+  left/right-split top row to buy anything, and Android's compose bar has no ticket chip. Accepted
+  platform-idiomatic difference — no Android change; web (`sessions.html` + `chat.js`) + glasses
+  vendor only.
 - **In-app updater** (`ui/UpdateBanner.kt`) — a sideload stopgap until Play (XERK-11), no web analog.
 - **Chat text-size control** (XERK-144) — a phone-only addition, no web analog. The chat settings menu
   (the top-bar ⚙/Tune button that holds verbosity) also picks a chat text size, scaling every bubble/

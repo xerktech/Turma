@@ -2708,9 +2708,15 @@
             '<span class="cc-val">' + esc(modelChipLabel()) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
             '<span class="cc-menu" id="ccModelMenu"><span class="cc-hint">Model</span>' +
             menuHtml(mOpts, model, "data-model") + "</span></span>");
-    host.innerHTML = modeChip +
-      '<span class="cc-right">' + contextMeterChip() + ticketFooterChip(sess) + prFooterChip(sess) +
-        runtimeChip + modelChip + "</span>";
+    // A controls row (context meter + ticket left, mode/runtime/model right)
+    // over a full-width PR-chip row — a session can open many PRs, and keeping
+    // them off the controls line is what stops the chips overlapping.
+    host.innerHTML =
+      '<div class="cc-controls">' +
+        '<span class="cc-left">' + contextMeterChip() + ticketFooterChip(sess) + "</span>" +
+        '<span class="cc-right">' + modeChip + runtimeChip + modelChip + "</span>" +
+      "</div>" +
+      '<div class="cc-prs">' + prFooterChip(sess) + "</div>";
     wireComposeMenu("ccModeBtn", "ccModeMenu", "data-mode", setSessionMode);
     wireComposeMenu("ccModelBtn", "ccModelMenu", "data-model", setSessionModel);
     wireComposeMenu("ccSourceBtn", "ccSourceMenu", "data-source", setSessionModelSource);
