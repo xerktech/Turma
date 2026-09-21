@@ -47,12 +47,14 @@
 
   /* ---- Left sidebar: new-session picker, active list, ended list ----------- */
   .sidebar {
-    /* Sized so a session card's PR row fits four 3-digit chips snugly, with the
-       row's leftover space split evenly (chips are right-aligned, so trimming to
-       just above the ~382px 4-chip floor leaves the left gap ≈ the right).
+    /* Sized so a session card's PR row fits four 3-digit chips snugly across the
+       FULL card width (the state-row reclaims the dot gutter on the left as well
+       as the ⋯ padding on the right, so the 4-chip floor is ~364px here, down from
+       the ~382px of the content-column-only layout). Trimmed to just above that
+       floor so a right-aligned wrapped row spans edge to edge with little padding.
        Was 340px = three. Only applies above the 820px breakpoint, where the
        sidebar goes full-width. */
-    width: 384px; flex: none; border-right: 1px solid var(--hairline);
+    width: 366px; flex: none; border-right: 1px solid var(--hairline);
     overflow-y: auto; padding: 14px 14px 24px; display: flex; flex-direction: column; gap: 6px;
     scrollbar-width: thin;
   }
@@ -135,26 +137,29 @@
     font-size: 12px; color: var(--ink-2); margin-top: 3px;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   }
-  /* PR badges CONSOLIDATE and RIGHT-ALIGN on the state line: they share the first
-     line with the state text ("idle"), packed to the right after it, and wrap to
-     fill the full card width — never the old block that capped at ~3 per row and
-     stopped short of the edge. The card reserves right padding (36px for the ⋯
-     menu, 78px for a Resume button) down its WHOLE height, yet those controls only
-     occupy the top-right corner, so the state row — always below the title/meta —
-     reclaims that padding with a negative margin and runs the chips to the edge.
-     `.pr-list` is `display:contents` so its chips become direct children of the
-     state-row's single wrap flow. Two pieces make it right-aligned yet full-width:
-     the state keeps `flex:1 1 auto` so it grows and stays pinned left (pushing the
-     chips right on the first line), and `justify-content:flex-end` — which applies
-     PER wrapped line — right-aligns the chips on every line, so wrapped rows use the
-     whole card width (including under the state text) rather than a nested item's
-     narrower box. */
+  /* PR badges share the FIRST line with the state text ("idle") — the state grows
+     (`flex:1 1 auto`) and pushes them to the right edge — then WRAP to their own
+     full-width rows below, which use the ENTIRE card width. The state row reclaims
+     the padding the card reserves down its whole height for the top-right controls
+     (the ⋯ menu / Resume button) with `margin-right`, and reclaims the status-dot
+     gutter (dot 8px + the card's 10px flex gap) with `margin-left`, so a wrapped
+     chip row runs edge to edge at a ~10px inset on BOTH sides. `.pr-list` is
+     `display:contents` so its chips are direct children of this single wrap flow.
+     `justify-content:flex-end` right-aligns every line: line 1 is unaffected (the
+     grown state consumes the free space, so the chips land right anyway), and the
+     chip-only wrapped lines hug the right edge too — with the sidebar trimmed so
+     four chips span the full reclaimed width, the row runs edge to edge (leftmost
+     chip in the reclaimed gutter, rightmost at the ⋯-padding inset) with little
+     leftover. The state keeps a matching `margin-left` so its text stays aligned
+     with the title/meta above, not out under the dot. */
   .s-card .state-row {
     display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; margin-top: 4px;
     justify-content: flex-end;
     margin-right: -24px;   /* reclaim the ⋯ (34px padding-right) down to the card's 10px inset */
+    margin-left: -18px;    /* reclaim the status-dot gutter (dot 8px + 10px gap) so wrapped
+                              chip rows reach the card's left inset, mirroring the right */
   }
-  .s-card .state-row .state { margin-top: 0; min-width: 0; flex: 1 1 auto; }
+  .s-card .state-row .state { margin-top: 0; min-width: 0; flex: 1 1 auto; margin-left: 18px; }
   .s-card .state-row .pr-list { display: contents; }
   .s-card .state-row .pr-badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
   /* Ended cards reserve a wider right padding for the Resume button; reclaim that
