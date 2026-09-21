@@ -77,6 +77,7 @@ fun ChatItemView(item: ChatItem) {
     when (item) {
         is ChatItem.Bubble -> TranscriptBubble(item)
         is ChatItem.Thinking -> TranscriptThinking(item.text, item.clipped)
+        is ChatItem.FoldedThoughts -> TranscriptFoldedThoughts(item.count)
         is ChatItem.Tool -> TranscriptTool(item)
         is ChatItem.TaskNote -> Pill("⚑ ${item.summary} (${item.status})")
     }
@@ -168,6 +169,27 @@ private fun TranscriptThinking(text: String, clipped: Boolean = false) {
             if (clipped) ClippedMark(Modifier.padding(start = 8.dp))
         }
     }
+}
+
+/**
+ * A run of thinking traces the current verbosity hides, shown as ONE muted,
+ * counted marker (XERK-860) — the web's `💭 n thought(s) hidden`
+ * (chat.js `renderFoldedThoughts`). Deliberately quieter than a collapsed trace
+ * and NOT interactive: the trace itself isn't carried at a verbosity that hides
+ * thinking, so raising the verbosity to Verbose is what reveals it — there is no
+ * body for a tap to open. It exists only so an elided turn is distinguishable
+ * from a quiet one.
+ */
+@Composable
+private fun TranscriptFoldedThoughts(count: Int) {
+    val label = if (count == 1) "1 thought hidden" else "$count thoughts hidden"
+    Text(
+        "💭 $label",
+        Modifier.fillMaxWidth(),
+        fontSize = scaledSp(11f),
+        fontStyle = FontStyle.Italic,
+        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
+    )
 }
 
 // ---- prose block rendering (web parity: chat.js renderProse) --------------

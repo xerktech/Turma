@@ -58,6 +58,26 @@ sealed interface ChatItem {
         val clipped: Boolean = false,
     ) : ChatItem
 
+    /**
+     * A run of consecutive thinking traces the current verbosity HIDES, folded
+     * into ONE muted marker that COUNTS them (XERK-860) — the web's
+     * `💭 n thought(s) hidden` (chat.js `renderFoldedThoughts`), which glasses
+     * renders through the same vendored engine. Hidden thinking used to render
+     * as NOTHING here, exactly as it did on the web before the fix: next to the
+     * terminal — which always shows the trace — an elided turn read as a quiet
+     * one, with no signal that anything was cut. This makes the elision VISIBLE.
+     *
+     * It is deliberately SUMMARY ONLY — [count] alone, never the trace: the
+     * hiding verbosities (Concise/Normal) mean "do not show me the thinking", so
+     * raising the verbosity to Verbose is what reveals it. The marker is NOT a
+     * control (the web's is a plain, non-clickable label): there is no fuller
+     * copy to fetch, only a preset to change.
+     */
+    data class FoldedThoughts(
+        override val entryKey: String,
+        val count: Int,
+    ) : ChatItem
+
     data class Tool(
         override val entryKey: String,
         val name: String,
@@ -107,6 +127,26 @@ fun buildItems(
             }
         }
     }
+    // A run of consecutive hidden thoughts folds into ONE counted marker
+    // (XERK-860). The web builds every thinking item unconditionally and folds
+    // the run at RENDER time (chat.js itemsToHtml collects `while items[j].kind
+    // === "thinking"`); this single-pass port folds inline instead, so the run
+    // must break on exactly what the web's item stream breaks it on — a bubble,
+    // a tool_use, an orphan tool_result or a task note, EACH an item there even
+    // when this verbosity hides its card. So `flushFold` is called before every
+    // such item, whether or not it renders, and the count SPANS entries the way
+    // adjacent items do (state lives outside the entry loop). A PAIRED
+    // tool_result is `continue`d in the web with no item and no flush, so it
+    // does NOT break a run — it is left untouched below.
+    var foldCount = 0
+    var foldKey: String? = null
+    fun flushFold() {
+        if (foldCount > 0) {
+            out.add(ChatItem.FoldedThoughts(foldKey ?: "", foldCount))
+            foldCount = 0
+            foldKey = null
+        }
+    }
     for (entry in entries) {
         // Older agents / the text-only heartbeat seed carry no blocks: synthesize
         // them, splitting a trailing run of tool markers off into name-only
@@ -126,7 +166,13 @@ fun buildItems(
             val clipped = pendingClipped
             pending = null
             pendingClipped = false
-            if (!text.isNullOrBlank()) out.add(ChatItem.Bubble(entry.key, entry.role, text, clipped))
+            // Any thoughts already folded come BEFORE this bubble in the stream
+            // (the web pushes the msg item after the thinking items it followed),
+            // so drain the fold first.
+            if (!text.isNullOrBlank()) {
+                flushFold()
+                out.add(ChatItem.Bubble(entry.key, entry.role, text, clipped))
+            }
         }
         for (block in blocks) {
             when (block) {
@@ -134,31 +180,49 @@ fun buildItems(
                     (pending ?: StringBuilder().also { pending = it }).append(block.text)
                     if (block.truncated) pendingClipped = true
                 }
-                is ThinkingBlock -> if (prefs.thinking && block.text.isNotBlank()) {
+                is ThinkingBlock -> if (prefs.thinking) {
+                    if (block.text.isNotBlank()) {
+                        flushText()
+                        out.add(ChatItem.Thinking(entry.key, block.text, block.truncated))
+                    }
+                } else {
+                    // Hidden by this verbosity: fold into a counted marker rather
+                    // than dropping it (XERK-860). Flush the preceding text first
+                    // so its bubble renders BEFORE the marker, then extend the
+                    // run. Every hidden thought is counted — including a blank one
+                    // — because the web pushes a thinking item for each regardless
+                    // of text, so the count must match.
                     flushText()
-                    out.add(ChatItem.Thinking(entry.key, block.text, block.truncated))
+                    if (foldCount == 0) foldKey = entry.key
+                    foldCount++
                 }
                 // A SendUserFile delivery (a block carrying rendered files) is
                 // user-facing content, not a tool mechanic, so it shows in EVERY
                 // verbosity — even Concise, which hides ordinary tool cards (XERK-221).
-                is ToolUseBlock -> if (prefs.toolCalls || block.files.isNotEmpty()) {
+                is ToolUseBlock -> {
+                    // A tool_use is ALWAYS an item in the web stream, so it ends a
+                    // hidden-thinking run even when this verbosity hides its card.
                     flushText()
-                    val res = resultsByForId[block.id]
-                    out.add(
-                        ChatItem.Tool(
-                            entry.key,
-                            name = block.name,
-                            input = renderInput(block.input),
-                            result = if (prefs.toolOutputs) (res?.text ?: "") else "",
-                            isError = res?.isError ?: false,
-                            files = block.files,
-                            caption = block.caption,
-                            clipped = block.truncated || (prefs.toolOutputs && res?.truncated == true),
+                    flushFold()
+                    if (prefs.toolCalls || block.files.isNotEmpty()) {
+                        val res = resultsByForId[block.id]
+                        out.add(
+                            ChatItem.Tool(
+                                entry.key,
+                                name = block.name,
+                                input = renderInput(block.input),
+                                result = if (prefs.toolOutputs) (res?.text ?: "") else "",
+                                isError = res?.isError ?: false,
+                                files = block.files,
+                                caption = block.caption,
+                                clipped = block.truncated || (prefs.toolOutputs && res?.truncated == true),
+                            )
                         )
-                    )
+                    }
                 }
                 is TaskNotificationBlock -> {
                     flushText()
+                    flushFold() // a task note is an item too — it ends a run
                     out.add(ChatItem.TaskNote(entry.key, block.summary, block.status, block.result, block.truncated))
                 }
                 // A result whose call is anywhere in the conversation folded into
@@ -166,19 +230,27 @@ fun buildItems(
                 // result-only turn isn't dropped (matching _entry_blocks).
                 is ToolResultBlock -> {
                     val paired = block.forId.isNotEmpty() && block.forId in toolUseIds
-                    // No isNotBlank() guard: chat.js pushes the orphan card
-                    // regardless and renders "(no output)". Dropping the empty
-                    // one was the last divergence out of 14 producer-generated
-                    // wire cases (XERK-235).
-                    if (!paired && prefs.toolOutputs) {
+                    // A PAIRED result folded into its card above — the web
+                    // `continue`s before flushing, so it neither renders nor ends
+                    // a run; leave it untouched. An ORPHAN is always an item in
+                    // the web stream, so it ends a hidden-thinking run even when
+                    // outputs are hidden (`flushFold` unconditional below).
+                    if (!paired) {
                         flushText()
-                        out.add(
-                            ChatItem.Tool(
-                                entry.key, name = "result", input = "",
-                                result = block.text, isError = block.isError,
-                                clipped = block.truncated,
+                        flushFold()
+                        // No isNotBlank() guard: chat.js pushes the orphan card
+                        // regardless and renders "(no output)". Dropping the empty
+                        // one was the last divergence out of 14 producer-generated
+                        // wire cases (XERK-235).
+                        if (prefs.toolOutputs) {
+                            out.add(
+                                ChatItem.Tool(
+                                    entry.key, name = "result", input = "",
+                                    result = block.text, isError = block.isError,
+                                    clipped = block.truncated,
+                                )
                             )
-                        )
+                        }
                     }
                 }
                 else -> { /* unknown block: skip */ }
@@ -186,6 +258,7 @@ fun buildItems(
         }
         flushText()
     }
+    flushFold() // a conversation ending in hidden thinking still shows its marker
     return out
 }
 

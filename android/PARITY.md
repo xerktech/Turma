@@ -977,13 +977,18 @@ those are marked `[MODEL]`.
   the web fix exists to remove. There is nothing to mirror.
   - **The selection-freeze fix is web-only for the same reason** — it is a DOM-selection concern
     (`selectionIn`), which Compose does not have.
-  - **`XERK-860`, the "n thoughts hidden" affordance, IS a user-facing behaviour change and is
-    currently web-only.** Thinking is hidden at the default verbosity while the terminal always shows
-    it, so an elided turn read as a quiet one. The web now renders a `💭 n thought(s) hidden` marker.
-    It is deliberately SUMMARY ONLY — the trace itself is not emitted at a verbosity that hides it
-    (glasses renders the same vendored engine onto a tiny display, pinned by `vendor.test.ts`), so
-    raising the verbosity is what reveals it. **Android's `TranscriptView` still renders nothing for
-    hidden thinking and should grow the same marker.**
+  - **`XERK-860`, the "n thoughts hidden" affordance, now MATCHES on Android.** Thinking is hidden at
+    the default verbosity while the terminal always shows it, so an elided turn read as a quiet one.
+    A run of hidden thoughts folds into ONE muted `💭 n thought(s) hidden` marker (`core/ChatItems.kt`
+    `ChatItem.FoldedThoughts` + `ui/TranscriptView.kt` `TranscriptFoldedThoughts`), the web's
+    `renderFoldedThoughts` (which glasses renders through the same vendored engine, pinned by
+    `vendor.test.ts`). It is deliberately SUMMARY ONLY — the trace itself is never carried at a
+    verbosity that hides it, so raising the verbosity to Verbose is what reveals it, and the marker is
+    NOT interactive (no body for a tap to open). The web builds every thinking item then folds runs at
+    render; Android's single-pass `buildItems` folds inline but breaks a run on exactly what the web's
+    item stream breaks it on — a bubble, a tool_use, an orphan tool_result or a task note, each an item
+    there even when its card is hidden — so the counts agree in every verbosity. Tests:
+    `ChatItemsTest.kt` (the `XERK-860` cases), the web twin in `chat.test.js`.
   - **The Edit line diff (B4) is web-only so far.** An `Edit` card used to stack the whole old body
     over the whole new body; the web now renders an interleaved per-line diff with unchanged lines as
     context, off the `{old,new}` already on the wire (no wire change). **Android still stacks the two
