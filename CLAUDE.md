@@ -47,6 +47,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `epic-builder.md` | `agent/hub-agent.py`, `turma/epic-plan.js` | Epic Builder agent+plan half (XERK-722/723/724): EpicPlan model + `waves`==`buildEpicWaves` parity (3 mirrors), verified Blocks direction (inwardIssue=blocker), emit isEpic/epicKey/blocks so Auto Epic needs no change, final-child-blocked-by-all, `createBlocksLink` idempotency, the builder session + no-silent-half-epic materializer + on-beat reap |
 | `board-ticket-view.md` | `server.js`, `hub-agent.py`, `board.js` + vendored copies, `Board.kt` | routing a ticket to a capable host; hub resolving a ticket as the board does |
 | `turma-sessions.md` | `turma/public/sessions.html`, `chat.js` | Sessions page, chat engine, live tail, composer, terminal |
+| `chat-prose.md` | `turma/public/chat.js`, `glasses/…/chat.cjs`, android `Prose.kt` | `renderProse` markdown engine: block/inline rules, linearity invariants, JS↔Kotlin port parity |
 | `android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
 | `glasses.md` | `glasses/**` | G2 client |
 | `ui-review.md` | `turma/public/**`, `glasses/src/**`, `android/app/src/**` | UI changes get a screenshot review from the operator BEFORE a PR is opened |
