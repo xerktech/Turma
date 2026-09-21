@@ -13837,6 +13837,25 @@ function channelDuplex(socket) {
   return d;
 }
 
+// How long to wait for the agent's data-channel dial-back before rejecting.
+//
+// This bounds the FIRST-CONNECT latency of a terminal (XERK-880): the base
+// `/term/<id>/` GET and the WS upgrade both await `openChannel`, so on a
+// slow/flapping tunnel the browser sees a black/grey pane for the whole wait
+// before the dial rejects and the self-reloading interstitial
+// (`terminalReconnectPage`, base doc) / XERK-879 client watchdog (grey pane)
+// can act. A HEALTHY dial-back is one agent→hub round trip over the tunnel —
+// sub-second — so the old 10s ceiling was pure tail: a transient flap hung the
+// pane 10s before the interstitial's own 2s-base retry cadence
+// (`TERM_RECONNECT_BASE_MS`) even started. 5s clears a healthy dial-back many
+// times over while cutting that worst-case hang in half, so a transient failure
+// reaches the client's retry sooner. Env-tunable (`positiveEnv`) so the default
+// can be tightened from real measurement without a code change — the ticket's
+// "measure first, then tune" lever. NOTE this is the OWNER-side/local dial-back
+// only; under HA a cross-replica open ALSO pays `relay.connect`'s handshake
+// ceiling (`relay.js` DEFAULT_HANDSHAKE_MS, in-cluster pod-to-pod, left as-is —
+// a different failure class from first-connect latency).
+const TERM_CHANNEL_OPEN_TIMEOUT_MS = positiveEnv("TERM_CHANNEL_OPEN_TIMEOUT_MS", 5000);
 // Ask `name`'s tunnel-agent to dial back a data channel bridged to the given
 // local ttyd `port`; resolves with its Duplex once the agent connects (or
 // rejects if the tunnel is offline / slow). One control channel per host fans
@@ -13853,7 +13872,7 @@ function openChannelLocal(name, port) {
     const timer = setTimeout(() => {
       delete pendingChannels[ch];
       reject(new Error("channel open timeout"));
-    }, 10000);
+    }, TERM_CHANNEL_OPEN_TIMEOUT_MS);
     // `host` is carried so the dial-back can be checked against the host the
     // channel was opened FOR (XERK-268) — `ch` alone identifies the channel but
     // proves nothing about who answered it.
