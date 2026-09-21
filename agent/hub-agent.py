@@ -8077,6 +8077,60 @@ def _session_transcript_path(sess):
     return _newest_transcript_path(wt)
 
 
+# XERK-892: transcript `type`s that carry NO entry `claude --resume` can rejoin.
+# A transcript of only these (plus blank lines) makes `claude --resume` exit
+# "No conversation found" and take its tmux down — verified on Claude Code 2.1.x:
+# a 0-byte, mode-only, summary-only, or all-meta transcript ALL exit 1, while a
+# transcript with even one user turn resumes. Any OTHER `type` — a message, a
+# system/local-command entry, or one we do not recognise — counts as resumable,
+# so _transcript_has_resumable_entry FAILS SAFE toward attempting the resume when
+# a future Claude Code adds a meta type we have not listed here. NEVER widen this
+# set to a type that might carry a real turn: misclassifying a live conversation
+# as unresumable would silently ABANDON it (the dangerous direction). The one-shot
+# fresh relaunch in _sweep_dead_sessions is the durable backstop for a genuinely-
+# unresumable shape this set misses (e.g. a lone file-history-snapshot).
+_UNRESUMABLE_META_TYPES = frozenset({
+    "mode", "permission-mode", "custom-title", "agent-name", "summary",
+})
+
+
+def _transcript_has_resumable_entry(path, max_lines=2000, max_bytes=1 << 20):
+    """Whether a transcript holds at least one line `claude --resume` can rejoin.
+
+    The complement of "every non-blank line is a known-unresumable meta type"
+    (_UNRESUMABLE_META_TYPES), and it FAILS SAFE toward True: an unparseable
+    line, a `type` not in that set, an over-long all-meta head, or an unreadable
+    file all read as RESUMABLE, because the cost of a wrong False is abandoning a
+    real conversation. Only a 0-byte / all-meta / summary-only transcript reads
+    False — exactly the shapes that send a resume into the XERK-868 dead-tmux
+    loop (XERK-892).
+
+    The read is bounded, but a real conversation's first non-meta line sits
+    within the first handful of entries (the meta lines lead the file), so this
+    short-circuits at once; the bounds only cap a pathological all-meta head."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(max_bytes)
+    except OSError:
+        return True   # can't read it -> attempt the resume, never abandon it
+    checked = 0
+    for line in raw.split(b"\n"):
+        line = line.strip()
+        if not line:
+            continue
+        checked += 1
+        if checked > max_lines:
+            return True   # all-meta this far is implausible; still err safe
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            return True   # a non-blank line we can't parse is not a known meta
+        if (not isinstance(entry, dict)
+                or entry.get("type") not in _UNRESUMABLE_META_TYPES):
+            return True   # a message / system / unknown type -> resumable
+    return False          # empty, or every non-blank line a known-unresumable meta
+
+
 def _first_user_text(path, max_lines=500, max_bytes=None):
     """The first genuine human prompt from the START of a transcript, or None.
 
@@ -17371,8 +17425,27 @@ class SessionManager:
 
     def _session_transcript_id(self, sess):
         """Claude session id of THIS session's conversation, or None if it has
-        not had one yet. See _session_transcript_path — this is the same
-        resolution, reported as an id rather than opened as a path.
+        not had one yet OR its transcript has nothing `claude --resume` can
+        rejoin. See _session_transcript_path — the same resolution, reported as
+        an id rather than opened as a path, with one extra gate.
+
+        The extra gate is RESUMABILITY (XERK-868, extended by XERK-892). This id
+        feeds `claude --resume` on every start/resume (via _launch_tmux). Claude
+        Code creates <id>.jsonl at launch, and a session that never took a first
+        turn — or crashed after flushing only its meta lines — leaves a
+        transcript with no resumable entry (0-byte, or only mode/summary/… lines,
+        which `claude --resume` rejects with "No conversation found", killing its
+        tmux). Because the record still names that id, EVERY Start would relaunch
+        the same doomed --resume — an endless dead-tmux loop the operator cannot
+        Start out of. So an unresumable transcript is "nothing to resume" here,
+        and _launch_tmux opens a FRESH conversation instead (a survivable launch),
+        exactly as its own comment already promised. The READ surfaces keep the
+        path (an empty / meta-only scan is harmless); only the --resume id rejects
+        it.
+
+        _transcript_has_resumable_entry fails SAFE toward resumable, so a shape it
+        does not recognise still gets a resume attempt; _sweep_dead_sessions'
+        one-shot fresh relaunch is the backstop if that attempt is itself doomed.
 
         Re-validated on the way out, like _latest_transcript_id: the pinned
         branch validates the id before building a path from it, but the unpinned
@@ -17380,6 +17453,8 @@ class SessionManager:
         callers that put it on a command line."""
         path = _session_transcript_path(sess)
         if not path:
+            return None
+        if not _transcript_has_resumable_entry(path):
             return None
         sid = os.path.basename(path)[:-len(".jsonl")]
         return sid if VALID_CLAUDE_SID_RE.fullmatch(sid) else None
@@ -18923,6 +18998,15 @@ class SessionManager:
         if claude_sid:
             id_flag = "--resume"       # captured for the Windows argv path below
             parts.append(f"--resume {claude_sid}")
+            # XERK-892: a launch that ISSUES --resume can still be doomed — the
+            # pinned transcript may have no entry claude can rejoin (an
+            # unresumable shape _session_transcript_id's fail-safe predicate let
+            # through, e.g. a future meta type), so `claude --resume` exits at
+            # once and takes its tmux with it. Mark it so _sweep_dead_sessions can
+            # tell a resume that NEVER CAME UP from an ordinary crash and relaunch
+            # fresh ONCE instead of looping. Cleared the moment the tmux is seen
+            # alive, or by the fresh branch below.
+            sess["resumeRelaunch"] = True
         else:
             # Fresh conversation (spawn, restart-clear-context, or a resume with
             # nothing to resume). --session-id names its transcript up front, so
@@ -18931,6 +19015,7 @@ class SessionManager:
             claude_sid = str(uuid.uuid4())
             id_flag = "--session-id"
             parts.append(f"--session-id {claude_sid}")
+            sess.pop("resumeRelaunch", None)   # a fresh launch is never a doomed resume
         sess["claudeSessionId"] = claude_sid
         # This session now knows which conversation it is, which is the one moment
         # a ticket-backed one can be tied to its transcript. Every launch passes
@@ -22501,13 +22586,21 @@ class SessionManager:
             session launched between the listing and this scan, or one racing a
             relaunch, gets another beat before anything happens.
         The reap keeps the worktree and the transcript, exactly as `kill` does, so
-        Start resumes the conversation."""
+        Start resumes the conversation.
+
+        XERK-892 adds one exception to the reap: a session whose tmux died having
+        been RESUME-launched and NEVER seen alive (`resumeRelaunch` survived to
+        here) is a doomed `claude --resume` — the pinned transcript had nothing to
+        rejoin — so it is relaunched FRESH once rather than reported as a crash,
+        closing the dead-tmux loop for an unresumable shape _session_transcript_id's
+        fail-safe predicate did not catch."""
         live = self._live_tmux_names()
         if live is None:
             return
         for sess in list(self.registry):
             if sess.get("status") != "running":
                 sess.pop("deadTmuxStrikes", None)
+                sess.pop("resumeRelaunch", None)   # stale on a non-running record
                 continue
             # Every field is read with .get() and a missing one skips the record
             # (XERK-402): this is the BEAT, and a legacy / hand-edited / partial
@@ -22519,6 +22612,10 @@ class SessionManager:
                 continue
             if tmux in live:
                 sess.pop("deadTmuxStrikes", None)
+                # The tmux came up: a resume that reached this beat alive is not
+                # a doomed one, so it is no longer a fresh-relaunch candidate.
+                # (An ordinary later crash then reports normally.)
+                sess.pop("resumeRelaunch", None)
                 continue
             strikes = int(sess.get("deadTmuxStrikes") or 0) + 1
             sess["deadTmuxStrikes"] = strikes
@@ -22530,6 +22627,33 @@ class SessionManager:
             # tmux's raw "can't find session" text, which reads like a working
             # terminal saying something cryptic rather than a session that ended.
             self._kill_ttyd(sid)
+            # XERK-892: a RESUME launch whose tmux never came up is the doomed
+            # `claude --resume <unresumable id>` case — the pinned transcript had
+            # no entry to rejoin, so claude exited at once. (A resume that DID
+            # come up cleared this flag on its first live beat, and an ordinary
+            # crash of a once-alive session likewise cleared it.) Opening a FRESH
+            # conversation is the only survivable launch, so relaunch ONCE instead
+            # of reporting a crash the operator cannot Start out of. The fresh
+            # launch (resume=False) mints a new --session-id and clears the flag,
+            # so if it ALSO dies the next sweep reports it normally — a genuinely
+            # broken environment is never masked as an endless relaunch. Guarded:
+            # this is the beat, and a raise here takes the host down (XERK-402).
+            if sess.pop("resumeRelaunch", None):
+                log(f"session {sid}: resume launch never came up (unresumable "
+                    f"transcript?); relaunching fresh once (XERK-892)")
+                try:
+                    self.sess_state.pop(sid, None)   # fresh freshness/PR tracking
+                    self._clear_question_files(sid)  # nothing to answer in a fresh convo
+                    sess.pop("pendingInputs", None)  # queued for the gone convo (XERK-47)
+                    sess["errorMsg"] = None
+                    self._launch_tmux(sess)          # fresh --session-id, new convo
+                    self._launch_ttyd(sess)          # re-ensure the terminal
+                    self.save()
+                    continue
+                except Exception as e:
+                    log(f"session {sid}: fresh relaunch failed: {e}; "
+                        f"reporting the exit")
+                    # fall through to report the exit normally
             sess["stoppedAt"] = now_iso()
             self._set_error(
                 sess,

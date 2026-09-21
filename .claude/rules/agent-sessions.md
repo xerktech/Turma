@@ -91,6 +91,14 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
 - `_sweep_dead_sessions` runs on the beat, BEFORE the payload, and ends such a session with an
   operator-visible `errorMsg`; it reaps the orphaned ttyd first, and keeps the worktree and the
   transcript (like `kill`), so **Start resumes the conversation**.
+- **A RESUME launch that never came up is relaunched FRESH once, not reported** (XERK-892). Every
+  `--resume`-issuing launch stamps `resumeRelaunch`; the sweep clears it the moment the tmux is seen
+  alive. A tmux that dies WITHOUT ever clearing it is a doomed `claude --resume` — the pinned
+  transcript had no resumable entry (`_session_transcript_id`'s fail-safe predicate let it through:
+  a future meta type, a lone `file-history-snapshot`) — so the sweep relaunches with a fresh
+  `--session-id` (clearing the flag) instead of reporting a crash. The fresh launch's own death IS
+  reported (the flag is gone), so a broken environment is never masked as an endless relaunch. This
+  is the durable backstop under the `_session_transcript_id` gate; keep both.
 - **One `tmux list-sessions` for the WHOLE fleet** (`_live_tmux_names`) — never `has-session` per
   session, which would put `MAX_SESSIONS` timeouts on the beat.
 - **"No server" is EMPTY, not unknown.** The tmux server exits with its LAST session, so a host

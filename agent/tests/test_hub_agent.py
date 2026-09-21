@@ -20230,6 +20230,96 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
                 sm._sweep_dead_sessions()
         self.assertEqual(sm.registry[0]["status"], "running")
 
+    def test_a_doomed_resume_launch_relaunches_fresh_once(self):
+        # XERK-892: a session RESUME-launched whose tmux never came up — the
+        # `claude --resume <unresumable id>` case _session_transcript_id's
+        # fail-safe predicate let through — is relaunched FRESH instead of
+        # reported as a crash the operator cannot Start out of.
+        sm = self.make_manager()
+        sess = self._sess(resumeRelaunch=True)
+        sm.registry = [sess]
+        relaunched = []
+        sm._launch_tmux = lambda s, **kw: relaunched.append(("tmux", kw))
+        sm._launch_ttyd = lambda s: relaunched.append(("ttyd",))
+        for _ in range(ha.DEAD_TMUX_STRIKES):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "running")          # NOT reaped to error
+        self.assertIsNone(sess.get("errorMsg"))
+        self.assertNotIn("resumeRelaunch", sess)             # consumed -> only once
+        self.assertEqual([r[0] for r in relaunched], ["tmux", "ttyd"])
+        self.assertFalse(relaunched[0][1].get("resume"),
+                         "the relaunch must be FRESH, never another --resume")
+        self.assertEqual(sm.killed_ttyd, ["s1"])             # orphan ttyd reaped first
+
+    def test_a_resume_seen_alive_then_dead_is_reported_not_relaunched(self):
+        # A resume that came up is not doomed: the alive beat clears the
+        # relaunch candidacy, so a LATER crash reports normally.
+        sm = self.make_manager()
+        sess = self._sess(resumeRelaunch=True)
+        sm.registry = [sess]
+        relaunched = []
+        sm._launch_tmux = lambda s, **kw: relaunched.append(kw)
+        sm._launch_ttyd = lambda s: None
+        with mock.patch.object(ha.SessionManager, "_live_tmux_names",
+                               lambda self: {"agent-dead"}):
+            sm._sweep_dead_sessions()                        # seen alive -> cleared
+        self.assertNotIn("resumeRelaunch", sess)
+        for _ in range(ha.DEAD_TMUX_STRIKES):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "error")
+        self.assertEqual(relaunched, [])
+
+    def test_a_fresh_relaunch_that_also_dies_is_reported(self):
+        # Relaunch-once: the fresh launch clears the flag, so if it never comes up
+        # either the next reap reports the exit — a broken environment is never
+        # masked as an endless relaunch.
+        sm = self.make_manager()
+        sess = self._sess(resumeRelaunch=True)
+        sm.registry = [sess]
+        sm._launch_tmux = lambda s, **kw: None   # "relaunches" but stays dead
+        sm._launch_ttyd = lambda s: None
+        for _ in range(ha.DEAD_TMUX_STRIKES):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "running")          # relaunched, not reaped
+        self.assertNotIn("resumeRelaunch", sess)
+        for _ in range(ha.DEAD_TMUX_STRIKES):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "error")            # now reported
+
+    def test_a_failed_fresh_relaunch_falls_through_to_the_error(self):
+        # If the relaunch itself raises, the reap must still report the exit
+        # (never leave a doomed session reading running forever) and never raise
+        # onto the beat.
+        sm = self.make_manager()
+        sess = self._sess(resumeRelaunch=True)
+        sm.registry = [sess]
+        sm._launch_tmux = mock.Mock(side_effect=RuntimeError("boom"))
+        sm._launch_ttyd = lambda s: None
+        for _ in range(ha.DEAD_TMUX_STRIKES):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "error")
+        self.assertNotIn("resumeRelaunch", sess)
+
+    def test_a_non_resume_dead_session_is_reported_as_before(self):
+        # A session with no resumeRelaunch flag (a fresh spawn, or a resume that
+        # once ran) keeps the original XERK-868 behavior: reap to error.
+        sm = self.make_manager()
+        sess = self._sess()                                  # no resumeRelaunch
+        sm.registry = [sess]
+        called = []
+        sm._launch_tmux = lambda s, **kw: called.append(kw)
+        for _ in range(ha.DEAD_TMUX_STRIKES):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "error")
+        self.assertEqual(called, [], "a non-resume death must not relaunch")
+
+    def test_a_live_tmux_clears_the_resume_relaunch_flag(self):
+        sm = self.make_manager()
+        sess = self._sess(tmuxName="agent-alive", resumeRelaunch=True)
+        sm.registry = [sess]
+        sm._sweep_dead_sessions()
+        self.assertNotIn("resumeRelaunch", sess)
+
     def test_the_sweep_never_raises_onto_the_beat(self):
         # run_forever is the manager's MAIN process: a KeyError here takes every
         # session on the host down. Legacy / hand-edited / partial
@@ -20532,6 +20622,87 @@ class TestFirstUserText(unittest.TestCase):
         self.assertIsNone(ha._first_user_text(path, max_lines=5))
 
 
+class TestTranscriptResumable(unittest.TestCase):
+    """XERK-892: _transcript_has_resumable_entry decides whether a transcript
+    holds anything `claude --resume` can rejoin. The shapes below were verified
+    against real Claude Code 2.1.x: a 0-byte / mode-only / summary-only / all-meta
+    transcript exits "No conversation found"; one with a user turn resumes. The
+    predicate FAILS SAFE toward resumable (an unrecognised or unreadable shape
+    reads True) — misclassifying a live conversation as unresumable would abandon
+    it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="resumable-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _write(self, *lines):
+        path = os.path.join(self.tmp, "t.jsonl")
+        with open(path, "w") as f:
+            f.write("".join(lines))
+        return path
+
+    def _line(self, obj):
+        return json.dumps(obj) + "\n"
+
+    def test_zero_byte_transcript_is_not_resumable(self):
+        self.assertFalse(ha._transcript_has_resumable_entry(self._write("")))
+
+    def test_blank_lines_only_is_not_resumable(self):
+        self.assertFalse(ha._transcript_has_resumable_entry(self._write("\n\n  \n")))
+
+    def test_mode_only_is_not_resumable(self):
+        p = self._write(self._line({"type": "mode", "mode": "normal"}))
+        self.assertFalse(ha._transcript_has_resumable_entry(p))
+
+    def test_summary_only_is_not_resumable(self):
+        p = self._write(self._line({"type": "summary", "summary": "x"}))
+        self.assertFalse(ha._transcript_has_resumable_entry(p))
+
+    def test_all_meta_is_not_resumable(self):
+        # The four header lines Claude Code writes before the first turn.
+        p = self._write(
+            self._line({"type": "custom-title", "customTitle": "T"}),
+            self._line({"type": "agent-name", "agentName": "T"}),
+            self._line({"type": "mode", "mode": "normal"}),
+            self._line({"type": "permission-mode", "permissionMode": "auto"}))
+        self.assertFalse(ha._transcript_has_resumable_entry(p))
+
+    def test_a_user_turn_after_meta_is_resumable(self):
+        p = self._write(
+            self._line({"type": "mode", "mode": "normal"}),
+            self._line({"type": "user", "message": {"role": "user",
+                                                    "content": "hello"}}))
+        self.assertTrue(ha._transcript_has_resumable_entry(p))
+
+    def test_a_lone_user_turn_is_resumable(self):
+        p = self._write(self._line({"type": "user",
+                                    "message": {"role": "user", "content": "hi"}}))
+        self.assertTrue(ha._transcript_has_resumable_entry(p))
+
+    def test_an_unknown_type_is_treated_as_resumable(self):
+        # Fail-safe: a `type` not in the known-unresumable set (e.g. a future meta
+        # type, or a file-history-snapshot) reads resumable — _sweep_dead_sessions
+        # is the backstop if it turns out claude still can't resume it.
+        p = self._write(
+            self._line({"type": "mode", "mode": "normal"}),
+            self._line({"type": "file-history-snapshot", "snapshot": {}}))
+        self.assertTrue(ha._transcript_has_resumable_entry(p))
+
+    def test_an_unparseable_nonblank_line_is_treated_as_resumable(self):
+        p = self._write(self._line({"type": "mode"}), "{not valid json\n")
+        self.assertTrue(ha._transcript_has_resumable_entry(p))
+
+    def test_a_nondict_json_line_is_treated_as_resumable(self):
+        # A bare array / number is not a known meta line -> err toward resumable.
+        p = self._write(self._line({"type": "mode"}), "[1, 2, 3]\n")
+        self.assertTrue(ha._transcript_has_resumable_entry(p))
+
+    def test_an_unreadable_file_is_treated_as_resumable(self):
+        # A transient read error must NEVER abandon a possibly-real conversation.
+        self.assertTrue(ha._transcript_has_resumable_entry(
+            os.path.join(self.tmp, "does-not-exist.jsonl")))
+
+
 class TestRootSessionIsolation(ManagerMixin, unittest.TestCase):
     """XERK-6: a fresh root session must not open onto the previous one's chat.
 
@@ -20696,6 +20867,44 @@ class TestRootSessionIsolation(ManagerMixin, unittest.TestCase):
         self.assertEqual(rec_a["transcriptId"], a["claudeSessionId"])
         rec_b = next(c for c in sm.closed if c["id"] == b["id"])
         self.assertEqual(rec_b["transcriptId"], b["claudeSessionId"])
+
+    def test_resuming_a_session_with_a_meta_only_transcript_starts_fresh(self):
+        # XERK-892: a >0-byte transcript with no resumable entry (only meta /
+        # summary lines) is as doomed to `claude --resume` as a 0-byte one — it
+        # exits "No conversation found" and kills its tmux, and because the record
+        # still names the id EVERY Start relaunches the same doomed --resume. The
+        # pinned transcript must read as NOT resumable, so resume opens a FRESH
+        # conversation (a survivable launch) instead of looping.
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        pinned = a["claudeSessionId"]
+        meta = os.path.join(self.proj, f"{pinned}.jsonl")
+        with open(meta, "w") as f:                       # >0 bytes, no real turn
+            f.write(json.dumps({"type": "mode", "mode": "normal"}) + "\n")
+            f.write(json.dumps({"type": "summary", "summary": "x"}) + "\n")
+        self.assertGreater(os.path.getsize(meta), 0)
+        # The READ surfaces keep the path (an empty/meta scan is harmless); only
+        # the --resume id resolver rejects it.
+        self.assertEqual(ha._session_transcript_path(a), meta)
+        self.assertIsNone(sm._session_transcript_id(a))
+        sm.kill(a["id"])
+
+        sm.resume(a["id"])
+        cmd = [c[-1] for c in self.run_ok_calls if "new-session" in c][-1]
+        self.assertNotIn(f"--resume {pinned}", cmd,
+                         "a meta-only transcript must not be resumed into a crash")
+        self.assertIn("--session-id", cmd)               # a fresh conversation
+
+    def test_killing_a_session_with_a_meta_only_transcript_records_no_id(self):
+        # Consistent with the resume gate: an Ended-sessions card has nothing to
+        # reopen from a transcript with no conversation in it.
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        with open(os.path.join(self.proj, f"{a['claudeSessionId']}.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "mode"}) + "\n")
+        sm.kill(a["id"])
+        rec = next(c for c in sm.closed if c["id"] == a["id"])
+        self.assertIsNone(rec["transcriptId"])
 
     def test_restart_moves_a_root_session_to_a_fresh_conversation(self):
         # "Restart (clear context)" means a new conversation, and the session has
