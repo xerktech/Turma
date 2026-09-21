@@ -24,6 +24,15 @@ moves between agents and how a refused start is reported.
 - **A pinned session with no transcript on disk resolves to nothing.** Never add a newest-mtime
   fallback — an empty conversation before the first turn is the truth. A session from an agent
   predating the pin carries no id and keeps the newest-mtime rule.
+- **An EMPTY (0-byte) transcript is not RESUMABLE, though it still resolves as a read path**
+  (XERK-868 follow-up). Claude Code creates `<id>.jsonl` at launch; a session that never took a first
+  turn leaves it 0 bytes. `_session_transcript_path` keeps returning its path (tail/history/pending
+  scan an empty file harmlessly), but `_session_transcript_id` — the ONLY caller that feeds `claude
+  --resume` (via `_launch_tmux`) — gates on `getsize > 0` and returns None, so a resume opens a FRESH
+  conversation. Without that gate `claude --resume <empty id>` exits "No conversation found", killing
+  its tmux, and because the record still names the id EVERY Start relaunches the same doomed
+  `--resume` — an endless failure loop `_sweep_dead_sessions` reports as a crash. Keep the emptiness
+  gate on the resume-id resolver, not on the shared path resolver.
 - A watch is sent once and held, so `rearmMovedWatches` re-sends it when a watched session's
   `transcriptId` moves. Only "Restart (clear context)" moves it; without the re-arm that session's
   chat freezes on the pre-restart conversation.

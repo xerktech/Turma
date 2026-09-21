@@ -8043,7 +8043,12 @@ def _pinned_transcript_path(workdir, claude_sid):
     --resume id otherwise), and Claude Code names the transcript after it, so
     the file is <claude_sid>.jsonl under the cwd's project slug. None when the
     session predates the pin (no id) or claude hasn't written its first entry
-    yet — see _session_transcript_path for why that is NOT a fallback."""
+    yet — see _session_transcript_path for why that is NOT a fallback.
+
+    A 0-byte transcript still resolves to its PATH here: the read surfaces
+    (tail/history/pending-scan) scan it harmlessly (it yields nothing). Whether
+    it is RESUMABLE is a separate question, answered in _session_transcript_id,
+    which is the only caller that must not hand an empty id to `claude --resume`."""
     if not claude_sid or not VALID_CLAUDE_SID_RE.fullmatch(claude_sid):
         return None
     path = os.path.join(PROJECTS_ROOT, _project_slug(workdir),
@@ -17371,8 +17376,21 @@ class SessionManager:
 
     def _session_transcript_id(self, sess):
         """Claude session id of THIS session's conversation, or None if it has
-        not had one yet. See _session_transcript_path — this is the same
-        resolution, reported as an id rather than opened as a path.
+        not had one yet OR its transcript is empty. See _session_transcript_path
+        — this is the same resolution, reported as an id rather than opened as a
+        path, with one extra gate.
+
+        The extra gate is EMPTINESS (XERK-868 follow-up). Claude Code creates
+        <id>.jsonl at launch, but a session that never took a first turn leaves
+        it 0 bytes. This id feeds `claude --resume` on every start/resume (via
+        _launch_tmux), and `claude --resume <empty id>` exits at once with "No
+        conversation found" — killing its tmux, which _sweep_dead_sessions then
+        reports as a crash. Because the record still names that id, EVERY Start
+        relaunches the same doomed --resume: an endless failure loop the operator
+        cannot Start out of. So an empty transcript is "nothing to resume" here,
+        and _launch_tmux opens a FRESH conversation instead (a survivable launch),
+        exactly as its own comment already promised. The read surfaces keep the
+        path (an empty scan is harmless); only the --resume id must reject it.
 
         Re-validated on the way out, like _latest_transcript_id: the pinned
         branch validates the id before building a path from it, but the unpinned
@@ -17380,6 +17398,13 @@ class SessionManager:
         callers that put it on a command line."""
         path = _session_transcript_path(sess)
         if not path:
+            return None
+        # getsize, not exists: an empty transcript is not resumable (above); the
+        # OSError guard absorbs the file vanishing between resolution and here.
+        try:
+            if os.path.getsize(path) <= 0:
+                return None
+        except OSError:
             return None
         sid = os.path.basename(path)[:-len(".jsonl")]
         return sid if VALID_CLAUDE_SID_RE.fullmatch(sid) else None
