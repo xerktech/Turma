@@ -47,7 +47,10 @@
 
   /* ---- Left sidebar: new-session picker, active list, ended list ----------- */
   .sidebar {
-    width: 340px; flex: none; border-right: 1px solid var(--hairline);
+    /* Sized so a session card's PR row fits four 3-digit chips before wrapping
+       (was 340px = three). Only applies above the 820px breakpoint, where the
+       sidebar goes full-width. */
+    width: 420px; flex: none; border-right: 1px solid var(--hairline);
     overflow-y: auto; padding: 14px 14px 24px; display: flex; flex-direction: column; gap: 6px;
     scrollbar-width: thin;
   }
