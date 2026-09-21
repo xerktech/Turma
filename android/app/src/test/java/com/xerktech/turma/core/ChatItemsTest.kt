@@ -179,6 +179,114 @@ class ChatItemsTest {
         assertTrue(verbose.any { it is ChatItem.Thinking })
     }
 
+    // ---- XERK-860: Concise drops / Normal folds+carries / Verbose shows ------
+    //
+    // The web twin is chat.test.js "XERK-860: Concise drops thinking, Normal folds
+    // it EXPANDABLY, Verbose expands it". Hidden thinking used to render as nothing
+    // at all here, so an elided turn read as a quiet one next to the terminal
+    // (which always shows the trace). The three presets now treat it three ways:
+    // Concise drops it (no marker, no trace); Normal folds a run into ONE marker
+    // that CARRIES the traces (expandable in the UI); Verbose shows the traces.
+
+    private fun folds(items: List<ChatItem>) = items.filterIsInstance<ChatItem.FoldedThoughts>()
+
+    @Test fun `normal folds hidden thinking into a marker that CARRIES the trace`() {
+        val e = TailEntry(id = "a1", role = "assistant",
+            blocks = listOf(ThinkingBlock("SECRET-TRACE"), TextBlock("done")))
+        val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
+        // Counted, and carrying the trace so the UI can reveal it in place.
+        val fold = folds(items).single()
+        assertEquals(1, fold.count)
+        assertEquals("SECRET-TRACE", fold.thoughts.single().text)
+        assertTrue(items.none { it is ChatItem.Thinking })
+        // The rest of the turn still renders, AFTER the marker (web order).
+        assertEquals("done", items.filterIsInstance<ChatItem.Bubble>().single().text)
+        assertTrue(items.indexOfFirst { it is ChatItem.FoldedThoughts } <
+            items.indexOfFirst { it is ChatItem.Bubble })
+    }
+
+    @Test fun `concise drops hidden thinking entirely — no marker, no trace`() {
+        val e = TailEntry(id = "a1", role = "assistant",
+            blocks = listOf(ThinkingBlock("SECRET-TRACE"), TextBlock("done")))
+        val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.CONCISE))
+        assertTrue("Concise shows no marker", folds(items).isEmpty())
+        assertTrue("and no shown trace", items.none { it is ChatItem.Thinking })
+        assertEquals("done", items.filterIsInstance<ChatItem.Bubble>().single().text)
+    }
+
+    @Test fun `two consecutive hidden thoughts fold into one marker, in order`() {
+        val e = TailEntry(id = "a2", role = "assistant",
+            blocks = listOf(ThinkingBlock("x"), ThinkingBlock("y"), TextBlock("ok")))
+        val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
+        assertEquals(listOf("x", "y"), folds(items).single().thoughts.map { it.text })
+    }
+
+    @Test fun `verbose reveals the trace and drops the folded marker`() {
+        val e = TailEntry(id = "a3", role = "assistant",
+            blocks = listOf(ThinkingBlock("SECRET-TRACE"), TextBlock("done")))
+        val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.VERBOSE))
+        assertEquals("SECRET-TRACE", items.filterIsInstance<ChatItem.Thinking>().single().text)
+        assertTrue("nothing is hidden once shown", folds(items).isEmpty())
+    }
+
+    @Test fun `a shown tool between two hidden thoughts breaks the fold run`() {
+        // NORMAL shows tool cards, so the tool is an item that ends the run — the
+        // two thoughts do NOT fold together (would be one "2 thoughts" marker).
+        val items = buildItems(
+            listOf(
+                TailEntry(id = "a4", role = "assistant", blocks = listOf(
+                    ThinkingBlock("before"),
+                    ToolUseBlock(id = "t1", name = "Bash"),
+                    ThinkingBlock("after"),
+                )),
+                TailEntry(id = "r1", role = "user", blocks = listOf(ToolResultBlock(forId = "t1", text = "out"))),
+            ),
+            VerbosityPrefs.forPreset(Verbosity.NORMAL),
+        )
+        assertEquals(listOf(1, 1), folds(items).map { it.count })
+        assertEquals(1, items.filterIsInstance<ChatItem.Tool>().size)
+    }
+
+    @Test fun `a HIDDEN tool still breaks a fold run`() {
+        // A custom verbosity where thinking FOLDS but tool CARDS are hidden
+        // (outputs on, calls off). The web keeps a tool_use as an item regardless
+        // of whether its card renders, so it still ends the run — two separate
+        // "1 thought" markers, never a merged "2".
+        val items = buildItems(
+            listOf(
+                TailEntry(id = "a5", role = "assistant", blocks = listOf(
+                    ThinkingBlock("before"),
+                    ToolUseBlock(id = "t1", name = "Bash"),
+                    ThinkingBlock("after"),
+                )),
+                TailEntry(id = "r1", role = "user", blocks = listOf(ToolResultBlock(forId = "t1", text = "out"))),
+            ),
+            VerbosityPrefs(thinking = false, toolCalls = false, toolOutputs = true),
+        )
+        assertEquals(listOf(1, 1), folds(items).map { it.count })
+        assertTrue("the tool card itself stays hidden", items.none { it is ChatItem.Tool })
+    }
+
+    @Test fun `a run of hidden thoughts folds across entry boundaries`() {
+        val items = buildItems(
+            listOf(
+                TailEntry(id = "e1", role = "assistant", blocks = listOf(ThinkingBlock("a"))),
+                TailEntry(id = "e2", role = "assistant", blocks = listOf(ThinkingBlock("b"), TextBlock("done"))),
+            ),
+            VerbosityPrefs.forPreset(Verbosity.NORMAL),
+        )
+        assertEquals(listOf("a", "b"), folds(items).single().thoughts.map { it.text })
+        assertEquals("done", items.filterIsInstance<ChatItem.Bubble>().single().text)
+    }
+
+    @Test fun `a turn ending in hidden thinking still shows the marker`() {
+        val e = TailEntry(id = "e1", role = "assistant",
+            blocks = listOf(TextBlock("hi"), ThinkingBlock("bye")))
+        val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
+        assertEquals("hi", (items.first() as ChatItem.Bubble).text)
+        assertEquals("bye", (items.last() as ChatItem.FoldedThoughts).thoughts.single().text)
+    }
+
     @Test fun `text-only entry with no blocks becomes a bubble`() {
         val e = TailEntry(id = "e3", role = "user", text = "hello")
         val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
