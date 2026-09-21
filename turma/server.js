@@ -7033,8 +7033,21 @@ function jiraHostPool(siteKey, requireOnline) {
 // rotating: the read paths
 // cache per host (createMeta, createTypes, jiraIssues), so spreading reads would
 // just multiply cache misses. Writes use pickBoardWriteHost below.
-function findJiraHost(siteKey, requireOnline) {
-  return jiraHostPool(siteKey, requireOnline)[0] || null;
+//
+// `kind` (XERK-151) is the READ-path twin of pickBoardWriteHost's capability
+// exclusion: given one, prefer the first host in the ranked pool that has NOT
+// PROVEN it can't run that command, so a New-ticket meta read routes AROUND a
+// too-old sibling to a capable one instead of refusing at the head. It stays
+// STICKY (returns the first ABLE host, never a rotating one), so the per-host
+// cache still holds. When EVERY covering host is gapped, it falls back to the
+// head — the caller then reaches the honest "agent too old" refusal.
+function findJiraHost(siteKey, requireOnline, kind) {
+  const pool = jiraHostPool(siteKey, requireOnline);
+  if (kind) {
+    const able = pool.find((k) => !agentGapError(agents[k], kind, ""));
+    if (able) return able;
+  }
+  return pool[0] || null;
 }
 
 // Which HOST should run a board WRITE (create a ticket, change a status) for an
@@ -17270,7 +17283,10 @@ const server = http.createServer(async (req, res) => {
         parts.length === 4 && parts[3] === "create-meta") {
       const siteKey = decodeURIComponent(parts[2]);
       const project = (url.searchParams.get("project") || "").trim();
-      const key = findJiraHost(siteKey, true);
+      // Route around a host that has PROVEN it can't offer the New-ticket options
+      // (XERK-151) to a capable sibling of the same org, rather than refusing at
+      // the too-old head while another host could answer.
+      const key = findJiraHost(siteKey, true, "boardCreateMeta");
       if (!key) {
         return findJiraHost(siteKey, false)
           ? json(res, 503, { error: "no online host reports that org" })

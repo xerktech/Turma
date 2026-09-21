@@ -6757,6 +6757,58 @@ test("http: a boardCreateMeta that DID stage its result asserts no gap", async (
   assert.deepEqual(res.body.projects, [{ key: "ENG", name: "Eng" }]);
 });
 
+test("http: New-ticket meta routes AROUND a too-old host to a capable sibling", async () => {
+  const site = "gaproute.atlassian.net";
+  // The too-old host beats FIRST, so it is the head of the org's pool and the
+  // create-meta read lands on it (both hosts online + available, so ties keep
+  // insertion order).
+  await jiraBeat("gaproute-old", site, { agentVersion: "2.0.48" });
+  await jiraBeat("gaproute-new", site, { agentVersion: "2.1.0" });
+
+  // Prove the gap on the head: queue, deliver, then ack with no result.
+  const first = await request("GET", `/api/jira/${site}/create-meta`, { headers: userHeaders });
+  assert.equal(first.status, 202);
+  await jiraBeat("gaproute-old", site, { agentVersion: "2.0.48" }); // deliver the command
+  await ackBeat("gaproute-old", site, [first.body.cmdId], { agentVersion: "2.0.48" });
+
+  // The next read must NOT refuse: it routes to the capable sibling and queues a
+  // fetch there, instead of returning the head's "too old" error.
+  const res = await request("GET", `/api/jira/${site}/create-meta`, { headers: userHeaders });
+  assert.equal(res.status, 202, "should route around the gapped head to the capable host");
+  assert.equal(res.body.error, undefined);
+  assert.ok(res.body.cmdId);
+
+  // The queued fetch lands on the capable host, never the gapped one.
+  const newBeat = await jiraBeat("gaproute-new", site, { agentVersion: "2.1.0" });
+  assert.ok((newBeat.body.commands || []).some((c) => c.type === "boardCreateMeta"),
+    "the capable host receives the boardCreateMeta command");
+  const oldBeat = await jiraBeat("gaproute-old", site, { agentVersion: "2.0.48" });
+  assert.deepEqual(oldBeat.body.commands, [], "the gapped host is not queued again");
+});
+
+test("http: New-ticket meta still refuses when EVERY host of the org is too old", async () => {
+  const site = "gapall.atlassian.net";
+  await jiraBeat("gapall-a", site, { agentVersion: "2.0.48" });
+  await jiraBeat("gapall-b", site, { agentVersion: "2.0.48" });
+
+  // Gap both hosts. Each read picks the first ABLE host; once one is gapped the
+  // read falls to the other, so two rounds gap both.
+  for (let round = 0; round < 2; round++) {
+    const q = await request("GET", `/api/jira/${site}/create-meta`, { headers: userHeaders });
+    assert.equal(q.status, 202);
+    // Deliver to whichever host took it, then ack empty (the cmdId's owning host
+    // settles; the other ack is a harmless no-op).
+    await jiraBeat("gapall-a", site, { agentVersion: "2.0.48" });
+    await jiraBeat("gapall-b", site, { agentVersion: "2.0.48" });
+    await ackBeat("gapall-a", site, [q.body.cmdId], { agentVersion: "2.0.48" });
+    await ackBeat("gapall-b", site, [q.body.cmdId], { agentVersion: "2.0.48" });
+  }
+
+  const res = await request("GET", `/api/jira/${site}/create-meta`, { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.match(res.body.error, /too old to offer the New-ticket options/);
+});
+
 test("http: the per-project type fetch proves its gap on its own project", async () => {
   await jiraBeat("gap3", "gap3.atlassian.net", { agentVersion: "0.5.38" });
   const q = await request("GET", "/api/jira/gap3.atlassian.net/create-meta?project=ENG", { headers: userHeaders });
