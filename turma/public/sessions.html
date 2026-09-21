@@ -1000,8 +1000,14 @@
   /* Live agent-mode (left) / model (right) selectors under the text box; the
      ticket chip and PR status chip (when present) ride just left of the model on
      the right — the ticket the work came from, then the PR it went to. */
-  .chat-compose-opts { display: flex; justify-content: space-between; gap: 8px; }
-  .cc-right { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  /* The footer wraps rather than overlapping (a session with many PR chips used
+     to stack the PR badges into a tall block that the context/ticket chips drew
+     on top of). The mode chip stays left; the right cluster grows to fill the
+     rest and wraps its own chips onto extra rows, right-aligned, when crowded. */
+  .chat-compose-opts { display: flex; justify-content: space-between; align-items: center;
+    gap: 6px 8px; flex-wrap: wrap; }
+  .cc-right { display: flex; align-items: center; justify-content: flex-end; gap: 6px 8px;
+    min-width: 0; flex: 1 1 auto; flex-wrap: wrap; }
   .cc-right .pr-badge { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
   .cc-pr { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
   .cc-ticket { display: flex; align-items: center; min-width: 0; }
