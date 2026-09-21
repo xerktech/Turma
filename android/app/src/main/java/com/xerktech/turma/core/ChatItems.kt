@@ -86,7 +86,7 @@ sealed interface ChatItem {
     /**
      * A run of consecutive thinking traces the NORMAL verbosity hides, folded
      * into ONE muted, counted, EXPANDABLE marker (XERK-860) — the web's
-     * `💭 n thought(s) hidden` (chat.js `renderFoldedThoughts`), which glasses
+     * `💭 n thought(s)` (chat.js `renderFoldedThoughts`), which glasses
      * renders through the same vendored engine. Hidden thinking used to render
      * as NOTHING here: next to the terminal — which always shows the trace — an
      * elided turn read as a quiet one, with no signal that anything was cut.

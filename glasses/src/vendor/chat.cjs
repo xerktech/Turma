@@ -1579,7 +1579,7 @@
   // the one that signposts-and-reveals.)
   function renderFoldedThoughts(run) {
     const key = "thf:" + run[0].id;
-    const label = run.length === 1 ? "1 thought hidden" : run.length + " thoughts hidden";
+    const label = run.length === 1 ? "1 thought" : run.length + " thoughts";
     return '<details class="thought folded" data-dkey="' + esc(key) + '" data-uuid="' + esc(run[0].id) + '"' + openAttr(key, false) +
       "><summary>💭 " + esc(label) + "</summary>" + run.map(thoughtBody).join("") + "</details>";
   }

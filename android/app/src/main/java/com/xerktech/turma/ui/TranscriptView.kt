@@ -175,7 +175,7 @@ private fun TranscriptThinking(text: String, clipped: Boolean = false) {
 
 /**
  * A run of thinking traces the NORMAL verbosity hides, shown as ONE muted,
- * counted, EXPANDABLE marker (XERK-860) — the web's `💭 n thought(s) hidden`
+ * counted, EXPANDABLE marker (XERK-860) — the web's `💭 n thought(s)`
  * (chat.js `renderFoldedThoughts`, a collapsed `<details>` carrying the traces).
  * Quieter than a Verbose trace card and COLLAPSED by default; a tap reveals the
  * run's traces in place, so the reader reaches them without changing the whole
@@ -185,7 +185,7 @@ private fun TranscriptThinking(text: String, clipped: Boolean = false) {
 @Composable
 private fun TranscriptFoldedThoughts(item: ChatItem.FoldedThoughts) {
     var open by remember { mutableStateOf(false) }
-    val label = if (item.count == 1) "1 thought hidden" else "${item.count} thoughts hidden"
+    val label = if (item.count == 1) "1 thought" else "${item.count} thoughts"
     val parsed = remember(item) { item.thoughts.map { parseProse(it.text) } }
     Column(Modifier.fillMaxWidth().clickable { open = !open }) {
         Text(

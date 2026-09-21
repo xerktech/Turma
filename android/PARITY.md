@@ -981,7 +981,7 @@ those are marked `[MODEL]`.
     hidden at the default verbosity while the terminal always shows it, so an elided turn read as a
     quiet one. The three presets treat it three ways (`core/ChatItems.kt` `ThoughtDisplay`, web parity
     with `chat.js` `thoughtDisplay`): **Concise** drops it entirely (no marker, no trace); **Normal**
-    folds a run of consecutive thoughts into ONE muted, counted, EXPANDABLE `💭 n thought(s) hidden`
+    folds a run of consecutive thoughts into ONE muted, counted, EXPANDABLE `💭 n thought(s)`
     marker that CARRIES the traces (`ChatItem.FoldedThoughts` + `ui/TranscriptView.kt`
     `TranscriptFoldedThoughts`, collapsed by default, a tap reveals them in place); **Verbose** shows
     the traces expanded by default (`TranscriptThinking` now defaults open, matching the web's

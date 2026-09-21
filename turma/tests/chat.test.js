@@ -470,13 +470,13 @@ test("XERK-860: Concise drops thinking, Normal folds it EXPANDABLY, Verbose expa
 
   // Concise (the minimal reading view): nothing at all — no marker, no trace.
   const concise = withVerbosity("concise", () => itemsToHtml(buildItems(entries)));
-  assert.ok(!/thought hidden/.test(concise), "Concise shows no marker");
+  assert.ok(!/class="thought folded"/.test(concise), "Concise shows no marker");
   assert.ok(!concise.includes("SECRET-TRACE"), "Concise carries no trace");
   assert.match(concise, /done/, "the rest of the turn still renders");
 
   // Normal: a counted marker that CARRIES the trace, COLLAPSED (expandable).
   const normal = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
-  assert.match(normal, /1 thought hidden/, "Normal signposts the elision");
+  assert.match(normal, /💭 1 thought<\/summary>/, "Normal signposts the elision (no 'hidden' in the label)");
   assert.match(normal, /class="thought folded"/, "as an expandable <details>");
   assert.ok(!/<details class="thought folded"[^>]* open>/.test(normal),
     "collapsed by default — the trace is hidden until the reader opens it");
@@ -488,12 +488,12 @@ test("XERK-860: Concise drops thinking, Normal folds it EXPANDABLY, Verbose expa
     id: "a2", role: "assistant",
     blocks: [{ t: "thinking", text: "x" }, { t: "thinking", text: "y" }, { t: "text", text: "ok" }],
   }])));
-  assert.match(two, /2 thoughts hidden/);
+  assert.match(two, /💭 2 thoughts<\/summary>/);
 
   // Verbose: the trace, expanded by default — raising verbosity reveals it.
   const shown = withVerbosity("verbose", () => itemsToHtml(buildItems(entries)));
   assert.match(shown, /SECRET-TRACE/, "verbose renders the trace");
-  assert.ok(!/thought hidden/.test(shown), "nothing is 'hidden' once it is shown");
+  assert.ok(!/class="thought folded"/.test(shown), "no folded marker once it is shown");
   assert.match(shown, /<details class="thought"[^>]* open>/, "expanded by default");
 });
 
