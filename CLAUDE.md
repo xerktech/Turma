@@ -27,7 +27,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `windows-agent.md` | `agent/hub-agent.py` | native Windows portability: paths, %APPDATA%, icacls ACL, liveness/degradation (XERK-670); ADR `docs/windows-agent-adr.md` |
 | `windows-launcher.md` | `agent/native/windows/**` | native Windows launcher (turma-agent.ps1, XERK-669) + service/control surface (turma-agent.xml, turma-agentctl.ps1, XERK-671) + installer (install.ps1, XERK-672) + `irm\|iex` bootstrap (bootstrap.ps1, XERK-673) + self-updater (turma-agent-update.ps1, XERK-674): WinSW unit, start/stop/restart/status/logs, session-preserving restart, pidfile, the update poller + payload swap, windows asset name/component seam |
 | `windows-terminal.md` | `agent/win/**` | native Windows terminal layer (XERK-668): the ttyd drop-in pty-host; rationale in `docs/windows-agent-adr.md` |
-| `turma.md` | `turma/**` | chrome, org filter, dashboard, notifications, auth |
+| `turma.md` | `turma/**` | chrome, org filter, org binding, dashboard, terminal proxy, auth |
 | `turma-archive.md` | `turma/archive.js` | durable archive: layers, size ceilings, how the total is measured |
 | `turma-ha-archive.md` | `turma/blobstore.js`, `turma/archive-mirror.js`, `turma/index-store.js` | HA archive of-record (XERK-759/780/793): object-store bytes + Postgres index of-record; under HA the local node:sqlite is RETIRED for an in-memory session map (hydrated from PG) + PG-direct search, the mirror/hydrate seam |
 | `turma-ha-postgres.md` | `turma/pgclient.js` | HA Postgres of-record spine (XERK-776): stdlib v3 wire client + SCRAM-SHA-256 + extended query + pool + GREATEST upsert; consumed by the ledger (XERK-779) + archive index (XERK-780) of-records; non-HA returns null |
@@ -38,6 +38,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `turma-oidc.md` | `turma/server.js` | OIDC relying-party core: code+PKCE, discovery, JWKS RS256, session cookie, RP-logout |
 | `turma-break-glass.md` | `turma/server.js`, `turma/public/login.html` | IdP-independent break-glass local login; invariants a mandatory-OIDC change must keep |
 | `turma-usage.md` | `turma/public/usage.html`, `usage-ledger.js` | token chart, durable ledger, sub-agent split, limit cards, ingest coercions |
+| `turma-notifications.md` | `turma/server.js`, `turma/push.js` | FCM alerts, one-alert-per-work rule, runaway spend (XERK-310), Claude login alerts, `notify()`/`push.js`, dismiss, `pushEnabled` |
 | `turma-board.md` | `turma/public/board.*` | Kanban, ticket panel, routing, auto-start/stop |
 | `turma-triage.md` | `turma/public/board.*`, `turma/server.js` | Triage lane, per-ticket verdicts, org triage policy, auto-start gate |
 | `turma-ticket-queue.md` | `turma/server.js`, `board.*` | hub ticket queue: admission, drain, expiries, caps |
