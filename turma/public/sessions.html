@@ -1127,30 +1127,50 @@
   }
   /* Click-to-zoom lightbox for chat images (XERK-221 previews + inline ![](…)).
      A rendered image carries a zoom-in cursor; clicking it opens #imgLightbox,
-     a fixed full-viewport overlay showing the image at natural size (capped to
-     the viewport, scrollable when larger), an ✕ close button top-right, and a
-     dark backdrop that also closes on click. Only shown while `.open`. */
+     a fixed full-viewport overlay showing the image fit-to-screen over a dark
+     backdrop. The image can be zoomed with the +/− toolbar, the mouse wheel
+     (anchored at the cursor) or double-click, and panned by dragging when
+     zoomed; an ✕ button (top-right), Esc and a backdrop click all close it.
+     The zoom/pan live in a CSS transform on the image. Only shown while
+     `.open`. */
   .md-img { cursor: zoom-in; }
   .img-lightbox {
     position: fixed; inset: 0; z-index: 2000; display: none;
     align-items: center; justify-content: center;
-    background: rgba(0, 0, 0, 0.86); overflow: auto; padding: 24px;
-    overscroll-behavior: contain; }
+    background: rgba(0, 0, 0, 0.86); overflow: hidden; padding: 24px;
+    overscroll-behavior: contain; touch-action: none; }
   .img-lightbox.open { display: flex; }
   .img-lightbox img {
-    max-width: none; max-height: none; height: auto; margin: auto;
+    max-width: 100%; max-height: 100%; height: auto; margin: auto;
     background: #fff; border-radius: var(--radius-sm);
-    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6); cursor: zoom-out; }
-  /* Fit-to-screen until the viewer opts to see it larger (native pixels). */
-  .img-lightbox.fit img { max-width: 100%; max-height: 100%; height: auto;
-    object-fit: contain; }
-  .img-lightbox-close {
-    position: fixed; top: 12px; right: 16px; z-index: 2001;
-    width: 40px; height: 40px; border-radius: 50%;
+    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+    transform: translate(0, 0) scale(1); transform-origin: center center;
+    cursor: zoom-in; will-change: transform;
+    -webkit-user-select: none; user-select: none; -webkit-user-drag: none; }
+  .img-lightbox.zoomed img { cursor: grab; }
+  .img-lightbox.grabbing img { cursor: grabbing; }
+  /* A round icon button used by the close (top-right) and the zoom toolbar. */
+  .img-lightbox-btn {
+    z-index: 2001; width: 40px; height: 40px; border-radius: 50%;
     border: 1px solid rgba(255, 255, 255, 0.4); background: rgba(0, 0, 0, 0.5);
     color: #fff; font-size: 22px; line-height: 1; cursor: pointer;
-    display: flex; align-items: center; justify-content: center; }
-  .img-lightbox-close:hover { background: rgba(0, 0, 0, 0.8); }
+    display: flex; align-items: center; justify-content: center; padding: 0; }
+  .img-lightbox-btn:hover { background: rgba(0, 0, 0, 0.85); }
+  .img-lightbox-btn:disabled { opacity: 0.4; cursor: default; }
+  .img-lightbox-close { position: fixed; top: 12px; right: 16px; }
+  /* Zoom toolbar, centred along the bottom. */
+  .img-lightbox-tools {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    z-index: 2001; display: flex; align-items: center; gap: 8px;
+    padding: 6px 10px; border-radius: 999px; background: rgba(0, 0, 0, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.25); }
+  .img-lightbox-tools .img-lightbox-btn {
+    width: 34px; height: 34px; font-size: 18px; border-color: transparent;
+    background: transparent; }
+  .img-lightbox-tools .img-lightbox-btn:hover { background: rgba(255, 255, 255, 0.16); }
+  .img-lightbox-zoomlabel {
+    color: #fff; font-size: 12px; min-width: 44px; text-align: center;
+    font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -4489,31 +4509,74 @@ setInterval(() => { if (!sseOk) refresh(); }, 15000);
      inline script so it can read its shared helpers (cache, esc, enc, …). -->
 <script src="/chat.js"></script>
 <!-- Full-screen image lightbox (XERK-221 zoom). Opened by clicking any rendered
-     chat image (.md-img); the ✕ button, the backdrop and Esc all close it. -->
-<div class="img-lightbox fit" id="imgLightbox" role="dialog" aria-modal="true" aria-label="Image viewer">
-  <button type="button" class="img-lightbox-close" id="imgLightboxClose" aria-label="Close image" title="Close (Esc)">✕</button>
-  <img id="imgLightboxImg" alt="">
+     chat image (.md-img); zoom with the toolbar / wheel / double-click, pan by
+     dragging; the ✕ button, the backdrop and Esc all close it. -->
+<div class="img-lightbox" id="imgLightbox" role="dialog" aria-modal="true" aria-label="Image viewer">
+  <button type="button" class="img-lightbox-btn img-lightbox-close" id="imgLightboxClose" aria-label="Close image" title="Close (Esc)">✕</button>
+  <img id="imgLightboxImg" alt="" draggable="false">
+  <div class="img-lightbox-tools" id="imgLightboxTools">
+    <button type="button" class="img-lightbox-btn" id="imgLightboxOut" aria-label="Zoom out" title="Zoom out (−)">−</button>
+    <span class="img-lightbox-zoomlabel" id="imgLightboxLabel">100%</span>
+    <button type="button" class="img-lightbox-btn" id="imgLightboxIn" aria-label="Zoom in" title="Zoom in (+)">+</button>
+    <button type="button" class="img-lightbox-btn" id="imgLightboxReset" aria-label="Reset zoom" title="Fit to screen (0)" style="font-size:15px;">⤢</button>
+  </div>
 </div>
 <script>
 // Click-to-zoom lightbox for chat images. A rendered image (chat.js emits
 // class="md-img" for inline ![](…), rendered SVGs and SendUserFile previews)
-// opens full-screen; the overlay starts fit-to-viewport and a click on the
-// image toggles native (1:1) size so a large screenshot can be inspected.
+// opens full-screen fit-to-viewport; zoom via the +/− toolbar, the mouse wheel
+// (anchored at the cursor) or double-click, and pan by dragging when zoomed.
+// Scale 1 == fit-to-screen (the image is already max-width/height 100%); zoom
+// and pan ride a single CSS transform, so no reflow/scroll is involved.
 (function () {
   const box = document.getElementById("imgLightbox");
   const img = document.getElementById("imgLightboxImg");
   const closeBtn = document.getElementById("imgLightboxClose");
+  const label = document.getElementById("imgLightboxLabel");
+  const inBtn = document.getElementById("imgLightboxIn");
+  const outBtn = document.getElementById("imgLightboxOut");
+  const resetBtn = document.getElementById("imgLightboxReset");
   if (!box || !img || !closeBtn) return;
+  const MIN = 1, MAX = 8;          // scale 1 = fit-to-screen, up to 8x
+  let scale = 1, tx = 0, ty = 0;   // current transform (translate + scale)
   function isOpen() { return box.classList.contains("open"); }
+  function clampScale(s) { return Math.min(MAX, Math.max(MIN, s)); }
+  function apply() {
+    if (scale <= MIN) { scale = MIN; tx = 0; ty = 0; }  // snap back to centred fit
+    img.style.transform = "translate(" + tx + "px," + ty + "px) scale(" + scale + ")";
+    box.classList.toggle("zoomed", scale > MIN);
+    if (label) label.textContent = Math.round(scale * 100) + "%";
+    if (outBtn) outBtn.disabled = scale <= MIN;
+    if (inBtn) inBtn.disabled = scale >= MAX;
+  }
+  function reset() { scale = 1; tx = 0; ty = 0; apply(); }
+  // Zoom to a target scale, keeping the point (px,py) — viewport coords — fixed.
+  // The image is centred in the viewport, so its transform maps a screen point
+  // P to center + t + scale·v; solving for the new translate that pins P gives
+  // t' = d − (s'/s)(d − t), where d = P − viewportCenter.
+  function zoomTo(next, px, py) {
+    const s2 = clampScale(next);
+    if (s2 === scale) return;
+    const dx = px - window.innerWidth / 2, dy = py - window.innerHeight / 2;
+    tx = dx - (s2 / scale) * (dx - tx);
+    ty = dy - (s2 / scale) * (dy - ty);
+    scale = s2;
+    apply();
+  }
+  function zoomStep(factor, px, py) {
+    zoomTo(scale * factor, px == null ? window.innerWidth / 2 : px,
+                           py == null ? window.innerHeight / 2 : py);
+  }
   function open(src, alt) {
     img.src = src;
     img.alt = alt || "";
-    box.classList.add("fit");   // always (re)open fit-to-screen
+    reset();
     box.classList.add("open");
   }
   function close() {
     box.classList.remove("open");
     img.removeAttribute("src");  // stop decoding / free memory while hidden
+    reset();
   }
   // Open when a rendered chat image is clicked. Delegated on the document so it
   // survives every transcript repaint; images inside the sandboxed HTML-preview
@@ -4524,18 +4587,62 @@ setInterval(() => { if (!sseOk) refresh(); }, 15000);
     e.preventDefault();
     open(hit.src, hit.alt);
   });
-  // Backdrop (but not the image) closes; clicking the image toggles zoom.
-  box.addEventListener("click", (e) => { if (e.target === box) close(); });
-  img.addEventListener("click", (e) => { e.stopPropagation(); box.classList.toggle("fit"); });
   closeBtn.addEventListener("click", close);
+  if (inBtn) inBtn.addEventListener("click", () => zoomStep(1.4));
+  if (outBtn) outBtn.addEventListener("click", () => zoomStep(1 / 1.4));
+  if (resetBtn) resetBtn.addEventListener("click", reset);
+  // Wheel zooms toward the cursor; preventDefault so the page doesn't scroll.
+  box.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    zoomTo(scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15), e.clientX, e.clientY);
+  }, { passive: false });
+  // Double-click toggles between fit and 2.5x, anchored at the cursor.
+  img.addEventListener("dblclick", (e) => {
+    e.preventDefault();
+    if (scale > MIN) reset(); else zoomTo(2.5, e.clientX, e.clientY);
+  });
+  // Drag to pan (only meaningful while zoomed). A click that never moved is
+  // treated as a plain click: on the backdrop it closes, on the image it does
+  // nothing. Uses pointer events so mouse + touch share one path.
+  let drag = null;
+  img.addEventListener("pointerdown", (e) => {
+    if (scale <= MIN) return;      // nothing to pan at fit
+    drag = { x: e.clientX, y: e.clientY, tx, ty, moved: false };
+    box.classList.add("grabbing");
+    img.setPointerCapture(e.pointerId);
+  });
+  img.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) drag.moved = true;
+    tx = drag.tx + dx; ty = drag.ty + dy;
+    apply();
+  });
+  function endDrag(e) {
+    if (!drag) return;
+    try { img.releasePointerCapture(e.pointerId); } catch (_) {}
+    box.classList.remove("grabbing");
+    drag = null;
+  }
+  img.addEventListener("pointerup", endDrag);
+  img.addEventListener("pointercancel", endDrag);
+  // A backdrop click closes; a click on the image is swallowed so it never
+  // reaches the backdrop (and a drag never counts as a close).
+  box.addEventListener("click", (e) => { if (e.target === box) close(); });
+  img.addEventListener("click", (e) => e.stopPropagation());
   // Esc closes, ahead of the page's other Escape handlers (backToList / menus):
   // capture phase runs first, and stopImmediatePropagation keeps them from also
-  // firing on the same key press.
+  // firing on the same key press. +/-/0 drive zoom while open.
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && isOpen()) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      close();
+    if (!isOpen()) return;
+    if (e.key === "Escape") {
+      e.preventDefault(); e.stopImmediatePropagation(); close();
+    } else if (e.key === "+" || e.key === "=") {
+      e.preventDefault(); zoomStep(1.4);
+    } else if (e.key === "-" || e.key === "_") {
+      e.preventDefault(); zoomStep(1 / 1.4);
+    } else if (e.key === "0") {
+      e.preventDefault(); reset();
     }
   }, true);
 })();
