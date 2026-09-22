@@ -271,6 +271,21 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   (dsh is headless; qwen's TUI has no `/rename`). Consequence: `--remote-control`/`--name` now carry
   arbitrary summary text, so both `shlex.quote` at launch (an apostrophe in a name once broke the
   single-quoted `--remote-control`). Tests: `TestReconcileRcNames`.
+  - **A resume/migration must come back ALREADY answering to its name, or it re-`/rename`s on every
+    relaunch** (XERK-815 follow-up). `--name <rcName>` on relaunch sets the LIVE registry name to
+    whatever `rcName` we pass — it OVERRIDES Claude Code's own per-session-id name restore (verified on
+    2.1.278). So when `_resume_at_cwd` reset `rcName` to a launch SLUG and dropped `rcRenamedFor`, the
+    live name became that slug and the reconciler dutifully `/rename`d it back to the summary — once per
+    resume/migration, landing in the resumed composer beside the operator's first message ("duplicate
+    rename prompts even though the name is already accurate"). Fix: `_resumed_rc_name` reconstructs the
+    named state from the CARRIED summary — `rcName` = the deduped summary, `rcRenamedFor` = the summary
+    — so `--name` makes the live name the summary at launch and `_reconcile_rc_names` finds
+    `summary == rcRenamedFor` and does nothing. Migration already carries `summary`; a resume-any now
+    carries the closed record's (`resume_transcript`'s `extra`). A session with NO name yet (a bare
+    resume-any) still gets the device/ticket slug and is named once from the transcript — the
+    legitimate single rename. Tests: `test_a_named_resume_comes_back_reconciled` /
+    `test_an_unnamed_resume_falls_back_to_the_slug` (`TestResumeTranscript`), the rcName/rcRenamedFor
+    assertions in `test_import_unpacks_and_resumes_with_identity` (`TestMigrateSession`).
 - The messaging POLICY lives in `PEERS_SYSTEM_PROMPT`, weighted toward restraint: a message costs the
   receiver a turn and sits in their context every turn after, so it ranks ASK-before-rediscovery above
   WARN-about-lost-work and forbids status traffic. It also states the two rules the tool can't

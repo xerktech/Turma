@@ -8232,6 +8232,40 @@ class TestResumeTranscript(ManagerMixin, unittest.TestCase):
         sm._worktree_add.assert_not_called()          # worktree still present
         self.assertEqual(sm._launch_tmux.call_args.kwargs["resume_id"], "trans1")
 
+    def test_a_named_resume_comes_back_reconciled(self):
+        # XERK-815: resuming an already-named session must reconstruct its rc-name
+        # (rcName = summary, rcRenamedFor = summary) so it comes back ANSWERING to
+        # its name — otherwise the reconciler `/rename`s it back into the resumed
+        # composer on every resume ("duplicate rename prompts").
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "named1")
+        os.makedirs(wt, exist_ok=True)
+        self._write_at(wt, "transN")
+        sm = self._manager()
+        sm._worktree_add = mock.Mock()
+        sm.closed = [{"id": "old", "claudeSessionId": "transN",
+                      "worktreePath": wt, "summary": "Fix the retry loop"}]
+        sm.resume_transcript("transN", wt, cmd_id="c9")
+        sess = sm.registry[0]
+        self.assertEqual(sess["summary"], "Fix the retry loop")
+        self.assertEqual(sess["rcName"], "Fix the retry loop")
+        # summary == rcRenamedFor is exactly the reconciler's first-gate no-op.
+        self.assertEqual(sess["rcRenamedFor"], "Fix the retry loop")
+
+    def test_an_unnamed_resume_falls_back_to_the_slug(self):
+        # A bare resume-any of a transcript with no closed record (no name yet):
+        # the launch slug, left UNreconciled so the reconciler names it once a
+        # summary is seeded from the transcript — the legitimate single rename.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "bare1")
+        os.makedirs(wt, exist_ok=True)
+        self._write_at(wt, "transB")
+        sm = self._manager()
+        sm._worktree_add = mock.Mock()
+        sm.resume_transcript("transB", wt, cmd_id="c10")
+        sess = sm.registry[0]
+        self.assertIsNone(sess.get("summary"))
+        self.assertIsNone(sess.get("rcRenamedFor"))
+        self.assertIn("turma", sess["rcName"].lower())   # device/repo slug
+
     def test_recreates_deleted_worktree_at_origin_path(self):
         wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "gone1")  # not on disk
         self._write_at(wt, "trans2")
@@ -8636,6 +8670,12 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["model"], "opus")
         self.assertEqual(sess["permissionMode"], "plan")
         self.assertEqual(sess["summary"], "Fix the logs")
+        # XERK-815: an already-named migrated session comes back ANSWERING to its
+        # summary (rcName + rcRenamedFor reconstructed from the carried summary),
+        # so the rc-name reconciler finds summary == rcRenamedFor and never types a
+        # `/rename` into the resumed composer. --name on relaunch follows rcName.
+        self.assertEqual(sess["rcName"], "Fix the logs")
+        self.assertEqual(sess["rcRenamedFor"], "Fix the logs")
         self.assertEqual(sess["ticket"]["key"], "ENG-9")
         self.assertEqual(sess["migratedFrom"]["host"], "hostA")
         # The moved conversation is resumed (its id pinned), and the missing

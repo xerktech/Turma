@@ -20655,7 +20655,14 @@ class SessionManager:
         extra = ({"modelSource": closed.get("modelSource"),
                   "agentType": closed.get("agentType"),
                   "localModelName": closed.get("localModelName"),
-                  "localModelContext": closed.get("localModelContext")}
+                  "localModelContext": closed.get("localModelContext"),
+                  # Carry the name it already had (XERK-815) so the resume comes
+                  # back answering to it instead of re-deriving a slug and then
+                  # `/rename`-ing back to it into the resumed composer. A closed
+                  # record without a summary (never named) carries none, and the
+                  # session is named once from the transcript as before.
+                  "summary": closed.get("summary"),
+                  "summaryManual": closed.get("summaryManual")}
                  if closed else None)
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id, extra=extra)
 
@@ -20691,6 +20698,31 @@ class SessionManager:
                 "at": now_iso(),
             })
             del self.spawn_failures[:-SPAWN_FAILURES_MAX]
+
+    def _resumed_rc_name(self, extra, repo, sid):
+        """The rc-name state a resumed/migrated session comes back with (XERK-815)
+        — a dict of `rcName` + `rcRenamedFor` to splat into the record.
+
+        An already-NAMED session (a carried summary) is reconstructed as if it had
+        just been `/rename`'d to that summary: `rcName` = the deduped summary and
+        `rcRenamedFor` = the summary, so the relaunch's `--name <rcName>` makes the
+        LIVE name the summary at once and `_reconcile_rc_names` finds nothing to
+        do. That is what stops a redundant `/rename` — which lands in the resumed
+        composer beside the operator's first message — firing on every
+        resume/migration.
+
+        An UNNAMED session (no carried summary — a bare resume-any) falls back to
+        the device/ticket launch slug and stays UNreconciled (`rcRenamedFor` None),
+        so the reconciler still names it once, correctly, when a summary is seeded
+        from the transcript. `exclude_id` is this session's own id (not yet in the
+        registry here, so a no-op today) for parity with the reconciler's dedupe."""
+        summary = (extra.get("summary") or "").strip()
+        if summary:
+            return {"rcName": self._unique_rc_name(summary, exclude_id=sid),
+                    "rcRenamedFor": summary}
+        slug = (f"{slugify(self.device)}-{slugify(repo)}-"
+                + (slugify((extra.get("ticket") or {}).get("key") or "") or sid))
+        return {"rcName": self._unique_rc_name(slug), "rcRenamedFor": None}
 
     def _resume_at_cwd(self, transcript_id, cwd, *, cmd_id=None, extra=None,
                        migration_id=None):
@@ -20760,13 +20792,24 @@ class SessionManager:
             "summaryManual": extra.get("summaryManual"),
             "ticket": extra.get("ticket"),
             "migratedFrom": extra.get("migratedFrom"),
-            # Named like a spawn (XERK-339): a MIGRATED ticket session carried
-            # its ticket here, so it keeps being called after its key rather
-            # than reverting to a hash the moment it changes host — the name is
-            # what a peer addresses and what the operator recognises.
-            "rcName": self._unique_rc_name(
-                f"{slugify(self.device)}-{slugify(repo)}-"
-                + (slugify((extra.get("ticket") or {}).get("key") or "") or sid)),
+            # A session that was ALREADY named (XERK-815) must come back already
+            # ANSWERING to that name, not to a launch slug the rc-name reconciler
+            # then has to `/rename` away on the first idle beat. That `/rename`
+            # lands in the freshly-resumed composer beside the operator's first
+            # message ("duplicate rename prompts even though the name is already
+            # accurate"), once per resume/migration — because `--name` on relaunch
+            # sets the LIVE name to whatever rcName we pass (it overrides Claude's
+            # own per-id name restore, verified on 2.1.278), so a slug rcName means
+            # a slug live name means a guaranteed rename.
+            #
+            # So when a summary was carried (migration always carries it; a
+            # resume-any now carries the closed record's), launch under it and mark
+            # it reconciled: rcName = the deduped summary, rcRenamedFor = the
+            # summary. The reconciler then finds summary == rcRenamedFor and does
+            # nothing. Falls back to the device/ticket slug only for a session with
+            # NO name yet (a bare resume-any), which the reconciler names once a
+            # summary is seeded from the transcript — the legitimate single rename.
+            **self._resumed_rc_name(extra, repo, sid),
             "tmuxName": f"agent-{sid}",
             "ttydPort": self._alloc_port(),
             "model": extra.get("model"),
@@ -22761,11 +22804,15 @@ class SessionManager:
 
         `rcRenamedFor` records the summary the current name was derived from, so a
         `/rename` is typed only when the summary actually CHANGES, never every
-        beat. Claude only: dsh is headless (no pane, no slash commands) and qwen
-        is a different TUI with no `/rename`. Runs on the beat, so it must never
-        raise (the caller guards it) and only ever drives an IDLE pane with no
-        dialog up — a `/rename` typed mid-turn or into a prompt would land as
-        input instead of running."""
+        beat. A resume/migration reconstructs both `rcName` (from the carried
+        summary) and `rcRenamedFor` in `_resume_at_cwd`, so a session that was
+        already named comes back ALREADY answering to it and this reconciler finds
+        nothing to do — that is what stops the redundant, composer-colliding
+        `/rename` on every resume. Claude only: dsh is headless (no pane, no slash
+        commands) and qwen is a different TUI with no `/rename`. Runs on the beat,
+        so it must never raise (the caller guards it) and only ever drives an IDLE
+        pane with no dialog up — a `/rename` typed mid-turn or into a prompt would
+        land as input instead of running."""
         for sess in list(self.registry):
             if sess.get("status") != "running":
                 continue
