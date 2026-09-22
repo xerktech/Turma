@@ -3,6 +3,7 @@ package com.xerktech.turma.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,10 +22,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -37,7 +40,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
@@ -67,6 +73,8 @@ import android.webkit.WebViewClient
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
 import java.nio.ByteBuffer
 import kotlinx.coroutines.delay
@@ -505,6 +513,9 @@ private fun SendFileView(f: SendFile) {
                 }
             }
             if (model == null) { FileChip(f.name, f.shed); return }
+            // Tapping the thumbnail opens a full-screen viewer (web parity: the
+            // click-to-zoom lightbox in sessions.html); back / the ✕ closes it.
+            var showFull by remember(f.src) { mutableStateOf(false) }
             Column {
                 // A DEFINITE height, not heightIn(max): AsyncImage's painter starts
                 // with an unknown intrinsic size, so a max-only height constraint
@@ -515,7 +526,8 @@ private fun SendFileView(f: SendFile) {
                     Modifier.fillMaxWidth().height(260.dp)
                         .clip(RoundedCornerShape(6.dp))
                         .background(Color.White)
-                        .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f), RoundedCornerShape(6.dp)),
+                        .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f), RoundedCornerShape(6.dp))
+                        .clickable { showFull = true },
                     contentAlignment = Alignment.Center,
                 ) {
                     AsyncImage(
@@ -527,6 +539,7 @@ private fun SendFileView(f: SendFile) {
                 }
                 Text(f.name, fontSize = scaledSp(10f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
             }
+            if (showFull) ImageLightbox(model, f.name) { showFull = false }
         }
         "html" -> Column {
             HtmlPreview(f.html, Modifier.fillMaxWidth().height(360.dp)
@@ -535,6 +548,45 @@ private fun SendFileView(f: SendFile) {
             Text(f.name, fontSize = scaledSp(10f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
         }
         else -> FileChip(f.name, f.shed)
+    }
+}
+
+// Full-screen image viewer (web parity: sessions.html's #imgLightbox). Fills the
+// screen over a dark backdrop; pinch-zoom + drag-to-pan let a large screenshot be
+// inspected, and a ✕ button (top-right) or the system back gesture dismisses it.
+@Composable
+private fun ImageLightbox(model: Any, name: String, onDismiss: () -> Unit) {
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        var scale by remember { mutableStateOf(1f) }
+        var offset by remember { mutableStateOf(Offset.Zero) }
+        Box(
+            Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.92f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            AsyncImage(
+                model = model,
+                contentDescription = name,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize().padding(12.dp)
+                    .pointerInput(Unit) {
+                        detectTransformGestures { _, pan, zoom, _ ->
+                            scale = (scale * zoom).coerceIn(1f, 6f)
+                            // Pan only while zoomed in; snap back to centre at 1x.
+                            offset = if (scale > 1f) offset + pan else Offset.Zero
+                        }
+                    }
+                    .graphicsLayer(
+                        scaleX = scale, scaleY = scale,
+                        translationX = offset.x, translationY = offset.y,
+                    ),
+            )
+            IconButton(
+                onClick = onDismiss,
+                modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
+            ) {
+                Icon(Icons.Filled.Close, contentDescription = "Close image", tint = Color.White)
+            }
+        }
     }
 }
 

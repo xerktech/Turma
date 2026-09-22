@@ -815,7 +815,10 @@ those are marked `[MODEL]`.
   an image/SVG via Coil `AsyncImage` (data: URIs decoded to a `ByteBuffer` the SVG/bitmap decoders
   accept; remote URLs pass through), an HTML page in a **JS-disabled, navigation-blocked, null-origin
   WebView** (the `sandbox` iframe's analogue), else a name chip — open by default, caption below, matching
-  the web's `renderToolFiles`.
+  the web's `renderToolFiles`. **Click-to-zoom (XERK-221 lightbox):** tapping an image preview opens a
+  full-screen viewer (`ImageLightbox`, pinch-zoom + pan, ✕ / back to close) — the analogue of
+  `sessions.html`'s `#imgLightbox`. On Android this covers SendUserFile image previews only, since inline
+  prose images are still deferred (next bullet); on the web it also covers inline `![](…)` images.
 - P1 Inline images in **PROSE** (the OTHER half of XERK-221) — still deferred. A markdown `![alt](url)`
   and a raw/fenced `<svg>` in an agent's *text* render as pictures on the web (`chat.js`
   `linkify`/`svgToImg`/`renderSvgAndText`); Android still shows `![alt](url)` as a link (stray `!`) and

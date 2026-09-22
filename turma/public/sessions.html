@@ -1125,6 +1125,32 @@
   @media (pointer: coarse) {
     details.ended-wrap-sec summary, details.spawn-wrap > summary { padding-top: 6px; padding-bottom: 6px; }
   }
+  /* Click-to-zoom lightbox for chat images (XERK-221 previews + inline ![](…)).
+     A rendered image carries a zoom-in cursor; clicking it opens #imgLightbox,
+     a fixed full-viewport overlay showing the image at natural size (capped to
+     the viewport, scrollable when larger), an ✕ close button top-right, and a
+     dark backdrop that also closes on click. Only shown while `.open`. */
+  .md-img { cursor: zoom-in; }
+  .img-lightbox {
+    position: fixed; inset: 0; z-index: 2000; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.86); overflow: auto; padding: 24px;
+    overscroll-behavior: contain; }
+  .img-lightbox.open { display: flex; }
+  .img-lightbox img {
+    max-width: none; max-height: none; height: auto; margin: auto;
+    background: #fff; border-radius: var(--radius-sm);
+    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6); cursor: zoom-out; }
+  /* Fit-to-screen until the viewer opts to see it larger (native pixels). */
+  .img-lightbox.fit img { max-width: 100%; max-height: 100%; height: auto;
+    object-fit: contain; }
+  .img-lightbox-close {
+    position: fixed; top: 12px; right: 16px; z-index: 2001;
+    width: 40px; height: 40px; border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.4); background: rgba(0, 0, 0, 0.5);
+    color: #fff; font-size: 22px; line-height: 1; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; }
+  .img-lightbox-close:hover { background: rgba(0, 0, 0, 0.8); }
 </style>
 </head>
 <body>
@@ -4462,5 +4488,57 @@ setInterval(() => { if (!sseOk) refresh(); }, 15000);
      verbosity control, compose + AskUserQuestion answering. Loaded after the
      inline script so it can read its shared helpers (cache, esc, enc, …). -->
 <script src="/chat.js"></script>
+<!-- Full-screen image lightbox (XERK-221 zoom). Opened by clicking any rendered
+     chat image (.md-img); the ✕ button, the backdrop and Esc all close it. -->
+<div class="img-lightbox fit" id="imgLightbox" role="dialog" aria-modal="true" aria-label="Image viewer">
+  <button type="button" class="img-lightbox-close" id="imgLightboxClose" aria-label="Close image" title="Close (Esc)">✕</button>
+  <img id="imgLightboxImg" alt="">
+</div>
+<script>
+// Click-to-zoom lightbox for chat images. A rendered image (chat.js emits
+// class="md-img" for inline ![](…), rendered SVGs and SendUserFile previews)
+// opens full-screen; the overlay starts fit-to-viewport and a click on the
+// image toggles native (1:1) size so a large screenshot can be inspected.
+(function () {
+  const box = document.getElementById("imgLightbox");
+  const img = document.getElementById("imgLightboxImg");
+  const closeBtn = document.getElementById("imgLightboxClose");
+  if (!box || !img || !closeBtn) return;
+  function isOpen() { return box.classList.contains("open"); }
+  function open(src, alt) {
+    img.src = src;
+    img.alt = alt || "";
+    box.classList.add("fit");   // always (re)open fit-to-screen
+    box.classList.add("open");
+  }
+  function close() {
+    box.classList.remove("open");
+    img.removeAttribute("src");  // stop decoding / free memory while hidden
+  }
+  // Open when a rendered chat image is clicked. Delegated on the document so it
+  // survives every transcript repaint; images inside the sandboxed HTML-preview
+  // iframe live in another document and never reach here.
+  document.addEventListener("click", (e) => {
+    const hit = e.target.closest && e.target.closest("img.md-img");
+    if (!hit || !hit.src) return;
+    e.preventDefault();
+    open(hit.src, hit.alt);
+  });
+  // Backdrop (but not the image) closes; clicking the image toggles zoom.
+  box.addEventListener("click", (e) => { if (e.target === box) close(); });
+  img.addEventListener("click", (e) => { e.stopPropagation(); box.classList.toggle("fit"); });
+  closeBtn.addEventListener("click", close);
+  // Esc closes, ahead of the page's other Escape handlers (backToList / menus):
+  // capture phase runs first, and stopImmediatePropagation keeps them from also
+  // firing on the same key press.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && isOpen()) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      close();
+    }
+  }, true);
+})();
+</script>
 </body>
 </html>
