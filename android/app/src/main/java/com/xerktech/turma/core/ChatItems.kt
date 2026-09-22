@@ -75,6 +75,10 @@ sealed interface ChatItem {
         val role: String,
         val text: String,
         val clipped: Boolean = false,
+        // For a user-role bubble, WHERE the turn actually came from (web parity:
+        // chat.js messageOrigin) — "operator" is the person typing; the rest are
+        // relayed/injected and render apart from operator input. See messageOrigin.
+        val origin: String = "operator",
     ) : ChatItem
 
     data class Thinking(
@@ -200,7 +204,8 @@ fun buildItems(
             // so drain the fold first.
             if (!text.isNullOrBlank()) {
                 flushFold()
-                out.add(ChatItem.Bubble(entry.key, entry.role, text, clipped))
+                val origin = if (entry.role == "user") messageOrigin(text) else "operator"
+                out.add(ChatItem.Bubble(entry.key, entry.role, text, clipped, origin))
             }
         }
         for (block in blocks) {
@@ -301,6 +306,36 @@ fun buildItems(
 
 private fun isMarkerAlpha(c: Char): Boolean = c in 'a'..'z' || c in 'A'..'Z'
 private fun isMarkerNameChar(c: Char): Boolean = isMarkerAlpha(c) || c in '0'..'9' || c == '_' || c == '-'
+
+/**
+ * The source of a user-role turn — a 1:1 port of chat.js `messageOrigin`. Only
+ * "operator" is the person typing; the others are relayed or injected and read
+ * wrong as blue operator bubbles, so the UI renders each apart:
+ *  - "turma":    a manager-composed message Turma relayed IN (a PR/conflict
+ *                nudge, the "uncommitted work" prompt) — carries "[Relayed by
+ *                Turma".
+ *  - "subagent": a background agent's hand-back to the session that spawned it
+ *                ("<agent-message from=…>", "[Subagent hand-back]").
+ *  - "peer":     a message from ANOTHER live session (native SendMessage, or the
+ *                dsh/qwen "[Peer message from <name>]" frame).
+ *  - "system":   Claude Code's OWN injected user turns (a resume prompt, a
+ *                pasted-image coordinate hint, a session-naming reminder).
+ * Classified by delivery framing (stable prepended text), not a wire flag, so it
+ * covers the live tail, /history AND archived transcripts alike. Turma and
+ * subagent markers are checked before the generic "Another Claude session"
+ * wrapper they sit inside. Keep in step with chat.js.
+ */
+fun messageOrigin(text: String): String {
+    val t = text
+    if (t.contains("[Relayed by Turma")) return "turma"
+    if (t.contains("<agent-message from")) return "subagent"
+    if (t.startsWith("Another Claude session sent a message")) return "peer"
+    if (t.startsWith("[Peer message from")) return "peer"
+    if (t.startsWith("<system-reminder>")) return "system"
+    if (t.startsWith("[Image:")) return "system"
+    if (t == "Continue from where you left off.") return "system"
+    return "operator"
+}
 
 /**
  * Synthesize display blocks for a BLOCK-LESS entry (an older agent or the

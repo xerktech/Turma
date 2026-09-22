@@ -7,7 +7,20 @@
 .tr-scroll { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
 .tr-msg { max-width: 760px; padding: 9px 13px; border-radius: var(--radius-md); font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 .tr-msg.user { align-self: flex-end; background: var(--accent-soft); color: var(--ink); }
-.tr-msg.assistant { align-self: flex-start; background: var(--surface); border: 1px solid var(--border); color: var(--ink); }
+/* Agent output is PLAIN left text, no box (parity with Claude Code's own
+   transcript) — only operator input (blue, right) and relayed/injected turns
+   (coloured) are boxed, so a box always means "not the agent talking". */
+.tr-msg.assistant { align-self: flex-start; background: transparent; border: none; color: var(--ink); padding-left: 0; padding-right: 0; max-width: 100%; }
+/* Non-operator user turns (chat.js messageOrigin): relayed/injected, so LEFT
+   and each in its own colour, never read as operator input (blue, right). */
+.tr-msg.turma { align-self: flex-start; background: color-mix(in srgb, var(--warning) 14%, transparent); border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent); color: var(--ink); }
+.tr-msg.turma .role { color: color-mix(in srgb, var(--warning) 65%, var(--ink)); }
+.tr-msg.peer { align-self: flex-start; background: color-mix(in srgb, var(--s5) 15%, transparent); border: 1px solid color-mix(in srgb, var(--s5) 40%, transparent); color: var(--ink); }
+.tr-msg.peer .role { color: var(--s5); }
+.tr-msg.subagent { align-self: flex-start; background: color-mix(in srgb, var(--s2) 14%, transparent); border: 1px solid color-mix(in srgb, var(--s2) 40%, transparent); color: var(--ink); }
+.tr-msg.subagent .role { color: color-mix(in srgb, var(--s2) 72%, var(--ink)); }
+.tr-msg.system { align-self: flex-start; background: color-mix(in srgb, var(--muted) 12%, transparent); border: 1px dashed var(--border); color: var(--ink-2); }
+.tr-msg.system .role { color: var(--muted); }
 .tr-msg .role { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 3px; }
 .tr-msg mark { background: var(--accent-soft); color: var(--accent); padding: 0 1px; border-radius: 2px; }
 /* Markdown tables (chat.js renderProse()). display:block + overflow-x lets a
@@ -193,7 +206,10 @@ h5.md-h, h6.md-h { color: var(--ink-2); }
    gets the identical look. */
 .chat-scroll .tr-msg.assistant, .tr-scroll .tr-msg.assistant { border: none; background: none; padding: 2px 0; }
 .chat-scroll .tr-msg.assistant.hit, .tr-scroll .tr-msg.assistant.hit { box-shadow: none; }
-.chat-scroll .tr-msg .role, .tr-scroll .tr-msg .role { display: none; }
+/* Hide the role caption ONLY on the plain turns (operator/agent); the
+   relayed/injected turns keep their caption (it names the coloured box). */
+.chat-scroll .tr-msg.user .role, .chat-scroll .tr-msg.assistant .role,
+.tr-scroll .tr-msg.user .role, .tr-scroll .tr-msg.assistant .role { display: none; }
 .chat-scroll .tr-msg.assistant.streaming::after {
   content: "▍"; margin-left: 1px; color: var(--accent); animation: caret 1s steps(1) infinite;
 }
@@ -464,6 +480,6 @@ h5.md-h, h6.md-h { color: var(--ink-2); }
    than the web live-chat's borderless prose; hide role labels. ---- */
 .chat-scroll .tr-msg.assistant { border: 1px solid var(--border); background: var(--surface-2); padding: 9px 13px; }
 .chat-scroll .tr-msg.assistant.streaming::after { content: "▍"; margin-left: 1px; color: var(--accent); animation: caret 1s steps(1) infinite; }
-.chat-scroll .tr-msg .role { display: none; }
+.chat-scroll .tr-msg.user .role, .chat-scroll .tr-msg.assistant .role { display: none; }
 .chat-scroll { padding: 16px; display: flex; flex-direction: column; gap: 10px; }
 .chat-scroll > * { flex-shrink: 0; }

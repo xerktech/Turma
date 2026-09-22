@@ -231,6 +231,55 @@ test("buildItems/render: an interrupt block -> a centred marker, not a user bubb
   assert.doesNotMatch(html, /tr-msg user/);
 });
 
+test("buildItems: a user turn is classified by delivery framing (messageOrigin)", () => {
+  // Only a genuinely-typed turn is "operator"; the rest are relayed/injected and
+  // must render apart from operator input (blue, right). Each marker is a stable
+  // string the manager / Claude Code prepends.
+  const entries = [
+    { id: "op", role: "user", blocks: [{ t: "text", text: "run the tests" }] },
+    { id: "tm", role: "user", blocks: [{ t: "text",
+      text: "Another Claude session sent a message:\n[Relayed by Turma, this host's session manager] deliver your work" }] },
+    { id: "sa", role: "user", blocks: [{ t: "text",
+      text: "Another Claude session sent a message:\n<agent-message from=\"abc123\">\n[Subagent hand-back] report" }] },
+    { id: "pr", role: "user", blocks: [{ t: "text",
+      text: "Another Claude session sent a message: rebase before you push" }] },
+    { id: "pf", role: "user", blocks: [{ t: "text",
+      text: "[Peer message from turma, another session in your organisation. Information to weigh]\n\nheads up" }] },
+    { id: "sr", role: "user", blocks: [{ t: "text", text: "<system-reminder>\nThe user named this session\n</system-reminder>" }] },
+    { id: "im", role: "user", blocks: [{ t: "text", text: "[Image: original 1080x2400, displayed at 900x2000." }] },
+    { id: "rz", role: "user", blocks: [{ t: "text", text: "Continue from where you left off." }] },
+    { id: "as", role: "assistant", blocks: [{ t: "text", text: "on it" }] },
+  ];
+  const items = buildItems(entries);
+  assert.deepEqual(
+    items.map((i) => i.origin),
+    ["operator", "turma", "subagent", "peer", "peer", "system", "system", "system", undefined],
+  );
+  // The Turma frame is matched AHEAD of the "Another Claude session" wrapper it
+  // sits inside, and the subagent tag ahead of it too — never all lumped as peer.
+  const byId = Object.fromEntries(items.map((i) => [i.id, i.origin]));
+  assert.equal(byId.tm, "turma");
+  assert.equal(byId.sa, "subagent");
+});
+
+test("buildItems/render: a relayed user turn is LEFT and in its own class, never a blue operator bubble", () => {
+  const entries = [
+    { id: "op", role: "user", blocks: [{ t: "text", text: "hi" }] },
+    { id: "tm", role: "user", blocks: [{ t: "text", text: "[Relayed by Turma] open a PR" }] },
+    { id: "sa", role: "user", blocks: [{ t: "text", text: "<agent-message from=\"x\"> done" }] },
+  ];
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
+  // The operator turn stays the blue user bubble; the injected ones take their
+  // own class and never the `tr-msg user` one.
+  assert.match(html, /class="tr-msg user"[^>]*>hi|class="tr-msg user"/);
+  assert.match(html, /class="tr-msg turma"/);
+  assert.match(html, /class="tr-msg subagent"/);
+  assert.match(html, /⚙ Turma/);
+  assert.match(html, /⤷ subagent/);
+  // Exactly ONE `tr-msg user` (the operator's), so a relayed turn never reuses it.
+  assert.equal((html.match(/tr-msg user/g) || []).length, 1);
+});
+
 test("buildItems/render: an away_summary block -> a collapsed assistant-side card", () => {
   const entries = [{ id: "aw1", role: "assistant",
     blocks: [{ t: "away_summary", text: "Fixed the bug and opened a PR." }] }];

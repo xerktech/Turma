@@ -1334,8 +1334,45 @@
     return out;
   }
 
+  // The source of a user-role turn, for rendering it apart from operator input.
+  // A session records several kinds of thing on the user side, and only the
+  // first is the person typing; the rest are relayed or injected and read wrong
+  // as blue operator bubbles:
+  //   "operator" — a message the operator actually sent (blue bubble, right).
+  //   "turma"    — a manager-composed message Turma relayed IN (a PR-review or
+  //                merge-conflict nudge, the "you have uncommitted work" prompt).
+  //                Delivered via the session inbox (framed "[Relayed by Turma…]",
+  //                which Claude Code wraps again as "Another Claude session sent
+  //                a message:") OR, for a session with no inbox, typed into the
+  //                pane verbatim (no wrapper). Either way the "[Relayed by Turma"
+  //                frame is present.
+  //   "subagent" — a background agent handing its final report back to the
+  //                session that spawned it ("<agent-message from=…>",
+  //                "[Subagent hand-back]"). Claude Code wraps it "Another Claude
+  //                session sent a message:" too, so match the inner tag first.
+  //   "peer"     — a message from ANOTHER live session (a native SendMessage
+  //                between peers, or the dsh/qwen "[Peer message from <name>]").
+  //   "system"   — Claude Code's OWN injected user turns: a resume prompt, a
+  //                pasted-image coordinate hint, a session-naming reminder.
+  // Classified by delivery framing (stable text the manager / Claude Code
+  // prepend), NOT a wire flag, so it covers the live tail, /history AND
+  // already-archived transcripts uniformly with no re-store. Turma and subagent
+  // markers are checked before the generic "Another Claude session" wrapper they
+  // sit inside. Anything unrecognised stays "operator".
+  function messageOrigin(text) {
+    const t = String(text == null ? "" : text);
+    if (t.indexOf("[Relayed by Turma") !== -1) return "turma";
+    if (t.indexOf("<agent-message from") !== -1) return "subagent";
+    if (t.lastIndexOf("Another Claude session sent a message", 0) === 0) return "peer";
+    if (t.lastIndexOf("[Peer message from", 0) === 0) return "peer";
+    if (t.lastIndexOf("<system-reminder>", 0) === 0) return "system";
+    if (t.lastIndexOf("[Image:", 0) === 0) return "system";
+    if (t === "Continue from where you left off.") return "system";
+    return "operator";
+  }
+
   // ---- build display items from rich entries --------------------------------
-  // Items: {kind:"msg",role,text,truncated,id} | {kind:"thinking",text,truncated,id}
+  // Items: {kind:"msg",role,text,truncated,id,origin} | {kind:"thinking",text,truncated,id}
   //        | {kind:"action", id, name, input, inputTrunc, result:{text,isError,truncated}|null, entryId}
   //        | {kind:"command", id, name, args, argsTrunc, result:{text,isError,truncated}|null}
   //        | {kind:"compact", id, text, truncated}
@@ -1386,7 +1423,18 @@
         ? e.blocks
         : degradedBlocks(e.text, role, e.truncated);
       let msg = null;
-      const flush = () => { if (msg) { items.push(msg); msg = null; } };
+      const flush = () => {
+        if (msg) {
+          // A user-role turn is not always something the OPERATOR typed: Turma
+          // relays manager-composed nudges and cross-session peer messages into
+          // the pane/inbox, and Claude Code records them as user turns too.
+          // Classify by their delivery framing so the renderer can set them
+          // apart from real operator input (blue, right) — see messageOrigin.
+          if (msg.role === "user") msg.origin = messageOrigin(msg.text);
+          items.push(msg);
+          msg = null;
+        }
+      };
       for (const b of blocks) {
         // Anything else between an invocation and an output means that output
         // isn't this command's — stop holding the card open for it.
@@ -1537,9 +1585,22 @@
       .trim();
   }
 
+  // A relayed/injected user turn (see messageOrigin) renders LEFT and in its own
+  // colour so it never reads as operator input; each origin gets its own label.
+  const MSG_ORIGIN_CLASSES = { turma: 1, subagent: 1, peer: 1, system: 1 };
+  const MSG_ORIGIN_LABEL = {
+    turma: "⚙ Turma", subagent: "⤷ subagent", peer: "⤺ another session", system: "Claude Code",
+  };
   function renderMsg(it) {
-    const cls = it.role === "user" ? "user" : "assistant";
-    return '<div class="tr-msg ' + cls + '" data-uuid="' + esc(it.id) + '"><span class="role">' + cls + "</span>" +
+    const origin = it.role === "user" ? (it.origin || "operator") : "";
+    const cls = it.role !== "user" ? "assistant"
+      : MSG_ORIGIN_CLASSES[origin] ? origin : "user";
+    // Only a relayed/injected turn carries a caption — it names WHO/WHAT the box
+    // is. Plain operator input (blue, right) and agent output (boxless, left)
+    // need none: their placement already says which is which.
+    const label = MSG_ORIGIN_LABEL[cls];
+    const role = label ? '<span class="role">' + esc(label) + "</span>" : "";
+    return '<div class="tr-msg ' + cls + '" data-uuid="' + esc(it.id) + '">' + role +
       renderProse(it.text) + clipMark(it.truncated) + "</div>";
   }
 

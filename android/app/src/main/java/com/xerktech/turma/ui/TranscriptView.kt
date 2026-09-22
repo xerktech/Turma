@@ -121,9 +121,44 @@ private fun ClippedMark(modifier: Modifier = Modifier, label: String = "… clip
 // screen width. Short turns still hug their text; only the cap moves.
 private val BASE_BUBBLE_MAX = 340.dp
 
+// How a bubble is drawn (web parity: chat.js MSG_ORIGIN_* + the .tr-msg.<origin>
+// rules in sessions.html). [boxed]==false is plain agent output — no background,
+// no border, no side padding — so a box always means "not the agent talking".
+// [accent]==null is the operator's plain blue bubble; [label]=="" is no caption.
+// Colours mirror the web palette (--warning / --s2 / --s5 / --muted) as fixed
+// hues that read on both themes at the alphas below.
+private data class BubbleLook(val bg: Color, val accent: Color?, val label: String, val boxed: Boolean)
+
+private const val ORIGIN_AMBER = 0xFFE0A21AL   // --warning family (Turma)
+private const val ORIGIN_TEAL = 0xFF1BAF7AL     // --s2 (subagent)
+private const val ORIGIN_VIOLET = 0xFF8A7DE8L   // --s5 (peer)
+
+@Composable
+private fun bubbleLook(b: ChatItem.Bubble): BubbleLook {
+    // Agent output is PLAIN left text, boxless (parity with Claude Code's own
+    // transcript). Only operator input and relayed/injected turns are boxed.
+    if (b.role != "user") {
+        return BubbleLook(Color.Transparent, null, "", boxed = false)
+    }
+    return when (b.origin) {
+        "turma" -> Color(ORIGIN_AMBER).let { BubbleLook(it.copy(alpha = 0.16f), it, "⚙ Turma", true) }
+        "subagent" -> Color(ORIGIN_TEAL).let { BubbleLook(it.copy(alpha = 0.16f), it, "⤷ subagent", true) }
+        "peer" -> Color(ORIGIN_VIOLET).let { BubbleLook(it.copy(alpha = 0.18f), it, "⤺ another session", true) }
+        "system" -> MaterialTheme.colorScheme.onSurfaceVariant.let {
+            BubbleLook(it.copy(alpha = 0.12f), it, "Claude Code", true)
+        }
+        else -> BubbleLook(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f), null, "", true)
+    }
+}
+
 @Composable
 private fun TranscriptBubble(b: ChatItem.Bubble) {
-    val isUser = b.role == "user"
+    // A user turn is the operator ONLY when origin == "operator" — a relayed or
+    // injected turn (Turma nudge, subagent hand-back, peer/native message,
+    // Claude Code's own injected turns) renders LEFT and in its own colour, so it
+    // never reads as the person typing (web parity: chat.js messageOrigin).
+    val isOperator = b.role == "user" && b.origin == "operator"
+    val look = bubbleLook(b)
     // Parse the prose once (web parity: chat.js renderProse) — tables, fenced
     // code, inline code and links become real blocks/spans rather than raw text.
     val blocks = remember(b.text) { parseProse(b.text) }
@@ -131,20 +166,24 @@ private fun TranscriptBubble(b: ChatItem.Bubble) {
     // code lines have room, mirroring the web's `:has(.md-code)` widening.
     val wide = blocks.any { it is ProseBlock.Table || it is ProseBlock.Code }
     BoxWithConstraints(Modifier.fillMaxWidth()) {
-        val cap = if (wide) maxWidth else (maxWidth + BASE_BUBBLE_MAX) / 2
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start) {
-            Surface(
-                color = if (isUser) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surfaceVariant,
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.widthIn(max = cap),
-            ) {
-                // Force full-contrast prose (web parity: assistant text is --ink,
-                // not the muted --ink-2). Without this the assistant bubble's
-                // surfaceVariant background makes Surface derive onSurfaceVariant
-                // (a grey) as its content color, so agent text read grey in dark
-                // mode while the user bubble — whose color isn't a theme token, so
-                // it keeps the ambient onSurface — read white (XERK-136).
-                Column(Modifier.padding(10.dp, 6.dp)) {
+        // Boxless agent output spans the full width; a boxed bubble is capped.
+        val cap = if (!look.boxed || wide) maxWidth else (maxWidth + BASE_BUBBLE_MAX) / 2
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = if (isOperator) Arrangement.End else Arrangement.Start) {
+            // Force full-contrast prose (web parity: content is --ink, not the
+            // muted --ink-2). Without this a surfaceVariant Surface derives
+            // onSurfaceVariant (a grey) as its content color, so agent text read
+            // grey in dark mode while the user bubble read white (XERK-136).
+            val body: @Composable () -> Unit = {
+                Column(Modifier.padding(if (look.boxed) 10.dp else 0.dp, if (look.boxed) 6.dp else 2.dp)) {
+                    if (look.label.isNotEmpty()) {
+                        Text(
+                            look.label,
+                            fontSize = scaledSp(10f),
+                            fontWeight = FontWeight.SemiBold,
+                            color = look.accent ?: MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(bottom = 3.dp),
+                        )
+                    }
                     ProseBlocks(
                         blocks,
                         fontSize = scaledSp(13f),
@@ -153,6 +192,15 @@ private fun TranscriptBubble(b: ChatItem.Bubble) {
                     )
                     if (b.clipped) ClippedMark(Modifier.padding(top = 2.dp))
                 }
+            }
+            if (look.boxed) {
+                val shape = RoundedCornerShape(12.dp)
+                var mod = Modifier.widthIn(max = cap)
+                if (look.accent != null) mod = mod.border(1.dp, look.accent.copy(alpha = 0.42f), shape)
+                Surface(color = look.bg, shape = shape, modifier = mod, content = body)
+            } else {
+                // Plain agent text: no Surface, no background, no border.
+                Box(Modifier.widthIn(max = cap)) { body() }
             }
         }
     }
