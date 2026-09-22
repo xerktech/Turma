@@ -395,4 +395,38 @@ class ChatItemsTest {
         assertTrue("no tool rows for a non-marker-terminated run", items.none { it is ChatItem.Tool })
         assertTrue("linear scan should be well under a second (was ${elapsedMs}ms)", elapsedMs < 2_000)
     }
+
+    // ---- messageOrigin: a user turn's real source (web parity) --------------
+
+    @Test fun `messageOrigin classifies each relay framing, operator by default`() {
+        assertEquals("operator", messageOrigin("run the tests"))
+        // The Turma frame is matched ahead of the "Another Claude session" wrapper.
+        assertEquals("turma", messageOrigin(
+            "Another Claude session sent a message:\n[Relayed by Turma, this host's session manager] deliver"))
+        assertEquals("subagent", messageOrigin(
+            "Another Claude session sent a message:\n<agent-message from=\"abc\">\n[Subagent hand-back] report"))
+        assertEquals("peer", messageOrigin("Another Claude session sent a message: rebase first"))
+        assertEquals("peer", messageOrigin("[Peer message from turma, another session] heads up"))
+        assertEquals("system", messageOrigin("<system-reminder>\nnamed the session\n</system-reminder>"))
+        assertEquals("system", messageOrigin("[Image: original 1080x2400, displayed at 900x2000."))
+        assertEquals("system", messageOrigin("Continue from where you left off."))
+    }
+
+    @Test fun `buildItems stamps the origin only on user turns`() {
+        val items = buildItems(
+            listOf(
+                TailEntry(id = "op", role = "user", blocks = listOf(TextBlock("hi"))),
+                TailEntry(id = "tm", role = "user", blocks = listOf(TextBlock("[Relayed by Turma] open a PR"))),
+                TailEntry(id = "sa", role = "user", blocks = listOf(TextBlock("<agent-message from=\"x\"> done"))),
+                TailEntry(id = "as", role = "assistant", blocks = listOf(TextBlock("on it"))),
+            ),
+            VerbosityPrefs.forPreset(Verbosity.NORMAL),
+        )
+        val byKey = items.filterIsInstance<ChatItem.Bubble>().associate { it.entryKey to it.origin }
+        assertEquals("operator", byKey["op"])
+        assertEquals("turma", byKey["tm"])
+        assertEquals("subagent", byKey["sa"])
+        // An assistant turn is never reclassified — it stays the default.
+        assertEquals("operator", byKey["as"])
+    }
 }
