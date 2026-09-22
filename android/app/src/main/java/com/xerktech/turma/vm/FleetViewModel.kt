@@ -1,11 +1,20 @@
 package com.xerktech.turma.vm
 
 import android.app.Application
+import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.Attachment
+import com.xerktech.turma.core.AttachStatus
 import com.xerktech.turma.core.ModelSource
 import com.xerktech.turma.core.Runtime
+import com.xerktech.turma.core.Uploads
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import com.xerktech.turma.net.AnswerRequest
 import com.xerktech.turma.net.CloneRequest
 import com.xerktech.turma.net.InputRequest
@@ -65,6 +74,96 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
             container.fleet.state.collect {
                 val next = reconcilePending(_pending.value, it.agents, System.currentTimeMillis())
                 if (next != _pending.value) _pending.value = next
+            }
+        }
+    }
+
+    /**
+     * Files staged for a NEW-SESSION spawn (XERK-234 spawn attach), keyed
+     * "<host>::<repo>" so the dialog for one target can't see another's — the
+     * host-scoped twin of ChatViewModel's per-session attachments. Bytes stage to
+     * the hub host-scoped (there is no session id yet); [spawn] sends the ready
+     * ids as [SpawnRequest.uploadIds] and clears the list on a successful queue.
+     */
+    private val _spawnAtt = MutableStateFlow<Map<String, List<Attachment>>>(emptyMap())
+    val spawnAtt: StateFlow<Map<String, List<Attachment>>> = _spawnAtt
+    private var spawnAttSeq = 0
+
+    private fun spawnRk(host: String, repo: String) = "$host::$repo"
+    fun spawnAttFor(host: String, repo: String): List<Attachment> =
+        _spawnAtt.value[spawnRk(host, repo)].orEmpty()
+
+    private fun setSpawnAtt(rk: String, list: List<Attachment>) {
+        _spawnAtt.value = if (list.isEmpty()) _spawnAtt.value - rk
+        else _spawnAtt.value + (rk to list)
+    }
+    private fun updateSpawnAtt(rk: String, key: String, f: (Attachment) -> Attachment) {
+        setSpawnAtt(rk, (_spawnAtt.value[rk].orEmpty()).map { if (it.key == key) f(it) else it })
+    }
+
+    /** Stage files the operator picked in the composer — mirrors ChatViewModel.attach. */
+    fun attachSpawn(host: String, repo: String, uris: List<Uri>) {
+        val cap = fleet.value.agents.firstOrNull { it.key == host }?.uploadMaxBytes ?: 0L
+        if (!Uploads.canAttach(cap) || uris.isEmpty()) return
+        val rk = spawnRk(host, repo)
+        val resolver = getApplication<Application>().contentResolver
+        for (uri in uris) {
+            if (_spawnAtt.value[rk].orEmpty().size >= Uploads.MAX_PER_MESSAGE) {
+                _messages.tryEmit("✗ at most ${Uploads.MAX_PER_MESSAGE} files")
+                break
+            }
+            val (name, size) = runCatching {
+                resolver.query(uri, null, null, null, null)?.use { c ->
+                    val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val si = c.getColumnIndex(OpenableColumns.SIZE)
+                    if (c.moveToFirst())
+                        (if (ni >= 0) c.getString(ni) else null) to (if (si >= 0 && !c.isNull(si)) c.getLong(si) else 0L)
+                    else null
+                }
+            }.getOrNull() ?: (null to 0L)
+            val rec = Attachment(
+                key = "s" + (++spawnAttSeq),
+                name = Uploads.sanitizeUploadName(name ?: uri.lastPathSegment),
+                size = size,
+                status = if (size > cap) AttachStatus.ERROR else AttachStatus.UPLOADING,
+                error = if (size > cap) "too big — max ${Uploads.formatBytes(cap)}" else "",
+            )
+            setSpawnAtt(rk, _spawnAtt.value[rk].orEmpty() + rec)
+            if (rec.status != AttachStatus.ERROR) uploadSpawnOne(host, repo, rec, uri)
+        }
+    }
+
+    fun removeSpawnAttachment(host: String, repo: String, key: String) {
+        val rk = spawnRk(host, repo)
+        setSpawnAtt(rk, _spawnAtt.value[rk].orEmpty().filterNot { it.key == key })
+    }
+
+    private fun uploadSpawnOne(host: String, repo: String, rec: Attachment, uri: Uri) {
+        val rk = spawnRk(host, repo)
+        viewModelScope.launch {
+            val result = runCatching {
+                val bytes = withContext(Dispatchers.IO) {
+                    getApplication<Application>().contentResolver.openInputStream(uri)
+                        ?.use { it.readBytes() } ?: error("can't read the file")
+                }
+                container.client.api.uploadSpawnAttachment(
+                    host, rec.name,
+                    bytes.toRequestBody("application/octet-stream".toMediaType()),
+                )
+            }
+            val reply = result.getOrNull()
+            if (reply != null && reply.uploadId.isNotBlank()) {
+                updateSpawnAtt(rk, rec.key) {
+                    it.copy(
+                        status = AttachStatus.READY,
+                        uploadId = reply.uploadId,
+                        name = reply.name.ifBlank { it.name },
+                        size = if (reply.size > 0) reply.size else it.size,
+                    )
+                }
+            } else {
+                val why = result.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "upload failed"
+                updateSpawnAtt(rk, rec.key) { it.copy(status = AttachStatus.ERROR, error = why) }
             }
         }
     }
@@ -149,11 +248,20 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
         host: String, repo: String, prompt: String? = null, label: String? = null,
         baseRef: String? = null, model: String? = null, permissionMode: String? = null,
         modelSource: String? = null, localModel: String? = null, agentType: String? = null,
-    ) = run("session queued") {
-        container.client.api.spawnSession(
-            host,
-            spawnRequest(repo, prompt, label, baseRef, model, permissionMode, modelSource, localModel, agentType),
-        )
+    ) {
+        // Files attached in this composer (XERK-234 spawn attach). The dialog's
+        // Spawn button is disabled until every chip is ready, so this is non-null;
+        // clear synchronously (the dialog is dismissing) so a re-open is fresh.
+        val rk = spawnRk(host, repo)
+        val uploadIds = Uploads.readyUploadIds(_spawnAtt.value[rk].orEmpty())
+        setSpawnAtt(rk, emptyList())
+        run("session queued") {
+            container.client.api.spawnSession(
+                host,
+                spawnRequest(repo, prompt, label, baseRef, model, permissionMode,
+                    modelSource, localModel, agentType, uploadIds),
+            )
+        }
     }
 
     fun kill(host: String, id: String) {
@@ -235,6 +343,7 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
             repo: String, prompt: String? = null, label: String? = null,
             baseRef: String? = null, model: String? = null, permissionMode: String? = null,
             modelSource: String? = null, localModel: String? = null, agentType: String? = null,
+            uploadIds: List<String>? = null,
         ) = SpawnRequest(
             repo = repo,
             prompt = prompt?.ifBlank { null },
@@ -250,6 +359,9 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
             // subscription spawn stays byte-identical to before.
             localModel = if (ModelSource.spawnValue(modelSource) == ModelSource.LOCAL)
                 localModel?.ifBlank { null } else null,
+            // Staged composer attachments (XERK-234 spawn attach); empty -> null so
+            // a bare spawn is the exact body it always was.
+            uploadIds = uploadIds?.ifEmpty { null },
         )
 
         /** The in-flight action kind for a session, or null (web sessPending). */
