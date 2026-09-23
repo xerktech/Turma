@@ -861,6 +861,50 @@ test("XERK-939 QA: a CRASHED leader's caps refuse nothing — the dial fails, th
   srv.close(); f.close();
 });
 
+test("XERK-939 QA: a failed liveness dial frees its refusal slot — the next leader's oversize body is refused", async () => {
+  const dead = http.createServer();
+  const dport = await listen(dead);
+  await new Promise((r) => dead.close(r));
+  const { leader, seen, port: lport } = await countingLeader();
+  const { f, store } = await follower(`127.0.0.1:${dport}`, { bodyRoute: () => "hb", drainMax: 1 },
+    { bodyCaps: { hb: 100 }, drainSlack: 10 });
+  const { srv, port } = await followerServer(f);
+  const held = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) });
+  assert.equal(held.status, 299);
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader2", addr: `127.0.0.1:${lport}`, at: Date.now(), bodyCaps: { hb: 100 }, drainSlack: 10 });
+  const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) })
+    .catch((e) => ({ status: "err:" + e.code }));
+  assert.equal(r.status, 413, "the one slot came back after the failed dial");
+  assert.equal(seen.length, 0);
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-939 QA: a client leaving DURING the liveness dial frees its slot", async () => {
+  const { leader, seen, port: lport } = await countingLeader();
+  const { f } = await follower(`127.0.0.1:${lport}`, { bodyRoute: () => "hb", drainMax: 1, drainIdleMs: 60000 },
+    { bodyCaps: { hb: 100 }, drainSlack: 10 });
+  const { srv, port } = await followerServer(f);
+  const c = net.connect(port, "127.0.0.1"); // connected BEFORE the dial is slowed
+  c.on("error", () => {});
+  await new Promise((r) => c.once("connect", r));
+  const orig = net.connect;
+  net.connect = (...a) => { const s = new net.Socket(); setTimeout(() => s.connect(...a), 150); return s; };
+  try {
+    c.write("POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n");
+    await sleep(40);
+    c.destroy(); // gone before the slow dial lands
+    await sleep(250);
+  } finally {
+    net.connect = orig;
+  }
+  assert.equal(f.stats.refusedOversize, 0, "nobody left to refuse");
+  const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) })
+    .catch((e) => ({ status: "err:" + e.code }));
+  assert.equal(r.status, 413, "the slot came back when the client left");
+  assert.equal(seen.length, 0);
+  srv.close(); leader.close(); f.close();
+});
+
 test("XERK-939 QA: our OWN entry (demoted / restarted in place) carries caps but never refuses — held, then served", async () => {
   const { leader, seen, port: lport } = await countingLeader();
   for (const pub of [{ replica: "me" }, { replica: "old-me" }]) {
