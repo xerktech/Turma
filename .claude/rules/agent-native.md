@@ -24,6 +24,9 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   permanent. Launcher reaps
   the supervisor BEFORE the tunnel (else the old loop respawns the just-killed tunnel);
   `turma-agentctl stop` too. Tests: `test_turma_agent.sh`.
+- **Launcher refuses any arg it doesn't own, before anything runs** (XERK-937): only no-args,
+  `--preflight`, `--tunnel-supervisor`; `-h/--help` → usage. A fall-through (`--help`) reaped the live
+  tunnel and exec'd a second manager outside `turma-agentctl`'s pidfile. New modes join that `case`.
 - Launcher exports `TURMA_MANAGER_PID=$$` so the tunnel's `pokeHeartbeat` signals the right process.
 - `install.sh` — idempotent (`--verify`/`--uninstall`): apt + npm + pinned static ttyd + pinned
   static glab (best-effort; a session's MR gets no chip without it), lays files keeping
