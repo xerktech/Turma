@@ -345,3 +345,242 @@ test("XERK-919: canServeLocally holds a promoted leader until its registry re-sy
     hub.__setLiveStore(new FS(), false);
   }
 });
+
+// ---- XERK-919 QA round 1 fixes ----------------------------------------------
+
+const { FORWARD_AUTH_HEADER } = require("../forward.js");
+
+test("XERK-919 QA: a client-supplied hop header without a valid proof is IGNORED (no forced hold / second writer)", async () => {
+  const store = new FileLiveStore();
+  const f = makeForwarder(store, "me", { isLeader: () => false, authToken: "sekret", holdMs: 50, holdPollMs: 5 });
+  await f.start();
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: "127.0.0.1:1", at: Date.now() });
+  assert.deepEqual(f.decide(req("/api/x", { [FORWARDED_HEADER]: "x,y" })), { forward: "127.0.0.1:1" },
+    "a spoofed hop list neither holds nor degrades the request");
+  // A genuine hop (proof from the same secret) is honoured.
+  const peer = makeForwarder(new FileLiveStore(), "leader", { isLeader: () => false, authToken: "sekret" });
+  const crypto = require("node:crypto");
+  const proof = crypto.createHmac("sha256", "sekret").update("turma-forward\nleader").digest("base64url");
+  assert.ok(f.decide(req("/api/x", { [FORWARDED_HEADER]: "leader", [FORWARD_AUTH_HEADER]: proof })).hold);
+  // A forged proof of the RIGHT length (an attacker can see the shape) is still refused.
+  const forged = proof.slice(0, -1) + (proof.endsWith("A") ? "B" : "A");
+  assert.deepEqual(f.decide(req("/api/x", { [FORWARDED_HEADER]: "leader", [FORWARD_AUTH_HEADER]: forged })),
+    { forward: "127.0.0.1:1" }, "a same-length forged proof is ignored");
+  f.close(); void peer;
+});
+
+test("XERK-919 QA: the forwarded hop header carries a proof the leader side can verify", async () => {
+  let seen;
+  const leader = http.createServer((rq, rs) => { seen = rq.headers; rs.end("ok"); });
+  const lport = await listen(leader);
+  const { f } = await follower(`127.0.0.1:${lport}`, { authToken: "sekret" });
+  const { srv, port } = await followerServer(f);
+  await request(port, { path: "/api/x", headers: { [FORWARDED_HEADER]: "evil", [FORWARD_AUTH_HEADER]: "forged" } });
+  assert.equal(seen[FORWARDED_HEADER], "me", "the client's hop list is stripped, ours replaces it");
+  const verifier = makeForwarder(new FileLiveStore(), "leader", { isLeader: () => false, authToken: "sekret" });
+  await verifier.start();
+  await (async () => {})();
+  // `leader` sees a proven hop through "me".
+  const d = verifier.decide(req("/api/x", seen));
+  assert.ok(d.hold || d.local, "a proven hop list is trusted downstream");
+  srv.close(); leader.close(); f.close(); verifier.close();
+});
+
+test("XERK-919 QA: a leader entry naming OUR OWN address (a previous incarnation) is never forwarded to", async () => {
+  const store = new FileLiveStore();
+  const f = makeForwarder(store, "new-me", { endpoint: "127.0.0.1:18301", isLeader: () => false });
+  await f.start();
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "old-me", addr: "127.0.0.1:18301", at: Date.now() });
+  assert.ok(f.decide(req("/api/x")).hold, "holds rather than dial itself");
+  assert.equal(f.remoteLeaderFresh(), false);
+  f.close();
+});
+
+test("XERK-919 QA: while the store link is down, a stale-by-age leader stays the target (no degrade to writer)", async () => {
+  let healthy = true;
+  const store = new FileLiveStore();
+  const f = makeForwarder(store, "me", { isLeader: () => false, ttlMs: 40, storeHealthy: () => healthy });
+  await f.start();
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: "127.0.0.1:1", at: Date.now() });
+  await sleep(60);
+  assert.ok(f.decide(req("/api/x")).hold, "healthy store + stale entry -> hold");
+  healthy = false;
+  assert.deepEqual(f.decide(req("/api/x")), { forward: "127.0.0.1:1" }, "store down -> keep the last known leader");
+  f.close();
+});
+
+test("XERK-919 QA: onRemoteLeader fires when a fresh remote leader is learned", async () => {
+  const store = new FileLiveStore();
+  let fired = 0;
+  const f = makeForwarder(store, "me", { isLeader: () => false, onRemoteLeader: () => { fired++; } });
+  await f.start();
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: "127.0.0.1:1", at: Date.now() });
+  assert.ok(fired >= 1);
+  f.close();
+});
+
+test("XERK-919 QA: a request whose body never comes still reaches the leader (head flushed at once)", async () => {
+  const leader = http.createServer((rq, rs) => { rs.writeHead(401); rs.end("no"); });
+  const lport = await listen(leader);
+  const { f } = await follower(`127.0.0.1:${lport}`);
+  const { srv, port } = await followerServer(f);
+  const got = await new Promise((resolve) => {
+    const s = net.connect(port, "127.0.0.1", () =>
+      s.write("POST /api/x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n"));
+    let buf = "";
+    s.on("data", (d) => { buf += d; if (/401/.test(buf)) { s.destroy(); resolve("401"); } });
+    setTimeout(() => { s.destroy(); resolve("HUNG:" + buf.slice(0, 40)); }, 2000);
+  });
+  assert.equal(got, "401");
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-919 QA: an HTTP/1.0 request with no Host still forwards", async () => {
+  const leader = http.createServer((rq, rs) => rs.end("host=" + rq.headers.host));
+  const lport = await listen(leader);
+  const { f } = await follower(`127.0.0.1:${lport}`);
+  const { srv, port } = await followerServer(f);
+  const got = await new Promise((resolve) => {
+    const s = net.connect(port, "127.0.0.1", () => s.write("GET /api/x HTTP/1.0\r\n\r\n"));
+    let buf = ""; s.on("data", (d) => (buf += d)); s.on("end", () => resolve(buf)); s.on("close", () => resolve(buf));
+  });
+  assert.match(got, /^HTTP\/1\.[01] 200/);
+  assert.match(got, /host=hub/);
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-919 QA: a CHUNKED request body arrives intact (transfer-encoding re-framed, not doubled)", async () => {
+  let body;
+  const leader = http.createServer((rq, rs) => { let b = ""; rq.on("data", (c) => (b += c)); rq.on("end", () => { body = b; rs.end("ok"); }); });
+  const lport = await listen(leader);
+  const { f } = await follower(`127.0.0.1:${lport}`);
+  const { srv, port } = await followerServer(f);
+  await new Promise((resolve, reject) => {
+    const r = http.request({ host: "127.0.0.1", port, method: "POST", path: "/api/x", agent: false }, (res) => { res.resume(); res.on("end", resolve); });
+    r.on("error", reject);
+    r.write("hello "); r.write("chunked "); r.end("world");
+  });
+  assert.equal(body, "hello chunked world");
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-919 QA: a leader closing a CHUNKED body without its terminal chunk truncates the client (no hang)", async () => {
+  const leader = net.createServer((sock) => {
+    sock.once("data", () => {
+      sock.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n");
+      setTimeout(() => sock.end(), 30); // FIN, no terminating 0-chunk
+    });
+    sock.on("error", () => {});
+  });
+  const lport = await listen(leader);
+  const { f } = await follower(`127.0.0.1:${lport}`);
+  const { srv, port } = await followerServer(f);
+  const outcome = await new Promise((resolve) => {
+    const t = setTimeout(() => resolve("HUNG"), 3000);
+    http.get({ host: "127.0.0.1", port, path: "/x", agent: false }, (res) => {
+      res.on("data", () => {});
+      const done = (w) => { clearTimeout(t); resolve(w); };
+      res.on("end", () => done("end")); res.on("error", () => done("error")); res.on("aborted", () => done("aborted"));
+      res.on("close", () => done("close"));
+    }).on("error", () => { clearTimeout(t); resolve("error"); });
+  });
+  assert.notEqual(outcome, "HUNG");
+  assert.notEqual(outcome, "end", "a truncated body must not read as a complete one");
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-919 QA: the leader handover lands the registry, THEN releases, THEN retracts", async () => {
+  const hub = require("../server.js");
+  const order = [];
+  let landWrite;
+  const st = {
+    watch() { return () => {}; }, async del() {}, async get() { return null; }, async scan() { return []; },
+    set() { return new Promise((r) => { landWrite = () => { order.push("store-write-landed"); r(); }; }); },
+  };
+  hub.__setLiveStore(st, true);
+  hub.agents.hh = { device: "hh", sessions: [], commands: [] };
+  hub.markAgentDirty("hh");
+  hub.__setLeader({ isLeader: () => true, release: async () => { order.push("release"); } });
+  hub.__setForwarder({ retract: async () => { order.push("retract"); } });
+  try {
+    assert.equal(hub.releaseAtSignal(), false, "a leader does NOT release at signal receipt");
+    const settle = (p) => Promise.resolve(p);
+    const done = hub.leaderHandover(settle);
+    await sleep(20);
+    assert.deepEqual(order, [], "nothing is released while the registry write is in flight");
+    landWrite();
+    await done;
+    assert.deepEqual(order, ["store-write-landed", "release", "retract"]);
+    hub.__setLeader({ isLeader: () => false, release: async () => {} });
+    assert.equal(hub.releaseAtSignal(), true, "a follower stops its elector at once");
+  } finally {
+    delete hub.agents.hh;
+    hub.__setForwarder(null);
+    hub.__setLeader(null);
+    hub.__setLiveStore(new FileLiveStore(), false);
+  }
+});
+
+test("XERK-919 QA: a follower hands back tunnels it holds once a leader is serving — never while it serves", async () => {
+  const hub = require("../server.js");
+  const ended = [];
+  hub.controlChannels.pinned = { socket: { end: () => ended.push("pinned") } };
+  let remote = true;
+  hub.__setForwarder({ remoteLeaderFresh: () => remote });
+  hub.__setLiveStore(new FileLiveStore(), true);
+  let leading = true;
+  hub.__setLeader({ isLeader: () => leading, release: async () => {} });
+  try {
+    assert.equal(hub.dropDegradedTunnels("t"), 0, "the serving leader keeps its tunnels");
+    leading = false; remote = false;
+    assert.equal(hub.dropDegradedTunnels("t"), 0, "no leader to hand to -> keep serving them (degraded)");
+    remote = true;
+    assert.equal(hub.dropDegradedTunnels("t"), 1);
+    assert.deepEqual(ended, ["pinned"], "closed (1001) so the agent re-dials onto the leader");
+  } finally {
+    delete hub.controlChannels.pinned;
+    hub.__setForwarder(null);
+    hub.__setLeader(null);
+    hub.__setLiveStore(new FileLiveStore(), false);
+  }
+});
+
+test("XERK-919 QA: gracefulShutdown releases at signal ONLY for a non-leader and hands over via leaderHandover", () => {
+  // The drain lives in the production boot branch (no TURMA_TEST path reaches it), so
+  // pin its wiring at the source: the release at signal receipt must be gated on
+  // releaseAtSignal(), and the leader's release must happen inside leaderHandover.
+  const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "server.js"), "utf8");
+  const body = src.slice(src.indexOf("const gracefulShutdown = (signal) => {"), src.indexOf('process.on("SIGTERM"'));
+  assert.match(body, /const wasLeader = !releaseAtSignal\(\);/);
+  assert.match(body, /if \(hubLeader && !wasLeader\) Promise\.resolve\(hubLeader\.release\(\)\)/);
+  assert.match(body, /if \(wasLeader\) await leaderHandover\(settle\);/);
+  assert.equal((body.match(/hubLeader\.release\(\)/g) || []).length, 1, "no other release in the drain");
+});
+
+test("XERK-919 QA: a leader that answers 413 mid-body, then resets, reaches the client as the 413", async () => {
+  // The real hub answers a body past its cap + drain slack and then cuts the socket
+  // while the client is still writing. The answer must be relayed, and the later
+  // write error must not clobber it (a reset in the SAME tick as the answer is a
+  // residual race Node cannot always win — see turma-ha-leader.md).
+  const leader = net.createServer((sock) => {
+    let got = 0;
+    sock.on("data", (d) => {
+      got += d.length;
+      if (got > 200000 && !sock.answered) {
+        sock.answered = true;
+        const body = '{"error":"body too large","limit":1}';
+        sock.write(`HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`);
+        setTimeout(() => sock.resetAndDestroy(), 20);
+      }
+    });
+    sock.on("error", () => {});
+  });
+  const lport = await listen(leader);
+  const { f } = await follower(`127.0.0.1:${lport}`);
+  const { srv, port } = await followerServer(f);
+  const big = Buffer.alloc(20 * 1024 * 1024, 120);
+  const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": big.length }, body: big })
+    .catch((e) => ({ status: "err:" + e.code }));
+  assert.equal(r.status, 413, `got ${r.status}`);
+  srv.close(); leader.close(); f.close();
+});

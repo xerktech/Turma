@@ -56,11 +56,32 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   once. `TURMA_HA_FORWARD=0` is the escape hatch back to active-active.
 - **The hop list (`x-turma-forwarded-by`) bounds forwarding**: never back through a replica already
   traversed, never past `MAX_HOPS` (2) — two replicas that briefly disagree hold rather than bounce.
+  **It is only trusted with a valid proof** (`x-turma-forward-auth` = HMAC of the list under
+  `HMAC(SESSION_KEY,"turma-forward")`); a client-supplied list is ignored and stripped. Unproven, any
+  client could force a follower to hold 5s and then serve DEGRADED — a second writer on demand
+  (QA measured 3/100 acknowledged inputs lost that way).
+- **A follower hands back tunnels it holds** (`dropDegradedTunnels`: every control channel closed
+  1001, local `/live` viewers dropped) the moment a fresh remote leader is known — on the forwarder's
+  `onRemoteLeader` edge and a 2s sweep. A tunnel accepted while this replica led, or while it served
+  DEGRADED after a crash, otherwise stays pinned to a replica the dial-backs never reach: that host's
+  terminals fail forever (QA: 3/5 SIGKILL+restart trials). Never while this replica serves.
+- **A leader entry naming THIS replica's own address under another id is a previous incarnation**
+  (a container restart keeps `POD_IP`) — ignored, never dialed (it forwarded to itself).
+- **While this replica's STORE link is down, the last known leader stays the target** regardless of
+  entry age (`storeHealthy`) — a stale-by-age entry proves nothing when refreshes cannot arrive; only
+  a failed dial ends it. Else a store blip turned a follower into a DEGRADED second writer.
 - **Forwarding is byte-faithful**: the follower dials the leader BEFORE reading the request (a failed
   dial leaves it unread, so it can still be held/served), pipes the body, relays raw headers
   (duplicate `Set-Cookie` kept), streams SSE chunk-by-chunk, and a leader dying mid-body TRUNCATES
   the client (never a hang — the XERK-865 lesson). An upgrade is rebuilt from `rawHeaders` + `head`
-  and piped raw, so the leader does the handshake. `Connection: close` upstream (one socket each).
+  and piped raw, so the leader does the handshake. `Connection: close` upstream (one socket each),
+  headers flushed at once (a client that sends `Expect: 100-continue` then no body still gets the
+  leader's 401/413), a `Host` added for an HTTP/1.0 client that sent none.
+- **Residual: a body past the leader's cap + drain slack can surface as 502, not 413, ~1 in 6.**
+  The hub answers 413 then RESETS; Node reports our next write's `ECONNRESET` before reading the
+  queued answer. The body is fed through a stage that yields to the event loop between chunks (and
+  stops on the answer) so the read usually wins; the agent retries a 502, so it self-heals. Fully
+  closing it needs the hub not to reset forwarded bodies — which weakens its runaway-body defence.
 - **The graceful handover, in this order (load-bearing)** — the leader KEEPS leading through the
   `/readyz` hold (followers keep forwarding to it), then in `cutAndFlush`: close the listener →
   `await flushAgentsToStoreNow()` → `await release()` → `await forwarder.retract()` (deletes its
@@ -76,7 +97,9 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   lost; terminals down until the lease expires, ~15s). **Not** horizontal request scale-out.
 - The tunnel directory + byte relay (`turma-ha-tunnel.md`) stay as the handover/degraded path.
 - **The graceful-drain readiness gate is per replica**: SIGTERM flips `hubDraining` → `/readyz` 503.
-- Tests: `turma/tests/forward.test.js`; the `XERK-919:` cases in `registry-store.test.js`.
+- Tests: `turma/tests/forward.test.js` (incl. the `XERK-919 QA:` cases, and a SOURCE pin on the
+  drain's release-at-signal wiring, which no TURMA_TEST path reaches); the `XERK-919:` cases in
+  `registry-store.test.js`.
 
 ### Verifying HA for real (the local stack recipe)
 

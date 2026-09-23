@@ -22,6 +22,8 @@
 
 const net = require("net");
 const http = require("http");
+const crypto = require("crypto");
+const { Transform } = require("stream");
 
 // The leader's dialable HTTP address, byte-free, TTL'd and refreshed while it leads.
 const LEADER_ENDPOINT_KEY = "hubLeader:endpoint";
@@ -29,6 +31,11 @@ const LEADER_ENDPOINT_KEY = "hubLeader:endpoint";
 // that already carries it — two replicas that briefly disagree about who leads
 // then serve it rather than bouncing it between them.
 const FORWARDED_HEADER = "x-turma-forwarded-by";
+// Proves a hop list came from a replica, not a client (XERK-919 QA): an HMAC of the
+// hop list under the replica-shared secret. A client-supplied FORWARDED_HEADER without
+// a valid proof is IGNORED (and stripped), so it can neither force a follower to hold
+// nor to serve as a second writer.
+const FORWARD_AUTH_HEADER = "x-turma-forward-auth";
 // Answered by THIS replica, never forwarded: the kubelet probes are per-pod facts
 // (a follower's liveness/drain is its own, not the leader's).
 const LOCAL_PATHS = new Set(["/healthz", "/readyz"]);
@@ -75,7 +82,7 @@ function endToEnd(raw) {
   for (let i = 0; i + 1 < raw.length; i += 2) {
     const k = raw[i];
     const lk = String(k).toLowerCase();
-    if (HOP_BY_HOP.has(lk) || lk === FORWARDED_HEADER) continue;
+    if (HOP_BY_HOP.has(lk) || lk === FORWARDED_HEADER || lk === FORWARD_AUTH_HEADER) continue;
     out.push(k, raw[i + 1]);
   }
   return out;
@@ -105,6 +112,14 @@ function makeForwarder(store, replicaId, deps = {}) {
     holdMs = DEFAULTS.holdMs,
     holdPollMs = DEFAULTS.holdPollMs,
     now = Date.now,
+    authToken = null, // replica-shared secret; null (tests) => hop lists are trusted
+    // () => boolean: is THIS replica's store link up? While it is down, a leader entry
+    // cannot be refreshed, so its age proves nothing — keep forwarding to the last
+    // known leader (a dial failure still ends it) instead of degrading to a writer.
+    storeHealthy = () => true,
+    // (leader) => void: a FRESH REMOTE leader was learned (appeared or changed). The
+    // caller drops sockets it served while degraded (its local agent tunnels).
+    onRemoteLeader = () => {},
   } = deps;
   const canServe = deps.canServe || isLeader;
 
@@ -141,9 +156,35 @@ function makeForwarder(store, replicaId, deps = {}) {
 
   // The replicas a request has already passed through (FORWARDED_HEADER is a
   // comma list, oldest first).
+  function hopProof(hops) {
+    return crypto.createHmac("sha256", authToken).update("turma-forward\n" + hops).digest("base64url");
+  }
   function hopsOf(req) {
     const v = req && req.headers && req.headers[FORWARDED_HEADER];
-    return typeof v === "string" && v ? v.split(",").map((x) => x.trim()).filter(Boolean) : [];
+    if (typeof v !== "string" || !v) return [];
+    if (authToken) {
+      const got = req.headers[FORWARD_AUTH_HEADER];
+      const want = hopProof(v);
+      if (typeof got !== "string" || got.length !== want.length ||
+          !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want))) return []; // a client's claim: ignored
+    }
+    return v.split(",").map((x) => x.trim()).filter(Boolean);
+  }
+  // The header pair to put on a forwarded request: our id appended, plus its proof.
+  function hopHeaders(hops) {
+    const list = hops.concat(replicaId).join(",");
+    return authToken ? [FORWARDED_HEADER, list, FORWARD_AUTH_HEADER, hopProof(list)] : [FORWARDED_HEADER, list];
+  }
+  // A leader entry naming OUR OWN address under another replica id is a previous
+  // incarnation of this pod (a container restart keeps the POD_IP) — never a target.
+  function isOwnAddr(addr) {
+    return !!endpoint && addr === endpoint;
+  }
+  // Is there a fresh leader that is not us? (the caller's "drop degraded sockets" test)
+  function remoteLeaderFresh() {
+    const e = leader;
+    return !!e && e.replica !== replicaId && !!e.addr && !isOwnAddr(e.addr) &&
+      (now() - e.seenAt < ttlMs || !storeHealthy());
   }
 
   const LOCAL = { local: true };
@@ -155,8 +196,8 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (LOCAL_PATHS.has(path)) return LOCAL;
     if (canServe()) { noteMode("serving locally (this replica is the leader)"); return LOCAL; }
     const e = leader;
-    const fresh = e && now() - e.seenAt < ttlMs;
-    if (!fresh || e.replica === replicaId) {
+    const fresh = e && (now() - e.seenAt < ttlMs || !storeHealthy());
+    if (!fresh || e.replica === replicaId || (e.addr && isOwnAddr(e.addr))) {
       // No live leader but us-not-yet-ready (promotion re-sync), or a handover in
       // flight, or the leader just died: never become a second writer — hold.
       return { hold: !fresh ? "no fresh leader endpoint" : "this replica is taking over" };
@@ -260,10 +301,17 @@ function makeForwarder(store, replicaId, deps = {}) {
     const headers = endToEnd(req.rawHeaders || []);
     // One upstream socket per forwarded request (dialed above), so ask the leader
     // to close it after the response rather than idling it in keep-alive.
-    headers.push(FORWARDED_HEADER, r.hops.concat(replicaId).join(","), "Connection", "close");
+    headers.push(...hopHeaders(r.hops), "Connection", "close");
+    // An HTTP/1.0 client may send no Host; the leader's parser requires one.
+    if (!req.headers.host) headers.push("Host", "hub");
     let up;
     try {
       up = http.request({ method: req.method, path: req.url, headers, createConnection: () => sock });
+      // Send the head NOW, not on the first body write: a request whose body never
+      // comes (an `Expect: 100-continue` client that gives up) must still reach the
+      // leader, which may answer it (401, 413) without the body.
+      up.flushHeaders();
+
     } catch (e) {
       sock.destroy();
       if (!res.headersSent) {
@@ -272,7 +320,12 @@ function makeForwarder(store, replicaId, deps = {}) {
       }
       return true;
     }
+    let answered = false;
     up.on("response", (upRes) => {
+      answered = true;
+      // The leader has answered: stop sending it the body (a refusal is about to cut
+      // the connection, and every further write only races that cut).
+      req.unpipe(feed);
       // A client that went away mid-request: nothing to relay to.
       if (res.destroyed) { upRes.resume(); up.destroy(); return; }
       try {
@@ -291,6 +344,9 @@ function makeForwarder(store, replicaId, deps = {}) {
       upRes.on("close", () => { if (!upRes.complete) res.destroy(); });
     });
     up.on("error", (e) => {
+      // A write error AFTER the leader answered (it refused the body and cut the
+      // connection) is not a failure of the answer: let the response relay finish.
+      if (answered && res.headersSent) return; // upRes' own close/error handling settles it
       if (!res.headersSent && !res.writableEnded && !res.destroyed) {
         res.writeHead(502, { "content-type": "application/json", "retry-after": "1" });
         res.end(JSON.stringify({ error: `hub leader unreachable — retry (${e.message})` }));
@@ -301,7 +357,16 @@ function makeForwarder(store, replicaId, deps = {}) {
     // The client going away tears the upstream down (SSE especially — else the
     // leader keeps writing to a socket nobody reads).
     res.on("close", () => { if (!res.writableFinished) up.destroy(); });
-    req.pipe(up);
+    // Feed the body through a stage that YIELDS to the event loop between chunks, so a
+    // response the leader sends mid-body (a size/budget refusal — 413 past its drain
+    // slack, then a reset) is READ before our next write can fail on the reset. With a
+    // tight write loop Node reports only the write error and drops the queued answer,
+    // turning a 413 (which tells the agent to SHRINK the body) into a 502 it retries.
+    const feed = new Transform({
+      transform(chunk, _enc, cb) { setImmediate(() => cb(null, chunk)); },
+    });
+    feed.on("error", () => {});
+    req.pipe(feed).pipe(up);
     return true;
   }
 
@@ -335,10 +400,12 @@ function makeForwarder(store, replicaId, deps = {}) {
     const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion || "1.1"}`];
     const raw = req.rawHeaders || [];
     for (let i = 0; i + 1 < raw.length; i += 2) {
-      if (String(raw[i]).toLowerCase() === FORWARDED_HEADER) continue;
+      const lk = String(raw[i]).toLowerCase();
+      if (lk === FORWARDED_HEADER || lk === FORWARD_AUTH_HEADER) continue;
       lines.push(`${raw[i]}: ${raw[i + 1]}`);
     }
-    lines.push(`${FORWARDED_HEADER}: ${r.hops.concat(replicaId).join(",")}`);
+    const hh = hopHeaders(r.hops);
+    for (let i = 0; i < hh.length; i += 2) lines.push(`${hh[i]}: ${hh[i + 1]}`);
     up.write(lines.join("\r\n") + "\r\n\r\n");
     if (head && head.length) up.write(head);
     if (typeof socket.setNoDelay === "function") socket.setNoDelay(true);
@@ -379,7 +446,11 @@ function makeForwarder(store, replicaId, deps = {}) {
     leader = { replica: v.replica, addr: v.addr, seenAt };
     if (changed && v.replica !== replicaId) {
       unreachableUntil.delete(v.addr); // a NEW leader gets a fresh chance at once
-      log(`forward: leader endpoint is ${v.addr || "UNDIALABLE"} (replica ${v.replica})`);
+      log(`forward: leader endpoint is ${v.addr || "UNDIALABLE"} (replica ${v.replica})` +
+        (v.addr && isOwnAddr(v.addr) ? " — OUR OWN address (a previous incarnation), ignored" : ""));
+    }
+    if (remoteLeaderFresh()) {
+      try { onRemoteLeader(leader); } catch { /* the caller's; never let it break the watch */ }
     }
   }
 
@@ -444,6 +515,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     close,
     // Introspection (tests, and the boot log) — never on the request path.
     get leader() { return leader; },
+    remoteLeaderFresh,
     get liveCount() { return live.size; },
     stats,
   };
@@ -455,6 +527,7 @@ module.exports = {
   endToEnd,
   LEADER_ENDPOINT_KEY,
   FORWARDED_HEADER,
+  FORWARD_AUTH_HEADER,
   LOCAL_PATHS,
   DEFAULTS,
   MAX_HOPS,

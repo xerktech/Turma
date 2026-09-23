@@ -190,6 +190,45 @@ let forwarder = null;
 let promotionSyncing = false;
 // Bounds that re-sync so a slow/broken store can never wedge a new leader.
 const PROMOTION_SYNC_MAX_MS = 3000;
+
+// A NON-serving replica that still holds agent tunnels (accepted while it led, or
+// while it served DEGRADED with no leader) must hand them back: every data-channel
+// dial-back and every /term, /live the fleet sends now terminates on the LEADER,
+// where this replica's pendingChannels do not exist — so a tunnel pinned here reads
+// online but no terminal for that host can ever open (XERK-919 QA HIGH). Close each
+// with 1001 "going away"; the agent re-dials through the LB, and the forwarder puts
+// it on the leader. Also closes this replica's local /live viewers so they re-attach
+// through the leader. No-op while this replica serves, or with no fresh remote leader.
+function dropDegradedTunnels(why) {
+  if (!forwarder || canServeLocally() || !forwarder.remoteLeaderFresh()) return 0;
+  let n = 0;
+  for (const name of Object.keys(controlChannels)) {
+    try { controlChannels[name].socket.end(wsEncode(0x8, Buffer.from([0x03, 0xe9]))); n++; } catch { /* gone */ }
+  }
+  for (const host of Object.keys(liveClients)) {
+    for (const sid of Object.keys(liveClients[host] || {})) {
+      for (const sock of liveClients[host][sid] || []) { try { if (sock.destroy) sock.destroy(); } catch { /* gone */ } }
+    }
+  }
+  if (n) console.log(`forward: handed ${n} agent tunnel(s) back to the leader (${why})`);
+  return n;
+}
+
+// The graceful LEADER handover (XERK-919), in its load-bearing order: land the
+// registry, THEN release the lease (backdated — a standby promotes within one retry),
+// THEN retract the leader endpoint so followers hold for the successor instead of
+// dialing a listener that is closing. `settle(p, ms)` bounds each step.
+async function leaderHandover(settle) {
+  await settle(flushAgentsToStoreNow(), 2000);
+  if (hubLeader) await settle(hubLeader.release(), 2000);
+  if (forwarder) await settle(forwarder.retract(), 1000);
+}
+// At SIGTERM a follower stops its elector at once (it must not win the lease while
+// draining); a leader must NOT release yet — it keeps leading through the readiness
+// hold, and hands over only in leaderHandover.
+function releaseAtSignal() {
+  return !(HA_ON && isLeader());
+}
 // May THIS replica serve a request as the single writer (XERK-919)? The leader,
 // once its promotion re-sync is done. HA off / no elector: always.
 function canServeLocally() {
@@ -4732,6 +4771,8 @@ function relayDial(_replica, addr) {
 // XERK-760 requires identical across replicas), so the relay listener can turn
 // away a channel from a stray in-cluster peer. Stable across a replica's life.
 const RELAY_AUTH_TOKEN = crypto.createHmac("sha256", SESSION_KEY).update("turma-relay").digest("base64url");
+// The forwarder's hop-list proof key (XERK-919): same derivation, its own label.
+const FORWARD_AUTH_TOKEN = crypto.createHmac("sha256", SESSION_KEY).update("turma-forward").digest("base64url");
 
 // Write one SSE frame to every open /api/events stream ON THIS PROCESS
 // (best-effort; a dead stream is dropped on its next failed write and by its
@@ -19543,6 +19584,7 @@ if (process.env.TURMA_TEST) {
     __setForwarder(v) { forwarder = v; },
     hubHttpEndpointAddr,
     resyncAgentsFromStore, canServeLocally, STORE_WRITER_KEY,
+    leaderHandover, releaseAtSignal, dropDegradedTunnels,
     get promotionSyncing() { return promotionSyncing; },
     // XERK-781: the relay CONSUMERS. `openChannel` is relay-aware (proxies a data
     // channel to the tunnel owner); `openChannelLocal`/`openLiveForRelay` are the
@@ -19769,7 +19811,14 @@ if (process.env.TURMA_TEST) {
       canServe: canServeLocally,
       enabled: forwardEnabled,
       log: (m) => console.log(m),
+      authToken: FORWARD_AUTH_TOKEN,
+      storeHealthy: () => !liveStore.health || liveStore.health === "ready",
+      onRemoteLeader: () => dropDegradedTunnels("a leader is serving"),
     });
+    // Backstop for the watch edge above (e.g. this replica LOST the lease while it
+    // still held tunnels it accepted as leader or while degraded).
+    const degradedSweep = setInterval(() => dropDegradedTunnels("a leader is serving"), 2000);
+    degradedSweep.unref?.();
     console.log(forwardEnabled
       ? `serving: single-writer — the leader serves, followers forward to it (this replica's endpoint ${
         hubEndpoint || "UNRESOLVED — followers cannot forward to this replica while it leads"})`
@@ -19862,7 +19911,7 @@ if (process.env.TURMA_TEST) {
     // served while a promoted successor served too: two writers, and commands
     // queued on this side overwritten. A FOLLOWER stops its elector at once (it must
     // not win the lease while draining); release() is a no-op for a non-holder.
-    const wasLeader = HA_ON && isLeader();
+    const wasLeader = !releaseAtSignal();
     if (hubLeader && !wasLeader) Promise.resolve(hubLeader.release()).catch(() => {});
     // Bounded await: a store or k8s API that hangs must never stall the drain past
     // the force-exit backstop.
@@ -19890,11 +19939,7 @@ if (process.env.TURMA_TEST) {
       // (backdated, so a standby promotes within one election retry), THEN retract
       // the leader endpoint so followers hold for the successor rather than dial a
       // listener that just closed. Each step bounded; the backstop still applies.
-      if (wasLeader) {
-        await settle(flushAgentsToStoreNow(), 2000);
-        if (hubLeader) await settle(hubLeader.release(), 2000);
-        if (forwarder) await settle(forwarder.retract(), 1000);
-      }
+      if (wasLeader) await leaderHandover(settle);
       // End the long-lived streams ourselves — server.close() waits on open SSE
       // responses and never tracks upgraded WebSockets, so neither ends without
       // this. Each is closed with a RECONNECT HINT so the client re-dials at once.
