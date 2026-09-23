@@ -2,6 +2,7 @@
 // timestamp render needs travels in AppState.now. Target: 10 lines x ~560px
 // usable width (the G2's 576x288 canvas, ~10 text lines).
 import type { AppState, ReplyScreenState, SessionScreenState } from "./app.ts";
+import { fontSafe, fontStrip } from "./font.ts";
 import { bottomBoxLines, inputBoxBody, menuBox, sheetBody, statusLabel, type MicState } from "./input-box.ts";
 import { DISPLAY_LINES, LINE_WIDTH_PX } from "./layout.ts";
 import { filterAgents, glyph, liveState, sessionName } from "./sessions.ts";
@@ -202,7 +203,7 @@ export function buildHomeRows(state: AppState): HomeRow[] {
       const display = state.pending[session.id] ? "pending" : liveState(session);
       const g = glyph(display);
       const labelOrRepo = session.label || session.repo;
-      const name = sessionName(session);
+      const name = glassesName(session);
       // The host is already the header above these rows, so the row itself is
       // just <repo>-<generated name> (e.g. "Turma-Adding Compose Flag"),
       // falling back to <repo>-<short id> when the session is unnamed.
@@ -342,7 +343,7 @@ function renderSessionBottom(state: AppState, sess: SessionScreenState): BottomM
     // The question fills the box; drop the background status so it doesn't sit
     // on top of the sheet. (questionSheetActive already implies mic idle, so
     // there's no mic indicator to preserve here.)
-    return { mode: "sheet", lines: sheetBody({ question, options, selected }), options, selected, status: "", focused };
+    return { mode: "sheet", lines: sheetBody({ question: fontSafe(question), options: options.map(fontSafe), selected }), options, selected, status: "", focused };
   }
 
   const draft = sess.draft;
@@ -518,13 +519,21 @@ function renderReply(state: AppState): string[] {
   return lines;
 }
 
+// sessionName made drawable by the G2 font. Done here, not in sessionName: the
+// phone companion shares that and pre-fills Rename from it, so degrading it
+// there would write back to the hub. Stripped BEFORE the name falls back, so an
+// undrawable summary gets the short id rather than "?".
+function glassesName(s: SessionInfo): string {
+  return sessionName(s.summary ? { ...s, summary: fontStrip(s.summary) } : s);
+}
+
 // ---- confirm ----------------------------------------------------------
 
 function confirmHeader(state: AppState): string {
   const c = state.confirm;
   if (!c) return "Confirm";
   const s = findSessionLocal(state, c.action.hostKey, c.action.sessionId);
-  const name = s ? sessionName(s) : c.action.sessionId.slice(0, 6);
+  const name = s ? glassesName(s) : c.action.sessionId.slice(0, 6);
   return `End session ${name}?`;
 }
 

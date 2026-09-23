@@ -1595,6 +1595,12 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       expect(display.lines.join(" ")).toContain("abcdefghijklmnopqrstuvwxyz0123456789");
     });
 
+    it("sanitises the in-progress turn for the G2 font like the committed tail (XERK-928)", async () => {
+      const app = await enterSession();
+      liveTail.deliverTurn(`${String.fromCodePoint(0x2713)} live`);
+      expect(app.getState().liveTurn).toEqual({ sessionId: "s1", text: "√ live" });
+    });
+
     it("stops the live tail on pause()", async () => {
       const app = await enterSession();
       liveTail.deliver([{ id: "m1", role: "assistant", text: "some text here" }]);

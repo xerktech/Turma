@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createInitialState, newSessionState, type AppState } from "./app.ts";
 import { render, sessionContentLines, sessionTranscriptArea, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
+import { setGlyphCoverage } from "./font.ts";
 import { charMeasure, setDefaultMeasure, type Measure } from "./text-wrap.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
@@ -256,6 +257,34 @@ describe("render: session", () => {
     // The persistent sticky line eats exactly one row from the scrollable area,
     // so app.ts's offset clamp matches what renderSession actually windows.
     expect(sessionTranscriptArea(withRefusal, sess)).toBe(sessionTranscriptArea(without, sess) - 1);
+  });
+
+  it("draws a question sheet and home row without G2-missing glyphs (XERK-928)", () => {
+    setGlyphCoverage((cp) => cp !== 0x1f9e0);
+    try {
+      const q = `${String.fromCodePoint(0x26a0)} Deploy?`;
+      const opt = `${String.fromCodePoint(0x2713)} Yes`;
+      const summary = `${String.fromCodePoint(0x1f9e0)} Fix it`;
+      const s = session({ id: "s1", summary, session: signals({ question: q, questionOptions: [opt] }) });
+      const agents = [agent({ sessions: [s] })];
+      const model = asSession(
+        render(base({ screen: "session", agents, session: newSessionState("host-a", "s1"), transcripts: { s1: { entries: [] } } }))
+      );
+      if (model.bottom.mode !== "sheet") throw new Error("expected sheet");
+      expect(model.bottom.lines.join("\n")).toContain("! Deploy?");
+      expect(model.bottom.lines.join("\n")).toContain("1. √ Yes");
+      expect(model.bottom.options).toEqual([opt]); // the answer sent back is untouched
+      const home = asLines(render(base({ agents, home: { cursor: 0 } }))).join("\n");
+      expect(home).toContain("Fix it");
+      expect(home).not.toContain(String.fromCodePoint(0x1f9e0));
+      const confirm = { action: { kind: "kill" as const, hostKey: "host-a", sessionId: "s1" }, cursor: 0 };
+      expect(asSession(render(base({ screen: "confirm", agents, confirm }))).bottom.lines[0]).toBe("End session Fix it?");
+      // Nothing drawable in the summary: fall back to the short id, not "?".
+      const blank = [agent({ sessions: [session({ id: "s1abcdef", summary: String.fromCodePoint(0x1f9e0) })] })];
+      expect(asLines(render(base({ agents: blank, home: { cursor: 0 } }))).join("\n")).toContain("s1abcd");
+    } finally {
+      setGlyphCoverage(null);
+    }
   });
 
   it("shows a sheet-mode bottom bar with numbered options and a Dictate answer row when a question is pending", () => {

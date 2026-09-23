@@ -175,7 +175,7 @@ one.
 cd glasses
 npm install
 npm run mock-hub                                  # terminal 1 — fake hub on :8301
-echo 'VITE_HUB_URL=http://localhost:8301' > .env.local
+printf 'VITE_HUB_URL=http://localhost:8301\nVITE_HUB_USER=dev\nVITE_HUB_PASSWORD=dev\n' > .env.local  # no poll until all three are set
 npm run dev                                       # terminal 2 — :5173
 npm test && npm run typecheck                     # vitest + tsc
 npm run build && npm run pack                     # dist/ → ../turma.ehpk
