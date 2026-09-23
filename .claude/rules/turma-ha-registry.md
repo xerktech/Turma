@@ -70,25 +70,32 @@ for the store contract this plugs into.
 - **Watch FIRST, then scan** (boot order) so no cross-replica change is missed during the async scan; a
   key a watch event already populated is left alone (the watched value is fresher).
 
-## Known constraints (residuals under active-active)
+## Known constraints
 
-- **The tunnel poke IS cross-replica now** (XERK-764): a poke for a host a sibling replica owns is
-  addressed over the control bus to the owning replica, so it is no longer leader-local. Serving is
-  active-active (XERK-782). Mechanics: `.claude/rules/turma-ha-tunnel.md`.
-- **Cross-replica command QUEUEING keeps a ~1s delivery race** — this is the residual, unchanged. A
-  command queued on replica A for a host beating to replica B propagates via the record+watch (~1s
-  debounce), NOT instantly; the host's next scheduled beat delivers it regardless (the poke is only a
-  latency optimisation). Accepted for active-active — see `.claude/rules/turma-ha-leader.md`.
-- **Leader election IS wired** — it is a k8s `Lease` (XERK-763, `.claude/rules/turma-ha-leader.md`),
-  gating only the singleton sweeps (offline-alert, the master-orchestration bundle, migration-advance)
-  + the eviction/prune `del`s, never serving. Each replica still writes only records it owns. Do not
-  add a store-key lease here (the ADR keeps election in k8s).
+- **Serving is single-writer (XERK-919)**: the lease leader serves every request and followers
+  forward to it (`.claude/rules/turma-ha-leader.md`), so in steady state ONE replica mutates records
+  and the whole-record last-writer-wins model is safe. Under active-active it was not — a command
+  queued on one replica was overwritten by another replica's beat write. Do not reintroduce
+  concurrent writers to one host record without a merge protocol.
+- **Every stored record carries its writer's replica id (`__writer`, `STORE_WRITER_KEY`), and the
+  watch drops ANY own echo by it** — never rely on `lastStoreWritten` alone. It remembers only the
+  LAST write, so with two writes for one host in flight the echo of the EARLIER one read as remote
+  and reverted the record, silently dropping every command queued since (measured). The stamp is
+  stripped (`withoutWriter`) on every path that installs a store value: watch, hydrate, re-sync.
+- **A queued command is flushed to the store AT ONCE** (`queueCommand` → `flushAgentsToStoreNow`),
+  not on the 1s debounce: the 200 + cmdId promises the command exists, and a leader crash inside the
+  debounce lost it. Beats and other mutations keep the debounce.
+- **Leader election IS wired** — a k8s `Lease` (XERK-763), gating the singleton sweeps + the
+  eviction/prune `del`s, and (XERK-919) who serves. Do not add a store-key lease here (the ADR keeps
+  election in k8s).
 
 ## Tests
 
 - `turma/tests/registry-store.test.js` (own process): non-HA inert; the per-host write (caches
   stripped, one key per host, commands kept); a queued command riding the record; removal deleting the
   key; hydration with the restore coercions + the XERK-303 delivered stamp; the watch mirroring a
-  remote record without an echo write, and a remote deletion.
+  remote record without an echo write, and a remote deletion; the `XERK-919:` cases (a LATE older own
+  echo never reverts a record, the writer stamp stripped on apply, the immediate command flush, the
+  promotion re-sync skipping a host written mid-scan).
 - The full existing suite (`server.test.js`, `registry-cap.test.js`, `registry-restore.test.js`,
   `cache-budget.test.js`) is the non-HA byte-identity guard — it runs with HA off and must stay green.

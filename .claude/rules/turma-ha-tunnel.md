@@ -8,6 +8,13 @@ paths:
 
 # Cross-replica tunnel/terminal/command plane (XERK-764, epic XERK-751)
 
+**Since XERK-919 the lease leader serves everything and followers forward to it
+(`turma-ha-leader.md`), so every agent tunnel, data dial-back and `/term`/`/live` socket terminates
+on the leader.** What follows is the cross-replica machinery built for active-active; it stays as
+the handover/degraded path (a tunnel still on the old leader mid-handover is relayed to). Its
+known gaps under active-active — the dial-back paired only on the issuing replica, and a re-dialed
+tunnel left a stale channel on the old replica — are why serving went single-writer.
+
 The #1 active-active blocker. Each agent holds exactly ONE reverse-tunnel control WebSocket to ONE
 replica (`controlChannels[host]`, set in the `/agent/control` upgrade). Under active-active HA a
 dashboard read of `terminalOnline`, a queued command's poke, a `/term`/`/live` socket, or an

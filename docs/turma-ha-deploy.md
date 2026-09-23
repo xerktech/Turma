@@ -6,20 +6,19 @@ Turma's hub supports **two deployment shapes**, and both are fully supported:
    is the **default**, the zero-config path a normal Docker user runs, and what
    [`examples/compose/hub.yaml`](../examples/compose/hub.yaml) brings up. HA is **off** unless you
    turn it on.
-2. **Multi-replica HA on Kubernetes** — 2–3 **active-active** hub replicas, every one serving traffic
-   behind the load balancer, backed by a shared store (Valkey + Postgres + object storage). A leader
-   lease still runs, but only to keep the singleton background sweeps on exactly one replica — **not**
-   to gate serving. A rolling update or a pod loss causes **no dashboard outage and effectively no
-   serving gap**, because the surviving replicas were already serving. This is the shipped end state
-   of epic [XERK-775](https://xerktech.atlassian.net/browse/XERK-775) (Option 3, active-active); the
-   design rationale is in [`turma-ha-design.md`](turma-ha-design.md) and
-   [`turma-ha-store-adr.md`](turma-ha-store-adr.md).
+2. **Multi-replica HA on Kubernetes** — 2–3 hub replicas, **every one Ready behind the load
+   balancer, with the lease leader as the single writer**: a follower transparently forwards every
+   request and WebSocket to the leader (XERK-919), backed by a shared store (Valkey + Postgres +
+   object storage). A rolling update causes **no serving gap** (requests arriving mid-handover are
+   HELD for ~1-2s, not failed), and the standby is warm. The design rationale is in
+   [`turma-ha-design.md`](turma-ha-design.md) and [`turma-ha-store-adr.md`](turma-ha-store-adr.md);
+   why serving is single-writer rather than active-active is below.
 
 **A hub outage costs dashboard visibility and queued commands, never work.** The fleet's agents run
 natively on each host; sessions are `claude`/tmux processes owned by those agents, not by the hub,
 and agents retry their heartbeats and tunnels across a gap. So the non-HA path is a completely
-legitimate production choice — HA buys a *deploy with no serving gap and horizontal scale-out across
-replicas*, not more capability.
+legitimate production choice — HA buys a *deploy with no serving gap and a warm standby*, not more
+capability.
 
 ---
 
@@ -31,15 +30,30 @@ replicas*, not more capability.
 | Terminals, live transcript tail, chat | ✅ | ✅ |
 | Durable archive, usage ledger, board, triage, migration | ✅ | ✅ |
 | OIDC / break-glass login, notifications (FCM) | ✅ | ✅ |
-| **Zero-gap rolling updates / pod-loss failover** | ❌ (a deploy = full-restart outage) | ✅ (every replica serves; the LB always has a Ready endpoint) |
-| **Horizontal scale-out of the dashboard** | ❌ | ✅ (all replicas serve; the LB spreads clients) |
+| **Zero-gap rolling updates / pod-loss failover** | ❌ (a deploy = full-restart outage) | ✅ (every replica Ready; the leader hands over after flushing; followers hold, then forward to the successor) |
+| **Horizontal scale-out of request serving** | ❌ | ❌ (the leader serves everything; followers only forward bytes) |
 
-**Everything except no-gap deploys and scale-out works identically on the single-process path.** HA
-does *not* add features; it removes the deploy gap and lets the dashboard/API load spread across
-pods. Active-active (all replicas serving) is **Option 3** in the design doc, and it is now the
-shipped topology (XERK-782 flipped `/readyz` to leader-independent once its prerequisites — the
-cross-replica byte-stream relay, XERK-777/781; the migration request path as a hot cross-replica
-mirror, XERK-778; and the shared Postgres archive index, XERK-780 — had all landed).
+**Everything except no-gap deploys works identically on the single-process path** — HA runs the
+same single process's semantics, just on whichever replica holds the lease.
+
+### Why the leader serves everything (XERK-919)
+
+Active-active serving (XERK-782: every replica serving its own requests) was reverted. The hub's
+request path is built on per-process state, and under a no-affinity LB a request and its follow-up
+land on different replicas. Reproduced on a real 2-replica stack:
+
+- **Terminals:** the agent's data-channel dial-back reached the wrong replica about half the time, so
+  each failed open was a 5s stall into the reconnect page (the "reconnect several times" symptom).
+- **Messages / new sessions:** a command queued on one replica was overwritten by the other
+  replica's heartbeat write — 46% of chat inputs lost at a 600ms cadence, every one answered 200.
+- **Everything else per-process:** the on-demand results (history, ticket create/status, merge), the
+  ticket queue, alert dedup, and a re-dialed tunnel's stale predecessor on the old replica.
+
+With one writer these are single-process again, by construction. Measured after the fix, under
+continuous load: 40/40 terminal opens (was 20/40), 50/50 inputs (was 27/50), a follower-then-leader
+rolling restart with 240/240 inputs delivered and a 678ms worst request, and a SIGKILLed leader with
+0 inputs lost (terminals return once the lease expires, ~15s — shorten `TURMA_LEADER_LEASE_MS` to
+shorten that). `TURMA_HA_FORWARD=0` restores active-active serving as an escape hatch only.
 
 ---
 
@@ -122,7 +136,7 @@ identity-bearing env must match on all:
 
 ---
 
-## Path 2 — Kubernetes HA (multi-replica active-active)
+## Path 2 — Kubernetes HA (multi-replica, single-writer)
 
 The manifests live in **`xerktech/ArgoCD`, not in this repo**:
 
@@ -145,7 +159,7 @@ adds to `ai/turma/` — they are net-new, because before HA the hub was `replica
 ```yaml
 # ai/turma/deployment.yaml (excerpt)
 spec:
-  replicas: 2                     # 2 or 3; ALL serve at once (active-active)
+  replicas: 2                     # 2 or 3; all Ready, the lease leader serves
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -179,7 +193,7 @@ then drains an old one — so the Service always has other Ready endpoints and a
 serving window. **Do not restore `maxUnavailable: 100%`** — it would let Kubernetes drain replicas
 before their replacements are Ready, reintroducing the gap the flip removed.
 
-### The leader lease + RBAC (still required — for the SWEEPS, not for serving)
+### The leader lease + RBAC (required — it decides who SERVES and who runs the sweeps)
 
 The singleton background work — the offline-alert sweep, the auto-start/stop/ticket-drain bundle
 (`masterOrchestrationTick`), migration-advance — must run on **exactly one** replica, or N replicas
@@ -232,9 +246,19 @@ that somehow share a name never both believe they hold the lease. `isLeader()` s
 last confirmed renewal, so a wedged leader drops leadership within the lease window even if its loop
 stalls — it can never race a newly-promoted follower into running the sweeps twice.
 
-### The cross-replica byte-stream relay (net-new manifest wiring)
+### Pod-to-pod reachability: the hub port and the relay port
 
-Under active-active a browser's `/term`, `/live` or `openChannel` socket can land on a **different**
+- **Followers forward to the leader's HTTP port** (XERK-919). The leader publishes
+  `POD_IP:8300` (`TURMA_HUB_ENDPOINT` overrides), so port `8300` must be reachable pod-to-pod — it
+  already is (it is the container port the Service targets). With no `POD_IP` and no override the
+  hub falls back to the pod's first IPv4; a leader with no address makes followers serve locally
+  (logged `DEGRADED`). Confirm on boot: `serving: single-writer — … (this replica's endpoint <ip>:8300)`.
+
+### The cross-replica byte-stream relay (the handover/degraded path)
+
+With the leader serving everything this relay is rarely used — mid-handover, a tunnel still held by
+the outgoing leader is reached through it. Under active-active (`TURMA_HA_FORWARD=0`) a browser's
+`/term`, `/live` or `openChannel` socket can land on a **different**
 replica than the one holding the target host's agent tunnel. The relay (`turma/relay.js`, XERK-777/781)
 proxies those bytes pod-to-pod on a **dedicated TCP transport** (never the store's pub/sub bus, which
 carries only a byte-free endpoint directory). Three manifest additions make it reachable:
@@ -258,25 +282,12 @@ carries only a byte-free endpoint directory). Three manifest additions make it r
 
 ### Ingress — sticky sessions are NOT required
 
-With the cross-replica relay (`/term`, `/live`, `openChannel`), the shared SSE bus (XERK-762, so a
-mutation on one replica reaches every replica's SSE clients), and the shared session cookie
-(`TURMA_SESSION_SECRET` identical across replicas), **any request can be served by any replica**. So
-the ingress needs **no session affinity / sticky routing** — a plain round-robin `Service` is correct,
-and a client that reconnects (SSE/WebSocket auto-retry after a pod drain) may safely land on a
-different replica.
-
-- Keep the existing WebSocket/SSE and no-buffer annotations the ingress already carries (they are
-  about upgrade + streaming, unrelated to affinity).
-- **Residual affinity that *helps* but is not required:** a `sessionAffinity: ClientIP` on the
-  `Service` (or ingress-level stickiness) keeps a client on one replica, which avoids the extra
-  pod-to-pod relay hop for a terminal/`/live` stream whose target host's tunnel is owned by a
-  *different* replica. It is a pure latency optimization for the terminal plane — never a correctness
-  requirement, and it slightly hurts even client spread — so leave it **off** unless terminal latency
-  under heavy cross-replica traffic proves it worthwhile. A stock L4/L7 LB **cannot** route by the
-  app-level host identity that would actually co-locate a client with the tunnel owner (that mapping
-  is hub state, not anything the LB can read), which is exactly why the relay exists instead of
-  route-by-host — see [`turma-ha-store-adr.md`](turma-ha-store-adr.md) §"The cross-replica byte-stream
-  relay transport".
+Any pod can accept any request: a follower forwards it to the leader, so a plain round-robin
+`Service` is correct and a client that reconnects may land on any replica. Affinity would not help
+either — the agents' tunnels, their data-channel dial-backs and the browsers' requests are all
+separate connections, and the thing that must be co-located (everything in one process) is what the
+forwarding already guarantees. Keep the existing WebSocket/SSE and no-buffer annotations the ingress
+carries (they are about upgrade + streaming, unrelated to affinity).
 
 ### Probes: `/readyz` (readiness) vs `/healthz` (liveness)
 
@@ -311,20 +322,21 @@ The Docker `healthcheck` in `hub.yaml` already targets `/healthz` — correct.
 On `SIGTERM` (which a rolling update sends to a pod being replaced):
 
 1. `/readyz` flips to **503 NotReady** immediately, so the Service pulls *that pod* from its
-   EndpointSlice — new connections stop landing on it. **Other replicas stay Ready and keep serving.**
-2. If this pod happens to hold the lease, it **renounces it** (backdated `renewTime`) so another
-   replica picks up the sweeps promptly; but serving never depended on the lease, so there is nothing
-   to hand off on the serving path.
-3. The hub holds for `READYZ_DRAIN_DELAY_MS` (default `2000`, capped below `SHUTDOWN_DRAIN_MS`) to let
-   the endpoint removal propagate, **then** closes its own SSE/WebSocket sockets with a going-away
-   code and flushes the store. Force-exit backstop at `SHUTDOWN_DRAIN_MS` (default `10000`). Clients
-   on that pod re-dial and the LB routes them to a replica that was **already Ready and serving** —
-   so the reconnect is bounded by a client's own retry, not by any pod cold-boot.
-4. Kubernetes only surged the replacement pod in once it was `Ready` (because `maxUnavailable: 0`),
-   so at no point is the Service left without a Ready endpoint. **There is no cold-promote gap** — the
-   active-passive topology's ~5–6 s (a fresh pod had to boot, win the lease, and hydrate the archive
-   index before it could serve) is gone, because the *other* replicas were serving the whole time and
-   the surged pod hydrates its index from Postgres *before* it goes Ready.
+   EndpointSlice — new connections stop landing on it. **Other replicas stay Ready.** A draining
+   LEADER keeps leading (followers keep forwarding to it) through the hold below.
+2. The hub holds for `READYZ_DRAIN_DELAY_MS` (default `2000`, capped below `SHUTDOWN_DRAIN_MS`) to let
+   the endpoint removal propagate.
+3. **Handover (leader only), in this order:** close the listener, flush the fleet registry to the
+   store and wait for it, release the lease (backdated `renewTime`, so a follower wins it within one
+   election retry, ~2s), and retract the leader endpoint. Followers HOLD requests meanwhile and
+   forward them to the successor the moment it publishes — held, not failed. The successor re-reads
+   the registry from the store before it serves.
+4. Then SSE/WebSocket sockets close with a going-away code and the rest flushes. Force-exit backstop
+   at `SHUTDOWN_DRAIN_MS` (default `10000`). Agents re-dial their tunnels through the LB and land on
+   the new leader (a terminal open in that ~1s window shows the self-reloading reconnect page once).
+5. Kubernetes only surged the replacement pod in once it was `Ready` (because `maxUnavailable: 0`),
+   so at no point is the Service left without a Ready endpoint. **There is no cold-promote gap**: the
+   successor is a replica that was already running and forwarding, its registry kept hot by the watch.
 
 Set `terminationGracePeriodSeconds` at or above `SHUTDOWN_DRAIN_MS` so Kubernetes doesn't `SIGKILL`
 mid-drain.
@@ -358,21 +370,20 @@ mid-drain.
   reach it. The line names the backends actually wired — both of-record backends write Postgres: the
   usage ledger's `usage_host`/`usage_series`/`usage_day`/`usage_model` tables (XERK-779, appear once a
   host reports spend) and the archive index's `archive_sessions`/`archive_entries` tables (XERK-780).
-- **All replicas serve:** **every** pod's `/readyz` returns `200` (a `503` means that pod is draining
-  or unhealthy, not that it's a standby). Confirm through the Service that more than one pod is a live
-  endpoint (`kubectl get endpointslices -l kubernetes.io/service-name=turma-hub`).
-- **Leadership (sweeps only):** exactly one pod holds the lease — `kubectl get lease turma-hub-leader
-  -n turma -o yaml` shows the current holder. This affects only which pod runs the sweeps, not which
-  pods serve.
+- **All replicas Ready, one serves:** **every** pod's `/readyz` returns `200` (a `503` means that pod
+  is draining). The leader logs `forward: serving locally (this replica is the leader)`; every
+  follower logs `forward: forwarding to the leader at <ip>:8300`. A follower logging `DEGRADED` means
+  it could not reach a leader — check pod-to-pod reachability of 8300 and the lease.
+- **Leadership:** exactly one pod holds the lease — `kubectl get lease turma-hub-leader -n <ns> -o
+  yaml` shows the current holder. It decides who serves and who runs the sweeps.
 - **No-gap deploy:** bump the image (or `kubectl rollout restart deploy/turma-hub`) and hold an
   SSE stream or a terminal open against the public URL — it stays up throughout (a client whose pod is
   drained reconnects within its own retry to an already-serving replica). Poll `/readyz` *through the
   Service* every 200 ms: the Service always has a Ready endpoint, so it should never go non-`200` for
   a whole window (only individual pods flip `503` as they drain).
-- **Cross-replica terminal/`/live`:** open a terminal for a host whose tunnel a *different* replica
-  owns (or just open several under load so the LB spreads you) — it should work with no sticky routing.
-  If it 502s, check `RELAY_PORT` is exposed pod-to-pod, `POD_IP` is injected, the NetworkPolicy allows
-  it, and `TURMA_SESSION_SECRET` is identical across replicas.
+- **Terminals / tunnels:** every `tunnel connected:` line should appear on the LEADER's log (agents
+  reach it through whichever pod the LB picks). Open several terminals in a row — each should connect
+  first time. If they stall, check `8300` pod-to-pod, `POD_IP`, and `TURMA_SESSION_SECRET` parity.
 - **RBAC:** if pod logs warn "no Kubernetes service account is reachable — leader election is
   DISABLED", the ServiceAccount/Role/RoleBinding or `automountServiceAccountToken` is missing, and
   every replica is running the sweeps (double alerts, double auto-starts). Fix before going wider.

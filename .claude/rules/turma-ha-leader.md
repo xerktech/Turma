@@ -1,8 +1,10 @@
 ---
 paths:
   - turma/leader.js
+  - turma/forward.js
   - turma/server.js
   - turma/tests/leader.test.js
+  - turma/tests/forward.test.js
 ---
 
 # Leader election + the shared single-flight guards (XERK-763, epic XERK-751)
@@ -28,64 +30,98 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
 (`autoStartSweep`, …) stay UNGATED, directly-callable units — the gate is at the tick, not in them
 (their own tests call them directly, with no leader, and must keep acting).
 
-## Service gating — active-active: every healthy replica serves (XERK-782, was XERK-765)
+## Serving — the leader is the SINGLE WRITER; followers forward (XERK-919)
 
-- **`/readyz` returns 200 on ANY healthy, non-draining replica** — leader-INDEPENDENT since XERK-782.
-  k8s keeps every replica in the Service EndpointSlice, so the LB spreads clients across the whole
-  fleet (true active-active / horizontal scale). `/healthz` is unchanged (pure process-up liveness).
-- **The XERK-765 leader-serves-all gate is LIFTED — do NOT restore it.** It was load-bearing only
-  while cross-replica serving was incomplete. Every prerequisite has landed: the duplex byte-stream
-  relay for `/term`, `/live` and `openChannel` (XERK-777 transport + XERK-781 consumers); the
-  migration REQUEST-path READ as a hot cross-replica mirror (XERK-778); and the shared archive index
-  (XERK-780). **The request-path MUTATION gap the old gate also covered is now CLOSED here** (below),
-  so a follower serving write traffic no longer silently drops it.
-- **Leader election STAYS, but now gates ONLY the singleton background work — never serving.** The
-  three leader-gated ticks (`offlineDetectionTick`, `masterOrchestrationTick`, `migrationAdvanceTick`)
-  are unchanged, AND the **inline migration-ADVANCE in the heartbeat handler is now `isLeader()`-gated
-  too** (XERK-782): under Option 2 only the leader beat, so that inline `advanceMigrations()` was
-  implicitly leader-only; with every replica Ready a host beats to any replica, so an ungated inline
-  advance would race the handoff (double source-kill). Every SERVING path a client hits is
-  leader-independent: registry/SSE bus (XERK-756/762), command-poke (XERK-764), the terminal/`/live`
-  relay (XERK-781), migration reads (XERK-778), archive index (XERK-780).
-- **The migration MUTATION flow reaches the leader (XERK-782).** A migration START / blob-upload /
-  restore-pack can now land on a non-leader. A FOLLOWER write-throughs ONLY the records it itself
-  mutated (`publishMigrations(id)` marks `migrationsDirty`, the follower branch mirrors just those —
-  never its whole Map, or it would resurrect a settled move: the registry own=dirty / remote=apply-only
-  split). The LEADER FORWARD-LEARNS via `applyRemoteMigration`: it ADOPTS a record it lacks (a
-  follower-started move), FORWARD-MERGES phase (exporting→importing→terminal) + progress fields
-  (`importCmdId`/`blobPath`/`blobSize`/`targetSessionId`/`error`) it lacks, NEVER regresses phase and
-  NEVER touches leader-local `uploading`/`refusal` (so the leader's own mirror self-echo is a no-op).
-  A `migrationsRetired` bounded set is the anti-resurrection guard: the leader never re-adopts an id
-  it retired, and DELETES the store zombie if a stale echo arrives.
-  - **Accepted residual (LOW):** a `refusal` ingested on a follower does NOT travel (mirrorMigration
-    still strips it — the leader-local rule XERK-778 pins), so a follower-side agent refusal fast-fails
-    only if the leader ingested it; otherwise the move TIMES OUT (`MIGRATE_TIMEOUT_MS`) with the source
-    intact — no data loss, just slower failure feedback. Cross-replica command QUEUEING keeps its
-    documented ~1s record+watch delivery race (`turma-ha-registry.md`), unchanged. The ticket queue is
-    per-replica in-memory (not shared): each replica self-drains its OWN admissions on its own beats
-    (the beat-handler `drainTicketQueue` stays UNgated — gating it would strand follower-admitted
-    tickets), and the shared double-start guards + agent-side session queue bound the dispatch race.
-  - **`heartbeatAlerts` can double-fire in the ~1s registry-convergence window.** Beats now spread
-    across replicas, and a host's dedup state (`next.alerts`, on the shared registry record) converges
-    via the watch with the ~1s debounce — so replica B can re-detect an edge replica A already fired
-    before B's mirror caught up. Informational only: deduped/retracted on the phone by the stable
-    `notifKey`, the same class as the XERK-756 SSE-convergence residual.
-- **It does not flap:** `isLeader()` is refreshed on every ~2s lease renewal and self-expires only
-  after the full ~15s window. **HA off / no elector → `isLeader()` always true**; the flip only removed
-  a 503 branch a single-process hub never took, so HA-off / docker-compose is byte-identical.
-- **The graceful-drain gate remains, per replica** (XERK-765's other half): a SIGTERM flips
-  `hubDraining` so THIS replica reports NotReady and k8s pulls it before its sockets are cut
-  (READYZ_DRAIN_DELAY_MS hold). The ArgoCD readinessProbe must point at `/readyz` (NOT `/healthz`);
-  liveness/startup stay on `/healthz`.
-- **Manifest implication (w4-deploy, XERK-783).** With all replicas Ready, `availableReplicas ==
-  replicas`, so a rolling update can use a REAL `maxUnavailable` (e.g. 0/1) for a genuinely
-  zero-serving-gap deploy — replacing the FORCED `maxUnavailable: 100%` Option 2 needed (its lone
-  Ready pod had to go NotReady before a standby could serve, XERK-772's cold-promote gap). The
-  cross-replica byte relay needs the pod-to-pod `RELAY_PORT` exposed + `POD_IP` injected + a
-  NetworkPolicy (XERK-781); that manifest work is XERK-783's.
-- Tests: `XERK-782: /readyz is leader-INDEPENDENT …`, `XERK-782: the leader FORWARD-LEARNS …`,
-  `XERK-782: … never RE-ADOPTS a retired migration …`, `XERK-782: a FOLLOWER write-throughs …` in
-  `server.test.js`.
+- **Every replica is Ready, but only the lease leader SERVES.** A follower transparently forwards
+  every HTTP request and WebSocket upgrade to the leader (`turma/forward.js`, wired first thing in
+  both server.js handlers); only `/healthz` + `/readyz` are always answered locally. So the hub's
+  whole request path runs in ONE process — the single-process semantics every path was written
+  against — while rolling deploys keep a Ready endpoint and a warm standby.
+- **Why active-active (XERK-782) was reverted: per-process state is everywhere, and a request and its
+  follow-up landed on different replicas.** Reproduced on a real 2-replica stack (XERK-919): the
+  agent's `/agent/data` dial-back paired against `pendingChannels` on the WRONG replica ~50% of the
+  time (every failed terminal open = a 5s stall into the reconnect interstitial); commands queued on
+  one replica were overwritten by the other's whole-record beat write (46% of chat inputs lost at a
+  600ms cadence); the `AGENT_CACHE_KEYS` results, ticket queue and alert dedup were per-replica; a
+  re-dialed tunnel left a live-looking stale channel on the old replica. **Do NOT restore
+  active-active serving** — each of those needs its own cross-replica protocol and more remain.
+- **The leader publishes its HTTP address** (`hubLeader:endpoint` → `{replica, addr, at}`, TTL'd,
+  refreshed every 2s + on the store ready edge + at promotion); followers hold a hot mirror (watch +
+  boot hydrate), freshness judged on the RECEIVER's clock. `addr` = `TURMA_HUB_ENDPOINT` ?? `POD_IP:PORT`
+  ?? first IPv4 — so the hub's own port (8300) must be reachable pod-to-pod, like the relay port.
+- **Never two writers — a replica that can neither serve nor forward HOLDS the request** (100ms
+  polls, bounded `holdMs`). `canServeLocally()` = leader AND past the promotion re-sync. Past the
+  bound it serves locally, logged `DEGRADED` — correct when it is the sole survivor (2 replicas, the
+  leader crashed), an accepted brief split with 3+. A leader that published `addr:null` degrades at
+  once. `TURMA_HA_FORWARD=0` is the escape hatch back to active-active.
+- **The hop list (`x-turma-forwarded-by`) bounds forwarding**: never back through a replica already
+  traversed, never past `MAX_HOPS` (2) — two replicas that briefly disagree hold rather than bounce.
+  **It is only trusted with a valid proof** (`x-turma-forward-auth` = HMAC of the list under
+  `HMAC(SESSION_KEY,"turma-forward")`); a client-supplied list is ignored and stripped. Unproven, any
+  client could force a follower to hold 5s and then serve DEGRADED — a second writer on demand
+  (QA measured 3/100 acknowledged inputs lost that way).
+- **A follower hands back tunnels it holds** (`dropDegradedTunnels`: every control channel closed
+  1001, local `/live` viewers dropped) the moment a fresh remote leader is known — on the forwarder's
+  `onRemoteLeader` edge and a 2s sweep. A tunnel accepted while this replica led, or while it served
+  DEGRADED after a crash, otherwise stays pinned to a replica the dial-backs never reach: that host's
+  terminals fail forever (QA: 3/5 SIGKILL+restart trials). Never while this replica serves.
+- **A leader entry naming THIS replica's own address under another id is a previous incarnation**
+  (a container restart keeps `POD_IP`) — ignored, never dialed (it forwarded to itself).
+- **While this replica's STORE link is down, the last known leader stays the target** regardless of
+  entry age (`storeHealthy`) — a stale-by-age entry proves nothing when refreshes cannot arrive; only
+  a failed dial ends it. Else a store blip turned a follower into a DEGRADED second writer.
+- **Forwarding is byte-faithful**: the follower dials the leader BEFORE reading the request (a failed
+  dial leaves it unread, so it can still be held/served), pipes the body, relays raw headers
+  (duplicate `Set-Cookie` kept), streams SSE chunk-by-chunk, and a leader dying mid-body TRUNCATES
+  the client (never a hang — the XERK-865 lesson). An upgrade is rebuilt from `rawHeaders` + `head`
+  and piped raw, so the leader does the handshake. `Connection: close` upstream (one socket each),
+  headers flushed at once (a client that sends `Expect: 100-continue` then no body still gets the
+  leader's 401/413), a `Host` added for an HTTP/1.0 client that sent none.
+- **Residual: a body past the leader's cap + drain slack can surface as 502, not 413, ~1 in 6.**
+  The hub answers 413 then RESETS; Node reports our next write's `ECONNRESET` before reading the
+  queued answer. The body is fed through a stage that yields to the event loop between chunks (and
+  stops on the answer) so the read usually wins; the agent retries a 502, so it self-heals. Fully
+  closing it needs the hub not to reset forwarded bodies — which weakens its runaway-body defence. Tracked: XERK-936
+  (with the hop proof binding only the list, not the request — replayable pod-to-pod).
+- **Known two-writer case (XERK-935, pre-existing): an ASYMMETRIC store partition.** A leader whose
+  store link is down cannot publish its endpoint, so a healthy-store follower degrades and serves too.
+- **The hop proof is compared as BYTES** — a non-ASCII value of the right string length made
+  `timingSafeEqual` throw, an unauthenticated crash of any follower via one upgrade (QA). The upgrade
+  handler also catches any forwarding fault. With the store down, a leader is "fresh" for the tunnel
+  hand-back only while dials to it recently SUCCEEDED (else tunnels went to a dead leader).
+- **The graceful handover, in this order (load-bearing)** — the leader KEEPS leading through the
+  `/readyz` hold (followers keep forwarding to it), then in `cutAndFlush`: close the listener →
+  `await flushAgentsToStoreNow()` → `await release()` → `await forwarder.retract()` (deletes its
+  endpoint so followers hold for the successor) → cut SSE/tunnels. Releasing at signal receipt (the
+  old order) left ~2s of two writers and lost the old leader's last commands. Each await is bounded.
+- **A promoted leader re-reads the registry before serving** (`resyncAgentsFromStore` in
+  `onLeaderPromoted`, bounded `PROMOTION_SYNC_MAX_MS`): it flushes its OWN pending writes, then applies
+  every stored host over its mirror — EXCEPT a host it wrote after the scan began (`localWriteGen`),
+  whose local copy is newer. Covers a dropped/late pub/sub event and the degraded-window writes.
+- **A draining follower never degrades to local** — `stop()` makes a hold end in `503 Retry-After`.
+- **What HA now buys**: zero-gap rolling deploys (measured: a follower-then-leader roll under load,
+  240/240 inputs delivered, 0 lost, max 678ms) and pod-loss survival (a SIGKILLed leader: 0 inputs
+  lost; terminals down until the lease expires, ~15s). **Not** horizontal request scale-out.
+- The tunnel directory + byte relay (`turma-ha-tunnel.md`) stay as the handover/degraded path.
+- **The graceful-drain readiness gate is per replica**: SIGTERM flips `hubDraining` → `/readyz` 503.
+- Tests: `turma/tests/forward.test.js` (incl. the `XERK-919 QA:` cases, and a SOURCE pin on the
+  drain's release-at-signal wiring, which no TURMA_TEST path reaches); the `XERK-919:` cases in
+  `registry-store.test.js`.
+
+### Verifying HA for real (the local stack recipe)
+
+- **The unit suite cannot see these bugs** — every one above was found on a real multi-process
+  stack behind a no-affinity LB. Stand one up locally: Valkey (static binary from
+  `download.valkey.io`), Postgres (`pip install pgserver`; initdb/pg_ctl as `nobody` via `setpriv`,
+  `LD_LIBRARY_PATH=…/pgserver.libs`, every path component `o+x`), S3 (`pip install 'moto[server]'`),
+  two `node server.js` with `HA_MODE=1` + distinct `PORT`/`TURMA_RELAY_PORT`/`TURMA_HUB_ENDPOINT`, a
+  round-robin TCP LB that polls `/readyz`, the real `agent/tunnel-agent.js` (poke via
+  `~/.turma/poke-port`), and a fake heartbeat agent + fake ttyd.
+- **TRAP: this host's pod service account is in prod's namespace (`ai`).** A test hub finds it and
+  elects against the PROD `turma-hub-leader` Lease. Always point `KUBERNETES_SERVICE_HOST` at a local
+  fake Lease API and set `TURMA_LEADER_TOKEN_FILE`/`_CA_FILE`/`_NAMESPACE`/`TURMA_LEADER_LEASE`.
+- **Judge a terminal by BODY, not status** — a failed open returns the reconnect interstitial as 200.
+  Judge a command by what the agent RECEIVED, not the 200 + cmdId.
 
 ## `isLeader()` and the elector
 
@@ -116,8 +152,8 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   two in agreement (both `leaseSeconds*1000`, `leaseSeconds` ceiled). Timing tests that need real
   expiry use ≥1s.
 - **On graceful shutdown the leader RENOUNCES** (`release()` backdates the lease's `renewTime`) so a
-  warm standby promotes within a beat or two instead of waiting out the whole lease — the fast-
-  failover point of a deploy. Fire-and-forget; the drain never waits on it.
+  warm standby promotes within one retry instead of waiting out the lease — but only AFTER its
+  registry writes landed (the handover order above); a draining FOLLOWER stops its elector at once.
 
 ## The shared single-flight guards (failover re-fires nothing)
 
