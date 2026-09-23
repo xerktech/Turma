@@ -104,15 +104,20 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   `ECONNRESET` before the queued 413 — a 502 the agent retries instead of the 413 that says SHRINK.
   - `refuseOversize` replays the leader's no-drain path exactly: discard to cap + slack, 413, cut.
     Draining first is XERK-235 — urllib writes the whole body before reading.
-  - Caps come from server.js `forwardBodyCap` — the SAME constants the routes read with (drift
-    pinned by a source-match test). A cap must never be BELOW the leader's: that refuses a body the
-    leader takes. Uploads use `UPLOAD_MAX_BYTES`, the ceiling over every host's own cap.
+  - The follower judges against the LEADER's caps + slack ALONE, published in `hubLeader:endpoint`
+    (`bodyCaps`/`drainSlack`, XERK-939) — never its own, nor a `min` of both: mid-rollout (a changed
+    memory limit) a smaller-cap follower cut a body the leader takes. No FRESH usable caps (an older
+    leader, a malformed entry, a stale entry while the store link is down) = forward, never refuse.
+  - It refuses only a request `decide()` would FORWARD, and only after a connect proves the leader is
+    up (`leaderAlive`, nothing sent). A refusal never otherwise dials, so a crashed leader's caps
+    kept refusing until its entry aged out; a held request (own entry, handover) is never judged.
+  - Route keys come from server.js `forwardBodyRoute`, caps from `forwardBodyCaps` — the SAME
+    constants the routes read with (drift pinned by a source-match test). Uploads use
+    `UPLOAD_MAX_BYTES`, the ceiling over every host's own cap.
   - Only past the auth gate the leader runs BEFORE reading (`agentPresentedRefusal`,
     `userAuthorized`, `agentHostRefusal`): a credential-less body stays the leader's 401, unread.
   - A refusal making less than `drainMinProgress` (64 KiB) per `drainIdleMs` (10s) is cut — else 8
     slow-loris sockets (silent OR a 1-byte trickle) held every slot and switched it off.
-  - Assumes every replica derives the SAME caps. Mid-rollout with a changed memory limit, a
-    smaller-cap follower cuts a body the leader would take (XERK-939).
   - Only routes whose 413 is STATELESS: heartbeat, both uploads, raw archive. NOT the archive chunk
     or migration blob (the leader RECORDS those refusals), NOT default-`BODY_MAX` routes (not every
     POST reads its body). Those, chunked bodies and anything past `drainMax` concurrent refusals keep
