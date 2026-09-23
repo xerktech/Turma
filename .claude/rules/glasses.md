@@ -41,3 +41,15 @@ paths:
   (XERK-934). Vite's CJS interop runs only in `build`, and `optimizeDeps` covers only `node_modules`,
   so without it dev serves `src/vendor/*.cjs` raw and the simulator dies on `Importing binding name
   'default'`. Tests: `src/vendor/dev-server.test.ts`.
+- **Hub text reaching the display goes through `fontSafe` (`src/font.ts`, XERK-928)** — transcript
+  entries at ingest, the live TUI turn (`onLiveTurn`), question sheet, session names. Missing
+  G2-font glyphs draw as blank gaps.
+  - Session names are sanitised in `render.ts`, NEVER in `sessionName`: the phone shares it and
+    pre-fills Rename from it, so a degraded name would be written back to the hub.
+  - Known markers map to drawable ones (check -> √, cross -> x); any other codepoint pretext's
+    `getAdvW` reports as 0 is dropped. That table is lazy (~670 KB), installed in `main.ts`
+    via `setGlyphCoverage` BEFORE boot — ingest before it would cache unchecked text.
+  - Transcript ingest runs the markdown/tool-marker trims on the RAW text, fontStrip AFTER: a
+    dropped glyph run first turned "the plan 🧠 [WIP]" into a stripped tool marker.
+  - Map keys are codepoint numbers: `glyphs.test.ts` (XERK-923) scans string literals, escapes too.
+  - Tests: `font.test.ts`.

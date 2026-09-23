@@ -1,6 +1,7 @@
 import type { HubClient, QueuedResponse } from "./hub-client.ts";
 import type { GlassesDisplay } from "./display/index.ts";
 import type { Dictation, DictationResult } from "./dictation.ts";
+import { fontSafe } from "./font.ts";
 import { emptyBuffer, mergeTail, prependHistory, type TranscriptBuffer } from "./transcript.ts";
 import { NoopLiveTail, type LiveTailLike } from "./live.ts";
 import { flattenSessions } from "./sessions.ts";
@@ -586,7 +587,8 @@ export class App {
     const beforeLen = this.sessionContentLength(_hostKey, sessionId);
     if (text) {
       // Still generating — show the capture as it stands.
-      this.state = { ...this.state, now: this.now(), liveTurn: { sessionId, text } };
+      // Sanitised like the committed tail (font.ts), or it streams blanks.
+      this.state = { ...this.state, now: this.now(), liveTurn: { sessionId, text: fontSafe(text) } };
     } else {
       // Turn completed: drop the live turn (the committed tail owns the
       // message now).
