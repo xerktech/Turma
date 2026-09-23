@@ -259,6 +259,43 @@ test("XERK-919: a DRAINING follower refuses (503) what it cannot forward, never 
   srv.close(); f.close();
 });
 
+// ---- XERK-935: asymmetric store partition (a store-less replica never double-writes) --
+
+test("XERK-935: a store-less follower REFUSES when another replica holds the lease (never a second writer)", async () => {
+  // Store link down, so the leader-endpoint mirror can't refresh — but the k8s lease
+  // (readable when only the store is down) says a healthy replica leads: refuse, don't degrade.
+  const { f } = await follower(undefined, { storeHealthy: () => false, leaseHeldElsewhere: () => true });
+  const d = f.decide(req("/api/x"));
+  assert.ok(d.refuse, "store down + lease held elsewhere -> refuse, not hold/degrade");
+  const { srv, port } = await followerServer(f);
+  const r = await request(port, { path: "/api/agents" });
+  assert.equal(r.status, 503, "the client's LB retry then lands on the real leader");
+  assert.equal(r.headers["retry-after"], "1");
+  assert.match(r.body, /store link is down/);
+  assert.equal(f.stats.refusedNoStore, 1);
+  srv.close(); f.close();
+});
+
+test("XERK-935: a store-less SOLE survivor (no other lease holder) still serves locally", async () => {
+  // Store down but NOBODY else holds the lease -> the normal hold/degrade path serves.
+  const { f } = await follower(undefined, {
+    storeHealthy: () => false, leaseHeldElsewhere: () => false, holdMs: 60, holdPollMs: 10,
+  });
+  assert.ok(f.decide(req("/api/x")).hold, "no other holder -> normal hold, never refuse");
+  const { srv, port } = await followerServer(f);
+  const r = await request(port, { path: "/api/agents" });
+  assert.equal(r.status, 299, "held then served locally (the sole-survivor degraded path)");
+  assert.equal(r.body, "served-locally");
+  assert.equal(f.stats.refusedNoStore, 0);
+  srv.close(); f.close();
+});
+
+test("XERK-935: with no leaseHeldElsewhere wired, a store-less follower is byte-identical (holds, never refuses)", async () => {
+  const { f } = await follower(undefined, { storeHealthy: () => false }); // default leaseHeldElsewhere = () => false
+  assert.ok(f.decide(req("/api/x")).hold, "default never refuses");
+  f.close();
+});
+
 // ---- upgrades ----------------------------------------------------------------
 
 test("XERK-919: an upgrade is piped byte for byte to the leader, head bytes and hop stamp included", async () => {

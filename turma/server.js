@@ -19822,6 +19822,11 @@ if (process.env.TURMA_TEST) {
       authToken: FORWARD_AUTH_TOKEN,
       storeHealthy: () => !liveStore.health || liveStore.health === "ready",
       onRemoteLeader: () => dropDegradedTunnels("a leader is serving"),
+      // XERK-935: while our store link is down we cannot learn the leader's endpoint,
+      // so the elector's view of the k8s lease (in the API, not the store) is the one
+      // still-readable leader signal — if another replica holds it, refuse rather than
+      // become a second writer. `hubLeader` is created just below; read lazily.
+      leaseHeldElsewhere: () => !!(hubLeader && hubLeader.leaseHeldByOther && hubLeader.leaseHeldByOther()),
     });
     // Backstop for the watch edge above (e.g. this replica LOST the lease while it
     // still held tunnels it accepted as leader or while degraded).
@@ -19858,6 +19863,13 @@ if (process.env.TURMA_TEST) {
     haOn: HA_ON,
     env: process.env,
     log: (m) => console.log(m),
+    // XERK-935: a replica whose shared-store link is down must not lead — a leader that
+    // cannot reach the store cannot be the single writer, and (unable to publish its
+    // endpoint) it would strand followers into serving DEGRADED beside it. The elector
+    // then ABSTAINS (drops + backdates the lease) so a healthy-store replica promotes.
+    // Same signal the forwarder's storeHealthy uses; the lease itself lives in the k8s
+    // API, not the store, so it stays writable to hand over.
+    canLead: () => !liveStore.health || liveStore.health === "ready",
     onChange: (leader) => {
       if (leader) {
         console.log("leader: this replica is now the leader — running the singleton sweeps");

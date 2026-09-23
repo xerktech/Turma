@@ -120,6 +120,16 @@ function makeForwarder(store, replicaId, deps = {}) {
     // (leader) => void: a FRESH REMOTE leader was learned (appeared or changed). The
     // caller drops sockets it served while degraded (its local agent tunnels).
     onRemoteLeader = () => {},
+    // () => boolean: does ANOTHER replica currently hold the leader lease (XERK-935)?
+    // Consulted ONLY while our own store link is down: a store-less replica cannot
+    // learn/refresh the leader's published endpoint (it rides the store), so with no
+    // second signal it would degrade to a local write beside the healthy leader — the
+    // asymmetric-store-partition double-writer. The lease lives in the k8s API, NOT
+    // the store, so it stays readable when the store link is down; when it says a
+    // healthy replica leads we REFUSE (503) rather than serve, and the client's LB
+    // retry lands on that leader. With no other holder we may be the sole survivor,
+    // so the normal hold/degrade path still serves locally.
+    leaseHeldElsewhere = () => false,
   } = deps;
   const canServe = deps.canServe || isLeader;
 
@@ -131,7 +141,7 @@ function makeForwarder(store, replicaId, deps = {}) {
   const unreachableUntil = new Map(); // addr -> time before which we do not dial it
   const lastDialOk = new Map(); // addr -> when a dial to it last SUCCEEDED
   const live = new Set(); // every forwarded socket (client + upstream), for drain
-  const stats = { requests: 0, upgrades: 0, dialFailures: 0, held: 0, degraded: 0 };
+  const stats = { requests: 0, upgrades: 0, dialFailures: 0, held: 0, degraded: 0, refusedNoStore: 0 };
   let refreshTimer = null;
   let unwatch = null;
   let unhealth = null;
@@ -209,6 +219,14 @@ function makeForwarder(store, replicaId, deps = {}) {
     const path = String((req && req.url) || "").split("?")[0];
     if (LOCAL_PATHS.has(path)) return LOCAL;
     if (canServe()) { noteMode("serving locally (this replica is the leader)"); return LOCAL; }
+    // XERK-935: our store link is down, so the leader-endpoint mirror cannot refresh
+    // — but the lease (k8s API, not the store) says another replica leads. It is the
+    // single writer; never become a second one. Refuse so the client's LB retry reaches
+    // it. (With no other holder we may be the sole survivor — fall through to hold/degrade.)
+    if (!storeHealthy() && leaseHeldElsewhere()) {
+      noteMode("refusing (store link down; the lease is held by another replica) — the client retries onto the leader");
+      return { refuse: "this hub replica's store link is down; the leader is elsewhere — retry" };
+    }
     const e = leader;
     const fresh = e && (now() - e.seenAt < ttlMs || !storeHealthy());
     if (!fresh || e.replica === replicaId || (e.addr && isOwnAddr(e.addr))) {
@@ -274,6 +292,7 @@ function makeForwarder(store, replicaId, deps = {}) {
       if (gone()) return { gone: true };
       const d = decide(req);
       if (d.local) return null;
+      if (d.refuse) { stats.refusedNoStore += 1; return { refuse: true, reason: d.refuse }; }
       if (d.forward) {
         try {
           return { sock: await dial(d.forward), hops: hopsOf(req) };
@@ -305,7 +324,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (r.refuse) {
       if (!res.headersSent) {
         res.writeHead(503, { "content-type": "application/json", "retry-after": "1", connection: "close" });
-        res.end(JSON.stringify({ error: "this hub replica is shutting down — retry" }));
+        res.end(JSON.stringify({ error: r.reason || "this hub replica is shutting down — retry" }));
       }
       return true;
     }
