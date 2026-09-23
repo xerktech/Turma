@@ -25,6 +25,16 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   its own project slug + Remote Control bridge pointer. `MAX_SESSIONS` caps concurrency; boot staggers
   launches.
 - Agents connect outbound-only to `TURMA_URL` (Cloudflare tunnel) — works from any network.
+- **`_worktree_add` checks out with `GIT_LFS_SKIP_SMUDGE=1`** (XERK-972). An LFS repo runs the
+  `git-lfs smudge` filter PER FILE at checkout (a subprocess, possibly a network fetch, each), so
+  `git worktree add` takes tens of seconds to minutes (measured ~65s on a real repo, 0s with smudge
+  skipped). It blew `run_ok`'s default 30s timeout — so EVERY session in that repo failed to start
+  with `git worktree add failed: … timed out` — and provision runs ON the beat under
+  `OFFLINE_AFTER_MS`, so a longer timeout would flap the host offline (the XERK-395 beat-budget
+  class) rather than fix it. Skipping smudge makes the checkout instant; LFS files land as pointer
+  files and a session materializes what it needs with `git lfs pull`. The env is the FULL inherited
+  environment plus the flag — a bare one-key dict would wipe `PATH` and break git's own exec.
+  Tests: `TestWorktreeAddSkipsLfsSmudge`.
 
 ### The trust-folder modal, and why it KILLED sessions (XERK-868)
 
