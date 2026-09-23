@@ -9,12 +9,13 @@
 //   - Timeout (plain browser / `npm run dev`) -> the existing DOM dev path,
 //     unchanged from Task 5.
 //
-// The SDK is only ever touched via a single dynamic `import()` right here —
+// The SDK is only ever touched via a single dynamic `import()` (bridge.ts) —
 // every other file in this package (display/evenhub.ts, storage.ts,
 // input/router.ts) is typed structurally against the SDK's shapes instead of
 // importing it, so the browser/dev build never needs to load or evaluate
 // `@evenrealities/even_hub_sdk` at all unless this import actually runs.
 import { App } from "./app.ts";
+import { resolveBridge, type ResolvedBridge } from "./bridge.ts";
 import type { Config } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { DomDisplay } from "./display/dom.ts";
@@ -29,33 +30,6 @@ import { mountPhone, type PhoneHandle } from "./phone/phone.ts";
 import { pretextGlyphCoverage, setGlyphCoverage } from "./font.ts";
 import { pretextMeasure, setDefaultMeasure } from "./text-wrap.ts";
 import { installLifecycle, onAbnormalOrSystemExit, onForegroundEnter, onForegroundExit } from "./lifecycle.ts";
-
-const BRIDGE_TIMEOUT_MS = 2000;
-
-function importSdk() {
-  return import("@evenrealities/even_hub_sdk");
-}
-
-// A structural stand-in for the awaited `waitForEvenAppBridge()` result —
-// deliberately untyped against the SDK (see file header): every consumer
-// (EvenHubDisplay, BridgeStorage, the input router) declares its own minimal
-// structural interface instead, and the real bridge satisfies all of them.
-type ResolvedBridge = Awaited<ReturnType<Awaited<ReturnType<typeof importSdk>>["waitForEvenAppBridge"]>>;
-
-// Races bridge resolution against a timeout so a plain browser (no Even
-// Realities WebView host) never hangs waiting for a bridge that will never
-// arrive. Any import/resolution failure is treated the same as a timeout.
-async function resolveBridge(): Promise<ResolvedBridge | null> {
-  try {
-    const mod = await importSdk();
-    const bridgePromise = mod.waitForEvenAppBridge();
-    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), BRIDGE_TIMEOUT_MS));
-    return await Promise.race([bridgePromise, timeout]);
-  } catch (err) {
-    console.warn("[glasses] Even Hub SDK unavailable, falling back to the DOM dev backend:", err);
-    return null;
-  }
-}
 
 async function main(): Promise<void> {
   const bridge = await resolveBridge();

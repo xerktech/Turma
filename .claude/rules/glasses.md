@@ -59,3 +59,7 @@ paths:
   simulator's font). Exempt: phone/, vendor/, phone-login.ts (browser fonts). Hub text is not a
   literal — it goes through `fontSafe` (bullet above). Tests: `glyphs.test.ts` "has a glyph for every
   non-ASCII character".
+- **A resolved `waitForEvenAppBridge()` does NOT mean a host is there** — it resolves in any browser.
+  `bridge.ts`'s `resolveBridge` also requires `window.flutter_inappwebview.callHandler` (the device
+  WebView or the simulator's shim), else it falls back to the DOM backend at `BRIDGE_TIMEOUT_MS`.
+  Tests: `src/bridge.test.ts`.
