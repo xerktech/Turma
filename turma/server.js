@@ -85,6 +85,7 @@ const { createIndexStore } = require("./index-store.js");
 // (which supply the pod-to-pod `dial`/listener + this replica's `endpoint`) are the
 // follow-up (w2-relay-consumers). See `.claude/rules/turma-ha-tunnel.md`.
 const { makeRelay } = require("./relay.js");
+const { makeForwarder } = require("./forward.js");
 
 // XERK-757 externalized-store persistence config, declared here so it can be
 // handed to the module-load store below. It maps each `policy:<name>` store key to
@@ -178,6 +179,22 @@ const HA_STORE_DEBOUNCE_MS = positiveEnv("HA_STORE_DEBOUNCE_MS", 1000);
 // is byte-identical to today. Wired at boot (or injected by a test) — see
 // __setLeader / the boot block. Mechanics: turma/leader.js, turma-ha-leader.md.
 let hubLeader = null;
+// XERK-919: single-writer serving. Under HA the lease leader serves EVERY request
+// and a follower forwards to it (turma/forward.js); null with HA off. Declared up
+// here, beside the elector it follows, because `onLeaderPromoted` below reads it.
+let forwarder = null;
+// True from the instant this replica wins the lease until it has re-read the fleet
+// registry from the shared store (`resyncAgentsFromStore`). Until then it HOLDS
+// requests rather than serve them off a mirror that may lack the old leader's last
+// writes — see `canServeLocally` and turma-ha-forward.md.
+let promotionSyncing = false;
+// Bounds that re-sync so a slow/broken store can never wedge a new leader.
+const PROMOTION_SYNC_MAX_MS = 3000;
+// May THIS replica serve a request as the single writer (XERK-919)? The leader,
+// once its promotion re-sync is done. HA off / no elector: always.
+function canServeLocally() {
+  return isLeader() && !promotionSyncing;
+}
 function isLeader() {
   // No elector (non-HA production before the boot wire, or a test with none
   // injected) is trivially the leader — single-process runs every sweep.
@@ -265,6 +282,17 @@ async function hydrateGuards() {
 // re-fires nothing: the migration record Map (its own hydrate) and the guards.
 function onLeaderPromoted() {
   if (!HA_ON) return;
+  // XERK-919: become the single writer only after re-reading the registry the old
+  // leader flushed before it released the lease (a watch event can be missed or
+  // still in flight). Requests forwarded here meanwhile are HELD, not served off
+  // a stale mirror. Announce the endpoint at once so followers stop dialing the
+  // old leader and queue behind us instead.
+  promotionSyncing = true;
+  if (forwarder) forwarder.publish();
+  const syncTimer = new Promise((r) => { const t = setTimeout(r, PROMOTION_SYNC_MAX_MS); t.unref?.(); });
+  Promise.race([resyncAgentsFromStore(), syncTimer])
+    .catch((e) => console.error(`leader promotion: registry re-sync failed: ${(e && e.message) || e}`))
+    .finally(() => { promotionSyncing = false; });
   hydrateMigrations().catch((e) =>
     console.error(`leader promotion: migration hydrate failed: ${(e && e.message) || e}`));
   hydrateGuards().catch((e) =>
@@ -1995,10 +2023,14 @@ function scheduleStoreFlush() {
 // Push the pending per-host changes to the shared store: one `set` per changed
 // record, one `del` per removed key. Best-effort and fire-and-forget — the
 // promises are caught, never awaited on any request path.
+// Returns a promise that settles when every write it issued has (or failed to)
+// land — the graceful handover awaits it before releasing the lease (XERK-919);
+// every other caller ignores it (fire-and-forget, never rejects).
 function flushAgentsToStore() {
-  if (!HA_ON || !liveStore) { storeDirty.clear(); storeRemoved.clear(); return; }
+  if (!HA_ON || !liveStore) { storeDirty.clear(); storeRemoved.clear(); return Promise.resolve(); }
+  const writes = [];
   for (const key of storeRemoved) {
-    liveStore.del(AGENT_STORE_PREFIX + key).catch(storeWriteFailed);
+    writes.push(liveStore.del(AGENT_STORE_PREFIX + key).catch(storeWriteFailed));
     lastStoreWritten.delete(key);
   }
   storeRemoved.clear();
@@ -2006,9 +2038,17 @@ function flushAgentsToStore() {
     const rec = agentStoreRecord(key);
     if (rec === null) continue; // gone or unserializable — skip; next beat retries
     lastStoreWritten.set(key, JSON.stringify(rec)); // remember it to drop the echo
-    liveStore.set(AGENT_STORE_PREFIX + key, rec).catch(storeWriteFailed);
+    writes.push(liveStore.set(AGENT_STORE_PREFIX + key, rec).catch(storeWriteFailed));
   }
   storeDirty.clear();
+  return Promise.all(writes).then(() => {});
+}
+
+// Flush any debounced per-host writes NOW (cancelling the timer). The awaited
+// form of flushStateNow's HA branch.
+function flushAgentsToStoreNow() {
+  if (storeFlushTimer) { clearTimeout(storeFlushTimer); storeFlushTimer = null; }
+  return flushAgentsToStore();
 }
 
 let saveTimer = null;
@@ -4629,6 +4669,23 @@ function relayEndpointAddr() {
   }
   return null;
 }
+// This replica's dialable HTTP address, which it publishes while it is the lease
+// leader so followers can forward to it (XERK-919). Same sources as the relay
+// endpoint, on the hub's own PORT: `TURMA_HUB_ENDPOINT` overrides, else the k8s
+// downward-API `POD_IP`, else the first non-internal IPv4. Null => followers can
+// never forward to this replica while it leads (logged at boot, not fatal: they
+// serve locally instead).
+function hubHttpEndpointAddr() {
+  if (process.env.TURMA_HUB_ENDPOINT) return process.env.TURMA_HUB_ENDPOINT;
+  const ip = process.env.POD_IP;
+  if (ip) return `${ip.includes(":") ? `[${ip}]` : ip}:${PORT}`;
+  for (const ifaces of Object.values(os.networkInterfaces())) {
+    for (const i of ifaces || []) {
+      if (i.family === "IPv4" && !i.internal) return `${i.address}:${PORT}`;
+    }
+  }
+  return null;
+}
 // Split "host:port" (host may be an IPv6 literal in [..]); returns {host, port}.
 function splitRelayAddr(addr) {
   const i = String(addr).lastIndexOf(":");
@@ -4820,6 +4877,27 @@ async function hydrateAgentsFromStore() {
   sanitizeRestoredCommands(agents);
   trimRestoredAgents();
   console.log(`hydrated ${loaded} agent record(s) from the HA store`);
+}
+
+// Promotion re-sync (XERK-919): re-read EVERY host record from the shared store and
+// apply it over this replica's mirror, as the watch would have. The old leader
+// awaited its last writes before releasing the lease, so after this the new leader
+// holds everything it queued — even an event the pub/sub watch dropped or had not
+// delivered yet. Caches are preserved (applyRemoteAgent). Never throws.
+async function resyncAgentsFromStore() {
+  if (!HA_ON || !liveStore || typeof liveStore.scan !== "function") return;
+  let rows;
+  try {
+    rows = await liveStore.scan(AGENT_STORE_PREFIX);
+  } catch (e) {
+    console.error(`HA registry re-sync failed: ${(e && e.message) || e}`);
+    return;
+  }
+  for (const { key, value } of rows) {
+    const hk = key.slice(AGENT_STORE_PREFIX.length);
+    if (!hk || !value || typeof value !== "object") continue;
+    applyRemoteAgent(hk, value);
+  }
 }
 
 // ---- Cross-replica tunnel directory (XERK-764) ------------------------------
@@ -14673,6 +14751,13 @@ const server = http.createServer(async (req, res) => {
   const parts = url.pathname.split("/").filter(Boolean); // e.g. api/agents/<id>/sessions
 
   try {
+    // XERK-919: under HA a FOLLOWER forwards the whole request to the lease leader,
+    // which serves everything (single-writer — the per-process state this handler
+    // is built on then lives in one process). Only /healthz and /readyz are always
+    // answered here. `false` (HA off, this replica leads, no fresh leader endpoint,
+    // or the leader could not be dialed) falls through to serving it locally.
+    if (forwarder && (await forwarder.forwardRequest(req, res))) return;
+
     // CORS for the cross-origin glasses WebView client: only /api/* and
     // /term/* opt in, and only when the request actually carries an Origin
     // (same-origin requests — the dashboard UI itself — never send one, so
@@ -18426,6 +18511,11 @@ server.on("drop", () => {
 //   /term/<sessionId>/… — a browser attaching to a live session terminal
 //                         (routed to the owning host + its ttyd port via tunnel)
 server.on("upgrade", async (req, socket, head) => {
+  // XERK-919: a follower pipes the upgrade, byte for byte, to the lease leader —
+  // so an agent's control channel, its data-channel dial-back and every browser
+  // /term + /live socket all terminate in ONE process (the dial-back pairs against
+  // `pendingChannels` there; a re-dialed tunnel reaps its stale predecessor there).
+  if (forwarder && (await forwarder.forwardUpgrade(req, socket, head))) return;
   const url = new URL(req.url, "http://x");
   const parts = url.pathname.split("/").filter(Boolean);
 
@@ -19412,6 +19502,11 @@ if (process.env.TURMA_TEST) {
     // against turma/relay.js directly; exposed here as the seam consumers reach.
     get relay() { return relay; },
     __setRelay(v) { relay = v; },
+    // XERK-919: the follower->leader forwarder (null single-process). A test injects
+    // one to pin that both handlers consult it first and serve locally on `false`.
+    get forwarder() { return forwarder; },
+    __setForwarder(v) { forwarder = v; },
+    hubHttpEndpointAddr,
     // XERK-781: the relay CONSUMERS. `openChannel` is relay-aware (proxies a data
     // channel to the tunnel owner); `openChannelLocal`/`openLiveForRelay` are the
     // OWNER-side bridges; `liveFanout`/`liveClients`/`liveRelayChannels` +
@@ -19622,6 +19717,27 @@ if (process.env.TURMA_TEST) {
     // TTL expiry fires no watch event, so a periodic sweep frees them (XERK-764).
     const dirSweep = setInterval(sweepTunnelDirectory, HOST_REPLICA_TTL_MS);
     dirSweep.unref?.();
+    // XERK-919: single-writer serving. The lease leader publishes its HTTP address;
+    // every follower forwards requests + upgrades to it, so all of the hub's
+    // per-process state (tunnels, dial-backs, command queues, result caches, the
+    // ticket queue) lives in ONE process — the single-process semantics every path
+    // was written against. `TURMA_HA_FORWARD=0` is the escape hatch back to
+    // active-active serving. Started before the elector exists: `isLeader` is read
+    // lazily, and a follower learns the current leader from the hydrate below.
+    const hubEndpoint = hubHttpEndpointAddr();
+    const forwardEnabled = process.env.TURMA_HA_FORWARD !== "0";
+    forwarder = makeForwarder(liveStore, SSE_REPLICA_ID, {
+      endpoint: hubEndpoint,
+      isLeader,
+      canServe: canServeLocally,
+      enabled: forwardEnabled,
+      log: (m) => console.log(m),
+    });
+    console.log(forwardEnabled
+      ? `serving: single-writer — the leader serves, followers forward to it (this replica's endpoint ${
+        hubEndpoint || "UNRESOLVED — followers cannot forward to this replica while it leads"})`
+      : "serving: ACTIVE-ACTIVE (TURMA_HA_FORWARD=0) — every replica serves its own requests");
+    forwarder.start().catch((e) => console.error(`forward start failed: ${(e && e.message) || e}`));
   }
   // Wave-2 (XERK-779): move the durable usage ledger of-record onto Postgres when HA
   // is on (retiring the XERK-758 Valkey backend), reusing the SHARED `archiveIndexPool`
@@ -19702,12 +19818,21 @@ if (process.env.TURMA_TEST) {
     hubDraining = true; // `/readyz` now answers 503 NotReady (liveness unaffected)
     console.log(`${signal} received — draining before exit`);
 
-    // XERK-763: renounce leadership FIRST so a warm standby promotes within a
-    // beat or two (release() backdates the lease's renewTime) instead of waiting
-    // out the whole lease duration — the fast-failover point of the deploy.
-    // Fire-and-forget: the drain below (and the force-exit backstop) never wait
-    // on it, and it never throws.
-    if (hubLeader) Promise.resolve(hubLeader.release()).catch(() => {});
+    // XERK-919: the LEADER keeps leading — and serving everything followers forward
+    // to it — through the readiness hold, and hands over only in cutAndFlush, after
+    // its registry writes have LANDED (so the successor's promotion re-sync reads
+    // them). Releasing here, at signal receipt, left ~2s in which this replica still
+    // served while a promoted successor served too: two writers, and commands
+    // queued on this side overwritten. A FOLLOWER stops its elector at once (it must
+    // not win the lease while draining); release() is a no-op for a non-holder.
+    const wasLeader = HA_ON && isLeader();
+    if (hubLeader && !wasLeader) Promise.resolve(hubLeader.release()).catch(() => {});
+    // Bounded await: a store or k8s API that hangs must never stall the drain past
+    // the force-exit backstop.
+    const settle = (p, ms) => Promise.race([
+      Promise.resolve(p).catch(() => {}),
+      new Promise((r) => { const t = setTimeout(r, ms); t.unref?.(); }),
+    ]);
 
     // Force-exit backstop, armed from signal receipt over the WHOLE budget so
     // the readiness delay + the flush together never overrun
@@ -19721,9 +19846,18 @@ if (process.env.TURMA_TEST) {
     // Phase 2 — cut the long-lived streams and flush. Deferred by the readiness
     // delay so the Service drops this pod first; the listener stays OPEN until
     // here so the readiness probe can still reach `/readyz` for a clean 503.
-    const cutAndFlush = () => {
+    const cutAndFlush = async () => {
       // Stop accepting new connections; in-flight HTTP requests finish on their own.
       try { server.close(); } catch {}
+      // XERK-919 handover, in this order: land the registry, THEN release the lease
+      // (backdated, so a standby promotes within one election retry), THEN retract
+      // the leader endpoint so followers hold for the successor rather than dial a
+      // listener that just closed. Each step bounded; the backstop still applies.
+      if (wasLeader) {
+        await settle(flushAgentsToStoreNow(), 2000);
+        if (hubLeader) await settle(hubLeader.release(), 2000);
+        if (forwarder) await settle(forwarder.retract(), 1000);
+      }
       // End the long-lived streams ourselves — server.close() waits on open SSE
       // responses and never tracks upgraded WebSockets, so neither ends without
       // this. Each is closed with a RECONNECT HINT so the client re-dials at once.
@@ -19754,6 +19888,9 @@ if (process.env.TURMA_TEST) {
       // whose bytes were proxying through us reconnects and re-resolves the owner.
       try { relayServer?.close(); } catch {}
       try { relay?.stop(); } catch {}
+      // XERK-919: cut every connection this replica was forwarding to the leader,
+      // so each client re-dials through the LB to a replica that is not draining.
+      try { forwarder?.stop(); } catch {}
       for (const host of Object.keys(liveRelayChannels)) {
         for (const sid of Object.keys(liveRelayChannels[host] || {})) {
           try { liveRelayChannels[host][sid].destroy(); } catch {}
@@ -19763,6 +19900,9 @@ if (process.env.TURMA_TEST) {
       // now); the archive SQLite handle is closed so its last writes land; the
       // usage ledger's write is async, and its callback is what ends the process.
       flushStateNow();
+      // HA: let those last per-host writes reach the store before its socket closes
+      // below (a fire-and-forget set racing close() could be dropped).
+      if (HA_ON) await settle(flushAgentsToStoreNow(), 1500);
       // Best-effort final push of any un-mirrored archive bytes to the object
       // store, so a deploy strands the least tail (agents re-push what doesn't
       // make it on the next replica's promotion — never data loss, XERK-759). Not
@@ -19781,9 +19921,9 @@ if (process.env.TURMA_TEST) {
 
     if (READYZ_DRAIN_DELAY_MS > 0) {
       console.log(`/readyz NotReady — holding ${READYZ_DRAIN_DELAY_MS}ms for endpoint drain before cutting sockets`);
-      setTimeout(cutAndFlush, READYZ_DRAIN_DELAY_MS).unref();
+      setTimeout(() => { cutAndFlush().catch(() => {}); }, READYZ_DRAIN_DELAY_MS).unref();
     } else {
-      cutAndFlush();
+      cutAndFlush().catch(() => {});
     }
   };
   process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
