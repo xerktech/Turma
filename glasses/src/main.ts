@@ -9,12 +9,13 @@
 //   - Timeout (plain browser / `npm run dev`) -> the existing DOM dev path,
 //     unchanged from Task 5.
 //
-// The SDK is only ever touched via a single dynamic `import()` right here —
+// The SDK is only ever touched via a single dynamic `import()` (bridge.ts) —
 // every other file in this package (display/evenhub.ts, storage.ts,
 // input/router.ts) is typed structurally against the SDK's shapes instead of
 // importing it, so the browser/dev build never needs to load or evaluate
 // `@evenrealities/even_hub_sdk` at all unless this import actually runs.
 import { App } from "./app.ts";
+import { resolveBridge, type ResolvedBridge } from "./bridge.ts";
 import type { Config } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { DomDisplay } from "./display/dom.ts";
@@ -26,35 +27,9 @@ import { LiveTail } from "./live.ts";
 import { BridgeStorage, BrowserStorage, type KeyValueStorage } from "./storage.ts";
 import { initPhoneLogin, signOut } from "./phone-login.ts";
 import { mountPhone, type PhoneHandle } from "./phone/phone.ts";
+import { pretextGlyphCoverage, setGlyphCoverage } from "./font.ts";
 import { pretextMeasure, setDefaultMeasure } from "./text-wrap.ts";
 import { installLifecycle, onAbnormalOrSystemExit, onForegroundEnter, onForegroundExit } from "./lifecycle.ts";
-
-const BRIDGE_TIMEOUT_MS = 2000;
-
-function importSdk() {
-  return import("@evenrealities/even_hub_sdk");
-}
-
-// A structural stand-in for the awaited `waitForEvenAppBridge()` result —
-// deliberately untyped against the SDK (see file header): every consumer
-// (EvenHubDisplay, BridgeStorage, the input router) declares its own minimal
-// structural interface instead, and the real bridge satisfies all of them.
-type ResolvedBridge = Awaited<ReturnType<Awaited<ReturnType<typeof importSdk>>["waitForEvenAppBridge"]>>;
-
-// Races bridge resolution against a timeout so a plain browser (no Even
-// Realities WebView host) never hangs waiting for a bridge that will never
-// arrive. Any import/resolution failure is treated the same as a timeout.
-async function resolveBridge(): Promise<ResolvedBridge | null> {
-  try {
-    const mod = await importSdk();
-    const bridgePromise = mod.waitForEvenAppBridge();
-    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), BRIDGE_TIMEOUT_MS));
-    return await Promise.race([bridgePromise, timeout]);
-  } catch (err) {
-    console.warn("[glasses] Even Hub SDK unavailable, falling back to the DOM dev backend:", err);
-    return null;
-  }
-}
 
 async function main(): Promise<void> {
   const bridge = await resolveBridge();
@@ -78,18 +53,21 @@ async function mainBridge(bridge: ResolvedBridge): Promise<void> {
   // Device path: the glasses render via the SDK, and the phone screen is the
   // native companion (mounted by boot()).
   document.body.classList.add("backend-bridge");
-  // These three are independent (two lazy bridge-path-only module imports —
+  // These four are independent (two lazy bridge-path-only module imports —
   // audio.ts is Task 7's real G2-mic dictation, both structural-only like
-  // display/evenhub.ts — plus resolving the pretext font measure), so run
+  // display/evenhub.ts — plus resolving the pretext font measure and glyph table), so run
   // their round-trips concurrently rather than one after another on the cold
   // boot path. `setDefaultMeasure` still runs before boot()/app.start(), so
   // the first render always wraps with the real metric.
-  const [{ EvenHubDisplay }, { AudioRecorder }, measure] = await Promise.all([
+  const [{ EvenHubDisplay }, { AudioRecorder }, measure, glyphCoverage] = await Promise.all([
     import("./display/evenhub.ts"),
     import("./audio.ts"),
     pretextMeasure(),
+    pretextGlyphCoverage(),
   ]);
   setDefaultMeasure(measure);
+  // Before boot(), so no transcript is ingested unchecked (font.ts, XERK-928).
+  setGlyphCoverage(glyphCoverage);
   const storage: KeyValueStorage = new BridgeStorage(bridge);
 
   const display = new EvenHubDisplay(bridge);

@@ -15,6 +15,23 @@
 # manager as the long-lived foreground process.
 set -eu
 
+# Refuse any argument this launcher doesn't own BEFORE anything runs (XERK-937).
+# The run path reaps the live tunnel and execs a manager, so an unrecognised arg
+# like `--help` falling through to it started a second hub-agent.py outside
+# turma-agentctl's pidfile — two processes beating as one host.
+usage() {
+  echo "usage: turma-agent [--preflight | --tunnel-supervisor | -h | --help]"
+  echo "  (no args)            run the session manager; start it via systemd or"
+  echo "                       turma-agentctl, not by hand"
+  echo "  --preflight          report credentials and tools, then exit"
+  echo "  --tunnel-supervisor  internal: the reverse-tunnel respawn loop"
+}
+case "$#:${1:-}" in
+  0:|1:--preflight|1:--tunnel-supervisor) ;;
+  1:-h|1:--help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
 # Resolve the install prefix from our own location ($PREFIX/bin/turma-agent).
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"   # $PREFIX/bin
 PREFIX="$(dirname "$SELF_DIR")"             # $PREFIX
@@ -247,6 +264,53 @@ if [ "${1:-}" = "--preflight" ]; then
     fi
   done
   exit 0
+fi
+
+# ---- refuse a SECOND manager for this $PREFIX (XERK-938) --------------------
+# No-args is the LEGITIMATE systemd/turma-agentctl entry point, so it can't be
+# rejected like an unknown arg (XERK-937). But run BY HAND on a host that already
+# has a manager, the run path below reaps the live reverse tunnel and execs a
+# second hub-agent.py — two managers beating as the same host, fighting over the
+# tunnel, and `turma-agentctl restart` (which only kills the pid in its pidfile)
+# can't reap the stray. So a no-arg start refuses when a manager for THIS prefix
+# is already running.
+#
+# It cannot false-refuse a real restart, because every restart path reaps the old
+# manager BEFORE this launcher runs:
+#   * systemd (Type=exec, KillMode=process): the restart's stop job waits for the
+#     main process (hub-agent.py) to exit before the start job runs ExecStart.
+#   * turma-agentctl restart: kill_manager SIGTERMs the pidfile pid and WAITS for
+#     it to exit before `start` (see agent/native/turma-agentctl).
+# Both leave no hub-agent.py for the pgrep below to find. A crash-restart is the
+# same: the old process is already gone. A zombie has an empty /proc/<pid>/cmdline
+# so `pgrep -f` never matches one.
+#
+# pgrep -f matches the full argv; $PREFIX/hub-agent.py is this install's manager
+# and the manager never re-spawns itself, so a match is a live manager — with one
+# rare exception: a CONCURRENT `hub-agent.py --enroll` probe (self-enroll, or
+# `turma-agentctl enroll`) shares the path and could read as a manager. This
+# launcher's OWN enroll (above) is awaited and gone before we get here, so it
+# never trips its own guard; only a second, overlapping enroll would, and it
+# fails LOUD (a printed refusal an operator retries), never dark. This launcher's
+# own argv is the bash script path, not hub-agent.py, so it never matches itself
+# (the exec is far below). Missing pgrep fails OPEN — the prior behaviour, never
+# worse. TURMA_ALLOW_SECOND_MANAGER=1 opts out for the rare case of deliberately
+# running a second one.
+if [ "${TURMA_ALLOW_SECOND_MANAGER:-0}" = 0 ] \
+   && command -v pgrep >/dev/null 2>&1 \
+   && pgrep -f "$PREFIX/hub-agent.py" >/dev/null 2>&1; then
+  echo "=================================================================="
+  echo " A Turma manager for this install ($PREFIX) is already running:"
+  pgrep -af "$PREFIX/hub-agent.py" 2>/dev/null | sed 's/^/   /'
+  echo
+  echo " NOT starting a second one — two managers would beat as the same host"
+  echo " and fight over the reverse tunnel. Restart the running one instead:"
+  echo "   systemctl --user restart turma-agent    # systemd hosts"
+  echo "   turma-agentctl restart                   # non-systemd hosts"
+  echo
+  echo " Set TURMA_ALLOW_SECOND_MANAGER=1 to override (rarely what you want)."
+  echo "=================================================================="
+  exit 1
 fi
 
 report_creds

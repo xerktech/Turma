@@ -74,6 +74,12 @@ class StandaloneLeader {
   isLeader() {
     return true;
   }
+  // No k8s lease here (single-process, or HA-with-no-lease), so no OTHER replica can
+  // hold one — the forwarder's XERK-935 store-partition guard is a no-op in these
+  // modes (single-process serves locally; ha-no-lease already runs every replica).
+  leaseHeldByOther() {
+    return false;
+  }
   start() {}
   stop() {}
   async release() {}
@@ -108,10 +114,24 @@ class LeaderElector {
     this.retryPeriodMs = cfg.retryPeriodMs || DEFAULTS.retryPeriodMs;
     this._request = opts.request;
     this._log = opts.log || (() => {});
+    // () => boolean: may THIS replica lead right now (XERK-935)? False while its
+    // shared-store link is down — a leader that cannot reach the store cannot be the
+    // single writer, so it ABSTAINS (drops + backdates the lease) and a healthy
+    // replica takes over. Default always-lead keeps every existing caller/test
+    // byte-identical. Only the k8s elector consults it; a StandaloneLeader ignores it.
+    this._canLead = opts.canLead || null;
     this._onChange = [];
     if (opts.onChange) this._onChange.push(opts.onChange);
 
     this._leader = false;
+    // Last observed lease holder (from every _get, whether leading, following or
+    // abstaining), so `leaseHeldByOther()` can answer the forwarder's XERK-935 guard
+    // even while we abstain. `_observedAt` bounds it: a wedged loop's stale view must
+    // not pin a stale holder (the isLeader() self-expiry philosophy).
+    this._observedHolder = null;
+    this._observedRenewMs = NaN;
+    this._observedDurMs = 0;
+    this._observedAt = 0;
     // Local monotonic-ish stamp of the last CONFIRMED renewal/acquisition. The
     // sync `isLeader()` self-expires off this, so a stalled loop drops leadership.
     this._lastRenew = 0;
@@ -147,6 +167,33 @@ class LeaderElector {
     // expiry (which a raw-ms bound would be whenever the ms rounds down to a
     // shorter second count; XERK-763 QA).
     return this._leader && Date.now() - this._lastRenew <= this.leaseSeconds * 1000;
+  }
+
+  // Does ANOTHER replica currently hold a fresh lease (XERK-935)? The forwarder's
+  // second-writer guard consults this ONLY while its own store link is down, where
+  // the lease (k8s API, not the store) is the one still-readable leader signal. False
+  // when WE hold it, when nobody does (we may be the sole survivor — serve degraded),
+  // when our observation is itself stale (a wedged loop), or when the observed lease
+  // has expired. SYNCHRONOUS, like isLeader() — read off the last _tick observation.
+  leaseHeldByOther() {
+    const h = this._observedHolder;
+    if (!h || h === this.identity) return false;
+    const window = this.leaseSeconds * 1000;
+    // Our observation must be recent, or a stalled loop pins a stale holder forever.
+    if (!this._observedAt || Date.now() - this._observedAt > window) return false;
+    // And the observed lease itself must not have expired since it was renewed.
+    if (!Number.isFinite(this._observedRenewMs)) return false;
+    return Date.now() - this._observedRenewMs <= (this._observedDurMs || window);
+  }
+
+  // Record the holder/renewTime/duration from a _get so leaseHeldByOther() can answer
+  // in every tick path — leading, following AND abstaining.
+  _observe(observed, now) {
+    const spec = observed && observed.spec ? observed.spec : null;
+    this._observedHolder = spec ? spec.holderIdentity || null : null;
+    this._observedRenewMs = spec && spec.renewTime ? Date.parse(spec.renewTime) : NaN;
+    this._observedDurMs = spec ? (Number(spec.leaseDurationSeconds) || this.leaseSeconds) * 1000 : 0;
+    this._observedAt = now;
   }
 
   onChange(cb) {
@@ -284,6 +331,24 @@ class LeaderElector {
     }
 
     const now = Date.now();
+    // Record who holds the lease before deciding anything, so leaseHeldByOther() is
+    // fresh whichever branch we take below (XERK-935).
+    this._observe(observed, now);
+
+    // XERK-935: while our store link is down we must NOT hold or take the lease — a
+    // leader that cannot reach the shared store cannot be the single writer. Step down
+    // (backdating the lease so a healthy replica promotes within a retry, not a full
+    // lease) and keep observing so we (a) learn who takes over — leaseHeldByOther()
+    // above, the forwarder's second-writer guard — and (b) re-elect when the store
+    // recovers. Never acquire or renew while we cannot lead.
+    if (this._canLead && !this._canLead()) {
+      if (this._leader) {
+        this._setLeader(false);
+        await this._abstain(observed, now);
+      }
+      return;
+    }
+
     if (observed === null) {
       this._setLeader(await this._create(now));
       return;
@@ -316,6 +381,33 @@ class LeaderElector {
   _maybeExpire() {
     if (this._leader && Date.now() - this._lastRenew > this.renewDeadlineMs) {
       this._setLeader(false);
+    }
+  }
+
+  // XERK-935: abstain from a lease we hold because we can no longer LEAD (store link
+  // down), without stopping the election loop (unlike release(), which is for
+  // shutdown). Backdate our renewTime so a healthy standby promotes within a retry
+  // rather than waiting out the full lease. Only touches the lease if WE are still the
+  // recorded holder; never throws. Fired once on the leader->abstain edge (the caller
+  // gates on `this._leader`), so the loop keeps running and re-elects on recovery.
+  async _abstain(observed, now) {
+    if (!observed || !observed.spec || observed.spec.holderIdentity !== this.identity) return;
+    try {
+      const rv = observed.metadata && observed.metadata.resourceVersion;
+      const past = microTime(now - this.leaseDurationMs - 1000);
+      await this._request(
+        "PUT",
+        `${this._leasePath()}/${encodeURIComponent(this.leaseName)}`,
+        {
+          apiVersion: "coordination.k8s.io/v1",
+          kind: "Lease",
+          metadata: { name: this.leaseName, namespace: this.namespace, resourceVersion: rv },
+          spec: { ...observed.spec, renewTime: past },
+        }
+      );
+      this._log(`leader: abstaining from lease ${this.leaseName} (store link down — cannot be the single writer)`);
+    } catch (e) {
+      this._log(`leader: abstain failed (harmless): ${(e && e.message) || e}`);
     }
   }
 
@@ -459,7 +551,7 @@ function timingFromEnv(env = process.env) {
  *   synchronous `isLeader()` in every mode.
  * @returns {StandaloneLeader|LeaderElector}
  */
-function createLeader({ haOn, env = process.env, log = () => {}, onChange, request } = {}) {
+function createLeader({ haOn, env = process.env, log = () => {}, onChange, request, canLead } = {}) {
   if (!haOn) return new StandaloneLeader("single-process");
 
   const timing = timingFromEnv(env);
@@ -472,7 +564,7 @@ function createLeader({ haOn, env = process.env, log = () => {}, onChange, reque
         leaseName: env.TURMA_LEADER_LEASE || "turma-hub-leader",
         ...timing,
       },
-      { request, log, onChange }
+      { request, log, onChange, canLead }
     );
   }
 
@@ -494,7 +586,7 @@ function createLeader({ haOn, env = process.env, log = () => {}, onChange, reque
       leaseName: env.TURMA_LEADER_LEASE || "turma-hub-leader",
       ...timing,
     },
-    { request: makeK8sRequest(sa), log, onChange }
+    { request: makeK8sRequest(sa), log, onChange, canLead }
   );
 }
 

@@ -61,10 +61,41 @@ start() {
   fi
 }
 
-# Kill only the manager pid, preserving tmux/ttyd/claude.
+# Kill only the manager pid, preserving tmux/ttyd/claude. SIGTERM first so it
+# shuts down gracefully (it announces the restart to the hub and reaps its
+# probes), then WAIT for it to exit; if it outlives the grace period, SIGKILL —
+# and only return once it is actually gone.
+#
+# The wait+escalation is load-bearing for restart(): the caller starts a NEW
+# manager next, and the launcher's XERK-938 guard refuses to start while a
+# hub-agent.py for this prefix is still alive. A manager's SIGTERM handler can
+# block a few seconds on the hub announce (`_handle_shutdown` →
+# `_announce_updating`, `UPDATING_ANNOUNCE_TIMEOUT_SEC`, default 4s), so a fixed
+# short wait let the new launcher see the still-dying old manager, refuse, and
+# leave the host with ZERO managers and no self-heal. The grace default sits well
+# above that budget; SIGKILL (uncatchable) is the backstop, mirroring systemd's
+# TimeoutStopSec-then-SIGKILL. TURMA_MANAGER_STOP_WAIT (whole seconds) overrides
+# the grace period.
 kill_manager() {
   pid="$(_pid)"
-  if _alive "$pid"; then kill "$pid" 2>/dev/null || true; fi
+  if _alive "$pid"; then
+    kill "$pid" 2>/dev/null || true
+    grace="${TURMA_MANAGER_STOP_WAIT:-15}"
+    case "$grace" in ''|*[!0-9]*) grace=15 ;; esac
+    for _ in $(seq 1 $(( grace * 5 ))); do
+      _alive "$pid" || break
+      sleep 0.2
+    done
+    if _alive "$pid"; then
+      kill -9 "$pid" 2>/dev/null || true
+      # SIGKILL can't be caught, so this converges; confirm gone before we return
+      # (and thus before restart() starts a new manager).
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        _alive "$pid" || break
+        sleep 0.2
+      done
+    fi
+  fi
   rm -f "$PIDFILE"
 }
 
@@ -85,12 +116,10 @@ stop() {
 
 restart() {
   # Manager-only restart: sessions survive, the new manager re-adopts them.
+  # kill_manager already waits for the old manager to EXIT (SIGTERM, grace,
+  # SIGKILL) before returning, so `start` never races a still-dying manager into
+  # the launcher's XERK-938 duplicate-manager guard.
   kill_manager
-  # Give the old manager a moment to release before the new one binds/reads.
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    pid="$(_pid)"; _alive "$pid" || break
-    sleep 0.2
-  done
   start
 }
 

@@ -563,3 +563,42 @@ describe("HubClient", () => {
     expect(client).toBeInstanceOf(HubClient);
   });
 });
+
+// XERK-929: before sign-in the stored hubUrl is "", so url(path) was a bare
+// relative "/api/agents" — fetched against the page's own origin (the Vite dev
+// server answering index.html; file:///api/agents on the device) on every poll.
+describe("HubClient with no hub URL (XERK-929)", () => {
+  const unsignedIn: Config = { hubUrl: "", user: "", password: "", pollMs: 6000 };
+
+  it("refuses to fetch rather than requesting a path relative to the page", async () => {
+    const fetchFn = fakeFetch({ now: 1, agents: [] });
+    const client = new HubClient({ config: unsignedIn, fetchFn });
+    await expect(client.listAgents()).rejects.toThrow(/no hub URL/);
+    await expect(client.wsToken()).rejects.toThrow(/no hub URL/);
+    await expect(client.getHistory("h", "s")).rejects.toThrow(/no hub URL/);
+    await client.loginForCookie(); // best-effort: swallows, never fetches
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("rejects without a status, so the app flashes hub-unreachable", async () => {
+    const client = new HubClient({ config: unsignedIn, fetchFn: fakeFetch({}) });
+    const err = await client.listAgents().catch((e: unknown) => e);
+    expect((err as { status?: unknown }).status).toBeUndefined();
+  });
+
+  it("refuses a hub URL with no host, which would also resolve to the page", async () => {
+    for (const hubUrl of ["http:", "https:", "/", "//"]) {
+      const fetchFn = fakeFetch({ now: 1, agents: [] });
+      const client = new HubClient({ config: { ...config, hubUrl }, fetchFn });
+      await expect(client.listAgents()).rejects.toThrow(/no hub URL/);
+      expect(fetchFn).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not poll the hub signed out (URL kept, credentials cleared)", async () => {
+    const fetchFn = fakeFetch({ now: 1, agents: [] });
+    const client = new HubClient({ config: { ...config, user: "", password: "" }, fetchFn });
+    await expect(client.listAgents()).rejects.toThrow(/no hub URL/);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+});

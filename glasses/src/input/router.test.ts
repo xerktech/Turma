@@ -24,6 +24,27 @@ describe("normalizeEvent", () => {
     expect(normalizeEvent({ textEvent: { eventType: 0 } })).not.toEqual({ type: "tap" });
   });
 
+  // XERK-922: the SDK strips a sysEvent eventType it doesn't recognise, leaving
+  // an empty `sysEvent` but keeping the raw value in `jsonData`. That must NOT
+  // read as a protobuf-zero click. A genuine click omits eventType everywhere.
+  it.each([11, 99, -1, "FOO", "9"])(
+    "ignores a sysEvent whose eventType (%s) the SDK dropped — never a tap",
+    (eventType) => {
+      expect(normalizeEvent({ sysEvent: {}, jsonData: { eventType } })).toBeNull();
+    },
+  );
+
+  it("ignores a sysEvent whose jsonData.eventType is a firmware null the SDK stripped", () => {
+    // The real SDK maps a firmware `eventType: null` to {jsonData:{eventType:null},
+    // sysEvent:{}} — a value it saw and dropped, not the absent field of a real click.
+    expect(normalizeEvent({ sysEvent: {}, jsonData: { eventType: null as unknown as number } })).toBeNull();
+  });
+
+  it("still taps a genuine protobuf-zero click (eventType absent from jsonData too)", () => {
+    expect(normalizeEvent({ sysEvent: {}, jsonData: {} })).toEqual({ type: "tap" });
+    expect(normalizeEvent({ sysEvent: {}, jsonData: { eventType: 0 } })).toEqual({ type: "tap" });
+  });
+
   it("maps sysEvent DOUBLE_CLICK_EVENT (3) to doubleTap", () => {
     expect(normalizeEvent({ sysEvent: { eventType: 3 } })).toEqual({ type: "doubleTap" });
   });
@@ -48,6 +69,13 @@ describe("normalizeEvent", () => {
     [6, { type: "lifecycle", phase: "abnormal-exit" }],
   ])("maps sysEvent eventType %i to the matching lifecycle phase", (eventType, expected) => {
     expect(normalizeEvent({ sysEvent: { eventType } })).toEqual(expected);
+  });
+
+  it.each([9, 10])("ignores sysEvent LONG_PRESS (9) / LONG_PRESS_RELEASE (10) — never a tap", (eventType) => {
+    // Answering a question or toggling dictation on a long press would be a
+    // misfire the operator never asked for.
+    expect(normalizeEvent({ sysEvent: { eventType, eventSource: 1 } })).toBeNull();
+    expect(normalizeEvent({ textEvent: { eventType } })).toBeNull();
   });
 
   it("maps SYSTEM_EXIT_EVENT (7) to lifecycle system-exit and carries the reason code", () => {

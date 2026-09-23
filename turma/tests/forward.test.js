@@ -8,7 +8,12 @@
 // WebSocket upgrades), the hold-don't-double-write rule, the drain refusal, and the
 // server.js wiring (both handlers consult the forwarder first).
 
-const { test } = require("node:test");
+const { test: baseTest, after } = require("node:test");
+// Every case is bounded, and the file force-exits once they finish: a failed assertion
+// skips its own server.close()/f.close(), and the open handles would otherwise keep
+// this process (and CI's `node --test`) hanging instead of exiting red.
+const test = (name, fn) => baseTest(name, { timeout: 20000 }, fn);
+after(() => { setTimeout(() => process.exit(process.exitCode || 0), 200).unref(); });
 const assert = require("node:assert/strict");
 const http = require("node:http");
 const net = require("node:net");
@@ -253,6 +258,43 @@ test("XERK-919: a DRAINING follower refuses (503) what it cannot forward, never 
   assert.equal(r.status, 503);
   assert.equal(r.headers["retry-after"], "1");
   srv.close(); f.close();
+});
+
+// ---- XERK-935: asymmetric store partition (a store-less replica never double-writes) --
+
+test("XERK-935: a store-less follower REFUSES when another replica holds the lease (never a second writer)", async () => {
+  // Store link down, so the leader-endpoint mirror can't refresh — but the k8s lease
+  // (readable when only the store is down) says a healthy replica leads: refuse, don't degrade.
+  const { f } = await follower(undefined, { storeHealthy: () => false, leaseHeldElsewhere: () => true });
+  const d = f.decide(req("/api/x"));
+  assert.ok(d.refuse, "store down + lease held elsewhere -> refuse, not hold/degrade");
+  const { srv, port } = await followerServer(f);
+  const r = await request(port, { path: "/api/agents" });
+  assert.equal(r.status, 503, "the client's LB retry then lands on the real leader");
+  assert.equal(r.headers["retry-after"], "1");
+  assert.match(r.body, /store link is down/);
+  assert.equal(f.stats.refusedNoStore, 1);
+  srv.close(); f.close();
+});
+
+test("XERK-935: a store-less SOLE survivor (no other lease holder) still serves locally", async () => {
+  // Store down but NOBODY else holds the lease -> the normal hold/degrade path serves.
+  const { f } = await follower(undefined, {
+    storeHealthy: () => false, leaseHeldElsewhere: () => false, holdMs: 60, holdPollMs: 10,
+  });
+  assert.ok(f.decide(req("/api/x")).hold, "no other holder -> normal hold, never refuse");
+  const { srv, port } = await followerServer(f);
+  const r = await request(port, { path: "/api/agents" });
+  assert.equal(r.status, 299, "held then served locally (the sole-survivor degraded path)");
+  assert.equal(r.body, "served-locally");
+  assert.equal(f.stats.refusedNoStore, 0);
+  srv.close(); f.close();
+});
+
+test("XERK-935: with no leaseHeldElsewhere wired, a store-less follower is byte-identical (holds, never refuses)", async () => {
+  const { f } = await follower(undefined, { storeHealthy: () => false }); // default leaseHeldElsewhere = () => false
+  assert.ok(f.decide(req("/api/x")).hold, "default never refuses");
+  f.close();
 });
 
 // ---- upgrades ----------------------------------------------------------------
@@ -1324,4 +1366,20 @@ test("XERK-936 QA7: a leader publishes stripsForward only when its caller says i
   }
   const src = require("node:fs").readFileSync(require.resolve("../server.js"), "utf8");
   assert.match(src, /stripsForward: true, \/\/ both handlers call stripForwardHeaders/);
+});
+
+test("XERK-919 QA3: a leader in dial cooldown is never fresh — fresh entry or recent dial proof notwithstanding", async () => {
+  const leader = net.createServer((s) => s.end()); const lport = await listen(leader);
+  let healthy = false; // store link down throughout
+  const store = new FileLiveStore();
+  const f = makeForwarder(store, "me", { isLeader: () => false, ttlMs: 60000, storeHealthy: () => healthy, cooldownMs: 60000, holdMs: 100, holdPollMs: 10 });
+  await f.start();
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: `127.0.0.1:${lport}`, at: Date.now() - 120000 });
+  const { srv, port } = await followerServer(f);
+  await request(port, { path: "/api/x" }).catch(() => {});
+  assert.equal(f.remoteLeaderFresh(), true, "a good dial just now");
+  leader.close(); await sleep(30);
+  await request(port, { path: "/api/y" }).catch(() => {}); // this dial fails -> cooldown
+  assert.equal(f.remoteLeaderFresh(), false, "the dial proof is recent, but the leader is in cooldown: no hand-back");
+  srv.close(); f.close();
 });

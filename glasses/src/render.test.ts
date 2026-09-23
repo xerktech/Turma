@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createInitialState, newSessionState, type AppState } from "./app.ts";
 import { render, sessionContentLines, sessionTranscriptArea, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
+import { setGlyphCoverage } from "./font.ts";
 import { charMeasure, setDefaultMeasure, type Measure } from "./text-wrap.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
@@ -175,16 +176,16 @@ describe("render: home", () => {
   // the canvas edge with nothing saying the tail was cut.
   it("clips a flash too long for the one-line header, marking the cut", () => {
     const long =
-      "✗ message too long — 12,345 characters, the agent accepts at most 10,000 per message";
+      "x message too long — 12,345 characters, the agent accepts at most 10,000 per message";
     const line = asLines(render(base({ flash: long, flashUntil: NOW + 1000 })))[0] ?? "";
     expect(line.endsWith("…")).toBe(true);
     expect(line.length).toBeLessThan(long.length);
-    expect(line.startsWith("✗ message too long")).toBe(true);
+    expect(line.startsWith("x message too long")).toBe(true);
   });
 
   it("leaves a flash that already fits untouched", () => {
-    const state = base({ flash: "✗ that host is offline", flashUntil: NOW + 1000 });
-    expect(asLines(render(state))[0]).toBe("✗ that host is offline");
+    const state = base({ flash: "x that host is offline", flashUntil: NOW + 1000 });
+    expect(asLines(render(state))[0]).toBe("x that host is offline");
   });
 
   it("does not show an expired flash", () => {
@@ -224,7 +225,7 @@ describe("render: session", () => {
     const model = asSession(render(state));
 
     // The hub's own words sit above the transcript content, not strobed as a flash.
-    expect(model.transcriptLines[0]).toBe("✗ wrong hub password");
+    expect(model.transcriptLines[0]).toBe("x wrong hub password");
     expect(model.transcriptLines).toContain("» hi");
   });
 
@@ -256,6 +257,34 @@ describe("render: session", () => {
     // The persistent sticky line eats exactly one row from the scrollable area,
     // so app.ts's offset clamp matches what renderSession actually windows.
     expect(sessionTranscriptArea(withRefusal, sess)).toBe(sessionTranscriptArea(without, sess) - 1);
+  });
+
+  it("draws a question sheet and home row without G2-missing glyphs (XERK-928)", () => {
+    setGlyphCoverage((cp) => cp !== 0x1f9e0);
+    try {
+      const q = `${String.fromCodePoint(0x26a0)} Deploy?`;
+      const opt = `${String.fromCodePoint(0x2713)} Yes`;
+      const summary = `${String.fromCodePoint(0x1f9e0)} Fix it`;
+      const s = session({ id: "s1", summary, session: signals({ question: q, questionOptions: [opt] }) });
+      const agents = [agent({ sessions: [s] })];
+      const model = asSession(
+        render(base({ screen: "session", agents, session: newSessionState("host-a", "s1"), transcripts: { s1: { entries: [] } } }))
+      );
+      if (model.bottom.mode !== "sheet") throw new Error("expected sheet");
+      expect(model.bottom.lines.join("\n")).toContain("! Deploy?");
+      expect(model.bottom.lines.join("\n")).toContain("1. √ Yes");
+      expect(model.bottom.options).toEqual([opt]); // the answer sent back is untouched
+      const home = asLines(render(base({ agents, home: { cursor: 0 } }))).join("\n");
+      expect(home).toContain("Fix it");
+      expect(home).not.toContain(String.fromCodePoint(0x1f9e0));
+      const confirm = { action: { kind: "kill" as const, hostKey: "host-a", sessionId: "s1" }, cursor: 0 };
+      expect(asSession(render(base({ screen: "confirm", agents, confirm }))).bottom.lines[0]).toBe("End session Fix it?");
+      // Nothing drawable in the summary: fall back to the short id, not "?".
+      const blank = [agent({ sessions: [session({ id: "s1abcdef", summary: String.fromCodePoint(0x1f9e0) })] })];
+      expect(asLines(render(base({ agents: blank, home: { cursor: 0 } }))).join("\n")).toContain("s1abcd");
+    } finally {
+      setGlyphCoverage(null);
+    }
   });
 
   it("shows a sheet-mode bottom bar with numbered options and a Dictate answer row when a question is pending", () => {
@@ -524,12 +553,12 @@ describe("render: session", () => {
       agents,
       session: newSessionState("host-a", "s1"),
       transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
-      flash: "✓ queued — agent picks up in ~20s",
+      flash: "√ queued — agent picks up in ~20s",
       flashUntil: NOW + 1000,
     });
 
     const model = asSession(render(state));
-    expect(model.transcriptLines[0]).toContain("✓ queued");
+    expect(model.transcriptLines[0]).toContain("√ queued");
     expect(model.transcriptLines.some((l) => l.includes("hi"))).toBe(true);
   });
 
@@ -541,7 +570,7 @@ describe("render: session", () => {
       agents,
       session: newSessionState("host-a", "s1"),
       transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
-      flash: "✓ queued — agent picks up in ~20s",
+      flash: "√ queued — agent picks up in ~20s",
       flashUntil: NOW - 1,
     });
 

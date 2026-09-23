@@ -192,6 +192,16 @@ function makeForwarder(store, replicaId, deps = {}) {
     // relaying anything (server.js stripForwardHeaders). Published on the leader entry: a
     // follower learns a self-alias only under a leader that claims it (see learnAlias).
     stripsForward = false,
+    // () => boolean: does ANOTHER replica currently hold the leader lease (XERK-935)?
+    // Consulted ONLY while our own store link is down: a store-less replica cannot
+    // learn/refresh the leader's published endpoint (it rides the store), so with no
+    // second signal it would degrade to a local write beside the healthy leader — the
+    // asymmetric-store-partition double-writer. The lease lives in the k8s API, NOT
+    // the store, so it stays readable when the store link is down; when it says a
+    // healthy replica leads we REFUSE (503) rather than serve, and the client's LB
+    // retry lands on that leader. With no other holder we may be the sole survivor,
+    // so the normal hold/degrade path still serves locally.
+    leaseHeldElsewhere = () => false,
   } = deps;
   const canServe = deps.canServe || isLeader;
 
@@ -206,7 +216,7 @@ function makeForwarder(store, replicaId, deps = {}) {
   const lastDialOk = new Map(); // addr -> when a dial to it last SUCCEEDED
   const live = new Set(); // every forwarded socket (client + upstream), for drain
   const stats = {
-    requests: 0, upgrades: 0, dialFailures: 0, held: 0, degraded: 0,
+    requests: 0, upgrades: 0, dialFailures: 0, held: 0, degraded: 0, refusedNoStore: 0,
     refusedOversize: 0, staleProofs: 0, replayedProofs: 0, loops: 0,
   };
   let refreshTimer = null;
@@ -344,6 +354,9 @@ function makeForwarder(store, replicaId, deps = {}) {
   function remoteLeaderFresh() {
     const e = leader;
     if (!e || e.replica === replicaId || !e.addr || isOwnAddr(e.addr)) return false;
+    // A leader we just FAILED to dial is not a place to send tunnels, however fresh
+    // its entry reads (it can be up to ttlMs old when the leader dies).
+    if (unreachableUntil.get(e.addr) > now()) return false;
     if (now() - e.seenAt < ttlMs) return true;
     // With the store link down the entry cannot be refreshed, so its age proves
     // nothing — but neither does it prove the leader is ALIVE. Only a dial that
@@ -351,7 +364,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     // leader that has died too (the only replica left able to serve them).
     if (storeHealthy()) return false;
     const ok = lastDialOk.get(e.addr);
-    return !!ok && now() - ok < ttlMs && !(unreachableUntil.get(e.addr) > now());
+    return !!ok && now() - ok < ttlMs;
   }
 
   const LOCAL = { local: true };
@@ -364,6 +377,14 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (canServe()) { noteMode("serving locally (this replica is the leader)"); return LOCAL; }
     const loop = proofOf(req).loop;
     if (loop) return { loop }; // our own proof back: refuse now, never forward/hold/serve
+    // XERK-935: our store link is down, so the leader-endpoint mirror cannot refresh
+    // — but the lease (k8s API, not the store) says another replica leads. It is the
+    // single writer; never become a second one. Refuse so the client's LB retry reaches
+    // it. (With no other holder we may be the sole survivor — fall through to hold/degrade.)
+    if (!storeHealthy() && leaseHeldElsewhere()) {
+      noteMode("refusing (store link down; the lease is held by another replica) — the client retries onto the leader");
+      return { refuse: "this hub replica's store link is down; the leader is elsewhere — retry" };
+    }
     const e = leader;
     const fresh = e && (now() - e.seenAt < ttlMs || !storeHealthy());
     if (!fresh || e.replica === replicaId || (e.addr && isOwnAddr(e.addr))) {
@@ -436,6 +457,7 @@ function makeForwarder(store, replicaId, deps = {}) {
       const d = decide(req);
       if (d.local) return null;
       if (d.loop) { stats.loops += 1; return { loop: d.loop }; }
+      if (d.refuse) { stats.refusedNoStore += 1; return { refuse: true, reason: d.refuse }; }
       if (d.forward) {
         try {
           return { sock: await dial(d.forward), hops: hopsOf(req), addr: d.forward };
@@ -565,7 +587,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (r.refuse) {
       if (!res.headersSent) {
         res.writeHead(503, { "content-type": "application/json", "retry-after": "1", connection: "close" });
-        res.end(JSON.stringify({ error: "this hub replica is shutting down — retry" }));
+        res.end(JSON.stringify({ error: r.reason || "this hub replica is shutting down — retry" }));
       }
       return true;
     }
@@ -706,7 +728,10 @@ function makeForwarder(store, replicaId, deps = {}) {
         if (head.startsWith("HTTP/1.1 508 ") && head.includes(want)) learnAlias(r.addr); // our own writer's exact form
       });
     }
-    up.write(lines.join("\r\n") + "\r\n\r\n");
+    // latin1: Node's parser decodes raw header bytes as latin1, so writing latin1
+    // puts every original byte back on the wire unchanged (UTF-8 would re-encode
+    // any byte >= 0x80 as two).
+    up.write(lines.join("\r\n") + "\r\n\r\n", "latin1");
     if (head && head.length) up.write(head);
     if (typeof socket.setNoDelay === "function") socket.setNoDelay(true);
     socket.pipe(up);
