@@ -37,7 +37,8 @@ paths:
 - **`npm run pack` passes `--sdk-ver` = the INSTALLED SDK.** evenhub-cli >= 0.1.14 stamps the .ehpk's
   `min_app_version` from that SDK's npm `minAppVersion`; without the flag it uses the LATEST published
   SDK, so an unrelated SDK release silently raises our floor. Keep `app.json`'s values equal to it.
-- **Every non-ASCII char on the G2 display must exist in the firmware font** (XERK-923). A missing
-  codepoint draws blank — ✓ U+2713 and ✗ U+2717 are absent, so markers are `√` and `x`. Check a new
-  glyph with `@evenrealities/pretext`'s `getAdvW(cp)` (0 = missing); phone/ + vendor/ are exempt
-  (browser fonts). Tests: `glyphs.test.ts` "has a glyph for every non-ASCII character".
+- **Every non-ASCII char in a glasses source literal must exist in the firmware font** (XERK-923).
+  A missing codepoint draws blank — ✓ U+2713 and ✗ U+2717 are absent, so markers are `√` and `x`.
+  Check a glyph with `@evenrealities/pretext`'s `getAdvW(cp)` (0 = missing; it matches the
+  simulator's font). Exempt: phone/, vendor/, phone-login.ts (browser fonts). Session content from
+  the hub is NOT covered. Tests: `glyphs.test.ts` "has a glyph for every non-ASCII character".

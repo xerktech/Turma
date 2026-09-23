@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAdvW } from "@evenrealities/pretext";
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 // Every non-ASCII character the glasses sources can put on the G2 display must
@@ -11,11 +12,14 @@ import { describe, expect, it } from "vitest";
 // `@evenrealities/pretext` ships Even's own per-glyph table for that chain, and
 // `getAdvW` returns 0 for a codepoint the chain lacks.
 //
-// Scans source text rather than rendered output so a new literal is caught the
-// day it lands, not the day some test happens to render it. Comments are
-// stripped first; the phone WebView (phone/, phone-login.ts) and the vendored
-// web chat engine (vendor/) render in a browser with system fonts, so they are
-// out of scope.
+// Scans source literals rather than rendered output so a new one is caught the
+// day it lands, not the day some test happens to render it. It walks the
+// TypeScript syntax tree — string, template and JSX text, escapes decoded — so
+// comments never count and a `//` or `/*` inside a string, a `\u2717` escape,
+// or a `${}` template can't hide one. It covers source literals only: session
+// content arriving from the hub is not sanitised here. The phone WebView
+// (phone/, phone-login.ts) and the vendored web chat engine (vendor/) render
+// in a browser with system fonts, so they are out of scope.
 const SRC = new URL(".", import.meta.url).pathname;
 const PHONE_ONLY = new Set(["phone", "vendor", "phone-login.ts"]);
 
@@ -28,17 +32,32 @@ function glassesSources(dir: string): string[] {
   });
 }
 
-function stripComments(src: string): string {
-  return src
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/(^|[^:"'`\\])\/\/.*$/gm, "$1");
+function literalText(file: string): string {
+  const src = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
+  const parts: string[] = [];
+  const visit = (node: ts.Node): void => {
+    // StringLiteralLike = "…", '…' and `…` with no substitutions; a `${}`
+    // template splits into a head, middles and a tail.
+    if (
+      ts.isStringLiteralLike(node) ||
+      ts.isTemplateHead(node) ||
+      ts.isTemplateMiddle(node) ||
+      ts.isTemplateTail(node) ||
+      ts.isJsxText(node)
+    ) {
+      parts.push(node.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(src);
+  return parts.join("\n");
 }
 
 describe("G2 font coverage", () => {
   it("has a glyph for every non-ASCII character in the glasses sources", () => {
     const missing: string[] = [];
     for (const file of glassesSources(SRC)) {
-      const seen = new Set(stripComments(readFileSync(file, "utf8")).match(/[^\x00-\x7f]/gu) ?? []);
+      const seen = new Set(literalText(file).match(/[^\x00-\x7f]/gu) ?? []);
       for (const ch of seen) {
         const cp = ch.codePointAt(0)!;
         if (getAdvW(cp) === 0) {
