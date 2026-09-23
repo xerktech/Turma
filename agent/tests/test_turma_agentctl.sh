@@ -128,6 +128,38 @@ else
 fi
 HOME="$HOME_DIR" XDG_RUNTIME_DIR="$RUN" "$CTL" stop >/dev/null 2>&1 || true
 
+# ---------------------------------------------------------------------------
+# Case 4 (XERK-938): restart waits for the old manager to EXIT before starting
+# a new one, so it never overlaps two managers — nor, on a real host, trips the
+# launcher's duplicate-manager guard by leaving the old hub-agent.py dying while
+# the new one starts. The old restart() read the pidfile back AFTER kill_manager
+# had removed it, so its wait loop was a no-op.
+# ---------------------------------------------------------------------------
+echo "case: restart replaces the manager without overlapping two"
+new_home restart
+RUN="$WORK/run-restart"; mkdir -p "$RUN"
+HOME="$HOME_DIR" XDG_RUNTIME_DIR="$RUN" "$CTL" start >/dev/null 2>&1 || true
+OLDPID="$(cat "$RUN/turma-agent.pid" 2>/dev/null || true)"
+if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+  ok "manager running before restart (pid $OLDPID)"
+else
+  fail "manager not running before restart"
+fi
+HOME="$HOME_DIR" XDG_RUNTIME_DIR="$RUN" "$CTL" restart >/dev/null 2>&1 || true
+NEWPID="$(cat "$RUN/turma-agent.pid" 2>/dev/null || true)"
+# By the time restart returns, the old manager must be gone (it waited for it).
+if [ -n "$OLDPID" ] && ! kill -0 "$OLDPID" 2>/dev/null; then
+  ok "old manager exited before restart returned (the wait loop actually waited)"
+else
+  fail "old manager still alive after restart — two managers would overlap"
+fi
+if [ -n "$NEWPID" ] && [ "$NEWPID" != "$OLDPID" ] && kill -0 "$NEWPID" 2>/dev/null; then
+  ok "a fresh manager is running after restart (pid $NEWPID)"
+else
+  fail "no fresh manager after restart (new='$NEWPID' old='$OLDPID')"
+fi
+HOME="$HOME_DIR" XDG_RUNTIME_DIR="$RUN" "$CTL" stop >/dev/null 2>&1 || true
+
 if [ "$FAILED" -eq 0 ]; then
   echo "all turma-agentctl tests passed"
 else

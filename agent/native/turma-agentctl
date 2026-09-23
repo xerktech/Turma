@@ -85,10 +85,17 @@ stop() {
 
 restart() {
   # Manager-only restart: sessions survive, the new manager re-adopts them.
+  # Capture the pid BEFORE kill_manager removes the pidfile, then wait for THAT
+  # process to exit before starting again. The old loop read the pidfile back
+  # AFTER kill_manager had `rm -f`'d it, so `_pid` was always empty and the wait
+  # was a no-op — the new manager could start while the old one was still dying.
+  # That both risks a momentary double-heartbeat and, since XERK-938, could trip
+  # the launcher's duplicate-manager guard (it would see the old, still-dying
+  # hub-agent.py and refuse to start).
+  oldpid="$(_pid)"
   kill_manager
-  # Give the old manager a moment to release before the new one binds/reads.
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    pid="$(_pid)"; _alive "$pid" || break
+    _alive "$oldpid" || break
     sleep 0.2
   done
   start

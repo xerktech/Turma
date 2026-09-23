@@ -24,6 +24,15 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   permanent. Launcher reaps
   the supervisor BEFORE the tunnel (else the old loop respawns the just-killed tunnel);
   `turma-agentctl stop` too. Tests: `test_turma_agent.sh`.
+- **A no-arg start REFUSES when a manager for this `$PREFIX` is already running (XERK-938)** —
+  `pgrep -f "$PREFIX/hub-agent.py"`, `TURMA_ALLOW_SECOND_MANAGER=1` opts out. No-args is the legit
+  systemd/turma-agentctl entry point (can't be rejected like an unknown arg, XERK-937), but a HAND
+  run would reap the live tunnel and exec a SECOND hub-agent.py — two managers beating as one host,
+  and `turma-agentctl restart` (pidfile-scoped) can't reap the stray. Safe against real restarts:
+  every restart path reaps the old manager BEFORE ExecStart — systemd's stop job waits for the main
+  process (`Type=exec`/`KillMode=process`), and **`turma-agentctl restart` now waits too** (its old
+  wait loop read the pidfile AFTER `kill_manager` removed it → a no-op). Tests: `test_turma_agent.sh`,
+  `test_turma_agentctl.sh`.
 - Launcher exports `TURMA_MANAGER_PID=$$` so the tunnel's `pokeHeartbeat` signals the right process.
 - `install.sh` — idempotent (`--verify`/`--uninstall`): apt + npm + pinned static ttyd + pinned
   static glab (best-effort; a session's MR gets no chip without it), lays files keeping
