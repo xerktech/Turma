@@ -60,6 +60,38 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   `HMAC(SESSION_KEY,"turma-forward")`); a client-supplied list is ignored and stripped. Unproven, any
   client could force a follower to hold 5s and then serve DEGRADED — a second writer on demand
   (QA measured 3/100 acknowledged inputs lost that way).
+- **A request served HERE loses every `x-turma-forward*` header first** (`stripForwardHeaders`, right
+  after both forwarder checks in server.js): hop proofs are for replicas, never relayed to an agent.
+- **The proof is bound to its REQUEST and single-use** (XERK-936): `<at>.<nonce>.<mac>`, the mac over
+  list + method + target + stamp + nonce (`hopProof`, the one definition both sides use). Stale
+  (`PROOF_MAX_AGE_MS`, 30s either way), another method/target, or a nonce this replica already
+  accepted = ignored like a forged one. A list-only mac let one captured pair be replayed forever.
+  - Verified ONCE per request (`hopCache`): `decide()` re-runs every hold poll — never a "replay".
+  - Only a NON-serving replica verifies (`decide` returns local first), and filling it takes the key,
+    so the seen-nonce map stays tiny. Full of FRESH nonces it fails CLOSED (refuses), never evicts.
+  - **A valid proof whose LAST hop is this replica is REFUSED at once: 508** (`decide` → `loop`) —
+    never forwarded, held or served. It is either a replay onto its minter (the one replica a replay
+    bites: its id is in the list, so it would hold, then serve DEGRADED) or a genuine SELF-LOOP (the
+    leader endpoint reaches US — an alias, proxy, sidecar, NAT hairpin). The two cannot be told
+    apart statelessly, and every attempt to was defeated in QA: a minted-nonce cache (evicted by a
+    10k-request flood), a TCP-peer match (lost to address translation). Ignoring the list instead
+    recursed forwarding into ourselves until MAX_CONNECTIONS.
+  - The 508 carries `loopProof` = the looped nonce + a MAC under the forward key
+    (`x-turma-forward-loop`); a minter seeing ITS nonce's mac come back learns that leader address
+    as an alias of itself (`ownAliases`, 10 min). An agent's ttyd that sees a proof (the /term relay
+    spreads `req.headers`) could teach a follower the LIVE leader was itself — a 10-min second
+    writer, re-armed per terminal view (QA). The mac stops a bare ECHO; only the leader's
+    `stripForwardHeaders` stops a REPLAY (we sign a 508 for anyone replaying our live proof), so
+    **aliases are learned only under a leader whose entry declares `stripsForward`** — a rollout from
+    a pre-strip build otherwise reopened it. Under such a leader a real loop just 508s. Later
+    requests hold + serve as for `isOwnAddr`. An upgrade learns it too, from the 508 head it gets
+    back — else an expiring alias handed tunnels "back to the leader" and every re-dial was 508'd
+    until some HTTP request re-taught it. Cost of a loop: what is in flight when the alias is
+    (re)learned gets a retryable 508, once per TTL; a wrong alias lasts at most the TTL.
+  - The mac cannot cover the body (it streams), so a pair replayed within 30s onto a THIRD replica
+    that never saw it, same method + target, is honoured once there. That bites only while that
+    replica believes the minter leads (a transient disagreement): one held-then-DEGRADED request.
+  - Node clock skew past 30s refuses every proof = the bounce guard off; logged, never a stuck request.
 - **A follower hands back tunnels it holds** (`dropDegradedTunnels`: every control channel closed
   1001, local `/live` viewers dropped) the moment a fresh remote leader is known — on the forwarder's
   `onRemoteLeader` edge and a 2s sweep. A tunnel accepted while this replica led, or while it served
@@ -77,12 +109,29 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   and piped raw, so the leader does the handshake. `Connection: close` upstream (one socket each),
   headers flushed at once (a client that sends `Expect: 100-continue` then no body still gets the
   leader's 401/413), a `Host` added for an HTTP/1.0 client that sent none.
-- **Residual: a body past the leader's cap + drain slack can surface as 502, not 413, ~1 in 6.**
-  The hub answers 413 then RESETS; Node reports our next write's `ECONNRESET` before reading the
-  queued answer. The body is fed through a stage that yields to the event loop between chunks (and
-  stops on the answer) so the read usually wins; the agent retries a 502, so it self-heals. Fully
-  closing it needs the hub not to reset forwarded bodies — which weakens its runaway-body defence. Tracked: XERK-936
-  (with the hop proof binding only the list, not the request — replayable pod-to-pod).
+- **A body DECLARED past the route's cap + drain slack is refused BY THE FOLLOWER** (XERK-936). The
+  leader answers such a body 413 and then RESETS, and Node reported the follower's next write's
+  `ECONNRESET` before the queued 413 — a 502 the agent retries instead of the 413 that says SHRINK.
+  - `refuseOversize` replays the leader's no-drain path exactly: discard to cap + slack, 413, cut.
+    Draining first is XERK-235 — urllib writes the whole body before reading.
+  - The follower judges against the LEADER's caps + slack ALONE, published in `hubLeader:endpoint`
+    (`bodyCaps`/`drainSlack`, XERK-939) — never its own, nor a `min` of both: mid-rollout (a changed
+    memory limit) a smaller-cap follower cut a body the leader takes. No FRESH usable caps (an older
+    leader, a malformed entry, a stale entry while the store link is down) = forward, never refuse.
+  - It refuses only a request `decide()` would FORWARD, and only after a connect proves the leader is
+    up (`leaderAlive`, nothing sent). A refusal never otherwise dials, so a crashed leader's caps
+    kept refusing until its entry aged out; a held request (own entry, handover) is never judged.
+  - Route keys come from server.js `forwardBodyRoute`, caps from `forwardBodyCaps` — the SAME
+    constants the routes read with (drift pinned by a source-match test). Uploads use
+    `UPLOAD_MAX_BYTES`, the ceiling over every host's own cap.
+  - Only past the auth gate the leader runs BEFORE reading (`agentPresentedRefusal`,
+    `userAuthorized`, `agentHostRefusal`): a credential-less body stays the leader's 401, unread.
+  - A refusal making less than `drainMinProgress` (64 KiB) per `drainIdleMs` (10s) is cut — else 8
+    slow-loris sockets (silent OR a 1-byte trickle) held every slot and switched it off.
+  - Only routes whose 413 is STATELESS: heartbeat, both uploads, raw archive. NOT the archive chunk
+    or migration blob (the leader RECORDS those refusals), NOT default-`BODY_MAX` routes (not every
+    POST reads its body). Those, chunked bodies and anything past `drainMax` concurrent refusals keep
+    the old path: forwarded through the yielding feed stage, the 502 race still possible (rare).
 - **Asymmetric store partition — a store-less leader STEPS DOWN, a store-less replica REFUSES if the
   lease is held elsewhere (XERK-935).** A leader whose store link is down cannot publish/refresh its
   endpoint, so a healthy-store follower used to degrade and serve too (two writers). Two-part fix, one

@@ -85,7 +85,7 @@ const { createIndexStore } = require("./index-store.js");
 // (which supply the pod-to-pod `dial`/listener + this replica's `endpoint`) are the
 // follow-up (w2-relay-consumers). See `.claude/rules/turma-ha-tunnel.md`.
 const { makeRelay } = require("./relay.js");
-const { makeForwarder } = require("./forward.js");
+const { makeForwarder, stripForwardHeaders } = require("./forward.js");
 
 // XERK-757 externalized-store persistence config, declared here so it can be
 // handed to the module-load store below. It maps each `policy:<name>` store key to
@@ -4773,6 +4773,46 @@ function relayDial(_replica, addr) {
 const RELAY_AUTH_TOKEN = crypto.createHmac("sha256", SESSION_KEY).update("turma-relay").digest("base64url");
 // The forwarder's hop-list proof key (XERK-919): same derivation, its own label.
 const FORWARD_AUTH_TOKEN = crypto.createHmac("sha256", SESSION_KEY).update("turma-forward").digest("base64url");
+
+// Which capped route a request is on, for a follower to refuse a body declared past
+// the LEADER's cap for it (+ its RAW_BODY_DRAIN_SLACK) itself rather than forward it
+// into the leader's 413-then-reset, which raced into a 502 (XERK-936). "" = forward as
+// usual. The follower judges against the caps the leader PUBLISHES (forwardBodyCaps,
+// XERK-939), never its own: mid-rollout the replicas' memory limits can differ.
+// Deliberately covers only routes whose 413 is STATELESS on the leader:
+//  - not the archive chunk route or the migration blob: the leader RECORDS those
+//    refusals (noteArchiveRefusal, the migration's failed phase), which a follower
+//    answering alone would lose;
+//  - not the default-BODY_MAX routes: not every non-GET route reads its body, and
+//    a follower must never refuse what the leader would serve.
+// A request the leader's auth gate would refuse BEFORE reading its body (the same
+// check each route runs) is left to the leader, so the follower never reads an
+// unauthenticated body the leader would not have (XERK-936 QA).
+function forwardBodyRoute(req) {
+  if (req.method !== "POST") return "";
+  let parts;
+  try { parts = new URL(req.url, "http://x").pathname.split("/").filter(Boolean); } catch { return ""; }
+  if (parts[0] !== "api") return "";
+  if (parts[1] === "heartbeat" && parts.length === 2) return agentPresentedRefusal(req) ? "" : "heartbeat";
+  if (parts[1] !== "agents") return "";
+  const uploads = (parts[3] === "uploads" && parts.length === 4) ||
+    (parts[3] === "sessions" && parts[5] === "uploads" && parts.length === 6);
+  if (uploads) return userAuthorized(req) ? "upload" : "";
+  if (parts[3] === "archive" && parts[5] === "raw" && parts.length === 7) {
+    let claimed;
+    try { claimed = decodeURIComponent(parts[2]); } catch { claimed = parts[2]; }
+    return agentHostRefusal(req, claimed) ? "" : "archiveRaw";
+  }
+  return "";
+}
+
+// THIS replica's cap for each forwardBodyRoute route — the SAME constant the route
+// reads with — published beside its endpoint while it leads (XERK-939). Uploads use
+// UPLOAD_MAX_BYTES, the ceiling over every host's own cap, so a stale registry copy
+// can never make a follower refuse an acceptable file.
+function forwardBodyCaps() {
+  return { heartbeat: HEARTBEAT_MAX, upload: UPLOAD_MAX_BYTES, archiveRaw: ARCHIVE_RAW_BODY_MAX };
+}
 
 // Write one SSE frame to every open /api/events stream ON THIS PROCESS
 // (best-effort; a dead stream is dropped on its next failed write and by its
@@ -14833,6 +14873,9 @@ const server = http.createServer(async (req, res) => {
     // answered here. `false` (HA off, this replica leads, no fresh leader endpoint,
     // or the leader could not be dialed) falls through to serving it locally.
     if (forwarder && (await forwarder.forwardRequest(req, res))) return;
+    // Served HERE: hop proofs are for replicas, never relayed on (the /term proxy hands
+    // req.headers to an agent's ttyd, which could then echo them — XERK-936 QA).
+    stripForwardHeaders(req);
 
     // CORS for the cross-origin glasses WebView client: only /api/* and
     // /term/* opt in, and only when the request actually carries an Origin
@@ -18595,6 +18638,7 @@ server.on("upgrade", async (req, socket, head) => {
   // here exits the hub, and an upgrade is reachable unauthenticated.
   try {
     if (forwarder && (await forwarder.forwardUpgrade(req, socket, head))) return;
+    stripForwardHeaders(req); // served here: never relay hop proofs to an agent (see the request handler)
   } catch (e) {
     console.error(`forward: upgrade forwarding failed: ${(e && e.message) || e}`);
     try { socket.destroy(); } catch {}
@@ -19590,7 +19634,7 @@ if (process.env.TURMA_TEST) {
     // one to pin that both handlers consult it first and serve locally on `false`.
     get forwarder() { return forwarder; },
     __setForwarder(v) { forwarder = v; },
-    hubHttpEndpointAddr,
+    hubHttpEndpointAddr, forwardBodyRoute, forwardBodyCaps, UPLOAD_MAX_BYTES, ARCHIVE_RAW_BODY_MAX,
     resyncAgentsFromStore, canServeLocally, STORE_WRITER_KEY,
     leaderHandover, releaseAtSignal, dropDegradedTunnels,
     get promotionSyncing() { return promotionSyncing; },
@@ -19822,6 +19866,11 @@ if (process.env.TURMA_TEST) {
       authToken: FORWARD_AUTH_TOKEN,
       storeHealthy: () => !liveStore.health || liveStore.health === "ready",
       onRemoteLeader: () => dropDegradedTunnels("a leader is serving"),
+      bodyRoute: forwardBodyRoute,
+      bodyCaps: forwardBodyCaps(),
+      drainSlack: RAW_BODY_DRAIN_SLACK,
+      drainMax: DRAIN_CONCURRENCY_MAX,
+      stripsForward: true, // both handlers call stripForwardHeaders once the forwarder declines
       // XERK-935: while our store link is down we cannot learn the leader's endpoint,
       // so the elector's view of the k8s lease (in the API, not the store) is the one
       // still-readable leader signal — if another replica holds it, refuse rather than

@@ -31,11 +31,31 @@ const LEADER_ENDPOINT_KEY = "hubLeader:endpoint";
 // that already carries it — two replicas that briefly disagree about who leads
 // then serve it rather than bouncing it between them.
 const FORWARDED_HEADER = "x-turma-forwarded-by";
-// Proves a hop list came from a replica, not a client (XERK-919 QA): an HMAC of the
-// hop list under the replica-shared secret. A client-supplied FORWARDED_HEADER without
-// a valid proof is IGNORED (and stripped), so it can neither force a follower to hold
-// nor to serve as a second writer.
+// Proves a hop list came from a replica, not a client (XERK-919 QA): `<at>.<nonce>.<mac>`,
+// the mac an HMAC under the replica-shared secret of the hop list AND the request it rode
+// (method + target) AND the stamp (XERK-936). A client-supplied FORWARDED_HEADER without
+// a valid, fresh, first-seen proof is IGNORED (and stripped), so it can neither force a
+// follower to hold nor to serve as a second writer. Binding only the list (the XERK-919
+// shape) let one captured header pair be replayed forever, onto any request.
 const FORWARD_AUTH_HEADER = "x-turma-forward-auth";
+// A proof older (or further in the future) than this is refused. It is minted as the hop
+// is sent and checked on arrival, pod to pod, so this only has to cover node clock skew.
+// Too tight for a badly skewed cluster = every proof refused = the bounce guard off (the
+// pre-XERK-919-QA behaviour) — logged, never a stuck request.
+const PROOF_MAX_AGE_MS = 30000;
+// Proofs accepted within that window, so one captured pair buys at most ONE hold per
+// replica. Only a replica that is NOT serving ever verifies a proof (decide() returns
+// local first), and filling it takes the key, so this stays tiny. Full of FRESH
+// entries it fails CLOSED (the proof is refused), never evicting a live nonce.
+const SEEN_PROOFS_MAX = 10000;
+// On a 508 answer: `<nonce>.<mac>` of the looped proof, so its minter knows the loop was
+// its own. MAC'd under the forward key (`loopProof`): the leader relays a browser's headers
+// to an agent's ttyd, so the NONCE alone was readable — and echoable — by an agent host,
+// which then taught a follower that the live leader was itself (QA: a 10-minute second
+// writer). Only a replica holding the key can mint this.
+const LOOP_HEADER = "x-turma-forward-loop";
+// How long a leader address PROVEN to lead back to us is treated as our own.
+const ALIAS_TTL_MS = 10 * 60 * 1000;
 // Answered by THIS replica, never forwarded: the kubelet probes are per-pod facts
 // (a follower's liveness/drain is its own, not the leader's).
 const LOCAL_PATHS = new Set(["/healthz", "/readyz"]);
@@ -63,6 +83,34 @@ const DEFAULTS = {
 // FORWARDED_HEADER), so a replica that is mid-handover can pass a request on to
 // the new leader once, but two replicas can never bounce one between them.
 const MAX_HOPS = 2;
+
+// The mac half of a hop proof. Exported for tests; the one place the bound fields and
+// their order are defined, so the minting and the checking side cannot drift.
+function hopProof(key, list, method, target, at, nonce) {
+  return crypto.createHmac("sha256", key)
+    .update(["turma-forward", list, method, target, at, nonce].join("\n"))
+    .digest("base64url");
+}
+
+function loopProof(key, nonce) {
+  return `${nonce}.${crypto.createHmac("sha256", key).update("turma-forward-loop\n" + nonce).digest("base64url")}`;
+}
+
+// Delete every forwarding header from a request this replica SERVES, before any of it can
+// be relayed on (the /term proxy hands req.headers to the agent's ttyd): hop proofs are
+// for replicas only, never for an agent host to read, echo or replay.
+function stripForwardHeaders(req) {
+  if (!req || !req.headers) return;
+  const drop = (k) => k === FORWARDED_HEADER || k === FORWARD_AUTH_HEADER || k === LOOP_HEADER;
+  for (const k of Object.keys(req.headers)) if (drop(k)) delete req.headers[k];
+  if (Array.isArray(req.rawHeaders)) {
+    const kept = [];
+    for (let i = 0; i + 1 < req.rawHeaders.length; i += 2) {
+      if (!drop(String(req.rawHeaders[i]).toLowerCase())) kept.push(req.rawHeaders[i], req.rawHeaders[i + 1]);
+    }
+    try { req.rawHeaders.splice(0, req.rawHeaders.length, ...kept); } catch { /* read-only: headers already gone */ }
+  }
+}
 
 function splitAddr(addr) {
   const s = String(addr || "");
@@ -120,6 +168,30 @@ function makeForwarder(store, replicaId, deps = {}) {
     // (leader) => void: a FRESH REMOTE leader was learned (appeared or changed). The
     // caller drops sockets it served while degraded (its local agent tunnels).
     onRemoteLeader = () => {},
+    // (req) => string: which capped route this request is on (a key of `bodyCaps`), or
+    // "" = not one to refuse here (XERK-936, server.js `forwardBodyRoute`). A follower
+    // refuses a body DECLARED past the LEADER's cap for that route plus the leader's
+    // `drainSlack` itself — the band the leader answers 413 and then resets in, where the
+    // reset raced the relayed 413 into a 502.
+    bodyRoute = () => "",
+    // {route: bytes}: THIS replica's caps, published beside its endpoint while it leads
+    // (XERK-939). A follower judges against the leader's published numbers ALONE, never
+    // its own: mid-rollout (a changed memory limit) the two differ, and a follower's
+    // smaller cap would cut a body the leader takes.
+    bodyCaps = {},
+    drainSlack = 4 << 20, // server.js RAW_BODY_DRAIN_SLACK: where the leader cuts (published too)
+    drainMax = 8, // concurrent local refusals (DRAIN_CONCURRENCY_MAX); past it, forward
+    // A refusal whose client sends NOTHING for this long is cut and frees its slot, so
+    // a slow-loris cannot hold every slot and switch the local refusal off.
+    drainIdleMs = 10000,
+    // ...where "sends nothing" means less than this much progress in the window, so a
+    // 1-byte trickle is idle too (readBody's BODY_MIN_PROGRESS_BYTES rule).
+    drainMinProgress = 64 << 10,
+    aliasTtlMs = ALIAS_TTL_MS, // how long a PROVEN self-alias is treated as our own address
+    // true = the caller strips every forwarding header from a request it serves before
+    // relaying anything (server.js stripForwardHeaders). Published on the leader entry: a
+    // follower learns a self-alias only under a leader that claims it (see learnAlias).
+    stripsForward = false,
     // () => boolean: does ANOTHER replica currently hold the leader lease (XERK-935)?
     // Consulted ONLY while our own store link is down: a store-less replica cannot
     // learn/refresh the leader's published endpoint (it rides the store), so with no
@@ -133,20 +205,30 @@ function makeForwarder(store, replicaId, deps = {}) {
   } = deps;
   const canServe = deps.canServe || isLeader;
 
-  // Hot mirror of the leader endpoint: {replica, addr, seenAt}. `seenAt` is THIS
+  // Hot mirror of the leader endpoint: {replica, addr, seenAt, caps, slack}. `seenAt` is THIS
   // replica's clock at receipt (a watch event), so freshness never depends on two
   // pods' clocks agreeing — except the one boot-time hydrate, which can only use
-  // the writer's `at`. `addr` null = a leader with no dialable address.
+  // the writer's `at`. `addr` null = a leader with no dialable address. `caps` (a
+  // Map route -> bytes) / `slack` are the leader's body caps, null when it published
+  // none (an older leader) — then nothing is refused here.
   let leader = null;
   const unreachableUntil = new Map(); // addr -> time before which we do not dial it
   const lastDialOk = new Map(); // addr -> when a dial to it last SUCCEEDED
   const live = new Set(); // every forwarded socket (client + upstream), for drain
-  const stats = { requests: 0, upgrades: 0, dialFailures: 0, held: 0, degraded: 0, refusedNoStore: 0 };
+  const stats = {
+    requests: 0, upgrades: 0, dialFailures: 0, held: 0, degraded: 0, refusedNoStore: 0,
+    refusedOversize: 0, staleProofs: 0, replayedProofs: 0, loops: 0,
+  };
   let refreshTimer = null;
   let unwatch = null;
   let unhealth = null;
   let lastMode = null; // for the edge-only mode log
   let draining = false; // set by stop(): this replica is shutting down
+  let refusing = 0; // oversize bodies being drained by refuseOversize() right now
+  const seenProofs = new Map(); // nonce -> expiry: proofs already accepted (replay guard)
+  const hopCache = new WeakMap(); // req -> {hops, loop}: its verified proof (decide() re-runs per poll)
+  const ownAliases = new Map(); // addr -> until: leader addresses PROVEN to lead back to us (a 508)
+  let staleLoggedAt = 0;
 
   function storeFailed(e) {
     // Never throw from a timer/callback (XERK-235): a dropped endpoint write
@@ -166,33 +248,107 @@ function makeForwarder(store, replicaId, deps = {}) {
   }
 
   // The replicas a request has already passed through (FORWARDED_HEADER is a
-  // comma list, oldest first).
-  function hopProof(hops) {
-    return crypto.createHmac("sha256", authToken).update("turma-forward\n" + hops).digest("base64url");
+  // comma list, oldest first). Verified ONCE per request and remembered: decide()
+  // re-runs on every hold poll, and a second look must not read as a replay.
+  function proofOf(req) {
+    if (!req || typeof req !== "object") return NO_PROOF;
+    let p = hopCache.get(req);
+    if (!p) { p = verifyHops(req); hopCache.set(req, p); }
+    return p;
   }
-  function hopsOf(req) {
-    const v = req && req.headers && req.headers[FORWARDED_HEADER];
-    if (typeof v !== "string" || !v) return [];
+  const hopsOf = (req) => proofOf(req).hops;
+  const NO_PROOF = { hops: [], loop: null };
+  // The verified hop list, or `loop` = the nonce of OUR OWN valid proof come back.
+  function verifyHops(req) {
+    const none = NO_PROOF;
+    const v = req.headers && req.headers[FORWARDED_HEADER];
+    if (typeof v !== "string" || !v) return none;
     if (authToken) {
       const got = req.headers[FORWARD_AUTH_HEADER];
-      if (typeof got !== "string") return [];
+      if (typeof got !== "string") return none;
+      const [at, nonce, mac, extra] = got.split(".");
+      if (extra !== undefined || !/^\d{1,15}$/.test(at || "") || !/^[A-Za-z0-9_-]{1,64}$/.test(nonce || "")) return none;
       // Compare BYTES, not string length: a non-ASCII value of the right string
       // length has a longer UTF-8 encoding, and timingSafeEqual THROWS on unequal
       // buffer lengths — which on the upgrade path was an unauthenticated crash.
-      const a = Buffer.from(got), b = Buffer.from(hopProof(v));
-      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return []; // a client's claim: ignored
+      const a = Buffer.from(mac || "");
+      const b = Buffer.from(hopProof(authToken, v, String(req.method || ""), String(req.url || ""), at, nonce));
+      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return none; // a client's claim: ignored
+      const t = now();
+      if (Math.abs(t - Number(at)) > PROOF_MAX_AGE_MS) {
+        stats.staleProofs += 1;
+        if (t - staleLoggedAt > 60000) {
+          staleLoggedAt = t;
+          log(`forward: refused a hop proof ${t - Number(at)}ms off this replica's clock — ` +
+            `check node clock sync (hop lists are ignored while it is off by >${PROOF_MAX_AGE_MS}ms)`);
+        }
+        return none;
+      }
+      const hops = v.split(",").map((x) => x.trim()).filter(Boolean);
+      // Our OWN proof coming back: a replay (the one replica it bites — our id is in the
+      // list, so it would hold, then serve DEGRADED) or a genuine SELF-LOOP (the leader
+      // entry names an address that reaches US: an alias, a proxy, a sidecar, a NAT
+      // hairpin). Neither may be forwarded (it recursed to MAX_CONNECTIONS), held or
+      // served, and the two cannot be told apart statelessly (a minted-nonce cache was
+      // evictable by a flood; a TCP-peer match loses to address translation) — so both
+      // are REFUSED at once (508, decide()'s `loop`). A replay gains nothing; a loop's
+      // sender learns the alias from the 508 (see forwardRequest).
+      if (hops[hops.length - 1] === replicaId) return { hops: [], loop: nonce };
+      if (seenProofs.has(nonce)) { stats.replayedProofs += 1; return none; } // a replay: ignored
+      for (const [n, exp] of seenProofs) { if (exp > t) break; seenProofs.delete(n); }
+      // The sweep above stops at the first live entry, and expiries follow each SENDER's
+      // clock, so a skewed one can shelter expired entries behind it: rescan before
+      // refusing, so fail-closed means "full of LIVE nonces", nothing earlier.
+      if (seenProofs.size >= SEEN_PROOFS_MAX) {
+        for (const [n, exp] of seenProofs) if (exp <= t) seenProofs.delete(n);
+      }
+      if (seenProofs.size >= SEEN_PROOFS_MAX) { stats.replayedProofs += 1; return none; } // fail closed
+      seenProofs.set(nonce, Number(at) + PROOF_MAX_AGE_MS);
+      return { hops, loop: null };
     }
-    return v.split(",").map((x) => x.trim()).filter(Boolean);
+    return { hops: v.split(",").map((x) => x.trim()).filter(Boolean), loop: null };
   }
-  // The header pair to put on a forwarded request: our id appended, plus its proof.
-  function hopHeaders(hops) {
+  // The header pair to put on a forwarded request: our id appended, plus its proof,
+  // bound to THIS request's method + target and stamped now with a fresh nonce.
+  // `nonce` is returned too: a 508 naming it is proof the request came back to us.
+  function hopHeaders(hops, req) {
     const list = hops.concat(replicaId).join(",");
-    return authToken ? [FORWARDED_HEADER, list, FORWARD_AUTH_HEADER, hopProof(list)] : [FORWARDED_HEADER, list];
+    if (!authToken) return { headers: [FORWARDED_HEADER, list], nonce: null };
+    const at = String(now());
+    const nonce = crypto.randomBytes(12).toString("base64url");
+    const mac = hopProof(authToken, list, String(req.method || ""), String(req.url || ""), at, nonce);
+    return { headers: [FORWARDED_HEADER, list, FORWARD_AUTH_HEADER, `${at}.${nonce}.${mac}`], nonce };
   }
+
   // A leader entry naming OUR OWN address under another replica id is a previous
   // incarnation of this pod (a container restart keeps the POD_IP) — never a target.
+  // So is one a 508 proved leads back to us (an alias `isOwnAddr`'s string compare
+  // misses) — remembered a while, then re-proved, since a pod IP can be reused.
   function isOwnAddr(addr) {
-    return !!endpoint && addr === endpoint;
+    if (!!endpoint && addr === endpoint) return true;
+    const until = ownAliases.get(addr);
+    if (until && now() < until) return true;
+    if (until) ownAliases.delete(addr);
+    return false;
+  }
+  function learnAlias(addr) {
+    if (!addr || isOwnAddr(addr)) return;
+    // Only under a leader that STRIPS forwarding headers before relaying (its entry says
+    // so). An older leader relays them to an agent's ttyd, which can REPLAY our live proof
+    // to us, collect the signed 508 we answer it with, and hand that back to the request:
+    // the mac cannot tell that from a real loop (QA: a rollout from a pre-strip build
+    // made a new follower serve as a second writer under the live old leader). Under such
+    // a leader a genuine loop just keeps getting 508s — retryable, never a second writer.
+    const e = leader;
+    if (!e || e.addr !== addr || e.strips !== true) {
+      log(`forward: a loop 508 came back from ${addr}, but that leader does not declare it strips ` +
+        "forwarding headers — NOT learning it as our own address");
+      return;
+    }
+    ownAliases.set(addr, now() + aliasTtlMs);
+    log(`forward: the leader endpoint ${addr} leads back to THIS replica (a forwarding loop) — ` +
+      "treating it as our own address; fix the leader's TURMA_HUB_ENDPOINT / POD_IP");
+    lastMode = null;
   }
   // Is there a fresh leader that is not us? (the caller's "drop degraded sockets" test)
   function remoteLeaderFresh() {
@@ -219,6 +375,8 @@ function makeForwarder(store, replicaId, deps = {}) {
     const path = String((req && req.url) || "").split("?")[0];
     if (LOCAL_PATHS.has(path)) return LOCAL;
     if (canServe()) { noteMode("serving locally (this replica is the leader)"); return LOCAL; }
+    const loop = proofOf(req).loop;
+    if (loop) return { loop }; // our own proof back: refuse now, never forward/hold/serve
     // XERK-935: our store link is down, so the leader-endpoint mirror cannot refresh
     // — but the lease (k8s API, not the store) says another replica leads. It is the
     // single writer; never become a second one. Refuse so the client's LB retry reaches
@@ -280,6 +438,12 @@ function makeForwarder(store, replicaId, deps = {}) {
     });
   }
 
+  const sameBytes = (got, want) => {
+    if (typeof got !== "string") return false;
+    const a = Buffer.from(got), b = Buffer.from(want);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  };
+
   const pause = (ms) => new Promise((r) => { const t = setTimeout(r, ms); if (t.unref) t.unref(); });
 
   // Resolve a connected upstream socket to forward over, or null to serve locally.
@@ -292,10 +456,11 @@ function makeForwarder(store, replicaId, deps = {}) {
       if (gone()) return { gone: true };
       const d = decide(req);
       if (d.local) return null;
+      if (d.loop) { stats.loops += 1; return { loop: d.loop }; }
       if (d.refuse) { stats.refusedNoStore += 1; return { refuse: true, reason: d.refuse }; }
       if (d.forward) {
         try {
-          return { sock: await dial(d.forward), hops: hopsOf(req) };
+          return { sock: await dial(d.forward), hops: hopsOf(req), addr: d.forward };
         } catch (e) {
           markUnreachable(d.forward, e);
           continue; // re-decide: now held for the cooldown, or a new leader appeared
@@ -314,13 +479,111 @@ function makeForwarder(store, replicaId, deps = {}) {
     }
   }
 
-  // Forward one HTTP request. Resolves true once it is handled here (proxied, or
-  // the client left while held), false when the caller should serve it locally.
-  // Never throws, never rejects.
+  // The {cap, slack, addr} to refuse this request against HERE, or null to forward it
+  // as usual. Only a body DECLARED past the LEADER's published cap + slack (the leader
+  // would cut it) on a request this replica would FORWARD right now — the leader /
+  // HA-off path is untouched, and a held request (a handover, our own entry, a leader
+  // marked unreachable) is left to whoever serves it. The leader's numbers alone
+  // (XERK-939): with none, or none FRESH (an older leader, a stale entry while the
+  // store link is down), the body is forwarded — never judged against this replica's
+  // own, possibly smaller, cap.
+  function oversizeCap(req) {
+    if (!enabled) return null;
+    const declared = Number(req.headers && req.headers["content-length"]);
+    if (!Number.isFinite(declared)) return null; // chunked: nothing to judge up front
+    let route = "";
+    try { route = String(bodyRoute(req) || ""); } catch { return null; }
+    const e = leader;
+    if (!route || !e || !e.caps || e.replica === replicaId || !(now() - e.seenAt < ttlMs)) return null;
+    const cap = e.caps.get(route) || 0;
+    if (!(cap > 0) || !(declared > cap + e.slack)) return null;
+    if (refusing >= drainMax) return null;
+    const d = decide(req);
+    return d.forward ? { cap, slack: e.slack, addr: d.forward } : null;
+  }
+
+  // Is the leader whose caps we are about to refuse by still up? A connect, closed at
+  // once — nothing is sent. A refusal never otherwise dials, so without this a crashed
+  // leader's caps kept refusing until its entry went stale, though its successor may
+  // take more (XERK-939 QA). A failed dial marks it unreachable: the request is held.
+  function leaderAlive(addr) {
+    return dial(addr).then((s) => { s.destroy(); return true; }, (e) => { markUnreachable(addr, e); return false; });
+  }
+
+  // Refuse a declared-oversize body on THIS replica, exactly as the leader would
+  // (readBody's no-drain path): read and DISCARD it up to cap + slack, answer 413, cut.
+  // Draining first is the XERK-235 rule — a client that writes its whole body before
+  // reading (python urllib: the agent) must be nearly done writing when the status
+  // goes out, or it sees only the reset. Stateless, so safe on a follower; it never
+  // dials the leader, so the leader's reset can no longer turn the 413 into a 502.
+  // The caller has already taken this refusal's `refusing` slot.
+  function refuseOversize(req, res, { cap, slack }) {
+    stats.refusedOversize += 1;
+    let len = 0;
+    let settled = false;
+    let idle = null;
+    let mark = 0; // `len` when the idle window last re-armed
+    const release = () => {
+      if (idle) { clearTimeout(idle); idle = null; }
+      if (!settled) { settled = true; refusing -= 1; }
+    };
+    const armIdle = () => {
+      if (idle) clearTimeout(idle);
+      idle = setTimeout(() => { release(); try { req.socket.destroy(); } catch { /* gone */ } }, drainIdleMs);
+      if (idle.unref) idle.unref();
+    };
+    const answer = (cut) => {
+      if (settled) return;
+      release();
+      req.removeListener("data", onData);
+      if (!res.headersSent && !res.destroyed) {
+        res.writeHead(413, { "content-type": "application/json", connection: "close" });
+        res.end(JSON.stringify({ error: "body too large", limit: cap }));
+      }
+      if (!cut) return;
+      // Nothing will read the rest of this body: close once the 413 is on the wire,
+      // rather than let Node dump a body we already said no to (endRefusedConnection).
+      try { req.pause(); } catch { /* gone */ }
+      const kill = () => { try { req.socket.destroy(); } catch { /* gone */ } };
+      if (res.writableFinished) kill(); else res.once("finish", kill);
+    };
+    const onData = (c) => {
+      len += c.length;
+      if (len > cap + slack) answer(true);
+      else if (len - mark >= drainMinProgress) { mark = len; armIdle(); }
+    };
+    armIdle();
+    req.on("data", onData);
+    req.once("end", () => answer(false));
+    // A client that gives up mid-body frees its slot (a stalled one: drainIdleMs).
+    req.once("close", release);
+    req.on("error", release);
+  }
+
+  // Forward one HTTP request. Resolves true once it is handled here (proxied,
+  // refused as oversize, or the client left while held), false when the caller
+  // should serve it locally. Never throws, never rejects.
   async function forwardRequest(req, res) {
+    const over = oversizeCap(req);
+    if (over) {
+      refusing += 1; // held across the liveness dial, so drainMax still bounds us
+      if (await leaderAlive(over.addr)) {
+        if (res.destroyed) { refusing -= 1; return true; } // the client left meanwhile
+        refuseOversize(req, res, over);
+        return true;
+      }
+      refusing -= 1; // the leader is gone: held below like any other request
+    }
     const r = await route(req, () => res.destroyed || res.writableEnded);
     if (!r) return false;
     if (r.gone) return true;
+    if (r.loop) {
+      if (!res.headersSent) {
+        res.writeHead(508, { "content-type": "application/json", [LOOP_HEADER]: loopProof(authToken, r.loop), connection: "close" });
+        res.end(JSON.stringify({ error: "hub forwarding loop: the leader endpoint leads back to this replica — retry" }));
+      }
+      return true;
+    }
     if (r.refuse) {
       if (!res.headersSent) {
         res.writeHead(503, { "content-type": "application/json", "retry-after": "1", connection: "close" });
@@ -335,7 +598,8 @@ function makeForwarder(store, replicaId, deps = {}) {
     const headers = endToEnd(req.rawHeaders || []);
     // One upstream socket per forwarded request (dialed above), so ask the leader
     // to close it after the response rather than idling it in keep-alive.
-    headers.push(...hopHeaders(r.hops), "Connection", "close");
+    const hh = hopHeaders(r.hops, req);
+    headers.push(...hh.headers, "Connection", "close");
     // An HTTP/1.0 client may send no Host; the leader's parser requires one.
     if (!req.headers.host) headers.push("Host", "hub");
     let up;
@@ -357,6 +621,12 @@ function makeForwarder(store, replicaId, deps = {}) {
     let answered = false;
     up.on("response", (upRes) => {
       answered = true;
+      // Our own request came back to us (the 508 names the nonce only we minted for
+      // it): that leader address is an alias of this replica. Later requests then hold
+      // and serve here (the pre-loop behaviour) instead of each failing with a 508.
+      if (upRes.statusCode === 508 && hh.nonce && sameBytes(upRes.headers[LOOP_HEADER], loopProof(authToken, hh.nonce))) {
+        learnAlias(r.addr);
+      }
       // The leader has answered: stop sending it the body (a refusal is about to cut
       // the connection, and every further write only races that cut).
       req.unpipe(feed);
@@ -418,6 +688,13 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (!r) { socket.removeListener("error", early); return false; } // serve locally, untouched
     if (r.gone) return true;
     if (r.refuse) { socket.destroy(); return true; } // draining: the client re-dials elsewhere
+    if (r.loop) { // our own proof back (see verifyHops); the minting upgrade learns from this 508
+      socket.removeListener("error", early);
+      socket.on("error", () => {});
+      socket.end(`HTTP/1.1 508 Loop Detected\r\n${LOOP_HEADER}: ${loopProof(authToken, r.loop)}\r\n` +
+        "Connection: close\r\nContent-Length: 0\r\n\r\n");
+      return true;
+    }
     const up = r.sock;
     if (socket.destroyed) { up.destroy(); return true; }
     stats.upgrades += 1;
@@ -438,8 +715,19 @@ function makeForwarder(store, replicaId, deps = {}) {
       if (lk === FORWARDED_HEADER || lk === FORWARD_AUTH_HEADER) continue;
       lines.push(`${raw[i]}: ${raw[i + 1]}`);
     }
-    const hh = hopHeaders(r.hops);
+    const minted = hopHeaders(r.hops, req);
+    const hh = minted.headers;
     for (let i = 0; i < hh.length; i += 2) lines.push(`${hh[i]}: ${hh[i + 1]}`);
+    // The upgrade path learns a self-alias too, from the first bytes back (the 508 head
+    // naming OUR nonce): without it, an alias expiring handed our tunnels "back to the
+    // leader" and every re-dial was 508'd until some HTTP request re-taught it (QA).
+    if (minted.nonce) {
+      const want = `${LOOP_HEADER}: ${loopProof(authToken, minted.nonce)}\r\n`;
+      up.once("data", (d) => {
+        const head = d.subarray(0, 512).toString("latin1");
+        if (head.startsWith("HTTP/1.1 508 ") && head.includes(want)) learnAlias(r.addr); // our own writer's exact form
+      });
+    }
     // latin1: Node's parser decodes raw header bytes as latin1, so writing latin1
     // puts every original byte back on the wire unchanged (UTF-8 would re-encode
     // any byte >= 0x80 as two).
@@ -457,8 +745,10 @@ function makeForwarder(store, replicaId, deps = {}) {
   function publish() {
     if (!enabled || !store || !isLeader()) return;
     const at = now();
-    leader = { replica: replicaId, addr: endpoint, seenAt: at };
-    Promise.resolve(store.set(LEADER_ENDPOINT_KEY, { replica: replicaId, addr: endpoint, at }, { ttlMs }))
+    leader = { replica: replicaId, addr: endpoint, seenAt: at, caps: null, slack: 0 };
+    // Our body caps ride the entry, so a follower refuses against OUR numbers (XERK-939).
+    const entry = { replica: replicaId, addr: endpoint, at, bodyCaps, drainSlack, stripsForward: stripsForward === true };
+    Promise.resolve(store.set(LEADER_ENDPOINT_KEY, entry, { ttlMs }))
       .catch(storeFailed);
   }
 
@@ -476,11 +766,23 @@ function makeForwarder(store, replicaId, deps = {}) {
     }
   }
 
+  // The body caps a leader entry carries, validated: {caps: Map, slack}, or caps null
+  // when it carries none usable (an older leader, or a malformed entry) — which only
+  // switches the follower-side refusal off, so a bad value can never make one refuse.
+  function publishedCaps(v) {
+    const none = { caps: null, slack: 0 };
+    const c = v.bodyCaps;
+    if (!Number.isSafeInteger(v.drainSlack) || v.drainSlack < 0 || !c || typeof c !== "object" || Array.isArray(c)) return none;
+    const caps = new Map();
+    for (const [k, n] of Object.entries(c)) if (Number.isSafeInteger(n) && n > 0) caps.set(k, n);
+    return caps.size ? { caps, slack: v.drainSlack } : none;
+  }
+
   function apply(v, seenAt) {
     if (!v || typeof v !== "object" || typeof v.replica !== "string" || typeof v.at !== "number") return;
     if (v.addr !== null && (typeof v.addr !== "string" || !splitAddr(v.addr))) return;
     const changed = !leader || leader.replica !== v.replica || leader.addr !== v.addr;
-    leader = { replica: v.replica, addr: v.addr, seenAt };
+    leader = { replica: v.replica, addr: v.addr, seenAt, ...publishedCaps(v), strips: v.stripsForward === true };
     if (changed && v.replica !== replicaId) {
       unreachableUntil.delete(v.addr); // a NEW leader gets a fresh chance at once
       log(`forward: leader endpoint is ${v.addr || "UNDIALABLE"} (replica ${v.replica})` +
@@ -568,4 +870,8 @@ module.exports = {
   LOCAL_PATHS,
   DEFAULTS,
   MAX_HOPS,
+  hopProof,
+  loopProof,
+  stripForwardHeaders,
+  PROOF_MAX_AGE_MS,
 };
