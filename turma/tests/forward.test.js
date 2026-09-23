@@ -759,6 +759,10 @@ test("XERK-936: server.js forwardBodyCap names each stateless-413 route's OWN ca
   assert.match(src, /readRawBody\(req, ARCHIVE_RAW_BODY_MAX\)/);
   assert.match(src, /return Math\.min\(reported, UPLOAD_MAX_BYTES\)/);
   assert.match(src, /bodyCap: forwardBodyCap,\s+drainSlack: RAW_BODY_DRAIN_SLACK,/);
+  // ...and only past the auth gate the leader runs BEFORE reading the body (QA L1).
+  assert.match(src, /agentPresentedRefusal\(req\) \? 0 : HEARTBEAT_MAX/);
+  assert.match(src, /userAuthorized\(req\) \? UPLOAD_MAX_BYTES : 0/);
+  assert.match(src, /agentHostRefusal\(req, claimed\) \? 0 : ARCHIVE_RAW_BODY_MAX/);
 });
 
 test("XERK-936: a hop proof is bound to its request — another method or target, a stale stamp, or a replay is ignored", async () => {
@@ -816,4 +820,72 @@ test("XERK-936: a proof minted by a forwarding follower verifies on the next rep
   assert.deepEqual(verifier.decide({ ...seen }), { hold: "the request already passed through the leader" },
     "the minted proof verifies for its own request");
   srv.close(); next.close(); f.close(); verifier.close();
+});
+
+// ---- XERK-936 QA round 1 ------------------------------------------------------
+
+test("XERK-936 QA: a pair a follower MINTED is never honoured back on that follower (the one place a replay bites)", async () => {
+  let seen;
+  const leader = http.createServer((rq, rs) => { seen = { headers: rq.headers, url: rq.url, method: rq.method }; rs.end("ok"); });
+  const lport = await listen(leader);
+  const { f } = await follower(`127.0.0.1:${lport}`, { authToken: "sekret" });
+  const { srv, port } = await followerServer(f);
+  await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 2 }, body: "{}" });
+  // Replayed onto the minter: its own id is in the list, so honoured it would HOLD
+  // and then serve DEGRADED. It must read as a replay — forwarded like any request.
+  assert.deepEqual(f.decide({ ...seen }), { forward: `127.0.0.1:${lport}` });
+  assert.equal(f.stats.replayedProofs, 1);
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-936 QA: the follower cuts a refused body at cap + slack exactly — never drains without bound", async () => {
+  const { leader, port: lport } = await countingLeader();
+  const { f } = await follower(`127.0.0.1:${lport}`, { bodyCap: () => 1000, drainSlack: 4000 });
+  const { srv, port } = await followerServer(f);
+  let read = 0;
+  srv.on("request", (rq) => rq.on("data", (c) => { read += c.length; }));
+  // Declared huge, sent in small paced writes: the answer must come after ~5000 bytes.
+  const s = net.connect(port, "127.0.0.1");
+  let got = "";
+  let sent = 0;
+  s.on("data", (d) => { got += d; });
+  s.on("error", () => {});
+  await new Promise((r) => s.on("connect", r));
+  s.write("POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: 10000000\r\n\r\n");
+  while (!got && sent < 100000) { s.write(Buffer.alloc(500)); sent += 500; await sleep(2); }
+  assert.match(got, /^HTTP\/1\.1 413 /);
+  assert.ok(sent > 5000 && sent <= 8000, `answered after ${sent} bytes sent`);
+  await sleep(50);
+  assert.ok(s.destroyed || s.readyState !== "open", "the connection is cut");
+  s.destroy(); srv.close(); leader.close(); f.close();
+});
+
+test("XERK-936 QA: exactly cap + slack declared is still the leader's; one byte more is refused here", async () => {
+  const { leader, seen, port: lport } = await countingLeader();
+  const { f } = await follower(`127.0.0.1:${lport}`, { bodyCap: () => 1000, drainSlack: 4000 });
+  const { srv, port } = await followerServer(f);
+  const at = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) });
+  assert.equal(at.body, "leader");
+  const over = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5001 }, body: Buffer.alloc(5001) })
+    .catch((e) => ({ status: "err:" + e.code }));
+  assert.equal(over.status, 413);
+  assert.equal(seen.length, 1);
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-936 QA: a refusal whose client goes silent is cut after drainIdleMs and frees its slot", async () => {
+  const { leader, port: lport } = await countingLeader();
+  const { f } = await follower(`127.0.0.1:${lport}`, { bodyCap: () => 100, drainSlack: 100, drainMax: 1, drainIdleMs: 80 });
+  const { srv, port } = await followerServer(f);
+  const hog = net.connect(port, "127.0.0.1");
+  hog.on("error", () => {});
+  const closed = new Promise((r) => hog.on("close", r));
+  await new Promise((r) => hog.on("connect", r));
+  // Headers only — not one body byte, so the idle timer must be armed up front.
+  hog.write("POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: 999999\r\n\r\n");
+  await closed; // the follower cut it for going silent
+  const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 500 }, body: Buffer.alloc(500) })
+    .catch((e) => ({ status: "err:" + e.code }));
+  assert.equal(r.status, 413, "the slot is free again");
+  srv.close(); leader.close(); f.close();
 });

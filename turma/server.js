@@ -4787,16 +4787,24 @@ const FORWARD_AUTH_TOKEN = crypto.createHmac("sha256", SESSION_KEY).update("turm
 //    a follower must never refuse what the leader would serve.
 // Uploads use UPLOAD_MAX_BYTES, the ceiling over every host's own cap, so a stale
 // registry copy on the follower can never make it refuse an acceptable file.
+// A request the leader's auth gate would refuse BEFORE reading its body (the same
+// check each route runs) is left to the leader, so the follower never reads an
+// unauthenticated body the leader would not have (XERK-936 QA).
 function forwardBodyCap(req) {
   if (req.method !== "POST") return 0;
   let parts;
   try { parts = new URL(req.url, "http://x").pathname.split("/").filter(Boolean); } catch { return 0; }
   if (parts[0] !== "api") return 0;
-  if (parts[1] === "heartbeat" && parts.length === 2) return HEARTBEAT_MAX;
+  if (parts[1] === "heartbeat" && parts.length === 2) return agentPresentedRefusal(req) ? 0 : HEARTBEAT_MAX;
   if (parts[1] !== "agents") return 0;
-  if (parts[3] === "uploads" && parts.length === 4) return UPLOAD_MAX_BYTES;
-  if (parts[3] === "sessions" && parts[5] === "uploads" && parts.length === 6) return UPLOAD_MAX_BYTES;
-  if (parts[3] === "archive" && parts[5] === "raw" && parts.length === 7) return ARCHIVE_RAW_BODY_MAX;
+  const uploads = (parts[3] === "uploads" && parts.length === 4) ||
+    (parts[3] === "sessions" && parts[5] === "uploads" && parts.length === 6);
+  if (uploads) return userAuthorized(req) ? UPLOAD_MAX_BYTES : 0;
+  if (parts[3] === "archive" && parts[5] === "raw" && parts.length === 7) {
+    let claimed;
+    try { claimed = decodeURIComponent(parts[2]); } catch { claimed = parts[2]; }
+    return agentHostRefusal(req, claimed) ? 0 : ARCHIVE_RAW_BODY_MAX;
+  }
   return 0;
 }
 

@@ -148,6 +148,9 @@ function makeForwarder(store, replicaId, deps = {}) {
     bodyCap = () => 0,
     drainSlack = 4 << 20, // server.js RAW_BODY_DRAIN_SLACK: where the leader cuts
     drainMax = 8, // concurrent local refusals (DRAIN_CONCURRENCY_MAX); past it, forward
+    // A refusal whose client sends NOTHING for this long is cut and frees its slot, so
+    // a slow-loris cannot hold every slot and switch the local refusal off.
+    drainIdleMs = 10000,
   } = deps;
   const canServe = deps.canServe || isLeader;
 
@@ -223,11 +226,15 @@ function makeForwarder(store, replicaId, deps = {}) {
         }
         return [];
       }
-      for (const [n, exp] of seenProofs) { if (exp > t && seenProofs.size < SEEN_PROOFS_MAX) break; seenProofs.delete(n); }
       if (seenProofs.has(nonce)) { stats.replayedProofs += 1; return []; } // a replay: ignored
-      seenProofs.set(nonce, Number(at) + PROOF_MAX_AGE_MS);
+      rememberProof(nonce, Number(at));
     }
     return v.split(",").map((x) => x.trim()).filter(Boolean);
+  }
+  function rememberProof(nonce, at) {
+    const t = now();
+    for (const [n, exp] of seenProofs) { if (exp > t && seenProofs.size < SEEN_PROOFS_MAX) break; seenProofs.delete(n); }
+    seenProofs.set(nonce, at + PROOF_MAX_AGE_MS);
   }
   // The header pair to put on a forwarded request: our id appended, plus its proof,
   // bound to THIS request's method + target and stamped now with a fresh nonce.
@@ -236,6 +243,11 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (!authToken) return [FORWARDED_HEADER, list];
     const at = String(now());
     const nonce = crypto.randomBytes(12).toString("base64url");
+    // Seen by US from the start: the one replica where a replayed pair would bite is
+    // the one that minted it (its own id is in the list, so it holds, then degrades),
+    // and it never receives the original to record (XERK-936 QA). A genuine bounce
+    // back here carries a fresh nonce minted by the replica it went through.
+    rememberProof(nonce, Number(at));
     const mac = hopProof(authToken, list, String(req.method || ""), String(req.url || ""), at, nonce);
     return [FORWARDED_HEADER, list, FORWARD_AUTH_HEADER, `${at}.${nonce}.${mac}`];
   }
@@ -377,7 +389,16 @@ function makeForwarder(store, replicaId, deps = {}) {
     refusing += 1;
     let len = 0;
     let settled = false;
-    const release = () => { if (!settled) { settled = true; refusing -= 1; } };
+    let idle = null;
+    const release = () => {
+      if (idle) { clearTimeout(idle); idle = null; }
+      if (!settled) { settled = true; refusing -= 1; }
+    };
+    const armIdle = () => {
+      if (idle) clearTimeout(idle);
+      idle = setTimeout(() => { release(); try { req.socket.destroy(); } catch { /* gone */ } }, drainIdleMs);
+      if (idle.unref) idle.unref();
+    };
     const answer = (cut) => {
       if (settled) return;
       release();
@@ -393,11 +414,11 @@ function makeForwarder(store, replicaId, deps = {}) {
       const kill = () => { try { req.socket.destroy(); } catch { /* gone */ } };
       if (res.writableFinished) kill(); else res.once("finish", kill);
     };
-    const onData = (c) => { len += c.length; if (len > cap + drainSlack) answer(true); };
+    const onData = (c) => { len += c.length; if (len > cap + drainSlack) answer(true); else armIdle(); };
+    armIdle();
     req.on("data", onData);
     req.once("end", () => answer(false));
-    // A client that gives up mid-body frees its slot (Node's requestTimeout bounds a
-    // stalled one).
+    // A client that gives up mid-body frees its slot (a stalled one: drainIdleMs).
     req.once("close", release);
     req.on("error", release);
   }

@@ -66,7 +66,13 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   accepted = ignored like a forged one. A list-only mac let one captured pair be replayed forever.
   - Verified ONCE per request (`hopCache`): `decide()` re-runs every hold poll — never a "replay".
   - Only a NON-serving replica verifies (`decide` returns local first), so the seen-nonce map stays
-    tiny; it is bounded anyway. A captured pair replays at most once per replica within the window.
+    tiny; it is bounded anyway.
+  - **The MINTER records its own nonce** (`hopHeaders` → `rememberProof`). The one replica a replay
+    bites is the one that minted it (its id is in the list: hold, then DEGRADED), and it never
+    receives the original to record. Without this, every captured beat = one forced local write.
+  - The mac cannot cover the body (it streams), so a pair replayed within 30s onto a THIRD replica
+    that never saw it, same method + target, is honoured once there. That bites only while that
+    replica believes the minter leads (a transient disagreement): one held-then-DEGRADED request.
   - Node clock skew past 30s refuses every proof = the bounce guard off; logged, never a stuck request.
 - **A follower hands back tunnels it holds** (`dropDegradedTunnels`: every control channel closed
   1001, local `/live` viewers dropped) the moment a fresh remote leader is known — on the forwarder's
@@ -93,6 +99,12 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   - Caps come from server.js `forwardBodyCap` — the SAME constants the routes read with (drift
     pinned by a source-match test). A cap must never be BELOW the leader's: that refuses a body the
     leader takes. Uploads use `UPLOAD_MAX_BYTES`, the ceiling over every host's own cap.
+  - Only past the auth gate the leader runs BEFORE reading (`agentPresentedRefusal`,
+    `userAuthorized`, `agentHostRefusal`): a credential-less body stays the leader's 401, unread.
+  - A refusal whose client sends nothing for `drainIdleMs` (10s) is cut — else 8 slow-loris sockets
+    held every slot and switched the local refusal off.
+  - Assumes every replica derives the SAME caps. Mid-rollout with a changed memory limit, a
+    smaller-cap follower cuts a body the leader would take (XERK-939).
   - Only routes whose 413 is STATELESS: heartbeat, both uploads, raw archive. NOT the archive chunk
     or migration blob (the leader RECORDS those refusals), NOT default-`BODY_MAX` routes (not every
     POST reads its body). Those, chunked bodies and anything past `drainMax` concurrent refusals keep
