@@ -1,4 +1,4 @@
-import { authHeader, type Config } from "./config.ts";
+import { authHeader, isConfigured, type Config } from "./config.ts";
 import type {
   AgentsResponse,
   HistoryPending,
@@ -219,6 +219,16 @@ export function timeoutFetch(
 // HttpError carrying its status AND the hub's own `{error}` words (see
 // `refusal`) — except getHistory's 202 ("still fetching"), which is a normal,
 // non-throwing return per the brief's 202-pending pattern.
+// True for an absolute URL naming a host — "http:" or "/" name none, and a
+// fetch of either resolves against the page's own origin.
+function hasHost(base: string): boolean {
+  try {
+    return new URL(base).host !== "";
+  } catch {
+    return false;
+  }
+}
+
 export class HubClient {
   private readonly config: Config;
   private readonly fetchFn: typeof fetch;
@@ -231,14 +241,18 @@ export class HubClient {
     );
   }
 
-  // Refuses an empty base (not signed in yet — XERK-929): `${""}/api/agents` is a
-  // RELATIVE url, fetched against the page's own origin (the dev server, or
-  // file:// on the device). Every hub request goes through here, so this also
-  // covers the poll App.resume() re-arms. No `status`, so callers treat it as
-  // hub-unreachable.
+  // Refuses to build a request until signed in (XERK-929). Before sign-in the
+  // hub URL is "", and `${""}/api/agents` is a RELATIVE url fetched against the
+  // page's own origin (the dev server, or file:// on the device); a scheme-only
+  // "http:" resolves there too; and after sign-out (URL kept, creds cleared)
+  // every poll would 401 against the hub. Every hub request goes through here,
+  // so this also covers the poll App.resume() re-arms. No `status`, so callers
+  // treat it as hub-unreachable.
   private url(path: string): string {
     const base = this.hubBase();
-    if (!base) throw new Error("no hub URL configured — sign in on the phone");
+    if (!isConfigured(this.config) || !hasHost(base)) {
+      throw new Error("no hub URL configured — sign in on the phone");
+    }
     return `${base}${path}`;
   }
 

@@ -585,4 +585,20 @@ describe("HubClient with no hub URL (XERK-929)", () => {
     const err = await client.listAgents().catch((e: unknown) => e);
     expect((err as { status?: unknown }).status).toBeUndefined();
   });
+
+  it("refuses a hub URL with no host, which would also resolve to the page", async () => {
+    for (const hubUrl of ["http:", "https:", "/", "//"]) {
+      const fetchFn = fakeFetch({ now: 1, agents: [] });
+      const client = new HubClient({ config: { ...config, hubUrl }, fetchFn });
+      await expect(client.listAgents()).rejects.toThrow(/no hub URL/);
+      expect(fetchFn).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not poll the hub signed out (URL kept, credentials cleared)", async () => {
+    const fetchFn = fakeFetch({ now: 1, agents: [] });
+    const client = new HubClient({ config: { ...config, user: "", password: "" }, fetchFn });
+    await expect(client.listAgents()).rejects.toThrow(/no hub URL/);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
 });
