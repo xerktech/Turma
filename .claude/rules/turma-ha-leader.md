@@ -60,6 +60,14 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   `HMAC(SESSION_KEY,"turma-forward")`); a client-supplied list is ignored and stripped. Unproven, any
   client could force a follower to hold 5s and then serve DEGRADED — a second writer on demand
   (QA measured 3/100 acknowledged inputs lost that way).
+- **The proof is bound to its REQUEST and single-use** (XERK-936): `<at>.<nonce>.<mac>`, the mac over
+  list + method + target + stamp + nonce (`hopProof`, the one definition both sides use). Stale
+  (`PROOF_MAX_AGE_MS`, 30s either way), another method/target, or a nonce this replica already
+  accepted = ignored like a forged one. A list-only mac let one captured pair be replayed forever.
+  - Verified ONCE per request (`hopCache`): `decide()` re-runs every hold poll — never a "replay".
+  - Only a NON-serving replica verifies (`decide` returns local first), so the seen-nonce map stays
+    tiny; it is bounded anyway. A captured pair replays at most once per replica within the window.
+  - Node clock skew past 30s refuses every proof = the bounce guard off; logged, never a stuck request.
 - **A follower hands back tunnels it holds** (`dropDegradedTunnels`: every control channel closed
   1001, local `/live` viewers dropped) the moment a fresh remote leader is known — on the forwarder's
   `onRemoteLeader` edge and a 2s sweep. A tunnel accepted while this replica led, or while it served
@@ -77,12 +85,18 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   and piped raw, so the leader does the handshake. `Connection: close` upstream (one socket each),
   headers flushed at once (a client that sends `Expect: 100-continue` then no body still gets the
   leader's 401/413), a `Host` added for an HTTP/1.0 client that sent none.
-- **Residual: a body past the leader's cap + drain slack can surface as 502, not 413, ~1 in 6.**
-  The hub answers 413 then RESETS; Node reports our next write's `ECONNRESET` before reading the
-  queued answer. The body is fed through a stage that yields to the event loop between chunks (and
-  stops on the answer) so the read usually wins; the agent retries a 502, so it self-heals. Fully
-  closing it needs the hub not to reset forwarded bodies — which weakens its runaway-body defence. Tracked: XERK-936
-  (with the hop proof binding only the list, not the request — replayable pod-to-pod).
+- **A body DECLARED past the route's cap + drain slack is refused BY THE FOLLOWER** (XERK-936). The
+  leader answers such a body 413 and then RESETS, and Node reported the follower's next write's
+  `ECONNRESET` before the queued 413 — a 502 the agent retries instead of the 413 that says SHRINK.
+  - `refuseOversize` replays the leader's no-drain path exactly: discard to cap + slack, 413, cut.
+    Draining first is XERK-235 — urllib writes the whole body before reading.
+  - Caps come from server.js `forwardBodyCap` — the SAME constants the routes read with (drift
+    pinned by a source-match test). A cap must never be BELOW the leader's: that refuses a body the
+    leader takes. Uploads use `UPLOAD_MAX_BYTES`, the ceiling over every host's own cap.
+  - Only routes whose 413 is STATELESS: heartbeat, both uploads, raw archive. NOT the archive chunk
+    or migration blob (the leader RECORDS those refusals), NOT default-`BODY_MAX` routes (not every
+    POST reads its body). Those, chunked bodies and anything past `drainMax` concurrent refusals keep
+    the old path: forwarded through the yielding feed stage, the 502 race still possible (rare).
 - **Known two-writer case (XERK-935, pre-existing): an ASYMMETRIC store partition.** A leader whose
   store link is down cannot publish its endpoint, so a healthy-store follower degrades and serves too.
 - **The hop proof is compared as BYTES** — a non-ASCII value of the right string length made

@@ -4774,6 +4774,32 @@ const RELAY_AUTH_TOKEN = crypto.createHmac("sha256", SESSION_KEY).update("turma-
 // The forwarder's hop-list proof key (XERK-919): same derivation, its own label.
 const FORWARD_AUTH_TOKEN = crypto.createHmac("sha256", SESSION_KEY).update("turma-forward").digest("base64url");
 
+// The largest body the LEADER could accept on this request's route, for a follower
+// to refuse a body declared past it (+ RAW_BODY_DRAIN_SLACK) itself rather than
+// forward it into the leader's 413-then-reset, which raced into a 502 (XERK-936).
+// 0 = forward as usual. Each cap is the SAME constant the route reads with, and
+// every replica derives it from the same env + memory limit. Deliberately covers
+// only routes whose 413 is STATELESS on the leader:
+//  - not the archive chunk route or the migration blob: the leader RECORDS those
+//    refusals (noteArchiveRefusal, the migration's failed phase), which a follower
+//    answering alone would lose;
+//  - not the default-BODY_MAX routes: not every non-GET route reads its body, and
+//    a follower must never refuse what the leader would serve.
+// Uploads use UPLOAD_MAX_BYTES, the ceiling over every host's own cap, so a stale
+// registry copy on the follower can never make it refuse an acceptable file.
+function forwardBodyCap(req) {
+  if (req.method !== "POST") return 0;
+  let parts;
+  try { parts = new URL(req.url, "http://x").pathname.split("/").filter(Boolean); } catch { return 0; }
+  if (parts[0] !== "api") return 0;
+  if (parts[1] === "heartbeat" && parts.length === 2) return HEARTBEAT_MAX;
+  if (parts[1] !== "agents") return 0;
+  if (parts[3] === "uploads" && parts.length === 4) return UPLOAD_MAX_BYTES;
+  if (parts[3] === "sessions" && parts[5] === "uploads" && parts.length === 6) return UPLOAD_MAX_BYTES;
+  if (parts[3] === "archive" && parts[5] === "raw" && parts.length === 7) return ARCHIVE_RAW_BODY_MAX;
+  return 0;
+}
+
 // Write one SSE frame to every open /api/events stream ON THIS PROCESS
 // (best-effort; a dead stream is dropped on its next failed write and by its
 // "close" handler). The LOCAL half — the whole story with HA off, and the
@@ -19590,7 +19616,7 @@ if (process.env.TURMA_TEST) {
     // one to pin that both handlers consult it first and serve locally on `false`.
     get forwarder() { return forwarder; },
     __setForwarder(v) { forwarder = v; },
-    hubHttpEndpointAddr,
+    hubHttpEndpointAddr, forwardBodyCap, UPLOAD_MAX_BYTES, ARCHIVE_RAW_BODY_MAX,
     resyncAgentsFromStore, canServeLocally, STORE_WRITER_KEY,
     leaderHandover, releaseAtSignal, dropDegradedTunnels,
     get promotionSyncing() { return promotionSyncing; },
@@ -19822,6 +19848,9 @@ if (process.env.TURMA_TEST) {
       authToken: FORWARD_AUTH_TOKEN,
       storeHealthy: () => !liveStore.health || liveStore.health === "ready",
       onRemoteLeader: () => dropDegradedTunnels("a leader is serving"),
+      bodyCap: forwardBodyCap,
+      drainSlack: RAW_BODY_DRAIN_SLACK,
+      drainMax: DRAIN_CONCURRENCY_MAX,
     });
     // Backstop for the watch edge above (e.g. this replica LOST the lease while it
     // still held tunnels it accepted as leader or while degraded).

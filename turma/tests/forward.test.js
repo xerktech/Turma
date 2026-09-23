@@ -22,7 +22,7 @@ const { FileLiveStore } = require("../store.js");
 
 const tick = () => new Promise((r) => setImmediate(r));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const req = (url, headers = {}) => ({ url, headers });
+const req = (url, headers = {}, method = "GET") => ({ url, headers, method });
 
 function listen(server) {
   return new Promise((r) => server.listen(0, "127.0.0.1", () => r(server.address().port)));
@@ -348,7 +348,7 @@ test("XERK-919: canServeLocally holds a promoted leader until its registry re-sy
 
 // ---- XERK-919 QA round 1 fixes ----------------------------------------------
 
-const { FORWARD_AUTH_HEADER } = require("../forward.js");
+const { FORWARD_AUTH_HEADER, hopProof, PROOF_MAX_AGE_MS } = require("../forward.js");
 
 test("XERK-919 QA: a client-supplied hop header without a valid proof is IGNORED (no forced hold / second writer)", async () => {
   const store = new FileLiveStore();
@@ -358,15 +358,14 @@ test("XERK-919 QA: a client-supplied hop header without a valid proof is IGNORED
   assert.deepEqual(f.decide(req("/api/x", { [FORWARDED_HEADER]: "x,y" })), { forward: "127.0.0.1:1" },
     "a spoofed hop list neither holds nor degrades the request");
   // A genuine hop (proof from the same secret) is honoured.
-  const peer = makeForwarder(new FileLiveStore(), "leader", { isLeader: () => false, authToken: "sekret" });
-  const crypto = require("node:crypto");
-  const proof = crypto.createHmac("sha256", "sekret").update("turma-forward\nleader").digest("base64url");
+  const at = String(Date.now());
+  const proof = `${at}.n1.${hopProof("sekret", "leader", "GET", "/api/x", at, "n1")}`;
   assert.ok(f.decide(req("/api/x", { [FORWARDED_HEADER]: "leader", [FORWARD_AUTH_HEADER]: proof })).hold);
   // A forged proof of the RIGHT length (an attacker can see the shape) is still refused.
   const forged = proof.slice(0, -1) + (proof.endsWith("A") ? "B" : "A");
   assert.deepEqual(f.decide(req("/api/x", { [FORWARDED_HEADER]: "leader", [FORWARD_AUTH_HEADER]: forged })),
     { forward: "127.0.0.1:1" }, "a same-length forged proof is ignored");
-  f.close(); void peer;
+  f.close();
 });
 
 test("XERK-919 QA: the forwarded hop header carries a proof the leader side can verify", async () => {
@@ -641,4 +640,180 @@ test("XERK-919 QA2: with the store down, a leader counts as fresh ONLY while dia
   await request(port, { path: "/api/y" }).catch(() => {});
   assert.equal(f.remoteLeaderFresh(), false, "a failed dial / stale dial proof -> never hand tunnels to it");
   srv.close(); f.close();
+});
+
+// ---- XERK-936: follower-side oversize refusal + request-bound hop proof ---------
+
+// A leader that records every connection it gets (a follower must not dial it for a
+// body it refuses itself) and answers 200 once it has the whole body.
+async function countingLeader() {
+  const seen = [];
+  const leader = http.createServer((rq, rs) => {
+    let n = 0;
+    rq.on("data", (c) => { n += c.length; });
+    rq.on("end", () => { seen.push({ url: rq.url, bytes: n }); rs.end("leader"); });
+  });
+  return { leader, seen, port: await listen(leader) };
+}
+
+// Post `size` bytes the way urllib does — the WHOLE body written before any read —
+// over a raw socket, and report the status line it gets (or the socket error).
+function postLikeUrllib(port, path, size) {
+  return new Promise((resolve) => {
+    const s = net.connect(port, "127.0.0.1");
+    let got = "";
+    s.on("connect", () => {
+      s.write(`POST ${path} HTTP/1.1\r\nHost: x\r\nContent-Length: ${size}\r\n\r\n`);
+      s.end(Buffer.alloc(size, 120));
+    });
+    s.on("data", (d) => { got += d; });
+    s.on("error", (e) => resolve(got ? got.split("\r\n")[0] : "err:" + e.code));
+    s.on("close", () => resolve(got.split("\r\n")[0] || "closed"));
+  });
+}
+
+test("XERK-936: a follower refuses a body DECLARED past cap + slack itself — 413, the leader never dialed", async () => {
+  const { leader, seen, port: lport } = await countingLeader();
+  const { f } = await follower(`127.0.0.1:${lport}`, {
+    bodyCap: (rq) => (rq.url === "/api/heartbeat" ? 1000 : 0), drainSlack: 64 << 10,
+  });
+  const { srv, port } = await followerServer(f);
+  // Far past the cut, like QA's 37 MiB beat: urllib-style, never reads before writing.
+  const line = await postLikeUrllib(port, "/api/heartbeat", 20 * 1024 * 1024);
+  assert.match(line, / 413 /, `got ${line}`);
+  // Inside the slack: still the LEADER's to answer (it drains to end and answers cleanly).
+  const inside = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) });
+  assert.equal(inside.body, "leader");
+  // A route with no cap (0) is forwarded however big.
+  const other = await request(port, { method: "POST", path: "/api/other", headers: { "content-length": 200000 }, body: Buffer.alloc(200000) });
+  assert.equal(other.body, "leader");
+  assert.deepEqual(seen.map((x) => x.url), ["/api/heartbeat", "/api/other"], "the oversize beat never reached the leader");
+  assert.equal(f.stats.refusedOversize, 1);
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-936: the 413 body matches the leader's generic refusal and the connection closes", async () => {
+  const { leader, port: lport } = await countingLeader();
+  const { f } = await follower(`127.0.0.1:${lport}`, { bodyCap: () => 1000, drainSlack: 4000 });
+  const { srv, port } = await followerServer(f);
+  const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 6000 }, body: Buffer.alloc(6000) })
+    .catch((e) => ({ status: "err:" + e.code }));
+  assert.equal(r.status, 413, `got ${r.status}`);
+  assert.deepEqual(JSON.parse(r.body), { error: "body too large", limit: 1000 });
+  assert.equal(r.headers.connection, "close");
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-936: the leader (and HA off) never refuses in the forwarder — its own handler answers", async () => {
+  for (const opts of [{ isLeader: () => true }, { enabled: false }]) {
+    const f = makeForwarder(new FileLiveStore(), "me", { bodyCap: () => 10, drainSlack: 10, ...opts });
+    await f.start();
+    const { srv, port } = await followerServer(f);
+    const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) });
+    assert.equal(r.status, 299, "served locally, untouched");
+    assert.equal(f.stats.refusedOversize, 0);
+    srv.close(); f.close();
+  }
+});
+
+test("XERK-936: past drainMax concurrent refusals a follower forwards as before; a slot frees on close", async () => {
+  const { leader, seen, port: lport } = await countingLeader();
+  const { f } = await follower(`127.0.0.1:${lport}`, { bodyCap: () => 100, drainSlack: 100, drainMax: 1 });
+  const { srv, port } = await followerServer(f);
+  // Hold one refusal open: declared huge, only a trickle sent.
+  const hog = net.connect(port, "127.0.0.1");
+  await new Promise((r) => hog.on("connect", r));
+  hog.write("POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: 999999\r\n\r\nabc");
+  hog.on("error", () => {});
+  await sleep(50);
+  assert.equal(f.stats.refusedOversize, 1);
+  const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 500 }, body: Buffer.alloc(500) });
+  assert.equal(r.body, "leader", "the slot is taken: forwarded, the leader decides");
+  hog.destroy();
+  await sleep(50);
+  const again = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 500 }, body: Buffer.alloc(500) })
+    .catch((e) => ({ status: "err:" + e.code }));
+  assert.equal(again.status, 413, "the slot freed when the hog left");
+  assert.equal(seen.length, 1);
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-936: server.js forwardBodyCap names each stateless-413 route's OWN cap, and 0 elsewhere", () => {
+  const hub = require("../server.js");
+  const cap = (method, url) => hub.forwardBodyCap({ method, url });
+  assert.equal(cap("POST", "/api/heartbeat"), hub.HEARTBEAT_MAX);
+  assert.equal(cap("POST", "/api/heartbeat?x=1"), hub.HEARTBEAT_MAX);
+  assert.equal(cap("POST", "/api/agents/h/uploads?name=a"), hub.UPLOAD_MAX_BYTES);
+  assert.equal(cap("POST", "/api/agents/h/sessions/s/uploads"), hub.UPLOAD_MAX_BYTES);
+  assert.equal(cap("POST", "/api/agents/h/archive/t/raw/f"), hub.ARCHIVE_RAW_BODY_MAX);
+  // The leader RECORDS these refusals, so a follower must not answer them alone.
+  assert.equal(cap("POST", "/api/agents/h/archive/t"), 0);
+  assert.equal(cap("POST", "/api/agents/h/migrations/m/blob"), 0);
+  assert.equal(cap("GET", "/api/heartbeat"), 0);
+  assert.equal(cap("POST", "/api/agents/h/sessions/s/input"), 0);
+  assert.equal(cap("POST", "//["), 0, "an unparseable target never throws");
+  // Drift pin: the routes still read with exactly those caps (and the upload cap is
+  // still bounded by UPLOAD_MAX_BYTES), so the follower's number is the leader's.
+  const src = require("node:fs").readFileSync(require.resolve("../server.js"), "utf8");
+  assert.match(src, /readBody\(req, HEARTBEAT_MAX, /);
+  assert.match(src, /readRawBody\(req, ARCHIVE_RAW_BODY_MAX\)/);
+  assert.match(src, /return Math\.min\(reported, UPLOAD_MAX_BYTES\)/);
+  assert.match(src, /bodyCap: forwardBodyCap,\s+drainSlack: RAW_BODY_DRAIN_SLACK,/);
+});
+
+test("XERK-936: a hop proof is bound to its request — another method or target, a stale stamp, or a replay is ignored", async () => {
+  const store = new FileLiveStore();
+  const f = makeForwarder(store, "me", { isLeader: () => false, authToken: "sekret" });
+  await f.start();
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: "127.0.0.1:1", at: Date.now() });
+  const FWD = { forward: "127.0.0.1:1" };
+  const mint = (method, url, at = Date.now(), nonce = "n" + Math.random().toString(36).slice(2)) =>
+    `${at}.${nonce}.${hopProof("sekret", "leader", method, url, String(at), nonce)}`;
+  const hop = (auth) => ({ [FORWARDED_HEADER]: "leader", [FORWARD_AUTH_HEADER]: auth });
+  // Minted for GET /api/a: honoured there, and only there.
+  const p = mint("GET", "/api/a");
+  assert.deepEqual(f.decide(req("/api/a", hop(mint("GET", "/api/a")), "GET")).hold !== undefined, true);
+  assert.deepEqual(f.decide(req("/api/b", hop(p), "GET")), FWD, "another target");
+  assert.deepEqual(f.decide(req("/api/a", hop(p), "POST")), FWD, "another method");
+  // Stale (or far-future) stamps.
+  assert.deepEqual(f.decide(req("/api/a", hop(mint("GET", "/api/a", Date.now() - PROOF_MAX_AGE_MS - 1000)))), FWD);
+  assert.deepEqual(f.decide(req("/api/a", hop(mint("GET", "/api/a", Date.now() + PROOF_MAX_AGE_MS + 1000)))), FWD);
+  assert.equal(f.stats.staleProofs, 2);
+  // A tampered stamp breaks the mac.
+  const fresh = mint("GET", "/api/a");
+  assert.deepEqual(f.decide(req("/api/a", hop(String(Date.now() + 1) + fresh.slice(fresh.indexOf("."))))), FWD);
+  // One-shot: the same header on a SECOND request is a replay, ignored.
+  const once = mint("GET", "/api/a");
+  const first = req("/api/a", hop(once));
+  assert.ok(f.decide(first).hold, "first sighting honoured");
+  assert.ok(f.decide(first).hold, "re-deciding the SAME request (a hold poll) is not a replay");
+  assert.deepEqual(f.decide(req("/api/a", hop(once))), FWD, "a replayed pair is ignored");
+  assert.equal(f.stats.replayedProofs, 1);
+  // Malformed shapes (the XERK-919 bare-mac form included) are ignored, never thrown on.
+  for (const bad of [hopProof("sekret", "leader", "GET", "/api/a", "", ""), "1.2", "x.y.z", "1.n.m.extra", "1.é.m"]) {
+    assert.deepEqual(f.decide(req("/api/a", hop(bad))), FWD, bad);
+  }
+  f.close();
+});
+
+test("XERK-936: a proof minted by a forwarding follower verifies on the next replica for that request only", async () => {
+  let seen;
+  const next = http.createServer((rq, rs) => { seen = { headers: rq.headers, url: rq.url, method: rq.method }; rs.end("ok"); });
+  const nport = await listen(next);
+  const { f } = await follower(`127.0.0.1:${nport}`, { authToken: "sekret" });
+  const { srv, port } = await followerServer(f);
+  await request(port, { method: "POST", path: "/api/x?q=1", headers: { "content-length": 2 }, body: "{}" });
+  // The next replica believes "me" leads: a PROVEN hop through "me" must hold there
+  // (never bounce back), an unproven one is just forwarded.
+  const vstore = new FileLiveStore();
+  const verifier = makeForwarder(vstore, "leader", { isLeader: () => false, authToken: "sekret" });
+  await verifier.start();
+  await vstore.set(LEADER_ENDPOINT_KEY, { replica: "me", addr: "127.0.0.1:1", at: Date.now() });
+  assert.match(seen.headers[FORWARD_AUTH_HEADER], /^\d+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+  assert.equal(seen.url, "/api/x?q=1");
+  assert.deepEqual(verifier.decide({ ...seen, url: "/api/y" }), { forward: "127.0.0.1:1" },
+    "the same headers on another target are not a proven hop");
+  assert.deepEqual(verifier.decide({ ...seen }), { hold: "the request already passed through the leader" },
+    "the minted proof verifies for its own request");
+  srv.close(); next.close(); f.close(); verifier.close();
 });
