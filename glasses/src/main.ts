@@ -27,6 +27,7 @@ import { LiveTail } from "./live.ts";
 import { BridgeStorage, BrowserStorage, type KeyValueStorage } from "./storage.ts";
 import { initPhoneLogin, signOut } from "./phone-login.ts";
 import { mountPhone, type PhoneHandle } from "./phone/phone.ts";
+import { pretextGlyphCoverage, setGlyphCoverage } from "./font.ts";
 import { pretextMeasure, setDefaultMeasure } from "./text-wrap.ts";
 import { installLifecycle, onAbnormalOrSystemExit, onForegroundEnter, onForegroundExit } from "./lifecycle.ts";
 
@@ -52,18 +53,21 @@ async function mainBridge(bridge: ResolvedBridge): Promise<void> {
   // Device path: the glasses render via the SDK, and the phone screen is the
   // native companion (mounted by boot()).
   document.body.classList.add("backend-bridge");
-  // These three are independent (two lazy bridge-path-only module imports —
+  // These four are independent (two lazy bridge-path-only module imports —
   // audio.ts is Task 7's real G2-mic dictation, both structural-only like
-  // display/evenhub.ts — plus resolving the pretext font measure), so run
+  // display/evenhub.ts — plus resolving the pretext font measure and glyph table), so run
   // their round-trips concurrently rather than one after another on the cold
   // boot path. `setDefaultMeasure` still runs before boot()/app.start(), so
   // the first render always wraps with the real metric.
-  const [{ EvenHubDisplay }, { AudioRecorder }, measure] = await Promise.all([
+  const [{ EvenHubDisplay }, { AudioRecorder }, measure, glyphCoverage] = await Promise.all([
     import("./display/evenhub.ts"),
     import("./audio.ts"),
     pretextMeasure(),
+    pretextGlyphCoverage(),
   ]);
   setDefaultMeasure(measure);
+  // Before boot(), so no transcript is ingested unchecked (font.ts, XERK-928).
+  setGlyphCoverage(glyphCoverage);
   const storage: KeyValueStorage = new BridgeStorage(bridge);
 
   const display = new EvenHubDisplay(bridge);

@@ -17,4 +17,16 @@ describe("SDK-parsed events through normalizeEvent", () => {
     const event = evenHubEventFromJson({ type: "sysEvent", jsonData: { eventSource: 1 } });
     expect(normalizeEvent(event)).toEqual({ type: "tap" });
   });
+
+  // XERK-922: the SDK DROPS an eventType it doesn't recognise (any numeric code
+  // or string outside its enum), so `sysEvent` comes back empty — exactly the
+  // shape a protobuf-zero CLICK has. The raw value survives only in `jsonData`;
+  // normalizeEvent must read it and ignore the event, or the next firmware
+  // event type re-opens the long-press-fires-a-tap bug.
+  it.each([11, 99, -1, "FOO", "9", null])("an unknown sysEvent eventType (%s) is not a tap", (eventType) => {
+    const event = evenHubEventFromJson({ type: "sysEvent", jsonData: { eventType, eventSource: 1 } });
+    expect(event.sysEvent?.eventType).toBeUndefined(); // the SDK really did strip it
+    expect(event.jsonData?.eventType).toBe(eventType); // ...but kept it here
+    expect(normalizeEvent(event)).toBeNull();
+  });
 });
