@@ -4512,7 +4512,7 @@ class ManagerMixin:
             self.run_calls.append(cmd)
             return ""
 
-        def fake_run_ok(cmd, cwd=None, timeout=None):
+        def fake_run_ok(cmd, cwd=None, timeout=None, env=None):
             self.run_ok_calls.append(cmd)
             return 0, ""
 
@@ -18003,6 +18003,44 @@ class TestCloneStaging(ManagerMixin, unittest.TestCase):
         sm._kill_clones()
         self.assertTrue(captured["proc"].killed)
         self.assertFalse(os.path.isdir(captured["tmp"]))
+
+
+class TestWorktreeAddSkipsLfsSmudge(unittest.TestCase):
+    """XERK-972: an LFS repo's smudge filter runs per file at checkout, so
+    `git worktree add` blows the default timeout AND the on-beat provision budget.
+    `_worktree_add` disables it with GIT_LFS_SKIP_SMUDGE=1 so the checkout is
+    instant; LFS content is pulled on demand."""
+
+    def test_worktree_add_passes_skip_smudge_env(self):
+        sm = ha.SessionManager()
+        sess = {"repoPath": "/repos/SmashBot", "worktreePath": "/wt/abcde"}
+        captured = {}
+
+        def fake_run_ok(cmd, cwd=None, timeout=30, env=None):
+            captured["cmd"] = cmd
+            captured["env"] = env
+            return 0, ""
+
+        with mock.patch.object(ha, "run", lambda *a, **k: ""), \
+             mock.patch.object(ha, "run_ok", fake_run_ok), \
+             mock.patch.object(ha.os, "makedirs", lambda *a, **k: None):
+            sm._worktree_add(sess, base_ref="origin/main")
+
+        self.assertEqual(captured["cmd"][:5],
+                         ["git", "-C", "/repos/SmashBot", "worktree", "add"])
+        # The env is the FULL inherited environment plus the skip flag — a bare
+        # {"GIT_LFS_SKIP_SMUDGE": "1"} would wipe PATH and break git's own exec.
+        self.assertEqual(captured["env"].get("GIT_LFS_SKIP_SMUDGE"), "1")
+        self.assertIn("PATH", captured["env"])
+
+    def test_worktree_add_raises_on_failure(self):
+        sm = ha.SessionManager()
+        sess = {"repoPath": "/repos/SmashBot", "worktreePath": "/wt/abcde"}
+        with mock.patch.object(ha, "run", lambda *a, **k: ""), \
+             mock.patch.object(ha, "run_ok", lambda *a, **k: (None, "boom")), \
+             mock.patch.object(ha.os, "makedirs", lambda *a, **k: None):
+            with self.assertRaises(RuntimeError):
+                sm._worktree_add(sess, base_ref="origin/main")
 
 
 class TestRepoHeadReady(unittest.TestCase):

@@ -1097,14 +1097,16 @@ def run_stdin(cmd, data, timeout=15):
         return False
 
 
-def run_ok(cmd, cwd=None, timeout=30):
+def run_ok(cmd, cwd=None, timeout=30, env=None):
     """Run a command, return (rc, stderr). rc is None if it couldn't launch.
     `timeout` is capped short (FETCH_TIMEOUT_SEC) for the network `git fetch`es
     that run on the heartbeat loop's critical path, so a slow remote can't stall
-    the loop long enough for the hub to mark the host offline."""
+    the loop long enough for the hub to mark the host offline. `env` (a full
+    environment dict) overrides the inherited environment — used by `_worktree_add`
+    to disable the LFS smudge filter for the checkout."""
     try:
         out = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env
         )
         return out.returncode, (out.stderr or "").strip()
     except Exception as e:
@@ -19478,7 +19480,17 @@ class SessionManager:
                sess["worktreePath"]]
         if base_ref:
             cmd.append(base_ref)
-        rc, err = run_ok(cmd)
+        # Skip the git-LFS smudge filter during checkout. In an LFS repo the
+        # filter runs per file at checkout (git-lfs smudge, one subprocess and
+        # possibly a network fetch each), so `worktree add` takes tens of seconds
+        # to minutes (measured ~65s for a real repo) — it BLEW the default 30s
+        # timeout, so every session in that repo failed to start, and even a
+        # longer timeout would flap the host offline since provision runs ON the
+        # beat under OFFLINE_AFTER_MS (the XERK-395 beat-budget class). With smudge
+        # skipped the checkout is instant (measured 0s) and LFS files land as
+        # pointer files; a session materializes what it needs with `git lfs pull`.
+        env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+        rc, err = run_ok(cmd, env=env)
         if rc != 0:
             raise RuntimeError(f"git worktree add failed: {git_error_text(err)}")
 
