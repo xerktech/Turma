@@ -188,6 +188,9 @@ function makeForwarder(store, replicaId, deps = {}) {
   function remoteLeaderFresh() {
     const e = leader;
     if (!e || e.replica === replicaId || !e.addr || isOwnAddr(e.addr)) return false;
+    // A leader we just FAILED to dial is not a place to send tunnels, however fresh
+    // its entry reads (it can be up to ttlMs old when the leader dies).
+    if (unreachableUntil.get(e.addr) > now()) return false;
     if (now() - e.seenAt < ttlMs) return true;
     // With the store link down the entry cannot be refreshed, so its age proves
     // nothing — but neither does it prove the leader is ALIVE. Only a dial that
@@ -195,7 +198,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     // leader that has died too (the only replica left able to serve them).
     if (storeHealthy()) return false;
     const ok = lastDialOk.get(e.addr);
-    return !!ok && now() - ok < ttlMs && !(unreachableUntil.get(e.addr) > now());
+    return !!ok && now() - ok < ttlMs;
   }
 
   const LOCAL = { local: true };
@@ -418,7 +421,10 @@ function makeForwarder(store, replicaId, deps = {}) {
     }
     const hh = hopHeaders(r.hops);
     for (let i = 0; i < hh.length; i += 2) lines.push(`${hh[i]}: ${hh[i + 1]}`);
-    up.write(lines.join("\r\n") + "\r\n\r\n");
+    // latin1: Node's parser decodes raw header bytes as latin1, so writing latin1
+    // puts every original byte back on the wire unchanged (UTF-8 would re-encode
+    // any byte >= 0x80 as two).
+    up.write(lines.join("\r\n") + "\r\n\r\n", "latin1");
     if (head && head.length) up.write(head);
     if (typeof socket.setNoDelay === "function") socket.setNoDelay(true);
     socket.pipe(up);

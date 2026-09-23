@@ -8,7 +8,12 @@
 // WebSocket upgrades), the hold-don't-double-write rule, the drain refusal, and the
 // server.js wiring (both handlers consult the forwarder first).
 
-const { test } = require("node:test");
+const { test: baseTest, after } = require("node:test");
+// Every case is bounded, and the file force-exits once they finish: a failed assertion
+// skips its own server.close()/f.close(), and the open handles would otherwise keep
+// this process (and CI's `node --test`) hanging instead of exiting red.
+const test = (name, fn) => baseTest(name, { timeout: 20000 }, fn);
+after(() => { setTimeout(() => process.exit(process.exitCode || 0), 200).unref(); });
 const assert = require("node:assert/strict");
 const http = require("node:http");
 const net = require("node:net");
@@ -640,5 +645,21 @@ test("XERK-919 QA2: with the store down, a leader counts as fresh ONLY while dia
   leader.close(); await sleep(80);
   await request(port, { path: "/api/y" }).catch(() => {});
   assert.equal(f.remoteLeaderFresh(), false, "a failed dial / stale dial proof -> never hand tunnels to it");
+  srv.close(); f.close();
+});
+
+test("XERK-919 QA3: a leader in dial cooldown is never fresh — fresh entry or recent dial proof notwithstanding", async () => {
+  const leader = net.createServer((s) => s.end()); const lport = await listen(leader);
+  let healthy = false; // store link down throughout
+  const store = new FileLiveStore();
+  const f = makeForwarder(store, "me", { isLeader: () => false, ttlMs: 60000, storeHealthy: () => healthy, cooldownMs: 60000, holdMs: 100, holdPollMs: 10 });
+  await f.start();
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: `127.0.0.1:${lport}`, at: Date.now() - 120000 });
+  const { srv, port } = await followerServer(f);
+  await request(port, { path: "/api/x" }).catch(() => {});
+  assert.equal(f.remoteLeaderFresh(), true, "a good dial just now");
+  leader.close(); await sleep(30);
+  await request(port, { path: "/api/y" }).catch(() => {}); // this dial fails -> cooldown
+  assert.equal(f.remoteLeaderFresh(), false, "the dial proof is recent, but the leader is in cooldown: no hand-back");
   srv.close(); f.close();
 });
