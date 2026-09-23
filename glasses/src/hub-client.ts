@@ -231,8 +231,15 @@ export class HubClient {
     );
   }
 
+  // Refuses an empty base (not signed in yet — XERK-929): `${""}/api/agents` is a
+  // RELATIVE url, fetched against the page's own origin (the dev server, or
+  // file:// on the device). Every hub request goes through here, so this also
+  // covers the poll App.resume() re-arms. No `status`, so callers treat it as
+  // hub-unreachable.
   private url(path: string): string {
-    return `${this.hubBase()}${path}`;
+    const base = this.hubBase();
+    if (!base) throw new Error("no hub URL configured — sign in on the phone");
+    return `${base}${path}`;
   }
 
   // The hub origin without a trailing slash — for the terminal iframe URL.
