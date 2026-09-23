@@ -51,7 +51,7 @@ export const PENDING_TIMEOUT_MS = 60 * 1000;
 // nudgePoll()/pause()/schedulePoll(). Matches the pending-overlay lifetime.
 export const POLL_GRACE_MS = 60 * 1000;
 export const FLASH_DURATION_MS = 4000;
-export const FLASH_QUEUED = "✓ queued — agent picks up in ~20s";
+export const FLASH_QUEUED = "√ queued — agent picks up in ~20s";
 export const FLASH_HUB_UNREACHABLE = "hub unreachable";
 // What a failed hub call flashes (XERK-270). The flash is the ONLY feedback a
 // wearer gets, so a refusal must arrive in the hub's own words — the client
@@ -65,7 +65,7 @@ export const FLASH_HUB_UNREACHABLE = "hub unreachable";
 export function failureFlash(err: unknown): string {
   const e = err as { status?: unknown; message?: unknown } | null;
   if (typeof e?.status !== "number") return FLASH_HUB_UNREACHABLE;
-  return typeof e.message === "string" && e.message ? `✗ ${e.message}` : FLASH_HUB_UNREACHABLE;
+  return typeof e.message === "string" && e.message ? `x ${e.message}` : FLASH_HUB_UNREACHABLE;
 }
 export const HISTORY_RETRY_MS = 3000;
 export const WORKING_WINDOW_SEC = 90;

@@ -176,16 +176,16 @@ describe("render: home", () => {
   // the canvas edge with nothing saying the tail was cut.
   it("clips a flash too long for the one-line header, marking the cut", () => {
     const long =
-      "✗ message too long — 12,345 characters, the agent accepts at most 10,000 per message";
+      "x message too long — 12,345 characters, the agent accepts at most 10,000 per message";
     const line = asLines(render(base({ flash: long, flashUntil: NOW + 1000 })))[0] ?? "";
     expect(line.endsWith("…")).toBe(true);
     expect(line.length).toBeLessThan(long.length);
-    expect(line.startsWith("✗ message too long")).toBe(true);
+    expect(line.startsWith("x message too long")).toBe(true);
   });
 
   it("leaves a flash that already fits untouched", () => {
-    const state = base({ flash: "✗ that host is offline", flashUntil: NOW + 1000 });
-    expect(asLines(render(state))[0]).toBe("✗ that host is offline");
+    const state = base({ flash: "x that host is offline", flashUntil: NOW + 1000 });
+    expect(asLines(render(state))[0]).toBe("x that host is offline");
   });
 
   it("does not show an expired flash", () => {
@@ -225,7 +225,7 @@ describe("render: session", () => {
     const model = asSession(render(state));
 
     // The hub's own words sit above the transcript content, not strobed as a flash.
-    expect(model.transcriptLines[0]).toBe("✗ wrong hub password");
+    expect(model.transcriptLines[0]).toBe("x wrong hub password");
     expect(model.transcriptLines).toContain("» hi");
   });
 
@@ -553,12 +553,12 @@ describe("render: session", () => {
       agents,
       session: newSessionState("host-a", "s1"),
       transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
-      flash: "✓ queued — agent picks up in ~20s",
+      flash: "√ queued — agent picks up in ~20s",
       flashUntil: NOW + 1000,
     });
 
     const model = asSession(render(state));
-    expect(model.transcriptLines[0]).toContain("✓ queued");
+    expect(model.transcriptLines[0]).toContain("√ queued");
     expect(model.transcriptLines.some((l) => l.includes("hi"))).toBe(true);
   });
 
@@ -570,7 +570,7 @@ describe("render: session", () => {
       agents,
       session: newSessionState("host-a", "s1"),
       transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
-      flash: "✓ queued — agent picks up in ~20s",
+      flash: "√ queued — agent picks up in ~20s",
       flashUntil: NOW - 1,
     });
 

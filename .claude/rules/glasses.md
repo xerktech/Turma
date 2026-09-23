@@ -53,6 +53,12 @@ paths:
     dropped glyph run first turned "the plan 🧠 [WIP]" into a stripped tool marker.
   - Map keys are codepoint numbers: `glyphs.test.ts` (XERK-923) scans string literals, escapes too.
   - Tests: `font.test.ts`.
+- **Every non-ASCII char in a glasses source literal must exist in the firmware font** (XERK-923).
+  A missing codepoint draws blank — ✓ U+2713 and ✗ U+2717 are absent, so markers are `√` and `x`.
+  Check a glyph with `@evenrealities/pretext`'s `getAdvW(cp)` (0 = missing; it matches the
+  simulator's font). Exempt: phone/, vendor/, phone-login.ts (browser fonts). Hub text is not a
+  literal — it goes through `fontSafe` (bullet above). Tests: `glyphs.test.ts` "has a glyph for every
+  non-ASCII character".
 - **A resolved `waitForEvenAppBridge()` does NOT mean a host is there** — it resolves in any browser.
   `bridge.ts`'s `resolveBridge` also requires `window.flutter_inappwebview.callHandler` (the device
   WebView or the simulator's shim), else it falls back to the DOM backend at `BRIDGE_TIMEOUT_MS`.
