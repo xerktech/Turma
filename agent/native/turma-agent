@@ -15,6 +15,23 @@
 # manager as the long-lived foreground process.
 set -eu
 
+# Refuse any argument this launcher doesn't own BEFORE anything runs (XERK-937).
+# The run path reaps the live tunnel and execs a manager, so an unrecognised arg
+# like `--help` falling through to it started a second hub-agent.py outside
+# turma-agentctl's pidfile — two processes beating as one host.
+usage() {
+  echo "usage: turma-agent [--preflight | --tunnel-supervisor | -h | --help]"
+  echo "  (no args)            run the session manager; start it via systemd or"
+  echo "                       turma-agentctl, not by hand"
+  echo "  --preflight          report credentials and tools, then exit"
+  echo "  --tunnel-supervisor  internal: the reverse-tunnel respawn loop"
+}
+case "$#:${1:-}" in
+  0:|1:--preflight|1:--tunnel-supervisor) ;;
+  1:-h|1:--help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
 # Resolve the install prefix from our own location ($PREFIX/bin/turma-agent).
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"   # $PREFIX/bin
 PREFIX="$(dirname "$SELF_DIR")"             # $PREFIX

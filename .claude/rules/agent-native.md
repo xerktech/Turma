@@ -24,6 +24,9 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   permanent. Launcher reaps
   the supervisor BEFORE the tunnel (else the old loop respawns the just-killed tunnel);
   `turma-agentctl stop` too. Tests: `test_turma_agent.sh`.
+- **Launcher refuses any arg it doesn't own, before anything runs** (XERK-937): only no-args,
+  `--preflight`, `--tunnel-supervisor`; `-h/--help` → usage. A fall-through (`--help`) reaped the live
+  tunnel and exec'd a second manager outside `turma-agentctl`'s pidfile. New modes join that `case`.
 - **A no-arg start REFUSES when a manager for this `$PREFIX` is already running (XERK-938)** —
   `pgrep -f "$PREFIX/hub-agent.py"`, `TURMA_ALLOW_SECOND_MANAGER=1` opts out. No-args is the legit
   systemd/turma-agentctl entry point (can't be rejected like an unknown arg, XERK-937), but a HAND

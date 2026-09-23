@@ -33,8 +33,8 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `turma-ha-postgres.md` | `turma/pgclient.js` | HA Postgres of-record spine (XERK-776): stdlib v3 wire client + SCRAM-SHA-256 + extended query + pool + GREATEST upsert; consumed by the ledger (XERK-779) + archive index (XERK-780) of-records; non-HA returns null |
 | `turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `turma-ha-registry.md` | `turma/server.js` | HA: the fleet registry + per-host command queues in the shared store (per-host write-through, hydration, watch); non-HA byte-identical (XERK-756) |
-| `turma-ha-leader.md` | `turma/leader.js`, `turma/server.js` | HA: k8s-Lease leader election + `isLeader()` gating the singleton sweeps/migration-advance; the shared single-flight guards (write-through + hydrate-on-promotion); non-HA always-leader/byte-identical (XERK-763) |
-| `turma-ha-tunnel.md` | `turma/server.js`, `turma/relay.js` | HA: cross-replica tunnel directory + control bus (XERK-764) + the duplex byte-stream relay for /term,/live,openChannel (XERK-777/781) — active-active serving across replicas; non-HA byte-identical |
+| `turma-ha-leader.md` | `turma/leader.js`, `turma/forward.js`, `turma/server.js` | HA: k8s-Lease leader election; the LEADER SERVES, followers forward (XERK-919) + the handover order; `isLeader()`-gated sweeps; shared guards; local HA-stack recipe; non-HA byte-identical |
+| `turma-ha-tunnel.md` | `turma/server.js`, `turma/relay.js` | HA: cross-replica tunnel directory + control bus (XERK-764) + the duplex byte-stream relay for /term,/live,openChannel (XERK-777/781) — now the handover/degraded path (XERK-919); non-HA byte-identical |
 | `turma-oidc.md` | `turma/server.js` | OIDC relying-party core: code+PKCE, discovery, JWKS RS256, session cookie, RP-logout |
 | `turma-break-glass.md` | `turma/server.js`, `turma/public/login.html` | IdP-independent break-glass local login; invariants a mandatory-OIDC change must keep |
 | `turma-usage.md` | `turma/public/usage.html`, `usage-ledger.js` | token chart, durable ledger, sub-agent split, limit cards, ingest coercions |

@@ -555,7 +555,40 @@ else
 fi
 rm -f "$PREFIX/bin/turma-agent-update"
 
-# --- Case 15 (XERK-938): a hand re-run is refused while a manager is live -----
+# --- Case 15: an unknown argument never starts a manager (XERK-937) ---------
+# `turma-agent --help` once ran the whole run path: it reaped the live tunnel and
+# exec'd a second hub-agent.py outside turma-agentctl's pidfile, so the host beat
+# twice under one name. Every argument the launcher doesn't own must be refused
+# before anything runs; -h/--help prints usage and succeeds.
+echo "case: unknown args are refused before anything runs"
+# A live supervisor stands in for the running agent's: a stray invocation must
+# leave it alone, not reap it the way the run path does.
+PATH="$WORK/stub-bin:$PATH" setsid "$PREFIX/bin/turma-agent" --tunnel-supervisor \
+  >/dev/null 2>&1 &
+LIVE_SUP=$!
+wait_for starts_at_least 1 || true
+for args in "--help" "-h" "--bogus" "start" "--preflight extra"; do
+  rm -f "$WORK/manager.log"
+  rc=0
+  # shellcheck disable=SC2086  # word-split on purpose: "--preflight extra" is two args.
+  PATH="$WORK/stub-bin:$PATH" timeout 10 \
+    "$PREFIX/bin/turma-agent" $args >"$WORK/args.log" 2>&1 || rc=$?
+  sleep 0.3
+  if ! kill -0 "$LIVE_SUP" 2>/dev/null; then
+    fail "'$args' killed the running tunnel supervisor (rc=$rc)"
+  elif [ -e "$WORK/manager.log" ]; then
+    fail "'$args' started a manager (rc=$rc)"
+  elif ! grep -q "usage: turma-agent" "$WORK/args.log"; then
+    fail "'$args' printed no usage: $(cat "$WORK/args.log")"
+  elif case "$args" in -h|--help) [ "$rc" != 0 ];; *) [ "$rc" = 0 ];; esac; then
+    fail "'$args' exited $rc"
+  else
+    ok "'$args' -> usage, rc=$rc, nothing started"
+  fi
+done
+kill "$LIVE_SUP" 2>/dev/null || true
+
+# --- Case 16 (XERK-938): a hand re-run is refused while a manager is live -----
 # No-args is the legit systemd/turma-agentctl entry point, so it can't be
 # rejected like an unknown arg (XERK-937). But run BY HAND while a manager for
 # this prefix is already up, the run path would reap the live tunnel and exec a
@@ -599,7 +632,7 @@ else
   fail "expected 1 supervisor after a refused launch, found $n"
 fi
 
-# --- Case 16 (XERK-938): the opt-out env allows a deliberate second manager ---
+# --- Case 17 (XERK-938): the opt-out env allows a deliberate second manager ---
 echo "case: TURMA_ALLOW_SECOND_MANAGER=1 overrides the guard"
 rm -f "$WORK/manager.log"
 TURMA_ALLOW_SECOND_MANAGER=1 PATH="$WORK/stub-bin:$PATH" setsid \
