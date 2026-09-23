@@ -847,6 +847,36 @@ test("XERK-939: a STALE leader entry (store link down, still forwarded to) is no
   srv.close(); leader.close(); f.close();
 });
 
+test("XERK-939 QA: a CRASHED leader's caps refuse nothing — the dial fails, the request is held, then served", async () => {
+  const dead = http.createServer();
+  const dport = await listen(dead);
+  await new Promise((r) => dead.close(r));
+  const { f } = await follower(`127.0.0.1:${dport}`, { bodyRoute: () => "hb", cooldownMs: 60000 },
+    { bodyCaps: { hb: 100 }, drainSlack: 10 });
+  const { srv, port } = await followerServer(f);
+  const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) });
+  assert.equal(r.status, 299, "held past holdMs, then served by this replica at its own cap");
+  assert.equal(f.stats.refusedOversize, 0);
+  assert.equal(f.stats.dialFailures, 1, "the liveness dial marked the leader unreachable");
+  srv.close(); f.close();
+});
+
+test("XERK-939 QA: our OWN entry (demoted / restarted in place) carries caps but never refuses — held, then served", async () => {
+  const { leader, seen, port: lport } = await countingLeader();
+  for (const pub of [{ replica: "me" }, { replica: "old-me" }]) {
+    const { f } = await follower(`127.0.0.1:${lport}`,
+      { bodyRoute: () => "hb", endpoint: `127.0.0.1:${lport}` },
+      { ...pub, bodyCaps: { hb: 100 }, drainSlack: 10 });
+    const { srv, port } = await followerServer(f);
+    const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) });
+    assert.equal(r.status, 299, `${pub.replica}: taking over, not a leader to judge by`);
+    assert.equal(f.stats.refusedOversize, 0);
+    srv.close(); f.close();
+  }
+  assert.equal(seen.length, 0, "the own-address entry was never dialed");
+  leader.close();
+});
+
 test("XERK-939: the leader publishes its caps + slack; a follower on the same store refuses by THEM", async () => {
   const { leader: up, seen, port: lport } = await countingLeader();
   const store = new FileLiveStore();

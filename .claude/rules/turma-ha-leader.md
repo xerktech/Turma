@@ -100,6 +100,9 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
     (`bodyCaps`/`drainSlack`, XERK-939) — never its own, nor a `min` of both: mid-rollout (a changed
     memory limit) a smaller-cap follower cut a body the leader takes. No FRESH usable caps (an older
     leader, a malformed entry, a stale entry while the store link is down) = forward, never refuse.
+  - It refuses only a request `decide()` would FORWARD, and only after a connect proves the leader is
+    up (`leaderAlive`, nothing sent). A refusal never otherwise dials, so a crashed leader's caps
+    kept refusing until its entry aged out; a held request (own entry, handover) is never judged.
   - Route keys come from server.js `forwardBodyRoute`, caps from `forwardBodyCaps` — the SAME
     constants the routes read with (drift pinned by a source-match test). Uploads use
     `UPLOAD_MAX_BYTES`, the ceiling over every host's own cap.

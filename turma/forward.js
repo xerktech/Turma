@@ -370,12 +370,14 @@ function makeForwarder(store, replicaId, deps = {}) {
     }
   }
 
-  // The {cap, slack} to refuse this request against HERE, or null to forward it as
-  // usual. Only a body DECLARED past the LEADER's published cap + slack (the leader
-  // would cut it) on a request this replica would not serve itself — the leader /
-  // HA-off path is untouched. The leader's numbers alone (XERK-939): with none, or
-  // none FRESH (an older leader, a stale entry while the store link is down), the
-  // body is forwarded — never judged against this replica's own, possibly smaller, cap.
+  // The {cap, slack, addr} to refuse this request against HERE, or null to forward it
+  // as usual. Only a body DECLARED past the LEADER's published cap + slack (the leader
+  // would cut it) on a request this replica would FORWARD right now — the leader /
+  // HA-off path is untouched, and a held request (a handover, our own entry, a leader
+  // marked unreachable) is left to whoever serves it. The leader's numbers alone
+  // (XERK-939): with none, or none FRESH (an older leader, a stale entry while the
+  // store link is down), the body is forwarded — never judged against this replica's
+  // own, possibly smaller, cap.
   function oversizeCap(req) {
     if (!enabled) return null;
     const declared = Number(req.headers && req.headers["content-length"]);
@@ -386,8 +388,17 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (!route || !e || !e.caps || e.replica === replicaId || !(now() - e.seenAt < ttlMs)) return null;
     const cap = e.caps.get(route) || 0;
     if (!(cap > 0) || !(declared > cap + e.slack)) return null;
-    if (decide(req).local || refusing >= drainMax) return null;
-    return { cap, slack: e.slack };
+    if (refusing >= drainMax) return null;
+    const d = decide(req);
+    return d.forward ? { cap, slack: e.slack, addr: d.forward } : null;
+  }
+
+  // Is the leader whose caps we are about to refuse by still up? A connect, closed at
+  // once — nothing is sent. A refusal never otherwise dials, so without this a crashed
+  // leader's caps kept refusing until its entry went stale, though its successor may
+  // take more (XERK-939 QA). A failed dial marks it unreachable: the request is held.
+  function leaderAlive(addr) {
+    return dial(addr).then((s) => { s.destroy(); return true; }, (e) => { markUnreachable(addr, e); return false; });
   }
 
   // Refuse a declared-oversize body on THIS replica, exactly as the leader would
@@ -396,9 +407,9 @@ function makeForwarder(store, replicaId, deps = {}) {
   // reading (python urllib: the agent) must be nearly done writing when the status
   // goes out, or it sees only the reset. Stateless, so safe on a follower; it never
   // dials the leader, so the leader's reset can no longer turn the 413 into a 502.
+  // The caller has already taken this refusal's `refusing` slot.
   function refuseOversize(req, res, { cap, slack }) {
     stats.refusedOversize += 1;
-    refusing += 1;
     let len = 0;
     let settled = false;
     let idle = null;
@@ -440,7 +451,15 @@ function makeForwarder(store, replicaId, deps = {}) {
   // should serve it locally. Never throws, never rejects.
   async function forwardRequest(req, res) {
     const over = oversizeCap(req);
-    if (over) { refuseOversize(req, res, over); return true; }
+    if (over) {
+      refusing += 1; // held across the liveness dial, so drainMax still bounds us
+      if (await leaderAlive(over.addr)) {
+        if (res.destroyed) { refusing -= 1; return true; } // the client left meanwhile
+        refuseOversize(req, res, over);
+        return true;
+      }
+      refusing -= 1; // the leader is gone: held below like any other request
+    }
     const r = await route(req, () => res.destroyed || res.writableEnded);
     if (!r) return false;
     if (r.gone) return true;
