@@ -163,6 +163,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     // ...where "sends nothing" means less than this much progress in the window, so a
     // 1-byte trickle is idle too (readBody's BODY_MIN_PROGRESS_BYTES rule).
     drainMinProgress = 64 << 10,
+    aliasTtlMs = ALIAS_TTL_MS, // how long a PROVEN self-alias is treated as our own address
   } = deps;
   const canServe = deps.canServe || isLeader;
 
@@ -294,7 +295,7 @@ function makeForwarder(store, replicaId, deps = {}) {
   }
   function learnAlias(addr) {
     if (!addr || isOwnAddr(addr)) return;
-    ownAliases.set(addr, now() + ALIAS_TTL_MS);
+    ownAliases.set(addr, now() + aliasTtlMs);
     log(`forward: the leader endpoint ${addr} leads back to THIS replica (a forwarding loop) — ` +
       "treating it as our own address; fix the leader's TURMA_HUB_ENDPOINT / POD_IP");
     lastMode = null;
@@ -617,7 +618,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (!r) { socket.removeListener("error", early); return false; } // serve locally, untouched
     if (r.gone) return true;
     if (r.refuse) { socket.destroy(); return true; } // draining: the client re-dials elsewhere
-    if (r.loop) { // our own proof back (see verifyHops); piped raw, so nothing learns the alias
+    if (r.loop) { // our own proof back (see verifyHops); the minting upgrade learns from this 508
       socket.removeListener("error", early);
       socket.on("error", () => {});
       socket.end(`HTTP/1.1 508 Loop Detected\r\n${LOOP_HEADER}: ${r.loop}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
@@ -643,8 +644,19 @@ function makeForwarder(store, replicaId, deps = {}) {
       if (lk === FORWARDED_HEADER || lk === FORWARD_AUTH_HEADER) continue;
       lines.push(`${raw[i]}: ${raw[i + 1]}`);
     }
-    const hh = hopHeaders(r.hops, req).headers;
+    const minted = hopHeaders(r.hops, req);
+    const hh = minted.headers;
     for (let i = 0; i < hh.length; i += 2) lines.push(`${hh[i]}: ${hh[i + 1]}`);
+    // The upgrade path learns a self-alias too, from the first bytes back (the 508 head
+    // naming OUR nonce): without it, an alias expiring handed our tunnels "back to the
+    // leader" and every re-dial was 508'd until some HTTP request re-taught it (QA).
+    if (minted.nonce) {
+      const want = `${LOOP_HEADER}: ${minted.nonce}\r\n`;
+      up.once("data", (d) => {
+        const head = d.subarray(0, 512).toString("latin1");
+        if (head.startsWith("HTTP/1.1 508 ") && head.includes(want)) learnAlias(r.addr); // our own writer's exact form
+      });
+    }
     up.write(lines.join("\r\n") + "\r\n\r\n");
     if (head && head.length) up.write(head);
     if (typeof socket.setNoDelay === "function") socket.setNoDelay(true);

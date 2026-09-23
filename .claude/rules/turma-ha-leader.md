@@ -76,8 +76,10 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
     recursed forwarding into ourselves until MAX_CONNECTIONS.
   - The 508 carries the looped proof's nonce (`x-turma-forward-loop`); a minter seeing ITS nonce
     come back learns that leader address as an alias of itself (`ownAliases`, 10 min), so later
-    requests hold + serve as for `isOwnAddr`. Cost of a loop: ONE retryable 508 per alias TTL.
-    Upgrades are piped raw, so they are refused but never teach the alias.
+    requests hold + serve as for `isOwnAddr`. An upgrade learns it too, from the 508 head it gets
+    back — else an expiring alias handed tunnels "back to the leader" and every re-dial was 508'd
+    until some HTTP request re-taught it. Cost of a loop: what is in flight when the alias is
+    (re)learned gets a retryable 508, once per TTL; a wrong alias lasts at most the TTL.
   - The mac cannot cover the body (it streams), so a pair replayed within 30s onto a THIRD replica
     that never saw it, same method + target, is honoured once there. That bites only while that
     replica believes the minter leads (a transient disagreement): one held-then-DEGRADED request.

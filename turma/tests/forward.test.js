@@ -1206,3 +1206,34 @@ test("XERK-936 QA3: an UPGRADE carrying our own proof back is refused 508 — ne
   assert.match(got, /x-turma-forward-loop: nn/);
   srv.close(); f.close();
 });
+
+function upgradeTo(port, url = "/agent/control?name=h") {
+  return new Promise((resolve) => {
+    const s = net.connect(port, "127.0.0.1", () =>
+      s.write(`GET ${url} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n`));
+    let b = "";
+    s.on("data", (d) => { b += d; if (b.includes("\r\n\r\n")) { s.destroy(); resolve(b.split("\r\n")[0]); } });
+    s.on("close", () => resolve(b.split("\r\n")[0]));
+    s.on("error", () => resolve(b.split("\r\n")[0]));
+  });
+}
+
+test("XERK-936 QA4: an UPGRADE looping back teaches the alias too; a learned alias EXPIRES and is re-proved", async () => {
+  const store = new FileLiveStore();
+  const f = makeForwarder(store, "me", {
+    isLeader: () => false, authToken: "sekret", holdMs: 100, holdPollMs: 10, ttlMs: 60000,
+    endpoint: "10.9.9.9:1", aliasTtlMs: 300,
+  });
+  const { srv, port } = await followerServer(f);
+  await f.start();
+  const prox = await tcpProxy(port);
+  const addr = `127.0.0.1:${prox.port}`;
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr, at: Date.now() });
+  assert.match(await upgradeTo(port), / 508 /, "the looped upgrade is refused");
+  await sleep(20);
+  assert.deepEqual(f.decide(req("/a")), { hold: "this replica is taking over" }, "...and its 508 taught the alias");
+  assert.match(await upgradeTo(port), / 418 /, "later upgrades hold, then serve locally");
+  await sleep(350);
+  assert.deepEqual(f.decide(req("/a")), { forward: addr }, "past aliasTtlMs the address is re-proved, never kept forever");
+  srv.close(); prox.p.close(); f.close();
+});
