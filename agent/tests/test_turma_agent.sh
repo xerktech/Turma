@@ -110,6 +110,24 @@ starts_at_least() { [ "$(count_starts)" -ge "$1" ]; }
 logged() { grep -q "$1" "$2"; }
 # shellcheck disable=SC2329
 file_has_content() { [ -s "$1" ]; }
+# shellcheck disable=SC2329  # invoked indirectly, through wait_for.
+# No manager for this prefix is alive. The launcher's XERK-938 guard refuses to
+# start a second one, so a case that expects a fresh manager must first wait for
+# the previous case's (SIGTERM'd) stub to actually exit — pkill is asynchronous.
+no_manager() { ! pgrep -f "$PREFIX/hub-agent.py" >/dev/null 2>&1; }
+
+# Tear down every launcher/supervisor/manager from a prior case, then wait for the
+# manager to be gone, before a case that starts a FRESH manager. These cases fire
+# launchers fire-and-forget and don't synchronise teardown, and a prior launcher
+# still mid-startup can exec its manager AFTER a bare `no_manager` check passes —
+# which the XERK-938 guard then refuses. Killing the launcher AND any manager (by
+# both the launcher path and the hub-agent.py argv) closes that window. Not for
+# the reconcile case, which must keep the old tunnel supervisor alive.
+reset_agents() {
+  pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
+  pkill -f "$PREFIX/hub-agent.py" 2>/dev/null || true
+  wait_for no_manager || true
+}
 
 # --- Case 1: the supervisor respawns a tunnel that exits ---------------------
 echo "case: supervisor respawns the tunnel"
@@ -164,6 +182,7 @@ pkill -f "$PREFIX/bin/turma-agent --tunnel-supervisor" 2>/dev/null || true
 echo "case: run path exports the manager pid and supervises the tunnel"
 : > "$WORK/tunnel.log"
 rm -f "$WORK/manager.log"
+reset_agents
 PATH="$WORK/stub-bin:$PATH" setsid "$PREFIX/bin/turma-agent" >"$WORK/run.log" 2>&1 &
 if wait_for file_has_content "$WORK/manager.log"; then
   named="$(sed -n 's/named=\([0-9]*\).*/\1/p' "$WORK/manager.log")"
@@ -182,8 +201,15 @@ else
   fail "run path started no tunnel"
 fi
 
-# --- Case 4: a re-run replaces the supervisor rather than duplicating it -----
-echo "case: a second launch leaves exactly one supervisor"
+# --- Case 4: a restart reaps the old supervisor rather than duplicating it ----
+# A real restart (systemd KillMode=process, or turma-agentctl) reaps the MANAGER
+# first — and since XERK-938 the launcher refuses to start while one is live — so
+# mimic that: kill the case-3 manager, but leave its tunnel supervisor running
+# (KillMode=process spares it). The relaunch's reconcile must reap that stray
+# supervisor and leave exactly one.
+echo "case: a restart reaps the old supervisor and leaves exactly one"
+pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
+wait_for no_manager || true
 PATH="$WORK/stub-bin:$PATH" setsid "$PREFIX/bin/turma-agent" >"$WORK/run2.log" 2>&1 &
 sleep 1
 n="$(pgrep -f -c "$PREFIX/bin/turma-agent --tunnel-supervisor" 2>/dev/null || echo 0)"
@@ -308,6 +334,7 @@ mkdir -p "$WORK/home/.local/bin"
 printf '#!/bin/sh\nexit 0\n' > "$WORK/home/.local/bin/claude"
 chmod +x "$WORK/home/.local/bin/claude"
 rm -f "$WORK/manager.log"
+reset_agents
 PATH="$WORK/svc-bin" setsid "$PREFIX/bin/turma-agent" >"$WORK/run3.log" 2>&1 &
 if wait_for file_has_content "$WORK/manager.log" && \
    wait_for logged "claude=" "$WORK/manager.log"; then
@@ -335,6 +362,7 @@ pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
 # install later heals with no restart), but the journal names the fault.
 echo "case: missing claude is a loud warning, not a silent failure"
 rm -f "$WORK/home/.local/bin/claude" "$WORK/manager.log"
+reset_agents
 PATH="$WORK/svc-bin" setsid "$PREFIX/bin/turma-agent" >"$WORK/run4.log" 2>&1 &
 if wait_for logged "claude not on PATH" "$WORK/run4.log"; then
   ok "said sessions will fail and how to fix it"
@@ -393,6 +421,7 @@ STUB
 chmod +x "$PREFIX/bin/turma-agent-update"
 : > "$WORK/boot-update.log"
 rm -f "$WORK/manager.log" "$WORK/claude-done"
+reset_agents
 PATH="$WORK/stub-bin:$PATH" setsid "$PREFIX/bin/turma-agent" >"$WORK/run5.log" 2>&1 &
 if wait_for logged "update --boot" "$WORK/boot-update.log"; then
   ok "fired both start checks"
@@ -436,6 +465,7 @@ echo "case: a hung Claude Code check does not hold the boot"
 rm -f "$WORK/manager.log" "$WORK/claude-done"
 # The deadline is held clear of the INSTALL budget and nothing else, so a small
 # budget is how a test gets a small deadline without touching the property.
+reset_agents
 TEST_CLAUDE_CHECK_SLEEP=600 TURMA_CLAUDE_UPDATE_TIMEOUT=8 TURMA_NPM_INSTALL_TIMEOUT=1 \
   PATH="$WORK/stub-bin:$PATH" \
   setsid "$PREFIX/bin/turma-agent" >"$WORK/run7.log" 2>&1 &
@@ -467,6 +497,7 @@ rm -f "$WORK/manager.log" "$WORK/claude-done"
 # replacing the package and npm carries on while the manager launches sessions
 # into it. An operator raising the install budget past the deadline is the shape
 # that matters, and it must not be honoured silently.
+reset_agents
 TURMA_CLAUDE_UPDATE_TIMEOUT=5 TURMA_NPM_INSTALL_TIMEOUT=600 \
   PATH="$WORK/stub-bin:$PATH" setsid \
   "$PREFIX/bin/turma-agent" >"$WORK/run8.log" 2>&1 &
@@ -494,6 +525,7 @@ pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
 echo "case: TURMA_BOOT_UPDATE=0 suppresses both checks"
 : > "$WORK/boot-update.log"
 rm -f "$WORK/manager.log"
+reset_agents
 TURMA_BOOT_UPDATE=0 PATH="$WORK/stub-bin:$PATH" setsid \
   "$PREFIX/bin/turma-agent" >"$WORK/run6.log" 2>&1 &
 if wait_for file_has_content "$WORK/manager.log"; then
@@ -555,6 +587,61 @@ for args in "--help" "-h" "--bogus" "start" "--preflight extra"; do
   fi
 done
 kill "$LIVE_SUP" 2>/dev/null || true
+
+# --- Case 16 (XERK-938): a hand re-run is refused while a manager is live -----
+# No-args is the legit systemd/turma-agentctl entry point, so it can't be
+# rejected like an unknown arg (XERK-937). But run BY HAND while a manager for
+# this prefix is already up, the run path would reap the live tunnel and exec a
+# SECOND hub-agent.py — two managers beating as one host, and turma-agentctl
+# restart (pidfile-scoped) can't reap the stray. The launcher must detect a live
+# manager for THIS prefix and refuse, touching nothing.
+echo "case: a hand re-run is refused while a manager is already running"
+: > "$WORK/tunnel.log"
+rm -f "$WORK/manager.log"
+reset_agents
+PATH="$WORK/stub-bin:$PATH" setsid "$PREFIX/bin/turma-agent" >"$WORK/run9.log" 2>&1 &
+if ! wait_for file_has_content "$WORK/manager.log"; then
+  fail "first manager never started: $(cat "$WORK/run9.log")"
+fi
+# The second launch runs in THIS shell (a hand run), synchronously, so its exit
+# status is the refusal.
+rm -f "$WORK/manager.log"
+rc=0
+PATH="$WORK/stub-bin:$PATH" "$PREFIX/bin/turma-agent" >"$WORK/run10.log" 2>&1 || rc=$?
+if [ "$rc" != 0 ]; then
+  ok "the second launch exited nonzero ($rc)"
+else
+  fail "the second launch did not refuse (rc=0): $(cat "$WORK/run10.log")"
+fi
+if grep -q "already running" "$WORK/run10.log"; then
+  ok "explained a manager is already running"
+else
+  fail "no already-running explanation: $(cat "$WORK/run10.log")"
+fi
+if [ -f "$WORK/manager.log" ]; then
+  fail "a SECOND manager was started despite the guard"
+else
+  ok "started no second manager"
+fi
+# The refused launch must not have reaped or duplicated the live tunnel: exactly
+# one supervisor, the one the first launch started, still stands.
+n="$(pgrep -f -c "$PREFIX/bin/turma-agent --tunnel-supervisor" 2>/dev/null || echo 0)"
+if [ "$n" = "1" ]; then
+  ok "left the one live tunnel supervisor untouched"
+else
+  fail "expected 1 supervisor after a refused launch, found $n"
+fi
+
+# --- Case 17 (XERK-938): the opt-out env allows a deliberate second manager ---
+echo "case: TURMA_ALLOW_SECOND_MANAGER=1 overrides the guard"
+rm -f "$WORK/manager.log"
+TURMA_ALLOW_SECOND_MANAGER=1 PATH="$WORK/stub-bin:$PATH" setsid \
+  "$PREFIX/bin/turma-agent" >"$WORK/run11.log" 2>&1 &
+if wait_for file_has_content "$WORK/manager.log"; then
+  ok "started with the override despite a live manager"
+else
+  fail "the override did not start a manager: $(cat "$WORK/run11.log")"
+fi
 pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
 pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
 
