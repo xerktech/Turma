@@ -1005,7 +1005,7 @@ describe("App", () => {
       await toKillConfirm(app);
 
       await vi.advanceTimersByTimeAsync(0); // flush the rejection
-      expect(app.getState().flash).toBe("✗ that host is offline");
+      expect(app.getState().flash).toBe("x that host is offline");
       expect(display.lines.some((l) => l.includes("that host is offline"))).toBe(true);
     });
 
@@ -1027,7 +1027,7 @@ describe("App", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(client.spawnSession).toHaveBeenCalled();
       expect(app.getState().screen).toBe("home");
-      expect(app.getState().flash).toBe("✗ too many queued commands");
+      expect(app.getState().flash).toBe("x too many queued commands");
     });
 
     it("a transport failure still reads 'hub unreachable' — nothing answered", async () => {
@@ -1058,7 +1058,7 @@ describe("App", () => {
       await vi.advanceTimersByTimeAsync(0);
 
       expect(app.getState().loadingHistory["s1"]).toBe(false);
-      expect(app.getState().flash).toBe("✗ that host is offline");
+      expect(app.getState().flash).toBe("x that host is offline");
     });
 
     it("a REFUSED poll says so instead of blaming the network", async () => {
@@ -1070,7 +1070,7 @@ describe("App", () => {
       await vi.advanceTimersByTimeAsync(0);
 
       expect(app.getState().pollErrorActive).toBe(true);
-      expect(app.getState().flash).toBe("✗ the hub answered HTTP 401");
+      expect(app.getState().flash).toBe("x the hub answered HTTP 401");
     });
   });
 
@@ -1639,7 +1639,7 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       // surfaces the reason once rather than reconnecting forever in silence.
       liveTail.deliverRefused("wrong hub password");
       expect(app.getState().liveRefusal).toEqual({ sessionId: "s1", message: "wrong hub password" });
-      expect(display.lines.some((l) => l.includes("✗ wrong hub password"))).toBe(true);
+      expect(display.lines.some((l) => l.includes("x wrong hub password"))).toBe(true);
 
       display.emit({ type: "doubleTap" }); // session -> home
       expect(app.getState().liveRefusal).toBe(null);

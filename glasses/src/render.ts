@@ -370,7 +370,7 @@ export function boxLineCount(bottom: BottomModel): number {
 // could scroll a line or two past what's actually visible.
 function sessionRefusalLines(state: AppState, sess: SessionScreenState): string[] {
   const refusal = state.liveRefusal?.sessionId === sess.sessionId ? state.liveRefusal.message : null;
-  return refusal ? wrap(`✗ ${refusal}`) : [];
+  return refusal ? wrap(`x ${refusal}`) : [];
 }
 
 // The transcript's visible line-count for a given session — the bottom box
@@ -405,7 +405,7 @@ function renderSession(state: AppState): ScreenModel {
 
   const bottom = renderSessionBottom(state, sess);
   const content = sessionContentLines(state, sess.hostKey, sess.sessionId);
-  // An active flash (e.g. "✓ queued" after Send/restart/kill) has nowhere
+  // An active flash (e.g. "√ queued" after Send/restart/kill) has nowhere
   // else to render on this screen — Task 2 dropped the session header this
   // and every other screen's headerLine used to carry it. Surface it as a
   // transient top line of the transcript instead (only while it's live),
