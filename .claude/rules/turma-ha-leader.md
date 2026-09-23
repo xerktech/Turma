@@ -65,11 +65,17 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   (`PROOF_MAX_AGE_MS`, 30s either way), another method/target, or a nonce this replica already
   accepted = ignored like a forged one. A list-only mac let one captured pair be replayed forever.
   - Verified ONCE per request (`hopCache`): `decide()` re-runs every hold poll — never a "replay".
-  - Only a NON-serving replica verifies (`decide` returns local first), so the seen-nonce map stays
-    tiny; it is bounded anyway.
-  - **The MINTER records its own nonce** (`hopHeaders` → `rememberProof`). The one replica a replay
-    bites is the one that minted it (its id is in the list: hold, then DEGRADED), and it never
-    receives the original to record. Without this, every captured beat = one forced local write.
+  - Only a NON-serving replica verifies (`decide` returns local first), and filling it takes the key,
+    so the seen-nonce map stays tiny. Full of FRESH nonces it fails CLOSED (refuses), never evicts.
+  - **A proof whose LAST hop is this replica is ignored** — its own mint coming back. That is the one
+    replica a replay bites (its id is in the list: hold, then DEGRADED), and it never receives the
+    original to record. Keep it STATELESS: a minted-nonce cache was evicted by a ~10k-request flood
+    in 4s (QA), reopening the replay.
+  - **Except a SELF-DIAL** (`isSelfLoop`): a leader entry naming an alias of our address
+    (`localhost` vs `127.0.0.1` — `isOwnAddr` is string equality) makes us dial ourselves; that
+    request arrives on a socket whose peer is one of OUR upstream dials (`ownDials`, the TCP
+    4-tuple — unforgeable by a client) and keeps its list, so the hop guard holds it. Dropped, it
+    re-forwarded to itself until MAX_CONNECTIONS (QA: 502 on every request).
   - The mac cannot cover the body (it streams), so a pair replayed within 30s onto a THIRD replica
     that never saw it, same method + target, is honoured once there. That bites only while that
     replica believes the minter leads (a transient disagreement): one held-then-DEGRADED request.
@@ -108,8 +114,8 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
     `UPLOAD_MAX_BYTES`, the ceiling over every host's own cap.
   - Only past the auth gate the leader runs BEFORE reading (`agentPresentedRefusal`,
     `userAuthorized`, `agentHostRefusal`): a credential-less body stays the leader's 401, unread.
-  - A refusal whose client sends nothing for `drainIdleMs` (10s) is cut — else 8 slow-loris sockets
-    held every slot and switched the local refusal off.
+  - A refusal making less than `drainMinProgress` (64 KiB) per `drainIdleMs` (10s) is cut — else 8
+    slow-loris sockets (silent OR a 1-byte trickle) held every slot and switched it off.
   - Only routes whose 413 is STATELESS: heartbeat, both uploads, raw archive. NOT the archive chunk
     or migration blob (the leader RECORDS those refusals), NOT default-`BODY_MAX` routes (not every
     POST reads its body). Those, chunked bodies and anything past `drainMax` concurrent refusals keep
