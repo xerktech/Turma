@@ -139,14 +139,18 @@ function makeForwarder(store, replicaId, deps = {}) {
     // (leader) => void: a FRESH REMOTE leader was learned (appeared or changed). The
     // caller drops sockets it served while degraded (its local agent tunnels).
     onRemoteLeader = () => {},
-    // (req) => bytes: the largest body the LEADER could accept on this request's route,
-    // or 0 = unknown / not one to refuse here (XERK-936, server.js `forwardBodyCap`).
-    // A follower refuses a body DECLARED past that plus `drainSlack` itself — the band
-    // the leader answers 413 and then resets in, where the reset raced the relayed 413
-    // into a 502. Must never be BELOW the leader's real cap (that refuses a body the
-    // leader would take); an over-estimate only leaves a body to the old path.
-    bodyCap = () => 0,
-    drainSlack = 4 << 20, // server.js RAW_BODY_DRAIN_SLACK: where the leader cuts
+    // (req) => string: which capped route this request is on (a key of `bodyCaps`), or
+    // "" = not one to refuse here (XERK-936, server.js `forwardBodyRoute`). A follower
+    // refuses a body DECLARED past the LEADER's cap for that route plus the leader's
+    // `drainSlack` itself — the band the leader answers 413 and then resets in, where the
+    // reset raced the relayed 413 into a 502.
+    bodyRoute = () => "",
+    // {route: bytes}: THIS replica's caps, published beside its endpoint while it leads
+    // (XERK-939). A follower judges against the leader's published numbers ALONE, never
+    // its own: mid-rollout (a changed memory limit) the two differ, and a follower's
+    // smaller cap would cut a body the leader takes.
+    bodyCaps = {},
+    drainSlack = 4 << 20, // server.js RAW_BODY_DRAIN_SLACK: where the leader cuts (published too)
     drainMax = 8, // concurrent local refusals (DRAIN_CONCURRENCY_MAX); past it, forward
     // A refusal whose client sends NOTHING for this long is cut and frees its slot, so
     // a slow-loris cannot hold every slot and switch the local refusal off.
@@ -154,10 +158,12 @@ function makeForwarder(store, replicaId, deps = {}) {
   } = deps;
   const canServe = deps.canServe || isLeader;
 
-  // Hot mirror of the leader endpoint: {replica, addr, seenAt}. `seenAt` is THIS
+  // Hot mirror of the leader endpoint: {replica, addr, seenAt, caps, slack}. `seenAt` is THIS
   // replica's clock at receipt (a watch event), so freshness never depends on two
   // pods' clocks agreeing — except the one boot-time hydrate, which can only use
-  // the writer's `at`. `addr` null = a leader with no dialable address.
+  // the writer's `at`. `addr` null = a leader with no dialable address. `caps` (a
+  // Map route -> bytes) / `slack` are the leader's body caps, null when it published
+  // none (an older leader) — then nothing is refused here.
   let leader = null;
   const unreachableUntil = new Map(); // addr -> time before which we do not dial it
   const lastDialOk = new Map(); // addr -> when a dial to it last SUCCEEDED
@@ -364,18 +370,24 @@ function makeForwarder(store, replicaId, deps = {}) {
     }
   }
 
-  // The cap to refuse this request against HERE, or 0 to forward it as usual. Only a
-  // body DECLARED past the leader's cap + drain slack (the leader would cut it) on a
-  // request this replica would not serve itself — the leader / HA-off path is untouched.
+  // The {cap, slack} to refuse this request against HERE, or null to forward it as
+  // usual. Only a body DECLARED past the LEADER's published cap + slack (the leader
+  // would cut it) on a request this replica would not serve itself — the leader /
+  // HA-off path is untouched. The leader's numbers alone (XERK-939): with none, or
+  // none FRESH (an older leader, a stale entry while the store link is down), the
+  // body is forwarded — never judged against this replica's own, possibly smaller, cap.
   function oversizeCap(req) {
-    if (!enabled) return 0;
+    if (!enabled) return null;
     const declared = Number(req.headers && req.headers["content-length"]);
-    if (!Number.isFinite(declared)) return 0; // chunked: nothing to judge up front
-    let cap = 0;
-    try { cap = Number(bodyCap(req)) || 0; } catch { return 0; }
-    if (!(cap > 0) || !(declared > cap + drainSlack)) return 0;
-    if (decide(req).local || refusing >= drainMax) return 0;
-    return cap;
+    if (!Number.isFinite(declared)) return null; // chunked: nothing to judge up front
+    let route = "";
+    try { route = String(bodyRoute(req) || ""); } catch { return null; }
+    const e = leader;
+    if (!route || !e || !e.caps || e.replica === replicaId || !(now() - e.seenAt < ttlMs)) return null;
+    const cap = e.caps.get(route) || 0;
+    if (!(cap > 0) || !(declared > cap + e.slack)) return null;
+    if (decide(req).local || refusing >= drainMax) return null;
+    return { cap, slack: e.slack };
   }
 
   // Refuse a declared-oversize body on THIS replica, exactly as the leader would
@@ -384,7 +396,7 @@ function makeForwarder(store, replicaId, deps = {}) {
   // reading (python urllib: the agent) must be nearly done writing when the status
   // goes out, or it sees only the reset. Stateless, so safe on a follower; it never
   // dials the leader, so the leader's reset can no longer turn the 413 into a 502.
-  function refuseOversize(req, res, cap) {
+  function refuseOversize(req, res, { cap, slack }) {
     stats.refusedOversize += 1;
     refusing += 1;
     let len = 0;
@@ -414,7 +426,7 @@ function makeForwarder(store, replicaId, deps = {}) {
       const kill = () => { try { req.socket.destroy(); } catch { /* gone */ } };
       if (res.writableFinished) kill(); else res.once("finish", kill);
     };
-    const onData = (c) => { len += c.length; if (len > cap + drainSlack) answer(true); else armIdle(); };
+    const onData = (c) => { len += c.length; if (len > cap + slack) answer(true); else armIdle(); };
     armIdle();
     req.on("data", onData);
     req.once("end", () => answer(false));
@@ -427,8 +439,8 @@ function makeForwarder(store, replicaId, deps = {}) {
   // refused as oversize, or the client left while held), false when the caller
   // should serve it locally. Never throws, never rejects.
   async function forwardRequest(req, res) {
-    const cap = oversizeCap(req);
-    if (cap) { refuseOversize(req, res, cap); return true; }
+    const over = oversizeCap(req);
+    if (over) { refuseOversize(req, res, over); return true; }
     const r = await route(req, () => res.destroyed || res.writableEnded);
     if (!r) return false;
     if (r.gone) return true;
@@ -565,8 +577,10 @@ function makeForwarder(store, replicaId, deps = {}) {
   function publish() {
     if (!enabled || !store || !isLeader()) return;
     const at = now();
-    leader = { replica: replicaId, addr: endpoint, seenAt: at };
-    Promise.resolve(store.set(LEADER_ENDPOINT_KEY, { replica: replicaId, addr: endpoint, at }, { ttlMs }))
+    leader = { replica: replicaId, addr: endpoint, seenAt: at, caps: null, slack: 0 };
+    // Our body caps ride the entry, so a follower refuses against OUR numbers (XERK-939).
+    const entry = { replica: replicaId, addr: endpoint, at, bodyCaps, drainSlack };
+    Promise.resolve(store.set(LEADER_ENDPOINT_KEY, entry, { ttlMs }))
       .catch(storeFailed);
   }
 
@@ -584,11 +598,23 @@ function makeForwarder(store, replicaId, deps = {}) {
     }
   }
 
+  // The body caps a leader entry carries, validated: {caps: Map, slack}, or caps null
+  // when it carries none usable (an older leader, or a malformed entry) — which only
+  // switches the follower-side refusal off, so a bad value can never make one refuse.
+  function publishedCaps(v) {
+    const none = { caps: null, slack: 0 };
+    const c = v.bodyCaps;
+    if (!Number.isSafeInteger(v.drainSlack) || v.drainSlack < 0 || !c || typeof c !== "object" || Array.isArray(c)) return none;
+    const caps = new Map();
+    for (const [k, n] of Object.entries(c)) if (Number.isSafeInteger(n) && n > 0) caps.set(k, n);
+    return caps.size ? { caps, slack: v.drainSlack } : none;
+  }
+
   function apply(v, seenAt) {
     if (!v || typeof v !== "object" || typeof v.replica !== "string" || typeof v.at !== "number") return;
     if (v.addr !== null && (typeof v.addr !== "string" || !splitAddr(v.addr))) return;
     const changed = !leader || leader.replica !== v.replica || leader.addr !== v.addr;
-    leader = { replica: v.replica, addr: v.addr, seenAt };
+    leader = { replica: v.replica, addr: v.addr, seenAt, ...publishedCaps(v) };
     if (changed && v.replica !== replicaId) {
       unreachableUntil.delete(v.addr); // a NEW leader gets a fresh chance at once
       log(`forward: leader endpoint is ${v.addr || "UNDIALABLE"} (replica ${v.replica})` +

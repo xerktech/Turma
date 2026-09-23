@@ -29,11 +29,12 @@ function listen(server) {
 }
 
 // A follower whose store already names a leader at `addr`.
-async function follower(addr, opts = {}) {
+// `pub` = extra fields on the leader's published entry (its body caps, XERK-939).
+async function follower(addr, opts = {}, pub = {}) {
   const store = new FileLiveStore();
   const f = makeForwarder(store, "me", { isLeader: () => false, ttlMs: 60000, holdMs: 300, holdPollMs: 10, ...opts });
   await f.start();
-  if (addr !== undefined) await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr, at: Date.now() });
+  if (addr !== undefined) await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr, at: Date.now(), ...pub });
   return { f, store };
 }
 
@@ -675,8 +676,8 @@ function postLikeUrllib(port, path, size) {
 test("XERK-936: a follower refuses a body DECLARED past cap + slack itself — 413, the leader never dialed", async () => {
   const { leader, seen, port: lport } = await countingLeader();
   const { f } = await follower(`127.0.0.1:${lport}`, {
-    bodyCap: (rq) => (rq.url === "/api/heartbeat" ? 1000 : 0), drainSlack: 64 << 10,
-  });
+    bodyRoute: (rq) => (rq.url === "/api/heartbeat" ? "hb" : ""),
+  }, { bodyCaps: { hb: 1000 }, drainSlack: 64 << 10 });
   const { srv, port } = await followerServer(f);
   // Far past the cut, like QA's 37 MiB beat: urllib-style, never reads before writing.
   const line = await postLikeUrllib(port, "/api/heartbeat", 20 * 1024 * 1024);
@@ -694,7 +695,7 @@ test("XERK-936: a follower refuses a body DECLARED past cap + slack itself — 4
 
 test("XERK-936: the 413 body matches the leader's generic refusal and the connection closes", async () => {
   const { leader, port: lport } = await countingLeader();
-  const { f } = await follower(`127.0.0.1:${lport}`, { bodyCap: () => 1000, drainSlack: 4000 });
+  const { f } = await follower(`127.0.0.1:${lport}`, { bodyRoute: () => "hb" }, { bodyCaps: { hb: 1000 }, drainSlack: 4000 });
   const { srv, port } = await followerServer(f);
   const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 6000 }, body: Buffer.alloc(6000) })
     .catch((e) => ({ status: "err:" + e.code }));
@@ -706,7 +707,7 @@ test("XERK-936: the 413 body matches the leader's generic refusal and the connec
 
 test("XERK-936: the leader (and HA off) never refuses in the forwarder — its own handler answers", async () => {
   for (const opts of [{ isLeader: () => true }, { enabled: false }]) {
-    const f = makeForwarder(new FileLiveStore(), "me", { bodyCap: () => 10, drainSlack: 10, ...opts });
+    const f = makeForwarder(new FileLiveStore(), "me", { bodyRoute: () => "hb", bodyCaps: { hb: 10 }, drainSlack: 10, ...opts });
     await f.start();
     const { srv, port } = await followerServer(f);
     const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) });
@@ -718,7 +719,7 @@ test("XERK-936: the leader (and HA off) never refuses in the forwarder — its o
 
 test("XERK-936: past drainMax concurrent refusals a follower forwards as before; a slot frees on close", async () => {
   const { leader, seen, port: lport } = await countingLeader();
-  const { f } = await follower(`127.0.0.1:${lport}`, { bodyCap: () => 100, drainSlack: 100, drainMax: 1 });
+  const { f } = await follower(`127.0.0.1:${lport}`, { bodyRoute: () => "hb", drainMax: 1 }, { bodyCaps: { hb: 100 }, drainSlack: 100 });
   const { srv, port } = await followerServer(f);
   // Hold one refusal open: declared huge, only a trickle sent.
   const hog = net.connect(port, "127.0.0.1");
@@ -738,31 +739,132 @@ test("XERK-936: past drainMax concurrent refusals a follower forwards as before;
   srv.close(); leader.close(); f.close();
 });
 
-test("XERK-936: server.js forwardBodyCap names each stateless-413 route's OWN cap, and 0 elsewhere", () => {
+test("XERK-936: server.js forwardBodyRoute names each stateless-413 route, forwardBodyCaps its OWN cap", () => {
   const hub = require("../server.js");
-  const cap = (method, url) => hub.forwardBodyCap({ method, url });
-  assert.equal(cap("POST", "/api/heartbeat"), hub.HEARTBEAT_MAX);
-  assert.equal(cap("POST", "/api/heartbeat?x=1"), hub.HEARTBEAT_MAX);
-  assert.equal(cap("POST", "/api/agents/h/uploads?name=a"), hub.UPLOAD_MAX_BYTES);
-  assert.equal(cap("POST", "/api/agents/h/sessions/s/uploads"), hub.UPLOAD_MAX_BYTES);
-  assert.equal(cap("POST", "/api/agents/h/archive/t/raw/f"), hub.ARCHIVE_RAW_BODY_MAX);
+  const route = (method, url) => hub.forwardBodyRoute({ method, url });
+  assert.deepEqual(hub.forwardBodyCaps(),
+    { heartbeat: hub.HEARTBEAT_MAX, upload: hub.UPLOAD_MAX_BYTES, archiveRaw: hub.ARCHIVE_RAW_BODY_MAX });
+  assert.equal(route("POST", "/api/heartbeat"), "heartbeat");
+  assert.equal(route("POST", "/api/heartbeat?x=1"), "heartbeat");
+  assert.equal(route("POST", "/api/agents/h/uploads?name=a"), "upload");
+  assert.equal(route("POST", "/api/agents/h/sessions/s/uploads"), "upload");
+  assert.equal(route("POST", "/api/agents/h/archive/t/raw/f"), "archiveRaw");
   // The leader RECORDS these refusals, so a follower must not answer them alone.
-  assert.equal(cap("POST", "/api/agents/h/archive/t"), 0);
-  assert.equal(cap("POST", "/api/agents/h/migrations/m/blob"), 0);
-  assert.equal(cap("GET", "/api/heartbeat"), 0);
-  assert.equal(cap("POST", "/api/agents/h/sessions/s/input"), 0);
-  assert.equal(cap("POST", "//["), 0, "an unparseable target never throws");
+  assert.equal(route("POST", "/api/agents/h/archive/t"), "");
+  assert.equal(route("POST", "/api/agents/h/migrations/m/blob"), "");
+  assert.equal(route("GET", "/api/heartbeat"), "");
+  assert.equal(route("POST", "/api/agents/h/sessions/s/input"), "");
+  assert.equal(route("POST", "//["), "", "an unparseable target never throws");
   // Drift pin: the routes still read with exactly those caps (and the upload cap is
-  // still bounded by UPLOAD_MAX_BYTES), so the follower's number is the leader's.
+  // still bounded by UPLOAD_MAX_BYTES), so the published number is the leader's.
   const src = require("node:fs").readFileSync(require.resolve("../server.js"), "utf8");
   assert.match(src, /readBody\(req, HEARTBEAT_MAX, /);
   assert.match(src, /readRawBody\(req, ARCHIVE_RAW_BODY_MAX\)/);
   assert.match(src, /return Math\.min\(reported, UPLOAD_MAX_BYTES\)/);
-  assert.match(src, /bodyCap: forwardBodyCap,\s+drainSlack: RAW_BODY_DRAIN_SLACK,/);
+  assert.match(src, /bodyRoute: forwardBodyRoute,\s+bodyCaps: forwardBodyCaps\(\),\s+drainSlack: RAW_BODY_DRAIN_SLACK,/);
   // ...and only past the auth gate the leader runs BEFORE reading the body (QA L1).
-  assert.match(src, /agentPresentedRefusal\(req\) \? 0 : HEARTBEAT_MAX/);
-  assert.match(src, /userAuthorized\(req\) \? UPLOAD_MAX_BYTES : 0/);
-  assert.match(src, /agentHostRefusal\(req, claimed\) \? 0 : ARCHIVE_RAW_BODY_MAX/);
+  assert.match(src, /agentPresentedRefusal\(req\) \? "" : "heartbeat"/);
+  assert.match(src, /userAuthorized\(req\) \? "upload" : ""/);
+  assert.match(src, /agentHostRefusal\(req, claimed\) \? "" : "archiveRaw"/);
+});
+
+// ---- XERK-939: the follower judges against the LEADER's published caps ----------
+
+test("XERK-939: a follower whose OWN cap is smaller forwards what the leader's published cap takes", async () => {
+  const { leader, seen, port: lport } = await countingLeader();
+  // The ticket's rollout: the follower at 8 KiB-ish, the leader publishing 32x that.
+  const { f } = await follower(`127.0.0.1:${lport}`,
+    { bodyRoute: () => "hb", bodyCaps: { hb: 1000 }, drainSlack: 100 },
+    { bodyCaps: { hb: 32000 }, drainSlack: 100 });
+  const { srv, port } = await followerServer(f);
+  const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 20000 }, body: Buffer.alloc(20000) });
+  assert.equal(r.body, "leader", "within the leader's cap: forwarded, never cut here");
+  assert.deepEqual(seen, [{ url: "/api/heartbeat", bytes: 20000 }]);
+  assert.equal(f.stats.refusedOversize, 0);
+  // Past the LEADER's cap + slack it is still refused here, at the leader's number.
+  const big = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 40000 }, body: Buffer.alloc(40000) })
+    .catch((e) => ({ status: "err:" + e.code }));
+  assert.equal(big.status, 413, `got ${big.status}`);
+  assert.deepEqual(JSON.parse(big.body), { error: "body too large", limit: 32000 });
+  assert.equal(seen.length, 1);
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-939: a follower whose own cap is LARGER refuses at the leader's published cap + slack", async () => {
+  const { leader, seen, port: lport } = await countingLeader();
+  const { f } = await follower(`127.0.0.1:${lport}`,
+    { bodyRoute: () => "hb", bodyCaps: { hb: 1 << 30 }, drainSlack: 1 << 30 },
+    { bodyCaps: { hb: 1000 }, drainSlack: 500 });
+  const { srv, port } = await followerServer(f);
+  const inside = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 1400 }, body: Buffer.alloc(1400) });
+  assert.equal(inside.body, "leader", "inside the LEADER's slack: its to answer");
+  const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 1600 }, body: Buffer.alloc(1600) })
+    .catch((e) => ({ status: "err:" + e.code }));
+  assert.equal(r.status, 413, `past the leader's 1000 + 500: got ${r.status}`);
+  assert.equal(seen.length, 1);
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-939: no usable published caps (older leader, malformed, unknown route) -> forwarded, never refused here", async () => {
+  const pubs = [
+    {}, // an older leader: no caps at all
+    { bodyCaps: { hb: 100 } }, // no slack
+    { bodyCaps: { hb: 100 }, drainSlack: -1 },
+    { bodyCaps: { hb: 100 }, drainSlack: "10" },
+    { bodyCaps: { hb: "100" }, drainSlack: 10 },
+    { bodyCaps: { hb: 0 }, drainSlack: 10 },
+    { bodyCaps: { hb: 1.5 }, drainSlack: 10 },
+    { bodyCaps: [100], drainSlack: 10 },
+    { bodyCaps: { other: 100 }, drainSlack: 10 }, // the leader caps a different route
+    { bodyCaps: JSON.parse('{"__proto__": 100}'), drainSlack: 10 },
+  ];
+  for (const pub of pubs) {
+    const { leader, seen, port: lport } = await countingLeader();
+    const { f } = await follower(`127.0.0.1:${lport}`, { bodyRoute: () => "hb", bodyCaps: { hb: 100 }, drainSlack: 10 }, pub);
+    const { srv, port } = await followerServer(f);
+    const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) });
+    assert.equal(r.body, "leader", `forwarded for ${JSON.stringify(pub)}`);
+    assert.equal(seen.length, 1);
+    assert.equal(f.stats.refusedOversize, 0);
+    srv.close(); leader.close(); f.close();
+  }
+});
+
+test("XERK-939: a STALE leader entry (store link down, still forwarded to) is not judged — forwarded", async () => {
+  const { leader, seen, port: lport } = await countingLeader();
+  let healthy = true;
+  const { f } = await follower(`127.0.0.1:${lport}`,
+    { bodyRoute: () => "hb", ttlMs: 100, storeHealthy: () => healthy },
+    { bodyCaps: { hb: 100 }, drainSlack: 10 });
+  const { srv, port } = await followerServer(f);
+  healthy = false;
+  await sleep(150); // the entry ages past ttlMs; decide() still forwards (store down)
+  assert.ok(f.decide(req("/api/heartbeat")).forward, "still forwarding to the last known leader");
+  const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) });
+  assert.equal(r.body, "leader");
+  assert.equal(seen.length, 1);
+  assert.equal(f.stats.refusedOversize, 0);
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-939: the leader publishes its caps + slack; a follower on the same store refuses by THEM", async () => {
+  const { leader: up, seen, port: lport } = await countingLeader();
+  const store = new FileLiveStore();
+  const lead = makeForwarder(store, "L", { isLeader: () => true, endpoint: `127.0.0.1:${lport}`, bodyCaps: { hb: 2000 }, drainSlack: 300 });
+  const fol = makeForwarder(store, "F", { isLeader: () => false, ttlMs: 60000, bodyRoute: () => "hb", bodyCaps: { hb: 10 }, drainSlack: 10 });
+  await fol.start();
+  await lead.start();
+  const v = await store.get(LEADER_ENDPOINT_KEY);
+  assert.deepEqual({ bodyCaps: v.bodyCaps, drainSlack: v.drainSlack }, { bodyCaps: { hb: 2000 }, drainSlack: 300 });
+  await sleep(20);
+  const { srv, port } = await followerServer(fol);
+  const ok = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 2200 }, body: Buffer.alloc(2200) });
+  assert.equal(ok.body, "leader");
+  const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 2400 }, body: Buffer.alloc(2400) })
+    .catch((e) => ({ status: "err:" + e.code }));
+  assert.equal(r.status, 413, `got ${r.status}`);
+  assert.equal(seen.length, 1);
+  srv.close(); up.close(); lead.close(); fol.close();
 });
 
 test("XERK-936: a hop proof is bound to its request — another method or target, a stale stamp, or a replay is ignored", async () => {
@@ -840,7 +942,7 @@ test("XERK-936 QA: a pair a follower MINTED is never honoured back on that follo
 
 test("XERK-936 QA: the follower cuts a refused body at cap + slack exactly — never drains without bound", async () => {
   const { leader, port: lport } = await countingLeader();
-  const { f } = await follower(`127.0.0.1:${lport}`, { bodyCap: () => 1000, drainSlack: 4000 });
+  const { f } = await follower(`127.0.0.1:${lport}`, { bodyRoute: () => "hb" }, { bodyCaps: { hb: 1000 }, drainSlack: 4000 });
   const { srv, port } = await followerServer(f);
   let read = 0;
   srv.on("request", (rq) => rq.on("data", (c) => { read += c.length; }));
@@ -862,7 +964,7 @@ test("XERK-936 QA: the follower cuts a refused body at cap + slack exactly — n
 
 test("XERK-936 QA: exactly cap + slack declared is still the leader's; one byte more is refused here", async () => {
   const { leader, seen, port: lport } = await countingLeader();
-  const { f } = await follower(`127.0.0.1:${lport}`, { bodyCap: () => 1000, drainSlack: 4000 });
+  const { f } = await follower(`127.0.0.1:${lport}`, { bodyRoute: () => "hb" }, { bodyCaps: { hb: 1000 }, drainSlack: 4000 });
   const { srv, port } = await followerServer(f);
   const at = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 5000 }, body: Buffer.alloc(5000) });
   assert.equal(at.body, "leader");
@@ -875,7 +977,7 @@ test("XERK-936 QA: exactly cap + slack declared is still the leader's; one byte 
 
 test("XERK-936 QA: a refusal whose client goes silent is cut after drainIdleMs and frees its slot", async () => {
   const { leader, port: lport } = await countingLeader();
-  const { f } = await follower(`127.0.0.1:${lport}`, { bodyCap: () => 100, drainSlack: 100, drainMax: 1, drainIdleMs: 80 });
+  const { f } = await follower(`127.0.0.1:${lport}`, { bodyRoute: () => "hb", drainMax: 1, drainIdleMs: 80 }, { bodyCaps: { hb: 100 }, drainSlack: 100 });
   const { srv, port } = await followerServer(f);
   const hog = net.connect(port, "127.0.0.1");
   hog.on("error", () => {});
