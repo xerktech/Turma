@@ -29,10 +29,15 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   systemd/turma-agentctl entry point (can't be rejected like an unknown arg, XERK-937), but a HAND
   run would reap the live tunnel and exec a SECOND hub-agent.py — two managers beating as one host,
   and `turma-agentctl restart` (pidfile-scoped) can't reap the stray. Safe against real restarts:
-  every restart path reaps the old manager BEFORE ExecStart — systemd's stop job waits for the main
-  process (`Type=exec`/`KillMode=process`), and **`turma-agentctl restart` now waits too** (its old
-  wait loop read the pidfile AFTER `kill_manager` removed it → a no-op). Tests: `test_turma_agent.sh`,
-  `test_turma_agentctl.sh`.
+  every restart path reaps the old manager BEFORE ExecStart — systemd's stop job waits the full
+  `TimeoutStopSec` for the main process (`Type=exec`/`KillMode=process`), and **`turma-agentctl`'s
+  `kill_manager` now waits for the manager to EXIT then SIGKILLs (grace `TURMA_MANAGER_STOP_WAIT`,
+  default 15s)** before `start`. A fixed SHORT wait was a regression: the manager's SIGTERM handler
+  can block a few seconds on the hub announce (`UPDATING_ANNOUNCE_TIMEOUT_SEC`, 4s), so the new
+  launcher saw the still-dying old manager, the guard refused, and the host went DARK (zero managers,
+  no self-heal on non-systemd). The `--enroll` probe shares the pgrep path, so a CONCURRENT enroll can
+  spuriously refuse a start — rare, and fails loud (retryable), never dark. Tests:
+  `test_turma_agent.sh`, `test_turma_agentctl.sh`.
 - Launcher exports `TURMA_MANAGER_PID=$$` so the tunnel's `pokeHeartbeat` signals the right process.
 - `install.sh` — idempotent (`--verify`/`--uninstall`): apt + npm + pinned static ttyd + pinned
   static glab (best-effort; a session's MR gets no chip without it), lays files keeping

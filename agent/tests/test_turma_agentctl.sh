@@ -26,7 +26,9 @@ FAILED=0
 # shellcheck disable=SC2329  # invoked indirectly, via the EXIT trap below.
 cleanup() {
   # Reap any stub manager/updater the tests left running, by their fixture path.
+  # A SIGTERM first, then SIGKILL — one case runs a manager that IGNORES SIGTERM.
   pkill -f "$WORK/prefix/bin/turma-agent" 2>/dev/null || true
+  pkill -9 -f "$WORK/prefix/bin/turma-agent" 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -159,6 +161,54 @@ else
   fail "no fresh manager after restart (new='$NEWPID' old='$OLDPID')"
 fi
 HOME="$HOME_DIR" XDG_RUNTIME_DIR="$RUN" "$CTL" stop >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# Case 5 (XERK-938): restart FORCE-KILLS a manager that outlives the grace
+# period, so it never leaves the host with ZERO managers. The regression this
+# pins: the real manager's SIGTERM handler can block a few seconds on the hub
+# announce, so a fixed short wait let start() re-run the launcher while the old
+# manager was still dying — the XERK-938 duplicate-manager guard then refused,
+# and the host went dark. kill_manager must escalate to SIGKILL and only return
+# once the old manager is gone.
+# ---------------------------------------------------------------------------
+echo "case: restart SIGKILLs a slow-to-die manager and leaves exactly one"
+new_home slowkill
+RUN="$WORK/run-slowkill"; mkdir -p "$RUN"
+# The extreme of a slow shutdown: a manager that IGNORES SIGTERM outright, so
+# only SIGKILL can stop it. Does not `exec`, so `trap` survives.
+cat > "$PREFIX/bin/turma-agent" <<'STUB'
+#!/bin/sh
+trap '' TERM
+while :; do sleep 1; done
+STUB
+chmod +x "$PREFIX/bin/turma-agent"
+HOME="$HOME_DIR" XDG_RUNTIME_DIR="$RUN" "$CTL" start >/dev/null 2>&1 || true
+OLDPID="$(cat "$RUN/turma-agent.pid" 2>/dev/null || true)"
+if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+  ok "slow manager running before restart (pid $OLDPID)"
+else
+  fail "slow manager not running before restart"
+fi
+# A 1s grace keeps the SIGKILL escalation quick; the manager ignores SIGTERM.
+HOME="$HOME_DIR" XDG_RUNTIME_DIR="$RUN" TURMA_MANAGER_STOP_WAIT=1 \
+  "$CTL" restart >/dev/null 2>&1 || true
+NEWPID="$(cat "$RUN/turma-agent.pid" 2>/dev/null || true)"
+if [ -n "$OLDPID" ] && ! kill -0 "$OLDPID" 2>/dev/null; then
+  ok "old manager was force-killed (SIGTERM ignored, SIGKILL landed)"
+else
+  fail "old manager survived restart — a stray would double-heartbeat / trip the guard"
+fi
+# The property the regression broke: exactly one manager after restart, NEVER
+# zero. A dark host is the failure QA caught.
+if [ -n "$NEWPID" ] && [ "$NEWPID" != "$OLDPID" ] && kill -0 "$NEWPID" 2>/dev/null; then
+  ok "exactly one fresh manager after restart (pid $NEWPID) — host is not dark"
+else
+  fail "no fresh manager after restart (new='$NEWPID' old='$OLDPID') — HOST WOULD BE DARK"
+fi
+# The fresh manager is the slow stub too; force it down so nothing leaks.
+HOME="$HOME_DIR" XDG_RUNTIME_DIR="$RUN" TURMA_MANAGER_STOP_WAIT=0 \
+  "$CTL" stop >/dev/null 2>&1 || true
+[ -n "$NEWPID" ] && kill -9 "$NEWPID" 2>/dev/null || true
 
 if [ "$FAILED" -eq 0 ]; then
   echo "all turma-agentctl tests passed"

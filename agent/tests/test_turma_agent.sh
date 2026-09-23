@@ -116,6 +116,19 @@ file_has_content() { [ -s "$1" ]; }
 # the previous case's (SIGTERM'd) stub to actually exit — pkill is asynchronous.
 no_manager() { ! pgrep -f "$PREFIX/hub-agent.py" >/dev/null 2>&1; }
 
+# Tear down every launcher/supervisor/manager from a prior case, then wait for the
+# manager to be gone, before a case that starts a FRESH manager. These cases fire
+# launchers fire-and-forget and don't synchronise teardown, and a prior launcher
+# still mid-startup can exec its manager AFTER a bare `no_manager` check passes —
+# which the XERK-938 guard then refuses. Killing the launcher AND any manager (by
+# both the launcher path and the hub-agent.py argv) closes that window. Not for
+# the reconcile case, which must keep the old tunnel supervisor alive.
+reset_agents() {
+  pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
+  pkill -f "$PREFIX/hub-agent.py" 2>/dev/null || true
+  wait_for no_manager || true
+}
+
 # --- Case 1: the supervisor respawns a tunnel that exits ---------------------
 echo "case: supervisor respawns the tunnel"
 : > "$WORK/tunnel.log"
@@ -169,7 +182,7 @@ pkill -f "$PREFIX/bin/turma-agent --tunnel-supervisor" 2>/dev/null || true
 echo "case: run path exports the manager pid and supervises the tunnel"
 : > "$WORK/tunnel.log"
 rm -f "$WORK/manager.log"
-wait_for no_manager || true
+reset_agents
 PATH="$WORK/stub-bin:$PATH" setsid "$PREFIX/bin/turma-agent" >"$WORK/run.log" 2>&1 &
 if wait_for file_has_content "$WORK/manager.log"; then
   named="$(sed -n 's/named=\([0-9]*\).*/\1/p' "$WORK/manager.log")"
@@ -321,7 +334,7 @@ mkdir -p "$WORK/home/.local/bin"
 printf '#!/bin/sh\nexit 0\n' > "$WORK/home/.local/bin/claude"
 chmod +x "$WORK/home/.local/bin/claude"
 rm -f "$WORK/manager.log"
-wait_for no_manager || true
+reset_agents
 PATH="$WORK/svc-bin" setsid "$PREFIX/bin/turma-agent" >"$WORK/run3.log" 2>&1 &
 if wait_for file_has_content "$WORK/manager.log" && \
    wait_for logged "claude=" "$WORK/manager.log"; then
@@ -349,7 +362,7 @@ pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
 # install later heals with no restart), but the journal names the fault.
 echo "case: missing claude is a loud warning, not a silent failure"
 rm -f "$WORK/home/.local/bin/claude" "$WORK/manager.log"
-wait_for no_manager || true
+reset_agents
 PATH="$WORK/svc-bin" setsid "$PREFIX/bin/turma-agent" >"$WORK/run4.log" 2>&1 &
 if wait_for logged "claude not on PATH" "$WORK/run4.log"; then
   ok "said sessions will fail and how to fix it"
@@ -408,7 +421,7 @@ STUB
 chmod +x "$PREFIX/bin/turma-agent-update"
 : > "$WORK/boot-update.log"
 rm -f "$WORK/manager.log" "$WORK/claude-done"
-wait_for no_manager || true
+reset_agents
 PATH="$WORK/stub-bin:$PATH" setsid "$PREFIX/bin/turma-agent" >"$WORK/run5.log" 2>&1 &
 if wait_for logged "update --boot" "$WORK/boot-update.log"; then
   ok "fired both start checks"
@@ -452,7 +465,7 @@ echo "case: a hung Claude Code check does not hold the boot"
 rm -f "$WORK/manager.log" "$WORK/claude-done"
 # The deadline is held clear of the INSTALL budget and nothing else, so a small
 # budget is how a test gets a small deadline without touching the property.
-wait_for no_manager || true
+reset_agents
 TEST_CLAUDE_CHECK_SLEEP=600 TURMA_CLAUDE_UPDATE_TIMEOUT=8 TURMA_NPM_INSTALL_TIMEOUT=1 \
   PATH="$WORK/stub-bin:$PATH" \
   setsid "$PREFIX/bin/turma-agent" >"$WORK/run7.log" 2>&1 &
@@ -484,7 +497,7 @@ rm -f "$WORK/manager.log" "$WORK/claude-done"
 # replacing the package and npm carries on while the manager launches sessions
 # into it. An operator raising the install budget past the deadline is the shape
 # that matters, and it must not be honoured silently.
-wait_for no_manager || true
+reset_agents
 TURMA_CLAUDE_UPDATE_TIMEOUT=5 TURMA_NPM_INSTALL_TIMEOUT=600 \
   PATH="$WORK/stub-bin:$PATH" setsid \
   "$PREFIX/bin/turma-agent" >"$WORK/run8.log" 2>&1 &
@@ -512,7 +525,7 @@ pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
 echo "case: TURMA_BOOT_UPDATE=0 suppresses both checks"
 : > "$WORK/boot-update.log"
 rm -f "$WORK/manager.log"
-wait_for no_manager || true
+reset_agents
 TURMA_BOOT_UPDATE=0 PATH="$WORK/stub-bin:$PATH" setsid \
   "$PREFIX/bin/turma-agent" >"$WORK/run6.log" 2>&1 &
 if wait_for file_has_content "$WORK/manager.log"; then
@@ -552,7 +565,7 @@ rm -f "$PREFIX/bin/turma-agent-update"
 echo "case: a hand re-run is refused while a manager is already running"
 : > "$WORK/tunnel.log"
 rm -f "$WORK/manager.log"
-wait_for no_manager || true
+reset_agents
 PATH="$WORK/stub-bin:$PATH" setsid "$PREFIX/bin/turma-agent" >"$WORK/run9.log" 2>&1 &
 if ! wait_for file_has_content "$WORK/manager.log"; then
   fail "first manager never started: $(cat "$WORK/run9.log")"

@@ -269,11 +269,16 @@ fi
 # so `pgrep -f` never matches one.
 #
 # pgrep -f matches the full argv; $PREFIX/hub-agent.py is this install's manager
-# and the manager never re-spawns itself, so a match is exactly a live manager.
-# This launcher's own argv is the bash script path, not hub-agent.py, so it never
-# matches itself (the exec is far below). Missing pgrep fails OPEN — the prior
-# behaviour, never worse. TURMA_ALLOW_SECOND_MANAGER=1 opts out for the rare case
-# of deliberately running a second one.
+# and the manager never re-spawns itself, so a match is a live manager — with one
+# rare exception: a CONCURRENT `hub-agent.py --enroll` probe (self-enroll, or
+# `turma-agentctl enroll`) shares the path and could read as a manager. This
+# launcher's OWN enroll (above) is awaited and gone before we get here, so it
+# never trips its own guard; only a second, overlapping enroll would, and it
+# fails LOUD (a printed refusal an operator retries), never dark. This launcher's
+# own argv is the bash script path, not hub-agent.py, so it never matches itself
+# (the exec is far below). Missing pgrep fails OPEN — the prior behaviour, never
+# worse. TURMA_ALLOW_SECOND_MANAGER=1 opts out for the rare case of deliberately
+# running a second one.
 if [ "${TURMA_ALLOW_SECOND_MANAGER:-0}" = 0 ] \
    && command -v pgrep >/dev/null 2>&1 \
    && pgrep -f "$PREFIX/hub-agent.py" >/dev/null 2>&1; then
