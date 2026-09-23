@@ -37,3 +37,9 @@ paths:
 - **`npm run pack` passes `--sdk-ver` = the INSTALLED SDK.** evenhub-cli >= 0.1.14 stamps the .ehpk's
   `min_app_version` from that SDK's npm `minAppVersion`; without the flag it uses the LATEST published
   SDK, so an unrelated SDK release silently raises our floor. Keep `app.json`'s values equal to it.
+- **`vite.config.ts`'s `turma-vendor-cjs-dev` shim is what lets `npm run dev` boot** (XERK-921). The
+  dev server serves `src/vendor/*.cjs` raw (no `default` export), so `engines.ts`'s default import
+  kills the page without it. Vitest runs through it too — a broken shim fails the engine tests.
+- **A resolved `waitForEvenAppBridge()` does NOT mean a host is there** — it resolves in any browser.
+  `main.ts`'s `resolveBridge` also requires `window.flutter_inappwebview.callHandler` (the device
+  WebView or the simulator's shim), else it falls back to the DOM backend at `BRIDGE_TIMEOUT_MS`.
