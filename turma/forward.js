@@ -177,6 +177,7 @@ function makeForwarder(store, replicaId, deps = {}) {
   let draining = false; // set by stop(): this replica is shutting down
   let refusing = 0; // oversize bodies being drained by refuseOversize() right now
   const seenProofs = new Map(); // nonce -> expiry: proofs already accepted (replay guard)
+  const ownDials = new Set(); // "addr|port" of every upstream socket we have open (see isSelfLoop)
   const hopCache = new WeakMap(); // req -> its verified hop list (decide() re-runs per poll)
   let staleLoggedAt = 0;
 
@@ -232,13 +233,25 @@ function makeForwarder(store, replicaId, deps = {}) {
       }
       const hops = v.split(",").map((x) => x.trim()).filter(Boolean);
       // Our OWN proof coming back — the one replica a replay bites (our id is in the
-      // list, so it would hold, then serve DEGRADED). A genuine forward never lands on
-      // its last hop: we only ever dial a leader that is neither our id nor our address,
-      // and a real bounce back here was re-minted by that replica, which appends itself.
+      // list, so it would hold, then serve DEGRADED). The only genuine way here is a
+      // SELF-DIAL (the leader entry names an alias of our address — `localhost` for
+      // 127.0.0.1): that request arrives on a socket WE opened, which no client can
+      // forge, and it must keep its list so the hop guard holds it (ignored, it
+      // re-forwarded to itself until MAX_CONNECTIONS — QA). Anything else is a replay.
       // Stateless on purpose: a minted-nonce cache was evictable by a request flood.
-      if (hops[hops.length - 1] === replicaId) { stats.replayedProofs += 1; return []; }
+      if (hops[hops.length - 1] === replicaId) {
+        if (isSelfLoop(req)) return hops;
+        stats.replayedProofs += 1;
+        return [];
+      }
       if (seenProofs.has(nonce)) { stats.replayedProofs += 1; return []; } // a replay: ignored
       for (const [n, exp] of seenProofs) { if (exp > t) break; seenProofs.delete(n); }
+      // The sweep above stops at the first live entry, and expiries follow each SENDER's
+      // clock, so a skewed one can shelter expired entries behind it: rescan before
+      // refusing, so fail-closed means "full of LIVE nonces", nothing earlier.
+      if (seenProofs.size >= SEEN_PROOFS_MAX) {
+        for (const [n, exp] of seenProofs) if (exp <= t) seenProofs.delete(n);
+      }
       if (seenProofs.size >= SEEN_PROOFS_MAX) { stats.replayedProofs += 1; return []; } // fail closed
       seenProofs.set(nonce, Number(at) + PROOF_MAX_AGE_MS);
       return hops;
@@ -255,6 +268,15 @@ function makeForwarder(store, replicaId, deps = {}) {
     const mac = hopProof(authToken, list, String(req.method || ""), String(req.url || ""), at, nonce);
     return [FORWARDED_HEADER, list, FORWARD_AUTH_HEADER, `${at}.${nonce}.${mac}`];
   }
+  // Did this request arrive on a connection one of OUR upstream dials opened? (the
+  // TCP 4-tuple: its peer is our own socket's local end). `::ffff:` is stripped, since
+  // a dual-stack listener sees an IPv4 dialer in mapped form.
+  const bareAddr = (a) => String(a || "").replace(/^::ffff:/, "");
+  function isSelfLoop(req) {
+    const s = req && req.socket;
+    return !!s && ownDials.has(`${bareAddr(s.remoteAddress)}|${s.remotePort}`);
+  }
+
   // A leader entry naming OUR OWN address under another replica id is a previous
   // incarnation of this pod (a container restart keeps the POD_IP) — never a target.
   function isOwnAddr(addr) {
@@ -329,6 +351,9 @@ function makeForwarder(store, replicaId, deps = {}) {
         // Terminal keystrokes are tiny packets; Nagle would batch them (the same
         // reason tunnel-agent.js disables it on the ttyd side).
         s.setNoDelay(true);
+        const self = `${bareAddr(s.localAddress)}|${s.localPort}`;
+        ownDials.add(self);
+        s.once("close", () => ownDials.delete(self));
         lastDialOk.set(addr, now());
         resolve(s);
       });

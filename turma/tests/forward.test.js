@@ -936,3 +936,26 @@ test("XERK-936 QA2: a refusal that keeps making progress is never cut idle; a 1-
   for (const s of [steady, trickle]) { clearInterval(s.timer); s.destroy(); }
   srv.close(); leader.close(); f.close();
 });
+
+test("XERK-936 QA3: a follower dialing ITSELF through an address alias holds (then serves), never recurses", async () => {
+  // The leader entry names our listener under a string that is not our `endpoint`
+  // (an alias — `localhost` vs 127.0.0.1 in QA): not isOwnAddr, so we dial ourselves.
+  // The looped request arrives on a socket WE opened — its hop list must survive the
+  // own-proof rule so the hop guard holds it.
+  const store = new FileLiveStore();
+  const f = makeForwarder(store, "me", {
+    isLeader: () => false, authToken: "sekret", holdMs: 200, holdPollMs: 10, ttlMs: 60000,
+    endpoint: "10.9.9.9:1",
+  });
+  const { srv, port } = await followerServer(f);
+  await f.start();
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: `127.0.0.1:${port}`, at: Date.now() });
+  let conns = 0;
+  srv.on("connection", () => { conns += 1; });
+  const r = await request(port, { path: "/api/x" });
+  assert.equal(r.status, 299, "the looped request is held, then served locally (DEGRADED) — never a 502");
+  assert.equal(f.stats.requests, 1, "the outer request really was forwarded (to ourselves)");
+  assert.equal(conns, 2, "client + one self-dial: bounded, not a recursion");
+  assert.equal(f.stats.replayedProofs, 0, "a self-loop is not a replay");
+  srv.close(); f.close();
+});

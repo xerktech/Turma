@@ -69,9 +69,13 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
     so the seen-nonce map stays tiny. Full of FRESH nonces it fails CLOSED (refuses), never evicts.
   - **A proof whose LAST hop is this replica is ignored** — its own mint coming back. That is the one
     replica a replay bites (its id is in the list: hold, then DEGRADED), and it never receives the
-    original to record. A genuine forward never lands on its last hop (the leader dialed is never our
-    id or address; a real bounce is re-minted by the replica it passed). Keep it STATELESS: a
-    minted-nonce cache was evicted by a ~10k-request flood in 4s (QA), reopening the replay.
+    original to record. Keep it STATELESS: a minted-nonce cache was evicted by a ~10k-request flood
+    in 4s (QA), reopening the replay.
+  - **Except a SELF-DIAL** (`isSelfLoop`): a leader entry naming an alias of our address
+    (`localhost` vs `127.0.0.1` — `isOwnAddr` is string equality) makes us dial ourselves; that
+    request arrives on a socket whose peer is one of OUR upstream dials (`ownDials`, the TCP
+    4-tuple — unforgeable by a client) and keeps its list, so the hop guard holds it. Dropped, it
+    re-forwarded to itself until MAX_CONNECTIONS (QA: 502 on every request).
   - The mac cannot cover the body (it streams), so a pair replayed within 30s onto a THIRD replica
     that never saw it, same method + target, is honoured once there. That bites only while that
     replica believes the minter leads (a transient disagreement): one held-then-DEGRADED request.
