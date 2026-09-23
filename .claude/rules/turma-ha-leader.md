@@ -83,8 +83,28 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   stops on the answer) so the read usually wins; the agent retries a 502, so it self-heals. Fully
   closing it needs the hub not to reset forwarded bodies — which weakens its runaway-body defence. Tracked: XERK-936
   (with the hop proof binding only the list, not the request — replayable pod-to-pod).
-- **Known two-writer case (XERK-935, pre-existing): an ASYMMETRIC store partition.** A leader whose
-  store link is down cannot publish its endpoint, so a healthy-store follower degrades and serves too.
+- **Asymmetric store partition — a store-less leader STEPS DOWN, a store-less replica REFUSES if the
+  lease is held elsewhere (XERK-935).** A leader whose store link is down cannot publish/refresh its
+  endpoint, so a healthy-store follower used to degrade and serve too (two writers). Two-part fix, one
+  signal — the k8s lease lives in the API, NOT the store, so it stays readable/writable when the store
+  link is down:
+  - **The elector ABSTAINS while it cannot lead** (`canLead` = `storeHealthy`, `turma/leader.js`): a
+    store-less holder drops leadership and BACKDATES the lease (`_abstain`, release-style but the loop
+    keeps running) so a healthy replica promotes within a retry, keeps GETting the lease to observe who
+    takes over and to re-elect on store recovery, and never acquires/renews meanwhile. So a store-less
+    leader stops leading (its sweeps + `canServeLocally` fall with `isLeader()`), and the healthy
+    replica becomes the proper single writer.
+  - **The forwarder REFUSES (503) instead of degrading when `!storeHealthy() && leaseHeldElsewhere()`**
+    (`decide()`): a store-less replica cannot learn the new leader's endpoint (it rides the store), but
+    `leaseHeldByOther()` (off the elector's lease observation) says a healthy replica leads — so refuse
+    and let the client's LB retry reach it, never become a second writer. With NO other lease holder we
+    may be the SOLE SURVIVOR, so the normal hold/degrade path still serves locally (unchanged). Both
+    deps default to always-lead / never-elsewhere, so HA-off and a StandaloneLeader (single-process /
+    ha-no-lease) are byte-identical.
+  - Accepted residual: a brief (~one retry) window between the store-less leader abstaining and the
+    healthy replica acquiring, where the store-less replica may still serve degraded (no other holder
+    yet) — the same "accepted brief split" class as a crashed-leader failover, bounded by the backdated
+    handover, not the permanent double-write it replaces.
 - **The hop proof is compared as BYTES** — a non-ASCII value of the right string length made
   `timingSafeEqual` throw, an unauthenticated crash of any follower via one upgrade (QA). The upgrade
   handler also catches any forwarding fault. With the store down, a leader is "fresh" for the tunnel
@@ -106,7 +126,11 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
 - **The graceful-drain readiness gate is per replica**: SIGTERM flips `hubDraining` → `/readyz` 503.
 - Tests: `turma/tests/forward.test.js` (incl. the `XERK-919 QA:` cases, and a SOURCE pin on the
   drain's release-at-signal wiring, which no TURMA_TEST path reaches); the `XERK-919:` cases in
-  `registry-store.test.js`.
+  `registry-store.test.js`. The `XERK-935:` cases pin the store-partition fix: in `leader.test.js` a
+  store-less leader abstains + backdates so a healthy replica promotes, `leaseHeldByOther()`
+  (holder/other/sole-survivor + wedged-observation staleness), re-lead on recovery, and the
+  always-lead default; in `forward.test.js` the refuse-not-degrade when the lease is held elsewhere,
+  the sole-survivor still serving, and the byte-identical default.
 
 ### Verifying HA for real (the local stack recipe)
 

@@ -281,6 +281,114 @@ test("acquire + renew send valid MicroTime stamps (a millis stamp would 400)", a
   assert.ok(MICROTIME_RE.test(api.lease.spec.renewTime));
 });
 
+// -- XERK-935: a store-less replica must not lead (asymmetric store partition) -----
+
+function leadElector(api, identity, canLead) {
+  return new LeaderElector(
+    { identity, namespace: "turma", leaseName: "turma-hub-leader",
+      leaseDurationMs: 300, renewDeadlineMs: 200, retryPeriodMs: 1000 },
+    { request: api.request, connect: false, canLead }
+  );
+}
+
+test("XERK-935: a leader whose store link is down ABSTAINS so a healthy replica takes over", async () => {
+  const api = fakeK8s();
+  const store = { up: true };
+  const a = leadElector(api, "pod-a", () => store.up);
+  const b = leadElector(api, "pod-b", () => true);
+
+  await a._tick(); // a acquires
+  assert.equal(a.isLeader(), true);
+  const renewBefore = api.lease.spec.renewTime;
+
+  store.up = false; // a's shared-store link goes down
+  await a._tick(); // a abstains: drops leadership AND backdates the lease
+  assert.equal(a.isLeader(), false, "a steps down the moment it cannot be the single writer");
+  assert.notEqual(api.lease.spec.renewTime, renewBefore);
+  assert.ok(
+    Date.parse(api.lease.spec.renewTime) < Date.now() - 300,
+    "the lease is backdated (expired) so a healthy replica promotes within a retry"
+  );
+
+  await b._tick(); // b sees the expired lease and acquires
+  assert.equal(b.isLeader(), true);
+  assert.equal(api.lease.spec.holderIdentity, "pod-b");
+
+  await a._tick(); // a, still store-down, keeps observing and never re-acquires
+  assert.equal(a.isLeader(), false);
+  assert.equal(api.lease.spec.holderIdentity, "pod-b", "a does not steal the lease back while store-down");
+  assert.equal(a.leaseHeldByOther(), true, "a now sees a healthy leader elsewhere (the forwarder's refuse signal)");
+});
+
+test("XERK-935: leaseHeldByOther() is false for the holder and true for another replica", async () => {
+  const api = fakeK8s();
+  const a = elector(api, "pod-a");
+  const b = elector(api, "pod-b");
+  assert.equal(a.leaseHeldByOther(), false, "no observation yet → no known holder");
+  await a._tick(); // a leads
+  assert.equal(a.leaseHeldByOther(), false, "the leader never counts itself");
+  await b._tick(); // b observes a's lease as a follower
+  assert.equal(b.leaseHeldByOther(), true, "a follower sees the leader is elsewhere");
+});
+
+test("XERK-935: an abstaining SOLE survivor reports no other holder, and re-leads on recovery", async () => {
+  const api = fakeK8s();
+  const store = { up: true };
+  const a = leadElector(api, "pod-a", () => store.up);
+
+  await a._tick(); // a leads
+  store.up = false;
+  await a._tick(); // a abstains — but nobody else exists to take the lease
+  assert.equal(a.isLeader(), false);
+  assert.equal(
+    a.leaseHeldByOther(), false,
+    "the holder is still a itself → the forwarder may still serve degraded as the sole survivor"
+  );
+
+  store.up = true; // store link recovers
+  await a._tick();
+  assert.equal(a.isLeader(), true, "a re-elects when its store link recovers");
+  assert.equal(api.lease.spec.holderIdentity, "pod-a");
+});
+
+test("XERK-935: leaseHeldByOther() ignores a STALE observation (a wedged loop must not pin a holder)", () => {
+  const api = fakeK8s();
+  const a = elector(api, "pod-a"); // leaseDurationMs 300 -> leaseSeconds 1 -> a 1000ms window
+  const now = Date.now();
+  const other = { spec: { holderIdentity: "pod-b", renewTime: new Date(now).toISOString(), leaseDurationSeconds: 1 } };
+  a._observe(other, now);
+  assert.equal(a.leaseHeldByOther(), true, "a fresh observation of another holder counts");
+  // Simulate a wedged election loop: the observation itself is now older than the window.
+  a._observe(other, now - 5000);
+  assert.equal(a.leaseHeldByOther(), false, "a stale observation must not pin a (possibly dead) holder forever");
+});
+
+test("XERK-935: leaseHeldByOther() ignores an EXPIRED observed lease", () => {
+  const api = fakeK8s();
+  const a = elector(api, "pod-a");
+  const now = Date.now();
+  const fresh = { spec: { holderIdentity: "pod-b", renewTime: new Date(now).toISOString(), leaseDurationSeconds: 1 } };
+  a._observe(fresh, now);
+  assert.equal(a.leaseHeldByOther(), true);
+  // Same recent observation, but the other replica's lease has since expired (renewTime old).
+  const expired = { spec: { holderIdentity: "pod-b", renewTime: new Date(now - 5000).toISOString(), leaseDurationSeconds: 1 } };
+  a._observe(expired, now);
+  assert.equal(a.leaseHeldByOther(), false, "another replica's EXPIRED lease is not a fresh holder");
+});
+
+test("XERK-935: canLead defaults to always-lead (byte-identical without the gate)", async () => {
+  const api = fakeK8s();
+  const a = elector(api, "pod-a"); // no canLead injected
+  await a._tick();
+  await a._tick();
+  assert.equal(a.isLeader(), true, "an elector with no canLead behaves exactly as before");
+});
+
+test("XERK-935: StandaloneLeader reports no other lease holder", () => {
+  assert.equal(new StandaloneLeader("single-process").leaseHeldByOther(), false);
+  assert.equal(new StandaloneLeader("ha-no-lease").leaseHeldByOther(), false);
+});
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
