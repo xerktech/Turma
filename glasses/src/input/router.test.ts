@@ -50,6 +50,13 @@ describe("normalizeEvent", () => {
     expect(normalizeEvent({ sysEvent: { eventType } })).toEqual(expected);
   });
 
+  it.each([9, 10])("ignores sysEvent LONG_PRESS (9) / LONG_PRESS_RELEASE (10) — never a tap", (eventType) => {
+    // Answering a question or toggling dictation on a long press would be a
+    // misfire the operator never asked for.
+    expect(normalizeEvent({ sysEvent: { eventType, eventSource: 1 } })).toBeNull();
+    expect(normalizeEvent({ textEvent: { eventType } })).toBeNull();
+  });
+
   it("maps SYSTEM_EXIT_EVENT (7) to lifecycle system-exit and carries the reason code", () => {
     expect(normalizeEvent({ sysEvent: { eventType: 7, systemExitReasonCode: 42 } })).toEqual({
       type: "lifecycle",

@@ -2,7 +2,7 @@
 //
 // Two independent pieces:
 //
-//  1. A tiny background-state registry. The SDK (0.0.10) doesn't ship
+//  1. A tiny background-state registry. The SDK (through 0.0.15) doesn't ship
 //     `setBackgroundState`/`onBackgroundRestore` helpers — the host instead
 //     calls `window.__getStateSnapshot()` right before backgrounding and
 //     `window.__restoreState(json)` on a (possibly brand-new, headless)

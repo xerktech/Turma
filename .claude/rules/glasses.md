@@ -31,3 +31,9 @@ paths:
   scopes the list too. Board is Phase 2.
 - CI: `glasses-ci.yml`, path-filtered to `glasses/**`, runs typecheck + Vitest + a production build
   in a throwaway `node:24-alpine` container.
+- **Keep `@evenrealities/even_hub_sdk` >= 0.0.14.** Older SDKs strip long-press eventTypes (9/10),
+  so `input/router.ts` sees a bare `sysEvent` — protobuf-zero CLICK — and a long press fires taps.
+  Tests: `input/sdk-events.test.ts` (fails on SDK 0.0.10), `router.test.ts` "ignores sysEvent LONG_PRESS".
+- **`npm run pack` passes `--sdk-ver` = the INSTALLED SDK.** evenhub-cli >= 0.1.14 stamps the .ehpk's
+  `min_app_version` from that SDK's npm `minAppVersion`; without the flag it uses the LATEST published
+  SDK, so an unrelated SDK release silently raises our floor. Keep `app.json`'s values equal to it.

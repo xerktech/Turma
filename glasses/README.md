@@ -119,7 +119,7 @@ npm run simulate                                   # in another
 `npm run simulate` launches `@evenrealities/evenhub-simulator` against the
 running dev server. Known gaps versus real hardware: the simulator's
 scripted automation surface (`/api/input`) only drives touchpad actions (up/
-down/click/double-click) — there's no way to inject synthetic mic audio
+down/click/double-click/long-press) — there's no way to inject synthetic mic audio
 through it, so the dictation path can't be exercised via automation and
 should be verified on real hardware; and `sysEvent.eventSource` is hardcoded
 by the simulator to `TOUCH_EVENT_FROM_GLASSES_R`, so anything keyed on which
