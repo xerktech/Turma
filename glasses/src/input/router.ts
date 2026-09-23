@@ -111,9 +111,12 @@ export function normalizeEvent(raw: RawEvenHubEvent): InputEvent | LifecycleEven
         return { type: "lifecycle", phase: "abnormal-exit" };
       case OS_EVENT.SYSTEM_EXIT:
         return { type: "lifecycle", phase: "system-exit", reasonCode: raw.sysEvent.systemExitReasonCode };
+      case OS_EVENT.LONG_PRESS:
+      case OS_EVENT.LONG_PRESS_RELEASE:
+        return null;
       default:
-        // IMU_DATA_REPORT, LONG_PRESS / LONG_PRESS_RELEASE, and anything else
-        // unrecognized — not part of this app's vocabulary.
+        // IMU_DATA_REPORT and anything else unrecognized — not part of this
+        // app's vocabulary (no IMU feature, no list containers).
         return null;
     }
   }
