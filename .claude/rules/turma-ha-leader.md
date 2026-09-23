@@ -60,6 +60,8 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   `HMAC(SESSION_KEY,"turma-forward")`); a client-supplied list is ignored and stripped. Unproven, any
   client could force a follower to hold 5s and then serve DEGRADED — a second writer on demand
   (QA measured 3/100 acknowledged inputs lost that way).
+- **A request served HERE loses every `x-turma-forward*` header first** (`stripForwardHeaders`, right
+  after both forwarder checks in server.js): hop proofs are for replicas, never relayed to an agent.
 - **The proof is bound to its REQUEST and single-use** (XERK-936): `<at>.<nonce>.<mac>`, the mac over
   list + method + target + stamp + nonce (`hopProof`, the one definition both sides use). Stale
   (`PROOF_MAX_AGE_MS`, 30s either way), another method/target, or a nonce this replica already
@@ -74,8 +76,11 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
     apart statelessly, and every attempt to was defeated in QA: a minted-nonce cache (evicted by a
     10k-request flood), a TCP-peer match (lost to address translation). Ignoring the list instead
     recursed forwarding into ourselves until MAX_CONNECTIONS.
-  - The 508 carries the looped proof's nonce (`x-turma-forward-loop`); a minter seeing ITS nonce
-    come back learns that leader address as an alias of itself (`ownAliases`, 10 min), so later
+  - The 508 carries `loopProof` = the looped nonce + a MAC under the forward key
+    (`x-turma-forward-loop`); a minter seeing ITS nonce's mac come back learns that leader address
+    as an alias of itself (`ownAliases`, 10 min). **The mac is load-bearing**: an agent's ttyd saw the
+    proof (the /term relay spreads `req.headers`) and echoed the bare nonce — that taught a follower
+    the LIVE leader was itself, a 10-min second writer, re-armed per terminal view (QA). Later
     requests hold + serve as for `isOwnAddr`. An upgrade learns it too, from the 508 head it gets
     back — else an expiring alias handed tunnels "back to the leader" and every re-dial was 508'd
     until some HTTP request re-taught it. Cost of a loop: what is in flight when the alias is

@@ -349,7 +349,7 @@ test("XERK-919: canServeLocally holds a promoted leader until its registry re-sy
 
 // ---- XERK-919 QA round 1 fixes ----------------------------------------------
 
-const { FORWARD_AUTH_HEADER, hopProof, PROOF_MAX_AGE_MS } = require("../forward.js");
+const { FORWARD_AUTH_HEADER, hopProof, loopProof, stripForwardHeaders, PROOF_MAX_AGE_MS } = require("../forward.js");
 
 test("XERK-919 QA: a client-supplied hop header without a valid proof is IGNORED (no forced hold / second writer)", async () => {
   const store = new FileLiveStore();
@@ -1236,4 +1236,60 @@ test("XERK-936 QA4: an UPGRADE looping back teaches the alias too; a learned ali
   await sleep(350);
   assert.deepEqual(f.decide(req("/a")), { forward: addr }, "past aliasTtlMs the address is re-proved, never kept forever");
   srv.close(); prox.p.close(); f.close();
+});
+
+// ---- XERK-936 QA round 6: an agent host must not be able to teach an alias ---------
+
+// An upstream that ECHOES the nonce it can read off the proof (what a hostile ttyd
+// behind the leader's /term relay could do) — over HTTP and on the raw upgrade path.
+async function echoingLeader() {
+  const nonceOf = (h) => String(h[FORWARD_AUTH_HEADER] || "").split(".")[1] || "";
+  const srv = http.createServer((rq, rs) => {
+    rs.writeHead(508, { "x-turma-forward-loop": nonceOf(rq.headers) }); rs.end();
+  });
+  srv.on("upgrade", (rq, sock) => {
+    sock.end(`HTTP/1.1 508 Loop Detected\r\nx-turma-forward-loop: ${nonceOf(rq.headers)}\r\nContent-Length: 0\r\n\r\n`);
+  });
+  return { srv, port: await listen(srv) };
+}
+
+test("XERK-936 QA6: a 508 echoing our NONCE without the key's mac teaches no alias (HTTP and upgrade)", async () => {
+  const { srv: evil, port: eport } = await echoingLeader();
+  const { f } = await follower(`127.0.0.1:${eport}`, { authToken: "sekret" });
+  const { srv, port } = await followerServer(f);
+  assert.equal((await request(port, { path: "/term/s1/" })).status, 508);
+  assert.match(await upgradeTo(port, "/term/s1/ws"), / 508 /);
+  await sleep(20);
+  assert.deepEqual(f.decide(req("/a")), { forward: `127.0.0.1:${eport}` }, "the live leader is still the leader, not us");
+  srv.close(); evil.close(); f.close();
+});
+
+test("XERK-936 QA6: the loop header a replica sends is MAC'd — only the key's holder can mint it", async () => {
+  const store = new FileLiveStore();
+  const f = makeForwarder(store, "me", { isLeader: () => false, authToken: "sekret" });
+  await f.start();
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: "127.0.0.1:1", at: Date.now() });
+  const { srv, port } = await followerServer(f);
+  const at = String(Date.now());
+  const auth = `${at}.nn.${hopProof("sekret", "me", "GET", "/x", at, "nn")}`;
+  const r = await request(port, { path: "/x", headers: { [FORWARDED_HEADER]: "me", [FORWARD_AUTH_HEADER]: auth } });
+  assert.equal(r.status, 508);
+  assert.equal(r.headers["x-turma-forward-loop"], loopProof("sekret", "nn"));
+  assert.notEqual(loopProof("other", "nn"), loopProof("sekret", "nn"));
+  srv.close(); f.close();
+});
+
+test("XERK-936 QA6: a request served locally loses every forwarding header before anything relays it", () => {
+  const rq = {
+    headers: { a: "1", [FORWARDED_HEADER]: "x", [FORWARD_AUTH_HEADER]: "y", "x-turma-forward-loop": "z" },
+    rawHeaders: ["A", "1", "X-Turma-Forwarded-By", "x", "x-turma-forward-auth", "y", "X-Turma-Forward-Loop", "z"],
+  };
+  stripForwardHeaders(rq);
+  assert.deepEqual(rq.headers, { a: "1" });
+  assert.deepEqual(rq.rawHeaders, ["A", "1"]);
+  // Wired in server.js right after the forwarder declines, on BOTH handlers — so the
+  // /term proxy (which spreads req.headers onto the ttyd request) never carries them.
+  const src = require("node:fs").readFileSync(require.resolve("../server.js"), "utf8");
+  assert.match(src, /forwarder\.forwardRequest\(req, res\)\)\) return;\n(?:\s*\/\/.*\n)*\s*stripForwardHeaders\(req\);/);
+  assert.match(src, /forwarder\.forwardUpgrade\(req, socket, head\)\)\) return;\n\s*stripForwardHeaders\(req\);/);
 });

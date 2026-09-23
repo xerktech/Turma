@@ -85,7 +85,7 @@ const { createIndexStore } = require("./index-store.js");
 // (which supply the pod-to-pod `dial`/listener + this replica's `endpoint`) are the
 // follow-up (w2-relay-consumers). See `.claude/rules/turma-ha-tunnel.md`.
 const { makeRelay } = require("./relay.js");
-const { makeForwarder } = require("./forward.js");
+const { makeForwarder, stripForwardHeaders } = require("./forward.js");
 
 // XERK-757 externalized-store persistence config, declared here so it can be
 // handed to the module-load store below. It maps each `policy:<name>` store key to
@@ -14873,6 +14873,9 @@ const server = http.createServer(async (req, res) => {
     // answered here. `false` (HA off, this replica leads, no fresh leader endpoint,
     // or the leader could not be dialed) falls through to serving it locally.
     if (forwarder && (await forwarder.forwardRequest(req, res))) return;
+    // Served HERE: hop proofs are for replicas, never relayed on (the /term proxy hands
+    // req.headers to an agent's ttyd, which could then echo them — XERK-936 QA).
+    stripForwardHeaders(req);
 
     // CORS for the cross-origin glasses WebView client: only /api/* and
     // /term/* opt in, and only when the request actually carries an Origin
@@ -18635,6 +18638,7 @@ server.on("upgrade", async (req, socket, head) => {
   // here exits the hub, and an upgrade is reachable unauthenticated.
   try {
     if (forwarder && (await forwarder.forwardUpgrade(req, socket, head))) return;
+    stripForwardHeaders(req); // served here: never relay hop proofs to an agent (see the request handler)
   } catch (e) {
     console.error(`forward: upgrade forwarding failed: ${(e && e.message) || e}`);
     try { socket.destroy(); } catch {}

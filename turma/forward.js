@@ -48,7 +48,11 @@ const PROOF_MAX_AGE_MS = 30000;
 // local first), and filling it takes the key, so this stays tiny. Full of FRESH
 // entries it fails CLOSED (the proof is refused), never evicting a live nonce.
 const SEEN_PROOFS_MAX = 10000;
-// On a 508 answer: the nonce of the looped proof, so its minter knows the loop was its own.
+// On a 508 answer: `<nonce>.<mac>` of the looped proof, so its minter knows the loop was
+// its own. MAC'd under the forward key (`loopProof`): the leader relays a browser's headers
+// to an agent's ttyd, so the NONCE alone was readable — and echoable — by an agent host,
+// which then taught a follower that the live leader was itself (QA: a 10-minute second
+// writer). Only a replica holding the key can mint this.
 const LOOP_HEADER = "x-turma-forward-loop";
 // How long a leader address PROVEN to lead back to us is treated as our own.
 const ALIAS_TTL_MS = 10 * 60 * 1000;
@@ -86,6 +90,26 @@ function hopProof(key, list, method, target, at, nonce) {
   return crypto.createHmac("sha256", key)
     .update(["turma-forward", list, method, target, at, nonce].join("\n"))
     .digest("base64url");
+}
+
+function loopProof(key, nonce) {
+  return `${nonce}.${crypto.createHmac("sha256", key).update("turma-forward-loop\n" + nonce).digest("base64url")}`;
+}
+
+// Delete every forwarding header from a request this replica SERVES, before any of it can
+// be relayed on (the /term proxy hands req.headers to the agent's ttyd): hop proofs are
+// for replicas only, never for an agent host to read, echo or replay.
+function stripForwardHeaders(req) {
+  if (!req || !req.headers) return;
+  const drop = (k) => k === FORWARDED_HEADER || k === FORWARD_AUTH_HEADER || k === LOOP_HEADER;
+  for (const k of Object.keys(req.headers)) if (drop(k)) delete req.headers[k];
+  if (Array.isArray(req.rawHeaders)) {
+    const kept = [];
+    for (let i = 0; i + 1 < req.rawHeaders.length; i += 2) {
+      if (!drop(String(req.rawHeaders[i]).toLowerCase())) kept.push(req.rawHeaders[i], req.rawHeaders[i + 1]);
+    }
+    try { req.rawHeaders.splice(0, req.rawHeaders.length, ...kept); } catch { /* read-only: headers already gone */ }
+  }
 }
 
 function splitAddr(addr) {
@@ -377,6 +401,12 @@ function makeForwarder(store, replicaId, deps = {}) {
     });
   }
 
+  const sameBytes = (got, want) => {
+    if (typeof got !== "string") return false;
+    const a = Buffer.from(got), b = Buffer.from(want);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  };
+
   const pause = (ms) => new Promise((r) => { const t = setTimeout(r, ms); if (t.unref) t.unref(); });
 
   // Resolve a connected upstream socket to forward over, or null to serve locally.
@@ -511,7 +541,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (r.gone) return true;
     if (r.loop) {
       if (!res.headersSent) {
-        res.writeHead(508, { "content-type": "application/json", [LOOP_HEADER]: r.loop, connection: "close" });
+        res.writeHead(508, { "content-type": "application/json", [LOOP_HEADER]: loopProof(authToken, r.loop), connection: "close" });
         res.end(JSON.stringify({ error: "hub forwarding loop: the leader endpoint leads back to this replica — retry" }));
       }
       return true;
@@ -556,7 +586,9 @@ function makeForwarder(store, replicaId, deps = {}) {
       // Our own request came back to us (the 508 names the nonce only we minted for
       // it): that leader address is an alias of this replica. Later requests then hold
       // and serve here (the pre-loop behaviour) instead of each failing with a 508.
-      if (upRes.statusCode === 508 && hh.nonce && upRes.headers[LOOP_HEADER] === hh.nonce) learnAlias(r.addr);
+      if (upRes.statusCode === 508 && hh.nonce && sameBytes(upRes.headers[LOOP_HEADER], loopProof(authToken, hh.nonce))) {
+        learnAlias(r.addr);
+      }
       // The leader has answered: stop sending it the body (a refusal is about to cut
       // the connection, and every further write only races that cut).
       req.unpipe(feed);
@@ -621,7 +653,8 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (r.loop) { // our own proof back (see verifyHops); the minting upgrade learns from this 508
       socket.removeListener("error", early);
       socket.on("error", () => {});
-      socket.end(`HTTP/1.1 508 Loop Detected\r\n${LOOP_HEADER}: ${r.loop}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+      socket.end(`HTTP/1.1 508 Loop Detected\r\n${LOOP_HEADER}: ${loopProof(authToken, r.loop)}\r\n` +
+        "Connection: close\r\nContent-Length: 0\r\n\r\n");
       return true;
     }
     const up = r.sock;
@@ -651,7 +684,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     // naming OUR nonce): without it, an alias expiring handed our tunnels "back to the
     // leader" and every re-dial was 508'd until some HTTP request re-taught it (QA).
     if (minted.nonce) {
-      const want = `${LOOP_HEADER}: ${minted.nonce}\r\n`;
+      const want = `${LOOP_HEADER}: ${loopProof(authToken, minted.nonce)}\r\n`;
       up.once("data", (d) => {
         const head = d.subarray(0, 512).toString("latin1");
         if (head.startsWith("HTTP/1.1 508 ") && head.includes(want)) learnAlias(r.addr); // our own writer's exact form
@@ -797,5 +830,7 @@ module.exports = {
   DEFAULTS,
   MAX_HOPS,
   hopProof,
+  loopProof,
+  stripForwardHeaders,
   PROOF_MAX_AGE_MS,
 };
