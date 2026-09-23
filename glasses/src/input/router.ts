@@ -9,6 +9,9 @@
 //   - `sysEvent.eventType` 4-7 -> lifecycle (foreground enter/exit, abnormal
 //     exit, system exit).
 //   - `sysEvent.eventType` 9/10 (long press / release) -> ignored, NOT a tap.
+//   - a `sysEvent` whose eventType the SDK didn't recognise (stripped, so the
+//     raw value survives only in `jsonData`) -> ignored, NOT a tap. See the
+//     block in `normalizeEvent` and XERK-922.
 //   - `textEvent.eventType` 1 / 2 -> scroll up / down on the text container.
 //
 // CRITICAL gotcha (the whole reason this file exists instead of a one-line
@@ -65,6 +68,14 @@ export interface RawAudioEvent {
   audioPcm?: Uint8Array;
 }
 
+// The SDK preserves the pre-parse payload on every event as `jsonData`, so its
+// `eventType` survives even when the SDK strips one it doesn't recognise (the
+// numeric/string codes below). We read it to tell a genuine protobuf-zero CLICK
+// (no `eventType` at all) apart from an unknown type the SDK dropped.
+export interface RawJsonData {
+  eventType?: number | string;
+}
+
 // Structural stand-in for the SDK's `EvenHubEvent` — every field optional,
 // same field names, so a real bridge event is assignable here with no cast.
 export interface RawEvenHubEvent {
@@ -72,6 +83,7 @@ export interface RawEvenHubEvent {
   textEvent?: RawTextEvent;
   listEvent?: RawListEvent;
   audioEvent?: RawAudioEvent;
+  jsonData?: RawJsonData;
 }
 
 export type LifecyclePhase = "foreground-enter" | "foreground-exit" | "abnormal-exit" | "system-exit";
@@ -97,6 +109,23 @@ export function normalizeEvent(raw: RawEvenHubEvent): InputEvent | LifecycleEven
   // Clicks/double-clicks on the text container, plus every lifecycle event,
   // land here — the gotcha called out at the top of this file.
   if (raw.sysEvent) {
+    // The SDK's `evenHubEventFromJson` DROPS an eventType it doesn't recognise
+    // (any numeric code or string outside its enum), leaving `sysEvent` empty
+    // but keeping the raw value in `jsonData`. A missing `sysEvent.eventType`
+    // is therefore ambiguous: it's either a genuine protobuf-zero CLICK (which
+    // omits the field entirely — `jsonData.eventType` is absent too) or an
+    // unknown type the SDK stripped (`jsonData.eventType` carries what it saw).
+    // Treating the second as a CLICK is XERK-922 — the next firmware event type
+    // fires a tap. Ignore an unknown type; only a true protobuf-zero taps.
+    if (raw.sysEvent.eventType === undefined) {
+      // A genuine CLICK omits eventType from `jsonData` entirely (absent, i.e.
+      // undefined here); ANY present value — including a literal `null` the
+      // firmware sent — is a type the SDK saw and stripped, so ignore it.
+      const rawType = raw.jsonData?.eventType;
+      if (rawType !== undefined && rawType !== OS_EVENT.CLICK) {
+        return null;
+      }
+    }
     const t = raw.sysEvent.eventType ?? OS_EVENT.CLICK;
     switch (t) {
       case OS_EVENT.CLICK:
