@@ -7,16 +7,19 @@ import { defineConfig, type Plugin } from "vite";
 // `default` export — engines.ts's default import then kills the whole page
 // (XERK-921). Wrap them in a CJS shim at serve time only; the bytes on disk are
 // untouched and the production build keeps its own commonjs path.
-const VENDOR_CJS = /\/src\/vendor\/[^/]+\.cjs(?:\?|$)/;
+// Anchored at the end so a `?raw` / `?url` import is left to Vite.
+const VENDOR_CJS = /\/src\/vendor\/[^/]+\.cjs$/;
 
-function vendorCjsDev(): Plugin {
+export function vendorCjsDev(): Plugin {
   return {
     name: "turma-vendor-cjs-dev",
     apply: "serve",
     transform(code, id) {
       if (!VENDOR_CJS.test(id)) return null;
+      // The prefix stays on the file's first line so every line keeps its
+      // on-disk number — `map: null` tells Vite nothing moved.
       return {
-        code: `const module = { exports: {} };\nconst exports = module.exports;\n${code}\nexport default module.exports;\n`,
+        code: `const module = { exports: {} }; const exports = module.exports; ${code}\nexport default module.exports;\n`,
         map: null,
       };
     },

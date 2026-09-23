@@ -39,7 +39,10 @@ paths:
   SDK, so an unrelated SDK release silently raises our floor. Keep `app.json`'s values equal to it.
 - **`vite.config.ts`'s `turma-vendor-cjs-dev` shim is what lets `npm run dev` boot** (XERK-921). The
   dev server serves `src/vendor/*.cjs` raw (no `default` export), so `engines.ts`'s default import
-  kills the page without it. Vitest runs through it too — a broken shim fails the engine tests.
+  kills the page without it. Vitest's own CJS interop passes WITHOUT it, so only
+  `src/dev-server.test.ts` (drives the real dev-server transform) guards it. The prefix stays on
+  line 1 so dev stack traces keep on-disk line numbers.
 - **A resolved `waitForEvenAppBridge()` does NOT mean a host is there** — it resolves in any browser.
-  `main.ts`'s `resolveBridge` also requires `window.flutter_inappwebview.callHandler` (the device
+  `bridge.ts`'s `resolveBridge` also requires `window.flutter_inappwebview.callHandler` (the device
   WebView or the simulator's shim), else it falls back to the DOM backend at `BRIDGE_TIMEOUT_MS`.
+  Tests: `src/bridge.test.ts`.

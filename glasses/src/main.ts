@@ -9,12 +9,13 @@
 //   - Timeout (plain browser / `npm run dev`) -> the existing DOM dev path,
 //     unchanged from Task 5.
 //
-// The SDK is only ever touched via a single dynamic `import()` right here —
+// The SDK is only ever touched via a single dynamic `import()` (bridge.ts) —
 // every other file in this package (display/evenhub.ts, storage.ts,
 // input/router.ts) is typed structurally against the SDK's shapes instead of
 // importing it, so the browser/dev build never needs to load or evaluate
 // `@evenrealities/even_hub_sdk` at all unless this import actually runs.
 import { App } from "./app.ts";
+import { resolveBridge, type ResolvedBridge } from "./bridge.ts";
 import type { Config } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { DomDisplay } from "./display/dom.ts";
@@ -28,51 +29,6 @@ import { initPhoneLogin, signOut } from "./phone-login.ts";
 import { mountPhone, type PhoneHandle } from "./phone/phone.ts";
 import { pretextMeasure, setDefaultMeasure } from "./text-wrap.ts";
 import { installLifecycle, onAbnormalOrSystemExit, onForegroundEnter, onForegroundExit } from "./lifecycle.ts";
-
-const BRIDGE_TIMEOUT_MS = 2000;
-
-function importSdk() {
-  return import("@evenrealities/even_hub_sdk");
-}
-
-// A structural stand-in for the awaited `waitForEvenAppBridge()` result —
-// deliberately untyped against the SDK (see file header): every consumer
-// (EvenHubDisplay, BridgeStorage, the input router) declares its own minimal
-// structural interface instead, and the real bridge satisfies all of them.
-type ResolvedBridge = Awaited<ReturnType<Awaited<ReturnType<typeof importSdk>>["waitForEvenAppBridge"]>>;
-
-// The native side of the bridge. The SDK sends every call through
-// `window.flutter_inappwebview.callHandler`, which only a real host injects —
-// the Even Realities WebView, or the simulator's shim.
-function hostPresent(): boolean {
-  const host = (window as { flutter_inappwebview?: { callHandler?: unknown } }).flutter_inappwebview;
-  return typeof host?.callHandler === "function";
-}
-
-// Races bridge resolution against a timeout so a plain browser (no Even
-// Realities WebView host) never hangs waiting for a bridge that will never
-// arrive. Any import/resolution failure is treated the same as a timeout.
-//
-// `waitForEvenAppBridge()` resolves in ANY browser — the SDK builds its bridge
-// object whether or not a host is there to answer it (XERK-921) — so a
-// resolved bridge only counts once the host is present. A host that is late
-// gets the rest of the timeout window before we fall back to the DOM backend.
-async function resolveBridge(): Promise<ResolvedBridge | null> {
-  try {
-    const mod = await importSdk();
-    const bridgePromise = mod.waitForEvenAppBridge();
-    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), BRIDGE_TIMEOUT_MS));
-    const bridge = await Promise.race([bridgePromise, timeout]);
-    if (bridge && !hostPresent()) {
-      await timeout;
-      if (!hostPresent()) return null;
-    }
-    return bridge;
-  } catch (err) {
-    console.warn("[glasses] Even Hub SDK unavailable, falling back to the DOM dev backend:", err);
-    return null;
-  }
-}
 
 async function main(): Promise<void> {
   const bridge = await resolveBridge();
