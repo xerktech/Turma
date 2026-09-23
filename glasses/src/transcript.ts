@@ -1,3 +1,4 @@
+import { fontStrip, undrawable } from "./font.ts";
 import type { TailEntry } from "./types.ts";
 
 // Per-session accumulating transcript buffer. Polling delivers overlapping
@@ -113,7 +114,15 @@ function conciseEntry(entry: TailEntry): TailEntry {
   // blank-line collapse); user turns are the operator's own typed/dictated text
   // and carry no markdown or tool markers, but still have their blank lines
   // collapsed so a multi-line dictation doesn't reintroduce the gaps.
-  const text = entry.role === "assistant" ? conciseText(entry.text) : collapseBlankLines(entry.text);
+  const trimmed = entry.role === "assistant" ? conciseText(entry.text) : collapseBlankLines(entry.text);
+  // THEN made drawable by the G2 font (font.ts). In this order the trims see
+  // exactly the raw text — a dropped glyph can't turn prose into a tool marker
+  // or a code span into literal backticks — and what the font empties is just
+  // re-tidied. A turn the TRIMS emptied (tool-only "[Read]") stays empty so
+  // render skips it; one the FONT emptied (emoji-only) says "?".
+  const safe = fontStrip(trimmed);
+  const text =
+    safe === trimmed ? trimmed : undrawable(trimmed, collapseBlankLines(safe).replace(/[ \t]+$/gm, "").trim());
   return text === entry.text ? entry : { ...entry, text };
 }
 
