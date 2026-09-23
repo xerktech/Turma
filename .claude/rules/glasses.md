@@ -37,3 +37,7 @@ paths:
 - **`npm run pack` passes `--sdk-ver` = the INSTALLED SDK.** evenhub-cli >= 0.1.14 stamps the .ehpk's
   `min_app_version` from that SDK's npm `minAppVersion`; without the flag it uses the LATEST published
   SDK, so an unrelated SDK release silently raises our floor. Keep `app.json`'s values equal to it.
+- **`vite.config.ts`'s serve-only `turma-vendored-cjs-dev` plugin is what lets `npm run dev` boot**
+  (XERK-934). Vite's CJS interop runs only in `build`, and `optimizeDeps` covers only `node_modules`,
+  so without it dev serves `src/vendor/*.cjs` raw and the simulator dies on `Importing binding name
+  'default'`. Tests: `src/vendor/dev-server.test.ts`.
