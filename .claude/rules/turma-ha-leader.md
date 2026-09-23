@@ -65,11 +65,13 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   (`PROOF_MAX_AGE_MS`, 30s either way), another method/target, or a nonce this replica already
   accepted = ignored like a forged one. A list-only mac let one captured pair be replayed forever.
   - Verified ONCE per request (`hopCache`): `decide()` re-runs every hold poll — never a "replay".
-  - Only a NON-serving replica verifies (`decide` returns local first), so the seen-nonce map stays
-    tiny; it is bounded anyway.
-  - **The MINTER records its own nonce** (`hopHeaders` → `rememberProof`). The one replica a replay
-    bites is the one that minted it (its id is in the list: hold, then DEGRADED), and it never
-    receives the original to record. Without this, every captured beat = one forced local write.
+  - Only a NON-serving replica verifies (`decide` returns local first), and filling it takes the key,
+    so the seen-nonce map stays tiny. Full of FRESH nonces it fails CLOSED (refuses), never evicts.
+  - **A proof whose LAST hop is this replica is ignored** — its own mint coming back. That is the one
+    replica a replay bites (its id is in the list: hold, then DEGRADED), and it never receives the
+    original to record. A genuine forward never lands on its last hop (the leader dialed is never our
+    id or address; a real bounce is re-minted by the replica it passed). Keep it STATELESS: a
+    minted-nonce cache was evicted by a ~10k-request flood in 4s (QA), reopening the replay.
   - The mac cannot cover the body (it streams), so a pair replayed within 30s onto a THIRD replica
     that never saw it, same method + target, is honoured once there. That bites only while that
     replica believes the minter leads (a transient disagreement): one held-then-DEGRADED request.
@@ -101,8 +103,8 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
     leader takes. Uploads use `UPLOAD_MAX_BYTES`, the ceiling over every host's own cap.
   - Only past the auth gate the leader runs BEFORE reading (`agentPresentedRefusal`,
     `userAuthorized`, `agentHostRefusal`): a credential-less body stays the leader's 401, unread.
-  - A refusal whose client sends nothing for `drainIdleMs` (10s) is cut — else 8 slow-loris sockets
-    held every slot and switched the local refusal off.
+  - A refusal making less than `drainMinProgress` (64 KiB) per `drainIdleMs` (10s) is cut — else 8
+    slow-loris sockets (silent OR a 1-byte trickle) held every slot and switched it off.
   - Assumes every replica derives the SAME caps. Mid-rollout with a changed memory limit, a
     smaller-cap follower cuts a body the leader would take (XERK-939).
   - Only routes whose 413 is STATELESS: heartbeat, both uploads, raw archive. NOT the archive chunk

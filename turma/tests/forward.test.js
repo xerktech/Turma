@@ -835,7 +835,28 @@ test("XERK-936 QA: a pair a follower MINTED is never honoured back on that follo
   // and then serve DEGRADED. It must read as a replay — forwarded like any request.
   assert.deepEqual(f.decide({ ...seen }), { forward: `127.0.0.1:${lport}` });
   assert.equal(f.stats.replayedProofs, 1);
+  // Stateless: a flood of forwards (each minting a proof) cannot age it out of any cache.
+  for (let i = 0; i < 30; i++) await request(port, { path: "/api/y" + i });
+  assert.deepEqual(f.decide({ ...seen }), { forward: `127.0.0.1:${lport}` }, "still ignored after a flood");
   srv.close(); leader.close(); f.close();
+});
+
+test("XERK-936 QA2: the seen-proof set fails CLOSED when full of fresh nonces — it never evicts a live one", async () => {
+  const store = new FileLiveStore();
+  let t = Date.now();
+  const f = makeForwarder(store, "me", { isLeader: () => false, authToken: "sekret", now: () => t });
+  await f.start();
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: "127.0.0.1:1", at: t });
+  const mint = (nonce) => `${t}.${nonce}.${hopProof("sekret", "leader", "GET", "/a", String(t), nonce)}`;
+  const hop = (nonce) => req("/a", { [FORWARDED_HEADER]: "leader", [FORWARD_AUTH_HEADER]: mint(nonce) });
+  assert.ok(f.decide(hop("first")).hold, "honoured once");
+  for (let i = 0; i < 10000; i++) f.decide(hop("n" + i)); // fill (only possible with the key)
+  assert.deepEqual(f.decide(hop("first")), { forward: "127.0.0.1:1" }, "the first nonce was NOT evicted");
+  assert.equal(f.decide(hop("fresh")).hold, undefined, "full of fresh entries: a new proof is refused");
+  t += PROOF_MAX_AGE_MS + 1;
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: "127.0.0.1:1", at: t });
+  assert.ok(f.decide(hop("later")).hold, "once they expire, room again");
+  f.close();
 });
 
 test("XERK-936 QA: the follower cuts a refused body at cap + slack exactly — never drains without bound", async () => {
@@ -883,9 +904,35 @@ test("XERK-936 QA: a refusal whose client goes silent is cut after drainIdleMs a
   await new Promise((r) => hog.on("connect", r));
   // Headers only — not one body byte, so the idle timer must be armed up front.
   hog.write("POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: 999999\r\n\r\n");
-  await closed; // the follower cut it for going silent
+  assert.equal(await Promise.race([closed.then(() => "cut"), sleep(3000).then(() => "open")]), "cut",
+    "the follower cut it for going silent");
   const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 500 }, body: Buffer.alloc(500) })
     .catch((e) => ({ status: "err:" + e.code }));
   assert.equal(r.status, 413, "the slot is free again");
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-936 QA2: a refusal that keeps making progress is never cut idle; a 1-byte trickle is", async () => {
+  const { leader, port: lport } = await countingLeader();
+  const { f } = await follower(`127.0.0.1:${lport}`, {
+    bodyCap: () => 100, drainSlack: 1 << 20, drainIdleMs: 150, drainMinProgress: 1000,
+  });
+  const { srv, port } = await followerServer(f);
+  const open = (chunk, every) => {
+    const s = net.connect(port, "127.0.0.1");
+    s.on("error", () => {});
+    s.closed2 = new Promise((r) => s.on("close", r));
+    s.on("connect", () => {
+      s.write("POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: 9999999\r\n\r\n");
+      s.timer = setInterval(() => { if (!s.destroyed) s.write(Buffer.alloc(chunk)); }, every);
+    });
+    return s;
+  };
+  const steady = open(2000, 40); // well past drainMinProgress per window
+  const trickle = open(1, 40); // ~4 bytes per window: idle
+  const race = (s) => Promise.race([s.closed2.then(() => "cut"), sleep(600).then(() => "open")]);
+  assert.equal(await race(trickle), "cut", "a trickle is cut idle");
+  assert.equal(await race(steady), "open", "steady progress keeps the refusal alive past drainIdleMs");
+  for (const s of [steady, trickle]) { clearInterval(s.timer); s.destroy(); }
   srv.close(); leader.close(); f.close();
 });

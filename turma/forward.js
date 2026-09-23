@@ -45,7 +45,8 @@ const FORWARD_AUTH_HEADER = "x-turma-forward-auth";
 const PROOF_MAX_AGE_MS = 30000;
 // Proofs accepted within that window, so one captured pair buys at most ONE hold per
 // replica. Only a replica that is NOT serving ever verifies a proof (decide() returns
-// local first), so this stays tiny; the bound is a backstop, oldest evicted first.
+// local first), and filling it takes the key, so this stays tiny. Full of FRESH
+// entries it fails CLOSED (the proof is refused), never evicting a live nonce.
 const SEEN_PROOFS_MAX = 10000;
 // Answered by THIS replica, never forwarded: the kubelet probes are per-pod facts
 // (a follower's liveness/drain is its own, not the leader's).
@@ -151,6 +152,9 @@ function makeForwarder(store, replicaId, deps = {}) {
     // A refusal whose client sends NOTHING for this long is cut and frees its slot, so
     // a slow-loris cannot hold every slot and switch the local refusal off.
     drainIdleMs = 10000,
+    // ...where "sends nothing" means less than this much progress in the window, so a
+    // 1-byte trickle is idle too (readBody's BODY_MIN_PROGRESS_BYTES rule).
+    drainMinProgress = 64 << 10,
   } = deps;
   const canServe = deps.canServe || isLeader;
 
@@ -226,15 +230,20 @@ function makeForwarder(store, replicaId, deps = {}) {
         }
         return [];
       }
+      const hops = v.split(",").map((x) => x.trim()).filter(Boolean);
+      // Our OWN proof coming back — the one replica a replay bites (our id is in the
+      // list, so it would hold, then serve DEGRADED). A genuine forward never lands on
+      // its last hop: we only ever dial a leader that is neither our id nor our address,
+      // and a real bounce back here was re-minted by that replica, which appends itself.
+      // Stateless on purpose: a minted-nonce cache was evictable by a request flood.
+      if (hops[hops.length - 1] === replicaId) { stats.replayedProofs += 1; return []; }
       if (seenProofs.has(nonce)) { stats.replayedProofs += 1; return []; } // a replay: ignored
-      rememberProof(nonce, Number(at));
+      for (const [n, exp] of seenProofs) { if (exp > t) break; seenProofs.delete(n); }
+      if (seenProofs.size >= SEEN_PROOFS_MAX) { stats.replayedProofs += 1; return []; } // fail closed
+      seenProofs.set(nonce, Number(at) + PROOF_MAX_AGE_MS);
+      return hops;
     }
     return v.split(",").map((x) => x.trim()).filter(Boolean);
-  }
-  function rememberProof(nonce, at) {
-    const t = now();
-    for (const [n, exp] of seenProofs) { if (exp > t && seenProofs.size < SEEN_PROOFS_MAX) break; seenProofs.delete(n); }
-    seenProofs.set(nonce, at + PROOF_MAX_AGE_MS);
   }
   // The header pair to put on a forwarded request: our id appended, plus its proof,
   // bound to THIS request's method + target and stamped now with a fresh nonce.
@@ -243,11 +252,6 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (!authToken) return [FORWARDED_HEADER, list];
     const at = String(now());
     const nonce = crypto.randomBytes(12).toString("base64url");
-    // Seen by US from the start: the one replica where a replayed pair would bite is
-    // the one that minted it (its own id is in the list, so it holds, then degrades),
-    // and it never receives the original to record (XERK-936 QA). A genuine bounce
-    // back here carries a fresh nonce minted by the replica it went through.
-    rememberProof(nonce, Number(at));
     const mac = hopProof(authToken, list, String(req.method || ""), String(req.url || ""), at, nonce);
     return [FORWARDED_HEADER, list, FORWARD_AUTH_HEADER, `${at}.${nonce}.${mac}`];
   }
@@ -390,6 +394,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     let len = 0;
     let settled = false;
     let idle = null;
+    let mark = 0; // `len` when the idle window last re-armed
     const release = () => {
       if (idle) { clearTimeout(idle); idle = null; }
       if (!settled) { settled = true; refusing -= 1; }
@@ -414,7 +419,11 @@ function makeForwarder(store, replicaId, deps = {}) {
       const kill = () => { try { req.socket.destroy(); } catch { /* gone */ } };
       if (res.writableFinished) kill(); else res.once("finish", kill);
     };
-    const onData = (c) => { len += c.length; if (len > cap + drainSlack) answer(true); else armIdle(); };
+    const onData = (c) => {
+      len += c.length;
+      if (len > cap + drainSlack) answer(true);
+      else if (len - mark >= drainMinProgress) { mark = len; armIdle(); }
+    };
     armIdle();
     req.on("data", onData);
     req.once("end", () => answer(false));
