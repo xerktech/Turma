@@ -824,20 +824,29 @@ test("XERK-936: a proof minted by a forwarding follower verifies on the next rep
 
 // ---- XERK-936 QA round 1 ------------------------------------------------------
 
-test("XERK-936 QA: a pair a follower MINTED is never honoured back on that follower (the one place a replay bites)", async () => {
+test("XERK-936 QA: a pair a follower MINTED, replayed back onto it, is refused at once — never held, never served", async () => {
   let seen;
   const leader = http.createServer((rq, rs) => { seen = { headers: rq.headers, url: rq.url, method: rq.method }; rs.end("ok"); });
   const lport = await listen(leader);
   const { f } = await follower(`127.0.0.1:${lport}`, { authToken: "sekret" });
   const { srv, port } = await followerServer(f);
   await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 2 }, body: "{}" });
-  // Replayed onto the minter: its own id is in the list, so honoured it would HOLD
-  // and then serve DEGRADED. It must read as a replay — forwarded like any request.
-  assert.deepEqual(f.decide({ ...seen }), { forward: `127.0.0.1:${lport}` });
-  assert.equal(f.stats.replayedProofs, 1);
-  // Stateless: a flood of forwards (each minting a proof) cannot age it out of any cache.
+  // Honoured, its own id in the list would HOLD then serve DEGRADED. It is our own
+  // proof back — refused (508), whoever sent it.
+  const captured = seen; // the flood below overwrites `seen`
+  const nonce = captured.headers[FORWARD_AUTH_HEADER].split(".")[1];
+  assert.deepEqual(f.decide({ ...captured }), { loop: nonce });
+  // Stateless: a flood of forwards (each minting a proof) cannot age it out of anything.
   for (let i = 0; i < 30; i++) await request(port, { path: "/api/y" + i });
-  assert.deepEqual(f.decide({ ...seen }), { forward: `127.0.0.1:${lport}` }, "still ignored after a flood");
+  assert.deepEqual(f.decide({ ...captured }), { loop: nonce }, "still refused after a flood");
+  // Over the wire: an immediate 508, no hold.
+  const t0 = Date.now();
+  const hdrs = { ...captured.headers };
+  delete hdrs.connection;
+  const r = await request(port, { method: "POST", path: "/api/heartbeat", headers: { ...hdrs, "content-length": 2 }, body: "{}" });
+  assert.equal(r.status, 508);
+  assert.ok(Date.now() - t0 < 200, "refused at once, not held");
+  assert.equal(f.stats.degraded, 0);
   srv.close(); leader.close(); f.close();
 });
 
@@ -937,25 +946,87 @@ test("XERK-936 QA2: a refusal that keeps making progress is never cut idle; a 1-
   srv.close(); leader.close(); f.close();
 });
 
-test("XERK-936 QA3: a follower dialing ITSELF through an address alias holds (then serves), never recurses", async () => {
-  // The leader entry names our listener under a string that is not our `endpoint`
-  // (an alias — `localhost` vs 127.0.0.1 in QA): not isOwnAddr, so we dial ourselves.
-  // The looped request arrives on a socket WE opened — its hop list must survive the
-  // own-proof rule so the hop guard holds it.
-  const store = new FileLiveStore();
-  const f = makeForwarder(store, "me", {
-    isLeader: () => false, authToken: "sekret", holdMs: 200, holdPollMs: 10, ttlMs: 60000,
-    endpoint: "10.9.9.9:1",
+// A plain TCP relay — stands in for a sidecar / NAT hairpin that rewrites the peer.
+async function tcpProxy(toPort) {
+  const p = net.createServer((c) => {
+    const u = net.connect(toPort, "127.0.0.1");
+    c.pipe(u).pipe(c);
+    c.on("error", () => u.destroy()); u.on("error", () => c.destroy());
   });
+  return { p, port: await listen(p) };
+}
+
+test("XERK-936 QA3: a leader endpoint leading back to US (alias, proxy, NAT) never recurses: one 508, then hold + serve", async () => {
+  for (const via of ["direct", "proxy"]) {
+    const store = new FileLiveStore();
+    const f = makeForwarder(store, "me", {
+      isLeader: () => false, authToken: "sekret", holdMs: 150, holdPollMs: 10, ttlMs: 60000,
+      endpoint: "10.9.9.9:1", // our endpoint string never matches: only the 508 can reveal the loop
+    });
+    const { srv, port } = await followerServer(f);
+    await f.start();
+    const prox = via === "proxy" ? await tcpProxy(port) : null;
+    const addr = `127.0.0.1:${prox ? prox.port : port}`;
+    await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr, at: Date.now() });
+    let conns = 0;
+    srv.on("connection", () => { conns += 1; });
+    const first = await request(port, { path: "/api/x" });
+    assert.equal(first.status, 508, `${via}: the looped request is refused, never re-forwarded`);
+    assert.equal(conns, 2, `${via}: client + one self-dial — bounded, not a recursion`);
+    const second = await request(port, { path: "/api/x" });
+    assert.equal(second.status, 299, `${via}: the alias is learned — held, then served locally`);
+    assert.equal(f.stats.degraded, 1);
+    assert.equal(f.remoteLeaderFresh(), false, `${via}: an alias of us is not a remote leader`);
+    // An upgrade through a still-unlearned loop is refused, not piped into itself.
+    srv.close(); f.close(); if (prox) prox.p.close();
+  }
+});
+
+test("XERK-936 QA3: the alias is learned only from a 508 naming OUR nonce — a stray 508 teaches nothing", async () => {
+  const leader = http.createServer((rq, rs) => { rs.writeHead(508, { "x-turma-forward-loop": "not-yours" }); rs.end(); });
+  const lport = await listen(leader);
+  const { f } = await follower(`127.0.0.1:${lport}`, { authToken: "sekret" });
   const { srv, port } = await followerServer(f);
+  assert.equal((await request(port, { path: "/a" })).status, 508);
+  assert.deepEqual(f.decide(req("/a")), { forward: `127.0.0.1:${lport}` }, "still forwarding: nothing learned");
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-936 QA3: before failing closed the seen set rescans — a skewed live entry cannot shelter expired ones", async () => {
+  const store = new FileLiveStore();
+  let t = Date.now();
+  const f = makeForwarder(store, "me", { isLeader: () => false, authToken: "sekret", now: () => t, ttlMs: 1e9 });
   await f.start();
-  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: `127.0.0.1:${port}`, at: Date.now() });
-  let conns = 0;
-  srv.on("connection", () => { conns += 1; });
-  const r = await request(port, { path: "/api/x" });
-  assert.equal(r.status, 299, "the looped request is held, then served locally (DEGRADED) — never a 502");
-  assert.equal(f.stats.requests, 1, "the outer request really was forwarded (to ourselves)");
-  assert.equal(conns, 2, "client + one self-dial: bounded, not a recursion");
-  assert.equal(f.stats.replayedProofs, 0, "a self-loop is not a replay");
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: "127.0.0.1:1", at: t });
+  const hop = (nonce, at) => req("/a", {
+    [FORWARDED_HEADER]: "leader",
+    [FORWARD_AUTH_HEADER]: `${at}.${nonce}.${hopProof("sekret", "leader", "GET", "/a", String(at), nonce)}`,
+  });
+  assert.ok(f.decide(hop("skewed", t + PROOF_MAX_AGE_MS - 1000)).hold, "a sender clock ~29s ahead: first in, lives longest");
+  for (let i = 0; i < 9999; i++) f.decide(hop("n" + i, t));
+  t += PROOF_MAX_AGE_MS + 10; // every entry but the skewed one has expired
+  assert.ok(f.decide(hop("fresh", t)).hold, "room found by the rescan — not a false fail-closed");
+  f.close();
+});
+
+test("XERK-936 QA3: an UPGRADE carrying our own proof back is refused 508 — never piped into ourselves", async () => {
+  const store = new FileLiveStore();
+  const f = makeForwarder(store, "me", { isLeader: () => false, authToken: "sekret", ttlMs: 60000 });
+  await f.start();
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: "127.0.0.1:1", at: Date.now() });
+  const { srv, port } = await followerServer(f);
+  const at = String(Date.now());
+  const url = "/agent/control?name=h";
+  const auth = `${at}.nn.${hopProof("sekret", "me", "GET", url, at, "nn")}`;
+  const got = await new Promise((resolve) => {
+    const s = net.connect(port, "127.0.0.1", () => s.write(`GET ${url} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n` +
+      `Connection: Upgrade\r\n${FORWARDED_HEADER}: me\r\n${FORWARD_AUTH_HEADER}: ${auth}\r\n\r\n`));
+    let b = "";
+    s.on("data", (d) => { b += d; });
+    s.on("close", () => resolve(b));
+    s.on("error", () => resolve(b));
+  });
+  assert.match(got, /^HTTP\/1\.1 508 /);
+  assert.match(got, /x-turma-forward-loop: nn/);
   srv.close(); f.close();
 });

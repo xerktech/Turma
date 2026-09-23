@@ -48,6 +48,10 @@ const PROOF_MAX_AGE_MS = 30000;
 // local first), and filling it takes the key, so this stays tiny. Full of FRESH
 // entries it fails CLOSED (the proof is refused), never evicting a live nonce.
 const SEEN_PROOFS_MAX = 10000;
+// On a 508 answer: the nonce of the looped proof, so its minter knows the loop was its own.
+const LOOP_HEADER = "x-turma-forward-loop";
+// How long a leader address PROVEN to lead back to us is treated as our own.
+const ALIAS_TTL_MS = 10 * 60 * 1000;
 // Answered by THIS replica, never forwarded: the kubelet probes are per-pod facts
 // (a follower's liveness/drain is its own, not the leader's).
 const LOCAL_PATHS = new Set(["/healthz", "/readyz"]);
@@ -168,7 +172,7 @@ function makeForwarder(store, replicaId, deps = {}) {
   const live = new Set(); // every forwarded socket (client + upstream), for drain
   const stats = {
     requests: 0, upgrades: 0, dialFailures: 0, held: 0, degraded: 0,
-    refusedOversize: 0, staleProofs: 0, replayedProofs: 0,
+    refusedOversize: 0, staleProofs: 0, replayedProofs: 0, loops: 0,
   };
   let refreshTimer = null;
   let unwatch = null;
@@ -177,8 +181,8 @@ function makeForwarder(store, replicaId, deps = {}) {
   let draining = false; // set by stop(): this replica is shutting down
   let refusing = 0; // oversize bodies being drained by refuseOversize() right now
   const seenProofs = new Map(); // nonce -> expiry: proofs already accepted (replay guard)
-  const ownDials = new Set(); // "addr|port" of every upstream socket we have open (see isSelfLoop)
-  const hopCache = new WeakMap(); // req -> its verified hop list (decide() re-runs per poll)
+  const hopCache = new WeakMap(); // req -> {hops, loop}: its verified proof (decide() re-runs per poll)
+  const ownAliases = new Map(); // addr -> until: leader addresses PROVEN to lead back to us (a 508)
   let staleLoggedAt = 0;
 
   function storeFailed(e) {
@@ -201,26 +205,30 @@ function makeForwarder(store, replicaId, deps = {}) {
   // The replicas a request has already passed through (FORWARDED_HEADER is a
   // comma list, oldest first). Verified ONCE per request and remembered: decide()
   // re-runs on every hold poll, and a second look must not read as a replay.
-  function hopsOf(req) {
-    if (!req || typeof req !== "object") return [];
-    let hops = hopCache.get(req);
-    if (!hops) { hops = verifyHops(req); hopCache.set(req, hops); }
-    return hops;
+  function proofOf(req) {
+    if (!req || typeof req !== "object") return NO_PROOF;
+    let p = hopCache.get(req);
+    if (!p) { p = verifyHops(req); hopCache.set(req, p); }
+    return p;
   }
+  const hopsOf = (req) => proofOf(req).hops;
+  const NO_PROOF = { hops: [], loop: null };
+  // The verified hop list, or `loop` = the nonce of OUR OWN valid proof come back.
   function verifyHops(req) {
+    const none = NO_PROOF;
     const v = req.headers && req.headers[FORWARDED_HEADER];
-    if (typeof v !== "string" || !v) return [];
+    if (typeof v !== "string" || !v) return none;
     if (authToken) {
       const got = req.headers[FORWARD_AUTH_HEADER];
-      if (typeof got !== "string") return [];
+      if (typeof got !== "string") return none;
       const [at, nonce, mac, extra] = got.split(".");
-      if (extra !== undefined || !/^\d{1,15}$/.test(at || "") || !/^[A-Za-z0-9_-]{1,64}$/.test(nonce || "")) return [];
+      if (extra !== undefined || !/^\d{1,15}$/.test(at || "") || !/^[A-Za-z0-9_-]{1,64}$/.test(nonce || "")) return none;
       // Compare BYTES, not string length: a non-ASCII value of the right string
       // length has a longer UTF-8 encoding, and timingSafeEqual THROWS on unequal
       // buffer lengths — which on the upgrade path was an unauthenticated crash.
       const a = Buffer.from(mac || "");
       const b = Buffer.from(hopProof(authToken, v, String(req.method || ""), String(req.url || ""), at, nonce));
-      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return []; // a client's claim: ignored
+      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return none; // a client's claim: ignored
       const t = now();
       if (Math.abs(t - Number(at)) > PROOF_MAX_AGE_MS) {
         stats.staleProofs += 1;
@@ -229,22 +237,19 @@ function makeForwarder(store, replicaId, deps = {}) {
           log(`forward: refused a hop proof ${t - Number(at)}ms off this replica's clock — ` +
             `check node clock sync (hop lists are ignored while it is off by >${PROOF_MAX_AGE_MS}ms)`);
         }
-        return [];
+        return none;
       }
       const hops = v.split(",").map((x) => x.trim()).filter(Boolean);
-      // Our OWN proof coming back — the one replica a replay bites (our id is in the
-      // list, so it would hold, then serve DEGRADED). The only genuine way here is a
-      // SELF-DIAL (the leader entry names an alias of our address — `localhost` for
-      // 127.0.0.1): that request arrives on a socket WE opened, which no client can
-      // forge, and it must keep its list so the hop guard holds it (ignored, it
-      // re-forwarded to itself until MAX_CONNECTIONS — QA). Anything else is a replay.
-      // Stateless on purpose: a minted-nonce cache was evictable by a request flood.
-      if (hops[hops.length - 1] === replicaId) {
-        if (isSelfLoop(req)) return hops;
-        stats.replayedProofs += 1;
-        return [];
-      }
-      if (seenProofs.has(nonce)) { stats.replayedProofs += 1; return []; } // a replay: ignored
+      // Our OWN proof coming back: a replay (the one replica it bites — our id is in the
+      // list, so it would hold, then serve DEGRADED) or a genuine SELF-LOOP (the leader
+      // entry names an address that reaches US: an alias, a proxy, a sidecar, a NAT
+      // hairpin). Neither may be forwarded (it recursed to MAX_CONNECTIONS), held or
+      // served, and the two cannot be told apart statelessly (a minted-nonce cache was
+      // evictable by a flood; a TCP-peer match loses to address translation) — so both
+      // are REFUSED at once (508, decide()'s `loop`). A replay gains nothing; a loop's
+      // sender learns the alias from the 508 (see forwardRequest).
+      if (hops[hops.length - 1] === replicaId) return { hops: [], loop: nonce };
+      if (seenProofs.has(nonce)) { stats.replayedProofs += 1; return none; } // a replay: ignored
       for (const [n, exp] of seenProofs) { if (exp > t) break; seenProofs.delete(n); }
       // The sweep above stops at the first live entry, and expiries follow each SENDER's
       // clock, so a skewed one can shelter expired entries behind it: rescan before
@@ -252,35 +257,41 @@ function makeForwarder(store, replicaId, deps = {}) {
       if (seenProofs.size >= SEEN_PROOFS_MAX) {
         for (const [n, exp] of seenProofs) if (exp <= t) seenProofs.delete(n);
       }
-      if (seenProofs.size >= SEEN_PROOFS_MAX) { stats.replayedProofs += 1; return []; } // fail closed
+      if (seenProofs.size >= SEEN_PROOFS_MAX) { stats.replayedProofs += 1; return none; } // fail closed
       seenProofs.set(nonce, Number(at) + PROOF_MAX_AGE_MS);
-      return hops;
+      return { hops, loop: null };
     }
-    return v.split(",").map((x) => x.trim()).filter(Boolean);
+    return { hops: v.split(",").map((x) => x.trim()).filter(Boolean), loop: null };
   }
   // The header pair to put on a forwarded request: our id appended, plus its proof,
   // bound to THIS request's method + target and stamped now with a fresh nonce.
+  // `nonce` is returned too: a 508 naming it is proof the request came back to us.
   function hopHeaders(hops, req) {
     const list = hops.concat(replicaId).join(",");
-    if (!authToken) return [FORWARDED_HEADER, list];
+    if (!authToken) return { headers: [FORWARDED_HEADER, list], nonce: null };
     const at = String(now());
     const nonce = crypto.randomBytes(12).toString("base64url");
     const mac = hopProof(authToken, list, String(req.method || ""), String(req.url || ""), at, nonce);
-    return [FORWARDED_HEADER, list, FORWARD_AUTH_HEADER, `${at}.${nonce}.${mac}`];
-  }
-  // Did this request arrive on a connection one of OUR upstream dials opened? (the
-  // TCP 4-tuple: its peer is our own socket's local end). `::ffff:` is stripped, since
-  // a dual-stack listener sees an IPv4 dialer in mapped form.
-  const bareAddr = (a) => String(a || "").replace(/^::ffff:/, "");
-  function isSelfLoop(req) {
-    const s = req && req.socket;
-    return !!s && ownDials.has(`${bareAddr(s.remoteAddress)}|${s.remotePort}`);
+    return { headers: [FORWARDED_HEADER, list, FORWARD_AUTH_HEADER, `${at}.${nonce}.${mac}`], nonce };
   }
 
   // A leader entry naming OUR OWN address under another replica id is a previous
   // incarnation of this pod (a container restart keeps the POD_IP) — never a target.
+  // So is one a 508 proved leads back to us (an alias `isOwnAddr`'s string compare
+  // misses) — remembered a while, then re-proved, since a pod IP can be reused.
   function isOwnAddr(addr) {
-    return !!endpoint && addr === endpoint;
+    if (!!endpoint && addr === endpoint) return true;
+    const until = ownAliases.get(addr);
+    if (until && now() < until) return true;
+    if (until) ownAliases.delete(addr);
+    return false;
+  }
+  function learnAlias(addr) {
+    if (!addr || isOwnAddr(addr)) return;
+    ownAliases.set(addr, now() + ALIAS_TTL_MS);
+    log(`forward: the leader endpoint ${addr} leads back to THIS replica (a forwarding loop) — ` +
+      "treating it as our own address; fix the leader's TURMA_HUB_ENDPOINT / POD_IP");
+    lastMode = null;
   }
   // Is there a fresh leader that is not us? (the caller's "drop degraded sockets" test)
   function remoteLeaderFresh() {
@@ -304,6 +315,8 @@ function makeForwarder(store, replicaId, deps = {}) {
     const path = String((req && req.url) || "").split("?")[0];
     if (LOCAL_PATHS.has(path)) return LOCAL;
     if (canServe()) { noteMode("serving locally (this replica is the leader)"); return LOCAL; }
+    const loop = proofOf(req).loop;
+    if (loop) return { loop }; // our own proof back: refuse now, never forward/hold/serve
     const e = leader;
     const fresh = e && (now() - e.seenAt < ttlMs || !storeHealthy());
     if (!fresh || e.replica === replicaId || (e.addr && isOwnAddr(e.addr))) {
@@ -351,9 +364,6 @@ function makeForwarder(store, replicaId, deps = {}) {
         // Terminal keystrokes are tiny packets; Nagle would batch them (the same
         // reason tunnel-agent.js disables it on the ttyd side).
         s.setNoDelay(true);
-        const self = `${bareAddr(s.localAddress)}|${s.localPort}`;
-        ownDials.add(self);
-        s.once("close", () => ownDials.delete(self));
         lastDialOk.set(addr, now());
         resolve(s);
       });
@@ -372,9 +382,10 @@ function makeForwarder(store, replicaId, deps = {}) {
       if (gone()) return { gone: true };
       const d = decide(req);
       if (d.local) return null;
+      if (d.loop) { stats.loops += 1; return { loop: d.loop }; }
       if (d.forward) {
         try {
-          return { sock: await dial(d.forward), hops: hopsOf(req) };
+          return { sock: await dial(d.forward), hops: hopsOf(req), addr: d.forward };
         } catch (e) {
           markUnreachable(d.forward, e);
           continue; // re-decide: now held for the cooldown, or a new leader appeared
@@ -466,6 +477,13 @@ function makeForwarder(store, replicaId, deps = {}) {
     const r = await route(req, () => res.destroyed || res.writableEnded);
     if (!r) return false;
     if (r.gone) return true;
+    if (r.loop) {
+      if (!res.headersSent) {
+        res.writeHead(508, { "content-type": "application/json", [LOOP_HEADER]: r.loop, connection: "close" });
+        res.end(JSON.stringify({ error: "hub forwarding loop: the leader endpoint leads back to this replica — retry" }));
+      }
+      return true;
+    }
     if (r.refuse) {
       if (!res.headersSent) {
         res.writeHead(503, { "content-type": "application/json", "retry-after": "1", connection: "close" });
@@ -480,7 +498,8 @@ function makeForwarder(store, replicaId, deps = {}) {
     const headers = endToEnd(req.rawHeaders || []);
     // One upstream socket per forwarded request (dialed above), so ask the leader
     // to close it after the response rather than idling it in keep-alive.
-    headers.push(...hopHeaders(r.hops, req), "Connection", "close");
+    const hh = hopHeaders(r.hops, req);
+    headers.push(...hh.headers, "Connection", "close");
     // An HTTP/1.0 client may send no Host; the leader's parser requires one.
     if (!req.headers.host) headers.push("Host", "hub");
     let up;
@@ -502,6 +521,10 @@ function makeForwarder(store, replicaId, deps = {}) {
     let answered = false;
     up.on("response", (upRes) => {
       answered = true;
+      // Our own request came back to us (the 508 names the nonce only we minted for
+      // it): that leader address is an alias of this replica. Later requests then hold
+      // and serve here (the pre-loop behaviour) instead of each failing with a 508.
+      if (upRes.statusCode === 508 && hh.nonce && upRes.headers[LOOP_HEADER] === hh.nonce) learnAlias(r.addr);
       // The leader has answered: stop sending it the body (a refusal is about to cut
       // the connection, and every further write only races that cut).
       req.unpipe(feed);
@@ -563,6 +586,12 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (!r) { socket.removeListener("error", early); return false; } // serve locally, untouched
     if (r.gone) return true;
     if (r.refuse) { socket.destroy(); return true; } // draining: the client re-dials elsewhere
+    if (r.loop) { // our own proof back (see verifyHops); piped raw, so nothing learns the alias
+      socket.removeListener("error", early);
+      socket.on("error", () => {});
+      socket.end(`HTTP/1.1 508 Loop Detected\r\n${LOOP_HEADER}: ${r.loop}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+      return true;
+    }
     const up = r.sock;
     if (socket.destroyed) { up.destroy(); return true; }
     stats.upgrades += 1;
@@ -583,7 +612,7 @@ function makeForwarder(store, replicaId, deps = {}) {
       if (lk === FORWARDED_HEADER || lk === FORWARD_AUTH_HEADER) continue;
       lines.push(`${raw[i]}: ${raw[i + 1]}`);
     }
-    const hh = hopHeaders(r.hops, req);
+    const hh = hopHeaders(r.hops, req).headers;
     for (let i = 0; i < hh.length; i += 2) lines.push(`${hh[i]}: ${hh[i + 1]}`);
     up.write(lines.join("\r\n") + "\r\n\r\n");
     if (head && head.length) up.write(head);

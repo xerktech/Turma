@@ -67,15 +67,17 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   - Verified ONCE per request (`hopCache`): `decide()` re-runs every hold poll — never a "replay".
   - Only a NON-serving replica verifies (`decide` returns local first), and filling it takes the key,
     so the seen-nonce map stays tiny. Full of FRESH nonces it fails CLOSED (refuses), never evicts.
-  - **A proof whose LAST hop is this replica is ignored** — its own mint coming back. That is the one
-    replica a replay bites (its id is in the list: hold, then DEGRADED), and it never receives the
-    original to record. Keep it STATELESS: a minted-nonce cache was evicted by a ~10k-request flood
-    in 4s (QA), reopening the replay.
-  - **Except a SELF-DIAL** (`isSelfLoop`): a leader entry naming an alias of our address
-    (`localhost` vs `127.0.0.1` — `isOwnAddr` is string equality) makes us dial ourselves; that
-    request arrives on a socket whose peer is one of OUR upstream dials (`ownDials`, the TCP
-    4-tuple — unforgeable by a client) and keeps its list, so the hop guard holds it. Dropped, it
-    re-forwarded to itself until MAX_CONNECTIONS (QA: 502 on every request).
+  - **A valid proof whose LAST hop is this replica is REFUSED at once: 508** (`decide` → `loop`) —
+    never forwarded, held or served. It is either a replay onto its minter (the one replica a replay
+    bites: its id is in the list, so it would hold, then serve DEGRADED) or a genuine SELF-LOOP (the
+    leader endpoint reaches US — an alias, proxy, sidecar, NAT hairpin). The two cannot be told
+    apart statelessly, and every attempt to was defeated in QA: a minted-nonce cache (evicted by a
+    10k-request flood), a TCP-peer match (lost to address translation). Ignoring the list instead
+    recursed forwarding into ourselves until MAX_CONNECTIONS.
+  - The 508 carries the looped proof's nonce (`x-turma-forward-loop`); a minter seeing ITS nonce
+    come back learns that leader address as an alias of itself (`ownAliases`, 10 min), so later
+    requests hold + serve as for `isOwnAddr`. Cost of a loop: ONE retryable 508 per alias TTL.
+    Upgrades are piped raw, so they are refused but never teach the alias.
   - The mac cannot cover the body (it streams), so a pair replayed within 30s onto a THIRD replica
     that never saw it, same method + target, is honoured once there. That bites only while that
     replica believes the minter leads (a transient disagreement): one held-then-DEGRADED request.
