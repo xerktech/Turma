@@ -19870,6 +19870,7 @@ if (process.env.TURMA_TEST) {
       bodyCaps: forwardBodyCaps(),
       drainSlack: RAW_BODY_DRAIN_SLACK,
       drainMax: DRAIN_CONCURRENCY_MAX,
+      stripsForward: true, // both handlers call stripForwardHeaders once the forwarder declines
     });
     // Backstop for the watch edge above (e.g. this replica LOST the lease while it
     // still held tunnels it accepted as leader or while degraded).

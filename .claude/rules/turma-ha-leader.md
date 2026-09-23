@@ -78,9 +78,12 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
     recursed forwarding into ourselves until MAX_CONNECTIONS.
   - The 508 carries `loopProof` = the looped nonce + a MAC under the forward key
     (`x-turma-forward-loop`); a minter seeing ITS nonce's mac come back learns that leader address
-    as an alias of itself (`ownAliases`, 10 min). **The mac is load-bearing**: an agent's ttyd saw the
-    proof (the /term relay spreads `req.headers`) and echoed the bare nonce — that taught a follower
-    the LIVE leader was itself, a 10-min second writer, re-armed per terminal view (QA). Later
+    as an alias of itself (`ownAliases`, 10 min). An agent's ttyd that sees a proof (the /term relay
+    spreads `req.headers`) could teach a follower the LIVE leader was itself — a 10-min second
+    writer, re-armed per terminal view (QA). The mac stops a bare ECHO; only the leader's
+    `stripForwardHeaders` stops a REPLAY (we sign a 508 for anyone replaying our live proof), so
+    **aliases are learned only under a leader whose entry declares `stripsForward`** — a rollout from
+    a pre-strip build otherwise reopened it. Under such a leader a real loop just 508s. Later
     requests hold + serve as for `isOwnAddr`. An upgrade learns it too, from the 508 head it gets
     back — else an expiring alias handed tunnels "back to the leader" and every re-dial was 508'd
     until some HTTP request re-taught it. Cost of a loop: what is in flight when the alias is

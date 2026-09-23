@@ -188,6 +188,10 @@ function makeForwarder(store, replicaId, deps = {}) {
     // 1-byte trickle is idle too (readBody's BODY_MIN_PROGRESS_BYTES rule).
     drainMinProgress = 64 << 10,
     aliasTtlMs = ALIAS_TTL_MS, // how long a PROVEN self-alias is treated as our own address
+    // true = the caller strips every forwarding header from a request it serves before
+    // relaying anything (server.js stripForwardHeaders). Published on the leader entry: a
+    // follower learns a self-alias only under a leader that claims it (see learnAlias).
+    stripsForward = false,
   } = deps;
   const canServe = deps.canServe || isLeader;
 
@@ -319,6 +323,18 @@ function makeForwarder(store, replicaId, deps = {}) {
   }
   function learnAlias(addr) {
     if (!addr || isOwnAddr(addr)) return;
+    // Only under a leader that STRIPS forwarding headers before relaying (its entry says
+    // so). An older leader relays them to an agent's ttyd, which can REPLAY our live proof
+    // to us, collect the signed 508 we answer it with, and hand that back to the request:
+    // the mac cannot tell that from a real loop (QA: a rollout from a pre-strip build
+    // made a new follower serve as a second writer under the live old leader). Under such
+    // a leader a genuine loop just keeps getting 508s — retryable, never a second writer.
+    const e = leader;
+    if (!e || e.addr !== addr || e.strips !== true) {
+      log(`forward: a loop 508 came back from ${addr}, but that leader does not declare it strips ` +
+        "forwarding headers — NOT learning it as our own address");
+      return;
+    }
     ownAliases.set(addr, now() + aliasTtlMs);
     log(`forward: the leader endpoint ${addr} leads back to THIS replica (a forwarding loop) — ` +
       "treating it as our own address; fix the leader's TURMA_HUB_ENDPOINT / POD_IP");
@@ -706,7 +722,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     const at = now();
     leader = { replica: replicaId, addr: endpoint, seenAt: at, caps: null, slack: 0 };
     // Our body caps ride the entry, so a follower refuses against OUR numbers (XERK-939).
-    const entry = { replica: replicaId, addr: endpoint, at, bodyCaps, drainSlack };
+    const entry = { replica: replicaId, addr: endpoint, at, bodyCaps, drainSlack, stripsForward: stripsForward === true };
     Promise.resolve(store.set(LEADER_ENDPOINT_KEY, entry, { ttlMs }))
       .catch(storeFailed);
   }
@@ -741,7 +757,7 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (!v || typeof v !== "object" || typeof v.replica !== "string" || typeof v.at !== "number") return;
     if (v.addr !== null && (typeof v.addr !== "string" || !splitAddr(v.addr))) return;
     const changed = !leader || leader.replica !== v.replica || leader.addr !== v.addr;
-    leader = { replica: v.replica, addr: v.addr, seenAt, ...publishedCaps(v) };
+    leader = { replica: v.replica, addr: v.addr, seenAt, ...publishedCaps(v), strips: v.stripsForward === true };
     if (changed && v.replica !== replicaId) {
       unreachableUntil.delete(v.addr); // a NEW leader gets a fresh chance at once
       log(`forward: leader endpoint is ${v.addr || "UNDIALABLE"} (replica ${v.replica})` +

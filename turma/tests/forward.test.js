@@ -1143,7 +1143,7 @@ test("XERK-936 QA3: a leader endpoint leading back to US (alias, proxy, NAT) nev
     await f.start();
     const prox = via === "proxy" ? await tcpProxy(port) : null;
     const addr = `127.0.0.1:${prox ? prox.port : port}`;
-    await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr, at: Date.now() });
+    await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr, at: Date.now(), stripsForward: true });
     let conns = 0;
     srv.on("connection", () => { conns += 1; });
     const first = await request(port, { path: "/api/x" });
@@ -1228,7 +1228,7 @@ test("XERK-936 QA4: an UPGRADE looping back teaches the alias too; a learned ali
   await f.start();
   const prox = await tcpProxy(port);
   const addr = `127.0.0.1:${prox.port}`;
-  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr, at: Date.now() });
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr, at: Date.now(), stripsForward: true });
   assert.match(await upgradeTo(port), / 508 /, "the looped upgrade is refused");
   await sleep(20);
   assert.deepEqual(f.decide(req("/a")), { hold: "this replica is taking over" }, "...and its 508 taught the alias");
@@ -1292,4 +1292,36 @@ test("XERK-936 QA6: a request served locally loses every forwarding header befor
   const src = require("node:fs").readFileSync(require.resolve("../server.js"), "utf8");
   assert.match(src, /forwarder\.forwardRequest\(req, res\)\)\) return;\n(?:\s*\/\/.*\n)*\s*stripForwardHeaders\(req\);/);
   assert.match(src, /forwarder\.forwardUpgrade\(req, socket, head\)\)\) return;\n\s*stripForwardHeaders\(req\);/);
+});
+
+test("XERK-936 QA7: under a leader that does NOT declare it strips forward headers, a loop 508 teaches no alias", async () => {
+  // A pre-strip leader relays our proof to an agent's ttyd, which can replay it to us and
+  // collect OUR signed 508 — indistinguishable from a real loop. So: never learn there.
+  for (const strips of [undefined, false, "yes"]) {
+    const store = new FileLiveStore();
+    const f = makeForwarder(store, "me", {
+      isLeader: () => false, authToken: "sekret", holdMs: 100, holdPollMs: 10, ttlMs: 60000, endpoint: "10.9.9.9:1",
+    });
+    const { srv, port } = await followerServer(f);
+    await f.start();
+    const addr = `127.0.0.1:${port}`;
+    await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr, at: Date.now(), stripsForward: strips });
+    assert.equal((await request(port, { path: "/api/x" })).status, 508);
+    assert.equal((await request(port, { path: "/api/x" })).status, 508, `${strips}: still a loop 508, nothing learned`);
+    assert.deepEqual(f.decide(req("/a")), { forward: addr });
+    assert.equal(f.stats.degraded, 0, "never became a second writer");
+    srv.close(); f.close();
+  }
+});
+
+test("XERK-936 QA7: a leader publishes stripsForward only when its caller says it strips", async () => {
+  for (const [opt, want] of [[true, true], [undefined, false]]) {
+    const store = new FileLiveStore();
+    const f = makeForwarder(store, "L", { isLeader: () => true, endpoint: "10.0.0.1:8300", stripsForward: opt });
+    await f.start();
+    assert.equal((await store.get(LEADER_ENDPOINT_KEY)).stripsForward, want);
+    f.close();
+  }
+  const src = require("node:fs").readFileSync(require.resolve("../server.js"), "utf8");
+  assert.match(src, /stripsForward: true, \/\/ both handlers call stripForwardHeaders/);
 });
