@@ -53,3 +53,7 @@ paths:
     dropped glyph run first turned "the plan 🧠 [WIP]" into a stripped tool marker.
   - Map keys are codepoint numbers: `glyphs.test.ts` (XERK-923) scans string literals, escapes too.
   - Tests: `font.test.ts`.
+- **A resolved `waitForEvenAppBridge()` does NOT mean a host is there** — it resolves in any browser.
+  `bridge.ts`'s `resolveBridge` also requires `window.flutter_inappwebview.callHandler` (the device
+  WebView or the simulator's shim), else it falls back to the DOM backend at `BRIDGE_TIMEOUT_MS`.
+  Tests: `src/bridge.test.ts`.
