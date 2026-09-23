@@ -8,6 +8,7 @@
 //   - `sysEvent.eventType` 3 -> double click (doubleTap).
 //   - `sysEvent.eventType` 4-7 -> lifecycle (foreground enter/exit, abnormal
 //     exit, system exit).
+//   - `sysEvent.eventType` 9/10 (long press / release) -> ignored, NOT a tap.
 //   - `textEvent.eventType` 1 / 2 -> scroll up / down on the text container.
 //
 // CRITICAL gotcha (the whole reason this file exists instead of a one-line
@@ -35,6 +36,12 @@ const OS_EVENT = {
   ABNORMAL_EXIT: 6,
   SYSTEM_EXIT: 7,
   IMU_DATA_REPORT: 8,
+  // SDK 0.0.14+. An SDK older than that strips an eventType it doesn't know,
+  // so a long press reached this router as a bare `sysEvent` — indistinguishable
+  // from a protobuf-zero CLICK — and fired a tap on press AND another on
+  // release. The SDK must stay >= 0.0.14 for these to be ignorable at all.
+  LONG_PRESS: 9,
+  LONG_PRESS_RELEASE: 10,
 } as const;
 
 export interface RawSysEvent {
@@ -104,6 +111,9 @@ export function normalizeEvent(raw: RawEvenHubEvent): InputEvent | LifecycleEven
         return { type: "lifecycle", phase: "abnormal-exit" };
       case OS_EVENT.SYSTEM_EXIT:
         return { type: "lifecycle", phase: "system-exit", reasonCode: raw.sysEvent.systemExitReasonCode };
+      case OS_EVENT.LONG_PRESS:
+      case OS_EVENT.LONG_PRESS_RELEASE:
+        return null;
       default:
         // IMU_DATA_REPORT and anything else unrecognized — not part of this
         // app's vocabulary (no IMU feature, no list containers).
