@@ -179,3 +179,85 @@ test("XERK-756: the watch mirrors another replica's record without echoing it ba
   await store.del(PFX + "remote1");
   assert.equal(hub.agents.remote1, undefined, "a watched deletion is applied locally");
 });
+
+// ---- XERK-919: single-writer handover hardening ------------------------------
+
+// A store whose watch callback the test drives by hand, so an echo can be delivered
+// LATE (after a newer write) — the ordering a real Valkey round trip produces and
+// the inline FileLiveStore watch never does.
+function manualStore() {
+  const writes = [];
+  const st = {
+    cb: null,
+    watch(_prefix, cb) { st.cb = cb; return () => {}; },
+    async set(key, value) { writes.push({ key, value: JSON.parse(JSON.stringify(value)) }); },
+    async del() {},
+    async scan() { return []; },
+    async get() { return null; },
+    writes,
+  };
+  return st;
+}
+
+test("XERK-919: a LATE echo of an OLDER own write never reverts the record (commands kept)", async () => {
+  for (const k of Object.keys(hub.agents)) delete hub.agents[k];
+  const st = manualStore();
+  hub.__setLiveStore(st, true);
+  hub.installRegistryWatch();
+  hub.agents.h1 = record();
+  hub.queueCommand("h1", { type: "input", sessionId: "s", text: "first" });
+  hub.queueCommand("h1", { type: "input", sessionId: "s", text: "second" });
+  assert.ok(st.writes.length >= 2, "each queued command is written through at once");
+  // The echo of the FIRST write arrives after the second write went out. Matching only
+  // the most recent write, this read as a remote record and dropped "second".
+  st.cb({ type: "set", key: PFX + "h1", value: JSON.parse(JSON.stringify(st.writes[0].value)) });
+  const texts = hub.agents.h1.commands.map((c) => c.text);
+  assert.deepEqual(texts, ["first", "second"], "the newer command survives the older echo");
+  assert.equal(st.writes[0].value[hub.STORE_WRITER_KEY] !== undefined, true, "writes carry the writer stamp");
+});
+
+test("XERK-919: another replica's record is applied with the writer stamp stripped", async () => {
+  for (const k of Object.keys(hub.agents)) delete hub.agents[k];
+  const st = manualStore();
+  hub.__setLiveStore(st, true);
+  hub.installRegistryWatch();
+  st.cb({ type: "set", key: PFX + "r1", value: { device: "r1", sessions: [], commands: [], [hub.STORE_WRITER_KEY]: "peer-replica" } });
+  assert.ok(hub.agents.r1, "a peer's write is applied");
+  assert.equal(hub.agents.r1[hub.STORE_WRITER_KEY], undefined, "the stamp never reaches the served record");
+});
+
+test("XERK-919: a queued command reaches the store at once, not on the 1s debounce", async () => {
+  const store = reset(true);
+  hub.agents.h1 = record();
+  hub.queueCommand("h1", { type: "input", sessionId: "s", text: "now" });
+  await new Promise((r) => setImmediate(r));
+  const stored = await store.get(PFX + "h1");
+  assert.ok(stored && stored.commands.some((c) => c.text === "now"), "the command is durable before any debounce");
+});
+
+test("XERK-919: the promotion re-sync applies the store copy, but never over a host written meanwhile", async () => {
+  for (const k of Object.keys(hub.agents)) delete hub.agents[k];
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const st = {
+    watch() { return () => {}; }, async set() {}, async del() {}, async get() { return null; },
+    async scan() {
+      await gate; // the scan is in flight while this replica keeps serving
+      return [
+        { key: PFX + "stale", value: { device: "stale", sessions: [], commands: [{ cmdId: "old", type: "x" }] } },
+        { key: PFX + "busy", value: { device: "busy", sessions: [], commands: [] } },
+      ];
+    },
+  };
+  hub.__setLiveStore(st, true);
+  hub.agents.stale = { device: "stale", sessions: [], commands: [] };
+  hub.agents.busy = { device: "busy", sessions: [], commands: [] };
+  const p = hub.resyncAgentsFromStore();
+  await new Promise((r) => setImmediate(r));
+  hub.queueCommand("busy", { type: "input", sessionId: "s", text: "queued-during-resync" }); // local write mid-scan
+  release();
+  await p;
+  assert.equal(hub.agents.stale.commands[0].cmdId, "old", "an untouched host takes the store copy (missed events healed)");
+  assert.deepEqual(hub.agents.busy.commands.map((c) => c.text), ["queued-during-resync"],
+    "a host written after the snapshot keeps its newer local record");
+});

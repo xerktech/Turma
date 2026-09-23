@@ -49,7 +49,7 @@ const DEFAULTS = {
   // HOLD the request rather than serve it as a second writer. A graceful handover
   // resolves within one election retry (~2s); only past this bound does a replica
   // serve locally — the degraded mode, safe when it is the sole survivor.
-  holdMs: 8000,
+  holdMs: 5000,
   holdPollMs: 100,
 };
 // A request is forwarded at most this many times (the hop list rides

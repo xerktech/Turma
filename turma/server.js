@@ -1971,6 +1971,19 @@ let storeFlushTimer = null;
 // self-echo would re-apply the cache-STRIPPED copy over the live full record and
 // wipe this replica's on-demand caches for the host.
 const lastStoreWritten = new Map();
+// Every record this replica writes to the store carries its replica id (XERK-919), so
+// the watch can drop ANY of its own echoes — not only the most recent one. Matching
+// on `lastStoreWritten` alone fails as soon as two writes for one host are in flight:
+// the echo of the EARLIER write no longer matches, is applied as a remote record, and
+// reverts the host to that older copy — silently dropping every command queued since.
+const STORE_WRITER_KEY = "__writer";
+// Strip the stamp from a value read back from the store before it is installed.
+function withoutWriter(v) {
+  if (v && typeof v === "object" && Object.prototype.hasOwnProperty.call(v, STORE_WRITER_KEY)) {
+    delete v[STORE_WRITER_KEY];
+  }
+  return v;
+}
 
 // A store write must never throw on the hot path or in a timer (XERK-235); log
 // and move on. The record re-writes on the host's next beat, and a warm standby
@@ -1997,8 +2010,14 @@ function agentStoreRecord(key) {
   }
 }
 
+// host -> count of records THIS replica authored (bumped by markAgentDirty). The
+// promotion re-sync (XERK-919) snapshots it before its store scan and never applies a
+// scanned copy over a host whose count moved meanwhile — that local write is newer
+// than anything the scan could have read.
+const localWriteGen = new Map();
 function markAgentDirty(key) {
   if (!HA_ON || !liveStore) return;
+  localWriteGen.set(key, (localWriteGen.get(key) || 0) + 1);
   storeRemoved.delete(key);
   storeDirty.add(key);
   scheduleStoreFlush();
@@ -2037,6 +2056,7 @@ function flushAgentsToStore() {
   for (const key of storeDirty) {
     const rec = agentStoreRecord(key);
     if (rec === null) continue; // gone or unserializable — skip; next beat retries
+    rec[STORE_WRITER_KEY] = SSE_REPLICA_ID; // lets the watch drop every own echo
     lastStoreWritten.set(key, JSON.stringify(rec)); // remember it to drop the echo
     writes.push(liveStore.set(AGENT_STORE_PREFIX + key, rec).catch(storeWriteFailed));
   }
@@ -4834,7 +4854,9 @@ function installRegistryWatch() {
     try {
       if (lastStoreWritten.get(key) === JSON.stringify(ev.value)) return;
     } catch { /* fall through and apply */ }
-    applyRemoteAgent(key, ev.value);
+    // ...and any OLDER own echo, which the byte compare above cannot recognise.
+    if (ev.value && typeof ev.value === "object" && ev.value[STORE_WRITER_KEY] === SSE_REPLICA_ID) return;
+    applyRemoteAgent(key, withoutWriter(ev.value));
   });
 }
 
@@ -4861,7 +4883,7 @@ async function hydrateAgentsFromStore() {
     if (!hk) continue;
     if (Object.prototype.hasOwnProperty.call(agents, hk)) continue; // watch won
     if (!value || typeof value !== "object") continue;
-    agents[hk] = value;
+    agents[hk] = withoutWriter(value);
     loaded += 1;
   }
   // The same coercion/trim discipline the state.json restore uses (XERK-259/272/
@@ -4886,6 +4908,13 @@ async function hydrateAgentsFromStore() {
 // delivered yet. Caches are preserved (applyRemoteAgent). Never throws.
 async function resyncAgentsFromStore() {
   if (!HA_ON || !liveStore || typeof liveStore.scan !== "function") return;
+  // Land THIS replica's own pending writes first: a replica that served in the
+  // degraded no-leader mode (the old leader crashed) holds records only it has, and
+  // applying the store's older copy over them would drop the commands it queued.
+  // Requests keep being served while this runs (a held request's bound can expire),
+  // so also skip any host this replica writes AFTER the snapshot below.
+  const genAtStart = new Map(localWriteGen);
+  await flushAgentsToStoreNow();
   let rows;
   try {
     rows = await liveStore.scan(AGENT_STORE_PREFIX);
@@ -4896,7 +4925,8 @@ async function resyncAgentsFromStore() {
   for (const { key, value } of rows) {
     const hk = key.slice(AGENT_STORE_PREFIX.length);
     if (!hk || !value || typeof value !== "object") continue;
-    applyRemoteAgent(hk, value);
+    if ((localWriteGen.get(hk) || 0) !== (genAtStart.get(hk) || 0)) continue; // local is newer
+    applyRemoteAgent(hk, withoutWriter(value));
   }
 }
 
@@ -5097,6 +5127,11 @@ function queueCommand(key, cmd) {
   // The queued command is part of the serialized record — refresh the cache and
   // push it so other open dashboards reflect the in-flight command right away.
   publishAgent(key);
+  // XERK-919: a queued command is the one registry write that must not ride the 1s
+  // debounce — the 200 + cmdId the caller hands back is a promise the command
+  // exists, and a crash of the (single-writer) leader inside that window lost it.
+  // Flush now; no-op with HA off.
+  if (HA_ON) flushAgentsToStoreNow();
   // Poke the agent (if its control tunnel is up) to heartbeat immediately, so
   // the command it just enqueued is delivered in the next beat's reply within
   // ~a round-trip rather than up to a whole TURMA_INTERVAL later. Under HA the
@@ -19507,6 +19542,8 @@ if (process.env.TURMA_TEST) {
     get forwarder() { return forwarder; },
     __setForwarder(v) { forwarder = v; },
     hubHttpEndpointAddr,
+    resyncAgentsFromStore, canServeLocally, STORE_WRITER_KEY,
+    get promotionSyncing() { return promotionSyncing; },
     // XERK-781: the relay CONSUMERS. `openChannel` is relay-aware (proxies a data
     // channel to the tunnel owner); `openChannelLocal`/`openLiveForRelay` are the
     // OWNER-side bridges; `liveFanout`/`liveClients`/`liveRelayChannels` +
