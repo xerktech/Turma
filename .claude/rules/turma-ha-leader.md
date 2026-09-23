@@ -81,7 +81,14 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   The hub answers 413 then RESETS; Node reports our next write's `ECONNRESET` before reading the
   queued answer. The body is fed through a stage that yields to the event loop between chunks (and
   stops on the answer) so the read usually wins; the agent retries a 502, so it self-heals. Fully
-  closing it needs the hub not to reset forwarded bodies — which weakens its runaway-body defence.
+  closing it needs the hub not to reset forwarded bodies — which weakens its runaway-body defence. Tracked: XERK-936
+  (with the hop proof binding only the list, not the request — replayable pod-to-pod).
+- **Known two-writer case (XERK-935, pre-existing): an ASYMMETRIC store partition.** A leader whose
+  store link is down cannot publish its endpoint, so a healthy-store follower degrades and serves too.
+- **The hop proof is compared as BYTES** — a non-ASCII value of the right string length made
+  `timingSafeEqual` throw, an unauthenticated crash of any follower via one upgrade (QA). The upgrade
+  handler also catches any forwarding fault. With the store down, a leader is "fresh" for the tunnel
+  hand-back only while dials to it recently SUCCEEDED (else tunnels went to a dead leader).
 - **The graceful handover, in this order (load-bearing)** — the leader KEEPS leading through the
   `/readyz` hold (followers keep forwarding to it), then in `cutAndFlush`: close the listener →
   `await flushAgentsToStoreNow()` → `await release()` → `await forwarder.retract()` (deletes its

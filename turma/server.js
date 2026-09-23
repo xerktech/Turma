@@ -18591,7 +18591,15 @@ server.on("upgrade", async (req, socket, head) => {
   // so an agent's control channel, its data-channel dial-back and every browser
   // /term + /live socket all terminate in ONE process (the dial-back pairs against
   // `pendingChannels` there; a re-dialed tunnel reaps its stale predecessor there).
-  if (forwarder && (await forwarder.forwardUpgrade(req, socket, head))) return;
+  // Never let a forwarding fault escape this async listener: an unhandled rejection
+  // here exits the hub, and an upgrade is reachable unauthenticated.
+  try {
+    if (forwarder && (await forwarder.forwardUpgrade(req, socket, head))) return;
+  } catch (e) {
+    console.error(`forward: upgrade forwarding failed: ${(e && e.message) || e}`);
+    try { socket.destroy(); } catch {}
+    return;
+  }
   const url = new URL(req.url, "http://x");
   const parts = url.pathname.split("/").filter(Boolean);
 

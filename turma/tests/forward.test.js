@@ -584,3 +584,61 @@ test("XERK-919 QA: a leader that answers 413 mid-body, then resets, reaches the 
   assert.equal(r.status, 413, `got ${r.status}`);
   srv.close(); leader.close(); f.close();
 });
+
+// ---- XERK-919 QA round 2 ------------------------------------------------------
+
+test("XERK-919 QA2: a non-ASCII hop proof of the right string length is refused — it never THROWS", async () => {
+  const store = new FileLiveStore();
+  const f = makeForwarder(store, "me", { isLeader: () => false, authToken: "sekret" });
+  await f.start();
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: "127.0.0.1:1", at: Date.now() });
+  const evil = "A".repeat(42) + "é"; // 43 chars, 44 UTF-8 bytes — the real proof is 43 bytes
+  let d;
+  assert.doesNotThrow(() => { d = f.decide(req("/term/x/ws", { [FORWARDED_HEADER]: "zz", [FORWARD_AUTH_HEADER]: evil })); });
+  assert.deepEqual(d, { forward: "127.0.0.1:1" }, "treated as an unproven (ignored) hop list");
+  f.close();
+});
+
+test("XERK-919 QA2: a forwarding fault in the upgrade handler never takes the hub down", async () => {
+  const hub = require("../server.js");
+  const port = await listen(hub.server);
+  hub.__setForwarder({
+    async forwardRequest() { return false; },
+    async forwardUpgrade() { throw new RangeError("boom"); },
+  });
+  try {
+    const closed = await new Promise((resolve) => {
+      const s = net.connect(port, "127.0.0.1", () => s.write("GET /term/x/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"));
+      s.on("close", () => resolve(true)); s.on("error", () => {});
+      setTimeout(() => resolve(false), 2000);
+    });
+    assert.ok(closed, "the offending socket is closed");
+    const r = await request(port, { path: "/healthz" });
+    assert.equal(r.status, 200, "and the hub is still serving");
+  } finally {
+    hub.__setForwarder(null);
+    hub.server.close();
+  }
+});
+
+test("XERK-919 QA2: with the store down, a leader counts as fresh ONLY while dials to it succeed", async () => {
+  const leader = net.createServer((s) => s.end()); const lport = await listen(leader);
+  let healthy = true;
+  const store = new FileLiveStore();
+  const f = makeForwarder(store, "me", { isLeader: () => false, ttlMs: 60, storeHealthy: () => healthy, cooldownMs: 1000 });
+  await f.start();
+  await store.set(LEADER_ENDPOINT_KEY, { replica: "leader", addr: `127.0.0.1:${lport}`, at: Date.now() });
+  assert.equal(f.remoteLeaderFresh(), true, "fresh entry");
+  await sleep(80);
+  healthy = false;
+  assert.equal(f.remoteLeaderFresh(), false, "store down + entry aged + never dialed -> NOT proof the leader lives");
+  // A successful forward (dial) proves it.
+  const { srv, port } = await followerServer(f);
+  await request(port, { path: "/api/x" }).catch(() => {});
+  assert.equal(f.remoteLeaderFresh(), true, "a recent successful dial keeps it fresh while the store is down");
+  // The leader dies: the next dial fails and the claim lapses.
+  leader.close(); await sleep(80);
+  await request(port, { path: "/api/y" }).catch(() => {});
+  assert.equal(f.remoteLeaderFresh(), false, "a failed dial / stale dial proof -> never hand tunnels to it");
+  srv.close(); f.close();
+});

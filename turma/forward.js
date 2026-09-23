@@ -129,6 +129,7 @@ function makeForwarder(store, replicaId, deps = {}) {
   // the writer's `at`. `addr` null = a leader with no dialable address.
   let leader = null;
   const unreachableUntil = new Map(); // addr -> time before which we do not dial it
+  const lastDialOk = new Map(); // addr -> when a dial to it last SUCCEEDED
   const live = new Set(); // every forwarded socket (client + upstream), for drain
   const stats = { requests: 0, upgrades: 0, dialFailures: 0, held: 0, degraded: 0 };
   let refreshTimer = null;
@@ -164,9 +165,12 @@ function makeForwarder(store, replicaId, deps = {}) {
     if (typeof v !== "string" || !v) return [];
     if (authToken) {
       const got = req.headers[FORWARD_AUTH_HEADER];
-      const want = hopProof(v);
-      if (typeof got !== "string" || got.length !== want.length ||
-          !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want))) return []; // a client's claim: ignored
+      if (typeof got !== "string") return [];
+      // Compare BYTES, not string length: a non-ASCII value of the right string
+      // length has a longer UTF-8 encoding, and timingSafeEqual THROWS on unequal
+      // buffer lengths — which on the upgrade path was an unauthenticated crash.
+      const a = Buffer.from(got), b = Buffer.from(hopProof(v));
+      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return []; // a client's claim: ignored
     }
     return v.split(",").map((x) => x.trim()).filter(Boolean);
   }
@@ -183,8 +187,15 @@ function makeForwarder(store, replicaId, deps = {}) {
   // Is there a fresh leader that is not us? (the caller's "drop degraded sockets" test)
   function remoteLeaderFresh() {
     const e = leader;
-    return !!e && e.replica !== replicaId && !!e.addr && !isOwnAddr(e.addr) &&
-      (now() - e.seenAt < ttlMs || !storeHealthy());
+    if (!e || e.replica === replicaId || !e.addr || isOwnAddr(e.addr)) return false;
+    if (now() - e.seenAt < ttlMs) return true;
+    // With the store link down the entry cannot be refreshed, so its age proves
+    // nothing — but neither does it prove the leader is ALIVE. Only a dial that
+    // recently succeeded does; otherwise a follower would hand its tunnels to a
+    // leader that has died too (the only replica left able to serve them).
+    if (storeHealthy()) return false;
+    const ok = lastDialOk.get(e.addr);
+    return !!ok && now() - ok < ttlMs && !(unreachableUntil.get(e.addr) > now());
   }
 
   const LOCAL = { local: true };
@@ -242,6 +253,7 @@ function makeForwarder(store, replicaId, deps = {}) {
         // Terminal keystrokes are tiny packets; Nagle would batch them (the same
         // reason tunnel-agent.js disables it on the ttyd side).
         s.setNoDelay(true);
+        lastDialOk.set(addr, now());
         resolve(s);
       });
     });
