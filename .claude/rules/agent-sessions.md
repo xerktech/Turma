@@ -95,7 +95,7 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
 
 ### A dead tmux must not read `running` forever (XERK-868)
 
-- The runtime is its tmux session's only command, so a missing tmux means claude/qwen/dsh EXITED.
+- A missing tmux (or agent pane, below) means claude/qwen/dsh EXITED.
   Nothing on the beat checked this: the card kept saying running, the slot stayed spent, and the
   orphaned ttyd kept serving tmux's raw error as if it were the terminal.
 - `_sweep_dead_sessions` runs on the beat, BEFORE the payload, and ends such a session with an
@@ -109,8 +109,15 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   `--session-id` (clearing the flag) instead of reporting a crash. The fresh launch's own death IS
   reported (the flag is gone), so a broken environment is never masked as an endless relaunch. This
   is the durable backstop under the `_session_transcript_id` gate; keep both.
-- **One `tmux list-sessions` for the WHOLE fleet** (`_live_tmux_names`) — never `has-session` per
+- **One `tmux list-panes -a` for the WHOLE fleet** (`_live_tmux_panes`) — never `has-session` per
   session, which would put `MAX_SESSIONS` timeouts on the beat.
+- **Liveness is the AGENT PANE, not the tmux name** (XERK-1037). The runtime is the first pane's
+  command only; a `tmux new-window` the session ran lands in `agent-<id>` and keeps the tmux alive
+  after the agent exits. `_spawn_in_tmux` records `agentPane`; a record carrying it is dead once that
+  pane is gone (same strike rule), and the reap `kill-session`s the leftover windows — the agent that
+  owned them has exited, and an untracked tmux would hold its processes. A record WITHOUT
+  `agentPane` (pre-XERK-1037, failed read, malformed) keeps the name-only rule: never reap a live
+  agent on a guess. A pane line that does not parse makes the whole listing "can't tell".
 - **"No server" is EMPTY, not unknown.** The tmux server exits with its LAST session, so a host
   running exactly one session — the reported incident's own shape — gets rc 1 the moment that
   session dies. Reading that as "can't tell" left exactly the session this sweep exists for reading

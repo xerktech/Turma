@@ -4508,7 +4508,7 @@ class ManagerMixin:
         self.run_stdin_calls = []
         self.run_stdin_ok = True
 
-        def fake_run(cmd, cwd=None):
+        def fake_run(cmd, cwd=None, timeout=None):
             self.run_calls.append(cmd)
             return ""
 
@@ -20237,10 +20237,10 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
     forever. Nothing checked this before, so the operator's dead session kept its
     card, its slot and an orphaned ttyd serving tmux's raw error."""
 
-    # `tmux list-sessions` outcomes, as (returncode, stdout, stderr). The sweep
+    # `tmux list-panes -a` outcomes, as (returncode, stdout, stderr). The sweep
     # reads STDERR to tell "the server is gone, so there are no sessions" from
     # "tmux could not answer" — the two arrive as the same nonzero rc.
-    LISTING_OK = (0, "agent-alive\n", "")
+    LISTING_OK = (0, "agent-alive %1\n", "")
     # The tmux server exits with its LAST session, so this is what a host running
     # exactly one session sees the moment that session dies — the reported
     # incident's own shape.
@@ -20285,7 +20285,7 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
                        for i in range(6)]
         sm._sweep_dead_sessions()
         self.assertEqual(len(self.listing_calls), 1)
-        self.assertEqual(self.listing_calls[0][:2], ["tmux", "list-sessions"])
+        self.assertEqual(self.listing_calls[0][:3], ["tmux", "list-panes", "-a"])
 
     def test_a_dead_tmux_ends_the_session_after_the_strike_count(self):
         sm = self.make_manager()
@@ -20319,8 +20319,8 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         sm.registry = [sess]
         sm._sweep_dead_sessions()                       # strike 1
         with mock.patch.object(
-                ha.SessionManager, "_live_tmux_names",
-                lambda self: {"agent-dead"}):
+                ha.SessionManager, "_live_tmux_panes",
+                lambda self: {"agent-dead": {"%1"}}):
             sm._sweep_dead_sessions()                   # back: cleared
         for _ in range(ha.DEAD_TMUX_STRIKES - 1):
             sm._sweep_dead_sessions()
@@ -20333,7 +20333,7 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
             sm = self.make_manager(listing=listing)
             sess = self._sess()
             sm.registry = [sess]
-            self.assertIsNone(sm._live_tmux_names())
+            self.assertIsNone(sm._live_tmux_panes())
             for _ in range(ha.DEAD_TMUX_STRIKES + 2):
                 sm._sweep_dead_sessions()
             self.assertEqual(sess["status"], "running")
@@ -20343,7 +20343,7 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         # tmux not on PATH at all: subprocess.run raises, which is "can't tell".
         sm = self.make_manager()
         with mock.patch.object(ha.subprocess, "run", side_effect=OSError("no tmux")):
-            self.assertIsNone(sm._live_tmux_names())
+            self.assertIsNone(sm._live_tmux_panes())
             sess = self._sess()
             sm.registry = [sess]
             for _ in range(ha.DEAD_TMUX_STRIKES + 2):
@@ -20359,7 +20359,7 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         # manager start). Both wordings tmux uses must mean empty.
         for listing in (self.NO_SERVER, self.NO_SOCKET):
             sm = self.make_manager(listing=listing)
-            self.assertEqual(sm._live_tmux_names(), set())
+            self.assertEqual(sm._live_tmux_panes(), {})
             sess = self._sess()
             sm.registry = [sess]
             for _ in range(ha.DEAD_TMUX_STRIKES):
@@ -20381,7 +20381,7 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sm.registry = [self._sess()]
         with mock.patch.object(ha, "IS_WINDOWS", True):
-            self.assertIsNone(sm._live_tmux_names())
+            self.assertIsNone(sm._live_tmux_panes())
             for _ in range(ha.DEAD_TMUX_STRIKES + 2):
                 sm._sweep_dead_sessions()
         self.assertEqual(sm.registry[0]["status"], "running")
@@ -20416,8 +20416,8 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         relaunched = []
         sm._launch_tmux = lambda s, **kw: relaunched.append(kw)
         sm._launch_ttyd = lambda s: None
-        with mock.patch.object(ha.SessionManager, "_live_tmux_names",
-                               lambda self: {"agent-dead"}):
+        with mock.patch.object(ha.SessionManager, "_live_tmux_panes",
+                               lambda self: {"agent-dead": {"%1"}}):
             sm._sweep_dead_sessions()                        # seen alive -> cleared
         self.assertNotIn("resumeRelaunch", sess)
         for _ in range(ha.DEAD_TMUX_STRIKES):
@@ -20475,6 +20475,84 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         sm.registry = [sess]
         sm._sweep_dead_sessions()
         self.assertNotIn("resumeRelaunch", sess)
+
+    def test_spawn_records_the_agent_pane_or_nothing(self):
+        # XERK-1037: the sweep's per-pane read keys on this; a failed or odd
+        # read must record NOTHING (name-only rule), never keep a stale id.
+        sm = super().make_manager()
+        sess = self._sess(agentPane="%9")
+        with mock.patch.object(ha, "run_out", return_value=(0, "%42")):
+            sm._spawn_in_tmux(sess, "claude")
+        self.assertEqual(sess["agentPane"], "%42")
+        for bad in ((1, ""), (None, ""), (0, "garbage")):
+            sess["agentPane"] = "%9"
+            with mock.patch.object(ha, "run_out", return_value=bad):
+                sm._spawn_in_tmux(sess, "claude")
+            self.assertNotIn("agentPane", sess, bad)
+
+    # --- XERK-1037: the tmux outlived its agent pane ------------------------
+
+    def _reaped_tmux(self):
+        return [c for c in self.run_calls if c[:2] == ["tmux", "kill-session"]]
+
+    def test_an_exited_agent_pane_is_dead_though_its_tmux_lives_on(self):
+        # The session opened a window itself (`new-window` inside its pane lands
+        # in agent-<id>), then the agent exited: the tmux survives on %5, so the
+        # name-only read called it alive forever.
+        sm = self.make_manager(listing=(0, "agent-alive %5\n", ""))
+        sess = self._sess(tmuxName="agent-alive", agentPane="%1")
+        sm.registry = [sess]
+        for _ in range(ha.DEAD_TMUX_STRIKES - 1):
+            sm._sweep_dead_sessions()
+            self.assertEqual(sess["status"], "running")   # same strike rule
+        self.assertEqual(self._reaped_tmux(), [])
+        sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("pane is gone", sess["errorMsg"])
+        self.assertEqual(sm.killed_ttyd, ["s1"])
+        # The leftover windows are closed, not left as an untracked tmux.
+        self.assertEqual(self._reaped_tmux(),
+                         [["tmux", "kill-session", "-t", "agent-alive"]])
+
+    def test_a_live_agent_pane_beside_other_windows_is_untouched(self):
+        sm = self.make_manager(listing=(0, "agent-alive %1\nagent-alive %5\n"
+                                           "agent-other %7\n", ""))
+        sess = self._sess(tmuxName="agent-alive", agentPane="%1", deadTmuxStrikes=1)
+        sm.registry = [sess]
+        for _ in range(ha.DEAD_TMUX_STRIKES + 1):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "running")
+        self.assertNotIn("deadTmuxStrikes", sess)
+        self.assertEqual(self._reaped_tmux(), [])
+
+    def test_a_record_without_agent_pane_keeps_the_name_only_rule(self):
+        # Launched before XERK-1037 (or its pane read failed), or hand-edited to
+        # a malformed id: any pane keeps it alive — never reap a live agent.
+        for extra in ({}, {"agentPane": 12}, {"agentPane": "1"}):
+            sm = self.make_manager(listing=(0, "agent-alive %5\n", ""))
+            sess = self._sess(tmuxName="agent-alive", **extra)
+            sm.registry = [sess]
+            for _ in range(ha.DEAD_TMUX_STRIKES + 1):
+                sm._sweep_dead_sessions()
+            self.assertEqual(sess["status"], "running", extra)
+
+    def test_a_vanished_tmux_with_agent_pane_is_reaped_without_kill_session(self):
+        sm = self.make_manager()
+        sess = self._sess(agentPane="%1")                  # agent-dead: not listed
+        sm.registry = [sess]
+        for _ in range(ha.DEAD_TMUX_STRIKES):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("tmux session is gone", sess["errorMsg"])
+        self.assertEqual(self._reaped_tmux(), [])
+
+    def test_an_unparseable_pane_line_is_cant_tell(self):
+        # A partial read could drop the live agent pane: never "dead".
+        for out in ("agent-alive\n", "agent-alive %5\ngarbage\n", " %1\n"):
+            sm = self.make_manager(listing=(0, out, ""))
+            self.assertIsNone(sm._live_tmux_panes(), out)
+        sm = self.make_manager(listing=(0, "my session %3\n\n", ""))
+        self.assertEqual(sm._live_tmux_panes(), {"my session": {"%3"}})
 
     def test_the_sweep_never_raises_onto_the_beat(self):
         # run_forever is the manager's MAIN process: a KeyError here takes every

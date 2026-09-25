@@ -1069,6 +1069,12 @@ def run(cmd, cwd=None, timeout=15):
         return ""
 
 
+def _is_pane_id(s):
+    """True for a tmux pane id (`%<digits>`)."""
+    return (isinstance(s, str) and s[:1] == "%" and s[1:].isascii()
+            and s[1:].isdigit())
+
+
 def run_out(cmd, cwd=None, timeout=15):
     """Run a command, return (rc, stripped stdout). rc is None if it couldn't
     launch or timed out — the distinction run() collapses, and the one that
@@ -18364,6 +18370,18 @@ class SessionManager:
         if rc != 0:
             prefix = f"{what} " if what else ""
             raise RuntimeError(f"{prefix}tmux launch failed: {err}")
+        # Record the agent pane's id (XERK-1037): the runtime is the command of
+        # THIS pane only, so a window the session opens itself (`tmux new-window`
+        # inside its pane lands in agent-<id>) keeps the tmux session alive after
+        # the agent exits — `_sweep_dead_sessions` reads liveness off this pane.
+        # Asked right after the launch, the session's only pane is the agent's;
+        # a failed read records nothing (the sweep's name-only fallback).
+        rc, pane = run_out(["tmux", "display-message", "-p", "-t",
+                            sess["tmuxName"], "#{pane_id}"], timeout=5)
+        if rc == 0 and _is_pane_id(pane):
+            sess["agentPane"] = pane
+        else:
+            sess.pop("agentPane", None)
 
     def _confirm_launch(self, sess, timeout, poll, probe, timeout_reason):
         """The shared launch-confirmation poll (XERK-492) behind
@@ -23160,42 +23178,55 @@ class SessionManager:
 
     # --- a session whose runtime died (XERK-868) ---------------------------
 
-    def _live_tmux_names(self):
-        """Every tmux session name this host's server currently holds, or None
-        when the answer cannot be trusted.
+    def _live_tmux_panes(self):
+        """{tmux session name: set of its pane ids} for this host's server, or
+        None when the answer cannot be trusted.
 
         ONE subprocess for the WHOLE fleet — deliberately not `has-session` per
-        session, which would put MAX_SESSIONS timeouts on the beat.
+        session, which would put MAX_SESSIONS timeouts on the beat. Panes, not
+        just sessions (XERK-1037): the runtime is the command of the agent pane
+        only, so a session that opened a window of its own outlives its agent.
 
         **"No server" is EMPTY, not unknown.** The tmux server exits with its LAST
         session, so on a host running one session — which is the reported
         incident's own shape, an operator spawning a single manual session that
-        then dies — `list-sessions` exits 1 with `no server running on …` /
+        then dies — `list-panes` exits 1 with `no server running on …` /
         `error connecting to …`. Reading that as "can't tell" left exactly the
         session this sweep exists for reading `running` forever, and
         `resume_on_boot` does not cover it: that runs only at manager START, so
         nothing would have healed it until the agent restarted.
         Every OTHER nonzero rc (a wedged tmux, a permissions error, a failure to
         launch at all) stays "can't tell" — `_sweep_dead_sessions` must err toward
-        leaving sessions alone, so only these two explicit messages mean empty."""
+        leaving sessions alone, so only these two explicit messages mean empty.
+        So does a line that does not parse: a partial read could drop a live
+        agent pane."""
         if IS_WINDOWS:
             return None      # no tmux; the pty-host liveness read is _pty_alive
         try:
             out = subprocess.run(
-                ["tmux", "list-sessions", "-F", "#{session_name}"],
+                ["tmux", "list-panes", "-a", "-F", "#{session_name} #{pane_id}"],
                 capture_output=True, text=True, timeout=5)
         except Exception:
             return None
         if out.returncode == 0:
-            return {line.strip() for line in out.stdout.splitlines() if line.strip()}
+            live = {}
+            for line in out.stdout.splitlines():
+                if not line.strip():
+                    continue
+                # rpartition: a session name may itself contain spaces.
+                name, _, pane = line.rpartition(" ")
+                if not name or not _is_pane_id(pane):
+                    return None
+                live.setdefault(name, set()).add(pane)
+            return live
         err = (out.stderr or "").lower()
         if "no server running" in err or "error connecting to" in err:
-            return set()     # the server is gone: there are NO tmux sessions
+            return {}        # the server is gone: there are NO tmux sessions
         return None
 
     def _sweep_dead_sessions(self):
-        """Stop a `running` session whose tmux is gone from reading running
-        forever (XERK-868).
+        """Stop a `running` session whose tmux — or whose agent pane — is gone
+        from reading running forever (XERK-868, XERK-1037).
 
         The runtime is its tmux session's only command, so a missing session means
         claude/qwen/dsh exited — it quit at a startup prompt, crashed, or was
@@ -23204,10 +23235,21 @@ class SessionManager:
         `can't find session: agent-<id>` as if it were the terminal, and the slot
         stayed spent.
 
+        The runtime is the command of the FIRST pane only (XERK-1037): a session
+        that opened a window of its own (`tmux new-window` inside its pane lands
+        in agent-<id>) keeps its tmux alive after the agent exits, serving that
+        leftover window as if it were the agent. A record carrying `agentPane`
+        (set by `_spawn_in_tmux`) is dead once that pane is gone even while the
+        tmux lives on, and its reap kill-sessions the leftover windows — the
+        agent that owned them has exited, Start relaunches into a fresh tmux of
+        the same name anyway, and an untracked tmux would hold its processes
+        forever. A record without `agentPane` (launched before XERK-1037, or
+        whose pane read failed) keeps the name-only rule.
+
         Conservative by construction, because the cost of a false positive is
         ending a live session:
           * a QUEUED record has no tmux by design and is skipped (status gate);
-          * an untrustworthy listing (`_live_tmux_names() is None`) is skipped
+          * an untrustworthy listing (`_live_tmux_panes() is None`) is skipped
             whole — "can't tell" is never "dead";
           * a name must be missing on `DEAD_TMUX_STRIKES` CONSECUTIVE beats, so a
             session launched between the listing and this scan, or one racing a
@@ -23221,7 +23263,7 @@ class SessionManager:
         rejoin — so it is relaunched FRESH once rather than reported as a crash,
         closing the dead-tmux loop for an unresumable shape _session_transcript_id's
         fail-safe predicate did not catch."""
-        live = self._live_tmux_names()
+        live = self._live_tmux_panes()
         if live is None:
             return
         for sess in list(self.registry):
@@ -23237,7 +23279,13 @@ class SessionManager:
             sid, tmux = sess.get("id"), sess.get("tmuxName")
             if not sid or not tmux:
                 continue
-            if tmux in live:
+            agent_pane = sess.get("agentPane")
+            # A malformed recorded id (hand-edited sessions.json) reads as
+            # unrecorded: matching nothing would reap a live agent.
+            if not _is_pane_id(agent_pane):
+                agent_pane = None
+            leftover = tmux in live      # the tmux outlived its agent pane
+            if leftover and (agent_pane is None or agent_pane in live[tmux]):
                 sess.pop("deadTmuxStrikes", None)
                 # The tmux came up: a resume that reached this beat alive is not
                 # a doomed one, so it is no longer a fresh-relaunch candidate.
@@ -23254,6 +23302,13 @@ class SessionManager:
             # tmux's raw "can't find session" text, which reads like a working
             # terminal saying something cryptic rather than a session that ended.
             self._kill_ttyd(sid)
+            # XERK-1037: the agent pane is gone but windows it opened keep the
+            # tmux alive — end them, or the slot's processes outlive the record.
+            # Bounded like the listing: this is the beat.
+            if leftover:
+                log(f"session {sid}: agent pane {agent_pane} exited; closing the "
+                    f"windows it left in {tmux}")
+                run(["tmux", "kill-session", "-t", tmux], timeout=5)
             # XERK-892: a RESUME launch whose tmux never came up is the doomed
             # `claude --resume <unresumable id>` case — the pinned transcript had
             # no entry to rejoin, so claude exited at once. (A resume that DID
@@ -23282,9 +23337,11 @@ class SessionManager:
                         f"reporting the exit")
                     # fall through to report the exit normally
             sess["stoppedAt"] = now_iso()
+            gone = ("its tmux pane is gone (windows it left open were closed)"
+                    if leftover else "its tmux session is gone")
             self._set_error(
                 sess,
-                "the coding agent exited — its tmux session is gone. It may have "
+                f"the coding agent exited — {gone}. It may have "
                 "quit at a startup prompt or crashed. The worktree and the "
                 "conversation are kept: Start resumes it.")
             self.save()
