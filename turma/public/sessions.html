@@ -55,7 +55,7 @@
        Was 340px = three. Only applies above the 820px breakpoint, where the
        sidebar goes full-width. */
     width: 366px; flex: none; border-right: 1px solid var(--hairline);
-    overflow-y: auto; padding: 14px 14px 24px; display: flex; flex-direction: column; gap: 6px;
+    overflow-y: auto; padding: 0 14px 24px; display: flex; flex-direction: column; gap: 6px;
     scrollbar-width: thin;
   }
   .sidebar h2 { font-size: 12px; margin: 16px 0 8px; font-weight: 600; color: var(--ink-2);
@@ -395,7 +395,10 @@
     color: var(--ink); background: var(--surface);
     border: 1px solid var(--border); border-radius: var(--radius-sm);
   }
-  .searchbox input:focus { outline: none; border-color: var(--accent); }
+  /* Inset ring: the box sits flush with the sidebar's top edge (padding-top 0), and
+     .sidebar's overflow clips app.css's outside 3px ring there. */
+  .searchbox input:focus { outline: none; border-color: var(--accent);
+    box-shadow: inset 0 0 0 3px var(--focus-ring); }
   .searchbox .clr {
     position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
     border: 0; background: none; color: var(--muted); cursor: pointer;
