@@ -242,6 +242,9 @@
   details.ended-wrap-sec summary { cursor: pointer; user-select: none; margin: 4px 0 8px; }
   /* Collapsed, the summary is the sidebar's last row: no gap under it (operator ask). */
   details.ended-wrap-sec:not([open]) summary { margin-bottom: 0; }
+  /* Open, the list is the last row: keep the old 24px so the last card's border isn't
+     clipped by .sidebar's overflow edge. Phones already have .sidebar's 84px nav clearance. */
+  @media (min-width: 821px) { details.ended-wrap-sec[open] { padding-bottom: 24px; } }
   details.ended-wrap-sec summary h2 { display: inline; margin: 0; }
   details.ended-wrap-sec summary:hover h2 { color: var(--ink); }
   details.ended-wrap-sec .s-list { gap: 8px; }
