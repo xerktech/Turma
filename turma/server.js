@@ -13044,16 +13044,21 @@ registerGuardMirror("autoCloseNotified", {
 // follow-up must branch fresh: auto-merge squash-merges and deletes the branch
 // (TURMA_AUTOMERGE_DELETE_BRANCH), so re-pushing the old branch would re-propose
 // the already-squashed commits. Names the newly-merged PR(s) so a multi-PR session
-// knows which change to verify; only plain URLs are interpolated (agent-reported).
+// knows which change to verify. The urls are AGENT-reported, so only a bounded,
+// URL-charset-only string is interpolated: an oversize one would push the text past
+// the agent's input cap (send_input refuses the WHOLE message, so the session would
+// never hear its PR merged), and a looser shape lets arbitrary text into the pane.
+const AUTO_CLOSE_URL_RE = /^https?:\/\/[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]{1,300}$/;
 function autoCloseMergedMessage(urls) {
-  const named = (urls || []).filter((u) => typeof u === "string" && /^https?:\/\/\S+$/.test(u));
-  const which = named.length ? " (" + named.join(", ") + ")" : "";
-  return `Your PR${which} has been merged. Now verify the change is deployed and `
+  const named = (urls || []).filter((u) => typeof u === "string" && AUTO_CLOSE_URL_RE.test(u));
+  const which = named.length === 1 ? "PR " + named[0] + " has"
+    : named.length ? "PRs " + named.join(", ") + " have" : "PR has";
+  return `Your ${which} been merged. Now verify the change is deployed and `
     + "working — the deploy/release has actually rolled out and the fix behaves "
     + "correctly where it runs (if this repo has no deploy step, verify it on the "
     + "updated default branch). If it is NOT deployed or NOT working, keep working "
-    + "on it: branch fresh from the updated default branch (the merged branch was "
-    + "squash-merged and deleted) and open a follow-up PR from this session — it "
+    + "on it: branch fresh from the updated default branch (don't reuse the merged "
+    + "branch — auto-merge squashes it) and open a follow-up PR from this session — it "
     + "will be auto-merged the same way and you will be asked to verify again. "
     + "If it IS deployed and working and all the work for this ticket is done, "
     + "mark the ticket as Done (move it to the Done column) so this session can "
@@ -13290,7 +13295,10 @@ function autoCloseSweep() {
       // have NOT already announced for this session is present, so a follow-up PR
       // merging nudges again while a repeat sweep over the same set stays quiet.
       const nk = host + "\x00" + s.id;
-      const mergedUrls = prs.filter(isMerged).map((p) => p.url).filter(Boolean);
+      // Strings only: `seen` compares by identity, so an object url (forged/odd agent
+      // payload) would read "new" every beat and re-send the message every sweep.
+      const mergedUrls = prs.filter(isMerged).map((p) => p.url)
+        .filter((u) => typeof u === "string" && u);
       const rec = autoCloseNotified.get(nk);
       const seen = rec ? rec.urls : null;
       const fresh = seen ? mergedUrls.some((u) => !seen.has(u)) : mergedUrls.length > 0;
