@@ -20512,7 +20512,18 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.killed_ttyd, ["s1"])
         # The leftover windows are closed, not left as an untracked tmux.
         self.assertEqual(self._reaped_tmux(),
-                         [["tmux", "kill-session", "-t", "agent-alive"]])
+                         [["tmux", "kill-session", "-t", "=agent-alive"]])
+
+    def test_an_agent_pane_moved_to_another_session_is_alive(self):
+        # QA: swap-window/join-pane into another session moves the agent pane
+        # without ending it; reaping would also kill that session's window.
+        sm = self.make_manager(listing=(0, "agent-alive %6\nqa-other %1\n", ""))
+        sess = self._sess(tmuxName="agent-alive", agentPane="%1")
+        sm.registry = [sess]
+        for _ in range(ha.DEAD_TMUX_STRIKES + 1):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "running")
+        self.assertEqual(self._reaped_tmux(), [])
 
     def test_a_live_agent_pane_beside_other_windows_is_untouched(self):
         sm = self.make_manager(listing=(0, "agent-alive %1\nagent-alive %5\n"
@@ -20538,7 +20549,7 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
 
     def test_a_vanished_tmux_with_agent_pane_is_reaped_without_kill_session(self):
         sm = self.make_manager()
-        sess = self._sess(agentPane="%1")                  # agent-dead: not listed
+        sess = self._sess(agentPane="%2")                  # agent-dead: not listed
         sm.registry = [sess]
         for _ in range(ha.DEAD_TMUX_STRIKES):
             sm._sweep_dead_sessions()

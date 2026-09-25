@@ -18362,7 +18362,9 @@ class SessionManager:
         one at the session's worktree, with the fixed 220x50 geometry every
         launcher uses. Raises RuntimeError on a tmux failure (`what` names the
         runtime in the message; empty for the claude path)."""
-        run(["tmux", "kill-session", "-t", sess["tmuxName"]])  # ensure clean slate
+        # `=` = exact match: once the name is gone tmux falls back to a PREFIX
+        # match, killing some other `agent-<id>…` session.
+        run(["tmux", "kill-session", "-t", "=" + sess["tmuxName"]])  # clean slate
         rc, err = run_ok([
             "tmux", "new-session", "-d", "-s", sess["tmuxName"],
             "-c", sess["worktreePath"], "-x", "220", "-y", "50", cmd,
@@ -19826,7 +19828,7 @@ class SessionManager:
         if IS_WINDOWS:
             _pty_teardown(sess.get("tmuxName"))
             return
-        run(["tmux", "kill-session", "-t", sess["tmuxName"]])
+        run(["tmux", "kill-session", "-t", "=" + sess["tmuxName"]])  # exact match
 
     def _kill_ttyd(self, sid):
         # Windows: the pty-host that served the terminal was torn down by
@@ -23266,6 +23268,10 @@ class SessionManager:
         live = self._live_tmux_panes()
         if live is None:
             return
+        # Pane ids are server-unique, so the agent pane is alive wherever it is
+        # listed: a swap-window/join-pane into ANOTHER session moves it without
+        # ending it, and reaping then would kill that session's own window.
+        all_panes = set().union(*live.values()) if live else set()
         for sess in list(self.registry):
             if sess.get("status") != "running":
                 sess.pop("deadTmuxStrikes", None)
@@ -23285,7 +23291,8 @@ class SessionManager:
             if not _is_pane_id(agent_pane):
                 agent_pane = None
             leftover = tmux in live      # the tmux outlived its agent pane
-            if leftover and (agent_pane is None or agent_pane in live[tmux]):
+            if (agent_pane in all_panes if agent_pane is not None
+                    else leftover):
                 sess.pop("deadTmuxStrikes", None)
                 # The tmux came up: a resume that reached this beat alive is not
                 # a doomed one, so it is no longer a fresh-relaunch candidate.
@@ -23308,7 +23315,7 @@ class SessionManager:
             if leftover:
                 log(f"session {sid}: agent pane {agent_pane} exited; closing the "
                     f"windows it left in {tmux}")
-                run(["tmux", "kill-session", "-t", tmux], timeout=5)
+                run(["tmux", "kill-session", "-t", "=" + tmux], timeout=5)
             # XERK-892: a RESUME launch whose tmux never came up is the doomed
             # `claude --resume <unresumable id>` case — the pinned transcript had
             # no entry to rejoin, so claude exited at once. (A resume that DID

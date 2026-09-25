@@ -118,6 +118,11 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   owned them has exited, and an untracked tmux would hold its processes. A record WITHOUT
   `agentPane` (pre-XERK-1037, failed read, malformed) keeps the name-only rule: never reap a live
   agent on a guess. A pane line that does not parse makes the whole listing "can't tell".
+  - **The agent pane is alive wherever it is listed**, not only under its own session: pane ids are
+    server-unique, and a cross-session `swap-window`/`join-pane` moves it without ending it (reaping
+    then also killed the OTHER session's window).
+  - **Every `kill-session` on a session tmux targets `=<name>`** — a bare `-t` falls back to a
+    PREFIX match once the name is gone, killing some other `agent-<id>…` session.
 - **"No server" is EMPTY, not unknown.** The tmux server exits with its LAST session, so a host
   running exactly one session — the reported incident's own shape — gets rc 1 the moment that
   session dies. Reading that as "can't tell" left exactly the session this sweep exists for reading
