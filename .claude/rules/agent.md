@@ -44,6 +44,28 @@ Safety-guard policy: `agent-hooks.md`.
   `TestLimitsSnapshot.test_the_thread_start_never_raises_onto_the_beat`,
   `TestSessionPayloadNeverRaises`.
 
+## Memory guard (XERK-1019)
+
+Every session shares ONE memory cgroup (the pod's container / the systemd unit). A per-session
+cgroup needs a privileged pod (`/sys/fs/cgroup` ro, empty `subtree_control`, PID 1 not systemd) —
+an operator/ArgoCD decision, so the guard is userspace, earlyoom-style.
+
+- **Its own thread (`_memguard_loop`), never the beat** — the livelock it exists for stalled beats
+  for hours. Kills are staged on `memguard_kills`; the BEAT drains them to `notify_session`
+  (whose pane fallback writes the registry). Never raises.
+- **Trigger is the WORKING SET** (`memory.current - inactive_file`), never raw usage: page cache
+  fills usage to the limit on a healthy host. PSI `full avg10` triggers only within 10 points of
+  the line. No cgroup limit anywhere up the tree → host-wide `/proc/meminfo`.
+- **Kills only SESSION-OWNED trees**: owned = `TURMA_SESSION_ID` in environ (survives a
+  double-fork to PID 1) or cwd inside a session worktree; unowned (another uid's unreadable
+  process) is never touched, even if largest — it logs and leaves it to the kernel.
+- **Protected, never killed or crossed**: PID 1, the manager + its ancestors + its direct children,
+  every `claude`/`ttyd`/`tmux*`, and each tmux pane's own process (the agent, any runtime). Widening
+  the victim set past this kills the sessions the guard exists to save.
+- **Kill through a pidfd opened BEFORE the start-time re-check** (`_memguard_kill`) — the only
+  order that makes a reused pid unreachable. Cooldown after a kill so one runaway costs one tree.
+- Tests: `TestMemoryGuard`.
+
 ## Commands
 
 Lifecycle (`spawn`/`kill`/`start`/`restart`/`delete`/`resume`/`resumeTranscript`) per the session
