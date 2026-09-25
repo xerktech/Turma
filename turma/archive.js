@@ -315,8 +315,13 @@ function noteWrite(absPath) {
 const RAW_REMOTE_HOOKS = ["pending", "pendingSize", "pendingFiles", "pendingBytes"];
 let rawRemote = null;
 function setRawRemote(hooks) {
-  rawRemote = hooks && RAW_REMOTE_HOOKS.every((h) => typeof hooks[h] === "function")
-    ? hooks : null;
+  if (hooks == null) { rawRemote = null; return; }
+  // An incomplete set must FAIL LOUD, never quietly unwire: a null rawRemote turns
+  // every pending guard off, which is the of-record truncation XERK-1043 exists
+  // to prevent (QA pass 2).
+  const missing = RAW_REMOTE_HOOKS.filter((h) => typeof hooks[h] !== "function");
+  if (missing.length) throw new Error(`setRawRemote: missing hook(s) ${missing.join(", ")}`);
+  rawRemote = hooks;
 }
 function rawRemotePending(full) {
   if (!rawRemote) return false;

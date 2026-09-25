@@ -479,3 +479,43 @@ test("fetchRawUnder answers at its timeout while the store hangs (QA L1)", async
   }
   assert.equal(fs.readFileSync(path.join(root, "repo", "a.jsonl.raw", "t", "t.jsonl"), "utf8"), "x");
 });
+
+test("setRawRemote refuses an incomplete hook set instead of unwiring the guards", () => {
+  const archive = require("../archive.js");
+  assert.throws(() => archive.setRawRemote({ pending: () => false, pendingBytes: () => 0 }),
+    /missing hook\(s\) pendingSize, pendingFiles/);
+  archive.setRawRemote(null); // explicit unwire stays allowed
+});
+
+test("a route fetches at most 4 raw objects at once", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  for (let i = 0; i < 10; i++) store.map.set(`repo/a.jsonl.raw/t/f${i}.jsonl`, Buffer.from("x"));
+  let inFlight = 0, peak = 0;
+  const get = store.getToFile;
+  store.getToFile = async (k, d) => {
+    inFlight++; peak = Math.max(peak, inFlight);
+    await new Promise((r) => setTimeout(r, 5));
+    inFlight--;
+    return get(k, d);
+  };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  await m.hydrate();
+  assert.equal(await m.fetchRawUnder(path.join(root, "repo", "a.jsonl.raw", "t")), 0);
+  assert.equal(peak, 4);
+});
+
+test("a rendered download cut mid-body leaves nothing at its real path", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.map.set("repo/a.jsonl", Buffer.alloc(5000, 0x61));
+  store.getToFile = async (key, dest) => {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, Buffer.alloc(100, 0x61)); // the part that arrived
+    throw new Error("socket hang up");
+  };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  assert.equal(await m.hydrate(), 0);
+  assert.equal(fs.existsSync(path.join(root, "repo", "a.jsonl")), false);
+  assert.deepEqual(fs.readdirSync(path.join(root, ".raw-fetch")), []);
+});

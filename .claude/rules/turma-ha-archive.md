@@ -123,13 +123,15 @@ of-record**, so both halves of the ADR split now hold:
     replica never re-pulls the whole agent-held raw layer. Only an INGEST ask queues a fetch.
   - A fetch re-checks pending before its GET and before its rename: renaming the bucket copy over a
     file that landed (and grew) meanwhile regresses the cursor (QA D2).
-  - Fetches land in `ARCHIVE_DIR/.raw-fetch/` and are RENAMED into place (a half-written file must
-    never be visible at a path whose size is a cursor). `getToFile` destroys its stream on any
+  - EVERY hydrate download (rendered too) lands in `ARCHIVE_DIR/.raw-fetch/` and is RENAMED into
+    place (`_download`): a half-written file must never be visible at a path whose size is a cursor. `getToFile` destroys its stream on any
     failure: an open fd kept the unlinked temp's bytes allocated, invisible to `du` (QA D4).
   - `rawBytes` = local walk + `pendingBytes`, where pending counts only the bucket's EXCESS over a
     partial local copy — counting the full size double-counts it and refuses ingest (QA D3).
   - Routes `await fetchRawUnder(dir)` (4 at a time, answering 503 "still syncing" after 10s while the
     fetches carry on) — never the S3 client's 60s timeout.
+  - `archive.setRawRemote` THROWS on an incomplete hook set: silently unwiring disables every
+    pending guard.
   - Hydrate takes sizes from the listing (`listSizes`, ListObjectsV2 `<Size>`): no HEAD per key.
   - Tests: `archive-mirror.test.js` (the `QA D1`–`D3`/`L1` cases), `blobstore.test.js` (fd leak).
 - **`reindex` is INJECTED and is a NO-OP when the Postgres index is wired** (XERK-780): the byte

@@ -216,9 +216,10 @@ class ArchiveMirror {
       }
       for (const { key, dest } of downloads) {
         try {
-          fs.mkdirSync(path.dirname(dest), { recursive: true });
-          const ok = await this.blobStore.getToFile(key, dest);
-          if (ok) fetched++;
+          // Through a temp file too: a GET cut mid-body left a PARTIAL rendered
+          // file at its real path, which ingest would then append to and the
+          // drain PUT over the complete object (XERK-1043 QA, pass 2).
+          if (await this._download(key, dest)) fetched++;
         } catch (e) {
           this.log(`archive hydrate: ${key} failed (${e && e.message}); skipped`);
         }
@@ -329,20 +330,11 @@ class ArchiveMirror {
     const run = (async () => {
       const dest = this.pathFor(key);
       if (!dest) return;
-      // A dot-directory at the archive root: every tree walk in archive.js either
-      // skips it or finds no `.jsonl` in it, and it shares the volume, so the
-      // rename is atomic.
-      const tmpDir = path.join(this.archiveDir, ".raw-fetch");
-      const tmp = path.join(tmpDir, `${process.pid}-${++this._tmpSeq}.part`);
       try {
-        fs.mkdirSync(tmpDir, { recursive: true });
-        const ok = await this.blobStore.getToFile(key, tmp);
-        if (!this._isPending(key)) return;
-        if (ok) {
-          fs.mkdirSync(path.dirname(dest), { recursive: true });
-          fs.renameSync(tmp, dest);
-        }
         // Landed, or gone from the bucket (404) — either way no longer pending.
+        // The re-check runs AFTER the GET, before the rename (see above).
+        await this._download(key, dest, () => this._isPending(key));
+        if (!this._isPending(key)) return;
         const root = rawRootOf(key);
         const map = this._rawPending.get(root);
         if (map) {
@@ -352,13 +344,32 @@ class ArchiveMirror {
       } catch (e) {
         this._logFetchFailure(key, e);
         throw e;
-      } finally {
-        try { fs.unlinkSync(tmp); } catch { /* renamed, or never written */ }
       }
     })();
     this._rawInflight.set(key, run);
     run.then(() => this._rawInflight.delete(key), () => this._rawInflight.delete(key));
     return run;
+  }
+
+  // GET `key` into a temp file and RENAME it to `dest`, so `dest` only ever holds a
+  // complete object (a file's size is its ingest cursor). The temp lives in a
+  // dot-directory at the archive root: every tree walk in archive.js either skips
+  // it or finds no `.jsonl` in it, and it shares the volume, so the rename is
+  // atomic. `stillWanted` is re-asked after the GET: false discards the download.
+  // Returns true when `dest` was written, false on a 404 or a discard.
+  async _download(key, dest, stillWanted = () => true) {
+    const tmpDir = path.join(this.archiveDir, ".raw-fetch");
+    const tmp = path.join(tmpDir, `${process.pid}-${++this._tmpSeq}.part`);
+    try {
+      fs.mkdirSync(tmpDir, { recursive: true });
+      const ok = await this.blobStore.getToFile(key, tmp);
+      if (!ok || !stillWanted()) return false;
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.renameSync(tmp, dest);
+      return true;
+    } finally {
+      try { fs.unlinkSync(tmp); } catch { /* renamed, or never written */ }
+    }
   }
 
   // A store outage fails every fetch; say so once a minute, not once per file.
