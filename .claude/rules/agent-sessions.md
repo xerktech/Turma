@@ -146,6 +146,19 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   re-triggers from `awaitCloneOwner`.
 - Capacity rides the heartbeat as `capacity` = {maxSessions, running, queued, free, rootRunning}
   (`_capacity_payload`); `free` never negative.
+- **`free` counts SLOTS USED, not running alone (XERK-1044).** A slot is held by any
+  `SLOT_HOLDING_STATUSES` record — `running` OR `error`. A broken (`error`) session keeps its worktree
+  and conversation (`_sweep_dead_sessions` reaps a dead tmux to `error` so "Start resumes it"), so its
+  slot is not free; reporting it free let the hub auto-start fresh sessions into the very slots crashed
+  sessions needed to come back to, then refused the Start because the host was genuinely at
+  `MAX_SESSIONS`. Every capacity gate (spawn/drain/resume/`_resume_at_cwd`) uses `_slots_used()`; only
+  `start()` passes `exclude_id=<that session>`, because Start transitions its OWN already-held `error`
+  slot to `running` (net zero) and must never be refused for it. `queued` holds no slot (no worktree
+  yet; the hub subtracts it from headroom separately); `stopped` holds none either (worktree vanished,
+  and the drain has always treated going `stopped` as freeing the slot). Delete — not Start — releases
+  a held `error` slot. `capacity.running` stays running-only. Tests:
+  `test_slots_used_counts_broken_sessions_against_capacity`,
+  `test_a_broken_session_can_still_be_started_at_capacity`.
 - Queued sessions are killable (nothing to tear down); resume-on-boot skips them (drainer picks up),
   as do archival/usage/PR scans.
 - **The agent queue is for spawns whose HOST is already the decision** (an explicit "+ New session",

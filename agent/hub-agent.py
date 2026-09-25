@@ -215,6 +215,22 @@ REPOS_ROOT = os.environ.get("REPOS_ROOT", _default_repos_root())
 MAX_SESSIONS = _env_int("MAX_SESSIONS", 6, minimum=1)
 TTYD_PORT_BASE = _env_int("TTYD_PORT_BASE", 7700, minimum=1, maximum=65535)
 
+# Registry statuses that HOLD a slot against MAX_SESSIONS (XERK-1044). A `running`
+# session obviously does; a broken (`error`) one does too, because its
+# worktree AND conversation are KEPT (`_sweep_dead_sessions` reaps a dead tmux to
+# `error` precisely so "Start resumes it") — so a Start re-occupies a REAL slot.
+# Counting the broken ones is what stops the hub reading their slots as free
+# capacity: without it a crashed session reads as a free slot, the hub auto-starts
+# a fresh session into it, the host fills to MAX_SESSIONS with running work, and
+# the crashed session can then NEVER be Started (every slot is genuinely spent).
+# `queued` is absent — no worktree yet, so it holds no slot (the hub subtracts it
+# from headroom separately). `stopped` is absent too, and DELIBERATELY: it means
+# the worktree VANISHED (resume_on_boot demotes a worktree-less session to it), so
+# it holds no slot on disk, and the queue drain has always treated a session going
+# `stopped` as FREEING its slot. Delete (not Start) is what releases a held
+# `error` slot: it drops the record and removes the worktree.
+SLOT_HOLDING_STATUSES = frozenset({"running", "error"})
+
 # Reserved pseudo-repo name for a session that runs directly at REPOS_ROOT
 # (spanning every repo) instead of inside one repo's worktree. It is NOT a git
 # worktree: no branch, no base/branch-name option, no worktree add/remove —
@@ -17730,6 +17746,19 @@ class SessionManager:
     def _running_count(self):
         return sum(1 for s in self.registry if s.get("status") == "running")
 
+    def _slots_used(self, exclude_id=None):
+        """Sessions HOLDING a slot against MAX_SESSIONS (XERK-1044) — running plus
+        broken (`error`), since a broken session keeps a worktree the operator can
+        Start back into. This is the count every capacity gate uses, so a crashed
+        session no longer reads as free capacity the hub fills with fresh work.
+
+        `exclude_id` drops one record from the tally — for `start()`, whose target
+        is ALREADY an `error` record in this set: it is transitioning to `running`
+        (net zero), so it must never be refused for the slot it already holds."""
+        return sum(1 for s in self.registry
+                   if s.get("status") in SLOT_HOLDING_STATUSES
+                   and not (exclude_id is not None and s.get("id") == exclude_id))
+
     def _queued_count(self):
         return sum(1 for s in self.registry if s.get("status") == "queued")
 
@@ -17751,10 +17780,14 @@ class SessionManager:
             "maxSessions": MAX_SESSIONS,
             "running": running,
             "queued": self._queued_count(),
-            # Never negative: MAX_SESSIONS can be lowered under a host that is
-            # already over it, and "-2 free slots" is not something the hub
-            # should have to reason about.
-            "free": max(0, MAX_SESSIONS - running),
+            # `free` is against SLOTS USED (running + broken), NOT running alone
+            # (XERK-1044): a broken session keeps its worktree and can be
+            # Started, so its slot is not free — reporting it free is what let the
+            # hub auto-start fresh sessions into the very slots crashed sessions
+            # need to come back to. Never negative: MAX_SESSIONS can be lowered
+            # under a host already over it, and "-2 free slots" is not something
+            # the hub should have to reason about.
+            "free": max(0, MAX_SESSIONS - self._slots_used()),
             # How many root (repos-root) sessions are live on this host. Purely
             # informational: root sessions are bounded by MAX_SESSIONS like any
             # other, not by a separate one-per-host slot.
@@ -20022,7 +20055,7 @@ class SessionManager:
         # REPOS_ROOT (they share a project slug, but transcripts are per-session
         # and the RC bridge pointer is last-writer-wins), capped only by MAX.
         reason = None
-        if self._running_count() >= MAX_SESSIONS:
+        if self._slots_used() >= MAX_SESSIONS:
             reason = "capacity"
         elif awaiting_clone:
             reason = "awaiting-clone"
@@ -20257,7 +20290,7 @@ class SessionManager:
 
         Head-of-line is skipped, not blocking: a session still waiting on its
         clone doesn't hold up a capacity-only one behind it."""
-        if self._running_count() >= MAX_SESSIONS:
+        if self._slots_used() >= MAX_SESSIONS:
             return  # no slot to drain into; nothing below can change that
         # The XERK-375 deadline rescue is the ONE place this loop touches the
         # network (a `git fetch`), so it is capped at one per beat: a second
@@ -20868,7 +20901,11 @@ class SessionManager:
             return
         if sess.get("status") == "running":
             return
-        if self._running_count() >= MAX_SESSIONS:
+        # Exclude THIS session: it is an error record already counted in
+        # slots-used (XERK-1044), and Start only transitions it to running (net
+        # zero) — refusing it for the slot it already holds is the exact deadlock
+        # this ticket removes.
+        if self._slots_used(exclude_id=sid) >= MAX_SESSIONS:
             log(f"start refused: at MAX_SESSIONS ({MAX_SESSIONS})")
             return
         try:
@@ -20898,7 +20935,7 @@ class SessionManager:
         if not rec:
             log(f"resume: no closed session {sid}")
             return
-        if self._running_count() >= MAX_SESSIONS:
+        if self._slots_used() >= MAX_SESSIONS:
             log(f"resume refused: at MAX_SESSIONS ({MAX_SESSIONS})")
             return
         sess = {
@@ -21142,7 +21179,7 @@ class SessionManager:
             return None
         repo, _origin, is_root = cls
         cwd = os.path.normpath(cwd)
-        if self._running_count() >= MAX_SESSIONS:
+        if self._slots_used() >= MAX_SESSIONS:
             refuse(f"the host is at MAX_SESSIONS ({MAX_SESSIONS})")
             return None
         # One live session per NON-ROOT cwd: two claudes in the same repo dir

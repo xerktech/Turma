@@ -10197,6 +10197,34 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         pay = sm._session_payload(q, refresh=False)
         self.assertEqual(pay["queuedReason"], "capacity")
 
+    def test_a_new_spawn_queues_when_a_broken_session_holds_the_last_slot(self):
+        # XERK-1044: the slot held by a broken (error) session must ALSO refuse a
+        # NEW spawn, not just show as unavailable — this is what stops the host
+        # over-subscribing past MAX_SESSIONS with broken sessions still on the
+        # books. Distinct from test_spawn_at_max_sessions_queues_instead_of_refusing
+        # (a RUNNING session holds the slot there): here the ONLY slot is held by an
+        # `error` record, so a gate counting running-only would wrongly provision.
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        p = mock.patch.object(ha, "MAX_SESSIONS", 1)
+        p.start()
+        self.addCleanup(p.stop)
+        sm.registry = [{"id": "aaaaa", "status": "error", "ttydPort": 7700,
+                        "errorMsg": "the coding agent exited"}]
+        self.run_ok_calls.clear()
+        sm.spawn("Turma")
+        self.assertEqual(len(sm.registry), 2)
+        q = sm.registry[1]
+        self.assertEqual(q["status"], "queued")
+        self.assertEqual(q["queuedReason"], "capacity")
+        self.assertFalse(any("worktree" in c and "add" in c for c in self.run_ok_calls))
+        # And the drain does NOT provision it while the broken session holds the
+        # slot — only Delete (which drops the error record) or Start frees it.
+        self.run_ok_calls.clear()
+        sm._drain_queue()
+        self.assertEqual(q["status"], "queued")
+        self.assertFalse(any("worktree" in c and "add" in c for c in self.run_ok_calls))
+
     def test_drain_queue_provisions_when_a_slot_frees(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
@@ -10270,6 +10298,50 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         # free never goes negative even when the cap is lowered under a full host.
         with mock.patch.object(ha, "MAX_SESSIONS", 1):
             self.assertEqual(sm._capacity_payload()["free"], 0)
+
+    def test_slots_used_counts_broken_sessions_against_capacity(self):
+        # XERK-1044: a broken (error) session keeps its worktree and can be
+        # Started, so it must NOT read as free capacity — else the hub auto-starts
+        # fresh work into the slot the crashed session needs to come back to.
+        sm = self.make_spawn_ready_manager([])
+        p = mock.patch.object(ha, "MAX_SESSIONS", 3)
+        p.start()
+        self.addCleanup(p.stop)
+        sm.registry = [
+            {"id": "a", "status": "running"},
+            {"id": "b", "status": "error"},    # crashed, worktree kept -> a slot
+            {"id": "c", "status": "queued"},   # no worktree yet -> holds no slot
+            {"id": "d", "status": "stopped"},  # worktree gone -> frees its slot
+        ]
+        self.assertEqual(sm._slots_used(), 2)  # running + error only
+        cap = sm._capacity_payload()
+        self.assertEqual(cap["running"], 1)    # `running` stays running-only
+        self.assertEqual(cap["queued"], 1)
+        self.assertEqual(cap["free"], 1)       # 3 - (running + error)
+        # Excluding the broken session itself (what start() does) drops it.
+        self.assertEqual(sm._slots_used(exclude_id="b"), 1)
+
+    def test_a_broken_session_can_still_be_started_at_capacity(self):
+        # The deadlock XERK-1044 removes: running + error == MAX_SESSIONS and the
+        # operator Starts the error session. It ALREADY holds its slot, so Start is
+        # a net-zero transition and must NOT be refused (it once was, leaving a
+        # crashed session unrecoverable while fresh sessions filled every slot).
+        sm = self.make_spawn_ready_manager([])
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        p = mock.patch.object(ha, "MAX_SESSIONS", 2)
+        p.start()
+        self.addCleanup(p.stop)
+        sm.registry = [
+            {"id": "a", "status": "running"},
+            # root=True skips the worktree re-add; error keeps the record around.
+            {"id": "b", "status": "error", "root": True, "errorMsg": "died",
+             "ttydPort": 7701, "worktreePath": None},
+        ]
+        sm.start("b")
+        self.assertEqual(sm._find("b")["status"], "running")
+        self.assertIsNone(sm._find("b")["errorMsg"])
+        sm._launch_tmux.assert_called_once()
 
     def test_kill_drops_record_but_keeps_worktree(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
