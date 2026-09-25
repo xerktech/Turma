@@ -113,6 +113,11 @@ of-record**, so both halves of the ADR split now hold:
   A failed listing (or a rendered GET that never landed) used to return and open
   ingest over an empty tree with Postgres cursors: agents re-shipped tails onto missing files and
   the drain PUT those over the complete objects (reproduced on MinIO: 30190 → 324 bytes).
+  - The gate lives in `mirror.hydrateGated(setGate)`, not inline in server.js, so a test pins it.
+  - Accepted trade-off: ONE rendered key that never downloads (403, local EACCES/ENOSPC) keeps
+    this replica's archive ingest closed indefinitely. Fail closed (agents re-offer, nothing is
+    lost) over fail open (truncation). The retry line names the cause (`lastFailure`), one line
+    per attempt. A per-transcript gate is the refinement (XERK-1050).
 - **The raw layer is LAZY (XERK-1043)** — keys under `<x>.jsonl.raw/` are ~83% of the bucket, and
   pulling them into every replica's size-limited `/data` emptyDir evicted each pod mid-hydrate once
   the bucket outgrew it (8.55 GiB vs 8Gi, 2026-09-25). Hydrate records them as REMOTE-PENDING

@@ -4309,10 +4309,8 @@ async function hydrateArchiveOnce() {
     // a missing or half-downloaded local tree, the agents' re-shipped tails became
     // partial files the drain PUT over the complete objects. hydrateArchiveIndex
     // re-sets the gate synchronously on entry, so there is no gap between the two.
-    archive.setHydrating(true);
-    try { await archiveMirror.hydrateUntilListed(); }
+    try { await archiveMirror.hydrateGated((v) => archive.setHydrating(v)); }
     catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
-    finally { archive.setHydrating(false); }
   }
   await hydrateArchiveIndex();
 }
