@@ -13036,13 +13036,29 @@ registerGuardMirror("autoCloseNotified", {
   },
 });
 // The message typed into the session (the operator `input` path, so it survives a
-// compaction via the agent's pendingInputs outbox — agent-input.md). Kept close to
-// the ticket's own wording; it is a directive to act, not third-party text, so it
-// rides `input`/send_input rather than the peer inbox.
-const AUTO_CLOSE_MERGED_MESSAGE =
-  "That PR has been merged. If all the work for this ticket is done, mark the "
-  + "ticket as Done (move it to the Done column) so this session can wrap up — "
-  + "otherwise, keep going and it will re-check when your next PR lands.";
+// compaction via the agent's pendingInputs outbox — agent-input.md). It is a
+// directive to act, not third-party text, so it rides `input`/send_input rather
+// than the peer inbox. A merge is not the finish line: the session must confirm the
+// change actually DEPLOYED and WORKS before it closes the ticket, and otherwise keep
+// going — a follow-up PR it opens is auto-merged and re-fires this message. The
+// follow-up must branch fresh: auto-merge squash-merges and deletes the branch
+// (TURMA_AUTOMERGE_DELETE_BRANCH), so re-pushing the old branch would re-propose
+// the already-squashed commits. Names the newly-merged PR(s) so a multi-PR session
+// knows which change to verify; only plain URLs are interpolated (agent-reported).
+function autoCloseMergedMessage(urls) {
+  const named = (urls || []).filter((u) => typeof u === "string" && /^https?:\/\/\S+$/.test(u));
+  const which = named.length ? " (" + named.join(", ") + ")" : "";
+  return `Your PR${which} has been merged. Now verify the change is deployed and `
+    + "working — the deploy/release has actually rolled out and the fix behaves "
+    + "correctly where it runs (if this repo has no deploy step, verify it on the "
+    + "updated default branch). If it is NOT deployed or NOT working, keep working "
+    + "on it: branch fresh from the updated default branch (the merged branch was "
+    + "squash-merged and deleted) and open a follow-up PR from this session — it "
+    + "will be auto-merged the same way and you will be asked to verify again. "
+    + "If it IS deployed and working and all the work for this ticket is done, "
+    + "mark the ticket as Done (move it to the Done column) so this session can "
+    + "wrap up.";
+}
 // "<siteKey>\x00<epicKey>" epics already written to Done by epicRunCompleteSweep,
 // so the epic-Done write fires at most once per hub lifetime. The DURABLE guard is
 // the run's own persisted state:"done" — this Set
@@ -13279,7 +13295,8 @@ function autoCloseSweep() {
       const seen = rec ? rec.urls : null;
       const fresh = seen ? mergedUrls.some((u) => !seen.has(u)) : mergedUrls.length > 0;
       if (fresh) {
-        queueCommand(host, { type: "input", sessionId: s.id, text: AUTO_CLOSE_MERGED_MESSAGE });
+        const newly = seen ? mergedUrls.filter((u) => !seen.has(u)) : mergedUrls;
+        queueCommand(host, { type: "input", sessionId: s.id, text: autoCloseMergedMessage(newly) });
         const at = Date.now();
         autoCloseNotified.set(nk, { at, urls: new Set(mergedUrls) });
         guardStoreSet("autoCloseNotified", nk, { at, urls: [...mergedUrls] });

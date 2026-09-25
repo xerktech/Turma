@@ -261,6 +261,13 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
       "until the ticket is marked Done and the session auto-closes." In-memory like `autoStopped`: a
       restart at worst re-sends one message. The `epicRunCompleteSweep` epic-Done write is unchanged
       (an epic has no session to message).
+    - **The message is "verify it DEPLOYED and WORKS, then Done" (`autoCloseMergedMessage`), never
+      "merged, so Done"** — a merge is not the finish line. It names only the NEWLY-merged url(s) and
+      tells a failing session to open the follow-up on a FRESH branch off the updated default branch:
+      the squash + `--delete-branch` merge means re-pushing the old branch re-proposes squashed commits.
+    - **Multi-PR is the designed loop**: merge sweep skips landed PRs and merges each new one; close
+      re-fires per new merged url; a Done ticket stands both down. Tests: `auto-close:`/`auto-merge +
+      auto-close run through MULTIPLE PRs` in `server.test.js`.
 - **GitHub only for now** — the agent's `merge_pr` refuses a GitLab MR / ADO PR (staged `ok:false`)
   so the hub gives up rather than retrying. Merge method is `--squash --delete-branch`,
   env-overridable (`TURMA_AUTOMERGE_METHOD`/`_DELETE_BRANCH`).
