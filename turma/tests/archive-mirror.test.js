@@ -583,7 +583,7 @@ test("hydrateGated holds the ingest gate closed until the hydrate completes (XER
   assert.deepEqual(gate, [true, false]);          // closed once, opened once, at the end
   assert.deepEqual(gateAtSleep, [true, true]);    // closed across every retry
   assert.ok(fs.existsSync(path.join(root, "repo", "a.jsonl")));
-  assert.match(logs.join("\n"), /listing the bucket failed \(ECONNREFUSED\)/);
+  assert.match(logs.join("\n"), /listing the bucket failed \(ECONNREFUSED\) — is the object store reachable\? Archive ingest/);
   // ...and released even when the hydrate throws.
   const m2 = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
   m2.hydrateUntilListed = async () => { throw new Error("boom"); };
@@ -617,6 +617,8 @@ test("persistent download failures log one summary per attempt, naming the cause
   assert.equal(m.hydrated, true);
   const retries = logs.filter((l) => /incomplete/.test(l));
   assert.equal(retries.length, 3);                // one line per attempt, not 50
+  assert.equal(logs.length, 4, logs.join("\n"));  // + the raw-pending line; no per-key lines
+  assert.doesNotMatch(retries[0], /\?\./);
   assert.match(retries[0], /50 rendered download\(s\) failed, e\.g\. .*HTTP 403/);
   assert.doesNotMatch(retries[0], /object store reachable/); // a 403 is not an outage
   assert.equal(logs.filter((l) => /raw-layer object/.test(l)).length, 1); // said once

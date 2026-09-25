@@ -239,7 +239,7 @@ class ArchiveMirror {
       // across a whole prod listing was ~9000 lines a minute (XERK-1048 QA).
       this.hydrated = failures.length === 0;
       this.lastFailure = failures.length
-        ? `${failures.length} rendered download(s) failed, e.g. ${failures.slice(0, 3).join("; ")}`
+        ? `${failures.length} rendered download(s) failed, e.g. ${failures.slice(0, 3).join("; ")}.`
         : null;
       // Reindex whatever landed, so search + cursors reflect the hydrated store.
       // Never fatal — a rebuild hiccup leaves the index stale, not the hub down.
@@ -264,7 +264,7 @@ class ArchiveMirror {
     let fetched = await this.hydrate();
     for (let delay = firstDelayMs; this.blobStore && !this.hydrated;
       delay = Math.min(delay * 2, maxDelayMs)) {
-      this.log(`archive hydrate: incomplete — ${this.lastFailure}. Archive ingest ` +
+      this.log(`archive hydrate: incomplete — ${this.lastFailure} Archive ingest ` +
         `stays closed on this replica; retrying in ${Math.round(delay / 1000)}s`);
       await sleep(delay);
       fetched = await this.hydrate();
