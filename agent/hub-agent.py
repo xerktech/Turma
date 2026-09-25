@@ -22553,8 +22553,13 @@ class SessionManager:
                 if name not in first or cand < first[name]:
                     first[name] = cand
         panes = {pid for _, pid in first.values()}
+        # Cache only a listing that saw EVERY running session, each pane still
+        # alive to be timed: one missing (mid-relaunch, or its tmux just died)
+        # would come back as a new pane no cached entry vouches for.
+        cached = {(pid, _proc_start_time(pid)) for pid in panes}
         self._memguard_panes_cache = (
-            names, {(pid, _proc_start_time(pid)) for pid in panes})
+            (names, cached) if names <= first.keys()
+            and all(start is not None for _, start in cached) else None)
         return panes
 
     def _memguard_loop(self):

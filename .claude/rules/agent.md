@@ -71,7 +71,8 @@ an operator/ArgoCD decision, so the guard is userspace, earlyoom-style.
   its tmux server, and a shell pane's children (dash doesn't exec the runtime). A `claude`-named
   process or a pane on a session's own tmux is session work. Can't list tmux → the last listing
   (refreshed while healthy) only if it covers exactly today's running sessions AND each cached
-  `(pane pid, start)` is still live — a relaunch keeps the tmux name — else kill nothing.
+  `(pane pid, start)` is still live — a relaunch keeps the tmux name — else kill nothing. A
+  listing that missed a running session is never cached (its relaunched pane would be unvouched).
 - **Kill through a pidfd opened BEFORE the start-time re-check** (`_memguard_kill`) — the only
   order that makes a reused pid unreachable.
 - Tests: `TestMemoryGuard`.

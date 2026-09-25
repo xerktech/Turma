@@ -34374,6 +34374,18 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
             # reused by another process)...
             self.assertIsNone(sm._memguard_panes({}))
             self.assertIsNone(sm._memguard_panes({61: {"start": 8}}))
+        # A listing that missed a running session (its tmux mid-relaunch), or
+        # whose pane died before it was timed, is never cached at all.
+        sm.registry.append({"id": "d", "status": "running", "tmuxName": "agent-d"})
+        with mock.patch.object(ha, "run_out", return_value=(0, out)), \
+                mock.patch.object(ha, "_proc_start_time", return_value=7):
+            self.assertEqual(sm._memguard_panes(), {61})
+        self.assertIsNone(sm._memguard_panes_cache)
+        sm.registry.pop()
+        with mock.patch.object(ha, "run_out", return_value=(0, out)), \
+                mock.patch.object(ha, "_proc_start_time", return_value=None):
+            sm._memguard_panes()
+        self.assertIsNone(sm._memguard_panes_cache)
         # ...nor once a session has launched since: it would be missing.
         sm.registry.append({"id": "c", "status": "running", "tmuxName": "agent-c"})
         with mock.patch.object(ha, "run_out", return_value=(1, "")):
