@@ -15878,7 +15878,7 @@ class SessionManager:
         # since notify_session's pane fallback writes the registry.
         self.memguard_kills = []
         self._memguard_lock = threading.Lock()
-        self._memguard_panes_cache = None        # (running tmux names, pane pids)
+        self._memguard_panes_cache = None  # (running tmux names, {(pane pid, start)})
         self.usage_cache = {}                    # id -> usage_report result
         self.slug_usage = {}                     # project slug -> {acc, offsets}
                                                  # persistent incremental usage fold,
@@ -22513,7 +22513,7 @@ class SessionManager:
         threading.Thread(target=self._memguard_loop, name="memguard",
                          daemon=True).start()
 
-    def _memguard_panes(self):
+    def _memguard_panes(self, procs=None):
         """The pid of each running session's AGENT pane, or None when tmux cannot
         be listed while sessions run — the guard then kills nothing, since an
         agent it cannot identify must never look killable.
@@ -22524,9 +22524,12 @@ class SessionManager:
         opened itself (`tmux new-window` inside the pane lands in agent-<id>) is
         session work, not a place to hide a hog.
 
-        A successful listing is cached; when a fresh one fails (a fork timing out
-        under thrash), the cache stands in only if it covers exactly the running
-        sessions it was taken for — a session launched since would be missing."""
+        A successful listing is cached with each pane's start time; when a fresh
+        one fails (a fork timing out under thrash), the cache stands in only if it
+        covers exactly the running sessions it was taken for AND every cached pane
+        is still the same process in `procs` — a session launched since would be
+        missing, and one relaunched in place (same tmux name, new pane) would leave
+        its new agent unprotected."""
         names = {s.get("tmuxName") for s in list(self.registry)
                  if s.get("status") == "running" and s.get("tmuxName")}
         if not names:
@@ -22535,7 +22538,11 @@ class SessionManager:
                            "#{session_name} #{pane_id} #{pane_pid}"], timeout=5)
         if rc != 0:
             cached = self._memguard_panes_cache
-            return cached[1] if cached and cached[0] == names else None
+            if (not cached or cached[0] != names or procs is None
+                    or any(procs.get(pid, {}).get("start") != start
+                           for pid, start in cached[1])):
+                return None
+            return {pid for pid, _ in cached[1]}
         first = {}                          # session name -> (pane id, pane pid)
         for line in out.splitlines():
             rest, _, pid = line.rpartition(" ")
@@ -22546,7 +22553,8 @@ class SessionManager:
                 if name not in first or cand < first[name]:
                     first[name] = cand
         panes = {pid for _, pid in first.values()}
-        self._memguard_panes_cache = (names, panes)
+        self._memguard_panes_cache = (
+            names, {(pid, _proc_start_time(pid)) for pid in panes})
         return panes
 
     def _memguard_loop(self):
@@ -22578,7 +22586,7 @@ class SessionManager:
                 procs = {pid: p for pid, p in procs.items()
                          if (pid, p["start"]) not in signalled}
                 # AFTER the snapshot: a pane in it was launched before the listing.
-                panes = self._memguard_panes()
+                panes = self._memguard_panes(procs)
                 units = (_memguard_units(procs, os.getpid(), panes)
                          if panes is not None else [])
                 unit = _memguard_choose(units, mem[0], mem[1])
@@ -22586,10 +22594,11 @@ class SessionManager:
                     reason = ("tmux could not be listed" if panes is None else
                               "no session-owned process is using memory"
                               if not units else
-                              f"no session-owned tree is big enough to relieve "
-                              f"it alone (largest: {units[0]['comm']}, pid "
+                              f"no session-owned tree alone frees the "
+                              f"{_gib(mem[0] - (MEMGUARD_PCT - 10) / 100.0 * mem[1])}"
+                              f" needed (largest: {units[0]['comm']}, pid "
                               f"{units[0]['root']}, at most "
-                              f"{_gib(units[0]['rss'])})")
+                              f"{_gib(units[0]['rss'])} before sharing)")
                     if stuck != reason:
                         stuck = reason
                         log(f"memguard: {why}, but {reason}; leaving it to the "

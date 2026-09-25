@@ -70,7 +70,8 @@ an operator/ArgoCD decision, so the guard is userspace, earlyoom-style.
   pane id — a `new-window` inside the pane lands in agent-<id> and is session work),
   its tmux server, and a shell pane's children (dash doesn't exec the runtime). A `claude`-named
   process or a pane on a session's own tmux is session work. Can't list tmux → the last listing
-  if it covers exactly today's running sessions (refreshed while healthy), else kill nothing.
+  (refreshed while healthy) only if it covers exactly today's running sessions AND each cached
+  `(pane pid, start)` is still live — a relaunch keeps the tmux name — else kill nothing.
 - **Kill through a pidfd opened BEFORE the start-time re-check** (`_memguard_kill`) — the only
   order that makes a reused pid unreachable.
 - Tests: `TestMemoryGuard`.

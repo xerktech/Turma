@@ -34269,6 +34269,17 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
             with mock.patch.object(ha, "_memguard_pss", return_value=None):
                 self.assertEqual(ha._memguard_choose(units, 950, 1000)["root"], 1)
 
+    def test_pss_prefers_the_anon_share_over_total_pss(self):
+        rollup = ("Rss:  900 kB\nPss:  500 kB\nPss_Anon:  200 kB\n"
+                  "Pss_File:  300 kB\n")
+        with mock.patch("builtins.open", mock.mock_open(read_data=rollup)):
+            self.assertEqual(ha._memguard_pss([1, 2]), 2 * 200 * 1024)
+        old_kernel = "Rss:  900 kB\nPss:  500 kB\n"
+        with mock.patch("builtins.open", mock.mock_open(read_data=old_kernel)):
+            self.assertEqual(ha._memguard_pss([1]), 500 * 1024)
+        with mock.patch("builtins.open", side_effect=OSError):
+            self.assertIsNone(ha._memguard_pss([1]))
+
     def test_pss_counts_copy_on_write_pages_once(self):
         # 32 MiB touched, then three children sharing it copy-on-write.
         code = ("import os,sys,time\nb=bytearray(32<<20)\n"
@@ -34347,17 +34358,26 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
                        {"id": "b", "status": "stopped", "tmuxName": "agent-b"}]
         # agent-a's %9 is a window the session opened itself (new-window inside
         # its pane lands in agent-a): session work, not the agent.
-        out = ("agent-a %9 64\nagent-a %3 61\nagent-b %4 62\n"
+        # Listed in window order, which is not pane-id order after a swap-window.
+        out = ("agent-a %3 61\nagent-a %9 64\nagent-b %4 62\n"
                "my test session %5 63\nagent-a %x 65\n")
-        with mock.patch.object(ha, "run_out", return_value=(0, out)):
+        with mock.patch.object(ha, "run_out", return_value=(0, out)), \
+                mock.patch.object(ha, "_proc_start_time", return_value=7):
             self.assertEqual(sm._memguard_panes(), {61})
         # A failed listing falls back to the cache taken for the same sessions...
+        live = {61: {"start": 7}}
         with mock.patch.object(ha, "run_out", return_value=(None, "")):
-            self.assertEqual(sm._memguard_panes(), {61})
-        # ...but never once a session has launched since: it would be missing.
+            self.assertEqual(sm._memguard_panes(live), {61})
+            # ...never without a snapshot to check it against...
+            self.assertIsNone(sm._memguard_panes())
+            # ...nor once that session was relaunched in place (pane pid gone, or
+            # reused by another process)...
+            self.assertIsNone(sm._memguard_panes({}))
+            self.assertIsNone(sm._memguard_panes({61: {"start": 8}}))
+        # ...nor once a session has launched since: it would be missing.
         sm.registry.append({"id": "c", "status": "running", "tmuxName": "agent-c"})
         with mock.patch.object(ha, "run_out", return_value=(1, "")):
-            self.assertIsNone(sm._memguard_panes())
+            self.assertIsNone(sm._memguard_panes(live))
         sm.registry = []
         with mock.patch.object(ha, "run_out") as ro:
             self.assertEqual(sm._memguard_panes(), set())
