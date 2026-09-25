@@ -519,3 +519,49 @@ test("a rendered download cut mid-body leaves nothing at its real path", async (
   assert.equal(fs.existsSync(path.join(root, "repo", "a.jsonl")), false);
   assert.deepEqual(fs.readdirSync(path.join(root, ".raw-fetch")), []);
 });
+
+test("hydrateUntilListed retries until the hydrate completes (XERK-1048)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.map.set("repo/a.jsonl", Buffer.from("x\n"));
+  let down = 3;
+  const list = store.list;
+  store.list = async (p) => { if (down-- > 0) throw new Error("ECONNREFUSED"); return list(p); };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  const slept = [];
+  const n = await m.hydrateUntilListed({
+    firstDelayMs: 100, maxDelayMs: 250, sleep: async (ms) => { slept.push(ms); },
+  });
+  assert.equal(n, 1);
+  assert.equal(m.hydrated, true);
+  assert.deepEqual(slept, [100, 200, 250]); // capped exponential backoff
+  assert.ok(fs.existsSync(path.join(root, "repo", "a.jsonl")));
+});
+
+test("a failed listing is reported, not mistaken for an empty bucket", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.list = async () => { throw new Error("down"); };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  assert.equal(await m.hydrate(), 0);
+  assert.equal(m.hydrated, false);
+});
+
+test("a failed rendered download keeps the hydrate incomplete until it lands (XERK-1048)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.map.set("repo/a.jsonl", Buffer.from("a\n"));
+  store.map.set("repo/b.jsonl", Buffer.from("b\n"));
+  let failB = 2;
+  const get = store.getToFile;
+  store.getToFile = async (k, d) => {
+    if (k === "repo/b.jsonl" && failB-- > 0) throw new Error("socket hang up");
+    return get(k, d);
+  };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  const slept = [];
+  await m.hydrateUntilListed({ firstDelayMs: 10, sleep: async (ms) => { slept.push(ms); } });
+  assert.equal(m.hydrated, true);
+  assert.equal(slept.length, 2);
+  assert.equal(fs.readFileSync(path.join(root, "repo", "b.jsonl"), "utf8"), "b\n");
+});

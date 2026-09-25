@@ -4304,8 +4304,15 @@ function hydrateArchive() {
 }
 async function hydrateArchiveOnce() {
   if (archiveMirror) {
-    try { await archiveMirror.hydrate(); }
+    // Ingest stays CLOSED across the byte hydrate, not just the index hydrate
+    // below, and until the bucket has actually been listed (XERK-1048): opened over
+    // a missing or half-downloaded local tree, the agents' re-shipped tails became
+    // partial files the drain PUT over the complete objects. hydrateArchiveIndex
+    // re-sets the gate synchronously on entry, so there is no gap between the two.
+    archive.setHydrating(true);
+    try { await archiveMirror.hydrateUntilListed(); }
     catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
+    finally { archive.setHydrating(false); }
   }
   await hydrateArchiveIndex();
 }

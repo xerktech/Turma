@@ -107,6 +107,12 @@ of-record**, so both halves of the ADR split now hold:
   back to the of-record; its files are append-only + authoritative and re-mirror on the next drain. A
   leader that has been writing thus hydrates to a near-no-op. Best-effort per key; a store blip
   leaves the local copy stale, not the hub down.
+- **Ingest stays CLOSED until the byte hydrate COMPLETES (XERK-1048)** — listed AND every rendered
+  download landed (`mirror.hydrated`). `hydrateArchiveOnce` holds `setHydrating(true)` across it
+  (`hydrateUntilListed`: capped backoff, retried forever) and hands straight to the index hydrate.
+  A failed listing (or a rendered GET that never landed) used to return and open
+  ingest over an empty tree with Postgres cursors: agents re-shipped tails onto missing files and
+  the drain PUT those over the complete objects (reproduced on MinIO: 30190 → 324 bytes).
 - **The raw layer is LAZY (XERK-1043)** — keys under `<x>.jsonl.raw/` are ~83% of the bucket, and
   pulling them into every replica's size-limited `/data` emptyDir evicted each pod mid-hydrate once
   the bucket outgrew it (8.55 GiB vs 8Gi, 2026-09-25). Hydrate records them as REMOTE-PENDING
