@@ -170,15 +170,19 @@ function lowerKeys(obj) {
 // the server, so decode the five entity forms. This is pure + unit-tested.
 function parseListXml(xml) {
   const keys = [];
+  const sizes = [];
   const re = /<Contents\b[^>]*>([\s\S]*?)<\/Contents>/g;
   let m;
   while ((m = re.exec(xml))) {
     const km = /<Key>([\s\S]*?)<\/Key>/.exec(m[1]);
-    if (km) keys.push(xmlDecode(km[1]));
+    if (!km) continue;
+    keys.push(xmlDecode(km[1]));
+    const sm = /<Size>\s*(\d+)\s*<\/Size>/.exec(m[1]);
+    sizes.push(sm ? Number(sm[1]) : null);
   }
   const truncated = /<IsTruncated>\s*true\s*<\/IsTruncated>/i.test(xml);
   const tokM = /<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/.exec(xml);
-  return { keys, truncated, nextToken: tokM ? xmlDecode(tokM[1]) : null };
+  return { keys, sizes, truncated, nextToken: tokM ? xmlDecode(tokM[1]) : null };
 }
 
 function xmlDecode(s) {
@@ -314,7 +318,14 @@ class S3BlobStore {
 
   // List every key under a prefix, paging past the 1000-key truncation.
   async list(prefix) {
-    const keys = [];
+    return (await this.listSizes(prefix)).map((e) => e.key);
+  }
+
+  // The same listing as [{key, size}] — ListObjectsV2 carries each object's size,
+  // so a caller that needs sizes (the archive hydrate) is spared a HEAD per key.
+  // `size` is null if the server omitted it.
+  async listSizes(prefix) {
+    const out = [];
     let token = null;
     do {
       const query = { "list-type": "2", prefix: prefix || "" };
@@ -322,10 +333,10 @@ class S3BlobStore {
       const r = await this._request("GET", null, { query, collect: true });
       if (r.status !== 200) throw new Error(`s3 list ${prefix} -> HTTP ${r.status}`);
       const parsed = parseListXml(r.body || "");
-      for (const k of parsed.keys) keys.push(k);
+      parsed.keys.forEach((key, i) => out.push({ key, size: parsed.sizes[i] }));
       token = parsed.truncated ? parsed.nextToken : null;
     } while (token);
-    return keys;
+    return out;
   }
 
   async del(key) {

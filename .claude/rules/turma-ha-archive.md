@@ -100,13 +100,29 @@ of-record**, so both halves of the ADR split now hold:
   discipline); an ENOENT (raced operator delete) is dropped. Serialized so two workers never overlap.
   Run on an off-beat `setInterval` (`ARCHIVE_MIRROR_DRAIN_MS`, 15s) and once on graceful shutdown
   (best-effort, not awaited).
-- **`hydrate()` pulls every object down + `reindex()`** — run at boot AND on promotion (the XERK-763
+- **`hydrate()` pulls the RENDERED layer down + `reindex()`** — run at boot AND on promotion (the XERK-763
   seam, via `hydrateArchive()` in server.js). Downloads only a key whose local copy is **absent or
   SMALLER** than the object (missing, or a partial download to finish) — **never same-size-or-larger**,
   so a leader warm-restarting with un-mirrored appends (local ahead of the bucket) is NOT truncated
   back to the of-record; its files are append-only + authoritative and re-mirror on the next drain. A
   leader that has been writing thus hydrates to a near-no-op. Best-effort per key; a store blip
   leaves the local copy stale, not the hub down.
+- **The raw layer is LAZY (XERK-1043)** — keys under `<x>.jsonl.raw/` are ~83% of the bucket, and
+  pulling them into every replica's size-limited `/data` emptyDir evicted each pod mid-hydrate once
+  the bucket outgrew it (8.55 GiB vs 8Gi, 2026-09-25). Hydrate records them as REMOTE-PENDING
+  (grouped by raw root) and downloads none of them.
+  - **A pending raw file's cursor is "cannot tell" (`null`), never 0.** Its local ENOENT is not
+    "absent": an agent restarting it from 0 would build a partial local copy the drain then PUTs
+    OVER the complete object. `archive.setRawRemote` wires `rawCursor` to `rawPending`, and
+    `ingestRaw` already refuses a `null` cursor.
+  - Asking `rawPending` queues a ONE-AT-A-TIME background fetch (a beat can ask about
+    `ARCHIVE_RAW_CURSOR_MAX` files). The read-back/restore routes `await fetchRawUnder(dir)` and answer
+    503 "still syncing" if anything stayed pending.
+  - Fetches land in `ARCHIVE_DIR/.raw-fetch/` and are RENAMED into place: a raw file's size is its
+    cursor, so a half-written file must never be visible at the real path.
+  - `rawBytes` (the per-transcript raw budget) is local walk + `rawPendingBytes`, so a fresh replica
+    still knows a budget is spent.
+  - Hydrate takes sizes from the listing (`listSizes`, ListObjectsV2 `<Size>`): no HEAD per key.
 - **`reindex` is INJECTED and is a NO-OP when the Postgres index is wired** (XERK-780): the byte
   hydrate no longer rebuilds the index from files (the expensive walk) — server.js's `hydrateArchive`
   runs the Postgres index hydrate separately, AFTER the bytes. With no PG index store (HA off, or an

@@ -301,6 +301,30 @@ function noteWrite(absPath) {
   if (blobSink) { try { blobSink(absPath); } catch { /* best-effort */ } }
 }
 
+// ---- the lazily-hydrated raw layer (XERK-1043) ------------------------------
+//
+// Under HA the hydrate leaves raw-layer objects in the bucket and fetches them on
+// demand (archive-mirror.js), so a raw file can exist in the of-record while its
+// local path is ENOENT. `pending(absPath)` says so (sync; asking queues the
+// fetch) and `pendingBytes(absDir)` says how many such bytes a raw directory
+// holds. UNSET (every non-HA path) makes both no-ops.
+let rawRemote = null;
+function setRawRemote(hooks) {
+  rawRemote = hooks && typeof hooks.pending === "function" &&
+    typeof hooks.pendingBytes === "function" ? hooks : null;
+}
+function rawRemotePending(full) {
+  if (!rawRemote) return false;
+  // A hook that throws cannot say the file is local, so it is not trusted to be.
+  try { return !!rawRemote.pending(full); } catch { return true; }
+}
+// A raw directory's bytes: what is on disk plus what the bucket still holds.
+function rawLayerBytes(dir) {
+  let pending = 0;
+  if (rawRemote) { try { pending = Number(rawRemote.pendingBytes(dir)) || 0; } catch { /* 0 */ } }
+  return walkAllBytes(dir) + pending;
+}
+
 // ---- the Postgres INDEX mirror sink (XERK-780) ------------------------------
 //
 // Under HA the archive's searchable index has a shared Postgres OF-RECORD (server.js
@@ -1332,8 +1356,13 @@ function restampOrg(transcriptId, siteKey, host) {
  * EACCES/EIO/ESTALE read as 0 would re-ship the whole file and append it to the
  * copy that is still there, writing a second copy of the session into the same
  * file. Null means "cannot tell", and every caller declines to act on it.
+ *
+ * A file still waiting in the object store (XERK-1043) is also "cannot tell":
+ * its ENOENT is not "absent", and starting it over from 0 would let the drain
+ * push a partial copy over the complete object.
  */
 function rawCursor(full) {
+  if (rawRemotePending(full)) return null;
   try {
     return fs.statSync(full).size;
   } catch (e) {
@@ -1584,6 +1613,14 @@ function sessionRow(transcriptId) {
     createdAt: row.createdAt, endedTs: row.endedTs, msgCount: row.msgCount,
     filePath: row.filePath,
   };
+}
+
+/** The raw directory one transcript's files live under. null when unknown. */
+function rawDirOf(transcriptId) {
+  openDb();
+  const row = idxGetSession(transcriptId);
+  if (!row || !row.filePath) return null;
+  return rawDirFor(row.filePath, transcriptId);
 }
 
 /** One raw file's absolute path, for streaming it back. null when unknown. */
@@ -2141,7 +2178,7 @@ function rebuildIndex() {
     // directory actually give the budget back, rather than only the disk.
     // The whole suffix directory: it now holds one subdirectory per transcript
     // (see rawDirFor), and a collided canonical file legitimately has two.
-    const rawBytes = walkAllBytes(jsonl + RAW_DIR_SUFFIX);
+    const rawBytes = rawLayerBytes(jsonl + RAW_DIR_SUFFIX);
     tx(() => {
       let msgCount = 0;
       for (const line of raw.split("\n")) {
@@ -2281,7 +2318,7 @@ function reconcileHydratedCursors() {
     catch { continue; } // no local file (or unreadable): trust PG, as rebuildIndex skips it
     const sc = readSidecar(paths.meta);
     const bytesStored = sc && Number.isFinite(sc.bytesStored) ? sc.bytesStored : (row.bytesStored || 0);
-    const rawBytes = walkAllBytes(paths.jsonl + RAW_DIR_SUFFIX);
+    const rawBytes = rawLayerBytes(paths.jsonl + RAW_DIR_SUFFIX);
     if (bytesStored === row.bytesStored && fileSize === row.archiveBytes && rawBytes === row.rawBytes) continue;
     if (isPgMode()) {
       // Mutate the LIVE map row (idxFiledRows returned a copy); filePath is unchanged
@@ -2348,7 +2385,7 @@ function backfillPgIndexFromFiles() {
     // From the file/stat, never the sidecar — same rule rebuildIndex uses (a stale or
     // pre-field sidecar must not drive the byte budgets).
     const archiveBytes = Buffer.byteLength(raw);
-    const rawBytes = walkAllBytes(jsonl + RAW_DIR_SUFFIX);
+    const rawBytes = rawLayerBytes(jsonl + RAW_DIR_SUFFIX);
     const entries = [];
     for (const line of raw.split("\n")) {
       const s = line.trim();
@@ -3036,7 +3073,7 @@ module.exports = {
   RAW_DIR_SUFFIX,
   slugify, archiveRelPath, resolveNewRelPath, __RELPATH_PROBE_MAX: RELPATH_PROBE_MAX,
   ftsQuery, byteCeiling, shedFilePayloads,
-  openDb, closeDb, rebuildIndex, setBlobSink,
+  openDb, closeDb, rebuildIndex, setBlobSink, setRawRemote,
   // Boot/hydrate serialization + corrupt-cache self-heal (XERK-789) — all inert
   // off HA (`hydrating` is only ever set around the HA index hydrate).
   isHydrating, setHydrating, isSqliteCorruption, resetLocalIndex, checkIndexIntegrity,
@@ -3051,7 +3088,7 @@ module.exports = {
   ingestChunk, manifestCursors, inventoryCursors, rawCursorsForIds,
   archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).
-  ingestRaw, rawCursors, rawLimits, listRawFiles, rawFileFor,
+  ingestRaw, rawCursors, rawLimits, listRawFiles, rawFileFor, rawDirOf,
   safeRawRel, rawDirFor, rawFilePath,
   totalArchiveBytes, totalForCeiling, __resetTotalCache,
   searchArchive, listArchive, getTranscript, sessionRow, restampOrg,

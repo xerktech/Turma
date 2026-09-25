@@ -10,7 +10,7 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const path = require("path");
 const { mkdtemp } = require("./tmpdirs");
-const { ArchiveMirror } = require("../archive-mirror.js");
+const { ArchiveMirror, rawRootOf } = require("../archive-mirror.js");
 
 // A fake BlobStore: an in-memory key->Buffer map with the same async surface.
 function memStore(opts = {}) {
@@ -189,8 +189,17 @@ test("archive.js sink fires for rendered + raw writes; the bytes hydrate + reind
     archiveDir: archive2.ARCHIVE_DIR,
     reindex: () => { archive2.openDb(); archive2.rebuildIndex(); },
   });
+  archive2.setRawRemote({
+    pending: (p) => mirror2.rawPending(p),
+    pendingBytes: (d) => mirror2.rawPendingBytes(d),
+  });
   const fetched = await mirror2.hydrate();
-  assert.ok(fetched >= 3, "hydrated every layer");
+  assert.ok(fetched >= 2, "hydrated the rendered layer");
+  // The raw file stayed in the bucket (XERK-1043).
+  const rawDir = archive2.rawDirOf("tid-1");
+  assert.ok(rawDir);
+  assert.equal(fs.existsSync(path.join(rawDir, "tid-1.jsonl")), false, "raw not downloaded");
+  assert.equal(mirror2.rawPendingBytes(rawDir), rawBuf.length);
 
   const t = archive2.getTranscript("tid-1");
   assert.ok(t, "transcript reads back after hydrate");
@@ -203,5 +212,137 @@ test("archive.js sink fires for rendered + raw writes; the bytes hydrate + reind
   const again = archive2.ingestChunk("host-1", "tid-1", meta, 0, Buffer.byteLength(body), entries, "");
   assert.equal(again.bytesStored, Buffer.byteLength(body));
   assert.equal(archive2.getTranscript("tid-1").entries.length, 2); // not duplicated
+
+  // A PENDING raw file is "cannot tell", never 0: no cursor goes back, and a push
+  // from offset 0 is refused without creating a local file the drain would later
+  // push over the complete object.
+  const manifest = [{ transcriptId: "tid-1", rawFiles: [["tid-1.jsonl", rawBuf.length]] }];
+  assert.equal(archive2.rawCursors(manifest), undefined);
+  const refused = archive2.ingestRaw("host-1", "tid-1", "tid-1.jsonl", 0, rawBuf);
+  assert.deepEqual(refused, { stored: 0, skip: true });
+  assert.equal(fs.existsSync(path.join(rawDir, "tid-1.jsonl")), false);
+  // Asking queued the fetch; once it lands the local size IS the cursor, and the
+  // same push realigns to it instead of duplicating.
+  assert.equal(await mirror2.fetchRawUnder(rawDir), 0);
+  assert.deepEqual(fs.readFileSync(path.join(rawDir, "tid-1.jsonl")), rawBuf);
+  assert.deepEqual(archive2.rawCursors(manifest), { "tid-1": { "tid-1.jsonl": rawBuf.length } });
+  assert.deepEqual(archive2.ingestRaw("host-1", "tid-1", "tid-1.jsonl", 0, rawBuf),
+    { stored: rawBuf.length });
+  assert.deepEqual(fs.readFileSync(path.join(rawDir, "tid-1.jsonl")), rawBuf); // not doubled
+  archive2.setRawRemote(null);
+  archive2.closeDb();
+});
+
+test("rawRootOf names the `.jsonl.raw` directory, never a rendered key", () => {
+  assert.equal(rawRootOf("repo/a.jsonl.raw/tid/tid.jsonl"), "repo/a.jsonl.raw");
+  assert.equal(rawRootOf("repo/a.jsonl.raw/tid/tid/subagents/x.jsonl"), "repo/a.jsonl.raw");
+  assert.equal(rawRootOf("repo/a.jsonl"), null);
+  assert.equal(rawRootOf("repo/a.jsonl.meta"), null);
+  assert.equal(rawRootOf("x.jsonl.raw/f"), null);  // top level is never a raw dir
+  assert.equal(rawRootOf("repo/a.jsonl.raw"), null); // the directory itself, no file
+});
+
+test("hydrate leaves raw objects pending; asking fetches them, atomically", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  let listed = 0;
+  store.listSizes = async (prefix) => {
+    listed++;
+    return [...store.map].filter(([k]) => k.startsWith(prefix || ""))
+      .map(([key, buf]) => ({ key, size: buf.length }));
+  };
+  let statted = 0;
+  const stat = store.stat;
+  store.stat = async (k) => { statted++; return stat(k); };
+  store.map.set("repo/a.jsonl", Buffer.from("rendered\n"));
+  store.map.set("repo/a.jsonl.raw/t1/t1.jsonl", Buffer.from("0123456789"));
+  store.map.set("repo/a.jsonl.raw/t1/t1/subagents/s.jsonl", Buffer.from("abc"));
+  store.map.set("repo/a.jsonl.raw/t2/t2.jsonl", Buffer.from("zz"));
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+
+  assert.equal(await m.hydrate(), 1); // only the rendered file
+  assert.equal(listed, 1);
+  assert.equal(statted, 0, "sizes came from the listing, not a HEAD per key");
+  assert.ok(fs.existsSync(path.join(root, "repo", "a.jsonl")));
+  const t1 = path.join(root, "repo", "a.jsonl.raw", "t1");
+  assert.equal(fs.existsSync(t1), false);
+  assert.equal(m.rawPendingBytes(t1), 13);
+  assert.equal(m.rawPendingBytes(path.join(root, "repo", "a.jsonl.raw")), 15);
+  assert.equal(m.rawPending(path.join(root, "repo", "a.jsonl")), false); // rendered: never pending
+
+  // A fetch that fails leaves the file pending, with nothing half-written in place.
+  const get = store.getToFile;
+  store.getToFile = async () => { throw new Error("minio down"); };
+  assert.equal(await m.fetchRawUnder(t1), 2);
+  assert.equal(fs.existsSync(t1), false);
+  assert.equal(m.rawPendingBytes(t1), 13); // still pending (asked without queuing a fetch)
+  store.getToFile = get;
+
+  assert.equal(await m.fetchRawUnder(t1), 0);
+  assert.equal(fs.readFileSync(path.join(t1, "t1.jsonl"), "utf8"), "0123456789");
+  assert.equal(fs.readFileSync(path.join(t1, "t1", "subagents", "s.jsonl"), "utf8"), "abc");
+  assert.equal(m.rawPending(path.join(t1, "t1.jsonl")), false);
+  assert.equal(m.rawPendingBytes(t1), 0);
+  assert.deepEqual(fs.readdirSync(path.join(root, ".raw-fetch")), []); // no temp left
+  // Its sibling transcript is untouched until asked for.
+  assert.equal(m.rawPendingBytes(path.join(root, "repo", "a.jsonl.raw", "t2")), 2);
+
+  // rawPending (the sync cursor question) queues a background fetch by itself.
+  const t2file = path.join(root, "repo", "a.jsonl.raw", "t2", "t2.jsonl");
+  assert.equal(m.rawPending(t2file), true);
+  for (let i = 0; i < 50 && m.rawPending(t2file); i++) await new Promise((r) => setImmediate(r));
+  assert.equal(fs.readFileSync(t2file, "utf8"), "zz");
+
+  // A re-hydrate does not re-list anything local as pending.
+  await m.hydrate();
+  assert.equal(m.rawPendingBytes(path.join(root, "repo")), 0);
+});
+
+test("rawBytes counts the pending part, so the per-transcript raw budget holds", async () => {
+  const A = mkdtemp("turma-mir-arc-");
+  process.env.ARCHIVE_DIR = path.join(A, "archive");
+  process.env.ARCHIVE_DB = path.join(A, "archive", "index.db");
+  delete require.cache[require.resolve("../archive.js")];
+  const archive = require("../archive.js");
+  const store = memStore();
+  const mirror = new ArchiveMirror({
+    blobStore: store, archiveDir: archive.ARCHIVE_DIR,
+    reindex: () => { archive.openDb(); archive.rebuildIndex(); },
+  });
+  archive.setBlobSink((p) => mirror.note(p));
+  const meta = {
+    remoteKey: "github.com/x/turma", repo: "turma", worktree: "/w/ab",
+    slug: "-w-ab", createdAt: "2026-07-10T00:00:00Z", endedTs: "2026-07-10T01:00:00Z",
+    summary: "budget",
+  };
+  const entries = [{ uuid: "u1", role: "user", ts: "2026-07-10T00:00:00Z", text: "hi" }];
+  const body = JSON.stringify(entries[0]);
+  archive.ingestChunk("host-1", "tid-b", meta, 0, Buffer.byteLength(body), entries, "");
+  const rawBuf = Buffer.alloc(64, 0x61);
+  archive.ingestRaw("host-1", "tid-b", "tid-b.jsonl", 0, rawBuf);
+  await mirror.drain();
+  archive.setBlobSink(null);
+  archive.closeDb();
+
+  // A fresh replica whose raw budget is exactly what the bucket holds.
+  process.env.ARCHIVE_DIR = path.join(A, "replica", "archive");
+  process.env.ARCHIVE_DB = path.join(A, "replica", "archive", "index.db");
+  process.env.ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES = String(rawBuf.length);
+  delete require.cache[require.resolve("../archive.js")];
+  const archive2 = require("../archive.js");
+  delete process.env.ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES;
+  const mirror2 = new ArchiveMirror({
+    blobStore: store, archiveDir: archive2.ARCHIVE_DIR,
+    reindex: () => { archive2.openDb(); archive2.rebuildIndex(); },
+  });
+  archive2.setRawRemote({
+    pending: (p) => mirror2.rawPending(p),
+    pendingBytes: (d) => mirror2.rawPendingBytes(d),
+  });
+  await mirror2.hydrate();
+  // Nothing raw is local, yet the rebuilt row knows the budget is spent.
+  assert.equal(fs.existsSync(path.join(archive2.rawDirOf("tid-b"), "tid-b.jsonl")), false);
+  assert.deepEqual(archive2.rawLimits(["tid-b"]), ["tid-b"]);
+  archive2.setRawRemote(null);
   archive2.closeDb();
 });
