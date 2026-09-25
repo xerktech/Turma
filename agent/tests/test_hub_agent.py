@@ -20536,6 +20536,28 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         self.assertNotIn("deadTmuxStrikes", sess)
         self.assertEqual(self._reaped_tmux(), [])
 
+    def test_a_reused_pane_id_never_keeps_a_gone_tmux_alive(self):
+        # QA: the tmux server exits with its last session and the next one
+        # restarts pane ids at %0, so another session's %0 is not our agent.
+        sm = self.make_manager(listing=(0, "operator-own %0\n", ""))
+        sess = self._sess(agentPane="%0")                  # agent-dead: gone
+        sm.registry = [sess]
+        for _ in range(ha.DEAD_TMUX_STRIKES):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "error")
+        self.assertEqual(self._reaped_tmux(), [])
+
+    def test_session_tmux_kills_target_the_exact_name(self):
+        # A bare `-t` prefix-matches another `agent-<id>…` session once the
+        # name is gone; every kill-session on a session tmux uses `=`.
+        sm = super().make_manager()
+        sess = self._sess()
+        with mock.patch.object(ha, "run_out", return_value=(0, "%1")):
+            sm._spawn_in_tmux(sess, "claude")
+        sm._kill_tmux(sess)
+        self.assertEqual(self._reaped_tmux(),
+                         [["tmux", "kill-session", "-t", "=agent-dead"]] * 2)
+
     def test_a_record_without_agent_pane_keeps_the_name_only_rule(self):
         # Launched before XERK-1037 (or its pane read failed), or hand-edited to
         # a malformed id: any pane keeps it alive — never reap a live agent.

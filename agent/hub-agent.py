@@ -23268,9 +23268,12 @@ class SessionManager:
         live = self._live_tmux_panes()
         if live is None:
             return
-        # Pane ids are server-unique, so the agent pane is alive wherever it is
-        # listed: a swap-window/join-pane into ANOTHER session moves it without
-        # ending it, and reaping then would kill that session's own window.
+        # While a session's own tmux lives, its recorded agent pane is alive
+        # wherever it is listed: a swap-window/join-pane into ANOTHER session
+        # moves it without ending it, and reaping then would kill that session's
+        # own window. Never on the pane id alone: ids are unique only per tmux
+        # SERVER, which exits with its last session and restarts at %0, so any
+        # later pane could carry a dead agent's id and keep it `running` forever.
         all_panes = set().union(*live.values()) if live else set()
         for sess in list(self.registry):
             if sess.get("status") != "running":
@@ -23291,8 +23294,7 @@ class SessionManager:
             if not _is_pane_id(agent_pane):
                 agent_pane = None
             leftover = tmux in live      # the tmux outlived its agent pane
-            if (agent_pane in all_panes if agent_pane is not None
-                    else leftover):
+            if leftover and (agent_pane is None or agent_pane in all_panes):
                 sess.pop("deadTmuxStrikes", None)
                 # The tmux came up: a resume that reached this beat alive is not
                 # a doomed one, so it is no longer a fresh-relaunch candidate.
