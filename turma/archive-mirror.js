@@ -27,8 +27,10 @@
 //     `rawPending(path)` before trusting a raw file's size as its ingest cursor:
 //     a pending file answers "cannot tell", so ingest refuses rather than letting
 //     an agent restart it from 0 (whose partial local copy the drain would then
-//     push OVER the complete object). Asking queues a background fetch; the
-//     read-back routes `await fetchRawUnder(dir)` first.
+//     push OVER the complete object). Only that ingest ask queues a fetch; the
+//     heartbeat cursor advertises the bucket's size instead (`rawPendingSize`),
+//     so an unchanged file is never pulled down at all. The read-back routes
+//     `await fetchRawUnder(dir)` first.
 //
 // With HA off this module is never wired (createBlobStore returns null), so the
 // single-process path is byte-identical: local files ARE the of-record, no sink,
@@ -38,6 +40,11 @@
 
 const fs = require("fs");
 const path = require("path");
+
+// How many raw objects one read-back route fetches at once, and how long it waits
+// before answering "still syncing" (the fetches carry on). XERK-1043.
+const RAW_FETCH_CONCURRENCY = 4;
+const RAW_ROUTE_WAIT_MS = 10 * 1000;
 
 class ArchiveMirror {
   /**
@@ -88,6 +95,9 @@ class ArchiveMirror {
   // outside ARCHIVE_DIR — the tar-extract discipline).
   pathFor(key) {
     if (typeof key !== "string" || !key || key.includes("\0")) return null;
+    // Every component a plain name: a listed `a.jsonl.raw/t/../../b.jsonl` stays
+    // inside the tree but would land on ANOTHER transcript's file.
+    if (key.split("/").some((c) => !c || c === "." || c === "..")) return null;
     // The startsWith(archiveDir + sep) check below IS the traversal guard — a
     // listing key that would escape the tree returns null, never a path.
     // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
@@ -141,8 +151,8 @@ class ArchiveMirror {
   // pending — see the header), then rebuild the index from it. Only downloads a key
   // whose local copy is ABSENT or SMALLER than the object (missing, or a partial
   // download to finish) — NEVER when the local copy is same-size-or-larger, so a
-  // leader warm-restarting with un-mirrored appends (local ahead of the bucket)
-  // is never truncated back to the of-record. Its local files are append-only and
+  // leader warm-restarting with un-mirrored appends (local ahead of the bucket) is
+  // never truncated back to the of-record. Its local files are append-only and
   // authoritative; the un-mirrored tail re-mirrors on the next drain. A leader
   // that has been writing thus hydrates to a near-no-op. Best-effort per key.
   // Returns the count downloaded.
@@ -155,42 +165,56 @@ class ArchiveMirror {
       // does); otherwise a HEAD per key, the pre-XERK-1043 shape.
       let listing;
       try {
-        listing = typeof this.blobStore.listSizes === "function"
-          ? await this.blobStore.listSizes("")
-          : (await this.blobStore.list("")).map((key) => ({ key, size: null }));
+        if (typeof this.blobStore.listSizes === "function") {
+          listing = await this.blobStore.listSizes("");
+        } else {
+          listing = [];
+          for (const key of await this.blobStore.list("")) {
+            let st = null;
+            try { st = await this.blobStore.stat(key); } catch { st = null; }
+            if (st) listing.push({ key, size: st.size });
+          }
+        }
       } catch (e) {
         this.log(`archive hydrate: list failed (${e && e.message}); the store retries`);
         return 0;
       }
-      // Rebuilt from THIS listing: a promotion re-hydrate must not keep a key the
-      // bucket no longer holds pending forever.
-      this._rawPending.clear();
-      this._rawWanted.clear();
+      // Classify EVERY key against local disk and swap the pending set in ONE
+      // synchronous step — no await between the listing and the swap. Clearing
+      // the set and refilling it across the download loop's awaits left a window
+      // on a promotion re-hydrate where a still-remote raw file read as ENOENT
+      // (cursor 0), so an agent re-shipped it from 0 and the drain PUT the partial
+      // copy over the complete object (XERK-1043 QA D1).
+      const nextPending = new Map();
+      const downloads = [];
       let pendingRaw = 0;
       for (const item of listing) {
-        const key = item.key;
+        const key = item && item.key;
         const dest = this.pathFor(key);
-        if (!dest) continue;
-        let remote = Number.isFinite(item.size) ? { size: item.size } : null;
-        if (!remote) {
-          try {
-            remote = await this.blobStore.stat(key);
-          } catch { remote = null; }
-        }
-        if (!remote) continue;
+        if (!dest || !Number.isFinite(item.size)) continue;
         let localSize = -1;
         try { localSize = fs.statSync(dest).size; } catch { localSize = -1; }
         // Skip when local is same-size OR larger (ahead of the bucket) — only a
         // missing/partial (smaller) local is (re)fetched. Never truncate a leader.
-        if (localSize >= remote.size) continue;
+        if (localSize >= item.size) continue;
         const root = rawRootOf(key);
         if (root) {
-          // Raw layer: recorded, not downloaded (see the header).
-          if (!this._rawPending.has(root)) this._rawPending.set(root, new Map());
-          this._rawPending.get(root).set(key, remote.size);
+          // Raw layer: recorded, not downloaded (see the header). `have` is the
+          // partial local copy (if any), so pending bytes count only the excess.
+          if (!nextPending.has(root)) nextPending.set(root, new Map());
+          nextPending.get(root).set(key, { size: item.size, have: Math.max(localSize, 0) });
           pendingRaw++;
-          continue;
+        } else {
+          downloads.push({ key, dest });
         }
+      }
+      this._rawPending = nextPending;
+      for (const k of [...this._rawWanted]) if (!this._isPending(k)) this._rawWanted.delete(k);
+      if (pendingRaw) {
+        this.log(`archive hydrate: ${pendingRaw} raw-layer object(s) left in the ` +
+          `bucket, fetched on demand (XERK-1043)`);
+      }
+      for (const { key, dest } of downloads) {
         try {
           fs.mkdirSync(path.dirname(dest), { recursive: true });
           const ok = await this.blobStore.getToFile(key, dest);
@@ -198,10 +222,6 @@ class ArchiveMirror {
         } catch (e) {
           this.log(`archive hydrate: ${key} failed (${e && e.message}); skipped`);
         }
-      }
-      if (pendingRaw) {
-        this.log(`archive hydrate: ${pendingRaw} raw-layer object(s) left in the ` +
-          `bucket, fetched on demand (XERK-1043)`);
       }
       // Reindex whatever landed, so search + cursors reflect the hydrated store.
       // Never fatal — a rebuild hiccup leaves the index stale, not the hub down.
@@ -214,67 +234,101 @@ class ArchiveMirror {
     return fetched;
   }
 
-  // The pending entry for an absolute path: {root, map, key}, or null.
-  _pendingEntry(absPath) {
-    const key = this.keyFor(absPath);
-    if (!key) return null;
+  _isPending(key) {
     const root = rawRootOf(key);
     const map = root && this._rawPending.get(root);
-    return map && map.has(key) ? { root, map, key } : null;
+    return !!(map && map.has(key));
   }
 
-  // SYNC, for archive.js's raw cursor: is this raw file in the bucket but not yet
-  // on local disk? Asking queues its fetch, so the answer turns false (and the
-  // local size becomes the cursor) a beat or two later.
+  // The pending keys under a directory, as [key, {size, have}] — `absDir` may be
+  // the raw root itself (archive.js sums the whole `<x>.jsonl.raw`) or any
+  // directory under it.
+  _pendingUnder(absDir) {
+    const key = this.keyFor(absDir);
+    const root = key && rawRootOf(key + "/_");
+    const map = root && this._rawPending.get(root);
+    if (!map) return [];
+    const prefix = key + "/";
+    return [...map].filter(([k]) => k.startsWith(prefix));
+  }
+
+  // SYNC, for archive.js's INGEST cursor: is this raw file in the bucket but not
+  // yet (fully) on local disk? Asking queues its fetch — only ingest asks, i.e.
+  // only a file an agent actually has new bytes for is ever pulled back down.
   rawPending(absPath) {
-    const p = this._pendingEntry(absPath);
-    if (!p) return false;
-    this._rawWanted.add(p.key);
+    const key = this.keyFor(absPath);
+    if (!key || !this._isPending(key)) return false;
+    this._rawWanted.add(key);
     this._pumpRaw();
     return true;
   }
 
-  // SYNC: bytes the bucket holds under `absDir` that are not on local disk yet —
-  // what archive.js adds to a raw directory's walked size so `rawBytes` (the
-  // per-transcript raw budget) counts the whole copy, not just the local part.
-  rawPendingBytes(absDir) {
+  // SYNC, ADVISORY: the bucket's size for a pending raw file (null if it is not
+  // pending). The heartbeat hands this back as the agent's cursor, so an agent
+  // whose copy is no longer than the bucket's ships nothing, and one with more
+  // ships only the tail — without this hub fetching anything.
+  rawPendingSize(absPath) {
+    const key = this.keyFor(absPath);
+    if (!key || !this._isPending(key)) return null;
+    return this._rawPending.get(rawRootOf(key)).get(key).size;
+  }
+
+  // SYNC: the pending files under `absDir`, as [{path (relative), bytes}].
+  rawPendingFiles(absDir) {
     const key = this.keyFor(absDir);
-    // `absDir` may be the raw root itself (archive.js sums the whole
-    // `<x>.jsonl.raw`) or a directory under it; either way it has files below.
-    const root = key && rawRootOf(key + "/_");
-    const map = root && this._rawPending.get(root);
-    if (!map) return 0;
-    const prefix = key + "/";
+    return this._pendingUnder(absDir)
+      .map(([k, v]) => ({ path: k.slice(key.length + 1), bytes: v.size }));
+  }
+
+  // SYNC: bytes the bucket holds under `absDir` BEYOND what is on local disk —
+  // added to a raw directory's walked size so `rawBytes` (the per-transcript raw
+  // budget) counts the whole copy once: a partial local copy is not counted twice.
+  rawPendingBytes(absDir) {
     let bytes = 0;
-    for (const [k, size] of map) if (k === key || k.startsWith(prefix)) bytes += size;
+    for (const [, v] of this._pendingUnder(absDir)) bytes += Math.max(0, v.size - v.have);
     return bytes;
   }
 
-  // Fetch every pending raw object under `absDir` and resolve once they are all
-  // local (or have failed). Returns how many are STILL pending, so a read-back
-  // route can answer "still syncing" rather than serve a partial directory.
-  async fetchRawUnder(absDir) {
-    const key = this.keyFor(absDir);
-    const root = key && rawRootOf(key + "/_"); // see rawPendingBytes
-    const map = root && this._rawPending.get(root);
-    if (!map) return 0;
-    const prefix = key + "/";
-    const keys = [...map.keys()].filter((k) => k === key || k.startsWith(prefix));
-    await Promise.all(keys.map((k) => this._fetchRaw(k).catch(() => {})));
-    const left = this._rawPending.get(root);
-    return left ? keys.filter((k) => left.has(k)).length : 0;
+  // Fetch every pending raw object under `absDir` (RAW_FETCH_CONCURRENCY at a
+  // time) and resolve once they are local, or at `timeoutMs` — the fetches carry
+  // on in the background. Returns how many are STILL pending, so a read-back
+  // route answers "still syncing" rather than serve a partial directory, and never
+  // holds an operator for the store's full request timeout.
+  async fetchRawUnder(absDir, { timeoutMs = RAW_ROUTE_WAIT_MS } = {}) {
+    const keys = this._pendingUnder(absDir).map(([k]) => k);
+    if (!keys.length) return 0;
+    const queue = keys.slice();
+    const worker = async () => {
+      while (queue.length) {
+        const k = queue.shift();
+        try { await this._fetchRaw(k); } catch { /* logged; stays pending */ }
+      }
+    };
+    const work = Promise.all(Array.from(
+      { length: Math.min(RAW_FETCH_CONCURRENCY, keys.length) }, worker));
+    let timer;
+    await Promise.race([
+      work,
+      new Promise((r) => { timer = setTimeout(r, timeoutMs); if (timer.unref) timer.unref(); }),
+    ]);
+    clearTimeout(timer);
+    return keys.filter((k) => this._isPending(k)).length;
   }
 
   // One raw object, downloaded to a temp file and RENAMED into place, so a
   // half-written file is never visible at its real path (its size is a cursor).
-  // Deduped per key; a failure leaves it pending for the next ask.
+  // Deduped per key; a failure leaves it pending for the next ask. Pending is
+  // re-checked before the GET and again before the rename: a key that stopped
+  // being pending meanwhile (already landed via another path, or a re-hydrate
+  // found it local) is never downloaded over — its local file may have grown
+  // since, and renaming the bucket copy over it would regress the cursor (QA D2).
   _fetchRaw(key) {
     const running = this._rawInflight.get(key);
     if (running) return running;
+    if (!this._isPending(key)) return Promise.resolve();
     const run = (async () => {
       const dest = this.pathFor(key);
-      const root = rawRootOf(key);
-      if (!dest || !root) return;
+      if (!dest) return;
       // A dot-directory at the archive root: every tree walk in archive.js either
       // skips it or finds no `.jsonl` in it, and it shares the volume, so the
       // rename is atomic.
@@ -283,18 +337,20 @@ class ArchiveMirror {
       try {
         fs.mkdirSync(tmpDir, { recursive: true });
         const ok = await this.blobStore.getToFile(key, tmp);
+        if (!this._isPending(key)) return;
         if (ok) {
           fs.mkdirSync(path.dirname(dest), { recursive: true });
           fs.renameSync(tmp, dest);
         }
         // Landed, or gone from the bucket (404) — either way no longer pending.
+        const root = rawRootOf(key);
         const map = this._rawPending.get(root);
         if (map) {
           map.delete(key);
           if (!map.size) this._rawPending.delete(root);
         }
       } catch (e) {
-        this.log(`archive raw fetch: ${key} failed (${e && e.message}); retried on next use`);
+        this._logFetchFailure(key, e);
         throw e;
       } finally {
         try { fs.unlinkSync(tmp); } catch { /* renamed, or never written */ }
@@ -305,9 +361,20 @@ class ArchiveMirror {
     return run;
   }
 
-  // The background fetcher for keys asked about from the (sync) cursor path. One
-  // at a time: a heartbeat can ask about up to ARCHIVE_RAW_CURSOR_MAX files, and
-  // this must never turn into that many parallel downloads.
+  // A store outage fails every fetch; say so once a minute, not once per file.
+  _logFetchFailure(key, e) {
+    const now = Date.now();
+    this._fetchFailures = (this._fetchFailures || 0) + 1;
+    if (now - (this._fetchLogAt || 0) < 60 * 1000) return;
+    this._fetchLogAt = now;
+    this.log(`archive raw fetch: ${key} failed (${e && e.message}); ` +
+      `${this._fetchFailures} failure(s) in the last minute, each retried on next use`);
+    this._fetchFailures = 0;
+  }
+
+  // The background fetcher for keys ingest asked about. One at a time: a beat can
+  // push to many files, and this must never turn into that many parallel
+  // downloads. A key that stopped being pending meanwhile is skipped.
   async _pumpRaw() {
     if (this._rawPumping || !this.blobStore) return;
     this._rawPumping = true;

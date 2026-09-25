@@ -4097,6 +4097,8 @@ function setArchiveMirror(blobStore, ha) {
   // The raw layer stays in the bucket until something needs it (XERK-1043).
   archive.setRawRemote({
     pending: (p) => archiveMirror.rawPending(p),
+    pendingSize: (p) => archiveMirror.rawPendingSize(p),
+    pendingFiles: (d) => archiveMirror.rawPendingFiles(d),
     pendingBytes: (d) => archiveMirror.rawPendingBytes(d),
   });
 }

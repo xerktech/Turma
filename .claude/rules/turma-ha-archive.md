@@ -111,18 +111,27 @@ of-record**, so both halves of the ADR split now hold:
   pulling them into every replica's size-limited `/data` emptyDir evicted each pod mid-hydrate once
   the bucket outgrew it (8.55 GiB vs 8Gi, 2026-09-25). Hydrate records them as REMOTE-PENDING
   (grouped by raw root) and downloads none of them.
-  - **A pending raw file's cursor is "cannot tell" (`null`), never 0.** Its local ENOENT is not
-    "absent": an agent restarting it from 0 would build a partial local copy the drain then PUTs
+  - **A pending raw file's INGEST cursor is "cannot tell" (`null`), never 0.** Its local ENOENT is
+    not "absent": an agent restarting it from 0 would build a partial local copy the drain then PUTs
     OVER the complete object. `archive.setRawRemote` wires `rawCursor` to `rawPending`, and
     `ingestRaw` already refuses a `null` cursor.
-  - Asking `rawPending` queues a ONE-AT-A-TIME background fetch (a beat can ask about
-    `ARCHIVE_RAW_CURSOR_MAX` files). The read-back/restore routes `await fetchRawUnder(dir)` and answer
-    503 "still syncing" if anything stayed pending.
-  - Fetches land in `ARCHIVE_DIR/.raw-fetch/` and are RENAMED into place: a raw file's size is its
-    cursor, so a half-written file must never be visible at the real path.
-  - `rawBytes` (the per-transcript raw budget) is local walk + `rawPendingBytes`, so a fresh replica
-    still knows a budget is spent.
+  - **Hydrate swaps the pending set in ONE sync step after listing, BEFORE any download await.**
+    Clearing it and refilling across the download loop left a promotion window where a raw file read
+    ENOENT → cursor 0 → the of-record truncated (QA D1, reproduced on MinIO).
+  - **The HEARTBEAT cursor for a pending file is the bucket's size** (`pendingSize`/`pendingFiles`,
+    advisory; ingest still refuses). An unchanged file ships nothing, and asking fetches nothing, so a
+    replica never re-pulls the whole agent-held raw layer. Only an INGEST ask queues a fetch.
+  - A fetch re-checks pending before its GET and before its rename: renaming the bucket copy over a
+    file that landed (and grew) meanwhile regresses the cursor (QA D2).
+  - Fetches land in `ARCHIVE_DIR/.raw-fetch/` and are RENAMED into place (a half-written file must
+    never be visible at a path whose size is a cursor). `getToFile` destroys its stream on any
+    failure: an open fd kept the unlinked temp's bytes allocated, invisible to `du` (QA D4).
+  - `rawBytes` = local walk + `pendingBytes`, where pending counts only the bucket's EXCESS over a
+    partial local copy — counting the full size double-counts it and refuses ingest (QA D3).
+  - Routes `await fetchRawUnder(dir)` (4 at a time, answering 503 "still syncing" after 10s while the
+    fetches carry on) — never the S3 client's 60s timeout.
   - Hydrate takes sizes from the listing (`listSizes`, ListObjectsV2 `<Size>`): no HEAD per key.
+  - Tests: `archive-mirror.test.js` (the `QA D1`–`D3`/`L1` cases), `blobstore.test.js` (fd leak).
 - **`reindex` is INJECTED and is a NO-OP when the Postgres index is wired** (XERK-780): the byte
   hydrate no longer rebuilds the index from files (the expensive walk) — server.js's `hydrateArchive`
   runs the Postgres index hydrate separately, AFTER the bytes. With no PG index store (HA off, or an

@@ -305,18 +305,34 @@ function noteWrite(absPath) {
 //
 // Under HA the hydrate leaves raw-layer objects in the bucket and fetches them on
 // demand (archive-mirror.js), so a raw file can exist in the of-record while its
-// local path is ENOENT. `pending(absPath)` says so (sync; asking queues the
-// fetch) and `pendingBytes(absDir)` says how many such bytes a raw directory
-// holds. UNSET (every non-HA path) makes both no-ops.
+// local path is ENOENT (or holds only a prefix). All SYNC:
+//   pending(absPath)      is it still (partly) remote? Asking queues its fetch —
+//                         only INGEST asks, the one caller that must write it.
+//   pendingSize(absPath)  the bucket's size for it, or null; ADVISORY cursor only.
+//   pendingFiles(absDir)  [{path, bytes}] still remote under a raw directory.
+//   pendingBytes(absDir)  bytes remote BEYOND the local copy (the raw budget).
+// UNSET (every non-HA path) makes all of them no-ops.
+const RAW_REMOTE_HOOKS = ["pending", "pendingSize", "pendingFiles", "pendingBytes"];
 let rawRemote = null;
 function setRawRemote(hooks) {
-  rawRemote = hooks && typeof hooks.pending === "function" &&
-    typeof hooks.pendingBytes === "function" ? hooks : null;
+  rawRemote = hooks && RAW_REMOTE_HOOKS.every((h) => typeof hooks[h] === "function")
+    ? hooks : null;
 }
 function rawRemotePending(full) {
   if (!rawRemote) return false;
   // A hook that throws cannot say the file is local, so it is not trusted to be.
   try { return !!rawRemote.pending(full); } catch { return true; }
+}
+function rawRemoteSize(full) {
+  if (!rawRemote) return null;
+  try {
+    const n = rawRemote.pendingSize(full);
+    return Number.isFinite(n) ? n : null;
+  } catch { return null; }
+}
+function rawRemoteFiles(dir) {
+  if (!rawRemote) return [];
+  try { return rawRemote.pendingFiles(dir) || []; } catch { return []; }
 }
 // A raw directory's bytes: what is on disk plus what the bucket still holds.
 function rawLayerBytes(dir) {
@@ -1420,7 +1436,11 @@ function rawCursors(manifest) {
       const rel = Array.isArray(f) ? f[0] : (f && f.path);
       const full = rawFilePath(row.filePath, m.transcriptId, rel);
       if (!full) continue;
-      const n = rawCursor(full);
+      // Still in the bucket (XERK-1043): advertise ITS size. Advisory only —
+      // ingest re-checks and refuses while pending — but it keeps an agent from
+      // re-shipping a file from 0 that only needs its tail, or nothing at all.
+      const remote = rawRemoteSize(full);
+      const n = remote !== null ? remote : rawCursor(full);
       if (n === null) continue;   // cannot tell — say nothing rather than "0"
       if (n > 0) have[safeRawRel(rel)] = n;
     }
@@ -1800,9 +1820,15 @@ function rawCursorsForIds(ids) {
   const out = {};
   for (const id of Array.isArray(ids) ? ids : []) {
     const files = listRawFiles(id);
-    if (!files || !files.length) continue;
+    if (!files) continue;
+    // Plus what is still in the bucket (XERK-1043), at the bucket's size — the
+    // same advisory cursor rawCursors gives, and for the same reason.
+    const dir = rawDirOf(id);
+    const all = dir ? files.concat(rawRemoteFiles(dir)) : files;
     const have = {};
-    for (const f of files) if (f && f.path && f.bytes > 0) have[f.path] = f.bytes;
+    for (const f of all) {
+      if (f && f.path && f.bytes > 0) have[f.path] = Math.max(have[f.path] || 0, f.bytes);
+    }
     if (Object.keys(have).length) out[id] = have;
   }
   return Object.keys(out).length ? out : undefined;

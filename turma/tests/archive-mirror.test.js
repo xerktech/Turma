@@ -47,6 +47,10 @@ test("keyFor/pathFor stay inside ARCHIVE_DIR and use '/' keys", () => {
   assert.equal(m.pathFor("repo/a.jsonl"), path.join(root, "repo", "a.jsonl"));
   assert.equal(m.pathFor("../etc/passwd"), null);
   assert.equal(m.pathFor("a\0b"), null);
+  // Inside the tree but through `..`: would land on ANOTHER transcript's file.
+  assert.equal(m.pathFor("repo/a.jsonl.raw/t/../../b.jsonl"), null);
+  assert.equal(m.pathFor("repo//a.jsonl"), null);
+  assert.equal(m.pathFor("./repo/a.jsonl"), null);
 });
 
 test("note records dirty files; drain pushes them to the store", async () => {
@@ -128,6 +132,16 @@ test("hydrate pulls every object down, skips a same-size local, then reindexes",
   assert.deepEqual(fs.readFileSync(ahead), before); // untouched
 });
 
+// archive.setRawRemote's hooks, wired the way server.js wires them.
+function hooksFor(m) {
+  return {
+    pending: (p) => m.rawPending(p),
+    pendingSize: (p) => m.rawPendingSize(p),
+    pendingFiles: (d) => m.rawPendingFiles(d),
+    pendingBytes: (d) => m.rawPendingBytes(d),
+  };
+}
+
 // ---- real archive.js integration -------------------------------------------
 // Requiring archive.js reads ARCHIVE_DIR at load, so this sets it before the
 // require and drives real ingest to prove the SINK fires for both byte layers,
@@ -189,10 +203,7 @@ test("archive.js sink fires for rendered + raw writes; the bytes hydrate + reind
     archiveDir: archive2.ARCHIVE_DIR,
     reindex: () => { archive2.openDb(); archive2.rebuildIndex(); },
   });
-  archive2.setRawRemote({
-    pending: (p) => mirror2.rawPending(p),
-    pendingBytes: (d) => mirror2.rawPendingBytes(d),
-  });
+  archive2.setRawRemote(hooksFor(mirror2));
   const fetched = await mirror2.hydrate();
   assert.ok(fetched >= 2, "hydrated the rendered layer");
   // The raw file stayed in the bucket (XERK-1043).
@@ -213,11 +224,15 @@ test("archive.js sink fires for rendered + raw writes; the bytes hydrate + reind
   assert.equal(again.bytesStored, Buffer.byteLength(body));
   assert.equal(archive2.getTranscript("tid-1").entries.length, 2); // not duplicated
 
-  // A PENDING raw file is "cannot tell", never 0: no cursor goes back, and a push
-  // from offset 0 is refused without creating a local file the drain would later
-  // push over the complete object.
+  // A PENDING raw file's heartbeat cursor is the BUCKET's size (advisory — an
+  // agent with nothing new ships nothing), and asking for it fetches nothing.
   const manifest = [{ transcriptId: "tid-1", rawFiles: [["tid-1.jsonl", rawBuf.length]] }];
-  assert.equal(archive2.rawCursors(manifest), undefined);
+  assert.deepEqual(archive2.rawCursors(manifest), { "tid-1": { "tid-1.jsonl": rawBuf.length } });
+  assert.deepEqual(archive2.rawCursorsForIds(["tid-1"]), { "tid-1": { "tid-1.jsonl": rawBuf.length } });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(mirror2.rawPendingBytes(rawDir), rawBuf.length, "a cursor ask queued no fetch");
+  // Its INGEST cursor is "cannot tell", never 0: a push from offset 0 is refused
+  // without creating a local file the drain would later push over the object.
   const refused = archive2.ingestRaw("host-1", "tid-1", "tid-1.jsonl", 0, rawBuf);
   assert.deepEqual(refused, { stored: 0, skip: true });
   assert.equal(fs.existsSync(path.join(rawDir, "tid-1.jsonl")), false);
@@ -335,14 +350,132 @@ test("rawBytes counts the pending part, so the per-transcript raw budget holds",
     blobStore: store, archiveDir: archive2.ARCHIVE_DIR,
     reindex: () => { archive2.openDb(); archive2.rebuildIndex(); },
   });
-  archive2.setRawRemote({
-    pending: (p) => mirror2.rawPending(p),
-    pendingBytes: (d) => mirror2.rawPendingBytes(d),
-  });
+  archive2.setRawRemote(hooksFor(mirror2));
   await mirror2.hydrate();
   // Nothing raw is local, yet the rebuilt row knows the budget is spent.
   assert.equal(fs.existsSync(path.join(archive2.rawDirOf("tid-b"), "tid-b.jsonl")), false);
   assert.deepEqual(archive2.rawLimits(["tid-b"]), ["tid-b"]);
   archive2.setRawRemote(null);
   archive2.closeDb();
+});
+
+// A memStore whose getToFile can be held open per key, to pin down races.
+function gatedStore() {
+  const store = memStore();
+  const gates = new Map();
+  const get = store.getToFile;
+  store.getToFile = async (key, dest) => {
+    const g = gates.get(key);
+    if (g) await g.promise;
+    return get(key, dest);
+  };
+  store.hold = (key) => {
+    let release;
+    const promise = new Promise((r) => { release = r; });
+    gates.set(key, { promise });
+    return () => { gates.delete(key); release(); };
+  };
+  return store;
+}
+
+test("a promotion re-hydrate never un-pends a raw file mid-download (QA D1)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = gatedStore();
+  store.map.set("repo/a.jsonl", Buffer.from("v1\n"));
+  store.map.set("repo/a.jsonl.raw/t/t.jsonl", Buffer.alloc(9000, 0x72));
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  await m.hydrate();
+  const raw = path.join(root, "repo", "a.jsonl.raw", "t", "t.jsonl");
+  assert.equal(m.rawPendingSize(raw), 9000);
+  // The old leader appended to the rendered file; the promoted replica's
+  // re-hydrate must download it — and is held mid-download.
+  store.map.set("repo/a.jsonl", Buffer.from("v1\nv2\n"));
+  // ...and wrote a raw file this replica has never seen.
+  store.map.set("repo/a.jsonl.raw/t/new.jsonl", Buffer.alloc(700, 0x6e));
+  const fresh = path.join(root, "repo", "a.jsonl.raw", "t", "new.jsonl");
+  const release = store.hold("repo/a.jsonl");
+  const run = m.hydrate();
+  await new Promise((r) => setImmediate(r));
+  // Throughout the download, both raw files are pending: their ingest cursors
+  // stay "cannot tell" instead of an ENOENT 0.
+  assert.equal(m.rawPendingSize(raw), 9000);
+  assert.equal(m.rawPendingSize(fresh), 700);
+  assert.equal(m.rawPendingBytes(path.join(root, "repo", "a.jsonl.raw")), 9700);
+  release();
+  await run;
+  assert.equal(fs.readFileSync(path.join(root, "repo", "a.jsonl"), "utf8"), "v1\nv2\n");
+  assert.equal(m.rawPendingSize(raw), 9000);
+});
+
+test("a file that already landed is never downloaded over again (QA D2)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = gatedStore();
+  store.map.set("repo/a.jsonl.raw/t/one.jsonl", Buffer.alloc(1000, 0x31));
+  store.map.set("repo/a.jsonl.raw/t/slow.jsonl", Buffer.alloc(10, 0x32));
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  await m.hydrate();
+  const dir = path.join(root, "repo", "a.jsonl.raw", "t");
+  const one = path.join(dir, "one.jsonl");
+  // The background pump is stuck on `slow` with `one` queued behind it...
+  const releaseSlow = store.hold("repo/a.jsonl.raw/t/slow.jsonl");
+  m.rawPending(path.join(dir, "slow.jsonl"));
+  m.rawPending(one);
+  // ...while a route lands `one`, and ingest appends to it.
+  await m.fetchRawUnder(dir, { timeoutMs: 50 });
+  assert.equal(fs.statSync(one).size, 1000);
+  fs.appendFileSync(one, Buffer.alloc(500, 0x33));
+  // Now the pump reaches `one`: it is no longer pending, so it is left alone.
+  releaseSlow();
+  for (let i = 0; i < 50 && m.rawPendingBytes(dir); i++) await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(fs.statSync(one).size, 1500, "appended bytes survived the pump");
+
+  // And the rename-time check: a key that stops being pending DURING its GET (a
+  // re-hydrate found it local) is not renamed over the local file.
+  store.map.set("repo/a.jsonl.raw/t/late.jsonl", Buffer.alloc(100, 0x34));
+  await m.hydrate();
+  const late = path.join(dir, "late.jsonl");
+  const releaseLate = store.hold("repo/a.jsonl.raw/t/late.jsonl");
+  const fetching = m.fetchRawUnder(dir, { timeoutMs: 5000 });
+  await new Promise((r) => setImmediate(r));
+  fs.writeFileSync(late, Buffer.alloc(150, 0x35)); // a local copy AHEAD of the bucket
+  await m.hydrate();                              // ...so it is no longer pending
+  releaseLate();
+  await fetching;
+  assert.equal(fs.statSync(late).size, 150);
+});
+
+test("a partial local raw copy is counted once in pending bytes (QA D3)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.map.set("repo/a.jsonl.raw/t/t.jsonl", Buffer.alloc(3000, 0x61));
+  const dir = path.join(root, "repo", "a.jsonl.raw", "t");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "t.jsonl"), Buffer.alloc(1000, 0x61)); // a prefix
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  await m.hydrate();
+  assert.equal(m.rawPendingSize(path.join(dir, "t.jsonl")), 3000);
+  // local walk (1000) + this (2000) = the true 3000, not 4000.
+  assert.equal(m.rawPendingBytes(dir), 2000);
+  assert.equal(await m.fetchRawUnder(dir), 0);
+  assert.equal(fs.statSync(path.join(dir, "t.jsonl")).size, 3000);
+  assert.equal(m.rawPendingBytes(dir), 0);
+});
+
+test("fetchRawUnder answers at its timeout while the store hangs (QA L1)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = gatedStore();
+  store.map.set("repo/a.jsonl.raw/t/t.jsonl", Buffer.from("x"));
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  await m.hydrate();
+  const release = store.hold("repo/a.jsonl.raw/t/t.jsonl");
+  const t0 = Date.now();
+  const left = await m.fetchRawUnder(path.join(root, "repo", "a.jsonl.raw", "t"), { timeoutMs: 50 });
+  assert.equal(left, 1);
+  assert.ok(Date.now() - t0 < 1000);
+  release(); // the fetch carries on and lands
+  for (let i = 0; i < 50 && m.rawPendingBytes(root + "/repo/a.jsonl.raw"); i++) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.equal(fs.readFileSync(path.join(root, "repo", "a.jsonl.raw", "t", "t.jsonl"), "utf8"), "x");
 });

@@ -83,6 +83,16 @@ test("parseListXml pulls keys, truncation flag and the continuation token", () =
   assert.equal(r.nextToken, "TOK&2");
 });
 
+test("parseListXml reads sizes and decodes numeric entities in keys", () => {
+  const r = parseListXml(`<ListBucketResult><IsTruncated>false</IsTruncated>
+    <Contents><Key>it&#39;s &#34;q&#34; &#x41;&amp;#39;</Key><Size>7</Size></Contents>
+    <Contents><Key>nosize</Key></Contents>
+    <Contents><Key>&#99999999;</Key><Size>1</Size></Contents>
+  </ListBucketResult>`);
+  assert.deepEqual(r.keys, [`it's "q" A&#39;`, "nosize", "&#99999999;"]);
+  assert.deepEqual(r.sizes, [7, null, 1]);
+});
+
 test("parseListXml reads an empty listing as not-truncated, no keys", () => {
   const r = parseListXml(`<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>`);
   assert.deepEqual(r.keys, []);
@@ -130,7 +140,8 @@ function fakeS3() {
         .filter((k) => k.startsWith(prefix));
       const body =
         `<ListBucketResult><IsTruncated>false</IsTruncated>` +
-        items.map((k) => `<Contents><Key>${k.replace(/&/g, "&amp;")}</Key></Contents>`).join("") +
+        items.map((k) => `<Contents><Key>${k.replace(/&/g, "&amp;")}</Key>` +
+          `<Size>${objects.get(bucketPath + "/" + k).length}</Size></Contents>`).join("") +
         `</ListBucketResult>`;
       res.writeHead(200, { "content-type": "application/xml" });
       res.end(body);
@@ -190,6 +201,13 @@ test("S3BlobStore put/get/stat/list/del round-trip over the socket", async () =>
     await store.put("re/x.jsonl.meta", { body: Buffer.from('{"transcriptId":"t"}') });
     const keys = (await store.list("re/")).sort();
     assert.deepEqual(keys, ["re/x.jsonl", "re/x.jsonl.meta"]);
+    // listSizes carries each object's size from the same listing (XERK-1043) —
+    // a null here would silently put a HEAD per key back into the hydrate.
+    const sized = (await store.listSizes("re/")).sort((a, b) => a.key.localeCompare(b.key));
+    assert.deepEqual(sized, [
+      { key: "re/x.jsonl", size: payload.length },
+      { key: "re/x.jsonl.meta", size: Buffer.byteLength('{"transcriptId":"t"}') },
+    ]);
 
     // delete, then it is gone (and re-delete is a no-op success)
     await store.del("re/x.jsonl");
@@ -199,6 +217,51 @@ test("S3BlobStore put/get/stat/list/del round-trip over the socket", async () =>
     // every request the client made was SigV4-signed
     assert.ok(seenAuth.length > 0);
     assert.ok(seenAuth.every((a) => typeof a === "string" && a.startsWith("AWS4-HMAC-SHA256 ")));
+  } finally {
+    server.close();
+  }
+});
+
+test("getToFile: a body cut short fails AND closes its file (no leaked fd)", async () => {
+  // Claims 1000 bytes, sends 10, then drops the socket — the mid-GET store
+  // failure that leaked an fd per attempt (XERK-1043 QA D4).
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "content-length": "1000" });
+    res.write(Buffer.alloc(10, 0x61));
+    setTimeout(() => res.socket.destroy(), 20);
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const TMP = mkdtemp("turma-blob-");
+  const fds = () => fs.readdirSync("/proc/self/fd").length;
+  try {
+    const store = new S3BlobStore({
+      endpoint: `http://127.0.0.1:${server.address().port}`,
+      bucket: "arc", region: "us-east-1", accessKey: "AK", secretKey: "SK",
+    });
+    const before = fds();
+    for (let i = 0; i < 5; i++) {
+      await assert.rejects(store.getToFile("k", path.join(TMP, `p${i}`)));
+    }
+    await new Promise((r) => setTimeout(r, 50)); // let destroyed streams close
+    assert.ok(fds() <= before + 1, `fds leaked: ${before} -> ${fds()}`);
+  } finally {
+    server.close();
+  }
+});
+
+test("getToFile: a body that ends cleanly but short is a failure, not a small object", async () => {
+  const server = http.createServer((req, res) => {
+    // Wrong length on purpose: the transport ends "normally" after 4 of 9 bytes.
+    res.socket.end("HTTP/1.1 200 OK\r\ncontent-length: 9\r\nconnection: close\r\n\r\nabcd");
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const TMP = mkdtemp("turma-blob-");
+  try {
+    const store = new S3BlobStore({
+      endpoint: `http://127.0.0.1:${server.address().port}`,
+      bucket: "arc", region: "us-east-1", accessKey: "AK", secretKey: "SK",
+    });
+    await assert.rejects(store.getToFile("k", path.join(TMP, "short")));
   } finally {
     server.close();
   }
