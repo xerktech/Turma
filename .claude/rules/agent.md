@@ -58,16 +58,19 @@ an operator/ArgoCD decision, so the guard is userspace, earlyoom-style.
   the line. **No cgroup limit → guard OFF, never host `/proc/meminfo`**: MemAvailable omits ZFS
   ARC, so a healthy TrueNAS reads ~90% and the guard would kill for nothing.
 - **Kills only a tree that relieves the overage ON ITS OWN** (`_memguard_relieves`: working set
-  minus the tree < the PSI floor). Without it, pressure the guard can't attribute (a protected
+  minus the tree < the PSI floor), measured by **`smaps_rollup` Pss_Anon** (`_memguard_choose`)
+  for the top few: statm anon counts a forked pool's CoW pages once PER CHILD (upper bound only). Without it, pressure the guard can't attribute (a protected
   agent, another uid, shm) makes it serially kill small innocent trees. Otherwise: log once, leave
   it to the kernel. Signalled `(pid, start)` are never re-picked; cooldown after a kill.
 - **Owned** = cwd inside a session worktree, else `TURMA_SESSION_ID` in environ (survives a
   double-fork to PID 1). cwd first: an environ read takes the target's mmap lock. Unreadable
   (another uid, setproctitle) = unowned = never killed.
 - **Protected BY PID from the registry, never by name**: PID 1, the manager + ancestors + its whole
-  subtree, each running session's pane pid (`_memguard_panes`, filtered to registry tmux names),
+  subtree, each running session's AGENT pane pid (`_memguard_panes`: registry tmux names, LOWEST
+  pane id — a `new-window` inside the pane lands in agent-<id> and is session work),
   its tmux server, and a shell pane's children (dash doesn't exec the runtime). A `claude`-named
-  process or a pane on a session's own tmux is session work. Can't list tmux → kill nothing.
+  process or a pane on a session's own tmux is session work. Can't list tmux → the last listing
+  if it covers exactly today's running sessions (refreshed while healthy), else kill nothing.
 - **Kill through a pidfd opened BEFORE the start-time re-check** (`_memguard_kill`) — the only
   order that makes a reused pid unreachable.
 - Tests: `TestMemoryGuard`.
