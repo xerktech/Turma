@@ -4094,6 +4094,24 @@ function setArchiveMirror(blobStore, ha) {
     isLeader: () => true,
   });
   archive.setBlobSink((p) => archiveMirror.note(p));
+  // The raw layer stays in the bucket until something needs it (XERK-1043).
+  archive.setRawRemote({
+    pending: (p) => archiveMirror.rawPending(p),
+    pendingSize: (p) => archiveMirror.rawPendingSize(p),
+    pendingFiles: (d) => archiveMirror.rawPendingFiles(d),
+    pendingBytes: (d) => archiveMirror.rawPendingBytes(d),
+  });
+}
+
+// Under HA a transcript's raw files may still be in the bucket (XERK-1043): fetch
+// them before a route lists or streams that directory. Answers false when some
+// could not be fetched, so the route says "still syncing" instead of treating a
+// partial directory as the whole record.
+async function rawLocalFor(transcriptId) {
+  if (!archiveMirror) return true;
+  const dir = archive.rawDirOf(transcriptId);
+  if (!dir) return true;
+  return (await archiveMirror.fetchRawUnder(dir)) === 0;
 }
 
 // ---- archive Postgres INDEX mirror (XERK-780) -------------------------------
@@ -16641,6 +16659,10 @@ const server = http.createServer(async (req, res) => {
       // files can be resumed, so a session archived before that layer existed, or
       // one whose raw push never landed, is readable and not restorable. Say
       // which, rather than failing later inside the agent.
+      if (!(await rawLocalFor(transcriptId)))
+        return json(res, 503, {
+          error: "this session's raw copy is still syncing from object storage — try again shortly",
+        });
       const files = archive.listRawFiles(transcriptId) || [];
       const packable = [];
       let conversation = false;
@@ -16707,6 +16729,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "archive" &&
         parts[3] === "raw" && parts.length === 4) {
       const transcriptId = decodeURIComponent(parts[2]);
+      if (!(await rawLocalFor(transcriptId)))
+        return json(res, 503, { error: "still syncing from object storage" });
       const files = archive.listRawFiles(transcriptId);
       if (!files) return json(res, 404, { error: "unknown transcript" });
       return json(res, 200, { transcriptId, files });
@@ -16726,6 +16750,8 @@ const server = http.createServer(async (req, res) => {
       const transcriptId = decodeURIComponent(parts[2]);
       let rel;
       try { rel = decodeURIComponent(parts[4]); } catch { return json(res, 400, { error: "bad file" }); }
+      if (!(await rawLocalFor(transcriptId)))
+        return json(res, 503, { error: "still syncing from object storage" });
       const full = archive.rawFileFor(transcriptId, rel);
       if (!full) return json(res, 404, { error: "unknown file" });
       let size;

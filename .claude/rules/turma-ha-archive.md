@@ -100,13 +100,40 @@ of-record**, so both halves of the ADR split now hold:
   discipline); an ENOENT (raced operator delete) is dropped. Serialized so two workers never overlap.
   Run on an off-beat `setInterval` (`ARCHIVE_MIRROR_DRAIN_MS`, 15s) and once on graceful shutdown
   (best-effort, not awaited).
-- **`hydrate()` pulls every object down + `reindex()`** — run at boot AND on promotion (the XERK-763
+- **`hydrate()` pulls the RENDERED layer down + `reindex()`** — run at boot AND on promotion (the XERK-763
   seam, via `hydrateArchive()` in server.js). Downloads only a key whose local copy is **absent or
   SMALLER** than the object (missing, or a partial download to finish) — **never same-size-or-larger**,
   so a leader warm-restarting with un-mirrored appends (local ahead of the bucket) is NOT truncated
   back to the of-record; its files are append-only + authoritative and re-mirror on the next drain. A
   leader that has been writing thus hydrates to a near-no-op. Best-effort per key; a store blip
   leaves the local copy stale, not the hub down.
+- **The raw layer is LAZY (XERK-1043)** — keys under `<x>.jsonl.raw/` are ~83% of the bucket, and
+  pulling them into every replica's size-limited `/data` emptyDir evicted each pod mid-hydrate once
+  the bucket outgrew it (8.55 GiB vs 8Gi, 2026-09-25). Hydrate records them as REMOTE-PENDING
+  (grouped by raw root) and downloads none of them.
+  - **A pending raw file's INGEST cursor is "cannot tell" (`null`), never 0.** Its local ENOENT is
+    not "absent": an agent restarting it from 0 would build a partial local copy the drain then PUTs
+    OVER the complete object. `archive.setRawRemote` wires `rawCursor` to `rawPending`, and
+    `ingestRaw` already refuses a `null` cursor.
+  - **Hydrate swaps the pending set in ONE sync step after listing, BEFORE any download await.**
+    Clearing it and refilling across the download loop left a promotion window where a raw file read
+    ENOENT → cursor 0 → the of-record truncated (QA D1, reproduced on MinIO).
+  - **The HEARTBEAT cursor for a pending file is the bucket's size** (`pendingSize`/`pendingFiles`,
+    advisory; ingest still refuses). An unchanged file ships nothing, and asking fetches nothing, so a
+    replica never re-pulls the whole agent-held raw layer. Only an INGEST ask queues a fetch.
+  - A fetch re-checks pending before its GET and before its rename: renaming the bucket copy over a
+    file that landed (and grew) meanwhile regresses the cursor (QA D2).
+  - EVERY hydrate download (rendered too) lands in `ARCHIVE_DIR/.raw-fetch/` and is RENAMED into
+    place (`_download`): a half-written file must never be visible at a path whose size is a cursor. `getToFile` destroys its stream on any
+    failure: an open fd kept the unlinked temp's bytes allocated, invisible to `du` (QA D4).
+  - `rawBytes` = local walk + `pendingBytes`, where pending counts only the bucket's EXCESS over a
+    partial local copy — counting the full size double-counts it and refuses ingest (QA D3).
+  - Routes `await fetchRawUnder(dir)` (4 at a time, answering 503 "still syncing" after 10s while the
+    fetches carry on) — never the S3 client's 60s timeout.
+  - `archive.setRawRemote` THROWS on an incomplete hook set: silently unwiring disables every
+    pending guard.
+  - Hydrate takes sizes from the listing (`listSizes`, ListObjectsV2 `<Size>`): no HEAD per key.
+  - Tests: `archive-mirror.test.js` (the `QA D1`–`D3`/`L1` cases), `blobstore.test.js` (fd leak).
 - **`reindex` is INJECTED and is a NO-OP when the Postgres index is wired** (XERK-780): the byte
   hydrate no longer rebuilds the index from files (the expensive walk) — server.js's `hydrateArchive`
   runs the Postgres index hydrate separately, AFTER the bytes. With no PG index store (HA off, or an

@@ -170,19 +170,32 @@ function lowerKeys(obj) {
 // the server, so decode the five entity forms. This is pure + unit-tested.
 function parseListXml(xml) {
   const keys = [];
+  const sizes = [];
   const re = /<Contents\b[^>]*>([\s\S]*?)<\/Contents>/g;
   let m;
   while ((m = re.exec(xml))) {
     const km = /<Key>([\s\S]*?)<\/Key>/.exec(m[1]);
-    if (km) keys.push(xmlDecode(km[1]));
+    if (!km) continue;
+    keys.push(xmlDecode(km[1]));
+    const sm = /<Size>\s*(\d+)\s*<\/Size>/.exec(m[1]);
+    sizes.push(sm ? Number(sm[1]) : null);
   }
   const truncated = /<IsTruncated>\s*true\s*<\/IsTruncated>/i.test(xml);
   const tokM = /<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/.exec(xml);
-  return { keys, truncated, nextToken: tokM ? xmlDecode(tokM[1]) : null };
+  return { keys, sizes, truncated, nextToken: tokM ? xmlDecode(tokM[1]) : null };
+}
+
+// An out-of-range reference stays as written rather than failing the listing.
+function codePoint(raw, n) {
+  try { return String.fromCodePoint(n); } catch { return raw; }
 }
 
 function xmlDecode(s) {
+  // Numeric references first (MinIO lists ' and " as &#39; / &#34;); `&amp;` last,
+  // so an escaped `&amp;#39;` decodes to the literal text `&#39;`.
   return s
+    .replace(/&#(\d+);/g, (m, d) => codePoint(m, Number(d)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (m, h) => codePoint(m, parseInt(h, 16)))
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
@@ -249,6 +262,7 @@ class S3BlobStore {
       });
 
       const path = canonicalUri + (query && Object.keys(query).length ? "?" + canonicalQuery(query) : "");
+      let streamFail = null; // set once a GET body is streaming to a file
       const req = this._agentLib().request({
         method,
         hostname: this.hostname,
@@ -259,10 +273,33 @@ class S3BlobStore {
         const status = res.statusCode;
         if (toFile && status === 200) {
           const ws = fs.createWriteStream(toFile);
+          const want = Number(res.headers["content-length"]);
+          let settled = false;
+          // Any failure DESTROYS the write stream: left open, its fd kept a
+          // caller's unlinked temp file allocated on the volume, invisible to du
+          // (XERK-1043 QA D4).
+          const fail = (e) => {
+            if (settled) return;
+            settled = true;
+            res.unpipe(ws);
+            res.destroy();
+            ws.destroy();
+            reject(e);
+          };
+          streamFail = fail;
+          ws.on("error", fail);
+          res.on("error", fail);
+          res.on("aborted", () => fail(new Error("s3 get aborted mid-body")));
+          ws.on("finish", () => {
+            if (settled) return;
+            // A body that ended short is a failed download, never a smaller object.
+            if (Number.isFinite(want) && ws.bytesWritten !== want) {
+              return fail(new Error(`s3 get short body: ${ws.bytesWritten} of ${want} bytes`));
+            }
+            settled = true;
+            resolve({ status, headers: res.headers });
+          });
           res.pipe(ws);
-          ws.on("finish", () => resolve({ status, headers: res.headers }));
-          ws.on("error", reject);
-          res.on("error", reject);
           return;
         }
         // Buffer the (small) body for list/errors; drain otherwise.
@@ -275,7 +312,9 @@ class S3BlobStore {
         }));
         res.on("error", reject);
       });
-      req.on("error", reject);
+      // A socket error or timeout mid-body surfaces HERE, not on the response —
+      // route it through the body's own teardown so its stream is closed too.
+      req.on("error", (e) => (streamFail ? streamFail(e) : reject(e)));
       req.setTimeout(this.timeoutMs, () => req.destroy(new Error("s3 request timeout")));
       if (bodyBuffer) req.end(bodyBuffer);
       else if (bodyFile) {
@@ -314,7 +353,14 @@ class S3BlobStore {
 
   // List every key under a prefix, paging past the 1000-key truncation.
   async list(prefix) {
-    const keys = [];
+    return (await this.listSizes(prefix)).map((e) => e.key);
+  }
+
+  // The same listing as [{key, size}] — ListObjectsV2 carries each object's size,
+  // so a caller that needs sizes (the archive hydrate) is spared a HEAD per key.
+  // `size` is null if the server omitted it.
+  async listSizes(prefix) {
+    const out = [];
     let token = null;
     do {
       const query = { "list-type": "2", prefix: prefix || "" };
@@ -322,10 +368,10 @@ class S3BlobStore {
       const r = await this._request("GET", null, { query, collect: true });
       if (r.status !== 200) throw new Error(`s3 list ${prefix} -> HTTP ${r.status}`);
       const parsed = parseListXml(r.body || "");
-      for (const k of parsed.keys) keys.push(k);
+      parsed.keys.forEach((key, i) => out.push({ key, size: parsed.sizes[i] }));
       token = parsed.truncated ? parsed.nextToken : null;
     } while (token);
-    return keys;
+    return out;
   }
 
   async del(key) {
