@@ -75,6 +75,10 @@ class ArchiveMirror {
     this._rawInflight = new Map(); // key -> Promise, so a key is fetched once
     this._rawPumping = false;
     this._tmpSeq = 0;
+    // Did the last hydrate COMPLETE — list the bucket AND land every rendered file
+    // it needed? Until one has, the local tree does not match the of-record the
+    // Postgres cursors describe, and ingest must stay closed (XERK-1048).
+    this.hydrated = false;
   }
 
   // The blob key for an absolute path under ARCHIVE_DIR, or null if it escapes
@@ -176,9 +180,11 @@ class ArchiveMirror {
           }
         }
       } catch (e) {
-        this.log(`archive hydrate: list failed (${e && e.message}); the store retries`);
+        this.hydrated = false;
+        this.lastFailure = `listing the bucket failed (${e && e.message}) — is the object store reachable?`;
         return 0;
       }
+      const failures = [];
       // Classify EVERY key against local disk and swap the pending set in ONE
       // synchronous step — no await between the listing and the swap. Clearing
       // the set and refilling it across the download loop's awaits left a window
@@ -210,10 +216,12 @@ class ArchiveMirror {
       }
       this._rawPending = nextPending;
       for (const k of [...this._rawWanted]) if (!this._isPending(k)) this._rawWanted.delete(k);
-      if (pendingRaw) {
+      // Said once per change, not on every retry of an incomplete hydrate.
+      if (pendingRaw && pendingRaw !== this._loggedPendingRaw) {
         this.log(`archive hydrate: ${pendingRaw} raw-layer object(s) left in the ` +
           `bucket, fetched on demand (XERK-1043)`);
       }
+      this._loggedPendingRaw = pendingRaw;
       for (const { key, dest } of downloads) {
         try {
           // Through a temp file too: a GET cut mid-body left a PARTIAL rendered
@@ -221,9 +229,18 @@ class ArchiveMirror {
           // drain PUT over the complete object (XERK-1043 QA, pass 2).
           if (await this._download(key, dest)) fetched++;
         } catch (e) {
-          this.log(`archive hydrate: ${key} failed (${e && e.message}); skipped`);
+          failures.push(`${key} (${e && e.message})`);
         }
       }
+      // A rendered file that did not land is ABSENT (or short) locally while
+      // Postgres holds its full cursor: ingest onto it writes a tail-only file the
+      // drain PUTs over the complete object — the same loss as a failed listing.
+      // One summary line per attempt, never one per key: a persistent failure
+      // across a whole prod listing was ~9000 lines a minute (XERK-1048 QA).
+      this.hydrated = failures.length === 0;
+      this.lastFailure = failures.length
+        ? `${failures.length} rendered download(s) failed, e.g. ${failures.slice(0, 3).join("; ")}.`
+        : null;
       // Reindex whatever landed, so search + cursors reflect the hydrated store.
       // Never fatal — a rebuild hiccup leaves the index stale, not the hub down.
       try { this.reindex(); } catch (e) {
@@ -233,6 +250,36 @@ class ArchiveMirror {
       this._hydrating = false;
     }
     return fetched;
+  }
+
+  // hydrate(), retried with capped exponential backoff until it COMPLETES (lists
+  // and lands every rendered file; a retry only fetches what is still missing).
+  // A replica that opened ingest after a failed listing served Postgres cursors
+  // over an EMPTY local tree: agents re-shipped tails onto missing files and the
+  // drain PUT those partial files over the complete objects (XERK-1048). The
+  // caller keeps ingest gated for as long as this runs. `sleep` is injectable
+  // for tests.
+  async hydrateUntilListed({ firstDelayMs = 2000, maxDelayMs = 60 * 1000,
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+    let fetched = await this.hydrate();
+    for (let delay = firstDelayMs; this.blobStore && !this.hydrated;
+      delay = Math.min(delay * 2, maxDelayMs)) {
+      this.log(`archive hydrate: incomplete — ${this.lastFailure} Archive ingest ` +
+        `stays closed on this replica; retrying in ${Math.round(delay / 1000)}s`);
+      await sleep(delay);
+      fetched = await this.hydrate();
+    }
+    return fetched;
+  }
+
+  // The byte hydrate as server.js runs it: archive ingest GATED CLOSED (via the
+  // injected `setGate`, archive.setHydrating) for the whole of hydrateUntilListed,
+  // released only in `finally`. Kept here, not inline in server.js, so the gate
+  // itself is under test — dropping it silently brings XERK-1048's loss back.
+  async hydrateGated(setGate, opts) {
+    setGate(true);
+    try { return await this.hydrateUntilListed(opts); }
+    finally { setGate(false); }
   }
 
   _isPending(key) {

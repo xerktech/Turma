@@ -519,3 +519,107 @@ test("a rendered download cut mid-body leaves nothing at its real path", async (
   assert.equal(fs.existsSync(path.join(root, "repo", "a.jsonl")), false);
   assert.deepEqual(fs.readdirSync(path.join(root, ".raw-fetch")), []);
 });
+
+test("hydrateUntilListed retries until the hydrate completes (XERK-1048)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.map.set("repo/a.jsonl", Buffer.from("x\n"));
+  let down = 3;
+  const list = store.list;
+  store.list = async (p) => { if (down-- > 0) throw new Error("ECONNREFUSED"); return list(p); };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  const slept = [];
+  const n = await m.hydrateUntilListed({
+    firstDelayMs: 100, maxDelayMs: 250, sleep: async (ms) => { slept.push(ms); },
+  });
+  assert.equal(n, 1);
+  assert.equal(m.hydrated, true);
+  assert.deepEqual(slept, [100, 200, 250]); // capped exponential backoff
+  assert.ok(fs.existsSync(path.join(root, "repo", "a.jsonl")));
+});
+
+test("a failed listing is reported, not mistaken for an empty bucket", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.list = async () => { throw new Error("down"); };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  assert.equal(await m.hydrate(), 0);
+  assert.equal(m.hydrated, false);
+});
+
+test("a failed rendered download keeps the hydrate incomplete until it lands (XERK-1048)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.map.set("repo/a.jsonl", Buffer.from("a\n"));
+  store.map.set("repo/b.jsonl", Buffer.from("b\n"));
+  let failB = 2;
+  const get = store.getToFile;
+  store.getToFile = async (k, d) => {
+    if (k === "repo/b.jsonl" && failB-- > 0) throw new Error("socket hang up");
+    return get(k, d);
+  };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  const slept = [];
+  await m.hydrateUntilListed({ firstDelayMs: 10, sleep: async (ms) => { slept.push(ms); } });
+  assert.equal(m.hydrated, true);
+  assert.equal(slept.length, 2);
+  assert.equal(fs.readFileSync(path.join(root, "repo", "b.jsonl"), "utf8"), "b\n");
+});
+
+test("hydrateGated holds the ingest gate closed until the hydrate completes (XERK-1048)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.map.set("repo/a.jsonl", Buffer.from("a\n"));
+  let down = 2;
+  const list = store.list;
+  store.list = async (p) => { if (down-- > 0) throw new Error("ECONNREFUSED"); return list(p); };
+  const logs = [];
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log: (l) => logs.push(l) });
+  const gate = [];
+  const gateAtSleep = [];
+  await m.hydrateGated((v) => gate.push(v), {
+    firstDelayMs: 1, sleep: async () => { gateAtSleep.push(gate[gate.length - 1]); },
+  });
+  assert.deepEqual(gate, [true, false]);          // closed once, opened once, at the end
+  assert.deepEqual(gateAtSleep, [true, true]);    // closed across every retry
+  assert.ok(fs.existsSync(path.join(root, "repo", "a.jsonl")));
+  assert.match(logs.join("\n"), /listing the bucket failed \(ECONNREFUSED\) — is the object store reachable\? Archive ingest/);
+  // ...and released even when the hydrate throws.
+  const m2 = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  m2.hydrateUntilListed = async () => { throw new Error("boom"); };
+  const gate2 = [];
+  await assert.rejects(m2.hydrateGated((v) => gate2.push(v)));
+  assert.deepEqual(gate2, [true, false]);
+});
+
+test("a completed hydrate whose next listing fails is incomplete again", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  await m.hydrate();
+  assert.equal(m.hydrated, true);
+  store.list = async () => { throw new Error("down"); };
+  await m.hydrate();
+  assert.equal(m.hydrated, false);
+});
+
+test("persistent download failures log one summary per attempt, naming the cause", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  for (let i = 0; i < 50; i++) store.map.set(`repo/f${i}.jsonl`, Buffer.from("x"));
+  store.map.set("repo/a.jsonl.raw/t/t.jsonl", Buffer.from("r"));
+  let bad = 3; // three attempts fail every rendered GET with a 403
+  const get = store.getToFile;
+  store.getToFile = async (k, d) => { if (bad > 0) throw new Error("HTTP 403"); return get(k, d); };
+  const logs = [];
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log: (l) => logs.push(l) });
+  await m.hydrateUntilListed({ firstDelayMs: 1, sleep: async () => { bad--; } });
+  assert.equal(m.hydrated, true);
+  const retries = logs.filter((l) => /incomplete/.test(l));
+  assert.equal(retries.length, 3);                // one line per attempt, not 50
+  assert.equal(logs.length, 4, logs.join("\n"));  // + the raw-pending line; no per-key lines
+  assert.doesNotMatch(retries[0], /\?\./);
+  assert.match(retries[0], /50 rendered download\(s\) failed, e\.g\. .*HTTP 403/);
+  assert.doesNotMatch(retries[0], /object store reachable/); // a 403 is not an outage
+  assert.equal(logs.filter((l) => /raw-layer object/.test(l)).length, 1); // said once
+});
