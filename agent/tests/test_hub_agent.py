@@ -33941,11 +33941,14 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
         ws, limit, psi = ha._memguard_memory(proc, cg)
         self.assertEqual((ws, limit, psi), (400, 2000, None))
 
-    def test_no_cgroup_limit_falls_back_to_the_whole_host(self):
-        proc, cg = self._fake_roots("0::/", {"": {"memory.max": "max\n"}})
+    def test_no_cgroup_limit_is_off_never_host_meminfo(self):
+        # TrueNAS: MemAvailable omits the ZFS ARC, so host meminfo reads ~90% on a
+        # healthy host. No limit must mean no reading, not that one.
+        proc, cg = self._fake_roots("0::/a", {"": {"memory.max": "max\n"},
+                                              "a": {"memory.max": "max\n"}})
         with open(os.path.join(proc, "meminfo"), "w") as f:
-            f.write("MemTotal:  1000 kB\nMemFree: 10 kB\nMemAvailable:  250 kB\n")
-        self.assertEqual(ha._memguard_memory(proc, cg), (750 * 1024, 1000 * 1024, None))
+            f.write("MemTotal:  1000 kB\nMemFree: 10 kB\nMemAvailable:  50 kB\n")
+        self.assertIsNone(ha._memguard_memory(proc, cg))
 
     def test_unreadable_memory_is_none_not_a_crash(self):
         proc, cg = self._fake_roots("0::/", {"": {"memory.max": "1000\n"}})
@@ -33964,6 +33967,13 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
             self.assertIsNone(ha._memguard_over(800, 1000, 39.9))
             self.assertIsNone(ha._memguard_over(10, 0, 99.0))
 
+    def test_only_a_tree_that_relieves_it_alone_is_worth_killing(self):
+        with mock.patch.object(ha, "MEMGUARD_PCT", 90.0):
+            # 950 of 1000: must fall under the 80% floor, so >150 has to go.
+            self.assertTrue(ha._memguard_relieves(950, 1000, 151))
+            self.assertFalse(ha._memguard_relieves(950, 1000, 150))
+            self.assertFalse(ha._memguard_relieves(950, 1000, 4))
+
     # -- choosing the victim --------------------------------------------------
 
     @staticmethod
@@ -33971,25 +33981,28 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
         return {"ppid": ppid, "comm": comm, "rss": rss, "sid": sid,
                 "worktree": worktree, "start": start}
 
+    PANES = {61, 70}
+
     def _fleet(self):
-        """A host like the one this was found on: a manager, tmux + claude panes,
-        a Bash tool tree, a daemon that double-forked to PID 1, and a big
-        process nobody owns."""
+        """A host like the one this was found on: a manager (itself under a
+        supervisor), tmux + agent panes, a Bash tool tree, a daemon that
+        double-forked to PID 1, and a big process nobody owns."""
         p = self._p
         return {
             1: p(0, "bash", 10),
-            50: p(1, "python3", 900),                 # the manager
+            40: p(1, "supervisor", 900, sid="a"),     # the manager's ancestor
+            50: p(40, "python3", 900),                # the manager
             51: p(50, "ttyd", 900, worktree="/w/r/a"),
             52: p(50, "bash", 900),                   # tunnel supervisor
-            53: p(52, "node", 900),
+            53: p(52, "node", 900, sid="a"),          # manager grandchild, with an id
             54: p(50, "git", 900, sid="a"),           # the manager's own git call
-            60: p(1, "tmux: server", 900),
-            61: p(60, "claude", 5000, sid="a"),       # session a's agent
+            60: p(1, "tmux: server", 900, sid="a"),
+            61: p(60, "claude", 5000, sid="a"),       # session a's agent pane
             62: p(61, "bash", 10, sid="a"),           # a Bash tool shell
             63: p(62, "node", 300, sid="a"),
             64: p(63, "evenhub-sim", 700),            # env cleared, still a's work
-            65: p(61, "claude", 9000, sid="a"),       # a nested claude -p
-            70: p(60, "qwen", 8000, sid="b"),         # session b's agent (any runtime)
+            70: p(60, "sh", 10, sid="b"),             # session b's pane: dash, no exec
+            71: p(70, "MainThread", 8000, sid="b"),   # ...so b's runtime is its child
             80: p(1, "vite", 800, sid="b"),           # orphaned daemon of b
             81: p(80, "esbuild", 100),
             90: p(1, "postgres", 99999),              # unreadable env/cwd: unowned
@@ -33997,7 +34010,7 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
         }
 
     def test_picks_the_largest_session_owned_tree_summed(self):
-        u = ha._memguard_pick(self._fleet(), 50)
+        u = ha._memguard_pick(self._fleet(), 50, self.PANES)
         # a's Bash tree (10+300+700) beats b's orphaned vite tree (800+100).
         self.assertEqual(u["root"], 62)
         self.assertEqual(u["pids"][0], 62)
@@ -34008,22 +34021,43 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
     def test_a_daemon_reparented_to_pid_1_is_still_its_sessions(self):
         procs = self._fleet()
         procs[64]["rss"] = 0
-        u = ha._memguard_pick(procs, 50)
+        u = ha._memguard_pick(procs, 50, self.PANES)
         self.assertEqual((u["root"], sorted(u["pids"]), u["sid"]),
                          (80, [80, 81], "b"))
 
-    def test_never_picks_agents_tmux_ttyd_manager_or_unowned(self):
+    def test_never_picks_agents_tmux_manager_tree_ancestors_or_unowned(self):
         procs = self._fleet()
         for pid in (62, 63, 64, 80, 81):
             del procs[pid]
-        # What is left: agents, nested claude, tmux, the manager and its children,
-        # and a huge unowned postgres. None of it is the guard's to kill.
-        self.assertIsNone(ha._memguard_pick(procs, 50))
+        # What is left: agent panes and a shell pane's runtime child, the tmux
+        # server, the manager's ancestor, whole subtree (a grandchild carrying a
+        # session id included), and a huge unowned postgres. None is killable.
+        self.assertIsNone(ha._memguard_pick(procs, 50, self.PANES))
+
+    def test_protection_is_by_registry_pid_not_by_name(self):
+        p = self._p
+        procs = {1: p(0, "init"), 50: p(1, "python3"),
+                 60: p(1, "tmux: server"), 61: p(60, "claude", 10, sid="a"),
+                 # A process that CALLS itself claude, under the agent.
+                 62: p(61, "claude", 500, sid="a"),
+                 # A pane on a tmux server the session started itself.
+                 70: p(1, "tmux: server", 1, sid="a"),
+                 71: p(70, "python3", 300, sid="a")}
+        u = ha._memguard_pick(procs, 50, {61})
+        self.assertEqual(u["root"], 62)
+        del procs[62]
+        u = ha._memguard_pick(procs, 50, {61})
+        self.assertEqual((u["root"], sorted(u["pids"])), (70, [70, 71]))
+
+    def test_an_exec_ing_pane_leaves_its_children_killable(self):
+        # claude is the pane itself, so its children are Bash tool shells.
+        u = ha._memguard_pick(self._fleet(), 50, self.PANES)
+        self.assertIn(62, u["pids"])
 
     def test_worktree_cwd_owns_a_process_with_a_cleaned_environment(self):
         procs = {1: self._p(0, "init"), 50: self._p(1, "python3"),
                  7: self._p(1, "valkey-server", 50, worktree="/w/r/c")}
-        u = ha._memguard_pick(procs, 50)
+        u = ha._memguard_pick(procs, 50, set())
         self.assertEqual((u["root"], u["worktree"], u["sid"]), (7, "/w/r/c", None))
 
     def test_a_ppid_cycle_from_a_racy_snapshot_terminates(self):
@@ -34031,7 +34065,7 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
                  7: self._p(8, "x", 10, sid="a"), 8: self._p(7, "y", 10)}
         # A cycle has no top, so which member roots it is arbitrary; the point is
         # that the walk ends and still finds the owned process.
-        u = ha._memguard_pick(procs, 50)
+        u = ha._memguard_pick(procs, 50, set())
         self.assertIn(7, u["pids"])
 
     # -- reading /proc --------------------------------------------------------
@@ -34055,7 +34089,8 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
 
         mk(10, "we) ird (name", "S",
            env=b"A=1\0TURMA_SESSION_ID_X=no\0TURMA_SESSION_ID=abcde\0B=2\0")
-        mk(11, "srv", "S", cwd=os.path.join(wt, "sub", "dir"))
+        mk(11, "srv", "S", cwd=os.path.join(wt, "sub", "dir"),
+           env=b"TURMA_SESSION_ID=zzzzz\0")
         mk(12, "dead", "Z", env=b"TURMA_SESSION_ID=abcde\0")
         mk(13, "bad", "S", env=b"TURMA_SESSION_ID=$(rm -rf /)\0")
         os.makedirs(os.path.join(proc, "٤٢"))   # Arabic-Indic digits
@@ -34088,6 +34123,34 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
         self.assertEqual(ha._memguard_kill(procs, {"pids": [child.pid]}), 0)
         self.assertIsNone(child.poll())
 
+    def test_signals_through_the_pidfd_it_opened_before_the_check(self):
+        child = self._spawn()
+        procs = {child.pid: {"start": ha._proc_start_time(child.pid)}}
+        order = []
+        real_open, real_start = os.pidfd_open, ha._proc_start_time
+
+        def opened(pid, *a):
+            order.append("open")
+            return real_open(pid, *a)
+
+        def started(pid):
+            order.append("check")
+            return real_start(pid)
+        with mock.patch.object(ha.os, "pidfd_open", side_effect=opened), \
+                mock.patch.object(ha, "_proc_start_time", side_effect=started), \
+                mock.patch.object(ha.os, "kill") as bare_kill:
+            self.assertEqual(ha._memguard_kill(procs, {"pids": [child.pid]}), 1)
+        self.assertEqual(order, ["open", "check"])
+        bare_kill.assert_not_called()
+        self.assertEqual(child.wait(timeout=5), -signal.SIGKILL)
+
+    def test_a_process_reaped_after_the_open_is_not_counted(self):
+        child = self._spawn()
+        procs = {child.pid: {"start": ha._proc_start_time(child.pid)}}
+        with mock.patch.object(ha.signal, "pidfd_send_signal",
+                               side_effect=ProcessLookupError):
+            self.assertEqual(ha._memguard_kill(procs, {"pids": [child.pid]}), 0)
+
     def test_a_vanished_pid_is_skipped(self):
         child = self._spawn()
         start = ha._proc_start_time(child.pid)
@@ -34101,16 +34164,22 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
     class _Stop(BaseException):
         pass
 
-    def _one_pass(self, sm, mem, unit, killed=1):
-        """Run _memguard_loop for exactly one poll."""
-        with mock.patch.object(ha.time, "sleep", side_effect=[None, self._Stop]), \
+    def _one_pass(self, sm, mem, unit, killed=1, polls=1, panes=frozenset(),
+                  procs=None):
+        """Run _memguard_loop for exactly `polls` polls."""
+        with mock.patch.object(ha.time, "sleep",
+                               side_effect=[None] * polls + [self._Stop]), \
                 mock.patch.object(ha, "_memguard_memory", return_value=mem), \
-                mock.patch.object(ha, "_memguard_procs", return_value={}), \
-                mock.patch.object(ha, "_memguard_pick", return_value=unit), \
+                mock.patch.object(ha, "_memguard_procs",
+                                  return_value=procs or {62: {"start": 1},
+                                                         63: {"start": 2}}), \
+                mock.patch.object(sm, "_memguard_panes", return_value=panes), \
+                mock.patch.object(ha, "_memguard_pick", return_value=unit) as pick, \
                 mock.patch.object(ha, "_memguard_kill",
                                   return_value=killed) as kill:
             with self.assertRaises(self._Stop):
                 sm._memguard_loop()
+        self.last_pick = pick
         return kill
 
     def _unit(self, **over):
@@ -34122,11 +34191,45 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
     def test_loop_kills_when_over_and_stages_the_kill_for_the_beat(self):
         sm = self.make_manager()
         with mock.patch.object(ha, "MEMGUARD_PCT", 90.0):
-            kill = self._one_pass(sm, (950, 1000, 0.0), self._unit())
+            kill = self._one_pass(sm, (950, 1000, 0.0), self._unit(rss=900))
         kill.assert_called_once()
         self.assertEqual(len(sm.memguard_kills), 1)
         self.assertEqual(sm.memguard_kills[0]["killed"], 1)
         self.assertIn("95%", sm.memguard_kills[0]["why"])
+
+    def test_loop_leaves_a_tree_too_small_to_relieve_it_to_the_kernel(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "MEMGUARD_PCT", 90.0):
+            kill = self._one_pass(sm, (950, 1000, 0.0), self._unit(rss=100),
+                                  polls=3)
+        kill.assert_not_called()
+        self.assertEqual(sm.memguard_kills, [])
+
+    def test_loop_kills_nothing_when_tmux_cannot_be_listed(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "MEMGUARD_PCT", 90.0):
+            kill = self._one_pass(sm, (950, 1000, 0.0), self._unit(rss=900),
+                                  panes=None)
+        kill.assert_not_called()
+        self.last_pick.assert_not_called()
+
+    def test_loop_cools_down_after_a_kill(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "MEMGUARD_PCT", 90.0), \
+                mock.patch.object(ha, "MEMGUARD_COOLDOWN_SEC", 3600.0):
+            kill = self._one_pass(sm, (950, 1000, 0.0), self._unit(rss=900),
+                                  polls=3)
+        kill.assert_called_once()
+
+    def test_loop_never_repicks_a_signalled_process_still_exiting(self):
+        sm = self.make_manager()
+        procs = {62: {"start": 5}, 63: {"start": 6}, 99: {"start": 7}}
+        with mock.patch.object(ha, "MEMGUARD_PCT", 90.0), \
+                mock.patch.object(ha, "MEMGUARD_COOLDOWN_SEC", 0.0):
+            self._one_pass(sm, (950, 1000, 0.0), self._unit(rss=900), polls=2,
+                           procs=procs)
+        second = self.last_pick.call_args_list[1].args[0]
+        self.assertEqual(sorted(second), [99])
 
     def test_loop_does_nothing_under_the_line(self):
         sm = self.make_manager()
@@ -34170,6 +34273,20 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
                                side_effect=RuntimeError("boom")) as d:
             sm.build_payload(0)
         d.assert_called_once()
+
+    def test_panes_are_the_registry_sessions_only(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "a", "status": "running", "tmuxName": "agent-a"},
+                       {"id": "b", "status": "stopped", "tmuxName": "agent-b"}]
+        out = "agent-a 61\nagent-b 62\nmy test session 63\nagent-a x\n"
+        with mock.patch.object(ha, "run_out", return_value=(0, out)):
+            self.assertEqual(sm._memguard_panes(), {61})
+        with mock.patch.object(ha, "run_out", return_value=(1, "")):
+            self.assertIsNone(sm._memguard_panes())
+        sm.registry = []
+        with mock.patch.object(ha, "run_out") as ro:
+            self.assertEqual(sm._memguard_panes(), set())
+        ro.assert_not_called()
 
     def test_start_is_off_when_disabled_or_unreadable(self):
         sm = self.make_manager()

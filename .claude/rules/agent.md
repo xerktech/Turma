@@ -55,15 +55,21 @@ an operator/ArgoCD decision, so the guard is userspace, earlyoom-style.
   (whose pane fallback writes the registry). Never raises.
 - **Trigger is the WORKING SET** (`memory.current - inactive_file`), never raw usage: page cache
   fills usage to the limit on a healthy host. PSI `full avg10` triggers only within 10 points of
-  the line. No cgroup limit anywhere up the tree → host-wide `/proc/meminfo`.
-- **Kills only SESSION-OWNED trees**: owned = `TURMA_SESSION_ID` in environ (survives a
-  double-fork to PID 1) or cwd inside a session worktree; unowned (another uid's unreadable
-  process) is never touched, even if largest — it logs and leaves it to the kernel.
-- **Protected, never killed or crossed**: PID 1, the manager + its ancestors + its direct children,
-  every `claude`/`ttyd`/`tmux*`, and each tmux pane's own process (the agent, any runtime). Widening
-  the victim set past this kills the sessions the guard exists to save.
+  the line. **No cgroup limit → guard OFF, never host `/proc/meminfo`**: MemAvailable omits ZFS
+  ARC, so a healthy TrueNAS reads ~90% and the guard would kill for nothing.
+- **Kills only a tree that relieves the overage ON ITS OWN** (`_memguard_relieves`: working set
+  minus the tree < the PSI floor). Without it, pressure the guard can't attribute (a protected
+  agent, another uid, shm) makes it serially kill small innocent trees. Otherwise: log once, leave
+  it to the kernel. Signalled `(pid, start)` are never re-picked; cooldown after a kill.
+- **Owned** = cwd inside a session worktree, else `TURMA_SESSION_ID` in environ (survives a
+  double-fork to PID 1). cwd first: an environ read takes the target's mmap lock. Unreadable
+  (another uid, setproctitle) = unowned = never killed.
+- **Protected BY PID from the registry, never by name**: PID 1, the manager + ancestors + its whole
+  subtree, each running session's pane pid (`_memguard_panes`, filtered to registry tmux names),
+  its tmux server, and a shell pane's children (dash doesn't exec the runtime). A `claude`-named
+  process or a pane on a session's own tmux is session work. Can't list tmux → kill nothing.
 - **Kill through a pidfd opened BEFORE the start-time re-check** (`_memguard_kill`) — the only
-  order that makes a reused pid unreachable. Cooldown after a kill so one runaway costs one tree.
+  order that makes a reused pid unreachable.
 - Tests: `TestMemoryGuard`.
 
 ## Commands

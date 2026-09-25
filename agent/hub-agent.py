@@ -1336,39 +1336,41 @@ def _psi_full_avg10(path):
 
 
 def _memguard_memory(proc_root="/proc", cg_root="/sys/fs/cgroup"):
-    """(working_set_bytes, limit_bytes, psi_full_avg10) for whatever bounds this
-    process, or None when that cannot be read. The cgroup's limit when one is set;
-    otherwise the whole host (MemTotal - MemAvailable), since the kernel's own OOM
-    killer — and its livelock — is then host-wide. PSI is None when unreadable."""
+    """(working_set_bytes, limit_bytes, psi_full_avg10) of the cgroup whose limit
+    binds this process, or None when no cgroup sets one or it cannot be read.
+
+    There is deliberately NO host-wide fallback: MemAvailable leaves reclaimable
+    caches such as ZFS's ARC out, so a healthy TrueNAS host reads ~90% "used", and
+    a guard acting on that would kill session trees that relieve nothing. Where no
+    limit is set, the kernel's own OOM killer is the whole-host backstop."""
     d = _memguard_cgroup_limit_dir(proc_root, cg_root)
-    if d is not None:
-        try:
-            limit = int(_read_text(os.path.join(d, "memory.max")))
-            current = int(_read_text(os.path.join(d, "memory.current")))
-            inactive = 0
-            for line in _read_text(os.path.join(d, "memory.stat")).splitlines():
-                if line.startswith("inactive_file "):
-                    inactive = int(line.split()[1])
-                    break
-            return (max(0, current - inactive), limit,
-                    _psi_full_avg10(os.path.join(d, "memory.pressure")))
-        except (OSError, ValueError):
-            return None
-    try:
-        info = {}
-        for line in _read_text(os.path.join(proc_root, "meminfo")).splitlines():
-            key, _, rest = line.partition(":")
-            if key in ("MemTotal", "MemAvailable"):
-                info[key] = int(rest.split()[0]) * 1024
-        total, avail = info["MemTotal"], info["MemAvailable"]
-    except (OSError, ValueError, KeyError, IndexError):
+    if d is None:
         return None
-    return (max(0, total - avail), total,
-            _psi_full_avg10(os.path.join(proc_root, "pressure", "memory")))
+    try:
+        limit = int(_read_text(os.path.join(d, "memory.max")))
+        current = int(_read_text(os.path.join(d, "memory.current")))
+        inactive = 0
+        for line in _read_text(os.path.join(d, "memory.stat")).splitlines():
+            if line.startswith("inactive_file "):
+                inactive = int(line.split()[1])
+                break
+    except (OSError, ValueError):
+        return None
+    return (max(0, current - inactive), limit,
+            _psi_full_avg10(os.path.join(d, "memory.pressure")))
 
 
 def _gib(n):
     return f"{n / 2**30:.1f} GiB"
+
+
+def _memguard_relieves(working_set, limit, rss):
+    """Whether killing a tree holding `rss` would, ON ITS OWN, bring the working set
+    under the PSI floor (10 points below MEMGUARD_PCT) and so under every trigger.
+    The guard kills nothing that fails this: the ticket's runaway held ~25 of 28
+    GiB, and a tree too small to matter is someone else's innocent work — killing
+    it would relieve nothing and the next pass would kill another."""
+    return working_set - rss < (MEMGUARD_PCT - 10) / 100.0 * limit
 
 
 def _memguard_over(working_set, limit, psi):
@@ -1393,7 +1395,8 @@ def _memguard_procs(proc_root="/proc"):
     exports it and children inherit it, which is what still names a daemon that
     double-forked away to PID 1 — or, failing that (a server started with a
     cleaned environment), when its cwd is inside a session worktree. Neither can
-    be read for another user's process; that one stays unowned, so never killed."""
+    be read for another user's process, nor is the environment left after a
+    setproctitle; such a process stays unowned, so never killed."""
     page = os.sysconf("SC_PAGE_SIZE")
     wt_root = WORKTREES_ROOT.rstrip(os.sep) + os.sep
     procs = {}
@@ -1424,16 +1427,6 @@ def _memguard_procs(proc_root="/proc"):
             continue
         sid = worktree = None
         try:
-            with open(os.path.join(base, "environ"), "rb") as f:
-                env = f.read(MEMGUARD_ENVIRON_MAX)
-            for kv in env.split(b"\0"):
-                m = MEMGUARD_SID_RE.fullmatch(kv)
-                if m:
-                    sid = m.group(1).decode()
-                    break
-        except OSError:
-            pass
-        try:
             cwd = os.readlink(os.path.join(base, "cwd"))
             if cwd.startswith(wt_root):
                 parts = cwd[len(wt_root):].split(os.sep)
@@ -1441,45 +1434,75 @@ def _memguard_procs(proc_root="/proc"):
                     worktree = os.path.join(wt_root, parts[0], parts[1])
         except OSError:
             pass
+        # environ only when cwd did not answer: reading it takes the target's
+        # mmap lock, which a thrashing process contends — cwd does not.
+        if worktree is None:
+            try:
+                with open(os.path.join(base, "environ"), "rb") as f:
+                    env = f.read(MEMGUARD_ENVIRON_MAX)
+                for kv in env.split(b"\0"):
+                    m = MEMGUARD_SID_RE.fullmatch(kv)
+                    if m:
+                        sid = m.group(1).decode()
+                        break
+            except OSError:
+                pass
         procs[int(name)] = {"ppid": ppid, "comm": comm, "start": start, "rss": rss,
                             "sid": sid, "worktree": worktree}
     return procs
 
 
-def _memguard_pick(procs, self_pid):
-    """The tree to kill: {root, comm, pids (root first), rss, sid, worktree} for the
-    session-owned process tree holding the most anonymous memory, or None.
+# A pane process that is one of these did not exec its command, so the session's
+# agent runtime is its CHILD (dash runs `set -a; . env; qwen ...` that way).
+MEMGUARD_SHELLS = frozenset(("sh", "dash", "bash", "zsh", "ash", "ksh"))
 
-    PROTECTED, and never killed or crossed: PID 1; this manager, its ancestors and
-    its direct children (ttyd, the tunnel supervisor, its own git calls); every
-    `claude`, `ttyd` and `tmux` process; and each tmux pane's own process — the
-    session's agent itself, whatever its runtime. A tree's root is the topmost
-    session-owned, unprotected process of its chain (a Bash tool's shell, or a
-    daemon reparented to PID 1); everything unprotected beneath it is its tree,
-    owned or not, because a child that cleared its environment is still that
-    session's work."""
+
+def _memguard_pick(procs, self_pid, panes):
+    """The session-owned process tree holding the most anonymous memory, as {root,
+    comm, pids (root first), rss, sid, worktree}, or None. `panes` is the pid of
+    each of THIS manager's sessions' tmux panes (see `_memguard_panes`).
+
+    PROTECTED, never killed or crossed: PID 1; this manager, its ancestors and its
+    whole subtree (ttyd, the tunnel, its git calls — even if it was started from a
+    session shell and carries that session's id); each session pane's process, its
+    tmux server, and — when the pane is a shell that did not exec — the pane's
+    children, which is where the agent runtime then lives. Protection is by PID
+    from the manager's own registry, never by name: a process named `claude`, or a
+    pane on a tmux server a session started itself, is that session's work like
+    any other. A tree's root is the topmost session-owned, unprotected process of
+    its chain (a Bash tool's shell, or a daemon reparented to PID 1); everything
+    unprotected beneath it is its tree, owned or not, because a child that cleared
+    its environment is still that session's work."""
     guarded = {1, self_pid}
     cur = procs.get(self_pid)
     while cur is not None and cur["ppid"] not in guarded:
         guarded.add(cur["ppid"])
         cur = procs.get(cur["ppid"])
-
-    def protected(pid):
-        p = procs[pid]
-        if pid in guarded or p["ppid"] == self_pid:
-            return True
-        comm = p["comm"]
-        if comm in ("claude", "ttyd") or comm.startswith("tmux"):
-            return True
-        parent = procs.get(p["ppid"])
-        return parent is not None and parent["comm"].startswith("tmux")
+    children = {}
+    for pid, p in procs.items():
+        children.setdefault(p["ppid"], []).append(pid)
+    todo = list(children.get(self_pid, ()))
+    while todo:                             # the manager's subtree
+        pid = todo.pop()
+        if pid not in guarded:
+            guarded.add(pid)
+            todo.extend(children.get(pid, ()))
+    for pane in panes:
+        p = procs.get(pane)
+        if p is None:
+            continue
+        guarded.add(pane)
+        guarded.add(p["ppid"])              # its tmux server
+        if p["comm"] in MEMGUARD_SHELLS:
+            guarded.update(children.get(pane, ()))
+    guarded.discard(0)
 
     root_of = {}    # pid -> root of its killable tree, or None when not killable
     for pid in procs:
         chain = []
         cur = pid
         while (cur in procs and cur not in root_of and cur not in chain
-               and not protected(cur)):
+               and cur not in guarded):
             chain.append(cur)
             cur = procs[cur]["ppid"]
         base = root_of.get(cur)
@@ -22433,7 +22456,8 @@ class SessionManager:
             return
         mem = _memguard_memory()
         if mem is None:
-            log("memguard: off (cannot read this host's memory usage)")
+            log("memguard: off (no readable cgroup memory limit binds this host; "
+                "the kernel's OOM killer is the backstop)")
             return
         log(f"memguard: watching a {_gib(mem[1])} limit, killing the largest "
             f"session-owned process tree at {MEMGUARD_PCT:g}% "
@@ -22441,12 +22465,35 @@ class SessionManager:
         threading.Thread(target=self._memguard_loop, name="memguard",
                          daemon=True).start()
 
+    def _memguard_panes(self):
+        """The pane pid of every running session's tmux, or None when tmux cannot
+        be listed while sessions run — the guard then kills nothing, since an
+        agent it cannot identify must never look killable. Filtered to the
+        registry's own tmux names: a session may open sessions on the same server."""
+        names = {s.get("tmuxName") for s in list(self.registry)
+                 if s.get("status") == "running" and s.get("tmuxName")}
+        if not names:
+            return set()
+        rc, out = run_out(["tmux", "list-panes", "-a", "-F",
+                           "#{session_name} #{pane_pid}"], timeout=5)
+        if rc != 0:
+            return None
+        panes = set()
+        for line in out.splitlines():
+            name, _, pid = line.rpartition(" ")
+            if name in names and pid.isascii() and pid.isdigit():
+                panes.add(int(pid))
+        return panes
+
     def _memguard_loop(self):
-        """Poll memory every MEMGUARD_INTERVAL_SEC and kill one tree per pass while
-        over the line. Its own thread, never the beat: in the livelock this exists
-        for, a beat took hours. Never raises — a dead guard is a silent one."""
+        """Poll memory every MEMGUARD_INTERVAL_SEC and kill at most one tree per
+        pass while over the line — and only a tree that relieves it on its own
+        (_memguard_relieves). Its own thread, never the beat: in the livelock this
+        exists for, a beat took hours. Never raises — a dead guard is a silent one.
+        """
         quiet_until = 0.0
-        stuck = False
+        stuck = None            # the last "can't act" reason logged, once per episode
+        signalled = set()       # (pid, start) already SIGKILLed, maybe still exiting
         while True:
             time.sleep(MEMGUARD_INTERVAL_SEC)
             try:
@@ -22455,17 +22502,34 @@ class SessionManager:
                 mem = _memguard_memory()
                 why = _memguard_over(*mem) if mem else None
                 if why is None:
-                    stuck = False
+                    stuck = None
                     continue
                 procs = _memguard_procs()
-                unit = _memguard_pick(procs, os.getpid())
-                if unit is None:
-                    if not stuck:
-                        stuck = True
-                        log(f"memguard: {why}, but no session-owned process is "
-                            f"using memory; leaving it to the kernel")
+                # A process already signalled (slow to exit, stuck in D state) is
+                # neither re-killed nor re-announced, and is not counted again.
+                signalled &= {(pid, p["start"]) for pid, p in procs.items()}
+                procs = {pid: p for pid, p in procs.items()
+                         if (pid, p["start"]) not in signalled}
+                # AFTER the snapshot: a pane in it was launched before the listing.
+                panes = self._memguard_panes()
+                unit = (_memguard_pick(procs, os.getpid(), panes)
+                        if panes is not None else None)
+                if unit is None or not _memguard_relieves(mem[0], mem[1],
+                                                          unit["rss"]):
+                    reason = ("tmux could not be listed" if panes is None else
+                              "no session-owned process is using memory"
+                              if unit is None else
+                              f"the largest session-owned tree ({unit['comm']}, "
+                              f"pid {unit['root']}, {_gib(unit['rss'])}) is too "
+                              f"small to relieve it")
+                    if stuck != reason:
+                        stuck = reason
+                        log(f"memguard: {why}, but {reason}; leaving it to the "
+                            f"kernel")
                     continue
                 killed = _memguard_kill(procs, unit)
+                signalled.update((pid, procs[pid]["start"]) for pid in unit["pids"]
+                                 if pid in procs)
                 owner = unit["sid"] or unit["worktree"]
                 log(f"memguard: {why}; killed {killed} of {len(unit['pids'])} "
                     f"process(es) in {unit['comm']} (pid {unit['root']}, "
@@ -22476,7 +22540,7 @@ class SessionManager:
                         self.memguard_kills.append(dict(unit, why=why,
                                                         killed=killed))
                         # Only reachable behind a beat stalled for many kills.
-                        del self.memguard_kills[:-50]
+                        del self.memguard_kills[:-10]
             except Exception as e:
                 log(f"memguard: pass failed: {type(e).__name__}: {e}")
 
