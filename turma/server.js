@@ -4073,7 +4073,7 @@ let archiveMirror = null;
 // slow object store never touches the heartbeat budget (XERK-395).
 const ARCHIVE_MIRROR_DRAIN_MS = positiveEnv("ARCHIVE_MIRROR_DRAIN_MS", 15 * 1000);
 function setArchiveMirror(blobStore, ha) {
-  if (!ha || !blobStore) { archiveMirror = null; return; }
+  if (!ha || !blobStore) { archiveMirror = null; archive.setRenderedGate(null); return; }
   archiveMirror = new ArchiveMirror({
     blobStore,
     archiveDir: archive.ARCHIVE_DIR,
@@ -4092,8 +4092,18 @@ function setArchiveMirror(blobStore, ha) {
     // predicate is the not-yet-landed XERK-763 lease. Default true keeps a
     // single-replica HA hub (or a fleet mid-rollout) mirroring.
     isLeader: () => true,
+    // A rendered file retryBlocked landed after the hydrate (XERK-1050): re-derive
+    // cursors from it, as the hydrate does. Skipped while a hydrate holds the gate
+    // (the concurrent-writer rule, XERK-789); that hydrate reconciles it anyway.
+    onLanded: () => {
+      if (archive.isHydrating()) return;
+      if (archiveIndexStore) archive.reconcileHydratedCursors();
+      else { archive.openDb(); archive.rebuildIndex(); }
+    },
   });
   archive.setBlobSink((p) => archiveMirror.note(p));
+  // Ingest closes per TRANSCRIPT for rendered files that did not land (XERK-1050).
+  archive.setRenderedGate((p) => archiveMirror.renderedBlocked(p));
   // The raw layer stays in the bucket until something needs it (XERK-1043).
   archive.setRawRemote({
     pending: (p) => archiveMirror.rawPending(p),
@@ -4313,6 +4323,13 @@ async function hydrateArchiveOnce() {
     catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
   }
   await hydrateArchiveIndex();
+  // Rendered downloads that failed keep only THEIR transcripts closed; keep
+  // retrying them in the background with the rest of the hub ingesting (XERK-1050).
+  // Started after the index hydrate so a landing never reconciles mid-hydrate.
+  if (archiveMirror) {
+    archiveMirror.retryBlockedUntilClear().catch((e) =>
+      console.error(`archive hydrate: blocked-key retry failed: ${e && e.message}`));
+  }
 }
 
 // The multi-replica-safe boot spool sweep (XERK-761). On a shared spool volume a
@@ -15009,6 +15026,24 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/readyz") {
       if (hubDraining) return json(res, 503, { ready: false, draining: true });
       return json(res, 200, { ready: true });
+    }
+
+    // Prometheus gauges for a stalled archive ingest (XERK-1050), which is
+    // otherwise one log line a minute. Unauthenticated like the probes: two
+    // integers, no ids. Under HA a follower forwards this to the leader (above),
+    // the one replica that ingests, so it reports the state that matters.
+    if (url.pathname === "/metrics" && req.method === "GET") {
+      const blocked = archive.blockedTranscripts().length;
+      res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4" });
+      return res.end(
+        "# HELP turma_archive_hydrate_incomplete Transcripts whose archive ingest is " +
+        "held closed because their rendered bytes are not on this replica's disk.\n" +
+        "# TYPE turma_archive_hydrate_incomplete gauge\n" +
+        `turma_archive_hydrate_incomplete ${blocked}\n` +
+        "# HELP turma_archive_ingest_gated 1 while ALL archive ingest is closed " +
+        "(boot/promotion hydrate, or the bucket cannot be listed).\n" +
+        "# TYPE turma_archive_ingest_gated gauge\n" +
+        `turma_archive_ingest_gated ${archive.isHydrating() ? 1 : 0}\n`);
     }
 
     // Branded static assets (stylesheet, UI fonts, icon/favicon set, manifest):

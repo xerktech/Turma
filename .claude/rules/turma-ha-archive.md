@@ -107,17 +107,30 @@ of-record**, so both halves of the ADR split now hold:
   back to the of-record; its files are append-only + authoritative and re-mirror on the next drain. A
   leader that has been writing thus hydrates to a near-no-op. Best-effort per key; a store blip
   leaves the local copy stale, not the hub down.
-- **Ingest stays CLOSED until the byte hydrate COMPLETES (XERK-1048)** — listed AND every rendered
-  download landed (`mirror.hydrated`). `hydrateArchiveOnce` holds `setHydrating(true)` across it
-  (`hydrateUntilListed`: capped backoff, retried forever) and hands straight to the index hydrate.
-  A failed listing (or a rendered GET that never landed) used to return and open
-  ingest over an empty tree with Postgres cursors: agents re-shipped tails onto missing files and
-  the drain PUT those over the complete objects (reproduced on MinIO: 30190 → 324 bytes).
+- **ALL ingest stays CLOSED until the bucket LISTS (XERK-1048)** (`mirror.hydrated`).
+  `hydrateArchiveOnce` holds `setHydrating(true)` across it (`hydrateUntilListed`: capped backoff,
+  retried forever) and hands straight to the index hydrate. Opened over an unlisted tree with
+  Postgres cursors, agents re-shipped tails onto missing files and the drain PUT those over the
+  complete objects (reproduced on MinIO: 30190 → 324 bytes).
   - The gate lives in `mirror.hydrateGated(setGate)`, not inline in server.js, so a test pins it.
-  - Accepted trade-off: ONE rendered key that never downloads (403, local EACCES/ENOSPC) keeps
-    this replica's archive ingest closed indefinitely. Fail closed (agents re-offer, nothing is
-    lost) over fail open (truncation). The retry line names the cause (`lastFailure`), one line
-    per attempt. A per-transcript gate is the refinement (XERK-1050).
+- **A rendered file that did not land closes ingest for ITS transcript only (XERK-1050)**, not the
+  replica: one undownloadable key (403, IAM List-without-Get, EACCES/ENOSPC) used to stall the
+  whole fleet's archive ingest forever.
+  - `archive.setRenderedGate` → `renderedBlocked(row)`: blocked when the mirror's `_blocked` holds its
+    `.jsonl`/`.meta`, OR its row records `archiveBytes` with no local `.jsonl` (a GET that 404'd after
+    the listing, never mirrored, or hand-deleted). The second arm needs no mirror state, so it holds
+    across a restart; it never self-heals — deliberately, re-seeding from 0 is the operator's call.
+  - Blocked = `ingestChunk` returns the cursor (no progress, never an error — XERK-255),
+    `inventoryCursors` does not want it, `relPathOwner` treats a blocked path as owned. The
+    MANIFEST path still reports its cursor: an id left out there is pushed from 0 every beat.
+  - The raw layer is not gated: raw objects are never in the rendered download, and have their own
+    pending guard (XERK-1043).
+  - `retryBlockedUntilClear` retries in the background (started after the index hydrate), one log
+    line per attempt; a landing calls `onLanded` → `reconcileHydratedCursors`, skipped while
+    `isHydrating()` (the XERK-789 concurrent-writer rule — that hydrate reconciles it anyway).
+    `retryBlocked` and `hydrate` never overlap: its renames would race hydrate's classify.
+  - `/metrics` (unauthenticated, forwarded to the leader): `turma_archive_hydrate_incomplete`
+    (blocked transcripts) and `turma_archive_ingest_gated` (1 while ALL ingest is closed).
 - **The raw layer is LAZY (XERK-1043)** — keys under `<x>.jsonl.raw/` are ~83% of the bucket, and
   pulling them into every replica's size-limited `/data` emptyDir evicted each pod mid-hydrate once
   the bucket outgrew it (8.55 GiB vs 8Gi, 2026-09-25). Hydrate records them as REMOTE-PENDING
@@ -297,7 +310,7 @@ of-record**, so both halves of the ADR split now hold:
   before. The bucket itself is unbounded object storage (it scales — the ADR's whole reason for the
   split); an operator-side lifecycle/quota on the bucket is the deployment's concern, not the hub's.
 - **Known gap, documented not closed:** an operator HAND-DELETING a local `.jsonl` is not propagated
-  to the bucket (the mirror only pushes writes). The of-record keeps the object until a bucket-side
+  to the bucket (the mirror only pushes writes); its transcript stays blocked (XERK-1050). The of-record keeps the object until a bucket-side
   lifecycle rule or a future reconcile sweep removes it. This mirrors the archive's existing posture
   that deletion is an out-of-band operator action.
 

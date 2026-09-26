@@ -53,9 +53,10 @@ class ArchiveMirror {
    * @param {string}  o.archiveDir the local ARCHIVE_DIR root the keys are relative to.
    * @param {Function} o.reindex   called after a hydrate to rebuild the local index.
    * @param {Function} [o.isLeader] leader gate for the PUSH (XERK-763); default true.
+   * @param {Function} [o.onLanded] called after retryBlocked lands a rendered file.
    * @param {Function} [o.log]     console.error-shaped logger.
    */
-  constructor({ blobStore, archiveDir, reindex, isLeader, log }) {
+  constructor({ blobStore, archiveDir, reindex, isLeader, onLanded, log }) {
     this.blobStore = blobStore;
     // archiveDir is ARCHIVE_DIR (operator env / a fixed default), not user input;
     // keyFor/pathFor below re-check every derived path against this resolved root.
@@ -63,6 +64,7 @@ class ArchiveMirror {
     this.archiveDir = path.resolve(archiveDir);
     this.reindex = typeof reindex === "function" ? reindex : () => {};
     this.isLeader = typeof isLeader === "function" ? isLeader : () => true;
+    this.onLanded = typeof onLanded === "function" ? onLanded : () => {};
     this.log = typeof log === "function" ? log : (m) => console.error(m);
     this._dirty = new Set();
     this._draining = false;
@@ -75,10 +77,16 @@ class ArchiveMirror {
     this._rawInflight = new Map(); // key -> Promise, so a key is fetched once
     this._rawPumping = false;
     this._tmpSeq = 0;
-    // Did the last hydrate COMPLETE — list the bucket AND land every rendered file
-    // it needed? Until one has, the local tree does not match the of-record the
-    // Postgres cursors describe, and ingest must stay closed (XERK-1048).
+    // Did the last hydrate LIST the bucket? Until one has, nothing here knows
+    // which local files are short of the of-record the Postgres cursors describe,
+    // so ingest stays closed for the whole replica (XERK-1048).
     this.hydrated = false;
+    // Rendered keys the listing named that did NOT land: key -> failure text.
+    // Ingest stays closed for THOSE transcripts only (`renderedBlocked`), not the
+    // whole hub, until `retryBlocked` lands them (XERK-1050).
+    this._blocked = new Map();
+    this._retrying = null;   // the in-flight retryBlocked pass, so hydrate waits on it
+    this._retryLoop = false; // retryBlockedUntilClear is running
   }
 
   // The blob key for an absolute path under ARCHIVE_DIR, or null if it escapes
@@ -165,6 +173,8 @@ class ArchiveMirror {
     this._hydrating = true;
     let fetched = 0;
     try {
+      // A retryBlocked pass renames files into place; never classify under it.
+      if (this._retrying) await this._retrying;
       // [{key, size}] in one listing when the store can give sizes (S3 always
       // does); otherwise a HEAD per key, the pre-XERK-1043 shape.
       let listing;
@@ -184,7 +194,6 @@ class ArchiveMirror {
         this.lastFailure = `listing the bucket failed (${e && e.message}) — is the object store reachable?`;
         return 0;
       }
-      const failures = [];
       // Classify EVERY key against local disk and swap the pending set in ONE
       // synchronous step — no await between the listing and the swap. Clearing
       // the set and refilling it across the download loop's awaits left a window
@@ -193,16 +202,18 @@ class ArchiveMirror {
       // copy over the complete object (XERK-1043 QA D1).
       const nextPending = new Map();
       const downloads = [];
+      const listed = new Set();
       let pendingRaw = 0;
       for (const item of listing) {
         const key = item && item.key;
         const dest = this.pathFor(key);
         if (!dest || !Number.isFinite(item.size)) continue;
+        listed.add(key);
         let localSize = -1;
         try { localSize = fs.statSync(dest).size; } catch { localSize = -1; }
         // Skip when local is same-size OR larger (ahead of the bucket) — only a
         // missing/partial (smaller) local is (re)fetched. Never truncate a leader.
-        if (localSize >= item.size) continue;
+        if (localSize >= item.size) { this._blocked.delete(key); continue; }
         const root = rawRootOf(key);
         if (root) {
           // Raw layer: recorded, not downloaded (see the header). `have` is the
@@ -222,25 +233,27 @@ class ArchiveMirror {
           `bucket, fetched on demand (XERK-1043)`);
       }
       this._loggedPendingRaw = pendingRaw;
+      // A key gone from the bucket is no longer this mirror's to fetch. If
+      // Postgres still counts its bytes, archive.js blocks the transcript itself
+      // (its local .jsonl is absent), so nothing is lost by forgetting it here.
+      for (const k of [...this._blocked.keys()]) if (!listed.has(k)) this._blocked.delete(k);
       for (const { key, dest } of downloads) {
         try {
           // Through a temp file too: a GET cut mid-body left a PARTIAL rendered
           // file at its real path, which ingest would then append to and the
-          // drain PUT over the complete object (XERK-1043 QA, pass 2).
+          // drain PUT over the complete object (XERK-1043 QA, pass 2). A 404
+          // (deleted since the listing) returns false: gone, as above.
           if (await this._download(key, dest)) fetched++;
+          this._blocked.delete(key);
         } catch (e) {
-          failures.push(`${key} (${e && e.message})`);
+          // ABSENT (or short) locally while Postgres holds its full cursor:
+          // ingest onto it would write a tail-only file the drain PUTs over the
+          // complete object. Blocked until retryBlocked lands it (XERK-1050).
+          this._blocked.set(key, `${key} (${e && e.message})`);
         }
       }
-      // A rendered file that did not land is ABSENT (or short) locally while
-      // Postgres holds its full cursor: ingest onto it writes a tail-only file the
-      // drain PUTs over the complete object — the same loss as a failed listing.
-      // One summary line per attempt, never one per key: a persistent failure
-      // across a whole prod listing was ~9000 lines a minute (XERK-1048 QA).
-      this.hydrated = failures.length === 0;
-      this.lastFailure = failures.length
-        ? `${failures.length} rendered download(s) failed, e.g. ${failures.slice(0, 3).join("; ")}.`
-        : null;
+      this.hydrated = true;
+      this.lastFailure = this._blockedSummary();
       // Reindex whatever landed, so search + cursors reflect the hydrated store.
       // Never fatal — a rebuild hiccup leaves the index stale, not the hub down.
       try { this.reindex(); } catch (e) {
@@ -252,13 +265,23 @@ class ArchiveMirror {
     return fetched;
   }
 
-  // hydrate(), retried with capped exponential backoff until it COMPLETES (lists
-  // and lands every rendered file; a retry only fetches what is still missing).
-  // A replica that opened ingest after a failed listing served Postgres cursors
-  // over an EMPTY local tree: agents re-shipped tails onto missing files and the
-  // drain PUT those partial files over the complete objects (XERK-1048). The
-  // caller keeps ingest gated for as long as this runs. `sleep` is injectable
-  // for tests.
+  // One summary line, never one per key: a persistent failure across a whole prod
+  // listing was ~9000 lines a minute (XERK-1048 QA). null when nothing is blocked.
+  _blockedSummary() {
+    if (!this._blocked.size) return null;
+    const eg = [...this._blocked.values()].slice(0, 3).join("; ");
+    return `${this._blocked.size} rendered download(s) failed, e.g. ${eg}.`;
+  }
+
+  // hydrate(), retried with capped exponential backoff until the bucket LISTS (a
+  // retry only fetches what is still missing). A replica that opened ingest after
+  // a failed listing served Postgres cursors over an EMPTY local tree: agents
+  // re-shipped tails onto missing files and the drain PUT those partial files over
+  // the complete objects (XERK-1048). The caller keeps ingest gated for as long as
+  // this runs. Rendered downloads that failed do NOT hold it: they stay blocked
+  // per transcript (`renderedBlocked`) and `retryBlockedUntilClear` owns them, so
+  // one undownloadable key no longer stalls the whole hub (XERK-1050). `sleep` is
+  // injectable for tests.
   async hydrateUntilListed({ firstDelayMs = 2000, maxDelayMs = 60 * 1000,
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
     let fetched = await this.hydrate();
@@ -270,6 +293,71 @@ class ArchiveMirror {
       fetched = await this.hydrate();
     }
     return fetched;
+  }
+
+  // SYNC, for archive.js's ingest + cursor paths: is this transcript's rendered
+  // `.jsonl` (or its `.meta` sidecar) listed in the bucket but not downloaded?
+  renderedBlocked(absJsonl) {
+    const key = this.keyFor(absJsonl);
+    return !!key && (this._blocked.has(key) || this._blocked.has(key + ".meta"));
+  }
+
+  // How many TRANSCRIPTS are blocked (a `.jsonl` and its `.meta` count once) —
+  // the `turma_archive_hydrate_incomplete` gauge's mirror half.
+  blockedCount() {
+    return new Set([...this._blocked.keys()].map((k) => k.replace(/\.meta$/, ""))).size;
+  }
+
+  // One pass over the blocked keys: GET each again; landed or gone (404) unblocks
+  // it. Runs with ingest OPEN, which is safe because ingest is refused for exactly
+  // these transcripts, so nothing else writes their local files while the rename
+  // lands. Never overlaps a hydrate (they share `_hydrating`/`_retrying`). Calls
+  // `onLanded` when anything landed, so the caller re-derives cursors from it.
+  async retryBlocked() {
+    if (!this.blobStore || this._hydrating || this._retrying || !this._blocked.size) return 0;
+    let landed = 0;
+    const run = (async () => {
+      for (const key of [...this._blocked.keys()]) {
+        const dest = this.pathFor(key);
+        if (!dest) { this._blocked.delete(key); continue; }
+        try {
+          if (await this._download(key, dest, () => this._blocked.has(key))) landed++;
+          this._blocked.delete(key);
+        } catch (e) {
+          this._blocked.set(key, `${key} (${e && e.message})`);
+        }
+      }
+    })();
+    this._retrying = run;
+    try { await run; } finally { this._retrying = null; }
+    this.lastFailure = this._blockedSummary();
+    if (landed) {
+      try { this.onLanded(); } catch (e) {
+        this.log(`archive hydrate: post-retry reconcile failed (${e && e.message})`);
+      }
+    }
+    return landed;
+  }
+
+  // retryBlocked, with the same capped backoff, until nothing is blocked. The
+  // rest of the hub ingests meanwhile; one log line per attempt names the cause.
+  // Single-flight: a second call while one runs is a no-op. `sleep` injectable.
+  async retryBlockedUntilClear({ firstDelayMs = 2000, maxDelayMs = 60 * 1000,
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+    if (this._retryLoop) return;
+    this._retryLoop = true;
+    try {
+      for (let delay = firstDelayMs; this.blobStore && this._blocked.size;
+        delay = Math.min(delay * 2, maxDelayMs)) {
+        this.log(`archive hydrate: ${this.lastFailure} Archive ingest stays closed ` +
+          `for ${this.blockedCount()} transcript(s) only; retrying in ` +
+          `${Math.round(delay / 1000)}s`);
+        await sleep(delay);
+        await this.retryBlocked();
+      }
+    } finally {
+      this._retryLoop = false;
+    }
   }
 
   // The byte hydrate as server.js runs it: archive ingest GATED CLOSED (via the

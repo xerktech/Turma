@@ -547,23 +547,86 @@ test("a failed listing is reported, not mistaken for an empty bucket", async () 
   assert.equal(m.hydrated, false);
 });
 
-test("a failed rendered download keeps the hydrate incomplete until it lands (XERK-1048)", async () => {
+test("a failed rendered download blocks only its transcript until retryBlocked lands it (XERK-1050)", async () => {
   const root = mkdtemp("turma-mir-");
   const store = memStore();
   store.map.set("repo/a.jsonl", Buffer.from("a\n"));
   store.map.set("repo/b.jsonl", Buffer.from("b\n"));
+  store.map.set("repo/b.jsonl.meta", Buffer.from("{}"));
   let failB = 2;
   const get = store.getToFile;
   store.getToFile = async (k, d) => {
     if (k === "repo/b.jsonl" && failB-- > 0) throw new Error("socket hang up");
     return get(k, d);
   };
-  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  let landed = 0;
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {},
+    onLanded: () => { landed++; } });
   const slept = [];
   await m.hydrateUntilListed({ firstDelayMs: 10, sleep: async (ms) => { slept.push(ms); } });
+  // Listed, so the replica-wide gate would open; only b is held back.
   assert.equal(m.hydrated, true);
-  assert.equal(slept.length, 2);
+  assert.deepEqual(slept, []);
+  assert.equal(m.renderedBlocked(path.join(root, "repo", "b.jsonl")), true);
+  assert.equal(m.renderedBlocked(path.join(root, "repo", "a.jsonl")), false);
+  assert.equal(m.blockedCount(), 1);
+  assert.match(m.lastFailure, /1 rendered download\(s\) failed, e\.g\. repo\/b\.jsonl \(socket hang up\)/);
+  await m.retryBlockedUntilClear({ firstDelayMs: 10, maxDelayMs: 15, sleep: async (ms) => { slept.push(ms); } });
+  assert.deepEqual(slept, [10, 15]);
+  assert.equal(m.blockedCount(), 0);
+  assert.equal(m.lastFailure, null);
+  assert.equal(landed, 1);
   assert.equal(fs.readFileSync(path.join(root, "repo", "b.jsonl"), "utf8"), "b\n");
+});
+
+test("a blocked .meta blocks its transcript; a key gone from the bucket is forgotten (XERK-1050)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.map.set("repo/b.jsonl", Buffer.from("b\n"));
+  store.map.set("repo/b.jsonl.meta", Buffer.from("{}"));
+  store.map.set("repo/c.jsonl", Buffer.from("c\n"));
+  const get = store.getToFile;
+  store.getToFile = async (k, d) => {
+    if ((k === "repo/b.jsonl.meta" || k === "repo/c.jsonl") && store.map.has(k)) throw new Error("HTTP 403");
+    return get(k, d);
+  };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  await m.hydrate();
+  assert.equal(m.renderedBlocked(path.join(root, "repo", "b.jsonl")), true);
+  assert.equal(m.blockedCount(), 2);
+  // c deleted from the bucket: the retry's GET 404s, and so does the next listing.
+  store.map.delete("repo/c.jsonl");
+  await m.retryBlocked();
+  assert.equal(m.renderedBlocked(path.join(root, "repo", "c.jsonl")), false);
+  assert.equal(m.blockedCount(), 1);
+  // A re-hydrate forgets a blocked key the listing no longer names.
+  store.map.delete("repo/b.jsonl.meta");
+  await m.hydrate();
+  assert.equal(m.blockedCount(), 0);
+});
+
+test("a hydrate waits for an in-flight retryBlocked pass, never overlapping it", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = gatedStore();
+  store.map.set("repo/b.jsonl", Buffer.from("b\n"));
+  const get = store.getToFile;
+  let fail = true;
+  store.getToFile = async (k, d) => { if (fail) throw new Error("HTTP 403"); return get(k, d); };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  await m.hydrate();
+  assert.equal(m.blockedCount(), 1);
+  fail = false;
+  const release = store.hold("repo/b.jsonl");
+  const retry = m.retryBlocked();
+  let hydrated = false;
+  const h = m.hydrate().then(() => { hydrated = true; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(hydrated, false, "hydrate waited on the retry pass");
+  assert.equal(await m.retryBlocked(), 0, "no second pass while one runs");
+  release();
+  assert.equal(await retry, 1);
+  await h;
+  assert.equal(m.blockedCount(), 0);
 });
 
 test("hydrateGated holds the ingest gate closed until the hydrate completes (XERK-1048)", async () => {
@@ -584,6 +647,14 @@ test("hydrateGated holds the ingest gate closed until the hydrate completes (XER
   assert.deepEqual(gateAtSleep, [true, true]);    // closed across every retry
   assert.ok(fs.existsSync(path.join(root, "repo", "a.jsonl")));
   assert.match(logs.join("\n"), /listing the bucket failed \(ECONNREFUSED\) — is the object store reachable\? Archive ingest/);
+  // A failed rendered DOWNLOAD does not hold the replica-wide gate (XERK-1050).
+  const m3 = new ArchiveMirror({ blobStore: { ...store, list: async () => ["repo/z.jsonl"],
+    stat: async () => ({ size: 9 }), getToFile: async () => { throw new Error("HTTP 403"); } },
+  archiveDir: root, reindex() {}, log() {} });
+  const gate3 = [];
+  await m3.hydrateGated((v) => gate3.push(v), { firstDelayMs: 1, sleep: async () => { throw new Error("retried"); } });
+  assert.deepEqual(gate3, [true, false]);
+  assert.equal(m3.blockedCount(), 1);
   // ...and released even when the hydrate throws.
   const m2 = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
   m2.hydrateUntilListed = async () => { throw new Error("boom"); };
@@ -613,13 +684,66 @@ test("persistent download failures log one summary per attempt, naming the cause
   store.getToFile = async (k, d) => { if (bad > 0) throw new Error("HTTP 403"); return get(k, d); };
   const logs = [];
   const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log: (l) => logs.push(l) });
-  await m.hydrateUntilListed({ firstDelayMs: 1, sleep: async () => { bad--; } });
-  assert.equal(m.hydrated, true);
-  const retries = logs.filter((l) => /incomplete/.test(l));
+  await m.hydrateUntilListed({ firstDelayMs: 1, sleep: async () => { throw new Error("listed"); } });
+  await m.retryBlockedUntilClear({ firstDelayMs: 1, sleep: async () => { bad--; } });
+  assert.equal(m.blockedCount(), 0);
+  const retries = logs.filter((l) => /retrying/.test(l));
   assert.equal(retries.length, 3);                // one line per attempt, not 50
   assert.equal(logs.length, 4, logs.join("\n"));  // + the raw-pending line; no per-key lines
   assert.doesNotMatch(retries[0], /\?\./);
   assert.match(retries[0], /50 rendered download\(s\) failed, e\.g\. .*HTTP 403/);
+  assert.match(retries[0], /closed for 50 transcript\(s\) only/);
   assert.doesNotMatch(retries[0], /object store reachable/); // a 403 is not an outage
   assert.equal(logs.filter((l) => /raw-layer object/.test(l)).length, 1); // said once
+});
+
+test("archive.js refuses ingest for a blocked transcript only (XERK-1050)", async () => {
+  const A = mkdtemp("turma-mir-arc-");
+  process.env.ARCHIVE_DIR = path.join(A, "archive");
+  process.env.ARCHIVE_DB = path.join(A, "archive", "index.db");
+  delete require.cache[require.resolve("../archive.js")];
+  const archive = require("../archive.js");
+  const store = memStore();
+  const mirror = new ArchiveMirror({ blobStore: store, archiveDir: archive.ARCHIVE_DIR,
+    reindex: () => { archive.openDb(); archive.rebuildIndex(); }, log() {} });
+  const meta = (slug) => ({ remoteKey: "github.com/x/turma", repo: "turma", worktree: `/w/${slug}`,
+    slug, createdAt: "2026-07-10T00:00:00Z", summary: slug });
+  const e = (t) => [{ uuid: t, role: "user", ts: "2026-07-10T00:00:00Z", text: t }];
+  const len = (t) => Buffer.byteLength(JSON.stringify(e(t)[0]));
+  for (const t of ["ta", "tb"]) archive.ingestChunk("h", t, meta(t), 0, len(t), e(t), "");
+  archive.setRenderedGate((p) => mirror.renderedBlocked(p));
+  const fileOf = (t) => path.join(archive.ARCHIVE_DIR, archive.sessionRow(t).filePath);
+  const before = fs.readFileSync(fileOf("tb"));
+  mirror._blocked.set(mirror.keyFor(fileOf("tb")), "repo/tb.jsonl (HTTP 403)");
+
+  // Blocked: no progress, nothing written; the other transcript ingests normally.
+  assert.deepEqual(archive.ingestChunk("h", "tb", meta("tb"), len("tb"), len("tb") * 2, e("tb"), ""),
+    { bytesStored: len("tb") });
+  assert.deepEqual(fs.readFileSync(fileOf("tb")), before);
+  assert.equal(archive.ingestChunk("h", "ta", meta("ta"), len("ta"), len("ta") * 2, e("ta"), "").bytesStored,
+    len("ta") * 2);
+  // The inverted path does not want it; the manifest path still names its cursor.
+  assert.deepEqual(archive.inventoryCursors("h",
+    [{ i: "ta", s: len("ta") * 3 }, { i: "tb", s: len("tb") * 3 }], ""), { ta: len("ta") * 2 });
+  assert.equal(archive.manifestCursors("h", [{ transcriptId: "tb" }], "").tb, len("tb"));
+  assert.deepEqual(archive.blockedTranscripts(), ["tb"]);
+
+  // Recorded bytes with no local file (a 404, or never mirrored): blocked too.
+  mirror._blocked.clear();
+  fs.unlinkSync(fileOf("ta"));
+  assert.deepEqual(archive.blockedTranscripts(), ["ta"]);
+  assert.deepEqual(archive.ingestChunk("h", "ta", meta("ta"), len("ta") * 2, len("ta") * 3, e("ta"), ""),
+    { bytesStored: len("ta") * 2 });
+  assert.equal(fs.existsSync(fileOf("ta")), false);
+
+  // A new transcript never takes a path whose object is still in the bucket.
+  const taken = path.join(archive.ARCHIVE_DIR, archive.archiveRelPath("tc", { ...meta("tc"), host: "h", transcriptId: "tc" }));
+  mirror._blocked.set(mirror.keyFor(taken), "x");
+  archive.ingestChunk("h", "tc", meta("tc"), 0, len("tc"), e("tc"), "");
+  assert.notEqual(fileOf("tc"), taken);
+
+  // Unset (every non-HA path): inert.
+  archive.setRenderedGate(null);
+  assert.deepEqual(archive.blockedTranscripts(), []);
+  archive.closeDb();
 });
