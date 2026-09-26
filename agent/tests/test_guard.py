@@ -13,11 +13,13 @@ so no package layout is assumed.
 """
 
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GUARD_PATH = os.path.join(AGENT_DIR, "hooks", "guard.py")
@@ -1202,6 +1204,45 @@ class TestHookEntrypoint(unittest.TestCase):
         event = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /opt/app"}}
         proc = self._run_hook(event, {"TURMA_TOOL_GRANTS": "Bash(rm -rf /opt/app)"})
         self.assertEqual(proc.stdout.strip(), "")
+
+    def test_empty_unwrap_does_not_hide_the_rest_of_the_command(self):
+        # `$(x | xargs kill)` unwrapped to an EMPTY segment and crashed the
+        # classifier, which exits 1 — non-blocking — so the push ran (XERK-1080).
+        cmd = "git push --force origin main; echo $(x | xargs kill)"
+        proc = self._run_hook({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        # Denied for the PUSH, i.e. classified — not by the crash fallback.
+        self.assertNotIn("could not classify", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_empty_unwrap_classifies_cleanly(self):
+        # The filter itself: an empty unwrap is dropped, not crashed on.
+        for cmd in ("echo $(x | xargs kill)", "ls | xargs nice {}"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
+    def test_a_classifier_crash_fails_closed(self):
+        for exc in (IndexError("boom"), TypeError("boom"), RecursionError()):
+            with self.subTest(exc=type(exc).__name__), \
+                    mock.patch.object(guard, "decide", side_effect=exc), \
+                    mock.patch.object(guard.sys, "stdin", io.StringIO(json.dumps(
+                        {"tool_name": "Bash", "tool_input": {"command": "ls"}}))), \
+                    mock.patch.object(guard, "_emit_deny") as emit:
+                self.assertEqual(guard.main(), 0)
+                emit.assert_called_once()
+                self.assertIn("could not classify", emit.call_args[0][0])
+
+    def test_unparseable_envelopes_fail_open_cleanly(self):
+        # A 5000-digit int (ValueError) or very deep JSON (RecursionError) is a
+        # malformed EVENT: allow with rc 0, not a traceback (XERK-1080).
+        for raw in ('{"x": ' + "9" * 5000 + "}", "[" * 100000 + "]" * 100000):
+            with self.subTest(raw=raw[:12]):
+                proc = subprocess.run(
+                    [sys.executable, GUARD_PATH], input=raw, capture_output=True, text=True
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr[-300:])
+                self.assertEqual(proc.stdout.strip(), "")
 
     def test_malformed_input_fails_open(self):
         proc = subprocess.run(
