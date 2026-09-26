@@ -905,7 +905,10 @@ _TMUX_VALUE_FLAGS = "cfLST"
 
 # The tmux commands that destroy a session, or its only window/pane. tmux takes
 # any unique prefix of a command name, hence prefixes rather than full names.
-_TMUX_KILL_TARGET = ("kill-ses", "kill-win", "kill-pan", "killw", "killp")
+_TMUX_KILL_TARGET = (
+    "kill-ses", "kill-win", "kill-pan", "killw", "killp",
+    "respawn-p", "respawn-w", "respawnp", "respawnw", "unlink-w", "unlinkw",
+)
 
 _TMUX_HOST_REASON = (
     "every Turma session on this host, including yours, runs in the host's "
@@ -935,7 +938,10 @@ def _tmux_server(tokens: list[str]) -> tuple[str | None, int]:
                 elif flag == "S":
                     server = re.split(r"[\\/]", value)[-1]
                 break
-    # `-L default` / `-S .../default` IS the host's server by another name.
+    # `-L default` / `-S .../default` IS the host's server by another name, and a
+    # value the guard cannot see (`-S "${TMUX%%,*}"`) may be it too.
+    if server is not None and ("$" in server or "`" in server or _OPAQUE_SUBST in server):
+        server = None
     return (None if server in ("default", "") else server), i
 
 
@@ -948,6 +954,10 @@ def _tmux_target_is_agent(target: str | None) -> bool:
     means the current or most recent session — possibly another agent's.
     """
     if not target or "$" in target or target == _OPAQUE_SUBST:
+        return True
+    # A pane/window id (`%3`, `@2`) or special token (`{last}`, `!`, `~`) can be
+    # any session's — `list-panes -a` then a kill by id is ordinary tmux use.
+    if target[0] in "%@{!~":
         return True
     if target.startswith("="):
         return target[1:].startswith("agent-")
@@ -970,7 +980,8 @@ def _destructive_agent_tmux(tokens: list[str]) -> str | None:
     # `pkill -f "tmux: server"` is how `ps` names the server, so match the word
     # inside an argument, not just a whole `tmux` token.
     if prog in ("pkill", "killall") and any(
-        re.search(r"(^|[\s/])tmux(:|\s|$)", t) for t in tokens[1:]
+        re.search(r"(^|[\s/])tmux(:|\s|$)", re.sub(r"[\[\]^$\\.*+?]", "", t))
+        for t in tokens[1:]
     ):
         return "refusing to kill tmux processes — " + _TMUX_HOST_REASON
     if prog != "tmux":
@@ -978,6 +989,12 @@ def _destructive_agent_tmux(tokens: list[str]) -> str | None:
     server, i = _tmux_server(tokens)
     if server is not None:
         return None
+    # An expansion as the server (`-S "${TMUX%%,*}"`) can also split into extra
+    # words and shift where the command starts, so scan every word for it.
+    if any("$" in t or t == _OPAQUE_SUBST for t in tokens[1:i]) and any(
+        t.startswith("kill-ser") for t in tokens[i:]
+    ):
+        return "refusing `tmux kill-server` — " + _TMUX_HOST_REASON
     # Split tmux's own `;`-chained commands so each is judged on its own words.
     commands: list[list[str]] = [[]]
     for tok in tokens[i:]:
@@ -993,10 +1010,11 @@ def _destructive_agent_tmux(tokens: list[str]) -> str | None:
         word, args = cmd[0], cmd[1:]
         if word.startswith("kill-ser"):
             return "refusing `tmux kill-server` — " + _TMUX_HOST_REASON
-        if word.startswith(("run", "if-shell", "if")) and any(
-            "kill-ser" in a or "kill-ses" in a for a in args
-        ):
-            return "refusing a tmux shell hook that kills tmux — " + _TMUX_HOST_REASON
+        # run-shell, if-shell, new-session/-window, split-window, respawn-* and
+        # popups all run a shell command: classify that command on its own terms.
+        for a in args:
+            if " " in a and is_destructive(a):
+                return "refusing a shell command run by tmux — " + (is_destructive(a) or "")
         if word.startswith(_TMUX_KILL_TARGET):
             target = None
             all_others = False
@@ -1027,8 +1045,8 @@ def _destructive_agent_tmux(tokens: list[str]) -> str | None:
 
 def _destructive_tmux_pid_kill(command: str) -> str | None:
     """`kill $(pgrep tmux)` / `pgrep tmux | xargs kill` — `pkill tmux` by PID."""
-    if re.search(r"\b(pgrep|pidof)\b[^;&\n]*\btmux\b", command) and re.search(
-        r"(^|[\s;&|(`])kill(\s|$)", command
+    if re.search(r"\b(pgrep|pidof|grep)\b[^;&\n]*\btmux\b", command) and re.search(
+        r"(^|[;&|(`]|\bxargs(\s+-\S+)*)\s*(\S*/)?kill(\s|$)", command
     ):
         return "refusing to kill tmux by PID — " + _TMUX_HOST_REASON
     return None

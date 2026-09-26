@@ -1138,6 +1138,18 @@ class TestAgentTmuxProtection(unittest.TestCase):
         'tmux run-shell "tmux kill-server"',
         "kill $(pgrep tmux)",
         "pgrep tmux | xargs kill",
+        # Pane/window ids, an expanded socket, shell commands tmux runs, PID
+        # pipelines and pkill regexes (QA pass 3).
+        "tmux kill-pane -t %3",
+        "tmux kill-window -t @2",
+        'tmux -S "${TMUX%%,*}" kill-server',
+        "tmux new-session -d 'tmux kill-server'",
+        "tmux run-shell 'tmux kill-window -t agent-x'",
+        "tmux respawn-pane -k -t agent-x",
+        "xargs -I% tmux kill-session -t %",
+        "/bin/kill $(pgrep tmux)",
+        "ps aux | grep tmux | awk '{print $2}' | xargs kill",
+        "pkill -f '[t]mux'",
         "bash -c 'tmux kill-server'",
         "pkill tmux",
         "killall -9 tmux",
@@ -1161,6 +1173,12 @@ class TestAgentTmuxProtection(unittest.TestCase):
         "tmux kill-session -t =ag",
         "tmux kill-session -t my-agent-x",
         "pgrep -a tmux",
+        "pgrep -a tmux; echo kill",
+        "ps aux | grep tmux",
+        "tmux -L qa kill-pane -t %3",
+        "tmux new-session -d -s qa 'sleep 100'",
+        "tmux kill-pane -t qa:0.1",
+        "pkill -f tmuxinator",
     ]
 
     def test_killing_the_host_server_is_denied(self):
