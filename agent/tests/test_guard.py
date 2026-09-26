@@ -1172,6 +1172,12 @@ class TestAgentTmuxProtection(unittest.TestCase):
         "tmux set-hook -g session-created kill-server \\; new-session -d -s trig",
         "tmux set-hook -g session-created 'kill-session -t agent-aaa'",
         "tmux bind-key -n F1 kill-server",
+        # QA pass 6: hooks via option commands and abbreviations, `kill>`.
+        "tmux set-h -g session-created kill-server",
+        "tmux set -g session-created kill-server",
+        "tmux set-option -g 'session-created[0]' kill-server",
+        "tmux display-menu -T x kill kill-server",
+        "pgrep tmux | xargs kill>/dev/null",
         "bash -c 'tmux kill-server'",
         "pkill tmux",
         "killall -9 tmux",

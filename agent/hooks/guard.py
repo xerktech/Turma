@@ -1015,10 +1015,14 @@ def _destructive_agent_tmux(tokens: list[str]) -> str | None:
         for a in args:
             if " " in a and is_destructive(a):
                 return "refusing a shell command run by tmux — " + (is_destructive(a) or "")
-        # if-shell's commands, `run-shell -C`, hooks and key bindings run as
-        # TMUX commands — `set-hook -g session-created kill-server` arms a trap
-        # that fires on the agent's next spawn.
-        if word.startswith(("run", "if", "set-hook", "bind", "confirm", "command-prompt")):
+        # Many commands take a TMUX command as an argument — if-shell,
+        # `run-shell -C`, key bindings, menus, prompts, and hooks, which are
+        # options any `set`/`set-h`/`set-option` spelling writes (`set -g
+        # session-created kill-server` fires on the agent's next spawn). A list
+        # of those names kept missing spellings, so classify EVERY argument as
+        # a tmux command, except where the argument is typed text or a name.
+        if not word.startswith(("send", "rename", "display-m", "display", "switch")) \
+                or word.startswith("display-menu"):
             for a in args:
                 if not a.startswith("-"):
                     try:
@@ -1066,7 +1070,7 @@ def _destructive_tmux_pid_kill(command: str) -> str | None:
     """
     if re.search(
         r"\b(pgrep|pidof|grep)\b[^;&\n]*\btmux\b", re.sub(r"[\[\]]", "", command)
-    ) and re.search(r"(^|[\s;&|(`/'\"\\])kill([\s;&|)`'\"]|$)", command):
+    ) and re.search(r"(^|[\s;&|(`/'\"\\])kill([\s;&|)`'\"<>]|$)", command):
         return "refusing to kill tmux by PID — " + _TMUX_HOST_REASON
     return None
 
