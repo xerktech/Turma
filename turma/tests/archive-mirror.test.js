@@ -726,15 +726,22 @@ test("archive.js refuses ingest for a blocked transcript only (XERK-1050)", asyn
   assert.deepEqual(archive.inventoryCursors("h",
     [{ i: "ta", s: len("ta") * 3 }, { i: "tb", s: len("tb") * 3 }], ""), { ta: len("ta") * 2 });
   assert.equal(archive.manifestCursors("h", [{ transcriptId: "tb" }], "").tb, len("tb"));
-  assert.deepEqual(archive.blockedTranscripts(), ["tb"]);
+  assert.deepEqual(mirror.blockedPaths(), [fileOf("tb")]);
+  assert.deepEqual(archive.missingFiledPaths(), []);
 
   // Recorded bytes with no local file (a 404, or never mirrored): blocked too.
   mirror._blocked.clear();
   fs.unlinkSync(fileOf("ta"));
-  assert.deepEqual(archive.blockedTranscripts(), ["ta"]);
+  assert.deepEqual(archive.missingFiledPaths(), []); // not yet found
+  archive.reconcileHydratedCursors();                // a hydrate finds it
+  assert.deepEqual(archive.missingFiledPaths(), [fileOf("ta")]);
   assert.deepEqual(archive.ingestChunk("h", "ta", meta("ta"), len("ta") * 2, len("ta") * 3, e("ta"), ""),
     { bytesStored: len("ta") * 2 });
   assert.equal(fs.existsSync(fileOf("ta")), false);
+  // A source cursor with no sidecar is blocked the same way (a `.meta` 404).
+  fs.unlinkSync(fileOf("tb") + ".meta");
+  assert.deepEqual(archive.ingestChunk("h", "tb", meta("tb"), len("tb"), len("tb") * 2, e("tb"), ""),
+    { bytesStored: len("tb") });
 
   // A new transcript never takes a path whose object is still in the bucket.
   const taken = path.join(archive.ARCHIVE_DIR, archive.archiveRelPath("tc", { ...meta("tc"), host: "h", transcriptId: "tc" }));
@@ -744,6 +751,67 @@ test("archive.js refuses ingest for a blocked transcript only (XERK-1050)", asyn
 
   // Unset (every non-HA path): inert.
   archive.setRenderedGate(null);
-  assert.deepEqual(archive.blockedTranscripts(), []);
+  assert.deepEqual(archive.missingFiledPaths(), []);
   archive.closeDb();
+});
+
+test("a late landing re-derives the cursor BEFORE it unblocks (XERK-1050 QA D1)", async () => {
+  const A = mkdtemp("turma-mir-arc-");
+  process.env.ARCHIVE_DIR = path.join(A, "archive");
+  process.env.ARCHIVE_DB = path.join(A, "archive", "index.db");
+  delete require.cache[require.resolve("../archive.js")];
+  const archive = require("../archive.js");
+  const store = memStore();
+  let order = [];
+  const mirror = new ArchiveMirror({ blobStore: store, archiveDir: archive.ARCHIVE_DIR,
+    reindex() {}, log() {},
+    onLanded: () => {
+      // Still refused while the cursor is re-derived: no window with a stale one.
+      order.push(archive.ingestChunk("h", "t", m, c2, c2 + 10, e("x"), "").bytesStored);
+      archive.reconcileLanded(true);
+    } });
+  archive.setBlobSink((p) => mirror.note(p));
+  const m = { repo: "turma", slug: "t", summary: "t", createdAt: "2026-07-10T00:00:00Z" };
+  const e = (t) => [{ uuid: t, role: "user", ts: "2026-07-10T00:00:00Z", text: t }];
+  const c1 = 100, c2 = 200;
+  archive.ingestChunk("h", "t", m, 0, c1, e("a"), "");
+  await mirror.drain();                       // the bucket holds chunk 1 only...
+  archive.setBlobSink(null);
+  archive.ingestChunk("h", "t", m, c1, c2, e("b"), ""); // ...the index, chunk 2
+  const file = path.join(archive.ARCHIVE_DIR, archive.sessionRow("t").filePath);
+  fs.unlinkSync(file); fs.unlinkSync(file + ".meta"); // a fresh replica's disk
+  archive.setRenderedGate((p) => mirror.renderedBlocked(p));
+  for (const k of [mirror.keyFor(file), mirror.keyFor(file + ".meta")]) mirror._blocked.set(k, k);
+
+  assert.equal(await mirror.retryBlocked(), 2);
+  assert.deepEqual(order, [c2]);                          // refused inside onLanded
+  // Healed to the landed copy (a mismatched offset hands back the cursor).
+  assert.equal(archive.ingestChunk("h", "t", m, 1, 2, [], "").bytesStored, c1);
+  assert.equal(mirror.blockedCount(), 0);
+  // The agent re-sends chunk 2 from the healed cursor; nothing is skipped.
+  assert.equal(archive.ingestChunk("h", "t", m, c1, c2, e("b"), "").bytesStored, c2);
+  assert.equal(archive.getTranscript("t").entries.map((x) => x.text).join(""), "ab");
+
+  // A reconcile that throws (an index hydrate running) keeps it blocked.
+  fs.unlinkSync(file); mirror._blocked.set(mirror.keyFor(file), "x");
+  archive.setHydrating(true);
+  assert.equal(await mirror.retryBlocked(), 0);
+  assert.equal(mirror.blockedCount(), 1);
+  archive.setHydrating(false);
+  archive.setRenderedGate(null);
+  archive.closeDb();
+});
+
+test("drain never PUTs a blocked key over the bucket's copy (XERK-1050)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const f = path.join(root, "a.jsonl");
+  fs.writeFileSync(f, "short");
+  const store = memStore();
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {} });
+  m.note(f);
+  m._blocked.set("a.jsonl", "x");
+  assert.equal(await m.drain(), 0);
+  assert.equal(m.pending(), 1);
+  m._blocked.clear();
+  assert.equal(await m.drain(), 1);
 });

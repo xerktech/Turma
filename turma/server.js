@@ -4093,13 +4093,8 @@ function setArchiveMirror(blobStore, ha) {
     // single-replica HA hub (or a fleet mid-rollout) mirroring.
     isLeader: () => true,
     // A rendered file retryBlocked landed after the hydrate (XERK-1050): re-derive
-    // cursors from it, as the hydrate does. Skipped while a hydrate holds the gate
-    // (the concurrent-writer rule, XERK-789); that hydrate reconciles it anyway.
-    onLanded: () => {
-      if (archive.isHydrating()) return;
-      if (archiveIndexStore) archive.reconcileHydratedCursors();
-      else { archive.openDb(); archive.rebuildIndex(); }
-    },
+    // cursors from it before it unblocks, as the hydrate does.
+    onLanded: () => archive.reconcileLanded(!!archiveIndexStore),
   });
   archive.setBlobSink((p) => archiveMirror.note(p));
   // Ingest closes per TRANSCRIPT for rendered files that did not land (XERK-1050).
@@ -15033,7 +15028,10 @@ const server = http.createServer(async (req, res) => {
     // integers, no ids. Under HA a follower forwards this to the leader (above),
     // the one replica that ingests, so it reports the state that matters.
     if (url.pathname === "/metrics" && req.method === "GET") {
-      const blocked = archive.blockedTranscripts().length;
+      const blocked = new Set([
+        ...(archiveMirror ? archiveMirror.blockedPaths() : []),
+        ...archive.missingFiledPaths(),
+      ]).size;
       res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4" });
       return res.end(
         "# HELP turma_archive_hydrate_incomplete Transcripts whose archive ingest is " +

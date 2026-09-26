@@ -140,6 +140,8 @@ class ArchiveMirror {
     try {
       const batch = Array.from(this._dirty);
       for (const key of batch) {
+        // Blocked = short of the bucket's copy (XERK-1050): never PUT it over that.
+        if (this._blocked.has(key)) continue;
         this._dirty.delete(key);
         const file = this.pathFor(key);
         if (!file) continue;
@@ -302,27 +304,36 @@ class ArchiveMirror {
     return !!key && (this._blocked.has(key) || this._blocked.has(key + ".meta"));
   }
 
-  // How many TRANSCRIPTS are blocked (a `.jsonl` and its `.meta` count once) —
-  // the `turma_archive_hydrate_incomplete` gauge's mirror half.
-  blockedCount() {
-    return new Set([...this._blocked.keys()].map((k) => k.replace(/\.meta$/, ""))).size;
+  // The blocked TRANSCRIPTS' local `.jsonl` paths (a `.jsonl` and its `.meta`
+  // count once) — the `turma_archive_hydrate_incomplete` gauge's mirror half.
+  blockedPaths() {
+    return [...new Set([...this._blocked.keys()].map((k) => k.replace(/\.meta$/, "")))]
+      .map((k) => this.pathFor(k)).filter(Boolean);
   }
 
-  // One pass over the blocked keys: GET each again; landed or gone (404) unblocks
-  // it. Runs with ingest OPEN, which is safe because ingest is refused for exactly
-  // these transcripts, so nothing else writes their local files while the rename
-  // lands. Never overlaps a hydrate (they share `_hydrating`/`_retrying`). Calls
-  // `onLanded` when anything landed, so the caller re-derives cursors from it.
+  blockedCount() { return this.blockedPaths().length; }
+
+  // One pass over the blocked keys: GET each again. Runs with ingest OPEN, which
+  // is safe because ingest is refused for exactly these transcripts, so nothing
+  // else writes their local files while the rename lands. Never overlaps a
+  // hydrate (they share `_hydrating`/`_retrying`).
+  //
+  // A landed or gone (404) key stays BLOCKED until the pass ends and `onLanded`
+  // has re-derived cursors from the landed files, and only then unblocks — in the
+  // same synchronous step. Unblocked on landing, a transcript was open with its
+  // Postgres cursor still AHEAD of the older bucket copy, so the agent's next
+  // chunk appended past a gap and the lagging tail was lost for good (QA D1).
   async retryBlocked() {
     if (!this.blobStore || this._hydrating || this._retrying || !this._blocked.size) return 0;
     let landed = 0;
+    const done = [];
     const run = (async () => {
       for (const key of [...this._blocked.keys()]) {
         const dest = this.pathFor(key);
-        if (!dest) { this._blocked.delete(key); continue; }
+        if (!dest) { done.push(key); continue; }
         try {
           if (await this._download(key, dest, () => this._blocked.has(key))) landed++;
-          this._blocked.delete(key);
+          done.push(key);
         } catch (e) {
           this._blocked.set(key, `${key} (${e && e.message})`);
         }
@@ -330,12 +341,16 @@ class ArchiveMirror {
     })();
     this._retrying = run;
     try { await run; } finally { this._retrying = null; }
-    this.lastFailure = this._blockedSummary();
     if (landed) {
       try { this.onLanded(); } catch (e) {
+        // Not reconciled, so not safe to open: they stay blocked for the next pass.
         this.log(`archive hydrate: post-retry reconcile failed (${e && e.message})`);
+        this.lastFailure = this._blockedSummary();
+        return 0;
       }
     }
+    for (const k of done) this._blocked.delete(k);
+    this.lastFailure = this._blockedSummary();
     return landed;
   }
 

@@ -117,20 +117,26 @@ of-record**, so both halves of the ADR split now hold:
   replica: one undownloadable key (403, IAM List-without-Get, EACCES/ENOSPC) used to stall the
   whole fleet's archive ingest forever.
   - `archive.setRenderedGate` → `renderedBlocked(row)`: blocked when the mirror's `_blocked` holds its
-    `.jsonl`/`.meta`, OR its row records `archiveBytes` with no local `.jsonl` (a GET that 404'd after
-    the listing, never mirrored, or hand-deleted). The second arm needs no mirror state, so it holds
-    across a restart; it never self-heals — deliberately, re-seeding from 0 is the operator's call.
+    `.jsonl`/`.meta`, OR its row records `archiveBytes` with no local `.jsonl` / `bytesStored` with no
+    `.meta` (a GET that 404'd after the listing, never mirrored, or hand-deleted). The second arm
+    needs no mirror state, so it holds across a restart; it never self-heals — deliberately,
+    re-seeding from 0 is the operator's call — and logs each id once.
   - Blocked = `ingestChunk` returns the cursor (no progress, never an error — XERK-255),
     `inventoryCursors` does not want it, `relPathOwner` treats a blocked path as owned. The
     MANIFEST path still reports its cursor: an id left out there is pushed from 0 every beat.
   - The raw layer is not gated: raw objects are never in the rendered download, and have their own
     pending guard (XERK-1043).
   - `retryBlockedUntilClear` retries in the background (started after the index hydrate), one log
-    line per attempt; a landing calls `onLanded` → `reconcileHydratedCursors`, skipped while
-    `isHydrating()` (the XERK-789 concurrent-writer rule — that hydrate reconciles it anyway).
-    `retryBlocked` and `hydrate` never overlap: its renames would race hydrate's classify.
+    line per attempt. **A landed key stays blocked until `onLanded` (`archive.reconcileLanded`) has
+    re-derived its cursor, then unblocks in the same sync step.** Unblocked on landing, the stale
+    ahead-of-bucket PG cursor let the next chunk skip the lagging tail forever (QA D1). A reconcile
+    that throws (`isHydrating()`, XERK-789) leaves it blocked for the next pass.
+  - `retryBlocked` and `hydrate` never overlap: its renames would race hydrate's classify. `drain`
+    skips a blocked key: its local copy is short of the bucket's.
   - `/metrics` (unauthenticated, forwarded to the leader): `turma_archive_hydrate_incomplete`
-    (blocked transcripts) and `turma_archive_ingest_gated` (1 while ALL ingest is closed).
+    (blocked transcripts) and `turma_archive_ingest_gated` (1 while ALL ingest is closed). It must
+    stay O(blocked), never O(rows): a per-row stat was ~125 ms a scrape at 10k transcripts, on the
+    single writer (QA D2). The missing-file arm's ids are found by `reconcileHydratedCursors`.
 - **The raw layer is LAZY (XERK-1043)** — keys under `<x>.jsonl.raw/` are ~83% of the bucket, and
   pulling them into every replica's size-limited `/data` emptyDir evicted each pod mid-hydrate once
   the bucket outgrew it (8.55 GiB vs 8Gi, 2026-09-25). Hydrate records them as REMOTE-PENDING
@@ -320,7 +326,8 @@ of-record**, so both halves of the ADR split now hold:
   encoders/parsers (`encodeS3Path`, `canonicalQuery`, `parseListXml`, `xmlDecode`), the factory
   selection, and the FULL put/get/stat/list/del round-trip over a local http fake-S3 (asserting every
   request is SigV4-signed).
-- `archive-mirror.test.js`: `keyFor`/`pathFor` escape rejection, note→drain push, the leader gate
+- `archive-mirror.test.js`: XERK-1050's per-transcript gate — `a late landing re-derives the cursor
+  BEFORE it unblocks` pins QA D1. `keyFor`/`pathFor` escape rejection, note→drain push, the leader gate
   (non-leader drains nothing, keeps the queue), transient-fail re-queue vs ENOENT-drop, hydrate
   pull+skip-same-size+reindex, and the REAL archive.js integration — the sink fires for the rendered
   `.jsonl`, its `.meta` and the raw file, and those bytes hydrate into a FRESH replica dir whose
