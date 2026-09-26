@@ -1170,8 +1170,19 @@ test("XERK-1051: a cut refusal lingers — FIN after the 413, slot held while dr
   clearInterval(tick);
   const after = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 500 }, body: Buffer.alloc(500) });
   assert.equal(after.status, 413, "the slot is free once the linger ends");
-  assert.equal(seen.length, 1);
-  assert.equal(f.stats.refusedOversize, 2);
+  // ...and freed exactly ONCE per refusal: a double release would drive the count below
+  // zero, and a second concurrent refusal past drainMax would be refused locally too.
+  const hold = net.connect({ port, host: "127.0.0.1", allowHalfOpen: true });
+  hold.on("error", () => {});
+  await new Promise((r) => hold.on("connect", r));
+  hold.write("POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: 9999999\r\n\r\n");
+  hold.write(Buffer.alloc(1000));
+  await sleep(100);
+  const second = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 500 }, body: Buffer.alloc(500) });
+  assert.equal(second.body, "leader", "drainMax still bounds local refusals after earlier ones released");
+  hold.destroy();
+  assert.equal(seen.length, 2);
+  assert.equal(f.stats.refusedOversize, 3);
   srv.close(); leader.close(); f.close();
 });
 
