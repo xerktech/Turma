@@ -18481,6 +18481,32 @@ test("uploads: a store-full refusal answers once the body ENDS, and frees its dr
   } finally { early.req.destroy(); aborted.req.destroy(); release(); }
 });
 
+// XERK-1092: a stalled drain gives its DRAIN_CONCURRENCY_MAX slot back after the
+// idle window instead of holding it to requestTimeout. readBody's path is in
+// drain-idle.test.js; these cover the other two slot holders.
+test("uploads: a STALLED store-full drain answers 503 and frees its slot", async () => {
+  await upHost("upStallFull");
+  const release = fillUploadStore(4);
+  const stalled = partialUpload("upStallFull", 1000, 10);
+  try {
+    await waitFor(() => hub.drainingNow === 1);
+    // The slot first: without the watch this is what never happens.
+    await waitFor(() => hub.drainingNow === 0, hub.BODY_IDLE_TIMEOUT_MS * 5);
+    assert.equal((await stalled.reply).status, 503);
+  } finally { stalled.req.destroy(); release(); }
+});
+
+test("uploads: a STALLED over-cap drain (readRawBody) answers 413 and frees its slot", async () => {
+  await upHost("upStallBig", { uploadMaxBytes: 1000 });
+  const stalled = partialUpload("upStallBig", 100000, 5000); // past the 1000-byte cap
+  try {
+    await waitFor(() => hub.drainingNow === 1);
+    // The slot first: without the watch this is what never happens.
+    await waitFor(() => hub.drainingNow === 0, hub.BODY_IDLE_TIMEOUT_MS * 5);
+    assert.equal((await stalled.reply).status, 413);
+  } finally { stalled.req.destroy(); }
+});
+
 test("uploads: staging needs the user login, collecting needs the agent token", async () => {
   await upHost("upAuth");
   const anon = await stage("upAuth", "s1", "a.png", Buffer.from("x"), {});

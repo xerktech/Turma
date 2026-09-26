@@ -111,6 +111,13 @@ with `restart: unless-stopped`
   the process, after which every over-cap body takes the no-drain path and resets. `endDrain()` runs
   on reject/resolve/drain-cut/error too (idempotent, `close` stays a backstop). Tests:
   `drain-slot.test.js` (own process, small budget so beats are budget-refused).
+- **A drain that stops making progress gives its slot back** (XERK-1092, `drainIdleWatch`): same
+  window as a read (`BODY_IDLE_TIMEOUT_MS` / `BODY_MIN_PROGRESS_BYTES`), then 413/503 now + close.
+  - It fires UNCONDITIONALLY, unlike the read timer: a slot must be free BEFORE the refusal that
+    needs it arrives, so waiting for contention reclaims it too late for that caller.
+  - Covers all three slot holders: `readBody`, `readRawBody`, `refuseUploadStoreFull`. A new
+    slot holder without it lets 8 stalled clients reset every over-cap urllib beat for 300s.
+  - Tests: `drain-idle.test.js` (readBody, own process); `uploads: a STALLED …` in server.test.js.
 
 ## Per-route ceilings
 
