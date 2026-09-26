@@ -2664,3 +2664,46 @@ test("live tail: a frame that fails to send is re-sent, not silently dropped", a
     mod.__setControlSink(null);
   }
 });
+
+// XERK-1042: tmux resolves a bare `-t agent-<id>` by PREFIX once that session is
+// gone, so the live tail would stream a neighbour `agent-<id>…` session's turn.
+// Driven against a real tmux on a private socket dir. `TMUX` is removed BEFORE
+// any tmux call: it outranks TMUX_TMPDIR, and inside a Turma pane it names the
+// host's live server.
+const hasTmux = (() => {
+  try { require("child_process").execFileSync("tmux", ["-V"], { stdio: "ignore" }); return true; }
+  catch { return false; }
+})();
+test("captureLiveTurn never reads a prefix-named neighbour's pane", { skip: !hasTmux && "needs tmux" }, async () => {
+  const { execFileSync } = require("child_process");
+  const { captureLiveTurn } = require("../tunnel-agent.js");
+  const saved = { TMUX: process.env.TMUX, TMUX_TMPDIR: process.env.TMUX_TMPDIR };
+  delete process.env.TMUX;
+  process.env.TMUX_TMPDIR = fs.mkdtempSync(path.join(os.tmpdir(), "tmx-"));
+  const tmux = (...a) => execFileSync("tmux", a, { env: process.env, stdio: "ignore" });
+  const capture = (id) => new Promise((resolve) => captureLiveTurn(id, resolve));
+  try {
+    // Both panes show a BUSY Claude turn, so a prefix match would read as one.
+    const busy = (text) => {
+      const f = path.join(process.env.TMUX_TMPDIR, `${text}.txt`);
+      fs.writeFileSync(f, ["❯ go", `● ${text}`, RULE, "❯ ", RULE,
+        "  ⏵⏵ bypass permissions on · esc to interrupt"].join("\n") + "\n");
+      return `cat '${f}'; exec sleep 60`;
+    };
+    tmux("new-session", "-d", "-x", "120", "-y", "20", "-s", "agent-zz1-helper", "sh", "-c", busy("NEIGHBOUR-MARK"));
+    tmux("new-session", "-d", "-x", "120", "-y", "20", "-s", "agent-live", "sh", "-c", busy("OWN-MARK"));
+    await new Promise((r) => setTimeout(r, 300));
+    // Positive control: an exact name reads its own live turn.
+    const own = await capture("live");
+    assert.equal(own.generating, true);
+    assert.match(own.text, /OWN-MARK/);
+    // agent-zz1 is gone: the idle result, never agent-zz1-helper's turn.
+    assert.deepEqual(await capture("zz1"), { generating: false, text: "", status: null, agents: [] });
+  } finally {
+    try { tmux("kill-server"); } catch { /* already gone */ }
+    fs.rmSync(process.env.TMUX_TMPDIR, { recursive: true, force: true });
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});

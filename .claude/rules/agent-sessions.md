@@ -135,6 +135,14 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   tmux by design; and a name must be missing `DEAD_TMUX_STRIKES` CONSECUTIVE beats, since the
   listing and the scan are not atomic. Windows is left to `_pty_alive`.
 - Tests: `TestSweepDeadSessions`.
+- **Every tmux `-t` naming a session's tmux is EXACT** (XERK-1037/1042): `=<name>` for a session
+  target, `_tmux_pane(name)` (`=<name>:`) for a pane target. A bare `-t agent-<id>` prefix-matches
+  another `agent-<id>…` session once that one is gone — reading, typing into or killing it.
+  `tunnel-agent.js`'s `captureLiveTurn` follows the same rule. Tests: `TestTmuxExactTargets`,
+  `captureLiveTurn never reads a prefix-named neighbour's pane` (real tmux; CI installs it).
+- **A test driving real tmux must drop `TMUX` before its FIRST tmux call** — it outranks
+  `TMUX_TMPDIR`, and inside a Turma pane it names the host's live server (a `kill-server` there
+  kills every session).
 
 ## Repos-root sessions
 

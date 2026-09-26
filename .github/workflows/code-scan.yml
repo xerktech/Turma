@@ -199,6 +199,11 @@ jobs:
             fi
           done
           exit "$fail"
+      # tmux is not on ubuntu-latest; the XERK-1042 exact-target tests (python
+      # TestTmuxExactTargets, node captureLiveTurn) drive a real one
+      # and silently skip without it.
+      - name: Install tmux
+        run: sudo apt-get update -q && sudo apt-get install -y -q tmux
       - name: Python unit tests (agent/hub-agent.py)
         run: python3 -m unittest discover -s agent/tests -p "test_*.py" -v
       # bench/archive holds the XERK-445 routing-eval tooling, including
