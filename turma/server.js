@@ -958,6 +958,7 @@ async function stageUpload(req, res, url, key, sessionId) {
       json(res, 503, { error: e.message, held: e.held, limit: e.limit });
       return endRefusedConnection(req, res);
     }
+    if (e.noDrain) res.setHeader("Connection", "close");
     json(res, 413, {
       error: `file too large — the limit is ${cap.toLocaleString("en-US")} bytes`,
       limit: cap,
@@ -9974,8 +9975,8 @@ function readRawBody(req, cap, pressure = null) {
 }
 
 /**
- * Close the connection under a request whose body we refused on BUDGET, once its
- * response has flushed.
+ * Close the connection under a request whose body we refused on BUDGET (or past
+ * the drain concurrency cap), once its response has flushed.
  *
  * Pausing the request is not enough on its own. Node keeps a connection alive by
  * DUMPING an unread body when the response finishes — it resumes the stream we
@@ -9984,16 +9985,52 @@ function readRawBody(req, cap, pressure = null) {
  * gigabytes of churn while the hub is already at its ceiling. It OOM-killed the
  * hub at the deployed 256m with not one of those bodies being buffered.
  *
- * So the socket goes, and it goes AFTER `finish` so the 503 the caller needs
- * (XERK-264) is on the wire first. The connection is not reusable anyway — we
- * never read its body — which is what `Connection: close` tells the client.
+ * So the connection goes, AFTER `finish` so the 503/413 the caller needs
+ * (XERK-264) is on the wire first — and it goes WITHOUT a reset (XERK-1076).
+ * Destroying a socket whose receive buffer holds unread bytes makes the kernel
+ * send an RST, and a client still writing its body (python urllib: the agent)
+ * has that RST discard the response it already received, so it sees ECONNRESET
+ * instead of "shrink" or "retry". So: FIN once the response is flushed, read and
+ * discard until the client closes, destroy after REFUSE_LINGER_MS regardless.
+ * Discarding is transient — nothing is kept — but it is read churn, the very
+ * cost above, so at most REFUSE_LINGER_MAX refusals linger at once; past that a
+ * refusal falls back to the immediate destroy (a reset the caller retries).
  */
 function endRefusedConnection(req, res) {
   try { req.pause(); } catch {}
-  const kill = () => { try { req.socket.destroy(); } catch {} };
-  if (res.writableFinished) kill();
-  else res.once("finish", kill);
+  const sock = req.socket;
+  if (!sock || sock.destroyed) return;
+  const kill = () => { try { sock.destroy(); } catch {} };
+  if (refusalsLingering >= REFUSE_LINGER_MAX) {
+    if (res.writableFinished) kill();
+    else res.once("finish", kill);
+    return;
+  }
+  refusalsLingering++;
+  // Bounded from here, so a response that never flushes cannot hold the slot either.
+  const t = setTimeout(kill, REFUSE_LINGER_MS);
+  if (t.unref) t.unref();
+  sock.once("close", () => { clearTimeout(t); refusalsLingering--; });
+  const linger = () => {
+    try { sock.end(); req.resume(); sock.resume(); } catch { kill(); }
+  };
+  // Node closes a `connection: close` response itself, by destroySoon — FIN then
+  // destroy, the reset above. Take that one call over for this socket.
+  sock.destroySoon = linger;
+  if (res.writableFinished) linger();
+  else res.once("finish", linger);
 }
+// How many refused connections may linger (FIN sent, draining to the client's
+// close) at once, and for how long each. The discard is unbudgeted read churn at
+// the client's full write speed, and it shows: under a flood of 80 MiB refusals at
+// 512m, peak RSS (VmHWM) measured ~+60 MB over main at 4 lingering and ~+96 MB at
+// 16 (XERK-1076 QA) — against a ~68 MiB co-peak margin (XERK-287). So small: the
+// one or two refusals a healthy fleet produces still get a readable status, and a
+// flood past this is reset as before. Behind the nginx ingress (which buffers the
+// body) none of this runs — it is for clients that reach the hub directly.
+const REFUSE_LINGER_MAX = positiveEnv("REFUSE_LINGER_MAX", 4);
+const REFUSE_LINGER_MS = 2000;
+let refusalsLingering = 0;
 
 // Collect a request body straight into a FILE, never the heap (XERK-263), and
 // resolve with the byte count. For the migration relay, whose bundle can be 65
@@ -18790,7 +18827,10 @@ const server = http.createServer(async (req, res) => {
     // The socket is still open here precisely because readBody drained instead
     // of destroying it (XERK-235).
     if (err && err.tooLarge) {
-      if (!res.writableEnded) json(res, 413, { error: "body too large", limit: err.cap });
+      if (!res.writableEnded) {
+        if (err.noDrain) res.setHeader("Connection", "close");
+        json(res, 413, { error: "body too large", limit: err.cap });
+      }
       // Not drained (the hub is under an oversize flood), so nothing is coming
       // to consume the rest of this body — close rather than let Node dump it.
       if (err.noDrain) endRefusedConnection(req, res);
@@ -19417,6 +19457,8 @@ if (process.env.TURMA_TEST) {
     // XERK-291: the live drain-slot count, so a test can pin that refused bodies
     // (budget-refused ones especially) release their slot instead of leaking it.
     get drainingNow() { return drainingNow; },
+    // XERK-1076: refused connections lingering to a FIN-close, and their cap.
+    REFUSE_LINGER_MAX, REFUSE_LINGER_MS, get refusalsLingering() { return refusalsLingering; },
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,

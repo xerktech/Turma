@@ -121,7 +121,8 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
     close` teardown) is overridden on that one socket. Tests: `XERK-1051: a cut refusal lingers`.
   - While lingering, Node's parser still runs: a request PIPELINED after the refused body is
     dispatched (forwarded) and its response lost. Accepted: urllib, nginx, browsers don't pipeline.
-  - The leader's own `endRefusedConnection` (server.js) still destroys at once — XERK-1076.
+  - The leader's own `endRefusedConnection` lingers the same way, count-capped (XERK-1076,
+    `turma-limits.md`).
   - The follower judges against the LEADER's caps + slack ALONE, published in `hubLeader:endpoint`
     (`bodyCaps`/`drainSlack`, XERK-939) — never its own, nor a `min` of both: mid-rollout (a changed
     memory limit) a smaller-cap follower cut a body the leader takes. No FRESH usable caps (an older

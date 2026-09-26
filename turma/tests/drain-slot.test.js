@@ -122,3 +122,123 @@ test("XERK-291: an honest over-cap beat still gets its 413 after a refusal flood
   }
   assert.ok(await drainingSettlesToZero(), `drainingNow=${hub.drainingNow} after over-cap beats`);
 });
+
+// A raw client shaped like urllib (what hub-agent.py posts with): it writes its WHOLE
+// declared body before it reads, and keeps writing after the hub's FIN (allowHalfOpen) —
+// that is the case the lingering close exists for. It closes only once it sees the hub's
+// FIN. Resolves on close with what was read, whether the whole body went out, any socket
+// error, and how long after the status arrived the hub's FIN came.
+function postWhileWriting(declared, route = "/api/heartbeat", auth = "Bearer agenttok") {
+  const net = require("net");
+  const { port } = server.address();
+  return new Promise((resolve) => {
+    const sock = net.connect({ port, host: "127.0.0.1", allowHalfOpen: true });
+    let got = "";
+    let err = null;
+    let sent = 0;
+    let wroteAt = 0;
+    let statusAt = 0;
+    let finMs = Infinity;
+    sock.on("data", (c) => { if (!statusAt) statusAt = Date.now(); got += c; });
+    let finOpen = true; // the hub has not FIN'd yet
+    const closeIfDone = () => { if (!finOpen && wroteAt) sock.end(); };
+    sock.on("end", () => { finOpen = false; finMs = Date.now() - statusAt; closeIfDone(); });
+    sock.on("error", (e) => { err = e.code; });
+    sock.on("close", () => resolve({ got, err, wroteAll: sent >= declared, finMs }));
+    sock.write(`POST ${route} HTTP/1.1\r\nhost: x\r\nauthorization: ${auth}\r\n` +
+      `content-type: application/json\r\ncontent-length: ${declared}\r\n\r\n`);
+    const chunk = Buffer.alloc(256 * 1024, 0x79);
+    (function pump() {
+      while (sent < declared && !sock.destroyed) {
+        sent += chunk.length;
+        if (!sock.write(chunk)) { sock.once("drain", pump); return; }
+      }
+      wroteAt = Date.now();
+      closeIfDone();
+    })();
+  });
+}
+
+// Take the big lane with a beat that has sent 6 MiB (charged ~6x) of a declared 7 MiB,
+// so the next heartbeat declaring 7 MiB is refused 503 on its claim.
+async function holdBigLane() {
+  const holder = require("net").connect(server.address().port, "127.0.0.1");
+  holder.on("error", () => {});
+  holder.write(`POST /api/heartbeat HTTP/1.1\r\nhost: x\r\nauthorization: Bearer agenttok\r\n` +
+    `content-type: application/json\r\ncontent-length: ${7 << 20}\r\n\r\n` + "y".repeat(6 << 20));
+  const inBigLane = () => hub.bodyInflightHeld() > hub.BODY_INFLIGHT_TOTAL_MAX;
+  for (let i = 0; i < 80 && !inBigLane(); i++) await sleep(25);
+  assert.ok(inBigLane(), "the holder occupies the big lane");
+  return holder;
+}
+
+for (const [label, declared, status, holdBudget] of [
+  // An idle hub admits any one body into the big lane, so another beat takes that
+  // lane first; this one is then refused on its claim, before it has sent anything.
+  ["a budget 503", 7 << 20, 503, true],
+  // Past cap + drain slack: read to there, then refused without draining.
+  ["a no-drain 413", 40 << 20, 413, false],
+]) {
+  test(`XERK-1076: ${label} lingers under a still-writing client — it writes its whole body, reads the status, no reset`, async () => {
+    const holder = holdBudget ? await holdBigLane() : null;
+    try {
+      const r = await postWhileWriting(declared);
+      assert.equal(r.err, null, `the connection was reset (${r.err}) instead of closing cleanly`);
+      assert.ok(r.wroteAll, "the hub kept reading (and discarding) until the client finished");
+      // The FIN follows the response itself — Node's own `connection: close` teardown is
+      // what the override replaces, so without the linger's own end() only the time bound
+      // would close it.
+      assert.ok(r.finMs < hub.REFUSE_LINGER_MS / 4, `FIN ${r.finMs}ms after the status, not at the time bound`);
+      assert.match(r.got, /\r\nconnection: close\r\n/i, "the refusal announces the close");
+      assert.match(r.got, new RegExp(`^HTTP/1\\.1 ${status} `), `the ${status} reached the client`);
+      for (let i = 0; i < 40 && hub.refusalsLingering; i++) await sleep(50);
+      assert.equal(hub.refusalsLingering, 0, "lingering refusal released on close");
+    } finally {
+      if (holder) holder.destroy();
+    }
+  });
+}
+
+test("XERK-1076: an attachment past cap + drain slack lingers too, and announces the close", async () => {
+  // A host that takes 1 MiB attachments; 40 MiB is past cap + slack, so no drain.
+  const hb = await fetch(baseUrl + "/api/heartbeat", {
+    method: "POST", headers: agentHeaders,
+    body: JSON.stringify({ device: "up1076", sessions: [], repos: [], uploadMaxBytes: 1 << 20 }),
+  });
+  assert.equal(hb.status, 200);
+  const basic = "Basic " + Buffer.from("hubuser:hubpass").toString("base64");
+  const r = await postWhileWriting(40 << 20, "/api/agents/up1076/uploads?name=a.bin", basic);
+  assert.equal(r.err, null, `the connection was reset (${r.err})`);
+  assert.ok(r.wroteAll, "the hub kept reading (and discarding) until the client finished");
+  assert.match(r.got, /^HTTP\/1\.1 413 /, "the 413 reached the client");
+  assert.match(r.got, /\r\nconnection: close\r\n/i, "the refusal announces the close");
+  assert.ok(r.finMs < hub.REFUSE_LINGER_MS / 4, `FIN ${r.finMs}ms after the status, not at the time bound`);
+});
+
+test("XERK-1076: lingers are capped at REFUSE_LINGER_MAX and bounded in time by REFUSE_LINGER_MS", async () => {
+  const net = require("net");
+  const holder = await holdBigLane();
+  // Clients that declare a body, get their 503, and then neither send nor close: each
+  // holds a linger until the time bound. More of them than the cap allows to linger.
+  const n = hub.REFUSE_LINGER_MAX + 3;
+  const socks = [];
+  let peak = 0;
+  try {
+    for (let i = 0; i < n; i++) {
+      const s = net.connect({ port: server.address().port, host: "127.0.0.1", allowHalfOpen: true });
+      s.on("error", () => {});
+      s.write(`POST /api/heartbeat HTTP/1.1\r\nhost: x\r\nauthorization: Bearer agenttok\r\n` +
+        `content-type: application/json\r\ncontent-length: ${7 << 20}\r\n\r\n`);
+      socks.push(s);
+    }
+    const t0 = Date.now();
+    while (Date.now() - t0 < 500) { peak = Math.max(peak, hub.refusalsLingering); await sleep(10); }
+    assert.equal(peak, hub.REFUSE_LINGER_MAX, "exactly the cap lingers; the overflow is cut at once");
+    // Nobody closes, so only the time bound can release them.
+    while (hub.refusalsLingering && Date.now() - t0 < hub.REFUSE_LINGER_MS + 1500) await sleep(25);
+    assert.equal(hub.refusalsLingering, 0, "every linger released by the time bound");
+  } finally {
+    holder.destroy();
+    for (const s of socks) s.destroy();
+  }
+});
