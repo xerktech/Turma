@@ -18368,6 +18368,119 @@ test("uploads: an empty file and one past the cap are refused", async () => {
   assert.equal(big.body.limit, 16);
 });
 
+// XERK-1089: the store was checked only AFTER a body had been buffered, so eight
+// concurrent 30 MiB uploads all read into a store with room for four and the
+// second round OOM-killed the hub at 512m. Room is now reserved before reading.
+
+// Fill the store to within `room` bytes, with a fake held blob `release` drops.
+function fillUploadStore(room) {
+  const id = "fill-" + crypto.randomBytes(4).toString("hex");
+  let held = 0;
+  for (const u of uploads.values()) held += u.size; // earlier tests' blobs count too
+  uploads.set(id, { id, host: "nobody", sessionId: "", name: "fill",
+    size: hub.UPLOAD_TOTAL_MAX_BYTES - held - room, bytes: Buffer.alloc(0), at: Date.now() });
+  return () => uploads.delete(id);
+}
+
+// An upload whose body is only partly sent: holds its read open until finished.
+function partialUpload(host, total, sent) {
+  const req = http.request(`${baseUrl}/api/agents/${host}/uploads?name=p.bin`, {
+    method: "POST", headers: { ...userHeaders, "content-length": String(total) },
+  });
+  const reply = new Promise((resolve) => {
+    req.on("response", (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks)) }));
+    });
+    req.on("error", (e) => resolve({ status: "error", error: e }));
+  });
+  req.write(Buffer.alloc(sent, 1));
+  return { req, reply, finish: () => req.end(Buffer.alloc(total - sent, 1)) };
+}
+
+test("uploads: a full store refuses with a READABLE 503, after the body arrives", async () => {
+  await upHost("upFull");
+  const release = fillUploadStore(4);
+  try {
+    // requestRaw writes the whole body before reading, as urllib and fetch do: a
+    // refusal answered mid-body would reach it as a broken pipe, not a status.
+    const res = await stageHost("upFull", "a.bin", Buffer.alloc(64 << 10, 1));
+    assert.equal(res.status, 503);
+    assert.match(res.body.error, /too many pending uploads/);
+    assert.equal(res.headers["retry-after"], "1");
+  } finally { release(); }
+  assert.equal((await stageHost("upFull", "a.bin", Buffer.from("fits"))).status, 200);
+});
+
+test("uploads: a body still being read reserves its room in the store", async () => {
+  await upHost("upResv");
+  const release = fillUploadStore(100);
+  const first = partialUpload("upResv", 60, 10);
+  try {
+    await new Promise((r) => setTimeout(r, 50));
+    // 60 reserved + 60 more > 100 of room: refused while the first is mid-read,
+    // though nothing new is HELD yet — the old post-read check admitted it.
+    const second = await stageHost("upResv", "b.bin", Buffer.alloc(60, 1));
+    assert.equal(second.status, 503);
+    first.finish();
+    assert.equal((await first.reply).status, 200);
+  } finally { first.req.destroy(); release(); }
+});
+
+test("uploads: an aborted or refused read gives its reservation back", async () => {
+  await upHost("upGive", { uploadMaxBytes: 80 });
+  const release = fillUploadStore(100);
+  const aborted = partialUpload("upGive", 60, 10);
+  try {
+    await new Promise((r) => setTimeout(r, 50));
+    aborted.req.destroy();
+    await aborted.reply;
+    // The hub sees the abort a beat later.
+    for (let i = 0; i < 200 && hub.uploadsReservedBytes > 0; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    assert.equal(hub.uploadsReservedBytes, 0, "the aborted read kept its reservation");
+    // Too large for the cap (413) — its reservation must come back too.
+    assert.equal((await stageHost("upGive", "c.bin", Buffer.alloc(81, 1))).status, 413);
+    assert.equal(hub.uploadsReservedBytes, 0, "the refused read kept its reservation");
+    // Had either leaked, 60 more would not fit in the 100 of room.
+    assert.equal((await stageHost("upGive", "d.bin", Buffer.alloc(60, 1))).status, 200);
+  } finally { aborted.req.destroy(); release(); }
+});
+
+test("uploads: a stalled upload's reservation is reclaimed, not held until requestTimeout", async () => {
+  await upHost("upStall", { uploadMaxBytes: 80 }); // requestRaw is chunked: it reserves the cap
+  const release = fillUploadStore(100);
+  const stalled = partialUpload("upStall", 60, 10);
+  try {
+    // A few bytes then silence: the in-flight budget holds ~nothing, so only
+    // the store's own pressure can reclaim it (BODY_IDLE_TIMEOUT_MS in tests).
+    await waitFor(() => hub.uploadsReservedBytes === 60); // reserved on arrival
+    await waitFor(() => hub.uploadsReservedBytes === 0); // reclaimed, not held
+    const after = await stageHost("upStall", "e.bin", Buffer.alloc(60, 1));
+    assert.equal(after.status, 200, JSON.stringify(after.body));
+  } finally { stalled.req.destroy(); release(); }
+});
+
+test("uploads: a store-full refusal answers once the body ENDS, and frees its drain slot", async () => {
+  await upHost("upDrain");
+  const release = fillUploadStore(4);
+  const early = partialUpload("upDrain", 1000, 10);
+  const aborted = partialUpload("upDrain", 1000, 10);
+  try {
+    let answered = false;
+    early.reply.then(() => { answered = true; });
+    await new Promise((r) => setTimeout(r, 100));
+    // Answered mid-body, a client still writing sees a broken pipe, not the 503.
+    assert.equal(answered, false, "answered before the body arrived");
+    early.finish();
+    assert.equal((await early.reply).status, 503);
+    // An abandoned drain must give back its DRAIN_CONCURRENCY_MAX slot.
+    aborted.req.destroy();
+    await waitFor(() => hub.drainingNow === 0); // the aborted drain gave its slot back
+  } finally { early.req.destroy(); aborted.req.destroy(); release(); }
+});
+
 test("uploads: staging needs the user login, collecting needs the agent token", async () => {
   await upHost("upAuth");
   const anon = await stage("upAuth", "s1", "a.png", Buffer.from("x"), {});

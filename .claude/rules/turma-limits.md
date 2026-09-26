@@ -157,6 +157,16 @@ with `restart: unless-stopped`
   shrinking either budget (the two rejected levers were halving the upload relay and halving
   `HEARTBEAT_MAX`, both with user-visible cost). The parse-cost model means held memory ≈ the budget,
   so the raise is safe by design; the 256m OOM was the ~6 MiB margin being eaten by transient churn.
+- **An upload RESERVES its room in `UPLOAD_TOTAL_MAX_BYTES` before its body is read** (XERK-1089,
+  `stageUpload`: declared length, or the per-file cap when chunked). The ¾ co-peak assumes uploads
+  being READ fit the store; checking only after buffering let 8 concurrent 30 MiB uploads read into
+  a store with room for 4, twice, and OOM-killed the 512m hub. Never move the check back post-read.
+  - A store-full refusal DRAINS (discards, never buffers) and answers 503 on `end`, within
+    `DRAIN_CONCURRENCY_MAX`, so urllib/fetch read it — a full store is not memory pressure.
+  - A STALLED upload is reclaimed on store pressure (held+reserved > half the store), via
+    `readRawBody`'s `pressure` arg: the in-flight budget holds ~0 for a stall, so without it four
+    sockets sending 16 bytes each lock every upload out until Node's requestTimeout (~330s).
+  - Tests: the `uploads:` tests on reservation, stall reclaim, and store-full drain in server.test.js.
 - **The chunked-body and socket-error halves (findings 2/3) are neutralized by the DEPLOYMENT
   topology, and need no hub code.** In k8s the hub is fronted by an NGINX Inc ingress with
   `proxy_request_buffering on` (its default, unoverridden): nginx buffers each request body IN FULL,
