@@ -1000,8 +1000,9 @@ function refuseUploadStoreFull(req, res, reserve) {
   }
   drainingNow++;
   let draining = true;
-  const endDrain = () => { if (draining) { draining = false; drainingNow--; } };
   let len = 0;
+  const drainWatch = drainIdleWatch(Number(req.headers["content-length"]), () => answer(true));
+  const endDrain = () => { drainWatch.stop(); if (draining) { draining = false; drainingNow--; } };
   let answered = false;
   const answer = (close) => {
     if (answered) return;
@@ -1014,7 +1015,9 @@ function refuseUploadStoreFull(req, res, reserve) {
   req.on("data", (c) => {
     len += c.length;
     if (len > reserve + RAW_BODY_DRAIN_SLACK) answer(true);
+    else drainWatch.progress(len);
   });
+  drainWatch.start(0);
   req.on("end", () => answer(false));
   req.on("close", endDrain);
   req.on("error", endDrain);
@@ -9521,7 +9524,10 @@ function readBody(req, cap = BODY_MAX, costPerByte = BODY_PARSE_COST) {
     // body takes the no-drain path and resets, defeating XERK-291's own fix
     // under concurrent load. Idempotent (guarded by `draining`), so the settle
     // call and the `close` backstop can both run.
-    const endDrain = () => { if (draining) { draining = false; drainingNow--; } };
+    // Gives up on a drain that stopped making progress (XERK-1092): the 413
+    // goes out now and the route closes, instead of the slot waiting for `end`.
+    const drainWatch = drainIdleWatch(Number(req.headers["content-length"]), () => giveUpDrain());
+    const endDrain = () => { drainWatch.stop(); if (draining) { draining = false; drainingNow--; } };
     // Armed only while this read holds budget, and reset by every chunk: a slow
     // client keeps sending and is never touched; an abandoned one is.
     let idleTimer = null;
@@ -9598,6 +9604,17 @@ function readBody(req, cap = BODY_MAX, costPerByte = BODY_PARSE_COST) {
       // unread bytes remain to force a reset when the socket closes. The drain
       // slack bounds an honest overshoot; a flood past drainLimit is cut below.
       pendingTooLarge = err;
+      drainWatch.start(len);
+    };
+    // Answer the deferred 413 now with `noDrain`, so the route closes. Fires
+    // once — pendingTooLarge nulls.
+    const giveUpDrain = () => {
+      if (!pendingTooLarge) return;
+      pendingTooLarge.noDrain = true;
+      endDrain();
+      req.pause();
+      reject(pendingTooLarge);
+      pendingTooLarge = null;
     };
 
     const declared = Number(req.headers["content-length"]);
@@ -9636,13 +9653,8 @@ function readBody(req, cap = BODY_MAX, costPerByte = BODY_PARSE_COST) {
         // on delivering the deferred 413 cleanly, raise it now with `noDrain` so
         // the route answers and closes (a reset the flooder retries beats
         // reading a runaway body forever). Fires once — pendingTooLarge nulls.
-        if (len > drainLimit && pendingTooLarge) {
-          pendingTooLarge.noDrain = true;
-          endDrain();
-          req.pause();
-          reject(pendingTooLarge);
-          pendingTooLarge = null;
-        }
+        if (len > drainLimit) giveUpDrain();
+        else drainWatch.progress(len);
         return;
       }
       if (len > cap) return refuse(new BodyTooLarge(cap));
@@ -9774,6 +9786,35 @@ class BodyStalled extends Error {
   }
 }
 
+/**
+ * The idle timer for a refused body's DRAIN (XERK-1092). A drain holds one of
+ * DRAIN_CONCURRENCY_MAX slots, so a client that sends past the cap and then
+ * stalls would hold it until Node's requestTimeout; with every slot pinned,
+ * each other over-cap refusal falls back to answer-and-close, which a
+ * write-before-read client (urllib — the agent) sees as a reset, not its 413.
+ * Same progress rule as a read's idle timer (BODY_IDLE_TIMEOUT_MS /
+ * BODY_MIN_PROGRESS_BYTES), but it fires unconditionally: a slot is only worth
+ * reclaiming BEFORE the refusal that needs it arrives, and a stalled client is
+ * owed nothing more than the refusal it gets now instead of at `end`.
+ * `start(len)` when the drain claims its slot, `progress(len)` on every drained
+ * chunk, `stop()` wherever the slot is released.
+ */
+function drainIdleWatch(declared, onStall) {
+  let timer = null;
+  let mark = 0;
+  let needed = 0;
+  const stop = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  const start = (len) => {
+    stop();
+    mark = len;
+    const left = Number.isFinite(declared) && declared > len ? declared - len : Infinity;
+    needed = Math.max(1, Math.min(BODY_MIN_PROGRESS_BYTES, left));
+    timer = setTimeout(() => { timer = null; onStall(); }, BODY_IDLE_TIMEOUT_MS);
+    if (timer.unref) timer.unref();
+  };
+  return { start, stop, progress: (len) => { if (timer && len - mark >= needed) start(len); } };
+}
+
 // Collect a request body as raw bytes (for the binary migration relay and the
 // attachment uploads, which readBody's 1 MiB string cap would truncate). Rejects
 // past `cap` so a huge or runaway upload can't exhaust the hub's memory: the
@@ -9797,7 +9838,10 @@ function readRawBody(req, cap, pressure = null) {
     const release = () => { releaseBody(held, lane); held = 0; lane = null; };
     // Released on every settle path AND on `close` — mirrors readBody's endDrain
     // (see there for why `close` alone leaks a paused refusal's drain slot).
-    const endDrain = () => { if (draining) { draining = false; drainingNow--; } };
+    // Gives up on a drain that stopped making progress (XERK-1092): the 413
+    // goes out now and the route closes, instead of the slot waiting for `end`.
+    const drainWatch = drainIdleWatch(Number(req.headers["content-length"]), () => giveUpDrain());
+    const endDrain = () => { drainWatch.stop(); if (draining) { draining = false; drainingNow--; } };
     // Armed only while this read holds budget, and reset by every chunk: a slow
     // client keeps sending and is never touched; an abandoned one is.
     let idleTimer = null;
@@ -9864,6 +9908,17 @@ function readRawBody(req, cap, pressure = null) {
       // status goes out — a mid-stream answer + close reaches it as a bare
       // ECONNRESET, not the 413 (XERK-291, and see readBody's refuse).
       pendingTooLarge = err;
+      drainWatch.start(len);
+    };
+    // Answer the deferred 413 now with `noDrain`, so the route closes. Fires
+    // once — pendingTooLarge nulls.
+    const giveUpDrain = () => {
+      if (!pendingTooLarge) return;
+      pendingTooLarge.noDrain = true;
+      endDrain();
+      req.pause();
+      reject(pendingTooLarge);
+      pendingTooLarge = null;
     };
 
     // Same rule readBody follows: checked against the budget, charged to nothing,
@@ -9879,13 +9934,8 @@ function readRawBody(req, cap, pressure = null) {
         // point, then give up on the deferred 413 and answer now with `noDrain`
         // so the route closes — a reset the flooder retries beats reading a
         // runaway body forever. Fires once (pendingTooLarge nulls).
-        if (len > drainLimit && pendingTooLarge) {
-          pendingTooLarge.noDrain = true;
-          endDrain();
-          req.pause();
-          reject(pendingTooLarge);
-          pendingTooLarge = null;
-        }
+        if (len > drainLimit) giveUpDrain();
+        else drainWatch.progress(len);
         return;
       }
       // BodyTooLarge, like readBody (and spoolRawBody): callers test `.tooLarge`
