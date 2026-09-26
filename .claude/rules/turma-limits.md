@@ -117,7 +117,7 @@ with `restart: unless-stopped`
     needs it arrives, so waiting for contention reclaims it too late for that caller.
   - Covers all three slot holders: `readBody`, `readRawBody`, `refuseUploadStoreFull`. A new
     slot holder without it lets 8 stalled clients reset every over-cap urllib beat for 300s.
-  - Tests: `drain-idle.test.js` (own process, short idle window).
+  - Tests: `drain-idle.test.js` (readBody, own process); `uploads: a STALLED …` in server.test.js.
 
 ## Per-route ceilings
 
