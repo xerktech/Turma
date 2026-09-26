@@ -660,7 +660,9 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
                     if run:
                         out.append((_strip_prefixes(run), seg))
                     rest = rest[i + 1:]
-    return out
+    # An unwrap can leave nothing behind (`$(x | xargs kill)`); every checker
+    # reads tokens[0], and a crash there let the WHOLE command through (XERK-1080).
+    return [entry for entry in out if entry[0]]
 
 
 # --- dangerous-path detection (for rm / chmod / chown) -------------------
@@ -1519,7 +1521,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         raw = sys.stdin.read()
         event = json.loads(raw) if raw.strip() else {}
-    except (json.JSONDecodeError, OSError):
+    except (ValueError, RecursionError, OSError):  # JSONDecodeError is a ValueError
         # Fail open on a malformed event: a guard that crashes must not wedge
         # the agent. The deny rules in the settings file remain as a backstop.
         return 0
@@ -1531,12 +1533,23 @@ def main(argv: list[str] | None = None) -> int:
     overrides = _parse_overrides(os.environ.get("TURMA_TOOL_GRANTS"))
     no_attribution = os.environ.get("TURMA_NO_ATTRIBUTION", "1") != "0"
 
-    decision, reason, _category = decide(
-        tool_name,
-        tool_input if isinstance(tool_input, dict) else {},
-        overrides=overrides,
-        no_attribution=no_attribution,
-    )
+    try:
+        decision, reason, _category = decide(
+            tool_name,
+            tool_input if isinstance(tool_input, dict) else {},
+            overrides=overrides,
+            no_attribution=no_attribution,
+        )
+    except Exception as exc:  # noqa: BLE001 - any classifier bug
+        # Fail CLOSED here, unlike a malformed event above: a traceback exits 1,
+        # which Claude Code treats as non-blocking, so a crash on one segment
+        # ran the whole command unclassified (XERK-1080).
+        decision = "deny"
+        reason = (
+            f"the safety guard could not classify this command ({type(exc).__name__}); "
+            "refusing it rather than letting it run unchecked. Rephrase it (a grant "
+            "cannot help: the crash happens before grants are consulted)."
+        )
     if decision == "deny" and reason:
         _emit_deny(reason)
     return 0

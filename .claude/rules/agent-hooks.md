@@ -47,8 +47,11 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
 ## Implementation contract
 
 - **Guard** (`hooks/guard.py`) — `PreToolUse` over Bash, plus the `permissions.deny` credential-store
-  rules (same shell-not-string classification as Policy). **Fails open on malformed input.** Keep in
-  sync with the twin hook outside this repo. Tests: `test_guard.py`, `test_guard_settings.py`.
+  rules (same shell-not-string classification as Policy).
+  - **Fails open on a malformed EVENT, closed on a classifier crash** (XERK-1080): a traceback
+    exits 1, which Claude Code treats as non-blocking, so failing open ran the command unchecked.
+  - Keep in sync with the twin hook outside this repo.
+  - Tests: `test_guard.py`, `test_guard_settings.py`.
 - **File guard** (`hooks/fileguard.py`, same shape) — `PreToolUse` over
   `Write|Edit|MultiEdit|NotebookEdit`; refuses any write under `~/.claude` except
   `agent-memory/<agent>/**` and `projects/<slug>/memory/**`.
