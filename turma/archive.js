@@ -346,6 +346,66 @@ function rawLayerBytes(dir) {
   return walkAllBytes(dir) + pending;
 }
 
+// ---- the per-transcript rendered-layer gate (XERK-1050) ---------------------
+//
+// Under HA the byte hydrate opens ingest once the bucket LISTS, not once every
+// rendered file has landed, so a transcript can still be short of its of-record
+// locally while the rest of the hub ingests. Such a transcript is BLOCKED: ingest
+// onto it would append a tail to an absent/short file that the drain then PUTs
+// over the complete object (the XERK-1048 loss, one transcript at a time). Blocked
+// when either:
+//   - the mirror says its `.jsonl`/`.meta` was listed but did not download; or
+//   - its row records bytes whose file is not on local disk — `.jsonl` bytes
+//     (`archiveBytes`) with no `.jsonl`, or a source cursor (`bytesStored`, which
+//     every chunk writes to the sidecar) with no `.meta`: the object was deleted
+//     between listing and GET (a 404), or never reached the bucket at all. Nothing
+//     re-fetches that; it stays blocked, logged once and counted in
+//     `turma_archive_hydrate_incomplete`, rather than silently re-seeded.
+// UNSET (every non-HA path) makes it a no-op. The raw layer is not gated here:
+// its objects are never part of the rendered download and carry their own
+// remote-pending guard above.
+let renderedGate = null;
+// transcriptId -> [its .jsonl path, the check] for rows found blocked by a missing
+// file: logs each once, and lets the gauge recount only these, never every row.
+const missingFiled = new Map();
+function setRenderedGate(fn) {
+  renderedGate = typeof fn === "function" ? fn : null;
+  missingFiled.clear();
+}
+function filesMissing(row) {
+  const { jsonl, meta } = filePaths(row.filePath);
+  const gone = (p) => { try { fs.statSync(p); return false; } catch { return true; } };
+  return (row.archiveBytes > 0 && gone(jsonl)) || (row.bytesStored > 0 && gone(meta));
+}
+function renderedBlocked(row) {
+  if (!renderedGate || !row || !row.filePath) return false;
+  const { jsonl } = filePaths(row.filePath);
+  // A hook that throws cannot say the file is local, so it is not trusted to be.
+  try { if (renderedGate(jsonl)) return true; } catch { return true; }
+  if (!filesMissing(row)) return false;
+  if (!missingFiled.has(row.transcriptId)) {
+    missingFiled.set(row.transcriptId, jsonl);
+    console.error(`archive: ${row.transcriptId}'s index records bytes (archiveBytes ` +
+      `${row.archiveBytes || 0}, bytesStored ${row.bytesStored || 0}) but ` +
+      `${row.filePath} (or its .meta) is missing from disk and the bucket; its ingest ` +
+      `stays closed until they are restored (XERK-1050)`);
+  }
+  return true;
+}
+// The local `.jsonl` paths of transcripts blocked for a missing file — the
+// gauge's archive-side half (the mirror reports its own). Recounts only the ids
+// already found; `reconcileHydratedCursors` finds them after every hydrate.
+function missingFiledPaths() {
+  if (!renderedGate) return [];
+  const out = [];
+  for (const [id, p] of [...missingFiled]) {
+    const row = idxGetSession(id);
+    if (row && row.filePath && filesMissing(row)) out.push(p);
+    else missingFiled.delete(id);
+  }
+  return out;
+}
+
 // ---- the Postgres INDEX mirror sink (XERK-780) ------------------------------
 //
 // Under HA the archive's searchable index has a shared Postgres OF-RECORD (server.js
@@ -1061,6 +1121,12 @@ function relPathOwner(relPath, transcriptId) {
   if (ownerId && ownerId !== transcriptId) return ownerId;
   const sc = readSidecar(filePaths(relPath).meta);
   if (sc && sc.transcriptId && sc.transcriptId !== transcriptId) return sc.transcriptId;
+  // Still in the bucket, not downloaded (XERK-1050), so the sidecar above could
+  // not be read: whoever it belongs to, a new file here would be PUT over it.
+  if (renderedGate) {
+    try { if (renderedGate(filePaths(relPath).jsonl)) return "(not yet hydrated)"; }
+    catch { return "(not yet hydrated)"; }
+  }
   return null;
 }
 
@@ -1161,6 +1227,9 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
   if (rePoint && !legacyNull && !sharedOrg) {
     return { bytesStored: have };
   }
+  // Its rendered bytes are not on local disk yet (XERK-1050): store nothing and
+  // hand back the cursor — "no progress", never an error status (XERK-255).
+  if (renderedBlocked(row)) return { bytesStored: have };
   // Store full: hand back the cursor we already hold and store nothing. Not an
   // error status — the agent must read this as "no progress" and move on, never
   // as a chunk to retry (XERK-267). Deleting archives is what reopens it, and
@@ -1704,6 +1773,9 @@ function manifestCursors(host, manifest, siteKey) {
     for (const m of list) {
       if (!m || !m.transcriptId) continue;
       const row = idxGetSession(m.transcriptId);
+      // A blocked transcript (XERK-1050) still reports its real cursor: on this
+      // path an id left OUT is pushed from 0, so omitting it would cost a whole
+      // re-ship per beat where this costs a tail — which ingestChunk refuses.
       have[m.transcriptId] = row ? row.bytesStored : 0;
       if (!row) {
         if (isPgMode()) {
@@ -1788,6 +1860,9 @@ function inventoryCursors(host, inventory, siteKey) {
       // Another host owns this id: never re-point here (manifestCursors' rule),
       // and never want it for the caller — the owner drives its own sync.
       if (row && row.host && row.host !== host) continue;
+      // Not wanted while blocked (XERK-1050): ingestChunk would refuse it anyway,
+      // and on this path an id left out is simply not pushed this beat.
+      if (renderedBlocked(row)) continue;
       const bytesStored = row ? row.bytesStored : 0;
       const rawBytes = row ? row.rawBytes : 0;
       const rShort = Number.isFinite(r) && r > 0 && rawBytes < r;
@@ -2343,6 +2418,8 @@ function reconcileHydratedCursors() {
     "UPDATE sessions SET bytesStored=?, archiveBytes=?, rawBytes=? WHERE transcriptId=?");
   let healed = 0;
   for (const row of rows) {
+    // Records the ones a missing file blocks (XERK-1050), logged once each.
+    if (renderedGate) renderedBlocked(row);
     const paths = filePaths(row.filePath);
     let fileSize;
     try { fileSize = fs.statSync(paths.jsonl).size; }
@@ -2366,6 +2443,18 @@ function reconcileHydratedCursors() {
       `after a Postgres index hydrate (files ahead of the of-record; XERK-780)`);
   }
   return healed;
+}
+
+// The mirror's `onLanded` (XERK-1050): a blocked rendered file landed after the
+// hydrate, so re-derive cursors from it BEFORE the mirror unblocks it. With a
+// Postgres index that is the reconcile above; without one the index is rebuilt
+// from files, as the hydrate does. Throws while a hydrate holds the gate (the
+// XERK-789 concurrent-writer rule), which leaves the file blocked for the next
+// pass rather than opening it unreconciled.
+function reconcileLanded(hasIndexStore) {
+  if (hydrating) throw new Error("an index hydrate is running");
+  if (hasIndexStore) reconcileHydratedCursors();
+  else { openDb(); rebuildIndex(); }
 }
 
 // The pg-mode REBUILD-OF-RECORD-FROM-FILES backstop (XERK-797) — the one thing the
@@ -3108,6 +3197,8 @@ module.exports = {
   // Boot/hydrate serialization + corrupt-cache self-heal (XERK-789) — all inert
   // off HA (`hydrating` is only ever set around the HA index hydrate).
   isHydrating, setHydrating, isSqliteCorruption, resetLocalIndex, checkIndexIntegrity,
+  // The per-transcript rendered gate (XERK-1050) — unset, and inert, off HA.
+  setRenderedGate, missingFiledPaths, reconcileLanded,
   // The Postgres INDEX of-record seam (XERK-780): the write sink + the hydration
   // bulk loader + the post-hydrate cursor reconcile (all no-ops off HA — the sink
   // stays unset, and the loader/reconcile only run on the HA hydrate path).

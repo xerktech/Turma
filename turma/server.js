@@ -4073,7 +4073,7 @@ let archiveMirror = null;
 // slow object store never touches the heartbeat budget (XERK-395).
 const ARCHIVE_MIRROR_DRAIN_MS = positiveEnv("ARCHIVE_MIRROR_DRAIN_MS", 15 * 1000);
 function setArchiveMirror(blobStore, ha) {
-  if (!ha || !blobStore) { archiveMirror = null; return; }
+  if (!ha || !blobStore) { archiveMirror = null; archive.setRenderedGate(null); return; }
   archiveMirror = new ArchiveMirror({
     blobStore,
     archiveDir: archive.ARCHIVE_DIR,
@@ -4092,8 +4092,13 @@ function setArchiveMirror(blobStore, ha) {
     // predicate is the not-yet-landed XERK-763 lease. Default true keeps a
     // single-replica HA hub (or a fleet mid-rollout) mirroring.
     isLeader: () => true,
+    // A rendered file retryBlocked landed after the hydrate (XERK-1050): re-derive
+    // cursors from it before it unblocks, as the hydrate does.
+    onLanded: () => archive.reconcileLanded(!!archiveIndexStore),
   });
   archive.setBlobSink((p) => archiveMirror.note(p));
+  // Ingest closes per TRANSCRIPT for rendered files that did not land (XERK-1050).
+  archive.setRenderedGate((p) => archiveMirror.renderedBlocked(p));
   // The raw layer stays in the bucket until something needs it (XERK-1043).
   archive.setRawRemote({
     pending: (p) => archiveMirror.rawPending(p),
@@ -4101,6 +4106,29 @@ function setArchiveMirror(blobStore, ha) {
     pendingFiles: (d) => archiveMirror.rawPendingFiles(d),
     pendingBytes: (d) => archiveMirror.rawPendingBytes(d),
   });
+}
+
+// The /metrics body (XERK-1050). The blocked count costs a stat per BLOCKED
+// transcript — ~150 ms at 10k blocked, exactly the incident a scraper polls
+// through — so it is computed at most once per METRICS_CACHE_MS, never per
+// request: the route is unauthenticated, and this runs on the single writer.
+const METRICS_CACHE_MS = 15 * 1000;
+let metricsBlocked = { at: -Infinity, n: 0 };
+function metricsText(now = Date.now()) {
+  if (now - metricsBlocked.at >= METRICS_CACHE_MS) {
+    metricsBlocked = { at: now, n: new Set([
+      ...(archiveMirror ? archiveMirror.blockedPaths() : []),
+      ...archive.missingFiledPaths(),
+    ]).size };
+  }
+  return "# HELP turma_archive_hydrate_incomplete Transcripts whose archive ingest is " +
+    "held closed because their rendered bytes are not on this replica's disk.\n" +
+    "# TYPE turma_archive_hydrate_incomplete gauge\n" +
+    `turma_archive_hydrate_incomplete ${metricsBlocked.n}\n` +
+    "# HELP turma_archive_ingest_gated 1 while ALL archive ingest is closed " +
+    "(boot/promotion hydrate, or the bucket cannot be listed).\n" +
+    "# TYPE turma_archive_ingest_gated gauge\n" +
+    `turma_archive_ingest_gated ${archive.isHydrating() ? 1 : 0}\n`;
 }
 
 // Under HA a transcript's raw files may still be in the bucket (XERK-1043): fetch
@@ -4313,6 +4341,13 @@ async function hydrateArchiveOnce() {
     catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
   }
   await hydrateArchiveIndex();
+  // Rendered downloads that failed keep only THEIR transcripts closed; keep
+  // retrying them in the background with the rest of the hub ingesting (XERK-1050).
+  // Started after the index hydrate so a landing never reconciles mid-hydrate.
+  if (archiveMirror) {
+    archiveMirror.retryBlockedUntilClear().catch((e) =>
+      console.error(`archive hydrate: blocked-key retry failed: ${e && e.message}`));
+  }
 }
 
 // The multi-replica-safe boot spool sweep (XERK-761). On a shared spool volume a
@@ -15011,6 +15046,15 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ready: true });
     }
 
+    // Prometheus gauges for a stalled archive ingest (XERK-1050), which is
+    // otherwise one log line a minute. Unauthenticated like the probes: two
+    // integers, no ids. Under HA a follower forwards this to the leader (above),
+    // the one replica that ingests, so it reports the state that matters.
+    if (url.pathname === "/metrics" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4" });
+      return res.end(metricsText());
+    }
+
     // Branded static assets (stylesheet, UI fonts, icon/favicon set, manifest):
     // public and served before the auth gate so the login page renders before a
     // session exists. Explicit allowlist — no arbitrary path -> file mapping.
@@ -19142,6 +19186,11 @@ if (process.env.TURMA_TEST) {
     ingestHistory,
     ingestSubagentHistory,
     coerceLiveStatus,
+    // The HA archive mirror's wiring (XERK-1050): its `onLanded` must reconcile a
+    // late-landed file's cursor, and dropping it loses data with no unit failing.
+    setArchiveMirror,
+    getArchiveMirror: () => archiveMirror,
+    metricsText,
     // The create single-flight's backstop, exported so a test can hold the
     // PRODUCTION default rather than the wound-down one the suite runs with —
     // its value relative to the client's give-up is the whole point (XERK-241).
