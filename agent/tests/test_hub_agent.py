@@ -7781,6 +7781,11 @@ class TestUsageBaselineManager(ManagerMixin, unittest.TestCase):
         if not os.access(other, os.R_OK):                 # root ignores modes
             self.assertIn(tid, self.make_manager().usage_baseline["imported"])
         os.chmod(other, 0o700)
+        # Readable but not searchable: the names still answer.
+        os.makedirs(os.path.join(other, tid))
+        os.chmod(other, 0o500 & ~0o100)
+        self.assertIn(tid, self.make_manager().usage_baseline["imported"])
+        os.chmod(other, 0o700)
         with mock.patch.object(ha, "PROJECTS_ROOT",
                                os.path.join(self.tmp, "unmounted")):
             self.assertIn(tid, self.make_manager().usage_baseline["imported"])

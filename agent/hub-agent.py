@@ -5589,18 +5589,24 @@ def _usage_excluded(t, exclude):
     return any((f is None or t > f) and t <= to for f, to in wins)
 
 
-def _projects_fully_readable():
-    """True when PROJECTS_ROOT and every slug dir directly under it can be
-    listed — the precondition for concluding a transcript is GONE from a glob
-    that silently skips what it can't read."""
+def _transcripts_present(tids):
+    """Which of `tids` still has a `<tid>.jsonl` or a `<tid>/` in any slug dir
+    under PROJECTS_ROOT, or None when any of it can't be listed — "can't look"
+    must never read as "gone". One listing per slug dir, matched by NAME (so a
+    dir readable but not searchable still answers), rather than a glob per id:
+    that was imported x slug dirs at startup, tens of seconds on a big host."""
+    present = set()
     try:
         with os.scandir(PROJECTS_ROOT) as it:
-            for e in it:
-                if e.is_dir() and not os.access(e.path, os.R_OK | os.X_OK):
-                    return False
+            slugs = [e.path for e in it if e.is_dir()]
+        for slug in slugs:
+            for name in os.listdir(slug):
+                tid = name[:-len(".jsonl")] if name.endswith(".jsonl") else name
+                if tid in tids:
+                    present.add(tid)
     except OSError:
-        return False
-    return True
+        return None
+    return present
 
 
 def _transcript_tree_max_ms(proj, tid):
@@ -17415,14 +17421,12 @@ class SessionManager:
         # A migrated-in transcript Claude Code has since deleted needs no window.
         # Gone means NEITHER `<tid>.jsonl` NOR `<tid>/` survives: the usage walk
         # still counts a `<tid>/subagents/` tree whose parent is gone. And never
-        # on an unreadable root OR slug dir — glob hides a read error, and "can't
-        # look" must not read as "gone".
+        # on an unreadable root OR slug dir (_transcripts_present).
         gone = []
-        if state["imported"] and _projects_fully_readable():
-            root = glob.escape(PROJECTS_ROOT)
-            gone = [tid for tid in state["imported"]
-                    if not glob.glob(os.path.join(root, "*", tid + ".jsonl"))
-                    and not glob.glob(os.path.join(root, "*", tid))]
+        if state["imported"]:
+            present = _transcripts_present(set(state["imported"]))
+            if present is not None:
+                gone = [tid for tid in state["imported"] if tid not in present]
         for tid in gone:
             del state["imported"][tid]
         prev = state["device"]

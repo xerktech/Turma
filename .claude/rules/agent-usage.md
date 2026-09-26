@@ -73,7 +73,8 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
     (the price of `to` covering a fast source clock — erring low, never double).
   - A window is pruned at load only when NEITHER `<tid>.jsonl` NOR `<tid>/` is left (the walk still
     counts an orphaned `subagents/`), and never while `PROJECTS_ROOT` or any slug dir is unreadable
-    (`_projects_fully_readable` — glob hides a read error).
+    (`_transcripts_present`: one listing per slug dir, not a glob per id — that was imported x slugs
+    at startup, tens of seconds on a big host).
   - A first run (no file) records the name and counts everything — so a host renamed/cloned BEFORE
     this shipped needs `countFrom` written by hand, then its hub ledger purged
     (`DELETE /api/agents/<host>?usage=purge`), since the high-water keeps the duplicate otherwise.
