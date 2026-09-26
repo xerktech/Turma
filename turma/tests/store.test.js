@@ -201,7 +201,9 @@ test("XERK-754: the debounced (async) write also lands byte-for-byte", async () 
   const file = path.join(dir, "d.json");
   const s = new FileLiveStore({ persistent: { d: { file, debounceMs: 5 } } });
   await s.set("d", { n: 7 });
-  await delay(30); // let the debounce fire (async temp+rename)
+  // Let the debounce fire (async temp+rename). Polled, not a fixed sleep: the
+  // async write can outlast 30ms when the whole suite loads the box.
+  for (let i = 0; i < 200 && !fs.existsSync(file); i++) await delay(10);
   assert.equal(fs.readFileSync(file, "utf8"), JSON.stringify({ n: 7 }));
 });
 
