@@ -1139,6 +1139,53 @@ test("XERK-936 QA: a refusal whose client goes silent is cut after drainIdleMs a
   srv.close(); leader.close(); f.close();
 });
 
+test("XERK-1051: a cut refusal lingers — FIN after the 413, slot held while draining, destroyed after drainLingerMs", async () => {
+  const { leader, seen, port: lport } = await countingLeader();
+  const { f } = await follower(`127.0.0.1:${lport}`, {
+    bodyRoute: () => "hb", drainMax: 1, drainLingerMs: 400, drainIdleMs: 60000,
+  }, { bodyCaps: { hb: 100 }, drainSlack: 100 });
+  const { srv, port } = await followerServer(f);
+  // Past the cut, then keep the socket open and keep writing: the follower must answer,
+  // half-close (the client sees `end`, never a reset) and keep discarding. allowHalfOpen:
+  // like urllib, the client does not close its side just because the server did.
+  const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: true });
+  let got = "", ended = false;
+  s.on("data", (d) => { got += d; });
+  s.on("end", () => { ended = true; });
+  s.on("error", () => {}); // our writes after the linger's destroy
+  const closed = new Promise((r) => s.on("close", r));
+  await new Promise((r) => s.on("connect", r));
+  s.write("POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: 9999999\r\n\r\n");
+  s.write(Buffer.alloc(1000));
+  const tick = setInterval(() => { if (!s.destroyed) s.write(Buffer.alloc(1000)); }, 20);
+  await sleep(150);
+  assert.match(got, / 413 /, "answered before the linger ends");
+  assert.ok(ended, "the follower half-closed (FIN) after the 413");
+  // The slot is still held while lingering (drainMax 1): the next oversize body is not
+  // refused locally but forwarded, and the leader answers it.
+  const during = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 500 }, body: Buffer.alloc(500) });
+  assert.equal(during.body, "leader", "the lingering refusal still holds its slot");
+  // A client that never closes is cut after drainLingerMs.
+  assert.equal(await Promise.race([closed.then(() => "cut"), sleep(3000).then(() => "open")]), "cut");
+  clearInterval(tick);
+  const after = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 500 }, body: Buffer.alloc(500) });
+  assert.equal(after.status, 413, "the slot is free once the linger ends");
+  // ...and freed exactly ONCE per refusal: a double release would drive the count below
+  // zero, and a second concurrent refusal past drainMax would be refused locally too.
+  const hold = net.connect({ port, host: "127.0.0.1", allowHalfOpen: true });
+  hold.on("error", () => {});
+  await new Promise((r) => hold.on("connect", r));
+  hold.write("POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: 9999999\r\n\r\n");
+  hold.write(Buffer.alloc(1000));
+  await sleep(100);
+  const second = await request(port, { method: "POST", path: "/api/heartbeat", headers: { "content-length": 500 }, body: Buffer.alloc(500) });
+  assert.equal(second.body, "leader", "drainMax still bounds local refusals after earlier ones released");
+  hold.destroy();
+  assert.equal(seen.length, 2);
+  assert.equal(f.stats.refusedOversize, 3);
+  srv.close(); leader.close(); f.close();
+});
+
 test("XERK-936 QA2: a refusal that keeps making progress is never cut idle; a 1-byte trickle is", async () => {
   const { leader, port: lport } = await countingLeader();
   const { f } = await follower(`127.0.0.1:${lport}`, {

@@ -187,6 +187,9 @@ function makeForwarder(store, replicaId, deps = {}) {
     // ...where "sends nothing" means less than this much progress in the window, so a
     // 1-byte trickle is idle too (readBody's BODY_MIN_PROGRESS_BYTES rule).
     drainMinProgress = 64 << 10,
+    // After the 413, how long a refusal keeps reading (and discarding) the rest of the
+    // body before it destroys the socket: a lingering close (nginx's lingering_close).
+    drainLingerMs = 2000,
     aliasTtlMs = ALIAS_TTL_MS, // how long a PROVEN self-alias is treated as our own address
     // true = the caller strips every forwarding header from a request it serves before
     // relaying anything (server.js stripForwardHeaders). Published on the leader entry: a
@@ -520,32 +523,53 @@ function makeForwarder(store, replicaId, deps = {}) {
   function refuseOversize(req, res, { cap, slack }) {
     stats.refusedOversize += 1;
     let len = 0;
-    let settled = false;
+    let settled = false; // answered (or abandoned): no more 413s, no more idle re-arms
+    let held = true; // this refusal's `refusing` slot
     let idle = null;
     let mark = 0; // `len` when the idle window last re-armed
+    const sock = req.socket;
+    const disarm = () => { if (idle) { clearTimeout(idle); idle = null; } };
     const release = () => {
-      if (idle) { clearTimeout(idle); idle = null; }
-      if (!settled) { settled = true; refusing -= 1; }
+      disarm();
+      settled = true;
+      if (held) { held = false; refusing -= 1; }
     };
+    const kill = () => { release(); try { sock.destroy(); } catch { /* gone */ } };
     const armIdle = () => {
-      if (idle) clearTimeout(idle);
-      idle = setTimeout(() => { release(); try { req.socket.destroy(); } catch { /* gone */ } }, drainIdleMs);
+      disarm();
+      idle = setTimeout(kill, drainIdleMs);
       if (idle.unref) idle.unref();
     };
+    // Close under a body we will never read WITHOUT a reset (XERK-1051). Destroying a
+    // socket whose receive buffer holds unread bytes makes the kernel send an RST, and a
+    // client still writing its body (urllib: the agent) can have that RST discard the
+    // 413 it already received, so it sees ECONNRESET. So: FIN once the 413 is flushed,
+    // keep reading and discarding until the client closes, and destroy after
+    // drainLingerMs regardless. The slot stays held while lingering, so drainMax still
+    // bounds what refusals can cost; the bytes are dropped as they arrive, never kept.
+    const linger = () => { try { sock.end(); sock.resume(); } catch { kill(); } };
     const answer = (cut) => {
       if (settled) return;
-      release();
+      settled = true;
+      disarm();
       req.removeListener("data", onData);
+      if (!cut) release();
+      else if (!sock || sock.destroyed) { release(); return; }
+      else {
+        // Bounded from the answer, so a 413 that never flushes cannot hold the slot either.
+        const t = setTimeout(kill, drainLingerMs);
+        if (t.unref) t.unref();
+        sock.once("close", () => { clearTimeout(t); release(); });
+        // Node closes a `connection: close` response itself, by destroySoon — FIN then
+        // destroy, the reset above. Take that one call over for this socket.
+        sock.destroySoon = linger;
+      }
       if (!res.headersSent && !res.destroyed) {
         res.writeHead(413, { "content-type": "application/json", connection: "close" });
         res.end(JSON.stringify({ error: "body too large", limit: cap }));
+      } else if (cut) {
+        linger();
       }
-      if (!cut) return;
-      // Nothing will read the rest of this body: close once the 413 is on the wire,
-      // rather than let Node dump a body we already said no to (endRefusedConnection).
-      try { req.pause(); } catch { /* gone */ }
-      const kill = () => { try { req.socket.destroy(); } catch { /* gone */ } };
-      if (res.writableFinished) kill(); else res.once("finish", kill);
     };
     const onData = (c) => {
       len += c.length;
@@ -555,8 +579,10 @@ function makeForwarder(store, replicaId, deps = {}) {
     armIdle();
     req.on("data", onData);
     req.once("end", () => answer(false));
-    // A client that gives up mid-body frees its slot (a stalled one: drainIdleMs).
-    req.once("close", release);
+    // A client that gives up mid-body frees its slot (a stalled one: drainIdleMs). A
+    // lingering refusal is released by its socket's close instead: the request closes
+    // with the response, while the socket is still draining.
+    req.once("close", () => { if (!settled || !sock || sock.destroyed) release(); });
     req.on("error", release);
   }
 
