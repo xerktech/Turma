@@ -942,7 +942,11 @@ async function stageUpload(req, res, url, key, sessionId) {
   uploadsReservedBytes += reserve;
   let bytes;
   try {
-    bytes = await readRawBody(req, cap);
+    // A stalled upload is reclaimed once the store is half committed: a
+    // reservation for bytes that never arrive otherwise holds its room until
+    // Node's requestTimeout, and four of them lock every upload out for minutes.
+    bytes = await readRawBody(req, cap,
+      () => (uploadsHeldBytes() + uploadsReservedBytes) * 2 > UPLOAD_TOTAL_MAX_BYTES);
   } catch (e) {
     uploadsReservedBytes -= reserve;
     // "too big" is about the file (pick a smaller one); "busy" is about the hub
@@ -9775,7 +9779,10 @@ class BodyStalled extends Error {
 // past `cap` so a huge or runaway upload can't exhaust the hub's memory: the
 // bytes already held are dropped on the spot, and what follows is discarded
 // rather than buffered.
-function readRawBody(req, cap) {
+// `pressure`, when given, is a second reason to reclaim a stalled read beside
+// the in-flight budget — the upload store a stalled upload's reservation holds
+// room in (XERK-1089), which the budget cannot see.
+function readRawBody(req, cap, pressure = null) {
   return new Promise((resolve, reject) => {
     let chunks = [];
     let len = 0;
@@ -9815,7 +9822,7 @@ function readRawBody(req, cap) {
         // bad link holds a few hundred KB of a 64 MiB budget and monopolizes
         // nothing. Under pressure the non-progressing reads are exactly the
         // ones that should give way.
-        if (!budgetUnderPressure(lane)) return armIdle();
+        if (!budgetUnderPressure(lane) && !(pressure && pressure())) return armIdle();
         over = true;
         release();
         reject(new BodyStalled());

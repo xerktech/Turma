@@ -163,7 +163,10 @@ with `restart: unless-stopped`
   a store with room for 4, twice, and OOM-killed the 512m hub. Never move the check back post-read.
   - A store-full refusal DRAINS (discards, never buffers) and answers 503 on `end`, within
     `DRAIN_CONCURRENCY_MAX`, so urllib/fetch read it — a full store is not memory pressure.
-  - Tests: `uploads: a body still being read reserves its room in the store` and its two siblings.
+  - A STALLED upload is reclaimed on store pressure (held+reserved > half the store), via
+    `readRawBody`'s `pressure` arg: the in-flight budget holds ~0 for a stall, so without it four
+    sockets sending 16 bytes each lock every upload out until Node's requestTimeout (~330s).
+  - Tests: the `uploads:` tests on reservation, stall reclaim, and store-full drain in server.test.js.
 - **The chunked-body and socket-error halves (findings 2/3) are neutralized by the DEPLOYMENT
   topology, and need no hub code.** In k8s the hub is fronted by an NGINX Inc ingress with
   `proxy_request_buffering on` (its default, unoverridden): nginx buffers each request body IN FULL,

@@ -18448,6 +18448,39 @@ test("uploads: an aborted or refused read gives its reservation back", async () 
   } finally { aborted.req.destroy(); release(); }
 });
 
+test("uploads: a stalled upload's reservation is reclaimed, not held until requestTimeout", async () => {
+  await upHost("upStall", { uploadMaxBytes: 80 }); // requestRaw is chunked: it reserves the cap
+  const release = fillUploadStore(100);
+  const stalled = partialUpload("upStall", 60, 10);
+  try {
+    // A few bytes then silence: the in-flight budget holds ~nothing, so only
+    // the store's own pressure can reclaim it (BODY_IDLE_TIMEOUT_MS in tests).
+    await waitFor(() => hub.uploadsReservedBytes === 60); // reserved on arrival
+    await waitFor(() => hub.uploadsReservedBytes === 0); // reclaimed, not held
+    const after = await stageHost("upStall", "e.bin", Buffer.alloc(60, 1));
+    assert.equal(after.status, 200, JSON.stringify(after.body));
+  } finally { stalled.req.destroy(); release(); }
+});
+
+test("uploads: a store-full refusal answers once the body ENDS, and frees its drain slot", async () => {
+  await upHost("upDrain");
+  const release = fillUploadStore(4);
+  const early = partialUpload("upDrain", 1000, 10);
+  const aborted = partialUpload("upDrain", 1000, 10);
+  try {
+    let answered = false;
+    early.reply.then(() => { answered = true; });
+    await new Promise((r) => setTimeout(r, 100));
+    // Answered mid-body, a client still writing sees a broken pipe, not the 503.
+    assert.equal(answered, false, "answered before the body arrived");
+    early.finish();
+    assert.equal((await early.reply).status, 503);
+    // An abandoned drain must give back its DRAIN_CONCURRENCY_MAX slot.
+    aborted.req.destroy();
+    await waitFor(() => hub.drainingNow === 0); // the aborted drain gave its slot back
+  } finally { early.req.destroy(); aborted.req.destroy(); release(); }
+});
+
 test("uploads: staging needs the user login, collecting needs the agent token", async () => {
   await upHost("upAuth");
   const anon = await stage("upAuth", "s1", "a.png", Buffer.from("x"), {});
