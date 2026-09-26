@@ -48,6 +48,23 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
     pruned session's `subagents/` tree has real spend and a zero count.
   - Tests: `TestSubagentUsage`, `subagentCard` in `usage.test.js`, the split cases in
     `UsageViewModelTest`.
+- **A host counts only what it spent UNDER ITS OWN NAME** (XERK-1085, `USAGE_BASELINE_PATH` =
+  `~/.turma/usage-baseline.json`). The hub SUMS hosts, so one disk reported under two names counts
+  twice — `k8x` renamed to `k8x-01`, then its volume cloned to `k8x-02`, tripled every figure.
+  - The file records the `device` this disk last counted as. A different name at boot (other than
+    casing — XERK-448 folds case twins by high-water) sets `countFrom` = now: everything already on
+    disk was reported under the old name, which the hub ledger keeps (retired host / the original).
+    Rename and clone need no telling apart — the same rule is right for both.
+  - `import_session` sets `imported[<tid>]` = now: the SOURCE keeps its copy (killed = resumable) and
+    keeps reporting the pre-move turns. It drops that slug's incremental fold so it re-reads.
+  - `_accumulate_usage` skips entries at/before the cutoff (`_usage_cutoff_ms`, the later of the two,
+    keyed on the first path segment so `<tid>/subagents/**` follows its parent). An UNDATED entry
+    under a cutoff is skipped too. Times compare as epoch ms (`_ts_ms`), never as strings.
+  - A first run (no file) records the name and counts everything — so a host renamed/cloned BEFORE
+    this shipped needs `countFrom` written by hand, then its hub ledger purged
+    (`DELETE /api/agents/<host>?usage=purge`), since the high-water keeps the duplicate otherwise.
+  - Cost: a migrated/cloned session's CARD shows only this host's spend, not the conversation's.
+  - Tests: `TestUsageCutoff`, `TestUsageBaselineManager`, the import case in `TestMigrateSession`.
 - The per-model breakdown **excludes `<synthetic>`** (any `<...>` model) — Claude Code stamps
   fabricated entries with that model and an all-zero block; `_accumulate_usage` keeps them out of
   `acc.models` (tokens still fold into grand totals). Mirrors `_scan_model_entry`'s guard.

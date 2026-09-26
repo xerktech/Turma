@@ -324,6 +324,10 @@ RESUMABLE_PER_REPO = 50
 # traceable to its repo long after the session (and even its worktree) is gone.
 # This is what makes host/repo usage persist regardless of active sessions.
 USAGE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "repo-usage.json")
+# Where THIS host's usage count starts (XERK-1085): transcript entries at or
+# before a cutoff were spent — and reported — under another host name, so they
+# are not this host's spend. See _usage_cutoff_ms.
+USAGE_BASELINE_PATH = os.path.join(REGISTRY_DIR, "usage-baseline.json")
 # Cached Jira-ticket -> repo triage decisions, keyed by "<siteKey>/<issueKey>".
 # Persisted so a triaged board survives a manager restart without re-running the
 # model over every ticket. See the "Jira -> repo triage" section.
@@ -5455,7 +5459,107 @@ class _UsageAcc:
         self.sessions = 0   # transcript files folded in
 
 
-def _accumulate_usage(lines, acc, subagent=False):
+_ISO_INSTANT_RE = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?"
+    r"(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def _ts_ms(ts):
+    """An ISO-8601 instant (a transcript `timestamp`, a baseline cutoff) as epoch
+    milliseconds, or None when it isn't one. No offset reads as UTC, which is
+    what Claude Code and the dsh/qwen projections write. Compared as numbers,
+    never as strings: `…:20Z` sorts AFTER `…:20.100Z` lexically."""
+    if not isinstance(ts, str):
+        return None
+    m = _ISO_INSTANT_RE.match(ts.strip())
+    if not m:
+        return None
+    y, mo, d, h, mi, s, frac, tz = m.groups()
+    try:
+        dt = datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(s),
+                               tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    ms = int(dt.timestamp()) * 1000 + (int((frac or "0")[:3].ljust(3, "0")))
+    if tz and tz != "Z":
+        sign = -1 if tz[0] == "-" else 1
+        hh, mm = int(tz[1:3]), int(tz[-2:])
+        ms -= sign * (hh * 60 + mm) * 60000
+    return ms
+
+
+def _ms_iso(ms):
+    """Epoch milliseconds as the `YYYY-MM-DDTHH:MM:SS.mmmZ` Claude Code writes."""
+    return (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms // 1000))
+            + f".{ms % 1000:03d}Z")
+
+
+def _normalize_usage_baseline(raw):
+    """The usage baseline file (USAGE_BASELINE_PATH), re-validated: `device` —
+    the DEVICE_NAME this host last counted as; `countFrom` — a host-wide cutoff;
+    `imported` — {transcript id: cutoff} for sessions migrated in. Anything
+    malformed drops to "no cutoff", the pre-XERK-1085 behaviour; the file is
+    operator-editable, so it is never trusted on shape."""
+    out = {"device": "", "countFrom": "", "imported": {}}
+    if not isinstance(raw, dict):
+        return out
+    if isinstance(raw.get("device"), str):
+        out["device"] = raw["device"]
+    if _ts_ms(raw.get("countFrom")) is not None:
+        out["countFrom"] = raw["countFrom"]
+    imp = raw.get("imported")
+    if isinstance(imp, dict):
+        for tid, ts in imp.items():
+            if (isinstance(tid, str) and VALID_CLAUDE_SID_RE.fullmatch(tid)
+                    and _ts_ms(ts) is not None):
+                out["imported"][tid] = ts
+    return out
+
+
+def _reconcile_usage_baseline(state, device, now_ms):
+    """Adopt `device` as this host's name, returning (state, changed). Pure.
+
+    A transcript's spend is reported by whichever host NAME re-parses it, and
+    the hub sums hosts — so the same disk reported under two names counts twice
+    (XERK-1085: `k8x` renamed to `k8x-01`, then its volume cloned to `k8x-02`,
+    tripled every figure). When the name this disk last counted under differs
+    from the one it runs as now, everything already on it was reported under the
+    OLD name — which the hub's ledger keeps (a rename's old name becomes a
+    retired host; a clone's original keeps beating) — so this host counts only
+    what is spent from now on. Rename and clone are indistinguishable from here
+    and need no distinguishing: both are correct under the same rule.
+
+    A CASING-only change is NOT a new name (XERK-448): the hub folds case twins
+    by the high-water rule, which is only right while both report the same disk.
+    A first run (no recorded name) records one and counts everything, as
+    before."""
+    prev = state.get("device") or ""
+    if prev == device:
+        return state, False
+    new = dict(state, device=device)
+    if prev and prev.lower() != device.lower():
+        cur = _ts_ms(state.get("countFrom"))
+        if cur is None or now_ms > cur:
+            new["countFrom"] = _ms_iso(now_ms)
+    return new, True
+
+
+def _usage_cutoff_ms(baseline, rel):
+    """The instant (epoch ms) at or before which the entries of the transcript at
+    slug-relative path `rel` are NOT this host's spend, or None to count all.
+
+    The later of the host-wide `countFrom` and a per-transcript `imported`
+    cutoff, keyed on the transcript id — the first path segment, so a migrated
+    session's `<id>/subagents/…` agents share its cutoff."""
+    head = rel.replace("\\", "/").split("/", 1)[0]
+    tid = head[:-len(".jsonl")] if head.endswith(".jsonl") else head
+    cuts = [c for c in (_ts_ms(baseline.get("countFrom")),
+                        _ts_ms((baseline.get("imported") or {}).get(tid)))
+            if c is not None]
+    return max(cuts) if cuts else None
+
+
+def _accumulate_usage(lines, acc, subagent=False, after_ms=None):
     """Fold transcript JSONL lines into `acc` in place. Only lines that mention a
     usage block count for anything; each message is deduped on
     (message id, requestId) via acc.seen, so a message re-seen across files or
@@ -5463,7 +5567,12 @@ def _accumulate_usage(lines, acc, subagent=False):
 
     `subagent` marks the lines as a background agent's own transcript, which
     counts toward the totals exactly like a session's own turns AND is tallied
-    into acc.subagent so the report can name the delegated share."""
+    into acc.subagent so the report can name the delegated share.
+
+    `after_ms` skips every entry stamped at or before it — spend another host
+    name already reported (_usage_cutoff_ms). An UNDATED entry under a cutoff
+    is skipped too: it can't be placed after it, and a double count is the
+    error this exists to stop."""
     for line in lines:
         if '"usage"' not in line:
             continue
@@ -5475,6 +5584,10 @@ def _accumulate_usage(lines, acc, subagent=False):
         usage = msg.get("usage")
         if not isinstance(usage, dict):
             continue
+        if after_ms is not None:
+            t = _ts_ms(entry.get("timestamp"))
+            if t is None or t <= after_ms:
+                continue
         key = (msg.get("id"), entry.get("requestId"))
         if key[0] and key in acc.seen:
             continue
@@ -5586,8 +5699,11 @@ def _project_transcripts(proj):
     return out
 
 
-def _aggregate_project(proj, acc, offsets=None):
+def _aggregate_project(proj, acc, offsets=None, cutoff=None):
     """Fold one Claude project dir's transcript token usage into `acc`.
+
+    `cutoff`, when given, maps a transcript's slug-relative path to the instant
+    its entries start counting (_usage_cutoff_ms) — None counts all of it.
 
     With an `offsets` dict {relpath: byte-offset} this parses INCREMENTALLY:
     only bytes appended since the last call are read, and each offset advances
@@ -5618,7 +5734,8 @@ def _aggregate_project(proj, acc, offsets=None):
         if offsets is None:
             try:
                 with open(path, errors="replace") as fh:
-                    _accumulate_usage(fh, acc, subagent)
+                    _accumulate_usage(fh, acc, subagent,
+                                      cutoff(rel) if cutoff else None)
             except OSError:
                 continue
             continue
@@ -5642,7 +5759,8 @@ def _aggregate_project(proj, acc, offsets=None):
         if nl < 0:
             continue
         _accumulate_usage(
-            chunk[:nl + 1].decode(errors="replace").splitlines(), acc, subagent)
+            chunk[:nl + 1].decode(errors="replace").splitlines(), acc, subagent,
+            cutoff(rel) if cutoff else None)
         offsets[rel] = start + nl + 1
     # `sessions` is a display stat (CONVERSATIONS folded in), so a delegated
     # agent's transcript is not one — it belongs to a session already counted,
@@ -15832,6 +15950,9 @@ class SessionManager:
         # Durable worktreePath -> {repo, remote, slug} attribution map, so a
         # transcript's usage stays traceable to its repo after kill/delete.
         self.usage_ledger = self._load_ledger()
+        # Where this host's usage count starts (XERK-1085) — read before any
+        # fold, since slug_usage folds incrementally and never re-reads a byte.
+        self.usage_baseline = self._load_usage_baseline()
         # Cached host/repo usage aggregated across ALL known transcripts (refreshed
         # on the slow USAGE_EVERY cadence, reported every beat, independent of the
         # live registry so it persists regardless of active sessions).
@@ -17218,6 +17339,49 @@ class SessionManager:
             os.replace(tmp, USAGE_LEDGER_PATH)
         except OSError as e:
             log(f"usage ledger save failed: {e}")
+
+    def _load_usage_baseline(self):
+        """Read the usage baseline and adopt this run's DEVICE_NAME into it
+        (_reconcile_usage_baseline), saving when that changed anything. A
+        rename/clone is logged: it is the moment this host stops reporting the
+        spend already on its disk."""
+        try:
+            with open(USAGE_BASELINE_PATH) as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            raw = None
+        state = _normalize_usage_baseline(raw)
+        prev = state["device"]
+        state, changed = _reconcile_usage_baseline(
+            state, self.device, int(time.time() * 1000))
+        if changed:
+            if state["countFrom"] and prev and prev.lower() != self.device.lower():
+                log(f"usage: this disk last counted as {prev!r}, now {self.device!r} "
+                    f"(renamed or cloned) — counting spend from {state['countFrom']} "
+                    f"on; earlier spend stays with {prev!r}")
+            self._save_usage_baseline(state)
+        return state
+
+    def _save_usage_baseline(self, state):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = USAGE_BASELINE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp, USAGE_BASELINE_PATH)
+        except OSError as e:
+            log(f"usage baseline save failed: {e}")
+
+    def _mark_imported_usage(self, transcript_id, slug):
+        """A migrated-in transcript's bytes up to now were spent — and are still
+        reported — on the source host, which KEEPS its copy (killed = resumable),
+        so this host counts only turns after the import (XERK-1085). Drops the
+        slug's incremental fold so it is re-read under the new cutoff: a
+        migrate-BACK overwrites a transcript this host already counted."""
+        self.usage_baseline["imported"][transcript_id] = _ms_iso(
+            int(time.time() * 1000))
+        self._save_usage_baseline(self.usage_baseline)
+        self.slug_usage.pop(slug, None)
 
     def _ingest_peers(self, raw):
         """Take the org-scoped roster off a heartbeat reply (XERK-348).
@@ -21507,6 +21671,8 @@ class SessionManager:
         except Exception as e:
             refuse(f"unpacking the transcript bundle failed: {e}")
             return
+        self._mark_imported_usage(transcript_id,
+                                  _project_slug(os.path.normpath(cwd)))
         extra = {
             "ticket": cmd.get("ticket"),
             "summary": cmd.get("summary"),
@@ -29391,11 +29557,12 @@ class SessionManager:
         if st is None:
             st = self.slug_usage[slug] = {"acc": _UsageAcc(), "offsets": {}}
         proj = os.path.join(PROJECTS_ROOT, slug)
-        if not _aggregate_project(proj, st["acc"], st["offsets"]):
+        cutoff = lambda rel: _usage_cutoff_ms(self.usage_baseline, rel)  # noqa: E731
+        if not _aggregate_project(proj, st["acc"], st["offsets"], cutoff):
             # A tracked transcript shrank/vanished — start this slug over so the
             # running total still matches a from-scratch parse.
             st = self.slug_usage[slug] = {"acc": _UsageAcc(), "offsets": {}}
-            _aggregate_project(proj, st["acc"], st["offsets"])
+            _aggregate_project(proj, st["acc"], st["offsets"], cutoff)
         return st["acc"]
 
     def _backfill_ledger(self):
