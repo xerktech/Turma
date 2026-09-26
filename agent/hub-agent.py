@@ -10039,6 +10039,15 @@ def _pane_status(tmux_name, state):
     return busy, parse_pane_mode(cap), parse_pane_prompt(cap)
 
 
+def _tmux_pane(tmux_name):
+    """An EXACT pane target for a session's tmux (XERK-1042). A bare `-t name`
+    falls back to a PREFIX match when `name` is gone, so `agent-<id>` would land
+    on any session called `agent-<id>…` and read or type into its pane. `=` forces
+    an exact session name; the trailing `:` makes it a pane target — tmux 3.x
+    rejects `=name` alone where a pane is expected."""
+    return f"={tmux_name}:"
+
+
 def _capture_pane(tmux_name):
     """The session pane's current text, or None when it can't be captured
     (tmux gone, timeout).
@@ -10057,7 +10066,7 @@ def _capture_pane(tmux_name):
         return None
     try:
         out = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-t", tmux_name],
+            ["tmux", "capture-pane", "-p", "-t", _tmux_pane(tmux_name)],
             capture_output=True, text=True, timeout=5,
         )
     except Exception:
@@ -10245,7 +10254,7 @@ def _type_into_pane(tmux_name, text):
         # is what keeps it ONE message instead of a turn per line.
         flags = ["-d", "-p"] if "\n" in text else ["-d"]
         rc, _err = run_ok(["tmux", "paste-buffer", *flags, "-b", buf,
-                           "-t", tmux_name], timeout=15)
+                           "-t", _tmux_pane(tmux_name)], timeout=15)
         pasted = rc == 0
         if not pasted:
             run(["tmux", "delete-buffer", "-b", buf])
@@ -10259,8 +10268,8 @@ def _type_into_pane(tmux_name, text):
             # `--` ends tmux's own option parsing before the literal text, so a
             # message starting with '-' isn't misread as more send-keys flags.
             # Each chunk appends to the input line; only the Enter below submits.
-            run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", chunk])
-    run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+            run(["tmux", "send-keys", "-t", _tmux_pane(tmux_name), "-l", "--", chunk])
+    run(["tmux", "send-keys", "-t", _tmux_pane(tmux_name), "Enter"])
     return pasted
 
 
@@ -10752,7 +10761,7 @@ def _pane_send_keys(tmux_name, *tokens, literal=False, timeout=None):
             data = "".join(_TMUX_KEY_BYTES.get(t, str(t)) for t in tokens)
         _pty_control(tmux_name, "inject", data=data)
         return
-    cmd = ["tmux", "send-keys", "-t", tmux_name]
+    cmd = ["tmux", "send-keys", "-t", _tmux_pane(tmux_name)]
     if literal:
         cmd += ["-l", "--"]
     cmd += [str(t) for t in tokens]
@@ -18412,7 +18421,8 @@ class SessionManager:
         # Asked right after the launch, the session's only pane is the agent's;
         # a failed read records nothing (the sweep's name-only fallback).
         rc, pane = run_out(["tmux", "display-message", "-p", "-t",
-                            sess["tmuxName"], "#{pane_id}"], timeout=5)
+                            _tmux_pane(sess["tmuxName"]), "#{pane_id}"],
+                           timeout=5)
         if rc == 0 and _is_pane_id(pane):
             sess["agentPane"] = pane
         else:
@@ -19838,7 +19848,7 @@ class SessionManager:
             # terminal trades it for.
             "-t", "macOptionClickForcesSelection=true",
             "-c", f"term:{TURMA_TOKEN or 'changeme'}",
-            "tmux", "attach", "-t", sess["tmuxName"],
+            "tmux", "attach", "-t", "=" + sess["tmuxName"],  # exact match
         ]
         try:
             proc = subprocess.Popen(
@@ -23684,12 +23694,14 @@ class SessionManager:
 
         `strict` is honoured on Windows only, where a pid alone can be a RECYCLED
         pid naming an unrelated process; pass it on the boot/adopt decision. The
-        tmux path is name-keyed and already exact, so it ignores the flag."""
+        tmux path ignores the flag: it is name-keyed, and `=` makes the name
+        EXACT — a bare `-t` prefix-matches another `agent-<id>…` session once
+        this one is gone (XERK-1042)."""
         if IS_WINDOWS:
             return _pty_alive(tmux_name, strict=strict)
         if not tmux_name:
             return False
-        rc, _ = run_ok(["tmux", "has-session", "-t", tmux_name], timeout=5)
+        rc, _ = run_ok(["tmux", "has-session", "-t", "=" + tmux_name], timeout=5)
         return rc == 0
 
     def _sweep_orphan_questions(self):

@@ -2041,7 +2041,7 @@ class TestPaneBusy(unittest.TestCase):
     def _capture(self, stdout="", returncode=0, raises=None):
         def fake_run(cmd, *a, **kw):
             self.assertEqual(cmd[:2], ["tmux", "capture-pane"])
-            self.assertIn("agent-x", cmd)  # -t <tmux_name>
+            self.assertIn("=agent-x:", cmd)  # exact pane target (XERK-1042)
             if raises:
                 raise raises
             return mock.Mock(stdout=stdout, returncode=returncode)
@@ -9974,6 +9974,8 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
             sm._launch_ttyd(sess)
         args = popen.call_args[0][0]
         self.assertIn("macOptionClickForcesSelection=true", args)
+        # XERK-1042: attach EXACTLY this session, never a prefix-named one.
+        self.assertEqual(args[args.index("attach") + 1:][:2], ["-t", "=" + sess["tmuxName"]])
 
     def test_launch_ttyd_uses_the_webgl_renderer(self):
         # Canvas left after-images on the TUI's full alt-screen repaints, and
@@ -11309,10 +11311,10 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         ])
         self.assertEqual(self.run_ok_calls, [
             ["tmux", "paste-buffer", "-d", "-b", "turma-input-agent-abcde",
-             "-t", "agent-abcde"],
+             "-t", "=agent-abcde:"],
         ])
         self.assertEqual(self.run_calls, [
-            ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
+            ["tmux", "send-keys", "-t", "=agent-abcde:", "Enter"],
         ])
 
     def test_only_multi_line_input_is_bracketed(self):
@@ -11381,8 +11383,8 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         self.run_stdin_ok = False
         sm.send_input(sess["id"], "line1\nline2")
         self.assertEqual(self.run_calls, [
-            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "--", "line1 line2"],
-            ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
+            ["tmux", "send-keys", "-t", "=agent-abcde:", "-l", "--", "line1 line2"],
+            ["tmux", "send-keys", "-t", "=agent-abcde:", "Enter"],
         ])
 
     def test_fallback_chunks_a_long_message_instead_of_clipping_it(self):
@@ -11399,7 +11401,7 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         self.assertEqual("".join(typed), text, "no character may be dropped")
         self.assertTrue(all(len(t) <= ha.SENDKEYS_MAX_CHARS for t in typed))
         self.assertEqual(self.run_calls[-1],
-                         ["tmux", "send-keys", "-t", "agent-abcde", "Enter"])
+                         ["tmux", "send-keys", "-t", "=agent-abcde:", "Enter"])
 
     def test_message_past_the_cap_is_refused_not_truncated(self):
         # Half a message is worse than none: the operator cannot tell a
@@ -12667,7 +12669,7 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
             (["tmux", "load-buffer", "-b", "turma-input-agent-s1", "-"], "hi there"),
         ])
         self.assertEqual(self.run_calls, [
-            ["tmux", "send-keys", "-t", "agent-s1", "Enter"],
+            ["tmux", "send-keys", "-t", "=agent-s1:", "Enter"],
         ])
         it = sess["pendingInputs"][0]
         self.assertEqual(it["attempts"], 2)
@@ -14587,7 +14589,7 @@ class TestAnswerPanePrompt(ManagerMixin, unittest.TestCase):
         self._session(sm)
         self._answer(sm, 2)
         self.assertEqual(
-            self.run_calls, [["tmux", "send-keys", "-t", "agent-abcde", "2"]])
+            self.run_calls, [["tmux", "send-keys", "-t", "=agent-abcde:", "2"]])
 
     def test_stale_click_is_dropped_when_the_dialog_is_gone(self):
         # The whole safety property: without the re-read this would type a bare
@@ -14639,7 +14641,7 @@ class TestInterrupt(ManagerMixin, unittest.TestCase):
         self._session(sm)
         sm.interrupt("abcde")
         self.assertEqual(
-            self.run_calls, [["tmux", "send-keys", "-t", "agent-abcde", "Escape"]])
+            self.run_calls, [["tmux", "send-keys", "-t", "=agent-abcde:", "Escape"]])
 
     def test_noop_for_stopped_session(self):
         sm = self.make_manager()
@@ -14662,7 +14664,7 @@ class TestInterrupt(ManagerMixin, unittest.TestCase):
         sess["paneBusy"] = False
         sm.interrupt("abcde")
         self.assertEqual(
-            self.run_calls, [["tmux", "send-keys", "-t", "agent-abcde", "Escape"]])
+            self.run_calls, [["tmux", "send-keys", "-t", "=agent-abcde:", "Escape"]])
 
 
 # A realistic /model picker pane capture: ❯ on the current model (Fable, row
@@ -16484,7 +16486,7 @@ class TestSweepOrphanQuestions(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         self.run_ok_calls.clear()
         self.assertTrue(sm._tmux_alive("agent-x"))  # fake_run_ok returns rc 0
-        self.assertIn(["tmux", "has-session", "-t", "agent-x"], self.run_ok_calls)
+        self.assertIn(["tmux", "has-session", "-t", "=agent-x"], self.run_ok_calls)
 
     def test_tmux_alive_false_without_name(self):
         sm = self.make_manager()
@@ -20553,9 +20555,11 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         # read must record NOTHING (name-only rule), never keep a stale id.
         sm = super().make_manager()
         sess = self._sess(agentPane="%9")
-        with mock.patch.object(ha, "run_out", return_value=(0, "%42")):
+        with mock.patch.object(ha, "run_out", return_value=(0, "%42")) as ro:
             sm._spawn_in_tmux(sess, "claude")
         self.assertEqual(sess["agentPane"], "%42")
+        # XERK-1042: an exact pane target, never a prefix match.
+        self.assertIn("=" + sess["tmuxName"] + ":", ro.call_args[0][0])
         for bad in ((1, ""), (None, ""), (0, "garbage")):
             sess["agentPane"] = "%9"
             with mock.patch.object(ha, "run_out", return_value=bad):
@@ -33078,6 +33082,46 @@ class _FrameSock:
         return chunk
 
 
+@unittest.skipUnless(shutil.which("tmux"), "needs a real tmux")
+class TestTmuxExactTargets(unittest.TestCase):
+    """XERK-1042: tmux resolves a bare `-t name` by PREFIX once `name` is gone,
+    so a vanished `agent-<id>` must not read, type into, or report as alive a
+    session merely named `agent-<id>…`. Driven against a real tmux on a private
+    socket dir, since the risk is tmux's own target syntax."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        env["TMUX_TMPDIR"] = self.tmp
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(subprocess.run, ["tmux", "kill-server"],
+                        capture_output=True)
+        subprocess.run(["tmux", "new-session", "-d", "-s", "agent-zz1-helper",
+                        "cat"], check=True)
+
+    def test_capture_does_not_read_a_prefix_named_session(self):
+        self.assertIsNone(ha._capture_pane("agent-zz1"))
+        self.assertIsNotNone(ha._capture_pane("agent-zz1-helper"))
+
+    def test_send_keys_does_not_type_into_a_prefix_named_session(self):
+        ha._pane_send_keys("agent-zz1", "stray-input", literal=True, timeout=5)
+        ha._pane_send_keys("agent-zz1-helper", "own-input", literal=True,
+                           timeout=5)
+        time.sleep(0.3)
+        pane = ha._capture_pane("agent-zz1-helper")
+        self.assertIn("own-input", pane)
+        self.assertNotIn("stray-input", pane)
+
+    def test_tmux_alive_is_exact(self):
+        # _tmux_alive reads nothing off self on the tmux path.
+        alive = ha.SessionManager._tmux_alive
+        self.assertFalse(alive(None, "agent-zz1"))
+        self.assertTrue(alive(None, "agent-zz1-helper"))
+
+
 class TestWindowsTerminalBackend(unittest.TestCase):
     """XERK-697 — the manager side of the ConPTY pty-host seam (ADR D5): the
     pure-Python control client + the tmux/ttyd call-site dispatch, all verified
@@ -33478,7 +33522,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
              mock.patch.object(ha, "run") as run:
             ha._pane_send_keys("agent-x", "Escape")
         self.assertEqual(run.call_args.args[0],
-                         ["tmux", "send-keys", "-t", "agent-x", "Escape"])
+                         ["tmux", "send-keys", "-t", "=agent-x:", "Escape"])
 
     # --- host-specific helpers -------------------------------------------------
 

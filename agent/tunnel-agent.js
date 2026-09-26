@@ -1323,7 +1323,9 @@ function captureLiveTurn(sessionId, cb) {
   }
   execFile(
     "tmux",
-    ["capture-pane", "-p", "-t", `agent-${sessionId}`],
+    // `=…:` is an EXACT pane target: a bare name prefix-matches another
+    // `agent-<id>…` session once this one is gone (XERK-1042).
+    ["capture-pane", "-p", "-t", `=agent-${sessionId}:`],
     { timeout: 2000, maxBuffer: 1 << 20 },
     (err, stdout) => cb(err ? idle : parsePaneLiveTurn(stdout))
   );
@@ -2164,6 +2166,7 @@ if (require.main === module) {
   module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; },
     __setPaneCapture: (f) => { paneCapture = f || captureLiveTurn; },
+    captureLiveTurn,
     // OPEN FSWatcher handles. Exported so a test can pin the teardown DIRECTLY:
     // a leaked watcher is otherwise invisible until it shows up as a file-handle
     // leak on a long-lived host. Counting `watchers` entries would NOT work —
