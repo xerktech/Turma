@@ -326,8 +326,13 @@ RESUMABLE_PER_REPO = 50
 USAGE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "repo-usage.json")
 # Where THIS host's usage count starts (XERK-1085): transcript entries at or
 # before a cutoff were spent — and reported — under another host name, so they
-# are not this host's spend. See _usage_cutoff_ms.
+# are not this host's spend. See _usage_exclusion.
 USAGE_BASELINE_PATH = os.path.join(REGISTRY_DIR, "usage-baseline.json")
+USAGE_BASELINE_READ_MAX = 4 * 1024 * 1024
+# How many migrate-in windows one transcript keeps (one per move onto this host).
+USAGE_IMPORT_WINDOWS_MAX = 32
+# Read ceiling for repo-usage.json — far past any real ledger, only a backstop.
+USAGE_LEDGER_READ_MAX = 256 * 1024 * 1024
 # Cached Jira-ticket -> repo triage decisions, keyed by "<siteKey>/<issueKey>".
 # Persisted so a triaged board survives a manager restart without re-running the
 # model over every ticket. See the "Jira -> repo triage" section.
@@ -5497,9 +5502,10 @@ def _ms_iso(ms):
 def _normalize_usage_baseline(raw):
     """The usage baseline file (USAGE_BASELINE_PATH), re-validated: `device` —
     the DEVICE_NAME this host last counted as; `countFrom` — a host-wide cutoff;
-    `imported` — {transcript id: cutoff} for sessions migrated in. Anything
-    malformed drops to "no cutoff", the pre-XERK-1085 behaviour; the file is
-    operator-editable, so it is never trusted on shape."""
+    `imported` — {transcript id: [[from, to], …]}, the windows a migrated-in
+    transcript spent on ANOTHER host (`from` exclusive, "" = since the start;
+    `to` inclusive). Anything malformed drops to "no cutoff", the pre-XERK-1085
+    behaviour; the file is operator-editable, so it is never trusted on shape."""
     out = {"device": "", "countFrom": "", "imported": {}}
     if not isinstance(raw, dict):
         return out
@@ -5509,10 +5515,16 @@ def _normalize_usage_baseline(raw):
         out["countFrom"] = raw["countFrom"]
     imp = raw.get("imported")
     if isinstance(imp, dict):
-        for tid, ts in imp.items():
-            if (isinstance(tid, str) and VALID_CLAUDE_SID_RE.fullmatch(tid)
-                    and _ts_ms(ts) is not None):
-                out["imported"][tid] = ts
+        for tid, wins in imp.items():
+            if not (isinstance(tid, str) and VALID_CLAUDE_SID_RE.fullmatch(tid)
+                    and isinstance(wins, list)):
+                continue
+            ok = [[w[0], w[1]] for w in wins
+                  if isinstance(w, list) and len(w) == 2
+                  and (w[0] == "" or _ts_ms(w[0]) is not None)
+                  and _ts_ms(w[1]) is not None]
+            if ok:
+                out["imported"][tid] = ok[-USAGE_IMPORT_WINDOWS_MAX:]
     return out
 
 
@@ -5544,22 +5556,65 @@ def _reconcile_usage_baseline(state, device, now_ms):
     return new, True
 
 
-def _usage_cutoff_ms(baseline, rel):
-    """The instant (epoch ms) at or before which the entries of the transcript at
-    slug-relative path `rel` are NOT this host's spend, or None to count all.
-
-    The later of the host-wide `countFrom` and a per-transcript `imported`
-    cutoff, keyed on the transcript id — the first path segment, so a migrated
-    session's `<id>/subagents/…` agents share its cutoff."""
+def _rel_transcript_id(rel):
+    """The transcript id a slug-relative path belongs to — its first segment, so
+    `<id>/subagents/…` follows its parent `<id>.jsonl`. Either separator: a
+    Windows agent's relpaths carry backslashes."""
     head = rel.replace("\\", "/").split("/", 1)[0]
-    tid = head[:-len(".jsonl")] if head.endswith(".jsonl") else head
-    cuts = [c for c in (_ts_ms(baseline.get("countFrom")),
-                        _ts_ms((baseline.get("imported") or {}).get(tid)))
-            if c is not None]
-    return max(cuts) if cuts else None
+    return head[:-len(".jsonl")] if head.endswith(".jsonl") else head
 
 
-def _accumulate_usage(lines, acc, subagent=False, after_ms=None):
+def _usage_exclusion(baseline, rel):
+    """What of the transcript at slug-relative path `rel` is NOT this host's
+    spend, as (countFrom_ms | None, [(from_ms | None, to_ms), …]), or None to
+    count all of it. An entry at/before `countFrom`, or inside a window
+    (from, to], was spent — and is reported — under another host name."""
+    cf = _ts_ms(baseline.get("countFrom"))
+    wins = [(_ts_ms(f) if f else None, _ts_ms(t))
+            for f, t in (baseline.get("imported") or {}).get(
+                _rel_transcript_id(rel), ())]
+    if cf is None and not wins:
+        return None
+    return cf, wins
+
+
+def _usage_excluded(t, exclude):
+    """True when an entry stamped `t` (epoch ms, None = undated) falls inside a
+    _usage_exclusion. Undated counts as excluded: it can't be placed outside."""
+    if t is None:
+        return True
+    cf, wins = exclude
+    if cf is not None and t <= cf:
+        return True
+    return any((f is None or t > f) and t <= to for f, to in wins)
+
+
+def _transcript_tree_max_ms(proj, tid):
+    """The newest entry timestamp (epoch ms) in transcript `tid` under project
+    dir `proj` — `<tid>.jsonl` and its `<tid>/subagents/**` — or None when it
+    has none (or isn't there). Bounded by what's on disk for ONE session; only
+    a migration import calls it, never the beat's fold."""
+    best = None
+    for rel, _sub in _project_transcripts(proj) or ():
+        if _rel_transcript_id(rel) != tid:
+            continue
+        try:
+            with open(os.path.join(proj, rel), errors="replace") as fh:
+                for line in fh:
+                    if '"timestamp"' not in line:
+                        continue
+                    try:
+                        t = _ts_ms(json.loads(line).get("timestamp"))
+                    except (ValueError, AttributeError, RecursionError):
+                        continue
+                    if t is not None and (best is None or t > best):
+                        best = t
+        except OSError:
+            continue
+    return best
+
+
+def _accumulate_usage(lines, acc, subagent=False, exclude=None):
     """Fold transcript JSONL lines into `acc` in place. Only lines that mention a
     usage block count for anything; each message is deduped on
     (message id, requestId) via acc.seen, so a message re-seen across files or
@@ -5569,10 +5624,9 @@ def _accumulate_usage(lines, acc, subagent=False, after_ms=None):
     counts toward the totals exactly like a session's own turns AND is tallied
     into acc.subagent so the report can name the delegated share.
 
-    `after_ms` skips every entry stamped at or before it — spend another host
-    name already reported (_usage_cutoff_ms). An UNDATED entry under a cutoff
-    is skipped too: it can't be placed after it, and a double count is the
-    error this exists to stop."""
+    `exclude` (a _usage_exclusion) skips entries spent — and reported — under
+    another host name. An UNDATED entry under one is skipped too: it can't be
+    placed outside it, and a double count is the error this exists to stop."""
     for line in lines:
         if '"usage"' not in line:
             continue
@@ -5584,10 +5638,9 @@ def _accumulate_usage(lines, acc, subagent=False, after_ms=None):
         usage = msg.get("usage")
         if not isinstance(usage, dict):
             continue
-        if after_ms is not None:
-            t = _ts_ms(entry.get("timestamp"))
-            if t is None or t <= after_ms:
-                continue
+        if exclude is not None and _usage_excluded(
+                _ts_ms(entry.get("timestamp")), exclude):
+            continue
         key = (msg.get("id"), entry.get("requestId"))
         if key[0] and key in acc.seen:
             continue
@@ -5703,7 +5756,7 @@ def _aggregate_project(proj, acc, offsets=None, cutoff=None):
     """Fold one Claude project dir's transcript token usage into `acc`.
 
     `cutoff`, when given, maps a transcript's slug-relative path to the instant
-    its entries start counting (_usage_cutoff_ms) — None counts all of it.
+    its _usage_exclusion — None counts all of it.
 
     With an `offsets` dict {relpath: byte-offset} this parses INCREMENTALLY:
     only bytes appended since the last call are read, and each offset advances
@@ -17323,12 +17376,10 @@ class SessionManager:
     # --- usage attribution ledger -----------------------------------------
 
     def _load_ledger(self):
-        try:
-            with open(USAGE_LEDGER_PATH) as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            return {}
+        # _read_untrusted_json, not open(): a FIFO planted here blocked __init__
+        # forever, and a deeply nested file raised RecursionError out of it —
+        # either way the agent never started (XERK-1085 QA).
+        return _read_untrusted_json(USAGE_LEDGER_PATH, USAGE_LEDGER_READ_MAX) or {}
 
     def _save_ledger(self):
         try:
@@ -17345,17 +17396,18 @@ class SessionManager:
         (_reconcile_usage_baseline), saving when that changed anything. A
         rename/clone is logged: it is the moment this host stops reporting the
         spend already on its disk."""
-        try:
-            with open(USAGE_BASELINE_PATH) as f:
-                raw = json.load(f)
-        except (OSError, ValueError):
-            raw = None
-        state = _normalize_usage_baseline(raw)
+        state = _normalize_usage_baseline(
+            _read_untrusted_json(USAGE_BASELINE_PATH, USAGE_BASELINE_READ_MAX))
+        # A migrated-in transcript Claude Code has since deleted needs no window.
+        gone = [tid for tid in state["imported"] if not glob.glob(
+            os.path.join(glob.escape(PROJECTS_ROOT), "*", tid + ".jsonl"))]
+        for tid in gone:
+            del state["imported"][tid]
         prev = state["device"]
         state, changed = _reconcile_usage_baseline(
             state, self.device, int(time.time() * 1000))
-        if changed:
-            if state["countFrom"] and prev and prev.lower() != self.device.lower():
+        if changed or gone:
+            if changed and state["countFrom"] and prev and prev.lower() != self.device.lower():
                 log(f"usage: this disk last counted as {prev!r}, now {self.device!r} "
                     f"(renamed or cloned) — counting spend from {state['countFrom']} "
                     f"on; earlier spend stays with {prev!r}")
@@ -17372,14 +17424,24 @@ class SessionManager:
         except OSError as e:
             log(f"usage baseline save failed: {e}")
 
-    def _mark_imported_usage(self, transcript_id, slug):
-        """A migrated-in transcript's bytes up to now were spent — and are still
-        reported — on the source host, which KEEPS its copy (killed = resumable),
-        so this host counts only turns after the import (XERK-1085). Drops the
-        slug's incremental fold so it is re-read under the new cutoff: a
-        migrate-BACK overwrites a transcript this host already counted."""
-        self.usage_baseline["imported"][transcript_id] = _ms_iso(
-            int(time.time() * 1000))
+    def _mark_imported_usage(self, transcript_id, slug, own_until_ms):
+        """Exclude what a migrated-in transcript spent on the SOURCE host, which
+        KEEPS its copy (killed = resumable) and keeps reporting it (XERK-1085).
+
+        The window is (own_until, to]: `own_until_ms` is the newest entry this
+        host already had in that transcript BEFORE the unpack overwrote it —
+        a migrate-BACK (A→B→A) carries A's own earlier turns, which A reported
+        and nobody else does, so they must keep counting. `to` is the later of
+        now and the newest entry in the unpacked bundle, so a source clock
+        running ahead of this one can't slip pre-move turns past it. Drops the
+        slug's incremental fold so it is re-read under the new window."""
+        proj = os.path.join(PROJECTS_ROOT, slug)
+        to = max(int(time.time() * 1000),
+                 _transcript_tree_max_ms(proj, transcript_id) or 0)
+        wins = self.usage_baseline["imported"].setdefault(transcript_id, [])
+        wins.append([_ms_iso(own_until_ms) if own_until_ms is not None else "",
+                     _ms_iso(to)])
+        del wins[:-USAGE_IMPORT_WINDOWS_MAX]
         self._save_usage_baseline(self.usage_baseline)
         self.slug_usage.pop(slug, None)
 
@@ -21654,6 +21716,8 @@ class SessionManager:
         qwen_store_dest = (self._qwen_store_dest(os.path.normpath(cwd),
                                                  transcript_id)
                            if want_qwen else None)
+        slug = _project_slug(os.path.normpath(cwd))
+        own_until = _transcript_tree_max_ms(slug_dir, transcript_id)
         try:
             os.makedirs(slug_dir, exist_ok=True)
             if dsh_store_dest:
@@ -21669,10 +21733,12 @@ class SessionManager:
                 self._reconcile_qwen_store_cwd(qwen_store_dest,
                                                os.path.normpath(cwd))
         except Exception as e:
+            # A partial unpack may already have written the transcript, whose
+            # pre-move turns the source still reports.
+            self._mark_imported_usage(transcript_id, slug, own_until)
             refuse(f"unpacking the transcript bundle failed: {e}")
             return
-        self._mark_imported_usage(transcript_id,
-                                  _project_slug(os.path.normpath(cwd)))
+        self._mark_imported_usage(transcript_id, slug, own_until)
         extra = {
             "ticket": cmd.get("ticket"),
             "summary": cmd.get("summary"),
@@ -29557,7 +29623,7 @@ class SessionManager:
         if st is None:
             st = self.slug_usage[slug] = {"acc": _UsageAcc(), "offsets": {}}
         proj = os.path.join(PROJECTS_ROOT, slug)
-        cutoff = lambda rel: _usage_cutoff_ms(self.usage_baseline, rel)  # noqa: E731
+        cutoff = lambda rel: _usage_exclusion(self.usage_baseline, rel)  # noqa: E731
         if not _aggregate_project(proj, st["acc"], st["offsets"], cutoff):
             # A tracked transcript shrank/vanished — start this slug over so the
             # running total still matches a from-scratch parse.

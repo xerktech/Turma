@@ -55,16 +55,27 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
     casing — XERK-448 folds case twins by high-water) sets `countFrom` = now: everything already on
     disk was reported under the old name, which the hub ledger keeps (retired host / the original).
     Rename and clone need no telling apart — the same rule is right for both.
-  - `import_session` sets `imported[<tid>]` = now: the SOURCE keeps its copy (killed = resumable) and
-    keeps reporting the pre-move turns. It drops that slug's incremental fold so it re-reads.
-  - `_accumulate_usage` skips entries at/before the cutoff (`_usage_cutoff_ms`, the later of the two,
-    keyed on the first path segment so `<tid>/subagents/**` follows its parent). An UNDATED entry
-    under a cutoff is skipped too. Times compare as epoch ms (`_ts_ms`), never as strings.
+  - `import_session` records a WINDOW `imported[<tid>] += [own_until, to]`: the SOURCE keeps its copy
+    (killed = resumable) and keeps reporting the pre-move turns. `own_until` = the newest entry this
+    host ALREADY had in that transcript (a move BACK A→B→A carries A's own earlier turns, which only
+    A reports — excluding from "" under-counted them). `to` = max(now, newest entry in the bundle),
+    so a source clock running ahead can't slip pre-move turns past it. Recorded on a refused unpack
+    too (it may already have written the file). Drops the slug's fold so it re-reads.
+  - `_accumulate_usage` skips an entry at/before `countFrom` or inside a window
+    (`_usage_exclusion`/`_usage_excluded`, keyed on `_rel_transcript_id` so `<tid>/subagents/**`
+    follows its parent on either separator). UNDATED entries under one are skipped too. Times
+    compare as epoch ms (`_ts_ms`), never as strings.
+  - Both loaders go through `_read_untrusted_json` (so does `repo-usage.json`): a FIFO there blocked
+    `__init__` forever and deep nesting raised `RecursionError` out of it. Windows for transcripts
+    no longer on disk are dropped at load.
+  - Known residue: a rename loses whatever the old name spent after its last usage refresh; a
+    migrate-back with the TARGET's clock behind the source's can still count a few boundary turns.
   - A first run (no file) records the name and counts everything — so a host renamed/cloned BEFORE
     this shipped needs `countFrom` written by hand, then its hub ledger purged
     (`DELETE /api/agents/<host>?usage=purge`), since the high-water keeps the duplicate otherwise.
   - Cost: a migrated/cloned session's CARD shows only this host's spend, not the conversation's.
-  - Tests: `TestUsageCutoff`, `TestUsageBaselineManager`, the import case in `TestMigrateSession`.
+  - Tests: `TestUsageCutoff`, `TestUsageBaselineManager`, `TestUsageAcrossAMigration` (real
+    pack/import over two disks), the import case in `TestMigrateSession`.
 - The per-model breakdown **excludes `<synthetic>`** (any `<...>` model) — Claude Code stamps
   fabricated entries with that model and an all-zero block; `_accumulate_usage` keeps them out of
   `acc.models` (tokens still fold into grand totals). Mirrors `_scan_model_entry`'s guard.
