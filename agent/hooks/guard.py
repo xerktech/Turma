@@ -1010,6 +1010,10 @@ def _destructive_agent_tmux(tokens: list[str]) -> str | None:
         word, args = cmd[0], cmd[1:]
         if word.startswith("kill-ser"):
             return "refusing `tmux kill-server` — " + _TMUX_HOST_REASON
+        # `source-file -` runs tmux commands read from stdin, which the guard
+        # cannot see (`echo kill-server | tmux source -`).
+        if word.startswith("source") and "-" in args:
+            return "refusing `tmux source-file -` (commands from stdin) — " + _TMUX_HOST_REASON
         # run-shell, if-shell, new-session/-window, split-window, respawn-* and
         # popups all run a shell command: classify that command on its own terms.
         for a in args:
@@ -1024,11 +1028,16 @@ def _destructive_agent_tmux(tokens: list[str]) -> str | None:
         if not word.startswith(("send", "rename", "display-m", "display", "switch")) \
                 or word.startswith("display-menu"):
             for a in args:
-                if not a.startswith("-"):
+                if a.startswith("-"):
+                    continue
+                # tmux's command parser splits a command STRING on `;` even
+                # mid-word (`'ls;kill-server'`), unlike argv where only a
+                # trailing `;` separates — so split before judging each part.
+                for part in a.split(";"):
                     try:
-                        inner = shlex.split(a)
+                        inner = shlex.split(part)
                     except ValueError:
-                        inner = a.split()
+                        inner = part.split()
                     reason = inner and _destructive_agent_tmux(["tmux", *inner])
                     if reason:
                         return reason

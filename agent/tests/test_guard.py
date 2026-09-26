@@ -1178,6 +1178,12 @@ class TestAgentTmuxProtection(unittest.TestCase):
         "tmux set-option -g 'session-created[0]' kill-server",
         "tmux display-menu -T x kill kill-server",
         "pgrep tmux | xargs kill>/dev/null",
+        # QA pass 7: tmux splits a command STRING on a mid-word `;`; stdin config.
+        "tmux if-shell true 'ls;kill-server'",
+        "tmux run -C 'ls;kill-server'",
+        "tmux set -g session-created 'display x;kill-server'",
+        "tmux set-hook -g session-created 'send x;kill-session -t agent-zz'",
+        "echo kill-server | tmux source-file -",
         "bash -c 'tmux kill-server'",
         "pkill tmux",
         "killall -9 tmux",
