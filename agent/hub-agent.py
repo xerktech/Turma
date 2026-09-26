@@ -17399,8 +17399,15 @@ class SessionManager:
         state = _normalize_usage_baseline(
             _read_untrusted_json(USAGE_BASELINE_PATH, USAGE_BASELINE_READ_MAX))
         # A migrated-in transcript Claude Code has since deleted needs no window.
-        gone = [tid for tid in state["imported"] if not glob.glob(
-            os.path.join(glob.escape(PROJECTS_ROOT), "*", tid + ".jsonl"))]
+        # Gone means NEITHER `<tid>.jsonl` NOR `<tid>/` survives: the usage walk
+        # still counts a `<tid>/subagents/` tree whose parent is gone. And never
+        # on an unreadable root — "can't look" must not read as "gone".
+        gone = []
+        if os.path.isdir(PROJECTS_ROOT) and os.access(PROJECTS_ROOT, os.R_OK | os.X_OK):
+            root = glob.escape(PROJECTS_ROOT)
+            gone = [tid for tid in state["imported"]
+                    if not glob.glob(os.path.join(root, "*", tid + ".jsonl"))
+                    and not glob.glob(os.path.join(root, "*", tid))]
         for tid in gone:
             del state["imported"][tid]
         prev = state["device"]

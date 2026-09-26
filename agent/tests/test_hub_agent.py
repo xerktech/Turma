@@ -7753,8 +7753,31 @@ class TestUsageBaselineManager(ManagerMixin, unittest.TestCase):
         with open(ha.USAGE_LEDGER_PATH, "w") as f:
             f.write('{"a":' * 5000)
         self.assertEqual(self.make_manager().usage_ledger, {})
+        os.remove(ha.USAGE_LEDGER_PATH)
+        os.mkfifo(ha.USAGE_LEDGER_PATH)
+        done = []
+        t = threading.Thread(target=lambda: done.append(self.make_manager()),
+                             daemon=True)
+        t.start()
+        t.join(10)
+        self.assertTrue(done, "manager init blocked on a FIFO ledger")
+
+    def test_a_window_is_kept_while_its_subagents_or_an_unreadable_root_remain(self):
+        tid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        base = {"device": ha.device_name(),
+                "imported": {tid: [["", "2026-09-01T00:00:00Z"]]}}
+        # Parent transcript deleted, its subagents/ still counted by the walk.
+        os.makedirs(os.path.join(ha.PROJECTS_ROOT, "slug", tid, "subagents"))
+        with open(ha.USAGE_BASELINE_PATH, "w") as f:
+            json.dump(base, f)
+        self.assertIn(tid, self.make_manager().usage_baseline["imported"])
+        # A missing projects root is "can't look", never "gone".
+        with mock.patch.object(ha, "PROJECTS_ROOT",
+                               os.path.join(self.tmp, "unmounted")):
+            self.assertIn(tid, self.make_manager().usage_baseline["imported"])
 
     def test_a_window_for_a_transcript_no_longer_on_disk_is_dropped(self):
+        os.makedirs(ha.PROJECTS_ROOT, exist_ok=True)
         with open(ha.USAGE_BASELINE_PATH, "w") as f:
             json.dump({"device": ha.device_name(), "imported": {
                 "gone-id": [["", "2026-09-01T00:00:00Z"]]}}, f)
