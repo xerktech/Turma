@@ -7771,7 +7771,16 @@ class TestUsageBaselineManager(ManagerMixin, unittest.TestCase):
         with open(ha.USAGE_BASELINE_PATH, "w") as f:
             json.dump(base, f)
         self.assertIn(tid, self.make_manager().usage_baseline["imported"])
-        # A missing projects root is "can't look", never "gone".
+        # An unreadable slug dir, or a missing projects root, is "can't look",
+        # never "gone".
+        other = os.path.join(ha.PROJECTS_ROOT, "other-slug")
+        os.makedirs(other)
+        shutil.rmtree(os.path.join(ha.PROJECTS_ROOT, "slug"))
+        os.chmod(other, 0)
+        self.addCleanup(os.chmod, other, 0o700)
+        if not os.access(other, os.R_OK):                 # root ignores modes
+            self.assertIn(tid, self.make_manager().usage_baseline["imported"])
+        os.chmod(other, 0o700)
         with mock.patch.object(ha, "PROJECTS_ROOT",
                                os.path.join(self.tmp, "unmounted")):
             self.assertIn(tid, self.make_manager().usage_baseline["imported"])

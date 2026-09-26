@@ -5589,6 +5589,20 @@ def _usage_excluded(t, exclude):
     return any((f is None or t > f) and t <= to for f, to in wins)
 
 
+def _projects_fully_readable():
+    """True when PROJECTS_ROOT and every slug dir directly under it can be
+    listed — the precondition for concluding a transcript is GONE from a glob
+    that silently skips what it can't read."""
+    try:
+        with os.scandir(PROJECTS_ROOT) as it:
+            for e in it:
+                if e.is_dir() and not os.access(e.path, os.R_OK | os.X_OK):
+                    return False
+    except OSError:
+        return False
+    return True
+
+
 def _transcript_tree_max_ms(proj, tid):
     """The newest entry timestamp (epoch ms) in transcript `tid` under project
     dir `proj` — `<tid>.jsonl` and its `<tid>/subagents/**` — or None when it
@@ -17401,9 +17415,10 @@ class SessionManager:
         # A migrated-in transcript Claude Code has since deleted needs no window.
         # Gone means NEITHER `<tid>.jsonl` NOR `<tid>/` survives: the usage walk
         # still counts a `<tid>/subagents/` tree whose parent is gone. And never
-        # on an unreadable root — "can't look" must not read as "gone".
+        # on an unreadable root OR slug dir — glob hides a read error, and "can't
+        # look" must not read as "gone".
         gone = []
-        if os.path.isdir(PROJECTS_ROOT) and os.access(PROJECTS_ROOT, os.R_OK | os.X_OK):
+        if state["imported"] and _projects_fully_readable():
             root = glob.escape(PROJECTS_ROOT)
             gone = [tid for tid in state["imported"]
                     if not glob.glob(os.path.join(root, "*", tid + ".jsonl"))
