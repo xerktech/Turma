@@ -114,6 +114,11 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   `ECONNRESET` before the queued 413 — a 502 the agent retries instead of the 413 that says SHRINK.
   - `refuseOversize` replays the leader's no-drain path exactly: discard to cap + slack, 413, cut.
     Draining first is XERK-235 — urllib writes the whole body before reading.
+  - **The cut is a LINGERING close, never an immediate destroy** (XERK-1051). Destroying a socket
+    with unread bytes sends an RST, which can discard the 413 before a still-writing client reads it.
+    FIN after the 413, discard until the client closes, destroy after `drainLingerMs` (2s); the slot
+    stays held meanwhile so `drainMax` still bounds it. Node's own `destroySoon` (the `connection:
+    close` teardown) is overridden on that one socket. Tests: `XERK-1051: a cut refusal lingers`.
   - The follower judges against the LEADER's caps + slack ALONE, published in `hubLeader:endpoint`
     (`bodyCaps`/`drainSlack`, XERK-939) — never its own, nor a `min` of both: mid-rollout (a changed
     memory limit) a smaller-cap follower cut a body the leader takes. No FRESH usable caps (an older
