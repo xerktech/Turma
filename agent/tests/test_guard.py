@@ -1100,6 +1100,57 @@ class TestAgentServiceProtection(unittest.TestCase):
                 self.assertIsNone(guard.is_destructive(cmd))
 
 
+class TestAgentTmuxProtection(unittest.TestCase):
+    """A session must not kill the tmux server every session runs in (XERK-1077).
+
+    Sessions are panes of one tmux server on the default socket and inherit
+    `$TMUX`, which tmux prefers over `TMUX_TMPDIR` — so a QA subagent's
+    `export TMUX_TMPDIR=...; tmux kill-server` killed all five sessions on a host.
+    """
+
+    DOWN = [
+        "tmux kill-server",
+        "export TMUX_TMPDIR=/tmp/qd; tmux kill-server; unset TMUX TMUX_PANE",
+        "TMUX_TMPDIR=/tmp/x tmux kill-server",
+        "env -u TMUX tmux kill-server",
+        "tmux -f /dev/null kill-ser",
+        "tmux new -d -s x \\; kill-server",
+        "tmux kill-session -a",
+        "tmux kill-session -t agent-56d5d",
+        "tmux kill-session -t =agent-56d5d",
+        "tmux kill-session -tagent-56d5d",
+        "command tmux kill-server",
+        "echo x | xargs -r tmux kill-server",
+        'pkill -f "tmux: server"',
+        "bash -c 'tmux kill-server'",
+        "pkill tmux",
+        "killall -9 tmux",
+    ]
+
+    # A private server, and killing your own scratch sessions, stay allowed.
+    OK = [
+        "tmux -L qa kill-server",
+        "tmux -Lqa kill-server",
+        "tmux -S /tmp/qa.sock kill-server",
+        "env -u TMUX tmux -L qa kill-server",
+        "tmux kill-session -t scratch",
+        "tmux ls",
+        "tmux capture-pane -p -t =agent-56d5d:",
+        "pkill -f my-daemon",
+        "pkill -f my-tmuxish-helper",
+    ]
+
+    def test_killing_the_host_server_is_denied(self):
+        for cmd in self.DOWN:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_private_servers_and_reads_stay_allowed(self):
+        for cmd in self.OK:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
+
 class TestDecide(unittest.TestCase):
     def test_allows_non_bash(self):
         self.assertEqual(

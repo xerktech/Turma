@@ -898,6 +898,67 @@ def _destructive_agent_service(tokens: list[str]) -> str | None:
             "session on this host, including yours. Ask the operator."
         )
     return None
+# tmux global options that take a value (`tmux [-2CDlNuVv] [-c cmd] [-f file]
+# [-L name] [-S path] [-T features] command ...`), so the command word is found
+# after them rather than mistaken for one.
+_TMUX_OPTS_WITH_VALUE = {"-c", "-f", "-L", "-S", "-T"}
+
+
+def _destructive_agent_tmux(tokens: list[str]) -> str | None:
+    """Refuse taking down the tmux server every session on this host runs in.
+
+    Sessions run as panes of ONE tmux server on its default socket, and every
+    session's shell inherits `$TMUX` pointing at it. `tmux kill-server` from a
+    session therefore kills every session on the host at once — and tmux
+    prefers `$TMUX` over `TMUX_TMPDIR`, so exporting a private `TMUX_TMPDIR`
+    first does not help (XERK-1077: a QA subagent did exactly that). A tmux
+    call that names its server with `-L`/`-S` cannot reach the host's, so it
+    stays allowed: that is the fix the reason points at.
+    """
+    prog = _basename(tokens[0])
+    # `pkill -f "tmux: server"` is how `ps` names the server, so match the word
+    # inside an argument, not just a whole `tmux` token.
+    if prog in ("pkill", "killall") and any(
+        re.search(r"(^|[\s/])tmux(:|\s|$)", t) for t in tokens[1:]
+    ):
+        return (
+            "refusing to kill tmux processes — every Turma session on this host, "
+            "including yours, runs inside the host's tmux server. Kill a private "
+            "test server with `tmux -L <name> kill-server` instead."
+        )
+    if prog != "tmux":
+        return None
+    i = 1
+    while i < len(tokens) and tokens[i].startswith("-") and tokens[i] != "--":
+        opt = tokens[i]
+        if opt[:2] in ("-L", "-S"):
+            return None  # an explicitly named server is never the host's default one
+        if opt in _TMUX_OPTS_WITH_VALUE:
+            i += 1
+        i += 1
+    # tmux accepts a unique command prefix, and chains commands with `;`.
+    args = tokens[i:]
+    for j, a in enumerate(args):
+        if a.startswith("kill-ser"):
+            return (
+                "refusing `tmux kill-server` on the host's tmux server — every "
+                "Turma session on this host, including yours, runs in it (`$TMUX` "
+                "overrides TMUX_TMPDIR). Name a private server: `tmux -L <name> "
+                "kill-server`."
+            )
+        if a.startswith("kill-ses"):
+            rest = args[j + 1:]
+            # `-t agent-x`, `-t=agent-x` and the attached `-tagent-x` all name one.
+            targets = [t[2:] if t.startswith("-t") else t for t in rest]
+            if "-a" in rest or any(t.lstrip("=").startswith("agent-") for t in targets):
+                return (
+                    "refusing to kill Turma session tmux sessions — `agent-*` "
+                    "sessions (and `kill-session -a`) are other sessions' agents. "
+                    "Use a private server: `tmux -L <name> ...`."
+                )
+    return None
+
+
 _PS_POWER = {"stop-computer", "restart-computer", "clear-disk", "format-volume"}
 
 
@@ -1423,6 +1484,7 @@ def is_destructive(command: str) -> str | None:
         # suffix-derived candidate too: it needs no dangerous path, but it names
         # specific units, so a container called `reboot` cannot trip it.
         checks.append(_destructive_agent_service(tokens))
+        checks.append(_destructive_agent_tmux(tokens))
         for reason in checks:
             if reason:
                 return reason
