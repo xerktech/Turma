@@ -1134,6 +1134,101 @@ class TestRepoUsageReport(unittest.TestCase):
         self.assertIsNone(host)
 
 
+class TestUsageCutoff(ProjectDirMixin, unittest.TestCase):
+    """XERK-1085: a transcript's entries at or before a cutoff were spent under
+    another host name, so they are not this host's spend."""
+
+    M = "claude-opus-4-20250514"
+
+    def test_ts_ms_parses_what_transcripts_write_and_compares_numerically(self):
+        self.assertEqual(ha._ts_ms("1970-01-01T00:00:01.500Z"), 1500)
+        self.assertEqual(ha._ts_ms("1970-01-01T00:00:01Z"), 1000)
+        self.assertEqual(ha._ts_ms("1970-01-01T01:00:00+01:00"), 0)
+        self.assertEqual(ha._ts_ms("1970-01-01T00:00:00.123456Z"), 123)
+        # Lexically "...:20Z" > "...:20.100Z"; numerically it is earlier.
+        self.assertLess(ha._ts_ms("2026-09-26T00:01:20Z"),
+                        ha._ts_ms("2026-09-26T00:01:20.100Z"))
+        for bad in (None, 5, "", "yesterday", "2026-02-30T00:00:00Z"):
+            self.assertIsNone(ha._ts_ms(bad))
+        self.assertEqual(ha._ms_iso(1790380296088), "2026-09-25T23:51:36.088Z")
+
+    def test_entries_at_or_before_the_cutoff_are_skipped(self):
+        path = os.path.join(self.proj, "a.jsonl")
+        write_jsonl(path, [
+            usage_entry("2026-09-25T12:00:00.000Z", "m1", "r1", self.M, 100, 0),
+            usage_entry("2026-09-26T00:01:20.000Z", "m2", "r2", self.M, 20, 0),
+            usage_entry("2026-09-26T09:00:00.000Z", "m3", "r3", self.M, 3, 0),
+            # Undated under a cutoff: can't be placed after it, so not counted.
+            {"requestId": "r4", "message": {"id": "m4", "model": self.M,
+                                            "usage": {"input_tokens": 4000}}},
+        ])
+        cut = ha._ts_ms("2026-09-26T00:01:20.000Z")
+        acc = ha._UsageAcc()
+        ha._aggregate_project(self.proj, acc, {}, lambda rel: (cut, []))
+        self.assertEqual(acc.totals["input"], 3)
+        self.assertEqual(set(acc.days), {"2026-09-26"})
+        # No cutoff: everything counts, as before.
+        acc = ha._UsageAcc()
+        ha._aggregate_project(self.proj, acc, {})
+        self.assertEqual(acc.totals["input"], 4123)
+
+    def test_exclusion_combines_host_cutoff_and_import_windows(self):
+        tid = "11111111-2222-3333-4444-555555555555"
+        ms = ha._ts_ms
+        base = {"countFrom": "2026-09-01T00:00:00.000Z",
+                "imported": {tid: [["2026-09-10T00:00:00.000Z",
+                                    "2026-09-20T00:00:00.000Z"]]}}
+        ex = ha._usage_exclusion(base, f"{tid}.jsonl")
+        for ts, out in (("2026-08-31T00:00:00Z", True),    # host cutoff
+                        ("2026-09-05T00:00:00Z", False),   # this host's own turns
+                        ("2026-09-10T00:00:00Z", False),   # window start is exclusive
+                        ("2026-09-15T00:00:00Z", True),    # spent on the source
+                        ("2026-09-20T00:00:00Z", True),    # window end is inclusive
+                        ("2026-09-21T00:00:00Z", False)):
+            self.assertEqual(ha._usage_excluded(ms(ts), ex), out, ts)
+        self.assertTrue(ha._usage_excluded(None, ex))
+        # A migrated session's delegated agents follow the parent — on either
+        # separator, since a Windows agent's relpaths carry backslashes.
+        for rel in (f"{tid}/subagents/agent-a.jsonl",
+                    f"{tid}\\subagents\\agent-a.jsonl"):
+            self.assertEqual(ha._usage_exclusion(base, rel), ex)
+        self.assertEqual(ha._usage_exclusion(base, "other.jsonl"),
+                         (ms("2026-09-01T00:00:00.000Z"), []))
+        self.assertIsNone(ha._usage_exclusion(
+            {"countFrom": "", "imported": {}}, "other.jsonl"))
+
+    def test_a_name_change_starts_the_count_now_but_casing_and_first_run_do_not(self):
+        now = ha._ts_ms("2026-09-26T00:01:20.000Z")
+        empty = ha._normalize_usage_baseline(None)
+        st, changed = ha._reconcile_usage_baseline(empty, "k8x-01", now)
+        self.assertTrue(changed)
+        self.assertEqual((st["device"], st["countFrom"]), ("k8x-01", ""))
+        st2, changed = ha._reconcile_usage_baseline(st, "k8x-01", now)
+        self.assertFalse(changed)
+        self.assertIs(st2, st)
+        # A clone (or rename): the disk last counted as k8x-01.
+        st3, changed = ha._reconcile_usage_baseline(st, "k8x-02", now)
+        self.assertTrue(changed)
+        self.assertEqual(st3["countFrom"], "2026-09-26T00:01:20.000Z")
+        # Casing only (XERK-448 folds case twins): same host, no cutoff.
+        st4, _ = ha._reconcile_usage_baseline(
+            dict(empty, device="MaxAI"), "MAXAI", now)
+        self.assertEqual((st4["device"], st4["countFrom"]), ("MAXAI", ""))
+        # A cutoff never moves backwards (a skewed clock on a later rename).
+        st5, _ = ha._reconcile_usage_baseline(
+            dict(st3, device="k8x-03"), "k8x-04", now - 1000)
+        self.assertEqual(st5["countFrom"], st3["countFrom"])
+
+    def test_normalize_drops_malformed_fields(self):
+        st = ha._normalize_usage_baseline({
+            "device": 7, "countFrom": "soon",
+            "imported": {"ok-id": [["", "2026-09-01T00:00:00Z"], ["x", "y"], "junk"],
+                         "../x": [["", "2026-09-01T00:00:00Z"]],
+                         "flat": "2026-09-01T00:00:00Z"}})
+        self.assertEqual(st, {"device": "", "countFrom": "",
+                              "imported": {"ok-id": [["", "2026-09-01T00:00:00Z"]]}})
+
+
 class TestAggregateProjectIncremental(ProjectDirMixin, unittest.TestCase):
     """With an `offsets` dict, _aggregate_project folds only newly-appended bytes
     across beats (the manager carries a persistent per-slug acc + offsets), but
@@ -4547,6 +4642,7 @@ class ManagerMixin:
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("QUESTIONS_DIR", os.path.join(self.tmp, "questions")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
+            ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
             ("PRIORITY_WRITE_LEDGER_PATH", os.path.join(self.tmp, "jira-priority-writes.json")),
@@ -7582,6 +7678,226 @@ class TestSubscriptionIdentity(unittest.TestCase):
         self.assertEqual(len(self._read()["label"]), ha.SUBSCRIPTION_LABEL_MAX)
 
 
+class TestUsageBaselineManager(ManagerMixin, unittest.TestCase):
+    """XERK-1085, manager side: the baseline file is read at boot, a DEVICE_NAME
+    change is adopted, and the per-slug fold honours it."""
+
+    M = "claude-opus-4-20250514"
+
+    def _slug_with(self, entries, name="t.jsonl"):
+        slug = ha._project_slug(os.path.join(self.tmp, "wt"))
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, name), entries)
+        return slug
+
+    def _baseline_on_disk(self):
+        with open(ha.USAGE_BASELINE_PATH) as f:
+            return json.load(f)
+
+    def test_first_run_records_the_name_and_counts_everything(self):
+        with mock.patch.object(ha, "device_name", return_value="k8x-01"):
+            sm = self.make_manager()
+        self.assertEqual(self._baseline_on_disk(),
+                         {"device": "k8x-01", "countFrom": "", "imported": {}})
+        slug = self._slug_with([usage_entry(
+            "2020-01-01T00:00:00.000Z", "m1", "r1", self.M, 7, 0)])
+        self.assertEqual(sm._fold_slug(slug).totals["input"], 7)
+
+    def test_a_cloned_disk_stops_reporting_what_the_original_already_did(self):
+        with open(ha.USAGE_BASELINE_PATH, "w") as f:
+            json.dump({"device": "k8x-01"}, f)
+        slug = self._slug_with([
+            usage_entry("2020-01-01T00:00:00.000Z", "m1", "r1", self.M, 7, 0),
+            usage_entry("2999-01-01T00:00:00.000Z", "m2", "r2", self.M, 5, 0),
+        ])
+        with mock.patch.object(ha, "device_name", return_value="k8x-02"):
+            sm = self.make_manager()
+        on_disk = self._baseline_on_disk()
+        self.assertEqual(on_disk["device"], "k8x-02")
+        self.assertTrue(on_disk["countFrom"])
+        # Only the entry after the clone counts; the original keeps the rest.
+        self.assertEqual(sm._fold_slug(slug).totals["input"], 5)
+
+    def test_an_import_counts_only_turns_after_it_even_over_a_folded_slug(self):
+        tid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        slug = self._slug_with([usage_entry(
+            "2020-01-01T00:00:00.000Z", "m1", "r1", self.M, 7, 0)], f"{tid}.jsonl")
+        sm = self.make_manager()
+        self.assertEqual(sm._fold_slug(slug).totals["input"], 7)
+        sm._mark_imported_usage(tid, slug, None)
+        self.assertIn(tid, self._baseline_on_disk()["imported"])
+        # The fold is rebuilt under the new cutoff, not left holding the old sum.
+        self.assertEqual(sm._fold_slug(slug).totals["input"], 0)
+        write_jsonl(os.path.join(ha.PROJECTS_ROOT, slug, f"{tid}.jsonl"), [usage_entry(
+            "2999-01-01T00:00:00.000Z", "m2", "r2", self.M, 5, 0)])
+        self.assertEqual(sm._fold_slug(slug).totals["input"], 5)
+        # Survives a restart.
+        self.assertEqual(self.make_manager()._fold_slug(slug).totals["input"], 5)
+
+
+    def test_a_baseline_file_that_is_hostile_never_stops_the_manager(self):
+        with open(ha.USAGE_BASELINE_PATH, "w") as f:
+            f.write("[" * 200000)
+        self.make_manager()                       # RecursionError used to escape
+        os.remove(ha.USAGE_BASELINE_PATH)
+        os.mkfifo(ha.USAGE_BASELINE_PATH)         # a plain open() blocked forever
+        done = []
+        t = threading.Thread(target=lambda: done.append(self.make_manager()),
+                             daemon=True)
+        t.start()
+        t.join(10)
+        self.assertTrue(done, "manager init blocked on a FIFO baseline")
+
+    def test_a_ledger_file_that_is_hostile_never_stops_the_manager(self):
+        with open(ha.USAGE_LEDGER_PATH, "w") as f:
+            f.write('{"a":' * 5000)
+        self.assertEqual(self.make_manager().usage_ledger, {})
+        os.remove(ha.USAGE_LEDGER_PATH)
+        os.mkfifo(ha.USAGE_LEDGER_PATH)
+        done = []
+        t = threading.Thread(target=lambda: done.append(self.make_manager()),
+                             daemon=True)
+        t.start()
+        t.join(10)
+        self.assertTrue(done, "manager init blocked on a FIFO ledger")
+
+    def test_a_window_is_kept_while_its_subagents_or_an_unreadable_root_remain(self):
+        tid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        base = {"device": ha.device_name(),
+                "imported": {tid: [["", "2026-09-01T00:00:00Z"]]}}
+        # Parent transcript deleted, its subagents/ still counted by the walk.
+        os.makedirs(os.path.join(ha.PROJECTS_ROOT, "slug", tid, "subagents"))
+        with open(ha.USAGE_BASELINE_PATH, "w") as f:
+            json.dump(base, f)
+        self.assertIn(tid, self.make_manager().usage_baseline["imported"])
+        # An unreadable slug dir, or a missing projects root, is "can't look",
+        # never "gone".
+        other = os.path.join(ha.PROJECTS_ROOT, "other-slug")
+        os.makedirs(other)
+        shutil.rmtree(os.path.join(ha.PROJECTS_ROOT, "slug"))
+        os.chmod(other, 0)
+        self.addCleanup(os.chmod, other, 0o700)
+        if not os.access(other, os.R_OK):                 # root ignores modes
+            self.assertIn(tid, self.make_manager().usage_baseline["imported"])
+        os.chmod(other, 0o700)
+        # Readable but not searchable: the names still answer.
+        os.makedirs(os.path.join(other, tid))
+        os.chmod(other, 0o500 & ~0o100)
+        self.assertIn(tid, self.make_manager().usage_baseline["imported"])
+        os.chmod(other, 0o700)
+        with mock.patch.object(ha, "PROJECTS_ROOT",
+                               os.path.join(self.tmp, "unmounted")):
+            self.assertIn(tid, self.make_manager().usage_baseline["imported"])
+
+    def test_a_window_for_a_transcript_no_longer_on_disk_is_dropped(self):
+        os.makedirs(ha.PROJECTS_ROOT, exist_ok=True)
+        with open(ha.USAGE_BASELINE_PATH, "w") as f:
+            json.dump({"device": ha.device_name(), "imported": {
+                "gone-id": [["", "2026-09-01T00:00:00Z"]]}}, f)
+        self.assertEqual(self.make_manager().usage_baseline["imported"], {})
+        self.assertEqual(self._baseline_on_disk()["imported"], {})
+
+
+class TestUsageAcrossAMigration(ManagerMixin, unittest.TestCase):
+    """XERK-1085 end to end over the REAL pack/unpack/import path, two hosts on
+    two simulated disks: each reports only the turns it ran — including a move
+    back (A→B→A) and a source whose clock runs ahead of the target's."""
+
+    M = "claude-opus-4-20250514"
+    TID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    def setUp(self):
+        super().setUp()
+        self.wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "mv")
+        self.slug = ha._project_slug(self.wt)
+        self.n = 0
+        self.hosts = {}
+        for name in ("A", "B"):
+            with self.on(name):
+                self.hosts[name] = self.make_manager()
+                self.hosts[name]._worktree_add = mock.Mock()
+                self.hosts[name]._launch_tmux = mock.Mock()
+                self.hosts[name]._launch_ttyd = mock.Mock()
+
+    @contextlib.contextmanager
+    def on(self, name):
+        root = os.path.join(self.tmp, "disk-" + name)
+        os.makedirs(os.path.join(root, "projects"), exist_ok=True)
+        with mock.patch.object(ha, "PROJECTS_ROOT", os.path.join(root, "projects")), \
+             mock.patch.object(ha, "USAGE_BASELINE_PATH",
+                               os.path.join(root, "baseline.json")):
+            yield
+
+    def _path(self):
+        return os.path.join(ha.PROJECTS_ROOT, self.slug, self.TID + ".jsonl")
+
+    def _turn(self, tokens, skew_ms=0, sub=False):
+        self.n += 1
+        ts = ha._ms_iso(int(time.time() * 1000) + skew_ms)
+        path = self._path()
+        if sub:
+            path = os.path.join(path[:-len(".jsonl")], "subagents", "agent-x.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        write_jsonl(path, [usage_entry(ts, f"m{self.n}", f"r{self.n}",
+                                       self.M, tokens, 0)])
+        time.sleep(0.005)
+
+    def _move(self, src, dst):
+        with self.on(src):
+            blob = self.hosts[src]._pack_transcript(self._path())
+        with self.on(dst):
+            sm = self.hosts[dst]
+            sm._migration_download = lambda mid: blob
+            with mock.patch.object(ha, "resolve_base_ref",
+                                   return_value="origin/main"):
+                sm.import_session({"type": "importSession", "cmdId": "c1",
+                                   "migrationId": "mig1", "transcriptId": self.TID,
+                                   "cwd": self.wt, "repo": "Turma"})
+            self.assertTrue(os.path.isfile(self._path()))
+        time.sleep(0.005)
+
+    def _count(self, name):
+        with self.on(name):
+            return self.hosts[name]._fold_slug(self.slug).totals["input"]
+
+    def test_each_host_counts_only_its_own_turns_across_a_move_and_back(self):
+        with self.on("A"):
+            self._turn(1)
+            self._turn(10, sub=True)
+        self.assertEqual(self._count("A"), 11)
+        self._move("A", "B")
+        self.assertEqual(self._count("B"), 0)            # A still reports those
+        with self.on("B"):
+            self._turn(100)
+            self._turn(1000, sub=True)
+        self.assertEqual(self._count("B"), 1100)
+        self._move("B", "A")
+        # A's own earlier turns still count; B's don't (B still reports them).
+        self.assertEqual(self._count("A"), 11)
+        with self.on("A"):
+            self._turn(10000)
+        self.assertEqual(self._count("A"), 10011)
+        self.assertEqual(self._count("A") + self._count("B"), 11111)
+
+    def test_a_source_clock_running_ahead_cannot_double_count(self):
+        with self.on("A"):
+            self._turn(1, skew_ms=60000)                 # A's clock is 60s fast
+        self._move("A", "B")
+        self.assertEqual(self._count("B"), 0)
+
+    def test_a_refused_unpack_still_excludes_what_it_wrote(self):
+        with self.on("A"):
+            self._turn(1)
+        real = ha.SessionManager._unpack_transcript
+
+        def half(sm, blob, dest, **kw):
+            real(sm, blob, dest, **kw)
+            raise OSError("disk full")
+        with mock.patch.object(ha.SessionManager, "_unpack_transcript", half):
+            self._move("A", "B")
+        self.assertEqual(self._count("B"), 0)
+
 class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
     """Usage counts EVERY transcript on disk, not only ledger-known slugs: an
     orphan transcript (session aged out of closed.json, or predating the ledger)
@@ -8682,6 +8998,9 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         # worktree re-created at the exact origin path.
         self.assertEqual(sm._launch_tmux.call_args.kwargs["resume_id"], "transI")
         sm._worktree_add.assert_called_once()
+        # XERK-1085: the source keeps its copy (killed = resumable) and still
+        # reports the pre-move turns, so this host counts only turns after it.
+        self.assertIn("transI", sm.usage_baseline["imported"])
 
     def test_import_download_failure_creates_no_session(self):
         wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "orig2")
@@ -22015,6 +22334,7 @@ class TestPruneRepo(unittest.TestCase):
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
+            ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
             ("PRIORITY_WRITE_LEDGER_PATH", os.path.join(self.tmp, "jira-priority-writes.json")),

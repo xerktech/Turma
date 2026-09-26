@@ -48,6 +48,39 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
     pruned session's `subagents/` tree has real spend and a zero count.
   - Tests: `TestSubagentUsage`, `subagentCard` in `usage.test.js`, the split cases in
     `UsageViewModelTest`.
+- **A host counts only what it spent UNDER ITS OWN NAME** (XERK-1085, `USAGE_BASELINE_PATH` =
+  `~/.turma/usage-baseline.json`). The hub SUMS hosts, so one disk reported under two names counts
+  twice — `k8x` renamed to `k8x-01`, then its volume cloned to `k8x-02`, tripled every figure.
+  - The file records the `device` this disk last counted as. A different name at boot (other than
+    casing — XERK-448 folds case twins by high-water) sets `countFrom` = now: everything already on
+    disk was reported under the old name, which the hub ledger keeps (retired host / the original).
+    Rename and clone need no telling apart — the same rule is right for both.
+  - `import_session` records a WINDOW `imported[<tid>] += [own_until, to]`: the SOURCE keeps its copy
+    (killed = resumable) and keeps reporting the pre-move turns. `own_until` = the newest entry this
+    host ALREADY had in that transcript (a move BACK A→B→A carries A's own earlier turns, which only
+    A reports — excluding from "" under-counted them). `to` = max(now, newest entry in the bundle),
+    so a source clock running ahead can't slip pre-move turns past it. Recorded on a refused unpack
+    too (it may already have written the file). Drops the slug's fold so it re-reads.
+  - `_accumulate_usage` skips an entry at/before `countFrom` or inside a window
+    (`_usage_exclusion`/`_usage_excluded`, keyed on `_rel_transcript_id` so `<tid>/subagents/**`
+    follows its parent on either separator). UNDATED entries under one are skipped too. Times
+    compare as epoch ms (`_ts_ms`), never as strings.
+  - Both loaders go through `_read_untrusted_json` (so does `repo-usage.json`): a FIFO there blocked
+    `__init__` forever and deep nesting raised `RecursionError` out of it. Windows for transcripts
+    no longer on disk are dropped at load.
+  - Known residue: a rename loses whatever the old name spent after its last usage refresh; a
+    target whose clock runs BEHIND the source's under-counts its own first turns by up to that skew
+    (the price of `to` covering a fast source clock — erring low, never double).
+  - A window is pruned at load only when NEITHER `<tid>.jsonl` NOR `<tid>/` is left (the walk still
+    counts an orphaned `subagents/`), and never while `PROJECTS_ROOT` or any slug dir is unreadable
+    (`_transcripts_present`: one listing per slug dir, not a glob per id — that was imported x slugs
+    at startup, tens of seconds on a big host).
+  - A first run (no file) records the name and counts everything — so a host renamed/cloned BEFORE
+    this shipped needs `countFrom` written by hand, then its hub ledger purged
+    (`DELETE /api/agents/<host>?usage=purge`), since the high-water keeps the duplicate otherwise.
+  - Cost: a migrated/cloned session's CARD shows only this host's spend, not the conversation's.
+  - Tests: `TestUsageCutoff`, `TestUsageBaselineManager`, `TestUsageAcrossAMigration` (real
+    pack/import over two disks), the import case in `TestMigrateSession`.
 - The per-model breakdown **excludes `<synthetic>`** (any `<...>` model) — Claude Code stamps
   fabricated entries with that model and an all-zero block; `_accumulate_usage` keeps them out of
   `acc.models` (tokens still fold into grand totals). Mirrors `_scan_model_entry`'s guard.
