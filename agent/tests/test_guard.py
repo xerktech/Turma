@@ -1187,6 +1187,7 @@ class TestAgentTmuxProtection(unittest.TestCase):
         "echo kill-server | tmux so -",
         "echo kill-server | tmux source-file /dev/stdin",
         "tmux if true \"'kill-server\"",
+        'tmux set -g session-created "\\"kill-server"',
         "bash -c 'tmux kill-server'",
         "pkill tmux",
         "killall -9 tmux",
@@ -1215,6 +1216,8 @@ class TestAgentTmuxProtection(unittest.TestCase):
         "tmux new-session -d -s qa 'sleep 100'",
         "tmux kill-pane -t qa:0.1",
         "pkill -f tmuxinator",
+        "tmux new-session -d -s relay 'socat - TCP:localhost:8080'",
+        "tmux new -d \"sort - > /tmp/out\"",
     ]
 
     def test_killing_the_host_server_is_denied(self):

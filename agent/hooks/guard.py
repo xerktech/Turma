@@ -1012,7 +1012,10 @@ def _destructive_agent_tmux(tokens: list[str]) -> str | None:
             return "refusing `tmux kill-server` — " + _TMUX_HOST_REASON
         # `source-file -` runs tmux commands read from stdin, which the guard
         # cannot see (`echo kill-server | tmux source -`).
-        if word.startswith("so") and any(a in ("-", "/dev/stdin") for a in args):
+        # Any unique abbreviation of source-file (`so`, `sour`), but not a pane's
+        # shell command that merely starts with "so" (`socat -`, `sort -`).
+        if len(word) >= 2 and ("source-file".startswith(word) or word == "source") \
+                and any(a in ("-", "/dev/stdin") for a in args):
             return "refusing `tmux source-file -` (commands from stdin) — " + _TMUX_HOST_REASON
         # run-shell, if-shell, new-session/-window, split-window, respawn-* and
         # popups all run a shell command: classify that command on its own terms.
