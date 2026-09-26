@@ -957,7 +957,7 @@ def _tmux_target_is_agent(target: str | None) -> bool:
         return True
     # A pane/window id (`%3`, `@2`) or special token (`{last}`, `!`, `~`) can be
     # any session's — `list-panes -a` then a kill by id is ordinary tmux use.
-    if target[0] in "%@{!~":
+    if target[0] in "%@{!~+-":
         return True
     if target.startswith("="):
         return target[1:].startswith("agent-")
@@ -980,7 +980,7 @@ def _destructive_agent_tmux(tokens: list[str]) -> str | None:
     # `pkill -f "tmux: server"` is how `ps` names the server, so match the word
     # inside an argument, not just a whole `tmux` token.
     if prog in ("pkill", "killall") and any(
-        re.search(r"(^|[\s/])tmux(:|\s|$)", re.sub(r"[\[\]^$\\.*+?]", "", t))
+        re.search(r"(^|[^a-z0-9])tmux([^a-z0-9]|$)", re.sub(r"[\[\]^$\\]", "", t.lower()))
         for t in tokens[1:]
     ):
         return "refusing to kill tmux processes — " + _TMUX_HOST_REASON
@@ -1015,6 +1015,17 @@ def _destructive_agent_tmux(tokens: list[str]) -> str | None:
         for a in args:
             if " " in a and is_destructive(a):
                 return "refusing a shell command run by tmux — " + (is_destructive(a) or "")
+        # if-shell's commands and `run-shell -C` run as TMUX commands.
+        if word.startswith(("run", "if")):
+            for a in args:
+                if not a.startswith("-"):
+                    try:
+                        inner = shlex.split(a)
+                    except ValueError:
+                        inner = a.split()
+                    reason = inner and _destructive_agent_tmux(["tmux", *inner])
+                    if reason:
+                        return reason
         if word.startswith(_TMUX_KILL_TARGET):
             target = None
             all_others = False
@@ -1044,9 +1055,15 @@ def _destructive_agent_tmux(tokens: list[str]) -> str | None:
 
 
 def _destructive_tmux_pid_kill(command: str) -> str | None:
-    """`kill $(pgrep tmux)` / `pgrep tmux | xargs kill` — `pkill tmux` by PID."""
+    """`kill $(pgrep tmux)` / `pgrep tmux | xargs kill` — `pkill tmux` by PID.
+
+    `kill` counts anywhere as a word: wrappers, loops, xargs values and
+    newlines all put it somewhere other than a command's first position, and a
+    tighter rule reopened those. `pgrep tmux; echo kill` is denied too — the
+    accepted, fail-safe cost.
+    """
     if re.search(r"\b(pgrep|pidof|grep)\b[^;&\n]*\btmux\b", command) and re.search(
-        r"(^|[;&|(`]|\bxargs(\s+-\S+)*)\s*(\S*/)?kill(\s|$)", command
+        r"(^|[\s;&|(`/'\"])kill(\s|$)", command
     ):
         return "refusing to kill tmux by PID — " + _TMUX_HOST_REASON
     return None
