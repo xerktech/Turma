@@ -1015,8 +1015,10 @@ def _destructive_agent_tmux(tokens: list[str]) -> str | None:
         for a in args:
             if " " in a and is_destructive(a):
                 return "refusing a shell command run by tmux — " + (is_destructive(a) or "")
-        # if-shell's commands and `run-shell -C` run as TMUX commands.
-        if word.startswith(("run", "if")):
+        # if-shell's commands, `run-shell -C`, hooks and key bindings run as
+        # TMUX commands — `set-hook -g session-created kill-server` arms a trap
+        # that fires on the agent's next spawn.
+        if word.startswith(("run", "if", "set-hook", "bind", "confirm", "command-prompt")):
             for a in args:
                 if not a.startswith("-"):
                     try:
@@ -1062,9 +1064,9 @@ def _destructive_tmux_pid_kill(command: str) -> str | None:
     tighter rule reopened those. `pgrep tmux; echo kill` is denied too — the
     accepted, fail-safe cost.
     """
-    if re.search(r"\b(pgrep|pidof|grep)\b[^;&\n]*\btmux\b", command) and re.search(
-        r"(^|[\s;&|(`/'\"])kill(\s|$)", command
-    ):
+    if re.search(
+        r"\b(pgrep|pidof|grep)\b[^;&\n]*\btmux\b", re.sub(r"[\[\]]", "", command)
+    ) and re.search(r"(^|[\s;&|(`/'\"\\])kill([\s;&|)`'\"]|$)", command):
         return "refusing to kill tmux by PID — " + _TMUX_HOST_REASON
     return None
 
