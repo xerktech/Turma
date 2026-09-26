@@ -95,6 +95,21 @@ with `restart: unless-stopped`
   (`endRefusedConnection`, after `finish`).
 - **A refused body must be CLOSED, not paused** — Node dumps (reads) an unread body when the response
   finishes to keep the connection alive, so a pause still reads the whole thing into memory.
+- **That close is a LINGERING close, never an immediate destroy** (XERK-1076). A destroy under
+  unread bytes sends an RST that erases the 413/503 before a still-writing urllib client reads it
+  (repro: 100% ECONNRESET). FIN after `finish`, discard until the client closes, destroy after
+  `REFUSE_LINGER_MS`; Node's `destroySoon` is overridden on that socket.
+  - At most `REFUSE_LINGER_MAX` (4) linger at once — the discard is UNBUDGETED read churn at wire
+    speed (measured VmHWM +60 MB at cap 4, +96 MB at 16, under a flood at 512m), the XERK-258 cost —
+    near the ~68 MiB XERK-287 margin already. Past the cap
+    a refusal falls back to the immediate destroy (a reset the caller retries). Don't raise it
+    without re-measuring against the XERK-287 margin.
+  - A client still writing when `REFUSE_LINGER_MS` (2s) runs out is reset anyway — slow writers too.
+  - Behind the nginx ingress (buffers the body) main already delivered these; this is direct-to-hub.
+  - Tests: `XERK-1076: …` in `drain-slot.test.js` — the client is `allowHalfOpen` and keeps writing
+    past the FIN; a test client that stops at `'end'` cannot tell a lingering close from a pause.
+  - The linger's own `sock.end()` IS the FIN: overriding `destroySoon` removes Node's. Time the FIN
+    from the status line, never from the client's last write (a 2s timer close hides in that gap).
 - **A drainable SIZE (413) refusal DEFERS its response to the body's `end`, never mid-stream**
   (XERK-291). A client that streams a large body writes it in FULL before it reads (python urllib,
   which the agents post with); answering at `cap` and then closing reaches it as a bare ECONNRESET,
