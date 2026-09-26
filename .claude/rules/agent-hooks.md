@@ -40,10 +40,13 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   system roots, protected-branch history destruction, `DROP DATABASE|TABLE`); **policy** (push to /
   delete `main`/`master`, self-merging a PR/MR — work lands via a human-merged PR); **attribution**
   (AI self-attribution trailers).
-- **Destructive includes the host's tmux server** (XERK-1077): `tmux kill-server`, `kill-session -a`
-  or of an `agent-*` session, and `pkill`/`killall tmux` are denied unless tmux names its server with
-  `-L`/`-S`. Every session is a pane of ONE default-socket server and inherits `$TMUX`, which tmux
-  prefers over `TMUX_TMPDIR` — so a "private" `TMUX_TMPDIR` kill-server killed every session on a host.
+- **Destructive includes the host's tmux server** (XERK-1077): `kill-server`, killing tmux by name
+  or PID, and `kill-session`/`-window`/`-pane` of anything that could resolve to an `agent-*` session
+  are denied unless tmux names a NON-default server (`-L`/`-S`; `-L default` is the host's).
+  - Every session is a pane of ONE default-socket server and inherits `$TMUX`, which tmux prefers
+    over `TMUX_TMPDIR` — so a "private" `TMUX_TMPDIR` kill-server killed every session on a host.
+  - tmux resolves `-t` by exact name, then unique PREFIX, then glob, so `-t ag` / `agent*` reach
+    `agent-<id>`; a missing or unknowable target (`$var`, loop value) is the current session.
 - Ordinary dev work (edits, builds, tests, git, `rm -rf node_modules`) untouched. Allowlist a command
   via `$TURMA_TOOL_GRANTS` (CSV `Bash(<cmd>)`), attribution via `$TURMA_NO_ATTRIBUTION=0`.
 - Classifies what the SHELL runs, **never the raw string** — `qa.md` §6.1 is the rule and its limits.

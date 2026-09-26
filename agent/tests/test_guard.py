@@ -1122,6 +1122,22 @@ class TestAgentTmuxProtection(unittest.TestCase):
         "command tmux kill-server",
         "echo x | xargs -r tmux kill-server",
         'pkill -f "tmux: server"',
+        # `-L`/`-S` naming the DEFAULT socket is the host's server by another name.
+        "tmux -L default kill-server",
+        "tmux -S /tmp/tmux-1000/default kill-server",
+        # No/unknown target is the current or most recent session; tmux also
+        # resolves a target by unique prefix and glob, so these reach agent-*.
+        "tmux kill-session",
+        'tmux kill-session -t "$SESSION"',
+        "tmux ls -F '#S' | xargs -n1 tmux kill-session -t",
+        "tmux kill-session -at qa",
+        "tmux kill-session -t ag",
+        "tmux kill-session -t 'agent*'",
+        "tmux kill-window -t agent-x:0",
+        "tmux kill-pane -t agent-x",
+        'tmux run-shell "tmux kill-server"',
+        "kill $(pgrep tmux)",
+        "pgrep tmux | xargs kill",
         "bash -c 'tmux kill-server'",
         "pkill tmux",
         "killall -9 tmux",
@@ -1138,6 +1154,13 @@ class TestAgentTmuxProtection(unittest.TestCase):
         "tmux capture-pane -p -t =agent-56d5d:",
         "pkill -f my-daemon",
         "pkill -f my-tmuxish-helper",
+        "tmux -uL qa kill-server",
+        "tmux -Lqa kill-session -a",
+        "tmux send-keys -t qa kill-server",
+        "tmux kill-session -t qa \\; new-session -d -s agent-new",
+        "tmux kill-session -t =ag",
+        "tmux kill-session -t my-agent-x",
+        "pgrep -a tmux",
     ]
 
     def test_killing_the_host_server_is_denied(self):
