@@ -136,7 +136,10 @@ of-record**, so both halves of the ADR split now hold:
   - `/metrics` (unauthenticated, forwarded to the leader): `turma_archive_hydrate_incomplete`
     (blocked transcripts) and `turma_archive_ingest_gated` (1 while ALL ingest is closed). It must
     stay O(blocked), never O(rows): a per-row stat was ~125 ms a scrape at 10k transcripts, on the
-    single writer (QA D2). The missing-file arm's ids are found by `reconcileHydratedCursors`.
+    single writer (QA D2). The missing-file arm's ids are found by `reconcileHydratedCursors`, and
+    the count is cached `METRICS_CACHE_MS` — O(blocked) is still ~150 ms at 10k blocked.
+  - ANY unblock runs `onLanded`, not only a landing: landed-then-reconcile-threw-then-404 opened
+    a transcript unreconciled.
 - **The raw layer is LAZY (XERK-1043)** — keys under `<x>.jsonl.raw/` are ~83% of the bucket, and
   pulling them into every replica's size-limited `/data` emptyDir evicted each pod mid-hydrate once
   the bucket outgrew it (8.55 GiB vs 8Gi, 2026-09-25). Hydrate records them as REMOTE-PENDING
@@ -327,7 +330,8 @@ of-record**, so both halves of the ADR split now hold:
   selection, and the FULL put/get/stat/list/del round-trip over a local http fake-S3 (asserting every
   request is SigV4-signed).
 - `archive-mirror.test.js`: XERK-1050's per-transcript gate — `a late landing re-derives the cursor
-  BEFORE it unblocks` pins QA D1. `keyFor`/`pathFor` escape rejection, note→drain push, the leader gate
+  BEFORE it unblocks` pins QA D1. `archive-landed-wiring.test.js` pins server.js's `onLanded` wiring
+  (a no-op there passed every unit and lost a chunk live) and the `/metrics` cache. `keyFor`/`pathFor` escape rejection, note→drain push, the leader gate
   (non-leader drains nothing, keeps the queue), transient-fail re-queue vs ENOENT-drop, hydrate
   pull+skip-same-size+reindex, and the REAL archive.js integration — the sink fires for the rendered
   `.jsonl`, its `.meta` and the raw file, and those bytes hydrate into a FRESH replica dir whose

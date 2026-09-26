@@ -385,9 +385,10 @@ function renderedBlocked(row) {
   if (!filesMissing(row)) return false;
   if (!missingFiled.has(row.transcriptId)) {
     missingFiled.set(row.transcriptId, jsonl);
-    console.error(`archive: ${row.transcriptId} records ${row.archiveBytes || 0} bytes at ` +
-      `${row.filePath} but its file is not on disk or in the bucket; its ingest stays ` +
-      `closed until it is restored (XERK-1050)`);
+    console.error(`archive: ${row.transcriptId}'s index records bytes (archiveBytes ` +
+      `${row.archiveBytes || 0}, bytesStored ${row.bytesStored || 0}) that its ` +
+      `${row.filePath} .jsonl/.meta are missing from disk and the bucket; its ingest ` +
+      `stays closed until they are restored (XERK-1050)`);
   }
   return true;
 }

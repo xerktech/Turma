@@ -802,6 +802,23 @@ test("a late landing re-derives the cursor BEFORE it unblocks (XERK-1050 QA D1)"
   archive.closeDb();
 });
 
+test("a key that 404s after a failed reconcile still reconciles before it opens (XERK-1050)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.map.set("repo/t.jsonl", Buffer.from("t\n"));
+  let fail = true, reconciled = 0;
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {},
+    onLanded: () => { if (fail) throw new Error("hydrating"); reconciled++; } });
+  m._blocked.set("repo/t.jsonl", "x");
+  assert.equal(await m.retryBlocked(), 0);   // landed, reconcile threw: still blocked
+  assert.equal(m.blockedCount(), 1);
+  store.map.delete("repo/t.jsonl");          // now it 404s: nothing lands this pass
+  fail = false;
+  await m.retryBlocked();
+  assert.equal(reconciled, 1, "the unblock reconciled, though nothing landed");
+  assert.equal(m.blockedCount(), 0);
+});
+
 test("drain never PUTs a blocked key over the bucket's copy (XERK-1050)", async () => {
   const root = mkdtemp("turma-mir-");
   const f = path.join(root, "a.jsonl");

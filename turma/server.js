@@ -4108,6 +4108,29 @@ function setArchiveMirror(blobStore, ha) {
   });
 }
 
+// The /metrics body (XERK-1050). The blocked count costs a stat per BLOCKED
+// transcript — ~150 ms at 10k blocked, exactly the incident a scraper polls
+// through — so it is computed at most once per METRICS_CACHE_MS, never per
+// request: the route is unauthenticated, and this runs on the single writer.
+const METRICS_CACHE_MS = 15 * 1000;
+let metricsBlocked = { at: -Infinity, n: 0 };
+function metricsText(now = Date.now()) {
+  if (now - metricsBlocked.at >= METRICS_CACHE_MS) {
+    metricsBlocked = { at: now, n: new Set([
+      ...(archiveMirror ? archiveMirror.blockedPaths() : []),
+      ...archive.missingFiledPaths(),
+    ]).size };
+  }
+  return "# HELP turma_archive_hydrate_incomplete Transcripts whose archive ingest is " +
+    "held closed because their rendered bytes are not on this replica's disk.\n" +
+    "# TYPE turma_archive_hydrate_incomplete gauge\n" +
+    `turma_archive_hydrate_incomplete ${metricsBlocked.n}\n` +
+    "# HELP turma_archive_ingest_gated 1 while ALL archive ingest is closed " +
+    "(boot/promotion hydrate, or the bucket cannot be listed).\n" +
+    "# TYPE turma_archive_ingest_gated gauge\n" +
+    `turma_archive_ingest_gated ${archive.isHydrating() ? 1 : 0}\n`;
+}
+
 // Under HA a transcript's raw files may still be in the bucket (XERK-1043): fetch
 // them before a route lists or streams that directory. Answers false when some
 // could not be fetched, so the route says "still syncing" instead of treating a
@@ -15028,20 +15051,8 @@ const server = http.createServer(async (req, res) => {
     // integers, no ids. Under HA a follower forwards this to the leader (above),
     // the one replica that ingests, so it reports the state that matters.
     if (url.pathname === "/metrics" && req.method === "GET") {
-      const blocked = new Set([
-        ...(archiveMirror ? archiveMirror.blockedPaths() : []),
-        ...archive.missingFiledPaths(),
-      ]).size;
       res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4" });
-      return res.end(
-        "# HELP turma_archive_hydrate_incomplete Transcripts whose archive ingest is " +
-        "held closed because their rendered bytes are not on this replica's disk.\n" +
-        "# TYPE turma_archive_hydrate_incomplete gauge\n" +
-        `turma_archive_hydrate_incomplete ${blocked}\n` +
-        "# HELP turma_archive_ingest_gated 1 while ALL archive ingest is closed " +
-        "(boot/promotion hydrate, or the bucket cannot be listed).\n" +
-        "# TYPE turma_archive_ingest_gated gauge\n" +
-        `turma_archive_ingest_gated ${archive.isHydrating() ? 1 : 0}\n`);
+      return res.end(metricsText());
     }
 
     // Branded static assets (stylesheet, UI fonts, icon/favicon set, manifest):
@@ -19175,6 +19186,11 @@ if (process.env.TURMA_TEST) {
     ingestHistory,
     ingestSubagentHistory,
     coerceLiveStatus,
+    // The HA archive mirror's wiring (XERK-1050): its `onLanded` must reconcile a
+    // late-landed file's cursor, and dropping it loses data with no unit failing.
+    setArchiveMirror,
+    getArchiveMirror: () => archiveMirror,
+    metricsText,
     // The create single-flight's backstop, exported so a test can hold the
     // PRODUCTION default rather than the wound-down one the suite runs with —
     // its value relative to the client's give-up is the whole point (XERK-241).

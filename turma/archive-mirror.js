@@ -341,7 +341,9 @@ class ArchiveMirror {
     })();
     this._retrying = run;
     try { await run; } finally { this._retrying = null; }
-    if (landed) {
+    // Any unblock reconciles, not only a landing: a key that landed on a pass
+    // whose reconcile threw, then 404'd, would otherwise open unreconciled.
+    if (done.length) {
       try { this.onLanded(); } catch (e) {
         // Not reconciled, so not safe to open: they stay blocked for the next pass.
         this.log(`archive hydrate: post-retry reconcile failed (${e && e.message})`);
