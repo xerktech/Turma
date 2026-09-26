@@ -386,8 +386,8 @@ function renderedBlocked(row) {
   if (!missingFiled.has(row.transcriptId)) {
     missingFiled.set(row.transcriptId, jsonl);
     console.error(`archive: ${row.transcriptId}'s index records bytes (archiveBytes ` +
-      `${row.archiveBytes || 0}, bytesStored ${row.bytesStored || 0}) that its ` +
-      `${row.filePath} .jsonl/.meta are missing from disk and the bucket; its ingest ` +
+      `${row.archiveBytes || 0}, bytesStored ${row.bytesStored || 0}) but ` +
+      `${row.filePath} (or its .meta) is missing from disk and the bucket; its ingest ` +
       `stays closed until they are restored (XERK-1050)`);
   }
   return true;
