@@ -898,6 +898,196 @@ def _destructive_agent_service(tokens: list[str]) -> str | None:
             "session on this host, including yours. Ask the operator."
         )
     return None
+# tmux global options that take a value (`tmux [-2CDlNuVv] [-c cmd] [-f file]
+# [-L name] [-S path] [-T features] command ...`). Short flags cluster, so
+# `-uL qa` names a server just as `-u -L qa` does.
+_TMUX_VALUE_FLAGS = "cfLST"
+
+# The tmux commands that destroy a session, or its only window/pane. tmux takes
+# any unique prefix of a command name, hence prefixes rather than full names.
+_TMUX_KILL_TARGET = (
+    "kill-ses", "kill-win", "kill-pan", "killw", "killp",
+    "respawn-p", "respawn-w", "respawnp", "respawnw", "unlink-w", "unlinkw",
+)
+
+_TMUX_HOST_REASON = (
+    "every Turma session on this host, including yours, runs in the host's "
+    "default tmux server, and your shell's `$TMUX` points at it (it overrides "
+    "TMUX_TMPDIR). Use a private server for tests: `tmux -L <name> ...`."
+)
+
+
+def _tmux_server(tokens: list[str]) -> tuple[str | None, int]:
+    """The server a tmux call names with -L/-S (None = the default one), and the
+    index of its command word."""
+    server = None
+    i = 1
+    while i < len(tokens) and tokens[i].startswith("-") and len(tokens[i]) > 1:
+        tok = tokens[i]
+        i += 1
+        if tok == "--":
+            break
+        for k, flag in enumerate(tok[1:], start=1):
+            if flag in _TMUX_VALUE_FLAGS:
+                value = tok[k + 1:]
+                if not value and i < len(tokens):
+                    value = tokens[i]
+                    i += 1
+                if flag == "L":
+                    server = value
+                elif flag == "S":
+                    server = re.split(r"[\\/]", value)[-1]
+                break
+    # `-L default` / `-S .../default` IS the host's server by another name, and a
+    # value the guard cannot see (`-S "${TMUX%%,*}"`) may be it too.
+    if server is not None and ("$" in server or "`" in server or _OPAQUE_SUBST in server):
+        server = None
+    return (None if server in ("default", "") else server), i
+
+
+def _tmux_target_is_agent(target: str | None) -> bool:
+    """Could this -t target resolve to an `agent-<id>` session?
+
+    tmux resolves a target as an exact name, then a unique PREFIX, then a
+    glob, so `ag`, `agent*` and `*` all reach `agent-abcde`. Only `=name` is
+    exact. No target, or one the guard cannot see (a variable, a loop value),
+    means the current or most recent session — possibly another agent's.
+    """
+    if not target or "$" in target or target == _OPAQUE_SUBST:
+        return True
+    # A pane/window id (`%3`, `@2`) or special token (`{last}`, `!`, `~`) can be
+    # any session's — `list-panes -a` then a kill by id is ordinary tmux use.
+    if target[0] in "%@{!~+-":
+        return True
+    if target.startswith("="):
+        return target[1:].startswith("agent-")
+    name = target.split(":")[0].split(".")[0]
+    if not name or any(c in name for c in "*?["):
+        return True
+    return name.startswith("agent-") or "agent-".startswith(name)
+
+
+def _destructive_agent_tmux(tokens: list[str]) -> str | None:
+    """Refuse taking down the tmux server, or a session, other sessions run in.
+
+    Sessions run as panes of ONE tmux server on its default socket, and every
+    session's shell inherits `$TMUX` pointing at it — tmux prefers that over
+    `TMUX_TMPDIR`, so exporting a private `TMUX_TMPDIR` first does not help
+    (XERK-1077: a QA subagent's `tmux kill-server` killed every session on a
+    host). A call naming a non-default server with `-L`/`-S` is left alone.
+    """
+    prog = _basename(tokens[0])
+    # `pkill -f "tmux: server"` is how `ps` names the server, so match the word
+    # inside an argument, not just a whole `tmux` token.
+    if prog in ("pkill", "killall") and any(
+        re.search(r"(^|[^a-z0-9])tmux([^a-z0-9]|$)", re.sub(r"[\[\]^$\\]", "", t.lower()))
+        for t in tokens[1:]
+    ):
+        return "refusing to kill tmux processes — " + _TMUX_HOST_REASON
+    if prog != "tmux":
+        return None
+    server, i = _tmux_server(tokens)
+    if server is not None:
+        return None
+    # An expansion as the server (`-S "${TMUX%%,*}"`) can also split into extra
+    # words and shift where the command starts, so scan every word for it.
+    if any("$" in t or t == _OPAQUE_SUBST for t in tokens[1:i]) and any(
+        t.startswith("kill-ser") for t in tokens[i:]
+    ):
+        return "refusing `tmux kill-server` — " + _TMUX_HOST_REASON
+    # Split tmux's own `;`-chained commands so each is judged on its own words.
+    commands: list[list[str]] = [[]]
+    for tok in tokens[i:]:
+        if tok.endswith(";"):
+            if tok[:-1]:
+                commands[-1].append(tok[:-1])
+            commands.append([])
+        else:
+            commands[-1].append(tok)
+    for cmd in commands:
+        if not cmd:
+            continue
+        word, args = cmd[0], cmd[1:]
+        if word.startswith("kill-ser"):
+            return "refusing `tmux kill-server` — " + _TMUX_HOST_REASON
+        # `source-file -` runs tmux commands read from stdin, which the guard
+        # cannot see (`echo kill-server | tmux source -`).
+        # Any unique abbreviation of source-file (`so`, `sour`), but not a pane's
+        # shell command that merely starts with "so" (`socat -`, `sort -`).
+        if len(word) >= 2 and ("source-file".startswith(word) or word == "source") \
+                and any(a in ("-", "/dev/stdin") for a in args):
+            return "refusing `tmux source-file -` (commands from stdin) — " + _TMUX_HOST_REASON
+        # run-shell, if-shell, new-session/-window, split-window, respawn-* and
+        # popups all run a shell command: classify that command on its own terms.
+        for a in args:
+            if " " in a and is_destructive(a):
+                return "refusing a shell command run by tmux — " + (is_destructive(a) or "")
+        # Many commands take a TMUX command as an argument — if-shell,
+        # `run-shell -C`, key bindings, menus, prompts, and hooks, which are
+        # options any `set`/`set-h`/`set-option` spelling writes (`set -g
+        # session-created kill-server` fires on the agent's next spawn). A list
+        # of those names kept missing spellings, so classify EVERY argument as
+        # a tmux command, except where the argument is typed text or a name.
+        if not word.startswith(("send", "rename", "display-m", "display", "switch")) \
+                or word.startswith("display-menu"):
+            for a in args:
+                if a.startswith("-"):
+                    continue
+                # tmux's command parser splits a command STRING on `;` even
+                # mid-word (`'ls;kill-server'`), unlike argv where only a
+                # trailing `;` separates — so split before judging each part.
+                for part in a.split(";"):
+                    try:
+                        inner = shlex.split(part)
+                    except ValueError:
+                        # tmux closes an unterminated quote at end of string.
+                        inner = part.replace("'", " ").replace('"', " ").split()
+                    reason = inner and _destructive_agent_tmux(["tmux", *inner])
+                    if reason:
+                        return reason
+        if word.startswith(_TMUX_KILL_TARGET):
+            target = None
+            all_others = False
+            k = 0
+            while k < len(args):
+                a = args[k]
+                if a.startswith("-") and len(a) > 1 and not a.startswith("--"):
+                    if "a" in a[1:a.find("t") if "t" in a else None]:
+                        all_others = True
+                    if "t" in a:
+                        rest = a[a.index("t") + 1:]
+                        if rest:
+                            target = rest
+                        elif k + 1 < len(args):
+                            target = args[k + 1]
+                            k += 1
+                        else:
+                            target = ""
+                k += 1
+            if all_others or _tmux_target_is_agent(target):
+                return (
+                    "refusing to kill a tmux session/window that may be another "
+                    "Turma session's agent (`agent-*`, a prefix or glob of it, "
+                    "`-a`, or no/unknown target) — " + _TMUX_HOST_REASON
+                )
+    return None
+
+
+def _destructive_tmux_pid_kill(command: str) -> str | None:
+    """`kill $(pgrep tmux)` / `pgrep tmux | xargs kill` — `pkill tmux` by PID.
+
+    `kill` counts anywhere as a word: wrappers, loops, xargs values and
+    newlines all put it somewhere other than a command's first position, and a
+    tighter rule reopened those. `pgrep tmux; echo kill` is denied too — the
+    accepted, fail-safe cost.
+    """
+    if re.search(
+        r"\b(pgrep|pidof|grep)\b[^;&\n]*\btmux\b", re.sub(r"[\[\]]", "", command)
+    ) and re.search(r"(^|[\s;&|(`/'\"\\])kill([\s;&|)`'\"<>]|$)", command):
+        return "refusing to kill tmux by PID — " + _TMUX_HOST_REASON
+    return None
+
+
 _PS_POWER = {"stop-computer", "restart-computer", "clear-disk", "format-volume"}
 
 
@@ -1394,6 +1584,9 @@ def is_destructive(command: str) -> str | None:
     reason = _destructive_forkbomb(command)
     if reason:
         return reason
+    reason = _destructive_tmux_pid_kill(command)
+    if reason:
+        return reason
     reason = _destructive_database(command)
     if reason:
         return reason
@@ -1423,6 +1616,7 @@ def is_destructive(command: str) -> str | None:
         # suffix-derived candidate too: it needs no dangerous path, but it names
         # specific units, so a container called `reboot` cannot trip it.
         checks.append(_destructive_agent_service(tokens))
+        checks.append(_destructive_agent_tmux(tokens))
         for reason in checks:
             if reason:
                 return reason

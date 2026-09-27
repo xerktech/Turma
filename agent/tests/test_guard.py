@@ -1100,6 +1100,137 @@ class TestAgentServiceProtection(unittest.TestCase):
                 self.assertIsNone(guard.is_destructive(cmd))
 
 
+class TestAgentTmuxProtection(unittest.TestCase):
+    """A session must not kill the tmux server every session runs in (XERK-1077).
+
+    Sessions are panes of one tmux server on the default socket and inherit
+    `$TMUX`, which tmux prefers over `TMUX_TMPDIR` — so a QA subagent's
+    `export TMUX_TMPDIR=...; tmux kill-server` killed all five sessions on a host.
+    """
+
+    DOWN = [
+        "tmux kill-server",
+        "export TMUX_TMPDIR=/tmp/qd; tmux kill-server; unset TMUX TMUX_PANE",
+        "TMUX_TMPDIR=/tmp/x tmux kill-server",
+        "env -u TMUX tmux kill-server",
+        "tmux -f /dev/null kill-ser",
+        "tmux new -d -s x \\; kill-server",
+        "tmux kill-session -a",
+        "tmux kill-session -t agent-56d5d",
+        "tmux kill-session -t =agent-56d5d",
+        "tmux kill-session -tagent-56d5d",
+        "command tmux kill-server",
+        "echo x | xargs -r tmux kill-server",
+        'pkill -f "tmux: server"',
+        # `-L`/`-S` naming the DEFAULT socket is the host's server by another name.
+        "tmux -L default kill-server",
+        "tmux -S /tmp/tmux-1000/default kill-server",
+        # No/unknown target is the current or most recent session; tmux also
+        # resolves a target by unique prefix and glob, so these reach agent-*.
+        "tmux kill-session",
+        'tmux kill-session -t "$SESSION"',
+        "tmux ls -F '#S' | xargs -n1 tmux kill-session -t",
+        "tmux kill-session -at qa",
+        "tmux kill-session -t ag",
+        "tmux kill-session -t 'agent*'",
+        "tmux kill-window -t agent-x:0",
+        "tmux kill-pane -t agent-x",
+        'tmux run-shell "tmux kill-server"',
+        "kill $(pgrep tmux)",
+        "pgrep tmux | xargs kill",
+        # Pane/window ids, an expanded socket, shell commands tmux runs, PID
+        # pipelines and pkill regexes (QA pass 3).
+        "tmux kill-pane -t %3",
+        "tmux kill-window -t @2",
+        'tmux -S "${TMUX%%,*}" kill-server',
+        "tmux new-session -d 'tmux kill-server'",
+        "tmux run-shell 'tmux kill-window -t agent-x'",
+        "tmux respawn-pane -k -t agent-x",
+        "xargs -I% tmux kill-session -t %",
+        "/bin/kill $(pgrep tmux)",
+        "ps aux | grep tmux | awk '{print $2}' | xargs kill",
+        "pkill -f '[t]mux'",
+        # QA pass 4: kill away from a command's first word, tmux-command args.
+        "sudo kill $(pgrep tmux)",
+        "timeout 5 kill $(pgrep tmux)",
+        "for p in $(pgrep tmux); do kill $p; done",
+        "pgrep tmux | while read p; do kill \"$p\"; done",
+        "P=$(pgrep tmux)\nkill $P",
+        "pgrep tmux | xargs -n 1 kill",
+        "tmux if-shell true 'kill-server'",
+        "tmux if -F 1 kill-server",
+        "tmux run-shell -C 'kill-session -t agent-aaa'",
+        "tmux kill-window -t +",
+        "pkill -f 'tmux.*agent-'",
+        "pkill -f '(tmux|ttyd)'",
+        'tmux new -d "kill $(pgrep tmux)"',
+        # QA pass 5: kill followed by punctuation, tmux hooks/bindings.
+        "pgrep tmux | xargs kill; echo done",
+        "echo $(pgrep tmux | xargs kill)",
+        "\\kill $(pgrep tmux)",
+        "pgrep -f 'tmu[x]' | xargs kill",
+        "tmux set-hook -g session-created kill-server \\; new-session -d -s trig",
+        "tmux set-hook -g session-created 'kill-session -t agent-aaa'",
+        "tmux bind-key -n F1 kill-server",
+        # QA pass 6: hooks via option commands and abbreviations, `kill>`.
+        "tmux set-h -g session-created kill-server",
+        "tmux set -g session-created kill-server",
+        "tmux set-option -g 'session-created[0]' kill-server",
+        "tmux display-menu -T x kill kill-server",
+        "pgrep tmux | xargs kill>/dev/null",
+        # QA pass 7: tmux splits a command STRING on a mid-word `;`; stdin config.
+        "tmux if-shell true 'ls;kill-server'",
+        "tmux run -C 'ls;kill-server'",
+        "tmux set -g session-created 'display x;kill-server'",
+        "tmux set-hook -g session-created 'send x;kill-session -t agent-zz'",
+        "echo kill-server | tmux source-file -",
+        "echo kill-server | tmux so -",
+        "echo kill-server | tmux source-file /dev/stdin",
+        "tmux if true \"'kill-server\"",
+        'tmux set -g session-created "\\"kill-server"',
+        "bash -c 'tmux kill-server'",
+        "pkill tmux",
+        "killall -9 tmux",
+    ]
+
+    # A private server, and killing your own scratch sessions, stay allowed.
+    OK = [
+        "tmux -L qa kill-server",
+        "tmux -Lqa kill-server",
+        "tmux -S /tmp/qa.sock kill-server",
+        "env -u TMUX tmux -L qa kill-server",
+        "tmux kill-session -t scratch",
+        "tmux ls",
+        "tmux capture-pane -p -t =agent-56d5d:",
+        "pkill -f my-daemon",
+        "pkill -f my-tmuxish-helper",
+        "tmux -uL qa kill-server",
+        "tmux -Lqa kill-session -a",
+        "tmux send-keys -t qa kill-server",
+        "tmux kill-session -t qa \\; new-session -d -s agent-new",
+        "tmux kill-session -t =ag",
+        "tmux kill-session -t my-agent-x",
+        "pgrep -a tmux",
+        "ps aux | grep tmux",
+        "tmux -L qa kill-pane -t %3",
+        "tmux new-session -d -s qa 'sleep 100'",
+        "tmux kill-pane -t qa:0.1",
+        "pkill -f tmuxinator",
+        "tmux new-session -d -s relay 'socat - TCP:localhost:8080'",
+        "tmux new -d \"sort - > /tmp/out\"",
+    ]
+
+    def test_killing_the_host_server_is_denied(self):
+        for cmd in self.DOWN:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_private_servers_and_reads_stay_allowed(self):
+        for cmd in self.OK:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
+
 class TestDecide(unittest.TestCase):
     def test_allows_non_bash(self):
         self.assertEqual(
