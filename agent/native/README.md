@@ -326,8 +326,16 @@ qwen Python files.
   The installer never clobbers an existing conf at either path — it warns when
   the one in effect lacks the clipboard settings; merge the missing lines from
   `$PREFIX/tmux.conf`, or colors flatten and every copy made in the terminal is
-  silently dropped. The agent's sessions also share the user's own tmux server
-  on a native host, so a personal tmux config applies to them.
+  silently dropped. The agent's sessions run on their OWN tmux server
+  (`tmux -L turma`), started with the bundled config, so a personal tmux config
+  does not apply to them, and a session's bare `tmux` reaches the default server
+  instead (the safety guard also refuses destructive commands aimed at
+  `-L turma`). Inspect one with `tmux -L turma ls` /
+  `tmux -L turma attach -t agent-<id>`.
+- **Downgrading past XERK-1078 needs a drain** — an older agent only looks at the
+  default tmux server, so it reads `-L turma` sessions as dead and resumes them
+  a second time beside the still-running originals. Stop every session first
+  (then `tmux -L turma kill-server`), or don't roll back across it.
 - **Manual `stop` leaves sessions running** — as with "kill keeps the worktree",
   stopping the service orphans the tmux/ttyd (a later `start` re-adopts).
   `--uninstall` prints how to sweep them.

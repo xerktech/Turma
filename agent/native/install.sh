@@ -540,7 +540,9 @@ do_uninstall() {
   rm -rf "$PREFIX"
   info "removed $PREFIX. Preserved: config ($CFG_DIR), ~/.turma, ~/.claude, /etc/tmux.conf."
   warn "already-running sessions are NOT stopped (tmux/ttyd outlive the manager)."
-  warn "  sweep them with:  tmux ls | sed 's/:.*//' | grep '^agent-' | xargs -r -n1 tmux kill-session -t"
+  warn "  sweep them with:  tmux -L turma kill-server"
+  warn "  (sessions an agent older than XERK-1078 started are on the default server:"
+  warn "   tmux ls | sed 's/:.*//' | grep '^agent-' | xargs -r -n1 tmux kill-session -t)"
   info "remove config manually if desired:  rm -rf $CFG_DIR"
   # The dsh CLI was installed into ~/.local (outside the prefix) by --with-dsh;
   # flag it rather than silently leaving a ~150 MB npm tree behind.

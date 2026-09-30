@@ -1127,6 +1127,16 @@ class TestAgentTmuxProtection(unittest.TestCase):
         # `-L`/`-S` naming the DEFAULT socket is the host's server by another name.
         "tmux -L default kill-server",
         "tmux -S /tmp/tmux-1000/default kill-server",
+        # The agent's own server, where sessions run (XERK-1078).
+        "tmux -L turma kill-server",
+        "tmux -uL turma kill-server",
+        "tmux -S /tmp/tmux-1000/turma kill-server",
+        "tmux -L turma kill-session -t agent-abcde",
+        # tmux joins -L onto its socket dir: path spellings name the same socket.
+        "tmux -L ./turma kill-server",
+        "tmux -L turma/ kill-server",
+        "tmux -L ./default kill-server",
+        "tmux -L ../tmux-0/turma kill-server",
         # No/unknown target is the current or most recent session; tmux also
         # resolves a target by unique prefix and glob, so these reach agent-*.
         "tmux kill-session",

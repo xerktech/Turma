@@ -25,6 +25,34 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   its own project slug + Remote Control bridge pointer. `MAX_SESSIONS` caps concurrency; boot staggers
   launches.
 - Agents connect outbound-only to `TURMA_URL` (Cloudflare tunnel) — works from any network.
+- **Session tmux is the agent's OWN server, `tmux -L turma`** (`TMUX_SOCKET`, XERK-1078), never the
+  host's default, and every pane command starts `unset TMUX TMUX_PANE;` (`_TMUX_ENV_STRIP`).
+  - Why: a session's own bare `tmux kill-server` (a QA scratch server) reached the shared default
+    server and killed every session on the host (XERK-1077); a guard pattern net can't be complete.
+  - Every agent tmux call goes through `_tmux(..., name=)` / `_kill_tmux_session` /
+    `_tmux_servers()`. A bare `["tmux", …]` addresses the DEFAULT server — the session's, not ours.
+  - The socket name is mirrored in `tunnel-agent.js` (`TMUX_SOCKET`) and `hooks/guard.py`
+    (`_AGENT_TMUX_SOCKET`, which keeps protecting it); change all three together.
+  - **Legacy sessions**: tmux can't move a session between servers, and an in-place update adopts
+    live sessions, so `_probe_legacy_tmux` (boot, before `resume_on_boot`) records registry names
+    still on the default server. They are addressed there BY NAME until killed/relaunched, which
+    lands them on `-L turma`; the set only shrinks. It is published to `~/.turma/tmux-legacy` so the
+    tunnel reads the default server ONLY for a listed name — a blind fallback would read a
+    session's own `agent-<id>`-named tmux there.
+  - A ttyd runs `tmux attach` per browser connection, so it keeps reaching the server it was
+    started for: `_launch_ttyd` records `ttydTmuxSocket` and relaunches a ttyd whose socket differs
+    from the session's (absent = default, i.e. a pre-XERK-1078 ttyd).
+  - The agent server runs `exit-empty off`, so an EMPTY server fails `list-panes -a` with
+    `no current target`; `_tmux_list_panes` reads that as "no sessions" for BOTH the dead-session
+    sweep and the memory guard, or one session exiting blinds them host-wide until it is reaped.
+    The guard counts ONLY that connected message as empty: `no server running` is also what a LIVE
+    server with a deleted socket says, and reading it as empty leaves its agents killable. The sweep drops legacy names the default server no
+    longer holds, and matches an agent pane only among its OWN server's panes (ids are per server).
+  - **A downgrade past this change is NOT safe without a drain**: an older agent reads `-L turma`
+    sessions as dead and `--resume`s them a second time beside the live originals (README says so).
+  - Tests: `TestAgentTmuxSocket`, `test_launch_ttyd_relaunches_a_ttyd_attached_to_the_other_server`,
+    `test_a_dead_legacy_session_is_reaped_and_forgotten`, `test_pane_ids_are_matched_on_the_sessions_own_server`,
+    `captureLiveTurn reads the default server only for a published legacy session`.
 - **`_worktree_add` checks out with `GIT_LFS_SKIP_SMUDGE=1`** (XERK-972). An LFS repo runs the
   `git-lfs smudge` filter PER FILE at checkout (a subprocess, possibly a network fetch, each), so
   `git worktree add` takes tens of seconds to minutes (measured ~65s on a real repo, 0s with smudge

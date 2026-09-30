@@ -2135,7 +2135,7 @@ class TestPaneBusy(unittest.TestCase):
 
     def _capture(self, stdout="", returncode=0, raises=None):
         def fake_run(cmd, *a, **kw):
-            self.assertEqual(cmd[:2], ["tmux", "capture-pane"])
+            self.assertEqual(cmd[:4], ["tmux", "-L", "turma", "capture-pane"])
             self.assertIn("=agent-x:", cmd)  # exact pane target (XERK-1042)
             if raises:
                 raise raises
@@ -2376,8 +2376,9 @@ class TestLoadTmuxConfig(unittest.TestCase):
             ha.load_tmux_config()
         # `-f <conf> start-server` starts the server WITH the config (cold boot);
         # `source-file` applies it to an already-running server (warm/adopted).
-        self.assertEqual(calls[0], ["tmux", "-f", ha._TMUX_CONF, "start-server"])
-        self.assertEqual(calls[1], ["tmux", "source-file", ha._TMUX_CONF])
+        # Both on the agent's own server (XERK-1078), never the host's default.
+        self.assertEqual(calls[0], ["tmux", "-L", "turma", "-f", ha._TMUX_CONF, "start-server"])
+        self.assertEqual(calls[1], ["tmux", "-L", "turma", "source-file", ha._TMUX_CONF])
 
     def test_skips_and_runs_no_tmux_when_the_conf_is_absent(self):
         calls = []
@@ -2477,9 +2478,9 @@ class TestDshWeb(unittest.TestCase):
              mock.patch.object(ha, "DSH_BIN", "dsh"):
             self.assertTrue(sm._launch_dsh_web("/tmp/patch.yml"))
         # Clean-slate kill first, then a detached new-session running dsh web.
-        self.assertEqual(calls["run"][0][:2], ["tmux", "kill-session"])
+        self.assertEqual(calls["run"][0][:4], ["tmux", "-L", "turma", "kill-session"])
         new = calls["run_ok"][0]
-        self.assertEqual(new[:3], ["tmux", "new-session", "-d"])
+        self.assertEqual(new[:5], ["tmux", "-L", "turma", "new-session", "-d"])
         cmd = new[-1]
         self.assertIn("--profile web", cmd)
         self.assertIn("--patch /tmp/patch.yml", cmd)   # reads the plaintext stores
@@ -4858,7 +4859,7 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
     def _last_tmux_cmd(self):
         # The `tmux new-session ... <cmd>` the launcher built (fake run_ok logs it).
         for cmd in reversed(self.run_ok_calls):
-            if cmd[:2] == ["tmux", "new-session"]:
+            if cmd[:4] == ["tmux", "-L", "turma", "new-session"]:
                 return cmd[-1]
         return ""
 
@@ -6909,8 +6910,8 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
              mock.patch.object(ha, "_answer_trust_dialog", return_value=True):
             sm._run_limits_probe(os.path.join(self.tmp, "limits-settings.json"))
         kills = [i for i, c in enumerate(self.run_calls)
-                 if c == ["tmux", "kill-session", "-t", "=" + ha.LIMITS_TMUX]]
-        launch = [c for c in self.run_ok_calls if c[:2] == ["tmux", "new-session"]]
+                 if c == ["tmux", "-L", "turma", "kill-session", "-t", "=" + ha.LIMITS_TMUX]]
+        launch = [c for c in self.run_ok_calls if c[:4] == ["tmux", "-L", "turma", "new-session"]]
         self.assertEqual(len(launch), 1)
         self.assertEqual(len(kills), 2, "expected a clean-slate kill AND a teardown")
 
@@ -6923,11 +6924,11 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
              mock.patch.object(sm, "_announce_updating"):
             with self.assertRaises(SystemExit):
                 sm._handle_shutdown(15, None)
-        self.assertIn(["tmux", "kill-session", "-t", "=" + ha.LIMITS_TMUX], self.run_calls)
+        self.assertIn(["tmux", "-L", "turma", "kill-session", "-t", "=" + ha.LIMITS_TMUX], self.run_calls)
         self.run_calls.clear()
         sm.registry = []
         sm.resume_on_boot()
-        self.assertIn(["tmux", "kill-session", "-t", "=" + ha.LIMITS_TMUX], self.run_calls)
+        self.assertIn(["tmux", "-L", "turma", "kill-session", "-t", "=" + ha.LIMITS_TMUX], self.run_calls)
 
     def test_single_flight_while_a_probe_is_running(self):
         started = threading.Event()
@@ -6959,9 +6960,9 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # OS-general helper the ConPTY path uses — never a blind send-keys Enter,
         # which current Claude Code would read as "No, exit" and use to EXIT.
         self.assertEqual(trust, [ha.LIMITS_TMUX])
-        self.assertNotIn(["tmux", "send-keys", "-t", ha.LIMITS_TMUX, "Enter"],
+        self.assertNotIn(["tmux", "-L", "turma", "send-keys", "-t", ha.LIMITS_TMUX, "Enter"],
                          self.run_calls)
-        launch = [c for c in self.run_ok_calls if c[:2] == ["tmux", "new-session"]]
+        launch = [c for c in self.run_ok_calls if c[:4] == ["tmux", "-L", "turma", "new-session"]]
         self.assertEqual(len(launch), 1)
         cmd = launch[0][-1]
         # Not a registered session: its own tmux name, so no pane parser, no
@@ -6986,7 +6987,7 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # usage page (_is_internal_tool_slug tombstones that slug).
         self.assertIn(ha.REGISTRY_DIR, launch[0])
         # And it always tears its tmux down, even when nothing was captured.
-        self.assertIn(["tmux", "kill-session", "-t", "=" + ha.LIMITS_TMUX], self.run_calls)
+        self.assertIn(["tmux", "-L", "turma", "kill-session", "-t", "=" + ha.LIMITS_TMUX], self.run_calls)
 
     def test_the_probes_transcript_is_internal_overhead_not_a_repo(self):
         # It runs where the summary/models helpers run, so the same tombstone
@@ -7066,7 +7067,7 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # It ran a pty-host, not a tmux session.
         self.assertEqual(captured["tmux_name"], ha.LIMITS_TMUX)
         self.assertEqual([c for c in self.run_ok_calls
-                          if c[:2] == ["tmux", "new-session"]], [])
+                          if c[:4] == ["tmux", "-L", "turma", "new-session"]], [])
         cmd = captured["cmd"]
         self.assertEqual(cmd[0], ha.PTY_NODE_EXE)
         self.assertEqual(cmd[1], ha.PTY_HOST_MJS)
@@ -7113,7 +7114,7 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
             sm._kill_limits_probe()
         teardown.assert_called_once_with(ha.LIMITS_TMUX)
         # No tmux kill-session shelled on Windows.
-        self.assertNotIn(["tmux", "kill-session", "-t", "=" + ha.LIMITS_TMUX],
+        self.assertNotIn(["tmux", "-L", "turma", "kill-session", "-t", "=" + ha.LIMITS_TMUX],
                          self.run_calls)
 
 
@@ -10234,12 +10235,49 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
         sess = self._running_sess()
         sess["ttydPid"] = 5150
         sess["ttydTokenFp"] = ha._token_fp(ha.TURMA_TOKEN)
+        sess["ttydTmuxSocket"] = ha.TMUX_SOCKET
         with mock.patch.object(ha, "_pid_alive", return_value=True), \
              mock.patch.object(ha, "_port_open", return_value=True), \
              mock.patch.object(ha.subprocess, "Popen") as popen:
             sm._launch_ttyd(sess)
         popen.assert_not_called()
         self.assertNotIn(sess["id"], sm.ttyd)
+
+    def test_launch_ttyd_adopts_a_legacy_sessions_default_server_ttyd(self):
+        # XERK-1078: a session an older agent left on the DEFAULT tmux server
+        # keeps its ttyd, whose `tmux attach` (no socket recorded) reaches it.
+        sm = self.make_manager()
+        sess = self._running_sess()
+        sess["ttydPid"] = 5150
+        sess["ttydTokenFp"] = ha._token_fp(ha.TURMA_TOKEN)
+        with mock.patch.object(ha, "_legacy_tmux", {sess["tmuxName"]}), \
+             mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_port_open", return_value=True), \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm._launch_ttyd(sess)
+        popen.assert_not_called()
+
+    def test_launch_ttyd_relaunches_a_ttyd_attached_to_the_other_server(self):
+        # XERK-1078: ttyd runs `tmux attach` per browser connection, so one an
+        # older agent started (no socket recorded: the default server) would keep
+        # attaching there after the session moved to the agent's socket.
+        sm = self.make_manager()
+        sess = self._running_sess()
+        sess["ttydPid"] = 5150
+        sess["ttydTokenFp"] = ha._token_fp(ha.TURMA_TOKEN)
+        ports = iter([True, False])  # open at the adopt check, freed after kill
+        with mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_port_open",
+                               side_effect=lambda *a, **k: next(ports, False)), \
+             mock.patch.object(ha, "time"), \
+             mock.patch.object(sm, "_kill_ttyd") as kill, \
+             mock.patch.object(ha.subprocess, "Popen",
+                               return_value=mock.Mock(pid=9999)) as popen:
+            sm._launch_ttyd(sess)
+        kill.assert_called_once_with(sess["id"])
+        args = popen.call_args[0][0]
+        self.assertEqual(args[args.index("tmux"):][:4], ["tmux", "-L", "turma", "attach"])
+        self.assertEqual(sess["ttydTmuxSocket"], "turma")
 
     def test_launch_ttyd_does_not_adopt_a_reused_open_port(self):
         # Fresh spawn onto a port that happens to be open (just freed by a killed
@@ -10896,6 +10934,9 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         settings = os.path.join(ha.REGISTRY_DIR, "guard-settings.json")
         self.assertEqual(
             self._claude_cmd(),
+            # $TMUX/$TMUX_PANE unset first, so the session's own `tmux` never
+            # addresses the agent's server (XERK-1078).
+            "unset TMUX TMUX_PANE; "
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
             f"TURMA_QUESTIONS_DIR={shlex.quote(ha.QUESTIONS_DIR)} "
             f"claude --session-id {sess['claudeSessionId']} "
@@ -10998,7 +11039,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm = self.make_spawn_ready_manager([repo])
 
         # Make the base ref resolve (branch_exists -> run rev-parse --verify).
-        def fake_run(cmd, cwd=None):
+        def fake_run(cmd, cwd=None, **_kw):
             self.run_calls.append(cmd)
             return "sha" if " ".join(cmd).endswith("--verify --quiet develop") else ""
 
@@ -11626,14 +11667,14 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         sess = self._running_session(sm)
         sm.send_input(sess["id"], "hello")
         self.assertEqual(self.run_stdin_calls, [
-            (["tmux", "load-buffer", "-b", "turma-input-agent-abcde", "-"], "hello"),
+            (["tmux", "-L", "turma", "load-buffer", "-b", "turma-input-agent-abcde", "-"], "hello"),
         ])
         self.assertEqual(self.run_ok_calls, [
-            ["tmux", "paste-buffer", "-d", "-b", "turma-input-agent-abcde",
+            ["tmux", "-L", "turma", "paste-buffer", "-d", "-b", "turma-input-agent-abcde",
              "-t", "=agent-abcde:"],
         ])
         self.assertEqual(self.run_calls, [
-            ["tmux", "send-keys", "-t", "=agent-abcde:", "Enter"],
+            ["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "Enter"],
         ])
 
     def test_only_multi_line_input_is_bracketed(self):
@@ -11660,7 +11701,7 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
 
         # The buffer (XERK-227's argv limit) is used either way — only the
         # markers are conditional.
-        self.assertTrue(all(c[0][:2] == ["tmux", "load-buffer"]
+        self.assertTrue(all(c[0][:4] == ["tmux", "-L", "turma", "load-buffer"]
                             for c in self.run_stdin_calls))
 
     def test_a_long_message_is_pasted_whole(self):
@@ -11702,8 +11743,8 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         self.run_stdin_ok = False
         sm.send_input(sess["id"], "line1\nline2")
         self.assertEqual(self.run_calls, [
-            ["tmux", "send-keys", "-t", "=agent-abcde:", "-l", "--", "line1 line2"],
-            ["tmux", "send-keys", "-t", "=agent-abcde:", "Enter"],
+            ["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "-l", "--", "line1 line2"],
+            ["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "Enter"],
         ])
 
     def test_fallback_chunks_a_long_message_instead_of_clipping_it(self):
@@ -11720,7 +11761,7 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         self.assertEqual("".join(typed), text, "no character may be dropped")
         self.assertTrue(all(len(t) <= ha.SENDKEYS_MAX_CHARS for t in typed))
         self.assertEqual(self.run_calls[-1],
-                         ["tmux", "send-keys", "-t", "=agent-abcde:", "Enter"])
+                         ["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "Enter"])
 
     def test_message_past_the_cap_is_refused_not_truncated(self):
         # Half a message is worse than none: the operator cannot tell a
@@ -12985,10 +13026,10 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
             sm._poll_pending_inputs()
         # Re-typed the same way a first send goes in: pasted, then Enter.
         self.assertEqual(self.run_stdin_calls, [
-            (["tmux", "load-buffer", "-b", "turma-input-agent-s1", "-"], "hi there"),
+            (["tmux", "-L", "turma", "load-buffer", "-b", "turma-input-agent-s1", "-"], "hi there"),
         ])
         self.assertEqual(self.run_calls, [
-            ["tmux", "send-keys", "-t", "=agent-s1:", "Enter"],
+            ["tmux", "-L", "turma", "send-keys", "-t", "=agent-s1:", "Enter"],
         ])
         it = sess["pendingInputs"][0]
         self.assertEqual(it["attempts"], 2)
@@ -14908,7 +14949,7 @@ class TestAnswerPanePrompt(ManagerMixin, unittest.TestCase):
         self._session(sm)
         self._answer(sm, 2)
         self.assertEqual(
-            self.run_calls, [["tmux", "send-keys", "-t", "=agent-abcde:", "2"]])
+            self.run_calls, [["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "2"]])
 
     def test_stale_click_is_dropped_when_the_dialog_is_gone(self):
         # The whole safety property: without the re-read this would type a bare
@@ -14960,7 +15001,7 @@ class TestInterrupt(ManagerMixin, unittest.TestCase):
         self._session(sm)
         sm.interrupt("abcde")
         self.assertEqual(
-            self.run_calls, [["tmux", "send-keys", "-t", "=agent-abcde:", "Escape"]])
+            self.run_calls, [["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "Escape"]])
 
     def test_noop_for_stopped_session(self):
         sm = self.make_manager()
@@ -14983,7 +15024,7 @@ class TestInterrupt(ManagerMixin, unittest.TestCase):
         sess["paneBusy"] = False
         sm.interrupt("abcde")
         self.assertEqual(
-            self.run_calls, [["tmux", "send-keys", "-t", "=agent-abcde:", "Escape"]])
+            self.run_calls, [["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "Escape"]])
 
 
 # A realistic /model picker pane capture: ❯ on the current model (Fable, row
@@ -15091,7 +15132,7 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
 
         def fake_run(cmd, cwd=None):
             self.run_calls.append(cmd)
-            if cmd[:2] == ["tmux", "send-keys"] and hasattr(self.pane, "key"):
+            if cmd[:4] == ["tmux", "-L", "turma", "send-keys"] and hasattr(self.pane, "key"):
                 self.pane.key(cmd[-1])
             return ""
 
@@ -16805,7 +16846,7 @@ class TestSweepOrphanQuestions(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         self.run_ok_calls.clear()
         self.assertTrue(sm._tmux_alive("agent-x"))  # fake_run_ok returns rc 0
-        self.assertIn(["tmux", "has-session", "-t", "=agent-x"], self.run_ok_calls)
+        self.assertIn(["tmux", "-L", "turma", "has-session", "-t", "=agent-x"], self.run_ok_calls)
 
     def test_tmux_alive_false_without_name(self):
         sm = self.make_manager()
@@ -20678,7 +20719,7 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
                        for i in range(6)]
         sm._sweep_dead_sessions()
         self.assertEqual(len(self.listing_calls), 1)
-        self.assertEqual(self.listing_calls[0][:3], ["tmux", "list-panes", "-a"])
+        self.assertEqual(self.listing_calls[0][:5], ["tmux", "-L", "turma", "list-panes", "-a"])
 
     def test_a_dead_tmux_ends_the_session_after_the_strike_count(self):
         sm = self.make_manager()
@@ -20888,7 +20929,7 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
     # --- XERK-1037: the tmux outlived its agent pane ------------------------
 
     def _reaped_tmux(self):
-        return [c for c in self.run_calls if c[:2] == ["tmux", "kill-session"]]
+        return [c for c in self.run_calls if c[:4] == ["tmux", "-L", "turma", "kill-session"]]
 
     def test_an_exited_agent_pane_is_dead_though_its_tmux_lives_on(self):
         # The session opened a window itself (`new-window` inside its pane lands
@@ -20907,7 +20948,62 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.killed_ttyd, ["s1"])
         # The leftover windows are closed, not left as an untracked tmux.
         self.assertEqual(self._reaped_tmux(),
-                         [["tmux", "kill-session", "-t", "=agent-alive"]])
+                         [["tmux", "-L", "turma", "kill-session", "-t", "=agent-alive"]])
+
+    EMPTY_SERVER = (1, "", "no current target\n")
+
+    def _two_servers(self, sm, turma, default):
+        """Route the listing by server (XERK-1078): `-L turma` vs default."""
+        def fake(cmd, **kw):
+            self.listing_calls.append(cmd)
+            rc, out, err = turma if "-L" in cmd else default
+            return subprocess.CompletedProcess(cmd, rc, out, err)
+        p = mock.patch.object(ha.subprocess, "run", fake)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_an_up_but_empty_server_holds_no_sessions(self):
+        # XERK-1078: the agent's server runs `exit-empty off`, so once its last
+        # session dies it stays up and `list-panes -a` fails "no current
+        # target". Reading that as "can't tell" left the session running forever.
+        sm = self.make_manager(listing=self.EMPTY_SERVER)
+        sess = self._sess()
+        sm.registry = [sess]
+        for _ in range(ha.DEAD_TMUX_STRIKES):
+            sm._sweep_dead_sessions()
+        self.assertEqual(sess["status"], "error")
+
+    def test_a_dead_legacy_session_is_reaped_and_forgotten(self):
+        # XERK-1078: a legacy session that dies on its own leaves the default
+        # server up and EMPTY; it must not blind the sweep for the whole host.
+        sm = self.make_manager()
+        self._two_servers(sm, (0, "agent-alive %1\n", ""), self.EMPTY_SERVER)
+        dead = self._sess(tmuxName="agent-old")
+        alive = self._sess(id="s2", tmuxName="agent-alive", agentPane="%1")
+        sm.registry = [dead, alive]
+        with mock.patch.object(ha, "_legacy_tmux", {"agent-old"}), \
+                mock.patch.object(ha, "_publish_legacy_tmux"):
+            for _ in range(ha.DEAD_TMUX_STRIKES):
+                sm._sweep_dead_sessions()
+            self.assertEqual(ha._legacy_tmux, set())
+        self.assertEqual(dead["status"], "error")
+        self.assertEqual(alive["status"], "running")
+
+    def test_pane_ids_are_matched_on_the_sessions_own_server(self):
+        # XERK-1078: pane ids are unique per SERVER. agent-x's agent pane %1
+        # exited (a window it opened survives on %5); legacy agent-y also has a
+        # %1 on the default server, which must not keep agent-x alive.
+        sm = self.make_manager()
+        self._two_servers(sm, (0, "agent-x %5\n", ""), (0, "agent-y %1\n", ""))
+        x = self._sess(tmuxName="agent-x", agentPane="%1")
+        y = self._sess(id="s2", tmuxName="agent-y", agentPane="%1")
+        sm.registry = [x, y]
+        with mock.patch.object(ha, "_legacy_tmux", {"agent-y"}), \
+                mock.patch.object(ha, "_publish_legacy_tmux"):
+            for _ in range(ha.DEAD_TMUX_STRIKES):
+                sm._sweep_dead_sessions()
+        self.assertEqual(x["status"], "error")
+        self.assertEqual(y["status"], "running")
 
     def test_an_agent_pane_moved_to_another_session_is_alive(self):
         # QA: swap-window/join-pane into another session moves the agent pane
@@ -20951,7 +21047,7 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
             sm._spawn_in_tmux(sess, "claude")
         sm._kill_tmux(sess)
         self.assertEqual(self._reaped_tmux(),
-                         [["tmux", "kill-session", "-t", "=agent-dead"]] * 2)
+                         [["tmux", "-L", "turma", "kill-session", "-t", "=agent-dead"]] * 2)
 
     def test_a_record_without_agent_pane_keeps_the_name_only_rule(self):
         # Launched before XERK-1037 (or its pane read failed), or hand-edited to
@@ -32693,7 +32789,7 @@ class TestQwenSessionArms(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "_capture_pane",
                                return_value=_qwen_pane_frame("03-tool-approval")):
             sm.answer_pane_prompt("q1", 1)
-        sends = [c for c in self.run_calls if c[:2] == ["tmux", "send-keys"]]
+        sends = [c for c in self.run_calls if c[:4] == ["tmux", "-L", "turma", "send-keys"]]
         self.assertEqual(sends[-2][-1], "1")
         self.assertEqual(sends[-1][-1], "Enter")
 
@@ -32707,7 +32803,7 @@ class TestQwenSessionArms(ManagerMixin, unittest.TestCase):
                 "  ❯ 1. Yes\n    2. No\n")
         with mock.patch.object(ha, "_capture_pane", return_value=pane):
             sm.answer_pane_prompt("c1", 1)
-        sends = [c for c in self.run_calls if c[:2] == ["tmux", "send-keys"]]
+        sends = [c for c in self.run_calls if c[:4] == ["tmux", "-L", "turma", "send-keys"]]
         self.assertEqual([s[-1] for s in sends], ["1"])  # no Enter
 
     # --- HITL input 2: the ask_user_question MCP registration ---------------
@@ -33417,10 +33513,10 @@ class TestTmuxExactTargets(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.addCleanup(subprocess.run, ["tmux", "kill-server"],
+        self.addCleanup(subprocess.run, ["tmux", "-L", ha.TMUX_SOCKET, "kill-server"],
                         capture_output=True)
-        subprocess.run(["tmux", "new-session", "-d", "-s", "agent-zz1-helper",
-                        "cat"], check=True)
+        subprocess.run(["tmux", "-L", ha.TMUX_SOCKET, "new-session", "-d", "-s",
+                        "agent-zz1-helper", "cat"], check=True)
 
     def test_capture_does_not_read_a_prefix_named_session(self):
         self.assertIsNone(ha._capture_pane("agent-zz1"))
@@ -33446,25 +33542,26 @@ class TestTmuxExactTargets(unittest.TestCase):
         # names; with only a prefix-named neighbour alive, neither may report
         # it alive nor kill it.
         for name in (ha.DSH_WEB_TMUX, ha.LIMITS_TMUX):
-            subprocess.run(["tmux", "new-session", "-d", "-s", name + "-x",
-                            "cat"], check=True)
+            subprocess.run(["tmux", "-L", ha.TMUX_SOCKET, "new-session", "-d", "-s",
+                            name + "-x", "cat"], check=True)
         self.assertFalse(ha.SessionManager._dsh_web_running(None))
         with mock.patch.object(ha, "IS_WINDOWS", False):
             ha.SessionManager._kill_limits_probe(None)
         for name in (ha.DSH_WEB_TMUX, ha.LIMITS_TMUX):
-            rc = subprocess.run(["tmux", "has-session", "-t", "=" + name + "-x"],
+            rc = subprocess.run(["tmux", "-L", ha.TMUX_SOCKET, "has-session", "-t",
+                                 "=" + name + "-x"],
                                 capture_output=True).returncode
             self.assertEqual(rc, 0, name + "-x was killed")
-        subprocess.run(["tmux", "new-session", "-d", "-s", ha.DSH_WEB_TMUX,
-                        "cat"], check=True)
+        subprocess.run(["tmux", "-L", ha.TMUX_SOCKET, "new-session", "-d", "-s",
+                        ha.DSH_WEB_TMUX, "cat"], check=True)
         self.assertTrue(ha.SessionManager._dsh_web_running(None))
 
     def test_dsh_web_launch_and_supervisor_kills_are_exact(self):
         # The two dsh-web kill-session sites: the launch's clean-slate kill and
         # the supervisor's teardown of an alive-but-not-serving viewer.
-        want = ["tmux", "kill-session", "-t", "=" + ha.DSH_WEB_TMUX]
+        want = ["tmux", "-L", "turma", "kill-session", "-t", "=" + ha.DSH_WEB_TMUX]
         calls = []
-        with mock.patch.object(ha, "run", side_effect=calls.append), \
+        with mock.patch.object(ha, "run", side_effect=lambda c, **k: calls.append(c)), \
                 mock.patch.object(ha, "run_ok", return_value=(1, "no")):
             self.assertFalse(ha.SessionManager._launch_dsh_web(None, "p"))
         self.assertIn(want, calls)
@@ -33475,9 +33572,127 @@ class TestTmuxExactTargets(unittest.TestCase):
         sm._dsh_web_serving.return_value = False
         sm._launch_dsh_web.side_effect = \
             lambda patch: sm._dsh_web_stop.set() or False
-        with mock.patch.object(ha, "run", side_effect=calls.append):
+        with mock.patch.object(ha, "run", side_effect=lambda c, **k: calls.append(c)):
             ha.SessionManager._dsh_web_loop(sm)
         self.assertEqual(calls, [want])
+
+
+@unittest.skipUnless(shutil.which("tmux"), "needs a real tmux")
+class TestAgentTmuxSocket(unittest.TestCase):
+    """XERK-1078: sessions run on the agent's own `-L turma` server with $TMUX
+    unset, so a session's bare `tmux kill-server` reaches the host's DEFAULT
+    server, never the agent's; sessions an older agent left on the default
+    server stay managed there, by name, until relaunched. Real tmux on a
+    private socket dir — the claim is about which server tmux resolves."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
+        env["TMUX_TMPDIR"] = self.tmp
+        for patcher in (mock.patch.dict(os.environ, env, clear=True),
+                        mock.patch.object(ha, "_legacy_tmux", set()),
+                        mock.patch.object(ha, "LEGACY_TMUX_FILE",
+                                          os.path.join(self.tmp, "tmux-legacy"))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        for server in (["tmux"], ["tmux", "-L", ha.TMUX_SOCKET]):
+            self.addCleanup(subprocess.run, server + ["kill-server"],
+                            capture_output=True)
+
+    def _default(self, *args):
+        return subprocess.run(["tmux", *args], capture_output=True, text=True)
+
+    def test_a_sessions_bare_kill_server_spares_the_agents_server(self):
+        # The XERK-1077 incident, replayed: a scratch server on the default
+        # socket, then the session's runtime runs a bare `tmux kill-server`.
+        self._default("new-session", "-d", "-s", "scratch", "sleep 30")
+        env_dump = os.path.join(self.tmp, "env.txt")
+        sess = {"tmuxName": "agent-k1", "worktreePath": self.tmp}
+        ha.SessionManager._spawn_in_tmux(
+            None, sess, f"env > {env_dump}; tmux kill-server; exec sleep 30")
+        for _ in range(50):
+            if self._default("has-session", "-t", "=scratch").returncode:
+                break
+            time.sleep(0.1)
+        self.assertNotEqual(self._default("has-session", "-t", "=scratch").returncode, 0)
+        self.assertTrue(ha.SessionManager._tmux_alive(None, "agent-k1"))
+        dumped = open(env_dump).read()
+        self.assertNotIn("\nTMUX=", "\n" + dumped)
+        self.assertNotIn("\nTMUX_PANE=", "\n" + dumped)
+        self.assertTrue(ha._is_pane_id(sess.get("agentPane")))
+
+    def test_a_legacy_session_is_managed_on_the_default_server_until_relaunched(self):
+        self._default("new-session", "-d", "-s", "agent-old", "cat")
+        # A session's OWN tmux on the default server, carrying an agent-ish name.
+        self._default("new-session", "-d", "-s", "agent-forged", "cat")
+        found = ha._probe_legacy_tmux({"agent-old", "agent-gone"})
+        self.assertEqual(found, {"agent-old"})
+        self.assertEqual(open(ha.LEGACY_TMUX_FILE).read(), "agent-old\n")
+        # Reached by name on the default server.
+        self.assertTrue(ha.SessionManager._tmux_alive(None, "agent-old"))
+        self.assertIsNotNone(ha._capture_pane("agent-old"))
+        self.assertFalse(ha.SessionManager._tmux_alive(None, "agent-forged"))
+        # The fleet listing spans both servers, but only the agent's sessions.
+        sess = {"tmuxName": "agent-new", "worktreePath": self.tmp}
+        ha.SessionManager._spawn_in_tmux(None, sess, "exec sleep 30")
+        live = ha.SessionManager._live_tmux_panes(None)
+        self.assertEqual(set(live), {"agent-old", "agent-new"})
+        # Relaunching moves it onto the agent's server and forgets it as legacy.
+        old = {"tmuxName": "agent-old", "worktreePath": self.tmp}
+        ha.SessionManager._spawn_in_tmux(None, old, "exec sleep 30")
+        self.assertEqual(ha._legacy_tmux, set())
+        self.assertFalse(os.path.exists(ha.LEGACY_TMUX_FILE))
+        self.assertNotEqual(self._default("has-session", "-t", "=agent-old").returncode, 0)
+        self.assertEqual(subprocess.run(
+            ["tmux", "-L", ha.TMUX_SOCKET, "has-session", "-t", "=agent-old"]).returncode, 0)
+        # The session's own default-server tmux was never touched.
+        self.assertEqual(self._default("has-session", "-t", "=agent-forged").returncode, 0)
+
+
+    def test_a_just_died_session_on_an_empty_server_does_not_blind_the_guard(self):
+        # XERK-1078 delta QA: s (agent server) just exited — still `running`
+        # until the sweep's strikes reap it, ~40s — while legacy b lives. The
+        # empty agent server must list as no panes, not fail the whole listing.
+        ha.load_tmux_config()
+        self._default("new-session", "-d", "-s", "agent-b", "cat")
+        ha._probe_legacy_tmux({"agent-b"})
+        mgr = types.SimpleNamespace(
+            registry=[{"id": "s", "status": "running", "tmuxName": "agent-s"},
+                      {"id": "b", "status": "running", "tmuxName": "agent-b"}],
+            _memguard_panes_cache=None)
+        panes = ha.SessionManager._memguard_panes(mgr)
+        self.assertIsNotNone(panes)
+        self.assertEqual(len(panes), 1)
+
+    def test_an_unreachable_live_server_fails_the_guard_closed(self):
+        # XERK-1078 delta QA: a live server whose socket file was deleted says
+        # "no server running" — the same words as an exited one. The guard must
+        # read that as can't-tell (None: kill nothing), never as "no agents".
+        subprocess.run(["tmux", "-L", ha.TMUX_SOCKET, "new-session", "-d", "-s",
+                        "agent-s", "cat"], check=True)
+        sock = os.path.join(self.tmp, f"tmux-{os.getuid()}", ha.TMUX_SOCKET)
+        os.rename(sock, sock + ".moved")
+        self.addCleanup(lambda: os.path.exists(sock + ".moved")
+                        and os.rename(sock + ".moved", sock))
+        mgr = types.SimpleNamespace(
+            registry=[{"id": "s", "status": "running", "tmuxName": "agent-s"}],
+            _memguard_panes_cache=None)
+        self.assertIsNone(ha.SessionManager._memguard_panes(mgr))
+
+    def test_an_empty_agent_server_does_not_blind_the_memory_guard(self):
+        # XERK-1078: every running session is still legacy, and the agent's own
+        # server is up but EMPTY (exit-empty off): listing it fails "no current
+        # target", which must not make the guard's listing fail as a whole.
+        ha.load_tmux_config()
+        self._default("new-session", "-d", "-s", "agent-old", "cat")
+        ha._probe_legacy_tmux({"agent-old"})
+        mgr = types.SimpleNamespace(
+            registry=[{"id": "o", "status": "running", "tmuxName": "agent-old"}],
+            _memguard_panes_cache=None)
+        panes = ha.SessionManager._memguard_panes(mgr)
+        self.assertIsNotNone(panes)
+        self.assertEqual(len(panes), 1)
 
 
 class TestWindowsTerminalBackend(unittest.TestCase):
@@ -33880,7 +34095,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
              mock.patch.object(ha, "run") as run:
             ha._pane_send_keys("agent-x", "Escape")
         self.assertEqual(run.call_args.args[0],
-                         ["tmux", "send-keys", "-t", "=agent-x:", "Escape"])
+                         ["tmux", "-L", "turma", "send-keys", "-t", "=agent-x:", "Escape"])
 
     # --- host-specific helpers -------------------------------------------------
 
@@ -34027,7 +34242,7 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         ctl.assert_called_once()
         self.assertEqual(ctl.call_args.args[1], "kill")
         # No tmux kill-session was shelled, and the state file is gone.
-        self.assertFalse(any(c[:2] == ["tmux", "kill-session"]
+        self.assertFalse(any(c[:4] == ["tmux", "-L", "turma", "kill-session"]
                              for c in self.run_calls))
         self.assertFalse(os.path.exists(ha._pty_state_path("agent-w1")))
 
@@ -34392,7 +34607,8 @@ class TestTtydTokenRelaunch(unittest.TestCase):
     def test_adopts_when_the_token_fingerprint_still_matches(self):
         sm = self._mgr()
         sess = {"id": "s1", "ttydPort": 7700, "ttydPid": 4242,
-                "tmuxName": "agent-s1", "ttydTokenFp": ha._token_fp("derivedtok")}
+                "tmuxName": "agent-s1", "ttydTokenFp": ha._token_fp("derivedtok"),
+                "ttydTmuxSocket": ha.TMUX_SOCKET}
         with mock.patch.object(ha, "TURMA_TOKEN", "derivedtok"), \
              mock.patch.object(ha, "_pid_alive", return_value=True), \
              mock.patch.object(ha, "_port_open", return_value=True), \
@@ -34946,12 +35162,12 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
         # Listed in window order, which is not pane-id order after a swap-window.
         out = ("agent-a %3 61\nagent-a %9 64\nagent-b %4 62\n"
                "my test session %5 63\nagent-a %x 65\n")
-        with mock.patch.object(ha, "run_out", return_value=(0, out)), \
+        with mock.patch.object(ha, "_tmux_list_panes", return_value=(0, out)), \
                 mock.patch.object(ha, "_proc_start_time", return_value=7):
             self.assertEqual(sm._memguard_panes(), {61})
         # A failed listing falls back to the cache taken for the same sessions...
         live = {61: {"start": 7}}
-        with mock.patch.object(ha, "run_out", return_value=(None, "")):
+        with mock.patch.object(ha, "_tmux_list_panes", return_value=(None, "")):
             self.assertEqual(sm._memguard_panes(live), {61})
             # ...never without a snapshot to check it against...
             self.assertIsNone(sm._memguard_panes())
@@ -34962,23 +35178,39 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
         # A listing that missed a running session (its tmux mid-relaunch), or
         # whose pane died before it was timed, is never cached at all.
         sm.registry.append({"id": "d", "status": "running", "tmuxName": "agent-d"})
-        with mock.patch.object(ha, "run_out", return_value=(0, out)), \
+        with mock.patch.object(ha, "_tmux_list_panes", return_value=(0, out)), \
                 mock.patch.object(ha, "_proc_start_time", return_value=7):
             self.assertEqual(sm._memguard_panes(), {61})
         self.assertIsNone(sm._memguard_panes_cache)
         sm.registry.pop()
-        with mock.patch.object(ha, "run_out", return_value=(0, out)), \
+        with mock.patch.object(ha, "_tmux_list_panes", return_value=(0, out)), \
                 mock.patch.object(ha, "_proc_start_time", return_value=None):
             sm._memguard_panes()
         self.assertIsNone(sm._memguard_panes_cache)
         # ...nor once a session has launched since: it would be missing.
         sm.registry.append({"id": "c", "status": "running", "tmuxName": "agent-c"})
-        with mock.patch.object(ha, "run_out", return_value=(1, "")):
+        with mock.patch.object(ha, "_tmux_list_panes", return_value=(1, "")):
             self.assertIsNone(sm._memguard_panes(live))
         sm.registry = []
-        with mock.patch.object(ha, "run_out") as ro:
+        with mock.patch.object(ha, "_tmux_list_panes") as ro:
             self.assertEqual(sm._memguard_panes(), set())
         ro.assert_not_called()
+
+    def test_a_recorded_pane_is_matched_on_its_own_server(self):
+        # XERK-1078: pane ids are unique per SERVER. agent-x's (agent server)
+        # recorded pane %4 exited; legacy agent-y's window %4 on the default
+        # server is another process and must not be protected as x's agent.
+        sm = self.make_manager()
+        sm.registry = [{"id": "x", "status": "running", "tmuxName": "agent-x",
+                        "agentPane": "%4"},
+                       {"id": "y", "status": "running", "tmuxName": "agent-y",
+                        "agentPane": "%9"}]
+        listing = {True: "agent-x %5 65\n", False: "agent-y %4 74\nagent-y %9 79\n"}
+        with mock.patch.object(ha, "_legacy_tmux", {"agent-y"}), \
+                mock.patch.object(ha, "_tmux_list_panes",
+                                  side_effect=lambda base, fmt, **k: (0, listing["-L" in base])), \
+                mock.patch.object(ha, "_proc_start_time", return_value=7):
+            self.assertEqual(sm._memguard_panes(), {79})
 
     def test_panes_protect_the_recorded_agent_pane_not_the_lowest(self):
         # XERK-1028: agent-a's agent pane %4 exited, leaving its own window %5
@@ -34994,20 +35226,20 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
         # agent while agent-b lives. agent-c's malformed id reads as unrecorded.
         out = ("agent-a %5 65\nagent-a %6 66\nagent-b %8 68\n"
                "other %7 67\nagent-c %2 62\nagent-c %3 63\n")
-        with mock.patch.object(ha, "run_out", return_value=(0, out)), \
+        with mock.patch.object(ha, "_tmux_list_panes", return_value=(0, out)), \
                 mock.patch.object(ha, "_proc_start_time", return_value=7):
             self.assertEqual(sm._memguard_panes(), {67, 62})
         # A session whose agent pane is gone is not vouched for: never cached.
         self.assertIsNone(sm._memguard_panes_cache)
         # The pane recorded, listed again: protected and cached.
         out += "agent-a %4 64\n"
-        with mock.patch.object(ha, "run_out", return_value=(0, out)), \
+        with mock.patch.object(ha, "_tmux_list_panes", return_value=(0, out)), \
                 mock.patch.object(ha, "_proc_start_time", return_value=7):
             self.assertEqual(sm._memguard_panes(), {64, 67, 62})
         self.assertIsNotNone(sm._memguard_panes_cache)
         # A recorded pane listed only in ANOTHER session, with the session's own
         # tmux gone (a server restart reuses ids), protects nothing.
-        with mock.patch.object(ha, "run_out",
+        with mock.patch.object(ha, "_tmux_list_panes",
                                return_value=(0, "other %4 64\nagent-c %2 62\n")), \
                 mock.patch.object(ha, "_proc_start_time", return_value=7):
             self.assertEqual(sm._memguard_panes(), {62})

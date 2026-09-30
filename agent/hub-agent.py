@@ -90,7 +90,7 @@ if _AGENT_DIR not in sys.path:
 # applies: mouse-wheel scroll routing (else the wheel reaches the app — a qwen
 # session then scrolls its input-prompt history instead of the conversation),
 # OSC52 copy-out, truecolor, history-limit. `load_tmux_config()` sources it into
-# the default-socket server the sessions share (see there).
+# the agent's own `-L turma` server the sessions share (see there).
 _TMUX_CONF = os.path.join(_AGENT_DIR, "tmux.conf")
 
 # Set by a SIGUSR1 handler (installed in run_forever). tunnel-agent.js sends
@@ -274,6 +274,11 @@ REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
 # the tunnel reads this path (os.homedir()/.turma, matching REGISTRY_DIR) to find
 # it. Lives beside the other ~/.turma ledgers.
 POKE_PORT_FILE = os.path.join(REGISTRY_DIR, "poke-port")
+# The legacy default-server tmux sessions (`_legacy_tmux`, XERK-1078), one name
+# per line, for tunnel-agent.js's live-tail capture: it may read the DEFAULT
+# server only for a name listed here, never as a blind fallback (a session's own
+# tmux lives there and could carry a neighbour's `agent-<id>` name). Absent = none.
+LEGACY_TMUX_FILE = os.path.join(REGISTRY_DIR, "tmux-legacy")
 POKE_CONN_TIMEOUT_SEC = _env_float("TURMA_POKE_CONN_TIMEOUT_SEC", 2.0)
 # Expected-restart signal (XERK-29). Before the manager goes down for a restart
 # it can't heartbeat through — an image update recreating the whole container,
@@ -1144,6 +1149,149 @@ def run_ok(cmd, cwd=None, timeout=30, env=None):
         return None, str(e)
 
 
+# The agent's OWN tmux server (XERK-1078). Every session is a pane of it, so it
+# must not be the host's DEFAULT server: a session's bare `tmux kill-server` (a
+# QA scratch server, a test teardown) reached the default one and took every
+# session on the host with it (XERK-1077). On `-L turma`, and with $TMUX/$TMUX_PANE
+# unset in each session's runtime (`_TMUX_ENV_STRIP`), a session's own tmux use
+# lands on the default server, which is never the agent's. The guard hook
+# protects this name too (`_AGENT_TMUX_SOCKET` in hooks/guard.py) and
+# tunnel-agent.js captures on it (`TMUX_SOCKET`) — keep all three equal.
+TMUX_SOCKET = "turma"
+
+# Prefixed to every command the agent starts in a tmux pane. tmux exports
+# TMUX/TMUX_PANE into the pane, and tmux prefers $TMUX over TMUX_TMPDIR, so a
+# session that inherited them would still address the agent's server with a
+# bare `tmux`.
+_TMUX_ENV_STRIP = "unset TMUX TMUX_PANE; "
+
+# Agent-owned tmux sessions an OLDER agent started on the default server, which
+# a manager-only restart (an in-place update) leaves running there: tmux can't
+# move a session between servers, and relaunching would abort a live turn. Found
+# once at boot (`_probe_legacy_tmux`), addressed by name through `_tmux`, and
+# dropped as each is killed or relaunched — which relaunches it on TMUX_SOCKET —
+# so it only ever shrinks, and once empty the default server is never touched.
+_legacy_tmux = set()
+# Held across each mutation AND its publish, so concurrent callers (the beat's
+# sweep, a launch/kill) can't leave the file naming a state the set has left.
+_legacy_tmux_lock = threading.Lock()
+
+
+def _publish_legacy_tmux():
+    """Mirror `_legacy_tmux` to LEGACY_TMUX_FILE (atomically; removed once empty)
+    for the tunnel's capture. Best-effort: a failed write leaves the tunnel
+    reading those sessions' live tail as idle, never another pane."""
+    try:
+        if _legacy_tmux:
+            tmp = LEGACY_TMUX_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("".join(n + "\n" for n in sorted(_legacy_tmux)))
+            os.replace(tmp, LEGACY_TMUX_FILE)
+        elif os.path.exists(LEGACY_TMUX_FILE):
+            os.remove(LEGACY_TMUX_FILE)
+    except OSError as e:
+        log(f"tmux: could not publish the legacy session list ({e})")
+
+
+def _tmux(*args, name=None):
+    """argv for a tmux command on the server holding session `name`: the default
+    server for a legacy session still running there, else TMUX_SOCKET. A command
+    that creates a session passes no name, so it always lands on TMUX_SOCKET."""
+    if name is not None and name in _legacy_tmux:
+        return ["tmux", *args]
+    return ["tmux", "-L", TMUX_SOCKET, *args]
+
+
+def _tmux_socket_of(name):
+    """The `-L` socket `_tmux` addresses for session `name` ("" = the default
+    server) — what a ttyd's baked-in `tmux attach` must match."""
+    return "" if name in _legacy_tmux else TMUX_SOCKET
+
+
+# How `list-panes -a` says a server holds no sessions: none is running, its
+# socket is dead, or it is up and EMPTY ("no current target" — `exit-empty off`
+# keeps an empty server alive). Anything else is "can't tell".
+_TMUX_EMPTY_ERRS = ("no server running", "error connecting to", "no current target")
+
+
+def _tmux_list_panes(base, fmt, timeout=5, empty=_TMUX_EMPTY_ERRS):
+    """`list-panes -a -F fmt` on one server as (rc, stdout). A server whose
+    error is one of `empty` holds NO sessions and answers (0, ""); rc is nonzero
+    or None only when the server could not answer at all."""
+    try:
+        out = subprocess.run(base + ["list-panes", "-a", "-F", fmt],
+                             capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None, ""
+    if out.returncode == 0:
+        return 0, out.stdout
+    err = (out.stderr or "").lower()
+    if any(m in err for m in empty):
+        return 0, ""
+    return out.returncode, ""
+
+
+def _tmux_servers():
+    """[(argv prefix, owns(name))] for each server that may hold agent sessions:
+    TMUX_SOCKET, plus the default server while a legacy session is left there.
+    `owns` filters a fleet-wide listing to the sessions the agent put on THAT
+    server — a session's own `tmux new -s agent-x` on the default server is not
+    an agent session."""
+    legacy = set(_legacy_tmux)
+    servers = [(["tmux", "-L", TMUX_SOCKET], lambda n: n not in legacy)]
+    if legacy:
+        servers.append((["tmux"], legacy.__contains__))
+    return servers
+
+
+def _probe_legacy_tmux(names):
+    """Record which of `names` (the registry's running tmux names plus the
+    agent's host-wide ones) are live on the DEFAULT server and not on
+    TMUX_SOCKET — sessions a pre-XERK-1078 agent started. Run once at boot,
+    before `resume_on_boot` adopts. Returns the set it recorded."""
+    if IS_WINDOWS or not names:
+        with _legacy_tmux_lock:
+            _legacy_tmux.clear()
+            _publish_legacy_tmux()
+        return set()
+
+    def listed(base):
+        rc, out = run_out(base + ["list-sessions", "-F", "#{session_name}"],
+                          timeout=5)
+        return set(out.splitlines()) if rc == 0 else set()
+
+    found = (listed(["tmux"]) & set(names)) - listed(["tmux", "-L", TMUX_SOCKET])
+    with _legacy_tmux_lock:
+        _legacy_tmux.clear()
+        _legacy_tmux.update(found)
+        _publish_legacy_tmux()
+    if found:
+        log(f"tmux: {len(found)} session(s) still on the default server from an "
+            f"older agent; managing them there until they are relaunched: "
+            f"{', '.join(sorted(found))}")
+    return found
+
+
+def _kill_tmux_session(tmux_name, exact=False, timeout=15):
+    """End an agent tmux session on whichever server holds it, and forget it as
+    legacy — so the next launch under that name lands on TMUX_SOCKET. `exact`
+    targets `=name`: once the name is gone tmux falls back to a PREFIX match,
+    ending some other `agent-<id>…` session."""
+    target = "=" + tmux_name if exact else tmux_name
+    run(_tmux("kill-session", "-t", target, name=tmux_name), timeout=timeout)
+    _forget_legacy_tmux([tmux_name])
+
+
+def _forget_legacy_tmux(names):
+    """Drop `names` from `_legacy_tmux` (they were killed, relaunched, or are
+    gone from the default server) and republish if that changed anything."""
+    with _legacy_tmux_lock:
+        gone = _legacy_tmux & set(names)
+        if gone:
+            _legacy_tmux.difference_update(gone)
+            _publish_legacy_tmux()
+
+
 def load_tmux_config(socket=None):
     """Load `_TMUX_CONF` into the tmux SERVER the agent's sessions share, so its
     options and key bindings actually take effect (see `_TMUX_CONF` for why they
@@ -1162,12 +1310,12 @@ def load_tmux_config(socket=None):
       to it LIVE — existing sessions included — without touching a session.
 
     `socket` is for tests only (an isolated `-L <name>` so a real-tmux test can
-    exercise the cold-boot path without touching the production default socket).
+    exercise the cold-boot path without touching the production TMUX_SOCKET).
     Best-effort and non-fatal: a tmux hiccup must never stop the agent booting."""
     if not os.path.exists(_TMUX_CONF):
         log(f"tmux config not found at {_TMUX_CONF}; using tmux defaults")
         return
-    base = ["tmux"] + (["-L", socket] if socket else [])
+    base = ["tmux", "-L", socket or TMUX_SOCKET]
     run_ok(base + ["-f", _TMUX_CONF, "start-server"], timeout=10)
     rc, err = run_ok(base + ["source-file", _TMUX_CONF], timeout=10)
     if rc == 0:
@@ -10257,7 +10405,7 @@ def _capture_pane(tmux_name):
         return None
     try:
         out = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-t", _tmux_pane(tmux_name)],
+            _tmux("capture-pane", "-p", "-t", _tmux_pane(tmux_name), name=tmux_name),
             capture_output=True, text=True, timeout=5,
         )
     except Exception:
@@ -10430,7 +10578,8 @@ def _type_into_pane(tmux_name, text):
     if not tmux_name:
         return False
     buf = f"turma-input-{tmux_name}"      # per-pane, so two sessions can't race
-    pasted = run_stdin(["tmux", "load-buffer", "-b", buf, "-"], text)
+    # The buffer is per-SERVER, so load and paste must address the same one.
+    pasted = run_stdin(_tmux("load-buffer", "-b", buf, "-", name=tmux_name), text)
     if pasted:
         # -d drops the buffer once it has been pasted, so a message never sits
         # in tmux's paste history waiting to be re-pasted by hand.
@@ -10444,11 +10593,12 @@ def _type_into_pane(tmux_name, text):
         # the Enter below submits it either way. Multi-line still brackets, which
         # is what keeps it ONE message instead of a turn per line.
         flags = ["-d", "-p"] if "\n" in text else ["-d"]
-        rc, _err = run_ok(["tmux", "paste-buffer", *flags, "-b", buf,
-                           "-t", _tmux_pane(tmux_name)], timeout=15)
+        rc, _err = run_ok(_tmux("paste-buffer", *flags, "-b", buf,
+                                "-t", _tmux_pane(tmux_name), name=tmux_name),
+                          timeout=15)
         pasted = rc == 0
         if not pasted:
-            run(["tmux", "delete-buffer", "-b", buf])
+            run(_tmux("delete-buffer", "-b", buf, name=tmux_name))
     if not pasted:
         flat = text.replace("\n", " ")
         chunks = [flat[i:i + SENDKEYS_MAX_CHARS]
@@ -10459,8 +10609,9 @@ def _type_into_pane(tmux_name, text):
             # `--` ends tmux's own option parsing before the literal text, so a
             # message starting with '-' isn't misread as more send-keys flags.
             # Each chunk appends to the input line; only the Enter below submits.
-            run(["tmux", "send-keys", "-t", _tmux_pane(tmux_name), "-l", "--", chunk])
-    run(["tmux", "send-keys", "-t", _tmux_pane(tmux_name), "Enter"])
+            run(_tmux("send-keys", "-t", _tmux_pane(tmux_name), "-l", "--", chunk,
+                      name=tmux_name))
+    run(_tmux("send-keys", "-t", _tmux_pane(tmux_name), "Enter", name=tmux_name))
     return pasted
 
 
@@ -10952,7 +11103,7 @@ def _pane_send_keys(tmux_name, *tokens, literal=False, timeout=None):
             data = "".join(_TMUX_KEY_BYTES.get(t, str(t)) for t in tokens)
         _pty_control(tmux_name, "inject", data=data)
         return
-    cmd = ["tmux", "send-keys", "-t", _tmux_pane(tmux_name)]
+    cmd = _tmux("send-keys", "-t", _tmux_pane(tmux_name), name=tmux_name)
     if literal:
         cmd += ["-l", "--"]
     cmd += [str(t) for t in tokens]
@@ -18315,7 +18466,8 @@ class SessionManager:
         the limits probe relies on. NOT sufficient alone: a tmux that started is
         not proof the port bound (D1), and a bound-then-wedged process keeps the
         tmux alive — so callers pair it with _dsh_web_port_open."""
-        rc, _ = run_ok(["tmux", "has-session", "-t", "=" + DSH_WEB_TMUX], timeout=5)
+        rc, _ = run_ok(_tmux("has-session", "-t", "=" + DSH_WEB_TMUX,
+                             name=DSH_WEB_TMUX), timeout=5)
         return rc == 0
 
     def _dsh_web_connect_host(self):
@@ -18388,10 +18540,10 @@ class SessionManager:
             + shlex.join([
                 DSH_BIN, "--profile", "web", "--patch", patch,
                 "--no-open", "--host", DSH_WEB_HOST, "--port", str(DSH_WEB_PORT)]))
-        run(["tmux", "kill-session", "-t", "=" + DSH_WEB_TMUX])
-        rc, err = run_ok([
-            "tmux", "new-session", "-d", "-s", DSH_WEB_TMUX,
-            "-c", DSH_HOME, "-x", "200", "-y", "50", cmd])
+        _kill_tmux_session(DSH_WEB_TMUX, exact=True)
+        rc, err = run_ok(_tmux(
+            "new-session", "-d", "-s", DSH_WEB_TMUX,
+            "-c", DSH_HOME, "-x", "200", "-y", "50", _TMUX_ENV_STRIP + cmd))
         if rc != 0:
             log(f"dsh web launch failed: {err}")
             return False
@@ -18436,7 +18588,7 @@ class SessionManager:
                         backoff = DSH_WEB_RESTART_SEC
                         self._dsh_web_stop.wait(DSH_WEB_POLL_SEC)
                         continue
-                    run(["tmux", "kill-session", "-t", "=" + DSH_WEB_TMUX])
+                    _kill_tmux_session(DSH_WEB_TMUX, exact=True)
                 if patch is None:
                     patch = self._ensure_dsh_web_patch()
                 # `running` means SERVING OUR dsh: confirm an HTTP GET comes back
@@ -18658,11 +18810,12 @@ class SessionManager:
         runtime in the message; empty for the claude path)."""
         # `=` = exact match: once the name is gone tmux falls back to a PREFIX
         # match, killing some other `agent-<id>…` session.
-        run(["tmux", "kill-session", "-t", "=" + sess["tmuxName"]])  # clean slate
-        rc, err = run_ok([
-            "tmux", "new-session", "-d", "-s", sess["tmuxName"],
-            "-c", sess["worktreePath"], "-x", "220", "-y", "50", cmd,
-        ])
+        _kill_tmux_session(sess["tmuxName"], exact=True)  # clean slate
+        rc, err = run_ok(_tmux(
+            "new-session", "-d", "-s", sess["tmuxName"],
+            "-c", sess["worktreePath"], "-x", "220", "-y", "50",
+            _TMUX_ENV_STRIP + cmd,
+        ))
         if rc != 0:
             prefix = f"{what} " if what else ""
             raise RuntimeError(f"{prefix}tmux launch failed: {err}")
@@ -18672,8 +18825,8 @@ class SessionManager:
         # the agent exits — `_sweep_dead_sessions` reads liveness off this pane.
         # Asked right after the launch, the session's only pane is the agent's;
         # a failed read records nothing (the sweep's name-only fallback).
-        rc, pane = run_out(["tmux", "display-message", "-p", "-t",
-                            _tmux_pane(sess["tmuxName"]), "#{pane_id}"],
+        rc, pane = run_out(_tmux("display-message", "-p", "-t",
+                                 _tmux_pane(sess["tmuxName"]), "#{pane_id}"),
                            timeout=5)
         if rc == 0 and _is_pane_id(pane):
             sess["agentPane"] = pane
@@ -20036,9 +20189,21 @@ class SessionManager:
             return
         if sess.get("agentType") == "dsh":
             return
+        # ttyd runs its `tmux attach` per browser connection, so a ttyd started
+        # against one server keeps attaching THERE. A session relaunched off the
+        # legacy default server onto TMUX_SOCKET (XERK-1078) must get a new one,
+        # or its terminal attaches to the wrong server. A ttyd from a
+        # pre-XERK-1078 agent recorded no socket: it attaches to the default.
+        want_socket = _tmux_socket_of(sess["tmuxName"])
+        on_socket = sess.get("ttydTmuxSocket", "") == want_socket
         proc = self.ttyd.get(sess["id"])
         if proc is not None and proc.poll() is None:
-            return  # already serving (e.g. an in-process restart keeps ttyd up)
+            if on_socket:
+                return  # already serving (e.g. an in-process restart keeps ttyd up)
+            log(f"ttyd for {sess['id']}: attached to another tmux server; "
+                "relaunching it on the session's")
+            self._kill_ttyd(sess["id"])
+            self._await_port_free(sess.get("ttydPort"))
         # Adopt a ttyd of OURS that outlived a *manager* restart: ttyd is its own
         # daemon, so on a native in-place update (systemd KillMode=process /
         # manager-only kill) the old ttyd keeps holding this session's stable
@@ -20061,18 +20226,16 @@ class SessionManager:
             # through to relaunch with the current token. This SELF-HEALS a host
             # already rolled (its next restart relaunches ttyd) as well as every
             # future roll.
-            if sess.get("ttydTokenFp") == _token_fp(TURMA_TOKEN):
+            if sess.get("ttydTokenFp") == _token_fp(TURMA_TOKEN) and on_socket:
                 return
-            log(f"ttyd for {sess['id']}: basic-auth token changed under a "
-                "surviving ttyd (post-roll); relaunching with the current token")
+            if not on_socket:
+                log(f"ttyd for {sess['id']}: a surviving ttyd attaches to another "
+                    "tmux server; relaunching it on the session's")
+            else:
+                log(f"ttyd for {sess['id']}: basic-auth token changed under a "
+                    "surviving ttyd (post-roll); relaunching with the current token")
             self._kill_ttyd(sess["id"])
-            # Wait for the old ttyd to release the port before rebinding it, or
-            # the relaunch below races it and fails to bind (leaving the terminal
-            # down). Bounded; SIGTERM'd ttyd exits promptly.
-            for _ in range(20):
-                if not _port_open(sess.get("ttydPort")):
-                    break
-                time.sleep(0.1)
+            self._await_port_free(sess.get("ttydPort"))
         args = [
             "ttyd", "-p", str(sess["ttydPort"]), "-i", "127.0.0.1",
             "-b", f"/term/{sess['id']}", "-W", "-m", "8",
@@ -20100,7 +20263,8 @@ class SessionManager:
             # terminal trades it for.
             "-t", "macOptionClickForcesSelection=true",
             "-c", f"term:{TURMA_TOKEN or 'changeme'}",
-            "tmux", "attach", "-t", "=" + sess["tmuxName"],  # exact match
+            *_tmux("attach", "-t", "=" + sess["tmuxName"],  # exact match
+                   name=sess["tmuxName"]),
         ]
         try:
             proc = subprocess.Popen(
@@ -20112,8 +20276,20 @@ class SessionManager:
             # Persisted so the adopt path above can tell, after a manager-only
             # restart, whether the token changed under it and a relaunch is due.
             sess["ttydTokenFp"] = _token_fp(TURMA_TOKEN)
+            # The server its `tmux attach` reaches (XERK-1078), checked above.
+            sess["ttydTmuxSocket"] = want_socket
         except Exception as e:
             raise RuntimeError(f"ttyd launch failed: {e}")
+
+    @staticmethod
+    def _await_port_free(port):
+        """Wait for a killed ttyd to release its port before rebinding it, or the
+        relaunch races it and fails to bind (leaving the terminal down). Bounded;
+        SIGTERM'd ttyd exits promptly."""
+        for _ in range(20):
+            if not _port_open(port):
+                break
+            time.sleep(0.1)
 
     def _kill_tmux(self, sess):
         # On Windows the pty-host is BOTH the terminal and the pty (no separate
@@ -20123,7 +20299,7 @@ class SessionManager:
         if IS_WINDOWS:
             _pty_teardown(sess.get("tmuxName"))
             return
-        run(["tmux", "kill-session", "-t", "=" + sess["tmuxName"]])  # exact match
+        _kill_tmux_session(sess["tmuxName"], exact=True)
 
     def _kill_ttyd(self, sid):
         # Windows: the pty-host that served the terminal was torn down by
@@ -22871,8 +23047,24 @@ class SessionManager:
         names = set(recorded)
         if not names:
             return set()
-        rc, out = run_out(["tmux", "list-panes", "-a", "-F",
-                           "#{session_name} #{pane_id} #{pane_pid}"], timeout=5)
+        # One listing per server (a legacy default-server session too, XERK-1078),
+        # each filtered to the sessions the agent put there; any failure fails all.
+        # An EMPTY server (exit-empty off; its last session just died, before
+        # the sweep has reaped it) lists as no panes, never as a failure — that
+        # would blind the guard for every OTHER server's sessions. Only the
+        # CONNECTED "no current target" counts: "no server running" is also what
+        # a live server whose socket file was deleted says, and reading that as
+        # empty would leave its agents killable. The guard fails closed there.
+        rc, lines = 0, []
+        for base, owns in _tmux_servers():
+            if not any(owns(n) for n in names):
+                continue
+            rc, out = _tmux_list_panes(base, "#{session_name} #{pane_id} #{pane_pid}",
+                                       empty=("no current target",))
+            if rc != 0:
+                break
+            # Tagged by server: pane ids are unique per SERVER only.
+            lines += [(base == ["tmux"], owns, ln) for ln in out.splitlines()]
         if rc != 0:
             cached = self._memguard_panes_cache
             if (not cached or cached[0] != names or procs is None
@@ -22881,14 +23073,14 @@ class SessionManager:
                 return None
             return {pid for pid, _ in cached[1]}
         first = {}                          # session name -> (pane id, pane pid)
-        by_id = {}                          # pane id -> pane pid, whole server
-        for line in out.splitlines():
+        by_id = {}                  # (on default server, pane id) -> pane pid
+        for on_default, owns, line in lines:
             rest, _, pid = line.rpartition(" ")
             name, _, pane_id = rest.rpartition(" ")
             if not (_is_pane_id(pane_id) and pid.isascii() and pid.isdigit()):
                 continue
-            by_id[pane_id] = int(pid)
-            if name in names:
+            by_id[(on_default, pane_id)] = int(pid)
+            if name in names and owns(name):
                 cand = (int(pane_id[1:]), int(pid))
                 if name not in first or cand < first[name]:
                     first[name] = cand
@@ -22897,8 +23089,8 @@ class SessionManager:
             pane = recorded[name]
             if pane is None:
                 agents[name] = pid
-            elif pane in by_id:
-                agents[name] = by_id[pane]
+            elif (name in _legacy_tmux, pane) in by_id:
+                agents[name] = by_id[(name in _legacy_tmux, pane)]
         panes = set(agents.values())
         # Cache only a listing that saw EVERY running session, each pane still
         # alive to be timed: one missing (mid-relaunch, or its tmux just died)
@@ -23523,35 +23715,38 @@ class SessionManager:
         `error connecting to …`. Reading that as "can't tell" left exactly the
         session this sweep exists for reading `running` forever, and
         `resume_on_boot` does not cover it: that runs only at manager START, so
-        nothing would have healed it until the agent restarted.
+        nothing would have healed it until the agent restarted. The agent's
+        server runs `exit-empty off`, so once its last session dies it stays UP
+        and EMPTY, and `list-panes -a` fails `no current target` — empty too.
         Every OTHER nonzero rc (a wedged tmux, a permissions error, a failure to
         launch at all) stays "can't tell" — `_sweep_dead_sessions` must err toward
-        leaving sessions alone, so only these two explicit messages mean empty.
+        leaving sessions alone, so only `_TMUX_EMPTY_ERRS` mean empty.
         So does a line that does not parse: a partial read could drop a live
         agent pane."""
         if IS_WINDOWS:
             return None      # no tmux; the pty-host liveness read is _pty_alive
-        try:
-            out = subprocess.run(
-                ["tmux", "list-panes", "-a", "-F", "#{session_name} #{pane_id}"],
-                capture_output=True, text=True, timeout=5)
-        except Exception:
-            return None
-        if out.returncode == 0:
-            live = {}
-            for line in out.stdout.splitlines():
+        # One listing per server: TMUX_SOCKET, plus the default server while a
+        # legacy session is left there (XERK-1078), each filtered to the sessions
+        # the agent put on it. Any server that can't answer makes the whole
+        # answer "can't tell". A legacy name the default server no longer holds
+        # is dropped: nothing else would (it died outside `_kill_tmux_session`).
+        live = {}
+        for base, owns in _tmux_servers():
+            rc, out = _tmux_list_panes(base, "#{session_name} #{pane_id}")
+            if rc != 0:
+                return None
+            for line in out.splitlines():
                 if not line.strip():
                     continue
                 # rpartition: a session name may itself contain spaces.
                 name, _, pane = line.rpartition(" ")
                 if not name or not _is_pane_id(pane):
                     return None
-                live.setdefault(name, set()).add(pane)
-            return live
-        err = (out.stderr or "").lower()
-        if "no server running" in err or "error connecting to" in err:
-            return {}        # the server is gone: there are NO tmux sessions
-        return None
+                if owns(name):
+                    live.setdefault(name, set()).add(pane)
+            if base == ["tmux"]:
+                _forget_legacy_tmux(n for n in set(_legacy_tmux) if n not in live)
+        return live
 
     def _sweep_dead_sessions(self):
         """Stop a `running` session whose tmux — or whose agent pane — is gone
@@ -23601,7 +23796,13 @@ class SessionManager:
         # own window. Never on the pane id alone: ids are unique only per tmux
         # SERVER, which exits with its last session and restarts at %0, so any
         # later pane could carry a dead agent's id and keep it `running` forever.
-        all_panes = set().union(*live.values()) if live else set()
+        # Pane ids are unique per SERVER only, so an agent pane is looked for
+        # among the panes of its own session's server (XERK-1078 transition).
+        legacy = set(_legacy_tmux)
+        server_panes = {
+            on_legacy: set().union(*(ps for n, ps in (live or {}).items()
+                                     if (n in legacy) == on_legacy))
+            for on_legacy in (False, True)}
         for sess in list(self.registry):
             if sess.get("status") != "running":
                 sess.pop("deadTmuxStrikes", None)
@@ -23621,7 +23822,8 @@ class SessionManager:
             if not _is_pane_id(agent_pane):
                 agent_pane = None
             leftover = tmux in live      # the tmux outlived its agent pane
-            if leftover and (agent_pane is None or agent_pane in all_panes):
+            if leftover and (agent_pane is None
+                             or agent_pane in server_panes[tmux in legacy]):
                 sess.pop("deadTmuxStrikes", None)
                 # The tmux came up: a resume that reached this beat alive is not
                 # a doomed one, so it is no longer a fresh-relaunch candidate.
@@ -23644,7 +23846,7 @@ class SessionManager:
             if leftover:
                 log(f"session {sid}: agent pane {agent_pane} exited; closing the "
                     f"windows it left in {tmux}")
-                run(["tmux", "kill-session", "-t", "=" + tmux], timeout=5)
+                _kill_tmux_session(tmux, exact=True, timeout=5)
             # XERK-892: a RESUME launch whose tmux never came up is the doomed
             # `claude --resume <unresumable id>` case — the pinned transcript had
             # no entry to rejoin, so claude exited at once. (A resume that DID
@@ -23981,7 +24183,8 @@ class SessionManager:
             return _pty_alive(tmux_name, strict=strict)
         if not tmux_name:
             return False
-        rc, _ = run_ok(["tmux", "has-session", "-t", "=" + tmux_name], timeout=5)
+        rc, _ = run_ok(_tmux("has-session", "-t", "=" + tmux_name, name=tmux_name),
+                       timeout=5)
         return rc == 0
 
     def _sweep_orphan_questions(self):
@@ -28881,10 +29084,11 @@ class SessionManager:
             f"-- {shlex.quote(LIMITS_PROBE_PROMPT)}",
         ]
         self._kill_limits_probe()  # clean slate
-        rc, err = run_ok([
-            "tmux", "new-session", "-d", "-s", LIMITS_TMUX,
-            "-c", REGISTRY_DIR, "-x", "80", "-y", "24", " ".join(parts),
-        ])
+        rc, err = run_ok(_tmux(
+            "new-session", "-d", "-s", LIMITS_TMUX,
+            "-c", REGISTRY_DIR, "-x", "80", "-y", "24",
+            _TMUX_ENV_STRIP + " ".join(parts),
+        ))
         if rc != 0:
             log(f"limits probe launch failed: {err}")
             self._limits_probe_outcome(False)
@@ -29026,7 +29230,7 @@ class SessionManager:
         if IS_WINDOWS:
             _pty_teardown(LIMITS_TMUX)
             return
-        run(["tmux", "kill-session", "-t", "=" + LIMITS_TMUX])
+        _kill_tmux_session(LIMITS_TMUX, exact=True)
 
     def models_available(self):
         """The probed alias list, or () before the first successful probe —
@@ -31317,6 +31521,12 @@ class SessionManager:
         # agent's `tmux new-session` passes no `-f` and neither /etc/tmux.conf nor
         # ~/.tmux.conf is reliably present. See load_tmux_config().
         load_tmux_config()
+        # Sessions an older agent left on the DEFAULT server stay managed there
+        # until relaunched (XERK-1078); must precede resume_on_boot's adopt check.
+        _probe_legacy_tmux(
+            {s.get("tmuxName") for s in self.registry
+             if s.get("status") == "running" and s.get("tmuxName")}
+            | {DSH_WEB_TMUX, LIMITS_TMUX})
         # Probe the qwen runtime (binary + model route) on a WORKER THREAD when
         # this host offers qwen — the `qwen --version` subprocess stays off-beat
         # (XERK-395). It must start BEFORE resume_on_boot below: a boot relaunch

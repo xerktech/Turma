@@ -40,11 +40,13 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   system roots, protected-branch history destruction, `DROP DATABASE|TABLE`); **policy** (push to /
   delete `main`/`master`, self-merging a PR/MR — work lands via a human-merged PR); **attribution**
   (AI self-attribution trailers).
-- **Destructive includes the host's tmux server** (XERK-1077): `kill-server`, killing tmux by name
+- **Destructive includes the agent's tmux server** (XERK-1077): `kill-server`, killing tmux by name
   or PID, and `kill-session`/`-window`/`-pane` of anything that could resolve to an `agent-*` session
-  are denied unless tmux names a NON-default server (`-L`/`-S`; `-L default` is the host's).
-  - Every session is a pane of ONE default-socket server and inherits `$TMUX`, which tmux prefers
-    over `TMUX_TMPDIR` — so a "private" `TMUX_TMPDIR` kill-server killed every session on a host.
+  are denied unless tmux names some OTHER server (`-L`/`-S`). Protected: the default server and the
+  agent's own `-L turma` (`_AGENT_TMUX_SOCKET`, = `TMUX_SOCKET` in hub-agent.py).
+  - Sessions now run on `-L turma` with `$TMUX` unset (XERK-1078, `agent-sessions.md`), which removes
+    the class; the net stays as defence in depth, and the default server stays protected because
+    sessions an older agent started remain there across an in-place update.
   - tmux resolves `-t` by exact name, then unique PREFIX, then glob, so `-t ag` / `agent*` reach
     `agent-<id>`; a missing or unknowable target (`$var`, loop value) is the current session.
 - Ordinary dev work (edits, builds, tests, git, `rm -rf node_modules`) untouched. Allowlist a command
