@@ -2511,7 +2511,8 @@ function lostTranscripts() {
 // as everything lost, and must not reset the archive. An operator who has checked
 // the bucket sets ARCHIVE_RESEED_MAX, which then IS the ceiling. Read here, not
 // passed in, so no caller can drop it.
-function reseedCeiling(filed, override = process.env.ARCHIVE_RESEED_MAX) {
+function reseedCeiling(filed) {
+  const override = process.env.ARCHIVE_RESEED_MAX;
   const n = Number(override);
   if (override != null && String(override).trim() !== "" && Number.isFinite(n) && n >= 0) return Math.floor(n);
   return Math.min(200, Math.max(20, Math.floor((Number(filed) || 0) / 10)));

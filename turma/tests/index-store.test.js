@@ -702,21 +702,25 @@ test("pg mode: a filed row whose rendered files exist nowhere is reset so its ag
   } finally { archive.setRenderedGate(null); pgTeardown(); }
 });
 
-test("reseedCeiling: a tenth of filed rows within 20..200, and an explicit ARCHIVE_RESEED_MAX wins", () => {
-  assert.equal(archive.reseedCeiling(25), 20);
-  assert.equal(archive.reseedCeiling(1500), 150);
-  assert.equal(archive.reseedCeiling(11000), 200);
-  assert.equal(archive.reseedCeiling(25, "100000"), 100000, "the operator's override lifts it");
-  assert.equal(archive.reseedCeiling(11000, "0"), 0, "and can shut it off");
-  assert.equal(archive.reseedCeiling(25, ""), 20);
-  assert.equal(archive.reseedCeiling(25, "junk"), 20);
-  // With no argument it reads the env itself, so a caller cannot drop the override.
+test("reseedCeiling: a tenth of filed rows within 20..200, and a set ARCHIVE_RESEED_MAX wins", () => {
+  // It reads the env itself and takes no override argument, so no caller can drop it.
   const prev = process.env.ARCHIVE_RESEED_MAX;
+  const withEnv = (v, filed) => {
+    if (v === undefined) delete process.env.ARCHIVE_RESEED_MAX; else process.env.ARCHIVE_RESEED_MAX = v;
+    return archive.reseedCeiling(filed);
+  };
   try {
+    assert.equal(withEnv(undefined, 25), 20);
+    assert.equal(withEnv(undefined, 1500), 150);
+    assert.equal(withEnv(undefined, 11000), 200);
+    assert.equal(withEnv("100000", 25), 100000, "the operator's override lifts it");
+    assert.equal(withEnv("0", 11000), 0, "and can shut it off");
+    assert.equal(withEnv("", 25), 20);
+    assert.equal(withEnv("junk", 25), 20);
+    // A stray second argument must not hide the operator's override.
     process.env.ARCHIVE_RESEED_MAX = "500";
-    assert.equal(archive.reseedCeiling(25), 500);
-    delete process.env.ARCHIVE_RESEED_MAX;
-    assert.equal(archive.reseedCeiling(25), 20);
+    assert.equal(archive.reseedCeiling(25, null), 500);
+    assert.equal(archive.reseedCeiling(25, "7"), 500);
   } finally { if (prev === undefined) delete process.env.ARCHIVE_RESEED_MAX; else process.env.ARCHIVE_RESEED_MAX = prev; }
 });
 
