@@ -1372,6 +1372,27 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         self.assertEqual(guard._balanced_groups("echo (reboot"), ([], True))
         self.assertEqual(guard._balanced_groups("(a; b)"), (["a; b"], False))
 
+    def test_lexer_contexts_read_cleanly(self):
+        # The fallback masks a broken context in the verdict tests, so pin each
+        # one at the scanner: the exact body, and NOT suspect.
+        cases = [
+            ("(case x in a) esac; b)", ["case x in a) esac; b"]),        # esac after `)`
+            ("(case x in a) { t; } esac; b)", ["case x in a) { t; } esac; b"]),
+            ("(case x in a) echo esac;; b) t;; esac; c)",               # `esac` as argument
+             ["case x in a) echo esac;; b) t;; esac; c"]),
+            ("x ${v#(}; (a; b)", ["a; b"]),                             # ${…} context
+            ("( {case; b)", [" {case; b"]),                             # `{case` is a word
+            ("(echo do case; b)", ["echo do case; b"]),                 # `do` as argument
+            ("(case-x; b)", ["case-x; b"]),                             # word boundary
+            ("[[ $x =~ (a|b) ]]", []),
+            ("case $x in (a|b) t;; esac", []),
+            ("ls # (a; b)", []),
+            ("(t)#(\n(a; b)", ["t", "a; b"]),                           # `#` after `)`
+        ]
+        for cmd, bodies in cases:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard._balanced_groups(cmd), (bodies, False))
+
     def test_a_suspect_scan_fails_closed(self):
         # The lexer will misread SOME context; when it knows it lost track, the
         # split halves `echo $(true` / `rm -rf /)` are classified edge-stripped.
