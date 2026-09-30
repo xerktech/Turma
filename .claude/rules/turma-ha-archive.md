@@ -134,8 +134,9 @@ of-record**, so both halves of the ADR split now hold:
       listing would otherwise read as everything lost; past it nothing is reset and it logs. A set
       `ARCHIVE_RESEED_MAX` REPLACES the default, so an operator can lift it after checking the bucket.
     - Only ENOENT is absence (an ELOOP/EIO is not). Not in sqlite mode (its local FTS duplicates).
-    - Tests: `exist nowhere`, `only ENOENT` in `index-store.test.js`; `confirmLost` in
-      `archive-mirror.test.js`.
+    - Unset the override after the recovery, or the guard stays off for every later rollout.
+    - Tests: `exist nowhere`, `only ENOENT`, `reseedCeiling` in `index-store.test.js`; `confirmLost`
+      in `archive-mirror.test.js`.
   - **A pg-mode reconcile that lowers a cursor re-derives `msgCount` from the file's lines** — left at
     PG's GREATEST figure, the re-sent tail mirrors entries at stale ordinals and PG duplicates them.
   - Blocked = `ingestChunk` returns the cursor (no progress, never an error — XERK-255),

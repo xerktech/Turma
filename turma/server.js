@@ -4428,12 +4428,12 @@ async function reseedLostTranscripts() {
   if (!archiveMirror) return;
   const { candidates, filed } = archive.lostTranscripts();
   if (!candidates.length) return;
-  const cap = archive.reseedCeiling(filed, process.env.ARCHIVE_RESEED_MAX);
+  const cap = archive.reseedCeiling(filed);
   if (candidates.length > cap) {
     console.error(`archive: ${candidates.length} of ${filed} filed transcript(s) have no ` +
       `rendered files on disk or in the bucket — over the re-seed ceiling (${cap}), so none ` +
       `are reset; once the bucket is confirmed right, set ARCHIVE_RESEED_MAX to at least ` +
-      `${candidates.length} and restart to re-seed them`);
+      `${candidates.length} and restart to re-seed them, then unset it so the guard returns`);
     return;
   }
   const { gone, adopted } = await archiveMirror.confirmLost(candidates);

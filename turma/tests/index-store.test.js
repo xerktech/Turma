@@ -710,6 +710,14 @@ test("reseedCeiling: a tenth of filed rows within 20..200, and an explicit ARCHI
   assert.equal(archive.reseedCeiling(11000, "0"), 0, "and can shut it off");
   assert.equal(archive.reseedCeiling(25, ""), 20);
   assert.equal(archive.reseedCeiling(25, "junk"), 20);
+  // With no argument it reads the env itself, so a caller cannot drop the override.
+  const prev = process.env.ARCHIVE_RESEED_MAX;
+  try {
+    process.env.ARCHIVE_RESEED_MAX = "500";
+    assert.equal(archive.reseedCeiling(25), 500);
+    delete process.env.ARCHIVE_RESEED_MAX;
+    assert.equal(archive.reseedCeiling(25), 20);
+  } finally { if (prev === undefined) delete process.env.ARCHIVE_RESEED_MAX; else process.env.ARCHIVE_RESEED_MAX = prev; }
 });
 
 test("pg mode: only ENOENT counts as lost; a file that landed before the confirm is not reset", async () => {
