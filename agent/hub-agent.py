@@ -22844,10 +22844,17 @@ class SessionManager:
         agent it cannot identify must never look killable.
 
         Filtered to the registry's own tmux names (a session may open sessions on
-        the same server), and within each to its LOWEST pane id: the manager's
-        new-session made the first pane, and ids only grow, so a window a session
-        opened itself (`tmux new-window` inside the pane lands in agent-<id>) is
-        session work, not a place to hide a hog.
+        the same server), and within each to the pane `_spawn_in_tmux` recorded as
+        `agentPane` (XERK-1028): a window a session opened itself (`tmux
+        new-window` inside the pane lands in agent-<id>) is session work, not a
+        place to hide a hog — and stays so after the agent pane exits, when it
+        would become the session's LOWEST pane. A recorded pane no longer listed
+        protects nothing (the agent is gone; `_sweep_dead_sessions` reaps it). It
+        is matched anywhere on the server while the session's own tmux lives, as
+        the sweep does: swap-window/join-pane moves a pane without ending it. A
+        record without `agentPane` (launched before XERK-1037, or whose pane read
+        failed) falls back to its lowest pane id — the manager's new-session made
+        the first pane, and ids only grow.
 
         A successful listing is cached with each pane's start time; when a fresh
         one fails (a fork timing out under thrash), the cache stands in only if it
@@ -22855,8 +22862,13 @@ class SessionManager:
         is still the same process in `procs` — a session launched since would be
         missing, and one relaunched in place (same tmux name, new pane) would leave
         its new agent unprotected."""
-        names = {s.get("tmuxName") for s in list(self.registry)
-                 if s.get("status") == "running" and s.get("tmuxName")}
+        recorded = {}                       # tmux name -> recorded agent pane id
+        for s in list(self.registry):
+            if s.get("status") == "running" and s.get("tmuxName"):
+                pane = s.get("agentPane")
+                # A malformed id (hand-edited sessions.json) reads as unrecorded.
+                recorded[s["tmuxName"]] = pane if _is_pane_id(pane) else None
+        names = set(recorded)
         if not names:
             return set()
         rc, out = run_out(["tmux", "list-panes", "-a", "-F",
@@ -22869,21 +22881,31 @@ class SessionManager:
                 return None
             return {pid for pid, _ in cached[1]}
         first = {}                          # session name -> (pane id, pane pid)
+        by_id = {}                          # pane id -> pane pid, whole server
         for line in out.splitlines():
             rest, _, pid = line.rpartition(" ")
             name, _, pane_id = rest.rpartition(" ")
-            if (name in names and pane_id[:1] == "%" and pane_id[1:].isascii()
-                    and pane_id[1:].isdigit() and pid.isascii() and pid.isdigit()):
+            if not (_is_pane_id(pane_id) and pid.isascii() and pid.isdigit()):
+                continue
+            by_id[pane_id] = int(pid)
+            if name in names:
                 cand = (int(pane_id[1:]), int(pid))
                 if name not in first or cand < first[name]:
                     first[name] = cand
-        panes = {pid for _, pid in first.values()}
+        agents = {}                         # session name -> agent pane pid
+        for name, (_, pid) in first.items():
+            pane = recorded[name]
+            if pane is None:
+                agents[name] = pid
+            elif pane in by_id:
+                agents[name] = by_id[pane]
+        panes = set(agents.values())
         # Cache only a listing that saw EVERY running session, each pane still
         # alive to be timed: one missing (mid-relaunch, or its tmux just died)
         # would come back as a new pane no cached entry vouches for.
         cached = {(pid, _proc_start_time(pid)) for pid in panes}
         self._memguard_panes_cache = (
-            (names, cached) if names <= first.keys()
+            (names, cached) if names <= agents.keys()
             and all(start is not None for _, start in cached) else None)
         return panes
 

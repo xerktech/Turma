@@ -34980,6 +34980,38 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
             self.assertEqual(sm._memguard_panes(), set())
         ro.assert_not_called()
 
+    def test_panes_protect_the_recorded_agent_pane_not_the_lowest(self):
+        # XERK-1028: agent-a's agent pane %4 exited, leaving its own window %5
+        # as the lowest pane — a hog there must not inherit the protection.
+        sm = self.make_manager()
+        sm.registry = [{"id": "a", "status": "running", "tmuxName": "agent-a",
+                        "agentPane": "%4"},
+                       {"id": "b", "status": "running", "tmuxName": "agent-b",
+                        "agentPane": "%7"},
+                       {"id": "c", "status": "running", "tmuxName": "agent-c",
+                        "agentPane": "bogus"}]
+        # agent-b's agent pane was join-pane'd into another session: still the
+        # agent while agent-b lives. agent-c's malformed id reads as unrecorded.
+        out = ("agent-a %5 65\nagent-a %6 66\nagent-b %8 68\n"
+               "other %7 67\nagent-c %2 62\nagent-c %3 63\n")
+        with mock.patch.object(ha, "run_out", return_value=(0, out)), \
+                mock.patch.object(ha, "_proc_start_time", return_value=7):
+            self.assertEqual(sm._memguard_panes(), {67, 62})
+        # A session whose agent pane is gone is not vouched for: never cached.
+        self.assertIsNone(sm._memguard_panes_cache)
+        # The pane recorded, listed again: protected and cached.
+        out += "agent-a %4 64\n"
+        with mock.patch.object(ha, "run_out", return_value=(0, out)), \
+                mock.patch.object(ha, "_proc_start_time", return_value=7):
+            self.assertEqual(sm._memguard_panes(), {64, 67, 62})
+        self.assertIsNotNone(sm._memguard_panes_cache)
+        # A recorded pane listed only in ANOTHER session, with the session's own
+        # tmux gone (a server restart reuses ids), protects nothing.
+        with mock.patch.object(ha, "run_out",
+                               return_value=(0, "other %4 64\nagent-c %2 62\n")), \
+                mock.patch.object(ha, "_proc_start_time", return_value=7):
+            self.assertEqual(sm._memguard_panes(), {62})
+
     def test_start_is_off_when_disabled_or_unreadable(self):
         sm = self.make_manager()
         with mock.patch.object(ha, "MEMGUARD", False), \
