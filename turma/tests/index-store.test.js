@@ -676,6 +676,13 @@ test("pg mode: a filed row whose rendered files exist nowhere is reset so its ag
     await mem.hydrateSessionsInto(archive.sessionLoader());
 
     archive.reconcileHydratedCursors();
+    // The hydrate only records it; nothing opens until the bucket is re-checked.
+    const lost = archive.lostTranscripts();
+    assert.deepEqual(lost.candidates.map((c) => c.transcriptId), ["t-lost"]);
+    assert.equal(lost.filed, 3);
+    assert.equal(archive.manifestCursors("nas", [{ transcriptId: "t-lost" }], "acme")["t-lost"], len,
+      "still blocked before the confirm");
+    assert.deepEqual(archive.reseedLost(["t-lost", "t-listed", "t-metaonly", "nope"]), ["t-lost"]);
     const have = archive.manifestCursors("nas",
       ["t-lost", "t-listed", "t-metaonly"].map((transcriptId) => ({ transcriptId })), "acme");
     assert.equal(have["t-lost"], 0, "nothing holds it: reset, so the agent re-sends from 0");
@@ -692,6 +699,57 @@ test("pg mode: a filed row whose rendered files exist nowhere is reset so its ag
     assert.equal(mem.entries.get("t-lost").size, 2, "Postgres entries overwritten by ordinal, not duplicated");
     // Still blocked ones refuse, as XERK-1050 requires.
     assert.deepEqual(archive.ingestChunk("nas", "t-listed", META, 0, len1, b1, "acme"), { bytesStored: len1 });
+  } finally { archive.setRenderedGate(null); pgTeardown(); }
+});
+
+test("pg mode: only ENOENT counts as lost; a file that landed before the confirm is not reset", async () => {
+  const mem = pgSetup();
+  archive.setRenderedGate(() => false);
+  try {
+    const b = [ent("u0", "user", "one")];
+    const len = Buffer.byteLength(JSON.stringify(b));
+    for (const id of ["t-loop", "t-late"]) archive.ingestChunk("nas", id, { ...META, summary: id }, 0, len, b, "acme");
+    const jsonlOf = (id) => path.join(process.env.ARCHIVE_DIR, archive.sessionRow(id).filePath);
+    // t-loop: both paths are self-looping symlinks — stat fails ELOOP, not ENOENT.
+    for (const p of [jsonlOf("t-loop"), jsonlOf("t-loop") + ".meta"]) { fs.unlinkSync(p); fs.symlinkSync(p, p); }
+    const lateBytes = fs.readFileSync(jsonlOf("t-late"));
+    const lateMeta = fs.readFileSync(jsonlOf("t-late") + ".meta");
+    fs.unlinkSync(jsonlOf("t-late")); fs.unlinkSync(jsonlOf("t-late") + ".meta");
+    archive.reconcileHydratedCursors();
+    assert.deepEqual(archive.lostTranscripts().candidates.map((c) => c.transcriptId), ["t-late"]);
+    // The old leader's final push lands during the grace period.
+    fs.writeFileSync(jsonlOf("t-late"), lateBytes); fs.writeFileSync(jsonlOf("t-late") + ".meta", lateMeta);
+    assert.deepEqual(archive.reseedLost(["t-late"]), [], "re-verified against disk before resetting");
+    assert.equal(archive.getTranscript("t-late").entries.length, 1);
+  } finally { archive.setRenderedGate(null); pgTeardown(); }
+});
+
+test("pg mode: a reconcile that lowers the byte cursor re-derives msgCount, so a re-sent tail never duplicates PG entries", async () => {
+  const mem = pgSetup();
+  archive.setRenderedGate(() => false);
+  try {
+    const b = [ent("u0", "user", "a"), ent("u1", "assistant", "b"), ent("u2", "user", "c")];
+    const lines = b.map((e) => JSON.stringify(e));
+    const cut = Buffer.byteLength(lines[0]) + 1;
+    const total = Buffer.byteLength(lines.join("\n")) + 1;
+    // Offsets are the agent's source bytes; entries are what the hub renders.
+    archive.ingestChunk("nas", "t-short", META, 0, cut, [b[0]], "acme");
+    archive.ingestChunk("nas", "t-short", META, cut, total, [b[1], b[2]], "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-short").filePath);
+    // A restart left only the first line (and a sidecar at its cursor) on disk,
+    // while Postgres kept the full figures.
+    const first = fs.readFileSync(jsonl, "utf8").split("\n")[0] + "\n";
+    fs.writeFileSync(jsonl, first);
+    const sc = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    fs.writeFileSync(jsonl + ".meta", JSON.stringify({ ...sc, bytesStored: cut }));
+    archive.setIndexMode(null); archive.setIndexSink(mem.sink()); archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    archive.reconcileHydratedCursors();
+    assert.equal(archive.sessionRow("t-short").msgCount, 1, "msgCount follows the shorter file");
+    assert.equal(archive.manifestCursors("nas", [{ transcriptId: "t-short" }], "acme")["t-short"], cut);
+    archive.ingestChunk("nas", "t-short", META, cut, total, [b[1], b[2]], "acme");
+    assert.equal(mem.entries.get("t-short").size, 3, "re-sent tail landed at ordinals 1-2, not 3-4");
+    assert.deepEqual(archive.getTranscript("t-short").entries.map((e) => e.text), ["a", "b", "c"]);
   } finally { archive.setRenderedGate(null); pgTeardown(); }
 });
 

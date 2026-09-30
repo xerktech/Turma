@@ -366,6 +366,32 @@ class ArchiveMirror {
     return landed;
   }
 
+  // Re-check, key by key, transcripts the last hydrate found on neither disk nor
+  // the bucket listing (`archive.lostTranscripts`). Run after a grace period that
+  // outlasts the previous leader's shutdown, whose final push lands AFTER the lease
+  // moves (so after this replica listed). Returns the ids whose `.jsonl` and `.meta`
+  // are both still absent — safe to re-seed. A key that has since LANDED is adopted
+  // as blocked, so `retryBlockedUntilClear` downloads it and reconciles through
+  // `onLanded` like any other blocked key. A stat that fails says nothing: that
+  // transcript is left blocked, neither gone nor adopted.
+  async confirmLost(candidates) {
+    const gone = [];
+    let adopted = 0;
+    if (!this.blobStore) return { gone, adopted };
+    for (const c of candidates || []) {
+      const keys = [this.keyFor(c.jsonl), this.keyFor(c.meta)];
+      if (keys.some((k) => !k)) continue;
+      let present;
+      try { present = await Promise.all(keys.map(async (k) => !!(await this.blobStore.stat(k)))); }
+      catch { continue; }
+      if (!present[0] && !present[1]) { gone.push(c.transcriptId); continue; }
+      keys.forEach((k, i) => { if (present[i]) this._blocked.set(k, `${k} (landed after the listing)`); });
+      adopted++;
+    }
+    if (adopted) this.retryBlockedUntilClear().catch(() => {});
+    return { gone, adopted };
+  }
+
   // retryBlocked, with the same capped backoff, until nothing is blocked. The
   // rest of the hub ingests meanwhile; one log line per attempt names the cause.
   // Single-flight: a second call while one runs is a no-op. `sleep` injectable.

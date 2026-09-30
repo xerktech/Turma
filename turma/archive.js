@@ -2419,10 +2419,11 @@ function reconcileHydratedCursors() {
   const upd = isPgMode() ? null : db.prepare(
     "UPDATE sessions SET bytesStored=?, archiveBytes=?, rawBytes=? WHERE transcriptId=?");
   let healed = 0;
-  const reseeded = [];
+  lostCandidates.clear();
+  lostFiledCount = rows.length;
   for (const row of rows) {
     const paths = filePaths(row.filePath);
-    if (reseedLost(row, paths)) { reseeded.push(row.transcriptId); continue; }
+    if (lostEverywhere(row, paths)) lostCandidates.set(row.transcriptId, paths);
     // Records the ones a missing file blocks (XERK-1050), logged once each.
     if (renderedGate) renderedBlocked(row);
     let fileSize;
@@ -2436,7 +2437,17 @@ function reconcileHydratedCursors() {
       // Mutate the LIVE map row (idxFiledRows returned a copy); filePath is unchanged
       // so the filePath index stays consistent.
       const live = sessionsMap.get(row.transcriptId);
-      if (live) { live.bytesStored = bytesStored; live.archiveBytes = fileSize; live.rawBytes = rawBytes; }
+      if (live) {
+        live.bytesStored = bytesStored; live.archiveBytes = fileSize; live.rawBytes = rawBytes;
+        // msgCount is the ordinal the next chunk's entries mirror at. Left at PG's
+        // (GREATEST-kept) figure over a SHORTER file, the re-sent tail lands at
+        // stale ordinals and Postgres holds duplicate entries. One line per entry,
+        // and only a changed file is read.
+        if (fileSize !== row.archiveBytes) {
+          const n = countLines(paths.jsonl);
+          if (n != null) live.msgCount = n;
+        }
+      }
     } else {
       upd.run(bytesStored, fileSize, rawBytes, row.transcriptId);
     }
@@ -2446,37 +2457,67 @@ function reconcileHydratedCursors() {
     console.error(`archive: reconciled ${healed} transcript cursor(s) against local files ` +
       `after a Postgres index hydrate (files ahead of the of-record; XERK-780)`);
   }
-  if (reseeded.length) {
-    console.error(`archive: ${reseeded.length} transcript(s) are recorded in the Postgres ` +
-      `index but their rendered files are on neither this disk nor the bucket — cursors ` +
-      `reset to 0 so their agents re-send them (e.g. ${reseeded.slice(0, 3).join(", ")})`);
-  }
   return healed;
 }
 
-// A filed pg-mode row whose `.jsonl` AND `.meta` exist NOWHERE: not on this disk, and
-// not in the bucket (the mirror listed it and holds no blocked download for it). The
-// index and the bytes reach their of-records on separate workers, so a leader that
-// dies between an index mirror and its byte drain leaves Postgres counting bytes no
-// one holds. XERK-1050 blocks such a row forever — right when the bucket holds a
-// copy a re-push would clobber, but here there is none, so blocking only strands the
-// transcript: the viewer serves it empty and its agent can never re-send it. Reset its
-// cursors (msgCount too: PG entries upsert by ordinal, so a re-send from 0 overwrites
-// rather than duplicates) and let the agent re-ship from byte 0. Not mirrored — PG's
-// GREATEST keeps the old figures, which the re-send reaches again; a hydrate before
-// then lands back here. pg mode only: sqlite mode's local FTS would duplicate.
-function reseedLost(row, paths) {
+function countLines(p) {
+  try {
+    const buf = fs.readFileSync(p);
+    let n = 0;
+    for (let i = buf.indexOf(10); i !== -1; i = buf.indexOf(10, i + 1)) n++;
+    return n;
+  } catch { return null; }
+}
+
+// A filed pg-mode row whose `.jsonl` AND `.meta` exist NOWHERE: not on this disk and
+// not in the bucket listing (the mirror holds no blocked download for it). The index
+// and the bytes reach their of-records on separate workers, so a pod that dies between
+// the two leaves Postgres counting bytes no one holds, and XERK-1050 then blocks the
+// row forever: the viewer serves it empty and its agent can never re-send it.
+//
+// The hydrate only RECORDS these (`lostCandidates`). The previous leader's final
+// archive push runs AFTER it hands over the lease, so a candidate's objects may
+// still be landing while this replica lists; resetting on the listing alone would
+// have a partial re-send PUT over the complete copy. server.js re-checks each key in
+// the bucket after a grace period and only then calls `reseedLost`.
+// pg mode only: sqlite mode's local FTS would duplicate on a re-send.
+const lostCandidates = new Map(); // transcriptId -> its filePaths
+let lostFiledCount = 0;
+function lostEverywhere(row, paths) {
   if (!isPgMode() || !renderedGate) return false;
   if (!(row.bytesStored > 0 || row.archiveBytes > 0)) return false;
   // Listed but not downloaded: the bucket HAS it — the XERK-1050 block stands.
   try { if (renderedGate(paths.jsonl)) return false; } catch { return false; }
-  const gone = (p) => { try { fs.statSync(p); return false; } catch (e) { return !!e && e.code === "ENOENT"; } };
-  if (!gone(paths.jsonl) || !gone(paths.meta)) return false;
-  const live = sessionsMap.get(row.transcriptId);
-  if (!live) return false;
-  live.bytesStored = 0; live.archiveBytes = 0; live.msgCount = 0;
-  missingFiled.delete(row.transcriptId);
-  return true;
+  return enoent(paths.jsonl) && enoent(paths.meta);
+}
+// Only ENOENT proves absence; any other stat error cannot say the file is gone.
+function enoent(p) {
+  try { fs.statSync(p); return false; } catch (e) { return !!e && e.code === "ENOENT"; }
+}
+// What the last hydrate found lost everywhere, plus how many filed rows it walked
+// (the caller's ceiling: an empty listing would otherwise read as everything lost).
+function lostTranscripts() {
+  return { filed: lostFiledCount,
+    candidates: [...lostCandidates].map(([transcriptId, p]) => ({ transcriptId, jsonl: p.jsonl, meta: p.meta })) };
+}
+// Reset the cursors (and msgCount: Postgres entries upsert by ordinal, so a re-send
+// from 0 overwrites rather than duplicates) of the named transcripts the bucket has
+// been re-checked NOT to hold, so their agents re-ship them from byte 0. Re-verifies
+// each against local disk and the gate first — ingest may have moved on since. Not
+// mirrored: PG's GREATEST keeps the old figures until the re-send reaches them.
+function reseedLost(ids) {
+  const reset = [];
+  for (const id of ids || []) {
+    const paths = lostCandidates.get(id);
+    lostCandidates.delete(id);
+    const live = paths && sessionsMap && sessionsMap.get(id);
+    if (!live || !live.filePath || filePaths(live.filePath).jsonl !== paths.jsonl) continue;
+    if (!lostEverywhere(live, paths)) continue;
+    live.bytesStored = 0; live.archiveBytes = 0; live.msgCount = 0;
+    missingFiled.delete(id);
+    reset.push(id);
+  }
+  return reset;
 }
 
 // The mirror's `onLanded` (XERK-1050): a blocked rendered file landed after the
@@ -3230,7 +3271,7 @@ module.exports = {
   openDb, closeDb, rebuildIndex, setBlobSink, setRawRemote,
   // Boot/hydrate serialization + corrupt-cache self-heal (XERK-789) — all inert
   // off HA (`hydrating` is only ever set around the HA index hydrate).
-  isHydrating, setHydrating, isSqliteCorruption, resetLocalIndex, checkIndexIntegrity,
+  isHydrating, setHydrating, isSqliteCorruption, lostTranscripts, reseedLost, resetLocalIndex, checkIndexIntegrity,
   // The per-transcript rendered gate (XERK-1050) — unset, and inert, off HA.
   setRenderedGate, missingFiledPaths, reconcileLanded,
   // The Postgres INDEX of-record seam (XERK-780): the write sink + the hydration

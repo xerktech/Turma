@@ -114,6 +114,28 @@ test("a final drain pushes past the leader gate and waits out an in-flight drain
   assert.equal(m.pending(), 0);
 });
 
+test("confirmLost: gone in the bucket is re-seedable; landed since the listing is downloaded", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  const landed = [];
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {},
+    onLanded: () => landed.push(1) });
+  await m.hydrate(); // empty listing
+  const c = (id) => ({ transcriptId: id, jsonl: path.join(root, "repo", `${id}.jsonl`),
+    meta: path.join(root, "repo", `${id}.jsonl.meta`) });
+  // After the listing, the old leader's final push lands `late` (both keys).
+  store.map.set("repo/late.jsonl", Buffer.from("l\n"));
+  store.map.set("repo/late.jsonl.meta", Buffer.from("{}"));
+  const stat = store.stat;
+  store.stat = async (k) => { if (k.startsWith("repo/err")) throw new Error("HTTP 500"); return stat(k); };
+  const r = await m.confirmLost([c("gone"), c("late"), c("err")]);
+  assert.deepEqual(r, { gone: ["gone"], adopted: 1 });
+  await new Promise((res) => setTimeout(res, 2100)); // retryBlockedUntilClear's first pass
+  assert.equal(fs.readFileSync(path.join(root, "repo", "late.jsonl"), "utf8"), "l\n");
+  assert.ok(landed.length >= 1, "a landing reconciles through onLanded");
+  assert.equal(m.blockedCount(), 0);
+});
+
 test("a failed push is re-queued; a raced-delete (ENOENT) is dropped", async () => {
   const root = mkdtemp("turma-mir-");
   const good = path.join(root, "good.jsonl");

@@ -123,12 +123,20 @@ of-record**, so both halves of the ADR split now hold:
     `.jsonl`/`.meta`, OR its row records `archiveBytes` with no local `.jsonl` / `bytesStored` with no
     `.meta` (a GET that 404'd after the listing, never mirrored, or hand-deleted). The second arm
     needs no mirror state, so it holds across a restart, and logs each id once.
-  - **Except when NOTHING is left** (`reseedLost`, pg mode): a filed row whose `.jsonl` AND `.meta` are
-    on neither disk nor the bucket (not in the mirror's `_blocked`) has its cursors + `msgCount` reset
-    to 0 in the map, so the agent re-ships it. Blocking it only served it empty forever; with no
-    bucket copy there is nothing for a re-push to clobber (the XERK-1048 hazard). PG's GREATEST keeps
-    the old figures, so a hydrate before the re-send completes resets it again. Not in sqlite mode,
-    whose local FTS would duplicate. Tests: `exist nowhere` in `index-store.test.js`.
+  - **Except when NOTHING is left** (pg mode): a filed row whose `.jsonl` AND `.meta` are ENOENT
+    locally and not in the listing is only RECORDED by the hydrate (`lostTranscripts`). After
+    `ARCHIVE_RESEED_GRACE_MS` (60s) `reseedLostTranscripts` re-`stat`s each key in the bucket: still
+    absent → `reseedLost` resets cursors + `msgCount` so the agent re-ships from 0; landed since →
+    adopted as blocked and downloaded. Blocking it only served it empty forever.
+    - **Never reset on the listing alone**: the old leader's final push runs AFTER the lease moves,
+      so its objects can land after the successor lists, and a partial re-send would PUT over them.
+    - **Ceiling** (`ARCHIVE_RESEED_MAX`, and a tenth of filed rows): an empty or wrong-bucket listing
+      would otherwise read as everything lost; past it nothing is reset and it logs.
+    - Only ENOENT is absence (an ELOOP/EIO is not). Not in sqlite mode (its local FTS duplicates).
+    - Tests: `exist nowhere`, `only ENOENT` in `index-store.test.js`; `confirmLost` in
+      `archive-mirror.test.js`.
+  - **A pg-mode reconcile that lowers a cursor re-derives `msgCount` from the file's lines** — left at
+    PG's GREATEST figure, the re-sent tail mirrors entries at stale ordinals and PG duplicates them.
   - Blocked = `ingestChunk` returns the cursor (no progress, never an error — XERK-255),
     `inventoryCursors` does not want it, `relPathOwner` treats a blocked path as owned. The
     MANIFEST path still reports its cursor: an id left out there is pushed from 0 every beat.
