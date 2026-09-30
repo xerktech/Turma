@@ -645,6 +645,132 @@ test("XERK-793 pg mode: a promoted replica hydrates its map from PG (sessions on
   } finally { pgTeardown(); }
 });
 
+test("pg mode: a filed row whose rendered files exist nowhere is reset so its agent re-sends it", async () => {
+  const mem = pgSetup();
+  const blocked = new Set();
+  archive.setRenderedGate((p) => blocked.has(p));
+  try {
+    const b = [ent("u0", "user", "lost then found"), ent("u1", "assistant", "resent")];
+    const len = Buffer.byteLength(JSON.stringify(b));
+    const b1 = [ent("x0", "user", "stays blocked")];
+    const len1 = Buffer.byteLength(JSON.stringify(b1));
+    for (const id of ["t-lost", "t-listed", "t-metaonly"]) {
+      archive.ingestChunk("nas", id, { ...META, summary: id }, 0, id === "t-lost" ? len : len1,
+        id === "t-lost" ? b : b1, "acme");
+    }
+    const pathsOf = (id) => {
+      const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow(id).filePath);
+      return { jsonl, meta: jsonl + ".meta" };
+    };
+    // The leader died between the index mirror and the byte drain: Postgres counts the
+    // bytes, while this fresh replica's disk and the bucket have neither file.
+    for (const id of ["t-lost", "t-listed"]) {
+      fs.unlinkSync(pathsOf(id).jsonl);
+      fs.unlinkSync(pathsOf(id).meta);
+    }
+    blocked.add(pathsOf("t-listed").jsonl);   // ...but the bucket listed this one
+    fs.unlinkSync(pathsOf("t-metaonly").jsonl); // ...and this one kept its sidecar
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+
+    archive.reconcileHydratedCursors();
+    // The hydrate only records it; nothing opens until the bucket is re-checked.
+    const lost = archive.lostTranscripts();
+    assert.deepEqual(lost.candidates.map((c) => c.transcriptId), ["t-lost"]);
+    assert.equal(lost.filed, 3);
+    assert.equal(archive.manifestCursors("nas", [{ transcriptId: "t-lost" }], "acme")["t-lost"], len,
+      "still blocked before the confirm");
+    assert.deepEqual(archive.reseedLost(["t-lost", "t-listed", "t-metaonly", "nope"]), ["t-lost"]);
+    const have = archive.manifestCursors("nas",
+      ["t-lost", "t-listed", "t-metaonly"].map((transcriptId) => ({ transcriptId })), "acme");
+    assert.equal(have["t-lost"], 0, "nothing holds it: reset, so the agent re-sends from 0");
+    assert.equal(archive.sessionRow("t-lost").msgCount, 0);
+    assert.equal(have["t-listed"], len1, "the bucket holds it: stays blocked");
+    assert.equal(have["t-metaonly"], len1, "a sidecar survives: stays blocked");
+    // Only the sidecar-survivor is blocked for a missing file; the listed one is the
+    // mirror's to count, and the reset one is not blocked at all.
+    assert.deepEqual(archive.missingFiledPaths(), [pathsOf("t-metaonly").jsonl]);
+
+    // The agent is asked from 0, re-sends, and the transcript reads back whole.
+    assert.equal(archive.ingestChunk("nas", "t-lost", META, 0, len, b, "acme").bytesStored, len);
+    assert.deepEqual(archive.getTranscript("t-lost").entries.map((e) => e.text), ["lost then found", "resent"]);
+    assert.equal(mem.entries.get("t-lost").size, 2, "Postgres entries overwritten by ordinal, not duplicated");
+    // Still blocked ones refuse, as XERK-1050 requires.
+    assert.deepEqual(archive.ingestChunk("nas", "t-listed", META, 0, len1, b1, "acme"), { bytesStored: len1 });
+  } finally { archive.setRenderedGate(null); pgTeardown(); }
+});
+
+test("reseedCeiling: a tenth of filed rows within 20..200, and an explicit ARCHIVE_RESEED_MAX wins", () => {
+  assert.equal(archive.reseedCeiling(25), 20);
+  assert.equal(archive.reseedCeiling(1500), 150);
+  assert.equal(archive.reseedCeiling(11000), 200);
+  assert.equal(archive.reseedCeiling(25, "100000"), 100000, "the operator's override lifts it");
+  assert.equal(archive.reseedCeiling(11000, "0"), 0, "and can shut it off");
+  assert.equal(archive.reseedCeiling(25, ""), 20);
+  assert.equal(archive.reseedCeiling(25, "junk"), 20);
+  // With no argument it reads the env itself, so a caller cannot drop the override.
+  const prev = process.env.ARCHIVE_RESEED_MAX;
+  try {
+    process.env.ARCHIVE_RESEED_MAX = "500";
+    assert.equal(archive.reseedCeiling(25), 500);
+    delete process.env.ARCHIVE_RESEED_MAX;
+    assert.equal(archive.reseedCeiling(25), 20);
+  } finally { if (prev === undefined) delete process.env.ARCHIVE_RESEED_MAX; else process.env.ARCHIVE_RESEED_MAX = prev; }
+});
+
+test("pg mode: only ENOENT counts as lost; a file that landed before the confirm is not reset", async () => {
+  const mem = pgSetup();
+  archive.setRenderedGate(() => false);
+  try {
+    const b = [ent("u0", "user", "one")];
+    const len = Buffer.byteLength(JSON.stringify(b));
+    for (const id of ["t-loop", "t-late"]) archive.ingestChunk("nas", id, { ...META, summary: id }, 0, len, b, "acme");
+    const jsonlOf = (id) => path.join(process.env.ARCHIVE_DIR, archive.sessionRow(id).filePath);
+    // t-loop: both paths are self-looping symlinks — stat fails ELOOP, not ENOENT.
+    for (const p of [jsonlOf("t-loop"), jsonlOf("t-loop") + ".meta"]) { fs.unlinkSync(p); fs.symlinkSync(p, p); }
+    const lateBytes = fs.readFileSync(jsonlOf("t-late"));
+    const lateMeta = fs.readFileSync(jsonlOf("t-late") + ".meta");
+    fs.unlinkSync(jsonlOf("t-late")); fs.unlinkSync(jsonlOf("t-late") + ".meta");
+    archive.reconcileHydratedCursors();
+    assert.deepEqual(archive.lostTranscripts().candidates.map((c) => c.transcriptId), ["t-late"]);
+    // The old leader's final push lands during the grace period.
+    fs.writeFileSync(jsonlOf("t-late"), lateBytes); fs.writeFileSync(jsonlOf("t-late") + ".meta", lateMeta);
+    assert.deepEqual(archive.reseedLost(["t-late"]), [], "re-verified against disk before resetting");
+    assert.equal(archive.getTranscript("t-late").entries.length, 1);
+  } finally { archive.setRenderedGate(null); pgTeardown(); }
+});
+
+test("pg mode: a reconcile that lowers the byte cursor re-derives msgCount, so a re-sent tail never duplicates PG entries", async () => {
+  const mem = pgSetup();
+  archive.setRenderedGate(() => false);
+  try {
+    const b = [ent("u0", "user", "a"), ent("u1", "assistant", "b"), ent("u2", "user", "c")];
+    const lines = b.map((e) => JSON.stringify(e));
+    const cut = Buffer.byteLength(lines[0]) + 1;
+    const total = Buffer.byteLength(lines.join("\n")) + 1;
+    // Offsets are the agent's source bytes; entries are what the hub renders.
+    archive.ingestChunk("nas", "t-short", META, 0, cut, [b[0]], "acme");
+    archive.ingestChunk("nas", "t-short", META, cut, total, [b[1], b[2]], "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-short").filePath);
+    // A restart left only the first line (and a sidecar at its cursor) on disk,
+    // while Postgres kept the full figures.
+    const first = fs.readFileSync(jsonl, "utf8").split("\n")[0] + "\n";
+    fs.writeFileSync(jsonl, first);
+    const sc = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    fs.writeFileSync(jsonl + ".meta", JSON.stringify({ ...sc, bytesStored: cut }));
+    archive.setIndexMode(null); archive.setIndexSink(mem.sink()); archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    archive.reconcileHydratedCursors();
+    assert.equal(archive.sessionRow("t-short").msgCount, 1, "msgCount follows the shorter file");
+    assert.equal(archive.manifestCursors("nas", [{ transcriptId: "t-short" }], "acme")["t-short"], cut);
+    archive.ingestChunk("nas", "t-short", META, cut, total, [b[1], b[2]], "acme");
+    assert.equal(mem.entries.get("t-short").size, 3, "re-sent tail landed at ordinals 1-2, not 3-4");
+    assert.deepEqual(archive.getTranscript("t-short").entries.map((e) => e.text), ["a", "b", "c"]);
+  } finally { archive.setRenderedGate(null); pgTeardown(); }
+});
+
 test("XERK-797 pg mode: a wiped/empty PG is rebuilt-of-record from the local files (no re-push duplication)", async () => {
   const mem = pgSetup();
   try {

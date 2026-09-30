@@ -67,7 +67,7 @@ class ArchiveMirror {
     this.onLanded = typeof onLanded === "function" ? onLanded : () => {};
     this.log = typeof log === "function" ? log : (m) => console.error(m);
     this._dirty = new Set();
-    this._draining = false;
+    this._draining = null; // the in-flight drain's promise, while one runs
     this._hydrating = false;
     // Remote-pending raw objects: raw-root key (`<repo>/<x>.jsonl.raw`) ->
     // Map(key -> remote size). Grouped by root so the per-transcript questions
@@ -129,33 +129,43 @@ class ArchiveMirror {
   }
 
   // Push every dirty file to the blob store. Best-effort per file: a failed push
-  // is re-queued for the next drain (the archive's own re-push discipline — a
-  // lagging of-record only means an agent re-sends the un-mirrored tail on
-  // promotion, never data loss). Serialized so two workers never overlap.
-  async drain() {
-    if (!this.blobStore || this._draining) return 0;
-    if (!this.isLeader()) return 0; // single owning writer (XERK-763 seam)
-    this._draining = true;
+  // is re-queued for the next drain. Serialized so two workers never overlap.
+  //
+  // `final` is the shutdown push: it WAITS for an in-flight drain instead of
+  // returning (the periodic worker is usually mid-drain under ingest load), and
+  // ignores the `isLeader` seam — this replica holds the only copy of whatever it
+  // has not pushed, on an emptyDir that dies with the pod. Skipping it is not
+  // harmless: the index reaches Postgres on its own worker, so a replacement leader
+  // found rows counting bytes no one held (what `archive.reseedLost` recovers).
+  async drain({ final = false } = {}) {
+    if (!this.blobStore) return 0;
+    if (this._draining) {
+      if (!final) return 0;
+      await this._draining.catch(() => {});
+    }
+    if (!final && !this.isLeader()) return 0; // single owning writer (XERK-763 seam)
+    const run = this._drainOnce();
+    this._draining = run;
+    try { return await run; } finally { if (this._draining === run) this._draining = null; }
+  }
+
+  async _drainOnce() {
     let pushed = 0;
-    try {
-      const batch = Array.from(this._dirty);
-      for (const key of batch) {
-        // Blocked = short of the bucket's copy (XERK-1050): never PUT it over that.
-        if (this._blocked.has(key)) continue;
-        this._dirty.delete(key);
-        const file = this.pathFor(key);
-        if (!file) continue;
-        try {
-          await this.blobStore.put(key, { file });
-          pushed++;
-        } catch (e) {
-          // ENOENT = the local file was deleted between note and push (a raced
-          // operator delete); drop it. Anything else is transient — re-queue.
-          if (!(e && e.code === "ENOENT")) this._dirty.add(key);
-        }
+    const batch = Array.from(this._dirty);
+    for (const key of batch) {
+      // Blocked = short of the bucket's copy (XERK-1050): never PUT it over that.
+      if (this._blocked.has(key)) continue;
+      this._dirty.delete(key);
+      const file = this.pathFor(key);
+      if (!file) continue;
+      try {
+        await this.blobStore.put(key, { file });
+        pushed++;
+      } catch (e) {
+        // ENOENT = the local file was deleted between note and push (a raced
+        // operator delete); drop it. Anything else is transient — re-queue.
+        if (!(e && e.code === "ENOENT")) this._dirty.add(key);
       }
-    } finally {
-      this._draining = false;
     }
     return pushed;
   }
@@ -354,6 +364,32 @@ class ArchiveMirror {
     for (const k of done) this._blocked.delete(k);
     this.lastFailure = this._blockedSummary();
     return landed;
+  }
+
+  // Re-check, key by key, transcripts the last hydrate found on neither disk nor
+  // the bucket listing (`archive.lostTranscripts`). Run after a grace period that
+  // outlasts the previous leader's shutdown, whose final push lands AFTER the lease
+  // moves (so after this replica listed). Returns the ids whose `.jsonl` and `.meta`
+  // are both still absent — safe to re-seed. A key that has since LANDED is adopted
+  // as blocked, so `retryBlockedUntilClear` downloads it and reconciles through
+  // `onLanded` like any other blocked key. A stat that fails says nothing: that
+  // transcript is left blocked, neither gone nor adopted.
+  async confirmLost(candidates) {
+    const gone = [];
+    let adopted = 0;
+    if (!this.blobStore) return { gone, adopted };
+    for (const c of candidates || []) {
+      const keys = [this.keyFor(c.jsonl), this.keyFor(c.meta)];
+      if (keys.some((k) => !k)) continue;
+      let present;
+      try { present = await Promise.all(keys.map(async (k) => !!(await this.blobStore.stat(k)))); }
+      catch { continue; }
+      if (!present[0] && !present[1]) { gone.push(c.transcriptId); continue; }
+      keys.forEach((k, i) => { if (present[i]) this._blocked.set(k, `${k} (landed after the listing)`); });
+      adopted++;
+    }
+    if (adopted) this.retryBlockedUntilClear().catch(() => {});
+    return { gone, adopted };
   }
 
   // retryBlocked, with the same capped backoff, until nothing is blocked. The

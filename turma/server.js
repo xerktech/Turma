@@ -4410,6 +4410,39 @@ async function hydrateArchiveOnce() {
   if (archiveMirror) {
     archiveMirror.retryBlockedUntilClear().catch((e) =>
       console.error(`archive hydrate: blocked-key retry failed: ${e && e.message}`));
+    const t = setTimeout(() => reseedLostTranscripts().catch((e) =>
+      console.error(`archive: re-seed check failed: ${e && e.message}`)), ARCHIVE_RESEED_GRACE_MS);
+    t.unref?.();
+  }
+}
+
+// Transcripts the hydrate found on neither disk nor the bucket (archive.js
+// `lostTranscripts`) are re-checked in the bucket once the previous leader's
+// shutdown push has had time to land — it runs after the lease moves — and only
+// those still absent are reset for their agents to re-send. The grace outlasts the
+// kubelet's SIGKILL (terminationGracePeriodSeconds 30s). Refused past a ceiling
+// (archive.reseedCeiling): a listing of the wrong or a recreated bucket would
+// otherwise read as everything lost.
+const ARCHIVE_RESEED_GRACE_MS = positiveEnv("ARCHIVE_RESEED_GRACE_MS", 60 * 1000);
+async function reseedLostTranscripts() {
+  if (!archiveMirror) return;
+  const { candidates, filed } = archive.lostTranscripts();
+  if (!candidates.length) return;
+  const cap = archive.reseedCeiling(filed);
+  if (candidates.length > cap) {
+    console.error(`archive: ${candidates.length} of ${filed} filed transcript(s) have no ` +
+      `rendered files on disk or in the bucket — over the re-seed ceiling (${cap}), so none ` +
+      `are reset; once the bucket is confirmed right, set ARCHIVE_RESEED_MAX to at least ` +
+      `${candidates.length} and restart to re-seed them, then unset it so the guard returns`);
+    return;
+  }
+  const { gone, adopted } = await archiveMirror.confirmLost(candidates);
+  const reset = archive.reseedLost(gone);
+  if (reset.length || adopted) {
+    console.error(`archive: re-seed check — ${reset.length} transcript(s) on neither disk nor ` +
+      `the bucket reset for their agents to re-send` +
+      (reset.length ? ` (e.g. ${reset.slice(0, 3).join(", ")})` : "") +
+      `; ${adopted} landed after the listing and are being downloaded`);
   }
 }
 
@@ -20214,6 +20247,9 @@ if (process.env.TURMA_TEST) {
   // long-lived streams are closed with a RECONNECT HINT (SSE `retry:`, tunnel WS
   // close-1001) so clients re-dial promptly to a surviving replica.
   const SHUTDOWN_DRAIN_MS = positiveEnv("SHUTDOWN_DRAIN_MS", 10 * 1000);
+  // The share of the flush phase the final archive push may take; the force-exit
+  // backstop still caps the whole drain at SHUTDOWN_DRAIN_MS.
+  const ARCHIVE_FINAL_DRAIN_MS = positiveEnv("ARCHIVE_FINAL_DRAIN_MS", 4 * 1000);
   // How long to keep serving with `/readyz` NotReady before cutting sockets, so
   // the Service has removed this pod from its EndpointSlice by the time it does.
   // Explicit `0` disables the wait — single-replica Recreate has no Service race
@@ -20314,12 +20350,12 @@ if (process.env.TURMA_TEST) {
       // HA: let those last per-host writes reach the store before its socket closes
       // below (a fire-and-forget set racing close() could be dropped).
       if (HA_ON) await settle(flushAgentsToStoreNow(), 1500);
-      // Best-effort final push of any un-mirrored archive bytes to the object
-      // store, so a deploy strands the least tail (agents re-push what doesn't
-      // make it on the next replica's promotion — never data loss, XERK-759). Not
-      // awaited: it reads files independently of the DB handle and must not hold
-      // up the exit; the drain worker's leader gate keeps a standby a no-op.
-      if (archiveMirror) archiveMirror.drain().catch(() => {});
+      // Final push of un-mirrored archive bytes to the object store, AWAITED
+      // (bounded). This replica's emptyDir holds the only copy, and the index rows
+      // for those bytes may already be in Postgres, so a fire-and-forget push —
+      // which also returned at once while the periodic drain was mid-run — cut off
+      // by process.exit stranded every transcript ingested since that drain began.
+      if (archiveMirror) await settle(archiveMirror.drain({ final: true }), ARCHIVE_FINAL_DRAIN_MS);
       // Drain the externalized stores' pending debounced writes synchronously
       // (file backend) and close the shared client's sockets (XERK-757) — the
       // same lossless-drain intent as flushStateNow, for the policy stores.

@@ -98,8 +98,11 @@ of-record**, so both halves of the ADR split now hold:
   GREATEST/`DO NOTHING` upserts safe under concurrent writers). Best-effort per file: a transient push
   failure re-queues (a lagging of-record is never data loss, matching the archive's append-only/re-push
   discipline); an ENOENT (raced operator delete) is dropped. Serialized so two workers never overlap.
-  Run on an off-beat `setInterval` (`ARCHIVE_MIRROR_DRAIN_MS`, 15s) and once on graceful shutdown
-  (best-effort, not awaited).
+  Run on an off-beat `setInterval` (`ARCHIVE_MIRROR_DRAIN_MS`, 15s) and once on graceful shutdown.
+- **The shutdown push is AWAITED (bounded by `ARCHIVE_FINAL_DRAIN_MS`) and uses `drain({ final })`**,
+  which waits out an in-flight periodic drain instead of returning 0. The index mirror reaches
+  Postgres on its own worker, so a push cut off by `process.exit` left PG counting bytes that died
+  with the emptyDir — 30 transcripts stranded by one rollout (2026-09-30).
 - **`hydrate()` pulls the RENDERED layer down + `reindex()`** — run at boot AND on promotion (the XERK-763
   seam, via `hydrateArchive()` in server.js). Downloads only a key whose local copy is **absent or
   SMALLER** than the object (missing, or a partial download to finish) — **never same-size-or-larger**,
@@ -119,8 +122,23 @@ of-record**, so both halves of the ADR split now hold:
   - `archive.setRenderedGate` → `renderedBlocked(row)`: blocked when the mirror's `_blocked` holds its
     `.jsonl`/`.meta`, OR its row records `archiveBytes` with no local `.jsonl` / `bytesStored` with no
     `.meta` (a GET that 404'd after the listing, never mirrored, or hand-deleted). The second arm
-    needs no mirror state, so it holds across a restart; it never self-heals — deliberately,
-    re-seeding from 0 is the operator's call — and logs each id once.
+    needs no mirror state, so it holds across a restart, and logs each id once.
+  - **Except when NOTHING is left** (pg mode): a filed row whose `.jsonl` AND `.meta` are ENOENT
+    locally and not in the listing is only RECORDED by the hydrate (`lostTranscripts`). After
+    `ARCHIVE_RESEED_GRACE_MS` (60s) `reseedLostTranscripts` re-`stat`s each key in the bucket: still
+    absent → `reseedLost` resets cursors + `msgCount` so the agent re-ships from 0; landed since →
+    adopted as blocked and downloaded. Blocking it only served it empty forever.
+    - **Never reset on the listing alone**: the old leader's final push runs AFTER the lease moves,
+      so its objects can land after the successor lists, and a partial re-send would PUT over them.
+    - **Ceiling** (`reseedCeiling`: a tenth of filed rows within 20..200): an empty or wrong-bucket
+      listing would otherwise read as everything lost; past it nothing is reset and it logs. A set
+      `ARCHIVE_RESEED_MAX` REPLACES the default, so an operator can lift it after checking the bucket.
+    - Only ENOENT is absence (an ELOOP/EIO is not). Not in sqlite mode (its local FTS duplicates).
+    - Unset the override after the recovery, or the guard stays off for every later rollout.
+    - Tests: `exist nowhere`, `only ENOENT`, `reseedCeiling` in `index-store.test.js`; `confirmLost`
+      in `archive-mirror.test.js`.
+  - **A pg-mode reconcile that lowers a cursor re-derives `msgCount` from the file's lines** — left at
+    PG's GREATEST figure, the re-sent tail mirrors entries at stale ordinals and PG duplicates them.
   - Blocked = `ingestChunk` returns the cursor (no progress, never an error — XERK-255),
     `inventoryCursors` does not want it, `relPathOwner` treats a blocked path as owned. The
     MANIFEST path still reports its cursor: an id left out there is pushed from 0 every beat.

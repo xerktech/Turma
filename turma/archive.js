@@ -2398,8 +2398,10 @@ function sessionLoader() {
 // `.jsonl` SIZE, rawBytes from the raw directory). This is the correctness backstop
 // for the one case where the Postgres of-record can lag the local files: a hub whose
 // ARCHIVE_DIR volume PERSISTED across a restart that lost the in-memory index-mirror
-// queue (a persistent-volume compose deploy; on k8s emptyDir the disk and the queue
-// are lost together, so PG never lags the files there). Without it a too-low
+// queue (a persistent-volume compose deploy). On k8s emptyDir the reverse happens:
+// PG can be AHEAD of files that died with a pod, which `reseedLost` handles when
+// nothing at all is left and XERK-1050 blocks when the bucket still has a copy.
+// Without it a too-low
 // `bytesStored` makes the agent re-push a range the `.jsonl` already holds, and
 // `appendFileSync` DUPLICATES it — the append-only corruption the file-authoritative
 // cursor exists to prevent.
@@ -2417,10 +2419,13 @@ function reconcileHydratedCursors() {
   const upd = isPgMode() ? null : db.prepare(
     "UPDATE sessions SET bytesStored=?, archiveBytes=?, rawBytes=? WHERE transcriptId=?");
   let healed = 0;
+  lostCandidates.clear();
+  lostFiledCount = rows.length;
   for (const row of rows) {
+    const paths = filePaths(row.filePath);
+    if (lostEverywhere(row, paths)) lostCandidates.set(row.transcriptId, paths);
     // Records the ones a missing file blocks (XERK-1050), logged once each.
     if (renderedGate) renderedBlocked(row);
-    const paths = filePaths(row.filePath);
     let fileSize;
     try { fileSize = fs.statSync(paths.jsonl).size; }
     catch { continue; } // no local file (or unreadable): trust PG, as rebuildIndex skips it
@@ -2432,7 +2437,17 @@ function reconcileHydratedCursors() {
       // Mutate the LIVE map row (idxFiledRows returned a copy); filePath is unchanged
       // so the filePath index stays consistent.
       const live = sessionsMap.get(row.transcriptId);
-      if (live) { live.bytesStored = bytesStored; live.archiveBytes = fileSize; live.rawBytes = rawBytes; }
+      if (live) {
+        live.bytesStored = bytesStored; live.archiveBytes = fileSize; live.rawBytes = rawBytes;
+        // msgCount is the ordinal the next chunk's entries mirror at. Left at PG's
+        // (GREATEST-kept) figure over a SHORTER file, the re-sent tail lands at
+        // stale ordinals and Postgres holds duplicate entries. One line per entry,
+        // and only a changed file is read.
+        if (fileSize !== row.archiveBytes) {
+          const n = countLines(paths.jsonl);
+          if (n != null) live.msgCount = n;
+        }
+      }
     } else {
       upd.run(bytesStored, fileSize, rawBytes, row.transcriptId);
     }
@@ -2443,6 +2458,76 @@ function reconcileHydratedCursors() {
       `after a Postgres index hydrate (files ahead of the of-record; XERK-780)`);
   }
   return healed;
+}
+
+function countLines(p) {
+  try {
+    const buf = fs.readFileSync(p);
+    let n = 0;
+    for (let i = buf.indexOf(10); i !== -1; i = buf.indexOf(10, i + 1)) n++;
+    return n;
+  } catch { return null; }
+}
+
+// A filed pg-mode row whose `.jsonl` AND `.meta` exist NOWHERE: not on this disk and
+// not in the bucket listing (the mirror holds no blocked download for it). The index
+// and the bytes reach their of-records on separate workers, so a pod that dies between
+// the two leaves Postgres counting bytes no one holds, and XERK-1050 then blocks the
+// row forever: the viewer serves it empty and its agent can never re-send it.
+//
+// The hydrate only RECORDS these (`lostCandidates`). The previous leader's final
+// archive push runs AFTER it hands over the lease, so a candidate's objects may
+// still be landing while this replica lists; resetting on the listing alone would
+// have a partial re-send PUT over the complete copy. server.js re-checks each key in
+// the bucket after a grace period and only then calls `reseedLost`.
+// pg mode only: sqlite mode's local FTS would duplicate on a re-send.
+const lostCandidates = new Map(); // transcriptId -> its filePaths
+let lostFiledCount = 0;
+function lostEverywhere(row, paths) {
+  if (!isPgMode() || !renderedGate) return false;
+  if (!(row.bytesStored > 0 || row.archiveBytes > 0)) return false;
+  // Listed but not downloaded: the bucket HAS it — the XERK-1050 block stands.
+  try { if (renderedGate(paths.jsonl)) return false; } catch { return false; }
+  return enoent(paths.jsonl) && enoent(paths.meta);
+}
+// Only ENOENT proves absence; any other stat error cannot say the file is gone.
+function enoent(p) {
+  try { fs.statSync(p); return false; } catch (e) { return !!e && e.code === "ENOENT"; }
+}
+// What the last hydrate found lost everywhere, plus how many filed rows it walked
+// (the caller's ceiling: an empty listing would otherwise read as everything lost).
+function lostTranscripts() {
+  return { filed: lostFiledCount,
+    candidates: [...lostCandidates].map(([transcriptId, p]) => ({ transcriptId, jsonl: p.jsonl, meta: p.meta })) };
+}
+// How many lost transcripts one re-seed check may reset. Default: a tenth of the
+// filed rows, at least 20 and at most 200 — an empty or wrong-bucket listing reads
+// as everything lost, and must not reset the archive. An operator who has checked
+// the bucket sets ARCHIVE_RESEED_MAX, which then IS the ceiling. Read here, not
+// passed in, so no caller can drop it.
+function reseedCeiling(filed, override = process.env.ARCHIVE_RESEED_MAX) {
+  const n = Number(override);
+  if (override != null && String(override).trim() !== "" && Number.isFinite(n) && n >= 0) return Math.floor(n);
+  return Math.min(200, Math.max(20, Math.floor((Number(filed) || 0) / 10)));
+}
+// Reset the cursors (and msgCount: Postgres entries upsert by ordinal, so a re-send
+// from 0 overwrites rather than duplicates) of the named transcripts the bucket has
+// been re-checked NOT to hold, so their agents re-ship them from byte 0. Re-verifies
+// each against local disk and the gate first — ingest may have moved on since. Not
+// mirrored: PG's GREATEST keeps the old figures until the re-send reaches them.
+function reseedLost(ids) {
+  const reset = [];
+  for (const id of ids || []) {
+    const paths = lostCandidates.get(id);
+    lostCandidates.delete(id);
+    const live = paths && sessionsMap && sessionsMap.get(id);
+    if (!live || !live.filePath || filePaths(live.filePath).jsonl !== paths.jsonl) continue;
+    if (!lostEverywhere(live, paths)) continue;
+    live.bytesStored = 0; live.archiveBytes = 0; live.msgCount = 0;
+    missingFiled.delete(id);
+    reset.push(id);
+  }
+  return reset;
 }
 
 // The mirror's `onLanded` (XERK-1050): a blocked rendered file landed after the
@@ -3196,7 +3281,7 @@ module.exports = {
   openDb, closeDb, rebuildIndex, setBlobSink, setRawRemote,
   // Boot/hydrate serialization + corrupt-cache self-heal (XERK-789) — all inert
   // off HA (`hydrating` is only ever set around the HA index hydrate).
-  isHydrating, setHydrating, isSqliteCorruption, resetLocalIndex, checkIndexIntegrity,
+  isHydrating, setHydrating, isSqliteCorruption, lostTranscripts, reseedLost, reseedCeiling, resetLocalIndex, checkIndexIntegrity,
   // The per-transcript rendered gate (XERK-1050) — unset, and inert, off HA.
   setRenderedGate, missingFiledPaths, reconcileLanded,
   // The Postgres INDEX of-record seam (XERK-780): the write sink + the hydration
