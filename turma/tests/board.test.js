@@ -2489,6 +2489,13 @@ test("board: a column is one fixed width at every viewport", () => {
     "without this a long card widens the column past its fixed width");
 });
 
+test("board: each column's card list scrolls inside the column", () => {
+  // The page never scrolls (it is one viewport tall), so a long column is only
+  // reachable through its own list's vertical scroll.
+  assert.match(APP_CSS, /\.kanban-col \.kc-list\s*\{[^}]*overflow-y:\s*auto/,
+    "a column's list must scroll vertically, or cards past the fold are unreachable");
+});
+
 test("board: the focused card is scrolled into the strip, not left clipped", () => {
   // The browser only auto-scrolls a focused element in when it is ENTIRELY out
   // of view, so on a strip that scrolls a half-visible card keeps its focus ring

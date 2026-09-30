@@ -97,7 +97,10 @@
    narrow for the centred column plus both gutters (1180 + 2×10), the content
    and header both run edge to edge instead, so the gutter goes on the right only
    and their LEFT edges line up; a left gutter there would indent the content off
-   the header's. Phones overlay their scrollbars, so no gutter at all there. */
+   the header's. Between 1180 and 1200 neither choice lines up exactly, so the
+   switch sits at the 1190 midpoint, which caps the offset at 5px. Phones overlay
+   their scrollbars, so no gutter at all there. The pane takes focus on load
+   (nav.js mount) so keyboard scrolling works without a click first. */
 body.app-shell {
   height: 100vh; height: 100dvh;
   display: flex; flex-direction: column;
@@ -106,7 +109,8 @@ body.app-shell {
   flex: 1; min-height: 0;
   overflow-y: auto; scrollbar-gutter: stable both-edges;
 }
-@media (max-width: 1200px) { .page-scroll { scrollbar-gutter: stable; } }
+.page-scroll:focus { outline: none; }
+@media (max-width: 1190px) { .page-scroll { scrollbar-gutter: stable; } }
 
 /* Every scrollbar in the UI is a thin, theme-coloured thumb on a transparent
    track, rather than the platform's grey default. `scrollbar-color` is inherited,
@@ -165,9 +169,10 @@ h1, h2, h3 { font-family: var(--font-display); }
    That keeps the strip's horizontal scrollbar on screen at the bottom of the
    window — uncapped, a long column made the strip taller than the window and
    parked that scrollbar below the fold. Flex, not a `calc(100dvh - N)` guess, so
-   a wrapped toolbar can't push the strip off the bottom. On a
-   window too short for the lists' `min-height` floors the content overflows and
-   the page scrolls again, which is the graceful end of it. */
+   a wrapped toolbar can't push the strip off the bottom. On a window too short
+   for the lists' `min-height` floors the strip itself becomes the vertical
+   scroller (its `overflow-x: auto` makes it clip both axes) — the content stays
+   reachable, through a nested scroll. */
 .wrap.board-page {
   flex: 1; min-height: 0; width: 100%; padding-bottom: 16px;
   display: flex; flex-direction: column;

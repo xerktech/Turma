@@ -96,6 +96,12 @@
     header.innerHTML = siteHeaderHtml(active, header.dataset.sub || "");
     const bottom = doc.getElementById("bottomNav");
     if (bottom) bottom.innerHTML = bottomNavHtml(active);
+    // The document no longer scrolls (see `.app-shell` in app.css), so a key
+    // scroll — PageDown, Space, arrows, End — with nothing focused goes to the
+    // root and does nothing. Focusing the page's scroll pane (tabindex="-1")
+    // sends it there instead, as the document scroll used to.
+    const pane = doc.querySelector && doc.querySelector(".page-scroll");
+    if (pane && doc.activeElement === doc.body) pane.focus({ preventScroll: true });
   }
 
   // Every page repaints by replacing a container's innerHTML on each heartbeat

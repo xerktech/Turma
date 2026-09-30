@@ -151,11 +151,11 @@ test("nav: every page is a fixed shell whose content scrolls below the header", 
   assert.ok(pane, "no .page-scroll rule in app.css");
   assert.match(pane[1], /overflow-y:\s*auto/);
   assert.match(pane[1], /scrollbar-gutter:\s*stable both-edges/);
-  assert.match(css, /@media \(max-width: 1200px\) \{ \.page-scroll \{ scrollbar-gutter: stable; \} \}/,
+  assert.match(css, /@media \(max-width: 1190px\) \{ \.page-scroll \{ scrollbar-gutter: stable; \} \}/,
     "below the centred column's width the gutter must go on the right only, or the content is indented off the header");
   for (const f of ["index.html", "usage.html"]) {
     const src = fs.readFileSync(path.join(PUBLIC, f), "utf8");
-    assert.match(src, /<body class="app-shell">\s*<header[^>]*><\/header>\s*<div class="page-scroll">/,
+    assert.match(src, /<body class="app-shell">\s*<header[^>]*><\/header>\s*<div class="page-scroll" tabindex="-1">/,
       `${f} must scroll its content in a .page-scroll pane below the header`);
   }
   const board = fs.readFileSync(path.join(PUBLIC, "board.html"), "utf8");
@@ -170,6 +170,21 @@ test("nav: no page opts out of the reserved gutter", () => {
     assert.doesNotMatch(src, /scrollbar-gutter\s*:\s*auto/,
       `${f} releases the scrollbar gutter, which shifts its header off every other page's`);
   }
+});
+
+// With the document unscrollable, a key scroll on an unfocused page goes nowhere
+// unless the pane holds focus.
+test("nav: mount focuses the page's scroll pane so keys scroll it without a click", () => {
+  let focused = null;
+  const pane = { focus(opts) { focused = opts; } };
+  const body = {};
+  const doc = { getElementById: () => ({ dataset: {} }), querySelector: (s) => s === ".page-scroll" ? pane : null,
+    body, activeElement: body };
+  mount(doc);
+  assert.deepEqual(focused, { preventScroll: true });
+  focused = null;
+  mount({ ...doc, activeElement: {} });            // something else already has focus
+  assert.equal(focused, null, "must not steal focus from an element that holds it");
 });
 
 test("nav: each page declares its own sub-header text and its own tab", () => {
