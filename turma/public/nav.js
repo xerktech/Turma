@@ -97,7 +97,11 @@
     const bottom = doc.getElementById("bottomNav");
     if (bottom) bottom.innerHTML = bottomNavHtml(active);
     const pane = doc.querySelector && doc.querySelector(".page-scroll");
-    if (pane) doc.addEventListener("keydown", (e) => paneKeyScroll(doc, pane, e));
+    if (pane) {
+      let lastDown = null;
+      doc.addEventListener("pointerdown", (e) => { lastDown = e.target; }, true);
+      doc.addEventListener("keydown", (e) => paneKeyScroll(doc, pane, e, lastDown));
+    }
   }
 
   // The document no longer scrolls (see `.app-shell` in app.css), so a key
@@ -105,11 +109,21 @@
   // the root and does nothing. Route those keys to the page's scroll pane, as
   // the document scroll used to take them. Deliberately NOT done by focusing the
   // pane on load: that moves where Tab starts, so the first Tab skipped the
-  // whole header. Only when nothing holds focus — a focused input, button or
-  // inner scroller keeps its own keys.
-  function paneKeyScroll(doc, pane, e) {
-    if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+  // whole header. It steps aside whenever the browser has a scroll target of
+  // its own, because the browser does that better (inner lists, the pane itself):
+  //  - something holds focus (an input, a button, the org menu);
+  //  - a modal is open (`body.td-open`) — its keys belong to the modal;
+  //  - the last click landed inside a scroller — Chrome/Firefox send
+  //    unfocused key scrolls to the scroller that was last clicked, so a clicked
+  //    log or clone list keeps its arrow keys, as it did before the pane.
+  // What's left — fresh load, or the last click was in the header — is exactly
+  // the case where the key would otherwise go to the unscrollable root.
+  function paneKeyScroll(doc, pane, e, lastDown) {
+    if (e.defaultPrevented || e.metaKey || e.altKey) return;
+    if (e.ctrlKey && e.key !== "Home" && e.key !== "End") return;
     if (doc.activeElement && doc.activeElement !== doc.body) return;
+    if (doc.body.classList && doc.body.classList.contains("td-open")) return;
+    if (lastDown && inScroller(doc, lastDown)) return;
     const page = pane.clientHeight * 0.875, line = 40;
     const by = {
       ArrowDown: line, ArrowUp: -line,
@@ -122,6 +136,13 @@
     if (by === Infinity) pane.scrollTop = pane.scrollHeight;
     else if (by === -Infinity) pane.scrollTop = 0;
     else pane.scrollBy({ top: by });
+  }
+  function inScroller(doc, el) {
+    for (let n = el; n && n !== doc.body && n.nodeType === 1; n = n.parentElement) {
+      const oy = doc.defaultView.getComputedStyle(n).overflowY;
+      if ((oy === "auto" || oy === "scroll") && n.scrollHeight > n.clientHeight) return true;
+    }
+    return false;
   }
 
   // Every page repaints by replacing a container's innerHTML on each heartbeat

@@ -178,10 +178,12 @@ test("nav: no page opts out of the reserved gutter", () => {
 test("nav: scroll keys with nothing focused scroll the page pane, never move focus", () => {
   const pane = { clientHeight: 800, scrollHeight: 5000, scrollTop: 0,
     scrollBy({ top }) { this.scrollTop += top; }, focus() { throw new Error("pane must not take focus"); } };
-  const body = {};
-  let onKey = null;
+  const classes = new Set();
+  const body = { classList: { contains: (c) => classes.has(c) } };
+  let onKey = null, onDown = null;
   const doc = { getElementById: () => ({ dataset: {} }), querySelector: (s) => s === ".page-scroll" ? pane : null,
-    body, activeElement: body, addEventListener: (t, fn) => { if (t === "keydown") onKey = fn; } };
+    body, activeElement: body, defaultView: { getComputedStyle: (n) => ({ overflowY: n.oy || "visible" }) },
+    addEventListener: (t, fn) => { if (t === "keydown") onKey = fn; if (t === "pointerdown") onDown = fn; } };
   mount(doc);
   assert.ok(onKey, "mount must listen for keydown on a page with a scroll pane");
   const key = (k, extra = {}) => {
@@ -196,6 +198,21 @@ test("nav: scroll keys with nothing focused scroll the page pane, never move foc
   key("Home"); assert.equal(pane.scrollTop, 0);
   assert.equal(key("a").prevented, false, "other keys pass through");
   assert.equal(key("PageDown", { ctrlKey: true }).prevented, false, "modified keys pass through");
+  key("End", { ctrlKey: true }); assert.equal(pane.scrollTop, 5000, "Ctrl+End still jumps to the end");
+  key("Home");
+  // A modal is open: its keys belong to it, never the page behind.
+  classes.add("td-open");
+  assert.equal(key("PageDown").prevented, false, "a modal keeps the keys");
+  classes.delete("td-open");
+  // The last click landed in an inner scroller: the browser scrolls that one.
+  const list = { nodeType: 1, oy: "auto", scrollHeight: 900, clientHeight: 200, parentElement: null };
+  const row = { nodeType: 1, parentElement: list };
+  onDown({ target: row });
+  assert.equal(key("ArrowDown").prevented, false, "a clicked inner scroller keeps its arrow keys");
+  // A click on non-scrolling chrome (the header) hands the keys back to the pane.
+  onDown({ target: { nodeType: 1, parentElement: body } });
+  assert.ok(key("ArrowDown").prevented);
+  key("Home");
   doc.activeElement = {};                                  // an input/button holds focus
   assert.equal(key("PageDown").prevented, false, "a focused element keeps its own keys");
   assert.equal(pane.scrollTop, 0);
