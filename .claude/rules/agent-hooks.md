@@ -57,6 +57,19 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   rules (same shell-not-string classification as Policy).
   - **Fails open on a malformed EVENT, closed on a classifier crash** (XERK-1080): a traceback
     exits 1, which Claude Code treats as non-blocking, so failing open ran the command unchecked.
+  - **Groups are extracted BEFORE operator splitting** (`_balanced_groups`, XERK-1083) — splitting
+    first cut `$(true; rm -rf /)` / `(cd x; rm -rf /)` in half and allowed them.
+    - It is a small lexer, not a paren count: `'…'`/`$'…'`, `"…"`, `[[ … ]]`, `case … esac` and
+      `#` comments each hid a bypass or caused a false deny when miscounted. Scans the RAW line
+      (pre-normalisation brace expansion unbalances quotes); unclosed groups yield nothing.
+    - **A misread must fail CLOSED**: no lexer short of bash is exact, and a misread context
+      swallows the group's `)`. So the scan reports SUSPECT (context open at the end, or a `)`
+      closing nothing outside `case`) and the split fragments are then also classified
+      edge-stripped (`_stray_group_fragments`). Never drop that fallback to fix a false deny.
+    - Exhausting `_MAX_EXPAND_DEPTH` DENIES (`_TOO_DEEP`) — returning nothing let a 7-deep group
+      through, since a group body is only reachable by recursing.
+    - Verify parser changes with a replay of every real Bash command in `~/.claude/projects` (old
+      vs new guard): 0 diffs is the bar. Unit cases alone missed every false deny above.
   - Keep in sync with the twin hook outside this repo.
   - Tests: `test_guard.py`, `test_guard_settings.py`.
 - **File guard** (`hooks/fileguard.py`, same shape) — `PreToolUse` over

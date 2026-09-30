@@ -122,6 +122,228 @@ _ECHO_PROGS = {"echo", "printf"}
 _SUBST_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`|<\(([^()]*)\)|>\(([^()]*)\)")
 
 
+# Characters that end a shell word.
+_WORD_END = set(" \t\n;&|()<>")
+# Reserved words after which the next word is again a command position.
+_CMD_KEYWORDS = {"then", "do", "else", "elif", "if", "while", "until", "time", "!", "{"}
+_CASE_PATTERN_OPEN_RE = re.compile(r"(?:\bin|;;&?|;&)\s*$")
+
+
+def _word_before(command: str, j: int) -> tuple[str, int]:
+    """The word ending at index ``j`` (inclusive) and the index it starts at."""
+    k = j
+    while k >= 0 and command[k] not in _WORD_END:
+        k -= 1
+    return command[k + 1:j + 1], k + 1
+
+
+def _at_command_start(command: str, i: int, hops: int = 0) -> bool:
+    """Whether the word at ``i`` is where a command begins.
+
+    A reserved word only means something THERE — `echo case`, `x do case`,
+    `{case` and `!case` are ordinary words — and reading one where it isn't
+    leaves a context open, which swallows the group's closing `)`.
+    """
+    j = i - 1
+    if j < 0 or command[j] in ";&|(\n":
+        return True
+    if command[j] not in " \t":
+        return False
+    while j >= 0 and command[j] in " \t":
+        j -= 1
+    if j < 0 or command[j] in ";&|(\n":
+        return True
+    word, k = _word_before(command, j)
+    return word in _CMD_KEYWORDS and hops < 4 and _at_command_start(command, k, hops + 1)
+
+
+def _esac_closes(command: str, i: int) -> bool:
+    """Whether an `esac` at ``i`` ends the open `case`.
+
+    Looser than `_at_command_start` on purpose: `esac` also follows a pattern's
+    `)`, a `}`, `fi`, `done`, `]]` or the bare `in` of an empty case. Reading
+    one too EARLY is what the suspect fallback in `_expand_segments` absorbs.
+    """
+    if i > 0 and command[i - 1] not in " \t\n;&|(){}":
+        return False
+    j = i - 1
+    while j >= 0 and command[j] in " \t":
+        j -= 1
+    if j < 0 or command[j] in ";&|()\n{}]":
+        return True
+    word, _ = _word_before(command, j)
+    return word in ("fi", "done", "esac", "in") or _at_command_start(command, i)
+
+
+def _word_at(command: str, i: int, word: str) -> bool:
+    end = i + len(word)
+    return command.startswith(word, i) and (end >= len(command) or command[end] in _WORD_END)
+
+
+def _is_comment(command: str, i: int) -> bool:
+    """`#` starts a comment only at the start of an UNESCAPED word."""
+    if i == 0:
+        return True
+    prev = command[i - 1]
+    if prev in ";&|()":
+        return True
+    # `a\ #` is one word, `a\<newline>#` is `a#`: an escaped blank is no break.
+    return prev in " \t\n" and not (i >= 2 and command[i - 2] == "\\")
+
+
+def _balanced_groups(command: str) -> tuple[list[str], bool]:
+    """Bodies of the outermost `$(…)`, `<(…)`, `>(…)`, `(…)` and backtick groups,
+    and whether the scan is SUSPECT.
+
+    `_SUBST_RE` only ever sees ONE segment, and segmenting happens first, so a
+    group holding `;`, `|` or `&&` was cut in half before it could match:
+    `echo $(true; rm -rf /)` became `echo $(true` and `rm -rf /)`, whose last
+    token `/)` is no path at all — and `(cd /tmp; rm -rf /)` likewise (XERK-1083).
+    Matching parens over the WHOLE command keeps each body intact so it can be
+    expanded on its own terms; nesting is left to that recursion.
+
+    A paren that is not a group must not open or close one, so this is a
+    small lexer; each context below was a bypass or a false deny:
+    - `'…'` and `$'…'` are literal (`$'\\''` holds an escaped quote).
+    - Inside `"…"`, `[[ … ]]` and `${…}` only `$(`, `${` and backticks open
+      anything — a bare paren is text, regex or a pattern (`[[ $x =~ (a|b) ]]`).
+    - Inside `case … esac` a `)` ends a PATTERN, and a `(` right after `in`
+      or `;;` is the optional pattern opener (`case $x in (a|b) …`).
+    - `#` at the start of an unescaped word runs to the end of the line.
+
+    No lexer short of bash's own is exact, so the scan reports when it lost
+    track — a context still open at the end, or a `)` closing nothing outside a
+    `case` — and the caller then also classifies the operator-split fragments
+    with their stray group edges stripped. A misread fails CLOSED that way,
+    where on its own it swallowed the group's `)` and extracted nothing.
+    An unclosed group yields no body: reading it to the end of the string
+    swallowed later commands into it.
+    """
+    bodies: list[str] = []
+    # One entry per open context: '"' a double-quoted string, 'p' a `${…}`,
+    # '[' a `[[ … ]]` test, 'c' a `case … esac`, '(' a group. Quoting nests
+    # inside `$(…)`, so a flat flag cannot tell `"$(grep "a)" f)"` from `"a)"`.
+    stack: list[str] = []
+    suspect = False
+    start = 0
+    i, n = 0, len(command)
+
+    def skip_single(j: int, ansi: bool) -> int:
+        """Index just past the `'` closing a quote whose opener is at ``j``."""
+        j += 1
+        while j < n and command[j] != "'":
+            j += 2 if ansi and command[j] == "\\" else 1
+        return j + 1
+
+    def open_group(j: int) -> None:
+        nonlocal start
+        if "(" not in stack:
+            start = j
+        stack.append("(")
+
+    while i < n:
+        ch = command[i]
+        top = stack[-1] if stack else ""
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "`":
+            end = i + 1
+            while end < n and command[end] != "`":
+                end += 2 if command[end] == "\\" else 1
+            if end >= n:
+                suspect = True
+            if "(" not in stack:
+                bodies.append(command[i + 1:end])
+            i = end + 1
+            continue
+        if ch == "$" and command[i + 1:i + 2] == "(":
+            open_group(i + 2)
+            i += 2
+            continue
+        if ch == "$" and command[i + 1:i + 2] == "{":
+            stack.append("p")
+            i += 2
+            continue
+        if top == '"':
+            if ch == '"':
+                stack.pop()
+            i += 1
+            continue
+        if ch == "$" and command[i + 1:i + 2] == "'":
+            i = skip_single(i + 1, ansi=True)
+            continue
+        if ch == "'":
+            i = skip_single(i, ansi=False)
+            continue
+        if ch == '"':
+            stack.append('"')
+            i += 1
+            continue
+        if top == "p":
+            if ch == "}":
+                stack.pop()
+            i += 1
+            continue
+        if top == "[":
+            if command.startswith("]]", i):
+                stack.pop()
+                i += 2
+                continue
+            i += 1
+            continue
+        if ch == "#" and _is_comment(command, i):
+            end = command.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        if _word_at(command, i, "[[") and _at_command_start(command, i):
+            stack.append("[")
+            i += 2
+            continue
+        if _word_at(command, i, "case") and _at_command_start(command, i):
+            stack.append("c")
+            i += 4
+            continue
+        if top == "c" and _word_at(command, i, "esac") and _esac_closes(command, i):
+            stack.pop()
+            i += 4
+            continue
+        if ch == "(":
+            if top == "c" and _CASE_PATTERN_OPEN_RE.search(command[max(0, i - 64):i]):
+                i += 1  # the optional `(` before a case pattern; its `)` ends it
+                continue
+            open_group(i + 1)
+        elif ch == ")":
+            if top == "(":
+                stack.pop()
+                if "(" not in stack:
+                    bodies.append(command[start:i])
+            elif top != "c":
+                suspect = True  # closes nothing: some context was misread
+        i += 1
+    return [b for b in bodies if b.strip()], suspect or bool(stack)
+
+
+# The ends a group leaves on an operator-split fragment: `rm -rf /)` is the
+# tail of `$(true; rm -rf /)`, `echo $(rm -rf /` its head.
+_GROUP_TAIL_RE = re.compile(r"[)`\s]+\Z")
+_GROUP_HEAD_RE = re.compile(r"\A(?:\$\(|[<>]\(|[(`\s])+")
+_GROUP_OPEN_RE = re.compile(r"\$\(|[<>]\(|\(|`")
+
+
+def _stray_group_fragments(segment: str) -> list[str]:
+    """``segment`` with a group's severed edges cut off, when it has any."""
+    s = segment.strip()
+    trimmed = _GROUP_HEAD_RE.sub("", _GROUP_TAIL_RE.sub("", s))
+    out = [trimmed] if trimmed and trimmed != s else []
+    opens = list(_GROUP_OPEN_RE.finditer(trimmed))
+    if opens:
+        tail = trimmed[opens[-1].end():].strip()
+        if tail:
+            out.append(tail)
+    return out
+
+
 def _subst_inner(m: "re.Match[str]") -> str:
     """The command text inside whichever substitution form matched."""
     return next((g for g in m.groups() if g), "")
@@ -148,9 +370,21 @@ def _subst_text(m: "re.Match[str]") -> str:
     return _OPAQUE_SUBST
 
 
-# How deep the expansion recurses before giving up (a guard against a
-# pathological nest, not a security boundary).
+# How deep the expansion recurses before giving up. Exhausting it DENIES
+# (`_TOO_DEEP`): a group body is only reachable by recursing, so returning
+# nothing let `(true; (true; … rm -rf /))` seven deep through (XERK-1083).
+# Real commands reach depth 0-2.
 _MAX_EXPAND_DEPTH = 6
+
+# The body `_balanced_groups` returns for `$((n+1))` / `((i++))`: a wordless
+# `(…)` bash can only evaluate as arithmetic, never run. Recursing into it cost
+# two depth levels for nothing and pushed a real nested `ssh … sh -c` command
+# past the budget. Whitespace, `$` or a backtick disqualifies it — bash DOES
+# run `$((echo hi) )` as a command substitution.
+_ARITH_BODY_RE = re.compile(r"\([^\s$`]*\)\Z")
+
+# The program name `_expand_segments` reports once the depth budget is spent.
+_TOO_DEEP = "\x00turma-too-deep"
 
 
 # --- pre-normalisation ---------------------------------------------------
@@ -252,14 +486,16 @@ def _var_values(command: str) -> dict[str, list[str]]:
     return vals
 
 
-def _substitute_vars(command: str) -> str:
+def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> str:
     """Inline variables the command line sets itself.
 
     Only names this very command assigns are substituted — an unresolved
-    `$TMPDIR` is left alone rather than guessed at.
+    `$TMPDIR` is left alone rather than guessed at. ``vals`` supplies them
+    from an enclosing command line instead (a group body sees its parent's).
     """
     # NB: no early return on an empty map — `${nope:-/etc}` needs no assignment.
-    vals = _var_values(command)
+    if vals is None:
+        vals = _var_values(command)
 
     def rep(m: "re.Match[str]") -> str:
         name = m.group(1) or m.group(3) or ""
@@ -501,7 +737,19 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
     """
     out: list[tuple[list[str], str]] = []
     if depth > _MAX_EXPAND_DEPTH:
-        return out
+        return [([_TOO_DEEP], command)]
+    # Groups first, over the whole command: splitting below would sever any
+    # group whose body holds an operator (see _balanced_groups). Scanned
+    # BEFORE pre-normalisation, whose brace expansion ignores quoting and can
+    # unbalance them (`awk '{print $2, $4}'`); each body gets the variables
+    # this line assigns, so `d=/etc; (true; rm -rf $d)` still resolves.
+    raw_commands, _ = _split_heredocs(command)
+    raw_vals = _var_values(raw_commands)
+    bodies, suspect = _balanced_groups(raw_commands)
+    for body in bodies:
+        if _ARITH_BODY_RE.match(body):
+            continue
+        out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1))
     command, heredocs = _split_heredocs(_prenormalise(command))
     # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF` runs
     # every line of it. Expand those bodies as commands; bodies fed to anything
@@ -521,6 +769,12 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             if not tok.startswith("-") and ("/" in tok or tok in ("~", ".", "..")):
                 piped_operands.append(tok)
     for raw in segments:
+        if suspect:
+            # The group scan lost track, so a body it should have found may
+            # sit here split in half (see _balanced_groups): classify the
+            # halves too.
+            for frag in _stray_group_fragments(raw):
+                out.extend(_expand_segments(frag, depth + 1))
         # Anything a substitution would run, wherever it sits in the segment.
         for m in _SUBST_RE.finditer(raw):
             inner = _subst_inner(m)
@@ -1593,6 +1847,8 @@ def is_destructive(command: str) -> str | None:
     if reason:
         return reason
     for tokens, segment, *flags in _expand_segments(command):
+        if tokens[0] == _TOO_DEEP:
+            return "refusing a command nested too deeply to classify — flatten it"
         # A candidate recovered by the wrapper SUFFIX pass is a guess at where
         # the command starts, so only the rules that also require a dangerous
         # PATH run on it. `_destructive_disk_power` matches on argv[0] ALONE, and

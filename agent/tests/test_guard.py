@@ -1291,6 +1291,146 @@ class TestDecide(unittest.TestCase):
         self.assertEqual(guard._parse_overrides(None), [])
 
 
+class TestGroupsHoldingOperators(unittest.TestCase):
+    """A group whose body holds `;`, `|` or `&&` must still be classified.
+
+    Operator splitting ran before the substitution regex could see the group,
+    so it cut `$( … )` in half and every one of these was ALLOWED (XERK-1083).
+    """
+
+    DENIED = [
+        "echo $(true; rm -rf /)",
+        "(x | xargs rm -rf /)",
+        "echo `a && rm -rf /`",
+        "echo $(x | sudo rm -rf /)",
+        "(cd /tmp; rm -rf /)",
+        "cat <(true; rm -rf /etc)",
+        "echo $(echo a $(true; rm -rf /))",
+        "echo $( (rm -rf /) )",
+        'echo "a $(true; rm -rf /) b"',
+        'echo "$(grep "a)" f; rm -rf /)"',
+        'x "`true; rm -rf /`"',
+        "d=/etc; (true; rm -rf $d)",
+        "for d in /etc; do (true; rm -rf $d); done",
+        # Contexts that desynced a naive paren/quote count (QA of XERK-1083):
+        "echo $'\\''; (cd /tmp; rm -rf /)",
+        "x=$'it\\'s'; echo $(true; rm -rf /)",
+        "(case x in a) true;; esac; rm -rf /)",
+        "echo $(case x in a) true;; esac; rm -rf /)",
+        "# (note\n(cd /tmp; rm -rf /)",
+        "# don't\n(cd /tmp; rm -rf /)",
+        "[[ -n $(true; rm -rf /) ]]",
+        # Past the depth budget is a refusal, never "nothing found".
+        "(true; " * 7 + "rm -rf /" + ")" * 7,
+        "echo " + "$(true; " * 8 + "rm -rf /" + ")" * 8,
+        # A reserved word or comment misread must fail CLOSED (second QA pass):
+        # each of these left a context open that swallowed the group's `)`.
+        "echo $(case-x; rm -rf /)",
+        "echo $(case=1; rm -rf /)",
+        "echo $(echo; [[x; rm -rf /)",
+        "echo $([[[; rm -rf /)",
+        "echo $( {case; rm -rf /)",
+        "echo $( ![[; rm -rf /)",
+        "echo $(echo do case; rm -rf /)",
+        "echo a\\ #; echo $(true; rm -rf /)",
+        "(case x in a) esac; rm -rf /)",
+        "echo $(case x in a) { true; } esac; rm -rf /)",
+        "(case x in esac; rm -rf /)",
+        "(true)#(\necho $(true; rm -rf /)",
+        "x=a; echo ${x#(}; echo $(true; rm -rf /)",
+        # `$((cmd) )` is a command substitution in bash, not arithmetic.
+        "echo $((rm -rf /) )",
+        "echo $(($(rm -rf /)))",
+    ]
+
+    # Shapes a real-transcript replay (32k commands) showed a naive paren
+    # match refusing: literal parens in quotes, `case` arms, arithmetic, and a
+    # brace-expanded awk program that unbalances the quotes after
+    # pre-normalisation.
+    ALLOWED = [
+        "echo '(true; rm -rf /)'",
+        'grep -nE "ruff (check|format)" f',
+        'echo "(reboot; format)"',
+        "case $x in a) rm -rf /tmp/x;; esac",
+        "echo $((1+2)); (cd /tmp && ls)",
+        'rm -rf "$(mktemp -d)"',
+        "R=$(command -v ruff || ls ~/.local/bin/ruff | head -1); $R format --check .",
+        "awk '{print $2, $4}' f; grep -E 'talosctl (reboot|shutdown)' .",
+        "[[ $x =~ (shutdown|reboot) ]] && echo y",
+        "case $x in (reboot|shutdown) echo hi;; esac",
+        "ls # (reboot; shutdown)",
+        # Arithmetic costs no depth: this real command reached depth 7.
+        "ssh h 'sudo docker exec c sh -c \"n=0; for f in \\$(find /m); do "
+        "t=\\$(ffprobe \\\"\\$f\\\"); n=\\$((n+1)); done; echo \\$n\"'",
+    ]
+
+    def test_unclosed_group_yields_nothing(self):
+        # Reading an unclosed group to the end of the line swallowed the
+        # commands after it (`$R format` read as a disk format).
+        # It is SUSPECT instead, so the split fragments get classified.
+        self.assertEqual(guard._balanced_groups("echo $(format x; ls"), ([], True))
+        self.assertEqual(guard._balanced_groups("echo (reboot"), ([], True))
+        self.assertEqual(guard._balanced_groups("(a; b)"), (["a; b"], False))
+
+    def test_lexer_contexts_read_cleanly(self):
+        # The fallback masks a broken context in the verdict tests, so pin each
+        # one at the scanner: the exact body, and NOT suspect.
+        cases = [
+            ("(case x in a) esac; b)", ["case x in a) esac; b"]),        # esac after `)`
+            ("(case x in a) { t; } esac; b)", ["case x in a) { t; } esac; b"]),
+            ("(case x in a) echo esac;; b) t;; esac; c)",               # `esac` as argument
+             ["case x in a) echo esac;; b) t;; esac; c"]),
+            ("x ${v#(}; (a; b)", ["a; b"]),                             # ${…} context
+            ("( {case; b)", [" {case; b"]),                             # `{case` is a word
+            ("(echo do case; b)", ["echo do case; b"]),                 # `do` as argument
+            ("(case-x; b)", ["case-x; b"]),                             # word boundary
+            ("[[ $x =~ (a|b) ]]", []),
+            ("case $x in (a|b) t;; esac", []),
+            ("ls # (a; b)", []),
+            ("(t)#(\n(a; b)", ["t", "a; b"]),                           # `#` after `)`
+        ]
+        for cmd, bodies in cases:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard._balanced_groups(cmd), (bodies, False))
+
+    def test_a_suspect_scan_fails_closed(self):
+        # The lexer will misread SOME context; when it knows it lost track, the
+        # split halves `echo $(true` / `rm -rf /)` are classified edge-stripped.
+        # Forced here so the fallback is pinned whatever the lexer catches.
+        cmd = "echo $(true; rm -rf /)"
+        with mock.patch.object(guard, "_balanced_groups", return_value=([], True)):
+            self.assertIsNotNone(guard.is_destructive(cmd))
+        with mock.patch.object(guard, "_balanced_groups", return_value=([], False)):
+            self.assertIsNone(guard.is_destructive(cmd))
+        self.assertEqual(guard._stray_group_fragments("rm -rf /))"), ["rm -rf /"])
+        self.assertEqual(guard._stray_group_fragments("echo $(rm -rf /"), ["rm -rf /"])
+
+    def test_destructive_group_bodies_are_denied(self):
+        for cmd in self.DENIED:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_policy_inside_a_group_is_denied(self):
+        self.assertIsNotNone(guard.policy_reason("echo $(x | xargs git push -f origin main)"))
+
+    def test_ordinary_groups_stay_allowed(self):
+        for cmd in self.ALLOWED:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+                self.assertIsNone(guard.policy_reason(cmd))
+
+    def test_real_hook_denies_a_split_substitution(self):
+        proc = subprocess.run(
+            [sys.executable, GUARD_PATH],
+            input=json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command": "echo $(true; rm -rf /)"}}),
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+
 class TestHookEntrypoint(unittest.TestCase):
     """Invoke guard.py as a subprocess the way Claude Code runs the hook."""
 
