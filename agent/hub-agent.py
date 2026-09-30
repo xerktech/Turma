@@ -5108,12 +5108,43 @@ def coding_agent():
     return {"name": CODING_AGENT_NAME, "version": out}
 
 
-def git_info_cheap(cwd):
+class GitTimeout(Exception):
+    """A `strict` cheap git read that did not answer in time (XERK-1217).
+    run() folds a timeout into the same "" as a failure, so without this a
+    stalled disk reads as a removed worktree, or as a clean one."""
+
+
+def _strict_git(cmd, cwd, timeout=15):
+    """run() for a `strict` cheap read: stripped stdout on success, "" on any
+    failure (a git error, a missing cwd), GitTimeout ONLY when it timed out."""
+    try:
+        out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                             timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise GitTimeout(" ".join(cmd[1:3]))
+    except Exception:
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def git_info_cheap(cwd, strict=False):
     """Fast, fast-changing worktree facts read EVERY heartbeat: the current
     checked-out branch and the `git status --porcelain` dirty count. None when
     `cwd` is no longer a git worktree (e.g. removed). The slow-changing facts
     (repo name, remote URL, last-commit line) are read separately and cached
-    across beats — see git_info_slow / SessionManager._session_git."""
+    across beats — see git_info_slow / SessionManager._session_git.
+
+    `strict` raises GitTimeout instead of answering None / dirtyFiles 0 when a
+    read timed out — what the heartbeat's cache (_cheap_read) needs to keep its
+    last real answer through a disk stall."""
+    if strict:
+        if not _strict_git(["git", "rev-parse", "--git-dir"], cwd):
+            return None
+        dirty = _strict_git(["git", "status", "--porcelain"], cwd)
+        return {
+            "branch": _strict_git(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd),
+            "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
+        }
     if not run(["git", "rev-parse", "--git-dir"], cwd=cwd):
         return None
     dirty = run(["git", "status", "--porcelain"], cwd=cwd)
@@ -12219,15 +12250,24 @@ def repo_slow_facts(path):
     }
 
 
-def repo_cheap_facts(path):
+def repo_cheap_facts(path, strict=False):
     """The CHEAP, fast-changing repo reads done every beat: the current checked-out
     branch and the `git status --porcelain` dirty count. Two git spawns — which is
-    why a `light` beat reuses the previous answer instead (see repo_entry)."""
-    dirty = run(["git", "status", "--porcelain"], cwd=path)
+    why a `light` beat reuses the previous answer instead (see repo_entry).
+    `strict` raises GitTimeout on a timed-out read, as git_info_cheap does."""
+    git = ((lambda cmd: _strict_git(cmd, path)) if strict
+           else (lambda cmd: run(cmd, cwd=path)))
+    dirty = git(["git", "status", "--porcelain"])
     return {
-        "branch": run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path),
+        "branch": git(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
         "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
     }
+
+
+def _root_cheap_facts(path, strict=False):
+    """git_info_cheap for the repos-root pseudo-repo, which reports {} rather
+    than None when REPOS_ROOT is not itself a git checkout."""
+    return git_info_cheap(path, strict=strict) or {}
 
 
 def repo_entry(repo, slow, cheap=None):
@@ -16306,6 +16346,16 @@ class SessionManager:
         # only arrive on a beat's REPLY. `light` already means "reuse the caches".
         self.repo_cheap = {}                     # repo path -> cheap entry fields
         self.session_cheap = {}                  # session id -> git_info_cheap
+        # A FULL beat no longer re-reads them inline either (XERK-1217): it serves
+        # the cached answer and stages a refresh on the cheap-git worker, so a
+        # disk that stalls `git status` (an HDD pool under NFS load took beats
+        # to 100-425s) costs one beat of staleness, not the host's online status.
+        # Both maps are only ever REBOUND, under _cheap_lock, by either side —
+        # see _cheap_store.
+        self._cheap_lock = threading.Lock()
+        self._cheap_wake = threading.Event()
+        self._cheap_worker = None
+        self._cheap_due = {}                     # (attr, key) -> (fn, path)
         self.root_repo_cache = None              # repos-root origin remote (slow)
         # Throttled `docker logs` tail (LOG_TAIL_EVERY beats); reused in between.
         self.log_tail_cache = None
@@ -20414,7 +20464,7 @@ class SessionManager:
         # toward the persistent per-repo/host usage. It's keyed by slug (not
         # session id) and bounded by _prune_ledger when the transcript is gone.
         self.session_facts.pop(sid, None)
-        self.session_cheap.pop(sid, None)
+        self._cheap_forget("session_cheap", lambda k: k != sid)
         self.pending_prs.pop(sid, None)
         self.session_pr_urls.pop(sid, None)
         # A killed/deleted session's tmux (and its blocked ask.py hook) is gone;
@@ -27462,6 +27512,103 @@ class SessionManager:
                     # rest, and keeps the worker alive for the next beat.
                     log(f"slow refresh {kind} failed: {e}")
 
+    def _cheap_read(self, attr, key, fn, path, light=False, fresh=False,
+                    default=None):
+        """The cheap git facts (branch + dirty count) for one repo or session,
+        from the `attr` cache (repo_cheap / session_cheap), keyed by `key`.
+
+        A FULL beat serves the cached answer and stages a refresh on the
+        cheap-git worker (XERK-1217) instead of spawning `git status` inline: on
+        a host whose disk is saturated (an HDD pool under NFS load), those
+        spawns — two or three per repo and per running session, each bounded
+        only by run()'s 15s — took beats to 100-425s and the hub read a healthy
+        host as offline. A `light` beat serves the cache without staging.
+        Only first sight (the key is not cached at all) and `fresh` read
+        inline. A cached None ("worktree gone") is served like any other
+        answer, and reads are `strict`: a read that TIMES OUT on a stalled disk
+        raises GitTimeout rather than reporting "gone" or "clean", so the cache
+        keeps its last real answer instead of re-reading inline every beat."""
+        cache = getattr(self, attr)
+        if fresh or key not in cache:
+            try:
+                value = fn(path, strict=True)
+            except GitTimeout:
+                # Keep the last real answer; with none yet, report `default`
+                # (what a timed-out read used to report) and let the worker
+                # retry it off the beat.
+                if key in cache:
+                    return cache[key]
+                self._cheap_store(attr, key, default)
+                self._stage_cheap_refresh(attr, key, fn, path)
+                return default
+            self._cheap_store(attr, key, value)
+            return value
+        if not light:
+            self._stage_cheap_refresh(attr, key, fn, path)
+        return cache[key]
+
+    def _cheap_store(self, attr, key, value, only_if_present=False):
+        """Publish one cheap read. Both the beat and the worker write these
+        maps, so every write REBINDS the map under _cheap_lock: a reader never
+        sees a dict change size mid-iteration, and neither writer loses the
+        other's update. `only_if_present` is the worker's guard — a key pruned
+        while its read was in flight (a killed session, a removed repo) stays
+        pruned rather than being resurrected."""
+        with self._cheap_lock:
+            cur = getattr(self, attr)
+            if only_if_present and key not in cur:
+                return
+            setattr(self, attr, {**cur, key: value})
+
+    def _cheap_forget(self, attr, keep):
+        """Drop the `attr` cache's keys for which `keep(key)` is false."""
+        with self._cheap_lock:
+            setattr(self, attr, {k: v for k, v in getattr(self, attr).items()
+                                 if keep(k)})
+
+    def _stage_cheap_refresh(self, attr, key, fn, path):
+        """Queue a cheap read for the worker and wake it. Coalesces per key.
+
+        MUST NOT raise onto the beat — same contract and same shape as
+        _stage_slow_refresh: a Thread.start() failing at the pids_limit
+        (XERK-402) leaves the job staged and a dead worker the next beat
+        restarts."""
+        try:
+            with self._cheap_lock:
+                self._cheap_due[(attr, key)] = (fn, path)
+                worker = self._cheap_worker
+                if worker is None or not worker.is_alive():
+                    worker = threading.Thread(
+                        target=self._cheap_git_worker_loop,
+                        name="cheap-git", daemon=True)
+                    self._cheap_worker = worker
+                    worker.start()
+            self._cheap_wake.set()
+        except Exception as e:
+            log(f"cheap git refresh could not be staged: {type(e).__name__}: {e}")
+
+    def _cheap_git_worker_loop(self):
+        """Run the staged cheap git reads, then wait for the beat to stage more.
+
+        Daemon and never joined, like the slow-refresh worker: every read is a
+        cache the next beat re-stages, so a pass cut short by a restart costs
+        nothing. The wake is cleared BEFORE the due map is taken, so a job
+        staged mid-pass is never dropped."""
+        while True:
+            self._cheap_wake.wait()
+            self._cheap_wake.clear()
+            with self._cheap_lock:
+                due, self._cheap_due = self._cheap_due, {}
+            for (attr, key), (fn, path) in due.items():
+                try:
+                    value = fn(path, strict=True)
+                except GitTimeout:
+                    continue        # a stalled disk: keep the last real answer
+                except Exception as e:
+                    log(f"cheap git refresh of {path} failed: {e}")
+                    continue
+                self._cheap_store(attr, key, value, only_if_present=True)
+
     def _refresh_jira_if_configured(self):
         """The worker's jira arm. The configured() re-check keeps 'unset creds =
         zero tracker HTTP, ever' a property of the AGENT, not just of where the
@@ -27968,7 +28115,7 @@ class SessionManager:
             # Force a fresh read of the branch-sync facts: the poller runs more
             # often than the slow facts refresh (USAGE_EVERY), and the undelivered
             # check (pushed / aheadOfRemote) must not be up to a beat stale.
-            gi, work = self._session_git(sess, refresh=True)
+            gi, work = self._session_git(sess, refresh=True, fresh=True)
             dirty = (gi or {}).get("dirtyFiles") or 0
             live_branch = (self.session_facts.get(sid) or {}).get("liveBranch")
             ahead_remote = (work or {}).get("aheadOfRemote") or 0
@@ -30213,7 +30360,7 @@ class SessionManager:
         except Exception as e:
             log(f"cc-socks sweep failed: {e}")
 
-    def _session_git(self, sess, refresh, light=False):
+    def _session_git(self, sess, refresh, light=False, fresh=False):
         """(git-info dict | None, branch-sync work dict) for a session's payload.
         The CHEAP current-branch + dirty reads run every beat; the SLOW facts —
         repo name / remote URL / last-commit line, and the branch<->base/origin
@@ -30224,12 +30371,14 @@ class SessionManager:
 
         On a `light` beat the cheap reads are cached too (three git spawns per
         RUNNING session), for the same reason the repo entries cache theirs — a
-        light beat's job is to get the command result back fast."""
+        light beat's job is to get the command result back fast. A full beat
+        serves the cache as well and stages a refresh on the cheap-git worker
+        (XERK-1217); only first sight, or `fresh`, reads inline."""
         sid = sess["id"]
-        gi = self.session_cheap.get(sid) if light else None
-        if gi is None:
-            gi = git_info_cheap(sess["worktreePath"])  # None if the worktree is gone
-            self.session_cheap[sid] = gi
+        # None if the worktree is gone. `fresh` is a caller asking for the
+        # facts as of NOW (the undelivered-work poller), so it reads inline.
+        gi = self._cheap_read("session_cheap", sid, git_info_cheap,
+                              sess["worktreePath"], light=light, fresh=fresh)
         gi = dict(gi) if gi is not None else None      # never hand out the cache
         # The app owns no branch, so the branch to report is the LIVE one the
         # running agent named for its work ("HEAD" = still detached, not yet
@@ -30630,18 +30779,17 @@ class SessionManager:
         entries = []
         for r in repos:
             path = r["path"]
-            cheap = self.repo_cheap.get(path) if light else None
-            if cheap is None:
-                cheap = repo_cheap_facts(path)
-                self.repo_cheap[path] = cheap
+            cheap = self._cheap_read("repo_cheap", path, repo_cheap_facts, path,
+                                     light=light,
+                                     default={"branch": "", "dirtyFiles": 0})
             entries.append(repo_entry(r, self._repo_slow_facts(path, refresh),
                                       cheap))
         # Drop cache entries for repos that are gone (renamed/removed).
         live_paths = {r["path"] for r in repos}
         self.repo_facts = {p: f for p, f in self.repo_facts.items()
                            if p in live_paths}
-        self.repo_cheap = {p: f for p, f in self.repo_cheap.items()
-                           if p in live_paths or p == REPOS_ROOT}
+        self._cheap_forget("repo_cheap",
+                           lambda p: p in live_paths or p == REPOS_ROOT)
         for e in entries:
             e["lastActivity"] = max(
                 e.get("lastCommit") or "", activity.get(e["name"], "")
@@ -30650,10 +30798,8 @@ class SessionManager:
         # The root pseudo-repo's own cheap reads are cached on a light beat too
         # (it is another three spawns), keyed in the same map — REPOS_ROOT is not
         # a scanned repo path, so the prune above never touches it.
-        root_cheap = self.repo_cheap.get(REPOS_ROOT) if light else None
-        if root_cheap is None:
-            root_cheap = git_info_cheap(REPOS_ROOT) or {}
-            self.repo_cheap[REPOS_ROOT] = root_cheap
+        root_cheap = self._cheap_read("repo_cheap", REPOS_ROOT, _root_cheap_facts,
+                                      REPOS_ROOT, light=light, default={})
         out = [root_repo_entry(self._root_repo_remote(refresh), root_cheap)] + entries
         # Attach each repo's resumable-session list (cached; refreshed on the slow
         # cadence in _refresh_repo_usage) for the "Resume any session" picker and
