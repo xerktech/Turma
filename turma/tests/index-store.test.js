@@ -864,3 +864,23 @@ test("XERK-793 pg mode: heal-on-read and reclaim do NOT mutate the of-record", a
     assert.equal(mem.sessions.get("t-heal").msgCount, 2, "PG row msgCount untouched");
   } finally { pgTeardown(); }
 });
+
+test("XERK-1315 pg mode: a raw file re-pushed from 0 after losing its local copy is not double-counted", async () => {
+  const mem = pgSetup();
+  try {
+    const b = [ent("u0", "user", "raw recount")];
+    archive.ingestChunk("nas", "t-raw", META, 0, Buffer.byteLength(JSON.stringify(b)), b, "acme");
+    const raw = Buffer.from("0123456789");
+    assert.equal(archive.ingestRaw("nas", "t-raw", "t-raw.jsonl", 0, raw).stored, 10);
+    assert.equal(mem.sessions.get("t-raw").rawBytes, 10);
+    // A new pod on an emptyDir: every local file is gone, so reconcile has nothing to
+    // re-derive from and the row keeps PG's rawBytes (10).
+    fs.rmSync(process.env.ARCHIVE_DIR, { recursive: true, force: true });
+    archive.setIndexMode(null); archive.setIndexSink(mem.sink()); archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    archive.reconcileHydratedCursors();
+    // The agent re-pushes the same 10 bytes from 0: the raw dir holds 10, so the row says 10.
+    assert.equal(archive.ingestRaw("nas", "t-raw", "t-raw.jsonl", 0, raw).stored, 10);
+    assert.equal(mem.sessions.get("t-raw").rawBytes, 10, "PG raw_bytes not inflated to 20");
+  } finally { pgTeardown(); }
+});

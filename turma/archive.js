@@ -1620,7 +1620,13 @@ function ingestRaw(host, transcriptId, rel, start, buf) {
     warnArchiveFull(total);
     return { stored: have, full: true };
   }
-  const rawBytes = row.rawBytes || 0;
+  // Walked off the raw directory (plus what the bucket still holds), never read
+  // back from the row: after a rollout onto an emptyDir the row carries Postgres's
+  // figure for bytes this replica no longer has, so the agent re-pushes them from
+  // 0 and row+push counted them twice — and GREATEST kept the inflated total in
+  // Postgres, tripping the per-transcript cap early (XERK-1315). The same whole-
+  // suffix-directory measure rebuildIndex and reconcileHydratedCursors use.
+  const rawBytes = rawLayerBytes(filePaths(row.filePath).jsonl + RAW_DIR_SUFFIX);
   if (ARCHIVE_RAW_TRANSCRIPT_MAX > 0 && rawBytes >= ARCHIVE_RAW_TRANSCRIPT_MAX) {
     const now = Date.now();
     if (now - lastRawOverWarnAt > 60 * 60 * 1000) {
