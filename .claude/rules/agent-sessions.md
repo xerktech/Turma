@@ -64,6 +64,17 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   environment plus the flag — a bare one-key dict would wipe `PATH` and break git's own exec.
   Tests: `TestWorktreeAddSkipsLfsSmudge`.
 
+- **A pane never inherits another Claude session's env markers** (`_CLAUDE_SESSION_ENV`): the
+  manager drops them from its own env in `main()`, and `_TMUX_ENV_STRIP` unsets them per pane.
+  - Why: a manager started from inside a session (`turma-agentctl update` from its Bash) carries
+    `CLAUDE_CODE_CHILD_SESSION=1`, and a tmux server it cold-starts copies that into its GLOBAL env
+    for every later pane. Claude Code (≥2.1.285) then saves NO transcript — the chat view goes blank.
+  - Both halves: the scrub alone misses a warm server polluted by an earlier manager.
+  - Name the markers; never strip a `CLAUDE_CODE_*` prefix — operators set e.g.
+    `CLAUDE_CODE_USE_BEDROCK` in the env file.
+  - Tests: `TestScrubClaudeSessionEnv`,
+    `TestAgentTmuxSocket.test_a_polluted_warm_server_cannot_switch_a_sessions_transcript_off`.
+
 ### The trust-folder modal, and why it KILLED sessions (XERK-868)
 
 - A repo Claude Code has never run in opens its **trust-folder modal** before anything else, and its
