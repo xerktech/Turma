@@ -180,6 +180,14 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
 - **`light` means "reuse the caches" for the CHEAP git reads too**, not just the slow ones:
   `repo_cheap`/`session_cheap` hold the previous beat's branch + dirty counts. Never make a light beat
   re-derive something a scheduled beat will re-derive moments later. Tests: `TestLightBeatCost`.
+- **A FULL beat serves the cheap git reads from cache too; the cheap-git worker refreshes them**
+  (XERK-1217). Inline, `git status` per repo and per running session — each bounded only by `run()`'s
+  15s — took beats to 100-425s on an HDD pool under NFS load, and the hub read the host offline.
+  - `_cheap_read` reads inline only on first sight (or a cached `None`) and for `fresh` — the
+    undelivered-work poller, which must see the dirty count as of now. Don't route the beat there.
+  - Both sides write `repo_cheap`/`session_cheap`, so every write REBINDS under `_cheap_lock`
+    (`_cheap_store`/`_cheap_forget`); never mutate them in place. The worker stores
+    `only_if_present`, so a key pruned mid-read stays pruned. Tests: `TestCheapGitWorker`.
 - **`root_repo_entry` takes its `remote` from the slow-cadence cache.** It used to call `git_info()`,
   running the whole `git_info_slow` — remote, `log -1`, `rev-parse --show-toplevel` — every beat and
   throwing all but the remote away. Do not re-introduce a full `git_info()` on this path.
