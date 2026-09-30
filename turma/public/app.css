@@ -669,29 +669,31 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 body.kc-drag-on { user-select: none; -webkit-user-select: none; }
 body.kc-drag-on .kanban-card { touch-action: none; }
 
-/* On phones the strip the base rule already lays out gets swipe manners and a
-   per-column vertical scroll (XERK-24). The column keeps its fixed 300px here
-   too — on a typical phone that still leaves a peek of the next one, which is
-   what signals the row swipes — and the row scroll-snaps to it.
-   Each column's card list scrolls vertically, capped to roughly a viewport minus
-   the header/toolbar/bottom-nav chrome. The estimate is deliberately rough —
-   being a little off only trades a touch of page scroll for a touch of unused
-   height, never a broken layout — and the `min-height` floor keeps a list usable
-   in landscape, where a full 100dvh is short. The `vh` line is the fallback for
-   browsers without `dvh`. */
+/* Each column's card list scrolls vertically at EVERY width, capped to roughly a
+   viewport minus the header/toolbar chrome, so the whole strip fits on screen.
+   That is what keeps the strip's horizontal scrollbar reachable: uncapped, a long
+   column made the strip taller than the window and parked its scrollbar far
+   below the fold, so a board too wide for the window could not be scrolled
+   sideways without first scrolling the page to the bottom. The estimate is
+   deliberately rough — being a little off only trades a touch of page scroll for
+   a touch of unused height, never a broken layout — and the `min-height` floor
+   keeps a list usable in landscape, where a full 100dvh is short. The `vh` line
+   is the fallback for browsers without `dvh`. */
+.kanban-col { display: flex; flex-direction: column; }
+.kanban-col .kc-list {
+  overflow-y: auto; overscroll-behavior: contain; padding-right: 2px;
+  min-height: 96px;
+  max-height: calc(100vh - 210px);
+  max-height: calc(100dvh - 210px);
+}
+
+/* On phones the strip also gets swipe manners (XERK-24). The column keeps its
+   fixed 300px here too — on a typical phone that still leaves a peek of the next
+   one, which is what signals the row swipes — and the row scroll-snaps to it. */
 @media (max-width: 560px) {
   .kanban-cols { gap: 10px; scroll-snap-type: x proximity; }
-  .kanban-col {
-    scroll-snap-align: start;
-    display: flex; flex-direction: column;
-  }
+  .kanban-col { scroll-snap-align: start; }
   .kanban-col .kc-head { padding: 2px 2px 6px; }
-  .kanban-col .kc-list {
-    overflow-y: auto; overscroll-behavior: contain; padding-right: 2px;
-    min-height: 96px;
-    max-height: calc(100vh - 210px);
-    max-height: calc(100dvh - 210px);
-  }
 }
 
 /* ---- Expanded ticket detail (board) ------------------------------------- */
