@@ -515,6 +515,8 @@ class PgConnection {
     this._q = null; // { resolve, reject, fields, rows, command, rowCount, timer, error }
     // SCRAM in-flight state.
     this._scram = null; // { clientNonce, clientFirstBare, expectedServerSignature }
+    // Called once when this connection is torn down, so its pool stops counting it.
+    this.onDead = null;
   }
 
   // Dial, negotiate SSL, send startup, run auth. Resolves once ReadyForQuery lands.
@@ -824,6 +826,11 @@ class PgConnection {
 
   _teardown() {
     this.alive = false;
+    if (this.onDead) {
+      const dead = this.onDead;
+      this.onDead = null;
+      dead();
+    }
     if (this._connectTimer) {
       clearTimeout(this._connectTimer);
       this._connectTimer = null;
@@ -955,6 +962,13 @@ class PgPool {
 
   _spawnConn() {
     const conn = new PgConnection(this.cfg);
+    // A connection that dies while IDLE (a Postgres restart/failover closing it)
+    // has no query to fail and no _afterQuery to drop it. Left in `_conns` it still
+    // counts toward `max`, so once every slot is dead `_pump` spawns nothing and
+    // every later acquire waits forever — which hung the archive hydrate for days
+    // with ingest 503'd behind it. Busy/connecting deaths are dropped by
+    // _afterQuery/the connect catch too; `_removeConn` is idempotent.
+    conn.onDead = () => this._removeConn(conn);
     this._conns.push(conn);
     this._setHealth();
     conn

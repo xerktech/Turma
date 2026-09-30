@@ -86,6 +86,11 @@ byte-identical + no-work-on-the-beat invariants. This file is the operative rule
   spawns a fresh one. Per-query timeout (`queryTimeoutMs`, default 30s) + connect timeout
   (`connectTimeoutMs`, default 15s). `health` is `idle`/`connecting`/`ready`/`closed`; `ready()`
   resolves once a connection is up.
+- **Every torn-down connection leaves `_conns` (`onDead`), including one that dies IDLE.** An idle
+  death (PG restart/failover) has no query to fail and no `_afterQuery`; kept, it counts toward
+  `max`, so `_pump` spawns nothing and every acquire waits FOREVER — acquire has no deadline. That
+  hung the leader's archive hydrate for 3 days (ingest 503 "still syncing" the whole time).
+  Tests: `live: idle connections the server closed never wedge the pool` in `pgclient.test.js`.
 - **`upsertGreatest({table, keys, values, greatest})`** builds the `INSERT … ON CONFLICT (keys) DO
   UPDATE SET col = GREATEST(table.col, EXCLUDED.col)` the ledger's per-host high-water needs — a
   low/partial writer can NEVER lower a recorded total, the SAME max-merge semantics the Valkey ledger
