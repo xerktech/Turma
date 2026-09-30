@@ -185,9 +185,10 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   15s — took beats to 100-425s on an HDD pool under NFS load, and the hub read the host offline.
   - `_cheap_read` reads inline only on first sight (key absent) and for `fresh` — the
     undelivered-work poller, which must see the dirty count as of now. Don't route the beat there.
-  - A cached `None` is SERVED, never re-read inline: `git_info_cheap` reports a timed-out
-    `rev-parse` as `None` too, so re-reading it put 15s/session back on every beat. The worker keeps
-    the last real answer when a read returns `None` for a path that still exists.
+  - The cache's reads are `strict`: a git TIMEOUT raises `GitTimeout` (plain `run()` folds it into
+    "gone"/"clean"), and the worker and `fresh` path keep the last real answer on it. A fast
+    failure — missing cwd, broken `.git` link — is still "gone". A cached `None` is served, never
+    re-read inline.
   - Both sides write `repo_cheap`/`session_cheap`, so every write REBINDS under `_cheap_lock`
     (`_cheap_store`/`_cheap_forget`); never mutate them in place. The worker stores
     `only_if_present`, so a key pruned mid-read stays pruned. Tests: `TestCheapGitWorker`.

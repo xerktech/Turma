@@ -17977,7 +17977,7 @@ class TestBuildPayloadCaching(ManagerMixin, unittest.TestCase):
         slow_calls, sync_calls = [], []
         staged = hold_cheap_refreshes(self, sm)
         with mock.patch.object(ha, "git_info_cheap",
-                               lambda wt: {"branch": self._branch}), \
+                               lambda wt, strict=False: {"branch": self._branch}), \
              mock.patch.object(ha, "git_info_slow",
                                lambda wt: slow_calls.append(wt) or {"remote": "r"}), \
              mock.patch.object(ha, "branch_sync",
@@ -21959,7 +21959,7 @@ class TestRepoActivitySort(ManagerMixin, unittest.TestCase):
             # repo_entry takes cached slow facts as its second arg and the cheap
             # branch/dirty reads as its third (both ignored here).
             ("repo_entry", lambda r, slow, cheap=None: dict(by_name[r["name"]])),
-            ("repo_cheap_facts", lambda path: {}),
+            ("repo_cheap_facts", lambda path, strict=False: {}),
             ("repo_slow_facts", lambda path: {}),
             ("root_repo_entry", lambda remote=None, cheap=None: {"name": "(root)", "isRoot": True}),
         ]:
@@ -22020,7 +22020,7 @@ def run_held_cheap_refreshes(sm, staged):
     jobs = list(staged)
     staged.clear()
     for attr, key, fn, path in jobs:
-        sm._cheap_store(attr, key, fn(path), only_if_present=True)
+        sm._cheap_store(attr, key, fn(path, strict=True), only_if_present=True)
 
 
 class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
@@ -22044,7 +22044,8 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         staged = hold_cheap_refreshes(self, sm)
         reads = []
-        fn = lambda p: reads.append(p) or {"branch": "b", "dirtyFiles": len(reads)}
+        fn = lambda p, strict=False: reads.append(p) or {"branch": "b",
+                                                          "dirtyFiles": len(reads)}
         sm._cheap_read("session_cheap", "s1", fn, "/w/s1")          # first sight
         got = sm._cheap_read("session_cheap", "s1", fn, "/w/s1", fresh=True)
         self.assertEqual(reads, ["/w/s1", "/w/s1"])
@@ -22057,7 +22058,7 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
         sm.repo_cheap = {"/x/A": {"branch": "old", "dirtyFiles": 0}}
         done = threading.Event()
 
-        def fn(path):
+        def fn(path, strict=False):
             done.set()
             return {"branch": "new", "dirtyFiles": 3}
 
@@ -22107,23 +22108,60 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
         self.assertIsNone(got)
         self.assertEqual(len(staged), 1)
 
-    def test_the_worker_keeps_the_last_answer_when_a_live_worktree_times_out(self):
+    def test_a_timed_out_read_keeps_the_last_answer(self):
+        """run() folds a timeout into the same answer as "not a worktree" /
+        "clean", so strict reads raise GitTimeout and every path — the worker,
+        the poller's fresh read — keeps the last real answer instead."""
         sm = self.make_manager()
-        wt = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, wt, True)
         good = {"branch": "feat", "dirtyFiles": 2}
-        sm.session_cheap = {"s1": good, "gone": good}
+        sm.session_cheap = {"s1": good}
+
+        def stalled(path, strict=False):
+            raise ha.GitTimeout("status")
+
         done = threading.Event()
-        sm._stage_cheap_refresh("session_cheap", "s1", lambda p: None, wt)
-        sm._stage_cheap_refresh("session_cheap", "gone", lambda p: done.set(),
-                                os.path.join(wt, "removed"))
+        sm._stage_cheap_refresh("session_cheap", "s1", stalled, "/w/s1")
+        sm._stage_cheap_refresh("session_cheap", "s2",
+                                lambda p, strict=False: done.set(), "/w/s2")
         self.assertTrue(done.wait(5))
-        for _ in range(100):
-            if sm.session_cheap.get("gone") is None:
-                break
-            time.sleep(0.01)
-        self.assertEqual(sm.session_cheap["s1"], good, "a timeout is not 'gone'")
-        self.assertIsNone(sm.session_cheap["gone"], "a removed worktree is")
+        self.assertEqual(sm.session_cheap["s1"], good)
+        got = sm._cheap_read("session_cheap", "s1", stalled, "/w/s1", fresh=True)
+        self.assertEqual(got, good)
+        self.assertEqual(sm.session_cheap["s1"], good)
+
+    def test_a_fast_failure_still_reports_the_worktree_gone(self):
+        """Only a TIMEOUT is kept: a directory whose .git link broke answers
+        rev-parse at once, and that must still read as gone."""
+        sm = self.make_manager()
+        sm.session_cheap = {"s1": {"branch": "feat", "dirtyFiles": 0}}
+        with mock.patch.object(ha.subprocess, "run", return_value=mock.Mock(
+                returncode=128, stdout="")):
+            got = sm._cheap_read("session_cheap", "s1", ha.git_info_cheap,
+                                 "/w/s1", fresh=True)
+        self.assertIsNone(got)
+        self.assertIsNone(sm.session_cheap["s1"])
+
+    def test_first_sight_timeout_reports_the_default_and_retries_off_the_beat(self):
+        sm = self.make_manager()
+        staged = hold_cheap_refreshes(self, sm)
+        with mock.patch.object(ha.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("git", 15)):
+            got = sm._cheap_read("repo_cheap", "/x/A", ha.repo_cheap_facts, "/x/A",
+                                 default={"branch": "", "dirtyFiles": 0})
+        self.assertEqual(got, {"branch": "", "dirtyFiles": 0})
+        self.assertEqual([j[:2] for j in staged], [("repo_cheap", "/x/A")])
+
+    def test_strict_reads_raise_on_timeout_and_plain_reads_do_not(self):
+        with mock.patch.object(ha.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("git", 15)):
+            with self.assertRaises(ha.GitTimeout):
+                ha.git_info_cheap("/w", strict=True)
+            with self.assertRaises(ha.GitTimeout):
+                ha.repo_cheap_facts("/w", strict=True)
+        with mock.patch.object(ha, "run", return_value=""):
+            self.assertIsNone(ha.git_info_cheap("/w"))
+        # A cwd that does not exist is a failure ("gone"), never a timeout.
+        self.assertIsNone(ha.git_info_cheap("/nonexistent/xerk-1217", strict=True))
 
     def test_staging_never_raises_onto_the_beat(self):
         """A Thread.start() refused at the pids_limit (XERK-402) must leave the
@@ -22152,7 +22190,7 @@ class TestLightBeatCost(ManagerMixin, unittest.TestCase):
         staged = hold_cheap_refreshes(self, sm)
         calls = []
 
-        def fake_cheap(path):
+        def fake_cheap(path, strict=False):
             calls.append(path)
             return {"branch": "main", "dirtyFiles": 0}
 
@@ -22194,7 +22232,7 @@ class TestLightBeatCost(ManagerMixin, unittest.TestCase):
         sess = {"id": "s1", "worktreePath": "/w/s1", "repoPath": "/x/A"}
         calls = []
 
-        def fake_cheap(path):
+        def fake_cheap(path, strict=False):
             calls.append(path)
             return {"branch": "feat", "dirtyFiles": 2}
 
