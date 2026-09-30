@@ -33459,6 +33459,26 @@ class TestTmuxExactTargets(unittest.TestCase):
                         "cat"], check=True)
         self.assertTrue(ha.SessionManager._dsh_web_running(None))
 
+    def test_dsh_web_launch_and_supervisor_kills_are_exact(self):
+        # The two dsh-web kill-session sites: the launch's clean-slate kill and
+        # the supervisor's teardown of an alive-but-not-serving viewer.
+        want = ["tmux", "kill-session", "-t", "=" + ha.DSH_WEB_TMUX]
+        calls = []
+        with mock.patch.object(ha, "run", side_effect=calls.append), \
+                mock.patch.object(ha, "run_ok", return_value=(1, "no")):
+            self.assertFalse(ha.SessionManager._launch_dsh_web(None, "p"))
+        self.assertIn(want, calls)
+        calls.clear()
+        sm = mock.Mock()
+        sm._dsh_web_stop = threading.Event()
+        sm._dsh_web_running.return_value = True
+        sm._dsh_web_serving.return_value = False
+        sm._launch_dsh_web.side_effect = \
+            lambda patch: sm._dsh_web_stop.set() or False
+        with mock.patch.object(ha, "run", side_effect=calls.append):
+            ha.SessionManager._dsh_web_loop(sm)
+        self.assertEqual(calls, [want])
+
 
 class TestWindowsTerminalBackend(unittest.TestCase):
     """XERK-697 — the manager side of the ConPTY pty-host seam (ADR D5): the
