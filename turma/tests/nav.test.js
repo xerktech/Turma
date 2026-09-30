@@ -137,15 +137,31 @@ test("nav: the header's bottom gap is a margin, so it still collapses with conte
   assert.match(inner[1], /max-width:\s*var\(--wrap\)/);
 });
 
-// The header row is centred, so the column it centres in must not depend on
-// whether a page is long enough to scroll. The dashboard always overflows and
-// board/usage/sessions often don't: without a reserved gutter the dashboard
-// centred in a 15px-narrower viewport and its header sat 7.5px left of theirs.
-test("nav: the scrollbar gutter is reserved, so a scrolling page centres like a short one", () => {
+// No page scrolls its DOCUMENT, so the header stays put and no scrollbar runs
+// beside it: each is one viewport tall and scrolls in a pane below the header.
+// That also keeps the centred header on the same line on every page, and the
+// pane reserves its gutter on both edges so its content centres on that line
+// too, whether or not it currently overflows.
+test("nav: every page is a fixed shell whose content scrolls below the header", () => {
   const css = fs.readFileSync(path.join(PUBLIC, "app.css"), "utf8");
-  const html = /^html\s*\{([^}]*)\}/m.exec(css);
-  assert.ok(html, "no html rule in app.css");
-  assert.match(html[1], /scrollbar-gutter:\s*stable/);
+  const shell = /body\.app-shell\s*\{([^}]*)\}/.exec(css);
+  assert.ok(shell, "no body.app-shell rule in app.css");
+  assert.match(shell[1], /height:\s*100dvh/);
+  const pane = /\.page-scroll\s*\{([^}]*)\}/.exec(css);
+  assert.ok(pane, "no .page-scroll rule in app.css");
+  assert.match(pane[1], /overflow-y:\s*auto/);
+  assert.match(pane[1], /scrollbar-gutter:\s*stable both-edges/);
+  assert.match(css, /@media \(max-width: 1200px\) \{ \.page-scroll \{ scrollbar-gutter: stable; \} \}/,
+    "below the centred column's width the gutter must go on the right only, or the content is indented off the header");
+  for (const f of ["index.html", "usage.html"]) {
+    const src = fs.readFileSync(path.join(PUBLIC, f), "utf8");
+    assert.match(src, /<body class="app-shell">\s*<header[^>]*><\/header>\s*<div class="page-scroll">/,
+      `${f} must scroll its content in a .page-scroll pane below the header`);
+  }
+  const board = fs.readFileSync(path.join(PUBLIC, "board.html"), "utf8");
+  assert.match(board, /<body class="app-shell">/);
+  const sessions = fs.readFileSync(path.join(PUBLIC, "sessions.html"), "utf8");
+  assert.match(sessions, /html\s*\{[^}]*overflow:\s*hidden/, "sessions.html keeps its own locked shell");
 });
 
 test("nav: no page opts out of the reserved gutter", () => {
@@ -205,12 +221,15 @@ test("preserveScroll: null container still runs the paint once", () => {
   assert.equal(n, 1);
 });
 
-test("preserveScroll: restores window scroll a paint clamped to the top", () => {
-  withFakeWindow(140, (ctx) => {
-    const container = fakeEl();
-    preserveScroll(container, () => { ctx.setY(0); });   // paint collapsed height
-    assert.equal(ctx.getY(), 140);
-    assert.deepEqual(ctx.scrolls, [140]);
+test("preserveScroll: restores a scrolling ancestor a paint clamped to the top", () => {
+  // The page's .page-scroll pane (or the document) is OUTSIDE the container a
+  // repaint swaps, and collapsing the container's height clamps it to the top.
+  withFakeWindow(0, () => {
+    const pane = fakeEl(), container = fakeEl();
+    container.parentElement = pane;
+    pane.scrollTop = 140;
+    preserveScroll(container, () => { pane.scrollTop = 0; });   // paint collapsed height
+    assert.equal(pane.scrollTop, 140);
   });
 });
 

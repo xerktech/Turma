@@ -114,8 +114,10 @@
   // scroll to the right row), else the STRUCTURAL child-index path from the
   // container (fine for a fixed, ordered set like the board's four columns). Only
   // elements actually scrolled off zero are captured, so a settled page costs one
-  // cheap walk. Window scroll is restored only if the paint moved it (replacing a
-  // tall container can briefly collapse document height and clamp to the top).
+  // cheap walk. The container's scrolling ANCESTORS — the page's .page-scroll
+  // pane, or the document itself — are restored only if the paint moved them
+  // (replacing a tall container can briefly collapse their content height and
+  // clamp them to the top).
   function scrollKey(container, el) {
     const path = [];
     for (let n = el; n && n !== container; n = n.parentNode) {
@@ -137,7 +139,10 @@
   }
   function preserveScroll(container, paint) {
     if (!container) { paint(); return; }
-    const winX = window.scrollX, winY = window.scrollY;
+    const outer = [];
+    for (let n = container.parentElement; n; n = n.parentElement) {
+      outer.push([n, n.scrollTop, n.scrollLeft]);
+    }
     const saved = [];
     for (const el of container.querySelectorAll("*")) {
       if (el.scrollTop || el.scrollLeft) {
@@ -149,7 +154,9 @@
       const el = nodeForKey(container, s.key);
       if (el) { el.scrollTop = s.top; el.scrollLeft = s.left; }
     }
-    if (window.scrollX !== winX || window.scrollY !== winY) window.scrollTo(winX, winY);
+    for (const [n, top, left] of outer) {
+      if (n.scrollTop !== top || n.scrollLeft !== left) { n.scrollTop = top; n.scrollLeft = left; }
+    }
   }
 
   // ---- the shared failure toast (XERK-264) ----------------------------------
