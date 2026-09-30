@@ -83,6 +83,37 @@ test("drain is a no-op for a non-leader (single owning writer), dirty kept", asy
   assert.equal(m.pending(), 1); // still queued — a promoted leader pushes it
 });
 
+test("a final drain pushes past the leader gate and waits out an in-flight drain", async () => {
+  const root = mkdtemp("turma-mir-");
+  const a = path.join(root, "a.jsonl");
+  const b = path.join(root, "b.jsonl");
+  fs.writeFileSync(a, "a");
+  fs.writeFileSync(b, "b");
+  const store = memStore();
+  // A put for a.jsonl that holds until released: the periodic drain is mid-flight.
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const put = store.put;
+  store.put = async (k, src) => { if (k === "a.jsonl") await held; return put(k, src); };
+  let leader = true;
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, isLeader: () => leader });
+  m.note(a);
+  const periodic = m.drain();
+  // Shutdown: the lease is handed over, then b lands and the final push starts.
+  leader = false;
+  m.note(b);
+  assert.equal(await m.drain(), 0, "an ordinary drain still stands down");
+  let finished = false;
+  const final = m.drain({ final: true }).then((n) => { finished = true; return n; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(finished, false, "the final drain waits for the in-flight one");
+  release();
+  assert.equal(await periodic, 1);
+  assert.equal(await final, 1, "then pushes what is left, non-leader or not");
+  assert.deepEqual([...store.map.keys()].sort(), ["a.jsonl", "b.jsonl"]);
+  assert.equal(m.pending(), 0);
+});
+
 test("a failed push is re-queued; a raced-delete (ENOENT) is dropped", async () => {
   const root = mkdtemp("turma-mir-");
   const good = path.join(root, "good.jsonl");

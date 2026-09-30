@@ -67,7 +67,7 @@ class ArchiveMirror {
     this.onLanded = typeof onLanded === "function" ? onLanded : () => {};
     this.log = typeof log === "function" ? log : (m) => console.error(m);
     this._dirty = new Set();
-    this._draining = false;
+    this._draining = null; // the in-flight drain's promise, while one runs
     this._hydrating = false;
     // Remote-pending raw objects: raw-root key (`<repo>/<x>.jsonl.raw`) ->
     // Map(key -> remote size). Grouped by root so the per-transcript questions
@@ -129,33 +129,43 @@ class ArchiveMirror {
   }
 
   // Push every dirty file to the blob store. Best-effort per file: a failed push
-  // is re-queued for the next drain (the archive's own re-push discipline — a
-  // lagging of-record only means an agent re-sends the un-mirrored tail on
-  // promotion, never data loss). Serialized so two workers never overlap.
-  async drain() {
-    if (!this.blobStore || this._draining) return 0;
-    if (!this.isLeader()) return 0; // single owning writer (XERK-763 seam)
-    this._draining = true;
+  // is re-queued for the next drain. Serialized so two workers never overlap.
+  //
+  // `final` is the shutdown push: it WAITS for an in-flight drain instead of
+  // returning (the periodic worker is usually mid-drain under ingest load), and
+  // ignores the `isLeader` seam — this replica holds the only copy of whatever it
+  // has not pushed, on an emptyDir that dies with the pod. Skipping it is not
+  // harmless: the index reaches Postgres on its own worker, so a replacement leader
+  // found rows counting bytes no one held (what `archive.reseedLost` recovers).
+  async drain({ final = false } = {}) {
+    if (!this.blobStore) return 0;
+    if (this._draining) {
+      if (!final) return 0;
+      await this._draining.catch(() => {});
+    }
+    if (!final && !this.isLeader()) return 0; // single owning writer (XERK-763 seam)
+    const run = this._drainOnce();
+    this._draining = run;
+    try { return await run; } finally { if (this._draining === run) this._draining = null; }
+  }
+
+  async _drainOnce() {
     let pushed = 0;
-    try {
-      const batch = Array.from(this._dirty);
-      for (const key of batch) {
-        // Blocked = short of the bucket's copy (XERK-1050): never PUT it over that.
-        if (this._blocked.has(key)) continue;
-        this._dirty.delete(key);
-        const file = this.pathFor(key);
-        if (!file) continue;
-        try {
-          await this.blobStore.put(key, { file });
-          pushed++;
-        } catch (e) {
-          // ENOENT = the local file was deleted between note and push (a raced
-          // operator delete); drop it. Anything else is transient — re-queue.
-          if (!(e && e.code === "ENOENT")) this._dirty.add(key);
-        }
+    const batch = Array.from(this._dirty);
+    for (const key of batch) {
+      // Blocked = short of the bucket's copy (XERK-1050): never PUT it over that.
+      if (this._blocked.has(key)) continue;
+      this._dirty.delete(key);
+      const file = this.pathFor(key);
+      if (!file) continue;
+      try {
+        await this.blobStore.put(key, { file });
+        pushed++;
+      } catch (e) {
+        // ENOENT = the local file was deleted between note and push (a raced
+        // operator delete); drop it. Anything else is transient — re-queue.
+        if (!(e && e.code === "ENOENT")) this._dirty.add(key);
       }
-    } finally {
-      this._draining = false;
     }
     return pushed;
   }

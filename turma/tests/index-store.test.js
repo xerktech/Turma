@@ -645,6 +645,56 @@ test("XERK-793 pg mode: a promoted replica hydrates its map from PG (sessions on
   } finally { pgTeardown(); }
 });
 
+test("pg mode: a filed row whose rendered files exist nowhere is reset so its agent re-sends it", async () => {
+  const mem = pgSetup();
+  const blocked = new Set();
+  archive.setRenderedGate((p) => blocked.has(p));
+  try {
+    const b = [ent("u0", "user", "lost then found"), ent("u1", "assistant", "resent")];
+    const len = Buffer.byteLength(JSON.stringify(b));
+    const b1 = [ent("x0", "user", "stays blocked")];
+    const len1 = Buffer.byteLength(JSON.stringify(b1));
+    for (const id of ["t-lost", "t-listed", "t-metaonly"]) {
+      archive.ingestChunk("nas", id, { ...META, summary: id }, 0, id === "t-lost" ? len : len1,
+        id === "t-lost" ? b : b1, "acme");
+    }
+    const pathsOf = (id) => {
+      const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow(id).filePath);
+      return { jsonl, meta: jsonl + ".meta" };
+    };
+    // The leader died between the index mirror and the byte drain: Postgres counts the
+    // bytes, while this fresh replica's disk and the bucket have neither file.
+    for (const id of ["t-lost", "t-listed"]) {
+      fs.unlinkSync(pathsOf(id).jsonl);
+      fs.unlinkSync(pathsOf(id).meta);
+    }
+    blocked.add(pathsOf("t-listed").jsonl);   // ...but the bucket listed this one
+    fs.unlinkSync(pathsOf("t-metaonly").jsonl); // ...and this one kept its sidecar
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+
+    archive.reconcileHydratedCursors();
+    const have = archive.manifestCursors("nas",
+      ["t-lost", "t-listed", "t-metaonly"].map((transcriptId) => ({ transcriptId })), "acme");
+    assert.equal(have["t-lost"], 0, "nothing holds it: reset, so the agent re-sends from 0");
+    assert.equal(archive.sessionRow("t-lost").msgCount, 0);
+    assert.equal(have["t-listed"], len1, "the bucket holds it: stays blocked");
+    assert.equal(have["t-metaonly"], len1, "a sidecar survives: stays blocked");
+    // Only the sidecar-survivor is blocked for a missing file; the listed one is the
+    // mirror's to count, and the reset one is not blocked at all.
+    assert.deepEqual(archive.missingFiledPaths(), [pathsOf("t-metaonly").jsonl]);
+
+    // The agent is asked from 0, re-sends, and the transcript reads back whole.
+    assert.equal(archive.ingestChunk("nas", "t-lost", META, 0, len, b, "acme").bytesStored, len);
+    assert.deepEqual(archive.getTranscript("t-lost").entries.map((e) => e.text), ["lost then found", "resent"]);
+    assert.equal(mem.entries.get("t-lost").size, 2, "Postgres entries overwritten by ordinal, not duplicated");
+    // Still blocked ones refuse, as XERK-1050 requires.
+    assert.deepEqual(archive.ingestChunk("nas", "t-listed", META, 0, len1, b1, "acme"), { bytesStored: len1 });
+  } finally { archive.setRenderedGate(null); pgTeardown(); }
+});
+
 test("XERK-797 pg mode: a wiped/empty PG is rebuilt-of-record from the local files (no re-push duplication)", async () => {
   const mem = pgSetup();
   try {

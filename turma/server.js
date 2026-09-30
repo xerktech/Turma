@@ -20214,6 +20214,9 @@ if (process.env.TURMA_TEST) {
   // long-lived streams are closed with a RECONNECT HINT (SSE `retry:`, tunnel WS
   // close-1001) so clients re-dial promptly to a surviving replica.
   const SHUTDOWN_DRAIN_MS = positiveEnv("SHUTDOWN_DRAIN_MS", 10 * 1000);
+  // The share of the flush phase the final archive push may take; the force-exit
+  // backstop still caps the whole drain at SHUTDOWN_DRAIN_MS.
+  const ARCHIVE_FINAL_DRAIN_MS = positiveEnv("ARCHIVE_FINAL_DRAIN_MS", 4 * 1000);
   // How long to keep serving with `/readyz` NotReady before cutting sockets, so
   // the Service has removed this pod from its EndpointSlice by the time it does.
   // Explicit `0` disables the wait — single-replica Recreate has no Service race
@@ -20314,12 +20317,12 @@ if (process.env.TURMA_TEST) {
       // HA: let those last per-host writes reach the store before its socket closes
       // below (a fire-and-forget set racing close() could be dropped).
       if (HA_ON) await settle(flushAgentsToStoreNow(), 1500);
-      // Best-effort final push of any un-mirrored archive bytes to the object
-      // store, so a deploy strands the least tail (agents re-push what doesn't
-      // make it on the next replica's promotion — never data loss, XERK-759). Not
-      // awaited: it reads files independently of the DB handle and must not hold
-      // up the exit; the drain worker's leader gate keeps a standby a no-op.
-      if (archiveMirror) archiveMirror.drain().catch(() => {});
+      // Final push of un-mirrored archive bytes to the object store, AWAITED
+      // (bounded). This replica's emptyDir holds the only copy, and the index rows
+      // for those bytes may already be in Postgres, so a fire-and-forget push —
+      // which also returned at once while the periodic drain was mid-run — cut off
+      // by process.exit stranded every transcript ingested since that drain began.
+      if (archiveMirror) await settle(archiveMirror.drain({ final: true }), ARCHIVE_FINAL_DRAIN_MS);
       // Drain the externalized stores' pending debounced writes synchronously
       // (file backend) and close the shared client's sockets (XERK-757) — the
       // same lossless-drain intent as flushStateNow, for the policy stores.

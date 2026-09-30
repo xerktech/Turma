@@ -98,8 +98,11 @@ of-record**, so both halves of the ADR split now hold:
   GREATEST/`DO NOTHING` upserts safe under concurrent writers). Best-effort per file: a transient push
   failure re-queues (a lagging of-record is never data loss, matching the archive's append-only/re-push
   discipline); an ENOENT (raced operator delete) is dropped. Serialized so two workers never overlap.
-  Run on an off-beat `setInterval` (`ARCHIVE_MIRROR_DRAIN_MS`, 15s) and once on graceful shutdown
-  (best-effort, not awaited).
+  Run on an off-beat `setInterval` (`ARCHIVE_MIRROR_DRAIN_MS`, 15s) and once on graceful shutdown.
+- **The shutdown push is AWAITED (bounded by `ARCHIVE_FINAL_DRAIN_MS`) and uses `drain({ final })`**,
+  which waits out an in-flight periodic drain instead of returning 0. The index mirror reaches
+  Postgres on its own worker, so a push cut off by `process.exit` left PG counting bytes that died
+  with the emptyDir — 30 transcripts stranded by one rollout (2026-09-30).
 - **`hydrate()` pulls the RENDERED layer down + `reindex()`** — run at boot AND on promotion (the XERK-763
   seam, via `hydrateArchive()` in server.js). Downloads only a key whose local copy is **absent or
   SMALLER** than the object (missing, or a partial download to finish) — **never same-size-or-larger**,
@@ -119,8 +122,13 @@ of-record**, so both halves of the ADR split now hold:
   - `archive.setRenderedGate` → `renderedBlocked(row)`: blocked when the mirror's `_blocked` holds its
     `.jsonl`/`.meta`, OR its row records `archiveBytes` with no local `.jsonl` / `bytesStored` with no
     `.meta` (a GET that 404'd after the listing, never mirrored, or hand-deleted). The second arm
-    needs no mirror state, so it holds across a restart; it never self-heals — deliberately,
-    re-seeding from 0 is the operator's call — and logs each id once.
+    needs no mirror state, so it holds across a restart, and logs each id once.
+  - **Except when NOTHING is left** (`reseedLost`, pg mode): a filed row whose `.jsonl` AND `.meta` are
+    on neither disk nor the bucket (not in the mirror's `_blocked`) has its cursors + `msgCount` reset
+    to 0 in the map, so the agent re-ships it. Blocking it only served it empty forever; with no
+    bucket copy there is nothing for a re-push to clobber (the XERK-1048 hazard). PG's GREATEST keeps
+    the old figures, so a hydrate before the re-send completes resets it again. Not in sqlite mode,
+    whose local FTS would duplicate. Tests: `exist nowhere` in `index-store.test.js`.
   - Blocked = `ingestChunk` returns the cursor (no progress, never an error — XERK-255),
     `inventoryCursors` does not want it, `relPathOwner` treats a blocked path as owned. The
     MANIFEST path still reports its cursor: an id left out there is pushed from 0 every beat.
