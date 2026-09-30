@@ -610,6 +610,39 @@ test("the per-transcript raw ceiling stops that session, not the archive", () =>
   assert.deepEqual(JSON.parse(fresh.stdout.trim().split("\n").pop()), [40, true, true, 1]);
 });
 
+test("XERK-1315: the raw ceiling counts the raw dir (plus bucket-pending bytes), not an accumulated row", () => {
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const fs = require("fs"), path = require("path");
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
+    const tmp = mkdtemp("turma-rawrecount-");
+    process.env.ARCHIVE_DIR = path.join(tmp, "archive");
+    process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
+    process.env.ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES = "32";
+    const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
+    const meta = { repo: "r", endedTs: "2026-07-11T00:00:00Z", summary: "s" };
+    const row = (id) => a.openDb().prepare("SELECT rawBytes FROM sessions WHERE transcriptId=?").get(id).rawBytes;
+    const out = [];
+    // Re-pushed from 0 after the local raw copy is lost: counted once, not twice.
+    a.ingestChunk("nas", "rp", meta, 0, 10, [{ uuid: "u", role: "user", text: "hi" }]);
+    a.ingestRaw("nas", "rp", "rp.jsonl", 0, Buffer.alloc(20, 0x61));
+    fs.rmSync(path.dirname(a.rawDirOf("rp")), { recursive: true, force: true });
+    a.ingestRaw("nas", "rp", "rp.jsonl", 0, Buffer.alloc(20, 0x61));
+    out.push(row("rp"));
+    // ...so the 32-byte ceiling (which a doubled 40 would already be over) still admits more.
+    out.push(a.ingestRaw("nas", "rp", "rp.jsonl", 20, Buffer.alloc(4, 0x62)).stored);
+    // Bytes still in the bucket count toward the ceiling: 30 pending + 4 local is over it.
+    a.ingestChunk("nas", "pd", meta, 0, 10, [{ uuid: "v", role: "user", text: "hi" }]);
+    a.setRawRemote({ pending: () => false, pendingSize: () => null, pendingFiles: () => [],
+      pendingBytes: (dir) => (dir.includes(".raw") ? 30 : 0) });
+    a.ingestRaw("nas", "pd", "pd/subagents/x.jsonl", 0, Buffer.alloc(4, 0x63));
+    out.push(row("pd"));
+    out.push(a.ingestRaw("nas", "pd", "pd/subagents/x.jsonl", 4, Buffer.alloc(4, 0x63)).skip === true);
+    console.log(JSON.stringify(out));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  assert.deepEqual(JSON.parse(fresh.stdout.trim().split("\n").pop()), [20, 24, 34, true]);
+});
+
 test("the store total counts raw bytes of EVERY extension", () => {
   // The ceiling exists to keep this volume writable for the hub's own state, so
   // it has to see the raw layer — most of which is not named .jsonl.
