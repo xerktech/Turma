@@ -176,7 +176,8 @@ test("nav: no page opts out of the reserved gutter", () => {
 // unless it is routed to the pane — without ever focusing the pane, which would
 // move where Tab starts and skip the header.
 test("nav: scroll keys with nothing focused scroll the page pane, never move focus", () => {
-  const pane = { clientHeight: 800, scrollHeight: 5000, scrollTop: 0,
+  const inPane = { tagName: "BUTTON" };
+  const pane = { clientHeight: 800, scrollHeight: 5000, scrollTop: 0, contains: (n) => n === inPane,
     scrollBy({ top }) { this.scrollTop += top; }, focus() { throw new Error("pane must not take focus"); } };
   const classes = new Set();
   const body = { classList: { contains: (c) => classes.has(c) } };
@@ -213,9 +214,14 @@ test("nav: scroll keys with nothing focused scroll the page pane, never move foc
   onDown({ target: { nodeType: 1, parentElement: body } });
   assert.ok(key("ArrowDown").prevented);
   key("Home");
-  doc.activeElement = {};                                  // an input/button holds focus
-  assert.equal(key("PageDown").prevented, false, "a focused element keeps its own keys");
-  assert.equal(pane.scrollTop, 0);
+  doc.activeElement = { tagName: "INPUT" };                // an editable control holds focus
+  assert.equal(key("PageDown").prevented, false, "an input keeps its own keys");
+  doc.activeElement = inPane;                              // a control inside the pane
+  assert.equal(key("PageDown").prevented, false, "focus inside the pane scrolls natively");
+  doc.activeElement = { tagName: "A" };                    // a header link, outside the pane
+  assert.equal(key(" ").prevented, false, "Space activates a focused header control");
+  assert.ok(key("PageDown").prevented, "a focused header control still lets the page scroll");
+  assert.equal(pane.scrollTop, 700);
 });
 
 test("nav: each page declares its own sub-header text and its own tab", () => {
