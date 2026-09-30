@@ -33925,6 +33925,20 @@ class TestScrubClaudeSessionEnv(unittest.TestCase):
                                "CLAUDE_PROJECTS_ROOT": "/p"})
         self.assertEqual(ha._scrub_claude_session_env(env), [])
 
+    def test_main_scrubs_before_the_manager_starts(self):
+        # The cold-start half: a tmux server the manager starts copies ITS env.
+        seen = {}
+
+        class FakeManager:
+            def run_forever(self):
+                seen["child"] = os.environ.get("CLAUDE_CODE_CHILD_SESSION")
+
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_CHILD_SESSION": "1"}), \
+                mock.patch.object(ha, "SessionManager", FakeManager), \
+                mock.patch.object(ha, "log"):
+            ha.main()
+        self.assertEqual(seen, {"child": None})
+
     def test_the_child_session_marker_is_on_the_list(self):
         # The one that switches transcript saving off (Claude Code 2.1.285).
         self.assertIn("CLAUDE_CODE_CHILD_SESSION", ha._CLAUDE_SESSION_ENV)
