@@ -122,29 +122,78 @@ _ECHO_PROGS = {"echo", "printf"}
 _SUBST_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`|<\(([^()]*)\)|>\(([^()]*)\)")
 
 
-# Where a reserved word (`case`, `esac`, `[[`) or a comment can start: the
-# beginning of a command, i.e. after an operator, a group opener or a newline.
-_CMD_START_CHARS = set(";&|(\n{!")
+# Characters that end a shell word.
+_WORD_END = set(" \t\n;&|()<>")
+# Reserved words after which the next word is again a command position.
+_CMD_KEYWORDS = {"then", "do", "else", "elif", "if", "while", "until", "time", "!", "{"}
 _CASE_PATTERN_OPEN_RE = re.compile(r"(?:\bin|;;&?|;&)\s*$")
 
 
-def _at_command_start(command: str, i: int) -> bool:
+def _word_before(command: str, j: int) -> tuple[str, int]:
+    """The word ending at index ``j`` (inclusive) and the index it starts at."""
+    k = j
+    while k >= 0 and command[k] not in _WORD_END:
+        k -= 1
+    return command[k + 1:j + 1], k + 1
+
+
+def _at_command_start(command: str, i: int, hops: int = 0) -> bool:
+    """Whether the word at ``i`` is where a command begins.
+
+    A reserved word only means something THERE — `echo case`, `x do case`,
+    `{case` and `!case` are ordinary words — and reading one where it isn't
+    leaves a context open, which swallows the group's closing `)`.
+    """
+    j = i - 1
+    if j < 0 or command[j] in ";&|(\n":
+        return True
+    if command[j] not in " \t":
+        return False
+    while j >= 0 and command[j] in " \t":
+        j -= 1
+    if j < 0 or command[j] in ";&|(\n":
+        return True
+    word, k = _word_before(command, j)
+    return word in _CMD_KEYWORDS and hops < 4 and _at_command_start(command, k, hops + 1)
+
+
+def _esac_closes(command: str, i: int) -> bool:
+    """Whether an `esac` at ``i`` ends the open `case`.
+
+    Looser than `_at_command_start` on purpose: `esac` also follows a pattern's
+    `)`, a `}`, `fi`, `done`, `]]` or the bare `in` of an empty case. Reading
+    one too EARLY is what the suspect fallback in `_expand_segments` absorbs.
+    """
+    if i > 0 and command[i - 1] not in " \t\n;&|(){}":
+        return False
     j = i - 1
     while j >= 0 and command[j] in " \t":
         j -= 1
-    if j < 0 or command[j] in _CMD_START_CHARS:
+    if j < 0 or command[j] in ";&|()\n{}]":
         return True
-    return bool(re.search(r"(?:^|[\s;&|(])(?:then|do|else|elif)$", command[max(0, j - 7):j + 1]))
+    word, _ = _word_before(command, j)
+    return word in ("fi", "done", "esac", "in") or _at_command_start(command, i)
 
 
 def _word_at(command: str, i: int, word: str) -> bool:
     end = i + len(word)
-    return command.startswith(word, i) and (end >= len(command) or not (
-        command[end].isalnum() or command[end] == "_"))
+    return command.startswith(word, i) and (end >= len(command) or command[end] in _WORD_END)
 
 
-def _balanced_groups(command: str) -> list[str]:
-    """Bodies of the outermost `$(…)`, `<(…)`, `>(…)`, `(…)` and backtick groups.
+def _is_comment(command: str, i: int) -> bool:
+    """`#` starts a comment only at the start of an UNESCAPED word."""
+    if i == 0:
+        return True
+    prev = command[i - 1]
+    if prev in ";&|()":
+        return True
+    # `a\ #` is one word, `a\<newline>#` is `a#`: an escaped blank is no break.
+    return prev in " \t\n" and not (i >= 2 and command[i - 2] == "\\")
+
+
+def _balanced_groups(command: str) -> tuple[list[str], bool]:
+    """Bodies of the outermost `$(…)`, `<(…)`, `>(…)`, `(…)` and backtick groups,
+    and whether the scan is SUSPECT.
 
     `_SUBST_RE` only ever sees ONE segment, and segmenting happens first, so a
     group holding `;`, `|` or `&&` was cut in half before it could match:
@@ -153,26 +202,29 @@ def _balanced_groups(command: str) -> list[str]:
     Matching parens over the WHOLE command keeps each body intact so it can be
     expanded on its own terms; nesting is left to that recursion.
 
-    A paren that is not a group must not open or close one, in either
-    direction: miscounting early cuts a body short (the tail falls back into
-    the split above), miscounting late swallows the rest of the line. So this
-    is a small lexer, and each context below was a bypass or a false deny:
-    - `'…'` and `$'…'` are literal (`$'\''` holds an escaped quote).
-    - Inside `"…"` and `[[ … ]]` only `$(` and backticks open a group — a
-      bare paren is text or regex (`grep -E "a (b|c)"`, `[[ $x =~ (a|b) ]]`).
+    A paren that is not a group must not open or close one, so this is a
+    small lexer; each context below was a bypass or a false deny:
+    - `'…'` and `$'…'` are literal (`$'\\''` holds an escaped quote).
+    - Inside `"…"`, `[[ … ]]` and `${…}` only `$(`, `${` and backticks open
+      anything — a bare paren is text, regex or a pattern (`[[ $x =~ (a|b) ]]`).
     - Inside `case … esac` a `)` ends a PATTERN, and a `(` right after `in`
       or `;;` is the optional pattern opener (`case $x in (a|b) …`).
-    - `#` at the start of a word runs to the end of the line.
-    An UNCLOSED group yields nothing: bash refuses it anyway, and
-    `_substitute_vars` pastes fragments like `$(command` (from
-    `R=$(command -v ruff …)`) into the text, so reading one to the end of the
-    string swallowed later commands — `$R format` became a disk-format command.
+    - `#` at the start of an unescaped word runs to the end of the line.
+
+    No lexer short of bash's own is exact, so the scan reports when it lost
+    track — a context still open at the end, or a `)` closing nothing outside a
+    `case` — and the caller then also classifies the operator-split fragments
+    with their stray group edges stripped. A misread fails CLOSED that way,
+    where on its own it swallowed the group's `)` and extracted nothing.
+    An unclosed group yields no body: reading it to the end of the string
+    swallowed later commands into it.
     """
     bodies: list[str] = []
-    # One entry per open context: '"' a double-quoted string, '[' a `[[ … ]]`
-    # test, 'c' a `case … esac`, '(' a group. Quoting nests inside `$(…)`, so a
-    # flat flag cannot tell `"$(grep "a)" f)"` from `"a)"`.
+    # One entry per open context: '"' a double-quoted string, 'p' a `${…}`,
+    # '[' a `[[ … ]]` test, 'c' a `case … esac`, '(' a group. Quoting nests
+    # inside `$(…)`, so a flat flag cannot tell `"$(grep "a)" f)"` from `"a)"`.
     stack: list[str] = []
+    suspect = False
     start = 0
     i, n = 0, len(command)
 
@@ -199,12 +251,18 @@ def _balanced_groups(command: str) -> list[str]:
             end = i + 1
             while end < n and command[end] != "`":
                 end += 2 if command[end] == "\\" else 1
+            if end >= n:
+                suspect = True
             if "(" not in stack:
                 bodies.append(command[i + 1:end])
             i = end + 1
             continue
         if ch == "$" and command[i + 1:i + 2] == "(":
             open_group(i + 2)
+            i += 2
+            continue
+        if ch == "$" and command[i + 1:i + 2] == "{":
+            stack.append("p")
             i += 2
             continue
         if top == '"':
@@ -222,6 +280,11 @@ def _balanced_groups(command: str) -> list[str]:
             stack.append('"')
             i += 1
             continue
+        if top == "p":
+            if ch == "}":
+                stack.pop()
+            i += 1
+            continue
         if top == "[":
             if command.startswith("]]", i):
                 stack.pop()
@@ -229,11 +292,11 @@ def _balanced_groups(command: str) -> list[str]:
                 continue
             i += 1
             continue
-        if ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|("):
+        if ch == "#" and _is_comment(command, i):
             end = command.find("\n", i)
             i = n if end < 0 else end
             continue
-        if command.startswith("[[", i) and _at_command_start(command, i):
+        if _word_at(command, i, "[[") and _at_command_start(command, i):
             stack.append("[")
             i += 2
             continue
@@ -241,7 +304,7 @@ def _balanced_groups(command: str) -> list[str]:
             stack.append("c")
             i += 4
             continue
-        if top == "c" and _word_at(command, i, "esac") and _at_command_start(command, i):
+        if top == "c" and _word_at(command, i, "esac") and _esac_closes(command, i):
             stack.pop()
             i += 4
             continue
@@ -251,13 +314,34 @@ def _balanced_groups(command: str) -> list[str]:
                 continue
             open_group(i + 1)
         elif ch == ")":
-            # A `)` with no group open is a `case` pattern end, not a group.
             if top == "(":
                 stack.pop()
                 if "(" not in stack:
                     bodies.append(command[start:i])
+            elif top != "c":
+                suspect = True  # closes nothing: some context was misread
         i += 1
-    return [b for b in bodies if b.strip()]
+    return [b for b in bodies if b.strip()], suspect or bool(stack)
+
+
+# The ends a group leaves on an operator-split fragment: `rm -rf /)` is the
+# tail of `$(true; rm -rf /)`, `echo $(rm -rf /` its head.
+_GROUP_TAIL_RE = re.compile(r"[)`\s]+\Z")
+_GROUP_HEAD_RE = re.compile(r"\A(?:\$\(|[<>]\(|[(`\s])+")
+_GROUP_OPEN_RE = re.compile(r"\$\(|[<>]\(|\(|`")
+
+
+def _stray_group_fragments(segment: str) -> list[str]:
+    """``segment`` with a group's severed edges cut off, when it has any."""
+    s = segment.strip()
+    trimmed = _GROUP_HEAD_RE.sub("", _GROUP_TAIL_RE.sub("", s))
+    out = [trimmed] if trimmed and trimmed != s else []
+    opens = list(_GROUP_OPEN_RE.finditer(trimmed))
+    if opens:
+        tail = trimmed[opens[-1].end():].strip()
+        if tail:
+            out.append(tail)
+    return out
 
 
 def _subst_inner(m: "re.Match[str]") -> str:
@@ -661,7 +745,8 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
     # this line assigns, so `d=/etc; (true; rm -rf $d)` still resolves.
     raw_commands, _ = _split_heredocs(command)
     raw_vals = _var_values(raw_commands)
-    for body in _balanced_groups(raw_commands):
+    bodies, suspect = _balanced_groups(raw_commands)
+    for body in bodies:
         if _ARITH_BODY_RE.match(body):
             continue
         out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1))
@@ -684,6 +769,12 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             if not tok.startswith("-") and ("/" in tok or tok in ("~", ".", "..")):
                 piped_operands.append(tok)
     for raw in segments:
+        if suspect:
+            # The group scan lost track, so a body it should have found may
+            # sit here split in half (see _balanced_groups): classify the
+            # halves too.
+            for frag in _stray_group_fragments(raw):
+                out.extend(_expand_segments(frag, depth + 1))
         # Anything a substitution would run, wherever it sits in the segment.
         for m in _SUBST_RE.finditer(raw):
             inner = _subst_inner(m)

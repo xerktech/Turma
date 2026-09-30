@@ -62,6 +62,10 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     - It is a small lexer, not a paren count: `'…'`/`$'…'`, `"…"`, `[[ … ]]`, `case … esac` and
       `#` comments each hid a bypass or caused a false deny when miscounted. Scans the RAW line
       (pre-normalisation brace expansion unbalances quotes); unclosed groups yield nothing.
+    - **A misread must fail CLOSED**: no lexer short of bash is exact, and a misread context
+      swallows the group's `)`. So the scan reports SUSPECT (context open at the end, or a `)`
+      closing nothing outside `case`) and the split fragments are then also classified
+      edge-stripped (`_stray_group_fragments`). Never drop that fallback to fix a false deny.
     - Exhausting `_MAX_EXPAND_DEPTH` DENIES (`_TOO_DEEP`) — returning nothing let a 7-deep group
       through, since a group body is only reachable by recursing.
     - Verify parser changes with a replay of every real Bash command in `~/.claude/projects` (old

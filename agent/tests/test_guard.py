@@ -1323,6 +1323,21 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # Past the depth budget is a refusal, never "nothing found".
         "(true; " * 7 + "rm -rf /" + ")" * 7,
         "echo " + "$(true; " * 8 + "rm -rf /" + ")" * 8,
+        # A reserved word or comment misread must fail CLOSED (second QA pass):
+        # each of these left a context open that swallowed the group's `)`.
+        "echo $(case-x; rm -rf /)",
+        "echo $(case=1; rm -rf /)",
+        "echo $(echo; [[x; rm -rf /)",
+        "echo $([[[; rm -rf /)",
+        "echo $( {case; rm -rf /)",
+        "echo $( ![[; rm -rf /)",
+        "echo $(echo do case; rm -rf /)",
+        "echo a\\ #; echo $(true; rm -rf /)",
+        "(case x in a) esac; rm -rf /)",
+        "echo $(case x in a) { true; } esac; rm -rf /)",
+        "(case x in esac; rm -rf /)",
+        "(true)#(\necho $(true; rm -rf /)",
+        "x=a; echo ${x#(}; echo $(true; rm -rf /)",
         # `$((cmd) )` is a command substitution in bash, not arithmetic.
         "echo $((rm -rf /) )",
         "echo $(($(rm -rf /)))",
@@ -1352,8 +1367,22 @@ class TestGroupsHoldingOperators(unittest.TestCase):
     def test_unclosed_group_yields_nothing(self):
         # Reading an unclosed group to the end of the line swallowed the
         # commands after it (`$R format` read as a disk format).
-        self.assertEqual(guard._balanced_groups("echo $(format x; ls"), [])
-        self.assertEqual(guard._balanced_groups("echo (reboot"), [])
+        # It is SUSPECT instead, so the split fragments get classified.
+        self.assertEqual(guard._balanced_groups("echo $(format x; ls"), ([], True))
+        self.assertEqual(guard._balanced_groups("echo (reboot"), ([], True))
+        self.assertEqual(guard._balanced_groups("(a; b)"), (["a; b"], False))
+
+    def test_a_suspect_scan_fails_closed(self):
+        # The lexer will misread SOME context; when it knows it lost track, the
+        # split halves `echo $(true` / `rm -rf /)` are classified edge-stripped.
+        # Forced here so the fallback is pinned whatever the lexer catches.
+        cmd = "echo $(true; rm -rf /)"
+        with mock.patch.object(guard, "_balanced_groups", return_value=([], True)):
+            self.assertIsNotNone(guard.is_destructive(cmd))
+        with mock.patch.object(guard, "_balanced_groups", return_value=([], False)):
+            self.assertIsNone(guard.is_destructive(cmd))
+        self.assertEqual(guard._stray_group_fragments("rm -rf /))"), ["rm -rf /"])
+        self.assertEqual(guard._stray_group_fragments("echo $(rm -rf /"), ["rm -rf /"])
 
     def test_destructive_group_bodies_are_denied(self):
         for cmd in self.DENIED:
