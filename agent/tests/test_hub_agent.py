@@ -6909,7 +6909,7 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
              mock.patch.object(ha, "_answer_trust_dialog", return_value=True):
             sm._run_limits_probe(os.path.join(self.tmp, "limits-settings.json"))
         kills = [i for i, c in enumerate(self.run_calls)
-                 if c == ["tmux", "kill-session", "-t", ha.LIMITS_TMUX]]
+                 if c == ["tmux", "kill-session", "-t", "=" + ha.LIMITS_TMUX]]
         launch = [c for c in self.run_ok_calls if c[:2] == ["tmux", "new-session"]]
         self.assertEqual(len(launch), 1)
         self.assertEqual(len(kills), 2, "expected a clean-slate kill AND a teardown")
@@ -6923,11 +6923,11 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
              mock.patch.object(sm, "_announce_updating"):
             with self.assertRaises(SystemExit):
                 sm._handle_shutdown(15, None)
-        self.assertIn(["tmux", "kill-session", "-t", ha.LIMITS_TMUX], self.run_calls)
+        self.assertIn(["tmux", "kill-session", "-t", "=" + ha.LIMITS_TMUX], self.run_calls)
         self.run_calls.clear()
         sm.registry = []
         sm.resume_on_boot()
-        self.assertIn(["tmux", "kill-session", "-t", ha.LIMITS_TMUX], self.run_calls)
+        self.assertIn(["tmux", "kill-session", "-t", "=" + ha.LIMITS_TMUX], self.run_calls)
 
     def test_single_flight_while_a_probe_is_running(self):
         started = threading.Event()
@@ -6986,7 +6986,7 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # usage page (_is_internal_tool_slug tombstones that slug).
         self.assertIn(ha.REGISTRY_DIR, launch[0])
         # And it always tears its tmux down, even when nothing was captured.
-        self.assertIn(["tmux", "kill-session", "-t", ha.LIMITS_TMUX], self.run_calls)
+        self.assertIn(["tmux", "kill-session", "-t", "=" + ha.LIMITS_TMUX], self.run_calls)
 
     def test_the_probes_transcript_is_internal_overhead_not_a_repo(self):
         # It runs where the summary/models helpers run, so the same tombstone
@@ -7113,7 +7113,7 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
             sm._kill_limits_probe()
         teardown.assert_called_once_with(ha.LIMITS_TMUX)
         # No tmux kill-session shelled on Windows.
-        self.assertNotIn(["tmux", "kill-session", "-t", ha.LIMITS_TMUX],
+        self.assertNotIn(["tmux", "kill-session", "-t", "=" + ha.LIMITS_TMUX],
                          self.run_calls)
 
 
@@ -33440,6 +33440,44 @@ class TestTmuxExactTargets(unittest.TestCase):
         alive = ha.SessionManager._tmux_alive
         self.assertFalse(alive(None, "agent-zz1"))
         self.assertTrue(alive(None, "agent-zz1-helper"))
+
+    def test_fixed_name_helper_tmuxes_are_exact(self):
+        # XERK-1075: the dsh-web viewer and the limits probe have FIXED tmux
+        # names; with only a prefix-named neighbour alive, neither may report
+        # it alive nor kill it.
+        for name in (ha.DSH_WEB_TMUX, ha.LIMITS_TMUX):
+            subprocess.run(["tmux", "new-session", "-d", "-s", name + "-x",
+                            "cat"], check=True)
+        self.assertFalse(ha.SessionManager._dsh_web_running(None))
+        with mock.patch.object(ha, "IS_WINDOWS", False):
+            ha.SessionManager._kill_limits_probe(None)
+        for name in (ha.DSH_WEB_TMUX, ha.LIMITS_TMUX):
+            rc = subprocess.run(["tmux", "has-session", "-t", "=" + name + "-x"],
+                                capture_output=True).returncode
+            self.assertEqual(rc, 0, name + "-x was killed")
+        subprocess.run(["tmux", "new-session", "-d", "-s", ha.DSH_WEB_TMUX,
+                        "cat"], check=True)
+        self.assertTrue(ha.SessionManager._dsh_web_running(None))
+
+    def test_dsh_web_launch_and_supervisor_kills_are_exact(self):
+        # The two dsh-web kill-session sites: the launch's clean-slate kill and
+        # the supervisor's teardown of an alive-but-not-serving viewer.
+        want = ["tmux", "kill-session", "-t", "=" + ha.DSH_WEB_TMUX]
+        calls = []
+        with mock.patch.object(ha, "run", side_effect=calls.append), \
+                mock.patch.object(ha, "run_ok", return_value=(1, "no")):
+            self.assertFalse(ha.SessionManager._launch_dsh_web(None, "p"))
+        self.assertIn(want, calls)
+        calls.clear()
+        sm = mock.Mock()
+        sm._dsh_web_stop = threading.Event()
+        sm._dsh_web_running.return_value = True
+        sm._dsh_web_serving.return_value = False
+        sm._launch_dsh_web.side_effect = \
+            lambda patch: sm._dsh_web_stop.set() or False
+        with mock.patch.object(ha, "run", side_effect=calls.append):
+            ha.SessionManager._dsh_web_loop(sm)
+        self.assertEqual(calls, [want])
 
 
 class TestWindowsTerminalBackend(unittest.TestCase):

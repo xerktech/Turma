@@ -18315,7 +18315,7 @@ class SessionManager:
         the limits probe relies on. NOT sufficient alone: a tmux that started is
         not proof the port bound (D1), and a bound-then-wedged process keeps the
         tmux alive — so callers pair it with _dsh_web_port_open."""
-        rc, _ = run_ok(["tmux", "has-session", "-t", DSH_WEB_TMUX], timeout=5)
+        rc, _ = run_ok(["tmux", "has-session", "-t", "=" + DSH_WEB_TMUX], timeout=5)
         return rc == 0
 
     def _dsh_web_connect_host(self):
@@ -18388,7 +18388,7 @@ class SessionManager:
             + shlex.join([
                 DSH_BIN, "--profile", "web", "--patch", patch,
                 "--no-open", "--host", DSH_WEB_HOST, "--port", str(DSH_WEB_PORT)]))
-        run(["tmux", "kill-session", "-t", DSH_WEB_TMUX])
+        run(["tmux", "kill-session", "-t", "=" + DSH_WEB_TMUX])
         rc, err = run_ok([
             "tmux", "new-session", "-d", "-s", DSH_WEB_TMUX,
             "-c", DSH_HOME, "-x", "200", "-y", "50", cmd])
@@ -18436,7 +18436,7 @@ class SessionManager:
                         backoff = DSH_WEB_RESTART_SEC
                         self._dsh_web_stop.wait(DSH_WEB_POLL_SEC)
                         continue
-                    run(["tmux", "kill-session", "-t", DSH_WEB_TMUX])
+                    run(["tmux", "kill-session", "-t", "=" + DSH_WEB_TMUX])
                 if patch is None:
                     patch = self._ensure_dsh_web_patch()
                 # `running` means SERVING OUR dsh: confirm an HTTP GET comes back
@@ -29004,7 +29004,7 @@ class SessionManager:
         if IS_WINDOWS:
             _pty_teardown(LIMITS_TMUX)
             return
-        run(["tmux", "kill-session", "-t", LIMITS_TMUX])
+        run(["tmux", "kill-session", "-t", "=" + LIMITS_TMUX])
 
     def models_available(self):
         """The probed alias list, or () before the first successful probe —

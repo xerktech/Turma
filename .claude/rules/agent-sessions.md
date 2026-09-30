@@ -140,6 +140,9 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   another `agent-<id>…` session once that one is gone — reading, typing into or killing it.
   `tunnel-agent.js`'s `captureLiveTurn` follows the same rule. Tests: `TestTmuxExactTargets`,
   `captureLiveTurn never reads a prefix-named neighbour's pane` (real tmux; CI installs it).
+- **The fixed-name helper tmuxes (`DSH_WEB_TMUX`, `LIMITS_TMUX`) are exact too** (XERK-1075):
+  `=` + name on has-session/kill-session. Tests: `test_fixed_name_helper_tmuxes_are_exact`,
+  `test_dsh_web_launch_and_supervisor_kills_are_exact`.
 - **A test driving real tmux must drop `TMUX` before its FIRST tmux call** — it outranks
   `TMUX_TMPDIR`, and inside a Turma pane it names the host's live server (a `kill-server` there
   kills every session).
