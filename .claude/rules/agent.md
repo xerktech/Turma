@@ -66,8 +66,9 @@ an operator/ArgoCD decision, so the guard is userspace, earlyoom-style.
   double-fork to PID 1). cwd first: an environ read takes the target's mmap lock. Unreadable
   (another uid, setproctitle) = unowned = never killed.
 - **Protected BY PID from the registry, never by name**: PID 1, the manager + ancestors + its whole
-  subtree, each running session's AGENT pane pid (`_memguard_panes`: registry tmux names, LOWEST
-  pane id — a `new-window` inside the pane lands in agent-<id> and is session work),
+  subtree, each running session's AGENT pane pid (`_memguard_panes`: registry tmux names, the
+  RECORDED `agentPane` — never the lowest pane, which is the session's own window once the agent
+  pane exits (XERK-1028); gone = protect nothing; unrecorded legacy record = lowest pane id),
   its tmux server, and a shell pane's children (dash doesn't exec the runtime). A `claude`-named
   process or a pane on a session's own tmux is session work. Can't list tmux → the last listing
   (refreshed while healthy) only if it covers exactly today's running sessions AND each cached
