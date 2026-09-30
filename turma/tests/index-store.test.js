@@ -702,6 +702,16 @@ test("pg mode: a filed row whose rendered files exist nowhere is reset so its ag
   } finally { archive.setRenderedGate(null); pgTeardown(); }
 });
 
+test("reseedCeiling: a tenth of filed rows within 20..200, and an explicit ARCHIVE_RESEED_MAX wins", () => {
+  assert.equal(archive.reseedCeiling(25), 20);
+  assert.equal(archive.reseedCeiling(1500), 150);
+  assert.equal(archive.reseedCeiling(11000), 200);
+  assert.equal(archive.reseedCeiling(25, "100000"), 100000, "the operator's override lifts it");
+  assert.equal(archive.reseedCeiling(11000, "0"), 0, "and can shut it off");
+  assert.equal(archive.reseedCeiling(25, ""), 20);
+  assert.equal(archive.reseedCeiling(25, "junk"), 20);
+});
+
 test("pg mode: only ENOENT counts as lost; a file that landed before the confirm is not reset", async () => {
   const mem = pgSetup();
   archive.setRenderedGate(() => false);

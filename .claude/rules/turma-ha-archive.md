@@ -130,8 +130,9 @@ of-record**, so both halves of the ADR split now hold:
     adopted as blocked and downloaded. Blocking it only served it empty forever.
     - **Never reset on the listing alone**: the old leader's final push runs AFTER the lease moves,
       so its objects can land after the successor lists, and a partial re-send would PUT over them.
-    - **Ceiling** (`ARCHIVE_RESEED_MAX`, and a tenth of filed rows): an empty or wrong-bucket listing
-      would otherwise read as everything lost; past it nothing is reset and it logs.
+    - **Ceiling** (`reseedCeiling`: a tenth of filed rows within 20..200): an empty or wrong-bucket
+      listing would otherwise read as everything lost; past it nothing is reset and it logs. A set
+      `ARCHIVE_RESEED_MAX` REPLACES the default, so an operator can lift it after checking the bucket.
     - Only ENOENT is absence (an ELOOP/EIO is not). Not in sqlite mode (its local FTS duplicates).
     - Tests: `exist nowhere`, `only ENOENT` in `index-store.test.js`; `confirmLost` in
       `archive-mirror.test.js`.

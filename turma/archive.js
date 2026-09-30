@@ -2500,6 +2500,15 @@ function lostTranscripts() {
   return { filed: lostFiledCount,
     candidates: [...lostCandidates].map(([transcriptId, p]) => ({ transcriptId, jsonl: p.jsonl, meta: p.meta })) };
 }
+// How many lost transcripts one re-seed check may reset. Default: a tenth of the
+// filed rows, at least 20 and at most 200 — an empty or wrong-bucket listing reads
+// as everything lost, and must not reset the archive. An operator who has checked
+// the bucket sets ARCHIVE_RESEED_MAX, which then IS the ceiling.
+function reseedCeiling(filed, override) {
+  const n = Number(override);
+  if (override != null && String(override).trim() !== "" && Number.isFinite(n) && n >= 0) return Math.floor(n);
+  return Math.min(200, Math.max(20, Math.floor((Number(filed) || 0) / 10)));
+}
 // Reset the cursors (and msgCount: Postgres entries upsert by ordinal, so a re-send
 // from 0 overwrites rather than duplicates) of the named transcripts the bucket has
 // been re-checked NOT to hold, so their agents re-ship them from byte 0. Re-verifies
@@ -3271,7 +3280,7 @@ module.exports = {
   openDb, closeDb, rebuildIndex, setBlobSink, setRawRemote,
   // Boot/hydrate serialization + corrupt-cache self-heal (XERK-789) — all inert
   // off HA (`hydrating` is only ever set around the HA index hydrate).
-  isHydrating, setHydrating, isSqliteCorruption, lostTranscripts, reseedLost, resetLocalIndex, checkIndexIntegrity,
+  isHydrating, setHydrating, isSqliteCorruption, lostTranscripts, reseedLost, reseedCeiling, resetLocalIndex, checkIndexIntegrity,
   // The per-transcript rendered gate (XERK-1050) — unset, and inert, off HA.
   setRenderedGate, missingFiledPaths, reconcileLanded,
   // The Postgres INDEX of-record seam (XERK-780): the write sink + the hydration

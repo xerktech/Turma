@@ -4420,19 +4420,20 @@ async function hydrateArchiveOnce() {
 // `lostTranscripts`) are re-checked in the bucket once the previous leader's
 // shutdown push has had time to land — it runs after the lease moves — and only
 // those still absent are reset for their agents to re-send. The grace outlasts the
-// kubelet's SIGKILL (terminationGracePeriodSeconds 30s). Refused past a ceiling: a
-// listing of the wrong or a recreated bucket would otherwise read as everything lost.
+// kubelet's SIGKILL (terminationGracePeriodSeconds 30s). Refused past a ceiling
+// (archive.reseedCeiling): a listing of the wrong or a recreated bucket would
+// otherwise read as everything lost.
 const ARCHIVE_RESEED_GRACE_MS = positiveEnv("ARCHIVE_RESEED_GRACE_MS", 60 * 1000);
-const ARCHIVE_RESEED_MAX = positiveEnv("ARCHIVE_RESEED_MAX", 200);
 async function reseedLostTranscripts() {
   if (!archiveMirror) return;
   const { candidates, filed } = archive.lostTranscripts();
   if (!candidates.length) return;
-  const cap = Math.min(ARCHIVE_RESEED_MAX, Math.max(20, Math.floor(filed / 10)));
+  const cap = archive.reseedCeiling(filed, process.env.ARCHIVE_RESEED_MAX);
   if (candidates.length > cap) {
     console.error(`archive: ${candidates.length} of ${filed} filed transcript(s) have no ` +
       `rendered files on disk or in the bucket — over the re-seed ceiling (${cap}), so none ` +
-      `are reset; check the bucket before raising ARCHIVE_RESEED_MAX`);
+      `are reset; once the bucket is confirmed right, set ARCHIVE_RESEED_MAX to at least ` +
+      `${candidates.length} and restart to re-seed them`);
     return;
   }
   const { gone, adopted } = await archiveMirror.confirmLost(candidates);
