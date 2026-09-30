@@ -1312,6 +1312,20 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         'x "`true; rm -rf /`"',
         "d=/etc; (true; rm -rf $d)",
         "for d in /etc; do (true; rm -rf $d); done",
+        # Contexts that desynced a naive paren/quote count (QA of XERK-1083):
+        "echo $'\\''; (cd /tmp; rm -rf /)",
+        "x=$'it\\'s'; echo $(true; rm -rf /)",
+        "(case x in a) true;; esac; rm -rf /)",
+        "echo $(case x in a) true;; esac; rm -rf /)",
+        "# (note\n(cd /tmp; rm -rf /)",
+        "# don't\n(cd /tmp; rm -rf /)",
+        "[[ -n $(true; rm -rf /) ]]",
+        # Past the depth budget is a refusal, never "nothing found".
+        "(true; " * 7 + "rm -rf /" + ")" * 7,
+        "echo " + "$(true; " * 8 + "rm -rf /" + ")" * 8,
+        # `$((cmd) )` is a command substitution in bash, not arithmetic.
+        "echo $((rm -rf /) )",
+        "echo $(($(rm -rf /)))",
     ]
 
     # Shapes a real-transcript replay (32k commands) showed a naive paren
@@ -1327,7 +1341,19 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         'rm -rf "$(mktemp -d)"',
         "R=$(command -v ruff || ls ~/.local/bin/ruff | head -1); $R format --check .",
         "awk '{print $2, $4}' f; grep -E 'talosctl (reboot|shutdown)' .",
+        "[[ $x =~ (shutdown|reboot) ]] && echo y",
+        "case $x in (reboot|shutdown) echo hi;; esac",
+        "ls # (reboot; shutdown)",
+        # Arithmetic costs no depth: this real command reached depth 7.
+        "ssh h 'sudo docker exec c sh -c \"n=0; for f in \\$(find /m); do "
+        "t=\\$(ffprobe \\\"\\$f\\\"); n=\\$((n+1)); done; echo \\$n\"'",
     ]
+
+    def test_unclosed_group_yields_nothing(self):
+        # Reading an unclosed group to the end of the line swallowed the
+        # commands after it (`$R format` read as a disk format).
+        self.assertEqual(guard._balanced_groups("echo $(format x; ls"), [])
+        self.assertEqual(guard._balanced_groups("echo (reboot"), [])
 
     def test_destructive_group_bodies_are_denied(self):
         for cmd in self.DENIED:
