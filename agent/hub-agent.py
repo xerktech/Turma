@@ -27285,15 +27285,19 @@ class SessionManager:
         spawns — two or three per repo and per running session, each bounded
         only by run()'s 15s — took beats to 100-425s and the hub read a healthy
         host as offline. A `light` beat serves the cache without staging.
-        Only first sight (nothing cached, or a cached None: a worktree that
-        was gone may be back) and `fresh` read inline."""
-        cached = getattr(self, attr).get(key)
-        if cached is None or fresh:
-            cached = fn(path)
-            self._cheap_store(attr, key, cached)
-        elif not light:
+        Only first sight (the key is not cached at all) and `fresh` read
+        inline. A cached None ("worktree gone") is served like any other
+        answer: were it read inline, a read that TIMED OUT on a stalled disk
+        (git_info_cheap reports that as None too) would put up to 15s per
+        session back on every beat — the incident this exists for."""
+        cache = getattr(self, attr)
+        if fresh or key not in cache:
+            value = fn(path)
+            self._cheap_store(attr, key, value)
+            return value
+        if not light:
             self._stage_cheap_refresh(attr, key, fn, path)
-        return cached
+        return cache[key]
 
     def _cheap_store(self, attr, key, value, only_if_present=False):
         """Publish one cheap read. Both the beat and the worker write these
@@ -27352,6 +27356,13 @@ class SessionManager:
                     value = fn(path)
                 except Exception as e:
                     log(f"cheap git refresh of {path} failed: {e}")
+                    continue
+                # git_info_cheap answers None both for a removed worktree and
+                # for a `rev-parse` that timed out. While the path still exists
+                # it is the timeout: keep the last real answer rather than
+                # report a live session's worktree as gone.
+                if (value is None and getattr(self, attr).get(key) is not None
+                        and os.path.isdir(path)):
                     continue
                 self._cheap_store(attr, key, value, only_if_present=True)
 

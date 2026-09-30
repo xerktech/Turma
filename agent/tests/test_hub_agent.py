@@ -14493,7 +14493,11 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
                 "pushed": pushed, "aheadOfRemote": ahead_remote}
         sm.session_facts = {"s1": {"liveBranch": live_branch, "slow": {},
                                    "work": work}}
-        sm._session_git = lambda sess_, refresh=False, fresh=False: (gi, work)
+        # The poller must read the dirty count as of NOW (fresh=True): a full
+        # beat's cached read may predate the agent's last edit (XERK-1217), so
+        # the stub answers "clean" to anything that is not a fresh read.
+        sm._session_git = lambda sess_, refresh=False, fresh=False: (
+            gi if fresh else {**gi, "dirtyFiles": 0}, work)
         return sess
 
     def _typed(self):
@@ -22000,9 +22004,6 @@ class TestRepoActivitySort(ManagerMixin, unittest.TestCase):
         self.assertEqual(self._order(sm), ["(root)", "A", "B", "C"])
 
 
-@unittest.skipUnless(
-    hasattr(signal, "SIGUSR1"), "SIGUSR1 is POSIX-only; the agent runs on Linux"
-)
 def hold_cheap_refreshes(test, sm):
     """Capture what a beat stages for the cheap-git worker instead of starting
     the real thread, so a test decides when the worker's reads happen."""
@@ -22091,6 +22092,39 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
         self.assertEqual(before, {"/x/A": {"branch": "main", "dirtyFiles": 0}})
         self.assertEqual(list(sm.repo_cheap), ["/x/B"])
 
+    def test_a_cached_none_is_served_not_re_read_inline(self):
+        """git_info_cheap reports a TIMED-OUT rev-parse as None, same as a
+        removed worktree. Re-reading a cached None inline put 15s per affected
+        session back on every beat on exactly the stalled disk this is for."""
+        sm = self.make_manager()
+        sm.session_cheap = {"s1": None}
+        staged = hold_cheap_refreshes(self, sm)
+        with mock.patch.object(ha, "git_info_cheap") as cheap:
+            got = sm._cheap_read("session_cheap", "s1", ha.git_info_cheap, "/w/s1")
+            sm._cheap_read("session_cheap", "s1", ha.git_info_cheap, "/w/s1",
+                           light=True)
+        cheap.assert_not_called()
+        self.assertIsNone(got)
+        self.assertEqual(len(staged), 1)
+
+    def test_the_worker_keeps_the_last_answer_when_a_live_worktree_times_out(self):
+        sm = self.make_manager()
+        wt = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, wt, True)
+        good = {"branch": "feat", "dirtyFiles": 2}
+        sm.session_cheap = {"s1": good, "gone": good}
+        done = threading.Event()
+        sm._stage_cheap_refresh("session_cheap", "s1", lambda p: None, wt)
+        sm._stage_cheap_refresh("session_cheap", "gone", lambda p: done.set(),
+                                os.path.join(wt, "removed"))
+        self.assertTrue(done.wait(5))
+        for _ in range(100):
+            if sm.session_cheap.get("gone") is None:
+                break
+            time.sleep(0.01)
+        self.assertEqual(sm.session_cheap["s1"], good, "a timeout is not 'gone'")
+        self.assertIsNone(sm.session_cheap["gone"], "a removed worktree is")
+
     def test_staging_never_raises_onto_the_beat(self):
         """A Thread.start() refused at the pids_limit (XERK-402) must leave the
         job staged for the next beat, not take the host down."""
@@ -22101,6 +22135,9 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
         self.assertIn(("repo_cheap", "/x/A"), sm._cheap_due)
 
 
+@unittest.skipUnless(
+    hasattr(signal, "SIGUSR1"), "SIGUSR1 is POSIX-only; the agent runs on Linux"
+)
 class TestLightBeatCost(ManagerMixin, unittest.TestCase):
     """A `light` beat exists to get a command RESULT back fast — and, since
     commands arrive only on a beat's REPLY, a POKED beat is what every operator
