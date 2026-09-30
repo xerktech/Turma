@@ -95,6 +95,30 @@
    the shared header's own markup was identical, it was the column that moved. */
 html { scrollbar-gutter: stable; }
 
+/* Every scrollbar in the UI is a thin, theme-coloured thumb on a transparent
+   track, rather than the platform's grey default. `scrollbar-color` is inherited,
+   so setting it on `html` reaches every scroller; `scrollbar-width` is not, hence
+   `*`. Only Firefox gets those standard properties: Chrome 121+ also supports
+   them, but once they are set it ignores `::-webkit-scrollbar` and draws its
+   own thin bar WITH arrow buttons on Windows/Linux, so Chromium and Safari are
+   styled through the `::-webkit-scrollbar` rules instead, which draw no buttons.
+   `-moz-appearance` is the Firefox-only feature test that keeps them apart. */
+:root {
+  --scrollbar:       color-mix(in srgb, var(--ink) 22%, transparent);
+  --scrollbar-hover: color-mix(in srgb, var(--ink) 38%, transparent);
+}
+@supports (-moz-appearance: none) {
+  html { scrollbar-color: var(--scrollbar) transparent; }
+  * { scrollbar-width: thin; }
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar); background-clip: padding-box;
+  border: 2px solid transparent; border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover { background-color: var(--scrollbar-hover); }
+
 body {
   margin: 0;
   background: var(--page);
@@ -123,6 +147,36 @@ h1, h2, h3 { font-family: var(--font-display); }
 .wrap.board-page { max-width: var(--wrap-board); }
 .wrap.board-page > .board-bar,
 .wrap.board-page > .footer { max-width: var(--wrap); margin-inline: auto; }
+
+/* The board page is exactly one viewport tall, so the PAGE never scrolls: the
+   strip takes whatever height the header, toolbar and footer leave, each column
+   stretches to it and its card list scrolls inside it (see .kanban-col below).
+   That keeps the strip's horizontal scrollbar on screen at the bottom of the
+   window — uncapped, a long column made the strip taller than the window and
+   parked that scrollbar below the fold. Flex, not a `calc(100dvh - N)` guess, so
+   a wrapped toolbar or a long footer can't push the strip off the bottom. On a
+   window too short for the lists' `min-height` floors the content overflows and
+   the page scrolls again, which is the graceful end of it. */
+body.board-body {
+  height: 100vh; height: 100dvh;
+  display: flex; flex-direction: column;
+}
+body.board-body > .site-header { flex: none; }
+.wrap.board-page {
+  flex: 1; min-height: 0; width: 100%; padding-bottom: 16px;
+  display: flex; flex-direction: column;
+}
+.wrap.board-page > * { flex: none; }
+.wrap.board-page > #board {
+  flex: 1; min-height: 0; display: flex; flex-direction: column;
+}
+#board > * { flex: none; }
+#board > .kanban-cols { flex: 1; min-height: 0; align-items: stretch; }
+.wrap.board-page > .board-bar, .wrap.board-page > .footer { width: 100%; }
+.wrap.board-page > .footer { margin-top: 14px; }
+/* On a phone the footer's paragraph wraps to ~15 lines — half the screen, taken
+   out of the columns now that the page doesn't scroll — so the board drops it. */
+@media (max-width: 560px) { .wrap.board-page > .footer { display: none; } }
 
 h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 
@@ -669,23 +723,17 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 body.kc-drag-on { user-select: none; -webkit-user-select: none; }
 body.kc-drag-on .kanban-card { touch-action: none; }
 
-/* Each column's card list scrolls vertically at EVERY width, capped to roughly a
-   viewport minus the header/toolbar chrome, so the whole strip fits on screen.
-   That is what keeps the strip's horizontal scrollbar reachable: uncapped, a long
-   column made the strip taller than the window and parked its scrollbar far
-   below the fold, so a board too wide for the window could not be scrolled
-   sideways without first scrolling the page to the bottom. The estimate is
-   deliberately rough — being a little off only trades a touch of page scroll for
-   a touch of unused height, never a broken layout — and the `min-height` floor
-   keeps a list usable in landscape, where a full 100dvh is short. The `vh` line
-   is the fallback for browsers without `dvh`. */
-.kanban-col { display: flex; flex-direction: column; }
+/* Each column fills the strip's height (it is stretched by .board-page's flex
+   layout above) and its card list scrolls inside it, so a long column never
+   makes the page scroll. The `min-height` floor keeps a list usable on a very
+   short window, at the cost of the page scrolling there. */
+.kanban-col { display: flex; flex-direction: column; min-height: 0; }
+.kanban-col > .kc-head { flex: none; }
 .kanban-col .kc-list {
+  flex: 1; min-height: 96px;
   overflow-y: auto; overscroll-behavior: contain; padding-right: 2px;
-  min-height: 96px;
-  max-height: calc(100vh - 210px);
-  max-height: calc(100dvh - 210px);
 }
+.kanban-col .kc-list > * { flex: none; }
 
 /* On phones the strip also gets swipe manners (XERK-24). The column keeps its
    fixed 300px here too — on a typical phone that still leaves a peek of the next
