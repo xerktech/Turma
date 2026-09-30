@@ -2489,6 +2489,13 @@ test("board: a column is one fixed width at every viewport", () => {
     "without this a long card widens the column past its fixed width");
 });
 
+test("board: each column's card list scrolls inside the column", () => {
+  // The page never scrolls (it is one viewport tall), so a long column is only
+  // reachable through its own list's vertical scroll.
+  assert.match(APP_CSS, /\.kanban-col \.kc-list\s*\{[^}]*overflow-y:\s*auto/,
+    "a column's list must scroll vertically, or cards past the fold are unreachable");
+});
+
 test("board: the focused card is scrolled into the strip, not left clipped", () => {
   // The browser only auto-scrolls a focused element in when it is ENTIRELY out
   // of view, so on a strip that scrolls a half-visible card keeps its focus ring
@@ -2514,9 +2521,9 @@ test("board: the strip carries the id preserveScroll anchors its sideways scroll
 // The fixed-300px columns scroll off-screen at the shared --wrap long before a
 // wide monitor is full, so the board page alone widens its CONTENT column to
 // --wrap-board. The header must not move (it lives outside .wrap and caps itself
-// at --wrap), and the toolbar + footer are re-centred back at --wrap so they
-// still sit under it — only #board takes the extra width.
-test("board: the page widens only its column area; header/toolbar/footer stay at --wrap", () => {
+// at --wrap), and the toolbar is re-centred back at --wrap so it still sits
+// under it — only #board takes the extra width.
+test("board: the page widens only its column area; header/toolbar stay at --wrap", () => {
   const wrap = /--wrap:\s*(\d+)px/.exec(APP_CSS);
   const wide = /--wrap-board:\s*(\d+)px/.exec(APP_CSS);
   assert.ok(wrap && wide, "both --wrap and --wrap-board must be defined");
@@ -2524,13 +2531,11 @@ test("board: the page widens only its column area; header/toolbar/footer stay at
     "--wrap-board must be wider than the shared --wrap, or the board doesn't expand");
   assert.match(APP_CSS, /\.wrap\.board-page\s*\{[^}]*max-width:\s*var\(--wrap-board\)/,
     "the board page's .wrap must widen to --wrap-board");
-  // The toolbar + footer are pulled back to the reading width, centred, so they
-  // still line up under the header.
+  // The toolbar is pulled back to the reading width, centred, so it still lines
+  // up under the header.
   assert.match(APP_CSS,
     /\.wrap\.board-page\s*>\s*\.board-bar[\s\S]*?max-width:\s*var\(--wrap\)[^}]*margin-inline:\s*auto/,
-    "the toolbar (and footer) must re-centre at --wrap");
-  assert.match(APP_CSS, /\.wrap\.board-page\s*>\s*\.footer/,
-    "the footer must be re-centred with the toolbar");
+    "the toolbar must re-centre at --wrap");
   // The header is never given the wide width — that is what keeps it in place.
   assert.doesNotMatch(APP_CSS, /\.site-header-in\s*\{[^}]*var\(--wrap-board\)/,
     "the site header must never take the wide board width");

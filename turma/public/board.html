@@ -12,7 +12,7 @@
 <meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
 <link rel="stylesheet" href="/app.css">
 </head>
-<body>
+<body class="app-shell">
 <header class="site-header" id="siteHeader" data-page="board"
         data-sub="Ticket board · assigned tickets across orgs"></header>
 <div class="wrap board-page">
@@ -52,7 +52,6 @@
   <div class="td-backdrop" id="epicBuilderBackdrop" hidden>
     <div class="td-panel td-narrow" id="epicBuilderPanel" role="dialog" aria-modal="true" aria-label="New epic from idea"></div>
   </div>
-  <div class="footer">Each host agent polls its org's tracker — Jira Cloud (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code>) or a self-hosted/cloud Azure DevOps board (<code>AZDO_URL</code> / <code>AZDO_TOKEN</code>) in the agent's env — for tickets assigned to that user, active work plus the last two weeks of Done, and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns follow the tracker's universal status categories, with an In Review column carved out for review/testing statuses; each card's pill shows the org's own status name. The header's org filter scopes this board — and every other page — to one org; each org is labelled from its site unless the agent sets <code>BOARD_ORG_NAME</code>. The board reads the tracker; the one write it makes is creating a ticket via the New ticket button.</div>
 </div>
 
 <nav class="bottom-nav" id="bottomNav"></nav>

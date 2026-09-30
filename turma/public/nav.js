@@ -96,6 +96,60 @@
     header.innerHTML = siteHeaderHtml(active, header.dataset.sub || "");
     const bottom = doc.getElementById("bottomNav");
     if (bottom) bottom.innerHTML = bottomNavHtml(active);
+    const pane = doc.querySelector && doc.querySelector(".page-scroll");
+    if (pane) {
+      let lastDown = null;
+      doc.addEventListener("pointerdown", (e) => { lastDown = e.target; }, true);
+      doc.addEventListener("keydown", (e) => paneKeyScroll(doc, pane, e, lastDown));
+    }
+  }
+
+  // The document no longer scrolls (see `.app-shell` in app.css), so a key
+  // scroll — PageDown, Space, arrows, Home/End — with nothing focused goes to
+  // the root and does nothing. Route those keys to the page's scroll pane, as
+  // the document scroll used to take them. Deliberately NOT done by focusing the
+  // pane on load: that moves where Tab starts, so the first Tab skipped the
+  // whole header. It steps aside whenever the browser has a scroll target of
+  // its own, because the browser does that better (inner lists, the pane itself):
+  //  - the focused element is inside the pane (its own scroller handles it) or
+  //    is editable (keys are text); a focused header link/button outside the
+  //    pane keeps only Space, which activates it — its other keys route here,
+  //    since the browser would send them to the unscrollable root;
+  //  - a modal is open (`body.td-open`) — its keys belong to the modal;
+  //  - the last click landed inside a scroller — Chrome/Firefox send
+  //    unfocused key scrolls to the scroller that was last clicked, so a clicked
+  //    log or clone list keeps its arrow keys, as it did before the pane.
+  // What's left — fresh load, or the last click was in the header — is exactly
+  // the case where the key would otherwise go to the unscrollable root.
+  function paneKeyScroll(doc, pane, e, lastDown) {
+    if (e.defaultPrevented || e.metaKey || e.altKey) return;
+    if (e.ctrlKey && e.key !== "Home" && e.key !== "End") return;
+    const focused = doc.activeElement && doc.activeElement !== doc.body ? doc.activeElement : null;
+    if (focused) {
+      if (e.key === " " || pane.contains(focused)) return;
+      if (focused.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(focused.tagName)) return;
+    }
+    if (doc.body.classList && doc.body.classList.contains("td-open")) return;
+    if (lastDown && inScroller(doc, lastDown)) return;
+    const page = pane.clientHeight * 0.875, line = 40;
+    const by = {
+      ArrowDown: line, ArrowUp: -line,
+      PageDown: page, PageUp: -page,
+      " ": e.shiftKey ? -page : page,
+      End: Infinity, Home: -Infinity,
+    }[e.key];
+    if (by === undefined) return;
+    e.preventDefault();
+    if (by === Infinity) pane.scrollTop = pane.scrollHeight;
+    else if (by === -Infinity) pane.scrollTop = 0;
+    else pane.scrollBy({ top: by });
+  }
+  function inScroller(doc, el) {
+    for (let n = el; n && n !== doc.body && n.nodeType === 1; n = n.parentElement) {
+      const oy = doc.defaultView.getComputedStyle(n).overflowY;
+      if ((oy === "auto" || oy === "scroll") && n.scrollHeight > n.clientHeight) return true;
+    }
+    return false;
   }
 
   // Every page repaints by replacing a container's innerHTML on each heartbeat
@@ -114,8 +168,10 @@
   // scroll to the right row), else the STRUCTURAL child-index path from the
   // container (fine for a fixed, ordered set like the board's four columns). Only
   // elements actually scrolled off zero are captured, so a settled page costs one
-  // cheap walk. Window scroll is restored only if the paint moved it (replacing a
-  // tall container can briefly collapse document height and clamp to the top).
+  // cheap walk. The container's scrolling ANCESTORS — the page's .page-scroll
+  // pane, or the document itself — are restored only if the paint moved them
+  // (replacing a tall container can briefly collapse their content height and
+  // clamp them to the top).
   function scrollKey(container, el) {
     const path = [];
     for (let n = el; n && n !== container; n = n.parentNode) {
@@ -137,7 +193,10 @@
   }
   function preserveScroll(container, paint) {
     if (!container) { paint(); return; }
-    const winX = window.scrollX, winY = window.scrollY;
+    const outer = [];
+    for (let n = container.parentElement; n; n = n.parentElement) {
+      outer.push([n, n.scrollTop, n.scrollLeft]);
+    }
     const saved = [];
     for (const el of container.querySelectorAll("*")) {
       if (el.scrollTop || el.scrollLeft) {
@@ -149,7 +208,9 @@
       const el = nodeForKey(container, s.key);
       if (el) { el.scrollTop = s.top; el.scrollLeft = s.left; }
     }
-    if (window.scrollX !== winX || window.scrollY !== winY) window.scrollTo(winX, winY);
+    for (const [n, top, left] of outer) {
+      if (n.scrollTop !== top || n.scrollLeft !== left) { n.scrollTop = top; n.scrollLeft = left; }
+    }
   }
 
   // ---- the shared failure toast (XERK-264) ----------------------------------
