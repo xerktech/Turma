@@ -8,11 +8,11 @@ FROM node:24-alpine
 # node:24-alpine tag between rebuilds (CVE-2026-14456, fixed 3.5.8-r0).
 RUN apk --no-cache upgrade
 
-# npm — pinned ahead of the base image's bundled npm to pull in patched
-# transitive deps (e.g. undici). The hub never runs npm, but the image scan
-# still gates on npm's node_modules, so keep it current here too.
-ARG NPM_VERSION=11.18.0
-RUN npm install -g "npm@${NPM_VERSION}" && npm cache clean --force
+# npm — REMOVED, not pinned. The hub is stdlib-only and never runs npm, but the
+# image scan gates HIGH/CRITICAL on npm's bundled node_modules, and pinning a
+# newer npm stops working whenever no npm release yet carries a patched
+# transitive dep (brace-expansion/undici, 2026-09). Nothing to scan, nothing to chase.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 ENV NODE_ENV=production
 WORKDIR /app
