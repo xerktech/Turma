@@ -122,6 +122,76 @@ _ECHO_PROGS = {"echo", "printf"}
 _SUBST_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`|<\(([^()]*)\)|>\(([^()]*)\)")
 
 
+def _balanced_groups(command: str) -> list[str]:
+    """Bodies of the outermost `$(…)`, `<(…)`, `>(…)`, `(…)` and backtick groups.
+
+    `_SUBST_RE` only ever sees ONE segment, and segmenting happens first, so a
+    group holding `;`, `|` or `&&` was cut in half before it could match:
+    `echo $(true; rm -rf /)` became `echo $(true` and `rm -rf /)`, whose last
+    token `/)` is no path at all — and `(cd /tmp; rm -rf /)` likewise (XERK-1083).
+    Matching parens over the WHOLE command keeps each body intact so it can be
+    expanded on its own terms; nesting is left to that recursion.
+
+    Single-quoted text is literal and skipped. Inside double quotes only `$(`
+    and backticks open a group — a substitution there still runs, but a bare
+    paren is text (`grep -E "ruff (check|format)"` runs no `format`). An UNCLOSED group yields
+    nothing: bash refuses it anyway, and `_substitute_vars` pastes fragments
+    like `$(command` (from `R=$(command -v ruff …)`) into the text, so reading
+    one to the end of the string swallowed later commands — `$R format` became
+    a disk-format command.
+    """
+    bodies: list[str] = []
+    # One entry per open context: '"' for a double-quoted string, '(' for a
+    # group. Quoting nests inside `$(…)`, so a flat quote flag cannot tell
+    # `"$(grep "a)" f)"` from `"a)"`.
+    stack: list[str] = []
+    start = 0
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        in_dq = bool(stack) and stack[-1] == '"'
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "`":
+            end = i + 1
+            while end < n and command[end] != "`":
+                end += 2 if command[end] == "\\" else 1
+            if "(" not in stack:
+                bodies.append(command[i + 1:end])
+            i = end + 1
+            continue
+        if in_dq:
+            # Inside "…" a bare `(` is text; only `$(` runs anything.
+            if ch == '"':
+                stack.pop()
+            elif ch == "$" and command[i + 1:i + 2] == "(":
+                if "(" not in stack:
+                    start = i + 2
+                stack.append("(")
+                i += 2
+                continue
+            i += 1
+            continue
+        if ch == "'":
+            end = command.find("'", i + 1)
+            i = n if end < 0 else end + 1
+            continue
+        if ch == '"':
+            stack.append('"')
+        elif ch == "(":
+            if "(" not in stack:
+                start = i + 1
+            stack.append("(")
+        elif ch == ")" and stack:
+            # A `)` with nothing open is a `case` pattern, not a group.
+            stack.pop()
+            if "(" not in stack:
+                bodies.append(command[start:i])
+        i += 1
+    return [b for b in bodies if b.strip()]
+
+
 def _subst_inner(m: "re.Match[str]") -> str:
     """The command text inside whichever substitution form matched."""
     return next((g for g in m.groups() if g), "")
@@ -252,14 +322,16 @@ def _var_values(command: str) -> dict[str, list[str]]:
     return vals
 
 
-def _substitute_vars(command: str) -> str:
+def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> str:
     """Inline variables the command line sets itself.
 
     Only names this very command assigns are substituted — an unresolved
-    `$TMPDIR` is left alone rather than guessed at.
+    `$TMPDIR` is left alone rather than guessed at. ``vals`` supplies them
+    from an enclosing command line instead (a group body sees its parent's).
     """
     # NB: no early return on an empty map — `${nope:-/etc}` needs no assignment.
-    vals = _var_values(command)
+    if vals is None:
+        vals = _var_values(command)
 
     def rep(m: "re.Match[str]") -> str:
         name = m.group(1) or m.group(3) or ""
@@ -502,6 +574,15 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
     out: list[tuple[list[str], str]] = []
     if depth > _MAX_EXPAND_DEPTH:
         return out
+    # Groups first, over the whole command: splitting below would sever any
+    # group whose body holds an operator (see _balanced_groups). Scanned
+    # BEFORE pre-normalisation, whose brace expansion ignores quoting and can
+    # unbalance them (`awk '{print $2, $4}'`); each body gets the variables
+    # this line assigns, so `d=/etc; (true; rm -rf $d)` still resolves.
+    raw_commands, _ = _split_heredocs(command)
+    raw_vals = _var_values(raw_commands)
+    for body in _balanced_groups(raw_commands):
+        out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1))
     command, heredocs = _split_heredocs(_prenormalise(command))
     # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF` runs
     # every line of it. Expand those bodies as commands; bodies fed to anything

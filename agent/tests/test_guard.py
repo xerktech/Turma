@@ -1291,6 +1291,70 @@ class TestDecide(unittest.TestCase):
         self.assertEqual(guard._parse_overrides(None), [])
 
 
+class TestGroupsHoldingOperators(unittest.TestCase):
+    """A group whose body holds `;`, `|` or `&&` must still be classified.
+
+    Operator splitting ran before the substitution regex could see the group,
+    so it cut `$( … )` in half and every one of these was ALLOWED (XERK-1083).
+    """
+
+    DENIED = [
+        "echo $(true; rm -rf /)",
+        "(x | xargs rm -rf /)",
+        "echo `a && rm -rf /`",
+        "echo $(x | sudo rm -rf /)",
+        "(cd /tmp; rm -rf /)",
+        "cat <(true; rm -rf /etc)",
+        "echo $(echo a $(true; rm -rf /))",
+        "echo $( (rm -rf /) )",
+        'echo "a $(true; rm -rf /) b"',
+        'echo "$(grep "a)" f; rm -rf /)"',
+        'x "`true; rm -rf /`"',
+        "d=/etc; (true; rm -rf $d)",
+        "for d in /etc; do (true; rm -rf $d); done",
+    ]
+
+    # Shapes a real-transcript replay (32k commands) showed a naive paren
+    # match refusing: literal parens in quotes, `case` arms, arithmetic, and a
+    # brace-expanded awk program that unbalances the quotes after
+    # pre-normalisation.
+    ALLOWED = [
+        "echo '(true; rm -rf /)'",
+        'grep -nE "ruff (check|format)" f',
+        'echo "(reboot; format)"',
+        "case $x in a) rm -rf /tmp/x;; esac",
+        "echo $((1+2)); (cd /tmp && ls)",
+        'rm -rf "$(mktemp -d)"',
+        "R=$(command -v ruff || ls ~/.local/bin/ruff | head -1); $R format --check .",
+        "awk '{print $2, $4}' f; grep -E 'talosctl (reboot|shutdown)' .",
+    ]
+
+    def test_destructive_group_bodies_are_denied(self):
+        for cmd in self.DENIED:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_policy_inside_a_group_is_denied(self):
+        self.assertIsNotNone(guard.policy_reason("echo $(x | xargs git push -f origin main)"))
+
+    def test_ordinary_groups_stay_allowed(self):
+        for cmd in self.ALLOWED:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+                self.assertIsNone(guard.policy_reason(cmd))
+
+    def test_real_hook_denies_a_split_substitution(self):
+        proc = subprocess.run(
+            [sys.executable, GUARD_PATH],
+            input=json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command": "echo $(true; rm -rf /)"}}),
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+
 class TestHookEntrypoint(unittest.TestCase):
     """Invoke guard.py as a subprocess the way Claude Code runs the hook."""
 

@@ -57,6 +57,11 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   rules (same shell-not-string classification as Policy).
   - **Fails open on a malformed EVENT, closed on a classifier crash** (XERK-1080): a traceback
     exits 1, which Claude Code treats as non-blocking, so failing open ran the command unchecked.
+  - **Groups are extracted BEFORE operator splitting** (`_balanced_groups`, XERK-1083) — splitting
+    first cut `$(true; rm -rf /)` / `(cd x; rm -rf /)` in half and allowed them. It scans the RAW
+    line (pre-normalisation brace expansion unbalances quotes) and is quote-aware: only `$(` and
+    backticks open inside `"…"`; unclosed groups yield nothing (var substitution pastes stray
+    `$(command` fragments). Each of those was a false deny in a real-transcript replay.
   - Keep in sync with the twin hook outside this repo.
   - Tests: `test_guard.py`, `test_guard_settings.py`.
 - **File guard** (`hooks/fileguard.py`, same shape) — `PreToolUse` over
