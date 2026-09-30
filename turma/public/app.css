@@ -139,22 +139,20 @@ h1, h2, h3 { font-family: var(--font-display); }
    content column to --wrap-board so those columns can show without scrolling
    (XERK-606). The site header is unaffected — it lives OUTSIDE .wrap and caps
    its own row at --wrap (see .site-header-in), so it stays put at every width.
-   The toolbar and footer are re-centred back at the reading width so they still
-   line up under the header (the footer is a long paragraph that must not stretch
-   to 1640px, and the toolbar keeps its buttons above the header's right edge);
-   both stay centred in the viewport at --wrap exactly as the header does, since
-   the wide .wrap is itself centred. Only #board takes the extra width. */
+   The toolbar is re-centred back at the reading width so its buttons still sit
+   above the header's right edge; it stays centred in the viewport at --wrap
+   exactly as the header does, since the wide .wrap is itself centred. Only
+   #board takes the extra width. */
 .wrap.board-page { max-width: var(--wrap-board); }
-.wrap.board-page > .board-bar,
-.wrap.board-page > .footer { max-width: var(--wrap); margin-inline: auto; }
+.wrap.board-page > .board-bar { max-width: var(--wrap); margin-inline: auto; width: 100%; }
 
 /* The board page is exactly one viewport tall, so the PAGE never scrolls: the
-   strip takes whatever height the header, toolbar and footer leave, each column
+   strip takes whatever height the header and toolbar leave, each column
    stretches to it and its card list scrolls inside it (see .kanban-col below).
    That keeps the strip's horizontal scrollbar on screen at the bottom of the
    window — uncapped, a long column made the strip taller than the window and
    parked that scrollbar below the fold. Flex, not a `calc(100dvh - N)` guess, so
-   a wrapped toolbar or a long footer can't push the strip off the bottom. On a
+   a wrapped toolbar can't push the strip off the bottom. On a
    window too short for the lists' `min-height` floors the content overflows and
    the page scrolls again, which is the graceful end of it. */
 body.board-body {
@@ -172,11 +170,6 @@ body.board-body > .site-header { flex: none; }
 }
 #board > * { flex: none; }
 #board > .kanban-cols { flex: 1; min-height: 0; align-items: stretch; }
-.wrap.board-page > .board-bar, .wrap.board-page > .footer { width: 100%; }
-.wrap.board-page > .footer { margin-top: 14px; }
-/* On a phone the footer's paragraph wraps to ~15 lines — half the screen, taken
-   out of the columns now that the page doesn't scroll — so the board drops it. */
-@media (max-width: 560px) { .wrap.board-page > .footer { display: none; } }
 
 h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 
