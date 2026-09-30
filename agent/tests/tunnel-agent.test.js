@@ -2680,7 +2680,8 @@ test("captureLiveTurn never reads a prefix-named neighbour's pane", { skip: !has
   const saved = { TMUX: process.env.TMUX, TMUX_TMPDIR: process.env.TMUX_TMPDIR };
   delete process.env.TMUX;
   process.env.TMUX_TMPDIR = fs.mkdtempSync(path.join(os.tmpdir(), "tmx-"));
-  const tmux = (...a) => execFileSync("tmux", a, { env: process.env, stdio: "ignore" });
+  // The manager's own server (XERK-1078), inside the private socket dir.
+  const tmux = (...a) => execFileSync("tmux", ["-L", "turma", ...a], { env: process.env, stdio: "ignore" });
   const capture = (id) => new Promise((resolve) => captureLiveTurn(id, resolve));
   try {
     // Both panes show a BUSY Claude turn, so a prefix match would read as one.
@@ -2702,6 +2703,45 @@ test("captureLiveTurn never reads a prefix-named neighbour's pane", { skip: !has
   } finally {
     try { tmux("kill-server"); } catch { /* already gone */ }
     fs.rmSync(process.env.TMUX_TMPDIR, { recursive: true, force: true });
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
+// XERK-1078: sessions live on the manager's `-L turma` server. The DEFAULT
+// server is read only for a name the manager published as a legacy session — a
+// session's own tmux lives there now, and could carry a neighbour's name.
+test("captureLiveTurn reads the default server only for a published legacy session", { skip: !hasTmux && "needs tmux" }, async () => {
+  const { execFileSync } = require("child_process");
+  const { captureLiveTurn } = require("../tunnel-agent.js");
+  const saved = { TMUX: process.env.TMUX, TMUX_TMPDIR: process.env.TMUX_TMPDIR, HOME: process.env.HOME };
+  delete process.env.TMUX;
+  process.env.TMUX_TMPDIR = fs.mkdtempSync(path.join(os.tmpdir(), "tmx-"));
+  process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), "home-"));
+  fs.mkdirSync(path.join(process.env.HOME, ".turma"));
+  const legacyFile = path.join(process.env.HOME, ".turma", "tmux-legacy");
+  const onDefault = (...a) => execFileSync("tmux", a, { env: process.env, stdio: "ignore" });
+  const capture = (id) => new Promise((resolve) => captureLiveTurn(id, resolve));
+  const idle = { generating: false, text: "", status: null, agents: [] };
+  try {
+    const f = path.join(process.env.TMUX_TMPDIR, "pane.txt");
+    fs.writeFileSync(f, ["❯ go", "● DEFAULT-MARK", RULE, "❯ ", RULE,
+      "  ⏵⏵ bypass permissions on · esc to interrupt"].join("\n") + "\n");
+    onDefault("new-session", "-d", "-x", "120", "-y", "20", "-s", "agent-old", "sh", "-c", `cat '${f}'; exec sleep 60`);
+    await new Promise((r) => setTimeout(r, 300));
+    // Not published: a default-server pane is never read.
+    assert.deepEqual(await capture("old"), idle);
+    // Published by the manager as legacy: read there.
+    fs.writeFileSync(legacyFile, "agent-other\nagent-old\n");
+    assert.match((await capture("old")).text, /DEFAULT-MARK/);
+    // Relaunched onto the manager's server (the file drops the name): idle again.
+    fs.rmSync(legacyFile);
+    assert.deepEqual(await capture("old"), idle);
+  } finally {
+    try { onDefault("kill-server"); } catch { /* already gone */ }
+    fs.rmSync(process.env.TMUX_TMPDIR, { recursive: true, force: true });
+    fs.rmSync(process.env.HOME, { recursive: true, force: true });
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }

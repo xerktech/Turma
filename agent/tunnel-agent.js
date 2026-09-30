@@ -1315,6 +1315,24 @@ function ptyCaptureWindows(sessionId, cb) {
 // `tmux capture-pane` (execFile, not execFileSync), on Windows via the pty-host
 // control socket (ptyCaptureWindows). Platform checked at call time so the suite
 // can drive both paths.
+// The manager's own tmux server (XERK-1078) — `TMUX_SOCKET` in hub-agent.py.
+// Sessions no longer share the host's DEFAULT server, where a session's own
+// `tmux kill-server` could take them all down.
+const TMUX_SOCKET = "turma";
+// Sessions an older manager left on the DEFAULT server, published by
+// hub-agent.py's `_publish_legacy_tmux` (one tmux name per line; absent = none).
+// Only a listed name is read there: a session's own tmux lives on the default
+// server now and could carry a neighbour's `agent-<id>` name. Resolved per call
+// (it is a few bytes, and only on a live-tail capture) so a manager's update to
+// it needs no tunnel restart.
+function tmuxServerArgs(tmuxName) {
+  let legacy = "";
+  try {
+    legacy = fs.readFileSync(path.join(os.homedir(), ".turma", "tmux-legacy"), "utf8");
+  } catch { /* none */ }
+  return legacy.split("\n").includes(tmuxName) ? [] : ["-L", TMUX_SOCKET];
+}
+
 function captureLiveTurn(sessionId, cb) {
   const idle = { generating: false, text: "", status: null, agents: [] };
   if (process.platform === "win32") {
@@ -1325,7 +1343,7 @@ function captureLiveTurn(sessionId, cb) {
     "tmux",
     // `=…:` is an EXACT pane target: a bare name prefix-matches another
     // `agent-<id>…` session once this one is gone (XERK-1042).
-    ["capture-pane", "-p", "-t", `=agent-${sessionId}:`],
+    [...tmuxServerArgs(`agent-${sessionId}`), "capture-pane", "-p", "-t", `=agent-${sessionId}:`],
     { timeout: 2000, maxBuffer: 1 << 20 },
     (err, stdout) => cb(err ? idle : parsePaneLiveTurn(stdout))
   );

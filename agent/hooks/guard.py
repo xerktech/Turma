@@ -1166,16 +1166,22 @@ _TMUX_KILL_TARGET = (
     "respawn-p", "respawn-w", "respawnp", "respawnw", "unlink-w", "unlinkw",
 )
 
+# The Turma agent's own tmux server (XERK-1078): `TMUX_SOCKET` in hub-agent.py.
+# Every session is a pane of it. Sessions of an older agent can still be on the
+# DEFAULT server across an in-place upgrade, so both stay protected.
+_AGENT_TMUX_SOCKET = "turma"
+
 _TMUX_HOST_REASON = (
-    "every Turma session on this host, including yours, runs in the host's "
-    "default tmux server, and your shell's `$TMUX` points at it (it overrides "
-    "TMUX_TMPDIR). Use a private server for tests: `tmux -L <name> ...`."
+    "every Turma session on this host, including yours, runs in the agent's "
+    "tmux server (`-L " + _AGENT_TMUX_SOCKET + "`, or the default server for a "
+    "session an older agent started). Use a private server for tests: "
+    "`tmux -L <name> ...`."
 )
 
 
 def _tmux_server(tokens: list[str]) -> tuple[str | None, int]:
-    """The server a tmux call names with -L/-S (None = the default one), and the
-    index of its command word."""
+    """The server a tmux call names with -L/-S (None = one Turma sessions may run
+    in: the default server or the agent's), and the index of its command word."""
     server = None
     i = 1
     while i < len(tokens) and tokens[i].startswith("-") and len(tokens[i]) > 1:
@@ -1190,15 +1196,21 @@ def _tmux_server(tokens: list[str]) -> tuple[str | None, int]:
                     value = tokens[i]
                     i += 1
                 if flag == "L":
-                    server = value
+                    # tmux joins -L onto its socket dir, so `./turma`, `turma/`
+                    # or `../tmux-0/turma` name the same socket: normalize, and a
+                    # name that still walks directories can't be told apart.
+                    server = posixpath.normpath(value) if value else value
+                    if "/" in server or "\\" in server or server in (".", ".."):
+                        server = "default"
                 elif flag == "S":
-                    server = re.split(r"[\\/]", value)[-1]
+                    server = re.split(r"[\\/]", value.rstrip("/\\"))[-1]
                 break
-    # `-L default` / `-S .../default` IS the host's server by another name, and a
-    # value the guard cannot see (`-S "${TMUX%%,*}"`) may be it too.
+    # `-L default` / `-S .../default` IS the host's server by another name, the
+    # agent's own `-L turma` is where sessions run, and a value the guard cannot
+    # see (`-S "${TMUX%%,*}"`) may be either.
     if server is not None and ("$" in server or "`" in server or _OPAQUE_SUBST in server):
         server = None
-    return (None if server in ("default", "") else server), i
+    return (None if server in ("default", "", _AGENT_TMUX_SOCKET) else server), i
 
 
 def _tmux_target_is_agent(target: str | None) -> bool:
@@ -1226,11 +1238,13 @@ def _tmux_target_is_agent(target: str | None) -> bool:
 def _destructive_agent_tmux(tokens: list[str]) -> str | None:
     """Refuse taking down the tmux server, or a session, other sessions run in.
 
-    Sessions run as panes of ONE tmux server on its default socket, and every
-    session's shell inherits `$TMUX` pointing at it — tmux prefers that over
-    `TMUX_TMPDIR`, so exporting a private `TMUX_TMPDIR` first does not help
-    (XERK-1077: a QA subagent's `tmux kill-server` killed every session on a
-    host). A call naming a non-default server with `-L`/`-S` is left alone.
+    Sessions run as panes of ONE tmux server, the agent's `-L turma` (XERK-1078;
+    the default server for a session an older agent started), and a session's
+    runtime starts with `$TMUX` unset, so its bare `tmux` reaches the default
+    server. This net stays as defence in depth (XERK-1077: a QA subagent's
+    `tmux kill-server` killed every session on a host, back when sessions were
+    on the default server and inherited `$TMUX`). A call naming any other server
+    with `-L`/`-S` is left alone.
     """
     prog = _basename(tokens[0])
     # `pkill -f "tmux: server"` is how `ps` names the server, so match the word
