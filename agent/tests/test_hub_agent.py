@@ -22117,6 +22117,10 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
         sm.session_cheap = {"s1": good}
 
         def stalled(path, strict=False):
+            # What run() makes of a timeout for a NON-strict read: "gone".
+            # Only a strict read can tell, so this also pins the worker to one.
+            if not strict:
+                return None
             raise ha.GitTimeout("status")
 
         done = threading.Event()
