@@ -155,7 +155,7 @@ test("nav: every page is a fixed shell whose content scrolls below the header", 
     "below the centred column's width the gutter must go on the right only, or the content is indented off the header");
   for (const f of ["index.html", "usage.html"]) {
     const src = fs.readFileSync(path.join(PUBLIC, f), "utf8");
-    assert.match(src, /<body class="app-shell">\s*<header[^>]*><\/header>\s*<div class="page-scroll" tabindex="-1">/,
+    assert.match(src, /<body class="app-shell">\s*<header[^>]*><\/header>\s*<div class="page-scroll">/,
       `${f} must scroll its content in a .page-scroll pane below the header`);
   }
   const board = fs.readFileSync(path.join(PUBLIC, "board.html"), "utf8");
@@ -173,18 +173,32 @@ test("nav: no page opts out of the reserved gutter", () => {
 });
 
 // With the document unscrollable, a key scroll on an unfocused page goes nowhere
-// unless the pane holds focus.
-test("nav: mount focuses the page's scroll pane so keys scroll it without a click", () => {
-  let focused = null;
-  const pane = { focus(opts) { focused = opts; } };
+// unless it is routed to the pane — without ever focusing the pane, which would
+// move where Tab starts and skip the header.
+test("nav: scroll keys with nothing focused scroll the page pane, never move focus", () => {
+  const pane = { clientHeight: 800, scrollHeight: 5000, scrollTop: 0,
+    scrollBy({ top }) { this.scrollTop += top; }, focus() { throw new Error("pane must not take focus"); } };
   const body = {};
+  let onKey = null;
   const doc = { getElementById: () => ({ dataset: {} }), querySelector: (s) => s === ".page-scroll" ? pane : null,
-    body, activeElement: body };
+    body, activeElement: body, addEventListener: (t, fn) => { if (t === "keydown") onKey = fn; } };
   mount(doc);
-  assert.deepEqual(focused, { preventScroll: true });
-  focused = null;
-  mount({ ...doc, activeElement: {} });            // something else already has focus
-  assert.equal(focused, null, "must not steal focus from an element that holds it");
+  assert.ok(onKey, "mount must listen for keydown on a page with a scroll pane");
+  const key = (k, extra = {}) => {
+    const e = { key: k, defaultPrevented: false, prevented: false, ...extra,
+      preventDefault() { this.prevented = true; } };
+    onKey(e); return e;
+  };
+  assert.ok(key("PageDown").prevented); assert.equal(pane.scrollTop, 700);
+  key("ArrowUp"); assert.equal(pane.scrollTop, 660);
+  key(" ", { shiftKey: true }); assert.equal(pane.scrollTop, -40);
+  key("End"); assert.equal(pane.scrollTop, 5000);
+  key("Home"); assert.equal(pane.scrollTop, 0);
+  assert.equal(key("a").prevented, false, "other keys pass through");
+  assert.equal(key("PageDown", { ctrlKey: true }).prevented, false, "modified keys pass through");
+  doc.activeElement = {};                                  // an input/button holds focus
+  assert.equal(key("PageDown").prevented, false, "a focused element keeps its own keys");
+  assert.equal(pane.scrollTop, 0);
 });
 
 test("nav: each page declares its own sub-header text and its own tab", () => {

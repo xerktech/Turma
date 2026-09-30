@@ -96,12 +96,32 @@
     header.innerHTML = siteHeaderHtml(active, header.dataset.sub || "");
     const bottom = doc.getElementById("bottomNav");
     if (bottom) bottom.innerHTML = bottomNavHtml(active);
-    // The document no longer scrolls (see `.app-shell` in app.css), so a key
-    // scroll — PageDown, Space, arrows, End — with nothing focused goes to the
-    // root and does nothing. Focusing the page's scroll pane (tabindex="-1")
-    // sends it there instead, as the document scroll used to.
     const pane = doc.querySelector && doc.querySelector(".page-scroll");
-    if (pane && doc.activeElement === doc.body) pane.focus({ preventScroll: true });
+    if (pane) doc.addEventListener("keydown", (e) => paneKeyScroll(doc, pane, e));
+  }
+
+  // The document no longer scrolls (see `.app-shell` in app.css), so a key
+  // scroll — PageDown, Space, arrows, Home/End — with nothing focused goes to
+  // the root and does nothing. Route those keys to the page's scroll pane, as
+  // the document scroll used to take them. Deliberately NOT done by focusing the
+  // pane on load: that moves where Tab starts, so the first Tab skipped the
+  // whole header. Only when nothing holds focus — a focused input, button or
+  // inner scroller keeps its own keys.
+  function paneKeyScroll(doc, pane, e) {
+    if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (doc.activeElement && doc.activeElement !== doc.body) return;
+    const page = pane.clientHeight * 0.875, line = 40;
+    const by = {
+      ArrowDown: line, ArrowUp: -line,
+      PageDown: page, PageUp: -page,
+      " ": e.shiftKey ? -page : page,
+      End: Infinity, Home: -Infinity,
+    }[e.key];
+    if (by === undefined) return;
+    e.preventDefault();
+    if (by === Infinity) pane.scrollTop = pane.scrollHeight;
+    else if (by === -Infinity) pane.scrollTop = 0;
+    else pane.scrollBy({ top: by });
   }
 
   // Every page repaints by replacing a container's innerHTML on each heartbeat

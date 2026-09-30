@@ -99,8 +99,8 @@
    and their LEFT edges line up; a left gutter there would indent the content off
    the header's. Between 1180 and 1200 neither choice lines up exactly, so the
    switch sits at the 1190 midpoint, which caps the offset at 5px. Phones overlay
-   their scrollbars, so no gutter at all there. The pane takes focus on load
-   (nav.js mount) so keyboard scrolling works without a click first. */
+   their scrollbars, so no gutter at all there. nav.js routes scroll keys to the
+   pane when nothing is focused, so keyboard scrolling works without a click. */
 body.app-shell {
   height: 100vh; height: 100dvh;
   display: flex; flex-direction: column;
@@ -109,7 +109,6 @@ body.app-shell {
   flex: 1; min-height: 0;
   overflow-y: auto; scrollbar-gutter: stable both-edges;
 }
-.page-scroll:focus { outline: none; }
 @media (max-width: 1190px) { .page-scroll { scrollbar-gutter: stable; } }
 
 /* Every scrollbar in the UI is a thin, theme-coloured thumb on a transparent
