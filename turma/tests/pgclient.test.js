@@ -344,8 +344,11 @@ function startFakePg(opts = {}) {
   const password = opts.password || "pencil";
   const iterations = 4096;
   let connectionCount = 0;
+  const sockets = new Set();
   const server = net.createServer((socket) => {
     connectionCount++;
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
     let buf = Buffer.alloc(0);
     let phase = "ssl";
     const sc = {}; // scram state for this socket
@@ -488,6 +491,9 @@ function startFakePg(opts = {}) {
         get connectionCount() {
           return connectionCount;
         },
+        // Server-side close of every open connection — a Postgres restart/failover
+        // as the pool's IDLE connections see it.
+        dropAll: () => { for (const s of sockets) s.destroy(); },
       });
     });
   });
@@ -570,6 +576,31 @@ test("live: concurrent queries never exceed the pool's max connections", async (
     assert.equal(results.length, 5);
     for (const r of results) assert.equal(r.length, 1);
     assert.ok(fake.connectionCount <= 2, `made ${fake.connectionCount} connections, cap is 2`);
+  } finally {
+    pool.close();
+    await fake.close();
+  }
+});
+
+test("live: idle connections the server closed never wedge the pool", async () => {
+  // Every pooled connection dies while IDLE (a Postgres failover). They must not
+  // keep counting toward `max`: when they did, _pump saw a full pool with nothing
+  // alive, spawned nothing, and every later query waited forever — on prod the
+  // archive hydrate hung for days with ingest 503'd behind it.
+  const fake = await startFakePg();
+  const pool = poolFor(fake, { max: 2 });
+  try {
+    await Promise.all([pool.query("SELECT $1", ["a"]), pool.query("SELECT $1", ["b"])]);
+    assert.equal(fake.connectionCount, 2);
+    fake.dropAll();
+    await new Promise((r) => setTimeout(r, 50)); // let both 'close' events land
+    let timer;
+    const rows = await Promise.race([
+      pool.query("SELECT $1", ["c"]),
+      new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("pool wedged")), 2000); }),
+    ]).finally(() => clearTimeout(timer));
+    assert.deepEqual(rows, [{ p0: "c" }]);
+    assert.equal(fake.connectionCount, 3, "a fresh connection replaced the dead ones");
   } finally {
     pool.close();
     await fake.close();
