@@ -10935,8 +10935,10 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(
             self._claude_cmd(),
             # $TMUX/$TMUX_PANE unset first, so the session's own `tmux` never
-            # addresses the agent's server (XERK-1078).
-            "unset TMUX TMUX_PANE; "
+            # addresses the agent's server (XERK-1078), and so are the Claude
+            # session markers, so an inherited CHILD_SESSION can't switch the
+            # session's transcript off.
+            ha._TMUX_ENV_STRIP +
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
             f"TURMA_QUESTIONS_DIR={shlex.quote(ha.QUESTIONS_DIR)} "
             f"claude --session-id {sess['claudeSessionId']} "
@@ -33878,6 +33880,70 @@ class TestAgentTmuxSocket(unittest.TestCase):
         panes = ha.SessionManager._memguard_panes(mgr)
         self.assertIsNotNone(panes)
         self.assertEqual(len(panes), 1)
+
+    def test_a_polluted_warm_server_cannot_switch_a_sessions_transcript_off(self):
+        # A manager started from inside a Claude session cold-starts the tmux
+        # server with that session's env as its GLOBAL env, which every later
+        # pane inherits. Claude reads CLAUDE_CODE_CHILD_SESSION there as "child
+        # session" and saves no transcript. Replayed on a real server.
+        start = subprocess.run(
+            ["tmux", "-L", ha.TMUX_SOCKET, "new-session", "-d", "-s", "seed",
+             "sleep 30"], capture_output=True)
+        self.assertEqual(start.returncode, 0, start.stderr)
+        for k in ha._CLAUDE_SESSION_ENV + ("CLAUDE_CODE_USE_BEDROCK",):
+            subprocess.run(["tmux", "-L", ha.TMUX_SOCKET, "set-environment",
+                            "-g", k, "1"], check=True)
+        env_dump = os.path.join(self.tmp, "env.txt")
+        sess = {"tmuxName": "agent-k2", "worktreePath": self.tmp}
+        ha.SessionManager._spawn_in_tmux(
+            None, sess, f"env > {env_dump}.tmp; mv {env_dump}.tmp {env_dump}; "
+                        "exec sleep 30")
+        for _ in range(50):
+            if os.path.exists(env_dump):
+                break
+            time.sleep(0.1)
+        dumped = "\n" + open(env_dump).read()
+        # Compared by name, never assertIn on the dump: a failure would print
+        # the pane's whole env (tokens included) into the CI log.
+        leaked = [k for k in ha._CLAUDE_SESSION_ENV if f"\n{k}=" in dumped]
+        self.assertEqual(leaked, [])
+        # An operator's own CLAUDE_CODE_* setting survives.
+        self.assertTrue("\nCLAUDE_CODE_USE_BEDROCK=1" in dumped)
+
+
+class TestScrubClaudeSessionEnv(unittest.TestCase):
+    """A manager started from inside a Claude session drops that session's
+    markers from its own env, so nothing it spawns inherits them."""
+
+    def test_drops_session_markers_and_keeps_operator_settings(self):
+        env = {k: "x" for k in ha._CLAUDE_SESSION_ENV}
+        env.update({"CLAUDE_CODE_USE_BEDROCK": "1", "PATH": "/bin",
+                    "CLAUDE_PROJECTS_ROOT": "/p"})
+        self.assertEqual(ha._scrub_claude_session_env(env),
+                         list(ha._CLAUDE_SESSION_ENV))
+        self.assertEqual(env, {"CLAUDE_CODE_USE_BEDROCK": "1", "PATH": "/bin",
+                               "CLAUDE_PROJECTS_ROOT": "/p"})
+        self.assertEqual(ha._scrub_claude_session_env(env), [])
+
+    def test_main_scrubs_before_the_manager_starts(self):
+        # The cold-start half: a tmux server the manager starts copies ITS env.
+        seen = {}
+
+        class FakeManager:
+            def run_forever(self):
+                seen["child"] = os.environ.get("CLAUDE_CODE_CHILD_SESSION")
+
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_CHILD_SESSION": "1"}), \
+                mock.patch.object(ha, "SessionManager", FakeManager), \
+                mock.patch.object(ha, "log"):
+            ha.main()
+        self.assertEqual(seen, {"child": None})
+
+    def test_the_child_session_marker_is_on_the_list(self):
+        # The one that switches transcript saving off (Claude Code 2.1.285).
+        self.assertIn("CLAUDE_CODE_CHILD_SESSION", ha._CLAUDE_SESSION_ENV)
+        self.assertIn("CLAUDE_CODE_CHILD_SESSION", ha._TMUX_ENV_STRIP)
+
 
 
 class TestWindowsTerminalBackend(unittest.TestCase):

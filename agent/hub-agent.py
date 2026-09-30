@@ -1159,11 +1159,39 @@ def run_ok(cmd, cwd=None, timeout=30, env=None):
 # tunnel-agent.js captures on it (`TMUX_SOCKET`) — keep all three equal.
 TMUX_SOCKET = "turma"
 
+# The markers a running Claude Code session exports into its own tool
+# subprocesses. A manager started from INSIDE a session (`turma-agentctl update`
+# run from a session's Bash) inherits them, and so does the tmux server it
+# cold-starts — its global env is a copy of the starter's, handed to every pane.
+# Claude Code then reads `CLAUDE_CODE_CHILD_SESSION` as "I am a child session"
+# and writes NO transcript, which blanks that session's chat view; the rest name
+# a session that is not this one (its id, messaging socket + token). Operator
+# settings such as CLAUDE_CODE_USE_BEDROCK are NOT on this list — never widen it
+# to a `CLAUDE_CODE_*` prefix.
+_CLAUDE_SESSION_ENV = (
+    "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH", "CLAUDE_PID",
+    "CLAUDE_EFFORT", "AI_AGENT",
+)
+
+
+def _scrub_claude_session_env(env=None):
+    """Drop `_CLAUDE_SESSION_ENV` from `env` (default: this process's), so the
+    claude subprocesses the manager runs directly and a tmux server it cold-starts
+    don't inherit another session's identity. Returns the names removed."""
+    env = os.environ if env is None else env
+    return [k for k in _CLAUDE_SESSION_ENV if env.pop(k, None) is not None]
+
+
 # Prefixed to every command the agent starts in a tmux pane. tmux exports
 # TMUX/TMUX_PANE into the pane, and tmux prefers $TMUX over TMUX_TMPDIR, so a
 # session that inherited them would still address the agent's server with a
-# bare `tmux`.
-_TMUX_ENV_STRIP = "unset TMUX TMUX_PANE; "
+# bare `tmux`. The Claude session markers are unset here too, not only scrubbed
+# from the manager: a WARM tmux server started by a polluted manager keeps them
+# in its global env across every later manager restart.
+_TMUX_ENV_STRIP = "unset TMUX TMUX_PANE " + " ".join(_CLAUDE_SESSION_ENV) + "; "
 
 # Agent-owned tmux sessions an OLDER agent started on the default server, which
 # a manager-only restart (an in-place update) leaves running there: tmux can't
@@ -31825,6 +31853,10 @@ class SessionManager:
 
 
 def main():
+    scrubbed = _scrub_claude_session_env()
+    if scrubbed:
+        log("started from inside a Claude session; dropped its env markers: "
+            + " ".join(scrubbed))
     SessionManager().run_forever()
 
 
