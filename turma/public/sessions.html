@@ -2245,8 +2245,8 @@ function prLanded(p) {
 // with an answer and no PR, which is the one the operator asked for by name:
 //
 //   - a pending question / blocking TUI dialog. It is BLOCKED on a human, so it
-//     qualifies whatever the busy read says, and it leads the section (collect()
-//     already sorts `waiting` first);
+//     qualifies whatever the busy read says (it sits in its createdAt slot like
+//     every card — collect() never re-ranks within a section);
 //   - a PR that hasn't landed — there is a diff to read;
 //   - a finished turn: the newest transcript entry is plain assistant output
 //     with no tool call pending, which is the only trace a no-PR task leaves.

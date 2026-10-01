@@ -487,13 +487,18 @@ test("live sections keep a stable newest-created order whatever the activity", (
       at(running("33333", "Mid Work", { paneBusy: true, transcriptAgeSec: ages[2] }), "2026-01-02T00:00:00Z"),
       at(waiting("44444", "Old Ask"), "2026-01-01T00:00:00Z"),
       at(finished("55555", "New Done"), "2026-01-05T00:00:00Z"),
+      // Undated cards sort last; a tie falls back to the id.
+      running("77777", "Undated Z", { paneBusy: true, transcriptAgeSec: ages[0] }),
+      running("66666", "Undated Y", { paneBusy: true, transcriptAgeSec: ages[1] }),
+      at(running("99999", "Tie Z", { paneBusy: true, transcriptAgeSec: ages[2] }), "2026-01-02T00:00:00Z"),
     ]);
     render({ now, agents: [h] });
   };
-  const names = ["New Work", "Mid Work", "Old Work"];
+  const names = ["New Work", "Mid Work", "Tie Z", "Old Work", "Undated Y", "Undated Z"];
   beat([1, 2, 3]);
   const first = order(els.active.innerHTML, names);
-  assert.deepEqual(first, [...first].sort((a, b) => a - b), "newest-created first");
+  assert.deepEqual(first, [...first].sort((a, b) => a - b),
+    "newest-created first, id breaking ties, undated last");
   beat([3, 1, 2]);   // activity reshuffles; the cards must not
   assert.deepEqual(order(els.active.innerHTML, names), first, "activity does not reorder a section");
   const r = els.review.innerHTML;

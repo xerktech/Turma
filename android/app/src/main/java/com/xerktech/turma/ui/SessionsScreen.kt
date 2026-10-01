@@ -522,7 +522,7 @@ fun SessionsListPane(
     // channels, deduped on <host>::<transcriptId>.
     val lists = remember(agents, query) { collectSessions(agents, query) }
     // The live sessions split into the web's Ready-for-review / Active / Idle
-    // sections, each ranked attention-first / freshest-first (XERK-73).
+    // sections, each in a stable newest-created order (see rankRunning).
     val groups = remember(lists, now) { rankRunning(lists.running, now) }
     val (review, active, idle) = groups
     val queued = lists.queued
