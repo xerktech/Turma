@@ -2283,9 +2283,6 @@ function reviewState(s, live) {
   return { ...live, kind: "review", label, detail: live.detail };
 }
 
-// Running sessions sorted attention-first: waiting on you, then working, then
-// idle; freshest activity first within each group.
-const KIND_ORDER = { waiting: 0, working: 1, idle: 2 };
 // A session is "ended" if it is over but still resumable, and that covers three
 // records the agent reports through different channels:
 //
@@ -2383,10 +2380,15 @@ function collect(agents, now) {
       }
     }
   }
+  // Newest-created first, on a key that never changes while a session lives.
+  // Sessions MOVE between sections as their state changes, but never within
+  // one: ranking by activity or urgency reshuffled a section every beat, which
+  // made it impossible to keep track of which cards had already been looked at.
+  // Do not re-rank on anything a heartbeat can change. Undated records sort last;
+  // the id breaks ties so the order is total.
   running.sort((x, y) =>
-    (KIND_ORDER[x.live.kind] - KIND_ORDER[y.live.kind]) ||
-    ((y.s.session?.transcriptAgeSec == null ? -1 : -y.s.session.transcriptAgeSec) -
-     (x.s.session?.transcriptAgeSec == null ? -1 : -x.s.session.transcriptAgeSec)));
+    String(y.s.createdAt || "").localeCompare(String(x.s.createdAt || "")) ||
+    String(x.s.id).localeCompare(String(y.s.id)));
   // Most recently ended first — the one you just killed is the one you're most
   // likely to want back. Ties (same-second kills, or two undated records) fall
   // back to the id so the order is at least stable across beats.
@@ -2513,8 +2515,8 @@ function render(data) {
   //                      not produced anything yet.
   //
   // All three are live, attachable sessions rendered with the same card;
-  // collect() already sorted `running`, and filtering preserves that order, so
-  // the waiting-first ranking survives into each section.
+  // collect() already sorted `running` by a stable key, and filtering preserves
+  // that order, so a card keeps its place within its section.
   const review = [], rest = [];
   for (const x of running) (readyForReview(x.s, x.live) ? review : rest).push(x);
   const active = rest.filter(x => x.live.kind !== "idle");

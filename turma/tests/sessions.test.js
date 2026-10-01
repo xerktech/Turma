@@ -465,15 +465,40 @@ test("ready for review: question, open PR and a finished turn all qualify", () =
     "the live card's PR chip is a link");
   assert.match(r, /<div class="s-card[^"]*">\s*<button class="s-hit"/,
     "a live card is a <div> with a stretched hit button, not a <button>");
-  // A question is the most urgent, so it leads the section (collect()'s ranking
-  // survives the filter).
-  assert.ok(r.indexOf("Waiting Task") < r.indexOf("Research Task"), "waiting leads the section");
 
   assert.match(els.active.innerHTML, /Active <span class="count">1<\/span>/);
   assert.ok(els.active.innerHTML.includes("Working Task"));
   assert.ok(!els.active.innerHTML.includes("Waiting Task"), "a question moved out of Active");
   assert.match(els.idle.innerHTML, /Idle <span class="count">1<\/span>/);
   assert.ok(els.idle.innerHTML.includes("Never Ran"));
+});
+
+// Cards move BETWEEN sections as their state changes, never WITHIN one: the
+// order is newest-created first, on a key no heartbeat changes, so the operator
+// can keep track of which cards they have already looked at.
+test("live sections keep a stable newest-created order whatever the activity", () => {
+  const { render, els } = loadPage();
+  const at = (x, iso) => ({ ...x, createdAt: iso });
+  const order = (html, names) => names.map(n => html.indexOf(n));
+  const beat = (ages) => {
+    const { now, host: h } = host([
+      at(running("11111", "Old Work", { paneBusy: true, transcriptAgeSec: ages[0] }), "2026-01-01T00:00:00Z"),
+      at(running("22222", "New Work", { paneBusy: true, transcriptAgeSec: ages[1] }), "2026-01-03T00:00:00Z"),
+      at(running("33333", "Mid Work", { paneBusy: true, transcriptAgeSec: ages[2] }), "2026-01-02T00:00:00Z"),
+      at(waiting("44444", "Old Ask"), "2026-01-01T00:00:00Z"),
+      at(finished("55555", "New Done"), "2026-01-05T00:00:00Z"),
+    ]);
+    render({ now, agents: [h] });
+  };
+  const names = ["New Work", "Mid Work", "Old Work"];
+  beat([1, 2, 3]);
+  const first = order(els.active.innerHTML, names);
+  assert.deepEqual(first, [...first].sort((a, b) => a - b), "newest-created first");
+  beat([3, 1, 2]);   // activity reshuffles; the cards must not
+  assert.deepEqual(order(els.active.innerHTML, names), first, "activity does not reorder a section");
+  const r = els.review.innerHTML;
+  assert.ok(r.indexOf("New Done") < r.indexOf("Old Ask"),
+    "a waiting question does not jump ahead of a newer card in its section");
 });
 
 test("ready for review: a session whose every PR has landed drops back to Idle", () => {
