@@ -54,6 +54,19 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   (XERK-137) and **changing status** (XERK-138). Every other control writes a hub/agent ledger, not
   the board.
 
+### Search / filter / sort toolbar
+
+- **A client-only VIEW** (`board.js` `boardView*`; android `core/BoardView.kt`) — nothing reaches the
+  hub or tracker. Two mirrors: change both. Tests: `board-view.test.js`, `BoardViewTest.kt`.
+- Every filter is a FACET (`ticketFacets`: field → values a ticket carries); OR within a field,
+  AND across. Options/counts come from the in-scope tickets — never hard-code a vocabulary.
+- **Epics stay pinned top under every sort**; the default sort IS `ticketSort`/`TICKET_ORDER`'s rule.
+- A card mid-move stays visible even if the view drops it (a drag must not vanish).
+- Web persists the view in the URL + `localStorage` (`turma-board-view`); Android in
+  SharedPreferences, same query encoding. `consumeDeepLink` strips only `ticket`/`site`.
+- **One row, always**: on phones (web ≤560px, Android) active filters show as a BADGE only, never
+  a chip row; web folds Refresh/New epic/Triage policy behind ⋯ there.
+
 ### Creating a ticket (XERK-137)
 
 - **"New ticket"** opens a modal (title, description, labels), source-agnostic across Jira/Azure,

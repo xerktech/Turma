@@ -450,7 +450,110 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 /* Board toolbar: just the refresh button now, pinned right — the org chips it
    used to run alongside became the header's org filter (XERK-62), and the New
    ticket button moved into the header too (XERK-150). */
-.board-bar { display: flex; align-items: flex-start; justify-content: flex-end; gap: 10px; margin: 2px 0 14px; }
+.board-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 2px 0 14px; position: relative; }
+.board-actions { display: flex; gap: 10px; flex: none; }
+
+/* Search / filter / sort toolbar — the left half of the board bar. One row at
+   every width: on a phone the labels fold to icons, the active-filter chips
+   give way to the badge, and the page actions fold behind ⋯. */
+.board-tools { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; position: relative; }
+.bt-search {
+  display: flex; align-items: center; gap: 7px; flex: 1 1 300px; max-width: 360px; min-width: 120px;
+  height: 30px; padding: 0 10px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--field); color: var(--muted); font-size: 12.5px; cursor: text;
+}
+.bt-search:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+.bt-search svg { width: 13px; height: 13px; flex: none; }
+.bt-search input {
+  flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; padding: 0;
+  color: var(--ink); font: inherit; font-size: 12.5px;
+}
+.bt-search input::-webkit-search-cancel-button { display: none; }
+.bt-search input::placeholder { color: var(--muted); }
+.bt-kbd { font: 11px var(--font-mono); border: 1px solid var(--border); border-radius: 5px; padding: 0 5px; color: var(--muted); }
+.bt-search:focus-within .bt-kbd, .bt-search:has(.bt-clear:not([hidden])) .bt-kbd { display: none; }
+.bt-clear { border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 13px; padding: 0 2px; line-height: 1; }
+.bt-clear:hover { color: var(--ink); }
+.bt-btn {
+  font: inherit; font-size: 12.5px; height: 30px; padding: 0 12px; cursor: pointer;
+  color: var(--ink-2); background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
+  display: inline-flex; align-items: center; gap: 6px; flex: none; white-space: nowrap; position: relative;
+}
+.bt-btn:hover { color: var(--ink); }
+.bt-btn svg { width: 13px; height: 13px; flex: none; }
+.bt-btn.on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: var(--accent-soft); }
+.bt-caret { font-size: 10px; opacity: 0.7; }
+.bt-badge {
+  min-width: 17px; height: 17px; border-radius: 9px; background: var(--accent); color: #fff;
+  font-size: 10.5px; font-weight: 600; display: inline-grid; place-items: center; padding: 0 4px;
+}
+.bt-badge[hidden] { display: none; }
+.bt-chips { display: flex; gap: 6px; min-width: 0; overflow: hidden; }
+.bf-chip {
+  font-size: 12px; height: 24px; padding: 0 2px 0 10px; border-radius: 999px; white-space: nowrap; flex: none;
+  background: var(--accent-soft); color: var(--accent); display: inline-flex; align-items: center; gap: 5px;
+  max-width: 240px; overflow: hidden; text-overflow: ellipsis;
+}
+.bf-chip b { font-weight: 500; color: var(--ink-2); }
+.bf-chip button { border: 0; background: none; color: inherit; cursor: pointer; opacity: 0.75; font-size: 12px; padding: 0 6px; height: 100%; }
+.bf-chip button:hover { opacity: 1; }
+.bt-more { display: none; width: 30px; padding: 0; justify-content: center; font-size: 15px; }
+.bt-pop, .bt-menu {
+  position: absolute; top: calc(100% + 6px); z-index: 50; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-md);
+}
+.bt-pop[hidden], .bt-menu[hidden] { display: none; }
+.bt-pop { left: 0; width: min(680px, calc(100vw - 32px)); padding: 16px 18px 12px; font-size: 12.5px; max-height: 70vh; overflow-y: auto; }
+.bt-menu { width: 210px; padding: 6px; font-size: 12.5px; border-radius: var(--radius-md); }
+.bf-grid { display: grid; grid-template-columns: 110px 1fr; row-gap: 11px; column-gap: 14px; align-items: start; }
+.bf-l { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; padding-top: 5px; }
+.bf-opts { display: flex; flex-wrap: wrap; gap: 6px; }
+.bf-o {
+  font: inherit; font-size: 12.5px; height: 25px; padding: 0 10px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--border); display: inline-flex; align-items: center; gap: 5px;
+  color: var(--ink-2); background: var(--field); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.bf-o:hover { color: var(--ink); border-color: color-mix(in srgb, var(--ink) 25%, transparent); }
+.bf-o.sel { background: var(--accent); border-color: var(--accent); color: #fff; }
+.bf-o small { color: var(--muted); font-size: 11px; }
+.bf-o.sel small { color: rgba(255,255,255,0.75); }
+.bf-foot {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--hairline); color: var(--muted);
+}
+.bf-tog { display: inline-flex; align-items: center; gap: 7px; color: var(--ink-2); cursor: pointer; }
+.bf-tog input { accent-color: var(--accent); margin: 0; }
+.bf-link { font: inherit; border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; }
+.bs-mh { padding: 6px 10px 4px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+.bs-mi {
+  font: inherit; width: 100%; text-align: left; border: 0; background: none; cursor: pointer;
+  padding: 7px 10px; border-radius: 7px; color: var(--ink-2); display: flex; justify-content: space-between;
+}
+.bs-mi:hover { background: color-mix(in srgb, var(--ink) 6%, transparent); color: var(--ink); }
+.bs-mi.sel { background: var(--accent-soft); color: var(--accent); }
+.bs-hr { height: 1px; background: var(--hairline); margin: 5px 4px; }
+.bf-chip[hidden] { display: none; }
+.bf-more { font: inherit; font-size: 12px; border: 0; cursor: pointer; padding: 0 10px; }
+/* Below this the toolbar and the page actions can't share a row, so the
+   chips give way to the badge and the actions fold behind ⋯. */
+@media (max-width: 760px) {
+  .bt-chips { display: none; }
+  .bt-search { max-width: none; }
+  .bt-more { display: inline-flex; }
+  .board-actions { display: none; }
+  .board-actions.open {
+    display: flex; flex-direction: column; align-items: stretch; gap: 6px; position: absolute; right: 0;
+    top: calc(100% + 6px); z-index: 50; padding: 8px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: var(--shadow-md);
+  }
+}
+@media (max-width: 560px) {
+  .board-tools .bt-label, .board-tools .bt-kbd { display: none; }
+  .board-tools .bt-btn { width: 30px; padding: 0; justify-content: center; }
+  .board-tools .bt-badge { position: absolute; top: -5px; right: -5px; }
+  .bf-grid { grid-template-columns: 1fr; row-gap: 6px; }
+  .bf-l { padding-top: 6px; }
+}
 .board-refresh {
   font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
   color: var(--ink-2); background: var(--surface);

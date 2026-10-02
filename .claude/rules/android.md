@@ -43,6 +43,8 @@ Mirrors the glasses pure-core/adapter-shell split:
   `fleetTokens`/`mergeModels`), Ready-for-review split (`core/Sessions.kt` `rankRunning` →
   `LiveGroups`), sessions search (`core/Search.kt`, XERK-243 — one box filters live lists AND
   appends archive matches). Port logic there; keep the Compose screen a thin renderer.
+- **Board search/filter/sort** is `core/BoardView.kt` ↔ `board.js` `boardView*` (rule in
+  `turma-board.md`). The phone shows active filters as a badge only — never a second chip row.
 - **Match features and structure, not pixels** (platform-idiomatic controls). A justified platform
   difference (native chat vs ttyd terminal, Hub-URL login field, voice dictation) goes in
   `android/PARITY.md` — the living gap tracker, updated whenever a gap closes or opens.

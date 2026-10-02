@@ -17,6 +17,32 @@
         data-sub="Ticket board · assigned tickets across orgs"></header>
 <div class="wrap board-page">
   <div class="board-bar">
+    <!-- Search / filter / sort (a client-only view over the board's tickets —
+         nothing here reaches the hub or the tracker). board.js owns the logic
+         (boardViewMatches/boardViewSort); this page owns the controls. -->
+    <div class="board-tools">
+      <label class="bt-search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="boardSearch" type="search" autocomplete="off" spellcheck="false" maxlength="200"
+          placeholder="Search key, summary, label, repo…" aria-label="Search tickets">
+        <kbd class="bt-kbd" aria-hidden="true">/</kbd>
+        <button type="button" class="bt-clear" id="boardSearchClear" aria-label="Clear search" hidden>✕</button>
+      </label>
+      <button type="button" class="bt-btn" id="boardFilterBtn" aria-haspopup="dialog" aria-expanded="false" title="Filter tickets">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 5h18M6 12h12M10 19h4"/></svg>
+        <span class="bt-label">Filters</span><span class="bt-badge" id="boardFilterBadge" hidden></span>
+      </button>
+      <span class="bt-chips" id="boardFilterChips"></span>
+      <button type="button" class="bt-btn" id="boardSortBtn" aria-haspopup="menu" aria-expanded="false" title="Sort tickets">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M7 4v16M3 16l4 4 4-4M17 20V4M13 8l4-4 4 4"/></svg>
+        <span class="bt-label" id="boardSortLabel">Updated</span><span class="bt-caret bt-label" aria-hidden="true">▾</span>
+      </button>
+      <div class="bt-pop" id="boardFilterPop" role="dialog" aria-label="Filters" hidden></div>
+      <div class="bt-menu" id="boardSortMenu" role="menu" aria-label="Sort" hidden></div>
+    </div>
+    <!-- On a phone the page actions fold behind ⋯ so the toolbar keeps one row. -->
+    <button type="button" class="bt-btn bt-more" id="boardMoreBtn" aria-haspopup="menu" aria-expanded="false" aria-label="More board actions">⋯</button>
+    <div class="board-actions" id="boardActions">
     <button id="refresh" class="board-refresh" title="Re-poll Jira on every connected host now">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
       <span id="refreshLabel">Refresh</span>
@@ -29,6 +55,7 @@
       title="Decides which To Do tickets each org's auto-start sweep qualifies: minimum priority, excluded types, repo allow/deny, auto-start rate (XERK-486)">
       Triage policy
     </button>
+    </div>
   </div>
   <div id="epicBuilders"></div>
   <div id="board"></div>
@@ -98,9 +125,209 @@ function consumeDeepLink() {
     (!site || s.siteKey === site) && s.tickets.some(t => t.key === key));
   if (!found) return;                    // its org hasn't reported yet
   deepLink = null;
-  history.replaceState(null, "", location.pathname);
+  // Strip only the deep link's own params — the toolbar's view rides the same
+  // query string and must survive the panel opening.
+  const p = new URLSearchParams(location.search);
+  p.delete("ticket"); p.delete("site");
+  history.replaceState(null, "", location.pathname + (p.toString() ? "?" + p : ""));
   openDetail(key, found.siteKey, null);
 }
+
+// --- Search / filter / sort toolbar ------------------------------------------
+// The view is the page's own state, never sent anywhere. It lives in the URL
+// (so a filtered board can be bookmarked or shared) and in localStorage (so the
+// board reopens the way it was left); the URL wins when it carries any view
+// param. board.js owns matching/sorting/markup; this section owns the controls.
+const VIEW_STORE_KEY = "turma-board-view";
+const $search = document.getElementById("boardSearch");
+const $searchClear = document.getElementById("boardSearchClear");
+const $filterBtn = document.getElementById("boardFilterBtn");
+const $filterBadge = document.getElementById("boardFilterBadge");
+const $filterChips = document.getElementById("boardFilterChips");
+const $filterPop = document.getElementById("boardFilterPop");
+const $sortBtn = document.getElementById("boardSortBtn");
+const $sortLabel = document.getElementById("boardSortLabel");
+const $sortMenu = document.getElementById("boardSortMenu");
+const $moreBtn = document.getElementById("boardMoreBtn");
+const $actions = document.getElementById("boardActions");
+
+let view = (() => {
+  const p = new URLSearchParams(location.search);
+  if (B.hasBoardViewParams(p)) return B.boardViewFromParams(p);
+  try {
+    const stored = localStorage.getItem(VIEW_STORE_KEY);
+    if (stored) return B.boardViewFromParams(new URLSearchParams(stored));
+  } catch { /* storage blocked — start from the default view */ }
+  return B.emptyBoardView();
+})();
+// What the last render saw, so the toolbar can repaint between beats.
+let viewGroups = [], viewShown = 0, viewTotal = 0;
+
+function saveView() {
+  const qs = new URLSearchParams(B.boardViewToParams(view)).toString();
+  const p = new URLSearchParams(location.search);
+  const keep = ["ticket", "site"].filter(k => p.has(k)).map(k => [k, p.get(k)]);
+  const all = new URLSearchParams([...keep, ...new URLSearchParams(qs)]).toString();
+  history.replaceState(null, "", location.pathname + (all ? "?" + all : ""));
+  try { localStorage.setItem(VIEW_STORE_KEY, qs); } catch { /* storage blocked */ }
+}
+
+function setView(next) {
+  view = Object.assign({}, view, next);
+  saveView();
+  if (cache) render(cache); else paintToolbar();
+}
+
+// Repaints only what changed: the popover/menu bodies are replaced only when
+// their markup differs, so a beat never swaps a chip out from under a click.
+function setHtml(el, html) { if (el.__html !== html) { el.innerHTML = html; el.__html = html; } }
+
+function paintToolbar() {
+  if (document.activeElement !== $search && $search.value !== view.q) $search.value = view.q;
+  $searchClear.hidden = !$search.value;
+  const n = B.boardViewFilterCount(view);
+  $filterBadge.hidden = !n;
+  $filterBadge.textContent = n ? String(n) : "";
+  $filterBtn.classList.toggle("on", n > 0 || !$filterPop.hidden);
+  setHtml($filterChips, B.boardFilterChipsHtml(viewGroups, view));
+  fitChips();
+  $sortLabel.textContent = B.sortLabel(view);
+  $sortBtn.classList.toggle("on", view.sort !== "updated" || !!view.rev || !$sortMenu.hidden);
+  if (!$filterPop.hidden) setHtml($filterPop, B.boardFilterPanelHtml(viewGroups, view, viewShown, viewTotal));
+  if (!$sortMenu.hidden) setHtml($sortMenu, B.boardSortMenuHtml(view));
+}
+
+// The chip strip never wraps or clips silently: chips that don't fit are hidden
+// and a "+N" chip (which opens the popover) says how many.
+function fitChips() {
+  const chips = [...$filterChips.querySelectorAll(".bf-chip:not(.bf-more)")];
+  let more = $filterChips.querySelector(".bf-more");
+  chips.forEach(c => { c.hidden = false; });
+  if (more) more.hidden = true;
+  if (!chips.length || !$filterChips.clientWidth) return;
+  let hidden = 0;
+  for (let i = chips.length - 1; i >= 0 && $filterChips.scrollWidth > $filterChips.clientWidth; i--) {
+    chips[i].hidden = true;
+    hidden++;
+    if (!more) {
+      more = document.createElement("button");
+      more.type = "button";
+      more.className = "bf-chip bf-more";
+      more.dataset.bfOpen = "1";
+      $filterChips.appendChild(more);
+      $filterChips.__html = null;
+    }
+    more.hidden = false;
+    more.textContent = `+${hidden} more`;
+    more.title = `${hidden} more active filter${hidden === 1 ? "" : "s"} — open Filters`;
+  }
+  // Not even "+N more" fits: show nothing rather than a clipped chip — the
+  // Filters badge already carries the count.
+  if (more && $filterChips.scrollWidth > $filterChips.clientWidth) more.hidden = true;
+}
+window.addEventListener("resize", () => fitChips());
+
+// One open menu at a time: the filter popover, the sort menu, or (on a phone)
+// the folded page actions.
+function closeMenus(except) {
+  if (except !== $filterPop) { $filterPop.hidden = true; $filterBtn.setAttribute("aria-expanded", "false"); }
+  if (except !== $sortMenu) { $sortMenu.hidden = true; $sortBtn.setAttribute("aria-expanded", "false"); }
+  if (except !== $actions) { $actions.classList.remove("open"); $moreBtn.setAttribute("aria-expanded", "false"); }
+  paintToolbar();
+}
+function toggleMenu(el, btn) {
+  const open = el === $actions ? !el.classList.contains("open") : el.hidden;
+  closeMenus(open ? el : null);
+  if (!open) return;
+  if (el === $actions) el.classList.add("open"); else { el.hidden = false; el.__html = null; }
+  // The sort menu hangs under its button, kept inside the toolbar's width.
+  if (el === $sortMenu) {
+    const room = el.parentElement.clientWidth - 210;
+    el.style.left = Math.max(0, Math.min(btn.offsetLeft, room)) + "px";
+  }
+  btn.setAttribute("aria-expanded", "true");
+  paintToolbar();
+}
+function anyMenuOpen() { return !$filterPop.hidden || !$sortMenu.hidden || $actions.classList.contains("open"); }
+
+let searchTimer = null;
+$search.addEventListener("input", () => {
+  $searchClear.hidden = !$search.value;
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => setView({ q: $search.value.slice(0, 200) }), 150);
+});
+$search.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || !$search.value) return;
+  e.stopPropagation();
+  clearTimeout(searchTimer);
+  $search.value = "";
+  setView({ q: "" });
+});
+$searchClear.addEventListener("click", (e) => {
+  e.preventDefault();
+  clearTimeout(searchTimer);
+  $search.value = "";
+  setView({ q: "" });
+  $search.focus();
+});
+$filterBtn.addEventListener("click", (e) => { e.__boardMenu = true; toggleMenu($filterPop, $filterBtn); });
+$sortBtn.addEventListener("click", (e) => { e.__boardMenu = true; toggleMenu($sortMenu, $sortBtn); });
+$moreBtn.addEventListener("click", (e) => { e.__boardMenu = true; toggleMenu($actions, $moreBtn); });
+$filterPop.addEventListener("click", (e) => {
+  e.__boardMenu = true;
+  const opt = e.target.closest("[data-bf-field]");
+  if (opt) {
+    const field = opt.dataset.bfField, value = opt.dataset.bfValue;
+    const cur = view.f[field] || [];
+    const next = cur.includes(value) ? cur.filter(v => v !== value) : [...cur, value];
+    const f = Object.assign({}, view.f);
+    if (next.length) f[field] = next; else delete f[field];
+    return setView({ f });
+  }
+  if (e.target.closest("[data-bf-clear]")) setView({ f: {} });
+});
+$filterPop.addEventListener("change", (e) => {
+  if (e.target.matches("[data-bf-done]")) setView({ hideDone: !e.target.checked });
+});
+$filterChips.addEventListener("click", (e) => {
+  if (e.target.closest("[data-bf-open]")) { e.__boardMenu = true; return toggleMenu($filterPop, $filterBtn); }
+  const x = e.target.closest("[data-bf-unset]");
+  if (!x) return;
+  const f = Object.assign({}, view.f);
+  delete f[x.dataset.bfUnset];
+  setView({ f });
+});
+$sortMenu.addEventListener("click", (e) => {
+  e.__boardMenu = true;
+  const s = e.target.closest("[data-bs-sort]");
+  const r = e.target.closest("[data-bs-rev]");
+  if (s) setView({ sort: s.dataset.bsSort, rev: false });
+  else if (r) setView({ rev: r.dataset.bsRev === "1" });
+  else return;
+  closeMenus(null);
+});
+// A click on one of the folded actions runs it and folds the menu back up.
+$actions.addEventListener("click", (e) => {
+  if (e.target.closest("button") && $actions.classList.contains("open")) closeMenus(null);
+});
+// Click-away closes. The opening click is flagged on the EVENT (a repaint can
+// detach the clicked node, so a contains() test would close it again at once).
+document.addEventListener("click", (e) => {
+  if (e.__boardMenu || !anyMenuOpen()) return;
+  if (e.target.closest && e.target.closest(".bt-pop, .bt-menu, .board-actions")) return;
+  closeMenus(null);
+});
+// "/" focuses search, unless the operator is typing somewhere or a modal is up.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "/" || e.ctrlKey || e.metaKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+  if (document.querySelector(".td-backdrop:not([hidden])")) return;
+  e.preventDefault();
+  $search.focus();
+  $search.select();
+});
+paintToolbar();
 
 // The per-org auto-start switch (XERK-41) moved with the org chips into the
 // header menu — see org.js's setAutoStart, which owns the optimistic flip, the
@@ -138,6 +365,22 @@ function render(data) {
 
   const sessionIndex = B.ticketSessionIndex(data.agents || []);
   const activeMoves = sweepMoves(sites);
+  const ticketQueue = queueView(data.ticketQueue);
+  // The toolbar's options and counts, over the tickets in the header's org scope.
+  const scoped = orgFilter.length ? sites.filter(s => orgFilter.includes(s.siteKey)) : sites;
+  const viewCtx = { sessionIndex, ticketQueue };
+  viewGroups = B.boardFilterGroups(scoped, view, viewCtx);
+  viewTotal = 0; viewShown = 0;
+  for (const site of scoped) {
+    for (const t of site.tickets) {
+      // A hidden Done column hides its tickets too, so the footer counts what
+      // the columns can actually show.
+      if (view.hideDone && B.categoryOf(t) === "done") continue;
+      viewTotal++;
+      if (B.boardViewMatches(t, site, view, viewCtx)) viewShown++;
+    }
+  }
+  paintToolbar();
   // A grid swap mid-drag would tear the card out from under the finger and drop
   // the column highlight every beat; the drag ghost + highlight live outside the
   // grid (on <body>), so we simply leave the grid as-is until the drag ends —
@@ -155,7 +398,8 @@ function render(data) {
       // Tickets waiting for a free slot (XERK-296) — hub state, so the payload
       // (and its SSE event) is the source of truth; `queueView` only overlays
       // the moment between a click and the beat that confirms it.
-      ticketQueue: queueView(data.ticketQueue),
+      ticketQueue,
+      view,
       // Manual org-color pins (XERK-145), via TurmaOrg so the SSE event and the
       // poll feed one map.
       orgColors: TurmaOrg.orgColors(),
@@ -1757,6 +2001,7 @@ $panel.addEventListener("change", (e) => {
 $backdrop.addEventListener("click", (e) => { if (e.target === $backdrop) closeDetail(); });
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
+  if (anyMenuOpen()) return closeMenus(null);
   if (!openTicketState && !$ebBackdrop.hidden) return closeEpicBuilder();
   if (!openTicketState && !$policyBackdrop.hidden) return closePolicyPanel();
   if (openTicketState) closeDetail();
