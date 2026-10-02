@@ -172,7 +172,7 @@ flow and renders the local form for, never re-bouncing to the IdP.)
 - **OIDC-issued sessions are SHORTER-lived** so a revoked user re-authenticates (and is re-checked
   against current groups) within a bounded window: `issueSessionToken(ttlMs)` +
   `sessionSetCookie(req, token, ttlMs)` take `OIDC_SESSION_TTL_MS` (`TURMA_OIDC_SESSION_TTL_MS`,
-  default 8h) on the OIDC path; **password/break-glass logins keep the 30-day `SESSION_TTL_MS`** (the
+  default 24h) on the OIDC path; **password/break-glass logins keep the 30-day `SESSION_TTL_MS`** (the
   IdP-outage path must not force re-login every few hours). The cookie Max-Age matches the token's
   own HMAC expiry.
 - **Break-glass is untouched** (`turma-break-glass.md`): a denied OIDC user can still reach the local
