@@ -118,7 +118,9 @@ body.app-shell {
    them, but once they are set it ignores `::-webkit-scrollbar` and draws its
    own thin bar WITH arrow buttons on Windows/Linux, so Chromium and Safari are
    styled through the `::-webkit-scrollbar` rules instead, which draw no buttons.
-   `-moz-appearance` is the Firefox-only feature test that keeps them apart. */
+   `-moz-appearance` is the Firefox-only feature test that keeps them apart.
+   So never set `scrollbar-width`/`scrollbar-color` on an individual scroller:
+   in Chromium that alone reverts it to the arrowed platform bar. */
 :root {
   --scrollbar:       color-mix(in srgb, var(--ink) 22%, transparent);
   --scrollbar-hover: color-mix(in srgb, var(--ink) 38%, transparent);
