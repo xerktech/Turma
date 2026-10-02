@@ -56,10 +56,11 @@ class SessionsFlattenTest {
         id: String, status: String = "running",
         question: String = "", paneBusy: Boolean? = null, ageSec: Double? = 2.0,
         lastRole: String = "", prs: List<com.xerktech.turma.model.PrInfo> = emptyList(),
+        createdAt: String = "",
     ) = FlatSession(
         host = "h", device = "BOX", online = true, hostLastSeen = 1_000L,
         session = SessionInfo(
-            id = id, status = status, prs = prs,
+            id = id, status = status, prs = prs, createdAt = createdAt,
             session = LiveSignals(
                 paneBusy = paneBusy, question = question, transcriptAgeSec = ageSec, lastRole = lastRole,
             ),
@@ -96,37 +97,38 @@ class SessionsFlattenTest {
             ),
             now = 1_000L,
         )
-        // A question is the most urgent, so it leads the section — the ranking
-        // happens before the split, exactly as the web's collect() does.
-        assertEquals(listOf("waitOne", "researchOne", "prOne"), groups.review.map { it.flat.session.id })
+        // Undated fixtures fall back to the id, so the order is total.
+        assertEquals(listOf("prOne", "researchOne", "waitOne"), groups.review.map { it.flat.session.id })
         assertEquals(listOf("workOne"), groups.active.map { it.flat.session.id })
         // Merged IS the review, so it parks in Idle until the build is verified.
         assertEquals(listOf("mergedOne", "quietOne"), groups.idle.map { it.flat.session.id }.sorted())
     }
 
-    @Test fun `rankRunning orders freshest-first within a kind`() {
-        val (_, active, _) = rankRunning(
+    @Test fun `rankRunning orders newest-created first, whatever the activity`() {
+        fun beat(oldAge: Double, newAge: Double) = rankRunning(
             listOf(
-                flat("stale", paneBusy = true, ageSec = 90.0),
-                flat("fresh", paneBusy = true, ageSec = 3.0),
+                flat("old", paneBusy = true, ageSec = oldAge, createdAt = "2026-01-01T00:00:00Z"),
+                flat("new", paneBusy = true, ageSec = newAge, createdAt = "2026-01-03T00:00:00Z"),
+                flat("undated", paneBusy = true, ageSec = 1.0),
+                flat("mid", paneBusy = true, ageSec = 5.0, createdAt = "2026-01-02T00:00:00Z"),
             ),
             now = 1_000L,
-        )
-        assertEquals(listOf("fresh", "stale"), active.map { it.flat.session.id })
+        ).active.map { it.flat.session.id }
+        val expected = listOf("new", "mid", "old", "undated")
+        assertEquals(expected, beat(oldAge = 1.0, newAge = 90.0))
+        // Activity changing must not reorder the group.
+        assertEquals(expected, beat(oldAge = 90.0, newAge = 1.0))
     }
 
-    @Test fun `a null age sorts ahead of any aged one, exactly as the web's ?? -1`() {
-        // These land in IDLE, not Active — a session with no transcript is
-        // "no transcript yet", never working. The sort is what's under test.
-        val (_, _, idle) = rankRunning(
+    @Test fun `a waiting question does not jump ahead of a newer card in its group`() {
+        val (review, _, _) = rankRunning(
             listOf(
-                flat("stale", paneBusy = false, ageSec = 90.0),
-                flat("fresh", paneBusy = false, ageSec = 3.0),
-                flat("brandNew", paneBusy = false, ageSec = null),
+                flat("oldAsk", question = "pick one", createdAt = "2026-01-01T00:00:00Z"),
+                flat("newDone", paneBusy = false, lastRole = "assistant", createdAt = "2026-01-05T00:00:00Z"),
             ),
             now = 1_000L,
         )
-        assertEquals(listOf("brandNew", "fresh", "stale"), idle.map { it.flat.session.id })
+        assertEquals(listOf("newDone", "oldAsk"), review.map { it.flat.session.id })
     }
 
     @Test fun `no transcript yet is idle even while paneBusy says working (XERK-235)`() {

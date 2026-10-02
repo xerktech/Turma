@@ -263,14 +263,6 @@ fun endedStateText(e: EndedSession): String = when {
  *  Active/Idle lists. */
 data class RankedSession(val flat: FlatSession, val state: com.xerktech.turma.core.LiveState)
 
-/** Attention rank for the running lists — waiting, then working, then idle,
- *  matching the web sidebar's KIND_ORDER. */
-private val KIND_RANK = mapOf(
-    com.xerktech.turma.core.LiveState.WAITING to 0,
-    com.xerktech.turma.core.LiveState.WORKING to 1,
-    com.xerktech.turma.core.LiveState.IDLE to 2,
-)
-
 /** The three live groups the running sessions split into, in reading order. */
 data class LiveGroups(
     val review: List<RankedSession>,
@@ -283,20 +275,20 @@ data class LiveGroups(
  * (XERK-224) — Ready for review (stopped, and waiting on YOU: see
  * [com.xerktech.turma.core.readyForReview]), Active (still working, leave it
  * alone), and Idle (quiet, with nothing asking to be looked at) — each ranked as
- * the web's `collect()` does: attention-first by [KIND_RANK], then freshest
- * activity first. Freshest-first is ascending transcript age; a session with no
- * transcript yet (null age) sorts first, exactly as the web's `?? -1` fallback.
- * Ranking happens before the split, so the waiting-first order survives into each
- * group as it does on the web. Only status=="running" sessions are ranked here;
- * stopped/queued records are handled separately by the caller.
+ * the web's `collect()` does: newest-created first (undated last), id breaking
+ * ties. That key never changes while a session lives, so a card moves BETWEEN
+ * groups as its state changes but never WITHIN one — ranking on activity or
+ * urgency reshuffled every beat. Do not re-rank on anything a heartbeat changes.
+ * Only status=="running" sessions are ranked here; stopped/queued records are
+ * handled separately by the caller.
  */
 fun rankRunning(rows: List<FlatSession>, now: Long): LiveGroups {
     val running = rows.asSequence()
         .filter { it.session.status == "running" }
         .map { RankedSession(it, liveState(it.session, it.hostLastSeen, now)) }
         .sortedWith(
-            compareBy<RankedSession> { KIND_RANK[it.state] ?: 3 }
-                .thenBy { it.flat.session.session?.transcriptAgeSec ?: -1.0 },
+            compareByDescending<RankedSession> { it.flat.session.createdAt }
+                .thenBy { it.flat.session.id },
         )
         .toList()
     val (review, rest) = running.partition {
@@ -530,7 +522,7 @@ fun SessionsListPane(
     // channels, deduped on <host>::<transcriptId>.
     val lists = remember(agents, query) { collectSessions(agents, query) }
     // The live sessions split into the web's Ready-for-review / Active / Idle
-    // sections, each ranked attention-first / freshest-first (XERK-73).
+    // sections, each in a stable newest-created order (see rankRunning).
     val groups = remember(lists, now) { rankRunning(lists.running, now) }
     val (review, active, idle) = groups
     val queued = lists.queued
