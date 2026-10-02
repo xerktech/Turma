@@ -3793,6 +3793,11 @@ class TestLiveAgentsScan(unittest.TestCase):
                                      "<task-id>__orphan_summary__:shell</task-id>\n"
                                      "<status>stopped</status>\n</task-notification>"}], st)
         self.assertEqual(ha.live_agents_report(st), [])
+        # The sentinel is not a task: it never reaches `taskIds`.
+        tn = ha._parse_task_notification(
+            "<task-notification><task-id>bsh1</task-id><task-id>__orphan_summary__:shell</task-id>"
+            "<status>stopped</status></task-notification>")
+        self.assertEqual(tn["taskIds"], ["bsh1"])
 
     def test_shells_never_crowd_out_a_later_agent(self):
         shells = [{"type": "user", "message": {"content": [

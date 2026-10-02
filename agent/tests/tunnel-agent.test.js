@@ -1496,6 +1496,10 @@ test("scanAgentEntry: one restart notification retires every shell it names; she
     content: "<task-notification>\n<task-id>bs1</task-id>\n<task-id>bs2</task-id>\n<task-id>bs3</task-id>\n" +
       "<task-id>__orphan_summary__:shell</task-id>\n<status>stopped</status>\n</task-notification>" }], st);
   assert.deepEqual(liveAgentsReport(st), []);
+  // The sentinel is not a task: it never reaches `taskIds`.
+  const { parseTaskNotification } = require("../tunnel-agent.js");
+  assert.deepEqual(parseTaskNotification("<task-notification><task-id>bs1</task-id>" +
+    "<task-id>__orphan_summary__:shell</task-id><status>stopped</status></task-notification>").taskIds, ["bs1"]);
   const many = scanAll([...Array.from({ length: 40 }, (_, i) => shell(i + 10)), ...LAUNCH_ENTRIES]);
   const rows = liveAgentsReport(many);
   assert.equal(rows.filter((r) => r.type === "shell").length, 16);
