@@ -605,6 +605,7 @@ test("XERK-591: the mobile flow deep-links a code, exchanges it once, and the to
     const { token, ttlMs } = JSON.parse(ex.raw);
     assert.ok(token);
     assert.equal(ttlMs, hub.OIDC_SESSION_TTL_MS);
+    assert.equal(ttlMs, 24 * 3600 * 1000, "default OIDC session is 24h");
 
     // That token authorises an API call as `Cookie: hub_session=<token>`.
     const authed = await req("GET", "/api/agents", { headers: { cookie: `hub_session=${token}` } });
