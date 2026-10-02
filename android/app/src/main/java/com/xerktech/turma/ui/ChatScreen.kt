@@ -431,7 +431,8 @@ private fun BackgroundAgentsBar(
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 CircularProgressIndicator(Modifier.size(11.dp), strokeWidth = 2.dp)
                 Text(
-                    "Background agents…",
+                    // A background shell is not an agent (web chat.js mirrors this).
+                    if (agents.any { it.type == "shell" }) "Background tasks…" else "Background agents…",
                     fontWeight = FontWeight.SemiBold,
                     style = MaterialTheme.typography.bodySmall,
                 )

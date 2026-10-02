@@ -2302,7 +2302,10 @@
       bar.hidden = false;
       bar.innerHTML =
         '<div class="cc-row"><span class="cc-spin"></span>' +
-        '<span class="verb">Background agents…</span></div>' + agents;
+        // A background shell is not an agent: name the bar for what is running.
+        '<span class="verb">Background ' +
+        (liveAgents.some((a) => a && a.type === "shell") ? "tasks" : "agents") +
+        '…</span></div>' + agents;
       wireAgentDelegation(bar);
       return;
     }

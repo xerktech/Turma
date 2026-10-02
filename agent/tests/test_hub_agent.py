@@ -3776,6 +3776,34 @@ class TestLiveAgentsScan(unittest.TestCase):
                                "task_id": "bsh1", "task_type": "local_bash"}}])
         self.assertEqual(ha.live_agents_report(st), [])
 
+    def test_one_restart_notification_retires_every_shell_it_names(self):
+        # After a Claude restart, ONE notification reports every still-running
+        # shell plus an orphan-summary sentinel; retiring only the first id left
+        # the rest live (WORKING) forever.
+        launches = []
+        for i in ("bsh1", "bsh2", "bsh3"):
+            launches.append({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t" + i}]},
+                "toolUseResult": {"stdout": "", "backgroundTaskId": i}})
+        st = self._scan(launches)
+        self.assertEqual(len(ha.live_agents_report(st)), 3)
+        st = self._scan([{"type": "queue-operation", "operation": "enqueue",
+                          "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                                     "<task-id>bsh2</task-id>\n<task-id>bsh3</task-id>\n"
+                                     "<task-id>__orphan_summary__:shell</task-id>\n"
+                                     "<status>stopped</status>\n</task-notification>"}], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_shells_never_crowd_out_a_later_agent(self):
+        shells = [{"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t%d" % i}]},
+            "toolUseResult": {"stdout": "", "backgroundTaskId": "bs%d" % i}}
+            for i in range(ha.LIVE_AGENTS_MAX + 5)]
+        st = self._scan(shells + TASK_LAUNCH_ENTRIES)
+        rows = ha.live_agents_report(st)
+        self.assertEqual(sum(r["type"] == "shell" for r in rows), ha.LIVE_AGENTS_MAX // 2)
+        self.assertIn({"type": "agent", "label": "QA the parity change"}, rows)
+
     def test_a_foreground_bash_result_registers_nothing(self):
         st = self._scan([
             {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t"}]},
@@ -3968,6 +3996,7 @@ class TestTaskNotification(unittest.TestCase):
             # The id is what makes this a usable STOPPED edge for the live-agent
             # scan, not just display text (XERK-245).
             "taskId": "af9e62627de15eaf4",
+            "taskIds": ["af9e62627de15eaf4"],
         })
 
     def test_non_notification_text_is_not_parsed(self):

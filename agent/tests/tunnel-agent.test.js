@@ -196,6 +196,7 @@ test("parseTaskNotification: extracts summary/status/result, ignores non-notific
     // The id is what makes this a usable STOPPED edge for the live-agent scan,
     // not just display text (XERK-245). Mirrors _parse_task_notification.
     taskId: "af9e62627de15eaf4",
+    taskIds: ["af9e62627de15eaf4"],
   });
   assert.equal(parseTaskNotification("just a normal prompt"), null);
   assert.equal(parseTaskNotification("talk about <task-notification> inline"), null);
@@ -1484,6 +1485,21 @@ test("scanAgentEntry: a background shell is live work until its stop edge", () =
   const stopped = scanAll([...launch, { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "k", content: "{}" }] },
     toolUseResult: { message: "Successfully stopped task: bsh1", task_id: "bsh1", task_type: "local_bash" } }]);
   assert.deepEqual(liveAgentsReport(stopped), []);
+});
+
+test("scanAgentEntry: one restart notification retires every shell it names; shells cap at half", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const shell = (i) => ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t" + i }] },
+    toolUseResult: { stdout: "", backgroundTaskId: "bs" + i } });
+  const st = scanAll([shell(1), shell(2), shell(3)]);
+  scanAll([{ type: "queue-operation", operation: "enqueue",
+    content: "<task-notification>\n<task-id>bs1</task-id>\n<task-id>bs2</task-id>\n<task-id>bs3</task-id>\n" +
+      "<task-id>__orphan_summary__:shell</task-id>\n<status>stopped</status>\n</task-notification>" }], st);
+  assert.deepEqual(liveAgentsReport(st), []);
+  const many = scanAll([...Array.from({ length: 40 }, (_, i) => shell(i + 10)), ...LAUNCH_ENTRIES]);
+  const rows = liveAgentsReport(many);
+  assert.equal(rows.filter((r) => r.type === "shell").length, 16);
+  assert.ok(rows.some((r) => r.type !== "shell"), "a later agent still registers");
 });
 
 test("scanAgentEntry: loose agentId text in tool output registers nothing", () => {

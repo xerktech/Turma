@@ -261,6 +261,9 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   - **A background SHELL is a `shell` row** — a Bash result carrying `backgroundTaskId`
     (run_in_background, or moved there on timeout). Same `<task-notification>` stop edge; label is
     the call's `description`. It has no transcript, so clients render it non-clickable.
+  - **One notification can retire MANY ids** (`taskIds`): after a Claude restart it lists every
+    still-running shell plus an `__orphan_summary__:*` sentinel; first-id-only left phantoms.
+  - **Shells fill at most HALF of `LIVE_AGENTS_MAX`**, so they never crowd out a later agent (QA).
   - **`TaskStop` is a third stop edge** — its structured result carries `task_id` + `task_type` and
     no notification follows, so without it a stopped shell/agent stays live.
   - **A `workflow` row resolves to a RUN, not a conversation** (XERK-304, no transcript of its own):

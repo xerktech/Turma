@@ -2224,6 +2224,26 @@ test("live status bar: agents keep the bar up after the turn ends", () => {
   } finally { clearDom(); }
 });
 
+// A background shell has no transcript to open, so its row is not a button —
+// and a bar holding one says "tasks", since a shell is not an agent.
+test("agentsHtml: a background shell row is a plain marker, not a button", () => {
+  const html = agentsHtml([{ sel: false, type: "shell", label: "Watch CI" }]);
+  assert.doesNotMatch(html, /<button/);
+  assert.doesNotMatch(html, /data-atype/);
+  assert.match(html, /<span class="alabel">Watch CI<\/span>/);
+});
+
+test("live status bar: a shell keeps the bar up and names it background tasks", () => {
+  const bar = fakeStatusBar();
+  try {
+    __setLiveStatus(null);
+    __setLiveAgents([{ sel: false, type: "shell", label: "Watch CI" }]);
+    updateLiveStatus();
+    assert.equal(bar.hidden, false);
+    assert.match(bar.innerHTML, /Background tasks…/);
+  } finally { clearDom(); }
+});
+
 // `main` is the conversation already on screen. A list carrying only it means
 // nothing is delegated, so raising a "Background agents…" bar for it would claim
 // work that isn't running — the same carve-out live_subagents makes agent-side.

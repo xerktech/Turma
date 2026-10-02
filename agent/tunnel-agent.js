@@ -232,8 +232,13 @@ function parseTaskNotification(text) {
   const body = m[1];
   // `taskId` is what makes this a usable STOPPED edge for the live-agent scan,
   // not just display text (XERK-245). Mirrors _parse_task_notification.
+  // `taskIds`: EVERY id it retires — after a Claude restart one notification
+  // reports all still-running shells (plus an `__orphan_summary__:*` sentinel).
+  const taskIds = [...body.matchAll(/<task-id>([\s\S]*?)<\/task-id>/g)]
+    .map((x) => edgeTrim(x[1].replace(ANSI_RE, "")))
+    .filter((i) => i && !i.startsWith("__orphan_summary__"));
   return { summary: tnTag("summary", body), status: tnTag("status", body),
-           result: tnTag("result", body), taskId: tnTag("task-id", body) };
+           result: tnTag("result", body), taskId: tnTag("task-id", body), taskIds };
 }
 // Flatten a parsed task-notification to text-feed form (summary + result) —
 // mirror of hub-agent.py _tn_preview.
@@ -1036,7 +1041,12 @@ function scanAgentEntry(entry, state) {
       }
     }
   }
-  const launch = asyncLaunch(entry);
+  let launch = asyncLaunch(entry);
+  // Shells may fill at most HALF the rows, so they never crowd out a later agent.
+  if (launch && launch.type === "shell"
+      && [...live.values()].filter((a) => a.type === "shell").length >= Math.floor(LIVE_AGENTS_MAX / 2)) {
+    launch = null;
+  }
   if (launch && live.size < LIVE_AGENTS_MAX && !stopped.has(launch.id)) {
     // A stop already seen wins over a later-read launch: a notification can be
     // written at an EARLIER file offset than the launch it refers to. The
@@ -1051,8 +1061,8 @@ function scanAgentEntry(entry, state) {
     const done = [];
     for (const text of entryTextsForScan(entry)) {
       const tn = parseTaskNotification(text);
-      if (!tn || !tn.taskId) continue;
-      if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) done.push(tn.taskId);
+      if (!tn || !tn.taskIds.length) continue;
+      if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) done.push(...tn.taskIds);
     }
     // A `TaskStop` the session ran itself: no notification follows it.
     const tur = entry.toolUseResult;

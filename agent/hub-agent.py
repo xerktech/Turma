@@ -7510,6 +7510,9 @@ def _tn_tag(name, body):
     return _edge_trim(ANSI_RE.sub("", m.group(1))) if m else ""
 
 
+TN_TASK_ID_RE = re.compile(r"<task-id>(.*?)</task-id>", re.DOTALL)
+
+
 def _parse_task_notification(text):
     """Parse a `<task-notification>` payload into {summary, status, result}, or
     None when `text` isn't one. Mirror of tunnel-agent.js parseTaskNotification."""
@@ -7527,6 +7530,11 @@ def _parse_task_notification(text):
         # as `agentId:`. It is what makes the notification a usable STOPPED edge
         # for the live-agent scan (XERK-245), not just display text.
         "taskId": _tn_tag("task-id", body),
+        # EVERY id it retires: after a Claude restart, one notification reports all
+        # the shells that were still running (plus an `__orphan_summary__:*`
+        # sentinel), and stopping only the first left the rest live forever.
+        "taskIds": [i for i in (_edge_trim(ANSI_RE.sub("", x)) for x in TN_TASK_ID_RE.findall(body))
+                    if i and not i.startswith("__orphan_summary__")],
     }
 
 
@@ -8415,6 +8423,11 @@ def _scan_agent_entry(entry, state):
                     while len(tasks) > LIVE_AGENTS_MAX * 4:
                         tasks.pop(next(iter(tasks)))
     launch = _async_launch(entry)
+    # Shells may fill at most HALF the rows, so a pile of them never crowds out a
+    # background agent launched later (a QA pass, say).
+    if launch and launch["type"] == "shell" \
+            and sum(1 for a in live.values() if a.get("type") == "shell") >= LIVE_AGENTS_MAX // 2:
+        launch = None
     if launch and len(live) < LIVE_AGENTS_MAX:
         # A notification can be WRITTEN BEFORE the launch it refers to (observed:
         # the queued copy lands at an earlier file offset than the launch, with a
@@ -8449,10 +8462,10 @@ def _scan_agent_entry(entry, state):
         done = []
         for text in _entry_texts_for_scan(entry):
             tn = _parse_task_notification(text)
-            if not tn or not tn.get("taskId"):
+            if not tn or not tn.get("taskIds"):
                 continue
             if not tn.get("status") or tn["status"] in AGENT_DONE_STATUSES:
-                done.append(tn["taskId"])
+                done.extend(tn["taskIds"])
         # The THIRD stop edge: a `TaskStop` the session ran itself. Its
         # structured result names the task, and no notification follows it, so
         # without this a stopped shell (or agent) stays live until restart.
