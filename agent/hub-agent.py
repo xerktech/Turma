@@ -8319,9 +8319,10 @@ def _scan_entry_line(raw, state, report):
 # cannot tell a running agent from a just-finished one at all. Same reason
 # pending questions come from the ask.py bridge and never from scraping.
 #
-# Failure direction is EMPTY: a launch this scan never saw (an agent restart
-# primes the byte offsets to EOF) reports no agents, which is the behaviour that
-# predates the feature. A phantom would instead strand work silently.
+# Failure direction is EMPTY: a launch this scan never saw (one further back
+# than _backscan_live_agents' window on a restart) reports no agents, which is
+# the behaviour that predates the feature. A phantom would instead strand work
+# silently.
 # Every status Claude Code writes is terminal — "the agent stopped" — so the set
 # is a guard against a future non-terminal one, not a filter of today's.
 AGENT_DONE_STATUSES = frozenset({"completed", "failed", "killed", "stopped", "error"})
@@ -8495,6 +8496,41 @@ def _entry_texts_for_scan(entry):
             if isinstance(block, dict) and isinstance(block.get("text"), str):
                 out.append(block["text"])
     return out
+
+
+# How far back the first beat after a manager restart looks for background work
+# still in flight. Same bound as the incremental scan's backlog cap.
+AGENT_BACKSCAN_BYTES = 1 << 22
+
+
+def _backscan_live_agents(path, state):
+    """Fold the transcript's last AGENT_BACKSCAN_BYTES into the live-agent scan
+    ONLY, once, when the offsets are primed to EOF (a manager restart).
+
+    Priming exists so a restart never REPLAYS PR links, but it also hid every
+    background agent/shell launched before the restart: the session read idle
+    until that work finished, while the chat bar (tunnel-agent's tail-window
+    scan) listed it as running. A launch and its stop sit in file order, so a
+    window that holds the launch holds the stop too; only `_scan_agent_entry`
+    runs here, so no other per-beat scan sees old lines."""
+    try:
+        size = os.stat(path).st_size
+        start = max(0, size - AGENT_BACKSCAN_BYTES)
+        with open(path, "rb") as f:
+            f.seek(start)
+            raw = f.read(size - start)
+    except OSError:
+        return
+    lines = raw.split(b"\n")
+    if start:
+        lines = lines[1:]  # the window's leading fragment of a cut line
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            _scan_agent_entry(entry, state)
 
 
 def live_agents_report(state):
@@ -12152,6 +12188,8 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         return _finish()
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
     report["tail"] = transcript_tail(newest)
+    if not primed:
+        _backscan_live_agents(newest, state)
 
     entry = _last_entry(newest)
     if entry:

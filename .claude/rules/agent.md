@@ -272,9 +272,12 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     an earlier file offset than the launch it refers to.
   - **An ASSISTANT turn is never a notification carrier** — real ones ride `queue-operation`/`user`,
     so a session merely quoting one cannot retire a running agent.
-  - **Failure direction is EMPTY.** An unseen launch (offsets primed to EOF on restart) reports no
-    agents — the pre-feature behaviour — rather than a phantom that strands work silently. Bounded
-    by `LIVE_AGENTS_MAX`.
+  - **Failure direction is EMPTY.** An unseen launch reports no agents rather than a phantom that
+    strands work silently. Bounded by `LIVE_AGENTS_MAX`.
+  - **A manager restart back-scans** (`_backscan_live_agents`): priming offsets to EOF hid work
+    launched before the restart, so the card read idle while the chat bar (tunnel-agent's
+    tail-window scan) listed it. The first beat folds the last 4 MiB into the agent scan ONLY —
+    never the PR scan, whose no-replay rule priming exists for.
   - Reported on **every** `session_report` exit path (`_finish`). Mirrors
     `scanAgentEntry`/`liveAgentsReport` in `tunnel-agent.js`. Tests: `TestLiveAgentsScan`.
 - `modeActual` — the TUI's REAL mode off the footer marker (glyph-anchored). `_session_payload`

@@ -1625,6 +1625,31 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["prUrls"], [])
         self.assertTrue(state["primed"])  # still primes so later beats scan
 
+    def test_a_restart_still_sees_background_work_launched_before_it(self):
+        # Priming to EOF must not hide a shell/agent already running when the
+        # manager restarted — the session read idle until it finished. Old PR
+        # links are still NOT replayed.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, self.opened_pr(self.PR1, "old") + SHELL_LAUNCH_ENTRIES)
+        state = {}
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["agents"], [{"type": "shell", "label": "Watch CI"}])
+        self.assertEqual(rep["prUrls"], [])
+        # The stop edge still lands on a later beat, incrementally.
+        with open(path, "a") as f:
+            f.write(json.dumps({"type": "queue-operation", "operation": "enqueue",
+                                "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                                           "<status>completed</status>\n</task-notification>"}) + "\n")
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["agents"], [])
+
+    def test_a_restart_does_not_resurrect_finished_background_work(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES + [
+            {"type": "queue-operation", "operation": "enqueue",
+             "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                        "<status>completed</status>\n</task-notification>"}])
+        self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"], [])
+
     def test_prime_to_eof_then_incremental_pr_scan(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, self.opened_pr(self.PR1, "old"))
