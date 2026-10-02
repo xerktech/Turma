@@ -1669,6 +1669,24 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         with mock.patch.object(ha, "AGENT_BACKSCAN_BYTES", len(body) - cut):
             self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"], [])
 
+    def test_a_transcript_inside_the_window_keeps_its_first_line(self):
+        # No cut: line 0 is the shell's Bash call, which carries its label.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES)
+        self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"],
+                         [{"type": "shell", "label": "Watch CI"}])
+
+    def test_a_launch_in_the_lead_in_never_goes_live(self):
+        # The lead-in records stops only; a launch there is outside the window.
+        path = os.path.join(self.proj, "s.jsonl")
+        pad = {"type": "user", "message": {"content": "x" * 1000}}
+        write_jsonl(path, [pad] + SHELL_LAUNCH_ENTRIES + [pad] * 3)
+        with open(path, "rb") as f:
+            body = f.read()
+        cut = body.index(b"backgroundTaskId") + 200
+        with mock.patch.object(ha, "AGENT_BACKSCAN_BYTES", len(body) - cut):
+            self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"], [])
+
     def test_the_back_scan_window_skips_its_cut_line(self):
         path = os.path.join(self.proj, "s.jsonl")
         pad = {"type": "user", "message": {"content": "x" * 1000}}
