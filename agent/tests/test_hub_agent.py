@@ -1642,6 +1642,42 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
                                            "<status>completed</status>\n</task-notification>"}) + "\n")
         self.assertEqual(ha.session_report(self.WORKDIR, state)["agents"], [])
 
+    def test_the_restart_back_scan_runs_once(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES)
+        state = {}
+        with mock.patch.object(ha, "_backscan_live_agents",
+                               wraps=ha._backscan_live_agents) as scan:
+            ha.session_report(self.WORKDIR, state)
+            ha.session_report(self.WORKDIR, state)
+        self.assertEqual(scan.call_count, 1)
+
+    def test_a_stop_written_just_before_the_window_still_wins(self):
+        # Claude can write a notification BEFORE its launch; a window cut between
+        # the two must not register the launch as a phantom.
+        path = os.path.join(self.proj, "s.jsonl")
+        stop = {"type": "queue-operation", "operation": "enqueue",
+                "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                           "<status>completed</status>\n</task-notification>"}
+        pad = {"type": "user", "message": {"content": "x" * 1000}}
+        write_jsonl(path, [pad] * 3 + [stop, pad] + SHELL_LAUNCH_ENTRIES + [pad])
+        with open(path, "rb") as f:
+            body = f.read()
+        # Cut the window in the middle of the pad between the stop and the launch.
+        cut = body.index(b"bsh1") + 600
+        self.assertLess(cut, body.index(b"backgroundTaskId"))
+        with mock.patch.object(ha, "AGENT_BACKSCAN_BYTES", len(body) - cut):
+            self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"], [])
+
+    def test_the_back_scan_window_skips_its_cut_line(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        pad = {"type": "user", "message": {"content": "x" * 1000}}
+        with mock.patch.object(ha, "AGENT_BACKSCAN_BYTES", 3000), \
+                mock.patch.object(ha, "AGENT_BACKSCAN_LEAD_IN", 500):
+            write_jsonl(path, [pad] * 6 + SHELL_LAUNCH_ENTRIES)
+            self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"],
+                             [{"type": "shell", "label": "Watch CI"}])
+
     def test_a_restart_does_not_resurrect_finished_background_work(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, SHELL_LAUNCH_ENTRIES + [

@@ -278,6 +278,8 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     launched before the restart, so the card read idle while the chat bar (tunnel-agent's
     tail-window scan) listed it. The first beat folds the last 4 MiB into the agent scan ONLY —
     never the PR scan, whose no-replay rule priming exists for.
+  - **The back-scan's 64 KiB lead-in records STOPS only** — Claude can write a notification a few KB
+    BEFORE its launch, so a window cut between them would register a permanent phantom.
   - Reported on **every** `session_report` exit path (`_finish`). Mirrors
     `scanAgentEntry`/`liveAgentsReport` in `tunnel-agent.js`. Tests: `TestLiveAgentsScan`.
 - `modeActual` — the TUI's REAL mode off the footer marker (glyph-anchored). `_session_payload`
