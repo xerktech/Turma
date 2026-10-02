@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.BoardView
 import com.xerktech.turma.core.CreateMetaFetch
 import com.xerktech.turma.core.CreateResultFetch
 import com.xerktech.turma.core.IssueFetch
@@ -14,6 +15,8 @@ import com.xerktech.turma.core.categoryOf
 import com.xerktech.turma.core.classifyCreateMeta
 import com.xerktech.turma.core.classifyCreateResult
 import com.xerktech.turma.core.classifyIssueResponse
+import com.xerktech.turma.core.decodeBoardView
+import com.xerktech.turma.core.encodeBoardView
 import com.xerktech.turma.core.jiraRefreshFailed
 import com.xerktech.turma.core.jiraRefreshPending
 import com.xerktech.turma.core.moveSweepVerdict
@@ -57,6 +60,18 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val messages: SharedFlow<String> = _messages
+
+    // The toolbar's search/filter/sort view (board.html `view`): client-only, and
+    // remembered across launches like the web's localStorage copy — in the same
+    // query encoding, so the two read alike. A display preference, not a secret.
+    private val viewPrefs = app.getSharedPreferences("turma_prefs", 0)
+    private val _view = MutableStateFlow(decodeBoardView(viewPrefs.getString(VIEW_PREF_KEY, null)))
+    val view: StateFlow<BoardView> = _view
+
+    fun setView(next: BoardView) {
+        _view.value = next
+        viewPrefs.edit().putString(VIEW_PREF_KEY, encodeBoardView(next)).apply()
+    }
 
     /**
      * Per-ticket in-flight start state, keyed "<siteKey>\u0000<issueKey>" — the
@@ -283,6 +298,7 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         fun startKey(siteKey: String, issueKey: String) = siteKey + "\u0000" + issueKey
+        private const val VIEW_PREF_KEY = "boardView"
         const val START_TIMEOUT_MS = 60_000L
         // How long an optimistic queue entry survives without the hub listing it
         // (board.html QUEUE_OPTIMISM_MS): past this the payload is authoritative,

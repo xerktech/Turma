@@ -75,6 +75,318 @@
     return String(b.updated || "").localeCompare(String(a.updated || ""));
   }
 
+  // --- toolbar: search, filter, sort -----------------------------------------
+  // A client-only VIEW over the tickets the board already has: nothing here is
+  // sent to the hub or the tracker. Ported to android's core/Board.kt
+  // (BoardView / ticketFacets / boardViewMatches / boardViewSort) — change one,
+  // change both.
+  //
+  // A view is {q, f: {field: [values]}, sort, rev, hideDone}. Within one field
+  // the selected values OR; across fields they AND. Every filter is a FACET of
+  // the ticket (ticketFacets): a field maps to the list of values the ticket
+  // carries for it, so multi-valued fields (labels, due windows) need no special
+  // case in the matcher or the option counts.
+  const FILTER_FIELDS = [
+    ["type", "Type"], ["priority", "Priority"], ["project", "Project"],
+    ["label", "Label"], ["repo", "Repo"], ["epic", "Epic"],
+    ["session", "Session"], ["deps", "Dependencies"], ["due", "Due"],
+    ["updated", "Updated"],
+  ];
+  // Fixed-vocabulary facets, in display order. The rest take their values (and
+  // labels) from the tickets themselves.
+  const FACET_LABELS = {
+    repo: { "-none": "no repo", "-untriaged": "untriaged" },
+    epic: { "-none": "No epic" },
+    session: { running: "Running", queued: "Queued", none: "None" },
+    deps: { blocked: "Blocked", blocking: "Blocking" },
+    due: { overdue: "Overdue", week: "Next 7 days", has: "Has due date", none: "No due date" },
+    updated: { "24h": "24h", "7d": "7 days", "30d": "30 days" },
+  };
+  // Natural order first; `rev` flips it. The labels name each direction so the
+  // menu reads "Highest first" rather than a bare asc/desc.
+  const SORTS = [
+    ["updated", "Updated", "Newest first", "Oldest first"],
+    ["created", "Created", "Newest first", "Oldest first"],
+    ["priority", "Priority", "Highest first", "Lowest first"],
+    ["due", "Due date", "Soonest first", "Latest first"],
+    ["key", "Key", "Ascending", "Descending"],
+    ["type", "Type", "A → Z", "Z → A"],
+  ];
+  // Caps on what a URL / stored view may carry — it is operator input.
+  const VIEW_MAX_VALUES = 50;
+  const VIEW_MAX_LEN = 200;
+
+  function emptyBoardView() {
+    return { q: "", f: {}, sort: "updated", rev: false, hideDone: false };
+  }
+
+  // Does the view narrow the board at all? (Sort and the Done toggle don't:
+  // they never hide a ticket from a column that is shown.)
+  function boardViewActive(view) {
+    if (!view) return false;
+    if (String(view.q || "").trim()) return true;
+    return Object.values(view.f || {}).some(v => Array.isArray(v) && v.length);
+  }
+
+  function boardViewFilterCount(view) {
+    return Object.values((view && view.f) || {}).filter(v => Array.isArray(v) && v.length).length;
+  }
+
+  // Jira's five names, Azure's P1..P4 (the agent ships `P<n>`), and the common
+  // alternates, onto one 0 (most urgent) .. 4 scale. Unknown sorts last.
+  function priorityRank(name) {
+    const p = String(name || "").trim().toLowerCase();
+    if (!p) return 9;
+    if (/^p\d$/.test(p)) return Math.min(+p.slice(1) - 1, 8);
+    const ranks = {
+      highest: 0, blocker: 0, critical: 0, urgent: 0,
+      high: 1, major: 1,
+      medium: 2, normal: 2,
+      low: 3, minor: 3,
+      lowest: 4, trivial: 4,
+    };
+    return p in ranks ? ranks[p] : 8;
+  }
+
+  function utcDay(ms) { return new Date(ms).toISOString().slice(0, 10); }
+
+  // field -> the values this ticket carries for it. `ctx` supplies what the
+  // ticket alone doesn't know: its sessions/queue entry (session) and `now`.
+  function ticketFacets(t, site, ctx) {
+    const c = ctx || {};
+    const now = c.now != null ? c.now : Date.now();
+    const siteKey = (site && site.siteKey) || "";
+    const g = t.repoGuess;
+    const repo = !g ? "-untriaged" : g.repo ? String(g.repo) : "-none";
+    let session = "none";
+    if (ticketSessionsOf(c.sessionIndex, siteKey, t.key).length) session = "running";
+    else if (queuedTicketOf(c.ticketQueue, siteKey, t.key)) session = "queued";
+    const deps = [];
+    if (Array.isArray(t.blockedBy) && t.blockedBy.length) deps.push("blocked");
+    if (Array.isArray(t.blocks) && t.blocks.length) deps.push("blocking");
+    const due = [];
+    const dd = /^\d{4}-\d{2}-\d{2}/.test(String(t.dueDate || "")) ? String(t.dueDate).slice(0, 10) : "";
+    if (dd) {
+      due.push("has");
+      const today = utcDay(now);
+      if (dd < today) due.push("overdue");
+      else if (dd <= utcDay(now + 7 * 86400e3)) due.push("week");
+    } else {
+      due.push("none");
+    }
+    const updated = [];
+    const at = Date.parse(t.updated || "");
+    if (!isNaN(at)) {
+      const h = (now - at) / 3600e3;
+      if (h <= 24) updated.push("24h");
+      if (h <= 24 * 7) updated.push("7d");
+      if (h <= 24 * 30) updated.push("30d");
+    }
+    return {
+      type: t.type ? [String(t.type)] : [],
+      priority: t.priority ? [String(t.priority)] : [],
+      project: t.project ? [String(t.project)] : [],
+      label: Array.isArray(t.labels) ? t.labels.filter(Boolean).map(String) : [],
+      repo: [repo],
+      epic: [t.epicKey ? String(t.epicKey) : "-none"],
+      session: [session],
+      deps,
+      due,
+      updated,
+    };
+  }
+
+  // A search matches a substring of the ticket's text fields — except a query
+  // shaped like an issue key, which matches that ticket exactly, so XERK-12
+  // doesn't also pull in XERK-120..129.
+  const KEY_QUERY_RE = /^[a-z][a-z0-9_]*-\d+$/i;
+  function ticketSearchMatch(t, q) {
+    const s = String(q || "").trim().toLowerCase();
+    if (!s) return true;
+    if (KEY_QUERY_RE.test(s)) return String(t.key || "").toLowerCase() === s;
+    const g = t.repoGuess;
+    const hay = [
+      t.key, t.summary, t.type, t.status, t.project, t.projectName, t.epicKey,
+      g && g.repo, ...(Array.isArray(t.labels) ? t.labels : []),
+    ].filter(Boolean).join("\n").toLowerCase();
+    return hay.includes(s);
+  }
+
+  function boardViewMatches(t, site, view, ctx) {
+    if (!view) return true;
+    if (!ticketSearchMatch(t, view.q)) return false;
+    const f = view.f || {};
+    let facets = null;
+    for (const [field] of FILTER_FIELDS) {
+      const sel = f[field];
+      if (!Array.isArray(sel) || !sel.length) continue;
+      facets = facets || ticketFacets(t, site, ctx);
+      if (!facets[field].some(v => sel.includes(v))) return false;
+    }
+    return true;
+  }
+
+  // The comparator for a view's sort. Epics stay pinned to the top under every
+  // sort (as in ticketSort); ties fall back to newest `updated`. A missing due
+  // date sorts LAST in both directions — "no date" is never the soonest.
+  function boardViewSort(view) {
+    const sort = view && SORTS.some(s => s[0] === view.sort) ? view.sort : "updated";
+    const dir = view && view.rev ? -1 : 1;
+    const str = (v) => String(v || "");
+    return (a, b) => {
+      const ea = isEpicTicket(a) ? 0 : 1;
+      const eb = isEpicTicket(b) ? 0 : 1;
+      if (ea !== eb) return ea - eb;
+      let d = 0;
+      if (sort === "updated" || sort === "created") {
+        d = str(b[sort]).localeCompare(str(a[sort])) * dir;
+      } else if (sort === "priority") {
+        d = (priorityRank(a.priority) - priorityRank(b.priority)) * dir;
+      } else if (sort === "due") {
+        const da = str(a.dueDate), db = str(b.dueDate);
+        if (!da !== !db) return da ? -1 : 1;
+        d = da.localeCompare(db) * dir;
+      } else if (sort === "key") {
+        d = str(a.key).localeCompare(str(b.key), "en", { numeric: true }) * dir;
+      } else if (sort === "type") {
+        d = str(a.type).localeCompare(str(b.type), "en", { sensitivity: "base" }) * dir;
+      }
+      return d || str(b.updated).localeCompare(str(a.updated));
+    };
+  }
+
+  // The popover's groups: every field, with the values the in-scope tickets
+  // carry and how many carry each. A selected value nobody carries any more
+  // still shows (count 0) so it can be cleared. Fixed vocabularies keep their
+  // order; ticket-derived values sort by count, priorities by rank.
+  function boardFilterGroups(sites, view, ctx) {
+    const counts = {};
+    for (const [field] of FILTER_FIELDS) counts[field] = new Map();
+    const epicNames = new Map();   // an epic on the board labels its option by summary
+    for (const site of sites || []) {
+      for (const t of site.tickets || []) {
+        if (isEpicTicket(t) && t.key && t.summary) epicNames.set(String(t.key), `${t.key} · ${t.summary}`);
+        const facets = ticketFacets(t, site, ctx);
+        for (const [field] of FILTER_FIELDS) {
+          for (const v of new Set(facets[field])) counts[field].set(v, (counts[field].get(v) || 0) + 1);
+        }
+      }
+    }
+    const f = (view && view.f) || {};
+    return FILTER_FIELDS.map(([field, label]) => {
+      const m = counts[field];
+      for (const v of f[field] || []) if (!m.has(v)) m.set(v, 0);
+      const fixed = FACET_LABELS[field];
+      let values = [...m.keys()];
+      if (fixed && field !== "repo" && field !== "epic") {
+        values = Object.keys(fixed).filter(v => m.has(v));
+      } else if (field === "priority") {
+        values.sort((a, b) => priorityRank(a) - priorityRank(b) || a.localeCompare(b));
+      } else {
+        // Special "-" values (no repo, untriaged, no epic) trail the real ones.
+        values.sort((a, b) => (a[0] === "-") - (b[0] === "-") ||
+          m.get(b) - m.get(a) || a.localeCompare(b, "en", { numeric: true }));
+      }
+      const sel = f[field] || [];
+      return {
+        field, label,
+        options: values.map(v => ({
+          value: v,
+          label: (fixed && fixed[v]) || (field === "epic" && epicNames.get(v)) || v,
+          count: m.get(v) || 0,
+          selected: sel.includes(v),
+        })),
+      };
+    });
+  }
+
+  // View <-> URL query. Repeated params carry multi-values (type=Bug&type=Task)
+  // so a value is never split on a separator. Unknown fields, unknown sorts,
+  // and oversized values are dropped — the URL is operator input.
+  function boardViewFromParams(params) {
+    const v = emptyBoardView();
+    if (!params || typeof params.get !== "function") return v;
+    v.q = String(params.get("q") || "").slice(0, VIEW_MAX_LEN);
+    const sort = params.get("sort");
+    if (SORTS.some(s => s[0] === sort)) v.sort = sort;
+    v.rev = params.get("rev") === "1";
+    v.hideDone = params.get("done") === "0";
+    for (const [field] of FILTER_FIELDS) {
+      const vals = [...new Set(params.getAll(field).map(String)
+        .filter(x => x && x.length <= VIEW_MAX_LEN))].slice(0, VIEW_MAX_VALUES);
+      if (vals.length) v.f[field] = vals;
+    }
+    return v;
+  }
+
+  // The view as [key, value] pairs, defaults omitted, in a stable order.
+  function boardViewToParams(view) {
+    const out = [];
+    if (!view) return out;
+    const q = String(view.q || "").trim();
+    if (q) out.push(["q", q]);
+    for (const [field] of FILTER_FIELDS) {
+      for (const val of (view.f && view.f[field]) || []) out.push([field, val]);
+    }
+    if (view.sort && view.sort !== "updated") out.push(["sort", view.sort]);
+    if (view.rev) out.push(["rev", "1"]);
+    if (view.hideDone) out.push(["done", "0"]);
+    return out;
+  }
+
+  // Is any of this a view param? (The deep link's ticket/site are not.)
+  function hasBoardViewParams(params) {
+    if (!params || typeof params.has !== "function") return false;
+    return ["q", "sort", "rev", "done", ...FILTER_FIELDS.map(f => f[0])].some(k => params.has(k));
+  }
+
+  // The filter popover's body: one row of toggle chips per non-empty field,
+  // then the Done switch and the result count. data-* attributes carry the
+  // field/value so the page's one delegated click handler can toggle them.
+  function boardFilterPanelHtml(groups, view, shown, total) {
+    const rows = (groups || []).filter(g => g.options.length).map(g =>
+      `<div class="bf-l">${esc(g.label)}</div><div class="bf-opts">${g.options.map(o =>
+        `<button type="button" class="bf-o${o.selected ? " sel" : ""}" aria-pressed="${o.selected}"
+          data-bf-field="${esc(g.field)}" data-bf-value="${esc(o.value)}">${esc(o.label)}${
+          o.count ? ` <small>${o.count}</small>` : ""}</button>`).join("")}</div>`).join("");
+    const done = !(view && view.hideDone);
+    return `<div class="bf-grid">${rows || `<div class="bf-l">No tickets to filter</div><div></div>`}</div>
+      <div class="bf-foot">
+        <label class="bf-tog"><input type="checkbox" data-bf-done="1"${done ? " checked" : ""}> Show Done column</label>
+        <span>Showing ${shown} of ${total}${boardViewFilterCount(view)
+          ? ` · <button type="button" class="bf-link" data-bf-clear="1">Clear all</button>` : ""}</span>
+      </div>`;
+  }
+
+  // The active filters as removable chips — one per field, its values joined.
+  function boardFilterChipsHtml(groups, view) {
+    const f = (view && view.f) || {};
+    return (groups || []).filter(g => (f[g.field] || []).length).map(g => {
+      const names = f[g.field].map(v => {
+        const o = g.options.find(x => x.value === v);
+        return o ? o.label : v;
+      });
+      return `<span class="bf-chip"><b>${esc(g.label)}</b> ${esc(names.join(", "))}<button type="button"
+        data-bf-unset="${esc(g.field)}" aria-label="Remove ${esc(g.label)} filter">✕</button></span>`;
+    }).join("");
+  }
+
+  // The sort menu: each sort, then the two directions worded for that sort.
+  function boardSortMenuHtml(view) {
+    const cur = SORTS.find(s => s[0] === (view && view.sort)) || SORTS[0];
+    const rev = !!(view && view.rev);
+    const item = (attr, label, sel) =>
+      `<button type="button" class="bs-mi${sel ? " sel" : ""}" role="menuitemradio" aria-checked="${sel}" ${attr}>${esc(label)}${sel ? "<span>✓</span>" : ""}</button>`;
+    return `<div class="bs-mh">Sort by</div>${
+      SORTS.map(s => item(`data-bs-sort="${s[0]}"`, s[1], s[0] === cur[0])).join("")}
+      <div class="bs-hr"></div>${
+      item(`data-bs-rev="0"`, cur[2], !rev)}${item(`data-bs-rev="1"`, cur[3], rev)}`;
+  }
+
+  function sortLabel(view) {
+    return (SORTS.find(s => s[0] === (view && view.sort)) || SORTS[0])[1];
+  }
+
   // --- drag-and-drop status change (XERK-141) --------------------------------
   // A card dragged into another column changes the ticket's status: the drop
   // POSTs the target COLUMN (not a transition id — the card never loaded the
@@ -1903,6 +2215,12 @@
     const shown = sites.filter(s => !fkeys.length || fkeys.includes(s.siteKey));
     const moves = o.moves || null;
     const cards = { triage: [], todo: [], inprogress: [], review: [], done: [] };
+    // The toolbar's view (search/filter/sort). A column counts every ticket it
+    // holds and renders the ones the view keeps, so its head can say "3 / 12".
+    const view = o.view || null;
+    const narrowed = boardViewActive(view);
+    const viewCtx = { sessionIndex: o.sessionIndex, ticketQueue: o.ticketQueue, now: o.now };
+    const totals = { triage: 0, todo: 0, inprogress: 0, review: 0, done: 0 };
     for (const site of shown) {
       const color = colorMap.get(site.siteKey) || orgColor(site.siteKey);
       for (const t of site.tickets) {
@@ -1927,11 +2245,18 @@
                 { sessionIndex: o.sessionIndex, ticketQueue: o.ticketQueue }) : null;
             })()
           : null;
-        cards[lane || boardColumnOf(t, mv)].push({ t, site, color, mv, triageAction, epicRun });
+        const col = lane || boardColumnOf(t, mv);
+        totals[col]++;
+        // A card mid-move stays visible even if the view would now drop it, so
+        // a drag never makes the card vanish under the operator's hand.
+        if (narrowed && !(mv && mv.pending) && !boardViewMatches(t, site, view, viewCtx)) continue;
+        cards[col].push({ t, site, color, mv, triageAction, epicRun });
       }
     }
-    const cols = CATEGORIES.map(([cat, label]) => {
-      const list = cards[cat].sort((x, y) => ticketSort(x.t, y.t));
+    const cmp = view ? boardViewSort(view) : ticketSort;
+    const cols = CATEGORIES.filter(([cat]) => !(view && view.hideDone && cat === "done")).map(([cat, label]) => {
+      const list = cards[cat].sort((x, y) => cmp(x.t, y.t));
+      const count = narrowed && list.length !== totals[cat] ? `${list.length} / ${totals[cat]}` : String(list.length);
       const body = list.length
         ? list.map(c => cardHtml(c.t, c.site, {
             color: c.color, now: o.now,
@@ -1943,12 +2268,12 @@
             triageAction: c.triageAction,
             epicRun: c.epicRun,
           })).join("")
-        : `<div class="kc-none">none</div>`;
+        : `<div class="kc-none">${narrowed && totals[cat] ? "no matches" : "none"}</div>`;
       // data-cat lets the drag handler read which column a card was dropped on.
       // The Triage lane is board-only (XERK-486 [F]): kanban-triage marks it for
       // styling, and the drag handler refuses it as a drop target.
       return `<div class="kanban-col${cat === "done" ? " kanban-done" : ""}${cat === "triage" ? " kanban-triage" : ""}" data-cat="${cat}">
-        <div class="kc-head">${label} <span class="kc-count">${list.length}</span></div>
+        <div class="kc-head">${label} <span class="kc-count">${count}</span></div>
         <div class="kc-list">${body}</div>
       </div>`;
     });
@@ -2197,6 +2522,10 @@
     triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
     isEpicTicket, epicRunOf, epicRunView, epicRunSig,
     epicCardControlHtml, epicProgressBarHtml, epicRunPanelHtml,
+    FILTER_FIELDS, SORTS, emptyBoardView, boardViewActive, boardViewFilterCount, priorityRank,
+    ticketFacets, ticketSearchMatch, boardViewMatches, boardViewSort, boardFilterGroups,
+    boardViewFromParams, boardViewToParams, hasBoardViewParams,
+    boardFilterPanelHtml, boardFilterChipsHtml, boardSortMenuHtml, sortLabel,
     epicBuilderRows, epicBuilderStateLabel, epicBuilderProgressHtml, epicBuilderComposerHtml,
     boardColumnOf, moveSweepVerdict,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,

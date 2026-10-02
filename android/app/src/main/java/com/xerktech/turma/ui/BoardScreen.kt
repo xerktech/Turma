@@ -91,6 +91,10 @@ import android.os.Handler
 import android.os.Looper
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xerktech.turma.core.boardFilterGroups
+import com.xerktech.turma.core.boardViewActive
+import com.xerktech.turma.core.boardViewComparator
+import com.xerktech.turma.core.boardViewMatches
 import com.xerktech.turma.core.BOARD_CATEGORIES
 import com.xerktech.turma.core.BoardSite
 import com.xerktech.turma.core.CreateMetaFetch
@@ -114,7 +118,6 @@ import com.xerktech.turma.core.epicBuilderRows
 import com.xerktech.turma.core.epicBuilderStateLabel
 import com.xerktech.turma.core.EpicRunView
 import com.xerktech.turma.core.epicRunOf
-import com.xerktech.turma.core.TICKET_ORDER
 import com.xerktech.turma.core.epicRunView
 import com.xerktech.turma.core.isEpicTicket
 import com.xerktech.turma.core.filterSites
@@ -193,6 +196,20 @@ fun BoardScreen(
     // The scope is the header control's (XERK-62); filterSites self-heals picks
     // no org still reports, exactly as `effectiveOrgs` does for the other screens.
     val shown = remember(sites, orgFilter) { filterSites(sites, orgFilter) }
+    // The toolbar's search/filter/sort view (board.html `view`), and what it
+    // keeps of the in-scope tickets — the filter sheet's options and its
+    // "Show N tickets" both read these.
+    val view by vm.view.collectAsStateWithLifecycle()
+    val narrowed = boardViewActive(view)
+    val viewOrder = remember(view.sort, view.rev) { boardViewComparator(view) }
+    val filterGroups = remember(shown, view, sessionIndex, ticketQueue, now / 60_000) {
+        boardFilterGroups(shown, view, sessionIndex, ticketQueue, now)
+    }
+    val viewTotal = shown.sumOf { it.tickets.size }
+    val viewShown = remember(shown, view, sessionIndex, ticketQueue, now / 60_000) {
+        shown.sumOf { site -> site.tickets.count { boardViewMatches(it, site.siteKey, view, sessionIndex, ticketQueue, now) } }
+    }
+    var filterOpen by remember { mutableStateOf(false) }
     var detail by remember { mutableStateOf<Pair<BoardSite, JiraTicket>?>(null) }
     // The per-org triage policy sheet (XERK-486), opened from the header — the
     // board bar's "Triage policy" button on the web.
@@ -237,6 +254,13 @@ fun BoardScreen(
                 if (refreshing) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                 else Icon(Icons.Filled.Refresh, "Refresh")
             }
+        }
+        if (sites.isNotEmpty()) {
+            BoardToolbar(
+                view = view,
+                onView = vm::setView,
+                onOpenFilters = { filterOpen = true },
+            )
         }
         if (epicBuilders.isNotEmpty()) {
             EpicBuilderStrip(
@@ -321,14 +345,16 @@ fun BoardScreen(
                 ) {
                     // The client-only Triage lane (XERK-486) leads the strip;
                     // the four tracker columns follow it unchanged.
-                    for ((cat, title) in (listOf("triage" to "Triage") + BOARD_CATEGORIES)) {
+                    val columns = (listOf("triage" to "Triage") + BOARD_CATEGORIES)
+                        .filterNot { view.hideDone && it.first == "done" }
+                    for ((cat, title) in columns) {
                         // Epics float to the top of every column, then newest-updated
                         // first within each group — matching board.js `ticketSort`
                         // (sortedWith is stable, so same-group order is preserved). A
                         // live drag override lands the card in its dropped column,
                         // and (XERK-486) untriaged/held To Do tickets sit in the
                         // Triage lane unless a live drag overrides them.
-                        val cards = shown
+                        val inColumn = shown
                             .flatMap { site -> site.tickets
                                 .filter {
                                     displayColumnOf(
@@ -338,9 +364,21 @@ fun BoardScreen(
                                     ) == cat
                                 }
                                 .map { site to it } }
-                            .sortedWith(compareBy(TICKET_ORDER) { it.second })
+                        // The toolbar's view narrows and orders each column; a card
+                        // mid-move stays put so a drag never vanishes under the
+                        // finger (board.js boardHtml). The order is boardViewComparator
+                        // — TICKET_ORDER's rule under the default sort, never an inline copy.
+                        val cards = inColumn
+                            .filter { (site, t) ->
+                                !narrowed ||
+                                    moves[BoardViewModel.startKey(site.siteKey, t.key)]?.pending == true ||
+                                    boardViewMatches(t, site.siteKey, view, sessionIndex, ticketQueue, now)
+                            }
+                            .sortedWith(compareBy(viewOrder) { it.second })
                         KanbanColumn(
                             cat, title, cards, colorMap, now,
+                            total = inColumn.size,
+                            narrowed = narrowed,
                             sessionIndex = sessionIndex,
                             starts = starts,
                             moves = moves,
@@ -426,6 +464,17 @@ fun BoardScreen(
         TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, vm, onDismiss = { detail = null })
     }
 
+    if (filterOpen) {
+        BoardFilterSheet(
+            groups = filterGroups,
+            view = view,
+            shown = viewShown,
+            total = viewTotal,
+            onView = vm::setView,
+            onDismiss = { filterOpen = false },
+        )
+    }
+
     // The policy sheet edits the orgs in scope under the header filter — the
     // web panel's policySites.
     if (policyOpen && shown.isNotEmpty()) {
@@ -504,6 +553,8 @@ private fun KanbanColumn(
     cards: List<Pair<BoardSite, JiraTicket>>,
     colorMap: Map<String, Int>,
     now: Long,
+    total: Int,
+    narrowed: Boolean,
     sessionIndex: Map<String, List<TicketSession>>,
     starts: Map<String, StartState>,
     moves: Map<String, MoveState>,
@@ -537,7 +588,21 @@ private fun KanbanColumn(
         Row(Modifier.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             SectionLabel(title)
             Spacer(Modifier.width(6.dp))
-            Text("${cards.size}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            // "3 / 12" while the toolbar's view hides some (board.js kc-count).
+            Text(
+                if (narrowed && cards.size != total) "${cards.size} / $total" else "${cards.size}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (narrowed && cards.isEmpty() && total > 0) {
+            Text(
+                "no matches",
+                Modifier.fillMaxWidth().padding(vertical = 18.dp),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            )
         }
         if (cat == "triage") {
             // The web marks the lane with a dashed rule under its header; a thin
