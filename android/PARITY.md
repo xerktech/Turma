@@ -977,7 +977,7 @@ those are marked `[MODEL]`.
   - **Group-based access (XERK-594) stays hub-side** in the OIDC callback and gates only the session
     that flow issues. The break-glass username/password path is unchanged and deliberately not
     group-gated (the IdP-independent local credential).
-  - **OIDC sessions are the hub's shorter `OIDC_SESSION_TTL_MS`** (default 8h): a 401 on an SSO token
+  - **OIDC sessions are the hub's shorter `OIDC_SESSION_TTL_MS`** (default 24h): a 401 on an SSO token
     drops it (`HubClient` → `Config.clearSession`), and `TurmaApp` returns to the login screen to
     re-authenticate. A break-glass password login keeps the 30-day session.
   - Tests: `core/OidcTest` (PKCE golden vector, deep-link parse), `net/OidcControllerTest` (probe /

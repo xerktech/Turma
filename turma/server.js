@@ -1266,14 +1266,14 @@ const OIDC_CHALLENGE_MAX = 200;
 const OIDC_USER_GROUP = (process.env.TURMA_OIDC_USER_GROUP ?? "k8x-ai").trim();
 const OIDC_ADMIN_GROUP = (process.env.TURMA_OIDC_ADMIN_GROUP ?? "k8x-admins").trim();
 const OIDC_GROUPS_ENFORCED = !!(OIDC_USER_GROUP || OIDC_ADMIN_GROUP);
-// OIDC-issued browser sessions are shorter-lived than the 30-day password
+// OIDC-issued browser sessions (24h default) are shorter-lived than the 30-day password
 // session so a revoked user must re-authenticate — and be re-checked against
 // their CURRENT groups — within a bounded window. This is the app-side half of
 // "loses access on the next sync"; password/break-glass sessions keep
 // SESSION_TTL_MS (the IdP outage path must not force re-login every few hours).
 const OIDC_SESSION_TTL_MS = Math.max(
   60 * 1000,
-  parseInt(process.env.TURMA_OIDC_SESSION_TTL_MS, 10) || 8 * 3600 * 1000
+  parseInt(process.env.TURMA_OIDC_SESSION_TTL_MS, 10) || 24 * 3600 * 1000
 );
 
 // Injected on every proxied ttyd request so ttyd's own basic-auth
