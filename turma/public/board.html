@@ -190,11 +190,39 @@ function paintToolbar() {
   $filterBadge.textContent = n ? String(n) : "";
   $filterBtn.classList.toggle("on", n > 0 || !$filterPop.hidden);
   setHtml($filterChips, B.boardFilterChipsHtml(viewGroups, view));
+  fitChips();
   $sortLabel.textContent = B.sortLabel(view);
   $sortBtn.classList.toggle("on", view.sort !== "updated" || !!view.rev || !$sortMenu.hidden);
   if (!$filterPop.hidden) setHtml($filterPop, B.boardFilterPanelHtml(viewGroups, view, viewShown, viewTotal));
   if (!$sortMenu.hidden) setHtml($sortMenu, B.boardSortMenuHtml(view));
 }
+
+// The chip strip never wraps or clips silently: chips that don't fit are hidden
+// and a "+N" chip (which opens the popover) says how many.
+function fitChips() {
+  const chips = [...$filterChips.querySelectorAll(".bf-chip:not(.bf-more)")];
+  let more = $filterChips.querySelector(".bf-more");
+  chips.forEach(c => { c.hidden = false; });
+  if (more) more.hidden = true;
+  if (!chips.length || !$filterChips.clientWidth) return;
+  let hidden = 0;
+  for (let i = chips.length - 1; i >= 0 && $filterChips.scrollWidth > $filterChips.clientWidth; i--) {
+    chips[i].hidden = true;
+    hidden++;
+    if (!more) {
+      more = document.createElement("button");
+      more.type = "button";
+      more.className = "bf-chip bf-more";
+      more.dataset.bfOpen = "1";
+      $filterChips.appendChild(more);
+      $filterChips.__html = null;
+    }
+    more.hidden = false;
+    more.textContent = `+${hidden} more`;
+    more.title = `${hidden} more active filter${hidden === 1 ? "" : "s"} — open Filters`;
+  }
+}
+window.addEventListener("resize", () => fitChips());
 
 // One open menu at a time: the filter popover, the sort menu, or (on a phone)
 // the folded page actions.
@@ -259,6 +287,7 @@ $filterPop.addEventListener("change", (e) => {
   if (e.target.matches("[data-bf-done]")) setView({ hideDone: !e.target.checked });
 });
 $filterChips.addEventListener("click", (e) => {
+  if (e.target.closest("[data-bf-open]")) { e.__boardMenu = true; return toggleMenu($filterPop, $filterBtn); }
   const x = e.target.closest("[data-bf-unset]");
   if (!x) return;
   const f = Object.assign({}, view.f);
@@ -341,6 +370,9 @@ function render(data) {
   viewTotal = 0; viewShown = 0;
   for (const site of scoped) {
     for (const t of site.tickets) {
+      // A hidden Done column hides its tickets too, so the footer counts what
+      // the columns can actually show.
+      if (view.hideDone && B.categoryOf(t) === "done") continue;
       viewTotal++;
       if (B.boardViewMatches(t, site, view, viewCtx)) viewShown++;
     }

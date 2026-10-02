@@ -148,7 +148,13 @@
     return p in ranks ? ranks[p] : 8;
   }
 
-  function utcDay(ms) { return new Date(ms).toISOString().slice(0, 10); }
+  // The viewer's LOCAL calendar day, YYYY-MM-DD — a due date is a day on the
+  // operator's calendar, so "overdue" must not flip at UTC midnight.
+  function localDay(ms) {
+    const d = new Date(ms);
+    const p = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  }
 
   // field -> the values this ticket carries for it. `ctx` supplies what the
   // ticket alone doesn't know: its sessions/queue entry (session) and `now`.
@@ -158,9 +164,14 @@
     const siteKey = (site && site.siteKey) || "";
     const g = t.repoGuess;
     const repo = !g ? "-untriaged" : g.repo ? String(g.repo) : "-none";
+    // The session index also folds in killed/ended sessions and resumable
+    // transcripts (for the card's chips), so only a session whose OWN status is
+    // live counts — an old killed attempt is not "running".
+    const sess = ticketSessionsOf(c.sessionIndex, siteKey, t.key);
     let session = "none";
-    if (ticketSessionsOf(c.sessionIndex, siteKey, t.key).length) session = "running";
-    else if (queuedTicketOf(c.ticketQueue, siteKey, t.key)) session = "queued";
+    if (sess.some(x => x && x.status === "running")) session = "running";
+    else if (sess.some(x => x && x.status === "queued") ||
+      queuedTicketOf(c.ticketQueue, siteKey, t.key)) session = "queued";
     const deps = [];
     if (Array.isArray(t.blockedBy) && t.blockedBy.length) deps.push("blocked");
     if (Array.isArray(t.blocks) && t.blocks.length) deps.push("blocking");
@@ -168,9 +179,9 @@
     const dd = /^\d{4}-\d{2}-\d{2}/.test(String(t.dueDate || "")) ? String(t.dueDate).slice(0, 10) : "";
     if (dd) {
       due.push("has");
-      const today = utcDay(now);
+      const today = localDay(now);
       if (dd < today) due.push("overdue");
-      else if (dd <= utcDay(now + 7 * 86400e3)) due.push("week");
+      else if (dd <= localDay(now + 7 * 86400e3)) due.push("week");
     } else {
       due.push("none");
     }

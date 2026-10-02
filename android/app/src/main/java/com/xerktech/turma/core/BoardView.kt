@@ -78,7 +78,9 @@ fun priorityRank(name: String?): Int {
     }
 }
 
-private fun utcDay(ms: Long): String = java.time.Instant.ofEpochMilli(ms).toString().take(10)
+/** The viewer's LOCAL calendar day — "overdue" must not flip at UTC midnight. */
+private fun localDay(ms: Long): String =
+    java.time.Instant.ofEpochMilli(ms).atZone(java.time.ZoneId.systemDefault()).toLocalDate().toString()
 
 /** field -> the values this ticket carries for it (board.js ticketFacets). */
 fun ticketFacets(
@@ -94,9 +96,12 @@ fun ticketFacets(
         !g.repo.isNullOrEmpty() -> g.repo
         else -> "-none"
     }
+    // The index also folds in killed/ended sessions and resumable transcripts
+    // (for the chips), so only a session whose OWN status is live counts.
+    val sess = ticketSessionsOf(sessionIndex, siteKey, t.key)
     val session = when {
-        ticketSessionsOf(sessionIndex, siteKey, t.key).isNotEmpty() -> "running"
-        queuedTicketOf(queue, siteKey, t.key) != null -> "queued"
+        sess.any { it.status == "running" } -> "running"
+        sess.any { it.status == "queued" } || queuedTicketOf(queue, siteKey, t.key) != null -> "queued"
         else -> "none"
     }
     val deps = buildList {
@@ -105,11 +110,11 @@ fun ticketFacets(
     }
     val dd = t.dueDate.orEmpty().takeIf { Regex("^\\d{4}-\\d{2}-\\d{2}").containsMatchIn(it) }?.take(10)
     val due = if (dd != null) {
-        val today = utcDay(now)
+        val today = localDay(now)
         buildList {
             add("has")
             if (dd < today) add("overdue")
-            else if (dd <= utcDay(now + 7 * 86_400_000L)) add("week")
+            else if (dd <= localDay(now + 7 * 86_400_000L)) add("week")
         }
     } else listOf("none")
     val updated = buildList {

@@ -97,6 +97,30 @@ class BoardViewTest {
         assertEquals(listOf("none"), ticketFacets(t, "other", emptyMap(), q, now)["session"])
     }
 
+    @Test fun killedOrEndedSessionIsNotRunning() {
+        val t = tk(key = "XERK-5")
+        fun ses(status: String) = TicketSession("h", "s", "t", status, "", "", "", false, "", "XERK-5", siteKey)
+        fun idx(vararg st: String) = mapOf(siteKey + "\u0000XERK-5" to st.map { ses(it) })
+        fun sess(i: Map<String, List<TicketSession>>, q: List<QueuedTicket>? = null) =
+            ticketFacets(t, siteKey, i, q, now)["session"]
+        assertEquals(listOf("none"), sess(idx("stopped")))
+        assertEquals(listOf("running"), sess(idx("stopped", "running")))
+        assertEquals(listOf("queued"), sess(idx("queued")))
+        assertEquals(listOf("queued"), sess(idx("stopped"), listOf(QueuedTicket(siteKey = siteKey, issueKey = "XERK-5"))))
+    }
+
+    @Test fun dueUsesLocalDayNotUtc() {
+        val prev = java.util.TimeZone.getDefault()
+        java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("America/Los_Angeles"))
+        try {
+            val at = java.time.Instant.parse("2026-10-03T01:00:00Z").toEpochMilli()
+            assertEquals(listOf("has", "week"), ticketFacets(tk(dueDate = "2026-10-02"), siteKey, emptyMap(), null, at)["due"])
+            assertEquals(listOf("has", "overdue"), ticketFacets(tk(dueDate = "2026-10-01"), siteKey, emptyMap(), null, at)["due"])
+        } finally {
+            java.util.TimeZone.setDefault(prev)
+        }
+    }
+
     @Test fun searchIsSubstringExceptExactKey() {
         val t = tk(key = "XERK-12", summary = "Webhook retry storm", labels = listOf("api"), epicKey = "XERK-900")
         assertTrue(ticketSearchMatch(t, "webhook"))

@@ -205,9 +205,14 @@ fun BoardScreen(
     val filterGroups = remember(shown, view, sessionIndex, ticketQueue, now / 60_000) {
         boardFilterGroups(shown, view, sessionIndex, ticketQueue, now)
     }
-    val viewTotal = shown.sumOf { it.tickets.size }
+    // A hidden Done column hides its tickets too, so the sheet counts what the
+    // columns can actually show.
+    val countable = { t: JiraTicket -> !(view.hideDone && categoryOf(t) == "done") }
+    val viewTotal = shown.sumOf { site -> site.tickets.count(countable) }
     val viewShown = remember(shown, view, sessionIndex, ticketQueue, now / 60_000) {
-        shown.sumOf { site -> site.tickets.count { boardViewMatches(it, site.siteKey, view, sessionIndex, ticketQueue, now) } }
+        shown.sumOf { site ->
+            site.tickets.count { countable(it) && boardViewMatches(it, site.siteKey, view, sessionIndex, ticketQueue, now) }
+        }
     }
     var filterOpen by remember { mutableStateOf(false) }
     var detail by remember { mutableStateOf<Pair<BoardSite, JiraTicket>?>(null) }

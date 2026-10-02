@@ -530,13 +530,12 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 .bs-mi:hover { background: color-mix(in srgb, var(--ink) 6%, transparent); color: var(--ink); }
 .bs-mi.sel { background: var(--accent-soft); color: var(--accent); }
 .bs-hr { height: 1px; background: var(--hairline); margin: 5px 4px; }
+.bf-chip[hidden] { display: none; }
+.bf-more { font: inherit; font-size: 12px; border: 0; cursor: pointer; padding: 0 10px; }
+/* Below this the toolbar and the page actions can't share a row, so the
+   chips give way to the badge and the actions fold behind ⋯. */
 @media (max-width: 760px) {
   .bt-chips { display: none; }
-}
-@media (max-width: 560px) {
-  .board-tools .bt-label, .board-tools .bt-kbd { display: none; }
-  .board-tools .bt-btn { width: 30px; padding: 0; justify-content: center; }
-  .board-tools .bt-badge { position: absolute; top: -5px; right: -5px; }
   .bt-search { max-width: none; }
   .bt-more { display: inline-flex; }
   .board-actions { display: none; }
@@ -545,6 +544,11 @@ button:disabled .spin { border-top-color: var(--ink-2); }
     top: calc(100% + 6px); z-index: 50; padding: 8px; background: var(--surface);
     border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: var(--shadow-md);
   }
+}
+@media (max-width: 560px) {
+  .board-tools .bt-label, .board-tools .bt-kbd { display: none; }
+  .board-tools .bt-btn { width: 30px; padding: 0; justify-content: center; }
+  .board-tools .bt-badge { position: absolute; top: -5px; right: -5px; }
   .bf-grid { grid-template-columns: 1fr; row-gap: 6px; }
   .bf-l { padding-top: 6px; }
 }

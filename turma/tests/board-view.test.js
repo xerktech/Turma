@@ -72,13 +72,39 @@ test("ticketFacets: repo, epic, session, deps, due and updated windows", () => {
 
 test("ticketFacets: session reads the session index first, then the hub queue", () => {
   const t = tk({ key: "XERK-5" });
-  const sessionIndex = new Map([[SITE + "\x00XERK-5", [{ id: "s1" }]]]);
+  const sessionIndex = new Map([[SITE + "\x00XERK-5", [{ id: "s1", status: "running" }]]]);
   assert.deepEqual(ticketFacets(t, site([]), { now: NOW, sessionIndex }).session, ["running"]);
   const ticketQueue = [{ siteKey: SITE, issueKey: "XERK-5" }];
   assert.deepEqual(ticketFacets(t, site([]), { now: NOW, ticketQueue }).session, ["queued"]);
   assert.deepEqual(ticketFacets(t, site([]), { now: NOW, sessionIndex, ticketQueue }).session, ["running"]);
   assert.deepEqual(ticketFacets(t, { siteKey: "other" }, { now: NOW, ticketQueue }).session, ["none"],
     "a queue entry for another org's same key doesn't count");
+});
+
+test("ticketFacets: a killed/ended/resumable session is not running (QA defect 1)", () => {
+  const t = tk({ key: "XERK-5" });
+  const idx = (...st) => new Map([[SITE + "\x00XERK-5", st.map((status, i) => ({ id: "s" + i, status }))]]);
+  const sess = (sessionIndex, ticketQueue) =>
+    ticketFacets(t, site([]), { now: NOW, sessionIndex, ticketQueue }).session;
+  assert.deepEqual(sess(idx("stopped")), ["none"], "a killed attempt is not running");
+  assert.deepEqual(sess(idx(undefined)), ["none"], "a resumable transcript row is not running");
+  assert.deepEqual(sess(idx("stopped", "running")), ["running"]);
+  assert.deepEqual(sess(idx("queued")), ["queued"], "an agent-side queued session is queued");
+  assert.deepEqual(sess(idx("stopped"), [{ siteKey: SITE, issueKey: "XERK-5" }]), ["queued"],
+    "re-queued after a killed attempt reads queued, not running");
+});
+
+test("ticketFacets: due buckets use the viewer's local day, not UTC (QA defect 3)", () => {
+  const prev = process.env.TZ;
+  process.env.TZ = "America/Los_Angeles";
+  try {
+    // 01:00Z on Oct 3 is 18:00 on Oct 2 in Los Angeles: due Oct 2 is today, not overdue.
+    const now = Date.parse("2026-10-03T01:00:00Z");
+    assert.deepEqual(ticketFacets(tk({ dueDate: "2026-10-02" }), site([]), { now }).due, ["has", "week"]);
+    assert.deepEqual(ticketFacets(tk({ dueDate: "2026-10-01" }), site([]), { now }).due, ["has", "overdue"]);
+  } finally {
+    if (prev === undefined) delete process.env.TZ; else process.env.TZ = prev;
+  }
 });
 
 test("ticketSearchMatch: substring over text fields, exact on an issue-key query", () => {
@@ -241,6 +267,9 @@ test("board.html carries the toolbar controls its script binds", () => {
     assert.ok(src.includes(`getElementById("${id}")`), `#${id} bound`);
   }
   assert.match(src, /view,\n/, "render passes the view to boardHtml");
+  assert.match(src, /view\.hideDone && B\.categoryOf\(t\) === "done"/,
+    "the Showing N of M footer leaves out a hidden Done column (QA defect 4)");
+  assert.match(src, /function fitChips\(\)/, "overflowing chips collapse into +N (QA defect 5)");
   assert.ok(!src.includes('history.replaceState(null, "", location.pathname);'),
     "the deep link no longer wipes the view's query params");
 });
