@@ -1625,6 +1625,85 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["prUrls"], [])
         self.assertTrue(state["primed"])  # still primes so later beats scan
 
+    def test_a_restart_still_sees_background_work_launched_before_it(self):
+        # Priming to EOF must not hide a shell/agent already running when the
+        # manager restarted — the session read idle until it finished. Old PR
+        # links are still NOT replayed.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, self.opened_pr(self.PR1, "old") + SHELL_LAUNCH_ENTRIES)
+        state = {}
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["agents"], [{"type": "shell", "label": "Watch CI"}])
+        self.assertEqual(rep["prUrls"], [])
+        # The stop edge still lands on a later beat, incrementally.
+        with open(path, "a") as f:
+            f.write(json.dumps({"type": "queue-operation", "operation": "enqueue",
+                                "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                                           "<status>completed</status>\n</task-notification>"}) + "\n")
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["agents"], [])
+
+    def test_the_restart_back_scan_runs_once(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES)
+        state = {}
+        with mock.patch.object(ha, "_backscan_live_agents",
+                               wraps=ha._backscan_live_agents) as scan:
+            ha.session_report(self.WORKDIR, state)
+            ha.session_report(self.WORKDIR, state)
+        self.assertEqual(scan.call_count, 1)
+
+    def test_a_stop_written_just_before_the_window_still_wins(self):
+        # Claude can write a notification BEFORE its launch; a window cut between
+        # the two must not register the launch as a phantom.
+        path = os.path.join(self.proj, "s.jsonl")
+        stop = {"type": "queue-operation", "operation": "enqueue",
+                "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                           "<status>completed</status>\n</task-notification>"}
+        pad = {"type": "user", "message": {"content": "x" * 1000}}
+        write_jsonl(path, [pad] * 3 + [stop, pad] + SHELL_LAUNCH_ENTRIES + [pad])
+        with open(path, "rb") as f:
+            body = f.read()
+        # Cut the window in the middle of the pad between the stop and the launch.
+        cut = body.index(b"bsh1") + 600
+        self.assertLess(cut, body.index(b"backgroundTaskId"))
+        with mock.patch.object(ha, "AGENT_BACKSCAN_BYTES", len(body) - cut):
+            self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"], [])
+
+    def test_a_transcript_inside_the_window_keeps_its_first_line(self):
+        # No cut: line 0 is the shell's Bash call, which carries its label.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES)
+        self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"],
+                         [{"type": "shell", "label": "Watch CI"}])
+
+    def test_a_launch_in_the_lead_in_never_goes_live(self):
+        # The lead-in records stops only; a launch there is outside the window.
+        path = os.path.join(self.proj, "s.jsonl")
+        pad = {"type": "user", "message": {"content": "x" * 1000}}
+        write_jsonl(path, [pad] + SHELL_LAUNCH_ENTRIES + [pad] * 3)
+        with open(path, "rb") as f:
+            body = f.read()
+        cut = body.index(b"backgroundTaskId") + 200
+        with mock.patch.object(ha, "AGENT_BACKSCAN_BYTES", len(body) - cut):
+            self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"], [])
+
+    def test_the_back_scan_window_skips_its_cut_line(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        pad = {"type": "user", "message": {"content": "x" * 1000}}
+        with mock.patch.object(ha, "AGENT_BACKSCAN_BYTES", 3000), \
+                mock.patch.object(ha, "AGENT_BACKSCAN_LEAD_IN", 500):
+            write_jsonl(path, [pad] * 6 + SHELL_LAUNCH_ENTRIES)
+            self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"],
+                             [{"type": "shell", "label": "Watch CI"}])
+
+    def test_a_restart_does_not_resurrect_finished_background_work(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES + [
+            {"type": "queue-operation", "operation": "enqueue",
+             "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                        "<status>completed</status>\n</task-notification>"}])
+        self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"], [])
+
     def test_prime_to_eof_then_incremental_pr_scan(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, self.opened_pr(self.PR1, "old"))
