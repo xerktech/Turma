@@ -1087,6 +1087,15 @@ function prBadgeHtml(pr) {
 // one is still working — stays Active — but says "QA Review" instead of a bare
 // agent count (XERK-538). Same rule and wording as sessions.html.
 const QA_AGENT_TYPES = new Set(["qa", "qa-delta"]);
+// "1 background agent" / "2 background shells" / "3 background tasks" (mixed):
+// a background shell rides `agents` as a `shell` row. Same as sessions.html.
+function backgroundWorkLabel(rows) {
+  rows = Array.isArray(rows) ? rows : [];
+  const n = rows.length;
+  const shells = rows.filter(a => a && a.type === "shell").length;
+  const noun = !shells ? "agent" : shells === n ? "shell" : "task";
+  return n + " background " + noun + (n === 1 ? "" : "s");
+}
 function qaReviewing(s) {
   return (Array.isArray(s?.agents) ? s.agents : []).some(a => a && QA_AGENT_TYPES.has(a.type));
 }
@@ -1114,8 +1123,7 @@ function liveState(sess, host, now) {
   // agent was still running (XERK-245). Same rule and wording as sessions.html.
   const agentsLive = Array.isArray(s.agents) ? s.agents.length : 0;
   if (host.online && agentsLive)
-    return { label: qaReviewing(s) ? "QA Review"
-                    : (agentsLive === 1 ? "1 background agent" : agentsLive + " background agents"),
+    return { label: qaReviewing(s) ? "QA Review" : backgroundWorkLabel(s.agents),
              cls: "sess-working", detail: "last write " + ago(age), busy: true };
   const working = s.paneBusy != null
     ? (host.online && s.paneBusy)

@@ -2219,8 +2219,17 @@ function qaReviewing(s) {
 // "1 background agent" / "3 background agents".
 function agentWorkLabel(s) {
   if (qaReviewing(s)) return "QA Review";
-  const n = liveAgentCount(s);
-  return n === 1 ? "1 background agent" : n + " background agents";
+  return backgroundWorkLabel(s.agents);
+}
+// "1 background agent" / "2 background shells" / "3 background tasks" (mixed):
+// a background shell rides `agents` as a `shell` row. Mirrored in index.html and
+// android's CommonUi.kt.
+function backgroundWorkLabel(rows) {
+  rows = Array.isArray(rows) ? rows : [];
+  const n = rows.length;
+  const shells = rows.filter(a => a && a.type === "shell").length;
+  const noun = !shells ? "agent" : shells === n ? "shell" : "task";
+  return n + " background " + noun + (n === 1 ? "" : "s");
 }
 
 // Has this PR left the operator's plate? MERGED and CLOSED are the two end

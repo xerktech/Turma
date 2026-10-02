@@ -2450,6 +2450,8 @@
       const label = a.label ? '<span class="alabel">' + esc(a.label) + "</span>" : "";
       // "main" (the parent conversation) has no separate transcript to open.
       if (a.type === "main" && !a.label) return '<div class="cc-agent main">' + dot + type + "</div>";
+      // Nor does a background shell — it is a command, not a conversation.
+      if (a.type === "shell") return '<div class="cc-agent main">' + dot + type + label + "</div>";
       return '<button type="button" class="cc-agent" data-atype="' + esc(a.type) +
         '" data-alabel="' + esc(a.label || "") + '">' + dot + type + label + "</button>";
     });

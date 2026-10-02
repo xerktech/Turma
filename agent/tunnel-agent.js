@@ -991,7 +991,12 @@ const LIVE_AGENTS_MAX = 32;
 // `isAsync` is deliberately not required (it would exclude `Workflow`).
 function asyncLaunch(entry) {
   const tur = entry && entry.toolUseResult;
-  if (!tur || typeof tur !== "object" || tur.status !== "async_launched") return null;
+  if (!tur || typeof tur !== "object") return null;
+  // A background shell (`Bash` run_in_background, or moved there on timeout).
+  if (typeof tur.backgroundTaskId === "string" && tur.backgroundTaskId) {
+    return { id: tur.backgroundTaskId, type: "shell", label: "" };
+  }
+  if (tur.status !== "async_launched") return null;
   const ident = tur.agentId || tur.taskId;
   if (!ident) return null;
   if (tur.taskType === "local_workflow") {
@@ -1006,14 +1011,21 @@ function scanAgentEntry(entry, state) {
   if (!entry || typeof entry !== "object" || !state) return;
   const live = state.live || (state.live = new Map());
   const tasks = state.tasks || (state.tasks = new Map());
+  const shells = state.shells || (state.shells = new Map());
   const stopped = state.stopped || (state.stopped = new Set());
   const content = entry.message && entry.message.content;
   let toolId = null;
   if (Array.isArray(content)) {
     for (const block of content) {
       if (!block || typeof block !== "object") continue;
+      if (block.type === "tool_use" && block.name === "Bash" && block.id) {
+        // Any Bash call can end up in the background; its description (or
+        // command) labels the shell row.
+        const inp = block.input || {};
+        shells.set(block.id, String(inp.description || inp.command || "").trim().slice(0, 200));
+        while (shells.size > LIVE_AGENTS_MAX * 4) shells.delete(shells.keys().next().value);
       // `Agent` in current Claude Code, `Task` in older transcripts — both.
-      if (block.type === "tool_use" && (block.name === "Agent" || block.name === "Task") && block.id) {
+      } else if (block.type === "tool_use" && (block.name === "Agent" || block.name === "Task") && block.id) {
         const atype = String((block.input || {}).subagent_type || "").trim();
         if (atype) {
           tasks.set(block.id, atype);
@@ -1029,19 +1041,28 @@ function scanAgentEntry(entry, state) {
     // A stop already seen wins over a later-read launch: a notification can be
     // written at an EARLIER file offset than the launch it refers to. The
     // call's subagent_type is the only place a real agent TYPE appears.
-    live.set(launch.id, { type: tasks.get(toolId) || launch.type, label: launch.label });
+    live.set(launch.id, launch.type === "shell"
+      ? { type: "shell", label: shells.get(toolId) || "" }
+      : { type: tasks.get(toolId) || launch.type, label: launch.label });
   }
   // Never an ASSISTANT turn — a session merely QUOTING a notification must not
   // retire an agent that is still running.
   if (entry.type !== "assistant") {
+    const done = [];
     for (const text of entryTextsForScan(entry)) {
       const tn = parseTaskNotification(text);
       if (!tn || !tn.taskId) continue;
-      if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) {
-        live.delete(tn.taskId);
-        stopped.add(tn.taskId);
-        while (stopped.size > LIVE_AGENTS_MAX * 4) stopped.delete(stopped.values().next().value);
-      }
+      if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) done.push(tn.taskId);
+    }
+    // A `TaskStop` the session ran itself: no notification follows it.
+    const tur = entry.toolUseResult;
+    if (tur && typeof tur === "object" && typeof tur.task_id === "string" && tur.task_id && tur.task_type) {
+      done.push(tur.task_id);
+    }
+    for (const id of done) {
+      live.delete(id);
+      stopped.add(id);
+      while (stopped.size > LIVE_AGENTS_MAX * 4) stopped.delete(stopped.values().next().value);
     }
   }
 }

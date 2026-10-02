@@ -469,7 +469,8 @@ private fun AgentsList(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         agents.forEach { a ->
-            val isMain = a.type == "main" && a.label.isBlank()
+            // A background shell has no transcript to open either (web agentsHtml).
+            val isMain = (a.type == "main" && a.label.isBlank()) || a.type == "shell"
             val rowMod = Modifier.fillMaxWidth()
                 .clip(RoundedCornerShape(5.dp))
                 .then(if (isMain) Modifier else Modifier.clickable { onOpenSubagent(a.type, a.label) })

@@ -258,6 +258,11 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     duration. A workflow reports `type:"workflow"` + `workflowName`; same stop edge.
   - **The tool is named `Agent` now, `Task` in older transcripts — match both.** No `subagent_type`
     on a background launch, so the row's type falls back to `agent` (wildcard match on description).
+  - **A background SHELL is a `shell` row** — a Bash result carrying `backgroundTaskId`
+    (run_in_background, or moved there on timeout). Same `<task-notification>` stop edge; label is
+    the call's `description`. It has no transcript, so clients render it non-clickable.
+  - **`TaskStop` is a third stop edge** — its structured result carries `task_id` + `task_type` and
+    no notification follows, so without it a stopped shell/agent stays live.
   - **A `workflow` row resolves to a RUN, not a conversation** (XERK-304, no transcript of its own):
     `agent-workflows.md`.
   - **A stop already seen beats a later-read launch** (`stoppedAgents`) — the queued copy can sit at

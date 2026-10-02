@@ -282,8 +282,11 @@ private val QA_AGENT_TYPES = setOf("qa", "qa-delta")
 fun liveStateLabel(state: LiveState, live: LiveSignals?): String {
     if (state == LiveState.WORKING && hasLiveAgents(live)) {
         if (live?.agents?.any { it.type in QA_AGENT_TYPES } == true) return "QA Review"
-        val n = live?.agents?.size ?: 0
-        return if (n == 1) "1 background agent" else "$n background agents"
+        val rows = live?.agents.orEmpty()
+        // A background shell rides `agents` as a `shell` row (web backgroundWorkLabel).
+        val shells = rows.count { it.type == "shell" }
+        val noun = if (shells == 0) "agent" else if (shells == rows.size) "shell" else "task"
+        return "${rows.size} background $noun" + if (rows.size == 1) "" else "s"
     }
     return liveStateLabel(state)
 }

@@ -1469,6 +1469,23 @@ test("scanAgentEntry: a launch makes an agent live, named by its own record", ()
 // any tool that reads a transcript, and an id from ANOTHER session can never
 // receive its notification here — so a text match registered a phantom that
 // never cleared. Worse than the pane rows it replaced, which self-cleared.
+test("scanAgentEntry: a background shell is live work until its stop edge", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const launch = [
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_s1", name: "Bash",
+      input: { command: "gh pr checks 1 --watch", description: "Watch CI", run_in_background: true } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "toolu_s1", content: "x" }] },
+      toolUseResult: { stdout: "", stderr: "", interrupted: false, isImage: false, backgroundTaskId: "bsh1" } },
+  ];
+  assert.deepEqual(liveAgentsReport(scanAll(launch)), [{ type: "shell", label: "Watch CI" }]);
+  const notified = scanAll([...launch, { type: "queue-operation", operation: "enqueue",
+    content: "<task-notification>\n<task-id>bsh1</task-id>\n<status>completed</status>\n<summary>done</summary>\n</task-notification>" }]);
+  assert.deepEqual(liveAgentsReport(notified), []);
+  const stopped = scanAll([...launch, { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "k", content: "{}" }] },
+    toolUseResult: { message: "Successfully stopped task: bsh1", task_id: "bsh1", task_type: "local_bash" } }]);
+  assert.deepEqual(liveAgentsReport(stopped), []);
+});
+
 test("scanAgentEntry: loose agentId text in tool output registers nothing", () => {
   const { liveAgentsReport } = require("../tunnel-agent.js");
   const st = scanAll([{ type: "user",
