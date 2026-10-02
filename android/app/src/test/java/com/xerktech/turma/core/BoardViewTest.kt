@@ -199,6 +199,18 @@ class BoardViewTest {
         assertEquals(listOf("none"), g("session").map { it.value })
     }
 
+    @Test fun hiddenDoneTicketsDontCount() {
+        val tickets = listOf(
+            tk(key = "A-1", type = "Bug"),
+            tk(key = "A-2", type = "Bug", statusCategory = "done"),
+            tk(key = "A-3", type = "Story", statusCategory = "done"),
+        )
+        fun type(v: BoardView) = boardFilterGroups(listOf(site(tickets)), v, emptyMap(), emptyList(), now)
+            .first { it.field == "type" }.options.map { it.value to it.count }
+        assertEquals(listOf("Bug" to 2, "Story" to 1), type(BoardView()))
+        assertEquals(listOf("Bug" to 1), type(BoardView(hideDone = true)))
+    }
+
     @Test fun toggleAddsAndRemoves() {
         val v1 = toggleBoardFilter(BoardView(), "type", "Bug")
         assertEquals(mapOf("type" to listOf("Bug")), v1.f)

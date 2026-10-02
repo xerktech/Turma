@@ -221,6 +221,9 @@ function fitChips() {
     more.textContent = `+${hidden} more`;
     more.title = `${hidden} more active filter${hidden === 1 ? "" : "s"} — open Filters`;
   }
+  // Not even "+N more" fits: show nothing rather than a clipped chip — the
+  // Filters badge already carries the count.
+  if (more && $filterChips.scrollWidth > $filterChips.clientWidth) more.hidden = true;
 }
 window.addEventListener("resize", () => fitChips());
 

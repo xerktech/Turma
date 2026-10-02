@@ -276,6 +276,8 @@
     const epicNames = new Map();   // an epic on the board labels its option by summary
     for (const site of sites || []) {
       for (const t of site.tickets || []) {
+        // A hidden Done column hides its tickets, so they don't count either.
+        if (view && view.hideDone && categoryOf(t) === "done") continue;
         if (isEpicTicket(t) && t.key && t.summary) epicNames.set(String(t.key), `${t.key} · ${t.summary}`);
         const facets = ticketFacets(t, site, ctx);
         for (const [field] of FILTER_FIELDS) {

@@ -233,6 +233,8 @@ fun boardFilterGroups(
     val counts = FILTER_FIELDS.associate { it.first to LinkedHashMap<String, Int>() }
     val epicNames = HashMap<String, String>()
     for (site in sites) for (t in site.tickets) {
+        // A hidden Done column hides its tickets, so they don't count either.
+        if (view.hideDone && categoryOf(t) == "done") continue
         if (isEpicTicket(t) && t.key.isNotEmpty() && t.summary.isNotEmpty()) epicNames[t.key] = "${t.key} · ${t.summary}"
         val facets = ticketFacets(t, site.siteKey, sessionIndex, queue, now)
         for ((field, _) in FILTER_FIELDS) {

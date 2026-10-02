@@ -188,6 +188,18 @@ test("boardFilterGroups: counts, ordering, epic names and a stale selection", ()
   assert.deepEqual(g("session").map(o => o.value), ["none"], "fixed vocab shows only present values");
 });
 
+test("boardFilterGroups: a hidden Done column's tickets don't count", () => {
+  const tickets = [
+    tk({ key: "A-1", type: "Bug" }),
+    tk({ key: "A-2", type: "Bug", statusCategory: "done", status: "Done" }),
+    tk({ key: "A-3", type: "Story", statusCategory: "done", status: "Done" }),
+  ];
+  const type = (view) => boardFilterGroups([site(tickets)], view, ctx)
+    .find(g => g.field === "type").options.map(o => [o.value, o.count]);
+  assert.deepEqual(type(emptyBoardView()), [["Bug", 2], ["Story", 1]]);
+  assert.deepEqual(type(Object.assign(emptyBoardView(), { hideDone: true })), [["Bug", 1]]);
+});
+
 test("view <-> URL: round-trips, drops junk, keeps defaults out", () => {
   const p = new URLSearchParams("q=api&type=Bug&type=Story&type=Bug&sort=priority&rev=1&done=0&nope=1&label=");
   const v = boardViewFromParams(p);
