@@ -209,6 +209,12 @@ class BoardViewTest {
             .first { it.field == "type" }.options.map { it.value to it.count }
         assertEquals(listOf("Bug" to 2, "Story" to 1), type(BoardView()))
         assertEquals(listOf("Bug" to 1), type(BoardView(hideDone = true)))
+        // A Done epic still names its open child's option when Done is hidden.
+        val withEpic = tickets + tk(key = "E-9", isEpic = true, summary = "Shipped", statusCategory = "done") +
+            tk(key = "A-4", epicKey = "E-9")
+        val epic = boardFilterGroups(listOf(site(withEpic)), BoardView(hideDone = true), emptyMap(), emptyList(), now)
+            .first { it.field == "epic" }.options.first { it.value == "E-9" }
+        assertEquals("E-9 · Shipped", epic.label)
     }
 
     @Test fun toggleAddsAndRemoves() {

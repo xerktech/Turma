@@ -198,6 +198,13 @@ test("boardFilterGroups: a hidden Done column's tickets don't count", () => {
     .find(g => g.field === "type").options.map(o => [o.value, o.count]);
   assert.deepEqual(type(emptyBoardView()), [["Bug", 2], ["Story", 1]]);
   assert.deepEqual(type(Object.assign(emptyBoardView(), { hideDone: true })), [["Bug", 1]]);
+  // A Done epic still names its open child's option when Done is hidden.
+  const withEpic = [...tickets,
+    tk({ key: "E-9", isEpic: true, summary: "Shipped", statusCategory: "done", status: "Done" }),
+    tk({ key: "A-4", epicKey: "E-9" })];
+  const epic = boardFilterGroups([site(withEpic)], Object.assign(emptyBoardView(), { hideDone: true }), ctx)
+    .find(g => g.field === "epic").options.find(o => o.value === "E-9");
+  assert.equal(epic.label, "E-9 · Shipped");
 });
 
 test("view <-> URL: round-trips, drops junk, keeps defaults out", () => {
