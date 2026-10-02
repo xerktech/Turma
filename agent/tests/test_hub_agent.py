@@ -3719,6 +3719,23 @@ TASK_LAUNCH_ENTRIES = [
 ]
 
 
+# A background shell, as Claude Code records it: the Bash call, then its result
+# carrying `backgroundTaskId` — the same shape when a foreground call is MOVED to
+# the background on its timeout.
+SHELL_LAUNCH_ENTRIES = [
+    {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "toolu_s1", "name": "Bash",
+         "input": {"command": "gh pr checks 1 --watch", "description": "Watch CI",
+                   "run_in_background": True}}]}},
+    {"type": "user",
+     "message": {"content": [
+         {"type": "tool_result", "tool_use_id": "toolu_s1",
+          "content": "Command running in background with ID: bsh1. Output is being written to: /tmp/x"}]},
+     "toolUseResult": {"stdout": "", "stderr": "", "interrupted": False, "isImage": False,
+                       "noOutputExpected": False, "backgroundTaskId": "bsh1"}},
+]
+
+
 class TestLiveAgentsScan(unittest.TestCase):
     """_scan_agent_entry — which background agents are in flight, off the
     transcript's own launch/stop edges. The TUI footer is NOT the source: its
@@ -3734,6 +3751,70 @@ class TestLiveAgentsScan(unittest.TestCase):
         st = self._scan(TASK_LAUNCH_ENTRIES)
         self.assertEqual(ha.live_agents_report(st),
                          [{"type": "agent", "label": "QA the parity change"}])
+
+
+    def test_a_background_shell_is_live_work(self):
+        # The TUI footer says "1 shell" while the session otherwise reads idle.
+        st = self._scan(SHELL_LAUNCH_ENTRIES)
+        self.assertEqual(ha.live_agents_report(st), [{"type": "shell", "label": "Watch CI"}])
+
+    def test_a_background_shell_stops_on_its_notification(self):
+        st = self._scan(SHELL_LAUNCH_ENTRIES + [
+            {"type": "queue-operation", "operation": "enqueue",
+             "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                        "<status>completed</status>\n<summary>Background command done</summary>\n"
+                        "</task-notification>"}])
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_task_stop_retires_the_task(self):
+        # TaskStop writes no notification; its structured result is the stop edge.
+        st = self._scan(SHELL_LAUNCH_ENTRIES + [
+            {"type": "user",
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_k",
+                                      "content": "{}"}]},
+             "toolUseResult": {"message": "Successfully stopped task: bsh1",
+                               "task_id": "bsh1", "task_type": "local_bash"}}])
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_one_restart_notification_retires_every_shell_it_names(self):
+        # After a Claude restart, ONE notification reports every still-running
+        # shell plus an orphan-summary sentinel; retiring only the first id left
+        # the rest live (WORKING) forever.
+        launches = []
+        for i in ("bsh1", "bsh2", "bsh3"):
+            launches.append({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t" + i}]},
+                "toolUseResult": {"stdout": "", "backgroundTaskId": i}})
+        st = self._scan(launches)
+        self.assertEqual(len(ha.live_agents_report(st)), 3)
+        st = self._scan([{"type": "queue-operation", "operation": "enqueue",
+                          "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                                     "<task-id>bsh2</task-id>\n<task-id>bsh3</task-id>\n"
+                                     "<task-id>__orphan_summary__:shell</task-id>\n"
+                                     "<status>stopped</status>\n</task-notification>"}], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+        # The sentinel is not a task: it never reaches `taskIds`.
+        tn = ha._parse_task_notification(
+            "<task-notification><task-id>bsh1</task-id><task-id>__orphan_summary__:shell</task-id>"
+            "<status>stopped</status></task-notification>")
+        self.assertEqual(tn["taskIds"], ["bsh1"])
+
+    def test_shells_never_crowd_out_a_later_agent(self):
+        shells = [{"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t%d" % i}]},
+            "toolUseResult": {"stdout": "", "backgroundTaskId": "bs%d" % i}}
+            for i in range(ha.LIVE_AGENTS_MAX + 5)]
+        st = self._scan(shells + TASK_LAUNCH_ENTRIES)
+        rows = ha.live_agents_report(st)
+        self.assertEqual(sum(r["type"] == "shell" for r in rows), ha.LIVE_AGENTS_MAX // 2)
+        self.assertIn({"type": "agent", "label": "QA the parity change"}, rows)
+
+    def test_a_foreground_bash_result_registers_nothing(self):
+        st = self._scan([
+            {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t"}]},
+             "toolUseResult": {"stdout": "backgroundTaskId: bx", "stderr": "",
+                               "interrupted": False, "isImage": False}}])
+        self.assertEqual(ha.live_agents_report(st), [])
 
     def test_the_subagent_type_names_the_row_when_the_call_carries_one(self):
         # Older `Task` calls do; today's background `Agent` calls do not.
@@ -3920,6 +4001,7 @@ class TestTaskNotification(unittest.TestCase):
             # The id is what makes this a usable STOPPED edge for the live-agent
             # scan, not just display text (XERK-245).
             "taskId": "af9e62627de15eaf4",
+            "taskIds": ["af9e62627de15eaf4"],
         })
 
     def test_non_notification_text_is_not_parsed(self):

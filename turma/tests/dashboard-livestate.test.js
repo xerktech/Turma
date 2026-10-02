@@ -85,6 +85,21 @@ test("dashboard liveState: background agents read as working and are named", () 
   assert.equal(many.label, "2 background agents");
 });
 
+// A background shell (Bash run_in_background) rides `agents` as a `shell` row:
+// the session is working, and the label says what kind of work it is.
+test("dashboard liveState: a background shell reads as working and is named", () => {
+  const { liveState } = loadDashboard();
+  const shell = liveState(
+    sess({ paneBusy: false, transcriptAgeSec: 900, agents: [{ type: "shell", label: "Watch CI" }] }),
+    onlineHost, NOW);
+  assert.equal(shell.label, "1 background shell");
+  assert.equal(shell.cls, "sess-working");
+  const mixed = liveState(
+    sess({ paneBusy: false, transcriptAgeSec: 900, agents: [{ type: "shell" }, { type: "Explore" }] }),
+    onlineHost, NOW);
+  assert.equal(mixed.label, "2 background tasks");
+});
+
 // XERK-538: a QA / QA-delta pass reads "QA Review" while staying working (Active).
 test("dashboard liveState: a QA agent reads 'QA Review' and stays working", () => {
   const { liveState } = loadDashboard();

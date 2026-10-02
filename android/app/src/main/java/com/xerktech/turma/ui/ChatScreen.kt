@@ -431,7 +431,8 @@ private fun BackgroundAgentsBar(
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 CircularProgressIndicator(Modifier.size(11.dp), strokeWidth = 2.dp)
                 Text(
-                    "Background agents…",
+                    // A background shell is not an agent (web chat.js mirrors this).
+                    if (agents.any { it.type == "shell" }) "Background tasks…" else "Background agents…",
                     fontWeight = FontWeight.SemiBold,
                     style = MaterialTheme.typography.bodySmall,
                 )
@@ -469,7 +470,8 @@ private fun AgentsList(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         agents.forEach { a ->
-            val isMain = a.type == "main" && a.label.isBlank()
+            // A background shell has no transcript to open either (web agentsHtml).
+            val isMain = (a.type == "main" && a.label.isBlank()) || a.type == "shell"
             val rowMod = Modifier.fillMaxWidth()
                 .clip(RoundedCornerShape(5.dp))
                 .then(if (isMain) Modifier else Modifier.clickable { onOpenSubagent(a.type, a.label) })

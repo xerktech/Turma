@@ -55,6 +55,16 @@ class SessionsTest {
             com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, one))
         assertEquals("2 background agents",
             com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, two))
+        // A background shell rides `agents` as a `shell` row (web backgroundWorkLabel).
+        val shell = LiveSignals(agents = listOf(com.xerktech.turma.model.LiveAgent(type = "shell")))
+        assertEquals("1 background shell",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, shell))
+        val mixed = LiveSignals(agents = listOf(
+            com.xerktech.turma.model.LiveAgent(type = "shell"),
+            com.xerktech.turma.model.LiveAgent(type = "Explore"),
+        ))
+        assertEquals("2 background tasks",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, mixed))
         // No agents, or a state that isn't WORKING: the plain state word.
         assertEquals("working",
             com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, LiveSignals()))

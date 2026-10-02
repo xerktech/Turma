@@ -347,6 +347,18 @@ test("background agents: the count is pluralized, and an empty list changes noth
   assert.ok(els.idle.innerHTML.includes("Quiet Task"));
 });
 
+test("a background shell keeps a session Active and is named as a shell", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    running("33333", "Shell Wait", {
+      paneBusy: false, transcriptAgeSec: 900, agents: [{ type: "shell", label: "Watch CI" }],
+    }),
+  ]);
+  render({ now, agents: [h] });
+  assert.ok(els.active.innerHTML.includes("1 background shell"));
+  assert.ok(!els.idle.innerHTML.includes("Shell Wait"));
+});
+
 // XERK-735. The card's second line reads repo · related ticket · pc name ·
 // session id, one line, and the ticket key links to that ticket's detail on the
 // board rather than out to Jira.

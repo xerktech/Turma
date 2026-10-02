@@ -2302,7 +2302,10 @@
       bar.hidden = false;
       bar.innerHTML =
         '<div class="cc-row"><span class="cc-spin"></span>' +
-        '<span class="verb">Background agents…</span></div>' + agents;
+        // A background shell is not an agent: name the bar for what is running.
+        '<span class="verb">Background ' +
+        (liveAgents.some((a) => a && a.type === "shell") ? "tasks" : "agents") +
+        '…</span></div>' + agents;
       wireAgentDelegation(bar);
       return;
     }
@@ -2450,6 +2453,8 @@
       const label = a.label ? '<span class="alabel">' + esc(a.label) + "</span>" : "";
       // "main" (the parent conversation) has no separate transcript to open.
       if (a.type === "main" && !a.label) return '<div class="cc-agent main">' + dot + type + "</div>";
+      // Nor does a background shell — it is a command, not a conversation.
+      if (a.type === "shell") return '<div class="cc-agent main">' + dot + type + label + "</div>";
       return '<button type="button" class="cc-agent" data-atype="' + esc(a.type) +
         '" data-alabel="' + esc(a.label || "") + '">' + dot + type + label + "</button>";
     });

@@ -7510,6 +7510,9 @@ def _tn_tag(name, body):
     return _edge_trim(ANSI_RE.sub("", m.group(1))) if m else ""
 
 
+TN_TASK_ID_RE = re.compile(r"<task-id>(.*?)</task-id>", re.DOTALL)
+
+
 def _parse_task_notification(text):
     """Parse a `<task-notification>` payload into {summary, status, result}, or
     None when `text` isn't one. Mirror of tunnel-agent.js parseTaskNotification."""
@@ -7527,6 +7530,11 @@ def _parse_task_notification(text):
         # as `agentId:`. It is what makes the notification a usable STOPPED edge
         # for the live-agent scan (XERK-245), not just display text.
         "taskId": _tn_tag("task-id", body),
+        # EVERY id it retires: after a Claude restart, one notification reports all
+        # the shells that were still running (plus an `__orphan_summary__:*`
+        # sentinel), and stopping only the first left the rest live forever.
+        "taskIds": [i for i in (_edge_trim(ANSI_RE.sub("", x)) for x in TN_TASK_ID_RE.findall(body))
+                    if i and not i.startswith("__orphan_summary__")],
     }
 
 
@@ -8346,7 +8354,18 @@ def _async_launch(entry):
     whose background runs are the longest-lived work on a host — a session
     running a background `code-review` read idle for its whole duration."""
     tur = entry.get("toolUseResult") if isinstance(entry, dict) else None
-    if not isinstance(tur, dict) or tur.get("status") != "async_launched":
+    if not isinstance(tur, dict):
+        return None
+    # A BACKGROUND SHELL — `Bash` with run_in_background, or one moved to the
+    # background on its timeout — records `backgroundTaskId` on the same kind of
+    # structured result, and stops on the same `<task-notification>` edge. It
+    # is work in flight that `paneBusy` cannot see either: the TUI footer says
+    # "1 shell" while the session otherwise reads idle. The label is filled
+    # from the call's `description` by _scan_agent_entry.
+    if isinstance(tur.get("backgroundTaskId"), str) and tur["backgroundTaskId"]:
+        return {"id": tur["backgroundTaskId"], "type": "shell", "label": "",
+                "resolveId": ""}
+    if tur.get("status") != "async_launched":
         return None
     ident = tur.get("agentId") or tur.get("taskId")
     if not ident:
@@ -8378,6 +8397,7 @@ def _scan_agent_entry(entry, state):
     fall back to an unnamed row."""
     live = state.setdefault("liveAgents", {})
     tasks = state.setdefault("agentTasks", {})
+    shells = state.setdefault("shellCalls", {})
     stopped = state.setdefault("stoppedAgents", [])
     msg = entry.get("message") if isinstance(entry, dict) else None
     content = msg.get("content") if isinstance(msg, dict) else None
@@ -8385,7 +8405,15 @@ def _scan_agent_entry(entry, state):
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") == "tool_use" and block.get("name") in ("Agent", "Task"):
+            if block.get("type") == "tool_use" and block.get("name") == "Bash" and block.get("id"):
+                # Any Bash call can end up in the background (run_in_background,
+                # or moved there on its timeout); its description — or, failing
+                # that, its command — labels the shell row.
+                inp = block.get("input") or {}
+                shells[block["id"]] = str(inp.get("description") or inp.get("command") or "").strip()[:200]
+                while len(shells) > LIVE_AGENTS_MAX * 4:
+                    shells.pop(next(iter(shells)))
+            elif block.get("type") == "tool_use" and block.get("name") in ("Agent", "Task"):
                 inp = block.get("input") or {}
                 atype = str(inp.get("subagent_type") or "").strip()
                 if block.get("id") and atype:
@@ -8395,6 +8423,11 @@ def _scan_agent_entry(entry, state):
                     while len(tasks) > LIVE_AGENTS_MAX * 4:
                         tasks.pop(next(iter(tasks)))
     launch = _async_launch(entry)
+    # Shells may fill at most HALF the rows, so a pile of them never crowds out a
+    # background agent launched later (a QA pass, say).
+    if launch and launch["type"] == "shell" \
+            and sum(1 for a in live.values() if a.get("type") == "shell") >= LIVE_AGENTS_MAX // 2:
+        launch = None
     if launch and len(live) < LIVE_AGENTS_MAX:
         # A notification can be WRITTEN BEFORE the launch it refers to (observed:
         # the queued copy lands at an earlier file offset than the launch, with a
@@ -8414,23 +8447,37 @@ def _scan_agent_entry(entry, state):
             # window the resolvers read. The JS mirror (scanAgentEntry) does not
             # carry it: resolution lives only here, and its liveAgentsReport emits
             # the same {type,label} rows onto the wire, so parity is unaffected.
-            live[launch["id"]] = {"type": tasks.get(tool_id) or launch["type"],
-                                  "label": launch["label"],
-                                  "resolveId": launch.get("resolveId") or ""}
+            if launch["type"] == "shell":
+                live[launch["id"]] = {"type": "shell", "label": shells.get(tool_id) or "",
+                                      "resolveId": ""}
+            else:
+                live[launch["id"]] = {"type": tasks.get(tool_id) or launch["type"],
+                                      "label": launch["label"],
+                                      "resolveId": launch.get("resolveId") or ""}
     # The notification rides a queued operation, the user turn it becomes once
     # dequeued, or an attachment — never an ASSISTANT turn, which is skipped so
     # that a session merely QUOTING a notification (this feature's own fixtures,
     # say) cannot retire an agent that is still running.
     if entry.get("type") != "assistant":
+        done = []
         for text in _entry_texts_for_scan(entry):
             tn = _parse_task_notification(text)
-            if not tn or not tn.get("taskId"):
+            if not tn or not tn.get("taskIds"):
                 continue
             if not tn.get("status") or tn["status"] in AGENT_DONE_STATUSES:
-                live.pop(tn["taskId"], None)
-                if tn["taskId"] not in stopped:
-                    stopped.append(tn["taskId"])
-                    del stopped[:-LIVE_AGENTS_MAX * 4]
+                done.extend(tn["taskIds"])
+        # The THIRD stop edge: a `TaskStop` the session ran itself. Its
+        # structured result names the task, and no notification follows it, so
+        # without this a stopped shell (or agent) stays live until restart.
+        tur = entry.get("toolUseResult")
+        if isinstance(tur, dict) and isinstance(tur.get("task_id"), str) and tur["task_id"] \
+                and tur.get("task_type"):
+            done.append(tur["task_id"])
+        for tid in done:
+            live.pop(tid, None)
+            if tid not in stopped:
+                stopped.append(tid)
+                del stopped[:-LIVE_AGENTS_MAX * 4]
 
 
 def _entry_texts_for_scan(entry):

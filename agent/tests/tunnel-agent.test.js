@@ -196,6 +196,7 @@ test("parseTaskNotification: extracts summary/status/result, ignores non-notific
     // The id is what makes this a usable STOPPED edge for the live-agent scan,
     // not just display text (XERK-245). Mirrors _parse_task_notification.
     taskId: "af9e62627de15eaf4",
+    taskIds: ["af9e62627de15eaf4"],
   });
   assert.equal(parseTaskNotification("just a normal prompt"), null);
   assert.equal(parseTaskNotification("talk about <task-notification> inline"), null);
@@ -1469,6 +1470,42 @@ test("scanAgentEntry: a launch makes an agent live, named by its own record", ()
 // any tool that reads a transcript, and an id from ANOTHER session can never
 // receive its notification here — so a text match registered a phantom that
 // never cleared. Worse than the pane rows it replaced, which self-cleared.
+test("scanAgentEntry: a background shell is live work until its stop edge", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const launch = [
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_s1", name: "Bash",
+      input: { command: "gh pr checks 1 --watch", description: "Watch CI", run_in_background: true } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "toolu_s1", content: "x" }] },
+      toolUseResult: { stdout: "", stderr: "", interrupted: false, isImage: false, backgroundTaskId: "bsh1" } },
+  ];
+  assert.deepEqual(liveAgentsReport(scanAll(launch)), [{ type: "shell", label: "Watch CI" }]);
+  const notified = scanAll([...launch, { type: "queue-operation", operation: "enqueue",
+    content: "<task-notification>\n<task-id>bsh1</task-id>\n<status>completed</status>\n<summary>done</summary>\n</task-notification>" }]);
+  assert.deepEqual(liveAgentsReport(notified), []);
+  const stopped = scanAll([...launch, { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "k", content: "{}" }] },
+    toolUseResult: { message: "Successfully stopped task: bsh1", task_id: "bsh1", task_type: "local_bash" } }]);
+  assert.deepEqual(liveAgentsReport(stopped), []);
+});
+
+test("scanAgentEntry: one restart notification retires every shell it names; shells cap at half", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const shell = (i) => ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t" + i }] },
+    toolUseResult: { stdout: "", backgroundTaskId: "bs" + i } });
+  const st = scanAll([shell(1), shell(2), shell(3)]);
+  scanAll([{ type: "queue-operation", operation: "enqueue",
+    content: "<task-notification>\n<task-id>bs1</task-id>\n<task-id>bs2</task-id>\n<task-id>bs3</task-id>\n" +
+      "<task-id>__orphan_summary__:shell</task-id>\n<status>stopped</status>\n</task-notification>" }], st);
+  assert.deepEqual(liveAgentsReport(st), []);
+  // The sentinel is not a task: it never reaches `taskIds`.
+  const { parseTaskNotification } = require("../tunnel-agent.js");
+  assert.deepEqual(parseTaskNotification("<task-notification><task-id>bs1</task-id>" +
+    "<task-id>__orphan_summary__:shell</task-id><status>stopped</status></task-notification>").taskIds, ["bs1"]);
+  const many = scanAll([...Array.from({ length: 40 }, (_, i) => shell(i + 10)), ...LAUNCH_ENTRIES]);
+  const rows = liveAgentsReport(many);
+  assert.equal(rows.filter((r) => r.type === "shell").length, 16);
+  assert.ok(rows.some((r) => r.type !== "shell"), "a later agent still registers");
+});
+
 test("scanAgentEntry: loose agentId text in tool output registers nothing", () => {
   const { liveAgentsReport } = require("../tunnel-agent.js");
   const st = scanAll([{ type: "user",
