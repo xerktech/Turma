@@ -2,7 +2,8 @@ import type { AgentInfo, PrInfo, SessionInfo, SessionRef } from "./types.ts";
 
 // "holding" (XERK-1570): every live background row is a WAITING shell (a sleep,
 // a CI watch) — not working, and not the operator's yet. Stalled waits read
-// "idle", so a dead shell surfaces like any finished session.
+// "idle", so a dead shell surfaces like any finished session. A session ASLEEP
+// until a session-CLI wake (XERK-1571) is "holding" too.
 export type LiveState = "working" | "waiting" | "holding" | "idle" | "stopped" | "error";
 
 // "pending" is not a live-server state — it's an app-layer overlay app.ts
@@ -39,7 +40,9 @@ export function liveState(
   // behaviour rather than reading every session as idle.
   if (live?.transcriptAgeSec == null) return "idle";
   if (hostLastSeen != null && (now ?? Date.now()) - hostLastSeen >= OFFLINE_AFTER_MS) {
-    return "idle";
+    // A sleep is not a pushed busy read: the hub honours a pending wake on an
+    // offline host too (sessionSleeping has no online gate), so this does.
+    return sleeping(live, now ?? Date.now()) ? "holding" : "idle";
   }
   // Background agents are what paneBusy cannot see (XERK-245): a session that
   // delegated work and ended its own turn paints no interrupt hint, so it read
@@ -53,6 +56,9 @@ export function liveState(
     : !hasLiveAgents(live) && live.transcriptAgeSec * 1000 < WORKING_WINDOW_MS;
   if (working) return "working";
   const t = now ?? Date.now();
+  // Asleep until a session-CLI wake (XERK-1571) — mirror of server.js
+  // sessionSleeping: never ready for review until the wake is due.
+  if (sleeping(live, t)) return "holding";
   const wait = backgroundWait(live?.agents, (hostLastSeen ?? t) - live.transcriptAgeSec * 1000, t);
   return wait?.state === "waiting" ? "holding" : "idle";
 }
@@ -63,6 +69,12 @@ type LiveAgentRow = NonNullable<NonNullable<SessionInfo["session"]>["agents"]>[n
 // or an agent predating the field — is work.
 export function isWaitRow(a: LiveAgentRow | null | undefined): boolean {
   return !!a && (a.kind === "wait-timed" || a.kind === "wait-external");
+}
+
+// A session-CLI wake still in the future (XERK-1571).
+export function sleeping(live: SessionInfo["session"], now: number): boolean {
+  const w = live?.wakeAt;
+  return typeof w === "number" && Number.isSafeInteger(w) && w > now;
 }
 
 // Does the session have background WORK in flight (any row that isn't a wait)?

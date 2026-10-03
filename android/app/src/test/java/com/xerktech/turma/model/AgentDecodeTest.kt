@@ -169,6 +169,33 @@ class AgentDecodeTest {
         assertNull(rows[1].eta)
     }
 
+    // XERK-1571: the hub-stamped `attention` and the session-CLI `wakeAt`/
+    // `wakeReason` are TYPED, so the decode is pinned; absent decodes to null.
+    @Test fun `a session's attention and wake decode, null when absent`() {
+        val body = """
+            { "now": 1, "agents": [ { "key": "h", "device": "h", "online": true,
+                "sessions": [
+                  { "id": "s1", "attention": { "state": "sleeping", "since": 1700000000000,
+                      "eta": 1700000600000, "why": "check CI" },
+                    "session": { "wakeAt": 1700000600000, "wakeReason": "check CI" } },
+                  { "id": "s2", "attention": { "state": "needs-you:review", "since": 1700000000000 },
+                    "session": { } },
+                  { "id": "s3" }
+                ] } ] }
+        """.trimIndent()
+        val s = TurmaJson.decodeFromString<AgentsResponse>(body).agents[0].sessions
+        assertEquals("sleeping", s[0].attention!!.state)
+        assertEquals(1700000000000L, s[0].attention!!.since)
+        assertEquals(1700000600000L, s[0].attention!!.eta)
+        assertEquals("check CI", s[0].attention!!.why)
+        assertEquals(1700000600000L, s[0].session!!.wakeAt)
+        assertEquals("check CI", s[0].session!!.wakeReason)
+        assertNull(s[1].attention!!.eta)
+        assertNull(s[1].attention!!.why)
+        assertNull(s[1].session!!.wakeAt)
+        assertNull(s[2].attention)
+    }
+
     // XERK-544: the hub-derived auto-start-paused flag. Emitted only when true,
     // so the default `false` must cover an absent field (an older hub, or any
     // host not past the weekly pace line) — typing it makes a wrong value

@@ -183,6 +183,7 @@ const {
   wsAccept, wsEncode, wsParser, WS_FRAME_MAX, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   sessionWait, backgroundWait, ATTENTION_WAIT_STALL_MS, WAIT_ETA_GRACE_MS,
+  sessionAttention, sessionSleeping,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
   termRetryReset, terminalFail, terminalReconnectPage, TERM_AGENT_IDLE_MS,
   armChannelIdleTimeout,
@@ -1161,7 +1162,7 @@ test("XERK-1570: a wait stalls past its ETA or after ATTENTION_WAIT_STALL_MIN of
   assert.deepEqual(backgroundWait([], now, now), null);
 });
 
-test("XERK-1570: a waiting session is not alerted ready for review; once stalled it is", () => {
+test("XERK-1570: a waiting session is not alerted ready for review; once stalled it is alerted stalled", () => {
   const beat = makeHost();
   const now = Date.now();
   const sess = (ageSec, agents) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
@@ -1173,7 +1174,161 @@ test("XERK-1570: a waiting session is not alerted ready for review; once stalled
   beat(sess(5, ci), now + 20000);    // ended its turn to watch CI: waiting, no buzz
   assert.deepEqual(titles(), []);
   beat(sess(46 * 60, ci), now + 46 * WMIN); // silent past the stall: surfaces
-  assert.deepEqual(titles(), ["nas-repo-s1 is ready for review"]);
+  // XERK-1571: the stalled alert, not the review one (precedence stalled > review).
+  assert.deepEqual(titles(), ["nas-repo-s1 has stalled"]);
+});
+
+// ---- XERK-1571: attention state per session ------------------------------------
+
+test("XERK-1571: sessionAttention derives every state in precedence order", () => {
+  const now = Date.now();
+  const done = { paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false };
+  const s = (live, extra = {}) => ({ id: "s1", status: "running", session: { ...done, ...live }, ...extra });
+  const att = (sess) => sessionAttention(sess, sessionWorking(sess, now, now), sessionWait(sess, now, now), now);
+  const ci = { type: "shell", label: "Watch CI", kind: "wait-external" };
+  const timed = { type: "shell", label: "Sleep", kind: "wait-timed", eta: now + 10 * WMIN };
+  assert.deepEqual(att(s({ question: "Ship it?" })), { state: "needs-you:question", why: "Ship it?" });
+  assert.deepEqual(att(s({ panePrompt: { prompt: "Allow rm?" } })), { state: "needs-you:permission", why: "Allow rm?" });
+  // A question outranks everything below it, stalled included.
+  assert.equal(att(s({ question: "Q", transcriptAgeSec: 50 * 60, agents: [ci] })).state, "needs-you:question");
+  assert.deepEqual(att(s({ paneBusy: true })), { state: "working" });
+  // Sleeping: a wake still ahead — never review, carries the wake as eta + why.
+  assert.deepEqual(att(s({ wakeAt: now + 20 * WMIN, wakeReason: "check CI" })),
+    { state: "sleeping", eta: now + 20 * WMIN, why: "check CI" });
+  // ...and a wake already due no longer sleeps (the beat is about to deliver it).
+  assert.equal(att(s({ wakeAt: now - 1000 })).state, "needs-you:review");
+  assert.deepEqual(att(s({ agents: [timed] })), { state: "waiting", eta: now + 10 * WMIN, why: "Sleep" });
+  assert.deepEqual(att(s({ agents: [ci] })), { state: "waiting", why: "Watch CI" });
+  assert.deepEqual(att(s({ agents: [ci], transcriptAgeSec: 46 * 60 })), { state: "needs-you:stalled", why: "Watch CI" });
+  // Review splits on the existing inputs: the PR and its CI, or nothing to merge.
+  assert.deepEqual(att(s({})), { state: "needs-you:review", why: "finished · nothing to merge" });
+  const pr = (extra) => s({}, { prs: [{ url: "u", state: "OPEN", ...extra }] });
+  assert.equal(att(pr({ checks: "passing" })).why, "PR open · CI passing");
+  assert.equal(att(pr({ checks: "failing" })).why, "PR open · CI failing");
+  assert.equal(att(pr({ checks: "pending" })).why, "PR open · CI running");
+  assert.equal(att(pr({ checks: "passing", mergeable: "CONFLICTING" })).why, "PR open · merge conflict");
+  assert.equal(att(pr({})).why, "PR open");
+  // needs-you:test is reserved for the classifier (XERK-1572): nothing produces it.
+  assert.equal(att(s({ lastRole: "user" })).state, "idle");
+  assert.deepEqual(att({ id: "s1", status: "stopped", session: done }), { state: "idle" });
+});
+
+test("XERK-1571: a sleeping session is never ready for review", () => {
+  const now = Date.now();
+  const sess = { id: "s1", status: "running", prs: [{ url: "u", state: "OPEN" }], session: {
+    paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false, wakeAt: now + WMIN } };
+  assert.equal(readyForReview(sess, false, null, now), false);
+  assert.equal(readyForReview(sess, false, null, now + 2 * WMIN), true);
+  assert.equal(sessionSleeping(sess.session, now), true);
+  assert.equal(sessionSleeping({ wakeAt: "soon" }, now), false);
+  // A question still outranks the sleep — blocked on a human either way.
+  assert.equal(readyForReview({ ...sess, session: { ...sess.session, question: "Q" } }, false, null, now), true);
+});
+
+test("XERK-1571: attention `since` is the edge time, kept in alerts.sessions and swept with the session", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  const sess = (live) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
+    session: { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false, ...live } }] });
+  let rec = beat(sess({ paneBusy: true }), t0);
+  assert.deepEqual(rec.alerts.sessions.s1.attn, { state: "working", since: t0 });
+  rec = beat(sess({ paneBusy: true }), t0 + 20000);
+  assert.equal(rec.alerts.sessions.s1.attn.since, t0, "same state keeps its edge");
+  rec = beat(sess({}), t0 + 40000);
+  assert.deepEqual(rec.alerts.sessions.s1.attn,
+    { state: "needs-you:review", why: "finished · nothing to merge", since: t0 + 40000 });
+  rec = beat(sess({}), t0 + 60000);
+  assert.equal(rec.alerts.sessions.s1.attn.since, t0 + 40000);
+  rec = beat({ sessions: [] }, t0 + 80000);
+  assert.equal(rec.alerts.sessions.s1, undefined, "swept with liveIds");
+});
+
+test("XERK-1571: the stalled alert fires once per edge, is retracted on recovery, and a question outranks it", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  const ci = [{ type: "shell", label: "Watch CI", kind: "wait-external" }];
+  const sess = (live) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
+    session: { paneBusy: false, lastRole: "assistant", lastHasToolUse: false, ...live } }] });
+  notifications.length = 0;
+  beat(sess({ paneBusy: true, transcriptAgeSec: 1 }), t0);
+  beat(sess({ transcriptAgeSec: 5, agents: ci }), t0 + 20000);                // waiting
+  beat(sess({ transcriptAgeSec: 46 * 60, agents: ci }), t0 + 46 * WMIN);       // stalled
+  assert.deepEqual(titles(), ["nas-repo-s1 has stalled"]);
+  const sent = notifications.find((n) => n.title === "nas-repo-s1 has stalled");
+  assert.equal(sent.data.notifKey, "stalled:host1:s1");
+  assert.match(sent.body, /Watch CI/);
+  beat(sess({ transcriptAgeSec: 47 * 60, agents: ci }), t0 + 47 * WMIN);       // still stalled: no re-fire
+  assert.deepEqual(titles(), ["nas-repo-s1 has stalled"]);
+  assert.deepEqual(dismisses(), []);
+  // Recovery (the shell came back, the session works again): retracted, once.
+  beat(sess({ paneBusy: true, transcriptAgeSec: 1 }), t0 + 48 * WMIN);
+  beat(sess({ paneBusy: true, transcriptAgeSec: 1 }), t0 + 49 * WMIN);
+  assert.deepEqual(dismisses(), ["stalled:host1:s1"]);
+
+  // A question pending outranks stalled: the session's attention IS the question.
+  const b2 = makeHost();
+  notifications.length = 0;
+  b2(sess({ paneBusy: true, transcriptAgeSec: 1 }), t0);
+  b2(sess({ transcriptAgeSec: 5, agents: ci }), t0 + 20000);
+  const rec = b2(sess({ transcriptAgeSec: 46 * 60, agents: ci, question: "Keep waiting?" }), t0 + 46 * WMIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 has a question"]);
+  assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:question");
+});
+
+test("XERK-1571: sleeping and waiting never alert", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  const sess = (live) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
+    session: { paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false, ...live } }] });
+  notifications.length = 0;
+  beat(sess({ paneBusy: true }), t0);
+  // Ends its turn having asked to be woken in 30 minutes: asleep, no review alert.
+  beat(sess({ wakeAt: t0 + 30 * WMIN, wakeReason: "check CI" }), t0 + 20000);
+  beat(sess({ wakeAt: t0 + 30 * WMIN, wakeReason: "check CI", transcriptAgeSec: 20 * 60 }), t0 + 20 * WMIN);
+  assert.deepEqual(titles(), []);
+});
+
+test("XERK-1571: serializeAgent stamps attention on a CLONE, and a forged one never reaches the wire", async () => {
+  const now = Date.now();
+  const rec = {
+    device: "attn-host", lastSeen: now,
+    sessions: [{ id: "s1", status: "running", attention: { state: "needs-you:review", since: 1 } },
+               { id: "s2", status: "running" }, { id: "s3", status: "running" },
+               { id: "s4", status: "running", attention: { state: "needs-you:question", since: 1 } }],
+    alerts: { sessions: {
+      s1: { attn: { state: "sleeping", since: now - 5000, eta: now + WMIN, why: "check CI" } },
+      // A corrupt/hand-edited restore: wrong-typed fields are dropped, a bad state omits it.
+      s2: { attn: { state: "working", since: now - 1000, eta: "soon", why: 7 } },
+      s3: { attn: { state: "napping", since: now } },
+    } },
+  };
+  const out = hub.serializeAgent("attn-host", rec, now);
+  assert.deepEqual(out.sessions[0].attention, { state: "sleeping", since: now - 5000, eta: now + WMIN, why: "check CI" });
+  assert.deepEqual(out.sessions[1].attention, { state: "working", since: now - 1000 });
+  assert.equal("attention" in out.sessions[2], false);
+  assert.equal("attention" in out.sessions[3], false, "a record's own attention is never served");
+  // Never mutated into the stored record (the forged one there is left to normalizeSessions).
+  assert.notEqual(out.sessions, rec.sessions);
+  assert.equal("attention" in rec.sessions[1], false);
+  assert.deepEqual(rec.sessions[0].attention, { state: "needs-you:review", since: 1 });
+
+  // Ingest strips an agent-asserted attention (normalizeSessions), and the served
+  // one is the hub's own read.
+  const host = "attn-forge";
+  const r = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [{ id: "s1", status: "running",
+      attention: { state: "needs-you:question", since: 1, why: "forged" },
+      session: { paneBusy: true, transcriptAgeSec: 1 } }] },
+  });
+  assert.equal(r.status, 200);
+  assert.equal("attention" in agents[host].sessions[0], false);
+  const served = hub.serializeAgent(host, agents[host], Date.now());
+  assert.equal(served.sessions[0].attention.state, "working");
+  // The restore path strips it too.
+  const restored = { sessions: [{ id: "s1", attention: { state: "idle", since: 5 } }] };
+  hub.normalizeRecord(restored, "restore");
+  assert.equal("attention" in restored.sessions[0], false);
 });
 
 // ---- heartbeatAlerts (edge-triggered) ------------------------------------------

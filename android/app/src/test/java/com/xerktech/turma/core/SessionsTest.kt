@@ -153,14 +153,70 @@ class SessionsTest {
 
     @Test fun `liveStateLabel says what a holding session waits on`() {
         val timed = LiveSignals(agents = listOf(shell("wait-timed", "Sleep", eta = now + 12 * 60_000L)))
-        assertEquals("waiting · 12m left", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, timed, now))
+        assertEquals("⏳ waiting · 12m left", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, timed, now))
         val ci = LiveSignals(agents = listOf(shell("wait-external", "Watch CI")))
-        assertEquals("waiting · Watch CI", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, ci, now))
+        assertEquals("⏳ waiting · Watch CI", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, ci, now))
         val two = LiveSignals(agents = listOf(shell("wait-external"), shell("wait-timed")))
-        assertEquals("waiting on 2 background shells", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, two, now))
+        assertEquals("⏳ waiting on 2 background shells", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, two, now))
         // A working card names only its WORK rows.
         val mixed = LiveSignals(agents = listOf(shell("work"), shell("wait-external")))
         assertEquals("1 background shell", com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, mixed, now))
+    }
+
+    // ---- attention (XERK-1571) ----------------------------------------------
+
+    @Test fun `a pending wake sleeps — holding, never ready for review, labelled until when`() {
+        val wakeAt = now + 30 * 60_000L
+        val asleep = SessionInfo(
+            status = "running",
+            session = LiveSignals(paneBusy = false, transcriptAgeSec = 5.0, lastRole = "assistant", wakeAt = wakeAt),
+        )
+        assertEquals(true, sessionSleeping(asleep, now))
+        assertEquals(LiveState.HOLDING, liveState(asleep, now, now))
+        assertEquals(false, readyForReview(asleep, liveState(asleep, now, now)))
+        assertEquals(
+            "💤 sleeping until ${clockTime(wakeAt)}",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, asleep.session, now),
+        )
+        // A due wake no longer sleeps; working outranks a sleep.
+        assertEquals(LiveState.IDLE, liveState(asleep, now, wakeAt + 1))
+        val busy = asleep.copy(session = asleep.session!!.copy(paneBusy = true))
+        assertEquals(LiveState.WORKING, liveState(busy, now, now))
+        // "14:05"-shaped local clock time.
+        assertEquals(true, Regex("^\\d\\d:\\d\\d$").matches(clockTime(wakeAt)))
+    }
+
+    private fun att(state: String, since: Long?, why: String? = null) =
+        com.xerktech.turma.model.Attention(state = state, since = since, why = why)
+
+    @Test fun `needsYou lists the hub's needs-you running sessions, oldest wait first`() {
+        val agents = listOf(
+            AgentInfo(key = "h", sessions = listOf(
+                SessionInfo(id = "new", status = "running", attention = att("needs-you:review", now - 60_000L)),
+                SessionInfo(id = "old", status = "running", attention = att("needs-you:stalled", now - 3_600_000L)),
+                SessionInfo(id = "busy", status = "running", attention = att("working", now - 10L)),
+                SessionInfo(id = "zzz", status = "running", attention = att("sleeping", now - 10L)),
+                SessionInfo(id = "stopped", status = "stopped", attention = att("needs-you:review", 1L)),
+                SessionInfo(id = "olderHub", status = "running"),
+            )),
+        )
+        assertEquals(listOf("old", "new"), needsYou(agents).map { it.session.id })
+        assertEquals("stalled", needsYouChip("needs-you:stalled"))
+        assertEquals(null, needsYouChip("waiting"))
+    }
+
+    @Test fun `attentionWhy says why and for how long; a question shows only the wait`() {
+        assertEquals("PR open · CI passing · waiting 12m",
+            attentionWhy(att("needs-you:review", now - 12 * 60_000L, "PR open · CI passing"), now))
+        assertEquals("waiting 3m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
+        assertEquals("", attentionWhy(att("working", now), now))
+        assertEquals("", attentionWhy(null, now))
+    }
+
+    @Test fun `sortedBySince puts the oldest first and keeps since-less rows in place after them`() {
+        val rows = listOf("a" to null, "b" to 30L, "c" to null, "d" to 10L)
+        val out = sortedBySince(rows) { r -> r.second?.let { att("needs-you:review", it) } }
+        assertEquals(listOf("d", "b", "a", "c"), out.map { it.first })
     }
 
     // ---- readyForReview (XERK-224) ------------------------------------------

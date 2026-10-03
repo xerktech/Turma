@@ -295,7 +295,9 @@ fun rankRunning(rows: List<FlatSession>, now: Long): LiveGroups {
         com.xerktech.turma.core.readyForReview(it.flat.session, it.state)
     }
     return LiveGroups(
-        review = review,
+        // Oldest-waiting first by the hub's attention `since` (XERK-1571); it
+        // moves only when a card ENTERS the group, so it does not reshuffle per beat.
+        review = com.xerktech.turma.core.sortedBySince(review) { it.flat.session.attention },
         active = rest.filter { it.state != com.xerktech.turma.core.LiveState.IDLE },
         idle = rest.filter { it.state == com.xerktech.turma.core.LiveState.IDLE },
     )
@@ -1048,6 +1050,20 @@ private fun SessionListCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                // Why it is the operator's and for how long (XERK-1571, web
+                // sessions.html `.why` line) — review cards only.
+                if (review) {
+                    val why = com.xerktech.turma.core.attentionWhy(r.session.attention, now)
+                    if (why.isNotEmpty()) {
+                        Text(
+                            why,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
                 // The PRs share a marks row at the BOTTOM of the card (web
                 // sessions.html state-row), rendered when there is at least one.
                 if (r.session.prs.isNotEmpty()) {

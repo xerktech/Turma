@@ -106,12 +106,12 @@ test("dashboard liveState: waiting shells hold, stall, and never read working", 
   const { liveState } = loadDashboard();
   const ci = { type: "shell", label: "Watch CI", kind: "wait-external" };
   const held = liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [ci] }), onlineHost, NOW);
-  assert.equal(held.label, "waiting · Watch CI");
+  assert.equal(held.label, "⏳ waiting · Watch CI");
   assert.equal(held.cls, "sess-holding");
   assert.notEqual(held.busy, true);
   const timed = liveState(sess({ paneBusy: false, transcriptAgeSec: 5,
     agents: [{ type: "shell", kind: "wait-timed", eta: NOW + 5 * 60 * 1000 }] }), onlineHost, NOW);
-  assert.equal(timed.label, "waiting · 5m left");
+  assert.equal(timed.label, "⏳ waiting · 5m left");
   const stalled = liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [ci] }), onlineHost, NOW);
   assert.equal(stalled.label, "stalled · Watch CI");
   assert.equal(stalled.cls, "");
@@ -125,6 +125,21 @@ test("dashboard liveState: waiting shells hold, stall, and never read working", 
   // Offline host: no wait read at all — plain idle.
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [ci] }),
     { online: false, lastSeen: NOW - 600_000 }, NOW).label, "idle");
+});
+
+// XERK-1571: a session-CLI wake still ahead reads sleeping (holding style), "until
+// HH:MM" in local time; a due wake no longer does.
+test("dashboard liveState: a pending wake reads sleeping until its time", () => {
+  const { liveState } = loadDashboard();
+  const wakeAt = NOW + 30 * 60 * 1000;
+  const d = new Date(wakeAt), p = (n) => String(n).padStart(2, "0");
+  const asleep = liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt }), onlineHost, NOW);
+  assert.equal(asleep.label, `💤 sleeping until ${p(d.getHours())}:${p(d.getMinutes())}`);
+  assert.equal(asleep.cls, "sess-holding");
+  assert.notEqual(asleep.busy, true);
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt: NOW - 1000 }), onlineHost, NOW).label, "idle");
+  // Working outranks it: a session still finishing its turn is working.
+  assert.equal(liveState(sess({ paneBusy: true, transcriptAgeSec: 1, wakeAt }), onlineHost, NOW).label, "working");
 });
 
 // XERK-538: a QA / QA-delta pass reads "QA Review" while staying working (Active).

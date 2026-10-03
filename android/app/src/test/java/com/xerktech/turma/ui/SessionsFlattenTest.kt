@@ -105,6 +105,27 @@ class SessionsFlattenTest {
         assertEquals(listOf("mergedOne", "quietOne"), groups.idle.map { it.flat.session.id }.sorted())
     }
 
+    // XERK-1571: Ready for review is ordered oldest-WAITING first by the hub's
+    // attention `since`, not by createdAt; the other groups keep createdAt.
+    @Test fun `rankRunning orders Ready for review by attention since, oldest first`() {
+        fun done(id: String, createdAt: String, since: Long?) = flat(
+            id, paneBusy = false, lastRole = "assistant", createdAt = createdAt,
+        ).let { f ->
+            f.copy(session = f.session.copy(
+                attention = since?.let { com.xerktech.turma.model.Attention(state = "needs-you:review", since = it) },
+            ))
+        }
+        val groups = rankRunning(
+            listOf(
+                done("newest", "2026-03-01T00:00:00Z", since = 900L),
+                done("oldest", "2026-01-01T00:00:00Z", since = 100L),
+                done("noSince", "2026-04-01T00:00:00Z", since = null),
+            ),
+            now = 1_000L,
+        )
+        assertEquals(listOf("oldest", "newest", "noSince"), groups.review.map { it.flat.session.id })
+    }
+
     @Test fun `rankRunning orders newest-created first, whatever the activity`() {
         fun beat(oldAge: Double, newAge: Double) = rankRunning(
             listOf(

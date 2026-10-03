@@ -162,6 +162,41 @@ test("dashboard: the session card renders a context-fullness meter (XERK-489 Pha
   assert.match(D.contextMeterHtml({ modelSource: "local", lastTurnContextTokens: 97, contextWindowTokens: 100 }), /ctx-meter danger/);
 });
 
+// XERK-1571: the "Needs you" group lists exactly the sessions the hub's served
+// attention says wait on the operator, oldest wait first, with its chip, host,
+// repo, why and age — and is absent when none do (or the hub serves none).
+test("dashboard: the Needs you group lists hub needs-you sessions, oldest first", () => {
+  const D = loadDashboard();
+  const now = Date.now();
+  const sess = (id, summary, attention, status = "running") =>
+    ({ id, summary, status, repo: "Turma", attention });
+  const at = (state, agoMin, why) => ({ state, since: now - agoMin * 60_000, ...(why ? { why } : {}) });
+  const h = { ...liveHost("nas", 1), sessions: [
+    sess("s1", "Fresh Review", at("needs-you:review", 3, "PR open · CI passing")),
+    sess("s2", "Old Stall", at("needs-you:stalled", 50, "Watch CI")),
+    sess("s3", "Asking", at("needs-you:question", 10, "Ship it?")),
+    sess("s4", "Busy", at("working", 1)),
+    sess("s5", "Asleep", at("sleeping", 1, "check CI")),
+    sess("s6", "Stopped", at("needs-you:review", 99), "stopped"),
+    sess("s7", "Older Hub", undefined),
+  ] };
+  D.render({ now, agents: [h] });
+  const g = D.els.groups.innerHTML;
+  const ny = g.slice(g.indexOf('<section class="needs-you">'), g.indexOf("</section>"));
+  assert.ok(ny.includes('Needs you <span class="count">3</span>'), ny);
+  const order = ["Old Stall", "Asking", "Fresh Review"].map((n) => ny.indexOf(n));
+  assert.ok(order.every((i) => i > 0) && order[0] < order[1] && order[1] < order[2], "oldest wait first");
+  for (const n of ["Busy", "Asleep", "Stopped", "Older Hub"]) assert.ok(!ny.includes(n), n);
+  assert.ok(ny.includes('<span class="ny-chip stalled">stalled</span>'));
+  assert.ok(ny.includes("nas · Turma · PR open · CI passing"));
+  assert.ok(ny.includes('<span class="ny-age">50m</span>'));
+  assert.ok(ny.includes('href="/sessions?session=s2"'));
+  // Nothing waiting on the operator: no group at all.
+  const D2 = loadDashboard();
+  D2.render({ now, agents: [{ ...liveHost("nas", 1), sessions: [sess("s4", "Busy", at("working", 1))] }] });
+  assert.ok(!D2.els.groups.innerHTML.includes("needs-you"));
+});
+
 test("dashboard tiles: a removed host's spend still counts toward the fleet totals", () => {
   const D = loadDashboard();
   D.render({ now: Date.now(), agents: [liveHost("live", 100)], retiredUsage: [retiredHost("gone", 900)] });

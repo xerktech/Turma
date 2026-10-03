@@ -10,7 +10,7 @@
 // view; Board is a placeholder tab (Phase 2).
 import type { AppState } from "../app.ts";
 import type { AgentInfo, PrInfo, SessionInfo } from "../types.ts";
-import { filterAgents, liveState, readyForReview, sessionName, siteKeyOf, type LiveState } from "../sessions.ts";
+import { filterAgents, liveState, readyForReview, sessionName, siteKeyOf, sleeping, type LiveState } from "../sessions.ts";
 import { LIVE_TURN_ID } from "../render.ts";
 import { Board } from "../vendor/engines.ts";
 
@@ -125,6 +125,12 @@ function orgTintStyle(colorMap: Map<string, string>, siteKey: string): string {
   return c ? ` style="--org:${c}"` : "";
 }
 
+// "14:05" — the local wall-clock time a sleeping session wakes at.
+function clockTime(ms: number): string {
+  const d = new Date(ms), p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, current: boolean,
                         tint: string, hostLastSeen?: number, now?: number): string {
   // The host arguments matter here as much as in the grouping above: without
@@ -133,9 +139,13 @@ function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, cur
   const st = liveState(s, hostLastSeen, now);
   const name = sessionName(s);
   const q = s.session?.question;
+  // A holding session ASLEEP until a session-CLI wake (XERK-1571) says until when.
+  const wakeAt = s.session?.wakeAt;
+  const label = st === "holding" && sleeping(s.session, now ?? Date.now()) && typeof wakeAt === "number"
+    ? `sleeping until ${clockTime(wakeAt)}` : STATE_LABEL[st];
   const stateRow =
     `<span class="ph-state-row">` +
-    `<span class="ph-state st-${st}">${STATE_LABEL[st]}</span>` +
+    `<span class="ph-state st-${st}">${esc(label)}</span>` +
     prChips(s) +
     `</span>`;
   return (
@@ -220,6 +230,14 @@ export function sessionsBodyHtml(state: AppState): string {
   const idle = rest.filter((r) => !ACTIVE.includes(liveState(r.s, r.lastSeen, now)));
   const byCreated = (a: Row, b: Row) => (b.s.createdAt ?? "").localeCompare(a.s.createdAt ?? "");
   [review, active, idle, queued, ended].forEach((l) => l.sort(byCreated));
+  // Ready for review, oldest-waiting first by the hub's attention `since`
+  // (XERK-1571, web sessions.html bySince); a card without one keeps its place
+  // after them (the sort is stable).
+  review.sort((a, b) => {
+    const x = a.s.attention?.since, y = b.s.attention?.since;
+    if (typeof x === "number" && typeof y === "number") return x - y;
+    return typeof x === "number" ? -1 : typeof y === "number" ? 1 : 0;
+  });
 
   const tintOf = (r: Row): string => orgTintStyle(colorMap, r.siteKey);
   const section = (label: string, list: Row[], render: (r: Row) => string, cls = ""): string =>

@@ -389,6 +389,38 @@ test("background shell kinds: waiting holds, stalled surfaces, work stays workin
   assert.ok(a.includes("Test Runner") && a.includes("1 background shell"));
 });
 
+// XERK-1571. The attention layer on the Sessions page: a sleeping session (a
+// session-CLI wake still ahead) holds in Active, never Ready for review; Ready
+// for review is ordered by the hub's attention `since`, oldest first, and each
+// card carries the hub's `why` and how long it has waited.
+test("attention: sleeping holds, review sorts oldest-waiting first with the why line", () => {
+  const { render, els } = loadPage();
+  const t = Date.now();
+  const wake = new Date(t + 30 * 60 * 1000);
+  const hhmm = String(wake.getHours()).padStart(2, "0") + ":" + String(wake.getMinutes()).padStart(2, "0");
+  const att = (state, agoMin, why) => ({ attention: { state, since: t - agoMin * 60 * 1000, ...(why ? { why } : {}) } });
+  const { now, host: h } = host([
+    // createdAt order would put Newer first; `since` puts Older first.
+    finished("51111", "Newer Wait", { createdAt: "2026-10-03T10:00:00Z", ...att("needs-you:review", 5, "finished · nothing to merge") }),
+    finished("52222", "Older Wait", { createdAt: "2026-10-03T09:00:00Z", prs: [pr("OPEN")],
+      ...att("needs-you:review", 40, "PR open · CI passing") }),
+    running("53333", "Asleep", { paneBusy: false, transcriptAgeSec: 30, lastRole: "assistant", lastHasToolUse: false,
+      wakeAt: t + 30 * 60 * 1000, wakeReason: "check CI" }),
+    running("54444", "CI Watcher", { paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false,
+      agents: [{ type: "shell", label: "Watch CI", kind: "wait-external" }] }),
+  ]);
+  render({ now, agents: [h] });
+  const r = els.review.innerHTML, a = els.active.innerHTML;
+  assert.ok(r.indexOf("Older Wait") >= 0 && r.indexOf("Older Wait") < r.indexOf("Newer Wait"), "oldest-waiting first");
+  assert.ok(r.includes('<div class="why">PR open · CI passing · waiting 40m</div>'), r);
+  assert.ok(r.includes('<div class="why">finished · nothing to merge · waiting 5m</div>'));
+  // Sleeping: Active, holding, "until HH:MM" — not Ready for review.
+  assert.ok(!r.includes("Asleep"));
+  assert.ok(a.includes("Asleep") && a.includes("💤 sleeping until " + hhmm), a);
+  // Waiting cards lead with the hourglass.
+  assert.ok(a.includes("⏳ waiting · Watch CI"));
+});
+
 // XERK-735. The card's second line reads repo · related ticket · pc name ·
 // session id, one line, and the ticket key links to that ticket's detail on the
 // board rather than out to Jira.

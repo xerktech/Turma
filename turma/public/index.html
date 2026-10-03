@@ -290,6 +290,28 @@
   .sess-working { color: var(--good); }
   .sess-wait { color: var(--warning); }
   .sess-holding { color: var(--ink-2); font-style: italic; }
+
+  /* "Needs you" (XERK-1571): every session the hub says is waiting on the
+     operator, oldest wait first, above the host tree. */
+  .needs-you {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    padding: 12px 16px; margin-bottom: 16px;
+  }
+  .needs-you h2 { font-size: 14px; margin: 0 0 8px; }
+  .needs-you h2 .count { color: var(--muted); font-weight: 400; }
+  .ny-row {
+    display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 10px;
+    align-items: baseline; padding: 6px 0; border-top: 1px solid var(--border);
+    color: inherit; text-decoration: none;
+  }
+  .ny-row:first-of-type { border-top: 0; }
+  .ny-chip { font-size: 11px; font-weight: 600; color: var(--accent); white-space: nowrap; }
+  .ny-chip.question, .ny-chip.permission { color: var(--warning); }
+  .ny-chip.stalled { color: var(--critical); }
+  .ny-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ny-age { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .ny-why { grid-column: 2 / 4; color: var(--ink-2); font-size: 12px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sess-dying { color: var(--critical); }
 
   /* Per-session work-state line: warning when there's unpushed/uncommitted
@@ -1103,6 +1125,50 @@ function backgroundWorkLabel(rows) {
 function qaReviewing(s) {
   return (Array.isArray(s?.agents) ? s.agents : []).some(a => a && QA_AGENT_TYPES.has(a.type));
 }
+// A session-CLI wake still ahead (XERK-1571) — mirror of server.js sessionSleeping.
+function sleepingUntil(s, now) {
+  return Number.isSafeInteger(s?.wakeAt) && s.wakeAt > now;
+}
+// "14:05" — the local wall-clock time a sleeping session wakes at.
+function clockTime(ms) {
+  const d = new Date(ms), p = (n) => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes());
+}
+
+// "Needs you" (XERK-1571): the sessions the HUB says are waiting on the
+// operator (`attention.state` needs-you:*), oldest wait first. Read off the
+// served attention rather than re-derived: the hub stamps it on the same beat
+// it decides the alerts, so the group and the phone agree. Absent (an older
+// hub) = not listed. `sess` is the org-scoped [{s, host}] list.
+const NEEDS_YOU_CHIP = {
+  "needs-you:question": ["question", "question"],
+  "needs-you:permission": ["permission", "permission"],
+  "needs-you:review": ["review", "review"],
+  "needs-you:test": ["review", "test"],
+  "needs-you:stalled": ["stalled", "stalled"],
+};
+function needsYou(sess) {
+  return sess
+    .filter(x => x.s.status === "running" && NEEDS_YOU_CHIP[x.s.attention?.state])
+    .sort((x, y) => (x.s.attention.since || 0) - (y.s.attention.since || 0));
+}
+function needsYouHtml(rows, now) {
+  if (!rows.length) return "";
+  return `<section class="needs-you"><h2>Needs you <span class="count">${rows.length}</span></h2>${
+    rows.map(({ s, host }) => {
+      const att = s.attention;
+      const [cls, word] = NEEDS_YOU_CHIP[att.state];
+      const name = s.summary || s.label || s.rcName || s.id;
+      const age = Number.isSafeInteger(att.since) ? ago(now - att.since).replace(/ ago$/, "") : "";
+      return `<a class="ny-row" href="/sessions?session=${esc(encodeURIComponent(s.id))}">
+        <span class="ny-chip ${cls}">${esc(word)}</span>
+        <span class="ny-name" title="${esc(name)}">${esc(name)}</span>
+        <span class="ny-age">${esc(age)}</span>
+        <span class="ny-why">${esc([host.device || host.key, s.repo, att.why].filter(Boolean).join(" · "))}</span>
+      </a>`;
+    }).join("")}</section>`;
+}
+
 // A background shell that is WAITING (XERK-1570) — a sleep, a CI watch, a poll
 // loop. No kind (an agent, or an older agent) is work. Same as sessions.html.
 function isWaitRow(a) {
@@ -1126,7 +1192,7 @@ function backgroundWait(rows, lastWrite, now) {
 // "stalled …" once stalled. Same as sessions.html.
 function backgroundWaitLabel(rows, wait, now) {
   const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
-  const word = wait.state === "stalled" ? "stalled" : "waiting";
+  const word = wait.state === "stalled" ? "stalled" : "⏳ waiting";
   if (wait.eta != null && wait.eta > now) return word + " · " + ago(wait.eta - now).replace(/ ago$/, "") + " left";
   if (waits.length === 1 && waits[0].label) return word + " · " + waits[0].label;
   return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s");
@@ -1164,6 +1230,10 @@ function liveState(sess, host, now) {
     : (host.online && !agentsLive && age < 90 * 1000);
   if (working)
     return { label: "working", cls: "sess-working", detail: "last write " + ago(age), busy: true };
+  // Asleep until a session-CLI wake (XERK-1571). Same rule and wording as
+  // sessions.html (and the hub's sessionSleeping).
+  if (sleepingUntil(s, now))
+    return { label: "💤 sleeping until " + clockTime(s.wakeAt), cls: "sess-holding", detail: "last write " + ago(age) };
   // Every live row is a wait: holding, or stalled past its ETA / too long silent.
   // Same rule and wording as sessions.html (and the hub's sessionWait).
   const wait = host.online ? backgroundWait(s.agents, now - age, now) : null;
@@ -1309,7 +1379,8 @@ function render(data) {
   // scrolled `.clone-list`, id-keyed, is captured by preserveScroll).
   const focus = captureComposerFocus();
   TurmaNav.preserveScroll($groups, () => {
-    $groups.innerHTML = `<div class="hosts">${agents.map(a => hostCard(a, now)).join("")}</div>`;
+    $groups.innerHTML = needsYouHtml(needsYou(sess), now)
+      + `<div class="hosts">${agents.map(a => hostCard(a, now)).join("")}</div>`;
   });
   restoreComposerFocus(focus);
 }

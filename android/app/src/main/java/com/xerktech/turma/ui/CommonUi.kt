@@ -289,11 +289,13 @@ fun liveStateLabel(state: LiveState, live: LiveSignals?, now: Long = System.curr
     // Waiting out a background shell (XERK-1570) — web `backgroundWaitLabel`:
     // "waiting · 12m left" / "waiting · Watch CI" / "waiting on 2 background shells".
     if (state == LiveState.HOLDING) {
+        // Asleep until a session-CLI wake (XERK-1571) — web "💤 sleeping until 14:05".
+        live?.wakeAt?.takeIf { it > now }?.let { return "💤 sleeping until ${com.xerktech.turma.core.clockTime(it)}" }
         val waits = live?.agents.orEmpty().filter(::isWaitAgent)
         val eta = waits.mapNotNull { it.eta }.maxOrNull()
-        if (eta != null && eta > now) return "waiting · ${waitLeftText(eta - now)} left"
-        if (waits.size == 1 && waits[0].label.isNotBlank()) return "waiting · ${waits[0].label}"
-        return "waiting on ${waits.size} background shell" + if (waits.size == 1) "" else "s"
+        if (eta != null && eta > now) return "⏳ waiting · ${waitLeftText(eta - now)} left"
+        if (waits.size == 1 && waits[0].label.isNotBlank()) return "⏳ waiting · ${waits[0].label}"
+        return "⏳ waiting on ${waits.size} background shell" + if (waits.size == 1) "" else "s"
     }
     // Only WORK rows name the working state; a waiting shell beside them is not work.
     if (state == LiveState.WORKING && hasLiveWork(live)) {

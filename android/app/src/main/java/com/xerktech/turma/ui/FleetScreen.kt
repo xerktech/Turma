@@ -56,6 +56,8 @@ import com.xerktech.turma.core.FleetSummary
 import com.xerktech.turma.core.LiveState
 import com.xerktech.turma.core.fleetSummary
 import com.xerktech.turma.core.liveState
+import com.xerktech.turma.core.needsYou
+import com.xerktech.turma.core.needsYouChip
 import com.xerktech.turma.core.orgColorMap
 import com.xerktech.turma.core.scopedAgents
 import com.xerktech.turma.core.scopedRetired
@@ -136,6 +138,18 @@ fun FleetScreen(
                 if (agents.isNotEmpty() || retired.isNotEmpty()) {
                     item(key = "tiles") {
                         FleetTiles(remember(agents, retired) { fleetSummary(agents, retired) })
+                    }
+                }
+                // "Needs you" (XERK-1571, web index.html): what the hub says waits
+                // on the operator, oldest wait first, above the host cards.
+                val needs = needsYou(agents)
+                if (needs.isNotEmpty()) {
+                    item(key = "needsYou") {
+                        NeedsYouCard(
+                            needs,
+                            now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis(),
+                            onOpen = onOpenChat,
+                        )
                     }
                 }
                 if (agents.isEmpty()) {
@@ -635,6 +649,58 @@ private fun SessionCard(
  * today / this week / all-time). Data is [fleetSummary], a pure port of the web
  * reducers.
  */
+/**
+ * The dashboard's "Needs you" group (XERK-1571) — web index.html `needsYouHtml`:
+ * one row per session the hub says waits on the operator, oldest first, with its
+ * chip, name, how long, and host · repo · why. A tap opens the session.
+ */
+@Composable
+private fun NeedsYouCard(
+    rows: List<com.xerktech.turma.core.FlatSession>,
+    now: Long,
+    onOpen: (String, String) -> Unit,
+) {
+    TurmaCard(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            SectionLabel("Needs you (${rows.size})")
+            rows.forEach { r ->
+                val att = r.session.attention
+                val chip = needsYouChip(att?.state ?: "") ?: "review"
+                val chipColor = when (chip) {
+                    "question", "permission" -> com.xerktech.turma.ui.theme.TurmaColors.waiting
+                    "stalled" -> com.xerktech.turma.ui.theme.TurmaColors.critical
+                    else -> com.xerktech.turma.ui.theme.TurmaColors.review
+                }
+                Column(
+                    Modifier.fillMaxWidth().clickable { onOpen(r.host, r.session.id) },
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(chip, color = chipColor, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            sessionName(r.session), Modifier.weight(1f),
+                            fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        )
+                        att?.since?.let {
+                            Text(
+                                com.xerktech.turma.core.waitLeftText(now - it),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    Text(
+                        listOf(r.host, r.session.repo, att?.why.orEmpty()).filter { it.isNotBlank() }.joinToString(" · "),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
+}
+
 // Hub-wide "mobile push is off" banner (XERK-152) — shown above the tiles when
 // the hub reports no FCM credential, so a disabled push config is visible instead
 // of silently dropping every alert.

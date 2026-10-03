@@ -1,6 +1,7 @@
 package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.Attention
 import com.xerktech.turma.model.LiveAgent
 import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.PrInfo
@@ -116,8 +117,65 @@ fun liveState(session: SessionInfo, agentLastSeen: Long, now: Long): LiveState =
     session.status != "running" -> LiveState.STOPPED
     (session.session?.question ?: "").isNotBlank() -> LiveState.WAITING
     sessionWorking(session, agentLastSeen, now) -> LiveState.WORKING
+    // Asleep until a session-CLI wake (XERK-1571): holding, never Ready for review.
+    sessionSleeping(session, now) -> LiveState.HOLDING
     sessionWait(session, agentLastSeen, now)?.stalled == false -> LiveState.HOLDING
     else -> LiveState.IDLE
+}
+
+/** A session-CLI wake still in the future (XERK-1571) — the hub's `sessionSleeping`. */
+fun sessionSleeping(session: SessionInfo, now: Long): Boolean = (session.session?.wakeAt ?: 0L) > now
+
+/** "14:05" — the local wall-clock time a sleeping session wakes at. */
+fun clockTime(ms: Long): String {
+    val c = java.util.Calendar.getInstance().apply { timeInMillis = ms }
+    return String.format(
+        java.util.Locale.ROOT, "%02d:%02d",
+        c.get(java.util.Calendar.HOUR_OF_DAY), c.get(java.util.Calendar.MINUTE),
+    )
+}
+
+/** The chip word for a `needs-you:*` attention state (XERK-1571), else null. */
+fun needsYouChip(state: String): String? = when (state) {
+    "needs-you:question" -> "question"
+    "needs-you:permission" -> "permission"
+    "needs-you:review" -> "review"
+    "needs-you:test" -> "test"
+    "needs-you:stalled" -> "stalled"
+    else -> null
+}
+
+/**
+ * The dashboard's "Needs you" group (XERK-1571, web index.html `needsYou`): the
+ * running sessions the HUB says wait on the operator, oldest wait first. Read off
+ * the served [SessionInfo.attention], never re-derived, so it agrees with the
+ * phone's alerts. An older hub serves none, so nothing is listed.
+ */
+fun needsYou(agents: List<AgentInfo>): List<FlatSession> =
+    flattenSessions(agents)
+        .filter { it.session.status == "running" && needsYouChip(it.session.attention?.state ?: "") != null }
+        .sortedBy { it.session.attention?.since ?: 0L }
+
+/**
+ * Ready for review, oldest-waiting first by the hub's attention `since`
+ * (XERK-1571, web sessions.html `bySince`). A row with no `since` (an older hub)
+ * keeps its place after them — `sortedWith` is stable.
+ */
+fun <T> sortedBySince(rows: List<T>, attention: (T) -> Attention?): List<T> =
+    rows.sortedWith(compareBy<T, Long?>(nullsLast<Long>()) { attention(it)?.since })
+
+/**
+ * A review card's second line (XERK-1571, web sessions.html `attentionWhy`): WHY
+ * the session is the operator's and how long it has waited. A question/permission
+ * card already shows its question, so only the wait. "" when the hub serves none.
+ */
+fun attentionWhy(att: Attention?, now: Long): String {
+    if (att == null || needsYouChip(att.state) == null) return ""
+    val asked = att.state == "needs-you:question" || att.state == "needs-you:permission"
+    val bits = ArrayList<String>()
+    att.why?.takeIf { !asked && it.isNotBlank() }?.let { bits.add(it) }
+    att.since?.let { bits.add("waiting ${waitLeftText(now - it)}") }
+    return bits.joinToString(" · ")
 }
 
 /**

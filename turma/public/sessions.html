@@ -132,6 +132,9 @@
   /* Waiting out a background shell it launched (XERK-1570): not working, not
      the operator's yet — a quiet in-between, never the attention colours. */
   .s-card .state.holding { color: var(--ink-2); font-style: italic; }
+  /* Why a Ready-for-review card is the operator's, and for how long — the
+     hub's attention read (XERK-1571). */
+  .s-card .why { font-size: 11px; color: var(--ink-2); margin-top: 3px; }
   /* A card in the Ready-for-review section says why it is there instead of the
      bare "idle" it would otherwise read (XERK-224). */
   .s-card .state.review { color: var(--accent); font-weight: 600; }
@@ -2202,6 +2205,11 @@ function liveState(sess, host, now) {
     : (host.online && !liveAgentCount(s) && age < 90 * 1000);
   if (working)
     return { kind: "working", label: "working", detail: "last write " + ago(age) };
+  // Asleep until a session-CLI wake (XERK-1571): it ended its turn asking to be
+  // re-prompted then, so it is "holding" — never Ready for review — like the
+  // hub's sessionSleeping (no host-online gate there either).
+  if (sleepingUntil(s, now))
+    return { kind: "holding", label: "💤 sleeping until " + clockTime(s.wakeAt), detail: "last write " + ago(age) };
   // Every live row is a wait: "holding" while it waits (never Ready for review),
   // or — past its ETA, or silent too long — "stalled", which reads as idle so a
   // dead shell surfaces like any finished session. Mirrors the hub's sessionWait.
@@ -2224,6 +2232,15 @@ function liveAgentCount(s) {
 // takes a row out of "working".
 function isWaitRow(a) {
   return !!a && (a.kind === "wait-timed" || a.kind === "wait-external");
+}
+// A session-CLI wake still ahead (XERK-1571) — mirror of server.js sessionSleeping.
+function sleepingUntil(s, now) {
+  return Number.isSafeInteger(s?.wakeAt) && s.wakeAt > now;
+}
+// "14:05" — the local wall-clock time a sleeping session wakes at.
+function clockTime(ms) {
+  const d = new Date(ms), p = (n) => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes());
 }
 function liveWorkRows(s) {
   return (Array.isArray(s?.agents) ? s.agents : []).filter(a => !isWaitRow(a));
@@ -2251,7 +2268,7 @@ function backgroundWait(rows, lastWrite, now) {
 // else "waiting on 2 background shells"; "stalled …" once it has stalled.
 function backgroundWaitLabel(rows, wait, now) {
   const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
-  const word = wait.state === "stalled" ? "stalled" : "waiting";
+  const word = wait.state === "stalled" ? "stalled" : "⏳ waiting";
   if (wait.eta != null && wait.eta > now) return word + " · " + ago(wait.eta - now).replace(/ ago$/, "") + " left";
   if (waits.length === 1 && waits[0].label) return word + " · " + waits[0].label;
   return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s");
@@ -2306,8 +2323,8 @@ function prLanded(p) {
 // with an answer and no PR, which is the one the operator asked for by name:
 //
 //   - a pending question / blocking TUI dialog. It is BLOCKED on a human, so it
-//     qualifies whatever the busy read says (it sits in its createdAt slot like
-//     every card — collect() never re-ranks within a section);
+//     qualifies whatever the busy read says (the section is ordered by how
+//     long each card has waited — the hub's attention `since`, XERK-1571);
 //   - a PR that hasn't landed — there is a diff to read;
 //   - a finished turn: the newest transcript entry is plain assistant output
 //     with no tool call pending, which is the only trace a no-PR task leaves.
@@ -2339,12 +2356,38 @@ function readyForReview(s, live) {
 // The state line a Ready-for-review card carries. A waiting one keeps its own
 // (stronger) "waiting for your answer"; the rest would otherwise read a bare
 // "idle" under a heading that says they are not, so they say why they qualified.
-function reviewState(s, live) {
-  if (live.kind !== "idle") return live;
+function reviewState(s, live, now) {
+  const why = attentionWhy(s, now);
+  if (live.kind !== "idle") return { ...live, why };
   // A stalled background wait keeps its own reason — it is why it is here.
-  if (live.stalled) return { ...live, kind: "review" };
+  if (live.stalled) return { ...live, kind: "review", why };
   const label = (s.prs || []).some(p => !prLanded(p)) ? "PR awaiting review" : "finished · awaiting review";
-  return { ...live, kind: "review", label, detail: live.detail };
+  return { ...live, kind: "review", label, detail: live.detail, why };
+}
+
+// The hub's attention read (XERK-1571), as a review card's second line: WHY the
+// session is the operator's ("PR open · CI passing") and how long it has been
+// ("· 12m"). A question/permission card already quotes its question, so only
+// the wait shows. "" from an older hub that serves no `attention`.
+function attentionWhy(s, now) {
+  const att = s.attention;
+  if (!att || !String(att.state || "").startsWith("needs-you:")) return "";
+  const asked = att.state === "needs-you:question" || att.state === "needs-you:permission";
+  const bits = [];
+  if (att.why && !asked) bits.push(att.why);
+  if (Number.isSafeInteger(att.since)) bits.push("waiting " + ago(now - att.since).replace(/ ago$/, ""));
+  return bits.join(" · ");
+}
+
+// Ready for review, OLDEST-waiting first (XERK-1571): the hub's attention
+// `since` is when the session became the operator's, so the longest wait leads.
+// A card with no `since` (an older hub) keeps its collect() place after them —
+// Array.prototype.sort is stable.
+function bySince(x, y) {
+  const a = x.s.attention?.since, b = y.s.attention?.since;
+  const ok = (v) => Number.isSafeInteger(v);
+  if (ok(a) && ok(b)) return a - b;
+  return ok(a) ? -1 : ok(b) ? 1 : 0;
 }
 
 // A session is "ended" if it is over but still resumable, and that covers three
@@ -2580,9 +2623,12 @@ function render(data) {
   //
   // All three are live, attachable sessions rendered with the same card;
   // collect() already sorted `running` by a stable key, and filtering preserves
-  // that order, so a card keeps its place within its section.
+  // that order, so a card keeps its place within its section — except Ready for
+  // review, ordered oldest-waiting first by the hub's attention `since`
+  // (XERK-1571), which moves only when a card enters the section.
   const review = [], rest = [];
   for (const x of running) (readyForReview(x.s, x.live) ? review : rest).push(x);
+  review.sort(bySince);
   const active = rest.filter(x => x.live.kind !== "idle");
   const idle = rest.filter(x => x.live.kind === "idle");
 
@@ -2619,7 +2665,7 @@ function render(data) {
   // Idle — an empty state here would just be noise above the live list.
   $review.innerHTML = review.length
     ? `<h2>Ready for review <span class="count">${review.length}</span></h2>
-       <div class="s-list">${review.map(x => activeCard({ ...x, live: reviewState(x.s, x.live) })).join("")}</div>`
+       <div class="s-list">${review.map(x => activeCard({ ...x, live: reviewState(x.s, x.live, now) })).join("")}</div>`
     : "";
 
   $active.innerHTML = `<h2>Active <span class="count">${active.length}</span></h2>` +
@@ -2753,6 +2799,7 @@ function activeCard({ a, s, live }) {
           ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeLinkHtml).join("")}</span>` : ""}
         </div>
         ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
+        ${live.why ? `<div class="why">${esc(live.why)}</div>` : ""}
         ${moving}
       </span>
     </div>

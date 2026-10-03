@@ -93,6 +93,24 @@ describe("liveState", () => {
     expect(glyph("holding")).toBe("~");
   });
 
+  // XERK-1571: a session-CLI wake still ahead is SLEEPING — "holding", never
+  // ready for review (the hub's sessionSleeping); a due wake is idle again.
+  it("is 'holding' while asleep until a wake, and not ready for review", () => {
+    const now = 10_000_000;
+    const asleep = (wakeAt: number, extra: Partial<LiveSignals> = {}) => session({
+      session: signals({ paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", wakeAt, ...extra }),
+    });
+    expect(liveState(asleep(now + 60_000), now, now)).toBe("holding");
+    expect(readyForReview(asleep(now + 60_000), now, now)).toBe(false);
+    expect(liveState(asleep(now - 1), now, now)).toBe("idle");
+    expect(readyForReview(asleep(now - 1), now, now)).toBe(true);
+    // Working outranks it; an offline host's session still sleeps (no online gate).
+    expect(liveState(asleep(now + 60_000, { paneBusy: true }), now, now)).toBe("working");
+    expect(readyForReview(asleep(now + 60_000), now - 120_000, now)).toBe(false);
+    // A question outranks the sleep.
+    expect(readyForReview(asleep(now + 60_000, { question: "Q?" }), now, now)).toBe(true);
+  });
+
   it("is 'error' when status is error, regardless of session signals", () => {
     const s = session({ status: "error", session: signals({ question: "pick one" }) });
     expect(liveState(s)).toBe("error");

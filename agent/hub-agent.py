@@ -4127,6 +4127,21 @@ that is not in it is not yours to contact.
 """
 
 
+# The wake directive (XERK-1571): a session waiting out something with a known
+# duration asks the session CLI (XERK-1564) to re-prompt it, and ENDS its turn,
+# instead of parking on a `sleep` — which holds the pane and reads as a wait the
+# hub can only call stalled. {cli} is the ABSOLUTE CLI path, spelled exactly as
+# `session_cli_allow_rule` names it, so the call matches that allow rule and never
+# prompts (the "$TURMA_SESSION_CLI" spelling may not match a command-text rule).
+# Claude sessions only: dsh/qwen launches export neither TURMA_SESSION_ID nor
+# TURMA_SESSION_CLI yet, so the CLI would refuse there (agent-session-cli.md).
+WAKE_SYSTEM_PROMPT = """
+When the next step depends on something with a known duration, do not sleep in a
+shell: run `python3 -SsE {cli} wake <N>m <what to check>` and end the turn; Turma
+re-prompts you then.
+"""
+
+
 # A ticket summary is operator-written and unbounded; the roster is read whole by
 # every session that consults it, so one long cell is charged to all of them.
 PEER_CELL_MAX_CHARS = 120
@@ -4439,6 +4454,12 @@ def session_cli_allow_rule(cli_path=None):
     security flags) and the ABSOLUTE script path, so the rule admits only this
     script — an allow rule for `python3` alone would admit any code at all."""
     return f"Bash(python3 -SsE {cli_path or session_cli_path()}:*)"
+
+
+def wake_directive(cli_path=None):
+    """The wake paragraph of the session directive (XERK-1571), naming the CLI
+    exactly as the allow rule does (``session_cli_allow_rule``)."""
+    return WAKE_SYSTEM_PROMPT.format(cli=shlex.quote(cli_path or session_cli_path()))
 
 
 def qwen_ask_mcp_path():
@@ -19652,6 +19673,8 @@ class SessionManager:
         policy += PR_SUMMARY_SYSTEM_PROMPT
         policy += PEERS_SYSTEM_PROMPT.format(
             path=PEERS_FILE, sid=sess["id"], host=self.device)
+        if sess.get("agentType") not in ("dsh", "qwen"):
+            policy += wake_directive()
         return policy + addendum
 
     def _spawn_in_tmux(self, sess, cmd, what=""):

@@ -154,6 +154,28 @@ describe("phone render", () => {
     expect(idle).toContain("quiet one");
   });
 
+  it("orders Ready for review oldest-waiting first and labels a sleeper (XERK-1571)", () => {
+    const now = Date.now();
+    const done = { paneBusy: false, transcriptAgeSec: 900, lastRole: "assistant" };
+    const wakeAt = now + 30 * 60_000;
+    const d = new Date(wakeAt), p = (n: number) => String(n).padStart(2, "0");
+    const st = state({
+      agents: [agent({ sessions: [
+        session({ id: "n1", summary: "newer wait", createdAt: "2026-01-01T00:00:00Z", session: signals(done),
+          attention: { state: "needs-you:review", since: now - 60_000 } }),
+        session({ id: "o1", summary: "older wait", createdAt: "2025-01-01T00:00:00Z", session: signals(done),
+          attention: { state: "needs-you:review", since: now - 3_600_000 } }),
+        session({ id: "z1", summary: "asleep one", session: signals({ ...done, transcriptAgeSec: 5, wakeAt }) }),
+      ] })],
+    });
+    const html = sessionsBodyHtml(st);
+    const review = html.slice(html.indexOf("Ready for review"), html.indexOf("Active"));
+    expect(review.indexOf("older wait")).toBeGreaterThan(-1);
+    expect(review.indexOf("older wait")).toBeLessThan(review.indexOf("newer wait"));
+    expect(review).not.toContain("asleep one");
+    expect(html.slice(html.indexOf("Active"))).toContain(`sleeping until ${p(d.getHours())}:${p(d.getMinutes())}`);
+  });
+
   it("a new task on a merged-PR session is not hidden by that PR (XERK-224)", () => {
     const quiet = { paneBusy: false, transcriptAgeSec: 900, lastRole: "assistant" };
     const merged = [{ url: "https://github.com/o/r/pull/2", number: 2, state: "Merged" }];
