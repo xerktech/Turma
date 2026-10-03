@@ -926,6 +926,172 @@ class TestKnownBypasses(unittest.TestCase):
         self.assertIsNotNone(guard.is_destructive("shred /dev/sda"))
 
 
+class TestParserGaps(unittest.TestCase):
+    """XERK-1256: heredoc, here-string, comment, case-pattern, quoting and
+    empty-substitution shapes the parser misread. Every bypass below was
+    proved to run its payload under real bash; every false deny runs nothing.
+    """
+
+    R = "rm -rf /"
+
+    def assertDenied(self, cmd):
+        self.assertIsNotNone(guard.is_destructive(cmd), cmd)
+
+    def assertAllowed(self, cmd):
+        self.assertIsNone(guard.is_destructive(cmd), cmd)
+
+    def test_an_unquoted_heredoc_body_runs_its_substitutions(self):
+        R = self.R
+        for cmd in (f"cat <<EOF\n$({R})\nEOF", f"cat <<EOF\n`{R}`\nEOF",
+                    f"cat <<EOF\n$(true; {R})\nEOF",
+                    # An apostrophe is literal in a heredoc body.
+                    f"cat <<EOF\ndon't $({R})\nEOF",
+                    f"cat <<-EOF\n\t$({R})\n\tEOF",
+                    f"cat <<EOF\n${{x:-$({R})}}\nEOF",
+                    f'git commit -m "$(cat <<EOF\n$({R})\nEOF\n)"'):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_a_quoted_heredoc_body_stays_data(self):
+        for cmd in (f"cat <<'EOF'\n$({self.R})\nEOF", f'cat <<"EOF"\n`{self.R}`\nEOF',
+                    f"cat <<\\EOF\n$({self.R})\nEOF",
+                    "cat <<EOF\nrm -rf / is prose, don't run (this)\nEOF",
+                    "cat <<EOF\n`date` and $(git rev-parse HEAD)\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_only_a_real_heredoc_operator_swallows_lines(self):
+        """`<<` as a here-string, in quotes, in a comment or as an arithmetic
+        shift opens no body — reading one hid every line up to the delimiter."""
+        R = self.R
+        for cmd in (f"cat <<<x\n(true; {R})\nx", f"echo '<<x'\n{R}\nx",
+                    f'echo "<<x"\n{R}\nx', f"# <<x\n{R}\nx",
+                    f"echo $((1<<2))\n{R}",
+                    # Bash strips quoting from the WHOLE delimiter word.
+                    f'cat <<E"OF"\nhi\nEOF\n{R}',
+                    f"cat <<A <<B\na\nA\nb\nB\n{R}",
+                    f"echo ${{x:-<<y}}\n{R}\ny",
+                    f'cat <<<"$({R})"'):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("cat <<<'rm -rf /'")
+
+    def test_heredoc_split_is_a_lexer(self):
+        kept, bodies = guard._split_heredocs("cat <<A <<'B'\na\nA\nb\nB\necho done")
+        self.assertEqual(kept, "cat <<A <<'B'\necho done")
+        self.assertEqual([(b, q) for _o, b, q in bodies], [("a", False), ("b", True)])
+
+    def test_a_hash_after_a_substitution_is_no_comment(self):
+        """`$(x)#` continues the word, so bash runs what follows it. Reading
+        a subshell's `)#…` as text too is the fail-closed side of that."""
+        R = self.R
+        for cmd in (f"echo $(true)#; {R}", f"echo $(true)#|{R}", f"x=$(true)#; {R}",
+                    f"cat <(true)#; {R}", f"echo $((1))#; {R}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertTrue(guard._balanced_groups("(t)#(\n(a; b)")[1])
+
+    def test_a_comment_apostrophe_is_not_a_quote(self):
+        for cmd in (f"# don't\n{self.R}", f"echo hi # don't\n{self.R}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertEqual(guard._split_segments("# don't\nls"), ["ls"])
+
+    def test_case_pattern_alternatives_are_not_pipelines(self):
+        for cmd in ("case $x in reboot|shutdown) echo hi;; esac",
+                    "case $x in reboot | shutdown) echo hi;; esac",
+                    "case $1 in start|stop) echo ok;; *) echo no;; esac",
+                    "case $x in (halt|poweroff) echo hi;; esac"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        R = self.R
+        for cmd in (f"case x in a|b) {R};; esac", f"case x in (a) {R};; esac",
+                    f"case x in @(a|b)) {R};; esac",
+                    f"case x in a) true;; esac | {R}",
+                    f"case $x in\n a) echo;;\nesac\n{R}",
+                    # A substitution in a pattern runs.
+                    f"case x in $({R})) true;; esac"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_a_single_quoted_substitution_is_still_classified(self):
+        """A single-quoted `$(…)` is classified as if it ran, even where bash
+        reads it as text (`git commit -m '$(…)'` — a known false deny).
+
+        Treating it as text was tried and backed out (XERK-1256): every way of
+        scoping "only where nothing runs it" leaked — pipes, `printf -v`, a
+        redirect into .git/config, `--trailer` and its abbreviations, and
+        expansions that make shlex's words differ from bash's. Each case below
+        ran its payload under bash in one of those attempts.
+        """
+        self.assertAllowed("echo \\$\\(rm -rf /\\)")
+        R = self.R
+        for cmd in (f"git commit -m '$({R})'", f"gh pr create --title t --body '$({R})'",
+                    f"bash -c 'echo $({R})'", f"eval 'echo $({R})'",
+                    f"echo \"'$({R})'\"", f"x='$({R})'; eval $x",
+                    f"x='{R}'; eval $x", f"echo 'x $({R})' | sh",
+                    f"find . -exec sh -c 'echo $({R})' \\;", f"sh <<< 'x $({R})'",
+                    f"builtin eval 'x $({R})'", f"eval -- 'x $({R})'",
+                    f"sh -c \"$(echo '$({R})')\"", f"eval \"$(echo '$({R})')\"",
+                    f"git -c core.pager='less $({R})' log",
+                    # An assignment in front is an environment git RUNS, and a
+                    # wrapper word is a program of its own.
+                    "GIT_EDITOR='$(reboot)' git commit", "GIT_EDITOR='`reboot`'; git commit",
+                    "nice git commit -m '$(reboot)'",
+                    "./git commit -m '$(reboot)'",
+                    "printf -v GIT_EDITOR '$(reboot)'; git commit",
+                    "echo ${GIT_EDITOR:='$(reboot)'}; git commit",
+                    # One stage only, and no redirection: nothing later on the
+                    # line may consume what it writes.
+                    f"echo -e '[trailer \"x\"]\\n\\tcommand = $({R})' >> .git/config; "
+                    "git commit --trailer x:y",
+                    f"echo '$({R})' > .git/hooks/pre-commit",
+                    f"git commit -m '$({R})' && echo done",
+                    # A configured trailer.<k>.command runs the value via sh.
+                    f"git commit -m m --trailer 'k:$({R})'", f"git commit -m m --trailer='k:$({R})'",
+                    # git takes any unique prefix of a long option.
+                    f"git commit -m m --trai 'k:$({R})'", f"git commit -m m --tr='k:$({R})'",
+                    f"git -c x=y commit -m '$({R})'", f"git commit -C HEAD -m '$({R})'",
+                    # shlex is not bash: these become `--trailer` only once expanded.
+                    f"git commit -m m $\"--trailer\" 'k:$({R})'",
+                    f"git commit -m m [-]-trailer 'k:$({R})'",
+                    f"git commit -m m * 'k:$({R})'",
+                    # Each of those two rules alone, failing closed: a token
+                    # before `--` that is no allowed option, and a bare expansion.
+                    f"git commit -m m x 'k:$({R})'",
+                    f"gh pr create --title t --body '$({R})' $\"--web\"",
+                    f"git tag -a t -m '$({R})'", "git commit -m x && git status '$(reboot)'",
+                    f"echo \"$(sh -c 'echo $({R})')\"",
+                    f"for i in 1; do printf '$({R})'; done | sh"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_quoted_braces_are_not_expanded(self):
+        self.assertEqual(guard._expand_braces("awk '{print $2,$4}' f"),
+                         "awk '{print $2,$4}' f")
+        self.assertEqual(guard._expand_braces("echo {a,b} '{c,d}'"), "echo a b '{c,d}'")
+        self.assertDenied("bash -c 'rm -rf {/,x}'")
+        self.assertDenied("echo '{a,b}'; rm -rf {/,x}")
+
+    def test_an_empty_substitution_glued_to_a_word_leaves_the_word(self):
+        R = self.R
+        for cmd in (f"``{R}", f"$(){R}", f"`|`{R}", f"$(true){R}",
+                    f'"$(true)"{R}', "rm -rf /$(true)"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ('rm -rf "$(mktemp -d)"', "rm -rf /tmp/build-$(date +%s)"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_a_self_referencing_assignment_does_not_grow(self):
+        """`d=…$d…` was re-inlined at every recursion level until the depth
+        budget refused an ordinary command."""
+        cmd = ("sh -c 'd=/tmp/x; ls $d; python -c \"d=json.load(open(\\\"$d/m\\\")); "
+               "print((d.get(k) for k in (1, 2)))\"'")
+        self.assertAllowed(cmd)
+        self.assertEqual(guard._var_values("d=/; d=$d/etc")["d"], ["/", "//etc"])
+
+
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):
         for cmd in DESTRUCTIVE:
@@ -1397,7 +1563,8 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             ("[[ $x =~ (a|b) ]]", []),
             ("case $x in (a|b) t;; esac", []),
             ("ls # (a; b)", []),
-            ("(t)#(\n(a; b)", ["t", "a; b"]),                           # `#` after `)`
+            # `#` after a substitution's `)` continues the word (XERK-1256).
+            ("echo $(t)#; (a; b)", ["t", "a; b"]),
         ]
         for cmd, bodies in cases:
             with self.subTest(cmd=cmd):
