@@ -166,22 +166,17 @@ static and the only thing that changes is a child's board Done-ness.
     arming a run still gets the child auto-MERGED and messaged, but each ticket owns the decision that
     its work is complete. TRADE-OFF: a child that neither continues nor self-marks Done stalls its
     wave (the deliberate cost of not closing behind live work). Mechanics: `turma-board.md`.
-- **Arming the run is the hands-off opt-in — it OVERRIDES the org auto-merge toggle AND the bug-only
-  floor.** An epic's children are tasks/stories, not just bugs, and the operator armed the run
-  deliberately (operator-confirmed for XERK-637). So `epicRunChildSession` requires neither
-  `autoMergeOrgs[site]` nor `AUTO_MERGE_ISSUE_TYPES` — only membership in an armed run's `children`
-  and a non-Done row. This is why XERK-635 excludes epic children from the ORG stream: the run owns
-  their whole lifecycle (merge + close), and an UNARMED epic's child stays fully excluded (regression-
-  pinned).
-  - **This IS the run-scoped bug-floor bypass XERK-642 names** — the lifting of `AUTO_MERGE_ISSUE_TYPES`
-    for a run's children was already delivered by D (XERK-637); XERK-642 is the ticket that pins it as
-    a deliberate exception to turma-board.md's "never widen past bugs" floor and pins both directions in
-    one place (`XERK-642:` in `server.test.js`). The scope key is HUB-OWNED run membership
-    (`run.children.includes(t.key)`), never the agent-asserted `epicKey` alone — a ticket merely
-    claiming epic membership is NOT enough (a child not in `run.children`, or with no armed run, keeps
-    the bug floor). Do NOT re-implement this inside `autoMergeSession`: the disjoint-function + OR
-    keeps every other XERK-550 gate (readiness, per-repo serialization, retry classification, backoff)
-    shared and unduplicated.
+- **Arming the run is the hands-off opt-in — it OVERRIDES the org auto-merge toggle.** The operator
+  armed the run deliberately (operator-confirmed for XERK-637), so `epicRunChildSession` requires
+  neither `autoMergeOrgs[site]` nor the org triage policy — only membership in an armed run's
+  `children` and a non-Done row. This is why XERK-635 excludes epic children from the ORG stream: the
+  run owns their whole lifecycle (merge + close), and an UNARMED epic's child stays fully excluded
+  (regression-pinned).
+  - **The scope key is HUB-OWNED run membership** (`run.children.includes(t.key)`, XERK-642), never
+    the agent-asserted `epicKey` alone — a ticket claiming epic membership after arming rides neither
+    the run nor the org stream (`XERK-642:` in `server.test.js`). Do NOT re-implement this inside
+    `autoMergeSession`: the disjoint-function + OR keeps every other XERK-550 gate (readiness,
+    per-repo serialization, retry classification, backoff) shared and unduplicated.
 - **An armed child also merges a MERGEABLE no-CI PR — the org stream does not** (XERK-659,
   `prAutoMergeReady`). `_merge_ready` leaves a PR with ZERO CI checks unmarked (`ready:null`,
   `checks:null`) — "absent CI is not evidence of anything" — which is the right conservative bar for
@@ -249,7 +244,7 @@ static and the only thing that changes is a child's board Done-ness.
   and a paused run never auto-completes its epic. Web: the `XERK-641` cases in `board.test.js`
   (paused view/sig, the `kc-epic-paused` chip, Resume/Pause button visibility). Android:
   `epicRunView surfaces the run's paused hold` in `BoardTest.kt`.
-- The `XERK-637:` cases in `server.test.js`: an armed child auto-merges past the opt-in + bug floor,
+- The `XERK-637:` cases in `server.test.js`: an armed child auto-merges past the org opt-in,
   is MESSAGED to self-close past the opt-in (XERK-705, no Done write/kill), an UNARMED epic child
   stays excluded, a child added after arming (not in `run.children`) stays excluded, chain-advance (a
   self-closed child unblocks dependents without completing the epic), epic-Done-written-once + run

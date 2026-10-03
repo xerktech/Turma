@@ -6706,8 +6706,21 @@ class TestAdoptTicket(ManagerMixin, unittest.TestCase):
         self.assertEqual(t["summary"], "Link session to ticket")
         self.assertEqual(t["branch"], "XERK-817")
         self.assertTrue(sess["ticketAdopted"])
+        # SERVED provenance: the hub's auto-merge stands down on it (XERK-1440).
+        self.assertIs(t["adopted"], True)
         # And it landed in the durable transcriptId -> ticket ledger.
         self.assertEqual(sm.ticket_ledger["t1"]["key"], "XERK-817")
+
+    def test_served_ticket_marks_adoption_for_older_records(self):
+        # A record adopted before the block carried `adopted` (internal flag only)
+        # still serves it; a spawned ticket serves its block untouched.
+        hub = sys.modules[type(self.make_manager()).__module__]
+        old = {"ticket": {"key": "XERK-817", "siteKey": "x"}, "ticketAdopted": True}
+        self.assertIs(hub._served_ticket(old)["adopted"], True)
+        self.assertNotIn("adopted", old["ticket"])      # the record is not mutated
+        spawned = {"ticket": {"key": "XERK-1", "siteKey": "x"}}
+        self.assertIs(hub._served_ticket(spawned), spawned["ticket"])
+        self.assertIsNone(hub._served_ticket({}))
 
     def test_adopts_from_a_decorated_branch(self):
         sm = self._mgr()
@@ -16109,6 +16122,23 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
             sm.set_model_source("abcde", "local")
         self.assertEqual(sess["modelSource"], "subscription")
         self.assertEqual(sess["status"], "error")
+
+    def test_kill_resume_keeps_an_older_agents_ticket_adoption(self):
+        """A session adopted by an agent predating `ticket.adopted` carries only
+        the internal `ticketAdopted` flag. A kill -> resume must still serve the
+        session as adopted, or the hub auto-merges it (XERK-1440)."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess.update({"repo": "Turma", "repoPath": os.path.join(self.tmp, "Turma"),
+                     "ticket": {"key": "AD-1", "siteKey": "x"}, "ticketAdopted": True})
+        os.makedirs(sess["repoPath"], exist_ok=True)
+        self.assertIs(sm._session_payload(sess)["ticket"]["adopted"], True)
+        sm._remember_closed(sess)
+        sm.registry = []
+        sm.resume(sess["id"])
+        revived = sm._find(sess["id"])
+        self.assertIs(revived["ticket"]["adopted"], True)
+        self.assertIs(sm._session_payload(revived)["ticket"]["adopted"], True)
 
     def test_kill_then_resume_stays_on_the_local_model(self):
         """Usage has not come back just because the session was killed. A resume

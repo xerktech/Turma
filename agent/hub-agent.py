@@ -15247,6 +15247,16 @@ def ticket_branch_base(key, detail):
 _JIRA_KEY_IN_BRANCH_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*-[0-9]+")
 
 
+def _served_ticket(sess):
+    """The session's `ticket` block as served. A record adopted before the block
+    carried `adopted` (only the internal `ticketAdopted` flag) still serves it, so
+    the hub's auto-merge stand-down covers sessions that predate this agent."""
+    ticket = sess.get("ticket")
+    if isinstance(ticket, dict) and sess.get("ticketAdopted") and not ticket.get("adopted"):
+        return {**ticket, "adopted": True}
+    return ticket
+
+
 def issue_key_from_branch(branch, known_keys):
     """Find a board issue key embedded in a session's live branch name, matched
     against the set of keys this host actually collected (`known_keys`). Returns
@@ -18087,9 +18097,12 @@ class SessionManager:
             "url": match.get("url") or f"https://{site_key}/browse/{key}",
             "summary": (match.get("summary") or "")[:200],
             "branch": live_branch,
+            # Provenance, SERVED: this session was started bare ("new session")
+            # and only linked to the ticket by its branch, so the hub never
+            # auto-merges its PRs (XERK-1440). Rides the block, so a migration
+            # carries it.
+            "adopted": True,
         }
-        # Internal provenance only (not served) — distinguishes a branch-adopted
-        # link from a ticket spawn without changing the wire `ticket` shape.
         sess["ticketAdopted"] = True
         self._remember_ticket(sess)           # durable transcriptId -> ticket ledger
         return True
@@ -21491,6 +21504,10 @@ class SessionManager:
             "id", "repo", "repoPath", "worktreePath", "branch", "baseRef",
             "rcName", "tmuxName", "createdAt", "label", "summary",
             "summaryManual", "model", "permissionMode", "root", "ticket",
+            # Branch-adopted ticket provenance (XERK-1440). A record adopted by an
+            # older agent has it ONLY here, not as `ticket.adopted`; dropping it
+            # would make the resumed session auto-merge.
+            "ticketAdopted",
             # The summary the live name was last renamed to (XERK-815). Carried so
             # a resume does NOT re-issue a redundant `/rename` for a name the
             # relaunched session already answers to — that keystroke would collide
@@ -21632,7 +21649,7 @@ class SessionManager:
             # The ticket (and its reserved branch name) survives a kill/resume:
             # it's what this session IS, and _launch_tmux re-tells the agent the
             # same branch name rather than reserving a fresh one.
-            "ticket": rec.get("ticket"),
+            "ticket": _served_ticket(rec),     # folds an older ticketAdopted in
             # The conversation this session was having, so _launch_tmux rejoins
             # THAT one. Root sessions share a project dir, so "the newest
             # transcript here" is not the same question as "this session's".
@@ -30797,7 +30814,7 @@ class SessionManager:
             # The Jira ticket this session was spawned to work — {key, siteKey,
             # url, summary, branch} — or None. The board reverse-indexes it to
             # link a ticket to its sessions; the session card links back out.
-            "ticket": sess.get("ticket"),
+            "ticket": _served_ticket(sess),
             # The hub command that created this session (spawn / resumeTranscript),
             # so the UI that issued it can find the id the agent minted and open
             # the session. None for sessions predating the echo, or restored ones.
