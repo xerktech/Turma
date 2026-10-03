@@ -143,6 +143,16 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
       needed escaping, and denies if either reading does. Don't add escape layers instead.
     - `_quote_states` reads a `#` comment as `#` to line end, in its one pass: `# don't`
       opened a "quote"; a per-comment re-scan was 10x slower and capped (fail-open).
+  - **A `#` inside `${…}` is text** (XERK-1585): `${y:- #}; rm -rf /` runs the `rm`. The
+    splitter tracks `${`/`$(` nesting; the default splice escapes its `#`.
+    - `_VAR_USE_RE`'s `[^}]*` stops at a QUOTED or nested `}` (`${a:-'}' #}`); `rep` leaves
+      such a match raw (`_brace_end`) rather than splice a short one.
+    - Whether a `$` is live (`_live_dollar`: `\${`, `$${`) holds for ONE parse — an unquoted
+      heredoc or `bash -c "…"` strips a backslash first. A skip therefore also triggers
+      `_expand_both`'s splice-everything reading. Never trust a single escape judgement.
+  - **`eval` re-parses its RAW words once per `eval`** (XERK-1585): read before the
+    substitution pass (which ate a quoted `'$('`) and before the `_SEGMENT_SPLIT` early
+    `continue`. A 7-deep `eval` chain hits `_MAX_EXPAND_DEPTH` and is denied, on purpose.
   - **`cd` targets are SCOPE-blind** (`_cd_targets`, inherited into recursion): a later `cd`
     never clears an earlier one, since it may fail, sit in a subshell/pipe, or be `cd -`;
     clearing let `cd /; (cd /tmp); rm -rf *` through.
