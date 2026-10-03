@@ -21,6 +21,52 @@ NATIVE_DIR="$(dirname "$HERE")/native"
 SCRIPT="$NATIVE_DIR/turma-agent-update"
 FAILED=0
 
+# Isolate the whole suite from the HOST it runs on (XERK-1481). The per-case fake
+# gh/systemctl live under each case's $root, so anything that outlives its case's
+# `rm -rf "$root"` resolves the REAL ones — and on an agent host the inherited
+# bus reaches the live user manager: a stray updater installed the real latest
+# release into a dead test prefix, then ran the real `systemctl --user restart
+# turma-agent`, restarting the host's agent ~20 times in an hour. Taking away the
+# bus and gh credentials is NOT enough on its own: the updater falls back to
+# anonymous curl against the public repo, and with no bus it restarts through the
+# freshly installed turma-agentctl, which would start a second manager on the
+# host's inherited TURMA_* env. So also route every HTTP(S) request to a dead
+# proxy (inherited by any stray, and it outlives `rm -rf`) and drop the host's
+# agent identity. Every fake (gh, curl, systemctl) ignores all of these.
+ISOLATE="$(mktemp -d)"
+chmod 700 "$ISOLATE"
+trap 'rm -rf "$ISOLATE"' EXIT
+export XDG_RUNTIME_DIR="$ISOLATE" GH_CONFIG_DIR="$ISOLATE/gh"
+# Every case root (and the updater's own staging dirs) lands under ISOLATE, so
+# the end-of-suite orphan check below has one path to look for, and the EXIT
+# trap sweeps whatever a case forgot.
+mkdir -p "$ISOLATE/tmp"; export TMPDIR="$ISOLATE/tmp"
+export http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 all_proxy=http://127.0.0.1:9
+export HTTP_PROXY="$http_proxy" HTTPS_PROXY="$https_proxy" ALL_PROXY="$all_proxy"
+unset no_proxy NO_PROXY DBUS_SESSION_BUS_ADDRESS GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN \
+  GITHUB_ENTERPRISE_TOKEN TURMA_AGENT_ENV TURMA_TOKEN TURMA_URL
+
+# Stop a backgrounded `--loop` poller AND everything it started. `kill $pid`
+# alone ends only the loop's bash: its `timeout … --locked-run` child (run_locked)
+# is orphaned and runs on — up to its 900s deadline — after the case has deleted
+# the fakes it relied on. So is a holder's child when a reclaim case kills the
+# holder, before this ever runs. Every one of them carries this case's
+# "$bin/turma-agent-update" in its cmdline, so reap by that, not by parentage.
+# pkill/pgrep -f take a REGEX, so the path is escaped — a `+` in TMPDIR otherwise
+# matched nothing — and the loop pid is signalled directly so `wait` can't hang.
+stop_loop() {  # <pid> <bin>
+  local pat
+  pat="$(printf '%s/turma-agent-update' "$2" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+  kill -TERM "$1" 2>/dev/null || true
+  pkill -TERM -f "$pat" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    pgrep -f "$pat" >/dev/null || return 0
+    sleep 0.1
+  done
+  pkill -KILL -f "$pat" 2>/dev/null || true
+}
+
 pass() { echo "  ok: $1"; }
 fail() { echo "  FAIL: $1"; FAILED=1; }
 # assert <expected> <actual> <ok-msg> <fail-msg>
@@ -893,7 +939,7 @@ for bad in 0 abc -5; do
   sleep 3
   runs="$(grep -c 'up to date' "$root/loop.log" 2>/dev/null || true)"
   alive=no; kill -0 "$loop_pid" 2>/dev/null && alive=yes
-  kill "$loop_pid" 2>/dev/null || true; wait "$loop_pid" 2>/dev/null || true
+  stop_loop "$loop_pid" "$bin"
   if [ "${runs:-0}" -le 2 ] && [ "$alive" = yes ]; then
     pass "TURMA_UPDATE_INTERVAL=$bad neither hot-loops nor kills the poller ($runs run(s) in 3s)"
   else
@@ -1114,7 +1160,7 @@ for _ in $(seq 1 60); do grep -q "up to date" "$root/loop.log" 2>/dev/null && br
 out="$(FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
   TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_BOOT_UPDATE_MIN_INTERVAL=0 \
   "$bin/turma-agent-update" --boot 2>&1 || true)"
-kill "$loop_pid" 2>/dev/null || true; wait "$loop_pid" 2>/dev/null || true
+stop_loop "$loop_pid" "$bin"
 if printf '%s' "$out" | grep -q "holds the lock"; then
   fail "a sleeping --loop poller blocked the start-fired check (that host never updates)"
 else
@@ -1430,7 +1476,7 @@ install_fake_gh "$bin"
 FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
   TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_LOCK_RECLAIM_AFTER=2 TURMA_BOOT_UPDATE_MIN_INTERVAL=0 \
   "$bin/turma-agent-update" --boot >"$root/boot.log" 2>&1 || true
-kill "$loop_pid" 2>/dev/null || true; wait "$loop_pid" 2>/dev/null || true
+stop_loop "$loop_pid" "$bin"
 got="$(tr -d '[:space:]' < "$prefix/VERSION")"
 if grep -q 'reclaimed update.lock' "$root/home/.turma/update.log" 2>/dev/null; then
   pass "a wedged lock holder is reclaimed once it ages past the threshold"
@@ -1464,7 +1510,7 @@ out="$(FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech
   TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_BOOT_UPDATE_MIN_INTERVAL=0 \
   "$bin/turma-agent-update" --boot 2>&1 || true)"
 still_alive=no; kill -0 "$loop_pid" 2>/dev/null && still_alive=yes
-kill "$loop_pid" 2>/dev/null || true; wait "$loop_pid" 2>/dev/null || true
+stop_loop "$loop_pid" "$bin"
 if [ "$still_alive" = yes ] && printf '%s' "$out" | grep -q 'holds the lock'; then
   pass "a healthy holder is not reclaimed — single-flight preserved"
 else
@@ -1504,7 +1550,7 @@ for _ in $(seq 1 50); do
   [ "${n:-0}" -ge 3 ] && break
   sleep 0.2
 done
-kill "$loop_pid" 2>/dev/null || true; wait "$loop_pid" 2>/dev/null || true
+stop_loop "$loop_pid" "$bin"
 kill "$hold_pid" 2>/dev/null || true; wait "$hold_pid" 2>/dev/null || true
 n="$(grep -c 'retrying in' "$root/loop.log" 2>/dev/null || true)"; n="${n:-0}"
 if [ "$n" -ge 3 ]; then
@@ -1680,6 +1726,17 @@ EOF2
   rm -rf "$root" "$d"
 else
   pass "timer refresh cases skipped: no systemd on this runner"
+fi
+
+# Nothing this suite started may outlive it (XERK-1481): an orphan loses its
+# fakes when its case root goes and reaches for the real gh/systemctl. Fail on
+# one — so a stop_loop regression can't ship green — and reap it.
+iso_pat="$(printf '%s' "$ISOLATE" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+if pgrep -f "$iso_pat" >/dev/null; then
+  fail "processes outlived their case: $(pgrep -af "$iso_pat" | cut -c1-160 | tr '\n' ';')"
+  pkill -KILL -f "$iso_pat" 2>/dev/null || true
+else
+  pass "no process outlived its case"
 fi
 
 if [ "$FAILED" = 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi

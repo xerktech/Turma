@@ -1,6 +1,7 @@
 ---
 paths:
   - "agent/native/**"
+  - "agent/tests/test_turma_agent_update.sh"
 ---
 
 # `agent/native/` — non-Docker agent install (WSL/Linux)
@@ -96,6 +97,17 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
 - `turma-agent-update` — self-updater: compares the manifest's **component version, never the tag**,
   verifies sha256, swaps files, restarts. Falls back to the legacy `agent-native-v*` stream. Tests:
   `test_turma_agent_update.sh`.
+  - **Its test suite must never let an updater outlive its case (XERK-1481)** — this suite runs
+    the REAL updater, and on an agent host an orphan (a killed `--loop`'s or reclaimed holder's
+    `timeout … --locked-run` child) outlives the case's `rm -rf $root`, loses the fakes, installs
+    the real release and runs the real `systemctl --user restart turma-agent`: TrueNAS restarted
+    ~20 times in an hour. Stop a background updater with `stop_loop <pid> "$bin"` (reaps by the
+    case's escaped `$bin` path, not parentage); the suite FAILS if any process outlives it (all
+    roots live under its private `TMPDIR`). Keep the top-of-file host isolation: no bus and no
+    gh auth are NOT enough (the updater falls back to anonymous curl, then restarts via the
+    installed `turma-agentctl` on the inherited `TURMA_*` env), so it also points every HTTP(S)
+    request at a dead proxy and unsets `TURMA_AGENT_ENV`/`TURMA_TOKEN`/`TURMA_URL`. CI has no user
+    bus, so none of this ever shows there.
   - **Lock taken per run, released before the sleep** — `--loop` holding it for its whole life made
     every `turma-agentctl start`-fired check exit as "another update run holds the lock".
   - **The lock + stamps are SCOPED to the install `$PREFIX` (XERK-551)** — keyed off `$HOME` (as they
