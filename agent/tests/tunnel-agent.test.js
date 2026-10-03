@@ -2874,3 +2874,75 @@ test("captureLiveTurn reads the default server only for a published legacy sessi
     }
   }
 });
+
+// XERK-1421: a watch arming on a session whose background shell was launched
+// further back than the 128 KiB tail window must still list it — the manager's
+// restart back-scan (AGENT_BACKSCAN_BYTES) sees it, so the card and the chat
+// bar would otherwise disagree.
+test("watch start back-scans: a shell launched beyond the tail window is still live", async () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backscan-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const proj = path.join(PROJECTS_ROOT, mod.projectSlug(work));
+  fs.mkdirSync(proj, { recursive: true });
+  const tid = "22222222-3333-4444-5555-666666666666";
+  const tpath = path.join(proj, `${tid}.jsonl`);
+  const write = (...entries) =>
+    fs.appendFileSync(tpath, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  // A stop for an OLDER shell, written just before the back-scan window — the
+  // lead-in must keep it, so its (later-read) launch is no phantom.
+  write({ type: "queue-operation", operation: "enqueue", content:
+    "<task-notification>\n<task-id>old1</task-id>\n<status>completed</status>\n</task-notification>" });
+  write({ type: "assistant", message: { content: [
+    { type: "tool_use", id: "tb1", name: "Bash",
+      input: { command: "gh pr checks --watch", description: "Watch CI", run_in_background: true } }] } });
+  write({ type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "tb1", content: "started" }] },
+    toolUseResult: { stdout: "", backgroundTaskId: "bsh1" } });
+  // One 174 KB attachment pushes the launch out of the 128 KiB tail window.
+  write({ type: "attachment", attachment: { content: "x".repeat(174 * 1024) } });
+  write({ type: "user", message: { content: "next" } });
+  assert.ok(fs.statSync(tpath).size > (1 << 17));
+
+  const frames = [];
+  mod.__setControlSink((o) => frames.push(o));
+  try {
+    mod.startWatch("sess-backscan", work, tid);
+    await new Promise((r) => setTimeout(r, 400));
+    const turn = frames.find((f) => f.turn === "sess-backscan");
+    assert.ok(turn, "a turn frame was emitted");
+    assert.deepEqual(turn.agents.map((a) => [a.type, a.label]), [["shell", "Watch CI"]],
+      "the shell launched beyond the tail window is listed");
+  } finally {
+    mod.stopWatch("sess-backscan");
+    mod.__setControlSink(null);
+  }
+});
+
+test("backscanLiveAgents: a stop in the lead-in before the window still wins", () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backscan-lead-"));
+  const p = path.join(dir, "t.jsonl");
+  const stop = { type: "queue-operation", operation: "enqueue", content:
+    "<task-notification>\n<task-id>bsh1</task-id>\n<status>completed</status>\n</task-notification>" };
+  const pad = { type: "user", message: { content: "x".repeat(1000) } };
+  const launch = [
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "tb1", name: "Bash",
+      input: { command: "sleep 600", run_in_background: true } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tb1", content: "" }] },
+      toolUseResult: { stdout: "", backgroundTaskId: "bsh1" } }];
+  const lines = [pad, pad, pad, stop, pad, ...launch, pad];
+  fs.writeFileSync(p, lines.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  const body = fs.readFileSync(p, "utf8");
+  // Cut the window in the pad between the stop and the launch.
+  const cut = body.indexOf("bsh1") + 600;
+  assert.ok(cut < body.indexOf("backgroundTaskId"));
+  const state = { live: new Map(), tasks: new Map() };
+  mod.backscanLiveAgents(p, state, body.length - cut);
+  assert.deepEqual(mod.liveAgentsReport(state), []);
+  // Same window without the lead-in's stop: the launch registers.
+  const fresh = { live: new Map(), tasks: new Map() };
+  mod.backscanLiveAgents(p, fresh, body.length - cut, 0);
+  assert.equal(mod.liveAgentsReport(fresh).length, 1);
+});
