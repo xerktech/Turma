@@ -8554,6 +8554,12 @@ _SHELL_REDIR_RE = re.compile(r"^(\d+|&)?(>>?|<<?<?)(&?)(.*)\Z", re.ASCII)
 # is a short line, and `work` is today's reading.
 _SHELL_KIND_MAX_CHARS = 4096
 _SHELL_KIND_MAX_WORD = 256
+
+
+def _utf16_len(s):
+    """Length in UTF-16 units, the unit JS `.length` counts — so both caps cut
+    at the SAME place in the tunnel mirror (an astral char is 2 there, 1 in len)."""
+    return len(s.encode("utf-16-le", "surrogatepass")) // 2
 # kubectl global flags that take a SEPARATE value, skipped to find the subcommand.
 _KUBECTL_VALUE_FLAGS = frozenset({"-n", "--namespace", "--context", "--kubeconfig",
                                   "--cluster", "--user", "-s", "--server", "--as",
@@ -8803,10 +8809,13 @@ def _shell_loop(segs, i):
 
 def _shell_kind(command):
     """(kind, seconds-or-None) of a background shell's command — see above."""
-    if not isinstance(command, str) or len(command) > _SHELL_KIND_MAX_CHARS:
+    # len() first: a code-point count never exceeds the UTF-16 one, so an
+    # oversize command is refused before anything encodes it.
+    if (not isinstance(command, str) or len(command) > _SHELL_KIND_MAX_CHARS
+            or _utf16_len(command) > _SHELL_KIND_MAX_CHARS):
         return SHELL_KIND_WORK, None
     segs = _shell_segments(command)
-    if any(len(w) > _SHELL_KIND_MAX_WORD for seg in segs for st in seg for w in st):
+    if any(_utf16_len(w) > _SHELL_KIND_MAX_WORD for seg in segs for st in seg for w in st):
         return SHELL_KIND_WORK, None
     timed = external = False
     total = 0.0
@@ -8962,7 +8971,8 @@ def _scan_agent_entry(entry, state):
             # index — which spans the whole conversation — rather than the 8 MiB
             # window the resolvers read. The JS mirror (scanAgentEntry) does not
             # carry it: resolution lives only here, and its liveAgentsReport emits
-            # the same {type,label} rows onto the wire, so parity is unaffected.
+            # the same {type,label,kind?,startedAt?,eta?} rows (never resolveId),
+            # so parity is unaffected.
             launched_at = _ts_ms(entry.get("timestamp"))
             if launch["type"] == "shell":
                 call = shells.get(tool_id) or {}
