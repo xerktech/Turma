@@ -1031,7 +1031,13 @@ class TestParserGaps(unittest.TestCase):
                     f"find . -exec sh -c 'echo $({R})' \\;", f"sh <<< 'x $({R})'",
                     f"builtin eval 'x $({R})'", f"eval -- 'x $({R})'",
                     f"sh -c \"$(echo '$({R})')\"", f"eval \"$(echo '$({R})')\"",
-                    f"git -c core.pager='less $({R})' log"):
+                    f"git -c core.pager='less $({R})' log",
+                    # An assignment in front is an environment git RUNS, and a
+                    # wrapper word is a program of its own.
+                    "GIT_EDITOR='$(reboot)' git commit", "GIT_EDITOR='`reboot`'; git commit",
+                    "nice git commit -m '$(reboot)'",
+                    f"echo \"$(sh -c 'echo $({R})')\"",
+                    f"for i in 1; do printf '$({R})'; done | sh"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
 

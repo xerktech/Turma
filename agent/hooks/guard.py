@@ -426,8 +426,19 @@ _QUOTED_TEXT_GIT = {"commit", "tag", "notes", "log", "show", "status", "add", "d
 _QUOTED_TEXT_FORGE = {"create", "comment", "edit", "review", "note", "update"}
 
 
-def _quoted_text_only(tokens: list[str]) -> bool:
-    """Whether ``tokens`` (one stage) only ever reads a quoted string as text."""
+def _quoted_text_only(raw_tokens: list[str]) -> bool:
+    """Whether one stage (its UNSTRIPPED tokens) only ever reads a quoted
+    string as text.
+
+    Anything but a reserved word in front of the program disqualifies it: an
+    assignment is an environment the program may RUN — `GIT_EDITOR='$(x)' git
+    commit` has git hand it to `sh -c` — and a wrapper word is a program of its
+    own. A bare assignment stage (`GIT_EDITOR='…'; git commit`) updates an
+    exported variable the same way.
+    """
+    tokens = _strip_prefixes(raw_tokens)
+    if any(t not in _SHELL_KEYWORDS for t in raw_tokens[:len(raw_tokens) - len(tokens)]):
+        return False
     if not tokens:
         return True
     prog = _basename(tokens[0])
@@ -1138,7 +1149,7 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
     # Collect every path-shaped operand in the command so an xargs segment can
     # be judged against what is actually going to be fed to it.
     quoted_text = all(
-        _quoted_text_only(_strip_prefixes(_tokenize(_unwrap_group(raw)))) for raw in segments
+        _quoted_text_only(_tokenize(_unwrap_group(raw))) for raw in segments
     )
     piped_operands: list[str] = []
     for raw in segments:
