@@ -16578,6 +16578,10 @@ class SessionManager:
         self._inventory_inputs = None
         self._inventory_ready = None
         self._inventory_worker = None
+        # Whether any reply has told us the hub's archive path yet, and whether
+        # an inventory has been staged since boot (see build_payload).
+        self._archive_offer_known = False
+        self._inventory_staged_once = False
         # XERK-424. `_archive_known` is transcriptId -> the byte cursor the hub
         # last reported for it, which is the only way this side can tell "the hub
         # has this" from "the hub has never seen it" — the reply only carries
@@ -27061,6 +27065,7 @@ class SessionManager:
             # rolled-back hub stops advertising it). Cheap, and inside the try
             # because it reads the untrusted reply.
             self._archive_hub_offer = (reply.get("archiveOffer") == "hub")
+            self._archive_offer_known = True
             if job is not None and self._archive_sent_inventory:
                 # The inverted path: the reply's `archiveHave` IS the hub's want,
                 # so `_archive_pending` becomes exactly the wanted ids resolved
@@ -31434,11 +31439,22 @@ class SessionManager:
                 self._archive_sent_inventory = True
                 if inventory:
                     payload["archiveInventory"] = inventory
-        if refresh:
+        #
+        # Until a reply has said which path this hub takes, NEITHER runs: beat 0
+        # after every restart used to take the inline manifest walk by default,
+        # paying the very cost this moved off. The first full beat that learns
+        # the hub offers stages straight away rather than waiting a refresh cycle.
+        stage = refresh or (not light and self._archive_hub_offer
+                            and not self._inventory_staged_once)
+        if stage and self._archive_offer_known:
             if self._archive_hub_offer:
                 self._archive_sent_inventory = True
+                self._inventory_staged_once = True
                 self._stage_archive_inventory(self._archive_candidate_inputs())
-            else:
+            elif refresh:
+                # A hub that stopped offering: an inventory published for it must
+                # never ship after it re-advertises, however stale by then.
+                self._take_archive_inventory()
                 self._archive_sent_inventory = False
                 manifest = self._archive_manifest()
                 self._archive_pending = {m["transcriptId"]: m for m in manifest}

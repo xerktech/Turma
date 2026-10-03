@@ -25549,7 +25549,8 @@ class TestArchiveInventory(ManagerMixin, unittest.TestCase):
         self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
         self._ledger(sm, wt)
         sm.registry = []
-        # Default: no capability seen yet -> the old manifest path.
+        # A hub that does NOT offer -> the old manifest path.
+        sm._archive_offer_known = True
         sm._archive_hub_offer = False
         payload = sm.build_payload(0)
         self.assertIn("archiveManifest", payload)
@@ -25585,15 +25586,26 @@ class TestArchiveInventory(ManagerMixin, unittest.TestCase):
         self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
         self._ledger(sm, wt)
         sm.registry = []
+        sm._archive_offer_known = True
         sm._archive_hub_offer = True
         threads = []
+        input_threads = []
         release = threading.Event()
         real = sm._archive_candidates_from
+        real_inputs = sm._archive_candidate_inputs
         def slow_walk(inputs):
             threads.append(threading.current_thread().name)
             release.wait(5)
             return real(inputs)
-        with mock.patch.object(sm, "_archive_candidates_from", slow_walk):
+        def inputs_spy():
+            input_threads.append(threading.current_thread().name)
+            return real_inputs()
+        # An EMPTY repos root: the bound below times the inventory, not the
+        # first beat's git over whatever repos this host has.
+        empty = tempfile.mkdtemp(dir=self.tmp)
+        with mock.patch.object(sm, "_archive_candidates_from", slow_walk), \
+             mock.patch.object(sm, "_archive_candidate_inputs", inputs_spy), \
+             mock.patch.object(ha, "REPOS_ROOT", empty):
             t0 = time.time()
             payload = sm.build_payload(0)
             self.assertLess(time.time() - t0, 3, "the refresh beat waited for the walk")
@@ -25603,6 +25615,9 @@ class TestArchiveInventory(ManagerMixin, unittest.TestCase):
             release.set()
             self._wait_published(sm)
         self.assertEqual(threads, ["archive-inventory"])
+        # The registry/ledger reads stay on the beat; the worker only walks disk.
+        self.assertTrue(input_threads)
+        self.assertNotIn("archive-inventory", input_threads)
         # A LIGHT beat never ships it; the next full beat does, once, with the
         # catalog it was built with swapped in beside it.
         sm._archive_catalog = {}
@@ -25614,6 +25629,44 @@ class TestArchiveInventory(ManagerMixin, unittest.TestCase):
         # The reply's want resolves against that catalog.
         sm.queue_archive_sync({"archiveOffer": "hub", "archiveHave": {"t1": 0}})
         self.assertEqual(set(sm._archive_pending), {"t1"})
+
+    def test_no_archive_walk_until_the_hub_has_said_which_path(self):
+        # Beat 0 after a restart knows nothing of the hub yet; it must not take
+        # the inline manifest walk by default.
+        sm = self.make_manager()
+        sm.registry = []
+        sm.usage_ledger = {}
+        with mock.patch.object(sm, "_archive_manifest",
+                               side_effect=AssertionError("inline walk")), \
+             mock.patch.object(sm, "_stage_archive_inventory",
+                               side_effect=AssertionError("staged blind")):
+            payload = sm.build_payload(0)
+        self.assertNotIn("archiveManifest", payload)
+        # The first reply says the hub offers: the very next full beat stages,
+        # without waiting for a refresh beat.
+        sm.queue_archive_sync({"archiveOffer": "hub"})
+        with mock.patch.object(sm, "_stage_archive_inventory") as stage:
+            sm.build_payload(1, light=True)
+            stage.assert_not_called()
+            sm.build_payload(1)
+            stage.assert_called_once()
+            sm.build_payload(2)
+            stage.assert_called_once()
+
+    def test_a_stale_inventory_never_ships_after_the_offer_flips_back(self):
+        sm = self.make_manager()
+        sm.registry = []
+        sm.usage_ledger = {}
+        sm._archive_offer_known = True
+        sm._archive_hub_offer = True
+        with sm._inventory_lock:
+            sm._inventory_ready = ([{"i": "old", "s": 1, "r": 1}], {"old": {}})
+        sm._archive_hub_offer = False  # a rolled-back hub
+        sm.build_payload(ha.USAGE_EVERY)  # refresh: the manifest path
+        sm._archive_hub_offer = True   # re-rolled
+        with mock.patch.object(sm, "_stage_archive_inventory"):
+            payload = sm.build_payload(ha.USAGE_EVERY + 1)
+        self.assertNotIn("archiveInventory", payload)
 
     def test_a_failed_worker_start_never_raises_onto_the_beat(self):
         sm = self.make_manager()
