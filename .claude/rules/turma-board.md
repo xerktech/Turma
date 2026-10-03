@@ -216,10 +216,9 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
   - **No issue-type floor (XERK-1440)**: any tracker Issue Type the content gate passes auto-merges
     — the org's triage auto-start settings (board → Triage policy, `excludeTypes`) ARE the knob for
     what merges hands-off. Narrow the policy to narrow auto-merge; there is no second bug-only gate.
-    Jira epics + epic children never ride this stream (the content gate excludes them); an armed
-    epic run merges its own children via `epicRunChildSession` (`.claude/rules/turma-epic-run.md`).
-    - **ADO rows carry no `isEpic`/`epicKey`** (`_shape_azure` emits only `type`/`parentKey`), so an
-      ADO Epic/Feature and its children are NOT excluded — from auto-start OR auto-merge. XERK-1444.
+    Epics + epic children never ride this stream (the content gate excludes them) — Jira, and ADO
+    Epics/Features + their direct children (XERK-1444, `agent-board.md`); an armed epic run merges
+    its own children via `epicRunChildSession` (`.claude/rules/turma-epic-run.md`).
     - A session spawned FROM a ticket (board Start, auto-start, queue) merges whoever started it —
       do not describe it as "only sessions the hub started". It is independent of the auto-START
       switch (`autoMergeOrgs`, never `autoStartOrgs`).
