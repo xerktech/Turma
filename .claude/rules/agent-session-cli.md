@@ -42,7 +42,8 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
 
 - Every Claude launch exports `TURMA_SESSION_CLI=<absolute path>` beside `TURMA_SESSION_ID`/
   `TURMA_QUESTIONS_DIR` — in the POSIX env prefix and in the Windows `extra_env` dict.
-- Not yet exported to dsh/qwen sessions (their launchers build their own env); a follow-up.
+- Not yet exported to dsh/qwen sessions (`_launch_dsh`/`_launch_qwen` build their own env); a
+  follow-up. The directive that teaches the CLI must not teach it to a dsh/qwen session until then.
 
 ## Guard bookkeeping
 
@@ -77,6 +78,9 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   `pendingInputs` outbox. Then the fields are cleared and `wake.json` removed — unless the session
   has since written a DIFFERENT request, which stands. `_wake_fired` stops a file that could not be
   removed from firing twice.
+- **After ingest the RECORD is authoritative, not the file.** A beat with no `wake.json` keeps the
+  record's `wakeAt`, so deleting the file does not cancel. A newer `wake` supersedes; nothing
+  cancels (no `wake cancel` subcommand yet).
 - **Kill / delete / clear-context restart** (and the dead-session sweep's fresh relaunch) clear the
   whole request dir via `_clear_session_requests` beside `_clear_question_files` — a request made by
   a conversation dies with it. A symlinked dir is unlinked, never followed. A model switch or
@@ -92,3 +96,8 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   Bash rules on the command text, so the `"$TURMA_SESSION_CLI"` spelling may not match it. If it
   prompts, the directive that teaches sessions the CLI (a later child) must give the absolute path
   (`session_cli_path()`), not the variable. Record the answer here.
+- **Windows interpreter (not yet answered)**: the rule and the taught command hard-code `python3`,
+  but the Windows launcher runs `python`, and a python.org/winget install has no `python3.exe` —
+  `python3` there is the Microsoft Store stub. The directive child must spell the interpreter that
+  works there, or export it (e.g. `TURMA_SESSION_PYTHON=sys.executable`) and build the allow rule
+  from it, as `build_guard_settings` does for the hooks.
