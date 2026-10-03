@@ -257,7 +257,11 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
   first present in `self.jira` (which both validates it over a coincidental/foreign `X-9` and yields
   the url/summary), leftmost wins over a trailing `-slug`. Guarded (root session / already-linked /
   detached / no board all skip; a raise can't take the host down, XERK-402); idempotent via the
-  `ticket` check; provenance is the internal, unserved `ticketAdopted`.
+  `ticket` check.
+  - **Provenance is SERVED as `ticket.adopted: true`** (XERK-1440): the hub's auto-merge gates
+    (`ticketAdopted` in `server.js`) skip an adopted session — an operator who pressed "new session"
+    reviews its PR. It rides the block so a migration carries it; `_served_ticket` adds it for a
+    record that only has the older internal `ticketAdopted` flag. Never drop it from the block.
   - **JIRA-ONLY** (`issue_key_from_branch` returns None for an Azure board): an Azure work-item id is
     a BARE INTEGER, so a version/date/number in a branch (`release-2024-oauth`) that equals a
     collected id would false-link to an unrelated card, and an inventing agent follows no reserved

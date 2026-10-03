@@ -13290,6 +13290,41 @@ test("XERK-1440: auto-merge takes any issue type the auto stream would start, no
     "a non-string ticket type must be coerced off the wire");
 });
 
+test("XERK-1440: a session started bare and only ADOPTED onto a ticket never auto-merges", async () => {
+  // The "new session" button spawns with no ticket; the agent links it later from
+  // its branch name and serves `ticket.adopted: true`. Even when that ticket would
+  // otherwise qualify, the operator started it by hand and reviews its PR.
+  resetMerge();
+  await mergeBeat("amAdopt", "amadopt.atlassian.net", { url: "https://github.com/x/adopt/pull/1" });
+  agents.amAdopt.sessions[0].ticket.adopted = true;
+  autoMergeSweep();
+  autoCloseSweep();
+  assert.equal((agents.amAdopt.commands || []).length, 0,
+    "an adopted-ticket session must not be auto-merged or messaged");
+  // A malformed flag is not adoption (it can only drop the host's own protection).
+  agents.amAdopt.sessions[0].ticket.adopted = "yes";
+  autoMergeSweep();
+  assert.equal((agents.amAdopt.commands || []).filter((c) => c.type === "mergePr").length, 1);
+});
+
+test("XERK-1440: an adopted session on an armed epic run's child does not auto-merge either", async () => {
+  resetEpicD();
+  const site = "dadopt.atlassian.net";
+  const url = "https://github.com/ep/adopt/pull/1";
+  await asBeat("edAdopt", site, { autoStart: false,
+    tickets: [dEpic(), dChild("C-1", [], "inprogress")],
+    sessions: [dChildSession("s-c1", "C-1", site, "OPEN", url)] });
+  armEpicRun(site, "E-1");
+  agents.edAdopt.sessions[0].ticket.adopted = true;
+  autoMergeSweep();
+  assert.equal((agents.edAdopt.commands || []).filter((c) => c.type === "mergePr").length, 0,
+    "an adopted session must not ride the epic run's merge");
+  // Control: the same child, spawned from the ticket, does merge.
+  delete agents.edAdopt.sessions[0].ticket.adopted;
+  autoMergeSweep();
+  assert.equal((agents.edAdopt.commands || []).filter((c) => c.type === "mergePr").length, 1);
+});
+
 test("XERK-550: auto-merge skips a ticket the auto stream would NOT start (untriaged)", async () => {
   resetMerge();
   await mergeBeat("am7", "am7.atlassian.net", {

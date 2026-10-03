@@ -215,10 +215,13 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
     epic run merges its own children via `epicRunChildSession` (`.claude/rules/turma-epic-run.md`).
     - **ADO rows carry no `isEpic`/`epicKey`** (`_shape_azure` emits only `type`/`parentKey`), so an
       ADO Epic/Feature and its children are NOT excluded — from auto-start OR auto-merge. XERK-1444.
-    - The gate is also **provenance-agnostic** — a hand-started session in an opted-in org
-      whose ticket the auto stream would start auto-merges too, which is the same class — so do
-      not describe it as "only sessions the hub started". It is independent of the auto-START
+    - A session spawned FROM a ticket (board Start, auto-start, queue) merges whoever started it —
+      do not describe it as "only sessions the hub started". It is independent of the auto-START
       switch (`autoMergeOrgs`, never `autoStartOrgs`).
+    - **A bare "new session" that the agent later ADOPTED onto a ticket never auto-merges**
+      (`ticket.adopted`, `ticketAdopted()`), in the org stream AND an epic run, even when that
+      ticket would qualify: the operator started it by hand and reviews its PR. An older agent
+      never sends the flag, so its adopted sessions still merge until it updates.
   - **A Done ticket is excluded** (`statusCategory === "done"`): moving to Done is the abandon/stop
     gesture (autoStopSweep kills the session), and autoStopSweep only QUEUES that kill, so the
     session still reads running for a beat — the column, not the run state, stands the merge down.

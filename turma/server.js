@@ -13143,6 +13143,7 @@ function autoMergeSession(s, byKey, rows) {
   if (!s || s.status !== "running") return null;
   const t = s.ticket;
   if (!t || !t.key) return null;
+  if (ticketAdopted(t)) return null;
   const siteKey = t.siteKey || "";
   if (!autoMergeOrgs[siteKey]) return null;
   const row = byKey.get(siteKey + "\x00" + t.key);
@@ -13157,6 +13158,17 @@ function autoMergeSession(s, byKey, rows) {
   const repo = ticketRepo(siteKey, t.key, rows);
   if (autoStartContentGate(siteKey, row, repo)) return null;
   return { siteKey, key: t.key, row, repo };
+}
+
+// A session started BARE (the "new session" button) whose ticket link the agent
+// only ADOPTED later from its branch name (XERK-817) — `ticket.adopted`. An
+// operator who starts a session by hand reviews its PR, so neither auto-merge
+// stream acts on it even when the ticket it linked to would otherwise qualify
+// (XERK-1440). Strict `=== true`: a malformed flag can only drop a host's own
+// protection, never widen a merge. An older agent never sends it, so its
+// adopted sessions still read as ticket-spawned.
+function ticketAdopted(t) {
+  return !!t && t.adopted === true;
 }
 
 function autoMergeRowIndex(rows) {
@@ -13182,6 +13194,7 @@ function epicRunChildSession(s, byKey, rows) {
   if (!s || s.status !== "running") return null;
   const t = s.ticket;
   if (!t || !t.key) return null;
+  if (ticketAdopted(t)) return null;
   const siteKey = t.siteKey || "";
   const row = byKey.get(siteKey + "\x00" + t.key);
   if (!row) return null;                          // the board doesn't list it yet
