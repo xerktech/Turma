@@ -269,18 +269,21 @@ class PermlogTest(unittest.TestCase):
     def test_non_bash_and_a_down_judge_only_log(self):
         # Non-Bash: the grant is honoured by guard.py, whose matcher is Bash.
         self._alive()
-        ev = denied(tool_name="WebFetch", tool_input={"url": "https://x.example/a"})
-        self.assertEqual(self.run_judge(ev), (0, ""))
-        self.assertEqual(self.judge_files(), [])
-        # No (or a stale) alive marker: no request, no wait.
-        os.remove(os.path.join(self.dir, permlog.JUDGE_ALIVE_FILE))
-        self.assertEqual(self.run_judge(denied()), (0, ""))
+        with mock.patch.object(permlog, "await_verdict", return_value="allow") as wait:
+            for ev in (denied(tool_name="WebFetch", tool_input={"url": "https://x.example/a"}),
+                       # A non-Bash tool whose input happens to carry a `command`.
+                       denied(tool_name="mcp__shell__run", tool_input={"command": "ls"})):
+                self.assertEqual(self.run_judge(ev), (0, ""))
+            # No (or a stale) alive marker: no request, no wait.
+            os.remove(os.path.join(self.dir, permlog.JUDGE_ALIVE_FILE))
+            self.assertEqual(self.run_judge(denied()), (0, ""))
+            wait.assert_not_called()
         self.assertEqual(self.judge_files(), [])
         self._alive()
         old = os.path.getmtime(os.path.join(self.dir, permlog.JUDGE_ALIVE_FILE)) - 3600
         os.utime(os.path.join(self.dir, permlog.JUDGE_ALIVE_FILE), (old, old))
         self.assertFalse(permlog.judge_alive(self.dir))
-        self.assertEqual(len(self.rows()), 2, "every event is still logged")
+        self.assertEqual(len(self.rows()), 3, "every event is still logged")
 
     def test_without_the_flag_nothing_is_handed_over(self):
         self._alive()
