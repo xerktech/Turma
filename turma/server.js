@@ -4316,7 +4316,10 @@ function setIndexMirror(store, ha) {
 // one. Its loader is cut off first, so if the hung await ever does return it writes
 // nothing into the index that ingest (reopened by the `finally`) now owns. Without
 // it one await that never settled kept ingest 503'd until the pod died.
-const ARCHIVE_INDEX_HYDRATE_DEADLINE_MS = positiveEnv("ARCHIVE_INDEX_HYDRATE_DEADLINE_MS", 10 * 60 * 1000);
+// setTimeout fires after ~1ms for a delay past 2^31-1, so clamp the env knobs below.
+const MAX_TIMER_MS = 2147483647;
+const ARCHIVE_INDEX_HYDRATE_DEADLINE_MS = Math.min(MAX_TIMER_MS,
+  positiveEnv("ARCHIVE_INDEX_HYDRATE_DEADLINE_MS", 10 * 60 * 1000));
 // Every method of `loader`, made a no-op once `cut()` is called.
 function cuttableLoader(loader) {
   let live = true;
@@ -4438,7 +4441,8 @@ async function hydrateArchiveIndex() {
 // ARCHIVE_HYDRATE_WATCH_MS it is still in flight it says so, naming how long ingest
 // has been gated — a hydrate that hangs somewhere new is a log line and a growing
 // `turma_archive_ingest_gated_seconds`, never days of silence.
-const ARCHIVE_HYDRATE_WATCH_MS = positiveEnv("ARCHIVE_HYDRATE_WATCH_MS", 5 * 60 * 1000);
+const ARCHIVE_HYDRATE_WATCH_MS = Math.min(MAX_TIMER_MS,
+  positiveEnv("ARCHIVE_HYDRATE_WATCH_MS", 5 * 60 * 1000));
 let archiveHydrateInFlight = null;
 function hydrateArchive() {
   if (archiveHydrateInFlight) return archiveHydrateInFlight;
@@ -4461,7 +4465,12 @@ async function hydrateArchiveOnce() {
     // a missing or half-downloaded local tree, the agents' re-shipped tails became
     // partial files the drain PUT over the complete objects. hydrateArchiveIndex
     // re-sets the gate synchronously on entry, so there is no gap between the two.
-    try { await archiveMirror.hydrateGated((v) => archive.setHydrating(v)); }
+    // With an index hydrate to follow, ITS `finally` is what opens the gate: the
+    // byte phase never opens it in between, so the gate's closed-since stamp
+    // (turma_archive_ingest_gated_seconds) spans the whole run (XERK-1282).
+    try {
+      await archiveMirror.hydrateGated((v) => { if (v || !archiveIndexStore) archive.setHydrating(v); });
+    }
     catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
   }
   await hydrateArchiveIndex();

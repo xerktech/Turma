@@ -52,6 +52,22 @@ const RAW_ROUTE_WAIT_MS = 10 * 1000;
 // gate closed for days. Generous: a slow first fill that hits it loses nothing —
 // what it downloaded stays on disk and the next pass fetches only the rest.
 const HYDRATE_PASS_DEADLINE_MS = 15 * 60 * 1000;
+// The longest one retryBlocked GET may run before that key is left blocked for the
+// next pass. A hydrate waits on an in-flight retry pass (they must not overlap), so
+// a retry GET that never settled made every bounded hydrate pass abandon and retry
+// forever, gate closed (XERK-1282 QA).
+const RETRY_GET_DEADLINE_MS = 5 * 60 * 1000;
+const TIMED_OUT = Symbol("timedOut");
+// `p`, or TIMED_OUT once `ms` passes first. `p` itself is left running.
+async function raceDeadline(p, ms) {
+  let timer;
+  try {
+    return await Promise.race([p,
+      new Promise((res) => { timer = setTimeout(() => res(TIMED_OUT), ms); timer.unref?.(); })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 class ArchiveMirror {
   /**
@@ -96,6 +112,7 @@ class ArchiveMirror {
     // whole hub, until `retryBlocked` lands them (XERK-1050).
     this._blocked = new Map();
     this._retrying = null;   // the in-flight retryBlocked pass, so hydrate waits on it
+    this._yieldRetry = false; // a hydrate is waiting: the retry pass stops after its current key
     this._retryLoop = false; // retryBlockedUntilClear is running
   }
 
@@ -198,7 +215,7 @@ class ArchiveMirror {
     let fetched = 0;
     try {
       // A retryBlocked pass renames files into place; never classify under it.
-      if (this._retrying) await this._retrying;
+      if (this._retrying) { this._yieldRetry = true; await this._retrying; }
       if (stale()) return 0;
       // [{key, size}] in one listing when the store can give sizes (S3 always
       // does); otherwise a HEAD per key, the pre-XERK-1043 shape.
@@ -322,14 +339,8 @@ class ArchiveMirror {
   // incomplete hydrate, so hydrateUntilListed logs it and retries with ingest still
   // gated (XERK-1048: never open over a tree that was not fully classified).
   async _boundedHydrate(deadlineMs) {
-    let timer;
-    const timedOut = Symbol("timedOut");
-    const r = await Promise.race([
-      this.hydrate(),
-      new Promise((res) => { timer = setTimeout(() => res(timedOut), deadlineMs); timer.unref?.(); }),
-    ]);
-    clearTimeout(timer);
-    if (r !== timedOut) return r;
+    const r = await raceDeadline(this.hydrate(), deadlineMs);
+    if (r !== TIMED_OUT) return r;
     this._hydrateRun++;
     this._hydrating = false;
     this.hydrated = false;
@@ -395,16 +406,27 @@ class ArchiveMirror {
   // same synchronous step. Unblocked on landing, a transcript was open with its
   // Postgres cursor still AHEAD of the older bucket copy, so the agent's next
   // chunk appended past a gap and the lagging tail was lost for good (QA D1).
-  async retryBlocked() {
+  async retryBlocked({ getDeadlineMs = RETRY_GET_DEADLINE_MS } = {}) {
     if (!this.blobStore || this._hydrating || this._retrying || !this._blocked.size) return 0;
     let landed = 0;
     const done = [];
     const run = (async () => {
       for (const key of [...this._blocked.keys()]) {
+        if (this._yieldRetry) break; // the rest wait for the next pass
         const dest = this.pathFor(key);
         if (!dest) { done.push(key); continue; }
+        // A GET past its deadline leaves the key blocked; if it lands later it is
+        // discarded, never renamed in after the pass (and its reconcile) moved on.
+        let abandoned = false;
         try {
-          if (await this._download(key, dest, () => this._blocked.has(key))) landed++;
+          const r = await raceDeadline(
+            this._download(key, dest, () => !abandoned && this._blocked.has(key)), getDeadlineMs);
+          if (r === TIMED_OUT) {
+            abandoned = true;
+            this._blocked.set(key, `${key} (GET did not finish within ${Math.round(getDeadlineMs / 1000)}s)`);
+            continue;
+          }
+          if (r) landed++;
           done.push(key);
         } catch (e) {
           this._blocked.set(key, `${key} (${e && e.message})`);
@@ -412,7 +434,7 @@ class ArchiveMirror {
       }
     })();
     this._retrying = run;
-    try { await run; } finally { this._retrying = null; }
+    try { await run; } finally { this._retrying = null; this._yieldRetry = false; }
     // Any unblock reconciles, not only a landing: a key that landed on a pass
     // whose reconcile threw, then 404'd, would otherwise open unreconciled.
     if (done.length) {

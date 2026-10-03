@@ -120,12 +120,18 @@ of-record**, so both halves of the ADR split now hold:
   - The gate lives in `mirror.hydrateGated(setGate)`, not inline in server.js, so a test pins it.
 - **Every await under the gate is BOUNDED (XERK-1282)** — one that never settled kept prod ingest
   503'd for days, and `hydrateArchive`'s single-flight swallowed every later promotion.
-  - A byte pass past `HYDRATE_PASS_DEADLINE_MS` is ABANDONED (`_hydrateRun` bump) and retried with
-    the gate still CLOSED — never opened over an unclassified tree (XERK-1048).
+  - A byte pass past `HYDRATE_PASS_DEADLINE_MS` (constant, not env) is ABANDONED (`_hydrateRun`
+    bump) and retried with the gate still CLOSED — never opened over an unclassified tree (XERK-1048).
+  - A hydrate waits on an in-flight `retryBlocked` pass, so that pass is bounded too: each GET by
+    `RETRY_GET_DEADLINE_MS` (key stays blocked), and it stops after its current key once a hydrate
+    waits (`_yieldRetry`). Unbounded, one hung retry GET made every hydrate pass abandon forever.
+  - The byte phase does not open the gate when an index hydrate follows — the index phase's
+    `finally` does — so the closed-since stamp spans the whole run.
   - An abandoned pass writes nothing: its late GET is discarded via `_download`'s `stillWanted`,
     or it would rename an older object over a file ingest has since appended to.
   - The index load past `ARCHIVE_INDEX_HYDRATE_DEADLINE_MS` is treated as a failed one, its loader
     CUT first (`withLoaderDeadline`) so a late page never lands in a map ingest now owns.
+  - The env deadlines are clamped to 2^31-1 ms: past it `setTimeout` fires after ~1ms.
   - A run still in flight logs every `ARCHIVE_HYDRATE_WATCH_MS`; gate duration is on `/metrics`
     (`turma_archive_ingest_gated_seconds`) and the `/readyz` body — `/readyz` stays 200.
 - **A rendered file that did not land closes ingest for ITS transcript only (XERK-1050)**, not the

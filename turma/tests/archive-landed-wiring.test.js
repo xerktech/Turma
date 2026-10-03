@@ -71,8 +71,6 @@ test("/metrics reports the gauges and recomputes the blocked count at most every
     archive.setHydrating(true);
     const closedAt = Date.now();
     assert.match(hub.metricsText(t0 + 15001), /^turma_archive_ingest_gated 1$/m);
-    // How long it has been closed (XERK-1282) — a re-close keeps the first stamp.
-    archive.setHydrating(true);
     assert.match(hub.metricsText(closedAt + 90500), /^turma_archive_ingest_gated_seconds (90|91)$/m);
     archive.setHydrating(false);
     assert.match(hub.metricsText(closedAt + 90500), /^turma_archive_ingest_gated_seconds 0$/m);
@@ -81,6 +79,18 @@ test("/metrics reports the gauges and recomputes the blocked count at most every
     archive.setBlobSink(null);
     archive.setRawRemote(null);
   }
+});
+
+test("re-closing the gate keeps its first closed-since stamp (XERK-1282)", async () => {
+  archive.setHydrating(true);
+  try {
+    await new Promise((r) => setTimeout(r, 40));
+    archive.setHydrating(true); // a later phase re-asserting it
+    assert.ok(archive.hydratingForMs() >= 35, `${archive.hydratingForMs()}ms`);
+  } finally {
+    archive.setHydrating(false);
+  }
+  assert.equal(archive.hydratingForMs(), 0);
 });
 
 test("a hung index hydrate is abandoned at its deadline and its loader cut (XERK-1282)", async () => {
