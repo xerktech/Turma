@@ -24,34 +24,20 @@ name: code-scan
 # the hub image build included (its layer cache is `type=gha`, which is GitHub-side
 # and moves with the job).
 on:
+  # No paths filter: the main ruleset REQUIRES this workflow's "Unit tests"
+  # check (XERK-1542), and a required check that never starts blocks the PR
+  # forever — a glasses- or docs-only PR would be unmergeable. Semgrep scans the
+  # whole tree and the size gate guards CLAUDE.md/.claude/rules, so every PR is
+  # in scope for at least one job anyway.
   pull_request:
     branches: [main]
-    paths:
-      - "agent/**"
-      - "turma/**"
-      # Semgrep scans the whole tree (no path arg), so android/ was covered
-      # only incidentally — when some OTHER component's PR happened to trigger
-      # this workflow. An Android-only PR ran zero SAST, while
-      # AndroidManifest.xml and net/WsUrls.kt both carry `nosemgrep`
-      # annotations written on the assumption that it runs (XERK-235).
-      - "android/**"
-      - ".github/scripts/**"
-      # Same reasoning as android/** above: Semgrep scans the whole tree, so
-      # bench/ was covered only when some OTHER component's PR happened to
-      # trigger this workflow — a bench-only PR ran zero SAST over its Python.
-      - "bench/**"
-      # Every workflow, not just this one: Semgrep's shell-injection rules read
-      # the workflows themselves, so scoping this to code-scan.yml meant a
-      # `run:` step interpolating ${{ }} could land in any OTHER workflow
-      # without the gate that exists to catch it ever running. One did — see the
-      # Resolve flags step in release.yml. Workflow edits are rare, so the wider
-      # trigger costs little.
-      - ".github/workflows/**"
-      # The instruction-file size gate lives in the tests job below, and the PR
-      # that pushes a file over its limit is usually a docs-only PR — without
-      # these paths the gate would never run on the change it exists to catch.
-      - "CLAUDE.md"
-      - ".claude/rules/**"
+  # release.yml calls this whole workflow as the gate before it plans a release
+  # (XERK-1542). A PR is only tested against the main it branched from, so two
+  # individually-green PRs can merge into a red main; nothing re-ran these jobs
+  # on main, and the release shipped it. Under workflow_call github.ref is the
+  # caller's (refs/heads/main), which never collides with a PR's
+  # refs/pull/<n>/merge in the concurrency group below.
+  workflow_call:
 
 concurrency:
   group: code-scan-${{ github.ref }}

@@ -81,10 +81,24 @@ env:
   TURMA_IMAGE: ghcr.io/${{ github.repository_owner }}/turma
 
 jobs:
+  # ------------------------------------------------------------- code-scan ----
+  # The same gate a PR must pass, re-run on the commit being released
+  # (XERK-1542). A PR is tested against the main it branched from, not the main
+  # it merges into, so two individually-green PRs can land a red main — that is
+  # how agent v2.1.50 shipped a guard that crashed on every heredoc. plan needs
+  # this job, and every later job needs plan, so a red main builds, deploys and
+  # publishes nothing. Runs on a dry_run dispatch too: rehearsing a release of
+  # an untested commit is not a rehearsal.
+  code-scan:
+    uses: ./.github/workflows/code-scan.yml
+    permissions:
+      contents: read
+
   # ------------------------------------------------------------------ plan ----
   # Read-only: compute version/tag and the per-component build matrix from the
   # tags + the diff since the previous release. See .github/scripts/plan.js.
   plan:
+    needs: code-scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
