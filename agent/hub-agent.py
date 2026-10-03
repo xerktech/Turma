@@ -5156,21 +5156,33 @@ def coding_agent():
 
 
 class GitTimeout(Exception):
-    """A `strict` cheap git read that did not answer in time (XERK-1217).
-    run() folds a timeout into the same "" as a failure, so without this a
-    stalled disk reads as a removed worktree, or as a clean one."""
+    """A `strict` cheap git read that gave NO answer (XERK-1217): it timed out,
+    or git could not be launched at all (XERK-1263 — e.g. a fork refused at the
+    pids_limit). run() folds both into the same "" as a failure, so without
+    this a stalled disk reads as a removed worktree, or as a clean one."""
 
 
-def _strict_git(cmd, cwd, timeout=15):
-    """run() for a `strict` cheap read: stripped stdout on success, "" on any
-    failure (a git error, a missing cwd), GitTimeout ONLY when it timed out."""
+def _strict_git(cmd, cwd, timeout=15, fail_is_unknown=False):
+    """run() for a `strict` cheap read: stripped stdout on success, "" when git
+    answered with a failure or `cwd` is gone, GitTimeout when there was no
+    answer — a timeout, or a launch failure in a directory that still exists.
+
+    `fail_is_unknown` makes a nonzero exit GitTimeout too: for `status`, whose
+    EMPTY output is itself the verdict "clean", a failure (a corrupt index, an
+    EIO) must not read as one. rev-parse keeps "" — that failure IS "gone"."""
     try:
         out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                              timeout=timeout)
     except subprocess.TimeoutExpired:
         raise GitTimeout(" ".join(cmd[1:3]))
     except Exception:
-        return ""
+        # A missing cwd fails the launch too, and that one IS an answer:
+        # the worktree is gone.
+        if cwd and not os.path.isdir(cwd):
+            return ""
+        raise GitTimeout(" ".join(cmd[1:3]))
+    if out.returncode != 0 and fail_is_unknown:
+        raise GitTimeout(" ".join(cmd[1:3]))
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
@@ -5187,7 +5199,8 @@ def git_info_cheap(cwd, strict=False):
     if strict:
         if not _strict_git(["git", "rev-parse", "--git-dir"], cwd):
             return None
-        dirty = _strict_git(["git", "status", "--porcelain"], cwd)
+        dirty = _strict_git(["git", "status", "--porcelain"], cwd,
+                            fail_is_unknown=True)
         return {
             "branch": _strict_git(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd),
             "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
@@ -5218,19 +5231,6 @@ def git_info_slow(cwd):
         "lastCommit": run(["git", "log", "-1", "--format=%h %s"], cwd=cwd)[:120],
         "remote": remote,
     }
-
-
-def git_info(cwd):
-    """Full worktree facts (cheap + slow merged) — same shape as before the
-    cheap/slow split. Used off the heartbeat's hot path (root pseudo-repo entry,
-    the delete dirty-file check); the per-session heartbeat path reads the two
-    halves separately so it can cache the slow one."""
-    cheap = git_info_cheap(cwd)
-    if cheap is None:
-        return None
-    info = git_info_slow(cwd)
-    info.update(cheap)
-    return info
 
 
 def branch_exists(repo_path, ref):
@@ -5331,10 +5331,17 @@ def branch_sync(repo_path, branch, base_ref):
             "aheadOfRemote": None}
     if not branch or branch == "HEAD":
         return info
+    def has_ref(ref):
+        # `--verify --quiet` exits 1 for a missing ref. Anything else — no
+        # answer (timeout / launch failure) or a git error (128, corrupt
+        # refs) — is None, so it never reads as "never pushed" (XERK-1263).
+        rc, _ = run_out(["git", "-C", repo_path, "rev-parse", "--verify",
+                         "--quiet", ref])
+        return {0: True, 1: False}.get(rc)
     local = f"refs/heads/{branch}"
-    if not branch_exists(repo_path, local):
+    if not has_ref(local):
         return info
-    info["pushed"] = branch_exists(repo_path, f"refs/remotes/origin/{branch}")
+    info["pushed"] = has_ref(f"refs/remotes/origin/{branch}")
     if info["pushed"]:
         n = run(["git", "-C", repo_path, "rev-list", "--count",
                  f"refs/remotes/origin/{branch}..{local}"])
@@ -12404,9 +12411,9 @@ def repo_cheap_facts(path, strict=False):
     branch and the `git status --porcelain` dirty count. Two git spawns — which is
     why a `light` beat reuses the previous answer instead (see repo_entry).
     `strict` raises GitTimeout on a timed-out read, as git_info_cheap does."""
-    git = ((lambda cmd: _strict_git(cmd, path)) if strict
-           else (lambda cmd: run(cmd, cwd=path)))
-    dirty = git(["git", "status", "--porcelain"])
+    git = ((lambda cmd, **kw: _strict_git(cmd, path, **kw)) if strict
+           else (lambda cmd, **kw: run(cmd, cwd=path)))
+    dirty = git(["git", "status", "--porcelain"], fail_is_unknown=True)
     return {
         "branch": git(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
         "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
@@ -22750,7 +22757,12 @@ class SessionManager:
         # Root has no worktree to remove — REPOS_ROOT and its repos stay put;
         # delete just tears down the processes and drops the record.
         if not sess.get("root") and os.path.isdir(sess["worktreePath"]):
-            gi = git_info(sess["worktreePath"])
+            try:
+                gi = git_info_cheap(sess["worktreePath"], strict=True)
+            except GitTimeout:
+                gi = None
+                log(f"delete {sid}: git gave no answer; any uncommitted "
+                    f"worktree files are discarded uncounted")
             if gi and gi.get("dirtyFiles"):
                 log(f"delete {sid}: discarding {gi['dirtyFiles']} "
                     f"uncommitted worktree file(s)")
@@ -27786,12 +27798,18 @@ class SessionManager:
         inline. A cached None ("worktree gone") is served like any other
         answer, and reads are `strict`: a read that TIMES OUT on a stalled disk
         raises GitTimeout rather than reporting "gone" or "clean", so the cache
-        keeps its last real answer instead of re-reading inline every beat."""
+        keeps its last real answer instead of re-reading inline every beat.
+
+        A `fresh` caller asked for the facts as of NOW, so a cached answer is
+        not one: it gets the GitTimeout (XERK-1263) and decides nothing on it,
+        rather than acting on a possibly stale "clean"."""
         cache = getattr(self, attr)
         if fresh or key not in cache:
             try:
                 value = fn(path, strict=True)
             except GitTimeout:
+                if fresh:
+                    raise
                 # Keep the last real answer; with none yet, report `default`
                 # (what a timed-out read used to report) and let the worker
                 # retry it off the beat.
@@ -28374,9 +28392,24 @@ class SessionManager:
             # Force a fresh read of the branch-sync facts: the poller runs more
             # often than the slow facts refresh (USAGE_EVERY), and the undelivered
             # check (pushed / aheadOfRemote) must not be up to a beat stale.
-            gi, work = self._session_git(sess, refresh=True, fresh=True)
+            try:
+                gi, work = self._session_git(sess, refresh=True, fresh=True)
+            except GitTimeout:
+                # git gave no answer (a stalled disk): the dirty count is
+                # UNKNOWN, not 0, so neither nudge nor re-arm (XERK-1263).
+                continue
             dirty = (gi or {}).get("dirtyFiles") or 0
             live_branch = (self.session_facts.get(sid) or {}).get("liveBranch")
+            # branch_sync degrades a failed/timed-out read to None. A live
+            # branch always exists locally, so `pushed` None there — or a
+            # pushed branch with no ahead count — is an UNANSWERED read, not
+            # "delivered": skip the decision rather than re-arm (XERK-1263).
+            # Dirty files decide on their own (an unborn branch reads None).
+            if not dirty and live_branch is not None and (
+                    (work or {}).get("pushed") is None
+                    or ((work or {}).get("pushed")
+                        and (work or {}).get("aheadOfRemote") is None)):
+                continue
             ahead_remote = (work or {}).get("aheadOfRemote") or 0
             undelivered = (
                 dirty > 0
@@ -30635,7 +30668,8 @@ class SessionManager:
         (XERK-1217); only first sight, or `fresh`, reads inline."""
         sid = sess["id"]
         # None if the worktree is gone. `fresh` is a caller asking for the
-        # facts as of NOW (the undelivered-work poller), so it reads inline.
+        # facts as of NOW (the undelivered-work poller), so it reads inline —
+        # and a read with no answer raises GitTimeout to it.
         gi = self._cheap_read("session_cheap", sid, git_info_cheap,
                               sess["worktreePath"], light=light, fresh=fresh)
         gi = dict(gi) if gi is not None else None      # never hand out the cache
