@@ -206,7 +206,7 @@ jobs:
   build-turma-image:
     needs: [plan, bump]
     if: >-
-      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
+      !cancelled() && needs.plan.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.bump.result)
       && needs.plan.outputs.build_turma == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -350,7 +350,7 @@ jobs:
   build-glasses:
     needs: [plan, bump]
     if: >-
-      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
+      !cancelled() && needs.plan.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.bump.result)
       && needs.plan.outputs.build_glasses == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -421,7 +421,7 @@ jobs:
   build-android:
     needs: [plan, bump]
     if: >-
-      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
+      !cancelled() && needs.plan.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.bump.result)
       && needs.plan.outputs.build_android == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -469,7 +469,7 @@ jobs:
   build-agent-native:
     needs: [plan, bump]
     if: >-
-      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
+      !cancelled() && needs.plan.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.bump.result)
       && needs.plan.outputs.build_agent_native == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -544,7 +544,7 @@ jobs:
   build-agent-windows:
     needs: [plan, bump]
     if: >-
-      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
+      !cancelled() && needs.plan.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.bump.result)
       && needs.plan.outputs.build_agent_windows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -602,20 +602,22 @@ jobs:
 
   # --------------------------------------------------------------- publish ----
   # Runs last. Assembles manifest.json + release notes, carries unchanged assets
-  # forward, and (unless dry_run) creates the tag + release. Runs unless a build
-  # that was SUPPOSED to run failed (a skipped/carried component is fine).
+  # forward, and (unless dry_run) creates the tag + release. Runs only if every
+  # upstream job succeeded or was skipped (a skipped/carried component is fine).
+  # Never gate on `!= 'failure'`: a job that hits timeout-minutes ends CANCELLED,
+  # and publish would then carry the previous asset forward under the new tag.
   publish:
     needs:
       [plan, bump, build-turma-image, deploy-argocd, build-glasses, build-android, build-agent-native, build-agent-windows]
     if: >-
       !cancelled() && needs.plan.result == 'success'
-      && needs.bump.result != 'failure'
+      && contains(fromJSON('["success", "skipped"]'), needs.bump.result)
       && contains(fromJSON('["success", "skipped"]'), needs.build-turma-image.result)
       && contains(fromJSON('["success", "skipped"]'), needs.deploy-argocd.result)
-      && needs.build-glasses.result != 'failure'
-      && needs.build-android.result != 'failure'
-      && needs.build-agent-native.result != 'failure'
-      && needs.build-agent-windows.result != 'failure'
+      && contains(fromJSON('["success", "skipped"]'), needs.build-glasses.result)
+      && contains(fromJSON('["success", "skipped"]'), needs.build-android.result)
+      && contains(fromJSON('["success", "skipped"]'), needs.build-agent-native.result)
+      && contains(fromJSON('["success", "skipped"]'), needs.build-agent-windows.result)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
