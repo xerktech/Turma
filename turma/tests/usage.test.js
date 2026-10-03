@@ -49,6 +49,9 @@ function makeEl() {
 let orgFilter = (agents) => agents;
 // The header's selected org keys, for the permission card's scoped fetch.
 let orgKeys = [];
+// A test may stand in org.js's own key/update behaviour (getKeys is [] until
+// update() has seen the sites the data names); null = the plain stub above.
+let orgHooks = null;
 
 function loadHelpers(fetchReply = null) {
   const els = {};
@@ -78,7 +81,7 @@ function loadHelpers(fetchReply = null) {
     fetch: (u) => {
       fetches.push(String(u));
       return fetchReply
-        ? Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(fetchReply()) })
+        ? Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(fetchReply(String(u))) })
         : new Promise(() => {});
     },
     // Captures the page's SSE handlers so a test can deliver a real `removed`
@@ -102,7 +105,9 @@ function loadHelpers(fetchReply = null) {
     TurmaNav: { preserveScroll: (el, paint) => { scrollCalls.push(el); paint(); } },
     // Indirected through `orgFilter` so a test can narrow the page the way the
     // header's org control does, and check what each section was rendered from.
-    TurmaOrg: { get: () => "", getKeys: () => orgKeys, update: noop, filter: (a) => orgFilter(a), subscribe: noop, sse: noop, orgColors: () => ({}) },
+    TurmaOrg: { get: () => "", getKeys: () => (orgHooks ? orgHooks.getKeys() : orgKeys),
+      update: (d) => { if (orgHooks) orgHooks.update(d); }, filter: (a) => orgFilter(a),
+      subscribe: noop, sse: noop, orgColors: () => ({}) },
     TurmaBoard: { orgName: (k) => k, orgColorMap: () => ({}) },
     TurmaNewTicket: { update: noop },
   };
@@ -1323,7 +1328,12 @@ test("XERK-1563: the minute repaint keeps Recent prompts open and goes through p
   toggle(false);
   await H4.refreshPermissions();
   assert.doesNotMatch(el.innerHTML, /perm-recent-view" open/);
-  // An unchanged card is not repainted at all.
+  // An unchanged card is not repainted at all — even though a browser hands
+  // innerHTML back re-serialized (`open` as `open=""`), so the skip must not
+  // compare against what it reads back.
+  toggle(true);
+  await H4.refreshPermissions();
+  el.innerHTML = el.innerHTML.replace(/ open>/g, ' open="">');
   const n = H4.scrollCalls.length;
   await H4.refreshPermissions();
   assert.equal(H4.scrollCalls.length, n);
@@ -1339,6 +1349,32 @@ test("XERK-1563: the card's fetch is scoped by the header's org filter", async (
   assert.equal(url, "/api/permissions?days=7&org=acme.atlassian.net%2Crival.atlassian.net");
   assert.equal(H3.getPermView(), permView);
   assert.match(H3.els.permissions.innerHTML, /Bash\(npm test:\*\)/);
+});
+
+test("XERK-1563: the card's first fetch waits for the org scope, then follows it", async () => {
+  // org.js's real order: getKeys() is [] until update() has seen the sites
+  // /api/agents names, so a fetch at script start would go out unscoped.
+  let site = null;
+  orgHooks = {
+    getKeys: () => (site ? [site] : []),
+    update: (d) => { if (!site) site = d && d.site; },   // the sites are now known
+  };
+  try {
+    const H5 = loadHelpers((u) => (u.startsWith("/api/agents")
+      ? { now: Date.now(), agents: [], retiredUsage: [], site: "acme.atlassian.net" }
+      : permView));
+    const card = () => H5.fetches.filter((u) => u.startsWith("/api/permissions"));
+    for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+    assert.deepEqual(card(), ["/api/permissions?days=7&org=acme.atlassian.net"],
+      "never an unscoped fetch before the org keys are known");
+    // A render whose keys did not move does not refetch…
+    H5.render(H5.getCache());
+    assert.equal(card().length, 1);
+    // …one whose keys moved does, scoped to the new org.
+    site = "rival.atlassian.net";
+    H5.render(H5.getCache());
+    assert.equal(card().pop(), "/api/permissions?days=7&org=rival.atlassian.net");
+  } finally { orgHooks = null; }
 });
 
 test("XERK-1563: an ask-in-chat group shows its question as prose and no 0 / 0", () => {

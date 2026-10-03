@@ -3,8 +3,7 @@ paths:
   - "turma/permission-ledger.js"
   - "turma/tests/permission-ledger.test.js"
   - "turma/public/usage.html"
-  - "agent/hooks/permlog.py"
-  - "agent/tests/test_permlog.py"
+  - "turma/server.js"
 ---
 
 # The permission ledger (XERK-1563, epic XERK-1560)
@@ -14,86 +13,8 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
 (`_permission_edges`, the hook-log tail) + `agent/hooks/permlog.py`; hub half in
 `turma/permission-ledger.js` + `server.js` (`permissionEvents` ingest, `GET /api/permissions`,
 `/metrics`); surface on `usage.html`. Android has only a `PARITY.md` line (XERK-1576 adds the screen).
-
-## The three kinds — each has a different fix, so the row must say which
-
-- **`dialog`** — the numbered TUI dialog (rule/manual prompt, plan approval, sandbox escape). Source:
-  the `panePrompt` EDGES the beat already scrapes. `dialogKind` = `permission`/`plan`/`sandbox`/`other`
-  (`classify_pane_dialog`; wording is the TUI's, so unknown = `other`).
-  - **The kind comes from the PENDING CALL and the QUESTION line, never the detail.** The detail is
-    the call's free text (a command, Claude's description, a path), so `terraform plan`, `ls sandbox/`
-    or "Check network access" there would mislabel a tool prompt. Pending `ExitPlanMode` → `plan`;
-    "Do you want to allow this connection?" → `sandbox`; any other "Do you want to …" → `permission`.
-  - On None→dialog the row opens and attaches the PENDING CALL (`pending_tool_call`): of the newest
-    assistant message (entries sharing `message.id`) with a `tool_use` lacking a `tool_result`, its
-    OLDEST such call — Claude asks about parallel calls one at a time, in order. `head`/`digest` come
-    from permlog.py's OWN functions (`_permlog_module`) so pane and hook rows aggregate together.
-  - **A dialog is keyed on its whole face** (`_pane_dialog_identity`: question + detail + option
-    labels), not its question: every tool prompt asks "Do you want to proceed?", and two prompts
-    answered between beats never show "no dialog". A changed face closes the row and opens another.
-  - **Except a REPAINT** (`_dialog_is_repaint`): the face moves with the pane's width (the ttyd
-    attach resizes tmux, wrapping detail and labels) and with Tab-to-amend, not the call. A changed
-    face whose pending call is still the open row's `toolUseId`, with the same `dialogKind`, keeps the
-    row. NOT for a delegated row (every sub-agent prompt shares the Task id) or one with no
-    `toolUseId`, which fall back to the face. The tail is read only on a face change.
-  - **Only a PRE-EXECUTION prompt (`permission`/`plan`) repaints on the call alone.** A running call
-    raises any number of sandbox prompts under one `toolUseId` (`npm install`: the registry, then
-    GitHub), so a `sandbox` face is a repaint only while its host equals the row's `head`.
-  - `classify_pane_dialog` matches its phrases across any whitespace, so a wrap never changes the kind.
-  - **A question picker is not a permission row**: no row opens while `signals.question` is set or
-    the pending call is `AskUserQuestion` (its native picker after ask.py's wait) — no rule retires it.
-  - On dialog→gone it closes: `waitedMs`, and `answer` = Turma's `answer_pane_prompt` number mapped
-    through that option's label (`via:"turma"`), else the call's result (`tool_call_outcome`: a
-    refusal's words → `deny`, any other result → `allow`, `via:"terminal"`), else `allow` if the pane
-    went busy with no result yet (it is running), else `unknown`.
-  - A `PermissionRequest` hook row merges into its dialog by `toolUseId` (its `rulesMatched`); one no
-    dialog claims within `PERMISSION_HOOK_HOLD_SEC` (answered between two beats) is its own row.
-  - **A dialog claims ONE hook row**: one already carrying `rulesMatched` never takes another, so a
-    second request with no `toolUseId` is held as its own prompt instead of vanishing into the first.
-  - **A dialog raised inside a foreground sub-agent** has the parent's `Agent`/`Task` call as its
-    pending call (`PERMISSION_DELEGATING_TOOLS`). The sub-agent's hook row (its own `toolUseId`)
-    OVERRIDES tool/head/digest/toolUseId on that row — one prompt, counted once, named by the real
-    call — instead of being held and emitted as a second, mis-attributed row.
-  - A dialog with no `toolUseId` to match (a delegated one, or no pending call) adopts the ONE held
-    hook only if it fired within `PERMISSION_HOOK_ADOPT_MS` (two beats) of the dialog's beat — an
-    older held hook is an earlier prompt answered between beats, and stays its own row.
-- **`classifier-denied`** — auto mode's soft block shows NO dialog: the model is told no and turns to
-  the human in chat. Only the `PermissionDenied` hook sees it. A complete row on its own.
-- **`ask-in-chat`** — the session ended its turn asking for permission in prose. INTERIM: a cheap
-  regex (`PERMISSION_ASK_RE`) on the last assistant message, once per turn, on the agent's
-  ended-turn edge (idle pane, nothing pending, last word the assistant's with no tool call); closed by
-  the next operator `input` (`via:"turma"`). Sessions already sitting there on a manager's first beat
-  are PRIMED, not re-filed. Replaced by the wait classifier (a later XERK-1560 child).
-  - **Answered OUTSIDE Turma** (the terminal, claude.ai) it closes `via:"terminal"` once the session
-    moves past the asking turn: the pane went busy, a newer `user` entry, or a NEWER ended turn. An
-    open row blocks every later ask of that session, so it must not wait for a Turma `input`. A
-    trailing entry of another role (a `system` line) is not an answer.
-- **A session that leaves `running`** without a kill/delete (exited, errored, stopped) closes its
-  open rows on the next beat (`_permission_close_departed`), as kill/delete already did.
-- **Accepted: a manager restart re-files a live dialog.** `_perm_open` is in memory, so a dialog up
-  across a restart stays open on the hub under its old id and is opened again under a new one.
-- **A sandbox escape is not hookable at all** — the pane is its only source.
-- **Open question (record the answer here):** what the TUI shows for a classifier block. The first
-  week of real data answers it; until then nothing assumes it shows a dialog.
-
-## Agent-side wire discipline (XERK-395)
-
-- **The hook-log tail runs on its OWN worker** (`_permission_fetch_worker_loop`, the
-  `_fetch_pr_comments` shape) — never on the beat, never on the slow-refresh worker. Per-file cursor
-  `(inode, offset)`, worker-owned; a changed inode drains the rotated `.1` first; the first pass of a
-  process PRIMES every log ON DISK to EOF, a stopped session's included (it keeps its id and log, and
-  a later Start would otherwise replay them as new prompts). Rows are staged in
-  `_permission_rows_fetched`, REBOUND under `_permission_lock`; the beat drains and owns every row.
-- **The log is session-written** (Bash walks past the `Edit` deny): every read is `O_NONBLOCK` +
-  `O_NOFOLLOW` + regular-file only + bounded (`_read_permission_log`, guard.py's `_read_text`
-  discipline), every line re-shaped (`parse_permission_log_lines`), over-long lines skipped.
-- **The pane edges read the transcript tail ONLY on an edge** — the same bounded tail read
-  `session_report` already does every beat.
-- **`permissionEvents`** rides the heartbeat oldest-first, at most `PERMISSION_EVENTS_MAX` (200) a
-  beat, snapshotted under `_permission_lock`, cleared BY IDENTITY in `_clear_delivered_staged`, and
-  NEVER shed by `_drop_on_demand_results` (a row is an event that exists nowhere else). The outbox
-  is bounded (`PERMISSION_OUTBOX_MAX`, oldest dropped, logged). Rows are COPIES; an open row is sent
-  again closed under the same `id`, and the hub upserts.
+This file is the HUB + web half; the agent half (row kinds, dialog edges, the hook merge, the
+beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent files it governs.
 
 ## Hub ingest bounds
 
@@ -131,6 +52,10 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
 - **Never an allow-everything Bash rule** (`BASH_NEVER_HEADS`): `Bash(python3:*)`, `Bash(sudo:*)`,
   `Bash(env:*)`… run whatever follows. A head outside `BASH_HEAD_RE` (`(cd`, a glob) would be a
   malformed rule. Both get no rule — the table is copied verbatim, and XERK-1566 consumes it.
+- **The never-list names each exec under EVERY spelling**: an alias or parent noun heads as itself
+  (`docker container run` → `docker container`, `docker compose run` → `docker compose`, `npm x`,
+  `yarn exec`, `go run`), and a wrapper/runner whose head is the bare CLI (`stdbuf`, `nsenter`,
+  `poetry`, `conda`) covers its argument. Add a new exec form here, with a test row, as it is found.
 - **Nor a BARE subcommand CLI** (`git`, `docker`, `kubectl`, `make`…; `SUBCOMMAND_CLIS`, a
   parity-tested mirror of permlog.py's set). permlog keeps the subcommand only as the SECOND word, so
   `git -C /repo push` / `kubectl -n prod exec` head as the bare CLI, whose rule allows every
@@ -185,21 +110,25 @@ consumes this table; it does not replace it.
   never a host, session or command. **GAUGES, not counters**: they fall as rows age out, and
   Prometheus reads a counter's drop as a reset (false `rate()` spikes).
 - **`usage.html`'s "Permission prompts (7 days)"** card reads its own route (not `/api/agents`), so
-  the beat's SSE patches never repaint it; refetched on load, on an org-filter change and every 60s.
-  Every agent-supplied field is escaped; each rule has a Copy button.
+  the beat's SSE patches never repaint it. Every agent-supplied field is escaped; each rule has a Copy
+  button.
+  - **Its first fetch waits for the first render's `TurmaOrg.update`** (`syncPermissionsScope`):
+    before it org.js knows no sites, `getKeys()` is `[]` and the fetch would be fleet-wide under a
+    scoped header — and `update()` never notifies, so nothing would refetch. Each render refetches
+    when the org keys moved (`permFetchedKeys`); the 60s refresh runs only once scoped.
   - **Below 600px each group reflows to a stacked block** (CSS only, same markup): kind + subject;
     one line of count / answers / wait (`data-label`); the rule + Copy on its own line. No sideways
     scroll — the sticky Prompt column used to cover the rule column on a phone.
   - **Only a command/tool subject (`.perm-subj.cmd`) breaks mid-token**; an ask's question is prose
     and wraps between words.
   - That repaint goes through `TurmaNav.preserveScroll` and re-applies "Recent prompts"' open state
-    (`permRecentOpen`, caught on capture — `toggle` does not bubble); an unchanged card is not
-    repainted. A fresh `<details>` defaults closed, which snapped it shut once a minute.
+    (`permRecentOpen`, caught on capture — `toggle` does not bubble). A fresh `<details>` defaults
+    closed, which snapped it shut once a minute.
+  - An unchanged card is not repainted: the skip compares the last PAINTED string (`permPainted`),
+    never `$perms.innerHTML`, which a browser re-serializes (`open` → `open=""`) so it never matched.
 
 ## Tests
 
-`test_permlog.py` (event shapes, bounds, fail-open incl. FIFO/symlink, rotation, `-SsE`);
-`TestPermissionLedgerEdges` + `TestPermissionLogTail` (`test_hub_agent.py`); the `test_guard_settings.py`
-pins (deny equality, every-hook-event `-SsE`, the PreToolUse matcher list); `permission-ledger.test.js`
+Agent-side tests are listed in `agent-permissions.md`. `permission-ledger.test.js`
 (ingest bounds, aggregates, the rule table, scoping, file + fake-Postgres backends); the `XERK-1563:`
 cases in `server.test.js` (ingest, org scoping, auth, `/metrics`) and `usage.test.js` (the card).

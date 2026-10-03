@@ -1075,6 +1075,10 @@ function renderInner(data) {
   // and "By repo" charts only what the scoped org's hosts spent — a repo two
   // orgs share reads as that org's share of it, which is the point of scoping.
   TurmaOrg.update(data);
+  // Only now do the header's org keys mean anything (org.js resolves them
+  // against the sites this data names), so the permission card's org scope is
+  // settled here — its first fetch included.
+  syncPermissionsScope();
   TurmaNewTicket.update(data);
   // Live hosts PLUS the usage of hosts the hub no longer has (XERK-338), which
   // is the only place a deleted, pruned or wiped host's spend still exists. They
@@ -1629,6 +1633,15 @@ const PERM_REFRESH_MS = 60000;
 const PERM_KIND = { dialog: "Dialog", "classifier-denied": "Classifier block", "ask-in-chat": "Asked in chat" };
 let permView = null;
 let permFetchSeq = 0;
+// The card is fetched only once a render has run TurmaOrg.update: before that
+// org.js knows no sites, so getKeys() is [] and an unscoped fetch would show
+// every org's prompts under a scoped header. `permFetchedKeys` is the key set
+// the card was last fetched for — a render whose keys differ refetches it.
+let permScoped = false;
+let permFetchedKeys = null;
+// The last string painted, compared instead of $perms.innerHTML: a browser
+// re-serializes innerHTML (`open` reads back `open=""`), so that never matched.
+let permPainted = null;
 // The card repaints every PERM_REFRESH_MS and on every org change, which builds a
 // fresh <details> — and a fresh one defaults CLOSED, snapping "Recent prompts"
 // shut under the operator once a minute. Its open state lives here and is
@@ -1731,15 +1744,26 @@ function permissionsCardHtml(view, now, recentOpen = false) {
 
 function paintPermissions() {
   const html = `<div class="models-card perm-card">${permissionsCardHtml(permView, Date.now(), permRecentOpen)}</div>`;
-  if (html === $perms.innerHTML) return;
+  if (html === permPainted) return;
+  permPainted = html;
   // A recurring innerHTML repaint: preserveScroll keeps the table's sideways
   // scroll (and the page's) across the swap, like every other repaint here.
   TurmaNav.preserveScroll($perms, () => { $perms.innerHTML = html; });
 }
 
+function permKeys() {
+  return (TurmaOrg.getKeys && TurmaOrg.getKeys()) || [];
+}
+
+function syncPermissionsScope() {
+  permScoped = true;
+  if (permKeys().join(",") !== permFetchedKeys) refreshPermissions();
+}
+
 async function refreshPermissions() {
   const seq = ++permFetchSeq;
-  const keys = (TurmaOrg.getKeys && TurmaOrg.getKeys()) || [];
+  const keys = permKeys();
+  permFetchedKeys = keys.join(",");
   const q = new URLSearchParams({ days: String(PERM_DAYS) });
   if (keys.length) q.set("org", keys.join(","));
   try {
@@ -1860,13 +1884,13 @@ function connectSSE() {
 // The org scope lives in the header and applies to every page (XERK-62);
 // a change there repaints this one straight away rather than waiting for
 // the next beat.
-TurmaOrg.subscribe(() => { if (cache) render(cache); refreshPermissions(); });
+// The render refetches the permission card when the change moved its org keys.
+TurmaOrg.subscribe(() => { if (cache) render(cache); });
 refresh();
 connectSSE();
 setInterval(() => { if (!sseOk) refresh(); }, 30000);
 paintPermissions();
-refreshPermissions();
-setInterval(refreshPermissions, PERM_REFRESH_MS);
+setInterval(() => { if (permScoped) refreshPermissions(); }, PERM_REFRESH_MS);
 let resizeTimer;
 addEventListener("resize", () => {
   clearTimeout(resizeTimer);

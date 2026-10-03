@@ -249,6 +249,19 @@ const BASH_NEVER_HEADS = new Set([
   "until", "if", "case", "select", "function", "do", "then", "npx", "bunx", "uvx",
   "npm exec", "pnpm exec", "pnpm dlx", "yarn dlx", "uv run", "docker run",
   "docker exec", "kubectl exec", "ssh", "awk", "find", "parallel", "script",
+  // The SAME exec under another spelling: an alias or a parent noun whose own
+  // subcommand is the exec (`docker container run`, `docker compose run` head
+  // as `docker container` / `docker compose`, covering `docker run` itself).
+  "docker container", "docker compose", "npm x", "bun x", "bun run", "yarn exec",
+  "go run", "cargo run", "dotnet run", "kubectl run", "kubectl debug",
+  // Wrappers that run their argument, and interpreters/runners whose head is
+  // the bare CLI (not a SUBCOMMAND_CLIS member, so `poetry run x` heads `poetry`).
+  "stdbuf", "setsid", "chroot", "unshare", "nsenter", "strace", "ltrace", "busybox",
+  "flock", "taskset", "ionice", "chrt", "runuser", "setpriv", "systemd-run",
+  "unbuffer", "expect", "xvfb-run", "dbus-run-session", "tsx", "ts-node",
+  "poetry", "pipx", "pdm", "hatch", "conda", "mamba", "micromamba", "nix", "nix-shell",
+  "mise", "asdf", "direnv", "java", "julia", "Rscript", "tclsh",
+  "cmd", "cmd.exe", "powershell.exe", "pwsh.exe", "wsl", "wsl.exe",
 ]);
 const BASH_HEAD_RE = /^[A-Za-z0-9._/-]+( [A-Za-z0-9._-]+)?$/;
 // MIRRORS `SUBCOMMAND_CLIS` in agent/hooks/permlog.py (parity-tested): CLIs whose

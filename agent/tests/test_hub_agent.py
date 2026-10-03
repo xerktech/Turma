@@ -36572,10 +36572,13 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
     def hook_rows(self, *rows):
         self.sm._permission_rows_fetched = {self.SID: list(rows)}
 
-    def request_hook(self, tuid="toolu_1", ts=900):
+    def request_hook(self, ts=900, head="npm test", tool="Bash"):
+        # The REAL shape: Claude Code's PermissionRequest carries NO
+        # tool_use_id (2.1.288, confirmed with a live hook dumping its stdin),
+        # so permlog.py writes toolUseId null and the tail reads it as "".
         return {"sessionId": self.SID, "event": "PermissionRequest", "ts": ts,
-                "toolUseId": tuid, "tool": "Bash", "head": "npm test",
-                "digest": "{}", "rulesMatched": ["Bash(npm test:*)"]}
+                "toolUseId": "", "tool": tool, "head": head,
+                "digest": "{}", "rulesMatched": [f"{tool}({head}:*)"]}
 
     # --- dialog edges ---------------------------------------------------------
 
@@ -36687,21 +36690,92 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
 
     # --- hook rows ------------------------------------------------------------
 
-    def test_a_permission_request_merges_into_its_dialog_by_tool_use_id(self):
+    def test_a_permission_request_merges_into_its_dialog_by_its_call(self):
+        # Tailed before the dialog is seen: held, then claimed by the dialog
+        # whose pending call is the same tool + head — though that row carries a
+        # transcript toolUseId and the hook none.
         self.write(self.tool_use("toolu_1"))
-        self.hook_rows(self.request_hook("toolu_1"))
+        self.hook_rows(self.request_hook())
         self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
         self.assertEqual(self.rows(), [])          # held for the dialog
         self.edge(self.dialog(), at=1000)
         row, = self.rows()
         self.assertEqual(row["rulesMatched"], ["Bash(npm test:*)"])
+        self.assertEqual(row["toolUseId"], "toolu_1")   # the transcript's, kept
         self.assertEqual(self.sm._perm_hook_pending.get(self.SID), {})
+
+    def test_a_held_request_and_its_dialog_are_one_row_never_two(self):
+        # Hook staging and the pane edge on different beats: the dialog opens
+        # and closes, and once the hold runs out no second `r-` row appears.
+        self.write(self.tool_use("toolu_1"))
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
+        self.edge(self.dialog(), at=1000)
+        self.write(self.tool_result("toolu_1"))
+        self.edge(None, at=2000)
+        self.sm._apply_permission_hook_rows(
+            now_ms=9000, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        self.assertEqual({r["id"] for r in self.rows()}, {f"d-{self.SID}-1000"})
+        self.assertEqual(self.rows()[-1]["rulesMatched"], ["Bash(npm test:*)"])
+
+    def test_the_real_hook_line_merges_end_to_end(self):
+        # permlog.py's own row for the real event shape, through the tail's
+        # parser, merges into the open dialog: no toolUseId anywhere upstream.
+        mod = ha._permlog_module()
+        self.assertIsNotNone(mod)
+        line = mod.build_row({
+            "session_id": self.CLAUDE_SID, "transcript_path": self.tpath,
+            "cwd": self.wt, "prompt_id": "p1", "permission_mode": "default",
+            "hook_event_name": "PermissionRequest", "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+            "permission_suggestions": [{"rules": [
+                {"toolName": "Bash", "ruleContent": "npm test:*"}]}]}, now_ms=900)
+        self.assertIsNone(line["toolUseId"])
+        parsed, _ = ha.parse_permission_log_lines(
+            (json.dumps(line) + "\n").encode(), self.SID)
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(*parsed)
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        row = self.sm._perm_open[self.SID]
+        self.assertEqual((row["toolUseId"], row["digest"], row["rulesMatched"]),
+                         ("toolu_1", line["digest"], ["Bash(npm test:*)"]))
+        self.assertEqual(self.sm._perm_hook_pending.get(self.SID), None)
+
+    def test_a_request_for_another_call_is_not_merged_into_the_open_dialog(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(self.request_hook(head="git push", ts=950))
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.assertNotIn("rulesMatched", self.sm._perm_open[self.SID])
+        held = self.sm._perm_hook_pending[self.SID]
+        self.assertEqual([h["head"] for h, _ in held.values()], ["git push"])
+
+    def test_a_request_stamped_after_the_dialog_was_seen_is_a_later_prompts(self):
+        # A hook fires BEFORE its dialog is drawn: one stamped well after the
+        # beat that saw this dialog belongs to the next prompt, same command or not.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        late = 1000 + ha.PERMISSION_HOOK_LATE_MS + 1
+        self.hook_rows(self.request_hook(ts=late))
+        self.sm._apply_permission_hook_rows(now_ms=late, mono=0)
+        self.assertNotIn("rulesMatched", self.sm._perm_open[self.SID])
+        self.assertEqual(len(self.sm._perm_hook_pending[self.SID]), 1)
+
+    def test_a_sandbox_prompt_never_takes_a_permission_request(self):
+        # A sandbox escape is not hookable: a request held while one is up is
+        # the call's own prompt (or another's), never the sandbox prompt's.
+        self.write(self.tool_use("toolu_1", inp={"command": "npm install"}))
+        self.edge(self.sandbox(), at=1000)
+        self.hook_rows(self.request_hook(head="npm install", ts=950))
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.assertNotIn("rulesMatched", self.sm._perm_open[self.SID])
 
     def test_a_request_tailed_after_its_dialog_closed_upserts_that_row(self):
         self.write(self.tool_use("toolu_1"))
         self.edge(self.dialog(), at=1000)
         self.edge(None, at=2000)
-        self.hook_rows(self.request_hook("toolu_1"))
+        self.hook_rows(self.request_hook())
         self.sm._apply_permission_hook_rows(now_ms=2100, mono=0)
         last = self.rows()[-1]
         self.assertEqual(last["id"], self.rows()[0]["id"])
@@ -36709,15 +36783,16 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         self.assertIn("closedAt", last)
 
     def test_an_unclaimed_request_becomes_its_own_dialog_row(self):
-        self.hook_rows(self.request_hook("toolu_9"))
+        self.hook_rows(self.request_hook())
         self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
         self.sm._apply_permission_hook_rows(
             now_ms=900, mono=ha.PERMISSION_HOOK_HOLD_SEC - 1)
         self.assertEqual(self.rows(), [])
         self.sm._apply_permission_hook_rows(now_ms=900, mono=ha.PERMISSION_HOOK_HOLD_SEC)
         row, = self.rows()
-        self.assertEqual((row["kind"], row["dialogKind"], row["toolUseId"], row["answer"]),
-                         ("dialog", "permission", "toolu_9", "unknown"))
+        self.assertEqual((row["id"], row["kind"], row["dialogKind"], row["toolUseId"],
+                          row["answer"]),
+                         (f"r-{self.SID}-900", "dialog", "permission", "", "unknown"))
 
     def test_a_classifier_denial_is_a_complete_row(self):
         self.hook_rows({"sessionId": self.SID, "event": "PermissionDenied", "ts": 777,
@@ -36860,11 +36935,11 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
 
     def test_a_sub_agents_request_names_the_real_call_not_the_delegation(self):
         # The parent's only result-less call is the foreground Agent; the
-        # dialog is the sub-agent's, whose hook row carries its own toolUseId.
+        # dialog is the sub-agent's, whose hook row names another tool/input.
         self.write(self.tool_use("toolu_A", name="Agent",
                                  inp={"description": "x", "prompt": "y"}))
         self.edge(self.dialog(), at=1000)
-        self.hook_rows(self.request_hook("toolu_sub"))
+        self.hook_rows(self.request_hook())
         self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
         self.edge(None, at=2000)
         self.sm._apply_permission_hook_rows(
@@ -36872,36 +36947,76 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         ids = {r["id"] for r in self.rows()}
         self.assertEqual(len(ids), 1)                 # one prompt, counted once
         last = self.rows()[-1]
+        # The delegation's id is dropped, never kept as this call's.
         self.assertEqual((last["tool"], last["head"], last["toolUseId"]),
-                         ("Bash", "npm test", "toolu_sub"))
+                         ("Bash", "npm test", ""))
         self.assertEqual(last["rulesMatched"], ["Bash(npm test:*)"])
+
+    def test_a_sub_agents_next_prompt_is_not_folded_after_the_override(self):
+        # Once the sub-agent's hook named the real call, the row holds no
+        # delegation id the repaint rule could fold the NEXT prompt under.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.edge(dict(self.dialog(), detail="Bash command\nnpm test"), at=1000)
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.edge(dict(self.dialog(), detail="Bash command\nrm -rf build"), at=6000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+
+    def test_the_delegations_own_prompt_is_not_overridden(self):
+        # A prompt to LAUNCH the Agent is the delegation's own call: same tool
+        # and input, so it merges without rewriting the row.
+        inp = {"description": "x", "prompt": "y"}
+        self.write(self.tool_use("toolu_A", name="Agent", inp=inp))
+        self.edge(self.dialog(), at=1000)
+        _head, dig = ha._permission_head_digest("Agent", inp)
+        self.hook_rows(dict(self.request_hook(tool="Agent", head="Agent"), digest=dig))
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        row = self.sm._perm_open[self.SID]
+        self.assertEqual((row["tool"], row["toolUseId"]), ("Agent", "toolu_A"))
+        self.assertEqual(row["rulesMatched"], ["Agent(Agent:*)"])
 
     def test_a_sub_agents_request_tailed_first_is_claimed_by_the_dialog(self):
         self.write(self.tool_use("toolu_A", name="Agent",
                                  inp={"description": "x", "prompt": "y"}))
-        self.hook_rows(self.request_hook("toolu_sub"))
+        self.hook_rows(self.request_hook())
         self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
         self.edge(self.dialog(), at=1000)
         row, = self.rows()
-        self.assertEqual((row["tool"], row["toolUseId"]), ("Bash", "toolu_sub"))
+        self.assertEqual((row["tool"], row["head"], row["toolUseId"]),
+                         ("Bash", "npm test", ""))
         self.assertEqual(self.sm._perm_hook_pending.get(self.SID), {})
+
+    def test_a_sub_agents_dialog_takes_the_newest_request_not_an_older_one(self):
+        # Two sub-agent prompts tailed together: the older was answered between
+        # beats (its own row once the hold runs out), the newer is on screen.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(self.request_hook(head="git push", ts=600),
+                       self.request_hook(head="npm test", ts=950))
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.assertEqual(self.sm._perm_open[self.SID]["head"], "npm test")
+        self.sm._apply_permission_hook_rows(
+            now_ms=9000, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        self.assertIn(f"r-{self.SID}-600", {r["id"] for r in self.rows()})
 
     def test_a_stale_held_request_is_not_taken_for_a_sub_agents_dialog(self):
         # A parent-level prompt answered between beats is still held when a
         # sub-agent's dialog opens much later: it is NOT that dialog's call.
         self.write(self.tool_use("toolu_A", name="Agent",
                                  inp={"description": "x", "prompt": "y"}))
-        self.hook_rows(self.request_hook("toolu_old", ts=1000))
+        self.hook_rows(self.request_hook(ts=1000))
         self.sm._apply_permission_hook_rows(now_ms=1000, mono=0)
         at = 1000 + ha.PERMISSION_HOOK_ADOPT_MS + 1
         self.edge(self.dialog(), at=at)
         row, = self.rows()
         self.assertEqual(row["tool"], "Agent")             # no wrong call adopted
-        self.assertIn("toolu_old", self.sm._perm_hook_pending.get(self.SID))
+        self.assertEqual(len(self.sm._perm_hook_pending.get(self.SID)), 1)
         # The held one still becomes its own row once the hold expires.
         self.sm._apply_permission_hook_rows(
             now_ms=at, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
-        self.assertIn(f"r-{self.SID}-toolu_old", {r["id"] for r in self.rows()})
+        self.assertIn(f"r-{self.SID}-1000", {r["id"] for r in self.rows()})
 
     # --- back-to-back dialogs, pickers, parallel calls -------------------------
 
@@ -37042,17 +37157,16 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.rows(), [])
 
     def test_a_second_request_never_merges_into_a_row_that_has_one(self):
-        # PermissionRequest rows with no toolUseId: the first claims the open
-        # dialog, the second is another prompt's and is held, not merged.
+        # Two requests for the same command: the newest claims the open dialog
+        # (it is the one on screen), the older is another prompt's and is held.
         self.write(self.tool_use("toolu_1"))
         self.edge(self.dialog(), at=1000)
-        self.hook_rows(dict(self.request_hook(""), head="git push", ts=1000),
-                       dict(self.request_hook(""), head="rm", ts=1500))
+        self.hook_rows(self.request_hook(ts=700), self.request_hook(ts=950))
         self.sm._apply_permission_hook_rows(now_ms=1600, mono=0)
         self.assertEqual(self.sm._perm_open[self.SID]["rulesMatched"],
                          ["Bash(npm test:*)"])
         held = self.sm._perm_hook_pending[self.SID]
-        self.assertEqual([h["head"] for h, _ in held.values()], ["rm"])
+        self.assertEqual([h["ts"] for h, _ in held.values()], [700])
 
     def test_an_ask_user_question_picker_is_not_a_permission_row(self):
         self.write(self.tool_use("toolu_Q", name="AskUserQuestion",

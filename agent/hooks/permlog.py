@@ -10,7 +10,9 @@ the rows into the ledger it heartbeats to the hub.
 
   * ``PermissionRequest`` fires for a rule/manual-mode prompt — the numbered
     dialog the pane scrape also sees. Carries the suggested rules Claude Code
-    offers (``rulesMatched``) and the ``toolUseId`` the manager merges on.
+    offers (``rulesMatched``) but NO ``tool_use_id`` (2.1.288; PermissionDenied
+    and PreToolUse have one), so the manager merges it with its dialog on the
+    call's ``tool`` + ``head``/``digest``; ``toolUseId`` is null here.
   * ``PermissionDenied`` fires for an auto-mode CLASSIFIER block, which shows no
     dialog at all: the model is told no and turns to the human in chat. The
     hook is the only signal of it (``denyReason``).

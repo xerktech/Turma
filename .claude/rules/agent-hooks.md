@@ -255,4 +255,4 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   `PermissionDenied` (NOT `PreToolUse`, whose matcher list stays `["Bash","AskUserQuestion"]` plus
   the file guard); RECORDS one line per event to `~/.turma/permissions/<sid>.jsonl`, decides nothing,
   fails open on everything, `-SsE` like every hook, wired only when the script exists. Its dir is
-  `Edit`-denied (`Edit(~/.turma/permissions/**)`, in the equality pin). Rules: `turma-permissions.md`.
+  `Edit`-denied (`Edit(~/.turma/permissions/**)`, in the equality pin). Rules: `agent-permissions.md`.

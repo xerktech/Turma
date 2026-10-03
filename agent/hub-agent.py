@@ -10768,7 +10768,8 @@ def _pane_status(tmux_name, state):
 # kinds, each with a different fix:
 #   * `dialog` — the numbered TUI dialog (manual/rule prompt, plan approval,
 #     sandbox escape), seen on the panePrompt EDGES this beat already scrapes, and
-#     merged by toolUseId with the PermissionRequest hook row when one fired;
+#     merged with the PermissionRequest hook row when one fired — on the call's
+#     tool + head/digest, since that event carries NO tool_use_id (2.1.288);
 #   * `classifier-denied` — auto mode's soft block, which shows NO dialog: only
 #     the PermissionDenied hook (hooks/permlog.py) sees it;
 #   * `ask-in-chat` — the session ended its turn asking for permission in prose,
@@ -10789,13 +10790,17 @@ PERMISSION_LOG_LINE_MAX = 16 * 1024
 # one answered between two beats — so it becomes a `dialog` row of its own.
 PERMISSION_HOOK_HOLD_SEC = 120
 # A dialog raised inside a foreground sub-agent: the parent transcript's pending
-# call is the delegation itself, so the sub-agent's PermissionRequest (its own
-# toolUseId) names the real call and overrides it rather than counting twice.
+# call is the delegation itself, so the sub-agent's PermissionRequest (another
+# tool/input than the delegation's) names the real call and overrides it rather
+# than counting twice.
 PERMISSION_DELEGATING_TOOLS = ("Agent", "Task")
-# A dialog with no toolUseId to match (a sub-agent's, or no pending call found)
-# adopts the one held hook only if it fired within this long before the beat
-# that saw the dialog — about one beat's gap, plus slack for the tail worker.
+# A dialog with no call of its own to match on (a sub-agent's, or no pending call
+# found) adopts a hook only if it fired within this long before the beat that
+# saw the dialog — about one beat's gap, plus slack for the tail worker.
 PERMISSION_HOOK_ADOPT_MS = 2 * INTERVAL * 1000
+# A hook fires BEFORE its dialog is drawn, so one stamped later than the beat
+# that saw a dialog (past this clock slack) is a later prompt's, never that one's.
+PERMISSION_HOOK_LATE_MS = 1000
 # How long a gone session's hook log is kept before the worker removes it.
 PERMISSION_LOG_RETAIN_SEC = 7 * 86400
 # The session ids a hook log may be named for — permlog.py's own SID_RE.
@@ -17243,7 +17248,8 @@ class SessionManager:
         self._perm_ask = {}           # sid -> the open `ask-in-chat` row
         self._perm_ask_turn = {}      # sid -> the lastActivityTs that row opened on
         self._perm_ask_seen = {}      # sid -> last assistant timestamp checked
-        self._perm_hook_pending = {}  # sid -> {toolUseId: (hook row, seen mono)}
+        self._perm_hook_pending = {}  # sid -> {hold key: (hook row, seen mono)}
+        self._perm_hook_seq = 0       # unique hold keys (hooks share no id)
         self._perm_turma_answer = {}  # sid -> option number Turma typed
         self._perm_last_closed = {}   # sid -> the last closed `dialog` row
         self._perm_first_beat_done = False
@@ -28793,49 +28799,47 @@ class SessionManager:
         """ON THE BEAT: drain the worker's staged hook rows into ledger rows.
 
         A PermissionDenied is a complete `classifier-denied` row on its own. A
-        PermissionRequest belongs to a dialog: merged (rulesMatched, the call)
-        into the open dialog row or the one just closed with the same
-        toolUseId, else held until a dialog opens for it. One no dialog claims
-        within PERMISSION_HOOK_HOLD_SEC was answered between two beats — still a
-        prompt, so it becomes a `dialog` row of its own."""
+        PermissionRequest belongs to a dialog. It carries NO tool_use_id (Claude
+        Code 2.1.288 — PermissionDenied and PreToolUse do), so it is matched on
+        the call it asks about (`_hook_fit`): merged (rulesMatched, the call)
+        into the open dialog row or the one just closed, else held until a
+        dialog opens for it. Newest first, since the dialog on screen is the
+        newest prompt and an older hook is one answered between two beats. One
+        no dialog claims within PERMISSION_HOOK_HOLD_SEC was answered between
+        two beats — still a prompt, so it becomes a `dialog` row of its own."""
         now_ms = int(time.time() * 1000) if now_ms is None else now_ms
         mono = time.monotonic() if mono is None else mono
         with self._permission_lock:
             fetched, self._permission_rows_fetched = self._permission_rows_fetched, {}
         for sid, rows in fetched.items():
+            requests = []
             for hook in rows:
                 tuid = hook.get("toolUseId") or ""
-                if hook["event"] == "PermissionDenied":
-                    self._emit_permission({
-                        "id": f"c-{sid}-{tuid or hook['ts']}", "sessionId": sid,
-                        "kind": "classifier-denied", "tool": hook["tool"],
-                        "head": hook["head"], "digest": hook["digest"],
-                        "toolUseId": tuid, "denyReason": hook.get("denyReason", ""),
-                        "openedAt": hook["ts"], "closedAt": hook["ts"],
-                        "answer": "deny"})
+                if hook["event"] != "PermissionDenied":
+                    requests.append(hook)
                     continue
+                self._emit_permission({
+                    "id": f"c-{sid}-{tuid or hook['ts']}", "sessionId": sid,
+                    "kind": "classifier-denied", "tool": hook["tool"],
+                    "head": hook["head"], "digest": hook["digest"],
+                    "toolUseId": tuid, "denyReason": hook.get("denyReason", ""),
+                    "openedAt": hook["ts"], "closedAt": hook["ts"],
+                    "answer": "deny"})
+            for hook in sorted(requests, key=lambda h: h["ts"], reverse=True):
                 target = self._perm_open.get(sid)
-                if (target is not None and tuid and target.get("toolUseId") != tuid
-                        and target.get("tool") in PERMISSION_DELEGATING_TOOLS):
-                    # The dialog was raised INSIDE a foreground sub-agent: the
-                    # parent's pending call is the delegation, the hook's is the
-                    # real one — one prompt, attributed to the real call.
-                    self._merge_permission_hook(target, hook, override=True)
+                fit = self._hook_fit(target, hook)
+                if fit is not None:
+                    self._claim_hook(target, hook, fit)
                     continue
-                if target is None or "rulesMatched" in target or (
-                        target.get("toolUseId") and tuid
-                        and target["toolUseId"] != tuid):
-                    last = self._perm_last_closed.get(sid)
-                    target = last if (last and tuid and last.get("toolUseId") == tuid
-                                      and "rulesMatched" not in last) else None
-                    if target is not None:
-                        self._merge_permission_hook(target, hook)
-                        self._emit_permission(target)
-                        continue
-                    self._perm_hook_pending.setdefault(sid, {})[
-                        tuid or f"ts{hook['ts']}"] = (hook, mono)
+                last = self._perm_last_closed.get(sid)
+                fit = self._hook_fit(last, hook)
+                if fit is not None:
+                    self._claim_hook(last, hook, fit)
+                    self._emit_permission(last)
                     continue
-                self._merge_permission_hook(target, hook)
+                self._perm_hook_seq += 1
+                self._perm_hook_pending.setdefault(sid, {})[
+                    hook.get("toolUseId") or f"h{self._perm_hook_seq}"] = (hook, mono)
         for sid in list(self._perm_hook_pending):
             pend = self._perm_hook_pending[sid]
             for key in [k for k, (_h, seen) in pend.items()
@@ -28845,8 +28849,60 @@ class SessionManager:
                 del self._perm_hook_pending[sid]
 
     @staticmethod
+    def _hook_fit(row, hook):
+        """How well a PermissionRequest hook row fits a dialog row — 3 by
+        toolUseId (should the event ever carry one), 2 by the call's tool +
+        digest, 1 by tool + head, 0 for an ADOPTION (a row with no call of its
+        own to match: a sub-agent's dialog, whose pending call is the
+        delegation, or one with no pending call found) — or None when it is not
+        that dialog's: the row already has its hook, is a sandbox prompt (not
+        hookable), or the hook fired after the dialog was seen."""
+        if not isinstance(row, dict) or "rulesMatched" in row:
+            return None
+        if row.get("dialogKind") == "sandbox":
+            return None
+        ts, opened = hook.get("ts"), row.get("openedAt")
+        timed = isinstance(ts, (int, float)) and isinstance(opened, (int, float))
+        if timed and ts > opened + PERMISSION_HOOK_LATE_MS:
+            return None
+        delegated = row.get("tool") in PERMISSION_DELEGATING_TOOLS
+        htuid, rtuid = hook.get("toolUseId") or "", row.get("toolUseId") or ""
+        if htuid and rtuid and htuid == rtuid:
+            return 3
+        if htuid and rtuid and not delegated:
+            return None
+        tool = hook.get("tool") or ""
+        if tool and tool == row.get("tool"):
+            if hook.get("digest") and hook["digest"] == row.get("digest"):
+                return 2
+            # (A row with no digest is permlog.py failing to load: tool only.)
+            # A delegation's head is its tool name, so only its digest says the
+            # prompt is about launching it rather than a call inside it.
+            if not delegated and ((hook.get("head") and hook["head"] == row.get("head"))
+                                  or not row.get("digest")):
+                return 1
+        if delegated or not row.get("tool"):
+            if timed and ts < opened - PERMISSION_HOOK_ADOPT_MS:
+                return None
+            return 0
+        return None
+
+    @classmethod
+    def _claim_hook(cls, row, hook, fit):
+        # An adoption into a sub-agent's dialog OVERRIDES the delegation's call:
+        # the hook names the real one. Anything else only fills empty keys.
+        cls._merge_permission_hook(
+            row, hook,
+            override=fit == 0 and row.get("tool") in PERMISSION_DELEGATING_TOOLS)
+
+    @staticmethod
     def _merge_permission_hook(row, hook, override=False):
         row["rulesMatched"] = list(hook.get("rulesMatched") or [])
+        if override:
+            # The delegation's toolUseId is not this call's (a PermissionRequest
+            # names none): keeping it would let the repaint rule fold the
+            # sub-agent's NEXT prompt into this row and charge its outcome.
+            row["toolUseId"] = hook.get("toolUseId") or ""
         for key in ("toolUseId", "tool", "head", "digest"):
             if (override or not row.get(key)) and hook.get(key):
                 row[key] = hook[key]
@@ -28944,19 +29000,20 @@ class SessionManager:
             host = _pane_dialog_host(pp)
             if host:
                 row["head"] = host
+        # A hook tailed before its dialog was seen is held: claim the best fit
+        # (its call, else — for a dialog with no call of its own — the newest
+        # one raised about when this dialog was; an older one is an earlier
+        # prompt answered between beats, that prompt's own row).
         pend = self._perm_hook_pending.get(sid) or {}
-        hit = pend.pop(row["toolUseId"], None) if row.get("toolUseId") else None
-        delegated = row.get("tool") in PERMISSION_DELEGATING_TOOLS
-        if hit is None and (delegated or not row.get("toolUseId")) and len(pend) == 1:
-            # A GUESS (no toolUseId to match on), so only a hook raised about
-            # when this dialog was: one held from an earlier prompt answered
-            # between beats is that prompt's own row, never this one's call.
-            (key, held), = pend.items()
-            ts = held[0].get("ts")
-            if isinstance(ts, (int, float)) and ts >= now_ms - PERMISSION_HOOK_ADOPT_MS:
-                hit = pend.pop(key)
-        if hit is not None:
-            self._merge_permission_hook(row, hit[0], override=delegated)
+        best = None
+        for key, (hook, _seen) in pend.items():
+            fit = self._hook_fit(row, hook)
+            if fit is not None and (best is None
+                                    or (fit, hook["ts"]) > (best[0], best[2]["ts"])):
+                best = (fit, key, hook)
+        if best is not None:
+            del pend[best[1]]
+            self._claim_hook(row, best[2], best[0])
         self._perm_turma_answer.pop(sid, None)
         self._perm_open[sid] = row
         self._emit_permission(row)

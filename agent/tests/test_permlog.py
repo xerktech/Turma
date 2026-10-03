@@ -35,9 +35,14 @@ def denied(**extra):
 
 
 def requested(**extra):
-    ev = {"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+    # The REAL PermissionRequest shape (Claude Code 2.1.288, confirmed with a
+    # live hook dumping its stdin): NO tool_use_id — unlike PermissionDenied and
+    # PreToolUse. The manager merges it with its dialog on tool + head/digest.
+    ev = {"session_id": "0b9f2c1e-1111-4222-8333-444455556666",
+          "transcript_path": "/home/u/.claude/projects/p/0b9f.jsonl",
+          "cwd": "/repo", "prompt_id": "p1", "permission_mode": "default",
+          "hook_event_name": "PermissionRequest", "tool_name": "Bash",
           "tool_input": {"command": "npm test -- --watch=false"},
-          "tool_use_id": "toolu_02",
           "permission_suggestions": [{
               "type": "addRules", "behavior": "allow", "destination": "localSettings",
               "rules": [{"toolName": "Bash", "ruleContent": "npm test:*"}]}]}
@@ -88,6 +93,7 @@ class PermlogTest(unittest.TestCase):
         self.assertEqual(row["head"], "npm test")
         self.assertEqual(row["rulesMatched"], ["Bash(npm test:*)"])
         self.assertNotIn("denyReason", row)
+        self.assertIsNone(row["toolUseId"])     # the event carries none
 
     def test_heads_per_tool(self):
         cases = [

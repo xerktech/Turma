@@ -162,7 +162,17 @@ test("suggestedRule: the deterministic table", () => {
 test("suggestedRule: never an allow-everything or malformed Bash prefix rule", () => {
   // An interpreter / shell / wrapper / keyword head runs whatever follows it.
   for (const head of ["python3", "bash", "sh", "sudo", "env", "xargs", "timeout", "for",
-    "eval", "/usr/bin/python3", "npx tsx", "uv run", "docker run", "npm exec"]) {
+    "eval", "/usr/bin/python3", "npx tsx", "uv run", "docker run", "npm exec",
+    // …and the same exec under an alias or a parent noun, plus bare wrappers.
+    "docker container", "docker compose", "npm x", "bun x", "bun run", "yarn exec",
+    "go run", "cargo run", "dotnet run", "kubectl run", "kubectl debug",
+    "stdbuf", "setsid", "chroot", "unshare", "nsenter", "strace", "ltrace", "busybox",
+    "flock", "taskset", "ionice", "chrt", "runuser", "setpriv", "systemd-run",
+    "unbuffer", "expect", "xvfb-run", "dbus-run-session", "tsx", "ts-node",
+    "poetry", "pipx", "pdm", "hatch", "conda", "mamba", "micromamba", "nix", "nix-shell",
+    "mise", "asdf", "direnv", "java", "julia", "Rscript", "tclsh",
+    "cmd", "cmd.exe", "powershell.exe", "pwsh.exe", "wsl", "wsl.exe",
+    "/usr/bin/stdbuf"]) {
     assert.equal(suggestedRule({ kind: "dialog", tool: "Bash", head }), null, head);
     assert.equal(suggestedRule({ kind: "classifier-denied", tool: "Bash", head }), null, head);
   }
