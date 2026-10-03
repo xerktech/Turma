@@ -1766,6 +1766,24 @@ test("XERK-1364: a rebuild from a stale sidecar de-duplicates the agent's re-sen
   assert.equal(archive.getTranscript(id).entries.length, 2);
 });
 
+// XERK-1459: the drain can leave a `.meta` NEWER than its `.jsonl`; its cursor claims
+// entries the file lacks, so a rebuild trusting it skips them for good.
+test("XERK-1459: a rebuild from a sidecar AHEAD of its .jsonl re-sends what the file lacks", () => {
+  const id = "t-1459-ahead";
+  const m = { ...META, summary: "Sidecar ahead" };
+  archive.ingestChunk("nas", id, m, 0, 10, [ent("h1", "user", "a")]);
+  const jsonl = path.join(process.env.ARCHIVE_DIR, archive.archiveRelPath(id, { ...m, host: "nas" }));
+  const pushed = fs.readFileSync(jsonl);
+  archive.ingestChunk("nas", id, m, 10, 20, [ent("h2", "assistant", "b")]);
+  fs.writeFileSync(jsonl, pushed);              // the .jsonl lost the append, the .meta kept it
+  archive.rebuildIndex();
+  assert.equal(archive.manifestCursors("nas", [{ transcriptId: id, ...m }])[id], 0);
+  archive.ingestChunk("nas", id, m, 0, 20, [ent("h1", "user", "a"), ent("h2", "assistant", "b")]);
+  const uuids = fs.readFileSync(jsonl, "utf8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+  assert.deepEqual(uuids, ["h1", "h2"]);
+  assert.equal(archive.getTranscript(id).entries.length, 2);
+});
+
 test("XERK-1364: identical held entries are consumed once each, not as a set", () => {
   const id = "t-1364-multi";
   const m = { ...META, summary: "Multiset" };

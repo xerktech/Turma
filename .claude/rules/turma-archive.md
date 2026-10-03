@@ -192,7 +192,10 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     (`reconcileHydratedCursors`, `rebuildIndex`, backfill): hydrate keeps a same-size STALE `.meta`
     beside a re-downloaded `.jsonl`. Neither sidecar nor row matches → lower cursor + suspect.
   - A SHORTER file is not this path — heal-on-read (XERK-280) owns it and also fixes the FTS.
-  - Tests: `XERK-1364` cases in `archive.test.js` and `index-store.test.js`.
+  - A cursor written beside a LONGER file is never trusted (XERK-1459): the mirror drain PUTs each
+    file alone, so the bucket can hold a `.meta` (and PG a row) newer than its `.jsonl`. Only
+    cursors whose `archiveBytes` ≤ the file size are candidates; none left → 0 (`sidecarCursor`).
+  - Tests: `XERK-1364` + `XERK-1459` cases in `archive.test.js` and `index-store.test.js`.
 - **`meta` is COERCED before it is bound** (`normalizeMeta`) — every field is agent-supplied and goes
   straight into sqlite (scalars only); a non-scalar stores as nothing rather than poisoning every
   later beat with a 500. The length cap is the receiving half of the same XERK-235 rule as above.
