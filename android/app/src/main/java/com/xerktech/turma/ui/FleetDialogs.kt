@@ -36,6 +36,7 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -333,12 +334,28 @@ fun NewSessionPickerDialog(
                         // the repo rows below it (which take the dialog's default bodyMedium, 14sp)
                         // so where one agent's list ends and the next begins is easy to see — the
                         // muted labelSmall SectionLabel read SMALLER than its own rows (XERK-737).
-                        Text(
-                            h.device,
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(top = 12.dp, bottom = 4.dp),
-                        )
+                        Row(
+                            Modifier.padding(top = 12.dp, bottom = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                h.device,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.weight(1f, fill = false),
+                            )
+                            // Active / limit, so a full host is visible before queueing onto it.
+                            hostCapLabel(h.capacity)?.let { cap ->
+                                Text(
+                                    cap.text,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = if (cap.full) FontWeight.SemiBold else FontWeight.Normal,
+                                    color = if (cap.full) MaterialTheme.colorScheme.error
+                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(start = 8.dp),
+                                )
+                            }
+                        }
                         h.repos.forEach { repo ->
                             Text(
                                 if (repo.root) "⌂ Repos root" else repo.name,

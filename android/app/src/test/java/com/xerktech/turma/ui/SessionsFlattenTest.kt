@@ -2,6 +2,7 @@ package com.xerktech.turma.ui
 
 import com.xerktech.turma.core.LiveState
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.Capacity
 import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.RepoInfo
 import com.xerktech.turma.model.SessionInfo
@@ -199,6 +200,18 @@ class SessionsFlattenTest {
             sessions = listOf(SessionInfo(id = "s", status = "stopped", root = true)),
         )
         assertTrue(spawnTargets(listOf(free))[0].repos.any { it.root })
+    }
+
+    @Test fun `spawnTargets carries capacity and hostCapLabel reads running over max`() {
+        val a = agentWithRepos("h1", "MAXAI", true, listOf(RepoInfo(name = "r")))
+            .copy(capacity = Capacity(maxSessions = 4, running = 2, free = 2))
+        val cap = spawnTargets(listOf(a))[0].capacity
+        assertEquals(HostCapLabel("2 / 4", full = false), hostCapLabel(cap))
+        // Full off `free`, not running: a broken session holds a slot (XERK-1044).
+        assertEquals(HostCapLabel("3 / 4", full = true), hostCapLabel(Capacity(maxSessions = 4, running = 3, free = 0)))
+        // No ceiling reported (pre-capacity agent) → no label, never "0 / 0".
+        assertEquals(null, hostCapLabel(null))
+        assertEquals(null, hostCapLabel(Capacity()))
     }
 
     // ---- collectSessions (the web collect(): queued + 3-channel ended) -------
