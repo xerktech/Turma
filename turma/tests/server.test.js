@@ -2689,6 +2689,43 @@ test("http: /updating shows an expected restart as `updating`, not `offline`", a
   assert.equal(agents["upd-host"].updating, undefined);
 });
 
+// ---- slow-build keepalive (XERK-1266) ------------------------------------------
+
+test("http: /alive keeps a host whose beat build is stalled online, and nothing else", async () => {
+  await request("POST", "/api/heartbeat",
+    { body: { device: "alive-host", sessions: [{ id: "s1" }], ackedCommands: [] }, headers: agentHeaders });
+  // Agent-authed like the heartbeat, and the host is BOUND to the credential
+  // (XERK-268): another host's derived token cannot keep this one alive.
+  assert.equal((await request("POST", "/api/agents/alive-host/alive", { body: {} })).status, 401);
+  const other = { authorization: `Bearer ${hostAgentToken("some-other-host")}` };
+  assert.equal(
+    (await request("POST", "/api/agents/alive-host/alive", { body: {}, headers: other })).status, 403);
+  // A host the hub has never seen has no record to keep alive.
+  assert.equal(
+    (await request("POST", "/api/agents/ghost-alive/alive", { body: {}, headers: agentHeaders })).status,
+    404);
+  assert.equal(agents["ghost-alive"], undefined, "a keepalive never creates a record");
+
+  const recOf = async () => {
+    hub.invalidateAgentsCache();
+    return (await request("GET", "/api/agents", { headers: userHeaders })).body.agents
+      .find((a) => a.key === "alive-host");
+  };
+  // Silent past the offline threshold: reads offline.
+  agents["alive-host"].lastSeen = Date.now() - 2 * 60 * 1000;
+  agents["alive-host"].commands = [{ cmdId: "c1", type: "noop" }];
+  assert.equal((await recOf()).online, false);
+  const before = JSON.stringify({ ...agents["alive-host"], lastSeen: 0 });
+  const ok = await request("POST", "/api/agents/alive-host/alive",
+    { body: { sessions: [], ackedCommands: ["c1"] }, headers: agentHeaders });
+  assert.equal(ok.status, 200);
+  // Online again — and the record is otherwise untouched: a body cannot replace
+  // the sessions or ack a queued command the way a full beat would.
+  assert.equal((await recOf()).online, true);
+  assert.equal(JSON.stringify({ ...agents["alive-host"], lastSeen: 0 }), before);
+  assert.equal(agents["alive-host"].commands.length, 1);
+});
+
 // ---- archive: agent-push ingest + heartbeat cursors + search/browse/view -------
 
 test("http: archive ingest is agent-authed; search/browse/view are user-authed", async () => {

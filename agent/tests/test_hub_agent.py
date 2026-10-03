@@ -26025,6 +26025,15 @@ class TestBeatLoopBudget(unittest.TestCase):
         self.assertIsNotNone(m, "OFFLINE_AFTER_MS moved or changed shape")
         return int(m.group(1)) * int(m.group(2))
 
+    def test_slow_build_keepalive_lands_before_the_offline_threshold(self):
+        """XERK-1266: the last full beat lands at T; the next build starts by
+        T + INTERVAL; the first keepalive lands by INTERVAL + AFTER + TIMEOUT,
+        each later one EVERY + TIMEOUT after the previous. Both must fit."""
+        off = self._offline_after_ms()
+        first = ha.INTERVAL + ha.KEEPALIVE_AFTER_SEC + ha.KEEPALIVE_TIMEOUT_SEC
+        self.assertLess(first * 1000, off)
+        self.assertLess((ha.KEEPALIVE_EVERY_SEC + ha.KEEPALIVE_TIMEOUT_SEC) * 1000, off)
+
     def test_archive_worst_case_exceeds_the_offline_threshold(self):
         """WHY archive sync may not run inline: one rendered push plus the raw
         pass's whole failure budget is longer than the hub's patience, so an
@@ -32846,6 +32855,63 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
             sm.spawn_ticket("PROJ-7")
         self.assertEqual(sm.spawn_failures, [])
+
+
+class TestSlowBuildKeepalive(ManagerMixin, unittest.TestCase):
+    """XERK-1266: while a beat BUILD stalls (cache-cold disk, inline git), a
+    watcher posts /api/agents/<host>/alive so the hub keeps the host online —
+    never a stale full snapshot."""
+
+    def _run_beat(self, sm, build_sec):
+        alive = []
+        def slow_build(beat, light=False):
+            time.sleep(build_sec)
+            return {}
+        with mock.patch.object(ha, "KEEPALIVE_AFTER_SEC", 0.2), \
+             mock.patch.object(ha, "KEEPALIVE_EVERY_SEC", 0.2), \
+             mock.patch.object(sm, "build_payload", slow_build), \
+             mock.patch.object(sm, "post", return_value={}) as post, \
+             mock.patch.object(sm, "_post_alive", lambda e: alive.append(e)):
+            sm._start_keepalive()
+            sm._beat_once(1)
+            # A FAST beat right after must not inherit the slow one's timer.
+            sm.build_payload = lambda beat, light=False: {}
+            n = len(alive)
+            sm._beat_once(2)
+            time.sleep(0.4)
+            self.assertEqual(len(alive), n, "a fast build sent a keepalive")
+            self.assertEqual(post.call_count, 2, "the full beat is posted once per build")
+        return alive
+
+    def test_a_stalled_build_sends_repeated_keepalives(self):
+        alive = self._run_beat(self.make_manager(), 0.75)
+        self.assertGreaterEqual(len(alive), 2)
+        self.assertLessEqual(len(alive), 4)
+        self.assertGreaterEqual(alive[0], 0.2)
+
+    def test_a_fast_build_sends_none(self):
+        self.assertEqual(self._run_beat(self.make_manager(), 0.0), [])
+
+    def test_post_alive_hits_the_host_route_and_ignores_a_404(self):
+        sm = self.make_manager()
+        seen = {}
+        def fake_urlopen(req, timeout=None):
+            seen.update(url=req.full_url, method=req.get_method(),
+                        body=req.data, auth=req.get_header("Authorization"),
+                        timeout=timeout)
+            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+        with mock.patch.object(ha, "TURMA_URL", "http://hub:8300"), \
+             mock.patch.object(ha, "TURMA_TOKEN", "tok"), \
+             mock.patch.object(ha.urllib.request, "urlopen", fake_urlopen):
+            sm._post_alive(31.0)  # an older hub's 404 must not raise
+        self.assertEqual(seen["url"], f"http://hub:8300/api/agents/{sm.device}/alive")
+        self.assertEqual(seen["method"], "POST")
+        self.assertEqual(seen["body"], b"{}", "never a payload snapshot")
+        self.assertEqual(seen["auth"], "Bearer tok")
+        self.assertEqual(seen["timeout"], ha.KEEPALIVE_TIMEOUT_SEC)
+        with mock.patch.object(ha, "TURMA_URL", "http://hub:8300"), \
+             mock.patch.object(ha.urllib.request, "urlopen", side_effect=OSError("down")):
+            sm._post_alive(31.0)  # a dead hub must not raise either
 
 
 class TestUpdatingAnnounce(ManagerMixin, unittest.TestCase):

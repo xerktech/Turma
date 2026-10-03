@@ -15310,6 +15310,12 @@ const server = http.createServer(async (req, res) => {
       req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
       parts[3] === "updating" && parts.length === 4;
 
+    // The slow-build keepalive (XERK-1266) is agent-pushed like the heartbeat:
+    // a host whose beat BUILD is stalled on disk/git says it is still up.
+    const isAliveSignal =
+      req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+      parts[3] === "alive" && parts.length === 4;
+
     // The programmatic trigger endpoint carries its own bearer-token auth (or a
     // user login), so it's gated by triggerAuthorized instead of the
     // browser-only userAuthorized gate below.
@@ -15346,7 +15352,8 @@ const server = http.createServer(async (req, res) => {
       // credential-less case refused before the body is read, as it always was.
       const gate = agentPresentedRefusal(req);
       if (gate) return json(res, gate.status, { error: gate.error });
-    } else if (isArchiveIngest || isUpdatingSignal || isMigrationBlob || isUploadBlob) {
+    } else if (isArchiveIngest || isUpdatingSignal || isAliveSignal || isMigrationBlob ||
+               isUploadBlob) {
       // These all carry the host they act as in `<host>`, so the credential is
       // checked AGAINST it rather than merely being a valid agent token. The
       // decode is the same expression each route runs on the same segment, so
@@ -16293,6 +16300,27 @@ const server = http.createServer(async (req, res) => {
       scheduleSave();
       // Refresh the memoized fleet payload (its `updating`/`online` flags just
       // changed) and push the transition to open dashboards immediately.
+      publishAgent(key);
+      return json(res, 200, { ok: true });
+    }
+
+    // POST /api/agents/<host>/alive — a host whose beat BUILD has been running a
+    // long time (a cache-cold transcript walk on a contended pool, an inline git
+    // read) saying it is still up, so the stall does not read as offline past
+    // OFFLINE_AFTER_MS (XERK-1266). Agent-authed above with `<host>` bound to the
+    // credential (XERK-268). It bumps `lastSeen` on an EXISTING record and nothing
+    // else: the record's content stays the last full beat's, and nothing a beat
+    // delivers (acks, spawnFailures, results) can ride it. An unknown host has no
+    // record to keep alive, so it 404s — the same answer an older hub gives for
+    // the route, which the agent reads as "no keepalive" either way.
+    // publishAgent is what carries the bump to the HA write-through (XERK-756).
+    if (isAliveSignal) {
+      const key = decodeURIComponent(parts[2]);
+      const a = agents[key];
+      if (!a) return json(res, 404, { error: "unknown host" });
+      await readBody(req);
+      a.lastSeen = Date.now();
+      scheduleSave();
       publishAgent(key);
       return json(res, 200, { ok: true });
     }

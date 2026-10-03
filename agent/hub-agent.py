@@ -178,6 +178,19 @@ BEAT_SLOW_LOG_SEC = _env_float("TURMA_BEAT_SLOW_LOG_SEC", 5.0, minimum=0.0)
 # TestBeatLoopBudget. A beat that executes commands posts a second, `light`
 # follow-up, so budget two of these per cycle.
 HEARTBEAT_TIMEOUT_SEC = 10
+# Keepalive while a beat BUILD is slow (XERK-1266). The hub's only liveness
+# signal used to be the full heartbeat, so ANY stall building the payload —
+# a cache-cold transcript walk on a contended pool, an inline git read — read
+# as offline past OFFLINE_AFTER_MS whatever its cause. Once a build has run
+# KEEPALIVE_AFTER_SEC, a watcher thread POSTs /api/agents/<host>/alive (which
+# only bumps lastSeen on the existing record) and repeats every
+# KEEPALIVE_EVERY_SEC until the build finishes. It never re-posts a stale full
+# snapshot: that would re-deliver spawnFailures/acks and replace the record.
+# Worst case to the first keepalive landing is INTERVAL + AFTER + TIMEOUT, which
+# TestBeatLoopBudget pins under the hub's threshold.
+KEEPALIVE_AFTER_SEC = 30
+KEEPALIVE_EVERY_SEC = 30
+KEEPALIVE_TIMEOUT_SEC = 5
 
 # Windows portability (XERK-670, native no-WSL host, epic XERK-666). The shared
 # runtime is ONE cross-platform codebase — never forked per OS (ADR D5) — so the
@@ -16419,6 +16432,13 @@ class SessionManager:
         self._input_lock = threading.Lock()
         self._input_wake = threading.Event()
         self._input_worker = None
+        # Slow-build keepalive (XERK-1266): _beat_once stamps the build's start
+        # and sets `_build_wake`; `_build_done` is set when it finishes. Read by
+        # _keepalive_loop only.
+        self._build_started = None
+        self._build_wake = threading.Event()
+        self._build_done = threading.Event()
+        self._build_done.set()
         # The memory guard (XERK-1019) kills on its own thread and stages each kill
         # here; the BEAT drains it and tells the session (_deliver_memguard_kills),
         # since notify_session's pane fallback writes the registry.
@@ -31683,7 +31703,16 @@ class SessionManager:
         Timing must never be able to take the host down, so the log is wrapped
         and the reply is returned untouched on any path."""
         t0 = time.time()
-        payload = self.build_payload(beat, light=light)
+        # Arm the slow-build keepalive (XERK-1266). `_build_done` is cleared
+        # BEFORE the start is published, so the watcher can never see a new
+        # start beside the previous build's done flag.
+        self._build_done.clear()
+        self._build_started = time.monotonic()
+        self._build_wake.set()
+        try:
+            payload = self.build_payload(beat, light=light)
+        finally:
+            self._build_done.set()
         t1 = time.time()
         reply = self.post(payload)
         t2 = time.time()
@@ -31695,6 +31724,62 @@ class SessionManager:
         except Exception:
             pass
         return reply
+
+    def _start_keepalive(self):
+        """Start the slow-build keepalive watcher (XERK-1266) once, from
+        run_forever. A failed Thread.start() (pids_limit, XERK-402) only loses
+        the keepalive — the beat itself is unaffected — so it is logged, never
+        raised."""
+        try:
+            threading.Thread(target=self._keepalive_loop, name="keepalive",
+                             daemon=True).start()
+        except Exception as e:
+            log(f"keepalive: failed to start: {e}")
+
+    def _keepalive_loop(self):
+        """Wait for a beat build to start; once it has run KEEPALIVE_AFTER_SEC,
+        post a keepalive every KEEPALIVE_EVERY_SEC until it finishes. Never
+        raises — a dead watcher silently loses the protection."""
+        while True:
+            self._build_wake.wait()
+            self._build_wake.clear()
+            started = self._build_started
+            if started is None:
+                continue
+            next_at = started + KEEPALIVE_AFTER_SEC
+            while not self._build_done.wait(max(0.0, next_at - time.monotonic())):
+                # A newer build replaced the one we were timing: its own wake is
+                # already set, so go round and time it from ITS start.
+                if self._build_started != started:
+                    break
+                try:
+                    self._post_alive(time.monotonic() - started)
+                except Exception as e:
+                    log(f"keepalive error: {type(e).__name__}: {e}")
+                next_at = time.monotonic() + KEEPALIVE_EVERY_SEC
+
+    def _post_alive(self, elapsed):
+        """POST /api/agents/<host>/alive — bump this host's lastSeen without a
+        payload (XERK-1266). The reply is IGNORED: a 404 from an older hub (no
+        such route) or for a host the hub has not met yet just means no
+        keepalive, and the beat in progress still lands on its own. Bounded by
+        KEEPALIVE_TIMEOUT_SEC; this runs on the watcher thread, never the beat."""
+        if not TURMA_URL:
+            return
+        headers = {"Content-Type": "application/json", "User-Agent": "hub-agent/1.0"}
+        if TURMA_TOKEN:
+            headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+        url = f"{TURMA_URL}/api/agents/{urllib.parse.quote(self.device, safe='')}/alive"
+        req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=KEEPALIVE_TIMEOUT_SEC) as resp:
+                resp.read(4096)
+                status = resp.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+        except Exception as e:
+            status = f"{type(e).__name__}: {e}"
+        log(f"beat build running {elapsed:.0f}s; sent keepalive ({status})")
 
     def _perform_restart(self):
         """Bring the manager back the way a SIGTERM restart (XERK-29) does, but
@@ -31845,6 +31930,9 @@ class SessionManager:
         # budget and flap a healthy host offline. Started once here; the queue is
         # in-memory and parks empty until a command stages something.
         self._start_input_worker()
+        # The slow-build keepalive (XERK-1266): keeps the host online on the hub
+        # while a beat build stalls on disk or git, whatever the cause.
+        self._start_keepalive()
         # The memory guard (XERK-1019): one session's runaway process must not
         # OOM-kill or livelock every session in the shared cgroup. Its own thread.
         try:

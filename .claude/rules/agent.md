@@ -199,6 +199,14 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   every beat (`BEAT_SLOW_LOG_SEC`). Build and post are logged separately: a slow build is local
   subprocess/disk cost we own, a slow post is the network. There was no instrumentation at all before,
   which made every claim about heartbeat latency unfalsifiable — keep new beat work behind it.
+- **A slow beat BUILD is kept alive by `POST /api/agents/<host>/alive`** (XERK-1266). `_beat_once`
+  arms a watcher thread; past `KEEPALIVE_AFTER_SEC` it posts every `KEEPALIVE_EVERY_SEC` until the
+  build ends. Hub-side it only bumps `lastSeen` on an existing record (404 otherwise, as on an older
+  hub — the reply is ignored). It covers every stall class, but it is liveness ONLY: commands still
+  wait for the beat, so it is no licence to put slow work back on the beat.
+  - **Never re-post a stale full payload as the keepalive** — that re-delivers `spawnFailures`/acks
+    and replaces the record. Tests: `TestSlowBuildKeepalive`, `TestBeatLoopBudget`, `/alive` in
+    `server.test.js`.
 - Repo list most-recently-active first; repos-root pseudo-repo **pinned first, never ranked**.
 - `agentVersion` falls back `TURMA_AGENT_VERSION` → `native/install.sh`'s stamped `VERSION` →
   repo-root `VERSION` → `null`. Tests: `TestAgentVersion`.
