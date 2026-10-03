@@ -65,7 +65,7 @@ make_tarball() {  # <version> <outdir> [nohooks] [withdsh]
     echo "// guard $version" >"$staged/dsh/guard/index.mjs"
   fi
   # Every real payload ships the update timer (release.yml).
-  echo "# timer $version" >"$staged/turma-agent-update.timer"
+  echo "[Timer] # timer $version" >"$staged/turma-agent-update.timer"
   echo "$version" >"$staged/VERSION"
   local tgz="$out/turma-agent-native-v${version}.tar.gz"
   tar czf "$tgz" -C "$staged" .
@@ -1582,7 +1582,7 @@ if [ -d /run/systemd/system ]; then
     echo "0.4.0" >"$prefix/VERSION"
     install_fake_restart "$bin"; install_fake_gh "$bin"
     udir="$root/home/.config/systemd/user"; mkdir -p "$udir"
-    if [ "$same" = yes ]; then echo "# timer 0.5.0" >"$udir/turma-agent-update.timer"
+    if [ "$same" = yes ]; then echo "[Timer] # timer 0.5.0" >"$udir/turma-agent-update.timer"
     else echo "OnUnitActiveSec=1h" >"$udir/turma-agent-update.timer"; fi
     export TURMA_TEST_RESTART_LOG="$root/restart.log"; : > "$TURMA_TEST_RESTART_LOG"
     FAKE_GH_DIR="$d" HOME="$root/home" XDG_CONFIG_HOME="" PATH="$bin:$PATH" \
@@ -1590,7 +1590,7 @@ if [ -d /run/systemd/system ]; then
       "$bin/turma-agent-update" >/dev/null 2>&1 || true
     unset TURMA_TEST_RESTART_LOG
     got="$(cat "$udir/turma-agent-update.timer")"
-    assert_eq "# timer 0.5.0" "$got" "timer content after update (same=$same)" \
+    assert_eq "[Timer] # timer 0.5.0" "$got" "timer content after update (same=$same)" \
       "installed timer not refreshed from the payload: $got"
     if [ "$same" = no ]; then
       if grep -q "systemctl --user daemon-reload" "$root/restart.log" \
@@ -1606,6 +1606,78 @@ if [ -d /run/systemd/system ]; then
     fi
     rm -rf "$root" "$d"
   done
+  # An UP-TO-DATE run reconciles too, from the copy an earlier install left in
+  # $PREFIX — an install runs the OLD updater, so install-only left a host a
+  # whole extra release away from the fix.
+  d="$(new_gh_dir)"; add_unified_release "$d" "v0.5.0" "0.5.0" "v0.5.0"
+  root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+  cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+  echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+  mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+  echo "0.5.0" >"$prefix/VERSION"
+  echo "[Timer] # timer 0.5.0" >"$prefix/turma-agent-update.timer"
+  install_fake_restart "$bin"; install_fake_gh "$bin"
+  udir="$root/home/.config/systemd/user"; mkdir -p "$udir"
+  echo "OnUnitActiveSec=1h" >"$udir/turma-agent-update.timer"
+  FAKE_GH_DIR="$d" HOME="$root/home" XDG_CONFIG_HOME="" PATH="$bin:$PATH" \
+    TURMA_REPO="xerktech/turma" TURMA_CLAUDE_AUTO_UPDATE=0 \
+    "$bin/turma-agent-update" >/dev/null 2>&1 || true
+  assert_eq "0.5.0" "$(tr -d '[:space:]' < "$prefix/VERSION")" "up-to-date run installs nothing" \
+    "an up-to-date run changed VERSION"
+  assert_eq "[Timer] # timer 0.5.0" "$(cat "$udir/turma-agent-update.timer")" \
+    "an up-to-date run refreshes the timer from \$PREFIX" "timer not refreshed on an up-to-date run"
+  rm -rf "$root" "$d"
+  # A copy into $PREFIX that dies part-way (ENOSPC truncates the destination
+  # first) must leave neither a partial copy nor the stale old one: the next run
+  # would install it, and an EMPTY unit file reads as MASKED (QA, XERK-1266).
+  d="$(new_gh_dir)"; add_unified_release "$d" "v0.6.0" "0.6.0" "v0.6.0"
+  root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+  cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+  echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+  mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+  echo "0.5.0" >"$prefix/VERSION"
+  printf '[Timer]\nOnUnitActiveSec=1h\n' >"$prefix/turma-agent-update.timer"
+  install_fake_restart "$bin"; install_fake_gh "$bin"
+  realcp="$(command -v cp)"
+  cat > "$bin/cp" <<EOF2
+#!/bin/sh
+case "\$3" in *prefix/turma-agent-update.timer.tmp.*) : > "\$3"; exit 1 ;; esac
+exec "$realcp" "\$@"
+EOF2
+  chmod +x "$bin/cp"
+  udir="$root/home/.config/systemd/user"; mkdir -p "$udir"
+  printf '[Timer]\nOnUnitActiveSec=1h\n' >"$udir/turma-agent-update.timer"
+  for _ in 1 2; do
+    FAKE_GH_DIR="$d" HOME="$root/home" XDG_CONFIG_HOME="" PATH="$bin:$PATH" \
+      TURMA_REPO="xerktech/turma" TURMA_CLAUDE_AUTO_UPDATE=0 \
+      "$bin/turma-agent-update" >/dev/null 2>&1 || true
+  done
+  assert_eq "[Timer] # timer 0.6.0" "$(cat "$udir/turma-agent-update.timer")" \
+    "a failed \$PREFIX copy still installs the payload's timer, and keeps it" \
+    "unit after a failed \$PREFIX copy: $(cat "$udir/turma-agent-update.timer")"
+  if [ -e "$prefix/turma-agent-update.timer" ] || ls "$prefix"/*.tmp.* >/dev/null 2>&1; then
+    fail "a failed copy left a stale or partial \$PREFIX timer behind"
+  else
+    pass "a failed copy leaves no \$PREFIX timer to revert the unit with"
+  fi
+  rm -rf "$root" "$d"
+  # A source that is not a timer (empty) is never installed.
+  d="$(new_gh_dir)"; add_unified_release "$d" "v0.5.0" "0.5.0" "v0.5.0"
+  root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+  cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+  echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+  mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+  echo "0.5.0" >"$prefix/VERSION"; : >"$prefix/turma-agent-update.timer"
+  install_fake_restart "$bin"; install_fake_gh "$bin"
+  udir="$root/home/.config/systemd/user"; mkdir -p "$udir"
+  echo "[Timer] # installed" >"$udir/turma-agent-update.timer"
+  FAKE_GH_DIR="$d" HOME="$root/home" XDG_CONFIG_HOME="" PATH="$bin:$PATH" \
+    TURMA_REPO="xerktech/turma" TURMA_CLAUDE_AUTO_UPDATE=0 \
+    "$bin/turma-agent-update" >/dev/null 2>&1 || true
+  assert_eq "[Timer] # installed" "$(cat "$udir/turma-agent-update.timer")" \
+    "an empty \$PREFIX timer is never installed (it would mask the unit)" \
+    "an empty source replaced the unit"
+  rm -rf "$root" "$d"
 else
   pass "timer refresh cases skipped: no systemd on this runner"
 fi

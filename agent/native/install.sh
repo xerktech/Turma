@@ -278,6 +278,11 @@ install_files() {
   cp "$SRC_DIR/tunnel-agent.js"  "$PREFIX/tunnel-agent.js"
   cp "$SRC_DIR/tmux.conf"        "$PREFIX/tmux.conf"
   cp "$SRC_DIR"/hooks/*.py       "$PREFIX/hooks/"        # sibling to hub-agent.py (load-bearing)
+  # The updater reconciles the installed update timer against this copy on every
+  # run (XERK-1266), so a fresh install is covered from its first hourly check.
+  if [ -f "$SELF_DIR/turma-agent-update.timer" ]; then
+    cp "$SELF_DIR/turma-agent-update.timer" "$PREFIX/turma-agent-update.timer"
+  fi
   # Shared runtime scaffolding (XERK-528): imported by BOTH the dsh and qwen
   # transcript/tail siblings, so lay them down UNCONDITIONALLY like qwen's — a
   # host with either runtime that lacks them runs that runtime DARK (the
