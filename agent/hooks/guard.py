@@ -510,7 +510,7 @@ _ASSIGN_SUBST_RE = re.compile(_ASSIGN_SUBST)
 _VAR_ASSIGN_RE = re.compile(
     r"(?:^|[;\n&|\s])"
     r"\s*([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]\s]*\])?\+?="
-    r"((?:" + _ASSIGN_SUBST + r"|'[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;|&\n'\"`])+)"
+    r"(\([^()]*\)|(?:" + _ASSIGN_SUBST + r"|'[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;|&\n'\"`])+)"
 )
 # printf's conversions — flags, `*`/digit width, `.`/`.*`/digit precision —
 # and the backslash escapes it decodes in a format (and in a `%b` argument).
@@ -611,7 +611,11 @@ def _var_values(command: str) -> dict[str, list[str]]:
     """Values this command line itself assigns to a variable."""
     vals: dict[str, list[str]] = {}
     for m in _VAR_ASSIGN_RE.finditer(command):
-        vals.setdefault(m.group(1), []).append(_produced_text(_dequote_value(m.group(2))))
+        value = m.group(2)
+        if value.startswith("(") and value.endswith(")"):
+            # An array, `a=(rm -rf *)`: its words, which `"${a[@]}"` runs.
+            value = value[1:-1].strip()
+        vals.setdefault(m.group(1), []).append(_produced_text(_dequote_value(value)))
     for m in _FOR_IN_RE.finditer(command):
         words = [w for w in m.group(2).split() if w != "do"]
         if words:
@@ -807,6 +811,10 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
         op = _VAR_OP_RE.match(m.group(2) or "")
         if got:
             value = got[0] if len(got) == 1 else " ".join(got)
+            if (m.group(2) or "").startswith(("[@]", "[*]")) and m.string[m.start() - 1:m.start()] == '"':
+                # `"${a[@]}"` is one word PER element, quotes and all: close
+                # the quote around them, as bash's expansion does.
+                return '"' + value + '"'
             return _apply_var_op(value, op.group(1), op.group(2)) if op else value
         if op and op.group(1) in _VAR_DEFAULT_OPS:
             return op.group(2)
@@ -1449,11 +1457,14 @@ def _expand_segments(command: str, depth: int = 0,
         elif prog == "find":
             roots = _find_roots(tokens) or ["."]
             # Relative roots from inside a protected cwd: `cd /; find . -delete`.
-            roots += [j for cwd in cwds for r in roots
-                      if (j := _under_cwd(r, cwd)) != r][:_MAX_CWDS]
+            by_cwd = [(cwd, [_under_cwd(r, cwd) for r in roots]) for cwd in cwds]
+            by_cwd = [(cwd, joined) for cwd, joined in by_cwd if joined != roots]
             if "-delete" in rest:
                 # Equivalent to a recursive delete of everything it walks.
                 out.append((["rm", "-r", *roots], seg))
+                for cwd, joined in by_cwd:
+                    out.append((["rm", "-r", *joined], seg, False, cwd))
+            roots += [r for _, joined in by_cwd for r in joined]
             for flag in ("-exec", "-execdir", "-ok"):
                 while flag in rest:
                     i = rest.index(flag)
@@ -1482,7 +1493,8 @@ _HOME_USER_RE = re.compile(r"^~[a-z0-9_][a-z0-9_.-]*$")
 # A construct that can run earlier text again after a later `cd`. Matched
 # loosely — in quotes, comments and heredocs too — since a miss fails open.
 _REPLAYS_RE = re.compile(
-    r"\b(?:while|until|for|select|function|alias|trap|eval|coproc)\b|\(\s*\)")
+    r"\b(?:while|until|for|select|function|alias|trap|eval|coproc|BASH_EXECUTION_STRING)\b"
+    r"|\(\s*\)")
 
 
 

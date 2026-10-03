@@ -1182,7 +1182,11 @@ class TestProducedScripts(unittest.TestCase):
                     "f() { echo ${a:-${b}}; rm -rf *; }; cd /; f",
                     "f() ( x=$((1+2)); rm -rf * ); cd /; f",
                     "f() { echo x}; rm -rf *; }; cd /; f",
-                    "for i in 1; do :; done; " * 20 + "g() { rm -rf *; }; cd /; g"):
+                    "for i in 1; do :; done; " * 20 + "g() { rm -rf *; }; cd /; g",
+                    # The whole command line, re-run by a child shell.
+                    'rm -rf *; cd /; [ -n "$Y" ] || Y=1 bash -c "$BASH_EXECUTION_STRING"',
+                    # An array's elements, one word each even when quoted.
+                    'a=(rm -rf *); cd /; "${a[@]}"', "a=(rm -rf *); cd /; ${a[@]}"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("tmpd=$(mktemp -d); trap 'rm -rf \"$tmpd\"' EXIT; cd /",
@@ -1193,6 +1197,12 @@ class TestProducedScripts(unittest.TestCase):
         # The accepted cost: any loop/function/trap/alias/eval sign makes the
         # whole line order-blind, so a trailing `cd /` reaches an earlier `.`.
         self.assertDenied("f() { :; }; chmod -R go-w .; cd /")
+        # ...and the refusal says where the path came from, find included.
+        for cmd in ("f() { :; }; chmod -R go-w .; cd /",
+                    "find . -name '*.o' -delete; cd /; for x in 1; do :; done"):
+            with self.subTest(cmd=cmd):
+                self.assertIn("absolute path", guard.is_destructive(cmd))
+        self.assertAllowed('a=(build dist); rm -rf "${a[@]}"')
 
     def test_fixing_ssh_permissions_is_not_deleting_them(self):
         for cmd in ("chmod -R 700 ~/.ssh", "chmod -R go-rwx ~/.ssh", "chown -R me:me ~/.ssh",
