@@ -118,10 +118,29 @@ fun sessionName(session: SessionInfo): String {
     return wt.ifBlank { session.id }
 }
 
-/** Branch shown on the card: the agent's live HEAD, or "detached" until it branches. */
+/**
+ * Branch shown on the card: the agent's live HEAD, or "detached" until it branches.
+ * "" when there is no git block — the agent hasn't read it yet (it serves git:null
+ * until its cheap-git worker answers), which is unknown, not detached (XERK-1538).
+ * Callers drop or placeholder the blank, as web sessions.html `sessMeta` does.
+ */
 fun sessionBranch(session: SessionInfo): String {
-    val b = session.git?.branch ?: session.branch
+    val b = session.git?.branch ?: return ""
     return if (b.isBlank() || b == "HEAD") "detached" else b
+}
+
+/**
+ * The delete button's armed label — a port of web index.html `delConfirm`. No git
+ * block is unknown, NOT clean, so it warns changes may be lost (XERK-1538); a
+ * repos-root session has no worktree to lose.
+ */
+fun deleteConfirmText(session: SessionInfo): String {
+    val dirty = session.git?.dirtyFiles
+    return when {
+        dirty != null && dirty > 0 -> "Confirm delete — uncommitted changes will be lost"
+        dirty == null && !session.root -> "Confirm delete — may have uncommitted changes"
+        else -> "Confirm delete"
+    }
 }
 
 /**

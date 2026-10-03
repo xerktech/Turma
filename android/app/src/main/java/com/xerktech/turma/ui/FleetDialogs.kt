@@ -416,7 +416,6 @@ fun SessionActionsDialog(
     val queued = session.status == "queued"
     // Destructive actions arm on the first tap and fire on the second (the web
     // card's two-click confirm); delete warns when uncommitted work would go.
-    val dirty = session.git?.dirtyFiles ?: 0
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(com.xerktech.turma.core.sessionName(session)) },
@@ -437,7 +436,7 @@ fun SessionActionsDialog(
                         ActionRow("Resume", onResume)
                         ConfirmActionRow(
                             "Delete",
-                            if (dirty > 0) "Confirm delete — uncommitted changes will be lost" else "Confirm delete",
+                            com.xerktech.turma.core.deleteConfirmText(session),
                             onDelete,
                         )
                     }

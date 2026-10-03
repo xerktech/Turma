@@ -179,6 +179,21 @@ class SessionsTest {
         assertEquals("feat/x", sessionBranch(SessionInfo(git = GitState(branch = "feat/x"))))
     }
 
+    @Test fun `no git block is unknown, not detached`() {
+        // XERK-1538: the agent serves git:null until its first read answers.
+        assertEquals("", sessionBranch(SessionInfo(git = null)))
+        assertEquals("truenas · Turma", sessionHeaderMeta("truenas", SessionInfo(repo = "Turma")))
+    }
+
+    @Test fun `delete confirm treats unknown dirty as maybe-dirty`() {
+        assertEquals("Confirm delete — uncommitted changes will be lost",
+            deleteConfirmText(SessionInfo(git = GitState(dirtyFiles = 2))))
+        assertEquals("Confirm delete", deleteConfirmText(SessionInfo(git = GitState(dirtyFiles = 0))))
+        assertEquals("Confirm delete — may have uncommitted changes",
+            deleteConfirmText(SessionInfo(git = null)))
+        assertEquals("Confirm delete", deleteConfirmText(SessionInfo(git = null, root = true)))
+    }
+
     @Test fun `name prefers summary then label then worktree`() {
         assertEquals("Fix login", sessionName(SessionInfo(summary = "Fix login", label = "l", worktreePath = "/a/b")))
         assertEquals("mylabel", sessionName(SessionInfo(label = "mylabel", worktreePath = "/a/wt-9")))
@@ -204,7 +219,7 @@ class SessionsTest {
             sessionHeaderMeta("truenas", SessionInfo(repo = "Turma", git = GitState(branch = "XERK-121"))),
         )
         // No repo (repos-root) or no branch (detached) still reads cleanly.
-        assertEquals("truenas · detached", sessionHeaderMeta("truenas", SessionInfo(repo = "")))
+        assertEquals("truenas · detached", sessionHeaderMeta("truenas", SessionInfo(repo = "", git = GitState(branch = "HEAD"))))
         assertEquals(
             "truenas · Turma · detached",
             sessionHeaderMeta("truenas", SessionInfo(repo = "Turma", git = GitState(branch = "HEAD"))),

@@ -499,7 +499,7 @@ private fun SessionCard(
                         val wt = session.worktreePath.substringAfterLast('/').substringAfterLast('\\').ifBlank { "–" }
                         Text("· $wt", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(
-                            "· ${sessionBranch(session)}",
+                            "· ${sessionBranch(session).ifBlank { "…" }}",
                             style = MaterialTheme.typography.bodySmall,
                             fontFamily = FontFamily.Monospace,
                             color = muted,
