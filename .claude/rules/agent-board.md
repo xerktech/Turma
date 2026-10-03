@@ -6,8 +6,8 @@ paths:
 
 # Board sources, repo triage and ticket sessions
 
-The agent half of the board: collecting tickets from Jira or Azure DevOps, the only two writes back
-to a tracker, deciding which repo a ticket belongs to, and spawning a session to work one. All in
+The agent half of the board: collecting tickets from Jira or Azure DevOps, the agent's few writes
+back to a tracker, deciding which repo a ticket belongs to, and spawning a session to work one. All in
 `hub-agent.py`; the hub/UI half is `.claude/rules/turma-board.md`.
 
 - Optional and **source-agnostic**: Jira Cloud creds (`JIRA_SITE`/`JIRA_EMAIL`/`JIRA_TOKEN`) or an
@@ -127,9 +127,12 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
     POST sets no `fields.resolution`, so a Jira board whose "Cannot Reproduce" is a resolution (not
     a status) closes as plain Done, and the kind survives only in the comment text and `outcome`.
   - **A final failure or refusal is TOLD to the session** (`notify_session` from the beat's
-    `_apply_closed_tickets`, `_close_ticket_failed_message`): the reason, "still open", and to close
+    `_apply_closed_tickets`, `_close_ticket_failed_message`): the reason, "not moved to Done", to close
     it with the host's tracker CLI/MCP or tell the operator. The CLI only queues, so without this
     the session ends its turn believing the ticket closed. A retry still due says nothing.
+  - **Already in Done is a SUCCESS**: a tracker offers no transition into the current status, so
+    with no Done option `_board_issue_done_status` reads the issue's own status; Done-column →
+    `ok` with that status name (an operator's close, or a repeat request), else the failure.
   - Only for a RUNNING Claude session whose `ticket.siteKey` is this host's board; dsh/qwen skipped.
   - Success stamps **`ticket.outcome = {kind, at}`** on the record (served via `_served_ticket`)
     AND its `_remember_ticket` ledger entry (added only when present), so `repos[].resumable`

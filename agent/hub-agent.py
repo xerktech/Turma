@@ -12177,13 +12177,13 @@ def _close_ticket_failed_message(key, kind, error):
     """What a session is told when the manager gave up on its close-ticket
     request (refused, or failed its last attempt). The CLI only queues the
     request and the directive then ends the turn, so without this the session
-    believes the ticket closed while it is still open — and its own "else the
+    believes the ticket closed when it was not moved — and its own "else the
     tracker CLI/MCP" fallback never runs. `error` is tracker/exception text, so
     it is flattened to one line and capped."""
     label = CLOSE_TICKET_LABELS.get(kind)
     why = re.sub(r"\s+", " ", str(error or "unknown error")).strip()[:300]
     return (f"The Turma manager could NOT close ticket {key}"
-            f"{f' as {label}' if label else ''}: {why}. The ticket is still open. "
+            f"{f' as {label}' if label else ''}: {why}. It was not moved to Done. "
             "Close it yourself with the tracker CLI/MCP this host gives you (comment "
             "the evidence, then move it to Done); if this host has no tracker tool, "
             "tell the operator the ticket needs closing and why.")
@@ -15204,6 +15204,34 @@ def add_board_comment(key, text):
 # A Done-category status a board names for "could not reproduce" (Jira's
 # "Cannot Reproduce", "Can't Reproduce", ADO's "Not Reproducible").
 _NOT_REPRO_STATUS_RE = re.compile(r"\b(not|cannot|can'?t|unable\s+to)[\s_-]*reproduc", re.I)
+
+
+def _board_issue_done_status(key):
+    """The name of `key`'s CURRENT status when it already sits in the Done
+    column, else None (also on any read failure — the caller then reports its
+    own error). Needed because a tracker offers no transition into the status
+    an issue is already in, so "no Done option" can mean "already Done"."""
+    try:
+        if azure_configured():
+            wi = azure_req(f"/_apis/wit/workitems/{urllib.parse.quote(key)}",
+                           {"fields": "System.TeamProject,System.WorkItemType,System.State"})
+            f = wi.get("fields") or {}
+            name = f.get("System.State")
+            cat = _azure_category(normalize_azure_site(AZDO_URL), f.get("System.TeamProject"),
+                                  f.get("System.WorkItemType"), name)
+        else:
+            data = jira_get(f"/rest/api/3/issue/{urllib.parse.quote(key)}",
+                            {"fields": "status"})
+            status = ((data or {}).get("fields") or {}).get("status") or {}
+            name = status.get("name")
+            cat = _JIRA_CATEGORY.get(
+                ((status.get("statusCategory") or {}).get("key") or "").lower(), "todo")
+    except Exception as e:
+        log(f"close-ticket: could not read {key}'s current status: {e}")
+        return None
+    if name and _board_column(name, cat) == "done":
+        return str(name)
+    return None
 
 
 def _close_ticket_option(options, kind):
@@ -24975,7 +25003,14 @@ class SessionManager:
                 st["commented"] = True
             option = _close_ticket_option(board_status_options(key), req["kind"])
             if option is None:
-                raise RuntimeError("nothing can move it to Done")
+                # Trackers offer no transition into the status an issue is
+                # already in, so an operator's own close (or a repeat request)
+                # lands here: already Done is the outcome asked for.
+                current = _board_issue_done_status(key)
+                if current is None:
+                    raise RuntimeError("nothing can move it to Done")
+                log(f"close-ticket: {key} already in {current} ({req['kind']})")
+                return land(status=current)
             apply_board_status(key, option["id"])
         except Exception as e:
             final = st["attempts"] >= CLOSE_TICKET_ATTEMPTS

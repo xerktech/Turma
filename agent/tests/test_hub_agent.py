@@ -17535,11 +17535,37 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
         self.assertEqual(sid, self.SID)
         self.assertIn(f"could NOT close ticket {self.KEY} as not reproducible", text)
         self.assertIn("nothing can move it to Done", text)
-        self.assertIn("still open", text)
+        self.assertIn("It was not moved to Done", text)
         self.assertIn("tracker CLI/MCP this host gives you", text)
         self.assertIn("tell the operator", text)
         sm._apply_closed_tickets()                     # told once, not every beat
         self.assertEqual(len(self.notified), 1)
+
+    def test_a_ticket_already_in_done_is_a_success_not_a_failure(self):
+        # Trackers offer no transition into the current status, so an operator's
+        # own close (or a repeat request) has no Done option: read the issue's
+        # current status and count already-Done as the outcome asked for.
+        self.OPTS = self.OPTS[:1]
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        real = ha.jira_req
+
+        def fake_req(path, params, body=None):
+            if path == f"/rest/api/3/issue/{self.KEY}":
+                return {"fields": {"status": {"name": "Closed",
+                                              "statusCategory": {"key": "done"}}}}
+            return real(path, params, body)
+        with mock.patch.object(ha, "jira_req", fake_req):
+            self._req()
+            sm._process_close_ticket_requests(now=1000.0)
+        sm._apply_closed_tickets()
+        self.assertEqual(self.notified, [])
+        self.assertEqual(self._transitions(), [])
+        self.assertFalse(os.path.exists(self._path()))
+        [r] = sm.ticket_outcome_results
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["status"], "Closed")
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "not-reproducible")
 
     def test_a_refusal_is_told_to_the_session_and_a_success_is_not(self):
         sm = self.make_manager()

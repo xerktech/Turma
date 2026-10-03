@@ -109,6 +109,11 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   returns before the tracker is touched, so this is what lets the "tracker CLI/MCP else" fallback
   run. Its reply says so ("…and message you if it cannot close the ticket").
 - Kill/delete/restart clears the dir (`_clear_session_requests`) — an unread request dies with it.
+- **Residual: a session can close a SIBLING's ticket.** The worker trusts the `<sid>` dir name, and
+  Bash (the `~/.turma` residual above) can write any sibling's dir, so a session can make the
+  manager comment on and close another same-host session's ticket with the host's tracker creds.
+  Accepted: same host, same org/board (siteKey-gated), and Done is reversible with the comment as
+  the audit trail. A sid stamped in the file would not help — the forger writes it too.
 - **Taught by three directives**, each "session CLI first, the host's tracker CLI/MCP else":
   `TICKET_CLOSE_STALE_CLAUSE` (bug prompt + `TICKET_CLOSE_PROMPT` in `_session_directive`) and the
   hub's `autoCloseMergedMessage`. All spell `"$TURMA_SESSION_CLI"` — see the open question below.
@@ -133,3 +138,6 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   `python3` there is the Microsoft Store stub. The directive child must spell the interpreter that
   works there, or export it (e.g. `TURMA_SESSION_PYTHON=sys.executable`) and build the allow rule
   from it, as `build_guard_settings` does for the hooks.
+- **XERK-1569 inherits both questions**: `TICKET_CLOSE_STALE_CLAUSE`, `TICKET_CLOSE_PROMPT` and the
+  hub's `autoCloseMergedMessage` all teach `python3 -SsE "$TURMA_SESSION_CLI"`; the spike's answer
+  must update all three (a failed or prompted command degrades to the tracker-CLI/MCP fallback).
