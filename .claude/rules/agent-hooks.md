@@ -133,11 +133,14 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   - **`cd` targets are SCOPE-blind** (`_cd_targets`, inherited into recursion): a later `cd`
     never clears an earlier one, since it may fail, sit in a subshell/pipe, or be `cd -`;
     clearing let `cd /; (cd /tmp); rm -rf *` through.
-    - Order counts: fully order-blind refused a real `chmod -R go-w .; …; cd /`.
-    - Text that can re-run is classified ONCE MORE seeing every `cd` on the line: each loop
-      (keyword→matching `done`, condition included) and function body (`_replay_regions`), and
-      every trap/alias/eval/`sh -c` script. A per-segment "inside a body" stack was tried and
-      lost to nesting (`do { :; }; rm -rf *; cd /; done`) — don't bring it back.
+    - Order counts only on a line with NO re-run construct (`_REPLAYS_RE`, matched loosely:
+      loop words, `function`, `()`, alias, trap, eval, coproc); otherwise every `cd` counts
+      everywhere. trap/alias/eval/`sh -c` scripts always see every `cd`.
+    - Finding where a body ends was tried twice and lost to bash's grammar (a per-segment
+      stack; then a region scanner: `done=1`, `f() if …`, `${a:-${b}}`, a region cap). Don't
+      retry without a bash parser.
+    - Accepted cost: one real command in 33.7k replayed (defines a function, `chmod -R go-w .`,
+      trailing `cd /`) is refused; the reason names the cwd and asks for an absolute path.
     - Joining covers `rm`/`unlink`/`chmod`/`chown` and `find` roots, never an opaque
       substitution (`trap 'rm -rf "$tmpd"' EXIT; cd /` is the cleanup idiom).
     - The literal `~/.ssh` is dangerous to `rm` only (`_is_home_ssh`): `chmod -R 700 ~/.ssh`

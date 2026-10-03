@@ -1173,15 +1173,26 @@ class TestProducedScripts(unittest.TestCase):
                     # Defined by text a shell or eval runs.
                     "eval 'f() { rm -rf *; }'; cd /; f", "eval \"trap 'rm -rf *' EXIT\"; cd /",
                     "bash -c 'trap \"rm -rf *\" EXIT; cd /'",
-                    "alias f='rm -rf *'\ncd /\nf"):
+                    "alias f='rm -rf *'\ncd /\nf",
+                    # Where a body ends is bash grammar (XERK-1549 QA pass 4):
+                    "for i in 1 2; do done=1; rm -rf *; cd /; done",
+                    "for i in 1 2; do cat <<E >/dev/null\ndone\nE\nrm -rf *; cd /; done",
+                    "f() if true; then rm -rf *; fi; cd /; f",
+                    "f()\nif true; then rm -rf *; fi\ncd /\nf",
+                    "f() { echo ${a:-${b}}; rm -rf *; }; cd /; f",
+                    "f() ( x=$((1+2)); rm -rf * ); cd /; f",
+                    "f() { echo x}; rm -rf *; }; cd /; f",
+                    "for i in 1; do :; done; " * 20 + "g() { rm -rf *; }; cd /; g"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("tmpd=$(mktemp -d); trap 'rm -rf \"$tmpd\"' EXIT; cd /",
                     "f() { echo hi; }; rm -rf ./build; cd /; f",
-                    "for f in a b; do echo $f; done; rm -rf ./build; cd /",
-                    "# loop for each file\nrm -rf ./build; cd /"):
+                    "for f in a b; do echo $f; done; rm -rf ./build; cd /"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
+        # The accepted cost: any loop/function/trap/alias/eval sign makes the
+        # whole line order-blind, so a trailing `cd /` reaches an earlier `.`.
+        self.assertDenied("f() { :; }; chmod -R go-w .; cd /")
 
     def test_fixing_ssh_permissions_is_not_deleting_them(self):
         for cmd in ("chmod -R 700 ~/.ssh", "chmod -R go-rwx ~/.ssh", "chown -R me:me ~/.ssh",

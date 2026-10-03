@@ -1250,15 +1250,15 @@ def _expand_segments(command: str, depth: int = 0,
     # one) may have moved it into. SCOPE-blind on purpose — a later `cd` never
     # clears one: it can fail, sit in a subshell or pipe, or be `cd -`, and
     # clearing let `cd /; (cd /tmp); rm -rf *` through (XERK-1549). Order
-    # counts only outside text that can run AGAIN: a trailing `cd /` must not
-    # turn an earlier `chmod -R go-w .` into `/.`, but a loop, function body,
-    # alias, trap handler or eval'd script can run after it, so each of those
-    # is classified once more seeing EVERY `cd` on the line. Tracking which
-    # segment sits inside which body was tried and lost to nesting.
+    # counts only on a line where nothing can run AGAIN: a trailing `cd /` must
+    # not turn an earlier `chmod -R go-w .` into `/.`. A loop, function,
+    # alias, trap or eval can re-run earlier text after a later `cd`, and
+    # finding where such a body ends lost to bash's grammar twice (a stack of
+    # open bodies, then a region scanner: `done=1`, `f() if …`, `${a:-${b}}`).
+    # So any sign of one, anywhere, makes the whole line order-blind.
     every_cd = _cd_targets(_SUBST_RE.sub(_subst_text, _prenormalise(raw_commands)), cwds)
-    if every_cd != cwds:
-        for region in _replay_regions(raw_commands):
-            out.extend(_expand_segments(_substitute_vars(region, raw_vals), depth + 1, every_cd))
+    if every_cd != cwds and _REPLAYS_RE.search(command):
+        cwds = every_cd
     bodies, suspect = _balanced_groups(raw_commands)
     for owner, body, quoted in heredocs:
         # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF`
@@ -1336,7 +1336,7 @@ def _expand_segments(command: str, depth: int = 0,
             for cwd in cwds:
                 joined = [_under_cwd(t, cwd) for t in rest]
                 if joined != rest:
-                    out.append(([tokens[0], *joined], seg))
+                    out.append(([tokens[0], *joined], seg, False, cwd))
         if prog in _SHELL_PROGS:
             i = _shell_c_index(rest)
             if i >= 0 and i + 1 < len(rest):
@@ -1479,74 +1479,10 @@ _CD_RE = re.compile(r"(?:^|[\s;&|({`])(?:(?:builtin|command)\s+)?\\?([\"']?)(?:c
                     r"([^;&|\n)`]*)")
 _MAX_CWDS = 8
 _HOME_USER_RE = re.compile(r"^~[a-z0-9_][a-z0-9_.-]*$")
-_LOOP_OPEN_RE = re.compile(r"\b(?:while|until|for|select)\b")
-_LOOP_WORD_RE = re.compile(r"\b(?:while|until|for|select|done)\b")
-_FUNC_HEAD_RE = re.compile(
-    r"(?:\bfunction\s+[^\s(){};&|]+(?:\s*\(\))?|\b[A-Za-z_][\w.:-]*\s*\(\))\s*([{(])")
-_MAX_REGIONS = 16
-
-
-def _replay_regions(text: str) -> list[str]:
-    """Text that can run AGAIN after a later `cd`: each loop (keyword to its
-    matching `done`, so a while/until condition is in it) and each function
-    body (to its matching brace). Unquoted words only; an unclosed one runs to
-    the end. A nested one is skipped: it is inside its parent's text, which
-    is classified with every `cd` on the line already."""
-    states = list(_quote_states(text))
-    # A `#` comment is text too: `# … for symlink checks` opened a "loop".
-    i = text.find("#")
-    while i >= 0:
-        end = text.find("\n", i)
-        end = len(text) if end < 0 else end
-        if not states[i] and _is_comment(text, i):
-            states[i:end] = ["#"] * (end - i)
-        i = text.find("#", end)
-    spans: list[tuple[int, int]] = []
-
-    def nested(i: int) -> bool:  # already inside a region taken
-        return any(a <= i < b for a, b in spans)
-
-    for m in _LOOP_OPEN_RE.finditer(text):
-        if (states[m.start()] or nested(m.start()) or len(spans) >= _MAX_REGIONS
-                or not _at_command_start(text, m.start())):
-            continue
-        depth, end = 0, len(text)
-        for w in _LOOP_WORD_RE.finditer(text, m.start()):
-            if states[w.start()] or not _at_command_start(text, w.start()):
-                continue
-            depth += -1 if w.group(0) == "done" else 1
-            if depth == 0:
-                end = w.end()
-                break
-        spans.append((m.start(), end))
-    for m in _FUNC_HEAD_RE.finditer(text):
-        if (states[m.start()] or nested(m.start()) or len(spans) >= _MAX_REGIONS
-                or not _at_command_start(text, m.start())):
-            continue
-        opener = m.group(1)
-        closer = "}" if opener == "{" else ")"
-        depth, end = 0, len(text)
-        i = m.start(1)
-        while i < len(text):
-            ch = text[i]
-            if states[i]:
-                i += 1
-                continue
-            if text.startswith(("${", "$("), i):
-                # `${x}`'s brace and `$(…)`'s paren are not the body's.
-                j = text.find("}" if text[i + 1] == "{" else ")", i + 2)
-                i = len(text) if j < 0 else j + 1
-                continue
-            if ch == opener:
-                depth += 1
-            elif ch == closer:
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-            i += 1
-        spans.append((m.start(1) + 1, end - 1 if end < len(text) else end))
-    return [text[a:b] for a, b in spans]
+# A construct that can run earlier text again after a later `cd`. Matched
+# loosely — in quotes, comments and heredocs too — since a miss fails open.
+_REPLAYS_RE = re.compile(
+    r"\b(?:while|until|for|select|function|alias|trap|eval|coproc)\b|\(\s*\)")
 
 
 
@@ -2822,6 +2758,10 @@ def is_destructive(command: str) -> str | None:
         checks.append(_destructive_agent_tmux(tokens))
         for reason in checks:
             if reason:
+                if len(flags) > 1:
+                    # Joined to a cwd the session never typed: say where from.
+                    reason += (f" — read from inside {flags[1]!r}, where a `cd` on this line"
+                               " may have left it; name the target by absolute path")
                 return reason
     return None
 
