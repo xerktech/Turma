@@ -48,6 +48,17 @@ const EVENTS_PER_BEAT = 200;
 // The file is measured before it is read (an oversized one is an OOM at boot,
 // every boot); ~1 KiB a row puts the ceiling well past MAX_ROWS.
 const FILE_MAX_BYTES = positiveEnv("PERMISSION_LEDGER_FILE_MAX", 64 << 20);
+// The store is bounded in BYTES as well as rows: every cap above is in chars, so
+// a row can serialize to ~15 KB of UTF-8 and MAX_ROWS of them would be a file
+// load() refuses (the whole ledger lost at the next boot) and a heap the
+// container cannot hold. The budget is the smaller of nine tenths of the file
+// ceiling (so a written file always loads) and a FRACTION of the container's
+// memory limit (CLAUDE.md: memory ceilings are fractions, never fixed numbers) —
+// server.js hands that limit in through setMemoryLimit() at boot.
+const FILE_BUDGET_BYTES = Math.floor(FILE_MAX_BYTES * 0.9);
+const BYTES_ENV = positiveEnv("PERMISSION_LEDGER_MAX_BYTES", 0);
+const MEMORY_FRACTION = 16;               // 32 MiB at the deployed 512m
+let maxBytes = BYTES_ENV ? Math.min(BYTES_ENV, FILE_BUDGET_BYTES) : FILE_BUDGET_BYTES;
 const SAVE_DEBOUNCE_MS = positiveEnv("PERMISSION_LEDGER_SAVE_MS", 5000);
 const TOP_MAX = 50;
 const RECENT_MAX = 50;
@@ -118,6 +129,33 @@ function sanitizePermissionEvent(raw, now = Date.now()) {
 // host -> Map(id -> row). Insertion order is not trusted for eviction: rows are
 // evicted by `openedAt`, oldest first.
 let hosts = new Map();
+// row -> its serialized UTF-8 size, measured once when the row enters the model.
+let rowBytes = new WeakMap();
+
+function track(row) {
+  rowBytes.set(row, Buffer.byteLength(JSON.stringify(row), "utf8") + 1);
+  return row;
+}
+function bytesOf(row) {
+  let n = rowBytes.get(row);
+  if (n === undefined) n = rowBytes.set(row, Buffer.byteLength(JSON.stringify(row), "utf8") + 1).get(row);
+  return n;
+}
+function totalBytes() {
+  let n = 0;
+  for (const m of hosts.values()) for (const row of m.values()) n += bytesOf(row);
+  return n;
+}
+
+/** The container's memory limit in bytes (null = unknown): the byte budget becomes
+ * the smaller of the file budget and a sixteenth of it. */
+function setMemoryLimit(limit) {
+  let b = FILE_BUDGET_BYTES;
+  if (BYTES_ENV) b = Math.min(b, BYTES_ENV);
+  if (Number.isFinite(limit) && limit > 0) b = Math.min(b, Math.max(64 << 10, Math.floor(limit / MEMORY_FRACTION)));
+  maxBytes = b;
+  return maxBytes;
+}
 
 function rowCount() {
   let n = 0;
@@ -145,12 +183,15 @@ function evict(now = Date.now()) {
     if (!m.size) hosts.delete(host);
   }
   let over = rowCount() - MAX_ROWS;
-  if (over > 0) {
+  let overBytes = totalBytes() - maxBytes;
+  if (over > 0 || overBytes > 0) {
     const all = [];
     for (const [host, m] of hosts) for (const row of m.values()) all.push({ host, row });
     all.sort((a, b) => a.row.openedAt - b.row.openedAt);
     for (const { host, row } of all) {
-      if (over-- <= 0) break;
+      if (over <= 0 && overBytes <= 0) break;
+      over -= 1;
+      overBytes -= bytesOf(row);
       const m = hosts.get(host);
       m.delete(row.id);
       if (!m.size) hosts.delete(host);
@@ -170,7 +211,7 @@ function ingest(host, events, now = Date.now()) {
   const kept = [];
   for (const raw of events.slice(0, EVENTS_PER_BEAT)) {
     const row = sanitizePermissionEvent(raw, now);
-    if (row) kept.push(row);
+    if (row) kept.push(track(row));
   }
   if (!kept.length) return 0;
   let m = hosts.get(host);
@@ -182,6 +223,12 @@ function ingest(host, events, now = Date.now()) {
 }
 
 // ---- reads ---------------------------------------------------------------------
+
+// How far along a row is: closed beats open, and a dialog that has its hook's
+// rulesMatched beats one that does not. Equal progress → the of-record copy wins.
+function rowProgress(row) {
+  return (typeof row.closedAt === "number" ? 2 : 0) + (row.rulesMatched ? 1 : 0);
+}
 
 function median(nums) {
   if (!nums.length) return null;
@@ -313,7 +360,7 @@ function load() {
       const m = new Map();
       for (const r of list) {
         const row = sanitizePermissionEvent(r, now);   // the file is re-checked too
-        if (row) m.set(row.id, row);
+        if (row) m.set(row.id, track(row));
       }
       if (m.size) hosts.set(host, m);
     }
@@ -338,9 +385,28 @@ function serialize() {
   }
 }
 
+// Never write a file load() would refuse: past FILE_MAX_BYTES (the byte budget
+// keeps the model under it; this is the backstop) the oldest rows go first.
+function serializeLoadable() {
+  let blob = serialize();
+  while (blob !== null && Buffer.byteLength(blob, "utf8") > FILE_MAX_BYTES && rowCount()) {
+    const all = [];
+    for (const [host, m] of hosts) for (const row of m.values()) all.push({ host, row });
+    all.sort((a, b) => a.row.openedAt - b.row.openedAt);
+    for (const { host, row } of all.slice(0, Math.max(1, Math.ceil(all.length / 10)))) {
+      const m = hosts.get(host);
+      m.delete(row.id);
+      if (!m.size) hosts.delete(host);
+    }
+    console.error("permission ledger: file past its ceiling; dropped the oldest tenth before writing");
+    blob = serialize();
+  }
+  return blob;
+}
+
 let saveTimer = null;
 function writeNow(done) {
-  const blob = serialize();
+  const blob = serializeLoadable();
   if (blob === null) return void (done && done(new Error("not serializable")));
   fs.mkdir(path.dirname(LEDGER_FILE), { recursive: true }, () => {
     fs.writeFile(LEDGER_FILE, blob, (err) => {
@@ -409,6 +475,8 @@ class PermissionLedgerPgStore {
     this._readyWork = (async () => {
       try {
         await this._ensureSchema();
+        // Writes the outage held back land BEFORE the scan reads the table back.
+        await this._drain();
         await this.rescan();
       } catch (e) {
         console.error(`permission ledger: Postgres ready-work failed: ${(e && e.message) || e}`);
@@ -435,11 +503,14 @@ class PermissionLedgerPgStore {
   }
 
   // Load the retained window into the hot model — boot/reconnect and promotion.
-  // A max-of-two merge is not needed: a row is immutable once closed and the
-  // newest write of an id wins in both places, so the store's copy REPLACES.
+  // NEWEST-WINS, never a blind replace: a write that failed during an outage
+  // leaves Postgres holding an OLDER copy of a row (open, where the hot model has
+  // it closed), and the agent sends a closed row only once — so a hot copy that
+  // is further along (`rowProgress`) is kept, and re-queued so the table catches up.
   async rescan(now = Date.now()) {
     await this._ensureSchema();
     const since = now - DAYS * DAY_MS;
+    const stale = [];
     const got = await this.pool.query(
       `SELECT host, doc FROM ${this.table} WHERE opened_at >= $1 ORDER BY opened_at DESC LIMIT $2`,
       [String(since), String(MAX_ROWS)]);
@@ -451,32 +522,60 @@ class PermissionLedgerPgStore {
       if (!row) continue;
       let m = hosts.get(r.host);
       if (!m) hosts.set(r.host, (m = new Map()));
-      m.set(row.id, row);
+      const hot = m.get(row.id);
+      if (hot && rowProgress(hot) > rowProgress(row)) {
+        stale.push([r.host, hot]);
+        continue;
+      }
+      m.set(row.id, track(row));
     }
     evict(now);
+    for (const [host, row] of stale) this._queue.push(this._tuple(host, row));
+    if (stale.length) this._drain();
     if (this._onExternalChange) { try { this._onExternalChange(); } catch { /* never breaks a scan */ } }
   }
 
   // Off the beat: enqueue only, a serialized background drain writes. Bounded —
   // a Postgres outage drops the OLDEST queued writes (the hot model keeps them
   // until the next promotion rescan), never grows the heap.
-  onChange(host, rows) {
-    for (const row of rows) this._queue.push([host, row.id, String(row.openedAt), JSON.stringify(row)]);
+  _tuple(host, row) {
+    return [host, row.id, String(row.openedAt), JSON.stringify(row)];
+  }
+
+  // Bounded: past PG_QUEUE_MAX the OLDEST queued writes go (the hot model still
+  // holds them; the next ready-edge rescan re-queues any the table lacks).
+  _trimQueue() {
     const over = this._queue.length - PG_QUEUE_MAX;
     if (over > 0) {
       this._queue.splice(0, over);
       if (!this._dropped) console.error(`permission ledger: Postgres write queue over ${PG_QUEUE_MAX}; dropping oldest`);
       this._dropped += over;
     }
+  }
+
+  onChange(host, rows) {
+    for (const row of rows) this._queue.push(this._tuple(host, row));
+    this._trimQueue();
     this._drain();
   }
 
   _drain() {
-    if (this._draining || this._closed) return this._draining;
+    if (this._draining) return this._draining;
+    if (this._closed || !this._queue.length) return Promise.resolve();
     this._draining = (async () => {
+      // Yield first: an async body that never awaited would run its `finally`
+      // BEFORE `_draining` is assigned, leaving a settled promise there for good
+      // and every later drain a silent no-op.
+      await null;
       try {
         while (this._queue.length) {
-          const batch = this._queue.splice(0, PG_ROWS_PER_INSERT);
+          // One statement may not upsert the same key twice (Postgres refuses
+          // "cannot affect row a second time"), and an outage backlog carries a
+          // row open AND closed — keep the LAST copy of each (host, id).
+          const raw = this._queue.splice(0, PG_ROWS_PER_INSERT);
+          const byKey = new Map();
+          for (const vals of raw) byKey.set(`${vals[0]}\u0000${vals[1]}`, vals);
+          const batch = [...byKey.values()];
           const params = [];
           const tuples = batch.map((vals) => `(${vals.map((v) => { params.push(v); return `$${params.length}`; }).join(", ")})`);
           try {
@@ -486,7 +585,13 @@ class PermissionLedgerPgStore {
               `ON CONFLICT (host, id) DO UPDATE SET opened_at = EXCLUDED.opened_at, doc = EXCLUDED.doc`,
               params);
           } catch (e) {
-            console.error(`permission ledger: Postgres write failed (${(e && e.message) || e}); ${batch.length} row(s) dropped`);
+            // Put the batch BACK (ahead of anything newer) and stop: the pool's
+            // next ready edge — or the next beat's write — retries it. Dropping
+            // it lost a closed row for good once a rescan read the stale copy.
+            this._queue.unshift(...batch);
+            this._trimQueue();
+            console.error(`permission ledger: Postgres write failed (${(e && e.message) || e}); ${batch.length} row(s) held for retry`);
+            break;
           }
         }
       } finally {
@@ -543,14 +648,16 @@ load();
 
 module.exports = {
   ingest, aggregate, kindTotals, sanitizePermissionEvent, suggestedRule, configure,
-  rehydrate, flush,
+  rehydrate, flush, setMemoryLimit,
   LEDGER_FILE, MAX_ROWS, HOST_MAX_ROWS, DAYS, EVENTS_PER_BEAT, T_EVENT,
   PermissionLedgerPgStore,
   _internals: {
     hosts: () => hosts,
-    rowCount, load, writeNow,
+    rowCount, load, writeNow, totalBytes, maxBytes: () => maxBytes,
     reset() {
       hosts = new Map();
+      rowBytes = new WeakMap();
+      setMemoryLimit(null);
       if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
       if (backend !== fileBackend) { try { backend.close(); } catch { /* noop */ } }
       backend = fileBackend;

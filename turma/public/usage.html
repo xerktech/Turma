@@ -1602,6 +1602,11 @@ const PERM_REFRESH_MS = 60000;
 const PERM_KIND = { dialog: "Dialog", "classifier-denied": "Classifier block", "ask-in-chat": "Asked in chat" };
 let permView = null;
 let permFetchSeq = 0;
+// The card repaints every PERM_REFRESH_MS and on every org change, which builds a
+// fresh <details> — and a fresh one defaults CLOSED, snapping "Recent prompts"
+// shut under the operator once a minute. Its open state lives here and is
+// re-applied each paint (the `tableOpen` fix, for this card).
+let permRecentOpen = false;
 
 function permWait(ms) {
   return typeof ms === "number" && Number.isFinite(ms) && ms >= 0 ? fmtDuration(ms / 1000) : "—";
@@ -1621,7 +1626,7 @@ function permNum(n) { return typeof n === "number" && Number.isFinite(n) ? n : 0
 // The whole card, as markup — pure over the hub's `{days, top, recent}`. Every
 // field is agent-supplied text, so every one is escaped (a rule or a command can
 // carry anything).
-function permissionsCardHtml(view, now) {
+function permissionsCardHtml(view, now, recentOpen = false) {
   const days = view && permNum(view.days) > 0 ? permNum(view.days) : PERM_DAYS;
   const head = `<h2>Permission prompts (${days} days)</h2>` +
     `<div class="note">Every permission dialog, auto-mode classifier block and ask-for-permission-in-chat ` +
@@ -1664,13 +1669,17 @@ function permissionsCardHtml(view, now) {
       `<span class="meta">${esc(wait)}</span><span class="meta">${esc(ago)}</span></li>`;
   }).join("");
   const list = items
-    ? `<details class="table-view"><summary>Recent prompts (${recent.length})</summary><ul class="perm-recent">${items}</ul></details>`
+    ? `<details class="table-view perm-recent-view"${recentOpen ? " open" : ""}><summary>Recent prompts (${recent.length})</summary><ul class="perm-recent">${items}</ul></details>`
     : "";
   return head + table + list;
 }
 
 function paintPermissions() {
-  $perms.innerHTML = `<div class="models-card perm-card">${permissionsCardHtml(permView, Date.now())}</div>`;
+  const html = `<div class="models-card perm-card">${permissionsCardHtml(permView, Date.now(), permRecentOpen)}</div>`;
+  if (html === $perms.innerHTML) return;
+  // A recurring innerHTML repaint: preserveScroll keeps the table's sideways
+  // scroll (and the page's) across the swap, like every other repaint here.
+  TurmaNav.preserveScroll($perms, () => { $perms.innerHTML = html; });
 }
 
 async function refreshPermissions() {
@@ -1687,6 +1696,12 @@ async function refreshPermissions() {
     paintPermissions();
   } catch { /* keep the last view */ }
 }
+
+// `toggle` does not bubble, so the disclosure's open state is caught on capture.
+$perms.addEventListener("toggle", (ev) => {
+  const d = ev.target;
+  if (d && d.matches && d.matches("details.perm-recent-view")) permRecentOpen = !!d.open;
+}, true);
 
 // One delegated listener: the card is repainted wholesale, its buttons are not.
 $perms.addEventListener("click", (ev) => {

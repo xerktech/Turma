@@ -10788,6 +10788,10 @@ PERMISSION_LOG_LINE_MAX = 16 * 1024
 # A PermissionRequest no pane edge claimed within this long is still a prompt —
 # one answered between two beats — so it becomes a `dialog` row of its own.
 PERMISSION_HOOK_HOLD_SEC = 120
+# A dialog raised inside a foreground sub-agent: the parent transcript's pending
+# call is the delegation itself, so the sub-agent's PermissionRequest (its own
+# toolUseId) names the real call and overrides it rather than counting twice.
+PERMISSION_DELEGATING_TOOLS = ("Agent", "Task")
 # How long a gone session's hook log is kept before the worker removes it.
 PERMISSION_LOG_RETAIN_SEC = 7 * 86400
 # The session ids a hook log may be named for — permlog.py's own SID_RE.
@@ -17185,6 +17189,7 @@ class SessionManager:
         self.permission_events = []
         self._perm_open = {}          # sid -> the open `dialog` row
         self._perm_ask = {}           # sid -> the open `ask-in-chat` row
+        self._perm_ask_turn = {}      # sid -> the lastActivityTs that row opened on
         self._perm_ask_seen = {}      # sid -> last assistant timestamp checked
         self._perm_hook_pending = {}  # sid -> {toolUseId: (hook row, seen mono)}
         self._perm_turma_answer = {}  # sid -> option number Turma typed
@@ -28746,6 +28751,13 @@ class SessionManager:
                         "answer": "deny"})
                     continue
                 target = self._perm_open.get(sid)
+                if (target is not None and tuid and target.get("toolUseId") != tuid
+                        and target.get("tool") in PERMISSION_DELEGATING_TOOLS):
+                    # The dialog was raised INSIDE a foreground sub-agent: the
+                    # parent's pending call is the delegation, the hook's is the
+                    # real one — one prompt, attributed to the real call.
+                    self._merge_permission_hook(target, hook, override=True)
+                    continue
                 if target is None or (target.get("toolUseId") and tuid
                                       and target["toolUseId"] != tuid):
                     last = self._perm_last_closed.get(sid)
@@ -28768,10 +28780,10 @@ class SessionManager:
                 del self._perm_hook_pending[sid]
 
     @staticmethod
-    def _merge_permission_hook(row, hook):
+    def _merge_permission_hook(row, hook, override=False):
         row["rulesMatched"] = list(hook.get("rulesMatched") or [])
         for key in ("toolUseId", "tool", "head", "digest"):
-            if not row.get(key) and hook.get(key):
+            if (override or not row.get(key)) and hook.get(key):
                 row[key] = hook[key]
 
     def _emit_unclaimed_request(self, sid, hook):
@@ -28820,10 +28832,11 @@ class SessionManager:
                 row["head"] = host
         pend = self._perm_hook_pending.get(sid) or {}
         hit = pend.pop(row["toolUseId"], None) if row.get("toolUseId") else None
-        if hit is None and not row.get("toolUseId") and len(pend) == 1:
+        delegated = row.get("tool") in PERMISSION_DELEGATING_TOOLS
+        if hit is None and (delegated or not row.get("toolUseId")) and len(pend) == 1:
             hit = pend.popitem()[1]
         if hit is not None:
-            self._merge_permission_hook(row, hit[0])
+            self._merge_permission_hook(row, hit[0], override=delegated)
         self._perm_turma_answer.pop(sid, None)
         self._perm_open[sid] = row
         self._emit_permission(row)
@@ -28864,11 +28877,22 @@ class SessionManager:
         re-read — a restart must not re-file old asks."""
         sid = sess["id"]
         ts = signals.get("lastActivityTs")
+        ts = ts if isinstance(ts, str) and ts else None
         ended = (signals.get("paneBusy") is False and not signals.get("panePrompt")
                  and not signals.get("question") and not signals.get("agents")
                  and signals.get("lastRole") == "assistant"
                  and not signals.get("lastHasToolUse"))
-        if not ended or not isinstance(ts, str) or not ts:
+        if sid in self._perm_ask:
+            # Answered OUTSIDE Turma (the terminal, claude.ai): the session moved
+            # past the asking turn — it went busy, the human spoke, or a NEW turn
+            # ended. Close it here, or it stays open for good and blocks every
+            # later ask of this session. A trailing system entry is not an answer.
+            turn = self._perm_ask_turn.get(sid)
+            moved = ts is not None and ts != turn
+            if signals.get("paneBusy") is True or (moved and (
+                    ended or signals.get("lastRole") == "user")):
+                self._permission_close_ask(sid, now_ms, via="terminal")
+        if not ended or ts is None:
             return
         seen = self._perm_ask_seen.get(sid)
         self._perm_ask_seen[sid] = ts
@@ -28888,18 +28912,30 @@ class SessionManager:
                "prompt": " ".join(text[start:].split())[:PERMISSION_TEXT_MAX],
                "openedAt": now_ms}
         self._perm_ask[sid] = row
+        self._perm_ask_turn[sid] = ts
         self._emit_permission(row)
 
     def _permission_close_ask(self, sid, now_ms=None, via="turma"):
-        """The operator's next input answers an ask-in-chat row: close it with
+        """The operator's next input answers an ask-in-chat row (via Turma's
+        `input`, or — seen by `_permission_ask_edge` — outside it): close it with
         how long the session waited for them."""
         row = self._perm_ask.pop(sid, None) if isinstance(sid, str) else None
+        self._perm_ask_turn.pop(sid, None)
         if row is None:
             return
         now_ms = int(time.time() * 1000) if now_ms is None else now_ms
         row.update(closedAt=now_ms, waitedMs=max(0, now_ms - row["openedAt"]),
                    answer="unknown", via=via)
         self._emit_permission(row)
+
+    def _permission_close_departed(self):
+        """ON THE BEAT: a session that left `running` without a kill/delete (it
+        exited by itself, errored, was stopped) closes its open rows too —
+        otherwise they read "still open" on the hub forever."""
+        running = {s.get("id") for s in self.registry if s.get("status") == "running"}
+        for sid in (set(self._perm_open) | set(self._perm_ask)
+                    | set(self._perm_hook_pending)) - running:
+            self._permission_forget(sid)
 
     def _permission_forget(self, sid):
         """A session that ended closes whatever it still had open (answer
@@ -32232,6 +32268,7 @@ class SessionManager:
             self._stage_permission_fetch()
         try:
             self._apply_permission_hook_rows()
+            self._permission_close_departed()
         except Exception as e:
             log(f"permission hook rows failed: {e}")
 

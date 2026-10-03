@@ -29,13 +29,25 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
     went busy with no result yet (it is running), else `unknown`.
   - A `PermissionRequest` hook row merges into its dialog by `toolUseId` (its `rulesMatched`); one no
     dialog claims within `PERMISSION_HOOK_HOLD_SEC` (answered between two beats) is its own row.
+  - **A dialog raised inside a foreground sub-agent** has the parent's `Agent`/`Task` call as its
+    pending call (`PERMISSION_DELEGATING_TOOLS`). The sub-agent's hook row (its own `toolUseId`)
+    OVERRIDES tool/head/digest/toolUseId on that row — one prompt, counted once, named by the real
+    call — instead of being held and emitted as a second, mis-attributed row.
 - **`classifier-denied`** — auto mode's soft block shows NO dialog: the model is told no and turns to
   the human in chat. Only the `PermissionDenied` hook sees it. A complete row on its own.
 - **`ask-in-chat`** — the session ended its turn asking for permission in prose. INTERIM: a cheap
   regex (`PERMISSION_ASK_RE`) on the last assistant message, once per turn, on the agent's
   ended-turn edge (idle pane, nothing pending, last word the assistant's with no tool call); closed by
-  the next operator `input`. Sessions already sitting there on a manager's first beat are PRIMED, not
-  re-filed. Replaced by the wait classifier (a later XERK-1560 child).
+  the next operator `input` (`via:"turma"`). Sessions already sitting there on a manager's first beat
+  are PRIMED, not re-filed. Replaced by the wait classifier (a later XERK-1560 child).
+  - **Answered OUTSIDE Turma** (the terminal, claude.ai) it closes `via:"terminal"` once the session
+    moves past the asking turn: the pane went busy, a newer `user` entry, or a NEWER ended turn. An
+    open row blocks every later ask of that session, so it must not wait for a Turma `input`. A
+    trailing entry of another role (a `system` line) is not an answer.
+- **A session that leaves `running`** without a kill/delete (exited, errored, stopped) closes its
+  open rows on the next beat (`_permission_close_departed`), as kill/delete already did.
+- **Accepted: a manager restart re-files a live dialog.** `_perm_open` is in memory, so a dialog up
+  across a restart stays open on the hub under its old id and is opened again under a new one.
 - **A sandbox escape is not hookable at all** — the pane is its only source.
 - **Open question (record the answer here):** what the TUI shows for a classifier block. The first
   week of real data answers it; until then nothing assumes it shows a dialog.
@@ -69,6 +81,12 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
 - Bounds: `EVENTS_PER_BEAT` (200) per beat, `PERMISSION_LEDGER_HOST_MAX_ROWS` per host (a flooding
   host cannot evict the fleet), `PERMISSION_LEDGER_MAX_ROWS` (20000) store-wide, oldest-`openedAt`
   first; `PERMISSION_LEDGER_DAYS` (30) retention.
+- **And a BYTE budget**, oldest first: every cap is in chars, so a row reaches ~15 KB of UTF-8 and
+  20000 of them would be a file `load()` refuses (the ledger lost at the next boot). The budget is
+  the smaller of 0.9 x `PERMISSION_LEDGER_FILE_MAX` and a sixteenth of the container limit
+  (`setMemoryLimit`, from server.js's `containerMemoryLimit()`, logged at boot);
+  `PERMISSION_LEDGER_MAX_BYTES` may only lower it. `writeNow` trims before writing as a backstop, so a
+  written file always loads.
 
 ## The suggestedRule table — deterministic, never a judgement
 
@@ -94,8 +112,15 @@ consumes this table; it does not replace it.
 - **HA: a Postgres APPEND table** (`permission_event(host, id, opened_at, doc)`, PK `(host, id)`) via
   the hub's shared `pgclient.js` pool; upsert by `(host, id)`, retention `DELETE` hourly, rescanned on
   the pool's ready edge and on LEADER PROMOTION (`rehydrate()` in `onLeaderPromoted`). Writes are
-  queued and drained off the request path, bounded; a failed write is logged and dropped.
+  queued and drained off the request path, bounded (`PG_QUEUE_MAX`, oldest dropped).
   **Never `registerExternalStore`** — rows churn every beat.
+  - **A failed write is put BACK and retried** (next write or the ready edge, which drains BEFORE it
+    rescans). Dropping it let a rescan read the stale OPEN copy over a hot CLOSED row, and the agent
+    sends a closed row once — the close was lost in both places.
+  - **The rescan is newest-wins, never a blind replace**: a hot row further along (`rowProgress`:
+    closed > open, then has `rulesMatched`) is kept and re-queued so the table catches up.
+  - **One INSERT never carries the same `(host, id)` twice** — Postgres refuses ("cannot affect row a
+    second time") and an outage backlog holds a row open AND closed; the batch keeps the last copy.
 - **Aggregates are computed from the hot in-memory model in both modes**, not by SQL `GROUP BY` —
   the usage ledger's "read model stays hot + synchronous" posture. Under XERK-919 the leader receives
   every beat and serves every read, and a promoted standby rescans, so the model is complete where
@@ -107,12 +132,19 @@ consumes this table; it does not replace it.
   = groups by `(kind, dialogKind, tool, head)` with `count/allowed/denied/medianWaitMs/lastAt/
   suggestedRule`, most frequent first. **Org-scoped off the LIVE fleet** (hosts currently declaring
   one of those orgs, like `retiredUsage`), so a removed host's rows show only under "All orgs".
-- **`/metrics`** (UNAUTHENTICATED) appends `turma_permission_prompts_total{kind}` and
-  `turma_permission_wait_seconds_sum{kind}` — per-kind aggregates over the retention window ONLY;
-  never a host, session or command.
+- **Groups are fleet-wide, not per host** — a deliberate deviation from the ticket's
+  `(host, kind, tool, head)`: one allow rule retires a prompt on every host, so per-host groups would
+  split one fix into N rows. The host rides each `recent` row; scope by org to narrow.
+- **`/metrics`** (UNAUTHENTICATED) appends `turma_permission_prompts{kind}` and
+  `turma_permission_wait_seconds{kind}` — per-kind aggregates over the retention window ONLY;
+  never a host, session or command. **GAUGES, not counters**: they fall as rows age out, and
+  Prometheus reads a counter's drop as a reset (false `rate()` spikes).
 - **`usage.html`'s "Permission prompts (7 days)"** card reads its own route (not `/api/agents`), so
   the beat's SSE patches never repaint it; refetched on load, on an org-filter change and every 60s.
   Every agent-supplied field is escaped; each rule has a Copy button.
+  - That repaint goes through `TurmaNav.preserveScroll` and re-applies "Recent prompts"' open state
+    (`permRecentOpen`, caught on capture — `toggle` does not bubble); an unchanged card is not
+    repainted. A fresh `<details>` defaults closed, which snapped it shut once a minute.
 
 ## Tests
 

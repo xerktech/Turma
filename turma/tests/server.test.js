@@ -22213,9 +22213,14 @@ test("XERK-1563: /metrics carries the ledger's per-kind aggregates and nothing e
         openedAt: Date.now() - 10 }] } });
   const m = await request("GET", "/metrics");
   assert.equal(m.status, 200);
-  assert.match(m.raw, /^turma_permission_prompts_total\{kind="dialog"\} 2$/m);
-  assert.match(m.raw, /^turma_permission_prompts_total\{kind="classifier-denied"\} 1$/m);
-  assert.match(m.raw, /^turma_permission_wait_seconds_sum\{kind="dialog"\} 6$/m);
+  assert.match(m.raw, /^turma_permission_prompts\{kind="dialog"\} 2$/m);
+  assert.match(m.raw, /^turma_permission_prompts\{kind="classifier-denied"\} 1$/m);
+  assert.match(m.raw, /^turma_permission_wait_seconds\{kind="dialog"\} 6$/m);
+  // Retention-window totals FALL as rows age out: gauges, never counters (a
+  // counter's drop reads as a reset, and rate() reports a false spike).
+  assert.match(m.raw, /^# TYPE turma_permission_prompts gauge$/m);
+  assert.match(m.raw, /^# TYPE turma_permission_wait_seconds gauge$/m);
+  assert.doesNotMatch(m.raw, /turma_permission_\w+ counter/);
   // The route is unauthenticated: no host, command or session leaks into it.
   assert.doesNotMatch(m.raw, /perm-metrics-host|secret-cmd|npm test/);
   delete agents["perm-metrics-host"];

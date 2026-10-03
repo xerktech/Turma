@@ -36709,6 +36709,40 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         self.assertEqual((closed["id"], closed["via"]), (row["id"], "turma"))
         self.assertGreaterEqual(closed["waitedMs"], 0)
 
+    def test_an_ask_answered_outside_turma_closes_and_the_next_ask_records(self):
+        sig = self.ended("2026-10-03T10:00:00Z", "Should I proceed with the deploy?")
+        self.edge(None, at=5000, **sig)
+        first = self.rows()[0]["id"]
+        # The operator answers in the terminal: a user entry, the pane busy.
+        self.write({"type": "user", "timestamp": "2026-10-03T10:01:00Z",
+                    "message": {"role": "user", "content": "yes"}})
+        self.edge(None, at=65000, lastRole="user",
+                  lastActivityTs="2026-10-03T10:01:00Z", paneBusy=True)
+        closed = self.rows()[-1]
+        self.assertEqual((closed["id"], closed["via"], closed["waitedMs"]),
+                         (first, "terminal", 60000))
+        self.assertEqual(self.sm._perm_ask, {})
+        sig = self.ended("2026-10-03T10:05:00Z", "May I push the branch?")
+        self.edge(None, at=300000, **sig)
+        asks = [r for r in self.rows() if "closedAt" not in r]
+        self.assertEqual(len(asks), 2)
+        self.assertIn("push the branch", asks[-1]["prompt"])
+
+    def test_an_ask_answered_between_two_beats_closes_on_the_next_ended_turn(self):
+        self.edge(None, at=5000, **self.ended("2026-10-03T10:00:00Z", "May I merge it?"))
+        # Answered and the next turn finished between beats: only a NEW ended turn.
+        self.edge(None, at=9000, **self.ended("2026-10-03T10:02:00Z", "Merged. Done."))
+        closed = self.rows()[-1]
+        self.assertEqual((closed["via"], closed["closedAt"]), ("terminal", 9000))
+        self.assertNotIn(self.SID, self.sm._perm_ask)
+
+    def test_a_trailing_system_entry_does_not_close_an_ask(self):
+        self.edge(None, at=5000, **self.ended("2026-10-03T10:00:00Z", "May I merge it?"))
+        self.edge(None, at=6000, lastRole="system",
+                  lastActivityTs="2026-10-03T10:00:01Z")
+        self.assertEqual(len(self.rows()), 1)
+        self.assertIn(self.SID, self.sm._perm_ask)
+
     def test_a_turn_that_asks_nothing_opens_nothing(self):
         self.edge(None, **self.ended("2026-10-03T10:00:00Z", "Done — PR #12 is up."))
         self.assertEqual(self.rows(), [])
@@ -36767,6 +36801,47 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         self.assertEqual((last["answer"], last["via"]), ("unknown", "unknown"))
         self.assertIn("closedAt", last)
         self.assertNotIn(self.SID, self.sm._perm_open)
+
+    def test_a_session_that_leaves_running_closes_its_open_rows(self):
+        sig = self.ended("2026-10-03T10:00:00Z", "May I merge?")
+        self.edge(None, at=1000, **sig)
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=5000, **sig)
+        self.sm._permission_close_departed()          # still running: nothing
+        self.assertTrue(all("closedAt" not in r for r in self.rows()))
+        self.sess["status"] = "stopped"
+        self.sm._permission_close_departed()
+        closed = {r["id"]: r for r in self.rows() if "closedAt" in r}
+        self.assertEqual(len(closed), 2)
+        self.assertEqual((self.sm._perm_open, self.sm._perm_ask), ({}, {}))
+
+    def test_a_sub_agents_request_names_the_real_call_not_the_delegation(self):
+        # The parent's only result-less call is the foreground Agent; the
+        # dialog is the sub-agent's, whose hook row carries its own toolUseId.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(self.request_hook("toolu_sub"))
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.edge(None, at=2000)
+        self.sm._apply_permission_hook_rows(
+            now_ms=9000, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        ids = {r["id"] for r in self.rows()}
+        self.assertEqual(len(ids), 1)                 # one prompt, counted once
+        last = self.rows()[-1]
+        self.assertEqual((last["tool"], last["head"], last["toolUseId"]),
+                         ("Bash", "npm test", "toolu_sub"))
+        self.assertEqual(last["rulesMatched"], ["Bash(npm test:*)"])
+
+    def test_a_sub_agents_request_tailed_first_is_claimed_by_the_dialog(self):
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.hook_rows(self.request_hook("toolu_sub"))
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
+        self.edge(self.dialog(), at=1000)
+        row, = self.rows()
+        self.assertEqual((row["tool"], row["toolUseId"]), ("Bash", "toolu_sub"))
+        self.assertEqual(self.sm._perm_hook_pending.get(self.SID), {})
 
     def test_a_raising_edge_never_costs_the_sessions_signals(self):
         with mock.patch.object(self.sm, "_permission_edges",

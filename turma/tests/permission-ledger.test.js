@@ -19,6 +19,7 @@ const dir = mkdtemp("turma-test-permledger-");
 process.env.PERMISSION_LEDGER_FILE = path.join(dir, "permission-ledger.json");
 process.env.PERMISSION_LEDGER_MAX_ROWS = "40";
 process.env.PERMISSION_LEDGER_HOST_MAX_ROWS = "30";
+process.env.PERMISSION_LEDGER_FILE_MAX = "400000";
 
 const ledger = require("../permission-ledger.js");
 const { sanitizePermissionEvent: sanitize, suggestedRule, aggregate } = ledger;
@@ -178,6 +179,57 @@ test("file backend: flush writes, load restores and re-sanitizes", async () => {
   assert.equal(ledger._internals.rowCount(), 2);
 });
 
+// A row whose every capped field is full of 3-byte UTF-8: the char caps let it
+// reach ~15 KB serialized, so a row cap alone does not bound the bytes.
+function fatRow(id, openedAt) {
+  const w = (n) => "\u20ac".repeat(n);
+  return { id, kind: "classifier-denied", openedAt, tool: w(128), head: w(200), digest: w(400),
+    toolUseId: w(128), prompt: w(300), denyReason: w(300),
+    options: Array.from({ length: 9 }, () => w(200)),
+    rulesMatched: Array.from({ length: 8 }, () => w(200)) };
+}
+
+test("bytes: the store is bounded in BYTES too, oldest first, and the file it writes loads", async () => {
+  const now = Date.now();
+  const rows = Array.from({ length: 40 }, (_, i) => fatRow(`f${i}`, now - (40 - i) * MIN));
+  ledger.ingest("h1", rows.slice(0, 20), now);
+  ledger.ingest("h2", rows.slice(20), now);
+  const kept = ledger._internals.rowCount();
+  assert.ok(kept < 40, `byte budget evicted nothing (${kept} rows)`);
+  assert.ok(ledger._internals.totalBytes() <= ledger._internals.maxBytes());
+  assert.ok(ledger._internals.hosts().get("h2").has("f39"));        // the newest stays
+  assert.ok(!ledger._internals.hosts().get("h1")?.has("f0"));       // the oldest went
+  await new Promise((r) => ledger.flush(r));
+  assert.ok(fs.statSync(ledger.LEDGER_FILE).size <= 400000);
+  ledger._internals.load();
+  assert.equal(ledger._internals.rowCount(), kept);                  // nothing lost to a refused load
+});
+
+test("bytes: the budget is a fraction of the container limit, never above the file budget", () => {
+  assert.equal(ledger.setMemoryLimit(2 << 20), (2 << 20) / 16);
+  assert.equal(ledger.setMemoryLimit(1 << 30), Math.floor(400000 * 0.9));
+  assert.equal(ledger.setMemoryLimit(null), Math.floor(400000 * 0.9));
+});
+
+test("bytes: a model over the file ceiling is trimmed before it is written, never written unloadable", async () => {
+  const now = Date.now();
+  const m = new Map();
+  for (let i = 0; i < 40; i++) {
+    const r = sanitize(fatRow(`g${i}`, now - (40 - i) * MIN), now);
+    m.set(r.id, r);
+  }
+  ledger._internals.hosts().set("h1", m);                            // past every bound, unevicted
+  const errs = [];
+  const orig = console.error;
+  console.error = (msg) => errs.push(String(msg));
+  try { await new Promise((r) => ledger._internals.writeNow(r)); } finally { console.error = orig; }
+  assert.ok(fs.statSync(ledger.LEDGER_FILE).size <= 400000);
+  assert.ok(errs.some((e) => /past its ceiling/.test(e)));
+  ledger._internals.load();
+  assert.ok(ledger._internals.rowCount() > 0);
+  assert.ok(ledger._internals.hosts().get("h1").has("g39"));
+});
+
 test("file backend: an unreadable file starts empty, never throws", () => {
   fs.writeFileSync(ledger.LEDGER_FILE, "{not json");
   ledger._internals.load();
@@ -196,6 +248,14 @@ class FakePgPool {
     if (/^CREATE (TABLE|INDEX) IF NOT EXISTS/i.test(sql)) return Promise.resolve([]);
     let m = /^INSERT INTO "permission_event" \(host, id, opened_at, doc\) VALUES (.*) ON CONFLICT \(host, id\) DO UPDATE SET opened_at = EXCLUDED\.opened_at, doc = EXCLUDED\.doc$/.exec(sql);
     if (m) {
+      const seen = new Set();
+      for (let i = 0; i < params.length; i += 4) {
+        const k = `${params[i]}\u0000${params[i + 1]}`;
+        // Postgres: "ON CONFLICT DO UPDATE command cannot affect row a second time".
+        if (seen.has(k)) return Promise.reject(new Error("cannot affect row a second time"));
+        seen.add(k);
+      }
+      if (this.failInserts) return Promise.reject(new Error("pg down"));
       for (let i = 0; i < params.length; i += 4) {
         const [host, id, openedAt, doc] = params.slice(i, i + 4);
         assert.equal(typeof openedAt, "string");             // text protocol
@@ -260,7 +320,7 @@ test("HA: the retention sweep deletes rows past PERMISSION_LEDGER_DAYS", async (
   assert.deepEqual([...pool.rows.keys()], ["h1\u0000new"]);
 });
 
-test("HA: a failed write is logged and dropped, never thrown into the beat", async () => {
+test("HA: a failed write is logged and held, never thrown into the beat", async () => {
   const pool = new FakePgPool();
   await ledger.configure({ ha: true }, pool);
   pool.query = (t) => (/^INSERT/.test(t) ? Promise.reject(new Error("pg down")) : Promise.resolve([]));
@@ -273,6 +333,53 @@ test("HA: a failed write is logged and dropped, never thrown into the beat", asy
   } finally { console.error = orig; }
   assert.ok(errs.some((m) => /Postgres write failed/.test(m)));
   assert.equal(ledger._internals.rowCount(), 1);              // the hot model kept it
+});
+
+test("HA: a write that failed is retried, and a ready-edge rescan never reverts a closed row", async () => {
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool);
+  const now = Date.now();
+  const store = ledger._internals.getBackend();
+  ledger.ingest("h1", [{ id: "d-s-1", kind: "dialog", openedAt: now - MIN, head: "git push" }], now);
+  await new Promise((r) => ledger.flush(r));
+  assert.equal(JSON.parse(pool.rows.get("h1\u0000d-s-1").doc).closedAt, undefined);
+  pool.failInserts = true;                                    // the blip
+  const orig = console.error;
+  console.error = () => {};
+  try {
+    ledger.ingest("h1", [row("d-s-1", { openedAt: now - MIN, closedAt: now, answer: "allow" })], now);
+    await new Promise((r) => ledger.flush(r));
+  } finally { console.error = orig; }
+  pool.failInserts = false;
+  await store._onReady();                                     // the pool's ready edge
+  const hot = ledger._internals.hosts().get("h1").get("d-s-1");
+  assert.equal(hot.closedAt, now);                            // the served model kept the close
+  assert.equal(hot.answer, "allow");
+  await new Promise((r) => ledger.flush(r));
+  assert.equal(JSON.parse(pool.rows.get("h1\u0000d-s-1").doc).closedAt, now);   // and the of-record caught up
+});
+
+test("HA: a stale hot copy re-queued by a rescan still lands in the table", async () => {
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool);
+  const now = Date.now();
+  // PG holds the open copy (the closed write was lost before this fix shipped).
+  pool.rows.set("h1\u0000d-2", { host: "h1", id: "d-2", opened_at: String(now - MIN),
+    doc: JSON.stringify({ id: "d-2", kind: "dialog", openedAt: now - MIN }) });
+  ledger._internals.hosts().set("h1", new Map([["d-2", sanitize(row("d-2", { openedAt: now - MIN, closedAt: now }), now)]]));
+  await ledger.rehydrate();
+  await new Promise((r) => ledger.flush(r));
+  assert.equal(JSON.parse(pool.rows.get("h1\u0000d-2").doc).answer, "allow");
+});
+
+test("HA: one row open AND closed in one batch upserts once, the closed copy winning", async () => {
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool);
+  const now = Date.now();
+  ledger.ingest("h1", [{ id: "d-3", kind: "dialog", openedAt: now - MIN },
+    row("d-3", { openedAt: now - MIN, closedAt: now })], now);
+  await new Promise((r) => ledger.flush(r));
+  assert.equal(JSON.parse(pool.rows.get("h1\u0000d-3").doc).closedAt, now);
 });
 
 test("HA off: configure is a no-op, the file backend stays", async () => {

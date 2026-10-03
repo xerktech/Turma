@@ -26,7 +26,8 @@ function makeEl() {
     _html: "", textContent: "", value: "", hidden: false,
     style: {}, dataset: {}, children: [],
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
-    addEventListener() {}, removeEventListener() {},
+    listeners: {},
+    addEventListener(name, fn) { (this.listeners[name] ||= []).push(fn); }, removeEventListener() {},
     append(...c) { this.children.push(...c); },
     appendChild(c) { this.children.push(c); return c; },
     replaceChildren(...c) { this.children = c; },
@@ -54,6 +55,7 @@ function loadHelpers(fetchReply = null) {
   const sse = [];
   const fetches = [];
   const timers = [];
+  const scrollCalls = [];
   const noop = () => {};
   const document = {
     getElementById(id) { return (els[id] ||= makeEl()); },
@@ -97,7 +99,7 @@ function loadHelpers(fetchReply = null) {
     console, Date, Math, JSON, encodeURIComponent, decodeURIComponent,
     parseInt, parseFloat, isNaN, Number, String, Object, Array, Map, Set,
     addEventListener: noop, removeEventListener: noop,
-    TurmaNav: { preserveScroll: (_el, paint) => paint() },
+    TurmaNav: { preserveScroll: (el, paint) => { scrollCalls.push(el); paint(); } },
     // Indirected through `orgFilter` so a test can narrow the page the way the
     // header's org control does, and check what each section was rendered from.
     TurmaOrg: { get: () => "", getKeys: () => orgKeys, update: noop, filter: (a) => orgFilter(a), subscribe: noop, sse: noop, orgColors: () => ({}) },
@@ -119,7 +121,7 @@ function loadHelpers(fetchReply = null) {
   const runTimers = async () => {
     for (const t of timers.splice(0).filter(Boolean)) await t.fn();
   };
-  return Object.assign(api, { els, sse, fetches, timers, runTimers });
+  return Object.assign(api, { els, sse, fetches, timers, runTimers, scrollCalls });
 }
 
 const H = loadHelpers();
@@ -1303,6 +1305,27 @@ test("XERK-1563: the card says loading, then empty, never a broken table", () =>
   assert.doesNotMatch(empty, /<table/);
   // A malformed view (an older hub answering something else) degrades the same way.
   assert.match(H.permissionsCardHtml({ top: "nope", recent: [null] }, PERM_NOW), /No permission prompts/);
+});
+
+test("XERK-1563: the minute repaint keeps Recent prompts open and goes through preserveScroll", async () => {
+  const H4 = loadHelpers(() => permView);
+  await H4.refreshPermissions();
+  const el = H4.els.permissions;
+  assert.match(el.innerHTML, /<details class="table-view perm-recent-view"><summary>/);   // closed by default
+  assert.ok(H4.scrollCalls.includes(el), "the repaint must go through TurmaNav.preserveScroll");
+  // The operator opens it; the next refresh must not snap it shut.
+  const toggle = (open) => el.listeners.toggle.forEach((fn) => fn({
+    target: { open, matches: (sel) => sel === "details.perm-recent-view" } }));
+  toggle(true);
+  await H4.refreshPermissions();
+  assert.match(el.innerHTML, /<details class="table-view perm-recent-view" open><summary>/);
+  toggle(false);
+  await H4.refreshPermissions();
+  assert.doesNotMatch(el.innerHTML, /perm-recent-view" open/);
+  // An unchanged card is not repainted at all.
+  const n = H4.scrollCalls.length;
+  await H4.refreshPermissions();
+  assert.equal(H4.scrollCalls.length, n);
 });
 
 test("XERK-1563: the card's fetch is scoped by the header's org filter", async () => {

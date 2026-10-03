@@ -1511,6 +1511,8 @@ function defaultRegistryBudget() {
   return Math.max(8 << 20, Math.min(64 << 20, Math.floor(limit / 8)));
 }
 const AGENTS_TOTAL_MAX = positiveEnv("AGENTS_TOTAL_MAX", defaultRegistryBudget());
+// The permission ledger's byte budget is a fraction of the same limit (XERK-1563).
+const PERMISSION_LEDGER_BYTES = permissionLedger.setMemoryLimit(containerMemoryLimit());
 
 // One host's share of the aggregate — 512 KiB at the deployed sizing, against a
 // measured real fleet whose LARGEST record is 0.30 MiB.
@@ -4211,20 +4213,22 @@ function permissionsView(params, now = Date.now()) {
 
 // The permission ledger's aggregate on /metrics (XERK-1563). That route is
 // UNAUTHENTICATED, so it carries per-kind counts and summed waits only — never a
-// command, a host or a session. Counts are over the retained window.
+// command, a host or a session. Values are over the retained window, so they
+// FALL as rows age out — GAUGES, never counters (Prometheus reads every drop in a
+// counter as a reset, and rate()/increase() report false spikes).
 function permissionMetricsText() {
   const totals = permissionLedger.kindTotals();
-  let out = "# HELP turma_permission_prompts_total Permission prompts recorded by the " +
-    "permission ledger, by kind, over its retention window.\n" +
-    "# TYPE turma_permission_prompts_total counter\n";
+  let out = "# HELP turma_permission_prompts Permission prompts the permission ledger " +
+    "holds, by kind, over its retention window.\n" +
+    "# TYPE turma_permission_prompts gauge\n";
   for (const [kind, t] of Object.entries(totals)) {
-    out += `turma_permission_prompts_total{kind="${kind}"} ${t.count}\n`;
+    out += `turma_permission_prompts{kind="${kind}"} ${t.count}\n`;
   }
-  out += "# HELP turma_permission_wait_seconds_sum Seconds sessions spent waiting on a " +
+  out += "# HELP turma_permission_wait_seconds Seconds sessions spent waiting on a " +
     "permission prompt, by kind, over the ledger's retention window.\n" +
-    "# TYPE turma_permission_wait_seconds_sum counter\n";
+    "# TYPE turma_permission_wait_seconds gauge\n";
   for (const [kind, t] of Object.entries(totals)) {
-    out += `turma_permission_wait_seconds_sum{kind="${kind}"} ${Math.round(t.waitMs / 1000)}\n`;
+    out += `turma_permission_wait_seconds{kind="${kind}"} ${Math.round(t.waitMs / 1000)}\n`;
   }
   return out;
 }
@@ -20657,6 +20661,7 @@ if (process.env.TURMA_TEST) {
       `agent on-demand caches: <=${AGENT_CACHE_TOTAL_MAX} bytes fleet-wide, ` +
         `<=${AGENT_CACHE_HOST_MAX} bytes/host`
     );
+    console.log(`permission ledger: <=${PERMISSION_LEDGER_BYTES} bytes retained`);
     if (push.fcmEnabled()) console.log("FCM push alerts -> Android devices");
     // A warning, not an info line: a hub running without FCM delivers ZERO mobile
     // notifications (every notify() is a no-op), and that has silently bitten us
