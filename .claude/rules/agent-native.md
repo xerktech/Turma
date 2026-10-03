@@ -119,6 +119,9 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
     differs from the payload's (reload + try-restart), so a timer fix reaches existing hosts.
   - **It reconciles on EVERY run, from `$PREFIX/turma-agent-update.timer`**, not only on install:
     an install runs the OLD updater, so install-only left a host one extra release from the fix.
+    `install.sh` and every install write that copy.
+  - **So a hand edit to the installed timer is reverted on the next run** — customise it with a
+    drop-in (`turma-agent-update.timer.d/*.conf`), which the reconcile never compares.
   - **A run cannot WEDGE holding the lock (XERK-549)** — a hung child once held it forever (a
     network/subprocess call that outran its own `timeout`), stranding the host on a stale build
     silently. Three guards, all in `with_lock`/`run_locked`:
