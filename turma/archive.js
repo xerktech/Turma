@@ -2600,7 +2600,7 @@ function reconcileHydratedCursors() {
     else {
       const covered = [];
       if (scBytes != null && Number.isFinite(sc.archiveBytes) && sc.archiveBytes < fileSize) covered.push(scBytes);
-      if ((row.archiveBytes || 0) < fileSize) covered.push(row.bytesStored || 0);
+      if (row.archiveBytes > 0 && row.archiveBytes < fileSize) covered.push(row.bytesStored || 0);
       bytesStored = covered.length ? Math.min(...covered) : 0;
       unverifiedCursors.add(row.transcriptId);
     }
