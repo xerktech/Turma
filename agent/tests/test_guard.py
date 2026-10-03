@@ -1570,8 +1570,8 @@ class TestPrSummary(unittest.TestCase):
     def test_only_what_is_sent_counts_as_the_body(self):
         """Headings in a title or a shell comment are not the description."""
         for cmd in ("gh pr create --title '**Summary:** x' --body nope",
-                    "# ## Why ## What changed ## Risk ## Testing ## Follow-ups\n"
-                    "gh pr create --body nope"):
+                    "# **Summary:** x\n# ## Why\n# ## What changed\n# ## Risk\n"
+                    "# ## Testing\n# ## Follow-ups\ngh pr create --body nope"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(self.reason(cmd))
 
@@ -1579,6 +1579,25 @@ class TestPrSummary(unittest.TestCase):
         cmd = ("cat > /tmp/xerk-body.md <<'EOF'\n" + GOOD_BODY +
                "EOF\ngh pr create -t t -F /tmp/xerk-body.md")
         self.assertIsNone(self.reason(cmd))
+
+    def test_an_unrelated_heredoc_is_not_the_body(self):
+        cmd = ("cat > notes.txt <<'EOF'\n" + GOOD_BODY + "EOF\n"
+               "gh pr create -t x -b junk")
+        self.assertIsNotNone(self.reason(cmd))
+        stdin = "gh pr create -t x -F - <<'EOF'\n" + GOOD_BODY + "EOF"
+        self.assertIsNone(self.reason(stdin))
+
+    def test_a_help_flag_used_as_a_value_is_still_checked(self):
+        for cmd in ("gh pr create -t x -b -h", "gh pr create -t -h -b junk",
+                    "gh pr create -t x -b junk --title --help",
+                    "gh --repo help pr create -b junk"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.reason(cmd))
+
+    def test_an_unreadable_template_falls_back_to_the_standard(self):
+        os.makedirs(os.path.join(self.repo, ".github"))
+        open(os.path.join(self.repo, ".github", "pull_request_template.md"), "w").close()
+        self.assertIn("PR summary standard", self.reason("gh pr create --body x"))
 
     def test_help_is_not_a_pr(self):
         for cmd in ("gh pr create --help", "gh pr create -h", "gh help pr create",
@@ -1598,7 +1617,8 @@ class TestPrSummary(unittest.TestCase):
         self.assertIsNotNone(self.reason("gh pr create -t t -F body.fifo"))
         os.makedirs(os.path.join(self.repo, ".github"))
         os.mkfifo(os.path.join(self.repo, ".github", "pull_request_template.md"))
-        self.assertIsNone(self.reason("gh pr create -t t --body x"))  # headingless
+        self.assertIn("PR summary standard",  # unreadable: the standard applies
+                      self.reason("gh pr create -t t --body x"))
 
     def test_unrepresentable_paths_do_not_crash(self):
         for cmd in ("cd ~$'\\x00' && ls", "gh pr create -F $'a\\x00b'"):

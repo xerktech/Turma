@@ -43,11 +43,13 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
 - **pr-summary is the hard half of `PR_SUMMARY_SYSTEM_PROMPT`** (`pr_summary_reason`): the two must
   name the same headings, or a session following its instructions is refused by its own guard.
   - Checks `gh pr create|new`, `glab mr create|new`, `az repos pr create`, and an `edit`/`update`
-    only when it sets the description (glued `-bTEXT` too); `--help` is not a PR.
-  - **The body is only what would be SENT**: inline body values + the command's heredoc bodies +
-    any `--body-file` (event `cwd`, moved by a leading `cd`). Never the whole command text — a
-    title or `# why` comment then satisfied it. Heredocs all count because `cat > f <<EOF; gh pr
-    create -F f` is common and `f` does not exist yet when the hook runs.
+    only when it sets the description (glued `-bTEXT` too). Help skips only as the SOLE argument —
+    elsewhere `-h` can be another flag's value (`-b -h`), which the CLI sends as the body.
+  - **The body is only what would be SENT**: inline body values, any `--body-file` (event `cwd`,
+    moved by a leading `cd`), and a heredoc only if it hangs off the PR command itself
+    (`$(cat <<EOF)`, `-F - <<EOF`) or its owner line names a `-F` file — `cat > f <<EOF; gh pr
+    create -F f` is common and `f` does not exist yet when the hook runs. Never the whole command
+    text or an unrelated heredoc — either let a junk body through.
   - A body it can't see (`--fill`, the editor, `$(cat file)`) is refused, saying how to pass it.
   - **Every file read is `O_NONBLOCK` + regular-file only** (`_read_text`): a FIFO at the body or
     template path hung the hook, and Claude Code lets a timed-out hook's command THROUGH.
@@ -55,7 +57,8 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   - Not covered (accepted): `gh api …/pulls`, `hub pull-request`, `git push -o
     merge_request.create`; `-R other/repo` is checked against the LOCAL checkout's template.
   - **A repo's own PR template wins**: its headings are required instead (ones worded `optional`/
-    `if applicable` excepted); a headingless template checks nothing. Turma ships one, so Turma's
+    `if applicable` excepted); a headingless template checks nothing; an EMPTY or unreadable one
+    (FIFO) is no template, so the standard applies — failing open there disabled the check. Turma ships one, so Turma's
     sessions are held to its headings, not the `**Summary:**` line.
   - Off with `$TURMA_PR_SUMMARY=0`. Replayed against 32k real Bash commands: refuses only PR
     creates/body edits, 0 others. Tests: `TestPrSummary`, the hook-entrypoint toggle case (its cwd

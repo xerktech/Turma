@@ -1708,10 +1708,13 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
         return None
     group, creates, body_flags = spec
     head = rest[:rest.index(group)]
-    if "help" in head or (_basename(tokens[0]) == "az" and "repos" not in head):
+    if (rest[:1] == ["help"]
+            or (_basename(tokens[0]) == "az" and "repos" not in head)):
         return None
     args = rest[rest.index(group) + 1:]
-    if not args or "-h" in args or "--help" in args:
+    # Help only when it is the ONLY argument: anywhere else `-h` may be another
+    # flag's value (`-b -h`), which the CLI sends as the description.
+    if not args or args[1:] in (["-h"], ["--help"]):
         return None
     verb = args[0]
     bodies: list[str] = []
@@ -1780,10 +1783,23 @@ def _repo_template_sections(root: str | None) -> list[tuple[str, str]] | None:
         if not match:
             continue
         text = _read_text(os.path.join(dirname, match))
+        if not text.strip():
+            # Unreadable, a FIFO, or empty: no template to follow, so the
+            # standard applies rather than nothing at all.
+            return None
         heads = [h for h in _TEMPLATE_HEADING.findall(text)
                  if not _OPTIONAL_HEADING.search(h)]
         return [(h, re.escape(h)) for h in heads]
     return None
+
+
+def _owner_is_pr_command(owner: str) -> bool:
+    """Whether the line a heredoc hangs off is itself a PR/MR command."""
+    try:
+        tokens = _tokenize(owner.split("<<")[0])
+    except ValueError:
+        return False
+    return bool(tokens) and _pr_body_command(tokens) is not None
 
 
 def _join_path(cwd: str, path: str) -> str:
@@ -1820,8 +1836,12 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             continue
         bodies, files = hit
         if heredocs is None:
-            heredocs = [b for _owner, b in _split_heredocs(command)[1]]
-        body = "\n".join(bodies + heredocs + [_read_text(_join_path(cwd, f)) for f in files])
+            heredocs = _split_heredocs(command)[1]
+        # Only a heredoc that feeds THIS command (`$(cat <<EOF)`, `-F - <<EOF`)
+        # or writes a file it sends, never an unrelated one in the same command.
+        fed = [b for owner, b in heredocs
+               if _owner_is_pr_command(owner) or any(f in owner for f in files)]
+        body = "\n".join(bodies + fed + [_read_text(_join_path(cwd, f)) for f in files])
         sections = _repo_template_sections(_repo_root(cwd))
         if sections is not None:
             # A template with no headings asks for prose; there is nothing to check.
