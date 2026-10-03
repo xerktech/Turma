@@ -852,6 +852,21 @@ def _brace_end(command: str, i: int) -> int:
     return -1
 
 
+def _live_dollar(command: str, i: int) -> bool:
+    """Whether the `$` at ``i`` starts an expansion: not escaped, and not the
+    second half of a `$$`. A run of `$` pairs into PIDs from its first LIVE
+    one, and an odd run of backslashes before the run makes its first `$`
+    literal — so `\\$${x}` expands `${x}` while `$${x}` and `\\${x}` do not."""
+    j = i
+    while j > 0 and command[j - 1] == "$":
+        j -= 1
+    k = j
+    while k > 0 and command[k - 1] == "\\":
+        k -= 1
+    live = i - j + 1 - (j - k) % 2
+    return live % 2 == 1
+
+
 def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> str:
     """Inline variables the command line sets itself.
 
@@ -866,8 +881,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     states = _quote_states(command) if vals and "$" in command else []
 
     def rep(m: "re.Match[str]") -> str:
-        lead = command[:m.start()]
-        if (len(lead) - len(lead.rstrip("\\"))) % 2 or (len(lead) - len(lead.rstrip("$"))) % 2:
+        if not _live_dollar(command, m.start()):
             # `\${a:-\"}` is literal text to bash, and `$${` is the PID then a
             # brace. Splicing either's "default" shifted the quoting under the
             # rest of the line: `echo "\${a:-\"}"; rm -rf /` hid the `rm`

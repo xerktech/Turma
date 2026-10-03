@@ -1363,6 +1363,11 @@ class TestCommentAndEvalReparse(unittest.TestCase):
         # `$$` is the PID: `$${` opens nothing.
         self.assertAllowed("echo $${ #; rm -rf /")
         self.assertAllowed("echo $${a:- #}; rm -rf /")
+        # ...but after `\\$` the `$` that follows is live again.
+        for cmd in ("rm -rf \\$${a:- /*}", "x=' /*'; rm -rf \\$$x",
+                    "x=' /'; rm -rf \\$${x}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
         self.assertAllowed("echo ${HOME} # rm -rf /")
         self.assertAllowed("echo ${#x} ${x#*/}; ls")
 
