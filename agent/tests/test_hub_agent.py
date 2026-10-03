@@ -25663,6 +25663,7 @@ class TestArchiveInventory(ManagerMixin, unittest.TestCase):
         # V1: published, the hub rolls back for one NON-refresh beat, re-rolls.
         with sm._inventory_lock:
             sm._inventory_ready = old
+        sm._inventory_staged_once = True  # as after the boot-time stage
         sm._archive_hub_offer = False
         sm.build_payload(1)
         sm._archive_hub_offer = True
@@ -25670,15 +25671,28 @@ class TestArchiveInventory(ManagerMixin, unittest.TestCase):
             payload = sm.build_payload(2)
             stage.assert_called_once()  # re-staged at once, not a cycle later
         self.assertNotIn("archiveInventory", payload)
-        # V2: a walk STARTED before the rollback publishes after it.
-        gen = sm._inventory_gen
-        sm._archive_hub_offer = False
-        sm.build_payload(3)
-        with sm._inventory_lock:
-            sm._inventory_ready = (gen, ([{"i": "inflight", "s": 1, "r": 1}], {}))
-        sm._archive_hub_offer = True
-        with mock.patch.object(sm, "_stage_archive_inventory"):
-            payload = sm.build_payload(4)
+        # V2: a REAL walk staged before the rollback, published after it. The
+        # worker must stamp the generation it was STAGED under, not the current.
+        started, release = threading.Event(), threading.Event()
+        def gated(inputs):
+            started.set()
+            release.wait(5)
+            return [{"i": "inflight", "s": 1, "r": 1}], {}
+        with mock.patch.object(sm, "_archive_inventory", gated):
+            sm._stage_archive_inventory(sm._archive_candidate_inputs())
+            self.assertTrue(started.wait(5))
+            sm._archive_hub_offer = False
+            sm.build_payload(3)
+            sm._archive_hub_offer = True
+            release.set()
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with sm._inventory_lock:
+                    if sm._inventory_ready is not None:
+                        break
+                time.sleep(0.01)
+            with mock.patch.object(sm, "_stage_archive_inventory"):
+                payload = sm.build_payload(4)
         self.assertNotIn("archiveInventory", payload)
 
     def test_a_failed_worker_start_never_raises_onto_the_beat(self):
