@@ -5331,10 +5331,16 @@ def branch_sync(repo_path, branch, base_ref):
             "aheadOfRemote": None}
     if not branch or branch == "HEAD":
         return info
+    def has_ref(ref):
+        # None when git gave no answer (timeout / launch failure), so a
+        # stalled lookup never reads as "never pushed" (XERK-1263).
+        rc, _ = run_out(["git", "-C", repo_path, "rev-parse", "--verify",
+                         "--quiet", ref])
+        return None if rc is None else rc == 0
     local = f"refs/heads/{branch}"
-    if not branch_exists(repo_path, local):
+    if not has_ref(local):
         return info
-    info["pushed"] = branch_exists(repo_path, f"refs/remotes/origin/{branch}")
+    info["pushed"] = has_ref(f"refs/remotes/origin/{branch}")
     if info["pushed"]:
         n = run(["git", "-C", repo_path, "rev-list", "--count",
                  f"refs/remotes/origin/{branch}..{local}"])
@@ -28397,7 +28403,8 @@ class SessionManager:
             # branch always exists locally, so `pushed` None there — or a
             # pushed branch with no ahead count — is an UNANSWERED read, not
             # "delivered": skip the decision rather than re-arm (XERK-1263).
-            if live_branch is not None and (
+            # Dirty files decide on their own (an unborn branch reads None).
+            if not dirty and live_branch is not None and (
                     (work or {}).get("pushed") is None
                     or ((work or {}).get("pushed")
                         and (work or {}).get("aheadOfRemote") is None)):

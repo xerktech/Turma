@@ -14826,6 +14826,16 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
                 self.assertEqual(sess["prOpenNudged"],
                                  {"s1": {"attempts": 1, "at": 0}})
 
+    def test_dirty_work_is_nudged_even_when_branch_sync_is_unknown(self):
+        """An unborn (orphan) branch reads pushed None; its dirty files still
+        decide on their own."""
+        sm = self.make_manager()
+        self._session(sm, dirty=2, pushed=None)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(len(self._typed()), 1)
+
     def test_blocking_dialog_is_not_nudged(self):
         sm = self.make_manager()
         self._session(sm)
@@ -22504,6 +22514,20 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
                 ha.git_info_cheap("/w", strict=True)
             with self.assertRaises(ha.GitTimeout):
                 ha.repo_cheap_facts("/w", strict=True)
+
+    def test_branch_sync_reads_a_stalled_origin_lookup_as_unknown(self):
+        """XERK-1263: a timed-out origin-ref lookup is pushed None, never the
+        False that would nudge a pushed branch as "never pushed"."""
+        real = subprocess.run
+
+        def fake(cmd, **kw):
+            if "refs/remotes/origin/feat" in cmd:
+                raise subprocess.TimeoutExpired("git", 15)
+            if "refs/heads/feat" in cmd:
+                return real(["true"])
+            return real(["false"])
+        with mock.patch.object(ha.subprocess, "run", side_effect=fake):
+            self.assertIsNone(ha.branch_sync("/r", "feat", None)["pushed"])
 
     def test_a_launch_failure_is_no_answer_not_clean(self):
         """XERK-1263: git that could not be launched (a fork refused at the
