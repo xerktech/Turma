@@ -817,7 +817,7 @@ test("pg mode: a reconcile that lowers the byte cursor re-derives msgCount, so a
     const first = fs.readFileSync(jsonl, "utf8").split("\n")[0] + "\n";
     fs.writeFileSync(jsonl, first);
     const sc = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
-    fs.writeFileSync(jsonl + ".meta", JSON.stringify({ ...sc, bytesStored: cut }));
+    fs.writeFileSync(jsonl + ".meta", JSON.stringify({ ...sc, bytesStored: cut, archiveBytes: Buffer.byteLength(first) }));
     archive.setIndexMode(null); archive.setIndexSink(mem.sink()); archive.setIndexMode("pg", mem);
     await mem.hydrateSessionsInto(archive.sessionLoader());
     archive.reconcileHydratedCursors();
@@ -1009,6 +1009,39 @@ test("XERK-1364 pg mode: neither sidecar nor Postgres describes the file — low
   } finally { pgTeardown(); }
 });
 
+// XERK-1459: the drain PUTs each file separately, so a pod that dies after pushing a
+// `.meta` newer than its `.jsonl` leaves a sidecar (and a Postgres row) ahead of the
+// file. Taking either cursor skips what the file lacks, and the entry is lost.
+test("XERK-1459 pg mode: a sidecar and row AHEAD of the .jsonl never skip what it lacks", async () => {
+  const mem = pgSetup();
+  try {
+    const b1 = [ent("m0", "user", "one"), ent("m1", "assistant", "two")];
+    const len1 = Buffer.byteLength(JSON.stringify(b1));
+    archive.ingestChunk("nas", "t-ahead", META, 0, len1, b1, "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-ahead").filePath);
+    const pushedJsonl = fs.readFileSync(jsonl);       // the .jsonl the drain pushed
+    const b2 = [ent("m2", "user", "three")];
+    const len2 = len1 + Buffer.byteLength(JSON.stringify(b2));
+    archive.ingestChunk("nas", "t-ahead", META, len1, len2, b2, "acme");
+    fs.writeFileSync(jsonl, pushedJsonl);              // .meta + PG are a chunk ahead
+
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    archive.reconcileHydratedCursors();
+    const have = archive.manifestCursors("nas", [{ transcriptId: "t-ahead" }], "acme")["t-ahead"];
+    assert.equal(have, 0, "no cursor written beside a longer file is trusted");
+    const b3 = [ent("m3", "assistant", "four")];
+    const len3 = len2 + Buffer.byteLength(JSON.stringify(b3));
+    archive.ingestChunk("nas", "t-ahead", META, have, len3, [...b1, ...b2, ...b3], "acme");
+    const uuids = fs.readFileSync(jsonl, "utf8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+    assert.deepEqual(uuids, ["m0", "m1", "m2", "m3"]);
+    assert.equal(archive.sessionRow("t-ahead").msgCount, 4);
+    assert.deepEqual([...mem.entries.get("t-ahead").keys()], [0, 1, 2, 3]);
+  } finally { pgTeardown(); }
+});
+
 test("XERK-1364 pg mode: backfill from a stale sidecar de-dups; a repeated key is not a re-send", async () => {
   const mem = pgSetup();
   try {
@@ -1037,6 +1070,33 @@ test("XERK-1364 pg mode: backfill from a stale sidecar de-dups; a repeated key i
     assert.deepEqual(uuids, ["p0", "pr-link:https://x/pr/1", "p1", "pr-link:https://x/pr/1"]);
     assert.equal(archive.sessionRow("t-bf").msgCount, 4);
     assert.equal(mem.entries.get("t-bf").size, 4);
+  } finally { pgTeardown(); }
+});
+
+test("XERK-1459 pg mode: backfill from a sidecar AHEAD of its .jsonl re-sends from 0", async () => {
+  const mem = pgSetup();
+  try {
+    const b1 = [ent("q0", "user", "one")];
+    const len1 = Buffer.byteLength(JSON.stringify(b1));
+    archive.ingestChunk("nas", "t-bfa", META, 0, len1, b1, "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-bfa").filePath);
+    const pushedJsonl = fs.readFileSync(jsonl);
+    const b2 = [ent("q1", "assistant", "two")];
+    const len2 = len1 + Buffer.byteLength(JSON.stringify(b2));
+    archive.ingestChunk("nas", "t-bfa", META, len1, len2, b2, "acme");
+    fs.writeFileSync(jsonl, pushedJsonl);
+    mem.sessions.clear(); mem.entries.clear();       // Postgres wiped (XERK-797)
+
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    assert.equal(archive.backfillPgIndexFromFiles(), 1);
+    assert.equal(archive.manifestCursors("nas", [{ transcriptId: "t-bfa" }], "acme")["t-bfa"], 0);
+    archive.ingestChunk("nas", "t-bfa", META, 0, len2, [...b1, ...b2], "acme");
+    const uuids = fs.readFileSync(jsonl, "utf8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+    assert.deepEqual(uuids, ["q0", "q1"]);
+    assert.equal(mem.entries.get("t-bfa").size, 2);
   } finally { pgTeardown(); }
 });
 

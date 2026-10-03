@@ -2456,7 +2456,7 @@ function rebuildIndex() {
         meta.remoteKey || null,
         meta.repo || null, meta.worktree || null, meta.slug || null,
         meta.createdAt || null, meta.endedTs || null, meta.summary || null,
-        msgCount, meta.bytesStored || 0, archiveBytes, rawBytes, relPath,
+        msgCount, sidecarCursor(meta, archiveBytes), archiveBytes, rawBytes, relPath,
         meta.updatedAt || null);
     });
   }
@@ -2587,15 +2587,21 @@ function reconcileHydratedCursors() {
     // sidecar is rewritten after every append, so it describes this `.jsonl` when
     // its archiveBytes is the file's size; else the row may (a promoted follower
     // keeps its own same-size stale `.meta` while the hydrate re-downloads the
-    // grown `.jsonl`). When neither does, take the LOWER cursor — the safer of two
-    // unproven ones — and have ingest de-duplicate whatever the re-send overlaps.
+    // grown `.jsonl`). When neither does, take the LOWER of the cursors written
+    // beside a file no longer than this one, and have ingest de-duplicate whatever
+    // the re-send overlaps. A cursor written beside a LONGER file (the drain pushed
+    // a `.meta` newer than its `.jsonl`, XERK-1459) claims bytes this file lacks, so
+    // it is never a candidate; with none left the re-send starts from 0.
     const scBytes = sc && Number.isFinite(sc.bytesStored) ? sc.bytesStored : null;
     let bytesStored;
     if (sc && sc.cursorUnverified) unverifiedCursors.add(row.transcriptId);
     if (scBytes != null && sc.archiveBytes === fileSize) bytesStored = scBytes;
     else if (row.archiveBytes === fileSize) bytesStored = row.bytesStored || 0;
     else {
-      bytesStored = Math.min(scBytes ?? Infinity, row.bytesStored || 0);
+      const covered = [];
+      if (scBytes != null && Number.isFinite(sc.archiveBytes) && sc.archiveBytes < fileSize) covered.push(scBytes);
+      if ((row.archiveBytes || 0) < fileSize) covered.push(row.bytesStored || 0);
+      bytesStored = covered.length ? Math.min(...covered) : 0;
       unverifiedCursors.add(row.transcriptId);
     }
     const rawBytes = rawLayerBytes(paths.jsonl + RAW_DIR_SUFFIX);
@@ -2625,6 +2631,15 @@ function reconcileHydratedCursors() {
       `after a Postgres index hydrate (files ahead of the of-record; XERK-780)`);
   }
   return healed;
+}
+
+// A sidecar's cursor, rebuilding a row from its file. A sidecar written beside a
+// LONGER `.jsonl` (the drain pushed a `.meta` newer than its `.jsonl`, XERK-1459)
+// claims entries this file lacks, so its cursor would skip them for good: re-send
+// from 0 instead, de-duplicated by ingest (the row is already marked suspect).
+function sidecarCursor(meta, fileSize) {
+  if (Number.isFinite(meta.archiveBytes) && meta.archiveBytes > fileSize) return 0;
+  return Number.isFinite(meta.bytesStored) ? meta.bytesStored : 0;
 }
 
 function countLines(p) {
@@ -2781,7 +2796,7 @@ function backfillPgIndexFromFiles() {
       worktree: meta.worktree || null, slug: meta.slug || null,
       createdAt: meta.createdAt || null, endedTs: meta.endedTs || null,
       summary: meta.summary || null, msgCount: entries.length,
-      bytesStored: Number.isFinite(meta.bytesStored) ? meta.bytesStored : 0,
+      bytesStored: sidecarCursor(meta, archiveBytes),
       archiveBytes, rawBytes, filePath: relPath, updatedAt: meta.updatedAt || null,
     }));
     mirrorSession(transcriptId);
