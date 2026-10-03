@@ -32027,6 +32027,40 @@ class TestParseTicketTriage(unittest.TestCase):
         out = self._parse(self._raw(reason="x" * 400))
         self.assertEqual(len(out["ENG-1"]["reason"]), ha.JIRA_TRIAGE_REASON_MAX)
 
+    def test_a_rollup_verdict_parses_as_not_actionable(self):
+        # XERK-1568: the classifier's answer for a rollup ticket is an ordinary
+        # actionable:false assessment — no new field, nothing the hub must learn.
+        out = self._parse(self._raw(actionable=False, type="other",
+                                    reason="rollup list, not work"))
+        self.assertIs(out["ENG-1"]["actionable"], False)
+
+
+class TestTicketTriagePrompt(unittest.TestCase):
+    """XERK-1568: a rollup ticket (`[Rollup] <repo>: low-severity findings`,
+    labelled `rollup`) is a findings list, never work. The hub gates it out of the
+    auto stream on its own; the classifier marks it not actionable too (belt and
+    braces), so the instruction must say so and the ticket line must carry what
+    it keys on."""
+
+    def test_the_instruction_marks_a_rollup_ticket_not_actionable(self):
+        text = ha.TICKET_TRIAGE_INSTRUCTION
+        self.assertIn("[Rollup]", text)
+        self.assertIn("labelled 'rollup'", text)
+        self.assertRegex(text, r"ROLLUP ticket[^\n]*\n?[^\n]*actionable is always false")
+
+    def test_the_prompt_carries_the_rule_and_the_rollup_markers(self):
+        t = {"key": "ENG-7", "summary": "[Rollup] Turma: low-severity findings",
+             "labels": ["rollup", "Turma"]}
+        prompt = ha._ticket_triage_prompt([t], [t])
+        self.assertTrue(prompt.startswith(ha.TICKET_TRIAGE_INSTRUCTION))
+        self.assertIn("- ENG-7: [Rollup] Turma: low-severity findings", prompt)
+        self.assertIn("(labels: rollup, Turma)", prompt)
+
+    def test_adding_the_rollup_label_re_triages(self):
+        before = {"key": "ENG-7", "summary": "Findings", "labels": ["Turma"]}
+        after = dict(before, labels=["Turma", "rollup"])
+        self.assertNotEqual(ha._ticket_fingerprint(before), ha._ticket_fingerprint(after))
+
 
 class TestTicketTriage(ManagerMixin, unittest.TestCase):
     """The ticket-triage lifecycle on the manager (XERK-482): batching, caching,
