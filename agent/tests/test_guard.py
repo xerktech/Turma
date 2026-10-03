@@ -1276,7 +1276,16 @@ class TestProducedScripts(unittest.TestCase):
                     "x='<<'; eval 'echo $x E\nrm -rf /\nE'",
                     # A comment's apostrophe is no quote; a `#` value no comment.
                     "x='\"'; echo hi # don't\necho \"$x\"; rm -rf /",
-                    "x='#'; echo $x; rm -rf /"):
+                    "x='#'; echo $x; rm -rf /",
+                    "x=\"'\"; echo hi # don't\necho $x; rm -rf /",
+                    "x=\"'\"; " + "echo n # c\n" * 70 + "echo hi # don't\necho $x; rm -rf /",
+                    # Parsed TWICE, the value is code again (QA pass 8).
+                    "x=';'; eval 'eval echo $x rm -rf /'",
+                    "x=';' bash -c 'bash -c \"echo $x rm -rf /\"'",
+                    "x='&&'; eval 'eval echo hi $x rm -rf /'",
+                    "x=';'; trap 'eval echo $x rm -rf /' EXIT",
+                    # eval re-parses its joined words: `\;` is an operator again.
+                    "eval echo \\; rm -rf /", "eval echo hi \\&\\& rm -rf /"):
             with self.subTest(cmd=cmd):
                 self.assertTrue(guard.is_destructive(cmd) or guard.policy_reason(cmd), cmd)
         for cmd in ("x=\"it's fine\"; git commit -m \"$x\"", 'a=(x y); echo "x${a[@]}"',
@@ -1284,6 +1293,12 @@ class TestProducedScripts(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
         self.assertDenied("d=/; bash -c 'rm -rf $d'")
+        self.assertAllowed("eval echo 'rm -rf /etc is banned'")
+        # Comments cost one scan, not one per comment.
+        cmd = "x=\"it's\"; " + ("echo step # don't panic\n" * 400) + "echo \"$x\""
+        started = time.monotonic()
+        self.assertAllowed(cmd)
+        self.assertLess(time.monotonic() - started, 5)
 
     def test_a_substitution_value_is_classified_once(self):
         # Inlining the `$(…)` text re-classified it at every use: minutes for

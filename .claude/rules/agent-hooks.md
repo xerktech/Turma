@@ -136,7 +136,11 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     unescaped. `"${a[@]}"` closes the quote around the elements (one word each).
     - Inside `'…'` (a script `eval`/`bash -c`/`trap` parses later) the value is a WORD there:
       quotes, `#` and operators all escaped. Bare keeps `;&|` live — `eval $x` re-parses them.
-    - Quote state ignores `#` comments (`_code_quote_states`): `# don't` opened a "quote".
+    - Each escape is right for ONE re-parse depth (`eval 'eval echo $x …'` makes `x=';'` code
+      again), so `_expand_both` also classifies the line with values spliced RAW whenever one
+      needed escaping, and denies if either reading does. Don't add escape layers instead.
+    - `_quote_states` reads a `#` comment as `#` to line end, in its one pass: `# don't`
+      opened a "quote"; a per-comment re-scan was 10x slower and capped (fail-open).
   - **`cd` targets are SCOPE-blind** (`_cd_targets`, inherited into recursion): a later `cd`
     never clears an earlier one, since it may fail, sit in a subshell/pipe, or be `cd -`;
     clearing let `cd /; (cd /tmp); rm -rf *` through.

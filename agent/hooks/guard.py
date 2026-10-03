@@ -376,7 +376,9 @@ def _quote_states(command: str) -> list[str]:
     literal, `"` inside a double-quoted string, `\\` escaped, "" bare.
 
     A `$(…)` inside a string restarts quoting, as bash does, so the `'…'` in
-    `"$(echo 'a')"` is a real single-quoted literal again.
+    `"$(echo 'a')"` is a real single-quoted literal again. A `#` comment is
+    `#` to its line's end: the apostrophe in `# don't` opened a "quote" that
+    every later character was read inside (XERK-1549).
     """
     out = [""] * len(command)
     stack: list[str] = []
@@ -384,6 +386,12 @@ def _quote_states(command: str) -> list[str]:
     while i < n:
         ch = command[i]
         top = stack[-1] if stack else ""
+        if ch == "#" and top != '"' and _is_comment(command, i):
+            end = command.find("\n", i)
+            end = n if end < 0 else end
+            out[i:end] = ["#"] * (end - i)
+            i = end
+            continue
         if ch == "\\":
             out[i:i + 2] = ["\\"] * len(out[i:i + 2])
             i += 2
@@ -805,7 +813,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     if vals is None:
         vals = _var_values(command)
 
-    states = _code_quote_states(command) if vals and "$" in command else []
+    states = _quote_states(command) if vals and "$" in command else []
 
     def rep(m: "re.Match[str]") -> str:
         name = m.group(1) or m.group(3) or ""
@@ -828,23 +836,9 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     return _VAR_USE_RE.sub(rep, command)
 
 
-def _code_quote_states(command: str) -> list[str]:
-    """`_quote_states`, with `#` comments read as comments: the apostrophe in
-    `# don't` opened a "quote" that every later use was escaped for."""
-    states = _quote_states(command)
-    pos = 0
-    for _ in range(64):  # bounded: each comment re-scans the line
-        i = command.find("#", pos)
-        while i >= 0 and (states[i] or not _is_comment(command, i)):
-            i = command.find("#", i + 1)
-        if i < 0:
-            break
-        end = command.find("\n", i)
-        end = len(command) if end < 0 else end
-        command = command[:i] + " " * (end - i) + command[end:]
-        states = _quote_states(command)
-        pos = end
-    return states
+# Set while `_expand_both` takes its raw reading; counts escaping splices.
+_SPLICE_RAW = [False]
+_SPLICES_ESCAPED = [0]
 
 
 def _quote_literal(value: str, state: str) -> str:
@@ -853,7 +847,21 @@ def _quote_literal(value: str, state: str) -> str:
     `x='"'; echo "$x"; rm -rf /` unbalanced the line and hid the `rm`
     (XERK-1549). Inside `'…'` (a script some shell will expand later) the
     value's `'` closes, escapes and reopens. `$` stays live, so a `$(…)` a
-    value carries is still classified where it lands."""
+    value carries is still classified where it lands.
+
+    Each escape is right for ONE re-parse depth only — a value an `eval` of an
+    `eval` reads is code again (`x=';'; eval 'eval echo $x rm -rf /'`). So when
+    any value needed escaping, `_expand_both` also classifies the line with
+    every value spliced RAW and denies if either reading does."""
+    if _SPLICE_RAW[0]:
+        return value
+    escaped = _escape_value(value, state)
+    if escaped != value:
+        _SPLICES_ESCAPED[0] += 1
+    return escaped
+
+
+def _escape_value(value: str, state: str) -> str:
     if state == "'":
         # The script `eval`/`bash -c`/`trap` will parse, where the expansion
         # is a WORD — never a quote, comment or operator (`x='<<'` opened a
@@ -1278,6 +1286,21 @@ def _find_roots(tokens: list[str]) -> list[str]:
     return roots
 
 
+def _expand_both(command: str) -> list[tuple[list[str], str]]:
+    """`_expand_segments`, and — when a spliced value needed escaping — again
+    with every value spliced raw (see `_quote_literal`). Neither reading is
+    right at every re-parse depth; together they fail closed."""
+    _SPLICES_ESCAPED[0] = 0
+    out = _expand_segments(command)
+    if _SPLICES_ESCAPED[0]:
+        _SPLICE_RAW[0] = True
+        try:
+            out = out + _expand_segments(command)
+        finally:
+            _SPLICE_RAW[0] = False
+    return out
+
+
 def _expand_segments(command: str, depth: int = 0,
                      cwds: tuple[str, ...] = ()) -> list[tuple[list[str], str]]:
     """Every command ``command`` would actually run, as (tokens, segment) pairs.
@@ -1422,6 +1445,10 @@ def _expand_segments(command: str, depth: int = 0,
                 #    mentioning rm -rf" class this file exists not to refuse.
                 if inner[0].strip() and re.search(r"\s", inner[0]):
                     out.extend(_expand_segments(inner[0], depth + 1, every_cd))
+                # 3. The words joined bare, as eval itself re-parses them: an
+                #    escaped `\;` is an operator again (`eval echo \; rm -rf /`).
+                if len(inner) > 1:
+                    out.extend(_expand_segments(" ".join(inner), depth + 1, every_cd))
         elif prog == "alias" and rest:
             # `alias f='rm -rf *'` runs wherever `f` is used — after any `cd`.
             for tok in rest:
@@ -2262,7 +2289,7 @@ def policy_reason(command: str) -> str | None:
     not push to / delete `main`/`master` directly, and it may not merge any
     pull request — that is a human reviewer's call.
     """
-    for tokens, _segment, *_flags in _expand_segments(command):
+    for tokens, _segment, *_flags in _expand_both(command):
         prog = _basename(tokens[0])
         rest = tokens[1:]
         if prog == "git":
@@ -2510,7 +2537,7 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
         except OSError:
             cwd = "/"
     heredocs = None
-    for tokens, _segment, *_flags in _expand_segments(command):
+    for tokens, _segment, *_flags in _expand_both(command):
         if _basename(tokens[0]) == "cd" and len(tokens) > 1:
             cwd = _join_path(cwd, tokens[1])
             continue
@@ -2741,7 +2768,7 @@ def _stage_executes_sql(tokens: list[str], depth: int = 0) -> bool:
 
 
 def _destructive_database(command: str) -> str | None:
-    for tokens, segment, *_flags in _expand_segments(command):
+    for tokens, segment, *_flags in _expand_both(command):
         if not _DB_DESTRUCTION.search(segment):
             continue
         if not _stage_executes_sql(tokens):
@@ -2783,7 +2810,7 @@ def is_destructive(command: str) -> str | None:
     reason = _destructive_database(command)
     if reason:
         return reason
-    for tokens, segment, *flags in _expand_segments(command):
+    for tokens, segment, *flags in _expand_both(command):
         if tokens[0] == _TOO_DEEP:
             return "refusing a command nested too deeply to classify — flatten it"
         # A candidate recovered by the wrapper SUFFIX pass is a guess at where
