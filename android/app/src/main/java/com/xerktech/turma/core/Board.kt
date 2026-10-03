@@ -948,7 +948,19 @@ data class TicketSession(
     val spawnCmdId: String = "",
     /** Sort key: createdAt for a record, endedTs for a resumable row. */
     val at: String = "",
+    /** `ticket.outcome.kind` — how the session closed its own ticket (XERK-1569); "" = it didn't. */
+    val outcome: String = "",
 )
+
+/**
+ * Why a session closed its own ticket, for its chip — board.js `ticketOutcomeLabel`.
+ * Only the two kinds the Done column does not already say get words; "" otherwise.
+ */
+fun ticketOutcomeLabel(kind: String): String = when (kind) {
+    "not-reproducible" -> "closed: not reproducible"
+    "already-fixed" -> "closed: already fixed"
+    else -> ""
+}
 
 /** The chip's run-state dot, board.js sessionChipHtml's `state`. */
 fun ticketSessionState(s: TicketSession): String = when {
@@ -1009,6 +1021,7 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
                 ticketBranch = t.branch.orEmpty(), summary = s.summary,
                 summaryManual = false, label = s.label, ticketKey = t.key,
                 siteKey = t.siteKey, spawnCmdId = s.spawnCmdId, at = s.createdAt,
+                outcome = t.outcome?.kind.orEmpty(),
             ), org)
         }
         for (c in a.closedSessions) {
@@ -1018,7 +1031,7 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
                 status = "stopped", gitBranch = c.branch,
                 ticketBranch = t.branch.orEmpty(), summary = c.summary,
                 summaryManual = c.summaryManual, label = c.label, ticketKey = t.key,
-                siteKey = t.siteKey, at = c.createdAt,
+                siteKey = t.siteKey, at = c.createdAt, outcome = t.outcome?.kind.orEmpty(),
             ), org)
         }
     }
@@ -1036,7 +1049,7 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
                 status = "stopped", gitBranch = "",
                 ticketBranch = tk.branch.orEmpty(), summary = t.summary,
                 summaryManual = false, label = "", ticketKey = tk.key,
-                siteKey = tk.siteKey, at = t.endedTs,
+                siteKey = tk.siteKey, at = t.endedTs, outcome = tk.outcome?.kind.orEmpty(),
             ), org)
         }
     }

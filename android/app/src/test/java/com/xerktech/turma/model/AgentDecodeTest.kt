@@ -50,6 +50,27 @@ class AgentDecodeTest {
         assertEquals("xerk.atlassian.net", ticket.siteKey)
     }
 
+    @Test fun `a ticket's self-close outcome decodes on every ticket channel`() {
+        // XERK-1569: ticket.outcome = {kind, at}, coerced hub-side (coerceTicketOutcome).
+        val t = """{ "key": "X-1", "siteKey": "s", "outcome": { "kind": "not-reproducible", "at": 1786400000000 } }"""
+        val body = """
+            { "now": 1, "agents": [ {
+              "key": "h", "device": "h", "online": true,
+              "sessions": [ { "id": "s1", "ticket": $t } ],
+              "closedSessions": [ { "id": "c1", "repo": "r", "ticket": $t } ],
+              "repos": [ { "name": "r", "resumable": [ { "transcriptId": "t1", "ticket": $t } ] } ]
+            } ] }
+        """.trimIndent()
+        val a = TurmaJson.decodeFromString<AgentsResponse>(body).agents[0]
+        assertEquals("not-reproducible", a.sessions[0].ticket!!.outcome!!.kind)
+        assertEquals("not-reproducible", a.closedSessions[0].ticket!!.outcome!!.kind)
+        assertEquals("not-reproducible", a.repos[0].resumable[0].ticket!!.outcome!!.kind)
+        // Absent = the session did not close it.
+        val plain = TurmaJson.decodeFromString<AgentsResponse>(
+            """{ "now": 1, "agents": [ { "key": "h", "device": "h", "sessions": [ { "id": "s", "ticket": { "key": "X-1" } } ] } ] }""")
+        assertNull(plain.agents[0].sessions[0].ticket!!.outcome)
+    }
+
     @Test fun `a closed session with no ticket decodes to null`() {
         val body = """
             { "now": 1, "agents": [ {

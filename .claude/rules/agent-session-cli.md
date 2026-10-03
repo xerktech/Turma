@@ -28,8 +28,7 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   - `wake <duration> <reason…>` → `{wakeAt (epoch ms), reason, requestedAt}`. Durations are
     `20m`/`2h`/`1h30m`-style (`s`/`m`/`h`/`d`), above zero, at most 7 days; reason ≤200 chars.
   - `close-ticket <done|not-reproducible|already-fixed> --note "<evidence>"` →
-    `{resolution, note, requestedAt}`, note ≤2000 chars. **Only WRITTEN here** — its reader is the
-    close-ticket child (XERK-1569).
+    `{resolution, note, requestedAt}`, note ≤2000 chars. Read by the close-ticket worker below.
 - Exit 0 + one confirmation line on success; **2** on a refusal (usage, a bound, no
   `TURMA_SESSION_ID`, an id that is not a plain name), saying why and writing nothing; 1 on an
   I/O error.
@@ -88,7 +87,35 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
 - Tests: `test_session_cli.py`; `TestWakeRequest` in `test_hub_agent.py`; the guard pins in
   `test_guard_settings.py`; the `XERK-1564` case in `server.test.js`.
 
+## Close-ticket delivery (XERK-1569)
+
+- **A WORKER reads it, never the beat**: the two tracker writes are network (XERK-395).
+  `_stage_close_ticket_work` wakes `_close_ticket_worker_loop` on every full beat (never raises; a
+  failed `Thread.start` retries next beat); `_process_close_ticket_requests` walks a registry
+  snapshot and writes nothing to it. The beat's `_apply_closed_tickets` drains `_close_ticket_landed`
+  (rebound under `_close_ticket_lock`), stamps `ticket.outcome` (REBINDS the ticket dict, which the
+  worker reads) + the ledger, `save()`s, and stages `ticket_outcome_results`. The PR-comment split.
+- **Served only for a RUNNING session with `ticket.key`, NOT dsh/qwen** (no CLI there), on this
+  host's board. The tracker half (comment, Done mapping, `ticket.outcome`): `agent-board.md`.
+- `read_close_ticket_request`: `_read_untrusted_json` (None = no request: missing/FIFO/symlink/
+  oversize); a parsed file breaking the contract (resolution outside `CLOSE_TICKET_KINDS`, note
+  empty/non-string/over `CLOSE_TICKET_NOTE_MAX`) is `{error}` → staged `refused: …` and dropped.
+- **One bounded retry**: `CLOSE_TICKET_ATTEMPTS` (2), the second `CLOSE_TICKET_RETRY_SEC` later. A
+  failure stages `ok:false, final:false` and LEAVES the file; the retry skips a comment that already
+  landed (`_close_ticket_tries[sid].commented`). A final outcome drops the file unless the session
+  has since written a DIFFERENT request (identity = kind/note/requestedAt). Progress is worker-owned
+  and in-memory: a manager restart re-tries a file still there, which can re-post its comment.
+- Kill/delete/restart clears the dir (`_clear_session_requests`) — an unread request dies with it.
+- **Taught by three directives**, each "session CLI first, the host's tracker CLI/MCP else":
+  `TICKET_CLOSE_STALE_CLAUSE` (bug prompt + `TICKET_CLOSE_PROMPT` in `_session_directive`) and the
+  hub's `autoCloseMergedMessage`. All spell `"$TURMA_SESSION_CLI"` — see the open question below.
+- Tests: `TestCloseTicketRequest`, `TestTicketClosingDirectives`; hub `XERK-1569` cases.
+
 ## Real-host spike (not yet run)
+
+- **close-ticket (XERK-1569)**: on a scratch bug ticket, `close-ticket not-reproducible --note "…"`
+  → comment + Done within a minute, the auto-stop kill within a Jira poll (`JIRA_REFRESH_EVERY`),
+  "closed: not reproducible" beside the chip on the board. Not yet run; record the answer here.
 
 - In a worktree session run `python3 -SsE "$TURMA_SESSION_CLI" wake 2m test`: the request file
   appears, no permission prompt, and two minutes later the pane receives the wake-up input.

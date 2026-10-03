@@ -875,6 +875,29 @@ class BoardTest {
         assertTrue(ticketSessionIndex(listOf(siteless)).isEmpty())
     }
 
+    @Test fun `a self-closed ticket's outcome rides each channel to its chip label`() {
+        // XERK-1569, web board.js ticketOutcomeLabel / sessionChipHtml's .kc-sess-why.
+        val t = com.xerktech.turma.model.TicketRef(
+            key = "X-1", siteKey = "org.atlassian.net",
+            outcome = com.xerktech.turma.model.TicketOutcome(kind = "not-reproducible"),
+        )
+        val a = AgentInfo(
+            key = "h",
+            sessions = listOf(com.xerktech.turma.model.SessionInfo(id = "s", ticket = t, transcriptId = "t-s")),
+            closedSessions = listOf(com.xerktech.turma.model.ClosedSessionInfo(id = "c", ticket = t, transcriptId = "t-c")),
+            repos = listOf(com.xerktech.turma.model.RepoInfo(name = "r",
+                resumable = listOf(com.xerktech.turma.model.ResumableInfo(transcriptId = "t-r", ticket = t)))),
+        )
+        val chips = ticketSessionsOf(ticketSessionIndex(listOf(a)), "org.atlassian.net", "X-1")
+        assertEquals(listOf("not-reproducible", "not-reproducible", "not-reproducible"), chips.map { it.outcome })
+        assertEquals("closed: not reproducible", ticketOutcomeLabel(chips[0].outcome))
+        assertEquals("closed: already fixed", ticketOutcomeLabel("already-fixed"))
+        // done is what the Done column says already; unknown/none say nothing.
+        assertEquals("", ticketOutcomeLabel("done"))
+        assertEquals("", ticketOutcomeLabel("wontfix"))
+        assertEquals("", ticketOutcomeLabel(""))
+    }
+
     @Test fun `chip label prefers rename, then branch, and state maps status`() {
         val s = TicketSession(
             host = "h", id = "aa1", transcriptId = "t", status = "running",

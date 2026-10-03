@@ -7132,6 +7132,26 @@ function ingestStatusResults(agent, ticketStatusResults) {
   }
 }
 
+// A session closing its OWN ticket (XERK-1569, heartbeat `ticketOutcomeResults`,
+// `[{sessionId, key, kind, ok, error, final, status, at}]`). Logged only: the
+// board reads the outcome off the session's stamped `ticket.outcome`, and
+// autoStopSweep retires the session once the Done edge is polled. Extracted from
+// the payload so the list is never persisted on the record. Every agent-supplied
+// string goes through logName (a newline in one would forge a log line).
+const TICKET_OUTCOME_LOG_MAX = 50;
+function logTicketOutcomes(host, results) {
+  for (const r of (Array.isArray(results) ? results : []).slice(0, TICKET_OUTCOME_LOG_MAX)) {
+    if (!objectish(r)) continue;
+    const what = `${logName(host)}: session closed ticket ${logName(r.key || "?")}`;
+    if (r.ok === true) {
+      console.log(`${what} -> ${logName(r.status || "Done")} as ${logName(r.kind || "?")}`);
+    } else {
+      console.log(`${what} FAILED${r.final === false ? " (will retry)" : ""}: `
+        + logName(String(r.error || "").slice(0, 300)));
+    }
+  }
+}
+
 // Per-cmdId cache of PR auto-merge outcomes (XERK-550), mirroring
 // ingestStatusResults. Keyed by cmdId and stripped from the fleet payload; the
 // only reader is autoMergeSweep, which uses an `ok:false` result to STOP
@@ -8142,7 +8162,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "sessions", "startedAt", "subscription", "tokenRoll", "uploadMaxBytes", "usage",
   "historyResults", "trajectoryTailResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
-  "ticketPriorityResults", "ticketLinkResults",
+  "ticketPriorityResults", "ticketLinkResults", "ticketOutcomeResults",
   "spawnFailures", "epicBuilderStatus",
 ]);
 
@@ -8944,11 +8964,32 @@ function normalizeRepos(a) {
       for (const t of res) {
         if ("root" in t && typeof t.root !== "boolean") delete t.root;
         if ("ticket" in t && !objectish(t.ticket)) delete t.ticket;
+        if (objectish(t.ticket)) coerceTicketOutcome(t.ticket);
         const prs = coerceObjectList(t, "prs");
         if (prs) prs.forEach(coercePrElem);
       }
     }
   }
+}
+
+// `ticket.outcome` (XERK-1569) — how a session closed its own ticket, stamped by
+// the agent's close-ticket reader on the session's ticket block and its ticket
+// ledger (so it rides sessions, closedSessions AND repos[].resumable). Android
+// TYPES it (TicketRef.outcome), so a wrong shape is decode-fatal: `kind` must be
+// one of the CLI's three resolutions and `at` a finite integer (epoch ms), else
+// the whole key is deleted — absent reads as "not closed by its session". The
+// kinds are an INLINE literal, never a module const: this runs from loadState's
+// restore at module-init, where a const declared down here is in its TDZ.
+function coerceTicketOutcome(t) {
+  if (!("outcome" in t)) return;
+  const o = t.outcome;
+  const kind = objectish(o) ? o.kind : null;
+  if (!(kind === "done" || kind === "not-reproducible" || kind === "already-fixed")
+      || !wireLong(o.at)) {
+    delete t.outcome;
+    return;
+  }
+  t.outcome = { kind: o.kind, at: o.at };
 }
 
 // `closedSessions` (List<ClosedSessionInfo> on Android). Non-array → [],
@@ -8963,6 +9004,7 @@ function normalizeClosedSessions(a) {
       if (k in c && typeof c[k] !== "boolean") delete c[k];
     }
     if ("ticket" in c && !objectish(c.ticket)) delete c.ticket;
+    if (objectish(c.ticket)) coerceTicketOutcome(c.ticket);
     const prs = coerceObjectList(c, "prs");
     if (prs) prs.forEach(coercePrElem);
   }
@@ -9340,6 +9382,8 @@ function normalizeSessions(payload) {
     for (const k of ["git", "ticket", "work"]) {
       if (k in s && !objectish(s[k])) s[k] = null;
     }
+    // XERK-1569: ticket.outcome (TicketRef.outcome on Android), named coercion.
+    if (objectish(s.ticket)) coerceTicketOutcome(s.ticket);
     // git.dirtyFiles is a non-null Int inside that block; work's aheadOfBase/
     // aheadOfRemote are Int? and pushed a Boolean? — a well-shaped block with a
     // wrong-typed leaf survives the shape check above, so coerce the leaves too.
@@ -13095,10 +13139,11 @@ function dedupeLinkSweep() {
 //
 // UNLIKE auto-start, this is UNCONDITIONAL — it is NOT gated on the per-org
 // "auto" opt-in (orgsWithAutoStart), which governs ONLY whether the hub
-// auto-STARTS work (XERK-161). A ticket only reaches Done by a HUMAN moving it
-// (the board is pull-only — no session writes to Jira), so it's a deliberate
-// "this work is finished" signal that should always retire its session, whatever
-// the org's auto-start preference. So this sweep runs for EVERY org that reports
+// auto-STARTS work (XERK-161). A ticket reaches Done by a human moving it, or by
+// the session working it closing it itself once its work is verified (the
+// auto-close message, XERK-705; a stale bug's close-ticket, XERK-1569) — either
+// way a deliberate "this work is finished" signal that should always retire its
+// session, whatever the org's auto-start preference. So this sweep runs for EVERY org that reports
 // a board block. It can only ever touch a session that was spawned to WORK a
 // ticket (s.ticket is set) whose key now reads Done on the board — a
 // manually-started session carries no ticket and is never affected.
@@ -13433,8 +13478,10 @@ function autoCloseMergedMessage(urls) {
     + "branch — auto-merge squashes it) and open a follow-up PR from this session — it "
     + "will be auto-merged the same way and you will be asked to verify again. "
     + "If it IS deployed and working and all the work for this ticket is done, "
-    + "mark the ticket as Done (move it to the Done column) so this session can "
-    + "wrap up.";
+    + "mark the ticket as Done so this session can wrap up — prefer "
+    + "`python3 -SsE \"$TURMA_SESSION_CLI\" close-ticket done --note '<what you verified>'` "
+    + "(it comments the evidence and records the outcome on the board), else the "
+    + "tracker CLI/MCP this host gives you.";
 }
 // "<siteKey>\x00<epicKey>" epics already written to Done by epicRunCompleteSweep,
 // so the epic-Done write fires at most once per hub lifetime. The DURABLE guard is
@@ -16041,6 +16088,9 @@ const server = http.createServer(async (req, res) => {
       // linked (or human-removed) pair is not re-queued every 15s.
       const ticketLinkResults = payload.ticketLinkResults;
       delete payload.ticketLinkResults;
+      // A session closing its own ticket (XERK-1569) — logged below, never kept.
+      const ticketOutcomeResults = payload.ticketOutcomeResults;
+      delete payload.ticketOutcomeResults;
       // PR auto-merge outcomes (XERK-550) — cached by cmdId below like the
       // status/priority results, and read by autoMergeSweep to stop retrying a
       // PR the agent's `gh pr merge` refused (branch protection, review required,
@@ -16300,6 +16350,7 @@ const server = http.createServer(async (req, res) => {
       ingestStatusResults(next, ticketStatusResults);
       ingestPriorityResults(next, ticketPriorityResults);
       ingestTicketLinkResults(next, ticketLinkResults);
+      logTicketOutcomes(key, ticketOutcomeResults);
       ingestMergeResults(next, mergePrResults);
       ingestCreateMeta(next, createMetaResults);
       ingestCreateResults(next, createTicketResults);

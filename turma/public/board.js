@@ -1304,6 +1304,17 @@
   //   - no transcript at all -> not a link. A session killed before its first
   //     turn has no conversation to open, and an <a> to nothing is worse than
   //     plain text saying so.
+  // Why a session closed its OWN ticket (XERK-1569): the agent stamps
+  // `ticket.outcome = {kind, at}` when the session's `close-ticket` lands. Only
+  // the two kinds that say something the Done column does not get words — a
+  // plain `done` is what the column already shows. "" = nothing to say.
+  function ticketOutcomeLabel(s) {
+    const o = s && s.ticket && s.ticket.outcome;
+    const kind = o && o.kind;
+    return kind === "not-reproducible" ? "closed: not reproducible"
+      : kind === "already-fixed" ? "closed: already fixed" : "";
+  }
+
   function sessionChipHtml(s) {
     const branch = (s.git && s.git.branch) || (s.ticket && s.ticket.branch);
     const renamed = s.summaryManual ? s.summary : null;
@@ -1313,8 +1324,12 @@
     const state = s.status === "error" ? "failed"
       : s.status === "queued" ? "queued"
       : (stopped ? "stopped" : "running");
-    const tip = [s.summary || s.label, branch && branch !== label ? "branch " + branch : "", state]
-      .filter(Boolean).join(" · ");
+    const why = ticketOutcomeLabel(s);
+    const tip = [s.summary || s.label, branch && branch !== label ? "branch " + branch : "",
+      state, why].filter(Boolean).join(" · ");
+    // The outcome rides BESIDE the chip, not inside it: the chip's label already
+    // ellipsises at 22ch and the reason must read whole.
+    const after = why ? `<span class="kc-sess-why">${esc(why)}</span>` : "";
     const cls = "kc-sess" + (s.status === "error" ? " kc-sess-err" : stopped ? " kc-sess-off" : "");
     // The label is its own element so it can ellipsise: .kc-sess is a flex
     // container, and text-overflow can't touch anonymous flex content — it would
@@ -1325,9 +1340,9 @@
       : (s.transcriptId ? `/sessions?ended=${encodeURIComponent(s.transcriptId)}` : null);
     if (!href) {
       return `<span class="${cls}" title="${esc(tip ? tip + " · no conversation" : label)}"
-        >${body}</span>`;
+        >${body}</span>${after}`;
     }
-    return `<a class="${cls}" href="${href}" title="${esc(tip || label)}">${body}</a>`;
+    return `<a class="${cls}" href="${href}" title="${esc(tip || label)}">${body}</a>${after}`;
   }
 
   // The card's session control: its sessions, plus the button that starts one.
@@ -2560,7 +2575,7 @@
     boardFilterPanelHtml, boardFilterChipsHtml, boardSortMenuHtml, sortLabel,
     epicBuilderRows, epicBuilderStateLabel, epicBuilderProgressHtml, epicBuilderComposerHtml,
     boardColumnOf, moveSweepVerdict,
-    ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
+    ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketOutcomeLabel, ticketStartHtml,
     queuedTicketOf, queuedLabel, queuedTip,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed, startSweepVerdict,
   };

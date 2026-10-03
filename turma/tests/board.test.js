@@ -24,7 +24,7 @@ const {
   epicCardControlHtml, epicRunPanelHtml,
   epicBuilderRows, epicBuilderStateLabel, epicBuilderProgressHtml, epicBuilderComposerHtml,
   boardColumnOf, moveSweepVerdict,
-  ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
+  ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketOutcomeLabel, ticketStartHtml,
   queuedTicketOf, queuedTip,
   startSweepVerdict,
   createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
@@ -1829,6 +1829,31 @@ test("sessionChipHtml: anything not running opens the READ-ONLY view", () => {
     assert.ok(html.includes(`href="/sessions?ended=tr1"`), html);
     assert.ok(!html.includes("?session="), html);
   }
+});
+
+test("XERK-1569: a session that closed its own ticket says why beside its chip", () => {
+  const closed = (kind, over = {}) => tsess("s1", "X-1", {
+    status: "stopped", transcriptId: "tr1",
+    ticket: { key: "X-1", siteKey: "myorg.atlassian.net", branch: "X-1",
+              outcome: { kind, at: 1786400000000 } },
+    ...over,
+  });
+  const nr = sessionChipHtml(closed("not-reproducible"));
+  assert.ok(nr.includes('<span class="kc-sess-why">closed: not reproducible</span>'), nr);
+  assert.ok(nr.includes("· closed: not reproducible"), "and in the tooltip");
+  assert.ok(nr.includes(`href="/sessions?ended=tr1"`), "the chip still links");
+  const af = sessionChipHtml(closed("already-fixed"));
+  assert.ok(af.includes(">closed: already fixed</span>"), af);
+  // A plain `done` is what the Done column already says; an unknown kind or no
+  // outcome at all adds nothing.
+  for (const s of [closed("done"), closed("wontfix"), tsess("s1", "X-1", { status: "stopped" })]) {
+    assert.ok(!sessionChipHtml(s).includes("kc-sess-why"), JSON.stringify(s.ticket));
+  }
+  // A chip with no conversation still says why.
+  assert.ok(sessionChipHtml(closed("not-reproducible", { transcriptId: undefined }))
+    .includes("closed: not reproducible"));
+  assert.equal(ticketOutcomeLabel({}), "");
+  assert.equal(ticketOutcomeLabel({ ticket: { outcome: "not-reproducible" } }), "");
 });
 
 test("sessionChipHtml: a session with no conversation is not a link", () => {

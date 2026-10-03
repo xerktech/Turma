@@ -17328,6 +17328,303 @@ class TestWakeRequest(ManagerMixin, unittest.TestCase):
         self.assertIsNone(ha.read_wake_request(self.SID)["wakeReason"])
 
 
+class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
+    """XERK-1569: a session's `session_cli.py close-ticket` file is read by a
+    WORKER (tracker HTTP off the beat), which comments the evidence and moves the
+    ticket to a Done-category status; the BEAT then stamps `ticket.outcome` on the
+    record and the ticket ledger and stages `ticketOutcomeResults`."""
+
+    SID = "abcde"
+    KEY = "ENG-9"
+    SITE = "s.atlassian.net"
+    OPTS = [{"id": "11", "name": "In Progress", "category": "inprogress"},
+            {"id": "31", "name": "Done", "category": "done"}]
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.multiple(ha, JIRA_SITE=self.SITE, JIRA_EMAIL="e",
+                                JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN="")
+        p.start()
+        self.addCleanup(p.stop)
+        self.calls = []        # (path, body) per jira_req
+        self.fail_paths = {}   # path suffix -> how many more calls to fail
+
+        def fake_req(path, params, body=None):
+            self.calls.append((path, body))
+            for suffix, n in list(self.fail_paths.items()):
+                if path.endswith(suffix) and n > 0:
+                    self.fail_paths[suffix] = n - 1
+                    raise ha.BoardHttpError("HTTP 500: tracker down", 500)
+            return {}
+        p2 = mock.patch.object(ha, "jira_req", fake_req)
+        p2.start()
+        self.addCleanup(p2.stop)
+        p3 = mock.patch.object(ha, "board_status_options", lambda key: list(self.OPTS))
+        p3.start()
+        self.addCleanup(p3.stop)
+
+    def _sess(self, sm, **over):
+        sess = {"id": self.SID, "status": "running", "repo": "Turma",
+                "repoPath": "/w/Turma", "worktreePath": os.path.join(self.tmp, "wt"),
+                "rcName": "rc", "tmuxName": f"agent-{self.SID}",
+                "claudeSessionId": "22222222-2222-4222-8222-222222222222",
+                "ticket": {"key": self.KEY, "siteKey": self.SITE, "branch": self.KEY,
+                           "url": f"https://{self.SITE}/browse/{self.KEY}", "summary": "s"}}
+        sess.update(over)
+        sm.registry = [sess]
+        return sess
+
+    def _path(self):
+        return os.path.join(ha.SESSION_REQUESTS_DIR, self.SID, "close-ticket.json")
+
+    def _write(self, data):
+        os.makedirs(os.path.dirname(self._path()), exist_ok=True)
+        with open(self._path(), "w") as fh:
+            json.dump(data, fh)
+
+    def _req(self, resolution="not-reproducible", note="ran repro.sh on main: passes",
+             at=1_786_400_000_000):
+        self._write({"resolution": resolution, "note": note, "requestedAt": at})
+
+    def _comments(self):
+        return [b for p, b in self.calls if p.endswith("/comment")]
+
+    def _transitions(self):
+        return [b for p, b in self.calls if p.endswith("/transitions")]
+
+    def test_the_file_becomes_a_comment_and_done_then_the_beat_stamps_the_outcome(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)      # the WORKER pass
+        self.assertEqual(self.calls[0][0], f"/rest/api/3/issue/{self.KEY}/comment")
+        adf = json.dumps(self._comments()[0])
+        self.assertIn("not reproducible", adf)
+        self.assertIn("ran repro.sh on main: passes", adf)
+        self.assertEqual(self._transitions(), [{"transition": {"id": "31"}}])
+        self.assertFalse(os.path.exists(self._path()))
+        # The worker wrote nothing to the registry — that is the beat's.
+        self.assertNotIn("outcome", sess["ticket"])
+        sm._apply_closed_tickets()
+        self.assertEqual(sess["ticket"]["outcome"],
+                         {"kind": "not-reproducible", "at": 1_000_000})
+        entry = sm.ticket_ledger[sess["claudeSessionId"]]
+        self.assertEqual(entry["outcome"], {"kind": "not-reproducible", "at": 1_000_000})
+        with open(ha.TICKET_LEDGER_PATH) as fh:      # persisted, not just in memory
+            self.assertEqual(json.load(fh)[sess["claudeSessionId"]]["outcome"]["kind"],
+                             "not-reproducible")
+        [r] = sm.ticket_outcome_results
+        self.assertEqual((r["sessionId"], r["key"], r["kind"], r["ok"], r["status"]),
+                         (self.SID, self.KEY, "not-reproducible", True, "Done"))
+        # The served ticket carries it, so the board can say why.
+        self.assertEqual(ha._served_ticket(sess)["outcome"]["kind"], "not-reproducible")
+        # A later pass finds nothing to do.
+        sm._process_close_ticket_requests(now=2000.0)
+        self.assertEqual(len(self._comments()), 1)
+
+    def test_a_board_that_names_not_reproducible_is_mapped_to_it(self):
+        named = {"id": "41", "name": "Cannot Reproduce", "category": "done"}
+        opts = self.OPTS + [named]
+        self.assertEqual(ha._close_ticket_option(opts, "not-reproducible"), named)
+        # Only for that kind, and only a Done-category one.
+        self.assertEqual(ha._close_ticket_option(opts, "already-fixed")["id"], "31")
+        self.assertEqual(ha._close_ticket_option(opts, "done")["id"], "31")
+        odd = [{"id": "9", "name": "Not reproducible yet", "category": "inprogress"}]
+        self.assertEqual(ha._close_ticket_option(self.OPTS + odd, "not-reproducible")["id"], "31")
+        self.assertIsNone(ha._close_ticket_option(self.OPTS[:1], "done"))
+
+    def test_bad_requests_are_refused_without_tracker_http(self):
+        for bad in ({"resolution": "wontfix", "note": "n"},
+                    {"resolution": "done", "note": "   "},
+                    {"resolution": "done"},
+                    {"resolution": "done", "note": "x" * (ha.CLOSE_TICKET_NOTE_MAX + 1)},
+                    {"resolution": ["done"], "note": "n"}):
+            with self.subTest(bad=bad):
+                sm = self.make_manager()
+                sess = self._sess(sm)
+                self.calls.clear()
+                self._write(bad)
+                self.assertIn("error", ha.read_close_ticket_request(self.SID))
+                sm._process_close_ticket_requests(now=1000.0)
+                self.assertEqual(self.calls, [])
+                self.assertFalse(os.path.exists(self._path()))   # dropped, never re-read
+                sm._apply_closed_tickets()
+                [r] = sm.ticket_outcome_results
+                self.assertFalse(r["ok"])
+                self.assertTrue(r["final"])
+                self.assertIn("refused", r["error"])
+                self.assertNotIn("outcome", sess["ticket"])
+        # The note bound is inclusive.
+        self._write({"resolution": "done", "note": "x" * ha.CLOSE_TICKET_NOTE_MAX})
+        self.assertNotIn("error", ha.read_close_ticket_request(self.SID))
+
+    def test_a_fifo_or_symlink_at_the_name_is_refused_and_never_blocks(self):
+        sm = self.make_manager()
+        self._sess(sm)
+        os.makedirs(os.path.dirname(self._path()), exist_ok=True)
+        os.mkfifo(self._path())
+        self.assertIsNone(ha.read_close_ticket_request(self.SID))
+        sm._process_close_ticket_requests(now=1000.0)       # returns, no HTTP
+        self.assertEqual(self.calls, [])
+        os.remove(self._path())
+        real = os.path.join(self.tmp, "real.json")
+        with open(real, "w") as fh:
+            json.dump({"resolution": "done", "note": "n"}, fh)
+        os.symlink(real, self._path())
+        self.assertIsNone(ha.read_close_ticket_request(self.SID))
+        sm._process_close_ticket_requests(now=1000.0)
+        self.assertEqual(self.calls, [])
+
+    def test_a_failure_is_staged_and_retried_once_without_reposting_the_comment(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        self.fail_paths["/transitions"] = 1
+        sm._process_close_ticket_requests(now=1000.0)
+        self.assertTrue(os.path.exists(self._path()))      # left for the retry
+        sm._apply_closed_tickets()
+        [r] = sm.ticket_outcome_results
+        self.assertEqual((r["ok"], r["final"]), (False, False))
+        self.assertIn("tracker down", r["error"])
+        # Not before the retry delay.
+        sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC - 1)
+        self.assertEqual(len(self._transitions()), 1)
+        sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC)
+        self.assertEqual(len(self._comments()), 1)        # the comment landed once
+        self.assertEqual(len(self._transitions()), 2)
+        self.assertFalse(os.path.exists(self._path()))
+        sm._apply_closed_tickets()
+        self.assertTrue(sm.ticket_outcome_results[-1]["ok"])
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "not-reproducible")
+
+    def test_a_request_that_fails_twice_is_dropped_with_a_final_error(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        self.fail_paths["/comment"] = 5
+        for t in (1000.0, 1000.0 + ha.CLOSE_TICKET_RETRY_SEC, 5000.0, 9000.0):
+            sm._process_close_ticket_requests(now=t)
+        self.assertEqual(len(self._comments()), ha.CLOSE_TICKET_ATTEMPTS)
+        self.assertFalse(os.path.exists(self._path()))
+        sm._apply_closed_tickets()
+        self.assertEqual([r["final"] for r in sm.ticket_outcome_results], [False, True])
+        self.assertNotIn("outcome", sess["ticket"])
+
+    def test_only_a_running_claude_session_with_a_ticket_is_served(self):
+        for over in ({"agentType": "dsh"}, {"agentType": "qwen"}, {"status": "stopped"},
+                     {"ticket": None}, {"ticket": {"key": ""}}):
+            with self.subTest(over=over):
+                sm = self.make_manager()
+                self._sess(sm, **over)
+                self._req()
+                sm._process_close_ticket_requests(now=1000.0)
+                self.assertEqual(self.calls, [])
+                self.assertTrue(os.path.exists(self._path()))    # untouched
+
+    def test_a_ticket_from_another_board_is_refused(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        sess["ticket"]["siteKey"] = "other.atlassian.net"
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        self.assertEqual(self.calls, [])
+        sm._apply_closed_tickets()
+        self.assertIn("not on this host's board", sm.ticket_outcome_results[0]["error"])
+
+    def test_the_beat_applies_what_the_worker_landed_and_wakes_it_off_the_beat(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        # No real tmux here: keep the dead-session sweep from ending the session.
+        p = mock.patch.object(sm, "_sweep_dead_sessions")
+        p.start()
+        self.addCleanup(p.stop)
+        # The beat itself makes no tracker call: it only wakes the worker.
+        with mock.patch.object(sm, "_stage_close_ticket_work") as stage:
+            payload = sm.build_payload(1)
+        stage.assert_called_once()
+        self.assertEqual(self.calls, [])
+        self.assertNotIn("ticketOutcomeResults", payload)
+        with mock.patch.object(sm, "_stage_close_ticket_work") as stage:
+            sm.build_payload(2, light=True)
+        stage.assert_not_called()                 # a light beat does not
+        sm._process_close_ticket_requests(now=1000.0)    # the worker pass
+        with mock.patch.object(sm, "_stage_close_ticket_work"):
+            payload = sm.build_payload(3)
+        self.assertEqual(payload["ticketOutcomeResults"][0]["kind"], "not-reproducible")
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "not-reproducible")
+        # Delivered results are cleared with the rest of the staged work.
+        sm._clear_delivered_staged(payload)
+        self.assertEqual(sm.ticket_outcome_results, [])
+
+    def test_the_worker_starts_once_and_a_failed_start_never_raises(self):
+        sm = self.make_manager()
+        with mock.patch.object(sm, "_close_ticket_worker_loop"):
+            sm._stage_close_ticket_work()
+            first = sm._close_ticket_worker
+            first.join(1)
+        with mock.patch.object(ha.threading.Thread, "start",
+                               side_effect=RuntimeError("can't start new thread")):
+            sm._stage_close_ticket_work()          # logged, never raised onto the beat
+        self.assertIsNot(sm._close_ticket_worker, first)
+
+    def test_an_azure_comment_posts_escaped_html_to_the_work_item(self):
+        seen = []
+
+        def fake_azure(path, params, body=None, method=None, content_type="application/json"):
+            seen.append((path, params, body))
+            return {"fields": {"System.TeamProject": "Proj One"}} if body is None else {}
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org", AZDO_TOKEN="p",
+                                 JIRA_SITE=""), \
+                mock.patch.object(ha, "azure_req", fake_azure):
+            ha.add_board_comment("42", "a <b>\nline two")
+        self.assertEqual(seen[1][0], "/Proj%20One/_apis/wit/workItems/42/comments")
+        self.assertEqual(seen[1][2], {"text": "a &lt;b&gt;<br>line two"})
+
+
+class TestTicketClosingDirectives(ManagerMixin, unittest.TestCase):
+    """XERK-1569: a ticket session is told to close its own ticket — the bug
+    directive and the appended system prompt name the session CLI first; a
+    dsh/qwen session (no CLI yet) is not taught it."""
+
+    CLI = 'python3 -SsE "$TURMA_SESSION_CLI" close-ticket'
+
+    def test_the_bug_directive_closes_a_stale_bug_with_the_cli(self):
+        p = ha.build_ticket_prompt({"key": "P-1", "type": "Bug"})
+        self.assertIn(self.CLI + " not-reproducible --note", p)
+        self.assertIn("else the tracker CLI/MCP this host gives you", p)
+        self.assertIn("end the turn: no PR, no question", p)
+        self.assertNotIn("so it can be closed", p)
+
+    def test_a_runtime_without_the_cli_keeps_the_report_wording(self):
+        p = ha.build_ticket_prompt({"key": "P-1", "type": "Bug"}, session_cli=False)
+        self.assertNotIn("TURMA_SESSION_CLI", p)
+        self.assertIn("so it can be closed", p)
+        self.assertIn("STOP", p)
+
+    def test_the_session_directive_restates_both_rules_for_a_ticket_key(self):
+        sm = self.make_manager()
+        # No branch yet (a deferred reservation) — the key alone is the gate.
+        d = sm._session_directive({"id": "s1", "ticket": {"key": "P-7", "branch": None}})
+        self.assertIn("Closing ticket P-7 is this session's job", d)
+        self.assertIn(self.CLI + " not-reproducible --note", d)
+        self.assertIn(self.CLI + " done --note", d)
+        self.assertNotIn("Name the branch you create", d)
+
+    def test_no_ticket_or_a_dsh_qwen_session_gets_no_close_paragraph(self):
+        sm = self.make_manager()
+        for sess in ({"id": "s1"}, {"id": "s1", "ticket": None},
+                     {"id": "s1", "ticket": {"key": "P-7"}, "agentType": "dsh"},
+                     {"id": "s1", "ticket": {"key": "P-7"}, "agentType": "qwen"}):
+            with self.subTest(sess=sess):
+                d = sm._session_directive(sess)
+                self.assertNotIn("TURMA_SESSION_CLI", d)
+                self.assertNotIn("Closing ticket", d)
+
+    def test_the_branch_prompt_no_longer_promises_the_first_message(self):
+        self.assertNotIn("whose full text is in your first", ha.TICKET_BRANCH_PROMPT)
+
+
 class TestAnswerQuestion(ManagerMixin, unittest.TestCase):
     """answer_question drops the ask.py bridge's answer file — only when a
     request file is actually pending for that session."""

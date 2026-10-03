@@ -128,6 +128,7 @@ import com.xerktech.turma.core.overdueOf
 import com.xerktech.turma.core.prioClass
 import com.xerktech.turma.core.rateMaxError
 import com.xerktech.turma.core.splitLabels
+import com.xerktech.turma.core.ticketOutcomeLabel
 import com.xerktech.turma.core.ticketSessionIndex
 import com.xerktech.turma.core.ticketSessionLabel
 import com.xerktech.turma.core.ticketSessionState
@@ -751,7 +752,15 @@ private fun TicketCard(
                 } else if (!t.epicKey.isNullOrBlank()) {
                     Pill("⧉ ${t.epicKey}", dashed = true, mono = true)
                 }
-                sessions.forEach { s -> TicketSessionChip(s, onClick = { onOpenSession(s) }) }
+                sessions.forEach { s ->
+                    TicketSessionChip(s, onClick = { onOpenSession(s) })
+                    // Why the session closed its own ticket (XERK-1569), beside its
+                    // chip like web's .kc-sess-why.
+                    val why = ticketOutcomeLabel(s.outcome)
+                    if (why.isNotEmpty()) {
+                        Text(why, style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace, fontStyle = FontStyle.Italic, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
                 // An epic never offers the ordinary per-ticket Start — the epic-run
                 // control takes its place: Start-epic when unarmed, else a
                 // state-tinted progress chip (the card tap opens the full panel).

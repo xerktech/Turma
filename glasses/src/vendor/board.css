@@ -135,6 +135,11 @@
 .kc-sess.kc-sess-off .kc-sess-dot { background: var(--muted); }
 .kc-sess.kc-sess-err { color: var(--critical); border-color: var(--critical); }
 .kc-sess.kc-sess-err .kc-sess-dot { background: var(--critical); }
+/* Why a session closed its own ticket (XERK-1569), beside its chip. */
+.kc-sess-why {
+  color: var(--muted); font-family: var(--font-mono); font-size: 10.5px;
+  font-style: italic; white-space: nowrap; vertical-align: middle;
+}
 .kc-org {
   display: inline-flex; align-items: center; gap: 5px;
   color: var(--muted); font-family: var(--font-mono); font-size: 10.5px;

@@ -62,6 +62,13 @@ machinery is in `.claude/rules/turma-board.md`.
   green, hold amber, reject red. The detail panel's **Triage row** (`triageFieldHtml` +
   `triagePickerHtml`, `data-triage-select`) follows the row-picker pattern: "Change" swaps the
   row for the picker, choosing an option IS the save, "Auto" is the release.
+- **A session that closed its OWN ticket says why beside its chip** (XERK-1569): `board.js`
+  `ticketOutcomeLabel` reads `session.ticket.outcome.kind` (hub-coerced `coerceTicketOutcome`) and
+  `sessionChipHtml` appends `.kc-sess-why` "closed: not reproducible" / "closed: already fixed" (a
+  plain `done` adds nothing — the column says it). Mirrors: vendored `board.cjs` (+ its `board.css`)
+  and Android `ticketOutcomeLabel`/`TicketSession.outcome` in `Board.kt`, rendered in
+  `BoardScreen.kt`; `TicketRef.outcome` is typed there. Tests: `XERK-1569` in `board.test.js`,
+  `BoardTest.kt`, `AgentDecodeTest`.
 - **The org triage-policy modal's DOM ids are `triageRules*`, NEVER `policy*`** (XERK-587). EasyList
   ships an exact-id cosmetic rule `###policyPanel` (an unrelated site's cookie/policy popup), so a
   bare `#policyPanel` is hidden by a user-origin `display:none !important` under Brave Shields /

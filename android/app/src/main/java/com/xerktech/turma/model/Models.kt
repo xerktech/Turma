@@ -549,6 +549,15 @@ data class TicketRef(
     val url: String = "",
     val summary: String = "",
     val branch: String? = null,
+    // How the session closed this ticket itself (XERK-1569); null = it didn't.
+    // The hub coerces it by name (coerceTicketOutcome), or deletes it.
+    val outcome: TicketOutcome? = null,
+)
+
+/** A ticket's self-close outcome (`ticket.outcome`): done | not-reproducible | already-fixed. */
+@Serializable
+data class TicketOutcome(
+    val kind: String = "",
 )
 
 // ---- Jira board (the agent's `jira` heartbeat block; see hub-agent collect_jira) --

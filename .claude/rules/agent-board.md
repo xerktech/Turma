@@ -34,7 +34,8 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
   unchanged.
 - Unset creds = feature off, **zero tracker HTTP**, `available:False`. **Nothing writes to the
   tracker except the operator's own create (XERK-137), status change (XERK-138), the hub-driven
-  triage priority write-back (XERK-483), and hub-driven duplicate linking (XERK-484).**
+  triage priority write-back (XERK-483), hub-driven duplicate linking (XERK-484), and a session
+  closing its OWN ticket (XERK-1569: evidence comment + Done, below).**
 - **On-demand issue detail**: a `{type:"jiraIssue", issueKey}` command (allowlist-checked against
   the key grammar) calls `fetch_jira_issue`/`fetch_azure_issue`, staging onto `jiraIssueResults`.
   **Every failure path stages a result carrying an `error` instead of raising**; an ADO
@@ -116,6 +117,18 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
   org's `jira_priority_options()` or the command refuses with the missing name; ADO path analogous.
   Same staged-result / never-raise discipline as `set_board_status` (keyed by cmdId on
   `ticket_priority_results`). Tests: `TestSetTicketPriority`.
+- **The fifth write: a session closes its own ticket** (XERK-1569). `close-ticket.json` (written by
+  the session CLI, read by `read_close_ticket_request`; reader mechanics in `agent-session-cli.md`)
+  makes the manager `add_board_comment` the evidence (Jira `POST /issue/<key>/comment` as ADF; ADO
+  the project-scoped comments endpoint, HTML-escaped), then `apply_board_status` to
+  `_close_ticket_option` — a Done-column option, re-read fresh like `set_board_status`; for
+  `not-reproducible` a Done-category option NAMED so (`_NOT_REPRO_STATUS_RE`) wins.
+  - Only for a RUNNING Claude session whose `ticket.siteKey` is this host's board; dsh/qwen skipped.
+  - Success stamps **`ticket.outcome = {kind, at}`** on the record (served via `_served_ticket`)
+    AND its `_remember_ticket` ledger entry (added only when present), so `repos[].resumable`
+    carries it after the record ages out. The hub coerces it (`coerceTicketOutcome`).
+  - Results ride `ticketOutcomeResults` (`ticket_outcome_results`, keyed by sessionId + key — no
+    cmdId, a session asked); the hub only logs them. Tests: `TestCloseTicketRequest`.
 - Tests: `TestSetBoardStatus`, `TestAzureStatusOptions`, `TestCreateAzureIssue`,
   `TestAzure*Identit*`, `TestHttpErrorDetail`, `TestBoardColumn`.
 
@@ -230,15 +243,19 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
   own, so that text is all it sees.
 - **A BUG-typed ticket's prompt tells the session to verify the bug is still real FIRST** (XERK-370,
   `_ticket_is_bug` + `TICKET_BUG_VERIFY_DIRECTIVE`): reproduce it against the up-to-date default
-  branch before changing anything, and STOP (report + evidence, no code change, no PR) if it's
-  already fixed/unreproducible — the prompt is a spawn-time snapshot and the bug may be stale. `type`
+  branch before changing anything, and STOP (no code change, no PR) if it's already
+  fixed/unreproducible — then comment the evidence and CLOSE it itself (XERK-1569:
+  `TICKET_CLOSE_STALE_CLAUSE`, the session CLI's `close-ticket` first, the host's tracker CLI/MCP
+  as fallback; a dsh/qwen session, with no CLI, keeps "say so so it can be closed"). The prompt is a
+  spawn-time snapshot and the bug may be stale. `_session_directive` restates it
+  (`TICKET_CLOSE_PROMPT`, gated on `ticket.key`) so it survives a clear-context restart. `type`
   is the tracker's own issue-type name (Jira `issuetype` / Azure `System.WorkItemType`), matched
   loosely on `bug`/`defect`. The directive sits just ahead of the generic "start by..." close so it
   reads as step one. Tests: the bug cases in `TestBuildTicketPrompt`.
 - **A ticket's own attachments come with it** (XERK-242): downloaded into the uploads tree on
   XERK-234's terms, paths named in the prompt (`ticket_detail=`, not `prompt=`). Tests:
   `TestStoreTicketAttachments`.
-- `ticket` = `{key, siteKey, url, summary, branch}` on the record, persisted and heartbeated,
+- `ticket` = `{key, siteKey, url, summary, branch, outcome?}` on the record, persisted and heartbeated,
   surviving kill/resume. **That record IS the ticket ↔ session link** — no hub-side ticket store;
   the board reverse-indexes the fleet payload.
 - The record only answers **while it exists**; a durable `transcriptId → ticket` ledger
