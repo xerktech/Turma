@@ -68,9 +68,9 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
 });
 
 test("XERK-757: asFlagMap keeps only truthy keys as true; asPlainObject keeps objects", () => {
-  assert.deepEqual(X.asFlagMap({ a: true, b: 1, c: 0, d: false, e: "x" }), { a: true, b: true, e: true });
-  assert.deepEqual(X.asFlagMap(["a"]), {});
-  assert.deepEqual(X.asFlagMap(null), {});
+  assert.deepEqual({ ...X.asFlagMap({ a: true, b: 1, c: 0, d: false, e: "x" }) }, { a: true, b: true, e: true });
+  assert.deepEqual({ ...X.asFlagMap(["a"]) }, {});
+  assert.deepEqual({ ...X.asFlagMap(null) }, {});
   assert.deepEqual(X.asPlainObject({ k: { v: 1 } }), { k: { v: 1 } });
   assert.deepEqual(X.asPlainObject([1, 2]), {});
   assert.deepEqual(X.asPlainObject(7), {});
@@ -84,13 +84,13 @@ test("XERK-757: applyExternalStoreValue installs a change, dedups an echo, coerc
   };
   // A genuine change installs and returns true.
   assert.equal(X.applyExternalStoreValue(desc, { org1: true }), true);
-  assert.deepEqual(mirror, { org1: true });
+  assert.deepEqual({ ...mirror }, { org1: true });
   // The same value again (our own write's echo) is a no-op.
   assert.equal(X.applyExternalStoreValue(desc, { org1: true }), false);
-  assert.deepEqual(mirror, { org1: true });
+  assert.deepEqual({ ...mirror }, { org1: true });
   // A malformed remote value is coerced by the store's own whitelist.
   assert.equal(X.applyExternalStoreValue(desc, { org1: true, junk: 0, bad: false }), false);
-  assert.deepEqual(mirror, { org1: true });
+  assert.deepEqual({ ...mirror }, { org1: true });
 });
 
 test("XERK-757: persist writes byte-identical JSON through the file backend", async () => {
@@ -130,7 +130,7 @@ test("XERK-757: a change on one replica reaches another via the shared backend's
   mirrorA = { "acme.atlassian.net": true };
   await store.set(descA.key, mirrorA);   // FileLiveStore fires BOTH watchers
 
-  assert.deepEqual(mirrorB, { "acme.atlassian.net": true }, "B saw A's change");
+  assert.deepEqual({ ...mirrorB }, { "acme.atlassian.net": true }, "B saw A's change");
   assert.deepEqual(mirrorA, { "acme.atlassian.net": true }, "A's own echo left it unchanged");
   store.close();
 });
@@ -296,4 +296,53 @@ test("XERK-769: boot adopts a stored epicBuilders value; a fresh store is SEEDED
   assert.equal(after["remote1"].title, "adopted");
   assert.equal(after[seeded.id], undefined, "adopting the store replaces the primed mirror");
   store.close();
+});
+
+test("XERK-1451: an org named __proto__ is STORED in every org-keyed map, set and restore", () => {
+  // These maps are null-prototype: on a plain object `m["__proto__"] = v` sets the
+  // prototype instead of an entry, so the write was a silent no-op (served `{}`,
+  // nothing persisted) and a restored file lost the key the same way.
+  const read = (name) => X.list().find((d) => d.name === name);
+  srv.setTriagePolicy("__proto__", { repoDeny: ["*"], minPriority: "P0" });
+  srv.setAutoStartOrg("__proto__", true);
+  srv.setAutoMergeOrg("__proto__", true);
+  srv.setPriorityWriteBackOrg("__proto__", true);
+  srv.setDedupeLinkOrg("__proto__", true);
+  srv.setOrgColor("__proto__", 3);
+  srv.setRepoTier("__proto__", "live");
+  const want = {
+    triagePolicies: { minPriority: "P0", repoDeny: ["*"] },
+    autoStartOrgs: true, autoMergeOrgs: true, priorityWriteBackOrgs: true,
+    dedupeLinkOrgs: true, orgColors: 3, repoTiers: "live",
+  };
+  for (const [name, v] of Object.entries(want)) {
+    const desc = read(name);
+    const mirror = desc.read();
+    assert.ok(Object.hasOwn(mirror, "__proto__"), `${name}: the write landed as an entry`);
+    assert.deepEqual(mirror["__proto__"], v, `${name}: with its value`);
+    // The serialized form (file + store + /api/agents) carries it, and a restore
+    // of that JSON (coerce over JSON.parse, which makes an OWN __proto__) keeps it.
+    const restored = desc.coerce(JSON.parse(JSON.stringify(mirror)));
+    assert.deepEqual(restored["__proto__"], v, `${name}: survives a restore`);
+  }
+  // Clean up global state.
+  srv.setTriagePolicy("__proto__", { repoDeny: null, minPriority: null });
+  srv.setAutoStartOrg("__proto__", false);
+  srv.setAutoMergeOrg("__proto__", false);
+  srv.setPriorityWriteBackOrg("__proto__", false);
+  srv.setDedupeLinkOrg("__proto__", false);
+  srv.setOrgColor("__proto__", null);
+  srv.setRepoTier("__proto__", "active");
+});
+
+test("XERK-1451: an org named like an Object.prototype member is not read as enabled", () => {
+  // On a plain object autoStartOrgs["constructor"] is Object (truthy), so an org
+  // named "constructor"/"toString" read as auto-start/auto-merge ON with no opt-in.
+  for (const name of ["autoStartOrgs", "autoMergeOrgs", "orgColors", "triagePolicies", "repoTiers"]) {
+    const m = X.list().find((d) => d.name === name).read();
+    for (const k of ["constructor", "toString", "hasOwnProperty"]) {
+      assert.equal(m[k], undefined, `${name}[${k}] reads as unset`);
+    }
+  }
+  assert.equal(srv.repoTier("constructor"), "active", "an unset repo named constructor is the default tier");
 });

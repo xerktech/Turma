@@ -311,6 +311,11 @@ retraction, `pushEnabled`.
   - `controlChannels`/`pendingChannels` are **null-prototype** — a wire key of `__proto__` on a plain
     object read back as `Object.prototype` (truthy), passing a pending-channel check and killing the
     hub on the next property access.
+  - **The org/repo-keyed policy maps are null-prototype too** (XERK-1451: `autoStartOrgs`,
+    `autoMergeOrgs`, `triagePolicies`, `priorityWriteBackOrgs`, `dedupeLinkOrgs`, `orgColors`,
+    `repoTiers`), and so is what their COERCE returns — every restore/watch install replaces the
+    map with it. On a plain object an org named `__proto__` silently lost writes and one named
+    `constructor` read as opted-in. `applyRemoteAgent` gates on `isPlainHostKey` like every path.
   - `ttydAuth(host)` sends the token that host's ttyd is ACTUALLY running (`tokenBound`), so a
     half-rolled fleet keeps every terminal working; hub-derived, stripped from the fleet payload.
   - **ttyd's `/token` returns that same credential** (ttyd echoes its `-c term:<token>` basic-auth as
