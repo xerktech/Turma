@@ -11836,11 +11836,11 @@ const TICKET_QUEUE_NOTES_MAX = TICKET_QUEUE_MAX;
 // How long a dispatch is remembered, so a cancel that LOST to it can say so
 // rather than 404ing as if the ticket had never been queued.
 const TICKET_DISPATCH_MEMO_MS = 5 * 60 * 1000;
-// XERK-485 [E]: the auto stream and the queue are ordered by the model's
-// triage, not just by repo tier. Lower rank comes first. An unknown band or
-// type (no triage yet, or one whose field survived sanitization as something
-// else) sorts AFTER every real one — an unassessed ticket never outranks one
-// the model actually assessed.
+// XERK-485 [E]: the model's triage bands and types. Lower rank comes first; an
+// unknown band or type (no triage yet, or one whose field survived
+// sanitization as something else) ranks AFTER every real one. The auto
+// stream's ORDER reads only P0 off the band (XERK-1567, `triageSortKey`); the
+// full band rank still drives the org policy's `minPriority`.
 const TRIAGE_PRIORITY_RANK = { P0: 0, P1: 1, P2: 2, P3: 3 };
 const NO_PRIORITY_RANK = 9;
 // Within one band, the KIND of work: a P1 bug ahead of a P1 doc nit. Same
@@ -12289,9 +12289,10 @@ function holdQueued(e, reason, error) {
 }
 
 // Hand the highest-priority waiting tickets to whichever hosts can actually
-// start them. Visit order (XERK-485 [E]): within an org's line the priority key
-// — triage band -> type weight -> repo tier -> FIFO — decides, and across orgs
-// the lines interleave round-robin so one backlog can't starve another.
+// start them. Visit order (XERK-485 [E]): within an org's line the sort key
+// — P0 -> oldest created -> type weight -> repo tier -> FIFO (XERK-1567) —
+// decides, and across orgs the lines interleave round-robin so one backlog
+// can't starve another.
 // Runs on every heartbeat (a beat is when capacity changes) and on the 15s
 // sweep, so a freed slot is filled within a beat rather than a sweep interval.
 //
@@ -12704,16 +12705,24 @@ function triageGateReason(t) {
   return null;
 }
 
-// XERK-485 [E]: the priority key as a comparable array —
-// [triage band, type weight, -repo tier]. A caller's STABLE sort on this is the
-// full ordering: priority -> type -> repo tier (XERK-487's [G], the tiebreak
-// below priority+type) -> the caller's insertion order (board order for the
-// sweep, FIFO for the queue).
-function triageSortKey(triage, repo) {
-  const tr = triage && typeof triage === "object" ? triage : null;
+// XERK-1567: the auto stream's order key, as a comparable array over a ticket
+// ROW — [P0 ? 0 : 1, created ms, type weight, -repo tier]. A caller's STABLE
+// sort on this is the full ordering: a P0 preempts -> OLDEST created first ->
+// type -> repo tier (XERK-487's [G]) -> the caller's insertion order (board
+// order for the sweep, FIFO for the queue). Oldest-first replaced the band
+// order (XERK-485 [E]) because the board order underneath it is the agent's
+// `updated DESC` query, so the NEWEST-touched ticket won every tie and old work
+// starved; P1-P3 are now FIFO by creation and type/tier only break ties.
+// An absent or unparseable `created` sorts LAST (Infinity) — both comparators
+// test `!==` before subtracting, so two Infinities stay equal and keep board
+// order. `Date.parse` reads Jira's `+0000` and ADO's `Z` alike.
+function triageSortKey(t, repo) {
+  const tr = t && typeof t === "object" && t.triage && typeof t.triage === "object"
+    ? t.triage : null;
+  const created = t && typeof t.created === "string" ? Date.parse(t.created) : NaN;
   return [
-    tr && TRIAGE_PRIORITY_RANK[tr.priority] !== undefined
-      ? TRIAGE_PRIORITY_RANK[tr.priority] : NO_PRIORITY_RANK,
+    tr && tr.priority === "P0" ? 0 : 1,
+    Number.isFinite(created) ? created : Infinity,
     tr && TRIAGE_TYPE_WEIGHT[tr.type] !== undefined
       ? TRIAGE_TYPE_WEIGHT[tr.type] : NO_TYPE_WEIGHT,
     -repoTierRank(repo),
@@ -12763,8 +12772,9 @@ function autoStartRateMax(siteKey) {
   return p && Number.isInteger(p.rateMax) && p.rateMax >= 1 ? p.rateMax : TICKET_QUEUE_RATE_MAX;
 }
 
-// XERK-485 [E]: the drain's visit order. Within an org's line the priority key
-// decides (band -> type -> tier -> FIFO by `at`); across orgs the lines
+// XERK-485 [E]: the drain's visit order. Within an org's line the sort key
+// decides (P0 -> oldest created -> type -> tier -> FIFO by `at`, XERK-1567);
+// across orgs the lines
 // interleave round-robin, each org's turn anchored on its OLDEST entry, so one
 // org's backlog can't starve another's. Hosts never cross orgs, so in practice
 // this decides which ticket in an org claims a host's one-per-pass dispatch —
@@ -12776,8 +12786,7 @@ function ticketQueueOrder(rows) {
   for (const e of ticketQueue) {
     const hit = rows.get(ticketQueueKey(e.siteKey, e.issueKey));
     const row = hit ? hit.row : null;
-    const key = triageSortKey(
-      row ? row.triage : null, ticketRepo(e.siteKey, e.issueKey, rows));
+    const key = triageSortKey(row, ticketRepo(e.siteKey, e.issueKey, rows));
     let line = lines.get(e.siteKey);
     if (!line) lines.set(e.siteKey, (line = []));
     line.push({ e, key });
@@ -12814,14 +12823,14 @@ function autoStartSweep() {
     // The board's own view of this org's tickets — see `fleetTicketRows`. Never
     // walk `agents` for a ticket list here: this sweep STARTS work, so acting on
     // a copy the operator was not shown is a session nobody asked for.
-    // XERK-485 [E]: the full priority key orders the auto stream —
-    // triage band -> type weight -> repo tier (XERK-487's [G], now a
-    // tiebreak below priority+type) -> board order (stable sort).
-    // A P0 bug takes the scarce auto slots ahead of a P3 chore.
+    // XERK-1567: the sort key orders the auto stream — a P0 preempts, then
+    // OLDEST created first, then type weight -> repo tier (XERK-487's [G]) ->
+    // board order (stable sort). Board order is the agent's `updated DESC`
+    // query, so without the age term the newest-touched ticket won every tie.
     const candidates = ticketRowsForSite(rows, siteKey)
       .map((r) => {
         const repo = r.row ? ticketRepo(siteKey, r.row.key, rows) : null;
-        return { t: r.row, repo, key: triageSortKey(r.row && r.row.triage, repo) };
+        return { t: r.row, repo, key: triageSortKey(r.row, repo) };
       })
       // XERK-635: an epic and its children never ride the org auto-start stream —
       // an epic is not a work ticket, and a child is started by its epic run in
