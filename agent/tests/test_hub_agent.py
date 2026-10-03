@@ -14735,7 +14735,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self.run_calls.clear()
         return sm
 
-    def _session(self, sm, dirty=1, live_branch="feature-x", pushed=None,
+    def _session(self, sm, dirty=1, live_branch="feature-x", pushed=False,
                  ahead_remote=0, status="running", urls=()):
         sess = {"id": "s1", "status": status, "tmuxName": "agent-s1",
                 "worktreePath": os.path.join(self.tmp, "wt"), "summary": "work"}
@@ -14806,6 +14806,60 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
                                return_value=(None, None, None)):
             self._poll(sm)
         self.assertEqual(self._typed(), [])
+
+    def test_unanswered_git_status_neither_nudges_nor_rearms(self):
+        """XERK-1263: a fresh read git gave no answer to is an UNKNOWN dirty
+        count, not 0 — so no nudge, and an earlier nudge is not re-armed as
+        if the work had been delivered."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["prOpenNudged"] = {"s1": {"attempts": 1, "at": 0}}
+
+        def stalled(sess_):
+            def read(path, strict=True):
+                raise ha.GitTimeout("status")
+            return read
+        sm._open_pr_nudge_reader = stalled
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges(stage=True)
+            # The worker skips a GitTimeout, so the read never lands.
+            for _a, _k, fn, path in list(self.staged):
+                with self.assertRaises(ha.GitTimeout):
+                    fn(path, strict=True)
+            self.staged.clear()
+            sm._poll_open_pr_nudges(stage=False)
+        self.assertEqual(self._typed(), [])
+        self.assertEqual(sess["prOpenNudged"], {"s1": {"attempts": 1, "at": 0}})
+
+    def test_an_unanswered_branch_sync_neither_nudges_nor_rearms(self):
+        """XERK-1263: branch_sync degrades a timed-out read to None, and None
+        is not 0 — a pushed branch with no ahead count, or a live branch whose
+        existence read failed, skips the decision."""
+        for pushed, ahead in ((True, None), (None, None)):
+            with self.subTest(pushed=pushed):
+                self.run_stdin_calls.clear()
+                sm = self.make_manager()
+                sess = self._session(sm, dirty=0, pushed=pushed,
+                                     ahead_remote=ahead)
+                sess["prOpenNudged"] = {"s1": {"attempts": 1, "at": 0}}
+                with mock.patch.object(ha, "_pane_status",
+                                       return_value=(False, "auto", None)):
+                    self._poll(sm)
+                self.assertEqual(self._typed(), [])
+                self.assertNotIn("s1", sm.nudge_reads, "the read was decided")
+                self.assertEqual(sess["prOpenNudged"],
+                                 {"s1": {"attempts": 1, "at": 0}})
+
+    def test_dirty_work_is_nudged_even_when_branch_sync_is_unknown(self):
+        """An unborn (orphan) branch reads pushed None; its dirty files still
+        decide on their own."""
+        sm = self.make_manager()
+        self._session(sm, dirty=2, pushed=None)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            self._poll(sm)
+        self.assertEqual(len(self._typed()), 1)
 
     def test_blocking_dialog_is_not_nudged(self):
         sm = self.make_manager()
@@ -22649,6 +22703,52 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
         self.assertTrue(done.wait(5))
         self.assertEqual(sm.session_cheap["s1"], good)
 
+    def test_a_failed_status_is_no_answer_not_clean(self):
+        """XERK-1263: `status` exiting nonzero (a corrupt index, an EIO) is NO
+        answer — while a failed rev-parse still reads as gone."""
+        def fake(cmd, **kw):
+            rc = 128 if "status" in cmd else 0
+            return mock.Mock(returncode=rc, stdout="" if rc else "main")
+        with mock.patch.object(ha.subprocess, "run", side_effect=fake):
+            with self.assertRaises(ha.GitTimeout):
+                ha.git_info_cheap("/w", strict=True)
+            with self.assertRaises(ha.GitTimeout):
+                ha.repo_cheap_facts("/w", strict=True)
+
+    def test_branch_sync_reads_a_stalled_origin_lookup_as_unknown(self):
+        """XERK-1263: a timed-out origin-ref lookup is pushed None, never the
+        False that would nudge a pushed branch as "never pushed"."""
+        real = subprocess.run
+
+        def fake(cmd, **kw):
+            if "refs/remotes/origin/feat" in cmd:
+                raise subprocess.TimeoutExpired("git", 15)
+            if "refs/heads/feat" in cmd:
+                return real(["true"])
+            return real(["false"])
+        with mock.patch.object(ha.subprocess, "run", side_effect=fake):
+            self.assertIsNone(ha.branch_sync("/r", "feat", None)["pushed"])
+        # A git ERROR (not the missing-ref exit 1) is unknown too.
+        def errs(cmd, **kw):
+            if "refs/remotes/origin/feat" in cmd:
+                return real(["sh", "-c", "exit 128"])
+            return fake(cmd, **kw)
+        with mock.patch.object(ha.subprocess, "run", side_effect=errs):
+            self.assertIsNone(ha.branch_sync("/r", "feat", None)["pushed"])
+
+    def test_a_launch_failure_is_no_answer_not_clean(self):
+        """XERK-1263: git that could not be launched (a fork refused at the
+        pids_limit) in a worktree that still exists is NO answer — never
+        "gone", never dirtyFiles 0."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with mock.patch.object(ha.subprocess, "run",
+                               side_effect=BlockingIOError(11, "EAGAIN")):
+            with self.assertRaises(ha.GitTimeout):
+                ha.git_info_cheap(d, strict=True)
+            with self.assertRaises(ha.GitTimeout):
+                ha.repo_cheap_facts(d, strict=True)
+
     def test_a_fast_failure_still_reports_the_worktree_gone(self):
         """Only a TIMEOUT is kept: a directory whose .git link broke answers
         rev-parse at once, and that must still read as gone."""
@@ -22836,11 +22936,9 @@ class TestLightBeatCost(ManagerMixin, unittest.TestCase):
         remote away, unlike every other slow read on this path."""
         with mock.patch.object(ha, "git_info_cheap",
                                return_value={"branch": "main", "dirtyFiles": 0}), \
-             mock.patch.object(ha, "git_info_slow") as slow, \
-             mock.patch.object(ha, "git_info") as full:
+             mock.patch.object(ha, "git_info_slow") as slow:
             entry = ha.root_repo_entry("ssh://example.com/x/y")
         slow.assert_not_called()
-        full.assert_not_called()
         self.assertEqual(entry["remote"], "ssh://example.com/x/y")
         self.assertEqual(entry["branch"], "main")
 

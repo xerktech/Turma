@@ -202,16 +202,23 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     (`_worktree_add`, a ticket branch fetch) is command handling, not this rule.
   - The open-PR reader builds its facts from the branch IT read, never `session_cheap` — the poller
     runs before the session payload, so on a cold start the card cache holds the placeholder.
-  - The cheap reads are `strict`: a git TIMEOUT raises `GitTimeout` (plain `run()` folds it into
-    "gone"/"clean") and the worker keeps the last real answer. A fast failure — missing cwd,
-    broken `.git` link — is still "gone". A cached `None` is served, never re-read inline.
+  - The cheap reads are `strict`: NO answer — a git TIMEOUT, or a launch failure in a dir that
+    still exists (XERK-1263) — raises `GitTimeout` (plain `run()` folds both into "gone"/"clean").
+    The worker keeps the last real answer on it. A fast failure — missing cwd, broken `.git` link —
+    is still "gone". A cached `None` is served, never re-read inline.
+  - A nonzero `status` exit is no answer too (`fail_is_unknown`); a failed `rev-parse` stays "gone".
+    The open-PR reader is strict, so a no-answer read stays PENDING — never decided as clean.
+  - The poller also skips on `branch_sync`'s None (`pushed` None on a live branch, or a pushed
+    branch with no `aheadOfRemote`) — that is a failed read, never "delivered". Only when CLEAN:
+    dirty files decide alone (an unborn branch reads `pushed` None). `branch_sync`'s ref lookups
+    are tri-state, so a stalled origin lookup is None, never a false "never pushed".
   - Both sides write these maps, so every write REBINDS under `_cheap_lock`
     (`_cheap_store`/`_cheap_forget`); never mutate them in place. The worker stores
     `only_if_present`, so a key pruned mid-read stays pruned. Tests: `TestCheapGitWorker`,
     `TestPollOpenPrNudges`.
-- **`root_repo_entry` takes its `remote` from the slow-cadence cache.** It used to call `git_info()`,
-  running the whole `git_info_slow` — remote, `log -1`, `rev-parse --show-toplevel` — every beat and
-  throwing all but the remote away. Do not re-introduce a full `git_info()` on this path.
+- **`root_repo_entry` takes its `remote` from the slow-cadence cache.** Running the whole
+  `git_info_slow` — remote, `log -1`, `rev-parse --show-toplevel` — every beat to keep only the
+  remote is what it replaced. Do not re-introduce slow reads on this path.
 - **`_beat_once` is the ONE place a beat is built and posted**, so its wall clock is measured for
   every beat (`BEAT_SLOW_LOG_SEC`). Build and post are logged separately: a slow build is local
   subprocess/disk cost we own, a slow post is the network. There was no instrumentation at all before,
