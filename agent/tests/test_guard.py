@@ -1020,6 +1020,7 @@ class TestParserGaps(unittest.TestCase):
                     f"(git commit -m '$({self.R})')",
                     f"git commit -qam '$({self.R})'", f"git commit --message='$({self.R})' --no-verify",
                     f"git commit -a -m x -m '$({self.R})'",
+                    f"git commit -m '$({self.R})' -- a.txt",
                     "echo \\$\\(rm -rf /\\)"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
@@ -1052,6 +1053,14 @@ class TestParserGaps(unittest.TestCase):
                     # git takes any unique prefix of a long option.
                     f"git commit -m m --trai 'k:$({R})'", f"git commit -m m --tr='k:$({R})'",
                     f"git -c x=y commit -m '$({R})'", f"git commit -C HEAD -m '$({R})'",
+                    # shlex is not bash: these become `--trailer` only once expanded.
+                    f"git commit -m m $\"--trailer\" 'k:$({R})'",
+                    f"git commit -m m [-]-trailer 'k:$({R})'",
+                    f"git commit -m m * 'k:$({R})'",
+                    # Each of those two rules alone, failing closed: a token
+                    # before `--` that is no allowed option, and a bare expansion.
+                    f"git commit -m m x 'k:$({R})'",
+                    f"gh pr create --title t --body '$({R})' $\"--web\"",
                     f"git tag -a t -m '$({R})'", "git commit -m x && git status '$(reboot)'",
                     f"echo \"$(sh -c 'echo $({R})')\"",
                     f"for i in 1; do printf '$({R})'; done | sh"):

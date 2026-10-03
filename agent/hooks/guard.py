@@ -475,6 +475,8 @@ def _quoted_text_only(raw_tokens: list[str]) -> bool:
                     return False
                 if m and not value:
                     next(rest, None)
+            else:
+                return False  # a pathspec goes after `--`, where it is inert
         return True
     if prog == "gh":
         return tuple(tokens[1:3]) in _QUOTED_TEXT_GH
@@ -494,8 +496,11 @@ def _quoted_text_line(raw_commands: str, segments: list[str]) -> bool:
     """
     if len(segments) != 1 or _ASSIGNING_EXPANSION_RE.search(raw_commands):
         return False
+    # Nothing bash rewrites may be left bare either: the tokens judged below
+    # are shlex's, not bash's, and `$"--trailer"`, `[-]-trailer`, `*` or
+    # `{a,b}` become options (or several words) only once bash expands them.
     states = _quote_states(raw_commands)
-    if any(ch in "<>" and not states[i] for i, ch in enumerate(raw_commands)):
+    if any(ch in "<>$*?[{~`" and not states[i] for i, ch in enumerate(raw_commands)):
         return False
     return _quoted_text_only(_tokenize(_unwrap_group(segments[0])))
 

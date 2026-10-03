@@ -81,6 +81,8 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   - **A single-quoted substitution is text ONLY on a line that is ONE allowlisted stage, no redirection**
     (`_quoted_text_only`: echo (not printf: `-v` assigns), `git commit` + EXACT option allowlist (git abbreviates `--trai`), `gh pr|issue create|edit|comment`),
     with NOTHING but reserved words before the program — `GIT_EDITOR='$(x)' git commit` runs it.
+    - Nothing bash rewrites may be bare on that line (`$ * ? [ { ~` backtick): the tokens judged are
+      shlex's, and `$"--trailer"`/`[-]-trailer` become a git option only once bash expands them.
     - Never widen it to "skip unless a modelled executor is present": `| sh`, `find -exec sh -c`,
       `xargs sh -c`, `<<<` into a shell, `flock`, `env -S`, `git -c core.pager=` each run it.
     - Never widen it to several stages or a redirect: `printf -v GIT_EDITOR '$(x)'; git commit`
