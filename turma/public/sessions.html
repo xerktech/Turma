@@ -2812,12 +2812,13 @@ function endedRow(e) {
 // operator can see which host has room before queueing onto a full one. Marked
 // full off `free` (slots USED, broken sessions included — XERK-1044), not
 // running alone, since that is what decides whether a spawn starts or queues.
-// An agent predating the capacity block (or reporting no ceiling) shows nothing.
+// A missing `free` is "can't tell", never full — the same read as the hub's
+// hostHasFreeSlot. An agent reporting no ceiling shows nothing.
 function hostCapHtml(c) {
   const max = Number(c && c.maxSessions);
   if (!(max > 0)) return "";
   const running = Math.max(0, Number(c.running) || 0);
-  const full = !(Number(c.free) > 0);
+  const full = typeof c.free === "number" && c.free <= 0;
   const queued = Math.max(0, Number(c.queued) || 0);
   const title = `${running} running of ${max} session slots` +
     (queued ? ` · ${queued} queued` : "") + (full ? " · full — a new session will queue" : "");

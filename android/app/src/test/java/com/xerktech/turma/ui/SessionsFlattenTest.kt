@@ -209,6 +209,9 @@ class SessionsFlattenTest {
         assertEquals(HostCapLabel("2 / 4", full = false), hostCapLabel(cap))
         // Full off `free`, not running: a broken session holds a slot (XERK-1044).
         assertEquals(HostCapLabel("3 / 4", full = true), hostCapLabel(Capacity(maxSessions = 4, running = 3, free = 0)))
+        // Missing `free` is "can't tell", never full; a negative running clamps to 0.
+        assertEquals(HostCapLabel("2 / 5", full = false), hostCapLabel(Capacity(maxSessions = 5, running = 2)))
+        assertEquals(HostCapLabel("0 / 4", full = false), hostCapLabel(Capacity(maxSessions = 4, running = -9, free = 4)))
         // No ceiling reported (pre-capacity agent) → no label, never "0 / 0".
         assertEquals(null, hostCapLabel(null))
         assertEquals(null, hostCapLabel(Capacity()))

@@ -313,13 +313,14 @@ data class SpawnHost(
  * "running / MAX_SESSIONS" beside a host in the New-session picker (web
  * `hostCapHtml`), so the operator sees which host has room before queueing onto
  * a full one; `full` reads `free` (slots used, broken included — XERK-1044), which
- * is what decides start-vs-queue. Null for an agent reporting no ceiling.
+ * is what decides start-vs-queue; a missing `free` is "can't tell", never full
+ * (the hub's hostHasFreeSlot). Null for an agent reporting no ceiling.
  */
 data class HostCapLabel(val text: String, val full: Boolean)
 
 fun hostCapLabel(c: com.xerktech.turma.model.Capacity?): HostCapLabel? {
     if (c == null || c.maxSessions <= 0) return null
-    return HostCapLabel("${c.running.coerceAtLeast(0)} / ${c.maxSessions}", c.free <= 0)
+    return HostCapLabel("${c.running.coerceAtLeast(0)} / ${c.maxSessions}", c.free != null && c.free <= 0)
 }
 
 /**
