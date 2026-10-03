@@ -12069,6 +12069,13 @@ function ticketRowsForSite(rows, siteKey) {
 //     same-user pair, so a ticket an offline host still lists but the board has
 //     dropped comes back to life and gets auto-started.
 //
+// Only a block from a host DECIDED into the org it claims counts (XERK-1491).
+// `jira.siteKey` is agent-asserted, and a newer `updated` wins a key outright,
+// so a host bound to org A that declares org B (drifted) — or a never-bound one
+// — could publish rows for B's tickets and have every sweep act on them: kill a
+// B session over a forged Done, merge one over a forged actionable triage, close
+// B's epic. The board's `mergeSites` skips the same hosts via the served `org`.
+//
 // Within a group, and between two groups reporting one key, `blockOutranks`
 // decides: online first, then freshest. Between two copies of a key the newer
 // `updated` wins outright, block rank only breaking that tie — which is
@@ -12079,7 +12086,7 @@ function fleetTicketRows() {
   const byUser = new Map();   // siteKey \x00 user -> winning block
   for (const a of Object.values(agents)) {
     const j = a && a.jira;
-    if (!j || !j.siteKey) continue;
+    if (!j || !j.siteKey || decidedOrgOf(a) !== j.siteKey) continue;
     const cand = { block: j, siteKey: j.siteKey, online: agentBlockOnline(a, now),
                    at: String(j.fetchedAt || "") };
     const k = j.siteKey + "\x00" + (j.user || "");

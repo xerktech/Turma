@@ -851,6 +851,11 @@
     for (const a of agents || []) {
       const j = a && a.jira;
       if (!j || !j.siteKey) continue;
+      // A host the hub has NOT decided into the org it claims (drifted, or never
+      // bound) reports nothing for that org (XERK-1491) — matching
+      // fleetTicketRows, so its rows can't forge this org's board. An older hub
+      // serves no `org`; fall back to trusting the claim, as orgOfAgent does.
+      if (a.org != null && a.org !== j.siteKey) continue;
       const site = j.siteKey;
       let rep = reporters.get(site);
       if (!rep) {
