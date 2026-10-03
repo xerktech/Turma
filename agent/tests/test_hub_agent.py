@@ -32892,6 +32892,19 @@ class TestSlowBuildKeepalive(ManagerMixin, unittest.TestCase):
     def test_a_fast_build_sends_none(self):
         self.assertEqual(self._run_beat(self.make_manager(), 0.0), [])
 
+    def test_a_wedged_build_stops_being_kept_alive(self):
+        # Past KEEPALIVE_MAX_SEC the host must be allowed to read offline.
+        with mock.patch.object(ha, "KEEPALIVE_MAX_SEC", 0.5):
+            alive = self._run_beat(self.make_manager(), 1.2)
+        self.assertTrue(alive)
+        self.assertTrue(all(e < 0.5 + 0.1 for e in alive), alive)
+
+    def test_run_forever_starts_the_watcher(self):
+        # Every unit test above drives _beat_once directly; this pins the one
+        # call that makes it live.
+        self.assertIn("self._start_keepalive()",
+                      inspect.getsource(ha.SessionManager.run_forever))
+
     def test_post_alive_hits_the_host_route_and_ignores_a_404(self):
         sm = self.make_manager()
         seen = {}

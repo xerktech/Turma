@@ -2705,6 +2705,15 @@ test("http: /alive keeps a host whose beat build is stalled online, and nothing 
     (await request("POST", "/api/agents/ghost-alive/alive", { body: {}, headers: agentHeaders })).status,
     404);
   assert.equal(agents["ghost-alive"], undefined, "a keepalive never creates a record");
+  // Prototype keys are not hosts: neither route may write onto a built-in.
+  for (const route of ["alive", "updating"]) {
+    for (const k of ["__proto__", "constructor", "toString", "hasOwnProperty"]) {
+      const r = await request("POST", `/api/agents/${k}/${route}`, { body: {}, headers: agentHeaders });
+      assert.equal(r.status, 404, `${k}/${route}`);
+    }
+  }
+  assert.equal(({}).lastSeen, undefined, "Object.prototype polluted via /alive");
+  assert.equal(({}).updating, undefined, "Object.prototype polluted via /updating");
 
   const recOf = async () => {
     hub.invalidateAgentsCache();

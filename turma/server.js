@@ -16285,7 +16285,9 @@ const server = http.createServer(async (req, res) => {
     // it) or once the grace window lapses on a stuck update.
     if (isUpdatingSignal) {
       const key = decodeURIComponent(parts[2]);
-      const a = agents[key];
+      // OWN keys only: `agents` is a plain object, so `__proto__` would resolve to
+      // Object.prototype and the write below would pollute every object.
+      const a = Object.hasOwn(agents, key) ? agents[key] : undefined;
       // Only a host we already know can be "updating" — an unknown key has no
       // record to hang the status on and nothing to suppress an alert for.
       if (!a) return json(res, 404, { error: "unknown host" });
@@ -16311,12 +16313,13 @@ const server = http.createServer(async (req, res) => {
     // credential (XERK-268). It bumps `lastSeen` on an EXISTING record and nothing
     // else: the record's content stays the last full beat's, and nothing a beat
     // delivers (acks, spawnFailures, results) can ride it. An unknown host has no
-    // record to keep alive, so it 404s — the same answer an older hub gives for
-    // the route, which the agent reads as "no keepalive" either way.
+    // record to keep alive, so it 404s; an older hub answers 401 (the route falls
+    // through to the user gate). The agent ignores the reply either way.
     // publishAgent is what carries the bump to the HA write-through (XERK-756).
     if (isAliveSignal) {
       const key = decodeURIComponent(parts[2]);
-      const a = agents[key];
+      // OWN keys only, as /updating: `__proto__` must never reach the write.
+      const a = Object.hasOwn(agents, key) ? agents[key] : undefined;
       if (!a) return json(res, 404, { error: "unknown host" });
       await readBody(req);
       a.lastSeen = Date.now();

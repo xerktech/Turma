@@ -186,11 +186,17 @@ HEARTBEAT_TIMEOUT_SEC = 10
 # only bumps lastSeen on the existing record) and repeats every
 # KEEPALIVE_EVERY_SEC until the build finishes. It never re-posts a stale full
 # snapshot: that would re-deliver spawnFailures/acks and replace the record.
+# Time the beat loop spends OUTSIDE the build (handle_commands, the light
+# follow-up post) is not covered; that stays the XERK-395 budget's job.
 # Worst case to the first keepalive landing is INTERVAL + AFTER + TIMEOUT, which
 # TestBeatLoopBudget pins under the hub's threshold.
 KEEPALIVE_AFTER_SEC = 30
 KEEPALIVE_EVERY_SEC = 30
 KEEPALIVE_TIMEOUT_SEC = 5
+# ...but not forever. A build wedged for good (a read stuck in uninterruptible
+# sleep) must still read offline, or the hub keeps dispatching work to a host
+# that will never run it. The worst measured stall was 396s.
+KEEPALIVE_MAX_SEC = 600
 
 # Windows portability (XERK-670, native no-WSL host, epic XERK-666). The shared
 # runtime is ONE cross-platform codebase — never forked per OS (ADR D5) — so the
@@ -31752,6 +31758,11 @@ class SessionManager:
                 # already set, so go round and time it from ITS start.
                 if self._build_started != started:
                     break
+                elapsed = time.monotonic() - started
+                if elapsed >= KEEPALIVE_MAX_SEC:
+                    log(f"beat build running {elapsed:.0f}s; past KEEPALIVE_MAX_SEC, "
+                        "no more keepalives — the hub will read this host offline")
+                    break
                 try:
                     self._post_alive(time.monotonic() - started)
                 except Exception as e:
@@ -31760,9 +31771,9 @@ class SessionManager:
 
     def _post_alive(self, elapsed):
         """POST /api/agents/<host>/alive — bump this host's lastSeen without a
-        payload (XERK-1266). The reply is IGNORED: a 404 from an older hub (no
-        such route) or for a host the hub has not met yet just means no
-        keepalive, and the beat in progress still lands on its own. Bounded by
+        payload (XERK-1266). The reply is IGNORED: an older hub's 401 (no such
+        route, so it falls through to the user gate) or a 404 for a host the hub
+        has not met yet just means no keepalive, and the beat in progress still lands on its own. Bounded by
         KEEPALIVE_TIMEOUT_SEC; this runs on the watcher thread, never the beat."""
         if not TURMA_URL:
             return
