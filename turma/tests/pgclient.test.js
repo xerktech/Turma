@@ -349,6 +349,12 @@ function startFakePg(opts = {}) {
     connectionCount++;
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
+    if (opts.hangConnection === connectionCount) {
+      // Accept the TCP connection but never answer — a black-holed handshake.
+      socket.on("error", () => {});
+      socket.resume(); // keep reading so the client's close reaches us and server.close() can finish
+      return;
+    }
     let buf = Buffer.alloc(0);
     let phase = "ssl";
     const sc = {}; // scram state for this socket
@@ -446,7 +452,8 @@ function startFakePg(opts = {}) {
             }
           }
         } else if (type === "S") {
-          answerQuery();
+          if (opts.queryDelayMs) setTimeout(answerQuery, opts.queryDelayMs);
+          else answerQuery();
         }
         return;
       }
@@ -487,9 +494,13 @@ function startFakePg(opts = {}) {
     server.listen(0, "127.0.0.1", () => {
       resolve({
         port: server.address().port,
-        close: () => new Promise((r) => server.close(r)),
+        // Destroy what is still open so a leak fails its assertion, not hangs close().
+        close: () => new Promise((r) => { for (const s of sockets) s.destroy(); server.close(r); }),
         get connectionCount() {
           return connectionCount;
+        },
+        get openSockets() {
+          return sockets.size;
         },
         // Server-side close of every open connection — a Postgres restart/failover
         // as the pool's IDLE connections see it.
@@ -503,7 +514,28 @@ function poolFor(fake, extra = {}) {
   // No sslmode -> "prefer": the client sends SSLRequest, the fake declines with
   // 'N', and the client falls back to plaintext — so the negotiation path runs.
   const url = `postgres://user:${extra.password || "pencil"}@127.0.0.1:${fake.port}/turma`;
-  return new PgPool({ ha: true, databaseUrl: url, fatal: [] }, { max: extra.max || 2, queryTimeoutMs: extra.queryTimeoutMs || 2000 });
+  return new PgPool({ ha: true, databaseUrl: url, fatal: [] }, {
+    max: extra.max || 2,
+    queryTimeoutMs: extra.queryTimeoutMs || 2000,
+    connectTimeoutMs: extra.connectTimeoutMs,
+  });
+}
+
+// Settle a promise or report it still pending — the defects below are all
+// "never settles", so a bounded wait is the assertion.
+function settleWithin(p, ms) {
+  let timer;
+  return Promise.race([
+    p.then((v) => ({ resolved: v }), (e) => ({ rejected: e })),
+    new Promise((r) => { timer = setTimeout(() => r({ pending: true }), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+function captureWarn() {
+  const lines = [];
+  const orig = console.warn;
+  console.warn = (...a) => lines.push(a.join(" "));
+  return { lines, restore: () => { console.warn = orig; } };
 }
 
 test("live: SSL negotiation + SCRAM handshake + parameterized query round-trip", async () => {
@@ -641,6 +673,143 @@ test("live: a wrong password fails the SCRAM handshake, so connect rejects", asy
   const pool = new PgPool({ ha: true, databaseUrl: url, fatal: [] }, { queryTimeoutMs: 1000, connectTimeoutMs: 5000 });
   try {
     await assert.rejects(pool.query("SELECT 1", []), /SCRAM/i);
+  } finally {
+    pool.close();
+    await fake.close();
+  }
+});
+
+test("live: acquire has a deadline, so a leaked slot rejects instead of wedging", async () => {
+  // A slot that never returns (the leak class that hung prod for days) used to make
+  // every later acquire wait forever with nothing logged.
+  const fake = await startFakePg();
+  const pool = poolFor(fake, { max: 1, queryTimeoutMs: 200 });
+  try {
+    pool._conns.push({ alive: true, busy: true }); // a leaked, permanently-busy slot
+    const r = await settleWithin(pool.query("SELECT 1", []), 2000);
+    assert.ok(r.rejected, "the acquire must not stay pending");
+    assert.match(r.rejected.message, /acquire timeout/);
+    assert.equal(pool._waiters.length, 0, "the timed-out waiter left the queue");
+    pool._conns.length = 0;
+  } finally {
+    pool.close();
+    await fake.close();
+  }
+});
+
+test("live: an IDLE connection death logs one line per connection; a busy one does not", async () => {
+  const fake = await startFakePg();
+  const pool = poolFor(fake, { max: 2 });
+  const warn = captureWarn();
+  try {
+    await Promise.all([pool.query("SELECT $1", ["a"]), pool.query("SELECT $1", ["b"])]);
+    fake.dropAll();
+    await new Promise((r) => setTimeout(r, 50));
+    const idle = warn.lines.filter((l) => /idle connection .* died/.test(l));
+    assert.equal(idle.length, 2, warn.lines.join("\n"));
+  } finally {
+    warn.restore();
+    pool.close();
+    await fake.close();
+  }
+  const hang = await startFakePg({ hangOnQuery: true });
+  const pool2 = poolFor(hang, { queryTimeoutMs: 150 });
+  const warn2 = captureWarn();
+  try {
+    await assert.rejects(pool2.query("SELECT 1", []), /query timeout/);
+    assert.equal(warn2.lines.filter((l) => /idle connection/.test(l)).length, 0);
+  } finally {
+    warn2.restore();
+    pool2.close();
+    await hang.close();
+  }
+});
+
+test("live: a failed dial never rejects a waiter that queued AFTER it started", async () => {
+  // conn #1 is healthy but slow; conn #2's handshake is black-holed until its
+  // connect timeout. q3 arrives while #2 is still dialling — it is #1's to serve,
+  // and #2's eventual failure must not reject it.
+  const fake = await startFakePg({ hangConnection: 2, queryDelayMs: 300 });
+  const pool = poolFor(fake, { max: 2, queryTimeoutMs: 5000, connectTimeoutMs: 500 });
+  try {
+    const q1 = pool.query("SELECT $1", ["1"]);
+    await new Promise((r) => setTimeout(r, 30));
+    const q2 = pool.query("SELECT $1", ["2"]); // spawns the doomed dial
+    await new Promise((r) => setTimeout(r, 330)); // q1 done; #1 now serves q2
+    const q3 = pool.query("SELECT $1", ["3"]); // queued behind q2, after the dial
+    const [r1, r2, r3] = await Promise.all([q1, q2, q3].map((p) => settleWithin(p, 3000)));
+    assert.deepEqual(r1.resolved, [{ p0: "1" }]);
+    assert.deepEqual(r2.resolved, [{ p0: "2" }]);
+    assert.ok(!r3.rejected, `q3 was rejected by a stale dial: ${r3.rejected && r3.rejected.message}`);
+    assert.deepEqual(r3.resolved, [{ p0: "3" }]);
+    // The timed-out dial was stuck in SSL negotiation; its socket must be destroyed.
+    await new Promise((r) => setTimeout(r, 50));
+    // (the dial's failure re-dials for q3, so every OTHER connection is still open)
+    assert.equal(fake.openSockets, fake.connectionCount - 1, "the black-holed dial's socket was closed");
+  } finally {
+    pool.close();
+    await fake.close();
+  }
+});
+
+test("live: ready() rejects when its only connection fails with no waiters", async () => {
+  const fake = await startFakePg();
+  const port = fake.port;
+  await fake.close(); // nothing listening -> ECONNREFUSED
+  const pool = new PgPool({ ha: true, databaseUrl: `postgres://u:p@127.0.0.1:${port}/turma`, fatal: [] }, {});
+  try {
+    const r = await settleWithin(pool.ready(), 2000);
+    assert.ok(r.rejected, "ready() must not stay pending");
+    assert.match(r.rejected.message, /ECONNREFUSED/);
+  } finally {
+    pool.close();
+  }
+});
+
+test("live: close() rejects an in-flight query and a pending ready()", async () => {
+  const fake = await startFakePg({ hangOnQuery: true });
+  const pool = poolFor(fake, { queryTimeoutMs: 5000 });
+  try {
+    await pool.ready();
+    const q = pool.query("SELECT 1", []);
+    await new Promise((r) => setTimeout(r, 50));
+    pool.close();
+    const r = await settleWithin(q, 1000);
+    assert.ok(r.rejected, "the in-flight query must not stay pending");
+    assert.match(r.rejected.message, /closed/);
+  } finally {
+    pool.close();
+    await fake.close();
+  }
+  const hung = await startFakePg({ hangConnection: 1 });
+  const pool2 = poolFor(hung, { connectTimeoutMs: 5000 });
+  try {
+    const ready = pool2.ready();
+    await new Promise((r) => setTimeout(r, 50));
+    pool2.close();
+    const r = await settleWithin(ready, 1000);
+    assert.ok(r.rejected, "ready() must not stay pending across close()");
+    assert.match(r.rejected.message, /closed/);
+    assert.equal(hung.connectionCount, 1, "close() spawned no new dial");
+  } finally {
+    await hung.close();
+  }
+});
+
+test("live: ready() waits out a failed dial that a queued query immediately re-dials", async () => {
+  // max=1, first handshake black-holed: health goes connecting>idle>connecting>ready.
+  // The transient idle edge is not "nothing is warming", so ready() must resolve.
+  const fake = await startFakePg({ hangConnection: 1 });
+  const pool = poolFor(fake, { max: 1, connectTimeoutMs: 200, queryTimeoutMs: 3000 });
+  try {
+    const q1 = pool.query("SELECT $1", ["1"]);
+    const ready = pool.ready();
+    const q2 = pool.query("SELECT $1", ["2"]);
+    await assert.rejects(q1, /connect timeout/);
+    const r = await settleWithin(ready, 2000);
+    assert.ok(!r.rejected, `ready() rejected: ${r.rejected && r.rejected.message}`);
+    assert.ok("resolved" in r, "ready() must not stay pending");
+    assert.deepEqual(await q2, [{ p0: "2" }]);
   } finally {
     pool.close();
     await fake.close();
