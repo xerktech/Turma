@@ -176,7 +176,7 @@ test.afterEach(() => {
 // see the fan-out. Real fan-out/pruning is exercised separately below.
 hub.registerDevice("capture-device", "android", ["dismiss"]);
 const {
-  server, agents, queueCommand, findSession, orgPeers, boundOrgOf, orgDrifted,
+  server, agents, queueCommand, findSession, orgPeers, boundOrgOf, orgDrifted, decidedOrgOf,
   orgDriftWarned, warnOrgDrift, siteKeyOf, normalizeJira, normalizeClones,
   normalizeTriage, normalizeTrajectory,
   CLONE_PROGRESS_MAX,
@@ -13254,6 +13254,48 @@ test("XERK-550: auto-merge skips when the org has NOT opted in", async () => {
   await mergeBeat("am2", "am2.atlassian.net", { autoMerge: false });
   autoMergeSweep();
   assert.equal((agents.am2.commands || []).filter((c) => c.type === "mergePr").length, 0);
+});
+
+test("XERK-1445: auto-merge/close never act on a session whose ticket names an org its host is not bound to", async () => {
+  resetMerge();
+  // Org B (auto-merge ON) has ENG-9 on its board, reported by its own host.
+  await mergeBeat("amB", "amb.atlassian.net", { prs: [] });
+  // Host amA is bound to org A (auto-merge OFF) yet claims a session on org B's
+  // ENG-9 with a merge-ready PR — and a merged one, for auto-close.
+  await asBeat("amA", "ama.atlassian.net", {
+    autoStart: false, tickets: [],
+    sessions: [{ id: "sx", status: "running",
+      ticket: { key: "ENG-9", siteKey: "amb.atlassian.net" },
+      prs: [{ url: PR1, state: "OPEN", ready: "ready", mergeable: "MERGEABLE" }],
+      session: { transcriptAgeSec: 30, paneBusy: false } }],
+  });
+  assert.equal(boundOrgOf(agents.amA), "ama.atlassian.net");
+  assert.equal(autoMergeOrgs["amb.atlassian.net"], true);
+  autoMergeSweep();
+  assert.equal((agents.amA.commands || []).filter((c) => c.type === "mergePr").length, 0);
+  agents.amA.sessions[0].prs = [{ url: PR1, state: "MERGED" }];
+  autoCloseSweep();
+  assert.equal((agents.amA.commands || []).filter((c) => c.type === "input").length, 0);
+  // Control: org B's own host on the same ticket IS acted on.
+  agents.amB.sessions = [{ id: "sy", status: "running",
+    ticket: { key: "ENG-9", siteKey: "amb.atlassian.net" },
+    prs: [{ url: PR1, state: "OPEN", ready: "ready", mergeable: "MERGEABLE" }],
+    session: { transcriptAgeSec: 30, paneBusy: false } }];
+  autoMergeSweep();
+  assert.equal((agents.amB.commands || []).filter((c) => c.type === "mergePr").length, 1);
+});
+
+test("XERK-1445: an armed epic run never adopts a child session whose host is bound elsewhere", () => {
+  const byKey = new Map([["epb.atlassian.net\x00C-1",
+    { key: "C-1", epicKey: "E-1", statusCategory: "inprogress" }]]);
+  epicRuns["epb.atlassian.net/E-1"] = { state: "running", children: ["C-1"] };
+  const s = { status: "running", ticket: { key: "C-1", siteKey: "epb.atlassian.net" } };
+  try {
+    assert.equal(epicRunChildSession({ orgBound: "epa.atlassian.net" }, s, byKey, new Map()), null);
+    assert.ok(epicRunChildSession({ orgBound: "epb.atlassian.net" }, s, byKey, new Map()));
+  } finally {
+    delete epicRuns["epb.atlassian.net/E-1"];
+  }
 });
 
 test("XERK-550: auto-merge skips a session that is still WORKING", async () => {

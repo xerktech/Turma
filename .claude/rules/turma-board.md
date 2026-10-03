@@ -222,6 +222,10 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
       (`ticket.adopted`, `ticketAdopted()`), in the org stream AND an epic run, even when that
       ticket would qualify: the operator started it by hand and reviews its PR. An older agent
       never sends the flag, so its adopted sessions still merge until it updates.
+  - **The ticket's org must be its host's DECIDED org** (`ticketOrgBound` = `decidedOrgOf(a) ===
+    siteKey`, XERK-1445), in the org stream AND an epic run. `ticket.siteKey` is agent-asserted: a
+    host bound to an org with auto-merge off could otherwise name another org's ticket and get its
+    PR merged under that org's opt-in. Never re-key this on the claimed siteKey.
   - **A Done ticket is excluded** (`statusCategory === "done"`): moving to Done is the abandon/stop
     gesture (autoStopSweep kills the session), and autoStopSweep only QUEUES that kill, so the
     session still reads running for a beat — the column, not the run state, stands the merge down.
