@@ -876,10 +876,10 @@ class BoardTest {
     }
 
     @Test fun `a self-closed ticket's outcome rides each channel to its chip label`() {
-        // XERK-1569, web board.js ticketOutcomeLabel / sessionChipHtml's .kc-sess-why.
+        // XERK-1569, web board.js ticketOutcomeLabel / sessionChipHtml's .kc-sess-closed.
         val t = com.xerktech.turma.model.TicketRef(
-            key = "X-1", siteKey = "org.atlassian.net",
-            outcome = com.xerktech.turma.model.TicketOutcome(kind = "not-reproducible"),
+            key = "X-1", siteKey = "org.atlassian.net", branch = "X-1",
+            outcome = com.xerktech.turma.model.TicketOutcome(kind = "not-reproducible", at = 1786400000000L),
         )
         val a = AgentInfo(
             key = "h",
@@ -890,12 +890,36 @@ class BoardTest {
         )
         val chips = ticketSessionsOf(ticketSessionIndex(listOf(a)), "org.atlassian.net", "X-1")
         assertEquals(listOf("not-reproducible", "not-reproducible", "not-reproducible"), chips.map { it.outcome })
-        assertEquals("closed: not reproducible", ticketOutcomeLabel(chips[0].outcome))
-        assertEquals("closed: already fixed", ticketOutcomeLabel("already-fixed"))
-        // done is what the Done column says already; unknown/none say nothing.
-        assertEquals("", ticketOutcomeLabel("done"))
+        assertEquals(listOf(1786400000000L, 1786400000000L, 1786400000000L), chips.map { it.outcomeAt })
+        // The outcome replaces the chip's name (the branch), whatever its run state.
+        assertEquals("closed · not reproducible", ticketSessionLabel(chips[0]))
+        assertEquals("closed · not reproducible", ticketOutcomeLabel(chips[0].outcome))
+        assertEquals("closed · already fixed", ticketOutcomeLabel("already-fixed"))
+        assertEquals("closed", ticketOutcomeLabel("done"))
+        // Unknown/none say nothing, and the chip keeps its branch name.
         assertEquals("", ticketOutcomeLabel("wontfix"))
         assertEquals("", ticketOutcomeLabel(""))
+        assertEquals("X-1", ticketSessionLabel(chips[0].copy(outcome = "")))
+    }
+
+    @Test fun `the detail sheet's Closed by row names the newest self-close, why and when`() {
+        // XERK-1569, web board.js ticketOutcomeOf / ticketOutcomeFieldHtml.
+        val base = TicketSession(
+            host = "h", id = "a", transcriptId = "t", status = "stopped", gitBranch = "",
+            ticketBranch = "X-1", summary = "", summaryManual = false, label = "",
+            ticketKey = "X-1", siteKey = "s",
+        )
+        val now = 1786400000000L
+        val older = base.copy(id = "a", outcome = "already-fixed", outcomeAt = now - 7200_000L)
+        val newer = base.copy(id = "b", outcome = "not-reproducible", outcomeAt = now - 3 * 3600_000L)
+        val plain = base.copy(id = "c", status = "running")
+        val closedBy = ticketOutcomeOf(listOf(older, newer, plain))
+        assertEquals("b", closedBy?.id)
+        assertEquals("session — not reproducible · 3h ago", ticketOutcomeText(closedBy!!, now))
+        assertEquals("session — done · just now", ticketOutcomeText(base.copy(outcome = "done", outcomeAt = now - 10_000L), now))
+        assertEquals("session — already fixed", ticketOutcomeText(base.copy(outcome = "already-fixed"), now))
+        assertNull(ticketOutcomeOf(listOf(plain, base.copy(outcome = "wontfix"))))
+        assertEquals("", ticketOutcomeWords("wontfix"))
     }
 
     @Test fun `chip label prefers rename, then branch, and state maps status`() {

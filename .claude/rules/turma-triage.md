@@ -62,13 +62,19 @@ machinery is in `.claude/rules/turma-board.md`.
   green, hold amber, reject red. The detail panel's **Triage row** (`triageFieldHtml` +
   `triagePickerHtml`, `data-triage-select`) follows the row-picker pattern: "Change" swaps the
   row for the picker, choosing an option IS the save, "Auto" is the release.
-- **A session that closed its OWN ticket says why beside its chip** (XERK-1569): `board.js`
+- **A session that closed its OWN ticket says why INSIDE its chip** (XERK-1569): `board.js`
   `ticketOutcomeLabel` reads `session.ticket.outcome.kind` (hub-coerced `coerceTicketOutcome`) and
-  `sessionChipHtml` appends `.kc-sess-why` "closed: not reproducible" / "closed: already fixed" (a
-  plain `done` adds nothing — the column says it). Mirrors: vendored `board.cjs` (+ its `board.css`)
-  and Android `ticketOutcomeLabel`/`TicketSession.outcome` in `Board.kt`, rendered in
-  `BoardScreen.kt`; `TicketRef.outcome` is typed there. Tests: `XERK-1569` in `board.test.js`,
-  `BoardTest.kt`, `AgentDecodeTest`.
+  `sessionChipHtml` swaps the chip's name for "closed · not reproducible" / "closed · already
+  fixed" / "closed" (done), class `.kc-sess-closed`: neutral dot, normal ink, whatever the run
+  state (a still-running session must not show a green dot beside "closed"); name + state move to
+  the tooltip. Never a separate caption beside the chip — it wrapped under the row in muted italic.
+- **The detail panel's "Closed by" row** (`ticketOutcomeOf` + `ticketOutcomeFieldHtml`): "session —
+  not reproducible · 3h ago" off the newest session that closed it; `board.html` passes the
+  ticket's sessions and repaints on `outcomeSig`. Mirrors: vendored `board.cjs` (+ its
+  `board.css`) and Android `ticketOutcomeLabel`/`ticketOutcomeOf`/`ticketOutcomeText` +
+  `TicketSession.outcome`/`outcomeAt` in `Board.kt`, rendered in `BoardScreen.kt` (chip + sheet);
+  `TicketRef.outcome` is typed there. Tests: `XERK-1569` in `board.test.js`, `BoardTest.kt`,
+  `AgentDecodeTest`.
 - **The org triage-policy modal's DOM ids are `triageRules*`, NEVER `policy*`** (XERK-587). EasyList
   ships an exact-id cosmetic rule `###policyPanel` (an unrelated site's cookie/policy popup), so a
   bare `#policyPanel` is hidden by a user-origin `display:none !important` under Brave Shields /

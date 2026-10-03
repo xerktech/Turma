@@ -1305,44 +1305,86 @@
   //     turn has no conversation to open, and an <a> to nothing is worse than
   //     plain text saying so.
   // Why a session closed its OWN ticket (XERK-1569): the agent stamps
-  // `ticket.outcome = {kind, at}` when the session's `close-ticket` lands. Only
-  // the two kinds that say something the Done column does not get words — a
-  // plain `done` is what the column already shows. "" = nothing to say.
+  // `ticket.outcome = {kind, at}` when the session's `close-ticket` lands. The
+  // words for each kind the hub lets through (coerceTicketOutcome); "" = the
+  // session did not close it (or an unknown kind, which says nothing).
+  function ticketOutcomeWords(kind) {
+    return kind === "not-reproducible" ? "not reproducible"
+      : kind === "already-fixed" ? "already fixed"
+      : kind === "done" ? "done" : "";
+  }
+
+  // The chip label of a session that closed its own ticket: "closed · <why>",
+  // or plain "closed" for `done` (the Done column already says the rest).
   function ticketOutcomeLabel(s) {
     const o = s && s.ticket && s.ticket.outcome;
-    const kind = o && o.kind;
-    return kind === "not-reproducible" ? "closed: not reproducible"
-      : kind === "already-fixed" ? "closed: already fixed" : "";
+    const words = ticketOutcomeWords(o && o.kind);
+    return !words ? "" : words === "done" ? "closed" : "closed · " + words;
+  }
+
+  // The newest of a ticket's sessions (ticketSessionsOf, oldest first) that
+  // closed it, as {kind, at, session}; null when none did. The detail panel's
+  // "Closed by" row reads it.
+  function ticketOutcomeOf(sessions) {
+    for (let i = (sessions || []).length - 1; i >= 0; i--) {
+      const s = sessions[i];
+      const o = s && s.ticket && s.ticket.outcome;
+      if (o && ticketOutcomeWords(o.kind)) return { kind: o.kind, at: o.at, session: s };
+    }
+    return null;
+  }
+
+  // The "Closed by" row's value: "session — not reproducible · 3h ago". `at` is
+  // epoch ms (wireLong-coerced by the hub); a missing one just drops the age.
+  function ticketOutcomeFieldHtml(outcome, now) {
+    if (!outcome) return "";
+    const at = Number.isFinite(outcome.at) ? new Date(outcome.at) : null;
+    const iso = at && !Number.isNaN(at.getTime()) ? at.toISOString() : "";
+    const age = iso ? ageStr(iso, now) : "";
+    const when = !age ? "" : age === "now" ? " · just now" : ` · ${age} ago`;
+    const title = iso ? ` title="${esc(iso)}"` : "";
+    return `<span class="td-outcome"${title}>session — ${esc(ticketOutcomeWords(outcome.kind))}${esc(when)}</span>`;
+  }
+
+  // Where a session's chip links (see above): live chat while running, the
+  // read-only view once it has a transcript, nowhere otherwise.
+  function sessionHref(s) {
+    return s.status === "running" && s.id
+      ? `/sessions?session=${encodeURIComponent(s.id)}`
+      : (s.transcriptId ? `/sessions?ended=${encodeURIComponent(s.transcriptId)}` : null);
   }
 
   function sessionChipHtml(s) {
     const branch = (s.git && s.git.branch) || (s.ticket && s.ticket.branch);
     const renamed = s.summaryManual ? s.summary : null;
-    const label = renamed || branch || s.summary || s.label || s.id
+    const name = renamed || branch || s.summary || s.label || s.id
       || (s.ticket && s.ticket.key) || "session";
     const stopped = s.status !== "running";
     const state = s.status === "error" ? "failed"
       : s.status === "queued" ? "queued"
       : (stopped ? "stopped" : "running");
-    const why = ticketOutcomeLabel(s);
-    const tip = [s.summary || s.label, branch && branch !== label ? "branch " + branch : "",
-      state, why].filter(Boolean).join(" · ");
-    // The outcome rides BESIDE the chip, not inside it: the chip's label already
-    // ellipsises at 22ch and the reason must read whole.
-    const after = why ? `<span class="kc-sess-why">${esc(why)}</span>` : "";
-    const cls = "kc-sess" + (s.status === "error" ? " kc-sess-err" : stopped ? " kc-sess-off" : "");
+    // A session that closed its own ticket says so INSIDE its chip, in place of
+    // its name: "closed · not reproducible" in the chip's normal ink, with a
+    // neutral dot. Its run state stops mattering to the card — the session may
+    // still be running, but the ticket's work is over — so the state and the
+    // name move to the tooltip rather than a green "running" dot beside "closed".
+    const closed = ticketOutcomeLabel(s);
+    const label = closed || name;
+    const tip = [s.summary || s.label, closed ? name : "",
+      branch && branch !== name ? "branch " + branch : "", state]
+      .filter(Boolean).join(" · ");
+    const cls = "kc-sess" + (closed ? " kc-sess-closed"
+      : s.status === "error" ? " kc-sess-err" : stopped ? " kc-sess-off" : "");
     // The label is its own element so it can ellipsise: .kc-sess is a flex
     // container, and text-overflow can't touch anonymous flex content — it would
     // hard-cut mid-letter. As a flex ITEM this span is blockified, so it can.
     const body = `<span class="kc-sess-dot"></span><span class="kc-sess-name">${esc(label)}</span>`;
-    const href = !stopped && s.id
-      ? `/sessions?session=${encodeURIComponent(s.id)}`
-      : (s.transcriptId ? `/sessions?ended=${encodeURIComponent(s.transcriptId)}` : null);
+    const href = sessionHref(s);
     if (!href) {
       return `<span class="${cls}" title="${esc(tip ? tip + " · no conversation" : label)}"
-        >${body}</span>${after}`;
+        >${body}</span>`;
     }
-    return `<a class="${cls}" href="${href}" title="${esc(tip || label)}">${body}</a>${after}`;
+    return `<a class="${cls}" href="${href}" title="${esc(tip || label)}">${body}</a>`;
   }
 
   // The card's session control: its sessions, plus the button that starts one.
@@ -2108,6 +2150,9 @@
             error: o.statusError,
           })),
       fieldRow("Resolution", d.resolution ? esc(d.resolution) : ""),
+      // A session that closed this ticket itself (XERK-1569), and why. The card's
+      // chip says why too; only this row has room for when.
+      fieldRow("Closed by", ticketOutcomeFieldHtml(ticketOutcomeOf(o.sessions), now)),
       fieldRow("Priority", v("priority")
         ? `<span class="kc-prio ${prioClass(v("priority"))}">${esc(v("priority"))}</span>` : ""),
       fieldRow("Type", v("type") ? esc(v("type")) : ""),
@@ -2575,7 +2620,8 @@
     boardFilterPanelHtml, boardFilterChipsHtml, boardSortMenuHtml, sortLabel,
     epicBuilderRows, epicBuilderStateLabel, epicBuilderProgressHtml, epicBuilderComposerHtml,
     boardColumnOf, moveSweepVerdict,
-    ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketOutcomeLabel, ticketStartHtml,
+    ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
+    ticketOutcomeWords, ticketOutcomeLabel, ticketOutcomeOf, ticketOutcomeFieldHtml,
     queuedTicketOf, queuedLabel, queuedTip,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed, startSweepVerdict,
   };

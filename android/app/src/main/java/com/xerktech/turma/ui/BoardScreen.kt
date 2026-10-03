@@ -129,6 +129,8 @@ import com.xerktech.turma.core.prioClass
 import com.xerktech.turma.core.rateMaxError
 import com.xerktech.turma.core.splitLabels
 import com.xerktech.turma.core.ticketOutcomeLabel
+import com.xerktech.turma.core.ticketOutcomeOf
+import com.xerktech.turma.core.ticketOutcomeText
 import com.xerktech.turma.core.ticketSessionIndex
 import com.xerktech.turma.core.ticketSessionLabel
 import com.xerktech.turma.core.ticketSessionState
@@ -467,7 +469,9 @@ fun BoardScreen(
             epicRunOf(fleet.epicRuns, site.siteKey, ticket.key)
                 ?.let { epicRunView(it, liveSite, sessionIndex, ticketQueue) }
         } else null
-        TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, vm, onDismiss = { detail = null })
+        // A session that closed this ticket itself (XERK-1569) — web's "Closed by" row.
+        val closedBy = ticketOutcomeOf(ticketSessionsOf(sessionIndex, site.siteKey, ticket.key))
+        TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, vm, closedBy, onDismiss = { detail = null })
     }
 
     if (filterOpen) {
@@ -752,15 +756,7 @@ private fun TicketCard(
                 } else if (!t.epicKey.isNullOrBlank()) {
                     Pill("⧉ ${t.epicKey}", dashed = true, mono = true)
                 }
-                sessions.forEach { s ->
-                    TicketSessionChip(s, onClick = { onOpenSession(s) })
-                    // Why the session closed its own ticket (XERK-1569), beside its
-                    // chip like web's .kc-sess-why.
-                    val why = ticketOutcomeLabel(s.outcome)
-                    if (why.isNotEmpty()) {
-                        Text(why, style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace, fontStyle = FontStyle.Italic, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                }
+                sessions.forEach { s -> TicketSessionChip(s, onClick = { onOpenSession(s) }) }
                 // An epic never offers the ordinary per-ticket Start — the epic-run
                 // control takes its place: Start-epic when unarmed, else a
                 // state-tinted progress chip (the card tap opens the full panel).
@@ -789,7 +785,11 @@ private fun TicketCard(
 @Composable
 private fun TicketSessionChip(s: TicketSession, onClick: () -> Unit) {
     val state = ticketSessionState(s)
-    val dot = when (state) {
+    // A session that closed its own ticket (XERK-1569) reads "closed · <why>" in
+    // the chip's normal ink with a neutral dot, whatever its run state — web's
+    // .kc-sess-closed. ticketSessionLabel already swaps the label.
+    val closed = ticketOutcomeLabel(s.outcome).isNotEmpty()
+    val dot = if (closed) TurmaColors.stopped else when (state) {
         "running" -> TurmaColors.working
         "queued" -> TurmaColors.waiting
         "failed" -> MaterialTheme.colorScheme.error
@@ -813,8 +813,9 @@ private fun TicketSessionChip(s: TicketSession, onClick: () -> Unit) {
             fontFamily = FontFamily.Monospace,
             maxLines = 1,
             overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-            modifier = Modifier.widthIn(max = 140.dp),
-            color = if (state == "running") MaterialTheme.colorScheme.onSurface
+            // The closed phrase is fixed-length, so it is let past the name cap.
+            modifier = Modifier.widthIn(max = if (closed) 220.dp else 140.dp),
+            color = if (closed || state == "running") MaterialTheme.colorScheme.onSurface
             else MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
@@ -1743,6 +1744,7 @@ private fun TicketDetailSheet(
     triageAction: String?,
     epicView: EpicRunView?,
     vm: BoardViewModel,
+    closedBy: TicketSession?,
     onDismiss: () -> Unit,
 ) {
     val siteKey = site.siteKey
@@ -1763,6 +1765,12 @@ private fun TicketDetailSheet(
             }
             Text(t.summary, style = MaterialTheme.typography.titleMedium)
             StatusSection(site, t, detail, vm, onDetailChange = { detail = it })
+            if (closedBy != null) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    SectionLabel("Closed by")
+                    Text(ticketOutcomeText(closedBy), style = MaterialTheme.typography.bodyMedium)
+                }
+            }
             // An epic is an organizer: it shows the epic-run panel (Start/progress),
             // not the work-ticket pins (repo/agent/model/runtime), which don't apply.
             if (isEpicTicket(t)) {

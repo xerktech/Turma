@@ -794,11 +794,12 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 .kc-sess.kc-sess-off .kc-sess-dot { background: var(--muted); }
 .kc-sess.kc-sess-err { color: var(--critical); border-color: var(--critical); }
 .kc-sess.kc-sess-err .kc-sess-dot { background: var(--critical); }
-/* Why a session closed its own ticket (XERK-1569), beside its chip. */
-.kc-sess-why {
-  color: var(--muted); font-family: var(--font-mono); font-size: 10.5px;
-  font-style: italic; white-space: nowrap; vertical-align: middle;
-}
+/* A session that closed its own ticket (XERK-1569): the chip's label becomes
+   "closed · <why>" in the chip's normal ink, with a neutral dot — never the green
+   running one, even while the session is still up. The label is a fixed phrase,
+   so it is let past the 22ch name cap rather than ellipsised. */
+.kc-sess.kc-sess-closed { max-width: none; }
+.kc-sess.kc-sess-closed .kc-sess-dot { background: var(--muted); }
 .kc-org {
   display: inline-flex; align-items: center; gap: 5px;
   color: var(--muted); font-family: var(--font-mono); font-size: 10.5px;

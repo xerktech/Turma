@@ -24,7 +24,8 @@ const {
   epicCardControlHtml, epicRunPanelHtml,
   epicBuilderRows, epicBuilderStateLabel, epicBuilderProgressHtml, epicBuilderComposerHtml,
   boardColumnOf, moveSweepVerdict,
-  ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketOutcomeLabel, ticketStartHtml,
+  ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
+  ticketOutcomeWords, ticketOutcomeLabel, ticketOutcomeOf, ticketOutcomeFieldHtml,
   queuedTicketOf, queuedTip,
   startSweepVerdict,
   createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
@@ -1831,7 +1832,7 @@ test("sessionChipHtml: anything not running opens the READ-ONLY view", () => {
   }
 });
 
-test("XERK-1569: a session that closed its own ticket says why beside its chip", () => {
+test("XERK-1569: a session that closed its own ticket says why INSIDE its chip", () => {
   const closed = (kind, over = {}) => tsess("s1", "X-1", {
     status: "stopped", transcriptId: "tr1",
     ticket: { key: "X-1", siteKey: "myorg.atlassian.net", branch: "X-1",
@@ -1839,21 +1840,63 @@ test("XERK-1569: a session that closed its own ticket says why beside its chip",
     ...over,
   });
   const nr = sessionChipHtml(closed("not-reproducible"));
-  assert.ok(nr.includes('<span class="kc-sess-why">closed: not reproducible</span>'), nr);
-  assert.ok(nr.includes("· closed: not reproducible"), "and in the tooltip");
+  assert.ok(nr.includes('class="kc-sess kc-sess-closed"'), nr);
+  assert.ok(nr.includes('<span class="kc-sess-name">closed · not reproducible</span>'), nr);
+  assert.ok(!nr.includes("kc-sess-why"), "no separate caption beside the chip");
   assert.ok(nr.includes(`href="/sessions?ended=tr1"`), "the chip still links");
+  assert.match(nr, /title="[^"]*X-1[^"]*stopped/, "the name and run state move to the tooltip");
   const af = sessionChipHtml(closed("already-fixed"));
-  assert.ok(af.includes(">closed: already fixed</span>"), af);
-  // A plain `done` is what the Done column already says; an unknown kind or no
-  // outcome at all adds nothing.
-  for (const s of [closed("done"), closed("wontfix"), tsess("s1", "X-1", { status: "stopped" })]) {
-    assert.ok(!sessionChipHtml(s).includes("kc-sess-why"), JSON.stringify(s.ticket));
+  assert.ok(af.includes(">closed · already fixed</span>"), af);
+  // `done` says just "closed" (the Done column says the rest).
+  const dn = sessionChipHtml(closed("done"));
+  assert.ok(dn.includes('<span class="kc-sess-name">closed</span>'), dn);
+  // A session still RUNNING after it closed its ticket reads closed, never as a
+  // green running chip — and still opens live.
+  const live = sessionChipHtml(closed("not-reproducible", { status: "running" }));
+  assert.ok(live.includes("kc-sess-closed") && !live.includes("kc-sess-off"), live);
+  assert.ok(live.includes(`href="/sessions?session=s1"`), live);
+  assert.match(live, /title="[^"]*running/, live);
+  // A failed session that closed its ticket reads closed too (the failure stays
+  // in the tooltip): the ticket's work is over either way.
+  assert.ok(sessionChipHtml(closed("done", { status: "error" })).includes("kc-sess-closed"));
+  // An unknown kind or no outcome at all changes nothing.
+  for (const s of [closed("wontfix"), tsess("s1", "X-1", { status: "stopped" })]) {
+    const h = sessionChipHtml(s);
+    assert.ok(!h.includes("kc-sess-closed") && !h.includes("closed ·"), h);
   }
   // A chip with no conversation still says why.
   assert.ok(sessionChipHtml(closed("not-reproducible", { transcriptId: undefined }))
-    .includes("closed: not reproducible"));
+    .includes(">closed · not reproducible</span>"));
   assert.equal(ticketOutcomeLabel({}), "");
   assert.equal(ticketOutcomeLabel({ ticket: { outcome: "not-reproducible" } }), "");
+});
+
+test("XERK-1569: the detail panel says a session closed the ticket, why and when", () => {
+  const now = Date.parse("2026-10-03T12:00:00Z");
+  const at = now - 3 * 3600 * 1000;
+  const withOutcome = (id, kind, when) => tsess(id, "X-1", {
+    status: "stopped", transcriptId: "t" + id,
+    ticket: { key: "X-1", siteKey: "myorg.atlassian.net", outcome: { kind, at: when } },
+  });
+  // The newest session that closed it wins; a later one that did not is skipped.
+  const sessions = [withOutcome("a", "already-fixed", at - 1000), withOutcome("b", "not-reproducible", at),
+    tsess("c", "X-1", { status: "running" })];
+  const o = ticketOutcomeOf(sessions);
+  assert.equal(o.kind, "not-reproducible");
+  assert.equal(o.session.id, "b");
+  const html = detailHtml(ticket("X-1"), null, { siteKey: "myorg.atlassian.net", sessions, now });
+  assert.match(html, /<dt>Closed by<\/dt><dd><span class="td-outcome"[^>]*>session — not reproducible · 3h ago<\/span>/);
+  assert.equal(ticketOutcomeFieldHtml({ kind: "done", at: now - 10 * 1000 }, now)
+    .replace(/<[^>]+>/g, ""), "session — done · just now");
+  assert.equal(ticketOutcomeFieldHtml({ kind: "already-fixed" }, now).replace(/<[^>]+>/g, ""),
+    "session — already fixed");
+  // No session closed it (or no sessions passed at all) → no row.
+  assert.equal(ticketOutcomeOf([tsess("c", "X-1")]), null);
+  assert.ok(!detailHtml(ticket("X-1"), null, { siteKey: "s" }).includes("Closed by"));
+  assert.ok(!detailHtml(ticket("X-1"), null, { sessions: [withOutcome("z", "wontfix", at)] })
+    .includes("Closed by"));
+  assert.equal(ticketOutcomeWords("done"), "done");
+  assert.equal(ticketOutcomeWords("x"), "");
 });
 
 test("sessionChipHtml: a session with no conversation is not a link", () => {
