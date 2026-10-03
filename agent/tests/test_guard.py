@@ -1362,7 +1362,12 @@ class TestCommentAndEvalReparse(unittest.TestCase):
         # A real comment after a closed expansion still hides its text, and
         # `$$` is the PID: `$${` opens nothing.
         self.assertAllowed("echo $${ #; rm -rf /")
-        self.assertAllowed("echo $${a:- #}; rm -rf /")
+        # A shell re-parses an unquoted heredoc or a "…" script one backslash
+        # level down, where the escaped `\\${` is live.
+        for cmd in ("bash <<EOF\necho \\${a:- #}; rm -rf /\nEOF",
+                    "bash -c \"echo \\\\\\$\\${a:- #}; rm -rf /\""):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
         # ...but after `\\$` the `$` that follows is live again.
         for cmd in ("rm -rf \\$${a:- /*}", "x=' /*'; rm -rf \\$$x",
                     "x=' /'; rm -rf \\$${x}"):

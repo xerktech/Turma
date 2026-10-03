@@ -881,11 +881,15 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     states = _quote_states(command) if vals and "$" in command else []
 
     def rep(m: "re.Match[str]") -> str:
-        if not _live_dollar(command, m.start()):
+        if not _SPLICE_RAW[0] and not _live_dollar(command, m.start()):
             # `\${a:-\"}` is literal text to bash, and `$${` is the PID then a
             # brace. Splicing either's "default" shifted the quoting under the
             # rest of the line: `echo "\${a:-\"}"; rm -rf /` hid the `rm`
-            # inside a string that had closed (XERK-1585).
+            # inside a string that had closed (XERK-1585). Which `$` is live is
+            # right for ONE parse only — an unquoted heredoc or `bash -c "…"`
+            # strips a backslash level first — so `_expand_both` also takes the
+            # splice-everything reading.
+            _SPLICES_ESCAPED[0] += 1
             return m.group(0)
         if m.group(1) and _brace_end(command, m.start()) != m.end() - 1:
             # `[^}]*` stopped at a `}` that is quoted or nested — in
@@ -1382,9 +1386,10 @@ def _find_roots(tokens: list[str]) -> list[str]:
 
 
 def _expand_both(command: str) -> list[tuple[list[str], str]]:
-    """`_expand_segments`, and — when a spliced value needed escaping — again
-    with every value spliced raw (see `_quote_literal`). Neither reading is
-    right at every re-parse depth; together they fail closed."""
+    """`_expand_segments`, and — when a spliced value needed escaping, or an
+    expansion was read as escaped — again with every value spliced raw and
+    every expansion live (see `_quote_literal`, `_live_dollar`). Neither
+    reading is right at every re-parse depth; together they fail closed."""
     _SPLICES_ESCAPED[0] = 0
     out = _expand_segments(command)
     if _SPLICES_ESCAPED[0]:
