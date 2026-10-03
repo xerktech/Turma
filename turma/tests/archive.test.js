@@ -1654,3 +1654,50 @@ test("XERK-789: resetLocalIndex drops a corrupt index.db and rebuilds from the f
   assert.ok((await archive.searchArchive("healing")).groups.length > 0,
     "searchable again after heal (rebuilt from files)");
 });
+
+// XERK-1364: the cursor is the only duplicate guard, so a `.jsonl` the index does not
+// describe must not have a re-send appended onto it whole.
+test("XERK-1364: a re-send from 0 onto an orphan .jsonl appends only what is new", () => {
+  const id = "t-1364-orphan";
+  const m = { ...META, summary: "Orphan resend" };
+  const b1 = [ent("o1", "user", "first"), ent("o2", "assistant", "second")];
+  const b2 = [ent("o3", "user", "third")];
+  archive.ingestChunk("nas", id, m, 0, 10, b1);
+  archive.ingestChunk("nas", id, m, 10, 20, b2);
+  const jsonl = path.join(process.env.ARCHIVE_DIR, archive.archiveRelPath(id, { ...m, host: "nas" }));
+  // The index loses the row (its sidecar gone, so a rebuild can't attribute the file):
+  // the agent's cursor is 0 while the file still holds all three entries.
+  fs.rmSync(jsonl + ".meta");
+  archive.rebuildIndex();
+  assert.equal(archive.manifestCursors("nas", [{ transcriptId: id, ...m }])[id], 0);
+  // Re-sent from 0 across two chunks (the second no longer reads as a size mismatch),
+  // then one genuinely new entry.
+  assert.equal(archive.ingestChunk("nas", id, m, 0, 10, b1).bytesStored, 10);
+  assert.equal(archive.ingestChunk("nas", id, m, 10, 20, b2).bytesStored, 20);
+  archive.ingestChunk("nas", id, m, 20, 30, [ent("o4", "assistant", "fourth")]);
+  const uuids = fs.readFileSync(jsonl, "utf8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+  assert.deepEqual(uuids, ["o1", "o2", "o3", "o4"]);
+  const meta = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+  assert.equal(meta.msgCount, 4);
+  assert.equal(meta.archiveBytes, fs.statSync(jsonl).size);
+  // Caught up: the next chunk appends without reading the file back.
+  archive.ingestChunk("nas", id, m, 30, 40, [ent("o4", "assistant", "fourth")]);
+  assert.equal(fs.readFileSync(jsonl, "utf8").trim().split("\n").length, 5,
+    "a cursor that describes the file is trusted as before");
+});
+
+test("XERK-1364: a rebuild from a stale sidecar de-duplicates the agent's re-send", () => {
+  const id = "t-1364-stale";
+  const m = { ...META, summary: "Stale sidecar" };
+  archive.ingestChunk("nas", id, m, 0, 10, [ent("s1", "user", "a")]);
+  const jsonl = path.join(process.env.ARCHIVE_DIR, archive.archiveRelPath(id, { ...m, host: "nas" }));
+  const stale = fs.readFileSync(jsonl + ".meta");
+  archive.ingestChunk("nas", id, m, 10, 20, [ent("s2", "assistant", "b")]);
+  fs.writeFileSync(jsonl + ".meta", stale);     // appended, sidecar never rewritten
+  archive.rebuildIndex();
+  assert.equal(archive.manifestCursors("nas", [{ transcriptId: id, ...m }])[id], 10);
+  archive.ingestChunk("nas", id, m, 10, 20, [ent("s2", "assistant", "b")]);
+  const uuids = fs.readFileSync(jsonl, "utf8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+  assert.deepEqual(uuids, ["s1", "s2"]);
+  assert.equal(archive.getTranscript(id).entries.length, 2);
+});

@@ -174,6 +174,16 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
   syncing" is the honest 404); a filePath'd row whose file is ENOENT reads back empty. Distinguishes
   "recorded no conversation" from "never heard of", and keeps the RAW layer (which may hold real
   material) reachable. Any OTHER read error stays null — a transient EIO must not read as empty.
+- **The cursor is the ONLY duplicate guard on the rendered `.jsonl` (XERK-1364)** — an append at a
+  cursor behind the file repeats lines (prod: whole transcripts doubled, meta counting them once).
+  - `ingestChunk` de-dups a chunk (by uuid, else whole line) against the file when it is LARGER than
+    the row's `archiveBytes`, or the id is in `unverifiedCursors`; it stays suspect until a chunk
+    carries a NEW entry, since a re-send from a stale cursor spans several chunks.
+  - A sidecar's `bytesStored` is trusted only when its `archiveBytes` equals the file size
+    (`reconcileHydratedCursors`, `rebuildIndex`, backfill): hydrate keeps a same-size STALE `.meta`
+    beside a re-downloaded `.jsonl`. Neither sidecar nor row matches → lower cursor + suspect.
+  - A SHORTER file is not this path — heal-on-read (XERK-280) owns it and also fixes the FTS.
+  - Tests: `XERK-1364` cases in `archive.test.js` and `index-store.test.js`.
 - **`meta` is COERCED before it is bound** (`normalizeMeta`) — every field is agent-supplied and goes
   straight into sqlite (scalars only); a non-scalar stores as nothing rather than poisoning every
   later beat with a 500. The length cap is the receiving half of the same XERK-235 rule as above.
