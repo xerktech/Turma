@@ -38,6 +38,9 @@ hook-log tail) + `agent/hooks/permlog.py`.
     with no pending call. Same `dialogKind`, and question + detail equal with all whitespace removed;
     a face at parse_pane_prompt's line cap is the other's tail, at its char cap the other's head.
     Labels are not compared (a wrap drops one). Without it a ttyd attach split such a prompt in two.
+  - **The face is UNCUT by chars** (`detailFace` → `panePromptFace` → `face=`): a long command cut at
+    BOTH caps is a middle window, and two widths' windows need not overlap, so only the line cap may
+    trim it. It never rides the wire: session_report lifts it out of `panePrompt`, the beat pops it.
   - **Only a PRE-EXECUTION prompt (`permission`/`plan`) repaints on the call alone.** A running call
     raises any number of sandbox prompts under one `toolUseId` (`npm install`: the registry, then
     GitHub), so a `sandbox` face is a repaint only while its host equals the row's `head`.

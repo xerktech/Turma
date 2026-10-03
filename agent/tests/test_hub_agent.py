@@ -37382,6 +37382,71 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
             wrapped[-ha.PANE_PROMPT_DETAIL_LINES:]) + " --force"), at=3000)
         self.assertEqual(len({r["id"] for r in self.rows()}), 2)
 
+    def pane_edge(self, body, width, at):
+        # The dialog drawn at `width` and read the way the beat reads it:
+        # parse_pane_prompt(face=True) via session_report, which lifts the uncut
+        # face out of the wire field into the `face` the beat passes on.
+        wrapped = [" " * 3 + line[i:i + width - 3]
+                   for line in body for i in range(0, len(line), width - 3)]
+        cap = "\n".join(["─" * width, " Bash command", ""] + wrapped + [
+            "", " Do you want to proceed?", " ❯ 1. Yes",
+            "   2. Yes, and don't ask again", "   3. No", ""])
+        pp = ha.parse_pane_prompt(cap, face=True)
+        face = pp.pop("detailFace", None)
+        self.sm._permission_edges(self.sess, {"panePrompt": pp, "paneBusy": False},
+                                  now_ms=at, face=face)
+        return pp, face
+
+    def test_a_long_sub_agent_command_redrawn_narrower_stays_one_row(self):
+        # Over PANE_PROMPT_DETAIL_CHARS, the wide face is char-cut (bottom
+        # lost) and the narrow one line-cut (top lost): two windows of one
+        # command that may not even overlap. The uncut face keeps it one row.
+        for n, size, narrow in ((10, 88, 60), (20, 110, 100)):
+            with self.subTest(lines=n, width=narrow):
+                self.setUp()
+                self.write(self.tool_use("toolu_A", name="Agent",
+                                         inp={"description": "x", "prompt": "y"}))
+                body = ["npm test " + "a" * (size - 9)] + [
+                    f"line{i} " + "x" * (size - 6) for i in range(1, n)] + ["Do it"]
+                wide, wide_face = self.pane_edge(body, 200, at=1000)
+                self.assertEqual(len(wide["detail"]), ha.PANE_PROMPT_DETAIL_CHARS)
+                self.assertIsNotNone(wide_face)
+                self.hook_rows(self.request_hook())
+                self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+                self.pane_edge(body, narrow, at=5000)
+                self.edge(None, at=30000, paneBusy=True)
+                rows = {r["id"]: r for r in self.rows()}
+                self.assertEqual(list(rows), [f"d-{self.SID}-1000"])
+                row, = rows.values()
+                self.assertEqual((row["tool"], row["head"], row["waitedMs"]),
+                                 ("Bash", "npm test", 29000))
+                # The face is never on the wire.
+                self.assertNotIn("detailFace", wide)
+
+    def test_a_long_commands_next_prompt_is_still_a_new_row(self):
+        self.write(self.tool_use("toolu_T", name="Task",
+                                 inp={"description": "fix", "prompt": "fix it"}))
+        body = [f"line{i} " + "x" * 100 for i in range(10)]
+        self.pane_edge(body, 200, at=1000)
+        # Same first 800 chars, another command after them.
+        self.pane_edge(body[:-1] + ["rm -rf build"], 200, at=2000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+
+    def test_a_char_cut_face_is_the_head_of_the_other_under_one_question(self):
+        # Pins _dialog_faces_match's char-cap branch: a detail of exactly
+        # PANE_PROMPT_DETAIL_CHARS lost its bottom, so it is the other's head.
+        full = "Bash command\n" + "\n".join(f"line{i} " + "y" * 70 for i in range(12))
+        cut = full[:ha.PANE_PROMPT_DETAIL_CHARS]
+        rewrapped = {"prompt": "Do you want to proceed?",
+                     "detail": full.replace(" y", "\ny")}
+        self.assertTrue(ha._dialog_faces_match("Do you want to proceed?", cut, rewrapped))
+        # Another question is another prompt, and an uncut face shorter than
+        # the cap is no cut at all.
+        self.assertFalse(ha._dialog_faces_match(
+            "Do you want to allow this?", cut, rewrapped))
+        self.assertFalse(ha._dialog_faces_match(
+            "Do you want to proceed?", cut[:-1], rewrapped))
+
     def test_the_delegations_own_prompt_is_not_overridden(self):
         # A prompt to LAUNCH the Agent is the delegation's own call: same tool
         # and input, so it merges without rewriting the row.
@@ -37654,6 +37719,24 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         gone = beat()[rid2]
         self.assertEqual((gone["answer"], gone["via"]), ("unknown", "unknown"))
         self.assertEqual(self.sm._perm_open, {})
+
+    def test_the_uncut_face_reaches_the_ledger_and_never_the_wire(self):
+        cap = "\n".join(["─" * 80, " Bash command", ""]
+                        + ["   " + "z" * 70] * 13 + ["", " Do you want to proceed?",
+                                                   " ❯ 1. Yes", "   2. No", ""])
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, None, ha.parse_pane_prompt(
+                                   cap, face=True))):
+            rep = ha.session_report(self.sess["worktreePath"], {}, "agent-x")
+        self.assertNotIn("detailFace", rep["panePrompt"])
+        self.assertGreater(len(rep["panePromptFace"]), ha.PANE_PROMPT_DETAIL_CHARS)
+        self.sm._stage_permission_fetch = mock.Mock()
+        with mock.patch.object(ha, "session_report", return_value=dict(rep, prUrls=[])), \
+                mock.patch.object(self.sm, "_live_tmux_panes", return_value=None), \
+                mock.patch.object(self.sm, "_permission_edges") as edges:
+            payload = self.sm.build_payload(1, light=True)
+        self.assertEqual(edges.call_args.kwargs["face"], rep["panePromptFace"])
+        self.assertNotIn("panePromptFace", json.dumps(payload))
 
     def test_a_raising_edge_never_costs_the_sessions_signals(self):
         with mock.patch.object(self.sm, "_permission_edges",

@@ -11052,16 +11052,25 @@ PANE_PROMPT_RULE_RE = re.compile(r"^[\s─╌━▔▁═_│╭╮╰╯┌┐�
 # description, or the plan's body): enough to decide on, bounded for the beat.
 PANE_PROMPT_DETAIL_LINES = 14
 PANE_PROMPT_DETAIL_CHARS = 800
+# The permission ledger's uncut face (`face=True`): the same bottom lines, bounded
+# only so a pathological pane can't grow the in-memory key. 14 lines of a wide pane.
+PANE_PROMPT_FACE_CHARS = 8000
 PANE_PROMPT_MAX_OPTIONS = 9   # answered by typing the digit; 10+ isn't one key
 
 
-def parse_pane_prompt(cap):
+def parse_pane_prompt(cap, face=False):
     """The blocking choice dialog the session's TUI is showing, or None.
 
     Returns {prompt, options: [{number, label, selected}], detail} — `detail`
     being the context lines above the question (the command being asked about,
     or the plan). See the comment above for the four conditions a run of lines
     must meet, and why an idle/working pane can't produce a false positive.
+
+    `face=True` adds `detailFace` when the char cap cut `detail`: the same lines
+    uncut, for the permission ledger's repaint test (`_dialog_faces_match`). A
+    face cut at BOTH caps keeps a middle window of the text, and two such windows
+    of one long command at two widths need not overlap at all. Never on the wire:
+    session_report lifts it out to `panePromptFace`, which the beat pops.
 
     Scanned bottom-up: the dialog owns the bottom of the pane, so an earlier
     dialog still scrolled on screen can't shadow the live one."""
@@ -11136,7 +11145,10 @@ def parse_pane_prompt(cap):
         detail.reverse()
         out = {"prompt": prompt[:300], "options": opts}
         if detail:
-            out["detail"] = "\n".join(detail)[:PANE_PROMPT_DETAIL_CHARS]
+            joined = "\n".join(detail)
+            out["detail"] = joined[:PANE_PROMPT_DETAIL_CHARS]
+            if face and len(joined) > PANE_PROMPT_DETAIL_CHARS:
+                out["detailFace"] = joined[:PANE_PROMPT_FACE_CHARS]
         return out
     return None
 
@@ -11158,7 +11170,7 @@ def _pane_status(tmux_name, state):
     if not tmux_name:
         return None, None, None
     busy, cap = _stable_pane_busy_from(tmux_name, state, _capture_pane(tmux_name))
-    return busy, parse_pane_mode(cap), parse_pane_prompt(cap)
+    return busy, parse_pane_mode(cap), parse_pane_prompt(cap, face=True)
 
 
 # --- the permission ledger (XERK-1563) ---------------------------------------
@@ -11305,7 +11317,7 @@ def _pane_dialog_identity(prompt):
     labels = tuple(str(o.get("label") or "")[:200] for o in (prompt.get("options") or [])
                    if isinstance(o, dict))
     return (str(prompt.get("prompt") or "")[:PERMISSION_TEXT_MAX],
-            str(prompt.get("detail") or "")[:800], labels)
+            str(prompt.get("detail") or "")[:PANE_PROMPT_FACE_CHARS], labels)
 
 
 def _dialog_compact(text):
@@ -11318,9 +11330,11 @@ def _dialog_faces_match(prev_prompt, prev_detail, prompt):
     removed (the question is the LAST line only, so a wrapped question moves its
     head into the detail). A face at parse_pane_prompt's caps is a cut of the
     other: one at PANE_PROMPT_DETAIL_LINES lost its TOP lines (its text is the
-    other's tail); one at PANE_PROMPT_DETAIL_CHARS lost its BOTTOM (its detail is
-    the other's head, under the same question). Option labels are not compared:
-    a narrow pane wraps one off the 1..N run."""
+    other's tail); one of exactly PANE_PROMPT_DETAIL_CHARS lost its BOTTOM (its
+    detail is the other's head, under the same question). A face cut at BOTH is
+    a middle window no test here can place, so the beat passes the UNCUT face
+    (`detailFace`), which only the line cap trims. Option labels are not
+    compared: a narrow pane wraps one off the 1..N run."""
     faces = [(str(prev_prompt or ""), str(prev_detail or "")),
              (str(prompt.get("prompt") or ""), str(prompt.get("detail") or ""))]
     full = [_dialog_compact(d + q) for q, d in faces]
@@ -11332,7 +11346,7 @@ def _dialog_faces_match(prev_prompt, prev_detail, prompt):
                                           (faces[1], full[1], faces[0], full[0])):
         if len(d.splitlines()) >= PANE_PROMPT_DETAIL_LINES and other.endswith(mine):
             return True
-        if (len(d) >= PANE_PROMPT_DETAIL_CHARS and _dialog_compact(q) == _dialog_compact(oq)
+        if (len(d) == PANE_PROMPT_DETAIL_CHARS and _dialog_compact(q) == _dialog_compact(oq)
                 and _dialog_compact(od).startswith(_dialog_compact(d))):
             return True
     return False
@@ -13136,6 +13150,11 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         "wakeAt": None,
         "wakeReason": None,
     }
+    # The uncut dialog face (parse_pane_prompt's `detailFace`) rides beside the
+    # wire field, never inside it: the beat pops it for the permission ledger.
+    pane_face = pane_prompt.pop("detailFace", None) if isinstance(pane_prompt, dict) else None
+    if pane_face:
+        report["panePromptFace"] = pane_face
 
     def _finish():
         # Live background agents, accumulated across beats by _scan_agent_entry
@@ -29474,10 +29493,13 @@ class SessionManager:
             "rulesMatched": list(hook.get("rulesMatched") or []),
             "openedAt": hook["ts"], "answer": "unknown", "via": "unknown"})
 
-    def _permission_edges(self, sess, signals, now_ms=None):
+    def _permission_edges(self, sess, signals, now_ms=None, face=None):
         """ON THE BEAT, per running session, off the signals session_report
         already read: the panePrompt None→dialog / dialog→gone edges, and the
-        ask-in-chat edge. Reads the transcript tail only ON an edge."""
+        ask-in-chat edge. Reads the transcript tail only ON an edge. `face` is
+        the dialog's detail before the char cap (session_report's
+        `panePromptFace`, set only when the cap cut it): the dialog's identity
+        and repaint test read it, the row reads the capped `panePrompt`."""
         sid = sess.get("id")
         if not isinstance(sid, str) or not isinstance(signals, dict):
             return
@@ -29488,11 +29510,13 @@ class SessionManager:
         # prompt asks "Do you want to proceed?", and the call it is about sits in
         # the detail and the option labels. Back-to-back prompts answered between
         # two beats never show "no dialog", so only this tells them apart.
-        key = _pane_dialog_identity(pp) if pp is not None else None
+        seen = (dict(pp, detail=face) if pp is not None and isinstance(face, str) and face
+                else pp)
+        key = _pane_dialog_identity(seen) if seen is not None else None
         if key != self._perm_dialog_key.get(sid):
             row = self._perm_open.get(sid)
             if (row is not None and pp is not None and self._dialog_is_repaint(
-                    sess, row, pp, self._perm_dialog_key.get(sid))):
+                    sess, row, seen, self._perm_dialog_key.get(sid))):
                 # The SAME prompt redrawn (a resize rewraps it, Tab amends the
                 # command): one prompt, one row — never close and reopen it.
                 self._perm_dialog_key[sid] = key
@@ -32413,6 +32437,7 @@ class SessionManager:
             sid = None
         running = sess.get("status") == "running"
         signals = None
+        pane_face = None
         if running:
             try:
                 st = self.sess_state.setdefault(sid, {})
@@ -32421,6 +32446,8 @@ class SessionManager:
                                          claude_sid=sess.get("claudeSessionId"),
                                          agent_type=sess.get("agentType"),
                                          dsh_status=self.dsh_status.get(sid))
+                # The ledger's uncut dialog face: never on the wire.
+                pane_face = signals.pop("panePromptFace", None)
                 pend = self.pending_prs.setdefault(sid, [])
                 pend.extend(signals.pop("prUrls"))
                 del pend[:-10]
@@ -32489,7 +32516,7 @@ class SessionManager:
             # this session's signals, let alone the beat.
             if signals is not None:
                 try:
-                    self._permission_edges(sess, signals)
+                    self._permission_edges(sess, signals, face=pane_face)
                 except Exception as e:
                     log(f"permission ledger edge failed for {sid}: {e}")
         # _session_git reads repoPath/worktreePath and shells out to git; on the
